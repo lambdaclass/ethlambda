@@ -63,6 +63,7 @@ pub(crate) fn build_body_proof(
     let head_state = store
         .get_state(&parent_root)
         .expect("head state read works")?;
+    let head_state = head_state.expect_lean();
     let aggregated_payloads = store.known_aggregated_payloads();
     let known_block_roots = store.get_block_roots().expect("block roots read works");
 
@@ -79,7 +80,7 @@ pub(crate) fn build_body_proof(
     };
 
     let (attestations, aggregates) =
-        block_builder::select_and_compact(&head_state, slot, parent_root, inputs, config)
+        block_builder::select_and_compact(head_state, slot, parent_root, inputs, config)
             .inspect_err(|err| warn!(%slot, %err, "Failed to select attestations for a body proof"))
             .ok()?;
 

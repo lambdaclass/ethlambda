@@ -1,0 +1,46 @@
+# The devnet in network_params.yaml, with the ethlambda validator talking to
+# `ethlambda beacon` first and the lighthouse participant second.
+#
+# ethlambda beacon runs with a geth of its own and serves the duties,
+# attestation data, attestation pool, aggregation and block production, and the
+# validator client talks to it alone (`fallback: false`), so every block on the
+# chain is one ethlambda beacon built. Lighthouse stays in the network as a
+# peer. Run from the repository root, after
+# `make docker-build DOCKER_TAG=beacon-block-production`:
+#
+#   kurtosis run --enclave ethlambda-beacon-devnet tooling/kurtosis-validator \
+#     --args-file tooling/kurtosis-validator/network_params_ethlambda_beacon.yaml
+#
+# Two lighthouse participants rather than one, because ethereum-package pins a
+# lone lighthouse to `--target-peers=0`, which makes it refuse every inbound
+# peer, ethlambda beacon included, and lighthouse rejects the flag given twice,
+# so it cannot be overridden. `--subscribe-all-subnets` because ethlambda beacon
+# publishes attestations through gossipsub fanout, which reaches only peers
+# subscribed to the subnet, and a lighthouse with no validators of its own joins
+# almost none. ethlambda beacon aggregates for the validator client itself, so
+# lighthouse needs no `--import-all-attestations`: it receives the aggregates on
+# `beacon_aggregate_and_proof` and packs them into the blocks it proposes.
+participants:
+  - el_type: geth
+    cl_type: lighthouse
+    validator_count: 0
+    supernode: true
+    count: 2
+    cl_extra_params:
+      - --subscribe-all-subnets
+network_params:
+  preset: mainnet
+  electra_fork_epoch: 0
+  fulu_fork_epoch: 0
+  preregistered_validator_count: 128
+additional_services:
+  - dora
+
+ethlambda_validator:
+  image: ghcr.io/lambdaclass/ethlambda:beacon-block-production
+  name: ethlambda-vc
+  suggested_fee_recipient: "0x000000000000000000000000000000000000dEaD"
+
+ethlambda_beacon:
+  enabled: true
+  fallback: false

@@ -28,7 +28,7 @@ struct SpecResponse {
 async fn get_spec(State(store): State<Store>) -> impl IntoResponse {
     let config = store.config();
     json_response(SpecResponse {
-        ms_per_slot: config.milliseconds_per_slot,
+        ms_per_slot: config.slot_duration_ms,
         intervals_per_slot: INTERVALS_PER_SLOT,
         ms_per_interval: config.milliseconds_per_interval(),
         historical_roots_limit: HISTORICAL_ROOTS_LIMIT as u64,

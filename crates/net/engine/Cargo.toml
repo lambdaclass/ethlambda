@@ -1,0 +1,32 @@
+[package]
+name = "ethlambda-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ethlambda-types.workspace = true
+# `json` on top of the workspace's rustls-only default: this crate's whole
+# payload is JSON-RPC, and the feature only pulls in `serde_json`, which is
+# already a direct dependency here.
+reqwest = { workspace = true, features = ["json"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+base64.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "sync",
+] }
