@@ -65,6 +65,34 @@ jobs:
       - name: Clippy (skipped spectests)
         run: cargo clippy --locked --workspace --test forkchoice_spectests --test signature_spectests --test stf_spectests --test ssz_spectests -- -D warnings
 
+      # The binary's `include-ethrex` code (the `--ethrex.*` flags, the
+      # embedded client's startup and shutdown) is cfg'd out of every pass
+      # above.
+      - name: Clippy (include-ethrex)
+        run: cargo clippy --locked --workspace --all-targets --features ethlambda/include-ethrex -- -D warnings
+
+  # The embedded execution client, in a job of its own: `make test-ethrex`
+  # says why it is kept out of both halves of `test`. No leanSpec fixtures:
+  # its integration tests run ethrex against a checked-in dev genesis.
+  ethrex:
+    name: Test (include-ethrex)
+    runs-on: ${{ vars.ETHLAMBDA_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/free-disk
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: make test-ethrex
+
   # Two features gate code that no step in `lint` reaches, so both would rot
   # silently between merges.
   #
