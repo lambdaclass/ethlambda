@@ -17,6 +17,11 @@ jemalloc = ["dep:tikv-jemallocator"]
 # The quinn-udp UDP fallback is a Cargo `[patch]` (which cannot be feature-gated),
 # injected at build time by `shadow/build.sh` / `make shadow-build`.
 shadow-integration = ["ethlambda-crypto/shadow-integration"]
+# Embed ethrex as the beacon node's execution client. Without
+# `--execution-endpoint`, `ethlambda beacon` starts it in-process and drives
+# its Engine API through direct handler calls instead of JSON-RPC; the
+# `--ethrex.*` flags configure it. See docs/ethrex.md.
+include-ethrex = ["dep:ethlambda-ethrex", "ethlambda-engine/include-ethrex"]
 
 [dependencies]
 ethlambda-blockchain.workspace = true
@@ -49,6 +54,7 @@ hex.workspace = true
 clap.workspace = true
 reqwest.workspace = true
 ethlambda-engine.workspace = true
+ethlambda-ethrex = { workspace = true, optional = true }
 thiserror.workspace = true
 eyre.workspace = true
 
