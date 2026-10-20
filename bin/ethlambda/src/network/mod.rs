@@ -222,12 +222,15 @@ pub(crate) fn check_constants(config: &Config) -> Result<(), ConstantsMismatch> 
 /// before its actual genesis, so reading it from the file would put every slot
 /// boundary off by that much.
 ///
-/// `slot_duration_ms` is always derived, never read from the file. A beacon
-/// chain's slots are a whole number of seconds, so `SECONDS_PER_SLOT` is
-/// authoritative and the millisecond field exists for lean's sub-second
-/// cadence. A config carrying `SECONDS_PER_SLOT: 6` and no `SLOT_DURATION_MS`
-/// would otherwise keep mainnet's 12000 by default, and every duty would fire
-/// at the wrong time while the second-resolution field looked correct.
+/// `slot_duration_ms` is always derived here, never taken from the file as
+/// is. A beacon chain's slots are a whole number of seconds, so
+/// `SECONDS_PER_SLOT` is authoritative and the millisecond field exists for
+/// lean's sub-second cadence. A config carrying `SECONDS_PER_SLOT: 6` and no
+/// `SLOT_DURATION_MS` would otherwise keep mainnet's 12000 by default, and
+/// every duty would fire at the wrong time while the second-resolution field
+/// looked correct. A config carrying only `SLOT_DURATION_MS`, as Gloas
+/// tooling writes them, had its seconds field set from it when the file was
+/// parsed (`ConfigFile::parse`), so the derivation here is the identity.
 fn derive_genesis_fields(config: &mut Config, genesis_time: u64) {
     config.genesis_time = genesis_time;
     config.slot_duration_ms = config.seconds_per_slot * 1_000;

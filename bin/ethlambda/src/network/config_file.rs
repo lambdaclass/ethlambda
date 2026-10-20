@@ -33,13 +33,34 @@ pub(crate) struct ConfigFile {
 pub(crate) enum ConfigFileError {
     #[error("could not parse the network config: {0}")]
     Malformed(#[from] serde_yaml_ng::Error),
+    #[error(
+        "SLOT_DURATION_MS is {0} and SECONDS_PER_SLOT is absent; a beacon chain's slot is a \
+         whole, non-zero number of seconds"
+    )]
+    SlotDurationNotWholeSeconds(u64),
 }
 
 impl ConfigFile {
     /// Parse one `config.yaml`'s text.
     pub(crate) fn parse(text: &str) -> Result<Self, ConfigFileError> {
-        let config: Config = serde_yaml_ng::from_str(text)?;
+        let mut config: Config = serde_yaml_ng::from_str(text)?;
         let document: BTreeMap<String, IgnoredAny> = serde_yaml_ng::from_str(text)?;
+
+        // A Gloas config (EIP-7782) carries `SLOT_DURATION_MS` and no
+        // `SECONDS_PER_SLOT`. Left alone, the seconds field would keep its
+        // default and `derive_genesis_fields` would then overwrite the
+        // millisecond field from it, so the node would run at the default
+        // cadence while the file said otherwise: every slot clock off, every
+        // payload timestamp check failing. The seconds field stays
+        // authoritative whenever the file has it.
+        if !document.contains_key("SECONDS_PER_SLOT") && document.contains_key("SLOT_DURATION_MS") {
+            if config.slot_duration_ms == 0 || config.slot_duration_ms % 1_000 != 0 {
+                return Err(ConfigFileError::SlotDurationNotWholeSeconds(
+                    config.slot_duration_ms,
+                ));
+            }
+            config.seconds_per_slot = config.slot_duration_ms / 1_000;
+        }
 
         let claimed = config_field_names();
         let ignored = document
@@ -135,6 +156,49 @@ mod tests {
         assert_eq!(parsed.config.config_name.as_str(), "ethlambda-devnet");
         assert_eq!(parsed.config.preset_base.as_str(), "mainnet");
         assert_eq!(parsed.config.deposit_chain_id, 3_151_908);
+        assert_eq!(parsed.config.seconds_per_slot, 6);
+    }
+
+    /// Written with `SLOT_DURATION_MS` as the only slot-length key, as the
+    /// Gloas tooling writes network configs.
+    fn with_only_slot_duration_ms(ms: &str) -> String {
+        let text = DEVNET.replace("SECONDS_PER_SLOT: 6\n", "").replace(
+            "SLOT_DURATION_MS: 12000",
+            &format!("SLOT_DURATION_MS: {ms}"),
+        );
+        assert!(!text.contains("SECONDS_PER_SLOT"), "fixture changed shape");
+        assert!(
+            text.contains(&format!("SLOT_DURATION_MS: {ms}")),
+            "fixture changed shape"
+        );
+        text
+    }
+
+    #[test]
+    fn a_config_with_only_slot_duration_ms_sets_the_seconds_from_it() {
+        let parsed = ConfigFile::parse(&with_only_slot_duration_ms("6000")).unwrap();
+        assert_eq!(parsed.config.seconds_per_slot, 6);
+        assert_eq!(parsed.config.slot_duration_ms, 6_000);
+    }
+
+    #[test]
+    fn a_sub_second_slot_duration_without_the_seconds_field_is_refused() {
+        let err = ConfigFile::parse(&with_only_slot_duration_ms("6500"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("SLOT_DURATION_MS is 6500"), "got {err}");
+        let err = ConfigFile::parse(&with_only_slot_duration_ms("0"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("SLOT_DURATION_MS is 0"), "got {err}");
+    }
+
+    #[test]
+    fn the_seconds_field_stays_authoritative_when_both_are_present() {
+        // The fixture carries SECONDS_PER_SLOT: 6 next to a stale
+        // SLOT_DURATION_MS: 12000; the seconds win here and the milliseconds
+        // are derived from them later, in `derive_genesis_fields`.
+        let parsed = ConfigFile::parse(DEVNET).unwrap();
         assert_eq!(parsed.config.seconds_per_slot, 6);
     }
 
