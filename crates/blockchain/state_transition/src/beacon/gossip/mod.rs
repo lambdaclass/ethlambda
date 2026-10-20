@@ -12,6 +12,7 @@ pub mod block;
 pub mod column;
 pub mod envelope;
 pub mod execution_payload_bid;
+pub mod execution_proof;
 pub mod operations;
 pub mod payload_attestation;
 pub mod proposer_preferences;
@@ -25,6 +26,7 @@ pub(crate) mod test_support;
 pub use aggregate::SeenAggregates;
 pub use attestation::SeenAttestations;
 pub use envelope::SeenEnvelopes;
+pub use execution_proof::SeenExecutionProofs;
 pub use payload_attestation::SeenPayloadAttestations;
 pub use sync_committee::{SeenSyncCommitteeMessages, SeenSyncContributions};
 
@@ -196,6 +198,8 @@ pub enum IgnoreReason {
     AlreadyExiting,
     /// The head state's sync committees cannot answer for the message's period.
     SyncCommitteeUnavailable,
+    /// The proof engine could not answer about an execution proof.
+    ProofEngineUnavailable,
 }
 
 impl IgnoreReason {
@@ -238,6 +242,7 @@ impl IgnoreReason {
             Self::BeforeFork => "before_fork",
             Self::AlreadyExiting => "already_exiting",
             Self::SyncCommitteeUnavailable => "sync_committee_unavailable",
+            Self::ProofEngineUnavailable => "proof_engine_unavailable",
         }
     }
 }
@@ -336,6 +341,14 @@ pub enum RejectReason {
     /// A sync committee contribution's subcommittee index is not below
     /// `SYNC_COMMITTEE_SUBNET_COUNT`.
     SubcommitteeIndex,
+    /// An execution proof with no proof bytes.
+    EmptyExecutionProof,
+    /// An execution proof of a type this node does not know.
+    UnsupportedProofType,
+    /// An execution proof signed by a validator that is not active.
+    InactiveValidator,
+    /// An execution proof the proof engine refused.
+    InvalidExecutionProof,
 }
 
 impl RejectReason {
@@ -390,6 +403,10 @@ impl RejectReason {
             Self::NotInPtc => "not_in_ptc",
             Self::InvalidOperation => "invalid_operation",
             Self::SubcommitteeIndex => "subcommittee_index",
+            Self::EmptyExecutionProof => "empty_execution_proof",
+            Self::UnsupportedProofType => "unsupported_proof_type",
+            Self::InactiveValidator => "inactive_validator",
+            Self::InvalidExecutionProof => "invalid_execution_proof",
         }
     }
 }

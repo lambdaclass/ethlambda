@@ -664,3 +664,27 @@ comes first. The validator client signs once, at the deadline
 (`SYNC_MESSAGE_DUE_BPS`, or its gloas variant), over the head root it then
 reads, and refuses to when that root is optimistic
 (`specs/bellatrix/optimistic-sync.md`).
+
+## Execution proofs are read from the cached head state, and only the mock engine exists
+
+EIP-8440 execution chain proofs (`--execution-proofs`) are verified against the
+head block's post-state and a proof engine.
+
+- **ethlambda:** the gossip rules read the head block's post-state from the
+  state cache only (`gossip::execution_proof::stateful_checks`,
+  `crates/blockchain/state_transition/src/beacon/gossip/execution_proof.rs`), and
+  `IGNORE` a proof whose block has a state on disk but not in the cache, as the
+  other topics do for their uncached states. A proof engine that cannot answer
+  is `IGNORE` as well, since nothing says the proof is bad. The only engine is
+  the mock (`--execution-proofs.mock`), which accepts a mock zkVM's output
+  whose public values are the SSZ encoding of the expected `PublicInput`, with
+  no cryptographic check.
+- **consensus-specs (PR #5725):** `validate_execution_proof_gossip` reads
+  `store.block_states[head_block_root]` directly, and `verify_execution_proof`
+  is answered by a proof engine given `hash_tree_root(public_input)`; the
+  guest programs shipped so far commit to the SSZ bytes instead, which is what
+  the mock compares.
+- **Equivalence:** a proof ignored for an uncached state is re-sent by its
+  prover's peers or submitted again, and is never rejected. The mock engine
+  proves nothing by design and is refused outside a devnet by the operator,
+  not the code: no recursive guest program exists yet, so no real engine can.

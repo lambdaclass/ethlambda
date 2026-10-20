@@ -151,6 +151,7 @@ pub fn wire_params(
     node_id: [u8; 32],
     node_key_supplied: bool,
     custody_group_count: u64,
+    execution_proofs: bool,
 ) -> eyre::Result<BeaconWireParams> {
     let chain = source.config().clone();
     let genesis = source.genesis();
@@ -275,6 +276,7 @@ pub fn wire_params(
             genesis_validators_root: genesis.genesis_validators_root,
             custody_columns,
             attestation_subnets,
+            execution_proofs,
         },
         fork_id,
     })
@@ -352,7 +354,7 @@ mod tests {
     #[test]
     fn the_wire_parameters_are_derived_offline() {
         let source = crate::network::NetworkSource::built_in_mainnet().unwrap();
-        let params = wire_params(&source, [0x11; 32], true, CUSTODY_REQUIREMENT)
+        let params = wire_params(&source, [0x11; 32], true, CUSTODY_REQUIREMENT, false)
             .expect("no network is needed");
         assert_eq!(params.wire.genesis_time, MAINNET_GENESIS_TIME);
         // The digest is whatever fork the wall clock lands in, so it is not
@@ -374,11 +376,11 @@ mod tests {
 
         let source = crate::network::NetworkSource::built_in_mainnet().unwrap();
 
-        let a = wire_params(&source, [0x11; 32], true, CUSTODY_REQUIREMENT)
+        let a = wire_params(&source, [0x11; 32], true, CUSTODY_REQUIREMENT, false)
             .expect("no network is needed");
         assert_eq!(a.wire.custody_columns.len(), sampling as usize);
 
-        let b = wire_params(&source, [0x22; 32], true, CUSTODY_REQUIREMENT)
+        let b = wire_params(&source, [0x22; 32], true, CUSTODY_REQUIREMENT, false)
             .expect("no network is needed");
         assert_ne!(a.wire.custody_columns, b.wire.custody_columns);
     }
@@ -390,8 +392,8 @@ mod tests {
     fn beacon_node_id_feeds_wire_params_a_valid_identity() {
         let node_id = beacon_node_id(&[0x33; 32]).expect("a well-formed key");
         let source = crate::network::NetworkSource::built_in_mainnet().unwrap();
-        let params =
-            wire_params(&source, node_id, true, CUSTODY_REQUIREMENT).expect("no network is needed");
+        let params = wire_params(&source, node_id, true, CUSTODY_REQUIREMENT, false)
+            .expect("no network is needed");
         let sampling = ethlambda_state_transition::beacon::das::sampling_size(
             ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT,
         );

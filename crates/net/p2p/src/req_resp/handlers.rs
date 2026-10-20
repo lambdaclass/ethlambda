@@ -2798,6 +2798,10 @@ pub(crate) mod tests {
             seen_envelopes: ethlambda_state_transition::beacon::gossip::SeenEnvelopes::new(
                 crate::SEEN_ENVELOPES_CAPACITY,
             ),
+            seen_execution_proofs: ethlambda_state_transition::beacon::gossip::SeenExecutionProofs::new(
+                crate::SEEN_EXECUTION_PROOFS_CAPACITY,
+            ),
+            execution_proof_engine: None,
             seen_payload_attestations:
                 ethlambda_state_transition::beacon::gossip::SeenPayloadAttestations::new(
                     crate::SEEN_PAYLOAD_ATTESTATIONS_CAPACITY,

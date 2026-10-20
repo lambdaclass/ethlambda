@@ -242,6 +242,28 @@ pub struct PtcDutyDto {
 
 /// `GET /eth/v1/beacon/blocks/head/root`: the root, and whether the head is
 /// one the execution client has not validated.
+/// `GET /eth/v1/beacon/headers/{block_id}`: the slot is all this client reads.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlockHeaderResponse {
+    pub data: BlockHeaderData,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlockHeaderData {
+    pub header: SignedBlockHeaderDto,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SignedBlockHeaderDto {
+    pub message: BlockHeaderMessageDto,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlockHeaderMessageDto {
+    #[serde(with = "quoted_u64")]
+    pub slot: u64,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct BlockRootResponse {
     /// `Option` and read as `false` when absent, for the reason
@@ -550,6 +572,12 @@ pub fn config_from_spec_response(value: &serde_json::Value) -> Result<Config> {
     // `Config` are the right answer for every network that predates it.
     if let Some(bps) = spec_u64(value, "ATTESTATION_DUE_BPS")? {
         config.attestation_due_bps = bps;
+    }
+    // The chain an execution proof's public input names. Absent keeps
+    // mainnet's, which is wrong on any other network, so a mock prover on a
+    // devnet needs the node to publish it (every client does).
+    if let Some(chain_id) = spec_u64(value, "DEPOSIT_CHAIN_ID")? {
+        config.deposit_chain_id = chain_id;
     }
     if let Some(bps) = spec_u64(value, "AGGREGATE_DUE_BPS")? {
         config.aggregate_due_bps = bps;

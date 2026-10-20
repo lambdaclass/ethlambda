@@ -21,6 +21,7 @@ use ethlambda_state_transition::beacon::helpers::accessors::get_block_root_at_sl
 use ethlambda_storage::{Chain, Store};
 use ethlambda_types::ShortRoot;
 use ethlambda_types::attestation::{AttestationData, SignedAttestation};
+use ethlambda_types::beacon::containers::execution_proof::SignedExecutionProof;
 use ethlambda_types::beacon::containers::{
     BeaconState, DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock, electra, gloas,
     phase0,
@@ -84,6 +85,9 @@ pub enum Topic {
     ExecutionPayloadGossip,
     ExecutionPayloadAvailable,
     ExecutionPayloadBid,
+    /// Beacon `execution_proof` (EIP-8440): a verified execution chain proof
+    /// was kept, with the proof as its payload.
+    ExecutionProof,
     PayloadAttestationMessage,
     FastConfirmation,
     ProposerPreferences,
@@ -117,6 +121,7 @@ impl Topic {
         Topic::ExecutionPayloadGossip,
         Topic::ExecutionPayloadAvailable,
         Topic::ExecutionPayloadBid,
+        Topic::ExecutionProof,
         Topic::PayloadAttestationMessage,
         Topic::FastConfirmation,
         Topic::ProposerPreferences,
@@ -159,6 +164,7 @@ impl Topic {
         Topic::ExecutionPayloadGossip,
         Topic::ExecutionPayloadAvailable,
         Topic::ExecutionPayloadBid,
+        Topic::ExecutionProof,
         Topic::PayloadAttestationMessage,
         Topic::FastConfirmation,
         Topic::ProposerPreferences,
@@ -202,6 +208,7 @@ impl Topic {
             Topic::ExecutionPayloadGossip => "execution_payload_gossip",
             Topic::ExecutionPayloadAvailable => "execution_payload_available",
             Topic::ExecutionPayloadBid => "execution_payload_bid",
+            Topic::ExecutionProof => "execution_proof",
             Topic::PayloadAttestationMessage => "payload_attestation_message",
             Topic::FastConfirmation => "fast_confirmation",
             Topic::ProposerPreferences => "proposer_preferences",
@@ -309,6 +316,9 @@ pub enum ChainEvent {
     BeaconAttestation(Box<BeaconAttestationEvent>),
     /// Beacon `data_column_sidecar`: a column this node custodies was stored.
     DataColumnSidecar(DataColumnSidecarEvent),
+    /// Beacon `execution_proof`: a verified EIP-8440 proof was kept. Boxed
+    /// like the attestation: a proof is up to 4 MiB.
+    ExecutionProof(Box<SignedExecutionProof>),
 }
 
 impl ChainEvent {
@@ -325,6 +335,7 @@ impl ChainEvent {
             ChainEvent::Aggregate { .. } => Topic::Aggregate,
             ChainEvent::ChainReorg { .. } | ChainEvent::BeaconChainReorg(_) => Topic::ChainReorg,
             ChainEvent::DataColumnSidecar(_) => Topic::DataColumnSidecar,
+            ChainEvent::ExecutionProof(_) => Topic::ExecutionProof,
         }
     }
 }
@@ -681,6 +692,16 @@ impl ChainEvents {
                 index: sidecar.index(),
                 slot: sidecar.slot(),
             }));
+    }
+
+    /// Beacon `execution_proof` (EIP-8440): a verified proof was kept. Behind
+    /// the subscriber check, since the payload clones a proof of up to 4 MiB.
+    pub(crate) fn publish_execution_proof(&self, proof: &SignedExecutionProof) {
+        if !self.bus.has_subscribers() {
+            return;
+        }
+        self.bus
+            .emit(ChainEvent::ExecutionProof(Box::new(proof.clone())));
     }
 }
 

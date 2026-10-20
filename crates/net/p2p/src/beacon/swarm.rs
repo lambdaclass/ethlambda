@@ -172,6 +172,9 @@ pub struct BeaconWireConfig {
     /// set, and a peer computes the same set from this node's id, so deriving
     /// it twice is how the two would come to disagree.
     pub attestation_subnets: Vec<u64>,
+    /// Whether this node verifies EIP-8440 execution proofs, and so joins
+    /// `execution_proof` under gloas digests.
+    pub execution_proofs: bool,
 }
 
 #[cfg(test)]
@@ -284,6 +287,7 @@ mod tests {
                 genesis_validators_root: Root::ZERO,
                 custody_columns: custody_columns.clone(),
                 attestation_subnets: Vec::new(),
+                execution_proofs: false,
             })),
         })
         .expect("swarm builds");

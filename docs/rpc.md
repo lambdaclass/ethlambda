@@ -229,6 +229,7 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `GET` | `/eth/v2/beacon/blocks/{block_id}` | JSON or SSZ | `SignedBeaconBlock` at `block_id` |
 | `GET` | `/eth/v1/beacon/blocks/{block_id}/root` | JSON | That block's root |
 | `GET` | `/eth/v1/beacon/execution_payload_envelopes/{block_id}` | JSON or SSZ | Gloas `SignedExecutionPayloadEnvelope` of that block (see below) |
+| `GET` | `/eth/v1/beacon/execution_proofs/{block_id}` | JSON or SSZ | The verified EIP-8440 `SignedExecutionProof`s of that block (see below) |
 | `GET` | `/eth/v1/beacon/headers/{block_id}` | JSON | `SignedBeaconBlockHeader`, plus `canonical` |
 | `GET` | `/eth/v2/debug/beacon/states/{state_id}` | JSON or SSZ | `BeaconState` at `state_id` |
 | `GET` | `/eth/v1/beacon/states/{state_id}/finality_checkpoints` | JSON | That state's three checkpoints |
@@ -270,6 +271,7 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `GET` | `/eth/v1/validator/execution_payload_envelopes/{slot}/{beacon_block_root}` | SSZ or JSON | The unsigned envelope `produceBlockV4` built (gloas) |
 | `POST` | `/eth/v2/beacon/blocks` | *(status only)* | Gossip and import a signed fulu or gloas block (`publishBlockV2`; JSON or SSZ body) |
 | `POST` | `/eth/v1/beacon/execution_payload_envelopes` | *(status only)* | Gossip a signed envelope and its data columns (gloas; JSON or SSZ body) |
+| `POST` | `/eth/v1/beacon/execution_proofs` | *(status only)* | Verify, keep and gossip signed EIP-8440 execution proofs (JSON array or SSZ list; `503` without `--execution-proofs`) |
 | `POST` | `/eth/v1/validator/prepare_beacon_proposer` | *(status only)* | Record each validator's fee recipient for block production (see below) |
 | `GET` | `/eth/v1/events` | SSE | Live stream of chain events (see below) |
 | `POST` | `/eth/v1/beacon/execution_payload_bids` | *(status only)* | Validate, pool and gossip a builder's `SignedExecutionPayloadBid` (gloas; JSON or SSZ body) |
@@ -752,6 +754,25 @@ received and a pre-gloas block (which has no envelope; the specification's
 error list names no other status for it) are indistinguishable here. A caller
 must read `404` as "unknown to this node", not as "the payload is empty".
 
+### `GET /eth/v1/beacon/execution_proofs/{block_id}`
+
+EIP-8440 execution chain proofs, for a node that cannot execute and wants to
+know which payloads a proof covers: ethrex's partial stateful node reads this
+route. The answer is every proof this node verified for the block, in proof
+type order, as `{execution_optimistic, finalized, data: [SignedExecutionProof]}`
+JSON or as an SSZ list on `Accept: application/octet-stream`. No `version`:
+the container is the same at every fork. A known block with no proof yet
+answers an empty list; a block this node does not hold is a `404`. Proofs of
+blocks below the finalized slot are dropped, so a reader has an epoch of slots
+to ask for a finalized block's.
+
+The node holds proofs only with `--execution-proofs`. The matching `POST` takes
+the proofs a prover submits, runs the checks gossip applies to a peer's (the
+head block is held with its state, the prover is an active validator who
+signed it, the proof engine takes the proof) on a blocking thread, keeps and
+gossips what passes, and reports the rest by position in an
+`IndexedErrorMessage`. Without a proof engine it answers `503`.
+
 ### `execution_optimistic` under gloas
 
 Before gloas a block's payload ran inside the block, so the flag is whether the
@@ -871,6 +892,7 @@ these are ever sent:
 | `chain_reorg` | `{"slot":"200", "depth":"50", "old_head_block":"0x…", "new_head_block":"0x…", "old_head_state":"0x…", "new_head_state":"0x…", "epoch":"2", "execution_optimistic":false}` | The new head does not descend from the previous one |
 | `attestation` | the aggregate's `Attestation` | An aggregate passed the `beacon_aggregate_and_proof` rules: accepted from gossip, or submitted through `POST /eth/v2/validator/aggregate_and_proofs` |
 | `data_column_sidecar` | `{"block_root":"0x…", "index":"1", "slot":"1"}` | A column this node custodies is stored, from any source |
+| `execution_proof` | the `SignedExecutionProof` | A verified EIP-8440 execution proof was kept, from gossip or `POST /eth/v1/beacon/execution_proofs` (`--execution-proofs` only) |
 
 Never emitted: `single_attestation` (subnet votes are verified and relayed but
 never reach the chain actor), the operation topics (`voluntary_exit`,

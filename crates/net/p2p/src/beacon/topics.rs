@@ -60,6 +60,9 @@ pub const PAYLOAD_ATTESTATION_MESSAGE: &str = "payload_attestation_message";
 pub const EXECUTION_PAYLOAD_BID: &str = "execution_payload_bid";
 /// Topic kind for gloas proposer preferences.
 pub const PROPOSER_PREFERENCES: &str = "proposer_preferences";
+/// Topic kind for EIP-8440 execution chain proofs. Subscribed under gloas
+/// digests, and only by a node that verifies them.
+pub const EXECUTION_PROOF: &str = "execution_proof";
 
 /// The topic kinds gloas adds to [`SUBSCRIBED_TOPIC_KINDS`], subscribed from
 /// the gloas digest on and never under an earlier one.
@@ -105,6 +108,7 @@ pub fn metric_kind(kind: &str) -> Option<&'static str> {
     if let Some(&global) = SUBSCRIBED_TOPIC_KINDS
         .iter()
         .chain(GLOAS_TOPIC_KINDS.iter())
+        .chain(std::iter::once(&EXECUTION_PROOF))
         .find(|&&known| known == kind)
     {
         return Some(global);
@@ -280,6 +284,7 @@ impl BeaconTopics {
         fork_digest: ForkDigest,
         column_subnets: &[u64],
         attestation_subnets: &[u64],
+        execution_proofs: bool,
     ) -> Self {
         match fork {
             ForkName::Phase0
@@ -290,13 +295,15 @@ impl BeaconTopics {
             | ForkName::Electra
             | ForkName::Fulu => Self::new(fork_digest, column_subnets, attestation_subnets),
             // Gloas adds the payload envelope and the payload attestation
-            // topics, which the follower consumes.
-            ForkName::Gloas => Self::with_extra_kinds(
-                fork_digest,
-                &GLOAS_TOPIC_KINDS,
-                column_subnets,
-                attestation_subnets,
-            ),
+            // topics, which the follower consumes, and `execution_proof` for
+            // a node that verifies EIP-8440 proofs.
+            ForkName::Gloas => {
+                let mut kinds = GLOAS_TOPIC_KINDS.to_vec();
+                if execution_proofs {
+                    kinds.push(EXECUTION_PROOF);
+                }
+                Self::with_extra_kinds(fork_digest, &kinds, column_subnets, attestation_subnets)
+            }
             ForkName::Lean => {
                 unreachable!("a beacon topic's fork is never Lean: it is absent from ForkName::ALL")
             }
@@ -393,7 +400,7 @@ mod tests {
     #[test]
     fn gloas_adds_the_envelope_vote_bid_and_preferences_topics() {
         let fork_topics = |fork| {
-            BeaconTopics::for_fork(fork, MAINNET, &[], &[])
+            BeaconTopics::for_fork(fork, MAINNET, &[], &[], false)
                 .topics
                 .iter()
                 .map(|topic| topic.to_string())
@@ -659,5 +666,19 @@ mod tests {
             metric_kind(SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF),
             Some(SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF)
         );
+    }
+
+    #[test]
+    fn execution_proofs_join_the_gloas_topics_only_when_asked() {
+        let without = BeaconTopics::for_fork(ForkName::Gloas, MAINNET, &[], &[], false);
+        let with = BeaconTopics::for_fork(ForkName::Gloas, MAINNET, &[], &[], true);
+        let fulu = BeaconTopics::for_fork(ForkName::Fulu, MAINNET, &[], &[], true);
+        let name = topic_name(MAINNET, EXECUTION_PROOF);
+        let holds = |topics: &BeaconTopics| topics.topics.iter().any(|t| t.to_string() == name);
+        assert!(!holds(&without));
+        assert!(holds(&with));
+        assert!(!holds(&fulu), "the topic is gloas-only");
+        assert_eq!(with.topics.len(), without.topics.len() + 1);
+        assert_eq!(metric_kind(EXECUTION_PROOF), Some(EXECUTION_PROOF));
     }
 }

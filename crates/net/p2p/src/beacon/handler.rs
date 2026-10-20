@@ -256,6 +256,7 @@ mod tests {
             metadata_seq_number: 0,
             custody_columns: Vec::new(),
             attestation_subnets: Vec::new(),
+            execution_proofs: false,
             sync_committee_subnets: Default::default(),
         }
     }

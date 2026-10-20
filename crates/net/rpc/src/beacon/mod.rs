@@ -23,6 +23,7 @@ pub(crate) mod builders;
 pub(crate) mod config;
 pub(crate) mod envelopes;
 pub(crate) mod events;
+pub(crate) mod execution_proofs;
 pub(crate) mod genesis;
 pub(crate) mod gloas_proposal;
 pub(crate) mod graffiti;
@@ -184,6 +185,7 @@ pub(crate) fn routes(version: &'static str, peer_id: String) -> Router<Store> {
         .merge(blocks::routes())
         .merge(events::routes())
         .merge(envelopes::routes())
+        .merge(execution_proofs::routes())
         .merge(headers::routes())
         .merge(states::routes())
         .merge(genesis::routes())

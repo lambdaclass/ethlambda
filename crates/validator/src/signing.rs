@@ -8,8 +8,9 @@
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::constants::{
     DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_BUILDER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
-    DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_EXECUTION_PROOF,
+    DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE,
+    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
 };
 use ethlambda_types::beacon::containers::altair::{
     ContributionAndProof, SyncAggregatorSelectionData,
@@ -295,6 +296,35 @@ impl SigningContext {
         slot: Slot,
     ) -> Result<BlsSignature> {
         self.sign_root(store, pubkey, self.envelope_signing_root(envelope, slot))
+    }
+
+    /// The root an EIP-8440 execution proof's prover signature is computed
+    /// over: the proof under the execution proof domain at `epoch`, the epoch
+    /// of its head block's post-state, which is what the beacon node verifies
+    /// against.
+    pub fn execution_proof_signing_root(
+        &self,
+        proof: &ethlambda_types::beacon::containers::execution_proof::ExecutionProof,
+        epoch: Epoch,
+    ) -> Root {
+        let domain = self.domain(DOMAIN_EXECUTION_PROOF, epoch);
+        compute_signing_root(proof.hash_tree_root(), domain)
+    }
+
+    /// Sign an execution proof on behalf of `pubkey`. Not slashable; the
+    /// beacon node takes one proof per block and type from a prover.
+    pub fn sign_execution_proof(
+        &self,
+        store: &ValidatorStore,
+        pubkey: &BlsPubkey,
+        proof: &ethlambda_types::beacon::containers::execution_proof::ExecutionProof,
+        epoch: Epoch,
+    ) -> Result<BlsSignature> {
+        self.sign_root(
+            store,
+            pubkey,
+            self.execution_proof_signing_root(proof, epoch),
+        )
     }
 
     /// Sign a payload timeliness committee vote on behalf of `pubkey`.

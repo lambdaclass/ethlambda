@@ -36,6 +36,7 @@ pub mod attestation_guard;
 pub mod beacon_node;
 pub mod duties;
 pub mod error;
+pub mod execution_prover;
 pub mod http_api;
 pub mod keys;
 pub mod metrics;
@@ -95,6 +96,10 @@ pub struct ValidatorConfig {
     /// Bind address for the keymanager API. `None` when `--enable-keymanager`
     /// was not passed, in which case it is never spawned.
     pub keymanager: Option<std::net::SocketAddr>,
+    /// Submit a mock EIP-8440 execution proof for each new full head, signed
+    /// by one of this client's validators. Devnets only: see
+    /// [`execution_prover`].
+    pub mock_execution_prover: bool,
 }
 
 /// Run the validator client until the process is stopped.
@@ -190,6 +195,12 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     let attestation = AttestationService::new(beacon_node.clone(), context.clone());
     let aggregation = AggregationService::new(beacon_node.clone(), context.clone());
     let payload_attestation = PayloadAttestationService::new(beacon_node.clone(), context.clone());
+    let execution_prover = config.mock_execution_prover.then(|| {
+        warn!(
+            "Mock execution prover enabled: this client will sign EIP-8440 execution proofs that              prove nothing. For devnets only."
+        );
+        execution_prover::ExecutionProverService::new(beacon_node.clone(), context.clone())
+    });
     let sync_committee = SyncCommitteeService::new(beacon_node.clone(), context.clone());
     let proposal = ProposalService::new(beacon_node.clone(), context.clone(), settings.clone());
 
@@ -312,6 +323,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             &aggregation,
             &payload_attestation,
             &sync_committee,
+            execution_prover.as_ref(),
             &clock,
             slot,
             &slot_duties,
@@ -341,6 +353,7 @@ async fn serve_slot_duties<B: BeaconNodeApi>(
     aggregation: &AggregationService<B>,
     payload_attestation: &PayloadAttestationService<B>,
     sync_committee: &SyncCommitteeService<B>,
+    execution_prover: Option<&execution_prover::ExecutionProverService<B>>,
     clock: &SlotClock,
     slot: u64,
     slot_duties: &[crate::beacon_node::dto::AttesterDutyDto],
@@ -362,10 +375,49 @@ async fn serve_slot_duties<B: BeaconNodeApi>(
             payload_attest(payload_attestation, clock, slot, committee, store).await;
         }
     };
+    // The mock prover runs at the payload attestation offset too: by then the
+    // node has applied the slot's envelope if it is going to, and the head is
+    // what this slot's proof should name.
+    let prove = async {
+        if let Some(prover) = execution_prover
+            && clock.is_gloas(slot)
+        {
+            tokio::time::sleep(clock.until_payload_attestation(slot, SystemTime::now())).await;
+            prove_head(prover, clock, slot, store).await;
+        }
+    };
     tokio::join!(
         attest_then_ptc,
-        sync_committee_duty(sync_committee, clock, slot, sync_duties, store)
+        sync_committee_duty(sync_committee, clock, slot, sync_duties, store),
+        prove
     );
+}
+
+/// Run the mock execution prover for `slot`, bounded by the end of the slot
+/// like every other duty. Failures are logged and counted, never propagated:
+/// a missed proof costs nothing but a slot of coverage.
+async fn prove_head<B: BeaconNodeApi>(
+    prover: &execution_prover::ExecutionProverService<B>,
+    clock: &SlotClock,
+    slot: u64,
+    store: &RwLock<ValidatorStore>,
+) {
+    let budget = clock.remaining_in(slot, SystemTime::now());
+    match tokio::time::timeout(budget, prover.prove_head(store)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => {
+            error!(%slot, %err, "Failed to submit a mock execution proof for this slot");
+            metrics::inc_execution_proof_failures();
+        }
+        Err(_) => {
+            warn!(
+                %slot,
+                budget_ms = budget.as_millis() as u64,
+                "Mock execution proof duty ran past the end of its slot and was abandoned"
+            );
+            metrics::inc_execution_proof_failures();
+        }
+    }
 }
 
 /// Run one slot's sync committee duty: sign the head at the message deadline,
@@ -1190,6 +1242,7 @@ mod tests {
             &AggregationService::new(node.clone(), context.clone()),
             &PayloadAttestationService::new(node.clone(), context.clone()),
             &SyncCommitteeService::new(node.clone(), context.clone()),
+            None,
             &clock,
             slot,
             &[],
@@ -1328,6 +1381,7 @@ mod tests {
             &AggregationService::new(node.clone(), context.clone()),
             &PayloadAttestationService::new(node.clone(), context.clone()),
             &SyncCommitteeService::new(node.clone(), context.clone()),
+            None,
             &clock,
             slot,
             &[],
@@ -1364,6 +1418,7 @@ mod tests {
             &AggregationService::new(node.clone(), context.clone()),
             &PayloadAttestationService::new(node.clone(), context.clone()),
             &SyncCommitteeService::new(node.clone(), context.clone()),
+            None,
             &clock,
             5,
             &[],

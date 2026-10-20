@@ -238,6 +238,13 @@ struct ChainSetup {
     /// What to spawn this chain's actor with: lean's validator keys and duty
     /// configuration, or beacon's custody columns and data-availability flag.
     chain: ChainActor,
+    /// What verifies EIP-8440 execution proofs, for gossip and the Beacon
+    /// API's submission route. `None` takes no proofs; always `None` on lean.
+    execution_proof_engine: Option<
+        std::sync::Arc<
+            dyn ethlambda_state_transition::beacon::execution_proofs::ExecutionProofEngine,
+        >,
+    >,
 }
 
 /// Boot the node, on whichever chain [`Options::network`] names.
@@ -538,6 +545,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                 store,
                 node_names,
                 chain: ChainActor::Lean(validator_keys, blockchain_config),
+                execution_proof_engine: None,
             }
         }
         // The Ethereum Beacon Chain follower: the wire plus a duty-free chain
@@ -567,12 +575,37 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             // the same computation, so the two cannot disagree about this
             // node's identity.
             let node_id = beacon::beacon_node_id(&node_p2p_key)?;
+            let execution_proofs = mainnet.execution_proofs || mainnet.execution_proofs_mock;
             let params = beacon::wire_params(
                 &source,
                 node_id,
                 common.node_key.is_some(),
                 mainnet.custody_group_count,
+                execution_proofs,
             )?;
+
+            // The proof engine, before the swarm is built: the topic is joined
+            // only when there is one. A real engine for chain proofs does not
+            // exist yet (no recursive guest program does), so the mock is the
+            // only choice, and it is said loudly.
+            let execution_proof_engine: Option<
+                std::sync::Arc<
+                    dyn ethlambda_state_transition::beacon::execution_proofs::ExecutionProofEngine,
+                >,
+            > = match (execution_proofs, mainnet.execution_proofs_mock) {
+                (false, _) => None,
+                (true, true) => {
+                    warn!(
+                        "Accepting MOCK execution proofs: every proof whose public values name                          the right blocks is taken as valid with no cryptographic check. For                          devnets only."
+                    );
+                    Some(std::sync::Arc::new(
+                        ethlambda_state_transition::beacon::execution_proofs::MockExecutionProofEngine,
+                    ))
+                }
+                (true, false) => eyre::bail!(
+                    "--execution-proofs needs a proof engine, and none exists yet for execution                      chain proofs; on a devnet pass --execution-proofs.mock"
+                ),
+            };
 
             // Cloned ahead of the move into `WireConfig::Beacon` below: the
             // chain actor needs its own copy to gate fulu import on, the same
@@ -649,6 +682,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                         .safe_slots_to_import_optimistically,
                     anchor_envelope_urls: clean_checkpoint_urls.clone(),
                 },
+                execution_proof_engine,
             }
         }
     };
@@ -704,6 +738,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     let builder_market =
         ethlambda_state_transition::beacon::builder_market::SharedBuilderMarket::default();
 
+    let execution_proof_engine = setup.execution_proof_engine.clone();
     // `P2P::spawn` starts the discv5 server from this and owns the resulting
     // handle.
     let p2p = P2P::spawn(
@@ -714,6 +749,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         payload_attestation_pool.clone(),
         sync_committee_pool.clone(),
         builder_market.clone(),
+        execution_proof_engine.clone(),
     )
     .await
     .wrap_err("failed to start discv5 discovery")?;
@@ -760,6 +796,9 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     engine: rpc_engine,
                     events: rpc_events,
                     client_version: version::engine_client_version(),
+                    execution_proof_engine: ethlambda_rpc::ProofEngineHandle(
+                        execution_proof_engine.clone(),
+                    ),
                 },
                 local_peer_id,
                 rpc_shutdown,

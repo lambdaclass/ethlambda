@@ -400,6 +400,30 @@ pub fn inc_payload_attestation_failures() {
     PAYLOAD_ATTESTATION_FAILURES_TOTAL.inc();
 }
 
+static EXECUTION_PROOFS_PUBLISHED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_execution_proofs_published_total",
+        "Mock execution proofs the beacon node accepted"
+    )
+    .unwrap()
+});
+
+static EXECUTION_PROOF_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_execution_proof_failures_total",
+        "Slots whose mock execution proof duty failed"
+    )
+    .unwrap()
+});
+
+pub fn inc_execution_proofs_published(count: u64) {
+    EXECUTION_PROOFS_PUBLISHED_TOTAL.inc_by(count);
+}
+
+pub fn inc_execution_proof_failures() {
+    EXECUTION_PROOF_FAILURES_TOTAL.inc();
+}
+
 pub fn inc_sync_committee_messages_published(count: u64) {
     SYNC_COMMITTEE_MESSAGES_PUBLISHED_TOTAL.inc_by(count);
 }

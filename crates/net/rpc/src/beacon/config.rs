@@ -229,6 +229,7 @@ fn extra_entries() -> impl Iterator<Item = (&'static str, String)> {
         DOMAIN_PTC_ATTESTER,
         DOMAIN_PROPOSER_PREFERENCES,
         DOMAIN_BUILDER_DEPOSIT,
+        DOMAIN_EXECUTION_PROOF,
     );
 
     // One-byte constants (withdrawal prefixes and execution request types), so
@@ -468,6 +469,7 @@ mod tests {
         assert_eq!(data["DOMAIN_PTC_ATTESTER"], "0x0c000000");
         assert_eq!(data["DOMAIN_PROPOSER_PREFERENCES"], "0x0d000000");
         assert_eq!(data["DOMAIN_BUILDER_DEPOSIT"], "0x0e000000");
+        assert_eq!(data["DOMAIN_EXECUTION_PROOF"], "0x0f000000");
         assert_eq!(data["DEPOSIT_REQUEST_TYPE"], "0x00");
         assert_eq!(data["CONSOLIDATION_REQUEST_TYPE"], "0x02");
         assert_eq!(data["BUILDER_WITHDRAWAL_PREFIX"], "0xb0");

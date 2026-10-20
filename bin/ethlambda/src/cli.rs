@@ -307,6 +307,21 @@ pub(crate) struct MainnetOptions {
     /// `eth-clients` publishes and kurtosis mounts at `/network-configs`.
     #[arg(long, default_value = crate::network::DEFAULT_NETWORK)]
     pub(crate) network: String,
+
+    /// Take EIP-8440 execution chain proofs: join the `execution_proof` gossip
+    /// topic, verify each proof's prover signature and the proof itself, keep
+    /// one verified proof per block and type, and serve them on
+    /// `GET /eth/v1/beacon/execution_proofs/{block_id}` and the
+    /// `execution_proof` event. Needs a proof engine, and the only one so far
+    /// is `--execution-proofs.mock`.
+    #[arg(long = "execution-proofs", default_value_t = false)]
+    pub(crate) execution_proofs: bool,
+
+    /// Accept mock execution proofs: a mock zkVM's output whose public values
+    /// name the right blocks and chain, with no cryptographic check. Implies
+    /// `--execution-proofs`. Devnets only: it proves nothing.
+    #[arg(long = "execution-proofs.mock", default_value_t = false)]
+    pub(crate) execution_proofs_mock: bool,
 }
 
 /// Flags only the lean chain takes.

@@ -422,6 +422,23 @@ pub trait BeaconNodeApi: Send + Sync {
         messages: &[gloas::PayloadAttestationMessage],
     ) -> Result<usize>;
 
+    /// The slot of the beacon block `root`, or `None` when the node does not
+    /// hold it (404), which is an ordinary outcome and not an error.
+    async fn block_slot(&self, root: Root) -> Result<Option<Slot>>;
+
+    /// Whether the node holds the verified execution payload envelope of the
+    /// block `root`. 404 is `false`, not an error: a block whose payload has
+    /// not arrived, or was withheld, has none.
+    async fn has_execution_payload_envelope(&self, root: Root) -> Result<bool>;
+
+    /// Submit signed EIP-8440 execution chain proofs for the node to verify
+    /// and gossip. Returns how many it accepted, with the partial-success
+    /// reading of [`Self::submit_attestations`].
+    async fn submit_execution_proofs(
+        &self,
+        proofs: &[ethlambda_types::beacon::containers::execution_proof::SignedExecutionProof],
+    ) -> Result<usize>;
+
     /// Submits signed attestations to the node's pool, so they reach gossip.
     /// `fork_name` names the fork the attestations were produced under, since
     /// the endpoint requires it as a header rather than inferring it.

@@ -78,6 +78,7 @@ mod bls_fixtures;
 pub mod builder_market;
 pub mod das;
 pub mod data_columns;
+pub mod execution_proofs;
 pub mod fork_choice;
 pub mod genesis;
 pub mod gloas_block_production;

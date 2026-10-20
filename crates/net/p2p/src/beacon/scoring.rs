@@ -863,6 +863,7 @@ mod tests {
                 genesis_validators_root: Root::ZERO,
                 custody_columns: vec![3],
                 attestation_subnets: vec![5],
+                execution_proofs: false,
             },
         ))))
         .expect("beacon swarm builds");

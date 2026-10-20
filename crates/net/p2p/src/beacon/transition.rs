@@ -149,6 +149,7 @@ pub(crate) fn apply(server: &mut P2PServer, epoch: Epoch) -> Changes {
             entry.digest,
             &column_subnets,
             &wire.attestation_subnets,
+            wire.execution_proofs,
         );
         for topic in &joined.topics {
             server.swarm_handle.subscribe(topic.clone());

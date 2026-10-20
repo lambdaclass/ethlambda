@@ -258,6 +258,8 @@ fn handle_beacon_gossip(
         triage_envelope(server, payload)
     } else if kind == beacon_topics::PAYLOAD_ATTESTATION_MESSAGE {
         triage_payload_attestation(server, payload)
+    } else if kind == beacon_topics::EXECUTION_PROOF {
+        triage_execution_proof(server, payload)
     } else if matches!(
         kind,
         beacon_topics::VOLUNTARY_EXIT
@@ -561,6 +563,48 @@ fn triage_payload_attestation(server: &P2PServer, payload: &[u8]) -> Dispatch {
         return Dispatch::Report(outcome);
     }
     Dispatch::Validate(Validated::PayloadAttestation(message))
+}
+
+/// Decode an EIP-8440 `execution_proof` and run its cheap gossip checks. Same
+/// shape as [`triage_block`], with the topic's size cap applied before
+/// decoding, as the bid's is: a proof is the largest message on the wire
+/// after a block.
+fn triage_execution_proof(server: &P2PServer, payload: &[u8]) -> Dispatch {
+    const KIND: &str = beacon_topics::EXECUTION_PROOF;
+    if payload.len() > ethlambda_types::beacon::constants::MAX_SIGNED_EXECUTION_PROOF_SIZE {
+        metrics::inc_beacon_gossip(KIND, "decode_failed");
+        debug!(
+            kind = KIND,
+            bytes = payload.len(),
+            "Beacon gossip payload over the size cap"
+        );
+        return Dispatch::Report(Outcome::Reject(RejectReason::Malformed));
+    }
+    let proof = match beacon_decode::decode_signed_execution_proof(payload) {
+        Ok(proof) => proof,
+        Err(err) => {
+            metrics::inc_beacon_gossip(KIND, "decode_failed");
+            debug!(kind = KIND, %err, bytes = payload.len(), "Beacon gossip decode failed");
+            return Dispatch::Report(Outcome::Reject(RejectReason::Decode));
+        }
+    };
+    metrics::inc_beacon_gossip(KIND, "decoded");
+    debug!(
+        proof_type = proof.message.proof_type,
+        validator = proof.validator_index,
+        head = %ShortRoot(&proof.message.head_block_root.0),
+        bytes = payload.len(),
+        "Beacon execution proof decoded"
+    );
+    if let Err(outcome) =
+        gossip::execution_proof::cheap_checks(&server.seen_execution_proofs, &server.store, &proof)
+    {
+        return Dispatch::Report(outcome);
+    }
+    Dispatch::Validate(Validated::ExecutionProof {
+        proof: Box::new(proof),
+        engine: server.execution_proof_engine.clone(),
+    })
 }
 
 /// Decode one of the four operation topics (`voluntary_exit`,
@@ -1136,6 +1180,55 @@ pub async fn publish_payload_attestation_message(
             .inspect_err(
                 |err| error!(%err, "Failed to hand the published payload attestation to the chain"),
             );
+    }
+}
+
+/// Gossip an execution proof the Beacon API received on `execution_proof`,
+/// under the digest of its head block's slot (a proof names no slot of its
+/// own), and hand it to the chain actor, which gossip never does for a node's
+/// own message. The seen cache is marked so a peer's echo is ignored.
+pub async fn publish_execution_proof(
+    server: &mut P2PServer,
+    proof: Box<ethlambda_types::beacon::containers::execution_proof::SignedExecutionProof>,
+) {
+    let head = proof.message.head_block_root;
+    let Some(beacon) = server.wire.beacon() else {
+        error!("An execution proof reached a lean node; dropping it");
+        return;
+    };
+    let Some((slot, _)) = server.store.block_slot_and_state_root(&head) else {
+        warn!(
+            head = %ShortRoot(&head.0),
+            "Execution proof names a block this node does not hold; not publishing"
+        );
+        return;
+    };
+    let Some(digest) = beacon.publish_digest(slot) else {
+        warn!(
+            slot,
+            "No held fork digest covers this execution proof's block; not publishing"
+        );
+        return;
+    };
+    let topic = IdentTopic::new(beacon_topics::topic_name(
+        digest,
+        beacon_topics::EXECUTION_PROOF,
+    ));
+    server
+        .swarm_handle
+        .publish(topic, compress_message(&proof.to_ssz()));
+    server.seen_execution_proofs.record(&proof);
+    info!(
+        slot,
+        proof_type = proof.message.proof_type,
+        validator = proof.validator_index,
+        head = %ShortRoot(&head.0),
+        "Published execution proof to gossipsub"
+    );
+    if let Some(ref blockchain) = server.blockchain {
+        let _ = blockchain.new_execution_proof(proof).inspect_err(
+            |err| error!(%err, "Failed to hand the published execution proof to the chain"),
+        );
     }
 }
 

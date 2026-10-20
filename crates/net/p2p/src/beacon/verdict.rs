@@ -18,6 +18,7 @@ use std::time::Instant;
 
 use ethlambda_network_api::{AggregateArrival, BlockAnnouncement, BlockArrival, BlockSource};
 use ethlambda_state_transition::beacon::builder_market::SharedBuilderMarket;
+use ethlambda_state_transition::beacon::execution_proofs::ExecutionProofEngine;
 use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome};
 use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCacheExt as _;
 use ethlambda_storage::{CacheKey, Store};
@@ -25,6 +26,7 @@ use ethlambda_types::beacon::containers::altair::{
     SignedContributionAndProof, SyncCommitteeMessage,
 };
 use ethlambda_types::beacon::containers::electra::{self, SingleAttestation};
+use ethlambda_types::beacon::containers::execution_proof::SignedExecutionProof;
 use ethlambda_types::beacon::containers::gloas::{
     PayloadAttestationMessage, SignedExecutionPayloadBid, SignedExecutionPayloadEnvelope,
     SignedProposerPreferences,
@@ -97,6 +99,13 @@ pub(crate) enum Validated {
     ProposerPreferences(Box<SignedProposerPreferences>),
     /// A gloas `payload_attestation_message`.
     PayloadAttestation(PayloadAttestationMessage),
+    /// An EIP-8440 `execution_proof`. Carries the proof engine because
+    /// `stateful_checks` receives only the store, as the bid carries its
+    /// market. Boxed: a proof is up to 4 MiB.
+    ExecutionProof {
+        proof: Box<SignedExecutionProof>,
+        engine: Option<std::sync::Arc<dyn ExecutionProofEngine>>,
+    },
     /// One of the four operation topics. Boxed like the other wide payloads.
     Operation(Box<BeaconOperation>),
     /// A `sync_committee_{subnet_id}` message.
@@ -121,6 +130,9 @@ impl Validated {
     /// them.
     fn stateful_checks(&mut self, store: &Store) -> Outcome {
         match self {
+            Self::ExecutionProof { proof, engine } => {
+                gossip::execution_proof::stateful_checks(store, proof, engine.as_deref())
+            }
             Self::Block { block, block_root } => {
                 gossip::block::stateful_checks(store, block, *block_root)
             }
@@ -178,6 +190,7 @@ impl Validated {
     /// another verdict recorded one first.
     fn record_seen(&self, server: &mut P2PServer) -> bool {
         match self {
+            Self::ExecutionProof { proof, .. } => server.seen_execution_proofs.record(proof),
             Self::Block { block, block_root } => {
                 server
                     .seen_blocks
@@ -388,10 +401,16 @@ impl Validated {
                     .new_payload_attestation_message(message, arrival)
                     .inspect_err(|err| warn!(%err, "Failed to forward a payload attestation"));
             }
+            Self::ExecutionProof { proof, .. } if outcome == Outcome::Accept => {
+                let _ = blockchain
+                    .new_execution_proof(proof)
+                    .inspect_err(|err| warn!(%err, "Failed to forward an execution proof"));
+            }
             Self::Aggregate { .. }
             | Self::Attestation { .. }
             | Self::Envelope(_)
             | Self::PayloadAttestation(_)
+            | Self::ExecutionProof { .. }
             | Self::Operation(_)
             | Self::SyncCommitteeMessage { .. }
             | Self::SyncContribution(_)
@@ -430,6 +449,7 @@ fn record_liveness(server: &P2PServer, object: &Validated) {
         | Validated::Column(_)
         | Validated::Envelope(_)
         | Validated::PayloadAttestation(_)
+        | Validated::ExecutionProof { .. }
         | Validated::Operation(_)
         | Validated::SyncCommitteeMessage { .. }
         | Validated::SyncContribution(_)
@@ -539,6 +559,15 @@ impl Message for GossipVerdict {
 /// valid". Any other outcome passes through unrecorded, since only an Accept
 /// is a candidate for the seen cache in the first place.
 fn settle(server: &mut P2PServer, outcome: Outcome, object: &Validated) -> Outcome {
+    // An execution proof's prover gets one attempt per block and type whether
+    // or not the proof engine took its proof: the specification marks both
+    // seen once the signature verified, before the engine runs.
+    if let Validated::ExecutionProof { proof, .. } = object
+        && outcome != Outcome::Accept
+        && gossip::execution_proof::authenticated(outcome)
+    {
+        server.seen_execution_proofs.record(proof);
+    }
     if outcome == Outcome::Accept && !object.record_seen(server) {
         Outcome::Ignore(IgnoreReason::AlreadySeen)
     } else {
@@ -608,6 +637,7 @@ fn permits_for<'a>(
         Validated::Aggregate { .. }
         | Validated::Attestation { .. }
         | Validated::PayloadAttestation(_)
+        | Validated::ExecutionProof { .. }
         | Validated::Operation(_) => &server.attestation_validation_permits,
         Validated::SyncCommitteeMessage { .. } | Validated::SyncContribution(_) => {
             &server.sync_validation_permits
@@ -1169,6 +1199,12 @@ mod tests {
             _arrival: BlockArrival,
         ) -> Result<(), ActorError> {
             let _ = self.0.send(Sent::Envelope);
+            Ok(())
+        }
+        fn new_execution_proof(
+            &self,
+            _proof: Box<ethlambda_types::beacon::containers::execution_proof::SignedExecutionProof>,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
             Ok(())
         }
         fn new_payload_attestation_message(

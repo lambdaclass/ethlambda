@@ -38,7 +38,7 @@ use libssz::SszDecode as _;
 
 use crate::beacon_node::block_contents::ProducedBlock;
 use crate::beacon_node::dto::{
-    AttestationDataDto, AttestationDto, AttesterDutyDto, BlockRootResponse,
+    AttestationDataDto, AttestationDto, AttesterDutyDto, BlockHeaderResponse, BlockRootResponse,
     CommitteeSubscriptionDto, DataResponse, DutiesResponse, GenesisDto, IndexedErrorResponse,
     ProposerDutyDto, ProposerPreparationDto, PtcDutyDto, SignedAggregateAndProofOutDto,
     SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto, SyncingDto, ValidatorEntryDto,
@@ -788,6 +788,85 @@ impl BeaconNodeApi for HttpBeaconNode {
             )));
         }
         Ok(Some(response.data))
+    }
+
+    async fn block_slot(&self, root: Root) -> Result<Option<Slot>> {
+        let url = format!("{}/eth/v1/beacon/headers/0x{root:x}", self.base_url);
+        debug!(%url, "Beacon API GET");
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|err| Error::BeaconNode {
+                url: url.clone(),
+                failure: BeaconNodeFailure::classify(&err),
+                detail: err.to_string(),
+            })?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let response: BlockHeaderResponse = Self::decode(response).await?;
+        Ok(Some(response.data.header.message.slot))
+    }
+
+    async fn has_execution_payload_envelope(&self, root: Root) -> Result<bool> {
+        let url = format!(
+            "{}/eth/v1/beacon/execution_payload_envelopes/0x{root:x}",
+            self.base_url
+        );
+        debug!(%url, "Beacon API GET");
+        // SSZ asked for, so a positive answer is one payload's bytes rather
+        // than its JSON, and the body is dropped unread either way: only the
+        // status is the answer.
+        let response = self
+            .client
+            .get(&url)
+            .header("Accept", "application/octet-stream")
+            .send()
+            .await
+            .map_err(|err| Error::BeaconNode {
+                url: url.clone(),
+                failure: BeaconNodeFailure::classify(&err),
+                detail: err.to_string(),
+            })?;
+        let status = response.status();
+        if status == StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        if status.is_success() {
+            return Ok(true);
+        }
+        Err(Error::BeaconNodeStatus {
+            status: status.as_u16(),
+            body: response.text().await.unwrap_or_default(),
+        })
+    }
+
+    /// The same partial-success reading as attestations: see
+    /// [`Self::handle_pool_submission`].
+    async fn submit_execution_proofs(
+        &self,
+        proofs: &[ethlambda_types::beacon::containers::execution_proof::SignedExecutionProof],
+    ) -> Result<usize> {
+        let url = format!("{}/eth/v1/beacon/execution_proofs", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .json(proofs)
+            .send()
+            .await
+            .map_err(|err| Error::BeaconNode {
+                url: url.clone(),
+                failure: BeaconNodeFailure::classify(&err),
+                detail: err.to_string(),
+            })?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(proofs.len());
+        }
+        let body = response.text().await.unwrap_or_default();
+        Self::handle_pool_submission(status, body, proofs.len())
     }
 
     /// The same partial-success reading as attestations: see

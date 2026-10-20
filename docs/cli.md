@@ -112,6 +112,8 @@ from a normal build.
 | `--execution-endpoint` | none | Base URL of the execution client's Engine API endpoint, e.g. `http://127.0.0.1:8551`. Must be given together with `--execution-jwt-secret` |
 | `--execution-jwt-secret` | none | File holding the 32-byte hex JWT secret shared with the execution client |
 | `--safe-slots-to-import-optimistically` | the specification's own value | How far behind the wall clock a block must be before it may be imported optimistically on age alone |
+| `--execution-proofs` | off | Take EIP-8440 execution chain proofs: join the `execution_proof` gossip topic, verify each proof's prover signature and the proof itself, keep one verified proof per block and type, and serve them on `GET /eth/v1/beacon/execution_proofs/{block_id}` and the `execution_proof` event. Needs a proof engine, and the only one so far is the mock below |
+| `--execution-proofs.mock` | off | Accept mock execution proofs: a mock zkVM's output whose public values name the right blocks and chain, with no cryptographic check. Implies `--execution-proofs`. Devnets only: it proves nothing |
 
 Accepted range is `CUSTODY_REQUIREMENT` to `NUMBER_OF_CUSTODY_GROUPS` (4 to
 128), enforced at parse time rather than clamped: serving a different set than
@@ -281,6 +283,7 @@ implementation's, so none of the [common flags](#common-flags) apply to it.
 | `--metrics-port` | `5064` | Prometheus metrics port |
 | `--keymanager-port` | `5062` | Keymanager API port. Only bound with `--enable-keymanager` |
 | `--suggested-fee-recipient` | none | Execution address to receive block rewards, `0x`-prefixed, for every validator the keymanager API gives no address of its own. Optional, and startup warns when it is absent: without it the beacon node picks an address, and it will not be yours |
+| `--execution-proofs.mock-prover` | off | Once per slot, after the payload timeliness vote is due, sign a mock EIP-8440 execution proof for the beacon node's head if it is new and its payload envelope is held, and submit it to `POST /eth/v1/beacon/execution_proofs`. The origin is the first head proved. Needs a beacon node running `--execution-proofs.mock`. Devnets only |
 | `--graffiti` | empty | Text for the graffiti field of proposed blocks, for every validator the keymanager API gives no graffiti of its own. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer. An ethlambda beacon node appends both clients' versions to it (see [`rpc.md`](rpc.md#validator-endpoints)) |
 | `--enable-keymanager` | off | Serve the keymanager API: keystores, plus each validator's own fee recipient, graffiti and gas limit. Off by default because it mutates key material |
 

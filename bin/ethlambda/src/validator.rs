@@ -67,6 +67,12 @@ pub(crate) struct ValidatorOptions {
     #[arg(long)]
     pub(crate) suggested_fee_recipient: Option<String>,
 
+    /// Submit a mock EIP-8440 execution proof for each new full head, signed
+    /// by one of this client's validators, to a beacon node running
+    /// `--execution-proofs.mock`. Devnets only: the proofs prove nothing.
+    #[arg(long = "execution-proofs.mock-prover", default_value_t = false)]
+    pub(crate) mock_execution_prover: bool,
+
     /// Serve the keymanager API: keystores, plus each validator's own fee
     /// recipient, graffiti and gas limit, which are held in memory only.
     ///
@@ -151,6 +157,7 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
         keymanager: options
             .enable_keymanager
             .then(|| std::net::SocketAddr::new(options.http_address, options.keymanager_port)),
+        mock_execution_prover: options.mock_execution_prover,
     })
     .await
     .map_err(Into::into)
@@ -167,6 +174,7 @@ mod tests {
             secrets_dir: PathBuf::from("/tmp/secrets"),
             http_address: "127.0.0.1".parse().expect("valid address"),
             keymanager_port: 5062,
+            mock_execution_prover: false,
             metrics_port: 5064,
             graffiti: graffiti.to_string(),
             suggested_fee_recipient: None,

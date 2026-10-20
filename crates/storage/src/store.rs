@@ -22,6 +22,7 @@ use ethlambda_types::{
     beacon::{
         config::Config,
         constants::NUM_BLOCK_TIMELINESS_DEADLINES,
+        containers::execution_proof::SignedExecutionProof,
         containers::{
             BeaconState, Checkpoint as BeaconCheckpoint, DataColumnSidecar, SignedBeaconBlock,
             gloas,
@@ -880,6 +881,13 @@ pub(crate) struct BeaconScratch {
     /// specification's `block_payload_statuses`; an absent root reads as
     /// `NOT_VALIDATED`.
     pub(crate) block_payload_statuses: HashMap<H256, (u64, PayloadStatusEnum)>,
+    /// EIP-8440: the verified execution chain proofs of each beacon block,
+    /// one per proof type, against the block's slot for pruning: the
+    /// specification's `store.execution_proofs`. Written by
+    /// `on_execution_proof`, read by the Beacon API and never by fork
+    /// choice, which keeps the execution client's verdict authoritative.
+    pub(crate) execution_proofs:
+        HashMap<H256, (u64, std::collections::BTreeMap<u8, SignedExecutionProof>)>,
     /// Gloas: beacon root to `(slot, milliseconds past genesis the block's
     /// envelope reached this node)`. What the payload timeliness committee's
     /// `payload_present` is decided from: the specification's vote is "an
@@ -4022,6 +4030,62 @@ impl Store {
             .payload_timeliness_vote
             .get(root)
             .cloned()
+    }
+
+    /// EIP-8440: the verified execution chain proofs held for the beacon block
+    /// `root`, in proof type order. Empty for a block with none, known or not.
+    pub fn execution_proofs(&self, root: &H256) -> Vec<SignedExecutionProof> {
+        self.beacon
+            .lock()
+            .unwrap()
+            .execution_proofs
+            .get(root)
+            .map(|(_slot, proofs)| proofs.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// EIP-8440: whether a verified proof of `proof_type` is held for `root`.
+    pub fn has_execution_proof(&self, root: &H256, proof_type: u8) -> bool {
+        self.beacon
+            .lock()
+            .unwrap()
+            .execution_proofs
+            .get(root)
+            .is_some_and(|(_slot, proofs)| proofs.contains_key(&proof_type))
+    }
+
+    /// EIP-8440: keeps a verified proof for the block `root` at `slot`.
+    /// Returns `false`, changing nothing, when a proof of its type is already
+    /// held: the specification stores one per block and type.
+    pub fn insert_execution_proof(
+        &mut self,
+        root: H256,
+        slot: u64,
+        proof: SignedExecutionProof,
+    ) -> bool {
+        let mut beacon = self.beacon.lock().unwrap();
+        let (_, proofs) = beacon
+            .execution_proofs
+            .entry(root)
+            .or_insert_with(|| (slot, std::collections::BTreeMap::new()));
+        match proofs.entry(proof.message.proof_type) {
+            std::collections::btree_map::Entry::Occupied(_) => false,
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(proof);
+                true
+            }
+        }
+    }
+
+    /// EIP-8440: drops the proofs of blocks strictly below `finalized_slot`.
+    /// A reader that wants a finalized block's proof has had a full epoch of
+    /// slots to ask for it.
+    pub fn prune_beacon_execution_proofs(&mut self, finalized_slot: u64) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .execution_proofs
+            .retain(|_root, (slot, _proofs)| *slot >= finalized_slot);
     }
 
     /// Replaces `root`'s payload-timeliness vote vector.

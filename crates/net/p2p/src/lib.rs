@@ -46,7 +46,7 @@ use ethlambda_network_api::{
     rpc_to_p2p::{
         PublishBeaconAggregate, PublishBeaconAttestation, PublishBeaconBlock,
         PublishBeaconOperation, PublishExecutionPayloadBid, PublishExecutionPayloadEnvelope,
-        PublishPayloadAttestationMessage, PublishProposerPreferences,
+        PublishExecutionProof, PublishPayloadAttestationMessage, PublishProposerPreferences,
         PublishSyncCommitteeContribution, PublishSyncCommitteeMessage, SubscribeAttestationSubnets,
         SubscribeSyncCommitteeSubnets,
     },
@@ -57,6 +57,7 @@ use ethlambda_state_transition::beacon::gossip::{
     aggregate::SeenAggregates,
     attestation::SeenAttestations,
     envelope::SeenEnvelopes,
+    execution_proof::SeenExecutionProofs,
     operations::SeenOperations,
     payload_attestation::SeenPayloadAttestations,
     sync_committee::{SeenSyncCommitteeMessages, SeenSyncContributions},
@@ -299,6 +300,11 @@ const SEEN_ENVELOPES_CAPACITY: NonZeroUsize = NonZeroUsize::new(1024).expect("no
 /// committee's worth of votes for a few slots is generous headroom, in the
 /// spirit of [`SEEN_COLUMNS_CAPACITY`].
 const SEEN_PAYLOAD_ATTESTATIONS_CAPACITY: NonZeroUsize = NonZeroUsize::new(4096).expect("non-zero");
+
+/// Capacity of the seen execution proof caches, keyed by `(head block root,
+/// proof root)` and `(head block root, proof type, prover)`. A block draws at
+/// most a few proofs, so this covers many slots of them.
+const SEEN_EXECUTION_PROOFS_CAPACITY: NonZeroUsize = NonZeroUsize::new(4096).expect("non-zero");
 
 /// How many `(target_epoch, aggregator_index)` pairs the accepted-aggregate
 /// cache remembers, and how many `(hash_tree_root(data), committee_index)`
@@ -1075,6 +1081,7 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
                 beacon.fork_digest,
                 &column_subnets,
                 &beacon.attestation_subnets,
+                beacon.execution_proofs,
             );
             for topic in &topics.topics {
                 swarm.behaviour_mut().gossipsub.subscribe(topic)?;
@@ -1111,6 +1118,7 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
                 metadata_seq_number: 0,
                 custody_columns: beacon.custody_columns,
                 attestation_subnets: beacon.attestation_subnets,
+                execution_proofs: beacon.execution_proofs,
                 sync_committee_subnets: std::collections::BTreeMap::new(),
             }))
         }
@@ -1146,6 +1154,12 @@ impl P2P {
     /// published mainnet bootnode ENRs carry no `quic` entry, so none of them
     /// is statically dialable. Opt-in on lean, where nothing else speaks discv5
     /// and co-located devnet nodes would otherwise all claim one UDP port.
+    ///
+    /// `execution_proof_engine` is what verifies an `execution_proof`'s bytes;
+    /// `None` on a node that does not take them, which never joins the topic.
+    // One parameter per shared handle, like the pools before it: a struct
+    // for them would be built at the single call site and taken apart here.
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn(
         built: BuiltSwarm,
         store: Store,
@@ -1154,6 +1168,11 @@ impl P2P {
         payload_attestation_pool: SharedPayloadAttestationPool,
         sync_committee_pool: SharedSyncCommitteePool,
         builder_market: SharedBuilderMarket,
+        execution_proof_engine: Option<
+            std::sync::Arc<
+                dyn ethlambda_state_transition::beacon::execution_proofs::ExecutionProofEngine,
+            >,
+        >,
     ) -> Result<P2P, DiscoveryError> {
         let discovery = match discovery {
             Some(config) => Some(spawn_discovery(config).await?),
@@ -1202,6 +1221,11 @@ impl P2P {
             seen_columns: SeenColumns::new(SEEN_COLUMNS_CAPACITY),
             seen_block_columns: SeenBlockColumns::new(SEEN_COLUMNS_CAPACITY),
             seen_envelopes: SeenEnvelopes::new(SEEN_ENVELOPES_CAPACITY),
+            seen_execution_proofs:
+                ethlambda_state_transition::beacon::gossip::SeenExecutionProofs::new(
+                    crate::SEEN_EXECUTION_PROOFS_CAPACITY,
+                ),
+            execution_proof_engine,
             seen_payload_attestations: SeenPayloadAttestations::new(
                 SEEN_PAYLOAD_ATTESTATIONS_CAPACITY,
             ),
@@ -1356,6 +1380,16 @@ pub struct P2PServer {
     /// The first valid `payload_attestation_message` per `(slot, validator
     /// index)` accepted from gossip.
     pub(crate) seen_payload_attestations: SeenPayloadAttestations,
+    /// The `execution_proof`s already judged, by proof root and by prover,
+    /// per head block.
+    pub(crate) seen_execution_proofs: SeenExecutionProofs,
+    /// What verifies an `execution_proof`'s proof bytes. `None` on a node that
+    /// does not subscribe to the topic, which ignores any proof it is sent.
+    pub(crate) execution_proof_engine: Option<
+        std::sync::Arc<
+            dyn ethlambda_state_transition::beacon::execution_proofs::ExecutionProofEngine,
+        >,
+    >,
     /// Accepted `beacon_aggregate_and_proof`s, by `(target_epoch,
     /// aggregator_index)` and by `(hash_tree_root(data), committee_index)`.
     pub(crate) seen_aggregates: SeenAggregates,
@@ -1763,6 +1797,12 @@ impl Handler<PublishProposerPreferences> for P2PServer {
 impl Handler<PublishPayloadAttestationMessage> for P2PServer {
     async fn handle(&mut self, msg: PublishPayloadAttestationMessage, _ctx: &Context<Self>) {
         gossipsub::publish_payload_attestation_message(self, msg.message).await;
+    }
+}
+
+impl Handler<PublishExecutionProof> for P2PServer {
+    async fn handle(&mut self, msg: PublishExecutionProof, _ctx: &Context<Self>) {
+        gossipsub::publish_execution_proof(self, msg.proof).await;
     }
 }
 
@@ -2849,6 +2889,12 @@ pub(crate) mod test_support {
         ) -> Result<(), spawned_concurrency::error::ActorError> {
             Ok(())
         }
+        fn new_execution_proof(
+            &self,
+            _proof: Box<ethlambda_types::beacon::containers::execution_proof::SignedExecutionProof>,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            Ok(())
+        }
         fn new_payload_attestation_message(
             &self,
             _message: ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage,
@@ -2929,6 +2975,7 @@ pub(crate) mod test_support {
                 genesis_validators_root: Root::ZERO,
                 custody_columns: Vec::new(),
                 attestation_subnets: Vec::new(),
+                execution_proofs: false,
             })),
         })
         .expect("swarm builds");
@@ -3011,6 +3058,10 @@ pub(crate) mod test_support {
             seen_envelopes: ethlambda_state_transition::beacon::gossip::envelope::SeenEnvelopes::new(
                 crate::SEEN_ENVELOPES_CAPACITY,
             ),
+            seen_execution_proofs: ethlambda_state_transition::beacon::gossip::SeenExecutionProofs::new(
+                crate::SEEN_EXECUTION_PROOFS_CAPACITY,
+            ),
+            execution_proof_engine: None,
             seen_payload_attestations:
                 ethlambda_state_transition::beacon::gossip::payload_attestation::SeenPayloadAttestations::new(
                     crate::SEEN_PAYLOAD_ATTESTATIONS_CAPACITY,
@@ -3409,6 +3460,7 @@ mod tests {
                     genesis_validators_root: Root::ZERO,
                     custody_columns: Vec::new(),
                     attestation_subnets: Vec::new(),
+                    execution_proofs: false,
                 })),
             })
             .expect("swarm builds")
@@ -4154,6 +4206,7 @@ mod tests {
                 genesis_validators_root: Root::ZERO,
                 custody_columns: Vec::new(),
                 attestation_subnets: Vec::new(),
+                execution_proofs: false,
             })),
         })
         .expect("swarm builds");

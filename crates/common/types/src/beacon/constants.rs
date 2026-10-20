@@ -149,6 +149,31 @@ pub const DOMAIN_PTC_ATTESTER: DomainType = [0x0c, 0x00, 0x00, 0x00];
 pub const DOMAIN_PROPOSER_PREFERENCES: DomainType = [0x0d, 0x00, 0x00, 0x00];
 /// Domain for a `BuilderDepositRequest`'s `signature` (gloas).
 pub const DOMAIN_BUILDER_DEPOSIT: DomainType = [0x0e, 0x00, 0x00, 0x00];
+/// Domain for a `SignedExecutionProof` (EIP-8025, kept by EIP-8440).
+pub const DOMAIN_EXECUTION_PROOF: DomainType = [0x0f, 0x00, 0x00, 0x00];
+
+// ---------------------------------------------------------------------------
+// Execution proofs (EIP-8025 / EIP-8440)
+// ---------------------------------------------------------------------------
+//
+// Provisional: the specification marks these values as not definitive.
+
+/// `MAX_PROOF_SIZE`: the bound on a proof's bytes, 4 MiB.
+pub const MAX_PROOF_SIZE: usize = 4_194_304;
+/// `MAX_SIGNED_EXECUTION_PROOF_SIZE`: the SSZ size of a `SignedExecutionProof`
+/// carrying `MAX_PROOF_SIZE` bytes, what the gossip topic bounds a message at.
+pub const MAX_SIGNED_EXECUTION_PROOF_SIZE: usize = 4_194_481;
+/// `STATELESS_INPUT_SCHEMA_ID`: the Amsterdam fork (`0x15`) at schema
+/// revision 1, which names the execution rules a proof's guest applied.
+pub const STATELESS_INPUT_SCHEMA_ID: u16 = 0x1501;
+/// `get_supported_proof_types()`: the provisional assignments, the ethrex
+/// stateless-validator guests on OpenVM, SP1 and ZisK.
+pub const SUPPORTED_EXECUTION_PROOF_TYPES: [u8; 3] = [1, 2, 3];
+
+/// Whether `proof_type` is in `get_supported_proof_types()`.
+pub fn is_supported_execution_proof_type(proof_type: u8) -> bool {
+    SUPPORTED_EXECUTION_PROOF_TYPES.contains(&proof_type)
+}
 
 // ---------------------------------------------------------------------------
 // Participation flags and incentivization weights (altair)
@@ -450,6 +475,7 @@ mod tests {
             DOMAIN_PTC_ATTESTER,
             DOMAIN_PROPOSER_PREFERENCES,
             DOMAIN_BUILDER_DEPOSIT,
+            DOMAIN_EXECUTION_PROOF,
         ] {
             let masked = [
                 domain[0] & DOMAIN_APPLICATION_MASK[0],

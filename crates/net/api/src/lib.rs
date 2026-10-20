@@ -6,6 +6,7 @@ use ethlambda_types::{
         DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock,
         altair::{SignedContributionAndProof, SyncCommitteeMessage},
         electra::SingleAttestation,
+        execution_proof::SignedExecutionProof,
         gloas::{
             PayloadAttestationMessage, SignedExecutionPayloadBid, SignedExecutionPayloadEnvelope,
             SignedProposerPreferences,
@@ -327,6 +328,11 @@ pub trait P2PToBlockChain: Send + Sync {
         message: PayloadAttestationMessage,
         arrival: BlockArrival,
     ) -> Result<(), ActorError>;
+    /// An EIP-8440 execution chain proof that passed gossip validation, prover
+    /// signature and proof engine included, for the chain actor to keep for
+    /// the Beacon API. Boxed for the reason the envelope is: a proof carries
+    /// up to 4 MiB.
+    fn new_execution_proof(&self, proof: Box<SignedExecutionProof>) -> Result<(), ActorError>;
 }
 
 /// When an aggregate reached this node, for the one metric that cannot be
@@ -468,6 +474,10 @@ pub trait RpcToP2P: Send + Sync {
         &self,
         message: PayloadAttestationMessage,
     ) -> Result<(), ActorError>;
+    /// Gossip a signed execution chain proof on `execution_proof` and hand it
+    /// to the chain actor. Checked by the caller as above, proof engine
+    /// included.
+    fn publish_execution_proof(&self, proof: Box<SignedExecutionProof>) -> Result<(), ActorError>;
 }
 
 // --- Init messages ---

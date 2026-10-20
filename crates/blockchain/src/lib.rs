@@ -3278,6 +3278,7 @@ impl BlockChainServer {
             .prune_beacon_optimistic_roots(finalized_slot, finalized.root);
         self.store
             .prune_beacon_block_payload_statuses(finalized_slot);
+        self.store.prune_beacon_execution_proofs(finalized_slot);
 
         if self.blocks_awaiting_columns.is_empty() {
             return;
@@ -3788,7 +3789,8 @@ impl BlockChainServer {
 
 use ethlambda_network_api::p2p_to_block_chain::{
     DataColumnSidecarsAwaitingParent, NewAggregatedAttestation, NewAttestation, NewBeaconAggregate,
-    NewBlock, NewDataColumnSidecars, NewExecutionPayloadEnvelope, NewPayloadAttestationMessage,
+    NewBlock, NewDataColumnSidecars, NewExecutionPayloadEnvelope, NewExecutionProof,
+    NewPayloadAttestationMessage,
 };
 
 impl Handler<InitP2P> for BlockChainServer {
@@ -3940,6 +3942,30 @@ impl Handler<NewPayloadAttestationMessage> for BlockChainServer {
             self.on_tick(unix_now_ms(), ctx).await;
         }
         self.apply_payload_attestation_message(&msg.message, &msg.arrival);
+    }
+}
+
+impl Handler<NewExecutionProof> for BlockChainServer {
+    async fn handle(&mut self, msg: NewExecutionProof, _ctx: &Context<Self>) {
+        // Beacon-only: lean has no execution proofs.
+        let ChainDuties::Beacon = &self.duties else {
+            return;
+        };
+        // Gossip verified the prover and the proof; what is left is the store's
+        // own bookkeeping.
+        match fork_choice::accept_verified_execution_proof(&mut self.store, &msg.proof) {
+            Ok(()) => {
+                info!(
+                    proof_type = msg.proof.message.proof_type,
+                    validator = msg.proof.validator_index,
+                    head = %ShortRoot(&msg.proof.message.head_block_root.0),
+                    origin = %ShortRoot(&msg.proof.message.origin_block_root.0),
+                    "Kept a verified execution proof"
+                );
+                self.events.publish_execution_proof(&msg.proof);
+            }
+            Err(err) => debug!(?err, "Execution proof not kept"),
+        }
     }
 }
 

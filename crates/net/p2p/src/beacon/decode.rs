@@ -238,6 +238,18 @@ pub fn decode_payload_attestation_message(
     gloas::PayloadAttestationMessage::from_ssz_bytes(bytes).map_err(|_| DecodeError::Ssz)
 }
 
+/// Decode an `execution_proof` payload (EIP-8440). Gloas on, like
+/// [`decode_execution_payload_envelope`].
+pub fn decode_signed_execution_proof(
+    bytes: &[u8],
+) -> Result<ethlambda_types::beacon::containers::execution_proof::SignedExecutionProof, DecodeError>
+{
+    ethlambda_types::beacon::containers::execution_proof::SignedExecutionProof::from_ssz_bytes(
+        bytes,
+    )
+    .map_err(|_| DecodeError::Ssz)
+}
+
 /// Decode a `sync_committee_{subnet_id}` payload. Altair on and the same
 /// container at every fork, so no fork lookup is needed.
 pub fn decode_sync_committee_message(

@@ -90,7 +90,9 @@ below. A gloas digest adds four more, `execution_payload`,
 `payload_attestation_message`, `execution_payload_bid` and
 `proposer_preferences`, which `BeaconTopics::for_fork` subscribes under gloas
 digests and not under earlier ones (so one epoch before the fork, when the
-digest is joined). An envelope is validated like a block
+digest is joined). With `--execution-proofs` a gloas digest also adds
+`execution_proof`, the EIP-8440 execution chain proofs; a node without a proof
+engine never joins it. An envelope is validated like a block
 (its stateful half on the blocking pool) and goes to the chain actor on `Accept`
 and on `Queue`, since the actor holds an envelope whose block is not imported
 yet. A payload attestation is validated on the attestation permit pool and goes
@@ -124,6 +126,7 @@ itself are recorded as known payloads, since gossip never echoes them.
 | `payload_attestation_message` | `PayloadAttestationMessage`, gloas digests only |
 | `execution_payload_bid` | `SignedExecutionPayloadBid`, gloas digests only |
 | `proposer_preferences` | `SignedProposerPreferences`, gloas digests only |
+| `execution_proof` | `SignedExecutionProof` (EIP-8440), gloas digests only, with `--execution-proofs` |
 
 `beacon_attestation_{0..63}` is no longer wholly unsubscribed. This node holds
 `SUBNETS_PER_NODE` (2 on mainnet) long-lived subscriptions from that family,
@@ -211,6 +214,19 @@ fork; `unsupported_fork` is kept for a fork the node does not follow
 an unbounded progressive bitlist, so one longer than electra's type bound is
 REJECTed first, reading its length without expanding it, since expanding is
 what the seen-set check does before any other.
+
+An `execution_proof` is capped at `MAX_SIGNED_EXECUTION_PROOF_SIZE`
+(4,194,481 decompressed bytes, `Reject(Malformed)` above that) and validated by
+EIP-8440's rules (`gossip::execution_proof`): the message checks, the store's
+one-proof-per-block-and-type rule and the two seen caches in triage, then the
+head block's cached post-state, the prover's registry entry, activity and
+signature, and the proof engine, on the attestation permit pool. The
+specification marks the proof and the prover seen once the signature verified,
+before the engine runs, so a prover gets one attempt per block and type whether
+or not its proof verifies; this node records both on every outcome past the
+signature check. What Accepts is handed to the chain actor, which keeps it for
+the Beacon API and never lets it move the head or a payload's status: the
+execution client's verdict stays authoritative.
 
 Three deliberate departures from the gloas gossip rules, each for want of state
 this node does not keep. Where the specification rejects a message whose block

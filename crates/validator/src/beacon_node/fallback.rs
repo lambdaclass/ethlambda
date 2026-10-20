@@ -308,6 +308,28 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
         .await
     }
 
+    async fn block_slot(&self, root: Root) -> Result<Option<Slot>> {
+        self.try_each("block_slot", |node| node.block_slot(root))
+            .await
+    }
+
+    async fn has_execution_payload_envelope(&self, root: Root) -> Result<bool> {
+        self.try_each("has_execution_payload_envelope", |node| {
+            node.has_execution_payload_envelope(root)
+        })
+        .await
+    }
+
+    async fn submit_execution_proofs(
+        &self,
+        proofs: &[ethlambda_types::beacon::containers::execution_proof::SignedExecutionProof],
+    ) -> Result<usize> {
+        self.try_each("submit_execution_proofs", |node| {
+            node.submit_execution_proofs(proofs)
+        })
+        .await
+    }
+
     async fn submit_attestations(
         &self,
         attestations: &[SingleAttestationDto],

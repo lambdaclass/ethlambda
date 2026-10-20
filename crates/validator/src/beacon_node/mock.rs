@@ -122,6 +122,12 @@ pub struct MockBeaconNode {
     pub sync_duty_requests: Mutex<Vec<(Epoch, Vec<ValidatorIndex>)>>,
     /// What `head_block_root` answers with. `None` fails the call.
     pub head_root: Option<Root>,
+    /// The slot `block_slot` answers for `head_root`; any other root is 404.
+    pub head_slot: Option<Slot>,
+    /// Whether `has_execution_payload_envelope` answers true for `head_root`.
+    pub head_has_envelope: bool,
+    pub submitted_execution_proofs:
+        Mutex<Vec<ethlambda_types::beacon::containers::execution_proof::SignedExecutionProof>>,
     /// The head is one the execution client has not validated.
     pub head_optimistic: bool,
     pub submitted_sync_messages: Mutex<Vec<altair::SyncCommitteeMessage>>,
@@ -376,6 +382,25 @@ impl MockBeaconNode {
     }
 
     /// Answer `head_block_root` with `root`.
+    pub fn with_head_slot(mut self, slot: Slot) -> Self {
+        self.head_slot = Some(slot);
+        self
+    }
+
+    pub fn with_head_envelope(mut self) -> Self {
+        self.head_has_envelope = true;
+        self
+    }
+
+    pub fn submitted_execution_proofs(
+        &self,
+    ) -> Vec<ethlambda_types::beacon::containers::execution_proof::SignedExecutionProof> {
+        self.submitted_execution_proofs
+            .lock()
+            .expect("lock")
+            .clone()
+    }
+
     pub fn with_head_root(mut self, root: Root) -> Self {
         self.head_root = Some(root);
         self
@@ -748,6 +773,28 @@ impl BeaconNodeApi for MockBeaconNode {
             .expect("lock")
             .extend_from_slice(messages);
         Ok(messages.len())
+    }
+
+    async fn block_slot(&self, root: Root) -> Result<Option<Slot>> {
+        self.guard("block_slot")?;
+        Ok(self.head_slot.filter(|_| self.head_root == Some(root)))
+    }
+
+    async fn has_execution_payload_envelope(&self, root: Root) -> Result<bool> {
+        self.guard("has_execution_payload_envelope")?;
+        Ok(self.head_has_envelope && self.head_root == Some(root))
+    }
+
+    async fn submit_execution_proofs(
+        &self,
+        proofs: &[ethlambda_types::beacon::containers::execution_proof::SignedExecutionProof],
+    ) -> Result<usize> {
+        self.guard("submit_execution_proofs")?;
+        self.submitted_execution_proofs
+            .lock()
+            .expect("lock")
+            .extend_from_slice(proofs);
+        Ok(proofs.len())
     }
 
     async fn submit_attestations(

@@ -176,6 +176,7 @@ use crate::beacon::constants;
 use crate::beacon::containers::{AttestationData, BeaconState, Checkpoint, SignedBeaconBlock};
 use crate::beacon::containers::{bellatrix, deneb, electra, fulu, gloas, phase0};
 use crate::beacon::error::{Error, Result, verify};
+use crate::beacon::execution_proofs::{self, ExecutionProofEngine, SignedExecutionProof};
 use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::{
     ActiveBalanceCache, CommitteeCache, CommitteeCacheExt, get_active_validator_indices,
@@ -5598,6 +5599,65 @@ pub fn on_attester_slashing(store: &mut Store, attester_slashing: &AttesterSlash
     Ok(())
 }
 
+/// The specification's `on_execution_proof` (EIP-8440): a gossiped or
+/// submitted execution chain proof is authenticated against its head block's
+/// post-state, verified by `proof_engine`, and kept for the Beacon API. A proof
+/// never moves the head or a payload's status here: the execution client's
+/// verdict stays authoritative, and the proof is what a node that cannot
+/// execute reads instead.
+pub fn on_execution_proof(
+    store: &mut Store,
+    signed_proof: &SignedExecutionProof,
+    config: &Config,
+    proof_engine: &dyn ExecutionProofEngine,
+) -> Result<()> {
+    let head_block_root = signed_proof.message.head_block_root;
+    // The corresponding beacon block must be known and consensus-valid
+    let (slot, _) = store
+        .block_slot_and_state_root(&head_block_root)
+        .ok_or(Error::SpecAssert("head_block_root in store.blocks"))?;
+    let state = store
+        .get_state(&head_block_root)
+        .expect("get")
+        .ok_or(Error::SpecAssert("state is not None"))?;
+    // Only one verified proof is stored for each beacon block and proof type
+    verify(
+        !store.has_execution_proof(&head_block_root, signed_proof.message.proof_type),
+        "proof.proof_type not in store.execution_proofs.get(head_block_root, {})",
+    )?;
+    execution_proofs::process_execution_proof(&state, signed_proof, config, proof_engine)?;
+    // Store only proofs that pass downstream verification
+    store.insert_execution_proof(head_block_root, slot, signed_proof.clone());
+    Ok(())
+}
+
+/// [`on_execution_proof`] for a proof that `ethlambda-p2p`'s `execution_proof`
+/// gossip validation already accepted: the store checks alone (the head block
+/// and its post-state are known, no proof of this type is held yet), without
+/// the signature and proof-engine verification gossip already paid for.
+///
+/// Only a gossip-verified proof may call this. A proof from anywhere else goes
+/// through [`on_execution_proof`], or it would be kept unverified.
+pub fn accept_verified_execution_proof(
+    store: &mut Store,
+    signed_proof: &SignedExecutionProof,
+) -> Result<()> {
+    let head_block_root = signed_proof.message.head_block_root;
+    let (slot, _) = store
+        .block_slot_and_state_root(&head_block_root)
+        .ok_or(Error::SpecAssert("head_block_root in store.blocks"))?;
+    verify(
+        matches!(store.has_state(&head_block_root), Ok(true)),
+        "head_block_root in store.block_states",
+    )?;
+    verify(
+        !store.has_execution_proof(&head_block_root, signed_proof.message.proof_type),
+        "proof.proof_type not in store.execution_proofs.get(head_block_root, {})",
+    )?;
+    store.insert_execution_proof(head_block_root, slot, signed_proof.clone());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use ethlambda_storage::backend::InMemoryBackend;
@@ -10413,5 +10473,123 @@ mod tests {
                 "slot {slot}"
             );
         }
+    }
+    /// A store holding a gloas block at slot 1 whose post-state is a signing
+    /// registry of four active validators, for the execution proof handlers.
+    fn execution_proof_store(root: Root) -> (Store, BeaconState) {
+        let mut store = store_anchored_at(root);
+        store
+            .insert_signed_block(
+                root,
+                gloas_block(
+                    1,
+                    Root::ZERO,
+                    ExecutionBlockHash::ZERO,
+                    ExecutionBlockHash::repeat_byte(0x22),
+                ),
+            )
+            .unwrap();
+        let mut state = test_state::with_signing_validators_at(ForkName::Gloas, 4);
+        let BeaconState::Gloas(inner) = &mut state else {
+            unreachable!("with_signing_validators_at(Gloas) builds a gloas state");
+        };
+        inner.slot = 1;
+        store.insert_state(root, state.clone()).unwrap();
+        (store, state)
+    }
+
+    /// A proof of `proof_type` spanning `head` alone, with mock proof data
+    /// claiming the public input of chain `chain_id`, signed by `validator`
+    /// under `state`.
+    fn signed_execution_proof(
+        state: &BeaconState,
+        head: Root,
+        proof_type: u8,
+        validator: u64,
+        chain_id: u64,
+    ) -> SignedExecutionProof {
+        let mut message = execution_proofs::ExecutionProof {
+            proof_data: Default::default(),
+            proof_type,
+            origin_block_root: head,
+            head_block_root: head,
+        };
+        let input = message.public_input(chain_id);
+        message.proof_data = execution_proofs::MockExecutionProofEngine::proof_claiming(&input)
+            .try_into()
+            .unwrap();
+        let domain = accessors::get_domain(state, constants::DOMAIN_EXECUTION_PROOF, None);
+        let signing_root = compute_signing_root(message.hash_tree_root(), domain);
+        SignedExecutionProof {
+            message,
+            validator_index: validator,
+            signature: test_state::sign_for(validator as usize, signing_root),
+        }
+    }
+
+    #[test]
+    fn on_execution_proof_keeps_one_verified_proof_per_block_and_type() {
+        let mut config = Config::active().with_fork_epoch(ForkName::Gloas, 0);
+        config.deposit_chain_id = 7;
+        let engine = execution_proofs::MockExecutionProofEngine;
+        let root = Root::repeat_byte(0xc1);
+        let (mut store, state) = execution_proof_store(root);
+
+        let proof = signed_execution_proof(&state, root, 1, 2, 7);
+        on_execution_proof(&mut store, &proof, &config, &engine).unwrap();
+        assert_eq!(store.execution_proofs(&root), vec![proof.clone()]);
+
+        // A second proof of the same type for the block is refused, whoever
+        // signed it.
+        let again = signed_execution_proof(&state, root, 1, 3, 7);
+        assert_eq!(
+            failed_assertion(on_execution_proof(&mut store, &again, &config, &engine)),
+            Some("proof.proof_type not in store.execution_proofs.get(head_block_root, {})")
+        );
+        // Another type for the same block is kept beside it.
+        let other_type = signed_execution_proof(&state, root, 2, 3, 7);
+        on_execution_proof(&mut store, &other_type, &config, &engine).unwrap();
+        assert_eq!(store.execution_proofs(&root), vec![proof, other_type]);
+
+        // A proof for a block this store never saw.
+        let unknown = signed_execution_proof(&state, Root::repeat_byte(0xee), 1, 2, 7);
+        assert_eq!(
+            failed_assertion(on_execution_proof(&mut store, &unknown, &config, &engine)),
+            Some("head_block_root in store.blocks")
+        );
+        // A proof whose public values are another chain's is verified and
+        // refused by the engine, and nothing is stored for it.
+        let other_root = Root::repeat_byte(0xc2);
+        let (mut other_store, other_state) = execution_proof_store(other_root);
+        let other_chain = signed_execution_proof(&other_state, other_root, 1, 2, 8);
+        assert_eq!(
+            failed_assertion(on_execution_proof(
+                &mut other_store,
+                &other_chain,
+                &config,
+                &engine
+            )),
+            Some("proof_engine.verify_execution_proof(signed_proof.message)")
+        );
+        assert!(other_store.execution_proofs(&other_root).is_empty());
+    }
+
+    #[test]
+    fn a_gossip_verified_execution_proof_is_kept_without_reverification() {
+        let root = Root::repeat_byte(0xc3);
+        let (mut store, state) = execution_proof_store(root);
+        // Proof data the engine would refuse: this path must not consult it.
+        let mut proof = signed_execution_proof(&state, root, 3, 1, 7);
+        proof.message.proof_data = vec![1, 2, 3].try_into().unwrap();
+        accept_verified_execution_proof(&mut store, &proof).unwrap();
+        assert_eq!(store.execution_proofs(&root), vec![proof.clone()]);
+        assert_eq!(
+            failed_assertion(accept_verified_execution_proof(&mut store, &proof)),
+            Some("proof.proof_type not in store.execution_proofs.get(head_block_root, {})")
+        );
+        // Pruning at a finality past the block's slot drops it.
+        store.prune_beacon_execution_proofs(2);
+        assert!(store.execution_proofs(&root).is_empty());
+        assert!(!store.has_execution_proof(&root, 3));
     }
 }

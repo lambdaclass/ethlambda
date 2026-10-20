@@ -81,6 +81,8 @@ pub struct BeaconWire {
     /// Read by `build_metadata` for the `attnets` bitfield it advertises, so
     /// what this node claims to serve is what it actually subscribed to.
     pub attestation_subnets: Vec<u64>,
+    /// Whether `execution_proof` is among the gloas topics this node joins.
+    pub execution_proofs: bool,
     /// The sync committee subnets joined on a validator client's request, each
     /// with the epoch (exclusive) it is needed until.
     ///

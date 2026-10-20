@@ -182,6 +182,12 @@ mod tests {
         ) -> Result<(), ActorError> {
             Ok(())
         }
+        fn new_execution_proof(
+            &self,
+            _proof: Box<ethlambda_types::beacon::containers::execution_proof::SignedExecutionProof>,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            Ok(())
+        }
         fn new_payload_attestation_message(
             &self,
             _message: ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage,

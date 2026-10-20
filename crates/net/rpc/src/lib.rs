@@ -18,6 +18,7 @@ pub(crate) const SSZ_CONTENT_TYPE: &str = "application/octet-stream";
 mod admin;
 mod base;
 mod beacon;
+pub use beacon::execution_proofs::ProofEngineHandle;
 mod blocks;
 mod events;
 mod fork_choice;
@@ -223,6 +224,10 @@ pub struct BeaconApiHandles {
     /// its code and commit, with the execution client's, to every block's
     /// graffiti.
     pub client_version: ethlambda_engine::types::ClientVersionV1,
+    /// What `POST /eth/v1/beacon/execution_proofs` verifies submitted EIP-8440
+    /// proofs with. Empty on a node that takes none, where the route answers
+    /// 503.
+    pub execution_proof_engine: ProofEngineHandle,
 }
 
 /// Start the HTTP servers for a beacon node.
@@ -249,6 +254,7 @@ pub async fn start_beacon_rpc_server(
         .layer(Extension(beacon::validator::FeeRecipients::default()))
         .layer(Extension(handles.engine))
         .layer(Extension(handles.events))
+        .layer(Extension(handles.execution_proof_engine))
         .layer(Extension(beacon::graffiti::OwnVersion(Arc::new(
             handles.client_version,
         ))));
@@ -473,6 +479,9 @@ pub(crate) mod test_utils {
         pub(crate) payload_attestations: std::sync::Mutex<
             Vec<ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage>,
         >,
+        pub(crate) execution_proofs: std::sync::Mutex<
+            Vec<ethlambda_types::beacon::containers::execution_proof::SignedExecutionProof>,
+        >,
         /// `(subnet ids, message)` per sync committee message published.
         pub(crate) sync_messages: std::sync::Mutex<
             Vec<(
@@ -582,6 +591,14 @@ pub(crate) mod test_utils {
             message: ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
             self.payload_attestations.lock().unwrap().push(message);
+            Ok(())
+        }
+
+        fn publish_execution_proof(
+            &self,
+            proof: Box<ethlambda_types::beacon::containers::execution_proof::SignedExecutionProof>,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.execution_proofs.lock().unwrap().push(*proof);
             Ok(())
         }
 
