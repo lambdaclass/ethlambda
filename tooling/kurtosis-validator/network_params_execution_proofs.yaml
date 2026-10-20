@@ -1,0 +1,53 @@
+# A gloas devnet that exercises EIP-8440 execution chain proofs end to end:
+# `ethlambda beacon` verifies and serves mock proofs (`--execution-proofs.mock`),
+# the ethlambda validator client produces one per full head
+# (`--execution-proofs.mock-prover`), ethrex is every execution client, and the
+# two lighthouse participants serve light client data (`--light-client-server`)
+# for a consumer that trusts the sync committee: ethrex's partial stateful node
+# reads light client updates from a lighthouse and proofs from ethlambda,
+#
+#   ethrex psn --network <el_cl_genesis_data>/genesis.json \
+#     --beacon.url http://127.0.0.1:<lighthouse http port> \
+#     --proofs.url http://127.0.0.1:<cl-ethlambda http port> \
+#     --proof-mode require --proof-engine.mock --bootnodes <an ethrex enode>
+#
+# Run from the repository root, after `make docker-build DOCKER_TAG=execution-proofs`:
+#
+#   kurtosis run --enclave execution-proofs tooling/kurtosis-validator \
+#     --args-file tooling/kurtosis-validator/network_params_execution_proofs.yaml
+#
+# Two lighthouse participants for the reason network_params_ethlambda_beacon.yaml
+# gives (a lone lighthouse refuses inbound peers). 128 of the 256 validators are
+# left unassigned, so the ethlambda validator client signs for them, and one of
+# them signs the mock proofs.
+participants:
+  - el_type: ethrex
+    el_image: ghcr.io/lambdaclass/ethrex:latest
+    cl_type: lighthouse
+    cl_image: ethpandaops/lighthouse:unstable
+    validator_count: 64
+    supernode: true
+    count: 2
+    cl_extra_params:
+      - --subscribe-all-subnets
+      - --light-client-server
+network_params:
+  preset: mainnet
+  gloas_fork_epoch: 0
+  preregistered_validator_count: 256
+additional_services:
+  - dora
+global_log_level: info
+ethlambda_validator:
+  image: ghcr.io/lambdaclass/ethlambda:execution-proofs
+  name: ethlambda-vc
+  suggested_fee_recipient: "0x000000000000000000000000000000000000dEaD"
+  extra_params:
+    - --execution-proofs.mock-prover
+ethlambda_beacon:
+  enabled: true
+  fallback: false
+  el: ethrex
+  el_image: ghcr.io/lambdaclass/ethrex:latest
+  extra_params:
+    - --execution-proofs.mock

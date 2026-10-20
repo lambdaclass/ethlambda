@@ -1176,6 +1176,9 @@ mod tests {
             "fast_confirmation",
             "proposer_preferences",
             "blob_sidecar",
+            // EIP-8025/EIP-8440, not in the Beacon API yet: the topic other
+            // clients emit execution proofs on.
+            "execution_proof",
         ];
         specification.sort_unstable();
         assert_eq!(names, specification);
