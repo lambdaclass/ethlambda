@@ -47,6 +47,8 @@ serde_yaml_ng.workspace = true
 hex.workspace = true
 
 clap.workspace = true
+# Framed snappy, the compression of every record in an `.era` file.
+snap = "1.1"
 reqwest.workspace = true
 ethlambda-engine.workspace = true
 thiserror.workspace = true

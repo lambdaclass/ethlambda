@@ -47,6 +47,11 @@ impl BuiltInNetwork {
         Self::ALL.into_iter().find(|network| network.name() == name)
     }
 
+    /// The embedded `config.yaml`, as published.
+    pub(crate) fn config_yaml(self) -> &'static str {
+        self.chain().config_yaml
+    }
+
     fn chain(self) -> &'static EmbeddedChain {
         match self {
             Self::Mainnet => &MAINNET,
