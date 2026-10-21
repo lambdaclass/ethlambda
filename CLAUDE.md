@@ -782,6 +782,10 @@ behavior.
 
 - `BlockProof` is the only pruned block table (below the finalized
   boundary); `get_signed_block` returns `None` for a pruned finalized block.
+- `States`/`StateDiffs` are pruned below the finalized block's snapshot interval
+  by `prune_finalized_states` (lean: in `prune_old_data`; beacon: in
+  `evict_held_blocks_at_or_below_finality`), watermarked by
+  `KEY_STATES_PRUNED_BELOW` so ranges are adjacent and never overlap.
 - A `StateDiff` omits `config` and `validators`, trusting they never mutate;
   breaking that invariant would silently corrupt every reconstructed state.
 - `Metadata["config"]` is written at bootstrap; it doubles as the DB's
@@ -799,12 +803,14 @@ behavior.
   which is what keeps a parked column from satisfying the availability gate.
   Its only index is the chain actor's in-memory `sidecars_awaiting_parent`, so
   `start_actor` clears the whole table at startup.
-- `DB_VERSION` is 4: `Config` gained `PRESET_BASE` and `CONFIG_NAME` (as
-  `ConfigName`, a bounded string) at the front of its encoding, and it is
-  SSZ-encoded under `KEY_CONFIG`, so a data directory written by an earlier
-  version decodes into the wrong fields. (3 was the runtime keys a
-  `config.yaml` supplies.) `Store::from_db_state` refuses any other version
-  outright; there is no migration.
+- `DB_VERSION` is 5: `States` and `StateDiffs` moved from root keys to
+  slot||root keys (the block's slot, looked up from `BlockHeaders` by readers)
+  so `Store::prune_finalized_states` can range-delete finalized states; a
+  directory written by an earlier version holds rows no lookup finds. (4 was
+  `Config` gaining `PRESET_BASE` and `CONFIG_NAME` at the front of its SSZ
+  encoding; 3 was the runtime keys a `config.yaml` supplies.)
+  `Store::from_db_state` refuses any other version outright; there is no
+  migration.
 
 ### State Root Computation
 - Always computed via `hash_tree_root()` after full state transition

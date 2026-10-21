@@ -126,8 +126,8 @@ The ten variants of the `Table` enum (`crates/storage/src/api/tables.rs`):
 | `BlockBodies`      | root                        | `BlockBody` (lean only)                   | never                            |
 | `BlockProof`       | slot ‖ root                 | aggregate proof (`MultiMessageAggregate`) | yes: finalized older than ~1 day |
 | `BlockRoots`       | slot                        | block root (`H256`)                       | never                            |
-| `States`           | root                        | full `State` snapshot                     | never                            |
-| `StateDiffs`       | root                        | `StateDiff`                               | never                            |
+| `States`           | slot ‖ root                 | full `State` snapshot                     | yes: finalized snapshot intervals |
+| `StateDiffs`       | slot ‖ root                 | `StateDiff`                               | yes: finalized snapshot intervals |
 | `Metadata`         | string                      | SSZ scalars                               | never                            |
 | `LiveChain`        | slot ‖ root                 | `parent_root`                             | yes: below finalized             |
 | `DataColumns`      | slot ‖ root ‖ column_index  | `DataColumnSidecar` (SSZ-encoded)         | no (see [DataColumns](#datacolumns) below) |
@@ -139,11 +139,17 @@ Four key layouts are used:
 
 - **Root-keyed** tables use the 32-byte SSZ encoding of the block root
   (`root.to_ssz()`).
-- **Slot-prefixed** tables (`BlockProof`, `LiveChain`) use
-  `encode_slot_root_key`: an 8-byte **big-endian** slot followed by the
-  32-byte root. Big-endian means lexicographic key order equals numeric slot
-  order, so pruning can iterate from the start of the table and stop at the
-  first key past its cutoff instead of scanning everything.
+- **Slot-prefixed** tables (`BlockProof`, `LiveChain`, `States`,
+  `StateDiffs`) use `encode_slot_root_key`: an 8-byte **big-endian** slot
+  followed by the 32-byte root. Big-endian means lexicographic key order
+  equals numeric slot order, so pruning can iterate from the start of the
+  table and stop at the first key past its cutoff, or drop a whole slot range
+  with one range delete. For `States` and `StateDiffs` the slot is the slot of
+  the block the state belongs to (the slot in that root's `BlockHeaders` row,
+  equal to the state's `latest_block_header.slot`), not `state.slot()`: a
+  beacon anchor state can be advanced past its block. A reader that only has
+  a root looks the slot up in `BlockHeaders`; a root with no block row has no
+  state.
 - **Slot-prefixed, then column** (`DataColumns`) extends the same
   `slot ‖ root` prefix with an 8-byte big-endian `column_index`, via
   `data_column_key`. A block's own sidecars therefore share one lexicographic
@@ -221,11 +227,13 @@ is reachable there only by root, never by slot.
 
 ### States
 
-`root → State` (full SSZ snapshot). Holds full-state snapshots **only**: the
-bootstrap anchor written at initialization, plus one anchor whenever a block
-crosses a `SNAPSHOT_ANCHOR_INTERVAL`-slot boundary. Never pruned — these
+`slot ‖ root → State` (full SSZ snapshot). Holds full-state snapshots
+**only**: the bootstrap anchor written at initialization, plus one anchor
+whenever a block crosses a `SNAPSHOT_ANCHOR_INTERVAL`-slot boundary. These
 anchors are the base every diff chain resolves against, so reconstruction
-always terminates.
+always terminates. Pruned below the finalized block's snapshot interval (see
+[Pruning](#pruning)), which never removes a snapshot a kept state's chain
+still needs.
 
 The genesis validator registry is constant for the life of the chain
 (`validators` is fixed at genesis; the lean STF never mutates it), but it has
@@ -235,9 +243,8 @@ no table of its own: it rides inside every `States` snapshot alongside
 
 ### StateDiffs
 
-`root → StateDiff`. A parent-linked diff written for **every** non-genesis
-state. Never pruned, so together with the snapshots this preserves the full
-state history. See [State Storage](#state-storage-snapshots--diffs) for what a
+`slot ‖ root → StateDiff`. A parent-linked diff written for **every**
+non-anchor state, pruned together with `States`. See [State Storage](#state-storage-snapshots--diffs) for what a
 diff contains and how states are rebuilt.
 
 ### Metadata
@@ -256,6 +263,7 @@ different checkpoints.
 | `config`                       | `Config`     | both   | The node's runtime configuration                              |
 | `head`                         | `H256`       | both   | Current fork choice head                                      |
 | `anchor_slot`                  | `u64`        | both   | The slot this directory's chain begins at                     |
+| `states_pruned_below`          | `u64`        | both   | Exclusive upper bound of the `States`/`StateDiffs` slots already range-deleted; absent means 0 |
 | `safe_target`                  | `H256`       | lean   | Current safe target (see [lmd_ghost.md](lmd_ghost.md))        |
 | `latest_justified`             | `Checkpoint` | both   | Latest justified checkpoint                                   |
 | `latest_finalized`             | `Checkpoint` | both   | Latest finalized checkpoint                                   |
@@ -508,7 +516,7 @@ the directory was deleted.
 Storing a full `State` per block would be wasteful: most fields never change
 or change predictably. Instead, `insert_state` writes:
 
-1. **Always** a `StateDiff` keyed by the block root, linked to its parent via
+1. **Always** a `StateDiff` keyed by the block's slot and root, linked to its parent via
    `base_root` (the block's `parent_root`).
 2. **Only at anchors** a full snapshot into `States`. A block is an anchor
    when it crosses a `SNAPSHOT_ANCHOR_INTERVAL` slot boundary relative
@@ -594,8 +602,8 @@ sequence of independent write batches:
    ├─ 3. insert_state()                 cache + PendingStates insert (synchronous),
    │      (hands the state to the        then a hand-off to the background writer
    │       storage crate's own writer     thread, which commits
-   │       thread; see below)                   StateDiffs[root]
-   │                                            States[root]         (anchors only)
+   │       thread; see below)                   StateDiffs[slot‖root]
+   │                                            States[slot‖root]    (anchors only)
    │                                      on its own schedule, not this one
    │
    └─ 4. update_head()                 Metadata: head
@@ -658,10 +666,25 @@ processed):
   not needed for fork choice, reorg safety, or re-aggregation once outside
   the window.
 
-**Never pruned, by design:** `BlockHeaders`, `BlockBodies`, `BlockRoots`,
-`States`, `StateDiffs`, and `Metadata`. Headers, bodies, the canonical slot
-index, and the snapshot+diff chain are the full historical record; only the
-proof blobs and the (non-finalized) fork choice index are disposable.
+- `prune_finalized_states`: range-deletes `States` and `StateDiffs` over
+  `[watermark, cut)`, where `cut` is the start of the snapshot interval that
+  holds the finalized **block** (its own slot from `BlockHeaders`, not the
+  checkpoint's epoch-start slot) and `watermark` is `states_pruned_below`, the
+  previous call's `cut`. The watermark is written in the same atomic batch as
+  the deletes, so consecutive ranges are adjacent and never overlap, even
+  across restarts. Safe because a diff-chain walk stops at the first snapshot
+  on its branch, and the first block of any branch inside an interval is a
+  snapshot, so every walk from a kept state stops at or after `cut`; blocks
+  below finality are never imported again, so nothing is written below the
+  watermark afterwards. Lean runs it inside `prune_old_data`; beacon runs it
+  from the chain actor's finality horizon, after every tick and import, where
+  the common case is one metadata read.
+
+**Never pruned, by design:** `BlockHeaders`, `BlockBodies`, `BlockRoots`, and
+`Metadata`. Headers, bodies and the canonical slot index are the full
+historical record (and the slot lookup every state read depends on); only the
+proof blobs, the finalized states and the (non-finalized) fork choice index are
+disposable.
 
 **Not pruned yet, unlike the six above:** `DataColumns`. It is not part of the
 historical-record set above; it simply has no pruning rule written for it,
@@ -714,7 +737,7 @@ The first two funnel into `init_store`, which writes the anchor in **one
 atomic batch**: the `Metadata` keys a lean directory needs (the format version
 and the chain and preset tags, time, config, head = safe_target = anchor root,
 justified = finalized = anchor checkpoint), the anchor header, its
-`BlockRoots` entry, the body if non-empty, a full snapshot into `States` (the
+`BlockRoots` entry, the body if non-empty, a full snapshot into `States` keyed by the anchor's slot and root (the
 base of every future diff chain), and the anchor's `LiveChain` entry. `time`
 starts at genesis rather than at zero because it is an absolute timestamp, so
 genesis is the value that means "the clock has not moved yet"; every derived

@@ -3081,6 +3081,10 @@ impl BlockChainServer {
     /// import — the two places beacon finality can move — bounds that by the
     /// unfinalized window rather than by this node's uptime.
     ///
+    /// Also prunes the states of finalized snapshot intervals on beacon (see
+    /// [`Store::prune_finalized_states`]), which shares this horizon and these
+    /// two call sites; lean does that in `Store::prune_old_data` instead.
+    ///
     /// Also bounds the two beacon scratch caches with the same horizon, the
     /// execution-hash cache and the optimistic-root set, which is why the
     /// finalized slot is read before the "nothing is held" early return rather
@@ -3112,6 +3116,23 @@ impl BlockChainServer {
         // takes one root per import and neither `mark_validated` nor
         // `invalidate_subtree` ever comes for them.
         self.store.prune_beacon_optimistic_roots(finalized_slot);
+
+        // Same horizon again: the states of finalized snapshot intervals. Beacon
+        // only, since lean prunes them inside `Store::prune_old_data`, and doing
+        // it here too would prune twice. A call with unchanged finality is one
+        // metadata read, which is what makes running it after every tick safe.
+        if self.store.chain() == Chain::Beacon
+            && let Some(pruned) = self
+                .store
+                .prune_finalized_states()
+                .expect("prune finalized states")
+        {
+            info!(
+                from_slot = pruned.start,
+                below_slot = pruned.end,
+                "Pruned finalized states"
+            );
+        }
 
         if self.blocks_awaiting_columns.is_empty() {
             return;
