@@ -62,14 +62,19 @@ impl BuiltInNetwork {
             .wrap_err_with(|| format!("the built-in {} config.yaml did not parse", self.name()))?;
         super::check_preset(parsed.config.preset_base.as_str())?;
         super::check_constants(&parsed.config)?;
-        // A built-in config can carry a fork this build cannot process (Sepolia
-        // schedules gloas), and saying so at every start is the point: the
-        // node follows the chain only up to that fork's epoch.
+        // A built-in config can carry a fork whose *keys* this build claims
+        // but whose state transition it does not implement yet (gloas), or
+        // one whose keys it does not even claim (heze). The ignored-keys
+        // warning below only ever said the second half of that; it used to
+        // say both, back when GLOAS_* were unclaimed too. `warn_if_unfollowed_fork_scheduled`
+        // says the first half explicitly instead of leaving it to be
+        // discovered as a stall.
         parsed.warn_about_ignored_keys();
 
         let genesis = chain.genesis();
         let mut config = parsed.config;
         super::derive_genesis_fields(&mut config, genesis.genesis_time);
+        super::warn_if_unfollowed_fork_scheduled(self.name(), &config);
 
         Ok(BuiltIn {
             config,

@@ -591,15 +591,30 @@ impl BeaconNodeApi for HttpBeaconNode {
             ))
         })?;
         // Refused by name rather than left to fail as an opaque decode error,
-        // the same way a pre-electra block is. Electra widened `Attestation`
-        // with `committee_bits`, so an earlier fork's bytes are a different
-        // shape and this client has no container for them.
-        if fork < ForkName::Electra {
-            return Err(Error::InconsistentResponse(format!(
-                "node produced a {} aggregate, which this client does not publish; electra is \
-                 the earliest supported",
-                fork.as_str()
-            )));
+        // the same way a pre-electra block is (see `ProducedBlock::from_ssz`).
+        // Electra widened `Attestation` with `committee_bits`, so an earlier
+        // fork's bytes are a different shape and this client has no container
+        // for them. Named explicitly rather than `fork < ForkName::Electra`,
+        // so a fork added after fulu is not silently waved through as
+        // electra-shaped.
+        match fork {
+            // Gloas's own attestation shape is not this client's electra one
+            // (EIP-7549 continues to change under EIP-7688), so it is
+            // refused by name too rather than mis-decoded.
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb
+            | ForkName::Gloas
+            | ForkName::Lean => {
+                return Err(Error::InconsistentResponse(format!(
+                    "node produced a {} aggregate, which this client does not publish; electra \
+                     is the earliest supported",
+                    fork.as_str()
+                )));
+            }
+            ForkName::Electra | ForkName::Fulu => {}
         }
         let attestation = Attestation::try_from(&response.data)?;
         // The same contract the other two fetches carry, enforced here so a

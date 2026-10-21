@@ -145,6 +145,7 @@ All checks are performed before a downloaded checkpoint anchor is accepted. The 
 | Justified epoch >= finalized epoch | Justified must be at or after finalized |
 | Block header slot <= state slot | Block header cannot be ahead of the state |
 | Block's fork matches state's fork | The fetched block must decode as the same fork the state resolved to |
+| Anchor is not gloas (`refuse_unfollowable_fork`) | Nothing delivers payload envelopes or payload attestations to the chain actor yet, so a gloas anchor could not be followed. Runs on both anchor sources, the checkpoint provider's state and a loaded network's own genesis state |
 | Anchor pairing | See [Anchor Pairing](#anchor-pairing) below |
 
 Beacon has no same-slot-checkpoints-matching-roots check: nothing here computes two separate checkpoint roots to compare, since a trusted checkpoint-synced anchor is finalized by fiat, and the beacon spec's own construction applies that single checkpoint to all four of the store's justified/finalized slots at once.
