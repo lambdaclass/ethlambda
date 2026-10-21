@@ -1118,11 +1118,6 @@ pub fn get_forkchoice_store(
     // this file's only outright whole-`BeaconState` clone. `checkpoint_state`
     // now derives that second copy on demand instead of caching it, so the
     // anchor is written once.
-    // Captured before `anchor_state` moves into `insert_state` below:
-    // `set_unrealized_justification` needs the anchor's own slot to persist
-    // alongside its checkpoint (see `Table::BeaconUnrealizedJustifications`),
-    // and `insert_state` takes the state by value.
-    let anchor_slot = anchor_state.slot();
     store
         .insert_signed_block(anchor_root, anchor_block)
         .expect("insert");
@@ -1841,6 +1836,36 @@ fn parent_node(parent_root: Root, parent_status: PayloadStatus) -> ForkChoiceNod
     }
 }
 
+/// Whether the proposer boost on `boost_root` can reach a node the head
+/// descent compares: whether `boost_root` is `justified_root` or a block under
+/// it in `index`.
+///
+/// The boost adds weight to the boosted block and its ancestors only, and the
+/// descent compares only blocks under the justified root, so a boosted block
+/// outside that subtree changes no comparison, whatever the gloas gate would
+/// answer. Such a block can hold the boost: the boost rule asks only that it
+/// share the pre-import head's shuffling dependent root, which can sit below
+/// the justified block, and a finalization advance later in the same slot can
+/// leave it off the finalized chain, its parent pruned from `index`. Skipping
+/// it keeps the gate from reading that parent, which would raise and fail the
+/// head computation until the next slot clears the boost. A boosted block
+/// whose own row is gone (`invalidate_subtree`) is skipped the same way.
+///
+/// A justified root missing from `index` answers `true`, leaving the boost to
+/// its own rules: on a consistent store the justified block sits at or above
+/// the finalized one and keeps its row, and the descent could not start from
+/// it anyway.
+fn boost_reaches_the_descent(
+    index: &HashMap<Root, (Slot, Root)>,
+    justified_root: Root,
+    boost_root: Root,
+) -> bool {
+    let Some(&(justified_slot, _)) = index.get(&justified_root) else {
+        return true;
+    };
+    get_ancestor_or_missing(index, boost_root, justified_slot) == Ok(justified_root)
+}
+
 /// The lowest slot [`compute_node_weights`] weighs: the least of the finalized
 /// block's slot, the justified block's slot and, when a proposer boost root is
 /// set and indexed, its parent's slot. All three come from `index`.
@@ -1867,16 +1892,19 @@ fn walk_bound(store: &Store, index: &HashMap<Root, (Slot, Root)>) -> Slot {
 /// `rules` selects the two fork-dependent rules: how a block's payload
 /// dimension is read (see [`PayloadTree`]) and whether the proposer boost is
 /// gated by `should_apply_proposer_boost` (gloas) or applies whenever a boost
-/// root is set (pre-gloas).
+/// root is set (pre-gloas). Under either, a boosted block outside the justified
+/// subtree gets no boost at all; see [`boost_reaches_the_descent`].
 ///
 /// # The bound
 ///
 /// Vote placement, the fold and the boost chain all stop at [`walk_bound`]'s
 /// slot: a block below it gets no weight and is never read, so a head
 /// computation covers the unfinalized window, not the history since the
-/// anchor. (A beacon store never prunes its block index, so without the bound
-/// every call would fold, and read the payload link of, every block down to
-/// the anchor.) The bound is the least of the finalized block's slot, the
+/// anchor. (Finality pruning drops the index rows below the finalized block's
+/// own slot, so on a live node the index already starts there; the bound
+/// holds the walk to that window whatever the index still keeps below it,
+/// such as the rows of a prune skipped for a finalized root with no block
+/// entry.) The bound is the least of the finalized block's slot, the
 /// justified block's slot and the boosted block's parent's slot, and it
 /// changes no answer the head reads, whichever of the three is least:
 /// - The descent compares only descendants of the justified root, so every
@@ -1892,9 +1920,10 @@ fn walk_bound(store: &Store, index: &HashMap<Root, (Slot, Root)>) -> Slot {
 ///   construction.
 ///
 /// On a live node the least of the three is the finalized block's slot: the
-/// justified block is at or above it, and the boosted block is a current-slot
-/// block, which descends from the finalized root, so its parent is too. That
-/// is what keeps the walk to the unfinalized window.
+/// justified block is at or above it, and a boost applies only to a block
+/// under the justified root (a current-slot block, so never that root itself),
+/// whose parent is therefore at or above the justified block too. That is
+/// what keeps the walk to the unfinalized window.
 ///
 /// The weight of a node below the bound is not computed, and reads as `0`.
 pub fn compute_node_weights(
@@ -2008,18 +2037,27 @@ pub fn compute_node_weights(
     // The boost. Gloas asks `should_apply_proposer_boost`, fed the parent's
     // score from the table just built; before gloas it applies whenever a boost
     // root is set and still indexed, the tolerance `compute_weights` documents.
+    // Neither runs for a boosted block outside the justified subtree, which no
+    // node the descent compares would gain from.
     let boost_root = store.proposer_boost_root();
-    let boost_applies = match rules {
-        ForkRules::PreGloas => !boost_root.is_zero() && in_window(&boost_root),
-        ForkRules::Gloas => {
-            should_apply_proposer_boost_with(store, config, committees, index, &state, |parent| {
-                Ok(weights.raw(ForkChoiceNode {
-                    root: parent,
-                    payload_status: PayloadStatus::Pending,
-                }))
-            })?
-        }
-    };
+    let justified_root = store.beacon_justified_checkpoint().root;
+    let boost_applies = boost_reaches_the_descent(index, justified_root, boost_root)
+        && match rules {
+            ForkRules::PreGloas => !boost_root.is_zero() && in_window(&boost_root),
+            ForkRules::Gloas => should_apply_proposer_boost_with(
+                store,
+                config,
+                committees,
+                index,
+                &state,
+                |parent| {
+                    Ok(weights.raw(ForkChoiceNode {
+                        root: parent,
+                        payload_status: PayloadStatus::Pending,
+                    }))
+                },
+            )?,
+        };
     if boost_applies {
         let proposer_score = get_proposer_score(store, config)?;
         let mut root = boost_root;
@@ -5763,8 +5801,8 @@ mod tests {
             epoch: 0,
             root: genesis_root,
         };
-        store.set_unrealized_justification(head_root, checkpoint);
-        store.set_unrealized_justification(parent_root, checkpoint);
+        store.set_unrealized_justification(head_root, 2, checkpoint);
+        store.set_unrealized_justification(parent_root, 1, checkpoint);
 
         // One slot past `head_root`'s own slot (2): `current_time_ok`.
         let proposer_head = get_proposer_head(&store, head_root, 3, &config, &committees)
@@ -7295,7 +7333,7 @@ mod tests {
             )
             .unwrap();
         store.insert_state(b_root, state).unwrap();
-        store.set_unrealized_justification(b_root, Checkpoint::default());
+        store.set_unrealized_justification(b_root, first_gloas_slot, Checkpoint::default());
 
         store
             .set_time_ms((first_gloas_slot - 1) * config.slot_duration_ms)
@@ -7756,7 +7794,7 @@ mod tests {
                 test_state::with_validators(preset::SLOTS_PER_EPOCH as usize),
             )
             .unwrap();
-        store.set_unrealized_justification(b_root, Checkpoint::default());
+        store.set_unrealized_justification(b_root, anchor_slot + 1, Checkpoint::default());
         store.set_proposer_boost_root(b_root);
 
         // No votes for the anchor (the boosted block's parent, one slot
@@ -7782,6 +7820,73 @@ mod tests {
             .expect("a pruned vote reached through should_apply_proposer_boost must not be fatal");
         gloas_get_head(&store, &config, &committees)
             .expect("the same tolerance must hold through the whole head walk");
+    }
+
+    /// A boosted block outside the justified subtree gets no boost under
+    /// either fork's rules, and the gloas gate is never asked about it. Its
+    /// parent has lost its index row here, as a finalization advance after
+    /// the boost was set prunes it, so the gate itself raises: the walk must
+    /// not reach it.
+    #[test]
+    fn a_boost_outside_the_justified_subtree_is_skipped_without_its_gate() {
+        let config = Config::active();
+        let (mut store, anchor_root, anchor_slot) =
+            anchored_store(preset::SLOTS_PER_EPOCH as usize);
+        let committees = CommitteeCache::default();
+
+        // anchor ─┬─ justified (anchor + 1)
+        //         └─ parent (anchor + 1, row pruned) ─ boosted (anchor + 2)
+        let justified_root = Root::repeat_byte(0xa1);
+        let parent_root = Root::repeat_byte(0xa2);
+        let boost_root = Root::repeat_byte(0xa3);
+        store
+            .insert_signed_block(justified_root, block(anchor_slot + 1, anchor_root))
+            .unwrap();
+        store
+            .insert_signed_block(parent_root, block(anchor_slot + 1, anchor_root))
+            .unwrap();
+        store
+            .insert_signed_block(boost_root, block(anchor_slot + 2, parent_root))
+            .unwrap();
+        store.delete_live_chain_entries(&[(anchor_slot + 1, parent_root)]);
+
+        let justified = Checkpoint {
+            epoch: store.beacon_justified_checkpoint().epoch + 1,
+            root: justified_root,
+        };
+        // The weights read the justified checkpoint's state, cached here so
+        // that no slot processing is needed to reach it.
+        let justified_state = store.get_state(&anchor_root).unwrap().unwrap();
+        store.cache_state(
+            CacheKey::CheckpointState {
+                epoch: justified.epoch,
+                root: justified.root,
+            },
+            justified_state,
+        );
+        let finalized = store.beacon_finalized_checkpoint();
+        update_checkpoints(&mut store, justified, finalized);
+        store.set_proposer_boost_root(boost_root);
+
+        assert_eq!(
+            failed_assertion(should_apply_proposer_boost(&store, &config, &committees)),
+            Some("parent_root in store.blocks"),
+            "the gate reads the boosted block's parent, which is gone"
+        );
+        let index = store.block_index();
+        let boosted = ForkChoiceNode {
+            root: boost_root,
+            payload_status: PayloadStatus::Pending,
+        };
+        for rules in [ForkRules::PreGloas, ForkRules::Gloas] {
+            let weights = compute_node_weights(&store, &index, &config, &committees, rules)
+                .unwrap_or_else(|err| panic!("{rules:?}: the gate must not be reached: {err:?}"));
+            assert_eq!(
+                weights.weight(boosted, anchor_slot + 2),
+                0,
+                "{rules:?}: a block outside the justified subtree gets no boost"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -8229,7 +8334,7 @@ mod tests {
             .insert_signed_block(anchor_root, fulu_block(anchor_slot, Root::ZERO))
             .unwrap();
         store.insert_state(anchor_root, fulu_state.clone()).unwrap();
-        store.set_unrealized_justification(anchor_root, Checkpoint::default());
+        store.set_unrealized_justification(anchor_root, anchor_slot, Checkpoint::default());
 
         let mut roots = vec![anchor_root];
         let mut slots: Vec<Slot> = vec![anchor_slot];
@@ -8299,6 +8404,7 @@ mod tests {
             let unrealized_epoch = if justified_moved { rng.below(2) } else { 0 };
             store.set_unrealized_justification(
                 root,
+                slot,
                 Checkpoint {
                     epoch: unrealized_epoch,
                     root: Root::ZERO,
@@ -8403,13 +8509,17 @@ mod tests {
         branches_filtered_out: usize,
     }
 
-    /// Whether `root` is `justified` or a block below it in `index`.
+    /// Whether `root` is `justified` or a block below it in `index`. A root
+    /// `index` no longer holds, as finality pruning leaves one, is neither.
     fn descends_from_justified(
         index: &HashMap<Root, (Slot, Root)>,
         root: Root,
         justified: Root,
     ) -> bool {
         let justified_slot = index[&justified].0;
+        if !index.contains_key(&root) {
+            return false;
+        }
         let mut cursor = root;
         while index[&cursor].0 > justified_slot {
             cursor = index[&cursor].1;
@@ -8426,7 +8536,9 @@ mod tests {
     /// Node weights are compared only for nodes at or above `walk_bound`, which
     /// can be lower than the finalized slot: the walk weighs nothing below it
     /// (see `compute_node_weights`' bound), so those nodes read as `0` where
-    /// the references count their votes.
+    /// the references count their votes. They are also compared only inside
+    /// the justified subtree, the nodes the descent compares, since the walk
+    /// gives no boost to a boosted block outside it.
     fn check_walk_against_references(
         seed: u64,
         tree: &mut RandomTree,
@@ -8465,11 +8577,14 @@ mod tests {
                 "seed {seed} slot {current_slot}: head differs from gloas_get_head"
             );
 
+            // Weights of the nodes the descent compares, the justified subtree:
+            // a boost root outside it is skipped by the walk but not by
+            // `gloas_get_weight`, which reaches no node inside it either way.
             let weights =
                 compute_node_weights(store, &index, &config, &committees, ForkRules::Gloas)
                     .unwrap_or_else(|err| panic!("seed {seed}: weights failed: {err:?}"));
             for (&root, &slot) in tree.roots.iter().zip(&tree.slots) {
-                if slot < bound {
+                if slot < bound || !descends_from_justified(&index, root, justified) {
                     continue;
                 }
                 for payload_status in [
@@ -8870,36 +8985,6 @@ mod tests {
         assert!(
             stats.pre_fork_weights > 0,
             "no weight was compared: {stats:?}"
-        );
-    }
-
-    /// The bound is the least of three slots so that it holds without assuming
-    /// the boosted block descends from the finalized one: with the boost on the
-    /// finalized block itself, the boost gate reads the score of a parent below
-    /// the finalized slot, and the walk still agrees with the unbounded
-    /// references on the head and on every node at or above the bound.
-    #[test]
-    fn the_bound_covers_a_boosted_finalized_block() {
-        let mut stats = WalkStats::default();
-        let mut boosted_finalized = 0;
-        for seed in 0..200 {
-            let mut tree = random_tree(seed, Arc::new(InMemoryBackend::new()));
-            if !tree.justified_moved {
-                continue;
-            }
-            let justified = finalize_at_justified(&mut tree);
-            tree.store.set_proposer_boost_root(justified.root);
-            if boost_gate_scans_for_equivocation(&tree) {
-                continue;
-            }
-            boosted_finalized += 1;
-            for current_slot in comparison_slots(&tree) {
-                check_walk_against_references(seed, &mut tree, current_slot, &mut stats);
-            }
-        }
-        assert!(
-            boosted_finalized > 0,
-            "the finalized block was never boosted"
         );
     }
 

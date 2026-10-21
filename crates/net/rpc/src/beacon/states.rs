@@ -376,8 +376,7 @@ fn validator_response(
     let index = match id {
         ValidatorId::Index(index) => index,
         ValidatorId::Pubkey(pubkey) => state
-            .validators()
-            .iter()
+            .iter_validators()
             .position(|validator| validator.pubkey == pubkey)
             .ok_or(ApiError::NotFound("validator not found"))?
             as ValidatorIndex,
@@ -385,12 +384,9 @@ fn validator_response(
     let validator = state
         .validator(index)
         .map_err(|_| ApiError::NotFound("validator not found"))?;
-    let balance = *state
-        .balances()
-        .get(index as usize)
-        .ok_or(ApiError::Internal(
-            "the registry and balances disagree in length",
-        ))?;
+    let balance = state
+        .balance(index)
+        .map_err(|_| ApiError::Internal("the registry and balances disagree in length"))?;
     let status = ValidatorStatus::of(validator, balance, compute_epoch_at_slot(state.slot()));
     Ok(serde_json::json!({
         "execution_optimistic": store.is_beacon_optimistic(root),
