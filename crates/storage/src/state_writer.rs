@@ -59,6 +59,7 @@ use tracing::error;
 use crate::api::{StorageBackend, StorageReadViewExt, Table};
 use crate::beacon_state_delta;
 use crate::error::Error;
+use crate::metrics::StateCacheMethod;
 use crate::state_codec::{decode_lean_state_value, decode_state_value, encode_state_value};
 use crate::state_diff::StateDiff;
 use crate::store::Chain;
@@ -131,6 +132,18 @@ pub enum CacheKey {
 /// The shared state cache, memoizing post-states by block root.
 pub(crate) type StateCache = Mutex<LruCache<CacheKey, Arc<BeaconState>>>;
 
+/// Looks `key` up in `cache`, promoting it to most recently used, and counts
+/// the lookup as `method`'s.
+pub(crate) fn cache_get(
+    cache: &StateCache,
+    key: CacheKey,
+    method: StateCacheMethod,
+) -> Option<Arc<BeaconState>> {
+    let state = cache.lock().unwrap().get(&key).cloned();
+    crate::metrics::inc_state_cache_lookups(method, &key, state.is_some());
+    state
+}
+
 /// Reads the post-state for `root`, from wherever it currently lives.
 ///
 /// The single state read path, called both by
@@ -159,7 +172,7 @@ pub(crate) fn read_state(
     root: &H256,
 ) -> Result<Option<Arc<BeaconState>>, Error> {
     let key = CacheKey::BlockState(*root);
-    if let Some(state) = cache.lock().unwrap().get(&key).cloned() {
+    if let Some(state) = cache_get(cache, key, StateCacheMethod::Get) {
         return Ok(Some(state));
     }
     if let Some(state) = pending.get(root) {
