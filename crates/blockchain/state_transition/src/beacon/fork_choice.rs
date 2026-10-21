@@ -10234,7 +10234,13 @@ mod tests {
             execution_requests: ExecutionRequests::default(),
             sync_aggregate: crate::beacon::block_production::empty_sync_aggregate(),
         };
-        let message = assemble_block(&advanced, inputs, &config).expect("assemble");
+        let message = assemble_block(
+            &advanced,
+            inputs,
+            &config,
+            crate::beacon::stf::block::BlockProcessingOptions::default(),
+        )
+        .expect("assemble");
         let state_root = message.state_root;
         let signed = SignedBeaconBlock::Fulu(electra::SignedBeaconBlock {
             message,

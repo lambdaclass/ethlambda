@@ -29,6 +29,7 @@ use ethlambda_state_transition::beacon::{
         test_state::{secret_key_for, sign_for},
     },
     payload_attestation_pool::SharedPayloadAttestationPool,
+    stf::block::RandaoVerification,
     sync_committee_pool::SharedSyncCommitteePool,
 };
 use ethlambda_storage::Store;
@@ -293,6 +294,7 @@ impl World {
             &self.market,
             SLOT,
             randao_reveal(&self.advanced()),
+            RandaoVerification::Verify,
         )
         .unwrap()
     }
@@ -449,6 +451,19 @@ async fn produce(
         produce_request(world, include_payload, config, false),
     )
     .await
+}
+
+/// A request for [`SLOT`] carrying `reveal` and `flag` (a raw query suffix such
+/// as `&skip_randao_verification`), with a self-built bare block wanted back.
+fn produce_request_with(reveal: BlsSignature, flag: &str) -> Request<Body> {
+    Request::post(format!(
+        "/eth/v4/validator/blocks/{SLOT}?randao_reveal=0x{}&include_payload=false{flag}",
+        hex::encode(reveal.0)
+    ))
+    .header("eth-consensus-version", "gloas")
+    .header("content-type", "application/json")
+    .body(Body::from(builder_config(0, 100)))
+    .unwrap()
 }
 
 /// The bid the produced block commits to, from a JSON response either way: a
@@ -1240,4 +1255,34 @@ async fn the_new_routes_are_wired_with_the_production_layers() {
     )
     .await;
     assert_eq!(reply.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn the_infinity_reveal_is_produced_only_when_the_flag_skips_its_verification() {
+    use ethlambda_state_transition::beacon::bls::G2_POINT_AT_INFINITY;
+
+    let world = World::new();
+    let engine = fake_engine(GWEI, false).await;
+    let app = world.app(Some(&engine));
+    let infinity = BlsSignature(G2_POINT_AT_INFINITY);
+
+    for flag in ["&skip_randao_verification=", "&skip_randao_verification"] {
+        let reply = send(&app, produce_request_with(infinity, flag)).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::OK,
+            "{flag}: {}",
+            String::from_utf8_lossy(&reply.body)
+        );
+        assert_eq!(
+            reply.json()["data"]["body"]["randao_reveal"],
+            format!("0x{}", hex::encode(G2_POINT_AT_INFINITY)),
+            "{flag}"
+        );
+    }
+
+    // Without the flag the same reveal is the caller's mistake, as before.
+    let reply = send(&app, produce_request_with(infinity, "")).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(reply.json()["message"], "invalid randao_reveal");
 }

@@ -54,7 +54,7 @@ use crate::test_utils::{RecordingNetwork, beacon_store_at, idle_engine};
 const COUNT: usize = 64;
 
 /// The version this node reports for itself, as `ethlambda beacon` builds it.
-fn own_version() -> ethlambda_engine::types::ClientVersionV1 {
+pub(super) fn own_version() -> ethlambda_engine::types::ClientVersionV1 {
     ethlambda_engine::types::ClientVersionV1 {
         code: "LA".to_string(),
         name: "ethlambda".to_string(),
@@ -419,7 +419,7 @@ fn valid_blob(seed: u8) -> Vec<u8> {
 ///
 /// The fulu bundle carries `blob_count` valid blobs with their commitments and
 /// cell proofs (flattened blob by blob, as `BlobsBundleV2` does).
-async fn fake_execution_client(blob_count: usize) -> ethlambda_engine::EngineClient {
+pub(super) async fn fake_execution_client(blob_count: usize) -> ethlambda_engine::EngineClient {
     fake_execution_client_with(blob_count, None).await
 }
 
