@@ -674,12 +674,33 @@ pub(crate) mod test_utils {
 
     /// [`beacon_store_at`], under `config` instead of mainnet's schedule.
     pub(crate) fn beacon_store_with_config(state: BeaconState, config: Config) -> (Store, H256) {
+        beacon_store_with_genesis(state, config, 1_606_824_023)
+    }
+
+    /// [`beacon_store_at`] on a wall clock whose slot `clock_slot` began a
+    /// second ago, for endpoints that bound a request by the current epoch.
+    pub(crate) fn beacon_store_at_clock(state: BeaconState, clock_slot: u64) -> (Store, H256) {
+        let config = Config::mainnet();
+        let slot_secs = config.slot_duration_ms / 1000;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_secs();
+        let genesis = now_secs - clock_slot * slot_secs - 1;
+        beacon_store_with_genesis(state, config, genesis)
+    }
+
+    fn beacon_store_with_genesis(
+        state: BeaconState,
+        config: Config,
+        genesis_time: u64,
+    ) -> (Store, H256) {
         let slot = state.slot();
         let block = phase0_beacon_block(slot, H256::ZERO);
         let root = block.message_hash_tree_root();
         let mut store = Store::init_beacon(
             Arc::new(InMemoryBackend::default()),
-            1_606_824_023,
+            genesis_time,
             config,
             root,
             Checkpoint { root, slot },
