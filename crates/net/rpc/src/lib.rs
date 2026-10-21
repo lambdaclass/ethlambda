@@ -4,7 +4,6 @@ use std::sync::Arc;
 use axum::{Extension, Router};
 use ethlambda_blockchain::{EventBus, SyncStatusController};
 use ethlambda_network_api::RpcToP2PRef;
-use ethlambda_state_transition::beacon::attestation_pool::SharedAttestationPool;
 use ethlambda_storage::Store;
 use ethlambda_types::aggregator::AggregatorController;
 use tokio_util::sync::CancellationToken;
@@ -190,9 +189,6 @@ pub struct BeaconApiHandles {
     /// Through which the pool, aggregate and block endpoints gossip what a
     /// validator client hands them.
     pub p2p: RpcToP2PRef,
-    /// Filled by the attestation pool endpoint and the aggregator subnets,
-    /// read by the aggregate endpoint and block production.
-    pub attestation_pool: SharedAttestationPool,
     /// The execution client block production builds payloads with. `None`
     /// makes block production, attestation data and aggregation answer 503:
     /// with nothing validating payloads, none has a block it may vouch for.
@@ -223,7 +219,6 @@ pub async fn start_beacon_rpc_server(
     let api_router = build_beacon_api_router(store, config.version, peer_id)
         .layer(Extension(sync_status))
         .layer(Extension(handles.p2p))
-        .layer(Extension(handles.attestation_pool))
         .layer(Extension(beacon::validator::FeeRecipients::default()))
         .layer(Extension(handles.engine))
         .layer(Extension(handles.events))
@@ -433,9 +428,15 @@ pub(crate) mod test_utils {
                 Vec<ethlambda_types::beacon::primitives::ValidatorIndex>,
             )>,
         >,
+        pub(crate) operations:
+            std::sync::Mutex<Vec<ethlambda_types::beacon::operation::BeaconOperation>>,
         pub(crate) subscriptions: std::sync::Mutex<Vec<(u64, u64)>>,
         pub(crate) blocks:
             std::sync::Mutex<Vec<ethlambda_types::beacon::containers::SignedBeaconBlock>>,
+        pub(crate) sidecars:
+            std::sync::Mutex<Vec<ethlambda_types::beacon::containers::DataColumnSidecar>>,
+        /// When set, `publish_beacon_operation` fails as a stopped actor would.
+        pub(crate) fail_operations: std::sync::atomic::AtomicBool,
     }
 
     impl ethlambda_network_api::RpcToP2P for RecordingNetwork {
@@ -463,6 +464,20 @@ pub(crate) mod test_utils {
             Ok(())
         }
 
+        fn publish_beacon_operation(
+            &self,
+            operation: ethlambda_types::beacon::operation::BeaconOperation,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            if self
+                .fail_operations
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(spawned_concurrency::error::ActorError::ActorStopped);
+            }
+            self.operations.lock().unwrap().push(operation);
+            Ok(())
+        }
+
         fn subscribe_attestation_subnets(
             &self,
             subnets: Vec<(u64, u64)>,
@@ -474,8 +489,10 @@ pub(crate) mod test_utils {
         fn publish_beacon_block(
             &self,
             block: ethlambda_types::beacon::containers::SignedBeaconBlock,
+            sidecars: Vec<ethlambda_types::beacon::containers::DataColumnSidecar>,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
             self.blocks.lock().unwrap().push(block);
+            self.sidecars.lock().unwrap().extend(sidecars);
             Ok(())
         }
     }

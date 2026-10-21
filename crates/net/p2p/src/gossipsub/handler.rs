@@ -8,12 +8,14 @@
 use std::time::Instant;
 
 use ethlambda_network_api::{AggregateArrival, BlockAnnouncement, BlockArrival, BlockSource};
+use ethlambda_state_transition::beacon::das;
 use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome, RejectReason};
 use ethlambda_types::{
     ShortRoot,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     beacon::containers::{DataColumnSidecar, SignedBeaconBlock, electra::SingleAttestation},
     beacon::fork::ForkName,
+    beacon::operation::BeaconOperation,
     beacon::primitives::ValidatorIndex,
     block::SignedBlock,
     primitives::HashTreeRoot as _,
@@ -33,6 +35,7 @@ use super::{
     },
 };
 use crate::beacon::constants::ATTESTATION_SUBNET_COUNT;
+use crate::beacon::decode::BeaconGossip;
 use crate::beacon::verdict::{self, Dispatch, GossipId, Validated};
 use crate::beacon::{BeaconWire, decode as beacon_decode, topics as beacon_topics};
 use crate::{P2PServer, metrics};
@@ -255,6 +258,14 @@ fn handle_beacon_gossip(
         triage_envelope(server, payload)
     } else if kind == beacon_topics::PAYLOAD_ATTESTATION_MESSAGE {
         triage_payload_attestation(server, payload)
+    } else if matches!(
+        kind,
+        beacon_topics::VOLUNTARY_EXIT
+            | beacon_topics::PROPOSER_SLASHING
+            | beacon_topics::ATTESTER_SLASHING
+            | beacon_topics::BLS_TO_EXECUTION_CHANGE
+    ) {
+        triage_operation(server, wire, kind, payload)
     } else {
         triage_other(wire, kind, payload)
     };
@@ -544,9 +555,66 @@ fn triage_payload_attestation(server: &P2PServer, payload: &[u8]) -> Dispatch {
     Dispatch::Validate(Validated::PayloadAttestation(message))
 }
 
-/// Decode one of the five beacon topics with nothing particular to report,
-/// and count it. Ignored rather than validated: none of the five has a
-/// consumer, so this always answers `Dispatch::Report`.
+/// Decode one of the four operation topics (`voluntary_exit`,
+/// `proposer_slashing`, `attester_slashing`, `bls_to_execution_change`) and run
+/// its cheap gossip checks: a verdict already, or the operation for
+/// [`verdict::spawn_stateful_checks`] to take further.
+fn triage_operation(server: &P2PServer, wire: &BeaconWire, kind: &str, payload: &[u8]) -> Dispatch {
+    let operation = match beacon_decode::decode_gossip(&wire.config, kind, payload) {
+        Ok(BeaconGossip::VoluntaryExit(exit)) => BeaconOperation::VoluntaryExit(exit),
+        Ok(BeaconGossip::ProposerSlashing(slashing)) => {
+            BeaconOperation::ProposerSlashing(*slashing)
+        }
+        Ok(BeaconGossip::AttesterSlashing(slashing)) => match *slashing {
+            beacon_decode::AttesterSlashing::Electra(slashing) => {
+                BeaconOperation::AttesterSlashing(slashing)
+            }
+            // The pool and the block builder only hold electra's shape:
+            // electra is the earliest fork this node produces blocks for, and
+            // it produces none for gloas.
+            beacon_decode::AttesterSlashing::Phase0(_)
+            | beacon_decode::AttesterSlashing::Gloas(_) => {
+                return Dispatch::Report(Outcome::Ignore(IgnoreReason::NoConsumer));
+            }
+        },
+        Ok(BeaconGossip::BlsToExecutionChange(change)) => {
+            BeaconOperation::BlsToExecutionChange(change)
+        }
+        Ok(other) => {
+            // `handle_beacon_gossip` routes only the four operation kinds
+            // here, and `decode_gossip` answers by topic, so this is a bug.
+            error!(
+                kind,
+                decoded = other.topic_kind(),
+                "Operation topic decoded as another kind"
+            );
+            return Dispatch::Report(Outcome::Reject(RejectReason::Decode));
+        }
+        Err(err) => {
+            metrics::inc_beacon_gossip(kind, "decode_failed");
+            debug!(kind, %err, bytes = payload.len(), "Beacon gossip decode failed");
+            return Dispatch::Report(Outcome::Reject(RejectReason::Decode));
+        }
+    };
+    metrics::inc_beacon_gossip(kind, "decoded");
+    // `debug` like the aggregate topic: operations are rare, but a per-message
+    // line adds nothing the counters do not already say.
+    debug!(kind, bytes = payload.len(), "Beacon operation decoded");
+
+    if let Err(outcome) = gossip::operations::cheap_checks(
+        &server.seen_operations,
+        &server.store,
+        &operation,
+        unix_now_ms(),
+    ) {
+        return Dispatch::Report(outcome);
+    }
+    Dispatch::Validate(Validated::Operation(Box::new(operation)))
+}
+
+/// Decode `sync_committee_contribution_and_proof`, the one beacon topic with
+/// nothing particular to report, and count it. Ignored rather than validated:
+/// it has no consumer, so this always answers `Dispatch::Report`.
 fn triage_other(wire: &BeaconWire, kind: &str, payload: &[u8]) -> Dispatch {
     let outcome = match beacon_decode::decode_gossip(&wire.config, kind, payload) {
         Ok(decoded) => {
@@ -767,10 +835,22 @@ pub async fn publish_beacon_aggregate(
 }
 
 /// Gossip a block a validator client signed, handed over by the Beacon API,
-/// on `beacon_block`, and pass it to the chain actor as a gossiped block would
-/// be: gossipsub never delivers a node its own messages, so this is the only
-/// way this node imports its own proposal.
-pub async fn publish_beacon_block(server: &mut P2PServer, block: SignedBeaconBlock) {
+/// on `beacon_block`, then each of its data column sidecars on its column
+/// subnet (the proposer publishes all of them), and pass the block to the
+/// chain actor as a gossiped block would be: gossipsub never delivers a node
+/// its own messages, so this is the only way this node imports its own
+/// proposal.
+///
+/// The block goes out before the columns so peers can start its state
+/// transition while the columns arrive. The chain actor gets this node's
+/// custody columns first and the block second: its mailbox is FIFO, so the
+/// block finds its columns already stored and never waits in
+/// `blocks_awaiting_columns`.
+pub async fn publish_beacon_block(
+    server: &mut P2PServer,
+    block: SignedBeaconBlock,
+    sidecars: Vec<DataColumnSidecar>,
+) {
     let slot = block.slot();
     let Some(beacon) = server.wire.beacon() else {
         error!(slot, "A beacon block reached a lean node; dropping it");
@@ -796,7 +876,32 @@ pub async fn publish_beacon_block(server: &mut P2PServer, block: SignedBeaconBlo
         block_root = %ShortRoot(&block.message_hash_tree_root().0),
         "Published block to gossipsub"
     );
+    // Under the block's own digest, like the block: the columns are for its
+    // slot, whichever digest the node has switched to so far.
+    for sidecar in &sidecars {
+        let subnet = das::compute_subnet_for_data_column_sidecar(sidecar.index());
+        let topic = IdentTopic::new(beacon_topics::data_column_topic_name(digest, subnet));
+        server
+            .swarm_handle
+            .publish(topic, compress_message(&sidecar.to_ssz()));
+    }
+    if !sidecars.is_empty() {
+        info!(
+            slot,
+            columns = sidecars.len(),
+            "Published data columns to gossipsub"
+        );
+    }
     if let Some(ref blockchain) = server.blockchain {
+        let custody: Vec<DataColumnSidecar> = sidecars
+            .into_iter()
+            .filter(|sidecar| beacon.custody_columns.contains(&sidecar.index()))
+            .collect();
+        if !custody.is_empty() {
+            let _ = blockchain
+                .new_data_column_sidecars(custody)
+                .inspect_err(|err| error!(%err, "Failed to hand the custody columns to the chain"));
+        }
         let _ = blockchain
             .new_block(
                 block,
@@ -853,6 +958,55 @@ pub fn join_aggregator_subnets(server: &mut P2PServer, subnets: Vec<(u64, u64)>)
     }
 }
 
+/// Gossip one operation on its topic, handed over by the Beacon API after
+/// validation. This node is subscribed to all four operation topics, so it
+/// reaches the mesh rather than relying on fanout.
+pub async fn publish_beacon_operation(server: &mut P2PServer, operation: BeaconOperation) {
+    let kind = operation_kind(&operation);
+    let Some(beacon) = server.wire.beacon() else {
+        error!(kind, "A beacon operation reached a lean node; dropping it");
+        return;
+    };
+    // An operation names no slot, so it goes out under the digest of the
+    // wall-clock slot: the one peers on the current fork listen on, even before
+    // this node's own switch at a boundary has run.
+    let digest = beacon
+        .publish_digest(beacon_wall_slot(beacon))
+        .unwrap_or(beacon.fork_digest);
+    let topic = IdentTopic::new(beacon_topics::topic_name(digest, kind));
+    server
+        .swarm_handle
+        .publish(topic, compress_message(&operation.to_ssz()));
+    debug!(kind, "Published operation to gossipsub");
+}
+
+/// The topic kind an operation travels on.
+pub(crate) fn operation_kind(operation: &BeaconOperation) -> &'static str {
+    match operation {
+        BeaconOperation::ProposerSlashing(_) => beacon_topics::PROPOSER_SLASHING,
+        BeaconOperation::AttesterSlashing(_) => beacon_topics::ATTESTER_SLASHING,
+        BeaconOperation::VoluntaryExit(_) => beacon_topics::VOLUNTARY_EXIT,
+        BeaconOperation::BlsToExecutionChange(_) => beacon_topics::BLS_TO_EXECUTION_CHANGE,
+    }
+}
+
+/// Drop pooled operations the head state has already made pointless.
+///
+/// Beacon wire only. Returns silently while there is no head or no state for
+/// it, since the next sweep will find one.
+pub fn prune_operation_pool(server: &P2PServer) {
+    if server.wire.beacon().is_none() {
+        return;
+    }
+    let Some((_slot, root)) = server.store.beacon_head() else {
+        return;
+    };
+    let Ok(Some(state)) = server.store.get_state(&root) else {
+        return;
+    };
+    server.store.operation_pool().prune(&state);
+}
+
 /// Drop attestation pool entries more than an epoch old.
 ///
 /// Inserts prune as they go; this also runs on the aggregator-subnet sweep, so
@@ -862,11 +1016,7 @@ pub fn prune_attestation_pool(server: &P2PServer) {
         return;
     };
     let now = beacon_wall_slot(wire);
-    server
-        .attestation_pool
-        .lock()
-        .expect("attestation pool lock poisoned")
-        .prune_before(now);
+    server.store.attestation_pool().prune_before(now);
 }
 
 /// Leave every aggregator subnet whose last slot has passed.
@@ -1295,13 +1445,31 @@ mod tests {
             .expect("a beacon server has a beacon wire");
 
         assert!(matches!(
-            triage_other(wire, beacon_topics::VOLUNTARY_EXIT, &[0xff; 3]),
+            triage_other(
+                wire,
+                beacon_topics::SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF,
+                &[0xff; 3]
+            ),
             Dispatch::Report(Outcome::Reject(RejectReason::Decode))
         ));
     }
 
     #[tokio::test]
-    async fn a_valid_voluntary_exit_is_ignored_for_lack_of_a_consumer() {
+    async fn garbage_bytes_on_the_voluntary_exit_topic_are_rejected_as_undecodable() {
+        let server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let wire = server
+            .wire
+            .beacon()
+            .expect("a beacon server has a beacon wire");
+
+        assert!(matches!(
+            triage_operation(&server, wire, beacon_topics::VOLUNTARY_EXIT, &[0xff; 3]),
+            Dispatch::Report(Outcome::Reject(RejectReason::Decode))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_decodable_voluntary_exit_goes_on_to_the_stateful_checks() {
         let server = unconnected_beacon_server(Config::mainnet(), 0).await;
         let wire = server
             .wire
@@ -1317,8 +1485,8 @@ mod tests {
         let payload = exit.to_ssz();
 
         assert!(matches!(
-            triage_other(wire, beacon_topics::VOLUNTARY_EXIT, &payload),
-            Dispatch::Report(Outcome::Ignore(IgnoreReason::NoConsumer))
+            triage_operation(&server, wire, beacon_topics::VOLUNTARY_EXIT, &payload),
+            Dispatch::Validate(Validated::Operation(_))
         ));
     }
 

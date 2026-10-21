@@ -265,7 +265,7 @@ pub fn wire_params(
     // and publishing, still are.
     warn!(
         "Advertising cgc={custody_group_count} while subscribing to no sync committee \
-         subnet, and publishing nothing"
+         subnet, and publishing only what its Beacon API clients submit"
     );
 
     Ok(BeaconWireParams {

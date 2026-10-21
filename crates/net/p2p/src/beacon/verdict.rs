@@ -25,14 +25,16 @@ use ethlambda_types::beacon::containers::gloas::{
 use ethlambda_types::beacon::containers::{
     DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock,
 };
+use ethlambda_types::beacon::operation::BeaconOperation;
 use ethlambda_types::beacon::primitives::{Root, ValidatorIndex};
 use libp2p::PeerId;
 use libp2p::gossipsub::{MessageAcceptance, MessageId};
 use spawned_concurrency::message::Message;
 use spawned_concurrency::tasks::{Context, Handler};
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use crate::beacon::column_checks;
+use crate::gossipsub::operation_kind;
 use crate::{P2PServer, metrics};
 
 /// Which gossip message a verdict is for.
@@ -80,6 +82,8 @@ pub(crate) enum Validated {
     Envelope(Box<SignedExecutionPayloadEnvelope>),
     /// A gloas `payload_attestation_message`.
     PayloadAttestation(PayloadAttestationMessage),
+    /// One of the four operation topics. Boxed like the other wide payloads.
+    Operation(Box<BeaconOperation>),
 }
 
 impl Validated {
@@ -118,6 +122,7 @@ impl Validated {
             Self::PayloadAttestation(message) => {
                 gossip::payload_attestation::stateful_checks(store, message)
             }
+            Self::Operation(operation) => gossip::operations::stateful_checks(store, operation),
         }
     }
 
@@ -150,6 +155,7 @@ impl Validated {
             Self::PayloadAttestation(message) => server
                 .seen_payload_attestations
                 .record(message.data.slot, message.validator_index),
+            Self::Operation(operation) => server.seen_operations.record(operation),
         }
     }
 
@@ -205,6 +211,16 @@ impl Validated {
             && server.aggregator_subnets.contains_key(subnet_id)
         {
             pool_aggregator_attestation(server, attestation);
+        }
+        if let Self::Operation(operation) = &self {
+            // Only an accepted operation is pooled; the chain actor consumes
+            // nothing on these topics, so nothing is forwarded to it.
+            if outcome == Outcome::Accept {
+                let kind = operation_kind(operation);
+                let inserted = server.store.operation_pool().insert((**operation).clone());
+                debug!(kind, inserted, "Pooled a gossip operation");
+            }
+            return;
         }
         let Some(blockchain) = &server.blockchain else {
             return;
@@ -272,7 +288,8 @@ impl Validated {
             Self::Aggregate { .. }
             | Self::Attestation { .. }
             | Self::Envelope(_)
-            | Self::PayloadAttestation(_) => {}
+            | Self::PayloadAttestation(_)
+            | Self::Operation(_) => {}
         }
     }
 }
@@ -303,7 +320,8 @@ fn record_liveness(server: &P2PServer, object: &Validated) {
         Validated::Block { .. }
         | Validated::Column(_)
         | Validated::Envelope(_)
-        | Validated::PayloadAttestation(_) => {}
+        | Validated::PayloadAttestation(_)
+        | Validated::Operation(_) => {}
     }
 }
 
@@ -322,9 +340,8 @@ fn pool_gossip_aggregate(server: &P2PServer, aggregate: &SignedAggregateAndProof
         return;
     };
     server
-        .attestation_pool
-        .lock()
-        .expect("attestation pool lock poisoned")
+        .store
+        .attestation_pool()
         .insert_aggregate(signed.message.aggregate.clone());
 }
 
@@ -356,9 +373,8 @@ fn pool_aggregator_attestation(server: &P2PServer, attestation: &SingleAttestati
         return;
     };
     server
-        .attestation_pool
-        .lock()
-        .expect("attestation pool lock poisoned")
+        .store
+        .attestation_pool()
         .insert(attestation, position, committee.len());
 }
 
@@ -459,8 +475,9 @@ pub(crate) fn report(server: &P2PServer, id: GossipId, outcome: Outcome) -> bool
 }
 
 /// The permit pool `object`'s stateful checks draw from: blocks, columns and
-/// envelopes from the gossip pool, everything the attesters send from the
-/// attestation pool, so neither burst starves the other.
+/// envelopes from the gossip pool, everything the attesters send (and the
+/// operation topics) from the attestation pool, so neither burst starves the
+/// other.
 fn permits_for<'a>(
     server: &'a P2PServer,
     object: &Validated,
@@ -471,7 +488,8 @@ fn permits_for<'a>(
         }
         Validated::Aggregate { .. }
         | Validated::Attestation { .. }
-        | Validated::PayloadAttestation(_) => &server.attestation_validation_permits,
+        | Validated::PayloadAttestation(_)
+        | Validated::Operation(_) => &server.attestation_validation_permits,
     }
 }
 
@@ -832,15 +850,20 @@ mod tests {
         };
 
         forward_accepted(phase0_aggregate(5, 1));
-        let pool = server.attestation_pool.clone();
-        assert!(pool.lock().unwrap().block_candidates().is_empty());
+        assert!(
+            server
+                .store
+                .attestation_pool()
+                .block_candidates()
+                .is_empty()
+        );
 
         forward_accepted(electra_aggregate(5, 1));
         let SignedAggregateAndProof::Electra(expected) = electra_aggregate(5, 1) else {
             unreachable!("built as electra")
         };
         assert_eq!(
-            pool.lock().unwrap().block_candidates(),
+            server.store.attestation_pool().block_candidates(),
             vec![expected.message.aggregate]
         );
     }
@@ -912,9 +935,8 @@ mod tests {
         );
         assert!(
             server
-                .attestation_pool
-                .lock()
-                .unwrap()
+                .store
+                .attestation_pool()
                 .block_candidates()
                 .is_empty()
         );
