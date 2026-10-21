@@ -230,6 +230,16 @@ impl<T: Value, U: UpdateMap<T>> ProgressiveIterCow<'_, T, U> {
     }
 }
 
+impl<T: Value, U: UpdateMap<T>> crate::Buffered for ProgressiveList<T, U> {
+    fn apply_updates(&mut self) {
+        ProgressiveList::apply_updates(self);
+    }
+
+    fn has_pending_updates(&self) -> bool {
+        ProgressiveList::has_pending_updates(self)
+    }
+}
+
 impl<T: Value, U: UpdateMap<T>> Default for ProgressiveList<T, U> {
     fn default() -> Self {
         Self::empty()

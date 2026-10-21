@@ -108,6 +108,16 @@ impl<T: Value, const N: usize, U: UpdateMap<T>> Vector<T, N, U> {
     }
 }
 
+impl<T: Value, const N: usize, U: UpdateMap<T>> crate::Buffered for Vector<T, N, U> {
+    fn apply_updates(&mut self) {
+        Vector::apply_updates(self);
+    }
+
+    fn has_pending_updates(&self) -> bool {
+        Vector::has_pending_updates(self)
+    }
+}
+
 impl<T: Value + Default, const N: usize, U: UpdateMap<T>> Default for Vector<T, N, U> {
     /// A vector of `N` default-valued elements.
     fn default() -> Self {

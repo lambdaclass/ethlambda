@@ -104,7 +104,7 @@ pub(super) fn weigh_with_totals(
 /// epoch's participation and genesis has none.
 ///
 /// Shared by every fork from altair on, gloas included: reading
-/// [`crate::beacon::containers::BeaconState::inactivity_scores_mut`] rather than
+/// [`crate::beacon::containers::BeaconState::inactivity_score_mut`] rather than
 /// [`crate::beacon::containers::BeaconState::altair_validator_lists_mut`] is what
 /// makes that so, since this only ever writes a score in place and never
 /// grows or replaces the list, and that narrower accessor extends to a gloas
@@ -129,26 +129,40 @@ fn update_inactivity_scores(
 ) -> Result<()> {
     let leaking = is_in_inactivity_leak(state)?;
 
-    let inactivity_scores = state.inactivity_scores_mut()?;
-    let score_count = inactivity_scores.len();
-    for (index, (flags, _)) in summary.iter().enumerate() {
-        if !flags.is_eligible() {
-            continue;
-        }
-        let score = inactivity_scores
-            .get_mut(index)
-            .ok_or(Error::IndexOutOfBounds {
+    // Decided over an in-order walk of the scores and written afterwards: a
+    // tree-backed list is read with an iterator (one descent per element would
+    // dominate), and only a score that changes is written, since outside a
+    // leak almost every score stays zero and a write of an equal value would
+    // still unshare its leaf from the parent state's.
+    let changes = {
+        let (_, _, inactivity_scores) = state.altair_validator_lists()?;
+        let score_count = inactivity_scores.len();
+        let mut score_iter = inactivity_scores.iter();
+        let mut changes: Vec<(usize, u64)> = Vec::new();
+        for (index, (flags, _)) in summary.iter().enumerate() {
+            // Advanced for ineligible validators too, to stay in step with `index`;
+            // a score list shorter than the registry is an error only at the first
+            // eligible validator without one.
+            let score = score_iter.next().copied();
+            if !flags.is_eligible() {
+                continue;
+            }
+            let score = score.ok_or(Error::IndexOutOfBounds {
                 index,
                 len: score_count,
             })?;
 
-        let updated = next_inactivity_score(*score, flags, leaking, config)?;
-
-        if updated != *score {
-            *score = updated;
+            let updated = next_inactivity_score(score, flags, leaking, config)?;
+            if updated != score {
+                changes.push((index, updated));
+            }
         }
-    }
+        changes
+    };
 
+    for (index, updated) in changes {
+        *state.inactivity_score_mut(index)? = updated;
+    }
     Ok(())
 }
 
@@ -515,7 +529,7 @@ mod tests {
         process_inactivity_updates(&mut state, &Config::mainnet()).unwrap();
 
         let (_, _, scores) = state.altair_validator_lists().unwrap();
-        assert_eq!(scores, before);
+        assert_eq!(scores.to_vec(), before);
     }
 
     #[test]
@@ -568,6 +582,58 @@ mod tests {
         // because the recovery rate outpaces a score this small.
         let (_, _, scores) = state.altair_validator_lists().unwrap();
         assert_eq!(scores[0], 0);
+    }
+
+    /// Outside a leak a missed epoch adds the bias and recovery takes it back
+    /// to zero, so every score ends where it started. The pass must then
+    /// leave the list untouched, not just equal: a write of an equal value
+    /// would still unshare the tree from the parent state's.
+    #[test]
+    fn inactivity_updates_that_change_nothing_leave_the_tree_shared() {
+        let mut state = altair_state_with_validators(4);
+        state.apply_pending_mutations();
+        let before_state = state.clone();
+        let (_, _, before) = before_state.altair_validator_lists().unwrap();
+
+        process_inactivity_updates(&mut state, &Config::mainnet()).unwrap();
+
+        let (_, _, scores) = state.altair_validator_lists().unwrap();
+        assert!(!scores.has_pending_updates(), "no write was buffered");
+        assert!(scores.ptr_eq(&before));
+        assert_eq!(scores.to_vec(), vec![0; 4]);
+    }
+
+    #[test]
+    fn inactivity_updates_buffer_only_the_scores_that_change() {
+        let mut state = altair_state_with_validators(4);
+        {
+            let (previous_epoch_participation, _, scores) =
+                state.altair_validator_lists_mut().unwrap();
+            scores[2] = 3;
+            // Validator 2 participates, so its score falls to zero; the rest
+            // stay at zero.
+            previous_epoch_participation[2] = add_flag(0, constants::TIMELY_TARGET_FLAG_INDEX);
+        }
+        state.apply_pending_mutations();
+
+        process_inactivity_updates(&mut state, &Config::mainnet()).unwrap();
+
+        let (_, _, scores) = state.altair_validator_lists().unwrap();
+        assert!(scores.has_pending_updates());
+        assert_eq!(scores.to_vec(), vec![0; 4]);
+    }
+
+    #[test]
+    fn inactivity_updates_still_reject_an_overflowing_score() {
+        let mut state = altair_state_with_validators(4);
+        {
+            let (_, _, scores) = state.altair_validator_lists_mut().unwrap();
+            scores[1] = u64::MAX;
+        }
+
+        let result = process_inactivity_updates(&mut state, &Config::mainnet());
+
+        assert!(matches!(result, Err(Error::ArithmeticOverflow(_))));
     }
 
     // -----------------------------------------------------------------------
