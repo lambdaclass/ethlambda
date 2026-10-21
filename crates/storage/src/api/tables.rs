@@ -31,9 +31,11 @@ pub enum Table {
     States,
     /// State diffs: slot || root -> StateDiff
     ///
-    /// Parent-linked diff written for every non-anchor state, keyed like
-    /// `States`. Pruned below the finalized snapshot interval together with
-    /// `States`. See `get_state` for reconstruction.
+    /// Diff written for every non-anchor state, keyed like `States`. Lean's is
+    /// parent-linked; a beacon diff is taken against the nearest snapshot on
+    /// its branch, so a beacon state is one snapshot plus one delta. Pruned
+    /// below the finalized snapshot interval together with `States`. See
+    /// `get_state` for reconstruction.
     StateDiffs,
     /// Metadata: string keys -> various scalar values
     Metadata,
