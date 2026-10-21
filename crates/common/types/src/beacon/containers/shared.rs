@@ -263,7 +263,16 @@ pub struct AttestationData {
 
 /// The execution chain's deposit state, as voted on by proposers.
 #[derive(
-    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct Eth1Data {
     /// The deposit contract's merkle root at this point.
@@ -295,9 +304,9 @@ pub struct Eth1Block {
 /// [`HistoricalRoots`] once the window is full.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct HistoricalBatch {
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub block_roots: BlockRoots,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub state_roots: StateRoots,
 }
 
@@ -347,7 +356,16 @@ pub struct DepositMessage {
 
 /// A deposit as recorded by the deposit contract.
 #[derive(
-    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct DepositData {
     pub pubkey: BlsPubkey,
@@ -362,9 +380,19 @@ pub struct DepositData {
 }
 
 /// A deposit together with its merkle proof against the deposit contract root.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 pub struct Deposit {
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub proof: DepositProof,
     pub data: DepositData,
 }

@@ -236,6 +236,7 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `GET` | `/eth/v1/beacon/genesis` | JSON | Genesis time, validators root, fork version |
 | `GET` | `/eth/v1/config/spec` | JSON | The store's `Config`, plus `PRESET_BASE`, `CONFIG_NAME`, the preset and the constants (see below) |
 | `GET` | `/eth/v1/config/deposit_contract` | JSON | The `Config`'s deposit chain id and contract address |
+| `GET` | `/eth/v1/config/fork_schedule` | JSON | Every scheduled fork as `{previous_version, current_version, epoch}` |
 | `GET` | `/eth/v1/node/syncing` | JSON | Head slot, sync distance, whether the head is optimistic |
 | `GET` | `/eth/v1/node/health` | *(status only)* | `200` caught up, `206` syncing or on an optimistic head |
 | `GET` | `/eth/v1/node/version` | JSON | Client version string |
@@ -250,21 +251,21 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `POST` | `/eth/v1/validator/duties/ptc/{epoch}` | JSON | Payload timeliness committee seats for the given indices (gloas) |
 | `GET` | `/eth/v1/validator/attestation_data` | JSON | What to attest to at `slot` |
 | `GET` | `/eth/v1/validator/payload_attestation_data` | JSON or SSZ | What a committee member signs for `slot` (gloas) |
-| `POST` | `/eth/v2/beacon/pool/attestations` | *(status only)* | Validate and gossip `SingleAttestation`s |
+| `POST` | `/eth/v2/beacon/pool/attestations` | *(status only)* | Validate and gossip `SingleAttestation`s (JSON or SSZ body) |
 | `GET`, `POST` | `/eth/v1/beacon/pool/proposer_slashings` | JSON | The operation pool's `ProposerSlashing`s; validate, pool and gossip one |
 | `GET`, `POST` | `/eth/v2/beacon/pool/attester_slashings` | JSON | The pool's `AttesterSlashing`s (GET carries `Eth-Consensus-Version`); validate, pool and gossip one |
 | `GET`, `POST` | `/eth/v1/beacon/pool/voluntary_exits` | JSON | The pool's `SignedVoluntaryExit`s; validate, pool and gossip one |
 | `GET`, `POST` | `/eth/v1/beacon/pool/bls_to_execution_changes` | JSON | The pool's `SignedBLSToExecutionChange`s; POST takes an array |
-| `POST` | `/eth/v1/beacon/pool/payload_attestations` | *(status only)* | Validate, pool and gossip `PayloadAttestationMessage`s (gloas) |
+| `POST` | `/eth/v1/beacon/pool/payload_attestations` | *(status only)* | Validate, pool and gossip `PayloadAttestationMessage`s (gloas; JSON or SSZ body) |
 | `GET` | `/eth/v1/beacon/pool/payload_attestations` | JSON | The pool's votes as aggregated `PayloadAttestation`s (gloas) |
 | `POST` | `/eth/v1/validator/beacon_committee_subscriptions` | *(status only)* | Aggregators' entries join their committee's subnet |
 | `GET` | `/eth/v2/validator/aggregate_attestation` | JSON | The pooled votes for a data root and committee, aggregated |
-| `POST` | `/eth/v2/validator/aggregate_and_proofs` | *(status only)* | Validate and gossip `SignedAggregateAndProof`s |
+| `POST` | `/eth/v2/validator/aggregate_and_proofs` | *(status only)* | Validate and gossip `SignedAggregateAndProof`s (JSON or SSZ body) |
 | `GET` | `/eth/v3/validator/blocks/{slot}` | SSZ or JSON | An unsigned fulu block built on the head (`produceBlockV3`) |
 | `POST` | `/eth/v4/validator/blocks/{slot}` | SSZ or JSON | An unsigned self-built gloas block, with its envelope and blobs when asked (`produceBlockV4`) |
 | `GET` | `/eth/v1/validator/execution_payload_envelopes/{slot}/{beacon_block_root}` | SSZ or JSON | The unsigned envelope `produceBlockV4` built (gloas) |
-| `POST` | `/eth/v2/beacon/blocks` | *(status only)* | Gossip and import a signed fulu or gloas block (`publishBlockV2`, SSZ) |
-| `POST` | `/eth/v1/beacon/execution_payload_envelopes` | *(status only)* | Gossip a signed envelope and its data columns (gloas, SSZ) |
+| `POST` | `/eth/v2/beacon/blocks` | *(status only)* | Gossip and import a signed fulu or gloas block (`publishBlockV2`; JSON or SSZ body) |
+| `POST` | `/eth/v1/beacon/execution_payload_envelopes` | *(status only)* | Gossip a signed envelope and its data columns (gloas; JSON or SSZ body) |
 | `POST` | `/eth/v1/validator/prepare_beacon_proposer` | *(status only)* | Record each validator's fee recipient for block production (see below) |
 | `GET` | `/eth/v1/events` | SSE | Live stream of chain events (see below) |
 
@@ -333,6 +334,12 @@ the chain actor writes, so no request waits on the actor.
   and the head is always that root here. So is every request on a node run
   without an execution client, whose blocks are never marked optimistic
   because nothing validates them.
+- **`states/{state_id}/validators/{validator_id}`** is one entry of the list
+  endpoint, in the same shape and with the same `state_id` handling,
+  `execution_optimistic` and `finalized`. The id is an index or a `0x` pubkey;
+  one naming no validator is a `404` (the list form omits it), a malformed one
+  a `400`. Lighthouse's validator client resolves each key to its index this
+  way, and stays inactive without it.
 - **`pool/attestations`** checks each attestation against the electra
   `beacon_attestation_{subnet_id}` gossip conditions it can evaluate (clock
   window, `data.index == 0`, target epoch, the voted block known and the target
@@ -371,6 +378,16 @@ the chain actor writes, so no request waits on the actor.
   pool, and is handed to the chain actor, which applies it to fork choice and
   announces it on `/eth/v1/events`'s `attestation`. The `Eth-Consensus-Version` header picks the decoder:
   `gloas` takes gloas's `SignedAggregateAndProof`, the others electra's.
+- **Request body encodings.** `pool/attestations`, `pool/payload_attestations`
+  and `aggregate_and_proofs` take either JSON (`application/json`, also the
+  reading of a request with no `Content-Type`) or the SSZ `List[...]` of the
+  same items (`application/octet-stream`): the offset-table encoding every
+  variable-size list uses, which is what prysm sends for aggregates and payload
+  votes, with a JSON retry only on a `415`, and what nimbus can send for
+  attestations. Any other content type is a `415`, and a body that does not
+  decode in the type's encoding a `400`. `POST beacon/blocks` and
+  `POST beacon/execution_payload_envelopes` choose the same way (below); the
+  other validator-client submissions are JSON.
 - **The attestation pool** holds, the best-covered per data root and
   committee: votes from `pool/attestations` and the aggregator subnets,
   aggregates from `aggregate_and_proofs`, and every electra gossip aggregate
@@ -412,8 +429,11 @@ the chain actor writes, so no request waits on the actor.
   `graffiti_policy` parameter Lighthouse's validator client sends is not read.
   `LA` is ethlambda's own code: `identification.md` reserves none for it and
   lets an unlisted client pick any two letters no listed client uses.
-- **`POST beacon/blocks`** takes SSZ and the `Eth-Consensus-Version` header
-  (`fulu` or `gloas`, else `400`; a non-SSZ content type is a `415`). Fulu: a
+- **`POST beacon/blocks`** takes JSON or SSZ, by `Content-Type` as above, and
+  the `Eth-Consensus-Version` header (`fulu` or `gloas`, else `400`; any other
+  content type is a `415`). The JSON is the specification's: lodestar's and
+  nimbus's validator clients post it, teku's falls back to it, and lighthouse
+  and prysm post SSZ. Both reach the same checks after decoding. Fulu: a
   `SignedBlockContents`. A slot the schedule does not place at fulu is a `400`,
   checked before any state is advanced. The block is then checked against its
   **parent's** state advanced to its slot: an unknown parent, a slot not after
@@ -489,8 +509,11 @@ serves the cached unsigned envelope, for a client that asked for the block with
 root.
 
 **`POST /eth/v1/beacon/execution_payload_envelopes`** takes the signed envelope,
-SSZ only (`415` otherwise), with `Eth-Consensus-Version: gloas` and
-`Eth-Blob-Data-Included` (both required, else `400`):
+as JSON or SSZ by `Content-Type` (any other is a `415`; teku's validator client
+posts JSON, nimbus posts the bare envelope as JSON and the contents as SSZ,
+lighthouse posts SSZ, prysm posts SSZ and retries as JSON on a `415`), with
+`Eth-Consensus-Version: gloas` and `Eth-Blob-Data-Included` (both required, else
+`400`):
 
 - `true`: the body is `SignedExecutionPayloadEnvelopeContents` (the signed
   envelope, `kzg_proofs`, `blobs`).
@@ -622,6 +645,20 @@ object that may arrive late or never, and two rules share the flag:
 Pre-gloas responses are unchanged. One helper implements both rules
 (`shared/optimistic.rs`) and every response that carries the flag goes through
 it.
+
+### `GET /eth/v1/config/fork_schedule`
+
+The `Fork` objects of the `Config`'s schedule, oldest first, as
+`{previous_version, current_version, epoch}` with the epoch quoted. Phase0 is
+first, at epoch `0` and its own predecessor; every later fork whose epoch is not
+`FAR_FUTURE_EPOCH` follows, and an unscheduled fork is skipped without breaking
+the chain, so each entry's `previous_version` is the one before it in the list.
+Nimbus's validator client reads this every epoch, requires that linked-list
+shape, and marks a node it cannot decode as incompatible. Nimbus also compares
+`/eth/v1/config/spec` against its own constants before use: the 13 preset
+values, the 7 domain types, `SECONDS_PER_SLOT` (or `SLOT_DURATION_MS`, which
+this node does not report) and every fork's `*_FORK_VERSION` and `*_FORK_EPOCH`,
+with altair scheduled. All are served (a unit test pins the list).
 
 ### `GET /eth/v1/config/spec`
 
