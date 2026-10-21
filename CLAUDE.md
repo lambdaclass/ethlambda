@@ -904,6 +904,9 @@ GENESIS_VALIDATORS:
    - `crates/blockchain/tests/signature_spectests.rs`
    - `crates/blockchain/state_transition/tests/stf_spectests.rs` (state transition)
 
+### Era Replay
+`ethlambda replay-era` replays real mainnet/Sepolia/Hoodi blocks from nimbus `.era` files through the beacon STF and compares the end of each era with the stored state. `.github/workflows/era_replay.yml` runs it on the published image after every push to `main` that touches the STF, types or ssz-tree. See [`docs/era_replay.md`](docs/era_replay.md).
+
 ### Running Tests
 ```bash
 cargo test --workspace --profile release-fast                       # All workspace tests
