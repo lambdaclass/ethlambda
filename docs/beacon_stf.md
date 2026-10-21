@@ -530,13 +530,23 @@ store.
 Fork choice has the same problem on a longer loop: `get_head` weighs every
 validator's latest vote by the voter's balance at the justified checkpoint, and
 the boost needs that state's total active balance. Both read one
-`JustifiedBalances` snapshot (`ethlambda-types`, held in the store's
-`BeaconScratch`) instead of a `validator(i)` descent per vote and a registry
-scan per boost. It is built from `checkpoint_state(justified)` only, keyed by
-the checkpoint it came from, so a moved justified checkpoint is a miss with no
-hook on the writers; it holds a zero for validators that are inactive or
-slashed, and a separate total that still counts slashed-but-active validators
-(the specification's `get_total_active_balance`, floored at one increment).
+`JustifiedBalances` snapshot (`ethlambda-types`) instead of a `validator(i)`
+descent per vote and a registry scan per boost. The store keeps a small cache
+of them (eight entries, lowest epoch evicted first, the current justified
+checkpoint protected), keyed by the checkpoint each came from, so a moved
+justified checkpoint needs no hook on the writers. Block import fills it: from
+a block's own post-state when the block sits at its epoch's first slot, and,
+for a block that crosses into an epoch over empty slots, from the
+epoch-boundary state captured inside `transition_block` by splitting
+`process_slots` at the epoch start. A head computation then reads no justified
+state, and the gloas proposer-boost gate (`is_head_weak`, `is_parent_strong`)
+takes the snapshot plus its raw effective-balance increments and the head and
+parent block states' committees. Only a miss (after a restart, or for a
+checkpoint whose boundary import this node never saw) builds one from
+`checkpoint_state(justified)`. A snapshot holds a zero for validators that are
+inactive or slashed, and a separate total that still counts slashed-but-active
+validators (the specification's `get_total_active_balance`, floored at one
+increment).
 Equivocations stay out of it: they are store-level and can change at any time,
 so they are filtered per vote. `get_weight` stays as the specification's
 per-root definition, and the fork-choice fixture runner checks
