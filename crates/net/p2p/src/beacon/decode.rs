@@ -24,6 +24,7 @@
 //! | `sync_committee_contribution_and_proof` | No, altair onward |
 //! | `data_column_sidecar_{subnet_id}` | Yes, at gloas, by topic digest |
 //! | `execution_payload`, `payload_attestation_message` | No, gloas onward |
+//! | `execution_payload_bid`, `proposer_preferences` | No, gloas onward |
 
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::{
@@ -251,6 +252,22 @@ pub fn decode_sync_committee_contribution(
     bytes: &[u8],
 ) -> Result<altair::SignedContributionAndProof, DecodeError> {
     altair::SignedContributionAndProof::from_ssz_bytes(bytes).map_err(|_| DecodeError::Ssz)
+}
+
+/// Decode an `execution_payload_bid` payload. Gloas on, like
+/// [`decode_execution_payload_envelope`].
+pub fn decode_execution_payload_bid(
+    bytes: &[u8],
+) -> Result<gloas::SignedExecutionPayloadBid, DecodeError> {
+    gloas::SignedExecutionPayloadBid::from_ssz_bytes(bytes).map_err(|_| DecodeError::Ssz)
+}
+
+/// Decode a `proposer_preferences` payload. Gloas on, like
+/// [`decode_execution_payload_envelope`].
+pub fn decode_proposer_preferences(
+    bytes: &[u8],
+) -> Result<gloas::SignedProposerPreferences, DecodeError> {
+    gloas::SignedProposerPreferences::from_ssz_bytes(bytes).map_err(|_| DecodeError::Ssz)
 }
 
 /// Decode a `beacon_aggregate_and_proof` payload, at the fork its slot names.
@@ -667,6 +684,42 @@ mod tests {
         for length in 0..bytes.len() {
             assert!(decode_payload_attestation_message(&bytes[..length]).is_err());
         }
+    }
+
+    #[test]
+    fn an_execution_payload_bid_round_trips() {
+        let mut bid = gloas::SignedExecutionPayloadBid::default();
+        bid.message.slot = slot_of(10);
+        bid.message.builder_index = 4;
+        bid.message.value = 99;
+        bid.message.parent_block_root = Root::repeat_byte(7);
+        let bytes = bid.to_ssz();
+        assert_eq!(decode_execution_payload_bid(&bytes), Ok(bid));
+        assert!(decode_execution_payload_bid(&bytes[..bytes.len() - 1]).is_err());
+        assert_eq!(
+            decode_execution_payload_bid(&[0xff; 3]),
+            Err(DecodeError::Ssz)
+        );
+    }
+
+    #[test]
+    fn proposer_preferences_round_trip() {
+        let mut preferences = gloas::SignedProposerPreferences::default();
+        preferences.message.proposal_slot = slot_of(10);
+        preferences.message.validator_index = 9;
+        preferences.message.dependent_root = Root::repeat_byte(2);
+        let bytes = preferences.to_ssz();
+        assert_eq!(decode_proposer_preferences(&bytes), Ok(preferences));
+        for length in 0..bytes.len() {
+            assert!(decode_proposer_preferences(&bytes[..length]).is_err());
+        }
+        let mut longer = bytes;
+        longer.push(0);
+        assert!(decode_proposer_preferences(&longer).is_err());
+        assert_eq!(
+            decode_proposer_preferences(&[0xff; 3]),
+            Err(DecodeError::Ssz)
+        );
     }
 
     #[test]

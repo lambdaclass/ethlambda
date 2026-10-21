@@ -270,6 +270,10 @@ fn handle_beacon_gossip(
         triage_sync_committee_message(server, payload, subnet_id)
     } else if kind == beacon_topics::SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF {
         triage_sync_contribution(server, payload)
+    } else if kind == beacon_topics::EXECUTION_PAYLOAD_BID {
+        crate::beacon::builder_market::triage_execution_payload_bid(server, payload)
+    } else if kind == beacon_topics::PROPOSER_PREFERENCES {
+        crate::beacon::builder_market::triage_proposer_preferences(server, payload)
     } else {
         triage_other(wire, kind, payload)
     };
@@ -1015,6 +1019,11 @@ pub async fn publish_execution_payload_envelope(
 ) {
     let slot = envelope.message.payload.slot_number;
     let block_root = envelope.message.beacon_block_root;
+    // Gossip never echoes a node's own message, so its own envelope is a
+    // known payload for bid validation only because it is recorded here.
+    server
+        .builder_market
+        .record_execution_payload(&envelope.message);
     let Some(beacon) = server.wire.beacon() else {
         error!(
             slot,

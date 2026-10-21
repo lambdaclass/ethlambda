@@ -75,6 +75,7 @@ pub mod block_production;
 pub use ethlambda_crypto::bls;
 #[cfg(test)]
 mod bls_fixtures;
+pub mod builder_market;
 pub mod das;
 pub mod data_columns;
 pub mod fork_choice;

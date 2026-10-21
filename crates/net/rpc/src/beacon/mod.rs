@@ -15,7 +15,11 @@ use serde::Serialize;
 
 use crate::shared::block_id::IdError;
 
+pub(crate) mod bid_selection;
+pub(crate) mod bids;
 pub(crate) mod blocks;
+pub(crate) mod builder_config;
+pub(crate) mod builders;
 pub(crate) mod config;
 pub(crate) mod envelopes;
 pub(crate) mod events;
@@ -27,6 +31,7 @@ pub(crate) mod node;
 pub(crate) mod operations;
 pub(crate) mod pool;
 pub(crate) mod proposal;
+pub(crate) mod proposer_preferences;
 pub(crate) mod ptc;
 pub(crate) mod states;
 pub(crate) mod sync_committee;
@@ -191,6 +196,9 @@ pub(crate) fn routes(version: &'static str, peer_id: String) -> Router<Store> {
         .merge(gloas_proposal::routes())
         .merge(ptc::routes())
         .merge(sync_committee::routes())
+        .merge(bids::routes())
+        .merge(proposer_preferences::routes())
+        .merge(builders::routes())
 }
 
 #[cfg(test)]
