@@ -10,5 +10,6 @@ pub use handler::{
     prune_attestation_pool, prune_operation_pool, publish_aggregated_attestation,
     publish_attestation, publish_beacon_aggregate, publish_beacon_attestation,
     publish_beacon_block, publish_beacon_operation, publish_block,
+    publish_execution_payload_envelope, publish_payload_attestation_message,
 };
 pub use messages::{aggregation_topic, attestation_subnet_topic, block_topic, topic_kind};

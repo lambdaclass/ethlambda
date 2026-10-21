@@ -705,6 +705,10 @@ and absent is not the same as zero.
 | `ethlambda_validator_blocks_broadcast_not_imported_total` | Counter | Blocks a node broadcast but could not import into its own database, which is what a 202 means. A subset of `blocks_proposed_total`, not a failure: the block reached the network. Points at that node's execution layer |
 | `ethlambda_validator_blocks_refused_total` | Counter | Blocks deliberately not signed, because this process had already proposed that slot for that validator. Should normally read zero |
 | `ethlambda_validator_block_proposal_failures_total` | Counter | Proposal duties that did not end in a published block, including ones abandoned for overrunning |
+| `ethlambda_validator_envelopes_published_total` | Counter | Execution payload envelopes a beacon node accepted for blocks this client proposed (gloas) |
+| `ethlambda_validator_envelope_failures_total` | Counter | Proposed gloas blocks whose self-built envelope was not published. The block is out and the proposal counts as made, but the slot's payload is withheld, so this is the failure that costs the payload. Should read zero |
+| `ethlambda_validator_payload_attestations_published_total` | Counter | Payload timeliness committee votes a beacon node accepted (gloas) |
+| `ethlambda_validator_payload_attestation_failures_total` | Counter | Slots whose payload timeliness committee duty did not result in published votes |
 | `ethlambda_validator_aggregates_published_total` | Counter | Aggregates accepted by a beacon node. Bursty rather than steady: a validator is selected a few times a day, so hours at zero are normal for a small deployment |
 | `ethlambda_validator_aggregation_failures_total` | Counter | Aggregation duties that ended in no published aggregate, including ones abandoned for overrunning the slot |
 | `ethlambda_validator_fee_recipient_mismatches_total` | Counter | Blocks paying execution rewards to an address this client did not request. Should read zero forever; a non-zero value means every proposal is paying somewhere else |
@@ -730,11 +734,20 @@ a failure. `blocks_proposed_total` counts blocks a node accepted;
 but that the node answering could not import, which is a beacon-node fault
 rather than a validator one and is why it is not folded into either.
 
+Gloas adds two pairs. A gloas proposal ends in a block and then an envelope,
+and the envelope's failure does not fail the proposal: `blocks_proposed_total`
+counts the block, and `envelope_failures_total` the reveal that did not follow.
+The committee vote has the same split as the attestation's: `payload_attestations_published_total`
+counts votes accepted and `payload_attestation_failures_total` the slots whose
+duty produced none. A slot where the node knows no block for the committee to
+vote on is neither, since there was nothing to sign.
+
 Two series should read zero for the life of a healthy deployment, and are the
 ones worth alerting on at any non-zero value rather than on a rate:
 `attestations_refused_total` and `blocks_refused_total` mean this client's own
 guards caught a duty they judged unsafe, and `fee_recipient_mismatches_total`
-means blocks are being proposed that pay someone else.
+means blocks are being proposed that pay someone else. `envelope_failures_total`
+belongs with them on a gloas network.
 
 ## Troubleshooting
 

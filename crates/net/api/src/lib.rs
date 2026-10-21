@@ -414,6 +414,25 @@ pub trait RpcToP2P: Send + Sync {
         block: SignedBeaconBlock,
         sidecars: Vec<DataColumnSidecar>,
     ) -> Result<(), ActorError>;
+    /// Gossip a gloas execution payload envelope a validator client signed on
+    /// `execution_payload`, and its blobs' data column sidecars on their
+    /// subnets, then hand both to the chain actor: as for a block, gossip never
+    /// delivers a node its own messages. Checked by the caller as above.
+    ///
+    /// Boxed for the reason [`P2PToBlockChain::new_execution_payload_envelope`]
+    /// is: the envelope carries a whole execution payload.
+    fn publish_execution_payload_envelope(
+        &self,
+        envelope: Box<SignedExecutionPayloadEnvelope>,
+        sidecars: Vec<DataColumnSidecar>,
+    ) -> Result<(), ActorError>;
+    /// Gossip a payload timeliness committee member's vote on
+    /// `payload_attestation_message` and hand it to the chain actor. Checked by
+    /// the caller as above.
+    fn publish_payload_attestation_message(
+        &self,
+        message: PayloadAttestationMessage,
+    ) -> Result<(), ActorError>;
 }
 
 // --- Init messages ---
