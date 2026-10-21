@@ -2822,6 +2822,7 @@ pub(crate) mod tests {
                 crate::ATTESTATION_VALIDATION_PERMITS,
             )),
             aggregator_subnets: HashMap::new(),
+            peer_scoring: None,
         }
     }
 

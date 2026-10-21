@@ -419,6 +419,26 @@ ethlambda-specific, not part of the leanMetrics spec.
 |------|------|-------|-------------------------|--------|---------|
 | `lean_beacon_publish_data_columns_seconds` | Histogram | Time to compute and verify a published block's cells and build its data column sidecars | On every published block that carries blobs and whose cells verify | | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5 |
 
+### Beacon Peer Scoring
+
+Gossipsub peer scoring runs on the beacon wire only; see
+[beacon_wire.md](./beacon_wire.md#peer-scoring) for the parameters and the
+mesh-delivery gate. These are ethlambda-specific, not part of the leanMetrics
+spec.
+
+| Name | Type | Usage | Sample collection event | Labels | Buckets |
+|------|------|-------|-------------------------|--------|---------|
+| `lean_gossipsub_peers_by_score` | Gauge | Gossipsub peers by score band | Every 10 s, in the swarm task | band=non_negative,negative,below_gossip,below_publish,below_graylist | |
+| `lean_gossipsub_score_disconnects_total` | Counter | Peers disconnected for a gossipsub score below the graylist (-16000) | When the 10 s check disconnects one | | |
+| `lean_gossipsub_mesh_delivery_scoring` | Gauge | 1 while mesh message deliveries (P3) are scored, 0 while the head lags the wall clock or is warming up after catching up | Every slot, on the scoring refresh | | |
+
+The bands are mutually exclusive and split at the gossip (-4000), publish
+(-8000) and graylist (-16000) thresholds, so they add up to the peers
+gossipsub knows. `below_graylist` counts the peers that same pass is about to
+disconnect, so it should not hold a value across passes. A persistent
+`below_gossip`/`below_publish` population points at slow peers first: a full
+send queue costs a peer 10 points per dropped message.
+
 ### Beacon Committee Cache
 
 `ethlambda beacon` derives an epoch's attester committees with one whole-epoch
