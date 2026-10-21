@@ -39,11 +39,12 @@ use super::config::Config;
 use super::error::{Error, Result, verify};
 use super::helpers::accessors::{
     ActiveBalanceCache, CommitteeCache, get_beacon_proposer_index, get_block_root,
-    get_current_epoch, get_previous_epoch, get_randao_mix,
+    get_block_root_at_slot, get_current_epoch, get_domain, get_previous_epoch, get_randao_mix,
 };
 use super::helpers::electra::{
     get_attesting_indices, get_indexed_attestation, is_valid_indexed_attestation,
 };
+use super::helpers::misc::compute_signing_root;
 use super::helpers::predicates::is_slashable_validator;
 use super::lean_boundary::lean_state_unreachable;
 use super::stf::{self, ExecutionEngine};
@@ -107,6 +108,52 @@ pub fn empty_sync_aggregate() -> SyncAggregate {
     SyncAggregate {
         sync_committee_bits: Default::default(),
         sync_committee_signature: BlsSignature(bls::G2_POINT_AT_INFINITY),
+    }
+}
+
+/// `candidate` when it passes exactly the check `process_sync_aggregate` will
+/// hold it to, else [`empty_sync_aggregate`].
+///
+/// `state` is the block's pre-state advanced to the block's slot. The
+/// participants are `current_sync_committee`'s members by bits, signing the
+/// block root at `state.slot - 1` under `DOMAIN_SYNC_COMMITTEE` at that slot's
+/// epoch. A pooled aggregate can fail this when the proposer's parent is not
+/// the root the committee signed, or when the head moved across a period: it
+/// then costs the rewards, never the block.
+pub fn verified_sync_aggregate(state: &BeaconState, candidate: SyncAggregate) -> SyncAggregate {
+    let Ok((committee, _)) = state.sync_committees() else {
+        return empty_sync_aggregate();
+    };
+    let participants: Vec<_> = committee
+        .pubkeys
+        .iter()
+        .enumerate()
+        .filter(|(position, _)| {
+            candidate
+                .sync_committee_bits
+                .get(*position)
+                .unwrap_or(false)
+        })
+        .map(|(_, pubkey)| *pubkey)
+        .collect();
+    let previous_slot = state.slot().saturating_sub(1);
+    let Ok(block_root) = get_block_root_at_slot(state, previous_slot) else {
+        return empty_sync_aggregate();
+    };
+    let domain = get_domain(
+        state,
+        constants::DOMAIN_SYNC_COMMITTEE,
+        Some(compute_epoch_at_slot(previous_slot)),
+    );
+    let signing_root = compute_signing_root(block_root, domain);
+    if bls::eth_fast_aggregate_verify(
+        &participants,
+        signing_root,
+        &candidate.sync_committee_signature,
+    ) {
+        candidate
+    } else {
+        empty_sync_aggregate()
     }
 }
 
@@ -444,6 +491,9 @@ pub struct BlockInputs {
     pub execution_payload: ExecutionPayload,
     pub blob_kzg_commitments: Vec<KzgCommitment>,
     pub execution_requests: ExecutionRequests,
+    /// The block's sync aggregate: [`empty_sync_aggregate`], or what
+    /// [`verified_sync_aggregate`] vouched for.
+    pub sync_aggregate: SyncAggregate,
 }
 
 /// The unsigned block for the slot `state` has been advanced to, with its
@@ -451,8 +501,8 @@ pub struct BlockInputs {
 ///
 /// The body votes the state's own `eth1_data` and carries no deposits (the
 /// deposit contract's log has been replaced by EIP-6110's requests), the
-/// slashings, exits and credential changes in `inputs.operations`, and an
-/// empty sync aggregate. The block is run through `process_block` on a copy of
+/// slashings, exits and credential changes in `inputs.operations`, and the
+/// sync aggregate it is given. The block is run through `process_block` on a copy of
 /// `state` with an execution engine that accepts the payload, which is the
 /// node's own execution client's payload; that run is also what rejects a body
 /// the network would, before anything is signed.
@@ -493,7 +543,7 @@ pub fn assemble_block(
             .map_err(|_| {
                 Error::SpecAssert("len(bls_to_execution_changes) <= MAX_BLS_TO_EXECUTION_CHANGES")
             })?,
-        sync_aggregate: empty_sync_aggregate(),
+        sync_aggregate: inputs.sync_aggregate,
         execution_payload: inputs.execution_payload,
         blob_kzg_commitments: inputs
             .blob_kzg_commitments
@@ -611,6 +661,7 @@ mod tests {
     fn an_assembled_block_passes_process_block_and_names_its_post_state() {
         let state = state_to_build_on();
         let inputs = BlockInputs {
+            sync_aggregate: empty_sync_aggregate(),
             randao_reveal: randao_reveal(&state),
             graffiti: Bytes32::repeat_byte(7),
             attestations: Vec::new(),
@@ -651,6 +702,7 @@ mod tests {
         let mut payload = payload_for(&state);
         payload.parent_hash = ExecutionBlockHash::repeat_byte(9);
         let inputs = BlockInputs {
+            sync_aggregate: empty_sync_aggregate(),
             randao_reveal: randao_reveal(&state),
             graffiti: Bytes32::ZERO,
             attestations: Vec::new(),
@@ -1022,11 +1074,91 @@ mod tests {
             operations,
             execution_payload: payload_for(&state),
             blob_kzg_commitments: Vec::new(),
+            sync_aggregate: empty_sync_aggregate(),
             execution_requests: ExecutionRequests::default(),
         };
         let block = assemble_block(&state, inputs, &config).unwrap();
         assert_eq!(block.body.voluntary_exits.len(), 1);
         assert_eq!(block.body.voluntary_exits[0].message.validator_index, 4);
+    }
+
+    /// A pool holding messages from `positions` of the committee, signed the way
+    /// `process_sync_aggregate` will check them (over the block root at
+    /// `state.slot - 1`, under the state's own domain), plus that root.
+    fn pooled_aggregate(
+        state: &BeaconState,
+        signed_root: Option<Root>,
+        positions: &[usize],
+    ) -> (SyncAggregate, Root) {
+        use crate::beacon::sync_committee_pool::SyncCommitteePool;
+        use ethlambda_types::beacon::containers::altair::{
+            SYNC_SUBCOMMITTEE_SIZE, SyncCommitteeMessage,
+        };
+
+        let previous_slot = state.slot() - 1;
+        let parent_root = get_block_root_at_slot(state, previous_slot).unwrap();
+        let root = signed_root.unwrap_or(parent_root);
+        let domain = get_domain(
+            state,
+            constants::DOMAIN_SYNC_COMMITTEE,
+            Some(compute_epoch_at_slot(previous_slot)),
+        );
+        let signing_root = compute_signing_root(root, domain);
+        let (committee, _) = state.sync_committees().unwrap();
+        let mut pool = SyncCommitteePool::default();
+        for &position in positions {
+            let pubkey = committee.pubkeys[position];
+            let index = (0..64)
+                .find(|&index| state.validator(index).unwrap().pubkey == pubkey)
+                .expect("the committee is drawn from the registry");
+            let message = SyncCommitteeMessage {
+                slot: previous_slot,
+                beacon_block_root: parent_root,
+                validator_index: index,
+                signature: sign_for(index as usize, signing_root),
+            };
+            let seats = [(
+                (position / SYNC_SUBCOMMITTEE_SIZE) as u64,
+                position % SYNC_SUBCOMMITTEE_SIZE,
+            )];
+            pool.insert_message(&message, &seats);
+        }
+        (
+            pool.sync_aggregate(previous_slot, parent_root)
+                .expect("something was pooled"),
+            parent_root,
+        )
+    }
+
+    #[test]
+    fn a_pooled_sync_aggregate_passes_assemble_block() {
+        let state = state_to_build_on();
+        let (candidate, _) = pooled_aggregate(&state, None, &[0, 1, 5]);
+        let verified = verified_sync_aggregate(&state, candidate.clone());
+        assert_eq!(verified, candidate);
+        assert!(verified.sync_committee_bits.count_ones() >= 3);
+        let inputs = BlockInputs {
+            randao_reveal: randao_reveal(&state),
+            graffiti: Bytes32::repeat_byte(7),
+            attestations: Vec::new(),
+            operations: Operations::default(),
+            execution_payload: payload_for(&state),
+            blob_kzg_commitments: Vec::new(),
+            execution_requests: ExecutionRequests::default(),
+            sync_aggregate: verified.clone(),
+        };
+        let block = assemble_block(&state, inputs, &Config::mainnet()).unwrap();
+        assert_eq!(block.body.sync_aggregate, verified);
+    }
+
+    #[test]
+    fn a_sync_aggregate_over_the_wrong_root_is_replaced_by_the_empty_one() {
+        let state = state_to_build_on();
+        let (wrong, _) = pooled_aggregate(&state, Some(Root::repeat_byte(1)), &[0, 1]);
+        assert_eq!(
+            verified_sync_aggregate(&state, wrong),
+            empty_sync_aggregate()
+        );
     }
 
     #[test]

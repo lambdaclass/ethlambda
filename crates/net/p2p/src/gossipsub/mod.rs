@@ -2,7 +2,7 @@ mod encoding;
 mod handler;
 mod messages;
 
-pub use encoding::decompress_message;
+pub use encoding::{compress_message, decompress_message};
 pub(crate) use handler::beacon_wall_slot;
 pub(crate) use handler::operation_kind;
 pub use handler::{

@@ -33,12 +33,14 @@ use ethlambda_engine::{
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
     block_production::{
-        BlockInputs, Operations, advance_to_slot, assemble_block, pack_attestations,
-        pack_operations, parse_execution_requests, payload_inputs,
+        BlockInputs, Operations, advance_to_slot, assemble_block, empty_sync_aggregate,
+        pack_attestations, pack_operations, parse_execution_requests, payload_inputs,
+        verified_sync_aggregate,
     },
     data_columns::{self, SidecarError},
     helpers::accessors::get_beacon_proposer_index,
     stf::verify_block_signature,
+    sync_committee_pool::SharedSyncCommitteePool,
 };
 use ethlambda_storage::Store;
 use ethlambda_types::{
@@ -353,6 +355,7 @@ async fn get_block(
     Query(query): Query<ProduceQuery>,
     State(store): State<Store>,
     Extension(engine): Extension<Option<EngineClient>>,
+    Extension(sync_pool): Extension<SharedSyncCommitteePool>,
     Extension(fee_recipients): Extension<FeeRecipients>,
     Extension(OwnVersion(own_version)): Extension<OwnVersion>,
     headers: HeaderMap,
@@ -379,6 +382,7 @@ async fn get_block(
     let produced = produce(
         &store,
         &engine,
+        &sync_pool,
         &fee_recipients,
         &own_version,
         slot,
@@ -422,6 +426,7 @@ async fn get_block(
 async fn produce(
     store: &Store,
     engine: &EngineClient,
+    sync_pool: &SharedSyncCommitteePool,
     fee_recipients: &FeeRecipients,
     own_version: &ClientVersionV1,
     slot: Slot,
@@ -495,7 +500,20 @@ async fn produce(
         }
     };
     let operations = pack_operations(&state, operation_candidates, &config);
-    let inputs = |attestations, operations| BlockInputs {
+    // What the committee signed at the previous slot over this block's parent,
+    // verified exactly as `process_sync_aggregate` will check it against the
+    // state the block is built on; a candidate that fails becomes the empty
+    // aggregate rather than a block the chain would refuse.
+    let candidate = sync_pool
+        .lock()
+        .expect("sync committee pool lock poisoned")
+        .sync_aggregate(slot - 1, head_root);
+    let sync_aggregate = candidate.map_or_else(empty_sync_aggregate, |candidate| {
+        verified_sync_aggregate(&state, candidate)
+    });
+    let has_sync_aggregate = sync_aggregate != empty_sync_aggregate();
+    let inputs = |attestations, operations, sync_aggregate| BlockInputs {
+        sync_aggregate,
         randao_reveal,
         graffiti,
         attestations,
@@ -506,16 +524,24 @@ async fn produce(
     };
     let attestation_count = attestations.len();
     let has_operations = !operations.is_empty();
-    let block = match assemble_block(&state, inputs(attestations, operations), &config) {
+    let block = match assemble_block(
+        &state,
+        inputs(attestations, operations, sync_aggregate),
+        &config,
+    ) {
         Ok(block) => block,
         // `pack_attestations` and `pack_operations` check every candidate
-        // against this state, so this should not happen; but a block without
-        // them still earns the proposal, and one that fails to build earns
-        // nothing.
-        Err(err) if attestation_count > 0 || has_operations => {
-            warn!(%slot, %err, "Block with attestations or operations failed to build; retrying without");
-            assemble_block(&state, inputs(Vec::new(), Operations::default()), &config)
-                .map_err(|_| ApiError::Internal("the block failed to build"))?
+        // against this state, and the sync aggregate is verified against it
+        // too, so this should not happen; but a block without them still earns
+        // the proposal, and one that fails to build earns nothing.
+        Err(err) if attestation_count > 0 || has_operations || has_sync_aggregate => {
+            warn!(%slot, %err, "Block with attestations, operations or a sync aggregate failed to build; retrying without");
+            assemble_block(
+                &state,
+                inputs(Vec::new(), Operations::default(), empty_sync_aggregate()),
+                &config,
+            )
+            .map_err(|_| ApiError::Internal("the block failed to build"))?
         }
         Err(_) => return Err(ApiError::Internal("the block failed to build")),
     };
@@ -651,6 +677,7 @@ mod tests {
         let app = routes()
             .with_state(store)
             .layer(Extension(None::<EngineClient>))
+            .layer(Extension(SharedSyncCommitteePool::default()))
             .layer(Extension(FeeRecipients::default()))
             .layer(Extension(OwnVersion(Arc::new(
                 ethlambda_engine::types::ClientVersionV1 {
