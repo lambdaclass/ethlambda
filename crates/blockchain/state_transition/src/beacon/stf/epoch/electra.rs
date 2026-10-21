@@ -66,7 +66,43 @@ use crate::beacon::primitives::{
 /// update, so a deposit credited this epoch is already reflected when
 /// effective balances round toward it).
 pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
-    super::altair::process_participation_steps(state, config)?;
+    // Everything from justification through the effective-balance updates,
+    // in one pass over the registry where the state allows it. See
+    // `super::single_pass` for the fused path and [`process_unfused_steps`]
+    // for the specification-shaped one it is checked against.
+    super::single_pass::process_steps_through_effective_balances(state, config)?;
+    super::process_slashings_reset(state)?;
+    super::process_randao_mixes_reset(state)?;
+    super::capella::process_historical_summaries_update(state)?;
+    super::altair::process_participation_flag_updates(state)?;
+    super::altair::process_sync_committee_updates(state)?;
+    Ok(())
+}
+
+/// Steps 1-9 as the specification lists them, one function per step.
+///
+/// The path [`super::single_pass`] replaces for registries it can fuse, and
+/// falls back to for states it cannot (see there). Steps 1-3 run through the
+/// altair driver's flat passes, or, with `reference_participation`, through
+/// the specification-shaped code they replaced: the single pass's debug oracle
+/// asks for that, so the fused path is checked against the original
+/// formulation and not against its own building blocks.
+pub(super) fn process_unfused_steps(
+    state: &mut BeaconState,
+    config: &Config,
+    reference_participation: bool,
+) -> Result<()> {
+    #[cfg(any(test, debug_assertions))]
+    if reference_participation {
+        super::altair_reference::process_participation_steps(state, config)?;
+    } else {
+        super::altair::process_participation_steps(state, config)?;
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        let _ = reference_participation;
+        super::altair::process_participation_steps(state, config)?;
+    }
     // [Modified in Electra:EIP7251]
     process_registry_updates(state, config)?;
     // [Modified in Electra:EIP7251]: electra's own copy; see this module's
@@ -79,13 +115,7 @@ pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
     // [New in Electra:EIP7251]
     process_pending_consolidations(state, config)?;
     // [Modified in Electra:EIP7251]
-    process_effective_balance_updates(state)?;
-    super::process_slashings_reset(state)?;
-    super::process_randao_mixes_reset(state)?;
-    super::capella::process_historical_summaries_update(state)?;
-    super::altair::process_participation_flag_updates(state)?;
-    super::altair::process_sync_committee_updates(state)?;
-    Ok(())
+    process_effective_balance_updates(state)
 }
 
 // ---------------------------------------------------------------------------
@@ -94,10 +124,34 @@ pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
 
 /// A validator's outcome for one run of [`process_registry_updates`]: at most
 /// one of the specification's `if`/`elif`/`elif` branches applies.
-enum RegistryAction {
+pub(super) enum RegistryAction {
     QueueForActivation,
     Eject,
     Activate,
+}
+
+/// The one registry change `validator` gets this epoch, if any.
+///
+/// The three branches are tested in the specification's order, and each
+/// reads only the validator itself plus epoch-wide values, which is what lets
+/// the single pass decide it without looking at any other validator.
+pub(super) fn registry_action(
+    validator: &Validator,
+    current_epoch: Epoch,
+    finalized_epoch: Epoch,
+    ejection_balance: Gwei,
+) -> Option<RegistryAction> {
+    if is_eligible_for_activation_queue(validator) {
+        Some(RegistryAction::QueueForActivation)
+    } else if is_active_validator(validator, current_epoch)
+        && validator.effective_balance <= ejection_balance
+    {
+        Some(RegistryAction::Eject)
+    } else if is_eligible_for_activation(validator, finalized_epoch) {
+        Some(RegistryAction::Activate)
+    } else {
+        None
+    }
 }
 
 /// Moves validators between activation-queue eligibility, ejection, and
@@ -134,17 +188,12 @@ pub fn process_registry_updates(state: &mut BeaconState, config: &Config) -> Res
         .validators()
         .iter()
         .map(|validator| {
-            if is_eligible_for_activation_queue(validator) {
-                Some(RegistryAction::QueueForActivation)
-            } else if is_active_validator(validator, current_epoch)
-                && validator.effective_balance <= config.ejection_balance
-            {
-                Some(RegistryAction::Eject)
-            } else if is_eligible_for_activation(validator, finalized_epoch) {
-                Some(RegistryAction::Activate)
-            } else {
-                None
-            }
+            registry_action(
+                validator,
+                current_epoch,
+                finalized_epoch,
+                config.ejection_balance,
+            )
         })
         .collect();
 
@@ -211,47 +260,14 @@ pub fn process_registry_updates(state: &mut BeaconState, config: &Config) -> Res
 /// `super::registry::process_slashings` does; the specification's own version
 /// takes no configuration either.
 pub fn process_slashings(state: &mut BeaconState, _config: &Config) -> Result<()> {
-    let epoch = get_current_epoch(state);
-    let total_balance = get_total_active_balance(state)?;
-
-    let mut slashed_sum: Gwei = 0;
-    for &slashing in state.slashings().iter() {
-        slashed_sum = slashed_sum
-            .checked_add(slashing)
-            .ok_or(Error::ArithmeticOverflow("summing the slashings vector"))?;
-    }
-    let multiplier = preset::retuned::proportional_slashing_multiplier(state.fork_name());
-    let scaled_slashings = slashed_sum
-        .checked_mul(multiplier)
-        .ok_or(Error::ArithmeticOverflow(
-            "scaling the summed slashings by the proportional multiplier",
-        ))?;
-    let adjusted_total_slashing_balance = scaled_slashings.min(total_balance);
-
-    let increment = preset::EFFECTIVE_BALANCE_INCREMENT;
-    // `total_balance` (`get_total_active_balance`) sums every active
-    // validator's own increment-quantized effective balance and is floored at
-    // one whole increment, so it is always an exact multiple of `increment`:
-    // this can never divide by zero, and no remainder is lost to carry
-    // forward.
-    let total_increments = total_balance / increment;
-    let penalty_per_effective_balance_increment =
-        adjusted_total_slashing_balance / total_increments;
-
-    let withdrawable_offset = (preset::EPOCHS_PER_SLASHINGS_VECTOR / 2) as Epoch;
+    let context = SlashingsContext::new(state, get_total_active_balance(state)?)?;
 
     // Collecting the penalties before applying any of them keeps this pass
     // reading a stable registry, the same reason
     // `super::registry::process_slashings` does.
     let mut penalties = Vec::new();
     for (index, validator) in state.validators().iter().enumerate() {
-        if validator.slashed && epoch + withdrawable_offset == validator.withdrawable_epoch {
-            let effective_balance_increments = validator.effective_balance / increment;
-            let penalty = penalty_per_effective_balance_increment
-                .checked_mul(effective_balance_increments)
-                .ok_or(Error::ArithmeticOverflow(
-                    "penalty_per_effective_balance_increment * effective_balance_increments",
-                ))?;
+        if let Some(penalty) = context.penalty(validator)? {
             penalties.push((index as ValidatorIndex, penalty));
         }
     }
@@ -261,6 +277,67 @@ pub fn process_slashings(state: &mut BeaconState, _config: &Config) -> Result<()
     }
 
     Ok(())
+}
+
+/// The epoch-wide part of [`process_slashings`]: everything but the
+/// per-validator effective balance.
+pub(super) struct SlashingsContext {
+    epoch: Epoch,
+    penalty_per_effective_balance_increment: Gwei,
+}
+
+impl SlashingsContext {
+    /// Sums and scales the slashings vector against `total_balance`, the
+    /// current epoch's `get_total_active_balance`. Fails where
+    /// [`process_slashings`] does, whether or not any validator is due.
+    pub(super) fn new(state: &BeaconState, total_balance: Gwei) -> Result<Self> {
+        let epoch = get_current_epoch(state);
+
+        let mut slashed_sum: Gwei = 0;
+        for &slashing in state.slashings().iter() {
+            slashed_sum = slashed_sum
+                .checked_add(slashing)
+                .ok_or(Error::ArithmeticOverflow("summing the slashings vector"))?;
+        }
+        let multiplier = preset::retuned::proportional_slashing_multiplier(state.fork_name());
+        let scaled_slashings =
+            slashed_sum
+                .checked_mul(multiplier)
+                .ok_or(Error::ArithmeticOverflow(
+                    "scaling the summed slashings by the proportional multiplier",
+                ))?;
+        let adjusted_total_slashing_balance = scaled_slashings.min(total_balance);
+
+        // `total_balance` (`get_total_active_balance`) sums every active
+        // validator's own increment-quantized effective balance and is floored
+        // at one whole increment, so it is always an exact multiple of
+        // `increment`: this can never divide by zero, and no remainder is lost
+        // to carry forward.
+        let total_increments = total_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
+        Ok(Self {
+            epoch,
+            penalty_per_effective_balance_increment: adjusted_total_slashing_balance
+                / total_increments,
+        })
+    }
+
+    /// The penalty due from `validator` this epoch, or `None` when its
+    /// slashing does not fall due now.
+    pub(super) fn penalty(&self, validator: &Validator) -> Result<Option<Gwei>> {
+        let withdrawable_offset = (preset::EPOCHS_PER_SLASHINGS_VECTOR / 2) as Epoch;
+        if !(validator.slashed && self.epoch + withdrawable_offset == validator.withdrawable_epoch)
+        {
+            return Ok(None);
+        }
+        let effective_balance_increments =
+            validator.effective_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
+        self.penalty_per_effective_balance_increment
+            .checked_mul(effective_balance_increments)
+            .map(Some)
+            .ok_or(Error::ArithmeticOverflow(
+                "penalty_per_effective_balance_increment * effective_balance_increments",
+            ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -436,7 +513,7 @@ pub fn process_pending_deposits(state: &mut BeaconState, config: &Config) -> Res
 /// this, still builds a new validator phase0's way; see
 /// [`add_validator_from_pending_deposit`]'s doc for exactly how reusing it
 /// would go wrong here.
-fn apply_pending_deposit(
+pub(super) fn apply_pending_deposit(
     state: &mut BeaconState,
     deposit: &electra::PendingDeposit,
     config: &Config,
@@ -628,17 +705,9 @@ pub fn process_pending_consolidations(state: &mut BeaconState, _config: &Config)
 /// toward is [`get_max_effective_balance`], read per validator, rather than
 /// the single `MAX_EFFECTIVE_BALANCE` every validator shared before
 /// EIP-7251, since a compounding validator's ceiling can be far higher. The
-/// hysteresis arithmetic itself is copied unchanged from that version, down
-/// to computing `HYSTERESIS_INCREMENT` by dividing first and only then
-/// multiplying it up to each threshold: multiplying before dividing is
-/// algebraically equivalent but rounds differently, and only the
-/// specification's own order reproduces its integer rounding.
+/// hysteresis test itself is [`super::leaves_hysteresis_band`], shared with
+/// that version.
 pub fn process_effective_balance_updates(state: &mut BeaconState) -> Result<()> {
-    const HYSTERESIS_INCREMENT: Gwei =
-        preset::EFFECTIVE_BALANCE_INCREMENT / preset::HYSTERESIS_QUOTIENT;
-    const DOWNWARD_THRESHOLD: Gwei = HYSTERESIS_INCREMENT * preset::HYSTERESIS_DOWNWARD_MULTIPLIER;
-    const UPWARD_THRESHOLD: Gwei = HYSTERESIS_INCREMENT * preset::HYSTERESIS_UPWARD_MULTIPLIER;
-
     // Two passes for the same reason `super::process_effective_balance_updates`
     // needs them: `state` is an enum over per-fork structs, so there is no
     // way to hold `validators` mutably while also reading `balances`, or
@@ -653,12 +722,7 @@ pub fn process_effective_balance_updates(state: &mut BeaconState) -> Result<()> 
         .zip(state.balances().iter())
         .enumerate()
     {
-        if balance + DOWNWARD_THRESHOLD < validator.effective_balance
-            || validator.effective_balance + UPWARD_THRESHOLD < balance
-        {
-            let max_effective_balance = get_max_effective_balance(validator);
-            let effective = (balance - balance % preset::EFFECTIVE_BALANCE_INCREMENT)
-                .min(max_effective_balance);
+        if let Some(effective) = updated_effective_balance(validator, balance)? {
             updates.push((index, effective));
         }
     }
@@ -668,6 +732,23 @@ pub fn process_effective_balance_updates(state: &mut BeaconState) -> Result<()> 
         validators[index].effective_balance = effective;
     }
     Ok(())
+}
+
+/// The effective balance `validator` moves to given its `balance`, or `None`
+/// when the balance is still inside the hysteresis band.
+///
+/// Fails where [`super::leaves_hysteresis_band`] does.
+pub(super) fn updated_effective_balance(
+    validator: &Validator,
+    balance: Gwei,
+) -> Result<Option<Gwei>> {
+    if !super::leaves_hysteresis_band(validator.effective_balance, balance)? {
+        return Ok(None);
+    }
+    let max_effective_balance = get_max_effective_balance(validator);
+    Ok(Some(
+        (balance - balance % preset::EFFECTIVE_BALANCE_INCREMENT).min(max_effective_balance),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -684,7 +765,7 @@ pub fn process_effective_balance_updates(state: &mut BeaconState) -> Result<()> 
 /// though its shape, an electra-or-fulu match, is identical: fulu keeps every
 /// field this covers unchanged (see `crate::beacon::helpers::electra`'s own module
 /// doc for why that module's projection accepts fulu too).
-enum PendingQueueFields<'a> {
+pub(super) enum PendingQueueFields<'a> {
     Electra(&'a mut electra::BeaconState),
     Fulu(&'a mut fulu::BeaconState),
 }
@@ -694,7 +775,7 @@ impl<'a> PendingQueueFields<'a> {
     /// from crediting deposits off `Eth1Data` votes to crediting them off
     /// `DepositRequest`s directly, read by [`process_pending_deposits`] to
     /// know whether any eth1-bridge deposit is still outstanding.
-    fn deposit_requests_start_index(&self) -> u64 {
+    pub(super) fn deposit_requests_start_index(&self) -> u64 {
         match self {
             PendingQueueFields::Electra(state) => state.deposit_requests_start_index,
             PendingQueueFields::Fulu(state) => state.deposit_requests_start_index,
@@ -702,14 +783,14 @@ impl<'a> PendingQueueFields<'a> {
     }
 
     /// How much of this epoch's deposit balance churn limit remains unused.
-    fn deposit_balance_to_consume(&self) -> Gwei {
+    pub(super) fn deposit_balance_to_consume(&self) -> Gwei {
         match self {
             PendingQueueFields::Electra(state) => state.deposit_balance_to_consume,
             PendingQueueFields::Fulu(state) => state.deposit_balance_to_consume,
         }
     }
 
-    fn deposit_balance_to_consume_mut(&mut self) -> &mut Gwei {
+    pub(super) fn deposit_balance_to_consume_mut(&mut self) -> &mut Gwei {
         match self {
             PendingQueueFields::Electra(state) => &mut state.deposit_balance_to_consume,
             PendingQueueFields::Fulu(state) => &mut state.deposit_balance_to_consume,
@@ -717,7 +798,7 @@ impl<'a> PendingQueueFields<'a> {
     }
 
     /// Deposits known but not yet credited to the validator registry.
-    fn pending_deposits_mut(&mut self) -> &mut electra::PendingDeposits {
+    pub(super) fn pending_deposits_mut(&mut self) -> &mut electra::PendingDeposits {
         match self {
             PendingQueueFields::Electra(state) => &mut state.pending_deposits,
             PendingQueueFields::Fulu(state) => &mut state.pending_deposits,
@@ -725,7 +806,7 @@ impl<'a> PendingQueueFields<'a> {
     }
 
     /// Consolidations known but not yet applied.
-    fn pending_consolidations_mut(&mut self) -> &mut electra::PendingConsolidations {
+    pub(super) fn pending_consolidations_mut(&mut self) -> &mut electra::PendingConsolidations {
         match self {
             PendingQueueFields::Electra(state) => &mut state.pending_consolidations,
             PendingQueueFields::Fulu(state) => &mut state.pending_consolidations,
@@ -756,7 +837,7 @@ impl<'a> PendingQueueFields<'a> {
 /// The electra-or-fulu state, mutably, through [`PendingQueueFields`]. See
 /// its own doc for why this is a second projection rather than a call into
 /// [`crate::beacon::helpers::electra::electra_state`].
-fn pending_queue_fields<'a>(
+pub(super) fn pending_queue_fields<'a>(
     state: &'a mut BeaconState,
     function: &'static str,
 ) -> Result<PendingQueueFields<'a>> {
