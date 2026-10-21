@@ -77,11 +77,37 @@ This is the recommended option for production deployments since it reduces trust
 
 3. **Initialize**: the node stores the anchor block's header, its body (present unless the fetched block's own body happens to be empty, same as any other block), and the full state from the checkpoint. On `node`, persisting the block itself also means it can be served over `BlocksByRoot`; without that, peers requesting the anchor by root would get a synthetic block whose hash differs from `latest_finalized.root` and would score-penalize this node. `beacon`'s req/resp protocol has no `BlocksByRoot` handler yet, so that benefit doesn't apply there today; the block is stored anyway, since the pairing check above needs it.
 
+#### Gloas anchor: the payload envelope (beacon only)
+
+A gloas block's execution payload is not in the block, so a node anchored on
+one holds the block and state but not the payload its children may build on.
+Once the chain actor is running, a node that anchored on a gloas block with no
+stored envelope asks the checkpoint URLs for it, in order:
+`GET /eth/v1/beacon/execution_payload_envelopes/{anchor_root}` as SSZ. A
+success is handed to the chain actor as `new_execution_payload_envelope`, the
+same entry a gossiped envelope takes, so the bid check, the column check and
+the verification all apply. The fetch runs in the background and never delays
+startup.
+
+It is a fast path and nothing depends on it. A `404` means the peer does not
+know the payload, **not** that the payload is empty, so the node concludes
+nothing from it; any failure (network, decoding, an envelope naming another
+block) is logged at `info` and ignored. Without the envelope, the by-root
+request that fires when a FULL child arrives recovers it.
+
+An anchor whose bid carries blobs also needs its sampled columns before its
+envelope verifies, and those are fetched by root like any other block's. They
+sit at the finalized slot, or below it for an anchor state advanced past empty
+slots, which is where the chain checks drop every other block's columns. So
+the finalized block's own columns are exempt from that rule
+(`column::chain_checks_gloas`); without the exemption such an anchor never gets
+its payload, and the node never imports past it.
+
 ### Failure and success
 
 If any step fails (network error, decoding error, verification failure), the node logs the error and exits. There is no automatic retry; restart the node to try again. The database is not modified until verification succeeds, so a failed checkpoint sync leaves the data directory clean.
 
-After successful initialization, the node starts normally: `node` connects to the P2P network and begins participating from the checkpoint slot; `beacon` joins the resolved network's gossip and logs what it decodes, without advancing its state past the anchor (see `docs/cli.md`, "What `ethlambda beacon` does today").
+After successful initialization, the node starts normally: `node` connects to the P2P network and begins participating from the checkpoint slot; `beacon` joins the resolved network's gossip and follows the chain from the anchor, importing blocks (a gloas anchor starts EMPTY, see [the envelope](#gloas-anchor-the-payload-envelope-beacon-only)).
 
 ## Restarts and Existing State
 
@@ -145,7 +171,7 @@ All checks are performed before a downloaded checkpoint anchor is accepted. The 
 | Justified epoch >= finalized epoch | Justified must be at or after finalized |
 | Block header slot <= state slot | Block header cannot be ahead of the state |
 | Block's fork matches state's fork | The fetched block must decode as the same fork the state resolved to |
-| Anchor is not gloas (`refuse_unfollowable_fork`) | Nothing delivers payload envelopes or payload attestations to the chain actor yet, so a gloas anchor could not be followed. Runs on both anchor sources, the checkpoint provider's state and a loaded network's own genesis state |
+| Anchor's fork is followed (`refuse_unfollowable_fork`) | A fork the node cannot follow is refused with `UnsupportedFork` before any store is built. Every fork is followed today, gloas included, so this refuses nothing; a gloas anchor starts with no payload known, so its head is EMPTY and its first FULL child is held until the parent's envelope is fetched. Runs on both anchor sources, the checkpoint provider's state and a loaded network's own genesis state |
 | Anchor pairing | See [Anchor Pairing](#anchor-pairing) below |
 
 Beacon has no same-slot-checkpoints-matching-roots check: nothing here computes two separate checkpoint roots to compare, since a trusted checkpoint-synced anchor is finalized by fiat, and the beacon spec's own construction applies that single checkpoint to all four of the store's justified/finalized slots at once.
