@@ -20,6 +20,7 @@ pub(crate) mod blocks;
 pub(crate) mod config;
 pub(crate) mod events;
 pub(crate) mod genesis;
+pub(crate) mod graffiti;
 pub(crate) mod headers;
 pub(crate) mod node;
 pub(crate) mod pool;

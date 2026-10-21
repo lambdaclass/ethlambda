@@ -1,4 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 use axum::{Extension, Router};
 use ethlambda_blockchain::{EventBus, SyncStatusController};
@@ -199,6 +200,10 @@ pub struct BeaconApiHandles {
     /// The chain-event bus `/eth/v1/events` streams from. Read only there:
     /// the chain actor is its only publisher, so no endpoint here writes to it.
     pub events: EventBus,
+    /// This build as the Engine API identifies it. Block production appends
+    /// its code and commit, with the execution client's, to every block's
+    /// graffiti.
+    pub client_version: ethlambda_engine::types::ClientVersionV1,
 }
 
 /// Start the HTTP servers for a beacon node.
@@ -221,7 +226,10 @@ pub async fn start_beacon_rpc_server(
         .layer(Extension(handles.attestation_pool))
         .layer(Extension(beacon::validator::FeeRecipients::default()))
         .layer(Extension(handles.engine))
-        .layer(Extension(handles.events));
+        .layer(Extension(handles.events))
+        .layer(Extension(beacon::graffiti::OwnVersion(Arc::new(
+            handles.client_version,
+        ))));
     start_http_servers(config, Some(api_router), shutdown).await
 }
 

@@ -46,6 +46,16 @@ use crate::test_utils::{RecordingNetwork, beacon_store_at, idle_engine};
 
 const COUNT: usize = 64;
 
+/// The version this node reports for itself, as `ethlambda beacon` builds it.
+fn own_version() -> ethlambda_engine::types::ClientVersionV1 {
+    ethlambda_engine::types::ClientVersionV1 {
+        code: "LA".to_string(),
+        name: "ethlambda".to_string(),
+        version: "ethlambda/test".to_string(),
+        commit: "0x3c4d7e8f".to_string(),
+    }
+}
+
 /// A fulu head state at the first slot of the wall clock's current epoch, with
 /// its proposer lookahead filled in, served over HTTP on an ephemeral port,
 /// by a node with no execution client.
@@ -103,7 +113,10 @@ async fn serve_with_store(
         .layer(Extension(p2p))
         .layer(Extension(SharedAttestationPool::default()))
         .layer(Extension(crate::beacon::validator::FeeRecipients::default()))
-        .layer(Extension(engine));
+        .layer(Extension(engine))
+        .layer(Extension(crate::beacon::graffiti::OwnVersion(Arc::new(
+            own_version(),
+        ))));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -347,6 +360,12 @@ async fn fake_execution_client() -> ethlambda_engine::EngineClient {
                         "executionRequests": [],
                     })
                 }
+                Some("engine_getClientVersionV1") => serde_json::json!([{
+                    "code": "RH",
+                    "name": "reth",
+                    "version": "v1.0.0",
+                    "commit": "0x1a2b5c6d",
+                }]),
                 _ => serde_json::Value::Null,
             };
             Json(serde_json::json!({ "jsonrpc": "2.0", "id": request["id"], "result": result }))
@@ -388,15 +407,22 @@ async fn the_validator_client_can_propose_through_this_node() {
         compute_signing_root(epoch.hash_tree_root(), randao_domain),
     );
 
+    let mut graffiti = [0u8; 32];
+    graffiti[..5].copy_from_slice(b"hello");
     let request = BlockRequest {
         slot,
         proposer_index: proposer,
         randao_reveal,
-        graffiti: Default::default(),
+        graffiti: ethlambda_types::primitives::H256(graffiti),
     };
     let produced = client.produce_block(&request).await.unwrap();
     assert_eq!(produced.block().slot, slot);
     assert_eq!(produced.block().proposer_index, proposer);
+    // The proposer's text, then both clients' codes and commits: the
+    // execution client's from `engine_getClientVersionV1`, this node's own.
+    let mut expected = [0u8; 32];
+    expected[..18].copy_from_slice(b"hello RH1a2bLA3c4d");
+    assert_eq!(produced.block().body.graffiti.0, expected);
 
     let block_domain = get_domain(&advanced, DOMAIN_BEACON_PROPOSER, Some(epoch));
     let signature = sign_for(

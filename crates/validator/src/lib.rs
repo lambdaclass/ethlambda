@@ -41,6 +41,7 @@ pub mod keys;
 pub mod metrics;
 pub mod proposal;
 pub mod proposal_guard;
+pub mod proposer_settings;
 pub(crate) mod secure_fs;
 pub mod signing;
 pub mod slot_clock;
@@ -65,6 +66,7 @@ use crate::beacon_node::http::HttpBeaconNode;
 use crate::duties::DutiesService;
 use crate::keys::ValidatorStore;
 use crate::proposal::ProposalService;
+use crate::proposer_settings::ProposerSettings;
 use crate::signing::SigningContext;
 use crate::slot_clock::SlotClock;
 
@@ -75,14 +77,16 @@ pub struct ValidatorConfig {
     pub validators_dir: PathBuf,
     pub secrets_dir: PathBuf,
     pub metrics: std::net::SocketAddr,
-    /// Thirty-two bytes put in every block this client proposes. Consensus
-    /// never reads them, so an empty default costs nothing and avoids
-    /// announcing which client built a block to anyone who did not ask.
+    /// The graffiti every validator proposes with unless the keymanager API
+    /// gives it its own. Consensus never reads it. An ethlambda beacon node
+    /// appends both clients' versions to it; other nodes follow their own
+    /// policy.
     pub graffiti: Bytes32,
-    /// Where execution-layer block rewards should be paid.
+    /// Where execution-layer block rewards should be paid, for every validator
+    /// the keymanager API gives no address of its own.
     ///
     /// `None` when the operator named no address, in which case the beacon node
-    /// picks one, and it will not be the operator's.
+    /// picks one for those validators, and it will not be the operator's.
     pub suggested_fee_recipient: Option<ExecutionAddress>,
     /// Bind address for the keymanager API. `None` when `--enable-keymanager`
     /// was not passed, in which case it is never spawned.
@@ -118,9 +122,14 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         warn!(
             "No --suggested-fee-recipient was set. Any block this client proposes will pay its \
              execution-layer rewards to an address chosen by the beacon node, which is very \
-             unlikely to be yours."
+             unlikely to be yours, unless that validator is given its own address through the \
+             keymanager API."
         );
     }
+    let settings = Arc::new(ProposerSettings::new(
+        config.graffiti,
+        config.suggested_fee_recipient,
+    ));
 
     let store = ValidatorStore::load(&config.validators_dir)?;
     if store.is_empty() {
@@ -181,17 +190,13 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     let mut duties = DutiesService::new(beacon_node.clone(), Vec::new());
     let attestation = AttestationService::new(beacon_node.clone(), context.clone());
     let aggregation = AggregationService::new(beacon_node.clone(), context.clone());
-    let proposal = ProposalService::new(
-        beacon_node.clone(),
-        context.clone(),
-        config.graffiti,
-        config.suggested_fee_recipient,
-    );
+    let proposal = ProposalService::new(beacon_node.clone(), context.clone(), settings.clone());
 
     if let Some(address) = config.keymanager {
         let token = http_api::load_or_create_token(&config.validators_dir)?;
         let context = http_api::KeymanagerContext {
             store: store.clone(),
+            settings: settings.clone(),
             validators_dir: config.validators_dir.clone(),
             secrets_dir: config.secrets_dir.clone(),
             definitions_lock: Arc::new(Mutex::new(())),
@@ -254,7 +259,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                 &mut duties,
                 &pubkeys,
                 epoch,
-                config.suggested_fee_recipient,
+                &settings,
                 &store,
                 &context,
             );
@@ -476,7 +481,7 @@ async fn refresh_epoch<B: BeaconNodeApi>(
     duties: &mut DutiesService<B>,
     pubkeys: &[BlsPubkey],
     epoch: u64,
-    fee_recipient: Option<ExecutionAddress>,
+    settings: &ProposerSettings,
     store: &RwLock<ValidatorStore>,
     context: &SigningContext,
 ) -> Result<()> {
@@ -522,25 +527,29 @@ async fn refresh_epoch<B: BeaconNodeApi>(
     // built for the wrong address, which the check before signing catches; the
     // consequence of returning here would be losing this epoch's attester
     // duties, which is worse and unrelated.
-    if let Some(fee_recipient) = fee_recipient {
-        let preparations: Vec<ProposerPreparationDto> = duties
-            .indices()
-            .iter()
-            .map(|index| ProposerPreparationDto {
-                validator_index: *index,
+    //
+    // Each validator is registered with its own address, and one with none,
+    // neither its own nor the default, is left out: there is nothing to tell
+    // the node, which then picks one itself, as the startup warning says.
+    let preparations: Vec<ProposerPreparationDto> = entries
+        .iter()
+        .filter_map(|entry| {
+            let fee_recipient = settings.fee_recipient(&entry.pubkey)?;
+            Some(ProposerPreparationDto {
+                validator_index: entry.index,
                 fee_recipient: crate::beacon_node::dto::encode_hex(&fee_recipient.0),
             })
-            .collect();
-        if !preparations.is_empty()
-            && let Err(err) = beacon_node.prepare_beacon_proposer(&preparations).await
-        {
-            warn!(
-                %epoch,
-                %err,
-                "Failed to register this client's fee recipient; blocks proposed this epoch may \
-                 pay somewhere else"
-            );
-        }
+        })
+        .collect();
+    if !preparations.is_empty()
+        && let Err(err) = beacon_node.prepare_beacon_proposer(&preparations).await
+    {
+        warn!(
+            %epoch,
+            %err,
+            "Failed to register this client's fee recipients; blocks proposed this epoch may \
+             pay somewhere else"
+        );
     }
 
     let changed = duties.refresh_around(epoch).await?;
@@ -595,7 +604,15 @@ mod tests {
         RwLock::new(ValidatorStore::new())
     }
 
+    fn settings(fee_recipient: Option<ExecutionAddress>) -> ProposerSettings {
+        ProposerSettings::new(Bytes32::ZERO, fee_recipient)
+    }
+
     async fn refresh(node: Arc<MockBeaconNode>, fee_recipient: Option<ExecutionAddress>) {
+        refresh_with(node, &settings(fee_recipient)).await;
+    }
+
+    async fn refresh_with(node: Arc<MockBeaconNode>, settings: &ProposerSettings) {
         let mut duties = DutiesService::new(node.clone(), Vec::new());
         let keys = [pubkey(1), pubkey(2)];
         refresh_epoch(
@@ -603,7 +620,7 @@ mod tests {
             &mut duties,
             &keys,
             3,
-            fee_recipient,
+            settings,
             &empty_store(),
             &context(),
         )
@@ -647,6 +664,44 @@ mod tests {
         assert!(node.preparations().is_empty());
     }
 
+    /// A validator's own address is the one registered for it, and the
+    /// default still covers the rest.
+    #[tokio::test]
+    async fn a_validators_own_address_is_registered_for_it() {
+        let node = Arc::new(node());
+        let settings = settings(Some(H160([0xab; 20])));
+        settings.set_fee_recipient(&pubkey(2), H160([0xcd; 20]));
+        refresh_with(node.clone(), &settings).await;
+
+        let sent: Vec<(u64, String)> = node
+            .preparations()
+            .into_iter()
+            .map(|entry| (entry.validator_index, entry.fee_recipient))
+            .collect();
+        assert_eq!(
+            sent,
+            vec![
+                (11, format!("0x{}", "ab".repeat(20))),
+                (22, format!("0x{}", "cd".repeat(20))),
+            ]
+        );
+    }
+
+    /// With no default, only the validators given an address of their own are
+    /// registered. The others have nothing to tell the node.
+    #[tokio::test]
+    async fn without_a_default_only_validators_with_their_own_address_are_registered() {
+        let node = Arc::new(node());
+        let settings = settings(None);
+        settings.set_fee_recipient(&pubkey(1), H160([0xcd; 20]));
+        refresh_with(node.clone(), &settings).await;
+
+        let sent = node.preparations();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].validator_index, 11);
+        assert_eq!(sent[0].fee_recipient, format!("0x{}", "cd".repeat(20)));
+    }
+
     /// A failed registration must not cost this epoch's duties. The
     /// consequence of the failure is a payload built for the wrong address,
     /// which the check before signing catches; the consequence of propagating
@@ -663,7 +718,7 @@ mod tests {
             &mut duties,
             &keys,
             3,
-            Some(H160([0xab; 20])),
+            &settings(Some(H160([0xab; 20]))),
             &empty_store(),
             &context(),
         )
@@ -689,7 +744,7 @@ mod tests {
             &mut duties,
             &[],
             3,
-            Some(H160([0xab; 20])),
+            &settings(Some(H160([0xab; 20]))),
             &empty_store(),
             &context(),
         )
