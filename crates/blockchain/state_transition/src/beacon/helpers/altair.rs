@@ -204,11 +204,14 @@ pub fn compute_sync_committee_period(epoch: Epoch) -> u64 {
 /// stake actually earned it rather than assuming every attestation splits the
 /// same fixed fraction.
 pub fn get_base_reward_per_increment(state: &BeaconState) -> Result<Gwei> {
-    let total_active_balance = get_total_active_balance(state)?;
-    Ok(
-        preset::EFFECTIVE_BALANCE_INCREMENT * preset::BASE_REWARD_FACTOR
-            / integer_squareroot(total_active_balance),
-    )
+    Ok(base_reward_per_increment(get_total_active_balance(state)?))
+}
+
+/// [`get_base_reward_per_increment`] for a total active balance the caller
+/// already holds, such as one served by an `ActiveBalanceCache`.
+pub fn base_reward_per_increment(total_active_balance: Gwei) -> Gwei {
+    preset::EFFECTIVE_BALANCE_INCREMENT * preset::BASE_REWARD_FACTOR
+        / integer_squareroot(total_active_balance)
 }
 
 /// The base reward for the validator at `index`.

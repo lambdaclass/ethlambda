@@ -54,10 +54,11 @@ use crate::beacon::containers::shared::{
 use crate::beacon::containers::{BeaconState, capella, deneb, electra, fulu};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::helpers::accessors::{
-    CommitteeCache, CommitteeCacheExt, get_beacon_proposer_index, get_block_root,
-    get_block_root_at_slot, get_current_epoch, get_previous_epoch, get_randao_mix,
+    ActiveBalanceCache, ActiveBalanceCacheExt, CommitteeCache, CommitteeCacheExt,
+    get_beacon_proposer_index, get_block_root, get_block_root_at_slot, get_current_epoch,
+    get_previous_epoch, get_randao_mix,
 };
-use crate::beacon::helpers::altair::{add_flag, get_base_reward_per_increment, has_flag};
+use crate::beacon::helpers::altair::{add_flag, base_reward_per_increment, has_flag};
 use crate::beacon::helpers::capella::withdrawal_address;
 use crate::beacon::helpers::electra::{
     compute_exit_epoch_and_update_churn, get_committee_indices,
@@ -639,6 +640,7 @@ pub fn process_attestation(
     state: &mut BeaconState,
     attestation: &electra::Attestation,
     committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     let data = attestation.data;
     let current_epoch = get_current_epoch(state);
@@ -743,7 +745,8 @@ pub fn process_attestation(
     // finished one. That was measured on a live mainnet run: the chain actor
     // sat at 98% CPU inside `get_active_validator_indices`, reached through
     // exactly this line, and the node's clock stopped advancing.
-    let base_reward_per_increment = get_base_reward_per_increment(state)?;
+    let base_reward_per_increment =
+        base_reward_per_increment(active_balances.total_active_balance(state)?);
 
     let mut proposer_reward_numerator: Gwei = 0;
     let mut updates: Vec<(ValidatorIndex, ParticipationFlags)> = Vec::new();
@@ -758,6 +761,10 @@ pub fn process_attestation(
                 })?;
 
         let mut new_flags: ParticipationFlags = 0;
+        // The attester's validator is read at most once, on the first flag
+        // it newly earns: each read is a tree descent, and the effective
+        // balance cannot change inside this read-only phase.
+        let mut attester_increments: Option<Gwei> = None;
         for &flag_index in &participation_flag_indices {
             if has_flag(current_flags, flag_index) {
                 continue;
@@ -767,8 +774,15 @@ pub fn process_attestation(
             // `get_base_reward(state, index)` inlined against the hoisted
             // per-increment value above, keeping the helper's own order of
             // operations so the result is bit-identical.
-            let increments =
-                state.validator(index)?.effective_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
+            let increments = match attester_increments {
+                Some(increments) => increments,
+                None => {
+                    let increments = state.validator(index)?.effective_balance
+                        / preset::EFFECTIVE_BALANCE_INCREMENT;
+                    attester_increments = Some(increments);
+                    increments
+                }
+            };
             let reward = (increments * base_reward_per_increment)
                 .checked_mul(weight)
                 .ok_or(Error::ArithmeticOverflow(
@@ -1770,6 +1784,7 @@ pub fn process_operations(
     body: &electra::BeaconBlockBody,
     config: &Config,
     committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     let deposit_requests_start_index =
         block_ref(state, "process_operations")?.deposit_requests_start_index();
@@ -1795,7 +1810,7 @@ pub fn process_operations(
     }
     // [Modified in Electra:EIP7549]
     for attestation in body.attestations.iter() {
-        process_attestation(state, attestation, committees)?;
+        process_attestation(state, attestation, committees, active_balances)?;
     }
     for deposit in body.deposits.iter() {
         process_deposit(state, deposit, config)?;
@@ -1836,6 +1851,7 @@ pub fn process_block(
     config: &Config,
     engine: &ExecutionEngine,
     committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     super::block::process_block_header(
         state,
@@ -1848,8 +1864,8 @@ pub fn process_block(
     process_execution_payload(state, &block.body, config, engine)?;
     super::block::process_randao(state, &block.body.randao_reveal)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
-    process_operations(state, &block.body, config, committees)?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate)?;
+    process_operations(state, &block.body, config, committees, active_balances)?;
+    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
     Ok(())
 }
 

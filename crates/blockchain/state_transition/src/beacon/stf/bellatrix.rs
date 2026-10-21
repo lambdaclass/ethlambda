@@ -33,7 +33,9 @@ use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::{BeaconState, bellatrix};
 use crate::beacon::error::{Error, Result, verify};
-use crate::beacon::helpers::accessors::{CommitteeCache, get_current_epoch, get_randao_mix};
+use crate::beacon::helpers::accessors::{
+    ActiveBalanceCache, CommitteeCache, get_current_epoch, get_randao_mix,
+};
 use crate::beacon::preset;
 use crate::beacon::primitives::{
     Bytes32, ExecutionAddress, ExecutionBlockHash, HashTreeRoot as _, Root, Slot, Uint256,
@@ -67,6 +69,7 @@ pub fn process_block(
     config: &Config,
     engine: &ExecutionEngine,
     committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     super::block::process_block_header(
         state,
@@ -89,8 +92,9 @@ pub fn process_block(
         &block.body.voluntary_exits,
         config,
         committees,
+        active_balances,
     )?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate)?;
+    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
     Ok(())
 }
 

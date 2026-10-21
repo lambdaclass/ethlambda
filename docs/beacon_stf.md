@@ -297,26 +297,42 @@ below): persistent Merkle trees in the shape of the SSZ one, modeled on the
   full sweep avoids a map entry and a sorted copy per element. The changed leaves are swapped into the tree
   when the cursor is dropped, which rebuilds only the paths to them; a changed
   composite element's root is computed then, on the state-transition thread. Writes pending
-  when the pass starts are applied first. `BeaconState::registry_mut` hands out
-  `validators` and `balances` as disjoint borrows, so a pass can write one while
-  reading the other. The balance application of `process_rewards_and_penalties`
-  and both `process_effective_balance_updates` run this way: they move
-  together, since once the rewards write bypasses the buffer, the effective
-  balance pass would otherwise pay a tree descent per `balances()[i]` instead of a
-  buffer hit.
+  when the pass starts are applied first. The progressive lists gloas uses for
+  the registry have the same cursor, one subtree after another.
+  `BeaconState::try_update_balances` runs a pass over the balances and
+  `try_update_validators_with_balances` one over the validators with each
+  balance read in step (disjoint borrows of the two lists, over either list
+  kind). The balance application of `process_rewards_and_penalties` and both
+  `process_effective_balance_updates` run this way: they move together, since
+  once the rewards write bypasses the buffer, the effective balance pass would
+  otherwise pay a tree descent per `balance(i)` instead of a buffer hit.
 
 The access pattern matters. `state.validator(i)` and `state.balance(i)` are tree
 descents, cheap next to a hash but far from an array index, and they add up
 when a helper calls them once per validator:
-`get_total_active_balance` builds the active-index `Vec` and then reads every
-index back, and runs several times per block (once per attestation through
-`get_base_reward_per_increment`, once per execution request through the churn
-limits). In the 2026-09-28 import profile, those per-index reads and the
-repeated whole-registry scans were the largest cost left after hashing. A loop
-over the registry should walk `iter_validators()`, zipped with
-`iter_balances()` where it needs both. The total active balance is the obvious
-candidate for computing once per epoch rather than per call, once it is shown
-that no block operation changes it mid-epoch.
+`get_total_active_balance` used to build the active-index `Vec` and then read
+every index back, and runs several times per block (once per attestation through
+`get_base_reward_per_increment`, twice per sync aggregate, once per execution
+request through the churn limits). In the 2026-09-28 import profile, those
+per-index reads and the repeated whole-registry scans were the largest cost left
+after hashing. A loop over the registry should walk `iter_validators()`,
+zipped with `iter_balances()` where it needs both; `get_total_active_balance`
+now does, in one pass.
+
+Block processing does not even pay that pass more than once per epoch. The
+total is cached in `ActiveBalanceCache` (`crates/storage/src/active_balance_cache.rs`),
+held by the `Store` beside the committee cache and consulted through
+`ActiveBalanceCacheExt::total_active_balance`. The key is the epoch plus the
+block root at the last slot of the epoch before it: effective balances are
+written only by that epoch's `process_effective_balance_updates`, and every
+activation or exit lands at least `MAX_SEED_LOOKAHEAD` epochs ahead, so no block
+inside the epoch can move the total, and two states agreeing on that root agree
+on it. The cache lives outside the state, so it adds no field to `BeaconState`
+and no SSZ concern; callers with no store (spec runners, block production,
+tests) hold a fresh `ActiveBalanceCache::default()`. Epoch processing, churn
+helpers and fork choice keep calling the uncached one-pass
+`get_total_active_balance`. In debug builds every hit is cross-checked against a
+fresh computation.
 
 Epoch steps 1-3 (justification, inactivity updates, rewards) follow that rule
 through `helpers::participation`. One walk of `iter_validators()`, zipped with

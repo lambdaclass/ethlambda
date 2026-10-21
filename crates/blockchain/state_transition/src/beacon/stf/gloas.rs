@@ -54,10 +54,11 @@ use crate::beacon::containers::shared::{DepositMessage, ProposerSlashing};
 use crate::beacon::containers::{BeaconState, capella, gloas};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::helpers::accessors::{
-    CommitteeCache, CommitteeCacheExt, get_beacon_proposer_index, get_block_root_at_slot,
-    get_current_epoch, get_domain, get_previous_epoch, get_randao_mix,
+    ActiveBalanceCache, ActiveBalanceCacheExt, CommitteeCache, CommitteeCacheExt,
+    get_beacon_proposer_index, get_block_root_at_slot, get_current_epoch, get_domain,
+    get_previous_epoch, get_randao_mix,
 };
-use crate::beacon::helpers::altair::{add_flag, get_base_reward_per_increment, has_flag};
+use crate::beacon::helpers::altair::{add_flag, base_reward_per_increment, has_flag};
 use crate::beacon::helpers::electra::{g2_point_at_infinity, get_committee_indices};
 use crate::beacon::helpers::gloas::{
     add_builder_to_registry, can_builder_cover_bid, convert_builder_index_to_validator_index,
@@ -102,6 +103,7 @@ pub fn process_block(
     block: &gloas::BeaconBlock,
     config: &Config,
     committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     // [New in Gloas:EIP7732]
     let parent_slot = state.latest_block_header().slot;
@@ -123,8 +125,15 @@ pub fn process_block(
     super::block::process_randao(state, &block.body.randao_reveal)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
     // [Modified in Gloas:EIP7732]
-    process_operations(state, &block.body, parent_slot, config, committees)?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate)?;
+    process_operations(
+        state,
+        &block.body,
+        parent_slot,
+        config,
+        committees,
+        active_balances,
+    )?;
+    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
     Ok(())
 }
 
@@ -1292,6 +1301,7 @@ pub fn process_attestation(
     attestation: &gloas::Attestation,
     parent_slot: Slot,
     committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     let data = attestation.data;
     let current_epoch = get_current_epoch(state);
@@ -1394,7 +1404,15 @@ pub fn process_attestation(
     // constant across this whole read phase (nothing here mutates `state`
     // yet), so computing it once outside the loop below avoids one
     // `get_total_active_balance` scan of the registry per attester per flag.
-    let base_reward_per_increment = get_base_reward_per_increment(state)?;
+    //
+    // Served from the store's total-active-balance cache: no gloas block
+    // operation writes a validator's effective balance (the effective-balance
+    // update at an epoch's end is the only writer, and the builder and
+    // execution-request paths touch balances, exit epochs and queues only), so
+    // the total is fixed for the epoch. The debug cross-check on every cache
+    // hit enforces that.
+    let base_reward_per_increment =
+        base_reward_per_increment(active_balances.total_active_balance(state)?);
 
     // Read phase: for every attester, decide which flags this attestation
     // newly satisfies, add up the proposer's reward for granting them, and
@@ -1418,6 +1436,10 @@ pub fn process_attestation(
             )?;
             let had_no_participation = current_flags == 0;
 
+            // The attester's validator is read at most once, on the first
+            // flag it newly earns: each read is a tree descent, and the
+            // effective balance cannot change inside this read-only phase.
+            let mut attester_effective_balance: Option<Gwei> = None;
             let mut new_flags: ParticipationFlags = 0;
             for &flag_index in &participation_flag_indices {
                 if has_flag(current_flags, flag_index) {
@@ -1425,8 +1447,15 @@ pub fn process_attestation(
                 }
                 new_flags = add_flag(new_flags, flag_index);
                 let weight = constants::PARTICIPATION_FLAG_WEIGHTS[flag_index];
-                let increments =
-                    state.validator(index)?.effective_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
+                let effective_balance = match attester_effective_balance {
+                    Some(effective_balance) => effective_balance,
+                    None => {
+                        let effective_balance = state.validator(index)?.effective_balance;
+                        attester_effective_balance = Some(effective_balance);
+                        effective_balance
+                    }
+                };
+                let increments = effective_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
                 let base_reward = increments.checked_mul(base_reward_per_increment).ok_or(
                     Error::ArithmeticOverflow("process_attestation: get_base_reward(state, index)"),
                 )?;
@@ -1446,7 +1475,11 @@ pub fn process_attestation(
                 && is_same_slot
                 && payment.withdrawal.amount > 0
             {
-                let effective_balance = state.validator(index)?.effective_balance;
+                // `will_set_new_flag` means the loop above read it already.
+                let effective_balance = match attester_effective_balance {
+                    Some(effective_balance) => effective_balance,
+                    None => state.validator(index)?.effective_balance,
+                };
                 payment.weight = payment.weight.checked_add(effective_balance).ok_or(
                     Error::ArithmeticOverflow(
                         "process_attestation: payment.weight + validator.effective_balance",
@@ -1553,6 +1586,7 @@ pub fn process_operations(
     parent_slot: Slot,
     config: &Config,
     committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     verify(
         body.deposits.is_empty(),
@@ -1594,7 +1628,7 @@ pub fn process_operations(
     }
     // [Modified in Gloas:EIP7732]
     for attestation in body.attestations.iter() {
-        process_attestation(state, attestation, parent_slot, committees)?;
+        process_attestation(state, attestation, parent_slot, committees, active_balances)?;
     }
     for voluntary_exit in body.voluntary_exits.iter() {
         crate::beacon::stf::electra::process_voluntary_exit(state, voluntary_exit, config)?;
@@ -1887,7 +1921,14 @@ mod tests {
         for (expected_message, body) in cases {
             let mut state = state.clone();
             let committees = CommitteeCache::default();
-            let result = process_operations(&mut state, &body, 0, &config, &committees);
+            let result = process_operations(
+                &mut state,
+                &body,
+                0,
+                &config,
+                &committees,
+                &ActiveBalanceCache::default(),
+            );
             assert!(
                 matches!(result, Err(Error::SpecAssert(message)) if message == expected_message),
                 "expected {expected_message:?} to fail, got {result:?}"

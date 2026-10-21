@@ -43,7 +43,9 @@
 use crate::beacon::config::Config;
 use crate::beacon::containers::{BeaconState, deneb, electra};
 use crate::beacon::error::{Result, verify};
-use crate::beacon::helpers::accessors::{CommitteeCache, get_current_epoch, get_randao_mix};
+use crate::beacon::helpers::accessors::{
+    ActiveBalanceCache, CommitteeCache, get_current_epoch, get_randao_mix,
+};
 use crate::beacon::helpers::electra::pending_queue_fields;
 use crate::beacon::helpers::fulu::{fulu_state, fulu_state_ref};
 use crate::beacon::primitives::{Bytes32, HashTreeRoot as _};
@@ -65,6 +67,7 @@ pub fn process_block(
     config: &Config,
     engine: &ExecutionEngine,
     committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     super::block::process_block_header(
         state,
@@ -77,8 +80,8 @@ pub fn process_block(
     process_execution_payload(state, &block.body, config, engine)?;
     super::block::process_randao(state, &block.body.randao_reveal)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
-    process_operations(state, &block.body, config, committees)?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate)?;
+    process_operations(state, &block.body, config, committees, active_balances)?;
+    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
     Ok(())
 }
 
@@ -219,6 +222,7 @@ pub fn process_operations(
     body: &electra::BeaconBlockBody,
     config: &Config,
     committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     // [Modified in Fulu]
     verify(body.deposits.is_empty(), "len(body.deposits) == 0")?;
@@ -230,7 +234,7 @@ pub fn process_operations(
         super::electra::process_attester_slashing(state, attester_slashing, config)?;
     }
     for attestation in body.attestations.iter() {
-        super::electra::process_attestation(state, attestation, committees)?;
+        super::electra::process_attestation(state, attestation, committees, active_balances)?;
     }
     // [Modified in Fulu]
     // Removed `process_deposit`
