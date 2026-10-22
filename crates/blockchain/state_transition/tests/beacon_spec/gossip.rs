@@ -175,14 +175,18 @@ impl Meta {
         OPERATION_TOPICS.contains(&self.topic.as_str())
     }
 
-    /// The case's clock. The state-only operation vectors omit it, and their
-    /// clock is genesis; every other topic must say.
+    /// The case's clock before any message: `meta.current_time_ms` when a
+    /// vector still names one, otherwise the earliest absolute time a message
+    /// carries (beta.4 moved the clock onto each message), otherwise genesis,
+    /// as for the vectors that carry no timing at all.
     fn base_ms(&self) -> Result<u64, String> {
-        match self.current_time_ms {
-            Some(ms) => Ok(ms),
-            None if self.is_operation_topic() => Ok(0),
-            None => Err("meta.yaml lacks current_time_ms".into()),
-        }
+        Ok(self.current_time_ms.unwrap_or_else(|| {
+            self.messages
+                .iter()
+                .filter_map(|message| message.current_time_ms)
+                .min()
+                .unwrap_or(0)
+        }))
     }
 
     /// The clock reading `message` arrives at, in milliseconds since genesis
@@ -192,7 +196,7 @@ impl Meta {
     fn arrival_ms(&self, message: &GossipMessage) -> Result<u64, String> {
         let base_ms = self.base_ms()?;
         let untimed = message.offset_ms.is_none() && message.current_time_ms.is_none();
-        if untimed && self.is_operation_topic() {
+        if untimed {
             return Ok(base_ms);
         }
         message.arrival_ms(base_ms)
