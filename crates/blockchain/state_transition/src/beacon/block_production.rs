@@ -38,8 +38,8 @@ use super::bls;
 use super::config::Config;
 use super::error::{Error, Result, verify};
 use super::helpers::accessors::{
-    CommitteeCache, get_beacon_proposer_index, get_block_root, get_current_epoch,
-    get_previous_epoch, get_randao_mix,
+    ActiveBalanceCache, CommitteeCache, get_beacon_proposer_index, get_block_root,
+    get_current_epoch, get_previous_epoch, get_randao_mix,
 };
 use super::helpers::electra::{
     get_attesting_indices, get_indexed_attestation, is_valid_indexed_attestation,
@@ -343,6 +343,7 @@ pub fn assemble_block(
         config,
         &ExecutionEngine::valid(),
         &CommitteeCache::default(),
+        &ActiveBalanceCache::default(),
     )?;
     block.state_root = post.hash_tree_root();
     Ok(block)
@@ -435,6 +436,7 @@ mod tests {
             &Config::mainnet(),
             &ExecutionEngine::valid(),
             &CommitteeCache::default(),
+            &ActiveBalanceCache::default(),
         )
         .unwrap();
         assert_eq!(block.state_root, post.hash_tree_root());

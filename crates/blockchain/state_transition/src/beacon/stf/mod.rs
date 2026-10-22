@@ -66,7 +66,7 @@ pub mod operations;
 use crate::beacon::containers;
 use crate::beacon::containers::{BeaconState, phase0};
 use crate::beacon::error::{Error, Result, verify};
-use crate::beacon::helpers::accessors::{CommitteeCache, get_domain};
+use crate::beacon::helpers::accessors::{ActiveBalanceCache, CommitteeCache, get_domain};
 use crate::beacon::helpers::misc::compute_signing_root;
 use crate::beacon::preset;
 use crate::beacon::primitives::{HashTreeRoot as _, Slot};
@@ -132,6 +132,7 @@ pub fn state_transition(
     config: &Config,
     engine: &ExecutionEngine,
     committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     process_slots(state, signed_block.slot(), config)?;
 
@@ -153,7 +154,14 @@ pub fn state_transition(
         )?;
     }
 
-    block::process_block(state, signed_block, config, engine, committees)?;
+    block::process_block(
+        state,
+        signed_block,
+        config,
+        engine,
+        committees,
+        active_balances,
+    )?;
     // As in `process_slot`: the post-state's root, checked below and needed
     // again in the next slot, is then computed on the state's own nodes.
     state.apply_pending_mutations();
