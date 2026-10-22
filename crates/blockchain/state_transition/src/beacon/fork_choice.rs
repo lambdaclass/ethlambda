@@ -175,7 +175,7 @@ use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::{
     ActiveBalanceCache, CommitteeCache, CommitteeCacheExt, get_active_validator_indices,
-    get_current_epoch, get_total_active_balance,
+    get_current_epoch,
 };
 use crate::beacon::helpers::attestation as phase0_attestation;
 use crate::beacon::helpers::electra as electra_helpers;
@@ -1396,10 +1396,17 @@ pub fn get_ancestor_or_missing(
 /// values it is called with are themselves already expressed on a 0-100
 /// scale.
 pub fn calculate_committee_fraction(state: &BeaconState, committee_percent: u64) -> Result<Gwei> {
-    Ok(committee_fraction(
-        get_total_active_balance(state)?,
-        committee_percent,
-    ))
+    // [Modified in beta.4, consensus-specs #5679] Slashed validators no longer
+    // count towards the committee weight, matching `get_attestation_score`.
+    let epoch = get_current_epoch(state);
+    let total = state
+        .iter_validators()
+        .filter(|validator| is_active_validator(validator, epoch) && !validator.slashed)
+        .fold(0, |sum: Gwei, validator| {
+            sum.saturating_add(validator.effective_balance)
+        })
+        .max(preset::EFFECTIVE_BALANCE_INCREMENT);
+    Ok(committee_fraction(total, committee_percent))
 }
 
 /// The arithmetic of [`calculate_committee_fraction`], for a caller that
@@ -1430,7 +1437,7 @@ pub fn get_checkpoint_block(
 pub fn get_proposer_score(store: &Store, config: &Config) -> Result<Gwei> {
     let balances = justified_balances(store, config)?;
     Ok(committee_fraction(
-        balances.total_active_balance(),
+        balances.unslashed_active_balance(),
         config.proposer_score_boost,
     ))
 }
@@ -1745,8 +1752,10 @@ pub fn compute_weights(
         let justified_slot = index
             .get(&justified_checkpoint.root)
             .map_or(0, |(slot, _)| *slot);
-        let proposer_score =
-            committee_fraction(balances.total_active_balance(), config.proposer_score_boost);
+        let proposer_score = committee_fraction(
+            balances.unslashed_active_balance(),
+            config.proposer_score_boost,
+        );
         let mut cursor = boost_root;
         while let Some((slot, parent_root)) = index.get(&cursor).copied() {
             let entry = weights.entry(cursor).or_default();
@@ -2899,7 +2908,7 @@ fn is_head_weak_with(
     attestation_score: Gwei,
 ) -> Result<bool> {
     let reorg_threshold = committee_fraction(
-        balances.total_active_balance(),
+        balances.unslashed_active_balance(),
         config.reorg_head_weight_threshold,
     );
     let mut head_weight = attestation_score;
@@ -2936,7 +2945,7 @@ fn is_head_weak_with(
 pub fn is_parent_strong(store: &Store, root: Root, config: &Config) -> Result<bool> {
     let balances = justified_balances(store, config)?;
     let parent_threshold = committee_fraction(
-        balances.total_active_balance(),
+        balances.unslashed_active_balance(),
         config.reorg_parent_weight_threshold,
     );
     let (_, parent_root) = store
@@ -5802,7 +5811,7 @@ mod tests {
     use super::*;
     use crate::beacon::bls;
     use crate::beacon::containers::BeaconBlockHeader;
-    use crate::beacon::helpers::accessors;
+    use crate::beacon::helpers::accessors::{self, get_total_active_balance};
     use crate::beacon::helpers::misc::compute_signing_root;
     use crate::beacon::helpers::test_state;
     use crate::beacon::primitives::BlsSignature;
@@ -6194,19 +6203,19 @@ mod tests {
         );
     }
 
-    /// The boost's committee weight divides the total active balance, which
-    /// counts a slashed validator that is still active and leaves out one that
-    /// is not active yet or already exited: the snapshot's per-vote zeros for
-    /// the first kind must not leak into the total.
+    /// The boost's committee weight divides the active, unslashed balance
+    /// (consensus-specs #5679): a slashed validator that is still active no
+    /// longer counts, and neither does one that is not active yet or already
+    /// exited.
     #[test]
-    fn the_proposer_score_counts_a_slashed_but_active_validator() {
+    fn the_proposer_score_leaves_out_a_slashed_validator() {
         let config = Config::active();
         let (store, _anchor_root, _anchor_slot) =
             anchored_store_from(state_with_slashed_and_inactive_validators(12));
 
-        // 12 validators, 2 of them (7 and 8) inactive; the slashed one stays.
+        // 12 validators, 2 of them (7 and 8) inactive and one slashed.
         let expected = committee_fraction(
-            10 * preset::MAX_EFFECTIVE_BALANCE,
+            9 * preset::MAX_EFFECTIVE_BALANCE,
             config.proposer_score_boost,
         );
         assert_eq!(
@@ -6216,10 +6225,10 @@ mod tests {
         assert_ne!(
             expected,
             committee_fraction(
-                9 * preset::MAX_EFFECTIVE_BALANCE,
+                10 * preset::MAX_EFFECTIVE_BALANCE,
                 config.proposer_score_boost
             ),
-            "a total that dropped the slashed validator would differ"
+            "a total that kept the slashed validator would differ"
         );
         // And it is the state's own definition, not a second one.
         let state = checkpoint_state(&store, &store.beacon_justified_checkpoint(), &config)
