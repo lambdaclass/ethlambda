@@ -7,13 +7,14 @@
 
 use std::time::Instant;
 
-use ethlambda_network_api::{BlockArrival, BlockSource};
+use ethlambda_network_api::{AggregateArrival, BlockAnnouncement, BlockArrival, BlockSource};
 use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome, RejectReason};
 use ethlambda_types::{
     ShortRoot,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     beacon::containers::{DataColumnSidecar, SignedBeaconBlock, electra::SingleAttestation},
     beacon::fork::ForkName,
+    beacon::primitives::ValidatorIndex,
     block::SignedBlock,
     primitives::HashTreeRoot as _,
     time::unix_now_ms,
@@ -168,6 +169,7 @@ async fn handle_lean_block(
                 SignedBeaconBlock::Lean(signed_block),
                 BlockSource::Gossip,
                 arrival,
+                BlockAnnouncement::Announce,
             )
             .inspect_err(|err| error!(%err, "Failed to forward block to blockchain"));
     }
@@ -713,12 +715,16 @@ pub async fn publish_beacon_attestation(
 }
 
 /// Gossip one of a validator client's signed aggregates, handed over by the
-/// Beacon API after validation, on `beacon_aggregate_and_proof`. This node is
+/// Beacon API after validation, on `beacon_aggregate_and_proof`, and pass it
+/// to the chain actor as an accepted gossip aggregate would be. This node is
 /// subscribed to that topic, so it reaches the mesh rather than relying on
-/// fanout.
+/// fanout; and gossipsub never delivers a node its own messages, so the
+/// hand-off is the only way this node's fork choice and `attestation` event
+/// stream see its own validator client's aggregates.
 pub async fn publish_beacon_aggregate(
     server: &mut P2PServer,
     aggregate: ethlambda_types::beacon::containers::SignedAggregateAndProof,
+    attesting_indices: Vec<ValidatorIndex>,
 ) {
     let slot = aggregate.slot();
     let aggregator = aggregate.aggregator_index();
@@ -749,6 +755,15 @@ pub async fn publish_beacon_aggregate(
     };
     server.swarm_handle.publish(topic, compress_message(&ssz));
     debug!(%slot, aggregator, "Published aggregate to gossipsub");
+    if let Some(ref blockchain) = server.blockchain {
+        let _ = blockchain
+            .new_beacon_aggregate(
+                Box::new(aggregate),
+                attesting_indices,
+                AggregateArrival::now(),
+            )
+            .inspect_err(|err| error!(%err, "Failed to hand the published aggregate to the chain"));
+    }
 }
 
 /// Gossip a block a validator client signed, handed over by the Beacon API,
@@ -783,7 +798,12 @@ pub async fn publish_beacon_block(server: &mut P2PServer, block: SignedBeaconBlo
     );
     if let Some(ref blockchain) = server.blockchain {
         let _ = blockchain
-            .new_block(block, BlockSource::Gossip, BlockArrival::now())
+            .new_block(
+                block,
+                BlockSource::Gossip,
+                BlockArrival::now(),
+                BlockAnnouncement::Announce,
+            )
             .inspect_err(|err| error!(%err, "Failed to hand the published block to the chain"));
     }
 }
@@ -1026,7 +1046,7 @@ mod tests {
     use ethlambda_types::beacon::primitives::Slot;
 
     use super::*;
-    use crate::test_support::{unconnected_beacon_server, valid_shaped_sidecar};
+    use crate::test_support::{RecordingChain, unconnected_beacon_server, valid_shaped_sidecar};
 
     /// An electra-shaped aggregate at `slot` with `data.index` set to
     /// `data_index`. Only what [`gossip::aggregate::cheap_checks`]'s very
@@ -1441,6 +1461,29 @@ mod tests {
             triage_other(wire, beacon_topics::VOLUNTARY_EXIT, &payload),
             Dispatch::Report(Outcome::Ignore(IgnoreReason::NoConsumer))
         ));
+    }
+
+    /// Gossip never delivers a node its own message, so the hand-off is the
+    /// only way the chain actor sees an aggregate this node's validator client
+    /// submitted, and it needs the indices the Beacon API resolved.
+    #[tokio::test]
+    async fn a_published_aggregate_is_handed_to_the_chain_with_its_indices() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        // The test server's digest is a placeholder, and an aggregate whose
+        // slot no held digest covers is neither published nor handed on.
+        let crate::Wire::Beacon(beacon) = &mut server.wire else {
+            unreachable!("unconnected_beacon_server builds a beacon wire");
+        };
+        beacon.topics.fork_digest = beacon.digest_for_slot(5);
+        let chain = std::sync::Arc::new(RecordingChain::default());
+        server.blockchain = Some(chain.clone());
+        let aggregate = ethlambda_types::beacon::containers::SignedAggregateAndProof::Electra(
+            electra_aggregate(5, 0),
+        );
+
+        publish_beacon_aggregate(&mut server, aggregate.clone(), vec![3, 4]).await;
+
+        assert_eq!(*chain.aggregates.lock().unwrap(), [(aggregate, vec![3, 4])]);
     }
 
     /// A payload that does not decode as a gloas envelope is the sender's
