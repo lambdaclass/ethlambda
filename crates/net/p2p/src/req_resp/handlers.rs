@@ -2575,6 +2575,7 @@ mod tests {
             )),
             attestation_pool: Default::default(),
             aggregator_subnets: HashMap::new(),
+            peer_scoring: None,
         }
     }
 
