@@ -68,8 +68,8 @@ order. That walk and the actor split the duties:
 | Interval | In `store::on_tick` | In the actor |
 | --- | --- | --- |
 | 0 | accept new attestations, if we propose this slot | nothing: the build ran at the previous interval 4 |
-| 1 | nothing | produce attestations, arm the early-aggregation check |
-| 2 | nothing | start the aggregation session |
+| 1 | nothing | produce attestations |
+| 2 | nothing | publish the aggregates the worker produced |
 | 3 | update the safe target | nothing |
 | 4 | accept accumulated attestations | build and publish the next slot's block |
 
@@ -94,18 +94,30 @@ recomputes the head with [LMD GHOST](./lmd_ghost.md) (`crates/blockchain/fork_ch
 ### Aggregation off the message loop
 
 XMSS proving costs hundreds of milliseconds, so it cannot run on the actor loop: a blocked
-actor stops importing blocks. The actor instead snapshots aggregation inputs from the store,
-ranks candidates by consensus value, and hands a job list to a `spawn_blocking` worker
-(`crates/blockchain/src/aggregation.rs`). The worker holds no store access, streams one
-`AggregateProduced` message back per finished job, and ends with `AggregationDone`. The actor
-publishes each result on gossip when it arrives.
+actor stops importing blocks. One worker thread
+(`crates/blockchain/src/aggregation.rs`) is spawned when the actor starts and runs for as
+long as it does. A plain `std::thread`, not a runtime task: it awaits nothing, it reaches
+the actor through an unbounded channel, and it would otherwise hold a blocking-pool thread
+for the life of the process. It holds its own `Store` handle — the same backend and the same in-memory
+buffers — and loops: rank the pool's candidates by consensus value, prove the best one, hand
+it to the actor as an `AggregateProduced` message, rank again. Idle rounds sleep
+`WORKER_IDLE_POLL` before re-reading the pool.
 
-A soft deadline cancels the worker through a `CancellationToken`, so an overrunning slot
-cannot eat the next one. The session can also start up to `EARLY_AGGREGATION_WINDOW` before
-interval 2, once two thirds of the expected signatures are in. Either entry point counts as
-the slot's one session, so a slot aggregates once. Starting early buys proving time, not an
-earlier publication: the worker holds each finished aggregate until the interval-2 boundary
-before delivering it to the actor.
+The worker stores each aggregate itself before announcing it, so the pool its next round
+re-reads already accounts for it, and the message carries only the participant set naming
+the proof, never the proof. The actor buffers those names and gossips the proofs at interval
+2, reading them back out of the pool. That splits the two concerns the old per-slot session
+conflated: proving runs whenever there is work, publication stays on the interval grid.
+
+What the worker may take up is a function of where the slot is (`JobPolicy`). Early on it
+works the backlog — stale groups, merges of proofs already in the pool — and takes a
+current-slot group once two thirds of the signatures this node expects are in, so the
+slot's votes go out as one wide aggregate rather than several thin ones. Inside the last
+600 ms before interval 2 it takes nothing else at all: those backlog jobs are recursive
+merges that can run past the boundary, and one of them occupying the single prover would
+delay the aggregate the slot is waiting on. From interval 2 on, whatever is in hand is
+aggregated. Separately, the actor raises a pause flag around its own block build, since
+that competes for the same prover.
 
 Block import runs a second, smaller aggregation path. `reaggregate.rs` splits an imported
 block's merged proof back into per-attestation aggregates and folds them into the local pool,
@@ -117,7 +129,7 @@ whole path while the node is catching up.
 ### Subnet-windowed aggregation
 
 Two aggregators handed the same pool of existing proofs would otherwise pick the same two
-children every session, since the greedy selection in `aggregation.rs` is deterministic: all
+children every round, since the greedy selection in `aggregation.rs` is deterministic: all
 that duplicated leanVM proving buys nothing once one of them publishes. Each aggregator instead
 scores that pool through a window: a contiguous run of subnets starting at its duty subnet, the
 first value of `--aggregate-subnet-ids` (or the lowest subnet it subscribes to, if that flag is
@@ -136,6 +148,13 @@ narrowest window then leaves it aggregating those instead of merging other aggre
 proofs. The price is that two aggregators reading one lopsided pool can derive different
 widths, so their windows nest rather than tile; that costs a round of climbing, not
 correctness.
+
+Because the worker stores each proof in the pool as soon as it finishes, a data root can
+climb within a single slot: once this node's first proof for the slot lands, a later round
+for the same data (a re-prove folding in a late signature, or a merge with a peer's proof)
+anchors on it and works through a wider window. Under `--skip-redundant-aggregation`
+(below) that means a late signature can wait for a slot in which this node owns the wider
+width, rather than being folded in straight away.
 
 A window can still decline a merge the unwindowed pool would have allowed, when the proof pool
 is sparse relative to the window's contiguous span (a strided aggregator placement is the
