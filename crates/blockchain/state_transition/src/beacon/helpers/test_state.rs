@@ -33,11 +33,11 @@ use crate::beacon::containers::{
     fulu, gloas, phase0,
 };
 use crate::beacon::fork::ForkName;
-use crate::beacon::lean_fork_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
     BlsPubkey, BlsSignature, Bytes32, ExecutionAddress, ExecutionBlockHash, Gwei, Root, Uint256,
 };
+use crate::beacon::{lean_fork_unreachable, lean_state_unreachable};
 
 /// A deterministic but genuinely valid BLS public key for validator `index`.
 ///
@@ -145,6 +145,32 @@ pub fn with_validators_at(fork: ForkName, count: usize) -> BeaconState {
         // fork name can produce; the `fork:` form, since the argument is the
         // whole input.
         ForkName::Lean => lean_fork_unreachable("with_validators_at"),
+    }
+}
+
+/// Replaces `state`'s whole balance list, which may leave it shorter or longer
+/// than the registry.
+///
+/// `BeaconState` only reaches balances one element at a time, since gloas's
+/// list is a different type from every earlier fork's; a test that needs a
+/// mismatched length (to exercise a step's missing-entry error) sets the
+/// fork's own field through this instead.
+pub fn replace_balances(state: &mut BeaconState, balances: Vec<Gwei>) {
+    let bounded = |balances: Vec<Gwei>| -> Balances {
+        balances
+            .try_into()
+            .expect("a test's balance list is far below VALIDATOR_REGISTRY_LIMIT")
+    };
+    match state {
+        BeaconState::Phase0(state) => state.balances = bounded(balances),
+        BeaconState::Altair(state) => state.balances = bounded(balances),
+        BeaconState::Bellatrix(state) => state.balances = bounded(balances),
+        BeaconState::Capella(state) => state.balances = bounded(balances),
+        BeaconState::Deneb(state) => state.balances = bounded(balances),
+        BeaconState::Electra(state) => state.balances = bounded(balances),
+        BeaconState::Fulu(state) => state.balances = bounded(balances),
+        BeaconState::Gloas(state) => state.balances = balances.into(),
+        BeaconState::Lean(_) => lean_state_unreachable("replace_balances"),
     }
 }
 
