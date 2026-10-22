@@ -60,8 +60,7 @@ use crate::beacon_state_delta;
 use crate::error::Error;
 use crate::state_codec::{decode_lean_state_value, decode_state_value, encode_state_value};
 use crate::state_diff::StateDiff;
-use crate::store::Chain;
-use crate::store::beacon_block_slot;
+use crate::store::{Chain, beacon_block_slot, block_slot, block_slot_in, encode_slot_root_key};
 
 /// What a state insert will write, decided but not yet committed.
 ///
@@ -168,9 +167,15 @@ pub(crate) fn read_state(
     let state = match chain {
         Chain::Lean => {
             // Anchor snapshot in `States`, otherwise reconstruct from the diff chain.
+            // `States` is keyed by block slot then root, so a root with no
+            // block row has no state to find.
+            let Some(slot) = block_slot(backend, chain, root) else {
+                return Ok(None);
+            };
             let snapshot = {
                 let view = backend.begin_read().expect("read view");
-                view.read_with(Table::States, &root.to_ssz(), decode_lean_state_value)
+                let key = encode_slot_root_key(slot, root);
+                view.read_with(Table::States, &key, decode_lean_state_value)
                     .expect("read")
             };
             let state = match snapshot {
@@ -257,10 +262,15 @@ fn rebase_onto_resident(cache: &StateCache, state: &mut BeaconState) {
 /// [`Cow::Owned`], so taking ownership costs no further copy either way
 /// beyond the one a borrowed snapshot needs.
 ///
+/// Both tables are keyed by block slot then root, so each hop looks up its
+/// own slot from that root's `BlockHeaders` row.
+///
 /// `Ok(None)` when `root` is unknown, or the chain runs off the retained
 /// window before reaching a snapshot: a missing `StateDiffs` record below
-/// the pruned boundary, matching how the lean walk in
-/// [`reconstruct_state`] handles both cases.
+/// the pruned boundary (see
+/// [`Store::prune_finalized_states`](crate::store::Store::prune_finalized_states)),
+/// matching how the lean walk in [`reconstruct_state`] handles both cases. A
+/// hop whose block row is absent ends the walk the same way.
 pub(crate) fn reconstruct_beacon_state_bytes<T>(
     backend: &dyn StorageBackend,
     root: &H256,
@@ -271,7 +281,10 @@ pub(crate) fn reconstruct_beacon_state_bytes<T>(
     let mut consume = Some(consume);
     let mut cursor = *root;
     loop {
-        let key = cursor.to_ssz();
+        let Some(slot) = block_slot_in(view.as_ref(), Chain::Beacon, &cursor) else {
+            return Ok(None);
+        };
+        let key = encode_slot_root_key(slot, &cursor);
         // The walk ends at the first snapshot, so the deltas collected so
         // far are folded onto it while it is still borrowed.
         let folded = view
@@ -344,7 +357,10 @@ pub(crate) fn reconstruct_state(
     let mut diffs: Vec<StateDiff> = Vec::new();
     let mut cursor = *root;
     let snapshot = loop {
-        let key = cursor.to_ssz();
+        let Some(slot) = block_slot_in(view.as_ref(), Chain::Lean, &cursor) else {
+            return Ok(None);
+        };
+        let key = encode_slot_root_key(slot, &cursor);
         if let Some(snapshot) = view
             .read_with(Table::States, &key, decode_lean_state_value)
             .expect("read")
@@ -560,7 +576,14 @@ impl StateWriter {
             write.snapshot.is_some() || write.diff.is_some(),
             "a state write that persists nothing would silently drop the state"
         );
-        let key = root.to_ssz();
+        // Keyed by the slot of the block the state belongs to, which is what a
+        // reader holding only a root recovers from `BlockHeaders`. Not
+        // `state.slot()`: a beacon anchor state can be advanced past its block.
+        let block_slot = match &*request.state {
+            BeaconState::Lean(lean) => lean.latest_block_header.slot,
+            beacon_state => beacon_state.latest_block_header().slot,
+        };
+        let key = encode_slot_root_key(block_slot, &root);
         let mut batch = self.backend.begin_write().expect("write batch");
         if let Some(diff) = write.diff {
             batch

@@ -3266,6 +3266,8 @@ mod tests {
         let root = block.message_hash_tree_root();
         let slot = block.slot();
         *post_state.slot_mut() = slot;
+        // The state is keyed by its block's slot, which is the header's.
+        post_state.latest_block_header_mut().slot = slot;
         store.insert_signed_block(root, block).unwrap();
         store.insert_state(root, post_state).unwrap();
         compute_pulled_up_tip(store, root, slot, config).expect("pulled-up tip");

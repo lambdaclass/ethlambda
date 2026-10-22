@@ -783,6 +783,10 @@ behavior.
 
 - `BlockProof` is the only pruned block table (below the finalized
   boundary); `get_signed_block` returns `None` for a pruned finalized block.
+- `States`/`StateDiffs` are pruned below the finalized block's snapshot interval
+  by `prune_finalized_states` (lean: in `prune_old_data`; beacon: in
+  `evict_held_blocks_at_or_below_finality`), watermarked by
+  `KEY_STATES_PRUNED_BELOW` so ranges are adjacent and never overlap.
 - A `StateDiff` omits `config` and `validators`, trusting they never mutate;
   breaking that invariant would silently corrupt every reconstructed state.
 - `Metadata["config"]` is written at bootstrap; it doubles as the DB's
@@ -809,13 +813,15 @@ behavior.
   in-memory map stays as a write-through cache in front of the table. Pruned
   on finalization to the same horizon as `LiveChain` (the finalized block's
   own slot, keeping that block's own entry).
-- `DB_VERSION` is 5: the new unrealized-justifications table means a
-  directory written by an earlier version has no row there for any block it
-  already imported, which would otherwise look identical to "no unrealized
-  justification computed yet" rather than "this directory predates the
-  table". (4 was `PRESET_BASE`/`CONFIG_NAME` at the front of `Config`; 3 was
-  the runtime keys a `config.yaml` supplies.) `Store::from_db_state` refuses
-  any other version outright; there is no migration.
+- `DB_VERSION` is 6: `States` and `StateDiffs` moved from root keys to
+  slot||root keys (the block's slot, looked up from `BlockHeaders` by readers)
+  so `Store::prune_finalized_states` can range-delete finalized states; a
+  directory written by an earlier version holds rows no lookup finds. (5 was
+  the unrealized-justifications table, since a directory written before it has
+  no row there for any block it already imported; 4 was
+  `PRESET_BASE`/`CONFIG_NAME` at the front of `Config`; 3 was the runtime keys
+  a `config.yaml` supplies.) `Store::from_db_state` refuses any other version
+  outright; there is no migration.
 
 ### State Root Computation
 - Always computed via `hash_tree_root()` after full state transition
