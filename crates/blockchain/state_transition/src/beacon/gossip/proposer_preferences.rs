@@ -301,6 +301,8 @@ mod tests {
             .expect("link the head to the dependent block");
         let mut dependent_state = scene.state.clone();
         *dependent_state.slot_mut() = 0;
+        // The state is keyed by its block's slot, which is the header's.
+        dependent_state.latest_block_header_mut().slot = 0;
         scene
             .store
             .insert_state(DEPENDENT, dependent_state)
