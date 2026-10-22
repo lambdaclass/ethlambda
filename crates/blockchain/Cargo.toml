@@ -41,6 +41,7 @@ libssz-types.workspace = true
 # The mock execution client the payload-validity tests talk to over a socket.
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt"] }
 datatest-stable = "0.3.3"
+serde_json.workspace = true
 snap = "1.1.1"
 
 [features]
