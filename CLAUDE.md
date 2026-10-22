@@ -28,7 +28,8 @@ crates/
     ├─ src/lib.rs           # BlockChain actor, tick events, validator duties
     ├─ src/store.rs         # Fork choice store, block/attestation processing
     ├─ src/block_builder.rs # Block assembly (pre-built at previous slot's interval 4)
-    ├─ src/aggregation.rs   # Always-on signature aggregation worker (own thread + Store clone)
+    ├─ src/aggregation.rs   # Always-on aggregation worker (own thread + Store clone; also body-proof jobs)
+    ├─ src/body_proof.rs    # Candidate block bodies: build, buffer, and the proposer's choice
     ├─ src/reaggregate.rs   # Re-aggregation of block-borne votes on import
     ├─ src/sync_status.rs   # Sync-gate tracker (suppresses duties while syncing)
     ├─ src/key_manager.rs   # Validator key management and signing
@@ -64,11 +65,11 @@ crates/
 
 ### Tick-Based Validator Duties (5 intervals per slot; 4-second slots by default)
 ```
-Interval 0: Block published (at the slot boundary). The build+publish code path is merged into the previous slot's interval 4 (see below) and aligned to publish here; no attestation acceptance happens at interval 0.
+Interval 0: Accept attestations (if proposing), then assemble+publish our block from the buffered BlockBodyProof candidates (or an empty body)
 Interval 1: Attestation production (all validators, including proposer)
 Interval 2: Aggregate publication (aggregators gossip the aggregates their worker produced). Proving itself is NOT confined to this interval: the worker runs continuously, and the actor buffers each finished aggregate until this tick. One that finishes DURING interval 2 or 3 is gossiped on arrival instead, since the window is already open and buffering would hold it a full slot.
 Interval 3: Safe target update (fork choice)
-Interval 4: Accept accumulated attestations; build the NEXT slot's block and publish it aligned to that slot's interval 0 (build and publish merged into this tick)
+Interval 4: Accept accumulated attestations; the worker packs the NEXT slot's candidate BlockBodyProof, gossiped as it finishes
 ```
 
 ### Attestation Pipeline
@@ -391,8 +392,8 @@ actual_slot = finalized_slot + 1 + relative_index
 ### Protocols
 - **Transport**: QUIC over UDP (TLS 1.3), plus TCP (noise, then yamux or mplex) on the same port number as a fallback: a peer whose advertised `quic` doesn't answer can still be reached over TCP. Both addresses go into one dial, `quic` first, and `DIAL_ADDRESS_CONCURRENCY` pins `dial_concurrency_factor` to one, so the order is a real preference and TCP is tried only after the QUIC attempt fails. Mainnet beacon peers answer `na` to a yamux-only proposal, so TCP connections negotiate mplex (see the `muxers` module doc), which is expensive: preferring QUIC is how that cost is avoided where the peer allows it
   - Binding TCP puts `--gossipsub-port` in the HTTP servers' namespace, so it must now differ from `--api-port`/`--metrics-port` too. `Options::validate_ports` rejects every clash before anything binds
-- **Gossipsub**: Blocks + Attestations (snappy raw compression)
-  - Topic: `/leanconsensus/{fork_digest}/{block|aggregation|attestation_N}/ssz_snappy`
+- **Gossipsub**: Blocks + Attestations + candidate block bodies (snappy raw compression)
+  - Topic: `/leanconsensus/{fork_digest}/{block|aggregation|block_body_proof|attestation_N}/ssz_snappy`
   - `fork_digest` is a 4-byte hex string (no `0x` prefix); currently the dummy `12345678` agreed across clients
   - Mesh size: 8 (6-12 bounds), heartbeat: 700ms
   - Beacon wire: `validate_messages()` is on, so every beacon message waits for a verdict (~4.2s before gossipsub's cache evicts it). Rules in `state_transition::beacon::gossip` (cheap half inline, stateful half on a bounded `spawn_blocking` task); plumbing in `p2p/src/beacon/verdict.rs`. Lean gossip still auto-forwards
@@ -818,7 +819,7 @@ incremental, and line-tables-only debuginfo, so rebuilds are much faster than
 ### Aggregator Flag Required for Finalization
 - At least one node **must** be started with `--is-aggregator` to finalize blocks
 - Without this flag, attestations pass signature verification and are logged as "Attestation processed", but the signature is never stored for aggregation (the `is_aggregator` gate in `on_gossip_attestation`, `store.rs`), so blocks are always built with `attestation_count=0`
-- The attestation pipeline: gossip → verify signature → store gossip signature (only if `is_aggregator`) → aggregation worker picks it up on its next selection round → publish at interval 2 → promote to known → pack into blocks
+- The attestation pipeline: gossip → verify signature → store gossip signature (only if `is_aggregator`) → aggregation worker picks it up on its next selection round → publish at interval 2 → promote to known → packed into a candidate body proof at interval 4
 - **Symptom**: `justified_slot=0` and `finalized_slot=0` indefinitely despite healthy block production and attestation gossip
 
 ### Runtime Aggregator Toggle (Hot-Standby Model)

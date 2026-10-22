@@ -14,7 +14,7 @@ use ethlambda_types::{
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     beacon::containers::{SignedBeaconBlock, electra::SingleAttestation},
     beacon::primitives::ValidatorIndex,
-    block::SignedBlock,
+    block::{BlockBodyProof, SignedBlock},
     primitives::HashTreeRoot as _,
     time::unix_now_ms,
 };
@@ -27,8 +27,8 @@ use tracing::{debug, error, info, trace, warn};
 use super::{
     encoding::{compress_message, decompress_message},
     messages::{
-        AGGREGATION_TOPIC_KIND, ATTESTATION_SUBNET_TOPIC_PREFIX, BLOCK_TOPIC_KIND,
-        attestation_subnet_topic, topic_kind,
+        AGGREGATION_TOPIC_KIND, ATTESTATION_SUBNET_TOPIC_PREFIX, BLOCK_BODY_PROOF_TOPIC_KIND,
+        BLOCK_TOPIC_KIND, attestation_subnet_topic, topic_kind,
     },
 };
 use crate::beacon::constants::ATTESTATION_SUBNET_COUNT;
@@ -95,6 +95,9 @@ pub async fn handle_gossip_message(
     match kind {
         BLOCK_TOPIC_KIND => handle_lean_block(server, &payload, compressed_len, wire_at).await,
         AGGREGATION_TOPIC_KIND => handle_lean_aggregation(server, &payload, compressed_len).await,
+        BLOCK_BODY_PROOF_TOPIC_KIND => {
+            handle_lean_block_body_proof(server, &payload, compressed_len).await
+        }
         kind if kind.starts_with(ATTESTATION_SUBNET_TOPIC_PREFIX) => {
             handle_lean_attestation(server, &payload, compressed_len).await
         }
@@ -192,6 +195,27 @@ async fn handle_lean_aggregation(server: &mut P2PServer, payload: &[u8], compres
             .inspect_err(
                 |err| error!(%err, "Failed to forward aggregated attestation to blockchain"),
             );
+    }
+}
+
+async fn handle_lean_block_body_proof(
+    server: &mut P2PServer,
+    payload: &[u8],
+    compressed_len: usize,
+) {
+    metrics::observe_gossip_block_body_proof_size(payload.len(), compressed_len);
+    let Some(body_proof) = decode_lean::<BlockBodyProof>(payload, "block body proof") else {
+        return;
+    };
+    info!(
+        attestation_count = body_proof.block_body.attestations.len(),
+        proof_bytes = body_proof.proof.proof.len(),
+        "Received block body proof from gossip"
+    );
+    if let Some(ref blockchain) = server.blockchain {
+        let _ = blockchain
+            .new_block_body_proof(body_proof)
+            .inspect_err(|err| error!(%err, "Failed to forward block body proof to blockchain"));
     }
 }
 
@@ -523,6 +547,34 @@ pub async fn publish_block(server: &mut P2PServer, signed_block: SignedBlock) {
         parent_root = %ShortRoot(&parent_root.0),
         attestation_count,
         "Published block to gossipsub"
+    );
+}
+
+pub async fn publish_block_body_proof(server: &mut P2PServer, body_proof: BlockBodyProof) {
+    let attestation_count = body_proof.block_body.attestations.len();
+
+    // Encode to SSZ
+    let ssz_bytes = body_proof.to_ssz();
+
+    // Compress with raw snappy
+    let compressed = compress_message(&ssz_bytes);
+
+    metrics::observe_gossip_block_body_proof_size(ssz_bytes.len(), compressed.len());
+
+    // Publish to the block-body-proof topic
+    let Some(topic) = server
+        .wire
+        .lean()
+        .map(|lean| lean.block_body_proof_topic.clone())
+    else {
+        warn!("Publishing is suppressed on the beacon wire; dropping block body proof");
+        return;
+    };
+    server.swarm_handle.publish(topic, compressed);
+    info!(
+        attestation_count,
+        proof_bytes = body_proof.proof.proof.len(),
+        "Published block body proof to gossipsub"
     );
 }
 

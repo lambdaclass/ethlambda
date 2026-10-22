@@ -7,7 +7,7 @@ use ethlambda_types::{
         fulu::DataColumnSidecar,
     },
     beacon::primitives::ValidatorIndex,
-    block::SignedBlock,
+    block::{BlockBodyProof, SignedBlock},
     primitives::H256,
 };
 use spawned_concurrency::error::ActorError;
@@ -24,6 +24,9 @@ pub trait BlockChainToP2P: Send + Sync {
         &self,
         attestation: SignedAggregatedAttestation,
     ) -> Result<(), ActorError>;
+    /// Gossip a candidate block body and the aggregate binding its
+    /// attestations, for the next slot's proposer to adopt.
+    fn publish_block_body_proof(&self, body_proof: BlockBodyProof) -> Result<(), ActorError>;
     /// Ask peers for whatever of one block this node is missing.
     fn fetch_block(&self, request: FetchRequest) -> Result<(), ActorError>;
     /// Run the chain checks on sidecars the chain actor had parked, now that
@@ -213,6 +216,9 @@ pub trait P2PToBlockChain: Send + Sync {
         &self,
         attestation: SignedAggregatedAttestation,
     ) -> Result<(), ActorError>;
+    /// A candidate block body plus attestation aggregate seen on gossip. Kept
+    /// as a proposal candidate; see `BlockChainServer`'s body-proof buffer.
+    fn new_block_body_proof(&self, body_proof: BlockBodyProof) -> Result<(), ActorError>;
     /// Data column sidecars that passed every check: gossip's own, for one it
     /// accepted, or the chain checks (`beacon::gossip::column::chain_checks`
     /// in `ethlambda-state-transition`) for any other.

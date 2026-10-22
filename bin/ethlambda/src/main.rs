@@ -2122,7 +2122,7 @@ mod tests {
     use ethlambda_storage::backend::InMemoryBackend;
     use ethlambda_types::beacon::config::BlobScheduleEntry;
     use ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
-    use ethlambda_types::block::{Block, BlockBody, MultiMessageAggregate, SignedBlock};
+    use ethlambda_types::block::{Block, BlockBody, BlockProof, SignedBlock};
     use ethlambda_types::checkpoint::Checkpoint;
     use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use ethlambda_types::genesis::GenesisValidatorEntry;
@@ -2448,7 +2448,7 @@ validators:
                 state_root: H256::ZERO,
                 body: BlockBody::default(),
             },
-            proof: MultiMessageAggregate::default(),
+            proof: BlockProof::default(),
         }
     }
 

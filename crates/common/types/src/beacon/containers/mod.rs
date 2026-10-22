@@ -1297,7 +1297,7 @@ mod tests {
                 state_root: crate::primitives::H256::ZERO,
                 body: crate::block::BlockBody::default(),
             },
-            proof: crate::block::MultiMessageAggregate::default(),
+            proof: crate::block::BlockProof::default(),
         };
         let expected =
             crate::primitives::HashTreeRoot::hash_tree_root(&crate::block::BlockBody::default());
@@ -1309,7 +1309,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "lean block reached a beacon accessor")]
     fn a_lean_block_has_no_bls_signature() {
-        // A lean block carries a MultiMessageAggregate proof, not a
+        // A lean block carries a BlockProof, not a
         // BlsSignature, so this accessor has nothing to answer with. Named
         // rather than silent, the same way the state accessors are.
         let lean = crate::block::SignedBlock {

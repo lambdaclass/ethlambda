@@ -150,6 +150,13 @@ mod tests {
         ) -> Result<(), ActorError> {
             Ok(())
         }
+
+        fn new_block_body_proof(
+            &self,
+            _body_proof: ethlambda_types::block::BlockBodyProof,
+        ) -> Result<(), ActorError> {
+            Ok(())
+        }
         fn new_data_column_sidecars(
             &self,
             sidecars: Vec<DataColumnSidecar>,
