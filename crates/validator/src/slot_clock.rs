@@ -761,8 +761,8 @@ mod tests {
         );
         assert_eq!(
             clock.remaining_inclusion_list_window(slot, start),
-            Duration::from_millis(8_000),
-            "6667 basis points of 12 seconds"
+            Duration::from_millis(9_000),
+            "7500 basis points of 12 seconds"
         );
         assert_eq!(
             clock.remaining_inclusion_list_window(slot, start + Duration::from_secs(9)),

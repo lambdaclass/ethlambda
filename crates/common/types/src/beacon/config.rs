@@ -763,7 +763,7 @@ impl Config {
             payload_due_bps: 5_000,
             payload_attestation_due_bps: 7_500,
             min_builder_withdrawability_delay: 64,
-            inclusion_list_due_bps: 6_667,
+            inclusion_list_due_bps: 7_500,
 
             inactivity_score_bias: 4,
             inactivity_score_recovery_rate: 16,
@@ -904,7 +904,7 @@ impl Config {
             payload_due_bps: 5_000,
             payload_attestation_due_bps: 7_500,
             min_builder_withdrawability_delay: 2,
-            inclusion_list_due_bps: 6_667,
+            inclusion_list_due_bps: 7_500,
 
             inactivity_score_bias: 4,
             inactivity_score_recovery_rate: 16,
