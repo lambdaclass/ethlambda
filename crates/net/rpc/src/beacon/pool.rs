@@ -114,6 +114,11 @@ async fn post_pool_attestations(
         // messages, so without this an aggregator served by this node would
         // be missing its own validator client's votes.
         let published = checked.and_then(|checked| {
+            // Live for liveness too: gossip never delivers this node its own
+            // validator clients' messages, so this is where it sees them.
+            store
+                .observed_liveness()
+                .record(attestation.data.target.epoch, validator);
             pool.lock().expect("attestation pool lock poisoned").insert(
                 &attestation,
                 checked.committee_position,
@@ -301,13 +306,19 @@ async fn post_aggregate_and_proofs(
         let aggregator = aggregate.aggregator_index();
         let seen = aggregate::SeenAggregates::new(capacity, capacity);
         let checked = aggregate::cheap_checks(&seen, &store, &aggregate, now_ms)
-            .and_then(|()| aggregate::stateful_checks(&store, &aggregate).map(|_| ()));
+            .and_then(|()| aggregate::stateful_checks(&store, &aggregate));
         let published = checked
             .map_err(|outcome: Outcome| {
                 warn!(%slot, aggregator, ?outcome, "Refused a submitted aggregate");
                 "aggregate failed validation"
             })
-            .and_then(|()| {
+            .and_then(|attesting_indices| {
+                // The aggregator and every attester its signature verified are
+                // live, as when P2P accepts a gossip aggregate.
+                let (epoch, _root) = aggregate.target();
+                store
+                    .observed_liveness()
+                    .record_all(epoch, std::iter::once(aggregator).chain(attesting_indices));
                 // Recorded for block production, which packs the aggregates
                 // this node has validated.
                 pool.lock()
@@ -726,6 +737,63 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(json["failures"][0]["index"], 0);
         assert!(fixture.network.aggregates.lock().unwrap().is_empty());
+    }
+
+    /// Gossip never delivers a node its own validator clients' messages, so a
+    /// submission through this API is where the node sees them act.
+    #[tokio::test]
+    async fn a_published_attestation_marks_its_attester_live() {
+        let fixture = fixture();
+        let attestation = attestation(&fixture, 0, 0);
+        let epoch = attestation.data.target.epoch;
+        submit(&fixture, std::slice::from_ref(&attestation)).await;
+        let observed = fixture.store.observed_liveness();
+        assert!(observed.is_live(epoch, attestation.attester_index));
+    }
+
+    #[tokio::test]
+    async fn a_refused_attestation_marks_nobody_live() {
+        let fixture = fixture();
+        let mut forged = attestation(&fixture, 0, 0);
+        forged.signature = attestation(&fixture, 0, 1).signature;
+        let epoch = forged.data.target.epoch;
+        submit(&fixture, std::slice::from_ref(&forged)).await;
+        assert!(
+            !fixture
+                .store
+                .observed_liveness()
+                .is_live(epoch, forged.attester_index)
+        );
+    }
+
+    /// The aggregate is built on one node and submitted to a fresh one, so its
+    /// attesters can only have been marked live by the aggregate itself, not
+    /// by their own votes.
+    #[tokio::test]
+    async fn a_published_aggregate_marks_its_aggregator_and_attesters_live() {
+        let builder = fixture();
+        let slot = builder.state.slot();
+        let committee = get_beacon_committee(&builder.state, slot, 0).unwrap();
+        let votes: Vec<SingleAttestation> = (0..committee.len())
+            .map(|position| attestation(&builder, 0, position))
+            .collect();
+        submit(&builder, &votes).await;
+        let aggregate = builder
+            .pool
+            .lock()
+            .unwrap()
+            .aggregate(votes[0].data.hash_tree_root(), slot, 0)
+            .unwrap();
+
+        let fresh = fixture();
+        let signed = signed_aggregate(&fresh, committee[0], aggregate);
+        let (status, json) = submit_aggregates(&fresh, std::slice::from_ref(&signed)).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let epoch = compute_epoch_at_slot(slot);
+        let observed = fresh.store.observed_liveness();
+        for validator in &committee {
+            assert!(observed.is_live(epoch, *validator), "{validator}");
+        }
     }
 
     #[tokio::test]
