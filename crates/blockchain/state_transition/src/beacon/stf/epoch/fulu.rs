@@ -69,16 +69,13 @@ use super::electra;
 /// with this module's own [`process_pending_deposits`] standing in for
 /// [`electra::process_pending_deposits`], and [`process_proposer_lookahead`]
 /// appended at the end.
+///
+/// Steps 1-9 (justification through the effective-balance updates) run as one
+/// registry pass where the state allows it, the same driver electra uses. Both
+/// that pass and its step-by-step fallback read the state's fork to retire
+/// the eth1-bridge gate here; see `super::single_pass`.
 pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
-    super::altair::process_justification_and_finalization(state)?;
-    super::altair::process_inactivity_updates(state, config)?;
-    super::altair::process_rewards_and_penalties(state, config)?;
-    electra::process_registry_updates(state, config)?;
-    electra::process_slashings(state, config)?;
-    super::process_eth1_data_reset(state)?;
-    process_pending_deposits(state, config)?;
-    electra::process_pending_consolidations(state, config)?;
-    electra::process_effective_balance_updates(state)?;
+    super::single_pass::process_steps_through_effective_balances(state, config)?;
     super::process_slashings_reset(state)?;
     super::process_randao_mixes_reset(state)?;
     super::capella::process_historical_summaries_update(state)?;
