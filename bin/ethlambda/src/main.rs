@@ -774,6 +774,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     payload_attestation_pool: payload_attestation_pool.clone(),
                     custody_columns: rpc_custody_columns,
                     engine: rpc_engine,
+                    events: rpc_events,
                 },
                 local_peer_id,
                 rpc_shutdown,

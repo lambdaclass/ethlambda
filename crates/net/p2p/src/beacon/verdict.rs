@@ -14,7 +14,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Instant;
 
-use ethlambda_network_api::{AggregateArrival, BlockArrival, BlockSource};
+use ethlambda_network_api::{AggregateArrival, BlockAnnouncement, BlockArrival, BlockSource};
 use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome};
 use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCacheExt as _;
 use ethlambda_storage::{CacheKey, Store};
@@ -229,8 +229,17 @@ impl Validated {
                     handed_off: Instant::now(),
                     deferred_from: None,
                 };
+                // Only a block that passed validation is announced: one
+                // forwarded on `Queue` or `Ignore(Overloaded)` still imports,
+                // but `block_gossip` names blocks that passed the topic's
+                // rules.
+                let announcement = if outcome == Outcome::Accept {
+                    BlockAnnouncement::Announce
+                } else {
+                    BlockAnnouncement::Silent
+                };
                 let _ = blockchain
-                    .new_block(*block, BlockSource::Gossip, arrival)
+                    .new_block(*block, BlockSource::Gossip, arrival, announcement)
                     .inspect_err(|err| warn!(%err, "Failed to forward a gossip block"));
             }
             Self::Column(sidecar) if outcome == Outcome::Accept => {
@@ -557,7 +566,6 @@ pub(crate) fn guarded(checks: impl FnOnce() -> Outcome) -> Outcome {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     use ethlambda_network_api::P2PToBlockChain;
     use ethlambda_state_transition::beacon::gossip::{QueueReason, RejectReason};
@@ -569,7 +577,9 @@ mod tests {
     use spawned_concurrency::error::ActorError;
 
     use super::*;
-    use crate::test_support::{envelope, unconnected_beacon_server, valid_shaped_sidecar};
+    use crate::test_support::{
+        RecordingChain, envelope, unconnected_beacon_server, valid_shaped_sidecar,
+    };
 
     /// A minimal fulu block for a given `(slot, proposer)`: `settle` and
     /// `record_seen` only ever read those two fields plus the root passed
@@ -664,68 +674,6 @@ mod tests {
                 },
             },
             signature: Default::default(),
-        }
-    }
-
-    /// A [`P2PToBlockChain`] stand-in that only records whether
-    /// `new_beacon_aggregate` was called, for the tests that check `forward`
-    /// keeps an aggregate off the chain actor on every outcome but `Accept`.
-    struct RecordingChain(AtomicBool);
-
-    impl P2PToBlockChain for RecordingChain {
-        fn new_block(
-            &self,
-            _block: SignedBeaconBlock,
-            _source: BlockSource,
-            _arrival: BlockArrival,
-        ) -> Result<(), ActorError> {
-            Ok(())
-        }
-        fn new_attestation(&self, _attestation: SignedAttestation) -> Result<(), ActorError> {
-            Ok(())
-        }
-        fn new_aggregated_attestation(
-            &self,
-            _attestation: SignedAggregatedAttestation,
-        ) -> Result<(), ActorError> {
-            Ok(())
-        }
-        fn new_data_column_sidecars(
-            &self,
-            _sidecars: Vec<DataColumnSidecar>,
-        ) -> Result<(), ActorError> {
-            Ok(())
-        }
-        fn data_column_sidecars_awaiting_parent(
-            &self,
-            _sidecars: Vec<DataColumnSidecar>,
-        ) -> Result<(), ActorError> {
-            Ok(())
-        }
-        fn new_beacon_aggregate(
-            &self,
-            _aggregate: Box<SignedAggregateAndProof>,
-            _attesting_indices: Vec<ValidatorIndex>,
-            _arrival: AggregateArrival,
-        ) -> Result<(), ActorError> {
-            self.0.store(true, Ordering::SeqCst);
-            Ok(())
-        }
-        fn new_execution_payload_envelope(
-            &self,
-            _envelope: Box<
-                ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope,
-            >,
-            _arrival: BlockArrival,
-        ) -> Result<(), ActorError> {
-            Ok(())
-        }
-        fn new_payload_attestation_message(
-            &self,
-            _message: ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage,
-            _arrival: BlockArrival,
-        ) -> Result<(), ActorError> {
-            Ok(())
         }
     }
 
@@ -837,10 +785,44 @@ mod tests {
     /// `Ignore`/`Reject` too, since `forward`'s guard is the same `if let ...
     /// if outcome == Outcome::Accept` for all three) must never reach the
     /// chain actor.
+    /// `block_gossip` names blocks that passed validation, so a block
+    /// forwarded on any other verdict still imports but is not announced.
+    #[tokio::test]
+    async fn only_an_accepted_gossip_block_is_announced() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let chain = Arc::new(RecordingChain::default());
+        server.blockchain = Some(chain.clone());
+        let block = || Validated::Block {
+            block: Box::new(fulu_block(5, 1)),
+            block_root: Root::repeat_byte(1),
+        };
+
+        block().forward(&server, Instant::now(), Outcome::Accept);
+        block().forward(
+            &server,
+            Instant::now(),
+            Outcome::Queue(QueueReason::ParentUnknown),
+        );
+        block().forward(
+            &server,
+            Instant::now(),
+            Outcome::Ignore(IgnoreReason::Overloaded),
+        );
+
+        assert_eq!(
+            *chain.announcements.lock().unwrap(),
+            [
+                BlockAnnouncement::Announce,
+                BlockAnnouncement::Silent,
+                BlockAnnouncement::Silent
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn an_overloaded_aggregate_is_not_forwarded() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
-        let chain = Arc::new(RecordingChain(AtomicBool::new(false)));
+        let chain = Arc::new(RecordingChain::default());
         server.blockchain = Some(chain.clone());
         let object = Validated::Aggregate {
             aggregate: Box::new(phase0_aggregate(5, 1)),
@@ -853,7 +835,7 @@ mod tests {
             Outcome::Ignore(IgnoreReason::Overloaded),
         );
 
-        assert!(!chain.0.load(Ordering::SeqCst));
+        assert!(chain.aggregates.lock().unwrap().is_empty());
     }
 
     /// An accepted electra aggregate is what block production packs other
@@ -992,7 +974,7 @@ mod tests {
     #[tokio::test]
     async fn a_subnet_attestation_is_never_forwarded_even_on_accept() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
-        let chain = Arc::new(RecordingChain(AtomicBool::new(false)));
+        let chain = Arc::new(RecordingChain::default());
         server.blockchain = Some(chain.clone());
         let object = Validated::Attestation {
             attestation: Box::new(electra_attestation(5, 1)),
@@ -1001,7 +983,7 @@ mod tests {
 
         object.forward(&server, Instant::now(), Outcome::Accept);
 
-        assert!(!chain.0.load(Ordering::SeqCst));
+        assert!(chain.aggregates.lock().unwrap().is_empty());
     }
 
     /// What `forward` handed the chain actor, by method.
@@ -1020,6 +1002,7 @@ mod tests {
             _block: SignedBeaconBlock,
             _source: BlockSource,
             _arrival: BlockArrival,
+            _announcement: BlockAnnouncement,
         ) -> Result<(), ActorError> {
             Ok(())
         }
