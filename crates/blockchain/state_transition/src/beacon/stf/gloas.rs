@@ -1200,64 +1200,20 @@ pub fn process_builder_exit_request(
 // Operations
 // ---------------------------------------------------------------------------
 
-/// `process_proposer_slashing` (modified, EIP-7732): the shared
-/// `crate::beacon::stf::operations::verify_proposer_slashing` prologue, plus
-/// clearing the [`gloas::BeaconState::builder_pending_payments`] entry tied
-/// to the slashed proposal, if the slashing lands the slashed validator
-/// itself as the payment's own proposer and the payment is still inside the
-/// live two-epoch window. An unrelated same-slot equivocation (a different
-/// validator's evidence about the same proposal) must not grief an honest
-/// proposer's payment, which is exactly what comparing `payment.proposer_index`
-/// against the slashed proposer's own index, rather than clearing
-/// unconditionally, prevents.
+/// `process_proposer_slashing`: unmodified since consensus-specs #5719, which
+/// moved gloas's builder-payment clearing out of the operation and into
+/// [`slash_validator`], so every slashing path (proposer, attester, and the
+/// epoch's) drops the slashed proposer's pending payments, not only the one
+/// tied to the evidenced proposal. Still its own function, as the state is
+/// matched on gloas's own variant by the dispatcher.
 pub fn process_proposer_slashing(
     state: &mut BeaconState,
     proposer_slashing: &ProposerSlashing,
     config: &Config,
 ) -> Result<()> {
-    let (proposer_index, current_epoch) =
+    let (proposer_index, _current_epoch) =
         crate::beacon::stf::operations::verify_proposer_slashing(state, proposer_slashing)?;
-
-    // [New in Gloas:EIP7732] Remove the `BuilderPendingPayment` corresponding
-    // to this proposal if it is still in the 2-epoch window.
-    let slot = proposer_slashing.signed_header_1.message.slot;
-    let proposal_epoch = compute_epoch_at_slot(slot);
-    if proposal_epoch == current_epoch {
-        let payment_index = preset::SLOTS_PER_EPOCH
-            .checked_add(slot % preset::SLOTS_PER_EPOCH)
-            .ok_or(Error::ArithmeticOverflow(
-                "process_proposer_slashing: SLOTS_PER_EPOCH + slot % SLOTS_PER_EPOCH",
-            ))? as usize;
-        clear_builder_pending_payment_if_owned_by(state, payment_index, proposer_index)?;
-    } else if proposal_epoch == get_previous_epoch(state) {
-        let payment_index = (slot % preset::SLOTS_PER_EPOCH) as usize;
-        clear_builder_pending_payment_if_owned_by(state, payment_index, proposer_index)?;
-    }
-
     slash_validator(state, proposer_index, None, config)?;
-    Ok(())
-}
-
-/// Clears `state.builder_pending_payments[payment_index]` if it is recorded
-/// against `proposer_index`, [`process_proposer_slashing`]'s own helper for
-/// its two (current-epoch, previous-epoch) payment-window branches.
-fn clear_builder_pending_payment_if_owned_by(
-    state: &mut BeaconState,
-    payment_index: usize,
-    proposer_index: ValidatorIndex,
-) -> Result<()> {
-    let inner = gloas_state(state, "process_proposer_slashing")?;
-    let len = inner.builder_pending_payments.len();
-    let payment = inner
-        .builder_pending_payments
-        .get_mut(payment_index)
-        .ok_or(Error::IndexOutOfBounds {
-            index: payment_index,
-            len,
-        })?;
-    if payment.proposer_index == proposer_index {
-        *payment = gloas::BuilderPendingPayment::default();
-    }
     Ok(())
 }
 
