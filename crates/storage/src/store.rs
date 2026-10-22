@@ -8,6 +8,7 @@ use lru::LruCache;
 use crate::api::{StorageBackend, StorageReadView, StorageReadViewExt, StorageWriteBatch, Table};
 use crate::committee_cache::CommitteeCache;
 use crate::error::Error;
+use crate::liveness::ObservedLiveness;
 
 use ethlambda_crypto::signature::ValidatorSignature;
 use ethlambda_types::{
@@ -152,8 +153,8 @@ const KEY_BEACON_UNREALIZED_FINALIZED: &[u8] = b"beacon_unrealized_finalized";
 /// whether that anchor is genesis or a checkpoint. Its value has type [`u64`]
 /// and it's SSZ-encoded.
 ///
-/// Written once by each bootstrap path and never rewritten, like [`KEY_CONFIG`]
-/// and [`KEY_CHAIN`]. It is the store's only record of where it started:
+/// Written once by each bootstrap path and never rewritten, like [`KEY_CHAIN`].
+/// It is the store's only record of where it started:
 /// [`KEY_LATEST_FINALIZED`] is seeded to the anchor too, but moves with the
 /// chain, so after the first finalization nothing else on disk can answer this.
 const KEY_ANCHOR_SLOT: &[u8] = b"anchor_slot";
@@ -177,7 +178,7 @@ pub const DB_VERSION: u64 = 4;
 
 /// The consensus protocol a data directory holds.
 ///
-/// Written once at bootstrap and never rewritten, like `Metadata["config"]`. A
+/// Written once at bootstrap and never rewritten. A
 /// directory is one chain or the other for its whole life: the two use
 /// different state shapes, different checkpoint types and different clock
 /// units, and nothing migrates between them.
@@ -814,7 +815,8 @@ pub struct Store {
     /// across a mutable borrow of the store it came from. Cloning the `Arc` is
     /// one atomic increment, not a copy of the fork schedule.
     ///
-    /// Written once at bootstrap and never rewritten, so a per-`Store` copy
+    /// Written at bootstrap, and rewritten only by [`Store::replace_config`],
+    /// which refuses to run once this copy is shared, so a per-`Store` copy
     /// cannot go stale. It stays in `Table::Metadata` under `KEY_CONFIG`
     /// because `from_db_state` reads it back to reject a DB whose genesis time
     /// or slot duration disagrees with the config file; this field only spares
@@ -882,6 +884,12 @@ pub struct Store {
     ///
     /// Always empty on lean, which has no beacon committees.
     committee_cache: Arc<CommitteeCache>,
+    /// Validators this node has seen act, by epoch, for the Beacon API's
+    /// liveness endpoint. Written by P2P (accepted gossip), the chain actor
+    /// (imported blocks' proposers) and the RPC (submissions through this
+    /// node's own API), which is why it lives on the `Store` all three share.
+    /// See [`ObservedLiveness`]. Always empty on lean.
+    observed_liveness: Arc<ObservedLiveness>,
     /// Beacon fork-choice scratch. Empty and untouched on a lean chain.
     pub(crate) beacon: Arc<Mutex<BeaconScratch>>,
     /// The background writer, joined when the last clone of this `Store`
@@ -1520,6 +1528,7 @@ impl Store {
             state_cache,
             pending_states,
             committee_cache: Arc::new(CommitteeCache::default()),
+            observed_liveness: Arc::new(ObservedLiveness::default()),
             beacon: Default::default(),
             state_writer,
             state_handoff: Default::default(),
@@ -1658,6 +1667,29 @@ impl Store {
     /// backend.
     pub fn config(&self) -> Arc<Config> {
         Arc::clone(&self.config)
+    }
+
+    /// Replaces the persisted configuration with `config`, on disk and in
+    /// this `Store`'s cached copy.
+    ///
+    /// For a resume only, and nothing here checks `config` against what the
+    /// directory holds: the caller must already have done that (a beacon
+    /// resume does it in `first_config_difference`). This is what lets a
+    /// directory follow a fork its network scheduled after the directory was
+    /// initialized.
+    ///
+    /// # Panics
+    ///
+    /// If the cached config is shared, that is, if this `Store` has been
+    /// cloned or a handle from [`Store::config`] is still alive. Either would
+    /// go on serving the old configuration after this returns.
+    pub fn replace_config(&mut self, config: Config) {
+        assert!(
+            Arc::get_mut(&mut self.config).is_some(),
+            "replace_config needs the only handle to the cached config"
+        );
+        self.set_metadata(KEY_CONFIG, &config);
+        self.config = Arc::new(config);
     }
 
     /// Which consensus protocol this data directory holds.
@@ -2687,6 +2719,12 @@ impl Store {
     /// returned cache takes `&self` regardless of which handle reaches it.
     pub fn committee_cache(&self) -> Arc<CommitteeCache> {
         Arc::clone(&self.committee_cache)
+    }
+
+    /// The validators this node has seen act, shared by every clone of this
+    /// `Store`. See [`ObservedLiveness`].
+    pub fn observed_liveness(&self) -> &ObservedLiveness {
+        &self.observed_liveness
     }
 
     /// Returns whether a state is available for the given block root.
@@ -5733,6 +5771,14 @@ mod tests {
     }
 
     #[test]
+    fn observed_liveness_is_shared_across_store_clones() {
+        let store = beacon_test_store(Arc::new(InMemoryBackend::new()));
+        let clone = store.clone();
+        clone.observed_liveness().record(3, 7);
+        assert!(store.observed_liveness().is_live(3, 7));
+    }
+
+    #[test]
     fn the_committee_cache_is_shared_across_store_clones() {
         let store = beacon_test_store(Arc::new(InMemoryBackend::new()));
         let clone = store.clone();
@@ -6884,6 +6930,40 @@ mod tests {
             .expect("reopen")
             .expect("populated directory");
         assert_eq!(reopened.config().genesis_time, 7);
+    }
+
+    #[test]
+    fn a_replaced_config_is_served_and_survives_a_reopen() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::from_anchor_state(
+            backend.clone(),
+            State::from_genesis(7, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
+
+        let mut config = (*store.config()).clone();
+        config.fulu_fork_epoch = 100;
+        store.replace_config(config);
+        assert_eq!(store.config().fulu_fork_epoch, 100);
+
+        let reopened = Store::from_db_state(backend)
+            .expect("reopen")
+            .expect("populated directory");
+        assert_eq!(reopened.config().fulu_fork_epoch, 100);
+    }
+
+    #[test]
+    #[should_panic(expected = "only handle to the cached config")]
+    fn replacing_the_config_of_a_cloned_store_panics() {
+        let mut store = Store::from_anchor_state(
+            Arc::new(InMemoryBackend::new()),
+            State::from_genesis(7, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
+        // The clone would go on serving the old config.
+        let _clone = store.clone();
+        let config = (*store.config()).clone();
+        store.replace_config(config);
     }
 
     // ============ Beacon Fork-Choice Scratch Tests ============
