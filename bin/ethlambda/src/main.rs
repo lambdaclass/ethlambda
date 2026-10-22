@@ -296,19 +296,19 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     ethlambda_blockchain::metrics::init();
     ethlambda_p2p::metrics::init();
     ethlambda_state_transition::metrics::init();
-    ethlambda_blockchain::metrics::set_node_info("ethlambda", version::CLIENT_VERSION);
+    ethlambda_blockchain::metrics::set_node_info("ethlambda", version::client_version());
     ethlambda_blockchain::metrics::set_node_start_time();
 
     let rpc_config = RpcConfig {
         http_address: common.http_address,
         api_port: common.api_port,
         metrics_port: common.metrics_port,
-        version: version::CLIENT_VERSION,
+        version: version::client_version(),
     };
 
     println!("\n{}", banner::for_locale());
 
-    info!(version = version::CLIENT_VERSION, "Starting ethlambda");
+    info!(version = version::client_version(), "Starting ethlambda");
 
     // Raise the soft open-file-descriptor limit to the hard limit. RocksDB
     // keeps an unbounded table cache (`set_max_open_files(-1)`), so on
@@ -614,7 +614,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                         // what the document names for a client without one.
                         code: "XX".to_string(),
                         name: "ethlambda".to_string(),
-                        version: version::CLIENT_VERSION.to_string(),
+                        version: version::client_version().to_string(),
                         // `identification.md` types `commit` as DATA, 4 bytes,
                         // and geth decodes it into `hexutil.Bytes`, which
                         // rejects a bare hex string with "hex string without
@@ -699,7 +699,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         // the loop has stopped asking for.
         target_peers: common.discovery.target_peers,
         wire: setup.wire,
-        agent_version: version::CLIENT_VERSION,
+        agent_version: version::client_version(),
     })
     .wrap_err("failed to build swarm")?;
 
