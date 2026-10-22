@@ -162,11 +162,13 @@ pub enum CheckpointSyncError {
         found: ethlambda_storage::Chain,
     },
     /// The directory is for the right chain, but the network config supplied
-    /// this run disagrees with the one it was initialized with: most likely a
-    /// fork epoch was edited in place. A changed fork epoch leaves genesis
-    /// time and the validators root untouched, so it survives the checks
-    /// above, while putting this node on a different chain from its peers
-    /// from that epoch on.
+    /// this run disagrees with the one it was initialized with in a way the
+    /// directory's contents rule out: most likely a fork epoch was moved onto
+    /// or off an epoch the directory already processed. A changed fork epoch
+    /// leaves genesis time and the validators root untouched, so it survives
+    /// the checks above, while putting this node on a different chain from
+    /// its peers from that epoch on. A fork rescheduled ahead of everything
+    /// the directory holds is not this error; the resume adopts it.
     #[error(
         "this data directory was initialized with a different configuration ({difference}); \
          delete it or point --data-dir elsewhere"
