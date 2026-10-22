@@ -229,6 +229,17 @@ pub fn slash_validator(
         whistleblower_index,
         whistleblower_reward - proposer_reward,
     )?;
+
+    // [New in Gloas:EIP7732] (consensus-specs #5719) A slashed proposer must
+    // not get its builder paid out of the block it proposed: drop the pending
+    // payments for blocks it proposed. Heze reuses the gloas state.
+    if let BeaconState::Gloas(inner) = state {
+        for payment in inner.builder_pending_payments.iter_mut() {
+            if payment.proposer_index == slashed_index {
+                *payment = Default::default();
+            }
+        }
+    }
     Ok(())
 }
 
@@ -312,6 +323,35 @@ mod tests {
         // the validator keeps most of its balance for now.
         assert!(state.balance(3).unwrap() < balance_before);
         assert!(state.balance(3).unwrap() > balance_before / 2);
+    }
+
+    /// consensus-specs #5719: slashing a validator drops every pending builder
+    /// payment of a block it proposed, and leaves other proposers' alone.
+    #[test]
+    fn slashing_clears_the_slashed_proposers_pending_builder_payments() {
+        let config = Config::minimal();
+        let mut state = crate::beacon::helpers::test_state::with_validators_at(ForkName::Gloas, 64);
+        let BeaconState::Gloas(inner) = &mut state else {
+            unreachable!("built as Gloas");
+        };
+        for (index, payment) in inner.builder_pending_payments.iter_mut().enumerate() {
+            payment.proposer_index = if index % 2 == 0 { 5 } else { 6 };
+            payment.weight = 7;
+        }
+
+        slash_validator(&mut state, 5, None, &config).unwrap();
+
+        let BeaconState::Gloas(inner) = &state else {
+            unreachable!("built as Gloas");
+        };
+        for (index, payment) in inner.builder_pending_payments.iter().enumerate() {
+            if index % 2 == 0 {
+                assert_eq!(*payment, Default::default());
+            } else {
+                assert_eq!(payment.proposer_index, 6);
+                assert_eq!(payment.weight, 7);
+            }
+        }
     }
 
     /// `initiate_validator_exit_for_fork` routes a gloas state to electra's

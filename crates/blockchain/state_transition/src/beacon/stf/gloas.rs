@@ -194,6 +194,24 @@ pub fn get_builder_withdrawals(
     Ok((withdrawals, withdrawal_index, processed_count))
 }
 
+/// `get_builder_balance_after_withdrawals` (gloas `beacon-chain.md`): the
+/// builder's balance minus what `withdrawals` already take from it. Takes the
+/// builder's balance rather than the state, since the caller already holds
+/// the builder.
+pub fn get_builder_balance_after_withdrawals(
+    builder_balance: Gwei,
+    builder_index: gloas::BuilderIndex,
+    withdrawals: &[capella::Withdrawal],
+) -> Gwei {
+    let validator_index = convert_builder_index_to_validator_index(builder_index);
+    let withdrawn: Gwei = withdrawals
+        .iter()
+        .filter(|withdrawal| withdrawal.validator_index == validator_index)
+        .map(|withdrawal| withdrawal.amount)
+        .fold(0, Gwei::saturating_add);
+    builder_balance.saturating_sub(withdrawn)
+}
+
 /// `get_builders_sweep_withdrawals` (gloas `beacon-chain.md`): the builder
 /// registry's own counterpart of
 /// [`get_validators_sweep_withdrawals`](crate::beacon::stf::electra::get_validators_sweep_withdrawals),
@@ -219,7 +237,14 @@ pub fn get_builders_sweep_withdrawals(
     let mut withdrawals = Vec::new();
     let mut builder_index = inner.next_withdrawal_builder_index;
     for _ in 0..builders_limit {
-        if prior_withdrawals.len() + withdrawals.len() >= withdrawals_limit {
+        // [Modified in Gloas] consensus-specs #5695: the balance test below sees
+        // every withdrawal already selected for the payload, not just this sweep's.
+        let all_withdrawals: Vec<capella::Withdrawal> = prior_withdrawals
+            .iter()
+            .chain(withdrawals.iter())
+            .cloned()
+            .collect();
+        if all_withdrawals.len() >= withdrawals_limit {
             break;
         }
 
@@ -231,12 +256,14 @@ pub fn get_builders_sweep_withdrawals(
                     index: builder_index as usize,
                     len: inner.builders.len(),
                 })?;
-        if builder.withdrawable_epoch <= epoch && builder.balance > 0 {
+        let balance =
+            get_builder_balance_after_withdrawals(builder.balance, builder_index, &all_withdrawals);
+        if builder.withdrawable_epoch <= epoch && balance > 0 {
             withdrawals.push(capella::Withdrawal {
                 index: withdrawal_index,
                 validator_index: convert_builder_index_to_validator_index(builder_index),
                 address: builder.execution_address,
-                amount: builder.balance,
+                amount: balance,
             });
             withdrawal_index = withdrawal_index
                 .checked_add(1)
@@ -894,8 +921,9 @@ pub fn process_execution_payload_bid(
 
 /// `apply_parent_execution_payload` (gloas `beacon-chain.md`).
 ///
-/// Processes the parent's execution-layer-triggered requests, settles (or
-/// directly queues) its builder payment, and marks its payload available.
+/// Settles (or directly queues) the parent's builder payment, processes its
+/// execution-layer-triggered requests, and marks its payload available. The
+/// payment goes first so a builder exit request sees it as pending.
 /// Called by [`process_parent_execution_payload`] during block processing,
 /// and (per the specification's own note) by the validator during block
 /// production before computing withdrawals.
@@ -931,30 +959,8 @@ pub fn apply_parent_execution_payload(
         "apply_parent_execution_payload: len(requests.builder_exits) <= MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD",
     )?;
 
-    // Process execution requests from the parent's payload. The execution
-    // requests are processed at state.slot (child's slot), not the parent's
-    // slot.
-    //
-    // Deposits, withdrawals, and consolidations are unmodified since electra
-    // (fulu, for deposits): see this module's own doc for why these three
-    // are shared calls into `stf::fulu`/`stf::electra` rather than copies.
-    for deposit in requests.deposits.iter() {
-        crate::beacon::stf::fulu::process_deposit_request(state, deposit)?;
-    }
-    for withdrawal in requests.withdrawals.iter() {
-        crate::beacon::stf::electra::process_withdrawal_request(state, withdrawal, config)?;
-    }
-    for consolidation in requests.consolidations.iter() {
-        crate::beacon::stf::electra::process_consolidation_request(state, consolidation, config)?;
-    }
-    for builder_deposit in requests.builder_deposits.iter() {
-        process_builder_deposit_request(state, builder_deposit, config)?;
-    }
-    for builder_exit in requests.builder_exits.iter() {
-        process_builder_exit_request(state, builder_exit, config)?;
-    }
-
-    // Settle the builder payment.
+    // Settle the builder payment before the requests so that a builder exit
+    // request is rejected while the payment is pending (consensus-specs #5695).
     let current_epoch = get_current_epoch(state);
     if parent_epoch == current_epoch {
         let payment_index = preset::SLOTS_PER_EPOCH
@@ -983,6 +989,29 @@ pub fn apply_parent_execution_payload(
                 amount: parent_bid.value,
                 builder_index: parent_bid.builder_index,
             });
+    }
+
+    // Process execution requests from the parent's payload. The execution
+    // requests are processed at state.slot (child's slot), not the parent's
+    // slot.
+    //
+    // Deposits, withdrawals, and consolidations are unmodified since electra
+    // (fulu, for deposits): see this module's own doc for why these three
+    // are shared calls into `stf::fulu`/`stf::electra` rather than copies.
+    for deposit in requests.deposits.iter() {
+        crate::beacon::stf::fulu::process_deposit_request(state, deposit)?;
+    }
+    for withdrawal in requests.withdrawals.iter() {
+        crate::beacon::stf::electra::process_withdrawal_request(state, withdrawal, config)?;
+    }
+    for consolidation in requests.consolidations.iter() {
+        crate::beacon::stf::electra::process_consolidation_request(state, consolidation, config)?;
+    }
+    for builder_deposit in requests.builder_deposits.iter() {
+        process_builder_deposit_request(state, builder_deposit, config)?;
+    }
+    for builder_exit in requests.builder_exits.iter() {
+        process_builder_exit_request(state, builder_exit, config)?;
     }
 
     // Update parent payload availability and latest block hash.
@@ -1171,64 +1200,20 @@ pub fn process_builder_exit_request(
 // Operations
 // ---------------------------------------------------------------------------
 
-/// `process_proposer_slashing` (modified, EIP-7732): the shared
-/// `crate::beacon::stf::operations::verify_proposer_slashing` prologue, plus
-/// clearing the [`gloas::BeaconState::builder_pending_payments`] entry tied
-/// to the slashed proposal, if the slashing lands the slashed validator
-/// itself as the payment's own proposer and the payment is still inside the
-/// live two-epoch window. An unrelated same-slot equivocation (a different
-/// validator's evidence about the same proposal) must not grief an honest
-/// proposer's payment, which is exactly what comparing `payment.proposer_index`
-/// against the slashed proposer's own index, rather than clearing
-/// unconditionally, prevents.
+/// `process_proposer_slashing`: unmodified since consensus-specs #5719, which
+/// moved gloas's builder-payment clearing out of the operation and into
+/// [`slash_validator`], so every slashing path (proposer, attester, and the
+/// epoch's) drops the slashed proposer's pending payments, not only the one
+/// tied to the evidenced proposal. Still its own function, as the state is
+/// matched on gloas's own variant by the dispatcher.
 pub fn process_proposer_slashing(
     state: &mut BeaconState,
     proposer_slashing: &ProposerSlashing,
     config: &Config,
 ) -> Result<()> {
-    let (proposer_index, current_epoch) =
+    let (proposer_index, _current_epoch) =
         crate::beacon::stf::operations::verify_proposer_slashing(state, proposer_slashing)?;
-
-    // [New in Gloas:EIP7732] Remove the `BuilderPendingPayment` corresponding
-    // to this proposal if it is still in the 2-epoch window.
-    let slot = proposer_slashing.signed_header_1.message.slot;
-    let proposal_epoch = compute_epoch_at_slot(slot);
-    if proposal_epoch == current_epoch {
-        let payment_index = preset::SLOTS_PER_EPOCH
-            .checked_add(slot % preset::SLOTS_PER_EPOCH)
-            .ok_or(Error::ArithmeticOverflow(
-                "process_proposer_slashing: SLOTS_PER_EPOCH + slot % SLOTS_PER_EPOCH",
-            ))? as usize;
-        clear_builder_pending_payment_if_owned_by(state, payment_index, proposer_index)?;
-    } else if proposal_epoch == get_previous_epoch(state) {
-        let payment_index = (slot % preset::SLOTS_PER_EPOCH) as usize;
-        clear_builder_pending_payment_if_owned_by(state, payment_index, proposer_index)?;
-    }
-
     slash_validator(state, proposer_index, None, config)?;
-    Ok(())
-}
-
-/// Clears `state.builder_pending_payments[payment_index]` if it is recorded
-/// against `proposer_index`, [`process_proposer_slashing`]'s own helper for
-/// its two (current-epoch, previous-epoch) payment-window branches.
-fn clear_builder_pending_payment_if_owned_by(
-    state: &mut BeaconState,
-    payment_index: usize,
-    proposer_index: ValidatorIndex,
-) -> Result<()> {
-    let inner = gloas_state(state, "process_proposer_slashing")?;
-    let len = inner.builder_pending_payments.len();
-    let payment = inner
-        .builder_pending_payments
-        .get_mut(payment_index)
-        .ok_or(Error::IndexOutOfBounds {
-            index: payment_index,
-            len,
-        })?;
-    if payment.proposer_index == proposer_index {
-        *payment = gloas::BuilderPendingPayment::default();
-    }
     Ok(())
 }
 

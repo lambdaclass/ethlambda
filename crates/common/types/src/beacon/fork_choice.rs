@@ -230,6 +230,10 @@ pub struct JustifiedBalances {
     /// `get_total_active_balance` of the checkpoint state: unlike `balances`
     /// it counts slashed validators, and it is floored at one increment.
     total_active_balance: Gwei,
+    /// `get_total_balance` over the active, unslashed validators: the sum of
+    /// `balances`, floored at one increment. What `calculate_committee_fraction`
+    /// scales (consensus-specs #5679 stopped counting slashed validators there).
+    unslashed_active_balance: Gwei,
     /// Every validator's raw effective balance in `EFFECTIVE_BALANCE_INCREMENT`
     /// units, whether or not it is active or slashed. Exact, since an
     /// effective balance is always a whole number of increments and the
@@ -251,10 +255,15 @@ impl JustifiedBalances {
         total_active_balance: Gwei,
         effective_increments: Box<[u16]>,
     ) -> Self {
+        let unslashed_active_balance = balances
+            .iter()
+            .fold(0, |sum: Gwei, balance| sum.saturating_add(*balance))
+            .max(crate::beacon::preset::EFFECTIVE_BALANCE_INCREMENT);
         Self {
             checkpoint,
             balances,
             total_active_balance,
+            unslashed_active_balance,
             effective_increments,
         }
     }
@@ -289,6 +298,12 @@ impl JustifiedBalances {
     /// `get_total_active_balance` defines it.
     pub fn total_active_balance(&self) -> Gwei {
         self.total_active_balance
+    }
+
+    /// The checkpoint state's total balance over active, unslashed validators,
+    /// the base of `calculate_committee_fraction`.
+    pub fn unslashed_active_balance(&self) -> Gwei {
+        self.unslashed_active_balance
     }
 }
 

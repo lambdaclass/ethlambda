@@ -145,7 +145,7 @@ leanSpec/fixtures:
 # definition of correctness for that module, so it should move only when we choose
 # to move it. The release publishes no checksums for these assets, so unlike the
 # leanSpec bundle below there is nothing to verify against.
-CONSENSUS_SPEC_TESTS_VERSION ?= v1.7.0-beta.2
+CONSENSUS_SPEC_TESTS_VERSION ?= v1.7.0-beta.4
 CONSENSUS_SPEC_TESTS_BASE_URL ?= https://github.com/ethereum/consensus-specs/releases/download/$(CONSENSUS_SPEC_TESTS_VERSION)
 
 # Which fixture trees to fetch. A run reads its own preset's tree and nothing
