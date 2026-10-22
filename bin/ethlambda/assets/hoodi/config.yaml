@@ -46,7 +46,7 @@ FULU_FORK_EPOCH: 50688
 
 # Gloas
 GLOAS_FORK_VERSION: 0x80000910
-GLOAS_FORK_EPOCH: 132352
+GLOAS_FORK_EPOCH: 18446744073709551615
 
 # Time parameters
 # ---------------------------------------------------------------
@@ -215,10 +215,3 @@ BLOB_SCHEDULE:
     MAX_BLOBS_PER_BLOCK: 15
   - EPOCH: 54016
     MAX_BLOBS_PER_BLOCK: 21
-
-# Gas limit scheduling
-# ---------------------------------------------------------------
-
-GAS_LIMIT_SCHEDULE:
-  - EPOCH: 132352
-    GAS_LIMIT: 200000000
