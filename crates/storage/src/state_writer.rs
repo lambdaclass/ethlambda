@@ -17,10 +17,12 @@
 //! needs to hold in mind is:
 //!
 //! - **One worker, never a pool.** A beacon state's delta is computed against
-//!   its parent's *encoded bytes*, so the backend walks in [`read_state`] are
-//!   only safe because states are inserted parent-before-child *and committed
-//!   in that same order*. A single thread draining one FIFO channel is what
-//!   gives the second half of that for free; a pool would not.
+//!   the *encoded bytes of the nearest snapshot on its branch*, and that
+//!   snapshot, like every ancestor, must already be committed when the delta is
+//!   planned; the backend walks in [`read_state`] are likewise only safe because
+//!   states are inserted parent-before-child *and committed in that same order*.
+//!   A single thread draining one FIFO channel is what gives the second half of
+//!   that for free; a pool would not.
 //! - **The channel blocks when full**, at [`STATE_WRITE_QUEUE_CAPACITY`]
 //!   entries, which is exactly what the write already did before it moved off
 //!   the importer's thread: this can only ever degrade to that, never past it.
@@ -56,7 +58,7 @@ use libssz::{SszDecode, SszEncode};
 use lru::LruCache;
 use tracing::error;
 
-use crate::api::{StorageBackend, StorageReadViewExt, Table};
+use crate::api::{StorageBackend, StorageReadView, StorageReadViewExt, Table};
 use crate::beacon_state_delta;
 use crate::error::Error;
 use crate::metrics::StateCacheMethod;
@@ -75,8 +77,10 @@ pub(crate) struct StateWrite {
     /// beacon state that is not an anchor.
     pub diff: Option<Vec<u8>>,
     /// Beacon only: the target's [`encode_state_value`] bytes, for the
-    /// writer's parent memo. `None` on the lean arm, which diffs in the field
-    /// domain and never reads a parent's bytes.
+    /// writer's snapshot memo. `Some` exactly when the write is a snapshot:
+    /// only a snapshot is ever a diff base, so a diff's own bytes are never
+    /// kept. `None` on the lean arm, which diffs in the field domain and never
+    /// reads a base's bytes.
     pub encoded: Option<Vec<u8>>,
 }
 
@@ -256,6 +260,14 @@ fn rebase_onto_resident(cache: &StateCache, state: &mut BeaconState) {
 /// [`encode_state_value`]) by walking `StateDiffs` back to the nearest
 /// `States` snapshot and folding deltas forward, byte domain only.
 ///
+/// Every frame names its own base, and that is all this walk follows. A diff
+/// written by [`plan_beacon_state_write`] names the snapshot of its interval, so
+/// the walk is one hop and the fold applies exactly one delta. A diff written
+/// parent-linked by an earlier build names its parent instead, and the same walk
+/// still reaches the snapshot and folds the longer chain. That is why moving the
+/// base from the parent to the snapshot needed no `DB_VERSION` bump, and why
+/// this function must keep following `base_root` rather than assume one hop.
+///
 /// Mirrors [`reconstruct_state`]'s walk-then-replay shape for lean, but
 /// cannot share its body: a beacon `StateDiffs` record is a
 /// [`beacon_state_delta::frame`]d byte delta, not a [`StateDiff`], so the
@@ -263,9 +275,8 @@ fn rebase_onto_resident(cache: &StateCache, state: &mut BeaconState) {
 /// [`beacon_state_delta::unframe`] instead of a `StateDiff`'s own field.
 ///
 /// Hands the encoded bytes to `consume` rather than returning a decoded
-/// [`BeaconState`], so that a caller that only needs the bytes (the writer
-/// thread's `StateWriter::encoded_parent_bytes`, for its diff base) is never
-/// made to pay for a decode it will not use.
+/// [`BeaconState`], so that a caller that only needs the bytes is never made to
+/// pay for a decode it will not use.
 /// [`Store::get_state`](crate::store::Store::get_state)'s beacon arm is the
 /// one caller that decodes, and it does so exactly once, after every delta
 /// has already been folded.
@@ -320,6 +331,42 @@ pub(crate) fn reconstruct_beacon_state_bytes<T>(
         let (base_root, _, _, _) = beacon_state_delta::unframe(&diff_bytes);
         cursor = base_root;
         records.push(diff_bytes);
+    }
+}
+
+/// The root of the snapshot that `root`'s state belongs to, found by following
+/// `StateDiffs` frames' `base_root` until a root has no diff row.
+///
+/// On a beacon directory a state is written as a snapshot xor a diff (see
+/// [`plan_beacon_state_write`]), so a root with no `StateDiffs` row is a
+/// snapshot. `States` is deliberately not probed to decide that: on RocksDB a
+/// hit there materializes the whole blob value, which is over a hundred
+/// megabytes, just to answer yes.
+///
+/// A diff written by this version names the snapshot directly, so the walk is
+/// one hop. Following `base_root` all the way, rather than taking one hop and
+/// trusting it, is what keeps a directory whose diffs were written
+/// parent-linked by an older build working: that chain ends at the snapshot
+/// too, only after more hops.
+///
+/// `None` when a root on the way has no block row, which is how a root the
+/// store never heard of looks. Takes the caller's view because opening a second
+/// one while holding the first can deadlock on a backend whose read lock is not
+/// reentrant.
+pub(crate) fn nearest_snapshot_root(view: &dyn StorageReadView, root: &H256) -> Option<H256> {
+    let mut cursor = *root;
+    loop {
+        let slot = block_slot_in(view, Chain::Beacon, &cursor)?;
+        let key = encode_slot_root_key(slot, &cursor);
+        let base = view
+            .read_with(Table::StateDiffs, &key, |frame| {
+                beacon_state_delta::unframe(frame).0
+            })
+            .expect("read");
+        match base {
+            Some(base_root) => cursor = base_root,
+            None => return Some(cursor),
+        }
     }
 }
 
@@ -425,7 +472,7 @@ pub(crate) fn reconstruct_state(
 /// base to diff against.
 ///
 /// Split out from the planning functions because the beacon arm has to know
-/// the answer *before* deciding whether to read the parent's encoded bytes at
+/// the answer *before* deciding whether to fetch a snapshot's encoded bytes at
 /// all: at an anchor it never diffs, and fetching a base it will not use would
 /// turn an avoided read into a mandatory one on every anchor.
 pub(crate) fn is_anchor(slot: u64, parent_slot: Option<u64>, interval: u64) -> bool {
@@ -458,10 +505,14 @@ pub(crate) fn plan_lean_state_write(state: State, parent: &State) -> StateWrite 
 
 /// The bytes a beacon post-state writes.
 ///
-/// `parent` is `Some((parent_root, parent_encoded_bytes))` for a state that
-/// diffs against its parent, and `None` for an anchor. Carrying the anchor
-/// decision in this argument rather than in a separate flag is what keeps a
-/// caller from fetching a base it will not use; see [`is_anchor`].
+/// `base` is `Some((snapshot_root, snapshot_encoded_bytes))` for a state that
+/// diffs, and `None` for an anchor. The base is the nearest snapshot on the
+/// state's branch, not its parent: a diff then carries every change since that
+/// snapshot, and reading any state back is one snapshot plus one delta however
+/// far into the interval it sits. The frame names the snapshot as its
+/// `base_root`. Carrying the anchor decision in this argument rather than in a
+/// separate flag is what keeps a caller from fetching a base it will not use;
+/// see [`is_anchor`].
 ///
 /// `slot` is passed rather than read off `state` because the caller has
 /// already computed it for [`is_anchor`], and because
@@ -470,16 +521,16 @@ pub(crate) fn plan_lean_state_write(state: State, parent: &State) -> StateWrite 
 pub(crate) fn plan_beacon_state_write(
     state: &BeaconState,
     slot: u64,
-    parent: Option<(H256, &[u8])>,
+    base: Option<(H256, &[u8])>,
 ) -> StateWrite {
     let target = encode_state_value(state);
-    match parent {
+    match base {
         None => StateWrite {
             snapshot: Some(target.clone()),
             diff: None,
             encoded: Some(target),
         },
-        Some((parent_root, base)) => {
+        Some((snapshot_root, base)) => {
             let delta = beacon_state_delta::encode(&target, base);
             // Deliberately not weakened to a plain `assert`: this repo's
             // release-fast profile keeps debug assertions on in tests while
@@ -492,11 +543,11 @@ pub(crate) fn plan_beacon_state_write(
                 "a beacon state delta must decode back to its target"
             );
             let target_len = target.len() as u64;
-            let framed = beacon_state_delta::frame(parent_root, slot, target_len, &delta);
+            let framed = beacon_state_delta::frame(snapshot_root, slot, target_len, &delta);
             StateWrite {
                 snapshot: None,
                 diff: Some(framed),
-                encoded: Some(target),
+                encoded: None,
             }
         }
     }
@@ -533,13 +584,22 @@ struct StateWriter {
     chain: Chain,
     cache: Arc<StateCache>,
     pending: Arc<PendingStates>,
-    /// The most recently encoded beacon state, so the beacon write path does
-    /// not re-encode a parent's whole SSZ on every import.
+    /// Root and [`encode_state_value`] bytes of the snapshot the newest beacon
+    /// diffs are taken against, so a diff does not re-read a snapshot of over a
+    /// hundred megabytes on every import.
     ///
-    /// Thread-local and a plain `Option`, not a shared `Mutex`: requests are
-    /// drained in order by this one thread, so the parent of the state being
-    /// written is whatever this thread wrote last.
-    encoded_memo: Option<(H256, Vec<u8>)>,
+    /// Set whenever this thread writes a beacon snapshot, and when it has to
+    /// load one from the backend (after a restart, or a fork off an older
+    /// interval). Thread-local and a plain `Option`, not a shared `Mutex`:
+    /// requests are drained in order by this one thread.
+    snapshot_memo: Option<(H256, Vec<u8>)>,
+    /// The last beacon state this thread wrote and the snapshot root it
+    /// belongs to (itself when it was a snapshot).
+    ///
+    /// Requests are drained in order, so the parent of the state being written
+    /// is almost always this one, which answers "which snapshot does my parent
+    /// belong to" without a read.
+    last_base: Option<(H256, H256)>,
 }
 
 impl StateWriter {
@@ -576,13 +636,17 @@ impl StateWriter {
                 let parent_root = beacon_state.latest_block_header().parent_root;
                 let interval = beacon_state.fork_name().snapshot_interval();
                 let parent_slot = beacon_block_slot(self.backend.as_ref(), &parent_root);
-                let base = (!is_anchor(slot, parent_slot, interval))
-                    .then(|| self.encoded_parent_bytes(parent_root));
-                plan_beacon_state_write(
-                    beacon_state,
-                    slot,
-                    base.as_deref().map(|base| (parent_root, base)),
-                )
+                let snapshot_root = (!is_anchor(slot, parent_slot, interval))
+                    .then(|| self.load_snapshot_base(parent_root));
+                let base = snapshot_root.map(|root| {
+                    let (memo_root, bytes) = self
+                        .snapshot_memo
+                        .as_ref()
+                        .expect("load_snapshot_base fills the memo");
+                    debug_assert_eq!(*memo_root, root);
+                    (root, bytes.as_slice())
+                });
+                plan_beacon_state_write(beacon_state, slot, base)
             }
         };
 
@@ -611,36 +675,68 @@ impl StateWriter {
         }
         batch.commit().expect("commit");
 
-        if let Some(encoded) = write.encoded {
-            self.encoded_memo = Some((root, encoded));
+        if matches!(&*request.state, BeaconState::Lean(_)) {
+            return;
+        }
+        match write.encoded {
+            // A snapshot is its own base, and the next diffs are taken against it.
+            Some(encoded) => {
+                self.snapshot_memo = Some((root, encoded));
+                self.last_base = Some((root, root));
+            }
+            None => {
+                let (snapshot_root, _) = self
+                    .snapshot_memo
+                    .as_ref()
+                    .expect("a beacon diff is planned against the memoized snapshot");
+                self.last_base = Some((root, *snapshot_root));
+            }
         }
     }
 
-    /// The parent's [`encode_state_value`] bytes, for the beacon delta.
+    /// Makes `snapshot_memo` hold the snapshot that `parent_root`'s state
+    /// belongs to, and returns that snapshot's root.
     ///
-    /// Checks the memo first: requests are drained in order, so the parent is
-    /// almost always the state this thread wrote last, making this free. A
-    /// miss folds the diff chain, which produces these exact bytes as a
-    /// by-product, so nothing is decoded and then re-encoded to satisfy it.
+    /// The common case is free: `last_base` names the snapshot of the state
+    /// this thread wrote last, which is almost always the parent, and the memo
+    /// holds that snapshot's bytes. A miss (a restart, or a fork off an older
+    /// block) resolves the snapshot with [`nearest_snapshot_root`] and, if the
+    /// memo is for another snapshot, reads its `States` row and replaces the
+    /// memo.
     ///
     /// # Panics
     ///
-    /// If `parent_root` has no state. This is only reached once
+    /// If the snapshot has no row. This is only reached once
     /// [`beacon_block_slot`] has found a parent block, which is only ever true
-    /// once that parent's own state has already been written: this thread
-    /// committed it before pulling the request being served now.
-    fn encoded_parent_bytes(&self, parent_root: H256) -> Vec<u8> {
-        self.encoded_memo
+    /// once that parent's own state has already been written, and a state's
+    /// snapshot is committed before the state itself: this thread is the only
+    /// writer and drains requests in order.
+    fn load_snapshot_base(&mut self, parent_root: H256) -> H256 {
+        let snapshot_root = match self.last_base {
+            Some((last_root, snapshot_root)) if last_root == parent_root => snapshot_root,
+            _ => {
+                let view = self.backend.begin_read().expect("read view");
+                nearest_snapshot_root(view.as_ref(), &parent_root)
+                    .expect("parent state must exist to diff against")
+            }
+        };
+        if self
+            .snapshot_memo
             .as_ref()
-            .filter(|(root, _)| *root == parent_root)
-            .map(|(_, bytes)| bytes.clone())
-            .unwrap_or_else(|| {
-                reconstruct_beacon_state_bytes(self.backend.as_ref(), &parent_root, |bytes| {
-                    bytes.into_owned()
-                })
-                .expect("read parent state")
-                .expect("parent state must exist to diff against")
-            })
+            .is_some_and(|(root, _)| *root == snapshot_root)
+        {
+            return snapshot_root;
+        }
+        let view = self.backend.begin_read().expect("read view");
+        let slot = block_slot_in(view.as_ref(), Chain::Beacon, &snapshot_root)
+            .expect("the snapshot's block must exist");
+        let key = encode_slot_root_key(slot, &snapshot_root);
+        let bytes = view
+            .read_with(Table::States, &key, <[u8]>::to_vec)
+            .expect("read")
+            .expect("the parent's snapshot must be committed before the parent itself");
+        self.snapshot_memo = Some((snapshot_root, bytes));
+        snapshot_root
     }
 }
 
@@ -678,7 +774,8 @@ impl StateWriterHandle {
             chain,
             cache,
             pending,
-            encoded_memo: None,
+            snapshot_memo: None,
+            last_base: None,
         };
         let join = std::thread::Builder::new()
             .name("state-writer".into())
@@ -823,13 +920,13 @@ mod tests {
     }
 
     #[test]
-    fn a_beacon_plan_with_no_parent_writes_a_snapshot_carrying_the_memo() {
+    fn a_beacon_plan_with_no_base_writes_a_snapshot_carrying_the_memo() {
         let state = BeaconState::Lean(base_state());
         let slot = state.expect_lean().slot;
         let plan = plan_beacon_state_write(&state, slot, None);
         assert!(
             plan.snapshot.is_some(),
-            "no parent means no base to diff against"
+            "no base means nothing to diff against"
         );
         assert!(plan.diff.is_none());
         assert_eq!(
@@ -845,30 +942,37 @@ mod tests {
     /// produced it. That keeps this test free of a multi-megabyte fixture.
     #[test]
     fn a_beacon_delta_decodes_back_to_its_target() {
-        let parent = base_state();
-        let child = child_state(&parent, parent.slot + 1);
-        let parent_root = parent.latest_block_header.hash_tree_root();
+        let snapshot = base_state();
+        let child = child_state(&snapshot, snapshot.slot + 1);
+        let snapshot_root = snapshot.latest_block_header.hash_tree_root();
 
-        let base = encode_state_value(&BeaconState::Lean(parent));
+        let base = encode_state_value(&BeaconState::Lean(snapshot));
         let slot = child.slot;
         let state = BeaconState::Lean(child);
-        let plan = plan_beacon_state_write(&state, slot, Some((parent_root, &base)));
+        let target = encode_state_value(&state);
+        let plan = plan_beacon_state_write(&state, slot, Some((snapshot_root, &base)));
 
         assert!(
             plan.snapshot.is_none(),
-            "a parent means a diff, not a snapshot"
+            "a base means a diff, not a snapshot"
+        );
+        assert!(
+            plan.encoded.is_none(),
+            "only a snapshot is a diff base, so a diff keeps no memo bytes"
         );
         let framed = plan.diff.expect("a non-anchor records a diff");
         let (read_base_root, framed_slot, target_len, delta) = beacon_state_delta::unframe(&framed);
-        assert_eq!(read_base_root, parent_root);
+        assert_eq!(
+            read_base_root, snapshot_root,
+            "the frame names the snapshot it was diffed against"
+        );
         assert_eq!(
             framed_slot, slot,
             "the frame carries the target state's slot"
         );
         assert_eq!(
             beacon_state_delta::decode(delta, &base, target_len as usize),
-            plan.encoded
-                .expect("the beacon arm always memoizes its target"),
+            target
         );
     }
 

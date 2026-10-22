@@ -3314,7 +3314,7 @@ impl Store {
     /// counterpart dispatches reads on `self.chain`).
     ///
     /// The byte-producing half of each arm, and the backend reads, the
-    /// commit and the parent-bytes memo, all live on the background writer in
+    /// commit and the snapshot memo, all live on the background writer in
     /// [`crate::state_writer`]; this method only builds the request and hands
     /// it off.
     ///
@@ -3334,15 +3334,17 @@ impl Store {
     /// falls back to a snapshot read or a diff-chain reconstruction.
     ///
     /// Beacon: a byte-domain [`beacon_state_delta`](crate::beacon_state_delta)
-    /// diff, snapshotting at anchors, the same shape as lean's but working in
+    /// diff, snapshotting at anchors, similar to lean's but working in
     /// the SSZ byte domain rather than the field domain: a beacon validator
     /// registry breaks lean's [`StateDiff`](crate::state_diff::StateDiff)'s "`validators` never changes"
     /// assumption every epoch, so lean's diff cannot be reused as-is. The
-    /// parent is identified the same way lean's is, off the post-state's own
-    /// `latest_block_header.parent_root`, but its *encoded* bytes are what the
-    /// delta is computed against; the writer thread's parent-bytes lookup
-    /// (`StateWriter::encoded_parent_bytes`) explains how those are obtained
-    /// without an extra encode round trip. The store's first-ever beacon
+    /// delta is computed against the *encoded* bytes of the nearest snapshot
+    /// on the state's branch, not against its parent: the snapshot is found
+    /// from the post-state's own `latest_block_header.parent_root`, and every
+    /// diff in an interval names the same snapshot, so a cold read is one
+    /// snapshot plus one delta. The writer thread's `StateWriter::load_snapshot_base`
+    /// explains how that snapshot is found and kept without a read per import.
+    /// The store's first-ever beacon
     /// state (a bootstrap or checkpoint-sync anchor) has no parent block on
     /// record, so it is always a snapshot regardless of the interval math:
     /// there is no base to diff against.
@@ -7314,15 +7316,16 @@ mod tests {
     }
 
     #[test]
-    fn a_cold_beacon_state_folds_every_delta_back_from_its_snapshot() {
+    fn a_cold_beacon_state_reads_back_as_its_snapshot_plus_one_delta() {
         let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
         let mut store = beacon_test_store(backend.clone());
         let interval = ForkName::Electra.snapshot_interval();
 
         // Slot 0 and slot `interval` are snapshots (no parent, then a boundary
-        // crossing), and every slot between them is a delta on its parent. So
-        // the reads cover a borrowed snapshot with nothing to fold, and chains
-        // of 1 up to `interval - 1` deltas applied to the borrowed snapshot.
+        // crossing), and every slot between them is a delta on the interval's
+        // snapshot. So the reads cover a borrowed snapshot with nothing to
+        // fold, and a single delta applied to the borrowed snapshot however
+        // deep into the interval the state sits.
         let mut expected = Vec::new();
         let mut parent = H256::ZERO;
         for slot in 0..=interval {
@@ -7356,13 +7359,208 @@ mod tests {
         state
     }
 
+    /// The root `insert_beacon_chain` gives the block at `slot`.
+    fn beacon_chain_root(slot: u64) -> H256 {
+        H256::from([(slot + 1) as u8; 32])
+    }
+
+    /// Inserts a linear beacon chain over `slots`, each block's parent being
+    /// the previous slot's (the first one's being `parent`), and returns the
+    /// last root.
+    fn insert_beacon_chain(
+        store: &mut Store,
+        slots: std::ops::RangeInclusive<u64>,
+        mut parent: H256,
+    ) -> H256 {
+        for slot in slots {
+            let root = beacon_chain_root(slot);
+            store
+                .insert_signed_block(root, beacon_test_block(slot, parent))
+                .expect("insert block");
+            store
+                .insert_state(root, beacon_test_state_with_parent(slot, parent))
+                .expect("insert state");
+            parent = root;
+        }
+        parent
+    }
+
+    /// Every `StateDiffs` row on the backend as `(slot, root, base_root)`.
+    fn beacon_diff_bases(backend: &Arc<dyn StorageBackend>) -> Vec<(u64, H256, H256)> {
+        let view = backend.begin_read().expect("read view");
+        view.prefix_iterator(Table::StateDiffs, &[])
+            .expect("iterator")
+            .map(|row| {
+                let (key, value) = row.expect("row");
+                let slot = u64::from_be_bytes(key[..8].try_into().unwrap());
+                let root = H256::from_slice(&key[8..]);
+                (slot, root, crate::beacon_state_delta::unframe(&value).0)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_beacon_diff_in_an_interval_names_the_intervals_snapshot() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        let mut store = beacon_test_store(backend.clone());
+        let interval = ForkName::Electra.snapshot_interval();
+
+        insert_beacon_chain(&mut store, 0..=interval, H256::ZERO);
+        // Dropping the store joins the writer, which settles the backend.
+        drop(store);
+
+        let diffs = beacon_diff_bases(&backend);
+        assert_eq!(
+            diffs.len() as u64,
+            interval - 1,
+            "slots 1..interval are diffs"
+        );
+        for (slot, _, base_root) in diffs {
+            assert_eq!(
+                base_root,
+                beacon_chain_root(0),
+                "the diff at slot {slot} must name the snapshot, not its parent"
+            );
+        }
+    }
+
+    #[test]
+    fn two_children_of_a_mid_interval_block_both_diff_against_the_snapshot() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        let mut store = beacon_test_store(backend.clone());
+        let fork_parent = insert_beacon_chain(&mut store, 0..=5, H256::ZERO);
+
+        // Two siblings of one parent: the second skips a slot, so the two
+        // states differ. The writer's last-written state is the first sibling,
+        // not the second's parent, so this is the fork-off-an-older-block path.
+        let first = H256::from([100u8; 32]);
+        let second = H256::from([101u8; 32]);
+        let first_state = beacon_test_state_with_parent(6, fork_parent);
+        let second_state = beacon_test_state_with_parent(7, fork_parent);
+        let expected = [
+            (first, first_state.to_ssz()),
+            (second, second_state.to_ssz()),
+        ];
+        store
+            .insert_signed_block(first, beacon_test_block(6, fork_parent))
+            .expect("insert block");
+        store
+            .insert_state(first, first_state)
+            .expect("insert state");
+        store
+            .insert_signed_block(second, beacon_test_block(7, fork_parent))
+            .expect("insert block");
+        store
+            .insert_state(second, second_state)
+            .expect("insert state");
+        drop(store);
+
+        let bases = beacon_diff_bases(&backend);
+        for sibling in [first, second] {
+            let (_, _, base_root) = bases
+                .iter()
+                .find(|(_, root, _)| *root == sibling)
+                .expect("the sibling has a diff");
+            assert_eq!(*base_root, beacon_chain_root(0));
+        }
+
+        let cold = beacon_test_store(backend);
+        for (root, encoded) in expected {
+            let state = cold.get_state(&root).expect("get").expect("present");
+            assert_eq!(state.to_ssz(), encoded);
+        }
+    }
+
+    #[test]
+    fn a_restart_mid_interval_keeps_diffing_against_the_snapshot() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        let interval = ForkName::Electra.snapshot_interval();
+        let half = interval / 2;
+
+        let mut store = beacon_test_store(backend.clone());
+        let tip = insert_beacon_chain(&mut store, 0..=half, H256::ZERO);
+        drop(store);
+
+        // A fresh store has an empty snapshot memo and no last-written state,
+        // so the next write has to find its snapshot by walking the frames.
+        let mut store = beacon_test_store(backend.clone());
+        insert_beacon_chain(&mut store, half + 1..=interval, tip);
+        drop(store);
+
+        let diffs = beacon_diff_bases(&backend);
+        assert_eq!(diffs.len() as u64, interval - 1);
+        for (slot, _, base_root) in diffs {
+            assert_eq!(base_root, beacon_chain_root(0), "diff at slot {slot}");
+        }
+
+        let cold = beacon_test_store(backend);
+        for slot in 0..=interval {
+            let state = cold
+                .get_state(&beacon_chain_root(slot))
+                .expect("get")
+                .expect("present");
+            assert_eq!(state.slot(), slot);
+        }
+    }
+
+    #[test]
+    fn the_snapshot_walk_follows_old_parent_linked_rows_to_the_snapshot() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        let mut store = beacon_test_store(backend.clone());
+        let (s, a, b) = (
+            beacon_chain_root(10),
+            beacon_chain_root(11),
+            beacon_chain_root(12),
+        );
+        store
+            .insert_signed_block(s, beacon_test_block(10, H256::ZERO))
+            .expect("insert block");
+        store
+            .insert_signed_block(a, beacon_test_block(11, s))
+            .expect("insert block");
+        store
+            .insert_signed_block(b, beacon_test_block(12, a))
+            .expect("insert block");
+
+        // Hand-written rows: S is a snapshot (no diff row), A diffs against S,
+        // and B diffs against A, the way a parent-linked older build wrote it.
+        let mut batch = backend.begin_write().expect("write batch");
+        let snapshot = vec![(encode_slot_root_key(10, &s), b"snapshot".to_vec())];
+        batch.put_batch(Table::States, snapshot).expect("put");
+        let diffs = vec![
+            (
+                encode_slot_root_key(11, &a),
+                crate::beacon_state_delta::frame(s, 11, 0, b""),
+            ),
+            (
+                encode_slot_root_key(12, &b),
+                crate::beacon_state_delta::frame(a, 12, 0, b""),
+            ),
+        ];
+        batch.put_batch(Table::StateDiffs, diffs).expect("put");
+        batch.commit().expect("commit");
+
+        let view = backend.begin_read().expect("read view");
+        for root in [s, a, b] {
+            assert_eq!(
+                crate::state_writer::nearest_snapshot_root(view.as_ref(), &root),
+                Some(s)
+            );
+        }
+        assert_eq!(
+            crate::state_writer::nearest_snapshot_root(view.as_ref(), &H256::from([99u8; 32])),
+            None,
+            "a root with no block has no snapshot"
+        );
+    }
+
     #[test]
     fn a_beacon_state_reconstructs_across_a_whole_snapshot_interval() {
         let mut store = beacon_test_store(Arc::new(InMemoryBackend::new()));
         let interval = ForkName::Electra.snapshot_interval();
 
-        // A chain one slot longer than the interval, so the walk crosses a
-        // snapshot boundary and the fold has real work to do.
+        // A chain one slot longer than the interval, so the reads cross a
+        // snapshot boundary and the deltas have real work to do.
         let mut roots = Vec::new();
         let mut parent = H256::ZERO;
         for slot in 0..=interval {

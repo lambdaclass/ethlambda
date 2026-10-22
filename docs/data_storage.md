@@ -258,8 +258,10 @@ no table of its own: it rides inside every `States` snapshot alongside
 
 ### StateDiffs
 
-`slot ‖ root → StateDiff`. A parent-linked diff written for **every**
-non-anchor state, pruned together with `States`. See [State Storage](#state-storage-snapshots--diffs) for what a
+`slot ‖ root → StateDiff`. A diff written for **every** non-anchor state,
+pruned together with `States`. Lean's is parent-linked; a beacon diff is a
+byte delta against the nearest snapshot on its branch, so a beacon state is one
+snapshot plus one delta. See [State Storage](#state-storage-snapshots--diffs) for what a
 diff contains and how states are rebuilt.
 
 ### Metadata
@@ -623,6 +625,18 @@ or change predictably. Instead, `insert_state` writes:
    to its parent (~68 minutes at 4-second slots). This bounds any
    reconstruction walk to at most `SNAPSHOT_ANCHOR_INTERVAL` diff applications.
 
+This is the lean arm. A beacon state is also a diff or, at an anchor, a
+snapshot, but the diff is a byte delta (`beacon_state_delta`) taken against the
+**nearest snapshot on its branch**, not against its parent, and its frame names
+that snapshot as `base_root`. Reading a beacon state is therefore one snapshot
+plus exactly one delta, however far into the interval the state sits; the cost
+is that a delta carries every change since its snapshot, so it grows across
+the interval. The reader follows each frame's `base_root` and does not assume
+one hop, so a directory whose diffs were written parent-linked by an earlier
+build still reads correctly (no `DB_VERSION` bump was needed), and a diff after
+a restart or on a fork finds its snapshot by walking `StateDiffs` frames until
+a root with no diff row.
+
 A `StateDiff` stores only what cannot be recovered elsewhere: the target slot,
 justified/finalized checkpoints, and the justification fields
 (`justified_slots`, `justifications_roots`, `justifications_validators`,
@@ -650,7 +664,8 @@ Reads go through `get_state`, which tries three levels:
    after importing its block — is a cache hit.
 2. A full snapshot in `States`.
 3. Reconstruction: walk `base_root` pointers back through `StateDiffs` until
-   a snapshot is found, then replay the diffs forward.
+   a snapshot is found, then replay the diffs forward. On lean that is a chain
+   of parent-linked diffs; on beacon it is one hop, to the interval's snapshot.
 
 ```text
                     STATE RECONSTRUCTION
