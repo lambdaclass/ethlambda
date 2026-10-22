@@ -692,8 +692,9 @@ mod tests {
     /// `Ignore`/`Reject` too, since `forward`'s guard is the same `if let ...
     /// if outcome == Outcome::Accept` for all three) must never reach the
     /// chain actor.
-    /// `block_gossip` names blocks that passed validation, so a block
-    /// forwarded on any other verdict still imports but is not announced.
+    /// `block_gossip` names blocks that passed validation. A queued block is
+    /// still forwarded, to import once it can, but is not announced; one the
+    /// validation pool never judged (`Overloaded`) is not forwarded at all.
     #[tokio::test]
     async fn only_an_accepted_gossip_block_is_announced() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
@@ -718,11 +719,7 @@ mod tests {
 
         assert_eq!(
             *chain.announcements.lock().unwrap(),
-            [
-                BlockAnnouncement::Announce,
-                BlockAnnouncement::Silent,
-                BlockAnnouncement::Silent
-            ]
+            [BlockAnnouncement::Announce, BlockAnnouncement::Silent]
         );
     }
 
