@@ -391,8 +391,16 @@ fn build_store(
         let head = store
             .head()
             .map_err(|err| format!("reading the head: {err}"))?;
+        // The builder market cases walk the head next, from the justified
+        // root, and moving finality prunes `LiveChain` below the finalized
+        // block, so a justified checkpoint left behind the override would
+        // start that walk from a pruned row. A store's justified checkpoint is
+        // never behind its finalized one, so it moves up with the override.
+        let justified = (builder_market
+            && store.beacon_justified_checkpoint().epoch < finalized.epoch)
+            .then_some(checkpoint);
         store
-            .update_checkpoints(ForkCheckpoints::new(head, None, Some(checkpoint)))
+            .update_checkpoints(ForkCheckpoints::new(head, justified, Some(checkpoint)))
             .map_err(|err| format!("overriding the finalized checkpoint: {err}"))?;
         if builder_market {
             // The bid generators activate their builders by finalizing epoch 1
