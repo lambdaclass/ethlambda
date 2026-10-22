@@ -151,7 +151,10 @@ fn pre_gloas_payload(state: &BeaconState) -> Option<(ExecutionBlockHash, u64)> {
             let header = &s.latest_execution_payload_header;
             Some((header.block_hash, header.gas_limit))
         }
-        BeaconState::Phase0(_) | BeaconState::Altair(_) | BeaconState::Gloas(_) => None,
+        BeaconState::Phase0(_)
+        | BeaconState::Altair(_)
+        | BeaconState::Gloas(_)
+        | BeaconState::Heze(_) => None,
         BeaconState::Lean(_) => lean_state_unreachable("execution_payload_bid::pre_gloas_payload"),
     }
 }
@@ -185,12 +188,17 @@ fn head_view(store: &Store) -> Result<HeadView, Outcome> {
     };
     if let Some(state) = store.cached_state(CacheKey::BlockState(node.root)) {
         return match &*state {
-            BeaconState::Gloas(inner) => Ok(HeadView::Gloas {
-                node,
-                parent_root: inner.latest_block_header.parent_root,
-                bid_parent_hash: inner.latest_execution_payload_bid.parent_block_hash,
-                bid_block_hash: inner.latest_execution_payload_bid.block_hash,
-            }),
+            BeaconState::Gloas(_) | BeaconState::Heze(_) => {
+                let bid = state
+                    .latest_execution_payload_bid()
+                    .map_err(|_| internal())?;
+                Ok(HeadView::Gloas {
+                    node,
+                    parent_root: state.latest_block_header().parent_root,
+                    bid_parent_hash: bid.parent_block_hash,
+                    bid_block_hash: bid.block_hash,
+                })
+            }
             other => match pre_gloas_payload(other) {
                 Some((block_hash, _)) => Ok(HeadView::PreGloas {
                     root: node.root,
@@ -206,6 +214,15 @@ fn head_view(store: &Store) -> Result<HeadView, Outcome> {
         .ok_or(Outcome::Ignore(IgnoreReason::StateUnavailable))?;
     match block {
         SignedBeaconBlock::Gloas(block) => {
+            let bid = &block.message.body.signed_execution_payload_bid.message;
+            Ok(HeadView::Gloas {
+                node,
+                parent_root: block.message.parent_root,
+                bid_parent_hash: bid.parent_block_hash,
+                bid_block_hash: bid.block_hash,
+            })
+        }
+        SignedBeaconBlock::Heze(block) => {
             let bid = &block.message.body.signed_execution_payload_bid.message;
             Ok(HeadView::Gloas {
                 node,
@@ -416,7 +433,9 @@ fn stateful_rules(
         cached_checkpoint_state(store, proposal_epoch, bid.parent_block_root)
             .ok_or(ignore(IgnoreReason::StateUnavailable))?
     };
-    let BeaconState::Gloas(inner) = &*state else {
+    let state: &BeaconState = &state;
+    let (Ok(builders), Ok(latest_bid)) = (state.builders(), state.latest_execution_payload_bid())
+    else {
         // A bid in a gloas epoch is advanced into gloas by the epoch
         // transition; anything else is a state this cannot judge.
         return Err(ignore(IgnoreReason::StateUnavailable));
@@ -424,24 +443,23 @@ fn stateful_rules(
 
     // [REJECT] The builder index is valid, [REJECT] it is a payload builder
     // and [REJECT] active.
-    let builder = inner
-        .builders
+    let builder = builders
         .get(bid.builder_index as usize)
         .ok_or(reject(RejectReason::UnknownBuilder))?;
     if builder.version != PAYLOAD_BUILDER_VERSION {
         return Err(reject(RejectReason::NotPayloadBuilder));
     }
-    if !is_active_builder(inner, bid.builder_index).unwrap_or(false) {
+    if !is_active_builder(state, bid.builder_index).unwrap_or(false) {
         return Err(reject(RejectReason::InactiveBuilder));
     }
     // [IGNORE] The builder can cover the bid.
-    if !can_builder_cover_bid(inner, bid.builder_index, bid.value).unwrap_or(false) {
+    if !can_builder_cover_bid(state, bid.builder_index, bid.value).unwrap_or(false) {
         return Err(ignore(IgnoreReason::BuilderCannotCover));
     }
     // [IGNORE] The parent's payload does not try to exit the builder. Only a
     // gloas parent has an envelope to carry the request.
-    let parent_is_gloas = matches!(&*parent_state, BeaconState::Gloas(_));
-    if parent_is_gloas && bid.parent_block_hash == inner.latest_execution_payload_bid.block_hash {
+    let parent_is_gloas = matches!(&*parent_state, BeaconState::Gloas(_) | BeaconState::Heze(_));
+    if parent_is_gloas && bid.parent_block_hash == latest_bid.block_hash {
         let exits = parent_payload_exits(store, market, bid)
             .ok_or(ignore(IgnoreReason::ParentPayloadUnverified))?;
         if exits.iter().any(|(pubkey, source)| {
@@ -459,7 +477,7 @@ fn stateful_rules(
             dependent_root_at(&parent_state, bid.parent_block_root, inclusion_list_slot)
                 .ok_or(ignore(IgnoreReason::AncestryUnknown))?;
         let committee =
-            get_inclusion_list_committee(&state, inclusion_list_slot, &*store.committee_cache())
+            get_inclusion_list_committee(state, inclusion_list_slot, &*store.committee_cache())
                 .map_err(|_| ignore(IgnoreReason::StateUnavailable))?;
         if !store.inclusion_list_store().is_bits_inclusive(
             &committee,
@@ -474,7 +492,7 @@ fn stateful_rules(
     // [REJECT] The signature is valid. An error (an index the state lacks)
     // is a signature that cannot be.
     if !matches!(
-        verify_execution_payload_bid_signature(&state, signed),
+        verify_execution_payload_bid_signature(state, signed),
         Ok(true)
     ) {
         return Err(reject(RejectReason::BadSignature));

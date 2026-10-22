@@ -53,7 +53,7 @@
 //!   passes it to `super::electra::drain_pending_deposits`, the loop electra
 //!   and fulu run.
 //! - **[`process_participation_flag_updates`] is gloas's own copy**, over
-//!   [`gloas::BeaconState`] directly (through `helpers::gloas::gloas_state`).
+//!   the gloas-family state (through `ethlambda_types::gloas_family!`).
 //!   It is unmodified in the specification,
 //!   but replaces the whole list (a new length, not an element write), which
 //!   only the fork's own concrete container type can do: electra's and
@@ -66,7 +66,7 @@ use crate::beacon::containers::{BeaconState, gloas};
 use crate::beacon::error::{Error, Result};
 use crate::beacon::helpers::accessors::{CommitteeCache, get_current_epoch};
 use crate::beacon::helpers::gloas::{
-    compute_ptc, get_activation_churn_limit, get_builder_payment_quorum_threshold, gloas_state,
+    compute_ptc, get_activation_churn_limit, get_builder_payment_quorum_threshold,
 };
 use crate::beacon::helpers::misc::compute_start_slot_at_epoch;
 use crate::beacon::preset;
@@ -79,12 +79,28 @@ use crate::beacon::preset;
 /// this module's own doc for which steps below are shared and which are
 /// gloas's own copy.
 pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
+    process_epoch_steps(state, config, true)
+}
+
+/// `process_epoch` (modified, Heze:EIP8015): gloas's, without
+/// `process_eth1_data_reset`, since heze's state has no `eth1_data_votes`.
+pub fn process_epoch_heze(state: &mut BeaconState, config: &Config) -> Result<()> {
+    process_epoch_steps(state, config, false)
+}
+
+fn process_epoch_steps(
+    state: &mut BeaconState,
+    config: &Config,
+    eth1_data_reset: bool,
+) -> Result<()> {
     super::altair::process_justification_and_finalization(state)?;
     super::altair::process_inactivity_updates(state, config)?;
     super::altair::process_rewards_and_penalties(state, config)?;
     super::electra::process_registry_updates(state, config)?;
     super::electra::process_slashings(state, config)?;
-    super::process_eth1_data_reset(state)?;
+    if eth1_data_reset {
+        super::process_eth1_data_reset(state)?;
+    }
     // [Modified in Gloas:EIP8061]
     process_pending_deposits(state, config)?;
     super::electra::process_pending_consolidations(state, config)?;
@@ -110,19 +126,19 @@ pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
 /// installs a fresh, all-zero current list, gloas's own copy of
 /// [`crate::beacon::stf::epoch::altair::process_participation_flag_updates`]:
 /// identical logic, writing gloas's own progressive lists through
-/// [`gloas_state`] (an infallible `From<Vec<_>>` conversion, unlike the
+/// `gloas_family!` (an infallible `From<Vec<_>>` conversion, unlike the
 /// bounded `EpochParticipation`'s fallible `TryFrom` altair's version needs).
 /// See this module's own doc for why that difference is what keeps this a
 /// separate copy rather than a shared, `Vec`-level function the way
 /// [`super::electra::process_pending_consolidations`] is.
 pub fn process_participation_flag_updates(state: &mut BeaconState) -> Result<()> {
     let validator_count = state.validator_count();
-    let inner = gloas_state(state, "process_participation_flag_updates")?;
-
-    inner.previous_epoch_participation = core::mem::take(&mut inner.current_epoch_participation);
-    inner.current_epoch_participation = vec![0; validator_count].into();
-
-    Ok(())
+    ethlambda_types::gloas_family!(state, "process_participation_flag_updates", |inner| {
+        inner.previous_epoch_participation =
+            core::mem::take(&mut inner.current_epoch_participation);
+        inner.current_epoch_participation = vec![0; validator_count].into();
+        Ok(())
+    })?
 }
 
 // ---------------------------------------------------------------------------
@@ -169,24 +185,26 @@ pub fn process_pending_deposits(state: &mut BeaconState, config: &Config) -> Res
 /// whole.
 pub fn process_builder_pending_payments(state: &mut BeaconState) -> Result<()> {
     let quorum = get_builder_payment_quorum_threshold(state)?;
-    let inner = gloas_state(state, "process_builder_pending_payments")?;
     let epoch_len = preset::SLOTS_PER_EPOCH as usize;
 
-    for payment in &inner.builder_pending_payments[..epoch_len] {
-        if payment.weight >= quorum {
-            inner
-                .builder_pending_withdrawals
-                .push(payment.withdrawal.clone());
+    ethlambda_types::gloas_family!(state, "process_builder_pending_payments", |inner| {
+        for payment in &inner.builder_pending_payments[..epoch_len] {
+            if payment.weight >= quorum {
+                inner
+                    .builder_pending_withdrawals
+                    .push(payment.withdrawal.clone());
+            }
         }
-    }
 
-    for index in 0..epoch_len {
-        inner.builder_pending_payments[index] =
-            inner.builder_pending_payments[epoch_len + index].clone();
-        inner.builder_pending_payments[epoch_len + index] = gloas::BuilderPendingPayment::default();
-    }
+        for index in 0..epoch_len {
+            inner.builder_pending_payments[index] =
+                inner.builder_pending_payments[epoch_len + index].clone();
+            inner.builder_pending_payments[epoch_len + index] =
+                gloas::BuilderPendingPayment::default();
+        }
 
-    Ok(())
+        Ok(())
+    })?
 }
 
 // ---------------------------------------------------------------------------
@@ -220,11 +238,11 @@ pub fn process_ptc_window(state: &mut BeaconState) -> Result<()> {
         new_slice.push(compute_ptc(state, slot, &committees)?);
     }
 
-    let inner = gloas_state(state, "process_ptc_window")?;
+    let ptc_window = state.ptc_window_mut()?;
     let mut window = Vec::with_capacity(preset::PTC_WINDOW_LENGTH);
-    window.extend_from_slice(&inner.ptc_window[slots_per_epoch..]);
+    window.extend_from_slice(&ptc_window[slots_per_epoch..]);
     window.extend(new_slice);
-    inner.ptc_window = window.try_into().expect(
+    *ptc_window = window.try_into().expect(
         "dropping SLOTS_PER_EPOCH entries and appending SLOTS_PER_EPOCH more preserves \
          PTC_WINDOW_LENGTH",
     );
@@ -238,7 +256,7 @@ mod tests {
     use crate::beacon::containers::electra;
     use crate::beacon::fork::ForkName;
     use crate::beacon::helpers::accessors::get_total_active_balance;
-    use crate::beacon::helpers::gloas::{get_ptc, gloas_state_ref};
+    use crate::beacon::helpers::gloas::get_ptc;
     use crate::beacon::primitives::ValidatorIndex;
 
     /// A gloas state with `count` fully active, full-balance validators,
@@ -250,11 +268,17 @@ mod tests {
     }
 
     fn gloas_inner(state: &BeaconState) -> &gloas::BeaconState {
-        gloas_state_ref(state, "test").unwrap()
+        match state {
+            BeaconState::Gloas(inner) => inner,
+            _ => panic!("a gloas test state"),
+        }
     }
 
     fn gloas_inner_mut(state: &mut BeaconState) -> &mut gloas::BeaconState {
-        gloas_state(state, "test").unwrap()
+        match state {
+            BeaconState::Gloas(inner) => inner,
+            _ => panic!("a gloas test state"),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -757,7 +781,7 @@ mod tests {
         // `> 0` regardless of weight.
         let mut settle_state = gloas_state_with_validators(64);
         gloas_inner_mut(&mut settle_state).builder_pending_payments[0] = payment;
-        settle_builder_payment(gloas_inner_mut(&mut settle_state), 0).unwrap();
+        settle_builder_payment(&mut settle_state, 0).unwrap();
         assert!(
             gloas_inner(&settle_state)
                 .builder_pending_withdrawals

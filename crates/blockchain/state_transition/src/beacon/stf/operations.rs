@@ -110,9 +110,9 @@ pub fn process_operations(
     // so a malformed pre-state (or a future bug) must not be allowed to wrap
     // this into a huge outstanding count that no block could ever satisfy.
     let outstanding = state
-        .eth1_data()
+        .eth1_data()?
         .deposit_count
-        .checked_sub(state.eth1_deposit_index())
+        .checked_sub(*state.eth1_deposit_index()?)
         .ok_or(Error::ArithmeticOverflow(
             "eth1_data.deposit_count - eth1_deposit_index",
         ))?;
@@ -589,13 +589,13 @@ pub fn process_deposit(state: &mut BeaconState, deposit: &Deposit, config: &Conf
             deposit.data.hash_tree_root(),
             &deposit.proof,
             (constants::DEPOSIT_CONTRACT_TREE_DEPTH + 1) as u64,
-            state.eth1_deposit_index(),
-            state.eth1_data().deposit_root,
+            *state.eth1_deposit_index()?,
+            state.eth1_data()?.deposit_root,
         ),
         "is_valid_merkle_branch(hash_tree_root(deposit.data), deposit.proof, DEPOSIT_CONTRACT_TREE_DEPTH + 1, state.eth1_deposit_index, state.eth1_data.deposit_root)",
     )?;
 
-    *state.eth1_deposit_index_mut() += 1;
+    *state.eth1_deposit_index_mut()? += 1;
 
     apply_deposit(
         state,

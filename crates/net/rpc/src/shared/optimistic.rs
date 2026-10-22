@@ -46,29 +46,25 @@ fn payload_link(store: &Store, root: H256) -> Option<BlockPayloadLink> {
         | SignedBeaconBlock::Deneb(_)
         | SignedBeaconBlock::Electra(_)
         | SignedBeaconBlock::Fulu(_) => Some(BlockPayloadLink::PreGloas),
-        SignedBeaconBlock::Gloas(block) => {
-            let parent_status = match store.get_signed_block(&block.message.parent_root).ok()? {
+        block @ (SignedBeaconBlock::Gloas(_) | SignedBeaconBlock::Heze(_)) => {
+            let message = block.gloas_message()?;
+            let parent_status = match store.get_signed_block(&message.parent_root()).ok()? {
                 None => None,
-                Some(SignedBeaconBlock::Gloas(parent)) => {
-                    let wanted = block
-                        .message
-                        .body
-                        .signed_execution_payload_bid
-                        .message
-                        .parent_block_hash;
-                    let held = parent
-                        .message
-                        .body
-                        .signed_execution_payload_bid
-                        .message
-                        .block_hash;
-                    Some(if wanted == held {
-                        PayloadStatus::Full
-                    } else {
-                        PayloadStatus::Empty
-                    })
-                }
-                Some(_) => Some(PayloadStatus::Full),
+                Some(parent) => match parent.gloas_message() {
+                    Some(parent) => {
+                        let wanted = message
+                            .signed_execution_payload_bid()
+                            .message
+                            .parent_block_hash;
+                        let held = parent.signed_execution_payload_bid().message.block_hash;
+                        Some(if wanted == held {
+                            PayloadStatus::Full
+                        } else {
+                            PayloadStatus::Empty
+                        })
+                    }
+                    None => Some(PayloadStatus::Full),
+                },
             };
             Some(BlockPayloadLink::Gloas { parent_status })
         }

@@ -364,7 +364,7 @@ impl HttpBeaconNode {
                     .to_string(),
             )
         })?;
-        let block = ProducedBlock::from_gloas_ssz(included, &response.body)?;
+        let block = ProducedBlock::from_gloas_ssz(response.fork, included, &response.body)?;
         // Enforced here rather than at the call site so failover works: see the
         // contract on `BeaconNodeApi::produce_block`.
         validate_produced_block(request, &block)?;

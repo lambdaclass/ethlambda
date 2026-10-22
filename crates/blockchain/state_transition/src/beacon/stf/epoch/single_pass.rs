@@ -408,7 +408,9 @@ impl DepositPlan {
                     electra_state.eth1_deposit_index,
                     fields.deposit_requests_start_index(),
                 )),
-                PendingQueueFields::Fulu(_) | PendingQueueFields::Gloas(_) => None,
+                PendingQueueFields::Fulu(_)
+                | PendingQueueFields::Gloas(_)
+                | PendingQueueFields::Heze(_) => None,
             };
             let available_for_processing = fields
                 .deposit_balance_to_consume()

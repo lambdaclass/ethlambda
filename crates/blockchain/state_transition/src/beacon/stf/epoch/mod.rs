@@ -105,7 +105,8 @@ pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
         // EIP-7688's progressive participation, inactivity, and pending-queue
         // lists need their own copies of several more (see `gloas`'s own
         // module doc for which), so gloas gets its own driver too.
-        ForkName::Gloas | ForkName::Heze => gloas::process_epoch(state, config),
+        ForkName::Gloas => gloas::process_epoch(state, config),
+        ForkName::Heze => gloas::process_epoch_heze(state, config),
         ForkName::Lean => lean_state_unreachable("process_epoch"),
     }
 }
@@ -279,7 +280,7 @@ pub fn get_attesting_balance(
 pub fn process_eth1_data_reset(state: &mut BeaconState) -> Result<()> {
     let next_epoch = get_current_epoch(state) + 1;
     if next_epoch.is_multiple_of(preset::EPOCHS_PER_ETH1_VOTING_PERIOD) {
-        *state.eth1_data_votes_mut() = Default::default();
+        *state.eth1_data_votes_mut()? = Default::default();
     }
     Ok(())
 }

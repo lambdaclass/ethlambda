@@ -79,6 +79,7 @@ macro_rules! dispatch_state {
             BeaconState::Electra($state) => $body,
             BeaconState::Fulu($state) => $body,
             BeaconState::Gloas($state) => $body,
+            BeaconState::Heze($state) => $body,
             BeaconState::Lean(_) => lean_state_unreachable($function),
         }
     };
@@ -109,6 +110,7 @@ macro_rules! dispatch_state_including_lean {
             BeaconState::Electra($state) => $body,
             BeaconState::Fulu($state) => $body,
             BeaconState::Gloas($state) => $body,
+            BeaconState::Heze($state) => $body,
             BeaconState::Lean($state) => $body,
         }
     };
@@ -154,6 +156,7 @@ macro_rules! dispatch_block {
             SignedBeaconBlock::Electra($block) => $body,
             SignedBeaconBlock::Fulu($block) => $body,
             SignedBeaconBlock::Gloas($block) => $body,
+            SignedBeaconBlock::Heze($block) => $body,
             SignedBeaconBlock::Lean(_) => lean_block_unreachable($function),
         }
     };
@@ -179,15 +182,16 @@ macro_rules! dispatch_block_including_lean {
             SignedBeaconBlock::Electra($block) => $body,
             SignedBeaconBlock::Fulu($block) => $body,
             SignedBeaconBlock::Gloas($block) => $body,
+            SignedBeaconBlock::Heze($block) => $body,
             SignedBeaconBlock::Lean($block) => $body,
         }
     };
 }
 
 /// Refuses a gloas-family value decoded for `fork` whose bid has the other
-/// fork's shape. Gloas and heze share their containers (see
-/// [`gloas::ExecutionPayloadBid`]), so decoding accepts either shape and the
-/// fork the caller expected is checked here.
+/// fork's shape. Gloas and heze share the bid container (see
+/// [`gloas::ExecutionPayloadBid`]), so decoding a bid accepts either shape and
+/// the fork the caller expected is checked here.
 fn expect_shape(fork: ForkName, shape: ForkName) -> Result<()> {
     if fork == shape {
         Ok(())
@@ -219,9 +223,10 @@ pub enum BeaconState {
     Deneb(deneb::BeaconState),
     Electra(electra::BeaconState),
     Fulu(fulu::BeaconState),
-    /// Gloas's state, and heze's: see [`SignedBeaconBlock::Gloas`] for why
-    /// one variant serves both.
     Gloas(gloas::BeaconState),
+    /// Heze's state: gloas's without the eth1 and deposit-index fields
+    /// (EIP-8015), so its own container.
+    Heze(heze::BeaconState),
     Lean(crate::state::State),
 }
 
@@ -266,6 +271,7 @@ impl serde::Serialize for BeaconState {
             BeaconState::Electra(state) => state.serialize(serializer),
             BeaconState::Fulu(state) => state.serialize(serializer),
             BeaconState::Gloas(state) => state.serialize(serializer),
+            BeaconState::Heze(state) => state.serialize(serializer),
             BeaconState::Lean(_) => Err(serde::ser::Error::custom(
                 "a lean state has no JSON encoding: /lean/v0/states/finalized serves SSZ only",
             )),
@@ -306,8 +312,8 @@ impl BeaconState {
             BeaconState::Deneb(_) => ForkName::Deneb,
             BeaconState::Electra(_) => ForkName::Electra,
             BeaconState::Fulu(_) => ForkName::Fulu,
-            // Heze's state is gloas's, told apart by its bid's shape.
-            BeaconState::Gloas(state) => state.latest_execution_payload_bid.fork_name(),
+            BeaconState::Gloas(_) => ForkName::Gloas,
+            BeaconState::Heze(_) => ForkName::Heze,
             BeaconState::Lean(_) => ForkName::Lean,
         }
     }
@@ -370,10 +376,15 @@ impl BeaconState {
                 bytes,
             )?)),
             ForkName::Fulu => Ok(BeaconState::Fulu(fulu::BeaconState::from_ssz_bytes(bytes)?)),
-            ForkName::Gloas | ForkName::Heze => {
+            ForkName::Gloas => {
                 let state = gloas::BeaconState::from_ssz_bytes(bytes)?;
                 expect_shape(fork, state.latest_execution_payload_bid.fork_name())?;
                 Ok(BeaconState::Gloas(state))
+            }
+            ForkName::Heze => {
+                let state = heze::BeaconState::from_ssz_bytes(bytes)?;
+                expect_shape(fork, state.latest_execution_payload_bid.fork_name())?;
+                Ok(BeaconState::Heze(state))
             }
             ForkName::Lean => Ok(BeaconState::Lean(crate::state::State::from_ssz_bytes(
                 bytes,
@@ -484,6 +495,11 @@ tree_fields!(
     gloas::BeaconState => validators, balances, block_roots, state_roots, historical_roots, eth1_data_votes, randao_mixes, slashings,
     historical_summaries
 );
+// Heze has no `eth1_data_votes` (EIP-8015).
+tree_fields!(
+    heze::BeaconState => validators, balances, block_roots, state_roots, historical_roots, randao_mixes, slashings,
+    historical_summaries
+);
 
 /// Generates read and write accessors for state fields that every fork shares.
 ///
@@ -535,10 +551,154 @@ macro_rules! shared_state_accessors {
     };
 }
 
+/// Generates accessors for the eth1 fields every fork carries except heze,
+/// which removes them (EIP-8015). Fallible, answering
+/// [`Error::UnsupportedForFork`] for heze, so a caller that reaches one on a
+/// heze state gets an error naming the field rather than a wrong answer.
+macro_rules! eth1_state_accessors {
+    ($(($field:ident, $field_mut:ident, $ty:ty)),* $(,)?) => {
+        impl BeaconState {
+            $(
+                pub fn $field(&self) -> Result<&$ty> {
+                    dispatch_state_from!(
+                        self,
+                        stringify!($field),
+                        |state| &state.$field,
+                        carried_by: [Phase0, Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas],
+                        absent_from: [Heze],
+                    )
+                }
+
+                pub fn $field_mut(&mut self) -> Result<&mut $ty> {
+                    dispatch_state_from!(
+                        self,
+                        stringify!($field_mut),
+                        |state| &mut state.$field,
+                        carried_by: [Phase0, Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas],
+                        absent_from: [Heze],
+                    )
+                }
+            )*
+        }
+    };
+}
+
+eth1_state_accessors!(
+    (eth1_deposit_index, eth1_deposit_index_mut, u64),
+    (eth1_data, eth1_data_mut, Eth1Data),
+    (eth1_data_votes, eth1_data_votes_mut, Eth1DataVotes),
+);
+
+/// Runs `$body` against the gloas or heze state inside `$state`, and answers
+/// [`Error::UnsupportedForFork`] naming `$function` for any other fork.
+///
+/// For code that touches several gloas-family fields at once, where one
+/// accessor per field would fight the borrow checker. The two arms hold
+/// different container types with the same field names, so `$body` is
+/// expanded once per fork and has to typecheck for both. The macro evaluates
+/// to a `Result` holding the body's value, so callers write `gloas_family!(..)?`;
+/// a `?` inside the body returns from the enclosing function. A fork added
+/// after heze is not caught by a wildcard here, it breaks this macro's match.
+#[macro_export]
+macro_rules! gloas_family {
+    ($state:expr, $function:expr, |$inner:ident| $body:expr) => {
+        match $state {
+            $crate::beacon::containers::BeaconState::Gloas($inner) => Ok($body),
+            $crate::beacon::containers::BeaconState::Heze($inner) => Ok($body),
+            $crate::beacon::containers::BeaconState::Phase0(_)
+            | $crate::beacon::containers::BeaconState::Altair(_)
+            | $crate::beacon::containers::BeaconState::Bellatrix(_)
+            | $crate::beacon::containers::BeaconState::Capella(_)
+            | $crate::beacon::containers::BeaconState::Deneb(_)
+            | $crate::beacon::containers::BeaconState::Electra(_)
+            | $crate::beacon::containers::BeaconState::Fulu(_) => {
+                Err($crate::beacon::error::Error::UnsupportedForFork {
+                    function: $function,
+                    fork: $state.fork_name(),
+                })
+            }
+            $crate::beacon::containers::BeaconState::Lean(_) => {
+                $crate::beacon::lean_state_unreachable($function)
+            }
+        }
+    };
+}
+
+/// Generates accessors for the fields that exist from gloas on (EIP-7732):
+/// gloas and heze carry each unchanged, every earlier fork answers
+/// [`Error::UnsupportedForFork`]. The two lists are spelled out rather than
+/// one derived from the other, so a new fork joins neither silently.
+macro_rules! gloas_family_state_accessors {
+    ($(($field:ident, $field_mut:ident, $ty:ty)),* $(,)?) => {
+        impl BeaconState {
+            $(
+                pub fn $field(&self) -> Result<&$ty> {
+                    dispatch_state_from!(
+                        self,
+                        stringify!($field),
+                        |state| &state.$field,
+                        carried_by: [Gloas, Heze],
+                        absent_from: [Phase0, Altair, Bellatrix, Capella, Deneb, Electra, Fulu],
+                    )
+                }
+
+                pub fn $field_mut(&mut self) -> Result<&mut $ty> {
+                    dispatch_state_from!(
+                        self,
+                        stringify!($field_mut),
+                        |state| &mut state.$field,
+                        carried_by: [Gloas, Heze],
+                        absent_from: [Phase0, Altair, Bellatrix, Capella, Deneb, Electra, Fulu],
+                    )
+                }
+            )*
+        }
+    };
+}
+
+gloas_family_state_accessors!(
+    (latest_block_hash, latest_block_hash_mut, ExecutionBlockHash),
+    (builders, builders_mut, gloas::Builders),
+    (
+        next_withdrawal_builder_index,
+        next_withdrawal_builder_index_mut,
+        gloas::BuilderIndex
+    ),
+    (
+        execution_payload_availability,
+        execution_payload_availability_mut,
+        gloas::ExecutionPayloadAvailability
+    ),
+    (
+        builder_pending_payments,
+        builder_pending_payments_mut,
+        gloas::BuilderPendingPayments
+    ),
+    (
+        builder_pending_withdrawals,
+        builder_pending_withdrawals_mut,
+        gloas::BuilderPendingWithdrawals
+    ),
+    (
+        latest_execution_payload_bid,
+        latest_execution_payload_bid_mut,
+        gloas::ExecutionPayloadBid
+    ),
+    (
+        payload_expected_withdrawals,
+        payload_expected_withdrawals_mut,
+        gloas::Withdrawals
+    ),
+    (
+        ptc_window,
+        ptc_window_mut,
+        gloas::PayloadTimelinessCommitteeWindow
+    ),
+);
+
 shared_state_accessors!(
     copy: [
         (slot, slot_mut, Slot),
-        (eth1_deposit_index, eth1_deposit_index_mut, u64),
         (previous_justified_checkpoint, previous_justified_checkpoint_mut, Checkpoint),
         (current_justified_checkpoint, current_justified_checkpoint_mut, Checkpoint),
         (finalized_checkpoint, finalized_checkpoint_mut, Checkpoint),
@@ -549,8 +709,6 @@ shared_state_accessors!(
         (block_roots, block_roots_mut, BlockRoots),
         (state_roots, state_roots_mut, StateRoots),
         (historical_roots, historical_roots_mut, HistoricalRoots),
-        (eth1_data, eth1_data_mut, Eth1Data),
-        (eth1_data_votes, eth1_data_votes_mut, Eth1DataVotes),
         (randao_mixes, randao_mixes_mut, RandaoMixes),
         (slashings, slashings_mut, Slashings),
         (justification_bits, justification_bits_mut, JustificationBits),
@@ -926,6 +1084,7 @@ impl BeaconState {
             BeaconState::Electra(s) => Some(Registry::Bounded(&s.validators, &s.balances)),
             BeaconState::Fulu(s) => Some(Registry::Bounded(&s.validators, &s.balances)),
             BeaconState::Gloas(s) => Some(Registry::Progressive(&s.validators, &s.balances)),
+            BeaconState::Heze(s) => Some(Registry::Progressive(&s.validators, &s.balances)),
             BeaconState::Lean(_) => None,
         }
     }
@@ -953,6 +1112,9 @@ impl BeaconState {
             }
             BeaconState::Fulu(s) => Some(RegistryMut::Bounded(&mut s.validators, &mut s.balances)),
             BeaconState::Gloas(s) => {
+                Some(RegistryMut::Progressive(&mut s.validators, &mut s.balances))
+            }
+            BeaconState::Heze(s) => {
                 Some(RegistryMut::Progressive(&mut s.validators, &mut s.balances))
             }
             BeaconState::Lean(_) => None,
@@ -1033,7 +1195,9 @@ impl BeaconState {
         self.state_roots_mut().rebase_on(base.state_roots());
         self.historical_roots_mut()
             .rebase_on(base.historical_roots());
-        self.eth1_data_votes_mut().rebase_on(base.eth1_data_votes());
+        if let (Ok(votes), Ok(base_votes)) = (self.eth1_data_votes_mut(), base.eth1_data_votes()) {
+            votes.rebase_on(base_votes);
+        }
         self.randao_mixes_mut().rebase_on(base.randao_mixes());
         self.slashings_mut().rebase_on(base.slashings());
         self.rebase_inactivity_scores_on(base);
@@ -1146,7 +1310,7 @@ impl BeaconState {
                 state.next_withdrawal_index,
                 state.next_withdrawal_validator_index,
             ),
-            carried_by: [Capella, Deneb, Electra, Fulu, Gloas],
+            carried_by: [Capella, Deneb, Electra, Fulu, Gloas, Heze],
             absent_from: [Phase0, Altair, Bellatrix],
         )
     }
@@ -1160,7 +1324,7 @@ impl BeaconState {
                 &mut state.next_withdrawal_index,
                 &mut state.next_withdrawal_validator_index,
             ),
-            carried_by: [Capella, Deneb, Electra, Fulu, Gloas],
+            carried_by: [Capella, Deneb, Electra, Fulu, Gloas, Heze],
             absent_from: [Phase0, Altair, Bellatrix],
         )
     }
@@ -1211,7 +1375,7 @@ impl BeaconState {
                 &state.current_epoch_participation[..],
                 InactivityScoresRef::from(&state.inactivity_scores),
             ),
-            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas],
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze],
             absent_from: [Phase0],
         )
     }
@@ -1263,7 +1427,7 @@ impl BeaconState {
                 &mut state.inactivity_scores,
             ),
             carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu],
-            absent_from: [Phase0, Gloas],
+            absent_from: [Phase0, Gloas, Heze],
         )
     }
 
@@ -1295,7 +1459,7 @@ impl BeaconState {
                     .get_mut(index)
                     .ok_or(Error::IndexOutOfBounds { index, len })?
             },
-            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas],
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze],
             absent_from: [Phase0],
         )
     }
@@ -1322,7 +1486,7 @@ impl BeaconState {
             } else {
                 &mut state.previous_epoch_participation[..]
             },
-            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas],
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze],
             absent_from: [Phase0],
         )
     }
@@ -1343,7 +1507,7 @@ impl BeaconState {
             self,
             "BeaconState::sync_committees",
             |state| (&state.current_sync_committee, &state.next_sync_committee),
-            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas],
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze],
             absent_from: [Phase0],
         )
     }
@@ -1366,7 +1530,7 @@ impl BeaconState {
                 &mut state.current_sync_committee,
                 &mut state.next_sync_committee,
             ),
-            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas],
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze],
             absent_from: [Phase0],
         )
     }
@@ -1585,12 +1749,11 @@ pub enum SignedBeaconBlock {
     /// Fulu's block. See the enum doc for why this wraps
     /// [`electra::SignedBeaconBlock`] instead of a `fulu` type.
     Fulu(electra::SignedBeaconBlock),
-    /// Gloas's block, and heze's: heze changes no block field except the
-    /// bid's, which [`gloas::ExecutionPayloadBid`] carries for both forks, and
-    /// unlike fulu's against electra's the two shapes differ on the wire, so
-    /// [`Self::fork_name`] reads the fork off the bid rather than needing a
-    /// variant to remember it.
     Gloas(gloas::SignedBeaconBlock),
+    /// Heze's block: gloas's without `eth1_data` and `deposits` in the body
+    /// (EIP-8015). Its bid is still [`gloas::ExecutionPayloadBid`], in its
+    /// heze shape.
+    Heze(heze::SignedBeaconBlock),
 
     /// The Lean consensus protocol's block.
     ///
@@ -1646,7 +1809,9 @@ impl SignedBeaconBlock {
     /// (`is_payload_verified(store, root)`) rather than this accessor.
     pub fn execution_block_hash(&self) -> Option<ExecutionBlockHash> {
         match self {
-            Self::Phase0(_) | Self::Altair(_) | Self::Gloas(_) | Self::Lean(_) => None,
+            Self::Phase0(_) | Self::Altair(_) | Self::Gloas(_) | Self::Heze(_) | Self::Lean(_) => {
+                None
+            }
             Self::Bellatrix(block) => Some(block.message.body.execution_payload.block_hash),
             Self::Capella(block) => Some(block.message.body.execution_payload.block_hash),
             Self::Deneb(block) => Some(block.message.body.execution_payload.block_hash),
@@ -1687,6 +1852,13 @@ impl SignedBeaconBlock {
                 .message
                 .blob_kzg_commitments
                 .len(),
+            Self::Heze(block) => block
+                .message
+                .body
+                .signed_execution_payload_bid
+                .message
+                .blob_kzg_commitments
+                .len(),
         }
     }
 
@@ -1700,7 +1872,9 @@ impl SignedBeaconBlock {
     /// would describe.
     pub fn execution_payload_timestamp(&self) -> Option<u64> {
         match self {
-            Self::Phase0(_) | Self::Altair(_) | Self::Gloas(_) | Self::Lean(_) => None,
+            Self::Phase0(_) | Self::Altair(_) | Self::Gloas(_) | Self::Heze(_) | Self::Lean(_) => {
+                None
+            }
             Self::Bellatrix(block) => Some(block.message.body.execution_payload.timestamp),
             Self::Capella(block) => Some(block.message.body.execution_payload.timestamp),
             Self::Deneb(block) => Some(block.message.body.execution_payload.timestamp),
@@ -1725,13 +1899,8 @@ impl SignedBeaconBlock {
             SignedBeaconBlock::Deneb(_) => ForkName::Deneb,
             SignedBeaconBlock::Electra(_) => ForkName::Electra,
             SignedBeaconBlock::Fulu(_) => ForkName::Fulu,
-            // Heze's block is gloas's, told apart by its bid's shape.
-            SignedBeaconBlock::Gloas(block) => block
-                .message
-                .body
-                .signed_execution_payload_bid
-                .message
-                .fork_name(),
+            SignedBeaconBlock::Gloas(_) => ForkName::Gloas,
+            SignedBeaconBlock::Heze(_) => ForkName::Heze,
             SignedBeaconBlock::Lean(_) => ForkName::Lean,
         }
     }
@@ -1765,11 +1934,17 @@ impl SignedBeaconBlock {
             ForkName::Fulu => Ok(SignedBeaconBlock::Fulu(
                 electra::SignedBeaconBlock::from_ssz_bytes(bytes)?,
             )),
-            ForkName::Gloas | ForkName::Heze => {
+            ForkName::Gloas => {
                 let block = gloas::SignedBeaconBlock::from_ssz_bytes(bytes)?;
                 let bid = &block.message.body.signed_execution_payload_bid.message;
                 expect_shape(fork, bid.fork_name())?;
                 Ok(SignedBeaconBlock::Gloas(block))
+            }
+            ForkName::Heze => {
+                let block = heze::SignedBeaconBlock::from_ssz_bytes(bytes)?;
+                let bid = &block.message.body.signed_execution_payload_bid.message;
+                expect_shape(fork, bid.fork_name())?;
+                Ok(SignedBeaconBlock::Heze(block))
             }
             ForkName::Lean => Ok(SignedBeaconBlock::Lean(
                 crate::block::SignedBlock::from_ssz_bytes(bytes)?,
@@ -1871,6 +2046,294 @@ signed_beacon_block_accessors!(
     ],
 );
 
+/// A borrowed gloas-family block message: gloas's or heze's.
+///
+/// What code that reads a block of either fork holds, since the two bodies are
+/// different containers (EIP-8015 removes two fields from heze's). Obtained
+/// from [`SignedBeaconBlock::gloas_message`] or [`GloasBlock::as_ref`]. The
+/// accessors are the fields both bodies share; `deposits_len` answers the one
+/// that differs, as zero for heze.
+#[derive(Debug, Clone, Copy)]
+pub enum GloasBlockRef<'a> {
+    Gloas(&'a gloas::BeaconBlock),
+    Heze(&'a heze::BeaconBlock),
+}
+
+macro_rules! gloas_ref_dispatch {
+    ($self:expr, |$block:ident| $body:expr) => {
+        match $self {
+            GloasBlockRef::Gloas($block) => $body,
+            GloasBlockRef::Heze($block) => $body,
+        }
+    };
+}
+
+impl<'a> GloasBlockRef<'a> {
+    pub fn fork_name(&self) -> ForkName {
+        match self {
+            GloasBlockRef::Gloas(_) => ForkName::Gloas,
+            GloasBlockRef::Heze(_) => ForkName::Heze,
+        }
+    }
+
+    pub fn slot(&self) -> Slot {
+        gloas_ref_dispatch!(self, |block| block.slot)
+    }
+
+    pub fn proposer_index(&self) -> ValidatorIndex {
+        gloas_ref_dispatch!(self, |block| block.proposer_index)
+    }
+
+    pub fn parent_root(&self) -> Root {
+        gloas_ref_dispatch!(self, |block| block.parent_root)
+    }
+
+    pub fn state_root(&self) -> Root {
+        gloas_ref_dispatch!(self, |block| block.state_root)
+    }
+
+    pub fn hash_tree_root(&self) -> Root {
+        gloas_ref_dispatch!(self, |block| block.hash_tree_root())
+    }
+
+    pub fn body_root(&self) -> Root {
+        gloas_ref_dispatch!(self, |block| block.body.hash_tree_root())
+    }
+
+    pub fn randao_reveal(&self) -> &'a BlsSignature {
+        gloas_ref_dispatch!(self, |block| &block.body.randao_reveal)
+    }
+
+    pub fn graffiti(&self) -> &'a Bytes32 {
+        gloas_ref_dispatch!(self, |block| &block.body.graffiti)
+    }
+
+    pub fn proposer_slashings(&self) -> &'a gloas::ProposerSlashings {
+        gloas_ref_dispatch!(self, |block| &block.body.proposer_slashings)
+    }
+
+    pub fn attester_slashings(&self) -> &'a gloas::AttesterSlashings {
+        gloas_ref_dispatch!(self, |block| &block.body.attester_slashings)
+    }
+
+    pub fn attestations(&self) -> &'a gloas::Attestations {
+        gloas_ref_dispatch!(self, |block| &block.body.attestations)
+    }
+
+    pub fn voluntary_exits(&self) -> &'a gloas::VoluntaryExits {
+        gloas_ref_dispatch!(self, |block| &block.body.voluntary_exits)
+    }
+
+    pub fn bls_to_execution_changes(&self) -> &'a gloas::BlsToExecutionChanges {
+        gloas_ref_dispatch!(self, |block| &block.body.bls_to_execution_changes)
+    }
+
+    pub fn payload_attestations(&self) -> &'a gloas::PayloadAttestations {
+        gloas_ref_dispatch!(self, |block| &block.body.payload_attestations)
+    }
+
+    pub fn sync_aggregate(&self) -> &'a altair::SyncAggregate {
+        gloas_ref_dispatch!(self, |block| &block.body.sync_aggregate)
+    }
+
+    pub fn signed_execution_payload_bid(&self) -> &'a gloas::SignedExecutionPayloadBid {
+        gloas_ref_dispatch!(self, |block| &block.body.signed_execution_payload_bid)
+    }
+
+    pub fn parent_execution_requests(&self) -> &'a gloas::ExecutionRequests {
+        gloas_ref_dispatch!(self, |block| &block.body.parent_execution_requests)
+    }
+
+    /// How many deposits the body carries: always zero at heze, whose body has
+    /// none (EIP-8015), and what the gossip rule bounds at gloas.
+    pub fn deposits_len(&self) -> usize {
+        match self {
+            GloasBlockRef::Gloas(block) => block.body.deposits.len(),
+            GloasBlockRef::Heze(_) => 0,
+        }
+    }
+}
+
+impl<'a> From<&'a gloas::BeaconBlock> for GloasBlockRef<'a> {
+    fn from(block: &'a gloas::BeaconBlock) -> Self {
+        GloasBlockRef::Gloas(block)
+    }
+}
+
+impl<'a> From<&'a heze::BeaconBlock> for GloasBlockRef<'a> {
+    fn from(block: &'a heze::BeaconBlock) -> Self {
+        GloasBlockRef::Heze(block)
+    }
+}
+
+impl SignedBeaconBlock {
+    /// The message of a gloas or heze block, or `None` for every other fork.
+    /// Panics on a lean block, like every beacon accessor here.
+    pub fn gloas_message(&self) -> Option<GloasBlockRef<'_>> {
+        match self {
+            SignedBeaconBlock::Gloas(block) => Some(GloasBlockRef::Gloas(&block.message)),
+            SignedBeaconBlock::Heze(block) => Some(GloasBlockRef::Heze(&block.message)),
+            SignedBeaconBlock::Phase0(_)
+            | SignedBeaconBlock::Altair(_)
+            | SignedBeaconBlock::Bellatrix(_)
+            | SignedBeaconBlock::Capella(_)
+            | SignedBeaconBlock::Deneb(_)
+            | SignedBeaconBlock::Electra(_)
+            | SignedBeaconBlock::Fulu(_) => None,
+            SignedBeaconBlock::Lean(_) => lean_block_unreachable("gloas_message"),
+        }
+    }
+}
+
+/// An unsigned gloas-family block, as a proposer builds one: gloas's or heze's.
+///
+/// Heze drops `eth1_data` and `deposits` from the body (EIP-8015), so the two
+/// forks' blocks are different containers. Block production, which runs the
+/// same code against either, holds the block in this enum until it is signed
+/// ([`Self::into_signed`]). The accessors cover the fields production, signing
+/// and the Beacon API read; a field only one fork has is not among them.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(untagged)]
+pub enum GloasBlock {
+    Gloas(gloas::BeaconBlock),
+    Heze(heze::BeaconBlock),
+}
+
+impl From<gloas::BeaconBlock> for GloasBlock {
+    fn from(block: gloas::BeaconBlock) -> Self {
+        GloasBlock::Gloas(block)
+    }
+}
+
+impl From<heze::BeaconBlock> for GloasBlock {
+    fn from(block: heze::BeaconBlock) -> Self {
+        GloasBlock::Heze(block)
+    }
+}
+
+macro_rules! gloas_block_dispatch {
+    ($self:expr, |$block:ident| $body:expr) => {
+        match $self {
+            GloasBlock::Gloas($block) => $body,
+            GloasBlock::Heze($block) => $body,
+        }
+    };
+}
+
+impl GloasBlock {
+    pub fn fork_name(&self) -> ForkName {
+        match self {
+            GloasBlock::Gloas(_) => ForkName::Gloas,
+            GloasBlock::Heze(_) => ForkName::Heze,
+        }
+    }
+
+    pub fn slot(&self) -> Slot {
+        gloas_block_dispatch!(self, |block| block.slot)
+    }
+
+    pub fn proposer_index(&self) -> ValidatorIndex {
+        gloas_block_dispatch!(self, |block| block.proposer_index)
+    }
+
+    pub fn parent_root(&self) -> Root {
+        gloas_block_dispatch!(self, |block| block.parent_root)
+    }
+
+    pub fn state_root(&self) -> Root {
+        gloas_block_dispatch!(self, |block| block.state_root)
+    }
+
+    pub fn set_state_root(&mut self, root: Root) {
+        gloas_block_dispatch!(self, |block| block.state_root = root)
+    }
+
+    pub fn hash_tree_root(&self) -> Root {
+        gloas_block_dispatch!(self, |block| block.hash_tree_root())
+    }
+
+    pub fn body_root(&self) -> Root {
+        gloas_block_dispatch!(self, |block| block.body.hash_tree_root())
+    }
+
+    pub fn to_ssz(&self) -> Vec<u8> {
+        gloas_block_dispatch!(self, |block| block.to_ssz())
+    }
+
+    /// Decodes a block of `fork`, which must be gloas or heze.
+    pub fn from_ssz(fork: ForkName, bytes: &[u8]) -> Result<Self> {
+        match fork {
+            ForkName::Gloas => {
+                let block = gloas::BeaconBlock::from_ssz_bytes(bytes)?;
+                expect_shape(
+                    fork,
+                    block.body.signed_execution_payload_bid.message.fork_name(),
+                )?;
+                Ok(GloasBlock::Gloas(block))
+            }
+            ForkName::Heze => {
+                let block = heze::BeaconBlock::from_ssz_bytes(bytes)?;
+                expect_shape(
+                    fork,
+                    block.body.signed_execution_payload_bid.message.fork_name(),
+                )?;
+                Ok(GloasBlock::Heze(block))
+            }
+            other => Err(Error::UnsupportedForFork {
+                function: "GloasBlock::from_ssz",
+                fork: other,
+            }),
+        }
+    }
+
+    pub fn as_ref(&self) -> GloasBlockRef<'_> {
+        match self {
+            GloasBlock::Gloas(block) => GloasBlockRef::Gloas(block),
+            GloasBlock::Heze(block) => GloasBlockRef::Heze(block),
+        }
+    }
+
+    pub fn randao_reveal(&self) -> &BlsSignature {
+        self.as_ref().randao_reveal()
+    }
+
+    pub fn graffiti(&self) -> &Bytes32 {
+        self.as_ref().graffiti()
+    }
+
+    pub fn attestations(&self) -> &gloas::Attestations {
+        self.as_ref().attestations()
+    }
+
+    pub fn payload_attestations(&self) -> &gloas::PayloadAttestations {
+        self.as_ref().payload_attestations()
+    }
+
+    pub fn sync_aggregate(&self) -> &altair::SyncAggregate {
+        self.as_ref().sync_aggregate()
+    }
+
+    pub fn signed_execution_payload_bid(&self) -> &gloas::SignedExecutionPayloadBid {
+        self.as_ref().signed_execution_payload_bid()
+    }
+
+    pub fn parent_execution_requests(&self) -> &gloas::ExecutionRequests {
+        self.as_ref().parent_execution_requests()
+    }
+
+    /// The signed block, in this block's own fork.
+    pub fn into_signed(self, signature: BlsSignature) -> SignedBeaconBlock {
+        match self {
+            GloasBlock::Gloas(message) => {
+                SignedBeaconBlock::Gloas(gloas::SignedBeaconBlock { message, signature })
+            }
+            GloasBlock::Heze(message) => {
+                SignedBeaconBlock::Heze(heze::SignedBeaconBlock { message, signature })
+            }
+        }
+    }
+}
+
 /// A data column sidecar in either shape: fulu's carries a signed header and
 /// an inclusion proof, gloas's names its block by root and reads its
 /// commitments from that block's bid.
@@ -1965,6 +2428,93 @@ mod tests {
     use crate::beacon::constants;
     use crate::beacon::preset;
     use crate::beacon::primitives::{ExecutionAddress, Uint256};
+
+    /// A heze state: the gloas one without the four eth1 fields EIP-8015
+    /// removes, its bid in heze's shape.
+    fn small_heze_state(count: usize) -> BeaconState {
+        let BeaconState::Gloas(gloas_state) = small_gloas_state(count) else {
+            unreachable!("built as gloas");
+        };
+        let mut state = heze::BeaconState::from(gloas_state);
+        state.latest_execution_payload_bid.inclusion_list_bits =
+            Some(heze::InclusionListBits::new());
+        BeaconState::Heze(state)
+    }
+
+    #[test]
+    fn a_heze_state_round_trips_in_its_own_shape_and_not_gloas() {
+        let state = small_heze_state(2);
+        assert_eq!(state.fork_name(), ForkName::Heze);
+
+        let bytes = state.to_ssz();
+        assert_eq!(
+            BeaconState::from_ssz(ForkName::Heze, &bytes).unwrap(),
+            state
+        );
+        // Decoded as gloas it is a different container: the fixed parts differ
+        // by the removed fields, so the offsets no longer line up.
+        assert!(BeaconState::from_ssz(ForkName::Gloas, &bytes).is_err());
+    }
+
+    #[test]
+    fn a_heze_state_has_no_eth1_fields() {
+        let state = small_heze_state(1);
+        let unsupported = |result: Result<()>| {
+            assert!(matches!(
+                result,
+                Err(Error::UnsupportedForFork {
+                    fork: ForkName::Heze,
+                    ..
+                })
+            ));
+        };
+        unsupported(state.eth1_data().map(|_| ()));
+        unsupported(state.eth1_data_votes().map(|_| ()));
+        unsupported(state.eth1_deposit_index().map(|_| ()));
+
+        let gloas = small_gloas_state(1);
+        assert!(gloas.eth1_data().is_ok());
+        assert!(gloas.eth1_deposit_index().is_ok());
+    }
+
+    #[test]
+    fn the_gloas_family_accessors_serve_both_forks_and_refuse_earlier_ones() {
+        assert!(small_gloas_state(1).builders().is_ok());
+        assert!(small_heze_state(1).builders().is_ok());
+        assert!(small_fulu_state(1).builders().is_err());
+    }
+
+    #[test]
+    fn a_heze_body_is_a_gloas_body_without_eth1_data_and_deposits() {
+        let mut gloas_body = gloas::BeaconBlockBody::empty_at(ForkName::Heze);
+        gloas_body.graffiti = Bytes32::repeat_byte(7);
+        let heze_body = heze::BeaconBlockBody::from(gloas_body.clone());
+        assert_eq!(heze_body.graffiti, gloas_body.graffiti);
+        // Different containers, so different roots: the gaps in the heze
+        // layout are part of what the root commits to.
+        assert_ne!(heze_body.hash_tree_root(), gloas_body.hash_tree_root());
+
+        let back = gloas::BeaconBlockBody::from(heze_body.clone());
+        assert_eq!(back.graffiti, gloas_body.graffiti);
+        assert!(back.deposits.is_empty());
+    }
+
+    #[test]
+    fn a_block_decoded_for_the_wrong_fork_is_refused() {
+        let block = SignedBeaconBlock::Heze(heze::SignedBeaconBlock {
+            message: heze::BeaconBlock {
+                body: heze::BeaconBlockBody::empty(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let bytes = block.to_ssz();
+        assert_eq!(
+            SignedBeaconBlock::from_ssz(ForkName::Heze, &bytes).unwrap(),
+            block
+        );
+        assert!(SignedBeaconBlock::from_ssz(ForkName::Gloas, &bytes).is_err());
+    }
 
     /// A Fulu state with `count` validators, each with a full effective
     /// balance and otherwise eligible, and every other field at an all-zero

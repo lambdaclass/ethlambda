@@ -129,7 +129,7 @@ pub fn initialize_beacon_state_from_eth1(
     for deposit in deposits {
         deposit_data_list.push(deposit.data.clone())?;
         let deposit_root = deposit_data_list.hash_tree_root();
-        state.eth1_data_mut().deposit_root = deposit_root;
+        state.eth1_data_mut()?.deposit_root = deposit_root;
         process_deposit(&mut state, deposit, config)?;
     }
 

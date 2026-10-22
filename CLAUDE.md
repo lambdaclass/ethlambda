@@ -867,16 +867,27 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   pinned release parses, `heze` included, and
   `fixture_forks/every_directory_is_accounted_for` fails on any fork directory
   that is neither parseable nor listed, so a new fork forces a decision.
-- **Heze** (EIP-7805, FOCIL) is gloas plus inclusion lists, and reuses gloas's
-  containers: the only field it adds is `inclusion_list_bits` on the bid,
-  which `containers::gloas::ExecutionPayloadBid` carries as an `Option`
-  (`None` gloas, `Some` heze) with hand-written SSZ (the two shapes differ in
-  the fixed part's length, which the first offset gives away) and
-  `ForkName::Heze` is read off the bid (`BeaconState::fork_name`,
-  `SignedBeaconBlock::fork_name`); `from_ssz(fork, ..)` checks the shape
-  against the fork it was asked for. A rule stated "from gloas on" asks
+- **Heze** (EIP-7805 FOCIL, EIP-8015) is gloas plus inclusion lists, without the
+  eth1 and deposit-index fields. It has its own containers in
+  `containers::heze` (`BeaconState`, `BeaconBlockBody`, `BeaconBlock`,
+  `SignedBeaconBlock`), progressive containers whose `active_fields` leave gaps
+  where EIP-8015 removed `eth1_data`, `deposits` and four state fields, so the
+  rest keep their generalized indices; `BeaconState::Heze` and
+  `SignedBeaconBlock::Heze` are the enum variants. The one thing it still
+  shares is the bid: `containers::gloas::ExecutionPayloadBid` carries
+  `inclusion_list_bits` as an `Option` (`None` gloas, `Some` heze) with
+  hand-written SSZ (the two shapes differ in the fixed part's length, which the
+  first offset gives away); `from_ssz(fork, ..)` checks the shape against the
+  fork it was asked for. Code that serves both forks reads gloas-family fields
+  through the `BeaconState` accessors (`builders()`, `ptc_window_mut()`, ...,
+  `UnsupportedForFork` before gloas), through the `gloas_family!` macro when it
+  needs several at once, and a block through `SignedBeaconBlock::gloas_message`
+  (`GloasBlockRef`) or, while a proposer builds one, `GloasBlock`. The eth1
+  accessors (`eth1_data()`, ...) answer `UnsupportedForFork` for heze. A rule stated "from gloas on" asks
   `ForkName::is_gloas_or_later`, never `== ForkName::Gloas`. `upgrade_to_heze`
-  sets the fork version and an empty `inclusion_list_bits`. The rest of heze:
+  asserts the eth1 bridge is retired, drops the four state fields, sets the fork
+  version and an empty `inclusion_list_bits`; heze's `process_epoch` and
+  `process_block` skip the eth1 steps. The rest of heze:
   the `InclusionListStore` pool on `Store` (`inclusion_list_store()`, in
   memory, 64 slots), `beacon::inclusion_list` (committee, signature,
   `on_inclusion_list`, committee state read from caches only),
@@ -1001,11 +1012,12 @@ behavior.
   in-memory map stays as a write-through cache in front of the table. Pruned
   on finalization to the same horizon as `LiveChain` (the finalized block's
   own slot, keeping that block's own entry).
-- `DB_VERSION` is 6: the unrealized-justifications table means a directory
+- `DB_VERSION` is 7: heze's own state and block containers (EIP-8015) mean a heze
+  row written by version 6 no longer decodes. (6 was the unrealized-justifications table: a directory
   written by an earlier version has no row there for any block it already
   imported, which would otherwise look identical to "no unrealized
   justification computed yet" rather than "this directory predates the
-  table". (5 was the gloas schedule, timing and churn keys in `Config`, which
+  table"; 5 was the gloas schedule, timing and churn keys in `Config`, which
   is SSZ-encoded under `KEY_CONFIG`; 4 was `PRESET_BASE`/`CONFIG_NAME` at the
   front of `Config`; 3 was the runtime keys a `config.yaml` supplies.)
   `Store::from_db_state` refuses any other version outright; there is no

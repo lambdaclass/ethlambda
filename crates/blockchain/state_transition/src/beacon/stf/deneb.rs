@@ -153,9 +153,9 @@ fn process_operations(
     active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     let outstanding = state
-        .eth1_data()
+        .eth1_data()?
         .deposit_count
-        .checked_sub(state.eth1_deposit_index())
+        .checked_sub(*state.eth1_deposit_index()?)
         .ok_or(Error::ArithmeticOverflow(
             "eth1_data.deposit_count - eth1_deposit_index",
         ))?;

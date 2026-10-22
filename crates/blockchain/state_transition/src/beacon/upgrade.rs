@@ -24,7 +24,7 @@ use crate::beacon::containers::{
     BeaconState, EpochParticipation, Fork, InactivityScores, altair, bellatrix, capella, deneb,
     electra, fulu, gloas, heze, phase0,
 };
-use crate::beacon::error::{Error, Result};
+use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::{CommitteeCache, get_current_epoch};
 use crate::beacon::helpers::attestation::get_attesting_indices;
@@ -985,28 +985,25 @@ fn requeue(
 /// recomputation. Finally, [`PendingValidatorIndex`] answers
 /// `is_pending_validator`'s own question without a rescan or a repeated
 /// signature check.
-fn onboard_builders_from_pending_deposits(
-    state: &mut gloas::BeaconState,
-    config: &Config,
-) -> Result<()> {
+fn onboard_builders_from_pending_deposits(state: &mut BeaconState, config: &Config) -> Result<()> {
     // Narrowed to the deposit queue's own pubkeys rather than every
     // validator: this only ever answers "is this pubkey already a
     // validator's" for a pubkey a deposit actually names, so it need not
     // hold more than `D` entries even when the registry itself holds `V`.
-    let deposit_pubkeys: HashSet<BlsPubkey> = state
-        .pending_deposits
-        .iter()
-        .map(|deposit| deposit.pubkey)
-        .collect();
+    let deposit_pubkeys: HashSet<BlsPubkey> =
+        crate::beacon::helpers::electra::pending_queue_fields(state, "onboard_builders")?
+            .pending_deposits()
+            .iter()
+            .map(|deposit| deposit.pubkey)
+            .collect();
     let validator_pubkeys: HashSet<BlsPubkey> = state
-        .validators
-        .iter()
+        .iter_validators()
         .map(|validator| validator.pubkey)
         .filter(|pubkey| deposit_pubkeys.contains(pubkey))
         .collect();
 
     let mut builder_indices: HashMap<BlsPubkey, gloas::BuilderIndex> = state
-        .builders
+        .builders()?
         .iter()
         .enumerate()
         .map(|(index, builder)| (builder.pubkey, index as gloas::BuilderIndex))
@@ -1020,7 +1017,9 @@ fn onboard_builders_from_pending_deposits(
     // and taking ownership here is what lets the loop body hold `state`
     // mutably (`add_builder_to_registry`, the balance top-up) without a
     // lingering borrow of one of its own fields.
-    for deposit in std::mem::take(&mut state.pending_deposits) {
+    let queued = crate::beacon::helpers::electra::pending_queue_fields(state, "onboard_builders")?
+        .take_pending_deposits();
+    for deposit in queued {
         if validator_pubkeys.contains(&deposit.pubkey) {
             requeue(&mut pending_deposits, &mut pending_index, deposit);
             continue;
@@ -1055,17 +1054,19 @@ fn onboard_builders_from_pending_deposits(
                     ExecutionAddress::from_slice(&deposit.withdrawal_credentials.0[12..]),
                     deposit.amount,
                     deposit.slot,
-                );
+                )?;
                 builder_indices.insert(deposit.pubkey, index);
             }
             Some(builder_index) => {
-                let len = state.builders.len();
-                let builder = state.builders.get_mut(builder_index as usize).ok_or(
-                    Error::IndexOutOfBounds {
-                        index: builder_index as usize,
-                        len,
-                    },
-                )?;
+                let builders = state.builders_mut()?;
+                let len = builders.len();
+                let builder =
+                    builders
+                        .get_mut(builder_index as usize)
+                        .ok_or(Error::IndexOutOfBounds {
+                            index: builder_index as usize,
+                            len,
+                        })?;
                 builder.balance = builder.balance.checked_add(deposit.amount).ok_or(
                     Error::ArithmeticOverflow(
                         "onboard_builders_from_pending_deposits: builder.balance + deposit.amount",
@@ -1075,7 +1076,8 @@ fn onboard_builders_from_pending_deposits(
         }
     }
 
-    state.pending_deposits = pending_deposits.into();
+    crate::beacon::helpers::electra::pending_queue_fields(state, "onboard_builders")?
+        .set_pending_deposits(pending_deposits)?;
     Ok(())
 }
 
@@ -1238,45 +1240,52 @@ pub fn upgrade_to_gloas(pre: &BeaconState, config: &Config) -> Result<BeaconStat
 
     // [New in Gloas:EIP7732]
     let ptc_window = initialize_ptc_window(&post)?;
-    crate::beacon::helpers::gloas::gloas_state(&mut post, "upgrade_to_gloas")?.ptc_window =
-        ptc_window;
+    *post.ptc_window_mut()? = ptc_window;
 
     // [New in Gloas:EIP7732]
-    onboard_builders_from_pending_deposits(
-        crate::beacon::helpers::gloas::gloas_state(&mut post, "upgrade_to_gloas")?,
-        config,
-    )?;
+    onboard_builders_from_pending_deposits(&mut post, config)?;
 
     Ok(post)
 }
 
-/// `upgrade_to_heze`: the gloas state with the heze fork version and an
-/// empty `inclusion_list_bits` on `latest_execution_payload_bid`.
+/// `upgrade_to_heze` (heze `fork.md`): the gloas state with the heze fork
+/// version, an empty `inclusion_list_bits` on `latest_execution_payload_bid`
+/// (EIP-7805), and without `eth1_data`, `eth1_data_votes`, `eth1_deposit_index`
+/// and `deposit_requests_start_index` (EIP-8015).
 ///
-/// Heze (EIP-7805) modifies no state field but that bid, whose container
-/// gains `inclusion_list_bits`; every other field carries over as is. The
-/// result stays a [`BeaconState::Gloas`]: one container serves both forks,
-/// and the bid's new field is what makes this state heze's (see
-/// `containers::gloas::ExecutionPayloadBid`).
+/// Every other field carries over as is, so the registry trees and the
+/// per-slot vectors move rather than being rebuilt. Asserts the old deposit
+/// mechanism has been disabled (`eth1_deposit_index == deposit_requests_start_index`):
+/// dropping the fields would otherwise strand deposits the eth1 bridge still owed.
 pub fn upgrade_to_heze(pre: &BeaconState, config: &Config) -> Result<BeaconState> {
-    let pre_fork = pre.fork_name();
-    if pre_fork != ForkName::Gloas {
+    let BeaconState::Gloas(pre) = pre else {
         return Err(Error::UnsupportedForFork {
             function: "upgrade_to_heze",
-            fork: pre_fork,
+            fork: pre.fork_name(),
         });
-    }
-    let mut post = pre.clone();
-    let state = crate::beacon::helpers::gloas::gloas_state(&mut post, "upgrade_to_heze")?;
-    state.fork = Fork {
-        previous_version: state.fork.current_version,
+    };
+    // [New in Heze:EIP8015]
+    // Check that the old deposit mechanism has been disabled.
+    verify(
+        pre.eth1_deposit_index == pre.deposit_requests_start_index,
+        "upgrade_to_heze: pre.eth1_deposit_index == pre.deposit_requests_start_index",
+    )?;
+
+    let epoch = compute_epoch_at_slot(pre.slot);
+    let fork = Fork {
+        previous_version: pre.fork.current_version,
         // [Modified in Heze]
         current_version: config.heze_fork_version,
-        epoch: compute_epoch_at_slot(state.slot),
+        epoch,
     };
     // [New in Heze:EIP7805]
-    state.latest_execution_payload_bid.inclusion_list_bits = Some(heze::InclusionListBits::new());
-    Ok(post)
+    let mut latest_execution_payload_bid = pre.latest_execution_payload_bid.clone();
+    latest_execution_payload_bid.inclusion_list_bits = Some(heze::InclusionListBits::new());
+
+    let mut post = heze::BeaconState::from(pre.clone());
+    post.fork = fork;
+    post.latest_execution_payload_bid = latest_execution_payload_bid;
+    Ok(BeaconState::Heze(post))
 }
 
 /// Applies the fork upgrade that produces `to`'s state shape from `state`.
@@ -1635,6 +1644,58 @@ mod tests {
     fn fulu_rejects_a_state_that_skipped_electra() {
         let (deneb_state, config) = advance_to(ForkName::Deneb, 4);
         assert!(upgrade_to_fulu(&deneb_state, &config).is_err());
+    }
+
+    /// A gloas state that satisfies heze's upgrade precondition: the eth1
+    /// bridge is retired, so the deposit index has met the requests' start index.
+    fn gloas_state_ready_for_heze() -> (BeaconState, Config) {
+        let config = Config::mainnet();
+        let mut state = crate::beacon::helpers::test_state::with_validators_at(ForkName::Gloas, 4);
+        let BeaconState::Gloas(inner) = &mut state else {
+            panic!("built as gloas");
+        };
+        inner.deposit_requests_start_index = inner.eth1_deposit_index;
+        (state, config)
+    }
+
+    #[test]
+    fn heze_drops_the_eth1_fields_and_keeps_everything_else() {
+        let (pre, config) = gloas_state_ready_for_heze();
+        let post = upgrade_to_heze(&pre, &config).expect("upgrade succeeds");
+        let BeaconState::Heze(post) = post else {
+            panic!("upgrade_to_heze returns a heze state");
+        };
+        let BeaconState::Gloas(pre) = pre else {
+            unreachable!("built as gloas");
+        };
+
+        assert_eq!(post.fork.current_version, config.heze_fork_version);
+        assert_eq!(post.fork.previous_version, pre.fork.current_version);
+        assert_eq!(post.slot, pre.slot);
+        assert_eq!(post.validators.len(), pre.validators.len());
+        assert_eq!(post.pending_deposits, pre.pending_deposits);
+        assert_eq!(post.ptc_window, pre.ptc_window);
+        assert_eq!(
+            post.latest_execution_payload_bid.inclusion_list_bits,
+            Some(heze::InclusionListBits::new())
+        );
+    }
+
+    #[test]
+    fn heze_refuses_a_state_whose_eth1_bridge_is_not_retired() {
+        let (mut pre, config) = gloas_state_ready_for_heze();
+        let BeaconState::Gloas(inner) = &mut pre else {
+            unreachable!("built as gloas");
+        };
+        inner.eth1_deposit_index = 3;
+        inner.deposit_requests_start_index = 7;
+        assert!(upgrade_to_heze(&pre, &config).is_err());
+    }
+
+    #[test]
+    fn heze_rejects_a_state_that_is_not_gloas() {
+        let (fulu_state, config) = advance_to(ForkName::Fulu, 4);
+        assert!(upgrade_to_heze(&fulu_state, &config).is_err());
     }
 
     #[test]

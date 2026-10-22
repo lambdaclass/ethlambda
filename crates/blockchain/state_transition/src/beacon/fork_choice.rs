@@ -571,6 +571,12 @@ pub fn block_operations(block: &SignedBeaconBlock) -> (Vec<Attestation>, Vec<Att
             Attestation::Gloas,
             AttesterSlashing::Gloas,
         ),
+        SignedBeaconBlock::Heze(block) => wrap_operations(
+            block.message.body.attestations.iter(),
+            block.message.body.attester_slashings.iter(),
+            Attestation::Gloas,
+            AttesterSlashing::Gloas,
+        ),
         SignedBeaconBlock::Lean(_) => lean_block_unreachable("fork_choice::block_operations"),
     }
 }
@@ -3155,10 +3161,13 @@ pub fn get_proposer_head(
 /// rule for that boundary (see the module documentation's "Gloas:
 /// payload-aware fork choice" section). A non-gloas block still reaching here
 /// is therefore a caller bug, reported by name rather than assumed away, the
-/// same projection `helpers::gloas::gloas_state_ref` gives a state.
+/// same projection `SignedBeaconBlock::gloas_message` gives a block.
 fn gloas_bid(block: &SignedBeaconBlock) -> Result<&gloas::ExecutionPayloadBid> {
     match block {
         SignedBeaconBlock::Gloas(inner) => {
+            Ok(&inner.message.body.signed_execution_payload_bid.message)
+        }
+        SignedBeaconBlock::Heze(inner) => {
             Ok(&inner.message.body.signed_execution_payload_bid.message)
         }
         other => Err(Error::UnsupportedForFork {
@@ -5093,6 +5102,7 @@ pub fn on_block(
         // imported, and its full payload branch stays unreachable, since
         // building on it requires `is_payload_verified` above.
         SignedBeaconBlock::Gloas(block) => Some(&block.message.body.payload_attestations),
+        SignedBeaconBlock::Heze(block) => Some(&block.message.body.payload_attestations),
         SignedBeaconBlock::Lean(_) => lean_block_unreachable("fork_choice::on_block"),
     };
 

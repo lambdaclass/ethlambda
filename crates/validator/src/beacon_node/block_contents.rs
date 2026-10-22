@@ -87,7 +87,7 @@
 
 use ethlambda_types::beacon::containers::deneb::Blob;
 use ethlambda_types::beacon::containers::electra::{BeaconBlock, SignedBeaconBlock};
-use ethlambda_types::beacon::containers::gloas;
+use ethlambda_types::beacon::containers::{GloasBlock, gloas, heze};
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::preset;
 use ethlambda_types::beacon::primitives::{BlsSignature, KzgProof};
@@ -158,13 +158,23 @@ pub struct FuluSignedBlockContents {
 /// block, the envelope revealing the self-built payload it commits to, and the
 /// blob material that goes out with the envelope. Not a consensus container; see
 /// the module doc.
-#[derive(Debug, Clone, PartialEq, SszEncode, SszDecode)]
-pub struct GloasBlockContents {
-    pub block: gloas::BeaconBlock,
-    pub execution_payload_envelope: gloas::ExecutionPayloadEnvelope,
-    pub kzg_proofs: CellKzgProofs,
-    pub blobs: Blobs,
+///
+/// One struct per fork whose block differs: heze's body drops `eth1_data` and
+/// `deposits` (EIP-8015).
+macro_rules! block_contents {
+    ($name:ident, $block:ty) => {
+        #[derive(Debug, Clone, PartialEq, SszEncode, SszDecode)]
+        pub struct $name {
+            pub block: $block,
+            pub execution_payload_envelope: gloas::ExecutionPayloadEnvelope,
+            pub kzg_proofs: CellKzgProofs,
+            pub blobs: Blobs,
+        }
+    };
 }
+
+block_contents!(GloasBlockContents, gloas::BeaconBlock);
+block_contents!(HezeBlockContents, heze::BeaconBlock);
 
 /// `publishExecutionPayloadEnvelope`'s body for gloas when the client supplies
 /// the blobs (`Eth-Blob-Data-Included: true`).
@@ -253,7 +263,7 @@ pub enum Contents {
     /// Gloas: a bare block, and the self-built payload's envelope when the
     /// node included it.
     Gloas {
-        block: gloas::BeaconBlock,
+        block: GloasBlock,
         payload: Option<Box<GloasPayload>>,
     },
 }
@@ -329,32 +339,80 @@ impl ProducedBlock {
     /// Decode a gloas `produceBlockV4` body. `payload_included` is the node's
     /// `Eth-Execution-Payload-Included`, which selects between
     /// [`GloasBlockContents`] and a bare block: SSZ carries no tag, so a wrong
-    /// guess would decode garbage or fail in a way that names neither.
-    pub fn from_gloas_ssz(payload_included: bool, bytes: &[u8]) -> crate::error::Result<Self> {
+    /// guess would decode garbage or fail in a way that names neither. `fork`
+    /// (the response's `Eth-Consensus-Version`) is gloas or heze and picks the
+    /// block's container.
+    pub fn from_gloas_ssz(
+        fork: ForkName,
+        payload_included: bool,
+        bytes: &[u8],
+    ) -> crate::error::Result<Self> {
         let decode = |what: &str, err: libssz::DecodeError| {
             Error::Decode(format!(
                 "produced gloas block: {what} did not decode: {err:?}"
             ))
         };
-        let (block, payload) = if payload_included {
-            let contents = GloasBlockContents::from_ssz_bytes(bytes)
-                .map_err(|err| decode("block contents", err))?;
-            (
-                contents.block,
-                Some(Box::new(GloasPayload {
-                    envelope: contents.execution_payload_envelope,
-                    kzg_proofs: contents.kzg_proofs,
-                    blobs: contents.blobs,
-                })),
-            )
-        } else {
-            let block = gloas::BeaconBlock::from_ssz_bytes(bytes)
-                .map_err(|err| decode("bare block", err))?;
-            (block, None)
+        if !matches!(fork, ForkName::Gloas | ForkName::Heze) {
+            return Err(Error::InconsistentResponse(format!(
+                "a gloas block was asked for under fork {}",
+                fork.as_str()
+            )));
+        }
+        let payload_of = |envelope, kzg_proofs, blobs| {
+            Some(Box::new(GloasPayload {
+                envelope,
+                kzg_proofs,
+                blobs,
+            }))
         };
-        // Heze's block is gloas's container with a heze-shaped bid, so the
-        // bid says which of the two forks this is.
-        let fork = block.body.signed_execution_payload_bid.message.fork_name();
+        let (block, payload) = match (fork, payload_included) {
+            (ForkName::Heze, true) => {
+                let contents = HezeBlockContents::from_ssz_bytes(bytes)
+                    .map_err(|err| decode("block contents", err))?;
+                (
+                    GloasBlock::Heze(contents.block),
+                    payload_of(
+                        contents.execution_payload_envelope,
+                        contents.kzg_proofs,
+                        contents.blobs,
+                    ),
+                )
+            }
+            (_, true) => {
+                let contents = GloasBlockContents::from_ssz_bytes(bytes)
+                    .map_err(|err| decode("block contents", err))?;
+                (
+                    GloasBlock::Gloas(contents.block),
+                    payload_of(
+                        contents.execution_payload_envelope,
+                        contents.kzg_proofs,
+                        contents.blobs,
+                    ),
+                )
+            }
+            (ForkName::Heze, false) => (
+                GloasBlock::Heze(
+                    heze::BeaconBlock::from_ssz_bytes(bytes)
+                        .map_err(|err| decode("bare block", err))?,
+                ),
+                None,
+            ),
+            (_, false) => (
+                GloasBlock::Gloas(
+                    gloas::BeaconBlock::from_ssz_bytes(bytes)
+                        .map_err(|err| decode("bare block", err))?,
+                ),
+                None,
+            ),
+        };
+        // The bid's shape must be the fork's own: heze's carries
+        // `inclusion_list_bits`, gloas's does not.
+        if block.signed_execution_payload_bid().message.fork_name() != fork {
+            return Err(Error::InconsistentResponse(format!(
+                "the {} block's bid has the other fork's shape",
+                fork.as_str()
+            )));
+        }
         Ok(Self {
             fork,
             contents: Contents::Gloas { block, payload },
@@ -367,7 +425,7 @@ impl ProducedBlock {
             Contents::WithBlobProofs { block, .. } | Contents::WithCellProofs { block, .. } => {
                 block.slot
             }
-            Contents::Gloas { block, .. } => block.slot,
+            Contents::Gloas { block, .. } => block.slot(),
         }
     }
 
@@ -377,7 +435,7 @@ impl ProducedBlock {
             Contents::WithBlobProofs { block, .. } | Contents::WithCellProofs { block, .. } => {
                 block.proposer_index
             }
-            Contents::Gloas { block, .. } => block.proposer_index,
+            Contents::Gloas { block, .. } => block.proposer_index(),
         }
     }
 
@@ -401,11 +459,7 @@ impl ProducedBlock {
                 block.body.execution_payload.fee_recipient
             }
             Contents::Gloas { block, .. } => {
-                block
-                    .body
-                    .signed_execution_payload_bid
-                    .message
-                    .fee_recipient
+                block.signed_execution_payload_bid().message.fee_recipient
             }
         }
     }
@@ -414,13 +468,9 @@ impl ProducedBlock {
     /// sentinel means this client's own proposer key signs the envelope.
     pub fn builder_index(&self) -> Option<gloas::BuilderIndex> {
         match &self.contents {
-            Contents::Gloas { block, .. } => Some(
-                block
-                    .body
-                    .signed_execution_payload_bid
-                    .message
-                    .builder_index,
-            ),
+            Contents::Gloas { block, .. } => {
+                Some(block.signed_execution_payload_bid().message.builder_index)
+            }
             _ => None,
         }
     }
@@ -483,11 +533,7 @@ impl ProducedBlock {
             // Bare: the envelope and blobs are published on their own, after
             // this body, and are expected to have been taken out already by
             // `take_gloas_payload`.
-            Contents::Gloas { block, .. } => gloas::SignedBeaconBlock {
-                message: block,
-                signature,
-            }
-            .to_ssz(),
+            Contents::Gloas { block, .. } => block.into_signed(signature).to_ssz(),
         }
     }
 }
@@ -811,7 +857,8 @@ mod tests {
     #[test]
     fn a_gloas_block_with_its_payload_decodes_and_hands_the_payload_over() {
         let (bytes, root) = gloas_contents_bytes(u64::MAX, 3, 2);
-        let mut produced = ProducedBlock::from_gloas_ssz(true, &bytes).expect("decodes");
+        let mut produced =
+            ProducedBlock::from_gloas_ssz(ForkName::Gloas, true, &bytes).expect("decodes");
 
         assert_eq!(produced.fork, ForkName::Gloas);
         assert_eq!(produced.slot(), 77);
@@ -839,7 +886,8 @@ mod tests {
     #[test]
     fn a_bare_gloas_block_has_no_payload_to_hand_over() {
         let block = empty_gloas_block_for(78, 6, 1);
-        let mut produced = ProducedBlock::from_gloas_ssz(false, &block.to_ssz()).expect("decodes");
+        let mut produced = ProducedBlock::from_gloas_ssz(ForkName::Gloas, false, &block.to_ssz())
+            .expect("decodes");
         assert_eq!(produced.slot(), 78);
         assert_eq!(produced.blob_count(), 0);
         assert!(produced.take_gloas_payload().is_none());
@@ -850,8 +898,8 @@ mod tests {
     #[test]
     fn the_included_header_selects_the_container() {
         let (bytes, _) = gloas_contents_bytes(u64::MAX, 0, 0);
-        let err =
-            ProducedBlock::from_gloas_ssz(false, &bytes).expect_err("contents are not a block");
+        let err = ProducedBlock::from_gloas_ssz(ForkName::Gloas, false, &bytes)
+            .expect_err("contents are not a block");
         assert!(matches!(err, Error::Decode(_)), "got {err:?}");
     }
 
@@ -872,7 +920,8 @@ mod tests {
             .signed_execution_payload_bid
             .message
             .fee_recipient = ethlambda_types::beacon::primitives::H160([0xcd; 20]);
-        let produced = ProducedBlock::from_gloas_ssz(false, &block.to_ssz()).expect("decodes");
+        let produced = ProducedBlock::from_gloas_ssz(ForkName::Gloas, false, &block.to_ssz())
+            .expect("decodes");
         assert_eq!(
             produced.fee_recipient(),
             ethlambda_types::beacon::primitives::H160([0xcd; 20])
@@ -884,7 +933,8 @@ mod tests {
     #[test]
     fn the_envelope_contents_round_trip() {
         let (bytes, root) = gloas_contents_bytes(u64::MAX, 2, 1);
-        let mut produced = ProducedBlock::from_gloas_ssz(true, &bytes).expect("decodes");
+        let mut produced =
+            ProducedBlock::from_gloas_ssz(ForkName::Gloas, true, &bytes).expect("decodes");
         let payload = produced.take_gloas_payload().expect("payload");
         let signed = payload.into_signed_contents_ssz(BlsSignature([8; 96]));
         let decoded = SignedExecutionPayloadEnvelopeContents::from_ssz_bytes(&signed).expect("ok");

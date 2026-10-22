@@ -46,17 +46,10 @@ use crate::BlockChainServer;
 /// The bid a gloas block carries, or `None` for any other fork.
 pub(crate) fn bid_of(block: &SignedBeaconBlock) -> Option<&gloas::ExecutionPayloadBid> {
     match block {
-        SignedBeaconBlock::Gloas(inner) => {
-            Some(&inner.message.body.signed_execution_payload_bid.message)
-        }
-        SignedBeaconBlock::Phase0(_)
-        | SignedBeaconBlock::Altair(_)
-        | SignedBeaconBlock::Bellatrix(_)
-        | SignedBeaconBlock::Capella(_)
-        | SignedBeaconBlock::Deneb(_)
-        | SignedBeaconBlock::Electra(_)
-        | SignedBeaconBlock::Fulu(_)
-        | SignedBeaconBlock::Lean(_) => None,
+        SignedBeaconBlock::Lean(_) => None,
+        other => other
+            .gloas_message()
+            .map(|message| &message.signed_execution_payload_bid().message),
     }
 }
 

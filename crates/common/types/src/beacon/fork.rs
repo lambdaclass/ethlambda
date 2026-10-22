@@ -168,8 +168,8 @@ impl ForkName {
 
     /// Whether this is gloas or a later beacon fork.
     ///
-    /// Heze keeps gloas's containers and every gloas rule, adding inclusion
-    /// lists on top, so a rule the specification states "from gloas on" asks
+    /// Heze keeps every gloas rule, adding inclusion lists on top (and removing
+    /// the eth1 fields, EIP-8015), so a rule the specification states "from gloas on" asks
     /// this rather than comparing with [`ForkName::Gloas`], which would leave
     /// heze out. An explicit match for the reason
     /// [`Self::has_payload_envelopes`] gives.
