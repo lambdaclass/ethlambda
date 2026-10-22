@@ -35,9 +35,7 @@ use crate::beacon::primitives::{Epoch, HashTreeRoot as _};
 /// them; the one exception is [`process_historical_summaries_update`] in
 /// place of `super::process_historical_roots_update`.
 pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
-    super::altair::process_justification_and_finalization(state)?;
-    super::altair::process_inactivity_updates(state, config)?;
-    super::altair::process_rewards_and_penalties(state, config)?;
+    super::altair::process_participation_steps(state, config)?;
     super::registry::process_registry_updates(state, config)?;
     super::registry::process_slashings(state, config)?;
     super::process_eth1_data_reset(state)?;
