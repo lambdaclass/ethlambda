@@ -411,10 +411,67 @@ pub fn get_domain(state: &BeaconState, domain_type: DomainType, epoch: Option<Ep
     compute_domain(domain_type, fork_version, state.genesis_validators_root())
 }
 
+/// [`get_domain`] with the fork version read from `config`'s schedule at
+/// `epoch` rather than from `state.fork`.
+///
+/// For signatures checked against a state that has not been advanced to the
+/// message's epoch, which is what gossip and the Beacon API do: they read the
+/// voted block's post-state, or the head's. When a fork's first slots are
+/// empty, that state still carries the previous fork, so [`get_domain`] would
+/// answer with the previous fork's version and reject every correctly signed
+/// vote of the new fork until one of its blocks is imported. The state
+/// transition keeps [`get_domain`]: it advances the state to the slot first,
+/// and there the two agree.
+pub fn get_domain_from_schedule(
+    config: &Config,
+    state: &BeaconState,
+    domain_type: DomainType,
+    epoch: Epoch,
+) -> Domain {
+    let fork_version = config.fork_version(config.fork_at_epoch(epoch));
+    compute_domain(domain_type, fork_version, state.genesis_validators_root())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::beacon::containers::shared::Fork;
     use crate::beacon::helpers::test_state::with_validators;
+
+    /// An electra state one epoch before a fulu fork: the two readings agree
+    /// on electra's own epochs and part at fulu's first.
+    #[test]
+    fn the_schedule_names_the_new_fork_before_the_state_reaches_it() {
+        let fulu_epoch = 10;
+        let config = Config::mainnet()
+            .with_fork_epoch(ForkName::Electra, 0)
+            .with_fork_epoch(ForkName::Fulu, fulu_epoch);
+        let mut state =
+            crate::beacon::helpers::test_state::with_validators_at(ForkName::Electra, 4);
+        *state.slot_mut() = compute_start_slot_at_epoch(fulu_epoch) - 1;
+        *state.fork_mut() = Fork {
+            previous_version: config.deneb_fork_version,
+            current_version: config.electra_fork_version,
+            epoch: 0,
+        };
+        let domain = constants::DOMAIN_BEACON_ATTESTER;
+
+        let before = fulu_epoch - 1;
+        assert_eq!(
+            get_domain_from_schedule(&config, &state, domain, before),
+            get_domain(&state, domain, Some(before))
+        );
+        let expected = compute_domain(
+            domain,
+            config.fulu_fork_version,
+            state.genesis_validators_root(),
+        );
+        assert_eq!(
+            get_domain_from_schedule(&config, &state, domain, fulu_epoch),
+            expected
+        );
+        assert_ne!(get_domain(&state, domain, Some(fulu_epoch)), expected);
+    }
 
     #[test]
     fn previous_epoch_is_clamped_at_genesis() {
