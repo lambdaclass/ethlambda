@@ -257,10 +257,11 @@ jobs:
         preset: [mainnet, minimal]
     env:
       # Read by the Makefile, which declares this `?=` and so defers to the
-      # environment. A run reads its own preset's tree plus `general` and nothing
-      # else, so fetching the other preset's would be the largest single download
-      # in the workflow spent on files no case opens.
-      CONSENSUS_SPEC_TESTS_CONFIGS: general ${{ matrix.preset }}
+      # environment. A run reads its own preset's tree and nothing else, so
+      # fetching the other preset's would be the largest single download in the
+      # workflow spent on files no case opens. The preset-independent BLS/KZG
+      # vectors are a separate download (`make cryptography-specs`) below.
+      CONSENSUS_SPEC_TESTS_CONFIGS: ${{ matrix.preset }}
     steps:
       - uses: actions/checkout@v6
 
@@ -291,8 +292,8 @@ jobs:
       - name: Download the consensus spec test fixtures
         run: make consensus-spec-tests
 
-      - name: Download the gossip validation test fixtures
-        run: make consensus-spec-gossip-tests
+      - name: Download the BLS/KZG test vectors
+        run: make cryptography-specs
 
       - name: Run the Beacon Chain spec tests
         run: make test-beacon-${{ matrix.preset }}
