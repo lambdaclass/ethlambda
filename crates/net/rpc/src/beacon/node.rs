@@ -36,6 +36,19 @@ pub(crate) fn wall_slot(store: &Store) -> u64 {
     now_ms.saturating_sub(genesis_ms) / config.slot_duration_ms.max(1)
 }
 
+/// Whether the fork-choice head was imported on a payload the execution client
+/// has not validated: the Beacon API's "optimistically tracking head".
+///
+/// The head, not any root in the optimistic set. An unvalidated block on a
+/// branch fork choice did not pick says nothing about what this node would
+/// have a validator sign, and reporting it would have a validator client stand
+/// down while every answer it could get is sound.
+fn head_is_optimistic(store: &Store) -> bool {
+    store
+        .beacon_head()
+        .is_some_and(|(_slot, root)| store.is_beacon_optimistic(root))
+}
+
 async fn get_syncing(
     State(store): State<Store>,
     Extension(sync_status): Extension<SyncStatusController>,
@@ -49,18 +62,27 @@ async fn get_syncing(
             "head_slot": head_slot.to_string(),
             "sync_distance": sync_distance.to_string(),
             "is_syncing": sync_status.get() == SyncStatus::Syncing,
-            "is_optimistic": store.has_beacon_optimistic_roots(),
+            "is_optimistic": head_is_optimistic(&store),
             "el_offline": false,
         }
     }))
 }
 
-async fn get_health(Extension(sync_status): Extension<SyncStatusController>) -> Response {
-    // 206 while syncing, 200 once caught up. 503 would mean uninitialized, and
-    // a store that answers at all is initialized.
-    let status = match sync_status.get() {
-        SyncStatus::Syncing => StatusCode::PARTIAL_CONTENT,
-        _ => StatusCode::OK,
+async fn get_health(
+    State(store): State<Store>,
+    Extension(sync_status): Extension<SyncStatusController>,
+) -> Response {
+    // 206 while syncing or tracking an optimistic head, 200 otherwise: the
+    // Beacon API's 206 is "syncing, or its execution node is optimistic or
+    // offline, so data served may be incorrect". The offline half is not
+    // detected: nothing tracks the execution client's liveness, which is also
+    // why `/node/syncing` reports `el_offline` as false. 503 would mean
+    // uninitialized, and a store that answers at all is initialized.
+    let degraded = sync_status.get() == SyncStatus::Syncing || head_is_optimistic(&store);
+    let status = if degraded {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
     };
     status.into_response()
 }
@@ -100,14 +122,21 @@ mod tests {
 
     const ANCHOR_SLOT: u64 = 64;
 
-    async fn get_with(uri: &str, sync: SyncStatusController) -> axum::response::Response {
-        let fixture = beacon_fixture(ANCHOR_SLOT);
+    async fn get_from(
+        store: Store,
+        uri: &str,
+        sync: SyncStatusController,
+    ) -> axum::response::Response {
         let app = routes("ethlambda/test", "test-peer".to_string())
-            .with_state(fixture.store)
+            .with_state(store)
             .layer(Extension(sync));
         app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await
             .unwrap()
+    }
+
+    async fn get_with(uri: &str, sync: SyncStatusController) -> axum::response::Response {
+        get_from(beacon_fixture(ANCHOR_SLOT).store, uri, sync).await
     }
 
     async fn get(uri: &str) -> axum::response::Response {
@@ -138,6 +167,38 @@ mod tests {
         let syncing = SyncStatusController::new(SyncStatus::Syncing);
         let json = body_json(get_with("/eth/v1/node/syncing", syncing).await).await;
         assert_eq!(json["data"]["is_syncing"], true);
+    }
+
+    /// `is_optimistic` and the health code follow the head alone: an
+    /// unvalidated block on a branch fork choice did not pick is not
+    /// "optimistically tracking head".
+    #[tokio::test]
+    async fn only_an_optimistic_head_makes_the_node_optimistic() {
+        let fixture = beacon_fixture(ANCHOR_SLOT);
+        let mut store = fixture.store;
+        let report = |store: &Store| {
+            let store = store.clone();
+            async move {
+                let syncing = get_from(
+                    store.clone(),
+                    "/eth/v1/node/syncing",
+                    SyncStatusController::default(),
+                );
+                let json = body_json(syncing.await).await;
+                let health = get_from(store, "/eth/v1/node/health", Default::default()).await;
+                (json["data"]["is_optimistic"].clone(), health.status())
+            }
+        };
+
+        let side_branch = ethlambda_types::primitives::H256::repeat_byte(0x42);
+        store.insert_beacon_optimistic_root(side_branch, fixture.head_slot);
+        assert_eq!(report(&store).await, (false.into(), StatusCode::OK));
+
+        store.insert_beacon_optimistic_root(fixture.head_root, fixture.head_slot);
+        assert_eq!(
+            report(&store).await,
+            (true.into(), StatusCode::PARTIAL_CONTENT)
+        );
     }
 
     #[tokio::test]

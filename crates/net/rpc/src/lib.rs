@@ -192,8 +192,9 @@ pub struct BeaconApiHandles {
     /// Filled by the attestation pool endpoint and the aggregator subnets,
     /// read by the aggregate endpoint and block production.
     pub attestation_pool: SharedAttestationPool,
-    /// The execution client block production builds payloads with; `None`
-    /// makes it answer 503.
+    /// The execution client block production builds payloads with. `None`
+    /// makes block production, attestation data and aggregation answer 503:
+    /// with nothing validating payloads, none has a block it may vouch for.
     pub engine: Option<ethlambda_engine::EngineClient>,
     /// The chain-event bus `/eth/v1/events` streams from. Read only there:
     /// the chain actor is its only publisher, so no endpoint here writes to it.
@@ -467,6 +468,15 @@ pub(crate) mod test_utils {
             self.blocks.lock().unwrap().push(block);
             Ok(())
         }
+    }
+
+    /// A configured execution client, for endpoints that only ask whether a
+    /// node has one. Nothing listens at its endpoint, so a test that reaches
+    /// the network through it fails instead of passing by accident.
+    pub(crate) fn idle_engine() -> Option<ethlambda_engine::EngineClient> {
+        let secret = ethlambda_engine::JwtSecret::new([0; 32]);
+        let client = ethlambda_engine::EngineClient::new("http://127.0.0.1:9".into(), secret);
+        Some(client.expect("building a client opens no connection"))
     }
 
     /// A beacon store whose anchor, and so head, is `state`, under a block at
