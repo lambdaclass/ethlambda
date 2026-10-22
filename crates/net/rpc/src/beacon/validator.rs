@@ -14,6 +14,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use ethlambda_blockchain::{SyncStatusController, metrics::SyncStatus};
 use ethlambda_storage::Store;
 use ethlambda_types::{
     beacon::{
@@ -31,9 +32,10 @@ use serde::{Deserialize, Serialize};
 
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
-    fork_choice::checkpoint_state,
+    fork_choice::{checkpoint_state, get_current_store_epoch},
     gossip::attestation::compute_subnet_for_attestation,
     helpers::accessors::{CommitteeCacheExt as _, get_block_root_at_slot},
+    helpers::altair::compute_sync_committee_period,
 };
 
 use crate::beacon::ApiError;
@@ -45,9 +47,18 @@ pub(crate) fn routes() -> Router<Store> {
             get(get_proposer_duties),
         )
         .route(
+            "/eth/v2/validator/duties/proposer/{epoch}",
+            get(get_proposer_duties_v2),
+        )
+        .route(
             "/eth/v1/validator/duties/attester/{epoch}",
             post(post_attester_duties),
         )
+        .route(
+            "/eth/v1/validator/duties/sync/{epoch}",
+            post(post_sync_duties),
+        )
+        .route("/eth/v1/validator/liveness/{epoch}", post(post_liveness))
         .route(
             "/eth/v1/validator/attestation_data",
             get(get_attestation_data),
@@ -60,6 +71,189 @@ pub(crate) fn routes() -> Router<Store> {
             "/eth/v1/validator/prepare_beacon_proposer",
             post(post_prepare_beacon_proposer),
         )
+}
+
+#[derive(Debug, Serialize)]
+struct SyncDuty {
+    pubkey: BlsPubkey,
+    #[serde(with = "ethlambda_types::beacon::serde_helpers::quoted_or_bare")]
+    validator_index: ValidatorIndex,
+    /// Every position the validator holds in the committee, quoted. A
+    /// validator can hold more than one, since the committee is drawn with
+    /// replacement.
+    validator_sync_committee_indices: Vec<String>,
+}
+
+/// `POST /eth/v1/validator/duties/sync/{epoch}`.
+///
+/// Answered from the head state: its `current_sync_committee` for an epoch in
+/// the head's own sync committee period, its `next_sync_committee` for the
+/// period after, which is as far ahead as the Beacon API allows. An earlier
+/// period is refused rather than answered from a historical state, since a
+/// validator client only ever asks about the current and next period.
+///
+/// A requested validator that holds no seat is left out of `data`. The
+/// answer is `503` while the node is syncing: the head state's committees are
+/// not yet the chain's.
+async fn post_sync_duties(
+    Path(epoch): Path<String>,
+    State(store): State<Store>,
+    Extension(sync_status): Extension<SyncStatusController>,
+    Json(indices): Json<Vec<String>>,
+) -> Response {
+    if sync_status.get() == SyncStatus::Syncing {
+        return ApiError::ServiceUnavailable("the node is syncing").into_response();
+    }
+    match sync_duties(&store, &epoch, &indices) {
+        Ok(body) => crate::json_response(body),
+        Err(err) => err.into_response(),
+    }
+}
+
+fn sync_duties(
+    store: &Store,
+    epoch: &str,
+    indices: &[String],
+) -> Result<serde_json::Value, ApiError> {
+    let epoch = parse_epoch(epoch)?;
+    let indices = indices
+        .iter()
+        .map(|index| index.parse::<ValidatorIndex>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ApiError::BadRequest("invalid validator index"))?;
+    let (head_root, state) = head(store)?;
+
+    let (current, next) = state
+        .sync_committees()
+        .map_err(|_| ApiError::BadRequest("sync committees start at altair"))?;
+    let head_period = compute_sync_committee_period(compute_epoch_at_slot(state.slot()));
+    let requested_period = compute_sync_committee_period(epoch);
+    let committee = if requested_period == head_period {
+        current
+    } else if requested_period == head_period + 1 {
+        next
+    } else {
+        return Err(ApiError::BadRequest(
+            "epoch is not in the head state's current or next sync committee period",
+        ));
+    };
+
+    // One pass over the committee rather than one per requested validator:
+    // the committee stores pubkeys, so that is what a validator is matched by.
+    let mut positions: HashMap<BlsPubkey, Vec<String>> = HashMap::new();
+    for (position, pubkey) in committee.pubkeys.iter().enumerate() {
+        positions
+            .entry(*pubkey)
+            .or_default()
+            .push(position.to_string());
+    }
+
+    let mut duties = Vec::new();
+    for validator_index in indices {
+        let validator = state
+            .validator(validator_index)
+            .map_err(|_| ApiError::BadRequest("unknown validator index"))?;
+        if let Some(held) = positions.get(&validator.pubkey) {
+            duties.push(SyncDuty {
+                pubkey: validator.pubkey,
+                validator_index,
+                validator_sync_committee_indices: held.clone(),
+            });
+        }
+    }
+
+    Ok(serde_json::json!({
+        "execution_optimistic": store.is_beacon_optimistic(head_root),
+        "data": duties,
+    }))
+}
+
+#[derive(Debug, Serialize)]
+struct Liveness {
+    #[serde(with = "ethlambda_types::beacon::serde_helpers::quoted_or_bare")]
+    index: ValidatorIndex,
+    is_live: bool,
+}
+
+/// `POST /eth/v1/validator/liveness/{epoch}`: whether this node saw each
+/// validator act in `epoch`, which is what a validator client's doppelganger
+/// protection asks before it signs anything.
+///
+/// The Beacon API leaves the source to the node's own view. A validator is
+/// live if either:
+/// - the head state credits it for `epoch` (a non-zero participation byte),
+///   which covers everything already included on chain; or
+/// - the node observed it act in `epoch`: an accepted gossip aggregate or
+///   subnet attestation, an imported block's proposer, or a submission
+///   through this API. That covers what no block has included yet, most of
+///   the current epoch. See [`ethlambda_storage::ObservedLiveness`].
+///
+/// Answered for the store clock's previous, current and next epoch; the next
+/// one is always `false`, and is accepted because a doppelganger check made
+/// at an epoch boundary can land on it. Anything else, and an index outside
+/// the head state's registry, is a `400`; the node syncing is a `503`.
+async fn post_liveness(
+    Path(epoch): Path<String>,
+    State(store): State<Store>,
+    Extension(sync_status): Extension<SyncStatusController>,
+    Json(indices): Json<Vec<String>>,
+) -> Response {
+    if sync_status.get() == SyncStatus::Syncing {
+        return ApiError::ServiceUnavailable("the node is syncing").into_response();
+    }
+    match liveness(&store, &epoch, &indices) {
+        Ok(body) => crate::json_response(body),
+        Err(err) => err.into_response(),
+    }
+}
+
+fn liveness(store: &Store, epoch: &str, indices: &[String]) -> Result<serde_json::Value, ApiError> {
+    let epoch = parse_epoch(epoch)?;
+    let indices = indices
+        .iter()
+        .map(|index| index.parse::<ValidatorIndex>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ApiError::BadRequest("invalid validator index"))?;
+
+    let current = get_current_store_epoch(store, &store.config());
+    if epoch + 1 < current || epoch > current + 1 {
+        return Err(ApiError::BadRequest(
+            "epoch is not the previous, current or next epoch",
+        ));
+    }
+
+    let (_head_root, state) = head(store)?;
+    let state_epoch = compute_epoch_at_slot(state.slot());
+    // The head state's flags for `epoch`, if it keeps them: its own epoch's
+    // and the one before. `None` before altair, which keeps no flags.
+    let participation = state
+        .altair_validator_lists()
+        .ok()
+        .and_then(|(previous, current, _)| {
+            if epoch == state_epoch {
+                Some(current)
+            } else if epoch + 1 == state_epoch {
+                Some(previous)
+            } else {
+                None
+            }
+        });
+
+    let observed = store.observed_liveness();
+    let mut data = Vec::with_capacity(indices.len());
+    for index in indices {
+        state
+            .validator(index)
+            .map_err(|_| ApiError::BadRequest("unknown validator index"))?;
+        let credited = participation
+            .and_then(|flags| flags.get(index as usize))
+            .is_some_and(|flags| *flags != 0);
+        data.push(Liveness {
+            index,
+            is_live: credited || observed.is_live(epoch, index),
+        });
+    }
+    Ok(serde_json::json!({ "data": data }))
 }
 
 /// One entry of `beacon_committee_subscriptions`. Parsed so a malformed body
@@ -198,13 +392,62 @@ struct ProposerDuty {
 /// `compute_start_slot_at_epoch(epoch) - 1` (the genesis block's at epoch 0).
 /// It is what `ethlambda validator` compares across fetches to notice a reorg.
 async fn get_proposer_duties(Path(epoch): Path<String>, State(store): State<Store>) -> Response {
-    match proposer_duties(&store, &epoch) {
+    match proposer_duties(&store, &epoch, DependentRoot::V1) {
         Ok(body) => crate::json_response(body),
         Err(err) => err.into_response(),
     }
 }
 
-fn proposer_duties(store: &Store, epoch: &str) -> Result<serde_json::Value, ApiError> {
+/// `GET /eth/v2/validator/duties/proposer/{epoch}`: the same duties as v1,
+/// with v2's `dependent_root`.
+///
+/// Fulu fixes an epoch's proposers one epoch ahead (EIP-7917's lookahead), so
+/// they depend on the chain as of the end of epoch `epoch - 2`, not
+/// `epoch - 1` as v1 has it. A validator client that compares v1's root
+/// across fetches sees a spurious reorg every epoch; Lighthouse asks for v2
+/// by default and does not fall back to v1. `503` while syncing, as the
+/// Beacon API lists.
+async fn get_proposer_duties_v2(
+    Path(epoch): Path<String>,
+    State(store): State<Store>,
+    Extension(sync_status): Extension<SyncStatusController>,
+) -> Response {
+    if sync_status.get() == SyncStatus::Syncing {
+        return ApiError::ServiceUnavailable("the node is syncing").into_response();
+    }
+    match proposer_duties(&store, &epoch, DependentRoot::V2) {
+        Ok(body) => crate::json_response(body),
+        Err(err) => err.into_response(),
+    }
+}
+
+/// Which definition of a proposer duty's `dependent_root` to answer with.
+#[derive(Debug, Clone, Copy)]
+enum DependentRoot {
+    /// `get_block_root_at_slot(state, compute_start_slot_at_epoch(epoch) - 1)`.
+    V1,
+    /// `get_block_root_at_slot(state, compute_start_slot_at_epoch(epoch - 1) - 1)`.
+    V2,
+}
+
+impl DependentRoot {
+    /// The slot whose block root this definition names for `epoch`. Either
+    /// definition names the genesis block where its subtraction would
+    /// underflow, which is slot 0.
+    fn slot(self, epoch: Epoch) -> Slot {
+        let epoch = match self {
+            Self::V1 => epoch,
+            Self::V2 => epoch.saturating_sub(1),
+        };
+        compute_start_slot_at_epoch(epoch).saturating_sub(1)
+    }
+}
+
+fn proposer_duties(
+    store: &Store,
+    epoch: &str,
+    dependent: DependentRoot,
+) -> Result<serde_json::Value, ApiError> {
     let epoch = parse_epoch(epoch)?;
     let (head_root, state) = head(store)?;
 
@@ -239,7 +482,7 @@ fn proposer_duties(store: &Store, epoch: &str) -> Result<serde_json::Value, ApiE
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
 
-    let dependent_root = block_root_at_or_before(&state, head_root, first_slot.saturating_sub(1))?;
+    let dependent_root = block_root_at_or_before(&state, head_root, dependent.slot(epoch))?;
     Ok(serde_json::json!({
         "dependent_root": dependent_root,
         "execution_optimistic": store.is_beacon_optimistic(head_root),
@@ -507,6 +750,76 @@ mod tests {
         let before = compute_start_slot_at_epoch(state_epoch) - 1;
         let expected = get_block_root_at_slot(&state, before).unwrap();
         assert_eq!(json["dependent_root"], format!("{expected}"));
+    }
+
+    async fn get_v2(
+        state: BeaconState,
+        epoch: u64,
+        sync_status: SyncStatusController,
+    ) -> (StatusCode, serde_json::Value) {
+        let (store, _root) = beacon_store_at(state);
+        let request = Request::get(format!("/eth/v2/validator/duties/proposer/{epoch}"))
+            .body(Body::empty())
+            .unwrap();
+        let app = routes().with_state(store).layer(Extension(sync_status));
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&body).unwrap_or_default())
+    }
+
+    /// v2 changes only the dependent root: the duties are the same ones.
+    #[tokio::test]
+    async fn v2_proposer_duties_are_v1_s() {
+        let state = fulu_state();
+        let state_epoch = compute_epoch_at_slot(state.slot());
+        for epoch in [state_epoch, state_epoch + 1] {
+            let (_, v1) = get(
+                state.clone(),
+                &format!("/eth/v1/validator/duties/proposer/{epoch}"),
+            )
+            .await;
+            let (status, v2) = get_v2(state.clone(), epoch, Default::default()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(v2["data"], v1["data"], "epoch {epoch}");
+        }
+    }
+
+    /// v2's root is the block before the *previous* epoch: for the head's next
+    /// epoch that is the block before the head's own epoch, v1's root for the
+    /// head's epoch.
+    #[tokio::test]
+    async fn the_v2_dependent_root_is_the_block_before_the_previous_epoch() {
+        let state = fulu_state();
+        let next = compute_epoch_at_slot(state.slot()) + 1;
+        let (_, json) = get_v2(state.clone(), next, Default::default()).await;
+        let before = compute_start_slot_at_epoch(next - 1) - 1;
+        let expected = get_block_root_at_slot(&state, before).unwrap();
+        assert_eq!(json["dependent_root"], format!("{expected}"));
+    }
+
+    /// `compute_start_slot_at_epoch(epoch - 1) - 1` underflows for epochs 0
+    /// and 1, where the spec names the genesis block instead.
+    #[tokio::test]
+    async fn the_v2_dependent_root_is_genesis_where_it_would_underflow() {
+        let state = fulu_state();
+        assert_eq!(
+            compute_epoch_at_slot(state.slot()),
+            1,
+            "the fixture's epoch"
+        );
+        let (_, json) = get_v2(state.clone(), 1, Default::default()).await;
+        let genesis = get_block_root_at_slot(&state, 0).unwrap();
+        assert_eq!(json["dependent_root"], format!("{genesis}"));
+    }
+
+    #[tokio::test]
+    async fn v2_proposer_duties_answer_503_while_syncing() {
+        let state = fulu_state();
+        let epoch = compute_epoch_at_slot(state.slot());
+        let syncing = SyncStatusController::new(SyncStatus::Syncing);
+        let (status, _) = get_v2(state, epoch, syncing).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -809,5 +1122,273 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // --- duties/sync -----------------------------------------------------
+
+    mod sync_duties {
+        use super::*;
+        use ethlambda_types::beacon::containers::altair::SyncCommittee;
+
+        /// A committee whose seat `i` belongs to validator `first + i % 8`, so
+        /// each of those eight holds `SYNC_COMMITTEE_SIZE / 8` seats and every
+        /// other validator holds none.
+        fn committee_of(state: &BeaconState, first: u64) -> SyncCommittee {
+            let pubkeys: Vec<BlsPubkey> = (0..preset::SYNC_COMMITTEE_SIZE as u64)
+                .map(|seat| state.validator(first + seat % 8).unwrap().pubkey)
+                .collect();
+            SyncCommittee {
+                aggregate_pubkey: pubkeys[0],
+                pubkeys: pubkeys.try_into().unwrap(),
+            }
+        }
+
+        /// A fulu state whose current committee is validators 0-7 and whose
+        /// next committee is validators 8-15, so an answer drawn from the
+        /// wrong one shows up.
+        fn state_with_committees() -> BeaconState {
+            let mut state = fulu_state();
+            let current = committee_of(&state, 0);
+            let next = committee_of(&state, 8);
+            let BeaconState::Fulu(fulu) = &mut state else {
+                unreachable!("built as fulu")
+            };
+            fulu.current_sync_committee = current;
+            fulu.next_sync_committee = next;
+            state
+        }
+
+        async fn post_sync(
+            state: BeaconState,
+            epoch: u64,
+            indices: &[&str],
+            sync_status: SyncStatusController,
+        ) -> (StatusCode, serde_json::Value) {
+            let (store, _root) = beacon_store_at(state);
+            let request = Request::post(format!("/eth/v1/validator/duties/sync/{epoch}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!(indices).to_string()))
+                .unwrap();
+            let app = routes().with_state(store).layer(Extension(sync_status));
+            let response = app.oneshot(request).await.unwrap();
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            (status, serde_json::from_slice(&body).unwrap_or_default())
+        }
+
+        /// The seats `validator` holds in [`committee_of`]`(_, first)`.
+        fn seats(validator: u64, first: u64) -> Vec<String> {
+            (0..preset::SYNC_COMMITTEE_SIZE as u64)
+                .filter(|seat| first + seat % 8 == validator)
+                .map(|seat| seat.to_string())
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn the_current_period_reads_the_current_committee() {
+            let state = state_with_committees();
+            let epoch = compute_epoch_at_slot(state.slot());
+            let (status, json) =
+                post_sync(state.clone(), epoch, &["3", "9", "20"], Default::default()).await;
+            assert_eq!(status, StatusCode::OK);
+
+            // Validator 3 sits in the current committee; 9 only in the next;
+            // 20 in neither, so only 3 is listed.
+            let duties = json["data"].as_array().unwrap();
+            assert_eq!(duties.len(), 1);
+            assert_eq!(duties[0]["validator_index"], "3");
+            let pubkey = state.validator(3).unwrap().pubkey;
+            assert_eq!(duties[0]["pubkey"], format!("0x{}", hex::encode(pubkey.0)));
+            assert_eq!(
+                duties[0]["validator_sync_committee_indices"],
+                serde_json::json!(seats(3, 0))
+            );
+            assert!(json["execution_optimistic"].is_boolean());
+        }
+
+        #[tokio::test]
+        async fn the_next_period_reads_the_next_committee() {
+            let state = state_with_committees();
+            let next_period_epoch = preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD
+                * (compute_sync_committee_period(compute_epoch_at_slot(state.slot())) + 1);
+            let (status, json) =
+                post_sync(state, next_period_epoch, &["3", "9"], Default::default()).await;
+            assert_eq!(status, StatusCode::OK);
+
+            let duties = json["data"].as_array().unwrap();
+            assert_eq!(duties.len(), 1);
+            assert_eq!(duties[0]["validator_index"], "9");
+            assert_eq!(
+                duties[0]["validator_sync_committee_indices"],
+                serde_json::json!(seats(9, 8))
+            );
+        }
+
+        #[tokio::test]
+        async fn the_period_after_next_is_a_400() {
+            let state = state_with_committees();
+            let period = compute_sync_committee_period(compute_epoch_at_slot(state.slot()));
+            let epoch = preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD * (period + 2);
+            let (status, _) = post_sync(state, epoch, &["3"], Default::default()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+
+        /// An earlier period would need a historical state, which a validator
+        /// client never asks for; refused rather than answered wrongly.
+        #[tokio::test]
+        async fn an_earlier_period_is_a_400() {
+            let mut state = state_with_committees();
+            let BeaconState::Fulu(fulu) = &mut state else {
+                unreachable!("built as fulu")
+            };
+            fulu.slot = preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD * preset::SLOTS_PER_EPOCH;
+            let (status, _) = post_sync(state, 0, &["3"], Default::default()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn an_unknown_validator_is_a_400() {
+            let state = state_with_committees();
+            let epoch = compute_epoch_at_slot(state.slot());
+            let unknown = (COUNT as u64).to_string();
+            let (status, _) = post_sync(state, epoch, &[&unknown], Default::default()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn a_syncing_node_answers_503() {
+            let state = state_with_committees();
+            let epoch = compute_epoch_at_slot(state.slot());
+            let syncing = SyncStatusController::new(SyncStatus::Syncing);
+            let (status, _) = post_sync(state, epoch, &["3"], syncing).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        }
+    }
+
+    // --- liveness --------------------------------------------------------
+
+    mod liveness {
+        use super::*;
+
+        /// The epoch every test's state and store clock sit in: far enough
+        /// from genesis that the epoch two before it exists.
+        const EPOCH: u64 = 5;
+
+        /// A fulu state at [`EPOCH`]'s first slot in which validator 2 is
+        /// credited for this epoch and validator 3 for the previous one.
+        fn credited_state() -> BeaconState {
+            let mut state = fulu_state();
+            let BeaconState::Fulu(fulu) = &mut state else {
+                unreachable!("built as fulu")
+            };
+            fulu.slot = compute_start_slot_at_epoch(EPOCH);
+            fulu.current_epoch_participation[2] = 0b001;
+            fulu.previous_epoch_participation[3] = 0b111;
+            state
+        }
+
+        /// `state`'s store, its clock moved to `state`'s slot, as the chain
+        /// actor's tick keeps it.
+        fn store_for(state: BeaconState) -> Store {
+            let slot = state.slot();
+            let (mut store, _root) = beacon_store_at(state);
+            let config = store.config();
+            let now = config.genesis_time_ms() + slot * config.slot_duration_ms;
+            store.set_time_ms(now).unwrap();
+            store
+        }
+
+        async fn post_liveness(
+            store: Store,
+            epoch: u64,
+            indices: &[&str],
+            sync_status: SyncStatusController,
+        ) -> (StatusCode, serde_json::Value) {
+            let request = Request::post(format!("/eth/v1/validator/liveness/{epoch}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!(indices).to_string()))
+                .unwrap();
+            let app = routes().with_state(store).layer(Extension(sync_status));
+            let response = app.oneshot(request).await.unwrap();
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            (status, serde_json::from_slice(&body).unwrap_or_default())
+        }
+
+        /// `(index, is_live)` pairs, in the order answered.
+        fn answers(json: &serde_json::Value) -> Vec<(String, bool)> {
+            json["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| {
+                    (
+                        entry["index"].as_str().unwrap().to_owned(),
+                        entry["is_live"].as_bool().unwrap(),
+                    )
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn a_participation_flag_makes_a_validator_live() {
+            let store = store_for(credited_state());
+            let (status, json) =
+                post_liveness(store.clone(), EPOCH, &["2", "3"], Default::default()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                answers(&json),
+                [("2".into(), true), ("3".into(), false)],
+                "2 is credited for this epoch, 3 only for the previous one"
+            );
+
+            let (_, json) = post_liveness(store, EPOCH - 1, &["2", "3"], Default::default()).await;
+            assert_eq!(answers(&json), [("2".into(), false), ("3".into(), true)]);
+        }
+
+        /// What no block has included yet: a validator the node saw act is
+        /// live without any flag.
+        #[tokio::test]
+        async fn an_observed_validator_is_live_without_a_flag() {
+            let store = store_for(credited_state());
+            store.observed_liveness().record(EPOCH, 9);
+            let (status, json) =
+                post_liveness(store, EPOCH, &["9", "10"], Default::default()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(answers(&json), [("9".into(), true), ("10".into(), false)]);
+        }
+
+        #[tokio::test]
+        async fn the_next_epoch_is_answered_and_nobody_is_live_in_it() {
+            let store = store_for(credited_state());
+            let (status, json) = post_liveness(store, EPOCH + 1, &["2"], Default::default()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(answers(&json), [("2".into(), false)]);
+        }
+
+        #[tokio::test]
+        async fn epochs_outside_the_window_are_a_400() {
+            for epoch in [EPOCH - 2, EPOCH + 2] {
+                let store = store_for(credited_state());
+                let (status, _) = post_liveness(store, epoch, &["2"], Default::default()).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "epoch {epoch}");
+            }
+        }
+
+        #[tokio::test]
+        async fn an_unknown_validator_is_a_400() {
+            let store = store_for(credited_state());
+            let unknown = (COUNT as u64).to_string();
+            let (status, _) = post_liveness(store, EPOCH, &[&unknown], Default::default()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn a_syncing_node_answers_503() {
+            let store = store_for(credited_state());
+            let syncing = SyncStatusController::new(SyncStatus::Syncing);
+            let (status, _) = post_liveness(store, EPOCH, &["2"], syncing).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        }
     }
 }
