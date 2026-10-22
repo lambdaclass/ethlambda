@@ -186,11 +186,11 @@ pub(super) fn next_inactivity_score(
 /// [`constants::PARTICIPATION_FLAG_WEIGHTS`]) plus the same kind of inactivity
 /// penalty, computed from [`crate::beacon::helpers::altair::get_inactivity_penalty_deltas`]
 /// against the scores [`process_inactivity_updates`] just brought up to date.
-/// Applying rewards and penalties as two separate passes (through
-/// [`increase_balance`] and [`decrease_balance`], not one netted delta) is
-/// unchanged from phase0, and for the same reason: [`decrease_balance`] floors
-/// at zero, so netting first would let a reward mask a penalty that should
-/// have driven a low balance all the way down.
+/// Rewards and penalties are applied as separate saturating steps, in spec
+/// order (see [`crate::beacon::helpers::mutators::apply_balance_deltas`]), not
+/// as one netted delta: that is unchanged from phase0, and for the same reason:
+/// a penalty floors at zero, so netting first would let a reward mask a penalty
+/// that should have driven a low balance all the way down.
 ///
 /// Skipped entirely at the genesis epoch: rewards pay for participation
 /// recorded during the previous epoch, and genesis has none.
@@ -255,13 +255,18 @@ fn apply_rewards_and_penalties(
         return Err(Error::UnknownValidator(balances.len() as ValidatorIndex));
     }
 
-    let balances = state.balances_mut();
-    for (index, updated) in changes {
-        *balances
-            .get_mut(index)
-            .ok_or(Error::UnknownValidator(index as ValidatorIndex))? = updated;
-    }
-    Ok(())
+    // The changes are in index order, so one cursor pass applies them: nothing
+    // is buffered per change, and the leaves it does not touch keep their hash.
+    let mut changes = changes.into_iter().peekable();
+    state.balances_mut().try_update_each(|balance| {
+        if let Some(&(index, updated)) = changes.peek()
+            && index == balance.index()
+        {
+            balance.set(updated);
+            changes.next();
+        }
+        Ok::<(), Error>(())
+    })
 }
 
 /// Steps 1-3 of every altair-through-fulu epoch, over one registry scan.
@@ -399,7 +404,7 @@ mod tests {
     use super::*;
     use crate::beacon::fork::ForkName;
     use crate::beacon::helpers::altair::add_flag;
-    use crate::beacon::primitives::BlsPubkey;
+    use crate::beacon::primitives::{BlsPubkey, ValidatorIndex};
 
     /// A deterministic but genuinely valid BLS public key for validator
     /// `index`.

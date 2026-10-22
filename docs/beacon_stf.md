@@ -279,6 +279,21 @@ lists lighthouse keeps its state in.
   writes pending is still correct but computed on a throwaway copy, and the
   store flushes a state before caching it, since a shared `Arc` cannot be
   flushed later.
+- **A pass that writes most of a list uses the write cursor instead.**
+  `List::iter_cow` (and `try_update_each`, its closure form) walks the list in
+  order and copies a leaf only when a write in it changes something, comparing
+  against the original at the leaf's end and keeping the original leaf, its
+  `Arc` and its hash if nothing differs. Nothing goes through the buffer, so a
+  full sweep avoids a map entry and a sorted copy per element. The changed leaves are swapped into the tree
+  when the cursor is dropped, which rebuilds only the paths to them; a changed
+  composite element's root is computed then, on the state-transition thread. Writes pending
+  when the pass starts are applied first. `BeaconState::registry_mut` hands out
+  `validators` and `balances` as disjoint borrows, so a pass can write one while
+  reading the other. The balance application of `process_rewards_and_penalties`
+  and both `process_effective_balance_updates` run this way: they move
+  together, since once the rewards write bypasses the buffer, the effective
+  balance pass would otherwise pay a tree descent per `balances()[i]` instead of a
+  buffer hit.
 
 The access pattern matters. `state.validator(i)` and `balances()[i]` are tree
 descents, cheap next to a hash but far from an array index, and they add up

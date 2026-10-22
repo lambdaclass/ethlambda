@@ -30,7 +30,7 @@ mod single_pass;
 mod single_pass_equivalence;
 
 use crate::beacon::containers::phase0::PendingAttestation;
-use crate::beacon::containers::{BeaconState, HistoricalBatch};
+use crate::beacon::containers::{BeaconState, HistoricalBatch, RegistryMut};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::{
@@ -267,31 +267,32 @@ pub fn process_eth1_data_reset(state: &mut BeaconState) -> Result<()> {
 /// and since effective balance feeds the shuffling seed's weighting and every
 /// reward, that would churn far more than it measures.
 pub fn process_effective_balance_updates(state: &mut BeaconState) -> Result<()> {
-    // Decided in one pass and applied in another. The state is an enum over
-    // per-fork structs, so the accessors hand out a borrow of the whole state
-    // rather than of one field, and there is no way to hold `validators` mutably
-    // while reading `balances`. Collecting the decisions first keeps this
-    // fork-independent, which matters because every fork runs this step
-    // unchanged.
-    let mut updates = Vec::new();
-    // Zipped rather than indexed: step 3 only writes the balances that changed,
-    // so `balances()[index]` would be a tree descent for most validators.
-    for (index, (validator, &balance)) in state
-        .validators()
-        .iter()
-        .zip(state.balances().iter())
-        .enumerate()
-    {
+    // `registry_mut` splits the state into the two lists, so the registry's write
+    // cursor can run while the balances are read in step. It copies a leaf only
+    // for a validator whose effective balance changes and keeps every other leaf
+    // (and its hash) as it was; this stays fork-independent, which matters
+    // because every fork runs this step unchanged.
+    let RegistryMut {
+        validators,
+        balances,
+    } = state.registry_mut();
+    let mut balances = balances.iter();
+    let mut pass = validators.iter_cow();
+    while let Some(mut validator) = pass.next_cow() {
+        // Zipped semantics: a validator past the end of a short balances list
+        // is left alone, as the unfused steps this replaces did.
+        let Some(&balance) = balances.next() else {
+            break;
+        };
         if leaves_hysteresis_band(validator.effective_balance, balance)? {
             let effective = (balance - balance % preset::EFFECTIVE_BALANCE_INCREMENT)
                 .min(preset::MAX_EFFECTIVE_BALANCE);
-            updates.push((index, effective));
+            // Equal to the old value when capped at the maximum: checked before
+            // the copy, so a validator already at its ceiling dirties nothing.
+            if effective != validator.effective_balance {
+                validator.make_mut().effective_balance = effective;
+            }
         }
-    }
-
-    let validators = state.validators_mut();
-    for (index, effective) in updates {
-        validators[index].effective_balance = effective;
     }
     Ok(())
 }

@@ -35,7 +35,7 @@ use crate::beacon::bls;
 use crate::beacon::config::Config;
 use crate::beacon::constants::{self, FAR_FUTURE_EPOCH};
 use crate::beacon::containers::shared::{DepositMessage, Validator};
-use crate::beacon::containers::{BeaconState, electra, fulu};
+use crate::beacon::containers::{BeaconState, RegistryMut, electra, fulu};
 use crate::beacon::error::{Error, Result};
 use crate::beacon::helpers::accessors::{get_current_epoch, get_total_active_balance};
 use crate::beacon::helpers::electra::{
@@ -708,28 +708,29 @@ pub fn process_pending_consolidations(state: &mut BeaconState, _config: &Config)
 /// hysteresis test itself is [`super::leaves_hysteresis_band`], shared with
 /// that version.
 pub fn process_effective_balance_updates(state: &mut BeaconState) -> Result<()> {
-    // Two passes for the same reason `super::process_effective_balance_updates`
-    // needs them: `state` is an enum over per-fork structs, so there is no
-    // way to hold `validators` mutably while also reading `balances`, or
-    // (here) while calling `get_max_effective_balance` on the validator
-    // being decided on.
-    let mut updates = Vec::new();
-    // Zipped rather than indexed: step 3 only writes the balances that changed,
-    // so `balances()[index]` would be a tree descent for most validators.
-    for (index, (validator, &balance)) in state
-        .validators()
-        .iter()
-        .zip(state.balances().iter())
-        .enumerate()
-    {
-        if let Some(effective) = updated_effective_balance(validator, balance)? {
-            updates.push((index, effective));
+    // Same shape as `super::process_effective_balance_updates`: the registry's
+    // write cursor, with the balances read in step through the disjoint borrow
+    // `registry_mut` hands out. `updated_effective_balance` reads the validator
+    // being decided on straight from the cursor's element.
+    let RegistryMut {
+        validators,
+        balances,
+    } = state.registry_mut();
+    let mut balances = balances.iter();
+    let mut pass = validators.iter_cow();
+    while let Some(mut validator) = pass.next_cow() {
+        // Zipped semantics: a validator past the end of a short balances list
+        // is left alone, as the unfused steps this replaces did.
+        let Some(&balance) = balances.next() else {
+            break;
+        };
+        if let Some(effective) = updated_effective_balance(&validator, balance)? {
+            // Equal to the old value when capped at the ceiling: checked before the
+            // copy, so a validator already there dirties nothing.
+            if effective != validator.effective_balance {
+                validator.make_mut().effective_balance = effective;
+            }
         }
-    }
-
-    let validators = state.validators_mut();
-    for (index, effective) in updates {
-        validators[index].effective_balance = effective;
     }
     Ok(())
 }

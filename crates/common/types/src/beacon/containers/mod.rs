@@ -395,6 +395,13 @@ impl BeaconState {
     }
 }
 
+/// Disjoint mutable borrows of a state's validator registry and balances, from
+/// [`BeaconState::registry_mut`].
+pub struct RegistryMut<'a> {
+    pub validators: &'a mut Validators,
+    pub balances: &'a mut Balances,
+}
+
 /// Generates read and write accessors for state fields that every fork shares.
 ///
 /// The `copy` and `reference` lists are this crate's statement of which state
@@ -590,6 +597,20 @@ impl BeaconState {
             .get(index as usize)
             .copied()
             .ok_or(Error::UnknownValidator(index))
+    }
+
+    /// The validator registry and the balances, both mutably at once.
+    ///
+    /// `validators_mut` and `balances_mut` each borrow the whole state, so a pass
+    /// that reads one list while writing the other (an in-order write cursor
+    /// over one list zipped with an iterator over the other) needs this
+    /// accessor, the same way [`Self::altair_validator_lists_mut`] splits the
+    /// per-validator lists.
+    pub fn registry_mut(&mut self) -> RegistryMut<'_> {
+        dispatch_state!(self, "BeaconState::registry_mut", |state| RegistryMut {
+            validators: &mut state.validators,
+            balances: &mut state.balances,
+        })
     }
 
     /// The randao mix for `epoch`, which the specification indexes modulo the

@@ -38,6 +38,48 @@ pub fn decrease_balance(state: &mut BeaconState, index: ValidatorIndex, delta: G
     Ok(())
 }
 
+/// Applies reward and penalty vectors to every balance in one in-order pass.
+///
+/// Equivalent to calling [`increase_balance`] then [`decrease_balance`] for
+/// every index, one `(rewards, penalties)` pair after another: each balance
+/// depends on its own deltas only, so going index by index and pair by pair
+/// within an index gives the same result as the specification's pair-by-pair
+/// loop. The saturation stays per step, in spec order (`saturating_add` of the
+/// reward, then `saturating_sub` of the penalty, for each pair): netting the
+/// deltas first would let a reward mask a penalty that should have driven a low
+/// balance to zero.
+///
+/// Goes through the balances' write cursor instead of a `get_mut` per call, so
+/// nothing is buffered per element and a leaf whose balances all come out
+/// unchanged keeps its hash. Every vector is indexed by validator index and
+/// must cover the registry.
+pub fn apply_balance_deltas(
+    state: &mut BeaconState,
+    deltas: &[(Vec<Gwei>, Vec<Gwei>)],
+) -> Result<()> {
+    let validator_count = state.validators().len();
+    if state.balances().len() < validator_count {
+        return Err(Error::UnknownValidator(
+            state.balances().len() as ValidatorIndex
+        ));
+    }
+    state.balances_mut().try_update_each(|balance| {
+        let index = balance.index();
+        // Balances past the registry are not the specification's to touch.
+        if index >= validator_count {
+            return Ok(());
+        }
+        let mut value = **balance;
+        for (rewards, penalties) in deltas {
+            value = value
+                .saturating_add(rewards[index])
+                .saturating_sub(penalties[index]);
+        }
+        balance.set(value);
+        Ok(())
+    })
+}
+
 /// Puts a validator into the exit queue.
 ///
 /// Does nothing if it is already exiting, so this is safe to call more than once
