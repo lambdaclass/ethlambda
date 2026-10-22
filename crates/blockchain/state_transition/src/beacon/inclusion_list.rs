@@ -24,13 +24,13 @@ use crate::beacon::fork_choice::{
 };
 use crate::beacon::gossip::execution_payload_bid::cached_checkpoint_state;
 use crate::beacon::gossip::proposer_preferences::{dependent_root_at, is_valid_dependent_root};
-use crate::beacon::helpers::accessors::{CommitteeCacheExt, get_current_epoch, get_domain};
+use crate::beacon::helpers::accessors::{CommitteeCacheExt, get_current_epoch};
 use crate::beacon::helpers::misc::{
-    compute_epoch_at_slot, compute_signing_root, compute_start_slot_at_epoch,
+    compute_domain, compute_epoch_at_slot, compute_signing_root, compute_start_slot_at_epoch,
 };
 use crate::beacon::preset;
 use crate::beacon::primitives::{
-    BlsSignature, Epoch, HashTreeRoot as _, Root, Slot, ValidatorIndex,
+    BlsSignature, Domain, Epoch, HashTreeRoot as _, Root, Slot, ValidatorIndex,
 };
 
 /// The specification's `get_inclusion_list_committee`: every beacon committee
@@ -62,19 +62,41 @@ pub fn get_inclusion_list_committee(
         .collect())
 }
 
-/// The signing root a committee member signs its inclusion list under:
-/// `DOMAIN_INCLUSION_LIST_COMMITTEE` at the list's own epoch.
-pub fn inclusion_list_signing_root(state: &BeaconState, inclusion_list: &InclusionList) -> Root {
-    let domain = get_domain(
-        state,
+/// The domain a committee member signs its inclusion list under, per
+/// consensus-specs #5721: `compute_domain(DOMAIN_INCLUSION_LIST_COMMITTEE,
+/// compute_fork_version(epoch), genesis_validators_root)`. It names the
+/// list's own epoch's fork version, not the verifier state's `fork`: for a
+/// list in the Heze fork epoch the state is still a Gloas one, so signer and
+/// verifier would otherwise disagree across the fork boundary.
+pub fn inclusion_list_domain(
+    config: &Config,
+    genesis_validators_root: Root,
+    epoch: Epoch,
+) -> Domain {
+    compute_domain(
         DOMAIN_INCLUSION_LIST_COMMITTEE,
-        Some(compute_epoch_at_slot(inclusion_list.slot)),
+        config.fork_version(config.fork_at_epoch(epoch)),
+        genesis_validators_root,
+    )
+}
+
+/// The signing root a committee member signs its inclusion list under.
+pub fn inclusion_list_signing_root(
+    config: &Config,
+    state: &BeaconState,
+    inclusion_list: &InclusionList,
+) -> Root {
+    let domain = inclusion_list_domain(
+        config,
+        state.genesis_validators_root(),
+        compute_epoch_at_slot(inclusion_list.slot),
     );
     compute_signing_root(inclusion_list.hash_tree_root(), domain)
 }
 
 /// The specification's `is_valid_inclusion_list_signature`.
 pub fn is_valid_inclusion_list_signature(
+    config: &Config,
     state: &BeaconState,
     signed_inclusion_list: &SignedInclusionList,
 ) -> bool {
@@ -82,7 +104,7 @@ pub fn is_valid_inclusion_list_signature(
     let Ok(validator) = state.validator(message.validator_index) else {
         return false;
     };
-    let signing_root = inclusion_list_signing_root(state, message);
+    let signing_root = inclusion_list_signing_root(config, state, message);
     bls::verify(
         &validator.pubkey,
         signing_root,
@@ -233,7 +255,7 @@ pub fn on_inclusion_list(
     )?;
     // Verify the signature.
     verify(
-        is_valid_inclusion_list_signature(&state, signed_inclusion_list),
+        is_valid_inclusion_list_signature(&config, &state, signed_inclusion_list),
         "is_valid_inclusion_list_signature(state, signed_inclusion_list)",
     )?;
 
@@ -267,11 +289,12 @@ pub fn get_inclusion_list_committee_assignment(
 /// closure rather than a private key: the node never holds one, and a
 /// validator client signs the root this returns.
 pub fn sign_inclusion_list(
+    config: &Config,
     state: &BeaconState,
     inclusion_list: InclusionList,
     sign: impl FnOnce(Root) -> BlsSignature,
 ) -> SignedInclusionList {
-    let signature = sign(inclusion_list_signing_root(state, &inclusion_list));
+    let signature = sign(inclusion_list_signing_root(config, state, &inclusion_list));
     SignedInclusionList {
         message: inclusion_list,
         signature,
@@ -294,4 +317,36 @@ pub fn payload_inclusion_list_transactions(
             .inclusion_list_store()
             .transactions(slot, dependent_root, true),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::beacon::ForkName;
+
+    /// consensus-specs #5721: a list in the Heze fork epoch is signed under
+    /// Heze's version even though the verifier's state is still Gloas.
+    #[test]
+    fn the_domain_follows_the_fork_schedule_at_the_lists_epoch() {
+        let config = Config::mainnet()
+            .with_fork_epoch(ForkName::Gloas, 0)
+            .with_fork_epoch(ForkName::Heze, 4);
+        let root = Root::repeat_byte(7);
+        let expect = |fork| {
+            compute_domain(
+                DOMAIN_INCLUSION_LIST_COMMITTEE,
+                config.fork_version(fork),
+                root,
+            )
+        };
+        assert_eq!(
+            inclusion_list_domain(&config, root, 3),
+            expect(ForkName::Gloas)
+        );
+        assert_eq!(
+            inclusion_list_domain(&config, root, 4),
+            expect(ForkName::Heze)
+        );
+        assert_ne!(expect(ForkName::Gloas), expect(ForkName::Heze));
+    }
 }
