@@ -231,15 +231,21 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `GET` | `/eth/v1/beacon/headers/{block_id}` | JSON | `SignedBeaconBlockHeader`, plus `canonical` |
 | `GET` | `/eth/v2/debug/beacon/states/{state_id}` | JSON or SSZ | `BeaconState` at `state_id` |
 | `GET` | `/eth/v1/beacon/states/{state_id}/finality_checkpoints` | JSON | That state's three checkpoints |
+| `GET` | `/eth/v1/beacon/states/{state_id}/fork` | JSON | That state's `Fork`: previous and current version, and the epoch it changed |
 | `GET` | `/eth/v1/beacon/genesis` | JSON | Genesis time, validators root, fork version |
 | `GET` | `/eth/v1/config/spec` | JSON | The store's `Config`, plus `PRESET_BASE`, `CONFIG_NAME`, the preset and the constants (see below) |
+| `GET` | `/eth/v1/config/deposit_contract` | JSON | The `Config`'s deposit chain id and contract address |
 | `GET` | `/eth/v1/node/syncing` | JSON | Head slot, sync distance, optimistic flag |
 | `GET` | `/eth/v1/node/health` | *(status only)* | `200` caught up, `206` syncing |
 | `GET` | `/eth/v1/node/version` | JSON | Client version string |
 | `GET` | `/eth/v1/node/identity` | JSON | Peer ID and metadata only (see below) |
 | `GET`, `POST` | `/eth/v1/beacon/states/{state_id}/validators` | JSON | Registry entries by index or pubkey, with status |
+| `GET` | `/eth/v1/beacon/states/{state_id}/validators/{validator_id}` | JSON | One registry entry, by index or pubkey; `404` if there is none |
 | `GET` | `/eth/v1/validator/duties/proposer/{epoch}` | JSON | Proposers for any epoch from the head's up to one past the wall clock's |
+| `GET` | `/eth/v2/validator/duties/proposer/{epoch}` | JSON | The same, with v2's `dependent_root` (what Lighthouse asks for) |
 | `POST` | `/eth/v1/validator/duties/attester/{epoch}` | JSON | Committee assignments for the given indices |
+| `POST` | `/eth/v1/validator/duties/sync/{epoch}` | JSON | Sync committee seats for the given indices, in the head's current or next period |
+| `POST` | `/eth/v1/validator/liveness/{epoch}` | JSON | Whether this node saw each validator act in the epoch (doppelganger protection) |
 | `POST` | `/eth/v1/validator/duties/ptc/{epoch}` | JSON | Payload timeliness committee seats for the given indices (gloas) |
 | `GET` | `/eth/v1/validator/attestation_data` | JSON | What to attest to at `slot` |
 | `GET` | `/eth/v1/validator/payload_attestation_data` | JSON or SSZ | What a committee member signs for `slot` (gloas) |
@@ -266,18 +272,44 @@ the chain actor writes, so no request waits on the actor.
   epoch up to one past the current one is served (or one past the head's, if
   the head is ahead of a lagging clock), so a validator client's next-epoch
   lookahead at an epoch boundary, while the head is still in the previous
-  epoch, is answered. Proposer duties read fulu's `proposer_lookahead`, which
-  covers the head's epoch and the next; attester duties read the head state as
-  it is for its previous, current and next epoch. A later epoch is computed from
-  a copy of the head advanced with `process_slots` to the first epoch that can
-  derive it, taken from fork choice's `checkpoint_state` cache and run on a
-  blocking thread. An epoch before the head's (attester: more than one before)
-  or past the bound is a `400`.
-  `dependent_root` follows each endpoint's v1 definition. Attester duties walk
+  epoch, is answered. Proposer duties (v1 and v2) read fulu's
+  `proposer_lookahead`, which covers the head's epoch and the next; attester
+  duties read the head state as it is for its previous, current and next epoch.
+  A later epoch is computed from a copy of the head advanced with
+  `process_slots` to the first epoch that can derive it, taken from fork
+  choice's `checkpoint_state` cache and run on a blocking thread. An epoch
+  before the head's (attester: more than one before) or past the bound is a
+  `400`.
+  `dependent_root` follows each endpoint's own definition: the last block
+  before the epoch for v1 proposer duties, and the last block before the
+  previous epoch for v2 proposer duties and attester duties. v2's is the block
+  fulu's lookahead depends on, so it changes only on reorgs that can change the
+  duties. Proposer duties v2 is a `503` while syncing. Attester duties walk
   every committee of the epoch, a full shuffle per request on mainnet. Gloas
   epochs are served like fulu ones: gloas keeps fulu's `proposer_lookahead` and
   `upgrade_to_gloas` carries it over, so a fulu head already answers proposer
-  duties for the first gloas epoch.
+  duties (v1 and v2) for the first gloas epoch, and a gloas head answers from
+  its own lookahead.
+- **Sync duties** read the head state's `current_sync_committee` for an epoch in
+  the head's own sync committee period and `next_sync_committee` for the one
+  after; any other period is a `400` (an earlier one would need a historical
+  state; see `docs/spec_deviations.md`). A validator is matched by pubkey and
+  gets every seat it holds, since the committee is drawn with replacement; one
+  with no seat is left out. An unknown index is a `400`, and the endpoint is a
+  `503` while the node is syncing. This node serves no sync committee message
+  or contribution endpoint yet, so a validator client that gets duties here
+  cannot publish what they ask for.
+- **Liveness** is this node's own view, which the Beacon API allows. A
+  validator is live in an epoch if the head state credits it for that epoch (a
+  non-zero participation byte, so anything a block already included), **or**
+  the node observed it act: an accepted gossip aggregate (its aggregator and
+  every attester its signature verified) or subnet attestation, an imported
+  block's proposer, or a submission through `pool/attestations` or
+  `aggregate_and_proofs`. The observed half covers what no block has included
+  yet, most of the current epoch; it keeps the newest three epochs recorded,
+  as one bitset each. The window is the store clock's previous, current and
+  next epoch (the next is always `false`); anything else, and an unknown
+  index, is a `400`, and the endpoint is a `503` while the node is syncing.
 - **`attestation_data`** follows phase0's `validator.md`: the head block, the
   epoch's boundary block as target, and as source the current justified
   checkpoint of the head state advanced to the slot's epoch (through fork
