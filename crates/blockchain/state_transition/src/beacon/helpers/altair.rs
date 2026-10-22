@@ -181,6 +181,16 @@ pub fn get_next_sync_committee(state: &BeaconState) -> Result<altair::SyncCommit
     })
 }
 
+/// The sync committee period `epoch` falls in.
+///
+/// Altair's `validator.md` `compute_sync_committee_period`. A state's
+/// `current_sync_committee` serves its own period and `next_sync_committee`
+/// the one after, so this is what tells a caller which of the two answers for
+/// a given epoch.
+pub fn compute_sync_committee_period(epoch: Epoch) -> u64 {
+    epoch / preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD
+}
+
 /// The reward every one-increment slice of a validator's effective balance
 /// earns for a single timely, correct component of its attestation.
 ///
@@ -602,5 +612,14 @@ mod tests {
         }
         let elapsed = start.elapsed() / ITERATIONS;
         println!("get_flag_index_deltas, {VALIDATOR_COUNT} validators -> {elapsed:?}/call");
+    }
+
+    #[test]
+    fn a_sync_committee_period_spans_its_epochs_and_no_more() {
+        let period = preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
+        assert_eq!(compute_sync_committee_period(0), 0);
+        assert_eq!(compute_sync_committee_period(period - 1), 0);
+        assert_eq!(compute_sync_committee_period(period), 1);
+        assert_eq!(compute_sync_committee_period(3 * period + 1), 3);
     }
 }

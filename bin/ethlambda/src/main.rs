@@ -62,6 +62,8 @@ use ethlambda_types::{
         BeaconState, SignedBeaconBlock, altair, bellatrix, capella, deneb, electra, gloas, phase0,
     },
     beacon::fork::ForkName,
+    beacon::primitives::Epoch,
+    beacon::signing::compute_epoch_at_slot,
     genesis::{GenesisConfig, verify_state_genesis},
     state::{State, ValidatorPubkeyBytes},
 };
@@ -1465,7 +1467,8 @@ async fn fetch_initial_state(
     Ok(store)
 }
 
-/// Name the first configuration field that disagrees with the persisted one.
+/// Name the first configuration field that disagrees with the persisted one
+/// in a way this directory's contents rule out.
 ///
 /// A changed fork epoch leaves genesis time and the validators root untouched,
 /// so `verify_state_genesis` cannot see it, while putting this node on a
@@ -1474,7 +1477,23 @@ async fn fetch_initial_state(
 /// Lighthouse reports the same situation as an SSZ decode error whose own
 /// message admits it is guessing between a wrong network and a corrupt
 /// database.
-fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<String> {
+///
+/// The fork schedule is compared against what the directory holds rather
+/// than for equality, because scheduling a fork is an edit to exactly these
+/// fields, made after every existing node initialized its directory. A fork's
+/// version and epoch may change as long as this directory has processed
+/// nothing of that fork under either schedule, so both the stored and the
+/// supplied epoch must lie past `processed_through`, the latest epoch this
+/// directory holds a block or state of. That accepts a fork scheduled ahead
+/// of the chain (unset before, set now) or moved while still ahead of it. It
+/// refuses one moved onto or off epochs already processed, since those were
+/// validated under the other schedule. `blob_schedule` follows the same rule:
+/// its entries up to `processed_through` must match.
+fn first_config_difference(
+    persisted: &Config,
+    supplied: &Config,
+    processed_through: Epoch,
+) -> Option<String> {
     macro_rules! compare {
         ($($field:ident),+ $(,)?) => {
             $(
@@ -1514,9 +1533,10 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         // `verify_state_genesis` already covers it.
         genesis_time: _,
 
-        // Fork scheduling: compared below. Changes which fork a block signs
-        // under and when, so a mismatch here silently forks this node from
-        // its peers.
+        // Fork scheduling: compared per fork below, against what this
+        // directory has processed. Changes which fork a block signs under and
+        // when, so a mismatch on a processed epoch silently forks this node
+        // from its peers.
         genesis_fork_version: _,
         altair_fork_version: _,
         altair_fork_epoch: _,
@@ -1591,7 +1611,8 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         terminal_block_hash: _,
         terminal_block_hash_activation_epoch: _,
 
-        // Blob limits: compared below. Bound how many blobs a block may
+        // Blob limits: compared below, `blob_schedule` only up to the epochs
+        // this directory has processed. Bound how many blobs a block may
         // legally carry.
         max_blobs_per_block_deneb: _,
         max_blobs_per_block_electra: _,
@@ -1648,23 +1669,62 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         min_epochs_for_block_requests: _,
     } = persisted;
 
+    compare!(preset_base);
+
+    for fork in ForkName::ALL {
+        let (stored_epoch, supplied_epoch) =
+            (persisted.fork_epoch(fork), supplied.fork_epoch(fork));
+        let (stored_version, supplied_version) =
+            (persisted.fork_version(fork), supplied.fork_version(fork));
+        if stored_epoch == supplied_epoch && stored_version == supplied_version {
+            continue;
+        }
+        // Ahead of everything processed under both schedules, so nothing
+        // stored was validated under either one's view of this fork.
+        if stored_epoch.min(supplied_epoch) > processed_through {
+            continue;
+        }
+        let (field, stored, supplied) = if stored_epoch != supplied_epoch {
+            let field = format!("{fork}_fork_epoch");
+            (field, stored_epoch.to_string(), supplied_epoch.to_string())
+        } else {
+            // Phase0's version is the only one not named after its fork.
+            let field = match fork {
+                ForkName::Phase0 => "genesis_fork_version".to_string(),
+                _ => format!("{fork}_fork_version"),
+            };
+            (
+                field,
+                format!("{stored_version:?}"),
+                format!("{supplied_version:?}"),
+            )
+        };
+        return Some(format!(
+            "{field}: directory has {stored}, config file says {supplied}, \
+             and this directory has processed through epoch {processed_through}"
+        ));
+    }
+
+    let processed_blob_entries = |config: &Config| -> Vec<_> {
+        config
+            .blob_schedule
+            .iter()
+            .filter(|entry| entry.epoch <= processed_through)
+            .copied()
+            .collect()
+    };
+    let (stored_entries, supplied_entries) = (
+        processed_blob_entries(persisted),
+        processed_blob_entries(supplied),
+    );
+    if stored_entries != supplied_entries {
+        return Some(format!(
+            "blob_schedule through epoch {processed_through}: directory has \
+             {stored_entries:?}, config file says {supplied_entries:?}"
+        ));
+    }
+
     compare!(
-        preset_base,
-        genesis_fork_version,
-        altair_fork_version,
-        altair_fork_epoch,
-        bellatrix_fork_version,
-        bellatrix_fork_epoch,
-        capella_fork_version,
-        capella_fork_epoch,
-        deneb_fork_version,
-        deneb_fork_epoch,
-        electra_fork_version,
-        electra_fork_epoch,
-        fulu_fork_version,
-        fulu_fork_epoch,
-        gloas_fork_version,
-        gloas_fork_epoch,
         seconds_per_slot,
         slot_duration_ms,
         min_validator_withdrawability_delay,
@@ -1683,7 +1743,6 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         consolidation_churn_limit_quotient,
         max_blobs_per_block_deneb,
         max_blobs_per_block_electra,
-        blob_schedule,
         deposit_chain_id,
         deposit_network_id,
         deposit_contract_address,
@@ -1793,25 +1852,60 @@ async fn fetch_initial_beacon_state(
                 )
             })?;
 
+            // The latest epoch anything here was processed at. Every imported
+            // block is in `LiveChain`, and the finalized state can sit past
+            // its own block: a checkpoint-sync anchor advanced through empty
+            // slots.
+            let processed_slot = store
+                .max_live_chain_slot()?
+                .unwrap_or_default()
+                .max(state.slot());
+            let processed_through = compute_epoch_at_slot(processed_slot);
+
             let persisted = store.config();
-            if let Some(difference) = first_config_difference(&persisted, &config) {
+            if let Some(difference) =
+                first_config_difference(&persisted, &config, processed_through)
+            {
                 error!(%difference, "Persisted config disagrees with the network config");
                 return Err(checkpoint_sync::CheckpointSyncError::ConfigChanged { difference });
             }
             // Not a chain value, so not refused (see `first_config_difference`).
-            // `Metadata["config"]` is never rewritten, so the stored name is
-            // the one `/eth/v1/config/spec` goes on reporting.
             if persisted.config_name != config.config_name {
                 warn!(
                     stored = %persisted.config_name,
                     supplied = %config.config_name,
                     "CONFIG_NAME differs from the one this data directory was initialized with; \
-                     resuming, and reporting the stored name"
+                     resuming under the config file's"
                 );
             }
+            for fork in ForkName::ALL {
+                let (stored_epoch, supplied_epoch) =
+                    (persisted.fork_epoch(fork), config.fork_epoch(fork));
+                if stored_epoch != supplied_epoch
+                    || persisted.fork_version(fork) != config.fork_version(fork)
+                {
+                    info!(
+                        %fork,
+                        stored_epoch,
+                        supplied_epoch,
+                        processed_through,
+                        "Fork rescheduled ahead of this directory; following the config file"
+                    );
+                }
+            }
+            // Whatever differs now is a value this directory does not
+            // contradict, so the config file wins: the node runs on the
+            // persisted config, and keeping the stored one would leave it on
+            // the old fork schedule. `replace_config` needs the only handle
+            // to the cached config, hence the `drop`.
+            let config_changed = *persisted != config;
+            drop(persisted);
+            if config_changed {
+                store.replace_config(config.clone());
+            }
 
-            // The only mutation on this path, and only reached once both
-            // checks above have passed; see `Store::from_db_state`'s doc.
+            // Like `replace_config` above, only reached once both checks
+            // above have passed; see `Store::from_db_state`'s doc.
             // Also what makes `beacon_head`'s `.expect` below safe: a
             // directory whose head had no state at all would have failed
             // `verify_anchor_states` above instead of reaching here (see
@@ -2081,6 +2175,8 @@ mod tests {
     use crate::command::{Command, try_parse_from};
     use ethlambda_storage::ForkCheckpoints;
     use ethlambda_storage::backend::InMemoryBackend;
+    use ethlambda_types::beacon::config::BlobScheduleEntry;
+    use ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
     use ethlambda_types::block::{Block, BlockBody, MultiMessageAggregate, SignedBlock};
     use ethlambda_types::checkpoint::Checkpoint;
     use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
@@ -2770,7 +2866,8 @@ validators:
     /// A changed fork epoch leaves genesis time and the validators root
     /// untouched, so `verify_state_genesis` cannot see it, while putting this
     /// node on a different chain from its peers from that epoch on. Resuming
-    /// must compare the persisted config too, and name the field that moved.
+    /// must compare the persisted config too, and name the field that moved,
+    /// when the move lands on an epoch the directory has already processed.
     #[tokio::test]
     async fn a_resume_with_an_edited_config_names_the_field_that_changed() {
         let dir = tempfile::tempdir().unwrap();
@@ -2792,10 +2889,11 @@ validators:
             .await
             .expect("first run anchors");
 
-        // Now resume with one fork epoch moved. Genesis time and validators
-        // root are untouched, so the existing check cannot see this.
+        // Now resume with altair moved onto genesis, which this directory has
+        // processed as phase0. Genesis time and validators root are
+        // untouched, so the existing check cannot see this.
         let mut edited = network::dir::NetworkDir::load(dir.path()).unwrap();
-        edited.config.electra_fork_epoch += 1;
+        edited.config.altair_fork_epoch = 0;
         let tampered = network::NetworkSource::Loaded(Box::new(edited));
 
         // `Store` is not `Debug`, so unwrap the error by pattern rather than
@@ -2805,8 +2903,52 @@ validators:
         };
         let message = format!("{err}");
         assert!(
-            message.contains("electra_fork_epoch"),
+            message.contains("altair_fork_epoch"),
             "the error should name the field that changed: {message}"
+        );
+    }
+
+    /// How a network schedules a fork: every existing node initialized its
+    /// directory with the fork unset, and the config file now sets it ahead
+    /// of the chain. That resumes, and the node goes on to run on the new
+    /// schedule, which means the persisted config has to change with it.
+    #[tokio::test]
+    async fn a_resume_follows_a_fork_scheduled_ahead_of_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/networks/devnet/config.yaml"),
+            dir.path().join("config.yaml"),
+        )
+        .unwrap();
+        let state = beacon::mainnet_genesis_state().unwrap();
+        std::fs::write(dir.path().join("genesis.ssz"), state.to_ssz()).unwrap();
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+
+        // First run: fulu not scheduled yet.
+        let mut unscheduled = network::dir::NetworkDir::load(dir.path()).unwrap();
+        let fulu_fork_epoch = unscheduled.config.fulu_fork_epoch;
+        unscheduled.config.fulu_fork_epoch = FAR_FUTURE_EPOCH;
+        let source = network::NetworkSource::Loaded(Box::new(unscheduled));
+        fetch_initial_beacon_state(&[], backend.clone(), &source)
+            .await
+            .expect("first run anchors");
+
+        // Second run: the file schedules it, far past the genesis anchor.
+        let scheduled = network::dir::NetworkDir::load(dir.path()).unwrap();
+        let source = network::NetworkSource::Loaded(Box::new(scheduled));
+        let Ok(store) = fetch_initial_beacon_state(&[], backend.clone(), &source).await else {
+            panic!("a fork scheduled ahead of the directory must resume");
+        };
+        assert_eq!(store.config().fulu_fork_epoch, fulu_fork_epoch);
+
+        let reopened = Store::from_db_state(backend)
+            .expect("reopen")
+            .expect("populated directory");
+        assert_eq!(
+            reopened.config().fulu_fork_epoch,
+            fulu_fork_epoch,
+            "the new schedule must be persisted, not only served"
         );
     }
 
@@ -2821,7 +2963,7 @@ validators:
         let mut supplied = Config::mainnet();
         supplied.churn_limit_quotient += 1;
 
-        let difference = first_config_difference(&persisted, &supplied)
+        let difference = first_config_difference(&persisted, &supplied, 0)
             .expect("a changed churn_limit_quotient must be caught");
         assert!(
             difference.contains("churn_limit_quotient"),
@@ -2838,24 +2980,112 @@ validators:
 
         let mut other_preset = Config::mainnet();
         other_preset.preset_base = "minimal".try_into().unwrap();
-        let difference = first_config_difference(&persisted, &other_preset)
+        let difference = first_config_difference(&persisted, &other_preset, 0)
             .expect("a changed PRESET_BASE must be caught");
         assert_eq!(
             difference,
             r#"preset_base: directory has "mainnet", config file says "minimal""#
         );
 
+        // Processed through altair's epoch, so moving it is a chain change.
+        let processed_through = persisted.altair_fork_epoch;
         let mut renamed = Config::mainnet();
         renamed.config_name = "devnet-2".try_into().unwrap();
-        assert_eq!(first_config_difference(&persisted, &renamed), None);
+        assert_eq!(
+            first_config_difference(&persisted, &renamed, processed_through),
+            None
+        );
 
         renamed.altair_fork_epoch += 1;
-        let difference = first_config_difference(&persisted, &renamed)
+        let difference = first_config_difference(&persisted, &renamed, processed_through)
             .expect("a rename must not hide a changed chain value");
         assert!(
             difference.starts_with("altair_fork_epoch:"),
             "got {difference}"
         );
+    }
+
+    /// A fork's schedule may change while neither the stored nor the supplied
+    /// epoch has been processed, which covers both scheduling an unset fork
+    /// and moving one that is still ahead.
+    #[test]
+    fn a_fork_schedule_may_change_only_ahead_of_what_was_processed() {
+        let mut persisted = Config::mainnet();
+        persisted.fulu_fork_epoch = FAR_FUTURE_EPOCH;
+        let mut supplied = Config::mainnet();
+        supplied.fulu_fork_epoch = 500_000;
+        supplied.fulu_fork_version = [0xaa, 0, 0, 0];
+
+        // Unset, then scheduled ahead of the chain, version included.
+        assert_eq!(
+            first_config_difference(&persisted, &supplied, 499_999),
+            None
+        );
+        // Once that epoch has been processed, the stored schedule is what it
+        // was processed under.
+        let difference = first_config_difference(&persisted, &supplied, 500_000)
+            .expect("a fork scheduled onto a processed epoch must be caught");
+        assert!(
+            difference.starts_with("fulu_fork_epoch:"),
+            "got {difference}"
+        );
+
+        // Moved while still ahead under both schedules.
+        persisted.fulu_fork_epoch = 600_000;
+        assert_eq!(
+            first_config_difference(&persisted, &supplied, 499_999),
+            None
+        );
+        // Moved later, off an epoch already processed as fulu.
+        assert!(first_config_difference(&supplied, &persisted, 550_000).is_some());
+
+        // A version change alone follows the same rule.
+        let mut reversioned = Config::mainnet();
+        reversioned.fulu_fork_version = [0xaa, 0, 0, 0];
+        let ahead_of_fulu = Config::mainnet().fulu_fork_epoch - 1;
+        assert_eq!(
+            first_config_difference(&Config::mainnet(), &reversioned, ahead_of_fulu),
+            None
+        );
+        let difference =
+            first_config_difference(&Config::mainnet(), &reversioned, ahead_of_fulu + 1)
+                .expect("a processed fork's version must be caught");
+        assert!(
+            difference.starts_with("fulu_fork_version:"),
+            "got {difference}"
+        );
+
+        // Phase0 is always processed, so its version can never change.
+        let mut regenesis = Config::mainnet();
+        regenesis.genesis_fork_version = [0xaa, 0, 0, 0];
+        let difference = first_config_difference(&Config::mainnet(), &regenesis, 0)
+            .expect("genesis_fork_version must be caught");
+        assert!(
+            difference.starts_with("genesis_fork_version:"),
+            "got {difference}"
+        );
+    }
+
+    /// `BLOB_SCHEDULE` gets the same treatment as the fork schedule: an
+    /// entry may be added ahead of the chain, not onto a processed epoch.
+    #[test]
+    fn a_blob_schedule_entry_may_be_added_only_ahead_of_what_was_processed() {
+        let persisted = Config::mainnet();
+        let mut entries: Vec<_> = persisted.blob_schedule.iter().copied().collect();
+        entries.push(BlobScheduleEntry {
+            epoch: 500_000,
+            max_blobs_per_block: 48,
+        });
+        let mut supplied = Config::mainnet();
+        supplied.blob_schedule = entries.try_into().unwrap();
+
+        assert_eq!(
+            first_config_difference(&persisted, &supplied, 499_999),
+            None
+        );
+        let difference = first_config_difference(&persisted, &supplied, 500_000)
+            .expect("an entry on a processed epoch must be caught");
+        assert!(difference.starts_with("blob_schedule"), "got {difference}");
     }
 
     /// Every built-in network is a live chain, and this follower imports
