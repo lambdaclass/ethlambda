@@ -371,6 +371,171 @@ mod tests {
         assert_eq!(inner.pending_deposits[0], deposit);
     }
 
+    // -----------------------------------------------------------------------
+    // EIP-8365: no new validators with BLS withdrawal credentials (heze)
+    // -----------------------------------------------------------------------
+
+    /// A pending deposit for `seed`'s key with `prefix` credentials, validly
+    /// signed so that only the credential rule, not the signature check, can
+    /// stop it.
+    fn signed_pending_deposit(seed: u8, prefix: u8) -> electra::PendingDeposit {
+        use crate::beacon::containers::shared::DepositMessage;
+        use crate::beacon::helpers::misc::{compute_deposit_domain, compute_signing_root};
+        use crate::beacon::primitives::{BlsPubkey, BlsSignature, Bytes32, HashTreeRoot as _};
+
+        let config = Config::mainnet();
+        let secret_key =
+            blst::min_pk::SecretKey::key_gen(&[seed; 32], &[]).expect("32 bytes of key material");
+        let pubkey = BlsPubkey(secret_key.sk_to_pk().to_bytes());
+        let mut withdrawal_credentials = Bytes32::ZERO;
+        withdrawal_credentials.0[0] = prefix;
+        let amount = preset::MIN_ACTIVATION_BALANCE;
+        let message = DepositMessage {
+            pubkey,
+            withdrawal_credentials,
+            amount,
+        };
+        let domain = compute_deposit_domain(config.genesis_fork_version);
+        let signing_root = compute_signing_root(message.hash_tree_root(), domain);
+        const DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+        let signature = BlsSignature(
+            secret_key
+                .sign(signing_root.as_slice(), DST, &[])
+                .to_bytes(),
+        );
+        electra::PendingDeposit {
+            pubkey,
+            withdrawal_credentials,
+            amount,
+            signature,
+            slot: constants::GENESIS_SLOT,
+        }
+    }
+
+    fn queue(state: &mut BeaconState, deposits: Vec<electra::PendingDeposit>) {
+        let mut fields = crate::beacon::helpers::electra::pending_queue_fields(state, "test")
+            .expect("a post-electra state has the queues");
+        for deposit in deposits {
+            fields.push_pending_deposit(deposit).unwrap();
+        }
+    }
+
+    fn queue_len(state: &mut BeaconState) -> usize {
+        crate::beacon::helpers::electra::pending_queue_fields(state, "test")
+            .unwrap()
+            .take_pending_deposits()
+            .len()
+    }
+
+    #[test]
+    fn heze_skips_a_new_bls_credentialed_deposit_without_refund() {
+        let config = Config::mainnet();
+        let mut state = crate::beacon::helpers::test_state::with_validators_at(ForkName::Heze, 2);
+        queue(
+            &mut state,
+            vec![signed_pending_deposit(1, constants::BLS_WITHDRAWAL_PREFIX)],
+        );
+
+        process_pending_deposits(&mut state, &config).unwrap();
+
+        assert_eq!(state.validator_count(), 2, "no validator created");
+        assert_eq!(state.balance(0).unwrap(), state.balance(1).unwrap());
+        assert_eq!(queue_len(&mut state), 0, "the deposit is consumed");
+    }
+
+    #[test]
+    fn heze_skips_a_bls_credentialed_deposit_with_an_invalid_signature_too() {
+        let config = Config::mainnet();
+        let mut state = crate::beacon::helpers::test_state::with_validators_at(ForkName::Heze, 2);
+        let mut deposit = signed_pending_deposit(1, constants::BLS_WITHDRAWAL_PREFIX);
+        deposit.signature = Default::default();
+        queue(&mut state, vec![deposit]);
+
+        process_pending_deposits(&mut state, &config).unwrap();
+
+        assert_eq!(state.validator_count(), 2);
+        assert_eq!(queue_len(&mut state), 0);
+    }
+
+    #[test]
+    fn heze_still_creates_validators_for_eth1_and_compounding_credentials() {
+        let config = Config::mainnet();
+        let mut state = crate::beacon::helpers::test_state::with_validators_at(ForkName::Heze, 2);
+        queue(
+            &mut state,
+            vec![
+                signed_pending_deposit(1, constants::ETH1_ADDRESS_WITHDRAWAL_PREFIX),
+                signed_pending_deposit(2, constants::COMPOUNDING_WITHDRAWAL_PREFIX),
+            ],
+        );
+
+        process_pending_deposits(&mut state, &config).unwrap();
+
+        assert_eq!(state.validator_count(), 4);
+        assert_eq!(queue_len(&mut state), 0);
+    }
+
+    #[test]
+    fn heze_still_credits_a_top_up_to_an_existing_bls_credentialed_validator() {
+        let config = Config::mainnet();
+        let mut state = crate::beacon::helpers::test_state::with_validators_at(ForkName::Heze, 2);
+        let mut deposit = signed_pending_deposit(1, constants::BLS_WITHDRAWAL_PREFIX);
+        {
+            let validator = state.validator_mut(0).unwrap();
+            validator.pubkey = deposit.pubkey;
+            validator.withdrawal_credentials = deposit.withdrawal_credentials;
+        }
+        // A top-up needs no valid signature.
+        deposit.signature = Default::default();
+        let amount = deposit.amount;
+        queue(&mut state, vec![deposit]);
+
+        let before = state.balance(0).unwrap();
+        process_pending_deposits(&mut state, &config).unwrap();
+
+        assert_eq!(state.validator_count(), 2);
+        assert_eq!(state.balance(0).unwrap(), before + amount);
+    }
+
+    #[test]
+    fn heze_bls_deposit_followed_by_an_eth1_deposit_creates_the_validator_with_the_latter() {
+        let config = Config::mainnet();
+        let mut state = crate::beacon::helpers::test_state::with_validators_at(ForkName::Heze, 2);
+        let bls = signed_pending_deposit(1, constants::BLS_WITHDRAWAL_PREFIX);
+        let eth1 = signed_pending_deposit(1, constants::ETH1_ADDRESS_WITHDRAWAL_PREFIX);
+        assert_eq!(bls.pubkey, eth1.pubkey);
+        let amount = eth1.amount;
+        let credentials = eth1.withdrawal_credentials;
+        queue(&mut state, vec![bls, eth1]);
+
+        process_pending_deposits(&mut state, &config).unwrap();
+
+        assert_eq!(state.validator_count(), 3);
+        let created = state.validator(2).unwrap();
+        assert_eq!(created.withdrawal_credentials, credentials);
+        assert_eq!(state.balance(2).unwrap(), amount);
+        assert_eq!(queue_len(&mut state), 0);
+    }
+
+    #[test]
+    fn a_bls_deposit_queued_at_gloas_is_skipped_once_upgraded_to_heze() {
+        let config = Config::mainnet();
+        let deposit = signed_pending_deposit(1, constants::BLS_WITHDRAWAL_PREFIX);
+
+        // Same deposit at gloas: still creates a validator.
+        let mut gloas = gloas_state_with_validators(2);
+        queue(&mut gloas, vec![deposit]);
+        let mut upgraded = crate::beacon::upgrade::upgrade_to_heze(&gloas, &config).unwrap();
+        process_pending_deposits(&mut gloas, &config).unwrap();
+        assert_eq!(gloas.validator_count(), 3);
+
+        // Carried over the fork, it is dropped.
+        assert_eq!(upgraded.fork_name(), ForkName::Heze);
+        process_pending_deposits(&mut upgraded, &config).unwrap();
+        assert_eq!(upgraded.validator_count(), 2);
+        assert_eq!(queue_len(&mut upgraded), 0);
+    }
+
     #[test]
     fn pending_deposits_stop_at_the_activation_only_churn_limit() {
         // A config whose gloas activation-churn quotient is deliberately
