@@ -20,8 +20,14 @@
 //!
 //! `insert_state`/`get_state` (in `store.rs`) call into this module for the
 //! beacon arm: `insert_state` writes a snapshot at anchors and a
-//! [`frame`]d [`encode`] otherwise, and `get_state` walks the resulting
-//! chain and [`decode`]s it back, via [`unframe`].
+//! [`frame`]d [`encode`] otherwise, and `get_state` follows the frame's base
+//! and [`decode`]s it back, via [`unframe`].
+//!
+//! The base of a delta is the nearest snapshot on the state's branch, not its
+//! parent. A read is then one snapshot plus one delta, whatever the state's
+//! distance from the snapshot; the price is that a delta carries every change
+//! since the snapshot, so it grows across the interval. The frame names its
+//! own base, so the reader does not care which of the two a given frame uses.
 
 use ethlambda_types::primitives::H256;
 

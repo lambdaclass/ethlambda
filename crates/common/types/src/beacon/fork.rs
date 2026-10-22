@@ -22,9 +22,10 @@ use crate::beacon::preset;
 const LEAN_SNAPSHOT_INTERVAL: u64 = 1_024;
 
 /// How many slots apart full state snapshots are written for the Beacon
-/// Chain, in [`ForkName::snapshot_interval`]: one epoch, so a
-/// reconstruction fold is bounded at one epoch of blocks plus a single
-/// decode.
+/// Chain, in [`ForkName::snapshot_interval`]: one epoch. A beacon read applies
+/// one delta against its snapshot whatever the interval, so what this bounds
+/// is how large a delta grows (it carries every change since its snapshot) and
+/// how often a full snapshot is written.
 const BEACON_SNAPSHOT_INTERVAL: u64 = preset::SLOTS_PER_EPOCH;
 
 /// A named fork of the Beacon Chain, ordered oldest to newest, followed by
@@ -135,10 +136,11 @@ impl ForkName {
     /// here rather than on `Config`: putting it in a config a chain agrees on
     /// would imply the two had to agree on it.
     ///
-    /// Lean's interval does not survive contact with a ~350 MB beacon state,
-    /// since the reconstruction fold would apply that many deltas; beacon
-    /// takes an epoch, so the fold is bounded at one epoch of blocks plus a
-    /// single decode.
+    /// Lean's interval does not survive contact with a ~350 MB beacon state:
+    /// a beacon diff carries every change since its snapshot, so a long
+    /// interval lets deltas grow large, and a snapshot is a full copy of the
+    /// state. Beacon takes an epoch, which bounds both; a read applies a single
+    /// delta whatever the interval, and decodes once.
     pub const fn snapshot_interval(self) -> u64 {
         match self {
             ForkName::Lean => LEAN_SNAPSHOT_INTERVAL,
