@@ -368,7 +368,13 @@ mod tests {
     /// A store whose head is a block at a heze state's slot, on a clock with
     /// that slot running now.
     fn heze_store(config: Config) -> (Store, H256) {
-        let gloas = with_signing_validators_at(ForkName::Gloas, COUNT);
+        let mut gloas = with_signing_validators_at(ForkName::Gloas, COUNT);
+        // `upgrade_to_heze` (EIP-8015) refuses a state whose eth1 bridge is not
+        // retired, which the test builder's unset start index is not.
+        let BeaconState::Gloas(inner) = &mut gloas else {
+            panic!("a gloas test state");
+        };
+        inner.deposit_requests_start_index = inner.eth1_deposit_index;
         let state = upgrade_to_heze(&gloas, &config).unwrap();
         let slot = state.slot();
         let block = gloas_beacon_block(slot, H256::ZERO, H256::ZERO, H256::repeat_byte(1));
