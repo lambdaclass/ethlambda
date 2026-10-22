@@ -1962,6 +1962,7 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "sha2",
+ "snap",
  "tempfile",
  "thiserror 2.0.18",
  "tikv-jemallocator",
