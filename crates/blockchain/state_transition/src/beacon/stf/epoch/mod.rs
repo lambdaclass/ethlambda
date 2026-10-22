@@ -15,17 +15,24 @@
 //!   is already exiting when the slashing penalty is scaled.
 
 pub mod altair;
+#[cfg(any(test, debug_assertions))]
+pub mod altair_reference;
 pub mod capella;
 pub mod electra;
 pub mod fulu;
 pub mod gloas;
 pub mod justification;
+#[cfg(test)]
+mod participation_equivalence;
 pub mod registry;
 pub mod rewards;
+mod single_pass;
+#[cfg(test)]
+mod single_pass_equivalence;
 
 use crate::beacon::containers::phase0::PendingAttestation;
 use crate::beacon::containers::{BeaconState, HistoricalBatch};
-use crate::beacon::error::{Result, verify};
+use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::{
     CommitteeCache, CommitteeCacheExt, get_block_root, get_block_root_at_slot, get_current_epoch,
@@ -284,11 +291,6 @@ pub fn process_eth1_data_reset(state: &mut BeaconState) -> Result<()> {
 /// and since effective balance feeds the shuffling seed's weighting and every
 /// reward, that would churn far more than it measures.
 pub fn process_effective_balance_updates(state: &mut BeaconState) -> Result<()> {
-    const HYSTERESIS_INCREMENT: Gwei =
-        preset::EFFECTIVE_BALANCE_INCREMENT / preset::HYSTERESIS_QUOTIENT;
-    const DOWNWARD_THRESHOLD: Gwei = HYSTERESIS_INCREMENT * preset::HYSTERESIS_DOWNWARD_MULTIPLIER;
-    const UPWARD_THRESHOLD: Gwei = HYSTERESIS_INCREMENT * preset::HYSTERESIS_UPWARD_MULTIPLIER;
-
     // Decided in one pass and applied in another: `validator_mut` clones the
     // element into the update buffer on every call, whether or not it is
     // then written (see its own doc), so deciding and writing in one combined
@@ -296,16 +298,22 @@ pub fn process_effective_balance_updates(state: &mut BeaconState) -> Result<()> 
     // validators that actually move. Collecting the decisions first also
     // keeps this fork-independent, which matters because every fork runs
     // this step unchanged.
-    debug_assert_eq!(state.iter_validators().len(), state.iter_balances().len());
+    // The specification reads `state.balances[index]` for every validator, so
+    // a balance list shorter than the registry fails at its first missing
+    // entry. Checked here because the zip below would stop at it silently.
+    let balance_count = state.iter_balances().len();
+    if balance_count < state.validator_count() {
+        return Err(Error::UnknownValidator(balance_count as ValidatorIndex));
+    }
     let mut updates = Vec::new();
+    // Zipped rather than indexed: step 3 only writes the balances that changed,
+    // so `balance(index)` would be a tree descent for most validators.
     for (index, (validator, balance)) in state
         .iter_validators()
         .zip(state.iter_balances())
         .enumerate()
     {
-        if balance + DOWNWARD_THRESHOLD < validator.effective_balance
-            || validator.effective_balance + UPWARD_THRESHOLD < balance
-        {
+        if leaves_hysteresis_band(validator.effective_balance, balance)? {
             let effective = (balance - balance % preset::EFFECTIVE_BALANCE_INCREMENT)
                 .min(preset::MAX_EFFECTIVE_BALANCE);
             updates.push((index as ValidatorIndex, effective));
@@ -316,6 +324,37 @@ pub fn process_effective_balance_updates(state: &mut BeaconState) -> Result<()> 
         state.validator_mut(index)?.effective_balance = effective;
     }
     Ok(())
+}
+
+/// Whether `balance` has moved far enough from `effective_balance` for the
+/// effective balance to follow it: the hysteresis test every fork's
+/// effective-balance update shares.
+///
+/// `HYSTERESIS_INCREMENT` is divided first and only then multiplied up to each
+/// threshold: multiplying first is algebraically equivalent but rounds
+/// differently, and only the specification's order reproduces its integer
+/// rounding. Both sums are checked, since the specification treats a `uint64`
+/// overflow as an invalid transition, where a wrapped sum would compare as a
+/// small number and move the effective balance. The upward sum is only taken
+/// when the downward comparison fails, as the specification's `or`
+/// short-circuits.
+pub(super) fn leaves_hysteresis_band(effective_balance: Gwei, balance: Gwei) -> Result<bool> {
+    const HYSTERESIS_INCREMENT: Gwei =
+        preset::EFFECTIVE_BALANCE_INCREMENT / preset::HYSTERESIS_QUOTIENT;
+    const DOWNWARD_THRESHOLD: Gwei = HYSTERESIS_INCREMENT * preset::HYSTERESIS_DOWNWARD_MULTIPLIER;
+    const UPWARD_THRESHOLD: Gwei = HYSTERESIS_INCREMENT * preset::HYSTERESIS_UPWARD_MULTIPLIER;
+
+    let below = balance
+        .checked_add(DOWNWARD_THRESHOLD)
+        .ok_or(Error::ArithmeticOverflow("balance + DOWNWARD_THRESHOLD"))?
+        < effective_balance;
+    Ok(below
+        || effective_balance
+            .checked_add(UPWARD_THRESHOLD)
+            .ok_or(Error::ArithmeticOverflow(
+                "effective_balance + UPWARD_THRESHOLD",
+            ))?
+            < balance)
 }
 
 /// Zeroes the slot the slashings ring buffer is about to reuse.
