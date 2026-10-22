@@ -682,7 +682,7 @@ mod gloas {
             .unwrap();
         let recorded = network.aggregates.lock().unwrap();
         assert_eq!(recorded.len(), 1);
-        assert_eq!(recorded[0], SignedAggregateAndProof::Gloas(signed));
+        assert_eq!(recorded[0].0, SignedAggregateAndProof::Gloas(signed));
     }
 
     /// [`super::signed_aggregate`] for gloas, whose `Attestation` roots
