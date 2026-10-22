@@ -115,6 +115,7 @@ pub fn stateful_checks(store: &Store, signed: &SignedInclusionList) -> Outcome {
 }
 
 fn stateful_rules(store: &Store, signed: &SignedInclusionList) -> Result<(), Outcome> {
+    let config = store.config();
     let inclusion_list = &signed.message;
     let dependent_root = inclusion_list.dependent_root;
     // [IGNORE] The dependent block has been seen (never queued).
@@ -148,7 +149,7 @@ fn stateful_rules(store: &Store, signed: &SignedInclusionList) -> Result<(), Out
         return Err(Outcome::Reject(RejectReason::NotInInclusionListCommittee));
     }
     // [REJECT] The signature is valid.
-    if !is_valid_inclusion_list_signature(&state, signed) {
+    if !is_valid_inclusion_list_signature(&config, &state, signed) {
         return Err(Outcome::Reject(RejectReason::BadSignature));
     }
     Ok(())

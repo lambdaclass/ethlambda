@@ -1068,7 +1068,7 @@ mod tests {
         assert_eq!(config.inclusion_list_due_bps, 7_000);
 
         let config = config_from_spec_response(&serde_json::json!({})).expect("builds");
-        assert_eq!(config.inclusion_list_due_bps, 6_667);
+        assert_eq!(config.inclusion_list_due_bps, 7_500);
     }
 
     /// A node that has not moved to the basis-point form keeps the defaults,
