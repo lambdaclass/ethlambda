@@ -198,7 +198,10 @@ pub fn trials() -> Vec<Trial> {
                 // registry and several other lists become progressive, and
                 // the builder registry and payload-timeliness bookkeeping are
                 // new fields, so it needs its own type too.
-                "BeaconState" if fork.is_gloas_or_later() => check::<gloas::BeaconState>(case),
+                "BeaconState" if fork == ForkName::Gloas => check::<gloas::BeaconState>(case),
+                // Heze (EIP-8015) drops four eth1 and deposit-index fields from
+                // the state, leaving gaps in its progressive layout.
+                "BeaconState" if fork == ForkName::Heze => check::<heze::BeaconState>(case),
 
                 "BeaconBlock" if fork == ForkName::Phase0 => check::<phase0::BeaconBlock>(case),
                 "BeaconBlockBody" if fork == ForkName::Phase0 => {
@@ -247,12 +250,18 @@ pub fn trials() -> Vec<Trial> {
                 // attestations instead, so it needs its own block family
                 // rather than electra's. Ahead of the `>= Electra` arms below,
                 // which would otherwise catch a gloas case first.
-                "BeaconBlock" if fork.is_gloas_or_later() => check::<gloas::BeaconBlock>(case),
-                "BeaconBlockBody" if fork.is_gloas_or_later() => {
+                "BeaconBlock" if fork == ForkName::Gloas => check::<gloas::BeaconBlock>(case),
+                "BeaconBlockBody" if fork == ForkName::Gloas => {
                     check::<gloas::BeaconBlockBody>(case)
                 }
-                "SignedBeaconBlock" if fork.is_gloas_or_later() => {
+                "SignedBeaconBlock" if fork == ForkName::Gloas => {
                     check::<gloas::SignedBeaconBlock>(case)
+                }
+                // Heze (EIP-8015) drops `eth1_data` and `deposits` from the body.
+                "BeaconBlock" if fork == ForkName::Heze => check::<heze::BeaconBlock>(case),
+                "BeaconBlockBody" if fork == ForkName::Heze => check::<heze::BeaconBlockBody>(case),
+                "SignedBeaconBlock" if fork == ForkName::Heze => {
+                    check::<heze::SignedBeaconBlock>(case)
                 }
 
                 // Fulu does not change the block's shape: its body still carries
@@ -489,8 +498,9 @@ pub fn trials() -> Vec<Trial> {
                 "SignedProposerPreferences" => check::<gloas::SignedProposerPreferences>(case),
 
                 // Heze (EIP-7805). The bid's new `inclusion_list_bits` is
-                // covered by the gloas arms above: heze's bid, block and state
-                // are gloas's containers with a heze-shaped bid.
+                // covered by the gloas arms above: heze's bid is gloas's
+                // container with a heze-shaped bid (the block and state
+                // containers are heze's own, in the arms above).
                 "InclusionList" => check::<heze::InclusionList>(case),
                 "SignedInclusionList" => check::<heze::SignedInclusionList>(case),
 

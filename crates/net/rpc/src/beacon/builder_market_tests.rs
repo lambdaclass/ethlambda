@@ -550,7 +550,10 @@ async fn nothing_is_cached_for_a_bid_block_and_a_self_build_envelope_for_it_is_r
     // The block is imported; the proposer's self-build envelope for it names
     // a different builder than the bid, so it is refused.
     let mut store = world.store.clone();
-    let post = post_state(&world.advanced(), &block);
+    let post = post_state(
+        &world.advanced(),
+        &ethlambda_types::beacon::containers::GloasBlock::Gloas(block.clone()),
+    );
     store
         .insert_signed_block(
             root,

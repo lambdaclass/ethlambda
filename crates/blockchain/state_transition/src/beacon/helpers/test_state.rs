@@ -141,13 +141,11 @@ pub fn with_validators_at(fork: ForkName, count: usize) -> BeaconState {
         ForkName::Electra => BeaconState::Electra(electra_state(count)),
         ForkName::Fulu => BeaconState::Fulu(fulu_state(count)),
         ForkName::Gloas => BeaconState::Gloas(gloas_state(count)),
-        // Heze's state is gloas's with a heze-shaped bid (see
-        // `containers::gloas::ExecutionPayloadBid`).
         ForkName::Heze => {
-            let mut state = gloas_state(count);
+            let mut state = crate::beacon::containers::heze::BeaconState::from(gloas_state(count));
             state.latest_execution_payload_bid.inclusion_list_bits =
                 Some(crate::beacon::containers::heze::InclusionListBits::new());
-            BeaconState::Gloas(state)
+            BeaconState::Heze(state)
         }
         // A test asking for a lean state from a beacon builder, which no fixture
         // fork name can produce; the `fork:` form, since the argument is the
@@ -178,6 +176,7 @@ pub fn replace_balances(state: &mut BeaconState, balances: Vec<Gwei>) {
         BeaconState::Electra(state) => state.balances = bounded(balances),
         BeaconState::Fulu(state) => state.balances = bounded(balances),
         BeaconState::Gloas(state) => state.balances = balances.into(),
+        BeaconState::Heze(state) => state.balances = balances.into(),
         BeaconState::Lean(_) => lean_state_unreachable("replace_balances"),
     }
 }

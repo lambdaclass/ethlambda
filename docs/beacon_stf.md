@@ -730,9 +730,10 @@ a name that does not parse is skipped. That skip is silent in a way the
 not counted as ignored either, and nothing in the output says they exist.
 
 `gloas` and `heze` do not take this silent path: both parse, so their cases
-become ordinary tests, individually named and run. Heze reuses gloas's
-containers (only the bid gains `inclusion_list_bits`, see `ForkName::Heze`'s
-doc), so the whole gloas machinery runs its fixtures, `upgrade_to_heze`
+become ordinary tests, individually named and run. Heze has its own
+state and block containers (EIP-8015 removes the eth1 fields and the body's
+`eth1_data` and `deposits`) and shares the gloas bid, so the gloas machinery
+runs its fixtures through the fork-generic accessors, `upgrade_to_heze`
 included.
 
 `UNMODELED_FORKS` is empty at the pinned release, and

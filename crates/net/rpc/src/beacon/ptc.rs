@@ -191,7 +191,7 @@ fn ptc_duties(
         ));
     }
 
-    let readable_from_head = matches!(*head_state, BeaconState::Gloas(_))
+    let readable_from_head = matches!(*head_state, BeaconState::Gloas(_) | BeaconState::Heze(_))
         && epoch <= state_epoch + preset::MIN_SEED_LOOKAHEAD;
     let state: Arc<BeaconState> = if readable_from_head {
         head_state
@@ -285,15 +285,15 @@ async fn get_payload_attestation_data(
 /// The number of blob commitments in a gloas block's bid.
 fn bid_commitment_count(block: &SignedBeaconBlock) -> Option<usize> {
     match block {
-        SignedBeaconBlock::Gloas(inner) => Some(
-            inner
-                .message
-                .body
-                .signed_execution_payload_bid
-                .message
-                .blob_kzg_commitments
-                .len(),
-        ),
+        SignedBeaconBlock::Gloas(_) | SignedBeaconBlock::Heze(_) => {
+            block.gloas_message().map(|message| {
+                message
+                    .signed_execution_payload_bid()
+                    .message
+                    .blob_kzg_commitments
+                    .len()
+            })
+        }
         _ => None,
     }
 }

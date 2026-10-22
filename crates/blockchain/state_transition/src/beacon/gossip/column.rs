@@ -442,6 +442,14 @@ pub fn stateful_checks_gloas(store: &Store, sidecar: &gloas::DataColumnSidecar) 
                 .message
                 .blob_kzg_commitments
         }
+        SignedBeaconBlock::Heze(block) => {
+            &block
+                .message
+                .body
+                .signed_execution_payload_bid
+                .message
+                .blob_kzg_commitments
+        }
         // A block of any other fork has no bid to read commitments from, so
         // no sidecar of this shape can be valid for it.
         SignedBeaconBlock::Phase0(_)

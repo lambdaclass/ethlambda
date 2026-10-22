@@ -342,6 +342,17 @@ pub fn process_slot(state: &mut BeaconState) -> Result<()> {
                 .set(next_position, false)
                 .expect("next_position is in [0, SLOTS_PER_HISTORICAL_ROOT)");
         }
+        BeaconState::Heze(inner) => {
+            let next_slot = inner
+                .slot
+                .checked_add(1)
+                .ok_or(Error::ArithmeticOverflow("process_slot: slot + 1"))?;
+            let next_position = (next_slot % preset::SLOTS_PER_HISTORICAL_ROOT as u64) as usize;
+            inner
+                .execution_payload_availability
+                .set(next_position, false)
+                .expect("next_position is in [0, SLOTS_PER_HISTORICAL_ROOT)");
+        }
         BeaconState::Lean(_) => lean_state_unreachable("process_slot"),
     }
 
@@ -552,7 +563,10 @@ mod tests {
                 true
             }),
             ("eth1_data_votes", |s| {
-                s.eth1_data_votes_mut().push(Default::default()).unwrap();
+                s.eth1_data_votes_mut()
+                    .unwrap()
+                    .push(Default::default())
+                    .unwrap();
                 true
             }),
             ("randao_mixes", |s| {

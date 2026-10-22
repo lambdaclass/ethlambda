@@ -102,6 +102,11 @@ pub fn process_block(
         containers::SignedBeaconBlock::Gloas(signed) => {
             gloas::process_block(state, &signed.message, config, committees, active_balances)
         }
+        // Heze's block body drops `eth1_data` and `deposits` (EIP-8015); the
+        // rest of block processing is gloas's own.
+        containers::SignedBeaconBlock::Heze(signed) => {
+            gloas::process_block(state, &signed.message, config, committees, active_balances)
+        }
         containers::SignedBeaconBlock::Lean(_) => {
             crate::beacon::lean_block_unreachable("process_block")
         }
@@ -269,16 +274,16 @@ pub fn process_randao(state: &mut BeaconState, randao_reveal: &BlsSignature) -> 
 /// count used for the majority check includes the vote just appended, so a
 /// single block can supply the deciding vote.
 pub fn process_eth1_data(state: &mut BeaconState, eth1_data: &Eth1Data) -> Result<()> {
-    state.eth1_data_votes_mut().push(eth1_data.clone())?;
+    state.eth1_data_votes_mut()?.push(eth1_data.clone())?;
 
     let matching_votes = state
-        .eth1_data_votes()
+        .eth1_data_votes()?
         .iter()
         .filter(|vote| *vote == eth1_data)
         .count() as u64;
     let voting_period_slots = preset::EPOCHS_PER_ETH1_VOTING_PERIOD * preset::SLOTS_PER_EPOCH;
     if matching_votes * 2 > voting_period_slots {
-        *state.eth1_data_mut() = eth1_data.clone();
+        *state.eth1_data_mut()? = eth1_data.clone();
     }
     Ok(())
 }

@@ -9,10 +9,10 @@ use super::{
     IgnoreReason, Outcome, QueueReason, RejectReason, SeenBlocks, execution_requests_within_limits,
     finalized_ancestry, finalized_start_slot, is_future_slot,
 };
-use crate::beacon::containers::{BeaconState, SignedBeaconBlock, gloas};
+use crate::beacon::containers::{BeaconState, GloasBlockRef, SignedBeaconBlock};
 use crate::beacon::fork_choice::{self, Store};
 use crate::beacon::helpers::misc::compute_epoch_at_slot;
-use crate::beacon::lean_boundary::{lean_block_unreachable, lean_state_unreachable};
+use crate::beacon::lean_boundary::lean_state_unreachable;
 use crate::beacon::precheck::{self, PrecheckError, Reference, precheck_block};
 use crate::beacon::preset;
 use crate::beacon::primitives::{ExecutionBlockHash, Root};
@@ -54,25 +54,14 @@ pub fn cheap_checks(
     Ok(())
 }
 
-/// `block` as a gloas block, or `None` for every earlier fork.
+/// `block`'s message as a gloas-family block (gloas or heze), or `None` for
+/// every earlier fork.
 ///
-/// Spelled out arm by arm so that a new fork breaks this match rather than
-/// silently taking fulu's rules.
-fn as_gloas<'a>(
-    block: &'a SignedBeaconBlock,
-    function: &str,
-) -> Option<&'a gloas::SignedBeaconBlock> {
-    match block {
-        SignedBeaconBlock::Gloas(block) => Some(block),
-        SignedBeaconBlock::Phase0(_)
-        | SignedBeaconBlock::Altair(_)
-        | SignedBeaconBlock::Bellatrix(_)
-        | SignedBeaconBlock::Capella(_)
-        | SignedBeaconBlock::Deneb(_)
-        | SignedBeaconBlock::Electra(_)
-        | SignedBeaconBlock::Fulu(_) => None,
-        SignedBeaconBlock::Lean(_) => lean_block_unreachable(function),
-    }
+/// Spelled out arm by arm in [`SignedBeaconBlock::gloas_message`], so that a
+/// new fork breaks that match rather than silently taking fulu's rules.
+fn as_gloas<'a>(block: &'a SignedBeaconBlock, function: &str) -> Option<GloasBlockRef<'a>> {
+    let _ = function;
+    block.gloas_message()
 }
 
 /// The gloas rules that read only the block, the clock and the store's
@@ -85,35 +74,34 @@ fn as_gloas<'a>(
 fn cheap_checks_gloas(
     seen: &SeenBlocks,
     store: &Store,
-    signed_block: &gloas::SignedBeaconBlock,
+    block: GloasBlockRef<'_>,
     now_ms: u64,
 ) -> Result<(), Outcome> {
     let config = store.config();
-    let block = &signed_block.message;
     // [IGNORE] The block is the first with a valid signature for its slot and
     // proposer.
-    if seen.contains(block.slot, block.proposer_index) {
+    if seen.contains(block.slot(), block.proposer_index()) {
         return Err(Outcome::Ignore(IgnoreReason::AlreadySeen));
     }
     // [IGNORE] The block is not from a future slot.
-    if is_future_slot(&config, block.slot, now_ms) {
+    if is_future_slot(&config, block.slot(), now_ms) {
         return Err(Outcome::Ignore(IgnoreReason::FutureSlot));
     }
     // [IGNORE] The block is from a slot greater than the latest finalized slot.
-    if block.slot <= finalized_start_slot(store) {
+    if block.slot() <= finalized_start_slot(store) {
         return Err(Outcome::Ignore(IgnoreReason::Finalized));
     }
     // [REJECT] The body's operation counts, and the parent execution
     // requests' counts, are within their limits.
-    if !body_operations_within_limits(&block.body)
-        || !execution_requests_within_limits(&block.body.parent_execution_requests)
+    if !body_operations_within_limits(block)
+        || !execution_requests_within_limits(block.parent_execution_requests())
     {
         return Err(Outcome::Reject(RejectReason::OperationLimit));
     }
     // [REJECT] The bid's blob KZG commitment count is within the per-epoch
     // limit.
-    let bid = &block.body.signed_execution_payload_bid.message;
-    let max_blobs = config.max_blobs_per_block(compute_epoch_at_slot(block.slot));
+    let bid = &block.signed_execution_payload_bid().message;
+    let max_blobs = config.max_blobs_per_block(compute_epoch_at_slot(block.slot()));
     if bid.blob_kzg_commitments.len() as u64 > max_blobs {
         return Err(Outcome::Reject(RejectReason::TooManyBlobs));
     }
@@ -124,14 +112,15 @@ fn cheap_checks_gloas(
 ///
 /// Gloas's operation lists are progressive, so unlike every earlier fork's
 /// they carry no bound of their own and decoding does not enforce it.
-fn body_operations_within_limits(body: &gloas::BeaconBlockBody) -> bool {
-    body.proposer_slashings.len() <= preset::MAX_PROPOSER_SLASHINGS
-        && body.attester_slashings.len() <= preset::MAX_ATTESTER_SLASHINGS_ELECTRA
-        && body.attestations.len() <= preset::MAX_ATTESTATIONS_ELECTRA
-        && body.deposits.is_empty()
-        && body.voluntary_exits.len() <= preset::MAX_VOLUNTARY_EXITS
-        && body.bls_to_execution_changes.len() <= preset::MAX_BLS_TO_EXECUTION_CHANGES
-        && body.payload_attestations.len() as u64 <= preset::MAX_PAYLOAD_ATTESTATIONS
+fn body_operations_within_limits(block: GloasBlockRef<'_>) -> bool {
+    block.proposer_slashings().len() <= preset::MAX_PROPOSER_SLASHINGS
+        && block.attester_slashings().len() <= preset::MAX_ATTESTER_SLASHINGS_ELECTRA
+        && block.attestations().len() <= preset::MAX_ATTESTATIONS_ELECTRA
+        // [Modified in Heze:EIP8015] Heze's body has no deposits to bound.
+        && block.deposits_len() == 0
+        && block.voluntary_exits().len() <= preset::MAX_VOLUNTARY_EXITS
+        && block.bls_to_execution_changes().len() <= preset::MAX_BLS_TO_EXECUTION_CHANGES
+        && block.payload_attestations().len() as u64 <= preset::MAX_PAYLOAD_ATTESTATIONS
 }
 
 /// The rules that need the parent's post-state. Runs on a blocking thread.
@@ -196,12 +185,8 @@ pub fn stateful_checks(store: &Store, block: &SignedBeaconBlock, block_root: Roo
     // execution payload's timestamp is the slot's.
     if let Some(gloas_block) = gloas_block {
         // [REJECT] The bid's parent equals the block's parent.
-        let bid = &gloas_block
-            .message
-            .body
-            .signed_execution_payload_bid
-            .message;
-        if bid.parent_block_root != gloas_block.message.parent_root {
+        let bid = &gloas_block.signed_execution_payload_bid().message;
+        if bid.parent_block_root != gloas_block.parent_root() {
             return Outcome::Reject(RejectReason::BidParentMismatch);
         }
         // [REJECT] If the parent is not full, the bid builds on the parent's
@@ -230,6 +215,7 @@ pub fn stateful_checks(store: &Store, block: &SignedBeaconBlock, block_root: Roo
 fn latest_block_hash(state: &BeaconState) -> Option<ExecutionBlockHash> {
     match state {
         BeaconState::Gloas(state) => Some(state.latest_block_hash),
+        BeaconState::Heze(state) => Some(state.latest_block_hash),
         BeaconState::Phase0(_)
         | BeaconState::Altair(_)
         | BeaconState::Bellatrix(_)
@@ -296,6 +282,7 @@ mod tests {
         DEPOSIT_CONTRACT_TREE_DEPTH, DOMAIN_BEACON_PROPOSER,
         MAXIMUM_GOSSIP_CLOCK_DISPARITY as DISPARITY,
     };
+    use crate::beacon::containers::gloas;
     use crate::beacon::containers::{BeaconState, electra};
     use crate::beacon::fork_choice;
     use crate::beacon::gossip::test_support::{
@@ -384,8 +371,15 @@ mod tests {
 
     #[test]
     fn a_gloas_body_is_limited_per_operation_and_carries_no_deposits() {
+        let within_limits = |body: &gloas::BeaconBlockBody| {
+            let block = gloas::BeaconBlock {
+                body: body.clone(),
+                ..Default::default()
+            };
+            body_operations_within_limits(GloasBlockRef::Gloas(&block))
+        };
         let body = gloas::BeaconBlockBody::default();
-        assert!(body_operations_within_limits(&body));
+        assert!(within_limits(&body));
 
         let mut with_deposit = body.clone();
         let deposit = crate::beacon::containers::Deposit {
@@ -397,13 +391,13 @@ mod tests {
         with_deposit.deposits = vec![deposit]
             .try_into()
             .expect("progressive lists are unbounded");
-        assert!(!body_operations_within_limits(&with_deposit));
+        assert!(!within_limits(&with_deposit));
 
         let mut too_many_exits = body;
         too_many_exits.voluntary_exits = vec![Default::default(); preset::MAX_VOLUNTARY_EXITS + 1]
             .try_into()
             .expect("progressive lists are unbounded");
-        assert!(!body_operations_within_limits(&too_many_exits));
+        assert!(!within_limits(&too_many_exits));
     }
 
     #[test]

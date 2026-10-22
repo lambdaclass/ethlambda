@@ -24,7 +24,6 @@ use ethlambda_engine::{EngineClient, EngineError, PayloadStatusV1, PayloadStatus
 use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::containers::{self, SignedBeaconBlock};
 use ethlambda_state_transition::beacon::fork_choice::PayloadValidity;
-use ethlambda_state_transition::beacon::primitives::HashTreeRoot as _;
 use ethlambda_state_transition::beacon::primitives::{Bytes32, Root};
 use ethlambda_state_transition::beacon::stf::deneb::kzg_commitment_to_versioned_hash;
 use ethlambda_state_transition::beacon::stf::electra::get_execution_requests_list;
@@ -74,22 +73,18 @@ pub fn gloas_new_payload_request<'a>(
     envelope: &'a containers::gloas::SignedExecutionPayloadEnvelope,
 ) -> Result<GloasNewPayloadRequest<'a>, EngineError> {
     let mismatch = |reason: &str| Err(EngineError::EnvelopeMismatch(reason.to_string()));
-    let inner = match block {
-        SignedBeaconBlock::Gloas(inner) => inner,
-        SignedBeaconBlock::Phase0(_)
-        | SignedBeaconBlock::Altair(_)
-        | SignedBeaconBlock::Bellatrix(_)
-        | SignedBeaconBlock::Capella(_)
-        | SignedBeaconBlock::Deneb(_)
-        | SignedBeaconBlock::Electra(_)
-        | SignedBeaconBlock::Fulu(_)
-        | SignedBeaconBlock::Lean(_) => return mismatch("the block is not a gloas block"),
+    let message = match block {
+        SignedBeaconBlock::Lean(_) => return mismatch("the block is not a gloas block"),
+        other => other.gloas_message(),
+    };
+    let Some(message) = message else {
+        return mismatch("the block is not a gloas block");
     };
 
-    if envelope.message.beacon_block_root != inner.message.hash_tree_root() {
+    if envelope.message.beacon_block_root != message.hash_tree_root() {
         return mismatch("the envelope's beacon_block_root is not the block's root");
     }
-    let bid = &inner.message.body.signed_execution_payload_bid.message;
+    let bid = &message.signed_execution_payload_bid().message;
     if bid.block_hash != envelope.message.payload.block_hash {
         return mismatch("the bid's block_hash is not the payload's block_hash");
     }
@@ -135,6 +130,7 @@ pub fn new_payload_request(block: &SignedBeaconBlock) -> Option<NewPayloadReques
         | SignedBeaconBlock::Capella(_)
         | SignedBeaconBlock::Deneb(_)
         | SignedBeaconBlock::Gloas(_)
+        | SignedBeaconBlock::Heze(_)
         | SignedBeaconBlock::Lean(_) => return None,
     };
 
@@ -253,6 +249,7 @@ pub async fn ask_envelope_status(
 #[cfg(test)]
 mod tests {
     use ethlambda_state_transition::beacon::preset;
+    use ethlambda_state_transition::beacon::primitives::HashTreeRoot as _;
     use ethlambda_state_transition::beacon::primitives::{
         BlsSignature, ExecutionAddress, ExecutionBlockHash, KzgCommitment, Uint256,
     };

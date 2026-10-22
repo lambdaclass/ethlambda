@@ -30,22 +30,22 @@ use super::helpers::accessors::{
     get_randao_mix,
 };
 use super::helpers::gloas::{
-    can_builder_cover_bid, get_indexed_payload_attestation, get_ptc, gloas_state_ref,
-    is_active_builder, is_attestation_same_slot, is_valid_indexed_payload_attestation,
+    can_builder_cover_bid, get_indexed_payload_attestation, get_ptc, is_active_builder,
+    is_attestation_same_slot, is_valid_indexed_payload_attestation,
 };
 use super::stf;
-use ethlambda_types::beacon::containers::heze::InclusionListBits;
+use ethlambda_types::beacon::containers::heze::{self, InclusionListBits};
 use ethlambda_types::beacon::{
     constants,
     containers::{
-        BeaconState,
+        BeaconState, GloasBlock,
         altair::SyncAggregate,
         capella::Withdrawal,
         electra,
         gloas::{
-            self, BeaconBlock, BeaconBlockBody, ExecutionPayload, ExecutionPayloadBid,
-            ExecutionPayloadEnvelope, ExecutionRequests, PayloadAttestation,
-            PayloadAttestationData, PayloadAttestationMessage, SignedExecutionPayloadBid,
+            self, BeaconBlockBody, ExecutionPayload, ExecutionPayloadBid, ExecutionPayloadEnvelope,
+            ExecutionRequests, PayloadAttestation, PayloadAttestationData,
+            PayloadAttestationMessage, SignedExecutionPayloadBid,
         },
     },
     preset,
@@ -88,8 +88,7 @@ pub fn gloas_payload_inputs(
     parent_requests: &ExecutionRequests,
     config: &Config,
 ) -> Result<GloasPayloadInputs> {
-    let inner = gloas_state_ref(state, "gloas_payload_inputs")?;
-    let parent_bid = &inner.latest_execution_payload_bid;
+    let parent_bid = state.latest_execution_payload_bid()?;
     let (withdrawals, head_block_hash) = if build_on_full {
         let mut applied = state.clone();
         stf::gloas::apply_parent_execution_payload(&mut applied, parent_requests, config)?;
@@ -99,7 +98,11 @@ pub fn gloas_payload_inputs(
         )
     } else {
         (
-            inner.payload_expected_withdrawals.iter().cloned().collect(),
+            state
+                .payload_expected_withdrawals()?
+                .iter()
+                .cloned()
+                .collect(),
             parent_bid.parent_block_hash,
         )
     };
@@ -359,6 +362,45 @@ pub struct GloasBlockInputs {
     pub inclusion_list_bits: Option<InclusionListBits>,
 }
 
+/// The `eth1_data` a gloas body votes: the state's own. Heze has none (EIP-8015),
+/// and its block drops the field when [`unsigned_block`] narrows the body, so
+/// the default stands in there.
+fn eth1_vote(state: &BeaconState) -> ethlambda_types::beacon::containers::Eth1Data {
+    state.eth1_data().cloned().unwrap_or_default()
+}
+
+/// The unsigned block for `state`'s slot around `body`, in `state`'s fork: gloas's
+/// as is, heze's with the two fields EIP-8015 removes dropped. `state_root` is
+/// left zero for the caller to fill from a `process_block` run.
+fn unsigned_block(state: &BeaconState, body: BeaconBlockBody) -> Result<GloasBlock> {
+    let slot = state.slot();
+    let proposer_index = get_beacon_proposer_index(state)?;
+    // `process_slots` filled the header's state root on the way out of the
+    // parent's slot, so this is the parent block's root.
+    let parent_root = state.latest_block_header().hash_tree_root();
+    Ok(match state {
+        BeaconState::Gloas(_) => GloasBlock::Gloas(gloas::BeaconBlock {
+            slot,
+            proposer_index,
+            parent_root,
+            state_root: Root::ZERO,
+            body,
+        }),
+        BeaconState::Heze(_) => GloasBlock::Heze(heze::BeaconBlock {
+            slot,
+            proposer_index,
+            parent_root,
+            state_root: Root::ZERO,
+            body: body.into(),
+        }),
+        _ => {
+            return Err(Error::SpecAssert(
+                "gloas block production runs on a gloas or heze state",
+            ));
+        }
+    })
+}
+
 /// What a gloas block body carries when it commits to another builder's bid
 /// rather than to a payload this node built.
 #[derive(Debug, Clone)]
@@ -387,14 +429,14 @@ pub fn assemble_gloas_block_on_bid(
     state: &BeaconState,
     inputs: GloasBidBlockInputs,
     config: &Config,
-) -> Result<BeaconBlock> {
+) -> Result<GloasBlock> {
     verify(
-        matches!(state, BeaconState::Gloas(_)),
-        "gloas block production runs on a gloas state",
+        matches!(state, BeaconState::Gloas(_) | BeaconState::Heze(_)),
+        "gloas block production runs on a gloas or heze state",
     )?;
     let body = BeaconBlockBody {
         randao_reveal: inputs.randao_reveal,
-        eth1_data: state.eth1_data().clone(),
+        eth1_data: eth1_vote(state),
         graffiti: inputs.graffiti,
         attestations: inputs.attestations.into(),
         sync_aggregate: inputs.sync_aggregate,
@@ -403,13 +445,7 @@ pub fn assemble_gloas_block_on_bid(
         parent_execution_requests: inputs.parent_execution_requests,
         ..BeaconBlockBody::empty()
     };
-    let mut block = BeaconBlock {
-        slot: state.slot(),
-        proposer_index: get_beacon_proposer_index(state)?,
-        parent_root: state.latest_block_header().hash_tree_root(),
-        state_root: Root::ZERO,
-        body,
-    };
+    let mut block = unsigned_block(state, body)?;
     let mut post = state.clone();
     stf::gloas::process_block(
         &mut post,
@@ -418,7 +454,7 @@ pub fn assemble_gloas_block_on_bid(
         &CommitteeCache::default(),
         &ActiveBalanceCache::default(),
     )?;
-    block.state_root = post.hash_tree_root();
+    block.set_state_root(post.hash_tree_root());
     Ok(block)
 }
 
@@ -439,13 +475,17 @@ pub fn bid_is_includable(
     signed_bid: &SignedExecutionPayloadBid,
     parent_requests: &ExecutionRequests,
 ) -> bool {
-    let BeaconState::Gloas(inner) = state else {
+    let (Ok(parent_bid), Ok(latest_block_hash), Ok(builders)) = (
+        state.latest_execution_payload_bid(),
+        state.latest_block_hash(),
+        state.builders(),
+    ) else {
         return false;
     };
     let bid = &signed_bid.message;
-    let parent_is_full = bid.parent_block_hash == inner.latest_execution_payload_bid.block_hash;
-    let builds_on_known_parent = parent_is_full || bid.parent_block_hash == inner.latest_block_hash;
-    let Some(builder) = inner.builders.get(bid.builder_index as usize) else {
+    let parent_is_full = bid.parent_block_hash == parent_bid.block_hash;
+    let builds_on_known_parent = parent_is_full || bid.parent_block_hash == *latest_block_hash;
+    let Some(builder) = builders.get(bid.builder_index as usize) else {
         return false;
     };
     let exited_by_parent = parent_is_full
@@ -460,14 +500,14 @@ pub fn bid_is_includable(
         && builder.version == constants::PAYLOAD_BUILDER_VERSION
         && bid.blob_kzg_commitments.len() <= preset::MAX_BLOB_COMMITMENTS_PER_BLOCK
         && !exited_by_parent
-        && is_active_builder(inner, bid.builder_index).unwrap_or(false)
-        && can_builder_cover_bid(inner, bid.builder_index, bid.value).unwrap_or(false)
+        && is_active_builder(state, bid.builder_index).unwrap_or(false)
+        && can_builder_cover_bid(state, bid.builder_index, bid.value).unwrap_or(false)
 }
 
 /// A produced block and the unsigned envelope that reveals its payload.
 #[derive(Debug, Clone)]
 pub struct GloasProduced {
-    pub block: BeaconBlock,
+    pub block: GloasBlock,
     pub envelope: ExecutionPayloadEnvelope,
 }
 
@@ -487,8 +527,8 @@ pub fn assemble_gloas_block(
     config: &Config,
 ) -> Result<GloasProduced> {
     verify(
-        matches!(state, BeaconState::Gloas(_)),
-        "gloas block production runs on a gloas state",
+        matches!(state, BeaconState::Gloas(_) | BeaconState::Heze(_)),
+        "gloas block production runs on a gloas or heze state",
     )?;
     let payload = &inputs.execution_payload;
     let bid = ExecutionPayloadBid {
@@ -508,7 +548,7 @@ pub fn assemble_gloas_block(
     };
     let body = BeaconBlockBody {
         randao_reveal: inputs.randao_reveal,
-        eth1_data: state.eth1_data().clone(),
+        eth1_data: eth1_vote(state),
         graffiti: inputs.graffiti,
         attestations: inputs.attestations.into(),
         sync_aggregate: inputs.sync_aggregate,
@@ -520,20 +560,9 @@ pub fn assemble_gloas_block(
         parent_execution_requests: inputs.parent_execution_requests,
         ..BeaconBlockBody::empty()
     };
-    let mut block = BeaconBlock {
-        slot: state.slot(),
-        proposer_index: get_beacon_proposer_index(state)?,
-        // `process_slots` filled the header's state root on the way out of
-        // the parent's slot, so this is the parent block's root.
-        parent_root: state.latest_block_header().hash_tree_root(),
-        state_root: Root::ZERO,
-        body,
-    };
+    let mut block = unsigned_block(state, body)?;
 
     let mut post = state.clone();
-    let BeaconState::Gloas(_) = &post else {
-        unreachable!("checked above")
-    };
     stf::gloas::process_block(
         &mut post,
         &block,
@@ -541,14 +570,14 @@ pub fn assemble_gloas_block(
         &CommitteeCache::default(),
         &ActiveBalanceCache::default(),
     )?;
-    block.state_root = post.hash_tree_root();
+    block.set_state_root(post.hash_tree_root());
 
     let envelope = ExecutionPayloadEnvelope {
         payload: inputs.execution_payload,
         execution_requests: inputs.execution_requests,
         builder_index: constants::BUILDER_INDEX_SELF_BUILD,
         beacon_block_root: block.hash_tree_root(),
-        parent_beacon_block_root: block.parent_root,
+        parent_beacon_block_root: block.parent_root(),
     };
     check_envelope(&post, &envelope, config)?;
     Ok(GloasProduced { block, envelope })
@@ -578,8 +607,7 @@ fn check_envelope(
         envelope.parent_beacon_block_root == post.latest_block_header().parent_root,
         "envelope.parent_beacon_block_root == state.latest_block_header.parent_root",
     )?;
-    let inner = gloas_state_ref(post, "check_envelope")?;
-    let bid = &inner.latest_execution_payload_bid;
+    let bid = post.latest_execution_payload_bid()?;
     verify(
         envelope.builder_index == bid.builder_index,
         "envelope.builder_index == bid.builder_index",
@@ -605,7 +633,7 @@ fn check_envelope(
         "payload.slot_number == state.slot",
     )?;
     verify(
-        payload.parent_hash == inner.latest_block_hash,
+        payload.parent_hash == *post.latest_block_hash()?,
         "payload.parent_hash == state.latest_block_hash",
     )?;
     verify(
@@ -613,7 +641,8 @@ fn check_envelope(
         "payload.timestamp == compute_time_at_slot(state, state.slot)",
     )?;
     verify(
-        payload.withdrawals.hash_tree_root() == inner.payload_expected_withdrawals.hash_tree_root(),
+        payload.withdrawals.hash_tree_root()
+            == post.payload_expected_withdrawals()?.hash_tree_root(),
         "hash_tree_root(payload.withdrawals) == hash_tree_root(state.payload_expected_withdrawals)",
     )?;
     Ok(())
@@ -746,7 +775,7 @@ pub mod test_support {
     }
 
     /// The state after `block` is applied to `state`, as the chain stores it.
-    pub fn post_state(state: &BeaconState, block: &BeaconBlock) -> BeaconState {
+    pub fn post_state(state: &BeaconState, block: &GloasBlock) -> BeaconState {
         let mut post = state.clone();
         stf::gloas::process_block(
             &mut post,
@@ -760,10 +789,10 @@ pub mod test_support {
     }
 
     /// The proposer's signature over `block`, as a validator client gives it.
-    pub fn sign_block(state: &BeaconState, block: &BeaconBlock) -> BlsSignature {
+    pub fn sign_block(state: &BeaconState, block: &GloasBlock) -> BlsSignature {
         let domain = get_domain(state, constants::DOMAIN_BEACON_PROPOSER, None);
         sign_for(
-            block.proposer_index as usize,
+            block.proposer_index() as usize,
             compute_signing_root(block.hash_tree_root(), domain),
         )
     }
@@ -883,7 +912,7 @@ mod gloas_block_production_tests {
             &config(),
         )
         .unwrap();
-        assert_eq!(produced.block.body.sync_aggregate, good);
+        assert_eq!(*produced.block.sync_aggregate(), good);
     }
 
     #[test]
@@ -893,17 +922,14 @@ mod gloas_block_production_tests {
         let GloasProduced { block, envelope } = &produced;
 
         // Signed by the proposer, as a validator client would.
-        let signed = gloas::SignedBeaconBlock {
-            message: block.clone(),
-            signature: {
-                let domain = get_domain(&state, constants::DOMAIN_BEACON_PROPOSER, None);
-                sign_for(
-                    block.proposer_index as usize,
-                    compute_signing_root(block.hash_tree_root(), domain),
-                )
-            },
+        let signature = {
+            let domain = get_domain(&state, constants::DOMAIN_BEACON_PROPOSER, None);
+            sign_for(
+                block.proposer_index() as usize,
+                compute_signing_root(block.hash_tree_root(), domain),
+            )
         };
-        let wrapped = ethlambda_types::beacon::containers::SignedBeaconBlock::Gloas(signed);
+        let wrapped = block.clone().into_signed(signature);
         assert!(stf::verify_block_signature(&state, &wrapped));
 
         // Applying it again, the way a peer importing it would, lands on the
@@ -918,7 +944,7 @@ mod gloas_block_production_tests {
             &ActiveBalanceCache::default(),
         )
         .unwrap();
-        assert_eq!(block.state_root, post.hash_tree_root());
+        assert_eq!(block.state_root(), post.hash_tree_root());
 
         // The envelope, signed by the same proposer under DOMAIN_BEACON_BUILDER,
         // passes the full import-side check.
@@ -926,7 +952,7 @@ mod gloas_block_production_tests {
         let signed_envelope = gloas::SignedExecutionPayloadEnvelope {
             message: envelope.clone(),
             signature: sign_for(
-                block.proposer_index as usize,
+                block.proposer_index() as usize,
                 compute_signing_root(envelope.hash_tree_root(), domain),
             ),
         };
@@ -938,14 +964,14 @@ mod gloas_block_production_tests {
         )
         .unwrap();
         assert_eq!(envelope.beacon_block_root, block.hash_tree_root());
-        assert_eq!(envelope.parent_beacon_block_root, block.parent_root);
+        assert_eq!(envelope.parent_beacon_block_root, block.parent_root());
     }
 
     #[test]
     fn the_bid_is_a_zero_value_self_build_over_the_payload() {
         let state = state_to_build_on();
         let produced = produce(&state, true, Vec::new()).unwrap();
-        let signed_bid = &produced.block.body.signed_execution_payload_bid;
+        let signed_bid = &produced.block.signed_execution_payload_bid();
         let bid = &signed_bid.message;
         let payload = &produced.envelope.payload;
         assert_eq!(bid.builder_index, constants::BUILDER_INDEX_SELF_BUILD);
@@ -997,8 +1023,7 @@ mod gloas_block_production_tests {
         let parent_hash = |produced: &GloasProduced| {
             produced
                 .block
-                .body
-                .signed_execution_payload_bid
+                .signed_execution_payload_bid()
                 .message
                 .parent_block_hash
         };
@@ -1099,7 +1124,7 @@ mod gloas_block_production_tests {
 
         // It rides in a block that passes the full STF.
         let produced = produce(&state, true, packed).unwrap();
-        assert_eq!(produced.block.body.payload_attestations.len(), 2);
+        assert_eq!(produced.block.payload_attestations().len(), 2);
     }
 
     #[test]
@@ -1342,16 +1367,16 @@ mod bid_assembly_tests {
         ));
         let block =
             assemble_gloas_block_on_bid(&state, inputs(&state, bid.clone()), &config()).unwrap();
-        assert_eq!(block.body.signed_execution_payload_bid, bid);
-        assert_eq!(block.slot, state.slot());
-        assert_ne!(block.state_root, Root::ZERO);
+        assert_eq!(*block.signed_execution_payload_bid(), bid);
+        assert_eq!(block.slot(), state.slot());
+        assert_ne!(block.state_root(), Root::ZERO);
         // The block goes through the state transition as the network would run it.
         let post = post_state(&state, &block);
         let BeaconState::Gloas(inner) = &post else {
             unreachable!("gloas")
         };
         assert_eq!(inner.latest_execution_payload_bid, bid.message);
-        assert_eq!(block.state_root, post.hash_tree_root());
+        assert_eq!(block.state_root(), post.hash_tree_root());
     }
 
     #[test]

@@ -129,7 +129,7 @@
 use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::config::Config;
 use ethlambda_state_transition::beacon::containers::{
-    BeaconState, altair, bellatrix, capella, deneb, electra, gloas, phase0, shared,
+    BeaconState, altair, bellatrix, capella, deneb, electra, gloas, heze, phase0, shared,
 };
 use ethlambda_state_transition::beacon::helpers::accessors::{ActiveBalanceCache, CommitteeCache};
 use ethlambda_state_transition::beacon::primitives::{HashTreeRoot as _, Slot};
@@ -254,8 +254,20 @@ fn apply(
             // `process_block_header` unmodified: a `BeaconBlockHeader` never
             // carried a payload to begin with, so the four fields this shared
             // function reads are unaffected.
-            ForkName::Gloas | ForkName::Heze => {
+            ForkName::Gloas => {
                 let block: gloas::BeaconBlock = case.ssz("block");
+                block::process_block_header(
+                    state,
+                    block.slot,
+                    block.proposer_index,
+                    block.parent_root,
+                    block.body.hash_tree_root(),
+                )
+            }
+            // Heze's block differs only in a body without `eth1_data` and
+            // `deposits` (EIP-8015), which the header's `body_root` commits to.
+            ForkName::Heze => {
+                let block: heze::BeaconBlock = case.ssz("block");
                 block::process_block_header(
                     state,
                     block.slot,
@@ -563,10 +575,28 @@ fn apply(
         // New in gloas (EIP-7732): the *next* block's processing of the
         // previous slot's payload, so the fixture's operation file is a whole
         // `BeaconBlock`, named `block` like `block_header`'s.
-        "parent_execution_payload" => {
-            let block: gloas::BeaconBlock = case.ssz("block");
-            gloas_stf::process_parent_execution_payload(state, &block, config)
-        }
+        "parent_execution_payload" => match case.fork {
+            ForkName::Heze => {
+                let block: heze::BeaconBlock = case.ssz("block");
+                let body = &block.body;
+                gloas_stf::process_parent_execution_payload(
+                    state,
+                    &body.signed_execution_payload_bid.message,
+                    &body.parent_execution_requests,
+                    config,
+                )
+            }
+            _ => {
+                let block: gloas::BeaconBlock = case.ssz("block");
+                let body = &block.body;
+                gloas_stf::process_parent_execution_payload(
+                    state,
+                    &body.signed_execution_payload_bid.message,
+                    &body.parent_execution_requests,
+                    config,
+                )
+            }
+        },
         // `consolidation_request` and `withdrawal_request` are new in
         // electra, alongside `withdrawals`; neither fulu's nor gloas's own
         // specification lists either as modified (gloas's own

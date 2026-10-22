@@ -687,7 +687,10 @@ impl BeaconNodeApi for MockBeaconNode {
             });
             let block = ProducedBlock {
                 fork: ForkName::Gloas,
-                contents: Contents::Gloas { block, payload },
+                contents: Contents::Gloas {
+                    block: block.into(),
+                    payload,
+                },
             };
             crate::beacon_node::validate_produced_block(request, &block)?;
             return Ok(block);

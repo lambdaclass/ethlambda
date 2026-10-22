@@ -59,7 +59,8 @@ use ethlambda_types::{
     aggregator::AggregatorController,
     beacon::config::Config,
     beacon::containers::{
-        BeaconState, SignedBeaconBlock, altair, bellatrix, capella, deneb, electra, gloas, phase0,
+        BeaconState, SignedBeaconBlock, altair, bellatrix, capella, deneb, electra, gloas, heze,
+        phase0,
     },
     beacon::fork::ForkName,
     genesis::{GenesisConfig, verify_state_genesis},
@@ -2002,18 +2003,39 @@ async fn fetch_initial_beacon_state(
 /// header names whichever of the two the network was built with, so that one
 /// is the anchor's; when it names neither, the empty body is returned and
 /// `get_forkchoice_store`'s header check reports the mismatch.
-fn gloas_genesis_body(state: &BeaconState, fork: ForkName) -> gloas::BeaconBlockBody {
-    let empty = gloas::BeaconBlockBody::empty_at(fork);
+fn gloas_genesis_body(state: &BeaconState) -> gloas::BeaconBlockBody {
+    let empty = gloas::BeaconBlockBody::empty_at(ForkName::Gloas);
+    mirrored_genesis_body(state, empty, |body, bid| {
+        body.signed_execution_payload_bid.message = bid;
+    })
+}
+
+/// [`gloas_genesis_body`] for heze, whose body has no `eth1_data` and `deposits`
+/// (EIP-8015).
+fn heze_genesis_body(state: &BeaconState) -> heze::BeaconBlockBody {
+    let empty = heze::BeaconBlockBody::empty();
+    mirrored_genesis_body(state, empty, |body, bid| {
+        body.signed_execution_payload_bid.message = bid;
+    })
+}
+
+/// `empty`, or `empty` with the state's own bid when that is the body the
+/// state's header commits to; `empty` again when it names neither.
+fn mirrored_genesis_body<B: Clone + ethlambda_types::beacon::primitives::HashTreeRoot>(
+    state: &BeaconState,
+    empty: B,
+    set_bid: impl FnOnce(&mut B, gloas::ExecutionPayloadBid),
+) -> B {
     let body_root = state.latest_block_header().body_root;
-    if empty.hash_tree_root() == body_root {
+    if ethlambda_types::beacon::primitives::HashTreeRoot::hash_tree_root(&empty) == body_root {
         return empty;
     }
-    let BeaconState::Gloas(inner) = state else {
+    let Ok(bid) = state.latest_execution_payload_bid() else {
         return empty;
     };
     let mut mirrored = empty.clone();
-    mirrored.signed_execution_payload_bid.message = inner.latest_execution_payload_bid.clone();
-    if mirrored.hash_tree_root() == body_root {
+    set_bid(&mut mirrored, bid.clone());
+    if ethlambda_types::beacon::primitives::HashTreeRoot::hash_tree_root(&mirrored) == body_root {
         mirrored
     } else {
         empty
@@ -2101,18 +2123,26 @@ fn genesis_anchor_block(state: &BeaconState) -> SignedBeaconBlock {
             },
             signature: Default::default(),
         }),
-        fork @ (ForkName::Gloas | ForkName::Heze) => {
-            SignedBeaconBlock::Gloas(gloas::SignedBeaconBlock {
-                message: gloas::BeaconBlock {
-                    slot,
-                    proposer_index,
-                    parent_root,
-                    state_root,
-                    body: gloas_genesis_body(state, fork),
-                },
-                signature: Default::default(),
-            })
-        }
+        ForkName::Gloas => SignedBeaconBlock::Gloas(gloas::SignedBeaconBlock {
+            message: gloas::BeaconBlock {
+                slot,
+                proposer_index,
+                parent_root,
+                state_root,
+                body: gloas_genesis_body(state),
+            },
+            signature: Default::default(),
+        }),
+        ForkName::Heze => SignedBeaconBlock::Heze(heze::SignedBeaconBlock {
+            message: heze::BeaconBlock {
+                slot,
+                proposer_index,
+                parent_root,
+                state_root,
+                body: heze_genesis_body(state),
+            },
+            signature: Default::default(),
+        }),
         // Never reached: this is only called on a network's own genesis
         // state, and every `NetworkSource` decodes a beacon fork there
         // (`NetworkDir::load` resolves the fork from `Config::fork_at_epoch`,
@@ -2997,6 +3027,15 @@ validators:
         let mut state = beacon::mainnet_genesis_state().unwrap();
 
         for fork in ForkName::ALL {
+            if fork == ForkName::Heze {
+                // Heze's upgrade asserts the eth1 bridge is retired (EIP-8015),
+                // which a genesis state that never processed a deposit request
+                // does not satisfy on its own.
+                let BeaconState::Gloas(inner) = &mut state else {
+                    panic!("the chain is at gloas before the heze upgrade");
+                };
+                inner.deposit_requests_start_index = inner.eth1_deposit_index;
+            }
             if fork != ForkName::Phase0 {
                 state = ethlambda_state_transition::beacon::upgrade::upgrade_state(
                     &state, fork, &config,
@@ -3013,9 +3052,8 @@ validators:
                 ForkName::Electra | ForkName::Fulu => {
                     electra::BeaconBlockBody::empty().hash_tree_root()
                 }
-                ForkName::Gloas | ForkName::Heze => {
-                    gloas::BeaconBlockBody::empty_at(fork).hash_tree_root()
-                }
+                ForkName::Gloas => gloas::BeaconBlockBody::empty_at(fork).hash_tree_root(),
+                ForkName::Heze => heze::BeaconBlockBody::empty().hash_tree_root(),
                 ForkName::Lean => unreachable!("ForkName::ALL excludes Lean"),
             };
             state.latest_block_header_mut().body_root = empty_body_root;

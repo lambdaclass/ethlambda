@@ -443,13 +443,13 @@ pub fn process_deposit(state: &mut BeaconState, deposit: &Deposit, config: &Conf
             deposit.data.hash_tree_root(),
             &deposit.proof,
             (constants::DEPOSIT_CONTRACT_TREE_DEPTH + 1) as u64,
-            state.eth1_deposit_index(),
-            state.eth1_data().deposit_root,
+            *state.eth1_deposit_index()?,
+            state.eth1_data()?.deposit_root,
         ),
         "is_valid_merkle_branch(hash_tree_root(deposit.data), deposit.proof, DEPOSIT_CONTRACT_TREE_DEPTH + 1, state.eth1_deposit_index, state.eth1_data.deposit_root)",
     )?;
 
-    *state.eth1_deposit_index_mut() += 1;
+    *state.eth1_deposit_index_mut()? += 1;
 
     apply_deposit(
         state,
@@ -1789,11 +1789,11 @@ pub fn process_operations(
     let deposit_requests_start_index =
         block_ref(state, "process_operations")?.deposit_requests_start_index();
     let eth1_deposit_index_limit = state
-        .eth1_data()
+        .eth1_data()?
         .deposit_count
         .min(deposit_requests_start_index);
-    if state.eth1_deposit_index() < eth1_deposit_index_limit {
-        let outstanding = eth1_deposit_index_limit - state.eth1_deposit_index();
+    if *state.eth1_deposit_index()? < eth1_deposit_index_limit {
+        let outstanding = eth1_deposit_index_limit - *state.eth1_deposit_index()?;
         verify(
             body.deposits.len() as u64 == outstanding.min(preset::MAX_DEPOSITS as u64),
             "len(body.deposits) == min(MAX_DEPOSITS, eth1_deposit_index_limit - state.eth1_deposit_index)",

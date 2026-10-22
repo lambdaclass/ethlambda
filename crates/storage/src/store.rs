@@ -194,7 +194,11 @@ const KEY_ANCHOR_SLOT: &[u8] = b"anchor_slot";
 /// would otherwise look identical to "no unrealized justification computed
 /// yet" rather than "this directory predates the table", the same silent
 /// wrong answer every prior bump exists to rule out.
-pub const DB_VERSION: u64 = 6;
+///
+/// 7 gave heze its own state and block containers (EIP-8015 removes the eth1
+/// and deposit-index fields): a heze state or block written by the previous
+/// version is gloas-shaped bytes under a heze fork tag, which no longer decode.
+pub const DB_VERSION: u64 = 7;
 
 /// The consensus protocol a data directory holds.
 ///
@@ -988,6 +992,15 @@ fn decode_beacon_block_value(bytes: &[u8]) -> SignedBeaconBlock {
 fn builds_on_payload(block: &SignedBeaconBlock, payload_block_hash: &ExecutionBlockHash) -> bool {
     match block {
         SignedBeaconBlock::Gloas(block) => {
+            block
+                .message
+                .body
+                .signed_execution_payload_bid
+                .message
+                .parent_block_hash
+                == *payload_block_hash
+        }
+        SignedBeaconBlock::Heze(block) => {
             block
                 .message
                 .body
@@ -7136,7 +7149,12 @@ mod tests {
                 .historical_roots()
                 .ptr_eq(resident.historical_roots())
         );
-        assert!(decoded.eth1_data_votes().ptr_eq(resident.eth1_data_votes()));
+        assert!(
+            decoded
+                .eth1_data_votes()
+                .unwrap()
+                .ptr_eq(resident.eth1_data_votes().unwrap())
+        );
         assert_eq!(decoded.to_ssz(), child.to_ssz());
     }
 

@@ -124,7 +124,7 @@ use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::config::Config;
 use ethlambda_state_transition::beacon::containers::{
     BeaconState, Checkpoint, SignedBeaconBlock, altair, bellatrix, capella, deneb, electra, fulu,
-    gloas, phase0,
+    gloas, heze, phase0,
 };
 use ethlambda_state_transition::beacon::fork_choice::{
     self, DataAvailability, ForkChoiceNode, ForkRules, PayloadStatus, Store,
@@ -341,12 +341,14 @@ pub(super) fn decode_anchor_block(case: &Case) -> Result<SignedBeaconBlock, Stri
             message: decode(case, "anchor_block")?,
             signature: Default::default(),
         })),
-        ForkName::Gloas | ForkName::Heze => {
-            Ok(SignedBeaconBlock::Gloas(gloas::SignedBeaconBlock {
-                message: decode(case, "anchor_block")?,
-                signature: Default::default(),
-            }))
-        }
+        ForkName::Gloas => Ok(SignedBeaconBlock::Gloas(gloas::SignedBeaconBlock {
+            message: decode(case, "anchor_block")?,
+            signature: Default::default(),
+        })),
+        ForkName::Heze => Ok(SignedBeaconBlock::Heze(heze::SignedBeaconBlock {
+            message: decode(case, "anchor_block")?,
+            signature: Default::default(),
+        })),
         ForkName::Lean => lean_is_not_a_fixture_fork("fork_choice"),
     }
 }

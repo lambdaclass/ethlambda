@@ -584,6 +584,7 @@ fn proposer_duties(
     let proposer_lookahead = match state.as_ref() {
         BeaconState::Fulu(fulu) => &fulu.proposer_lookahead,
         BeaconState::Gloas(gloas) => &gloas.proposer_lookahead,
+        BeaconState::Heze(heze) => &heze.proposer_lookahead,
         _ => {
             return Err(ApiError::BadRequest(
                 "proposer duties are served from the proposer lookahead of fulu and gloas only",
@@ -852,7 +853,7 @@ fn payload_present_index(
     if head_state.slot() == slot {
         return Ok(0);
     }
-    if !matches!(head_state, BeaconState::Gloas(_)) {
+    if !matches!(head_state, BeaconState::Gloas(_) | BeaconState::Heze(_)) {
         return Ok(1);
     }
     let status = match store.head_payload_status() {

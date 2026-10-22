@@ -1445,7 +1445,12 @@ mod gloas {
                 let published = network.blocks.lock().unwrap().first().cloned();
                 if let Some(SignedBeaconBlock::Gloas(signed)) = published {
                     let root = signed.message.hash_tree_root();
-                    let post = post_state(&parent, &signed.message);
+                    let post = post_state(
+                        &parent,
+                        &ethlambda_types::beacon::containers::GloasBlock::Gloas(
+                            signed.message.clone(),
+                        ),
+                    );
                     store
                         .insert_signed_block(root, SignedBeaconBlock::Gloas(signed))
                         .unwrap();
