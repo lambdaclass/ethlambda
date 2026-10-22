@@ -251,7 +251,7 @@ The bookkeeping an import triggers (chain-event emission, the finality eviction 
 
 `decode` is a gossip-only section, so `queue` is the only one a fetched block crosses before the chain actor. The req/resp codec has already turned the bytes into a block before any handler sees one, leaving no decode boundary to take; the path reports nothing rather than a zero, since a zero reads as free work rather than as unmeasured work and would drag the decode histogram down with samples that measured nothing. Two consequences: `decode` is a gossip population even though the `source` label allows `sync`, and a fetched block's `total` starts later in its life than a gossiped block's, having never counted the request round trip at all.
 
-On the beacon wire, `decode` for `source="gossip"` spans more than its name says. `BlockArrival::decode_start` is still the wire arrival, but `handed_off` is stamped only once the block has a gossip verdict, so the section also covers the cheap, stateless checks, the stateful check's own `spawn_blocking` task, and the verdict's trip back through the p2p actor's mailbox. There is no wait for a free validation slot to attribute here either: `try_acquire_owned` never blocks, and a message arriving with none free is reported `Ignore(Overloaded)` (and still forwarded to the chain actor) rather than queued. A rising `decode` on the beacon wire alone therefore does not mean decoding got slower; check `lean_beacon_gossip_validation_seconds` before assuming so.
+On the beacon wire, `decode` for `source="gossip"` spans more than its name says. `BlockArrival::decode_start` is still the wire arrival, but `handed_off` is stamped only once the block has a gossip verdict, so the section also covers the cheap, stateless checks, the stateful check's own `spawn_blocking` task, and the verdict's trip back through the p2p actor's mailbox. There is no wait for a free validation slot to attribute here either: `try_acquire_owned` never blocks, and a message arriving with none free is reported `Ignore(Overloaded)` rather than queued. A block reported that way never reaches the chain actor, so it contributes no import timing at all. A rising `decode` on the beacon wire alone therefore does not mean decoding got slower; check `lean_beacon_gossip_validation_seconds` before assuming so.
 
 `engine` and `fcu` are execution-client round trips. They are I/O waits rather than work, so a node whose import time is dominated by them is waiting on its execution client, not spending CPU.
 
@@ -383,6 +383,13 @@ only), `not_aggregator` (aggregate only), `not_in_committee`,
 only), `target_not_ancestor`, `wrong_subnet` (attestation only) on the reject
 side. `already_seen` and `overloaded` are shared with every other topic.
 
+`beacon_block` has one ignore reason of its own, `signature_unverified`: a
+block whose parent has no post-state yet, and whose proposer signature no
+cached state could check (no head state cached, or a proposer newer than the
+head state). It is dropped rather than queued, so it never reaches the chain
+actor. A resumed node caches its head state at startup, so a restart alone
+does not produce it.
+
 Two permit pools bound the blocking-thread half of validation:
 `gossip_validation_permits` for blocks and columns,
 `attestation_validation_permits` for aggregates and subnet attestations. They
@@ -459,6 +466,7 @@ spec.
 | `lean_data_column_kzg_verify_seconds` | Histogram | Time spent batch-verifying one sidecar's cells against its own commitments | On each KZG batch verification, in gossip validation or the chain checks | | 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0 |
 | `lean_data_column_fetch_failures_total` | Counter | `DataColumnsByRoot` lookups this node gave up on, by reason | On lookup abandonment | reason=no_peers,max_retries | |
 | `lean_blocks_held_for_columns` | Gauge | Blocks held out of fork choice pending their custody columns | On every hold, release, and finality eviction of the held-block set | | |
+| `lean_beacon_blocks_refused_before_waiting_total` | Counter | Blocks the chain actor refused instead of parking them for their parent or holding them for their columns, by the precheck rule they broke | On each refusal in `precheck_before_waiting`, whatever path delivered the block | reason=not_after_parent,wrong_proposer,unknown_proposer,bad_signature, wait=parent,columns | |
 | `lean_sidecars_awaiting_parent` | Gauge | Sidecars parked until their block's parent has a post-state | On every park, replay, and finality eviction of the parked set | | |
 
 `lean_data_columns_rejected_total` counts the chain checks, which run in the
