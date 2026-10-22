@@ -743,6 +743,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                 ethlambda_rpc::BeaconApiHandles {
                     p2p: rpc_p2p,
                     engine: rpc_engine,
+                    events: rpc_events,
                 },
                 local_peer_id,
                 rpc_shutdown,

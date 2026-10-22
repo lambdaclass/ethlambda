@@ -183,7 +183,7 @@ pub fn build_beacon_api_router(store: Store, version: &'static str, peer_id: Str
         .with_state(store)
 }
 
-/// What the Beacon API's validator endpoints reach beyond the store.
+/// What the Beacon API's endpoints reach beyond the store.
 pub struct BeaconApiHandles {
     /// Through which the pool, aggregate and block endpoints gossip what a
     /// validator client hands them.
@@ -191,14 +191,17 @@ pub struct BeaconApiHandles {
     /// The execution client block production builds payloads with; `None`
     /// makes it answer 503.
     pub engine: Option<ethlambda_engine::EngineClient>,
+    /// The chain-event bus `/eth/v1/events` streams from. Read only there:
+    /// the chain actor is its only publisher, so no endpoint here writes to it.
+    pub events: EventBus,
 }
 
 /// Start the HTTP servers for a beacon node.
 ///
 /// The beacon counterpart to [`start_rpc_server`]. It takes no
-/// `AggregatorController` and no `EventBus`: a follower has no aggregator duty
-/// to toggle, and the chain-events stream is part of the lean surface. It does
-/// take the [`BeaconApiHandles`] the validator endpoints need.
+/// `AggregatorController`, since a follower has no aggregator duty to toggle,
+/// and it does take the [`BeaconApiHandles`] the validator and event
+/// endpoints need.
 pub async fn start_beacon_rpc_server(
     config: RpcConfig,
     store: Store,
@@ -211,7 +214,8 @@ pub async fn start_beacon_rpc_server(
         .layer(Extension(sync_status))
         .layer(Extension(handles.p2p))
         .layer(Extension(beacon::validator::FeeRecipients::default()))
-        .layer(Extension(handles.engine));
+        .layer(Extension(handles.engine))
+        .layer(Extension(handles.events));
     start_http_servers(config, Some(api_router), shutdown).await
 }
 
@@ -405,8 +409,14 @@ pub(crate) mod test_utils {
                 ethlambda_types::beacon::containers::electra::SingleAttestation,
             )>,
         >,
-        pub(crate) aggregates:
-            std::sync::Mutex<Vec<ethlambda_types::beacon::containers::SignedAggregateAndProof>>,
+        /// Each published aggregate, with the attesting indices handed on
+        /// beside it.
+        pub(crate) aggregates: std::sync::Mutex<
+            Vec<(
+                ethlambda_types::beacon::containers::SignedAggregateAndProof,
+                Vec<ethlambda_types::beacon::primitives::ValidatorIndex>,
+            )>,
+        >,
         pub(crate) operations:
             std::sync::Mutex<Vec<ethlambda_types::beacon::operation::BeaconOperation>>,
         pub(crate) subscriptions: std::sync::Mutex<Vec<(u64, u64)>>,
@@ -434,8 +444,12 @@ pub(crate) mod test_utils {
         fn publish_beacon_aggregate(
             &self,
             aggregate: ethlambda_types::beacon::containers::SignedAggregateAndProof,
+            attesting_indices: Vec<ethlambda_types::beacon::primitives::ValidatorIndex>,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
-            self.aggregates.lock().unwrap().push(aggregate);
+            self.aggregates
+                .lock()
+                .unwrap()
+                .push((aggregate, attesting_indices));
             Ok(())
         }
 
