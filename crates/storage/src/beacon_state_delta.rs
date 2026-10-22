@@ -113,7 +113,7 @@ pub(crate) fn unframe(bytes: &[u8]) -> (H256, u64, u64, &[u8]) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use proptest::prelude::*;
 
@@ -289,7 +289,14 @@ mod tests {
     /// [`advance_across_epoch_boundary`]) are counted too, which is why every
     /// test that calls this is `#[ignore]`d.
     fn mainnet_scale_electra_state() -> electra::BeaconState {
-        let validators: Vec<Validator> = (0..VALIDATOR_COUNT)
+        electra_state_with_validators(VALIDATOR_COUNT)
+    }
+
+    /// [`mainnet_scale_electra_state`] with `count` validators, for tests that
+    /// need the electra shape (every tree-backed field populated) without the
+    /// mainnet cost.
+    pub(crate) fn electra_state_with_validators(count: usize) -> electra::BeaconState {
+        let validators: Vec<Validator> = (0..count)
             .map(|_| Validator {
                 effective_balance: preset::MIN_ACTIVATION_BALANCE,
                 activation_eligibility_epoch: 0,
@@ -320,33 +327,33 @@ mod tests {
             eth1_deposit_index: 0,
             validators: validators
                 .try_into()
-                .expect("VALIDATOR_COUNT is far below VALIDATOR_REGISTRY_LIMIT"),
-            balances: vec![preset::MIN_ACTIVATION_BALANCE; VALIDATOR_COUNT]
+                .expect("`count` is far below VALIDATOR_REGISTRY_LIMIT"),
+            balances: vec![preset::MIN_ACTIVATION_BALANCE; count]
                 .try_into()
-                .expect("VALIDATOR_COUNT is far below VALIDATOR_REGISTRY_LIMIT"),
+                .expect("`count` is far below VALIDATOR_REGISTRY_LIMIT"),
             randao_mixes: vec![H256::ZERO; preset::EPOCHS_PER_HISTORICAL_VECTOR]
                 .try_into()
                 .expect("the vector is built at its exact length"),
             slashings: vec![0; preset::EPOCHS_PER_SLASHINGS_VECTOR]
                 .try_into()
                 .expect("the vector is built at its exact length"),
-            previous_epoch_participation: vec![0u8; VALIDATOR_COUNT]
+            previous_epoch_participation: vec![0u8; count]
                 .try_into()
-                .expect("VALIDATOR_COUNT is far below VALIDATOR_REGISTRY_LIMIT"),
+                .expect("`count` is far below VALIDATOR_REGISTRY_LIMIT"),
             // Uniform and non-zero, standing in for "everyone was timely last
             // epoch": what makes advance_across_epoch_boundary's shift of this
             // into `previous_epoch_participation` a real change rather than a
             // zero-to-zero no-op.
-            current_epoch_participation: vec![0b0000_0111u8; VALIDATOR_COUNT]
+            current_epoch_participation: vec![0b0000_0111u8; count]
                 .try_into()
-                .expect("VALIDATOR_COUNT is far below VALIDATOR_REGISTRY_LIMIT"),
+                .expect("`count` is far below VALIDATOR_REGISTRY_LIMIT"),
             justification_bits: Default::default(),
             previous_justified_checkpoint: Default::default(),
             current_justified_checkpoint: Default::default(),
             finalized_checkpoint: Default::default(),
-            inactivity_scores: vec![0u64; VALIDATOR_COUNT]
+            inactivity_scores: vec![0u64; count]
                 .try_into()
-                .expect("VALIDATOR_COUNT is far below VALIDATOR_REGISTRY_LIMIT"),
+                .expect("`count` is far below VALIDATOR_REGISTRY_LIMIT"),
             current_sync_committee: empty_sync_committee(),
             next_sync_committee: empty_sync_committee(),
             latest_execution_payload_header: execution_payload_header_for_slot(0),
@@ -419,8 +426,8 @@ mod tests {
         for index in 0..state.balances.len() {
             state.balances[index] = balance_for_index(index);
         }
-        for (index, score) in state.inactivity_scores.iter_mut().enumerate() {
-            *score = inactivity_score_for_index(index);
+        for index in 0..state.inactivity_scores.len() {
+            state.inactivity_scores[index] = inactivity_score_for_index(index);
         }
 
         // Most validators' effective balance moves; hysteresis means a

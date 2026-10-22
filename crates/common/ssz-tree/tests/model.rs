@@ -521,3 +521,221 @@ proptest! {
         rebase_shrunk::<Item, 33, BTreeMap<usize, Item>>(orig_values, extra, hash_orig_first, hash_base_first)?;
     }
 }
+
+// ── Shapes the beacon state's tree fields take ──
+
+/// A 32-byte transparent newtype whose `HashTreeRoot` is derived, so it
+/// reports a composite (the shape `H256` had before it forwarded the answer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[ssz(transparent)]
+struct CompositeHash([u8; 32]);
+
+/// The same newtype with `is_basic_type` forwarded, as `H256` now does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SszEncode, SszDecode)]
+#[ssz(transparent)]
+struct BasicHash([u8; 32]);
+
+impl HashTreeRoot for BasicHash {
+    fn hash_tree_root(&self, hasher: &impl libssz_merkle::Sha256Hasher) -> libssz_merkle::Node {
+        HashTreeRoot::hash_tree_root(&self.0, hasher)
+    }
+
+    fn is_basic_type() -> bool {
+        <[u8; 32] as HashTreeRoot>::is_basic_type()
+    }
+}
+
+fn composite_hash() -> impl Strategy<Value = CompositeHash> + Clone {
+    prop_oneof![
+        Just(CompositeHash([0; 32])),
+        any::<[u8; 32]>().prop_map(CompositeHash)
+    ]
+}
+
+fn basic_hash() -> impl Strategy<Value = BasicHash> + Clone {
+    prop_oneof![
+        Just(BasicHash([0; 32])),
+        any::<[u8; 32]>().prop_map(BasicHash)
+    ]
+}
+
+fn zero_prone_u8() -> impl Strategy<Value = u8> + Clone {
+    prop_oneof![3 => Just(0u8), 1 => any::<u8>()]
+}
+
+/// Like `check_rebase`, for vectors, which never change length.
+fn rebase_vector<T, const N: usize, U>(
+    base_values: Vec<T>,
+    writes: Vec<(usize, T)>,
+    hash_base_first: bool,
+) -> Result<(), TestCaseError>
+where
+    T: Value + Debug,
+    U: UpdateMap<T>,
+{
+    let base = Vector::<T, N, U>::try_from(base_values.clone()).unwrap();
+    if hash_base_first {
+        root(&base);
+    }
+    let mut model = base_values.clone();
+    let mut orig = base.clone();
+    for (index, value) in writes {
+        let index = index % N;
+        orig[index] = value.clone();
+        model[index] = value;
+    }
+    orig.apply_updates();
+    // A decoded copy shares nothing with `base`, so sharing comes from the rebase.
+    let bytes = orig.to_ssz();
+    let mut orig = Vector::<T, N, U>::from_ssz_bytes(&bytes).unwrap();
+
+    orig.rebase_on(&base);
+
+    let reference = SszVector::<T, N>::try_from(model.clone()).unwrap();
+    prop_assert_eq!(orig.to_vec(), model.clone());
+    prop_assert_eq!(root(&orig), root(&reference));
+    let base_reference = SszVector::<T, N>::try_from(base_values.clone()).unwrap();
+    prop_assert_eq!(base.to_vec(), base_values.clone());
+    prop_assert_eq!(root(&base), root(&base_reference));
+    if model == base_values {
+        prop_assert!(orig.ptr_eq(&base));
+    }
+    Ok(())
+}
+
+proptest! {
+    /// A leaf holds 4096 u8s: this spans several, with the last partial.
+    #[test]
+    fn u8_list_spanning_leaves(
+        initial in vec(any::<u8>(), 0..10_000),
+        ops in ops(any::<u8>()),
+    ) {
+        run_list::<u8, 16_384, VecMap<u8>>(initial, ops)?;
+    }
+
+    /// A leaf holds 512 u64s: 8192 slashings span 16.
+    #[test]
+    fn u64_vector_spanning_leaves(
+        initial in vec(any::<u64>(), 8192),
+        writes in vec((any::<usize>(), any::<u64>(), any::<bool>()), 0..40),
+    ) {
+        run_vector::<u64, 8192, BTreeMap<usize, u64>>(initial, writes)?;
+    }
+
+    /// A leaf holds 128 roots: 300 span three.
+    #[test]
+    fn composite_hash_vector_spanning_leaves(
+        initial in vec(composite_hash(), 300),
+        writes in vec((any::<usize>(), composite_hash(), any::<bool>()), 0..40),
+    ) {
+        run_vector::<CompositeHash, 300, BTreeMap<usize, CompositeHash>>(initial, writes)?;
+    }
+
+    #[test]
+    fn basic_hash_vector_spanning_leaves(
+        initial in vec(basic_hash(), 300),
+        writes in vec((any::<usize>(), basic_hash(), any::<bool>()), 0..40),
+    ) {
+        run_vector::<BasicHash, 300, BTreeMap<usize, BasicHash>>(initial, writes)?;
+    }
+
+    #[test]
+    fn basic_hash_list_spanning_leaves(
+        initial in vec(basic_hash(), 0..300),
+        ops in ops(basic_hash()),
+    ) {
+        run_list::<BasicHash, 512, BTreeMap<usize, BasicHash>>(initial, ops)?;
+    }
+
+    #[test]
+    fn basic_and_composite_hash_collections_have_one_root(
+        values in vec(any::<[u8; 32]>(), 0..300),
+    ) {
+        let basic = List::<BasicHash, 512>::try_from(
+            values.iter().copied().map(BasicHash).collect::<Vec<_>>(),
+        ).unwrap();
+        let composite = List::<CompositeHash, 512>::try_from(
+            values.iter().copied().map(CompositeHash).collect::<Vec<_>>(),
+        ).unwrap();
+        prop_assert_eq!(root(&basic), root(&composite));
+        prop_assert_eq!(basic.to_ssz(), composite.to_ssz());
+    }
+
+    #[test]
+    fn u8_list_decode_parity(bytes in maybe_valid_bytes(vec(any::<u8>(), 0..=300))) {
+        list_decode_parity::<u8, 200>(&bytes)?;
+    }
+
+    #[test]
+    fn basic_hash_vector_decode_parity(bytes in maybe_valid_bytes(vec(basic_hash(), 0..=9))) {
+        vector_decode_parity::<BasicHash, 6>(&bytes)?;
+    }
+
+    #[test]
+    fn u64_vector_decode_parity_multi_leaf(bytes in maybe_valid_bytes(vec(any::<u64>(), 0..=1100))) {
+        vector_decode_parity::<u64, 1024>(&bytes)?;
+    }
+
+    // Mostly-zero lists: the trailing-zero trap in `rebase_on`.
+    #[test]
+    fn u8_rebase_grown(
+        base_values in vec(zero_prone_u8(), 0..9000),
+        ops in ops(zero_prone_u8()),
+        hash_base_first in any::<bool>(),
+        hash_orig_first in any::<bool>(),
+    ) {
+        rebase_grown::<u8, 16_384, VecMap<u8>>(base_values, ops, hash_base_first, hash_orig_first)?;
+    }
+
+    #[test]
+    fn u8_rebase_shrunk(
+        orig_values in vec(zero_prone_u8(), 0..9000),
+        extra in vec(zero_prone_u8(), 0..300),
+        hash_orig_first in any::<bool>(),
+        hash_base_first in any::<bool>(),
+    ) {
+        rebase_shrunk::<u8, 16_384, VecMap<u8>>(orig_values, extra, hash_orig_first, hash_base_first)?;
+    }
+
+    #[test]
+    fn u64_btree_rebase_grown_spanning_leaves(
+        base_values in vec(zero_prone_u64(), 0..1400),
+        ops in ops(zero_prone_u64()),
+        hash_base_first in any::<bool>(),
+        hash_orig_first in any::<bool>(),
+    ) {
+        rebase_grown::<u64, 4096, BTreeMap<usize, u64>>(base_values, ops, hash_base_first, hash_orig_first)?;
+    }
+
+    #[test]
+    fn u64_vector_rebase(
+        base_values in vec(zero_prone_u64(), 1024),
+        writes in vec((any::<usize>(), zero_prone_u64()), 0..8),
+        hash_base_first in any::<bool>(),
+    ) {
+        rebase_vector::<u64, 1024, BTreeMap<usize, u64>>(base_values, writes, hash_base_first)?;
+    }
+
+    #[test]
+    fn basic_hash_vector_rebase(
+        base_values in vec(basic_hash(), 300),
+        writes in vec((any::<usize>(), basic_hash()), 0..8),
+        hash_base_first in any::<bool>(),
+    ) {
+        rebase_vector::<BasicHash, 300, BTreeMap<usize, BasicHash>>(base_values, writes, hash_base_first)?;
+    }
+}
+
+#[test]
+fn buffered_forwards_to_lists_and_vectors() {
+    use ethlambda_ssz_tree::Buffered;
+
+    let mut list = List::<u64, 64>::try_from(vec![1, 2, 3]).unwrap();
+    let mut vector = Vector::<[u8; 32], 4>::try_from(vec![[0u8; 32]; 4]).unwrap();
+    list[0] = 9;
+    vector[1] = [7; 32];
+    let mut fields: Vec<&mut dyn Buffered> = vec![&mut list, &mut vector];
+    assert!(fields.iter().all(|f| f.has_pending_updates()));
+    fields.iter_mut().for_each(|f| f.apply_updates());
+    assert!(fields.iter().all(|f| !f.has_pending_updates()));
+}

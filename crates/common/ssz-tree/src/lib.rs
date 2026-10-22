@@ -69,6 +69,19 @@ pub use vector::Vector;
 use libssz::{SszDecode, SszEncode};
 use libssz_merkle::HashTreeRoot;
 
+/// The buffered-write surface of a [`List`] or [`Vector`], independent of its
+/// element type and update map.
+///
+/// Object safe, so a container can hold one `&dyn Buffered` per tree field of
+/// different element types and flush or check them all from one field list.
+pub trait Buffered {
+    /// Folds every buffered write into the tree.
+    fn apply_updates(&mut self);
+
+    /// Whether any write is buffered and not yet folded into the tree.
+    fn has_pending_updates(&self) -> bool;
+}
+
 /// A 32-byte Merkle node.
 pub(crate) type Hash256 = libssz_merkle::Node;
 
