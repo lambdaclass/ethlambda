@@ -780,6 +780,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     builder_market: builder_market.clone(),
                     custody_columns: rpc_custody_columns,
                     engine: rpc_engine,
+                    events: rpc_events,
                 },
                 local_peer_id,
                 rpc_shutdown,

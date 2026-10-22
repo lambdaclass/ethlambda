@@ -377,6 +377,9 @@ async fn post_aggregate_and_proofs(
         let slot = aggregate.slot();
         let aggregator = aggregate.aggregator_index();
         let seen = aggregate::SeenAggregates::new(capacity, capacity);
+        // The stateful checks resolve the aggregate's bits to the validators
+        // behind them, which the chain actor applies to fork choice once the
+        // network actor hands it over.
         let checked = if header_matches_slot(&store, header_fork, slot) {
             aggregate::cheap_checks(&seen, &store, &aggregate, now_ms)
                 .and_then(|()| aggregate::stateful_checks(&store, &aggregate))
@@ -391,9 +394,8 @@ async fn post_aggregate_and_proofs(
             // The aggregator and every attester its signature verified are
             // live, as when P2P accepts a gossip aggregate.
             let (epoch, _root) = aggregate.target();
-            store
-                .observed_liveness()
-                .record_all(epoch, std::iter::once(aggregator).chain(attesting_indices));
+            let live = std::iter::once(aggregator).chain(attesting_indices.iter().copied());
+            store.observed_liveness().record_all(epoch, live);
             // Recorded for block production, which packs the aggregates this
             // node has validated. The pool holds electra's shape, which a
             // gloas aggregate converts to.
@@ -409,7 +411,7 @@ async fn post_aggregate_and_proofs(
                     .expect("attestation pool lock poisoned")
                     .insert_aggregate(pooled);
             }
-            p2p.publish_beacon_aggregate(aggregate)
+            p2p.publish_beacon_aggregate(aggregate, attesting_indices)
                 .map_err(|_| "the network actor is not running")
         });
         match published {
@@ -853,7 +855,14 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{json}");
         let published = fixture.network.aggregates.lock().unwrap();
         assert_eq!(published.len(), 1);
-        assert_eq!(published[0], SignedAggregateAndProof::Electra(signed));
+        assert_eq!(published[0].0, SignedAggregateAndProof::Electra(signed));
+        // Every member voted, so the indices handed on for the chain actor to
+        // apply are the whole committee.
+        let mut attesting = published[0].1.clone();
+        attesting.sort_unstable();
+        let mut members = committee.clone();
+        members.sort_unstable();
+        assert_eq!(attesting, members);
     }
 
     #[tokio::test]
@@ -1128,7 +1137,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body:?}");
         let published = fixture.network.aggregates.lock().unwrap();
         assert_eq!(published.len(), 1);
-        assert_eq!(published[0], SignedAggregateAndProof::Gloas(signed));
+        assert_eq!(published[0].0, SignedAggregateAndProof::Gloas(signed));
     }
 
     #[tokio::test]
@@ -1267,8 +1276,9 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{json}");
         let published = fixture.network.aggregates.lock().unwrap();
+        let published: Vec<_> = published.iter().map(|(signed, _)| signed.clone()).collect();
         assert_eq!(
-            *published,
+            published,
             [
                 SignedAggregateAndProof::Electra(first),
                 SignedAggregateAndProof::Electra(second)
@@ -1304,6 +1314,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{json}");
         let published = fixture.network.aggregates.lock().unwrap();
-        assert_eq!(*published, [SignedAggregateAndProof::Gloas(signed)]);
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].0, SignedAggregateAndProof::Gloas(signed));
     }
 }
