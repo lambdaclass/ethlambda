@@ -328,13 +328,17 @@ pub mod test_support {
     }
 
     /// `prefs` signed by its own `validator_index` under `state`'s preferences
-    /// domain at the proposal slot's epoch (the spec's).
+    /// domain for the proposal epoch's own fork version (consensus-specs #5665).
     pub fn sign_preferences(
         state: &BeaconState,
         prefs: gloas::ProposerPreferences,
     ) -> gloas::SignedProposerPreferences {
         let epoch = compute_epoch_at_slot(prefs.proposal_slot);
-        let domain = get_domain(state, constants::DOMAIN_PROPOSER_PREFERENCES, Some(epoch));
+        let domain = crate::beacon::gossip::proposer_preferences::proposer_preferences_domain(
+            &crate::beacon::gloas_block_production::test_support::config(),
+            state.genesis_validators_root(),
+            epoch,
+        );
         let root = compute_signing_root(prefs.hash_tree_root(), domain);
         let signature = sign_for(prefs.validator_index as usize, root);
         gloas::SignedProposerPreferences {

@@ -20,32 +20,28 @@
 //! which writes `store.proposer_boost_root` on [`on_block`]'s behalf:
 //! [`on_block`] is its only caller.
 //!
-//! # Units: one seconds-granularity clock, read out in milliseconds at the edges
+//! # Units: one millisecond clock
 //!
-//! This module's entry points speak the specification's unit: both [`on_tick`]
-//! and [`on_tick_per_slot`] take a `time: u64` in seconds, exactly like
-//! `BeaconState.genesis_time`. The store underneath keeps one clock in
-//! milliseconds,
-//! [`Store::time_ms`](ethlambda_storage::Store::time_ms), so those two convert
-//! on the way in and nothing else in this module reads the row directly:
-//! `get_slots_since_genesis` and `get_current_slot` reduce to
+//! [`on_tick_ms`] and [`on_tick_per_slot_ms`] take Unix milliseconds, the
+//! specification's `on_tick` unit since consensus-specs #5667/#5668, and the
+//! live chain actor feeds them real milliseconds, so the sub-second deadlines
+//! (`get_attestation_due_ms` and friends, fractions of
+//! `Config::slot_duration_ms`) are judged on the instant an event arrived.
+//! [`on_tick`] is the same with a `time: u64` in seconds, exactly like
+//! `BeaconState.genesis_time`, for the spec fixtures, whose tick steps are
+//! whole seconds ([`seconds_to_milliseconds`] converts on the way in).
+//!
+//! The store keeps that one clock,
+//! [`Store::time_ms`](ethlambda_storage::Store::time_ms), and nothing else in
+//! this module reads the row directly: `get_slots_since_genesis` and
+//! `get_current_slot` reduce to
 //! [`Store::current_slot`](ethlambda_storage::Store::current_slot), and the
-//! handlers that need to place a moment *within* the current slot against the
-//! basis-point deadlines (`get_attestation_due_ms` and friends) read
+//! handlers that place a moment *within* the current slot read
 //! [`Store::ms_since_genesis`](ethlambda_storage::Store::ms_since_genesis).
 //!
 //! The lean chain shares that row and those derivations, and reads it on a
 //! third grid of its own, `Store::intervals_since_genesis`, which nothing here
 //! touches.
-//!
-//! Milliseconds only appear where a handler needs to place a moment *within*
-//! the current slot against the basis-point deadlines
-//! (`get_attestation_due_ms` and friends, fractions of
-//! `Config::slot_duration_ms`): [`seconds_to_milliseconds`] converts the
-//! coarse seconds-since-genesis value at exactly that point, and nowhere else.
-//! So this is not two clocks running at different rates; it is one
-//! seconds-resolution clock with a millisecond-resolution read-out computed on
-//! demand, purely for comparing against the sub-slot deadlines.
 //!
 //! # Why `Store::block_index` never needs to be a `BTreeMap`
 //!
@@ -1883,6 +1879,24 @@ pub fn filter_block_tree(
         return Ok(false);
     }
 
+    // If expected finalized/justified, add to viable block-tree and signal
+    // viability to parent.
+    if is_viable_leaf(store, index, block_root, config)? {
+        blocks.insert(block_root, entry);
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+/// The leaf test both filters share: whether the branch ending at `block_root`
+/// agrees with `store`'s justified and finalized checkpoints.
+fn is_viable_leaf(
+    store: &Store,
+    index: &HashMap<Root, (Slot, Root)>,
+    block_root: Root,
+    config: &Config,
+) -> Result<bool> {
     let current_epoch = get_current_store_epoch(store, config);
     let voting_source = get_voting_source(store, index, block_root, config)?;
 
@@ -1900,14 +1914,59 @@ pub fn filter_block_tree(
     let correct_finalized = finalized_checkpoint.epoch == constants::GENESIS_EPOCH
         || finalized_checkpoint.root == finalized_checkpoint_block;
 
-    // If expected finalized/justified, add to viable block-tree and signal
-    // viability to parent.
-    if correct_justified && correct_finalized {
-        blocks.insert(block_root, entry);
-        return Ok(true);
+    Ok(correct_justified && correct_finalized)
+}
+
+/// `filter_node_tree` (gloas `fork-choice.md` via phase0, modified): the
+/// viable nodes of `node`'s subtree, `node` included when any descendant is
+/// viable. The spec-literal, recursive reference; [`get_head_node`] uses
+/// [`filter_viable_nodes`], which answers the same question over the payload
+/// links.
+///
+/// Unlike [`filter_block_tree`] this is per payload variant: `EMPTY(P)` and
+/// `FULL(P)` are each viable only through their own children, or, as a leaf,
+/// through `P`'s voting source (consensus-specs #5509).
+pub fn filter_node_tree(
+    store: &Store,
+    index: &HashMap<Root, (Slot, Root)>,
+    node: ForkChoiceNode,
+    config: &Config,
+) -> Result<Vec<ForkChoiceNode>> {
+    let children = get_node_children(store, index, node)?;
+
+    // If any children branches contain expected finalized/justified
+    // checkpoints, include this node and those descendants.
+    if !children.is_empty() {
+        let mut viable_nodes = Vec::new();
+        for child in children {
+            viable_nodes.extend(filter_node_tree(store, index, child, config)?);
+        }
+        if !viable_nodes.is_empty() {
+            viable_nodes.push(node);
+            return Ok(viable_nodes);
+        }
+        return Ok(Vec::new());
     }
 
-    Ok(false)
+    if is_viable_leaf(store, index, node.root, config)? {
+        return Ok(vec![node]);
+    }
+    Ok(Vec::new())
+}
+
+/// `get_filtered_node_tree` (gloas `fork-choice.md`, modified): every viable
+/// node under `(justified_root, PENDING)`.
+pub fn get_filtered_node_tree(
+    store: &Store,
+    index: &HashMap<Root, (Slot, Root)>,
+    config: &Config,
+) -> Result<Vec<ForkChoiceNode>> {
+    // [Modified in Gloas:EIP7732]
+    let base = ForkChoiceNode {
+        root: store.beacon_justified_checkpoint().root,
+        payload_status: PayloadStatus::Pending,
+    };
+    filter_node_tree(store, index, base, config)
 }
 
 /// The filtered block tree: every block, from the justified checkpoint down,
@@ -2383,6 +2442,37 @@ pub fn compute_node_weights(
     Ok(weights)
 }
 
+/// [`filter_node_tree`] for the head walk: adds every viable node under `node`
+/// to `viable` and reports whether `node` is one, reading children from
+/// [`walk_children`] instead of decoding blocks.
+fn filter_viable_nodes(
+    tree: PayloadTree,
+    index: &HashMap<Root, (Slot, Root)>,
+    children_of: &HashMap<Root, Vec<Root>>,
+    node: ForkChoiceNode,
+    config: &Config,
+    viable: &mut HashSet<ForkChoiceNode>,
+) -> Result<bool> {
+    let children = walk_children(tree, children_of, node)?;
+    if !children.is_empty() {
+        let mut any_viable = false;
+        for child in children {
+            if filter_viable_nodes(tree, index, children_of, child, config, viable)? {
+                any_viable = true;
+            }
+        }
+        if any_viable {
+            viable.insert(node);
+        }
+        return Ok(any_viable);
+    }
+    if is_viable_leaf(tree.store, index, node.root, config)? {
+        viable.insert(node);
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// The nodes directly under `node` in the payload-aware tree, for the head
 /// descent: [`get_node_children`], answered from `children_of` (the filtered
 /// tree's parent-to-children map) and the payload links instead of decoding
@@ -2443,22 +2533,45 @@ fn walk_head(
     rules: ForkRules,
 ) -> Result<ForkChoiceNode> {
     let tree = PayloadTree { store, rules };
-    let blocks = get_filtered_block_tree(store, index, config)?;
     let weights = compute_node_weights(store, index, config, committees, rules)?;
     let current_slot = get_current_slot(store, config);
 
+    // Every block's children, not only the viable ones: viability is decided
+    // per node below, so a block whose `FULL` variant is the only viable one
+    // still has to be reachable.
     let mut children_of: HashMap<Root, Vec<Root>> = HashMap::new();
-    for (&root, &(_, parent_root)) in &blocks {
+    for (&root, &(_, parent_root)) in index {
         children_of.entry(parent_root).or_default().push(root);
     }
     let block_entry = |root: Root| index.get(&root).copied();
 
-    let mut head = ForkChoiceNode {
-        root: store.beacon_justified_checkpoint().root,
+    let justified_root = store.beacon_justified_checkpoint().root;
+    let base = ForkChoiceNode {
+        root: justified_root,
         payload_status: PayloadStatus::Pending,
     };
+    let mut nodes = HashSet::new();
+    filter_viable_nodes(tree, index, &children_of, base, config, &mut nodes)?;
+
+    // [New in Gloas:EIP7732] Return the empty node when nothing is viable, so
+    // a pending node is never the head. A pre-gloas justified block has no
+    // empty variant and keeps reporting `FULL`.
+    if nodes.is_empty() {
+        let payload_status = if tree.link(justified_root)?.is_gloas() {
+            PayloadStatus::Empty
+        } else {
+            PayloadStatus::Full
+        };
+        return Ok(ForkChoiceNode {
+            root: justified_root,
+            payload_status,
+        });
+    }
+
+    let mut head = base;
     loop {
-        let children = walk_children(tree, &children_of, head)?;
+        let mut children = walk_children(tree, &children_of, head)?;
+        children.retain(|child| nodes.contains(child));
         if children.len() <= 1 {
             let Some(only) = children.first() else {
                 return Ok(head);
@@ -3862,7 +3975,10 @@ pub fn gloas_get_weight(
 ///
 /// `blocks` is [`Store::block_index`]'s own shape, not the specification's
 /// `Dict[Root, BeaconBlock]`: see the section documentation above for why
-/// nodes, and the trees built from them, are derived rather than stored.
+/// nodes, and the trees built from them, are derived rather than stored. The
+/// specification (consensus-specs #5509) dropped its own `blocks` parameter
+/// and reads `store.blocks`; callers pass the whole [`Store::block_index`], not
+/// a filtered tree, and filter the result by [`get_filtered_node_tree`].
 pub fn get_node_children(
     store: &Store,
     blocks: &HashMap<Root, (Slot, Root)>,
@@ -3920,9 +4036,9 @@ pub fn get_node_children(
 /// empty branches with [`get_payload_status_tiebreaker`] rather than weight
 /// alone.
 ///
-/// Reuses the pre-gloas, index-only [`get_filtered_block_tree`] for the
-/// candidate tree: see [`gloas_get_ancestor`]'s own doc for why that
-/// is sound rather than a shortcut.
+/// Only nodes of [`get_filtered_node_tree`] are candidates, so `EMPTY(P)` and
+/// `FULL(P)` must each be viable themselves (consensus-specs #5509), and the
+/// empty node of the justified root is returned when none is.
 ///
 /// **A reference, not the node's head computation.** [`get_head_node`] runs
 /// [`walk_head`], which reaches the same node from one bottom-up weight table;
@@ -3933,13 +4049,38 @@ pub fn gloas_get_head(
     committees: &CommitteeCache,
 ) -> Result<ForkChoiceNode> {
     let index = store.block_index();
-    let blocks = get_filtered_block_tree(store, &index, config)?;
+    // [Modified in Gloas:EIP7732]
+    let nodes = get_filtered_node_tree(store, &index, config)?;
+
+    // [New in Gloas:EIP7732] Return the empty node if there are no viable nodes.
+    // A pre-gloas justified block has no empty variant (this crate's decided
+    // fulu-to-gloas rule, see `get_node_children`), so it reports `FULL`.
+    if nodes.is_empty() {
+        let justified_root = store.beacon_justified_checkpoint().root;
+        let justified = store
+            .get_signed_block(&justified_root)
+            .expect("get")
+            .ok_or(Error::SpecAssert("justified root in store.blocks"))?;
+        let payload_status = if is_pre_gloas(&justified) {
+            PayloadStatus::Full
+        } else {
+            PayloadStatus::Empty
+        };
+        return Ok(ForkChoiceNode {
+            root: justified_root,
+            payload_status,
+        });
+    }
+
     let mut head = ForkChoiceNode {
         root: store.beacon_justified_checkpoint().root,
         payload_status: PayloadStatus::Pending,
     };
     loop {
-        let children = get_node_children(store, &blocks, head)?;
+        let children: Vec<ForkChoiceNode> = get_node_children(store, &index, head)?
+            .into_iter()
+            .filter(|child| nodes.contains(child))
+            .collect();
         if children.is_empty() {
             return Ok(head);
         }
@@ -4502,19 +4643,17 @@ pub(crate) fn update_proposer_boost_root(
 // on_tick helpers
 // ---------------------------------------------------------------------------
 
-/// Advances `store` to `time`, one slot boundary at a time from where it was.
+/// Advances `store` to `time_ms` (Unix milliseconds), one slot boundary at a
+/// time from where it was.
 ///
-/// `on_tick` is what actually calls this in a loop to catch up more than one
-/// slot at once; called directly, `time` must already be at most one slot
+/// `on_tick_ms` is what actually calls this in a loop to catch up more than one
+/// slot at once; called directly, `time_ms` must already be at most one slot
 /// ahead of `store`'s current slot for the "new slot" resets below to fire at
 /// the right boundary.
-pub fn on_tick_per_slot(store: &mut Store, time: u64, config: &Config) {
+pub fn on_tick_per_slot_ms(store: &mut Store, time_ms: u64, config: &Config) {
     let previous_slot = get_current_slot(store, config);
 
-    // `time` is the specification's seconds; the store's row is milliseconds.
-    store
-        .set_time_ms(seconds_to_milliseconds(time))
-        .expect("set time");
+    store.set_time_ms(time_ms).expect("set time");
 
     let current_slot = get_current_slot(store, config);
 
@@ -4738,19 +4877,37 @@ pub fn update_latest_messages(
 // the same checks as [`on_payload_attestation_message`]; a failure partway
 // leaves the votes of the messages before it, which no valid block can cause.
 
-/// Advances `store` to `time` (Unix seconds), running [`on_tick_per_slot`]
-/// once per slot boundary crossed so that none of them are skipped even if
-/// `time` jumps forward by more than one slot since the last call.
-pub fn on_tick(store: &mut Store, time: u64, config: &Config) {
-    let genesis_time = store.config().genesis_time;
-    let tick_slot = time.saturating_sub(genesis_time) / config.seconds_per_slot;
+/// Advances `store` to `time_ms` (Unix milliseconds), running
+/// [`on_tick_per_slot_ms`] once per slot boundary crossed so that none of them
+/// are skipped even if `time_ms` jumps forward by more than one slot since the
+/// last call.
+///
+/// The specification's `on_tick` since consensus-specs #5667/#5668. The live
+/// chain actor feeds it real milliseconds, so the sub-second deadlines
+/// (block and attestation timeliness, proposer boost) are judged on the
+/// instant an event arrived, not the second it fell in.
+pub fn on_tick_ms(store: &mut Store, time_ms: u64, config: &Config) {
+    // The specification calls `on_tick` only "whenever `time > store.time`".
+    // Events now move the clock inside a slot, so a tick can arrive behind it
+    // and must not rewind it.
+    if time_ms < store.time_ms().expect("store time exists") {
+        return;
+    }
+    let genesis_time_ms = config.genesis_time_ms();
+    let tick_slot = time_ms.saturating_sub(genesis_time_ms) / config.slot_duration_ms;
     while get_current_slot(store, config) < tick_slot {
         let next_slot = get_current_slot(store, config).saturating_add(1);
-        let previous_time =
-            genesis_time.saturating_add(next_slot.saturating_mul(config.seconds_per_slot));
-        on_tick_per_slot(store, previous_time, config);
+        let boundary_ms =
+            genesis_time_ms.saturating_add(next_slot.saturating_mul(config.slot_duration_ms));
+        on_tick_per_slot_ms(store, boundary_ms, config);
     }
-    on_tick_per_slot(store, time, config);
+    on_tick_per_slot_ms(store, time_ms, config);
+}
+
+/// [`on_tick_ms`] for a whole-second `time` (Unix seconds), the unit the spec
+/// fixtures' `on_tick` steps and `BeaconState.genesis_time` use.
+pub fn on_tick(store: &mut Store, time: u64, config: &Config) {
+    on_tick_ms(store, seconds_to_milliseconds(time), config);
 }
 
 /// Validates and applies `signed_block`, adding it and its resulting
@@ -5655,6 +5812,26 @@ mod tests {
     /// Tests populate only what the function under test actually reads.
     fn empty_store() -> Store {
         store_anchored_at(Root::ZERO)
+    }
+
+    #[test]
+    fn on_tick_ms_keeps_sub_second_precision_and_never_rewinds() {
+        let mut store = empty_store();
+        let config = Config::active();
+
+        on_tick_ms(&mut store, 1_750, &config);
+        assert_eq!(store.time_ms().unwrap(), 1_750);
+
+        on_tick_ms(&mut store, 1_200, &config);
+        assert_eq!(
+            store.time_ms().unwrap(),
+            1_750,
+            "a late tick must not rewind"
+        );
+
+        // The whole-second entry point (fixtures) agrees with the ms one.
+        on_tick(&mut store, 3, &config);
+        assert_eq!(store.time_ms().unwrap(), 3_000);
     }
 
     /// A fresh store whose head and both realized checkpoints name `root` in
