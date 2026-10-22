@@ -195,6 +195,21 @@ rather than populated, which is not spec-valid.
   work. Everything that reads `peer_id` is unaffected. Out of scope for the
   change that added the Beacon API surface; a follow-up exposes the record.
 
+## Sync duties are served for the current and next period only
+
+`POST /eth/v1/validator/duties/sync/{epoch}` answers an `epoch` in the head
+state's own sync committee period or the next one, and refuses an earlier
+period with a `400`.
+
+- **Beacon API:** allows any period up to the current one plus one, so an
+  earlier period is valid to ask about.
+- **ethlambda:** the head state carries only `current_sync_committee` and
+  `next_sync_committee`. Answering an earlier period means loading the state
+  at the start of that period, which is what Lighthouse does; Prysm also
+  serves it. A validator client only asks about the current and next period,
+  so this refuses rather than add a historical state lookup to a duty
+  endpoint (`sync_duties`, `crates/net/rpc/src/beacon/validator.rs`).
+
 ## `block_id` cannot name `genesis`, and `state_id` cannot be a state root
 
 Two id forms the Beacon API defines return `404` here.

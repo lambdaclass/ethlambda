@@ -921,12 +921,16 @@ behavior.
   boundary); `get_signed_block` returns `None` for a pruned finalized block.
 - A `StateDiff` omits `config` and `validators`, trusting they never mutate;
   breaking that invariant would silently corrupt every reconstructed state.
-- `Metadata["config"]` is written once at bootstrap and never rewritten; it
-  doubles as the DB's genesis-time fingerprint on resume. A beacon resume also
-  refuses a config file that changes a chain value in it
-  (`first_config_difference`: fork schedule, slot time, `PRESET_BASE`, ...),
-  but only warns about a changed `CONFIG_NAME`, a label with no consensus
-  effect. The stored name is the one the node keeps reporting.
+- `Metadata["config"]` is written at bootstrap; it doubles as the DB's
+  genesis-time fingerprint on resume. A beacon resume also refuses a config
+  file that changes a chain value in it (`first_config_difference`: slot time,
+  `PRESET_BASE`, churn limits, ...), but only warns about a changed
+  `CONFIG_NAME`, a label with no consensus effect. The fork schedule and
+  `BLOB_SCHEDULE` may change ahead of the chain: a change is refused only when
+  its old or new epoch is at or before the latest epoch the directory
+  processed, so a network scheduling a fork does not cost its nodes their
+  directories. A resume that passes writes the file's config over the stored
+  one (`Store::replace_config`), since the node runs on the stored config.
 - `PendingDataColumns` holds *unverified* sidecars parked until their block's
   parent has a post-state. `data_column_indices_for` reads `DataColumns` only,
   which is what keeps a parked column from satisfying the availability gate.

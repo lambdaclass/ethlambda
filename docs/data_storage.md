@@ -310,13 +310,16 @@ the other two cannot, since both presets write the same layout at the same
 version while bounding every SSZ container differently. None of the three has a
 migration path.
 
-`config` and `chain` are the odd ones out among the mutable rows: written once
-at bootstrap (`init_store` for lean, `init_beacon` for beacon) and never
-rewritten afterward (`config` has a getter, `Store::config`, and `chain` has
-`Store::chain`, but neither has a setter). Because they never change, the
-`Store` keeps a copy of each in memory, and reads of them never reach the
-backend. Every other `Metadata` key is mutated in place as the chain
-progresses.
+`config` and `chain` are the odd ones out among the mutable rows: written at
+bootstrap (`init_store` for lean, `init_beacon` for beacon) and not mutated as
+the chain progresses. `chain` is never rewritten (it has a getter,
+`Store::chain`, and no setter). `config` is rewritten in one place,
+`Store::replace_config`, by a beacon resume whose config file changed values
+the directory does not contradict (see below), and that method panics unless
+its `Store` holds the only handle to the cached copy. Because neither changes
+once a `Store` is shared, the `Store` keeps a copy of each in memory, and
+reads of them never reach the backend. Every other `Metadata` key is mutated
+in place as the chain progresses.
 
 `config` used to double as the DB's fingerprint on its own, with
 `from_db_state` refusing to resume a data directory belonging to another
@@ -326,11 +329,23 @@ back and hands both to the caller, which compares `config`'s `genesis_time`
 and slot duration (and `genesis_validators_root`, computed off the anchored
 state itself rather than stored in `Metadata`) against the network it was
 configured for, and `chain` against the sub-command it is running. A beacon
-resume goes further, comparing every chain value in `config` (the fork
-schedule, the slot time, `PRESET_BASE`, ...) against the `config.yaml` it was
-started with, in `first_config_difference`. `CONFIG_NAME` is the exception: a
-label with no consensus effect, so a changed one is only warned about, and the
-stored name stays, since `config` is never rewritten.
+resume goes further, comparing every chain value in `config` (the slot time,
+`PRESET_BASE`, the churn limits, ...) against the `config.yaml` it was started
+with, in `first_config_difference`. `CONFIG_NAME` is exempt: a label with no
+consensus effect, so a changed one is only warned about.
+
+The fork schedule and `BLOB_SCHEDULE` are compared against what the directory
+holds instead, because scheduling a fork is an edit to exactly those values,
+made after every existing node initialized its directory. A fork's version or
+epoch may change as long as both the stored and the new epoch lie past the
+latest epoch the directory has processed: the highest `LiveChain` slot, or the
+finalized state's slot when that is later (a checkpoint-sync anchor advanced
+through empty slots). So a fork that was unset and is now scheduled ahead of
+the chain resumes, while one moved onto or off a processed epoch is refused.
+A resume that passes then writes the config file over `config` with
+`Store::replace_config`: the node runs on the stored config, so keeping the
+old one would leave it on the old schedule. From then on the file's values,
+`CONFIG_NAME` included, are the ones the node reports.
 
 A beacon directory **shares** `head`, `latest_justified` and `latest_finalized`
 rather than keeping parallel ones. `init_beacon` seeds all three from one
