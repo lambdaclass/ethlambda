@@ -25,6 +25,15 @@
 # client fails over per call, so everything ethlambda beacon serves goes through
 # it. With `ethlambda_beacon.fallback: false` the participant's node is left
 # out of the list entirely, and ethlambda beacon serves every duty alone.
+#
+# # Which validator client
+#
+# `ethlambda validator` by default. With `ethlambda_validator.client:
+# lighthouse`, Lighthouse's validator client signs for the same keys instead,
+# against the same beacon node list: that is how the Beacon API ethlambda
+# beacon serves is checked against a client other than its own.
+# `ethlambda_validator.doppelganger: true` turns on Lighthouse's doppelganger
+# protection, which calls `/eth/v1/validator/liveness`.
 
 ethereum_package = import_module("github.com/ethpandaops/ethereum-package/main.star")
 
@@ -112,6 +121,15 @@ def run(plan, args={}):
     mnemonic = network_params.get("preregistered_validator_keys_mnemonic", DEFAULT_MNEMONIC)
     derive_keys(plan, mnemonic, first, last)
 
+    if vc.get("client", "ethlambda") == "lighthouse":
+        launch_lighthouse_vc(plan, vc, beacon_nodes, name)
+        plan.print(
+            "Lighthouse's validator client signs for validators [{}, {}) via {}".format(
+                first, last, ", ".join(beacon_nodes)
+            )
+        )
+        return output
+
     cmd = [
         "validator",
         "--beacon-nodes",
@@ -151,6 +169,57 @@ def run(plan, args={}):
         )
     )
     return output
+
+
+def launch_lighthouse_vc(plan, vc, beacon_nodes, name):
+    """Run Lighthouse's validator client on the derived keys.
+
+    eth2-val-tools writes keys in Lighthouse's own layout
+    (`keys/<pubkey>/voting-keystore.json` and `secrets/<pubkey>`), and with no
+    `validator_definitions.yml` in the validators directory Lighthouse
+    discovers them and writes one. It writes that file into the directory, so
+    the keys are copied out of the artifact first rather than used in place.
+    No `--datadir`: Lighthouse refuses it alongside `--validators-dir`, and
+    keeps its slashing-protection database in the validators directory, which
+    is the writable copy. `--init-slashing-protection` because that database
+    starts empty.
+    """
+    flags = [
+        "--testnet-dir={}".format(GENESIS_MOUNT),
+        "--beacon-nodes={}".format(",".join(beacon_nodes)),
+        "--validators-dir=/data/raw/keys",
+        "--secrets-dir=/data/raw/secrets",
+        "--init-slashing-protection",
+        "--graffiti={}".format(vc.get("graffiti", name)),
+        "--metrics",
+        "--metrics-address=0.0.0.0",
+        "--metrics-port={}".format(METRICS_PORT),
+    ]
+    fee_recipient = vc.get("suggested_fee_recipient", "")
+    if fee_recipient:
+        flags.append("--suggested-fee-recipient={}".format(fee_recipient))
+    if vc.get("doppelganger", False):
+        flags.append("--enable-doppelganger-protection")
+    flags += vc.get("lighthouse_extra_params", [])
+
+    plan.add_service(
+        name="vc-lighthouse",
+        config=ServiceConfig(
+            image=vc.get("lighthouse_image", "sigp/lighthouse:latest"),
+            entrypoint=["sh", "-c"],
+            cmd=[
+                "mkdir -p /data && cp -r {}/raw /data/ && lighthouse vc {}".format(
+                    KEYS_MOUNT, " ".join(flags)
+                )
+            ],
+            files={KEYS_MOUNT: KEYS_ARTIFACT, GENESIS_MOUNT: GENESIS_ARTIFACT},
+            ports={
+                "metrics": PortSpec(
+                    number=METRICS_PORT, transport_protocol="TCP", application_protocol="http"
+                ),
+            },
+        ),
+    )
 
 
 def derive_keys(plan, mnemonic, first, last):
