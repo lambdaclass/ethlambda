@@ -232,9 +232,11 @@ pub fn slash_validator(
 
     // [New in Gloas:EIP7732] (consensus-specs #5719) A slashed proposer must
     // not get its builder paid out of the block it proposed: drop the pending
-    // payments for blocks it proposed. Heze reuses the gloas state.
-    if let BeaconState::Gloas(inner) = state {
-        for payment in inner.builder_pending_payments.iter_mut() {
+    // payments for blocks it proposed. Heze has its own state but carries the
+    // field unchanged; earlier forks answer `UnsupportedForFork`, which means
+    // there is nothing to clear.
+    if let Ok(payments) = state.builder_pending_payments_mut() {
+        for payment in payments.iter_mut() {
             if payment.proposer_index == slashed_index {
                 *payment = Default::default();
             }
