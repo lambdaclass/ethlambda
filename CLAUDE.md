@@ -336,8 +336,9 @@ actual_slot = finalized_slot + 1 + relative_index
   - Beacon subscribes seven global topics plus two node-id-derived subnet families: custody
     columns and backbone attestation subnets. `beacon_aggregate_and_proof` and
     `beacon_attestation_{subnet_id}` validate in p2p like blocks/columns, with their own
-    permit pool. The actor applies only accepted aggregates, attesting indices already
-    gossip-verified, held one slot per `validate_on_attestation`'s `current_slot >= data.slot
+    permit pool. The actor applies only accepted aggregates (gossip's, plus the Beacon API's
+    own validated `aggregate_and_proofs` submissions), attesting indices already
+    verified, held one slot per `validate_on_attestation`'s `current_slot >= data.slot
     + 1`; subnet attestations are verified and relayed but never applied. See
     [`docs/beacon_wire.md`](docs/beacon_wire.md)
 - **Req/Resp**: Status, BlocksByRoot, BlocksByRange (snappy frame compression + varint length)
@@ -518,8 +519,8 @@ disagree. `node` calls `start_rpc_server` and gets `/lean/v0`; `beacon` calls
 (`crates/net/rpc/src/beacon/`, one file per endpoint group). Both reach it with real
 handles: the DB-backed anchored `Store` the `P2PServer` already holds, plus a clone of the
 same `SyncStatusController` the chain actor writes to. The beacon arm takes no
-`AggregatorController` and no `EventBus`, because a follower has no aggregator duty to
-toggle and the chain-events stream is part of the lean surface. It does take the P2P
+`AggregatorController`, because a follower has no aggregator duty to toggle, but it does
+take the same `EventBus` lean does, for `GET /eth/v1/events`. It also takes the P2P
 actor's `RpcToP2PRef` (`crates/net/api`), the one path by which this node gossips on the
 beacon wire: `POST /eth/v2/beacon/pool/attestations` validates a validator client's
 attestations and publishes them through it.
@@ -815,7 +816,7 @@ snapshot (`States`) + diff (`StateDiffs`) pairs; `BlockRoots` and `LiveChain`
 index by slot for range serving and fork choice. Attestations and gossip
 signatures are not persisted; they live in in-memory `Store` buffers consumed
 during the tick pipeline. See [`docs/data_storage.md`](docs/data_storage.md)
-for the full reference: what each of the ten tables holds and how it's
+for the full reference: what each of the eleven tables holds and how it's
 keyed, the snapshot/diff reconstruction algorithm, the block-import write
 sequence, pruning rules, what never changes at runtime, and startup/restore
 behavior.
@@ -839,13 +840,23 @@ behavior.
   which is what keeps a parked column from satisfying the availability gate.
   Its only index is the chain actor's in-memory `sidecars_awaiting_parent`, so
   `start_actor` clears the whole table at startup.
-- `DB_VERSION` is 5: `Config` gained the gloas schedule, timing and churn
+- `BeaconUnrealizedJustifications` (root -> `(slot, Checkpoint)`) persists the
+  beacon store's per-block unrealized justified checkpoint
+  (consensus-specs' `store.unrealized_justifications`), which used to live
+  only in an in-memory `BeaconScratch` map. A restart emptied that map with
+  nothing to refill it, so `get_voting_source` hit a hard `SpecAssert` on the
+  first pre-restart leaf from an older epoch and `get_head` froze. The
+  in-memory map stays as a write-through cache in front of the table. Pruned
+  on finalization to the same horizon as `LiveChain` (the finalized block's
+  own slot, keeping that block's own entry).
+- `DB_VERSION` is 6: `Config` gained the gloas schedule, timing and churn
   keys, and it is SSZ-encoded under `KEY_CONFIG`, so a data directory written
-  by an earlier version decodes into the wrong fields. (4 was `PRESET_BASE` and
-  `CONFIG_NAME`, as `ConfigName`, a bounded string, at the front of the
-  encoding; 3 was the runtime keys a `config.yaml` supplies.)
-  `Store::from_db_state` refuses any other version outright; there is no
-  migration.
+  by an earlier version decodes into the wrong fields. (5 was the
+  unrealized-justifications table, since a directory written before it has no
+  row there for any block it already imported; 4 was
+  `PRESET_BASE`/`CONFIG_NAME` at the front of `Config`; 3 was the runtime keys
+  a `config.yaml` supplies.) `Store::from_db_state` refuses any other version
+  outright; there is no migration.
 
 ### State Root Computation
 - Always computed via `hash_tree_root()` after full state transition

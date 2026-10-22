@@ -169,7 +169,7 @@ use std::sync::Arc;
 
 use ethlambda_storage::{CacheKey, ForkCheckpoints, StorageBackend};
 use ethlambda_types::ShortRoot;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use crate::beacon::config::Config;
 use crate::beacon::constants;
@@ -777,10 +777,12 @@ pub fn resolve_invalid_block(
 ///
 /// # A dangling vote this can create
 ///
-/// Unlike `Store::promote_beacon_anchor`, which only ever prunes below a
-/// finality horizon, this removes rows from the *live* window, so a validator
-/// whose freshest vote named a branch the execution layer has since rejected
-/// keeps pointing at a root no longer in the index, until it attests again.
+/// Unlike the beacon arm of
+/// [`Store::update_checkpoints`](ethlambda_storage::Store::update_checkpoints),
+/// which only ever prunes below the finalized block's own slot, this removes
+/// rows from the *live* window, so a validator whose freshest vote named a
+/// branch the execution layer has since rejected keeps pointing at a root no
+/// longer in the index, until it attests again.
 ///
 /// [`compute_node_weights`] already drops such a vote rather than raising, so
 /// [`get_head`] is unaffected. [`get_weight`] deliberately does not: it is the
@@ -871,8 +873,11 @@ pub fn mark_validated(store: &mut Store, root: Root) {
     // With a healthy execution client nothing is optimistic, and the walk below
     // would exit on its own first iteration. Ask that before paying for
     // `block_index`, which is an uncached prefix scan of the whole `LiveChain`
-    // table (never pruned on beacon) plus a map build, on a path that runs once
-    // per imported block and once per `forkchoiceUpdated`.
+    // table plus a map build, on a path that runs once per imported block and
+    // once per `forkchoiceUpdated`. The table holds the unfinalized window
+    // (each finalization advance prunes it below the finalized block's own
+    // slot), which still grows with every block for as long as finality
+    // stalls.
     if !store.has_beacon_optimistic_roots() {
         return;
     }
@@ -1113,13 +1118,18 @@ pub fn get_forkchoice_store(
     // this file's only outright whole-`BeaconState` clone. `checkpoint_state`
     // now derives that second copy on demand instead of caching it, so the
     // anchor is written once.
+    // Captured before `anchor_state` moves into `insert_state` below:
+    // `set_unrealized_justification` needs the anchor's own slot to persist
+    // alongside its checkpoint (see `Table::BeaconUnrealizedJustifications`),
+    // and `insert_state` takes the state by value.
+    let anchor_slot = anchor_state.slot();
     store
         .insert_signed_block(anchor_root, anchor_block)
         .expect("insert");
     store
         .insert_state(anchor_root, anchor_state)
         .expect("insert");
-    store.set_unrealized_justification(anchor_root, justified_checkpoint);
+    store.set_unrealized_justification(anchor_root, anchor_slot, justified_checkpoint);
 
     // [New in Gloas:EIP7732] `block_timeliness={anchor_root: [True, True]}`,
     // both vote vectors seeded with `[None] * PTC_SIZE`, and `payloads={}`
@@ -1182,11 +1192,11 @@ pub fn compute_slots_since_epoch_start(slot: Slot) -> Slot {
 /// slot is at or before `slot`, found by walking parent links.
 ///
 /// The specification defines this recursively; implemented here as a loop
-/// instead, so that a long unfinalized suffix cannot risk a stack overflow.
-/// An unknown `root` is exactly the "unhandled exception" case the
-/// specification calls out as invalid (`store.blocks[root]` would raise
-/// `KeyError` in the reference implementation), so it becomes a `SpecAssert`
-/// here rather than a panic.
+/// instead (in [`get_ancestor_or_missing`], which this wraps), so that a long
+/// unfinalized suffix cannot risk a stack overflow. An unknown `root` is
+/// exactly the "unhandled exception" case the specification calls out as
+/// invalid (`store.blocks[root]` would raise `KeyError` in the reference
+/// implementation), so it becomes a `SpecAssert` here rather than a panic.
 ///
 /// Takes `index` (`root -> (slot, parent_root)`, [`Store::block_index`]'s own
 /// shape) rather than `&Store`: a caller in a per-validator loop
@@ -1195,11 +1205,26 @@ pub fn compute_slots_since_epoch_start(slot: Slot) -> Slot {
 /// naive by a backend round trip. Every caller builds `index` once, outside
 /// its own loop, and threads it down.
 pub fn get_ancestor(index: &HashMap<Root, (Slot, Root)>, root: Root, slot: Slot) -> Result<Root> {
+    get_ancestor_or_missing(index, root, slot)
+        .map_err(|_missing| Error::SpecAssert("root in store.blocks"))
+}
+
+/// [`get_ancestor`], except that a walk falling off `index` names the root it
+/// could not look up: `root` itself, or the parent of the last block it
+/// found.
+///
+/// The specification has no use for that root, so [`get_ancestor`] drops it.
+/// A caller asking *why* the walk failed does: `LiveChain` loses rows both to
+/// finality pruning and to `invalidate_subtree`, and the missing block's own
+/// slot is what tells the two apart (see `gossip::finalized_ancestry`).
+pub fn get_ancestor_or_missing(
+    index: &HashMap<Root, (Slot, Root)>,
+    root: Root,
+    slot: Slot,
+) -> std::result::Result<Root, Root> {
     let mut root = root;
     loop {
-        let &(block_slot, parent_root) = index
-            .get(&root)
-            .ok_or(Error::SpecAssert("root in store.blocks"))?;
+        let &(block_slot, parent_root) = index.get(&root).ok_or(root)?;
         if block_slot > slot {
             root = parent_root;
         } else {
@@ -1362,8 +1387,10 @@ pub fn get_weight(
 /// cache, and no registry scan at all.
 ///
 /// A vote for a block no longer in `index` is dropped rather than raising.
-/// `Store::promote_beacon_anchor` prunes the block index below the oldest kept
-/// finalized anchor, and a validator whose freshest recorded vote is for a
+/// The beacon arm of
+/// [`Store::update_checkpoints`](ethlambda_storage::Store::update_checkpoints)
+/// prunes the block index below the finalized block's own slot on every
+/// finalization advance, and a validator whose freshest recorded vote is for a
 /// block down there keeps that vote until it attests again. Such a vote cannot
 /// distinguish between candidates above the justified checkpoint (all of them
 /// descend from the finalized block it voted below), so it weighs nothing, and
@@ -1454,6 +1481,21 @@ pub fn compute_weights(
 /// `current_justified_checkpoint` happened to be at the time it was
 /// processed; a block from the current epoch has no unrealized value to pull
 /// up to yet, so its own post-state's checkpoint is used directly.
+///
+/// A missing unrealized justification is the specification's "unhandled
+/// exception" case, and `Store::unrealized_justification`'s own doc comment
+/// says when this build can actually produce one: a narrow crash window
+/// between a block's `insert_signed_block`/`insert_state` committing and
+/// `compute_pulled_up_tip`'s own write landing, which `has_state` then skips
+/// re-importing on resume. Rather than raise here (which would freeze
+/// `get_head` on that one leaf for as long as it stays a leaf), this falls
+/// back to `store.beacon_justified_checkpoint()`, the way Prysm seeds every
+/// block it rebuilds at startup (`buildForkchoiceChain` /
+/// doubly-linked-tree's `insert`). That value is always viable in
+/// `filter_block_tree` (`voting_source.epoch == store.justified.epoch`), so
+/// the fallback can only ever make a block *more* likely to survive
+/// filtering, never change what weight it casts once it does: this function
+/// answers "does this leaf count", not "how much".
 pub fn get_voting_source(
     store: &Store,
     index: &HashMap<Root, (Slot, Root)>,
@@ -1467,11 +1509,22 @@ pub fn get_voting_source(
     let block_epoch = compute_epoch_at_slot(block_slot);
 
     if current_epoch > block_epoch {
-        store
-            .unrealized_justification(&block_root)
-            .ok_or(Error::SpecAssert(
-                "block_root in store.unrealized_justifications",
-            ))
+        if let Some(checkpoint) = store.unrealized_justification(&block_root) {
+            return Ok(checkpoint);
+        }
+        let justified = store.beacon_justified_checkpoint();
+        // debug, not warn: get_head runs every tick, so a miss that persists
+        // while the block stays a leaf would otherwise repeat every tick
+        // until it is pruned or wins the head.
+        debug!(
+            block_root = %ShortRoot(&block_root.0),
+            block_slot,
+            justified_epoch = justified.epoch,
+            justified_root = %ShortRoot(&justified.root.0),
+            "No unrealized justification for a prior-epoch block; \
+             falling back to the store's justified checkpoint"
+        );
+        Ok(justified)
     } else {
         let head_state = store
             .get_state(&block_root)
@@ -2295,6 +2348,11 @@ pub fn is_shuffling_stable(slot: Slot) -> bool {
 /// Whether `head_root` and `parent_root` would cast the same FFG vote if
 /// either were head, so that reorging one for the other costs nothing on the
 /// justification side.
+///
+/// Unlike [`get_voting_source`], a miss here still raises: only the spec
+/// tests reach this function, through `get_proposer_head`/
+/// `should_override_forkchoice_update`, neither of which any production path
+/// calls yet.
 pub fn is_ffg_competitive(store: &Store, head_root: Root, parent_root: Root) -> Result<bool> {
     let head = store
         .unrealized_justification(&head_root)
@@ -3844,7 +3902,7 @@ pub fn compute_pulled_up_tip(
     let current_justified = state.current_justified_checkpoint();
     let finalized = state.finalized_checkpoint();
 
-    store.set_unrealized_justification(block_root, current_justified);
+    store.set_unrealized_justification(block_root, block_slot, current_justified);
     update_unrealized_checkpoints(store, current_justified, finalized);
 
     // If the block is from a prior epoch, apply the realized values. `block_slot`
@@ -4122,8 +4180,12 @@ pub fn validate_on_attestation(
 /// Takes `index` (`root -> (slot, parent_root)`, [`Store::block_index`]'s own
 /// shape) for the reason [`filter_block_tree`] does: a caller validating every
 /// attestation carried in one block ([`on_block_attestation`]) would otherwise
-/// re-scan `Table::LiveChain` once per attestation, and that table grows one
-/// row per imported block on a chain whose blocks are never pruned from it.
+/// re-scan `Table::LiveChain` once per attestation, and that table holds a
+/// row per imported block in the unfinalized window: the beacon arm of
+/// [`Store::update_checkpoints`](ethlambda_storage::Store::update_checkpoints)
+/// prunes it below the finalized block's own slot on each finalization
+/// advance, so its size follows the distance from the finalized block to the
+/// head, and grows with every block while finality stalls.
 fn validate_on_attestation_indexed(
     store: &Store,
     data: AttestationData,
@@ -5322,9 +5384,10 @@ mod tests {
         );
     }
 
-    /// The failure a live mainnet follower hit: `promote_beacon_anchor` prunes
-    /// the block index below the oldest kept anchor, and any validator whose
-    /// freshest vote was for a block down there kept pointing at it. Both
+    /// The failure a live mainnet follower hit: the beacon arm of
+    /// `Store::update_checkpoints` prunes the block index below the finalized
+    /// block's own slot, and any validator whose freshest vote was for a block
+    /// down there kept pointing at it. Both
     /// [`get_weight`] (through [`get_attestation_score`]'s own decided rule;
     /// see its doc) and [`compute_weights`] (its own independent bottom-up
     /// fold, which never called `get_attestation_score` and so never shared
@@ -5440,6 +5503,91 @@ mod tests {
             anchor_root,
             "the walk must stop at the lowest indexed ancestor rather than \
              stepping into `unindexed_parent`"
+        );
+    }
+
+    #[test]
+    fn get_ancestor_or_missing_names_the_root_the_walk_could_not_look_up() {
+        let pruned_root = Root::repeat_byte(1);
+        let a_root = Root::repeat_byte(2);
+        let b_root = Root::repeat_byte(3);
+
+        // `pruned_root` has no row of its own, as after finality pruning.
+        let mut index = HashMap::new();
+        index.insert(a_root, (5, pruned_root));
+        index.insert(b_root, (7, a_root));
+
+        // A walk that stops before the gap is unaffected by it.
+        assert_eq!(get_ancestor_or_missing(&index, b_root, 5), Ok(a_root));
+        // One that has to cross it names the parent it could not find, not
+        // the root it started from.
+        assert_eq!(get_ancestor_or_missing(&index, b_root, 4), Err(pruned_root));
+        // A starting root with no row is itself the missing one.
+        let unknown = Root::repeat_byte(9);
+        assert_eq!(get_ancestor_or_missing(&index, unknown, 0), Err(unknown));
+    }
+
+    /// The scenario `Store::update_checkpoints`' beacon arm exists for: the
+    /// finalized checkpoint names epoch 1, whose start slot nobody built a
+    /// block for, so the finalized block itself sits at the slot before. Once
+    /// finalization advances (a real `update_checkpoints` call, which prunes
+    /// `LiveChain` as a side effect), `filter_block_tree`'s own
+    /// `get_checkpoint_block(index, ..., 1)` must still resolve to that block
+    /// rather than fail: `on_block` and `get_head` both call it on every
+    /// leaf, and either one erroring here is `get_head` freezing on a live
+    /// follower.
+    ///
+    /// Reproduces the bug this fixes: pruning to the epoch's start slot
+    /// instead of the finalized block's own slot (the one before it) would
+    /// delete that block's row along with genesis', and this same call would
+    /// return `Err(SpecAssert("root in store.blocks"))` instead.
+    ///
+    /// Every slot is derived from the preset's epoch length: under the
+    /// minimal preset, slots hardcoded for mainnet name a finalized block in
+    /// a later epoch than its checkpoint, and the walk to epoch 1 then runs
+    /// into the pruned anchor.
+    #[test]
+    fn get_checkpoint_block_succeeds_after_pruning_past_an_empty_epoch_boundary() {
+        let genesis_root = Root::repeat_byte(1);
+        let mut store = store_anchored_at(genesis_root);
+        store
+            .insert_signed_block(genesis_root, block(0, Root::ZERO))
+            .unwrap();
+
+        // The finalized-block-to-be: the last block before epoch 1's start
+        // slot, which is never built.
+        let boundary = compute_start_slot_at_epoch(1);
+        let finalized_root = Root::repeat_byte(2);
+        store
+            .insert_signed_block(finalized_root, block(boundary - 1, genesis_root))
+            .unwrap();
+
+        // The current head, one slot past the empty boundary.
+        let head_root = Root::repeat_byte(3);
+        store
+            .insert_signed_block(head_root, block(boundary + 1, finalized_root))
+            .unwrap();
+
+        let finalized = Checkpoint {
+            epoch: 1,
+            root: finalized_root,
+        };
+        update_checkpoints(&mut store, finalized, finalized);
+        assert_eq!(
+            store.beacon_finalized_checkpoint(),
+            finalized,
+            "the checkpoint must have actually advanced for pruning to run"
+        );
+
+        let index = store.block_index();
+        assert!(
+            !index.contains_key(&genesis_root),
+            "the anchor is below the finalized block's own slot and must be pruned"
+        );
+        assert_eq!(
+            get_checkpoint_block(&index, head_root, 1).unwrap(),
+            finalized_root,
+            "the walk from head must still reach the finalized block across the empty boundary slot"
         );
     }
 
@@ -5615,8 +5763,8 @@ mod tests {
             epoch: 0,
             root: genesis_root,
         };
-        store.set_unrealized_justification(head_root, checkpoint);
-        store.set_unrealized_justification(parent_root, checkpoint);
+        store.set_unrealized_justification(head_root, 2, checkpoint);
+        store.set_unrealized_justification(parent_root, 1, checkpoint);
 
         // One slot past `head_root`'s own slot (2): `current_time_ok`.
         let proposer_head = get_proposer_head(&store, head_root, 3, &config, &committees)
@@ -5661,7 +5809,7 @@ mod tests {
             "the test must exercise two different values"
         );
 
-        store.set_unrealized_justification(block_root, unrealized);
+        store.set_unrealized_justification(block_root, 0, unrealized);
 
         let mut state = crate::beacon::helpers::test_state::with_validators(1);
         *state.current_justified_checkpoint_mut() = realized;
@@ -5673,6 +5821,38 @@ mod tests {
             voting_source, unrealized,
             "a block from a prior epoch must vote its pulled-up (unrealized) checkpoint"
         );
+    }
+
+    /// The crash-window fallback: no `set_unrealized_justification` call was
+    /// ever made for `block_root`, which is what a `SpecAssert` here used to
+    /// raise on. `get_voting_source` must instead answer exactly
+    /// `store.beacon_justified_checkpoint()`, not some other computed value.
+    #[test]
+    fn get_voting_source_falls_back_to_the_justified_checkpoint_on_a_miss() {
+        let config = Config::active();
+        let mut store = empty_store();
+        // Same clock skew as
+        // `get_voting_source_pulls_up_a_prior_epoch_blocks_vote`, so this
+        // takes the same `current_epoch > block_epoch` branch.
+        store
+            .set_time_ms(seconds_to_milliseconds(
+                config.seconds_per_slot * preset::SLOTS_PER_EPOCH * 2,
+            ))
+            .unwrap();
+
+        let block_root = Root::repeat_byte(5);
+        store
+            .insert_signed_block(block_root, block(0, Root::ZERO))
+            .unwrap();
+        assert_eq!(
+            store.unrealized_justification(&block_root),
+            None,
+            "the test must exercise a genuine miss"
+        );
+
+        let voting_source =
+            get_voting_source(&store, &store.block_index(), block_root, &config).unwrap();
+        assert_eq!(voting_source, store.beacon_justified_checkpoint());
     }
 
     #[test]
@@ -5698,6 +5878,220 @@ mod tests {
         let (slot, root) = store.beacon_head().expect("head recorded");
         assert_eq!(root, head);
         assert_eq!(slot, store.block_entry(&head).expect("head block").0);
+    }
+
+    /// Imports `block` with `post_state` as its post-state through the part
+    /// of [`on_block`] fork choice later reads back: the block and state rows,
+    /// then [`compute_pulled_up_tip`], the only production writer of a
+    /// non-anchor block's unrealized justification. `state_transition` is
+    /// skipped, since it would need properly signed blocks and nothing here
+    /// depends on it.
+    fn import_unchecked(
+        store: &mut Store,
+        block: SignedBeaconBlock,
+        mut post_state: BeaconState,
+        config: &Config,
+    ) -> Root {
+        let root = block.message_hash_tree_root();
+        let slot = block.slot();
+        *post_state.slot_mut() = slot;
+        store.insert_signed_block(root, block).unwrap();
+        store.insert_state(root, post_state).unwrap();
+        compute_pulled_up_tip(store, root, slot, config).expect("pulled-up tip");
+        root
+    }
+
+    /// A post-state for a block building on `anchor_root` in the anchor's
+    /// own epoch, whose justified checkpoint is that anchor: the shape every
+    /// block in the anchor epoch has, and one that keeps every leaf below
+    /// viable (`voting_source.epoch == justified.epoch`) whatever the clock
+    /// reads, so a failure can only come from the lookup, not the filter.
+    fn post_state_over(anchor_state: &BeaconState, anchor_root: Root) -> BeaconState {
+        let mut state = anchor_state.clone();
+        *state.current_justified_checkpoint_mut() = Checkpoint {
+            epoch: compute_epoch_at_slot(anchor_state.slot()),
+            root: anchor_root,
+        };
+        state
+    }
+
+    /// The resume path `fetch_initial_beacon_state` takes: reopen the
+    /// directory, check the anchor states, repair the head. Nothing else
+    /// happens to the store before the chain actor starts ticking it.
+    fn resume(backend: Arc<dyn StorageBackend>) -> Store {
+        let mut store = Store::from_db_state(backend)
+            .expect("same version")
+            .expect("a beacon directory");
+        store
+            .verify_anchor_states()
+            .expect("anchor states persisted");
+        store.repair_head().expect("head has a state");
+        store
+    }
+
+    /// The store clock two epochs past the anchor's, the first tick a node
+    /// restarted into a later epoch runs.
+    fn two_epochs_past(anchor_slot: Slot, config: &Config) -> u64 {
+        (anchor_slot + 2 * preset::SLOTS_PER_EPOCH) * config.seconds_per_slot
+    }
+
+    /// Reproduces the unrealized-justification loss on resume: the
+    /// pre-restart head is a leaf from an epoch older than the store's clock,
+    /// so `get_voting_source` needs its entry, and a reopened store used to
+    /// have none.
+    ///
+    /// Failed before `Table::BeaconUnrealizedJustifications` existed, with
+    /// `SpecAssert("block_root in store.unrealized_justifications")`; passes
+    /// now that the entry is persisted rather than living only in
+    /// `BeaconScratch`.
+    #[test]
+    fn get_head_survives_a_restart_over_a_pre_restart_leaf() {
+        let config = Config::active();
+        let (anchor_state, anchor_block) = anchor_pair();
+        let anchor_slot = anchor_state.slot();
+        let anchor_root = anchor_block.message_hash_tree_root();
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        let mut store =
+            get_forkchoice_store(backend.clone(), anchor_state.clone(), anchor_block, &config)
+                .expect("the pair matches");
+
+        // anchor -> a -> b, all in the anchor's epoch.
+        let post_state = post_state_over(&anchor_state, anchor_root);
+        let a = import_unchecked(
+            &mut store,
+            block(anchor_slot + 1, anchor_root),
+            post_state.clone(),
+            &config,
+        );
+        let b = import_unchecked(&mut store, block(anchor_slot + 2, a), post_state, &config);
+
+        // Before the restart, with the clock already past b's epoch, the map
+        // answers b's lookup and b is the head.
+        on_tick(&mut store, two_epochs_past(anchor_slot, &config), &config);
+        assert_eq!(get_head(&mut store, &config).expect("pre-restart"), b);
+
+        // Restart: the writer flushes on drop, then the directory reopens.
+        drop(store);
+        let mut resumed = resume(backend);
+        assert_eq!(resumed.beacon_head().map(|(_, root)| root), Some(b));
+        assert!(
+            resumed.unrealized_justification(&b).is_some(),
+            "the persisted entry must survive the restart, before the in-memory \
+             cache has been refilled by anything"
+        );
+
+        // The first tick after the restart: same time, same tree, same head
+        // expected.
+        on_tick(&mut resumed, two_epochs_past(anchor_slot, &config), &config);
+        let head = get_head(&mut resumed, &config).map_err(|err| format!("{err:?}"));
+        assert_eq!(
+            head,
+            Ok(b),
+            "a restart must not change what get_head can compute"
+        );
+    }
+
+    /// The same loss, but for a stale fork leaf rather than the head: a
+    /// block imported after the restart extends the head (so the head is no
+    /// longer a leaf and has a fresh entry), yet a pre-restart sibling branch
+    /// is still a leaf above the justified root, and its persisted entry must
+    /// still answer, from before the restart, with nothing having recomputed
+    /// it since.
+    ///
+    /// Failed before like [`get_head_survives_a_restart_over_a_pre_restart_leaf`].
+    #[test]
+    fn get_head_survives_a_restart_past_a_pre_restart_fork_leaf() {
+        let config = Config::active();
+        let (anchor_state, anchor_block) = anchor_pair();
+        let anchor_slot = anchor_state.slot();
+        let anchor_root = anchor_block.message_hash_tree_root();
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        let mut store =
+            get_forkchoice_store(backend.clone(), anchor_state.clone(), anchor_block, &config)
+                .expect("the pair matches");
+
+        // anchor -> a -> {b, f}: f is the branch the network did not build on.
+        let post_state = post_state_over(&anchor_state, anchor_root);
+        let a = import_unchecked(
+            &mut store,
+            block(anchor_slot + 1, anchor_root),
+            post_state.clone(),
+            &config,
+        );
+        let b = import_unchecked(
+            &mut store,
+            block(anchor_slot + 2, a),
+            post_state.clone(),
+            &config,
+        );
+        let f = import_unchecked(
+            &mut store,
+            block(anchor_slot + 3, a),
+            post_state.clone(),
+            &config,
+        );
+        on_tick(&mut store, two_epochs_past(anchor_slot, &config), &config);
+        get_head(&mut store, &config).expect("pre-restart");
+
+        drop(store);
+        let mut resumed = resume(backend);
+        on_tick(&mut resumed, two_epochs_past(anchor_slot, &config), &config);
+
+        // The chain moves on from b after the restart; c gets a fresh entry.
+        let c = import_unchecked(&mut resumed, block(anchor_slot + 4, b), post_state, &config);
+        assert!(resumed.unrealized_justification(&c).is_some());
+        assert!(
+            resumed.unrealized_justification(&f).is_some(),
+            "f's entry was persisted before the restart and nothing has pruned it"
+        );
+
+        let head = get_head(&mut resumed, &config).map_err(|err| format!("{err:?}"));
+        assert!(
+            head.as_ref().is_ok_and(|head| *head == c || *head == f),
+            "a stale pre-restart fork leaf must not stop get_head: {head:?}"
+        );
+    }
+
+    /// Simulates the one crash window `Store::unrealized_justification`'s
+    /// doc comment describes, rather than a whole-process restart: a block
+    /// imports and commits normally, but its own unrealized-justification
+    /// write is then dropped by hand
+    /// ([`Store::delete_unrealized_justification`]), the way it would be
+    /// missing had the process died between `insert_state` and
+    /// `compute_pulled_up_tip`'s own commit. `get_head` must still resolve to
+    /// it once it becomes the only leaf, falling back rather than failing.
+    #[test]
+    fn get_head_survives_a_dropped_unrealized_justification() {
+        let config = Config::active();
+        let (anchor_state, anchor_block) = anchor_pair();
+        let anchor_slot = anchor_state.slot();
+        let anchor_root = anchor_block.message_hash_tree_root();
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        let mut store =
+            get_forkchoice_store(backend.clone(), anchor_state.clone(), anchor_block, &config)
+                .expect("the pair matches");
+
+        let post_state = post_state_over(&anchor_state, anchor_root);
+        let a = import_unchecked(
+            &mut store,
+            block(anchor_slot + 1, anchor_root),
+            post_state,
+            &config,
+        );
+        store.delete_unrealized_justification(a);
+        assert_eq!(
+            store.unrealized_justification(&a),
+            None,
+            "the test must exercise a genuine miss, table and cache both"
+        );
+
+        on_tick(&mut store, two_epochs_past(anchor_slot, &config), &config);
+        let head = get_head(&mut store, &config).map_err(|err| format!("{err:?}"));
+        assert_eq!(
+            head,
+            Ok(a),
+            "a dropped unrealized justification must fall back rather than fail get_head: {head:?}"
+        );
     }
 
     /// The specification's assertion cannot hold for a checkpoint-synced
@@ -6901,7 +7295,7 @@ mod tests {
             )
             .unwrap();
         store.insert_state(b_root, state).unwrap();
-        store.set_unrealized_justification(b_root, Checkpoint::default());
+        store.set_unrealized_justification(b_root, first_gloas_slot, Checkpoint::default());
 
         store
             .set_time_ms((first_gloas_slot - 1) * config.slot_duration_ms)
@@ -7362,7 +7756,7 @@ mod tests {
                 test_state::with_validators(preset::SLOTS_PER_EPOCH as usize),
             )
             .unwrap();
-        store.set_unrealized_justification(b_root, Checkpoint::default());
+        store.set_unrealized_justification(b_root, anchor_slot + 1, Checkpoint::default());
         store.set_proposer_boost_root(b_root);
 
         // No votes for the anchor (the boosted block's parent, one slot
@@ -7835,7 +8229,7 @@ mod tests {
             .insert_signed_block(anchor_root, fulu_block(anchor_slot, Root::ZERO))
             .unwrap();
         store.insert_state(anchor_root, fulu_state.clone()).unwrap();
-        store.set_unrealized_justification(anchor_root, Checkpoint::default());
+        store.set_unrealized_justification(anchor_root, anchor_slot, Checkpoint::default());
 
         let mut roots = vec![anchor_root];
         let mut slots: Vec<Slot> = vec![anchor_slot];
@@ -7905,6 +8299,7 @@ mod tests {
             let unrealized_epoch = if justified_moved { rng.below(2) } else { 0 };
             store.set_unrealized_justification(
                 root,
+                slot,
                 Checkpoint {
                     epoch: unrealized_epoch,
                     root: Root::ZERO,
