@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-560b5714.js";
+            window.path_to_searchindex_js = "searchindex-e8213950.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-34fa44cf.js"></script>
@@ -317,6 +317,32 @@ really sits at the slot asked for. A slot the store holds nothing at still
 answers <code>404</code>, since no candidate matches.</p>
 <p>This was found by running a mainnet follower and pointing a second one at its
 API: before the fallback existed, the second died with <code>peer served no block at the anchor slot 15265888</code>.</p>
+<h2 id="the-inactivity-leak-check-runs-once-per-epoch-step-not-once-per-validator"><a class="header" href="#the-inactivity-leak-check-runs-once-per-epoch-step-not-once-per-validator">The inactivity-leak check runs once per epoch step, not once per validator</a></h2>
+<p>A state whose finalized checkpoint is past its previous epoch fails epoch
+processing here even where the specification never reaches the failing check.</p>
+<ul>
+<li><strong>ethlambda:</strong> <code>get_finality_delay</code>
+(<code>crates/blockchain/state_transition/src/beacon/helpers/finality.rs</code>) returns
+<code>ArithmeticOverflow</code> when <code>previous_epoch - finalized_checkpoint.epoch</code>
+underflows. From altair on, the inactivity-score update and
+<code>RewardContext::new</code> read the leak flag once, before their loop over
+validators, so either fails whenever the delay does. altair’s
+<code>get_inactivity_penalty_deltas</code> also builds a <code>RewardContext</code>, so it fails
+too. phase0 reads the flag where the specification does.</li>
+<li><strong>consensus-specs:</strong> the subtraction is the same, and a <code>uint64</code> underflow
+makes the transition invalid. But <code>process_inactivity_updates</code> and
+<code>get_flag_index_deltas</code> call <code>is_in_inactivity_leak</code> inside their loops, for
+eligible (and, for rewards, participating) validators only, and altair’s
+<code>get_inactivity_penalty_deltas</code> never calls it. A state where no validator
+reaches the check passes.</li>
+<li><strong>Consequence:</strong> none on a real chain. Justification only finalizes an epoch
+behind the current one, so the finalized epoch never passes the previous
+epoch, and only a crafted pre-state tells the two apart. Lighthouse reads
+the leak once per epoch as well (<code>process_epoch_single_pass</code>), failing on the
+same <code>safe_sub</code>. The randomized equivalence tests keep the finalized epoch
+behind the previous one for this reason: past it, the fast path and the
+specification-shaped reference fail at different points.</li>
+</ul>
 
                     </main>
 
