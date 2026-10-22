@@ -1040,6 +1040,7 @@ pub fn init() {
     std::sync::LazyLock::force(&LEAN_BLOCK_BUILDING_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_BLOCK_BUILDING_SUCCESS_TOTAL);
     std::sync::LazyLock::force(&LEAN_BLOCK_BUILDING_FAILURES_TOTAL);
+    std::sync::LazyLock::force(&LEAN_BLOCK_PROPOSALS_MISSED_TOTAL);
     // Block proposal attestation selection
     std::sync::LazyLock::force(&LEAN_BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASE_SECONDS);
     std::sync::LazyLock::force(&LEAN_BLOCK_PROPOSAL_ATTESTATION_BUILDS_TOTAL);
