@@ -707,6 +707,7 @@ mod tests {
                 fulu_block_at(slot),
                 BlockSource::Sync,
                 BlockArrival::now(),
+                ethlambda_network_api::BlockAnnouncement::Silent,
             );
         }
         // The handler's own steps, less the actor `Context` it also needs for

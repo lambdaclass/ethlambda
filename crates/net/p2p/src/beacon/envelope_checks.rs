@@ -149,7 +149,9 @@ pub(crate) fn check_and_forward_then(
 pub(crate) mod tests {
     use std::sync::Arc;
 
-    use ethlambda_network_api::{AggregateArrival, BlockSource, P2PToBlockChain};
+    use ethlambda_network_api::{
+        AggregateArrival, BlockAnnouncement, BlockSource, P2PToBlockChain,
+    };
     use ethlambda_state_transition::beacon::gossip::{IgnoreReason, QueueReason, RejectReason};
     use ethlambda_types::attestation::{SignedAggregatedAttestation, SignedAttestation};
     use ethlambda_types::beacon::config::Config;
@@ -181,6 +183,7 @@ pub(crate) mod tests {
             block: SignedBeaconBlock,
             _: BlockSource,
             _: BlockArrival,
+            _: BlockAnnouncement,
         ) -> Result<(), ActorError> {
             let _ = self.0.send(Seen::Block(block.slot()));
             Ok(())

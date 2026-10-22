@@ -80,10 +80,46 @@ pub enum Table {
     ///
     /// Never pruned; a row is a few bytes.
     BlockTimeliness,
+    /// Beacon per-block unrealized justified checkpoint: root ->
+    /// `(slot, Checkpoint)`.
+    ///
+    /// The specification's `store.unrealized_justifications[block_root]`,
+    /// consensus-specs' own scratch, used to live only in
+    /// `BeaconScratch::unrealized_justifications`. A restart emptied that map,
+    /// and nothing refilled it, so `get_voting_source`/`is_ffg_competitive`
+    /// hit a hard `SpecAssert` on the first pre-restart leaf from an epoch
+    /// older than the store's clock, freezing `get_head`. This table is what
+    /// makes the value survive a restart; the in-memory map stays too, as a
+    /// write-through cache over it, since `get_voting_source` reads this for
+    /// every block from a prior epoch.
+    ///
+    /// A miss is now possible only in one narrow crash window: the store
+    /// writer flushes a block's post-state, the process dies before that
+    /// block's own row here lands, and resume's `has_state` check then skips
+    /// re-importing it. `get_voting_source` no longer raises on that miss; it
+    /// falls back to the store's justified checkpoint (see its own doc
+    /// comment). `is_ffg_competitive` still raises, since nothing in
+    /// production calls it.
+    ///
+    /// Keyed by root alone rather than `slot ‖ root` (`encode_slot_root_key`,
+    /// as `LiveChain`/`BlockProof` are): both readers of this table
+    /// (`get_voting_source`, `is_ffg_competitive`) look up a root with no slot
+    /// in hand, so a root-only key keeps that lookup a single point read. The
+    /// slot rides
+    /// along in the *value* instead, purely so the pruner (which does need it)
+    /// does not have to decode a whole block to find it. The trade is a
+    /// pruning pass that scans the whole table rather than stopping early on a
+    /// slot-ordered prefix, which is cheap here: the table only ever holds the
+    /// unfinalized window's worth of leaves between two finalizations.
+    ///
+    /// Pruned on finalization, on the same horizon `LiveChain` is (the
+    /// finalized block's own slot): see `Store::update_checkpoints`'s
+    /// `Chain::Beacon` arm.
+    BeaconUnrealizedJustifications,
 }
 
 /// All table variants.
-pub const ALL_TABLES: [Table; 12] = [
+pub const ALL_TABLES: [Table; 13] = [
     Table::BlockHeaders,
     Table::BlockBodies,
     Table::BlockProof,
@@ -96,6 +132,7 @@ pub const ALL_TABLES: [Table; 12] = [
     Table::PendingDataColumns,
     Table::ExecutionPayloadEnvelopes,
     Table::BlockTimeliness,
+    Table::BeaconUnrealizedJustifications,
 ];
 
 impl Table {
@@ -114,6 +151,7 @@ impl Table {
             Table::PendingDataColumns => "pending_data_columns",
             Table::ExecutionPayloadEnvelopes => "execution_payload_envelopes",
             Table::BlockTimeliness => "block_timeliness",
+            Table::BeaconUnrealizedJustifications => "beacon_unrealized_justifications",
         }
     }
 }
