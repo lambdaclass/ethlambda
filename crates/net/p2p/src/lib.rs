@@ -80,7 +80,10 @@ use tracing::{debug, info, trace, warn};
 use crate::{
     discovery::{
         DIAL_INTERVAL_AT_TARGET, DIAL_INTERVAL_AT_ZERO_PEERS, DiscoveryError, DiscoverySpawnConfig,
-        dial::{DiscoveryState, dial_interval, dial_progress, dial_tick, forget_discovered_peer},
+        dial::{
+            DiscoveryState, dial_interval, dial_progress, dial_tick, forget_discovered_peer,
+            report_peer_connected, report_peer_disconnected,
+        },
         enr::{dialable_port, read_ip, read_public_key, read_quic_port, read_tcp_port},
         spawn_discovery,
     },
@@ -1600,6 +1603,7 @@ async fn handle_swarm_event(
             if num_established.get() == 1 {
                 server.connected_peers.insert(peer_id, direction);
                 server.refresh_peer_metrics();
+                report_peer_connected(server, &peer_id);
                 let peer_count = server.connected_peers.len();
                 metrics::notify_peer_connected(
                     server.resolve_node_name(Some(&peer_id)),
@@ -1699,6 +1703,7 @@ async fn handle_swarm_event(
                     .connected_peers
                     .remove(&peer_id)
                     .unwrap_or(closed_direction);
+                report_peer_disconnected(server, &peer_id);
                 forget_discovered_peer(server, &peer_id);
                 server.refresh_peer_metrics();
                 let peer_count = server.connected_peers.len();
