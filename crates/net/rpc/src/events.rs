@@ -10,16 +10,20 @@
 //! ([`ethlambda_blockchain::ChainEvent::topic`]) and the `data:` line carries
 //! the event's flat JSON payload; the topic is never repeated inside the body.
 //!
-//! Filtering: `?topics=head,block` (comma-separated [`Topic`] names) selects
-//! which events to stream. `topics` is required (matching the Beacon API): a
-//! missing, empty, or unknown value is a 400.
+//! Filtering: `?topics=head,block` (comma-separated [`Topic`] names from
+//! [`Topic::LEAN`]) selects which events to stream. `topics` is required
+//! (matching the Beacon API): a missing, empty, or unknown value is a 400.
+//!
+//! The stream itself ([`sse_response`]) is shared with the Beacon API's
+//! `/eth/v1/events` (`crate::beacon::events`), which differs only in how it
+//! reads `topics` and words a refusal.
 
-use std::{convert::Infallible, str::FromStr};
+use std::convert::Infallible;
 
 use axum::{
     Extension, Router,
     extract::Query,
-    http::StatusCode,
+    http::{HeaderValue, StatusCode},
     response::{IntoResponse, Response, Sse, sse::Event},
     routing::get,
 };
@@ -51,15 +55,34 @@ async fn get_events(
             )
                 .into_response();
         }
-        Some(list) => match list.split(',').map(Topic::from_str).collect() {
+        Some(list) => match list
+            .split(',')
+            .map(|name| Topic::parse_accepted(name, Topic::LEAN))
+            .collect()
+        {
             Ok(topics) => topics,
             Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
         },
     };
 
-    Sse::new(event_stream(events.subscribe(), topics))
+    sse_response(&events, topics)
+}
+
+/// An SSE response streaming every event on `events` whose topic is in
+/// `topics`, from now on.
+///
+/// `X-Accel-Buffering: no` tells an nginx reverse proxy not to buffer the
+/// stream, which would otherwise hold events back until a buffer fills; axum's
+/// [`Sse`] already sets `content-type: text/event-stream` and
+/// `cache-control: no-cache`.
+pub(crate) fn sse_response(events: &EventBus, topics: Vec<Topic>) -> Response {
+    let mut response = Sse::new(event_stream(events.subscribe(), topics))
         .keep_alive(axum::response::sse::KeepAlive::default())
-        .into_response()
+        .into_response();
+    response
+        .headers_mut()
+        .insert("x-accel-buffering", HeaderValue::from_static("no"));
+    response
 }
 
 /// Bridge the receiver's `recv` loop into a stream of SSE frames, dropping
@@ -314,6 +337,51 @@ mod tests {
         assert!(
             text.contains("unknown topic: 'bogus'"),
             "unhelpful 400 body: {text}"
+        );
+    }
+
+    /// Beacon-only names parse as topics now, but the lean surface still
+    /// refuses them exactly as it refuses a name matching nothing.
+    #[tokio::test]
+    async fn events_beacon_only_topic_returns_400() {
+        let events = EventBus::new(16);
+
+        let resp =
+            events_response(&events, "/lean/v0/events?topics=head,data_column_sidecar").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("unknown topic: 'data_column_sidecar'"),
+            "unhelpful 400 body: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn events_streams_chain_reorg_with_bare_integers() {
+        let events = EventBus::new(16);
+
+        let resp = events_response(&events, "/lean/v0/events?topics=chain_reorg").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        events.emit(ChainEvent::ChainReorg {
+            slot: 9,
+            depth: 2,
+            old_head_block: Default::default(),
+            new_head_block: Default::default(),
+            old_head_state: Default::default(),
+            new_head_state: Default::default(),
+        });
+
+        let text = first_frame(resp).await;
+        assert!(
+            text.contains("event:chain_reorg") || text.contains("event: chain_reorg"),
+            "missing chain_reorg event name in frame: {text}"
+        );
+        assert!(
+            text.contains("\"slot\":9") && text.contains("\"depth\":2"),
+            "missing bare slot/depth in frame: {text}"
         );
     }
 
