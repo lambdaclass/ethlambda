@@ -732,6 +732,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     p2p: rpc_p2p,
                     attestation_pool: attestation_pool.clone(),
                     engine: rpc_engine,
+                    events: rpc_events,
                     client_version: version::engine_client_version(),
                 },
                 local_peer_id,

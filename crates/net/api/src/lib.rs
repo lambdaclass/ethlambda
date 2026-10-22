@@ -100,6 +100,28 @@ pub enum BlockSource {
     Replay,
 }
 
+/// Whether the chain actor announces a block on the `block_gossip` chain
+/// event when it arrives.
+///
+/// Separate from [`BlockSource`], which says how the block arrived and labels
+/// its import metrics. The two disagree on the beacon wire: a gossip block
+/// handed over on a `Queue` or `Ignore(Overloaded)` verdict arrived by gossip
+/// without passing the `beacon_block` topic's validation rules, and a block a
+/// validator client published through the Beacon API passed them without
+/// arriving by gossip. The Beacon API's `block_gossip` names exactly the blocks
+/// that passed, from either path, so only the sender knows which one this is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockAnnouncement {
+    /// Emit `block_gossip`: a beacon block that passed gossip validation
+    /// (on its gossip `Accept`, or checked by the Beacon API before
+    /// publishing), or a lean block from gossip, which validates nothing
+    /// before import and has always announced every gossip block.
+    Announce,
+    /// Emit nothing: fetched by req/resp, re-delivered after a hold, replayed,
+    /// or handed over on a gossip verdict other than `Accept`.
+    Silent,
+}
+
 /// When a block's payload reached this node.
 ///
 /// Carried on the message rather than read by the chain actor when it handles
@@ -184,6 +206,7 @@ pub trait P2PToBlockChain: Send + Sync {
         block: SignedBeaconBlock,
         source: BlockSource,
         arrival: BlockArrival,
+        announcement: BlockAnnouncement,
     ) -> Result<(), ActorError>;
     fn new_attestation(&self, attestation: SignedAttestation) -> Result<(), ActorError>;
     fn new_aggregated_attestation(
@@ -221,10 +244,11 @@ pub trait P2PToBlockChain: Send + Sync {
         &self,
         sidecars: Vec<DataColumnSidecar>,
     ) -> Result<(), ActorError>;
-    /// An aggregate gossip validation accepted: `ethlambda-p2p`'s beacon
-    /// gossip verdict machinery already ran every `beacon_aggregate_and_proof`
-    /// condition, `attesting_indices` included, so the chain actor only has to
-    /// apply it to fork choice.
+    /// An aggregate that passed every `beacon_aggregate_and_proof` condition,
+    /// `attesting_indices` included: either `ethlambda-p2p`'s beacon gossip
+    /// verdict machinery accepted it, or the Beacon API ran the same checks on
+    /// one a validator client submitted. The chain actor only has to apply it
+    /// to fork choice.
     ///
     /// Separate from [`Self::new_aggregated_attestation`], which carries
     /// lean's unrelated [`SignedAggregatedAttestation`]: the two chains'
@@ -243,8 +267,12 @@ pub trait P2PToBlockChain: Send + Sync {
     /// `fork_choice::apply_verified_aggregate`.
     ///
     /// One aggregate per message rather than a batch, unlike
-    /// [`Self::new_data_column_sidecars`]: gossip is the only producer, and it
-    /// has exactly one to hand.
+    /// [`Self::new_data_column_sidecars`]: each producer has exactly one to
+    /// hand. There are two, gossip on `Accept` and
+    /// [`RpcToP2P::publish_beacon_aggregate`], since gossip never delivers a
+    /// node its own messages: without the second, an aggregate this node's
+    /// validator client submitted would reach neither its fork choice nor its
+    /// `attestation` event stream.
     fn new_beacon_aggregate(
         &self,
         aggregate: Box<SignedAggregateAndProof>,
@@ -265,9 +293,12 @@ pub trait P2PToBlockChain: Send + Sync {
 ///
 /// [`BlockArrival`]'s shape without its `deferred_from`: an aggregate held for
 /// a slot that has not started is held *inside* the chain actor, so that wait
-/// is measured where it happens rather than travelling on the message. And
-/// `decode_start` is not optional here, because gossip is the only producer
-/// and it always decodes the payload itself.
+/// is measured where it happens rather than travelling on the message.
+///
+/// `decode_start` is not optional, unlike [`BlockArrival`]'s: an aggregate a
+/// validator client submitted through the Beacon API crossed no wire, so it
+/// reports [`AggregateArrival::now`], both instants at the hand-off, and its
+/// end-to-end time is the mailbox wait plus the apply.
 #[derive(Clone, Copy, Debug)]
 pub struct AggregateArrival {
     /// The payload came off the wire, before decompression.
@@ -275,6 +306,18 @@ pub struct AggregateArrival {
     /// The aggregate is about to be handed to the chain actor, which is also
     /// the end of the decode.
     pub handed_off: Instant,
+}
+
+impl AggregateArrival {
+    /// An arrival whose earliest knowable moment is now, for a producer that
+    /// decoded nothing.
+    pub fn now() -> Self {
+        let now = Instant::now();
+        Self {
+            decode_start: now,
+            handed_off: now,
+        }
+    }
 }
 
 // --- Protocol: RPC -> P2P ---
@@ -298,10 +341,17 @@ pub trait RpcToP2P: Send + Sync {
         attestation: SingleAttestation,
     ) -> Result<(), ActorError>;
     /// Gossip one signed aggregate on `beacon_aggregate_and_proof`, already
-    /// validated by the caller for the same reason as above.
+    /// validated by the caller for the same reason as above, and hand it to
+    /// the chain actor, as [`Self::publish_beacon_block`] does with a block
+    /// and for the same reason.
+    ///
+    /// `attesting_indices` are the validators the caller's validation
+    /// resolved the aggregate's bits to, which is what the chain actor applies
+    /// to fork choice; see [`P2PToBlockChain::new_beacon_aggregate`].
     fn publish_beacon_aggregate(
         &self,
         aggregate: SignedAggregateAndProof,
+        attesting_indices: Vec<ValidatorIndex>,
     ) -> Result<(), ActorError>;
     /// Join attestation subnets a validator client's aggregators need, each
     /// until the end of the paired slot, so their committees' attestations
