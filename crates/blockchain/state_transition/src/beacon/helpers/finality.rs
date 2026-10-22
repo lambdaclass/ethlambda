@@ -8,6 +8,7 @@
 //! `helpers` depend on `stf` where the dependency otherwise runs the other way.
 
 use crate::beacon::containers::BeaconState;
+use crate::beacon::error::{Error, Result};
 use crate::beacon::preset;
 use crate::beacon::primitives::{Epoch, ValidatorIndex};
 
@@ -20,8 +21,18 @@ use super::predicates::is_active_validator;
 /// by one every further epoch the chain fails to finalize, which is what lets
 /// [`is_in_inactivity_leak`] and the inactivity penalty scale with how long the
 /// stall has lasted rather than firing at a fixed severity.
-pub fn get_finality_delay(state: &BeaconState) -> Epoch {
-    get_previous_epoch(state) - state.finalized_checkpoint().epoch
+///
+/// A finalized checkpoint past the previous epoch makes this a `uint64`
+/// underflow, which the specification treats as an invalid state transition,
+/// so it returns [`Error::ArithmeticOverflow`] rather than wrapping. No chain
+/// reaches that state: justification only ever finalizes an epoch already
+/// behind the current one.
+pub fn get_finality_delay(state: &BeaconState) -> Result<Epoch> {
+    get_previous_epoch(state)
+        .checked_sub(state.finalized_checkpoint().epoch)
+        .ok_or(Error::ArithmeticOverflow(
+            "get_previous_epoch(state) - finalized_checkpoint.epoch",
+        ))
 }
 
 /// Whether the chain has gone long enough without finalizing that inactive
@@ -32,8 +43,10 @@ pub fn get_finality_delay(state: &BeaconState) -> Epoch {
 /// stalls, the faster an inactive validator's share of the active set shrinks,
 /// until the honest, active minority eventually clears the two-thirds
 /// threshold on its own.
-pub fn is_in_inactivity_leak(state: &BeaconState) -> bool {
-    get_finality_delay(state) > preset::MIN_EPOCHS_TO_INACTIVITY_PENALTY
+///
+/// Fails wherever [`get_finality_delay`] does.
+pub fn is_in_inactivity_leak(state: &BeaconState) -> Result<bool> {
+    Ok(get_finality_delay(state)? > preset::MIN_EPOCHS_TO_INACTIVITY_PENALTY)
 }
 
 /// Validators whose participation this epoch's rewards and penalties account
