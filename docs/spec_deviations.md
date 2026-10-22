@@ -99,11 +99,12 @@ rather than populated, which is not spec-valid.
   work. Everything that reads `peer_id` is unaffected. Out of scope for the
   change that added the Beacon API surface; a follow-up exposes the record.
 
-## Sync duties are served for the current and next period only
+## Sync duties are not served for a period before the head's
 
-`POST /eth/v1/validator/duties/sync/{epoch}` answers an `epoch` in the head
-state's own sync committee period or the next one, and refuses an earlier
-period with a `400`.
+`POST /eth/v1/validator/duties/sync/{epoch}` refuses a period before the head
+state's own with a `400`. Later periods follow the wall clock, as the Beacon
+API defines: up to the clock's current period plus one, read from the head or,
+when the head lags a period boundary, from a copy advanced across it.
 
 - **Beacon API:** allows any period up to the current one plus one, so an
   earlier period is valid to ask about.
