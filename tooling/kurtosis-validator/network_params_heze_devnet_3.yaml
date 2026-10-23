@@ -1,0 +1,73 @@
+# heze-devnet-3's client set: heze-devnet-2 (Heze with EIP-7805 FOCIL, EIP-8015
+# and EIP-8365) plus EIP-8198 (quick slots), with `ethlambda beacon` and the
+# ethlambda validator client added. The slot duration changes at the heze
+# fork: 12 s slots become 9 s (`slot_duration_ms_heze: 9000`), so the run
+# crosses a schedule change as well as the heze upgrade. Images follow the
+# devnet's spec sheet (https://notes.ethereum.org/@ethpandaops/heze-devnet-3):
+# lighthouse, lodestar, teku and prysm on `heze-devnet-2`, every execution
+# client ethrex on `heze-devnet-3`. Run from the repository root, after
+# building the image as `ethlambda:heze-devnet-3`:
+#
+#   kurtosis run --enclave ethlambda-heze tooling/kurtosis-validator \
+#     --args-file tooling/kurtosis-validator/network_params_heze_devnet_3.yaml
+#
+# ethlambda beacon is paired with ethrex rather than geth, since heze needs
+# Bogota's Engine API (`engine_newPayloadV6`, `engine_forkchoiceUpdatedV5`,
+# `engine_getInclusionListV1`). Gloas from genesis and heze one epoch later,
+# so the run crosses the heze upgrade. spamoor keeps the mempools non-empty,
+# which is what gives the inclusion lists transactions to carry.
+participants:
+  - el_type: ethrex
+    el_image: ethpandaops/ethrex:heze-devnet-3
+    cl_type: lighthouse
+    cl_image: ethpandaops/lighthouse:heze-devnet-2
+    validator_count: 64
+    supernode: true
+    cl_extra_params:
+      - --subscribe-all-subnets
+  - el_type: ethrex
+    el_image: ethpandaops/ethrex:heze-devnet-3
+    cl_type: lodestar
+    cl_image: ethpandaops/lodestar:heze-devnet-2
+    validator_count: 64
+    supernode: true
+  - el_type: ethrex
+    el_image: ethpandaops/ethrex:heze-devnet-3
+    cl_type: teku
+    cl_image: ethpandaops/teku:heze-devnet-2
+    validator_count: 64
+    supernode: true
+  - el_type: ethrex
+    el_image: ethpandaops/ethrex:heze-devnet-3
+    cl_type: prysm
+    cl_image: ethpandaops/prysm-beacon-chain:heze-devnet-2
+    vc_image: ethpandaops/prysm-validator:heze-devnet-2
+    vc_extra_params:
+      - --enable-beacon-rest-api
+    validator_count: 64
+    supernode: true
+network_params:
+  preset: mainnet
+  gloas_fork_epoch: 0
+  heze_fork_epoch: 1
+  slot_duration_ms_heze: 9000
+  preregistered_validator_count: 256
+ethereum_genesis_generator_params:
+  image: ethpandaops/ethereum-genesis-generator:6.2.7
+dora_params:
+  image: ethpandaops/dora:master
+additional_services:
+  - dora
+  - spamoor
+global_log_level: info
+
+ethlambda_validator:
+  image: ethlambda:heze-devnet-3
+  name: ethlambda-vc
+  suggested_fee_recipient: "0x000000000000000000000000000000000000dEaD"
+
+ethlambda_beacon:
+  enabled: true
+  fallback: false
+  el: ethrex
+  el_image: ethpandaops/ethrex:heze-devnet-3
