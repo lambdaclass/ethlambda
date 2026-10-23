@@ -1010,6 +1010,7 @@ fn assert_full_sync_aggregate(
         &mut state,
         aggregate,
         &Default::default(),
+        &ethlambda_types::beacon::config::Config::mainnet(),
     )
     .expect("the packed aggregate verifies as the state transition checks it");
 }

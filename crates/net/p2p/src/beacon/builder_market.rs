@@ -183,8 +183,7 @@ pub(crate) fn publish_proposer_preferences(
 /// The wall-clock slot, from the store's config.
 pub(crate) fn wall_slot(server: &P2PServer) -> Slot {
     let config = server.store.config();
-    let genesis_ms = config.genesis_time_ms();
-    unix_now_ms().saturating_sub(genesis_ms) / config.slot_duration_ms.max(1)
+    config.slot_at_time_ms(config.genesis_time_ms(), unix_now_ms())
 }
 
 #[cfg(test)]

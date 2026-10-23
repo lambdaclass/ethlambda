@@ -917,7 +917,11 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
     // count; `P2PServer`'s first scoring refresh, at startup, replaces the
     // topic parameters with the head's.
     if let WireConfig::Beacon(beacon) = &wire {
-        let settings = beacon::scoring::ScoreSettings::new(&beacon.config, MESH_N);
+        let wall_slot = beacon.config.slot_at_time_ms(
+            beacon.genesis_time.saturating_mul(1000),
+            ethlambda_types::time::unix_now_ms(),
+        );
+        let settings = beacon::scoring::ScoreSettings::at_slot(&beacon.config, wall_slot, MESH_N);
         let params = settings.peer_score_params(
             beacon.fork_digest,
             beacon::scoring::ScoreInputs::placeholder(),
@@ -1686,7 +1690,9 @@ impl P2PServer {
         ctx: &Context<Self>,
     ) {
         if let Some(wire) = self.wire.beacon() {
-            let slot = Duration::from_millis(wire.config.slot_duration_ms);
+            // The duration of the slot now running: it changes at Heze.
+            let slot_duration_ms = wire.config.slot_duration_ms_at_slot(wire.wall_slot());
+            let slot = Duration::from_millis(slot_duration_ms);
             send_after(slot, ctx.clone(), p2p_protocol::RefreshPeerScoring);
         }
         beacon::scoring::refresh(self);

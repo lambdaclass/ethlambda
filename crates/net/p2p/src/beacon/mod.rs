@@ -122,11 +122,16 @@ impl BeaconWire {
     }
 
     /// The slot the wall clock is in, from this chain's genesis and slot
-    /// duration. Zero before genesis.
+    /// schedule (the slot duration changes at Heze, EIP-8198). Zero before
+    /// genesis.
     pub fn wall_slot(&self) -> Slot {
+        self.slot_at_ms(ethlambda_types::time::unix_now_ms())
+    }
+
+    /// The slot containing Unix time `now_ms`; zero before genesis.
+    pub fn slot_at_ms(&self, now_ms: u64) -> Slot {
         let genesis_ms = self.genesis_time.saturating_mul(1000);
-        ethlambda_types::time::unix_now_ms().saturating_sub(genesis_ms)
-            / self.config.slot_duration_ms.max(1)
+        self.config.slot_at_time_ms(genesis_ms, now_ms)
     }
 
     /// The two values the codec needs to put a block chunk on or off the wire.

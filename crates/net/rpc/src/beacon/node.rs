@@ -21,11 +21,12 @@ pub(crate) fn routes(version: &'static str, peer_id: String) -> Router<Store> {
         )
 }
 
-/// The wall-clock slot, from genesis and the configured slot duration.
+/// The wall-clock slot, from genesis and the slot schedule.
 ///
 /// Millisecond-denominated, the way `/lean/v0/node/syncing` computes the same
 /// number: `slot_duration_ms` is the value a loaded network can actually
 /// change, and `seconds_per_slot` would truncate a sub-second cadence to zero.
+/// It walks the EIP-8198 schedule, since the duration changes at Heze.
 pub(crate) fn wall_slot(store: &Store) -> u64 {
     let config = store.config();
     let genesis_ms = config.genesis_time_ms();
@@ -33,7 +34,7 @@ pub(crate) fn wall_slot(store: &Store) -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or(genesis_ms);
-    now_ms.saturating_sub(genesis_ms) / config.slot_duration_ms.max(1)
+    config.slot_at_time_ms(genesis_ms, now_ms)
 }
 
 /// Whether the fork-choice head was imported on a payload the execution client
