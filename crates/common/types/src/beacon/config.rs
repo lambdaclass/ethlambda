@@ -1043,7 +1043,7 @@ impl Config {
     /// Genesis as a millisecond timestamp, the zero point every tick
     /// computation measures from.
     pub fn genesis_time_ms(&self) -> u64 {
-        self.genesis_time * 1_000
+        self.genesis_time.saturating_mul(1_000)
     }
 
     /// Interval duration in milliseconds.
@@ -1989,6 +1989,31 @@ mod tests {
         );
         // Entirely after the fork the same window spans twice the epochs.
         assert_eq!(fork.blob_data_retention_start_epoch(3_500), 1_500);
+    }
+
+    #[test]
+    fn far_future_inputs_saturate_instead_of_overflowing() {
+        let config = quick_slots();
+        assert_eq!(config.time_at_slot_ms(GENESIS_MS, u64::MAX), u64::MAX);
+        assert_eq!(config.time_at_slot(u64::MAX, u64::MAX), u64::MAX / 1_000);
+        let at_far_epoch = Config {
+            heze_fork_epoch: u64::MAX - 1,
+            ..quick_slots()
+        };
+        assert_eq!(
+            at_far_epoch.time_at_slot_ms(GENESIS_MS, 10),
+            GENESIS_MS + 120_000
+        );
+        let _ = config.slot_at_time_ms(GENESIS_MS, u64::MAX);
+        let _ = config.blob_data_retention_start_epoch(u64::MAX);
+        assert_eq!(
+            Config {
+                genesis_time: u64::MAX,
+                ..quick_slots()
+            }
+            .genesis_time_ms(),
+            u64::MAX
+        );
     }
 
     #[test]
