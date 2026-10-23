@@ -210,7 +210,7 @@ pub(crate) fn check_constants(config: &Config) -> Result<(), ConstantsMismatch> 
     }
 }
 
-/// Fill in the two [`Config`] fields a `config.yaml` cannot be trusted for.
+/// Fill in the [`Config`] field a `config.yaml` cannot be trusted for.
 ///
 /// Shared by a loaded directory and the built-in networks, whose configs both
 /// come out of [`config_file::ConfigFile::parse`].
@@ -221,15 +221,11 @@ pub(crate) fn check_constants(config: &Config) -> Result<(), ConstantsMismatch> 
 /// before its actual genesis, so reading it from the file would put every slot
 /// boundary off by that much.
 ///
-/// `slot_duration_ms` is always derived, never read from the file. A beacon
-/// chain's slots are a whole number of seconds, so `SECONDS_PER_SLOT` is
-/// authoritative and the millisecond field exists for lean's sub-second
-/// cadence. A config carrying `SECONDS_PER_SLOT: 6` and no `SLOT_DURATION_MS`
-/// would otherwise keep mainnet's 12000 by default, and every duty would fire
-/// at the wrong time while the second-resolution field looked correct.
+/// The slot-time fields are not touched here: they are reconciled once, at
+/// parse time (see `config_file::reconcile_slot_time`), so built-in and
+/// loaded networks share the rule.
 fn derive_genesis_fields(config: &mut Config, genesis_time: u64) {
     config.genesis_time = genesis_time;
-    config.slot_duration_ms = config.seconds_per_slot * 1_000;
 }
 
 /// A resolved network: everything startup needs before it can build a swarm.

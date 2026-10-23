@@ -125,7 +125,7 @@ impl NetworkDir {
                 path: config_path.clone(),
             });
         }
-        // Two fields cannot come from the file and must be reconciled here,
+        // `genesis_time` cannot come from the file and must be set here,
         // once, before anything reads the config.
         let mut config = parsed.config;
         super::derive_genesis_fields(&mut config, genesis_state.genesis_time());
@@ -231,7 +231,7 @@ mod tests {
     }
 
     #[test]
-    fn the_two_derived_fields_are_reconciled_against_the_genesis_state() {
+    fn genesis_time_comes_from_the_genesis_state() {
         // The genesis state here MUST carry a genesis_time different from
         // `Config::mainnet().genesis_time`. `genesis_time` is `#[serde(skip)]`
         // under a container-level `default`, so an unreconciled config inherits
@@ -251,10 +251,7 @@ mod tests {
             "the test is only meaningful if the state differs from the default"
         );
 
-        // The devnet fixture deliberately carries an inconsistent pair:
-        // SECONDS_PER_SLOT is 6 while SLOT_DURATION_MS is still mainnet's
-        // 12000. The seconds field is authoritative on a beacon chain, so the
-        // derivation has to win over what the file says.
+        // The devnet fixture's two slot-time keys agree, so both survive.
         assert_eq!(loaded.config.seconds_per_slot, 6);
         assert_eq!(loaded.config.slot_duration_ms, 6_000);
     }
@@ -271,7 +268,11 @@ mod tests {
     fn a_zero_seconds_per_slot_is_rejected_naming_the_field() {
         let dir = complete_dir();
         let devnet_text = std::fs::read_to_string(fixture("devnet").join("config.yaml")).unwrap();
-        let zeroed_text = devnet_text.replacen("SECONDS_PER_SLOT: 6", "SECONDS_PER_SLOT: 0", 1);
+        // SLOT_DURATION_MS is zeroed too, so the pair agrees and only the
+        // zero itself is wrong.
+        let zeroed_text = devnet_text
+            .replacen("SECONDS_PER_SLOT: 6", "SECONDS_PER_SLOT: 0", 1)
+            .replacen("SLOT_DURATION_MS: 6000", "SLOT_DURATION_MS: 0", 1);
         assert_ne!(
             zeroed_text, devnet_text,
             "fixture no longer carries SECONDS_PER_SLOT in the expected form"
@@ -279,7 +280,17 @@ mod tests {
         std::fs::write(dir.path().join("config.yaml"), zeroed_text).unwrap();
 
         let err = NetworkDir::load(dir.path()).unwrap_err().to_string();
-        assert!(err.contains("SECONDS_PER_SLOT"), "got {err}");
+        assert!(err.contains("SECONDS_PER_SLOT is 0"), "got {err}");
+    }
+
+    #[test]
+    fn disagreeing_slot_keys_are_rejected_naming_both_keys_and_values() {
+        let dir = complete_dir();
+        replace_config_line(&dir, "SLOT_DURATION_MS: 6000", "SLOT_DURATION_MS: 12000");
+        let err = format!("{:#}", NetworkDir::load(dir.path()).unwrap_err());
+        for needle in ["SECONDS_PER_SLOT (6)", "SLOT_DURATION_MS (12000)"] {
+            assert!(err.contains(needle), "got {err}");
+        }
     }
 
     /// Write `dir`'s `config.yaml` as the devnet fixture's with one line
@@ -289,6 +300,48 @@ mod tests {
         let text = devnet_text.replacen(from, to, 1);
         assert_ne!(text, devnet_text, "fixture no longer carries {from:?}");
         std::fs::write(dir.path().join("config.yaml"), text).unwrap();
+    }
+
+    #[test]
+    fn a_config_with_only_slot_duration_ms_is_read_from_it() {
+        // Generated configs (kurtosis) carry SLOT_DURATION_MS and no
+        // SECONDS_PER_SLOT; the serde default would otherwise give 12 s.
+        let dir = complete_dir();
+        replace_config_line(&dir, "SECONDS_PER_SLOT: 6\n", "");
+        let loaded = NetworkDir::load(dir.path()).unwrap();
+        assert_eq!(loaded.config.seconds_per_slot, 6);
+        assert_eq!(loaded.config.slot_duration_ms, 6_000);
+    }
+
+    #[test]
+    fn a_slot_duration_ms_that_is_not_whole_seconds_is_rejected_naming_the_field() {
+        for bad in ["6500", "0"] {
+            let dir = complete_dir();
+            replace_config_line(&dir, "SECONDS_PER_SLOT: 6\n", "");
+            replace_slot_duration_ms(&dir, &format!("SLOT_DURATION_MS: {bad}"));
+            let err = NetworkDir::load(dir.path()).unwrap_err().to_string();
+            assert!(err.contains("SLOT_DURATION_MS"), "got {err}");
+        }
+    }
+
+    #[test]
+    fn a_config_with_neither_slot_key_keeps_the_mainnet_default() {
+        let dir = complete_dir();
+        replace_config_line(&dir, "SECONDS_PER_SLOT: 6\n", "");
+        replace_slot_duration_ms(&dir, "");
+        let loaded = NetworkDir::load(dir.path()).unwrap();
+        assert_eq!(loaded.config.seconds_per_slot, 12);
+        assert_eq!(loaded.config.slot_duration_ms, 12_000);
+    }
+
+    /// Replace the `SLOT_DURATION_MS` line of the `config.yaml` already
+    /// written to `dir` (`replace_config_line` reads the pristine fixture).
+    fn replace_slot_duration_ms(dir: &tempfile::TempDir, to: &str) {
+        let path = dir.path().join("config.yaml");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let replaced = text.replacen("SLOT_DURATION_MS: 6000", to, 1);
+        assert_ne!(replaced, text, "config no longer carries SLOT_DURATION_MS");
+        std::fs::write(path, replaced).unwrap();
     }
 
     /// A directory built for the other preset must fail naming the preset,
