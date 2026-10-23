@@ -134,6 +134,11 @@ pub const DOMAIN_APPLICATION_MASK: DomainType = [0x00, 0x00, 0x00, 0x01];
 /// `BuilderBid`), builder-specs `bellatrix/builder.md`. Always computed
 /// against the chain's genesis fork version and a zero validators root, so
 /// one signature stays valid across every fork of its chain.
+///
+/// Not [`DOMAIN_BEACON_BUILDER`], gloas's in-protocol builder domain: that one
+/// goes through `get_domain`, which mixes in the current fork and the chain's
+/// validators root, so signing a builder API message with it produces a
+/// signature no relay accepts.
 pub const DOMAIN_APPLICATION_BUILDER: DomainType = [0x00, 0x00, 0x00, 0x01];
 /// Domain for a `SyncCommitteeMessage` (altair).
 pub const DOMAIN_SYNC_COMMITTEE: DomainType = [0x07, 0x00, 0x00, 0x00];
@@ -147,6 +152,8 @@ pub const DOMAIN_CONTRIBUTION_AND_PROOF: DomainType = [0x09, 0x00, 0x00, 0x00];
 /// [`ETH1_ADDRESS_WITHDRAWAL_PREFIX`].
 pub const DOMAIN_BLS_TO_EXECUTION_CHANGE: DomainType = [0x0a, 0x00, 0x00, 0x00];
 /// Domain for a `SignedExecutionPayloadBid` (gloas).
+///
+/// Not the builder API's [`DOMAIN_APPLICATION_BUILDER`].
 pub const DOMAIN_BEACON_BUILDER: DomainType = [0x0b, 0x00, 0x00, 0x00];
 /// Domain for a `PayloadAttestationMessage` (gloas).
 pub const DOMAIN_PTC_ATTESTER: DomainType = [0x0c, 0x00, 0x00, 0x00];
