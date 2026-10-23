@@ -226,6 +226,18 @@ fn ms_until_next_beacon_slot(now_ms: u64, genesis_time_ms: u64, slot_duration_ms
     ms_until_next_boundary(now_ms, genesis_time_ms, slot_duration_ms)
 }
 
+/// Slots whose block was due to be built at an interval-4 tick that never ran.
+///
+/// `last_interval` is the last interval the store processed and `tick_interval`
+/// the one this tick is about to process. Every interval 4 strictly between them
+/// was skipped, and with it the build of the following slot's block.
+fn skipped_build_slots(last_interval: u64, tick_interval: u64) -> impl Iterator<Item = u64> {
+    let end_of_slot = INTERVALS_PER_SLOT - 1;
+    (last_interval.saturating_add(1)..tick_interval)
+        .filter(move |interval| interval % INTERVALS_PER_SLOT == end_of_slot)
+        .map(|interval| interval / INTERVALS_PER_SLOT + 1)
+}
+
 impl BlockChain {
     /// Spawn the blockchain actor for the lean chain.
     ///
@@ -942,6 +954,25 @@ impl BlockChainServer {
         if self.store.chain() == Chain::Lean && num_validators == 0 {
             error!("Head state has no validators, skipping tick");
             return;
+        }
+
+        // A tick that runs late, because the actor was blocked past the boundary,
+        // jumps over the intervals in between. If one of them was an interval 4
+        // and we propose the slot after it, that block was never built and no
+        // build failure was recorded, so count it here. Lean-only: on beacon
+        // `tick_time` and `store_time` are Unix seconds, not intervals.
+        if self.store.chain() == Chain::Lean && store_time > 0 && self.sync_status.duties_allowed()
+        {
+            for proposal_slot in skipped_build_slots(store_time, tick_time) {
+                if let Some(validator_id) = self.get_our_proposer(proposal_slot, num_validators) {
+                    warn!(
+                        %proposal_slot,
+                        %validator_id,
+                        "Missed block proposal, the interval-4 build tick was skipped"
+                    );
+                    metrics::inc_block_proposals_missed();
+                }
+            }
         }
 
         // Update current slot metric
@@ -4100,6 +4131,37 @@ mod tests {
     use ethlambda_types::beacon::preset;
     use ethlambda_types::checkpoint::Checkpoint;
     use ethlambda_types::state::State;
+
+    #[test]
+    fn skipped_build_slots_is_empty_for_consecutive_ticks() {
+        let ips = INTERVALS_PER_SLOT;
+        assert_eq!(skipped_build_slots(ips + 3, ips + 4).count(), 0);
+        assert_eq!(skipped_build_slots(ips + 4, 2 * ips).count(), 0);
+    }
+
+    #[test]
+    fn skipped_build_slots_reports_the_slot_after_a_skipped_interval_4() {
+        let ips = INTERVALS_PER_SLOT;
+        // Last processed interval 3 of slot 512, next tick lands on interval 1
+        // of slot 513: interval 4 of slot 512 was skipped, so slot 513's block.
+        let last = 512 * ips + 3;
+        let tick = 513 * ips + 1;
+        assert_eq!(
+            skipped_build_slots(last, tick).collect::<Vec<_>>(),
+            vec![513]
+        );
+    }
+
+    #[test]
+    fn skipped_build_slots_reports_every_skipped_slot_in_a_long_gap() {
+        let ips = INTERVALS_PER_SLOT;
+        let last = 10 * ips + 2;
+        let tick = 13 * ips + 4;
+        assert_eq!(
+            skipped_build_slots(last, tick).collect::<Vec<_>>(),
+            vec![11, 12, 13]
+        );
+    }
 
     const GENESIS_TIME: u64 = 1_000;
 

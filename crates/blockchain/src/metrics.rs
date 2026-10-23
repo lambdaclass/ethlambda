@@ -582,6 +582,15 @@ static LEAN_BLOCK_BUILDING_FAILURES_TOTAL: std::sync::LazyLock<IntCounter> =
         register_int_counter!("lean_block_building_failures_total", "Failed block builds").unwrap()
     });
 
+static LEAN_BLOCK_PROPOSALS_MISSED_TOTAL: std::sync::LazyLock<IntCounter> =
+    std::sync::LazyLock::new(|| {
+        register_int_counter!(
+            "lean_block_proposals_missed_total",
+            "Own proposal slots whose interval-4 build tick was skipped"
+        )
+        .unwrap()
+    });
+
 // --- Block Proposal (build_block phases, then the seal in seal_block) ---
 
 static LEAN_BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASE_SECONDS: std::sync::LazyLock<HistogramVec> =
@@ -1031,6 +1040,7 @@ pub fn init() {
     std::sync::LazyLock::force(&LEAN_BLOCK_BUILDING_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_BLOCK_BUILDING_SUCCESS_TOTAL);
     std::sync::LazyLock::force(&LEAN_BLOCK_BUILDING_FAILURES_TOTAL);
+    std::sync::LazyLock::force(&LEAN_BLOCK_PROPOSALS_MISSED_TOTAL);
     // Block proposal attestation selection
     std::sync::LazyLock::force(&LEAN_BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASE_SECONDS);
     std::sync::LazyLock::force(&LEAN_BLOCK_PROPOSAL_ATTESTATION_BUILDS_TOTAL);
@@ -1355,6 +1365,11 @@ pub fn inc_block_building_success() {
 /// Increment the failed block builds counter.
 pub fn inc_block_building_failures() {
     LEAN_BLOCK_BUILDING_FAILURES_TOTAL.inc();
+}
+
+/// Increment the missed block proposals counter.
+pub fn inc_block_proposals_missed() {
+    LEAN_BLOCK_PROPOSALS_MISSED_TOTAL.inc();
 }
 
 /// Observe the duration of a block-proposal phase. `phase` must be one of
