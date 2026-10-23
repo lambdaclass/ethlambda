@@ -51,7 +51,7 @@ network_params:
   gloas_fork_epoch: 0
   heze_fork_epoch: 1
   slot_duration_ms_heze: 9000
-  preregistered_validator_count: 256
+  preregistered_validator_count: 320
 ethereum_genesis_generator_params:
   image: ethpandaops/ethereum-genesis-generator:6.2.7
 dora_params:
