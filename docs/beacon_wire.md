@@ -25,7 +25,7 @@ ethlambda beacon \
 
 No flag is required, but that is only true for a built-in network:
 `ethlambda beacon` on its own follows mainnet, since `--network` defaults to
-`mainnet`. Sepolia and Hoodi are built in too, and any other network is a
+`mainnet`. Sepolia, Hoodi and Platåberget are built in too, and any other network is a
 `--network` naming a directory of published files (`config.yaml` and
 `genesis.ssz`, see [`cli.md`](./cli.md)):
 
@@ -36,8 +36,8 @@ ethlambda beacon --network ./my-network --node-key ./node-key
 
 `genesis_time` and `genesis_validators_root`, and therefore the fork digest,
 are derived from the resolved network: a built-in network (`mainnet`,
-`sepolia`, `hoodi`) carries the two values as constants beside its
-`eth-clients` `config.yaml` and bootnode list, and no genesis state; for a
+`sepolia`, `hoodi`, `plataberget`) carries the two values as constants beside
+its published `config.yaml` and bootnode list, and no genesis state; for a
 loaded network they are read off that directory's own `genesis.ssz`. Nothing
 about startup touches the network to get there. discv5 is forced on and needs no flag either: published mainnet
 bootnodes are largely seed-only, so a crawl is how a peer is reached.
