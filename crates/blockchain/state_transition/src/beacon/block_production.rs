@@ -1463,4 +1463,90 @@ mod tests {
         assert_eq!(blinded.hash_tree_root(), full.hash_tree_root());
         assert_eq!(blinded, BlindedBeaconBlock::from(full));
     }
+
+    /// The specification condition a refused blinded block failed.
+    fn refusal(state: &BeaconState, inputs: BlindedBlockInputs) -> &'static str {
+        match assemble_blinded_block(
+            state,
+            inputs,
+            &Config::mainnet(),
+            BlockProcessingOptions::default(),
+        ) {
+            Err(Error::SpecAssert(what)) => what,
+            other => panic!("expected a SpecAssert refusal, got {other:?}"),
+        }
+    }
+
+    fn blinded_inputs_for(state: &BeaconState) -> BlindedBlockInputs {
+        blinded(&full_inputs(state))
+    }
+
+    #[test]
+    fn a_header_with_the_wrong_withdrawals_root_is_refused() {
+        let state = state_to_build_on();
+        let mut inputs = blinded_inputs_for(&state);
+        inputs.execution_payload_header.withdrawals_root = Root::repeat_byte(0xee);
+        assert_eq!(
+            refusal(&state, inputs),
+            "header.withdrawals_root == hash_tree_root(get_expected_withdrawals(state))"
+        );
+    }
+
+    #[test]
+    fn a_header_on_the_wrong_parent_is_refused() {
+        let state = state_to_build_on();
+        let mut inputs = blinded_inputs_for(&state);
+        inputs.execution_payload_header.parent_hash = ExecutionBlockHash::repeat_byte(0xee);
+        assert_eq!(
+            refusal(&state, inputs),
+            "payload.parent_hash == state.latest_execution_payload_header.block_hash"
+        );
+    }
+
+    #[test]
+    fn a_header_with_the_wrong_prev_randao_is_refused() {
+        let state = state_to_build_on();
+        let mut inputs = blinded_inputs_for(&state);
+        inputs.execution_payload_header.prev_randao = Bytes32::repeat_byte(0xee);
+        assert_eq!(
+            refusal(&state, inputs),
+            "payload.prev_randao == get_randao_mix(state, get_current_epoch(state))"
+        );
+    }
+
+    #[test]
+    fn a_header_with_the_wrong_timestamp_is_refused() {
+        let state = state_to_build_on();
+        let mut inputs = blinded_inputs_for(&state);
+        inputs.execution_payload_header.timestamp += 1;
+        assert_eq!(
+            refusal(&state, inputs),
+            "payload.timestamp == compute_time_at_slot(state, state.slot)"
+        );
+    }
+
+    #[test]
+    fn a_bid_over_the_blob_limit_is_refused() {
+        let state = state_to_build_on();
+        let limit = Config::mainnet().max_blobs_per_block(get_current_epoch(&state));
+        let mut inputs = blinded_inputs_for(&state);
+        inputs.blob_kzg_commitments = vec![KzgCommitment::default(); limit as usize + 1];
+        assert_eq!(
+            refusal(&state, inputs),
+            "len(body.blob_kzg_commitments) <= get_blob_parameters(get_current_epoch(state)).max_blobs_per_block"
+        );
+    }
+
+    #[test]
+    fn a_state_before_fulu_is_refused() {
+        // Only the fork gate runs: it comes before anything reads the inputs,
+        // so building them from a fulu state does not matter, and no electra
+        // state transition is exercised.
+        let inputs = blinded_inputs_for(&state_to_build_on());
+        let electra = with_signing_validators_at(ForkName::Electra, 64);
+        assert_eq!(
+            refusal(&electra, inputs),
+            "blinded block production is fulu only"
+        );
+    }
 }
