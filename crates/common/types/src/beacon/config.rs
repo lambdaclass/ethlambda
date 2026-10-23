@@ -1095,14 +1095,15 @@ impl Config {
 
     /// Heze (EIP-8198) `compute_time_at_slot_ms`: the Unix time in
     /// milliseconds at the start of `slot`, summing each schedule segment's
-    /// slots at that segment's duration.
+    /// slots at that segment's duration. Saturates instead of wrapping.
     pub fn time_at_slot_ms(&self, genesis_time_ms: u64, slot: u64) -> u64 {
         let mut end_slot = slot;
         let mut time_ms = genesis_time_ms;
         for (fork_epoch, slot_duration_ms) in self.slot_durations().into_iter().rev() {
             let fork_slot = fork_epoch.saturating_mul(preset::SLOTS_PER_EPOCH);
             if fork_slot < end_slot {
-                time_ms += (end_slot - fork_slot) * slot_duration_ms;
+                time_ms =
+                    time_ms.saturating_add((end_slot - fork_slot).saturating_mul(slot_duration_ms));
                 end_slot = fork_slot;
             }
         }
@@ -1127,14 +1128,14 @@ impl Config {
             })
             .rfind(|(_, fork_time_ms, _)| time_ms >= *fork_time_ms)
             .unwrap_or((0, genesis_time_ms, self.slot_duration_ms));
-        start_slot + time_ms.saturating_sub(start_time_ms) / slot_duration_ms
+        start_slot.saturating_add(time_ms.saturating_sub(start_time_ms) / slot_duration_ms)
     }
 
     /// `compute_time_at_slot`: [`Self::time_at_slot_ms`] in whole seconds, for
     /// execution payload timestamps. Exact whenever every slot duration is a
     /// multiple of 1000, which [`Self::check_slot_durations`] enforces.
     pub fn time_at_slot(&self, genesis_time: u64, slot: u64) -> u64 {
-        self.time_at_slot_ms(genesis_time * 1_000, slot) / 1_000
+        self.time_at_slot_ms(genesis_time.saturating_mul(1_000), slot) / 1_000
     }
 
     /// Heze (EIP-8198) `compute_blob_data_retention_start_epoch`: the first
@@ -1152,22 +1153,17 @@ impl Config {
         self.slot_at_time_ms(0, window_start_ms) / preset::SLOTS_PER_EPOCH
     }
 
-    /// Heze (EIP-8198): `Err` naming the field when a slot duration is not a
-    /// positive whole number of seconds. The execution layer timestamps blocks
-    /// in seconds, so a sub-second duration at heze would make
-    /// [`Self::time_at_slot`] inexact. Only the beacon chain is checked:
-    /// lean's `slot_duration_ms` may be sub-second.
+    /// Heze (EIP-8198): `Err` when `SLOT_DURATION_MS_HEZE` is not a positive
+    /// multiple of 1000, the rule the specification states for it. The
+    /// execution layer timestamps blocks in whole seconds, so a sub-second
+    /// duration would make [`Self::time_at_slot`] inexact. `SLOT_DURATION_MS`
+    /// keeps whatever validation its own parsing applies.
     pub fn check_slot_durations(&self) -> Result<(), String> {
-        let entries = [
-            ("SLOT_DURATION_MS", self.slot_duration_ms),
-            ("SLOT_DURATION_MS_HEZE", self.slot_duration_ms_heze),
-        ];
-        for (name, duration_ms) in entries {
-            if duration_ms == 0 || duration_ms % 1_000 != 0 {
-                return Err(format!(
-                    "{name} is {duration_ms}, but must be a positive multiple of 1000"
-                ));
-            }
+        let duration_ms = self.slot_duration_ms_heze;
+        if duration_ms == 0 || !duration_ms.is_multiple_of(1_000) {
+            return Err(format!(
+                "SLOT_DURATION_MS_HEZE is {duration_ms}, but must be a positive multiple of 1000"
+            ));
         }
         Ok(())
     }
