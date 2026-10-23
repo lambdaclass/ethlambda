@@ -68,8 +68,9 @@ impl BuiltInNetwork {
         parsed.warn_about_ignored_keys();
 
         let genesis = chain.genesis();
+        let slot_duration_only = parsed.slot_duration_only;
         let mut config = parsed.config;
-        super::derive_genesis_fields(&mut config, genesis.genesis_time);
+        super::derive_genesis_fields(&mut config, genesis.genesis_time, slot_duration_only);
 
         Ok(BuiltIn {
             config,

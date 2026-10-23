@@ -27,6 +27,12 @@ pub(crate) struct ConfigFile {
     pub(crate) config: Config,
     /// Keys no field claimed: a typo, or a fork this build cannot process.
     pub(crate) ignored: Vec<String>,
+    /// The file carries `SLOT_DURATION_MS` and not `SECONDS_PER_SLOT`.
+    ///
+    /// `Config` has a container-level serde `default`, so a missing key and a
+    /// key holding the default value parse identically; only the raw key set
+    /// can tell them apart.
+    pub(crate) slot_duration_only: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -41,13 +47,20 @@ impl ConfigFile {
         let config: Config = serde_yaml_ng::from_str(text)?;
         let document: BTreeMap<String, IgnoredAny> = serde_yaml_ng::from_str(text)?;
 
+        let slot_duration_only =
+            document.contains_key("SLOT_DURATION_MS") && !document.contains_key("SECONDS_PER_SLOT");
+
         let claimed = config_field_names();
         let ignored = document
             .into_keys()
             .filter(|key| !claimed.contains(&key.as_str()))
             .collect();
 
-        Ok(Self { config, ignored })
+        Ok(Self {
+            config,
+            ignored,
+            slot_duration_only,
+        })
     }
 
     /// Log what was ignored, as one line naming each key.

@@ -221,15 +221,25 @@ pub(crate) fn check_constants(config: &Config) -> Result<(), ConstantsMismatch> 
 /// before its actual genesis, so reading it from the file would put every slot
 /// boundary off by that much.
 ///
-/// `slot_duration_ms` is always derived, never read from the file. A beacon
-/// chain's slots are a whole number of seconds, so `SECONDS_PER_SLOT` is
-/// authoritative and the millisecond field exists for lean's sub-second
-/// cadence. A config carrying `SECONDS_PER_SLOT: 6` and no `SLOT_DURATION_MS`
-/// would otherwise keep mainnet's 12000 by default, and every duty would fire
-/// at the wrong time while the second-resolution field looked correct.
-fn derive_genesis_fields(config: &mut Config, genesis_time: u64) {
+/// The two slot-time fields are reconciled, not read as a pair. A beacon
+/// chain's slots are a whole number of seconds, so when the file has
+/// `SECONDS_PER_SLOT` it is authoritative and `slot_duration_ms` is derived
+/// from it; otherwise a config carrying `SECONDS_PER_SLOT: 6` and a stale
+/// `SLOT_DURATION_MS` would run duties at the wrong time while the
+/// second-resolution field looked correct. Generated configs (kurtosis'
+/// ethereum-genesis-generator) are the exception: consensus-specs dropped
+/// `SECONDS_PER_SLOT`, so they carry only `SLOT_DURATION_MS`, and `Config`'s
+/// serde default would silently fill in mainnet's 12 seconds. With
+/// `slot_duration_only` set, `SLOT_DURATION_MS` is authoritative and
+/// `seconds_per_slot` is derived from it. The caller must have checked it is
+/// a non-zero multiple of 1000.
+fn derive_genesis_fields(config: &mut Config, genesis_time: u64, slot_duration_only: bool) {
     config.genesis_time = genesis_time;
-    config.slot_duration_ms = config.seconds_per_slot * 1_000;
+    if slot_duration_only {
+        config.seconds_per_slot = config.slot_duration_ms / 1_000;
+    } else {
+        config.slot_duration_ms = config.seconds_per_slot * 1_000;
+    }
 }
 
 /// A resolved network: everything startup needs before it can build a swarm.
