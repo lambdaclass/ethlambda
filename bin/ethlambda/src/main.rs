@@ -1595,6 +1595,9 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         // not change which block is valid.
         seconds_per_slot: _,
         slot_duration_ms: _,
+        // Compared below with `slot_duration_ms`: from the heze epoch on it
+        // moves every slot boundary (EIP-8198).
+        slot_duration_ms_heze: _,
         seconds_per_eth1_block: _,
         // Compared below: bounds how many validators may enter the
         // exit/activation queue and when a proposer/exiting validator is
@@ -1675,6 +1678,9 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         message_domain_valid_snappy: _,
         min_epochs_for_blob_sidecars_requests: _,
         min_epochs_for_data_column_sidecars_requests: _,
+        // The heze-era form of the retention window above: how long this node
+        // serves blob data, not which block is valid.
+        min_blob_data_retention_ms: _,
         subnets_per_node: _,
 
         // Deposit contract: compared below. Never read by the state
@@ -1734,6 +1740,7 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         heze_fork_epoch,
         seconds_per_slot,
         slot_duration_ms,
+        slot_duration_ms_heze,
         min_validator_withdrawability_delay,
         min_builder_withdrawability_delay,
         shard_committee_period,
@@ -2933,6 +2940,27 @@ validators:
             difference.contains("churn_limit_quotient"),
             "the error should name the field that changed: {difference}"
         );
+    }
+
+    /// EIP-8198: the Heze slot duration moves every slot boundary past the
+    /// fork, so a resume with a different one is refused; the blob retention
+    /// window only changes what this node serves, so it is not.
+    #[test]
+    fn a_changed_heze_slot_duration_is_caught_but_a_changed_blob_retention_is_not() {
+        let persisted = Config::mainnet();
+
+        let mut supplied = Config::mainnet();
+        supplied.slot_duration_ms_heze += 1_000;
+        let difference = first_config_difference(&persisted, &supplied)
+            .expect("a changed SLOT_DURATION_MS_HEZE must be caught");
+        assert!(
+            difference.starts_with("slot_duration_ms_heze:"),
+            "got {difference}"
+        );
+
+        let mut supplied = Config::mainnet();
+        supplied.min_blob_data_retention_ms += 1;
+        assert_eq!(first_config_difference(&persisted, &supplied), None);
     }
 
     /// A changed `PRESET_BASE` is refused, and the error shows both names as
