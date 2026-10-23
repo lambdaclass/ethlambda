@@ -27,7 +27,7 @@ Needs Docker and the kurtosis CLI (CI uses 1.20.0). From the repository root:
 
 ```bash
 git clone https://github.com/lambdaclass/ethereum-package.git /tmp/ethereum-package
-git -C /tmp/ethereum-package checkout bbae5eb7e7b5b938c625b3b2bb2167e997b2d0de
+git -C /tmp/ethereum-package checkout 67cb0e02dc0bd49ec9461cbf2ef7ac4a3232755f
 
 kurtosis run /tmp/ethereum-package --enclave ethlambda-assertoor \
   --args-file tooling/kurtosis-assertoor/network_params.yaml

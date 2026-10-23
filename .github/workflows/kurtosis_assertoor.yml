@@ -32,7 +32,7 @@ env:
   # The fork of ethpandaops/ethereum-package that adds `cl_type: ethlambda` and
   # `vc_type: ethlambda`, pinned to a commit. Bump it deliberately.
   ETHEREUM_PACKAGE_REPO: https://github.com/lambdaclass/ethereum-package.git
-  ETHEREUM_PACKAGE_REF: bbae5eb7e7b5b938c625b3b2bb2167e997b2d0de
+  ETHEREUM_PACKAGE_REF: 67cb0e02dc0bd49ec9461cbf2ef7ac4a3232755f
   ENCLAVE: ethlambda-assertoor
 
 jobs:
