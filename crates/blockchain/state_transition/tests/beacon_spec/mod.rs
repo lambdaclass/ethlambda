@@ -90,7 +90,7 @@ pub fn fork_active_from_genesis(case: &Case) -> Config {
         .into_iter()
         .take_while(|fork| *fork <= case.fork)
         .filter(|fork| *fork != ForkName::Phase0)
-        .fold(Config::active(), |config, fork| {
+        .fold(fixture_active_config(), |config, fork| {
             config.with_fork_epoch(fork, 0)
         })
 }
@@ -121,11 +121,37 @@ pub fn fork_active_from_genesis(case: &Case) -> Config {
 /// own default already keeps the two fields in agreement, so the correction
 /// is a no-op on that branch.
 pub fn case_config(case: &Case) -> Config {
+    let config_path = case.path.join("config.yaml");
     let mut config: Config = case
         .yaml_opt("config")
         .unwrap_or_else(|| fork_active_from_genesis(case));
     config.seconds_per_slot = config.slot_duration_ms / 1000;
+    // A case's own file that does not name `SLOT_DURATION_MS_HEZE` predates
+    // EIP-8198 (see [`fixture_slot_durations`]).
+    let names_heze_duration =
+        fs::read_to_string(&config_path).is_ok_and(|text| text.contains("SLOT_DURATION_MS_HEZE"));
+    if !names_heze_duration {
+        config = fixture_slot_durations(config);
+    }
     config
+}
+
+/// `config` with the Heze slot duration equal to the genesis one.
+///
+/// The pinned fixtures (v1.7.0-beta.4) predate EIP-8198: their configs carry
+/// no `SLOT_DURATION_MS_HEZE` and they were generated with the slot duration
+/// unchanged at Heze, whereas this crate's default for the key is the
+/// post-EIP-8198 `Config::mainnet`/`minimal` one. Without this every Heze case
+/// would run on a different slot duration than its vectors assume. Remove
+/// once fixtures from a release that includes EIP-8198 are pinned.
+pub fn fixture_slot_durations(mut config: Config) -> Config {
+    config.slot_duration_ms_heze = config.slot_duration_ms;
+    config
+}
+
+/// [`Config::active`] under [`fixture_slot_durations`].
+pub fn fixture_active_config() -> Config {
+    fixture_slot_durations(Config::active())
 }
 
 /// The newest fork whose state transition this crate implements.

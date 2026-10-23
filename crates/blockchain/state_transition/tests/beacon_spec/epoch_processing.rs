@@ -319,7 +319,7 @@ fn apply(
 }
 
 pub fn trials() -> Vec<Trial> {
-    let config = Arc::new(Config::active());
+    let config = Arc::new(super::fixture_active_config());
     let cases = collect_all_handlers(PRESET, "epoch_processing");
     let mut trials = vec![super::discovery_trial("epoch_processing", cases.len())];
 

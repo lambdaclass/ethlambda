@@ -85,6 +85,7 @@ use crate::beacon::constants;
 use crate::beacon::containers::shared::AttestationData;
 use crate::beacon::containers::{BeaconState, gloas};
 use crate::beacon::error::{Error, Result};
+use crate::beacon::fork::ForkName;
 use crate::beacon::hash::hash;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
@@ -792,13 +793,34 @@ pub fn get_builder_payment_quorum_threshold(state: &BeaconState) -> Result<Gwei>
 /// budget split with exits), this is its own independent proportion of total
 /// active balance, floored at [`Config::min_per_epoch_churn_limit_electra`]
 /// and capped at [`Config::max_per_epoch_activation_churn_limit_gloas`].
+///
+/// [Modified in Heze:EIP8198]: the cap is applied before scaling by the
+/// current epoch's slot duration, so the maximum activation rate scales too,
+/// and the increment rounding is applied once, after scaling. Gloas keeps its
+/// own order (round, then cap), which is the same whenever the cap is a whole
+/// number of increments.
 pub fn get_activation_churn_limit(state: &BeaconState, config: &Config) -> Result<Gwei> {
     let total_active_balance = get_total_active_balance(state)?;
     let churn = config
         .min_per_epoch_churn_limit_electra
         .max(total_active_balance / config.churn_limit_quotient_gloas);
+    if state.fork_name() == ForkName::Heze {
+        let churn = config.max_per_epoch_activation_churn_limit_gloas.min(churn);
+        let churn = scale_churn_to_slot_duration(churn, state, config);
+        return Ok(churn - churn % preset::EFFECTIVE_BALANCE_INCREMENT);
+    }
     let churn = churn - churn % preset::EFFECTIVE_BALANCE_INCREMENT;
     Ok(config.max_per_epoch_activation_churn_limit_gloas.min(churn))
+}
+
+/// `churn * get_slot_duration_ms(get_current_epoch(state)) //
+/// get_slot_duration_ms(GENESIS_EPOCH)` (EIP-8198): an epoch of shorter slots
+/// is shorter in wall-clock time, so its churn budget shrinks to keep the
+/// per-second rate. The ratio is exactly one before Heze.
+fn scale_churn_to_slot_duration(churn: Gwei, state: &BeaconState, config: &Config) -> Gwei {
+    let current_duration = u128::from(config.slot_duration_ms_at_epoch(get_current_epoch(state)));
+    let genesis_duration = u128::from(config.slot_duration_ms_at_epoch(constants::GENESIS_EPOCH));
+    Gwei::try_from(u128::from(churn) * current_duration / genesis_duration).unwrap_or(Gwei::MAX)
 }
 
 /// The per-epoch churn limit for exits, in Gwei.
@@ -814,6 +836,8 @@ pub fn get_exit_churn_limit(state: &BeaconState, config: &Config) -> Result<Gwei
     let churn = config
         .min_per_epoch_churn_limit_electra
         .max(total_active_balance / config.churn_limit_quotient_gloas);
+    // [Modified in Heze:EIP8198]
+    let churn = scale_churn_to_slot_duration(churn, state, config);
     Ok(churn - churn % preset::EFFECTIVE_BALANCE_INCREMENT)
 }
 
@@ -830,6 +854,8 @@ pub fn get_exit_churn_limit(state: &BeaconState, config: &Config) -> Result<Gwei
 pub fn get_consolidation_churn_limit(state: &BeaconState, config: &Config) -> Result<Gwei> {
     let total_active_balance = get_total_active_balance(state)?;
     let churn = total_active_balance / config.consolidation_churn_limit_quotient;
+    // [Modified in Heze:EIP8198]
+    let churn = scale_churn_to_slot_duration(churn, state, config);
     Ok(churn - churn % preset::EFFECTIVE_BALANCE_INCREMENT)
 }
 

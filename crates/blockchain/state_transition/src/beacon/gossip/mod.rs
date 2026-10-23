@@ -527,11 +527,10 @@ pub(crate) fn execution_requests_within_limits(requests: &gloas::ExecutionReques
 }
 
 /// The specification's `compute_time_at_slot_ms`: the clock reading at the
-/// start of `slot`.
+/// start of `slot`. [Modified in Heze:EIP8198]: piecewise over the slot
+/// duration schedule.
 pub(crate) fn slot_start_ms(config: &Config, slot: Slot) -> u64 {
-    config
-        .genesis_time_ms()
-        .saturating_add(slot.saturating_mul(config.slot_duration_ms))
+    config.time_at_slot_ms(config.genesis_time_ms(), slot)
 }
 
 /// The specification's `is_future_slot`: `slot` starts later than `now_ms`
@@ -555,10 +554,10 @@ pub(crate) fn is_current_slot(config: &Config, slot: Slot, now_ms: u64) -> bool 
 /// The specification's `is_future_epoch`: the wall clock, with the gossip
 /// clock disparity allowance, has not yet reached `epoch`.
 pub(crate) fn is_future_epoch(config: &Config, epoch: Epoch, now_ms: u64) -> bool {
-    let since_genesis_ms = now_ms
-        .saturating_sub(config.genesis_time_ms())
-        .saturating_add(MAXIMUM_GOSSIP_CLOCK_DISPARITY);
-    let current_slot = since_genesis_ms / config.slot_duration_ms;
+    let current_slot = config.slot_at_time_ms(
+        config.genesis_time_ms(),
+        now_ms.saturating_add(MAXIMUM_GOSSIP_CLOCK_DISPARITY),
+    );
     compute_epoch_at_slot(current_slot) < epoch
 }
 

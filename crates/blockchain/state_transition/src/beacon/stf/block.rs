@@ -178,7 +178,12 @@ pub fn process_block_altair(
         committees,
         active_balances,
     )?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
+    super::altair::process_sync_aggregate(
+        state,
+        &block.body.sync_aggregate,
+        active_balances,
+        config,
+    )?;
     Ok(())
 }
 

@@ -205,15 +205,48 @@ pub fn compute_sync_committee_period(epoch: Epoch) -> u64 {
 /// [`get_flag_index_deltas`] weight a flag's reward by how many increments of
 /// stake actually earned it rather than assuming every attestation splits the
 /// same fixed fraction.
-pub fn get_base_reward_per_increment(state: &BeaconState) -> Result<Gwei> {
-    Ok(base_reward_per_increment(get_total_active_balance(state)?))
+///
+/// [Modified in Heze:EIP8198]: priced at the slot duration in effect at
+/// `epoch`, so a shorter slot earns proportionally less per epoch.
+pub fn get_base_reward_per_increment(
+    state: &BeaconState,
+    epoch: Epoch,
+    config: &Config,
+) -> Result<Gwei> {
+    Ok(base_reward_per_increment_at(
+        get_total_active_balance(state)?,
+        epoch,
+        config,
+    ))
 }
 
 /// [`get_base_reward_per_increment`] for a total active balance the caller
 /// already holds, such as one served by an `ActiveBalanceCache`.
+///
+/// Pre-Heze pricing, at the genesis slot duration. Heze-capable paths use
+/// [`base_reward_per_increment_at`].
 pub fn base_reward_per_increment(total_active_balance: Gwei) -> Gwei {
     preset::EFFECTIVE_BALANCE_INCREMENT * preset::BASE_REWARD_FACTOR
         / integer_squareroot(total_active_balance)
+}
+
+/// [`base_reward_per_increment`] priced at the slot duration in effect at
+/// `epoch` (EIP-8198), in the specification's order of operations:
+/// `EFFECTIVE_BALANCE_INCREMENT * BASE_REWARD_FACTOR * duration(epoch) //
+/// duration(GENESIS_EPOCH) // integer_squareroot(total_active_balance)`.
+/// Equal to [`base_reward_per_increment`] wherever the duration is the
+/// genesis one.
+pub fn base_reward_per_increment_at(
+    total_active_balance: Gwei,
+    epoch: Epoch,
+    config: &Config,
+) -> Gwei {
+    let numerator = u128::from(preset::EFFECTIVE_BALANCE_INCREMENT)
+        * u128::from(preset::BASE_REWARD_FACTOR)
+        * u128::from(config.slot_duration_ms_at_epoch(epoch))
+        / u128::from(config.slot_duration_ms_at_epoch(constants::GENESIS_EPOCH));
+    Gwei::try_from(numerator / u128::from(integer_squareroot(total_active_balance)))
+        .unwrap_or(Gwei::MAX)
 }
 
 /// The base reward for the validator at `index`.
@@ -226,10 +259,18 @@ pub fn base_reward_per_increment(total_active_balance: Gwei) -> Gwei {
 /// directly. See [`crate::beacon::stf::epoch::rewards::get_base_reward`] for phase0's
 /// version; the two coexist in different modules rather than one replacing
 /// the other, since fork dispatch happens at the call site, not here.
-pub fn get_base_reward(state: &BeaconState, index: ValidatorIndex) -> Result<Gwei> {
+///
+/// [Modified in Heze:EIP8198]: priced at the slot duration in effect at
+/// `epoch`.
+pub fn get_base_reward(
+    state: &BeaconState,
+    index: ValidatorIndex,
+    epoch: Epoch,
+    config: &Config,
+) -> Result<Gwei> {
     let effective_balance = state.validator(index)?.effective_balance;
     let increments = effective_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
-    Ok(increments * get_base_reward_per_increment(state)?)
+    Ok(increments * get_base_reward_per_increment(state, epoch, config)?)
 }
 
 /// The active, unslashed validators that had `flag_index` set for `epoch`.
@@ -345,15 +386,19 @@ pub fn get_attestation_participation_flag_indices(
 /// and lets [`get_inactivity_penalty_deltas`] claw an equivalent amount back),
 /// altair simply withholds the reward outright, so there is nothing to claw
 /// back and [`get_inactivity_penalty_deltas`] only ever penalizes.
+///
+/// [Modified in Heze:EIP8198]: participation pays for the previous epoch, so
+/// it is priced at the slot duration in effect at that epoch.
 pub fn get_flag_index_deltas(
     state: &BeaconState,
     flag_index: usize,
+    config: &Config,
 ) -> Result<(Vec<Gwei>, Vec<Gwei>)> {
     // Thin projection of the one-pass summary: the fixtures call this one flag
     // at a time, so each call pays its own scan, which the epoch driver does
     // not (it builds a single summary for all steps).
     let summary = EpochSummary::build(state, false)?;
-    let context = RewardContext::new(state, summary.totals())?;
+    let context = RewardContext::new(state, summary.totals(), config)?;
 
     let mut rewards = vec![0; summary.len()];
     let mut penalties = vec![0; summary.len()];
@@ -390,7 +435,7 @@ pub fn get_inactivity_penalty_deltas(
     config: &Config,
 ) -> Result<(Vec<Gwei>, Vec<Gwei>)> {
     let summary = EpochSummary::build(state, false)?;
-    let context = RewardContext::new(state, summary.totals())?;
+    let context = RewardContext::new(state, summary.totals(), config)?;
     let (_, _, inactivity_scores) = state.altair_validator_lists()?;
 
     let rewards = vec![0; summary.len()];
@@ -553,8 +598,12 @@ mod tests {
 
         let start = Instant::now();
         for _ in 0..ITERATIONS {
-            get_flag_index_deltas(&state, constants::TIMELY_SOURCE_FLAG_INDEX)
-                .expect("deltas compute over a well-formed state");
+            get_flag_index_deltas(
+                &state,
+                constants::TIMELY_SOURCE_FLAG_INDEX,
+                &Config::minimal(),
+            )
+            .expect("deltas compute over a well-formed state");
         }
         let elapsed = start.elapsed() / ITERATIONS;
         println!("get_flag_index_deltas, {VALIDATOR_COUNT} validators -> {elapsed:?}/call");

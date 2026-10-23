@@ -30,7 +30,6 @@
 //! far this file's own state projection needs to reach.
 
 use crate::beacon::config::Config;
-use crate::beacon::constants;
 use crate::beacon::containers::{BeaconState, bellatrix};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::helpers::accessors::{
@@ -94,7 +93,12 @@ pub fn process_block(
         committees,
         active_balances,
     )?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
+    super::altair::process_sync_aggregate(
+        state,
+        &block.body.sync_aggregate,
+        active_balances,
+        config,
+    )?;
     Ok(())
 }
 
@@ -221,7 +225,7 @@ pub fn is_execution_enabled(
 // ---------------------------------------------------------------------------
 
 /// The wall-clock Unix time a slot's block is due, from the chain's genesis
-/// time and [`Config::seconds_per_slot`].
+/// time and the config's slot duration schedule ([`Config::time_at_slot`]).
 ///
 /// Named `compute_timestamp_at_slot` here rather than the specification's own
 /// `compute_time_at_slot`; [`Config::seconds_per_slot`]'s own doc comment
@@ -237,12 +241,11 @@ pub fn is_execution_enabled(
 /// saturates rather than wraps: wrapping could land on a small value that
 /// looks like a plausible, if wrong, timestamp, where saturating cannot.
 pub fn compute_timestamp_at_slot(state: &BeaconState, slot: Slot, config: &Config) -> u64 {
-    // `GENESIS_SLOT` is `Slot`'s zero point, so subtracting it from any slot
-    // can never underflow.
-    let slots_since_genesis = slot - constants::GENESIS_SLOT;
-    slots_since_genesis
-        .saturating_mul(config.seconds_per_slot)
-        .saturating_add(state.genesis_time())
+    // [Modified in Heze:EIP8198] the slot duration is a schedule, so this goes
+    // through the config's piecewise `compute_time_at_slot_ms` rather than
+    // multiplying by one `SECONDS_PER_SLOT`. Before Heze the schedule has one
+    // segment and the result is `genesis_time + slot * SECONDS_PER_SLOT`.
+    config.time_at_slot(state.genesis_time(), slot)
 }
 
 // ---------------------------------------------------------------------------
@@ -453,6 +456,29 @@ mod tests {
             compute_timestamp_at_slot(&state, state.slot(), &config),
             expected
         );
+    }
+
+    /// EIP-8198: the payload timestamp steps by the slot duration in effect,
+    /// so the execution layer sees 9 s between blocks once the fork is past.
+    #[test]
+    fn compute_timestamp_at_slot_follows_the_slot_duration_schedule() {
+        let header = default_execution_payload_header().unwrap();
+        let state = bellatrix_state_with_validators(4, header);
+        let config = Config {
+            slot_duration_ms: 12_000,
+            slot_duration_ms_heze: 9_000,
+            heze_fork_epoch: 2,
+            ..Config::minimal()
+        };
+        let genesis = state.genesis_time();
+        let fork_slot = 2 * preset::SLOTS_PER_EPOCH;
+        let at = |slot| compute_timestamp_at_slot(&state, slot, &config);
+
+        assert_eq!(at(0), genesis);
+        assert_eq!(at(fork_slot), genesis + fork_slot * 12);
+        assert_eq!(at(fork_slot - 1) + 12, at(fork_slot));
+        assert_eq!(at(fork_slot) + 9, at(fork_slot + 1));
+        assert_eq!(at(fork_slot + 10), genesis + fork_slot * 12 + 10 * 9);
     }
 
     #[test]

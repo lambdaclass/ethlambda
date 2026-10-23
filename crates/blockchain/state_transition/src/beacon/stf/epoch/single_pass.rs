@@ -143,7 +143,7 @@ fn fused(state: &mut BeaconState, config: &Config) -> Result<()> {
         weigh_with_totals(state, summary.totals())?;
     }
     let total_active_balance = summary.totals().total_active_balance;
-    let rewards = RewardContext::new(state, summary.totals())?;
+    let rewards = RewardContext::new(state, summary.totals(), config)?;
 
     let finalized_epoch = state.finalized_checkpoint().epoch;
     let activation_epoch = compute_activation_exit_epoch(current_epoch);

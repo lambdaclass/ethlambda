@@ -88,6 +88,8 @@ pub mod inclusion_list;
 pub mod kzg;
 pub mod payload_attestation_pool;
 pub mod precheck;
+#[cfg(test)]
+mod quick_slots_timing_tests;
 pub mod stf;
 pub mod sync_committee_pool;
 pub mod upgrade;

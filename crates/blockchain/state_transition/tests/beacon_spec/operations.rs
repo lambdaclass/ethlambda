@@ -321,6 +321,7 @@ fn apply(
                     state,
                     &attestation,
                     meta.parent_slot,
+                    config,
                     &committees,
                     &active_balances,
                 )
@@ -444,7 +445,7 @@ fn apply(
         // further fork match.
         "sync_aggregate" => {
             let sync_aggregate: altair::SyncAggregate = case.ssz("sync_aggregate");
-            altair_stf::process_sync_aggregate(state, &sync_aggregate, &active_balances)
+            altair_stf::process_sync_aggregate(state, &sync_aggregate, &active_balances, config)
         }
         // The fixture's operation file is a whole `BeaconBlockBody`, not a
         // bare payload: checking one needs fields that live on the body

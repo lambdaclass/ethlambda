@@ -1237,15 +1237,18 @@ pub fn get_forkchoice_store(
     // actually gone through the FFG rules.
     let finalized_checkpoint = justified_checkpoint;
 
-    // `SECONDS_PER_SLOT * anchor_state.slot` is arithmetic over values that
-    // ultimately come from an externally supplied anchor, so this fails
-    // loudly on overflow rather than silently wrapping the store's clock.
-    let time = config
-        .seconds_per_slot
-        .checked_mul(anchor_state.slot())
-        .and_then(|slot_seconds| slot_seconds.checked_add(anchor_state.genesis_time()))
+    // The anchor's slot start is arithmetic over values that ultimately come
+    // from an externally supplied anchor, and `time_at_slot_ms` saturates, so
+    // this fails loudly on a saturated result rather than silently seeding the
+    // store's clock with a bogus value. [Modified in Heze:EIP8198]: the start
+    // is piecewise over the slot duration schedule.
+    let time_ms = anchor_state
+        .genesis_time()
+        .checked_mul(1000)
+        .map(|genesis_time_ms| config.time_at_slot_ms(genesis_time_ms, anchor_state.slot()))
+        .filter(|time_ms| *time_ms != constants::UINT64_MAX)
         .ok_or(Error::ArithmeticOverflow(
-            "anchor_state.genesis_time + SECONDS_PER_SLOT * anchor_state.slot",
+            "anchor_state.genesis_time + slot start offset",
         ))?;
 
     // The anchor is the store's first head and its justified and finalized
@@ -1263,12 +1266,7 @@ pub fn get_forkchoice_store(
         Store::beacon_checkpoint_as_stored(justified_checkpoint),
         anchor_state.slot(),
     );
-    // The store's row is milliseconds; `time` above is the specification's
-    // seconds, computed with its own overflow check just as the specification
-    // writes it.
-    store
-        .set_time_ms(seconds_to_milliseconds(time))
-        .expect("set time");
+    store.set_time_ms(time_ms).expect("set time");
 
     store.set_beacon_unrealized_checkpoints(Some(justified_checkpoint), Some(finalized_checkpoint));
 
@@ -1324,7 +1322,26 @@ pub fn get_forkchoice_store(
 /// genesis, so the saturation that guarded against it belongs with the field
 /// it guards.
 pub fn get_slots_since_genesis(store: &Store, _config: &Config) -> u64 {
-    store.current_slot()
+    // [Modified in Heze:EIP8198] piecewise over the slot duration schedule,
+    // measured on the store's own config like `Store::current_slot`.
+    let store_config = store.config();
+    store_config.slot_at_time_ms(
+        store_config.genesis_time_ms(),
+        store.time_ms().expect("store time exists"),
+    )
+}
+
+/// How far into its slot `store.time` is, in milliseconds.
+///
+/// [Modified in Heze:EIP8198]: the slot's own duration is not the genesis one
+/// after the fork, so this measures from the current slot's start rather than
+/// taking a remainder by one fixed duration.
+pub fn time_into_slot_ms(store: &Store) -> u64 {
+    let store_config = store.config();
+    let genesis_time_ms = store_config.genesis_time_ms();
+    let time_ms = store.time_ms().expect("store time exists");
+    let slot = store_config.slot_at_time_ms(genesis_time_ms, time_ms);
+    time_ms.saturating_sub(store_config.time_at_slot_ms(genesis_time_ms, slot))
 }
 
 /// The slot `store.time` currently falls in.
@@ -2758,8 +2775,13 @@ pub fn seconds_to_milliseconds(seconds: u64) -> u64 {
 
 /// The duration, in milliseconds, that `basis_points` out of
 /// [`constants::BASIS_POINTS`] of a slot spans.
-pub fn get_slot_component_duration_ms(basis_points: u64, config: &Config) -> u64 {
-    basis_points.saturating_mul(config.slot_duration_ms) / constants::BASIS_POINTS
+///
+/// [Modified in Heze:EIP8198]: `epoch` is the epoch of the slot the component
+/// is about, since the slot duration changes at Heze. The specification's
+/// Heze function reads `SLOT_DURATION_MS_HEZE` directly because it only ever
+/// runs there; this crate's functions serve both sides of the boundary.
+pub fn get_slot_component_duration_ms(basis_points: u64, epoch: Epoch, config: &Config) -> u64 {
+    basis_points.saturating_mul(config.slot_duration_ms_at_epoch(epoch)) / constants::BASIS_POINTS
 }
 
 /// How far into a slot, in milliseconds, an attestation is due.
@@ -2777,13 +2799,13 @@ pub fn get_attestation_due_ms(epoch: Epoch, config: &Config) -> u64 {
         ForkRules::PreGloas => config.attestation_due_bps,
         ForkRules::Gloas => config.attestation_due_bps_gloas,
     };
-    get_slot_component_duration_ms(basis_points, config)
+    get_slot_component_duration_ms(basis_points, epoch, config)
 }
 
 /// How far into a slot, in milliseconds, a proposer must stop attempting a
 /// late-block reorg. Gloas does not modify this deadline.
-pub fn get_proposer_reorg_cutoff_ms(config: &Config) -> u64 {
-    get_slot_component_duration_ms(config.proposer_reorg_cutoff_bps, config)
+pub fn get_proposer_reorg_cutoff_ms(epoch: Epoch, config: &Config) -> u64 {
+    get_slot_component_duration_ms(config.proposer_reorg_cutoff_bps, epoch, config)
 }
 
 // ---------------------------------------------------------------------------
@@ -2850,8 +2872,9 @@ pub fn is_finalization_ok(store: &Store, slot: Slot, config: &Config) -> bool {
 /// Whether `store.time` is early enough in the current slot that a proposer
 /// building now still counts as on time.
 pub fn is_proposing_on_time(store: &Store, config: &Config) -> bool {
-    let time_into_slot_ms = store.ms_since_genesis() % config.slot_duration_ms;
-    time_into_slot_ms <= get_proposer_reorg_cutoff_ms(config)
+    let time_into_slot_ms = time_into_slot_ms(store);
+    let epoch = get_current_store_epoch(store, config);
+    time_into_slot_ms <= get_proposer_reorg_cutoff_ms(epoch, config)
 }
 
 /// Whether `head_root` has few enough votes to be overpowered by the
@@ -4122,15 +4145,15 @@ pub fn gloas_get_head(
 
 /// `get_payload_attestation_due_ms` (gloas `fork-choice.md`): how far into a
 /// slot, in milliseconds, the payload timeliness committee's votes are due.
-pub fn get_payload_attestation_due_ms(config: &Config) -> u64 {
-    get_slot_component_duration_ms(config.payload_attestation_due_bps, config)
+pub fn get_payload_attestation_due_ms(epoch: Epoch, config: &Config) -> u64 {
+    get_slot_component_duration_ms(config.payload_attestation_due_bps, epoch, config)
 }
 
 /// `get_payload_due_ms` (gloas `fork-choice.md`): how far into a slot, in
 /// milliseconds, an execution payload envelope must have been seen for the
 /// payload timeliness committee to vote `payload_present`.
-pub fn get_payload_due_ms(config: &Config) -> u64 {
-    get_slot_component_duration_ms(config.payload_due_bps, config)
+pub fn get_payload_due_ms(epoch: Epoch, config: &Config) -> u64 {
+    get_slot_component_duration_ms(config.payload_due_bps, epoch, config)
 }
 
 // ---------------------------------------------------------------------------
@@ -4525,7 +4548,7 @@ fn block_timeliness(
     rules: ForkRules,
     config: &Config,
 ) -> [bool; 2] {
-    let time_into_slot_ms = store.ms_since_genesis() % config.slot_duration_ms;
+    let time_into_slot_ms = time_into_slot_ms(store);
     let is_current_slot = get_current_slot(store, config) == block_slot;
     let epoch = get_current_store_epoch(store, config);
     let attestation_threshold_ms = get_attestation_due_ms(epoch, config);
@@ -4535,7 +4558,7 @@ fn block_timeliness(
             [is_timely, is_timely]
         }
         ForkRules::Gloas => {
-            let ptc_threshold_ms = get_payload_attestation_due_ms(config);
+            let ptc_threshold_ms = get_payload_attestation_due_ms(epoch, config);
             [
                 is_current_slot && time_into_slot_ms < attestation_threshold_ms,
                 is_current_slot && time_into_slot_ms < ptc_threshold_ms,
@@ -4912,11 +4935,10 @@ pub fn on_tick_ms(store: &mut Store, time_ms: u64, config: &Config) {
         return;
     }
     let genesis_time_ms = config.genesis_time_ms();
-    let tick_slot = time_ms.saturating_sub(genesis_time_ms) / config.slot_duration_ms;
+    let tick_slot = config.slot_at_time_ms(genesis_time_ms, time_ms);
     while get_current_slot(store, config) < tick_slot {
         let next_slot = get_current_slot(store, config).saturating_add(1);
-        let boundary_ms =
-            genesis_time_ms.saturating_add(next_slot.saturating_mul(config.slot_duration_ms));
+        let boundary_ms = config.time_at_slot_ms(genesis_time_ms, next_slot);
         on_tick_per_slot_ms(store, boundary_ms, config);
     }
     on_tick_per_slot_ms(store, time_ms, config);

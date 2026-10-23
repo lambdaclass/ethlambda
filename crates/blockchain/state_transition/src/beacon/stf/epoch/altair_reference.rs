@@ -126,7 +126,7 @@ pub fn process_rewards_and_penalties(state: &mut BeaconState, config: &Config) -
 
     let mut deltas = Vec::with_capacity(constants::PARTICIPATION_FLAG_WEIGHTS.len() + 1);
     for flag_index in 0..constants::PARTICIPATION_FLAG_WEIGHTS.len() {
-        deltas.push(get_flag_index_deltas(state, flag_index)?);
+        deltas.push(get_flag_index_deltas(state, flag_index, config)?);
     }
     deltas.push(get_inactivity_penalty_deltas(state, config)?);
 
