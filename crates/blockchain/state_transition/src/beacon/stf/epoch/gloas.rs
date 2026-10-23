@@ -549,6 +549,9 @@ mod tests {
         // Same deposit at gloas: still creates a validator.
         let mut gloas = gloas_state_with_validators(2);
         queue(&mut gloas, vec![deposit]);
+        // `upgrade_to_heze` (EIP-8015) needs the eth1 bridge retired.
+        let inner = gloas_inner_mut(&mut gloas);
+        inner.deposit_requests_start_index = inner.eth1_deposit_index;
         let mut upgraded = crate::beacon::upgrade::upgrade_to_heze(&gloas, &config).unwrap();
         process_pending_deposits(&mut gloas, &config).unwrap();
         assert_eq!(gloas.validator_count(), 3);
