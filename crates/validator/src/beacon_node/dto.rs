@@ -556,6 +556,22 @@ pub fn config_from_spec_response(value: &serde_json::Value) -> Result<Config> {
         // and the millisecond field is what the clock actually uses.
         config.seconds_per_slot = slot_duration_ms / 1_000;
     }
+    // Heze (EIP-8198) changes the slot duration. A node that predates it does
+    // not send the key, and its chain keeps one duration across the fork, so
+    // absent means "the same as before" rather than this crate's compiled-in
+    // Heze default.
+    config.slot_duration_ms_heze = match spec_u64(value, "SLOT_DURATION_MS_HEZE")? {
+        Some(0) => {
+            return Err(Error::Decode(
+                "config/spec: the Heze slot duration is 0".to_string(),
+            ));
+        }
+        Some(duration_ms) => duration_ms,
+        None => config.slot_duration_ms,
+    };
+    if let Some(window_ms) = spec_u64(value, "MIN_BLOB_DATA_RETENTION_MS")? {
+        config.min_blob_data_retention_ms = window_ms;
+    }
 
     // The duty offsets. Absent means the node has not moved to the
     // basis-point form yet, in which case the mainnet defaults already in

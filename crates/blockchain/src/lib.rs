@@ -218,8 +218,22 @@ fn ms_until_next_interval(now_ms: u64, config: &ChainConfig) -> u64 {
 /// A beacon follower has no sub-slot duties (see [`ChainDuties::Beacon`]'s
 /// documentation), so it ticks once per slot rather than once per lean
 /// interval.
-fn ms_until_next_beacon_slot(now_ms: u64, genesis_time_ms: u64, slot_duration_ms: u64) -> u64 {
-    ms_until_next_boundary(now_ms, genesis_time_ms, slot_duration_ms)
+///
+/// The boundary is the next slot's start on the EIP-8198 schedule, not a
+/// multiple of one duration past genesis: the slot duration changes at Heze,
+/// so the cadence after the fork is a different length from the one before it.
+/// A clock exactly on a boundary waits the whole slot that begins there, as
+/// [`ms_until_next_boundary`] does; before genesis it waits for genesis.
+fn ms_until_next_beacon_slot(now_ms: u64, genesis_time_ms: u64, config: &Config) -> u64 {
+    if now_ms < genesis_time_ms {
+        return genesis_time_ms - now_ms;
+    }
+    let next_slot = config
+        .slot_at_time_ms(genesis_time_ms, now_ms)
+        .saturating_add(1);
+    config
+        .time_at_slot_ms(genesis_time_ms, next_slot)
+        .saturating_sub(now_ms)
 }
 
 impl BlockChain {
@@ -783,10 +797,10 @@ pub enum ImportOutcome {
 /// Whether a block at `block_slot` still falls inside the window this node may
 /// insist on data availability for.
 ///
-/// The boundary is the specification's own
+/// The boundary is [`data_column_retention_start_epoch`], the specification's
 /// `max(current_epoch - MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS,
-/// FULU_FORK_EPOCH)`: the epoch range peers "MUST support serving requests of
-/// data columns on". Below it a peer "MAY respond with error code
+/// FULU_FORK_EPOCH)` before Heze and its wall-clock EIP-8198 form from it: the
+/// epoch range peers "MUST support serving requests of data columns on". Below it a peer "MAY respond with error code
 /// `3: ResourceUnavailable` or not include the data column sidecar in the
 /// response", so a block there can be unavailable through no fault of anyone,
 /// and holding it would stall the chain against data the network is entitled to
@@ -800,10 +814,35 @@ pub enum ImportOutcome {
 fn da_check_required_for_slot(block_slot: u64, current_slot: u64, config: &Config) -> bool {
     let block_epoch = block_slot / preset::SLOTS_PER_EPOCH;
     let current_epoch = current_slot / preset::SLOTS_PER_EPOCH;
-    let boundary = current_epoch
-        .saturating_sub(constants::MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS)
-        .max(config.fulu_fork_epoch);
-    block_epoch >= boundary
+    block_epoch >= data_column_retention_start_epoch(config, current_epoch)
+}
+
+/// The first epoch of the data column serving window ending at
+/// `current_epoch`.
+///
+/// Heze (EIP-8198) replaces the epoch-count window with a wall-clock one:
+/// `max(compute_blob_data_retention_start_epoch(current_epoch),
+/// FULU_FORK_EPOCH)`, so the window keeps its length in time when the slot
+/// duration changes. Before Heze the specification's own
+/// `max(current_epoch - MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS,
+/// FULU_FORK_EPOCH)` applies. The fork is read off `current_epoch`, as the
+/// specification does.
+pub(crate) fn data_column_retention_start_epoch(config: &Config, current_epoch: u64) -> u64 {
+    let window_start = if current_epoch >= config.heze_fork_epoch {
+        config.blob_data_retention_start_epoch(current_epoch)
+    } else {
+        current_epoch.saturating_sub(constants::MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS)
+    };
+    window_start.max(config.fulu_fork_epoch)
+}
+
+/// Unix milliseconds at the start of beacon `slot` on the EIP-8198 schedule.
+///
+/// The slot is clamped so a peer-supplied far-future slot saturates instead of
+/// overflowing the schedule's multiplication; no real slot is near the clamp.
+fn beacon_slot_start_ms(config: &Config, slot: u64) -> u64 {
+    const MAX_SLOT: u64 = 1 << 40;
+    config.time_at_slot_ms(config.genesis_time_ms(), slot.min(MAX_SLOT))
 }
 
 fn data_availability_for(
@@ -941,7 +980,7 @@ impl BlockChainServer {
 
         // Calculate current slot and interval from milliseconds
         let time_since_genesis_ms = timestamp_ms.saturating_sub(time_config.genesis_time_ms());
-        let slot = time_since_genesis_ms / time_config.milliseconds_per_slot;
+        let slot = self.slot_at_ms(timestamp_ms);
         let interval = SlotInterval::from_ms_since_genesis(time_since_genesis_ms, &time_config);
 
         // Idempotency guard
@@ -2240,11 +2279,7 @@ impl BlockChainServer {
     /// The deadline number: an import that finishes past the interval its
     /// chain expects attestations at was late whatever its sections say.
     fn ms_into_slot(&self, slot: u64) -> i64 {
-        let time_config = self.store.config().time_grid();
-        let slot_start_ms = time_config
-            .genesis_time_ms()
-            .saturating_add(SlotInterval::BlockPublication.to_ms_since_genesis(slot, &time_config));
-        unix_now_ms() as i64 - slot_start_ms as i64
+        unix_now_ms() as i64 - self.slot_start_ms(slot) as i64
     }
 
     /// Milliseconds from now until `slot` starts on the wall clock, zero once
@@ -2255,11 +2290,42 @@ impl BlockChainServer {
     /// started" means the same thing to a held block as it does to the tick
     /// that will import it.
     fn ms_until_slot_start(&self, slot: u64) -> u64 {
-        let time_config = self.store.config().time_grid();
-        let slot_start_ms = time_config
-            .genesis_time_ms()
-            .saturating_add(SlotInterval::BlockPublication.to_ms_since_genesis(slot, &time_config));
-        slot_start_ms.saturating_sub(unix_now_ms())
+        self.slot_start_ms(slot).saturating_sub(unix_now_ms())
+    }
+
+    /// Unix milliseconds at which `slot` starts.
+    ///
+    /// Beacon walks the EIP-8198 schedule, since the slot duration changes at
+    /// Heze and `slot * duration` is wrong past it. Lean has one duration and
+    /// keeps its saturating grid arithmetic, which the arrival metrics rely on
+    /// for slots a peer made up. A beacon slot is clamped well below overflow
+    /// for the same reason.
+    fn slot_start_ms(&self, slot: u64) -> u64 {
+        let config = self.store.config();
+        match self.store.chain() {
+            Chain::Lean => {
+                let time_config = config.time_grid();
+                time_config.genesis_time_ms().saturating_add(
+                    SlotInterval::BlockPublication.to_ms_since_genesis(slot, &time_config),
+                )
+            }
+            Chain::Beacon => beacon_slot_start_ms(&config, slot),
+        }
+    }
+
+    /// The slot containing Unix time `time_ms`; slot 0 before genesis.
+    ///
+    /// The inverse of [`Self::slot_start_ms`], on the same per-chain grid.
+    fn slot_at_ms(&self, time_ms: u64) -> u64 {
+        let config = self.store.config();
+        match self.store.chain() {
+            Chain::Lean => {
+                let time_config = config.time_grid();
+                time_ms.saturating_sub(time_config.genesis_time_ms())
+                    / time_config.milliseconds_per_slot
+            }
+            Chain::Beacon => config.slot_at_time_ms(config.genesis_time_ms(), time_ms),
+        }
     }
 
     /// The slot the wall clock is in right now.
@@ -2270,13 +2336,11 @@ impl BlockChainServer {
     /// that tick was scheduled for. The block path has neither, so anything
     /// there that needs "now" reads it here.
     ///
-    /// One grid for both chains: `slot_duration_ms` is authoritative on
-    /// either, since `Config::lean` takes it from the network config file
-    /// rather than leaving it a placeholder beside a compile-time constant.
+    /// `slot_duration_ms` is authoritative on lean, since `Config::lean` takes
+    /// it from the network config file rather than leaving it a placeholder
+    /// beside a compile-time constant; beacon follows the EIP-8198 schedule.
     fn wall_clock_slot(&self) -> u64 {
-        let time_config = self.store.config().time_grid();
-        unix_now_ms().saturating_sub(time_config.genesis_time_ms())
-            / time_config.milliseconds_per_slot
+        self.slot_at_ms(unix_now_ms())
     }
 
     /// Re-run beacon fork choice and republish the head gauge.
@@ -3650,14 +3714,8 @@ impl BlockChainServer {
         }
         let config = self.store.config();
         let current_slot = fork_choice::get_current_slot(&self.store, &config);
-        let slot_end_ms = config
-            .genesis_time_ms()
-            .saturating_add(
-                current_slot
-                    .saturating_add(1)
-                    .saturating_mul(config.slot_duration_ms),
-            )
-            .saturating_sub(1);
+        let slot_end_ms =
+            beacon_slot_start_ms(&config, current_slot.saturating_add(1)).saturating_sub(1);
         let time_ms = event_ms.min(slot_end_ms);
         let store_time_ms = self.store.time_ms().expect("store time exists");
         if time_ms > store_time_ms {
@@ -3709,7 +3767,7 @@ impl BlockChainServer {
         match &self.duties {
             ChainDuties::Lean(_) => ms_until_next_interval(now_ms, &config.time_grid()),
             ChainDuties::Beacon => {
-                ms_until_next_beacon_slot(now_ms, config.genesis_time_ms(), config.slot_duration_ms)
+                ms_until_next_beacon_slot(now_ms, config.genesis_time_ms(), &config)
             }
         }
     }
@@ -4328,9 +4386,10 @@ mod tests {
         // must schedule a whole slot ahead, since the beacon tick loop has no
         // sub-slot grid to fall back on if this ever returned less.
         let genesis_time_ms = 1_000;
-        let slot_duration_ms = Config::mainnet().slot_duration_ms;
+        let config = Config::mainnet();
+        let slot_duration_ms = config.slot_duration_ms;
         assert_eq!(
-            ms_until_next_beacon_slot(genesis_time_ms, genesis_time_ms, slot_duration_ms),
+            ms_until_next_beacon_slot(genesis_time_ms, genesis_time_ms, &config),
             slot_duration_ms
         );
     }
@@ -4338,11 +4397,12 @@ mod tests {
     #[test]
     fn ms_until_next_beacon_slot_returns_the_remainder_mid_slot() {
         let genesis_time_ms = 1_000;
-        let slot_duration_ms = Config::mainnet().slot_duration_ms;
+        let config = Config::mainnet();
+        let slot_duration_ms = config.slot_duration_ms;
         let elapsed_into_slot = 5_000;
         let now_ms = genesis_time_ms + elapsed_into_slot;
         assert_eq!(
-            ms_until_next_beacon_slot(now_ms, genesis_time_ms, slot_duration_ms),
+            ms_until_next_beacon_slot(now_ms, genesis_time_ms, &config),
             slot_duration_ms - elapsed_into_slot
         );
     }
@@ -4350,11 +4410,128 @@ mod tests {
     #[test]
     fn ms_until_next_beacon_slot_waits_for_genesis_itself_when_called_early() {
         let genesis_time_ms = 1_000;
-        let slot_duration_ms = Config::mainnet().slot_duration_ms;
+        let config = Config::mainnet();
         let now_ms = 400;
         assert_eq!(
-            ms_until_next_beacon_slot(now_ms, genesis_time_ms, slot_duration_ms),
+            ms_until_next_beacon_slot(now_ms, genesis_time_ms, &config),
             genesis_time_ms - now_ms
+        );
+    }
+
+    /// 12 s slots for the first two epochs, then 9 s slots (EIP-8198).
+    fn quick_slots_config() -> Config {
+        Config {
+            slot_duration_ms: 12_000,
+            slot_duration_ms_heze: 9_000,
+            heze_fork_epoch: 2,
+            ..Config::mainnet()
+        }
+    }
+
+    #[test]
+    fn the_beacon_tick_follows_the_slot_duration_change_at_heze() {
+        let config = quick_slots_config();
+        let genesis_ms = 1_000_000;
+        // Slot 64 is the first Heze slot, 64 old slots (768 s) after genesis.
+        let fork_ms = genesis_ms + 64 * 12_000;
+
+        // Inside the last old slot the boundary is the fork itself.
+        assert_eq!(
+            ms_until_next_beacon_slot(fork_ms - 5_000, genesis_ms, &config),
+            5_000
+        );
+        // Exactly on the fork a whole slot is waited, and it is a Heze one.
+        assert_eq!(
+            ms_until_next_beacon_slot(fork_ms, genesis_ms, &config),
+            9_000
+        );
+        // Mid-way through the first and second Heze slots.
+        assert_eq!(
+            ms_until_next_beacon_slot(fork_ms + 4_000, genesis_ms, &config),
+            5_000
+        );
+        assert_eq!(
+            ms_until_next_beacon_slot(fork_ms + 9_000 + 8_000, genesis_ms, &config),
+            1_000
+        );
+        // A genesis-duration modulo would have answered 12 s - (fork_ms +
+        // 4_000 - genesis) % 12 s = 8 s for the first of those.
+        assert_ne!(
+            ms_until_next_beacon_slot(fork_ms + 4_000, genesis_ms, &config),
+            8_000
+        );
+        // Before genesis it still waits for genesis, whatever the schedule.
+        assert_eq!(
+            ms_until_next_beacon_slot(400_000, genesis_ms, &config),
+            600_000
+        );
+    }
+
+    #[test]
+    fn a_beacon_slot_starts_where_the_schedule_puts_it() {
+        let config = quick_slots_config();
+        let genesis_ms = config.genesis_time_ms();
+        assert_eq!(beacon_slot_start_ms(&config, 0), genesis_ms);
+        assert_eq!(beacon_slot_start_ms(&config, 63), genesis_ms + 63 * 12_000);
+        assert_eq!(beacon_slot_start_ms(&config, 64), genesis_ms + 64 * 12_000);
+        assert_eq!(
+            beacon_slot_start_ms(&config, 66),
+            genesis_ms + 64 * 12_000 + 2 * 9_000
+        );
+        // A made-up slot saturates below overflow instead of panicking.
+        let far = beacon_slot_start_ms(&config, u64::MAX);
+        assert!(far > beacon_slot_start_ms(&config, 1 << 30));
+    }
+
+    #[test]
+    fn the_column_window_is_the_epoch_count_before_heze_and_wall_clock_from_it() {
+        const HEZE: u64 = 100_000;
+        let config = Config {
+            fulu_fork_epoch: 100,
+            heze_fork_epoch: HEZE,
+            slot_duration_ms: 12_000,
+            slot_duration_ms_heze: 9_000,
+            // 4096 epochs of 12 s slots.
+            min_blob_data_retention_ms: 1_572_864_000,
+            ..Config::mainnet()
+        };
+        let window_start = |epoch| data_column_retention_start_epoch(&config, epoch);
+
+        // Before Heze: the old 4096 epoch window, floored at fulu.
+        assert_eq!(window_start(HEZE - 1), HEZE - 1 - 4096);
+        assert_eq!(window_start(200), 100);
+
+        // 1000 Heze epochs in, 288_000 s of window are 9 s slots and the other
+        // 1_284_864 s are 12 s slots: 3346 whole old epochs, so the window
+        // reaches back to HEZE - 3346.
+        assert_eq!(window_start(HEZE + 1_000), HEZE - 3_346);
+
+        // Wholly past the fork the window is 5461.33 epochs of 9 s slots,
+        // which starts the epoch containing the window's first instant:
+        // 10_000 - 5_462.
+        assert_eq!(window_start(HEZE + 10_000), HEZE + 4_538);
+
+        // The gate agrees: the boundary epoch is required, the one below not.
+        let current_slot = (HEZE + 1_000) * preset::SLOTS_PER_EPOCH;
+        assert!(da_check_required_for_slot(
+            (HEZE - 3_346) * preset::SLOTS_PER_EPOCH,
+            current_slot,
+            &config
+        ));
+        assert!(!da_check_required_for_slot(
+            (HEZE - 3_347) * preset::SLOTS_PER_EPOCH,
+            current_slot,
+            &config
+        ));
+
+        // An unscheduled Heze never changes the window.
+        let unscheduled = Config {
+            heze_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            ..config
+        };
+        assert_eq!(
+            data_column_retention_start_epoch(&unscheduled, HEZE + 10_000),
+            HEZE + 10_000 - 4096
         );
     }
 

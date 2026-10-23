@@ -339,6 +339,25 @@ mod tests {
         }
     }
 
+    /// EIP-8198: a validator client reading the spec must see both the genesis
+    /// and the Heze slot duration, and the wall-clock blob retention window,
+    /// or it would run its whole clock on one duration.
+    #[test]
+    fn the_spec_reports_the_heze_slot_duration_and_blob_retention_window() {
+        let config = Config {
+            slot_duration_ms: 12_000,
+            slot_duration_ms_heze: 9_000,
+            heze_fork_epoch: 2,
+            min_blob_data_retention_ms: 1_572_864_000,
+            ..Config::mainnet()
+        };
+        let data = spec(&config);
+        assert_eq!(data["SLOT_DURATION_MS"], "12000");
+        assert_eq!(data["SLOT_DURATION_MS_HEZE"], "9000");
+        assert_eq!(data["MIN_BLOB_DATA_RETENTION_MS"], "1572864000");
+        assert_eq!(data["HEZE_FORK_EPOCH"], "2");
+    }
+
     #[tokio::test]
     async fn the_spec_carries_the_preset_and_constants() {
         let json = get_spec_json().await;

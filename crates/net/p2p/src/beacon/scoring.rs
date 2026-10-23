@@ -190,7 +190,16 @@ pub struct ScoreSettings {
 
 impl ScoreSettings {
     pub fn new(config: &Config, mesh_n: usize) -> Self {
-        let slot = Duration::from_millis(config.slot_duration_ms);
+        Self::at_slot(config, 0, mesh_n)
+    }
+
+    /// The settings for the slot duration in effect at `slot`.
+    ///
+    /// The duration changes at Heze (EIP-8198) and every expected rate here is
+    /// per slot, so [`refresh`] rebuilds the settings once the wall-clock slot
+    /// crosses it.
+    pub fn at_slot(config: &Config, slot: u64, mesh_n: usize) -> Self {
+        let slot = Duration::from_millis(config.slot_duration_ms_at_slot(slot));
         let attestation_subnet_weight = 1.0 / ATTESTATION_SUBNET_COUNT as f64;
         let max_positive_score = (MAX_IN_MESH_SCORE + MAX_FIRST_MESSAGE_DELIVERIES_SCORE)
             * (BEACON_BLOCK_WEIGHT
@@ -539,6 +548,10 @@ pub(crate) fn refresh(server: &mut P2PServer) {
     };
     let wall_slot = beacon_wall_slot(wire);
     let head_slot = server.store.beacon_head().map_or(0, |(slot, _)| slot);
+    let slot_duration = Duration::from_millis(wire.config.slot_duration_ms_at_slot(wall_slot));
+    if scoring.settings.slot != slot_duration {
+        scoring.settings = ScoreSettings::at_slot(&wire.config, wall_slot, crate::MESH_N);
+    }
     let mesh_deliveries_scored = scoring.gate.update(wall_slot, head_slot);
     if mesh_deliveries_scored != scoring.mesh_deliveries_scored {
         info!(
@@ -603,6 +616,27 @@ mod tests {
 
     fn settings(mesh_n: usize) -> ScoreSettings {
         ScoreSettings::new(&Config::mainnet(), mesh_n)
+    }
+
+    #[test]
+    fn the_settings_follow_the_slot_duration_at_the_wall_slot() {
+        // 12 s slots for two epochs, then 9 s ones (EIP-8198).
+        let config = Config {
+            slot_duration_ms: 12_000,
+            slot_duration_ms_heze: 9_000,
+            heze_fork_epoch: 2,
+            ..Config::mainnet()
+        };
+        let last_old = 2 * SLOTS_PER_EPOCH - 1;
+        let first_new = 2 * SLOTS_PER_EPOCH;
+
+        let old = ScoreSettings::at_slot(&config, last_old, 8);
+        let new = ScoreSettings::at_slot(&config, first_new, 8);
+        assert_eq!(old.slot, Duration::from_secs(12));
+        assert_eq!(new.slot, Duration::from_secs(9));
+        assert_eq!(new.epoch, Duration::from_secs(9) * SLOTS_PER_EPOCH as u32);
+        // `new` is the genesis duration, which is the pre-fork one.
+        assert_eq!(ScoreSettings::new(&config, 8).slot, old.slot);
     }
 
     fn inputs(active_validators: u64, mesh_deliveries_scored: bool) -> ScoreInputs {

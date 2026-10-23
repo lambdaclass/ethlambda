@@ -153,7 +153,7 @@ impl BlockChainServer {
         if self.store.chain() != Chain::Beacon || !is_last_slot_of_epoch(slot) {
             return;
         }
-        let slot_duration_ms = self.store.config().time_grid().milliseconds_per_slot;
+        let slot_duration_ms = self.store.config().slot_duration_ms_at_slot(slot);
         let into_slot = Duration::from_millis(self.ms_into_slot(slot).max(0) as u64);
         let delay = three_quarter_slot(slot_duration_ms).saturating_sub(into_slot);
         send_after(delay, ctx.clone(), EpochPrecomputeCheck { slot });
