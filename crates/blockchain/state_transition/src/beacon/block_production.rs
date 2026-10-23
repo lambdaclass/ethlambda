@@ -744,9 +744,11 @@ mod tests {
     use crate::beacon::helpers::misc::compute_signing_root;
     use crate::beacon::helpers::test_state::{sign_for, with_signing_validators_at};
     use crate::beacon::stf::block::{BlockProcessingOptions, RandaoVerification};
+    use ethlambda_types::beacon::containers::bellatrix::Transaction;
     use ethlambda_types::beacon::containers::shared::{
         AttestationData, BeaconBlockHeader, Checkpoint, SignedBeaconBlockHeader, VoluntaryExit,
     };
+    use ethlambda_types::beacon::primitives::{BlsPubkey, ExecutionAddress};
 
     /// A fulu state one epoch in, its lookahead and sync committee filled from
     /// its real registry (the builder leaves both as placeholders), advanced one
@@ -1395,11 +1397,6 @@ mod tests {
         );
     }
 
-    use ethlambda_types::beacon::builder::BlindedBeaconBlock;
-    use ethlambda_types::beacon::containers::bellatrix::Transaction;
-    use ethlambda_types::beacon::containers::deneb::ExecutionPayloadHeader;
-    use ethlambda_types::beacon::primitives::ExecutionAddress;
-
     /// [`payload_for`], with every field the stand-in payload does not copy
     /// from the header set to something else, so a missed patch changes the
     /// state root instead of passing unnoticed.
@@ -1413,8 +1410,31 @@ mod tests {
             gas_used: 21_000,
             block_hash: ExecutionBlockHash::repeat_byte(0x33),
             transactions: vec![transaction].try_into().unwrap(),
+            receipts_root: Bytes32::repeat_byte(0x44),
+            logs_bloom: vec![0x55; preset::BYTES_PER_LOGS_BLOOM].try_into().unwrap(),
+            extra_data: vec![0x66, 0x77].try_into().unwrap(),
+            base_fee_per_gas: 7.into(),
+            // Any distinct non-zero value; no gas-per-blob constant exists here.
+            blob_gas_used: 131_072,
+            excess_blob_gas: 262_144,
             ..payload_for(state)
         }
+    }
+
+    /// [`state_to_build_on`] with one validator due a partial withdrawal: ETH1
+    /// credentials and a balance above what it may keep.
+    fn state_with_a_withdrawal_due() -> BeaconState {
+        let mut state = state_to_build_on();
+        let validator = state.validator_mut(3).unwrap();
+        validator.withdrawal_credentials = {
+            let mut credentials = Bytes32::repeat_byte(0x12);
+            credentials.0[0] = constants::ETH1_ADDRESS_WITHDRAWAL_PREFIX;
+            credentials
+        };
+        validator.effective_balance = preset::MIN_ACTIVATION_BALANCE;
+        *state.balance_mut(3).unwrap() = preset::MIN_ACTIVATION_BALANCE + 1_000_000_000;
+        state.apply_pending_mutations();
+        state
     }
 
     fn full_inputs(state: &BeaconState) -> BlockInputs {
@@ -1426,7 +1446,18 @@ mod tests {
             operations: Operations::default(),
             execution_payload: distinctive_payload_for(state),
             blob_kzg_commitments: vec![KzgCommitment::default()],
-            execution_requests: ExecutionRequests::default(),
+            execution_requests: ExecutionRequests {
+                deposits: vec![DepositRequest {
+                    pubkey: BlsPubkey([0x88; 48]),
+                    withdrawal_credentials: Bytes32::repeat_byte(0x99),
+                    amount: preset::MIN_ACTIVATION_BALANCE,
+                    signature: BlsSignature::default(),
+                    index: 0,
+                }]
+                .try_into()
+                .unwrap(),
+                ..ExecutionRequests::default()
+            },
         }
     }
 
@@ -1451,7 +1482,14 @@ mod tests {
     /// other.
     #[test]
     fn blinded_and_full_blocks_reach_the_same_state_root() {
-        let state = state_to_build_on();
+        let state = state_with_a_withdrawal_due();
+        assert!(
+            !stf::electra::get_expected_withdrawals(&state)
+                .unwrap()
+                .0
+                .is_empty(),
+            "the guard needs a withdrawal due"
+        );
         let inputs = full_inputs(&state);
         let blinded_inputs = blinded(&inputs);
         let config = Config::mainnet();
