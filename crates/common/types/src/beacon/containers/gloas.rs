@@ -180,23 +180,36 @@ pub type CellsBitList = ProgressiveBitlist;
 /// A registered builder's record in the builder registry (EIP-7732), the
 /// builder-side counterpart of [`super::shared::Validator`].
 #[derive(
-    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct Builder {
     pub pubkey: BlsPubkey,
     /// Which shape this record is in. Only [`crate::beacon::constants::PAYLOAD_BUILDER_VERSION`]
     /// exists today; the field exists so a future format change has
     /// somewhere to record it.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub version: u8,
     pub execution_address: ExecutionAddress,
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub balance: Gwei,
     /// The epoch this builder's deposit was placed, which
     /// `is_active_builder` compares against the finalized checkpoint before
     /// treating the builder as eligible.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub deposit_epoch: Epoch,
     /// `FAR_FUTURE_EPOCH` until this builder initiates an exit, the same
     /// sentinel convention [`super::shared::Validator::withdrawable_epoch`]
     /// uses.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub withdrawable_epoch: Epoch,
 }
 
@@ -1115,7 +1128,16 @@ pub struct PartialDataColumnGroupID {
 /// A proposer's broadcast, ahead of its slot, of the fee recipient and gas
 /// limit it wants a builder's bid to target (EIP-7732 p2p-interface.md).
 #[derive(
-    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct ProposerPreferences {
     /// The root of the beacon state the proposer duty this message announces
@@ -1132,7 +1154,16 @@ pub struct ProposerPreferences {
 }
 
 #[derive(
-    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct SignedProposerPreferences {
     pub message: ProposerPreferences,
