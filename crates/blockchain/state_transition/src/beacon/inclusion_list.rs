@@ -114,8 +114,8 @@ pub fn is_valid_inclusion_list_signature(
 
 /// `get_inclusion_list_due_ms` (heze `fork-choice.md`): how far into its
 /// slot an inclusion list must arrive to count as timely.
-pub fn get_inclusion_list_due_ms(config: &Config) -> u64 {
-    get_slot_component_duration_ms(config.inclusion_list_due_bps, config)
+pub fn get_inclusion_list_due_ms(epoch: Epoch, config: &Config) -> u64 {
+    get_slot_component_duration_ms(config.inclusion_list_due_bps, epoch, config)
 }
 
 /// Whether a list for `slot` received at `now_ms` is timely: it arrived in
@@ -123,10 +123,12 @@ pub fn get_inclusion_list_due_ms(config: &Config) -> u64 {
 /// own rule, over the receipt time rather than the store's clock so a
 /// gossip handler can judge a list the moment it arrives.
 pub fn is_inclusion_list_timely(config: &Config, slot: Slot, now_ms: u64) -> bool {
-    let since_genesis_ms = now_ms.saturating_sub(config.genesis_time_ms());
-    let current_slot = since_genesis_ms / config.slot_duration_ms;
-    let time_into_slot_ms = since_genesis_ms % config.slot_duration_ms;
-    slot == current_slot && time_into_slot_ms < get_inclusion_list_due_ms(config)
+    let genesis_time_ms = config.genesis_time_ms();
+    let current_slot = config.slot_at_time_ms(genesis_time_ms, now_ms);
+    let time_into_slot_ms =
+        now_ms.saturating_sub(config.time_at_slot_ms(genesis_time_ms, current_slot));
+    slot == current_slot
+        && time_into_slot_ms < get_inclusion_list_due_ms(compute_epoch_at_slot(slot), config)
 }
 
 /// The summed byte length of a list's transactions, which the gossip rules

@@ -1012,8 +1012,10 @@ behavior.
   in-memory map stays as a write-through cache in front of the table. Pruned
   on finalization to the same horizon as `LiveChain` (the finalized block's
   own slot, keeping that block's own entry).
-- `DB_VERSION` is 7: heze's own state and block containers (EIP-8015) mean a heze
-  row written by version 6 no longer decodes. (6 was the unrealized-justifications table: a directory
+- `DB_VERSION` is 8: EIP-8198 appended `SLOT_DURATION_MS_HEZE` and
+  `MIN_BLOB_DATA_RETENTION_MS` to `Config`, so version 7's stored config decodes
+  into the wrong fields. (7 was heze's own state and block containers
+  (EIP-8015): a heze row written by version 6 no longer decodes; 6 was the unrealized-justifications table: a directory
   written by an earlier version has no row there for any block it already
   imported, which would otherwise look identical to "no unrealized
   justification computed yet" rather than "this directory predates the

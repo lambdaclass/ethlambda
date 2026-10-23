@@ -27,6 +27,7 @@
 //! derived quantities that happen to match.
 
 use crate::beacon::bls;
+use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::{BeaconState, altair, phase0};
 use crate::beacon::error::{Error, Result, verify};
@@ -36,7 +37,8 @@ use crate::beacon::helpers::accessors::{
     get_previous_epoch,
 };
 use crate::beacon::helpers::altair::{
-    add_flag, base_reward_per_increment, get_attestation_participation_flag_indices, has_flag,
+    add_flag, base_reward_per_increment, base_reward_per_increment_at,
+    get_attestation_participation_flag_indices, has_flag,
 };
 use crate::beacon::helpers::attestation::{get_indexed_attestation, is_valid_indexed_attestation};
 use crate::beacon::helpers::misc::{compute_epoch_at_slot, compute_signing_root};
@@ -295,8 +297,10 @@ pub fn process_attestation(
 /// `process_effective_balance_updates` (`crate::beacon::stf::epoch`) uses for the
 /// identical reason.
 ///
-/// Takes no [`crate::beacon::config::Config`]: [`constants::DOMAIN_SYNC_COMMITTEE`]
-/// and the weight constants are fixed, and [`preset::SYNC_COMMITTEE_SIZE`],
+/// Takes a [`Config`] only for the slot duration schedule: the rewards are
+/// priced at the current epoch's slot duration (EIP-8198, a no-op before
+/// Heze). [`constants::DOMAIN_SYNC_COMMITTEE`] and the weight constants are
+/// fixed, and [`preset::SYNC_COMMITTEE_SIZE`],
 /// [`preset::EFFECTIVE_BALANCE_INCREMENT`], and [`preset::SLOTS_PER_EPOCH`]
 /// are preset values; the specification lists none of them under a network's
 /// "Configuration" table.
@@ -304,6 +308,7 @@ pub fn process_sync_aggregate(
     state: &mut BeaconState,
     sync_aggregate: &altair::SyncAggregate,
     active_balances: &ActiveBalanceCache,
+    config: &Config,
 ) -> Result<()> {
     let committee_bits = &sync_aggregate.sync_committee_bits;
 
@@ -375,11 +380,13 @@ pub fn process_sync_aggregate(
 
     let total_active_balance = active_balances.total_active_balance(state)?;
     let total_active_increments = total_active_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
-    let total_base_rewards = base_reward_per_increment(total_active_balance)
-        .checked_mul(total_active_increments)
-        .ok_or(Error::ArithmeticOverflow(
-            "get_base_reward_per_increment(state) * total_active_increments",
-        ))?;
+    // [Modified in Heze:EIP8198] priced at the current epoch's slot duration.
+    let total_base_rewards =
+        base_reward_per_increment_at(total_active_balance, get_current_epoch(state), config)
+            .checked_mul(total_active_increments)
+            .ok_or(Error::ArithmeticOverflow(
+                "get_base_reward_per_increment(state) * total_active_increments",
+            ))?;
     let max_participant_rewards = total_base_rewards
         .checked_mul(constants::SYNC_REWARD_WEIGHT)
         .ok_or(Error::ArithmeticOverflow(
@@ -711,8 +718,13 @@ mod tests {
             .map(|index| state.balance(index).unwrap())
             .collect();
 
-        process_sync_aggregate(&mut state, &sync_aggregate, &ActiveBalanceCache::default())
-            .unwrap();
+        process_sync_aggregate(
+            &mut state,
+            &sync_aggregate,
+            &ActiveBalanceCache::default(),
+            &Config::minimal(),
+        )
+        .unwrap();
 
         // Independently derived expected rewards, sharing only the
         // already-tested building blocks (`get_total_active_balance`,
@@ -721,7 +733,9 @@ mod tests {
         let total_active_increments =
             get_total_active_balance(&state).unwrap() / preset::EFFECTIVE_BALANCE_INCREMENT;
         let total_base_rewards =
-            get_base_reward_per_increment(&state).unwrap() * total_active_increments;
+            get_base_reward_per_increment(&state, get_current_epoch(&state), &Config::minimal())
+                .unwrap()
+                * total_active_increments;
         let max_participant_rewards = total_base_rewards * constants::SYNC_REWARD_WEIGHT
             / constants::WEIGHT_DENOMINATOR
             / preset::SLOTS_PER_EPOCH;
@@ -777,8 +791,13 @@ mod tests {
             sync_committee_signature: BlsSignature::default(),
         };
         assert!(
-            process_sync_aggregate(&mut state.clone(), &wrong, &ActiveBalanceCache::default())
-                .is_err(),
+            process_sync_aggregate(
+                &mut state.clone(),
+                &wrong,
+                &ActiveBalanceCache::default(),
+                &Config::minimal()
+            )
+            .is_err(),
             "the all-zero signature is not the point at infinity, so this must be rejected"
         );
 
@@ -787,7 +806,13 @@ mod tests {
             sync_committee_signature: g2_point_at_infinity(),
         };
         let balance_before = state.balance(0).unwrap();
-        process_sync_aggregate(&mut state, &correct, &ActiveBalanceCache::default()).unwrap();
+        process_sync_aggregate(
+            &mut state,
+            &correct,
+            &ActiveBalanceCache::default(),
+            &Config::minimal(),
+        )
+        .unwrap();
 
         // The sole validator holds every seat and none of them participated,
         // so it is penalized once per seat and the proposer (itself, the only
@@ -795,7 +820,9 @@ mod tests {
         let total_active_increments =
             get_total_active_balance(&state).unwrap() / preset::EFFECTIVE_BALANCE_INCREMENT;
         let total_base_rewards =
-            get_base_reward_per_increment(&state).unwrap() * total_active_increments;
+            get_base_reward_per_increment(&state, get_current_epoch(&state), &Config::minimal())
+                .unwrap()
+                * total_active_increments;
         let max_participant_rewards = total_base_rewards * constants::SYNC_REWARD_WEIGHT
             / constants::WEIGHT_DENOMINATOR
             / preset::SLOTS_PER_EPOCH;

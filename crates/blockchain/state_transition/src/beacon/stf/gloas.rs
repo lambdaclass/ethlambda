@@ -59,7 +59,7 @@ use crate::beacon::helpers::accessors::{
     get_beacon_proposer_index, get_block_root_at_slot, get_current_epoch, get_domain,
     get_previous_epoch, get_randao_mix,
 };
-use crate::beacon::helpers::altair::{add_flag, base_reward_per_increment, has_flag};
+use crate::beacon::helpers::altair::{add_flag, base_reward_per_increment_at, has_flag};
 use crate::beacon::helpers::electra::{g2_point_at_infinity, get_committee_indices};
 use crate::beacon::helpers::gloas::{
     add_builder_to_registry, can_builder_cover_bid, convert_builder_index_to_validator_index,
@@ -246,7 +246,7 @@ where
         committees,
         active_balances,
     )?;
-    super::altair::process_sync_aggregate(state, block.sync_aggregate, active_balances)?;
+    super::altair::process_sync_aggregate(state, block.sync_aggregate, active_balances, config)?;
     Ok(())
 }
 
@@ -1399,6 +1399,7 @@ pub fn process_attestation(
     state: &mut BeaconState,
     attestation: &gloas::Attestation,
     parent_slot: Slot,
+    config: &Config,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
@@ -1511,8 +1512,15 @@ pub fn process_attestation(
     // execution-request paths touch balances, exit epochs and queues only), so
     // the total is fixed for the epoch. The debug cross-check on every cache
     // hit enforces that.
-    let base_reward_per_increment =
-        base_reward_per_increment(active_balances.total_active_balance(state)?);
+    //
+    // [Modified in Heze:EIP8198] priced at the slot duration in effect at the
+    // attestation's target epoch, so the proposer's share matches the
+    // attesters' own rewards for that epoch around a slot duration change.
+    let base_reward_per_increment = base_reward_per_increment_at(
+        active_balances.total_active_balance(state)?,
+        data.target.epoch,
+        config,
+    );
 
     // Read phase: for every attester, decide which flags this attestation
     // newly satisfies, add up the proposer's reward for granting them, and
@@ -1731,7 +1739,14 @@ pub fn process_operations<'a>(
     }
     // [Modified in Gloas:EIP7732]
     for attestation in body.attestations.iter() {
-        process_attestation(state, attestation, parent_slot, committees, active_balances)?;
+        process_attestation(
+            state,
+            attestation,
+            parent_slot,
+            config,
+            committees,
+            active_balances,
+        )?;
     }
     for voluntary_exit in body.voluntary_exits.iter() {
         crate::beacon::stf::electra::process_voluntary_exit(state, voluntary_exit, config)?;

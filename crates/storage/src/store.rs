@@ -198,7 +198,11 @@ const KEY_ANCHOR_SLOT: &[u8] = b"anchor_slot";
 /// 7 gave heze its own state and block containers (EIP-8015 removes the eth1
 /// and deposit-index fields): a heze state or block written by the previous
 /// version is gloas-shaped bytes under a heze fork tag, which no longer decode.
-pub const DB_VERSION: u64 = 7;
+///
+/// 8 appended `SLOT_DURATION_MS_HEZE` and `MIN_BLOB_DATA_RETENTION_MS` to
+/// `Config` (EIP-8198), so a directory written by version 7 decodes its stored
+/// config into the wrong fields.
+pub const DB_VERSION: u64 = 8;
 
 /// The consensus protocol a data directory holds.
 ///
@@ -1917,8 +1921,8 @@ impl Store {
     /// externally supplied anchor time can.
     ///
     /// Public because it is also what a caller placing a moment *within* the
-    /// current slot wants: `ms_since_genesis() % slot_duration_ms` is how far
-    /// into its slot the clock reads, which the beacon reorg and
+    /// current slot wants: `ms_since_genesis()` less the current slot's start
+    /// offset is how far into its slot the clock reads, which the beacon reorg and
     /// block-timeliness rules compare against their basis-point deadlines.
     pub fn ms_since_genesis(&self) -> u64 {
         self.time_ms()
@@ -1948,15 +1952,18 @@ impl Store {
 
     /// The slot the store clock falls in, on either chain.
     ///
-    /// Divides by [`Config::slot_duration_ms`] rather than
+    /// Goes through [`Config::slot_at_time_ms`], which walks the EIP-8198
+    /// schedule, so a beacon clock past Heze divides by the Heze slot
+    /// duration. It works in milliseconds rather than
     /// [`Config::seconds_per_slot`] so a cadence that is not a whole number of
     /// seconds still lands on the right slot: `Config::lean` derives
     /// `seconds_per_slot` by truncating the millisecond value, so for lean the
-    /// millisecond field is the authoritative one. The two agree wherever
-    /// `slot_duration_ms == seconds_per_slot * 1000`, which every beacon
-    /// configuration holds to.
+    /// millisecond field is the authoritative one. Lean has a single duration,
+    /// so its answer is the plain division it always was.
     pub fn current_slot(&self) -> u64 {
-        self.ms_since_genesis() / self.config.slot_duration_ms
+        let time_ms = self.time_ms().expect("store time exists");
+        self.config
+            .slot_at_time_ms(self.config.genesis_time_ms(), time_ms)
     }
 
     // ============ Config ============
@@ -5592,6 +5599,72 @@ mod tests {
         assert_eq!(store.ms_since_genesis(), 0);
         assert_eq!(store.intervals_since_genesis(), 0);
         assert_eq!(store.current_slot(), 0);
+    }
+
+    /// 12 s slots for the first two epochs, then 9 s ones (EIP-8198).
+    fn quick_slots_config() -> Config {
+        Config {
+            slot_duration_ms: 12_000,
+            slot_duration_ms_heze: 9_000,
+            heze_fork_epoch: 2,
+            ..Config::mainnet()
+        }
+    }
+
+    #[test]
+    fn a_beacon_store_clock_counts_slots_across_the_heze_slot_duration_change() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let genesis_time = 1_606_824_023;
+        let mut store = Store::init_beacon(
+            backend,
+            genesis_time,
+            quick_slots_config(),
+            H256::ZERO,
+            Checkpoint::default(),
+            0,
+        );
+        let genesis_ms = genesis_time * 1_000;
+        let fork_ms = genesis_ms + 64 * 12_000;
+
+        for (time_ms, expected_slot) in [
+            (genesis_ms, 0),
+            (fork_ms - 1, 63),
+            (fork_ms, 64),
+            (fork_ms + 8_999, 64),
+            (fork_ms + 9_000, 65),
+            // A single 12 s division would still read slot 64 here.
+            (fork_ms + 12_000, 65),
+            (fork_ms + 100 * 9_000, 164),
+        ] {
+            store.set_time_ms(time_ms).expect("set time");
+            assert_eq!(store.current_slot(), expected_slot, "at {time_ms}");
+        }
+    }
+
+    #[test]
+    fn the_heze_slot_schedule_survives_a_restart() {
+        // `Config` is SSZ-encoded into `Metadata["config"]`, so the two
+        // EIP-8198 fields must come back out of the directory unchanged.
+        let backend = Arc::new(InMemoryBackend::new());
+        let config = Config {
+            min_blob_data_retention_ms: 123_456_000,
+            ..quick_slots_config()
+        };
+        Store::init_beacon(
+            backend.clone(),
+            1_606_824_023,
+            config,
+            H256::ZERO,
+            Checkpoint::default(),
+            0,
+        );
+
+        let store = Store::from_db_state(backend).unwrap().unwrap();
+        let resumed = store.config();
+        assert_eq!(resumed.slot_duration_ms, 12_000);
+        assert_eq!(resumed.slot_duration_ms_heze, 9_000);
+        assert_eq!(resumed.min_blob_data_retention_ms, 123_456_000);
+        assert_eq!(resumed.slot_durations(), [(0, 12_000), (2, 9_000)]);
     }
 
     #[test]

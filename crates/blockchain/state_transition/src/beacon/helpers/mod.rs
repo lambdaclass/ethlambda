@@ -26,6 +26,8 @@ pub mod participation;
 #[cfg(any(test, debug_assertions))]
 pub mod participation_reference;
 pub mod predicates;
+#[cfg(test)]
+mod quick_slots_tests;
 pub mod shuffling;
 pub mod sync_committee;
 #[cfg(any(test, feature = "test-utils"))]

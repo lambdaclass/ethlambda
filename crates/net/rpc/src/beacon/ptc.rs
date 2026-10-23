@@ -229,6 +229,15 @@ struct PayloadAttestationDataQuery {
     slot: Slot,
 }
 
+/// When an envelope for `slot` must have been seen, as milliseconds since
+/// genesis: the slot's start plus `get_payload_due_ms()` of the slot's own
+/// epoch (EIP-8198), whose duration is not the genesis one past Heze.
+fn payload_due_ms(config: &ethlambda_types::beacon::config::Config, slot: u64) -> u64 {
+    let slot_start_ms = config.time_at_slot_ms(0, slot);
+    let due_in_slot_ms = get_payload_due_ms(compute_epoch_at_slot(slot), config);
+    slot_start_ms.saturating_add(due_in_slot_ms)
+}
+
 /// `GET /eth/v1/validator/payload_attestation_data?slot`.
 ///
 /// For the canonical block of `slot`, meaning the block of that very slot on
@@ -340,9 +349,7 @@ fn payload_attestation_data(
         return Ok(None);
     };
 
-    let due_ms = slot
-        .saturating_mul(config.slot_duration_ms)
-        .saturating_add(get_payload_due_ms(&config));
+    let due_ms = payload_due_ms(&config, slot);
     let payload_present = store
         .beacon_envelope_seen_ms(&root)
         .is_some_and(|seen_ms| seen_ms < due_ms);
@@ -873,8 +880,7 @@ mod tests {
     }
 
     fn due_ms(store: &Store, slot: u64) -> u64 {
-        let config = store.config();
-        slot * config.slot_duration_ms + get_payload_due_ms(&config)
+        payload_due_ms(&store.config(), slot)
     }
 
     #[tokio::test]

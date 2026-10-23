@@ -157,6 +157,8 @@ mod tests {
             "HEZE_FORK_VERSION",
             "HEZE_FORK_EPOCH",
             "INCLUSION_LIST_DUE_BPS",
+            "SLOT_DURATION_MS_HEZE",
+            "MIN_BLOB_DATA_RETENTION_MS",
         ] {
             assert!(
                 !parsed.ignored.contains(&key.to_string()),

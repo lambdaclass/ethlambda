@@ -101,7 +101,7 @@ fn validity_case(case: &Case, config: &Config) -> Result<(), String> {
 }
 
 pub fn trials() -> Vec<Trial> {
-    let config = Arc::new(Config::minimal());
+    let config = Arc::new(super::fixture_slot_durations(Config::minimal()));
 
     let initialization_cases = collect(PRESET, "genesis", "initialization");
     let mut trials = vec![super::discovery_trial(

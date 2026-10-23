@@ -1236,6 +1236,7 @@ mod tests {
         let mut config = ethlambda_types::beacon::config::Config::mainnet()
             .with_fork_epoch(ethlambda_types::beacon::fork::ForkName::Gloas, 0);
         config.slot_duration_ms = 1_000;
+        config.slot_duration_ms_heze = 1_000;
         let context = Arc::new(SigningContext {
             config: config.clone(),
             genesis_validators_root: Root::ZERO,
@@ -1364,6 +1365,7 @@ mod tests {
 
         let mut config = heze_context(0).config;
         config.slot_duration_ms = 1_000;
+        config.slot_duration_ms_heze = 1_000;
         let context = Arc::new(SigningContext {
             config: config.clone(),
             genesis_validators_root: Root::ZERO,
@@ -1544,6 +1546,7 @@ mod tests {
         let mut config = ethlambda_types::beacon::config::Config::mainnet()
             .with_fork_epoch(ethlambda_types::beacon::fork::ForkName::Altair, 0);
         config.slot_duration_ms = 1_000;
+        config.slot_duration_ms_heze = 1_000;
         let context = Arc::new(SigningContext {
             config: config.clone(),
             genesis_validators_root: Root::ZERO,

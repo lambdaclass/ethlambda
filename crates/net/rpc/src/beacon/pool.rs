@@ -174,16 +174,12 @@ fn validate(
 
     // [IGNORE] Not from the future, and from the current or previous epoch,
     // both with MAXIMUM_GOSSIP_CLOCK_DISPARITY of allowance (deneb's form).
-    let slot_start_ms = config
-        .genesis_time_ms()
-        .saturating_add(data.slot.saturating_mul(config.slot_duration_ms));
+    let slot_start_ms = config.time_at_slot_ms(config.genesis_time_ms(), data.slot);
     if slot_start_ms > now_ms + MAXIMUM_GOSSIP_CLOCK_DISPARITY {
         return Err("attestation slot is in the future");
     }
-    let clock_epoch = |ms: u64| {
-        let slot = ms.saturating_sub(config.genesis_time_ms()) / config.slot_duration_ms.max(1);
-        compute_epoch_at_slot(slot)
-    };
+    let clock_epoch =
+        |ms: u64| compute_epoch_at_slot(config.slot_at_time_ms(config.genesis_time_ms(), ms));
     let earliest_epoch = clock_epoch(now_ms.saturating_sub(MAXIMUM_GOSSIP_CLOCK_DISPARITY));
     let attestation_epoch = compute_epoch_at_slot(data.slot);
     if attestation_epoch + 1 < earliest_epoch {

@@ -63,6 +63,8 @@ pub(crate) enum NetworkDirError {
         fork: ForkName,
         reason: String,
     },
+    #[error("{}: {reason}", path.display())]
+    SlotDuration { path: PathBuf, reason: String },
     #[error("could not read bootnodes from {}: {reason}", path.display())]
     Bootnodes { path: PathBuf, reason: String },
     #[error(
@@ -97,6 +99,16 @@ impl NetworkDir {
             path: config_path.clone(),
             source,
         })?;
+
+        // EIP-8198: the heze slot duration must be a whole number of seconds,
+        // the unit the execution layer timestamps blocks in.
+        parsed
+            .config
+            .check_slot_durations()
+            .map_err(|reason| NetworkDirError::SlotDuration {
+                path: config_path.clone(),
+                reason,
+            })?;
 
         let genesis_path = base.join(GENESIS_STATE_FILE);
         let genesis_bytes = read_required_bytes(&genesis_path)?;
@@ -281,6 +293,32 @@ mod tests {
 
         let err = NetworkDir::load(dir.path()).unwrap_err().to_string();
         assert!(err.contains("SECONDS_PER_SLOT"), "got {err}");
+    }
+
+    #[test]
+    fn a_sub_second_heze_slot_duration_is_rejected_naming_the_key() {
+        let dir = complete_dir();
+        replace_config_line(
+            &dir,
+            "SECONDS_PER_SLOT: 6",
+            "SECONDS_PER_SLOT: 6\nSLOT_DURATION_MS_HEZE: 9500",
+        );
+
+        let err = NetworkDir::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("SLOT_DURATION_MS_HEZE"), "got {err}");
+    }
+
+    #[test]
+    fn a_heze_slot_duration_in_the_file_is_read() {
+        let dir = complete_dir();
+        replace_config_line(
+            &dir,
+            "SECONDS_PER_SLOT: 6",
+            "SECONDS_PER_SLOT: 6\nSLOT_DURATION_MS_HEZE: 3000",
+        );
+
+        let loaded = NetworkDir::load(dir.path()).unwrap();
+        assert_eq!(loaded.config.slot_duration_ms_heze, 3_000);
     }
 
     /// Write `dir`'s `config.yaml` as the devnet fixture's with one line

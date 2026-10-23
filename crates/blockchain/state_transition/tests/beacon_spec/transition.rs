@@ -185,7 +185,7 @@ fn apply_blocks(
 }
 
 pub fn trials() -> Vec<Trial> {
-    let config = Arc::new(Config::active());
+    let config = Arc::new(super::fixture_active_config());
     let cases = collect(PRESET, "transition", "core");
     let mut trials = vec![super::discovery_trial("transition", cases.len())];
 

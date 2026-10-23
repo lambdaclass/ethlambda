@@ -62,16 +62,13 @@ pub(crate) fn is_syncable_digest(wire: &BeaconWire, digest: ForkDigest, now_ms: 
         })
 }
 
-fn epoch_duration_ms(config: &Config) -> u64 {
-    config
-        .slot_duration_ms
-        .max(1)
-        .saturating_mul(preset::SLOTS_PER_EPOCH)
-}
-
 /// The epoch the wall clock reads at `now_ms`; epoch 0 before genesis.
+///
+/// Read off the EIP-8198 slot schedule, since the slot duration (so the epoch
+/// duration) changes at Heze.
 pub(crate) fn epoch_at_ms(config: &Config, genesis_time: u64, now_ms: u64) -> Epoch {
-    now_ms.saturating_sub(genesis_time.saturating_mul(1000)) / epoch_duration_ms(config)
+    let genesis_ms = genesis_time.saturating_mul(1000);
+    config.slot_at_time_ms(genesis_ms, now_ms) / preset::SLOTS_PER_EPOCH
 }
 
 /// How long from `now_ms` until `epoch` begins; zero if it already has.
@@ -81,9 +78,9 @@ pub(crate) fn delay_until_epoch(
     epoch: Epoch,
     now_ms: u64,
 ) -> Duration {
-    let start_ms = genesis_time
-        .saturating_mul(1000)
-        .saturating_add(epoch.saturating_mul(epoch_duration_ms(config)));
+    let genesis_ms = genesis_time.saturating_mul(1000);
+    let start_slot = epoch.saturating_mul(preset::SLOTS_PER_EPOCH);
+    let start_ms = config.time_at_slot_ms(genesis_ms, start_slot);
     Duration::from_millis(start_ms.saturating_sub(now_ms))
 }
 
@@ -311,6 +308,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_epoch_clock_follows_the_slot_duration_change_at_heze() {
+        // 12 s slots for two epochs, then 9 s slots (EIP-8198).
+        let config = Config {
+            slot_duration_ms: 12_000,
+            slot_duration_ms_heze: 9_000,
+            heze_fork_epoch: 2,
+            ..Config::mainnet()
+        };
+        let genesis = 1_000;
+        let genesis_ms = genesis * 1000;
+        let slots = preset::SLOTS_PER_EPOCH;
+        let old_epoch_ms = 12_000 * slots;
+        let new_epoch_ms = 9_000 * slots;
+        let fork_ms = genesis_ms + 2 * old_epoch_ms;
+
+        // Pre-fork epochs are 12 s wide.
+        assert_eq!(epoch_at_ms(&config, genesis, genesis_ms + old_epoch_ms), 1);
+        assert_eq!(epoch_at_ms(&config, genesis, fork_ms - 1), 1);
+        // The fork epoch and the ones after it are 9 s wide.
+        assert_eq!(epoch_at_ms(&config, genesis, fork_ms), 2);
+        assert_eq!(epoch_at_ms(&config, genesis, fork_ms + new_epoch_ms - 1), 2);
+        assert_eq!(epoch_at_ms(&config, genesis, fork_ms + new_epoch_ms), 3);
+        // A single genesis-duration division would call this epoch 3.
+        assert_eq!(
+            epoch_at_ms(&config, genesis, genesis_ms + 3 * old_epoch_ms - 1),
+            3
+        );
+        assert_eq!(
+            delay_until_epoch(&config, genesis, 2, genesis_ms),
+            Duration::from_millis(2 * old_epoch_ms)
+        );
+        assert_eq!(
+            delay_until_epoch(&config, genesis, 4, fork_ms),
+            Duration::from_millis(2 * new_epoch_ms)
+        );
+    }
+
     #[tokio::test]
     async fn a_live_crossing_joins_switches_and_leaves_in_order() {
         let config = config();
@@ -425,7 +460,8 @@ mod tests {
     }
 
     fn epoch_start_ms(wire: &BeaconWire, epoch: Epoch) -> u64 {
-        wire.genesis_time * 1000 + epoch * epoch_duration_ms(&wire.config)
+        wire.config
+            .time_at_slot_ms(wire.genesis_time * 1000, epoch * preset::SLOTS_PER_EPOCH)
     }
 
     #[tokio::test]

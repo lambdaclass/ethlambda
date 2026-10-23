@@ -43,7 +43,6 @@ const BASIS_POINTS: u64 = 10_000;
 #[derive(Debug, Clone)]
 pub struct SlotClock {
     genesis_time: u64,
-    slot_duration_ms: u64,
     config: Config,
 }
 
@@ -52,7 +51,8 @@ impl SlotClock {
     /// `/eth/v1/config/spec`.
     ///
     /// `slot_duration_ms` must be nonzero, since every slot computation divides
-    /// by it. Callers taking it from a beacon node's response must reject a
+    /// by it. It is the one duration for every fork; a chain whose slot changes
+    /// at Heze (EIP-8198) is described by [`Self::from_config`]. Callers taking it from a beacon node's response must reject a
     /// zero there, at the boundary where it can be reported as malformed input;
     /// this precondition is the backstop for any caller that does not.
     pub fn new(
@@ -63,6 +63,7 @@ impl SlotClock {
     ) -> Self {
         let mut config = Config::mainnet().with_fork_epoch(ForkName::Gloas, FAR_FUTURE_EPOCH);
         config.slot_duration_ms = slot_duration_ms;
+        config.slot_duration_ms_heze = slot_duration_ms;
         config.attestation_due_bps = attestation_due_bps;
         config.aggregate_due_bps = aggregate_due_bps;
         Self::from_config(genesis_time, &config)
@@ -73,12 +74,14 @@ impl SlotClock {
     /// configuration rather than one pair of offsets.
     pub fn from_config(genesis_time: u64, config: &Config) -> Self {
         assert!(
-            config.slot_duration_ms > 0,
-            "slot_duration_ms must be nonzero"
+            config
+                .slot_durations()
+                .iter()
+                .all(|(_, duration_ms)| *duration_ms > 0),
+            "every slot duration must be nonzero"
         );
         Self {
             genesis_time,
-            slot_duration_ms: config.slot_duration_ms,
             config: config.clone(),
         }
     }
@@ -98,12 +101,17 @@ impl SlotClock {
     ///
     /// Divides in milliseconds, not seconds, so a chain whose slot is not a
     /// whole number of seconds lands in the right slot rather than a rounded
-    /// one.
+    /// one. The division walks the slot schedule, so a clock past Heze counts
+    /// the slots since the fork at the Heze duration (EIP-8198).
     pub fn slot_at(&self, now: SystemTime) -> Option<Slot> {
         let since_epoch = now.duration_since(UNIX_EPOCH).ok()?;
-        let since_genesis = since_epoch.checked_sub(Duration::from_secs(self.genesis_time))?;
-        let elapsed_ms = u64::try_from(since_genesis.as_millis()).unwrap_or(u64::MAX);
-        Some(elapsed_ms / self.slot_duration_ms)
+        since_epoch.checked_sub(Duration::from_secs(self.genesis_time))?;
+        let now_ms = u64::try_from(since_epoch.as_millis()).unwrap_or(u64::MAX);
+        Some(self.config.slot_at_time_ms(self.genesis_time_ms(), now_ms))
+    }
+
+    fn genesis_time_ms(&self) -> u64 {
+        self.genesis_time.saturating_mul(1_000)
     }
 
     /// The current slot, or `None` before genesis.
@@ -118,12 +126,8 @@ impl SlotClock {
 
     /// When `slot` begins.
     pub fn start_of(&self, slot: Slot) -> SystemTime {
-        // Saturating rather than wrapping: a slot number large enough to
-        // overflow this product is centuries away at any real slot duration,
-        // and a clock that wrapped would put it in the past.
-        UNIX_EPOCH
-            + Duration::from_secs(self.genesis_time)
-            + Duration::from_millis(slot.saturating_mul(self.slot_duration_ms))
+        let start_ms = self.config.time_at_slot_ms(self.genesis_time_ms(), slot);
+        UNIX_EPOCH + Duration::from_millis(start_ms)
     }
 
     /// When the attester duty for `slot` should run.
@@ -210,8 +214,14 @@ impl SlotClock {
     /// milliseconds, multiplying before dividing. Doing it in `Duration`
     /// instead would keep nanoseconds and land 0.4 ms past the spec's answer on
     /// mainnet, which is wrong in the direction that matters for a deadline.
+    ///
+    /// The duration is the one of `slot` itself (EIP-8198's
+    /// `get_slot_component_duration_ms` takes the slot's own), never the
+    /// genesis one: the same basis points are a different length either side
+    /// of the Heze fork.
     fn offset_into(&self, slot: Slot, bps: u64) -> SystemTime {
-        let offset_ms = bps.saturating_mul(self.slot_duration_ms) / BASIS_POINTS;
+        let slot_duration_ms = self.config.slot_duration_ms_at_slot(slot);
+        let offset_ms = bps.saturating_mul(slot_duration_ms) / BASIS_POINTS;
         self.start_of(slot) + Duration::from_millis(offset_ms)
     }
 
@@ -653,6 +663,135 @@ mod tests {
 
     /// Slots before the gloas epoch keep the pre-gloas offsets and slots from
     /// it on take the gloas ones, on both sides of the boundary.
+    /// Gloas from genesis, then 9 s slots from epoch 2 where they were 12 s:
+    /// slot 63 is the last 12 s slot and slot 64 the first 9 s one (EIP-8198).
+    fn quick_slots_clock() -> SlotClock {
+        let mut config = Config::mainnet()
+            .with_fork_epoch(ForkName::Gloas, 0)
+            .with_fork_epoch(ForkName::Heze, 2);
+        config.slot_duration_ms = 12_000;
+        config.slot_duration_ms_heze = 9_000;
+        SlotClock::from_config(GENESIS, &config)
+    }
+
+    fn at_ms(offset_ms: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(GENESIS) + Duration::from_millis(offset_ms)
+    }
+
+    #[test]
+    fn slots_are_counted_at_the_duration_in_force_across_the_heze_fork() {
+        let clock = quick_slots_clock();
+        let fork_ms = 64 * 12_000;
+        assert_eq!(clock.start_of(63), at_ms(63 * 12_000));
+        assert_eq!(clock.start_of(64), at_ms(fork_ms));
+        assert_eq!(clock.start_of(65), at_ms(fork_ms + 9_000));
+        assert_eq!(clock.end_of(63), clock.start_of(64));
+        assert_eq!(clock.end_of(64), at_ms(fork_ms + 9_000));
+
+        assert_eq!(clock.slot_at(at_ms(fork_ms - 1)), Some(63));
+        assert_eq!(clock.slot_at(at_ms(fork_ms)), Some(64));
+        assert_eq!(clock.slot_at(at_ms(fork_ms + 8_999)), Some(64));
+        assert_eq!(clock.slot_at(at_ms(fork_ms + 9_000)), Some(65));
+        // Dividing by the genesis duration would still call this slot 64.
+        assert_eq!(clock.slot_at(at_ms(fork_ms + 12_000)), Some(65));
+        assert_eq!(clock.slot_at(at_ms(fork_ms + 10 * 9_000)), Some(74));
+        // And the two directions agree on every slot around the fork.
+        for slot in 60..70 {
+            assert_eq!(clock.slot_at(clock.start_of(slot)), Some(slot));
+        }
+    }
+
+    #[test]
+    fn a_duty_offset_is_a_share_of_the_slots_own_duration() {
+        let clock = quick_slots_clock();
+        let config = Config::mainnet();
+        let offset = |bps: u64, duration_ms: u64| Duration::from_millis(bps * duration_ms / 10_000);
+
+        // Last 12 s slot: the gloas attester offset (2500 bps) is 3 s in.
+        assert_eq!(
+            clock.attestation_time(63),
+            clock.start_of(63) + offset(config.attestation_due_bps_gloas, 12_000)
+        );
+        assert_eq!(
+            clock.attestation_time(63),
+            clock.start_of(63) + Duration::from_millis(3_000)
+        );
+        // First 9 s slot: the same basis points are 2.25 s in.
+        assert_eq!(
+            clock.attestation_time(64),
+            clock.start_of(64) + Duration::from_millis(2_250)
+        );
+        assert_eq!(
+            clock.aggregation_time(64),
+            clock.start_of(64) + offset(config.aggregate_due_bps_gloas, 9_000)
+        );
+        assert_eq!(
+            clock.sync_message_time(64),
+            clock.start_of(64) + offset(config.sync_message_due_bps_gloas, 9_000)
+        );
+        assert_eq!(
+            clock.contribution_time(64),
+            clock.start_of(64) + offset(config.contribution_due_bps_gloas, 9_000)
+        );
+        assert_eq!(
+            clock.payload_attestation_time(64),
+            clock.start_of(64) + offset(config.payload_attestation_due_bps, 9_000)
+        );
+        assert_eq!(
+            clock.inclusion_list_deadline(64),
+            clock.start_of(64) + offset(config.inclusion_list_due_bps, 9_000)
+        );
+        // The slot just before it keeps its own duration for the deadline.
+        assert_eq!(
+            clock.inclusion_list_deadline(63),
+            clock.start_of(63) + offset(config.inclusion_list_due_bps, 12_000)
+        );
+    }
+
+    #[test]
+    fn the_waits_and_budgets_cross_the_fork_on_the_right_durations() {
+        let clock = quick_slots_clock();
+        let fork_ms = 64 * 12_000;
+
+        // One second before the fork the last 12 s slot has a second left.
+        assert_eq!(
+            clock.remaining_in(63, at_ms(fork_ms - 1_000)),
+            Duration::from_secs(1)
+        );
+        // Right at the fork the first 9 s slot has all nine.
+        assert_eq!(
+            clock.remaining_in(64, at_ms(fork_ms)),
+            Duration::from_secs(9)
+        );
+        // Its attester duty is 2.25 s away from its start.
+        assert_eq!(
+            clock.until_attestation(64, at_ms(fork_ms)),
+            Duration::from_millis(2_250)
+        );
+    }
+
+    #[test]
+    fn the_duty_loop_steps_across_the_fork_without_skipping_or_repeating() {
+        let clock = quick_slots_clock();
+        let fork_ms = 64 * 12_000;
+
+        // From inside slot 63, the next slot is the first 9 s one, at the fork.
+        let (next, delay) = clock.next_slot_to_serve(Some(62), at_ms(fork_ms - 4_000));
+        assert_eq!(next, 63);
+        assert_eq!(delay, Duration::ZERO);
+        let (next, delay) = clock.next_slot_to_serve(Some(63), at_ms(fork_ms - 4_000));
+        assert_eq!(next, 64);
+        assert_eq!(delay, Duration::from_secs(4));
+        // After the first 9 s slot is served the next one begins 9 s on.
+        let (next, delay) = clock.next_slot_to_serve(Some(64), at_ms(fork_ms + 1_000));
+        assert_eq!(next, 65);
+        assert_eq!(delay, Duration::from_secs(8));
+        // First call, mid-way through slot 64: wait for slot 65's start.
+        let (next, delay) = clock.next_slot_to_serve(None, at_ms(fork_ms + 4_000));
+        assert_eq!(next, 65);
+        assert_eq!(delay, Duration::from_secs(5));
+    }
+
     #[test]
     fn the_offsets_change_at_the_gloas_boundary() {
         let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 2);
@@ -746,9 +885,12 @@ mod tests {
 
     #[test]
     fn the_inclusion_list_goes_out_at_the_attester_offset_and_closes_at_its_deadline() {
-        let config = Config::mainnet()
+        let mut config = Config::mainnet()
             .with_fork_epoch(ForkName::Gloas, 0)
             .with_fork_epoch(ForkName::Heze, 1);
+        // Mainnet's own Heze slot is shorter (EIP-8198); this test is about
+        // the offsets, so keep one duration across the fork.
+        config.slot_duration_ms_heze = config.slot_duration_ms;
         let clock = SlotClock::from_config(GENESIS, &config);
         let slot = SLOTS_PER_EPOCH + 5;
         assert!(clock.is_heze(slot));
