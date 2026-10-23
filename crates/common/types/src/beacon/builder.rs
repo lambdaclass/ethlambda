@@ -2,11 +2,11 @@
 //! MEV-Boost relay flow exchanges between a validator client, this node and a
 //! relay.
 //!
-//! Not consensus containers. Nothing here enters a state, and only
-//! [`BlindedBeaconBlock`] has a root anything depends on: it equals the full
-//! block's, because a payload header's root is the root of the payload it
-//! summarizes. That equality is what lets a validator sign a blinded block for
-//! a full one it never sees.
+//! Not consensus containers: nothing here enters a state. Registrations and
+//! bids are signed over their own roots, and [`BlindedBeaconBlock`]'s root must
+//! also equal the full block's, which it does because a payload header's root
+//! is the root of the payload it summarizes. That equality is what lets a
+//! validator sign a blinded block for a full one it never sees.
 //!
 //! Electra and fulu shapes only, which are identical, as the consensus
 //! containers they extend are.
@@ -47,13 +47,14 @@ pub struct ValidatorRegistrationV1 {
     pub fee_recipient: ExecutionAddress,
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub gas_limit: u64,
-    /// Seconds since the Unix epoch. Builders keep a validator's latest
-    /// registration by this, so re-sending an unchanged one must reuse it.
+    /// Seconds since the Unix epoch. Builders sequence a validator's
+    /// registrations by this and reject one older than the latest they hold.
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub timestamp: u64,
     pub pubkey: BlsPubkey,
 }
 
+/// A [`ValidatorRegistrationV1`] signed by its validator under [`DOMAIN_APPLICATION_BUILDER`](crate::beacon::constants::DOMAIN_APPLICATION_BUILDER).
 #[derive(
     Debug,
     Clone,
@@ -105,6 +106,7 @@ pub struct BuilderBid {
     pub pubkey: BlsPubkey,
 }
 
+/// A [`BuilderBid`] signed by its `pubkey` under [`DOMAIN_APPLICATION_BUILDER`](crate::beacon::constants::DOMAIN_APPLICATION_BUILDER).
 #[derive(
     Debug,
     Clone,
@@ -225,7 +227,9 @@ pub struct BlindedBeaconBlock {
 
 impl BlindedBeaconBlock {
     /// `block` with its body's payload swapped for `execution_payload_header`;
-    /// see [`BlindedBeaconBlockBody::from_parts`].
+    /// see [`BlindedBeaconBlockBody::from_parts`]. The block's `state_root` is
+    /// copied as is, so a caller passing a header other than the payload's own
+    /// must recompute it, as blinded block production does.
     pub fn from_parts(
         block: electra::BeaconBlock,
         execution_payload_header: ExecutionPayloadHeader,
@@ -249,6 +253,7 @@ impl From<electra::BeaconBlock> for BlindedBeaconBlock {
     }
 }
 
+/// A [`BlindedBeaconBlock`] signed by its proposer under the full block's domain, `DOMAIN_BEACON_PROPOSER`, since the two share a root.
 #[derive(
     Debug,
     Clone,
