@@ -171,9 +171,9 @@ impl BlindedBeaconBlockBody {
     /// `body` with its payload swapped for `execution_payload_header`.
     ///
     /// The header is taken as given, so the result's root equals `body`'s only
-    /// when the header is `body.execution_payload`'s own. Block production
-    /// relies on that: it builds the body around a stand-in payload and blinds
-    /// it with the builder's header.
+    /// when the header is `body.execution_payload`'s own. Blinded block
+    /// production relies on the header being kept as given: it builds the body
+    /// around a stand-in payload and blinds it with the builder's header.
     pub fn from_parts(
         body: electra::BeaconBlockBody,
         execution_payload_header: ExecutionPayloadHeader,

@@ -7,7 +7,8 @@
 //! electra's block containers unchanged.
 //!
 //! The pieces the execution client supplies (the payload, its blob commitments
-//! and its request list) arrive already built; this module decides everything
+//! and its request list) arrive already built; `assemble_blinded_block` takes
+//! them from a builder's bid instead, fulu only. This module decides everything
 //! the consensus layer decides, and computes the state root by running the
 //! block through `process_block` on a copy of the state, the way
 //! `validator.md` describes (`compute_new_state_root`).
@@ -614,7 +615,7 @@ fn post_state(
         BeaconState::Gloas(_) => {
             return Err(Error::SpecAssert("block production does not support gloas"));
         }
-        BeaconState::Lean(_) => lean_state_unreachable("assemble_block"),
+        BeaconState::Lean(_) => lean_state_unreachable("post_state"),
     };
     let mut post = state.clone();
     stf::block::process_block(
@@ -643,6 +644,8 @@ pub struct BlindedBlockInputs {
     pub execution_payload_header: ExecutionPayloadHeader,
     pub blob_kzg_commitments: Vec<KzgCommitment>,
     pub execution_requests: ExecutionRequests,
+    /// The block's sync aggregate: [`empty_sync_aggregate`], or what
+    /// [`verified_sync_aggregate`] vouched for.
     pub sync_aggregate: SyncAggregate,
 }
 
@@ -672,8 +675,9 @@ pub struct BlindedBlockInputs {
 ///   the header's `withdrawals_root` against them itself.
 ///
 /// This is not bid validation. Beyond what the table checks, the header is
-/// trusted as given: the caller verifies the bid's signature, value and gas
-/// limit before building on it.
+/// trusted as given: the caller verifies everything else it needs from the bid
+/// (at least the response's fork version, the signature, the value, the gas
+/// limit and `blob_gas_used`) before building on it.
 ///
 /// `options` is as in [`assemble_block`].
 ///

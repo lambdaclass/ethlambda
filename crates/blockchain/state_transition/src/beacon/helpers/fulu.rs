@@ -48,10 +48,9 @@
 //! function mutates state at an epoch boundary, and every other fork's
 //! equivalent epoch-processing step lives in `crate::beacon::stf`, not in a
 //! `helpers::<fork>` module (see [`super::altair`]'s module docs, which make
-//! the same point about `process_attestation`). [`fulu_state`] is kept
-//! alongside [`fulu_state_ref`] for whenever that step is written, the same
-//! way altair keeps a mutable state projection ready for its own
-//! not-yet-written processing steps.
+//! the same point about `process_attestation`). It is
+//! `crate::beacon::stf::epoch::fulu::process_proposer_lookahead`, which writes
+//! the window through [`proposer_lookahead_mut`] rather than [`fulu_state`].
 
 use crate::beacon::constants;
 use crate::beacon::containers::{BeaconState, fulu};
@@ -222,9 +221,13 @@ pub fn initialize_proposer_lookahead(state: &BeaconState) -> Result<Vec<Validato
 
 /// The fulu state, mutably, or an error naming the function that needs one.
 ///
-/// The write-side counterpart of [`fulu_state_ref`], for code that edits
-/// fulu-only fields (`proposer_lookahead`, the payload header) and must refuse
-/// any other fork by name rather than panic.
+/// The write-side counterpart of [`fulu_state_ref`], for code that writes
+/// fulu-only fields directly, such as `latest_execution_payload_header`, and
+/// must refuse any other fork by name rather than panic. Its callers are
+/// `process_execution_payload` and `assemble_blinded_block`.
+///
+/// `proposer_lookahead` deliberately does not go through here: see
+/// [`proposer_lookahead_mut`].
 pub(crate) fn fulu_state<'a>(
     state: &'a mut BeaconState,
     function: &'static str,

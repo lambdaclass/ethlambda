@@ -127,8 +127,8 @@ pub const DOMAIN_AGGREGATE_AND_PROOF: DomainType = [0x06, 0x00, 0x00, 0x00];
 /// application-specific domains outside the specification. Every
 /// specification-defined `DomainType` masks to zero against this; a
 /// `DomainType` that does not is reserved for other uses (for example
-/// re-purposing beacon chain signatures on an application layer). The one
-/// such domain this crate uses is [`DOMAIN_APPLICATION_BUILDER`].
+/// re-purposing beacon chain signatures on an application layer). [`DOMAIN_APPLICATION_BUILDER`]
+/// is one.
 pub const DOMAIN_APPLICATION_MASK: DomainType = [0x00, 0x00, 0x00, 0x01];
 /// Domain for the builder API's own messages (`ValidatorRegistrationV1`,
 /// `BuilderBid`), builder-specs `bellatrix/builder.md`. Always computed

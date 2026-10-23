@@ -881,7 +881,9 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
 - **`assemble_blinded_block` does not use a blinded STF.** It runs `process_block`
   on a stand-in payload built from the builder's header, then patches the two
   post-state fields that depend on the payload itself
-  (`latest_execution_payload_header`, `latest_block_header.body_root`). Fulu
+  (`latest_execution_payload_header`, `latest_block_header.body_root`). It
+  also checks the header's `withdrawals_root` itself: the stand-in carries the
+  expected withdrawals, so the STF's own withdrawals check passes trivially. Fulu
   only, since it is the last fork with blinded blocks. Read the function's doc
   before touching fulu's `process_block`;
   `blinded_and_full_blocks_reach_the_same_state_root` fails on any drift.
