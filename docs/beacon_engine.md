@@ -14,19 +14,22 @@ The wire is
 
 ## Which methods, and why so few
 
-Four:
+Six:
 
 | Method | Introduced | Why |
 |---|---|---|
 | `engine_newPayloadV4` | prague | Validate one block's payload |
+| `engine_newPayloadV5` | amsterdam | Validate the payload a gloas envelope reveals |
 | `engine_forkchoiceUpdatedV3` | cancun | Say where the head, safe and finalized blocks are |
+| `engine_forkchoiceUpdatedV4` | amsterdam | The same, from a gloas head on; also carries the node's custody columns |
 | `engine_exchangeCapabilities` | common | Startup handshake |
 | `engine_getClientVersionV1` | identification | Log what the execution client is |
 
 Osaka introduces **no new `newPayload`**. Its own document adds only
 `engine_getPayloadV5` and `engine_getBlobsV2`/`V3`; `engine_newPayloadV5` belongs
-to Amsterdam. So the Osaka-current call for a payload is prague's V4, and the
-Osaka-current fork choice notification is cancun's V3.
+to Amsterdam, where gloas's envelope import uses it. So the Osaka-current call for a payload is prague's V4, and the
+Osaka-current fork choice notification is cancun's V3. Amsterdam's pair (newPayload V5, forkchoiceUpdated V4) is
+used from gloas on; the startup handshake warns when the execution client does not advertise either, but only on a network whose schedule includes gloas.
 
 Three method families a full client would have are deliberately absent:
 
@@ -58,6 +61,10 @@ process_block (beacon arm)
         ├─ state_transition, with the engine derived from the verdict
         └─ record the block's execution hash and its optimistic status
 ```
+
+This diagram is the pre-gloas path. A gloas block carries no payload, only a
+builder's bid, so nothing is asked about it at import; the question moves to the
+envelope that reveals the payload (see [Gloas](#gloas) below).
 
 The order is the specification's own: `is_data_available` runs before
 `state_transition`, so a block about to be held for its custody columns is never
@@ -119,11 +126,11 @@ finality: an execution client doing a long state sync answers `NOT_VALIDATED` to
 every block, so without that bound the set would take one root per import for
 the life of the process.
 
-Nothing outside `mark_validated`'s own ancestor walk reads the set yet. The
-readers it is waiting for are the ones that need to answer "is my head
-optimistic?": the Beacon API's `execution_optimistic` response field, and a sync
-status that separates a head this node has vouched for from one it has merely
-imported.
+Besides `mark_validated`'s own ancestor walk, the Beacon API's
+`execution_optimistic` response field reads the set (see
+[rpc.md](./rpc.md#execution_optimistic-under-gloas)). A sync status that
+separates a head this node has vouched for from one it has merely imported does
+not exist yet.
 
 ### `is_optimistic_candidate_block`
 
@@ -194,6 +201,40 @@ itself. An execution client condemning finalized history means it and this node
 disagree about what is final, which is an operator emergency rather than
 something to resolve by emptying fork choice.
 
+## Gloas
+
+A gloas block commits to a builder's bid and the payload arrives later in a
+`SignedExecutionPayloadEnvelope`, so the execution client judges the envelope,
+not the block. The order differs from the specification's, which asks the engine
+last inside one boolean function: the follower runs the pure consensus checks
+first (signature, bid, state, data availability), and only an envelope that
+passed them is sent to `engine_newPayloadV5`. That way an unsigned copy with the
+honest block hash and a different body cannot earn an `INVALID` that lands on the
+honest payload, and the engine never spends time on an envelope this node would
+refuse anyway.
+
+| Answer | What happens to the envelope |
+|---|---|
+| `VALID` | Applied; the payload is recorded `VALID` |
+| `SYNCING`, `ACCEPTED` | Applied and recorded `SYNCING` (not yet validated); a later `forkchoiceUpdated` `VALID` promotes it |
+| `INVALID` with a `latestValidHash` | The payload is invalid: not applied, so the block's FULL node never exists; the block and its EMPTY branch stay |
+| `INVALID` with a null `latestValidHash`, or `INVALID_BLOCK_HASH` | The envelope's contents do not hash to the block hash it claims: only that envelope is refused, since the builder's real one may still arrive |
+| no answer after the retry ladder | Kept (it is consensus-valid) and asked again once a slot |
+
+The null-`latestValidHash` row exists because ethrex has no `INVALID_BLOCK_HASH`
+status: it answers a mismatch with a null hash and an executed-and-failed payload
+with its last valid ancestor. `latestValidHash` and `VALID` follow the execution
+chain (each block's `bid.parent_block_hash`), not every verified ancestor, since
+a block built past an ancestor's EMPTY node skips that ancestor's payload. The
+details, and why each departs from the specification, are in
+[spec_deviations.md](./spec_deviations.md#the-execution-client-judges-a-gloas-payload-before-the-envelope-is-applied).
+
+With the engine down, the per-slot retry asks about the oldest held envelope
+only and releases the rest once that ask is answered, so an unreachable client
+costs one retry ladder per slot however many envelopes wait. This is the gloas
+counterpart of the limitation below, and unlike a block the envelope is not
+dropped.
+
 ## `forkchoiceUpdated`
 
 Sent once after every head recompute, which is once per import cascade and once
@@ -217,6 +258,15 @@ root is the last block at *or before* that boundary, so a missed proposal at an
 epoch boundary leaves the finalized block below the bound. Dropping its hash
 would make every later call carry `finalized_block_hash = 0x00..0` and stop the
 execution client advancing its own finalized block for the life of the process.
+
+For a gloas head the hashes come from bids rather than from a cached payload
+hash: the head node's `bid.block_hash` when it is FULL and its
+`bid.parent_block_hash` when it is EMPTY, the finalized block's
+`bid.parent_block_hash`, and the justified block's `bid.parent_block_hash` as
+the safe hash. The last is a fallback, since the specification builds the safe
+hash on fast confirmation, which the follower does not run. The call is V4 with
+the node's custody columns. A head whose payload status has not been computed
+yet (the first moments after a restart) sends nothing.
 
 The response carries a `PayloadStatusV1` of its own, and that is the channel by
 which a block imported on `SYNCING` later becomes `VALID` or is found to be
