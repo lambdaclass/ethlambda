@@ -354,8 +354,10 @@ and peers will not import a block they cannot sample. Such payloads are refused
 at production (`503`, which a validator client fails over on) and such blocks
 at publication (`400`).
 
-`tooling/kurtosis-validator/network_params_ethlambda_beacon.yaml` points the
-validator client at this node alone, so every block on that devnet is one this
+A `cl_type: ethlambda` participant in our ethereum-package fork
+([`lambdaclass/ethereum-package`](https://github.com/lambdaclass/ethereum-package/tree/add-ethlambda),
+branch `add-ethlambda`) runs an ethlambda validator client that, by default,
+talks to this node alone, so every block its validators propose is one this
 node built.
 
 ### Encoding
