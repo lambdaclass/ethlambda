@@ -496,14 +496,15 @@ pub struct BlobSidecar {
 mod tests {
     use libssz::{SszDecode as _, SszEncode as _};
 
+    use super::super::bellatrix::Transaction;
+    use super::super::capella::Withdrawal;
     use super::*;
 
     /// A payload whose every field differs from the empty one, with a
     /// transaction and a withdrawal, so both list roots are non-trivial.
     fn sample_payload() -> ExecutionPayload {
-        let transaction: super::super::bellatrix::Transaction =
-            vec![0xde, 0xad, 0xbe, 0xef].try_into().unwrap();
-        let withdrawal = super::super::capella::Withdrawal {
+        let transaction: Transaction = vec![0xde, 0xad, 0xbe, 0xef].try_into().unwrap();
+        let withdrawal = Withdrawal {
             index: 1,
             validator_index: 2,
             address: ExecutionAddress::repeat_byte(3),
@@ -532,7 +533,6 @@ mod tests {
 
     #[test]
     fn a_payloads_header_has_the_payloads_root() {
-        use crate::beacon::primitives::HashTreeRoot as _;
         let payload = sample_payload();
         let header = ExecutionPayloadHeader::from(&payload);
         assert_eq!(header.hash_tree_root(), payload.hash_tree_root());
@@ -543,16 +543,6 @@ mod tests {
         assert_eq!(
             header.withdrawals_root,
             payload.withdrawals.hash_tree_root()
-        );
-    }
-
-    #[test]
-    fn a_header_round_trips_through_json() {
-        let header = ExecutionPayloadHeader::from(&sample_payload());
-        let json = serde_json::to_string(&header).unwrap();
-        assert_eq!(
-            serde_json::from_str::<ExecutionPayloadHeader>(&json).unwrap(),
-            header
         );
     }
 

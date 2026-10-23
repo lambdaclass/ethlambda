@@ -374,6 +374,13 @@ fn a_fulu_block_round_trips_through_json() {
 }
 
 #[test]
+fn an_execution_payload_header_round_trips_through_json() {
+    round_trip(&super::deneb::ExecutionPayloadHeader::from(
+        &electra_payload(),
+    ));
+}
+
+#[test]
 fn a_gloas_block_round_trips_through_json() {
     round_trip(&gloas_block());
 }
