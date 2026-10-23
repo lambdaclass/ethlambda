@@ -1592,9 +1592,12 @@ fn first_config_difference(
         reorg_parent_weight_threshold: _,
         reorg_max_epochs_since_finalization: _,
 
-        // Transition (bellatrix): mainnet crossed this in 2022 and every
-        // shipped network leaves it at its default; not worth chain-identity
-        // treatment for the same reason the fork-choice group above is not.
+        // Transition (bellatrix): these only judge the merge transition block
+        // (`validate_merge_block`), and every shipped network is past its
+        // merge. Sepolia's file does set the `TERMINAL_BLOCK_HASH` override
+        // its merge used, but no block a node imports today is checked
+        // against it. Not worth chain-identity treatment for the same reason
+        // the fork-choice group above is not.
         terminal_total_difficulty: _,
         terminal_block_hash: _,
         terminal_block_hash_activation_epoch: _,
