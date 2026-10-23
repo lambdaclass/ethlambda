@@ -661,6 +661,7 @@ pub struct BlindedBlockInputs {
 /// | `process_block_header` | the body's root | wrong `body_root`: patched |
 /// | `process_withdrawals` | `payload.withdrawals == expected` | identical: every write uses the expected withdrawals |
 /// | `process_execution_payload` | parent hash, prev_randao, timestamp; then caches the header | checks run on the header's own values; wrong cached header: patched |
+/// | the execution engine | the whole payload, in the specification | a constant here, as for a local block: no one checks the builder's payload |
 /// | randao, eth1, operations, sync aggregate | none | identical |
 ///
 /// Two things follow:
@@ -669,6 +670,12 @@ pub struct BlindedBlockInputs {
 /// - The stand-in carries the expected withdrawals, so the state transition's
 ///   own withdrawals check passes trivially. That is why this function checks
 ///   the header's `withdrawals_root` against them itself.
+///
+/// This is not bid validation. Beyond what the table checks, the header is
+/// trusted as given: the caller verifies the bid's signature, value and gas
+/// limit before building on it.
+///
+/// `options` is as in [`assemble_block`].
 ///
 /// Fulu only. The table describes fulu's `process_block`, and fulu is the last
 /// fork with blinded blocks (gloas has none), so it cannot change under this

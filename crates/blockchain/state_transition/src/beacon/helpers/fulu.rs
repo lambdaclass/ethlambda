@@ -222,13 +222,9 @@ pub fn initialize_proposer_lookahead(state: &BeaconState) -> Result<Vec<Validato
 
 /// The fulu state, mutably, or an error naming the function that needs one.
 ///
-/// Only [`get_beacon_proposer_index`] needs this: it is the one function in
-/// this module that reads `proposer_lookahead` itself rather than working
-/// through fork-invariant accessors. Kept alongside [`fulu_state_ref`] for
-/// `process_proposer_lookahead`, which will need to write through this same
-/// projection once it is written (see the module docs); nothing in this file
-/// calls it yet.
-#[allow(dead_code)]
+/// The write-side counterpart of [`fulu_state_ref`], for code that edits
+/// fulu-only fields (`proposer_lookahead`, the payload header) and must refuse
+/// any other fork by name rather than panic.
 pub(crate) fn fulu_state<'a>(
     state: &'a mut BeaconState,
     function: &'static str,
