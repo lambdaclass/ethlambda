@@ -270,6 +270,8 @@ mod tests {
     use libssz::{SszDecode as _, SszEncode as _};
 
     use super::*;
+    use crate::beacon::containers::deneb::ExecutionPayload;
+    use crate::beacon::primitives::HashTreeRoot as _;
 
     /// A vendored builder-specs example file (see the fixtures' README).
     macro_rules! example {
@@ -292,12 +294,13 @@ mod tests {
     fn the_registration_example_decodes_from_both_encodings() {
         let ssz = example!("bellatrix/signed_validator_registrations.ssz");
         let from_ssz = SignedValidatorRegistrations::from_ssz_bytes(ssz).unwrap();
-        let from_json: Vec<SignedValidatorRegistrationV1> = serde_json::from_value(example_value(
-            example!("bellatrix/signed_validator_registrations.json"),
-        ))
-        .unwrap();
+        let value = example_value(example!("bellatrix/signed_validator_registrations.json"));
+        let from_json: Vec<SignedValidatorRegistrationV1> =
+            serde_json::from_value(value.clone()).unwrap();
 
         assert_eq!(from_ssz.to_vec(), from_json);
+        // What this node would send a relay.
+        assert_eq!(serde_json::to_value(from_ssz.to_vec()).unwrap(), value);
         assert_eq!(from_ssz.to_ssz(), ssz.to_vec());
         assert_eq!(from_json[0].message.gas_limit, 100);
         assert_eq!(from_json[0].message.timestamp, 100);
@@ -312,30 +315,17 @@ mod tests {
         let from_json: SignedBuilderBid = serde_json::from_value(value["data"].clone()).unwrap();
 
         assert_eq!(from_ssz, from_json);
+        assert_eq!(serde_json::to_value(&from_ssz).unwrap(), value["data"]);
         assert_eq!(from_ssz.to_ssz(), ssz.to_vec());
         assert_eq!(from_json.message.value, Uint256::from(1u64));
         assert_eq!(from_json.message.blob_kzg_commitments.len(), 1);
     }
 
-    use crate::beacon::containers::bellatrix::Transaction;
-    use crate::beacon::containers::deneb::ExecutionPayload;
-    use crate::beacon::primitives::{Bytes32, ExecutionBlockHash, HashTreeRoot as _, Root};
-
-    /// A block whose payload has a transaction and a non-zero hash, so its
-    /// header's roots are not the empty ones.
+    /// A block with every list populated. Empty lists with equal limits share
+    /// a root, so a body with empty ones would not notice two of its fields
+    /// swapping places.
     fn full_block() -> electra::BeaconBlock {
-        let transaction: Transaction = vec![1u8, 2, 3].try_into().unwrap();
-        let mut body = electra::BeaconBlockBody::empty();
-        body.graffiti = Bytes32::repeat_byte(7);
-        body.execution_payload.block_hash = ExecutionBlockHash::repeat_byte(0xab);
-        body.execution_payload.transactions = vec![transaction].try_into().unwrap();
-        electra::BeaconBlock {
-            slot: 5,
-            proposer_index: 3,
-            parent_root: Root::repeat_byte(1),
-            state_root: Root::repeat_byte(2),
-            body,
-        }
+        crate::beacon::containers::json_tests::electra_block().message
     }
 
     #[test]
@@ -366,12 +356,11 @@ mod tests {
     fn the_blinded_block_example_decodes_from_both_encodings() {
         let ssz = example!("fulu/signed_blinded_beacon_block.ssz");
         let from_ssz = SignedBlindedBeaconBlock::from_ssz_bytes(ssz).unwrap();
-        let from_json: SignedBlindedBeaconBlock = serde_json::from_value(example_value(example!(
-            "fulu/signed_blinded_beacon_block.json"
-        )))
-        .unwrap();
+        let value = example_value(example!("fulu/signed_blinded_beacon_block.json"));
+        let from_json: SignedBlindedBeaconBlock = serde_json::from_value(value.clone()).unwrap();
 
         assert_eq!(from_ssz, from_json);
+        assert_eq!(serde_json::to_value(&from_ssz).unwrap(), value);
         assert_eq!(from_ssz.to_ssz(), ssz.to_vec());
     }
 }

@@ -188,7 +188,7 @@ fn electra_requests() -> electra::ExecutionRequests {
     }
 }
 
-fn electra_block() -> electra::SignedBeaconBlock {
+pub(crate) fn electra_block() -> electra::SignedBeaconBlock {
     let mut body = electra::BeaconBlockBody::empty();
     body.randao_reveal = signature(1);
     body.graffiti = [9; 32].into();
