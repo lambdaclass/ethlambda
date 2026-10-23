@@ -291,7 +291,7 @@ async fn block_production_without_an_execution_client_is_retryable() {
 /// exactly the requested attributes, which is all a real one's payload has to
 /// agree with for the block to verify. Answers both generations: V3/V5 for
 /// fulu and V4/V6 (`PayloadAttributesV4`, `ExecutionPayloadV4`) for gloas.
-async fn fake_execution_client() -> ethlambda_engine::EngineClient {
+pub(super) async fn fake_execution_client() -> ethlambda_engine::EngineClient {
     fake_execution_client_with_blob(None).await
 }
 
