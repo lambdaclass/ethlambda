@@ -283,9 +283,10 @@ mod tests {
     /// as a test fixture (mainnet's is, and `beacon::tests` checks mainnet's
     /// constants against it). What pins them is a digest someone else computed
     /// from it: each expected value below is the `eth2` entry of a bootnode
-    /// ENR in the network's own `bootstrap_nodes.yaml`, published while that
-    /// fork was current. The digest mixes the fork version with the root, so
-    /// a wrong root or a wrong fork version fails here.
+    /// ENR in the network's own `bootstrap_nodes.yaml` (or an earlier revision
+    /// of it), published while that fork was current. The digest mixes the
+    /// fork version with the root, so a wrong root or a wrong fork version
+    /// fails here.
     #[test]
     fn the_genesis_roots_reproduce_published_digests() {
         // Sepolia's last listed bootnode, signed during bellatrix, before
@@ -309,12 +310,14 @@ mod tests {
             [0xd2, 0xf1, 0x99, 0x7f]
         );
 
-        // Platåberget's bootnodes come from both sides of its gloas fork.
-        // Those signed before it name gloas as their next fork, at its
-        // `GLOAS_FORK_EPOCH`; genesis was fulu, so the digest also mixes in
-        // the blob schedule's first entry. Those signed after it repeat
-        // gloas's version with FAR_FUTURE_EPOCH, so they pin the gloas fork
-        // version as well.
+        // Platåberget's fulu digest is not in the embedded file anymore:
+        // upstream re-signed every bootnode after the gloas fork (in
+        // `bump erigon`, 2026-10-09). It comes from the revision before that
+        // (`add new buildoors`, 2026-08-26), whose ENRs signed before the fork
+        // name gloas as their next fork, at its `GLOAS_FORK_EPOCH`; genesis
+        // was fulu, so the digest also mixes in the blob schedule's first
+        // entry. Every current ENR repeats gloas's version with
+        // FAR_FUTURE_EPOCH, so it pins the gloas fork version as well.
         let plataberget = BuiltInNetwork::Plataberget.resolve().unwrap();
         let root = plataberget.genesis.genesis_validators_root;
         assert_eq!(
