@@ -5837,7 +5837,7 @@ pub fn on_attester_slashing(store: &mut Store, attester_slashing: &AttesterSlash
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use ethlambda_storage::backend::InMemoryBackend;
 
     use super::*;
@@ -5851,7 +5851,7 @@ mod tests {
     /// A store backed by a fresh in-memory backend, with every checkpoint at
     /// its default (genesis) value and no anchor block or state written.
     /// Tests populate only what the function under test actually reads.
-    fn empty_store() -> Store {
+    pub(crate) fn empty_store() -> Store {
         store_anchored_at(Root::ZERO)
     }
 
@@ -5906,7 +5906,7 @@ mod tests {
     /// A signed block with an empty body and a zero signature, for tests that
     /// only care about `slot` and `parent_root`. Phase0-shaped since nothing
     /// under test here reads anything fork-specific.
-    fn block(slot: Slot, parent_root: Root) -> SignedBeaconBlock {
+    pub(crate) fn block(slot: Slot, parent_root: Root) -> SignedBeaconBlock {
         SignedBeaconBlock::Phase0(phase0::SignedBeaconBlock {
             message: phase0::BeaconBlock {
                 slot,

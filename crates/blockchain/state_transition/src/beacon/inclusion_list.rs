@@ -145,9 +145,31 @@ pub fn transactions_size(inclusion_list: &InclusionList) -> u64 {
 /// head is `head_root`: `get_shuffling_dependent_root(store, head_root,
 /// epoch(slot))`. What a committee member signs over, and the key a proposer
 /// or builder reads the previous slot's lists under.
+///
+/// The walk continues past the live-chain index through the stored blocks.
+/// The index starts at the finalized block, while the lists of an epoch's last
+/// slot depend on the block just below it once the previous epoch finalizes at
+/// the boundary, so the index walk alone answered with the finalized block and
+/// every epoch's first slot read no lists. Stored blocks are never pruned, so
+/// they can finish the walk. A step onto a root the store does not hold (a
+/// checkpoint anchor's parent) ends it there, which is the true ancestor when
+/// the dependent slot is the one just below the anchor.
 pub fn inclusion_list_dependent_root(store: &Store, head_root: Root, slot: Slot) -> Root {
+    let epoch = compute_epoch_at_slot(slot);
+    let dependent_slot = compute_shuffling_dependent_slot(epoch);
     let index = store.block_index();
-    get_shuffling_dependent_root(&index, head_root, compute_epoch_at_slot(slot))
+    let mut root = get_shuffling_dependent_root(&index, head_root, epoch);
+    loop {
+        // The index first: `block_entry` decodes the whole block.
+        let entry = index
+            .get(&root)
+            .copied()
+            .or_else(|| store.block_entry(&root));
+        match entry {
+            Some((block_slot, parent_root)) if block_slot > dependent_slot => root = parent_root,
+            _ => return root,
+        }
+    }
 }
 
 /// A state that answers `get_inclusion_list_committee` for a list at `slot`
@@ -325,6 +347,7 @@ pub fn payload_inclusion_list_transactions(
 mod tests {
     use super::*;
     use crate::beacon::ForkName;
+    use crate::beacon::fork_choice::tests::{block, empty_store};
 
     /// consensus-specs #5721: a list in the Heze fork epoch is signed under
     /// Heze's version even though the verifier's state is still Gloas.
@@ -350,5 +373,68 @@ mod tests {
             expect(ForkName::Heze)
         );
         assert_ne!(expect(ForkName::Gloas), expect(ForkName::Heze));
+    }
+
+    /// The slot finality prunes the live chain to, and the last slot of the
+    /// epoch two past it, whose dependent slot is the one just below it.
+    const FINALIZED: Slot = 128;
+    const LAST_SLOT: Slot = 191;
+
+    /// A store holding one block per `slots` entry, each the parent of the
+    /// next, written the way fork choice writes them (`BlockHeaders` and
+    /// `LiveChain` both get a row). Returns the roots in the order given.
+    fn chain_store(slots: &[Slot]) -> (Store, Vec<Root>) {
+        let mut store = empty_store();
+        let mut parent = Root::ZERO;
+        let mut roots = Vec::new();
+        for (position, &slot) in slots.iter().enumerate() {
+            let signed = block(slot, parent);
+            let root = Root::repeat_byte(position as u8 + 1);
+            store
+                .insert_signed_block(root, signed)
+                .expect("insert block");
+            roots.push(root);
+            parent = root;
+        }
+        (store, roots)
+    }
+
+    #[test]
+    fn the_dependent_root_below_a_pruned_live_chain_is_the_real_ancestor() {
+        let (mut store, roots) = chain_store(&[0, 100, 127, 128, 150, 191]);
+        assert_eq!(
+            compute_shuffling_dependent_slot(compute_epoch_at_slot(LAST_SLOT)),
+            FINALIZED - 1
+        );
+        store.prune_live_chain(FINALIZED).expect("prune");
+
+        let dependent = inclusion_list_dependent_root(&store, roots[5], LAST_SLOT);
+
+        assert_eq!(dependent, roots[2], "the block at the dependent slot");
+    }
+
+    #[test]
+    fn a_skipped_dependent_slot_resolves_to_the_block_before_it_past_the_prune() {
+        let (mut store, roots) = chain_store(&[0, 100, 120, 128, 150, 191]);
+        store.prune_live_chain(FINALIZED).expect("prune");
+
+        let dependent = inclusion_list_dependent_root(&store, roots[5], LAST_SLOT);
+
+        assert_eq!(dependent, roots[2], "the latest block at or below the slot");
+    }
+
+    #[test]
+    fn an_unpruned_live_chain_answers_as_the_index_walk_does() {
+        let (store, roots) = chain_store(&[0, 100, 127, 128, 150, 191]);
+        let index = store.block_index();
+        let epoch = compute_epoch_at_slot(LAST_SLOT);
+
+        let dependent = inclusion_list_dependent_root(&store, roots[5], LAST_SLOT);
+
+        assert_eq!(dependent, roots[2]);
+        assert_eq!(
+            dependent,
+            get_shuffling_dependent_root(&index, roots[5], epoch)
+        );
     }
 }
