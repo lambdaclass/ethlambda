@@ -54,7 +54,8 @@ pub struct ValidatorRegistrationV1 {
     pub pubkey: BlsPubkey,
 }
 
-/// A [`ValidatorRegistrationV1`] signed by its validator under [`DOMAIN_APPLICATION_BUILDER`](crate::beacon::constants::DOMAIN_APPLICATION_BUILDER).
+/// A [`ValidatorRegistrationV1`] signed by its validator under
+/// [`DOMAIN_APPLICATION_BUILDER`](crate::beacon::constants::DOMAIN_APPLICATION_BUILDER).
 #[derive(
     Debug,
     Clone,
@@ -106,7 +107,8 @@ pub struct BuilderBid {
     pub pubkey: BlsPubkey,
 }
 
-/// A [`BuilderBid`] signed by its `pubkey` under [`DOMAIN_APPLICATION_BUILDER`](crate::beacon::constants::DOMAIN_APPLICATION_BUILDER).
+/// A [`BuilderBid`] signed by its `pubkey` under
+/// [`DOMAIN_APPLICATION_BUILDER`](crate::beacon::constants::DOMAIN_APPLICATION_BUILDER).
 #[derive(
     Debug,
     Clone,
@@ -253,7 +255,8 @@ impl From<electra::BeaconBlock> for BlindedBeaconBlock {
     }
 }
 
-/// A [`BlindedBeaconBlock`] signed by its proposer under the full block's domain, `DOMAIN_BEACON_PROPOSER`, since the two share a root.
+/// A [`BlindedBeaconBlock`] signed by its proposer under the full block's
+/// domain, `DOMAIN_BEACON_PROPOSER`, since the two share a root.
 #[derive(
     Debug,
     Clone,
