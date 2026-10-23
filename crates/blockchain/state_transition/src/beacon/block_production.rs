@@ -514,7 +514,21 @@ pub fn assemble_block(
     config: &Config,
     options: stf::block::BlockProcessingOptions,
 ) -> Result<BeaconBlock> {
-    let body = BeaconBlockBody {
+    let body = full_body(state, inputs)?;
+    let mut block = unsigned_block(state, body)?;
+    let mut post = post_state(state, &block, config, options)?;
+    // Fold the block's writes into their trees first, so the root is computed
+    // on (and cached in) the state's own nodes rather than a throwaway copy,
+    // as `state_transition` does before it checks a block's state root.
+    post.apply_pending_mutations();
+    block.state_root = post.hash_tree_root();
+    Ok(block)
+}
+
+/// The body for `inputs`, voting the state's own `eth1_data` and carrying no
+/// deposits; see [`assemble_block`].
+fn full_body(state: &BeaconState, inputs: BlockInputs) -> Result<BeaconBlockBody> {
+    Ok(BeaconBlockBody {
         randao_reveal: inputs.randao_reveal,
         eth1_data: state.eth1_data().clone(),
         graffiti: inputs.graffiti,
@@ -554,8 +568,13 @@ pub fn assemble_block(
             .map_err(|_| Error::SpecAssert("len(blob_kzg_commitments) within bound"))?,
         execution_requests: inputs.execution_requests,
         ..BeaconBlockBody::empty()
-    };
-    let mut block = BeaconBlock {
+    })
+}
+
+/// `body` framed as the block for the slot `state` has been advanced to, its
+/// state root still zero.
+fn unsigned_block(state: &BeaconState, body: BeaconBlockBody) -> Result<BeaconBlock> {
+    Ok(BeaconBlock {
         slot: state.slot(),
         proposer_index: get_beacon_proposer_index(state)?,
         // `process_slots` filled the header's state root on the way out of
@@ -563,8 +582,19 @@ pub fn assemble_block(
         parent_root: state.latest_block_header().hash_tree_root(),
         state_root: Root::ZERO,
         body,
-    };
+    })
+}
 
+/// A copy of `state` with `block` applied by `process_block`, under an
+/// execution engine that accepts its payload. Pending mutations are left
+/// unapplied, so the caller can still edit the state before computing its
+/// root.
+fn post_state(
+    state: &BeaconState,
+    block: &BeaconBlock,
+    config: &Config,
+    options: stf::block::BlockProcessingOptions,
+) -> Result<BeaconState> {
     let signed = electra::SignedBeaconBlock {
         message: block.clone(),
         signature: BlsSignature::default(),
@@ -594,12 +624,7 @@ pub fn assemble_block(
         &ActiveBalanceCache::default(),
         options,
     )?;
-    // Fold the block's writes into their trees first, so the root is computed
-    // on (and cached in) the state's own nodes rather than a throwaway copy,
-    // as `state_transition` does before it checks a block's state root.
-    post.apply_pending_mutations();
-    block.state_root = post.hash_tree_root();
-    Ok(block)
+    Ok(post)
 }
 
 #[cfg(test)]
