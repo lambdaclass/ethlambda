@@ -20,7 +20,10 @@
 
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 
-use crate::beacon::primitives::{Epoch, ExecutionBlockHash, Root, Slot, Uint256};
+use crate::beacon::containers::Checkpoint;
+use crate::beacon::primitives::{
+    Epoch, ExecutionBlockHash, Gwei, Root, Slot, Uint256, ValidatorIndex,
+};
 
 /// One validator's most recent attestation: the epoch it targeted, and the
 /// block it attested to (the LMD GHOST vote).
@@ -206,11 +209,114 @@ pub struct PayloadStatusV1 {
     pub validation_error: Option<String>,
 }
 
+/// The justified checkpoint state's balances, flattened for the fork-choice
+/// vote loop: `store.checkpoint_states[checkpoint]` as `get_weight` and
+/// `get_proposer_score` read it.
+///
+/// A tree descent per vote (`state.validator(i)`) is an order of magnitude
+/// dearer than an array read, and the loop runs once per `get_head` over every
+/// voter. This is built once per justified checkpoint and keyed by it, so a
+/// reader compares [`Self::checkpoint`] with the store's current one and
+/// rebuilds on a mismatch, with no hook on the code that moves the checkpoint.
+///
+/// Held in the store, hence here rather than in `ethlambda-state-transition`;
+/// the builder lives there, next to the state accessors.
+#[derive(Debug, PartialEq, Eq)]
+pub struct JustifiedBalances {
+    checkpoint: Checkpoint,
+    /// Zero unless the validator is active at `checkpoint.epoch` and unslashed,
+    /// the two conditions under which a vote weighs anything.
+    balances: Box<[Gwei]>,
+    /// `get_total_active_balance` of the checkpoint state: unlike `balances`
+    /// it counts slashed validators, and it is floored at one increment.
+    total_active_balance: Gwei,
+    /// Every validator's raw effective balance in `EFFECTIVE_BALANCE_INCREMENT`
+    /// units, whether or not it is active or slashed. Exact, since an
+    /// effective balance is always a whole number of increments and the
+    /// largest (`MAX_EFFECTIVE_BALANCE_ELECTRA`) is far below `u16::MAX`
+    /// increments; two bytes a validator instead of eight.
+    ///
+    /// `balances` zeroes a slashed validator, so it cannot answer the one
+    /// question that needs the raw figure: `is_head_weak` adds back the
+    /// effective balance of every equivocating validator in the head slot's
+    /// committees, and an equivocator is often slashed.
+    effective_increments: Box<[u16]>,
+}
+
+impl JustifiedBalances {
+    /// Wraps already-computed values; see the field docs for what they mean.
+    pub fn new(
+        checkpoint: Checkpoint,
+        balances: Box<[Gwei]>,
+        total_active_balance: Gwei,
+        effective_increments: Box<[u16]>,
+    ) -> Self {
+        Self {
+            checkpoint,
+            balances,
+            total_active_balance,
+            effective_increments,
+        }
+    }
+
+    /// `index`'s raw effective balance at the checkpoint, active and unslashed
+    /// or not; zero past the end, since that validator did not exist then.
+    pub fn effective_balance(&self, index: ValidatorIndex) -> Gwei {
+        usize::try_from(index)
+            .ok()
+            .and_then(|index| self.effective_increments.get(index))
+            .map_or(0, |&increments| {
+                Gwei::from(increments) * crate::beacon::preset::EFFECTIVE_BALANCE_INCREMENT
+            })
+    }
+
+    /// The checkpoint these balances were derived from.
+    pub fn checkpoint(&self) -> Checkpoint {
+        self.checkpoint
+    }
+
+    /// The weight of `index`'s vote: zero when inactive or slashed, and also
+    /// past the end, since that validator did not exist at the checkpoint.
+    pub fn get(&self, index: ValidatorIndex) -> Gwei {
+        usize::try_from(index)
+            .ok()
+            .and_then(|index| self.balances.get(index))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// The checkpoint state's total active balance, as the specification's
+    /// `get_total_active_balance` defines it.
+    pub fn total_active_balance(&self) -> Gwei {
+        self.total_active_balance
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use libssz::{SszDecode as _, SszEncode as _};
 
     use super::*;
+
+    #[test]
+    fn justified_balances_read_zero_past_the_registry() {
+        let balances = JustifiedBalances::new(
+            Checkpoint::default(),
+            vec![7, 0, 9].into(),
+            16,
+            vec![1, 2, 3].into(),
+        );
+        assert_eq!(balances.get(0), 7);
+        assert_eq!(balances.get(1), 0);
+        assert_eq!(balances.get(2), 9);
+        assert_eq!(balances.get(3), 0);
+        assert_eq!(balances.get(u64::MAX), 0);
+        assert_eq!(balances.total_active_balance(), 16);
+        let increment = crate::beacon::preset::EFFECTIVE_BALANCE_INCREMENT;
+        assert_eq!(balances.effective_balance(1), 2 * increment);
+        assert_eq!(balances.effective_balance(3), 0);
+        assert_eq!(balances.effective_balance(u64::MAX), 0);
+    }
 
     #[test]
     fn a_pow_block_round_trips_through_ssz() {
