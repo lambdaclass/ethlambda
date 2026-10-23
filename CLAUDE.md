@@ -669,6 +669,12 @@ existing once per chain.
     validator: helpers that build the active-index `Vec` and then read each
     index back were the largest cost left in the import profile
     (`docs/beacon_stf.md`, "Registry and balances").
+- **`beacon::builder` holds builder-specs containers** (`ValidatorRegistrationV1`,
+  `BuilderBid`, `BlindedBeaconBlock`), not consensus ones: the MEV-Boost relay
+  flow's wire types. `BlindedBeaconBlock`'s root equals the full block's, which
+  is what lets a validator sign a block whose payload it never sees. Electra and
+  fulu shapes only. Tests decode builder-specs' own examples, vendored under
+  `crates/common/types/tests/fixtures/builder_specs/`.
 
 ## Beacon Chain STF (`crates/blockchain/state_transition/src/beacon/`)
 
@@ -872,6 +878,13 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   that is neither parseable nor listed, so a new fork forces a decision.
 - A fixture case with no `post` state asserts the input must be **rejected**. That
   rule lives in `check_transition`; do not add a runner that ignores it.
+- **`assemble_blinded_block` does not use a blinded STF.** It runs `process_block`
+  on a stand-in payload built from the builder's header, then patches the two
+  post-state fields that depend on the payload itself
+  (`latest_execution_payload_header`, `latest_block_header.body_root`). Fulu
+  only, since it is the last fork with blinded blocks. Read the function's doc
+  before touching fulu's `process_block`;
+  `blinded_and_full_blocks_reach_the_same_state_root` fails on any drift.
 
 ## Configuration Files
 
