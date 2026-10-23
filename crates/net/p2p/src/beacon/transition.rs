@@ -78,11 +78,8 @@ pub(crate) fn delay_until_epoch(
     epoch: Epoch,
     now_ms: u64,
 ) -> Duration {
-    // An epoch this far out is no schedule's; clamped so the schedule's
-    // multiplication cannot overflow.
-    const MAX_EPOCH: u64 = 1 << 35;
     let genesis_ms = genesis_time.saturating_mul(1000);
-    let start_slot = epoch.min(MAX_EPOCH) * preset::SLOTS_PER_EPOCH;
+    let start_slot = epoch.saturating_mul(preset::SLOTS_PER_EPOCH);
     let start_ms = config.time_at_slot_ms(genesis_ms, start_slot);
     Duration::from_millis(start_ms.saturating_sub(now_ms))
 }

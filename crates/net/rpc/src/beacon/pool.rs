@@ -174,9 +174,7 @@ fn validate(
 
     // [IGNORE] Not from the future, and from the current or previous epoch,
     // both with MAXIMUM_GOSSIP_CLOCK_DISPARITY of allowance (deneb's form).
-    // The slot is a validator client's, so it is clamped before it reaches the
-    // schedule's multiplication; a clamped slot is still far in the future.
-    let slot_start_ms = config.time_at_slot_ms(config.genesis_time_ms(), data.slot.min(1 << 40));
+    let slot_start_ms = config.time_at_slot_ms(config.genesis_time_ms(), data.slot);
     if slot_start_ms > now_ms + MAXIMUM_GOSSIP_CLOCK_DISPARITY {
         return Err("attestation slot is in the future");
     }

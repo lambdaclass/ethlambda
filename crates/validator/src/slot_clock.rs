@@ -126,13 +126,7 @@ impl SlotClock {
 
     /// When `slot` begins.
     pub fn start_of(&self, slot: Slot) -> SystemTime {
-        // Clamped rather than wrapping: a slot number large enough to
-        // overflow the schedule's multiplication is centuries away at any real
-        // slot duration, and a clock that wrapped would put it in the past.
-        const MAX_SLOT: u64 = 1 << 40;
-        let start_ms = self
-            .config
-            .time_at_slot_ms(self.genesis_time_ms(), slot.min(MAX_SLOT));
+        let start_ms = self.config.time_at_slot_ms(self.genesis_time_ms(), slot);
         UNIX_EPOCH + Duration::from_millis(start_ms)
     }
 

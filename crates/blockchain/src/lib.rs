@@ -836,15 +836,6 @@ pub(crate) fn data_column_retention_start_epoch(config: &Config, current_epoch: 
     window_start.max(config.fulu_fork_epoch)
 }
 
-/// Unix milliseconds at the start of beacon `slot` on the EIP-8198 schedule.
-///
-/// The slot is clamped so a peer-supplied far-future slot saturates instead of
-/// overflowing the schedule's multiplication; no real slot is near the clamp.
-fn beacon_slot_start_ms(config: &Config, slot: u64) -> u64 {
-    const MAX_SLOT: u64 = 1 << 40;
-    config.time_at_slot_ms(config.genesis_time_ms(), slot.min(MAX_SLOT))
-}
-
 fn data_availability_for(
     store: &Store,
     block: &SignedBeaconBlock,
@@ -2298,8 +2289,7 @@ impl BlockChainServer {
     /// Beacon walks the EIP-8198 schedule, since the slot duration changes at
     /// Heze and `slot * duration` is wrong past it. Lean has one duration and
     /// keeps its saturating grid arithmetic, which the arrival metrics rely on
-    /// for slots a peer made up. A beacon slot is clamped well below overflow
-    /// for the same reason.
+    /// for slots a peer made up. The beacon time API saturates the same way.
     fn slot_start_ms(&self, slot: u64) -> u64 {
         let config = self.store.config();
         match self.store.chain() {
@@ -2309,7 +2299,7 @@ impl BlockChainServer {
                     SlotInterval::BlockPublication.to_ms_since_genesis(slot, &time_config),
                 )
             }
-            Chain::Beacon => beacon_slot_start_ms(&config, slot),
+            Chain::Beacon => config.time_at_slot_ms(config.genesis_time_ms(), slot),
         }
     }
 
@@ -3714,8 +3704,9 @@ impl BlockChainServer {
         }
         let config = self.store.config();
         let current_slot = fork_choice::get_current_slot(&self.store, &config);
-        let slot_end_ms =
-            beacon_slot_start_ms(&config, current_slot.saturating_add(1)).saturating_sub(1);
+        let slot_end_ms = config
+            .time_at_slot_ms(config.genesis_time_ms(), current_slot.saturating_add(1))
+            .saturating_sub(1);
         let time_ms = event_ms.min(slot_end_ms);
         let store_time_ms = self.store.time_ms().expect("store time exists");
         if time_ms > store_time_ms {
@@ -4471,16 +4462,18 @@ mod tests {
     fn a_beacon_slot_starts_where_the_schedule_puts_it() {
         let config = quick_slots_config();
         let genesis_ms = config.genesis_time_ms();
-        assert_eq!(beacon_slot_start_ms(&config, 0), genesis_ms);
-        assert_eq!(beacon_slot_start_ms(&config, 63), genesis_ms + 63 * 12_000);
-        assert_eq!(beacon_slot_start_ms(&config, 64), genesis_ms + 64 * 12_000);
+        let slot_start_ms =
+            |config: &Config, slot| config.time_at_slot_ms(config.genesis_time_ms(), slot);
+        assert_eq!(slot_start_ms(&config, 0), genesis_ms);
+        assert_eq!(slot_start_ms(&config, 63), genesis_ms + 63 * 12_000);
+        assert_eq!(slot_start_ms(&config, 64), genesis_ms + 64 * 12_000);
         assert_eq!(
-            beacon_slot_start_ms(&config, 66),
+            slot_start_ms(&config, 66),
             genesis_ms + 64 * 12_000 + 2 * 9_000
         );
-        // A made-up slot saturates below overflow instead of panicking.
-        let far = beacon_slot_start_ms(&config, u64::MAX);
-        assert!(far > beacon_slot_start_ms(&config, 1 << 30));
+        // A made-up slot saturates instead of panicking.
+        let far = slot_start_ms(&config, u64::MAX);
+        assert!(far > slot_start_ms(&config, 1 << 30));
     }
 
     #[test]
