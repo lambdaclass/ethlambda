@@ -862,7 +862,9 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   and a block at slot N packs only `(N-1, parent_root)`, replaced by the empty
   aggregate when `verified_sync_aggregate` fails (see `docs/spec_deviations.md`).
   `SlotClock` picks the
-  offsets by each slot's own fork, and `/eth/v1/config/spec` supplies them. It
+  offsets by each slot's own fork, and `/eth/v1/config/spec` supplies them. With
+  `--builder-proposals`, pre-gloas slots register validators with the node's builder
+  and may sign a blinded block, published to the producing node only. It
   still keeps no slashing-protection record; PTC votes have an in-memory
   `(validator, slot)` dedup only, and envelopes are unguarded.
   `get_head_node` is one bottom-up walk for every fork, with

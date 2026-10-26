@@ -741,6 +741,10 @@ and absent is not the same as zero.
 | `ethlambda_validator_aggregates_published_total` | Counter | Aggregates accepted by a beacon node. Bursty rather than steady: a validator is selected a few times a day, so hours at zero are normal for a small deployment |
 | `ethlambda_validator_aggregation_failures_total` | Counter | Aggregation duties that ended in no published aggregate, including ones abandoned for overrunning the slot |
 | `ethlambda_validator_fee_recipient_mismatches_total` | Counter | Blocks paying execution rewards to an address this client did not request. Should read zero forever; a non-zero value means every proposal is paying somewhere else |
+| `ethlambda_validator_builder_registrations_sent_total` | Counter | Builder registrations a beacon node accepted (`--builder-proposals`) |
+| `ethlambda_validator_builder_registration_failures_total` | Counter | Registration batches no beacon node accepted. A missed registration costs at most a builder block, never a duty |
+| `ethlambda_validator_blinded_blocks_proposed_total` | Counter | Blinded blocks a beacon node handed to its builder. A subset of `blocks_proposed_total` |
+| `ethlambda_validator_blinded_blocks_unconfirmed_total` | Counter | Blinded blocks the beacon node did not confirm (a 5xx or no answer), which the relay may still have published. Not retried, since a second block for the slot would be an equivocation |
 | `ethlambda_validator_block_publication_delay_seconds` | Histogram | Slot start to block accepted. Its buckets are tighter than the attestation histogram's, because a block is due at the slot boundary rather than a third of the way in |
 | `ethlambda_validator_beacon_node_available` | Gauge | 1 when a beacon node answered the last duty refresh or attestation |
 | `ethlambda_validator_signing_duration_seconds` | Histogram | Time to sign one slot's batch, store read lock included |
