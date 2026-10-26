@@ -17,6 +17,15 @@ on:
         description: "ethlambda image to test (default: ghcr.io/lambdaclass/ethlambda:unstable)"
         required: false
         type: string
+      battery:
+        description: "Which battery to run"
+        required: false
+        type: choice
+        options:
+          - assertoor
+          - commit-boost
+          - both
+        default: assertoor
 
 permissions:
   contents: read
@@ -34,6 +43,12 @@ env:
   ETHEREUM_PACKAGE_REPO: https://github.com/lambdaclass/ethereum-package.git
   ETHEREUM_PACKAGE_REF: 67cb0e02dc0bd49ec9461cbf2ef7ac4a3232755f
   ENCLAVE: ethlambda-assertoor
+  # The Commit-Boost check needs the fork's `--builder` / `--builder-proposals`
+  # wiring for ethlambda, which the commit above lacks. It has its own pin so
+  # the base battery stays where it is. This commit is on the fork branch
+  # feat/ethlambda-builder-flags; see the README before changing it.
+  COMMIT_BOOST_PACKAGE_REF: 37fe57ea309b954361c0f33ac6efc570313ffaf6
+  COMMIT_BOOST_ENCLAVE: ethlambda-commit-boost
 
 jobs:
   image:
@@ -79,6 +94,7 @@ jobs:
   assertoor:
     name: Assertoor
     needs: image
+    if: github.event_name != 'workflow_dispatch' || inputs.battery != 'commit-boost'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     outputs:
@@ -167,6 +183,83 @@ jobs:
       - name: Remove the enclave
         if: always()
         run: kurtosis enclave rm -f "$ENCLAVE" || true
+
+  # Dispatch-only for now: main's image does not have the builder flags until
+  # the builder PR stack (#694 to #705) lands. Once it is on main, drop the
+  # event condition so the check also runs on push and on pull requests.
+  commit-boost:
+    name: Commit-Boost
+    needs: image
+    if: github.event_name == 'workflow_dispatch' && inputs.battery != 'assertoor'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Free up disk space
+        uses: ./.github/actions/free-disk
+
+      - name: Install kurtosis
+        run: |
+          echo "deb [trusted=yes] https://sdk.kurtosis.com/kurtosis-cli-release-artifacts/ /" \
+            | sudo tee /etc/apt/sources.list.d/kurtosis.list
+          sudo apt-get update
+          sudo apt-get install -y "kurtosis-cli=$KURTOSIS_VERSION"
+          kurtosis analytics disable
+          kurtosis version
+
+      # A clone for the same reason as in the assertoor job.
+      - name: Fetch ethereum-package at the pinned commit
+        run: |
+          git init "$RUNNER_TEMP/ethereum-package"
+          cd "$RUNNER_TEMP/ethereum-package"
+          git fetch --depth 1 "$ETHEREUM_PACKAGE_REPO" "$COMMIT_BOOST_PACKAGE_REF"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$COMMIT_BOOST_PACKAGE_REF"
+
+      - name: Point the args at the image under test
+        env:
+          IMAGE: ${{ needs.image.outputs.image }}
+        run: |
+          cp tooling/kurtosis-assertoor/commit_boost_params.yaml "$RUNNER_TEMP/args.yaml"
+          yq -i '
+            (.participants[] | select(.cl_type == "ethlambda") | .cl_image) = strenv(IMAGE) |
+            (.participants[] | select(.vc_type == "ethlambda") | .vc_image) = strenv(IMAGE)
+          ' "$RUNNER_TEMP/args.yaml"
+          cat "$RUNNER_TEMP/args.yaml"
+
+      - name: Start the devnet
+        run: |
+          kurtosis run "$RUNNER_TEMP/ethereum-package" \
+            --enclave "$COMMIT_BOOST_ENCLAVE" --args-file "$RUNNER_TEMP/args.yaml" \
+            | tee "$RUNNER_TEMP/kurtosis_output.txt"
+
+      - name: Wait for builder blocks
+        run: |
+          tooling/kurtosis-assertoor/scripts/check-builder-blocks.sh \
+            "$COMMIT_BOOST_ENCLAVE" 40 "$RUNNER_TEMP/builder-results"
+
+      - name: Dump the enclave
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/dump"
+          cp "$RUNNER_TEMP/args.yaml" "$RUNNER_TEMP/dump/args.yaml"
+          cp "$RUNNER_TEMP/kurtosis_output.txt" "$RUNNER_TEMP/dump/" || true
+          cp -r "$RUNNER_TEMP/builder-results" "$RUNNER_TEMP/dump/" || true
+          cd "$RUNNER_TEMP/dump"
+          kurtosis enclave dump "$COMMIT_BOOST_ENCLAVE" || true
+
+      - name: Upload the dump and results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: commit-boost-enclave-dump-${{ github.run_id }}
+          path: ${{ runner.temp }}/dump
+          if-no-files-found: warn
+
+      - name: Remove the enclave
+        if: always()
+        run: kurtosis enclave rm -f "$COMMIT_BOOST_ENCLAVE" || true
 
   notify:
     name: Post failure to Slack
