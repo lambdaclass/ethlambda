@@ -14,9 +14,12 @@
 //! relayed but never applied to fork choice, which is what a lighthouse node
 //! with no validators does too.
 //!
-//! `sync_committee_{0..3}` and `blob_sidecar_{subnet_id}` stay absent; the
-//! first arrives with the work that reads it and the second is deneb's format
-//! for blobs, deprecated at fulu in favour of the column matrix. Both subnet
+//! `sync_committee_{0..3}` is not part of [`BeaconTopics`] either: those four
+//! subnets are joined on demand, from a validator client's subscription
+//! request, like the aggregator attestation subnets (see
+//! `beacon::sync_committee`). `blob_sidecar_{subnet_id}` stays absent: it is
+//! deneb's format for blobs, deprecated at fulu in favour of the column
+//! matrix. Both subnet
 //! families that *are* subscribed are subscribed narrowly: this node's sampling
 //! size worth of columns rather than the whole matrix, and two attestation
 //! subnets rather than all sixty-four, since widening either is what turns this
@@ -77,9 +80,14 @@ pub const DATA_COLUMN_SIDECAR_KIND: &str = "data_column_sidecar";
 /// [`DATA_COLUMN_SIDECAR_KIND`].
 pub const BEACON_ATTESTATION_KIND: &str = "beacon_attestation";
 
+/// The metric label every sync committee subnet shares. It is also the topic
+/// name the spec's gossip vectors use for the family.
+pub const SYNC_COMMITTEE_KIND: &str = "sync_committee";
+
 /// The metric label for a topic kind this node subscribes to on the beacon
 /// wire: the kind itself for a global topic, [`DATA_COLUMN_SIDECAR_KIND`] for
-/// a column subnet, [`BEACON_ATTESTATION_KIND`] for an attestation subnet.
+/// a column subnet, [`BEACON_ATTESTATION_KIND`] for an attestation subnet,
+/// [`SYNC_COMMITTEE_KIND`] for a sync committee subnet.
 /// `None` for anything else, lean kinds included, which is what tells the
 /// gossip handler a message needs no verdict.
 pub fn metric_kind(kind: &str) -> Option<&'static str> {
@@ -93,7 +101,32 @@ pub fn metric_kind(kind: &str) -> Option<&'static str> {
     if data_column_subnet(kind).is_some() {
         return Some(DATA_COLUMN_SIDECAR_KIND);
     }
+    if sync_committee_subnet(kind).is_some() {
+        return Some(SYNC_COMMITTEE_KIND);
+    }
     attestation_subnet(kind).map(|_| BEACON_ATTESTATION_KIND)
+}
+
+/// Topic family for sync committee messages, one topic per subnet.
+pub const SYNC_COMMITTEE_PREFIX: &str = "sync_committee_";
+
+/// The topic carrying one sync committee subnet.
+pub fn sync_committee_topic_name(fork_digest: ForkDigest, subnet_id: u64) -> String {
+    topic_name(fork_digest, &format!("{SYNC_COMMITTEE_PREFIX}{subnet_id}"))
+}
+
+/// The subnet a sync committee topic kind names, or `None` if the kind is not
+/// one.
+///
+/// The digit check is load-bearing: the global
+/// `sync_committee_contribution_and_proof` shares the family prefix and must
+/// not be read as a subnet.
+pub fn sync_committee_subnet(kind: &str) -> Option<u64> {
+    let suffix = kind.strip_prefix(SYNC_COMMITTEE_PREFIX)?;
+    if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    suffix.parse().ok()
 }
 
 /// Build one topic name: `/eth2/{fork_digest}/{kind}/ssz_snappy`.
@@ -571,5 +604,37 @@ mod tests {
         let topics = BeaconTopics::new(MAINNET, &[], &[12, 12, 40]);
         assert_eq!(topics.topics.len(), SUBSCRIBED_TOPIC_KINDS.len() + 2);
         assert_eq!(topics.attestation_topics.len(), 2);
+    }
+
+    #[test]
+    fn a_sync_committee_topic_is_the_family_name_and_its_subnet() {
+        assert_eq!(
+            sync_committee_topic_name(MAINNET, 2),
+            "/eth2/8c9f62fe/sync_committee_2/ssz_snappy"
+        );
+    }
+
+    #[test]
+    fn a_sync_committee_topic_reads_its_subnet_back() {
+        assert_eq!(sync_committee_subnet("sync_committee_3"), Some(3));
+        assert_eq!(sync_committee_subnet("sync_committee_"), None);
+        assert_eq!(sync_committee_subnet("sync_committee_x"), None);
+        // The contribution topic shares the prefix and is not a subnet.
+        assert_eq!(
+            sync_committee_subnet(SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF),
+            None
+        );
+        assert_eq!(sync_committee_subnet("beacon_block"), None);
+    }
+
+    #[test]
+    fn sync_committee_subnets_share_one_label() {
+        assert_eq!(metric_kind("sync_committee_0"), Some(SYNC_COMMITTEE_KIND));
+        assert_eq!(metric_kind("sync_committee_3"), Some(SYNC_COMMITTEE_KIND));
+        assert_eq!(metric_kind("sync_committee_"), None);
+        assert_eq!(
+            metric_kind(SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF),
+            Some(SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF)
+        );
     }
 }
