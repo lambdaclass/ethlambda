@@ -1500,6 +1500,7 @@ mod tests {
         let (store, _root) = crate::test_utils::beacon_store_with_config(state, config);
         let response = routes()
             .with_state(store)
+            .layer(Extension(crate::test_utils::idle_engine()))
             .oneshot(request(head_epoch, head_slot))
             .await
             .unwrap();
@@ -1598,7 +1599,12 @@ mod tests {
     async fn gloas_index(store: Store, slot: Slot) -> (StatusCode, serde_json::Value) {
         // No `committee_index`: gloas's request omits it.
         let request = get_request(format!("/eth/v1/validator/attestation_data?slot={slot}"));
-        let response = routes().with_state(store).oneshot(request).await.unwrap();
+        let response = routes()
+            .with_state(store)
+            .layer(Extension(idle_engine()))
+            .oneshot(request)
+            .await
+            .unwrap();
         let status = response.status();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         (status, serde_json::from_slice(&body).unwrap())
