@@ -307,6 +307,19 @@ pub(crate) struct MainnetOptions {
     /// `eth-clients` publishes and kurtosis mounts at `/network-configs`.
     #[arg(long, default_value = crate::network::DEFAULT_NETWORK)]
     pub(crate) network: String,
+
+    /// Base URL of a builder API endpoint, normally MEV-Boost (for example
+    /// `http://127.0.0.1:18550`) or a relay directly. Without it every block
+    /// is built locally, and `register_validator` answers 500 so a validator
+    /// client configured for a builder hears that it has none.
+    #[arg(long)]
+    pub(crate) builder: Option<String>,
+
+    /// How long block production waits for the builder's bid, in
+    /// milliseconds. Also sent to the builder as `X-Timeout-Ms`, so it can
+    /// hold its answer for as long as this node will wait.
+    #[arg(long, default_value_t = 1000, requires = "builder")]
+    pub(crate) builder_header_timeout: u64,
 }
 
 /// Flags only the lean chain takes.
@@ -1018,6 +1031,43 @@ mod tests {
             beacon.mainnet.safe_slots_to_import_optimistically,
             SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY
         );
+    }
+
+    #[test]
+    fn the_builder_is_off_by_default() {
+        let beacon = parse_beacon(beacon_args());
+
+        assert_eq!(beacon.mainnet.builder, None);
+        assert_eq!(beacon.mainnet.builder_header_timeout, 1000);
+    }
+
+    #[test]
+    fn the_builder_flags_parse() {
+        let mut args = beacon_args();
+        args.extend([
+            "--builder",
+            "http://127.0.0.1:18550",
+            "--builder-header-timeout",
+            "750",
+        ]);
+
+        let options: Options = parse_beacon(args).into();
+
+        match options.network {
+            Network::Mainnet { mainnet, .. } => {
+                assert_eq!(mainnet.builder.as_deref(), Some("http://127.0.0.1:18550"));
+                assert_eq!(mainnet.builder_header_timeout, 750);
+            }
+            other => panic!("expected the mainnet network, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_header_timeout_needs_a_builder() {
+        let mut args = beacon_args();
+        args.extend(["--builder-header-timeout", "750"]);
+
+        try_parse_from(args).expect_err("a timeout without a builder must not parse");
     }
 
     #[test]
