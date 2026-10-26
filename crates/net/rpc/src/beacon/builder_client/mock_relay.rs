@@ -54,6 +54,8 @@ struct RelayState {
     ssz_submissions: usize,
     /// Whether `status` answers 503.
     unavailable: bool,
+    /// `registerValidator` calls received, whatever their outcome.
+    registration_calls: usize,
 }
 
 /// A fixed answer to every `getHeader`.
@@ -165,6 +167,11 @@ impl MockRelay {
         self.state.lock().unwrap().ssz_submissions
     }
 
+    /// How many `registerValidator` calls arrived, whatever their outcome.
+    pub(crate) fn registration_calls(&self) -> usize {
+        self.state.lock().unwrap().registration_calls
+    }
+
     pub(crate) fn registrations(&self) -> Vec<SignedValidatorRegistrationV1> {
         self.state.lock().unwrap().registrations.clone()
     }
@@ -253,6 +260,7 @@ async fn header(
 
 async fn register(State(state): State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
     let mut state = state.lock().unwrap();
+    state.registration_calls += 1;
     // The client always registers in JSON (see `register_validators`); an
     // SSZ registration here is a regression.
     if is_ssz_request(&headers) {

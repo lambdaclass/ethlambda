@@ -32,6 +32,7 @@ pub(crate) mod node;
 pub(crate) mod operations;
 pub(crate) mod pool;
 pub(crate) mod proposal;
+pub(crate) mod registrations;
 pub(crate) mod proposer_preferences;
 pub(crate) mod ptc;
 pub(crate) mod states;
@@ -191,6 +192,7 @@ pub(crate) fn routes(version: &'static str, peer_id: String) -> Router<Store> {
         .merge(config::routes())
         .merge(node::routes(version, peer_id))
         .merge(validator::routes())
+        .merge(registrations::routes())
         .merge(pool::routes())
         .merge(operations::routes())
         .merge(proposal::routes())

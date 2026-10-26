@@ -1,6 +1,7 @@
 use axum::{Router, http::HeaderValue, http::header, response::IntoResponse, routing::get};
 use ethlambda_metrics::{
-    Histogram, HistogramVec, gather_default_metrics, register_histogram, register_histogram_vec,
+    Histogram, HistogramVec, IntCounterVec, gather_default_metrics, register_histogram,
+    register_histogram_vec, register_int_counter_vec,
 };
 use std::{sync::LazyLock, time::Duration};
 use tracing::warn;
@@ -65,4 +66,21 @@ pub(crate) async fn get_metrics() -> impl IntoResponse {
         .headers_mut()
         .insert(header::CONTENT_TYPE, content_type);
     response
+}
+
+/// Count `register_validator` entries by what became of them: forwarded to
+/// the builder, refused by it, or dropped here as an unknown or exited
+/// validator.
+pub(crate) fn inc_builder_registrations(outcome: &str, count: u64) {
+    static LEAN_BEACON_BUILDER_REGISTRATIONS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+        register_int_counter_vec!(
+            "lean_beacon_builder_registrations_total",
+            "Validator registrations received, by what became of them",
+            &["outcome"]
+        )
+        .unwrap()
+    });
+    LEAN_BEACON_BUILDER_REGISTRATIONS_TOTAL
+        .with_label_values(&[outcome])
+        .inc_by(count);
 }

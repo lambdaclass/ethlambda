@@ -274,6 +274,7 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `POST` | `/eth/v1/validator/proposer_preferences` | *(status only)* | Validate, cache and gossip `SignedProposerPreferences` (gloas; JSON or SSZ body) |
 | `POST` | `/eth/v1/beacon/states/{state_id}/builders` | JSON | The gloas builder registry, filtered by id and status |
 | `POST` | `/eth/v1/validator/prepare_beacon_proposer` | *(status only)* | Record each validator's fee recipient for block production (see below) |
+| `POST` | `/eth/v1/validator/register_validator` | none | Forwards builder registrations of active or pending validators to `--builder`, and sets their fee recipients |
 | `GET` | `/eth/v1/events` | SSE | Live stream of chain events (see below) |
 
 ### Validator endpoints
@@ -409,6 +410,15 @@ the chain actor writes, so no request waits on the actor.
   once a slot.
 - **`prepare_beacon_proposer`** records each validator's fee recipient, in
   memory (a validator client repeats the call every epoch).
+- **`register_validator`** takes a JSON array or an SSZ list of signed
+  builder registrations. Registrations of validators the head state does not
+  hold, or holds as exited, are dropped and counted
+  (`lean_beacon_builder_registrations_total`), not refused: the beacon-APIs say
+  they must not reach the builder, not that the request fails. Each kept
+  registration also sets its validator's fee recipient, so a block built
+  locally still pays the registered address. The kept ones go to `--builder` in
+  one call, skipped when none are left. A builder's 400 is passed through and
+  any other failure is a 500; with no `--builder` the answer is 500.
 - **`blocks/{slot}`** advances the head state to the slot and asks the node's
   own execution client to build on the head (`forkchoiceUpdatedV3` with
   payload attributes, then `getPayloadV5`), with the proposer's fee recipient.
