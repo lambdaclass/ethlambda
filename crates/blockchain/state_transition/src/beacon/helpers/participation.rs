@@ -134,7 +134,7 @@ fn scan(
     let mut previous_error = None;
     let mut current_error = None;
 
-    for (index, validator) in state.validators().iter().enumerate() {
+    for (index, validator) in state.iter_validators().enumerate() {
         let effective_balance = validator.effective_balance;
         let active_now = is_active_validator(validator, current_epoch);
         let active_before = is_active_validator(validator, previous_epoch);
@@ -225,7 +225,7 @@ impl EpochSummary {
     /// then is [`ParticipationTotals::current_epoch_target`] meaningful. Fails
     /// like [`ParticipationTotals::compute`].
     pub fn build(state: &BeaconState, need_current_target: bool) -> Result<Self> {
-        let count = state.validators().len();
+        let count = state.validator_count();
         let mut flags = Vec::with_capacity(count);
         let mut effective_balances = Vec::with_capacity(count);
         let totals = scan(state, need_current_target, |_, validator_flags, balance| {

@@ -19,4 +19,9 @@ pub enum EngineError {
     Rpc { code: i64, message: String },
     #[error("decoding the response: {0}")]
     Decode(String),
+    /// A caller asked about an envelope that does not belong to the block it
+    /// paired it with. Raised before any call is made, so it is no verdict on
+    /// the payload itself: the caller must not import either.
+    #[error("envelope does not match its block: {0}")]
+    EnvelopeMismatch(String),
 }
