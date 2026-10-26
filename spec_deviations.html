@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-7038f84c.js";
+            window.path_to_searchindex_js = "searchindex-8b514d79.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-34fa44cf.js"></script>
@@ -654,6 +654,68 @@ blocks.</li>
 <li>A hash of zero is “nothing to say” on either fork, so a payload whose hash is
 zero (the fixtures’ placeholder) sends no <code>forkchoiceUpdated</code>.</li>
 </ul>
+<h2 id="sync-committee-gossip-resolves-the-committee-by-the-messages-slot-and-the-domain-by-the-fork-schedule"><a class="header" href="#sync-committee-gossip-resolves-the-committee-by-the-messages-slot-and-the-domain-by-the-fork-schedule">Sync committee gossip resolves the committee by the message’s slot and the domain by the fork schedule</a></h2>
+<p><code>sync_committee_{subnet_id}</code> and <code>sync_committee_contribution_and_proof</code>
+validate against the cached head state, choosing the committee from the
+message’s slot and the signing domain from the config’s fork schedule.</p>
+<ul>
+<li><strong>Specification:</strong> <code>p2p-interface.md</code>’s <code>get_sync_subcommittee_pubkeys</code> and
+<code>validator.md</code>’s <code>compute_subnets_for_sync_committee</code> pick the committee by
+<code>state.slot + 1</code>, and <code>get_domain(state, ..)</code> takes the fork version from
+<code>state.fork</code>.</li>
+<li><strong>ethlambda:</strong> the committee is chosen by <code>message.slot + 1</code>
+(<code>current_sync_committee</code> in the head’s own period, <code>next_sync_committee</code> in
+the one after), and the domain comes from <code>Config</code>’s schedule
+(<code>helpers::sync_committee</code>). The validator client signs with the same
+domain. When the head is in the message’s period and fork the answer is the
+specification’s. When it lags across a period or fork boundary, the
+specification would reject honest messages and this does not.</li>
+<li><strong>Unanswerable cases are IGNORE:</strong> a head state that is not cached is
+<code>IGNORE</code> (<code>state_unavailable</code>), like every other topic, and a period the head
+state’s two committees cannot cover is <code>IGNORE sync_committee_unavailable</code>,
+since neither is the sender’s fault.</li>
+</ul>
+<h2 id="sync-committee-subnets-are-joined-on-request-immediately-and-advertised-in-metadata-only"><a class="header" href="#sync-committee-subnets-are-joined-on-request-immediately-and-advertised-in-metadata-only">Sync committee subnets are joined on request, immediately, and advertised in MetaData only</a></h2>
+<ul>
+<li><strong>Specification:</strong> <code>validator.md</code> (“Sync committee subnet stability”) has a
+validator join its subnets a random 1 to <code>SYNC_COMMITTEE_SUBNET_COUNT</code> epochs
+before its period starts, and has the node advertise them in the ENR’s
+<code>syncnets</code>.</li>
+<li><strong>ethlambda:</strong> a subnet is joined only when a validator client posts
+<code>POST /eth/v1/validator/sync_committee_subscriptions</code>, at once, until
+<code>until_epoch</code> (exclusive) clamped to the end of the next period. The node
+never subscribes without a request, because validating every subnet would
+cost each follower up to <code>SYNC_COMMITTEE_SIZE</code> BLS verifications a slot.
+<code>syncnets</code> appears in MetaData, never in the ENR: ethrex’s <code>DiscoveryServer</code>
+cannot replace the served record at runtime, the same known gap as the
+<code>eth2</code> entry. Peers therefore find this node’s sync subnets by chance, while
+publishing still reaches the mesh, because a joined subnet is subscribed.</li>
+<li>The <code>sync_committee_contribution_and_proof</code> topic is the exception: it is
+subscribed under every digest and always validated, and accepted
+contributions are relayed and pooled for block production.</li>
+</ul>
+<h2 id="block-production-packs-only-the-parents-sync-committee-votes"><a class="header" href="#block-production-packs-only-the-parents-sync-committee-votes">Block production packs only the parent’s sync committee votes</a></h2>
+<p><code>validator.md</code> (“Sync committee”) describes block packing in terms of
+contributions only.</p>
+<ul>
+<li><strong>ethlambda:</strong> a block at slot <code>N</code> packs only what is pooled for
+<code>(N - 1, parent_root)</code>. For each subcommittee it takes the best pooled
+contribution and adds every pooled direct message at a position that
+contribution does not cover. The result is verified exactly as
+<code>process_sync_aggregate</code> will check it
+(<code>block_production::verified_sync_aggregate</code>); a failure, or a proposer
+whose parent is not the root the committee signed, gets the empty aggregate.
+Every “retry without operations” fallback also drops it. That costs rewards,
+never the block.</li>
+<li>Messages from earlier slots over the same root are not packed.</li>
+</ul>
+<h2 id="the-validator-client-signs-a-sync-committee-message-at-the-deadline-only"><a class="header" href="#the-validator-client-signs-a-sync-committee-message-at-the-deadline-only">The validator client signs a sync committee message at the deadline only</a></h2>
+<p><code>validator.md</code> (“Prepare sync committee message”) has a member sign as soon as
+it sees the block for the slot, or at the sync-message deadline, whichever
+comes first. The validator client signs once, at the deadline
+(<code>SYNC_MESSAGE_DUE_BPS</code>, or its gloas variant), over the head root it then
+reads, and refuses to when that root is optimistic
+(<code>specs/bellatrix/optimistic-sync.md</code>).</p>
 
                     </main>
 

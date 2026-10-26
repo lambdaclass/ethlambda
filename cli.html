@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-7038f84c.js";
+            window.path_to_searchindex_js = "searchindex-8b514d79.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-34fa44cf.js"></script>
@@ -537,9 +537,25 @@ payload attestation data, signs it under the PTC domain and submits it. A <code>
 this order: propose at the boundary, attest at <code>ATTESTATION_DUE_BPS_GLOAS</code>,
 aggregate at <code>AGGREGATE_DUE_BPS_GLOAS</code>, then the committee vote. The attestation
 and the committee vote are each bounded by the end of the slot.</p>
+<p>Sync committee duties run beside the attester and committee work, not after it.
+Each epoch the client fetches its sync duties for the current period and the
+next (<code>POST /eth/v1/validator/duties/sync/{epoch}</code>, asked at the period’s first
+epoch) and posts <code>sync_committee_subscriptions</code> for the current period’s seats,
+until the period’s end, so the node joins the subnets. The next period’s are
+added once its boundary is within four epochs. A member sleeps until
+<code>SYNC_MESSAGE_DUE_BPS</code> (<code>SYNC_MESSAGE_DUE_BPS_GLOAS</code> from gloas), reads
+<code>/eth/v1/beacon/blocks/head/root</code>, signs it and submits one message per
+validator. It refuses to sign when the node reports the head optimistic. A
+member selected by the selection-proof hash for a subnet then waits for
+<code>CONTRIBUTION_DUE_BPS</code> (<code>CONTRIBUTION_DUE_BPS_GLOAS</code>), fetches the node’s
+contribution for that subnet and publishes it wrapped and signed. A subnet whose
+contribution cannot be fetched is skipped without stopping the others. Duties
+for wall slot <code>S</code> are those of the period containing <code>S + 1</code>, since members
+assigned to slot <code>S</code> sign for <code>S - 1</code>. Both halves are bounded by the end of the
+slot.</p>
 <p>Not implemented: the builder flow and blinded blocks (the client asks for an
-unblinded block and refuses a blinded one), sync-committee duties, voluntary
-exits, doppelganger protection and remote signing.</p>
+unblinded block and refuses a blinded one), voluntary exits, doppelganger
+protection and remote signing.</p>
 <h3 id="duty-offsets-come-from-the-network"><a class="header" href="#duty-offsets-come-from-the-network">Duty offsets come from the network</a></h3>
 <p>The slot length and the duty offsets are read from the beacon node’s
 <code>/eth/v1/config/spec</code>, not divided out of a compiled-in constant. The
@@ -548,7 +564,9 @@ specification states them as <code>SLOT_DURATION_MS</code> plus basis points of 
 work out at 3999 ms and 8000 ms. Gloas moves both earlier
 (<code>ATTESTATION_DUE_BPS_GLOAS</code>, <code>AGGREGATE_DUE_BPS_GLOAS</code>) and adds
 <code>PAYLOAD_ATTESTATION_DUE_BPS</code> (and <code>PAYLOAD_DUE_BPS</code>, which the node uses), so
-the clock picks the pair by the fork of each slot’s own epoch.</p>
+the clock picks the pair by the fork of each slot’s own epoch. The sync
+committee offsets (<code>SYNC_MESSAGE_DUE_BPS</code>, <code>CONTRIBUTION_DUE_BPS</code> and their
+<code>_GLOAS</code> variants) are read and picked the same way.</p>
 <p><code>SECONDS_PER_SLOT</code> no longer exists in the specification and is accepted only as
 a fallback, since deployed nodes still send it. A node sending both is required
 to agree with itself.</p>

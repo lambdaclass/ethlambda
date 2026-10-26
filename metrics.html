@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-7038f84c.js";
+            window.path_to_searchindex_js = "searchindex-8b514d79.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-34fa44cf.js"></script>
@@ -602,8 +602,9 @@ own section. These are ethlambda-specific, not part of the leanMetrics spec.</p>
 </table>
 </div>
 <p><code>kind</code> is the topic kind, with every <code>data_column_sidecar_{subnet}</code> sharing the
-label <code>data_column_sidecar</code> and every <code>beacon_attestation_{subnet_id}</code> sharing
-<code>beacon_attestation</code>. The gloas topics <code>execution_payload</code> and
+label <code>data_column_sidecar</code>, every <code>beacon_attestation_{subnet_id}</code> sharing
+<code>beacon_attestation</code> and every <code>sync_committee_{subnet_id}</code> sharing
+<code>sync_committee</code>. The gloas topics <code>execution_payload</code> and
 <code>payload_attestation_message</code> are labelled by their own name. <code>queue</code> means
 IGNORE to gossipsub while the chain actor still receives the object and parks
 it; of the gloas topics only <code>execution_payload</code> answers it, for an envelope
@@ -629,7 +630,13 @@ only), <code>not_aggregator</code> (aggregate only), <code>not_in_committee</cod
 <code>aggregator_signature</code> (aggregate only), <code>aggregate_signature</code> (aggregate
 only), <code>target_not_ancestor</code>, <code>wrong_subnet</code> (attestation only), and gloas’s
 <code>data_index_out_of_range</code>, <code>same_slot_payload_flag</code> and <code>payload_invalid</code> on the
-reject side. <code>already_seen</code>, <code>overloaded</code> and <code>unsupported_fork</code> are shared with the
+reject side. The sync committee topics add <code>sync_committee_unavailable</code> (the head
+state’s committees cannot answer for the message’s period) on the ignore side
+and <code>subcommittee_index</code> (contribution only) on the reject side; they reuse
+<code>not_current_slot</code>, <code>already_seen</code>, <code>covered_bits</code>, <code>no_participants</code>,
+<code>not_aggregator</code>, <code>not_in_committee</code>, <code>unknown_validator</code>, <code>selection_proof</code>,
+<code>aggregator_signature</code>, <code>aggregate_signature</code>, <code>wrong_subnet</code> and
+<code>bad_signature</code>. <code>already_seen</code>, <code>overloaded</code> and <code>unsupported_fork</code> are shared with the
 other topics: <code>unsupported_fork</code> is an ignore reason for a message of a fork this
 build has no gossip rules for, so an honest peer past the fork epoch is not
 scored as a bad decoder. Gloas blocks, data columns, aggregates and attestations
@@ -859,6 +866,11 @@ and absent is not the same as zero.</p>
 <tr><td><code>ethlambda_validator_envelope_failures_total</code></td><td>Counter</td><td>Proposed gloas blocks whose self-built envelope was not published. The block is out and the proposal counts as made, but the slot’s payload is withheld, so this is the failure that costs the payload. Should read zero</td></tr>
 <tr><td><code>ethlambda_validator_payload_attestations_published_total</code></td><td>Counter</td><td>Payload timeliness committee votes a beacon node accepted (gloas)</td></tr>
 <tr><td><code>ethlambda_validator_payload_attestation_failures_total</code></td><td>Counter</td><td>Slots whose payload timeliness committee duty did not result in published votes</td></tr>
+<tr><td><code>ethlambda_validator_sync_committee_messages_published_total</code></td><td>Counter</td><td>Sync committee messages a beacon node accepted</td></tr>
+<tr><td><code>ethlambda_validator_sync_committee_failures_total</code></td><td>Counter</td><td>Slots whose sync committee message duty ended in an error or ran past its slot. A head the node reports optimistic is not a failure: nothing is signed</td></tr>
+<tr><td><code>ethlambda_validator_sync_contributions_published_total</code></td><td>Counter</td><td>Sync committee contributions this client published as an aggregator. Bursty, like <code>aggregates_published_total</code></td></tr>
+<tr><td><code>ethlambda_validator_sync_contribution_failures_total</code></td><td>Counter</td><td>Sync aggregation duties that ended in an error or ran past their slot. A subnet with no contribution to fetch is skipped and not counted</td></tr>
+<tr><td><code>ethlambda_validator_sync_duties_held</code></td><td>Gauge</td><td>Sync committee duties held for the current period</td></tr>
 <tr><td><code>ethlambda_validator_aggregates_published_total</code></td><td>Counter</td><td>Aggregates accepted by a beacon node. Bursty rather than steady: a validator is selected a few times a day, so hours at zero are normal for a small deployment</td></tr>
 <tr><td><code>ethlambda_validator_aggregation_failures_total</code></td><td>Counter</td><td>Aggregation duties that ended in no published aggregate, including ones abandoned for overrunning the slot</td></tr>
 <tr><td><code>ethlambda_validator_fee_recipient_mismatches_total</code></td><td>Counter</td><td>Blocks paying execution rewards to an address this client did not request. Should read zero forever; a non-zero value means every proposal is paying somewhere else</td></tr>

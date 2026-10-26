@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-7038f84c.js";
+            window.path_to_searchindex_js = "searchindex-8b514d79.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-34fa44cf.js"></script>
@@ -2575,6 +2575,7 @@ since it is valid only within its own slot.</p>
 <tr><td><code>proposer_slashing</code></td><td><code>ProposerSlashing</code></td></tr>
 <tr><td><code>bls_to_execution_change</code></td><td><code>SignedBLSToExecutionChange</code></td></tr>
 <tr><td><code>sync_committee_contribution_and_proof</code></td><td><code>SignedContributionAndProof</code></td></tr>
+<tr><td><code>sync_committee_{subnet_id}</code></td><td><code>SyncCommitteeMessage</code> (joined on request only)</td></tr>
 <tr><td><code>beacon_attestation_{subnet_id}</code></td><td><code>Attestation</code>, phase0 or electra’s <code>SingleAttestation</code> (gloas keeps the latter)</td></tr>
 <tr><td><code>execution_payload</code></td><td><code>SignedExecutionPayloadEnvelope</code>, gloas digests only</td></tr>
 <tr><td><code>payload_attestation_message</code></td><td><code>PayloadAttestationMessage</code>, gloas digests only</td></tr>
@@ -2598,8 +2599,9 @@ aggregator duty or <code>--import-all-attestations</code> says otherwise.</p>
 <p>One deliberate shortfall: the set is computed once at startup and kept for the
 process’s lifetime rather than rotating every <code>EPOCHS_PER_SUBNET_SUBSCRIPTION</code>
 epochs. Lighthouse does the same, and reads that constant nowhere.</p>
-<p><code>sync_committee_{0..3}</code> stays unsubscribed and arrives with the work that reads
-it. <code>blob_sidecar_{subnet_id}</code> stays absent permanently: it is deneb’s format
+<p><code>sync_committee_{0..3}</code> is not in the startup set either: those subnets are
+joined on demand, see <a href="#sync-committee-subnets">Sync committee subnets</a>.
+<code>blob_sidecar_{subnet_id}</code> stays absent permanently: it is deneb’s format
 for blobs, deprecated at fulu in favor of the column matrix below.</p>
 <p><code>data_column_sidecar_{0..127}</code> is no longer in that absent list. This node
 subscribes to <code>sampling_size(CUSTODY_REQUIREMENT)</code> of them — the sampling size
@@ -2748,6 +2750,30 @@ dropped: nothing forwards it to the chain actor, on any outcome, matching a
 lighthouse follower with no validators, which verifies and relays its own
 backbone subnets while <code>should_process_attestation</code> keeps them out of its fork
 choice.</p>
+<h2 id="sync-committee-subnets"><a class="header" href="#sync-committee-subnets">Sync committee subnets</a></h2>
+<p>Sync committee gossip is joined on demand, never at startup. A validator
+client’s <code>POST /eth/v1/validator/sync_committee_subscriptions</code> reaches
+<code>P2PServer</code> as <code>subscribe_sync_committee_subnets</code>, which subscribes each
+subnet (<code>sync_committee_{0..3}</code>) immediately under every digest the node holds,
+until the request’s <code>until_epoch</code> (exclusive). Validating all four subnets
+permanently would cost every follower up to a committee’s worth of BLS
+verifications per slot, so nothing is joined without a request.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Piece</th><th>Behaviour</th></tr>
+</thead>
+<tbody>
+<tr><td>State</td><td><code>BeaconWire::sync_committee_subnets</code>: subnet to <code>until_epoch</code>, extended with the later of two requests; ids of 4 or more are dropped</td></tr>
+<tr><td>Advertised</td><td>MetaData v2 and v3 <code>syncnets</code> is built from that set, and the sequence number moves whenever the set does. The ENR carries no <code>syncnets</code> entry: ethrex’s <code>DiscoveryServer</code> cannot replace the served record at runtime, the same known gap as the <code>eth2</code> entry</td></tr>
+<tr><td>Left</td><td>the 12 s sweep leaves a subnet once the wall epoch reaches its <code>until_epoch</code>, and prunes the sync committee pool</td></tr>
+<tr><td>Fork boundaries</td><td><code>beacon::transition::apply</code> subscribes the set under each digest it joins and unsubscribes it under each it leaves, like the aggregator attestation subnets</td></tr>
+<tr><td>Validation</td><td>the cheap half runs inline, the stateful half on <code>spawn_blocking</code> under <code>SYNC_VALIDATION_PERMITS</code>, a pool of its own since the burst coincides with the attestations’. An accepted message is pooled with the seats its signature verified; neither it nor a contribution reaches the chain actor</td></tr>
+<tr><td>Contributions</td><td><code>sync_committee_contribution_and_proof</code> is always subscribed, validated, relayed and pooled for block production</td></tr>
+<tr><td>Publishing</td><td>the Beacon API pools its own submissions first, then publishes on each subnet its validator holds a seat in, under the digest the message’s slot names, and marks them seen so a peer’s echo is ignored</td></tr>
+</tbody>
+</table>
+</div>
 <h2 id="requestresponse"><a class="header" href="#requestresponse">Request/response</a></h2>
 <div class="table-wrapper">
 <table>
@@ -3072,6 +3098,9 @@ only honest value: claiming one it does not serve earns peer-score penalties
 for silence there, and claiming none while serving two loses the peers
 looking for precisely that. It used to be all-unset, which was honest while
 this node held no subscription at all.</li>
+<li><code>syncnets</code> names the sync committee subnets joined on a validator client’s
+request, so it is all-unset until one asks. It is advertised in MetaData
+only; the ENR has no <code>syncnets</code> entry.</li>
 <li><code>cgc</code> advertises <code>CUSTODY_REQUIREMENT</code>, the floor below which peers may
 reject a record outright, not <code>sampling_size(CUSTODY_REQUIREMENT)</code>, the
 larger number of columns this node actually custodies, stores and serves
@@ -3142,17 +3171,16 @@ cargo run --profile release-fast -p ethlambda --bin ethlambda -- beacon \
 No fork or blob-schedule boundary is scheduled
 Custodying data columns  columns=[…]
 Backboning attestation subnets  subnets_per_node=2 subnets=[…]
-Advertising cgc=4 while subscribing to no sync committee subnet, and publishing nothing
+Advertising cgc=4; sync committee subnets are joined only on a validator client's request
 Beacon P2P node started  socket=0.0.0.0:9001 fork_digest=8c9f62fe topics=17 columns=8 attestation_subnets=[…]
 HTTP server listening  addr=127.0.0.1:5054
 Starting discv5 discovery  discovery_addr=0.0.0.0:9002 seeds=17 total_bootnodes=17
 Local ENR  enr=enr:-…
 </code></pre>
-<p>The <code>Advertising cgc=…</code> line names what is still true: this node subscribes to
-no sync-committee subnet and publishes nothing of its own. Storing and serving
-the columns it custodies (see <a href="#data-column-sidecars">Data column
-sidecars</a>) is no longer part of that gap, and neither is
-the attestation subnet backbone.</p>
+<p>The <code>Advertising cgc=…</code> line names what is true of sync committees: this node
+subscribes to no sync-committee subnet at startup, and joins one only when a
+validator client asks (see <a href="#sync-committee-subnets">Sync committee
+subnets</a>).</p>
 <p><code>seeds=17</code> proves the built-in list parsed; a lower number means a bootnode
 ENR was skipped with a warning. <code>topics=17</code> proves the subscription set: the 7
 global topics, the 8 column subnets this run’s (randomly generated) node id
@@ -3897,9 +3925,25 @@ payload attestation data, signs it under the PTC domain and submits it. A <code>
 this order: propose at the boundary, attest at <code>ATTESTATION_DUE_BPS_GLOAS</code>,
 aggregate at <code>AGGREGATE_DUE_BPS_GLOAS</code>, then the committee vote. The attestation
 and the committee vote are each bounded by the end of the slot.</p>
+<p>Sync committee duties run beside the attester and committee work, not after it.
+Each epoch the client fetches its sync duties for the current period and the
+next (<code>POST /eth/v1/validator/duties/sync/{epoch}</code>, asked at the period’s first
+epoch) and posts <code>sync_committee_subscriptions</code> for the current period’s seats,
+until the period’s end, so the node joins the subnets. The next period’s are
+added once its boundary is within four epochs. A member sleeps until
+<code>SYNC_MESSAGE_DUE_BPS</code> (<code>SYNC_MESSAGE_DUE_BPS_GLOAS</code> from gloas), reads
+<code>/eth/v1/beacon/blocks/head/root</code>, signs it and submits one message per
+validator. It refuses to sign when the node reports the head optimistic. A
+member selected by the selection-proof hash for a subnet then waits for
+<code>CONTRIBUTION_DUE_BPS</code> (<code>CONTRIBUTION_DUE_BPS_GLOAS</code>), fetches the node’s
+contribution for that subnet and publishes it wrapped and signed. A subnet whose
+contribution cannot be fetched is skipped without stopping the others. Duties
+for wall slot <code>S</code> are those of the period containing <code>S + 1</code>, since members
+assigned to slot <code>S</code> sign for <code>S - 1</code>. Both halves are bounded by the end of the
+slot.</p>
 <p>Not implemented: the builder flow and blinded blocks (the client asks for an
-unblinded block and refuses a blinded one), sync-committee duties, voluntary
-exits, doppelganger protection and remote signing.</p>
+unblinded block and refuses a blinded one), voluntary exits, doppelganger
+protection and remote signing.</p>
 <h3 id="duty-offsets-come-from-the-network"><a class="header" href="#duty-offsets-come-from-the-network">Duty offsets come from the network</a></h3>
 <p>The slot length and the duty offsets are read from the beacon node’s
 <code>/eth/v1/config/spec</code>, not divided out of a compiled-in constant. The
@@ -3908,7 +3952,9 @@ specification states them as <code>SLOT_DURATION_MS</code> plus basis points of 
 work out at 3999 ms and 8000 ms. Gloas moves both earlier
 (<code>ATTESTATION_DUE_BPS_GLOAS</code>, <code>AGGREGATE_DUE_BPS_GLOAS</code>) and adds
 <code>PAYLOAD_ATTESTATION_DUE_BPS</code> (and <code>PAYLOAD_DUE_BPS</code>, which the node uses), so
-the clock picks the pair by the fork of each slot’s own epoch.</p>
+the clock picks the pair by the fork of each slot’s own epoch. The sync
+committee offsets (<code>SYNC_MESSAGE_DUE_BPS</code>, <code>CONTRIBUTION_DUE_BPS</code> and their
+<code>_GLOAS</code> variants) are read and picked the same way.</p>
 <p><code>SECONDS_PER_SLOT</code> no longer exists in the specification and is accepted only as
 a fallback, since deployed nodes still send it. A node sending both is required
 to agree with itself.</p>
@@ -4230,6 +4276,10 @@ surface rather than sitting beside it; a <code>/lean/v0</code> path on a beacon 
 <tr><td><code>POST</code></td><td><code>/eth/v1/validator/beacon_committee_subscriptions</code></td><td><em>(status only)</em></td><td>Aggregators’ entries join their committee’s subnet</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v2/validator/aggregate_attestation</code></td><td>JSON</td><td>The pooled votes for a data root and committee, aggregated</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v2/validator/aggregate_and_proofs</code></td><td><em>(status only)</em></td><td>Validate and gossip <code>SignedAggregateAndProof</code>s</td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v1/beacon/pool/sync_committees</code></td><td><em>(status only)</em></td><td>Validate, pool and gossip <code>SyncCommitteeMessage</code>s</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/validator/sync_committee_contribution</code></td><td>JSON</td><td>The pooled messages for <code>(slot, subcommittee_index, beacon_block_root)</code>, aggregated</td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v1/validator/contribution_and_proofs</code></td><td><em>(status only)</em></td><td>Validate, pool and gossip <code>SignedContributionAndProof</code>s</td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v1/validator/sync_committee_subscriptions</code></td><td><em>(status only)</em></td><td>Join sync committee subnets until an epoch</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v3/validator/blocks/{slot}</code></td><td>SSZ or JSON</td><td>An unsigned fulu block built on the head (<code>produceBlockV3</code>)</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v4/validator/blocks/{slot}</code></td><td>SSZ or JSON</td><td>An unsigned self-built gloas block, with its envelope and blobs when asked (<code>produceBlockV4</code>)</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/validator/execution_payload_envelopes/{slot}/{beacon_block_root}</code></td><td>SSZ or JSON</td><td>The unsigned envelope <code>produceBlockV4</code> built (gloas)</td></tr>
@@ -4278,9 +4328,8 @@ bound or before the head’s is a <code>400</code> (an earlier one would need a
 historical state; see <code>docs/spec_deviations.md</code>). A validator is matched by pubkey and
 gets every seat it holds, since the committee is drawn with replacement; one
 with no seat is left out. An unknown index is a <code>400</code>, and the endpoint is a
-<code>503</code> while the node is syncing. This node serves no sync committee message
-or contribution endpoint yet, so a validator client that gets duties here
-cannot publish what they ask for.</li>
+<code>503</code> while the node is syncing. What a duty asks for is served by the four
+sync committee endpoints in <a href="#sync-committee">Sync committee</a> below.</li>
 <li><strong>Liveness</strong> is this node’s own view, which the Beacon API allows. A
 validator is live in an epoch if the head state credits it for that epoch (a
 non-zero participation byte, so anything a block already included), <strong>or</strong>
@@ -4365,8 +4414,9 @@ into one EIP-7549 attestation, up to <code>MAX_ATTESTATIONS_ELECTRA</code>). A c
 is packed only if its target root is the advanced state’s own block root for
 that epoch and its aggregate signature verifies against that state, so an
 aggregate made on another branch cannot fail the whole block. The body also
-votes the state’s own <code>eth1_data</code>, and carries an empty sync aggregate and no
-slashings, exits or credential changes. The state root comes from running
+votes the state’s own <code>eth1_data</code>, and carries the sync aggregate described
+under <a href="#sync-committee">Sync committee</a> (empty when nothing verifiable is
+pooled) and no slashings, exits or credential changes. The state root comes from running
 the block through <code>process_block</code>. The answer is fulu <code>BlockContents</code>, with
 <code>Eth-Execution-Payload-Blinded: false</code>; there is no builder flow. It is a
 <strong><code>503</code></strong> without a configured execution client, or when the payload carries
@@ -4464,6 +4514,56 @@ commitments and cell proofs; any failure is a <code>400</code>. A success is <co
 envelope and all <code>NUMBER_OF_COLUMNS</code> gloas data column sidecars are handed to
 P2P, which gossips them together. A node that does not subscribe to a column’s
 subnet publishes through gossipsub fanout.</p>
+<h3 id="sync-committee"><a class="header" href="#sync-committee">Sync committee</a></h3>
+<p>All four endpoints are JSON only (beacon-APIs lists no SSZ body for them), and
+read integers quoted or bare. All share one <code>SharedSyncCommitteePool</code>, which
+P2P fills from accepted gossip as well. None of it reaches the chain actor:
+sync committee votes have no fork-choice effect.</p>
+<ul>
+<li><strong><code>POST /eth/v1/beacon/pool/sync_committees</code></strong> takes a JSON array of
+<code>SyncCommitteeMessage</code>s and needs no <code>Eth-Consensus-Version</code>. Each is
+checked against the head state with the rules <code>sync_committee_{subnet_id}</code>
+gossip applies (the current slot; the validator holds a seat in the
+committee its slot names, which is the next committee at a period’s last
+slot; the signature), then pooled once per seat and published on every
+distinct subnet its seats sit on. One BLS verification per message, on a
+blocking thread. Not gated on syncing, like <code>pool/attestations</code>. A refused
+message comes back in an <code>IndexedErrorMessage</code> (<code>400</code>) as
+<code>{outcome}: {reason}</code> with its position, and the rest still go out. A body
+that is not a list of messages is a <code>400</code> with no <code>failures</code>; a dead network
+actor is a per-item failure.</li>
+<li><strong><code>GET /eth/v1/validator/sync_committee_contribution?slot=&amp;subcommittee_index=&amp;beacon_block_root=</code></strong>
+answers <code>{data: SyncCommitteeContribution}</code> (no <code>version</code>): the best pooled
+contribution for the key, extended by every pooled direct message at a
+position it does not cover. <code>404</code> when the pool holds nothing for it, <code>400</code>
+when <code>subcommittee_index</code> is not below <code>SYNC_COMMITTEE_SUBNET_COUNT</code>, and
+<code>503</code> while the node is syncing or when the block is optimistic or unknown
+(an aggregator must not sign over a root this node cannot vouch for).</li>
+<li><strong><code>POST /eth/v1/validator/contribution_and_proofs</code></strong> takes a JSON array of
+<code>SignedContributionAndProof</code>s. Each passes the checks
+<code>sync_committee_contribution_and_proof</code> gossip applies (current slot,
+subcommittee in range, a participant, the selection proof selects the
+aggregator, aggregator is in the subcommittee, and the selection proof,
+envelope and aggregate signatures) against a fresh seen cache, since P2P’s
+holds what peers sent. A valid one is pooled and gossiped; the failure shape
+is the same as above.</li>
+<li><strong><code>POST /eth/v1/validator/sync_committee_subscriptions</code></strong> takes
+<code>[{validator_index, sync_committee_indices, until_epoch}]</code>. The subnet of a
+position is <code>index / SYNC_SUBCOMMITTEE_SIZE</code>; entries are grouped by subnet
+keeping the latest <code>until_epoch</code> (exclusive), clamped to the end of the next
+sync committee period, and handed to P2P, which joins the subnets
+immediately. A position at or above <code>SYNC_COMMITTEE_SIZE</code> is a <code>400</code> and
+nothing is joined. A node forgets these on restart, so a client repeats them
+every epoch. <code>sync_committee_selections</code> (distributed validators) is not
+served; beacon-APIs lets a node leave it out.</li>
+</ul>
+<p><strong>Block production.</strong> The block at slot <code>N</code> packs only what is pooled for
+<code>(N - 1, parent_root)</code>: per subcommittee the best contribution, extended by
+pooled direct messages at uncovered positions. The result is verified exactly
+as <code>process_sync_aggregate</code> will check it, against the state the block is built
+on; if it fails, or nothing is pooled, the block carries the empty aggregate.
+Fulu (<code>blocks/{slot}</code>) and gloas (<code>produceBlockV4</code>) do the same, and the
+“retry without operations” fallback of each also drops the sync aggregate.</p>
 <h3 id="payload-timeliness-committee"><a class="header" href="#payload-timeliness-committee">Payload timeliness committee</a></h3>
 <ul>
 <li><strong><code>POST /eth/v1/validator/duties/ptc/{epoch}</code></strong> takes a JSON array of quoted
@@ -5153,8 +5253,9 @@ own section. These are ethlambda-specific, not part of the leanMetrics spec.</p>
 </table>
 </div>
 <p><code>kind</code> is the topic kind, with every <code>data_column_sidecar_{subnet}</code> sharing the
-label <code>data_column_sidecar</code> and every <code>beacon_attestation_{subnet_id}</code> sharing
-<code>beacon_attestation</code>. The gloas topics <code>execution_payload</code> and
+label <code>data_column_sidecar</code>, every <code>beacon_attestation_{subnet_id}</code> sharing
+<code>beacon_attestation</code> and every <code>sync_committee_{subnet_id}</code> sharing
+<code>sync_committee</code>. The gloas topics <code>execution_payload</code> and
 <code>payload_attestation_message</code> are labelled by their own name. <code>queue</code> means
 IGNORE to gossipsub while the chain actor still receives the object and parks
 it; of the gloas topics only <code>execution_payload</code> answers it, for an envelope
@@ -5180,7 +5281,13 @@ only), <code>not_aggregator</code> (aggregate only), <code>not_in_committee</cod
 <code>aggregator_signature</code> (aggregate only), <code>aggregate_signature</code> (aggregate
 only), <code>target_not_ancestor</code>, <code>wrong_subnet</code> (attestation only), and gloas’s
 <code>data_index_out_of_range</code>, <code>same_slot_payload_flag</code> and <code>payload_invalid</code> on the
-reject side. <code>already_seen</code>, <code>overloaded</code> and <code>unsupported_fork</code> are shared with the
+reject side. The sync committee topics add <code>sync_committee_unavailable</code> (the head
+state’s committees cannot answer for the message’s period) on the ignore side
+and <code>subcommittee_index</code> (contribution only) on the reject side; they reuse
+<code>not_current_slot</code>, <code>already_seen</code>, <code>covered_bits</code>, <code>no_participants</code>,
+<code>not_aggregator</code>, <code>not_in_committee</code>, <code>unknown_validator</code>, <code>selection_proof</code>,
+<code>aggregator_signature</code>, <code>aggregate_signature</code>, <code>wrong_subnet</code> and
+<code>bad_signature</code>. <code>already_seen</code>, <code>overloaded</code> and <code>unsupported_fork</code> are shared with the
 other topics: <code>unsupported_fork</code> is an ignore reason for a message of a fork this
 build has no gossip rules for, so an honest peer past the fork epoch is not
 scored as a bad decoder. Gloas blocks, data columns, aggregates and attestations
@@ -5410,6 +5517,11 @@ and absent is not the same as zero.</p>
 <tr><td><code>ethlambda_validator_envelope_failures_total</code></td><td>Counter</td><td>Proposed gloas blocks whose self-built envelope was not published. The block is out and the proposal counts as made, but the slot’s payload is withheld, so this is the failure that costs the payload. Should read zero</td></tr>
 <tr><td><code>ethlambda_validator_payload_attestations_published_total</code></td><td>Counter</td><td>Payload timeliness committee votes a beacon node accepted (gloas)</td></tr>
 <tr><td><code>ethlambda_validator_payload_attestation_failures_total</code></td><td>Counter</td><td>Slots whose payload timeliness committee duty did not result in published votes</td></tr>
+<tr><td><code>ethlambda_validator_sync_committee_messages_published_total</code></td><td>Counter</td><td>Sync committee messages a beacon node accepted</td></tr>
+<tr><td><code>ethlambda_validator_sync_committee_failures_total</code></td><td>Counter</td><td>Slots whose sync committee message duty ended in an error or ran past its slot. A head the node reports optimistic is not a failure: nothing is signed</td></tr>
+<tr><td><code>ethlambda_validator_sync_contributions_published_total</code></td><td>Counter</td><td>Sync committee contributions this client published as an aggregator. Bursty, like <code>aggregates_published_total</code></td></tr>
+<tr><td><code>ethlambda_validator_sync_contribution_failures_total</code></td><td>Counter</td><td>Sync aggregation duties that ended in an error or ran past their slot. A subnet with no contribution to fetch is skipped and not counted</td></tr>
+<tr><td><code>ethlambda_validator_sync_duties_held</code></td><td>Gauge</td><td>Sync committee duties held for the current period</td></tr>
 <tr><td><code>ethlambda_validator_aggregates_published_total</code></td><td>Counter</td><td>Aggregates accepted by a beacon node. Bursty rather than steady: a validator is selected a few times a day, so hours at zero are normal for a small deployment</td></tr>
 <tr><td><code>ethlambda_validator_aggregation_failures_total</code></td><td>Counter</td><td>Aggregation duties that ended in no published aggregate, including ones abandoned for overrunning the slot</td></tr>
 <tr><td><code>ethlambda_validator_fee_recipient_mismatches_total</code></td><td>Counter</td><td>Blocks paying execution rewards to an address this client did not request. Should read zero forever; a non-zero value means every proposal is paying somewhere else</td></tr>
@@ -7717,6 +7829,68 @@ blocks.</li>
 <li>A hash of zero is “nothing to say” on either fork, so a payload whose hash is
 zero (the fixtures’ placeholder) sends no <code>forkchoiceUpdated</code>.</li>
 </ul>
+<h2 id="sync-committee-gossip-resolves-the-committee-by-the-messages-slot-and-the-domain-by-the-fork-schedule"><a class="header" href="#sync-committee-gossip-resolves-the-committee-by-the-messages-slot-and-the-domain-by-the-fork-schedule">Sync committee gossip resolves the committee by the message’s slot and the domain by the fork schedule</a></h2>
+<p><code>sync_committee_{subnet_id}</code> and <code>sync_committee_contribution_and_proof</code>
+validate against the cached head state, choosing the committee from the
+message’s slot and the signing domain from the config’s fork schedule.</p>
+<ul>
+<li><strong>Specification:</strong> <code>p2p-interface.md</code>’s <code>get_sync_subcommittee_pubkeys</code> and
+<code>validator.md</code>’s <code>compute_subnets_for_sync_committee</code> pick the committee by
+<code>state.slot + 1</code>, and <code>get_domain(state, ..)</code> takes the fork version from
+<code>state.fork</code>.</li>
+<li><strong>ethlambda:</strong> the committee is chosen by <code>message.slot + 1</code>
+(<code>current_sync_committee</code> in the head’s own period, <code>next_sync_committee</code> in
+the one after), and the domain comes from <code>Config</code>’s schedule
+(<code>helpers::sync_committee</code>). The validator client signs with the same
+domain. When the head is in the message’s period and fork the answer is the
+specification’s. When it lags across a period or fork boundary, the
+specification would reject honest messages and this does not.</li>
+<li><strong>Unanswerable cases are IGNORE:</strong> a head state that is not cached is
+<code>IGNORE</code> (<code>state_unavailable</code>), like every other topic, and a period the head
+state’s two committees cannot cover is <code>IGNORE sync_committee_unavailable</code>,
+since neither is the sender’s fault.</li>
+</ul>
+<h2 id="sync-committee-subnets-are-joined-on-request-immediately-and-advertised-in-metadata-only"><a class="header" href="#sync-committee-subnets-are-joined-on-request-immediately-and-advertised-in-metadata-only">Sync committee subnets are joined on request, immediately, and advertised in MetaData only</a></h2>
+<ul>
+<li><strong>Specification:</strong> <code>validator.md</code> (“Sync committee subnet stability”) has a
+validator join its subnets a random 1 to <code>SYNC_COMMITTEE_SUBNET_COUNT</code> epochs
+before its period starts, and has the node advertise them in the ENR’s
+<code>syncnets</code>.</li>
+<li><strong>ethlambda:</strong> a subnet is joined only when a validator client posts
+<code>POST /eth/v1/validator/sync_committee_subscriptions</code>, at once, until
+<code>until_epoch</code> (exclusive) clamped to the end of the next period. The node
+never subscribes without a request, because validating every subnet would
+cost each follower up to <code>SYNC_COMMITTEE_SIZE</code> BLS verifications a slot.
+<code>syncnets</code> appears in MetaData, never in the ENR: ethrex’s <code>DiscoveryServer</code>
+cannot replace the served record at runtime, the same known gap as the
+<code>eth2</code> entry. Peers therefore find this node’s sync subnets by chance, while
+publishing still reaches the mesh, because a joined subnet is subscribed.</li>
+<li>The <code>sync_committee_contribution_and_proof</code> topic is the exception: it is
+subscribed under every digest and always validated, and accepted
+contributions are relayed and pooled for block production.</li>
+</ul>
+<h2 id="block-production-packs-only-the-parents-sync-committee-votes"><a class="header" href="#block-production-packs-only-the-parents-sync-committee-votes">Block production packs only the parent’s sync committee votes</a></h2>
+<p><code>validator.md</code> (“Sync committee”) describes block packing in terms of
+contributions only.</p>
+<ul>
+<li><strong>ethlambda:</strong> a block at slot <code>N</code> packs only what is pooled for
+<code>(N - 1, parent_root)</code>. For each subcommittee it takes the best pooled
+contribution and adds every pooled direct message at a position that
+contribution does not cover. The result is verified exactly as
+<code>process_sync_aggregate</code> will check it
+(<code>block_production::verified_sync_aggregate</code>); a failure, or a proposer
+whose parent is not the root the committee signed, gets the empty aggregate.
+Every “retry without operations” fallback also drops it. That costs rewards,
+never the block.</li>
+<li>Messages from earlier slots over the same root are not packed.</li>
+</ul>
+<h2 id="the-validator-client-signs-a-sync-committee-message-at-the-deadline-only"><a class="header" href="#the-validator-client-signs-a-sync-committee-message-at-the-deadline-only">The validator client signs a sync committee message at the deadline only</a></h2>
+<p><code>validator.md</code> (“Prepare sync committee message”) has a member sign as soon as
+it sees the block for the slot, or at the sync-message deadline, whichever
+comes first. The validator client signs once, at the deadline
+(<code>SYNC_MESSAGE_DUE_BPS</code>, or its gloas variant), over the head root it then
+reads, and refuses to when that root is optimistic
+(<code>specs/bellatrix/optimistic-sync.md</code>).</p>
 
                     </main>
 

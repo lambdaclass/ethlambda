@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-7038f84c.js";
+            window.path_to_searchindex_js = "searchindex-8b514d79.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-34fa44cf.js"></script>
@@ -269,6 +269,7 @@ since it is valid only within its own slot.</p>
 <tr><td><code>proposer_slashing</code></td><td><code>ProposerSlashing</code></td></tr>
 <tr><td><code>bls_to_execution_change</code></td><td><code>SignedBLSToExecutionChange</code></td></tr>
 <tr><td><code>sync_committee_contribution_and_proof</code></td><td><code>SignedContributionAndProof</code></td></tr>
+<tr><td><code>sync_committee_{subnet_id}</code></td><td><code>SyncCommitteeMessage</code> (joined on request only)</td></tr>
 <tr><td><code>beacon_attestation_{subnet_id}</code></td><td><code>Attestation</code>, phase0 or electra’s <code>SingleAttestation</code> (gloas keeps the latter)</td></tr>
 <tr><td><code>execution_payload</code></td><td><code>SignedExecutionPayloadEnvelope</code>, gloas digests only</td></tr>
 <tr><td><code>payload_attestation_message</code></td><td><code>PayloadAttestationMessage</code>, gloas digests only</td></tr>
@@ -292,8 +293,9 @@ aggregator duty or <code>--import-all-attestations</code> says otherwise.</p>
 <p>One deliberate shortfall: the set is computed once at startup and kept for the
 process’s lifetime rather than rotating every <code>EPOCHS_PER_SUBNET_SUBSCRIPTION</code>
 epochs. Lighthouse does the same, and reads that constant nowhere.</p>
-<p><code>sync_committee_{0..3}</code> stays unsubscribed and arrives with the work that reads
-it. <code>blob_sidecar_{subnet_id}</code> stays absent permanently: it is deneb’s format
+<p><code>sync_committee_{0..3}</code> is not in the startup set either: those subnets are
+joined on demand, see <a href="#sync-committee-subnets">Sync committee subnets</a>.
+<code>blob_sidecar_{subnet_id}</code> stays absent permanently: it is deneb’s format
 for blobs, deprecated at fulu in favor of the column matrix below.</p>
 <p><code>data_column_sidecar_{0..127}</code> is no longer in that absent list. This node
 subscribes to <code>sampling_size(CUSTODY_REQUIREMENT)</code> of them — the sampling size
@@ -442,6 +444,30 @@ dropped: nothing forwards it to the chain actor, on any outcome, matching a
 lighthouse follower with no validators, which verifies and relays its own
 backbone subnets while <code>should_process_attestation</code> keeps them out of its fork
 choice.</p>
+<h2 id="sync-committee-subnets"><a class="header" href="#sync-committee-subnets">Sync committee subnets</a></h2>
+<p>Sync committee gossip is joined on demand, never at startup. A validator
+client’s <code>POST /eth/v1/validator/sync_committee_subscriptions</code> reaches
+<code>P2PServer</code> as <code>subscribe_sync_committee_subnets</code>, which subscribes each
+subnet (<code>sync_committee_{0..3}</code>) immediately under every digest the node holds,
+until the request’s <code>until_epoch</code> (exclusive). Validating all four subnets
+permanently would cost every follower up to a committee’s worth of BLS
+verifications per slot, so nothing is joined without a request.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Piece</th><th>Behaviour</th></tr>
+</thead>
+<tbody>
+<tr><td>State</td><td><code>BeaconWire::sync_committee_subnets</code>: subnet to <code>until_epoch</code>, extended with the later of two requests; ids of 4 or more are dropped</td></tr>
+<tr><td>Advertised</td><td>MetaData v2 and v3 <code>syncnets</code> is built from that set, and the sequence number moves whenever the set does. The ENR carries no <code>syncnets</code> entry: ethrex’s <code>DiscoveryServer</code> cannot replace the served record at runtime, the same known gap as the <code>eth2</code> entry</td></tr>
+<tr><td>Left</td><td>the 12 s sweep leaves a subnet once the wall epoch reaches its <code>until_epoch</code>, and prunes the sync committee pool</td></tr>
+<tr><td>Fork boundaries</td><td><code>beacon::transition::apply</code> subscribes the set under each digest it joins and unsubscribes it under each it leaves, like the aggregator attestation subnets</td></tr>
+<tr><td>Validation</td><td>the cheap half runs inline, the stateful half on <code>spawn_blocking</code> under <code>SYNC_VALIDATION_PERMITS</code>, a pool of its own since the burst coincides with the attestations’. An accepted message is pooled with the seats its signature verified; neither it nor a contribution reaches the chain actor</td></tr>
+<tr><td>Contributions</td><td><code>sync_committee_contribution_and_proof</code> is always subscribed, validated, relayed and pooled for block production</td></tr>
+<tr><td>Publishing</td><td>the Beacon API pools its own submissions first, then publishes on each subnet its validator holds a seat in, under the digest the message’s slot names, and marks them seen so a peer’s echo is ignored</td></tr>
+</tbody>
+</table>
+</div>
 <h2 id="requestresponse"><a class="header" href="#requestresponse">Request/response</a></h2>
 <div class="table-wrapper">
 <table>
@@ -766,6 +792,9 @@ only honest value: claiming one it does not serve earns peer-score penalties
 for silence there, and claiming none while serving two loses the peers
 looking for precisely that. It used to be all-unset, which was honest while
 this node held no subscription at all.</li>
+<li><code>syncnets</code> names the sync committee subnets joined on a validator client’s
+request, so it is all-unset until one asks. It is advertised in MetaData
+only; the ENR has no <code>syncnets</code> entry.</li>
 <li><code>cgc</code> advertises <code>CUSTODY_REQUIREMENT</code>, the floor below which peers may
 reject a record outright, not <code>sampling_size(CUSTODY_REQUIREMENT)</code>, the
 larger number of columns this node actually custodies, stores and serves
@@ -836,17 +865,16 @@ cargo run --profile release-fast -p ethlambda --bin ethlambda -- beacon \
 No fork or blob-schedule boundary is scheduled
 Custodying data columns  columns=[…]
 Backboning attestation subnets  subnets_per_node=2 subnets=[…]
-Advertising cgc=4 while subscribing to no sync committee subnet, and publishing nothing
+Advertising cgc=4; sync committee subnets are joined only on a validator client's request
 Beacon P2P node started  socket=0.0.0.0:9001 fork_digest=8c9f62fe topics=17 columns=8 attestation_subnets=[…]
 HTTP server listening  addr=127.0.0.1:5054
 Starting discv5 discovery  discovery_addr=0.0.0.0:9002 seeds=17 total_bootnodes=17
 Local ENR  enr=enr:-…
 </code></pre>
-<p>The <code>Advertising cgc=…</code> line names what is still true: this node subscribes to
-no sync-committee subnet and publishes nothing of its own. Storing and serving
-the columns it custodies (see <a href="#data-column-sidecars">Data column
-sidecars</a>) is no longer part of that gap, and neither is
-the attestation subnet backbone.</p>
+<p>The <code>Advertising cgc=…</code> line names what is true of sync committees: this node
+subscribes to no sync-committee subnet at startup, and joins one only when a
+validator client asks (see <a href="#sync-committee-subnets">Sync committee
+subnets</a>).</p>
 <p><code>seeds=17</code> proves the built-in list parsed; a lower number means a bootnode
 ENR was skipped with a warning. <code>topics=17</code> proves the subscription set: the 7
 global topics, the 8 column subnets this run’s (randomly generated) node id
