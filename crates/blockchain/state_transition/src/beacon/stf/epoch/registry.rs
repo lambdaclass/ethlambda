@@ -37,6 +37,15 @@ use crate::beacon::primitives::{Epoch, Gwei, ValidatorIndex};
 /// where the specification no longer has one at all, so both are refused
 /// outright rather than guessed at; see [`process_registry_updates`]'s own
 /// documentation for exactly which forks that leaves this serving.
+///
+/// Gloas is refused for the same reason, not routed to
+/// [`crate::beacon::helpers::gloas::get_activation_churn_limit`]: gloas
+/// inherits electra's balance-denominated `process_registry_updates`
+/// wholesale too (it has no validator-count activation cap of its own for
+/// this function to pick between), so this gate has nothing to serve gloas
+/// either. `get_activation_churn_limit` belongs to gloas's own
+/// `process_pending_deposits` (EIP-8061), which caps *deposit* processing,
+/// not registry activation.
 fn activation_churn_limit(state: &BeaconState, config: &Config) -> Result<u64> {
     let churn_limit = get_validator_churn_limit(state, config);
     match state.fork_name() {
@@ -44,10 +53,12 @@ fn activation_churn_limit(state: &BeaconState, config: &Config) -> Result<u64> {
             Ok(churn_limit)
         }
         ForkName::Deneb => Ok(config.max_per_epoch_activation_churn_limit.min(churn_limit)),
-        fork @ (ForkName::Electra | ForkName::Fulu) => Err(Error::UnsupportedForFork {
-            function: "process_registry_updates",
-            fork,
-        }),
+        fork @ (ForkName::Electra | ForkName::Fulu | ForkName::Gloas) => {
+            Err(Error::UnsupportedForFork {
+                function: "process_registry_updates",
+                fork,
+            })
+        }
         ForkName::Lean => lean_state_unreachable("activation_churn_limit"),
     }
 }
@@ -66,7 +77,7 @@ fn activation_churn_limit(state: &BeaconState, config: &Config) -> Result<u64> {
 /// (EIP-7514) is confined to which cap the third pass dequeues against, so it
 /// is selected by fork through [`activation_churn_limit`] rather than
 /// duplicating the three passes around it, the same reuse-by-value pattern
-/// [`super::process_slashings`] already uses for its own per-fork multiplier.
+/// [`process_slashings`] already uses for its own per-fork multiplier.
 /// Electra redefines every pass, not just the cap, so it is a wholly separate
 /// function the crate's electra module owns, and fulu never revives a
 /// validator-count rule after that; [`activation_churn_limit`] refuses to run
@@ -74,7 +85,7 @@ fn activation_churn_limit(state: &BeaconState, config: &Config) -> Result<u64> {
 /// fulu state silently activate validators under deneb's superseded rule.
 pub fn process_registry_updates(state: &mut BeaconState, config: &Config) -> Result<()> {
     let current_epoch = get_current_epoch(state);
-    let validator_count = state.validators().len() as ValidatorIndex;
+    let validator_count = state.validator_count() as ValidatorIndex;
 
     // `initiate_validator_exit` itself scans every validator's exit epoch to
     // find the queue's current tail, which needs `state` uncommitted to any
@@ -191,7 +202,7 @@ pub fn process_slashings(state: &mut BeaconState, _config: &Config) -> Result<()
     // vector, not the validator being read here, but every other mutator in
     // this module needs the same shape, so this one follows suit.
     let mut penalties = Vec::new();
-    for (index, validator) in state.validators().iter().enumerate() {
+    for (index, validator) in state.iter_validators().enumerate() {
         if validator.slashed && epoch + withdrawable_offset == validator.withdrawable_epoch {
             // Factored out from the penalty numerator to avoid a `uint64`
             // overflow, exactly as the specification does; multiplying before

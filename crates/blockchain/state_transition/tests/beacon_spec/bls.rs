@@ -7,17 +7,18 @@
 //! that module's own doc for why they return the shapes they do
 //! (`crate::Result` for aggregation, plain `bool` for verification).
 //!
-//! # Why `general`, not a preset
+//! # Why `cryptography-specs`, not a preset
 //!
 //! Every other runner in this harness picks its fixture tree by [`super::PRESET`],
 //! because the functions it exercises read a preset constant somewhere in their
 //! call graph (committee sizes, epoch lengths, and so on). Neither BLS handler
 //! does: aggregating public keys and checking a pairing equation are BLS12-381
-//! operations with no notion of a validator count or a slots-per-epoch. The
-//! release ships exactly one copy of these fixtures, under `general`, rather
-//! than one per preset, which is what `general` signals across this whole
-//! fixture tree (see `crates/blockchain/state_transition/tests/beacon_spec/mod.rs`'s module doc): a suite
-//! that does not vary with the compiled-in preset.
+//! operations with no notion of a validator count or a slots-per-epoch. Since
+//! v1.7.0-alpha.13 (consensus-specs #5398) these vectors, along with KZG's, ship
+//! from `ethereum/cryptography-specs` instead, downloaded by `make
+//! cryptography-specs` into a tree of its own (see [`super::crypto_root`]): one
+//! copy, not one per preset, which is what preset-independence means across
+//! this whole harness.
 //!
 //! # What `output: null` means
 //!
@@ -34,6 +35,7 @@
 //! mode distinct from "the check did not pass", so every fixture under that
 //! handler ships a `true` or `false`, never a `null`.
 
+use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::bls;
 use ethlambda_state_transition::beacon::primitives::{
     BLS_PUBKEY_SIZE, BlsPubkey, BlsSignature, Root,
@@ -152,10 +154,10 @@ fn eth_fast_aggregate_verify_case(case: &super::Case) -> Result<(), String> {
 
 /// This suite is not gated here: [`super::case_trial`] applies
 /// [`super::Case::in_scope`]'s gate itself, and every case this handler
-/// collects lands under altair, which is always in scope, so nothing here
-/// needs to check the fork.
+/// collects is tagged [`ForkName::Altair`], which is always in scope, so
+/// nothing here needs to check the fork.
 pub fn trials() -> Vec<Trial> {
-    let cases = super::collect_all_handlers("general", "bls");
+    let cases = super::collect_crypto("bls", |_| ForkName::Altair);
     let mut trials = vec![super::discovery_trial("bls", cases.len())];
 
     for (handler, case) in cases {
