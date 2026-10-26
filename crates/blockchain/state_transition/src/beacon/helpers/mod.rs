@@ -18,6 +18,7 @@ pub mod capella;
 pub mod electra;
 pub mod finality;
 pub mod fulu;
+pub mod gloas;
 pub mod math;
 pub mod misc;
 pub mod mutators;

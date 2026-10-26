@@ -129,6 +129,7 @@ impl NetworkDir {
         // once, before anything reads the config.
         let mut config = parsed.config;
         super::derive_genesis_fields(&mut config, genesis_state.genesis_time());
+        super::warn_if_unfollowed_fork_scheduled(config.config_name.as_str(), &config);
 
         Ok(Self {
             config,

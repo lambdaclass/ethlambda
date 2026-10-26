@@ -241,7 +241,9 @@ fn run_case(case: &Case, config: &Config) -> Result<(), String> {
     let steps: Vec<Step> = case.yaml("steps");
     for (index, step) in steps.iter().enumerate() {
         let outcome = match &step.checks {
-            Some(checks) => super::fork_choice::apply_checks(&mut store, checks, config),
+            Some(checks) => {
+                super::fork_choice::apply_checks(&mut store, checks, config, &committees)
+            }
             None => apply_step(&mut store, case, step, config, &committees),
         };
         outcome.map_err(|err| format!("step {index}: {err}"))?;
