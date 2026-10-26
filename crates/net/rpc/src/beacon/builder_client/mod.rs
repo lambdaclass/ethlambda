@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ethlambda_types::beacon::builder::SignedBuilderBid;
+use ethlambda_types::beacon::builder::{SignedBuilderBid, SignedValidatorRegistrationV1};
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{BlsPubkey, ExecutionBlockHash, Slot};
 use libssz::SszDecode as _;
@@ -45,6 +45,10 @@ const MAX_ERROR_TEXT: usize = 1024;
 /// `getHeader`'s `Accept` while the URL still takes SSZ: SSZ preferred and
 /// JSON acceptable, so a JSON-only builder answers instead of refusing.
 const ACCEPT_SSZ_FIRST: &str = "application/octet-stream;q=1.0,application/json;q=0.9";
+
+/// builder-specs gives `registerValidator` no deadline. Ten seconds covers a
+/// batch of a few thousand registrations.
+const REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A builder API endpoint: a relay, or MEV-Boost in front of several.
 #[derive(Debug, Clone)]
@@ -163,6 +167,43 @@ impl BuilderClient {
             .map_err(|err| BuilderError::from_reqwest(err, self.header_timeout))
     }
 
+    /// `registerValidator`: forwards signed registrations in one request.
+    ///
+    /// Always in JSON. MEV-Boost passes a registration's body and content
+    /// type to every relay unchanged and answers 200 if any one accepts it,
+    /// so an SSZ registration would be dropped without a word by every relay
+    /// that does not take SSZ.
+    pub async fn register_validators(
+        &self,
+        registrations: &[SignedValidatorRegistrationV1],
+    ) -> Result<(), BuilderError> {
+        let started = Instant::now();
+        let result = self.try_register_validators(registrations).await;
+        observe_builder_request("register_validators", outcome(&result), started.elapsed());
+        result
+    }
+
+    async fn try_register_validators(
+        &self,
+        registrations: &[SignedValidatorRegistrationV1],
+    ) -> Result<(), BuilderError> {
+        let body = serde_json::to_vec(registrations)
+            .map_err(|err| BuilderError::Encode(err.to_string()))?;
+        let response = self
+            .http
+            .post(self.url("/eth/v1/builder/validators"))
+            .timeout(REGISTER_TIMEOUT)
+            .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+            .body(body)
+            .send()
+            .await
+            .map_err(|err| BuilderError::from_reqwest(err, REGISTER_TIMEOUT))?;
+        match response.status() {
+            StatusCode::OK => Ok(()),
+            _ => Err(BuilderError::from_status(response, REGISTER_TIMEOUT).await),
+        }
+    }
+
     fn fall_back_to_json(&self) {
         info!("Builder refused SSZ; using JSON from now on");
         self.json_only.store(true, Ordering::Relaxed);
@@ -266,6 +307,11 @@ fn is_ssz(headers: &HeaderMap) -> bool {
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.starts_with(crate::SSZ_CONTENT_TYPE))
+}
+
+/// How a call that returns nothing on success ended, as a metric label.
+fn outcome<T>(result: &Result<T, BuilderError>) -> &'static str {
+    result.as_ref().map_or_else(BuilderError::label, |_| "ok")
 }
 
 fn unix_millis() -> u128 {

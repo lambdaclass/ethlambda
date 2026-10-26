@@ -8,7 +8,7 @@ use ethlambda_types::beacon::containers::electra::{self, ExecutionRequests};
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{BlsPubkey, ExecutionBlockHash, Uint256, Version};
 
-use super::mock_relay::MockRelay;
+use super::mock_relay::{MockRelay, signed_registration};
 use super::{BuilderClient, BuilderError, VersionedBid};
 
 /// Any version will do: the relay and the signers only have to agree on it.
@@ -292,4 +292,31 @@ async fn a_url_without_a_scheme_is_refused_up_front() {
         BuilderClient::new("localhost:18550", HEADER_TIMEOUT, "ethlambda/test"),
         Err(BuilderError::InvalidUrl(_))
     ));
+}
+
+#[tokio::test]
+async fn registrations_reach_the_relay_in_json() {
+    let relay = MockRelay::start(GENESIS_FORK_VERSION).await;
+    let registrations = vec![
+        signed_registration(0, GENESIS_FORK_VERSION),
+        signed_registration(1, GENESIS_FORK_VERSION),
+    ];
+    client_for(&relay)
+        .register_validators(&registrations)
+        .await
+        .unwrap();
+    // The relay refuses SSZ registrations, so arriving at all means JSON.
+    assert_eq!(relay.registrations(), registrations);
+}
+
+#[tokio::test]
+async fn a_registration_the_relay_refuses_is_a_bad_request() {
+    let relay = MockRelay::start(GENESIS_FORK_VERSION).await;
+    let mut registration = signed_registration(0, GENESIS_FORK_VERSION);
+    registration.signature = signed_registration(1, GENESIS_FORK_VERSION).signature;
+    assert!(matches!(
+        client_for(&relay).register_validators(&[registration]).await,
+        Err(BuilderError::BadRequest(message)) if message == "invalid signature"
+    ));
+    assert!(relay.registrations().is_empty());
 }

@@ -8,13 +8,19 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Router;
+use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
+use ethlambda_state_transition::beacon::bls;
 use ethlambda_state_transition::beacon::helpers::test_state::{secret_key_for, sign_for};
-use ethlambda_types::beacon::builder::{BuilderBid, SignedBuilderBid};
-use ethlambda_types::beacon::primitives::{BlsPubkey, HashTreeRoot as _, Version};
+use ethlambda_types::beacon::builder::{
+    BuilderBid, SignedBuilderBid, SignedValidatorRegistrationV1, ValidatorRegistrationV1,
+};
+use ethlambda_types::beacon::primitives::{
+    BlsPubkey, ExecutionAddress, HashTreeRoot as _, Version,
+};
 use ethlambda_types::beacon::signing::{compute_builder_domain, compute_signing_root};
 use libssz::SszEncode as _;
 
@@ -35,6 +41,7 @@ struct RelayState {
     bid: Option<VersionedBid>,
     header_requests: Vec<HeaderRequest>,
     raw_answer: Option<RawAnswer>,
+    registrations: Vec<SignedValidatorRegistrationV1>,
 }
 
 /// A fixed answer to every `getHeader`.
@@ -74,6 +81,7 @@ impl MockRelay {
                 "/eth/v1/builder/header/{slot}/{parent_hash}/{pubkey}",
                 get(header),
             )
+            .route("/eth/v1/builder/validators", post(register))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -122,6 +130,10 @@ impl MockRelay {
     /// Serve `bid` to every `getHeader`.
     pub(crate) fn offer(&self, bid: VersionedBid) {
         self.state.lock().unwrap().bid = Some(bid);
+    }
+
+    pub(crate) fn registrations(&self) -> Vec<SignedValidatorRegistrationV1> {
+        self.state.lock().unwrap().registrations.clone()
     }
 
     pub(crate) fn header_requests(&self) -> Vec<HeaderRequest> {
@@ -204,4 +216,64 @@ async fn header(
         let body = serde_json::json!({ "version": fork.as_str(), "data": bid }).to_string();
         ([(header::CONTENT_TYPE, "application/json")], body).into_response()
     }
+}
+
+async fn register(State(state): State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
+    let mut state = state.lock().unwrap();
+    // The client always registers in JSON (see `register_validators`); an
+    // SSZ registration here is a regression.
+    if is_ssz_request(&headers) {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    }
+    let Ok(registrations) = serde_json::from_slice::<Vec<SignedValidatorRegistrationV1>>(&body)
+    else {
+        return bad_request("invalid JSON");
+    };
+    let domain = compute_builder_domain(state.genesis_fork_version);
+    for registration in &registrations {
+        let root = compute_signing_root(registration.message.hash_tree_root(), domain);
+        if !bls::verify(&registration.message.pubkey, root, &registration.signature) {
+            return bad_request("invalid signature");
+        }
+    }
+    state.registrations.extend(registrations);
+    StatusCode::OK.into_response()
+}
+
+/// Test validator `index`'s registration, signed with its key for the chain
+/// whose genesis fork version is `genesis_fork_version`.
+pub(crate) fn signed_registration(
+    index: usize,
+    genesis_fork_version: Version,
+) -> SignedValidatorRegistrationV1 {
+    let message = ValidatorRegistrationV1 {
+        fee_recipient: ExecutionAddress::repeat_byte(0x11),
+        gas_limit: 60_000_000,
+        timestamp: 1_700_000_000,
+        pubkey: BlsPubkey(secret_key_for(index).sk_to_pk().to_bytes()),
+    };
+    let domain = compute_builder_domain(genesis_fork_version);
+    let root = compute_signing_root(message.hash_tree_root(), domain);
+    SignedValidatorRegistrationV1 {
+        message,
+        signature: sign_for(index, root),
+    }
+}
+
+fn is_ssz_request(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with(crate::SSZ_CONTENT_TYPE))
+}
+
+/// builder-specs' `ErrorMessage` body for a 400.
+fn bad_request(message: &str) -> Response {
+    let body = serde_json::json!({ "code": 400, "message": message }).to_string();
+    (
+        StatusCode::BAD_REQUEST,
+        [(header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response()
 }
