@@ -48,6 +48,7 @@ use ethlambda_blockchain::checkpoint_hash;
 use ethlambda_engine::{
     CustodyColumns, EngineClient, ForkchoiceStateV1,
     building::{BuiltGloasPayload, PayloadAttributesV3, PayloadAttributesV4},
+    types::ClientVersionV1,
 };
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
@@ -106,6 +107,7 @@ use crate::beacon::{
     ApiError, BodyEncoding,
     bid_selection::{LocalCandidate, PayloadChoice, bid_total_gwei, choose_payload, wei_u128},
     builder_config::{BuilderConfig, decode_builder_config},
+    graffiti::{self, OwnVersion},
     proposal::{Blobs, CellKzgProofs, decimal, randao_verification, require_gloas_slot},
     validator::{FeeRecipients, head},
 };
@@ -223,6 +225,7 @@ async fn post_produce_block(
     Extension(fee_recipients): Extension<FeeRecipients>,
     Extension(custody): Extension<NodeCustodyColumns>,
     Extension(cache): Extension<PayloadCache>,
+    Extension(OwnVersion(own_version)): Extension<OwnVersion>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -283,6 +286,7 @@ async fn post_produce_block(
         &ptc_pool,
         &fee_recipients,
         &custody,
+        &own_version,
         slot,
         query.randao_reveal,
         randao,
@@ -441,6 +445,7 @@ async fn produce(
     ptc_pool: &SharedPayloadAttestationPool,
     fee_recipients: &FeeRecipients,
     custody: &NodeCustodyColumns,
+    own_version: &ClientVersionV1,
     slot: Slot,
     randao_reveal: BlsSignature,
     randao: RandaoVerification,
@@ -455,13 +460,27 @@ async fn produce(
     .map_err(|_| ApiError::Internal("preparing the block failed"))??;
 
     // The local build first: bids keep arriving while the engine works, and
-    // are read once it is done.
-    let local = match engine {
-        Some(engine) => {
-            Some(build_local(store, engine, fee_recipients, custody, &prepared, slot).await)
-        }
-        None => None,
-    };
+    // are read once it is done. The execution client's version is asked
+    // alongside the build rather than before it, so a healthy execution client
+    // costs the block nothing for its version and a silent one costs it at most
+    // the version's own timeout.
+    let (local, el_version) = tokio::join!(
+        async {
+            match engine {
+                Some(engine) => {
+                    Some(build_local(store, engine, fee_recipients, custody, &prepared, slot).await)
+                }
+                None => None,
+            }
+        },
+        async {
+            match engine {
+                Some(engine) => graffiti::execution_client_version(engine, own_version).await,
+                None => None,
+            }
+        },
+    );
+    let graffiti = graffiti::with_client_versions(graffiti, el_version.as_ref(), own_version);
     let (local, local_error) = match local {
         Some(Ok(local)) => (Some(local), None),
         Some(Err(err)) => (None, Some(err)),
@@ -563,6 +582,7 @@ async fn produce(
         proposer = block.proposer_index,
         attestations = block.body.attestations.len(),
         payload_attestations = block.body.payload_attestations.len(),
+        graffiti = %graffiti::display(&block.body.graffiti),
         blobs = built.blobs_bundle.blobs.len(),
         "Produced gloas block"
     );
@@ -1175,6 +1195,12 @@ mod tests {
             .layer(Extension(SharedBuilderMarket::default()))
             .layer(Extension(FeeRecipients::default()))
             .layer(Extension(NodeCustodyColumns::default()))
+            .layer(Extension(OwnVersion(Arc::new(ClientVersionV1 {
+                code: "LA".to_string(),
+                name: "ethlambda".to_string(),
+                version: "ethlambda/test".to_string(),
+                commit: "0x3c4d7e8f".to_string(),
+            }))))
     }
 
     fn produce_request(slot: Slot, query: &str, body: &str) -> Request<Body> {

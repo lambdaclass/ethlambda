@@ -44,7 +44,6 @@ use command::Command;
 use ethlambda_blockchain::block_builder::ProposerConfig;
 use ethlambda_blockchain::key_manager::{KeyRole, ValidatorKeyPair};
 use ethlambda_crypto::signature::ValidatorSecretKey;
-use ethlambda_engine::types::ClientVersionV1;
 use ethlambda_engine::{EngineClient, JwtSecret};
 use ethlambda_network_api::{
     BlockArrival, InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef,
@@ -300,19 +299,19 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     ethlambda_blockchain::metrics::init();
     ethlambda_p2p::metrics::init();
     ethlambda_state_transition::metrics::init();
-    ethlambda_blockchain::metrics::set_node_info("ethlambda", version::CLIENT_VERSION);
+    ethlambda_blockchain::metrics::set_node_info("ethlambda", version::client_version());
     ethlambda_blockchain::metrics::set_node_start_time();
 
     let rpc_config = RpcConfig {
         http_address: common.http_address,
         api_port: common.api_port,
         metrics_port: common.metrics_port,
-        version: version::CLIENT_VERSION,
+        version: version::client_version(),
     };
 
     println!("\n{}", banner::for_locale());
 
-    info!(version = version::CLIENT_VERSION, "Starting ethlambda");
+    info!(version = version::client_version(), "Starting ethlambda");
 
     // Raise the soft open-file-descriptor limit to the hard limit. RocksDB
     // keeps an unbounded table cache (`set_max_open_files(-1)`), so on
@@ -612,34 +611,13 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                         .map_err(|err| eyre::eyre!("building the engine client: {err}"))?;
                     info!(endpoint = %options.endpoint, "Execution client configured");
 
-                    let ours = ClientVersionV1 {
-                        // `identification.md` reserves two-letter codes per
-                        // client; none is assigned to ethlambda, and `XX` is
-                        // what the document names for a client without one.
-                        code: "XX".to_string(),
-                        name: "ethlambda".to_string(),
-                        version: version::CLIENT_VERSION.to_string(),
-                        // `identification.md` types `commit` as DATA, 4 bytes,
-                        // and geth decodes it into `hexutil.Bytes`, which
-                        // rejects a bare hex string with "hex string without
-                        // 0x prefix". So the prefix is not cosmetic: without
-                        // it `engine_getClientVersionV1` comes back an RPC
-                        // error and the handshake below never identifies
-                        // anything. `get` rather than a slice or `take(8)`,
-                        // since `VERGEN_GIT_SHA` is not guaranteed to be eight
-                        // or more characters in every build configuration.
-                        commit: format!(
-                            "0x{}",
-                            env!("VERGEN_GIT_SHA").get(..8).unwrap_or("00000000")
-                        ),
-                    };
                     // A handshake failure is not a reason to refuse to run: the
                     // execution client may simply be starting up, and every
                     // call that matters has its own retry ladder.
                     let gloas_scheduled = store.config().gloas_fork_epoch
                         != ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
                     let _ = client
-                        .handshake(&ours, gloas_scheduled)
+                        .handshake(&version::engine_client_version(), gloas_scheduled)
                         .await
                         .inspect_err(|err| warn!(%err, "Engine API handshake failed"));
 
@@ -706,7 +684,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         // the loop has stopped asking for.
         target_peers: common.discovery.target_peers,
         wire: setup.wire,
-        agent_version: version::CLIENT_VERSION,
+        agent_version: version::client_version(),
     })
     .wrap_err("failed to build swarm")?;
 
@@ -781,6 +759,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     custody_columns: rpc_custody_columns,
                     engine: rpc_engine,
                     events: rpc_events,
+                    client_version: version::engine_client_version(),
                 },
                 local_peer_id,
                 rpc_shutdown,

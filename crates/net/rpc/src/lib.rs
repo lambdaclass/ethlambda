@@ -1,4 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 use axum::{Extension, Router};
 use ethlambda_blockchain::{EventBus, SyncStatusController};
@@ -211,12 +212,17 @@ pub struct BeaconApiHandles {
     /// the execution client it samples for when asking it to build a gloas
     /// payload.
     pub custody_columns: CustodyColumns,
-    /// The execution client block production builds payloads with; `None`
-    /// makes it answer 503.
+    /// The execution client block production builds payloads with. `None`
+    /// makes block production, attestation data and aggregation answer 503:
+    /// with nothing validating payloads, none has a block it may vouch for.
     pub engine: Option<ethlambda_engine::EngineClient>,
     /// The chain-event bus `/eth/v1/events` streams from. Read only there:
     /// the chain actor is its only publisher, so no endpoint here writes to it.
     pub events: EventBus,
+    /// This build as the Engine API identifies it. Block production appends
+    /// its code and commit, with the execution client's, to every block's
+    /// graffiti.
+    pub client_version: ethlambda_engine::types::ClientVersionV1,
 }
 
 /// Start the HTTP servers for a beacon node.
@@ -242,7 +248,10 @@ pub async fn start_beacon_rpc_server(
         .layer(Extension(handles.custody_columns))
         .layer(Extension(beacon::validator::FeeRecipients::default()))
         .layer(Extension(handles.engine))
-        .layer(Extension(handles.events));
+        .layer(Extension(handles.events))
+        .layer(Extension(beacon::graffiti::OwnVersion(Arc::new(
+            handles.client_version,
+        ))));
     start_http_servers(config, Some(api_router), shutdown).await
 }
 
@@ -652,6 +661,15 @@ pub(crate) mod test_utils {
             },
             signature: Default::default(),
         }
+    }
+
+    /// A configured execution client, for endpoints that only ask whether a
+    /// node has one. Nothing listens at its endpoint, so a test that reaches
+    /// the network through it fails instead of passing by accident.
+    pub(crate) fn idle_engine() -> Option<ethlambda_engine::EngineClient> {
+        let secret = ethlambda_engine::JwtSecret::new([0; 32]);
+        let client = ethlambda_engine::EngineClient::new("http://127.0.0.1:9".into(), secret);
+        Some(client.expect("building a client opens no connection"))
     }
 
     /// A beacon store whose anchor, and so head, is `state`, under a block at
