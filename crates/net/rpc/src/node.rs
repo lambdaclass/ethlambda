@@ -175,7 +175,7 @@ mod tests {
 
     #[tokio::test]
     async fn node_identity_reports_version_and_peer_id() {
-        // The binary injects the real `CLIENT_VERSION` and local peer ID; here we
+        // The binary injects the real `client_version()` and local peer ID; here we
         // inject sentinels and assert they round-trip verbatim.
         const VERSION: &str =
             "ethlambda/v9.9.9-test-deadbeef/x86_64-unknown-linux-gnu/rustc-v1.92.0";
