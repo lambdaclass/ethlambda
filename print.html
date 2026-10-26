@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-8b514d79.js";
+            window.path_to_searchindex_js = "searchindex-29c2506e.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-34fa44cf.js"></script>
+        <script src="toc-dd44a827.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -3581,7 +3581,9 @@ from one place, and were removed outright by capella. Nothing here changes them.
 </tbody>
 </table>
 </div>
-<p>Two subcommands follow no chain. <code>ethlambda benchmark</code> is the offline
+<p>Three subcommands follow no chain. <code>ethlambda replay-era</code> replays real chain
+history from <code>.era</code> files and checks it against the states stored in them; see
+<a href="#era-replay"><code>era_replay.md</code></a> for its flags and checks. <code>ethlambda benchmark</code> is the offline
 benchmarking harness, covering block building (<code>benchmark synthetic</code>, run
 through <code>make bench</code>) and block import (<code>benchmark import fetch</code> /
 <code>benchmark import replay</code>). See <a href="#benchmarking"><code>benchmarking.md</code></a> for
@@ -3593,7 +3595,7 @@ against a beacon node over the standard REST API, documented in
 <h2 id="node-is-the-default"><a class="header" href="#node-is-the-default"><code>node</code> is the default</a></h2>
 <p>clap has no native default subcommand, so the binary rewrites its own argv
 before parsing. If the first argument is not <code>node</code>, <code>beacon</code>, <code>benchmark</code>,
-<code>validator</code>, <code>help</code>, <code>-h</code>, <code>--help</code>, <code>-V</code>, or <code>--version</code>, then <code>node</code> is
+<code>replay-era</code>, <code>validator</code>, <code>help</code>, <code>-h</code>, <code>--help</code>, <code>-V</code>, or <code>--version</code>, then <code>node</code> is
 inserted ahead of it. The function is <code>inject_default_subcommand</code> in
 <code>bin/ethlambda/src/command.rs</code>. Every subcommand has to be listed there: a
 missing one would have <code>node</code> inserted ahead of it and become unreachable.</p>
@@ -7353,6 +7355,179 @@ in the same order. Each sample’s <code>block_root</code> is a per-block checks
 exactly that: if a change alters the sequence of roots a corpus produces, it
 changed what got imported, not just how fast, and a timing comparison against
 that run means something different than intended.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="era-replay"><a class="header" href="#era-replay">Era replay</a></h1>
+<p><code>ethlambda replay-era</code> replays real chain history from <code>.era</code> files through the
+Beacon Chain state transition. Era files carry every block of 8192 slots plus
+the state at the end of them, so they are history that no node has to still
+hold, unlike <code>benchmark import</code>, which reads a running node’s Beacon API. The
+command exists to catch state-transition divergences on real data across every
+fork, including the upgrade itself.</p>
+<h2 id="what-a-run-checks"><a class="header" href="#what-a-run-checks">What a run checks</a></h2>
+<p>For era <code>N</code>, file <code>N</code> holds the blocks of slots <code>[(N-1)*8192, N*8192)</code> and the
+state at slot <code>N*8192</code>. The command decodes the state stored in file <code>N-1</code>,
+then applies each block of file <code>N</code> in slot order with
+<code>stf::state_transition(.., validate_result = true, ..)</code> and one <code>CommitteeCache</code>
+for the whole run:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Check</th><th>Where</th></tr>
+</thead>
+<tbody>
+<tr><td>Proposer signature, randao, attestations, sync aggregate, deposits, exits</td><td>every block, always on</td></tr>
+<tr><td>Block <code>state_root</code> equals the post-state’s root</td><td>every block</td></tr>
+<tr><td>Block root equals <code>block_roots[slot % 8192]</code> of the stored end state</td><td>after the era</td></tr>
+<tr><td><code>state_roots[N*8192 - 1]</code> of the stored state equals our state’s root at the last slot before the boundary</td><td>after the era</td></tr>
+<tr><td>Our full state root at <code>N*8192</code> equals the stored state’s</td><td>after the era, only when slot <code>N*8192</code> is empty</td></tr>
+</tbody>
+</table>
+</div>
+<p>The execution payload is not run: the engine answers <code>valid</code>, so structural
+payload checks (parent hash, <code>prev_randao</code>, timestamp, commitment limit) run and
+the EL verdict does not.</p>
+<h3 id="the-block-at-the-end-slot"><a class="header" href="#the-block-at-the-end-slot">The block at the end slot</a></h3>
+<p>An era state is the state with the block at its own slot applied, and that
+block is stored in the next file. Two consequences: a starting state may
+already contain the first block of file <code>N</code> (blocks at or below the state’s slot
+are skipped and counted as <code>blocks_already_in_state</code>), and the closing state
+may include a block we do not have. The <code>state_roots</code> check needs nothing from
+file <code>N+1</code>, which is why it is the primary end-of-era check; the full-state
+comparison runs only when the stored state’s <code>latest_block_header</code> is older than
+<code>N*8192</code>, i.e. the slot is empty.</p>
+<h3 id="chaining-and-fork-upgrades"><a class="header" href="#chaining-and-fork-upgrades">Chaining and fork upgrades</a></h3>
+<p>Consecutive <code>--era</code> values continue from the same in-memory state without
+re-decoding. A fork upgrade is exercised by our own <code>process_slots</code>: replaying
+era 1607 (mainnet) from file 1606’s electra state, advancing to slot
+<code>1607*8192</code> runs the fulu upgrade, and the result is compared with the fulu state
+stored in file 1607 when that slot is empty. Era 1608 then applies the first
+fulu blocks. A non-consecutive era starts fresh from its predecessor’s file.</p>
+<p>Fork files are <code>F = fork_epoch / 256</code>. File <code>F</code> holds the <strong>last pre-fork</strong>
+blocks (slots up to the fork epoch), and the upgrade happens in our closing
+<code>process_slots</code>, so replaying <code>F</code> exercises the upgrade at the very end. The
+first post-fork blocks are in file <code>F+1</code>, which is why CI chains <code>F+F+1</code>:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Network</th><th>altair</th><th>bellatrix</th><th>capella</th><th>deneb</th><th>electra</th><th>fulu</th><th>gloas</th></tr>
+</thead>
+<tbody>
+<tr><td>mainnet</td><td>290 (not in CI, see Known limits)</td><td>566</td><td>758</td><td>1053</td><td>1422</td><td>1607</td><td>n/a</td></tr>
+<tr><td>sepolia</td><td>in era 0</td><td>in era 0</td><td>222</td><td>518</td><td>869</td><td>1065</td><td>1379</td></tr>
+<tr><td>hoodi</td><td>genesis</td><td>genesis</td><td>genesis</td><td>genesis</td><td>8</td><td>198</td><td>n/a</td></tr>
+</tbody>
+</table>
+</div>
+<p>An era whose closing state is at or past a fork this build cannot process
+(Sepolia gloas, era 1379 and later) is refused up front with the last
+replayable era named. The check reads <code>GLOAS_FORK_EPOCH</code> from the network’s
+<code>config.yaml</code>, which <code>Config</code> itself drops.</p>
+<h2 id="command-line-1"><a class="header" href="#command-line-1">Command line</a></h2>
+<pre><code>ethlambda replay-era --network &lt;mainnet|sepolia|hoodi|dir&gt; --era-dir &lt;dir&gt; \
+    --era &lt;N&gt; [--era &lt;N2&gt; ...] [--download] [--max-blocks K] [--report &lt;path.json&gt;]
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--network</code></td><td>Resolved like <code>beacon</code>’s: a built-in name or a directory of published files. Its <code>CONFIG_NAME</code> names the era files and the host</td></tr>
+<tr><td><code>--era-dir</code></td><td>Where <code>&lt;config-name&gt;-&lt;NNNNN&gt;-&lt;8 hex&gt;.era</code> files are read from and downloaded to</td></tr>
+<tr><td><code>--era</code></td><td>Repeatable. A number, or <code>latest</code> (newest era the host lists; needs <code>--download</code>)</td></tr>
+<tr><td><code>--download</code></td><td>Fetch missing files from <code>https://&lt;network&gt;.era.nimbus.team/</code>, matching the <code>&lt;network&gt;-&lt;NNNNN&gt;-</code> prefix in the index page. Written to <code>.part</code>, renamed on success</td></tr>
+<tr><td><code>--max-blocks</code></td><td>Smoke mode: stop the era after K applied blocks. Per-block checks still run; the end-of-era checks are skipped and reported as <code>skipped</code>. Takes a single <code>--era</code>; combining it with several is a CLI error, since a smoke run stops mid-era and cannot chain</td></tr>
+<tr><td><code>--report</code></td><td>JSON array with one entry per era: network, era, <code>blocks_applied</code>, <code>blocks_already_in_state</code>, <code>skipped_empty_slots</code>, <code>elapsed_secs</code>, <code>apply_secs</code>, <code>mean_ms_per_block</code>, the oracle checks with their outcome, and <code>error</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Every era needs two files, its own and its predecessor’s: about 1.5 GB for a
+recent mainnet era. The command logs one line per era start and end and a
+progress line every 512 blocks, and exits non-zero on any failure, after
+writing the report. A mismatch names the era, slot, expected and actual roots.</p>
+<p>The e2store reader (<code>bin/ethlambda/src/era/e2store.rs</code>) reads the trailing slot
+indices first and then seeks to single records, so a file is never held in memory
+whole; only the one state being decoded is.</p>
+<h2 id="ci"><a class="header" href="#ci">CI</a></h2>
+<p><code>.github/workflows/era_replay.yml</code> runs on pushes to <code>main</code> that touch the
+state transition, the types, the ssz-tree or the era module, and on manual
+dispatch. It builds nothing: it waits for <code>docker_publish.yaml</code>’s
+<code>ghcr.io/lambdaclass/ethlambda:sha-&lt;7&gt;</code> tag and runs <code>replay-era</code> in it, one job
+per entry:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Network</th><th>Entries</th></tr>
+</thead>
+<tbody>
+<tr><td>mainnet</td><td>566, 758, 1053, 1422, 1607+1608, latest (full eras)</td></tr>
+<tr><td>sepolia</td><td>222, 518, 869, 1065+1066, 1378 (full eras)</td></tr>
+<tr><td>hoodi</td><td>8, 198+199, latest (full eras, need the #648 cache, see Known limits)</td></tr>
+</tbody>
+</table>
+</div>
+<p>Hoodi era 8 is the last deneb blocks, with the electra upgrade (epoch 2048) in
+our closing <code>process_slots</code>; <code>198+199</code> is the fulu upgrade (epoch 50688) plus
+the first fulu era.</p>
+<p>Each job uploads its <code>report.json</code>; a failed push run posts the commit, the
+failing entries and the run URL to Slack. Manual dispatch takes an <code>image</code> and
+an <code>eras</code> override of space-separated <code>network:era[+era...][@K]</code> entries, where
+<code>@K</code> adds <code>--max-blocks K</code> (single era only), e.g.
+<code>mainnet:290 hoodi:199 hoodi:9@512</code>.</p>
+<h2 id="known-limits"><a class="header" href="#known-limits">Known limits</a></h2>
+<ul>
+<li><strong>Phase0 is quadratic.</strong> Mainnet era 290 is excluded from the matrix, see
+“Phase0 eras are not practical yet” below. The override can still request it.</li>
+<li><strong>Full Hoodi eras depend on #648.</strong> Without the per-epoch
+total-active-balance cache from #648, a deneb-era block costs about 4.6 s
+against 0.65 s on mainnet, because <code>get_base_reward_per_increment</code> scans the
+whole registry once per attestation (<code>stf/deneb.rs:359</code>,
+<code>stf/electra.rs:764</code>). A full era would then exceed the job limit.</li>
+<li><strong>Smoke runs do not cross fork boundaries.</strong> A <code>--max-blocks</code> run stops
+mid-era, so it never reaches the closing <code>process_slots</code> where the upgrade
+runs, and it skips the end-of-era checks. The CI matrix has no smoke entries;
+they are available through the <code>eras</code> override (<code>@K</code>).</li>
+</ul>
+<h2 id="measured-runtimes"><a class="header" href="#measured-runtimes">Measured runtimes</a></h2>
+<p>Measured on an Apple-silicon laptop with the <code>release-fast</code> binary, one core
+busy (<code>mean ms/block</code> covers block decode, the state transition and epoch
+processing; downloads and the end-of-era checks are excluded):</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Run</th><th>Result</th></tr>
+</thead>
+<tbody>
+<tr><td>Sepolia era 1, full (7627 blocks, crosses altair and bellatrix)</td><td>116 s, 15.2 ms/block, all three end-of-era checks as below</td></tr>
+<tr><td>Sepolia eras 2+3+4, chained</td><td>about 120 s each, 15 ms/block, <code>state_roots</code> and <code>block_roots</code> passed; <code>Continuing from the previous era's in-memory state</code> logged</td></tr>
+<tr><td>Sepolia era 31, full (slot 253952 empty)</td><td>108 s, 15.9 ms/block, <code>state_roots</code>, <code>block_roots</code> and <code>full_state_root</code> all passed</td></tr>
+<tr><td>Mainnet era 1888 (latest, fulu blocks), <code>--max-blocks 64</code></td><td>653 ms/block, every proposer signature and <code>state_root</code> passed; 1.5 GB download in about 2 min</td></tr>
+<tr><td>Hoodi era 8, <code>--max-blocks 256</code></td><td>4.6 s/block (1178 s; a second replay was running on the machine)</td></tr>
+</tbody>
+</table>
+</div>
+<p>A full recent era is 8192 blocks, so mainnet at 0.65 s/block is about 90 minutes
+and Hoodi at 4.6 s/block is about 10 hours: a full Hoodi era does not fit the
+330 minute job limit of a hosted runner at that speed, which is why the matrix
+relies on #648.</p>
+<h3 id="phase0-eras-are-not-practical-yet"><a class="header" href="#phase0-eras-are-not-practical-yet">Phase0 eras are not practical yet</a></h3>
+<p>The beacon STF’s phase0 epoch processing is quadratic in the validator count:
+<code>get_base_reward</code> calls <code>get_total_active_balance</code>, which walks the whole
+registry, once per validator per reward component
+(<code>stf/epoch/rewards.rs</code>). Mainnet era 2 (about 20k validators) spends roughly
+30 s per epoch boundary, 512 blocks in 484 s, and mainnet era 290 (about 280k
+validators) did not finish its first epoch boundary in 30 minutes. Phase0 eras
+past the first few hundred need that total hoisted out of the per-validator
+loop first; the spec fixtures are far too small to show it. Eras from altair
+on do not have the problem.</p>
+<p>The end-of-era checks, as observed on real files: slot <code>N*8192</code> held a block in
+every boundary checked except era 31 on Sepolia, so <code>full_state_root</code> is usually
+skipped and <code>state_roots[last slot]</code> plus <code>block_roots</code> carry the check.</p>
+<h3 id="file-format-notes"><a class="header" href="#file-format-notes">File format notes</a></h3>
+<p>Verified against real nimbus files: the slot index marks an empty slot by
+pointing at byte 0 (the Version record) rather than by offset 0 as the
+specification says, so both are read as empty. Block and state records are
+snappy framed; offsets are relative to the index record’s own start.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="spec-deviations"><a class="header" href="#spec-deviations">Spec Deviations</a></h1>
 <p>ethlambda diverges from its reference specifications in a few places. This page

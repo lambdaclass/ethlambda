@@ -34,10 +34,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-8b514d79.js";
+            window.path_to_searchindex_js = "searchindex-29c2506e.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-34fa44cf.js"></script>
+        <script src="toc-dd44a827.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -193,7 +193,9 @@
 </tbody>
 </table>
 </div>
-<p>Two subcommands follow no chain. <code>ethlambda benchmark</code> is the offline
+<p>Three subcommands follow no chain. <code>ethlambda replay-era</code> replays real chain
+history from <code>.era</code> files and checks it against the states stored in them; see
+<a href="./era_replay.html"><code>era_replay.md</code></a> for its flags and checks. <code>ethlambda benchmark</code> is the offline
 benchmarking harness, covering block building (<code>benchmark synthetic</code>, run
 through <code>make bench</code>) and block import (<code>benchmark import fetch</code> /
 <code>benchmark import replay</code>). See <a href="./benchmarking.html"><code>benchmarking.md</code></a> for
@@ -205,7 +207,7 @@ against a beacon node over the standard REST API, documented in
 <h2 id="node-is-the-default"><a class="header" href="#node-is-the-default"><code>node</code> is the default</a></h2>
 <p>clap has no native default subcommand, so the binary rewrites its own argv
 before parsing. If the first argument is not <code>node</code>, <code>beacon</code>, <code>benchmark</code>,
-<code>validator</code>, <code>help</code>, <code>-h</code>, <code>--help</code>, <code>-V</code>, or <code>--version</code>, then <code>node</code> is
+<code>replay-era</code>, <code>validator</code>, <code>help</code>, <code>-h</code>, <code>--help</code>, <code>-V</code>, or <code>--version</code>, then <code>node</code> is
 inserted ahead of it. The function is <code>inject_default_subcommand</code> in
 <code>bin/ethlambda/src/command.rs</code>. Every subcommand has to be listed there: a
 missing one would have <code>node</code> inserted ahead of it and become unreachable.</p>
