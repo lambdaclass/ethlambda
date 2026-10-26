@@ -38,7 +38,7 @@ use ethlambda_state_transition::beacon::{
     helpers::altair::compute_sync_committee_period,
 };
 
-use crate::beacon::{ApiError, refuse_unfollowed_epoch};
+use crate::beacon::{ApiError, refuse_validator_duties_from_gloas};
 
 pub(crate) fn routes() -> Router<Store> {
     Router::new()
@@ -163,7 +163,7 @@ fn sync_duties(
     }
 
     Ok(serde_json::json!({
-        "execution_optimistic": store.is_beacon_optimistic(head_root),
+        "execution_optimistic": crate::shared::optimistic::block_is_optimistic(store, head_root),
         "data": duties,
     }))
 }
@@ -449,7 +449,7 @@ fn proposer_duties(
     dependent: DependentRoot,
 ) -> Result<serde_json::Value, ApiError> {
     let epoch = parse_epoch(epoch)?;
-    refuse_unfollowed_epoch(
+    refuse_validator_duties_from_gloas(
         &store.config(),
         epoch,
         "gloas proposer duties are not supported",
@@ -551,7 +551,7 @@ fn attester_duties(
         .map(|index| index.parse::<ValidatorIndex>())
         .collect::<Result<std::collections::HashSet<_>, _>>()
         .map_err(|_| ApiError::BadRequest("invalid validator index"))?;
-    refuse_unfollowed_epoch(
+    refuse_validator_duties_from_gloas(
         &store.config(),
         epoch,
         "gloas attester duties are not supported",
@@ -642,7 +642,7 @@ async fn get_attestation_data(
 }
 
 fn attestation_data(store: &Store, slot: Slot) -> Result<AttestationData, ApiError> {
-    refuse_unfollowed_epoch(
+    refuse_validator_duties_from_gloas(
         &store.config(),
         compute_epoch_at_slot(slot),
         "gloas attestation data is not supported",

@@ -369,11 +369,18 @@ async fn build_payload(
             );
             ExecutionAddress::ZERO
         });
-    let el_hash = |root: H256| store.beacon_el_block_hash(root).unwrap_or(H256::ZERO);
+    // The same rule `forkchoiceUpdated` uses for a checkpoint block (a gloas
+    // one is its bid's parent hash), so the two calls never disagree.
     let forkchoice = ForkchoiceStateV1 {
         head_block_hash: inputs.parent_hash,
-        safe_block_hash: el_hash(store.beacon_justified_checkpoint().root),
-        finalized_block_hash: el_hash(store.beacon_finalized_checkpoint().root),
+        safe_block_hash: ethlambda_blockchain::checkpoint_hash(
+            store,
+            store.beacon_justified_checkpoint().root,
+        ),
+        finalized_block_hash: ethlambda_blockchain::checkpoint_hash(
+            store,
+            store.beacon_finalized_checkpoint().root,
+        ),
     };
     let attributes = PayloadAttributesV3 {
         timestamp: inputs.timestamp,
