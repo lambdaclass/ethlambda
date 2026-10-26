@@ -59,9 +59,9 @@ pub fn graffiti_to_text(graffiti: &Bytes32) -> String {
 
 /// The gas limit a validator with no override reports.
 ///
-/// Lighthouse's and Nimbus's default. Nothing in this client uses it yet: it
-/// matters only to builder registrations, and there is no builder flow. It is
-/// held so the keymanager API can serve it as the specification requires.
+/// Lighthouse's and Nimbus's default. Builder registrations carry it as the
+/// gas limit the builder should target, and the keymanager API serves it as the
+/// specification requires.
 pub const DEFAULT_GAS_LIMIT: u64 = 60_000_000;
 
 /// One validator's overrides; `None` means the default applies.

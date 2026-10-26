@@ -1504,6 +1504,7 @@ mod gloas {
                     None,
                 ),
             ),
+            None,
         );
         let duty = ProposerDutyDto {
             pubkey: encode_hex(&pubkey.0),
@@ -1622,6 +1623,7 @@ mod gloas {
                     None,
                 ),
             ),
+            None,
         );
         let duty = ProposerDutyDto {
             pubkey: encode_hex(&pubkey.0),

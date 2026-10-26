@@ -71,6 +71,7 @@ use crate::keys::ValidatorStore;
 use crate::payload_attestation::PayloadAttestationService;
 use crate::proposal::ProposalService;
 use crate::proposer_settings::ProposerSettings;
+use crate::registration::RegistrationService;
 use crate::signing::SigningContext;
 use crate::slot_clock::SlotClock;
 use crate::sync_committee::SyncCommitteeService;
@@ -96,6 +97,18 @@ pub struct ValidatorConfig {
     /// Bind address for the keymanager API. `None` when `--enable-keymanager`
     /// was not passed, in which case it is never spawned.
     pub keymanager: Option<std::net::SocketAddr>,
+    /// Builder proposals, or `None` when `--builder-proposals` is off.
+    pub builder: Option<BuilderProposals>,
+}
+
+/// Builder proposals: register each validator with the beacon node's builder
+/// and accept a blinded block when the builder's bid wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuilderProposals {
+    /// The `builder_boost_factor` sent with every pre-gloas block request:
+    /// 100 compares the bid and the local payload as they are; `u64::MAX`
+    /// takes the builder whenever there is a bid.
+    pub boost_factor: u64,
 }
 
 /// Run the validator client until the process is stopped.
@@ -203,7 +216,23 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     let aggregation = AggregationService::new(beacon_node.clone(), context.clone());
     let payload_attestation = PayloadAttestationService::new(beacon_node.clone(), context.clone());
     let sync_committee = SyncCommitteeService::new(beacon_node.clone(), context.clone());
-    let proposal = ProposalService::new(beacon_node.clone(), context.clone(), settings.clone());
+    let proposal = ProposalService::new(
+        beacon_node.clone(),
+        context.clone(),
+        settings.clone(),
+        config.builder.map(|builder| builder.boost_factor),
+    );
+    let registration = config.builder.map(|builder| {
+        info!(
+            boost_factor = builder.boost_factor,
+            "Builder proposals on: registering validators and accepting blinded blocks"
+        );
+        Arc::new(RegistrationService::new(
+            beacon_node.clone(),
+            context.clone(),
+            settings.clone(),
+        ))
+    });
 
     if let Some(address) = config.keymanager {
         let token = http_api::load_or_create_token(&config.validators_dir)?;
@@ -275,6 +304,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                 &settings,
                 &store,
                 &context,
+                registration.as_ref().map(|service| (service, &store)),
             );
             match refreshed.await {
                 Ok(()) => last_epoch = Some(epoch),
@@ -332,6 +362,15 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             &store,
         )
         .await;
+
+        // Off the slot loop, like the epoch's full send: a keymanager change
+        // to a fee recipient or gas limit reaches the builder within a slot,
+        // and a slow node cannot delay the next slot's duties.
+        if let Some(registration) = &registration {
+            let registration = registration.clone();
+            let store = store.clone();
+            tokio::spawn(async move { registration.register_changed(epoch, &store).await });
+        }
     }
 }
 
@@ -659,9 +698,20 @@ async fn propose<B: BeaconNodeApi>(
     }
 }
 
+/// What `refresh_epoch` needs to hand a spawned task the builder registration:
+/// the service and the store it signs from, both shared, since the task
+/// outlives the call.
+type RegistrationHandles<'a, B> = (
+    &'a Arc<RegistrationService<B>>,
+    &'a Arc<RwLock<ValidatorStore>>,
+);
+
 /// Resolve any newly activated validators, refresh the duty schedule, and
+///
+/// With `registration`, also spawns the epoch's full builder registration.
 /// re-send subnet subscriptions if it moved.
-async fn refresh_epoch<B: BeaconNodeApi>(
+#[allow(clippy::too_many_arguments)]
+async fn refresh_epoch<B: BeaconNodeApi + 'static>(
     beacon_node: &Arc<B>,
     duties: &mut DutiesService<B>,
     pubkeys: &[BlsPubkey],
@@ -669,6 +719,7 @@ async fn refresh_epoch<B: BeaconNodeApi>(
     settings: &ProposerSettings,
     store: &RwLock<ValidatorStore>,
     context: &SigningContext,
+    registration: Option<RegistrationHandles<'_, B>>,
 ) -> Result<()> {
     // Nothing to resolve, nothing to schedule, nothing to register. Returning
     // here also keeps an empty pubkey list away from `validator_indices`, whose
@@ -735,6 +786,16 @@ async fn refresh_epoch<B: BeaconNodeApi>(
             "Failed to register this client's fee recipients; blocks proposed this epoch may \
              pay somewhere else"
         );
+    }
+
+    // Spawned, so a slow or hung node never delays this epoch's duties: a
+    // missed registration costs at most a builder block, never a duty. Only
+    // the validators the node resolved are registered; it would drop the rest.
+    if let Some((registration, store)) = registration {
+        let registration = registration.clone();
+        let store = store.clone();
+        let registered: Vec<BlsPubkey> = entries.iter().map(|entry| entry.pubkey).collect();
+        tokio::spawn(async move { registration.register_all(epoch, registered, &store).await });
     }
 
     let changed = duties.refresh_around(epoch).await?;
@@ -895,6 +956,7 @@ mod tests {
             settings,
             &empty_store(),
             &context(),
+            None,
         )
         .await
         .expect("refreshes");
@@ -993,6 +1055,7 @@ mod tests {
             &settings(Some(H160([0xab; 20]))),
             &empty_store(),
             &context(),
+            None,
         )
         .await
         .expect("the refresh must survive a failed registration");
@@ -1019,6 +1082,7 @@ mod tests {
             &settings(Some(H160([0xab; 20]))),
             &empty_store(),
             &context(),
+            None,
         )
         .await
         .expect("a keyless client idles rather than failing");
@@ -1101,6 +1165,7 @@ mod tests {
             &settings(None),
             &empty_store(),
             &gloas_context(4),
+            None,
         )
         .await
         .expect("refreshes");
@@ -1122,6 +1187,7 @@ mod tests {
             &settings(None),
             &empty_store(),
             &context(),
+            None,
         )
         .await
         .expect("refreshes");
@@ -1146,6 +1212,7 @@ mod tests {
             &settings(None),
             &empty_store(),
             &gloas_context(0),
+            None,
         )
         .await
         .expect("the refresh survives it");
@@ -1253,6 +1320,7 @@ mod tests {
                 &settings(None),
                 &empty_store(),
                 &altair_context(),
+                None,
             )
             .await
             .expect("refreshes");
@@ -1294,6 +1362,7 @@ mod tests {
             &settings(None),
             &empty_store(),
             &altair_context(),
+            None,
         )
         .await
         .expect("the refresh survives it");
