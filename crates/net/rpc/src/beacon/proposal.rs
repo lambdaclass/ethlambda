@@ -505,7 +505,7 @@ async fn produce(
                 &config,
                 options,
             )
-                .map_err(|_| ApiError::Internal("the block failed to build"))?
+            .map_err(|_| ApiError::Internal("the block failed to build"))?
         }
         Err(_) => return Err(ApiError::Internal("the block failed to build")),
     };
