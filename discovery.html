@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-e8213950.js";
+            window.path_to_searchindex_js = "searchindex-2f29de31.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-34fa44cf.js"></script>
@@ -272,8 +272,11 @@ sequence number and <code>ip</code> move, which the reported ENR then lags.</p>
 <li>it advertises a <code>quic</code> port, a <code>tcp</code> port, or both.</li>
 </ul>
 <p>The digest compared against is the caller’s, not a constant: lean passes its
-hardcoded dummy and <code>beacon</code> passes the digest it derived at startup, so one
-admission policy serves both chains.</p>
+hardcoded dummy and <code>beacon</code> passes the digest it derived at startup and moves
+it at each fork-digest boundary, so one admission policy serves both chains. The
+record this node serves is not refreshed at a boundary (ethrex’s
+<code>DiscoveryServer</code> cannot replace it at runtime), so its <code>eth2</code> entry keeps the
+startup digest until a restart; see <a href="./beacon_wire.html#the-fork-digest">beacon_wire.md</a>.</p>
 <p>A differing <code>next_fork_version</code> or <code>next_fork_epoch</code> is <em>not</em> grounds for
 rejection: the spec permits connecting to a peer that is incompatible with an
 upcoming fork but compatible now.</p>

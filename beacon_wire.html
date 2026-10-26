@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-e8213950.js";
+            window.path_to_searchindex_js = "searchindex-2f29de31.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-34fa44cf.js"></script>
@@ -200,7 +200,7 @@ column sidecars</a>.</p>
 </code></pre>
 <p>No flag is required, but that is only true for a built-in network:
 <code>ethlambda beacon</code> on its own follows mainnet, since <code>--network</code> defaults to
-<code>mainnet</code>. Sepolia and Hoodi are built in too, and any other network is a
+<code>mainnet</code>. Sepolia, Hoodi and Platåberget are built in too, and any other network is a
 <code>--network</code> naming a directory of published files (<code>config.yaml</code> and
 <code>genesis.ssz</code>, see <a href="./cli.html"><code>cli.md</code></a>):</p>
 <pre><code class="language-bash">ethlambda beacon --network hoodi --checkpoint-sync-url https://checkpoint-sync.hoodi.ethpandaops.io
@@ -208,14 +208,15 @@ ethlambda beacon --network ./my-network --node-key ./node-key
 </code></pre>
 <p><code>genesis_time</code> and <code>genesis_validators_root</code>, and therefore the fork digest,
 are derived from the resolved network: a built-in network (<code>mainnet</code>,
-<code>sepolia</code>, <code>hoodi</code>) carries the two values as constants beside its
-<code>eth-clients</code> <code>config.yaml</code> and bootnode list, and no genesis state; for a
+<code>sepolia</code>, <code>hoodi</code>, <code>plataberget</code>) carries the two values as constants beside
+its published <code>config.yaml</code> and bootnode list, and no genesis state; for a
 loaded network they are read off that directory’s own <code>genesis.ssz</code>. Nothing
 about startup touches the network to get there. discv5 is forced on and needs no flag either: published mainnet
 bootnodes are largely seed-only, so a crawl is how a peer is reached.</p>
 <h2 id="the-fork-digest"><a class="header" href="#the-fork-digest">The fork digest</a></h2>
-<p>Computed once at startup from the resolved network’s genesis state, never
-hardcoded as a digest:</p>
+<p>Computed from the resolved network’s genesis state and fork schedule, never
+hardcoded as a digest. Startup derives the first one and a running node follows
+the schedule from there (see below):</p>
 <pre><code>epoch        = (now - genesis_time) / (SECONDS_PER_SLOT * SLOTS_PER_EPOCH)
 fork_version = the resolved network's fork schedule at epoch
 base         = compute_fork_data_root(fork_version, genesis_validators_root)
@@ -227,14 +228,34 @@ digest       = base[..4]                                    if epoch &lt;  FULU_
 <code>(ELECTRA_FORK_EPOCH, MAX_BLOBS_PER_BLOCK_ELECTRA)</code>. The fulu branch is
 EIP-7892’s, which is why mainnet’s digest is <code>8c9f62fe</code> rather than fulu’s bare
 <code>82fae541</code>.</p>
-<p>Startup logs the next boundary’s epoch and wall-clock time. The digest is
-computed once, so crossing one strands the node on topic names nobody publishes
-to; restart it to pick up the new digest.</p>
+<p>Startup logs the next boundary’s epoch, wall-clock time, fork and digest. A
+running node crosses it without a restart (<code>beacon::transition</code> in
+<code>ethlambda-p2p</code>, driven by <code>beacon::fork_schedule</code>). Both fork activations and
+blob-parameter-only forks move the digest, so both are boundaries. Following the
+spec’s “Transitioning the gossip” rules, the next digest’s topics are joined
+<code>SUBSCRIBE_LEAD_EPOCHS</code> before its boundary and the previous digest’s topics
+are left <code>UNSUBSCRIBE_LAG_EPOCHS</code> after it. At the boundary the node
+publishes and advertises the new digest, bumps its metadata sequence number
+and moves its discv5 admission filter. While the window is open a gossip
+message’s fork comes from its own topic’s digest, and a <code>Status</code> on either
+digest is answered, but range sync starts only from a peer on the current
+digest (or the next one, within clock skew of the boundary).</p>
+<p>One gap: the ENR this node serves over discv5 keeps the <code>eth2</code> entry it started
+with, because ethrex’s <code>DiscoveryServer</code> offers no way to replace its record at
+runtime. Peers already connected are unaffected; peers discovering the node
+after a boundary read the stale digest and reject the record.</p>
 <h2 id="gossip"><a class="header" href="#gossip">Gossip</a></h2>
 <p>Seven global topics, <code>/eth2/{digest}/{name}/ssz_snappy</code>, plus two subnet
 families this node’s own node id selects a narrow slice of: the data column
 subnets it custodies and the attestation subnets it backbones, both described
-below.</p>
+below. A gloas digest adds two more, <code>execution_payload</code> and
+<code>payload_attestation_message</code>, which <code>BeaconTopics::for_fork</code> subscribes under
+gloas digests and not under earlier ones. An envelope is validated like a block
+(its stateful half on the blocking pool) and goes to the chain actor on <code>Accept</code>
+and on <code>Queue</code>, since the actor holds an envelope whose block is not imported
+yet. A payload attestation is validated on the attestation permit pool and goes
+to the actor on <code>Accept</code> only: a vote for a block not imported here is dropped,
+since it is valid only within its own slot.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -242,13 +263,15 @@ below.</p>
 </thead>
 <tbody>
 <tr><td><code>beacon_block</code></td><td><code>SignedBeaconBlock</code>, fork chosen by the block’s slot</td></tr>
-<tr><td><code>beacon_aggregate_and_proof</code></td><td><code>SignedAggregateAndProof</code>, phase0 or electra</td></tr>
+<tr><td><code>beacon_aggregate_and_proof</code></td><td><code>SignedAggregateAndProof</code>, phase0, electra or gloas</td></tr>
 <tr><td><code>attester_slashing</code></td><td><code>AttesterSlashing</code>, phase0 or electra</td></tr>
 <tr><td><code>voluntary_exit</code></td><td><code>SignedVoluntaryExit</code></td></tr>
 <tr><td><code>proposer_slashing</code></td><td><code>ProposerSlashing</code></td></tr>
 <tr><td><code>bls_to_execution_change</code></td><td><code>SignedBLSToExecutionChange</code></td></tr>
 <tr><td><code>sync_committee_contribution_and_proof</code></td><td><code>SignedContributionAndProof</code></td></tr>
-<tr><td><code>beacon_attestation_{subnet_id}</code></td><td><code>Attestation</code>, phase0 or electra</td></tr>
+<tr><td><code>beacon_attestation_{subnet_id}</code></td><td><code>Attestation</code>, phase0 or electra’s <code>SingleAttestation</code> (gloas keeps the latter)</td></tr>
+<tr><td><code>execution_payload</code></td><td><code>SignedExecutionPayloadEnvelope</code>, gloas digests only</td></tr>
+<tr><td><code>payload_attestation_message</code></td><td><code>PayloadAttestationMessage</code>, gloas digests only</td></tr>
 </tbody>
 </table>
 </div>
@@ -284,13 +307,16 @@ plus <code>SUBNETS_PER_NODE</code>, still far short of a full subscription to ev
 attestation, sync-committee and data-column subnet, and narrower still than
 <code>NUMBER_OF_CUSTODY_GROUPS</code> columns of custody, which is what a supernode
 would carry alone. A sidecar decodes as
-<code>fulu::DataColumnSidecar</code>; the checks it passes before this node keeps or
+the fork-agnostic <code>DataColumnSidecar</code> enum, its fork taken from the topic’s
+digest (the bytes carry no tag): fulu’s names its block by a signed header and
+inclusion proof, gloas’s by a slot and block root, with the commitments it is
+checked against living in that block’s bid. The checks it passes before this node keeps or
 forwards it are described just below. How a kept sidecar is later served back
 out over req/resp is under <a href="#data-column-sidecars">Data column sidecars</a>.</p>
 <p>Every beacon message is held by gossipsub until it has a verdict
 (<code>validate_messages()</code> is on for this wire only). Blocks, data column
 sidecars, aggregates and subnet attestations are all validated by fulu’s
-gossip rules (<code>ethlambda_state_transition::beacon::gossip</code>, one module per
+gossip rules, or gloas’s modified ones from the fork on (<code>ethlambda_state_transition::beacon::gossip</code>, one module per
 topic family): the checks that need no state run inline in the p2p actor, the
 rest on a bounded <code>spawn_blocking</code> task whose verdict comes back to the actor
 (<code>crate::beacon::verdict</code>). Two permit pools bound how many of these run at
@@ -311,6 +337,31 @@ attesting indices gossip validation resolved. A subnet attestation never
 reaches it at all, on any outcome: verifying and relaying it is the whole of
 what this node owes the topic (see above), so there is nothing further for the
 chain actor to do with one.</p>
+<p>The rules above are fulu’s, except that blocks, data columns, aggregates and
+subnet attestations also have gloas rules. A gloas aggregate has electra’s bytes
+but its own progressive <code>Attestation</code>, so it decodes to its own
+<code>SignedAggregateAndProof::Gloas</code> (the signed root differs); a gloas subnet
+attestation is electra’s <code>SingleAttestation</code> unchanged. In both, <code>data.index</code> is
+the payload flag (0 or 1), and a vote for the full payload (1) is IGNOREd until
+the block’s envelope has been seen and its payload validated
+(<code>verify_attestation_payload_status</code>). Gloas is a followed fork, so a block at
+a gloas slot that fails to decode is REJECTed like one at any other followed
+fork; <code>unsupported_fork</code> is kept for a fork the node does not follow
+(<code>ForkName::is_followed</code>), none today. A gloas aggregate’s aggregation bits are
+an unbounded progressive bitlist, so one longer than electra’s type bound is
+REJECTed first, reading its length without expanding it, since expanding is
+what the seen-set check does before any other.</p>
+<p>Three deliberate departures from the gloas gossip rules, each for want of state
+this node does not keep. Where the specification rejects a message whose block
+failed validation, this node (having no bad-block cache) cannot tell that from
+a block it has not finished importing, so it queues or ignores instead; the
+matching <code>reject_block_failed_validation</code> vectors are in <code>SKIPPED</code>. An
+<code>execution_payload</code> whose block state is not in the cache p2p reads (a parent
+imported moments ago, say) is queued and forwarded to the chain actor, which
+verifies every envelope itself, without being propagated. And a
+<code>payload_attestation_message</code> is applied to fork choice after p2p verified its
+signature, with the actor re-checking only the store-state conditions (known
+block, current slot, committee seat).</p>
 <p>The remaining five global topics are decoded, logged at <code>debug</code>, and IGNOREd,
 since nothing consumes them; an undecodable payload on any topic is REJECTed.
 Nothing is published on any topic, columns included: nothing this node can
@@ -406,6 +457,8 @@ choice.</p>
 <tr><td><code>beacon_blocks_by_root/2</code></td><td>both</td></tr>
 <tr><td><code>data_column_sidecars_by_root/1</code></td><td>both</td></tr>
 <tr><td><code>data_column_sidecars_by_range/1</code></td><td>both</td></tr>
+<tr><td><code>execution_payload_envelopes_by_range/1</code></td><td>both</td></tr>
+<tr><td><code>execution_payload_envelopes_by_root/1</code></td><td>both</td></tr>
 </tbody>
 </table>
 </div>
@@ -504,6 +557,43 @@ what the digest exists to say and is not otherwise visible until a signature
 fails. A mismatch ends the stream, logged at <code>warn</code> with both digests: the one way to
 reach it in good faith is a blob schedule of ours that has fallen behind the
 network’s.</p>
+<h3 id="execution-payload-envelopes"><a class="header" href="#execution-payload-envelopes">Execution payload envelopes</a></h3>
+<p>Both gloas envelope protocols are registered <code>Full</code>: the server answers, and
+the client (<code>req_resp/envelope_client.rs</code>) asks. A chunk carries one
+<code>SignedExecutionPayloadEnvelope</code> under the fork digest of its block’s epoch.
+The envelope has no slot of its own, so the epoch comes from
+<code>payload.slot_number</code>, which <code>verify_execution_payload_envelope</code> pins to the
+block’s slot. A chunk whose digest names no gloas-or-later scheduled fork, or
+not the digest its slot implies, ends the stream.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Protocol</th><th>Served from</th></tr>
+</thead>
+<tbody>
+<tr><td><code>execution_payload_envelopes_by_root/1</code></td><td>a point lookup per root in <code>Table::ExecutionPayloadEnvelopes</code>; unknown roots are left out, answers follow the order asked</td></tr>
+<tr><td><code>execution_payload_envelopes_by_range/1</code></td><td>the canonical blocks of the window (<code>BlockRoots</code>), each envelope kept only when the next canonical block builds on its payload; the head’s own envelope only when the head node is FULL (<code>Store::head_payload_status</code>, which pairs the status with the head root it describes, so a stale status reads as unknown and the envelope is withheld)</td></tr>
+</tbody>
+</table>
+</div>
+<p>Both are bounded by <code>MAX_REQUEST_PAYLOADS</code>: a by-root list over it fails to
+decode, and a by-range <code>count</code> over it is truncated, which the specification’s
+“Clients MAY limit the number of payload envelopes in the response” allows.
+A by-range request starting below <code>Store::anchor_slot</code> gets
+<code>RESOURCE_UNAVAILABLE</code>, and a window before gloas is simply empty.</p>
+<p>The client asks in two situations. By root: the chain actor’s
+<code>FetchRequest.needs_envelope</code> (a block whose child waits on its payload) starts
+a lookup with the block fetch’s dedup, peer choice and retry ladder; a give-up
+is recovered by the actor’s per-slot re-ask. By range: after a
+<code>beacon_blocks_by_range/2</code> answer for a span that reaches gloas has been handed
+to the actor, the same peer is asked for that span’s envelopes, and range sync
+holds the next block request until that answer is checked and forwarded (or has
+failed). The pause exists because the actor keeps an envelope whose block has
+not imported only briefly and in small numbers, so a batch’s envelopes must
+arrive before the next batch’s blocks do. Everything fetched goes through the
+same rules as an <code>execution_payload</code> gossip message
+(<code>beacon/envelope_checks.rs</code>) before the actor sees it; a <code>Queue</code> verdict is
+forwarded too.</p>
 <h3 id="data-column-sidecars"><a class="header" href="#data-column-sidecars">Data column sidecars</a></h3>
 <p>Both protocols are registered <code>Full</code>, since with the columns on disk this node
 can serve every slot it has custodied:</p>
@@ -550,9 +640,10 @@ at all: the columns are normally already stored by the time their block reaches
 the availability gate. Nothing waits on the answer, so a short, empty or
 refused one costs nothing and is not retried; the per-block path is the
 backstop.</p>
-<p>Since the column request is aimed by custody, a batch reaching fulu is held
-back, blocks included, until every custody column has a known custodian among
-the connected peers. Lighthouse’s range sync holds its batches the same way.
+<p>Since the column request is aimed by custody, a batch whose last slot is fulu
+or later is held back, blocks included, until every custody column has a known
+custodian among the connected peers. Lighthouse’s range sync holds its batches
+the same way.
 Right after startup, custody is known for almost no peer, since a peer’s
 custody arrives with its <code>metadata/3</code> answer after it connects. A mainnet
 follower’s first batch after a fresh checkpoint sync went out 5 s after
@@ -693,7 +784,7 @@ as a query filter, so a <code>quic</code>-only record is invisible to it.</p>
 <tr><th>Metric</th><th>Meaning</th></tr>
 </thead>
 <tbody>
-<tr><td><code>lean_beacon_gossip_messages_total{topic,result}</code></td><td>Gossip received, by topic and by <code>decoded</code> / <code>decode_failed</code> / <code>decompress_failed</code></td></tr>
+<tr><td><code>lean_beacon_gossip_messages_total{topic,result}</code></td><td>Gossip received, by topic and by <code>decoded</code> / <code>decode_failed</code> / <code>decompress_failed</code> / <code>unsupported_fork</code></td></tr>
 <tr><td><code>lean_beacon_gossip_validation_total{kind,outcome,reason}</code></td><td>Gossip verdicts, now including <code>beacon_aggregate_and_proof</code> and <code>beacon_attestation</code>; see <a href="./metrics.html#beacon-gossip-validation">metrics.md</a></td></tr>
 <tr><td><code>lean_beacon_gossip_verdict_expired_total{kind}</code></td><td>Verdicts that came too late to propagate anything; should stay at zero</td></tr>
 <tr><td><code>lean_beacon_status_digest_mismatch_total</code></td><td>Handshakes seen from another fork digest</td></tr>

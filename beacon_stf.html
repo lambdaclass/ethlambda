@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-e8213950.js";
+            window.path_to_searchindex_js = "searchindex-2f29de31.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-34fa44cf.js"></script>
@@ -183,7 +183,7 @@
 <p>The <code>beacon</code> module of <code>ethlambda-state-transition</code>
 (<code>crates/blockchain/state_transition/src/beacon/</code>) implements the Ethereum
 <strong>Beacon Chain</strong> consensus specification,
-<a href="https://github.com/ethereum/consensus-specs"><code>ethereum/consensus-specs</code></a>, phase0 through fulu.</p>
+<a href="https://github.com/ethereum/consensus-specs"><code>ethereum/consensus-specs</code></a>, phase0 through gloas.</p>
 <p>This is not the Lean consensus protocol the rest of the crate implements. The two
 sit in one crate for the reason their types sit in one crate: a caller
 dispatching on a state’s fork can then reach either chain’s rules without the two
@@ -222,18 +222,22 @@ to grow an arm for it.</p>
 <p>Correctness is defined by the released spec test fixtures, pinned in the
 <code>Makefile</code>.</p>
 <h2 id="running-the-tests"><a class="header" href="#running-the-tests">Running the tests</a></h2>
-<pre><code class="language-bash">make consensus-spec-tests   # download the fixture tarballs (about 2.2 GB)
+<pre><code class="language-bash">make consensus-spec-tests   # download the fixture tarballs (mainnet and minimal)
+make cryptography-specs     # download the BLS/KZG test vectors
 make test-beacon            # build and test once per preset
 </code></pre>
 <p><code>make test-beacon</code> is the two per-preset targets, <code>test-beacon-mainnet</code> and
 <code>test-beacon-minimal</code>, run one after the other. Either can be run on its own,
 which is what CI does: the presets get a job each, so the two build and run
 concurrently instead of end to end.</p>
-<p>A run reads its own preset’s tree plus <code>general</code>, the preset-independent BLS and
-KZG vectors, and opens nothing else. <code>CONSENSUS_SPEC_TESTS_CONFIGS</code> narrows the
-download to that, and CI sets it, which takes roughly 1.25 GB of tarballs down to
-0.8 GB for mainnet and 0.6 GB for minimal. Locally the default fetches all three,
-so both presets can be run without re-downloading.</p>
+<p>A run reads its own preset’s tree and opens nothing else.
+<code>CONSENSUS_SPEC_TESTS_CONFIGS</code> narrows the download to that, and CI sets it.
+Locally the default fetches both, so both presets can be run without
+re-downloading. The BLS and KZG vectors are a separate, preset-independent
+download: consensus-specs shipped them itself, under a <code>general</code> config,
+through v1.7.0-alpha.12, but v1.7.0-alpha.13 (consensus-specs #5398) moved them
+to <code>ethereum/cryptography-specs</code>, which <code>make cryptography-specs</code> fetches into
+its own <code>cryptography-specs/</code> tree.</p>
 <p>The download is stamped with the release it came from and the configs it holds
 (<code>consensus-spec-tests/.version-&lt;version&gt;-&lt;configs&gt;</code>), so changing either wipes
 the tree and fetches afresh. Without the version in that name a bump would be a
@@ -338,16 +342,20 @@ tree, replaced in position by <code>previous_epoch_participation</code> and
 <code>current_epoch_participation</code>, which have a different type.</li>
 <li><code>latest_execution_payload_header</code> keeps its name from bellatrix on, but is a
 different container only in bellatrix, capella, and deneb; electra and fulu
-reuse deneb’s shape unchanged.</li>
+reuse deneb’s shape unchanged, and gloas drops it for a block hash and the
+latest bid.</li>
 <li>The field count crosses a power of two at electra, so the state’s merkle tree is
 five levels deep through deneb and six from electra on. The same logical field
-has a different generalized index in different forks.</li>
+has a different generalized index in different forks. Gloas’s state is a
+progressive container (EIP-7495), whose tree has no fixed depth at all.</li>
 <li><code>SignedBeaconBlock::Fulu</code> wraps <code>electra::SignedBeaconBlock</code> rather than a
 <code>fulu</code> type of its own, since fulu changes no field of a block. It still
 needs to be its own variant: fulu changes how a block is <em>processed</em>, since
 the blob commitment limit becomes epoch-dependent, so code that dispatches
 on fork still has to tell a fulu block from an electra one even though both
-carry the identical payload.</li>
+carry the identical payload. Gloas is a different case: its block body
+changes (a bid in place of a payload, payload attestations, the parent’s
+execution requests), so <code>SignedBeaconBlock::Gloas</code> has a type of its own.</li>
 </ul>
 <div class="table-wrapper">
 <table>
@@ -361,6 +369,7 @@ carry the identical payload.</li>
 <tr><td>capella, deneb</td><td>28</td><td>32</td><td>5</td></tr>
 <tr><td>electra</td><td>37</td><td>64</td><td>6</td></tr>
 <tr><td>fulu</td><td>38</td><td>64</td><td>6</td></tr>
+<tr><td>gloas</td><td>46</td><td>progressive</td><td>none</td></tr>
 </tbody>
 </table>
 </div>
@@ -369,7 +378,7 @@ of that by hand. Derived codecs get it from the struct definition, which is
 checked field by field against the spec text and then verified by <code>ssz_static</code>.</p>
 <p>Since SSZ carries no type tag, the fork cannot be recovered from the bytes, so
 decoding takes it from context: <code>BeaconState::from_ssz(fork, bytes)</code>.</p>
-<h3 id="not-duplicating-the-state-transition-seven-times"><a class="header" href="#not-duplicating-the-state-transition-seven-times">Not duplicating the state transition seven times</a></h3>
+<h3 id="not-duplicating-the-state-transition-once-per-fork"><a class="header" href="#not-duplicating-the-state-transition-once-per-fork">Not duplicating the state transition once per fork</a></h3>
 <p>The cost of per-fork structs is that a naive implementation would copy every
 function once per fork. Two things prevent that:</p>
 <ol>
@@ -414,9 +423,10 @@ impossible.</p>
 <h2 id="registry-and-balances"><a class="header" href="#registry-and-balances">Registry and balances</a></h2>
 <p><code>validators</code> and <code>balances</code> hold one entry per validator, about 2.4M on
 mainnet, so they dominate both the cost of a state root and the memory of every
-cached state. They are <code>ethlambda_ssz_tree::List</code>s rather than <code>SszList</code>s:
-persistent Merkle trees in the shape of the SSZ one, modeled on the <code>milhouse</code>
-lists lighthouse keeps its state in.</p>
+cached state. They are <code>ethlambda_ssz_tree::List</code>s rather than <code>SszList</code>s (from
+gloas on, <code>ethlambda_ssz_tree::ProgressiveList</code>s, described in the Gloas section
+below): persistent Merkle trees in the shape of the SSZ one, modeled on the
+<code>milhouse</code> lists lighthouse keeps its state in.</p>
 <ul>
 <li><strong>Nodes cache their hash, and states share nodes.</strong> A state derived from
 another shares every subtree the block did not touch through <code>Arc</code>, and its
@@ -439,7 +449,7 @@ writes pending is still correct but computed on a throwaway copy, and the
 store flushes a state before caching it, since a shared <code>Arc</code> cannot be
 flushed later.</li>
 </ul>
-<p>The access pattern matters. <code>state.validator(i)</code> and <code>balances()[i]</code> are tree
+<p>The access pattern matters. <code>state.validator(i)</code> and <code>state.balance(i)</code> are tree
 descents, cheap next to a hash but far from an array index, and they add up
 when a helper calls them once per validator:
 <code>get_total_active_balance</code> builds the active-index <code>Vec</code> and then reads every
@@ -447,12 +457,12 @@ index back, and runs several times per block (once per attestation through
 <code>get_base_reward_per_increment</code>, once per execution request through the churn
 limits). In the 2026-09-28 import profile, those per-index reads and the
 repeated whole-registry scans were the largest cost left after hashing. A loop
-over the registry should walk <code>validators().iter()</code>, zipped with
-<code>balances().iter()</code> where it needs both. The total active balance is the obvious
+over the registry should walk <code>iter_validators()</code>, zipped with
+<code>iter_balances()</code> where it needs both. The total active balance is the obvious
 candidate for computing once per epoch rather than per call, once it is shown
 that no block operation changes it mid-epoch.</p>
 <p>Epoch steps 1-3 (justification, inactivity updates, rewards) follow that rule
-through <code>helpers::participation</code>. One walk of <code>validators().iter()</code>, zipped with
+through <code>helpers::participation</code>. One walk of <code>iter_validators()</code>, zipped with
 the flat participation slices, produces each validator’s flags, its effective
 balance and the balance totals (an <code>EpochSummary</code>); the three steps then run
 over flat data and write back only the balances that changed. The summary lives
@@ -478,6 +488,160 @@ validator they name deferred until they are done. The genesis epoch and states
 whose registry-sized lists differ in length fall back to the step-by-step path.
 The debug oracle runs the specification-shaped steps on a clone and asserts the
 two full states hash equal.</p>
+<h2 id="gloas"><a class="header" href="#gloas">Gloas</a></h2>
+<p>Five of gloas’s EIPs shape this module: ePBS (EIP-7732), progressive lists and
+containers (EIP-7688), proposer selection that skips slashed validators
+(EIP-8045), increased exit and consolidation churn (EIP-8061), and builder
+deposits and exits (EIP-8282). EIP-7843 and EIP-7928 only add payload fields
+(<code>slot_number</code>, which <code>verify_execution_payload_envelope</code> checks, and
+<code>block_access_list</code>). It is the one fork whose containers change shape
+wholesale, so its code sits beside the pre-gloas code rather than inside it: <code>stf/gloas.rs</code> and
+<code>stf/epoch/gloas.rs</code> (transition), <code>helpers/gloas.rs</code> (helpers), the gloas
+section of <code>fork_choice.rs</code> (fork choice), and <code>containers/gloas.rs</code> in
+<code>ethlambda-types</code>. Every gloas case that is not ignored passes on both presets.</p>
+<p>The live follower follows gloas (<code>ForkName::Gloas.is_followed()</code>): the chain
+actor imports gloas blocks and their payload envelopes, a gloas checkpoint
+anchor is accepted (it starts EMPTY, with no payload known), and the clock
+passing the fork epoch no longer forces the sync status to syncing. Fork choice
+records the head node’s payload status next to the head root
+(<code>Store::head_payload_status</code>, in memory, recomputed by the first head
+computation after a restart), which the envelope by-range server reads to
+withhold the head’s envelope while the head is the EMPTY node. The node is
+still only a follower: the validator-client endpoints refuse a gloas epoch.</p>
+<h3 id="the-envelope-pipeline-in-the-chain-actor"><a class="header" href="#the-envelope-pipeline-in-the-chain-actor">The envelope pipeline in the chain actor</a></h3>
+<p>Order of arrival is not order of validity: an envelope can beat its block, a
+block can name a parent payload that has not arrived, and the columns an
+envelope’s commitments need can lag both. <code>beacon_envelope.rs</code> holds each case
+in a queue with its own bound, and <code>beacon_columns.rs</code> bounds the parked
+sidecars of the same fork.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Queue</th><th>Holds</th><th>Released when</th></tr>
+</thead>
+<tbody>
+<tr><td><code>awaiting_import</code></td><td>an envelope whose block is stored but has no post-state (pending on a parent, held for columns or for its parent’s payload), checked against the stored block’s bid</td><td>the block imports; evicted with the block when it is discarded and at finality; bounded by the stored blocks, not by arrival slot</td></tr>
+<tr><td><code>awaiting_block</code></td><td>an envelope whose block is not stored at all</td><td>the block imports; evicted after <code>ENVELOPE_AWAITING_BLOCK_TTL_SLOTS</code>, capped per slot and per root</td></tr>
+<tr><td><code>awaiting_columns</code></td><td>a consensus-checked envelope whose bid has commitments and whose sampled columns are not all stored</td><td>the last column is stored</td></tr>
+<tr><td><code>awaiting_engine</code></td><td>a consensus-valid envelope the execution client gave no answer for</td><td>the per-slot redrive gets an answer (see <a href="./beacon_engine.html#gloas">beacon_engine.md</a>)</td></tr>
+<tr><td><code>blocks_awaiting_parent_payload</code></td><td>a block whose parent is FULL with a payload not yet verified, capped per parent</td><td>that parent’s envelope verifies</td></tr>
+</tbody>
+</table>
+</div>
+<p>Data availability moves with the payload: a gloas block’s commitments are in its
+bid, so the columns gate the envelope that reveals the payload, not the block’s
+own import. A held block’s parent envelope is requested through
+<code>FetchRequest.needs_envelope</code> the moment the block is held, whatever its source:
+<code>BlockSource::Sync</code> also marks by-root answers and pending children a cascade
+released, so no range batch can be assumed to bring the envelope, and p2p dedups
+in-flight roots. The tick re-asks once a slot for every parent still missing
+one, which is only what recovers a fetch that gave up; catch-up does not wait
+for it.</p>
+<p>The two envelope-before-block queues differ in who has vouched for the root.
+A range batch’s envelopes arrive when all but its first block are stored and
+unimported, so a stored block’s own bid is the authority: an envelope matching
+it (<code>envelope_matches_bid</code>) goes to <code>awaiting_import</code> outside the per-slot cap,
+and one contradicting it is dropped. Only a root with no stored block, which
+nobody has authenticated, is held under the per-slot cap and the TTL.
+Everything is swept at finality, except the finalized block’s own envelope.</p>
+<p>Fork-choice events are timed at their arrival: the store clock is advanced to
+the moment an envelope, block or payload vote reached the node before its
+handler runs, because the tick fires once per slot and the timeliness deadlines
+would otherwise be judged at the slot’s start. Payload votes already verified
+in p2p are applied without a second signature check
+(<code>apply_verified_payload_attestation</code>). The PTC vote vectors are not persisted
+and are reseeded empty on resume; see <a href="./data_storage.html">data_storage.md</a>.</p>
+<h3 id="the-deferred-payload"><a class="header" href="#the-deferred-payload">The deferred payload</a></h3>
+<p>A gloas block has no execution payload. Its body commits to a builder’s bid
+(<code>process_execution_payload_bid</code>), and the builder reveals the payload later in
+a <code>SignedExecutionPayloadEnvelope</code>. The payload is applied by the <em>next</em>
+block: <code>process_parent_execution_payload</code> compares that block’s bid against the
+parent’s committed one to tell whether the parent was full or empty, and for a
+full parent <code>apply_parent_execution_payload</code> runs the execution-layer requests
+carried in <code>parent_execution_requests</code> and settles the builder’s payment. An
+empty parent must carry no requests.</p>
+<p><code>verify_execution_payload_envelope</code> is the checking half that used to sit in
+<code>process_execution_payload</code>, and it mutates nothing: fork choice calls it on a
+stored state when an envelope arrives, and only the next block changes state.
+Block processing therefore takes no <code>ExecutionEngine</code>, and <code>process_withdrawals</code>
+takes no payload, since the expected withdrawals are a function of the state
+alone.</p>
+<p>Execution-layer requests moved with the payload. Deposit, withdrawal and
+consolidation requests, and the two builder requests, are reached only through
+<code>apply_parent_execution_payload</code>; gloas’s <code>process_operations</code> no longer calls
+the first three. Their behavior did not change, so
+<code>apply_parent_execution_payload</code> calls the fulu and electra processors instead
+of keeping copies.</p>
+<h3 id="progressive-lists-and-the-registry"><a class="header" href="#progressive-lists-and-the-registry">Progressive lists and the registry</a></h3>
+<p>EIP-7688 makes most lists in the gloas state and body unbounded, merkleized as a
+chain of growing subtrees (EIP-7916), and makes the big containers progressive
+(EIP-7495); a progressive container has no fixed depth. The other progressive
+lists are libssz’s <code>ProgressiveList</code>. The registry is the exception:
+<code>validators</code> and <code>balances</code> stay tree-backed, through
+<code>ethlambda_ssz_tree::ProgressiveList</code>, which has the same persistent nodes,
+update buffer and rebase as the bounded <code>List</code> and the same method set, so a
+gloas state shares subtrees with its parent the way earlier ones do.</p>
+<p>The registry therefore has two list types across the forks, and an accessor
+cannot return either one. The whole-registry accessors were replaced by
+element-level ones on <code>BeaconState</code>: <code>validator_count</code>, <code>validator</code>,
+<code>validator_mut</code>, <code>balance</code>, <code>balance_mut</code>, <code>push_validator</code>, <code>iter_validators</code>,
+<code>iter_balances</code> and <code>validators_root</code>. Each dispatches once and hands back an
+element, a count or an iterator. Only the few that need the list itself
+(<code>iter_validators</code>, <code>iter_balances</code>, rebasing onto a cached state, pointer
+equality) match on the private <code>Registry</code> enum.</p>
+<h3 id="one-function-for-both-list-types"><a class="header" href="#one-function-for-both-list-types">One function for both list types</a></h3>
+<p>The spec modifies a small part of what gloas touches, and the rest is electra’s
+text run against a differently typed list. Copying it would fork every fix, so
+the shared functions take narrow views instead:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>View</th><th>Reaches</th></tr>
+</thead>
+<tbody>
+<tr><td><code>PendingQueueFields</code></td><td>The deposit balance cursor and the three pending queues, on electra, fulu and gloas</td></tr>
+<tr><td><code>ChurnCursorsMut</code></td><td>The four exit and consolidation churn cursors, on the same three forks</td></tr>
+<tr><td><code>gloas_state</code>, <code>gloas_state_ref</code></td><td>Gloas’s own concrete state, for fields only gloas has</td></tr>
+</tbody>
+</table>
+</div>
+<p>Both list types deref to a slice of the same element type, so a view can expose
+slices and element-level methods and let electra’s <code>process_withdrawal_request</code>,
+<code>process_consolidation_request</code>, exit and slashing paths serve a gloas state
+unchanged. The churn limit is the one input that differs: electra’s cursor
+functions read gloas’s own limits on a gloas state, which is a fork dispatch
+inside them rather than a second copy. A function gets a gloas copy only where
+the spec marks it modified. The rule for choosing between the views and a
+projection is the one in “A recurring bug” below: project only when the return
+type must be gloas’s own.</p>
+<h3 id="fork-choice"><a class="header" href="#fork-choice">Fork choice</a></h3>
+<p>Gloas gives each block two branches to weigh: <em>empty</em>, where no payload was
+revealed or attested as timely and available, and <em>full</em>, where the builder’s
+payload was. A gloas fork-choice node is therefore <code>(root, PayloadStatus)</code>
+with <code>Empty</code>, <code>Full</code> and <code>Pending</code>, where every earlier fork’s node is a bare
+root. Nodes are derived on demand from the block tree, each block’s bid and the
+set of verified payloads (<code>get_node_children</code> builds them), not stored, which
+mirrors the spec’s <code>Store</code>.</p>
+<p><code>ForkRules</code> (<code>PreGloas</code> or <code>Gloas</code>) is the other new dimension. It is derived
+from an exhaustive match on a fork or a container, and it is what
+<code>validate_on_attestation</code> and <code>update_latest_messages</code> read, since gloas turns
+<code>data.index</code> into the payload flag and orders votes by slot instead of target
+epoch. A vote’s rules follow its own container, not the clock.</p>
+<p>One head computation serves every fork: <code>get_head_node</code> builds a weight table
+for the node tree in one bottom-up pass and descends over it. The current
+slot’s fork selects the two rules that differ: from <code>GLOAS_FORK_EPOCH</code> on,
+blocks carry the payload dimension their bids give them and the proposer boost
+is gated by <code>should_apply_proposer_boost</code>; before it, every block is a single
+full node and the boost applies whenever it is set. A block’s fork and parent
+payload status are recorded at import (<code>BlockPayloadLink</code>), so the walk decodes
+no block in the ordinary case; the two exceptions are in
+<a href="spec_deviations.html">spec_deviations.md</a>. <code>compute_head</code> and the spec-literal
+<code>gloas_get_head</code> are kept as the references it is tested against; the cost
+argument is in the same page. The spec never describes a tree that
+crosses the boundary, so that page also records the rule this module chose.
+Two new handlers, <code>on_execution_payload_envelope</code> and
+<code>on_payload_attestation_message</code>, join the spec’s list of ways to change the
+store.</p>
 <h2 id="macros-and-traits"><a class="header" href="#macros-and-traits">Macros and traits</a></h2>
 <p>Two <code>macro_rules!</code> in the whole crate, both local, both replacing boilerplate that
 would otherwise run to hundreds of near-identical lines: the fixed-length byte
@@ -499,9 +663,11 @@ handlers.</li>
 </ul>
 <h2 id="fixture-suites"><a class="header" href="#fixture-suites">Fixture suites</a></h2>
 <p><code>consensus-spec-tests/tests/&lt;config&gt;/&lt;fork&gt;/&lt;runner&gt;/&lt;handler&gt;/&lt;suite&gt;/&lt;case&gt;/</code>,
-where <code>&lt;config&gt;</code> is <code>general</code> for the configuration-independent suites and the
-preset name otherwise. Container files are <code>.ssz_snappy</code>: SSZ compressed with
-<em>raw</em> snappy, not the framed format.</p>
+where <code>&lt;config&gt;</code> is the preset name. Container files are <code>.ssz_snappy</code>: SSZ
+compressed with <em>raw</em> snappy, not the framed format. The BLS and KZG vectors
+live in a separate tree, <code>cryptography-specs/tests/&lt;kind&gt;/&lt;handler&gt;/&lt;case&gt;/</code>,
+flatter still: no fork and no suite level, since neither is preset- or
+fork-dependent.</p>
 <p>Runners discover their cases from disk rather than listing them, so a fixture
 release that adds cases needs no code change. Two properties are deliberate: a
 suite that matches no case <strong>fails</strong> rather than reporting green, and a container
@@ -564,49 +730,56 @@ that check survives as one <code>&lt;runner&gt;/matched_fixture_cases</code> tes
 a stale runner or handler name still fails loudly.</li>
 </ul>
 <h2 id="status"><a class="header" href="#status">Status</a></h2>
-<p>All seven forks, phase0 through fulu, have containers, fork upgrades, state
-transitions, and epoch processing. Every fixture case passes on both presets:</p>
+<p>All eight forks, phase0 through gloas, have containers, fork upgrades, state
+transitions, and epoch processing. At the pinned fixture release every case
+that is not ignored passes on both presets:</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Preset</th><th>Fixture cases</th><th>Ignored</th><th>Lib tests</th></tr>
+<tr><th>Preset</th><th>Fixture cases passed</th><th>Ignored</th><th>Lib tests</th></tr>
 </thead>
 <tbody>
-<tr><td>mainnet</td><td>5705, all green</td><td>152</td><td>195</td></tr>
-<tr><td>minimal</td><td>40009, all green</td><td>3692</td><td>196</td></tr>
+<tr><td>mainnet</td><td>7175</td><td>1285</td><td>433 passed, 1 ignored</td></tr>
+<tr><td>minimal</td><td>49261</td><td>5403</td><td>434 passed, 1 ignored</td></tr>
 </tbody>
 </table>
 </div>
-<p>The lib counts were 244 and 245 while the containers, presets, configuration and
-primitives were defined here. Their 48 unit tests moved with them and run in
-<code>ethlambda-types</code>; the fixture counts, which are what defines correctness here,
-are unchanged.</p>
+<p>The lib counts are with <code>beacon-spec-tests</code> on, and include lean’s own unit
+tests, since the two chains share one lib target. The one ignored lib test is
+a timing measurement, not a fixture.</p>
 <p>Minimal runs more cases because the release ships more fixtures for it, and it
 runs two runners mainnet does not: <code>genesis</code>’s <code>initialization</code> and <code>validity</code>.
 The release ships no mainnet <code>genesis</code> fixtures, so that whole runner is gated
-behind the <code>preset-minimal</code> feature (<code>tests/spec/genesis.rs</code>).</p>
-<p>Nothing is ignored for being unimplemented. Every ignored case is one of two
-deliberate exclusions:</p>
+behind the <code>preset-minimal</code> feature (<code>tests/beacon_spec/genesis.rs</code>).</p>
+<p>The gossip validation vectors this crate’s <code>gossip.rs</code> runner covers come from
+the same tree as every other suite. The node validates four topics under fulu’s
+rules; every other case is ignored by name rather than left unmatched.</p>
+<p>Nothing is ignored for being unimplemented in the state transition or fork
+choice: <code>HIGHEST_IMPLEMENTED_FORK</code> is gloas, and every gloas case that is not
+ignored runs. The ignored cases are deliberate exclusions:</p>
 <ul>
 <li><code>LightClient*</code> containers under <code>ssz_static</code>, 5 container types across altair
-through fulu. The light-client sync protocol is a different layer from the
+through gloas. The light-client sync protocol is a different layer from the
 state transition and fork choice, and is not in this module’s scope.</li>
-<li>The <code>gloas</code> and <code>eip7805</code> fixture trees, one ignored entry each. See
-“Accounting for every fork directory” below.</li>
+<li><code>networking/gossip_*</code> cases outside what the node validates: every fork’s
+cases for topics it has no validator for (<code>IGNORED_HANDLERS</code>), non-fulu cases
+of the aggregate and attestation topics (block and data column validate fulu
+and gloas), and the vectors in <code>SKIPPED</code>, which assume a bad-block cache.</li>
+<li>The <code>heze</code> fixture tree, one ignored entry. See “Accounting for every fork
+directory” below.</li>
 </ul>
 <h2 id="accounting-for-every-fork-directory"><a class="header" href="#accounting-for-every-fork-directory">Accounting for every fork directory</a></h2>
 <p><code>collect</code> identifies a fork by parsing the directory name into a <code>ForkName</code>, and
 a name that does not parse is skipped. That skip is silent in a way the
 <code>HIGHEST_IMPLEMENTED_FORK</code> gate is not: the cases never become tests, so they are
 not counted as ignored either, and nothing in the output says they exist.</p>
-<p>The release does ship two such trees. <code>gloas</code> is the fork after fulu, and
-<code>eip7805</code> is not a fork in the sequence at all, being one of the per-EIP trees
-generated against a variant of some fork’s rules. Between them they hold 1898
-mainnet and 17539 minimal cases, all of which were previously dropped without a
-trace, which is the opposite of what this harness promises.</p>
-<p>So <code>UNMODELED_FORKS</code> names them, each reports as one ignored test, and
+<p><code>gloas</code> does not take this silent path: <code>ForkName::parse("gloas")</code> succeeds, so
+its cases become ordinary tests, individually named and run. <code>heze</code>, the one
+fork after gloas, is still unparseable and would be silently skipped without
+this section’s own accounting.</p>
+<p>So <code>UNMODELED_FORKS</code> names <code>heze</code> alone, it reports as one ignored test, and
 <code>fixture_forks/every_directory_is_accounted_for</code> fails if the tree holds a fork
-directory that is neither parseable nor listed. A release that adds a fork now
+directory that is neither parseable nor listed. A release that adds a fork
 forces a decision instead of quietly widening the gap.</p>
 <div class="table-wrapper">
 <table>
@@ -614,8 +787,8 @@ forces a decision instead of quietly widening the gap.</p>
 <tr><th>Suite</th><th>Covers</th></tr>
 </thead>
 <tbody>
-<tr><td><code>general/bls</code></td><td>Cryptography, fork- and preset-independent</td></tr>
-<tr><td><code>general/kzg</code></td><td>Cryptography, fork- and preset-independent</td></tr>
+<tr><td><code>bls</code> (<code>cryptography-specs</code>)</td><td>Cryptography, fork- and preset-independent</td></tr>
+<tr><td><code>kzg</code> (<code>cryptography-specs</code>)</td><td>Cryptography, fork- and preset-independent</td></tr>
 <tr><td><code>ssz_static</code></td><td>Every fork’s containers</td></tr>
 <tr><td><code>shuffling</code></td><td>Committee helpers</td></tr>
 <tr><td><code>operations</code>, <code>epoch_processing</code></td><td>Every fork’s operation and epoch sub-function</td></tr>
@@ -627,9 +800,14 @@ forces a decision instead of quietly widening the gap.</p>
 </table>
 </div>
 <h3 id="fork-choice-is-fixture-verified"><a class="header" href="#fork-choice-is-fixture-verified">Fork choice is fixture-verified</a></h3>
-<p>150 mainnet <code>fork_choice</code> cases pass, covering bellatrix’s <code>on_merge_block</code>/
-terminal-PoW validation, <code>should_override_forkchoice_update</code>, deneb’s blob
-data availability, and fulu’s column data availability.</p>
+<p>205 mainnet <code>fork_choice</code> cases pass, covering bellatrix’s <code>on_merge_block</code>/
+terminal-PoW validation, the <code>v1.7.0</code> proposer-boost dependent-root gate and
+<code>get_proposer_head</code>’s proposer-equivocation branch, deneb’s blob data
+availability, fulu’s column data availability, and gloas’s payload-aware
+suites: <code>get_head</code>, <code>get_parent_payload_status</code>, <code>on_block</code>, <code>on_attestation</code>,
+<code>on_execution_payload_envelope</code>, <code>on_payload_attestation_message</code>,
+<code>payload_data_availability</code>, <code>payload_timeliness</code> and <code>ex_ante</code>. Gloas
+accounts for 54 of the 205.</p>
 <p>The release still ships no phase0 <code>fork_choice</code> suite: the earliest is
 altair’s, built from altair-shaped states even though altair changes nothing
 about fork choice itself (<code>Store</code> accepts a block from any fork this module
@@ -653,8 +831,8 @@ through a different variant.</p>
 <ul>
 <li>Capella’s withdrawal sweep, projected to capella’s own state.</li>
 <li>Deneb reusing that same sweep, still projected to capella’s state.</li>
-<li>Altair’s participation fields, projected to altair’s state, so every one of
-the five later forks that also carries participation failed.</li>
+<li>Altair’s participation fields, projected to altair’s state, so every later
+fork that also carries participation failed.</li>
 <li>Deneb’s <code>process_attestation</code>, projected to deneb’s state.</li>
 <li><code>slash_validator</code> calling phase0’s <code>initiate_validator_exit</code> at electra,
 which also left electra’s EIP-7251 churn cursor unadvanced, mispricing every

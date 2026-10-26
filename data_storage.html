@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-e8213950.js";
+            window.path_to_searchindex_js = "searchindex-2f29de31.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-34fa44cf.js"></script>
@@ -182,7 +182,7 @@
                         <h1 id="-storage-what-lives-where"><a class="header" href="#-storage-what-lives-where">💾 Storage: What Lives Where</a></h1>
 <p>This doc explains how ethlambda saves data. Especially,
 the split between the fork choice <code>Store</code> and the <code>StorageBackend</code> trait,
-what each of the eleven tables holds, and which data is in-memory only.</p>
+what each of the thirteen tables holds, and which data is in-memory only.</p>
 <h2 id="overview"><a class="header" href="#overview">Overview</a></h2>
 <p>All chain data flows through a single high-level type, the <strong><code>Store</code></strong>
 (<code>crates/storage/src/store.rs</code>), which persists it through a small pluggable
@@ -281,15 +281,17 @@ is built from it, and clones are handed to the BlockChain and P2P actors.</p>
    │   │ LiveChain                      │         │ (raw XMSS sigs       │    │
    │   │ DataColumns                    │         │ awaiting             │    │
    │   │ PendingDataColumns             │         │ aggregation)         │    │
-   │   │ BeaconUnrealizedJustifications │         │ state_cache (LRU)    │    │
-   │   └────────────────────────────────┘         └──────────────────────┘    │
+   │   │ ExecutionPayloadEnvelopes      │         │ state_cache (LRU)    │    │
+   │   │ BlockTimeliness                │         └──────────────────────┘    │
+   │   │ BeaconUnrealizedJustifications │                                     │
+   │   └────────────────────────────────┘                                     │
    │   Survives restarts, except                                              │
    │   PendingDataColumns, which                  Lost on restart.            │
    │   is cleared at startup.                                                 │
    └──────────────────────────────────────────────────────────────────────────┘
 </code></pre>
 <h2 id="the-tables"><a class="header" href="#the-tables">The Tables</a></h2>
-<p>The eleven variants of the <code>Table</code> enum (<code>crates/storage/src/api/tables.rs</code>):</p>
+<p>The thirteen variants of the <code>Table</code> enum (<code>crates/storage/src/api/tables.rs</code>):</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -306,6 +308,8 @@ is built from it, and clones are handed to the BlockChain and P2P actors.</p>
 <tr><td><code>LiveChain</code></td><td>slot ‖ root</td><td><code>parent_root</code></td><td>yes: below finalized</td></tr>
 <tr><td><code>DataColumns</code></td><td>slot ‖ root ‖ column_index</td><td><code>DataColumnSidecar</code> (SSZ-encoded)</td><td>no (see <a href="#datacolumns">DataColumns</a> below)</td></tr>
 <tr><td><code>PendingDataColumns</code></td><td>slot ‖ root ‖ column_index</td><td><code>DataColumnSidecar</code> (SSZ-encoded), unverified</td><td>yes: on replay, below finalized, and wholly at startup</td></tr>
+<tr><td><code>ExecutionPayloadEnvelopes</code></td><td>slot ‖ root</td><td>gloas <code>SignedExecutionPayloadEnvelope</code> (SSZ), verified only</td><td>no: beacon block rows are kept too</td></tr>
+<tr><td><code>BlockTimeliness</code></td><td>root</td><td>one byte per timeliness deadline (0 or 1), gloas blocks only</td><td>no</td></tr>
 <tr><td><code>BeaconUnrealizedJustifications</code></td><td>root</td><td><code>(slot, Checkpoint)</code> (beacon only)</td><td>yes: below the finalized block’s own slot (see <a href="#beaconunrealizedjustifications">below</a>)</td></tr>
 </tbody>
 </table>
@@ -619,6 +623,28 @@ columns this node custodies, nearer 1 GB per day at current mainnet blob
 counts. <code>lean_table_bytes{table="data_columns"}</code> (see <a href="./metrics.html">metrics.md</a>)
 is that growth made visible; watch it, and size the disk against however long
 the node runs unattended before a pruner exists.</p>
+<h3 id="executionpayloadenvelopes-and-blocktimeliness"><a class="header" href="#executionpayloadenvelopes-and-blocktimeliness">ExecutionPayloadEnvelopes and BlockTimeliness</a></h3>
+<p>Gloas only. A row in <code>ExecutionPayloadEnvelopes</code> exists for an envelope that
+passed verification, keyed by the slot of the block it fulfills (the envelope
+has no slot of its own) so a by-range handler can scan a slot window. The
+table is the durable form of the store’s <code>verified_payloads</code> set. Losing that
+set on restart would silently drop every full payload branch from fork choice.
+<code>BlockTimeliness</code> is the durable form of the gloas part of <code>block_timeliness</code>.
+Pre-gloas blocks write no row, since nothing reads their timeliness after a
+restart.</p>
+<p><code>Store::from_db_state</code> reloads both for every <code>LiveChain</code> block at or above the
+finalized block’s slot, and reseeds the in-memory payload-committee vote
+vectors empty for each gloas block in that window. The votes themselves are not
+persisted: the next block’s payload attestations refill them. Neither table is
+pruned; rows outside the window are simply not read.</p>
+<p>The execution client’s verdict on each reloaded payload is in-memory scratch
+too, so the chain actor seeds one at startup: <code>SYNCING</code> when an execution
+client is configured, so its first <code>forkchoiceUpdated</code> <code>VALID</code> for the head
+promotes them, and <code>VALID</code> without one, as the follower trusts every envelope it
+applies then. The head node’s payload status (<code>Store::head_payload_status</code>) is
+likewise not stored; it is unknown until the first head computation after a
+restart, and the envelope by-range server withholds the head’s envelope until it
+is known.</p>
 <h3 id="pendingdatacolumns"><a class="header" href="#pendingdatacolumns">PendingDataColumns</a></h3>
 <p>Same key and same encoding as <code>DataColumns</code>, holding sidecars that have <strong>not
 been verified yet</strong>. A sidecar lands here when its block’s parent has no
@@ -867,10 +893,10 @@ what bounds it in the meantime (<code>lean_table_bytes{table="data_columns"}</co
 where a future pruner is meant to land
 (<code>MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS</code>).</p>
 <h2 id="in-memory-only-lost-on-restart"><a class="header" href="#in-memory-only-lost-on-restart">In-Memory Only (Lost on Restart)</a></h2>
-<p>Five <code>Store</code> fields never touch the backend directly, <code>beacon</code> with one
-exception (see its row below). All are bounded buffers (or, for <code>beacon</code>,
-bounded in practice by the validator set and the unfinalized window) shared
-across <code>Store</code> clones:</p>
+<p>Five <code>Store</code> fields never touch the backend directly, <code>beacon</code> with the
+exceptions its row below names. All are bounded buffers (or, for
+<code>beacon</code>, bounded in practice by the validator set and the unfinalized
+window) shared across <code>Store</code> clones:</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -881,7 +907,7 @@ across <code>Store</code> clones:</p>
 <tr><td><code>known_payloads</code></td><td>512 messages</td><td>Fork-choice-active aggregated proofs</td></tr>
 <tr><td><code>gossip_signatures</code></td><td>2048 signatures</td><td>Raw per-validator XMSS signatures awaiting aggregation (each ~3 KB, so ~6 MB worst case)</td></tr>
 <tr><td><code>state_cache</code></td><td>32 states</td><td>LRU memoization of block <em>and</em> checkpoint post-states (either chain), each held behind an <code>Arc</code> so a hit is not a copy; one bound covers both kinds, keyed apart by a small enum, and a miss is just a reconstruction rather than an error</td></tr>
-<tr><td><code>beacon</code></td><td>unbounded</td><td>Beacon fork-choice scratch: proposer boost root, block timeliness, equivocating validator indices, latest messages, PoW blocks, and unrealized justifications. Most of it is not persisted: proposer boost resets every slot, timeliness is read only by the same-slot reorg helpers, equivocators come back from replaying attester slashings on sync, latest messages from one epoch of attestations, and PoW blocks stand in for an execution-client call a restarted node would simply make again. Unrealized justifications are the exception: this map is a write-through cache in front of <code>BeaconUnrealizedJustifications</code> (see <a href="#beaconunrealizedjustifications">that table</a> above), so it is not lost, only refilled lazily on the next miss</td></tr>
+<tr><td><code>beacon</code></td><td>unbounded</td><td>Beacon fork-choice scratch: proposer boost root, block timeliness, equivocating validator indices, latest messages, PoW blocks, and unrealized justifications. Most of it is not persisted: proposer boost resets every slot, pre-gloas timeliness is read only by the same-slot reorg helpers, equivocators come back from replaying attester slashings on sync, latest messages from one epoch of attestations, and PoW blocks stand in for an execution-client call a restarted node would simply make again. The exceptions are a gloas block’s timeliness and verified payload (see <a href="#executionpayloadenvelopes-and-blocktimeliness">ExecutionPayloadEnvelopes and BlockTimeliness</a>) and unrealized justifications: this map is a write-through cache in front of <code>BeaconUnrealizedJustifications</code> (see <a href="#beaconunrealizedjustifications">that table</a> above), so it is not lost, only refilled lazily on the next miss</td></tr>
 </tbody>
 </table>
 </div>
@@ -895,7 +921,7 @@ section of <a href="lmd_ghost.html">lmd_ghost.md</a> for how attestations move b
 pools.</p>
 <p>After a restart these buffers start empty: pending attestations and
 un-aggregated gossip signatures are lost and must be re-collected from the
-network. Everything persisted in the eleven tables survives, except <code>PendingDataColumns</code>, which is cleared outright: its only index is in memory.</p>
+network. Everything persisted in the thirteen tables survives, except <code>PendingDataColumns</code>, which is cleared outright: its only index is in memory.</p>
 <h2 id="startup-and-restore"><a class="header" href="#startup-and-restore">Startup and Restore</a></h2>
 <p>A <code>Store</code> is created through one of four constructors in
 <code>crates/storage/src/store.rs</code>:</p>

@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-e8213950.js";
+            window.path_to_searchindex_js = "searchindex-2f29de31.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-34fa44cf.js"></script>
@@ -603,24 +603,37 @@ own section. These are ethlambda-specific, not part of the leanMetrics spec.</p>
 </div>
 <p><code>kind</code> is the topic kind, with every <code>data_column_sidecar_{subnet}</code> sharing the
 label <code>data_column_sidecar</code> and every <code>beacon_attestation_{subnet_id}</code> sharing
-<code>beacon_attestation</code>. <code>queue</code> means IGNORE to gossipsub while the chain actor
-still receives the object and parks it; neither the aggregate nor the
-attestation topic ever answers <code>queue</code>, since the vote block’s post-state is
-either cached or it is not (<code>IgnoreReason::UnknownBlock</code>/<code>StateUnavailable</code>),
-with nothing to hold the message for. <strong><code>verdict_expired_total</code> should stay at
+<code>beacon_attestation</code>. The gloas topics <code>execution_payload</code> and
+<code>payload_attestation_message</code> are labelled by their own name. <code>queue</code> means
+IGNORE to gossipsub while the chain actor still receives the object and parks
+it; of the gloas topics only <code>execution_payload</code> answers it, for an envelope
+whose block is not known yet (<code>block_unknown</code>), has no post-state yet
+(<code>block_not_ready</code>), or has one that is not in the cache the checks read
+(<code>state_not_cached</code>, as when the block was imported moments ago; the actor
+verifies the signature itself, so the envelope is forwarded rather than dropped). The aggregate, attestation and
+<code>payload_attestation_message</code> topics never answer <code>queue</code>, since the vote
+block’s post-state is either cached or it is not
+(<code>IgnoreReason::UnknownBlock</code>/<code>StateUnavailable</code>), with nothing to hold the
+message for. <strong><code>verdict_expired_total</code> should stay at
 zero</strong>: a rising count means validation is too slow for gossipsub’s message
 cache.</p>
 <p>The two topics add reasons the others do not, all <code>reason</code> label values on
 <code>lean_beacon_gossip_validation_total</code>: <code>outside_epoch_window</code>, <code>covered_bits</code>
 (aggregate only), <code>unknown_block</code>, <code>state_unavailable</code>,
-<code>finalized_not_ancestor</code>, <code>ancestry_unknown</code> on the ignore side;
+<code>finalized_not_ancestor</code>, <code>ancestry_unknown</code>, <code>payload_envelope_unseen</code> and
+<code>payload_optimistic</code> (gloas only) on the ignore side;
 <code>epoch_mismatch</code>, <code>no_participants</code> (aggregate only), <code>non_zero_data_index</code>,
 <code>committee_bits</code> (aggregate only), <code>committee_index</code>, <code>bits_length</code> (aggregate
 only), <code>not_aggregator</code> (aggregate only), <code>not_in_committee</code>,
 <code>unknown_validator</code>, <code>selection_proof</code> (aggregate only),
 <code>aggregator_signature</code> (aggregate only), <code>aggregate_signature</code> (aggregate
-only), <code>target_not_ancestor</code>, <code>wrong_subnet</code> (attestation only) on the reject
-side. <code>already_seen</code> and <code>overloaded</code> are shared with every other topic.</p>
+only), <code>target_not_ancestor</code>, <code>wrong_subnet</code> (attestation only), and gloas’s
+<code>data_index_out_of_range</code>, <code>same_slot_payload_flag</code> and <code>payload_invalid</code> on the
+reject side. <code>already_seen</code>, <code>overloaded</code> and <code>unsupported_fork</code> are shared with the
+other topics: <code>unsupported_fork</code> is an ignore reason for a message of a fork this
+build has no gossip rules for, so an honest peer past the fork epoch is not
+scored as a bad decoder. Gloas blocks, data columns, aggregates and attestations
+are validated, so they carry their own verdict reasons instead.</p>
 <p>Two permit pools bound the blocking-thread half of validation:
 <code>gossip_validation_permits</code> for blocks and columns,
 <code>attestation_validation_permits</code> for aggregates and subnet attestations. They
@@ -705,6 +718,9 @@ spec.</p>
 <tr><td><code>lean_data_column_fetch_failures_total</code></td><td>Counter</td><td><code>DataColumnsByRoot</code> lookups this node gave up on, by reason</td><td>On lookup abandonment</td><td>reason=no_peers,max_retries</td><td></td></tr>
 <tr><td><code>lean_blocks_held_for_columns</code></td><td>Gauge</td><td>Blocks held out of fork choice pending their custody columns</td><td>On every hold, release, and finality eviction of the held-block set</td><td></td><td></td></tr>
 <tr><td><code>lean_sidecars_awaiting_parent</code></td><td>Gauge</td><td>Sidecars parked until their block’s parent has a post-state</td><td>On every park, replay, and finality eviction of the parked set</td><td></td><td></td></tr>
+<tr><td><code>lean_envelopes_awaiting_block</code></td><td>Gauge</td><td>Gloas execution payload envelopes held until their block is imported</td><td>On every hold, release, and finality eviction of the held envelopes</td><td></td><td></td></tr>
+<tr><td><code>lean_envelopes_awaiting_columns</code></td><td>Gauge</td><td>Gloas execution payload envelopes held until every sampled column is stored</td><td>On every hold, release, and finality eviction of the held envelopes</td><td></td><td></td></tr>
+<tr><td><code>lean_blocks_awaiting_parent_payload</code></td><td>Gauge</td><td>Gloas blocks held until their FULL parent’s payload envelope is verified</td><td>On every hold, release, and finality eviction of the held blocks</td><td></td><td></td></tr>
 </tbody>
 </table>
 </div>
@@ -839,6 +855,10 @@ and absent is not the same as zero.</p>
 <tr><td><code>ethlambda_validator_blocks_broadcast_not_imported_total</code></td><td>Counter</td><td>Blocks a node broadcast but could not import into its own database, which is what a 202 means. A subset of <code>blocks_proposed_total</code>, not a failure: the block reached the network. Points at that node’s execution layer</td></tr>
 <tr><td><code>ethlambda_validator_blocks_refused_total</code></td><td>Counter</td><td>Blocks deliberately not signed, because this process had already proposed that slot for that validator. Should normally read zero</td></tr>
 <tr><td><code>ethlambda_validator_block_proposal_failures_total</code></td><td>Counter</td><td>Proposal duties that did not end in a published block, including ones abandoned for overrunning</td></tr>
+<tr><td><code>ethlambda_validator_envelopes_published_total</code></td><td>Counter</td><td>Execution payload envelopes a beacon node accepted for blocks this client proposed (gloas)</td></tr>
+<tr><td><code>ethlambda_validator_envelope_failures_total</code></td><td>Counter</td><td>Proposed gloas blocks whose self-built envelope was not published. The block is out and the proposal counts as made, but the slot’s payload is withheld, so this is the failure that costs the payload. Should read zero</td></tr>
+<tr><td><code>ethlambda_validator_payload_attestations_published_total</code></td><td>Counter</td><td>Payload timeliness committee votes a beacon node accepted (gloas)</td></tr>
+<tr><td><code>ethlambda_validator_payload_attestation_failures_total</code></td><td>Counter</td><td>Slots whose payload timeliness committee duty did not result in published votes</td></tr>
 <tr><td><code>ethlambda_validator_aggregates_published_total</code></td><td>Counter</td><td>Aggregates accepted by a beacon node. Bursty rather than steady: a validator is selected a few times a day, so hours at zero are normal for a small deployment</td></tr>
 <tr><td><code>ethlambda_validator_aggregation_failures_total</code></td><td>Counter</td><td>Aggregation duties that ended in no published aggregate, including ones abandoned for overrunning the slot</td></tr>
 <tr><td><code>ethlambda_validator_fee_recipient_mismatches_total</code></td><td>Counter</td><td>Blocks paying execution rewards to an address this client did not request. Should read zero forever; a non-zero value means every proposal is paying somewhere else</td></tr>
@@ -864,11 +884,19 @@ a failure. <code>blocks_proposed_total</code> counts blocks a node accepted;
 <code>blocks_broadcast_not_imported_total</code> counts blocks that did reach the network
 but that the node answering could not import, which is a beacon-node fault
 rather than a validator one and is why it is not folded into either.</p>
+<p>Gloas adds two pairs. A gloas proposal ends in a block and then an envelope,
+and the envelope’s failure does not fail the proposal: <code>blocks_proposed_total</code>
+counts the block, and <code>envelope_failures_total</code> the reveal that did not follow.
+The committee vote has the same split as the attestation’s: <code>payload_attestations_published_total</code>
+counts votes accepted and <code>payload_attestation_failures_total</code> the slots whose
+duty produced none. A slot where the node knows no block for the committee to
+vote on is neither, since there was nothing to sign.</p>
 <p>Two series should read zero for the life of a healthy deployment, and are the
 ones worth alerting on at any non-zero value rather than on a rate:
 <code>attestations_refused_total</code> and <code>blocks_refused_total</code> mean this client’s own
 guards caught a duty they judged unsafe, and <code>fee_recipient_mismatches_total</code>
-means blocks are being proposed that pay someone else.</p>
+means blocks are being proposed that pay someone else. <code>envelope_failures_total</code>
+belongs with them on a gloas network.</p>
 <h2 id="troubleshooting"><a class="header" href="#troubleshooting">Troubleshooting</a></h2>
 <h3 id="docker-desktop-on-macos"><a class="header" href="#docker-desktop-on-macos">Docker Desktop on MacOS</a></h3>
 <p>lean-quickstart uses the host network mode for Docker containers, which is a problem on MacOS.

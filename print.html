@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-e8213950.js";
+            window.path_to_searchindex_js = "searchindex-2f29de31.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-34fa44cf.js"></script>
@@ -1785,7 +1785,7 @@ clients.</p>
 <p>The <code>beacon</code> module of <code>ethlambda-state-transition</code>
 (<code>crates/blockchain/state_transition/src/beacon/</code>) implements the Ethereum
 <strong>Beacon Chain</strong> consensus specification,
-<a href="https://github.com/ethereum/consensus-specs"><code>ethereum/consensus-specs</code></a>, phase0 through fulu.</p>
+<a href="https://github.com/ethereum/consensus-specs"><code>ethereum/consensus-specs</code></a>, phase0 through gloas.</p>
 <p>This is not the Lean consensus protocol the rest of the crate implements. The two
 sit in one crate for the reason their types sit in one crate: a caller
 dispatching on a state’s fork can then reach either chain’s rules without the two
@@ -1824,18 +1824,22 @@ to grow an arm for it.</p>
 <p>Correctness is defined by the released spec test fixtures, pinned in the
 <code>Makefile</code>.</p>
 <h2 id="running-the-tests"><a class="header" href="#running-the-tests">Running the tests</a></h2>
-<pre><code class="language-bash">make consensus-spec-tests   # download the fixture tarballs (about 2.2 GB)
+<pre><code class="language-bash">make consensus-spec-tests   # download the fixture tarballs (mainnet and minimal)
+make cryptography-specs     # download the BLS/KZG test vectors
 make test-beacon            # build and test once per preset
 </code></pre>
 <p><code>make test-beacon</code> is the two per-preset targets, <code>test-beacon-mainnet</code> and
 <code>test-beacon-minimal</code>, run one after the other. Either can be run on its own,
 which is what CI does: the presets get a job each, so the two build and run
 concurrently instead of end to end.</p>
-<p>A run reads its own preset’s tree plus <code>general</code>, the preset-independent BLS and
-KZG vectors, and opens nothing else. <code>CONSENSUS_SPEC_TESTS_CONFIGS</code> narrows the
-download to that, and CI sets it, which takes roughly 1.25 GB of tarballs down to
-0.8 GB for mainnet and 0.6 GB for minimal. Locally the default fetches all three,
-so both presets can be run without re-downloading.</p>
+<p>A run reads its own preset’s tree and opens nothing else.
+<code>CONSENSUS_SPEC_TESTS_CONFIGS</code> narrows the download to that, and CI sets it.
+Locally the default fetches both, so both presets can be run without
+re-downloading. The BLS and KZG vectors are a separate, preset-independent
+download: consensus-specs shipped them itself, under a <code>general</code> config,
+through v1.7.0-alpha.12, but v1.7.0-alpha.13 (consensus-specs #5398) moved them
+to <code>ethereum/cryptography-specs</code>, which <code>make cryptography-specs</code> fetches into
+its own <code>cryptography-specs/</code> tree.</p>
 <p>The download is stamped with the release it came from and the configs it holds
 (<code>consensus-spec-tests/.version-&lt;version&gt;-&lt;configs&gt;</code>), so changing either wipes
 the tree and fetches afresh. Without the version in that name a bump would be a
@@ -1940,16 +1944,20 @@ tree, replaced in position by <code>previous_epoch_participation</code> and
 <code>current_epoch_participation</code>, which have a different type.</li>
 <li><code>latest_execution_payload_header</code> keeps its name from bellatrix on, but is a
 different container only in bellatrix, capella, and deneb; electra and fulu
-reuse deneb’s shape unchanged.</li>
+reuse deneb’s shape unchanged, and gloas drops it for a block hash and the
+latest bid.</li>
 <li>The field count crosses a power of two at electra, so the state’s merkle tree is
 five levels deep through deneb and six from electra on. The same logical field
-has a different generalized index in different forks.</li>
+has a different generalized index in different forks. Gloas’s state is a
+progressive container (EIP-7495), whose tree has no fixed depth at all.</li>
 <li><code>SignedBeaconBlock::Fulu</code> wraps <code>electra::SignedBeaconBlock</code> rather than a
 <code>fulu</code> type of its own, since fulu changes no field of a block. It still
 needs to be its own variant: fulu changes how a block is <em>processed</em>, since
 the blob commitment limit becomes epoch-dependent, so code that dispatches
 on fork still has to tell a fulu block from an electra one even though both
-carry the identical payload.</li>
+carry the identical payload. Gloas is a different case: its block body
+changes (a bid in place of a payload, payload attestations, the parent’s
+execution requests), so <code>SignedBeaconBlock::Gloas</code> has a type of its own.</li>
 </ul>
 <div class="table-wrapper">
 <table>
@@ -1963,6 +1971,7 @@ carry the identical payload.</li>
 <tr><td>capella, deneb</td><td>28</td><td>32</td><td>5</td></tr>
 <tr><td>electra</td><td>37</td><td>64</td><td>6</td></tr>
 <tr><td>fulu</td><td>38</td><td>64</td><td>6</td></tr>
+<tr><td>gloas</td><td>46</td><td>progressive</td><td>none</td></tr>
 </tbody>
 </table>
 </div>
@@ -1971,7 +1980,7 @@ of that by hand. Derived codecs get it from the struct definition, which is
 checked field by field against the spec text and then verified by <code>ssz_static</code>.</p>
 <p>Since SSZ carries no type tag, the fork cannot be recovered from the bytes, so
 decoding takes it from context: <code>BeaconState::from_ssz(fork, bytes)</code>.</p>
-<h3 id="not-duplicating-the-state-transition-seven-times"><a class="header" href="#not-duplicating-the-state-transition-seven-times">Not duplicating the state transition seven times</a></h3>
+<h3 id="not-duplicating-the-state-transition-once-per-fork"><a class="header" href="#not-duplicating-the-state-transition-once-per-fork">Not duplicating the state transition once per fork</a></h3>
 <p>The cost of per-fork structs is that a naive implementation would copy every
 function once per fork. Two things prevent that:</p>
 <ol>
@@ -2016,9 +2025,10 @@ impossible.</p>
 <h2 id="registry-and-balances"><a class="header" href="#registry-and-balances">Registry and balances</a></h2>
 <p><code>validators</code> and <code>balances</code> hold one entry per validator, about 2.4M on
 mainnet, so they dominate both the cost of a state root and the memory of every
-cached state. They are <code>ethlambda_ssz_tree::List</code>s rather than <code>SszList</code>s:
-persistent Merkle trees in the shape of the SSZ one, modeled on the <code>milhouse</code>
-lists lighthouse keeps its state in.</p>
+cached state. They are <code>ethlambda_ssz_tree::List</code>s rather than <code>SszList</code>s (from
+gloas on, <code>ethlambda_ssz_tree::ProgressiveList</code>s, described in the Gloas section
+below): persistent Merkle trees in the shape of the SSZ one, modeled on the
+<code>milhouse</code> lists lighthouse keeps its state in.</p>
 <ul>
 <li><strong>Nodes cache their hash, and states share nodes.</strong> A state derived from
 another shares every subtree the block did not touch through <code>Arc</code>, and its
@@ -2041,7 +2051,7 @@ writes pending is still correct but computed on a throwaway copy, and the
 store flushes a state before caching it, since a shared <code>Arc</code> cannot be
 flushed later.</li>
 </ul>
-<p>The access pattern matters. <code>state.validator(i)</code> and <code>balances()[i]</code> are tree
+<p>The access pattern matters. <code>state.validator(i)</code> and <code>state.balance(i)</code> are tree
 descents, cheap next to a hash but far from an array index, and they add up
 when a helper calls them once per validator:
 <code>get_total_active_balance</code> builds the active-index <code>Vec</code> and then reads every
@@ -2049,12 +2059,12 @@ index back, and runs several times per block (once per attestation through
 <code>get_base_reward_per_increment</code>, once per execution request through the churn
 limits). In the 2026-09-28 import profile, those per-index reads and the
 repeated whole-registry scans were the largest cost left after hashing. A loop
-over the registry should walk <code>validators().iter()</code>, zipped with
-<code>balances().iter()</code> where it needs both. The total active balance is the obvious
+over the registry should walk <code>iter_validators()</code>, zipped with
+<code>iter_balances()</code> where it needs both. The total active balance is the obvious
 candidate for computing once per epoch rather than per call, once it is shown
 that no block operation changes it mid-epoch.</p>
 <p>Epoch steps 1-3 (justification, inactivity updates, rewards) follow that rule
-through <code>helpers::participation</code>. One walk of <code>validators().iter()</code>, zipped with
+through <code>helpers::participation</code>. One walk of <code>iter_validators()</code>, zipped with
 the flat participation slices, produces each validator’s flags, its effective
 balance and the balance totals (an <code>EpochSummary</code>); the three steps then run
 over flat data and write back only the balances that changed. The summary lives
@@ -2080,6 +2090,160 @@ validator they name deferred until they are done. The genesis epoch and states
 whose registry-sized lists differ in length fall back to the step-by-step path.
 The debug oracle runs the specification-shaped steps on a clone and asserts the
 two full states hash equal.</p>
+<h2 id="gloas"><a class="header" href="#gloas">Gloas</a></h2>
+<p>Five of gloas’s EIPs shape this module: ePBS (EIP-7732), progressive lists and
+containers (EIP-7688), proposer selection that skips slashed validators
+(EIP-8045), increased exit and consolidation churn (EIP-8061), and builder
+deposits and exits (EIP-8282). EIP-7843 and EIP-7928 only add payload fields
+(<code>slot_number</code>, which <code>verify_execution_payload_envelope</code> checks, and
+<code>block_access_list</code>). It is the one fork whose containers change shape
+wholesale, so its code sits beside the pre-gloas code rather than inside it: <code>stf/gloas.rs</code> and
+<code>stf/epoch/gloas.rs</code> (transition), <code>helpers/gloas.rs</code> (helpers), the gloas
+section of <code>fork_choice.rs</code> (fork choice), and <code>containers/gloas.rs</code> in
+<code>ethlambda-types</code>. Every gloas case that is not ignored passes on both presets.</p>
+<p>The live follower follows gloas (<code>ForkName::Gloas.is_followed()</code>): the chain
+actor imports gloas blocks and their payload envelopes, a gloas checkpoint
+anchor is accepted (it starts EMPTY, with no payload known), and the clock
+passing the fork epoch no longer forces the sync status to syncing. Fork choice
+records the head node’s payload status next to the head root
+(<code>Store::head_payload_status</code>, in memory, recomputed by the first head
+computation after a restart), which the envelope by-range server reads to
+withhold the head’s envelope while the head is the EMPTY node. The node is
+still only a follower: the validator-client endpoints refuse a gloas epoch.</p>
+<h3 id="the-envelope-pipeline-in-the-chain-actor"><a class="header" href="#the-envelope-pipeline-in-the-chain-actor">The envelope pipeline in the chain actor</a></h3>
+<p>Order of arrival is not order of validity: an envelope can beat its block, a
+block can name a parent payload that has not arrived, and the columns an
+envelope’s commitments need can lag both. <code>beacon_envelope.rs</code> holds each case
+in a queue with its own bound, and <code>beacon_columns.rs</code> bounds the parked
+sidecars of the same fork.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Queue</th><th>Holds</th><th>Released when</th></tr>
+</thead>
+<tbody>
+<tr><td><code>awaiting_import</code></td><td>an envelope whose block is stored but has no post-state (pending on a parent, held for columns or for its parent’s payload), checked against the stored block’s bid</td><td>the block imports; evicted with the block when it is discarded and at finality; bounded by the stored blocks, not by arrival slot</td></tr>
+<tr><td><code>awaiting_block</code></td><td>an envelope whose block is not stored at all</td><td>the block imports; evicted after <code>ENVELOPE_AWAITING_BLOCK_TTL_SLOTS</code>, capped per slot and per root</td></tr>
+<tr><td><code>awaiting_columns</code></td><td>a consensus-checked envelope whose bid has commitments and whose sampled columns are not all stored</td><td>the last column is stored</td></tr>
+<tr><td><code>awaiting_engine</code></td><td>a consensus-valid envelope the execution client gave no answer for</td><td>the per-slot redrive gets an answer (see <a href="#gloas-1">beacon_engine.md</a>)</td></tr>
+<tr><td><code>blocks_awaiting_parent_payload</code></td><td>a block whose parent is FULL with a payload not yet verified, capped per parent</td><td>that parent’s envelope verifies</td></tr>
+</tbody>
+</table>
+</div>
+<p>Data availability moves with the payload: a gloas block’s commitments are in its
+bid, so the columns gate the envelope that reveals the payload, not the block’s
+own import. A held block’s parent envelope is requested through
+<code>FetchRequest.needs_envelope</code> the moment the block is held, whatever its source:
+<code>BlockSource::Sync</code> also marks by-root answers and pending children a cascade
+released, so no range batch can be assumed to bring the envelope, and p2p dedups
+in-flight roots. The tick re-asks once a slot for every parent still missing
+one, which is only what recovers a fetch that gave up; catch-up does not wait
+for it.</p>
+<p>The two envelope-before-block queues differ in who has vouched for the root.
+A range batch’s envelopes arrive when all but its first block are stored and
+unimported, so a stored block’s own bid is the authority: an envelope matching
+it (<code>envelope_matches_bid</code>) goes to <code>awaiting_import</code> outside the per-slot cap,
+and one contradicting it is dropped. Only a root with no stored block, which
+nobody has authenticated, is held under the per-slot cap and the TTL.
+Everything is swept at finality, except the finalized block’s own envelope.</p>
+<p>Fork-choice events are timed at their arrival: the store clock is advanced to
+the moment an envelope, block or payload vote reached the node before its
+handler runs, because the tick fires once per slot and the timeliness deadlines
+would otherwise be judged at the slot’s start. Payload votes already verified
+in p2p are applied without a second signature check
+(<code>apply_verified_payload_attestation</code>). The PTC vote vectors are not persisted
+and are reseeded empty on resume; see <a href="#-storage-what-lives-where">data_storage.md</a>.</p>
+<h3 id="the-deferred-payload"><a class="header" href="#the-deferred-payload">The deferred payload</a></h3>
+<p>A gloas block has no execution payload. Its body commits to a builder’s bid
+(<code>process_execution_payload_bid</code>), and the builder reveals the payload later in
+a <code>SignedExecutionPayloadEnvelope</code>. The payload is applied by the <em>next</em>
+block: <code>process_parent_execution_payload</code> compares that block’s bid against the
+parent’s committed one to tell whether the parent was full or empty, and for a
+full parent <code>apply_parent_execution_payload</code> runs the execution-layer requests
+carried in <code>parent_execution_requests</code> and settles the builder’s payment. An
+empty parent must carry no requests.</p>
+<p><code>verify_execution_payload_envelope</code> is the checking half that used to sit in
+<code>process_execution_payload</code>, and it mutates nothing: fork choice calls it on a
+stored state when an envelope arrives, and only the next block changes state.
+Block processing therefore takes no <code>ExecutionEngine</code>, and <code>process_withdrawals</code>
+takes no payload, since the expected withdrawals are a function of the state
+alone.</p>
+<p>Execution-layer requests moved with the payload. Deposit, withdrawal and
+consolidation requests, and the two builder requests, are reached only through
+<code>apply_parent_execution_payload</code>; gloas’s <code>process_operations</code> no longer calls
+the first three. Their behavior did not change, so
+<code>apply_parent_execution_payload</code> calls the fulu and electra processors instead
+of keeping copies.</p>
+<h3 id="progressive-lists-and-the-registry"><a class="header" href="#progressive-lists-and-the-registry">Progressive lists and the registry</a></h3>
+<p>EIP-7688 makes most lists in the gloas state and body unbounded, merkleized as a
+chain of growing subtrees (EIP-7916), and makes the big containers progressive
+(EIP-7495); a progressive container has no fixed depth. The other progressive
+lists are libssz’s <code>ProgressiveList</code>. The registry is the exception:
+<code>validators</code> and <code>balances</code> stay tree-backed, through
+<code>ethlambda_ssz_tree::ProgressiveList</code>, which has the same persistent nodes,
+update buffer and rebase as the bounded <code>List</code> and the same method set, so a
+gloas state shares subtrees with its parent the way earlier ones do.</p>
+<p>The registry therefore has two list types across the forks, and an accessor
+cannot return either one. The whole-registry accessors were replaced by
+element-level ones on <code>BeaconState</code>: <code>validator_count</code>, <code>validator</code>,
+<code>validator_mut</code>, <code>balance</code>, <code>balance_mut</code>, <code>push_validator</code>, <code>iter_validators</code>,
+<code>iter_balances</code> and <code>validators_root</code>. Each dispatches once and hands back an
+element, a count or an iterator. Only the few that need the list itself
+(<code>iter_validators</code>, <code>iter_balances</code>, rebasing onto a cached state, pointer
+equality) match on the private <code>Registry</code> enum.</p>
+<h3 id="one-function-for-both-list-types"><a class="header" href="#one-function-for-both-list-types">One function for both list types</a></h3>
+<p>The spec modifies a small part of what gloas touches, and the rest is electra’s
+text run against a differently typed list. Copying it would fork every fix, so
+the shared functions take narrow views instead:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>View</th><th>Reaches</th></tr>
+</thead>
+<tbody>
+<tr><td><code>PendingQueueFields</code></td><td>The deposit balance cursor and the three pending queues, on electra, fulu and gloas</td></tr>
+<tr><td><code>ChurnCursorsMut</code></td><td>The four exit and consolidation churn cursors, on the same three forks</td></tr>
+<tr><td><code>gloas_state</code>, <code>gloas_state_ref</code></td><td>Gloas’s own concrete state, for fields only gloas has</td></tr>
+</tbody>
+</table>
+</div>
+<p>Both list types deref to a slice of the same element type, so a view can expose
+slices and element-level methods and let electra’s <code>process_withdrawal_request</code>,
+<code>process_consolidation_request</code>, exit and slashing paths serve a gloas state
+unchanged. The churn limit is the one input that differs: electra’s cursor
+functions read gloas’s own limits on a gloas state, which is a fork dispatch
+inside them rather than a second copy. A function gets a gloas copy only where
+the spec marks it modified. The rule for choosing between the views and a
+projection is the one in “A recurring bug” below: project only when the return
+type must be gloas’s own.</p>
+<h3 id="fork-choice"><a class="header" href="#fork-choice">Fork choice</a></h3>
+<p>Gloas gives each block two branches to weigh: <em>empty</em>, where no payload was
+revealed or attested as timely and available, and <em>full</em>, where the builder’s
+payload was. A gloas fork-choice node is therefore <code>(root, PayloadStatus)</code>
+with <code>Empty</code>, <code>Full</code> and <code>Pending</code>, where every earlier fork’s node is a bare
+root. Nodes are derived on demand from the block tree, each block’s bid and the
+set of verified payloads (<code>get_node_children</code> builds them), not stored, which
+mirrors the spec’s <code>Store</code>.</p>
+<p><code>ForkRules</code> (<code>PreGloas</code> or <code>Gloas</code>) is the other new dimension. It is derived
+from an exhaustive match on a fork or a container, and it is what
+<code>validate_on_attestation</code> and <code>update_latest_messages</code> read, since gloas turns
+<code>data.index</code> into the payload flag and orders votes by slot instead of target
+epoch. A vote’s rules follow its own container, not the clock.</p>
+<p>One head computation serves every fork: <code>get_head_node</code> builds a weight table
+for the node tree in one bottom-up pass and descends over it. The current
+slot’s fork selects the two rules that differ: from <code>GLOAS_FORK_EPOCH</code> on,
+blocks carry the payload dimension their bids give them and the proposer boost
+is gated by <code>should_apply_proposer_boost</code>; before it, every block is a single
+full node and the boost applies whenever it is set. A block’s fork and parent
+payload status are recorded at import (<code>BlockPayloadLink</code>), so the walk decodes
+no block in the ordinary case; the two exceptions are in
+<a href="#spec-deviations">spec_deviations.md</a>. <code>compute_head</code> and the spec-literal
+<code>gloas_get_head</code> are kept as the references it is tested against; the cost
+argument is in the same page. The spec never describes a tree that
+crosses the boundary, so that page also records the rule this module chose.
+Two new handlers, <code>on_execution_payload_envelope</code> and
+<code>on_payload_attestation_message</code>, join the spec’s list of ways to change the
+store.</p>
 <h2 id="macros-and-traits"><a class="header" href="#macros-and-traits">Macros and traits</a></h2>
 <p>Two <code>macro_rules!</code> in the whole crate, both local, both replacing boilerplate that
 would otherwise run to hundreds of near-identical lines: the fixed-length byte
@@ -2101,9 +2265,11 @@ handlers.</li>
 </ul>
 <h2 id="fixture-suites"><a class="header" href="#fixture-suites">Fixture suites</a></h2>
 <p><code>consensus-spec-tests/tests/&lt;config&gt;/&lt;fork&gt;/&lt;runner&gt;/&lt;handler&gt;/&lt;suite&gt;/&lt;case&gt;/</code>,
-where <code>&lt;config&gt;</code> is <code>general</code> for the configuration-independent suites and the
-preset name otherwise. Container files are <code>.ssz_snappy</code>: SSZ compressed with
-<em>raw</em> snappy, not the framed format.</p>
+where <code>&lt;config&gt;</code> is the preset name. Container files are <code>.ssz_snappy</code>: SSZ
+compressed with <em>raw</em> snappy, not the framed format. The BLS and KZG vectors
+live in a separate tree, <code>cryptography-specs/tests/&lt;kind&gt;/&lt;handler&gt;/&lt;case&gt;/</code>,
+flatter still: no fork and no suite level, since neither is preset- or
+fork-dependent.</p>
 <p>Runners discover their cases from disk rather than listing them, so a fixture
 release that adds cases needs no code change. Two properties are deliberate: a
 suite that matches no case <strong>fails</strong> rather than reporting green, and a container
@@ -2166,49 +2332,56 @@ that check survives as one <code>&lt;runner&gt;/matched_fixture_cases</code> tes
 a stale runner or handler name still fails loudly.</li>
 </ul>
 <h2 id="status"><a class="header" href="#status">Status</a></h2>
-<p>All seven forks, phase0 through fulu, have containers, fork upgrades, state
-transitions, and epoch processing. Every fixture case passes on both presets:</p>
+<p>All eight forks, phase0 through gloas, have containers, fork upgrades, state
+transitions, and epoch processing. At the pinned fixture release every case
+that is not ignored passes on both presets:</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Preset</th><th>Fixture cases</th><th>Ignored</th><th>Lib tests</th></tr>
+<tr><th>Preset</th><th>Fixture cases passed</th><th>Ignored</th><th>Lib tests</th></tr>
 </thead>
 <tbody>
-<tr><td>mainnet</td><td>5705, all green</td><td>152</td><td>195</td></tr>
-<tr><td>minimal</td><td>40009, all green</td><td>3692</td><td>196</td></tr>
+<tr><td>mainnet</td><td>7175</td><td>1285</td><td>433 passed, 1 ignored</td></tr>
+<tr><td>minimal</td><td>49261</td><td>5403</td><td>434 passed, 1 ignored</td></tr>
 </tbody>
 </table>
 </div>
-<p>The lib counts were 244 and 245 while the containers, presets, configuration and
-primitives were defined here. Their 48 unit tests moved with them and run in
-<code>ethlambda-types</code>; the fixture counts, which are what defines correctness here,
-are unchanged.</p>
+<p>The lib counts are with <code>beacon-spec-tests</code> on, and include lean’s own unit
+tests, since the two chains share one lib target. The one ignored lib test is
+a timing measurement, not a fixture.</p>
 <p>Minimal runs more cases because the release ships more fixtures for it, and it
 runs two runners mainnet does not: <code>genesis</code>’s <code>initialization</code> and <code>validity</code>.
 The release ships no mainnet <code>genesis</code> fixtures, so that whole runner is gated
-behind the <code>preset-minimal</code> feature (<code>tests/spec/genesis.rs</code>).</p>
-<p>Nothing is ignored for being unimplemented. Every ignored case is one of two
-deliberate exclusions:</p>
+behind the <code>preset-minimal</code> feature (<code>tests/beacon_spec/genesis.rs</code>).</p>
+<p>The gossip validation vectors this crate’s <code>gossip.rs</code> runner covers come from
+the same tree as every other suite. The node validates four topics under fulu’s
+rules; every other case is ignored by name rather than left unmatched.</p>
+<p>Nothing is ignored for being unimplemented in the state transition or fork
+choice: <code>HIGHEST_IMPLEMENTED_FORK</code> is gloas, and every gloas case that is not
+ignored runs. The ignored cases are deliberate exclusions:</p>
 <ul>
 <li><code>LightClient*</code> containers under <code>ssz_static</code>, 5 container types across altair
-through fulu. The light-client sync protocol is a different layer from the
+through gloas. The light-client sync protocol is a different layer from the
 state transition and fork choice, and is not in this module’s scope.</li>
-<li>The <code>gloas</code> and <code>eip7805</code> fixture trees, one ignored entry each. See
-“Accounting for every fork directory” below.</li>
+<li><code>networking/gossip_*</code> cases outside what the node validates: every fork’s
+cases for topics it has no validator for (<code>IGNORED_HANDLERS</code>), non-fulu cases
+of the aggregate and attestation topics (block and data column validate fulu
+and gloas), and the vectors in <code>SKIPPED</code>, which assume a bad-block cache.</li>
+<li>The <code>heze</code> fixture tree, one ignored entry. See “Accounting for every fork
+directory” below.</li>
 </ul>
 <h2 id="accounting-for-every-fork-directory"><a class="header" href="#accounting-for-every-fork-directory">Accounting for every fork directory</a></h2>
 <p><code>collect</code> identifies a fork by parsing the directory name into a <code>ForkName</code>, and
 a name that does not parse is skipped. That skip is silent in a way the
 <code>HIGHEST_IMPLEMENTED_FORK</code> gate is not: the cases never become tests, so they are
 not counted as ignored either, and nothing in the output says they exist.</p>
-<p>The release does ship two such trees. <code>gloas</code> is the fork after fulu, and
-<code>eip7805</code> is not a fork in the sequence at all, being one of the per-EIP trees
-generated against a variant of some fork’s rules. Between them they hold 1898
-mainnet and 17539 minimal cases, all of which were previously dropped without a
-trace, which is the opposite of what this harness promises.</p>
-<p>So <code>UNMODELED_FORKS</code> names them, each reports as one ignored test, and
+<p><code>gloas</code> does not take this silent path: <code>ForkName::parse("gloas")</code> succeeds, so
+its cases become ordinary tests, individually named and run. <code>heze</code>, the one
+fork after gloas, is still unparseable and would be silently skipped without
+this section’s own accounting.</p>
+<p>So <code>UNMODELED_FORKS</code> names <code>heze</code> alone, it reports as one ignored test, and
 <code>fixture_forks/every_directory_is_accounted_for</code> fails if the tree holds a fork
-directory that is neither parseable nor listed. A release that adds a fork now
+directory that is neither parseable nor listed. A release that adds a fork
 forces a decision instead of quietly widening the gap.</p>
 <div class="table-wrapper">
 <table>
@@ -2216,8 +2389,8 @@ forces a decision instead of quietly widening the gap.</p>
 <tr><th>Suite</th><th>Covers</th></tr>
 </thead>
 <tbody>
-<tr><td><code>general/bls</code></td><td>Cryptography, fork- and preset-independent</td></tr>
-<tr><td><code>general/kzg</code></td><td>Cryptography, fork- and preset-independent</td></tr>
+<tr><td><code>bls</code> (<code>cryptography-specs</code>)</td><td>Cryptography, fork- and preset-independent</td></tr>
+<tr><td><code>kzg</code> (<code>cryptography-specs</code>)</td><td>Cryptography, fork- and preset-independent</td></tr>
 <tr><td><code>ssz_static</code></td><td>Every fork’s containers</td></tr>
 <tr><td><code>shuffling</code></td><td>Committee helpers</td></tr>
 <tr><td><code>operations</code>, <code>epoch_processing</code></td><td>Every fork’s operation and epoch sub-function</td></tr>
@@ -2229,9 +2402,14 @@ forces a decision instead of quietly widening the gap.</p>
 </table>
 </div>
 <h3 id="fork-choice-is-fixture-verified"><a class="header" href="#fork-choice-is-fixture-verified">Fork choice is fixture-verified</a></h3>
-<p>150 mainnet <code>fork_choice</code> cases pass, covering bellatrix’s <code>on_merge_block</code>/
-terminal-PoW validation, <code>should_override_forkchoice_update</code>, deneb’s blob
-data availability, and fulu’s column data availability.</p>
+<p>205 mainnet <code>fork_choice</code> cases pass, covering bellatrix’s <code>on_merge_block</code>/
+terminal-PoW validation, the <code>v1.7.0</code> proposer-boost dependent-root gate and
+<code>get_proposer_head</code>’s proposer-equivocation branch, deneb’s blob data
+availability, fulu’s column data availability, and gloas’s payload-aware
+suites: <code>get_head</code>, <code>get_parent_payload_status</code>, <code>on_block</code>, <code>on_attestation</code>,
+<code>on_execution_payload_envelope</code>, <code>on_payload_attestation_message</code>,
+<code>payload_data_availability</code>, <code>payload_timeliness</code> and <code>ex_ante</code>. Gloas
+accounts for 54 of the 205.</p>
 <p>The release still ships no phase0 <code>fork_choice</code> suite: the earliest is
 altair’s, built from altair-shaped states even though altair changes nothing
 about fork choice itself (<code>Store</code> accepts a block from any fork this module
@@ -2255,8 +2433,8 @@ through a different variant.</p>
 <ul>
 <li>Capella’s withdrawal sweep, projected to capella’s own state.</li>
 <li>Deneb reusing that same sweep, still projected to capella’s state.</li>
-<li>Altair’s participation fields, projected to altair’s state, so every one of
-the five later forks that also carries participation failed.</li>
+<li>Altair’s participation fields, projected to altair’s state, so every later
+fork that also carries participation failed.</li>
 <li>Deneb’s <code>process_attestation</code>, projected to deneb’s state.</li>
 <li><code>slash_validator</code> calling phase0’s <code>initiate_validator_exit</code> at electra,
 which also left electra’s EIP-7251 churn cursor unadvanced, mispricing every
@@ -2328,7 +2506,7 @@ column sidecars</a>.</p>
 </code></pre>
 <p>No flag is required, but that is only true for a built-in network:
 <code>ethlambda beacon</code> on its own follows mainnet, since <code>--network</code> defaults to
-<code>mainnet</code>. Sepolia and Hoodi are built in too, and any other network is a
+<code>mainnet</code>. Sepolia, Hoodi and Platåberget are built in too, and any other network is a
 <code>--network</code> naming a directory of published files (<code>config.yaml</code> and
 <code>genesis.ssz</code>, see <a href="#command-line"><code>cli.md</code></a>):</p>
 <pre><code class="language-bash">ethlambda beacon --network hoodi --checkpoint-sync-url https://checkpoint-sync.hoodi.ethpandaops.io
@@ -2336,14 +2514,15 @@ ethlambda beacon --network ./my-network --node-key ./node-key
 </code></pre>
 <p><code>genesis_time</code> and <code>genesis_validators_root</code>, and therefore the fork digest,
 are derived from the resolved network: a built-in network (<code>mainnet</code>,
-<code>sepolia</code>, <code>hoodi</code>) carries the two values as constants beside its
-<code>eth-clients</code> <code>config.yaml</code> and bootnode list, and no genesis state; for a
+<code>sepolia</code>, <code>hoodi</code>, <code>plataberget</code>) carries the two values as constants beside
+its published <code>config.yaml</code> and bootnode list, and no genesis state; for a
 loaded network they are read off that directory’s own <code>genesis.ssz</code>. Nothing
 about startup touches the network to get there. discv5 is forced on and needs no flag either: published mainnet
 bootnodes are largely seed-only, so a crawl is how a peer is reached.</p>
 <h2 id="the-fork-digest"><a class="header" href="#the-fork-digest">The fork digest</a></h2>
-<p>Computed once at startup from the resolved network’s genesis state, never
-hardcoded as a digest:</p>
+<p>Computed from the resolved network’s genesis state and fork schedule, never
+hardcoded as a digest. Startup derives the first one and a running node follows
+the schedule from there (see below):</p>
 <pre><code>epoch        = (now - genesis_time) / (SECONDS_PER_SLOT * SLOTS_PER_EPOCH)
 fork_version = the resolved network's fork schedule at epoch
 base         = compute_fork_data_root(fork_version, genesis_validators_root)
@@ -2355,14 +2534,34 @@ digest       = base[..4]                                    if epoch &lt;  FULU_
 <code>(ELECTRA_FORK_EPOCH, MAX_BLOBS_PER_BLOCK_ELECTRA)</code>. The fulu branch is
 EIP-7892’s, which is why mainnet’s digest is <code>8c9f62fe</code> rather than fulu’s bare
 <code>82fae541</code>.</p>
-<p>Startup logs the next boundary’s epoch and wall-clock time. The digest is
-computed once, so crossing one strands the node on topic names nobody publishes
-to; restart it to pick up the new digest.</p>
+<p>Startup logs the next boundary’s epoch, wall-clock time, fork and digest. A
+running node crosses it without a restart (<code>beacon::transition</code> in
+<code>ethlambda-p2p</code>, driven by <code>beacon::fork_schedule</code>). Both fork activations and
+blob-parameter-only forks move the digest, so both are boundaries. Following the
+spec’s “Transitioning the gossip” rules, the next digest’s topics are joined
+<code>SUBSCRIBE_LEAD_EPOCHS</code> before its boundary and the previous digest’s topics
+are left <code>UNSUBSCRIBE_LAG_EPOCHS</code> after it. At the boundary the node
+publishes and advertises the new digest, bumps its metadata sequence number
+and moves its discv5 admission filter. While the window is open a gossip
+message’s fork comes from its own topic’s digest, and a <code>Status</code> on either
+digest is answered, but range sync starts only from a peer on the current
+digest (or the next one, within clock skew of the boundary).</p>
+<p>One gap: the ENR this node serves over discv5 keeps the <code>eth2</code> entry it started
+with, because ethrex’s <code>DiscoveryServer</code> offers no way to replace its record at
+runtime. Peers already connected are unaffected; peers discovering the node
+after a boundary read the stale digest and reject the record.</p>
 <h2 id="gossip"><a class="header" href="#gossip">Gossip</a></h2>
 <p>Seven global topics, <code>/eth2/{digest}/{name}/ssz_snappy</code>, plus two subnet
 families this node’s own node id selects a narrow slice of: the data column
 subnets it custodies and the attestation subnets it backbones, both described
-below.</p>
+below. A gloas digest adds two more, <code>execution_payload</code> and
+<code>payload_attestation_message</code>, which <code>BeaconTopics::for_fork</code> subscribes under
+gloas digests and not under earlier ones. An envelope is validated like a block
+(its stateful half on the blocking pool) and goes to the chain actor on <code>Accept</code>
+and on <code>Queue</code>, since the actor holds an envelope whose block is not imported
+yet. A payload attestation is validated on the attestation permit pool and goes
+to the actor on <code>Accept</code> only: a vote for a block not imported here is dropped,
+since it is valid only within its own slot.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -2370,13 +2569,15 @@ below.</p>
 </thead>
 <tbody>
 <tr><td><code>beacon_block</code></td><td><code>SignedBeaconBlock</code>, fork chosen by the block’s slot</td></tr>
-<tr><td><code>beacon_aggregate_and_proof</code></td><td><code>SignedAggregateAndProof</code>, phase0 or electra</td></tr>
+<tr><td><code>beacon_aggregate_and_proof</code></td><td><code>SignedAggregateAndProof</code>, phase0, electra or gloas</td></tr>
 <tr><td><code>attester_slashing</code></td><td><code>AttesterSlashing</code>, phase0 or electra</td></tr>
 <tr><td><code>voluntary_exit</code></td><td><code>SignedVoluntaryExit</code></td></tr>
 <tr><td><code>proposer_slashing</code></td><td><code>ProposerSlashing</code></td></tr>
 <tr><td><code>bls_to_execution_change</code></td><td><code>SignedBLSToExecutionChange</code></td></tr>
 <tr><td><code>sync_committee_contribution_and_proof</code></td><td><code>SignedContributionAndProof</code></td></tr>
-<tr><td><code>beacon_attestation_{subnet_id}</code></td><td><code>Attestation</code>, phase0 or electra</td></tr>
+<tr><td><code>beacon_attestation_{subnet_id}</code></td><td><code>Attestation</code>, phase0 or electra’s <code>SingleAttestation</code> (gloas keeps the latter)</td></tr>
+<tr><td><code>execution_payload</code></td><td><code>SignedExecutionPayloadEnvelope</code>, gloas digests only</td></tr>
+<tr><td><code>payload_attestation_message</code></td><td><code>PayloadAttestationMessage</code>, gloas digests only</td></tr>
 </tbody>
 </table>
 </div>
@@ -2412,13 +2613,16 @@ plus <code>SUBNETS_PER_NODE</code>, still far short of a full subscription to ev
 attestation, sync-committee and data-column subnet, and narrower still than
 <code>NUMBER_OF_CUSTODY_GROUPS</code> columns of custody, which is what a supernode
 would carry alone. A sidecar decodes as
-<code>fulu::DataColumnSidecar</code>; the checks it passes before this node keeps or
+the fork-agnostic <code>DataColumnSidecar</code> enum, its fork taken from the topic’s
+digest (the bytes carry no tag): fulu’s names its block by a signed header and
+inclusion proof, gloas’s by a slot and block root, with the commitments it is
+checked against living in that block’s bid. The checks it passes before this node keeps or
 forwards it are described just below. How a kept sidecar is later served back
 out over req/resp is under <a href="#data-column-sidecars">Data column sidecars</a>.</p>
 <p>Every beacon message is held by gossipsub until it has a verdict
 (<code>validate_messages()</code> is on for this wire only). Blocks, data column
 sidecars, aggregates and subnet attestations are all validated by fulu’s
-gossip rules (<code>ethlambda_state_transition::beacon::gossip</code>, one module per
+gossip rules, or gloas’s modified ones from the fork on (<code>ethlambda_state_transition::beacon::gossip</code>, one module per
 topic family): the checks that need no state run inline in the p2p actor, the
 rest on a bounded <code>spawn_blocking</code> task whose verdict comes back to the actor
 (<code>crate::beacon::verdict</code>). Two permit pools bound how many of these run at
@@ -2439,6 +2643,31 @@ attesting indices gossip validation resolved. A subnet attestation never
 reaches it at all, on any outcome: verifying and relaying it is the whole of
 what this node owes the topic (see above), so there is nothing further for the
 chain actor to do with one.</p>
+<p>The rules above are fulu’s, except that blocks, data columns, aggregates and
+subnet attestations also have gloas rules. A gloas aggregate has electra’s bytes
+but its own progressive <code>Attestation</code>, so it decodes to its own
+<code>SignedAggregateAndProof::Gloas</code> (the signed root differs); a gloas subnet
+attestation is electra’s <code>SingleAttestation</code> unchanged. In both, <code>data.index</code> is
+the payload flag (0 or 1), and a vote for the full payload (1) is IGNOREd until
+the block’s envelope has been seen and its payload validated
+(<code>verify_attestation_payload_status</code>). Gloas is a followed fork, so a block at
+a gloas slot that fails to decode is REJECTed like one at any other followed
+fork; <code>unsupported_fork</code> is kept for a fork the node does not follow
+(<code>ForkName::is_followed</code>), none today. A gloas aggregate’s aggregation bits are
+an unbounded progressive bitlist, so one longer than electra’s type bound is
+REJECTed first, reading its length without expanding it, since expanding is
+what the seen-set check does before any other.</p>
+<p>Three deliberate departures from the gloas gossip rules, each for want of state
+this node does not keep. Where the specification rejects a message whose block
+failed validation, this node (having no bad-block cache) cannot tell that from
+a block it has not finished importing, so it queues or ignores instead; the
+matching <code>reject_block_failed_validation</code> vectors are in <code>SKIPPED</code>. An
+<code>execution_payload</code> whose block state is not in the cache p2p reads (a parent
+imported moments ago, say) is queued and forwarded to the chain actor, which
+verifies every envelope itself, without being propagated. And a
+<code>payload_attestation_message</code> is applied to fork choice after p2p verified its
+signature, with the actor re-checking only the store-state conditions (known
+block, current slot, committee seat).</p>
 <p>The remaining five global topics are decoded, logged at <code>debug</code>, and IGNOREd,
 since nothing consumes them; an undecodable payload on any topic is REJECTed.
 Nothing is published on any topic, columns included: nothing this node can
@@ -2534,6 +2763,8 @@ choice.</p>
 <tr><td><code>beacon_blocks_by_root/2</code></td><td>both</td></tr>
 <tr><td><code>data_column_sidecars_by_root/1</code></td><td>both</td></tr>
 <tr><td><code>data_column_sidecars_by_range/1</code></td><td>both</td></tr>
+<tr><td><code>execution_payload_envelopes_by_range/1</code></td><td>both</td></tr>
+<tr><td><code>execution_payload_envelopes_by_root/1</code></td><td>both</td></tr>
 </tbody>
 </table>
 </div>
@@ -2632,6 +2863,43 @@ what the digest exists to say and is not otherwise visible until a signature
 fails. A mismatch ends the stream, logged at <code>warn</code> with both digests: the one way to
 reach it in good faith is a blob schedule of ours that has fallen behind the
 network’s.</p>
+<h3 id="execution-payload-envelopes"><a class="header" href="#execution-payload-envelopes">Execution payload envelopes</a></h3>
+<p>Both gloas envelope protocols are registered <code>Full</code>: the server answers, and
+the client (<code>req_resp/envelope_client.rs</code>) asks. A chunk carries one
+<code>SignedExecutionPayloadEnvelope</code> under the fork digest of its block’s epoch.
+The envelope has no slot of its own, so the epoch comes from
+<code>payload.slot_number</code>, which <code>verify_execution_payload_envelope</code> pins to the
+block’s slot. A chunk whose digest names no gloas-or-later scheduled fork, or
+not the digest its slot implies, ends the stream.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Protocol</th><th>Served from</th></tr>
+</thead>
+<tbody>
+<tr><td><code>execution_payload_envelopes_by_root/1</code></td><td>a point lookup per root in <code>Table::ExecutionPayloadEnvelopes</code>; unknown roots are left out, answers follow the order asked</td></tr>
+<tr><td><code>execution_payload_envelopes_by_range/1</code></td><td>the canonical blocks of the window (<code>BlockRoots</code>), each envelope kept only when the next canonical block builds on its payload; the head’s own envelope only when the head node is FULL (<code>Store::head_payload_status</code>, which pairs the status with the head root it describes, so a stale status reads as unknown and the envelope is withheld)</td></tr>
+</tbody>
+</table>
+</div>
+<p>Both are bounded by <code>MAX_REQUEST_PAYLOADS</code>: a by-root list over it fails to
+decode, and a by-range <code>count</code> over it is truncated, which the specification’s
+“Clients MAY limit the number of payload envelopes in the response” allows.
+A by-range request starting below <code>Store::anchor_slot</code> gets
+<code>RESOURCE_UNAVAILABLE</code>, and a window before gloas is simply empty.</p>
+<p>The client asks in two situations. By root: the chain actor’s
+<code>FetchRequest.needs_envelope</code> (a block whose child waits on its payload) starts
+a lookup with the block fetch’s dedup, peer choice and retry ladder; a give-up
+is recovered by the actor’s per-slot re-ask. By range: after a
+<code>beacon_blocks_by_range/2</code> answer for a span that reaches gloas has been handed
+to the actor, the same peer is asked for that span’s envelopes, and range sync
+holds the next block request until that answer is checked and forwarded (or has
+failed). The pause exists because the actor keeps an envelope whose block has
+not imported only briefly and in small numbers, so a batch’s envelopes must
+arrive before the next batch’s blocks do. Everything fetched goes through the
+same rules as an <code>execution_payload</code> gossip message
+(<code>beacon/envelope_checks.rs</code>) before the actor sees it; a <code>Queue</code> verdict is
+forwarded too.</p>
 <h3 id="data-column-sidecars"><a class="header" href="#data-column-sidecars">Data column sidecars</a></h3>
 <p>Both protocols are registered <code>Full</code>, since with the columns on disk this node
 can serve every slot it has custodied:</p>
@@ -2678,9 +2946,10 @@ at all: the columns are normally already stored by the time their block reaches
 the availability gate. Nothing waits on the answer, so a short, empty or
 refused one costs nothing and is not retried; the per-block path is the
 backstop.</p>
-<p>Since the column request is aimed by custody, a batch reaching fulu is held
-back, blocks included, until every custody column has a known custodian among
-the connected peers. Lighthouse’s range sync holds its batches the same way.
+<p>Since the column request is aimed by custody, a batch whose last slot is fulu
+or later is held back, blocks included, until every custody column has a known
+custodian among the connected peers. Lighthouse’s range sync holds its batches
+the same way.
 Right after startup, custody is known for almost no peer, since a peer’s
 custody arrives with its <code>metadata/3</code> answer after it connects. A mainnet
 follower’s first batch after a fresh checkpoint sync went out 5 s after
@@ -2821,7 +3090,7 @@ as a query filter, so a <code>quic</code>-only record is invisible to it.</p>
 <tr><th>Metric</th><th>Meaning</th></tr>
 </thead>
 <tbody>
-<tr><td><code>lean_beacon_gossip_messages_total{topic,result}</code></td><td>Gossip received, by topic and by <code>decoded</code> / <code>decode_failed</code> / <code>decompress_failed</code></td></tr>
+<tr><td><code>lean_beacon_gossip_messages_total{topic,result}</code></td><td>Gossip received, by topic and by <code>decoded</code> / <code>decode_failed</code> / <code>decompress_failed</code> / <code>unsupported_fork</code></td></tr>
 <tr><td><code>lean_beacon_gossip_validation_total{kind,outcome,reason}</code></td><td>Gossip verdicts, now including <code>beacon_aggregate_and_proof</code> and <code>beacon_attestation</code>; see <a href="#beacon-gossip-validation">metrics.md</a></td></tr>
 <tr><td><code>lean_beacon_gossip_verdict_expired_total{kind}</code></td><td>Verdicts that came too late to propagate anything; should stay at zero</td></tr>
 <tr><td><code>lean_beacon_status_digest_mismatch_total</code></td><td>Handshakes seen from another fork digest</td></tr>
@@ -2954,7 +3223,7 @@ and the <code>verify_and_notify_new_payload</code> half of each fork’s <code>p
 The wire is
 <a href="https://github.com/ethereum/execution-apis/tree/main/src/engine"><code>execution-apis/src/engine</code></a>.</p>
 <h2 id="which-methods-and-why-so-few"><a class="header" href="#which-methods-and-why-so-few">Which methods, and why so few</a></h2>
-<p>Four:</p>
+<p>Six:</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -2962,7 +3231,9 @@ The wire is
 </thead>
 <tbody>
 <tr><td><code>engine_newPayloadV4</code></td><td>prague</td><td>Validate one block’s payload</td></tr>
+<tr><td><code>engine_newPayloadV5</code></td><td>amsterdam</td><td>Validate the payload a gloas envelope reveals</td></tr>
 <tr><td><code>engine_forkchoiceUpdatedV3</code></td><td>cancun</td><td>Say where the head, safe and finalized blocks are</td></tr>
+<tr><td><code>engine_forkchoiceUpdatedV4</code></td><td>amsterdam</td><td>The same, from a gloas head on; also carries the node’s custody columns</td></tr>
 <tr><td><code>engine_exchangeCapabilities</code></td><td>common</td><td>Startup handshake</td></tr>
 <tr><td><code>engine_getClientVersionV1</code></td><td>identification</td><td>Log what the execution client is</td></tr>
 </tbody>
@@ -2970,14 +3241,21 @@ The wire is
 </div>
 <p>Osaka introduces <strong>no new <code>newPayload</code></strong>. Its own document adds only
 <code>engine_getPayloadV5</code> and <code>engine_getBlobsV2</code>/<code>V3</code>; <code>engine_newPayloadV5</code> belongs
-to Amsterdam. So the Osaka-current call for a payload is prague’s V4, and the
-Osaka-current fork choice notification is cancun’s V3.</p>
+to Amsterdam, where gloas’s envelope import uses it. So the Osaka-current call for a payload is prague’s V4, and the
+Osaka-current fork choice notification is cancun’s V3. Amsterdam’s pair (newPayload V5, forkchoiceUpdated V4) is
+used from gloas on; the startup handshake warns when the execution client does not advertise either, but only on a network whose schedule includes gloas.</p>
 <p>Three method families a full client would have are deliberately absent:</p>
 <ul>
-<li><strong><code>engine_getPayload*</code> and <code>PayloadAttributesV3</code>.</strong> This node is a follower and
-never proposes, so it never asks an execution client to start building a block.
-That also keeps <code>forkchoiceUpdated</code> outside the fork-scheduling rules attached
-to <code>payloadAttributes.timestamp</code>: the second parameter is always <code>null</code>.</li>
+<li><strong><code>engine_getPayload*</code> outside the gloas path.</strong> The follower itself never
+asks an execution client to start building a block, so its own
+<code>forkchoiceUpdated</code> calls carry <code>null</code> payload attributes. Block production for
+a validator client (<code>produceBlockV3</code> for fulu, <code>produceBlockV4</code> for gloas) does:
+<code>forkchoiceUpdatedV3</code> with <code>PayloadAttributesV3</code> then <code>engine_getPayloadV5</code>
+before gloas, and <code>forkchoiceUpdatedV4</code> with <code>PayloadAttributesV4</code> (V3’s fields
+plus <code>slotNumber</code> and <code>targetGasLimit</code>, the parent bid’s gas limit) then
+<code>engine_getPayloadV6</code> (<code>ExecutionPayloadV4</code>, with <code>blockAccessList</code> and
+<code>slotNumber</code>) from gloas on. The handshake warns when a gloas network’s
+execution client does not advertise <code>engine_getPayloadV6</code>.</li>
 <li><strong><code>engine_getBlobs*</code>.</strong> There is no blob-pool fetch path here; data columns come
 from peers over the network.</li>
 <li><strong><code>engine_getPayloadBodies*</code>.</strong> Nothing consumes them.</li>
@@ -2999,6 +3277,9 @@ chains this follower cannot reach.</p>
         ├─ state_transition, with the engine derived from the verdict
         └─ record the block's execution hash and its optimistic status
 </code></pre>
+<p>This diagram is the pre-gloas path. A gloas block carries no payload, only a
+builder’s bid, so nothing is asked about it at import; the question moves to the
+envelope that reveals the payload (see <a href="#gloas-1">Gloas</a> below).</p>
 <p>The order is the specification’s own: <code>is_data_available</code> runs before
 <code>state_transition</code>, so a block about to be held for its custody columns is never
 one this node asks an execution client about.</p>
@@ -3036,10 +3317,10 @@ take the head from a <code>VALID</code> one on attestation weight, and then requ
 head to fall back when the <code>SYNCING</code> branch turns out to be invalid.</p>
 <p>An invalidated block leaves fork choice by having its <code>LiveChain</code> index row
 deleted. That is sufficient because <code>Store::block_index()</code> is the only source
-<code>filter_block_tree</code>, <code>compute_weights</code> and <code>get_head</code> read: a root with no row
-contributes no weight to any ancestor and can never be walked to. The block and
-its state stay in their own tables, so an operator can still inspect what was
-rejected.</p>
+<code>filter_block_tree</code>, <code>compute_node_weights</code> and <code>walk_head</code> read: a root with no
+row contributes no weight to any ancestor and can never be walked to. The block
+and its state stay in their own tables, so an operator can still inspect what
+was rejected.</p>
 <p>That an <code>INVALIDATED</code> block is never imported is enforced on the verdict itself,
 in <code>on_block</code>, not on the state transition having failed. The transition still
 runs first, so the failure arrives from inside <code>process_execution_payload</code> where
@@ -3055,11 +3336,11 @@ transition”) or <code>INVALIDATED</code> verdict, and, for the ones that get n
 finality: an execution client doing a long state sync answers <code>NOT_VALIDATED</code> to
 every block, so without that bound the set would take one root per import for
 the life of the process.</p>
-<p>Nothing outside <code>mark_validated</code>’s own ancestor walk reads the set yet. The
-readers it is waiting for are the ones that need to answer “is my head
-optimistic?”: the Beacon API’s <code>execution_optimistic</code> response field, and a sync
-status that separates a head this node has vouched for from one it has merely
-imported.</p>
+<p>Besides <code>mark_validated</code>’s own ancestor walk, the Beacon API’s
+<code>execution_optimistic</code> response field reads the set (see
+<a href="#execution_optimistic-under-gloas">rpc.md</a>). A sync status that
+separates a head this node has vouched for from one it has merely imported does
+not exist yet.</p>
 <h3 id="is_optimistic_candidate_block"><a class="header" href="#is_optimistic_candidate_block"><code>is_optimistic_candidate_block</code></a></h3>
 <p>A <code>NOT_VALIDATED</code> verdict is not enough on its own. The block must also either</p>
 <ol>
@@ -3124,6 +3405,42 @@ cache is bounded by finality, so its deepest entry is the finalized block
 itself. An execution client condemning finalized history means it and this node
 disagree about what is final, which is an operator emergency rather than
 something to resolve by emptying fork choice.</p>
+<h2 id="gloas-1"><a class="header" href="#gloas-1">Gloas</a></h2>
+<p>A gloas block commits to a builder’s bid and the payload arrives later in a
+<code>SignedExecutionPayloadEnvelope</code>, so the execution client judges the envelope,
+not the block. The order differs from the specification’s, which asks the engine
+last inside one boolean function: the follower runs the pure consensus checks
+first (signature, bid, state, data availability), and only an envelope that
+passed them is sent to <code>engine_newPayloadV5</code>. That way an unsigned copy with the
+honest block hash and a different body cannot earn an <code>INVALID</code> that lands on the
+honest payload, and the engine never spends time on an envelope this node would
+refuse anyway.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Answer</th><th>What happens to the envelope</th></tr>
+</thead>
+<tbody>
+<tr><td><code>VALID</code></td><td>Applied; the payload is recorded <code>VALID</code></td></tr>
+<tr><td><code>SYNCING</code>, <code>ACCEPTED</code></td><td>Applied and recorded <code>SYNCING</code> (not yet validated); a later <code>forkchoiceUpdated</code> <code>VALID</code> promotes it</td></tr>
+<tr><td><code>INVALID</code> with a <code>latestValidHash</code></td><td>The payload is invalid: not applied, so the block’s FULL node never exists; the block and its EMPTY branch stay</td></tr>
+<tr><td><code>INVALID</code> with a null <code>latestValidHash</code>, or <code>INVALID_BLOCK_HASH</code></td><td>The envelope’s contents do not hash to the block hash it claims: only that envelope is refused, since the builder’s real one may still arrive</td></tr>
+<tr><td>no answer after the retry ladder</td><td>Kept (it is consensus-valid) and asked again once a slot</td></tr>
+</tbody>
+</table>
+</div>
+<p>The null-<code>latestValidHash</code> row exists because ethrex has no <code>INVALID_BLOCK_HASH</code>
+status: it answers a mismatch with a null hash and an executed-and-failed payload
+with its last valid ancestor. <code>latestValidHash</code> and <code>VALID</code> follow the execution
+chain (each block’s <code>bid.parent_block_hash</code>), not every verified ancestor, since
+a block built past an ancestor’s EMPTY node skips that ancestor’s payload. The
+details, and why each departs from the specification, are in
+<a href="#the-execution-client-judges-a-gloas-payload-before-the-envelope-is-applied">spec_deviations.md</a>.</p>
+<p>With the engine down, the per-slot retry asks about the oldest held envelope
+only and releases the rest once that ask is answered, so an unreachable client
+costs one retry ladder per slot however many envelopes wait. This is the gloas
+counterpart of the limitation below, and unlike a block the envelope is not
+dropped.</p>
 <h2 id="forkchoiceupdated"><a class="header" href="#forkchoiceupdated"><code>forkchoiceUpdated</code></a></h2>
 <p>Sent once after every head recompute, which is once per import cascade and once
 per tick, not once per block. It is sent even when nothing moved: an execution
@@ -3144,6 +3461,14 @@ root is the last block at <em>or before</em> that boundary, so a missed proposal
 epoch boundary leaves the finalized block below the bound. Dropping its hash
 would make every later call carry <code>finalized_block_hash = 0x00..0</code> and stop the
 execution client advancing its own finalized block for the life of the process.</p>
+<p>For a gloas head the hashes come from bids rather than from a cached payload
+hash: the head node’s <code>bid.block_hash</code> when it is FULL and its
+<code>bid.parent_block_hash</code> when it is EMPTY, the finalized block’s
+<code>bid.parent_block_hash</code>, and the justified block’s <code>bid.parent_block_hash</code> as
+the safe hash. The last is a fallback, since the specification builds the safe
+hash on fast confirmation, which the follower does not run. The call is V4 with
+the node’s custody columns. A head whose payload status has not been computed
+yet (the first moments after a restart) sends nothing.</p>
 <p>The response carries a <code>PayloadStatusV1</code> of its own, and that is the channel by
 which a block imported on <code>SYNCING</code> later becomes <code>VALID</code> or is found to be
 <code>INVALID</code>. An invalidation reaching the follower this way can remove the head
@@ -3367,7 +3692,7 @@ something specific here.</p>
 <tr><th>Flag</th><th>Default</th><th>Meaning</th></tr>
 </thead>
 <tbody>
-<tr><td><code>--network</code></td><td><code>mainnet</code></td><td>A built-in network name (<code>mainnet</code>, <code>sepolia</code> or <code>hoodi</code>), or a path to a directory of published network files. A value containing a slash is always a path, so <code>mainnet</code> is the built-in and <code>./mainnet</code> is a directory. The directory must hold <code>config.yaml</code> and <code>genesis.ssz</code>, and may hold <code>bootstrap_nodes.yaml</code> or <code>bootstrap_nodes.txt</code></td></tr>
+<tr><td><code>--network</code></td><td><code>mainnet</code></td><td>A built-in network name (<code>mainnet</code>, <code>sepolia</code>, <code>hoodi</code> or <code>plataberget</code>), or a path to a directory of published network files. A value containing a slash is always a path, so <code>mainnet</code> is the built-in and <code>./mainnet</code> is a directory. The directory must hold <code>config.yaml</code> and <code>genesis.ssz</code>, and may hold <code>bootstrap_nodes.yaml</code> or <code>bootstrap_nodes.txt</code></td></tr>
 </tbody>
 </table>
 </div>
@@ -3380,7 +3705,7 @@ come from the resolved network:</p>
 <tr><th><code>--network</code></th><th>genesis values</th><th>config</th><th>bootnodes</th></tr>
 </thead>
 <tbody>
-<tr><td><code>mainnet</code> (default), <code>sepolia</code>, <code>hoodi</code></td><td>two constants in <code>network::built_in</code>; no genesis state is carried (a built-in network never anchors at genesis, and the states run from 5 MB to 150 MB)</td><td><code>bin/ethlambda/assets/&lt;name&gt;/config.yaml</code>, <code>eth-clients/&lt;name&gt;</code>’s file byte for byte</td><td><code>bin/ethlambda/assets/&lt;name&gt;/bootstrap_nodes.yaml</code>, from the same repo</td></tr>
+<tr><td><code>mainnet</code> (default), <code>sepolia</code>, <code>hoodi</code>, <code>plataberget</code></td><td>two constants in <code>network::built_in</code>; no genesis state is carried (a built-in network never anchors at genesis, and the states run from 5 MB to 150 MB)</td><td><code>bin/ethlambda/assets/&lt;name&gt;/config.yaml</code>, byte for byte from <code>eth-clients/&lt;name&gt;</code> (Platåberget: <code>ethpandaops/glamsterdam-devnets</code>’ <code>network-configs/devnet-8</code>)</td><td><code>bin/ethlambda/assets/&lt;name&gt;/bootstrap_nodes.yaml</code>, from the same repo</td></tr>
 <tr><td>a directory</td><td>read off the directory’s own <code>genesis.ssz</code></td><td>the directory’s <code>config.yaml</code></td><td>the directory’s <code>bootstrap_nodes.yaml</code>/<code>.txt</code></td></tr>
 </tbody>
 </table>
@@ -3394,12 +3719,17 @@ of its own the way <code>node</code> does: those are read off the resolved netwo
 of being separate operator input. A <code>config.yaml</code> (a directory’s, or a built-in
 network’s embedded one) is read permissively: absent keys fall back to mainnet’s values,
 numbers are accepted quoted or bare, and unrecognised keys (on a current
-config, the gloas and heze schedule this build cannot process) are dropped
+config, the heze schedule this build does not claim) are dropped
 with one warning line naming each. Its <code>PRESET_BASE</code> is checked against the
 compiled preset; a mismatch is a hard startup error naming the cargo feature
-that would fix it. The keys this build runs on compile-time constants for (the
-custody and subnet counts, the <code>MAX_REQUEST_*</code> limits, <code>MAX_PAYLOAD_SIZE</code>, the
-snappy message domains and <code>MAXIMUM_GOSSIP_CLOCK_DISPARITY</code>) must equal those
+that would fix it. Sepolia’s config schedules gloas, which this build follows, so
+it parses and runs like any other fork. A scheduled fork the build claims but
+does not follow gets a separate, explicit warning at startup, since the chain
+follower would stop tracking the chain there regardless of what parsed
+cleanly; none exists today. The keys this
+build runs on compile-time constants for (the custody and subnet counts, the
+<code>MAX_REQUEST_*</code> limits, <code>MAX_PAYLOAD_SIZE</code>, the snappy message domains and
+<code>MAXIMUM_GOSSIP_CLOCK_DISPARITY</code>) must equal those
 constants, or startup fails naming each key that differs: the node cannot
 follow a network that sets them otherwise, and <code>/eth/v1/config/spec</code> would
 report values it does not use. For a directory, both checks run before its
@@ -3416,26 +3746,22 @@ consistency (see <a href="#checkpoint-sync"><code>checkpoint_sync.md</code></a>)
 precedence is: a resumable data directory, then <code>--checkpoint-sync-url</code>, then,
 for a loaded network only, that directory’s own <code>genesis.ssz</code>, then abort. The
 URL is therefore <strong>required</strong> on a fresh data directory only for a built-in
-network: this follower imports nothing past its anchor, so anchoring a built-in
-network at genesis would leave it parked at slot 0 while claiming to follow a
-chain that has been live for years. A loaded network’s own genesis
+network: no built-in network carries a genesis state, and anchoring one at genesis
+would leave the follower replaying a chain that has been live for years. A loaded network’s own genesis
 state is a legitimate anchor instead, since a freshly started devnet has no
 checkpoint provider at slot 0 and this is the only way to join one. A
 directory already anchored from a previous run resumes without the flag
 either way, the same way <code>node</code>’s does.</p>
-<p><code>--api-port</code> is bound here too, off <code>beacon</code>’s own anchored store now rather
-than an empty one: one HTTP call site (<code>start_rpc_server</code>) serves both chains.
-The lean-shaped <code>/lean/v0/...</code> routes read metadata keys and state variants a
-beacon directory never carries, though, so calling one of them, e.g. <code>GET /lean/v0/states/finalized</code>, panics that request rather than answering for a
-chain that isn’t running. This is deliberate for now: giving the beacon
-follower its own HTTP surface is a change of its own. Treat <code>/metrics</code> on
-<code>--metrics-port</code> as the only meaningful HTTP surface of a <code>beacon</code> run today.</p>
+<p><code>--api-port</code> is bound here too, off <code>beacon</code>’s own anchored store: one HTTP call
+site serves both chains, but it picks the router by the store’s chain, so a
+<code>beacon</code> run serves the Beacon API under <code>/eth/v1</code> and <code>/eth/v2</code> and answers a
+<code>/lean/v0/...</code> path with a 404. See <a href="#http-api-1"><code>rpc.md</code></a>.</p>
 <h2 id="what-ethlambda-beacon-does-today"><a class="header" href="#what-ethlambda-beacon-does-today">What <code>ethlambda beacon</code> does today</a></h2>
-<p>It follows the resolved network’s gossip and nothing above it. It now anchors a real,
-RocksDB-backed store at a checkpoint-synced (or resumed) finalized state, but
-does nothing more with it: no state transition, no fork choice, and no block
-import past that anchor. The node joins the network, decodes what arrives, and
-logs it. See <a href="#the-mainnet-wire"><code>beacon_wire.md</code></a> for what goes on the wire and
+<p>It follows the resolved network as a non-validating follower. It anchors a
+RocksDB-backed store at a checkpoint-synced (or resumed) finalized state, joins
+the network’s gossip and req/resp, and the chain actor imports blocks from there
+(phase0 through gloas), runs fork choice, and, with <code>--execution-endpoint</code>,
+asks an execution client about payloads. It never proposes or attests. See <a href="#the-mainnet-wire"><code>beacon_wire.md</code></a> for what goes on the wire and
 how to check a run against the live network.</p>
 <h3 id="one-entry-point-two-chains"><a class="header" href="#one-entry-point-two-chains">One entry point, two chains</a></h3>
 <p>Both sub-commands run through <code>run_node</code> in <code>bin/ethlambda/src/main.rs</code>. Each
@@ -3460,18 +3786,18 @@ not chain-specific, branches once, and shares the shutdown:</p>
 <tr><td><strong>the one <code>match</code></strong>: produce a <code>ChainSetup</code></td><td>genesis config, validator keys, checkpoint sync or resume onto the shared backend, subnets</td><td><code>beacon::wire_params</code> (genesis metadata, epoch, fork digest), then checkpoint sync or resume onto the same backend</td></tr>
 <tr><td>build the swarm, spawn P2P, start discv5</td><td>shared; discv5 only with <code>--discovery.enable</code></td><td>shared</td></tr>
 <tr><td>start the HTTP server</td><td>shared</td><td>shared</td></tr>
-<tr><td>spawn the chain actor and wire it to P2P</td><td>yes</td><td>no: it imports nothing</td></tr>
+<tr><td>spawn the chain actor and wire it to P2P</td><td>yes</td><td>yes: <code>BlockChain::spawn_beacon</code></td></tr>
 <tr><td>ctrl-c, stop and join the actors</td><td>shared</td><td>shared</td></tr>
 </tbody>
 </table>
 </div>
 <p><code>ChainSetup</code> is what the <code>match</code> produces: the wire configuration, the ENR
 entries that describe it, the store the req/resp handlers answer from, the
-node-name roster, and an <code>Option</code> holding the validator keys and
-<code>BlockChainConfig</code>. The operator-supplied half of the discv5 configuration (node
+node-name roster, and a <code>ChainActor</code> saying what to spawn: lean’s validator keys
+and <code>BlockChainConfig</code>, or beacon’s marker. The operator-supplied half of the discv5 configuration (node
 key, ports, bootnodes, peer target) is the same on either chain, so it is filled
-in once below the match. That <code>Option</code> being <code>None</code> is what ends the mainnet path:
-<code>run_node</code> returns straight into the shared shutdown after starting the wire.</p>
+in once below the match; everything after it, including the chain actor spawn
+and the shutdown, is shared.</p>
 <p><code>beacon::wire_params</code> reads <code>genesis_time</code> and <code>genesis_validators_root</code> off
 the resolved network (a built-in network’s two constants, or a loaded
 network’s own <code>genesis.ssz</code>, decoded at whatever fork its own schedule names
@@ -3480,10 +3806,7 @@ and fork digest from them, and logs the next boundary that would move the
 digest. It builds nothing: one <code>build_swarm</code> serves both chains, dispatching on
 the <code>WireConfig</code> variant for the topics, the req/resp protocol set, the
 gossipsub <code>seen_ttl</code>, the identify version and the connection limits.</p>
-<p>The chain actor is the one thing mainnet has none of, so <code>RunningNode</code>
-carries it as an <code>Option</code> and the shared shutdown skips it.</p>
-<p>Not implemented here: block import and fork choice past the anchor. A decoded
-block is logged and dropped.</p>
+<p>Both chains run a chain actor, so <code>RunningNode</code> carries a plain <code>BlockChain</code>.</p>
 <h2 id="validator-flags"><a class="header" href="#validator-flags"><code>validator</code> flags</a></h2>
 <p><code>ethlambda validator</code> is not a node. It binds no libp2p port, opens no
 database, runs no discovery and follows no chain: it holds validator keys and
@@ -3516,7 +3839,8 @@ same care as a manual key move. The client repeats this warning at startup.</p>
 </table>
 </div>
 <h3 id="what-it-does-today"><a class="header" href="#what-it-does-today">What it does today</a></h3>
-<p>Attestations, block proposals and attestation aggregation.</p>
+<p>Attestations, block proposals and attestation aggregation, and from gloas on
+the self-built payload envelope and the payload timeliness committee vote.</p>
 <p>Each epoch it resolves its validators’ indices, fetches their attester duties
 for this epoch and the next, fetches this epoch’s proposer duties, subscribes
 to the committee subnets the attester duties need, and registers its fee
@@ -3552,15 +3876,34 @@ refused by name rather than failing to decode.</p>
 computing its <code>hash_tree_root</code>, which only the typed container can give; a
 hand-written JSON mapping of an execution payload would be a large surface on
 which a single wrong field silently produces a signature over the wrong block.</p>
+<p>From gloas on a proposal is two messages. The client asks for the block with
+<code>include_payload=true</code> (<code>produceBlockV4</code>), publishes the block bare, then signs
+the envelope with the proposer’s own key under the builder domain and publishes
+it with its blobs and cell proofs (<code>Eth-Blob-Data-Included: true</code>). Both go out as
+SSZ. The envelope shares the proposal’s budget (the attester offset, below), so
+a proposal that overruns it is abandoned wherever it is. A failure to publish
+the envelope is logged at error and counted, and does not fail the proposal. A
+block that commits to a builder’s bid is left alone.</p>
+<p>Each epoch it also fetches the payload timeliness committee duties for the
+validators it holds, for this epoch and the next when they are gloas ones. A member sleeps until <code>PAYLOAD_ATTESTATION_DUE_BPS</code> of the
+slot, asks the node for the
+payload attestation data, signs it under the PTC domain and submits it. A <code>204</code>
+(the node knows no block for the slot) means no vote. So a gloas slot runs in
+this order: propose at the boundary, attest at <code>ATTESTATION_DUE_BPS_GLOAS</code>,
+aggregate at <code>AGGREGATE_DUE_BPS_GLOAS</code>, then the committee vote. The attestation
+and the committee vote are each bounded by the end of the slot.</p>
 <p>Not implemented: the builder flow and blinded blocks (the client asks for an
 unblinded block and refuses a blinded one), sync-committee duties, voluntary
 exits, doppelganger protection and remote signing.</p>
 <h3 id="duty-offsets-come-from-the-network"><a class="header" href="#duty-offsets-come-from-the-network">Duty offsets come from the network</a></h3>
-<p>The slot length and the two duty offsets are read from the beacon node’s
+<p>The slot length and the duty offsets are read from the beacon node’s
 <code>/eth/v1/config/spec</code>, not divided out of a compiled-in constant. The
 specification states them as <code>SLOT_DURATION_MS</code> plus basis points of it,
 <code>ATTESTATION_DUE_BPS</code> and <code>AGGREGATE_DUE_BPS</code>, which on mainnet’s 12-second slot
-work out at 3999 ms and 8000 ms.</p>
+work out at 3999 ms and 8000 ms. Gloas moves both earlier
+(<code>ATTESTATION_DUE_BPS_GLOAS</code>, <code>AGGREGATE_DUE_BPS_GLOAS</code>) and adds
+<code>PAYLOAD_ATTESTATION_DUE_BPS</code> (and <code>PAYLOAD_DUE_BPS</code>, which the node uses), so
+the clock picks the pair by the fork of each slot’s own epoch.</p>
 <p><code>SECONDS_PER_SLOT</code> no longer exists in the specification and is accepted only as
 a fallback, since deployed nodes still send it. A node sending both is required
 to agree with itself.</p>
@@ -3819,7 +4162,7 @@ curl -X POST http://127.0.0.1:5052/lean/v0/admin/aggregator \
 </blockquote>
 <h2 id="beacon-api-server-5052-on-ethlambda-beacon"><a class="header" href="#beacon-api-server-5052-on-ethlambda-beacon">Beacon API Server (<code>:5052</code>, on <code>ethlambda beacon</code>)</a></h2>
 <p>The subset of the <a href="https://ethereum.github.io/beacon-APIs/">Ethereum Beacon API</a>
-that this follower can answer from its own store. It <strong>replaces</strong> the <code>/lean/v0</code>
+that this node can answer from its own store. It <strong>replaces</strong> the <code>/lean/v0</code>
 surface rather than sitting beside it; a <code>/lean/v0</code> path on a beacon node is a
 <code>404</code>.</p>
 <div class="table-wrapper">
@@ -3830,6 +4173,7 @@ surface rather than sitting beside it; a <code>/lean/v0</code> path on a beacon 
 <tbody>
 <tr><td><code>GET</code></td><td><code>/eth/v2/beacon/blocks/{block_id}</code></td><td>JSON or SSZ</td><td><code>SignedBeaconBlock</code> at <code>block_id</code></td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/beacon/blocks/{block_id}/root</code></td><td>JSON</td><td>That block’s root</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/beacon/execution_payload_envelopes/{block_id}</code></td><td>JSON or SSZ</td><td>Gloas <code>SignedExecutionPayloadEnvelope</code> of that block (see below)</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/beacon/headers/{block_id}</code></td><td>JSON</td><td><code>SignedBeaconBlockHeader</code>, plus <code>canonical</code></td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v2/debug/beacon/states/{state_id}</code></td><td>JSON or SSZ</td><td><code>BeaconState</code> at <code>state_id</code></td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/beacon/states/{state_id}/finality_checkpoints</code></td><td>JSON</td><td>That state’s three checkpoints</td></tr>
@@ -3843,18 +4187,25 @@ surface rather than sitting beside it; a <code>/lean/v0</code> path on a beacon 
 <tr><td><code>GET</code></td><td><code>/eth/v1/node/identity</code></td><td>JSON</td><td>Peer ID and metadata only (see below)</td></tr>
 <tr><td><code>GET</code>, <code>POST</code></td><td><code>/eth/v1/beacon/states/{state_id}/validators</code></td><td>JSON</td><td>Registry entries by index or pubkey, with status</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/beacon/states/{state_id}/validators/{validator_id}</code></td><td>JSON</td><td>One registry entry, by index or pubkey; <code>404</code> if there is none</td></tr>
-<tr><td><code>GET</code></td><td><code>/eth/v1/validator/duties/proposer/{epoch}</code></td><td>JSON</td><td>Proposers for the head’s epoch or the next</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/validator/duties/proposer/{epoch}</code></td><td>JSON</td><td>Proposers for any epoch from the head’s up to one past the wall clock’s</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v2/validator/duties/proposer/{epoch}</code></td><td>JSON</td><td>The same, with v2’s <code>dependent_root</code> (what Lighthouse asks for)</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/validator/duties/attester/{epoch}</code></td><td>JSON</td><td>Committee assignments for the given indices</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/validator/duties/sync/{epoch}</code></td><td>JSON</td><td>Sync committee seats for the given indices, in the head’s current or next period</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/validator/liveness/{epoch}</code></td><td>JSON</td><td>Whether this node saw each validator act in the epoch (doppelganger protection)</td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v1/validator/duties/ptc/{epoch}</code></td><td>JSON</td><td>Payload timeliness committee seats for the given indices (gloas)</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/validator/attestation_data</code></td><td>JSON</td><td>What to attest to at <code>slot</code></td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/validator/payload_attestation_data</code></td><td>JSON or SSZ</td><td>What a committee member signs for <code>slot</code> (gloas)</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v2/beacon/pool/attestations</code></td><td><em>(status only)</em></td><td>Validate and gossip <code>SingleAttestation</code>s</td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v1/beacon/pool/payload_attestations</code></td><td><em>(status only)</em></td><td>Validate, pool and gossip <code>PayloadAttestationMessage</code>s (gloas)</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/beacon/pool/payload_attestations</code></td><td>JSON</td><td>The pool’s votes as aggregated <code>PayloadAttestation</code>s (gloas)</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/validator/beacon_committee_subscriptions</code></td><td><em>(status only)</em></td><td>Aggregators’ entries join their committee’s subnet</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v2/validator/aggregate_attestation</code></td><td>JSON</td><td>The pooled votes for a data root and committee, aggregated</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v2/validator/aggregate_and_proofs</code></td><td><em>(status only)</em></td><td>Validate and gossip <code>SignedAggregateAndProof</code>s</td></tr>
-<tr><td><code>GET</code></td><td><code>/eth/v3/validator/blocks/{slot}</code></td><td>SSZ or JSON</td><td>An unsigned block built on the head (<code>produceBlockV3</code>)</td></tr>
-<tr><td><code>POST</code></td><td><code>/eth/v2/beacon/blocks</code></td><td><em>(status only)</em></td><td>Gossip and import a signed block (<code>publishBlockV2</code>, SSZ)</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v3/validator/blocks/{slot}</code></td><td>SSZ or JSON</td><td>An unsigned fulu block built on the head (<code>produceBlockV3</code>)</td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v4/validator/blocks/{slot}</code></td><td>SSZ or JSON</td><td>An unsigned self-built gloas block, with its envelope and blobs when asked (<code>produceBlockV4</code>)</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/validator/execution_payload_envelopes/{slot}/{beacon_block_root}</code></td><td>SSZ or JSON</td><td>The unsigned envelope <code>produceBlockV4</code> built (gloas)</td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v2/beacon/blocks</code></td><td><em>(status only)</em></td><td>Gossip and import a signed fulu or gloas block (<code>publishBlockV2</code>, SSZ)</td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v1/beacon/execution_payload_envelopes</code></td><td><em>(status only)</em></td><td>Gossip a signed envelope and its data columns (gloas, SSZ)</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/validator/prepare_beacon_proposer</code></td><td><em>(status only)</em></td><td>Acknowledged, not acted on (see below)</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/events</code></td><td>SSE</td><td>Live stream of chain events (see below)</td></tr>
 </tbody>
@@ -3865,15 +4216,28 @@ surface rather than sitting beside it; a <code>/lean/v0</code> path on a beacon 
 answer is computed from the fork-choice head’s post-state, read off the store
 the chain actor writes, so no request waits on the actor.</p>
 <ul>
-<li><strong>Duties</strong> answer for a window around the head, not any epoch. Proposer
-duties read fulu’s <code>proposer_lookahead</code>, which covers the head’s epoch and the
-next; attester duties cover the head’s previous, current and next epoch,
-which is as far as its shuffling is already fixed. Anything else is a <code>400</code>.
-<code>dependent_root</code> follows each endpoint’s v1 definition, except proposer
-duties v2, whose root is the block before the <em>previous</em> epoch (fulu fixes
-proposers an epoch ahead), or genesis where that would underflow; v2 is a
-<code>503</code> while syncing. Attester duties walk
-every committee of the epoch, a full shuffle per request on mainnet.</li>
+<li><strong>Duties</strong> are bounded by the wall clock, as the Beacon API defines it: any
+epoch up to one past the current one is served (or one past the head’s, if
+the head is ahead of a lagging clock), so a validator client’s next-epoch
+lookahead at an epoch boundary, while the head is still in the previous
+epoch, is answered. Proposer duties (v1 and v2) read fulu’s
+<code>proposer_lookahead</code>, which covers the head’s epoch and the next; attester
+duties read the head state as it is for its previous, current and next epoch.
+A later epoch is computed from a copy of the head advanced with
+<code>process_slots</code> to the first epoch that can derive it, taken from fork
+choice’s <code>checkpoint_state</code> cache and run on a blocking thread. An epoch
+before the head’s (attester: more than one before) or past the bound is a
+<code>400</code>.
+<code>dependent_root</code> follows each endpoint’s own definition: the last block
+before the epoch for v1 proposer duties, and the last block before the
+previous epoch for v2 proposer duties and attester duties. v2’s is the block
+fulu’s lookahead depends on, so it changes only on reorgs that can change the
+duties. Proposer duties v2 is a <code>503</code> while syncing. Attester duties walk
+every committee of the epoch, a full shuffle per request on mainnet. Gloas
+epochs are served like fulu ones: gloas keeps fulu’s <code>proposer_lookahead</code> and
+<code>upgrade_to_gloas</code> carries it over, so a fulu head already answers proposer
+duties (v1 and v2) for the first gloas epoch, and a gloas head answers from
+its own lookahead.</li>
 <li><strong>Sync duties</strong> read the head state’s <code>current_sync_committee</code> for an epoch in
 the head’s own sync committee period and <code>next_sync_committee</code> for the one
 after; any other period is a <code>400</code> (an earlier one would need a historical
@@ -3898,7 +4262,15 @@ index, is a <code>400</code>, and the endpoint is a <code>503</code> while the n
 epoch’s boundary block as target, and as source the current justified
 checkpoint of the head state advanced to the slot’s epoch (through fork
 choice’s cached <code>checkpoint_state</code>, and only when the head is in an earlier
-epoch). A slot before the head, or past the wall clock, is a <code>400</code>.</li>
+epoch). A slot before the head, or past the wall clock, is a <code>400</code>.
+<code>committee_index</code> is optional and ignored: from electra on every committee of
+a slot attests to the same data. <code>data.index</code> is <code>0</code> before gloas. At a gloas
+slot it is the payload-present flag: <code>0</code> when the head block is from the
+requested slot itself (its payload cannot be revealed yet), otherwise <code>1</code>
+exactly when fork choice holds the head block’s payload as FULL
+(<code>Store::head_payload_status</code>, or one fresh <code>get_head_node</code> walk when none is
+recorded for this head). A pre-gloas head counts as FULL (see
+<a href="#a-pre-gloas-head-counts-as-full-in-attestation_dataindex">Spec Deviations</a>).</li>
 <li><strong><code>pool/attestations</code></strong> checks each attestation against the electra
 <code>beacon_attestation_{subnet_id}</code> gossip conditions it can evaluate (clock
 window, <code>data.index == 0</code>, target epoch, the voted block known and the target
@@ -3907,7 +4279,15 @@ its subnet through fanout, without subscribing. A rejected attestation comes
 back in an <code>IndexedErrorMessage</code> with its position; the valid ones in the
 same batch are still published. There is no seen-attestation cache. Each
 accepted attestation also goes into the node’s <strong>attestation pool</strong>, since
-gossip never delivers a node its own messages.</li>
+gossip never delivers a node its own messages. <code>Eth-Consensus-Version</code> must
+name electra, fulu or gloas here and on <code>aggregate_and_proofs</code>, and must match
+the fork of each item’s slot: a <code>gloas</code> header on a pre-gloas slot, or an older
+one on a gloas slot, fails that item (not the batch) with
+<code>Eth-Consensus-Version does not match the attestation slot's fork</code>. At a
+gloas slot <code>data.index</code> may be <code>0</code> or <code>1</code>, checked with gloas’s payload-status
+gossip rule (a vote in the voted block’s own slot must be <code>0</code>; <code>1</code> needs the
+node to have verified the payload, otherwise the item fails). A gloas
+<code>SingleAttestation</code> is electra’s own container.</li>
 <li><strong><code>beacon_committee_subscriptions</code></strong>: each aggregator’s entry makes the node
 join its committee’s attestation subnet until the end of that slot, so the
 committee’s votes from other validators reach the pool too: every
@@ -3916,19 +4296,23 @@ checks first, and the ones accepted on a joined subnet are pooled. Joined
 subnets are left once their slot has passed, and never appear in <code>attnets</code>.</li>
 <li><strong><code>aggregate_attestation</code></strong> answers from the pool: every vote held for the
 data root and committee, as electra’s <code>Attestation</code> with the BLS aggregate of
-their signatures. <code>404</code> when nothing is held.</li>
+their signatures; at a gloas slot the answer is <code>{version: "gloas", data}</code>
+with gloas’s <code>Attestation</code> (the same JSON shape). JSON only. <code>404</code> when
+nothing is held.</li>
 <li><strong><code>aggregate_and_proofs</code></strong> checks each aggregate with the same
 <code>beacon_aggregate_and_proof</code> gossip conditions this node applies to its
 peers’ aggregates (<code>gossip::aggregate</code>), signatures included, against a
 fresh seen-cache (a node never receives its own messages, so P2P’s says
 nothing about them). What passes is gossiped on the topic, goes into the
 pool, and is handed to the chain actor, which applies it to fork choice and
-announces it on <code>/eth/v1/events</code>’s <code>attestation</code>.</li>
+announces it on <code>/eth/v1/events</code>’s <code>attestation</code>. The <code>Eth-Consensus-Version</code>
+header picks the decoder: <code>gloas</code> takes gloas’s <code>SignedAggregateAndProof</code>,
+the others electra’s.</li>
 <li><strong>The attestation pool</strong> holds, the best-covered per data root and
 committee: votes from <code>pool/attestations</code> and the aggregator subnets,
 aggregates from <code>aggregate_and_proofs</code>, and every electra gossip aggregate
-P2P accepts, once all three of its signatures have verified. Gossip
-aggregates are pooled on arrival, so a slot’s aggregates are there when the
+P2P accepts (gloas aggregates included, in gloas’s container), once all three
+of its signatures have verified. Gossip aggregates are pooled on arrival, so a slot’s aggregates are there when the
 next slot’s block is asked for. Entries more than an epoch old are dropped
 once a slot.</li>
 <li><strong><code>prepare_beacon_proposer</code></strong> records each validator’s fee recipient, in
@@ -3946,16 +4330,134 @@ slashings, exits or credential changes. The state root comes from running
 the block through <code>process_block</code>. The answer is fulu <code>BlockContents</code>, with
 <code>Eth-Execution-Payload-Blinded: false</code>; there is no builder flow. It is a
 <strong><code>503</code></strong> without a configured execution client, or when the payload carries
-blobs.</li>
-<li><strong><code>POST beacon/blocks</code></strong> takes SSZ <code>SignedBlockContents</code>, checks the block
-is after the head and its proposer signature, then gossips it on
-<code>beacon_block</code> and hands it to the chain actor to import.</li>
+blobs. A slot the schedule does not place at fulu (gloas included) is a
+<code>400</code>, checked before the execution client; <code>produceBlockV3</code> is the fulu
+endpoint, and a gloas slot goes to <code>produceBlockV4</code>.</li>
+<li><strong><code>POST beacon/blocks</code></strong> takes SSZ and the <code>Eth-Consensus-Version</code> header
+(<code>fulu</code> or <code>gloas</code>, else <code>400</code>; a non-SSZ content type is a <code>415</code>). Fulu: a
+<code>SignedBlockContents</code>; the node checks the block is after the head and its
+proposer signature, then gossips it on <code>beacon_block</code> and hands it to the
+chain actor to import. A slot the schedule does not place at fulu is a <code>400</code>,
+checked before the head state is advanced. Gloas: a bare
+<code>gloas::SignedBeaconBlock</code> (a gloas block carries no payload or blobs; they
+follow in the envelope). The slot must be scheduled at gloas, the parent must
+be held, the slot must be after the parent’s, and the proposer and signature
+are checked against the parent’s state advanced to the slot (all <code>400</code>
+otherwise), before the block is gossiped and handed to the chain actor.</li>
 </ul>
-<p><strong>Blobs are not supported yet.</strong> Publishing a blob-carrying block means
-computing and gossiping its data column sidecars, which this node does not do,
-and peers will not import a block they cannot sample. Such payloads are refused
-at production (<code>503</code>, which a validator client fails over on) and such blocks
-at publication (<code>400</code>).</p>
+<p><strong>Fulu blobs are not supported.</strong> Publishing a blob-carrying fulu block means
+computing and gossiping its data column sidecars, which this node does not do
+for fulu, and peers will not import a block they cannot sample. Such payloads
+are refused at production (<code>503</code>, which a validator client fails over on) and
+such blocks at publication (<code>400</code>). Gloas blobs are supported: the envelope
+publication below builds and gossips the columns.</p>
+<h3 id="gloas-block-production"><a class="header" href="#gloas-block-production">Gloas block production</a></h3>
+<p>A gloas proposer signs two things on their own, the block and the envelope that
+reveals its payload, and this node serves both halves. It only builds for
+itself: no builder bid is taken from gossip or a builder API, and no
+<code>SignedProposerPreferences</code> is read (see
+<a href="#self-build-only">Spec Deviations</a>).</p>
+<p><strong><code>POST /eth/v4/validator/blocks/{slot}</code></strong> (<code>produceBlockV4</code>):</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th></th><th></th></tr>
+</thead>
+<tbody>
+<tr><td>Query</td><td><code>randao_reveal</code> (required), <code>include_payload</code> (required, <code>true</code> or <code>false</code>), <code>graffiti</code> (optional, 32-byte hex), <code>skip_randao_verification</code> (accepted, ignored)</td></tr>
+<tr><td>Request headers</td><td><code>Eth-Consensus-Version</code> is optional but must be <code>gloas</code> when present. <code>Accept: application/octet-stream</code> for SSZ, JSON otherwise</td></tr>
+<tr><td>Body</td><td>A <code>BuilderConfig</code> (<code>min_bid</code>, <code>builder_boost_factor</code>, <code>builders</code>), JSON, or SSZ with <code>Content-Type: application/octet-stream</code>. It is decoded and otherwise ignored; a missing or undecodable one is a <code>400</code></td></tr>
+<tr><td><code>200</code> SSZ</td><td>With <code>include_payload=true</code>, <code>BlockContents</code> (<code>block</code>, <code>execution_payload_envelope</code>, <code>kzg_proofs</code>, <code>blobs</code>); with <code>false</code>, the bare <code>gloas::BeaconBlock</code></td></tr>
+<tr><td><code>200</code> JSON</td><td><code>{version: "gloas", consensus_block_value, execution_payload_value, execution_payload_included, data}</code>, where <code>data</code> is the same container as the SSZ body</td></tr>
+<tr><td>Response headers</td><td><code>Eth-Consensus-Version: gloas</code>, <code>Eth-Execution-Payload-Included</code> (<code>true</code> or <code>false</code>), <code>Eth-Execution-Payload-Value</code> (wei, decimal), <code>Eth-Consensus-Block-Value</code> (always <code>0</code>: no builder comparison happens on this node)</td></tr>
+<tr><td><code>400</code></td><td>A slot the schedule does not place at gloas, a missing or malformed query, a wrong <code>Eth-Consensus-Version</code>, a bad body, a slot not after the head block, or a <code>randao_reveal</code> that does not verify against the slot’s proposer. The slot check precedes the execution-client check, so it is a <code>400</code> on any node</td></tr>
+<tr><td><code>503</code></td><td>No execution client configured, the execution client did not start or return a build, or the node is building on a FULL parent whose envelope it does not hold</td></tr>
+</tbody>
+</table>
+</div>
+<p>The node advances the head state to the slot, and decides which parent payload
+to build on with <code>should_build_on_full</code> over the payload status fork choice
+recorded for the head. It then asks its execution client to build
+(<code>forkchoiceUpdatedV4</code> with <code>PayloadAttributesV4</code>, then <code>getPayloadV6</code>) with the
+proposer’s <code>prepare_beacon_proposer</code> fee recipient. The body packs the
+attestation pool’s best aggregates and the payload attestation pool’s votes for
+the parent block (an aggregate that does not verify against the advanced state
+is dropped, since one bad operation fails the block), and the state root comes
+from running the block through <code>process_block</code>. The bid is a zero-value
+self-build bid read off the built payload. What was built is cached by <code>(slot, block root)</code>, for the current and previous slot only.</p>
+<p><strong><code>GET /eth/v1/validator/execution_payload_envelopes/{slot}/{beacon_block_root}</code></strong>
+serves the cached unsigned envelope, for a client that asked for the block with
+<code>include_payload=false</code>: <code>{version: "gloas", data}</code> as JSON, or the SSZ
+<code>ExecutionPayloadEnvelope</code> on <code>Accept: application/octet-stream</code>, with
+<code>Eth-Consensus-Version: gloas</code>. <code>404</code> when nothing is cached for the pair
+(unknown, or older than the previous slot); <code>400</code> for an unparseable slot or
+root.</p>
+<p><strong><code>POST /eth/v1/beacon/execution_payload_envelopes</code></strong> takes the signed envelope,
+SSZ only (<code>415</code> otherwise), with <code>Eth-Consensus-Version: gloas</code> and
+<code>Eth-Blob-Data-Included</code> (both required, else <code>400</code>):</p>
+<ul>
+<li><code>true</code>: the body is <code>SignedExecutionPayloadEnvelopeContents</code> (the signed
+envelope, <code>kzg_proofs</code>, <code>blobs</code>).</li>
+<li><code>false</code>: the body is the bare signed envelope, and the blobs and proofs come
+from the production cache. <code>400</code> when none is cached and the block’s bid
+commits to blobs.</li>
+</ul>
+<p>The envelope’s block is waited for, polling every 50 ms for up to 4 seconds,
+since a validator client publishes the envelope right after the block returns,
+which is before the chain actor has imported it; a block still unknown after
+that is a <code>400</code> (<code>unknown block</code>). The envelope must fulfill the block’s bid
+(builder index and block hash), the blobs must match the bid’s commitments, the
+signature must verify under <code>DOMAIN_BEACON_BUILDER</code> against the block’s
+post-state, and every data column built from the blobs must verify against the
+commitments and cell proofs; any failure is a <code>400</code>. A success is <code>200</code> once the
+envelope and all <code>NUMBER_OF_COLUMNS</code> gloas data column sidecars are handed to
+P2P, which gossips them together. A node that does not subscribe to a column’s
+subnet publishes through gossipsub fanout.</p>
+<h3 id="payload-timeliness-committee"><a class="header" href="#payload-timeliness-committee">Payload timeliness committee</a></h3>
+<ul>
+<li><strong><code>POST /eth/v1/validator/duties/ptc/{epoch}</code></strong> takes a JSON array of quoted
+validator indices (an empty array or a bad index is a <code>400</code>) and answers
+<code>{dependent_root, execution_optimistic, data: [{pubkey, validator_index, slot}]}</code>: one duty per validator, the first slot of the epoch whose committee
+seats it. An index with no seat, or unknown, gets none. The epoch may be at
+most one past the later of the head state’s and the wall clock’s epoch (else
+<code>400</code>). An epoch before the gloas fork answers <code>200</code> with an empty <code>data</code>, so
+a client can ask every epoch. A gloas head state answers from its
+<code>ptc_window</code>; an epoch the head has not caught up to, or the first gloas epoch
+under a fulu head, is answered from a copy of the head state advanced to the
+epoch’s first slot, crossing the gloas upgrade where it falls, on a blocking
+thread. A gloas epoch more than one before the head state’s is a <code>400</code>.
+<code>dependent_root</code> is defined as for attester duties. There is no <code>503</code>.</li>
+<li><strong><code>GET /eth/v1/validator/payload_attestation_data?slot=</code></strong> answers
+<code>{version: "gloas", data: {beacon_block_root, slot, payload_present, blob_data_available}}</code> as JSON, or the SSZ <code>PayloadAttestationData</code> on
+<code>Accept: application/octet-stream</code>, with <code>Eth-Consensus-Version: gloas</code>. The
+data is for the block of that very slot on the head’s chain; a slot with no
+such block (or whose block is not a gloas block) answers <code>204</code> with no body,
+which a client reads as “cast no vote”. A slot before the gloas fork is a
+<code>400</code>, and a node that is syncing answers <code>503</code>. <code>payload_present</code> is whether
+the block’s envelope reached this node before the slot’s start plus
+<code>PAYLOAD_DUE_BPS</code> of it, judged by arrival time (see
+<a href="#payload_present-is-judged-by-the-envelopes-arrival-time">Spec Deviations</a>).
+<code>blob_data_available</code> is true when the bid commits to no blobs, the payload is
+verified, or every column this node custodies for the block is stored.</li>
+<li><strong><code>POST /eth/v1/beacon/pool/payload_attestations</code></strong> takes a JSON array of
+<code>PayloadAttestationMessage</code>s; <code>Eth-Consensus-Version</code> is optional and must be
+<code>gloas</code> when present. Each message passes the checks gossip applies to a
+peer’s (the current slot, a known block at the slot, committee membership,
+signature) against a fresh seen-cache. A valid one is pooled and gossiped; one
+already pooled is neither pooled nor gossiped again and still counts as
+accepted. A rejected one comes back in an <code>IndexedErrorMessage</code> (<code>400</code>) as
+<code>{outcome}: {reason}</code> with its position, and the rest still go out; a
+head-state cache miss is a per-item <code>ignore: state_unavailable</code>.</li>
+<li><strong><code>GET /eth/v1/beacon/pool/payload_attestations?slot=</code></strong> answers <code>{version: "gloas", data}</code> with the pool’s votes as the specification’s
+<code>PayloadAttestation</code>s, those of <code>slot</code> only when given: one aggregate per slot
+and <code>PayloadAttestationData</code>, a bit per seat of that slot’s committee
+(<code>get_ptc</code> on the head state) and the seats’ signatures aggregated, the way
+block production packs them. The pool itself keeps the individual messages.
+JSON only; a vote whose slot falls outside the head state’s committee window
+is left out.</li>
+</ul>
+<p>The payload attestation pool is shared with P2P, which fills it from accepted
+gossip, so a block this node builds carries the votes its peers sent too.</p>
 <p><code>tooling/kurtosis-validator/network_params_ethlambda_beacon.yaml</code> points the
 validator client at this node alone, so every block on that devnet is one this
 node built.</p>
@@ -3972,17 +4474,66 @@ surface’s: every integer is a quoted decimal string, byte strings are
 <p>Serving <code>/eth/v2/debug/beacon/states/finalized</code> as SSZ is what makes this client
 checkpoint-syncable from itself: it is the exact path
 <a href="#checkpoint-sync"><code>checkpoint_sync.rs</code></a> fetches from other clients.</p>
+<h3 id="get-ethv1beaconexecution_payload_envelopesblock_id"><a class="header" href="#get-ethv1beaconexecution_payload_envelopesblock_id"><code>GET /eth/v1/beacon/execution_payload_envelopes/{block_id}</code></a></h3>
+<p>Gloas moves a block’s execution payload into a separate signed envelope. This
+serves the one the node has verified, as <code>{version: "gloas", execution_optimistic, finalized, data}</code> JSON or as SSZ on <code>Accept: application/octet-stream</code>, with
+<code>Eth-Consensus-Version: gloas</code> either way. It is also what a checkpoint-syncing
+node asks for the payload of its anchor (see
+<a href="#checkpoint-sync"><code>checkpoint_sync.md</code></a>).</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Status</th><th>When</th></tr>
+</thead>
+<tbody>
+<tr><td><code>400</code></td><td><code>block_id</code> is malformed</td></tr>
+<tr><td><code>404</code></td><td>the block is unknown, or the node holds no envelope for it</td></tr>
+</tbody>
+</table>
+</div>
+<p>The second <code>404</code> is deliberately one status for several situations: the store
+keeps verified envelopes only, so a withheld payload, a payload not yet
+received and a pre-gloas block (which has no envelope; the specification’s
+error list names no other status for it) are indistinguishable here. A caller
+must read <code>404</code> as “unknown to this node”, not as “the payload is empty”.</p>
+<h3 id="execution_optimistic-under-gloas"><a class="header" href="#execution_optimistic-under-gloas"><code>execution_optimistic</code> under gloas</a></h3>
+<p>Before gloas a block’s payload ran inside the block, so the flag is whether the
+block is in the store’s optimistic set. From gloas on the payload is a separate
+object that may arrive late or never, and two rules share the flag:</p>
+<ul>
+<li>an <strong>envelope</strong> response is optimistic iff that payload’s verdict is not
+<code>VALID</code> (an unrecorded verdict reads as <code>NOT_VALIDATED</code>);</li>
+<li>a <strong>block, header, state or finality-checkpoints</strong> response for a gloas block
+is optimistic iff the latest FULL payload the block builds on is not <code>VALID</code>.
+The walk starts at the block’s parent: if the block’s bid names the parent’s
+payload as its parent block hash it reads the parent’s verdict, and otherwise
+it steps back to the parent and repeats. A pre-gloas block on the way reads
+the optimistic set. The block’s own payload does not count, so a withheld
+payload does not make the chain look unverified.</li>
+</ul>
+<p>Pre-gloas responses are unchanged. One helper implements both rules
+(<code>shared/optimistic.rs</code>) and every response that carries the flag goes through
+it.</p>
 <h3 id="get-ethv1configspec"><a class="header" href="#get-ethv1configspec"><code>GET /eth/v1/config/spec</code></a></h3>
 <p>One flat object holding the network’s configuration, the compiled preset, and
 the specification’s constants, as the Beacon API asks. Validator clients depend
 on it: lighthouse’s refuses a beacon node whose <code>PRESET_BASE</code> does not match
 its own, and treats an absent key as a mismatch.</p>
-<p>The key set is lighthouse’s, less gloas-only keys (this build cannot process
-gloas) and three keys the specification does not define
-(<code>GAS_LIMIT_ADJUSTMENT_FACTOR</code>, <code>RESP_TIMEOUT</code>, <code>TTFB_TIMEOUT</code>). Domain types
-and withdrawal prefixes are <code>0x</code>-prefixed hex; <code>VERSIONED_HASH_VERSION_KZG</code> is
-a decimal, as lighthouse reports it. <code>GENESIS_TIME</code> is absent:
-<code>/eth/v1/beacon/genesis</code> reports it.</p>
+<p>The key set is lighthouse’s plus gloas’s preset and constant keys, read from
+<code>beacon::preset</code> and <code>beacon::constants</code> rather than typed here: <code>PTC_SIZE</code>,
+<code>MAX_PAYLOAD_ATTESTATIONS</code>, <code>MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD</code>,
+<code>MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD</code>, <code>MAX_BUILDERS_PER_WITHDRAWALS_SWEEP</code>,
+the four gloas domains (<code>DOMAIN_BEACON_BUILDER</code>, <code>DOMAIN_PTC_ATTESTER</code>,
+<code>DOMAIN_PROPOSER_PREFERENCES</code>, <code>DOMAIN_BUILDER_DEPOSIT</code>), the builder
+withdrawal prefix and request types, and the <code>BUILDER_INDEX_*</code>,
+<code>BUILDER_PAYMENT_THRESHOLD_*</code> and <code>PAYLOAD_BUILDER_VERSION</code> constants. Gloas’s
+schedule, timing and churn keys are <code>Config</code> fields, so they were already
+reported. Three keys are left out because the specification does not define
+them (<code>GAS_LIMIT_ADJUSTMENT_FACTOR</code>, <code>RESP_TIMEOUT</code>, <code>TTFB_TIMEOUT</code>), and so are
+gloas’s <code>MAX_*_SIZE</code> preset keys, which bound gossip message sizes the node does
+not run on. Domain types and withdrawal prefixes are <code>0x</code>-prefixed hex;
+<code>VERSIONED_HASH_VERSION_KZG</code> is a decimal, as lighthouse reports it.
+<code>GENESIS_TIME</code> is absent: <code>/eth/v1/beacon/genesis</code> reports it.</p>
 <p>The configuration keys come from the <code>Config</code> the data directory was
 initialized with. Some of them (the custody and subnet counts, the
 <code>MAX_REQUEST_*</code> limits, <code>MAX_PAYLOAD_SIZE</code>, the snappy message domains,
@@ -4550,24 +5101,37 @@ own section. These are ethlambda-specific, not part of the leanMetrics spec.</p>
 </div>
 <p><code>kind</code> is the topic kind, with every <code>data_column_sidecar_{subnet}</code> sharing the
 label <code>data_column_sidecar</code> and every <code>beacon_attestation_{subnet_id}</code> sharing
-<code>beacon_attestation</code>. <code>queue</code> means IGNORE to gossipsub while the chain actor
-still receives the object and parks it; neither the aggregate nor the
-attestation topic ever answers <code>queue</code>, since the vote block’s post-state is
-either cached or it is not (<code>IgnoreReason::UnknownBlock</code>/<code>StateUnavailable</code>),
-with nothing to hold the message for. <strong><code>verdict_expired_total</code> should stay at
+<code>beacon_attestation</code>. The gloas topics <code>execution_payload</code> and
+<code>payload_attestation_message</code> are labelled by their own name. <code>queue</code> means
+IGNORE to gossipsub while the chain actor still receives the object and parks
+it; of the gloas topics only <code>execution_payload</code> answers it, for an envelope
+whose block is not known yet (<code>block_unknown</code>), has no post-state yet
+(<code>block_not_ready</code>), or has one that is not in the cache the checks read
+(<code>state_not_cached</code>, as when the block was imported moments ago; the actor
+verifies the signature itself, so the envelope is forwarded rather than dropped). The aggregate, attestation and
+<code>payload_attestation_message</code> topics never answer <code>queue</code>, since the vote
+block’s post-state is either cached or it is not
+(<code>IgnoreReason::UnknownBlock</code>/<code>StateUnavailable</code>), with nothing to hold the
+message for. <strong><code>verdict_expired_total</code> should stay at
 zero</strong>: a rising count means validation is too slow for gossipsub’s message
 cache.</p>
 <p>The two topics add reasons the others do not, all <code>reason</code> label values on
 <code>lean_beacon_gossip_validation_total</code>: <code>outside_epoch_window</code>, <code>covered_bits</code>
 (aggregate only), <code>unknown_block</code>, <code>state_unavailable</code>,
-<code>finalized_not_ancestor</code>, <code>ancestry_unknown</code> on the ignore side;
+<code>finalized_not_ancestor</code>, <code>ancestry_unknown</code>, <code>payload_envelope_unseen</code> and
+<code>payload_optimistic</code> (gloas only) on the ignore side;
 <code>epoch_mismatch</code>, <code>no_participants</code> (aggregate only), <code>non_zero_data_index</code>,
 <code>committee_bits</code> (aggregate only), <code>committee_index</code>, <code>bits_length</code> (aggregate
 only), <code>not_aggregator</code> (aggregate only), <code>not_in_committee</code>,
 <code>unknown_validator</code>, <code>selection_proof</code> (aggregate only),
 <code>aggregator_signature</code> (aggregate only), <code>aggregate_signature</code> (aggregate
-only), <code>target_not_ancestor</code>, <code>wrong_subnet</code> (attestation only) on the reject
-side. <code>already_seen</code> and <code>overloaded</code> are shared with every other topic.</p>
+only), <code>target_not_ancestor</code>, <code>wrong_subnet</code> (attestation only), and gloas’s
+<code>data_index_out_of_range</code>, <code>same_slot_payload_flag</code> and <code>payload_invalid</code> on the
+reject side. <code>already_seen</code>, <code>overloaded</code> and <code>unsupported_fork</code> are shared with the
+other topics: <code>unsupported_fork</code> is an ignore reason for a message of a fork this
+build has no gossip rules for, so an honest peer past the fork epoch is not
+scored as a bad decoder. Gloas blocks, data columns, aggregates and attestations
+are validated, so they carry their own verdict reasons instead.</p>
 <p>Two permit pools bound the blocking-thread half of validation:
 <code>gossip_validation_permits</code> for blocks and columns,
 <code>attestation_validation_permits</code> for aggregates and subnet attestations. They
@@ -4652,6 +5216,9 @@ spec.</p>
 <tr><td><code>lean_data_column_fetch_failures_total</code></td><td>Counter</td><td><code>DataColumnsByRoot</code> lookups this node gave up on, by reason</td><td>On lookup abandonment</td><td>reason=no_peers,max_retries</td><td></td></tr>
 <tr><td><code>lean_blocks_held_for_columns</code></td><td>Gauge</td><td>Blocks held out of fork choice pending their custody columns</td><td>On every hold, release, and finality eviction of the held-block set</td><td></td><td></td></tr>
 <tr><td><code>lean_sidecars_awaiting_parent</code></td><td>Gauge</td><td>Sidecars parked until their block’s parent has a post-state</td><td>On every park, replay, and finality eviction of the parked set</td><td></td><td></td></tr>
+<tr><td><code>lean_envelopes_awaiting_block</code></td><td>Gauge</td><td>Gloas execution payload envelopes held until their block is imported</td><td>On every hold, release, and finality eviction of the held envelopes</td><td></td><td></td></tr>
+<tr><td><code>lean_envelopes_awaiting_columns</code></td><td>Gauge</td><td>Gloas execution payload envelopes held until every sampled column is stored</td><td>On every hold, release, and finality eviction of the held envelopes</td><td></td><td></td></tr>
+<tr><td><code>lean_blocks_awaiting_parent_payload</code></td><td>Gauge</td><td>Gloas blocks held until their FULL parent’s payload envelope is verified</td><td>On every hold, release, and finality eviction of the held blocks</td><td></td><td></td></tr>
 </tbody>
 </table>
 </div>
@@ -4786,6 +5353,10 @@ and absent is not the same as zero.</p>
 <tr><td><code>ethlambda_validator_blocks_broadcast_not_imported_total</code></td><td>Counter</td><td>Blocks a node broadcast but could not import into its own database, which is what a 202 means. A subset of <code>blocks_proposed_total</code>, not a failure: the block reached the network. Points at that node’s execution layer</td></tr>
 <tr><td><code>ethlambda_validator_blocks_refused_total</code></td><td>Counter</td><td>Blocks deliberately not signed, because this process had already proposed that slot for that validator. Should normally read zero</td></tr>
 <tr><td><code>ethlambda_validator_block_proposal_failures_total</code></td><td>Counter</td><td>Proposal duties that did not end in a published block, including ones abandoned for overrunning</td></tr>
+<tr><td><code>ethlambda_validator_envelopes_published_total</code></td><td>Counter</td><td>Execution payload envelopes a beacon node accepted for blocks this client proposed (gloas)</td></tr>
+<tr><td><code>ethlambda_validator_envelope_failures_total</code></td><td>Counter</td><td>Proposed gloas blocks whose self-built envelope was not published. The block is out and the proposal counts as made, but the slot’s payload is withheld, so this is the failure that costs the payload. Should read zero</td></tr>
+<tr><td><code>ethlambda_validator_payload_attestations_published_total</code></td><td>Counter</td><td>Payload timeliness committee votes a beacon node accepted (gloas)</td></tr>
+<tr><td><code>ethlambda_validator_payload_attestation_failures_total</code></td><td>Counter</td><td>Slots whose payload timeliness committee duty did not result in published votes</td></tr>
 <tr><td><code>ethlambda_validator_aggregates_published_total</code></td><td>Counter</td><td>Aggregates accepted by a beacon node. Bursty rather than steady: a validator is selected a few times a day, so hours at zero are normal for a small deployment</td></tr>
 <tr><td><code>ethlambda_validator_aggregation_failures_total</code></td><td>Counter</td><td>Aggregation duties that ended in no published aggregate, including ones abandoned for overrunning the slot</td></tr>
 <tr><td><code>ethlambda_validator_fee_recipient_mismatches_total</code></td><td>Counter</td><td>Blocks paying execution rewards to an address this client did not request. Should read zero forever; a non-zero value means every proposal is paying somewhere else</td></tr>
@@ -4811,11 +5382,19 @@ a failure. <code>blocks_proposed_total</code> counts blocks a node accepted;
 <code>blocks_broadcast_not_imported_total</code> counts blocks that did reach the network
 but that the node answering could not import, which is a beacon-node fault
 rather than a validator one and is why it is not folded into either.</p>
+<p>Gloas adds two pairs. A gloas proposal ends in a block and then an envelope,
+and the envelope’s failure does not fail the proposal: <code>blocks_proposed_total</code>
+counts the block, and <code>envelope_failures_total</code> the reveal that did not follow.
+The committee vote has the same split as the attestation’s: <code>payload_attestations_published_total</code>
+counts votes accepted and <code>payload_attestation_failures_total</code> the slots whose
+duty produced none. A slot where the node knows no block for the committee to
+vote on is neither, since there was nothing to sign.</p>
 <p>Two series should read zero for the life of a healthy deployment, and are the
 ones worth alerting on at any non-zero value rather than on a rate:
 <code>attestations_refused_total</code> and <code>blocks_refused_total</code> mean this client’s own
 guards caught a duty they judged unsafe, and <code>fee_recipient_mismatches_total</code>
-means blocks are being proposed that pay someone else.</p>
+means blocks are being proposed that pay someone else. <code>envelope_failures_total</code>
+belongs with them on a gloas network.</p>
 <h2 id="troubleshooting"><a class="header" href="#troubleshooting">Troubleshooting</a></h2>
 <h3 id="docker-desktop-on-macos"><a class="header" href="#docker-desktop-on-macos">Docker Desktop on MacOS</a></h3>
 <p>lean-quickstart uses the host network mode for Docker containers, which is a problem on MacOS.
@@ -4842,10 +5421,10 @@ To work around this, enable the <a href="https://docs.docker.com/enterprise/secu
 <p>Where <code>&lt;URL&gt;</code> is the address of a checkpoint source (see <a href="#checkpoint-sources">Checkpoint Sources</a> below).</p>
 <p>State already on disk takes precedence over both checkpoint sync and genesis: if the data directory holds a previous run’s chain state for this network, the node resumes from it. <code>--checkpoint-sync-url</code> is the fallback for when there is nothing resumable on disk, or when what is there has fallen too far behind (see <a href="#restarts-and-existing-state">Restarts and Existing State</a>). With no resumable state and no URL, the node initializes from genesis.</p>
 <h3 id="ethlambda-beacon"><a class="header" href="#ethlambda-beacon"><code>ethlambda beacon</code></a></h3>
-<p><code>beacon</code> takes no genesis config, validator registry, or bootnode file of its own: it takes <code>--network</code> instead, naming a built-in network or a directory of published network files (see <a href="#command-line"><code>cli.md</code></a>). <code>genesis_time</code>, <code>genesis_validators_root</code>, and the bootnode list all come from whichever network <code>--network</code> resolves to; for the built-in networks (<code>mainnet</code>, the default, plus <code>sepolia</code> and <code>hoodi</code>), they are built into the binary (see <code>CLAUDE.md</code>’s “Built-in networks”).</p>
+<p><code>beacon</code> takes no genesis config, validator registry, or bootnode file of its own: it takes <code>--network</code> instead, naming a built-in network or a directory of published network files (see <a href="#command-line"><code>cli.md</code></a>). <code>genesis_time</code>, <code>genesis_validators_root</code>, and the bootnode list all come from whichever network <code>--network</code> resolves to; for the built-in networks (<code>mainnet</code>, the default, plus <code>sepolia</code>, <code>hoodi</code> and <code>plataberget</code>), they are built into the binary (see <code>CLAUDE.md</code>’s “Built-in networks”).</p>
 <pre><code class="language-bash">ethlambda beacon --network &lt;network&gt; --checkpoint-sync-url &lt;URL&gt;
 </code></pre>
-<p>The anchor precedence is, in order: a resumable data directory, then <code>--checkpoint-sync-url</code>, then, for a loaded network only, that directory’s own <code>genesis.ssz</code>, then abort. The URL is therefore <strong>required</strong> on a fresh data directory only for a built-in network, unlike on <code>node</code>: this follower imports nothing past its anchor, so anchoring a built-in network at genesis would leave it parked at slot 0 while claiming to follow a chain that has been live for years. A loaded network’s own genesis state is a legitimate anchor instead, since a freshly started devnet has no checkpoint provider at slot 0 and this is the only way to join one. With neither a resumable DB, a URL, nor (for a loaded network) a genesis fallback, startup aborts with <code>CheckpointSyncError::BeaconGenesisSync</code>. A data directory already anchored from a previous run resumes exactly as <code>node</code>’s does, without a URL, subject to the same resume window (see <a href="#restarts-and-existing-state">Restarts and Existing State</a>).</p>
+<p>The anchor precedence is, in order: a resumable data directory, then <code>--checkpoint-sync-url</code>, then, for a loaded network only, that directory’s own <code>genesis.ssz</code>, then abort. The URL is therefore <strong>required</strong> on a fresh data directory only for a built-in network, unlike on <code>node</code>: this follower imports nothing past its anchor, so anchoring a built-in network at genesis would leave it parked at slot 0 while claiming to follow a live chain. A loaded network’s own genesis state is a legitimate anchor instead, since a freshly started devnet has no checkpoint provider at slot 0 and this is the only way to join one. With neither a resumable DB, a URL, nor (for a loaded network) a genesis fallback, startup aborts with <code>CheckpointSyncError::BeaconGenesisSync</code>. A data directory already anchored from a previous run resumes exactly as <code>node</code>’s does, without a URL, subject to the same resume window (see <a href="#restarts-and-existing-state">Restarts and Existing State</a>).</p>
 <h2 id="checkpoint-sources"><a class="header" href="#checkpoint-sources">Checkpoint Sources</a></h2>
 <h3 id="direct-peer-lean"><a class="header" href="#direct-peer-lean">Direct peer (lean)</a></h3>
 <p>Any running node that serves the finalized state as SSZ can be used as a checkpoint source, not just ethlambda. For ethlambda nodes, the endpoint is <code>/lean/v0/states/finalized</code>.</p>
@@ -4884,9 +5463,31 @@ To work around this, enable the <a href="https://docs.docker.com/enterprise/secu
 <p><strong>Initialize</strong>: the node stores the anchor block’s header, its body (present unless the fetched block’s own body happens to be empty, same as any other block), and the full state from the checkpoint. On <code>node</code>, persisting the block itself also means it can be served over <code>BlocksByRoot</code>; without that, peers requesting the anchor by root would get a synthetic block whose hash differs from <code>latest_finalized.root</code> and would score-penalize this node. <code>beacon</code>’s req/resp protocol has no <code>BlocksByRoot</code> handler yet, so that benefit doesn’t apply there today; the block is stored anyway, since the pairing check above needs it.</p>
 </li>
 </ol>
+<h4 id="gloas-anchor-the-payload-envelope-beacon-only"><a class="header" href="#gloas-anchor-the-payload-envelope-beacon-only">Gloas anchor: the payload envelope (beacon only)</a></h4>
+<p>A gloas block’s execution payload is not in the block, so a node anchored on
+one holds the block and state but not the payload its children may build on.
+Once the chain actor is running, a node that anchored on a gloas block with no
+stored envelope asks the checkpoint URLs for it, in order:
+<code>GET /eth/v1/beacon/execution_payload_envelopes/{anchor_root}</code> as SSZ. A
+success is handed to the chain actor as <code>new_execution_payload_envelope</code>, the
+same entry a gossiped envelope takes, so the bid check, the column check and
+the verification all apply. The fetch runs in the background and never delays
+startup.</p>
+<p>It is a fast path and nothing depends on it. A <code>404</code> means the peer does not
+know the payload, <strong>not</strong> that the payload is empty, so the node concludes
+nothing from it; any failure (network, decoding, an envelope naming another
+block) is logged at <code>info</code> and ignored. Without the envelope, the by-root
+request that fires when a FULL child arrives recovers it.</p>
+<p>An anchor whose bid carries blobs also needs its sampled columns before its
+envelope verifies, and those are fetched by root like any other block’s. They
+sit at the finalized slot, or below it for an anchor state advanced past empty
+slots, which is where the chain checks drop every other block’s columns. So
+the finalized block’s own columns are exempt from that rule
+(<code>column::chain_checks_gloas</code>); without the exemption such an anchor never gets
+its payload, and the node never imports past it.</p>
 <h3 id="failure-and-success"><a class="header" href="#failure-and-success">Failure and success</a></h3>
 <p>If any step fails (network error, decoding error, verification failure), the node logs the error and exits. There is no automatic retry; restart the node to try again. The database is not modified until verification succeeds, so a failed checkpoint sync leaves the data directory clean.</p>
-<p>After successful initialization, the node starts normally: <code>node</code> connects to the P2P network and begins participating from the checkpoint slot; <code>beacon</code> joins the resolved network’s gossip and logs what it decodes, without advancing its state past the anchor (see <code>docs/cli.md</code>, “What <code>ethlambda beacon</code> does today”).</p>
+<p>After successful initialization, the node starts normally: <code>node</code> connects to the P2P network and begins participating from the checkpoint slot; <code>beacon</code> joins the resolved network’s gossip and follows the chain from the anchor, importing blocks (a gloas anchor starts EMPTY, see <a href="#gloas-anchor-the-payload-envelope-beacon-only">the envelope</a>).</p>
 <h2 id="restarts-and-existing-state"><a class="header" href="#restarts-and-existing-state">Restarts and Existing State</a></h2>
 <p>A node restarted against a populated data directory resumes from disk rather than re-initializing, so no flag is needed to preserve the chain across a redeploy. The decision is made before any download, and is the same shape on both chains except for one row:</p>
 <div class="table-wrapper">
@@ -4950,6 +5551,7 @@ To work around this, enable the <a href="https://docs.docker.com/enterprise/secu
 <tr><td>Justified epoch &gt;= finalized epoch</td><td>Justified must be at or after finalized</td></tr>
 <tr><td>Block header slot &lt;= state slot</td><td>Block header cannot be ahead of the state</td></tr>
 <tr><td>Block’s fork matches state’s fork</td><td>The fetched block must decode as the same fork the state resolved to</td></tr>
+<tr><td>Anchor’s fork is followed (<code>refuse_unfollowable_fork</code>)</td><td>A fork the node cannot follow is refused with <code>UnsupportedFork</code> before any store is built. Every fork is followed today, gloas included, so this refuses nothing; a gloas anchor starts with no payload known, so its head is EMPTY and its first FULL child is held until the parent’s envelope is fetched. Runs on both anchor sources, the checkpoint provider’s state and a loaded network’s own genesis state</td></tr>
 <tr><td>Anchor pairing</td><td>See <a href="#anchor-pairing">Anchor Pairing</a> below</td></tr>
 </tbody>
 </table>
@@ -5095,7 +5697,7 @@ To work around this, enable the <a href="https://docs.docker.com/enterprise/secu
 <h1 id="-storage-what-lives-where"><a class="header" href="#-storage-what-lives-where">💾 Storage: What Lives Where</a></h1>
 <p>This doc explains how ethlambda saves data. Especially,
 the split between the fork choice <code>Store</code> and the <code>StorageBackend</code> trait,
-what each of the eleven tables holds, and which data is in-memory only.</p>
+what each of the thirteen tables holds, and which data is in-memory only.</p>
 <h2 id="overview-1"><a class="header" href="#overview-1">Overview</a></h2>
 <p>All chain data flows through a single high-level type, the <strong><code>Store</code></strong>
 (<code>crates/storage/src/store.rs</code>), which persists it through a small pluggable
@@ -5194,15 +5796,17 @@ is built from it, and clones are handed to the BlockChain and P2P actors.</p>
    │   │ LiveChain                      │         │ (raw XMSS sigs       │    │
    │   │ DataColumns                    │         │ awaiting             │    │
    │   │ PendingDataColumns             │         │ aggregation)         │    │
-   │   │ BeaconUnrealizedJustifications │         │ state_cache (LRU)    │    │
-   │   └────────────────────────────────┘         └──────────────────────┘    │
+   │   │ ExecutionPayloadEnvelopes      │         │ state_cache (LRU)    │    │
+   │   │ BlockTimeliness                │         └──────────────────────┘    │
+   │   │ BeaconUnrealizedJustifications │                                     │
+   │   └────────────────────────────────┘                                     │
    │   Survives restarts, except                                              │
    │   PendingDataColumns, which                  Lost on restart.            │
    │   is cleared at startup.                                                 │
    └──────────────────────────────────────────────────────────────────────────┘
 </code></pre>
 <h2 id="the-tables"><a class="header" href="#the-tables">The Tables</a></h2>
-<p>The eleven variants of the <code>Table</code> enum (<code>crates/storage/src/api/tables.rs</code>):</p>
+<p>The thirteen variants of the <code>Table</code> enum (<code>crates/storage/src/api/tables.rs</code>):</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -5219,6 +5823,8 @@ is built from it, and clones are handed to the BlockChain and P2P actors.</p>
 <tr><td><code>LiveChain</code></td><td>slot ‖ root</td><td><code>parent_root</code></td><td>yes: below finalized</td></tr>
 <tr><td><code>DataColumns</code></td><td>slot ‖ root ‖ column_index</td><td><code>DataColumnSidecar</code> (SSZ-encoded)</td><td>no (see <a href="#datacolumns">DataColumns</a> below)</td></tr>
 <tr><td><code>PendingDataColumns</code></td><td>slot ‖ root ‖ column_index</td><td><code>DataColumnSidecar</code> (SSZ-encoded), unverified</td><td>yes: on replay, below finalized, and wholly at startup</td></tr>
+<tr><td><code>ExecutionPayloadEnvelopes</code></td><td>slot ‖ root</td><td>gloas <code>SignedExecutionPayloadEnvelope</code> (SSZ), verified only</td><td>no: beacon block rows are kept too</td></tr>
+<tr><td><code>BlockTimeliness</code></td><td>root</td><td>one byte per timeliness deadline (0 or 1), gloas blocks only</td><td>no</td></tr>
 <tr><td><code>BeaconUnrealizedJustifications</code></td><td>root</td><td><code>(slot, Checkpoint)</code> (beacon only)</td><td>yes: below the finalized block’s own slot (see <a href="#beaconunrealizedjustifications">below</a>)</td></tr>
 </tbody>
 </table>
@@ -5532,6 +6138,28 @@ columns this node custodies, nearer 1 GB per day at current mainnet blob
 counts. <code>lean_table_bytes{table="data_columns"}</code> (see <a href="#metrics-2">metrics.md</a>)
 is that growth made visible; watch it, and size the disk against however long
 the node runs unattended before a pruner exists.</p>
+<h3 id="executionpayloadenvelopes-and-blocktimeliness"><a class="header" href="#executionpayloadenvelopes-and-blocktimeliness">ExecutionPayloadEnvelopes and BlockTimeliness</a></h3>
+<p>Gloas only. A row in <code>ExecutionPayloadEnvelopes</code> exists for an envelope that
+passed verification, keyed by the slot of the block it fulfills (the envelope
+has no slot of its own) so a by-range handler can scan a slot window. The
+table is the durable form of the store’s <code>verified_payloads</code> set. Losing that
+set on restart would silently drop every full payload branch from fork choice.
+<code>BlockTimeliness</code> is the durable form of the gloas part of <code>block_timeliness</code>.
+Pre-gloas blocks write no row, since nothing reads their timeliness after a
+restart.</p>
+<p><code>Store::from_db_state</code> reloads both for every <code>LiveChain</code> block at or above the
+finalized block’s slot, and reseeds the in-memory payload-committee vote
+vectors empty for each gloas block in that window. The votes themselves are not
+persisted: the next block’s payload attestations refill them. Neither table is
+pruned; rows outside the window are simply not read.</p>
+<p>The execution client’s verdict on each reloaded payload is in-memory scratch
+too, so the chain actor seeds one at startup: <code>SYNCING</code> when an execution
+client is configured, so its first <code>forkchoiceUpdated</code> <code>VALID</code> for the head
+promotes them, and <code>VALID</code> without one, as the follower trusts every envelope it
+applies then. The head node’s payload status (<code>Store::head_payload_status</code>) is
+likewise not stored; it is unknown until the first head computation after a
+restart, and the envelope by-range server withholds the head’s envelope until it
+is known.</p>
 <h3 id="pendingdatacolumns"><a class="header" href="#pendingdatacolumns">PendingDataColumns</a></h3>
 <p>Same key and same encoding as <code>DataColumns</code>, holding sidecars that have <strong>not
 been verified yet</strong>. A sidecar lands here when its block’s parent has no
@@ -5780,10 +6408,10 @@ what bounds it in the meantime (<code>lean_table_bytes{table="data_columns"}</co
 where a future pruner is meant to land
 (<code>MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS</code>).</p>
 <h2 id="in-memory-only-lost-on-restart"><a class="header" href="#in-memory-only-lost-on-restart">In-Memory Only (Lost on Restart)</a></h2>
-<p>Five <code>Store</code> fields never touch the backend directly, <code>beacon</code> with one
-exception (see its row below). All are bounded buffers (or, for <code>beacon</code>,
-bounded in practice by the validator set and the unfinalized window) shared
-across <code>Store</code> clones:</p>
+<p>Five <code>Store</code> fields never touch the backend directly, <code>beacon</code> with the
+exceptions its row below names. All are bounded buffers (or, for
+<code>beacon</code>, bounded in practice by the validator set and the unfinalized
+window) shared across <code>Store</code> clones:</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -5794,7 +6422,7 @@ across <code>Store</code> clones:</p>
 <tr><td><code>known_payloads</code></td><td>512 messages</td><td>Fork-choice-active aggregated proofs</td></tr>
 <tr><td><code>gossip_signatures</code></td><td>2048 signatures</td><td>Raw per-validator XMSS signatures awaiting aggregation (each ~3 KB, so ~6 MB worst case)</td></tr>
 <tr><td><code>state_cache</code></td><td>32 states</td><td>LRU memoization of block <em>and</em> checkpoint post-states (either chain), each held behind an <code>Arc</code> so a hit is not a copy; one bound covers both kinds, keyed apart by a small enum, and a miss is just a reconstruction rather than an error</td></tr>
-<tr><td><code>beacon</code></td><td>unbounded</td><td>Beacon fork-choice scratch: proposer boost root, block timeliness, equivocating validator indices, latest messages, PoW blocks, and unrealized justifications. Most of it is not persisted: proposer boost resets every slot, timeliness is read only by the same-slot reorg helpers, equivocators come back from replaying attester slashings on sync, latest messages from one epoch of attestations, and PoW blocks stand in for an execution-client call a restarted node would simply make again. Unrealized justifications are the exception: this map is a write-through cache in front of <code>BeaconUnrealizedJustifications</code> (see <a href="#beaconunrealizedjustifications">that table</a> above), so it is not lost, only refilled lazily on the next miss</td></tr>
+<tr><td><code>beacon</code></td><td>unbounded</td><td>Beacon fork-choice scratch: proposer boost root, block timeliness, equivocating validator indices, latest messages, PoW blocks, and unrealized justifications. Most of it is not persisted: proposer boost resets every slot, pre-gloas timeliness is read only by the same-slot reorg helpers, equivocators come back from replaying attester slashings on sync, latest messages from one epoch of attestations, and PoW blocks stand in for an execution-client call a restarted node would simply make again. The exceptions are a gloas block’s timeliness and verified payload (see <a href="#executionpayloadenvelopes-and-blocktimeliness">ExecutionPayloadEnvelopes and BlockTimeliness</a>) and unrealized justifications: this map is a write-through cache in front of <code>BeaconUnrealizedJustifications</code> (see <a href="#beaconunrealizedjustifications">that table</a> above), so it is not lost, only refilled lazily on the next miss</td></tr>
 </tbody>
 </table>
 </div>
@@ -5808,7 +6436,7 @@ section of <a href="#-lmd-ghost-fork-choice-algorithm">lmd_ghost.md</a> for how 
 pools.</p>
 <p>After a restart these buffers start empty: pending attestations and
 un-aggregated gossip signatures are lost and must be re-collected from the
-network. Everything persisted in the eleven tables survives, except <code>PendingDataColumns</code>, which is cleared outright: its only index is in memory.</p>
+network. Everything persisted in the thirteen tables survives, except <code>PendingDataColumns</code>, which is cleared outright: its only index is in memory.</p>
 <h2 id="startup-and-restore"><a class="header" href="#startup-and-restore">Startup and Restore</a></h2>
 <p>A <code>Store</code> is created through one of four constructors in
 <code>crates/storage/src/store.rs</code>:</p>
@@ -5989,8 +6617,11 @@ sequence number and <code>ip</code> move, which the reported ENR then lags.</p>
 <li>it advertises a <code>quic</code> port, a <code>tcp</code> port, or both.</li>
 </ul>
 <p>The digest compared against is the caller’s, not a constant: lean passes its
-hardcoded dummy and <code>beacon</code> passes the digest it derived at startup, so one
-admission policy serves both chains.</p>
+hardcoded dummy and <code>beacon</code> passes the digest it derived at startup and moves
+it at each fork-digest boundary, so one admission policy serves both chains. The
+record this node serves is not refreshed at a boundary (ethrex’s
+<code>DiscoveryServer</code> cannot replace it at runtime), so its <code>eth2</code> entry keeps the
+startup digest until a restart; see <a href="#the-fork-digest">beacon_wire.md</a>.</p>
 <p>A differing <code>next_fork_version</code> or <code>next_fork_epoch</code> is <em>not</em> grounds for
 rejection: the spec permits connecting to a peer that is incompatible with an
 upcoming fork but compatible now.</p>
@@ -6619,6 +7250,17 @@ minimal rule for those (the slot must strictly advance). Between them they
 close the shapes reachable through ordinary operation: a backward wall-clock
 step, or a duty schedule replaced mid-epoch. Both are held in memory only, so
 a restart empties them and neither knows anything about any other process.</li>
+<li><strong>Gloas messages:</strong> a gloas proposer also signs an execution payload
+envelope, and a payload timeliness committee member signs a payload
+attestation. Neither is slashable, so neither has a guard. An envelope is
+published once per proposal, right after its block, and a failure to publish it
+is logged at error and counted without failing the proposal. A PTC vote has an
+in-memory dedup of <code>(validator, slot)</code> pairs recorded at signing time
+(<code>PayloadAttestationService</code>), so a duty abandoned between signing and
+submission is lost rather than re-signed. It is emptied by a restart and says
+nothing about another process, so it is not slashing protection either: a
+second, different vote for one slot is equivocation that peers penalize in
+gossip, not a slashing.</li>
 <li><strong>Why a proposer slashing is the worse of the two:</strong> a double vote needs a
 second validator’s attestation to be caught. Two signed block headers for one
 slot are the whole of the evidence on their own.</li>
@@ -6636,6 +7278,90 @@ carry its history.</li>
 <li><strong>Operationally:</strong> do not run these keys in any other client while this one
 runs, and treat a restart as an event that needs the same care a manual key
 move would. The client warns about this at startup on every run.</li>
+</ul>
+<h2 id="self-build-only"><a class="header" href="#self-build-only">Self-build only</a></h2>
+<p>The gloas validator duties are served for a proposer that builds its own
+payload, and for no one else.</p>
+<ul>
+<li><strong>The specification:</strong> a gloas proposer may take a builder’s signed bid
+(<code>SignedExecutionPayloadBid</code>, from gossip or a builder API) instead of building
+its own payload, and publishes a <code>SignedProposerPreferences</code> so builders know
+its fee recipient and gas limit target. <code>produceBlockV4</code> takes a
+<code>BuilderConfig</code> (<code>min_bid</code>, <code>builder_boost_factor</code>, <code>builders</code>) to steer that
+choice.</li>
+<li><strong>ethlambda:</strong> the beacon node never takes a bid, from gossip or otherwise, and
+never builds or reads a <code>SignedProposerPreferences</code>. <code>produceBlockV4</code> decodes
+the <code>BuilderConfig</code> body (a missing or undecodable one is a <code>400</code>, as the
+specification requires) and ignores it, logging at debug when it names
+builders. Every block commits to a zero-value self-build bid
+(<code>BUILDER_INDEX_SELF_BUILD</code>, the G2 point at infinity as signature), and
+<code>Eth-Consensus-Block-Value</code> is always <code>0</code> since there is nothing to compare.
+The validator client signs the envelope with the proposer’s own key under
+<code>DOMAIN_BEACON_BUILDER</code>, and leaves a block that commits to anyone else’s bid
+alone.</li>
+<li><strong>Why:</strong> a scope decision for the first gloas duties: taking bids needs a bid
+pool, builder payment handling and a builder-facing API, none of which this
+node has.</li>
+<li><strong>Consequence:</strong> a validator run through this node never earns a builder’s
+payment, and an execution client’s own block value is what
+<code>Eth-Execution-Payload-Value</code> reports.</li>
+</ul>
+<h2 id="target_gas_limit-is-the-parent-bids-gas-limit"><a class="header" href="#target_gas_limit-is-the-parent-bids-gas-limit"><code>target_gas_limit</code> is the parent bid’s gas limit</a></h2>
+<ul>
+<li><strong>The specification:</strong> the payload is built toward the <code>target_gas_limit</code> of
+the proposer’s <code>SignedProposerPreferences</code>, and <code>bid.gas_limit</code> must be
+compatible with it (<code>is_gas_limit_target_compatible</code>).</li>
+<li><strong>ethlambda:</strong> with no preferences to read, <code>PayloadAttributesV4.targetGasLimit</code>
+is the <code>gas_limit</code> of <code>latest_execution_payload_bid</code> of the state being built
+on (<code>gloas_payload_inputs</code>), so the execution client holds the gas limit where
+it is.</li>
+<li><strong>Equivalence:</strong> the bid is built from the payload the execution client
+returns, so <code>bid.gas_limit</code> is whatever that payload carries and is always
+consistent with the block. A validator that wants the limit to move cannot say
+so through this node: it follows the previous block’s.</li>
+</ul>
+<h2 id="skip_randao_verification-is-ignored"><a class="header" href="#skip_randao_verification-is-ignored"><code>skip_randao_verification</code> is ignored</a></h2>
+<ul>
+<li><strong>The specification:</strong> <code>produceBlockV4</code>’s <code>skip_randao_verification</code> lets a
+caller skip the node’s check of <code>randao_reveal</code>; when it is set, the reveal
+must be the point at infinity.</li>
+<li><strong>ethlambda:</strong> the parameter is accepted and not honored. The block’s state
+root comes from running it through the state transition, which verifies the
+reveal, so the endpoint checks the reveal against the slot’s proposer up front
+and answers <code>400</code> (<code>invalid randao_reveal</code>) for one that does not verify,
+infinity included.</li>
+<li><strong>Consequence:</strong> a caller cannot get a block without a real reveal. Every
+caller this client knows of (including its own validator client) sends one.</li>
+</ul>
+<h2 id="a-pre-gloas-head-counts-as-full-in-attestation_dataindex"><a class="header" href="#a-pre-gloas-head-counts-as-full-in-attestation_dataindex">A pre-gloas head counts as FULL in <code>attestation_data.index</code></a></h2>
+<ul>
+<li><strong>The specification:</strong> at a gloas slot <code>data.index</code> is <code>0</code> when the attested
+block is from the attestation’s own slot, and otherwise <code>0</code> for an <code>EMPTY</code> and
+<code>1</code> for a <code>FULL</code> payload status in the validator’s fork choice. It does not say
+which a pre-gloas block is.</li>
+<li><strong>ethlambda:</strong> at a gloas slot <code>data.index</code> is <code>0</code> when the head block is from
+the requested slot, <code>1</code> when fork choice holds the head’s payload as FULL
+(<code>Store::head_payload_status</code>, or one <code>get_head_node</code> walk when none is
+recorded), and <code>1</code> for a pre-gloas head, the same boundary rule
+<a href="#the-fulu-to-gloas-fork-choice-boundary">fork choice applies</a>. So the first
+gloas slots vote for the last fulu block’s payload.</li>
+<li><strong>Why:</strong> the vote should name the node fork choice itself walks to, and
+that rule makes a pre-gloas block’s one node FULL.</li>
+</ul>
+<h2 id="payload_present-is-judged-by-the-envelopes-arrival-time"><a class="header" href="#payload_present-is-judged-by-the-envelopes-arrival-time"><code>payload_present</code> is judged by the envelope’s arrival time</a></h2>
+<ul>
+<li><strong>The specification:</strong> a PTC member sets <code>payload_present</code> when it has
+received the block’s envelope by <code>get_payload_due_ms()</code> into the slot.</li>
+<li><strong>ethlambda:</strong> <code>GET payload_attestation_data</code> compares the time the envelope
+reached the node (<code>Store::beacon_envelope_seen_ms</code>, recorded by the chain
+actor from the arrival time of the envelope, not the time it finished
+verifying; the earliest arrival wins) with the slot’s start plus
+<code>get_payload_due_ms()</code>. An envelope held for its block or columns is
+therefore judged by when it came, as the rule intends. The record lives in
+memory only, pruned with the execution block hash cache.</li>
+<li><strong>Consequence:</strong> a restart forgets it. Only the slot in flight can be wrong
+(a member asked after a restart answers <code>payload_present = false</code> for an
+envelope that arrived before it), and the next slot’s record starts fresh.</li>
 </ul>
 <h2 id="ethv1nodeidentity-reports-no-enr"><a class="header" href="#ethv1nodeidentity-reports-no-enr"><code>/eth/v1/node/identity</code> reports no ENR</a></h2>
 <p>The endpoint’s <code>enr</code>, <code>p2p_addresses</code> and <code>discovery_addresses</code> are empty
@@ -6721,6 +7447,221 @@ the leak once per epoch as well (<code>process_epoch_single_pass</code>), failin
 same <code>safe_sub</code>. The randomized equivalence tests keep the finalized epoch
 behind the previous one for this reason: past it, the fast path and the
 specification-shaped reference fail at different points.</li>
+</ul>
+<h2 id="the-fulu-to-gloas-fork-choice-boundary"><a class="header" href="#the-fulu-to-gloas-fork-choice-boundary">The fulu-to-gloas fork-choice boundary</a></h2>
+<p>The gloas fork-choice text describes only a store anchored at a gloas block, so
+it says nothing about a tree that crosses from fulu into gloas, which is the
+tree every live follower holds at the fork epoch.</p>
+<ul>
+<li><strong>The specification:</strong> <code>get_parent_payload_status</code> reads the parent block’s
+execution payload bid, which a fulu parent does not have. Consensus-specs
+issue #5096 asked what a pre-gloas parent should answer and was closed as
+not planned. Pull request #5125 is open, as of this writing, and proposes
+<code>PENDING</code>.</li>
+<li><strong>ethlambda:</strong> a pre-gloas block is a single node whose payload status is
+<code>FULL</code>, since its payload ran inside the block and never had an empty branch.
+Concretely, <code>get_parent_payload_status</code> of a gloas block with a pre-gloas
+parent answers <code>FULL</code>; a pre-gloas block’s only child (<code>get_node_children</code>) is
+its <code>FULL</code> node; a vote for one (<code>get_supported_node</code>) supports that node
+whatever its <code>payload_present</code> says; and <code>gloas_get_ancestor</code> stepping onto
+one lands on <code>FULL</code>. Its payload also counts as verified, timely and available
+(<code>is_payload_verified</code>, <code>payload_timeliness</code>, <code>payload_data_availability</code>), so
+the first gloas block passes <code>on_block</code> and an <code>index == 1</code> vote for the last
+fulu block passes <code>validate_on_attestation</code>.</li>
+<li><strong>Which rules the head uses:</strong> <code>get_head_node</code> runs one bottom-up walk for
+every fork, and the current slot’s fork, not the head block’s or the
+justified checkpoint’s, selects its two fork-dependent rules. From
+<code>GLOAS_FORK_EPOCH</code> on, blocks carry the payload dimension their bids give
+them and the proposer boost is gated by <code>should_apply_proposer_boost</code>; before
+it, every block is a single full node and the boost applies whenever it is
+set. <code>compute_head</code> and <code>gloas_get_head</code> are the references the walk is
+tested against.</li>
+<li><strong>Other clients:</strong> Lodestar and Prysm also treat a pre-gloas parent as
+<code>FULL</code>. Lighthouse (v8.2.2) answers <code>EMPTY</code> for a pre-gloas parent, although
+#5125 describes its handling as <code>PENDING</code>.</li>
+<li><strong>Consequence:</strong> if #5125 lands, only the answers above change, and each is
+named in the header comment of <code>fork_choice.rs</code>’s gloas section.</li>
+</ul>
+<h2 id="the-gloas-head-tolerates-state-the-specification-asserts-on"><a class="header" href="#the-gloas-head-tolerates-state-the-specification-asserts-on">The gloas head tolerates state the specification asserts on</a></h2>
+<p>Three places in the gloas head read something the specification would abort on,
+because a live node holds gaps a fixture tree never has. Each is marked
+“Implementation choice, not spec text” at its definition. The head the node
+runs is <code>walk_head</code> (through <code>get_head_node</code>) over the weights of
+<code>compute_node_weights</code>; the spec-literal references carry the same tolerances so
+that the tests compare like with like.</p>
+<ul>
+<li><strong>Pruned votes</strong> (<code>compute_node_weights</code>; in the references,
+<code>get_attestation_score</code>, and through it <code>is_head_weak</code> and
+<code>is_parent_strong</code>, the latter reached from <code>get_proposer_head</code>). A vote
+for a root missing from the block index contributes nothing, where
+<code>get_ancestor</code> would raise. Pruning removes only entries below the finalized
+slot, and every root scored is indexed at or above it, so such a vote cannot
+descend from the scored root and the specification’s own contribution for it
+is zero too.</li>
+<li><strong>Unknown voters</strong> (<code>compute_node_weights</code>; <code>gloas_get_attestation_score</code> in
+the reference). A vote for a root the store never held is skipped, where
+<code>get_supported_node</code> would raise, so one stale voter cannot abort a head
+computation. The walk drops a block pruned from the index but still in the
+store the same way, with the pruned votes above; the reference does not skip
+it, and its vote walks the block table and contributes nothing.</li>
+<li><strong>Missing timeliness</strong> (<code>should_apply_proposer_boost</code>). A candidate with no
+<code>block_timeliness</code> entry reads as not timely by either deadline, where the
+specification indexes the entry directly. A gloas block’s entry is persisted
+(<code>Table::BlockTimeliness</code>) and reloaded on resume; a pre-gloas block’s is in
+memory only, so a restart empties it. The reading can only miss withholding a boost from an
+early equivocation, never withhold one wrongly.</li>
+<li><strong>Equivalence:</strong> each is the specification’s answer wherever the specification
+has one; they differ only where it would have raised.</li>
+</ul>
+<h2 id="the-envelope-check-reads-the-cached-state-root"><a class="header" href="#the-envelope-check-reads-the-cached-state-root">The envelope check reads the cached state root</a></h2>
+<p><code>verify_execution_payload_envelope</code> compares <code>envelope.beacon_block_root</code> with
+the root of the state’s latest block header.</p>
+<ul>
+<li><strong>The specification:</strong> sets <code>header.state_root = hash_tree_root(state)</code> on a
+copy of the header. That is exact for a state fresh out of block processing,
+whose <code>latest_block_header.state_root</code> is still zero.</li>
+<li><strong>ethlambda:</strong> uses <code>BeaconState::compute_state_root</code>. The function’s caller
+hands it a stored state, and this repository writes the real root into that
+header field as soon as the block’s transition returns. Hashing such a state
+would hash a header whose <code>state_root</code> is already set, a different value from
+the one the header committed to, and every stored state’s envelope would fail.
+<code>compute_state_root</code> returns the cached value only while the state is still
+at that block’s slot and the field is set, and hashes otherwise, so both
+shapes give the same root.</li>
+<li><strong>Equivalence:</strong> the same check, on both kinds of state.</li>
+</ul>
+<h2 id="the-attestation-deadline-takes-the-epoch-that-picks-the-forks-rule"><a class="header" href="#the-attestation-deadline-takes-the-epoch-that-picks-the-forks-rule">The attestation deadline takes the epoch that picks the fork’s rule</a></h2>
+<ul>
+<li><strong>The specification:</strong> <code>get_attestation_due_ms()</code> takes no argument, and
+gloas replaces it with a function that reads <code>ATTESTATION_DUE_BPS_GLOAS</code>.</li>
+<li><strong>ethlambda:</strong> one <code>get_attestation_due_ms(epoch, config)</code>
+(<code>fork_choice.rs</code>) that reads the basis points of the fork <code>epoch</code> falls in
+(<code>ForkRules::of</code>), so both sides of the fulu-to-gloas boundary share it.</li>
+<li><strong>Equivalence:</strong> the same deadline for every slot, since the epoch is the
+one the specification’s own per-fork function would have been selected for.</li>
+</ul>
+<h2 id="the-head-is-one-bottom-up-walk-not-the-specifications-per-node-get_weight"><a class="header" href="#the-head-is-one-bottom-up-walk-not-the-specifications-per-node-get_weight">The head is one bottom-up walk, not the specification’s per-node <code>get_weight</code></a></h2>
+<p>The specification’s gloas <code>get_head</code> calls <code>get_weight</code> for every candidate
+node, and each call walks every latest message and every ancestor step.</p>
+<ul>
+<li><strong>ethlambda:</strong> <code>get_head_node</code> computes every node’s attestation score in one
+pass over the latest messages and one over the blocks (highest slot first),
+folding each block’s total into the payload node of its parent that it builds
+on, then descends from the justified checkpoint over that table. The proof
+that the fold equals <code>get_attestation_score</code> for every node, from
+<code>is_ancestor</code>’s definition, is in the <code>fork_choice.rs</code> section “The head
+computation”. The proposer boost is added along the boosted block’s chain
+after <code>should_apply_proposer_boost</code> has read the parent’s score from the same
+table, so that gate no longer re-walks the votes either.</li>
+<li><strong>Few decodes:</strong> a block’s fork and parent payload status are recorded as a
+<code>BlockPayloadLink</code> when <code>on_block</code> imports it, and the head’s slot reads
+come from the block index, so a head computation decodes no block in the
+ordinary case. Two cases still decode. A block imported before a restart has
+no entry (the scratch is in memory), and the walk derives it once by
+decoding the block and its parent and records it; the actor does the same for
+each new finalized root before pruning links. And a weak boosted-block parent
+from the previous slot scans same-slot candidates for an early equivocation,
+which needs their proposer indexes; that scan is rare and bounded by the
+candidates at one slot.</li>
+<li><strong>Bounded at the finalized block:</strong> vote placement, the fold and the boost
+chain stop at the least of the finalized block’s slot, the justified block’s
+slot and the boosted block’s parent’s slot, which on a live node is the
+finalized block’s. The other two terms make the bound safe without assuming
+that the justified block and the boosted block’s parent are at or above the
+finalized block. Finality pruning drops the block index rows below the
+finalized block’s own slot, so on a live node the index already starts
+there; the bound holds the walk to that window whatever the index still
+keeps below it. Links below the finalized block are pruned because nothing
+reads them.</li>
+<li><strong>No boost outside the justified subtree:</strong> the specification evaluates
+<code>should_apply_proposer_boost</code> whenever a boost root is set. The walk skips
+the boost, gate included, when the boosted block is not under the justified
+root: the boost reaches only that block’s ancestors, none of which the
+descent compares, so the head is the same. It also keeps the gate from
+reading a parent that finality pruning removed after the boost was set,
+which would otherwise fail the head computation until the next slot.</li>
+<li><strong>Cost:</strong> work is proportional to the latest messages plus the indexed
+blocks at or above the finalized block, the unfinalized window. The
+spec-literal form is proportional to the messages times the
+candidate nodes, with block decodes at each ancestor step and for each voter,
+which would wedge the chain actor on a large tree.</li>
+<li><strong>Equivalence:</strong> the walk names the head and gives every node at or above the
+finalized block the weight the specification’s <code>get_head</code> and <code>get_weight</code>
+do, wherever they do not raise; the tolerances above are the only
+differences. The fixture harness checks the head at every <code>head</code> step and
+every viable leaf’s weight, and a seeded randomized test checks both over
+trees that cross the fork boundary.</li>
+<li><strong>Why still tested against the spec-literal form:</strong> <code>gloas_get_head</code> and
+<code>gloas_get_weight</code> remain, as the references the walk is compared with, at
+every <code>head</code> check of every fork-choice fixture and on randomized trees;
+<code>compute_head</code> is the pre-gloas reference.</li>
+</ul>
+<h2 id="the-execution-client-judges-a-gloas-payload-before-the-envelope-is-applied"><a class="header" href="#the-execution-client-judges-a-gloas-payload-before-the-envelope-is-applied">The execution client judges a gloas payload before the envelope is applied</a></h2>
+<p><code>verify_execution_payload_envelope</code> asks the execution engine last, as part of
+one boolean function. The follower runs the pure consensus checks first
+(<code>check_execution_payload_envelope</code>: signature, bid, state, data availability),
+then asks the engine with <code>engine_newPayloadV5</code> only about an envelope that
+passed them, and records it with <code>accept_execution_payload_envelope</code>. The
+engine’s part is answered “valid” inside the checks because its answer has
+three outcomes and the specification’s <code>ExecutionEngine</code> has two.</p>
+<ul>
+<li><strong><code>VALID</code>:</strong> applied; the payload is recorded <code>VALID</code>.</li>
+<li><strong><code>SYNCING</code> / <code>ACCEPTED</code>:</strong> applied, since the consensus checks passed and the
+payload is <code>NOT_VALIDATED</code> (<code>optimistic-sync.md</code>); recorded <code>SYNCING</code>, which
+the attestation gossip rules already read as not yet validated. A later
+<code>forkchoiceUpdated</code> <code>VALID</code> for the head, or for a descendant payload, moves
+it and every optimistic payload on that chain to <code>VALID</code>. Unlike a pre-gloas
+block there is no <code>is_optimistic_candidate_block</code> gate: a payload is applied
+to a block the consensus layer already imported, so there is no
+merge-transition poisoning to guard against.</li>
+<li><strong><code>INVALID</code>:</strong> not applied, so the FULL node of the block never exists; the
+payload is recorded <code>INVALID</code>, children held for it are dropped and later
+blocks that name it as their FULL parent are dropped instead of held. The
+block itself and its EMPTY branch stay. <code>latestValidHash</code> can reach further
+back, in which case the first payload after it is condemned the same way
+(<code>beacon_payloads::resolve_invalid_payload</code>, which skips blocks that carry no
+payload, unlike the pre-gloas <code>resolve_invalid_block</code>). A <code>forkchoiceUpdated</code>
+<code>INVALID</code> for a payload already applied removes it again (its FULL node, its
+stored envelope, and every child built on it).</li>
+<li><strong>A hash mismatch (<code>INVALID_BLOCK_HASH</code>, or <code>INVALID</code> with a null
+<code>latestValidHash</code>):</strong> the envelope’s contents do not hash to the block hash it
+claims, so only that envelope (by its own root) is refused; the root’s
+payload is not condemned, since the builder’s real envelope may still arrive.
+ethrex has no <code>INVALID_BLOCK_HASH</code> status: it answers a block hash mismatch
+with <code>INVALID</code> and a null <code>latestValidHash</code>, and an executed-and-failed
+payload with <code>INVALID</code> and its last valid ancestor. So a null one is read as
+a mismatch and a non-null one as the payload being invalid. A payload that
+failed with no valid ancestor to name is read as a mismatch too, which only
+costs a refused envelope.</li>
+<li><strong>No answer after the retry ladder:</strong> the payload is not applied, as for a
+block, but unlike a block the envelope is consensus-valid and already held,
+so it is kept and the per-slot redrive asks again, about the oldest held
+envelope only and the rest once that ask is answered, so a down client costs
+one retry ladder per slot however many wait. It is not fetched again:
+that would repeat the ladder for every copy that arrives.</li>
+</ul>
+<p><code>latestValidHash</code> and <code>VALID</code> follow the execution-layer chain, not every
+verified ancestor: a gloas block’s EL parent is the ancestor whose payload hash
+is its <code>bid.parent_block_hash</code>, skipping blocks it built past on their EMPTY
+node, and a pre-gloas block’s is its parent. Both walks stop at finality.</p>
+<h2 id="forkchoiceupdated-for-a-gloas-head"><a class="header" href="#forkchoiceupdated-for-a-gloas-head"><code>forkchoiceUpdated</code> for a gloas head</a></h2>
+<ul>
+<li>The head hash follows the head node: <code>bid.block_hash</code> for a FULL head,
+<code>bid.parent_block_hash</code> for an EMPTY one. A head whose payload status has not
+been computed yet is skipped.</li>
+<li><code>finalized_block_hash</code> is the finalized block’s <code>bid.parent_block_hash</code>, as
+the specification has it.</li>
+<li><code>safe_block_hash</code> is the justified block’s <code>bid.parent_block_hash</code>. The
+specification’s <code>get_safe_execution_block_hash</code> is built on fast
+confirmation, which the follower does not run, so this is the fallback. It
+can only be older than the confirmed block, which keeps it safe.</li>
+<li>A pre-gloas checkpoint block, including one beneath a gloas head, keeps its
+own payload hash.</li>
+<li>The call is V4 with the node’s custody columns when the head block is gloas,
+and V3 before; <code>engine_newPayloadV5</code> is for envelopes and V4 for pre-gloas
+blocks.</li>
+<li>A hash of zero is “nothing to say” on either fork, so a payload whose hash is
+zero (the fixtures’ placeholder) sends no <code>forkchoiceUpdated</code>.</li>
 </ul>
 
                     </main>
