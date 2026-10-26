@@ -55,8 +55,13 @@
 //! fails to confirm is reported as [`Published::BuilderUnconfirmed`] rather
 //! than as a missed proposal, since the relay may still publish the block.
 //!
-//! # Do not retry this call within a slot
+//! The publish runs on its own task. The beacon node waits up to 5 s for the
+//! relay, which can outlast the proposal's budget (see `lib.rs`), and dropping
+//! the proposal future must neither cancel the request nor lose its outcome: the
+//! task logs and counts it itself, and [`ProposalService::signed_blinded_at`]
+//! lets the caller tell an overrun after signing from a block never signed.
 //!
+//! # Do not retry this call within a slot
 //!
 //! For the same reason [`crate::attestation::AttestationService::attest`] must
 //! not be: a second call asks the node for a second block, which will differ
@@ -104,9 +109,12 @@ pub struct ProposalService<B> {
     /// The `builder_boost_factor` sent with each block request, or `None` when
     /// builder proposals are off, in which case a blinded answer is refused.
     builder_boost_factor: Option<u64>,
+    /// The slot of the latest blinded block this service signed, set before
+    /// its publish starts. A `std::sync::Mutex` for the reason `guard` is one.
+    last_blinded_slot: std::sync::Mutex<Option<Slot>>,
 }
 
-impl<B: BeaconNodeApi> ProposalService<B> {
+impl<B: BeaconNodeApi + 'static> ProposalService<B> {
     pub fn new(
         beacon_node: Arc<B>,
         context: Arc<SigningContext>,
@@ -118,8 +126,30 @@ impl<B: BeaconNodeApi> ProposalService<B> {
             context,
             settings,
             builder_boost_factor,
+            last_blinded_slot: std::sync::Mutex::new(None),
             guard: std::sync::Mutex::new(ProposalGuard::new()),
         }
+    }
+
+    /// Whether this service signed a blinded block for `slot`, whose publish
+    /// may therefore still be in flight on its own task.
+    pub fn signed_blinded_at(&self, slot: Slot) -> bool {
+        *self
+            .last_blinded_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            == Some(slot)
+    }
+
+    /// Whether the produced block's fee recipient is this client's to compare.
+    ///
+    /// Not for a blinded block: its header names the builder's address, and the
+    /// relay pays the validator inside the payload it reveals, so a difference
+    /// there is the flow working, not a node paying someone else.
+    fn compares_fee_recipient(
+        produced: &crate::beacon_node::block_contents::ProducedBlock,
+    ) -> bool {
+        !produced.is_blinded()
     }
 
     /// Compare the produced block's fee recipient against what was asked for,
@@ -275,17 +305,14 @@ impl<B: BeaconNodeApi> ProposalService<B> {
             )));
         }
 
-        // A blinded block's header names the builder's address, and the relay
-        // pays the validator inside the payload it reveals, so there is
-        // nothing here to compare.
-        if produced.is_blinded() {
+        if Self::compares_fee_recipient(&produced) {
+            Self::check_fee_recipient(&produced, fee_recipient, slot);
+        } else {
             tracing::debug!(
                 %slot,
                 "Blinded block: its header names the builder's address; the relay pays the \
                  validator in the payload"
             );
-        } else {
-            Self::check_fee_recipient(&produced, fee_recipient, slot);
         }
 
         let fork = produced.fork;
@@ -328,7 +355,16 @@ impl<B: BeaconNodeApi> ProposalService<B> {
                 }
             }
 
-            self.context.sign_block(&store, &pubkey, block_root, slot)?
+            let signature = self.context.sign_block(&store, &pubkey, block_root, slot)?;
+            // Before the first await after signing, so an overrun of the
+            // proposal's budget from here on is known to be a signed block.
+            if blinded {
+                *self
+                    .last_blinded_slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(slot);
+            }
+            signature
         };
 
         // Taken out before the block is signed into its body: the envelope is
@@ -338,17 +374,18 @@ impl<B: BeaconNodeApi> ProposalService<B> {
         let builder_index = produced.builder_index();
 
         let body = produced.into_signed_ssz(signature);
+        // A blinded block counts itself on its own task (see
+        // `publish_blinded`); a full one is counted here.
         let published = if blinded {
-            self.publish_blinded(slot, fork, &body, duty.validator_index)
+            self.publish_blinded(slot, fork, body, duty.validator_index)
                 .await?
         } else {
-            self.publish(fork, &body, slot, duty.validator_index)
-                .await?
+            let published = self
+                .publish(fork, &body, slot, duty.validator_index)
+                .await?;
+            crate::metrics::inc_blocks_proposed();
+            published
         };
-        crate::metrics::inc_blocks_proposed();
-        if published == Published::HandedToBuilder {
-            crate::metrics::inc_blinded_blocks_proposed();
-        }
 
         // Only a self-built payload is this client's to reveal.
         if builder_index == Some(BUILDER_INDEX_SELF_BUILD) {
@@ -445,6 +482,13 @@ impl<B: BeaconNodeApi> ProposalService<B> {
 
     /// Send a signed blinded block to the node that produced it.
     ///
+    /// # On its own task
+    ///
+    /// The request, its logging and its counters run on a spawned task, so a
+    /// proposal future dropped at the duty loop's budget (the node may wait up
+    /// to 5 s on the relay) neither cancels the request nor loses its outcome.
+    /// This method only awaits the task.
+    ///
     /// # Why an unconfirmed publish is not an error
     ///
     /// A 5xx or a missing answer does not say the block was not published: the
@@ -458,43 +502,66 @@ impl<B: BeaconNodeApi> ProposalService<B> {
         &self,
         slot: Slot,
         fork: ForkName,
-        body: &[u8],
+        body: Vec<u8>,
         validator: u64,
     ) -> Result<Published> {
-        match self
-            .beacon_node
-            .publish_blinded_block(slot, fork, body)
-            .await
-        {
-            Ok(Published::HandedToBuilder) => {
-                info!(%slot, validator, bytes = body.len(), "Blinded block handed to the builder");
-                Ok(Published::HandedToBuilder)
+        let beacon_node = self.beacon_node.clone();
+        let task = tokio::spawn(async move {
+            let bytes = body.len();
+            match beacon_node.publish_blinded_block(slot, fork, &body).await {
+                Ok(published) => {
+                    match published {
+                        Published::HandedToBuilder => {
+                            info!(%slot, validator, bytes, "Blinded block handed to the builder");
+                        }
+                        Published::BroadcastNotImported => {
+                            warn!(
+                                %slot,
+                                validator,
+                                "Block was broadcast but the beacon node could not import it; \
+                                 check that node's execution layer"
+                            );
+                            crate::metrics::inc_blocks_broadcast_not_imported();
+                        }
+                        // Neither belongs to this path: a full block's outcome,
+                        // and one only this service builds. Reported rather
+                        // than assumed away.
+                        Published::Imported | Published::BuilderUnconfirmed => warn!(
+                            %slot,
+                            validator,
+                            ?published,
+                            "Beacon node API answered a blinded publish with an outcome that \
+                             belongs to another call"
+                        ),
+                    }
+                    if published != Published::BuilderUnconfirmed {
+                        crate::metrics::inc_blocks_proposed();
+                        crate::metrics::inc_blinded_blocks_proposed();
+                    }
+                    Ok(published)
+                }
+                Err(err @ Error::BlindedUnconfirmed { .. }) => {
+                    tracing::error!(
+                        %slot,
+                        validator,
+                        %err,
+                        "The beacon node did not confirm the blinded block; the relay may still \
+                         publish it. Not retried: the slot is signed, and a second block would be \
+                         an equivocation"
+                    );
+                    crate::metrics::inc_blinded_blocks_unconfirmed();
+                    Ok(Published::BuilderUnconfirmed)
+                }
+                Err(err) => Err(err),
             }
-            Ok(Published::BroadcastNotImported) => {
-                warn!(
-                    %slot,
-                    validator,
-                    "Block was broadcast but the beacon node could not import it; \
-                     check that node's execution layer"
-                );
-                crate::metrics::inc_blocks_broadcast_not_imported();
-                Ok(Published::BroadcastNotImported)
-            }
-            Ok(other) => Ok(other),
-            Err(err @ Error::BlindedUnconfirmed { .. }) => {
-                tracing::error!(
-                    %slot,
-                    validator,
-                    %err,
-                    "The beacon node did not confirm the blinded block; the relay may still \
-                     publish it. Not retried: the slot is signed, and a second block would be \
-                     an equivocation"
-                );
-                crate::metrics::inc_blinded_blocks_unconfirmed();
-                Ok(Published::BuilderUnconfirmed)
-            }
-            Err(err) => Err(err),
-        }
+        });
+        // A task that panicked has no outcome to report; the block may or may
+        // not have gone out, which is what "unconfirmed" says.
+        task.await.unwrap_or_else(|err| {
+            tracing::error!(%slot, validator, %err, "The blinded publish task failed");
+            crate::metrics::inc_blinded_blocks_unconfirmed();
+            Ok(Published::BuilderUnconfirmed)
+        })
     }
 
     /// Send the signed body and report what the node made of it.
@@ -793,17 +860,56 @@ mod tests {
                 .with_blinded_block(),
         );
 
-        let published = builder_service(node.clone(), Some(H160([0xfe; 20])))
+        let service = builder_service(node.clone(), Some(H160([0xfe; 20])));
+        assert!(!service.signed_blinded_at(slot()));
+        let published = service
             .propose(slot(), &duty(&pubkey, 7, slot()), &store)
             .await
             .expect("proposes");
         assert_eq!(published, Published::HandedToBuilder);
+        assert!(
+            service.signed_blinded_at(slot()),
+            "the duty loop reads this to tell an overrun after signing from one before"
+        );
+        assert!(!service.signed_blinded_at(slot() + 1));
 
         assert_eq!(node.block_requests()[0].builder_boost_factor, Some(100));
         assert!(node.published_blocks().is_empty());
         let sent = node.published_blinded.lock().expect("lock").clone();
         assert_eq!(sent.len(), 1);
         assert_eq!((sent[0].0, sent[0].1), (slot(), ForkName::Electra));
+    }
+
+    /// The fee-recipient comparison is for a full block only: a blinded
+    /// block's header names the builder's address.
+    #[tokio::test]
+    async fn only_a_full_block_has_its_fee_recipient_compared() {
+        use crate::beacon_node::block_contents::{Contents, ProducedBlock, empty_block_for};
+        use ethlambda_types::beacon::builder::BlindedBeaconBlock;
+
+        let blinded = ProducedBlock {
+            fork: ForkName::Electra,
+            contents: Contents::Blinded {
+                block: BlindedBeaconBlock::from(empty_block_for(slot(), 7)),
+            },
+        };
+        assert!(!ProposalService::<MockBeaconNode>::compares_fee_recipient(
+            &blinded
+        ));
+
+        let full = MockBeaconNode::new().with_block(slot(), 7);
+        let request = BlockRequest {
+            slot: slot(),
+            fork: ForkName::Electra,
+            proposer_index: 7,
+            randao_reveal: Default::default(),
+            graffiti: Default::default(),
+            builder_boost_factor: None,
+        };
+        let full = full.produce_block(&request).await.expect("produces");
+        assert!(ProposalService::<MockBeaconNode>::compares_fee_recipient(
+            &full
+        ));
     }
 
     /// A node that does not confirm the publish may still have handed the block
@@ -833,23 +939,23 @@ mod tests {
         assert!(matches!(err, Error::ProposalRefused { .. }), "got {err:?}");
     }
 
-    /// Any failure that is not `BlindedUnconfirmed` is a definite refusal (a
-    /// 4xx): the block was not published, so the proposal failed.
+    /// A 4xx is a definite refusal: the block was not published, so the
+    /// proposal failed.
     #[tokio::test]
     async fn a_definitely_refused_blinded_publish_is_an_error() {
         let (store, pubkey) = store();
         let node = MockBeaconNode::new()
             .with_block(slot(), 7)
-            .with_blinded_block();
-        node.failures
-            .lock()
-            .expect("lock")
-            .insert("publish_blinded_block", "400 bad request".to_string());
+            .with_blinded_block()
+            .with_refused_blinded_publish(400);
 
         let result = builder_service(Arc::new(node), None)
             .propose(slot(), &duty(&pubkey, 7, slot()), &store)
             .await;
-        assert!(result.is_err(), "got {result:?}");
+        assert!(
+            matches!(result, Err(Error::BeaconNodeStatus { status: 400, .. })),
+            "got {result:?}"
+        );
     }
 
     #[tokio::test]

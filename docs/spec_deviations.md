@@ -696,10 +696,10 @@ the beacon node's builder and may sign a blinded block (builder-specs and
   `ProposalGuard` covers both kinds: one slot, one signature, whichever way the
   node answered.
 - **A blinded block is published only on the beacon node that produced it, with
-  no failover.** The specification says the block goes to the node that built
-  it. Only that node's builder holds the payload and only that node claimed the
-  slot, so offering the signed block to another node would hand it to a builder
-  that never saw the bid. If the producing node fails, the publish fails, and
+  no failover.** This is this client's choice, not the specification's: only
+  that node's builder holds the payload and only that node claimed the slot, so
+  offering the signed block to another node would hand it to a builder that
+  never saw the bid. If the producing node fails, the publish fails, and
   the guard has already recorded the slot, so nothing retries. A 5xx or no
   answer is reported as unconfirmed (logged at error, counted on
   `blinded_blocks_unconfirmed_total`) and not as a missed proposal, since the

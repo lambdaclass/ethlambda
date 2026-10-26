@@ -114,7 +114,7 @@ static BLOCKS_BROADCAST_NOT_IMPORTED_TOTAL: LazyLock<IntCounter> = LazyLock::new
 });
 
 /// Builder registrations a beacon node accepted, counted per registration so a
-/// batch of 500 reads as 500.
+/// full `REGISTRATION_BATCH` reads as that many.
 static BUILDER_REGISTRATIONS_SENT_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "ethlambda_validator_builder_registrations_sent_total",

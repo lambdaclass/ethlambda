@@ -21,7 +21,7 @@
 //!
 //! The endpoints support it: `Accept: application/octet-stream` on
 //! `produceBlockV3`, `Content-Type: application/octet-stream` on
-//! `publishBlockV2`.
+//! `publishBlockV2` and `publishBlindedBlockV2`.
 //!
 //! # `BlockContents` is not a consensus container
 //!
@@ -53,6 +53,8 @@
 //! client has signed. No blobs travel with it, since the builder publishes
 //! them. Its root is the full block's, so signing and the proposal guard work
 //! as for any other block. Electra and fulu share one blinded container.
+//! Electra blinded blocks are for third-party beacon nodes: an ethlambda node
+//! serves blinded blocks for fulu only.
 //!
 //! # Gloas
 //!
@@ -358,7 +360,15 @@ impl ProducedBlock {
                     contents: Contents::Blinded { block },
                 })
             }
-            _ => Err(Error::InconsistentResponse(format!(
+            // Named, as `from_ssz` names its arms, so a new fork forces a
+            // decision here instead of being refused by default.
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb
+            | ForkName::Gloas
+            | ForkName::Lean => Err(Error::InconsistentResponse(format!(
                 "beacon node produced a blinded block for fork {}; blinded blocks exist for \
                  electra and fulu only",
                 fork.as_str()
@@ -496,7 +506,8 @@ impl ProducedBlock {
         }
     }
 
-    /// Attach `signature` and encode the body `publishBlockV2` expects.
+    /// Attach `signature` and encode the body `publishBlockV2` expects, or
+    /// `publishBlindedBlockV2` for a blinded block.
     ///
     /// Consumes the block: the proofs and blobs are moved into the published
     /// body rather than copied, and a blob is 128 KiB, so a six-blob block

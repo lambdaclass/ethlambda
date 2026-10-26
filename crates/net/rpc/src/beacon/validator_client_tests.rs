@@ -131,16 +131,20 @@ async fn serve_at(
     .unwrap();
     let parent_root = advanced.latest_block_header().hash_tree_root();
     store.insert_state(parent_root, state.clone()).unwrap();
-    let (client, network, _pool, address) = spawn_server(store.clone(), engine).await;
+    let (client, network, _pool, address) = spawn_server(store.clone(), engine, None).await;
     (client, state, network, address, store)
 }
 
 /// Serve `store` through the router the real server builds, over a socket on an
 /// ephemeral port, and connect this crate's client to it. Also hands back the
 /// payload attestation pool the router fills and the socket it listens on.
+///
+/// With a `builder`, it is layered as `lib.rs` does when `--builder` is set,
+/// so the builder flow's endpoints see it.
 async fn spawn_server(
     mut store: Store,
     engine: Option<ethlambda_engine::EngineClient>,
+    builder: Option<Arc<crate::beacon::builder_flow::Builder>>,
 ) -> (
     HttpBeaconNode,
     Arc<RecordingNetwork>,
@@ -171,6 +175,10 @@ async fn spawn_server(
         .layer(Extension(crate::beacon::graffiti::OwnVersion(Arc::new(
             own_version(),
         ))));
+    let router = match builder {
+        Some(builder) => router.layer(Extension(builder)),
+        None => router,
+    };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -874,7 +882,7 @@ async fn serve_fulu_pinned(
         head_root,
         slot,
     );
-    let (client, network, _, _) = spawn_server(store, engine).await;
+    let (client, network, _, _) = spawn_server(store, engine, None).await;
     let genesis = client.genesis().await.expect("genesis");
     let spec = client
         .spec()
@@ -1175,7 +1183,8 @@ mod gloas {
         let head_root = header.hash_tree_root();
         let store =
             beacon_store_with_head_block(state.clone(), config(), block, head_root, clock_slot);
-        let (client, network, payload_pool, _address) = spawn_server(store.clone(), engine).await;
+        let (client, network, payload_pool, _address) =
+            spawn_server(store.clone(), engine, None).await;
         let genesis = client.genesis().await.expect("genesis");
         let spec = client
             .spec()
@@ -1649,7 +1658,9 @@ mod gloas {
 /// against this node's routes with a `Builder` layered over a mock relay.
 mod builder_flow {
     use super::*;
-    use crate::beacon::proposal::tests::{BuilderWorld, ETH, TARGET_GAS_LIMIT, builder_world};
+    use crate::beacon::proposal::test_support::{
+        BuilderWorld, ETH, TARGET_GAS_LIMIT, builder_world,
+    };
     use ethlambda_state_transition::beacon::helpers::accessors::get_beacon_proposer_index;
     use ethlambda_types::beacon::builder::{
         SignedBlindedBeaconBlock, SignedValidatorRegistrationV1, ValidatorRegistrationV1,
@@ -1668,8 +1679,8 @@ mod builder_flow {
         context: SigningContext,
     }
 
-    /// `world`'s routes (production, blinded publish and registration, sharing
-    /// one fee-recipient map as the real router does) behind a socket.
+    /// `world`'s store served through the real beacon router, with its
+    /// `Builder` layered, behind a socket.
     async fn harness(world: BuilderWorld, engine: ethlambda_engine::EngineClient) -> Harness {
         // A block built on this head names the advanced header's root as its
         // parent, which the fixture's placeholder anchor block does not have:
@@ -1682,22 +1693,8 @@ mod builder_flow {
             .insert_state(parent_root, (*head_state).clone())
             .unwrap();
 
-        let network: RpcToP2PRef = Arc::new(RecordingNetwork::default());
-        let router = crate::beacon::proposal::routes()
-            .merge(crate::beacon::registrations::routes())
-            .with_state(world.store.clone())
-            .layer(Extension(Some(engine)))
-            .layer(Extension(SharedSyncCommitteePool::default()))
-            .layer(Extension(crate::beacon::validator::FeeRecipients::default()))
-            .layer(Extension(crate::beacon::graffiti::OwnVersion(Arc::new(
-                own_version(),
-            ))))
-            .layer(Extension(network))
-            .layer(Extension(world.builder.clone()));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, router).await });
-        let client = HttpBeaconNode::new(format!("http://{address}")).unwrap();
+        let (client, _network, _pool, _address) =
+            spawn_server(store, Some(engine), Some(world.builder.clone())).await;
 
         let proposer = get_beacon_proposer_index(&world.state).unwrap();
         let keys = keys_for(&world.state, &[proposer]);
@@ -1798,9 +1795,15 @@ mod builder_flow {
         let registered = h.register().await;
         assert_eq!(h.world.relay.registrations(), [registered]);
 
-        h.world.offer(ETH, |_| {});
-        let produced = h.produce(Some(100)).await;
-        assert!(produced.is_blinded(), "a bid worth more must win");
+        // Worth far less than the local payload (42 wei), so only the maximum
+        // factor makes it win: a factor that is dropped or ignored (the node's
+        // default is 100) leaves a full block.
+        h.world.offer(1, |_| {});
+        let produced = h.produce(Some(u64::MAX)).await;
+        assert!(
+            produced.is_blinded(),
+            "the factor must reach the node and take the bid"
+        );
 
         let body = h.sign(produced).await;
         let published = h
@@ -1820,16 +1823,17 @@ mod builder_flow {
         let engine = fake_execution_client_paying("0x2a", false).await;
         let h = harness(world, engine).await;
 
-        // A client with builder proposals off never registers either, which
-        // is what keeps the node from asking the relay at all.
+        // Registered, with a bid worth far more than the local payload: only
+        // the factor the client sends (0 for `None`) keeps the block local.
+        h.register().await;
         h.world.offer(ETH, |_| {});
         let produced = h.produce(None).await;
         assert!(!produced.is_blinded());
         assert!(h.world.relay.blinded_blocks().is_empty());
         assert_eq!(
             h.world.relay.header_requests().len(),
-            0,
-            "a client with builder proposals off must not make the node ask the relay"
+            1,
+            "the node still asks the relay at a factor of 0, as Lighthouse does"
         );
     }
 

@@ -759,13 +759,17 @@ second points at the beacon nodes; a rise in the third points at the clock or
 the duty schedule and is worth investigating even though the attestation was
 correctly suppressed.
 
-The proposal series split the same way, plus one that is neither a success nor
+The proposal series split the same way, plus two that are neither a success nor
 a failure. `blocks_proposed_total` counts blocks a node accepted;
 `block_proposal_failures_total` counts duties that produced none;
 `blocks_refused_total` counts blocks deliberately not signed. Between them,
 `blocks_broadcast_not_imported_total` counts blocks that did reach the network
 but that the node answering could not import, which is a beacon-node fault
 rather than a validator one and is why it is not folded into either.
+`blinded_blocks_unconfirmed_total` is the other: a blinded block the node did
+not confirm, which the relay may still have published. It is not in
+`blocks_proposed_total` nor in the publication delay histogram, and it is not a
+failure either.
 
 Gloas adds two pairs. A gloas proposal ends in a block and then an envelope,
 and the envelope's failure does not fail the proposal: `blocks_proposed_total`

@@ -61,6 +61,12 @@ use crate::error::{BeaconNodeFailure, Error, Result};
 /// a stalled request could then outlive the slot it was serving.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// How long `register_validator` may take. Longer than [`REQUEST_TIMEOUT`]
+/// because an ethlambda node forwards the registrations to its relay and waits
+/// up to 10 s for the answer before replying; a client that gave up at 8 s
+/// would report a failure for a registration the node went on to install.
+const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(12);
+
 /// What an SSZ answer carries besides its bytes: the fork, which only a header
 /// can say, and the two booleans the block endpoints use to say what the bytes
 /// are.
@@ -148,10 +154,26 @@ impl HttpBeaconNode {
         body: &B,
         consensus_version: Option<&str>,
     ) -> Result<()> {
+        self.post_no_content_within(path, body, consensus_version, None)
+            .await
+    }
+
+    /// [`Self::post_no_content`] with `timeout` in place of the client's
+    /// default, when given.
+    async fn post_no_content_within<B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+        consensus_version: Option<&str>,
+        timeout: Option<Duration>,
+    ) -> Result<()> {
         let url = format!("{}{path}", self.base_url);
         let mut request = self.client.post(&url).json(body);
         if let Some(version) = consensus_version {
             request = request.header("Eth-Consensus-Version", version);
+        }
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
         }
         let response = request.send().await.map_err(|err| Error::BeaconNode {
             url: url.clone(),
@@ -167,6 +189,30 @@ impl HttpBeaconNode {
             status: status.as_u16(),
             body,
         })
+    }
+
+    /// POST an SSZ body with the fork it is for, returning the URL beside the
+    /// outcome so each caller maps a transport failure its own way: a full
+    /// block's is an ordinary error, a blinded block's may be unconfirmed.
+    async fn post_ssz_body(
+        &self,
+        path: &str,
+        fork: ForkName,
+        body: &[u8],
+    ) -> (
+        String,
+        std::result::Result<reqwest::Response, reqwest::Error>,
+    ) {
+        let url = format!("{}{path}", self.base_url);
+        let sent = self
+            .client
+            .post(&url)
+            .header("Eth-Consensus-Version", fork.as_str())
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(body.to_vec())
+            .send()
+            .await;
+        (url, sent)
     }
 
     /// Fetch a body as SSZ, returning the fork the node named alongside it.
@@ -665,21 +711,14 @@ impl BeaconNodeApi for HttpBeaconNode {
     /// 202 is not an error and not a clean success, so it is neither mapped to
     /// `Err` nor flattened into `Ok(())`. See [`Published`].
     async fn publish_block(&self, fork: ForkName, body: &[u8]) -> Result<Published> {
-        let path = "/eth/v2/beacon/blocks";
-        let url = format!("{}{path}", self.base_url);
-        let response = self
-            .client
-            .post(&url)
-            .header("Eth-Consensus-Version", fork.as_str())
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .body(body.to_vec())
-            .send()
-            .await
-            .map_err(|err| Error::BeaconNode {
-                url: url.clone(),
-                failure: BeaconNodeFailure::classify(&err),
-                detail: err.to_string(),
-            })?;
+        let (url, sent) = self
+            .post_ssz_body("/eth/v2/beacon/blocks", fork, body)
+            .await;
+        let response = sent.map_err(|err| Error::BeaconNode {
+            url: url.clone(),
+            failure: BeaconNodeFailure::classify(&err),
+            detail: err.to_string(),
+        })?;
 
         let status = response.status();
         if status == StatusCode::ACCEPTED {
@@ -697,27 +736,37 @@ impl BeaconNodeApi for HttpBeaconNode {
 
     /// Maps the answer as the trait's contract says: 2xx is handed to the
     /// builder (202 is the node's broadcast-without-import, as for a full
-    /// block), a 4xx is a definite refusal, and a 5xx or a transport failure
-    /// is [`Error::BlindedUnconfirmed`], since the relay may still publish.
+    /// block), and a 4xx is a definite refusal.
+    ///
+    /// Two cases that look like failures are also definite, because the node
+    /// cannot have acted on the block: a connection error (the request never
+    /// left) and a 503 (the node is syncing, and refuses before it hands
+    /// anything to a builder). Every other 5xx, and any failure after the
+    /// request was sent (a timeout, a reset), is [`Error::BlindedUnconfirmed`],
+    /// since the relay may still publish.
     async fn publish_blinded_block(
         &self,
         _slot: Slot,
         fork: ForkName,
         body: &[u8],
     ) -> Result<Published> {
-        let url = format!("{}/eth/v2/beacon/blinded_blocks", self.base_url);
-        let response = self
-            .client
-            .post(&url)
-            .header("Eth-Consensus-Version", fork.as_str())
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .body(body.to_vec())
-            .send()
-            .await
-            .map_err(|err| Error::BlindedUnconfirmed {
-                status: None,
-                detail: format!("{url}: {err}"),
-            })?;
+        let (url, sent) = self
+            .post_ssz_body("/eth/v2/beacon/blinded_blocks", fork, body)
+            .await;
+        let response = sent.map_err(|err| {
+            if err.is_connect() {
+                Error::BeaconNode {
+                    url: url.clone(),
+                    failure: BeaconNodeFailure::classify(&err),
+                    detail: err.to_string(),
+                }
+            } else {
+                Error::BlindedUnconfirmed {
+                    status: None,
+                    detail: format!("{url}: {err}"),
+                }
+            }
+        })?;
 
         let status = response.status();
         if status == StatusCode::ACCEPTED {
@@ -727,7 +776,7 @@ impl BeaconNodeApi for HttpBeaconNode {
             return Ok(Published::HandedToBuilder);
         }
         let body = response.text().await.unwrap_or_default();
-        if status.is_server_error() {
+        if status.is_server_error() && status != StatusCode::SERVICE_UNAVAILABLE {
             return Err(Error::BlindedUnconfirmed {
                 status: Some(status.as_u16()),
                 detail: format!("{url} answered {status}: {body}"),
@@ -747,8 +796,15 @@ impl BeaconNodeApi for HttpBeaconNode {
         if registrations.is_empty() {
             return Ok(());
         }
-        self.post_no_content("/eth/v1/validator/register_validator", &registrations, None)
-            .await
+        // Its own timeout: the node waits up to 10 s on the relay before it
+        // answers, which is longer than every other request's default.
+        self.post_no_content_within(
+            "/eth/v1/validator/register_validator",
+            &registrations,
+            None,
+            Some(REGISTRATION_TIMEOUT),
+        )
+        .await
     }
 
     async fn execution_payload_envelope(
@@ -1253,10 +1309,10 @@ mod tests {
         assert_eq!(value["builders"], serde_json::json!([]));
     }
 
-    /// A one-route Beacon API double: whatever the handler sees is pushed to
-    /// `seen` as (uri, body), and the answer is `status` with `headers` and
-    /// `reply` as the body.
-    type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+    /// A Beacon API double that answers every route the same way: whatever
+    /// the handler sees is pushed to `seen` as (uri, body, request headers),
+    /// and the answer is `status` with `headers` and `reply` as the body.
+    type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>, axum::http::HeaderMap)>>>;
     type Canned = (Seen, u16, Vec<(&'static str, &'static str)>, Vec<u8>);
 
     struct Served {
@@ -1276,11 +1332,14 @@ mod tests {
 
         let seen: Seen = Default::default();
         let state = (seen.clone(), status, headers, reply);
-        let handler = |State(state): State<Canned>, uri: Uri, body: Bytes| async move {
+        let handler = |State(state): State<Canned>,
+                       uri: Uri,
+                       request_headers: axum::http::HeaderMap,
+                       body: Bytes| async move {
             let (seen, status, headers, reply) = state;
             seen.lock()
                 .expect("lock")
-                .push((uri.to_string(), body.to_vec()));
+                .push((uri.to_string(), body.to_vec(), request_headers));
             let mut response = (
                 axum::http::StatusCode::from_u16(status).expect("a status"),
                 reply,
@@ -1426,6 +1485,8 @@ mod tests {
             let seen = served.seen.lock().expect("lock");
             assert!(seen[0].0.ends_with("/eth/v2/beacon/blinded_blocks"));
             assert_eq!(seen[0].1, vec![1, 2, 3]);
+            assert_eq!(seen[0].2["eth-consensus-version"], "fulu");
+            assert_eq!(seen[0].2["content-type"], "application/octet-stream");
         }
 
         let served = serve(400, vec![], b"bad".to_vec()).await;
@@ -1457,16 +1518,30 @@ mod tests {
         );
     }
 
+    /// The request never left, so the relay cannot have the block: a definite
+    /// failure, not an unconfirmed one.
     #[tokio::test]
-    async fn a_blinded_publish_that_cannot_connect_is_unconfirmed() {
+    async fn a_blinded_publish_that_cannot_connect_is_a_definite_failure() {
         // Nothing listens on port 1.
         let node = HttpBeaconNode::new("http://127.0.0.1:1").expect("builds");
         let err = node
             .publish_blinded_block(5, ForkName::Fulu, &[1])
             .await
             .expect_err("no answer");
+        assert!(matches!(err, Error::BeaconNode { .. }), "got {err:?}");
+    }
+
+    /// A syncing node refuses before it hands anything to a builder.
+    #[tokio::test]
+    async fn a_blinded_publish_to_a_syncing_node_is_a_definite_failure() {
+        let served = serve(503, vec![], b"syncing".to_vec()).await;
+        let err = served
+            .node
+            .publish_blinded_block(5, ForkName::Fulu, &[1])
+            .await
+            .expect_err("refused");
         assert!(
-            matches!(err, Error::BlindedUnconfirmed { status: None, .. }),
+            matches!(err, Error::BeaconNodeStatus { status: 503, .. }),
             "got {err:?}"
         );
     }

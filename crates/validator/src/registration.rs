@@ -33,10 +33,27 @@
 //! # Failures are never propagated
 //!
 //! A missed registration costs at most a builder block, never a duty, so a
-//! failed send is logged and counted and the caller moves on.
+//! failed send is logged and counted and the caller moves on. A changed
+//! registration whose send fails is cached anyway, so it is not re-sent at the
+//! next slot: it waits for the next epoch's full send.
+//!
+//! # Signing stays off the async runtime
+//!
+//! The first epoch signs one BLS signature per validator. That runs on the
+//! blocking pool in chunks of [`SIGN_CHUNK`], taking the store's read lock
+//! afresh for each chunk, so neither the runtime's threads nor a queued
+//! keymanager writer wait on thousands of signatures.
+//!
+//! # The per-slot check is one atomic read
+//!
+//! Only a keymanager write changes what a registration says, so
+//! [`RegistrationService::register_changed`] compares
+//! [`ProposerSettings::generation`] with the one it last signed against and
+//! returns before touching the store when it has not moved.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ethlambda_types::beacon::builder::{SignedValidatorRegistrationV1, ValidatorRegistrationV1};
@@ -46,6 +63,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
 use crate::beacon_node::BeaconNodeApi;
+use crate::beacon_node::dto::encode_hex;
 use crate::keys::ValidatorStore;
 use crate::proposer_settings::ProposerSettings;
 use crate::signing::SigningContext;
@@ -54,6 +72,9 @@ use crate::signing::SigningContext;
 /// thousand validators take a handful of requests, small enough that one
 /// request stays well under a node's body limit.
 pub const REGISTRATION_BATCH: usize = 500;
+
+/// Keys signed per blocking task, and so per hold of the store's read lock.
+const SIGN_CHUNK: usize = 64;
 
 /// What [`RegistrationService::current`] found for a set of validators.
 struct Current {
@@ -66,6 +87,14 @@ struct Current {
     no_fee_recipient: usize,
 }
 
+impl Current {
+    fn extend(&mut self, other: Current) {
+        self.all.extend(other.all);
+        self.changed.extend(other.changed);
+        self.no_fee_recipient += other.no_fee_recipient;
+    }
+}
+
 /// Signs and sends builder registrations.
 pub struct RegistrationService<B> {
     beacon_node: Arc<B>,
@@ -75,9 +104,12 @@ pub struct RegistrationService<B> {
     known: std::sync::Mutex<Vec<BlsPubkey>>,
     /// The latest signed registration per validator.
     signed: std::sync::Mutex<HashMap<BlsPubkey, SignedValidatorRegistrationV1>>,
+    /// The [`ProposerSettings::generation`] the cache was last brought up to
+    /// date against.
+    signed_generation: AtomicU64,
 }
 
-impl<B: BeaconNodeApi> RegistrationService<B> {
+impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
     pub fn new(
         beacon_node: Arc<B>,
         context: Arc<SigningContext>,
@@ -89,6 +121,7 @@ impl<B: BeaconNodeApi> RegistrationService<B> {
             settings,
             known: std::sync::Mutex::new(Vec::new()),
             signed: std::sync::Mutex::new(HashMap::new()),
+            signed_generation: AtomicU64::new(0),
         }
     }
 
@@ -134,7 +167,7 @@ impl<B: BeaconNodeApi> RegistrationService<B> {
             let signature = match self.context.sign_validator_registration(store, &message) {
                 Ok(signature) => signature,
                 Err(err) => {
-                    warn!(validator = ?pubkey, %err, "Could not sign a builder registration; skipping it");
+                    warn!(pubkey = %encode_hex(&pubkey.0), %err, "Could not sign a builder registration; skipping it");
                     continue;
                 }
             };
@@ -157,29 +190,63 @@ impl<B: BeaconNodeApi> RegistrationService<B> {
             .map_or(0, |elapsed| elapsed.as_secs())
     }
 
+    /// [`Self::current`] over `pubkeys`, off the async runtime, [`SIGN_CHUNK`]
+    /// keys per blocking task with the store's read lock taken per chunk.
+    async fn current_blocking(
+        self: &Arc<Self>,
+        store: &Arc<RwLock<ValidatorStore>>,
+        pubkeys: &[BlsPubkey],
+    ) -> Current {
+        let now_secs = Self::now_secs();
+        let mut current = Current {
+            all: Vec::with_capacity(pubkeys.len()),
+            changed: Vec::new(),
+            no_fee_recipient: 0,
+        };
+        for chunk in pubkeys.chunks(SIGN_CHUNK) {
+            let (service, store, chunk) = (self.clone(), store.clone(), chunk.to_vec());
+            let part = tokio::task::spawn_blocking(move || {
+                let store = store.blocking_read();
+                service.current(&store, &chunk, now_secs)
+            })
+            .await;
+            match part {
+                Ok(part) => current.extend(part),
+                Err(err) => warn!(%err, "Signing builder registrations failed; skipping a chunk"),
+            }
+        }
+        current
+    }
+
     /// Register every validator in `pubkeys`, the ones the beacon node resolved
     /// at this epoch's refresh. Called once per epoch.
+    ///
+    /// Also forgets any validator no longer in `pubkeys`, so a key the
+    /// keymanager removed stops being re-signed (and warned about) every slot.
     pub async fn register_all(
-        &self,
+        self: Arc<Self>,
         epoch: Epoch,
         pubkeys: Vec<BlsPubkey>,
-        store: &RwLock<ValidatorStore>,
+        store: Arc<RwLock<ValidatorStore>>,
     ) {
         if self.is_gloas(epoch) {
             return;
         }
+        // Read before signing, so a change that lands while this runs is seen
+        // by the next `register_changed` rather than lost.
+        let generation = self.settings.generation();
+        let current_keys: HashSet<BlsPubkey> = pubkeys.iter().copied().collect();
+        self.signed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|pubkey, _| current_keys.contains(pubkey));
         *self
             .known
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = pubkeys.clone();
 
-        // Scoped away from the sends below, as `proposal.rs` does: a held read
-        // guard across a network call lets a queued keymanager writer block
-        // every reader behind it.
-        let current = {
-            let store = store.read().await;
-            self.current(&store, &pubkeys, Self::now_secs())
-        };
+        let current = self.current_blocking(&store, &pubkeys).await;
+        self.signed_generation.store(generation, Ordering::Release);
         if current.no_fee_recipient > 0 {
             warn!(
                 skipped = current.no_fee_recipient,
@@ -194,10 +261,21 @@ impl<B: BeaconNodeApi> RegistrationService<B> {
     /// [`Self::register_all`] was given. Called every slot, so a keymanager
     /// change reaches the builder within a slot rather than an epoch.
     ///
+    /// Returns before touching the store when no setting was written since the
+    /// last signing: see the module doc.
+    ///
     /// Silent about validators with no fee recipient: that is reported once
     /// per epoch by [`Self::register_all`], not repeated every slot.
-    pub async fn register_changed(&self, epoch: Epoch, store: &RwLock<ValidatorStore>) {
+    pub async fn register_changed(
+        self: Arc<Self>,
+        epoch: Epoch,
+        store: Arc<RwLock<ValidatorStore>>,
+    ) {
         if self.is_gloas(epoch) {
+            return;
+        }
+        let generation = self.settings.generation();
+        if generation == self.signed_generation.load(Ordering::Acquire) {
             return;
         }
         let known = self
@@ -208,10 +286,8 @@ impl<B: BeaconNodeApi> RegistrationService<B> {
         if known.is_empty() {
             return;
         }
-        let current = {
-            let store = store.read().await;
-            self.current(&store, &known, Self::now_secs())
-        };
+        let current = self.current_blocking(&store, &known).await;
+        self.signed_generation.store(generation, Ordering::Release);
         if current.changed.is_empty() {
             return;
         }
@@ -273,10 +349,17 @@ mod tests {
     fn service(
         config: Config,
         settings: Arc<ProposerSettings>,
-    ) -> (RegistrationService<MockBeaconNode>, Arc<MockBeaconNode>) {
+    ) -> (
+        Arc<RegistrationService<MockBeaconNode>>,
+        Arc<MockBeaconNode>,
+    ) {
         let node = Arc::new(MockBeaconNode::new());
         (
-            RegistrationService::new(node.clone(), context(config), settings),
+            Arc::new(RegistrationService::new(
+                node.clone(),
+                context(config),
+                settings,
+            )),
             node,
         )
     }
@@ -346,11 +429,12 @@ mod tests {
     /// 501 keys is one more than a batch; signing them is a millisecond each.
     #[tokio::test]
     async fn register_all_sends_in_batches_of_500() {
+        assert_eq!(REGISTRATION_BATCH, 500);
         let (store, pubkeys) = store_with_keys(REGISTRATION_BATCH + 1);
         let (service, node) = service(Config::mainnet(), settings(Some(H160([0xab; 20]))));
-        let store = RwLock::new(store);
+        let store = Arc::new(RwLock::new(store));
 
-        service.register_all(0, pubkeys, &store).await;
+        service.register_all(0, pubkeys, store).await;
 
         assert_eq!(
             *node.registration_batches.lock().expect("lock"),
@@ -372,6 +456,9 @@ mod tests {
         );
     }
 
+    /// Both entry points stop at gloas, and `register_changed` is checked with
+    /// something to send: a service that was filled before the fork and then
+    /// had a setting changed.
     #[tokio::test]
     async fn nothing_is_sent_at_or_after_gloas() {
         let (store, pubkeys) = store_with_keys(2);
@@ -379,16 +466,32 @@ mod tests {
             gloas_fork_epoch: 4,
             ..Config::mainnet()
         };
-        let (service, node) = service(config, settings(Some(H160([0xab; 20]))));
-        let store = RwLock::new(store);
+        let settings = settings(Some(H160([0xab; 20])));
+        let (service, node) = service(config, settings.clone());
+        let store = Arc::new(RwLock::new(store));
 
-        service.register_all(4, pubkeys.clone(), &store).await;
-        service.register_changed(5, &store).await;
-        assert!(node.registration_batches.lock().expect("lock").is_empty());
-
-        // The epoch before the fork still registers.
-        service.register_all(3, pubkeys, &store).await;
+        // Before the fork the service registers, and holds the keys.
+        service
+            .clone()
+            .register_all(3, pubkeys.clone(), store.clone())
+            .await;
         assert_eq!(*node.registration_batches.lock().expect("lock"), vec![2]);
+
+        settings.set_gas_limit(&pubkeys[0], 30_000_000);
+        service
+            .clone()
+            .register_all(4, pubkeys, store.clone())
+            .await;
+        service.clone().register_changed(5, store.clone()).await;
+        assert_eq!(
+            *node.registration_batches.lock().expect("lock"),
+            vec![2],
+            "a changed key is still not sent at or after the fork"
+        );
+
+        // The same change is sent when the epoch is before the fork.
+        service.register_changed(3, store).await;
+        assert_eq!(*node.registration_batches.lock().expect("lock"), vec![2, 1]);
     }
 
     #[tokio::test]
@@ -396,10 +499,13 @@ mod tests {
         let (store, pubkeys) = store_with_keys(3);
         let settings = settings(Some(H160([0xab; 20])));
         let (service, node) = service(Config::mainnet(), settings.clone());
-        let store = RwLock::new(store);
+        let store = Arc::new(RwLock::new(store));
 
-        service.register_all(0, pubkeys.clone(), &store).await;
-        service.register_changed(0, &store).await;
+        service
+            .clone()
+            .register_all(0, pubkeys.clone(), store.clone())
+            .await;
+        service.clone().register_changed(0, store.clone()).await;
         assert_eq!(
             *node.registration_batches.lock().expect("lock"),
             vec![3],
@@ -407,11 +513,59 @@ mod tests {
         );
 
         settings.set_gas_limit(&pubkeys[2], 30_000_000);
-        service.register_changed(0, &store).await;
+        service.register_changed(0, store).await;
 
         let registrations = node.registrations.lock().expect("lock");
         assert_eq!(registrations.len(), 4);
         assert_eq!(registrations[3].message.pubkey, pubkeys[2]);
         assert_eq!(registrations[3].message.gas_limit, 30_000_000);
+    }
+
+    /// The per-slot call is one atomic read when no setting moved: with the
+    /// store write-locked, so any read of it would wait forever, it still
+    /// returns at once, and sends nothing.
+    #[tokio::test]
+    async fn a_slot_with_no_change_makes_no_store_read_and_no_send() {
+        let (store, pubkeys) = store_with_keys(2);
+        let (service, node) = service(Config::mainnet(), settings(Some(H160([0xab; 20]))));
+        let store = Arc::new(RwLock::new(store));
+        service
+            .clone()
+            .register_all(0, pubkeys, store.clone())
+            .await;
+        let signed_before = service.signed.lock().expect("lock").clone();
+
+        let _writer = store.write().await;
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            service.clone().register_changed(0, store.clone()),
+        )
+        .await
+        .expect("returns without waiting on the store");
+
+        assert_eq!(*node.registration_batches.lock().expect("lock"), vec![2]);
+        assert_eq!(*service.signed.lock().expect("lock"), signed_before);
+    }
+
+    /// A key that left the resolved set is dropped from the cache, so it is not
+    /// re-signed (and warned about) at every change.
+    #[tokio::test]
+    async fn a_key_no_longer_resolved_is_forgotten() {
+        let (store, pubkeys) = store_with_keys(2);
+        let (service, _node) = service(Config::mainnet(), settings(Some(H160([0xab; 20]))));
+        let store = Arc::new(RwLock::new(store));
+
+        service
+            .clone()
+            .register_all(0, pubkeys.clone(), store.clone())
+            .await;
+        service
+            .clone()
+            .register_all(0, vec![pubkeys[1]], store)
+            .await;
+
+        let signed = service.signed.lock().expect("lock");
+        assert_eq!(signed.keys().copied().collect::<Vec<_>>(), vec![pubkeys[1]]);
+        assert_eq!(*service.known.lock().expect("lock"), vec![pubkeys[1]]);
     }
 }

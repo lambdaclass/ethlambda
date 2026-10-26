@@ -62,10 +62,10 @@ use tracing::{error, info, warn};
 
 use crate::aggregation::AggregationService;
 use crate::attestation::AttestationService;
-use crate::beacon_node::BeaconNodeApi;
 use crate::beacon_node::dto::ProposerPreparationDto;
 use crate::beacon_node::fallback::FallbackBeaconNode;
 use crate::beacon_node::http::HttpBeaconNode;
+use crate::beacon_node::{BeaconNodeApi, Published};
 use crate::duties::DutiesService;
 use crate::keys::ValidatorStore;
 use crate::payload_attestation::PayloadAttestationService;
@@ -304,10 +304,21 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                 &settings,
                 &store,
                 &context,
-                registration.as_ref().map(|service| (service, &store)),
             );
             match refreshed.await {
-                Ok(()) => last_epoch = Some(epoch),
+                Ok(resolved) => {
+                    last_epoch = Some(epoch);
+                    // Only after a refresh that got all the way through, so a
+                    // failing one does not respawn a full send every slot, and
+                    // spawned so a slow or hung node never delays this epoch's
+                    // duties: a missed registration costs at most a builder
+                    // block, never a duty.
+                    if let Some(registration) = &registration {
+                        let registration = registration.clone();
+                        let store = store.clone();
+                        tokio::spawn(registration.register_all(epoch, resolved, store));
+                    }
+                }
                 // A beacon node that is down, syncing or answering badly will
                 // likely answer next epoch, so keep the schedule already held
                 // and try again. Anything else will not fix itself, and looping
@@ -367,9 +378,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         // to a fee recipient or gas limit reaches the builder within a slot,
         // and a slow node cannot delay the next slot's duties.
         if let Some(registration) = &registration {
-            let registration = registration.clone();
-            let store = store.clone();
-            tokio::spawn(async move { registration.register_changed(epoch, &store).await });
+            tokio::spawn(registration.clone().register_changed(epoch, store.clone()));
         }
     }
 }
@@ -666,7 +675,7 @@ async fn aggregate<B: BeaconNodeApi>(
 /// Failures are logged and counted rather than propagated. A proposal is one
 /// slot's work; losing it must not stop the client attesting for the rest of
 /// the epoch.
-async fn propose<B: BeaconNodeApi>(
+async fn propose<B: BeaconNodeApi + 'static>(
     proposal: &ProposalService<B>,
     clock: &SlotClock,
     slot: u64,
@@ -676,6 +685,10 @@ async fn propose<B: BeaconNodeApi>(
     let budget = clock.until_attestation(slot, SystemTime::now());
     let attempt = tokio::time::timeout(budget, proposal.propose(slot, duty, store));
     match attempt.await {
+        // Already logged at error and counted on its own series; the block
+        // may well be out, so it is neither a published-in-time delay nor a
+        // failure.
+        Ok(Ok(Published::BuilderUnconfirmed)) => {}
         Ok(Ok(_)) => {
             let elapsed = SystemTime::now()
                 .duration_since(clock.start_of(slot))
@@ -685,6 +698,18 @@ async fn propose<B: BeaconNodeApi>(
         Ok(Err(err)) => {
             error!(%slot, validator = duty.validator_index, %err, "Failed to propose this slot's block");
             metrics::inc_block_proposal_failures();
+        }
+        // A blinded block is signed, and its publish runs on its own task: the
+        // beacon node waits up to 5 s for the relay, which can outlast this
+        // budget. That is not a missed proposal, and the task counts the real
+        // outcome.
+        Err(_) if proposal.signed_blinded_at(slot) => {
+            info!(
+                %slot,
+                validator = duty.validator_index,
+                budget_ms = budget.as_millis() as u64,
+                "Blinded block signed; its publish outlived the proposal budget and continues"
+            );
         }
         Err(_) => {
             warn!(
@@ -698,20 +723,12 @@ async fn propose<B: BeaconNodeApi>(
     }
 }
 
-/// What `refresh_epoch` needs to hand a spawned task the builder registration:
-/// the service and the store it signs from, both shared, since the task
-/// outlives the call.
-type RegistrationHandles<'a, B> = (
-    &'a Arc<RegistrationService<B>>,
-    &'a Arc<RwLock<ValidatorStore>>,
-);
-
 /// Resolve any newly activated validators, refresh the duty schedule, and
-///
-/// With `registration`, also spawns the epoch's full builder registration.
 /// re-send subnet subscriptions if it moved.
-#[allow(clippy::too_many_arguments)]
-async fn refresh_epoch<B: BeaconNodeApi + 'static>(
+///
+/// Returns the pubkeys the beacon node resolved to an index, which is who a
+/// builder registration is signed for: the node drops the rest anyway.
+async fn refresh_epoch<B: BeaconNodeApi>(
     beacon_node: &Arc<B>,
     duties: &mut DutiesService<B>,
     pubkeys: &[BlsPubkey],
@@ -719,13 +736,12 @@ async fn refresh_epoch<B: BeaconNodeApi + 'static>(
     settings: &ProposerSettings,
     store: &RwLock<ValidatorStore>,
     context: &SigningContext,
-    registration: Option<RegistrationHandles<'_, B>>,
-) -> Result<()> {
+) -> Result<Vec<BlsPubkey>> {
     // Nothing to resolve, nothing to schedule, nothing to register. Returning
     // here also keeps an empty pubkey list away from `validator_indices`, whose
     // endpoint reads one as "every validator on the chain".
     if pubkeys.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     if beacon_node.is_optimistic_or_syncing().await? {
@@ -788,16 +804,6 @@ async fn refresh_epoch<B: BeaconNodeApi + 'static>(
         );
     }
 
-    // Spawned, so a slow or hung node never delays this epoch's duties: a
-    // missed registration costs at most a builder block, never a duty. Only
-    // the validators the node resolved are registered; it would drop the rest.
-    if let Some((registration, store)) = registration {
-        let registration = registration.clone();
-        let store = store.clone();
-        let registered: Vec<BlsPubkey> = entries.iter().map(|entry| entry.pubkey).collect();
-        tokio::spawn(async move { registration.register_all(epoch, registered, &store).await });
-    }
-
     let changed = duties.refresh_around(epoch).await?;
     refresh_ptc(duties, epoch, context).await;
     refresh_sync(beacon_node, duties, epoch, context).await;
@@ -806,7 +812,7 @@ async fn refresh_epoch<B: BeaconNodeApi + 'static>(
         subscriptions::subscribe(beacon_node, &duties.all(), store, context).await?;
     }
     metrics::set_beacon_node_available(true);
-    Ok(())
+    Ok(entries.iter().map(|entry| entry.pubkey).collect())
 }
 
 /// Fetch the payload timeliness committee schedule for this epoch and the next,
@@ -956,7 +962,6 @@ mod tests {
             settings,
             &empty_store(),
             &context(),
-            None,
         )
         .await
         .expect("refreshes");
@@ -1055,7 +1060,6 @@ mod tests {
             &settings(Some(H160([0xab; 20]))),
             &empty_store(),
             &context(),
-            None,
         )
         .await
         .expect("the refresh must survive a failed registration");
@@ -1082,7 +1086,6 @@ mod tests {
             &settings(Some(H160([0xab; 20]))),
             &empty_store(),
             &context(),
-            None,
         )
         .await
         .expect("a keyless client idles rather than failing");
@@ -1165,7 +1168,6 @@ mod tests {
             &settings(None),
             &empty_store(),
             &gloas_context(4),
-            None,
         )
         .await
         .expect("refreshes");
@@ -1187,7 +1189,6 @@ mod tests {
             &settings(None),
             &empty_store(),
             &context(),
-            None,
         )
         .await
         .expect("refreshes");
@@ -1212,7 +1213,6 @@ mod tests {
             &settings(None),
             &empty_store(),
             &gloas_context(0),
-            None,
         )
         .await
         .expect("the refresh survives it");
@@ -1320,7 +1320,6 @@ mod tests {
                 &settings(None),
                 &empty_store(),
                 &altair_context(),
-                None,
             )
             .await
             .expect("refreshes");
@@ -1362,7 +1361,6 @@ mod tests {
             &settings(None),
             &empty_store(),
             &altair_context(),
-            None,
         )
         .await
         .expect("the refresh survives it");

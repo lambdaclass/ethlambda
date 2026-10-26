@@ -130,7 +130,18 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
     /// unreachable node must not stop the reachable ones being told. A failure
     /// is logged per node so a partially-registered client is visible rather
     /// than silent.
-    async fn try_all<'p, F>(&'p self, what: &'static str, call: F) -> Result<()>
+    ///
+    /// `node_effect` says what a refusing node costs (said once per refusal);
+    /// `all_failed` says what it costs when none accepts, or is `None` when the
+    /// caller reports that itself, so a duty that did not depend on the call is
+    /// not claimed missed.
+    async fn try_all<'p, F>(
+        &'p self,
+        what: &'static str,
+        node_effect: &'static str,
+        all_failed: Option<&'static str>,
+        call: F,
+    ) -> Result<()>
     where
         F: Fn(&'p B) -> BoxFuture<'p, Result<()>>,
     {
@@ -140,7 +151,7 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
             match call(node).await {
                 Ok(()) => accepted += 1,
                 Err(err) => {
-                    warn!(%what, position, %err, "Beacon node did not accept; it will be unprepared for this duty");
+                    warn!(%what, position, %err, node_effect, "Beacon node did not accept");
                     last = Some(err);
                 }
             }
@@ -151,7 +162,9 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
         let detail = last
             .map(|err| err.to_string())
             .unwrap_or_else(|| "no nodes configured".to_string());
-        warn!(%what, %detail, "No configured beacon node accepted; duty likely missed");
+        if let Some(all_failed) = all_failed {
+            warn!(%what, %detail, all_failed, "No configured beacon node accepted");
+        }
         Err(Error::AllBeaconNodesFailed(detail))
     }
 }
@@ -320,9 +333,12 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
         &self,
         registrations: &[SignedValidatorRegistrationV1],
     ) -> Result<()> {
-        self.try_all("register_validators", |node| {
-            node.register_validators(registrations)
-        })
+        self.try_all(
+            "register_validators",
+            "it will not hold these registrations",
+            None,
+            |node| node.register_validators(registrations),
+        )
         .await
     }
 
@@ -422,9 +438,12 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
     /// that was never told where to pay builds a payload paying somewhere else,
     /// and it is the node this client falls over to that needs telling most.
     async fn prepare_beacon_proposer(&self, preparations: &[ProposerPreparationDto]) -> Result<()> {
-        self.try_all("prepare_beacon_proposer", |node| {
-            node.prepare_beacon_proposer(preparations)
-        })
+        self.try_all(
+            "prepare_beacon_proposer",
+            "it will be unprepared for this duty",
+            Some("duty likely missed"),
+            |node| node.prepare_beacon_proposer(preparations),
+        )
         .await
     }
 
@@ -433,9 +452,12 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
     /// the votes an aggregate is folded from, so a node that never received one
     /// answers 404 for every committee this client asks about.
     async fn subscribe_committees(&self, subscriptions: &[CommitteeSubscriptionDto]) -> Result<()> {
-        self.try_all("subscribe_committees", |node| {
-            node.subscribe_committees(subscriptions)
-        })
+        self.try_all(
+            "subscribe_committees",
+            "it will be unprepared for this duty",
+            Some("duty likely missed"),
+            |node| node.subscribe_committees(subscriptions),
+        )
         .await
     }
 
@@ -496,9 +518,12 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
         &self,
         subscriptions: &[SyncCommitteeSubscriptionDto],
     ) -> Result<()> {
-        self.try_all("subscribe_sync_committees", |node| {
-            node.subscribe_sync_committees(subscriptions)
-        })
+        self.try_all(
+            "subscribe_sync_committees",
+            "it will be unprepared for this duty",
+            Some("duty likely missed"),
+            |node| node.subscribe_sync_committees(subscriptions),
+        )
         .await
     }
 }

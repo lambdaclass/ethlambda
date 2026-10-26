@@ -534,10 +534,21 @@ mod tests {
         }
     }
 
+    /// A context whose genesis validators root is not zero, so the builder
+    /// domain (which zeroes it) and a context-derived one cannot coincide.
+    fn context_with_validators_root() -> SigningContext {
+        SigningContext {
+            config: Config::mainnet(),
+            genesis_validators_root: Root::repeat_byte(0x42),
+        }
+    }
+
     #[test]
     fn a_registration_is_signed_under_the_builder_domain() {
+        use ethlambda_types::beacon::constants::DOMAIN_APPLICATION_BUILDER;
+
         let (store, pubkey) = store_with_key();
-        let context = context();
+        let context = context_with_validators_root();
         let registration = registration(pubkey);
 
         let signature = context
@@ -549,6 +560,14 @@ mod tests {
             compute_builder_domain(Config::mainnet().genesis_fork_version),
         );
         assert!(verify(&pubkey, &signature, root));
+
+        // The same domain type under this chain's validators root is a
+        // different domain: a context-derived one would not verify.
+        let with_root = compute_signing_root(
+            registration.hash_tree_root(),
+            context.domain(DOMAIN_APPLICATION_BUILDER, 0),
+        );
+        assert!(!verify(&pubkey, &signature, with_root));
     }
 
     /// The registration domain is not gloas's envelope domain, whose type
@@ -557,7 +576,7 @@ mod tests {
     #[test]
     fn a_registration_does_not_verify_under_the_envelope_domain() {
         let (store, pubkey) = store_with_key();
-        let context = context();
+        let context = context_with_validators_root();
         let registration = registration(pubkey);
 
         let signature = context

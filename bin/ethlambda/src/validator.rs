@@ -89,7 +89,7 @@ pub(crate) struct ValidatorOptions {
 
     /// How a builder's bid is weighed against the local payload: the local
     /// payload wins iff `local >= factor * bid / 100`. 100 compares them as
-    /// they are; 0 always builds locally.
+    /// they are; 0 prefers the local payload unless it cannot be built.
     #[arg(
         long,
         default_value = "100",
@@ -98,7 +98,8 @@ pub(crate) struct ValidatorOptions {
     )]
     pub(crate) builder_boost_factor: u64,
 
-    /// Take the builder's block whenever there is a valid bid (sends
+    /// Take the builder's block whenever there is a valid bid, unless the
+    /// execution client asks to override the builder (sends
     /// `builder_boost_factor = u64::MAX`).
     #[arg(long, default_value = "false", requires = "builder_proposals")]
     pub(crate) prefer_builder_proposals: bool,

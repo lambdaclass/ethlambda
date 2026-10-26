@@ -71,6 +71,10 @@ pub enum Error {
     /// publishes on receipt, so the block may well be on the network. Nothing
     /// can safely be retried: the slot is signed, and a second block for it
     /// would be an equivocation. `status` is `None` for a transport failure.
+    ///
+    /// Classified retryable like the other beacon-node errors, but that governs
+    /// only whether the next duty is attempted, not this block: it is never
+    /// sent again.
     #[error(
         "the beacon node did not confirm the blinded block (it may still be published): {detail}"
     )]

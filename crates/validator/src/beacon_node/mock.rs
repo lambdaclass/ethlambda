@@ -96,6 +96,9 @@ pub struct MockBeaconNode {
     /// What `publish_blinded_block` reports. `None` is `Ok(HandedToBuilder)`;
     /// `Err(detail)` is a `BlindedUnconfirmed` carrying `detail`.
     pub blinded_publish_outcome: Option<std::result::Result<Published, String>>,
+    /// When set, `publish_blinded_block` answers with this status as a node
+    /// that definitely refused the block (a 4xx) does: `BeaconNodeStatus`.
+    pub blinded_publish_refusal: Option<u16>,
 
     /// What the test asserts against.
     pub submitted: Mutex<Vec<SingleAttestationDto>>,
@@ -286,6 +289,13 @@ impl MockBeaconNode {
     /// block, carrying `detail`.
     pub fn with_unconfirmed_blinded_publish(mut self, detail: &str) -> Self {
         self.blinded_publish_outcome = Some(Err(detail.to_string()));
+        self
+    }
+
+    /// Make `publish_blinded_block` fail as a node that definitely refused the
+    /// block, with `status`.
+    pub fn with_refused_blinded_publish(mut self, status: u16) -> Self {
+        self.blinded_publish_refusal = Some(status);
         self
     }
 
@@ -711,7 +721,20 @@ impl BeaconNodeApi for MockBeaconNode {
         fork: ForkName,
         body: &[u8],
     ) -> Result<Published> {
-        self.guard("publish_blinded_block")?;
+        // `failures` and `fail_everything` stand for a node that could not be
+        // reached or answered badly: over HTTP that is an unconfirmed publish,
+        // never a definite refusal (see `with_refused_blinded_publish`).
+        self.guard("publish_blinded_block")
+            .map_err(|err| Error::BlindedUnconfirmed {
+                status: None,
+                detail: err.to_string(),
+            })?;
+        if let Some(status) = self.blinded_publish_refusal {
+            return Err(Error::BeaconNodeStatus {
+                status,
+                body: "refused".to_string(),
+            });
+        }
         self.published_blinded
             .lock()
             .expect("lock")
