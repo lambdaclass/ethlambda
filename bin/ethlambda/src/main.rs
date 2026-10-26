@@ -4,6 +4,7 @@ mod benchmark;
 mod checkpoint_sync;
 mod cli;
 mod command;
+mod era;
 mod fd_limit;
 mod keygen;
 mod network;
@@ -98,6 +99,12 @@ fn main() -> eyre::Result<()> {
             init_benchmark_logging()?;
             benchmark::run(options)
         }
+        // Synchronous and CPU-bound like the benchmark; only the downloads
+        // start a runtime of their own.
+        Command::ReplayEra(options) => {
+            init_info_stderr_logging()?;
+            era::run(options)
+        }
         Command::Validator(options) => {
             init_node_logging()?;
             validator::run(options)
@@ -105,7 +112,7 @@ fn main() -> eyre::Result<()> {
         // Key generation is synchronous, CPU-bound work whose product is files,
         // so it runs on this thread too and leaves stdout alone.
         Command::Keygen(options) => {
-            init_keygen_logging()?;
+            init_info_stderr_logging()?;
             keygen::run(options)
         }
     }
@@ -136,10 +143,10 @@ fn init_benchmark_logging() -> eyre::Result<()> {
         .wrap_err("failed to set global tracing subscriber")
 }
 
-/// Keygen logging: INFO and above, on stderr. Key generation takes minutes for a
+/// Keygen and era-replay logging: INFO and above, on stderr. Key generation takes minutes for a
 /// large validator set, so progress has to be visible; stderr keeps stdout free
 /// for a machine-readable summary to claim later.
-fn init_keygen_logging() -> eyre::Result<()> {
+fn init_info_stderr_logging() -> eyre::Result<()> {
     let filter = EnvFilter::builder()
         .with_default_directive(tracing::Level::INFO.into())
         .from_env_lossy();
