@@ -17,6 +17,7 @@ use crate::shared::block_id::IdError;
 
 pub(crate) mod bid_selection;
 pub(crate) mod bids;
+pub(crate) mod blinded_blocks;
 pub(crate) mod blocks;
 pub(crate) mod builder_client;
 pub(crate) mod builder_config;

@@ -62,8 +62,8 @@ use ethlambda_types::{
         fork::ForkName,
         preset,
         primitives::{
-            BlsPubkey, BlsSignature, Bytes32, ExecutionAddress, ExecutionBlockHash, KzgProof, Slot,
-            Uint256, ValidatorIndex,
+            BlsPubkey, BlsSignature, Bytes32, ExecutionAddress, ExecutionBlockHash,
+            HashTreeRoot as _, KzgProof, Slot, Uint256, ValidatorIndex,
         },
         signing::compute_epoch_at_slot,
     },
@@ -77,6 +77,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use crate::beacon::bid_selection::wei_u128;
+use crate::beacon::blinded_blocks::{self, PublishedProposals, finalized_slot};
 use crate::beacon::builder_client::VersionedBid;
 use crate::beacon::builder_flow::{
     Builder,
@@ -126,6 +127,11 @@ pub(crate) fn routes() -> Router<Store> {
             "/eth/v2/beacon/blocks",
             post(post_block).layer(DefaultBodyLimit::max(super::MAX_PUBLISH_BODY_BYTES)),
         )
+        .route(
+            "/eth/v2/beacon/blinded_blocks",
+            post(blinded_blocks::post_blinded_block),
+        )
+        .layer(Extension(PublishedProposals::default()))
 }
 
 /// `POST /eth/v2/beacon/blocks`, `SignedBlockContents` (fulu) or a bare
@@ -144,6 +150,7 @@ pub(crate) fn routes() -> Router<Store> {
 async fn post_block(
     State(store): State<Store>,
     Extension(p2p): Extension<RpcToP2PRef>,
+    Extension(published): Extension<PublishedProposals>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -159,7 +166,7 @@ async fn post_block(
         Err(err) => return err.into_response(),
     };
     if fork == Some(ForkName::Gloas) {
-        return post_gloas_block(&store, &p2p, encoding, &body).await;
+        return post_gloas_block(&store, &p2p, &published, encoding, &body).await;
     }
     let Some(contents) = encoding.decode::<FuluSignedBlockContents>(&body) else {
         return ApiError::BadRequest("the body is not fulu SignedBlockContents").into_response();
@@ -245,6 +252,18 @@ async fn post_block(
             return ApiError::Internal("building the data column sidecars failed").into_response();
         }
     };
+    let root = signed_block.message.hash_tree_root();
+    if published
+        .claim(signed_block.message.slot, root, finalized_slot(&store))
+        .is_err()
+    {
+        warn!(
+            slot = signed_block.message.slot,
+            "Refusing a second, different block for the slot"
+        );
+        return ApiError::BadRequest("this node already published a different block for the slot")
+            .into_response();
+    }
     let block = containers::SignedBeaconBlock::Fulu(signed_block);
     let sidecars = sidecars
         .into_iter()
@@ -268,6 +287,7 @@ async fn post_block(
 async fn post_gloas_block(
     store: &Store,
     p2p: &RpcToP2PRef,
+    published: &PublishedProposals,
     encoding: BodyEncoding,
     body: &[u8],
 ) -> Response {
@@ -317,6 +337,21 @@ async fn post_gloas_block(
         Ok(Ok(())) => {}
         Ok(Err(err)) => return err.into_response(),
         Err(_) => return ApiError::Internal("verifying the block failed").into_response(),
+    }
+    if published
+        .claim(
+            block.slot(),
+            block.message_hash_tree_root(),
+            finalized_slot(store),
+        )
+        .is_err()
+    {
+        warn!(
+            slot = block.slot(),
+            "Refusing a second, different block for the slot"
+        );
+        return ApiError::BadRequest("this node already published a different block for the slot")
+            .into_response();
     }
     // A gloas block carries no blobs of its own: its data columns travel with
     // the execution payload envelope, published separately, so there are no
@@ -393,7 +428,11 @@ pub(super) fn randao_verification(
 /// advances a state to it: advancing a fulu head into a gloas slot would run
 /// `upgrade_to_gloas` only to refuse the result. Every other fork is refused
 /// too, since the containers here are fulu's.
-fn require_fulu_slot(config: &Config, slot: Slot, message: &'static str) -> Result<(), ApiError> {
+pub(super) fn require_fulu_slot(
+    config: &Config,
+    slot: Slot,
+    message: &'static str,
+) -> Result<(), ApiError> {
     match config.fork_at_epoch(compute_epoch_at_slot(slot)) {
         ForkName::Fulu => Ok(()),
         ForkName::Phase0
@@ -1334,7 +1373,6 @@ mod tests {
     use ethlambda_types::beacon::containers::capella;
     use ethlambda_types::beacon::containers::deneb::{ExecutionPayloadHeader, KzgCommitments};
     use ethlambda_types::beacon::containers::electra::{self, ExecutionRequests};
-    use ethlambda_types::beacon::primitives::HashTreeRoot as _;
     use libssz::SszDecode as _;
     use std::time::Duration;
 
@@ -1588,5 +1626,119 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let block = BlindedBeaconBlock::from_ssz_bytes(&body).unwrap();
         assert_eq!(block.slot, world.slot);
+    }
+
+    use ethlambda_state_transition::beacon::helpers::accessors::get_domain;
+    use ethlambda_state_transition::beacon::helpers::misc::compute_signing_root;
+    use ethlambda_state_transition::beacon::helpers::test_state::sign_for;
+    use ethlambda_types::beacon::builder::SignedBlindedBeaconBlock;
+    use ethlambda_types::beacon::constants::DOMAIN_BEACON_PROPOSER;
+    use ethlambda_types::beacon::primitives::Root;
+
+    /// A blinded block for `world`'s slot on its head, signed by the slot's
+    /// proposer (or by `signer`, to forge it), with `graffiti` to make
+    /// distinct blocks.
+    fn signed_blinded(
+        world: &BuilderWorld,
+        graffiti: u8,
+        signer: Option<usize>,
+    ) -> SignedBlindedBeaconBlock {
+        let (head_root, _) = super::super::validator::head(&world.store).unwrap();
+        let proposer = get_beacon_proposer_index(&world.state).unwrap();
+        let mut body = electra::BeaconBlockBody::empty();
+        body.graffiti = Bytes32::repeat_byte(graffiti);
+        let block = electra::BeaconBlock {
+            slot: world.slot,
+            proposer_index: proposer,
+            parent_root: head_root,
+            state_root: Root::ZERO,
+            body,
+        };
+        let message = BlindedBeaconBlock::from(block);
+        let domain = get_domain(&world.state, DOMAIN_BEACON_PROPOSER, None);
+        let root = compute_signing_root(message.hash_tree_root(), domain);
+        let signature = sign_for(signer.unwrap_or(proposer as usize), root);
+        SignedBlindedBeaconBlock { message, signature }
+    }
+
+    async fn post_blinded(
+        app: Router,
+        block: &SignedBlindedBeaconBlock,
+    ) -> (StatusCode, serde_json::Value) {
+        let request = Request::post("/eth/v2/beacon/blinded_blocks")
+            .header("content-type", "application/octet-stream")
+            .header("eth-consensus-version", "fulu")
+            .body(Body::from(block.to_ssz()))
+            .unwrap();
+        respond(app, request).await
+    }
+
+    fn publish_app(world: &BuilderWorld) -> Router {
+        let network: RpcToP2PRef = Arc::new(RecordingNetwork::default());
+        routes()
+            .with_state(world.store.clone())
+            .layer(Extension(network))
+            .layer(Extension(world.builder.clone()))
+    }
+
+    #[tokio::test]
+    async fn a_signed_blinded_block_goes_to_the_builder() {
+        let world = builder_world(true, SyncStatus::Synced).await;
+        let block = signed_blinded(&world, 1, None);
+        let (status, json) = post_blinded(publish_app(&world), &block).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(world.relay.blinded_blocks(), [block]);
+    }
+
+    #[tokio::test]
+    async fn a_forged_blinded_block_never_reaches_the_builder() {
+        let world = builder_world(true, SyncStatus::Synced).await;
+        let proposer = get_beacon_proposer_index(&world.state).unwrap() as usize;
+        let forged = signed_blinded(&world, 1, Some(proposer + 1));
+        let (status, _) = post_blinded(publish_app(&world), &forged).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(world.relay.blinded_blocks().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_second_different_block_for_the_slot_is_refused() {
+        let world = builder_world(true, SyncStatus::Synced).await;
+        let app = publish_app(&world);
+        let first = signed_blinded(&world, 1, None);
+        let second = signed_blinded(&world, 2, None);
+        assert_eq!(post_blinded(app.clone(), &first).await.0, StatusCode::OK);
+        assert_eq!(post_blinded(app.clone(), &first).await.0, StatusCode::OK);
+        let (status, json) = post_blinded(app, &second).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(world.relay.blinded_blocks(), [first.clone(), first]);
+    }
+
+    #[tokio::test]
+    async fn the_builders_answer_decides_the_status() {
+        for (answer, expected) in [
+            (StatusCode::BAD_REQUEST, StatusCode::BAD_REQUEST),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ] {
+            let world = builder_world(true, SyncStatus::Synced).await;
+            world.relay.answer_submissions_with(answer);
+            let block = signed_blinded(&world, 1, None);
+            let (status, json) = post_blinded(publish_app(&world), &block).await;
+            assert_eq!(status, expected, "{answer}: {json}");
+        }
+    }
+
+    #[tokio::test]
+    async fn without_a_builder_a_blinded_block_is_a_server_error() {
+        let world = builder_world(true, SyncStatus::Synced).await;
+        let network: RpcToP2PRef = Arc::new(RecordingNetwork::default());
+        let app = routes()
+            .with_state(world.store.clone())
+            .layer(Extension(network));
+        let block = signed_blinded(&world, 1, None);
+        let (status, _) = post_blinded(app, &block).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
