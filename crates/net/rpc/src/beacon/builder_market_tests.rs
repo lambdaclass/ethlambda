@@ -30,6 +30,7 @@ use ethlambda_state_transition::beacon::{
         test_state::{secret_key_for, sign_for},
     },
     payload_attestation_pool::SharedPayloadAttestationPool,
+    sync_committee_pool::SharedSyncCommitteePool,
 };
 use ethlambda_storage::Store;
 use ethlambda_types::{
@@ -268,6 +269,15 @@ impl World {
             .layer(Extension(engine.map(|engine| engine.client.clone())))
             .layer(Extension(SharedAttestationPool::default()))
             .layer(Extension(SharedPayloadAttestationPool::default()))
+            .layer(Extension(SharedSyncCommitteePool::default()))
+            .layer(Extension(crate::beacon::graffiti::OwnVersion(Arc::new(
+                ethlambda_engine::types::ClientVersionV1 {
+                    code: "LA".to_string(),
+                    name: "ethlambda".to_string(),
+                    version: "ethlambda/test".to_string(),
+                    commit: "0x3c4d7e8f".to_string(),
+                },
+            ))))
             .layer(Extension(self.market.clone()))
             .layer(Extension(self.fee_recipients.clone()))
             .layer(Extension(CustodyColumns::default()))
@@ -1209,6 +1219,15 @@ async fn the_new_routes_are_wired_with_the_production_layers() {
             .layer(Extension::<RpcToP2PRef>(world.network.clone()))
             .layer(Extension(SharedAttestationPool::default()))
             .layer(Extension(SharedPayloadAttestationPool::default()))
+            .layer(Extension(SharedSyncCommitteePool::default()))
+            .layer(Extension(crate::beacon::graffiti::OwnVersion(Arc::new(
+                ethlambda_engine::types::ClientVersionV1 {
+                    code: "LA".to_string(),
+                    name: "ethlambda".to_string(),
+                    version: "ethlambda/test".to_string(),
+                    commit: "0x3c4d7e8f".to_string(),
+                },
+            ))))
             .layer(Extension(world.market.clone()))
             .layer(Extension(CustodyColumns::default()))
             .layer(Extension(FeeRecipients::default()))
