@@ -134,6 +134,12 @@ provider. See
 [`ethlambda beacon`](#ethlambda-beacon--the-ethereum-beacon-chain) below for
 the remaining flags.
 
+`--network plataberget` (the Glamsterdam testnet) is built in as well. It has
+run gloas since its `GLOAS_FORK_EPOCH`, which the follower follows: a gloas
+checkpoint anchor is accepted, and payload envelopes are fetched and imported.
+It stays a follower, so the validator-client endpoints still refuse a gloas
+epoch.
+
 ### Lean consensus devnet
 
 To run a local lean devnet with ethlambda, follow the instructions on the
@@ -229,7 +235,7 @@ no attestation or sync committee subnet.
 
 | Flag | Meaning |
 |---|---|
-| `--network` | `mainnet` (default), `sepolia`, `hoodi`, or a path to a directory of network files (`config.yaml`, `genesis.ssz`, optionally `bootstrap_nodes.yaml`), the layout `eth-clients` publishes and kurtosis mounts |
+| `--network` | `mainnet` (default), `sepolia`, `hoodi`, `plataberget`, or a path to a directory of network files (`config.yaml`, `genesis.ssz`, optionally `bootstrap_nodes.yaml`), the layout `eth-clients` publishes and kurtosis mounts |
 | `--checkpoint-sync-url` | Where the anchor comes from. Required on a fresh data directory for a built-in network, since those never start from genesis. A resumable data directory is used before it; a network loaded from a directory anchors at its own `genesis.ssz` when no URL is given |
 | `--node-key` | Optional, but worth persisting: the columns this node custodies are a function of its node id, so without a key file it changes identity, and custody set, on every restart |
 | `--execution-endpoint`, `--execution-jwt-secret` | Optional Engine API pairing, given together. Without them, blocks import without payload validation |

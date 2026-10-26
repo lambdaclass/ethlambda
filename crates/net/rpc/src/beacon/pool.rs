@@ -4,7 +4,8 @@
 //! `POST /eth/v2/validator/aggregate_and_proofs`, how it publishes the result.
 //!
 //! Each attestation is checked against the electra `beacon_attestation_{subnet_id}`
-//! gossip conditions (p2p-interface) that can be evaluated here, then
+//! gossip conditions (p2p-interface) that can be evaluated here (gloas's
+//! payload-status rule on `data.index` too, at a gloas slot), then
 //! published on its subnet. Validating before publishing is not optional: a
 //! peer that relays invalid attestations has its gossipsub score cut, and
 //! enough of that disconnects it.
@@ -30,7 +31,7 @@ use ethlambda_state_transition::beacon::{
     attestation_pool::SharedAttestationPool,
     bls,
     gossip::attestation::compute_subnet_for_attestation,
-    gossip::{Outcome, aggregate},
+    gossip::{IgnoreReason, Outcome, RejectReason, aggregate, verify_attestation_payload_status},
     helpers::accessors::{CommitteeCacheExt as _, get_domain},
 };
 use ethlambda_storage::Store;
@@ -40,6 +41,7 @@ use ethlambda_types::{
         containers::{
             BeaconState, SignedAggregateAndProof,
             electra::{self, SingleAttestation},
+            gloas,
         },
         fork::ForkName,
         primitives::{CommitteeIndex, Epoch, Root, Slot},
@@ -94,9 +96,10 @@ async fn post_pool_attestations(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(err) = require_electra_or_later(&headers) {
-        return err.into_response();
-    }
+    let header_fork = match submission_fork(&headers) {
+        Ok(fork) => fork,
+        Err(err) => return err.into_response(),
+    };
     let Ok(attestations) = serde_json::from_slice::<Vec<SingleAttestation>>(&body) else {
         return ApiError::BadRequest("invalid request body").into_response();
     };
@@ -113,7 +116,11 @@ async fn post_pool_attestations(
     for (index, attestation) in attestations.into_iter().enumerate() {
         let slot = attestation.data.slot;
         let validator = attestation.attester_index;
-        let checked = validate(&store, &state, &attestation, now_ms);
+        let checked = if header_matches_slot(&store, header_fork, slot) {
+            validate(&store, &state, &attestation, now_ms)
+        } else {
+            Err("Eth-Consensus-Version does not match the attestation slot's fork")
+        };
         // Pooled as well as published: gossip never delivers a node its own
         // messages, so without this an aggregator served by this node would
         // be missing its own validator client's votes.
@@ -181,8 +188,14 @@ fn validate(
         return Err("attestation is older than the previous epoch");
     }
 
-    // [REJECT] data.index == 0, and the target epoch is the slot's.
-    if data.index != 0 {
+    // [REJECT] data.index == 0 (electra), or at a gloas slot 0 or 1, the
+    // payload-present flag; the target epoch is the slot's.
+    let at_gloas = config.fork_at_epoch(attestation_epoch) == ForkName::Gloas;
+    if at_gloas {
+        if data.index > 1 {
+            return Err("data.index must be 0 or 1 from gloas on");
+        }
+    } else if data.index != 0 {
         return Err("data.index must be zero from electra on");
     }
     if data.target.epoch != attestation_epoch {
@@ -203,6 +216,11 @@ fn validate(
     if checkpoint_block(store, data.beacon_block_root, data.target.epoch) != Some(data.target.root)
     {
         return Err("target root is not the voted block's checkpoint");
+    }
+    // [New in Gloas:EIP7732] The payload flag agrees with what this node knows
+    // of the voted block's payload.
+    if at_gloas {
+        verify_attestation_payload_status(store, data).map_err(payload_status_failure)?;
     }
 
     // [REJECT] The committee index is in range, and the attester is in it.
@@ -244,20 +262,57 @@ fn validate(
     })
 }
 
-/// The endpoints here take electra's containers, which exist only from that
-/// fork on; `Eth-Consensus-Version` is required to say so.
-fn require_electra_or_later(headers: &HeaderMap) -> Result<(), ApiError> {
+/// Why a gloas vote failed [`verify_attestation_payload_status`]. The gossip
+/// rule's `IGNORE`s are failures here too: a vote this node would not
+/// propagate must not be published on a validator client's say-so.
+fn payload_status_failure(outcome: Outcome) -> &'static str {
+    match outcome {
+        Outcome::Reject(RejectReason::SameSlotPayloadFlag) => {
+            "a same-slot attestation cannot vote for the payload"
+        }
+        Outcome::Ignore(IgnoreReason::PayloadEnvelopeUnseen) => {
+            "the voted block's payload has not been seen and verified"
+        }
+        Outcome::Ignore(IgnoreReason::PayloadOptimistic) => {
+            "the voted block's payload is optimistic"
+        }
+        _ => "the voted block's payload status could not be checked",
+    }
+}
+
+/// The fork a submit endpoint's `Eth-Consensus-Version` names. The endpoints
+/// take electra's containers, which fulu keeps, and gloas's, which are
+/// electra's own for a `SingleAttestation` and a new shape for an aggregate;
+/// anything earlier is refused.
+fn submission_fork(headers: &HeaderMap) -> Result<ForkName, ApiError> {
     let fork = headers
         .get("eth-consensus-version")
         .and_then(|value| value.to_str().ok())
         .and_then(ForkName::parse);
-    if fork.is_some_and(|fork| fork >= ForkName::Electra) {
-        Ok(())
-    } else {
-        Err(ApiError::BadRequest(
-            "Eth-Consensus-Version must name electra or a later fork",
-        ))
+    match fork {
+        Some(fork @ (ForkName::Electra | ForkName::Fulu | ForkName::Gloas)) => Ok(fork),
+        // `ForkName::parse` never returns Lean: it is absent from `ALL`.
+        Some(
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb
+            | ForkName::Lean,
+        )
+        | None => Err(ApiError::BadRequest(
+            "Eth-Consensus-Version must name electra, fulu or gloas",
+        )),
     }
+}
+
+/// Whether `header` is a version the fork at `slot` accepts: gloas's slots need
+/// the gloas header, and electra's and fulu's, whose containers are the same,
+/// accept either of theirs.
+fn header_matches_slot(store: &Store, header: ForkName, slot: Slot) -> bool {
+    let slot_is_gloas =
+        store.config().fork_at_epoch(compute_epoch_at_slot(slot)) == ForkName::Gloas;
+    slot_is_gloas == (header == ForkName::Gloas)
 }
 
 /// `200` when nothing failed, else the Beacon API's `IndexedErrorMessage`
@@ -289,11 +344,27 @@ async fn post_aggregate_and_proofs(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(err) = require_electra_or_later(&headers) {
-        return err.into_response();
-    }
-    let Ok(aggregates) = serde_json::from_slice::<Vec<electra::SignedAggregateAndProof>>(&body)
-    else {
+    let header_fork = match submission_fork(&headers) {
+        Ok(fork) => fork,
+        Err(err) => return err.into_response(),
+    };
+    // Gloas's aggregate is its own container, so the header picks the decoder.
+    let aggregates = if header_fork == ForkName::Gloas {
+        serde_json::from_slice::<Vec<gloas::SignedAggregateAndProof>>(&body).map(|signed| {
+            signed
+                .into_iter()
+                .map(SignedAggregateAndProof::Gloas)
+                .collect()
+        })
+    } else {
+        serde_json::from_slice::<Vec<electra::SignedAggregateAndProof>>(&body).map(|signed| {
+            signed
+                .into_iter()
+                .map(SignedAggregateAndProof::Electra)
+                .collect()
+        })
+    };
+    let Ok(aggregates): Result<Vec<SignedAggregateAndProof>, _> = aggregates else {
         return ApiError::BadRequest("invalid request body").into_response();
     };
 
@@ -304,35 +375,46 @@ async fn post_aggregate_and_proofs(
     let capacity = std::num::NonZeroUsize::MIN;
     let mut failures = Vec::new();
     for (index, aggregate) in aggregates.into_iter().enumerate() {
-        let inner = aggregate.message.aggregate.clone();
-        let aggregate = SignedAggregateAndProof::Electra(aggregate);
         let slot = aggregate.slot();
         let aggregator = aggregate.aggregator_index();
         let seen = aggregate::SeenAggregates::new(capacity, capacity);
         // The stateful checks resolve the aggregate's bits to the validators
         // behind them, which the chain actor applies to fork choice once the
         // network actor hands it over.
-        let checked = aggregate::cheap_checks(&seen, &store, &aggregate, now_ms)
-            .and_then(|()| aggregate::stateful_checks(&store, &aggregate));
-        let published = checked
-            .map_err(|outcome: Outcome| {
-                warn!(%slot, aggregator, ?outcome, "Refused a submitted aggregate");
-                "aggregate failed validation"
-            })
-            .and_then(|attesting_indices| {
-                // The aggregator and every attester its signature verified are
-                // live, as when P2P accepts a gossip aggregate.
-                let (epoch, _root) = aggregate.target();
-                let live = std::iter::once(aggregator).chain(attesting_indices.iter().copied());
-                store.observed_liveness().record_all(epoch, live);
-                // Recorded for block production, which packs the aggregates
-                // this node has validated.
+        let checked = if header_matches_slot(&store, header_fork, slot) {
+            aggregate::cheap_checks(&seen, &store, &aggregate, now_ms)
+                .and_then(|()| aggregate::stateful_checks(&store, &aggregate))
+                .map_err(|outcome: Outcome| {
+                    warn!(%slot, aggregator, ?outcome, "Refused a submitted aggregate");
+                    "aggregate failed validation"
+                })
+        } else {
+            Err("Eth-Consensus-Version does not match the aggregate slot's fork")
+        };
+        let published = checked.and_then(|attesting_indices| {
+            // The aggregator and every attester its signature verified are
+            // live, as when P2P accepts a gossip aggregate.
+            let (epoch, _root) = aggregate.target();
+            let live = std::iter::once(aggregator).chain(attesting_indices.iter().copied());
+            store.observed_liveness().record_all(epoch, live);
+            // Recorded for block production, which packs the aggregates this
+            // node has validated. The pool holds electra's shape, which a
+            // gloas aggregate converts to.
+            let pooled = match &aggregate {
+                SignedAggregateAndProof::Electra(signed) => Some(signed.message.aggregate.clone()),
+                SignedAggregateAndProof::Gloas(signed) => {
+                    electra::Attestation::try_from(&signed.message.aggregate).ok()
+                }
+                SignedAggregateAndProof::Phase0(_) => None,
+            };
+            if let Some(pooled) = pooled {
                 pool.lock()
                     .expect("attestation pool lock poisoned")
-                    .insert_aggregate(inner);
-                p2p.publish_beacon_aggregate(aggregate, attesting_indices)
-                    .map_err(|_| "the network actor is not running")
-            });
+                    .insert_aggregate(pooled);
+            }
+            p2p.publish_beacon_aggregate(aggregate, attesting_indices)
+                .map_err(|_| "the network actor is not running")
+        });
         match published {
             Ok(()) => debug!(%slot, aggregator, "Accepted aggregate for gossip"),
             Err(message) => failures.push(Failure { index, message }),
@@ -370,6 +452,9 @@ async fn get_aggregate_attestation(
     if let Err(err) = require_execution_client(&engine) {
         return err.into_response();
     }
+    let fork = store
+        .config()
+        .fork_at_epoch(compute_epoch_at_slot(query.slot));
     let aggregate = pool
         .lock()
         .expect("attestation pool lock poisoned")
@@ -384,12 +469,16 @@ async fn get_aggregate_attestation(
     if let Err(err) = require_validated(&store, aggregate.data.beacon_block_root) {
         return err.into_response();
     }
-    let fork = store
-        .config()
-        .fork_at_epoch(compute_epoch_at_slot(query.slot));
+    // The pool holds electra-shaped votes; a gloas slot is served the same
+    // vote in gloas's container, whose JSON is the same shape.
+    let data = if fork == ForkName::Gloas {
+        serde_json::json!(gloas::Attestation::from(&aggregate))
+    } else {
+        serde_json::json!(aggregate)
+    };
     let response = crate::json_response(serde_json::json!({
         "version": fork.as_str(),
-        "data": aggregate,
+        "data": data,
     }));
     crate::shared::content::with_consensus_version(response, fork)
 }
@@ -413,12 +502,13 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::test_utils::{RecordingNetwork, beacon_store_at, idle_engine};
+    use crate::test_utils::{RecordingNetwork, idle_engine};
     use axum::{body::Body, http::Request};
     use ethlambda_state_transition::beacon::helpers::{
         accessors::get_beacon_committee,
         test_state::{sign_for, with_signing_validators_at},
     };
+    use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::containers::shared::{AttestationData, Checkpoint};
     use http_body_util::BodyExt as _;
     use tower::ServiceExt as _;
@@ -429,27 +519,47 @@ mod tests {
         head_root: Root,
         network: Arc<RecordingNetwork>,
         pool: SharedAttestationPool,
+        /// The `Eth-Consensus-Version` the fixture's fork submits under.
+        version: &'static str,
     }
 
     /// A fulu head state, stored in the current wall-clock epoch so the
     /// submitted attestations are neither future nor stale.
     fn fixture() -> Fixture {
-        let mut state = with_signing_validators_at(ForkName::Fulu, 64);
-        let BeaconState::Fulu(fulu) = &mut state else {
-            unreachable!("built as fulu")
+        fixture_at(ForkName::Fulu, 0)
+    }
+
+    /// A head of `fork`'s state (fulu, or gloas under a schedule with gloas
+    /// from epoch 0) `slots_back` slots before the first slot of the wall
+    /// clock's epoch. At zero the head is its own epoch's checkpoint block and
+    /// the target root of a vote at its slot; further back, a vote in the
+    /// wall-clock epoch's first slot is for an earlier block.
+    fn fixture_at(fork: ForkName, slots_back: u64) -> Fixture {
+        let mut state = with_signing_validators_at(fork, 64);
+        let config = match fork {
+            ForkName::Gloas => Config::mainnet().with_fork_epoch(ForkName::Gloas, 0),
+            _ => Config::mainnet(),
         };
-        // At the first slot of the wall clock's epoch, so the head is its own
-        // epoch's checkpoint block and the attestation's target root.
-        let (probe, _) = beacon_store_at(BeaconState::Fulu(fulu.clone()));
+        let (probe, _) = crate::test_utils::beacon_store_with_config(state.clone(), config.clone());
         let wall_epoch = compute_epoch_at_slot(crate::beacon::node::wall_slot(&probe));
-        fulu.slot = compute_start_slot_at_epoch(wall_epoch);
-        let (store, head_root) = beacon_store_at(state.clone());
+        let head_slot = compute_start_slot_at_epoch(wall_epoch) - slots_back;
+        match &mut state {
+            BeaconState::Fulu(fulu) => fulu.slot = head_slot,
+            BeaconState::Gloas(gloas) => gloas.slot = head_slot,
+            _ => unreachable!("built as fulu or gloas"),
+        }
+        let (store, head_root) = crate::test_utils::beacon_store_with_config(state.clone(), config);
         Fixture {
             store,
             state,
             head_root,
             network: Arc::new(RecordingNetwork::default()),
             pool: SharedAttestationPool::default(),
+            version: if fork == ForkName::Gloas {
+                "gloas"
+            } else {
+                "fulu"
+            },
         }
     }
 
@@ -457,15 +567,35 @@ mod tests {
     /// voting for the head at the head's own slot.
     fn attestation(fixture: &Fixture, committee_index: u64, position: usize) -> SingleAttestation {
         let slot = fixture.state.slot();
+        attestation_for(
+            fixture,
+            slot,
+            (fixture.head_root, fixture.head_root),
+            0,
+            committee_index,
+            position,
+        )
+    }
+
+    /// A correctly signed vote at `slot` for the block and target roots in
+    /// `(block, target)`, carrying `index` as its `data.index`.
+    fn attestation_for(
+        fixture: &Fixture,
+        slot: u64,
+        (block, target): (Root, Root),
+        index: u64,
+        committee_index: u64,
+        position: usize,
+    ) -> SingleAttestation {
         let epoch = compute_epoch_at_slot(slot);
         let data = AttestationData {
             slot,
-            index: 0,
-            beacon_block_root: fixture.head_root,
+            index,
+            beacon_block_root: block,
             source: fixture.state.current_justified_checkpoint(),
             target: Checkpoint {
                 epoch,
-                root: fixture.head_root,
+                root: target,
             },
         };
         let committee = get_beacon_committee(&fixture.state, slot, committee_index).unwrap();
@@ -484,6 +614,14 @@ mod tests {
         fixture: &Fixture,
         attestations: &[SingleAttestation],
     ) -> (StatusCode, serde_json::Value) {
+        submit_as(fixture, attestations, fixture.version).await
+    }
+
+    async fn submit_as(
+        fixture: &Fixture,
+        attestations: &[SingleAttestation],
+        version: &str,
+    ) -> (StatusCode, serde_json::Value) {
         let network: RpcToP2PRef = fixture.network.clone();
         let app = routes()
             .with_state(fixture.store.clone())
@@ -491,7 +629,7 @@ mod tests {
             .layer(Extension(fixture.pool.clone()));
         let request = Request::post("/eth/v2/beacon/pool/attestations")
             .header("content-type", "application/json")
-            .header("eth-consensus-version", "fulu")
+            .header("eth-consensus-version", version)
             .body(Body::from(serde_json::to_vec(attestations).unwrap()))
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
@@ -889,5 +1027,214 @@ mod tests {
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn the_gloas_header_needs_a_gloas_slot_and_the_older_ones_a_pre_gloas_slot() {
+        let gloas = fixture_at(ForkName::Gloas, 0);
+        let vote = attestation(&gloas, 0, 0);
+        let (status, json) = submit_as(&gloas, std::slice::from_ref(&vote), "fulu").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json["failures"][0]["message"],
+            "Eth-Consensus-Version does not match the attestation slot's fork"
+        );
+        assert!(gloas.network.published.lock().unwrap().is_empty());
+
+        let fulu = fixture();
+        let vote = attestation(&fulu, 0, 0);
+        let (status, _) = submit_as(&fulu, std::slice::from_ref(&vote), "gloas").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(fulu.network.published.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_gloas_vote_in_the_voted_blocks_own_slot_is_published_with_index_zero() {
+        let fixture = fixture_at(ForkName::Gloas, 0);
+        let vote = attestation(&fixture, 0, 0);
+        let (status, json) = submit(&fixture, std::slice::from_ref(&vote)).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(fixture.network.published.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_same_slot_gloas_vote_for_the_payload_is_refused() {
+        let fixture = fixture_at(ForkName::Gloas, 0);
+        let slot = fixture.state.slot();
+        let roots = (fixture.head_root, fixture.head_root);
+        let vote = attestation_for(&fixture, slot, roots, 1, 0, 0);
+        let (status, json) = submit(&fixture, &[vote]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json["failures"][0]["message"],
+            "a same-slot attestation cannot vote for the payload"
+        );
+        assert!(fixture.network.published.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_gloas_index_past_one_is_refused() {
+        let fixture = fixture_at(ForkName::Gloas, 3);
+        let slot = fixture.state.slot() + 3;
+        let roots = (fixture.head_root, fixture.head_root);
+        let vote = attestation_for(&fixture, slot, roots, 2, 0, 0);
+        let (status, json) = submit(&fixture, &[vote]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json["failures"][0]["message"],
+            "data.index must be 0 or 1 from gloas on"
+        );
+    }
+
+    /// The voted block is the last pre-gloas one, whose payload this node
+    /// treats as FULL, so a vote for it with `index` 1 is valid.
+    #[tokio::test]
+    async fn a_gloas_vote_for_an_earlier_pre_gloas_block_may_name_its_payload() {
+        let fixture = fixture_at(ForkName::Gloas, 3);
+        let slot = fixture.state.slot() + 3;
+        let roots = (fixture.head_root, fixture.head_root);
+        let vote = attestation_for(&fixture, slot, roots, 1, 0, 0);
+        let (status, json) = submit(&fixture, &[vote]).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(fixture.network.published.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_gloas_vote_for_a_payload_never_seen_is_refused() {
+        let mut fixture = fixture_at(ForkName::Gloas, 3);
+        let head_slot = fixture.state.slot();
+        let block = crate::test_utils::gloas_beacon_block(
+            head_slot + 1,
+            fixture.head_root,
+            Root::repeat_byte(1),
+            Root::repeat_byte(2),
+        );
+        let block_root = block.message_hash_tree_root();
+        fixture
+            .store
+            .insert_signed_block(block_root, block)
+            .expect("insert gloas block");
+        let slot = head_slot + 3;
+        let roots = (block_root, block_root);
+        let empty = attestation_for(&fixture, slot, roots, 0, 0, 0);
+        let full = attestation_for(&fixture, slot, roots, 1, 0, 1);
+        let (status, json) = submit(&fixture, &[empty, full]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        let failures = json["failures"].as_array().unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0]["index"], 1);
+        assert_eq!(
+            failures[0]["message"],
+            "the voted block's payload has not been seen and verified"
+        );
+        fixture.network = Arc::new(RecordingNetwork::default());
+    }
+
+    /// `aggregate` as a gloas message, signed like [`signed_aggregate`].
+    fn signed_gloas_aggregate(
+        fixture: &Fixture,
+        aggregator: u64,
+        aggregate: &electra::Attestation,
+    ) -> gloas::SignedAggregateAndProof {
+        use ethlambda_types::beacon::constants::{
+            DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_SELECTION_PROOF,
+        };
+        let slot = aggregate.data.slot;
+        let epoch = compute_epoch_at_slot(slot);
+        let selection_domain = get_domain(&fixture.state, DOMAIN_SELECTION_PROOF, Some(epoch));
+        let selection_proof = sign_for(
+            aggregator as usize,
+            compute_signing_root(slot.hash_tree_root(), selection_domain),
+        );
+        let message = gloas::AggregateAndProof {
+            aggregator_index: aggregator,
+            aggregate: gloas::Attestation::from(aggregate),
+            selection_proof,
+        };
+        let domain = get_domain(&fixture.state, DOMAIN_AGGREGATE_AND_PROOF, Some(epoch));
+        let signature = sign_for(
+            aggregator as usize,
+            compute_signing_root(message.hash_tree_root(), domain),
+        );
+        gloas::SignedAggregateAndProof { message, signature }
+    }
+
+    /// A gloas aggregator's slot: votes in, the aggregate out as gloas's
+    /// container, and the signed gloas aggregate published and pooled.
+    #[tokio::test]
+    async fn a_gloas_aggregator_can_fetch_and_publish_its_aggregate() {
+        let fixture = fixture_at(ForkName::Gloas, 0);
+        let slot = fixture.state.slot();
+        let committee = get_beacon_committee(&fixture.state, slot, 0).unwrap();
+        let votes: Vec<SingleAttestation> = (0..committee.len())
+            .map(|position| attestation(&fixture, 0, position))
+            .collect();
+        let (status, json) = submit(&fixture, &votes).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+
+        let data = votes[0].data;
+        let (status, json) = get_aggregate(&fixture, data.hash_tree_root(), slot, 0).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["version"], "gloas");
+        let served: gloas::Attestation = serde_json::from_value(json["data"].clone()).unwrap();
+        let pooled = fixture
+            .pool
+            .lock()
+            .unwrap()
+            .aggregate(data.hash_tree_root(), slot, 0)
+            .unwrap();
+        assert_eq!(served, gloas::Attestation::from(&pooled));
+
+        let signed = signed_gloas_aggregate(&fixture, committee[0], &pooled);
+        let network: RpcToP2PRef = fixture.network.clone();
+        let app = routes()
+            .with_state(fixture.store.clone())
+            .layer(Extension(network))
+            .layer(Extension(fixture.pool.clone()));
+        let request = Request::post("/eth/v2/validator/aggregate_and_proofs")
+            .header("content-type", "application/json")
+            .header("eth-consensus-version", "gloas")
+            .body(Body::from(
+                serde_json::to_vec(std::slice::from_ref(&signed)).unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        let published = fixture.network.aggregates.lock().unwrap();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].0, SignedAggregateAndProof::Gloas(signed));
+    }
+
+    #[tokio::test]
+    async fn a_gloas_aggregate_with_a_forged_signature_is_refused() {
+        let fixture = fixture_at(ForkName::Gloas, 0);
+        let slot = fixture.state.slot();
+        let committee = get_beacon_committee(&fixture.state, slot, 0).unwrap();
+        let votes: Vec<SingleAttestation> = (0..committee.len())
+            .map(|position| attestation(&fixture, 0, position))
+            .collect();
+        submit(&fixture, &votes).await;
+        let pooled = fixture
+            .pool
+            .lock()
+            .unwrap()
+            .aggregate(votes[0].data.hash_tree_root(), slot, 0)
+            .unwrap();
+        let mut forged = signed_gloas_aggregate(&fixture, committee[0], &pooled);
+        forged.signature = signed_gloas_aggregate(&fixture, committee[1], &pooled).signature;
+        let network: RpcToP2PRef = fixture.network.clone();
+        let app = routes()
+            .with_state(fixture.store.clone())
+            .layer(Extension(network))
+            .layer(Extension(fixture.pool.clone()));
+        let request = Request::post("/eth/v2/validator/aggregate_and_proofs")
+            .header("eth-consensus-version", "gloas")
+            .body(Body::from(serde_json::to_vec(&[forged]).unwrap()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(fixture.network.aggregates.lock().unwrap().is_empty());
     }
 }

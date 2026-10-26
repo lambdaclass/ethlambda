@@ -7,6 +7,9 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ethlambda_types::beacon::config::Config;
+use ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
+use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
 use ethlambda_types::beacon::primitives::{Epoch, Slot};
 
@@ -29,12 +32,19 @@ const BASIS_POINTS: u64 = 10_000;
 /// both offsets to 2500 and 5000 basis points, which no fixed fraction
 /// expresses. Holding the basis points means this clock follows the network it
 /// was told about rather than the one it was compiled for.
-#[derive(Debug, Clone, Copy)]
+///
+/// # The offsets depend on the fork of the slot
+///
+/// Gloas moves the attester and aggregator offsets earlier (2500 and 5000
+/// basis points) and adds a payload timeliness committee deadline. So the clock
+/// holds the whole [`Config`] and answers by the fork of the slot's own epoch
+/// (`Config::fork_at_epoch`), which keeps a client running across the boundary
+/// on the right offsets on both sides of it.
+#[derive(Debug, Clone)]
 pub struct SlotClock {
     genesis_time: u64,
     slot_duration_ms: u64,
-    attestation_due_bps: u64,
-    aggregate_due_bps: u64,
+    config: Config,
 }
 
 impl SlotClock {
@@ -51,13 +61,31 @@ impl SlotClock {
         attestation_due_bps: u64,
         aggregate_due_bps: u64,
     ) -> Self {
-        assert!(slot_duration_ms > 0, "slot_duration_ms must be nonzero");
+        let mut config = Config::mainnet().with_fork_epoch(ForkName::Gloas, FAR_FUTURE_EPOCH);
+        config.slot_duration_ms = slot_duration_ms;
+        config.attestation_due_bps = attestation_due_bps;
+        config.aggregate_due_bps = aggregate_due_bps;
+        Self::from_config(genesis_time, &config)
+    }
+
+    /// A clock for the network `config` describes, which is how the offsets
+    /// of every fork reach it. See the type's docs for why it keeps the whole
+    /// configuration rather than one pair of offsets.
+    pub fn from_config(genesis_time: u64, config: &Config) -> Self {
+        assert!(
+            config.slot_duration_ms > 0,
+            "slot_duration_ms must be nonzero"
+        );
         Self {
             genesis_time,
-            slot_duration_ms,
-            attestation_due_bps,
-            aggregate_due_bps,
+            slot_duration_ms: config.slot_duration_ms,
+            config: config.clone(),
         }
+    }
+
+    /// Whether `slot` is a gloas slot.
+    pub fn is_gloas(&self, slot: Slot) -> bool {
+        self.config.fork_at_epoch(self.epoch_of(slot)) >= ForkName::Gloas
     }
 
     /// The slot containing `now`, or `None` before genesis.
@@ -94,7 +122,20 @@ impl SlotClock {
 
     /// When the attester duty for `slot` should run.
     pub fn attestation_time(&self, slot: Slot) -> SystemTime {
-        self.offset_into(slot, self.attestation_due_bps)
+        let bps = if self.is_gloas(slot) {
+            self.config.attestation_due_bps_gloas
+        } else {
+            self.config.attestation_due_bps
+        };
+        self.offset_into(slot, bps)
+    }
+
+    /// When the payload timeliness committee's duty for `slot` should run.
+    ///
+    /// Only meaningful for a gloas slot; the offset is the configured one
+    /// whatever the slot, and callers gate on [`Self::is_gloas`].
+    pub fn payload_attestation_time(&self, slot: Slot) -> SystemTime {
+        self.offset_into(slot, self.config.payload_attestation_due_bps)
     }
 
     /// When the aggregation duty for `slot` should run.
@@ -103,7 +144,12 @@ impl SlotClock {
     /// necessarily: an aggregator folds together votes its beacon node has
     /// collected, and before the attesters have voted there is nothing to fold.
     pub fn aggregation_time(&self, slot: Slot) -> SystemTime {
-        self.offset_into(slot, self.aggregate_due_bps)
+        let bps = if self.is_gloas(slot) {
+            self.config.aggregate_due_bps_gloas
+        } else {
+            self.config.aggregate_due_bps
+        };
+        self.offset_into(slot, bps)
     }
 
     /// `bps` basis points of the way into `slot`.
@@ -166,6 +212,17 @@ impl SlotClock {
     /// already had a whole slot to reach a block by another route.
     pub fn until_aggregation(&self, slot: Slot, now: SystemTime) -> Duration {
         self.aggregation_time(slot)
+            .duration_since(now)
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// How long from `now` until the payload timeliness committee's duty for
+    /// `slot`, or zero once that instant has passed.
+    ///
+    /// The PTC counterpart to [`Self::until_aggregation`]: the loop sleeps on
+    /// it between aggregation and the committee vote.
+    pub fn until_payload_attestation(&self, slot: Slot, now: SystemTime) -> Duration {
+        self.payload_attestation_time(slot)
             .duration_since(now)
             .unwrap_or(Duration::ZERO)
     }
@@ -498,6 +555,52 @@ mod tests {
         assert_eq!(slot, 0);
         assert_eq!(delay, Duration::from_secs(30));
         assert_eq!(now + delay, clock.start_of(0));
+    }
+
+    /// Slots before the gloas epoch keep the pre-gloas offsets and slots from
+    /// it on take the gloas ones, on both sides of the boundary.
+    #[test]
+    fn the_offsets_change_at_the_gloas_boundary() {
+        let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 2);
+        let clock = SlotClock::from_config(GENESIS, &config);
+        let last_fulu = 2 * SLOTS_PER_EPOCH - 1;
+        let first_gloas = 2 * SLOTS_PER_EPOCH;
+        let ms =
+            |t: SystemTime, slot: u64| t.duration_since(clock.start_of(slot)).expect("after start");
+
+        assert!(!clock.is_gloas(last_fulu));
+        assert!(clock.is_gloas(first_gloas));
+        assert_eq!(
+            ms(clock.attestation_time(last_fulu), last_fulu),
+            Duration::from_millis(3_999)
+        );
+        assert_eq!(
+            ms(clock.aggregation_time(last_fulu), last_fulu),
+            Duration::from_millis(8_000)
+        );
+        assert_eq!(
+            ms(clock.attestation_time(first_gloas), first_gloas),
+            Duration::from_millis(3_000)
+        );
+        assert_eq!(
+            ms(clock.aggregation_time(first_gloas), first_gloas),
+            Duration::from_millis(6_000)
+        );
+    }
+
+    #[test]
+    fn the_payload_attestation_deadline_is_three_quarters_in() {
+        let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 0);
+        let clock = SlotClock::from_config(GENESIS, &config);
+        let slot = 5;
+        assert_eq!(
+            clock.until_payload_attestation(slot, clock.start_of(slot)),
+            Duration::from_millis(9_000)
+        );
+        assert_eq!(
+            clock.until_payload_attestation(slot, clock.start_of(slot) + Duration::from_secs(10)),
+            Duration::ZERO
+        );
     }
 
     #[test]

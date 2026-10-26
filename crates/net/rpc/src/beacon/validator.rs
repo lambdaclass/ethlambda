@@ -23,6 +23,8 @@ use ethlambda_types::{
             BeaconState,
             shared::{AttestationData, Checkpoint},
         },
+        fork::ForkName,
+        fork_choice::PayloadStatus,
         preset,
         primitives::{BlsPubkey, CommitteeIndex, Epoch, ExecutionAddress, Slot, ValidatorIndex},
         signing::{compute_epoch_at_slot, compute_start_slot_at_epoch},
@@ -33,7 +35,7 @@ use serde::{Deserialize, Serialize};
 
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
-    fork_choice::{checkpoint_state, get_current_store_epoch},
+    fork_choice::{checkpoint_state, get_current_store_epoch, get_head_node},
     gossip::attestation::compute_subnet_for_attestation,
     helpers::accessors::{CommitteeCacheExt as _, get_block_root_at_slot},
     helpers::altair::compute_sync_committee_period,
@@ -164,7 +166,7 @@ fn sync_duties(
     }
 
     Ok(serde_json::json!({
-        "execution_optimistic": store.is_beacon_optimistic(head_root),
+        "execution_optimistic": crate::shared::optimistic::block_is_optimistic(store, head_root),
         "data": duties,
     }))
 }
@@ -363,7 +365,7 @@ pub(crate) fn head(store: &Store) -> Result<(H256, Arc<BeaconState>), ApiError> 
 /// Not a lasting refusal: a `VALID` from the execution client clears the root,
 /// and the actor asks through `forkchoiceUpdated` at least once a slot.
 pub(crate) fn require_validated(store: &Store, root: H256) -> Result<(), ApiError> {
-    if store.is_beacon_optimistic(root) {
+    if crate::shared::optimistic::block_is_optimistic(store, root) {
         return Err(ApiError::ServiceUnavailable(
             "the block's execution payload has not been validated yet",
         ));
@@ -384,6 +386,50 @@ pub(crate) fn require_execution_client(engine: &Option<EngineClient>) -> Result<
         ));
     }
     Ok(())
+}
+
+/// The newest epoch a duties request may name: one past the later of the wall
+/// clock's epoch and the head's.
+///
+/// The Beacon API bounds duties by the current epoch, not the head's: at the
+/// first slot of an epoch the head is still in the previous one until that
+/// slot's block arrives, and a validator client asks for the next epoch's
+/// duties right then. The head's epoch only matters when it is ahead of a
+/// lagging clock, where refusing it would be a regression.
+pub(crate) fn epoch_upper_bound(store: &Store, head_epoch: Epoch) -> Epoch {
+    let clock_epoch = compute_epoch_at_slot(crate::beacon::node::wall_slot(store));
+    head_epoch.max(clock_epoch) + 1
+}
+
+/// The head's post-state advanced through empty slots to the first slot of
+/// `epoch`, from fork choice's checkpoint-state cache (the one
+/// `attestation_data` reads) so a repeated request, or one for the epoch whose
+/// start `attestation_data` already advanced to, does no epoch processing.
+///
+/// Runs `process_slots` on a miss, which is seconds on a mainnet registry, so
+/// callers run on a blocking thread.
+fn state_for_epoch(
+    store: &Store,
+    head_root: H256,
+    epoch: Epoch,
+) -> Result<Arc<BeaconState>, ApiError> {
+    let target = Checkpoint {
+        epoch,
+        root: head_root,
+    };
+    checkpoint_state(store, &target, &store.config())
+        .map_err(|_| ApiError::Internal("advancing the head state failed"))
+}
+
+/// Turns a duties computation run on a blocking thread into a response.
+fn duties_response(
+    computed: Result<Result<serde_json::Value, ApiError>, tokio::task::JoinError>,
+) -> Response {
+    match computed {
+        Ok(Ok(body)) => crate::json_response(body),
+        Ok(Err(err)) => err.into_response(),
+        Err(_) => ApiError::Internal("computing the duties failed").into_response(),
+    }
 }
 
 /// The root of the latest block at or before `slot`, on the chain ending in
@@ -421,18 +467,14 @@ struct ProposerDuty {
 
 /// `GET /eth/v1/validator/duties/proposer/{epoch}`.
 ///
-/// Read from fulu's `proposer_lookahead`, which the state keeps for its own
-/// epoch and the next `MIN_SEED_LOOKAHEAD` epochs, so any epoch in that window
-/// is answered without advancing a state. Any other epoch is refused.
-///
 /// `dependent_root` is v1's definition, the block root at
 /// `compute_start_slot_at_epoch(epoch) - 1` (the genesis block's at epoch 0).
 /// It is what `ethlambda validator` compares across fetches to notice a reorg.
 async fn get_proposer_duties(Path(epoch): Path<String>, State(store): State<Store>) -> Response {
-    match proposer_duties(&store, &epoch, DependentRoot::V1) {
-        Ok(body) => crate::json_response(body),
-        Err(err) => err.into_response(),
-    }
+    let computed =
+        tokio::task::spawn_blocking(move || proposer_duties(&store, &epoch, DependentRoot::V1))
+            .await;
+    duties_response(computed)
 }
 
 /// `GET /eth/v2/validator/duties/proposer/{epoch}`: the same duties as v1,
@@ -452,10 +494,10 @@ async fn get_proposer_duties_v2(
     if sync_status.get() == SyncStatus::Syncing {
         return ApiError::ServiceUnavailable("the node is syncing").into_response();
     }
-    match proposer_duties(&store, &epoch, DependentRoot::V2) {
-        Ok(body) => crate::json_response(body),
-        Err(err) => err.into_response(),
-    }
+    let computed =
+        tokio::task::spawn_blocking(move || proposer_duties(&store, &epoch, DependentRoot::V2))
+            .await;
+    duties_response(computed)
 }
 
 /// Which definition of a proposer duty's `dependent_root` to answer with.
@@ -480,30 +522,59 @@ impl DependentRoot {
     }
 }
 
+/// Proposer duties for `epoch`, with `dependent_root` the block at the slot
+/// `dependent` names for it, which is all that differs between versions.
+///
+/// Read from the `proposer_lookahead` fulu introduced and gloas keeps, which
+/// the state keeps for its own epoch and the next `MIN_SEED_LOOKAHEAD` epochs,
+/// so any epoch in that window is answered without advancing a state. A later
+/// epoch, up to one past the wall clock's, is read from a copy of the head
+/// advanced to the first epoch whose lookahead covers it; an epoch before the
+/// head's or past that bound is a 400. Runs on a blocking thread, since the
+/// advance can be seconds.
 fn proposer_duties(
     store: &Store,
     epoch: &str,
     dependent: DependentRoot,
 ) -> Result<serde_json::Value, ApiError> {
     let epoch = parse_epoch(epoch)?;
-    let (head_root, state) = head(store)?;
-
-    let BeaconState::Fulu(fulu) = state.as_ref() else {
+    let (head_root, head_state) = head(store)?;
+    let head_epoch = compute_epoch_at_slot(head_state.slot());
+    if epoch < head_epoch || epoch > epoch_upper_bound(store, head_epoch) {
         return Err(ApiError::BadRequest(
-            "proposer duties are served from fulu's proposer lookahead only",
+            "epoch is outside the range the node serves duties for",
         ));
+    }
+
+    // The lookahead holds the state's own epoch and the next `MIN_SEED_LOOKAHEAD`.
+    // A later epoch the wall clock already allows (the head is behind it) is
+    // read from the head advanced to the first epoch whose lookahead covers it.
+    let state = if epoch > head_epoch + preset::MIN_SEED_LOOKAHEAD {
+        state_for_epoch(store, head_root, epoch - preset::MIN_SEED_LOOKAHEAD)?
+    } else {
+        head_state.clone()
     };
     let state_epoch = compute_epoch_at_slot(state.slot());
+
+    // Gloas keeps fulu's lookahead as it is, and `upgrade_to_gloas` carries it
+    // over, so a fulu head already holds the first gloas epoch's proposers.
+    let proposer_lookahead = match state.as_ref() {
+        BeaconState::Fulu(fulu) => &fulu.proposer_lookahead,
+        BeaconState::Gloas(gloas) => &gloas.proposer_lookahead,
+        _ => {
+            return Err(ApiError::BadRequest(
+                "proposer duties are served from the proposer lookahead of fulu and gloas only",
+            ));
+        }
+    };
     let offset = epoch
         .checked_sub(state_epoch)
         .filter(|offset| *offset <= preset::MIN_SEED_LOOKAHEAD)
-        .ok_or(ApiError::BadRequest(
-            "epoch is outside the head state's proposer lookahead",
-        ))?;
+        .ok_or(ApiError::Internal("epoch is outside the state's lookahead"))?;
 
     let first_slot = compute_start_slot_at_epoch(epoch);
     let window_start = (offset * preset::SLOTS_PER_EPOCH) as usize;
-    let proposers = &fulu.proposer_lookahead[window_start..][..preset::SLOTS_PER_EPOCH as usize];
+    let proposers = &proposer_lookahead[window_start..][..preset::SLOTS_PER_EPOCH as usize];
     let duties = proposers
         .iter()
         .zip(first_slot..)
@@ -519,7 +590,7 @@ fn proposer_duties(
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
 
-    let dependent_root = block_root_at_or_before(&state, head_root, dependent.slot(epoch))?;
+    let dependent_root = block_root_at_or_before(&head_state, head_root, dependent.slot(epoch))?;
     Ok(serde_json::json!({
         "dependent_root": dependent_root,
         "execution_optimistic": store.is_beacon_optimistic(head_root),
@@ -550,8 +621,14 @@ struct AttesterDuty {
 /// The head state answers for its previous, current and next epoch as it is:
 /// an epoch's committees depend only on its seed, whose RANDAO mix is fixed a
 /// full epoch earlier, and on which validators are active in it, which the
-/// registry records `MAX_SEED_LOOKAHEAD` epochs ahead. Any other epoch is
-/// refused rather than computed from an advanced state.
+/// registry records `MAX_SEED_LOOKAHEAD` epochs ahead. A later epoch is
+/// computed from a copy of the head advanced with `process_slots` to the start
+/// of the epoch before it (cached as fork choice's checkpoint state, run on a
+/// blocking thread). The upper bound is the wall clock's, as the Beacon API
+/// defines it: one past the current epoch (or the head's, if that is later),
+/// since the head lags the clock until the boundary slot's block arrives and a
+/// validator client asks for the next epoch's duties then. An epoch more than
+/// one before the head's, or past that bound, is a 400.
 ///
 /// `dependent_root` is the block root at
 /// `compute_start_slot_at_epoch(epoch - 1) - 1` (the genesis block's on
@@ -566,10 +643,9 @@ async fn post_attester_duties(
     State(store): State<Store>,
     Json(indices): Json<Vec<String>>,
 ) -> Response {
-    match attester_duties(&store, &epoch, &indices) {
-        Ok(body) => crate::json_response(body),
-        Err(err) => err.into_response(),
-    }
+    let computed =
+        tokio::task::spawn_blocking(move || attester_duties(&store, &epoch, &indices)).await;
+    duties_response(computed)
 }
 
 fn attester_duties(
@@ -583,14 +659,22 @@ fn attester_duties(
         .map(|index| index.parse::<ValidatorIndex>())
         .collect::<Result<std::collections::HashSet<_>, _>>()
         .map_err(|_| ApiError::BadRequest("invalid validator index"))?;
-    let (head_root, state) = head(store)?;
+    let (head_root, head_state) = head(store)?;
 
-    let state_epoch = compute_epoch_at_slot(state.slot());
-    if epoch + 1 < state_epoch || epoch > state_epoch + 1 {
+    let head_epoch = compute_epoch_at_slot(head_state.slot());
+    if epoch + 1 < head_epoch || epoch > epoch_upper_bound(store, head_epoch) {
         return Err(ApiError::BadRequest(
-            "epoch is not within one epoch of the head state's",
+            "epoch is outside the range the node serves duties for",
         ));
     }
+
+    // The head answers as it is up to its next epoch (see the endpoint's doc);
+    // beyond that it is advanced to the start of the epoch before `epoch`.
+    let state = if epoch > head_epoch + 1 {
+        state_for_epoch(store, head_root, epoch - 1)?
+    } else {
+        head_state.clone()
+    };
 
     let committees = store.committee_cache().committees(&state, epoch);
     let committees_at_slot = committees.committees_per_slot();
@@ -622,7 +706,7 @@ fn attester_duties(
     }
 
     let dependent_slot = compute_start_slot_at_epoch(epoch.saturating_sub(1)).saturating_sub(1);
-    let dependent_root = block_root_at_or_before(&state, head_root, dependent_slot)?;
+    let dependent_root = block_root_at_or_before(&head_state, head_root, dependent_slot)?;
     Ok(serde_json::json!({
         "dependent_root": dependent_root,
         "execution_optimistic": store.is_beacon_optimistic(head_root),
@@ -633,10 +717,10 @@ fn attester_duties(
 #[derive(Debug, Deserialize)]
 struct AttestationDataQuery {
     slot: Slot,
-    /// Optional and deprecated in the Beacon API, and ignored: from electra on
-    /// the committee travels outside `AttestationData`, whose `index` is always
-    /// zero, so every committee of a slot attests to the same data. Parsed
-    /// rather than dropped so a malformed value is still a `400`.
+    /// Ignored, and optional since gloas's beacon-APIs dropped it: from electra
+    /// on the committee travels outside `AttestationData`, whose `index` no
+    /// longer names it, so every committee of a slot attests to the same data.
+    /// Parsed rather than dropped so a malformed value is still a `400`.
     #[allow(dead_code)]
     committee_index: Option<CommitteeIndex>,
 }
@@ -655,7 +739,8 @@ struct AttestationDataQuery {
 /// - `target` is `slot`'s epoch and its boundary block: the head itself when
 ///   no block has filled the boundary slot since, else the root the state
 ///   recorded there.
-/// - `index` is zero, as electra requires.
+/// - `index` is zero, as electra requires. At a gloas slot it is the
+///   payload-present flag instead; see [`payload_present_index`].
 ///
 /// A slot before the head's, or more than one slot past the wall clock, is
 /// refused: neither is a slot a validator is asked to attest to. So is an
@@ -707,13 +792,54 @@ fn attestation_data(store: &Store, slot: Slot) -> Result<AttestationData, ApiErr
         root: block_root_at_or_before(&state, head_root, epoch_start)?,
     };
 
+    let index = if store.config().fork_at_epoch(epoch) == ForkName::Gloas {
+        payload_present_index(store, &state, slot)?
+    } else {
+        0
+    };
+
     Ok(AttestationData {
         slot,
-        index: 0,
+        index,
         beacon_block_root: head_root,
         source,
         target,
     })
+}
+
+/// `data.index` of a gloas attestation for `slot` voting for the head block
+/// whose post-state is `head_state` (`specs/gloas/validator.md`, "Attestation
+/// data"): `0` when the head block is from `slot` itself, since its payload
+/// cannot have been revealed yet, else `1` iff this node's fork choice holds
+/// the head block's payload as FULL.
+///
+/// The head's payload status is the one fork choice recorded with its head
+/// ([`Store::head_payload_status`]); it is `None` until this process has
+/// computed a head, or while the recorded node is not the current head, and
+/// then the walk is run once to find out. A pre-gloas head counts as FULL, the
+/// boundary rule this node's fork choice applies too
+/// (`docs/spec_deviations.md`), so the first gloas slots vote for the last
+/// fulu block's payload.
+fn payload_present_index(
+    store: &Store,
+    head_state: &BeaconState,
+    slot: Slot,
+) -> Result<u64, ApiError> {
+    if head_state.slot() == slot {
+        return Ok(0);
+    }
+    if !matches!(head_state, BeaconState::Gloas(_)) {
+        return Ok(1);
+    }
+    let status = match store.head_payload_status() {
+        Some(status) => status,
+        None => {
+            get_head_node(store, &store.config())
+                .map_err(|_| ApiError::Internal("fork choice head lookup failed"))?
+                .payload_status
+        }
+    };
+    Ok(u64::from(status == PayloadStatus::Full))
 }
 
 #[cfg(test)]
@@ -728,6 +854,7 @@ mod tests {
         fulu::{get_beacon_proposer_indices, initialize_proposer_lookahead},
         test_state::with_signing_validators_at,
     };
+    use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::fork::ForkName;
     use http_body_util::BodyExt as _;
     use tower::ServiceExt as _;
@@ -753,7 +880,10 @@ mod tests {
     async fn get(state: BeaconState, uri: &str) -> (StatusCode, serde_json::Value) {
         let (store, _root) = beacon_store_at(state);
         let request = Request::get(uri).body(Body::empty()).unwrap();
-        let response = routes().with_state(store).oneshot(request).await.unwrap();
+        let app = routes()
+            .with_state(store)
+            .layer(Extension(SyncStatusController::default()));
+        let response = app.oneshot(request).await.unwrap();
         let status = response.status();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         (status, serde_json::from_slice(&body).unwrap())
@@ -893,6 +1023,14 @@ mod tests {
         body: serde_json::Value,
     ) -> (StatusCode, serde_json::Value) {
         let (store, _root) = beacon_store_at(state);
+        post_to(store, uri, body).await
+    }
+
+    async fn post_to(
+        store: Store,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
         let request = Request::post(uri)
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
@@ -969,17 +1107,135 @@ mod tests {
         assert_eq!(json["dependent_root"], format!("{expected}"));
     }
 
-    #[tokio::test]
-    async fn attester_duties_two_epochs_ahead_are_a_400() {
+    /// The state's own epoch, with the wall clock at the first slot of the
+    /// epoch after it: the head is a slot behind the clock at an epoch
+    /// boundary, which is when validator clients ask for the next epoch.
+    fn boundary_store() -> (Store, BeaconState, Epoch) {
         let state = fulu_state();
-        let too_far = compute_epoch_at_slot(state.slot()) + 2;
-        let (status, _) = post(
-            state,
-            &format!("/eth/v1/validator/duties/attester/{too_far}"),
+        let head_epoch = compute_epoch_at_slot(state.slot());
+        let clock_slot = compute_start_slot_at_epoch(head_epoch + 1);
+        let (store, _root) = crate::test_utils::beacon_store_at_clock(state.clone(), clock_slot);
+        (store, state, head_epoch)
+    }
+
+    #[tokio::test]
+    async fn attester_duties_past_the_clocks_next_epoch_are_a_400() {
+        // The old head-relative bound is gone: with the clock in the head's
+        // epoch, two epochs ahead is exactly one past the clock and so is
+        // refused, while the clock itself decides how far a request may reach.
+        let state = fulu_state();
+        let head_epoch = compute_epoch_at_slot(state.slot());
+        let clock_slot = compute_start_slot_at_epoch(head_epoch);
+        let (store, _root) = crate::test_utils::beacon_store_at_clock(state, clock_slot);
+        let (status, _) = post_to(
+            store,
+            &format!("/eth/v1/validator/duties/attester/{}", head_epoch + 2),
             serde_json::json!(["0"]),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn attester_duties_two_epochs_past_the_clock_are_a_400() {
+        let (store, _state, head_epoch) = boundary_store();
+        let clock_epoch = head_epoch + 1;
+        let (status, _) = post_to(
+            store,
+            &format!("/eth/v1/validator/duties/attester/{}", clock_epoch + 2),
+            serde_json::json!(["0"]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn the_next_epoch_past_a_lagging_head_is_served_from_an_advanced_state() {
+        use ethlambda_state_transition::beacon::{
+            helpers::accessors::get_beacon_committee, stf::process_slots,
+        };
+
+        let (store, state, head_epoch) = boundary_store();
+        let epoch = head_epoch + 2;
+        let (status, json) = post_to(
+            store,
+            &format!("/eth/v1/validator/duties/attester/{epoch}"),
+            serde_json::json!(["3", "17"]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+
+        // What the spec derives from the head advanced to the first epoch
+        // that can derive `epoch`.
+        let mut advanced = state.clone();
+        let start = compute_start_slot_at_epoch(epoch - 1);
+        process_slots(&mut advanced, start, &Config::mainnet()).unwrap();
+
+        let duties = json["data"].as_array().unwrap();
+        assert_eq!(duties.len(), 2);
+        for duty in duties {
+            let slot: u64 = duty["slot"].as_str().unwrap().parse().unwrap();
+            let index: u64 = duty["committee_index"].as_str().unwrap().parse().unwrap();
+            let position: usize = duty["validator_committee_index"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(compute_epoch_at_slot(slot), epoch);
+            let committee = get_beacon_committee(&advanced, slot, index).unwrap();
+            assert_eq!(
+                committee[position].to_string(),
+                duty["validator_index"].as_str().unwrap()
+            );
+            assert_eq!(duty["committee_length"], committee.len().to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn the_dependent_root_two_epochs_ahead_is_the_head_when_no_block_followed_it() {
+        let (store, state, head_epoch) = boundary_store();
+        let head_root = store.beacon_head().unwrap().1;
+        let epoch = head_epoch + 2;
+        assert!(compute_start_slot_at_epoch(epoch - 1) > state.slot());
+        let (_, json) = post_to(
+            store,
+            &format!("/eth/v1/validator/duties/attester/{epoch}"),
+            serde_json::json!(["0"]),
+        )
+        .await;
+        assert_eq!(json["dependent_root"], format!("{head_root}"));
+    }
+
+    #[tokio::test]
+    async fn proposer_duties_for_the_epoch_after_a_lagging_heads_next_are_served() {
+        use ethlambda_state_transition::beacon::stf::process_slots;
+
+        let (store, state, head_epoch) = boundary_store();
+        let epoch = head_epoch + 2;
+        let uri = format!("/eth/v1/validator/duties/proposer/{epoch}");
+        let request = Request::get(uri).body(Body::empty()).unwrap();
+        let response = routes().with_state(store).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let mut advanced = state.clone();
+        process_slots(
+            &mut advanced,
+            compute_start_slot_at_epoch(head_epoch + 1),
+            &Config::mainnet(),
+        )
+        .unwrap();
+        let expected = get_beacon_proposer_indices(&advanced, epoch).unwrap();
+        let data = json["data"].as_array().unwrap();
+        assert_eq!(data.len() as u64, preset::SLOTS_PER_EPOCH);
+        for (duty, (slot, proposer)) in data
+            .iter()
+            .zip((compute_start_slot_at_epoch(epoch)..).zip(expected))
+        {
+            assert_eq!(duty["slot"], slot.to_string());
+            assert_eq!(duty["validator_index"], proposer.to_string());
+        }
     }
 
     /// `fulu_state` moved `slots_past_boundary` slots into its epoch, with a
@@ -1229,16 +1485,178 @@ mod tests {
         assert_eq!(*network.subscriptions.lock().unwrap(), vec![(11, 34)]);
     }
 
-    #[tokio::test]
-    async fn an_epoch_outside_the_lookahead_is_a_400() {
+    /// Sends the request `request` builds to a store holding a fulu head under
+    /// a schedule that puts gloas one epoch past the head's: the head's epoch
+    /// is the last fulu one, and the next is the first gloas one. `request`
+    /// gets the head's epoch and slot.
+    async fn with_gloas_next_epoch(
+        request: impl Fn(Epoch, Slot) -> Request<Body>,
+    ) -> (StatusCode, serde_json::Value) {
         let state = fulu_state();
-        let too_far = compute_epoch_at_slot(state.slot()) + 2;
-        let (status, _) = get(
-            state,
-            &format!("/eth/v1/validator/duties/proposer/{too_far}"),
-        )
+        let head_slot = state.slot();
+        let head_epoch = compute_epoch_at_slot(head_slot);
+        let config = ethlambda_types::beacon::config::Config::mainnet()
+            .with_fork_epoch(ForkName::Gloas, head_epoch + 1);
+        let (store, _root) = crate::test_utils::beacon_store_with_config(state, config);
+        let response = routes()
+            .with_state(store)
+            .oneshot(request(head_epoch, head_slot))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    fn get_request(uri: String) -> Request<Body> {
+        Request::get(uri).body(Body::empty()).unwrap()
+    }
+
+    fn attestation_data_request(slot: Slot) -> Request<Body> {
+        get_request(format!(
+            "/eth/v1/validator/attestation_data?slot={slot}&committee_index=0"
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_fulu_head_answers_the_first_gloas_epoch_for_every_duty() {
+        let (status, _) = with_gloas_next_epoch(|head_epoch, _| {
+            get_request(format!(
+                "/eth/v1/validator/duties/proposer/{}",
+                head_epoch + 1
+            ))
+        })
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = with_gloas_next_epoch(|head_epoch, _| {
+            Request::post(format!(
+                "/eth/v1/validator/duties/attester/{}",
+                head_epoch + 1
+            ))
+            .header("content-type", "application/json")
+            .body(Body::from("[\"0\"]"))
+            .unwrap()
+        })
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The head is a fulu block, which counts as FULL at the boundary.
+        let (status, json) = with_gloas_next_epoch(|head_epoch, _| {
+            attestation_data_request(compute_start_slot_at_epoch(head_epoch + 1))
+        })
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["data"]["index"], "1");
+    }
+
+    #[tokio::test]
+    async fn the_gloas_proposer_duties_match_the_lookahead_of_a_gloas_state() {
+        let mut state = with_signing_validators_at(ForkName::Gloas, COUNT);
+        let lookahead = initialize_proposer_lookahead(&state).unwrap();
+        let BeaconState::Gloas(gloas) = &mut state else {
+            unreachable!("built as gloas")
+        };
+        gloas.proposer_lookahead = lookahead.clone().try_into().unwrap();
+        let epoch = compute_epoch_at_slot(state.slot());
+        let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 0);
+        let (store, _) = crate::test_utils::beacon_store_with_config(state, config);
+        let request = get_request(format!("/eth/v1/validator/duties/proposer/{epoch}"));
+        let response = routes().with_state(store).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let proposers: Vec<u64> = json["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|duty| duty["validator_index"].as_str().unwrap().parse().unwrap())
+            .collect();
+        assert_eq!(proposers, lookahead[..preset::SLOTS_PER_EPOCH as usize]);
+    }
+
+    /// A store whose head is a gloas state `slots_past_boundary` into its
+    /// epoch, under a schedule with gloas from epoch 0, and the payload status
+    /// fork choice recorded for that head.
+    fn gloas_head(
+        slots_past_boundary: u64,
+        recorded: Option<PayloadStatus>,
+    ) -> (Store, BeaconState) {
+        let mut state = with_signing_validators_at(ForkName::Gloas, COUNT);
+        let BeaconState::Gloas(gloas) = &mut state else {
+            unreachable!("built as gloas")
+        };
+        gloas.slot += slots_past_boundary;
+        let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 0);
+        let (store, head_root) = crate::test_utils::beacon_store_with_config(state.clone(), config);
+        if let Some(status) = recorded {
+            store.set_head_payload_status(head_root, status);
+        }
+        (store, state)
+    }
+
+    async fn gloas_index(store: Store, slot: Slot) -> (StatusCode, serde_json::Value) {
+        // No `committee_index`: gloas's request omits it.
+        let request = get_request(format!("/eth/v1/validator/attestation_data?slot={slot}"));
+        let response = routes().with_state(store).oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_gloas_vote_in_the_head_blocks_own_slot_has_index_zero() {
+        let (store, state) = gloas_head(1, Some(PayloadStatus::Full));
+        let (status, json) = gloas_index(store, state.slot()).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["data"]["index"], "0");
+    }
+
+    #[tokio::test]
+    async fn a_gloas_vote_for_an_earlier_full_head_has_index_one() {
+        let (store, state) = gloas_head(1, Some(PayloadStatus::Full));
+        let (status, json) = gloas_index(store, state.slot() + 1).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["data"]["index"], "1");
+    }
+
+    #[tokio::test]
+    async fn a_gloas_vote_for_an_earlier_empty_head_has_index_zero() {
+        let (store, state) = gloas_head(1, Some(PayloadStatus::Empty));
+        let (status, json) = gloas_index(store, state.slot() + 1).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["data"]["index"], "0");
+    }
+
+    #[tokio::test]
+    async fn an_epoch_past_the_clocks_next_is_a_400() {
+        // Adapted from a head-relative bound: the clock now decides, and the
+        // request is two past it.
+        let (store, _state, head_epoch) = boundary_store();
+        for version in ["v1", "v2"] {
+            let request = get_request(format!(
+                "/eth/{version}/validator/duties/proposer/{}",
+                head_epoch + 3
+            ));
+            let response = routes()
+                .with_state(store.clone())
+                .layer(Extension(SyncStatusController::default()))
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{version}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_epoch_before_the_head_is_a_400() {
+        let state = fulu_state();
+        let before = compute_epoch_at_slot(state.slot()) - 1;
+        for version in ["v1", "v2"] {
+            let uri = format!("/eth/{version}/validator/duties/proposer/{before}");
+            let (status, _) = get(state.clone(), &uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{version}");
+        }
     }
 
     // --- duties/sync -----------------------------------------------------
