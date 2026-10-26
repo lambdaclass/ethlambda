@@ -96,7 +96,7 @@ async fn get_state(
         // borrow.
         Encoding::Json => crate::json_response(Envelope {
             version: fork.as_str(),
-            execution_optimistic: store.is_beacon_optimistic(root),
+            execution_optimistic: crate::shared::optimistic::block_is_optimistic(&store, root),
             finalized: is_finalized(&store, state.slot()),
             data: state.as_ref(),
         }),
@@ -113,7 +113,7 @@ async fn get_fork(Path(state_id): Path<String>, State(store): State<Store>) -> R
         Err(err) => return err.into_response(),
     };
     crate::json_response(serde_json::json!({
-        "execution_optimistic": store.is_beacon_optimistic(root),
+        "execution_optimistic": crate::shared::optimistic::block_is_optimistic(&store, root),
         "finalized": is_finalized(&store, state.slot()),
         "data": state.fork(),
     }))
@@ -133,7 +133,7 @@ async fn get_finality_checkpoints(
     // the state is the only place a *previous* justified checkpoint is kept
     // at all: the store keeps one justified row and one finalized row.
     crate::json_response(serde_json::json!({
-        "execution_optimistic": store.is_beacon_optimistic(root),
+        "execution_optimistic": crate::shared::optimistic::block_is_optimistic(&store, root),
         "finalized": is_finalized(&store, state.slot()),
         "data": {
             "previous_justified": state.previous_justified_checkpoint(),
@@ -322,12 +322,11 @@ fn validators_response(store: &Store, state_id: &str, request: ValidatorsRequest
             })
     };
     let entries: Vec<ValidatorEntry> = state
-        .validators()
-        .iter()
-        .zip(state.balances().iter())
+        .iter_validators()
+        .zip(state.iter_balances())
         .enumerate()
         .filter(|(index, (validator, _))| selected(*index as ValidatorIndex, validator))
-        .map(|(index, (validator, &balance))| {
+        .map(|(index, (validator, balance))| {
             let status = ValidatorStatus::of(validator, balance, epoch);
             (index as ValidatorIndex, balance, status, validator)
         })
@@ -344,7 +343,7 @@ fn validators_response(store: &Store, state_id: &str, request: ValidatorsRequest
         .collect();
 
     crate::json_response(serde_json::json!({
-        "execution_optimistic": store.is_beacon_optimistic(root),
+        "execution_optimistic": crate::shared::optimistic::block_is_optimistic(store, root),
         "finalized": is_finalized(store, state.slot()),
         "data": entries,
     }))
@@ -377,8 +376,7 @@ fn validator_response(
     let index = match id {
         ValidatorId::Index(index) => index,
         ValidatorId::Pubkey(pubkey) => state
-            .validators()
-            .iter()
+            .iter_validators()
             .position(|validator| validator.pubkey == pubkey)
             .ok_or(ApiError::NotFound("validator not found"))?
             as ValidatorIndex,
@@ -386,15 +384,12 @@ fn validator_response(
     let validator = state
         .validator(index)
         .map_err(|_| ApiError::NotFound("validator not found"))?;
-    let balance = *state
-        .balances()
-        .get(index as usize)
-        .ok_or(ApiError::Internal(
-            "the registry and balances disagree in length",
-        ))?;
+    let balance = state
+        .balance(index)
+        .map_err(|_| ApiError::Internal("the registry and balances disagree in length"))?;
     let status = ValidatorStatus::of(validator, balance, compute_epoch_at_slot(state.slot()));
     Ok(serde_json::json!({
-        "execution_optimistic": store.is_beacon_optimistic(root),
+        "execution_optimistic": crate::shared::optimistic::block_is_optimistic(store, root),
         "finalized": is_finalized(store, state.slot()),
         "data": ValidatorEntry {
             index,
@@ -575,7 +570,10 @@ mod tests {
         }
 
         fn pubkey_hex(state: &BeaconState, index: usize) -> String {
-            format!("0x{}", hex::encode(state.validators()[index].pubkey.0))
+            format!(
+                "0x{}",
+                hex::encode(state.validator(index as u64).unwrap().pubkey.0)
+            )
         }
 
         /// What `ethlambda validator` sends: its keys, to learn their indices.

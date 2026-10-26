@@ -259,6 +259,33 @@ pub async fn spawn_discovery(
     })
 }
 
+/// Publish a new `eth2` entry in the ENR this node serves over discv5.
+///
+/// Not possible with the discovery stack this node is built on, so this only
+/// says so. [`DiscoveryServer::spawn`] takes the local record by value, moves it
+/// into an actor it starts itself, and returns `()`: no actor handle comes back,
+/// and `DiscoveryServerProtocol` (`raw_packet`, `lookup_*`, `revalidate_*`,
+/// `enr_lookup`, `prune`, `shutdown`) has no message that replaces the record.
+/// The record is re-signed only internally, by discv5 IP voting
+/// (`update_local_ip`), which edits the address and nothing else. What would
+/// close the gap is a protocol message on `DiscoveryServer` that edits the
+/// local record and bumps its `seq`, or `spawn` returning the actor's handle.
+///
+/// Until then the record served to discv5 queries keeps the `eth2` entry it
+/// started with. Peers already connected are unaffected (they handshake on
+/// `Status`, which does follow the switch) and the admission filter does move,
+/// but a peer that discovers this node after a boundary reads the stale digest
+/// and rejects the record, so a long-running node becomes harder to find until
+/// it is restarted.
+pub(crate) fn update_served_enr(fork_id: &EnrForkId) {
+    warn!(
+        fork_digest = %hex::encode(fork_id.fork_digest),
+        next_fork_epoch = fork_id.next_fork_epoch,
+        "The served ENR keeps its startup eth2 entry: the discovery server offers no way to \
+         replace its record at runtime"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

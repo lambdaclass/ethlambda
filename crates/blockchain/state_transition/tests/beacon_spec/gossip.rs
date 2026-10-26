@@ -2,36 +2,99 @@
 //! vectors (`tests/formats/networking/gossip_validation.md` in
 //! consensus-specs), run against `beacon::gossip`.
 //!
-//! These come from their own fixture tree; see [`super::gossip_fixture_root`].
+//! These used to come from a separate, newer-release fixture tree of their
+//! own; v1.7.0-beta.2's main tree now ships the same vectors under
+//! `networking/gossip_*` alongside every other runner, so they are collected
+//! from there like any other handler (see [`super::collect`]). `networking.rs`
+//! filters these same directories out of its own collection, so the two
+//! runners partition the tree rather than both claiming it.
 
+use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::config::Config;
 use ethlambda_state_transition::beacon::containers::{
-    BeaconState, Checkpoint, SignedAggregateAndProof, SignedBeaconBlock, electra, fulu, phase0,
+    BeaconState, Checkpoint, DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock,
+    electra, gloas, phase0,
 };
 use ethlambda_state_transition::beacon::fork_choice::{
-    self, DataAvailability, PayloadValidity, Store,
+    self, DataAvailability, PayloadStatusEnum, PayloadValidity, Store,
 };
 use ethlambda_state_transition::beacon::gossip::{
-    self as rules, Outcome, SeenAggregates, SeenAttestations, SeenBlocks, SeenColumns,
+    self as rules, Outcome, SeenAggregates, SeenAttestations, SeenBlockColumns, SeenBlocks,
+    SeenColumns, SeenEnvelopes, SeenPayloadAttestations,
 };
 use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCache;
 use ethlambda_state_transition::beacon::primitives::Root;
+use ethlambda_state_transition::beacon::stf::ExecutionEngine;
 use ethlambda_storage::ForkCheckpoints;
 use libssz::SszDecode;
-use libtest_mimic::Trial;
+use libtest_mimic::{Failed, Trial};
 
-use super::{Case, PRESET, collect_gossip};
+use super::{Case, PRESET, collect, collect_all_handlers};
 
-/// The handlers this runner covers.
+/// The handlers this runner covers, and runs.
 const HANDLERS: &[&str] = &[
     "gossip_beacon_block",
     "gossip_data_column_sidecar",
     "gossip_beacon_aggregate_and_proof",
     "gossip_beacon_attestation",
+    "gossip_execution_payload_envelope",
+    "gossip_payload_attestation_message",
+];
+
+/// The forks each of [`HANDLERS`] validates. A case from any other fork is
+/// reported as ignored rather than run, the same "known gap, not a silent one"
+/// treatment `case.in_scope()` gives a fork past `HIGHEST_IMPLEMENTED_FORK`.
+///
+/// `case.in_scope()` alone would pass every fork up to gloas, since the state
+/// transition handles them all; the gossip rules do not. The block rules
+/// (`beacon::gossip::block`) and the column rules (`beacon::gossip::column`)
+/// have both fulu's and gloas's, and so do the aggregate and attestation
+/// rules (`beacon::gossip::{aggregate, attestation}`): electra's, which fulu
+/// keeps, and gloas's payload-flag modification of them.
+fn validated_forks(handler: &str) -> &'static [ForkName] {
+    match handler {
+        "gossip_data_column_sidecar" | "gossip_beacon_block" => &[ForkName::Fulu, ForkName::Gloas],
+        "gossip_beacon_aggregate_and_proof" | "gossip_beacon_attestation" => {
+            &[ForkName::Fulu, ForkName::Gloas]
+        }
+        "gossip_execution_payload_envelope" | "gossip_payload_attestation_message" => {
+            &[ForkName::Gloas]
+        }
+        other => panic!("{other} is not in HANDLERS, so it has no validated forks"),
+    }
+}
+
+/// Every other `gossip_*` handler the fixture tree ships, none of which this
+/// node validates yet: the topics it neither subscribes to nor has a
+/// validator for. Reported as ignored, named individually, rather than left
+/// for `HANDLERS` to silently not mention, so the gap is visible in the test
+/// list instead of inferred from an absence. [`trials`]'s accounting test
+/// fails if a fixture release adds a `gossip_*` handler that is in neither
+/// list, the same way [`super::UNMODELED_FORKS`] forces a decision on a new
+/// fork directory.
+///
+/// `gossip_execution_payload_bid` and `gossip_proposer_preferences` are
+/// gloas's own topics (EIP-7732 ePBS): the builder's bid and a builder's
+/// advertised preferences, respectively. (Its envelope and payload
+/// attestation topics are in [`HANDLERS`].) None of them existed
+/// until gloas's fixture directory started parsing (`ForkName::Gloas`), so
+/// they land here rather than silently in `unknown` the first time this
+/// runner sees them. Alphabetized with the rest rather than kept together.
+const IGNORED_HANDLERS: &[&str] = &[
+    "gossip_attester_slashing",
+    "gossip_blob_sidecar",
+    "gossip_bls_to_execution_change",
+    "gossip_execution_payload_bid",
+    "gossip_partial_data_column_sidecar",
+    "gossip_proposer_preferences",
+    "gossip_proposer_slashing",
+    "gossip_sync_committee_contribution_and_proof",
+    "gossip_sync_committee_message",
+    "gossip_voluntary_exit",
 ];
 
 /// Vectors that disagree with a deliberate deviation, by case name.
@@ -41,8 +104,16 @@ const SKIPPED: &[(&str, &str)] = &[
         "a parent seen without a post-state is queued, not rejected, until a bad-block cache exists",
     ),
     (
+        "gossip_beacon_block__reject_parent_failed_validation",
+        "a parent seen without a post-state is queued, not rejected, until a bad-block cache exists",
+    ),
+    (
         "gossip_data_column_sidecar__reject_parent_failed_validation",
         "a parent seen without a post-state is queued, not rejected, until a bad-block cache exists",
+    ),
+    (
+        "gossip_data_column_sidecar__reject_block_failed_validation",
+        "a block seen without a post-state is queued, not rejected, until a bad-block cache exists",
     ),
     (
         "gossip_beacon_aggregate_and_proof__reject_block_failed_validation",
@@ -50,6 +121,14 @@ const SKIPPED: &[(&str, &str)] = &[
     ),
     (
         "gossip_beacon_attestation__reject_block_failed_validation",
+        "a vote block seen without a post-state is ignored, not rejected, until a bad-block cache exists",
+    ),
+    (
+        "gossip_execution_payload_envelope__reject_block_failed_validation",
+        "a block seen without a post-state is queued, not rejected, until a bad-block cache exists",
+    ),
+    (
+        "gossip_payload_attestation_message__reject_block_failed_validation",
         "a vote block seen without a post-state is ignored, not rejected, until a bad-block cache exists",
     ),
 ];
@@ -75,6 +154,9 @@ struct StoreBlock {
     #[serde(default)]
     pending: bool,
     payload_status: Option<String>,
+    /// The block's execution payload envelope, delivered once the block is
+    /// imported so `is_payload_verified` answers true for its root.
+    payload: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -86,11 +168,36 @@ struct FinalizedOverride {
 
 #[derive(serde::Deserialize)]
 struct GossipMessage {
-    offset_ms: u64,
+    /// The format's offset from `meta.current_time_ms`. Some of gloas's
+    /// column vectors carry `current_time_ms` instead; see
+    /// [`GossipMessage::arrival_ms`].
+    offset_ms: Option<u64>,
+    current_time_ms: Option<u64>,
     subnet_id: Option<u64>,
     message: String,
     expected: String,
     reason: Option<String>,
+}
+
+impl GossipMessage {
+    /// The clock reading, in milliseconds since genesis, the message arrives
+    /// at: the format's `meta.current_time_ms + offset_ms`.
+    ///
+    /// Some of gloas's column vectors carry a per-message `current_time_ms`
+    /// instead: the generator (`test/gloas/networking/
+    /// test_gossip_data_column_sidecar.py`) writes `compute_time_at_slot_ms`
+    /// plus 500 there, the same basis as `meta.current_time_ms`, so it is the
+    /// absolute reading.
+    fn arrival_ms(&self, base_ms: u64) -> Result<u64, String> {
+        match (self.offset_ms, self.current_time_ms) {
+            (Some(offset), _) => Ok(base_ms + offset),
+            (None, Some(absolute)) => Ok(absolute),
+            (None, None) => Err(format!(
+                "{}: names neither offset_ms nor current_time_ms",
+                self.message
+            )),
+        }
+    }
 }
 
 fn parse_root(hex_root: &str) -> Root {
@@ -109,7 +216,7 @@ fn decode_block(case: &Case, name: &str) -> Result<SignedBeaconBlock, String> {
 /// needed one yet): every fork through deneb shares phase0's shape, and
 /// electra and fulu share electra's, exactly the split
 /// [`SignedAggregateAndProof`]'s own doc describes for
-/// [`SignedBeaconBlock::Fulu`].
+/// [`SignedBeaconBlock::Fulu`]. Gloas has its own, progressive one.
 fn decode_signed_aggregate(case: &Case, name: &str) -> Result<SignedAggregateAndProof, String> {
     let bytes = case.ssz_bytes(name);
     match case.fork {
@@ -125,40 +232,54 @@ fn decode_signed_aggregate(case: &Case, name: &str) -> Result<SignedAggregateAnd
             electra::SignedAggregateAndProof::from_ssz_bytes(&bytes)
                 .map_err(|err| format!("decoding {name}: {err:?}"))?,
         )),
-        other => Err(format!("no aggregate shape for fork {other:?}")),
+        ForkName::Gloas => Ok(SignedAggregateAndProof::Gloas(
+            gloas::SignedAggregateAndProof::from_ssz_bytes(&bytes)
+                .map_err(|err| format!("decoding {name}: {err:?}"))?,
+        )),
+        ForkName::Lean => Err(format!("no aggregate shape for fork {:?}", case.fork)),
     }
 }
 
-/// The case's own `config.yaml`, when it carries one: the vectors that pin a
-/// non-default blob schedule ship a full config alongside their blocks and
-/// state, which the compiled-in preset config does not share.
+/// [`super::case_config`], plus this suite's own `genesis_time` override.
 ///
-/// Most cases carry no `config.yaml` at all. Per the consensus-specs tests
-/// format README, a present `config.yaml` replaces the default runtime
-/// config, and an absent one means the preset default; the README says
-/// nothing about what fork epochs a present one holds. That is instead an
-/// observation of the vectors' own `config.yaml` files (checked by hand):
-/// every one of them sets every fork epoch to zero. So the fallback here
-/// models that same all-forks-at-genesis shape by hand: the compiled preset
-/// with every fork from altair up to and including the case's own fork pulled
-/// back to genesis, which is enough for `Config::fork_at_epoch` to resolve
-/// every case's low-epoch state without leaving a later fork's tree to
-/// inherit an earlier fork's fallback.
+/// The vectors that pin a non-default blob schedule ship a full
+/// `config.yaml` alongside their blocks and state, which the compiled-in
+/// preset config does not share; [`super::case_config`] is what reads it (or
+/// falls back) and corrects `seconds_per_slot`. Gossip validation additionally
+/// checks timestamps against the wall clock relative to `state.genesis_time`,
+/// which no case's `config.yaml` carries (every one of them was generated
+/// under [`super::PRESET`]'s own preset default), so this suite alone
+/// overrides it from the decoded state rather than trusting whatever
+/// `case_config` returned.
 fn case_config(case: &Case, state: &BeaconState) -> Config {
-    let mut config: Config = case.yaml_opt("config").unwrap_or_else(|| {
-        ForkName::ALL
-            .into_iter()
-            .take_while(|fork| *fork <= case.fork)
-            .filter(|fork| *fork != ForkName::Phase0)
-            .fold(Config::active(), |config, fork| {
-                config.with_fork_epoch(fork, 0)
-            })
-    });
+    let mut config = super::case_config(case);
     config.genesis_time = state.genesis_time();
-    // Newer configs name only `SLOT_DURATION_MS`; without `SECONDS_PER_SLOT`
-    // the field would keep mainnet's default.
-    config.seconds_per_slot = config.slot_duration_ms / 1000;
     config
+}
+
+/// Delivers `entry`'s execution payload envelope, if it lists one, so
+/// `is_payload_verified` answers true for its block.
+fn deliver_payload(
+    store: &mut Store,
+    case: &Case,
+    entry: &StoreBlock,
+    config: &Config,
+) -> Result<(), String> {
+    let Some(name) = &entry.payload else {
+        return Ok(());
+    };
+    let envelope = gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(&case.ssz_bytes(name))
+        .map_err(|err| format!("decoding {name}: {err:?}"))?;
+    // No sampled columns are named, so the empty retrieval reads as available,
+    // as in the fork-choice runner's envelope step.
+    fork_choice::on_execution_payload_envelope(
+        store,
+        &envelope,
+        config,
+        &[],
+        &ExecutionEngine::valid(),
+    )
+    .map_err(|err| format!("delivering {name}: {err:?}"))
 }
 
 /// The store the case describes: its anchor, then each listed block.
@@ -178,23 +299,41 @@ fn build_store(
         .map_err(|err| format!("get_forkchoice_store: {err:?}"))?;
 
     // The store's clock at the case's base time, so `on_block` accepts every
-    // listed block.
-    let now_s = (config.genesis_time_ms() + meta.current_time_ms) / 1000;
-    fork_choice::on_tick(&mut store, now_s, config);
+    // listed block; a block from a slot past that time advances it to that
+    // slot's start, since a vector may place its base time just before the
+    // slot a clock-disparity case sends its sidecar for.
+    let mut clock_s = (config.genesis_time_ms() + meta.current_time_ms) / 1000;
+    fork_choice::on_tick(&mut store, clock_s, config);
+    deliver_payload(&mut store, case, anchor, config)?;
 
     for entry in rest {
         let block = decode_block(case, &entry.block)?;
         let root = block.message_hash_tree_root();
-        // Seen without a post-state. An `INVALIDATED` payload lands here too:
-        // this store never keeps a post-state for one, since `on_block` fails
-        // it and invalidates the branch.
-        if entry.failed || entry.pending || entry.payload_status.as_deref() == Some("INVALIDATED") {
+        let block_slot = block.slot();
+        let block_start_s =
+            (config.genesis_time_ms() + block.slot() * config.slot_duration_ms) / 1000;
+        if block_start_s > clock_s {
+            clock_s = block_start_s;
+            fork_choice::on_tick(&mut store, clock_s, config);
+        }
+        // Gloas's `payload_status` is the verdict on the block's envelope, not
+        // on the block, which is imported regardless; it feeds the attestation
+        // rules' `block_payload_statuses` instead.
+        let gloas = case.fork == ForkName::Gloas;
+        // Seen without a post-state. A pre-gloas `INVALIDATED` payload lands
+        // here too: this store never keeps a post-state for one, since
+        // `on_block` fails it and invalidates the branch.
+        if entry.failed
+            || entry.pending
+            || (!gloas && entry.payload_status.as_deref() == Some("INVALIDATED"))
+        {
             store
                 .insert_pending_block(root, block)
                 .map_err(|err| format!("storing {}: {err}", entry.block))?;
             continue;
         }
         let validity = match entry.payload_status.as_deref() {
+            _ if gloas => PayloadValidity::NotRequired,
             None => PayloadValidity::NotRequired,
             Some("VALID") => PayloadValidity::Validated,
             Some("NOT_VALIDATED") => PayloadValidity::Optimistic,
@@ -209,6 +348,16 @@ fn build_store(
             &CommitteeCache::default(),
         )
         .map_err(|err| format!("importing {}: {err:?}", entry.block))?;
+        deliver_payload(&mut store, case, entry, config)?;
+        if gloas && let Some(status) = entry.payload_status.as_deref() {
+            let status = match status {
+                "VALID" => PayloadStatusEnum::Valid,
+                "NOT_VALIDATED" => PayloadStatusEnum::Syncing,
+                "INVALIDATED" => PayloadStatusEnum::Invalid,
+                other => return Err(format!("unknown payload_status {other}")),
+            };
+            store.insert_beacon_block_payload_status(root, block_slot, status);
+        }
     }
 
     if let Some(finalized) = &meta.finalized_checkpoint {
@@ -261,11 +410,17 @@ fn run_case(case: &Case) -> Result<(), String> {
     let capacity = NonZeroUsize::new(SEEN_CAPACITY).expect("non-zero");
     let mut seen_blocks = SeenBlocks::new(capacity);
     let mut seen_columns = SeenColumns::new(capacity);
+    let mut seen_block_columns = SeenBlockColumns::new(capacity);
     let mut seen_aggregates = SeenAggregates::new(capacity, capacity);
     let mut seen_attestations = SeenAttestations::new(capacity);
+    let mut seen_envelopes = SeenEnvelopes::new(capacity);
+    let mut seen_payload_attestations = SeenPayloadAttestations::new(capacity);
 
     for (index, message) in meta.messages.iter().enumerate() {
-        let now_ms = config.genesis_time_ms() + meta.current_time_ms + message.offset_ms;
+        let now_ms = config.genesis_time_ms()
+            + message
+                .arrival_ms(meta.current_time_ms)
+                .map_err(|err| format!("message {index}: {err}"))?;
         let outcome = match meta.topic.as_str() {
             "beacon_block" => {
                 let block = decode_block(case, &message.message)?;
@@ -278,18 +433,40 @@ fn run_case(case: &Case) -> Result<(), String> {
             }
             "data_column_sidecar" => {
                 let sidecar =
-                    fulu::DataColumnSidecar::from_ssz_bytes(&case.ssz_bytes(&message.message))
+                    DataColumnSidecar::from_ssz(case.fork, &case.ssz_bytes(&message.message))
                         .map_err(|err| format!("decoding {}: {err:?}", message.message))?;
                 let subnet_id = message
                     .subnet_id
                     .ok_or("a data_column_sidecar message names its subnet")?;
-                let outcome =
-                    rules::column::validate(&seen_columns, &store, &sidecar, subnet_id, now_ms);
-                if outcome == Outcome::Accept {
-                    let header = &sidecar.signed_block_header.message;
-                    seen_columns.record(header.slot, header.proposer_index, sidecar.index);
+                match sidecar {
+                    DataColumnSidecar::Fulu(sidecar) => {
+                        let outcome = rules::column::validate(
+                            &seen_columns,
+                            &store,
+                            &sidecar,
+                            subnet_id,
+                            now_ms,
+                        );
+                        if outcome == Outcome::Accept {
+                            let header = &sidecar.signed_block_header.message;
+                            seen_columns.record(header.slot, header.proposer_index, sidecar.index);
+                        }
+                        outcome
+                    }
+                    DataColumnSidecar::Gloas(sidecar) => {
+                        let outcome = rules::column::validate_gloas(
+                            &seen_block_columns,
+                            &store,
+                            &sidecar,
+                            subnet_id,
+                            now_ms,
+                        );
+                        if outcome == Outcome::Accept {
+                            seen_block_columns.record(sidecar.beacon_block_root, sidecar.index);
+                        }
+                        outcome
+                    }
                 }
-                outcome
             }
             "beacon_aggregate_and_proof" => {
                 let aggregate = decode_signed_aggregate(case, &message.message)?;
@@ -326,6 +503,37 @@ fn run_case(case: &Case) -> Result<(), String> {
                 }
                 outcome
             }
+            "execution_payload" => {
+                let envelope = gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(
+                    &case.ssz_bytes(&message.message),
+                )
+                .map_err(|err| format!("decoding {}: {err:?}", message.message))?;
+                let outcome = rules::envelope::validate(&seen_envelopes, &store, &envelope);
+                if outcome == Outcome::Accept {
+                    seen_envelopes.record(
+                        envelope.message.beacon_block_root,
+                        envelope.message.builder_index,
+                    );
+                }
+                outcome
+            }
+            "payload_attestation_message" => {
+                let attestation = gloas::PayloadAttestationMessage::from_ssz_bytes(
+                    &case.ssz_bytes(&message.message),
+                )
+                .map_err(|err| format!("decoding {}: {err:?}", message.message))?;
+                let outcome = rules::payload_attestation::validate(
+                    &seen_payload_attestations,
+                    &store,
+                    &attestation,
+                    now_ms,
+                );
+                if outcome == Outcome::Accept {
+                    seen_payload_attestations
+                        .record(attestation.data.slot, attestation.validator_index);
+                }
+                outcome
+            }
             other => return Err(format!("topic {other} has no runner")),
         };
         check(message, outcome).map_err(|err| format!("message {index}: {err}"))?;
@@ -336,15 +544,53 @@ fn run_case(case: &Case) -> Result<(), String> {
 pub fn trials() -> Vec<Trial> {
     let mut trials = Vec::new();
     for handler in HANDLERS {
-        let cases = collect_gossip(PRESET, handler);
+        let cases = collect(PRESET, "networking", handler);
         trials.push(super::discovery_trial(
             &format!("gossip/{handler}"),
             cases.len(),
         ));
         for case in cases {
-            let ignored = !case.in_scope() || SKIPPED.iter().any(|(name, _)| *name == case.name);
+            // A fork the handler's rules do not cover is ignored rather than
+            // run; see [`validated_forks`].
+            let ignored = !case.in_scope()
+                || !validated_forks(handler).contains(&case.fork)
+                || SKIPPED.iter().any(|(name, _)| *name == case.name);
             trials.push(super::case_trial("gossip", case, run_case).with_ignored_flag(ignored));
         }
     }
+
+    // Every other `gossip_*` handler and fork this fixture tree ships: named
+    // and ignored rather than left for the loop above to never mention, and
+    // `unknown` is what makes a fixture release adding a handler neither run
+    // nor listed here fail loudly instead of vanishing. Mirrors
+    // `fixture_fork_trials`'s treatment of `UNMODELED_FORKS`.
+    let mut unknown: BTreeSet<String> = BTreeSet::new();
+    for (handler, case) in collect_all_handlers(PRESET, "networking") {
+        if !handler.starts_with("gossip_") || HANDLERS.contains(&handler.as_str()) {
+            continue;
+        }
+        if !IGNORED_HANDLERS.contains(&handler.as_str()) {
+            unknown.insert(handler);
+            continue;
+        }
+        let name = format!("gossip/{}", case.id());
+        trials.push(Trial::test(name, || Ok(())).with_ignored_flag(true));
+    }
+
+    trials.push(Trial::test(
+        "gossip/every_handler_is_accounted_for",
+        move || {
+            if unknown.is_empty() {
+                return Ok(());
+            }
+            Err(Failed::from(format!(
+                "the fixture release ships gossip_* handlers this runner neither runs nor lists \
+                 in IGNORED_HANDLERS, so every case under them is skipped without appearing \
+                 anywhere in the output: {}",
+                unknown.into_iter().collect::<Vec<_>>().join(", ")
+            )))
+        },
+    ));
+
     trials
 }
