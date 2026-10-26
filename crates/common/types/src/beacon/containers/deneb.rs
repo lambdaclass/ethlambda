@@ -25,6 +25,12 @@
 //! the state transition document. Neither is ever stored in the state or a
 //! block body; a block only ever holds the commitments the sidecars are
 //! checked against.
+//!
+//! [`VersionedHash`] and [`VersionedHashes`] are new too: the versioned
+//! hashes `kzg_commitment_to_versioned_hash` derives from
+//! `blob_kzg_commitments`, which [`NewPayloadRequest`] passes to the
+//! execution engine alongside `parent_beacon_block_root` so it can check a
+//! payload's blob commitments without the blobs themselves.
 
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libssz_types::{SszList, SszVector};
@@ -42,7 +48,7 @@ use super::shared::{
 use crate::beacon::preset;
 use crate::beacon::primitives::{
     BlobIndex, BlsSignature, Bytes32, ExecutionAddress, ExecutionBlockHash, KzgCommitment,
-    KzgProof, Root, Slot, Uint256, ValidatorIndex, WithdrawalIndex,
+    KzgProof, Root, Slot, Uint256, ValidatorIndex, VersionedHash, WithdrawalIndex,
 };
 
 // ---------------------------------------------------------------------------
@@ -68,6 +74,11 @@ pub type KzgCommitments = SszList<KzgCommitment, { preset::MAX_BLOB_COMMITMENTS_
 /// that block's body.
 pub type BlobKzgCommitmentInclusionProof =
     SszVector<Bytes32, { preset::KZG_COMMITMENT_INCLUSION_PROOF_DEPTH }>;
+
+/// The versioned hashes [`NewPayloadRequest`] passes to the execution engine,
+/// one per blob committed to by [`BeaconBlockBody::blob_kzg_commitments`],
+/// computed from those commitments by `kzg_commitment_to_versioned_hash`.
+pub type VersionedHashes = SszList<VersionedHash, { preset::MAX_BLOB_COMMITMENTS_PER_BLOCK }>;
 
 // ---------------------------------------------------------------------------
 // Execution payload
@@ -140,6 +151,21 @@ pub struct ExecutionPayloadHeader {
     pub blob_gas_used: u64,
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub excess_blob_gas: u64,
+}
+
+/// What `process_execution_payload` hands `execution_engine.verify_and_notify_new_payload`
+/// to validate a proposed payload, deneb `beacon-chain.md`.
+///
+/// Bellatrix's version carries only `execution_payload`; deneb appends
+/// `versioned_hashes` (EIP-4844, so the engine can check blob commitments
+/// against the payload without the blobs themselves) and
+/// `parent_beacon_block_root` (EIP-4788, exposing the beacon root to the EVM).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+pub struct NewPayloadRequest {
+    pub execution_payload: ExecutionPayload,
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    pub versioned_hashes: VersionedHashes,
+    pub parent_beacon_block_root: Root,
 }
 
 // ---------------------------------------------------------------------------

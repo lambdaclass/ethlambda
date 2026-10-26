@@ -22,7 +22,8 @@ use ethlambda_storage::{Chain, Store};
 use ethlambda_types::ShortRoot;
 use ethlambda_types::attestation::{AttestationData, SignedAttestation};
 use ethlambda_types::beacon::containers::{
-    BeaconState, SignedAggregateAndProof, SignedBeaconBlock, electra, fulu, phase0,
+    BeaconState, DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock, electra, gloas,
+    phase0,
 };
 use ethlambda_types::beacon::serde_helpers::quoted_or_bare;
 use ethlambda_types::beacon::signing::{compute_epoch_at_slot, compute_start_slot_at_epoch};
@@ -403,6 +404,7 @@ pub struct BeaconChainReorgEvent {
 pub enum BeaconAttestationEvent {
     Phase0(phase0::Attestation),
     Electra(electra::Attestation),
+    Gloas(gloas::Attestation),
 }
 
 impl From<&SignedAggregateAndProof> for BeaconAttestationEvent {
@@ -414,6 +416,7 @@ impl From<&SignedAggregateAndProof> for BeaconAttestationEvent {
             SignedAggregateAndProof::Electra(signed) => {
                 Self::Electra(signed.message.aggregate.clone())
             }
+            SignedAggregateAndProof::Gloas(signed) => Self::Gloas(signed.message.aggregate.clone()),
         }
     }
 }
@@ -671,12 +674,12 @@ impl ChainEvents {
 
     /// Beacon `data_column_sidecar`: `sidecar`, of the block under
     /// `block_root`, was stored.
-    pub(crate) fn publish_data_column(&self, block_root: H256, sidecar: &fulu::DataColumnSidecar) {
+    pub(crate) fn publish_data_column(&self, block_root: H256, sidecar: &DataColumnSidecar) {
         self.bus
             .emit(ChainEvent::DataColumnSidecar(DataColumnSidecarEvent {
                 block_root,
-                index: sidecar.index,
-                slot: sidecar.signed_block_header.message.slot,
+                index: sidecar.index(),
+                slot: sidecar.slot(),
             }));
     }
 }
