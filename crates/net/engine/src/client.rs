@@ -311,6 +311,36 @@ impl EngineClient {
         response.try_into()
     }
 
+    /// `engine_forkchoiceUpdatedV4` with `payloadAttributes`: Amsterdam's fork
+    /// choice notification plus a request to build a payload for the slot the
+    /// attributes name, with the consensus client's custody set.
+    ///
+    /// Returns the head's status and the build process's id; the id is `None`
+    /// when the execution client declined to build.
+    pub async fn forkchoice_updated_v4_with_attributes(
+        &self,
+        state: &ForkchoiceStateV1,
+        attributes: &crate::building::PayloadAttributesV4,
+        custody_columns: Option<CustodyColumns>,
+    ) -> Result<(PayloadStatusV1, Option<crate::building::PayloadId>), EngineError> {
+        let params = json!([state, attributes, custody_columns]);
+        let response: ForkchoiceUpdatedResponse =
+            self.call("engine_forkchoiceUpdatedV4", params).await?;
+        Ok((response.payload_status, response.payload_id))
+    }
+
+    /// `engine_getPayloadV6`: [`Self::get_payload`] for Amsterdam, answering
+    /// with `ExecutionPayloadV4` (`blockAccessList` and `slotNumber` included).
+    pub async fn get_payload_v6(
+        &self,
+        payload_id: crate::building::PayloadId,
+    ) -> Result<crate::building::BuiltGloasPayload, EngineError> {
+        let response: crate::building::GetPayloadV6Response = self
+            .call("engine_getPayloadV6", json!([payload_id]))
+            .await?;
+        response.try_into()
+    }
+
     /// `engine_exchangeCapabilities`. Returns what the execution client says it
     /// supports.
     pub async fn exchange_capabilities(&self, ours: &[&str]) -> Result<Vec<String>, EngineError> {
@@ -355,7 +385,11 @@ impl EngineClient {
         // network that does not schedule gloas never needs it, and an
         // execution client that predates Amsterdam is right not to offer it.
         if gloas_scheduled {
-            for required in ["engine_newPayloadV5", "engine_forkchoiceUpdatedV4"] {
+            for required in [
+                "engine_newPayloadV5",
+                "engine_forkchoiceUpdatedV4",
+                "engine_getPayloadV6",
+            ] {
                 if !theirs.iter().any(|method| method == required) {
                     warn!(
                         method = required,

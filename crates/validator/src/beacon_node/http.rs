@@ -24,7 +24,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use ethlambda_types::beacon::config::Config;
-use ethlambda_types::beacon::containers::electra::{Attestation, SignedAggregateAndProof};
+use ethlambda_types::beacon::containers::electra::Attestation;
+use ethlambda_types::beacon::containers::gloas;
 use ethlambda_types::beacon::containers::shared::AttestationData;
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, Root, Slot, ValidatorIndex};
@@ -32,16 +33,19 @@ use reqwest::{Client, StatusCode};
 use serde::Serialize;
 use tracing::{debug, warn};
 
+use libssz::SszDecode as _;
+
 use crate::beacon_node::block_contents::ProducedBlock;
 use crate::beacon_node::dto::{
     AttestationDataDto, AttestationDto, AttesterDutyDto, CommitteeSubscriptionDto, DataResponse,
     DutiesResponse, GenesisDto, IndexedErrorResponse, ProposerDutyDto, ProposerPreparationDto,
-    SignedAggregateAndProofOutDto, SingleAttestationDto, SyncingDto, ValidatorEntryDto,
+    PtcDutyDto, SignedAggregateAndProofOutDto, SingleAttestationDto, SyncingDto, ValidatorEntryDto,
     VersionedResponse, config_from_spec_response, encode_hex, parse_pubkey, parse_root,
 };
 use crate::beacon_node::{
-    AggregateAttestation, AttesterDuties, BeaconNodeApi, BlockRequest, Genesis, ProposerDuties,
-    Published, ValidatorEntry, validate_attestation_data, validate_produced_block,
+    AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Genesis,
+    ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorEntry,
+    validate_attestation_data, validate_produced_block,
 };
 use crate::error::{BeaconNodeFailure, Error, Result};
 
@@ -53,6 +57,23 @@ use crate::error::{BeaconNodeFailure, Error, Result};
 /// same client. A network with shorter slots would need this revisited, since
 /// a stalled request could then outlive the slot it was serving.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// What an SSZ answer carries besides its bytes: the fork, which only a header
+/// can say, and the two booleans the block endpoints use to say what the bytes
+/// are.
+struct SszResponse {
+    fork: ForkName,
+    /// `Eth-Execution-Payload-Blinded`, sent by `produceBlockV3` only.
+    blinded: Option<bool>,
+    /// `Eth-Execution-Payload-Included`, sent by `produceBlockV4` only.
+    payload_included: Option<bool>,
+    body: Vec<u8>,
+}
+
+/// The body `produceBlockV4` requires. Self-build only, so no minimum bid, no
+/// boost and no builders: the node decodes it, as the specification demands,
+/// and builds locally.
+const BUILDER_CONFIG: &str = r#"{"min_bid":"0","builder_boost_factor":"0","builders":[]}"#;
 
 /// A [`BeaconNodeApi`] backed by one beacon node's standard REST Beacon API.
 pub struct HttpBeaconNode {
@@ -170,24 +191,43 @@ impl HttpBeaconNode {
     /// root that produces. The comparison is case-insensitive: the schema's
     /// enum is lowercase but nothing in the specification says a client must
     /// match it that way.
-    ///
-    /// Returns the blinded flag as an `Option`, `None` when the header is
-    /// absent, because only one endpoint sends it and only that endpoint's
-    /// caller knows whether its absence is an error.
-    async fn get_ssz(&self, path: &str) -> Result<(ForkName, Option<bool>, Vec<u8>)> {
+    async fn get_ssz(&self, path: &str) -> Result<SszResponse> {
         let url = format!("{}{path}", self.base_url);
         debug!(%url, "Beacon API GET (ssz)");
-        let response = self
+        let request = self
             .client
             .get(&url)
+            .header(reqwest::header::ACCEPT, "application/octet-stream");
+        Self::read_ssz(url, request).await
+    }
+
+    /// POST a JSON body and read the answer as SSZ, the way [`Self::get_ssz`]
+    /// does. For `produceBlockV4`, which is a POST because it carries the
+    /// builder configuration, and answers in SSZ like its predecessor.
+    async fn post_json_for_ssz(
+        &self,
+        path: &str,
+        json_body: &'static str,
+        consensus_version: &str,
+    ) -> Result<SszResponse> {
+        let url = format!("{}{path}", self.base_url);
+        debug!(%url, "Beacon API POST (json in, ssz out)");
+        let request = self
+            .client
+            .post(&url)
             .header(reqwest::header::ACCEPT, "application/octet-stream")
-            .send()
-            .await
-            .map_err(|err| Error::BeaconNode {
-                url: url.clone(),
-                failure: BeaconNodeFailure::classify(&err),
-                detail: err.to_string(),
-            })?;
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header("Eth-Consensus-Version", consensus_version)
+            .body(json_body);
+        Self::read_ssz(url, request).await
+    }
+
+    async fn read_ssz(url: String, request: reqwest::RequestBuilder) -> Result<SszResponse> {
+        let response = request.send().await.map_err(|err| Error::BeaconNode {
+            url: url.clone(),
+            failure: BeaconNodeFailure::classify(&err),
+            detail: err.to_string(),
+        })?;
 
         let status = response.status();
         if status == StatusCode::SERVICE_UNAVAILABLE {
@@ -233,26 +273,111 @@ impl HttpBeaconNode {
             ))
         })?;
 
-        // Reported, not judged. Only `produceBlockV3` sends this header, so
-        // requiring it here would break every other caller of this helper;
-        // whether its absence matters is the caller's question.
-        let blinded = match header("eth-execution-payload-blinded") {
-            Some(value) if value.eq_ignore_ascii_case("true") => Some(true),
-            Some(value) if value.eq_ignore_ascii_case("false") => Some(false),
-            Some(value) => {
-                return Err(Error::InconsistentResponse(format!(
-                    "Eth-Execution-Payload-Blinded is {value}, expected true or false"
-                )));
-            }
-            None => None,
-        };
+        // Reported, not judged. Each is sent by one endpoint only, so requiring
+        // it here would break every other caller of this helper; whether its
+        // absence matters is the caller's question.
+        let blinded = Self::bool_header(header("eth-execution-payload-blinded"), "Blinded")?;
+        let payload_included =
+            Self::bool_header(header("eth-execution-payload-included"), "Included")?;
 
         let body = response.bytes().await.map_err(|err| Error::BeaconNode {
             url,
             failure: BeaconNodeFailure::classify(&err),
             detail: err.to_string(),
         })?;
-        Ok((fork, blinded, body.to_vec()))
+        Ok(SszResponse {
+            fork,
+            blinded,
+            payload_included,
+            body: body.to_vec(),
+        })
+    }
+
+    /// A `true`/`false` header, `None` when absent, an error when it is
+    /// anything else.
+    fn bool_header(value: Option<String>, name: &str) -> Result<Option<bool>> {
+        match value {
+            Some(value) if value.eq_ignore_ascii_case("true") => Ok(Some(true)),
+            Some(value) if value.eq_ignore_ascii_case("false") => Ok(Some(false)),
+            Some(value) => Err(Error::InconsistentResponse(format!(
+                "Eth-Execution-Payload-{name} is {value}, expected true or false"
+            ))),
+            None => Ok(None),
+        }
+    }
+
+    /// A GET whose success may be a 204, which is an answer ("nothing to
+    /// report") and not a failure.
+    async fn get_optional<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<Option<T>> {
+        let url = format!("{}{path}", self.base_url);
+        debug!(%url, "Beacon API GET");
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|err| Error::BeaconNode {
+                url: url.clone(),
+                failure: BeaconNodeFailure::classify(&err),
+                detail: err.to_string(),
+            })?;
+        if response.status() == StatusCode::NO_CONTENT {
+            return Ok(None);
+        }
+        Self::decode(response).await.map(Some)
+    }
+
+    /// `produceBlockV4`: a POST carrying the builder configuration, asking for
+    /// the self-built payload to be included.
+    ///
+    /// `include_payload=true` saves the proposal a round trip, which matters
+    /// because the whole proposal, envelope included, has to fit before the
+    /// attesters' deadline. The node says whether it complied in
+    /// `Eth-Execution-Payload-Included`, and a missing header is an error for
+    /// the reason the blinded flag's absence is on the v3 path: it selects which
+    /// container the bytes are.
+    async fn produce_gloas_block(&self, request: &BlockRequest) -> Result<ProducedBlock> {
+        let path = format!(
+            "/eth/v4/validator/blocks/{}?randao_reveal={}&graffiti={}&include_payload=true",
+            request.slot,
+            encode_hex(&request.randao_reveal.0),
+            encode_hex(&request.graffiti.0),
+        );
+        let response = self
+            .post_json_for_ssz(&path, BUILDER_CONFIG, request.fork.as_str())
+            .await?;
+        if response.fork != ForkName::Gloas {
+            return Err(Error::InconsistentResponse(format!(
+                "asked for a gloas block for slot {}, node answered with a {} one",
+                request.slot,
+                response.fork.as_str()
+            )));
+        }
+        let included = response.payload_included.ok_or_else(|| {
+            Error::InconsistentResponse(
+                "response carries no Eth-Execution-Payload-Included, so whether the body is \
+                 block contents or a bare block is unknown"
+                    .to_string(),
+            )
+        })?;
+        let block = ProducedBlock::from_gloas_ssz(included, &response.body)?;
+        // Enforced here rather than at the call site so failover works: see the
+        // contract on `BeaconNodeApi::produce_block`.
+        validate_produced_block(request, &block)?;
+        Ok(block)
+    }
+
+    /// The path for one slot's attestation data.
+    ///
+    /// Gloas omits `committee_index`: the parameter is optional there, and the
+    /// answer's `index` is the payload signal rather than a committee, so
+    /// asking about committee 0 would only suggest the old meaning.
+    fn attestation_data_path(slot: Slot, fork: ForkName) -> String {
+        if fork >= ForkName::Gloas {
+            format!("/eth/v1/validator/attestation_data?slot={slot}")
+        } else {
+            format!("/eth/v1/validator/attestation_data?slot={slot}&committee_index=0")
+        }
     }
 
     /// The query string for one aggregate.
@@ -438,12 +563,9 @@ impl BeaconNodeApi for HttpBeaconNode {
         })
     }
 
-    async fn attestation_data(&self, slot: Slot) -> Result<AttestationData> {
-        let response: DataResponse<AttestationDataDto> = self
-            .get(&format!(
-                "/eth/v1/validator/attestation_data?slot={slot}&committee_index=0"
-            ))
-            .await?;
+    async fn attestation_data(&self, slot: Slot, fork: ForkName) -> Result<AttestationData> {
+        let response: DataResponse<AttestationDataDto> =
+            self.get(&Self::attestation_data_path(slot, fork)).await?;
         let data = AttestationData::try_from(&response.data)?;
         // Enforced here rather than at the call site so that failover works:
         // see the contract on `BeaconNodeApi::attestation_data`. An `Err` here
@@ -473,13 +595,21 @@ impl BeaconNodeApi for HttpBeaconNode {
     /// burn the slot's proposal guard entry for a block that can never be
     /// sent.
     async fn produce_block(&self, request: &BlockRequest) -> Result<ProducedBlock> {
+        if request.fork >= ForkName::Gloas {
+            return self.produce_gloas_block(request).await;
+        }
         let path = format!(
             "/eth/v3/validator/blocks/{}?randao_reveal={}&graffiti={}&builder_boost_factor=0",
             request.slot,
             encode_hex(&request.randao_reveal.0),
             encode_hex(&request.graffiti.0),
         );
-        let (fork, blinded, body) = self.get_ssz(&path).await?;
+        let SszResponse {
+            fork,
+            blinded,
+            body,
+            ..
+        } = self.get_ssz(&path).await?;
         // Required on this endpoint, so its absence is an error rather than a
         // default. The specification marks it required precisely because it
         // selects which container the bytes are, and a blinded body is a
@@ -540,6 +670,136 @@ impl BeaconNodeApi for HttpBeaconNode {
         })
     }
 
+    async fn execution_payload_envelope(
+        &self,
+        slot: Slot,
+        block_root: Root,
+    ) -> Result<gloas::ExecutionPayloadEnvelope> {
+        let path = format!(
+            "/eth/v1/validator/execution_payload_envelopes/{slot}/{}",
+            encode_hex(&block_root.0)
+        );
+        let response = self.get_ssz(&path).await?;
+        if response.fork != ForkName::Gloas {
+            return Err(Error::InconsistentResponse(format!(
+                "node answered an envelope request with a {} body",
+                response.fork.as_str()
+            )));
+        }
+        let envelope = gloas::ExecutionPayloadEnvelope::from_ssz_bytes(&response.body)
+            .map_err(|err| Error::Decode(format!("execution payload envelope: {err:?}")))?;
+        // The envelope is signed as it stands, so one for another block must
+        // never reach the signing path. Enforced here so failover can act on it.
+        if envelope.beacon_block_root != block_root {
+            return Err(Error::InconsistentResponse(format!(
+                "asked for the envelope of block {}, node answered with one for block {}",
+                encode_hex(&block_root.0),
+                encode_hex(&envelope.beacon_block_root.0)
+            )));
+        }
+        Ok(envelope)
+    }
+
+    async fn publish_execution_payload_envelope(
+        &self,
+        body: &[u8],
+        blob_data_included: bool,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/eth/v1/beacon/execution_payload_envelopes",
+            self.base_url
+        );
+        let response = self
+            .client
+            .post(&url)
+            .header("Eth-Consensus-Version", ForkName::Gloas.as_str())
+            .header("Eth-Blob-Data-Included", blob_data_included.to_string())
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(body.to_vec())
+            .send()
+            .await
+            .map_err(|err| Error::BeaconNode {
+                url: url.clone(),
+                failure: BeaconNodeFailure::classify(&err),
+                detail: err.to_string(),
+            })?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let body = response.text().await.unwrap_or_default();
+        Err(Error::BeaconNodeStatus {
+            status: status.as_u16(),
+            body,
+        })
+    }
+
+    async fn ptc_duties(&self, epoch: Epoch, indices: &[ValidatorIndex]) -> Result<PtcDuties> {
+        let body: Vec<String> = indices.iter().map(|index| index.to_string()).collect();
+        let response: DutiesResponse<Vec<PtcDutyDto>> = self
+            .post(
+                &format!("/eth/v1/validator/duties/ptc/{epoch}"),
+                &body,
+                None,
+            )
+            .await?;
+        Ok(PtcDuties {
+            dependent_root: parse_root(&response.dependent_root)?,
+            duties: response.data,
+        })
+    }
+
+    async fn payload_attestation_data(
+        &self,
+        slot: Slot,
+    ) -> Result<Option<gloas::PayloadAttestationData>> {
+        let response: Option<VersionedResponse<gloas::PayloadAttestationData>> = self
+            .get_optional(&format!(
+                "/eth/v1/validator/payload_attestation_data?slot={slot}"
+            ))
+            .await?;
+        let Some(response) = response else {
+            return Ok(None);
+        };
+        // Enforced here for the reason the other fetches' checks are: this is
+        // signable material, and a node answering about another slot must be
+        // failed over from rather than signed for.
+        if response.data.slot != slot {
+            return Err(Error::InconsistentResponse(format!(
+                "requested payload attestation data for slot {slot}, node answered for slot {}",
+                response.data.slot
+            )));
+        }
+        Ok(Some(response.data))
+    }
+
+    /// The same partial-success reading as attestations: see
+    /// [`Self::handle_pool_submission`].
+    async fn submit_payload_attestations(
+        &self,
+        messages: &[gloas::PayloadAttestationMessage],
+    ) -> Result<usize> {
+        let url = format!("{}/eth/v1/beacon/pool/payload_attestations", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .header("Eth-Consensus-Version", ForkName::Gloas.as_str())
+            .json(messages)
+            .send()
+            .await
+            .map_err(|err| Error::BeaconNode {
+                url: url.clone(),
+                failure: BeaconNodeFailure::classify(&err),
+                detail: err.to_string(),
+            })?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(messages.len());
+        }
+        let body = response.text().await.unwrap_or_default();
+        Self::handle_pool_submission(status, body, messages.len())
+    }
+
     /// Distinct from `post_no_content`: this endpoint's 400s are not always
     /// total failures. See [`Self::handle_pool_submission`].
     async fn submit_attestations(
@@ -583,7 +843,10 @@ impl BeaconNodeApi for HttpBeaconNode {
         // JSON, not SSZ, and not by preference: Lighthouse answers this endpoint
         // in JSON whatever `Accept` says. See `AttestationDto` for why that is
         // safe here when it would not be for a block.
-        let response: VersionedResponse<AttestationDto> = self.get(&path).await?;
+        //
+        // The body is read as untyped JSON first, because the layout of `data`
+        // depends on the `version` beside it.
+        let response: VersionedResponse<serde_json::Value> = self.get(&path).await?;
         let fork = ForkName::parse(&response.version.to_ascii_lowercase()).ok_or_else(|| {
             Error::InconsistentResponse(format!(
                 "aggregate names fork {}, which this client does not know",
@@ -595,18 +858,14 @@ impl BeaconNodeApi for HttpBeaconNode {
         // Electra widened `Attestation` with `committee_bits`, so an earlier
         // fork's bytes are a different shape and this client has no container
         // for them. Named explicitly rather than `fork < ForkName::Electra`,
-        // so a fork added after fulu is not silently waved through as
-        // electra-shaped.
-        match fork {
-            // Gloas's own attestation shape is not this client's electra one
-            // (EIP-7549 continues to change under EIP-7688), so it is
-            // refused by name too rather than mis-decoded.
+        // so a fork added after gloas is not silently waved through as
+        // gloas-shaped.
+        let attestation = match fork {
             ForkName::Phase0
             | ForkName::Altair
             | ForkName::Bellatrix
             | ForkName::Capella
             | ForkName::Deneb
-            | ForkName::Gloas
             | ForkName::Lean => {
                 return Err(Error::InconsistentResponse(format!(
                     "node produced a {} aggregate, which this client does not publish; electra \
@@ -614,19 +873,29 @@ impl BeaconNodeApi for HttpBeaconNode {
                     fork.as_str()
                 )));
             }
-            ForkName::Electra | ForkName::Fulu => {}
-        }
-        let attestation = Attestation::try_from(&response.data)?;
+            ForkName::Electra | ForkName::Fulu => {
+                let dto: AttestationDto = serde_json::from_value(response.data)
+                    .map_err(|err| Error::Decode(format!("electra aggregate: {err}")))?;
+                AggregateKind::Electra(Attestation::try_from(&dto)?)
+            }
+            // Gloas's attestation is its own container, with its own hash tree
+            // root, so it is decoded as one and signed over as one.
+            ForkName::Gloas => {
+                let attestation: gloas::Attestation = serde_json::from_value(response.data)
+                    .map_err(|err| Error::Decode(format!("gloas aggregate: {err}")))?;
+                AggregateKind::Gloas(attestation)
+            }
+        };
         // The same contract the other two fetches carry, enforced here so a
         // node answering about the wrong slot is failed over from rather than
         // wrapped in a signature. `committee_index` is deliberately not checked
         // against `committee_bits`: which committees an aggregate covers is the
         // node's answer to the question, and electra's gossip rules already
         // require exactly one.
-        if attestation.data.slot != slot {
+        if attestation.data().slot != slot {
             return Err(Error::InconsistentResponse(format!(
                 "requested an aggregate for slot {slot}, node answered for slot {}",
-                attestation.data.slot
+                attestation.data().slot
             )));
         }
         Ok(AggregateAttestation { fork, attestation })
@@ -637,18 +906,23 @@ impl BeaconNodeApi for HttpBeaconNode {
     async fn publish_aggregates(
         &self,
         fork: ForkName,
-        aggregates: &[SignedAggregateAndProof],
+        aggregates: &SignedAggregates,
     ) -> Result<()> {
-        let body: Vec<SignedAggregateAndProofOutDto> = aggregates
-            .iter()
-            .map(SignedAggregateAndProofOutDto::from)
-            .collect();
-        self.post_no_content(
-            "/eth/v2/validator/aggregate_and_proofs",
-            &body,
-            Some(fork.as_str()),
-        )
-        .await
+        const PATH: &str = "/eth/v2/validator/aggregate_and_proofs";
+        match aggregates {
+            SignedAggregates::Electra(list) => {
+                let body: Vec<SignedAggregateAndProofOutDto> = list
+                    .iter()
+                    .map(SignedAggregateAndProofOutDto::from)
+                    .collect();
+                self.post_no_content(PATH, &body, Some(fork.as_str())).await
+            }
+            // The gloas container serialises as the endpoint's JSON itself
+            // (hex bitfields, quoted integers), so there is no second DTO.
+            SignedAggregates::Gloas(list) => {
+                self.post_no_content(PATH, list, Some(fork.as_str())).await
+            }
+        }
     }
 
     async fn prepare_beacon_proposer(&self, preparations: &[ProposerPreparationDto]) -> Result<()> {
@@ -771,5 +1045,41 @@ mod tests {
         for parameter in ["attestation_data_root=", "slot=", "committee_index="] {
             assert!(path.contains(parameter), "{parameter} missing from {path}");
         }
+    }
+
+    /// Before gloas the query still names committee 0, exactly as it always
+    /// has; from gloas it is omitted.
+    #[test]
+    fn the_committee_index_is_omitted_from_gloas_on() {
+        assert_eq!(
+            HttpBeaconNode::attestation_data_path(96, ForkName::Fulu),
+            "/eth/v1/validator/attestation_data?slot=96&committee_index=0"
+        );
+        assert_eq!(
+            HttpBeaconNode::attestation_data_path(96, ForkName::Gloas),
+            "/eth/v1/validator/attestation_data?slot=96"
+        );
+    }
+
+    /// The body `produceBlockV4` requires: self-build only, so no builders.
+    #[test]
+    fn the_builder_config_is_the_documented_self_build_body() {
+        let value: serde_json::Value = serde_json::from_str(BUILDER_CONFIG).expect("valid json");
+        assert_eq!(value["min_bid"], "0");
+        assert_eq!(value["builder_boost_factor"], "0");
+        assert_eq!(value["builders"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn a_boolean_header_is_read_strictly() {
+        assert_eq!(
+            HttpBeaconNode::bool_header(Some("True".into()), "Included").expect("ok"),
+            Some(true)
+        );
+        assert_eq!(
+            HttpBeaconNode::bool_header(None, "Included").expect("ok"),
+            None
+        );
+        HttpBeaconNode::bool_header(Some("yes".into()), "Included").expect_err("not a boolean");
     }
 }
