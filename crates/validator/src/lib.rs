@@ -70,6 +70,7 @@ use crate::beacon_node::{BeaconNodeApi, Published};
 use crate::duties::DutiesService;
 use crate::keys::ValidatorStore;
 use crate::payload_attestation::PayloadAttestationService;
+use crate::preferences::PreferencesService;
 use crate::proposal::ProposalService;
 use crate::proposer_settings::ProposerSettings;
 use crate::registration::RegistrationService;
@@ -236,6 +237,14 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         ))
     });
 
+    // Unconditional, as Lighthouse does: from gloas the preferences carry the
+    // fee recipient of every proposal, builders or not. See the module doc.
+    let preferences = Arc::new(PreferencesService::new(
+        beacon_node.clone(),
+        context.clone(),
+        settings.clone(),
+    ));
+
     if let Some(address) = config.keymanager {
         let token = http_api::load_or_create_token(&config.validators_dir)?;
         let context = http_api::KeymanagerContext {
@@ -382,6 +391,10 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         if let Some(registration) = &registration {
             tokio::spawn(registration.clone().register_changed(epoch, store.clone()));
         }
+
+        // Likewise off the slot loop: the poll is single-flight, and a slow
+        // node must not delay the next slot's duties.
+        tokio::spawn(preferences.clone().poll(slot, store.clone()));
     }
 }
 

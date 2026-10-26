@@ -133,8 +133,9 @@ pub struct BlockRequest {
     pub graffiti: Bytes32,
     /// The `builder_boost_factor` to send, or `None` when builder proposals are
     /// off. `None` sends `0` and refuses a blinded answer; `Some` sends the
-    /// factor and accepts one. Ignored from gloas, where `produceBlockV4` takes
-    /// the builder configuration in its body.
+    /// factor and accepts one. From gloas the factor travels in
+    /// `produceBlockV4`'s body instead of the query, so a pooled p2p bid can
+    /// win on value; a gloas answer is never blinded.
     pub builder_boost_factor: Option<u64>,
 }
 

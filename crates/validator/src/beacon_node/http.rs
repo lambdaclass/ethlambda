@@ -79,10 +79,17 @@ struct SszResponse {
     body: Vec<u8>,
 }
 
-/// The body `produceBlockV4` requires. Self-build only, so no minimum bid, no
-/// boost and no builders: the node decodes it, as the specification demands,
-/// and builds locally.
-const BUILDER_CONFIG: &str = r#"{"min_bid":"0","builder_boost_factor":"0","builders":[]}"#;
+/// The body `produceBlockV4` requires: the node decodes it, as the
+/// specification demands, even when it builds locally.
+///
+/// `min_bid` stays `0` and `builders` stays empty, since the builder API
+/// (relay or `builder_pubkeys` bids) is a later phase. The factor is the
+/// configured `builder_boost_factor` with `--builder-proposals`, so a pooled
+/// p2p bid can win on value, and `0` without it: self-build only, as before.
+fn builder_config(boost_factor: Option<u64>) -> String {
+    let factor = boost_factor.unwrap_or(0);
+    format!(r#"{{"min_bid":"0","builder_boost_factor":"{factor}","builders":[]}}"#)
+}
 
 /// A [`BeaconNodeApi`] backed by one beacon node's standard REST Beacon API.
 pub struct HttpBeaconNode {
@@ -256,7 +263,7 @@ impl HttpBeaconNode {
     async fn post_json_for_ssz(
         &self,
         path: &str,
-        json_body: &'static str,
+        json_body: String,
         consensus_version: &str,
     ) -> Result<SszResponse> {
         let url = format!("{}{path}", self.base_url);
@@ -393,7 +400,11 @@ impl HttpBeaconNode {
             encode_hex(&request.graffiti.0),
         );
         let response = self
-            .post_json_for_ssz(&path, BUILDER_CONFIG, request.fork.as_str())
+            .post_json_for_ssz(
+                &path,
+                builder_config(request.builder_boost_factor),
+                request.fork.as_str(),
+            )
             .await?;
         if response.fork != ForkName::Gloas {
             return Err(Error::InconsistentResponse(format!(
@@ -1330,13 +1341,35 @@ mod tests {
         );
     }
 
-    /// The body `produceBlockV4` requires: self-build only, so no builders.
+    /// The body `produceBlockV4` requires: no minimum bid and no builders,
+    /// the boost factor being the configured one or `0`.
     #[test]
-    fn the_builder_config_is_the_documented_self_build_body() {
-        let value: serde_json::Value = serde_json::from_str(BUILDER_CONFIG).expect("valid json");
-        assert_eq!(value["min_bid"], "0");
-        assert_eq!(value["builder_boost_factor"], "0");
-        assert_eq!(value["builders"], serde_json::json!([]));
+    fn the_builder_config_carries_the_factor_or_zero() {
+        for (factor, expected) in [(None, "0"), (Some(250), "250"), (Some(0), "0")] {
+            let value: serde_json::Value =
+                serde_json::from_str(&builder_config(factor)).expect("valid json");
+            assert_eq!(value["min_bid"], "0");
+            assert_eq!(value["builder_boost_factor"], expected, "{factor:?}");
+            assert_eq!(value["builders"], serde_json::json!([]));
+        }
+    }
+
+    /// The body reaches the wire: a gloas production request posts it.
+    #[tokio::test]
+    async fn a_gloas_production_request_posts_the_factor_in_its_body() {
+        for (factor, expected) in [(None, "0"), (Some(250), "250")] {
+            let served = serve(500, vec![], vec![]).await;
+            let request = BlockRequest {
+                fork: ForkName::Gloas,
+                ..block_request(factor)
+            };
+            let _ = served.node.produce_block(&request).await;
+            let seen = served.seen.lock().expect("lock");
+            assert_eq!(seen.len(), 1);
+            assert!(seen[0].0.contains("/eth/v4/validator/blocks/5"));
+            let body: serde_json::Value = serde_json::from_slice(&seen[0].1).expect("json body");
+            assert_eq!(body["builder_boost_factor"], expected);
+        }
     }
 
     /// A Beacon API double that answers every route the same way: whatever
