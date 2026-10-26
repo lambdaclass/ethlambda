@@ -420,18 +420,29 @@ fn valid_blob(seed: u8) -> Vec<u8> {
 /// The fulu bundle carries `blob_count` valid blobs with their commitments and
 /// cell proofs (flattened blob by blob, as `BlobsBundleV2` does).
 pub(super) async fn fake_execution_client(blob_count: usize) -> ethlambda_engine::EngineClient {
-    fake_execution_client_with(blob_count, None).await
+    fake_execution_client_with(blob_count, None, "0x2a", false).await
+}
+
+/// [`fake_execution_client`] with no blobs, whose fulu payload pays
+/// `block_value` (hex wei) and carries `should_override_builder`.
+pub(super) async fn fake_execution_client_paying(
+    block_value: &'static str,
+    should_override_builder: bool,
+) -> ethlambda_engine::EngineClient {
+    fake_execution_client_with(0, None, block_value, should_override_builder).await
 }
 
 /// [`fake_execution_client`] whose gloas payloads carry `blob`, with its real
 /// commitment and cell proofs, in the blobs bundle.
 async fn fake_execution_client_with_blob(blob: Option<Vec<u8>>) -> ethlambda_engine::EngineClient {
-    fake_execution_client_with(0, blob).await
+    fake_execution_client_with(0, blob, "0x2a", false).await
 }
 
 async fn fake_execution_client_with(
     blob_count: usize,
     blob: Option<Vec<u8>>,
+    block_value: &'static str,
+    should_override_builder: bool,
 ) -> ethlambda_engine::EngineClient {
     use axum::{Json, routing::post};
     use ethlambda_state_transition::beacon::kzg;
@@ -513,9 +524,9 @@ async fn fake_execution_client_with(
                     v5_payload["blobGasUsed"] = blob_gas_used.clone().into();
                     serde_json::json!({
                         "executionPayload": v5_payload,
-                        "blockValue": "0x2a",
+                        "blockValue": block_value,
                         "blobsBundle": { "commitments": commitments, "proofs": proofs, "blobs": blobs },
-                        "shouldOverrideBuilder": false,
+                        "shouldOverrideBuilder": should_override_builder,
                         "executionRequests": [],
                     })
                 }
