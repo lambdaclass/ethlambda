@@ -76,7 +76,15 @@ impl BuilderClient {
         user_agent: &str,
     ) -> Result<Self, BuilderError> {
         let base_url = base_url.into();
-        reqwest::Url::parse(&base_url).map_err(|err| BuilderError::InvalidUrl(err.to_string()))?;
+        let url = reqwest::Url::parse(&base_url)
+            .map_err(|err| BuilderError::InvalidUrl(err.to_string()))?;
+        // `localhost:18550` parses, with `localhost` as its scheme.
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(BuilderError::InvalidUrl(format!(
+                "expected an http or https url, got scheme {:?}",
+                url.scheme()
+            )));
+        }
         let http = reqwest::Client::builder()
             .user_agent(user_agent)
             .build()

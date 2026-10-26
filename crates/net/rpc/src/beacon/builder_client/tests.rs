@@ -207,7 +207,7 @@ async fn a_long_error_is_cut_short() {
     let Err(BuilderError::BadRequest(message)) = get_header(&client_for(&relay)).await else {
         panic!("expected a bad request");
     };
-    assert!(message.len() <= 1024);
+    assert_eq!(message.len(), 1024);
 }
 
 #[tokio::test]
@@ -282,6 +282,14 @@ async fn an_oversized_answer_is_refused() {
 async fn an_invalid_url_is_refused_up_front() {
     assert!(matches!(
         BuilderClient::new("not a url", HEADER_TIMEOUT, "ethlambda/test"),
+        Err(BuilderError::InvalidUrl(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_url_without_a_scheme_is_refused_up_front() {
+    assert!(matches!(
+        BuilderClient::new("localhost:18550", HEADER_TIMEOUT, "ethlambda/test"),
         Err(BuilderError::InvalidUrl(_))
     ));
 }
