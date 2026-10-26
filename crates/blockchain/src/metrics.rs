@@ -960,6 +960,33 @@ static LEAN_BEACON_BLOCKS_REFUSED_BEFORE_WAITING_TOTAL: std::sync::LazyLock<IntC
         .unwrap()
     });
 
+static LEAN_ENVELOPES_AWAITING_BLOCK: std::sync::LazyLock<IntGauge> =
+    std::sync::LazyLock::new(|| {
+        register_int_gauge!(
+            "lean_envelopes_awaiting_block",
+            "Execution payload envelopes held until their block is imported"
+        )
+        .unwrap()
+    });
+
+static LEAN_ENVELOPES_AWAITING_COLUMNS: std::sync::LazyLock<IntGauge> =
+    std::sync::LazyLock::new(|| {
+        register_int_gauge!(
+            "lean_envelopes_awaiting_columns",
+            "Execution payload envelopes held until their custody columns are stored"
+        )
+        .unwrap()
+    });
+
+static LEAN_BLOCKS_AWAITING_PARENT_PAYLOAD: std::sync::LazyLock<IntGauge> =
+    std::sync::LazyLock::new(|| {
+        register_int_gauge!(
+            "lean_blocks_awaiting_parent_payload",
+            "Blocks held until their FULL parent's execution payload envelope is verified"
+        )
+        .unwrap()
+    });
+
 static LEAN_SIDECARS_AWAITING_PARENT: std::sync::LazyLock<IntGauge> =
     std::sync::LazyLock::new(|| {
         register_int_gauge!(
@@ -1084,6 +1111,9 @@ pub fn init() {
     // Data column sidecars.
     std::sync::LazyLock::force(&LEAN_DATA_COLUMNS_STORED_TOTAL);
     LEAN_BLOCKS_HELD_FOR_COLUMNS.set(0);
+    LEAN_ENVELOPES_AWAITING_BLOCK.set(0);
+    LEAN_ENVELOPES_AWAITING_COLUMNS.set(0);
+    LEAN_BLOCKS_AWAITING_PARENT_PAYLOAD.set(0);
 }
 
 // --- Public API ---
@@ -1442,6 +1472,25 @@ pub fn inc_beacon_blocks_refused_before_waiting(reason: &'static str, wait: &'st
     LEAN_BEACON_BLOCKS_REFUSED_BEFORE_WAITING_TOTAL
         .with_label_values(&[reason, wait])
         .inc();
+}
+
+/// Execution payload envelopes held until their block is imported.
+///
+/// Nobody has vouched for these (the block that would judge them is not here
+/// yet), so a value that stays up means envelopes are arriving for blocks this
+/// node never gets.
+pub fn set_envelopes_awaiting_block(count: u64) {
+    LEAN_ENVELOPES_AWAITING_BLOCK.set(count as i64);
+}
+
+/// Execution payload envelopes held until every sampled column is stored.
+pub fn set_envelopes_awaiting_columns(count: u64) {
+    LEAN_ENVELOPES_AWAITING_COLUMNS.set(count as i64);
+}
+
+/// Blocks held until their FULL parent's execution payload is verified.
+pub fn set_blocks_awaiting_parent_payload(count: u64) {
+    LEAN_BLOCKS_AWAITING_PARENT_PAYLOAD.set(count as i64);
 }
 
 /// Sidecars currently parked against a parent root with no post-state.
