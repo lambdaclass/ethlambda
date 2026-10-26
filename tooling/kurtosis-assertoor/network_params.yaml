@@ -1,0 +1,60 @@
+# The assertoor battery for ethlambda: a mainnet-preset devnet from
+# lambdaclass/ethereum-package (the fork that adds `cl_type: ethlambda` and
+# `vc_type: ethlambda`), with ethereum-package's built-in assertoor checking
+# every client pair. See README.md ("Run it locally") for the steps. The package
+# comes from a clone of lambdaclass/ethereum-package at the commit pinned in
+# .github/workflows/kurtosis_assertoor.yml (ETHEREUM_PACKAGE_REF), since kurtosis
+# refuses the fork as a remote package.
+#
+# Participants, in the order ethereum-package launches them:
+#   1. lighthouse + geth, lighthouse validator. It has to come first: the first
+#      participant is the network's bootnode, and ethlambda does not report an
+#      ENR over the beacon API.
+#   2. lighthouse + geth, validated by the ethlambda validator client, so the
+#      validator client is checked against a beacon node that is not ethlambda.
+#   3. ethlambda beacon node + geth, validated by the ethlambda validator client.
+#
+# Every participant holds validators, so block-proposal-check can require each
+# client pair to propose. The workflow rewrites the `cl_image` and `vc_image`
+# of the ethlambda entries (selected by type, not position) to the image under
+# test; the values below are what a local run uses.
+participants:
+  - el_type: geth
+    cl_type: lighthouse
+  - el_type: geth
+    cl_type: lighthouse
+    vc_type: ethlambda
+    vc_image: ghcr.io/lambdaclass/ethlambda:unstable
+  - el_type: geth
+    cl_type: ethlambda
+    cl_image: ghcr.io/lambdaclass/ethlambda:unstable
+    vc_type: ethlambda
+    vc_image: ghcr.io/lambdaclass/ethlambda:unstable
+network_params:
+  # ethlambda only supports the mainnet preset: 32-slot epochs of 12 s.
+  preset: mainnet
+  # Fulu is the last fork ethlambda processes; gloas stays unscheduled.
+  electra_fork_epoch: 0
+  fulu_fork_epoch: 0
+additional_services:
+  - assertoor
+# The image and the playbooks come from one assertoor commit, so a playbook
+# never names a task the image lacks. Bump the three together. The built-in
+# `run_*_check` flags are off because they run the fork's older copies of the
+# playbooks.
+assertoor_params:
+  image: ethpandaops/assertoor:master-87bbbd6
+  tests:
+    # Finality and participation. Every validator is held by a lighthouse or an
+    # ethlambda validator client, so passing means ethlambda beacon and its
+    # validator client attest and finalize with everyone else.
+    - file: https://raw.githubusercontent.com/ethpandaops/assertoor/87bbbd6c4efbe88be2cd2d0f40ca828d9e8f7088/playbooks/stable/stability-check.yaml
+      timeout: 75m
+    # Every client pair holding validators proposes at least one block.
+    - file: https://raw.githubusercontent.com/ethpandaops/assertoor/87bbbd6c4efbe88be2cd2d0f40ca828d9e8f7088/playbooks/stable/block-proposal-check.yaml
+      timeout: 45m
+    # Every CL and EL client reports synced. The playbook's own timeout is 12 h
+    # (it is meant to be left running); the test-level timeout bounds it, and it
+    # returns as soon as every pair is synced.
+    - file: https://raw.githubusercontent.com/ethpandaops/assertoor/87bbbd6c4efbe88be2cd2d0f40ca828d9e8f7088/playbooks/dev/synchronized-check.yaml
+      timeout: 20m
