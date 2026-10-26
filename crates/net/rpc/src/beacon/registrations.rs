@@ -3,7 +3,9 @@
 //! builder `--builder` names.
 //!
 //! Validators that the head state does not hold, or holds as exited, are
-//! dropped and counted rather than refused: the beacon-APIs say they must
+//! dropped and counted rather than refused. Exit is judged at the later of
+//! the head's epoch and the wall clock's, so a lagging head cannot let an
+//! exited validator through: the beacon-APIs say they must
 //! not reach the builder, not that the request fails. Each kept
 //! registration also becomes its validator's fee recipient, as
 //! `prepare_beacon_proposer` would make it, so a block built locally after
@@ -95,25 +97,25 @@ async fn register(
         .map(|(_, registration)| registration)
         .collect();
     // On its own task: a validator client that hangs up drops this handler,
-    // and the forward must complete regardless.
-    let count = kept.len() as u64;
-    let forwarded = tokio::spawn(async move { builder.register_validators(&kept).await })
-        .await
-        .map_err(|_| ApiError::Internal("forwarding the registrations failed"))?;
-    match forwarded {
-        Ok(()) => {
-            inc_builder_registrations("forwarded", count);
-            Ok(())
+    // and the forward, its count and its log must complete regardless.
+    let forwarded = tokio::spawn(async move {
+        let count = kept.len() as u64;
+        let result = builder.register_validators(&kept).await;
+        match &result {
+            Ok(()) => inc_builder_registrations("forwarded", count),
+            Err(err) => {
+                inc_builder_registrations("failed", count);
+                warn!(%err, count, "Builder did not take the registrations");
+            }
         }
-        Err(err) => {
-            inc_builder_registrations("failed", count);
-            warn!(%err, count, "Builder did not take the registrations");
-            Err(match err {
-                BuilderError::BadRequest(message) => ApiError::BadRequestDetail(message),
-                _ => ApiError::Internal("the builder did not take the registrations"),
-            })
-        }
-    }
+        result
+    })
+    .await
+    .map_err(|_| ApiError::Internal("forwarding the registrations failed"))?;
+    forwarded.map_err(|err| match err {
+        BuilderError::BadRequest(message) => ApiError::BadRequestDetail(message),
+        _ => ApiError::Internal("the builder did not take the registrations"),
+    })
 }
 
 /// The request body: a JSON array, or the SSZ list builder-specs defines.
@@ -131,8 +133,8 @@ fn decode(
 }
 
 /// The registrations whose validator `state` holds as active or pending at
-/// the later of its own epoch and `wall_epoch`, each with its validator index. One pass over the registry,
-/// whatever the number of registrations.
+/// the later of its own epoch and `wall_epoch`, each with its validator
+/// index. One pass over the registry, whatever the number of registrations.
 fn active_or_pending(
     state: &BeaconState,
     registrations: Vec<SignedValidatorRegistrationV1>,
@@ -473,5 +475,29 @@ mod tests {
         let (status, body) = post(store, None, FeeRecipients::default(), request).await;
 
         assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{body}");
+    }
+
+    #[tokio::test]
+    async fn an_exit_the_wall_clock_has_passed_drops_the_validator() {
+        // The head is at epoch 0 and the clock at epoch 10: an exit at epoch
+        // 5 is in the future for the head and in the past for the clock.
+        let mut state = with_signing_validators_at(ForkName::Fulu, VALIDATORS);
+        state.validator_mut(2).unwrap().exit_epoch = 5;
+        state.apply_pending_mutations();
+        let (store, _) = crate::test_utils::beacon_store_at_clock(state, 32 * 10);
+        let relay = MockRelay::start(genesis_fork_version(&store)).await;
+        let kept = signed_registration(0, genesis_fork_version(&store));
+        let exited = signed_registration(2, genesis_fork_version(&store));
+
+        let (status, body) = post(
+            store,
+            client_for(&relay),
+            FeeRecipients::default(),
+            json_request(&[kept.clone(), exited]),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(relay.registrations(), [kept]);
     }
 }

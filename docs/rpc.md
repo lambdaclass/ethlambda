@@ -413,7 +413,9 @@ the chain actor writes, so no request waits on the actor.
 - **`register_validator`** takes a JSON array or an SSZ list of signed
   builder registrations. Registrations of validators the head state does not
   hold, or holds as exited, are dropped and counted
-  (`lean_beacon_builder_registrations_total`), not refused: the beacon-APIs say
+  (`lean_beacon_builder_registrations_total`), not refused. Exit is judged at
+  the later of the head's epoch and the wall clock's, so a lagging head cannot
+  let an exited validator through. The beacon-APIs say
   they must not reach the builder, not that the request fails. Each kept
   registration also sets its validator's fee recipient, so a block built
   locally still pays the registered address. The kept ones go to `--builder` in
