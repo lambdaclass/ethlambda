@@ -2,4 +2,5 @@
 //! the chain is too unhealthy to, whether a bid is acceptable, and which
 //! payload goes into the block.
 
+pub(crate) mod breaker;
 pub(crate) mod cache;
