@@ -23,14 +23,16 @@
 //!
 //! [`get_beacon_proposer_index`] here does not replace
 //! [`super::accessors::get_beacon_proposer_index`] in place: the two coexist,
-//! fulu's reading the precomputed window and every earlier fork's computing
-//! on demand, and that accessor dispatches between them by fork itself,
-//! rather than each of *its* own callers doing so, the same split
+//! this one reading the precomputed window (for fulu and, unchanged, gloas
+//! too; see `containers::gloas`'s module doc) and every earlier fork
+//! computing on demand, and that accessor dispatches between them by fork
+//! itself, rather than each of *its* own callers doing so, the same split
 //! [`super::altair::altair_state_ref`] documents for altair's
-//! participation-flag fields. A state older than fulu has no
-//! `proposer_lookahead` to read, so [`get_beacon_proposer_index`] fails
-//! through [`fulu_state_ref`] rather than falling back to the on-demand
-//! computation.
+//! participation-flag fields. A state with no `proposer_lookahead` to read
+//! fails through the narrower `proposer_lookahead` projection rather than
+//! falling back to the on-demand computation; that projection is scoped to
+//! this one field, not [`fulu_state_ref`], since gloas does not carry every
+//! field that one gates (`latest_execution_payload_header` among them).
 //!
 //! [`compute_proposer_indices`] and [`get_beacon_proposer_indices`] are the
 //! building blocks the window is filled from. Both take a [`BeaconState`] of
@@ -125,22 +127,67 @@ pub fn get_beacon_proposer_indices(
     compute_proposer_indices(state, epoch, seed, &indices)
 }
 
+/// The `proposer_lookahead` field, for whichever fork's state carries it.
+///
+/// Fulu introduces it; gloas keeps it at the identical type unchanged (see
+/// `containers::gloas`'s module doc), so both variants read through here
+/// rather than gloas carrying a duplicate accessor of its own. Scoped to
+/// this one field rather than widening [`fulu_state_ref`], which also gates
+/// `latest_execution_payload_header`, a field gloas does not carry at all,
+/// so that projection has nothing true to answer for a gloas state.
+fn proposer_lookahead<'a>(
+    state: &'a BeaconState,
+    function: &'static str,
+) -> Result<&'a fulu::ProposerLookahead> {
+    match state {
+        BeaconState::Fulu(inner) => Ok(&inner.proposer_lookahead),
+        BeaconState::Gloas(inner) => Ok(&inner.proposer_lookahead),
+        other => Err(Error::UnsupportedForFork {
+            function,
+            fork: other.fork_name(),
+        }),
+    }
+}
+
+/// The `proposer_lookahead` field, mutably. See [`proposer_lookahead`] for
+/// why this is scoped to fulu and gloas rather than widening
+/// [`fulu_state`]/[`fulu_state_ref`].
+///
+/// `pub(crate)`: `crate::beacon::stf::epoch::fulu::process_proposer_lookahead`,
+/// shared by both forks (see that module's own doc), is the one caller.
+pub(crate) fn proposer_lookahead_mut<'a>(
+    state: &'a mut BeaconState,
+    function: &'static str,
+) -> Result<&'a mut fulu::ProposerLookahead> {
+    match state {
+        BeaconState::Fulu(inner) => Ok(&mut inner.proposer_lookahead),
+        BeaconState::Gloas(inner) => Ok(&mut inner.proposer_lookahead),
+        other => Err(Error::UnsupportedForFork {
+            function,
+            fork: other.fork_name(),
+        }),
+    }
+}
+
 /// The proposer for the state's current slot.
 ///
 /// Fulu's replacement for [`super::accessors::get_beacon_proposer_index`]: a
 /// lookup into the current epoch's slice of `proposer_lookahead` rather than
 /// a shuffle computed on demand. See the module docs for why that lookup is
 /// possible at all and why the on-demand version is not simply reused here.
+///
+/// Also gloas's: gloas does not redefine this function (`containers::gloas`'s
+/// module doc), so [`super::accessors::get_beacon_proposer_index`] routes
+/// both `Fulu` and `Gloas` here rather than gloas carrying a copy of its own.
 pub fn get_beacon_proposer_index(state: &BeaconState) -> Result<ValidatorIndex> {
-    let fulu_state = fulu_state_ref(state, "get_beacon_proposer_index")?;
+    let lookahead = proposer_lookahead(state, "get_beacon_proposer_index")?;
     let index = (state.slot() % preset::SLOTS_PER_EPOCH) as usize;
-    fulu_state
-        .proposer_lookahead
+    lookahead
         .get(index)
         .copied()
         .ok_or(Error::IndexOutOfBounds {
             index,
-            len: fulu_state.proposer_lookahead.len(),
+            len: lookahead.len(),
         })
 }
 

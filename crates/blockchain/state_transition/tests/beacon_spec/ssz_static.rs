@@ -18,7 +18,7 @@
 
 use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::containers::{
-    altair, bellatrix, capella, deneb, electra, fulu, phase0, shared,
+    altair, bellatrix, capella, deneb, electra, fulu, gloas, phase0, shared,
 };
 use ethlambda_state_transition::beacon::primitives::{HashTreeRoot, Root};
 use libssz::{SszDecode, SszEncode};
@@ -116,6 +116,25 @@ pub fn trials() -> Vec<Trial> {
                 "VoluntaryExit" => check::<shared::VoluntaryExit>(case),
                 "SignedVoluntaryExit" => check::<shared::SignedVoluntaryExit>(case),
 
+                // Gloas (EIP-7688) widens the attestation containers again,
+                // from electra's bounded lists to unbounded progressive ones,
+                // so these arms have to come before the `>= Electra` arms
+                // below, which would otherwise catch a gloas case first and
+                // check it against electra's bounded shape.
+                "Attestation" if fork == ForkName::Gloas => check::<gloas::Attestation>(case),
+                "IndexedAttestation" if fork == ForkName::Gloas => {
+                    check::<gloas::IndexedAttestation>(case)
+                }
+                "AttesterSlashing" if fork == ForkName::Gloas => {
+                    check::<gloas::AttesterSlashing>(case)
+                }
+                "AggregateAndProof" if fork == ForkName::Gloas => {
+                    check::<gloas::AggregateAndProof>(case)
+                }
+                "SignedAggregateAndProof" if fork == ForkName::Gloas => {
+                    check::<gloas::SignedAggregateAndProof>(case)
+                }
+
                 // Electra reshapes the attestation containers, widening the
                 // aggregation bits and attesting indices from one committee to a
                 // whole slot's worth, so phase0's definitions hold only through
@@ -175,6 +194,11 @@ pub fn trials() -> Vec<Trial> {
                 // Fulu appends proposer_lookahead to electra's state, so unlike
                 // the block family below it needs its own type here.
                 "BeaconState" if fork == ForkName::Fulu => check::<fulu::BeaconState>(case),
+                // Gloas (EIP-7732/EIP-7688) reshapes the state again: the
+                // registry and several other lists become progressive, and
+                // the builder registry and payload-timeliness bookkeeping are
+                // new fields, so it needs its own type too.
+                "BeaconState" if fork == ForkName::Gloas => check::<gloas::BeaconState>(case),
 
                 "BeaconBlock" if fork == ForkName::Phase0 => check::<phase0::BeaconBlock>(case),
                 "BeaconBlockBody" if fork == ForkName::Phase0 => {
@@ -216,6 +240,19 @@ pub fn trials() -> Vec<Trial> {
                 }
                 "SignedBeaconBlock" if fork == ForkName::Deneb => {
                     check::<deneb::SignedBeaconBlock>(case)
+                }
+
+                // Gloas (EIP-7732) moves the execution payload out of the body
+                // into a separate envelope and adds the bid and payload
+                // attestations instead, so it needs its own block family
+                // rather than electra's. Ahead of the `>= Electra` arms below,
+                // which would otherwise catch a gloas case first.
+                "BeaconBlock" if fork == ForkName::Gloas => check::<gloas::BeaconBlock>(case),
+                "BeaconBlockBody" if fork == ForkName::Gloas => {
+                    check::<gloas::BeaconBlockBody>(case)
+                }
+                "SignedBeaconBlock" if fork == ForkName::Gloas => {
+                    check::<gloas::SignedBeaconBlock>(case)
                 }
 
                 // Fulu does not change the block's shape: its body still carries
@@ -271,11 +308,47 @@ pub fn trials() -> Vec<Trial> {
                 "ExecutionPayloadHeader" if fork == ForkName::Capella => {
                     check::<capella::ExecutionPayloadHeader>(case)
                 }
+                // Gloas (EIP-7732) moves the payload out of the block into a
+                // signed envelope, so there is no header left to commit to in
+                // its place; only `ExecutionPayload` itself still exists, now
+                // progressive (EIP-7688) and carrying `block_access_list`
+                // (EIP-7928) and `slot_number` (EIP-8061). Ahead of the
+                // `>= Deneb` arm below, which would otherwise catch a gloas
+                // case first.
+                "ExecutionPayload" if fork == ForkName::Gloas => {
+                    check::<gloas::ExecutionPayload>(case)
+                }
                 "ExecutionPayload" if fork >= ForkName::Deneb => {
                     check::<deneb::ExecutionPayload>(case)
                 }
                 "ExecutionPayloadHeader" if fork >= ForkName::Deneb => {
                     check::<deneb::ExecutionPayloadHeader>(case)
+                }
+
+                // What `process_execution_payload` hands the execution engine
+                // to validate a proposed payload. Each fork whose own
+                // ExecutionPayload differs in shape needs its own type here,
+                // same as the ExecutionPayload arms above; fulu's payload is
+                // unchanged from electra's, so electra's request type covers
+                // both forks' cases.
+                "NewPayloadRequest" if fork == ForkName::Bellatrix => {
+                    check::<bellatrix::NewPayloadRequest>(case)
+                }
+                "NewPayloadRequest" if fork == ForkName::Capella => {
+                    check::<capella::NewPayloadRequest>(case)
+                }
+                "NewPayloadRequest" if fork == ForkName::Deneb => {
+                    check::<deneb::NewPayloadRequest>(case)
+                }
+                // Gloas's own execution_payload and execution_requests are
+                // progressive, so the request built from them needs its own
+                // type too. Ahead of the `>= Electra` arm below, which would
+                // otherwise catch a gloas case first.
+                "NewPayloadRequest" if fork == ForkName::Gloas => {
+                    check::<gloas::NewPayloadRequest>(case)
+                }
+                "NewPayloadRequest" if fork >= ForkName::Electra => {
+                    check::<electra::NewPayloadRequest>(case)
                 }
 
                 // Transcribed from fork-choice.md rather than beacon-chain.md, and
@@ -311,6 +384,14 @@ pub fn trials() -> Vec<Trial> {
                 "ConsolidationRequest" if fork >= ForkName::Electra => {
                     check::<electra::ConsolidationRequest>(case)
                 }
+                // Gloas (EIP-8282) adds builder deposit and exit requests
+                // alongside electra's three, and the whole container is
+                // progressive (EIP-7688), so it needs its own type. Ahead of
+                // the `>= Electra` arm below, which would otherwise catch a
+                // gloas case first.
+                "ExecutionRequests" if fork == ForkName::Gloas => {
+                    check::<gloas::ExecutionRequests>(case)
+                }
                 "ExecutionRequests" if fork >= ForkName::Electra => {
                     check::<electra::ExecutionRequests>(case)
                 }
@@ -325,14 +406,85 @@ pub fn trials() -> Vec<Trial> {
                 }
 
                 // Data availability sampling is fulu-only: no earlier fork has
-                // these containers at all.
+                // these containers at all. Gloas drops the sidecar's header
+                // and inclusion proof (its commitments are read from the
+                // block's bid instead, see `gloas::DataColumnSidecar`'s own
+                // doc), so it needs its own type there, but `MatrixEntry` and
+                // `DataColumnsByRootIdentifier` are untouched by that change
+                // and gloas's `beacon-chain.md`/`p2p-interface.md` do not
+                // redefine either, so fulu's types cover both forks' cases.
                 "DataColumnSidecar" if fork == ForkName::Fulu => {
                     check::<fulu::DataColumnSidecar>(case)
                 }
-                "MatrixEntry" if fork == ForkName::Fulu => check::<fulu::MatrixEntry>(case),
-                "DataColumnsByRootIdentifier" if fork == ForkName::Fulu => {
+                "DataColumnSidecar" if fork == ForkName::Gloas => {
+                    check::<gloas::DataColumnSidecar>(case)
+                }
+                "MatrixEntry" if matches!(fork, ForkName::Fulu | ForkName::Gloas) => {
+                    check::<fulu::MatrixEntry>(case)
+                }
+                "DataColumnsByRootIdentifier"
+                    if matches!(fork, ForkName::Fulu | ForkName::Gloas) =>
+                {
                     check::<fulu::DataColumnsByRootIdentifier>(case)
                 }
+
+                // Partial columns (gossipsub's Partial Message Extension) are
+                // fulu-only or later, transcribed from the same
+                // `partial-columns/p2p-interface.md` rather than
+                // `beacon-chain.md`. Gloas's own `partial-columns/p2p-interface.md`
+                // modifies fulu's: `CellsBitList` becomes progressive (so
+                // every container holding one gets a different merkleization
+                // even where its field list looks unchanged),
+                // `PartialDataColumnSidecar` drops `header` entirely, and
+                // `PartialDataColumnGroupID` gains `slot`; there is no
+                // `PartialDataColumnHeader` left to define for gloas at all.
+                // See the gloas module's own doc for the detail.
+                "PartialDataColumnSidecar" if fork == ForkName::Fulu => {
+                    check::<fulu::PartialDataColumnSidecar>(case)
+                }
+                "PartialDataColumnSidecar" if fork == ForkName::Gloas => {
+                    check::<gloas::PartialDataColumnSidecar>(case)
+                }
+                "PartialDataColumnPartsMetadata" if fork == ForkName::Fulu => {
+                    check::<fulu::PartialDataColumnPartsMetadata>(case)
+                }
+                "PartialDataColumnPartsMetadata" if fork == ForkName::Gloas => {
+                    check::<gloas::PartialDataColumnPartsMetadata>(case)
+                }
+                "PartialDataColumnHeader" if fork == ForkName::Fulu => {
+                    check::<fulu::PartialDataColumnHeader>(case)
+                }
+                "PartialDataColumnGroupID" if fork == ForkName::Fulu => {
+                    check::<fulu::PartialDataColumnGroupID>(case)
+                }
+                "PartialDataColumnGroupID" if fork == ForkName::Gloas => {
+                    check::<gloas::PartialDataColumnGroupID>(case)
+                }
+
+                // New in gloas (EIP-7732/EIP-8282): the builder registry and
+                // its payment/withdrawal queues, the payload timeliness
+                // committee's attestations, the builder's bid and its
+                // envelope reveal, and the proposer's advance broadcast of
+                // its fee recipient and gas limit preference. None of these
+                // has an earlier-fork shape to fall back to, so each gets an
+                // unconditional arm rather than a fork guard.
+                "Builder" => check::<gloas::Builder>(case),
+                "BuilderPendingPayment" => check::<gloas::BuilderPendingPayment>(case),
+                "BuilderPendingWithdrawal" => check::<gloas::BuilderPendingWithdrawal>(case),
+                "BuilderDepositRequest" => check::<gloas::BuilderDepositRequest>(case),
+                "BuilderExitRequest" => check::<gloas::BuilderExitRequest>(case),
+                "PayloadAttestationData" => check::<gloas::PayloadAttestationData>(case),
+                "PayloadAttestation" => check::<gloas::PayloadAttestation>(case),
+                "PayloadAttestationMessage" => check::<gloas::PayloadAttestationMessage>(case),
+                "IndexedPayloadAttestation" => check::<gloas::IndexedPayloadAttestation>(case),
+                "ExecutionPayloadBid" => check::<gloas::ExecutionPayloadBid>(case),
+                "SignedExecutionPayloadBid" => check::<gloas::SignedExecutionPayloadBid>(case),
+                "ExecutionPayloadEnvelope" => check::<gloas::ExecutionPayloadEnvelope>(case),
+                "SignedExecutionPayloadEnvelope" => {
+                    check::<gloas::SignedExecutionPayloadEnvelope>(case)
+                }
+                "ProposerPreferences" => check::<gloas::ProposerPreferences>(case),
+                "SignedProposerPreferences" => check::<gloas::SignedProposerPreferences>(case),
 
                 // No arm matched, so this crate has no container for this
                 // handler/fork pair, and this is not `LightClient*` (that

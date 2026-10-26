@@ -13,12 +13,13 @@
 //! the per-column grouping a sidecar presents; [`DataColumnsByRootIdentifier`]
 //! is how a request-response peer asks for specific columns of a specific
 //! block. `BeaconBlockBody`, `BeaconBlock`, `SignedBeaconBlock`,
-//! `ExecutionPayload`, and `ExecutionPayloadHeader` are unchanged from electra:
-//! a block still commits to the same `blob_kzg_commitments` it always has,
-//! since sampling changes how the data behind those commitments travels over
-//! the network, not what the block itself contains. This module defines none
-//! of those five; state transition code should import them from
-//! [`super::electra`] and [`super::deneb`] instead.
+//! `ExecutionPayload`, `ExecutionPayloadHeader`, and `NewPayloadRequest` are
+//! unchanged from electra: a block still commits to the same
+//! `blob_kzg_commitments` it always has, since sampling changes how the data
+//! behind those commitments travels over the network, not what the block
+//! itself, or the request the execution engine validates it with, contains.
+//! This module defines none of those six; state transition code should import
+//! them from [`super::electra`] and [`super::deneb`] instead.
 //!
 //! The other change is [`BeaconState::proposer_lookahead`]. Every fork through
 //! electra computes each slot's proposer on demand from the active set and the
@@ -27,9 +28,16 @@
 //! window of upcoming proposers at each epoch boundary, so
 //! `get_beacon_proposer_index` becomes a lookup into that window rather than a
 //! shuffle.
+//!
+//! [`PartialDataColumnSidecar`], [`PartialDataColumnPartsMetadata`],
+//! [`PartialDataColumnHeader`], and [`PartialDataColumnGroupID`] are
+//! transcribed from `fulu/partial-columns/p2p-interface.md`: wire types for
+//! gossipsub's Partial Message Extension, which exchanges the individual
+//! cells and proofs behind a [`DataColumnSidecar`] instead of the whole
+//! thing.
 
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
-use libssz_types::{SszList, SszVector};
+use libssz_types::{SszBitlist, SszList, SszVector};
 
 use super::altair::SyncCommittee;
 use super::deneb::{ExecutionPayloadHeader, KzgCommitments};
@@ -163,6 +171,91 @@ pub struct DataColumnsByRootIdentifier {
     pub block_root: Root,
     #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
     pub columns: ColumnIndices,
+}
+
+// ---------------------------------------------------------------------------
+// Partial columns
+// ---------------------------------------------------------------------------
+//
+// Transcribed from `fulu/partial-columns/p2p-interface.md` rather than
+// `beacon-chain.md`: gossipsub's Partial Message Extension lets a peer
+// exchange individual cells and proofs of a `DataColumnSidecar` instead of
+// the whole thing, and these are that mechanism's wire types. None of the
+// four is ever stored in the state or a block body, the same way
+// `DataColumnSidecar` itself is not: a node reconstructs the full sidecar
+// from these parts before forwarding it to peers that do not support partial
+// messages.
+
+/// A bitfield over the cells of one data column, one bit per blob in the
+/// block, `CellsBitList`.
+pub type CellsBitList = SszBitlist<{ preset::MAX_BLOB_COMMITMENTS_PER_BLOCK }>;
+
+/// A [`PartialDataColumnHeader`] that may or may not be present, encoded as a
+/// list of length zero or one, `OptionalPartialDataColumnHeader`.
+///
+/// A partial message can carry cells before its header has ever been sent, so
+/// the header field has to be optional; SSZ has no `Option`, so the
+/// specification spells "optional" as a list capped at one element instead.
+pub type OptionalPartialDataColumnHeader = SszList<PartialDataColumnHeader, 1>;
+
+/// One column's worth of cells and proofs sent as a gossipsub partial
+/// message, carrying only the cells `cells_present_bitmap` names rather than
+/// a full [`DataColumn`].
+///
+/// `header` is only ever set on an eager push: a peer can only request cells
+/// after it already has the header, so a request-driven response never needs
+/// to repeat it. The column index itself is not a field here; it is inferred
+/// from the gossipsub topic's subnet.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+pub struct PartialDataColumnSidecar {
+    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    pub cells_present_bitmap: CellsBitList,
+    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex_seq::serialize")]
+    pub partial_column: DataColumn,
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    pub kzg_proofs: KzgProofs,
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    pub header: OptionalPartialDataColumnHeader,
+}
+
+/// The two bitmaps peers exchange to negotiate which cells to send: `available`
+/// says which cells a peer holds, `requests` says which ones it wants.
+///
+/// Having a cell but declining to provide it is functionally the same as not
+/// having it, so no third state is needed beyond what the pair of bitmaps
+/// already encodes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+pub struct PartialDataColumnPartsMetadata {
+    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    pub available: CellsBitList,
+    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    pub requests: CellsBitList,
+}
+
+/// The header common to every column of one block: which blobs it commits to,
+/// proof that those commitments belong to the block, and enough of the block
+/// itself to check both.
+///
+/// Sent only on eager pushes, since a peer can only make a request once it
+/// already holds this. `verify_partial_data_column_header_inclusion_proof`
+/// checks `kzg_commitments_inclusion_proof` against
+/// `signed_block_header.message.body_root`, the same shallow proof
+/// [`DataColumnSidecar::kzg_commitments_inclusion_proof`] uses.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+pub struct PartialDataColumnHeader {
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    pub kzg_commitments: KzgCommitments,
+    pub signed_block_header: SignedBeaconBlockHeader,
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    pub kzg_commitments_inclusion_proof: KzgCommitmentsInclusionProof,
+}
+
+/// The gossipsub Partial Message group ID for a block's columns: the SSZ
+/// encoding of this container, prefixed by a version byte, names the group
+/// every partial message about that block's cells belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+pub struct PartialDataColumnGroupID {
+    pub beacon_block_root: Root,
 }
 
 // ---------------------------------------------------------------------------

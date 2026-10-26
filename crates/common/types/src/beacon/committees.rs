@@ -54,7 +54,7 @@ use crate::beacon::signing::compute_epoch_at_slot;
 /// # Why the active set is not memoized on `epoch` or `seed` alone
 ///
 /// `get_active_validator_indices` reads `activation_epoch` and `exit_epoch`
-/// off every validator in `state.validators()`, so it is a function of the
+/// off every validator in `state.iter_validators()`, so it is a function of the
 /// state's registry, not of `epoch` or `seed` alone. Two different states can
 /// share an epoch number, or even a seed (it comes from a RANDAO mix fixed
 /// before either state's fork point, so two sibling branches diverging
