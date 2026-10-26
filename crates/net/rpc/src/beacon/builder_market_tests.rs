@@ -1060,6 +1060,74 @@ async fn valid_preferences_are_cached_and_published_once() {
     assert_eq!(world.network.proposer_preferences.lock().unwrap().len(), 1);
 }
 
+/// The validator client's own signer and HTTP client against this node's
+/// gossip rules: the domain `sign_proposer_preferences` picks (the fork of the
+/// epoch before the proposal's) is the one `validate_proposer_preferences_gossip`
+/// verifies under, and the JSON the client posts is what the route decodes.
+///
+/// The fork-boundary case (a preference for the first gloas epoch, signed
+/// under the fulu version) is not driven here: this world's schedule has gloas
+/// at epoch 0 and a second world in the epoch before the fork would be a new
+/// chain fixture. `signing.rs` pins that domain in a unit test.
+#[tokio::test]
+async fn preferences_signed_by_the_validator_client_pass_this_nodes_gossip_rules() {
+    use ethlambda_validator::{
+        beacon_node::{BeaconNodeApi as _, http::HttpBeaconNode},
+        keys::ValidatorStore,
+        signing::SigningContext,
+    };
+
+    let world = World::new();
+    let proposer = world.prepared().proposer;
+    let dependent_root = dependent_root_at(&world.state, world.head_root, SLOT)
+        .expect("the head's chain gives the slot a dependent root");
+    let message = ProposerPreferences {
+        dependent_root,
+        proposal_slot: SLOT,
+        validator_index: proposer,
+        fee_recipient: address(0xaa),
+        target_gas_limit: 30_000_000,
+    };
+
+    let mut keys = ValidatorStore::new();
+    let pubkey = keys
+        .insert_secret("test", &secret_key_for(proposer as usize).to_bytes())
+        .expect("the test secret is a valid key");
+    assert_eq!(
+        pubkey,
+        world.state.validator(proposer).unwrap().pubkey,
+        "the test registry's key for the proposer"
+    );
+    let context = SigningContext {
+        config: chain_config(),
+        genesis_validators_root: world.state.genesis_validators_root(),
+    };
+    let signature = context
+        .sign_proposer_preferences(&keys, &pubkey, &message)
+        .expect("signs");
+    let signed = SignedProposerPreferences { message, signature };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = world.app(None);
+    tokio::spawn(async move { axum::serve(listener, router).await });
+    let client = HttpBeaconNode::new(format!("http://{address}")).unwrap();
+
+    client
+        .submit_proposer_preferences(
+            ethlambda_types::beacon::fork::ForkName::Gloas,
+            std::slice::from_ref(&signed),
+        )
+        .await
+        .expect("the node accepts what the validator client signed");
+
+    assert_eq!(
+        *world.network.proposer_preferences.lock().unwrap(),
+        vec![signed.clone()]
+    );
+    assert_eq!(world.market.preferences(SLOT, dependent_root), Some(signed));
+}
+
 #[tokio::test]
 async fn cached_preferences_resubmitted_are_a_200_without_a_publish() {
     // Needs only the market: an identical entry short-circuits the rules.
