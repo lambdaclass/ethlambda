@@ -368,8 +368,8 @@ static LEAN_BEACON_FORK_DIGEST: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .unwrap()
 });
 
-/// Count one gossip message. `result` is `decoded`, `decode_failed`, or
-/// `decompress_failed`.
+/// Count one gossip message. `result` is `decoded`, `decode_failed`,
+/// `decompress_failed`, or `unsupported_fork`.
 pub fn inc_beacon_gossip(topic: &str, result: &str) {
     LEAN_BEACON_GOSSIP_MESSAGES_TOTAL
         .with_label_values(&[topic, result])
