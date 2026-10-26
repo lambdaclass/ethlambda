@@ -58,6 +58,29 @@ pub mod quoted_u64 {
     }
 }
 
+/// A list of 64-bit integers, each quoted, as `validator_sync_committee_indices`
+/// and `sync_committee_indices` carry them.
+pub mod quoted_u64_vec {
+    use serde::ser::SerializeSeq as _;
+    use serde::{Deserialize as _, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(values: &[u64], serializer: S) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(Some(values.len()))?;
+        for value in values {
+            seq.serialize_element(&value.to_string())?;
+        }
+        seq.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u64>, D::Error> {
+        let texts = Vec::<String>::deserialize(deserializer)?;
+        texts
+            .iter()
+            .map(|text| text.parse().map_err(serde::de::Error::custom))
+            .collect()
+    }
+}
+
 /// The envelope almost every Beacon API response uses.
 #[derive(Debug, Deserialize)]
 pub struct DataResponse<T> {
@@ -205,6 +228,57 @@ pub struct ProposerDutyDto {
     pub slot: Slot,
 }
 
+/// One entry of `POST /eth/v1/validator/duties/ptc/{epoch}`: the same three
+/// fields a proposer duty has, since a committee member too is named by key,
+/// index and the one slot it votes in.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PtcDutyDto {
+    pub pubkey: String,
+    #[serde(with = "quoted_u64")]
+    pub validator_index: ValidatorIndex,
+    #[serde(with = "quoted_u64")]
+    pub slot: Slot,
+}
+
+/// `GET /eth/v1/beacon/blocks/head/root`: the root, and whether the head is
+/// one the execution client has not validated.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlockRootResponse {
+    /// `Option` and read as `false` when absent, for the reason
+    /// [`SyncingDto::is_optimistic`] is.
+    pub execution_optimistic: Option<bool>,
+    pub data: BlockRootDto,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlockRootDto {
+    pub root: String,
+}
+
+/// One entry of `POST /eth/v1/validator/duties/sync/{epoch}`: the validator and
+/// every seat it holds in the period's sync committee. Seats are positions in
+/// the whole committee, and a validator can hold several.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SyncDutyDto {
+    pub pubkey: String,
+    #[serde(with = "quoted_u64")]
+    pub validator_index: ValidatorIndex,
+    #[serde(with = "quoted_u64_vec")]
+    pub validator_sync_committee_indices: Vec<u64>,
+}
+
+/// One entry of `POST /eth/v1/validator/sync_committee_subscriptions`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SyncCommitteeSubscriptionDto {
+    #[serde(with = "quoted_u64")]
+    pub validator_index: ValidatorIndex,
+    #[serde(with = "quoted_u64_vec")]
+    pub sync_committee_indices: Vec<u64>,
+    /// Exclusive.
+    #[serde(with = "quoted_u64")]
+    pub until_epoch: Epoch,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ValidatorEntryDto {
     #[serde(with = "quoted_u64")]
@@ -229,6 +303,10 @@ pub struct SingleAttestationDto {
     pub signature: String,
 }
 
+/// `index` is whatever the beacon node answered, never rewritten: it is part of
+/// the signed message. It is zero from electra, and from gloas it carries the
+/// payload signal (1 when the attested block's payload was seen as full), which
+/// is why it must not be normalised on the way out.
 #[derive(Debug, Clone, Serialize)]
 pub struct AttestationDataOutDto {
     #[serde(with = "quoted_u64")]
@@ -475,6 +553,37 @@ pub fn config_from_spec_response(value: &serde_json::Value) -> Result<Config> {
     }
     if let Some(bps) = spec_u64(value, "AGGREGATE_DUE_BPS")? {
         config.aggregate_due_bps = bps;
+    }
+    // The gloas offsets and the payload deadlines. Absent keeps the
+    // specification's defaults already in `Config` (2500, 5000, 5000, 7500).
+    for (key, field) in [
+        (
+            "ATTESTATION_DUE_BPS_GLOAS",
+            &mut config.attestation_due_bps_gloas,
+        ),
+        (
+            "AGGREGATE_DUE_BPS_GLOAS",
+            &mut config.aggregate_due_bps_gloas,
+        ),
+        ("SYNC_MESSAGE_DUE_BPS", &mut config.sync_message_due_bps),
+        ("CONTRIBUTION_DUE_BPS", &mut config.contribution_due_bps),
+        (
+            "SYNC_MESSAGE_DUE_BPS_GLOAS",
+            &mut config.sync_message_due_bps_gloas,
+        ),
+        (
+            "CONTRIBUTION_DUE_BPS_GLOAS",
+            &mut config.contribution_due_bps_gloas,
+        ),
+        ("PAYLOAD_DUE_BPS", &mut config.payload_due_bps),
+        (
+            "PAYLOAD_ATTESTATION_DUE_BPS",
+            &mut config.payload_attestation_due_bps,
+        ),
+    ] {
+        if let Some(bps) = spec_u64(value, key)? {
+            *field = bps;
+        }
     }
     if let Some(version) = spec_version(value, "GENESIS_FORK_VERSION")? {
         config = config.with_fork_version(ForkName::Phase0, version);
@@ -910,6 +1019,27 @@ mod tests {
         assert_eq!(config.aggregate_due_bps, 5_000);
     }
 
+    #[test]
+    fn the_gloas_offsets_are_read_and_default_to_the_specification() {
+        let response = serde_json::json!({
+            "ATTESTATION_DUE_BPS_GLOAS": "2000",
+            "AGGREGATE_DUE_BPS_GLOAS": "4000",
+            "PAYLOAD_DUE_BPS": "5500",
+            "PAYLOAD_ATTESTATION_DUE_BPS": "8000",
+        });
+        let config = config_from_spec_response(&response).expect("builds");
+        assert_eq!(config.attestation_due_bps_gloas, 2_000);
+        assert_eq!(config.aggregate_due_bps_gloas, 4_000);
+        assert_eq!(config.payload_due_bps, 5_500);
+        assert_eq!(config.payload_attestation_due_bps, 8_000);
+
+        let config = config_from_spec_response(&serde_json::json!({})).expect("builds");
+        assert_eq!(config.attestation_due_bps_gloas, 2_500);
+        assert_eq!(config.aggregate_due_bps_gloas, 5_000);
+        assert_eq!(config.payload_due_bps, 5_000);
+        assert_eq!(config.payload_attestation_due_bps, 7_500);
+    }
+
     /// A node that has not moved to the basis-point form keeps the defaults,
     /// which are the right answer for every network that predates it.
     #[test]
@@ -964,5 +1094,100 @@ mod tests {
         });
         let err = config_from_spec_response(&response).expect_err("must reject");
         assert!(matches!(err, Error::Decode(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn the_sync_offsets_are_read_and_default_to_the_specification() {
+        let response = serde_json::json!({
+            "SYNC_MESSAGE_DUE_BPS": "3000",
+            "CONTRIBUTION_DUE_BPS": "6000",
+            "SYNC_MESSAGE_DUE_BPS_GLOAS": "2000",
+            "CONTRIBUTION_DUE_BPS_GLOAS": "4000",
+        });
+        let config = config_from_spec_response(&response).expect("builds");
+        assert_eq!(config.sync_message_due_bps, 3_000);
+        assert_eq!(config.contribution_due_bps, 6_000);
+        assert_eq!(config.sync_message_due_bps_gloas, 2_000);
+        assert_eq!(config.contribution_due_bps_gloas, 4_000);
+
+        let config = config_from_spec_response(&serde_json::json!({})).expect("builds");
+        assert_eq!(config.sync_message_due_bps, 3_333);
+        assert_eq!(config.contribution_due_bps, 6_667);
+        assert_eq!(config.sync_message_due_bps_gloas, 2_500);
+        assert_eq!(config.contribution_due_bps_gloas, 5_000);
+    }
+
+    #[test]
+    fn a_sync_duty_parses_its_quoted_indices() {
+        let duty: SyncDutyDto = serde_json::from_value(serde_json::json!({
+            "pubkey": "0xaa",
+            "validator_index": "7",
+            "validator_sync_committee_indices": ["3", "130"],
+        }))
+        .expect("parses");
+        assert_eq!(duty.validator_index, 7);
+        assert_eq!(duty.validator_sync_committee_indices, vec![3, 130]);
+    }
+
+    #[test]
+    fn an_unquoted_sync_index_is_rejected() {
+        let result = serde_json::from_value::<SyncDutyDto>(serde_json::json!({
+            "pubkey": "0xaa",
+            "validator_index": "7",
+            "validator_sync_committee_indices": [3],
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_sync_subscription_quotes_every_integer() {
+        let dto = SyncCommitteeSubscriptionDto {
+            validator_index: 7,
+            sync_committee_indices: vec![3, 130],
+            until_epoch: 256,
+        };
+        assert_eq!(
+            serde_json::to_value(&dto).expect("serialises"),
+            serde_json::json!({
+                "validator_index": "7",
+                "sync_committee_indices": ["3", "130"],
+                "until_epoch": "256",
+            })
+        );
+    }
+
+    /// A gloas aggregate parses straight into the gloas container, bitfields
+    /// included, and serialises back to the JSON the electra DTO produces for
+    /// the same vote, which is what the endpoint takes.
+    #[test]
+    fn a_gloas_aggregate_round_trips_through_its_json() {
+        use ethlambda_types::beacon::containers::gloas;
+
+        let electra_attestation = Attestation {
+            aggregation_bits: AggregationBits::from_ssz_bytes(&[0x3f]).expect("bits"),
+            data: AttestationData {
+                slot: 5,
+                index: 1,
+                beacon_block_root: Root::repeat_byte(3),
+                source: Checkpoint {
+                    epoch: 0,
+                    root: Root::ZERO,
+                },
+                target: Checkpoint {
+                    epoch: 0,
+                    root: Root::repeat_byte(4),
+                },
+            },
+            signature: BlsSignature([9; 96]),
+            committee_bits: CommitteeBits::from_ssz_bytes(&[0x01, 0, 0, 0, 0, 0, 0, 0])
+                .expect("bits"),
+        };
+        let json = serde_json::to_value(AttestationOutDto::from(&electra_attestation))
+            .expect("serialises");
+
+        let parsed: gloas::Attestation = serde_json::from_value(json.clone()).expect("parses");
+        assert_eq!(parsed, gloas::Attestation::from(&electra_attestation));
+        assert_eq!(parsed.data.index, 1, "the payload signal survives parsing");
+        assert_eq!(serde_json::to_value(&parsed).expect("serialises"), json);
     }
 }

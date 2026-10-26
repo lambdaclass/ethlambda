@@ -75,12 +75,15 @@ pub mod bls;
 pub mod das;
 pub mod fork_choice;
 pub mod genesis;
+pub mod gloas_block_production;
 pub mod gossip;
 pub mod hash;
 pub mod helpers;
 pub mod kzg;
+pub mod payload_attestation_pool;
 pub mod precheck;
 pub mod stf;
+pub mod sync_committee_pool;
 pub mod upgrade;
 
 mod lean_boundary;

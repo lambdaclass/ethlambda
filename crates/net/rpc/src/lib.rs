@@ -1,9 +1,14 @@
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 use axum::{Extension, Router};
 use ethlambda_blockchain::{EventBus, SyncStatusController};
 use ethlambda_network_api::RpcToP2PRef;
-use ethlambda_state_transition::beacon::attestation_pool::SharedAttestationPool;
+use ethlambda_state_transition::beacon::{
+    attestation_pool::SharedAttestationPool,
+    payload_attestation_pool::SharedPayloadAttestationPool,
+    sync_committee_pool::SharedSyncCommitteePool,
+};
 use ethlambda_storage::Store;
 use ethlambda_types::aggregator::AggregatorController;
 use tokio_util::sync::CancellationToken;
@@ -184,6 +189,11 @@ pub fn build_beacon_api_router(store: Store, version: &'static str, peer_id: Str
         .with_state(store)
 }
 
+/// The data columns this node custodies, as the chain actor's availability
+/// gate reads them. Empty on a node with nothing to custody.
+#[derive(Clone, Debug, Default)]
+pub struct CustodyColumns(pub Vec<u64>);
+
 /// What the Beacon API's endpoints reach beyond the store.
 pub struct BeaconApiHandles {
     /// Through which the pool, aggregate and block endpoints gossip what a
@@ -192,12 +202,28 @@ pub struct BeaconApiHandles {
     /// Filled by the attestation pool endpoint and the aggregator subnets,
     /// read by the aggregate endpoint and block production.
     pub attestation_pool: SharedAttestationPool,
-    /// The execution client block production builds payloads with; `None`
-    /// makes it answer 503.
+    /// Filled by gossip and the payload attestation pool endpoint, read by
+    /// block production and the pool's GET.
+    pub payload_attestation_pool: SharedPayloadAttestationPool,
+    /// Filled by gossip and the sync committee endpoints, read by block
+    /// production and the contribution endpoint.
+    pub sync_committee_pool: SharedSyncCommitteePool,
+    /// The columns this node custodies: what `payload_attestation_data` checks
+    /// a block's blob availability against, and what block production tells
+    /// the execution client it samples for when asking it to build a gloas
+    /// payload.
+    pub custody_columns: CustodyColumns,
+    /// The execution client block production builds payloads with. `None`
+    /// makes block production, attestation data and aggregation answer 503:
+    /// with nothing validating payloads, none has a block it may vouch for.
     pub engine: Option<ethlambda_engine::EngineClient>,
     /// The chain-event bus `/eth/v1/events` streams from. Read only there:
     /// the chain actor is its only publisher, so no endpoint here writes to it.
     pub events: EventBus,
+    /// This build as the Engine API identifies it. Block production appends
+    /// its code and commit, with the execution client's, to every block's
+    /// graffiti.
+    pub client_version: ethlambda_engine::types::ClientVersionV1,
 }
 
 /// Start the HTTP servers for a beacon node.
@@ -218,9 +244,15 @@ pub async fn start_beacon_rpc_server(
         .layer(Extension(sync_status))
         .layer(Extension(handles.p2p))
         .layer(Extension(handles.attestation_pool))
+        .layer(Extension(handles.payload_attestation_pool))
+        .layer(Extension(handles.sync_committee_pool))
+        .layer(Extension(handles.custody_columns))
         .layer(Extension(beacon::validator::FeeRecipients::default()))
         .layer(Extension(handles.engine))
-        .layer(Extension(handles.events));
+        .layer(Extension(handles.events))
+        .layer(Extension(beacon::graffiti::OwnVersion(Arc::new(
+            handles.client_version,
+        ))));
     start_http_servers(config, Some(api_router), shutdown).await
 }
 
@@ -246,7 +278,9 @@ pub(crate) mod test_utils {
     use ethlambda_types::{
         beacon::{
             config::Config,
-            containers::{BeaconState, SignedBeaconBlock, phase0, shared::BeaconBlockHeader},
+            containers::{
+                BeaconState, SignedBeaconBlock, gloas, phase0, shared::BeaconBlockHeader,
+            },
             preset,
         },
         block::{Block, BlockBody, BlockHeader},
@@ -391,7 +425,7 @@ pub(crate) mod test_utils {
     }
 
     /// A phase0 block at `slot`, with a trivial (default) body.
-    fn phase0_beacon_block(slot: u64, parent_root: H256) -> SignedBeaconBlock {
+    pub(crate) fn phase0_beacon_block(slot: u64, parent_root: H256) -> SignedBeaconBlock {
         SignedBeaconBlock::Phase0(phase0::SignedBeaconBlock {
             message: phase0::BeaconBlock {
                 slot,
@@ -425,6 +459,27 @@ pub(crate) mod test_utils {
         pub(crate) subscriptions: std::sync::Mutex<Vec<(u64, u64)>>,
         pub(crate) blocks:
             std::sync::Mutex<Vec<ethlambda_types::beacon::containers::SignedBeaconBlock>>,
+        pub(crate) envelopes: std::sync::Mutex<
+            Vec<(
+                ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope,
+                Vec<ethlambda_types::beacon::containers::DataColumnSidecar>,
+            )>,
+        >,
+        pub(crate) payload_attestations: std::sync::Mutex<
+            Vec<ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage>,
+        >,
+        /// `(subnet ids, message)` per sync committee message published.
+        pub(crate) sync_messages: std::sync::Mutex<
+            Vec<(
+                Vec<u64>,
+                ethlambda_types::beacon::containers::altair::SyncCommitteeMessage,
+            )>,
+        >,
+        pub(crate) sync_contributions: std::sync::Mutex<
+            Vec<ethlambda_types::beacon::containers::altair::SignedContributionAndProof>,
+        >,
+        /// `(subnet id, until epoch)` pairs asked for.
+        pub(crate) sync_subscriptions: std::sync::Mutex<Vec<(u64, u64)>>,
     }
 
     impl ethlambda_network_api::RpcToP2P for RecordingNetwork {
@@ -467,6 +522,173 @@ pub(crate) mod test_utils {
             self.blocks.lock().unwrap().push(block);
             Ok(())
         }
+
+        fn publish_execution_payload_envelope(
+            &self,
+            envelope: Box<
+                ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope,
+            >,
+            sidecars: Vec<ethlambda_types::beacon::containers::DataColumnSidecar>,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.envelopes.lock().unwrap().push((*envelope, sidecars));
+            Ok(())
+        }
+
+        fn publish_payload_attestation_message(
+            &self,
+            message: ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.payload_attestations.lock().unwrap().push(message);
+            Ok(())
+        }
+
+        fn publish_sync_committee_message(
+            &self,
+            subnet_ids: Vec<u64>,
+            message: ethlambda_types::beacon::containers::altair::SyncCommitteeMessage,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.sync_messages
+                .lock()
+                .unwrap()
+                .push((subnet_ids, message));
+            Ok(())
+        }
+
+        fn publish_sync_committee_contribution(
+            &self,
+            contribution: ethlambda_types::beacon::containers::altair::SignedContributionAndProof,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.sync_contributions.lock().unwrap().push(contribution);
+            Ok(())
+        }
+
+        fn subscribe_sync_committee_subnets(
+            &self,
+            subnets: Vec<(u64, u64)>,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.sync_subscriptions.lock().unwrap().extend(subnets);
+            Ok(())
+        }
+    }
+
+    /// [`beacon_fixture`]'s chain with three gloas blocks on top of its head.
+    ///
+    /// ```text
+    /// anchor(phase0) - head(phase0) - g1 - g2 - g3
+    /// ```
+    ///
+    /// `g1` builds on a pre-gloas parent, so on its FULL branch. `g2`'s bid
+    /// names `g1`'s payload as its parent block hash (FULL). `g3`'s names
+    /// something else (EMPTY), so it builds on `g1`'s payload through `g2`'s
+    /// skipped one. No verdict or envelope is recorded for any of them.
+    pub(crate) struct GloasFixture {
+        pub(crate) store: Store,
+        pub(crate) head_root: H256,
+        pub(crate) g1: (H256, u64),
+        pub(crate) g2: (H256, u64),
+        pub(crate) g3: (H256, u64),
+    }
+
+    /// A gloas block whose bid names `parent_block_hash` and `block_hash`.
+    pub(crate) fn gloas_beacon_block(
+        slot: u64,
+        parent_root: H256,
+        parent_block_hash: H256,
+        block_hash: H256,
+    ) -> SignedBeaconBlock {
+        let mut body = gloas::BeaconBlockBody::default();
+        let bid = &mut body.signed_execution_payload_bid.message;
+        bid.parent_block_hash = parent_block_hash;
+        bid.block_hash = block_hash;
+        SignedBeaconBlock::Gloas(gloas::SignedBeaconBlock {
+            message: gloas::BeaconBlock {
+                slot,
+                proposer_index: 0,
+                parent_root,
+                state_root: H256::ZERO,
+                body,
+            },
+            signature: Default::default(),
+        })
+    }
+
+    pub(crate) fn gloas_fixture() -> GloasFixture {
+        let BeaconFixture {
+            mut store,
+            head_root,
+            head_slot,
+            ..
+        } = beacon_fixture(64);
+
+        let hash = |n: u8| H256::from([n; 32]);
+        let mut chain = Vec::new();
+        let mut parent = (head_root, head_slot);
+        for (parent_hash, block_hash) in
+            [(hash(0), hash(1)), (hash(1), hash(2)), (hash(9), hash(3))]
+        {
+            let slot = parent.1 + 1;
+            let block = gloas_beacon_block(slot, parent.0, parent_hash, block_hash);
+            let root = block.message_hash_tree_root();
+            store
+                .insert_signed_block(root, block)
+                .expect("insert gloas block");
+            chain.push((root, slot));
+            parent = (root, slot);
+        }
+
+        GloasFixture {
+            store,
+            head_root,
+            g1: chain[0],
+            g2: chain[1],
+            g3: chain[2],
+        }
+    }
+
+    /// A signed envelope for `root` with every other field at its zero value.
+    pub(crate) fn gloas_envelope(root: H256, slot: u64) -> gloas::SignedExecutionPayloadEnvelope {
+        let payload = gloas::ExecutionPayload {
+            parent_hash: Default::default(),
+            fee_recipient: Default::default(),
+            state_root: Default::default(),
+            receipts_root: Default::default(),
+            logs_bloom: vec![0u8; preset::BYTES_PER_LOGS_BLOOM]
+                .try_into()
+                .expect("built at exactly BYTES_PER_LOGS_BLOOM"),
+            prev_randao: Default::default(),
+            block_number: 7,
+            gas_limit: 0,
+            gas_used: 0,
+            timestamp: 0,
+            extra_data: Default::default(),
+            base_fee_per_gas: Default::default(),
+            block_hash: Default::default(),
+            transactions: Default::default(),
+            withdrawals: Default::default(),
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+            block_access_list: Default::default(),
+            slot_number: slot,
+        };
+        gloas::SignedExecutionPayloadEnvelope {
+            message: gloas::ExecutionPayloadEnvelope {
+                payload,
+                execution_requests: Default::default(),
+                builder_index: 3,
+                beacon_block_root: root,
+                parent_beacon_block_root: H256::ZERO,
+            },
+            signature: Default::default(),
+        }
+    }
+
+    /// A configured execution client, for endpoints that only ask whether a
+    /// node has one. Nothing listens at its endpoint, so a test that reaches
+    /// the network through it fails instead of passing by accident.
+    pub(crate) fn idle_engine() -> Option<ethlambda_engine::EngineClient> {
+        let secret = ethlambda_engine::JwtSecret::new([0; 32]);
+        let client = ethlambda_engine::EngineClient::new("http://127.0.0.1:9".into(), secret);
+        Some(client.expect("building a client opens no connection"))
     }
 
     /// A beacon store whose anchor, and so head, is `state`, under a block at
@@ -477,13 +699,39 @@ pub(crate) mod test_utils {
     /// phase0 one whatever `state`'s fork: these endpoints read the state and
     /// the block's root and slot, never the block's body.
     pub(crate) fn beacon_store_at(state: BeaconState) -> (Store, H256) {
+        beacon_store_with_config(state, Config::mainnet())
+    }
+
+    /// [`beacon_store_at`], under `config` instead of mainnet's schedule.
+    pub(crate) fn beacon_store_with_config(state: BeaconState, config: Config) -> (Store, H256) {
+        beacon_store_with_genesis(state, config, 1_606_824_023)
+    }
+
+    /// [`beacon_store_at`] on a wall clock whose slot `clock_slot` began a
+    /// second ago, for endpoints that bound a request by the current epoch.
+    pub(crate) fn beacon_store_at_clock(state: BeaconState, clock_slot: u64) -> (Store, H256) {
+        let config = Config::mainnet();
+        let slot_secs = config.slot_duration_ms / 1000;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_secs();
+        let genesis = now_secs - clock_slot * slot_secs - 1;
+        beacon_store_with_genesis(state, config, genesis)
+    }
+
+    fn beacon_store_with_genesis(
+        state: BeaconState,
+        config: Config,
+        genesis_time: u64,
+    ) -> (Store, H256) {
         let slot = state.slot();
         let block = phase0_beacon_block(slot, H256::ZERO);
         let root = block.message_hash_tree_root();
         let mut store = Store::init_beacon(
             Arc::new(InMemoryBackend::default()),
-            1_606_824_023,
-            Config::mainnet(),
+            genesis_time,
+            config,
             root,
             Checkpoint { root, slot },
             slot,
@@ -498,6 +746,51 @@ pub(crate) mod test_utils {
             .update_checkpoints(ForkCheckpoints::head_only(root))
             .expect("make the anchor the head");
         (store, root)
+    }
+
+    /// A beacon store whose head is `block` (a block at `state`'s slot) with
+    /// `state` as its post-state, on a clock whose slot `clock_slot` began a
+    /// second ago.
+    ///
+    /// For endpoints that read the head block itself (the payload attestation
+    /// data names it) or that only accept the current slot (gossip-checked
+    /// votes), which [`beacon_store_at`]'s phase0 anchor on mainnet's real
+    /// clock cannot serve.
+    ///
+    /// The block is stored under `root`, which the caller names because a test
+    /// state's `latest_block_header` need not commit to the block built to
+    /// stand in for it, and a block built on the state names that header's root
+    /// as its parent.
+    pub(crate) fn beacon_store_with_head_block(
+        state: BeaconState,
+        config: Config,
+        block: SignedBeaconBlock,
+        root: H256,
+        clock_slot: u64,
+    ) -> Store {
+        let slot = state.slot();
+        let slot_secs = config.slot_duration_ms / 1000;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_secs();
+        let genesis = now_secs - clock_slot * slot_secs - 1;
+        let mut store = Store::init_beacon(
+            Arc::new(InMemoryBackend::default()),
+            genesis,
+            config,
+            root,
+            Checkpoint { root, slot },
+            slot,
+        );
+        store
+            .insert_signed_block(root, block)
+            .expect("insert head block");
+        store.insert_state(root, state).expect("insert head state");
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(root))
+            .expect("make the block the head");
+        store
     }
 
     /// Build a beacon store anchored at `anchor_slot`, with a real child block

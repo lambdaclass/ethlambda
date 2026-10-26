@@ -9,7 +9,8 @@ use std::pin::Pin;
 
 use async_trait::async_trait;
 use ethlambda_types::beacon::config::Config;
-use ethlambda_types::beacon::containers::electra::SignedAggregateAndProof;
+use ethlambda_types::beacon::containers::altair;
+use ethlambda_types::beacon::containers::gloas;
 use ethlambda_types::beacon::containers::shared::AttestationData;
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, Root, Slot, ValidatorIndex};
@@ -18,10 +19,11 @@ use tracing::{debug, warn};
 use crate::beacon_node::block_contents::ProducedBlock;
 use crate::beacon_node::dto::{
     CommitteeSubscriptionDto, ProposerPreparationDto, SingleAttestationDto,
+    SyncCommitteeSubscriptionDto, SyncDutyDto,
 };
 use crate::beacon_node::{
     AggregateAttestation, AttesterDuties, BeaconNodeApi, BlockRequest, Genesis, ProposerDuties,
-    Published, ValidatorEntry,
+    PtcDuties, Published, SignedAggregates, ValidatorEntry,
 };
 use crate::error::{Error, Result};
 
@@ -223,8 +225,8 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
             .await
     }
 
-    async fn attestation_data(&self, slot: Slot) -> Result<AttestationData> {
-        self.try_each("attestation_data", |node| node.attestation_data(slot))
+    async fn attestation_data(&self, slot: Slot, fork: ForkName) -> Result<AttestationData> {
+        self.try_each("attestation_data", |node| node.attestation_data(slot, fork))
             .await
     }
 
@@ -249,6 +251,61 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
     async fn publish_block(&self, fork: ForkName, body: &[u8]) -> Result<Published> {
         self.try_each("publish_block", |node| node.publish_block(fork, body))
             .await
+    }
+
+    /// Fails over like any query: the envelope the node cached is only on the
+    /// node that produced the block, and one that did not answers 404.
+    async fn execution_payload_envelope(
+        &self,
+        slot: Slot,
+        block_root: Root,
+    ) -> Result<gloas::ExecutionPayloadEnvelope> {
+        self.try_each("execution_payload_envelope", |node| {
+            node.execution_payload_envelope(slot, block_root)
+        })
+        .await
+    }
+
+    /// First node that accepts it wins, for the reason [`Self::publish_block`]
+    /// is: the accepting node gossips it.
+    async fn publish_execution_payload_envelope(
+        &self,
+        body: &[u8],
+        blob_data_included: bool,
+    ) -> Result<()> {
+        self.try_each("publish_execution_payload_envelope", |node| {
+            node.publish_execution_payload_envelope(body, blob_data_included)
+        })
+        .await
+    }
+
+    async fn ptc_duties(&self, epoch: Epoch, indices: &[ValidatorIndex]) -> Result<PtcDuties> {
+        self.try_each("ptc_duties", |node| node.ptc_duties(epoch, indices))
+            .await
+    }
+
+    /// A 204 is an answer, so the first node that knows no block ends the
+    /// walk, even though another might have one. That is the right trade: PTC
+    /// votes are due at three quarters of the slot, and a node that has seen
+    /// nothing by then is one this client should not be voting through.
+    async fn payload_attestation_data(
+        &self,
+        slot: Slot,
+    ) -> Result<Option<gloas::PayloadAttestationData>> {
+        self.try_each("payload_attestation_data", |node| {
+            node.payload_attestation_data(slot)
+        })
+        .await
+    }
+
+    async fn submit_payload_attestations(
+        &self,
+        messages: &[gloas::PayloadAttestationMessage],
+    ) -> Result<usize> {
+        self.try_each("submit_payload_attestations", |node| {
+            node.submit_payload_attestations(messages)
+        })
+        .await
     }
 
     async fn submit_attestations(
@@ -280,7 +337,7 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
     async fn publish_aggregates(
         &self,
         fork: ForkName,
-        aggregates: &[SignedAggregateAndProof],
+        aggregates: &SignedAggregates,
     ) -> Result<()> {
         self.try_each("publish_aggregates", |node| {
             node.publish_aggregates(fork, aggregates)
@@ -305,6 +362,69 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
     async fn subscribe_committees(&self, subscriptions: &[CommitteeSubscriptionDto]) -> Result<()> {
         self.try_all("subscribe_committees", |node| {
             node.subscribe_committees(subscriptions)
+        })
+        .await
+    }
+
+    async fn sync_duties(
+        &self,
+        epoch: Epoch,
+        indices: &[ValidatorIndex],
+    ) -> Result<Vec<SyncDutyDto>> {
+        self.try_each("sync_duties", |node| node.sync_duties(epoch, indices))
+            .await
+    }
+
+    /// An optimistic head is an error from each implementation, so a node
+    /// tracking an unvalidated head is walked past rather than signed over.
+    async fn head_block_root(&self) -> Result<Root> {
+        self.try_each("head_block_root", |node| node.head_block_root())
+            .await
+    }
+
+    async fn submit_sync_committee_messages(
+        &self,
+        messages: &[altair::SyncCommitteeMessage],
+    ) -> Result<usize> {
+        self.try_each("submit_sync_committee_messages", |node| {
+            node.submit_sync_committee_messages(messages)
+        })
+        .await
+    }
+
+    /// A 404 is a node that holds no messages for this subcommittee; another
+    /// node may have been subscribed when they arrived.
+    async fn sync_committee_contribution(
+        &self,
+        slot: Slot,
+        subcommittee_index: u64,
+        beacon_block_root: Root,
+    ) -> Result<altair::SyncCommitteeContribution> {
+        self.try_each("sync_committee_contribution", |node| {
+            node.sync_committee_contribution(slot, subcommittee_index, beacon_block_root)
+        })
+        .await
+    }
+
+    async fn publish_contribution_and_proofs(
+        &self,
+        contributions: &[altair::SignedContributionAndProof],
+    ) -> Result<()> {
+        self.try_each("publish_contribution_and_proofs", |node| {
+            node.publish_contribution_and_proofs(contributions)
+        })
+        .await
+    }
+
+    /// Every node, for the reason [`Self::subscribe_committees`] is: a node
+    /// that never joined a sync subnet cannot pool the messages a contribution
+    /// is folded from.
+    async fn subscribe_sync_committees(
+        &self,
+        subscriptions: &[SyncCommitteeSubscriptionDto],
+    ) -> Result<()> {
+        self.try_all("subscribe_sync_committees", |node| {
+            node.subscribe_sync_committees(subscriptions)
         })
         .await
     }
@@ -354,7 +474,7 @@ mod tests {
         let fallback = FallbackBeaconNode::new(vec![stale, fresh]);
 
         let data = fallback
-            .attestation_data(96)
+            .attestation_data(96, ForkName::Electra)
             .await
             .expect("the second node answers correctly");
 
@@ -374,7 +494,7 @@ mod tests {
         ]);
 
         let err = fallback
-            .attestation_data(96)
+            .attestation_data(96, ForkName::Electra)
             .await
             .expect_err("no node answered about the requested slot");
 
@@ -477,6 +597,7 @@ mod tests {
         use ethlambda_types::beacon::primitives::{BlsSignature, Bytes32};
         BlockRequest {
             slot,
+            fork: ForkName::Electra,
             proposer_index,
             randao_reveal: BlsSignature([0; 96]),
             graffiti: Bytes32::default(),
@@ -497,7 +618,7 @@ mod tests {
             .produce_block(&request(96, 7))
             .await
             .expect("the second node answers correctly");
-        assert_eq!(block.block().slot, 96);
+        assert_eq!(block.slot(), 96);
     }
 
     /// A node on a different fork computes a different proposer. Signing its
@@ -513,7 +634,7 @@ mod tests {
             .produce_block(&request(96, 7))
             .await
             .expect("the second node names the expected proposer");
-        assert_eq!(block.block().proposer_index, 7);
+        assert_eq!(block.proposer_index(), 7);
     }
 
     #[tokio::test]
@@ -662,6 +783,40 @@ mod tests {
         assert!(
             fallback.nodes[1].block_requests().is_empty(),
             "the second node must not have been asked to build a block too"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_optimistic_head_fails_over_to_the_next_node() {
+        let mut optimistic = MockBeaconNode::new().with_head_root(Root::repeat_byte(1));
+        optimistic.head_optimistic = true;
+        let healthy = MockBeaconNode::new().with_head_root(Root::repeat_byte(2));
+        let fallback = FallbackBeaconNode::new(vec![optimistic, healthy]);
+
+        assert_eq!(
+            fallback.head_block_root().await.expect("second answers"),
+            Root::repeat_byte(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sync_subscription_reaches_every_node() {
+        let fallback = FallbackBeaconNode::new(vec![MockBeaconNode::new(), MockBeaconNode::new()]);
+        let subscription = SyncCommitteeSubscriptionDto {
+            validator_index: 1,
+            sync_committee_indices: vec![3],
+            until_epoch: 256,
+        };
+        fallback
+            .subscribe_sync_committees(&[subscription])
+            .await
+            .expect("subscribes");
+
+        assert_eq!(fallback.nodes[0].sync_subscriptions().len(), 1);
+        assert_eq!(
+            fallback.nodes[1].sync_subscriptions().len(),
+            1,
+            "try_all, not try_each"
         );
     }
 

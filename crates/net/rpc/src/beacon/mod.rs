@@ -17,16 +17,33 @@ use crate::shared::block_id::IdError;
 
 pub(crate) mod blocks;
 pub(crate) mod config;
+pub(crate) mod envelopes;
 pub(crate) mod events;
 pub(crate) mod genesis;
+pub(crate) mod gloas_proposal;
+pub(crate) mod graffiti;
 pub(crate) mod headers;
 pub(crate) mod node;
 pub(crate) mod pool;
 pub(crate) mod proposal;
+pub(crate) mod ptc;
 pub(crate) mod states;
+pub(crate) mod sync_committee;
 pub(crate) mod validator;
 #[cfg(test)]
 mod validator_client_tests;
+
+/// Request-body cap for the routes that accept blocks, envelopes and blobs.
+///
+/// Axum's default is 2 MiB, which a fulu `SignedBlockContents` outgrows at
+/// about 14 blobs (each blob is 131072 bytes, plus 128 cell proofs of 48 bytes,
+/// 6144 bytes, per blob). The preset's `MAX_BLOB_COMMITMENTS_PER_BLOCK` (4096,
+/// roughly 550 MB) is no practical bound, so this is sized from what the blob
+/// schedule allows in practice instead: a generous 128 blobs and their cell
+/// proofs come to about 17.5 MiB, a maximal execution payload (the gloas
+/// envelope carries it whole) takes up to roughly 16 MiB more, and the rest is
+/// margin for the block and its operations. Applied per route, never router-wide.
+pub(crate) const MAX_PUBLISH_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// The wrapper every fork-versioned Beacon API payload travels in.
 ///
@@ -98,6 +115,7 @@ pub(crate) fn routes(version: &'static str, peer_id: String) -> Router<Store> {
     Router::new()
         .merge(blocks::routes())
         .merge(events::routes())
+        .merge(envelopes::routes())
         .merge(headers::routes())
         .merge(states::routes())
         .merge(genesis::routes())
@@ -106,6 +124,9 @@ pub(crate) fn routes(version: &'static str, peer_id: String) -> Router<Store> {
         .merge(validator::routes())
         .merge(pool::routes())
         .merge(proposal::routes())
+        .merge(gloas_proposal::routes())
+        .merge(ptc::routes())
+        .merge(sync_committee::routes())
 }
 
 #[cfg(test)]

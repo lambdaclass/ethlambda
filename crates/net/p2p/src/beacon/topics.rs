@@ -14,9 +14,12 @@
 //! relayed but never applied to fork choice, which is what a lighthouse node
 //! with no validators does too.
 //!
-//! `sync_committee_{0..3}` and `blob_sidecar_{subnet_id}` stay absent; the
-//! first arrives with the work that reads it and the second is deneb's format
-//! for blobs, deprecated at fulu in favour of the column matrix. Both subnet
+//! `sync_committee_{0..3}` is not part of [`BeaconTopics`] either: those four
+//! subnets are joined on demand, from a validator client's subscription
+//! request, like the aggregator attestation subnets (see
+//! `beacon::sync_committee`). `blob_sidecar_{subnet_id}` stays absent: it is
+//! deneb's format for blobs, deprecated at fulu in favour of the column
+//! matrix. Both subnet
 //! families that *are* subscribed are subscribed narrowly: this node's sampling
 //! size worth of columns rather than the whole matrix, and two attestation
 //! subnets rather than all sixty-four, since widening either is what turns this
@@ -28,6 +31,7 @@
 
 use std::collections::BTreeMap;
 
+use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::ForkDigest;
 use libp2p::gossipsub::IdentTopic;
 
@@ -46,7 +50,17 @@ pub const BLS_TO_EXECUTION_CHANGE: &str = "bls_to_execution_change";
 /// Topic kind for aggregated sync committee contributions.
 pub const SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF: &str = "sync_committee_contribution_and_proof";
 
-/// Every topic kind this node subscribes to, in the order they are subscribed.
+/// Topic kind for gloas execution payload envelopes.
+pub const EXECUTION_PAYLOAD: &str = "execution_payload";
+/// Topic kind for gloas payload timeliness committee votes.
+pub const PAYLOAD_ATTESTATION_MESSAGE: &str = "payload_attestation_message";
+
+/// The topic kinds gloas adds to [`SUBSCRIBED_TOPIC_KINDS`], subscribed from
+/// the gloas digest on and never under an earlier one.
+pub const GLOAS_TOPIC_KINDS: [&str; 2] = [EXECUTION_PAYLOAD, PAYLOAD_ATTESTATION_MESSAGE];
+
+/// Every topic kind this node subscribes to at every fork, in the order they
+/// are subscribed. [`GLOAS_TOPIC_KINDS`] follow from gloas.
 pub const SUBSCRIBED_TOPIC_KINDS: [&str; 7] = [
     BEACON_BLOCK,
     BEACON_AGGREGATE_AND_PROOF,
@@ -66,19 +80,53 @@ pub const DATA_COLUMN_SIDECAR_KIND: &str = "data_column_sidecar";
 /// [`DATA_COLUMN_SIDECAR_KIND`].
 pub const BEACON_ATTESTATION_KIND: &str = "beacon_attestation";
 
+/// The metric label every sync committee subnet shares. It is also the topic
+/// name the spec's gossip vectors use for the family.
+pub const SYNC_COMMITTEE_KIND: &str = "sync_committee";
+
 /// The metric label for a topic kind this node subscribes to on the beacon
 /// wire: the kind itself for a global topic, [`DATA_COLUMN_SIDECAR_KIND`] for
-/// a column subnet, [`BEACON_ATTESTATION_KIND`] for an attestation subnet.
+/// a column subnet, [`BEACON_ATTESTATION_KIND`] for an attestation subnet,
+/// [`SYNC_COMMITTEE_KIND`] for a sync committee subnet.
 /// `None` for anything else, lean kinds included, which is what tells the
 /// gossip handler a message needs no verdict.
 pub fn metric_kind(kind: &str) -> Option<&'static str> {
-    if let Some(&global) = SUBSCRIBED_TOPIC_KINDS.iter().find(|&&known| known == kind) {
+    if let Some(&global) = SUBSCRIBED_TOPIC_KINDS
+        .iter()
+        .chain(GLOAS_TOPIC_KINDS.iter())
+        .find(|&&known| known == kind)
+    {
         return Some(global);
     }
     if data_column_subnet(kind).is_some() {
         return Some(DATA_COLUMN_SIDECAR_KIND);
     }
+    if sync_committee_subnet(kind).is_some() {
+        return Some(SYNC_COMMITTEE_KIND);
+    }
     attestation_subnet(kind).map(|_| BEACON_ATTESTATION_KIND)
+}
+
+/// Topic family for sync committee messages, one topic per subnet.
+pub const SYNC_COMMITTEE_PREFIX: &str = "sync_committee_";
+
+/// The topic carrying one sync committee subnet.
+pub fn sync_committee_topic_name(fork_digest: ForkDigest, subnet_id: u64) -> String {
+    topic_name(fork_digest, &format!("{SYNC_COMMITTEE_PREFIX}{subnet_id}"))
+}
+
+/// The subnet a sync committee topic kind names, or `None` if the kind is not
+/// one.
+///
+/// The digit check is load-bearing: the global
+/// `sync_committee_contribution_and_proof` shares the family prefix and must
+/// not be read as a subnet.
+pub fn sync_committee_subnet(kind: &str) -> Option<u64> {
+    let suffix = kind.strip_prefix(SYNC_COMMITTEE_PREFIX)?;
+    if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    suffix.parse().ok()
 }
 
 /// Build one topic name: `/eth2/{fork_digest}/{kind}/ssz_snappy`.
@@ -97,6 +145,29 @@ pub fn topic_name(fork_digest: ForkDigest, kind: &str) -> String {
 /// the same index lean's `/leanconsensus/…` names put it at.
 pub fn topic_kind(topic: &str) -> Option<&str> {
     crate::gossipsub::topic_kind(topic)
+}
+
+/// The fork digest embedded in a full topic name, or `None` if the name is not
+/// shaped like a beacon topic or carries something other than four hex bytes.
+///
+/// A message's fork is the fork its topic's digest names, which is not the
+/// digest this node currently advertises while a fork boundary's subscription
+/// window is open.
+pub fn topic_digest(topic: &str) -> Option<ForkDigest> {
+    let digest = topic.split('/').nth(2)?;
+    hex::decode(digest).ok()?.try_into().ok()
+}
+
+/// The column subnets a custody set maps onto, in custody order.
+///
+/// A column's subnet is `column % DATA_COLUMN_SIDECAR_SUBNET_COUNT`, computed
+/// rather than assumed so a network that ever separates the two counts still
+/// subscribes to the right topic. `BeaconTopics::new` deduplicates.
+pub fn column_subnets(custody_columns: &[u64]) -> Vec<u64> {
+    custody_columns
+        .iter()
+        .map(|column| column % ethlambda_types::beacon::constants::DATA_COLUMN_SIDECAR_SUBNET_COUNT)
+        .collect()
 }
 
 /// Topic family for unaggregated attestations, one topic per subnet.
@@ -184,8 +255,53 @@ pub struct BeaconTopics {
 }
 
 impl BeaconTopics {
+    /// The topics to hold under `fork_digest`, for the fork that digest names.
+    ///
+    /// The one place a fork may change which topic kinds exist: a fork that adds
+    /// a kind extends its own arm, and the transition then joins those topics
+    /// ahead of the boundary as the spec asks. Every arm is named so a new fork
+    /// forces a decision here.
+    pub fn for_fork(
+        fork: ForkName,
+        fork_digest: ForkDigest,
+        column_subnets: &[u64],
+        attestation_subnets: &[u64],
+    ) -> Self {
+        match fork {
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb
+            | ForkName::Electra
+            | ForkName::Fulu => Self::new(fork_digest, column_subnets, attestation_subnets),
+            // Gloas adds the payload envelope and the payload attestation
+            // topics, which the follower consumes.
+            ForkName::Gloas => Self::with_extra_kinds(
+                fork_digest,
+                &GLOAS_TOPIC_KINDS,
+                column_subnets,
+                attestation_subnets,
+            ),
+            ForkName::Lean => {
+                unreachable!("a beacon topic's fork is never Lean: it is absent from ForkName::ALL")
+            }
+        }
+    }
+
     pub fn new(
         fork_digest: ForkDigest,
+        column_subnets: &[u64],
+        attestation_subnets: &[u64],
+    ) -> Self {
+        Self::with_extra_kinds(fork_digest, &[], column_subnets, attestation_subnets)
+    }
+
+    /// [`Self::new`] plus the global topic `extra_kinds` a fork adds, placed
+    /// after [`SUBSCRIBED_TOPIC_KINDS`] and ahead of the subnet families.
+    fn with_extra_kinds(
+        fork_digest: ForkDigest,
+        extra_kinds: &[&str],
         column_subnets: &[u64],
         attestation_subnets: &[u64],
     ) -> Self {
@@ -207,6 +323,7 @@ impl BeaconTopics {
 
         let mut topics: Vec<IdentTopic> = SUBSCRIBED_TOPIC_KINDS
             .iter()
+            .chain(extra_kinds)
             .map(|kind| IdentTopic::new(topic_name(fork_digest, kind)))
             .collect();
         topics.extend(column_topics.values().cloned());
@@ -260,6 +377,35 @@ mod tests {
     }
 
     #[test]
+    fn gloas_adds_the_envelope_and_payload_attestation_topics() {
+        let fork_topics = |fork| {
+            BeaconTopics::for_fork(fork, MAINNET, &[], &[])
+                .topics
+                .iter()
+                .map(|topic| topic.to_string())
+                .collect::<Vec<_>>()
+        };
+        let gloas = fork_topics(ForkName::Gloas);
+        let fulu = fork_topics(ForkName::Fulu);
+        assert_eq!(gloas.len(), SUBSCRIBED_TOPIC_KINDS.len() + 2);
+        assert_eq!(fulu.len(), SUBSCRIBED_TOPIC_KINDS.len());
+        for kind in GLOAS_TOPIC_KINDS {
+            let name = topic_name(MAINNET, kind);
+            assert!(gloas.contains(&name), "gloas lacks {name}");
+            assert!(!fulu.contains(&name), "fulu holds {name}");
+            assert_eq!(metric_kind(kind), Some(kind));
+        }
+        assert_eq!(
+            topic_name(MAINNET, EXECUTION_PAYLOAD),
+            "/eth2/8c9f62fe/execution_payload/ssz_snappy"
+        );
+        assert_eq!(
+            topic_name(MAINNET, PAYLOAD_ATTESTATION_MESSAGE),
+            "/eth2/8c9f62fe/payload_attestation_message/ssz_snappy"
+        );
+    }
+
+    #[test]
     fn no_subnet_family_is_subscribed() {
         // The narrow subscription set is a design decision, not an accident of
         // how many topics happened to be listed: widening it is what pulls in
@@ -285,6 +431,21 @@ mod tests {
                 assert!(!is_subnet, "{name} is a {prefix} subnet topic");
             }
         }
+    }
+
+    #[test]
+    fn the_digest_reads_back_from_a_topic_name() {
+        assert_eq!(
+            topic_digest(&topic_name(MAINNET, BEACON_BLOCK)),
+            Some(MAINNET)
+        );
+        assert_eq!(
+            topic_digest(&attestation_topic_name([0x0a, 0xbc, 0xde, 0xf0], 3)),
+            Some([0x0a, 0xbc, 0xde, 0xf0])
+        );
+        assert_eq!(topic_digest("/eth2/zz/beacon_block/ssz_snappy"), None);
+        assert_eq!(topic_digest("/eth2/8c9f62/beacon_block/ssz_snappy"), None);
+        assert_eq!(topic_digest("garbage"), None);
     }
 
     #[test]
@@ -443,5 +604,37 @@ mod tests {
         let topics = BeaconTopics::new(MAINNET, &[], &[12, 12, 40]);
         assert_eq!(topics.topics.len(), SUBSCRIBED_TOPIC_KINDS.len() + 2);
         assert_eq!(topics.attestation_topics.len(), 2);
+    }
+
+    #[test]
+    fn a_sync_committee_topic_is_the_family_name_and_its_subnet() {
+        assert_eq!(
+            sync_committee_topic_name(MAINNET, 2),
+            "/eth2/8c9f62fe/sync_committee_2/ssz_snappy"
+        );
+    }
+
+    #[test]
+    fn a_sync_committee_topic_reads_its_subnet_back() {
+        assert_eq!(sync_committee_subnet("sync_committee_3"), Some(3));
+        assert_eq!(sync_committee_subnet("sync_committee_"), None);
+        assert_eq!(sync_committee_subnet("sync_committee_x"), None);
+        // The contribution topic shares the prefix and is not a subnet.
+        assert_eq!(
+            sync_committee_subnet(SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF),
+            None
+        );
+        assert_eq!(sync_committee_subnet("beacon_block"), None);
+    }
+
+    #[test]
+    fn sync_committee_subnets_share_one_label() {
+        assert_eq!(metric_kind("sync_committee_0"), Some(SYNC_COMMITTEE_KIND));
+        assert_eq!(metric_kind("sync_committee_3"), Some(SYNC_COMMITTEE_KIND));
+        assert_eq!(metric_kind("sync_committee_"), None);
+        assert_eq!(
+            metric_kind(SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF),
+            Some(SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF)
+        );
     }
 }

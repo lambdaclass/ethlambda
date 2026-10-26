@@ -71,7 +71,9 @@ docker run -d --name ethlambda-beacon --network ethereum --stop-signal SIGINT \
 
 To run the consensus layer only, drop ethrex, the shared network, the JWT secret
 and the two `--execution-*` flags. The node then follows the chain without
-validating execution payloads:
+validating execution payloads. It cannot serve a validator client, since it
+answers attestation data, aggregation and block production requests with
+`503`:
 
 ```sh
 docker pull ghcr.io/lambdaclass/ethlambda:beacon
@@ -131,6 +133,12 @@ own `--network ethereum`), and point `--checkpoint-sync-url` at that network's
 provider. See
 [`ethlambda beacon`](#ethlambda-beacon--the-ethereum-beacon-chain) below for
 the remaining flags.
+
+`--network plataberget` (the Glamsterdam testnet) is built in as well. It has
+run gloas since its `GLOAS_FORK_EPOCH`, which the follower follows: a gloas
+checkpoint anchor is accepted, and payload envelopes are fetched and imported.
+It stays a follower, so the validator-client endpoints still refuse a gloas
+epoch.
 
 ### Lean consensus devnet
 
@@ -227,7 +235,7 @@ no attestation or sync committee subnet.
 
 | Flag | Meaning |
 |---|---|
-| `--network` | `mainnet` (default), `sepolia`, `hoodi`, or a path to a directory of network files (`config.yaml`, `genesis.ssz`, optionally `bootstrap_nodes.yaml`), the layout `eth-clients` publishes and kurtosis mounts |
+| `--network` | `mainnet` (default), `sepolia`, `hoodi`, `plataberget`, or a path to a directory of network files (`config.yaml`, `genesis.ssz`, optionally `bootstrap_nodes.yaml`), the layout `eth-clients` publishes and kurtosis mounts |
 | `--checkpoint-sync-url` | Where the anchor comes from. Required on a fresh data directory for a built-in network, since those never start from genesis. A resumable data directory is used before it; a network loaded from a directory anchors at its own `genesis.ssz` when no URL is given |
 | `--node-key` | Optional, but worth persisting: the columns this node custodies are a function of its node id, so without a key file it changes identity, and custody set, on every restart |
 | `--execution-endpoint`, `--execution-jwt-secret` | Optional Engine API pairing, given together. Without them, blocks import without payload validation |
@@ -320,16 +328,23 @@ Additional features:
 - [leanMetrics](docs/metrics.md) support for monitoring and observability
 - [lean-quickstart](https://github.com/blockblaz/lean-quickstart) integration for easier devnet running
 
-### Container Releases
+### Releases
 
-Docker images are published to `ghcr.io/lambdaclass/ethlambda` with the following tags:
+Binaries for Linux (x86_64, aarch64) and macOS (Apple silicon) are attached to
+[GitHub Releases](https://github.com/lambdaclass/ethlambda/releases). Docker
+images are published to `ghcr.io/lambdaclass/ethlambda` with the following tags:
 
 | Tag | Description |
 |-----|-------------|
+| `latest` | The latest release |
+| `X.Y.Z` | A specific release |
+| `X.Y.Z-rc.N` | A release candidate, promoted to `X.Y.Z`/`latest` once tested |
 | `devnetX` | Stable image for a specific devnet (e.g. `devnet4`) |
-| `latest` | Alias for the latest stable image of the currently running devnet |
-| `unstable` | Built from the latest main commit; promoted to `devnetX`/`latest` once tested |
+| `unstable` | Built from the latest main commit |
 | `sha-XXXXXXX` | Specific commit |
+
+Release binaries and images carry GitHub build provenance attestations;
+[`RELEASE.md`](./RELEASE.md#verifying-a-release) shows how to verify them.
 
 [`RELEASE.md`](./RELEASE.md) has more details on our release process and how to tag new images.
 
