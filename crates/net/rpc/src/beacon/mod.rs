@@ -20,6 +20,7 @@ pub(crate) mod bids;
 pub(crate) mod blocks;
 pub(crate) mod builder_client;
 pub(crate) mod builder_config;
+pub(crate) mod builder_flow;
 pub(crate) mod builders;
 pub(crate) mod config;
 pub(crate) mod envelopes;
