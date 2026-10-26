@@ -5,3 +5,4 @@
 pub(crate) mod bid;
 pub(crate) mod breaker;
 pub(crate) mod cache;
+pub(crate) mod choice;
