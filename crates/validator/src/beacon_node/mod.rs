@@ -17,9 +17,10 @@ use ethlambda_types::beacon::signing::compute_epoch_at_slot;
 use crate::beacon_node::block_contents::ProducedBlock;
 use crate::beacon_node::dto::{
     AttesterDutyDto, CommitteeSubscriptionDto, ProposerDutyDto, ProposerPreparationDto, PtcDutyDto,
-    SingleAttestationDto,
+    SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto,
 };
 use crate::error::Result;
+use ethlambda_types::beacon::containers::altair;
 use ethlambda_types::beacon::containers::electra;
 use ethlambda_types::beacon::containers::gloas;
 
@@ -486,4 +487,87 @@ pub trait BeaconNodeApi: Send + Sync {
     /// Tells the node which committees this client's validators care about
     /// this epoch, so it can manage subnet subscriptions on their behalf.
     async fn subscribe_committees(&self, subscriptions: &[CommitteeSubscriptionDto]) -> Result<()>;
+
+    /// The sync committee duties for `indices` in the period `epoch` falls in.
+    /// `POST /eth/v1/validator/duties/sync/{epoch}`, whose answer carries no
+    /// `dependent_root`: the committee is fixed a period ahead.
+    async fn sync_duties(
+        &self,
+        epoch: Epoch,
+        indices: &[ValidatorIndex],
+    ) -> Result<Vec<SyncDutyDto>>;
+
+    /// The root of the node's head block, which a sync committee message signs.
+    ///
+    /// # Contract: an optimistic head is `Err(BeaconNodeSyncing)`
+    ///
+    /// The answer carries `execution_optimistic`, and the optimistic-sync
+    /// specification forbids signing `DOMAIN_SYNC_COMMITTEE` over a head the
+    /// execution client has not validated. Mapping it to the same error a 503
+    /// gets makes failover try the next node rather than hand this one's root
+    /// to the signer.
+    async fn head_block_root(&self) -> Result<Root>;
+
+    /// Submit signed sync committee messages to the node's pool. Returns how
+    /// many it accepted, with the same partial-success reading as
+    /// [`Self::submit_attestations`].
+    async fn submit_sync_committee_messages(
+        &self,
+        messages: &[altair::SyncCommitteeMessage],
+    ) -> Result<usize>;
+
+    /// The best contribution the node holds for one subcommittee's messages on
+    /// `beacon_block_root` at `slot`. A node with nothing answers 404, which
+    /// surfaces as an error so failover tries the next node, as it does for
+    /// [`Self::aggregate_attestation`].
+    ///
+    /// # Contract: the answer is for this request, or it is an `Err`
+    ///
+    /// `slot`, `subcommittee_index` and `beacon_block_root` must equal the
+    /// request, checked by [`validate_sync_contribution`] in the
+    /// implementation for the reason [`Self::attestation_data`] states: the
+    /// contribution is wrapped in a signature, so a wrong one must be failed
+    /// over from rather than signed for.
+    async fn sync_committee_contribution(
+        &self,
+        slot: Slot,
+        subcommittee_index: u64,
+        beacon_block_root: Root,
+    ) -> Result<altair::SyncCommitteeContribution>;
+
+    /// Publish signed contributions. JSON: the endpoint lists no SSZ body.
+    async fn publish_contribution_and_proofs(
+        &self,
+        contributions: &[altair::SignedContributionAndProof],
+    ) -> Result<()>;
+
+    /// Tells the node which sync committee subnets this client's validators
+    /// sit in, so it joins them. Like [`Self::subscribe_committees`] it is
+    /// state installed on a node and must be re-sent, since a node forgets it
+    /// on restart.
+    async fn subscribe_sync_committees(
+        &self,
+        subscriptions: &[SyncCommitteeSubscriptionDto],
+    ) -> Result<()>;
+}
+
+/// Check that `contribution` is the one asked for, as the contract on
+/// [`BeaconNodeApi::sync_committee_contribution`] requires.
+pub fn validate_sync_contribution(
+    slot: Slot,
+    subcommittee_index: u64,
+    beacon_block_root: Root,
+    contribution: &altair::SyncCommitteeContribution,
+) -> Result<()> {
+    if contribution.slot != slot
+        || contribution.subcommittee_index != subcommittee_index
+        || contribution.beacon_block_root != beacon_block_root
+    {
+        return Err(crate::error::Error::InconsistentResponse(format!(
+            "requested a sync contribution for slot {slot} subcommittee {subcommittee_index} \
+             root {beacon_block_root:?}, node answered for slot {} subcommittee {} root {:?}",
+            contribution.slot, contribution.subcommittee_index, contribution.beacon_block_root
+        )));
+    }
+    Ok(())
 }
