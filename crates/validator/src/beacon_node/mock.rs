@@ -99,6 +99,9 @@ pub struct MockBeaconNode {
     /// When set, `publish_blinded_block` answers with this status as a node
     /// that definitely refused the block (a 4xx) does: `BeaconNodeStatus`.
     pub blinded_publish_refusal: Option<u16>,
+    /// How long `publish_blinded_block` takes before it records the block and
+    /// answers, as a slow relay makes the node.
+    pub blinded_publish_delay: Option<std::time::Duration>,
 
     /// What the test asserts against.
     pub submitted: Mutex<Vec<SingleAttestationDto>>,
@@ -289,6 +292,12 @@ impl MockBeaconNode {
     /// block, carrying `detail`.
     pub fn with_unconfirmed_blinded_publish(mut self, detail: &str) -> Self {
         self.blinded_publish_outcome = Some(Err(detail.to_string()));
+        self
+    }
+
+    /// Make `publish_blinded_block` take `delay` before it records the block.
+    pub fn with_blinded_publish_delay(mut self, delay: std::time::Duration) -> Self {
+        self.blinded_publish_delay = Some(delay);
         self
     }
 
@@ -734,6 +743,9 @@ impl BeaconNodeApi for MockBeaconNode {
                 status,
                 body: "refused".to_string(),
             });
+        }
+        if let Some(delay) = self.blinded_publish_delay {
+            tokio::time::sleep(delay).await;
         }
         self.published_blinded
             .lock()

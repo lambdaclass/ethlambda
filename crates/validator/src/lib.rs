@@ -221,7 +221,8 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         context.clone(),
         settings.clone(),
         config.builder.map(|builder| builder.boost_factor),
-    );
+    )
+    .with_clock(clock.clone());
     let registration = config.builder.map(|builder| {
         info!(
             boost_factor = builder.boost_factor,
@@ -689,12 +690,17 @@ async fn propose<B: BeaconNodeApi + 'static>(
         // may well be out, so it is neither a published-in-time delay nor a
         // failure.
         Ok(Ok(Published::BuilderUnconfirmed)) => {}
+        // A blinded publish observes its own delay, on the task that ran it.
+        Ok(Ok(_)) if proposal.signed_blinded_at(slot) => {}
         Ok(Ok(_)) => {
             let elapsed = SystemTime::now()
                 .duration_since(clock.start_of(slot))
                 .unwrap_or_default();
             metrics::observe_block_publication_delay(elapsed.as_secs_f64());
         }
+        // Once a blinded block is signed, only its publish task reports an
+        // error (and counts the failure), so it is not counted twice here.
+        Ok(Err(_)) if proposal.signed_blinded_at(slot) => {}
         Ok(Err(err)) => {
             error!(%slot, validator = duty.validator_index, %err, "Failed to propose this slot's block");
             metrics::inc_block_proposal_failures();

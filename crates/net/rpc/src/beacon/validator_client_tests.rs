@@ -1833,7 +1833,7 @@ mod builder_flow {
         assert_eq!(
             h.world.relay.header_requests().len(),
             1,
-            "the node still asks the relay at a factor of 0, as Lighthouse does"
+            "the node still asks the relay at a factor of 0"
         );
     }
 

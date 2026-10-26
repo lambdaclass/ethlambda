@@ -341,7 +341,8 @@ it is abandoned and the slot's attesters still vote. A blinded block that was
 already signed is the exception: its publish runs on its own task, since the
 beacon node may wait several seconds on the relay, so an overrun after signing
 is logged at info and not counted as a failed proposal, and the task counts the
-real outcome.
+real outcome (a refusal as a failed proposal, success with its publication
+delay).
 
 Electra is the earliest fork it will propose under. A deneb block body has one
 field fewer than an electra one, so it would need a container pair of its own,
