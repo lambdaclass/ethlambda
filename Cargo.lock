@@ -1951,6 +1951,7 @@ dependencies = [
  "ethlambda-types",
  "ethlambda-validator",
  "eyre",
+ "git2",
  "hex",
  "libc",
  "libssz 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=5cb14378ffdadcb51b387c003567e2630d0c7073)",
