@@ -1238,7 +1238,7 @@ mod tests {
                 &mut duties,
                 &keys,
                 3,
-                None,
+                &settings(None),
                 &empty_store(),
                 &altair_context(),
             )
@@ -1279,7 +1279,7 @@ mod tests {
             &mut duties,
             &keys,
             3,
-            None,
+            &settings(None),
             &empty_store(),
             &altair_context(),
         )

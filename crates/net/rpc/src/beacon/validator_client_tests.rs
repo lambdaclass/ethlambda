@@ -1333,7 +1333,16 @@ mod gloas {
         let pubkey = state.validator(proposer).unwrap().pubkey;
         import_published_block(store, network.clone(), advanced.clone());
 
-        let service = ProposalService::new(client, context, Bytes32::repeat_byte(0xab), None);
+        let service = ProposalService::new(
+            client,
+            context,
+            Arc::new(
+                ethlambda_validator::proposer_settings::ProposerSettings::new(
+                    Bytes32::repeat_byte(0xab),
+                    None,
+                ),
+            ),
+        );
         let duty = ProposerDutyDto {
             pubkey: encode_hex(&pubkey.0),
             validator_index: proposer,
