@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -22,7 +22,7 @@ use ethlambda_types::beacon::builder::{
     SignedValidatorRegistrationV1, SignedValidatorRegistrations,
 };
 use ethlambda_types::beacon::containers::BeaconState;
-use ethlambda_types::beacon::primitives::{BlsPubkey, ValidatorIndex};
+use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, ValidatorIndex};
 use ethlambda_types::beacon::signing::compute_epoch_at_slot;
 use libssz::SszDecode as _;
 use tracing::warn;
@@ -33,9 +33,11 @@ use super::{ApiError, BodyEncoding};
 use crate::metrics::inc_builder_registrations;
 
 pub(crate) fn routes() -> Router<Store> {
+    // A validator client may send every key it holds at once, which is more
+    // than axum's default body limit takes.
     Router::new().route(
         "/eth/v1/validator/register_validator",
-        post(post_register_validator),
+        post(post_register_validator).layer(DefaultBodyLimit::max(super::MAX_PUBLISH_BODY_BYTES)),
     )
 }
 
@@ -46,7 +48,7 @@ async fn post_register_validator(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    register(&store, builder.as_ref(), &fee_recipients, &headers, &body)
+    register(store, builder, fee_recipients, &headers, &body)
         .await
         .map_or_else(IntoResponse::into_response, |()| {
             axum::http::StatusCode::OK.into_response()
@@ -54,18 +56,29 @@ async fn post_register_validator(
 }
 
 async fn register(
-    store: &Store,
-    builder: Option<&BuilderClient>,
-    fee_recipients: &FeeRecipients,
+    store: Store,
+    builder: Option<BuilderClient>,
+    fee_recipients: FeeRecipients,
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<(), ApiError> {
-    let builder = builder.ok_or(ApiError::Internal("no builder is configured (--builder)"))?;
+    // Decoded first, so a malformed body is a 400 whether or not a builder is
+    // configured.
     let registrations = decode(headers, body)?;
-    let (_, state) = head(store)?;
+    let builder = builder.ok_or(ApiError::Internal("no builder is configured (--builder)"))?;
 
+    // The head-state read and the walk over the whole registry are blocking
+    // work, as the duty endpoints' walks are.
     let submitted = registrations.len();
-    let kept = active_or_pending(&state, registrations);
+    let kept = tokio::task::spawn_blocking(move || {
+        let (_, state) = head(&store)?;
+        // Judged at the later of the head's epoch and the wall clock's, so a
+        // lagging head cannot let an exited validator through.
+        let wall_epoch = compute_epoch_at_slot(super::node::wall_slot(&store));
+        Ok::<_, ApiError>(active_or_pending(&state, registrations, wall_epoch))
+    })
+    .await
+    .map_err(|_| ApiError::Internal("checking the registrations failed"))??;
     inc_builder_registrations("dropped", (submitted - kept.len()) as u64);
     if kept.is_empty() {
         return Ok(());
@@ -81,14 +94,20 @@ async fn register(
         .into_iter()
         .map(|(_, registration)| registration)
         .collect();
-    match builder.register_validators(&kept).await {
+    // On its own task: a validator client that hangs up drops this handler,
+    // and the forward must complete regardless.
+    let count = kept.len() as u64;
+    let forwarded = tokio::spawn(async move { builder.register_validators(&kept).await })
+        .await
+        .map_err(|_| ApiError::Internal("forwarding the registrations failed"))?;
+    match forwarded {
         Ok(()) => {
-            inc_builder_registrations("forwarded", kept.len() as u64);
+            inc_builder_registrations("forwarded", count);
             Ok(())
         }
         Err(err) => {
-            inc_builder_registrations("refused", kept.len() as u64);
-            warn!(%err, count = kept.len(), "Builder did not take the registrations");
+            inc_builder_registrations("failed", count);
+            warn!(%err, count, "Builder did not take the registrations");
             Err(match err {
                 BuilderError::BadRequest(message) => ApiError::BadRequestDetail(message),
                 _ => ApiError::Internal("the builder did not take the registrations"),
@@ -112,13 +131,14 @@ fn decode(
 }
 
 /// The registrations whose validator `state` holds as active or pending at
-/// its own epoch, each with its validator index. One pass over the registry,
+/// the later of its own epoch and `wall_epoch`, each with its validator index. One pass over the registry,
 /// whatever the number of registrations.
 fn active_or_pending(
     state: &BeaconState,
     registrations: Vec<SignedValidatorRegistrationV1>,
+    wall_epoch: Epoch,
 ) -> Vec<(ValidatorIndex, SignedValidatorRegistrationV1)> {
-    let epoch = compute_epoch_at_slot(state.slot());
+    let epoch = compute_epoch_at_slot(state.slot()).max(wall_epoch);
     let wanted: HashSet<BlsPubkey> = registrations
         .iter()
         .map(|registration| registration.message.pubkey)
@@ -128,7 +148,7 @@ fn active_or_pending(
     let indices: HashMap<BlsPubkey, ValidatorIndex> = state
         .iter_validators()
         .enumerate()
-        .filter(|(_, validator)| wanted.contains(&validator.pubkey) && epoch < validator.exit_epoch)
+        .filter(|(_, validator)| epoch < validator.exit_epoch && wanted.contains(&validator.pubkey))
         .map(|(index, validator)| (validator.pubkey, index as ValidatorIndex))
         .collect();
     registrations
@@ -147,6 +167,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use ethlambda_state_transition::beacon::helpers::test_state::with_signing_validators_at;
+    use ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
     use ethlambda_types::beacon::fork::ForkName;
     use ethlambda_types::beacon::primitives::{ExecutionAddress, Version};
     use http_body_util::BodyExt as _;
@@ -347,5 +368,110 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(relay.registrations(), registrations);
+    }
+
+    /// A store whose validator `index` is pending: its activation is in the
+    /// future and its exit is `FAR_FUTURE_EPOCH`.
+    fn store_with_pending(index: usize) -> Store {
+        let mut state = with_signing_validators_at(ForkName::Fulu, VALIDATORS);
+        let validator = state.validator_mut(index as ValidatorIndex).unwrap();
+        validator.activation_epoch = 1_000;
+        validator.exit_epoch = FAR_FUTURE_EPOCH;
+        state.apply_pending_mutations();
+        beacon_store_at(state).0
+    }
+
+    #[tokio::test]
+    async fn a_pending_validator_is_kept() {
+        let store = store_with_pending(4);
+        let relay = MockRelay::start(genesis_fork_version(&store)).await;
+        let pending = signed_registration(4, genesis_fork_version(&store));
+
+        let (status, body) = post(
+            store,
+            client_for(&relay),
+            FeeRecipients::default(),
+            json_request(std::slice::from_ref(&pending)),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(relay.registrations(), [pending]);
+    }
+
+    #[tokio::test]
+    async fn fee_recipients_are_set_even_when_the_builder_refuses() {
+        let store = store_with_exited(&[]);
+        let relay = MockRelay::start(genesis_fork_version(&store)).await;
+        let mut forged = signed_registration(0, genesis_fork_version(&store));
+        forged.signature = signed_registration(1, genesis_fork_version(&store)).signature;
+        let fee_recipients = FeeRecipients::default();
+
+        let (status, _) = post(
+            store,
+            client_for(&relay),
+            fee_recipients.clone(),
+            json_request(&[forged]),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            fee_recipients.lock().unwrap().get(&0),
+            Some(&ExecutionAddress::repeat_byte(0x11))
+        );
+    }
+
+    #[tokio::test]
+    async fn fee_recipients_are_set_even_when_the_builder_is_unreachable() {
+        let store = store_with_exited(&[]);
+        let registration = signed_registration(0, genesis_fork_version(&store));
+        let builder = BuilderClient::new(
+            "http://127.0.0.1:1",
+            Duration::from_secs(1),
+            "ethlambda/test",
+        )
+        .unwrap();
+        let fee_recipients = FeeRecipients::default();
+
+        let (status, _) = post(
+            store,
+            Some(builder),
+            fee_recipients.clone(),
+            json_request(&[registration]),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            fee_recipients.lock().unwrap().get(&0),
+            Some(&ExecutionAddress::repeat_byte(0x11))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_body_is_a_400() {
+        let store = store_with_exited(&[]);
+        let request = Request::post("/eth/v1/validator/register_validator")
+            .header("content-type", "application/json")
+            .body(Body::from("not json"))
+            .unwrap();
+
+        let (status, body) = post(store, None, FeeRecipients::default(), request).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_content_type_other_than_json_or_ssz_is_a_415() {
+        let store = store_with_exited(&[]);
+        let request = Request::post("/eth/v1/validator/register_validator")
+            .header("content-type", "text/plain")
+            .body(Body::from("[]"))
+            .unwrap();
+
+        let (status, body) = post(store, None, FeeRecipients::default(), request).await;
+
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{body}");
     }
 }

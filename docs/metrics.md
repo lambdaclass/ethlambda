@@ -468,7 +468,7 @@ ethlambda-specific, not part of the leanMetrics spec.
 |------|------|-------|-------------------------|--------|---------|
 | `lean_beacon_publish_data_columns_seconds` | Histogram | Time to compute and verify a published block's cells and build its data column sidecars | On every published block that carries blobs and whose cells verify | | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5 |
 | `lean_beacon_builder_request_seconds` | Histogram | Time a builder API call took | On every `getHeader`, `registerValidator`, `submitBlindedBlockV2` and `status` call to the configured builder | call=get_header,register_validators,submit_blinded_block,status<br>outcome=ok,no_bid,timeout,unreachable,bad_request,unexpected_status,invalid_response,unsupported_fork,encode | 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1, 2, 5, 10 |
-| `lean_beacon_builder_registrations_total` | Counter | Validator registrations received, by what became of them | On every `register_validator` request | outcome=forwarded\|refused\|dropped | |
+| `lean_beacon_builder_registrations_total` | Counter | Validator registrations received, by what became of them | On every `register_validator` request | outcome=forwarded,failed,dropped | |
 
 ### Beacon Committee Cache
 

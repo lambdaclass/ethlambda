@@ -318,7 +318,12 @@ pub(crate) struct MainnetOptions {
     /// How long block production waits for the builder's bid, in
     /// milliseconds. Also sent to the builder as `X-Timeout-Ms`, so it can
     /// hold its answer for as long as this node will wait.
-    #[arg(long, default_value_t = 1000, requires = "builder")]
+    #[arg(
+        long,
+        default_value_t = 1000,
+        requires = "builder",
+        value_parser = clap::value_parser!(u64).range(1..),
+    )]
     pub(crate) builder_header_timeout: u64,
 }
 
@@ -1060,6 +1065,19 @@ mod tests {
             }
             other => panic!("expected the mainnet network, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_zero_header_timeout_is_refused() {
+        let mut args = beacon_args();
+        args.extend([
+            "--builder",
+            "http://127.0.0.1:18550",
+            "--builder-header-timeout",
+            "0",
+        ]);
+
+        try_parse_from(args).expect_err("a zero timeout must not parse");
     }
 
     #[test]
