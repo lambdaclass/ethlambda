@@ -44,7 +44,7 @@ use ethlambda_validator::{
 
 use ethlambda_storage::Store;
 
-use crate::test_utils::{RecordingNetwork, beacon_store_at};
+use crate::test_utils::{RecordingNetwork, beacon_store_at, idle_engine};
 
 const COUNT: usize = 64;
 
@@ -59,7 +59,8 @@ fn own_version() -> ethlambda_engine::types::ClientVersionV1 {
 }
 
 /// A fulu head state at the first slot of the wall clock's current epoch, with
-/// its proposer lookahead filled in, served over HTTP on an ephemeral port.
+/// its proposer lookahead filled in, served over HTTP on an ephemeral port,
+/// by a node with no execution client.
 async fn serve() -> (HttpBeaconNode, BeaconState, Arc<RecordingNetwork>) {
     serve_with_engine(None).await
 }
@@ -67,6 +68,16 @@ async fn serve() -> (HttpBeaconNode, BeaconState, Arc<RecordingNetwork>) {
 async fn serve_with_engine(
     engine: Option<ethlambda_engine::EngineClient>,
 ) -> (HttpBeaconNode, BeaconState, Arc<RecordingNetwork>) {
+    let (client, state, network, _store) = serve_with_store(engine).await;
+    (client, state, network)
+}
+
+/// [`serve_with_engine`], also handing back the served store, for a test that
+/// changes what the node knows while it runs. It is a handle onto the same
+/// store the router reads.
+async fn serve_with_store(
+    engine: Option<ethlambda_engine::EngineClient>,
+) -> (HttpBeaconNode, BeaconState, Arc<RecordingNetwork>, Store) {
     let mut state = with_signing_validators_at(ForkName::Fulu, COUNT);
     let (probe, _) = beacon_store_at(state.clone());
     let wall_epoch = compute_epoch_at_slot(crate::beacon::node::wall_slot(&probe));
@@ -90,8 +101,8 @@ async fn serve_with_engine(
     fulu.next_sync_committee = sync_committee;
 
     let (store, _root) = beacon_store_at(state.clone());
-    let (client, network, _pool) = spawn_server(store, engine).await;
-    (client, state, network)
+    let (client, network, _pool) = spawn_server(store.clone(), engine).await;
+    (client, state, network, store)
 }
 
 /// Serve `store` through the router the real server builds, over a socket on an
@@ -135,9 +146,12 @@ async fn spawn_server(
 }
 
 /// One slot of an attester's work, in the order `ethlambda validator` does it.
+///
+/// The node has an execution client, since it refuses attestation data
+/// without one. None of these calls reach it.
 #[tokio::test]
 async fn the_validator_client_can_attest_through_this_node() {
-    let (client, state, network) = serve().await;
+    let (client, state, network) = serve_with_engine(idle_engine()).await;
     let slot = state.slot();
     let epoch = compute_epoch_at_slot(slot);
 
@@ -276,6 +290,32 @@ fn signed_aggregate(
         compute_signing_root(message.hash_tree_root(), domain),
     );
     SignedAggregateAndProof { message, signature }
+}
+
+/// On a head its execution client has not validated, the node refuses to hand
+/// out a vote, and the client reads that refusal the way it reads a node still
+/// syncing: as one to fail over from, and not as a malformed answer. Both ways
+/// of noticing agree, the per-request 503 and `/node/syncing`.
+#[tokio::test]
+async fn an_optimistic_head_is_one_the_client_will_not_attest_through() {
+    let (client, state, _, mut store) = serve_with_store(idle_engine()).await;
+    let (_slot, head_root) = store.beacon_head().expect("the anchor is the head");
+    store.insert_beacon_optimistic_root(head_root, state.slot());
+
+    let err = client
+        .attestation_data(state.slot(), ForkName::Fulu)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::BeaconNodeSyncing), "got {err:?}");
+    assert!(err.is_retryable());
+    assert!(client.is_optimistic_or_syncing().await.unwrap());
+
+    store.remove_beacon_optimistic_root(head_root);
+    client
+        .attestation_data(state.slot(), ForkName::Fulu)
+        .await
+        .expect("a validated head is attested to again");
+    assert!(!client.is_optimistic_or_syncing().await.unwrap());
 }
 
 /// Without an execution client to build a payload with, block production
@@ -619,7 +659,7 @@ mod gloas {
             store,
             head_root,
             ..
-        } = serve_gloas(32, None).await;
+        } = serve_gloas(32, idle_engine()).await;
         let slot = state.slot();
         let epoch = compute_epoch_at_slot(slot);
         assert_eq!(
@@ -762,7 +802,7 @@ mod gloas {
             head_root,
             context,
             ..
-        } = serve_gloas(32, None).await;
+        } = serve_gloas(32, idle_engine()).await;
         let slot = state.slot();
         let epoch = compute_epoch_at_slot(slot);
         let config = config();

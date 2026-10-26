@@ -236,8 +236,8 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `GET` | `/eth/v1/beacon/genesis` | JSON | Genesis time, validators root, fork version |
 | `GET` | `/eth/v1/config/spec` | JSON | The store's `Config`, plus `PRESET_BASE`, `CONFIG_NAME`, the preset and the constants (see below) |
 | `GET` | `/eth/v1/config/deposit_contract` | JSON | The `Config`'s deposit chain id and contract address |
-| `GET` | `/eth/v1/node/syncing` | JSON | Head slot, sync distance, optimistic flag |
-| `GET` | `/eth/v1/node/health` | *(status only)* | `200` caught up, `206` syncing |
+| `GET` | `/eth/v1/node/syncing` | JSON | Head slot, sync distance, whether the head is optimistic |
+| `GET` | `/eth/v1/node/health` | *(status only)* | `200` caught up, `206` syncing or on an optimistic head |
 | `GET` | `/eth/v1/node/version` | JSON | Client version string |
 | `GET` | `/eth/v1/node/identity` | JSON | Peer ID and metadata only (see below) |
 | `GET`, `POST` | `/eth/v1/beacon/states/{state_id}/validators` | JSON | Registry entries by index or pubkey, with status |
@@ -316,7 +316,12 @@ the chain actor writes, so no request waits on the actor.
   epoch's boundary block as target, and as source the current justified
   checkpoint of the head state advanced to the slot's epoch (through fork
   choice's cached `checkpoint_state`, and only when the head is in an earlier
-  epoch). A slot before the head, or past the wall clock, is a `400`.
+  epoch). A slot before the head, or past the wall clock, is a `400`. An
+  optimistic head is a `503`: the Beacon API requires one whenever the
+  answer's `beacon_block_root` has not been validated by the execution client,
+  and the head is always that root here. So is every request on a node run
+  without an execution client, whose blocks are never marked optimistic
+  because nothing validates them.
   `committee_index` is optional and ignored: from electra on every committee of
   a slot attests to the same data. `data.index` is `0` before gloas. At a gloas
   slot it is the payload-present flag: `0` when the head block is from the
@@ -352,7 +357,8 @@ the chain actor writes, so no request waits on the actor.
   data root and committee, as electra's `Attestation` with the BLS aggregate of
   their signatures; at a gloas slot the answer is `{version: "gloas", data}`
   with gloas's `Attestation` (the same JSON shape). JSON only. `404` when
-  nothing is held.
+  nothing is held, and `503` when the block the votes name is optimistic,
+  whether or not it is the head, or when no execution client is configured.
 - **`aggregate_and_proofs`** checks each aggregate with the same
   `beacon_aggregate_and_proof` gossip conditions this node applies to its
   peers' aggregates (`gossip::aggregate`), signatures included, against a
@@ -502,7 +508,9 @@ subnet publishes through gossipsub fanout.
   data is for the block of that very slot on the head's chain; a slot with no
   such block (or whose block is not a gloas block) answers `204` with no body,
   which a client reads as "cast no vote". A slot before the gloas fork is a
-  `400`, and a node that is syncing answers `503`. `payload_present` is whether
+  `400`, and a node that is syncing answers `503`, as does one run without an
+  execution client or whose block has an unvalidated execution payload behind
+  it (the same rule as attestation data). `payload_present` is whether
   the block's envelope reached this node before the slot's start plus
   `PAYLOAD_DUE_BPS` of it, judged by arrival time (see
   [Spec Deviations](./spec_deviations.md#payload_present-is-judged-by-the-envelopes-arrival-time)).
