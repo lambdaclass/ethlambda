@@ -69,6 +69,10 @@ pub struct MockBeaconNode {
     /// Every proposer preferences batch `submit_proposer_preferences`
     /// received, with the fork it was sent under, in call order.
     pub submitted_preferences: Mutex<Vec<(ForkName, Vec<gloas::SignedProposerPreferences>)>>,
+    /// Proposal slots whose preference the mock refuses, as a node does one it
+    /// holds with other content: a call carrying any of them is an `Err` and
+    /// records nothing, like the node's 400 for the whole call.
+    pub refused_preference_slots: Mutex<Vec<Slot>>,
     pub attestation_data: Option<AttestationData>,
     /// The slot and proposer the mock will produce a block for. `None` makes
     /// `produce_block` fail, the way an unset `attestation_data` does.
@@ -291,8 +295,9 @@ impl MockBeaconNode {
         self
     }
 
-    /// How many times `proposer_duties_v2` has been called, successes and
-    /// failures alike.
+    /// How many times `proposer_duties_v2` has been called and got past the
+    /// configured failures, answers and misses alike. A call `failures` or
+    /// `fail_everything` rejects is not counted.
     pub fn proposer_duties_v2_call_count(&self) -> usize {
         *self.proposer_duties_v2_calls.lock().expect("lock")
     }
@@ -579,8 +584,9 @@ impl MockBeaconNode {
         *self.validator_indices_calls.lock().expect("lock")
     }
 
-    /// How many times `proposer_duties` has been called, successes and
-    /// failures alike.
+    /// How many times `proposer_duties` has been called and got past the
+    /// configured failures, answers and misses alike. A call `failures` or
+    /// `fail_everything` rejects is not counted.
     pub fn proposer_duties_call_count(&self) -> usize {
         *self.proposer_duties_calls.lock().expect("lock")
     }
@@ -843,6 +849,19 @@ impl BeaconNodeApi for MockBeaconNode {
         preferences: &[gloas::SignedProposerPreferences],
     ) -> Result<()> {
         self.guard("submit_proposer_preferences")?;
+        let refused = self.refused_preference_slots.lock().expect("lock").clone();
+        if let Some(entry) = preferences
+            .iter()
+            .find(|entry| refused.contains(&entry.message.proposal_slot))
+        {
+            return Err(Error::BeaconNodeStatus {
+                status: 400,
+                body: format!(
+                    "preference for slot {} refused",
+                    entry.message.proposal_slot
+                ),
+            });
+        }
         self.submitted_preferences
             .lock()
             .expect("lock")

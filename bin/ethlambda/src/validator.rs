@@ -81,9 +81,10 @@ pub(crate) struct ValidatorOptions {
 
     /// Propose builder blocks: register each validator with the beacon node's
     /// builder and accept a blinded block when the builder's bid wins. Requires
-    /// a beacon node started with a builder (ethlambda: `--builder`). Fulu and
-    /// earlier only; from gloas the builder market works through proposer
-    /// preferences instead.
+    /// a beacon node started with a builder (ethlambda: `--builder`). The
+    /// registrations and blinded blocks are fulu and earlier only; from gloas
+    /// the builder market works through proposer preferences, and this flag's
+    /// boost factor weighs p2p bids in `produceBlockV4`.
     #[arg(long, default_value = "false")]
     pub(crate) builder_proposals: bool,
 

@@ -89,6 +89,32 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
     where
         F: Fn(&'p B) -> BoxFuture<'p, Result<T>>,
     {
+        self.try_each_at_inner(what, true, call).await
+    }
+
+    /// [`Self::try_each`] without the final `warn!`, for a caller whose own
+    /// duty did not depend on the answer and which reports the failure itself
+    /// (the counterpart of [`Self::try_all`]'s `all_failed: None`). A node that
+    /// is syncing, or lacks the endpoint, would otherwise make this warn on
+    /// every call for as long as it lasts.
+    async fn try_each_quiet<'p, T, F>(&'p self, what: &'static str, call: F) -> Result<T>
+    where
+        F: Fn(&'p B) -> BoxFuture<'p, Result<T>>,
+    {
+        self.try_each_at_inner(what, false, call)
+            .await
+            .map(|(_, value)| value)
+    }
+
+    async fn try_each_at_inner<'p, T, F>(
+        &'p self,
+        what: &'static str,
+        warn_when_all_fail: bool,
+        call: F,
+    ) -> Result<(usize, T)>
+    where
+        F: Fn(&'p B) -> BoxFuture<'p, Result<T>>,
+    {
         let mut last = None;
         for (position, node) in self.nodes.iter().enumerate() {
             match call(node).await {
@@ -106,7 +132,9 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
         let detail = last
             .map(|err| err.to_string())
             .unwrap_or_else(|| "no nodes configured".to_string());
-        warn!(%what, %detail, "All configured beacon nodes failed; duty likely missed");
+        if warn_when_all_fail {
+            warn!(%what, %detail, "All configured beacon nodes failed; duty likely missed");
+        }
         Err(Error::AllBeaconNodesFailed(detail))
     }
 
@@ -257,7 +285,9 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
     }
 
     async fn proposer_duties_v2(&self, epoch: Epoch) -> Result<ProposerDuties> {
-        self.try_each("proposer_duties_v2", |node| node.proposer_duties_v2(epoch))
+        // Quiet: the preferences service reports its own failure once per
+        // epoch, and no duty depends on this answer.
+        self.try_each_quiet("proposer_duties_v2", |node| node.proposer_duties_v2(epoch))
             .await
     }
 
@@ -358,10 +388,8 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
         self.try_all(
             "submit_proposer_preferences",
             "it will not gossip these proposer preferences",
-            Some(
-                "no node took this client's proposer preferences; builders' bids for those \
-                 slots are ignored, and from gloas a node may not know the fee recipient",
-            ),
+            // The service reports it, per preference, with what it costs.
+            None,
             |node| node.submit_proposer_preferences(fork, preferences),
         )
         .await

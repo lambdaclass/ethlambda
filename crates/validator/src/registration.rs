@@ -318,32 +318,15 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
 mod tests {
     use super::*;
     use crate::beacon_node::mock::MockBeaconNode;
+    use crate::test_support::{settings, store_with_keys};
     use ethlambda_types::beacon::config::Config;
-    use ethlambda_types::beacon::primitives::{Bytes32, H160, Root};
+    use ethlambda_types::beacon::primitives::{H160, Root};
 
     fn context(config: Config) -> Arc<SigningContext> {
         Arc::new(SigningContext {
             config,
             genesis_validators_root: Root::ZERO,
         })
-    }
-
-    /// `count` distinct keys. The secrets are small integers, which are valid
-    /// BLS scalars, so no keystore is needed.
-    fn store_with_keys(count: usize) -> (ValidatorStore, Vec<BlsPubkey>) {
-        let mut store = ValidatorStore::new();
-        let pubkeys = (0..count)
-            .map(|index| {
-                let mut secret = [0u8; 32];
-                secret[24..].copy_from_slice(&(index as u64 + 1).to_be_bytes());
-                store.insert_secret("test", &secret).expect("inserts")
-            })
-            .collect();
-        (store, pubkeys)
-    }
-
-    fn settings(fee_recipient: Option<H160>) -> Arc<ProposerSettings> {
-        Arc::new(ProposerSettings::new(Bytes32::ZERO, fee_recipient))
     }
 
     fn service(

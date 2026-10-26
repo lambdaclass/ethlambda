@@ -722,10 +722,13 @@ so the fork version it uses is the one in force an epoch before the proposal's.
 - **ethlambda:** the validator client signs at the epoch before the proposal's
   (`SigningContext::sign_proposer_preferences`), which is the domain the gossip
   rule verifies.
-- **Why:** the two agree except in the first epoch of a fork, where the head
-  state still carries the old fork version and a proposal's epoch resolves to
-  the new one, so the guide's signature would fail the gossip rule that peers
-  apply. This node's own `proposer_preferences` endpoint accepts both.
+- **Why:** `get_domain` reads `state.fork`, not the schedule, so the two agree
+  everywhere except for a proposal in the first epoch of a fork, signed during
+  that epoch. There the head state already carries the new fork version, while
+  the gossip rule's state (at the start of the previous epoch) still carries the
+  old one, so the guide's signature would fail the rule peers apply. During the
+  epoch before the fork both give the old version. This node's own
+  `proposer_preferences` endpoint accepts both.
 - **Published unconditionally,** not gated on `--builder-proposals`, since from
   gloas the preferences carry every proposal's fee recipient. Validators with no
   fee recipient are skipped (the field is required), and a preference cannot be

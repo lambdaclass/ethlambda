@@ -326,8 +326,12 @@ impl SigningContext {
     /// against: `get_domain(state, .., proposal_epoch)` on the dependent
     /// block's state advanced to the lookahead start, whose fork is the one
     /// in force an epoch before the proposal. The validator guide signs with
-    /// the head state instead; the two differ only in the first epoch of a
-    /// fork, where this one is the one peers accept. Not slashable.
+    /// the head state (`get_domain` reads `state.fork`, not the schedule);
+    /// the two agree everywhere except for a proposal in the first epoch of a
+    /// fork, signed during that epoch: the head state already carries the new
+    /// version, while the gossip rule's state, at the start of the previous
+    /// epoch, still carries the old one. This signer takes the gossip rule's,
+    /// which is the one peers verify. Not slashable.
     pub fn sign_proposer_preferences(
         &self,
         store: &ValidatorStore,
@@ -643,9 +647,10 @@ mod tests {
     }
 
     /// The first gloas epoch's preference is signed at the fork of the epoch
-    /// before it (fulu), which is what the gossip rule verifies against, and
-    /// not under the gloas version the validator guide's head-state signer
-    /// would use.
+    /// before it (fulu), which is what the gossip rule verifies against. The
+    /// validator guide's head-state signer would give gloas for a preference
+    /// signed during that epoch, which the gossip rule's state (still fulu)
+    /// would reject.
     #[test]
     fn a_preference_for_the_first_gloas_epoch_is_signed_under_the_fulu_version() {
         let (store, pubkey) = store_with_key();

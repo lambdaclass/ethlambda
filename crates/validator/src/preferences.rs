@@ -22,8 +22,9 @@
 //! # The signing domain
 //!
 //! See [`SigningContext::sign_proposer_preferences`]: the gossip rule's domain,
-//! at the fork of the epoch before the proposal's, which is not the validator
-//! guide's head-state one in the first epoch of a fork.
+//! at the fork of the epoch before the proposal's. The validator guide's
+//! head-state signer differs from it only for a proposal in the first epoch of
+//! a fork, signed during that epoch.
 //!
 //! # Why every slot
 //!
@@ -46,15 +47,25 @@
 //! replaced for the same slot and root. A fee recipient changed after a
 //! preference went out applies from the next dependent root onward only.
 //!
+//! # One preference per request
+//!
+//! A node answers 400 for a whole call when any entry in it fails, and one it
+//! holds for the same `(slot, dependent_root)` with other content is such a
+//! failure (a restart after a fee recipient change, say). Batching would then
+//! fail every entry every slot until that slot passed, so each preference is
+//! sent alone, and each success is remembered on its own. There are only a
+//! handful per epoch.
+//!
 //! # Failures are never propagated
 //!
 //! A missed preference costs a builder bid and, from gloas, possibly the
-//! node's knowledge of the fee recipient, never a duty. A failed send is logged
-//! and counted, and the next slot retries.
+//! node's knowledge of the fee recipient, never a duty. A failed send, or a
+//! failed duties fetch, is logged (the fetch once per epoch) and counted, and
+//! the next slot retries.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use ethlambda_types::beacon::containers::gloas::{ProposerPreferences, SignedProposerPreferences};
 use ethlambda_types::beacon::fork::ForkName;
@@ -88,13 +99,24 @@ pub struct PreferencesService<B> {
     /// `(proposal_slot, dependent_root)` pairs a node accepted, so a
     /// preference is signed and sent once per dependent root. A reorg that
     /// moves the root sends the slot again; pruned below the current epoch.
-    published: std::sync::Mutex<HashSet<(Slot, Root)>>,
+    published: Mutex<HashSet<(Slot, Root)>>,
     /// Epochs whose missing fee recipients were already warned about, so the
     /// warning is once per epoch rather than once per slot. Pruned like
     /// `published`.
-    warned_epochs: std::sync::Mutex<HashSet<Epoch>>,
+    no_fee_warned: Mutex<HashSet<Epoch>>,
+    /// Epochs whose failed duties fetch was already warned about, for the same
+    /// reason: a syncing node, or one without v2, fails every slot.
+    fetch_warned: Mutex<HashSet<Epoch>>,
     /// One poll at a time: a slow node must not stack polls up.
     in_flight: AtomicBool,
+}
+
+/// Lock `mutex`, recovering a poisoned one: every write here is one set
+/// operation, so the data behind it is never half-changed.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
@@ -107,8 +129,9 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
             beacon_node,
             context,
             settings,
-            published: std::sync::Mutex::new(HashSet::new()),
-            warned_epochs: std::sync::Mutex::new(HashSet::new()),
+            published: Mutex::new(HashSet::new()),
+            no_fee_warned: Mutex::new(HashSet::new()),
+            fetch_warned: Mutex::new(HashSet::new()),
             in_flight: AtomicBool::new(false),
         }
     }
@@ -128,31 +151,24 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
         // Snapshotted with the guard dropped at once: nothing below awaits a
         // node while holding the store.
         let pubkeys: HashSet<BlsPubkey> = store.read().await.pubkeys().into_iter().collect();
-        let fork = self.context.config.fork_at_epoch(epoch);
 
         for target in [epoch, epoch + 1] {
             if self.context.config.fork_at_epoch(target) < ForkName::Gloas {
                 continue;
             }
-            self.publish_epoch(fork, current_slot, target, &pubkeys, &store)
+            self.publish_epoch(current_slot, target, &pubkeys, &store)
                 .await;
         }
 
         let epoch_start = epoch * preset::SLOTS_PER_EPOCH;
-        self.published
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|(slot, _)| *slot >= epoch_start);
-        self.warned_epochs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|warned| *warned >= epoch);
+        lock(&self.published).retain(|(slot, _)| *slot >= epoch_start);
+        lock(&self.no_fee_warned).retain(|warned| *warned >= epoch);
+        lock(&self.fetch_warned).retain(|warned| *warned >= epoch);
     }
 
     /// One target epoch: fetch its v2 duties, sign what is still owed and send it.
     async fn publish_epoch(
         &self,
-        fork: ForkName,
         current_slot: Slot,
         target: Epoch,
         pubkeys: &HashSet<BlsPubkey>,
@@ -162,6 +178,15 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
             Ok(duties) => duties,
             Err(err) => {
                 debug!(epoch = target, %err, "Could not fetch proposer duties for preferences");
+                crate::metrics::inc_proposer_preferences_failures();
+                if lock(&self.fetch_warned).insert(target) {
+                    warn!(
+                        epoch = target,
+                        %err,
+                        "No beacon node answered the v2 proposer duties; proposer preferences \
+                         for this epoch wait for a node that does"
+                    );
+                }
                 return;
             }
         };
@@ -179,12 +204,7 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
             if !pubkeys.contains(&pubkey) {
                 continue;
             }
-            let already = self
-                .published
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains(&(duty.slot, duties.dependent_root));
-            if already {
+            if lock(&self.published).contains(&(duty.slot, duties.dependent_root)) {
                 continue;
             }
             let Some(fee_recipient) = self.settings.fee_recipient(&pubkey) else {
@@ -203,26 +223,19 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
             ));
         }
 
-        if no_fee_recipient > 0 {
-            let first_warning = self
-                .warned_epochs
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(target);
-            if first_warning {
-                warn!(
-                    epoch = target,
-                    skipped = no_fee_recipient,
-                    "Validators without a fee recipient publish no proposer preferences"
-                );
-            }
+        if no_fee_recipient > 0 && lock(&self.no_fee_warned).insert(target) {
+            warn!(
+                epoch = target,
+                skipped = no_fee_recipient,
+                "Validators without a fee recipient publish no proposer preferences"
+            );
         }
         if owed.is_empty() {
             return;
         }
 
         // At most a few per epoch, so signing inline is cheap; the read guard
-        // is released before the submit.
+        // is released before the submits.
         let mut signed = Vec::with_capacity(owed.len());
         {
             let store = store.read().await;
@@ -243,32 +256,46 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
                 }
             }
         }
-        if signed.is_empty() {
-            return;
-        }
 
-        match self
-            .beacon_node
-            .submit_proposer_preferences(fork, &signed)
-            .await
-        {
-            Ok(()) => {
-                let count = signed.len();
-                self.published
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .extend(
-                        signed.iter().map(|entry| {
-                            (entry.message.proposal_slot, entry.message.dependent_root)
-                        }),
+        // The target epoch's fork, which is what the submitted objects belong
+        // to (always gloas here).
+        let fork = self.context.config.fork_at_epoch(target);
+        let mut published = 0usize;
+        for entry in signed {
+            // One request per preference: a node answers 400 for the whole
+            // call when any entry fails, and the one it refuses (for a
+            // `(slot, root)` it holds with other content, say) would
+            // otherwise keep the others from ever being marked published.
+            let key = (entry.message.proposal_slot, entry.message.dependent_root);
+            match self
+                .beacon_node
+                .submit_proposer_preferences(fork, std::slice::from_ref(&entry))
+                .await
+            {
+                Ok(()) => {
+                    lock(&self.published).insert(key);
+                    published += 1;
+                }
+                Err(err) => {
+                    warn!(
+                        epoch = target,
+                        slot = key.0,
+                        validator = entry.message.validator_index,
+                        %err,
+                        "No beacon node accepted a proposer preference; builders' bids for that \
+                         slot are ignored, and from gloas a node may not know the fee recipient"
                     );
-                crate::metrics::inc_proposer_preferences_published(count);
-                info!(epoch = target, count, "Proposer preferences published");
+                    crate::metrics::inc_proposer_preferences_failures();
+                }
             }
-            Err(err) => {
-                warn!(epoch = target, count = signed.len(), %err, "No beacon node accepted the proposer preferences");
-                crate::metrics::inc_proposer_preferences_failures();
-            }
+        }
+        if published > 0 {
+            crate::metrics::inc_proposer_preferences_published(published);
+            info!(
+                epoch = target,
+                count = published,
+                "Proposer preferences published"
+            );
         }
     }
 }
@@ -278,9 +305,10 @@ mod tests {
     use super::*;
     use crate::beacon_node::dto::ProposerDutyDto;
     use crate::beacon_node::mock::MockBeaconNode;
+    use crate::test_support::{settings, store_with_keys};
     use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::constants::DOMAIN_PROPOSER_PREFERENCES;
-    use ethlambda_types::beacon::primitives::{Bytes32, H160, HashTreeRoot as _};
+    use ethlambda_types::beacon::primitives::{H160, HashTreeRoot as _};
     use ethlambda_types::beacon::signing::{compute_domain, compute_signing_root};
 
     const GLOAS_EPOCH: Epoch = 500_000;
@@ -295,30 +323,12 @@ mod tests {
         })
     }
 
-    /// `count` distinct keys. The secrets are small integers, which are valid
-    /// BLS scalars, so no keystore is needed.
-    fn store_with_keys(count: usize) -> (ValidatorStore, Vec<BlsPubkey>) {
-        let mut store = ValidatorStore::new();
-        let pubkeys = (0..count)
-            .map(|index| {
-                let mut secret = [0u8; 32];
-                secret[24..].copy_from_slice(&(index as u64 + 1).to_be_bytes());
-                store.insert_secret("test", &secret).expect("inserts")
-            })
-            .collect();
-        (store, pubkeys)
-    }
-
     fn duty(pubkey: &BlsPubkey, validator_index: u64, slot: Slot) -> ProposerDutyDto {
         ProposerDutyDto {
             pubkey: encode_hex(&pubkey.0),
             validator_index,
             slot,
         }
-    }
-
-    fn settings(fee_recipient: Option<H160>) -> Arc<ProposerSettings> {
-        Arc::new(ProposerSettings::new(Bytes32::ZERO, fee_recipient))
     }
 
     fn service(
@@ -345,16 +355,19 @@ mod tests {
 
         let context = context();
         let proposal_epoch = compute_epoch_at_slot(entry.message.proposal_slot);
-        let domain = context.domain(DOMAIN_PROPOSER_PREFERENCES, proposal_epoch - 1);
-        assert_eq!(
-            domain,
-            compute_domain(
-                DOMAIN_PROPOSER_PREFERENCES,
-                context
-                    .config
-                    .fork_version(context.config.fork_at_epoch(proposal_epoch - 1)),
-                context.genesis_validators_root,
-            )
+        // Spelled out rather than asked of `SigningContext::domain`: the
+        // first gloas epoch's preference verifies under fulu's version (the
+        // fork of the epoch before it), every later one under gloas's.
+        let version = if proposal_epoch == GLOAS_EPOCH {
+            context.config.fulu_fork_version
+        } else {
+            assert!(proposal_epoch > GLOAS_EPOCH);
+            context.config.gloas_fork_version
+        };
+        let domain = compute_domain(
+            DOMAIN_PROPOSER_PREFERENCES,
+            version,
+            context.genesis_validators_root,
         );
         let root = compute_signing_root(entry.message.hash_tree_root(), domain);
         let pk = PublicKey::from_bytes(&pubkey.0).expect("valid pubkey");
@@ -392,7 +405,7 @@ mod tests {
         service.poll(current, store).await;
 
         let sent = submitted(&node);
-        assert_eq!(sent.len(), 2, "one send per target epoch");
+        assert_eq!(sent.len(), 2, "one request per preference");
         let mut entries: Vec<_> = sent
             .iter()
             .inspect(|(fork, _)| assert_eq!(*fork, ForkName::Gloas))
@@ -477,7 +490,7 @@ mod tests {
             .await;
         let sent = submitted(&node);
         assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].0, ForkName::Fulu, "the current epoch's fork");
+        assert_eq!(sent[0].0, ForkName::Gloas, "the target epoch's fork");
         assert_eq!(sent[0].1[0].message.proposal_slot, slot_in(GLOAS_EPOCH, 10));
         assert_eq!(node.proposer_duties_v2_call_count(), 1);
 
@@ -550,6 +563,76 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].1.len(), 1);
         assert_eq!(sent[0].1[0].message.validator_index, 4);
+    }
+
+    /// A node that refuses one preference (it holds another for that slot and
+    /// root) must not keep the others from going out and being remembered, nor
+    /// make them re-sent every slot.
+    #[tokio::test]
+    async fn a_refused_preference_does_not_block_the_others() {
+        let (store, pubkeys) = store_with_keys(2);
+        let store = Arc::new(RwLock::new(store));
+        let refused = slot_in(GLOAS_EPOCH, 10);
+        let accepted = slot_in(GLOAS_EPOCH, 11);
+        let node = MockBeaconNode::new().with_proposers_v2(
+            GLOAS_EPOCH,
+            Root::repeat_byte(0x11),
+            vec![
+                duty(&pubkeys[0], 3, refused),
+                duty(&pubkeys[1], 4, accepted),
+            ],
+        );
+        node.refused_preference_slots
+            .lock()
+            .expect("lock")
+            .push(refused);
+        let (service, node) = service(node, settings(Some(FEE_RECIPIENT)));
+        let current = slot_in(GLOAS_EPOCH, 1);
+
+        service.clone().poll(current, store.clone()).await;
+        let sent = submitted(&node);
+        assert_eq!(sent.len(), 1, "only the accepted one was recorded");
+        assert_eq!(sent[0].1[0].message.proposal_slot, accepted);
+
+        // Next poll: the accepted one is not re-sent, the refused one is
+        // tried again (and refused again).
+        service.clone().poll(current + 1, store.clone()).await;
+        assert_eq!(submitted(&node).len(), 1);
+
+        node.refused_preference_slots.lock().expect("lock").clear();
+        service.poll(current + 2, store).await;
+        let sent = submitted(&node);
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1].1[0].message.proposal_slot, refused);
+    }
+
+    /// A failed duties fetch is warned about once per target epoch, and the
+    /// next poll that gets an answer publishes.
+    #[tokio::test]
+    async fn a_failed_duties_fetch_is_retried_and_warned_once_per_epoch() {
+        let (store, pubkeys) = store_with_keys(1);
+        let store = Arc::new(RwLock::new(store));
+        let node = MockBeaconNode::new().with_proposers_v2(
+            GLOAS_EPOCH,
+            Root::repeat_byte(0x11),
+            vec![duty(&pubkeys[0], 3, slot_in(GLOAS_EPOCH, 10))],
+        );
+        node.failures
+            .lock()
+            .expect("lock")
+            .insert("proposer_duties_v2", "syncing".to_string());
+        let (service, node) = service(node, settings(Some(FEE_RECIPIENT)));
+        let current = slot_in(GLOAS_EPOCH, 1);
+
+        service.clone().poll(current, store.clone()).await;
+        service.clone().poll(current + 1, store.clone()).await;
+        assert!(submitted(&node).is_empty());
+        let warned: Vec<Epoch> = lock(&service.fetch_warned).iter().copied().collect();
+        assert_eq!(warned.len(), 2, "one entry per target epoch, not per poll");
+
+        node.failures.lock().expect("lock").clear();
+        service.poll(current + 2, store).await;
+        assert_eq!(submitted(&node).len(), 1);
     }
 
     #[tokio::test]

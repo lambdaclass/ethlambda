@@ -50,6 +50,8 @@ pub mod signing;
 pub mod slot_clock;
 pub mod subscriptions;
 pub mod sync_committee;
+#[cfg(test)]
+mod test_support;
 
 pub use error::{Error, Result};
 
@@ -107,9 +109,10 @@ pub struct ValidatorConfig {
 /// and accept a blinded block when the builder's bid wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuilderProposals {
-    /// The `builder_boost_factor` sent with every pre-gloas block request:
-    /// 100 compares the bid and the local payload as they are; `u64::MAX`
-    /// takes the builder whenever there is a bid.
+    /// The `builder_boost_factor` sent with every block request (in the query
+    /// before gloas, in `produceBlockV4`'s body from gloas): 100 compares the
+    /// bid and the local payload as they are; `u64::MAX` takes the builder
+    /// whenever there is a bid.
     pub boost_factor: u64,
 }
 
@@ -352,6 +355,13 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             }
         }
 
+        // First in the slot, ahead of the proposal: the preferences for the
+        // slots after this one must be out before those slots start (gossip
+        // IGNOREs a started slot), and a poll queued behind a duty could land
+        // late. Off the slot loop, since it is single-flight and a slow node
+        // must not delay this slot's duties.
+        tokio::spawn(preferences.clone().poll(slot, store.clone()));
+
         // A block is due now, at the boundary this iteration woke on.
         //
         // Cloned out of `duties` so the borrow ends before the await: the duty
@@ -391,10 +401,6 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         if let Some(registration) = &registration {
             tokio::spawn(registration.clone().register_changed(epoch, store.clone()));
         }
-
-        // Likewise off the slot loop: the poll is single-flight, and a slow
-        // node must not delay the next slot's duties.
-        tokio::spawn(preferences.clone().poll(slot, store.clone()));
     }
 }
 

@@ -426,13 +426,16 @@ pub trait BeaconNodeApi: Send + Sync {
 
     /// Submit signed proposer preferences, which the node validates with the
     /// `proposer_preferences` gossip rules and publishes. `fork` is the
-    /// `Eth-Consensus-Version`: the fork of the current epoch.
+    /// `Eth-Consensus-Version`: the fork the preferences belong to, that of
+    /// their proposal epoch.
     ///
     /// A 400 naming per-index failures is an `Err`: the whole call failed for
-    /// the caller's purposes. The caller re-submits the entries next slot, and
-    /// the node answers per entry, so the ones that already went out are
-    /// deduplicated by the node. State on the node's gossip, so failover sends
-    /// it to every node.
+    /// the caller's purposes, although the node may have published the entries
+    /// that passed. A node only short-circuits an identical entry, so one it
+    /// holds for the same `(slot, dependent_root)` with other content fails
+    /// every call that carries it. The caller therefore sends one preference
+    /// per call. State on the node's gossip, so failover sends it to every
+    /// node.
     async fn submit_proposer_preferences(
         &self,
         fork: ForkName,
