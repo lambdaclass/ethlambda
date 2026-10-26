@@ -261,7 +261,7 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `GET` | `/eth/v1/validator/execution_payload_envelopes/{slot}/{beacon_block_root}` | SSZ or JSON | The unsigned envelope `produceBlockV4` built (gloas) |
 | `POST` | `/eth/v2/beacon/blocks` | *(status only)* | Gossip and import a signed fulu or gloas block (`publishBlockV2`, SSZ) |
 | `POST` | `/eth/v1/beacon/execution_payload_envelopes` | *(status only)* | Gossip a signed envelope and its data columns (gloas, SSZ) |
-| `POST` | `/eth/v1/validator/prepare_beacon_proposer` | *(status only)* | Acknowledged, not acted on (see below) |
+| `POST` | `/eth/v1/validator/prepare_beacon_proposer` | *(status only)* | Record each validator's fee recipient for block production (see below) |
 | `GET` | `/eth/v1/events` | SSE | Live stream of chain events (see below) |
 
 ### Validator endpoints
@@ -387,6 +387,17 @@ the chain actor writes, so no request waits on the actor.
   blobs. A slot the schedule does not place at fulu (gloas included) is a
   `400`, checked before the execution client; `produceBlockV3` is the fulu
   endpoint, and a gloas slot goes to `produceBlockV4`.
+- **Graffiti** is the validator client's, with both clients' codes and
+  commits appended as far as they fit: `hello RH1a2bLA3c4d` for reth at
+  `1a2b…` under ethlambda at `3c4d…`. The execution client's half comes from
+  `engine_getClientVersionV1`, asked alongside the payload build and given up
+  on after `EL_VERSION_TIMEOUT`, and is left out when it cannot be had
+  (`hello LA3c4d`). The
+  suffix shrinks rather than cutting the validator's text short, in
+  Lighthouse's tiers, and is appended to every block with no opt-out; the
+  `graffiti_policy` parameter Lighthouse's validator client sends is not read.
+  `LA` is ethlambda's own code: `identification.md` reserves none for it and
+  lets an unlisted client pick any two letters no listed client uses.
 - **`POST beacon/blocks`** takes SSZ and the `Eth-Consensus-Version` header
   (`fulu` or `gloas`, else `400`; a non-SSZ content type is a `415`). Fulu: a
   `SignedBlockContents`; the node checks the block is after the head and its
