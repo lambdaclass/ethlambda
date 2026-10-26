@@ -22,6 +22,7 @@ use axum::{
 };
 use ethlambda_blockchain::SyncStatusController;
 use ethlambda_blockchain::metrics::SyncStatus;
+use ethlambda_engine::EngineClient;
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
     fork_choice::get_payload_due_ms,
@@ -54,7 +55,10 @@ use tracing::{debug, warn};
 
 use crate::{
     CustodyColumns,
-    beacon::{ApiError, validator::head},
+    beacon::{
+        ApiError,
+        validator::{head, require_execution_client, require_validated},
+    },
     shared::content::{Encoding, ssz_response, with_consensus_version},
 };
 
@@ -239,13 +243,23 @@ struct PayloadAttestationDataQuery {
 ///   already verified (which required them), or every column this node
 ///   custodies for the block is stored. Columns are verified on arrival, so
 ///   holding them is the evidence `is_data_available` asks for.
+///
+/// Refused with a `503`, like attestation data, when the block voted on has an
+/// unvalidated execution payload behind it (see [`require_validated`]) and on
+/// a node run without an execution client (see [`require_execution_client`]):
+/// the answer is signed over the block's root, which an optimistic validator
+/// must not do.
 async fn get_payload_attestation_data(
     Query(query): Query<PayloadAttestationDataQuery>,
     State(store): State<Store>,
+    Extension(engine): Extension<Option<EngineClient>>,
     Extension(custody): Extension<CustodyColumns>,
     Extension(sync_status): Extension<SyncStatusController>,
     headers: HeaderMap,
 ) -> Response {
+    if let Err(err) = require_execution_client(&engine) {
+        return err.into_response();
+    }
     if sync_status.get() == SyncStatus::Syncing {
         return ApiError::ServiceUnavailable("node is syncing").into_response();
     }
@@ -254,6 +268,9 @@ async fn get_payload_attestation_data(
         Ok(None) => return StatusCode::NO_CONTENT.into_response(),
         Err(err) => return err.into_response(),
     };
+    if let Err(err) = require_validated(&store, data.beacon_block_root) {
+        return err.into_response();
+    }
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let response = match Encoding::from_accept(accept) {
         Encoding::Ssz => ssz_response(data.to_ssz()),
@@ -650,6 +667,7 @@ mod tests {
             .layer(Extension(p2p))
             .layer(Extension(pool))
             .layer(Extension(CustodyColumns(custody)))
+            .layer(Extension(crate::test_utils::idle_engine()))
             .layer(Extension(sync))
             .oneshot(request)
             .await
@@ -973,6 +991,27 @@ mod tests {
         )
         .await;
         assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// The answer is signed over the block's root, so it follows attestation
+    /// data's rule: no execution client is a `503`.
+    #[tokio::test]
+    async fn the_data_is_refused_without_an_execution_client() {
+        let state = gloas_state();
+        let slot = state.slot();
+        let (store, _) = store_with_head(state, gloas_config(), 0);
+
+        let p2p: RpcToP2PRef = Arc::new(RecordingNetwork::default());
+        let response = routes()
+            .with_state(store)
+            .layer(Extension(p2p))
+            .layer(Extension(CustodyColumns(Vec::new())))
+            .layer(Extension(None::<EngineClient>))
+            .layer(Extension(SyncStatusController::default()))
+            .oneshot(data_request(slot, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     // ----- pool ------------------------------------------------------------
