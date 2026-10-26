@@ -904,8 +904,10 @@ pub fn mark_validated(store: &mut Store, root: Root) {
 ///    chain has had time to justify around any poison.
 ///
 /// Reads `is_execution_block(parent)` off the cached execution hash rather than
-/// decoding the parent block: the cache is populated at import for exactly the
-/// blocks that have one, so its absence is the answer.
+/// decoding the parent block: the cache is populated for exactly the blocks
+/// that have one (at import, for the checkpoint anchor in
+/// [`get_forkchoice_store`], and on resume for the stored unfinalized window),
+/// so its absence is the answer.
 ///
 /// `safe_slots` is a parameter rather than the constant read directly, because
 /// the specification requires the value to be operator-configurable.
@@ -1120,9 +1122,19 @@ pub fn get_forkchoice_store(
     // this file's only outright whole-`BeaconState` clone. `checkpoint_state`
     // now derives that second copy on demand instead of caching it, so the
     // anchor is written once.
+    let anchor_el_hash = anchor_block.execution_block_hash_if_execution_block();
     store
         .insert_signed_block(anchor_root, anchor_block)
         .expect("insert");
+    // Only the hash, not a verdict: the specification's `is_execution_block`
+    // reads the block body, and the anchor is the one block that never goes
+    // through `on_block`, which is what fills this cache. Without it the first
+    // child's parent would look pre-merge, so `is_optimistic_candidate_block`
+    // would hold it until it is `safe_slots` old, and `forkchoiceUpdated`'s
+    // finalized and safe hashes would be zero for the anchor.
+    if let Some(hash) = anchor_el_hash {
+        store.insert_beacon_el_block_hash(anchor_root, anchor_slot, hash);
+    }
     store
         .insert_state(anchor_root, anchor_state)
         .expect("insert");
@@ -4725,7 +4737,7 @@ pub fn on_block(
 
     // Add new block to the store, and the new state for this block to the
     // store.
-    let signed_block_el_hash = signed_block.execution_block_hash();
+    let signed_block_el_hash = signed_block.execution_block_hash_if_execution_block();
     store
         .insert_signed_block(block_root, signed_block)
         .expect("insert");
@@ -4757,11 +4769,8 @@ pub fn on_block(
     // zero (see `stf::bellatrix::default_execution_payload`), and caching that
     // would make its children look like descendants of a merge block and skip
     // the age horizon that exists precisely to guard the merge transition.
-    // Testing the block hash alone is enough: it is a keccak digest in a real
-    // payload and zero in the empty one.
-    if let Some(el_block_hash) = signed_block_el_hash
-        && !el_block_hash.is_zero()
-    {
+    // The rule lives in `SignedBeaconBlock::execution_block_hash_if_execution_block`.
+    if let Some(el_block_hash) = signed_block_el_hash {
         store.insert_beacon_el_block_hash(block_root, block_slot, el_block_hash);
     }
     match payload_validity {
@@ -6794,6 +6803,82 @@ mod tests {
         ));
     }
 
+    /// An exact fulu anchor pair whose payload carries `el_hash`, built as
+    /// `get_forkchoice_store_seeds_a_gloas_anchor_and_leaves_an_earlier_one_alone`
+    /// builds its gloas one.
+    fn fulu_anchor_pair(el_hash: ExecutionBlockHash) -> (BeaconState, SignedBeaconBlock) {
+        let mut state = test_state::with_validators_at(ForkName::Fulu, 1);
+        let mut signed = fulu_block(state.slot(), Root::ZERO);
+        let SignedBeaconBlock::Fulu(inner) = &mut signed else {
+            unreachable!("`fulu_block` builds a fulu signed block");
+        };
+        inner.message.body.execution_payload.block_hash = el_hash;
+        *state.latest_block_header_mut() = BeaconBlockHeader {
+            slot: inner.message.slot,
+            proposer_index: 0,
+            parent_root: Root::ZERO,
+            state_root: Root::ZERO,
+            body_root: inner.message.body.hash_tree_root(),
+        };
+        inner.message.state_root = state.hash_tree_root();
+        (state, signed)
+    }
+
+    /// The anchor is the one block `on_block` never sees, so its execution hash
+    /// has to be cached when the store is built: otherwise its first child's
+    /// parent reads as pre-merge and waits out the age horizon.
+    #[test]
+    fn a_post_merge_anchor_makes_its_first_child_an_optimistic_candidate() {
+        let el_hash = ExecutionBlockHash::repeat_byte(0xaa);
+        let (state, block) = fulu_anchor_pair(el_hash);
+        let anchor_root = block.message_hash_tree_root();
+        let anchor_slot = block.slot();
+
+        let store = get_forkchoice_store(
+            Arc::new(InMemoryBackend::new()),
+            state,
+            block,
+            &Config::active(),
+        )
+        .expect("a fulu anchor is accepted");
+
+        assert_eq!(store.beacon_el_block_hash(anchor_root), Some(el_hash));
+        assert!(is_optimistic_candidate_block(
+            &store,
+            anchor_slot + 1,
+            anchor_slot + 1,
+            anchor_root,
+            constants::SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY,
+        ));
+    }
+
+    #[test]
+    fn an_anchor_with_no_execution_payload_caches_no_hash() {
+        // A zero payload hash is the pre-merge shape: not an execution block.
+        let (state, block) = fulu_anchor_pair(ExecutionBlockHash::ZERO);
+        let anchor_root = block.message_hash_tree_root();
+        let store = get_forkchoice_store(
+            Arc::new(InMemoryBackend::new()),
+            state,
+            block,
+            &Config::active(),
+        )
+        .unwrap();
+        assert_eq!(store.beacon_el_block_hash(anchor_root), None);
+
+        // Phase0 carries no payload at all.
+        let (state, block) = anchor_pair();
+        let anchor_root = block.message_hash_tree_root();
+        let store = get_forkchoice_store(
+            Arc::new(InMemoryBackend::new()),
+            state,
+            block,
+            &Config::active(),
+        )
+        .unwrap();
+        assert_eq!(store.beacon_el_block_hash(anchor_root), None);
+    }
+
     #[test]
     fn a_block_on_a_payloadless_parent_needs_the_age_horizon() {
         let store = empty_store();
@@ -8583,6 +8668,8 @@ mod tests {
             Some(vec![None; preset::PTC_SIZE])
         );
         assert!(!store.has_verified_payload(&anchor_root));
+        // A gloas block carries a bid, not a payload: nothing to cache.
+        assert_eq!(store.beacon_el_block_hash(anchor_root), None);
 
         // Earlier forks record none of the three for their anchor.
         let (state, block) = anchor_pair();
