@@ -16,12 +16,16 @@
 //! `GENESIS_TIME` is absent by design: it is not a `config.yaml` key, and
 //! `/eth/v1/beacon/genesis` is where it is reported.
 //!
-//! The preset and constant keys are the ones lighthouse reports, less two
-//! kinds: gloas-only keys, since this build cannot process gloas (the same
-//! reason `Config` leaves out `GLOAS_*`), and keys the specification does not
-//! define at all (`GAS_LIMIT_ADJUSTMENT_FACTOR`, `RESP_TIMEOUT`,
-//! `TTFB_TIMEOUT`). Constants lighthouse leaves out, such as
-//! `JUSTIFICATION_BITS_LENGTH`, are left out here too.
+//! The configuration keys include gloas's (`GLOAS_*` and the other gloas
+//! timing and churn keys), since `Config` holds them and this serializes the
+//! whole of it. The preset and constant keys are the ones lighthouse reports
+//! plus gloas's own, from `presets/*/gloas.yaml` and `beacon-chain.md`'s
+//! constants (`PTC_SIZE`, `DOMAIN_BEACON_BUILDER`, ...), less keys the
+//! specification does not define at all (`GAS_LIMIT_ADJUSTMENT_FACTOR`,
+//! `RESP_TIMEOUT`, `TTFB_TIMEOUT`). Constants lighthouse leaves out, such as
+//! `JUSTIFICATION_BITS_LENGTH`, are left out here too. Gloas's `MAX_*_SIZE`
+//! preset keys bound gossip message sizes, which the node does not run on, so
+//! they are left out as well.
 
 use axum::{Router, extract::State, response::Response, routing::get};
 use ethlambda_storage::Store;
@@ -153,6 +157,12 @@ fn extra_entries() -> impl Iterator<Item = (&'static str, String)> {
         FIELD_ELEMENTS_PER_EXT_BLOB,
         CELLS_PER_EXT_BLOB,
         NUMBER_OF_COLUMNS,
+        // Gloas, in the order of the specification's `presets/*/gloas.yaml`.
+        PTC_SIZE,
+        MAX_PAYLOAD_ATTESTATIONS,
+        MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD,
+        MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD,
+        MAX_BUILDERS_PER_WITHDRAWALS_SWEEP,
     );
 
     let domains = entries!(hex_string; constants:
@@ -168,13 +178,24 @@ fn extra_entries() -> impl Iterator<Item = (&'static str, String)> {
         DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
         DOMAIN_CONTRIBUTION_AND_PROOF,
         DOMAIN_BLS_TO_EXECUTION_CHANGE,
+        DOMAIN_BEACON_BUILDER,
+        DOMAIN_PTC_ATTESTER,
+        DOMAIN_PROPOSER_PREFERENCES,
+        DOMAIN_BUILDER_DEPOSIT,
     );
 
-    // One-byte constants, so each goes out as a one-byte array would.
-    let withdrawal_prefixes = entries!(|prefix: u8| hex_string([prefix]); constants:
+    // One-byte constants (withdrawal prefixes and execution request types), so
+    // each goes out as a one-byte array would.
+    let one_byte_constants = entries!(|prefix: u8| hex_string([prefix]); constants:
         BLS_WITHDRAWAL_PREFIX,
         ETH1_ADDRESS_WITHDRAWAL_PREFIX,
         COMPOUNDING_WITHDRAWAL_PREFIX,
+        DEPOSIT_REQUEST_TYPE,
+        WITHDRAWAL_REQUEST_TYPE,
+        CONSOLIDATION_REQUEST_TYPE,
+        BUILDER_WITHDRAWAL_PREFIX,
+        BUILDER_DEPOSIT_REQUEST_TYPE,
+        BUILDER_EXIT_REQUEST_TYPE,
     );
 
     // `VERSIONED_HASH_VERSION_KZG` is a `Bytes1` like the withdrawal prefixes,
@@ -186,12 +207,17 @@ fn extra_entries() -> impl Iterator<Item = (&'static str, String)> {
         VERSIONED_HASH_VERSION_KZG,
         UNSET_DEPOSIT_REQUESTS_START_INDEX,
         FULL_EXIT_REQUEST_AMOUNT,
+        BUILDER_INDEX_FLAG,
+        BUILDER_INDEX_SELF_BUILD,
+        BUILDER_PAYMENT_THRESHOLD_NUMERATOR,
+        BUILDER_PAYMENT_THRESHOLD_DENOMINATOR,
+        PAYLOAD_BUILDER_VERSION,
     );
 
     preset
         .into_iter()
         .chain(domains)
-        .chain(withdrawal_prefixes)
+        .chain(one_byte_constants)
         .chain(other_constants)
 }
 
@@ -285,6 +311,39 @@ mod tests {
             data["UNSET_DEPOSIT_REQUESTS_START_INDEX"],
             "18446744073709551615"
         );
+    }
+
+    #[tokio::test]
+    async fn the_spec_carries_gloas_preset_and_constant_keys() {
+        let json = get_spec_json().await;
+        let data = &json["data"];
+
+        assert_eq!(data["PTC_SIZE"], preset::PTC_SIZE.to_string());
+        assert_eq!(
+            data["MAX_PAYLOAD_ATTESTATIONS"],
+            preset::MAX_PAYLOAD_ATTESTATIONS.to_string()
+        );
+        assert_eq!(
+            data["MAX_BUILDERS_PER_WITHDRAWALS_SWEEP"],
+            preset::MAX_BUILDERS_PER_WITHDRAWALS_SWEEP.to_string()
+        );
+        assert_eq!(data["DOMAIN_BEACON_BUILDER"], "0x0b000000");
+        assert_eq!(data["DOMAIN_PTC_ATTESTER"], "0x0c000000");
+        assert_eq!(data["DOMAIN_PROPOSER_PREFERENCES"], "0x0d000000");
+        assert_eq!(data["DOMAIN_BUILDER_DEPOSIT"], "0x0e000000");
+        assert_eq!(data["DEPOSIT_REQUEST_TYPE"], "0x00");
+        assert_eq!(data["CONSOLIDATION_REQUEST_TYPE"], "0x02");
+        assert_eq!(data["BUILDER_WITHDRAWAL_PREFIX"], "0xb0");
+        assert_eq!(data["BUILDER_DEPOSIT_REQUEST_TYPE"], "0x03");
+        assert_eq!(data["BUILDER_EXIT_REQUEST_TYPE"], "0x04");
+        assert_eq!(data["BUILDER_INDEX_SELF_BUILD"], "18446744073709551615");
+        assert_eq!(data["BUILDER_INDEX_FLAG"], "1099511627776");
+        assert_eq!(
+            data["BUILDER_PAYMENT_THRESHOLD_NUMERATOR"],
+            constants::BUILDER_PAYMENT_THRESHOLD_NUMERATOR.to_string()
+        );
+        // A `Config` field, so it comes from the config half of the object.
+        assert!(data["MIN_BUILDER_WITHDRAWABILITY_DELAY"].is_string());
     }
 
     #[test]

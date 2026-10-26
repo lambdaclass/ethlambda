@@ -20,6 +20,7 @@ pub mod altair_reference;
 pub mod capella;
 pub mod electra;
 pub mod fulu;
+pub mod gloas;
 pub mod justification;
 #[cfg(test)]
 mod participation_equivalence;
@@ -84,8 +85,11 @@ pub fn process_epoch_phase0(state: &mut BeaconState, config: &Config) -> Result<
 ///   across forks, and never redefines `process_epoch` itself, so this reuses
 ///   capella's driver.
 /// - Electra's and fulu's sections each give a full, modified `process_epoch`
-///   (electra adds the pending-deposit and pending-consolidation steps;
-///   fulu appends the proposer-lookahead step), so each gets its own stub.
+///   (electra adds the pending-deposit and pending-consolidation steps; fulu
+///   appends the proposer-lookahead step and, less visibly in this listing,
+///   swaps in its own `process_pending_deposits`, which drops the
+///   eth1-bridge gate electra's version still has), so each gets its own
+///   stub.
 pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
     match state.fork_name() {
         ForkName::Phase0 => process_epoch_phase0(state, config),
@@ -95,6 +99,13 @@ pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
         ForkName::Deneb => capella::process_epoch(state, config),
         ForkName::Electra => electra::process_epoch(state, config),
         ForkName::Fulu => fulu::process_epoch(state, config),
+        // EIP-7732's builder registry, payment queues, and payload
+        // availability each need their own epoch-boundary steps
+        // (`process_builder_pending_payments`, `process_ptc_window`), and
+        // EIP-7688's progressive participation, inactivity, and pending-queue
+        // lists need their own copies of several more (see `gloas`'s own
+        // module doc for which), so gloas gets its own driver too.
+        ForkName::Gloas => gloas::process_epoch(state, config),
         ForkName::Lean => lean_state_unreachable("process_epoch"),
     }
 }
@@ -110,14 +121,27 @@ pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
 ///
 /// Altair rewrote the step to read participation flags instead of replaying
 /// stored attestations, and no later fork changes it again, so altair's version
-/// serves everything from altair on.
+/// serves everything from altair on, gloas included: nothing in gloas's own
+/// `beacon-chain.md` touches this step either, and
+/// [`crate::beacon::containers::BeaconState::altair_validator_lists`] now reaches
+/// a gloas state's participation lists too (as plain slices, since gloas's are
+/// progressive rather than `SszList`; see that accessor's own doc), which is
+/// what lets this one copy serve every fork from altair on without a
+/// gloas-specific one.
 pub fn process_justification_and_finalization(
     state: &mut BeaconState,
     config: &Config,
 ) -> Result<()> {
     match state.fork_name() {
         ForkName::Phase0 => justification::process_justification_and_finalization(state, config),
-        _ => altair::process_justification_and_finalization(state),
+        ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb
+        | ForkName::Electra
+        | ForkName::Fulu
+        | ForkName::Gloas => altair::process_justification_and_finalization(state),
+        ForkName::Lean => lean_state_unreachable("process_justification_and_finalization"),
     }
 }
 
@@ -267,31 +291,37 @@ pub fn process_eth1_data_reset(state: &mut BeaconState) -> Result<()> {
 /// and since effective balance feeds the shuffling seed's weighting and every
 /// reward, that would churn far more than it measures.
 pub fn process_effective_balance_updates(state: &mut BeaconState) -> Result<()> {
-    // Decided in one pass and applied in another. The state is an enum over
-    // per-fork structs, so the accessors hand out a borrow of the whole state
-    // rather than of one field, and there is no way to hold `validators` mutably
-    // while reading `balances`. Collecting the decisions first keeps this
-    // fork-independent, which matters because every fork runs this step
-    // unchanged.
+    // Decided in one pass and applied in another: `validator_mut` clones the
+    // element into the update buffer on every call, whether or not it is
+    // then written (see its own doc), so deciding and writing in one combined
+    // pass would buffer and rehash the whole registry instead of only the
+    // validators that actually move. Collecting the decisions first also
+    // keeps this fork-independent, which matters because every fork runs
+    // this step unchanged.
+    // The specification reads `state.balances[index]` for every validator, so
+    // a balance list shorter than the registry fails at its first missing
+    // entry. Checked here because the zip below would stop at it silently.
+    let balance_count = state.iter_balances().len();
+    if balance_count < state.validator_count() {
+        return Err(Error::UnknownValidator(balance_count as ValidatorIndex));
+    }
     let mut updates = Vec::new();
     // Zipped rather than indexed: step 3 only writes the balances that changed,
-    // so `balances()[index]` would be a tree descent for most validators.
-    for (index, (validator, &balance)) in state
-        .validators()
-        .iter()
-        .zip(state.balances().iter())
+    // so `balance(index)` would be a tree descent for most validators.
+    for (index, (validator, balance)) in state
+        .iter_validators()
+        .zip(state.iter_balances())
         .enumerate()
     {
         if leaves_hysteresis_band(validator.effective_balance, balance)? {
             let effective = (balance - balance % preset::EFFECTIVE_BALANCE_INCREMENT)
                 .min(preset::MAX_EFFECTIVE_BALANCE);
-            updates.push((index, effective));
+            updates.push((index as ValidatorIndex, effective));
         }
     }
 
-    let validators = state.validators_mut();
     for (index, effective) in updates {
-        validators[index].effective_balance = effective;
+        state.validator_mut(index)?.effective_balance = effective;
     }
     Ok(())
 }

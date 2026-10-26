@@ -53,9 +53,9 @@ impl ConfigFile {
     /// Log what was ignored, as one line naming each key.
     ///
     /// One line rather than one per key: a current `config.yaml` carries the
-    /// gloas and heze schedule, so per-key lines would flood every valid
-    /// startup with one warning per ignored key and bury a real typo among
-    /// them.
+    /// heze schedule, which this build does not claim, so per-key lines
+    /// would flood every valid startup with one warning per ignored key and
+    /// bury a real typo among them.
     pub(crate) fn warn_about_ignored_keys(&self) {
         if self.ignored.is_empty() {
             return;
@@ -142,12 +142,9 @@ mod tests {
     fn the_forks_this_build_cannot_process_are_reported_as_ignored() {
         let parsed = ConfigFile::parse(DEVNET).unwrap();
         for key in [
-            "GLOAS_FORK_VERSION",
-            "GLOAS_FORK_EPOCH",
             "HEZE_FORK_VERSION",
             "HEZE_FORK_EPOCH",
             "GAS_LIMIT_SCHEDULE",
-            "PAYLOAD_DUE_BPS",
             "INCLUSION_LIST_DUE_BPS",
         ] {
             assert!(
@@ -155,6 +152,21 @@ mod tests {
                 "{key} not reported"
             );
         }
+    }
+
+    #[test]
+    fn the_gloas_keys_are_claimed_rather_than_ignored() {
+        // GLOAS_* and PAYLOAD_DUE_BPS used to be reported as ignored
+        // alongside heze's; now that `Config` has fields for them, they must
+        // not be.
+        let parsed = ConfigFile::parse(DEVNET).unwrap();
+        for key in ["GLOAS_FORK_VERSION", "GLOAS_FORK_EPOCH", "PAYLOAD_DUE_BPS"] {
+            assert!(
+                !parsed.ignored.contains(&key.to_string()),
+                "{key} reported as ignored"
+            );
+        }
+        assert_eq!(parsed.config.gloas_fork_version, [0x07, 0, 0, 0]);
     }
 
     #[test]
