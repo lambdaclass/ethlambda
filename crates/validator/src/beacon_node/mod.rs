@@ -322,6 +322,13 @@ pub trait BeaconNodeApi: Send + Sync {
     /// treats the two the same way will act on a stale proposer schedule.
     async fn proposer_duties(&self, epoch: Epoch) -> Result<ProposerDuties>;
 
+    /// Every proposer duty in `epoch` with v2's `dependent_root`: the block at
+    /// `compute_start_slot_at_epoch(epoch - 1) - 1`, the shuffling dependent
+    /// root fulu's proposer lookahead fixes the epoch's proposers from. Signed
+    /// proposer preferences must carry exactly this root, which v1's
+    /// definition (one epoch later) is not.
+    async fn proposer_duties_v2(&self, epoch: Epoch) -> Result<ProposerDuties>;
+
     /// Produce the attestation data for `slot`, which is in `fork`.
     ///
     /// No committee index is ever a parameter here. Before gloas the query
@@ -414,6 +421,21 @@ pub trait BeaconNodeApi: Send + Sync {
     async fn register_validators(
         &self,
         registrations: &[SignedValidatorRegistrationV1],
+    ) -> Result<()>;
+
+    /// Submit signed proposer preferences, which the node validates with the
+    /// `proposer_preferences` gossip rules and publishes. `fork` is the
+    /// `Eth-Consensus-Version`: the fork of the current epoch.
+    ///
+    /// A 400 naming per-index failures is an `Err`: the whole call failed for
+    /// the caller's purposes. The caller re-submits the entries next slot, and
+    /// the node answers per entry, so the ones that already went out are
+    /// deduplicated by the node. State on the node's gossip, so failover sends
+    /// it to every node.
+    async fn submit_proposer_preferences(
+        &self,
+        fork: ForkName,
+        preferences: &[gloas::SignedProposerPreferences],
     ) -> Result<()>;
 
     /// The envelope the node cached for the self-built payload of the block

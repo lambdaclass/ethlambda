@@ -256,6 +256,11 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
             .await
     }
 
+    async fn proposer_duties_v2(&self, epoch: Epoch) -> Result<ProposerDuties> {
+        self.try_each("proposer_duties_v2", |node| node.proposer_duties_v2(epoch))
+            .await
+    }
+
     async fn attestation_data(&self, slot: Slot, fork: ForkName) -> Result<AttestationData> {
         self.try_each("attestation_data", |node| node.attestation_data(slot, fork))
             .await
@@ -338,6 +343,26 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
             "it will not hold these registrations",
             None,
             |node| node.register_validators(registrations),
+        )
+        .await
+    }
+
+    /// To every node, since each one gossips what it accepts: a preference
+    /// only the first node heard reaches the mesh through that node alone, and
+    /// builders subscribed elsewhere would ignore the slot.
+    async fn submit_proposer_preferences(
+        &self,
+        fork: ForkName,
+        preferences: &[gloas::SignedProposerPreferences],
+    ) -> Result<()> {
+        self.try_all(
+            "submit_proposer_preferences",
+            "it will not gossip these proposer preferences",
+            Some(
+                "no node took this client's proposer preferences; builders' bids for those \
+                 slots are ignored, and from gloas a node may not know the fee recipient",
+            ),
+            |node| node.submit_proposer_preferences(fork, preferences),
         )
         .await
     }
@@ -1059,6 +1084,49 @@ mod tests {
             .publish_blinded_block(5, ForkName::Electra, &[1])
             .await
             .expect_err("the record is gone");
+    }
+
+    #[tokio::test]
+    async fn proposer_preferences_reach_every_node_past_a_failing_one() {
+        use ethlambda_types::beacon::containers::gloas::{
+            ProposerPreferences, SignedProposerPreferences,
+        };
+
+        let preference = SignedProposerPreferences {
+            message: ProposerPreferences {
+                proposal_slot: 70,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let fallback = FallbackBeaconNode::new(vec![
+            MockBeaconNode::new(),
+            MockBeaconNode::failing("middle down"),
+            MockBeaconNode::new(),
+        ]);
+
+        fallback
+            .submit_proposer_preferences(ForkName::Fulu, std::slice::from_ref(&preference))
+            .await
+            .expect("two of three accepted");
+
+        for position in [0, 2] {
+            assert_eq!(
+                *fallback.nodes[position]
+                    .submitted_preferences
+                    .lock()
+                    .expect("lock"),
+                vec![(ForkName::Fulu, vec![preference.clone()])],
+                "node {position}"
+            );
+        }
+        assert!(
+            fallback.nodes[1]
+                .submitted_preferences
+                .lock()
+                .expect("lock")
+                .is_empty()
+        );
     }
 
     #[tokio::test]

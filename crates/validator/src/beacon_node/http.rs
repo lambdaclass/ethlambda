@@ -627,6 +627,18 @@ impl BeaconNodeApi for HttpBeaconNode {
         })
     }
 
+    /// [`Self::proposer_duties`] against the v2 path, whose `dependent_root`
+    /// is the shuffling dependent root proposer preferences must carry.
+    async fn proposer_duties_v2(&self, epoch: Epoch) -> Result<ProposerDuties> {
+        let response: DutiesResponse<Vec<ProposerDutyDto>> = self
+            .get(&format!("/eth/v2/validator/duties/proposer/{epoch}"))
+            .await?;
+        Ok(ProposerDuties {
+            dependent_root: parse_root(&response.dependent_root)?,
+            duties: response.data,
+        })
+    }
+
     async fn attestation_data(&self, slot: Slot, fork: ForkName) -> Result<AttestationData> {
         let response: DataResponse<AttestationDataDto> =
             self.get(&Self::attestation_data_path(slot, fork)).await?;
@@ -803,6 +815,24 @@ impl BeaconNodeApi for HttpBeaconNode {
             &registrations,
             None,
             Some(REGISTRATION_TIMEOUT),
+        )
+        .await
+    }
+
+    /// JSON, which every beacon node must accept, an empty list never reaching
+    /// the wire. The gloas container serialises as the endpoint's JSON itself.
+    async fn submit_proposer_preferences(
+        &self,
+        fork: ForkName,
+        preferences: &[gloas::SignedProposerPreferences],
+    ) -> Result<()> {
+        if preferences.is_empty() {
+            return Ok(());
+        }
+        self.post_no_content(
+            "/eth/v1/validator/proposer_preferences",
+            &preferences,
+            Some(fork.as_str()),
         )
         .await
     }
@@ -1467,6 +1497,61 @@ mod tests {
         let served = serve(200, vec![], vec![]).await;
         served.node.register_validators(&[]).await.expect("a no-op");
         assert!(served.seen.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn proposer_preferences_are_posted_as_json_with_the_fork_header() {
+        use ethlambda_types::beacon::primitives::{BlsSignature, H160};
+
+        let preferences = vec![gloas::SignedProposerPreferences {
+            message: gloas::ProposerPreferences {
+                dependent_root: Root::from([9u8; 32]),
+                proposal_slot: 70,
+                validator_index: 4,
+                fee_recipient: H160([0xcd; 20]),
+                target_gas_limit: 36_000_000,
+            },
+            signature: BlsSignature([5; 96]),
+        }];
+        let served = serve(200, vec![], vec![]).await;
+        served
+            .node
+            .submit_proposer_preferences(ForkName::Fulu, &preferences)
+            .await
+            .expect("accepted");
+
+        let seen = served.seen.lock().expect("lock");
+        assert_eq!(seen.len(), 1);
+        assert!(
+            seen[0]
+                .0
+                .ends_with("/eth/v1/validator/proposer_preferences")
+        );
+        assert_eq!(seen[0].2["eth-consensus-version"], "fulu");
+        let decoded: Vec<gloas::SignedProposerPreferences> =
+            serde_json::from_slice(&seen[0].1).expect("the body is the endpoint's JSON");
+        assert_eq!(decoded, preferences);
+    }
+
+    #[tokio::test]
+    async fn an_empty_preference_list_never_reaches_the_wire() {
+        let served = serve(200, vec![], vec![]).await;
+        served
+            .node
+            .submit_proposer_preferences(ForkName::Fulu, &[])
+            .await
+            .expect("a no-op");
+        assert!(served.seen.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn v2_proposer_duties_use_the_v2_path() {
+        let reply = br#"{"dependent_root":"0x0909090909090909090909090909090909090909090909090909090909090909","execution_optimistic":false,"data":[]}"#.to_vec();
+        let served = serve(200, vec![("content-type", "application/json")], reply).await;
+        let duties = served.node.proposer_duties_v2(3).await.expect("decodes");
+        assert_eq!(duties.dependent_root, Root::from([9u8; 32]));
+        let seen = served.seen.lock().expect("lock");
+        assert!(seen[0].0.ends_with("/eth/v2/validator/duties/proposer/3"));
     }
 
     #[tokio::test]
