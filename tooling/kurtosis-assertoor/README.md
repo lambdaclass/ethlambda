@@ -101,9 +101,13 @@ The relay, builder and PBS images are pinned by digest in
 
 ### Run it locally
 
-The image needs the builder support, so build one from the builder PR stack
-(#694 to #705) and set it as the `cl_image` and `vc_image` of the ethlambda
-entries in `commit_boost_params.yaml`. From the repository root:
+The image needs the builder support, so build one from a checkout of the
+builder PR stack (#694 to #705). From that checkout's root, `make docker-build
+DOCKER_TAG=<tag>` tags it `ghcr.io/lambdaclass/ethlambda:<tag>`; set that as the
+`cl_image` and `vc_image` of the ethlambda entries in `commit_boost_params.yaml`.
+Kurtosis uses an image that exists in the local Docker daemon and only pulls a
+missing one (`kurtosis run --image-download`, default `missing`), so no setting
+is needed; do not pass `--image-download always`. From the repository root:
 
 ```bash
 git clone https://github.com/lambdaclass/ethereum-package.git /tmp/ethereum-package
@@ -137,7 +141,7 @@ on push and on pull requests.
 `COMMIT_BOOST_PACKAGE_REF` is `37fe57ea309b954361c0f33ac6efc570313ffaf6`, the
 commit on the `lambdaclass/ethereum-package` branch `feat/ethlambda-builder-flags`
 that adds ethlambda to `apply_external_builder_flags` (`--builder=<url>` for the
-beacon node, `--builder-proposals` for the validator client). That branch has
-to be pushed before the job can fetch the commit. If the fork PR is
+beacon node, `--builder-proposals` for the validator client). That branch is
+lambdaclass/ethereum-package#22. If the fork PR is
 squash-merged, the commit is no longer reachable from the fork's default branch
 and may be garbage collected, so re-pin to the squash commit.
