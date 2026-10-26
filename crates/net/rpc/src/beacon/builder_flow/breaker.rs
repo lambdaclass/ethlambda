@@ -46,6 +46,7 @@ impl Default for FallbackThresholds {
 pub(crate) enum Trip {
     Syncing,
     OptimisticHead,
+    /// Reads the state's realized `finalized_checkpoint`, not fork choice's.
     NoFinality,
     ConsecutiveSkips,
     SkipsPerEpoch,
@@ -181,6 +182,45 @@ mod tests {
         // Slot 200 is in epoch 6.
         assert_eq!(check_at(&state_at(200, &[], 3)), Ok(()));
         assert_eq!(check_at(&state_at(200, &[], 2)), Err(Trip::NoFinality));
+    }
+
+    #[test]
+    fn a_proposal_near_genesis_counts_no_slot_before_slot_one() {
+        assert_eq!(check_at(&state_at(1, &[], 0)), Ok(()));
+        assert_eq!(check_at(&state_at(5, &[], 0)), Ok(()));
+        // Slots 1 to 4 are all empty: four in a row, and slot 0 is never judged.
+        assert_eq!(
+            check_at(&state_at(5, &[1, 2, 3, 4], 0)),
+            Err(Trip::ConsecutiveSkips)
+        );
+        assert_eq!(check_at(&state_at(4, &[1, 2, 3], 0)), Ok(()));
+    }
+
+    #[test]
+    fn a_history_that_wraps_is_read_at_its_wrapped_index() {
+        let wrapped = 8192 + 100;
+        assert_eq!(check_at(&state_at(wrapped, &[], 300)), Ok(()));
+        let run = [wrapped - 4, wrapped - 3, wrapped - 2, wrapped - 1];
+        assert_eq!(
+            check_at(&state_at(wrapped, &run, 300)),
+            Err(Trip::ConsecutiveSkips)
+        );
+    }
+
+    #[test]
+    fn a_slot_older_than_the_history_counts_as_filled() {
+        let slot = 8192 + 100;
+        let all_empty: Vec<Slot> = (1..slot).collect();
+        let state = state_at(slot, &all_empty, 300);
+        // Slot 1 is out of the state's reach, so its roots are not compared.
+        assert!(!is_empty(&state, 1));
+        assert!(is_empty(&state, slot - 1));
+    }
+
+    #[test]
+    fn an_empty_run_that_does_not_end_right_before_the_proposal_is_not_consecutive() {
+        // Five empty slots, but slot 99 had a block.
+        assert_eq!(check_at(&state_at(100, &[90, 91, 92, 93, 94], 2)), Ok(()));
     }
 
     #[test]

@@ -72,7 +72,7 @@ impl BuilderRegistrations {
 }
 
 fn expired(entry: &Entry, epoch: Epoch) -> bool {
-    epoch > entry.seen + REGISTRATION_LIFETIME_EPOCHS
+    epoch > entry.seen.saturating_add(REGISTRATION_LIFETIME_EPOCHS)
 }
 
 #[cfg(test)]

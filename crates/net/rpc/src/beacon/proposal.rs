@@ -51,13 +51,13 @@ use ethlambda_state_transition::beacon::{
 use ethlambda_storage::Store;
 use ethlambda_types::{
     beacon::{
-        builder::{BlindedBeaconBlock, ValidatorRegistrationV1},
+        builder::{BlindedBeaconBlock, BuilderBid, ValidatorRegistrationV1},
         config::Config,
         containers::{
             self, BeaconState,
             altair::SyncAggregate,
             deneb::Blob,
-            electra::{Attestation, BeaconBlock, SignedBeaconBlock},
+            electra::{Attestation, BeaconBlock, ExecutionRequests, SignedBeaconBlock},
         },
         fork::ForkName,
         preset,
@@ -129,7 +129,8 @@ pub(crate) fn routes() -> Router<Store> {
         )
         .route(
             "/eth/v2/beacon/blinded_blocks",
-            post(blinded_blocks::post_blinded_block),
+            post(blinded_blocks::post_blinded_block)
+                .layer(DefaultBodyLimit::max(super::MAX_PUBLISH_BODY_BYTES)),
         )
         .layer(Extension(PublishedProposals::default()))
 }
@@ -253,16 +254,10 @@ async fn post_block(
         }
     };
     let root = signed_block.message.hash_tree_root();
-    if published
-        .claim(signed_block.message.slot, root, finalized_slot(&store))
-        .is_err()
-    {
-        warn!(
-            slot = signed_block.message.slot,
-            "Refusing a second, different block for the slot"
-        );
-        return ApiError::BadRequest("this node already published a different block for the slot")
-            .into_response();
+    let slot = signed_block.message.slot;
+    if let Err(err) = published.claim(slot, root, finalized_slot(&store)) {
+        warn!(slot, ?err, "Refusing a block for the slot");
+        return err.into_api_error().into_response();
     }
     let block = containers::SignedBeaconBlock::Fulu(signed_block);
     let sidecars = sidecars
@@ -338,20 +333,11 @@ async fn post_gloas_block(
         Ok(Err(err)) => return err.into_response(),
         Err(_) => return ApiError::Internal("verifying the block failed").into_response(),
     }
-    if published
-        .claim(
-            block.slot(),
-            block.message_hash_tree_root(),
-            finalized_slot(store),
-        )
-        .is_err()
-    {
-        warn!(
-            slot = block.slot(),
-            "Refusing a second, different block for the slot"
-        );
-        return ApiError::BadRequest("this node already published a different block for the slot")
-            .into_response();
+    let slot = block.slot();
+    let root = block.message_hash_tree_root();
+    if let Err(err) = published.claim(slot, root, finalized_slot(store)) {
+        warn!(slot, ?err, "Refusing a block for the slot");
+        return err.into_api_error().into_response();
     }
     // A gloas block carries no blobs of its own: its data columns travel with
     // the execution payload envelope, published separately, so there are no
@@ -565,11 +551,13 @@ impl Packed {
     }
 }
 
-/// The local block and what its payload offers.
-struct LocalBlock {
-    contents: FuluBlockContents,
-    value: Uint256,
-    should_override_builder: bool,
+/// The local payload, checked and converted for a block but not yet built
+/// into one, so choosing between it and a bid costs no state transition.
+struct LocalParts {
+    built: BuiltPayload,
+    blobs: Blobs,
+    kzg_proofs: CellKzgProofs,
+    execution_requests: ExecutionRequests,
 }
 
 /// The blinded block around a validated bid, and what the bid pays.
@@ -591,8 +579,10 @@ struct BuilderRequest<'a> {
 ///
 /// With a builder layered, the proposer registered through this node and the
 /// circuit breaker quiet, the builder's bid is fetched alongside the local
-/// payload. Whichever [`choice::choose`] picks goes into the block. Otherwise
-/// the block is built exactly as it is without a builder.
+/// payload. Both are checked without a state transition, [`choice::choose`]
+/// picks one, and only that one is built into a block; the other is built only
+/// if the first fails. Without a builder the block is built exactly as it is
+/// without one.
 #[allow(clippy::too_many_arguments)]
 async fn produce(
     store: &Store,
@@ -632,63 +622,91 @@ async fn produce(
     );
     let graffiti = graffiti::with_client_versions(graffiti, el_version.as_ref(), own_version);
     let packed = pack(store, sync_pool, &state, head_root, slot, &config);
-    let local = built.and_then(|built| {
-        local_block(
-            &state,
-            built,
-            &packed,
-            randao_reveal,
-            graffiti,
-            &config,
-            options,
-            slot,
-        )
-    });
-    let blinded = request.as_ref().zip(bid).and_then(|(request, bid)| {
-        blinded_block(
-            &state,
-            &config,
-            request,
-            bid,
-            &packed,
-            randao_reveal,
-            graffiti,
-            options,
-        )
-    });
+    let local = built.and_then(|built| local_parts(built, slot));
+    let mut bid = request
+        .as_ref()
+        .zip(bid)
+        .and_then(|(request, bid)| accepted_bid(&state, &config, request, bid));
 
-    let local_offer = local.as_ref().ok().map(|local| LocalOffer {
-        value: wei_u128(&local.value),
-        should_override_builder: local.should_override_builder,
+    let local_offer = local.as_ref().ok().map(|parts| LocalOffer {
+        value: wei_u128(&parts.built.block_value),
+        should_override_builder: parts.built.should_override_builder,
     });
-    let bid_value = blinded.as_ref().map(|blinded| wei_u128(&blinded.value));
-    if choice::choose(local_offer, bid_value, boost_factor) == Some(Source::Builder)
-        && let Some(blinded) = blinded
-    {
-        inc_payload_source(Source::Builder.label());
-        let value = decimal(&blinded.value);
-        info!(%slot, proposer, %value, "Produced a blinded block around the builder's bid");
-        return Ok((Produced::Blinded(blinded.block), value, fork));
+    let bid_value = bid.as_ref().map(|bid| wei_u128(&bid.value));
+    let order = if choice::choose(local_offer, bid_value, boost_factor) == Some(Source::Builder) {
+        [Source::Builder, Source::Local]
+    } else {
+        [Source::Local, Source::Builder]
+    };
+
+    let (mut local, mut local_error) = match local {
+        Ok(parts) => (Some(parts), None),
+        Err(err) => (None, Some(err)),
+    };
+    for source in order {
+        match source {
+            Source::Builder => {
+                let Some(message) = bid.take() else {
+                    continue;
+                };
+                let blinded = blinded_block(
+                    &state,
+                    &config,
+                    message,
+                    &packed,
+                    randao_reveal,
+                    graffiti,
+                    options,
+                );
+                if let Some(blinded) = blinded {
+                    inc_payload_source(Source::Builder.label());
+                    let value = decimal(&blinded.value);
+                    info!(%slot, proposer, %value, "Produced a blinded block around the builder's bid");
+                    return Ok((Produced::Blinded(blinded.block), value, fork));
+                }
+            }
+            Source::Local => {
+                let Some(parts) = local.take() else {
+                    continue;
+                };
+                let assembled = local_block(
+                    &state,
+                    parts,
+                    &packed,
+                    randao_reveal,
+                    graffiti,
+                    &config,
+                    options,
+                    slot,
+                );
+                match assembled {
+                    Ok((contents, value)) => {
+                        if builder.is_some() {
+                            inc_payload_source(Source::Local.label());
+                        }
+                        let block = &contents.block;
+                        info!(
+                            %slot,
+                            proposer,
+                            attestations = block.body.attestations.len(),
+                            slashings = block.body.proposer_slashings.len()
+                                + block.body.attester_slashings.len(),
+                            exits = block.body.voluntary_exits.len(),
+                            bls_changes = block.body.bls_to_execution_changes.len(),
+                            transactions = block.body.execution_payload.transactions.len(),
+                            blobs = block.body.blob_kzg_commitments.len(),
+                            graffiti = %graffiti::display(&block.body.graffiti),
+                            "Produced block"
+                        );
+                        return Ok((Produced::Full(contents), decimal(&value), fork));
+                    }
+                    Err(err) => local_error = Some(err),
+                }
+            }
+        }
     }
     // The local error surfaces only when the builder did not step in.
-    let local = local?;
-    if builder.is_some() {
-        inc_payload_source(Source::Local.label());
-    }
-    let block = &local.contents.block;
-    info!(
-        %slot,
-        proposer,
-        attestations = block.body.attestations.len(),
-        slashings = block.body.proposer_slashings.len() + block.body.attester_slashings.len(),
-        exits = block.body.voluntary_exits.len(),
-        bls_changes = block.body.bls_to_execution_changes.len(),
-        transactions = block.body.execution_payload.transactions.len(),
-        blobs = block.body.blob_kzg_commitments.len(),
-        graffiti = %graffiti::display(&block.body.graffiti),
-        "Produced block"
-    );
-    Ok((Produced::Full(local.contents), decimal(&local.value), fork))
+    Err(local_error.unwrap_or(ApiError::Internal("the block failed to build")))
 }
 
 /// The block's consensus contents for `state`: attestations, operations and
@@ -731,19 +749,10 @@ fn pack(
     }
 }
 
-/// The local block: the execution client's payload around `packed`, with
-/// its blobs, cell proofs and value.
-#[allow(clippy::too_many_arguments)]
-fn local_block(
-    state: &BeaconState,
-    mut built: BuiltPayload,
-    packed: &Packed,
-    randao_reveal: BlsSignature,
-    graffiti: Bytes32,
-    config: &Config,
-    options: BlockProcessingOptions,
-    slot: Slot,
-) -> Result<LocalBlock, ApiError> {
+/// The execution client's payload checked and converted for a block: its
+/// blobs bundle against the commitments, the blobs and cell proofs into their
+/// containers, and its execution requests parsed. No state transition runs.
+fn local_parts(mut built: BuiltPayload, slot: Slot) -> Result<LocalParts, ApiError> {
     let bundle = &built.blobs_bundle;
     let malformed = bundle.commitments.len() != bundle.blobs.len()
         || bundle.proofs.len() != bundle.blobs.len() * preset::CELLS_PER_EXT_BLOB;
@@ -776,7 +785,33 @@ fn local_block(
     };
     let execution_requests = parse_execution_requests(&built.execution_requests)
         .map_err(|_| ApiError::Internal("the execution client's request list is malformed"))?;
+    Ok(LocalParts {
+        built,
+        blobs,
+        kzg_proofs,
+        execution_requests,
+    })
+}
 
+/// The local block: the execution client's payload around `packed`, with
+/// its blobs and cell proofs, and the payload's value.
+#[allow(clippy::too_many_arguments)]
+fn local_block(
+    state: &BeaconState,
+    parts: LocalParts,
+    packed: &Packed,
+    randao_reveal: BlsSignature,
+    graffiti: Bytes32,
+    config: &Config,
+    options: BlockProcessingOptions,
+    slot: Slot,
+) -> Result<(FuluBlockContents, Uint256), ApiError> {
+    let LocalParts {
+        built,
+        blobs,
+        kzg_proofs,
+        execution_requests,
+    } = parts;
     let inputs = |attestations, operations, sync_aggregate| BlockInputs {
         sync_aggregate,
         randao_reveal,
@@ -814,15 +849,12 @@ fn local_block(
         }
         Err(_) => return Err(ApiError::Internal("the block failed to build")),
     };
-    Ok(LocalBlock {
-        contents: FuluBlockContents {
-            block,
-            kzg_proofs,
-            blobs,
-        },
-        value: built.block_value,
-        should_override_builder: built.should_override_builder,
-    })
+    let contents = FuluBlockContents {
+        block,
+        kzg_proofs,
+        blobs,
+    };
+    Ok((contents, built.block_value))
 }
 
 /// What to ask the builder for, if anything.
@@ -877,19 +909,13 @@ async fn fetch_bid(request: Option<&BuilderRequest<'_>>, slot: Slot) -> Option<V
         .flatten()
 }
 
-/// The blinded block around `bid`, if the bid is acceptable and passes the
-/// state transition.
-#[allow(clippy::too_many_arguments)]
-fn blinded_block(
+/// `bid`'s message, if the bid is acceptable. No state transition runs.
+fn accepted_bid(
     state: &BeaconState,
     config: &Config,
     request: &BuilderRequest,
     bid: VersionedBid,
-    packed: &Packed,
-    randao_reveal: BlsSignature,
-    graffiti: Bytes32,
-    options: BlockProcessingOptions,
-) -> Option<BlindedCandidate> {
+) -> Option<BuilderBid> {
     let slot = state.slot();
     let BeaconState::Fulu(fulu) = state else {
         return None;
@@ -898,6 +924,7 @@ fn blinded_block(
     let context = BidContext {
         genesis_fork_version: config.genesis_fork_version,
         inputs: &inputs,
+        parent_block_number: fulu.latest_execution_payload_header.block_number,
         parent_gas_limit: fulu.latest_execution_payload_header.gas_limit,
         target_gas_limit: request.registration.gas_limit,
         max_blobs: config.max_blobs_per_block(compute_epoch_at_slot(slot)),
@@ -913,6 +940,22 @@ fn blinded_block(
         // and name the builder as its fee recipient (docs/spec_deviations.md).
         debug!(%slot, "The bid's fee recipient is not the registered one");
     }
+    Some(message)
+}
+
+/// The blinded block around an accepted bid, if it passes the state
+/// transition.
+#[allow(clippy::too_many_arguments)]
+fn blinded_block(
+    state: &BeaconState,
+    config: &Config,
+    message: BuilderBid,
+    packed: &Packed,
+    randao_reveal: BlsSignature,
+    graffiti: Bytes32,
+    options: BlockProcessingOptions,
+) -> Option<BlindedCandidate> {
+    let slot = state.slot();
     let assemble = |attestations, operations, sync_aggregate| {
         assemble_blinded_block(
             state,
@@ -1453,6 +1496,7 @@ mod tests {
             header.parent_hash = inputs.parent_hash;
             header.prev_randao = inputs.prev_randao;
             header.timestamp = inputs.timestamp;
+            header.block_number = fulu.latest_execution_payload_header.block_number + 1;
             header.withdrawals_root = withdrawals.hash_tree_root();
             header.gas_limit = TARGET_GAS_LIMIT.clamp(
                 parent_gas_limit - step,
@@ -1486,42 +1530,111 @@ mod tests {
         }
     }
 
-    async fn produce_json(
+    /// What a `produceBlockV3` answer says about the payload it carries.
+    struct Answer {
+        status: StatusCode,
+        blinded: Option<String>,
+        value: Option<String>,
+        json: serde_json::Value,
+    }
+
+    impl Answer {
+        /// The answer was a 200 whose headers and body say `blinded` and
+        /// `value` (wei, decimal), and the relay was asked `header_requests`
+        /// times.
+        fn assert(&self, world: &BuilderWorld, blinded: bool, value: &str, header_requests: usize) {
+            assert_eq!(self.status, StatusCode::OK, "{}", self.json);
+            assert_eq!(
+                self.blinded.as_deref(),
+                Some(if blinded { "true" } else { "false" }),
+                "{}",
+                self.json
+            );
+            assert_eq!(self.value.as_deref(), Some(value), "{}", self.json);
+            assert_eq!(served_blinded(&self.json), blinded, "{}", self.json);
+            assert_eq!(
+                world.relay.header_requests().len(),
+                header_requests,
+                "{}",
+                self.json
+            );
+        }
+    }
+
+    async fn produce_answer(
+        world: &BuilderWorld,
+        engine: Option<EngineClient>,
+        accept: Option<&str>,
+        query: &str,
+    ) -> Answer {
+        let mut request = Request::get(world.uri(query));
+        if let Some(accept) = accept {
+            request = request.header("accept", accept);
+        }
+        let response = world
+            .app(engine)
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .map(|value| value.to_str().unwrap().to_owned())
+        };
+        let (status, blinded, value) = (
+            response.status(),
+            header("eth-execution-payload-blinded"),
+            header("eth-execution-payload-value"),
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        Answer {
+            status,
+            blinded,
+            value,
+            json: serde_json::from_slice(&body).unwrap_or_default(),
+        }
+    }
+
+    async fn produce(
         world: &BuilderWorld,
         engine_value: &'static str,
         override_builder: bool,
         query: &str,
-    ) -> (StatusCode, serde_json::Value) {
+    ) -> Answer {
         let engine = super::super::validator_client_tests::fake_execution_client_paying(
             engine_value,
             override_builder,
         )
         .await;
-        let request = Request::get(world.uri(query)).body(Body::empty()).unwrap();
-        respond(world.app(Some(engine)), request).await
+        produce_answer(world, Some(engine), None, query).await
     }
 
     fn served_blinded(json: &serde_json::Value) -> bool {
         json["execution_payload_blinded"] == serde_json::json!(true)
     }
 
+    /// An execution client that is not there.
+    fn dead_engine() -> EngineClient {
+        EngineClient::new(
+            "http://127.0.0.1:1".to_owned(),
+            ethlambda_engine::JwtSecret::new([0x0f; 32]),
+        )
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn a_bid_worth_more_than_the_local_payload_is_served_blinded() {
         let world = builder_world(true, SyncStatus::Synced).await;
         world.offer(ETH, |_| {});
-        let (status, json) = produce_json(&world, "0x2a", false, "").await;
-        assert_eq!(status, StatusCode::OK, "{json}");
-        assert!(served_blinded(&json), "{json}");
+        let answer = produce(&world, "0x2a", false, "").await;
+        answer.assert(&world, true, &ETH.to_string(), 1);
         assert_eq!(
-            json["execution_payload_value"],
-            serde_json::json!(ETH.to_string())
-        );
-        assert_eq!(
-            json["data"]["slot"],
+            answer.json["data"]["slot"],
             serde_json::json!(world.slot.to_string())
         );
         assert_eq!(
-            json["data"]["body"]["execution_payload_header"]["block_hash"],
+            answer.json["data"]["body"]["execution_payload_header"]["block_hash"],
             serde_json::json!(format!("0x{}", "bb".repeat(32)))
         );
     }
@@ -1531,17 +1644,16 @@ mod tests {
         let world = builder_world(true, SyncStatus::Synced).await;
         world.offer(ETH, |_| {});
         // 1 ETH in hex wei.
-        let (status, json) = produce_json(&world, "0xde0b6b3a7640000", false, "").await;
-        assert_eq!(status, StatusCode::OK, "{json}");
-        assert!(!served_blinded(&json), "{json}");
+        let answer = produce(&world, "0xde0b6b3a7640000", false, "").await;
+        answer.assert(&world, false, &ETH.to_string(), 1);
     }
 
     #[tokio::test]
     async fn a_boost_factor_of_zero_keeps_the_local_payload() {
         let world = builder_world(true, SyncStatus::Synced).await;
         world.offer(ETH, |_| {});
-        let (_, json) = produce_json(&world, "0x2a", false, "&builder_boost_factor=0").await;
-        assert!(!served_blinded(&json), "{json}");
+        let answer = produce(&world, "0x2a", false, "&builder_boost_factor=0").await;
+        answer.assert(&world, false, "42", 1);
     }
 
     #[tokio::test]
@@ -1549,8 +1661,8 @@ mod tests {
         let world = builder_world(true, SyncStatus::Synced).await;
         world.offer(1_000_000_000, |_| {});
         let query = format!("&builder_boost_factor={}", u64::MAX);
-        let (_, json) = produce_json(&world, "0xde0b6b3a7640000", false, &query).await;
-        assert!(served_blinded(&json), "{json}");
+        let answer = produce(&world, "0xde0b6b3a7640000", false, &query).await;
+        answer.assert(&world, true, "1000000000", 1);
     }
 
     #[tokio::test]
@@ -1558,26 +1670,24 @@ mod tests {
         let world = builder_world(true, SyncStatus::Synced).await;
         // 10 ETH: the largest round value a u64 of wei holds.
         world.offer(10 * ETH, |_| {});
-        let (_, json) = produce_json(&world, "0x2a", true, "").await;
-        assert!(!served_blinded(&json), "{json}");
+        let answer = produce(&world, "0x2a", true, "").await;
+        answer.assert(&world, false, "42", 1);
     }
 
     #[tokio::test]
     async fn an_unregistered_proposer_never_reaches_the_builder() {
         let world = builder_world(false, SyncStatus::Synced).await;
         world.offer(ETH, |_| {});
-        let (_, json) = produce_json(&world, "0x2a", false, "").await;
-        assert!(!served_blinded(&json), "{json}");
-        assert!(world.relay.header_requests().is_empty());
+        let answer = produce(&world, "0x2a", false, "").await;
+        answer.assert(&world, false, "42", 0);
     }
 
     #[tokio::test]
     async fn a_syncing_node_keeps_the_builder_out() {
         let world = builder_world(true, SyncStatus::Syncing).await;
         world.offer(ETH, |_| {});
-        let (_, json) = produce_json(&world, "0x2a", false, "").await;
-        assert!(!served_blinded(&json), "{json}");
-        assert!(world.relay.header_requests().is_empty());
+        let answer = produce(&world, "0x2a", false, "").await;
+        answer.assert(&world, false, "42", 0);
     }
 
     #[tokio::test]
@@ -1586,24 +1696,61 @@ mod tests {
         world.offer(ETH, |bid| {
             bid.header.parent_hash = ExecutionBlockHash::repeat_byte(9)
         });
-        let (status, json) = produce_json(&world, "0x2a", false, "").await;
-        assert_eq!(status, StatusCode::OK, "{json}");
-        assert!(!served_blinded(&json), "{json}");
+        let answer = produce(&world, "0x2a", false, "").await;
+        answer.assert(&world, false, "42", 1);
+    }
+
+    #[tokio::test]
+    async fn a_bid_on_the_wrong_block_number_is_dropped() {
+        let world = builder_world(true, SyncStatus::Synced).await;
+        world.offer(ETH, |bid| bid.header.block_number += 5);
+        let answer = produce(&world, "0x2a", false, "").await;
+        answer.assert(&world, false, "42", 1);
     }
 
     #[tokio::test]
     async fn without_a_local_payload_the_bid_is_served() {
         let world = builder_world(true, SyncStatus::Synced).await;
         world.offer(ETH, |_| {});
-        let dead_engine = EngineClient::new(
+        let answer = produce_answer(&world, Some(dead_engine()), None, "").await;
+        answer.assert(&world, true, &ETH.to_string(), 1);
+    }
+
+    #[tokio::test]
+    async fn without_a_bid_or_a_local_payload_there_is_no_block() {
+        let world = builder_world(true, SyncStatus::Synced).await;
+        let answer = produce_answer(&world, Some(dead_engine()), None, "").await;
+        assert_ne!(answer.status, StatusCode::OK, "{}", answer.json);
+        assert_eq!(world.relay.header_requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_builder_leaves_the_local_payload() {
+        let mut world = builder_world(true, SyncStatus::Synced).await;
+        // The same registered proposer, with a builder nothing listens at.
+        let client = BuilderClient::new(
             "http://127.0.0.1:1".to_owned(),
-            ethlambda_engine::JwtSecret::new([0x0f; 32]),
+            Duration::from_secs(1),
+            "ethlambda/test",
         )
         .unwrap();
-        let request = Request::get(world.uri("")).body(Body::empty()).unwrap();
-        let (status, json) = respond(world.app(Some(dead_engine)), request).await;
-        assert_eq!(status, StatusCode::OK, "{json}");
-        assert!(served_blinded(&json), "{json}");
+        let dead = Arc::new(Builder::new(
+            client,
+            NEVER_TRIP,
+            SyncStatusController::new(SyncStatus::Synced),
+        ));
+        let proposer = get_beacon_proposer_index(&world.state).unwrap();
+        let registration = ValidatorRegistrationV1 {
+            fee_recipient: ExecutionAddress::repeat_byte(0x11),
+            gas_limit: TARGET_GAS_LIMIT,
+            timestamp: 1,
+            pubkey: world.state.validator(proposer).unwrap().pubkey,
+        };
+        dead.registrations
+            .record([&registration], compute_epoch_at_slot(world.slot));
+        world.builder = dead;
+        let answer = produce(&world, "0x2a", false, "").await;
+        answer.assert(&world, false, "42", 0);
     }
 
     #[tokio::test]
@@ -1623,6 +1770,7 @@ mod tests {
             response.headers()["eth-execution-payload-value"],
             ETH.to_string().as_str()
         );
+        assert_eq!(world.relay.header_requests().len(), 1);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let block = BlindedBeaconBlock::from_ssz_bytes(&body).unwrap();
         assert_eq!(block.slot, world.slot);
@@ -1740,5 +1888,91 @@ mod tests {
         let block = signed_blinded(&world, 1, None);
         let (status, _) = post_blinded(app, &block).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn a_claim_survives_a_failed_submission() {
+        let world = builder_world(true, SyncStatus::Synced).await;
+        world
+            .relay
+            .answer_submissions_with(StatusCode::INTERNAL_SERVER_ERROR);
+        let app = publish_app(&world);
+        let first = signed_blinded(&world, 1, None);
+        let second = signed_blinded(&world, 2, None);
+        assert_eq!(
+            post_blinded(app.clone(), &first).await.0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        // The slot stays claimed, so a different block is refused outright.
+        assert_eq!(
+            post_blinded(app.clone(), &second).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        // The same block is a retry, and goes to the builder again.
+        assert_eq!(
+            post_blinded(app, &first).await.0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(world.relay.blinded_blocks(), [first.clone(), first]);
+    }
+
+    #[tokio::test]
+    async fn a_block_published_in_full_blocks_a_different_blinded_one() {
+        let world = builder_world(true, SyncStatus::Synced).await;
+        // A full block for the slot from the local path, signed by its proposer.
+        let answer = produce(&world, "0x2a", false, "").await;
+        answer.assert(&world, false, "42", 1);
+        let mut contents: FuluBlockContents =
+            serde_json::from_value(answer.json["data"].clone()).unwrap();
+        // The test store keys its head by a root that is not its header's, so
+        // the block names the stored key as its parent, as `signed_blinded` does.
+        let (head_root, _) = super::super::validator::head(&world.store).unwrap();
+        contents.block.parent_root = head_root;
+        let proposer = get_beacon_proposer_index(&world.state).unwrap();
+        let domain = get_domain(&world.state, DOMAIN_BEACON_PROPOSER, None);
+        let signing_root = compute_signing_root(contents.block.hash_tree_root(), domain);
+        let signed = FuluSignedBlockContents {
+            signed_block: electra::SignedBeaconBlock {
+                message: contents.block,
+                signature: sign_for(proposer as usize, signing_root),
+            },
+            kzg_proofs: contents.kzg_proofs,
+            blobs: contents.blobs,
+        };
+
+        let network = Arc::new(RecordingNetwork::default());
+        let p2p: RpcToP2PRef = network.clone();
+        let app = routes()
+            .with_state(world.store.clone())
+            .layer(Extension(p2p))
+            .layer(Extension(world.builder.clone()));
+        let request = Request::post("/eth/v2/beacon/blocks")
+            .header("content-type", "application/octet-stream")
+            .header("eth-consensus-version", "fulu")
+            .body(Body::from(signed.to_ssz()))
+            .unwrap();
+        let (status, json) = respond(app.clone(), request).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(network.blocks.lock().unwrap().len(), 1);
+
+        let blinded = signed_blinded(&world, 1, None);
+        let (status, json) = post_blinded(app, &blinded).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert!(world.relay.blinded_blocks().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_oversized_blinded_block_is_a_413() {
+        let world = builder_world(true, SyncStatus::Synced).await;
+        let request = Request::post("/eth/v2/beacon/blinded_blocks")
+            .header("content-type", "application/octet-stream")
+            .header("eth-consensus-version", "fulu")
+            .body(Body::from(vec![
+                0u8;
+                super::super::MAX_PUBLISH_BODY_BYTES + 1
+            ]))
+            .unwrap();
+        let (status, _) = respond(publish_app(&world), request).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

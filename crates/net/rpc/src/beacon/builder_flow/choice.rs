@@ -34,9 +34,9 @@ pub(crate) struct LocalOffer {
 /// beacon-APIs' `builder_boost_factor`, taken literally: the local payload
 /// wins iff `local >= factor * (bid / 100)`. So 100 compares the two as they
 /// are, 0 always keeps the local payload, and a tie goes local.
-/// `u64::MAX` always takes the bid. The execution client's
-/// `shouldOverrideBuilder` beats any bid. When one side failed, the other
-/// stands.
+/// A factor of `u64::MAX` always takes the builder, except that the execution
+/// client's `shouldOverrideBuilder` still wins. When one side failed, the
+/// other stands.
 pub(crate) fn choose(
     local: Option<LocalOffer>,
     bid_value: Option<u128>,

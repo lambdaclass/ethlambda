@@ -35,14 +35,45 @@ use super::{ApiError, BodyEncoding};
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PublishedProposals(Arc<Mutex<BTreeMap<Slot, Root>>>);
 
+/// Why a slot could not be claimed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaimError {
+    /// The slot is below the finalized one, where claims are forgotten, so a
+    /// second block could not be told from the first.
+    Finalized,
+    /// This node already published another block for the slot.
+    Taken(Root),
+}
+
+impl ClaimError {
+    /// The 400 a publish endpoint answers with.
+    pub(crate) fn into_api_error(self) -> ApiError {
+        match self {
+            Self::Finalized => ApiError::BadRequest("the slot is already finalized"),
+            Self::Taken(_) => {
+                ApiError::BadRequest("this node already published a different block for the slot")
+            }
+        }
+    }
+}
+
 impl PublishedProposals {
-    /// Claims `slot` for `root`, or refuses with the root already claimed.
-    /// The same root again is a retry, not an equivocation.
-    pub(crate) fn claim(&self, slot: Slot, root: Root, finalized_slot: Slot) -> Result<(), Root> {
+    /// Claims `slot` for `root`, or refuses: below `finalized_slot` (a slot
+    /// equal to it is still held, as `split_off` keeps it), or with the root
+    /// already claimed. The same root again is a retry, not an equivocation.
+    pub(crate) fn claim(
+        &self,
+        slot: Slot,
+        root: Root,
+        finalized_slot: Slot,
+    ) -> Result<(), ClaimError> {
+        if slot < finalized_slot {
+            return Err(ClaimError::Finalized);
+        }
         let mut published = self.0.lock().expect("published proposals lock poisoned");
         *published = published.split_off(&finalized_slot);
         match published.get(&slot) {
-            Some(&claimed) if claimed != root => Err(claimed),
+            Some(&claimed) if claimed != root => Err(ClaimError::Taken(claimed)),
             Some(_) => Ok(()),
             None => {
                 published.insert(slot, root);
@@ -130,31 +161,36 @@ pub(crate) async fn post_blinded_block(
             return ApiError::Internal("checking the blinded block failed").into_response();
         }
     };
-    if published.claim(slot, root, finalized_slot(&store)).is_err() {
-        warn!(slot, "Refusing a second, different block for the slot");
-        return ApiError::BadRequest("this node already published a different block for the slot")
-            .into_response();
+    if let Err(err) = published.claim(slot, root, finalized_slot(&store)) {
+        warn!(slot, ?err, "Refusing a block for the slot");
+        return err.into_api_error().into_response();
     }
 
+    // The outcome is logged inside the task: once the proposer has signed, a
+    // validator client that hangs up drops this handler, and the reveal's
+    // result would otherwise go unrecorded. A block the builder does not take
+    // is a missed slot, so those are errors.
     let client = builder.client.clone();
-    let submitted =
-        tokio::spawn(async move { client.submit_blinded_block(&signed, ForkName::Fulu).await })
-            .await;
-    match submitted {
-        Ok(Ok(())) => {
-            info!(slot, "The builder took the blinded block");
-            StatusCode::OK.into_response()
+    let submitted = tokio::spawn(async move {
+        let result = client.submit_blinded_block(&signed, ForkName::Fulu).await;
+        match &result {
+            Ok(()) => info!(slot, "The builder took the blinded block"),
+            Err(BuilderError::BadRequest(message)) => {
+                error!(slot, %message, "The builder refused the signed blinded block")
+            }
+            Err(err) => error!(slot, %err, "The builder did not take the signed blinded block"),
         }
+        result
+    })
+    .await;
+    match submitted {
+        Ok(Ok(())) => StatusCode::OK.into_response(),
         Ok(Err(BuilderError::BadRequest(message))) => {
-            warn!(slot, %message, "The builder refused the blinded block");
             ApiError::BadRequestDetail(message).into_response()
         }
-        Ok(Err(err)) => {
-            warn!(slot, %err, "The builder did not take the blinded block");
-            ApiError::Internal("the builder did not take the block").into_response()
-        }
+        Ok(Err(_)) => ApiError::Internal("the builder did not take the block").into_response(),
         Err(err) => {
-            error!(%err, "Submitting the blinded block failed");
+            error!(slot, %err, "Submitting the blinded block failed");
             ApiError::Internal("submitting the block failed").into_response()
         }
     }
@@ -170,13 +206,33 @@ mod tests {
         let first = Root::repeat_byte(1);
         assert_eq!(published.claim(10, first, 0), Ok(()));
         assert_eq!(published.claim(10, first, 0), Ok(()));
-        assert_eq!(published.claim(10, Root::repeat_byte(2), 0), Err(first));
+        assert_eq!(
+            published.claim(10, Root::repeat_byte(2), 0),
+            Err(ClaimError::Taken(first))
+        );
     }
 
     #[test]
-    fn claims_below_the_finalized_slot_are_forgotten() {
+    fn a_claim_below_the_finalized_slot_is_refused() {
         let published = PublishedProposals::default();
         published.claim(10, Root::repeat_byte(1), 0).unwrap();
-        assert_eq!(published.claim(10, Root::repeat_byte(2), 11), Ok(()));
+        assert_eq!(
+            published.claim(10, Root::repeat_byte(2), 11),
+            Err(ClaimError::Finalized)
+        );
+        assert_eq!(
+            published.claim(10, Root::repeat_byte(1), 11),
+            Err(ClaimError::Finalized)
+        );
+    }
+
+    #[test]
+    fn the_finalized_slot_itself_can_still_be_claimed() {
+        let published = PublishedProposals::default();
+        assert_eq!(published.claim(11, Root::repeat_byte(1), 11), Ok(()));
+        assert_eq!(
+            published.claim(11, Root::repeat_byte(2), 11),
+            Err(ClaimError::Taken(Root::repeat_byte(1)))
+        );
     }
 }

@@ -1107,6 +1107,34 @@ mod tests {
     }
 
     #[test]
+    fn each_fallback_flag_needs_a_builder() {
+        for flag in [
+            "--builder-fallback-skips",
+            "--builder-fallback-skips-per-epoch",
+            "--builder-fallback-epochs-since-finalization",
+        ] {
+            let mut args = beacon_args();
+            args.extend([flag, "5"]);
+            try_parse_from(args).expect_err(flag);
+        }
+    }
+
+    #[test]
+    fn a_bad_fallback_value_is_refused() {
+        for flag in [
+            "--builder-fallback-skips",
+            "--builder-fallback-skips-per-epoch",
+            "--builder-fallback-epochs-since-finalization",
+        ] {
+            for value in ["-1", "many"] {
+                let mut args = beacon_args();
+                args.extend(["--builder", "http://127.0.0.1:18550", flag, value]);
+                try_parse_from(args).expect_err(flag);
+            }
+        }
+    }
+
+    #[test]
     fn a_zero_header_timeout_is_refused() {
         let mut args = beacon_args();
         args.extend([
