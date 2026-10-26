@@ -653,7 +653,16 @@ mod tests {
             .with_state(store)
             .layer(Extension(engine))
             .layer(Extension(SharedAttestationPool::default()))
+            .layer(Extension(SharedSyncCommitteePool::default()))
             .layer(Extension(FeeRecipients::default()))
+            .layer(Extension(OwnVersion(Arc::new(
+                ethlambda_engine::types::ClientVersionV1 {
+                    code: "LA".to_string(),
+                    name: "ethlambda".to_string(),
+                    version: "ethlambda/test".to_string(),
+                    commit: "0x3c4d7e8f".to_string(),
+                },
+            ))))
     }
 
     fn infinity_reveal() -> String {
