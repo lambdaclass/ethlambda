@@ -33,7 +33,9 @@
 //! withdrawal directly, instead of consensus replaying the deposit contract's
 //! event log or a validator signing a voluntary exit; EIP-7251 extends the
 //! same mechanism to consolidations. [`ExecutionRequests`] is the per-block
-//! envelope the execution payload carries all three request kinds in.
+//! envelope the execution payload carries all three request kinds in, and
+//! [`NewPayloadRequest`] appends it to deneb's fields so the execution engine
+//! validates those requests alongside the payload they arrived in.
 //!
 //! [`BeaconState`]'s field count crosses a power of two at electra, so its
 //! merkle tree gains a level relative to deneb's; see `docs/beacon_stf.md`
@@ -45,7 +47,7 @@ use libssz_types::{SszBitlist, SszBitvector, SszList};
 use super::altair::{SyncAggregate, SyncCommittee};
 use super::bellatrix::LogsBloom;
 use super::capella::SignedBLSToExecutionChange;
-use super::deneb::{ExecutionPayload, ExecutionPayloadHeader, KzgCommitments};
+use super::deneb::{ExecutionPayload, ExecutionPayloadHeader, KzgCommitments, VersionedHashes};
 use super::shared::{
     AttestationData, Balances, BeaconBlockHeader, BlockRoots, Checkpoint, Deposit,
     EpochParticipation, Eth1Data, Eth1DataVotes, Fork, HistoricalRoots, HistoricalSummaries,
@@ -280,6 +282,22 @@ pub struct ExecutionRequests {
     #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
     pub consolidations:
         SszList<ConsolidationRequest, { preset::MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD }>,
+}
+
+/// What `process_execution_payload` hands `execution_engine.verify_and_notify_new_payload`
+/// to validate a proposed payload, electra `beacon-chain.md`.
+///
+/// Deneb's fields, with `execution_requests` (EIP-6110/7002/7251) appended so
+/// the engine validates a block's execution-layer-triggered requests
+/// alongside its payload. Electra does not redefine [`ExecutionPayload`]
+/// itself, so this reuses deneb's, imported at the top of this module.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+pub struct NewPayloadRequest {
+    pub execution_payload: ExecutionPayload,
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    pub versioned_hashes: VersionedHashes,
+    pub parent_beacon_block_root: Root,
+    pub execution_requests: ExecutionRequests,
 }
 
 // ---------------------------------------------------------------------------

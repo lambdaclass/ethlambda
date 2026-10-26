@@ -342,7 +342,7 @@ pub fn process_sync_aggregate(
         seats_by_pubkey.entry(pubkey).or_default().push(seat);
     }
     let mut resolved: Vec<Option<ValidatorIndex>> = vec![None; committee_pubkeys.len()];
-    for (index, validator) in state.validators().iter().enumerate() {
+    for (index, validator) in state.iter_validators().enumerate() {
         if let Some(seats) = seats_by_pubkey.get(&validator.pubkey) {
             for &seat in seats {
                 resolved[seat] = Some(index as ValidatorIndex);

@@ -9,7 +9,7 @@ use std::pin::Pin;
 
 use async_trait::async_trait;
 use ethlambda_types::beacon::config::Config;
-use ethlambda_types::beacon::containers::electra::SignedAggregateAndProof;
+use ethlambda_types::beacon::containers::gloas;
 use ethlambda_types::beacon::containers::shared::AttestationData;
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, Root, Slot, ValidatorIndex};
@@ -21,7 +21,7 @@ use crate::beacon_node::dto::{
 };
 use crate::beacon_node::{
     AggregateAttestation, AttesterDuties, BeaconNodeApi, BlockRequest, Genesis, ProposerDuties,
-    Published, ValidatorEntry,
+    PtcDuties, Published, SignedAggregates, ValidatorEntry,
 };
 use crate::error::{Error, Result};
 
@@ -223,8 +223,8 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
             .await
     }
 
-    async fn attestation_data(&self, slot: Slot) -> Result<AttestationData> {
-        self.try_each("attestation_data", |node| node.attestation_data(slot))
+    async fn attestation_data(&self, slot: Slot, fork: ForkName) -> Result<AttestationData> {
+        self.try_each("attestation_data", |node| node.attestation_data(slot, fork))
             .await
     }
 
@@ -249,6 +249,61 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
     async fn publish_block(&self, fork: ForkName, body: &[u8]) -> Result<Published> {
         self.try_each("publish_block", |node| node.publish_block(fork, body))
             .await
+    }
+
+    /// Fails over like any query: the envelope the node cached is only on the
+    /// node that produced the block, and one that did not answers 404.
+    async fn execution_payload_envelope(
+        &self,
+        slot: Slot,
+        block_root: Root,
+    ) -> Result<gloas::ExecutionPayloadEnvelope> {
+        self.try_each("execution_payload_envelope", |node| {
+            node.execution_payload_envelope(slot, block_root)
+        })
+        .await
+    }
+
+    /// First node that accepts it wins, for the reason [`Self::publish_block`]
+    /// is: the accepting node gossips it.
+    async fn publish_execution_payload_envelope(
+        &self,
+        body: &[u8],
+        blob_data_included: bool,
+    ) -> Result<()> {
+        self.try_each("publish_execution_payload_envelope", |node| {
+            node.publish_execution_payload_envelope(body, blob_data_included)
+        })
+        .await
+    }
+
+    async fn ptc_duties(&self, epoch: Epoch, indices: &[ValidatorIndex]) -> Result<PtcDuties> {
+        self.try_each("ptc_duties", |node| node.ptc_duties(epoch, indices))
+            .await
+    }
+
+    /// A 204 is an answer, so the first node that knows no block ends the
+    /// walk, even though another might have one. That is the right trade: PTC
+    /// votes are due at three quarters of the slot, and a node that has seen
+    /// nothing by then is one this client should not be voting through.
+    async fn payload_attestation_data(
+        &self,
+        slot: Slot,
+    ) -> Result<Option<gloas::PayloadAttestationData>> {
+        self.try_each("payload_attestation_data", |node| {
+            node.payload_attestation_data(slot)
+        })
+        .await
+    }
+
+    async fn submit_payload_attestations(
+        &self,
+        messages: &[gloas::PayloadAttestationMessage],
+    ) -> Result<usize> {
+        self.try_each("submit_payload_attestations", |node| {
+            node.submit_payload_attestations(messages)
+        })
+        .await
     }
 
     async fn submit_attestations(
@@ -280,7 +335,7 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
     async fn publish_aggregates(
         &self,
         fork: ForkName,
-        aggregates: &[SignedAggregateAndProof],
+        aggregates: &SignedAggregates,
     ) -> Result<()> {
         self.try_each("publish_aggregates", |node| {
             node.publish_aggregates(fork, aggregates)
@@ -354,7 +409,7 @@ mod tests {
         let fallback = FallbackBeaconNode::new(vec![stale, fresh]);
 
         let data = fallback
-            .attestation_data(96)
+            .attestation_data(96, ForkName::Electra)
             .await
             .expect("the second node answers correctly");
 
@@ -374,7 +429,7 @@ mod tests {
         ]);
 
         let err = fallback
-            .attestation_data(96)
+            .attestation_data(96, ForkName::Electra)
             .await
             .expect_err("no node answered about the requested slot");
 
@@ -477,6 +532,7 @@ mod tests {
         use ethlambda_types::beacon::primitives::{BlsSignature, Bytes32};
         BlockRequest {
             slot,
+            fork: ForkName::Electra,
             proposer_index,
             randao_reveal: BlsSignature([0; 96]),
             graffiti: Bytes32::default(),
@@ -497,7 +553,7 @@ mod tests {
             .produce_block(&request(96, 7))
             .await
             .expect("the second node answers correctly");
-        assert_eq!(block.block().slot, 96);
+        assert_eq!(block.slot(), 96);
     }
 
     /// A node on a different fork computes a different proposer. Signing its
@@ -513,7 +569,7 @@ mod tests {
             .produce_block(&request(96, 7))
             .await
             .expect("the second node names the expected proposer");
-        assert_eq!(block.block().proposer_index, 7);
+        assert_eq!(block.proposer_index(), 7);
     }
 
     #[tokio::test]
