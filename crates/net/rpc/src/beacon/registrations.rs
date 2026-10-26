@@ -60,8 +60,7 @@ async fn register(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<(), ApiError> {
-    let builder =
-        builder.ok_or(ApiError::Internal("no builder is configured (--builder)"))?;
+    let builder = builder.ok_or(ApiError::Internal("no builder is configured (--builder)"))?;
     let registrations = decode(headers, body)?;
     let (_, state) = head(store)?;
 
@@ -78,8 +77,10 @@ async fn register(
             recipients.insert(*index, registration.message.fee_recipient);
         }
     }
-    let kept: Vec<SignedValidatorRegistrationV1> =
-        kept.into_iter().map(|(_, registration)| registration).collect();
+    let kept: Vec<SignedValidatorRegistrationV1> = kept
+        .into_iter()
+        .map(|(_, registration)| registration)
+        .collect();
     match builder.register_validators(&kept).await {
         Ok(()) => {
             inc_builder_registrations("forwarded", kept.len() as u64);
@@ -97,7 +98,10 @@ async fn register(
 }
 
 /// The request body: a JSON array, or the SSZ list builder-specs defines.
-fn decode(headers: &HeaderMap, body: &[u8]) -> Result<Vec<SignedValidatorRegistrationV1>, ApiError> {
+fn decode(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<Vec<SignedValidatorRegistrationV1>, ApiError> {
     match BodyEncoding::from_headers(headers)? {
         BodyEncoding::Ssz => SignedValidatorRegistrations::from_ssz_bytes(body)
             .map(|list| list.to_vec())
@@ -160,7 +164,10 @@ mod tests {
     fn store_with_exited(exited: &[usize]) -> Store {
         let mut state = with_signing_validators_at(ForkName::Fulu, VALIDATORS);
         for &index in exited {
-            state.validator_mut(index as ValidatorIndex).unwrap().exit_epoch = 0;
+            state
+                .validator_mut(index as ValidatorIndex)
+                .unwrap()
+                .exit_epoch = 0;
         }
         state.apply_pending_mutations();
         beacon_store_at(state).0
@@ -194,7 +201,10 @@ mod tests {
     }
 
     fn client_for(relay: &MockRelay) -> Option<BuilderClient> {
-        Some(BuilderClient::new(relay.url.clone(), Duration::from_secs(1), "ethlambda/test").unwrap())
+        Some(
+            BuilderClient::new(relay.url.clone(), Duration::from_secs(1), "ethlambda/test")
+                .unwrap(),
+        )
     }
 
     #[tokio::test]
@@ -218,8 +228,14 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(relay.registrations(), registrations);
         let recipients = fee_recipients.lock().unwrap();
-        assert_eq!(recipients.get(&0), Some(&ExecutionAddress::repeat_byte(0x11)));
-        assert_eq!(recipients.get(&1), Some(&ExecutionAddress::repeat_byte(0x11)));
+        assert_eq!(
+            recipients.get(&0),
+            Some(&ExecutionAddress::repeat_byte(0x11))
+        );
+        assert_eq!(
+            recipients.get(&1),
+            Some(&ExecutionAddress::repeat_byte(0x11))
+        );
     }
 
     #[tokio::test]
@@ -299,8 +315,12 @@ mod tests {
     async fn an_unreachable_builder_is_a_server_error() {
         let store = store_with_exited(&[]);
         let registration = signed_registration(0, genesis_fork_version(&store));
-        let builder =
-            BuilderClient::new("http://127.0.0.1:1", Duration::from_secs(1), "ethlambda/test").unwrap();
+        let builder = BuilderClient::new(
+            "http://127.0.0.1:1",
+            Duration::from_secs(1),
+            "ethlambda/test",
+        )
+        .unwrap();
         let (status, _) = post(
             store,
             Some(builder),
@@ -322,7 +342,8 @@ mod tests {
             .body(Body::from(list.to_ssz()))
             .unwrap();
 
-        let (status, body) = post(store, client_for(&relay), FeeRecipients::default(), request).await;
+        let (status, body) =
+            post(store, client_for(&relay), FeeRecipients::default(), request).await;
 
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(relay.registrations(), registrations);
