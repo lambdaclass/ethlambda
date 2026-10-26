@@ -2,7 +2,10 @@
 //!
 //! It serves one bid, records what it is asked and sent, and has knobs for
 //! the ways real builders differ: refusing SSZ, ignoring `Accept`, answering
-//! slowly, and leaving out `Eth-Consensus-Version`.
+//! slowly, and leaving out `Eth-Consensus-Version`. It also verifies
+//! registration signatures and refuses SSZ registrations, records blinded
+//! block submissions, and has `answer_headers_with` and
+//! `answer_submissions_with` to answer a call with exactly what a test needs.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

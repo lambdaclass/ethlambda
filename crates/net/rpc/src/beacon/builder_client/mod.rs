@@ -1,11 +1,18 @@
 //! The builder API client (`ethereum/builder-specs`): how this node talks to
 //! MEV-Boost, or to a relay directly, on a proposer's behalf.
 //!
-//! One client per URL. Requests go out in SSZ until the URL refuses it (406
-//! or 415), then in JSON for good, since a builder either takes SSZ or it
-//! does not. Responses are decoded by their own `Content-Type`, not by what
-//! was asked for: a builder may answer JSON to an SSZ request without
-//! refusing it.
+//! One client per URL, with an encoding chosen per call:
+//! - `getHeader` asks SSZ first. A 406 fails that call with no retry, since a
+//!   retry restarts the clock the proposer is waiting on; later calls ask for
+//!   JSON.
+//! - `registerValidator` is always JSON: MEV-Boost forwards the body
+//!   unchanged to every relay and answers 200 if any one accepts it.
+//! - `submitBlindedBlockV2` sends SSZ, which MEV-Boost converts per relay.
+//!   After its own 415 it resends the block in JSON, and sends JSON from then
+//!   on.
+//!
+//! Responses are decoded by their own `Content-Type`, not by what was asked
+//! for: a builder may answer JSON to an SSZ request without refusing it.
 //!
 //! Every call is timed into `lean_beacon_builder_request_seconds`, by call
 //! and outcome.
@@ -372,7 +379,7 @@ fn is_ssz(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value.starts_with(crate::SSZ_CONTENT_TYPE))
 }
 
-/// How a call that returns nothing on success ended, as a metric label.
+/// How a call whose success is just `ok` ended, as a metric label.
 fn outcome<T>(result: &Result<T, BuilderError>) -> &'static str {
     result.as_ref().map_or_else(BuilderError::label, |_| "ok")
 }

@@ -8,8 +8,10 @@ use super::{read_body, truncate_error_text};
 
 /// A failed builder API call.
 ///
-/// A Beacon API handler answers [`BadRequest`](Self::BadRequest) with the
-/// builder's own 400 and anything else with a 500.
+/// A Beacon API handler for registrations or blinded blocks answers
+/// [`BadRequest`](Self::BadRequest) with the builder's own 400 and anything
+/// else with a 500. On `produceBlockV3` any error just means no bid, and the
+/// node builds locally.
 #[derive(Debug, thiserror::Error)]
 pub enum BuilderError {
     /// No complete answer within the call's deadline.
