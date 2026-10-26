@@ -1082,7 +1082,7 @@ pub(crate) fn decimal(value: &ethlambda_types::beacon::primitives::Uint256) -> S
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::test_utils::{RecordingNetwork, beacon_store_with_config};
     use axum::{body::Body, http::Request};
@@ -1425,9 +1425,9 @@ mod tests {
     use libssz::SszDecode as _;
     use std::time::Duration;
 
-    const ETH: u64 = 1_000_000_000_000_000_000;
+    pub(crate) const ETH: u64 = 1_000_000_000_000_000_000;
     /// The registered gas limit the test proposer asks for.
-    const TARGET_GAS_LIMIT: u64 = 60_000_000;
+    pub(crate) const TARGET_GAS_LIMIT: u64 = 60_000_000;
 
     /// Thresholds that never trip, so a test state's history does not decide
     /// whether the builder is asked.
@@ -1440,15 +1440,15 @@ mod tests {
     /// A builder world for the next slot on `fulu_store()`: a mock relay, a
     /// `Builder` pointing at it with the proposer registered, and the
     /// advanced proposal state.
-    struct BuilderWorld {
-        store: Store,
-        slot: Slot,
-        state: BeaconState,
-        relay: MockRelay,
-        builder: Arc<Builder>,
+    pub(crate) struct BuilderWorld {
+        pub(crate) store: Store,
+        pub(crate) slot: Slot,
+        pub(crate) state: BeaconState,
+        pub(crate) relay: MockRelay,
+        pub(crate) builder: Arc<Builder>,
     }
 
-    async fn builder_world(registered: bool, sync: SyncStatus) -> BuilderWorld {
+    pub(crate) async fn builder_world(registered: bool, sync: SyncStatus) -> BuilderWorld {
         let (store, head_slot) = fulu_store();
         let slot = head_slot + 1;
         let config = store.config();
@@ -1488,7 +1488,7 @@ mod tests {
     impl BuilderWorld {
         /// A bid of `value` wei that passes every check for this slot, with
         /// `edit` applied before the relay signs it.
-        fn offer(&self, value: u64, edit: impl FnOnce(&mut BuilderBid)) {
+        pub(crate) fn offer(&self, value: u64, edit: impl FnOnce(&mut BuilderBid)) {
             let config = self.store.config();
             let inputs = payload_inputs(&self.state, &config).unwrap();
             let BeaconState::Fulu(fulu) = &self.state else {

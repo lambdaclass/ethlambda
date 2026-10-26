@@ -1643,3 +1643,211 @@ mod gloas {
         assert_full_sync_aggregate(&advanced, &signed.message.body.sync_aggregate);
     }
 }
+
+/// The builder flow through this node: the validator client's own
+/// registration, `produceBlockV3` with a boost factor, and blinded publish,
+/// against this node's routes with a `Builder` layered over a mock relay.
+mod builder_flow {
+    use super::*;
+    use crate::beacon::proposal::tests::{BuilderWorld, ETH, TARGET_GAS_LIMIT, builder_world};
+    use ethlambda_state_transition::beacon::helpers::accessors::get_beacon_proposer_index;
+    use ethlambda_types::beacon::builder::{
+        SignedBlindedBeaconBlock, SignedValidatorRegistrationV1, ValidatorRegistrationV1,
+    };
+    use ethlambda_types::beacon::primitives::ExecutionAddress;
+    use ethlambda_validator::beacon_node::Published;
+    use libssz::SszDecode as _;
+
+    /// What a test drives: this node served over a socket, the proposer's key
+    /// and the client's signing context.
+    struct Harness {
+        world: BuilderWorld,
+        client: HttpBeaconNode,
+        proposer: u64,
+        keys: RwLock<ValidatorStore>,
+        context: SigningContext,
+    }
+
+    /// `world`'s routes (production, blinded publish and registration, sharing
+    /// one fee-recipient map as the real router does) behind a socket.
+    async fn harness(world: BuilderWorld, engine: ethlambda_engine::EngineClient) -> Harness {
+        // A block built on this head names the advanced header's root as its
+        // parent, which the fixture's placeholder anchor block does not have:
+        // keep the head state under that root too, as `serve_at` does, so the
+        // publish finds its parent.
+        let mut store = world.store.clone();
+        let (_, head_state) = crate::beacon::validator::head(&store).unwrap();
+        let parent_root = world.state.latest_block_header().hash_tree_root();
+        store
+            .insert_state(parent_root, (*head_state).clone())
+            .unwrap();
+
+        let network: RpcToP2PRef = Arc::new(RecordingNetwork::default());
+        let router = crate::beacon::proposal::routes()
+            .merge(crate::beacon::registrations::routes())
+            .with_state(world.store.clone())
+            .layer(Extension(Some(engine)))
+            .layer(Extension(SharedSyncCommitteePool::default()))
+            .layer(Extension(crate::beacon::validator::FeeRecipients::default()))
+            .layer(Extension(crate::beacon::graffiti::OwnVersion(Arc::new(
+                own_version(),
+            ))))
+            .layer(Extension(network))
+            .layer(Extension(world.builder.clone()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        let client = HttpBeaconNode::new(format!("http://{address}")).unwrap();
+
+        let proposer = get_beacon_proposer_index(&world.state).unwrap();
+        let keys = keys_for(&world.state, &[proposer]);
+        let context = SigningContext {
+            config: (*world.store.config()).clone(),
+            genesis_validators_root: world.state.genesis_validators_root(),
+        };
+        Harness {
+            world,
+            client,
+            proposer,
+            keys,
+            context,
+        }
+    }
+
+    impl Harness {
+        fn pubkey(&self) -> BlsPubkey {
+            self.world.state.validator(self.proposer).unwrap().pubkey
+        }
+
+        /// The proposer's registration, signed by the client and sent through
+        /// this node. The relay checks the signature itself.
+        async fn register(&self) -> SignedValidatorRegistrationV1 {
+            let message = ValidatorRegistrationV1 {
+                fee_recipient: ExecutionAddress::repeat_byte(0x11),
+                gas_limit: TARGET_GAS_LIMIT,
+                timestamp: 1,
+                pubkey: self.pubkey(),
+            };
+            let signature = {
+                let keys = self.keys.read().await;
+                self.context
+                    .sign_validator_registration(&keys, &message)
+                    .unwrap()
+            };
+            let signed = SignedValidatorRegistrationV1 { message, signature };
+            self.client
+                .register_validators(std::slice::from_ref(&signed))
+                .await
+                .expect("the node takes the registration");
+            signed
+        }
+
+        async fn produce(
+            &self,
+            builder_boost_factor: Option<u64>,
+        ) -> ethlambda_validator::beacon_node::block_contents::ProducedBlock {
+            let epoch = compute_epoch_at_slot(self.world.slot);
+            // Signed under the head state's own fork rather than through the
+            // client's schedule: this world's state is not pinned to carry
+            // the schedule's fulu version (see `serve_fulu_pinned`), and the
+            // node verifies against the state, as the other proposal tests
+            // here do.
+            let randao_domain = get_domain(
+                &self.world.state,
+                ethlambda_types::beacon::constants::DOMAIN_RANDAO,
+                Some(epoch),
+            );
+            let randao_reveal = sign_for(
+                self.proposer as usize,
+                compute_signing_root(epoch.hash_tree_root(), randao_domain),
+            );
+            let request = BlockRequest {
+                slot: self.world.slot,
+                fork: ForkName::Fulu,
+                proposer_index: self.proposer,
+                randao_reveal,
+                graffiti: ethlambda_types::primitives::H256([0; 32]),
+                builder_boost_factor,
+            };
+            self.client.produce_block(&request).await.unwrap()
+        }
+
+        async fn sign(
+            &self,
+            produced: ethlambda_validator::beacon_node::block_contents::ProducedBlock,
+        ) -> Vec<u8> {
+            let domain = get_domain(
+                &self.world.state,
+                ethlambda_types::beacon::constants::DOMAIN_BEACON_PROPOSER,
+                Some(compute_epoch_at_slot(self.world.slot)),
+            );
+            let signature = sign_for(
+                self.proposer as usize,
+                compute_signing_root(produced.block_root(), domain),
+            );
+            produced.into_signed_ssz(signature)
+        }
+    }
+
+    #[tokio::test]
+    async fn the_validator_client_can_propose_a_builder_block_through_this_node() {
+        let world = builder_world(false, SyncStatus::Synced).await;
+        let engine = fake_execution_client_paying("0x2a", false).await;
+        let h = harness(world, engine).await;
+
+        let registered = h.register().await;
+        assert_eq!(h.world.relay.registrations(), [registered]);
+
+        h.world.offer(ETH, |_| {});
+        let produced = h.produce(Some(100)).await;
+        assert!(produced.is_blinded(), "a bid worth more must win");
+
+        let body = h.sign(produced).await;
+        let published = h
+            .client
+            .publish_blinded_block(h.world.slot, ForkName::Fulu, &body)
+            .await
+            .expect("the node hands the block to its builder");
+        assert_eq!(published, Published::HandedToBuilder);
+
+        let signed = SignedBlindedBeaconBlock::from_ssz_bytes(&body).unwrap();
+        assert_eq!(h.world.relay.blinded_blocks(), [signed]);
+    }
+
+    #[tokio::test]
+    async fn without_builder_proposals_the_client_gets_a_full_block() {
+        let world = builder_world(false, SyncStatus::Synced).await;
+        let engine = fake_execution_client_paying("0x2a", false).await;
+        let h = harness(world, engine).await;
+
+        // A client with builder proposals off never registers either, which
+        // is what keeps the node from asking the relay at all.
+        h.world.offer(ETH, |_| {});
+        let produced = h.produce(None).await;
+        assert!(!produced.is_blinded());
+        assert!(h.world.relay.blinded_blocks().is_empty());
+        assert_eq!(
+            h.world.relay.header_requests().len(),
+            0,
+            "a client with builder proposals off must not make the node ask the relay"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relay_that_is_down_leaves_a_full_block() {
+        let world = builder_world(false, SyncStatus::Synced).await;
+        world.relay.answer_headers_with(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "application/json",
+            Vec::new(),
+            None,
+        );
+        let engine = fake_execution_client_paying("0x2a", false).await;
+        let h = harness(world, engine).await;
+
+        h.register().await;
+        h.world.offer(ETH, |_| {});
+        let produced = h.produce(Some(100)).await;
+        assert!(!produced.is_blinded());
+    }
+}
