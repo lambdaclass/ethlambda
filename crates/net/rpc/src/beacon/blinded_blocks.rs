@@ -18,6 +18,7 @@ use ethlambda_state_transition::beacon::block_production::advance_to_slot;
 use ethlambda_state_transition::beacon::helpers::accessors::get_beacon_proposer_index;
 use ethlambda_state_transition::beacon::stf::verify_proposer_signature;
 use ethlambda_storage::Store;
+use ethlambda_types::ShortRoot;
 use ethlambda_types::beacon::builder::SignedBlindedBeaconBlock;
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{HashTreeRoot as _, Root, Slot};
@@ -46,6 +47,18 @@ pub(crate) enum ClaimError {
 }
 
 impl ClaimError {
+    /// Logs the refusal, naming the root that holds the slot.
+    pub(crate) fn log(&self, slot: Slot) {
+        match self {
+            Self::Finalized => warn!(slot, "Refusing a block for a finalized slot"),
+            Self::Taken(root) => warn!(
+                slot,
+                existing = %ShortRoot(&root.0),
+                "Refusing a second, different block for the slot"
+            ),
+        }
+    }
+
     /// The 400 a publish endpoint answers with.
     pub(crate) fn into_api_error(self) -> ApiError {
         match self {
@@ -162,7 +175,7 @@ pub(crate) async fn post_blinded_block(
         }
     };
     if let Err(err) = published.claim(slot, root, finalized_slot(&store)) {
-        warn!(slot, ?err, "Refusing a block for the slot");
+        err.log(slot);
         return err.into_api_error().into_response();
     }
 

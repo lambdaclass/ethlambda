@@ -256,7 +256,7 @@ async fn post_block(
     let root = signed_block.message.hash_tree_root();
     let slot = signed_block.message.slot;
     if let Err(err) = published.claim(slot, root, finalized_slot(&store)) {
-        warn!(slot, ?err, "Refusing a block for the slot");
+        err.log(slot);
         return err.into_api_error().into_response();
     }
     let block = containers::SignedBeaconBlock::Fulu(signed_block);
@@ -336,7 +336,7 @@ async fn post_gloas_block(
     let slot = block.slot();
     let root = block.message_hash_tree_root();
     if let Err(err) = published.claim(slot, root, finalized_slot(store)) {
-        warn!(slot, ?err, "Refusing a block for the slot");
+        err.log(slot);
         return err.into_api_error().into_response();
     }
     // A gloas block carries no blobs of its own: its data columns travel with
@@ -621,12 +621,18 @@ async fn produce(
         fetch_bid(request.as_ref(), slot),
     );
     let graffiti = graffiti::with_client_versions(graffiti, el_version.as_ref(), own_version);
-    let packed = pack(store, sync_pool, &state, head_root, slot, &config);
     let local = built.and_then(|built| local_parts(built, slot));
-    let mut bid = request
+    let bid = request
         .as_ref()
         .zip(bid)
         .and_then(|(request, bid)| accepted_bid(&state, &config, request, bid));
+    // Nothing to build a block from: skip the packing, whose sync aggregate
+    // costs a BLS verification.
+    let (local, mut bid) = match (local, bid) {
+        (Err(err), None) => return Err(err),
+        pair => pair,
+    };
+    let packed = pack(store, sync_pool, &state, head_root, slot, &config);
 
     let local_offer = local.as_ref().ok().map(|parts| LocalOffer {
         value: wei_u128(&parts.built.block_value),
@@ -1720,7 +1726,29 @@ mod tests {
     async fn without_a_bid_or_a_local_payload_there_is_no_block() {
         let world = builder_world(true, SyncStatus::Synced).await;
         let answer = produce_answer(&world, Some(dead_engine()), None, "").await;
-        assert_ne!(answer.status, StatusCode::OK, "{}", answer.json);
+        // The local error: the execution client did not start building.
+        assert_eq!(
+            answer.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            answer.json
+        );
+        assert_eq!(world.relay.header_requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_bid_whose_block_fails_to_build_falls_back_to_a_local_block_that_fails_too() {
+        let world = builder_world(true, SyncStatus::Synced).await;
+        world.offer(ETH, |_| {});
+        let engine =
+            super::super::validator_client_tests::fake_execution_client_paying("0x2a", false).await;
+        // The infinity reveal without the skip flag fails the randao check in
+        // both blocks' state transitions.
+        let uri = produce_uri(world.slot, &infinity_reveal(), "");
+        let request = Request::get(uri).body(Body::empty()).unwrap();
+        let (status, json) = respond(world.app(Some(engine)), request).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{json}");
+        assert_eq!(json["message"], "the block failed to build");
         assert_eq!(world.relay.header_requests().len(), 1);
     }
 
@@ -1750,7 +1778,9 @@ mod tests {
             .record([&registration], compute_epoch_at_slot(world.slot));
         world.builder = dead;
         let answer = produce(&world, "0x2a", false, "").await;
-        answer.assert(&world, false, "42", 0);
+        assert_eq!(answer.status, StatusCode::OK, "{}", answer.json);
+        assert_eq!(answer.blinded.as_deref(), Some("false"), "{}", answer.json);
+        assert_eq!(answer.value.as_deref(), Some("42"), "{}", answer.json);
     }
 
     #[tokio::test]
@@ -1958,7 +1988,24 @@ mod tests {
         let blinded = signed_blinded(&world, 1, None);
         let (status, json) = post_blinded(app, &blinded).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(
+            json["message"],
+            "this node already published a different block for the slot"
+        );
         assert!(world.relay.blinded_blocks().is_empty());
+    }
+
+    /// The blinded route takes the publish limit, not axum's 2 MiB default.
+    #[tokio::test]
+    async fn a_blinded_block_over_the_default_body_limit_is_not_a_413() {
+        let world = builder_world(true, SyncStatus::Synced).await;
+        let request = Request::post("/eth/v2/beacon/blinded_blocks")
+            .header("content-type", "application/octet-stream")
+            .header("eth-consensus-version", "fulu")
+            .body(Body::from(vec![0u8; 3 * 1024 * 1024]))
+            .unwrap();
+        let (status, _) = respond(publish_app(&world), request).await;
+        assert_ne!(status, StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]
