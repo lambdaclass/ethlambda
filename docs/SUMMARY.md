@@ -32,4 +32,5 @@
 # Development
 
 - [Benchmarking](./benchmarking.md)
+- [Era Replay](./era_replay.md)
 - [Spec Deviations](./spec_deviations.md)
