@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-09305b74.js";
+            window.path_to_searchindex_js = "searchindex-7038f84c.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-34fa44cf.js"></script>
@@ -404,7 +404,7 @@ surface rather than sitting beside it; a <code>/lean/v0</code> path on a beacon 
 <tr><td><code>GET</code></td><td><code>/eth/v1/validator/duties/proposer/{epoch}</code></td><td>JSON</td><td>Proposers for any epoch from the head’s up to one past the wall clock’s</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v2/validator/duties/proposer/{epoch}</code></td><td>JSON</td><td>The same, with v2’s <code>dependent_root</code> (what Lighthouse asks for)</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/validator/duties/attester/{epoch}</code></td><td>JSON</td><td>Committee assignments for the given indices</td></tr>
-<tr><td><code>POST</code></td><td><code>/eth/v1/validator/duties/sync/{epoch}</code></td><td>JSON</td><td>Sync committee seats for the given indices, in the head’s current or next period</td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v1/validator/duties/sync/{epoch}</code></td><td>JSON</td><td>Sync committee seats for the given indices, up to the wall clock’s current period plus one</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/validator/liveness/{epoch}</code></td><td>JSON</td><td>Whether this node saw each validator act in the epoch (doppelganger protection)</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/validator/duties/ptc/{epoch}</code></td><td>JSON</td><td>Payload timeliness committee seats for the given indices (gloas)</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/validator/attestation_data</code></td><td>JSON</td><td>What to attest to at <code>slot</code></td></tr>
@@ -454,8 +454,13 @@ duties (v1 and v2) for the first gloas epoch, and a gloas head answers from
 its own lookahead.</li>
 <li><strong>Sync duties</strong> read the head state’s <code>current_sync_committee</code> for an epoch in
 the head’s own sync committee period and <code>next_sync_committee</code> for the one
-after; any other period is a <code>400</code> (an earlier one would need a historical
-state; see <code>docs/spec_deviations.md</code>). A validator is matched by pubkey and
+after. The upper bound is the wall clock’s, as the Beacon API defines it: the
+period after the clock’s current one. When the head lags a period boundary
+(its block is late or missing), the later period is read from a copy of the
+head advanced to the first epoch of the period before it, through fork
+choice’s checkpoint-state cache on a blocking thread. A period past that
+bound or before the head’s is a <code>400</code> (an earlier one would need a
+historical state; see <code>docs/spec_deviations.md</code>). A validator is matched by pubkey and
 gets every seat it holds, since the committee is drawn with replacement; one
 with no seat is left out. An unknown index is a <code>400</code>, and the endpoint is a
 <code>503</code> while the node is syncing. This node serves no sync committee message

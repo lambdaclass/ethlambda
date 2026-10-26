@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-09305b74.js";
+            window.path_to_searchindex_js = "searchindex-7038f84c.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-34fa44cf.js"></script>
@@ -369,10 +369,11 @@ string rather than a record, so peer discovery through this endpoint does not
 work. Everything that reads <code>peer_id</code> is unaffected. Out of scope for the
 change that added the Beacon API surface; a follow-up exposes the record.</li>
 </ul>
-<h2 id="sync-duties-are-served-for-the-current-and-next-period-only"><a class="header" href="#sync-duties-are-served-for-the-current-and-next-period-only">Sync duties are served for the current and next period only</a></h2>
-<p><code>POST /eth/v1/validator/duties/sync/{epoch}</code> answers an <code>epoch</code> in the head
-state’s own sync committee period or the next one, and refuses an earlier
-period with a <code>400</code>.</p>
+<h2 id="sync-duties-are-not-served-for-a-period-before-the-heads"><a class="header" href="#sync-duties-are-not-served-for-a-period-before-the-heads">Sync duties are not served for a period before the head’s</a></h2>
+<p><code>POST /eth/v1/validator/duties/sync/{epoch}</code> refuses a period before the head
+state’s own with a <code>400</code>. Later periods follow the wall clock, as the Beacon
+API defines: up to the clock’s current period plus one, read from the head or,
+when the head lags a period boundary, from a copy advanced across it.</p>
 <ul>
 <li><strong>Beacon API:</strong> allows any period up to the current one plus one, so an
 earlier period is valid to ask about.</li>
