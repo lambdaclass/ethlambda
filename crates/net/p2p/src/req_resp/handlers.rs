@@ -2820,12 +2820,25 @@ pub(crate) mod tests {
             attestation_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::ATTESTATION_VALIDATION_PERMITS,
             )),
+            seen_sync_messages:
+                ethlambda_state_transition::beacon::gossip::sync_committee::SeenSyncCommitteeMessages::new(
+                    crate::SEEN_SYNC_MESSAGES_CAPACITY,
+                ),
+            seen_sync_contributions:
+                ethlambda_state_transition::beacon::gossip::sync_committee::SeenSyncContributions::new(
+                    crate::SEEN_SYNC_AGGREGATORS_CAPACITY,
+                    crate::SEEN_SYNC_DATA_CAPACITY,
+                ),
+            sync_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::SYNC_VALIDATION_PERMITS,
+            )),
             attestation_pool: Default::default(),
             payload_attestation_pool: Default::default(),
             builder_market: Default::default(),
             builder_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::BUILDER_VALIDATION_PERMITS,
             )),
+            sync_committee_pool: Default::default(),
             aggregator_subnets: HashMap::new(),
         }
     }

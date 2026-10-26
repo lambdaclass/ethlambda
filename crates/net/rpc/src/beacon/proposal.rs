@@ -32,10 +32,11 @@ use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
     attestation_pool::SharedAttestationPool,
     block_production::{
-        BlockInputs, advance_to_slot, assemble_block, pack_attestations, parse_execution_requests,
-        payload_inputs,
+        BlockInputs, advance_to_slot, assemble_block, empty_sync_aggregate, pack_attestations,
+        parse_execution_requests, payload_inputs, verified_sync_aggregate,
     },
     stf::verify_block_signature,
+    sync_committee_pool::SharedSyncCommitteePool,
 };
 use ethlambda_storage::Store;
 use ethlambda_types::{
@@ -295,6 +296,7 @@ async fn get_block(
     State(store): State<Store>,
     Extension(engine): Extension<Option<EngineClient>>,
     Extension(pool): Extension<SharedAttestationPool>,
+    Extension(sync_pool): Extension<SharedSyncCommitteePool>,
     Extension(fee_recipients): Extension<FeeRecipients>,
     Extension(OwnVersion(own_version)): Extension<OwnVersion>,
     headers: HeaderMap,
@@ -322,6 +324,7 @@ async fn get_block(
         &store,
         &engine,
         &pool,
+        &sync_pool,
         &fee_recipients,
         &own_version,
         slot,
@@ -371,6 +374,7 @@ async fn produce(
     store: &Store,
     engine: &EngineClient,
     pool: &SharedAttestationPool,
+    sync_pool: &SharedSyncCommitteePool,
     fee_recipients: &FeeRecipients,
     own_version: &ClientVersionV1,
     slot: Slot,
@@ -413,7 +417,20 @@ async fn produce(
         .expect("attestation pool lock poisoned")
         .block_candidates();
     let attestations = pack_attestations(&state, candidates);
-    let inputs = |attestations| BlockInputs {
+    // What the committee signed at the previous slot over this block's parent,
+    // verified exactly as `process_sync_aggregate` will check it against the
+    // state the block is built on; a candidate that fails becomes the empty
+    // aggregate rather than a block the chain would refuse.
+    let candidate = sync_pool
+        .lock()
+        .expect("sync committee pool lock poisoned")
+        .sync_aggregate(slot - 1, head_root);
+    let sync_aggregate = candidate.map_or_else(empty_sync_aggregate, |candidate| {
+        verified_sync_aggregate(&state, candidate)
+    });
+    let has_sync_aggregate = sync_aggregate != empty_sync_aggregate();
+    let inputs = |attestations, sync_aggregate| BlockInputs {
+        sync_aggregate,
         randao_reveal,
         graffiti,
         attestations,
@@ -422,14 +439,14 @@ async fn produce(
         execution_requests: execution_requests.clone(),
     };
     let attestation_count = attestations.len();
-    let block = match assemble_block(&state, inputs(attestations), &config) {
+    let block = match assemble_block(&state, inputs(attestations, sync_aggregate), &config) {
         Ok(block) => block,
         // `pack_attestations` checks every attestation's signature against this
         // state, so this should not happen; but a block without them still
         // earns the proposal, and one that fails to build earns nothing.
-        Err(err) if attestation_count > 0 => {
-            warn!(%slot, %err, "Block with attestations failed to build; retrying without");
-            assemble_block(&state, inputs(Vec::new()), &config)
+        Err(err) if attestation_count > 0 || has_sync_aggregate => {
+            warn!(%slot, %err, "Block with operations failed to build; retrying without");
+            assemble_block(&state, inputs(Vec::new(), empty_sync_aggregate()), &config)
                 .map_err(|_| ApiError::Internal("the block failed to build"))?
         }
         Err(_) => return Err(ApiError::Internal("the block failed to build")),
@@ -558,6 +575,7 @@ mod tests {
             .with_state(store)
             .layer(Extension(None::<EngineClient>))
             .layer(Extension(SharedAttestationPool::default()))
+            .layer(Extension(SharedSyncCommitteePool::default()))
             .layer(Extension(FeeRecipients::default()))
             .layer(Extension(OwnVersion(Arc::new(
                 ethlambda_engine::types::ClientVersionV1 {

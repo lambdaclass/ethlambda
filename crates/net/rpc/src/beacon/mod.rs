@@ -33,6 +33,7 @@ pub(crate) mod proposal;
 pub(crate) mod proposer_preferences;
 pub(crate) mod ptc;
 pub(crate) mod states;
+pub(crate) mod sync_committee;
 pub(crate) mod validator;
 #[cfg(test)]
 mod validator_client_tests;
@@ -195,6 +196,7 @@ pub(crate) fn routes(version: &'static str, peer_id: String) -> Router<Store> {
         .merge(bids::routes())
         .merge(proposer_preferences::routes())
         .merge(builders::routes())
+        .merge(sync_committee::routes())
 }
 
 #[cfg(test)]
