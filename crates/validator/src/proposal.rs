@@ -52,7 +52,7 @@ use std::sync::Arc;
 
 use ethlambda_types::beacon::constants::BUILDER_INDEX_SELF_BUILD;
 use ethlambda_types::beacon::fork::ForkName;
-use ethlambda_types::beacon::primitives::{BlsPubkey, Bytes32, ExecutionAddress, Root, Slot};
+use ethlambda_types::beacon::primitives::{BlsPubkey, ExecutionAddress, Root, Slot};
 use ethlambda_types::beacon::signing::compute_epoch_at_slot;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -63,21 +63,19 @@ use crate::beacon_node::{BeaconNodeApi, BlockRequest, Published, validate_produc
 use crate::error::{Error, Result};
 use crate::keys::ValidatorStore;
 use crate::proposal_guard::ProposalGuard;
+use crate::proposer_settings::ProposerSettings;
 use crate::signing::SigningContext;
 
 pub struct ProposalService<B> {
     beacon_node: Arc<B>,
     context: Arc<SigningContext>,
-    /// Thirty-two bytes put in every block this client proposes. Consensus
-    /// never reads them.
-    graffiti: Bytes32,
-    /// Where this client asked for its execution-layer block rewards to be
-    /// paid, if the operator named an address.
+    /// Each validator's graffiti, sent with its block request, and fee
+    /// recipient.
     ///
-    /// Held only to check what comes back. The beacon node is the one that
-    /// builds the payload, and the specification is explicit that it need not
-    /// honour the preparation it was sent.
-    fee_recipient: Option<ExecutionAddress>,
+    /// The fee recipient is held only to check what comes back. The beacon node
+    /// is the one that builds the payload, and the specification is explicit
+    /// that it need not honour the preparation it was sent.
+    settings: Arc<ProposerSettings>,
     /// What this process has already proposed, per validator.
     ///
     /// A `std::sync::Mutex` for the reason [`crate::attestation`]'s is: the
@@ -92,14 +90,12 @@ impl<B: BeaconNodeApi> ProposalService<B> {
     pub fn new(
         beacon_node: Arc<B>,
         context: Arc<SigningContext>,
-        graffiti: Bytes32,
-        fee_recipient: Option<ExecutionAddress>,
+        settings: Arc<ProposerSettings>,
     ) -> Self {
         Self {
             beacon_node,
             context,
-            graffiti,
-            fee_recipient,
+            settings,
             guard: std::sync::Mutex::new(ProposalGuard::new()),
         }
     }
@@ -129,11 +125,11 @@ impl<B: BeaconNodeApi> ProposalService<B> {
     /// says nothing, which is the same silence as a matching one; the startup
     /// warning is where that case is reported.
     fn check_fee_recipient(
-        &self,
         produced: &crate::beacon_node::block_contents::ProducedBlock,
+        expected: Option<ExecutionAddress>,
         slot: Slot,
     ) {
-        let Some(expected) = self.fee_recipient else {
+        let Some(expected) = expected else {
             return;
         };
         // The payload's before gloas, the bid's from it on: the same address
@@ -146,7 +142,9 @@ impl<B: BeaconNodeApi> ProposalService<B> {
                 actual = %crate::beacon_node::dto::encode_hex(&actual.0),
                 "Block pays its execution-layer rewards to an address this client did not ask \
                  for; signing it anyway, since refusing would also forfeit the consensus reward \
-                 and cost the network a slot. Check this beacon node's proposer preparation."
+                 and cost the network a slot. Check this beacon node's proposer preparation. A \
+                 fee recipient changed through the keymanager API this epoch reaches the node \
+                 only at the next one."
             );
             crate::metrics::inc_fee_recipient_mismatches();
         }
@@ -207,12 +205,16 @@ impl<B: BeaconNodeApi> ProposalService<B> {
             self.context.sign_randao(&store, &pubkey, epoch)?
         };
 
+        // Both read once, before the block is asked for, so the check below
+        // compares against the address in force when the request went out.
+        let graffiti = self.settings.graffiti(&pubkey);
+        let fee_recipient = self.settings.fee_recipient(&pubkey);
         let request = BlockRequest {
             slot,
             fork: self.context.config.fork_at_epoch(epoch),
             proposer_index: duty.validator_index,
             randao_reveal,
-            graffiti: self.graffiti,
+            graffiti,
         };
         let mut produced = self.beacon_node.produce_block(&request).await?;
 
@@ -250,7 +252,7 @@ impl<B: BeaconNodeApi> ProposalService<B> {
             )));
         }
 
-        self.check_fee_recipient(&produced, slot);
+        Self::check_fee_recipient(&produced, fee_recipient, slot);
 
         let fork = produced.fork;
         info!(
@@ -441,7 +443,7 @@ mod tests {
     use crate::beacon_node::mock::MockBeaconNode;
     use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::primitives::HashTreeRoot as _;
-    use ethlambda_types::beacon::primitives::{BlsPubkey, H160, Root};
+    use ethlambda_types::beacon::primitives::{BlsPubkey, Bytes32, H160, Root};
     use libssz::SszDecode as _;
 
     fn secret() -> [u8; 32] {
@@ -474,19 +476,16 @@ mod tests {
     }
 
     fn service(node: Arc<MockBeaconNode>) -> ProposalService<MockBeaconNode> {
-        ProposalService::new(node, context(), Bytes32::repeat_byte(0xab), None)
+        let settings = ProposerSettings::new(Bytes32::repeat_byte(0xab), None);
+        ProposalService::new(node, context(), Arc::new(settings))
     }
 
     fn service_expecting(
         node: Arc<MockBeaconNode>,
         fee_recipient: ExecutionAddress,
     ) -> ProposalService<MockBeaconNode> {
-        ProposalService::new(
-            node,
-            context(),
-            Bytes32::repeat_byte(0xab),
-            Some(fee_recipient),
-        )
+        let settings = ProposerSettings::new(Bytes32::repeat_byte(0xab), Some(fee_recipient));
+        ProposalService::new(node, context(), Arc::new(settings))
     }
 
     /// A slot inside mainnet's electra era.
@@ -573,6 +572,28 @@ mod tests {
         let seen = node.block_requests();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].graffiti, Bytes32::repeat_byte(0xab));
+    }
+
+    /// A per-validator graffiti replaces the default for that validator's
+    /// block, and is read at proposal time, so one set after the service was
+    /// built still applies.
+    #[tokio::test]
+    async fn a_validators_own_graffiti_replaces_the_default() {
+        let (store, pubkey) = store();
+        let node = Arc::new(MockBeaconNode::new().with_block(slot(), 7));
+        let settings = Arc::new(ProposerSettings::new(Bytes32::repeat_byte(0xab), None));
+        let service = ProposalService::new(node.clone(), context(), settings.clone());
+
+        settings.set_graffiti(&pubkey, Bytes32::repeat_byte(0xcd));
+        service
+            .propose(slot(), &duty(&pubkey, 7, slot()), &store)
+            .await
+            .expect("proposes");
+
+        assert_eq!(
+            node.block_requests()[0].graffiti,
+            Bytes32::repeat_byte(0xcd)
+        );
     }
 
     /// The reveal is over the slot's epoch, and it is what the node is given
@@ -802,7 +823,11 @@ mod gloas_tests {
     }
 
     fn service(node: Arc<MockBeaconNode>) -> ProposalService<MockBeaconNode> {
-        ProposalService::new(node, context(), Bytes32::repeat_byte(0xab), None)
+        let settings = ProposerSettings::new(
+            ethlambda_types::beacon::primitives::Bytes32::repeat_byte(0xab),
+            None,
+        );
+        ProposalService::new(node, context(), Arc::new(settings))
     }
 
     fn verifies(pubkey: &BlsPubkey, signature: &[u8; 96], root: Root) -> bool {
@@ -863,6 +888,30 @@ mod gloas_tests {
             node.envelope_requests().is_empty(),
             "an included payload needs no fetch"
         );
+    }
+
+    /// A validator's own graffiti reaches a gloas block request too, as it does
+    /// a fulu one: the settings are read before the fork is looked at.
+    #[tokio::test]
+    async fn a_validators_own_graffiti_reaches_the_gloas_block_request() {
+        use ethlambda_types::beacon::primitives::Bytes32;
+        let (store, pubkey) = store();
+        let node = Arc::new(MockBeaconNode::new().with_gloas_block(
+            slot(),
+            7,
+            BUILDER_INDEX_SELF_BUILD,
+            true,
+        ));
+        let settings = Arc::new(ProposerSettings::new(Bytes32::repeat_byte(0xab), None));
+        settings.set_graffiti(&pubkey, Bytes32::repeat_byte(0xcd));
+        ProposalService::new(node.clone(), context(), settings)
+            .propose(slot(), &duty(&pubkey), &store)
+            .await
+            .expect("proposes");
+
+        let request = node.block_requests().remove(0);
+        assert_eq!(request.fork, ForkName::Gloas);
+        assert_eq!(request.graffiti, Bytes32::repeat_byte(0xcd));
     }
 
     /// The builder domain is not the proposer domain: an envelope signature
