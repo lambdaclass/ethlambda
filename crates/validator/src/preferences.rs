@@ -104,6 +104,10 @@ pub struct PreferencesService<B> {
     /// warning is once per epoch rather than once per slot. Pruned like
     /// `published`.
     no_fee_warned: Mutex<HashSet<Epoch>>,
+    /// `(proposal_slot, dependent_root)` entries whose refusal was already
+    /// warned about, so a persistently refused one warns once rather than every
+    /// slot until its slot passes. Pruned with `published`.
+    refusal_warned: Mutex<HashSet<(Slot, Root)>>,
     /// Epochs whose failed duties fetch was already warned about, for the same
     /// reason: a syncing node, or one without v2, fails every slot.
     fetch_warned: Mutex<HashSet<Epoch>>,
@@ -131,6 +135,7 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
             settings,
             published: Mutex::new(HashSet::new()),
             no_fee_warned: Mutex::new(HashSet::new()),
+            refusal_warned: Mutex::new(HashSet::new()),
             fetch_warned: Mutex::new(HashSet::new()),
             in_flight: AtomicBool::new(false),
         }
@@ -162,6 +167,7 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
 
         let epoch_start = epoch * preset::SLOTS_PER_EPOCH;
         lock(&self.published).retain(|(slot, _)| *slot >= epoch_start);
+        lock(&self.refusal_warned).retain(|(slot, _)| *slot >= epoch_start);
         lock(&self.no_fee_warned).retain(|warned| *warned >= epoch);
         lock(&self.fetch_warned).retain(|warned| *warned >= epoch);
     }
@@ -277,14 +283,27 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
                     published += 1;
                 }
                 Err(err) => {
-                    warn!(
-                        epoch = target,
-                        slot = key.0,
-                        validator = entry.message.validator_index,
-                        %err,
-                        "No beacon node accepted a proposer preference; builders' bids for that \
-                         slot are ignored, and from gloas a node may not know the fee recipient"
-                    );
+                    // A refused entry is tried again every slot until its slot
+                    // passes, so only its first refusal is a warning.
+                    if lock(&self.refusal_warned).insert(key) {
+                        warn!(
+                            epoch = target,
+                            slot = key.0,
+                            validator = entry.message.validator_index,
+                            %err,
+                            "No beacon node accepted a proposer preference; builders' bids for \
+                             that slot are ignored, and from gloas a node may not know the fee \
+                             recipient"
+                        );
+                    } else {
+                        debug!(
+                            epoch = target,
+                            slot = key.0,
+                            validator = entry.message.validator_index,
+                            %err,
+                            "A proposer preference was refused again"
+                        );
+                    }
                     crate::metrics::inc_proposer_preferences_failures();
                 }
             }
@@ -598,6 +617,11 @@ mod tests {
         // tried again (and refused again).
         service.clone().poll(current + 1, store.clone()).await;
         assert_eq!(submitted(&node).len(), 1);
+        assert_eq!(
+            *lock(&service.refusal_warned),
+            HashSet::from([(refused, Root::repeat_byte(0x11))]),
+            "two refusals of one entry leave one warn-path record"
+        );
 
         node.refused_preference_slots.lock().expect("lock").clear();
         service.poll(current + 2, store).await;
