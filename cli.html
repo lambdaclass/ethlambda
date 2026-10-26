@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-2f29de31.js";
+            window.path_to_searchindex_js = "searchindex-09305b74.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-34fa44cf.js"></script>
@@ -323,7 +323,9 @@ the old set: nothing is corrupted, but the node advertises a set it has not
 finished filling until it backfills the difference.</p>
 <p>With neither execution flag, the follower contacts no execution client and
 imports blocks without validating their payloads, which is what it did before
-those flags existed. Supplying one without the other is refused at startup: an
+those flags existed. It then answers <code>attestation_data</code>,
+<code>aggregate_attestation</code> and block production with <code>503</code>, so a validator
+client cannot use it. Supplying one without the other is refused at startup: an
 Engine API endpoint always requires authentication. See
 <a href="./beacon_engine.html">the execution layer pairing</a> for what each verdict does and
 for the limitations that go with the retry ladder.</p>
@@ -475,9 +477,9 @@ same care as a manual key move. The client repeats this warning at startup.</p>
 <tr><td><code>--http-address</code></td><td><code>127.0.0.1</code></td><td>Bind address for the metrics and keymanager servers</td></tr>
 <tr><td><code>--metrics-port</code></td><td><code>5064</code></td><td>Prometheus metrics port</td></tr>
 <tr><td><code>--keymanager-port</code></td><td><code>5062</code></td><td>Keymanager API port. Only bound with <code>--enable-keymanager</code></td></tr>
-<tr><td><code>--suggested-fee-recipient</code></td><td>none</td><td>Execution address to receive block rewards, <code>0x</code>-prefixed. Optional, and startup warns when it is absent: without it the beacon node picks an address, and it will not be yours</td></tr>
-<tr><td><code>--graffiti</code></td><td>empty</td><td>Text for the graffiti field of proposed blocks. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer</td></tr>
-<tr><td><code>--enable-keymanager</code></td><td>off</td><td>Serve the keymanager API. Off by default because it mutates key material</td></tr>
+<tr><td><code>--suggested-fee-recipient</code></td><td>none</td><td>Execution address to receive block rewards, <code>0x</code>-prefixed, for every validator the keymanager API gives no address of its own. Optional, and startup warns when it is absent: without it the beacon node picks an address, and it will not be yours</td></tr>
+<tr><td><code>--graffiti</code></td><td>empty</td><td>Text for the graffiti field of proposed blocks, for every validator the keymanager API gives no graffiti of its own. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer. An ethlambda beacon node appends both clients’ versions to it (see <a href="rpc.html#validator-endpoints"><code>rpc.md</code></a>)</td></tr>
+<tr><td><code>--enable-keymanager</code></td><td>off</td><td>Serve the keymanager API: keystores, plus each validator’s own fee recipient, graffiti and gas limit. Off by default because it mutates key material</td></tr>
 </tbody>
 </table>
 </div>
@@ -486,10 +488,10 @@ same care as a manual key move. The client repeats this warning at startup.</p>
 the self-built payload envelope and the payload timeliness committee vote.</p>
 <p>Each epoch it resolves its validators’ indices, fetches their attester duties
 for this epoch and the next, fetches this epoch’s proposer duties, subscribes
-to the committee subnets the attester duties need, and registers its fee
-recipient with the beacon node. The subscription also tells the node which
-committees this client will aggregate for, which it has to know in advance so
-it can collect the votes.</p>
+to the committee subnets the attester duties need, and registers each
+validator’s fee recipient with the beacon node. The subscription also tells the
+node which committees this client will aggregate for, which it has to know in
+advance so it can collect the votes.</p>
 <p>Each slot it wakes at the boundary. If one of its validators proposes that
 slot, it signs the RANDAO reveal, asks the beacon node for a block, checks that
 the block is for the slot and proposer it asked about, signs it and publishes
@@ -563,6 +565,30 @@ epoch is not picked up until the next one.</p>
 <code>api-token.txt</code> in the validators directory and generated there on first start
 if absent. The token file is written <code>0600</code> and a file too short to be a real
 token is refused rather than accepted.</p>
+<p>It also serves <code>GET</code>, <code>POST</code> and <code>DELETE</code> on
+<code>/eth/v1/validator/{pubkey}/feerecipient</code>, <code>/graffiti</code> and <code>/gas_limit</code>, which
+give one validator its own value in place of the command line’s default:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Setting</th><th>Default</th><th>Takes effect</th></tr>
+</thead>
+<tbody>
+<tr><td><code>feerecipient</code></td><td><code>--suggested-fee-recipient</code></td><td>At the next epoch boundary, when the fee recipients are registered with the beacon node again. A block proposed before then pays the address the node was last given, and the check before signing reports the mismatch</td></tr>
+<tr><td><code>graffiti</code></td><td><code>--graffiti</code></td><td>The next proposal</td></tr>
+<tr><td><code>gas_limit</code></td><td><code>DEFAULT_GAS_LIMIT</code></td><td>Stored and served only: it matters to builder registrations, and there is no builder flow</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>These are held in memory only.</strong> A restart puts every validator back on the
+defaults, so an operator driving these endpoints must set them again after one.
+Deleting a keystore drops its values too.</p>
+<p>A few answers worth knowing: <code>GET feerecipient</code> is a <code>500</code> when the validator
+has no address and there is no <code>--suggested-fee-recipient</code> default, as
+Lighthouse answers it; <code>POST feerecipient</code> refuses the zero address, as the
+specification requires; <code>POST graffiti</code> refuses text over 32 bytes rather than
+truncating it; and every route answers <code>404</code> for a key this client does not
+hold.</p>
 <p>The specification requires TLS. This binds to <code>--http-address</code>, loopback by
 default; exposing it further means putting a TLS terminator in front.</p>
 <h3 id="metrics"><a class="header" href="#metrics">Metrics</a></h3>

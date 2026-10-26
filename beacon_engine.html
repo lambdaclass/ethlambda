@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-2f29de31.js";
+            window.path_to_searchindex_js = "searchindex-09305b74.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-34fa44cf.js"></script>
@@ -304,11 +304,14 @@ transition”) or <code>INVALIDATED</code> verdict, and, for the ones that get n
 finality: an execution client doing a long state sync answers <code>NOT_VALIDATED</code> to
 every block, so without that bound the set would take one root per import for
 the life of the process.</p>
-<p>Besides <code>mark_validated</code>’s own ancestor walk, the Beacon API’s
-<code>execution_optimistic</code> response field reads the set (see
-<a href="./rpc.html#execution_optimistic-under-gloas">rpc.md</a>). A sync status that
-separates a head this node has vouched for from one it has merely imported does
-not exist yet.</p>
+<p>Besides <code>mark_validated</code>’s own ancestor walk, the Beacon API reads the set:
+every <code>execution_optimistic</code> response field (see
+<a href="./rpc.html#execution_optimistic-under-gloas">rpc.md</a> for a gloas block’s),
+<code>is_optimistic</code> on <code>/eth/v1/node/syncing</code> and the <code>206</code> on
+<code>/eth/v1/node/health</code> (both about the head only), and <code>attestation_data</code> and
+<code>aggregate_attestation</code>, which answer <code>503</code> rather than hand a validator a
+vote for a block the execution client has not validated (see
+<a href="rpc.html#validator-endpoints"><code>rpc.md</code></a>).</p>
 <h3 id="is_optimistic_candidate_block"><a class="header" href="#is_optimistic_candidate_block"><code>is_optimistic_candidate_block</code></a></h3>
 <p>A <code>NOT_VALIDATED</code> verdict is not enough on its own. The block must also either</p>
 <ol>

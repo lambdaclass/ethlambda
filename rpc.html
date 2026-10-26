@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-2f29de31.js";
+            window.path_to_searchindex_js = "searchindex-09305b74.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-34fa44cf.js"></script>
@@ -395,8 +395,8 @@ surface rather than sitting beside it; a <code>/lean/v0</code> path on a beacon 
 <tr><td><code>GET</code></td><td><code>/eth/v1/beacon/genesis</code></td><td>JSON</td><td>Genesis time, validators root, fork version</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/config/spec</code></td><td>JSON</td><td>The store’s <code>Config</code>, plus <code>PRESET_BASE</code>, <code>CONFIG_NAME</code>, the preset and the constants (see below)</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/config/deposit_contract</code></td><td>JSON</td><td>The <code>Config</code>’s deposit chain id and contract address</td></tr>
-<tr><td><code>GET</code></td><td><code>/eth/v1/node/syncing</code></td><td>JSON</td><td>Head slot, sync distance, optimistic flag</td></tr>
-<tr><td><code>GET</code></td><td><code>/eth/v1/node/health</code></td><td><em>(status only)</em></td><td><code>200</code> caught up, <code>206</code> syncing</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/node/syncing</code></td><td>JSON</td><td>Head slot, sync distance, whether the head is optimistic</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/node/health</code></td><td><em>(status only)</em></td><td><code>200</code> caught up, <code>206</code> syncing or on an optimistic head</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/node/version</code></td><td>JSON</td><td>Client version string</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/node/identity</code></td><td>JSON</td><td>Peer ID and metadata only (see below)</td></tr>
 <tr><td><code>GET</code>, <code>POST</code></td><td><code>/eth/v1/beacon/states/{state_id}/validators</code></td><td>JSON</td><td>Registry entries by index or pubkey, with status</td></tr>
@@ -420,7 +420,7 @@ surface rather than sitting beside it; a <code>/lean/v0</code> path on a beacon 
 <tr><td><code>GET</code></td><td><code>/eth/v1/validator/execution_payload_envelopes/{slot}/{beacon_block_root}</code></td><td>SSZ or JSON</td><td>The unsigned envelope <code>produceBlockV4</code> built (gloas)</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v2/beacon/blocks</code></td><td><em>(status only)</em></td><td>Gossip and import a signed fulu or gloas block (<code>publishBlockV2</code>, SSZ)</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/beacon/execution_payload_envelopes</code></td><td><em>(status only)</em></td><td>Gossip a signed envelope and its data columns (gloas, SSZ)</td></tr>
-<tr><td><code>POST</code></td><td><code>/eth/v1/validator/prepare_beacon_proposer</code></td><td><em>(status only)</em></td><td>Acknowledged, not acted on (see below)</td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v1/validator/prepare_beacon_proposer</code></td><td><em>(status only)</em></td><td>Record each validator’s fee recipient for block production (see below)</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/events</code></td><td>SSE</td><td>Live stream of chain events (see below)</td></tr>
 </tbody>
 </table>
@@ -476,7 +476,12 @@ index, is a <code>400</code>, and the endpoint is a <code>503</code> while the n
 epoch’s boundary block as target, and as source the current justified
 checkpoint of the head state advanced to the slot’s epoch (through fork
 choice’s cached <code>checkpoint_state</code>, and only when the head is in an earlier
-epoch). A slot before the head, or past the wall clock, is a <code>400</code>.
+epoch). A slot before the head, or past the wall clock, is a <code>400</code>. An
+optimistic head is a <code>503</code>: the Beacon API requires one whenever the
+answer’s <code>beacon_block_root</code> has not been validated by the execution client,
+and the head is always that root here. So is every request on a node run
+without an execution client, whose blocks are never marked optimistic
+because nothing validates them.
 <code>committee_index</code> is optional and ignored: from electra on every committee of
 a slot attests to the same data. <code>data.index</code> is <code>0</code> before gloas. At a gloas
 slot it is the payload-present flag: <code>0</code> when the head block is from the
@@ -512,7 +517,8 @@ subnets are left once their slot has passed, and never appear in <code>attnets</
 data root and committee, as electra’s <code>Attestation</code> with the BLS aggregate of
 their signatures; at a gloas slot the answer is <code>{version: "gloas", data}</code>
 with gloas’s <code>Attestation</code> (the same JSON shape). JSON only. <code>404</code> when
-nothing is held.</li>
+nothing is held, and <code>503</code> when the block the votes name is optimistic,
+whether or not it is the head, or when no execution client is configured.</li>
 <li><strong><code>aggregate_and_proofs</code></strong> checks each aggregate with the same
 <code>beacon_aggregate_and_proof</code> gossip conditions this node applies to its
 peers’ aggregates (<code>gossip::aggregate</code>), signatures included, against a
@@ -547,6 +553,17 @@ the block through <code>process_block</code>. The answer is fulu <code>BlockCont
 blobs. A slot the schedule does not place at fulu (gloas included) is a
 <code>400</code>, checked before the execution client; <code>produceBlockV3</code> is the fulu
 endpoint, and a gloas slot goes to <code>produceBlockV4</code>.</li>
+<li><strong>Graffiti</strong> is the validator client’s, with both clients’ codes and
+commits appended as far as they fit: <code>hello RH1a2bLA3c4d</code> for reth at
+<code>1a2b…</code> under ethlambda at <code>3c4d…</code>. The execution client’s half comes from
+<code>engine_getClientVersionV1</code>, asked alongside the payload build and given up
+on after <code>EL_VERSION_TIMEOUT</code>, and is left out when it cannot be had
+(<code>hello LA3c4d</code>). The
+suffix shrinks rather than cutting the validator’s text short, in
+Lighthouse’s tiers, and is appended to every block with no opt-out; the
+<code>graffiti_policy</code> parameter Lighthouse’s validator client sends is not read.
+<code>LA</code> is ethlambda’s own code: <code>identification.md</code> reserves none for it and
+lets an unlisted client pick any two letters no listed client uses.</li>
 <li><strong><code>POST beacon/blocks</code></strong> takes SSZ and the <code>Eth-Consensus-Version</code> header
 (<code>fulu</code> or <code>gloas</code>, else <code>400</code>; a non-SSZ content type is a <code>415</code>). Fulu: a
 <code>SignedBlockContents</code>; the node checks the block is after the head and its
@@ -647,7 +664,9 @@ thread. A gloas epoch more than one before the head state’s is a <code>400</co
 data is for the block of that very slot on the head’s chain; a slot with no
 such block (or whose block is not a gloas block) answers <code>204</code> with no body,
 which a client reads as “cast no vote”. A slot before the gloas fork is a
-<code>400</code>, and a node that is syncing answers <code>503</code>. <code>payload_present</code> is whether
+<code>400</code>, and a node that is syncing answers <code>503</code>, as does one run without an
+execution client or whose block has an unvalidated execution payload behind
+it (the same rule as attestation data). <code>payload_present</code> is whether
 the block’s envelope reached this node before the slot’s start plus
 <code>PAYLOAD_DUE_BPS</code> of it, judged by arrival time (see
 <a href="./spec_deviations.html#payload_present-is-judged-by-the-envelopes-arrival-time">Spec Deviations</a>).
