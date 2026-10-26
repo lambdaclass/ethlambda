@@ -454,7 +454,7 @@ the chain actor writes, so no request waits on the actor.
   concurrently with the local build, bounded by its own timeout, and an error
   or a timeout means no bid. A bid is checked before it competes: a non-zero
   value, the head's execution block as its parent, the proposal's `prev_randao`
-  and timestamp, the withdrawals root, the blob commitment and blob gas bounds,
+  and timestamp, the parent's block number plus one, the withdrawals root, the blob commitment and blob gas bounds,
   a gas limit within one step of the parent's toward the registered target,
   and the builder's signature. Its fee recipient is not checked (see
   `spec_deviations.md`). A bid that passes goes through `assemble_blinded_block`
@@ -501,7 +501,8 @@ the chain actor writes, so no request waits on the actor.
   gossiped and handed to the chain actor. This node publishes one block per
   slot: a second block for a slot whose root differs from the first, through
   this endpoint or `blinded_blocks`, is a `400`, since a validator that signed
-  two would be slashed. The same block again is a retry and passes.
+  two would be slashed. The same block again is a retry and passes. A slot
+  below the finalized one is refused too, since claims there are forgotten.
 - **`POST beacon/blinded_blocks`** takes a fulu `SignedBlindedBeaconBlock` as
   JSON or SSZ, by `Content-Type` as above, with `Eth-Consensus-Version: fulu`.
   It is checked as a fulu `beacon/blocks` is, before anything leaves this node:
@@ -512,7 +513,9 @@ the chain actor writes, so no request waits on the actor.
   block goes to the builder (`submitBlindedBlockV2`) on its own task, so a
   validator client that hangs up cannot cancel the reveal. The builder
   publishes the full block and its data columns; it returns over gossip and
-  imports like any block, and nothing is gossiped here. The status is the
+  imports like any block, and nothing is gossiped here. The body limit is
+  the one `beacon/blocks` has (`413` over it). The builder's answer is logged
+  from the submission task, an error when it did not take a signed block. The status is the
   builder's: 202 becomes `200`, a builder `400` stays `400`, and anything else
   is a `500`. There is no local fallback, since a second block would be an
   equivocation. With no `--builder` the answer is `500`.
