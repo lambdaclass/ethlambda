@@ -1,0 +1,493 @@
+name: Release
+
+# Publishes every image built from this repository's history, and cuts release
+# candidates:
+#
+#   push to main         -> `unstable` and `unstable-shadow`, plus the immutable
+#                           `sha-<7>` and `sha-<7>-shadow`. Also builds the
+#                           release binaries and the changelog without publishing
+#                           them, so a break in that path shows up on the commit
+#                           that caused it rather than on the next tag.
+#   push tag vX.Y.Z-rc.N -> `X.Y.Z-rc.N`, the release binaries, and a GitHub
+#                           pre-release with those binaries attached.
+#   workflow_dispatch    -> a dry run of the `rc_tag` input on the chosen ref:
+#                           everything a push of that tag would run, version
+#                           check and release notes included, publishing nothing.
+#                           Run it on `release/vX.Y.Z` before tagging.
+#
+# A candidate becomes the final release through release_promote.yaml, which
+# re-stamps the tested images as `X.Y.Z` and `latest` without rebuilding them.
+# Devnet tags (`devnetX`) are published by hand through docker_publish.yaml.
+# See RELEASE.md for the whole procedure.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*-*"]
+  workflow_dispatch:
+    inputs:
+      rc_tag:
+        description: "Release-candidate tag to dry-run on the chosen ref, e.g. v0.2.0-rc.1. Nothing is published."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  # Build args of the Shadow-simulator image, mirroring the `shadow-docker-build`
+  # Makefile target. LOCKED= builds it unlocked (the quinn-udp [patch] is absent
+  # from Cargo.lock; see Dockerfile), so -shadow images are not reproducible and
+  # should not be treated as equivalent-security artifacts to the regular tags.
+  SHADOW_BUILD_ARGS: |
+    SHADOW=1
+    FEATURES=shadow-integration
+    NO_DEFAULT_FEATURES=--no-default-features
+    LOCKED=
+
+jobs:
+  meta:
+    name: Resolve release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      channel: ${{ steps.meta.outputs.channel }}
+      version: ${{ steps.meta.outputs.version }}
+      variants: ${{ steps.meta.outputs.variants }}
+      publish: ${{ steps.meta.outputs.publish }}
+      candidate: ${{ steps.meta.outputs.candidate }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Resolve tags, channel and version
+        id: meta
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_RC_TAG: ${{ inputs.rc_tag }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # The candidate tag this run builds: the pushed tag, or the one a dry
+          # run names. A push to main builds none.
+          candidate=""
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            candidate="$INPUT_RC_TAG"
+          elif [ "$REF_TYPE" = "tag" ]; then
+            candidate="$REF_NAME"
+          fi
+
+          if [ -n "$candidate" ]; then
+            # Final tags are never built: promotion creates them from a tested
+            # candidate.
+            if ! [[ "$candidate" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]+$ ]]; then
+              echo "::error::'$candidate' is not a release-candidate tag (vX.Y.Z-rc.N)"
+              exit 1
+            fi
+            tag="${candidate#v}"    # 0.2.0-rc.1
+            version="${tag%%-*}"    # 0.2.0
+            # The baked channel. Promotion overrides it with ETHLAMBDA_CHANNEL=stable.
+            channel="${tag#*-}"     # rc.1
+
+            # The binary reports its Cargo version, not the tag, so a tag naming
+            # another version would ship artifacts whose --version disagrees
+            # with the release they belong to.
+            cargo_version=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+            if [ "$version" != "$cargo_version" ]; then
+              echo "::error::tag $candidate names $version, but [workspace.package] version is '$cargo_version'"
+              exit 1
+            fi
+
+            image_tag="$tag"
+            variants='["default"]'
+          else
+            version="dev-${SHA::7}"
+            channel="$REF_NAME"
+            image_tag=unstable
+            variants='["default","shadow"]'
+          fi
+
+          publish=$([ "$EVENT_NAME" = "push" ] && echo true || echo false)
+
+          {
+            echo "candidate=$candidate"
+            echo "image_tag=$image_tag"
+            echo "channel=$channel"
+            echo "version=$version"
+            echo "variants=$variants"
+            echo "publish=$publish"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  build-image:
+    name: Build Docker image (${{ matrix.arch.name }}, ${{ matrix.variant }})
+    needs: meta
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        arch:
+          - runner: ubuntu-latest
+            name: amd64
+          - runner: ubuntu-22.04-arm
+            name: arm64
+        variant: ${{ fromJSON(needs.meta.outputs.variants) }}
+    runs-on: ${{ matrix.arch.runner }}
+    env:
+      # Must match the suffix publish-docker derives from the same variant name.
+      SUFFIX: ${{ matrix.variant == 'shadow' && '-shadow' || '' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the Container registry
+        if: needs.meta.outputs.publish == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          build-args: |
+            GIT_COMMIT=${{ github.sha }}
+            GIT_BRANCH=${{ needs.meta.outputs.channel }}
+            VERSION=${{ needs.meta.outputs.version }}
+            ${{ matrix.variant == 'shadow' && env.SHADOW_BUILD_ARGS || '' }}
+          push: ${{ needs.meta.outputs.publish == 'true' }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.meta.outputs.image_tag }}${{ env.SUFFIX }}-${{ matrix.arch.name }}
+          platforms: linux/${{ matrix.arch.name }}
+          # Same scopes docker_publish.yaml uses, so either workflow warms the other.
+          cache-from: type=gha,scope=${{ matrix.arch.name }}-${{ matrix.variant }}
+          cache-to: type=gha,scope=${{ matrix.arch.name }}-${{ matrix.variant }},mode=max
+
+  publish-docker:
+    name: Create and push multi-arch manifests
+    needs: [meta, build-image]
+    if: needs.meta.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifests
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          TAG: ${{ needs.meta.outputs.image_tag }}
+          VARIANTS: ${{ needs.meta.outputs.variants }}
+          REF_TYPE: ${{ github.ref_type }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          for variant in $(jq -r '.[]' <<< "$VARIANTS"); do
+            suffix=""
+            if [ "$variant" = "shadow" ]; then suffix="-shadow"; fi
+
+            # `unstable` moves with every push, so main images also get an
+            # immutable sha tag. A release-candidate tag is immutable already.
+            extra_tags=()
+            if [ "$REF_TYPE" = "branch" ]; then
+              extra_tags=(-t "$IMAGE:sha-${SHA::7}$suffix")
+            fi
+
+            docker buildx imagetools create \
+              -t "$IMAGE:$TAG$suffix" \
+              "${extra_tags[@]}" \
+              "$IMAGE:$TAG$suffix-amd64" \
+              "$IMAGE:$TAG$suffix-arm64"
+          done
+
+  # A job of its own so the OIDC and attestation permissions are granted only
+  # where a release asset is published, not on every push to main.
+  attest-image:
+    name: Attest the candidate image
+    needs: [meta, publish-docker]
+    if: needs.meta.outputs.publish == 'true' && needs.meta.outputs.candidate != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+
+    steps:
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The multi-arch index, which is what a tag resolves to.
+      - name: Resolve the image digest
+        id: image
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.meta.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          digest=$(docker buildx imagetools inspect "$IMAGE" --format '{{.Manifest.Digest}}')
+          echo "$IMAGE -> $digest"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+
+  build-binaries:
+    name: Build binary (${{ matrix.target.name }})
+    needs: meta
+    strategy:
+      matrix:
+        target:
+          # The oldest available runner, since the glibc it links against is
+          # the oldest one the binary runs on.
+          - runner: ubuntu-22.04
+            name: linux-x86_64
+          - runner: ubuntu-22.04-arm
+            name: linux-aarch64
+          - runner: macos-latest
+            name: macos-aarch64
+    runs-on: ${{ matrix.target.runner }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+
+      # RocksDB's bindings are generated by bindgen, which needs libclang (the
+      # Dockerfile installs the same package).
+      - name: Install libclang
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
+
+      - name: Build ethlambda
+        env:
+          # A tag checkout is detached, so vergen would report "HEAD".
+          VERGEN_GIT_BRANCH: ${{ needs.meta.outputs.channel }}
+        run: cargo build --release --locked --bin ethlambda
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/release/ethlambda "dist/ethlambda-${{ matrix.target.name }}"
+          "dist/ethlambda-${{ matrix.target.name }}" --version
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: ethlambda-${{ matrix.target.name }}
+          path: dist/ethlambda-${{ matrix.target.name }}
+          if-no-files-found: error
+
+  changelog:
+    name: Generate changelog
+    needs: meta
+    runs-on: ubuntu-latest
+    # Read-only on purpose: the third-party action never holds the token that
+    # can publish a release.
+    permissions:
+      contents: read
+    outputs:
+      changes: ${{ steps.notes.outputs.changes }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Find the previous release
+        id: previous
+        run: |
+          set -euo pipefail
+          # The last final release, never a candidate: rc.2's changelog covers
+          # everything since the last release, not just what changed since rc.1.
+          last=$(git tag --list --sort=-creatordate | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+          if [ -z "$last" ]; then
+            echo "No previous release: this is the first one."
+            exit 0
+          fi
+          # A release's tag sits on its release branch, which main only gets by
+          # merging it, so compare from where this commit's history meets it.
+          base=$(git merge-base HEAD "$last")
+          echo "Previous release: $last (merge base $base)"
+          echo "last=$last" >> "$GITHUB_OUTPUT"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+
+      - name: Generate changelog
+        id: changelog
+        if: steps.previous.outputs.base != ''
+        uses: requarks/changelog-action@v1
+        with:
+          token: ${{ github.token }}
+          fromTag: ${{ github.sha }}
+          toTag: ${{ steps.previous.outputs.base }}
+          writeToFile: false
+          restrictToTypes: feat,fix,perf,refactor,revert
+
+      - name: Collect changelog
+        id: notes
+        env:
+          CHANGES: ${{ steps.changelog.outputs.changes }}
+          LAST: ${{ steps.previous.outputs.last }}
+        run: |
+          set -euo pipefail
+          if [ -z "$LAST" ]; then
+            changes="First release: there is no previous release to compare against."
+          else
+            changes=$(printf '## Changes since %s\n\n%s' "$LAST" "$CHANGES")
+          fi
+          printf '%s\n' "$changes" >> "$GITHUB_STEP_SUMMARY"
+          delimiter="CHANGELOG_$(openssl rand -hex 16)"
+          {
+            echo "changes<<$delimiter"
+            printf '%s\n' "$changes"
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+
+  github-release:
+    name: ${{ needs.meta.outputs.publish == 'true' && 'Create GitHub pre-release' || 'Dry-run GitHub pre-release' }}
+    needs: [meta, build-binaries, publish-docker, attest-image, changelog]
+    # On a candidate tag, and in a dry run. A dry run skips publish-docker and
+    # attest-image, and a skipped dependency skips this job too unless the
+    # condition checks status.
+    if: ${{ !cancelled() && !failure() && needs.meta.outputs.candidate != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    steps:
+      # Anchored on `ethlambda-`: build-push-action also uploads build records,
+      # named `<owner>~<repo>~<id>.dockerbuild`, which download-artifact cannot
+      # extract.
+      - name: Download binaries
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: ethlambda-*
+          merge-multiple: true
+
+      - name: Compute checksums
+        working-directory: dist
+        run: |
+          sha256sum ethlambda-* > SHA256SUMS
+          cat SHA256SUMS
+
+      # Not in a dry run: an attestation is published the moment it is made.
+      - name: Attest build provenance
+        if: needs.meta.outputs.publish == 'true'
+        uses: actions/attest@v4
+        with:
+          subject-checksums: dist/SHA256SUMS
+
+      - name: Verify the attestations as a consumer would
+        if: needs.meta.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for binary in dist/ethlambda-*; do
+            gh attestation verify "$binary" --repo "$GITHUB_REPOSITORY"
+          done
+
+      # Outside dist/, whose every file becomes a release asset.
+      - name: Write release notes
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.meta.outputs.image_tag }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          CHANGELOG: ${{ needs.changelog.outputs.changes }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<EOF
+          Release candidate for ethlambda \`$VERSION\`. It becomes the final release once promoted; see [RELEASE.md](https://github.com/$GITHUB_REPOSITORY/blob/main/RELEASE.md).
+
+          **Docker image:** \`$IMAGE\` (amd64 and arm64)
+
+          **Binaries:** attached below, with their \`SHA256SUMS\`. The \`linux-x86_64\` build targets x86-64-v3, so it needs a CPU with AVX2 (Haswell or later).
+
+          **Verifying:** the binaries and the image carry GitHub build provenance attestations. See [RELEASE.md](https://github.com/$GITHUB_REPOSITORY/blob/main/RELEASE.md#verifying-a-release) for the commands.
+
+          $CHANGELOG
+          EOF
+
+      - name: Create pre-release
+        if: needs.meta.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.meta.outputs.candidate }}
+        run: |
+          set -euo pipefail
+          # A re-run of this job finds the release already there: refresh its
+          # assets instead of failing on the create.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --prerelease \
+              --title "ethlambda $TAG" \
+              --notes-file notes.md
+          fi
+
+      - name: Show the release a push of the tag would create
+        if: needs.meta.outputs.publish != 'true'
+        env:
+          TAG: ${{ needs.meta.outputs.candidate }}
+        run: |
+          {
+            echo "## Dry run of $TAG: nothing was published"
+            echo
+            echo "Assets:"
+            echo
+            echo '```'
+            ls -l dist
+            echo '```'
+            echo
+            echo "Notes:"
+            echo
+            cat notes.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the release assets
+        if: needs.meta.outputs.publish != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: dry-run-release-assets
+          path: dist
+          if-no-files-found: error
