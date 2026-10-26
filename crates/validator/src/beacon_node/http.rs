@@ -23,6 +23,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use ethlambda_types::beacon::builder::SignedValidatorRegistrationV1;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::altair;
 use ethlambda_types::beacon::containers::electra::Attestation;
@@ -593,8 +594,9 @@ impl BeaconNodeApi for HttpBeaconNode {
         Ok(data)
     }
 
-    /// `builder_boost_factor=0` is how this client says it does not do the
-    /// builder flow.
+    /// `builder_boost_factor` is how this client says whether it does the
+    /// builder flow: the request's factor when builder proposals are on, `0`
+    /// when they are off (`None`).
     ///
     /// The parameter is a bid comparison: the node returns the local execution
     /// payload when its value is at least `factor / 100` of the builder's, so
@@ -607,19 +609,21 @@ impl BeaconNodeApi for HttpBeaconNode {
     /// answer with a blinded block. The one unconditional guarantee is the
     /// other half: a node with no builder configured MUST return a full block.
     ///
-    /// A blinded answer is therefore rejected below rather than assumed away.
-    /// This client cannot publish what it cannot unblind, so signing one would
-    /// burn the slot's proposal guard entry for a block that can never be
-    /// sent.
+    /// A blinded answer is therefore never assumed away. With builder proposals
+    /// off (`None`) it is rejected: this client would not publish it through
+    /// `blinded_blocks`, so signing one would burn the slot's proposal guard
+    /// entry for a block that can never be sent. With them on it is decoded as
+    /// a blinded block, which `publish_blinded_block` sends.
     async fn produce_block(&self, request: &BlockRequest) -> Result<ProducedBlock> {
         if request.fork >= ForkName::Gloas {
             return self.produce_gloas_block(request).await;
         }
         let path = format!(
-            "/eth/v3/validator/blocks/{}?randao_reveal={}&graffiti={}&builder_boost_factor=0",
+            "/eth/v3/validator/blocks/{}?randao_reveal={}&graffiti={}&builder_boost_factor={}",
             request.slot,
             encode_hex(&request.randao_reveal.0),
             encode_hex(&request.graffiti.0),
+            request.builder_boost_factor.unwrap_or(0),
         );
         let SszResponse {
             fork,
@@ -639,15 +643,19 @@ impl BeaconNodeApi for HttpBeaconNode {
                     .to_string(),
             )
         })?;
-        if blinded {
+        if blinded && request.builder_boost_factor.is_none() {
             return Err(Error::InconsistentResponse(format!(
-                "node produced a blinded block for slot {}; this client does not implement the \
-                 builder flow and cannot publish one",
+                "node produced a blinded block for slot {}; builder proposals are off, so this \
+                 client cannot publish one",
                 request.slot
             )));
         }
 
-        let block = ProducedBlock::from_ssz(fork, &body)?;
+        let block = if blinded {
+            ProducedBlock::from_blinded_ssz(fork, &body)?
+        } else {
+            ProducedBlock::from_ssz(fork, &body)?
+        };
         // Enforced here rather than at the call site so failover works: see the
         // contract on `BeaconNodeApi::produce_block`.
         validate_produced_block(request, &block)?;
@@ -685,6 +693,62 @@ impl BeaconNodeApi for HttpBeaconNode {
             status: status.as_u16(),
             body,
         })
+    }
+
+    /// Maps the answer as the trait's contract says: 2xx is handed to the
+    /// builder (202 is the node's broadcast-without-import, as for a full
+    /// block), a 4xx is a definite refusal, and a 5xx or a transport failure
+    /// is [`Error::BlindedUnconfirmed`], since the relay may still publish.
+    async fn publish_blinded_block(
+        &self,
+        _slot: Slot,
+        fork: ForkName,
+        body: &[u8],
+    ) -> Result<Published> {
+        let url = format!("{}/eth/v2/beacon/blinded_blocks", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .header("Eth-Consensus-Version", fork.as_str())
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(body.to_vec())
+            .send()
+            .await
+            .map_err(|err| Error::BlindedUnconfirmed {
+                status: None,
+                detail: format!("{url}: {err}"),
+            })?;
+
+        let status = response.status();
+        if status == StatusCode::ACCEPTED {
+            return Ok(Published::BroadcastNotImported);
+        }
+        if status.is_success() {
+            return Ok(Published::HandedToBuilder);
+        }
+        let body = response.text().await.unwrap_or_default();
+        if status.is_server_error() {
+            return Err(Error::BlindedUnconfirmed {
+                status: Some(status.as_u16()),
+                detail: format!("{url} answered {status}: {body}"),
+            });
+        }
+        Err(Error::BeaconNodeStatus {
+            status: status.as_u16(),
+            body,
+        })
+    }
+
+    /// JSON, an empty list never reaching the wire.
+    async fn register_validators(
+        &self,
+        registrations: &[SignedValidatorRegistrationV1],
+    ) -> Result<()> {
+        if registrations.is_empty() {
+            return Ok(());
+        }
+        self.post_no_content("/eth/v1/validator/register_validator", &registrations, None)
+            .await
     }
 
     async fn execution_payload_envelope(
@@ -1187,6 +1251,224 @@ mod tests {
         assert_eq!(value["min_bid"], "0");
         assert_eq!(value["builder_boost_factor"], "0");
         assert_eq!(value["builders"], serde_json::json!([]));
+    }
+
+    /// A one-route Beacon API double: whatever the handler sees is pushed to
+    /// `seen` as (uri, body), and the answer is `status` with `headers` and
+    /// `reply` as the body.
+    type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+    type Canned = (Seen, u16, Vec<(&'static str, &'static str)>, Vec<u8>);
+
+    struct Served {
+        node: HttpBeaconNode,
+        seen: Seen,
+    }
+
+    async fn serve(
+        status: u16,
+        headers: Vec<(&'static str, &'static str)>,
+        reply: Vec<u8>,
+    ) -> Served {
+        use axum::body::Bytes;
+        use axum::extract::State;
+        use axum::http::Uri;
+        use axum::response::IntoResponse;
+
+        let seen: Seen = Default::default();
+        let state = (seen.clone(), status, headers, reply);
+        let handler = |State(state): State<Canned>, uri: Uri, body: Bytes| async move {
+            let (seen, status, headers, reply) = state;
+            seen.lock()
+                .expect("lock")
+                .push((uri.to_string(), body.to_vec()));
+            let mut response = (
+                axum::http::StatusCode::from_u16(status).expect("a status"),
+                reply,
+            )
+                .into_response();
+            for (name, value) in headers {
+                response
+                    .headers_mut()
+                    .insert(name, axum::http::HeaderValue::from_static(value));
+            }
+            response
+        };
+        let app = axum::Router::new().fallback(handler).with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        Served {
+            node: HttpBeaconNode::new(format!("http://{address}")).expect("builds"),
+            seen,
+        }
+    }
+
+    fn block_request(factor: Option<u64>) -> BlockRequest {
+        BlockRequest {
+            slot: 5,
+            fork: ForkName::Fulu,
+            proposer_index: 7,
+            randao_reveal: Default::default(),
+            graffiti: Default::default(),
+            builder_boost_factor: factor,
+        }
+    }
+
+    const SSZ_HEADERS: [(&str, &str); 3] = [
+        ("content-type", "application/octet-stream"),
+        ("eth-consensus-version", "fulu"),
+        ("eth-execution-payload-blinded", "true"),
+    ];
+
+    fn blinded_bytes() -> Vec<u8> {
+        use libssz::SszEncode as _;
+        ethlambda_types::beacon::builder::BlindedBeaconBlock::from(
+            crate::beacon_node::block_contents::empty_block_for(5, 7),
+        )
+        .to_ssz()
+    }
+
+    #[tokio::test]
+    async fn the_boost_factor_is_zero_without_builder_proposals_and_the_factor_with() {
+        for (factor, expected) in [
+            (None, "builder_boost_factor=0"),
+            (Some(250), "builder_boost_factor=250"),
+        ] {
+            let served = serve(500, vec![], vec![]).await;
+            let _ = served.node.produce_block(&block_request(factor)).await;
+            let seen = served.seen.lock().expect("lock");
+            assert_eq!(seen.len(), 1);
+            assert!(
+                seen[0].0.contains(expected),
+                "{} lacks {expected}",
+                seen[0].0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_blinded_answer_is_refused_without_builder_proposals() {
+        let served = serve(200, SSZ_HEADERS.to_vec(), blinded_bytes()).await;
+        let err = served
+            .node
+            .produce_block(&block_request(None))
+            .await
+            .expect_err("a blinded block cannot be published here");
+        assert!(matches!(err, Error::InconsistentResponse(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_blinded_answer_decodes_as_blinded_with_builder_proposals() {
+        let served = serve(200, SSZ_HEADERS.to_vec(), blinded_bytes()).await;
+        let produced = served
+            .node
+            .produce_block(&block_request(Some(100)))
+            .await
+            .expect("decodes");
+        assert!(produced.is_blinded());
+        assert_eq!(produced.slot(), 5);
+        assert_eq!(produced.proposer_index(), 7);
+    }
+
+    #[tokio::test]
+    async fn registrations_are_posted_as_json_that_round_trips() {
+        use ethlambda_types::beacon::builder::{
+            SignedValidatorRegistrationV1, ValidatorRegistrationV1,
+        };
+        use ethlambda_types::beacon::primitives::{BlsPubkey, BlsSignature, H160};
+
+        let registrations = vec![SignedValidatorRegistrationV1 {
+            message: ValidatorRegistrationV1 {
+                fee_recipient: H160([0xab; 20]),
+                gas_limit: 36_000_000,
+                timestamp: 1_700_000_000,
+                pubkey: BlsPubkey([3; 48]),
+            },
+            signature: BlsSignature([4; 96]),
+        }];
+        let served = serve(200, vec![], vec![]).await;
+        served
+            .node
+            .register_validators(&registrations)
+            .await
+            .expect("accepted");
+
+        let seen = served.seen.lock().expect("lock");
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].0.ends_with("/eth/v1/validator/register_validator"));
+        let decoded: Vec<SignedValidatorRegistrationV1> =
+            serde_json::from_slice(&seen[0].1).expect("the body is the JSON a relay takes");
+        assert_eq!(decoded, registrations);
+    }
+
+    #[tokio::test]
+    async fn an_empty_registration_list_never_reaches_the_wire() {
+        let served = serve(200, vec![], vec![]).await;
+        served.node.register_validators(&[]).await.expect("a no-op");
+        assert!(served.seen.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_blinded_publish_maps_each_status() {
+        for (status, expected) in [
+            (200, Published::HandedToBuilder),
+            (202, Published::BroadcastNotImported),
+        ] {
+            let served = serve(status, vec![], vec![]).await;
+            let published = served
+                .node
+                .publish_blinded_block(5, ForkName::Fulu, &[1, 2, 3])
+                .await
+                .expect("accepted");
+            assert_eq!(published, expected, "status {status}");
+            let seen = served.seen.lock().expect("lock");
+            assert!(seen[0].0.ends_with("/eth/v2/beacon/blinded_blocks"));
+            assert_eq!(seen[0].1, vec![1, 2, 3]);
+        }
+
+        let served = serve(400, vec![], b"bad".to_vec()).await;
+        let err = served
+            .node
+            .publish_blinded_block(5, ForkName::Fulu, &[1])
+            .await
+            .expect_err("a refusal");
+        assert!(
+            matches!(err, Error::BeaconNodeStatus { status: 400, .. }),
+            "got {err:?}"
+        );
+
+        let served = serve(500, vec![], b"boom".to_vec()).await;
+        let err = served
+            .node
+            .publish_blinded_block(5, ForkName::Fulu, &[1])
+            .await
+            .expect_err("unconfirmed");
+        assert!(
+            matches!(
+                err,
+                Error::BlindedUnconfirmed {
+                    status: Some(500),
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blinded_publish_that_cannot_connect_is_unconfirmed() {
+        // Nothing listens on port 1.
+        let node = HttpBeaconNode::new("http://127.0.0.1:1").expect("builds");
+        let err = node
+            .publish_blinded_block(5, ForkName::Fulu, &[1])
+            .await
+            .expect_err("no answer");
+        assert!(
+            matches!(err, Error::BlindedUnconfirmed { status: None, .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]

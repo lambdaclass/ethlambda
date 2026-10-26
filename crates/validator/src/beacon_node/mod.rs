@@ -6,6 +6,7 @@
 //! (a reorg invalidating duties, a node failing mid-slot) untestable.
 
 use async_trait::async_trait;
+use ethlambda_types::beacon::builder::SignedValidatorRegistrationV1;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::shared::AttestationData;
 use ethlambda_types::beacon::fork::ForkName;
@@ -130,6 +131,11 @@ pub struct BlockRequest {
     pub randao_reveal: BlsSignature,
     /// Thirty-two bytes consensus never reads.
     pub graffiti: Bytes32,
+    /// The `builder_boost_factor` to send, or `None` when builder proposals are
+    /// off. `None` sends `0` and refuses a blinded answer; `Some` sends the
+    /// factor and accepts one. Ignored from gloas, where `produceBlockV4` takes
+    /// the builder configuration in its body.
+    pub builder_boost_factor: Option<u64>,
 }
 
 /// What became of a published block.
@@ -145,6 +151,14 @@ pub enum Published {
     Imported,
     /// 202: broadcast, but the node could not import it.
     BroadcastNotImported,
+    /// 200 from `blinded_blocks`: the node handed the signed blinded block to
+    /// its builder, which publishes the block and reveals the payload. Nothing
+    /// says the node imported it.
+    HandedToBuilder,
+    /// The node failed to confirm the blinded block (5xx or no answer). The
+    /// relay may still have published it; see `Error::BlindedUnconfirmed`.
+    /// Produced only by `ProposalService`, never by an implementation.
+    BuilderUnconfirmed,
 }
 
 /// Check that `block` is the block that was asked for.
@@ -351,12 +365,13 @@ pub trait BeaconNodeApi: Send + Sync {
     /// returning, so that a node answering about the wrong slot or naming the
     /// wrong proposer is failed over from rather than signed for.
     ///
-    /// # Contract: never a blinded block
+    /// # Contract: a blinded block only when builder proposals are on
     ///
-    /// This client does not implement the builder flow, so it cannot publish a
-    /// blinded block and must not sign one. An implementation must ask for an
-    /// unblinded block and reject a blinded answer rather than returning
-    /// something the caller will sign and then be unable to send.
+    /// A blinded block is returned only when `request.builder_boost_factor` is
+    /// `Some`, since only then does the caller publish one through
+    /// [`Self::publish_blinded_block`]. With `None` an implementation must ask
+    /// for an unblinded block and reject a blinded answer rather than
+    /// returning something the caller will sign and then be unable to send.
     async fn produce_block(&self, request: &BlockRequest) -> Result<ProducedBlock>;
 
     /// Publish an already-signed block, given the SSZ body and the fork it was
@@ -371,6 +386,35 @@ pub trait BeaconNodeApi: Send + Sync {
     /// a `Vec` here would be cloned once per configured node on every
     /// proposal, whether or not the first one succeeded.
     async fn publish_block(&self, fork: ForkName, body: &[u8]) -> Result<Published>;
+
+    /// Publish a signed blinded block, produced at `slot` under `fork`, to
+    /// `POST /eth/v2/beacon/blinded_blocks`. The node hands it to its builder.
+    ///
+    /// # Contract: the node that produced it, and no other
+    ///
+    /// Only the producing node's builder holds the payload, and only that node
+    /// claimed the slot. Failover must not offer it elsewhere.
+    ///
+    /// # Contract: which error means what
+    ///
+    /// A definite refusal (4xx) is an `Err` other than
+    /// `Error::BlindedUnconfirmed`: the block was not published. A 5xx or a
+    /// transport failure is `Error::BlindedUnconfirmed`, because the relay may
+    /// still publish the block.
+    async fn publish_blinded_block(
+        &self,
+        slot: Slot,
+        fork: ForkName,
+        body: &[u8],
+    ) -> Result<Published>;
+
+    /// Send signed builder registrations to the node, which forwards them to its
+    /// builder. JSON, since a node may forward the body unchanged to MEV-Boost.
+    /// State installed on the node's builder, so failover sends it to every node.
+    async fn register_validators(
+        &self,
+        registrations: &[SignedValidatorRegistrationV1],
+    ) -> Result<()>;
 
     /// The envelope the node cached for the self-built payload of the block
     /// whose root is `block_root`, proposed at `slot`.

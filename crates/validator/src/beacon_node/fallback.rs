@@ -8,6 +8,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use async_trait::async_trait;
+use ethlambda_types::beacon::builder::SignedValidatorRegistrationV1;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::altair;
 use ethlambda_types::beacon::containers::gloas;
@@ -251,6 +252,32 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
     async fn publish_block(&self, fork: ForkName, body: &[u8]) -> Result<Published> {
         self.try_each("publish_block", |node| node.publish_block(fork, body))
             .await
+    }
+
+    /// Placeholder until the producing node is remembered; see the next commit.
+    async fn publish_blinded_block(
+        &self,
+        slot: Slot,
+        fork: ForkName,
+        body: &[u8],
+    ) -> Result<Published> {
+        self.try_each("publish_blinded_block", |node| {
+            node.publish_blinded_block(slot, fork, body)
+        })
+        .await
+    }
+
+    /// To every node, like the other calls that install state on a node: a
+    /// node that never heard the registrations cannot serve a builder bid for
+    /// these validators after a failover.
+    async fn register_validators(
+        &self,
+        registrations: &[SignedValidatorRegistrationV1],
+    ) -> Result<()> {
+        self.try_all("register_validators", |node| {
+            node.register_validators(registrations)
+        })
+        .await
     }
 
     /// Fails over like any query: the envelope the node cached is only on the
@@ -601,6 +628,7 @@ mod tests {
             proposer_index,
             randao_reveal: BlsSignature([0; 96]),
             graffiti: Bytes32::default(),
+            builder_boost_factor: None,
         }
     }
 

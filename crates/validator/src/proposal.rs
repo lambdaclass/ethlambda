@@ -215,6 +215,7 @@ impl<B: BeaconNodeApi> ProposalService<B> {
             proposer_index: duty.validator_index,
             randao_reveal,
             graffiti,
+            builder_boost_factor: None,
         };
         let mut produced = self.beacon_node.produce_block(&request).await?;
 
@@ -431,6 +432,10 @@ impl<B: BeaconNodeApi> ProposalService<B> {
                 );
                 crate::metrics::inc_blocks_broadcast_not_imported();
             }
+            // `publish_block` never answers with these: a blinded block goes
+            // through `publish_blinded_block`, and `BuilderUnconfirmed` is
+            // built by this service, not by an implementation.
+            Published::HandedToBuilder | Published::BuilderUnconfirmed => {}
         }
         Ok(published)
     }

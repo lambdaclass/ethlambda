@@ -393,6 +393,7 @@ async fn block_production_without_an_execution_client_is_retryable() {
         proposer_index: 0,
         randao_reveal: Default::default(),
         graffiti: Default::default(),
+        builder_boost_factor: None,
     };
     let err = client.produce_block(&request).await.unwrap_err();
     assert!(matches!(err, Error::BeaconNodeSyncing), "got {err:?}");
@@ -610,6 +611,7 @@ async fn produce_with_pool(
         proposer_index: proposer,
         randao_reveal,
         graffiti: ethlambda_types::primitives::H256(graffiti),
+        builder_boost_factor: None,
     };
     let produced = client.produce_block(&request).await.unwrap();
     assert_eq!(produced.slot(), slot);
@@ -644,6 +646,8 @@ fn fulu_block(
     match &produced.contents {
         Contents::WithCellProofs { block, .. } | Contents::WithBlobProofs { block, .. } => block,
         Contents::Gloas { .. } => unreachable!("a fulu proposal"),
+        // These tests ask with no `builder_boost_factor`, so no blinded answer.
+        Contents::Blinded { .. } => unreachable!("builder proposals are off"),
     }
 }
 
@@ -1060,6 +1064,7 @@ async fn the_validator_client_can_serve_on_the_sync_committee() {
         proposer_index: proposer,
         randao_reveal,
         graffiti: Default::default(),
+        builder_boost_factor: None,
     };
     let produced = client.produce_block(&request).await.unwrap();
     let block_domain = get_domain(&advanced, DOMAIN_BEACON_PROPOSER, Some(epoch));
