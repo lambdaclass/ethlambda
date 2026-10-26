@@ -20,7 +20,7 @@ use ethlambda_types::beacon::primitives::{BlsPubkey, ExecutionBlockHash, Slot};
 use libssz::SszDecode as _;
 use reqwest::StatusCode;
 use reqwest::header::{self, HeaderMap};
-use tracing::debug;
+use tracing::info;
 
 use crate::metrics::observe_builder_request;
 
@@ -33,6 +33,14 @@ mod tests;
 pub use error::BuilderError;
 
 const JSON_CONTENT_TYPE: &str = "application/json";
+
+/// The most a builder answer may hold. A fulu bid at its list limits is
+/// under 2 MiB in SSZ and about twice that in JSON.
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// How much of an error body is kept: enough to read, not a proxy's
+/// whole error page in a log line or a 400 passed back to the caller.
+const MAX_ERROR_TEXT: usize = 1024;
 
 /// `getHeader`'s `Accept` while the URL still takes SSZ: SSZ preferred and
 /// JSON acceptable, so a JSON-only builder answers instead of refusing.
@@ -67,11 +75,13 @@ impl BuilderClient {
         header_timeout: Duration,
         user_agent: &str,
     ) -> Result<Self, BuilderError> {
+        let base_url = base_url.into();
+        reqwest::Url::parse(&base_url).map_err(|err| BuilderError::InvalidUrl(err.to_string()))?;
         let http = reqwest::Client::builder()
             .user_agent(user_agent)
             .build()
-            .map_err(|err| BuilderError::Transport(err.to_string()))?;
-        let base_url = base_url.into().trim_end_matches('/').to_owned();
+            .map_err(|err| BuilderError::Transport(err.without_url().to_string()))?;
+        let base_url = base_url.trim_end_matches('/').to_owned();
         Ok(Self {
             base_url,
             http,
@@ -111,17 +121,20 @@ impl BuilderClient {
             hex::encode(parent_hash.0),
             hex::encode(pubkey.0)
         );
-        let mut response = self.send_get_header(&path).await?;
-        if response.status() == StatusCode::NOT_ACCEPTABLE
-            && !self.json_only.load(Ordering::Relaxed)
-        {
-            self.fall_back_to_json();
-            response = self.send_get_header(&path).await?;
-        }
+        let asked_ssz = !self.json_only.load(Ordering::Relaxed);
+        let response = self.send_get_header(&path).await?;
         match response.status() {
             StatusCode::OK => decode_bid(response, self.header_timeout).await.map(Some),
             StatusCode::NO_CONTENT => Ok(None),
-            _ => Err(BuilderError::from_status(response).await),
+            status => {
+                // No retry: a second request would get a fresh timeout, and
+                // one call could then take twice the proposer's budget. The
+                // next call asks for JSON instead.
+                if status == StatusCode::NOT_ACCEPTABLE && asked_ssz {
+                    self.fall_back_to_json();
+                }
+                Err(BuilderError::from_status(response, self.header_timeout).await)
+            }
         }
     }
 
@@ -139,11 +152,11 @@ impl BuilderClient {
             .header("date-milliseconds", unix_millis().to_string())
             .send()
             .await
-            .map_err(|err| BuilderError::from_reqwest(&err, self.header_timeout))
+            .map_err(|err| BuilderError::from_reqwest(err, self.header_timeout))
     }
 
     fn fall_back_to_json(&self) {
-        debug!(url = %self.base_url, "Builder refused SSZ; using JSON from now on");
+        info!("Builder refused SSZ; using JSON from now on");
         self.json_only.store(true, Ordering::Relaxed);
     }
 
@@ -163,14 +176,11 @@ async fn decode_bid(
         .get("eth-consensus-version")
         .and_then(|value| value.to_str().ok())
         .map(str::to_ascii_lowercase);
-    let body = response
-        .bytes()
-        .await
-        .map_err(|err| BuilderError::from_reqwest(&err, deadline))?;
+    let body = read_body(response, deadline).await?;
 
     if ssz {
-        // builder-specs makes this header optional, but an SSZ body has no
-        // other way to name its fork, and the bid's shape depends on it.
+        // builder-specs requires this header on an SSZ answer, since nothing
+        // else in an SSZ body names its fork and the bid's shape depends on it.
         let version = named_fork.ok_or_else(|| {
             BuilderError::Incomplete("an SSZ bid without Eth-Consensus-Version".to_owned())
         })?;
@@ -179,12 +189,47 @@ async fn decode_bid(
             .map_err(|err| BuilderError::Decode(format!("{err:?}")))?;
         return Ok(VersionedBid { fork, bid });
     }
-    let envelope: JsonBid =
+    // Two typed passes over the same bytes, each ignoring the other's field,
+    // so the bid is never built as an intermediate `serde_json::Value`.
+    let Version { version } =
         serde_json::from_slice(&body).map_err(|err| BuilderError::Decode(err.to_string()))?;
-    let fork = bid_fork(&envelope.version.to_ascii_lowercase())?;
-    let bid = serde_json::from_value(envelope.data)
-        .map_err(|err| BuilderError::Decode(err.to_string()))?;
+    let fork = bid_fork(&version.to_ascii_lowercase())?;
+    let Data { data: bid } =
+        serde_json::from_slice(&body).map_err(|err| BuilderError::Decode(err.to_string()))?;
     Ok(VersionedBid { fork, bid })
+}
+
+/// The whole body, or `TooLarge` as soon as it would pass the cap.
+pub(super) async fn read_body(
+    mut response: reqwest::Response,
+    deadline: Duration,
+) -> Result<Vec<u8>, BuilderError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|err| BuilderError::from_reqwest(err, deadline))?
+    {
+        if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Err(BuilderError::TooLarge {
+                limit: MAX_RESPONSE_BYTES,
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// `text` cut to at most [`MAX_ERROR_TEXT`] bytes, at a char boundary.
+pub(super) fn truncate_error_text(mut text: String) -> String {
+    if text.len() > MAX_ERROR_TEXT {
+        let mut end = MAX_ERROR_TEXT;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
 }
 
 /// The fork `version` names, if its bids have the shape [`SignedBuilderBid`]
@@ -196,11 +241,16 @@ fn bid_fork(version: &str) -> Result<ForkName, BuilderError> {
     }
 }
 
-/// `getHeader`'s JSON body: the bid under `data`, its fork under `version`.
+/// `getHeader`'s JSON body holds its fork under `version`...
 #[derive(serde::Deserialize)]
-struct JsonBid {
+struct Version {
     version: String,
-    data: serde_json::Value,
+}
+
+/// ...and the bid under `data`.
+#[derive(serde::Deserialize)]
+struct Data {
+    data: SignedBuilderBid,
 }
 
 fn is_ssz(headers: &HeaderMap) -> bool {

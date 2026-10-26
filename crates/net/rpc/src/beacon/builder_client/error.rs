@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use reqwest::StatusCode;
 
+use super::{read_body, truncate_error_text};
+
 /// A failed builder API call.
 ///
 /// A Beacon API handler answers [`BadRequest`](Self::BadRequest) with the
@@ -31,13 +33,22 @@ pub enum BuilderError {
     /// A bid for a fork whose containers this node does not decode.
     #[error("builder offered a bid for {0}")]
     UnsupportedFork(String),
+    /// An answer longer than the client reads.
+    #[error("builder answer larger than {limit} bytes")]
+    TooLarge { limit: usize },
+    /// A builder URL that does not parse.
+    #[error("invalid builder url: {0}")]
+    InvalidUrl(String),
     /// A request body this node could not encode.
     #[error("request did not encode: {0}")]
     Encode(String),
 }
 
 impl BuilderError {
-    pub(super) fn from_reqwest(err: &reqwest::Error, deadline: Duration) -> Self {
+    /// The URL is dropped from the message: it may carry credentials, and
+    /// the error ends up in logs and response bodies.
+    pub(super) fn from_reqwest(err: reqwest::Error, deadline: Duration) -> Self {
+        let err = err.without_url();
         if err.is_timeout() {
             Self::Timeout(deadline)
         } else {
@@ -47,29 +58,31 @@ impl BuilderError {
 
     /// The error a status other than the call's success stands for. A 400
     /// carries the builder's `message`, or its raw body if it sent no JSON.
-    pub(super) async fn from_status(response: reqwest::Response) -> Self {
+    pub(super) async fn from_status(response: reqwest::Response, deadline: Duration) -> Self {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = read_body(response, deadline).await.unwrap_or_default();
+        let body = String::from_utf8_lossy(&body).into_owned();
         if status != StatusCode::BAD_REQUEST {
             return Self::Status {
                 status: status.as_u16(),
-                body,
+                body: truncate_error_text(body),
             };
         }
         let message = serde_json::from_str::<ErrorMessage>(&body)
             .map(|error| error.message)
             .unwrap_or(body);
-        Self::BadRequest(message)
+        Self::BadRequest(truncate_error_text(message))
     }
 
     /// How the call ended, as a metric label.
-    pub(super) fn label(&self) -> &'static str {
+    pub(crate) fn label(&self) -> &'static str {
         match self {
             Self::Timeout(_) => "timeout",
             Self::Transport(_) => "unreachable",
             Self::BadRequest(_) => "bad_request",
             Self::Status { .. } => "unexpected_status",
-            Self::Decode(_) | Self::Incomplete(_) => "invalid_response",
+            Self::Decode(_) | Self::Incomplete(_) | Self::TooLarge { .. } => "invalid_response",
+            Self::InvalidUrl(_) => "invalid_url",
             Self::UnsupportedFork(_) => "unsupported_fork",
             Self::Encode(_) => "encode",
         }

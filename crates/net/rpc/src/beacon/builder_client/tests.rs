@@ -1,5 +1,6 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use axum::http::StatusCode;
 use axum::http::header::ACCEPT;
 use ethlambda_types::beacon::builder::BuilderBid;
 use ethlambda_types::beacon::containers::deneb::{ExecutionPayloadHeader, KzgCommitments};
@@ -81,15 +82,20 @@ async fn a_relay_that_refuses_ssz_is_asked_for_json_from_then_on() {
     relay.offer(bid.clone());
     let client = client_for(&relay);
 
-    assert_eq!(get_header(&client).await.unwrap(), Some(bid.clone()));
+    // The refusal is not retried, since a retry would restart the clock the
+    // proposer is waiting on; it is only remembered.
+    assert!(matches!(
+        get_header(&client).await,
+        Err(BuilderError::Status { status: 406, .. })
+    ));
     assert_eq!(get_header(&client).await.unwrap(), Some(bid));
 
-    // The first request asks for SSZ and is refused; its retry and every
-    // later request ask for JSON only.
+    // The first request asks for SSZ and is refused; every later one asks
+    // for JSON only.
     let accepts = accept_headers(&relay);
-    assert_eq!(accepts.len(), 3);
+    assert_eq!(accepts.len(), 2);
     assert!(accepts[0].starts_with("application/octet-stream"));
-    assert_eq!(accepts[1..], ["application/json", "application/json"]);
+    assert_eq!(accepts[1], "application/json");
 }
 
 #[tokio::test]
@@ -166,5 +172,116 @@ async fn an_unreachable_relay_is_reported_as_such() {
     assert!(matches!(
         get_header(&client).await,
         Err(BuilderError::Transport(_))
+    ));
+}
+
+const JSON: &str = "application/json";
+const TEXT: &str = "text/plain";
+const SSZ: &str = "application/octet-stream";
+
+#[tokio::test]
+async fn a_400_carries_the_builders_message() {
+    let relay = MockRelay::start(GENESIS_FORK_VERSION).await;
+    let body = br#"{"code":400,"message":"Unknown hash"}"#.to_vec();
+    relay.answer_headers_with(StatusCode::BAD_REQUEST, JSON, body, None);
+    assert!(matches!(
+        get_header(&client_for(&relay)).await,
+        Err(BuilderError::BadRequest(message)) if message == "Unknown hash"
+    ));
+}
+
+#[tokio::test]
+async fn a_400_without_json_carries_its_body() {
+    let relay = MockRelay::start(GENESIS_FORK_VERSION).await;
+    relay.answer_headers_with(StatusCode::BAD_REQUEST, TEXT, b"nope".to_vec(), None);
+    assert!(matches!(
+        get_header(&client_for(&relay)).await,
+        Err(BuilderError::BadRequest(message)) if message == "nope"
+    ));
+}
+
+#[tokio::test]
+async fn a_long_error_is_cut_short() {
+    let relay = MockRelay::start(GENESIS_FORK_VERSION).await;
+    relay.answer_headers_with(StatusCode::BAD_REQUEST, TEXT, vec![b'x'; 5000], None);
+    let Err(BuilderError::BadRequest(message)) = get_header(&client_for(&relay)).await else {
+        panic!("expected a bad request");
+    };
+    assert!(message.len() <= 1024);
+}
+
+#[tokio::test]
+async fn a_server_error_is_an_unexpected_status() {
+    let relay = MockRelay::start(GENESIS_FORK_VERSION).await;
+    relay.answer_headers_with(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        TEXT,
+        b"boom".to_vec(),
+        None,
+    );
+    assert!(matches!(
+        get_header(&client_for(&relay)).await,
+        Err(BuilderError::Status { status: 500, .. })
+    ));
+}
+
+#[tokio::test]
+async fn garbage_ssz_does_not_decode() {
+    let relay = MockRelay::start(GENESIS_FORK_VERSION).await;
+    relay.answer_headers_with(StatusCode::OK, SSZ, vec![1, 2, 3], Some("fulu"));
+    assert!(matches!(
+        get_header(&client_for(&relay)).await,
+        Err(BuilderError::Decode(_))
+    ));
+}
+
+#[tokio::test]
+async fn malformed_json_does_not_decode() {
+    let relay = MockRelay::start(GENESIS_FORK_VERSION).await;
+    let body = br#"{"version":"fulu","data":"#.to_vec();
+    relay.answer_headers_with(StatusCode::OK, JSON, body, None);
+    assert!(matches!(
+        get_header(&client_for(&relay)).await,
+        Err(BuilderError::Decode(_))
+    ));
+}
+
+#[tokio::test]
+async fn an_uppercase_version_is_read() {
+    let relay = MockRelay::start(GENESIS_FORK_VERSION).await;
+    let bid = bid_from(&relay, ForkName::Fulu);
+    let body = serde_json::json!({ "version": "FULU", "data": bid.bid }).to_string();
+    relay.answer_headers_with(StatusCode::OK, JSON, body.into_bytes(), None);
+    let got = get_header(&client_for(&relay)).await.unwrap().unwrap();
+    assert_eq!(got.fork, ForkName::Fulu);
+    assert_eq!(got, bid);
+}
+
+#[tokio::test]
+async fn a_json_bid_for_another_fork_is_refused() {
+    let relay = MockRelay::start(GENESIS_FORK_VERSION).await;
+    relay.ignore_accept();
+    relay.offer(bid_from(&relay, ForkName::Deneb));
+    assert!(matches!(
+        get_header(&client_for(&relay)).await,
+        Err(BuilderError::UnsupportedFork(fork)) if fork == "deneb"
+    ));
+}
+
+#[tokio::test]
+async fn an_oversized_answer_is_refused() {
+    let relay = MockRelay::start(GENESIS_FORK_VERSION).await;
+    relay.answer_headers_with(StatusCode::OK, SSZ, vec![0; 9 * 1024 * 1024], Some("fulu"));
+    assert!(matches!(
+        get_header(&client_for(&relay)).await,
+        Err(BuilderError::TooLarge { .. })
+    ));
+}
+
+#[tokio::test]
+async fn an_invalid_url_is_refused_up_front() {
+    assert!(matches!(
+        BuilderClient::new("not a url", HEADER_TIMEOUT, "ethlambda/test"),
+        Err(BuilderError::InvalidUrl(_))
     ));
 }

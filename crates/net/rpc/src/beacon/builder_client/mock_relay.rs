@@ -34,6 +34,16 @@ struct RelayState {
     delay: Duration,
     bid: Option<VersionedBid>,
     header_requests: Vec<HeaderRequest>,
+    raw_answer: Option<RawAnswer>,
+}
+
+/// A fixed answer to every `getHeader`.
+#[derive(Clone)]
+struct RawAnswer {
+    status: StatusCode,
+    content_type: &'static str,
+    body: Vec<u8>,
+    consensus_version: Option<&'static str>,
 }
 
 /// One `getHeader` the relay received.
@@ -82,9 +92,26 @@ impl MockRelay {
         self.state.lock().unwrap().ignores_accept = true;
     }
 
-    /// Leave `Eth-Consensus-Version` off every answer.
+    /// Leave `Eth-Consensus-Version` off SSZ answers. JSON answers never carry
+    /// it, as MEV-Boost's do not.
     pub(crate) fn omit_consensus_version(&self) {
         self.state.lock().unwrap().omits_consensus_version = true;
+    }
+
+    /// Answer every `getHeader` with exactly this, whatever the request.
+    pub(crate) fn answer_headers_with(
+        &self,
+        status: StatusCode,
+        content_type: &'static str,
+        body: Vec<u8>,
+        consensus_version: Option<&'static str>,
+    ) {
+        self.state.lock().unwrap().raw_answer = Some(RawAnswer {
+            status,
+            content_type,
+            body,
+            consensus_version,
+        });
     }
 
     /// Hold every `getHeader` answer for `delay`.
@@ -135,6 +162,20 @@ async fn header(
         pubkey,
         headers: headers.clone(),
     });
+    if let Some(raw) = state.raw_answer.clone() {
+        let mut response = (
+            raw.status,
+            [(header::CONTENT_TYPE, raw.content_type)],
+            raw.body,
+        )
+            .into_response();
+        if let Some(version) = raw.consensus_version {
+            response
+                .headers_mut()
+                .insert("eth-consensus-version", HeaderValue::from_static(version));
+        }
+        return response;
+    }
     let accept = headers
         .get(header::ACCEPT)
         .and_then(|value| value.to_str().ok())
@@ -146,21 +187,21 @@ async fn header(
     let Some(VersionedBid { fork, bid }) = state.bid.clone() else {
         return StatusCode::NO_CONTENT.into_response();
     };
-    let mut response = if wants_ssz && !state.ignores_accept {
-        (
+    if wants_ssz && !state.ignores_accept {
+        let mut response = (
             [(header::CONTENT_TYPE, crate::SSZ_CONTENT_TYPE)],
             bid.to_ssz(),
         )
-            .into_response()
+            .into_response();
+        if !state.omits_consensus_version {
+            response.headers_mut().insert(
+                "eth-consensus-version",
+                HeaderValue::from_static(fork.as_str()),
+            );
+        }
+        response
     } else {
         let body = serde_json::json!({ "version": fork.as_str(), "data": bid }).to_string();
         ([(header::CONTENT_TYPE, "application/json")], body).into_response()
-    };
-    if !state.omits_consensus_version {
-        response.headers_mut().insert(
-            "eth-consensus-version",
-            HeaderValue::from_static(fork.as_str()),
-        );
     }
-    response
 }
