@@ -187,15 +187,25 @@ impl MockRelay {
 
     /// `message` as this relay sends it: naming the relay's key and signed
     /// with it under the builder domain.
-    pub(crate) fn sign_bid(&self, mut message: BuilderBid) -> SignedBuilderBid {
-        message.pubkey = self.pubkey();
+    pub(crate) fn sign_bid(&self, message: BuilderBid) -> SignedBuilderBid {
         let genesis_fork_version = self.state.lock().unwrap().genesis_fork_version;
-        let domain = compute_builder_domain(genesis_fork_version);
-        let root = compute_signing_root(message.hash_tree_root(), domain);
-        SignedBuilderBid {
-            message,
-            signature: sign_for(RELAY_KEY, root),
-        }
+        signed_bid(message, genesis_fork_version)
+    }
+}
+
+/// `message` signed by the mock relay's key under the builder domain of the
+/// chain whose genesis fork version is `genesis_fork_version`, naming that
+/// key.
+pub(crate) fn signed_bid(
+    mut message: BuilderBid,
+    genesis_fork_version: Version,
+) -> SignedBuilderBid {
+    message.pubkey = BlsPubkey(secret_key_for(RELAY_KEY).sk_to_pk().to_bytes());
+    let domain = compute_builder_domain(genesis_fork_version);
+    let root = compute_signing_root(message.hash_tree_root(), domain);
+    SignedBuilderBid {
+        message,
+        signature: sign_for(RELAY_KEY, root),
     }
 }
 
