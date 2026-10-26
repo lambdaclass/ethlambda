@@ -13,6 +13,9 @@
 //! checking every cell proof first, and gossips them with the block. A
 //! malformed bundle from the execution client is a 503 the validator client
 //! fails over on; a block whose blobs do not verify is a 400.
+//!
+//! The validator client's graffiti gets this node's and its execution client's
+//! versions appended, always; see [`super::graffiti`].
 
 use axum::{
     Extension, Router,
@@ -25,7 +28,7 @@ use axum::{
 use ethlambda_engine::{
     EngineClient, ForkchoiceStateV1,
     building::{BuiltPayload, PayloadAttributesV3},
-    types::uint256,
+    types::{ClientVersionV1, uint256},
 };
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
@@ -59,6 +62,7 @@ use libssz_types::SszList;
 use serde::Deserialize;
 use tracing::{error, info, warn};
 
+use crate::beacon::graffiti::{self, OwnVersion};
 use crate::beacon::{ApiError, validator::FeeRecipients, validator::head};
 use crate::shared::content::{Encoding, ssz_response, with_consensus_version};
 
@@ -342,12 +346,14 @@ fn require_fulu_slot(config: &Config, slot: Slot, message: &'static str) -> Resu
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn get_block(
     Path(slot): Path<String>,
     Query(query): Query<ProduceQuery>,
     State(store): State<Store>,
     Extension(engine): Extension<Option<EngineClient>>,
     Extension(fee_recipients): Extension<FeeRecipients>,
+    Extension(OwnVersion(own_version)): Extension<OwnVersion>,
     headers: HeaderMap,
 ) -> Response {
     let Ok(slot) = slot.parse::<Slot>() else {
@@ -373,6 +379,7 @@ async fn get_block(
         &store,
         &engine,
         &fee_recipients,
+        &own_version,
         slot,
         query.randao_reveal,
         graffiti,
@@ -414,6 +421,7 @@ async fn produce(
     store: &Store,
     engine: &EngineClient,
     fee_recipients: &FeeRecipients,
+    own_version: &ClientVersionV1,
     slot: Slot,
     randao_reveal: BlsSignature,
     graffiti: Bytes32,
@@ -430,8 +438,15 @@ async fn produce(
         ethlambda_state_transition::beacon::helpers::accessors::get_beacon_proposer_index(&state)
             .map_err(|_| ApiError::Internal("no proposer for the slot"))?;
 
-    let mut built =
-        build_payload(store, engine, fee_recipients, &state, head_root, proposer).await?;
+    // Asked alongside the build rather than before it, so a healthy execution
+    // client costs the block nothing for its version and a silent one costs it
+    // at most the version's own timeout.
+    let (built, el_version) = tokio::join!(
+        build_payload(store, engine, fee_recipients, &state, head_root, proposer),
+        graffiti::execution_client_version(engine, own_version),
+    );
+    let mut built = built?;
+    let graffiti = graffiti::with_client_versions(graffiti, el_version.as_ref(), own_version);
     let bundle = &built.blobs_bundle;
     let malformed = bundle.commitments.len() != bundle.blobs.len()
         || bundle.proofs.len() != bundle.blobs.len() * preset::CELLS_PER_EXT_BLOB;
@@ -511,6 +526,7 @@ async fn produce(
         bls_changes = block.body.bls_to_execution_changes.len(),
         transactions = block.body.execution_payload.transactions.len(),
         blobs = block.body.blob_kzg_commitments.len(),
+        graffiti = %graffiti::display(&block.body.graffiti),
         "Produced block"
     );
     let contents = FuluBlockContents {
@@ -633,7 +649,15 @@ mod tests {
         let app = routes()
             .with_state(store)
             .layer(Extension(None::<EngineClient>))
-            .layer(Extension(FeeRecipients::default()));
+            .layer(Extension(FeeRecipients::default()))
+            .layer(Extension(OwnVersion(Arc::new(
+                ethlambda_engine::types::ClientVersionV1 {
+                    code: "LA".to_string(),
+                    name: "ethlambda".to_string(),
+                    version: "ethlambda/test".to_string(),
+                    commit: "0x3c4d7e8f".to_string(),
+                },
+            ))));
         let uri = format!(
             "/eth/v3/validator/blocks/{}?randao_reveal=0x{}",
             head_slot + 1,

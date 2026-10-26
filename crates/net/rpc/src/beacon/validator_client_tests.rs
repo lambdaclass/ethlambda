@@ -43,12 +43,23 @@ use ethlambda_validator::{
 
 use ethlambda_storage::Store;
 
-use crate::test_utils::{RecordingNetwork, beacon_store_at};
+use crate::test_utils::{RecordingNetwork, beacon_store_at, idle_engine};
 
 const COUNT: usize = 64;
 
+/// The version this node reports for itself, as `ethlambda beacon` builds it.
+fn own_version() -> ethlambda_engine::types::ClientVersionV1 {
+    ethlambda_engine::types::ClientVersionV1 {
+        code: "LA".to_string(),
+        name: "ethlambda".to_string(),
+        version: "ethlambda/test".to_string(),
+        commit: "0x3c4d7e8f".to_string(),
+    }
+}
+
 /// A fulu head state at the first slot of the wall clock's current epoch, with
-/// its proposer lookahead filled in, served over HTTP on an ephemeral port.
+/// its proposer lookahead filled in, served over HTTP on an ephemeral port,
+/// by a node with no execution client.
 async fn serve() -> (HttpBeaconNode, BeaconState, Arc<RecordingNetwork>) {
     serve_with_engine(None).await
 }
@@ -60,7 +71,17 @@ async fn serve_with_engine(
     (client, state, network)
 }
 
-/// [`serve_with_engine`], also naming the socket it listens on.
+/// [`serve_with_engine`], also handing back the served store, for a test that
+/// changes what the node knows while it runs. It is a handle onto the same
+/// store the router reads.
+async fn serve_with_store(
+    engine: Option<ethlambda_engine::EngineClient>,
+) -> (HttpBeaconNode, BeaconState, Arc<RecordingNetwork>, Store) {
+    let (client, state, network, _, store) = serve_at(engine).await;
+    (client, state, network, store)
+}
+
+/// [`serve_with_store`], also naming the socket it listens on.
 async fn serve_at(
     engine: Option<ethlambda_engine::EngineClient>,
 ) -> (
@@ -136,7 +157,10 @@ async fn spawn_server(
         .layer(Extension(payload_pool.clone()))
         .layer(Extension(crate::CustodyColumns(Vec::new())))
         .layer(Extension(crate::beacon::validator::FeeRecipients::default()))
-        .layer(Extension(engine));
+        .layer(Extension(engine))
+        .layer(Extension(crate::beacon::graffiti::OwnVersion(Arc::new(
+            own_version(),
+        ))));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -147,9 +171,12 @@ async fn spawn_server(
 }
 
 /// One slot of an attester's work, in the order `ethlambda validator` does it.
+///
+/// The node has an execution client, since it refuses attestation data
+/// without one. None of these calls reach it.
 #[tokio::test]
 async fn the_validator_client_can_attest_through_this_node() {
-    let (client, state, network) = serve().await;
+    let (client, state, network) = serve_with_engine(idle_engine()).await;
     let slot = state.slot();
     let epoch = compute_epoch_at_slot(slot);
 
@@ -288,6 +315,32 @@ fn signed_aggregate(
         compute_signing_root(message.hash_tree_root(), domain),
     );
     SignedAggregateAndProof { message, signature }
+}
+
+/// On a head its execution client has not validated, the node refuses to hand
+/// out a vote, and the client reads that refusal the way it reads a node still
+/// syncing: as one to fail over from, and not as a malformed answer. Both ways
+/// of noticing agree, the per-request 503 and `/node/syncing`.
+#[tokio::test]
+async fn an_optimistic_head_is_one_the_client_will_not_attest_through() {
+    let (client, state, _, mut store) = serve_with_store(idle_engine()).await;
+    let (_slot, head_root) = store.beacon_head().expect("the anchor is the head");
+    store.insert_beacon_optimistic_root(head_root, state.slot());
+
+    let err = client
+        .attestation_data(state.slot(), ForkName::Fulu)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::BeaconNodeSyncing), "got {err:?}");
+    assert!(err.is_retryable());
+    assert!(client.is_optimistic_or_syncing().await.unwrap());
+
+    store.remove_beacon_optimistic_root(head_root);
+    client
+        .attestation_data(state.slot(), ForkName::Fulu)
+        .await
+        .expect("a validated head is attested to again");
+    assert!(!client.is_optimistic_or_syncing().await.unwrap());
 }
 
 /// Without an execution client to build a payload with, block production
@@ -442,6 +495,12 @@ async fn fake_execution_client_with(
                         "executionRequests": [],
                     })
                 }
+                Some("engine_getClientVersionV1") => serde_json::json!([{
+                    "code": "RH",
+                    "name": "reth",
+                    "version": "v1.0.0",
+                    "commit": "0x1a2b5c6d",
+                }]),
                 _ => serde_json::Value::Null,
             };
             Json(serde_json::json!({ "jsonrpc": "2.0", "id": request["id"], "result": result }))
@@ -494,16 +553,23 @@ async fn produce_with_pool(
         compute_signing_root(epoch.hash_tree_root(), randao_domain),
     );
 
+    let mut graffiti = [0u8; 32];
+    graffiti[..5].copy_from_slice(b"hello");
     let request = BlockRequest {
         slot,
         fork: ForkName::Fulu,
         proposer_index: proposer,
         randao_reveal,
-        graffiti: Default::default(),
+        graffiti: ethlambda_types::primitives::H256(graffiti),
     };
     let produced = client.produce_block(&request).await.unwrap();
     assert_eq!(produced.slot(), slot);
     assert_eq!(produced.proposer_index(), proposer);
+    // The proposer's text, then both clients' codes and commits: the
+    // execution client's from `engine_getClientVersionV1`, this node's own.
+    let mut expected = [0u8; 32];
+    expected[..18].copy_from_slice(b"hello RH1a2bLA3c4d");
+    assert_eq!(fulu_block(&produced).body.graffiti.0, expected);
 
     let block_domain = get_domain(&advanced, DOMAIN_BEACON_PROPOSER, Some(epoch));
     let signature = sign_for(
@@ -839,7 +905,7 @@ mod gloas {
             store,
             head_root,
             ..
-        } = serve_gloas(32, None).await;
+        } = serve_gloas(32, idle_engine()).await;
         let slot = state.slot();
         let epoch = compute_epoch_at_slot(slot);
         assert_eq!(
@@ -982,7 +1048,7 @@ mod gloas {
             head_root,
             context,
             ..
-        } = serve_gloas(32, None).await;
+        } = serve_gloas(32, idle_engine()).await;
         let slot = state.slot();
         let epoch = compute_epoch_at_slot(slot);
         let config = config();
@@ -1126,8 +1192,16 @@ mod gloas {
         let pubkey = state.validator(proposer).unwrap().pubkey;
         import_published_block(store, network.clone(), advanced.clone());
 
-        let service =
-            ProposalService::new(Arc::new(client), context, Bytes32::repeat_byte(0xab), None);
+        let service = ProposalService::new(
+            Arc::new(client),
+            context,
+            Arc::new(
+                ethlambda_validator::proposer_settings::ProposerSettings::new(
+                    Bytes32::repeat_byte(0xab),
+                    None,
+                ),
+            ),
+        );
         let duty = ProposerDutyDto {
             pubkey: encode_hex(&pubkey.0),
             validator_index: proposer,

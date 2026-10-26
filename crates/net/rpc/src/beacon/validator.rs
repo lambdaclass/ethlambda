@@ -15,6 +15,7 @@ use axum::{
     routing::{get, post},
 };
 use ethlambda_blockchain::{SyncStatusController, metrics::SyncStatus};
+use ethlambda_engine::EngineClient;
 use ethlambda_storage::Store;
 use ethlambda_types::{
     beacon::{
@@ -90,9 +91,13 @@ struct SyncDuty {
 ///
 /// Answered from the head state: its `current_sync_committee` for an epoch in
 /// the head's own sync committee period, its `next_sync_committee` for the
-/// period after, which is as far ahead as the Beacon API allows. An earlier
-/// period is refused rather than answered from a historical state, since a
-/// validator client only ever asks about the current and next period.
+/// period after. The upper bound is the wall clock's, as the Beacon API
+/// defines it: the period after the current one. When the head lags the clock
+/// across a period boundary, the later period is read from a copy of the head
+/// advanced (through fork choice's checkpoint-state cache, on a blocking
+/// thread) to the first epoch of the period before it. An earlier period than
+/// the head's is refused rather than answered from a historical state, since
+/// a validator client only ever asks about the current and next period.
 ///
 /// A requested validator that holds no seat is left out of `data`. The
 /// answer is `503` while the node is syncing: the head state's committees are
@@ -106,10 +111,8 @@ async fn post_sync_duties(
     if sync_status.get() == SyncStatus::Syncing {
         return ApiError::ServiceUnavailable("the node is syncing").into_response();
     }
-    match sync_duties(&store, &epoch, &indices) {
-        Ok(body) => crate::json_response(body),
-        Err(err) => err.into_response(),
-    }
+    let computed = tokio::task::spawn_blocking(move || sync_duties(&store, &epoch, &indices)).await;
+    duties_response(computed)
 }
 
 fn sync_duties(
@@ -123,21 +126,40 @@ fn sync_duties(
         .map(|index| index.parse::<ValidatorIndex>())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| ApiError::BadRequest("invalid validator index"))?;
-    let (head_root, state) = head(store)?;
+    let (head_root, head_state) = head(store)?;
 
+    // Bounded by the wall clock, as the Beacon API defines it: up to the
+    // period after the current one. The head lags the clock at a period
+    // boundary whose block is late or missing, so the head's own period only
+    // sets the bound when it is ahead of the clock.
+    let head_period = compute_sync_committee_period(compute_epoch_at_slot(head_state.slot()));
+    let clock_period =
+        compute_sync_committee_period(compute_epoch_at_slot(crate::beacon::node::wall_slot(store)));
+    let requested_period = compute_sync_committee_period(epoch);
+    if requested_period < head_period || requested_period > head_period.max(clock_period) + 1 {
+        return Err(ApiError::BadRequest(
+            "epoch is outside the sync committee periods the node serves duties for",
+        ));
+    }
+
+    // The head state answers its own period and the next. A later one (the
+    // head is behind the clock) is read from a copy of the head advanced to
+    // the first epoch of the period before it, whose `next_sync_committee` is
+    // the requested one.
+    let state = if requested_period <= head_period + 1 {
+        head_state
+    } else {
+        let first_epoch = (requested_period - 1) * preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
+        state_for_epoch(store, head_root, first_epoch)?
+    };
+    let state_period = compute_sync_committee_period(compute_epoch_at_slot(state.slot()));
     let (current, next) = state
         .sync_committees()
         .map_err(|_| ApiError::BadRequest("sync committees start at altair"))?;
-    let head_period = compute_sync_committee_period(compute_epoch_at_slot(state.slot()));
-    let requested_period = compute_sync_committee_period(epoch);
-    let committee = if requested_period == head_period {
+    let committee = if requested_period == state_period {
         current
-    } else if requested_period == head_period + 1 {
-        next
     } else {
-        return Err(ApiError::BadRequest(
-            "epoch is not in the head state's current or next sync committee period",
-        ));
+        next
     };
 
     // One pass over the committee rather than one per requested validator:
@@ -349,6 +371,42 @@ pub(crate) fn head(store: &Store) -> Result<(H256, Arc<BeaconState>), ApiError> 
         .map_err(|_| ApiError::Internal("store read failed"))?
         .ok_or(ApiError::Internal("head state not found"))?;
     Ok((root, state))
+}
+
+/// Refuses with a `503` while `root`'s execution payload is still unvalidated.
+///
+/// For the endpoints whose answer a validator signs over a block root:
+/// `optimistic-sync.md` forbids an optimistic validator to attest, and the
+/// Beacon API makes it the node's job to refuse ("A 503 error must be returned
+/// if the block identified by the response `beacon_block_root` is
+/// optimistic"). The validator client cannot tell on its own, since execution
+/// status never reaches it, and a `503` is also what sends it to its next
+/// beacon node.
+///
+/// Not a lasting refusal: a `VALID` from the execution client clears the root,
+/// and the actor asks through `forkchoiceUpdated` at least once a slot.
+pub(crate) fn require_validated(store: &Store, root: H256) -> Result<(), ApiError> {
+    if crate::shared::optimistic::block_is_optimistic(store, root) {
+        return Err(ApiError::ServiceUnavailable(
+            "the block's execution payload has not been validated yet",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses with a `503` on a node run without an execution client.
+///
+/// [`require_validated`]'s companion, for the same endpoints. Nothing
+/// validates a payload on such a node: blocks import as
+/// `PayloadValidity::NotRequired` and never join the optimistic set, so
+/// [`require_validated`] alone would pass a block that nobody checked.
+pub(crate) fn require_execution_client(engine: &Option<EngineClient>) -> Result<(), ApiError> {
+    if engine.is_none() {
+        return Err(ApiError::ServiceUnavailable(
+            "no execution client configured to validate payloads with",
+        ));
+    }
+    Ok(())
 }
 
 /// The newest epoch a duties request may name: one past the later of the wall
@@ -683,6 +741,7 @@ struct AttestationDataQuery {
     /// Ignored, and optional since gloas's beacon-APIs dropped it: from electra
     /// on the committee travels outside `AttestationData`, whose `index` no
     /// longer names it, so every committee of a slot attests to the same data.
+    /// Parsed rather than dropped so a malformed value is still a `400`.
     #[allow(dead_code)]
     committee_index: Option<CommitteeIndex>,
 }
@@ -705,11 +764,21 @@ struct AttestationDataQuery {
 ///   payload-present flag instead; see [`payload_present_index`].
 ///
 /// A slot before the head's, or more than one slot past the wall clock, is
-/// refused: neither is a slot a validator is asked to attest to.
+/// refused: neither is a slot a validator is asked to attest to. So is an
+/// optimistic head, with a `503` (see [`require_validated`]); because of the
+/// first refusal, the head is always the `beacon_block_root` answered.
+///
+/// So is every request, with a `503`, on a node run without an execution
+/// client (see [`require_execution_client`]). Block production refuses the
+/// same way, for its own reason.
 async fn get_attestation_data(
     Query(query): Query<AttestationDataQuery>,
     State(store): State<Store>,
+    Extension(engine): Extension<Option<EngineClient>>,
 ) -> Response {
+    if let Err(err) = require_execution_client(&engine) {
+        return err.into_response();
+    }
     match attestation_data(&store, query.slot) {
         Ok(data) => crate::json_response(serde_json::json!({ "data": data })),
         Err(err) => err.into_response(),
@@ -724,6 +793,7 @@ fn attestation_data(store: &Store, slot: Slot) -> Result<AttestationData, ApiErr
     if slot > crate::beacon::node::wall_slot(store) + 1 {
         return Err(ApiError::BadRequest("slot is in the future"));
     }
+    require_validated(store, head_root)?;
 
     let epoch = compute_epoch_at_slot(slot);
     let epoch_start = compute_start_slot_at_epoch(epoch);
@@ -796,7 +866,7 @@ fn payload_present_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::beacon_store_at;
+    use crate::test_utils::{beacon_store_at, idle_engine};
     use axum::{
         body::Body,
         http::{Request, StatusCode},
@@ -1205,17 +1275,29 @@ mod tests {
         state
     }
 
+    /// `attestation_data` for `slot`, from a node whose execution client is
+    /// `engine`.
+    async fn fetch_attestation_data(
+        store: Store,
+        slot: Slot,
+        engine: Option<EngineClient>,
+    ) -> (StatusCode, serde_json::Value) {
+        let uri = format!("/eth/v1/validator/attestation_data?slot={slot}&committee_index=0");
+        let request = Request::get(uri).body(Body::empty()).unwrap();
+        let app = routes().with_state(store).layer(Extension(engine));
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
     async fn attestation_data_for(
         state: BeaconState,
         slot: Slot,
     ) -> (StatusCode, serde_json::Value, H256) {
         let (store, head_root) = beacon_store_at(state);
-        let uri = format!("/eth/v1/validator/attestation_data?slot={slot}&committee_index=0");
-        let request = Request::get(uri).body(Body::empty()).unwrap();
-        let response = routes().with_state(store).oneshot(request).await.unwrap();
-        let status = response.status();
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        (status, serde_json::from_slice(&body).unwrap(), head_root)
+        let (status, json) = fetch_attestation_data(store, slot, idle_engine()).await;
+        (status, json, head_root)
     }
 
     #[tokio::test]
@@ -1272,6 +1354,62 @@ mod tests {
             json["data"]["source"]["root"],
             format!("{}", H256::repeat_byte(0xaa))
         );
+    }
+
+    /// No vote for a head the execution client has not validated, and an
+    /// answer again once it has. The refusal is a 503, the status the Beacon
+    /// API names and the one a validator client fails over on.
+    #[tokio::test]
+    async fn an_optimistic_head_is_a_503_until_it_is_validated() {
+        let state = fulu_state_at(0);
+        let slot = state.slot();
+        let (mut store, head_root) = beacon_store_at(state);
+
+        store.insert_beacon_optimistic_root(head_root, slot);
+        let (status, json) = fetch_attestation_data(store.clone(), slot, idle_engine()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["code"], 503);
+
+        store.remove_beacon_optimistic_root(head_root);
+        let (status, _) = fetch_attestation_data(store, slot, idle_engine()).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// Without an execution client no head is ever optimistic, since nothing
+    /// was asked, so the optimistic check alone would answer. The node refuses
+    /// outright instead.
+    #[tokio::test]
+    async fn a_node_without_an_execution_client_is_a_503() {
+        let state = fulu_state_at(0);
+        let slot = state.slot();
+        let (store, head_root) = beacon_store_at(state);
+        assert!(!store.is_beacon_optimistic(head_root));
+
+        let (status, json) = fetch_attestation_data(store, slot, None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["code"], 503);
+    }
+
+    /// `committee_index` is deprecated and optional, and gloas clients are
+    /// told to omit it, so a request without one is answered. A malformed one
+    /// is still refused.
+    #[tokio::test]
+    async fn committee_index_may_be_omitted() {
+        let state = fulu_state_at(0);
+        let slot = state.slot();
+        let (store, _root) = beacon_store_at(state);
+        let fetch = |uri: String| {
+            let app = routes()
+                .with_state(store.clone())
+                .layer(Extension(idle_engine()));
+            app.oneshot(Request::get(uri).body(Body::empty()).unwrap())
+        };
+
+        let response = fetch(format!("/eth/v1/validator/attestation_data?slot={slot}"));
+        assert_eq!(response.await.unwrap().status(), StatusCode::OK);
+        let malformed = format!("/eth/v1/validator/attestation_data?slot={slot}&committee_index=x");
+        let response = fetch(malformed);
+        assert_eq!(response.await.unwrap().status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -1383,6 +1521,7 @@ mod tests {
         let (store, _root) = crate::test_utils::beacon_store_with_config(state, config);
         let response = routes()
             .with_state(store)
+            .layer(Extension(crate::test_utils::idle_engine()))
             .oneshot(request(head_epoch, head_slot))
             .await
             .unwrap();
@@ -1481,7 +1620,12 @@ mod tests {
     async fn gloas_index(store: Store, slot: Slot) -> (StatusCode, serde_json::Value) {
         // No `committee_index`: gloas's request omits it.
         let request = get_request(format!("/eth/v1/validator/attestation_data?slot={slot}"));
-        let response = routes().with_state(store).oneshot(request).await.unwrap();
+        let response = routes()
+            .with_state(store)
+            .layer(Extension(idle_engine()))
+            .oneshot(request)
+            .await
+            .unwrap();
         let status = response.status();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         (status, serde_json::from_slice(&body).unwrap())
@@ -1642,13 +1786,125 @@ mod tests {
             );
         }
 
+        /// `post_sync` on a store whose wall clock is at `clock_slot`.
+        async fn post_sync_at_clock(
+            state: BeaconState,
+            clock_slot: u64,
+            epoch: u64,
+            indices: &[&str],
+        ) -> (StatusCode, serde_json::Value) {
+            let (store, _root) = crate::test_utils::beacon_store_at_clock(state, clock_slot);
+            let request = Request::post(format!("/eth/v1/validator/duties/sync/{epoch}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!(indices).to_string()))
+                .unwrap();
+            let app = routes()
+                .with_state(store)
+                .layer(Extension(SyncStatusController::default()));
+            let response = app.oneshot(request).await.unwrap();
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            (status, serde_json::from_slice(&body).unwrap_or_default())
+        }
+
+        /// Adapted from a head-relative bound: the wall clock now decides how
+        /// far a request may reach, so the clock is pinned to the head's
+        /// period, where the period after next is past it.
         #[tokio::test]
         async fn the_period_after_next_is_a_400() {
             let state = state_with_committees();
             let period = compute_sync_committee_period(compute_epoch_at_slot(state.slot()));
             let epoch = preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD * (period + 2);
-            let (status, _) = post_sync(state, epoch, &["3"], Default::default()).await;
+            let clock_slot = state.slot();
+            let (status, _) = post_sync_at_clock(state, clock_slot, epoch, &["3"]).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+
+        /// The head in the last epoch of period 0, the wall clock at the first
+        /// slot of period 1: a validator client asks for period 2, which only
+        /// a state advanced across the boundary knows.
+        fn lagging_head() -> (BeaconState, u64) {
+            let mut state = state_with_committees();
+            let BeaconState::Fulu(fulu) = &mut state else {
+                unreachable!("built as fulu")
+            };
+            fulu.slot = (preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD - 1) * preset::SLOTS_PER_EPOCH;
+            let boundary_slot =
+                compute_start_slot_at_epoch(preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD);
+            (state, boundary_slot)
+        }
+
+        #[tokio::test]
+        async fn a_head_lagging_a_period_boundary_serves_the_period_after_from_an_advanced_state() {
+            let (state, boundary_slot) = lagging_head();
+            let mut advanced = state.clone();
+            ethlambda_state_transition::beacon::stf::process_slots(
+                &mut advanced,
+                boundary_slot,
+                &ethlambda_types::beacon::config::Config::mainnet(),
+            )
+            .unwrap();
+            let (_, expected) = advanced.sync_committees().unwrap();
+            let (_, head_next) = state.sync_committees().unwrap();
+            assert_ne!(
+                expected.pubkeys, head_next.pubkeys,
+                "the boundary must rotate the committee, or the test proves nothing"
+            );
+
+            let period_after = preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD * 2;
+            let indices: Vec<String> = (0..COUNT as u64).map(|i| i.to_string()).collect();
+            let refs: Vec<&str> = indices.iter().map(String::as_str).collect();
+            let (status, json) =
+                post_sync_at_clock(state.clone(), boundary_slot, period_after, &refs).await;
+            assert_eq!(status, StatusCode::OK);
+
+            let mut want = Vec::new();
+            for index in 0..COUNT as u64 {
+                let pubkey = advanced.validator(index).unwrap().pubkey;
+                let held: Vec<String> = expected
+                    .pubkeys
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, key)| **key == pubkey)
+                    .map(|(seat, _)| seat.to_string())
+                    .collect();
+                if !held.is_empty() {
+                    want.push((index.to_string(), held));
+                }
+            }
+            assert!(!want.is_empty());
+            let got: Vec<(String, Vec<String>)> = json["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|duty| {
+                    let seats = duty["validator_sync_committee_indices"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|seat| seat.as_str().unwrap().to_string())
+                        .collect();
+                    (duty["validator_index"].as_str().unwrap().to_string(), seats)
+                })
+                .collect();
+            assert_eq!(got, want);
+        }
+
+        #[tokio::test]
+        async fn a_head_lagging_a_period_boundary_still_refuses_two_periods_past_the_clock() {
+            let (state, boundary_slot) = lagging_head();
+            let epoch = preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD * 3;
+            let (status, _) = post_sync_at_clock(state, boundary_slot, epoch, &["3"]).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn a_head_lagging_a_period_boundary_serves_the_clocks_own_period_from_the_head() {
+            let (state, boundary_slot) = lagging_head();
+            let epoch = preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
+            let (status, json) = post_sync_at_clock(state, boundary_slot, epoch, &["9"]).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(json["data"][0]["validator_index"], "9");
         }
 
         /// An earlier period would need a historical state, which a validator

@@ -21,6 +21,7 @@ pub(crate) mod envelopes;
 pub(crate) mod events;
 pub(crate) mod genesis;
 pub(crate) mod gloas_proposal;
+pub(crate) mod graffiti;
 pub(crate) mod headers;
 pub(crate) mod node;
 pub(crate) mod operations;
