@@ -71,7 +71,9 @@ docker run -d --name ethlambda-beacon --network ethereum --stop-signal SIGINT \
 
 To run the consensus layer only, drop ethrex, the shared network, the JWT secret
 and the two `--execution-*` flags. The node then follows the chain without
-validating execution payloads:
+validating execution payloads. It cannot serve a validator client, since it
+answers attestation data, aggregation and block production requests with
+`503`:
 
 ```sh
 docker pull ghcr.io/lambdaclass/ethlambda:beacon
