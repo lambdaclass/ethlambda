@@ -715,6 +715,32 @@ pub fn get_ptc(
         })
 }
 
+/// The slot of `epoch` in which each of `validators` sits in the payload
+/// timeliness committee, from `get_ptc_assignment` (gloas `validator.md`).
+///
+/// The specification answers one validator at a time, each call walking the
+/// epoch's slots; this walks them once for the whole set. A validator with
+/// several seats gets its first slot, as `get_ptc_assignment` returns, and one
+/// in no committee of the epoch is absent. `epoch` must be one [`get_ptc`]
+/// can answer from `state`.
+pub fn get_ptc_assignments(
+    state: &BeaconState,
+    epoch: Epoch,
+    validators: &std::collections::HashSet<ValidatorIndex>,
+    config: &Config,
+) -> Result<std::collections::HashMap<ValidatorIndex, Slot>> {
+    let mut assignments = std::collections::HashMap::new();
+    let first_slot = compute_start_slot_at_epoch(epoch);
+    for slot in first_slot..first_slot + preset::SLOTS_PER_EPOCH {
+        for validator_index in get_ptc(state, slot, config)? {
+            if validators.contains(&validator_index) {
+                assignments.entry(validator_index).or_insert(slot);
+            }
+        }
+    }
+    Ok(assignments)
+}
+
 /// The same payload attestation with its attesters named rather than
 /// bit-encoded, the payload-attestation counterpart of
 /// [`super::electra::get_indexed_attestation`].

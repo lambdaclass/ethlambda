@@ -284,7 +284,8 @@ implementation's, so none of the [common flags](#common-flags) apply to it.
 
 ### What it does today
 
-Attestations, block proposals and attestation aggregation.
+Attestations, block proposals and attestation aggregation, and from gloas on
+the self-built payload envelope and the payload timeliness committee vote.
 
 Each epoch it resolves its validators' indices, fetches their attester duties
 for this epoch and the next, fetches this epoch's proposer duties, subscribes
@@ -327,17 +328,38 @@ computing its `hash_tree_root`, which only the typed container can give; a
 hand-written JSON mapping of an execution payload would be a large surface on
 which a single wrong field silently produces a signature over the wrong block.
 
+From gloas on a proposal is two messages. The client asks for the block with
+`include_payload=true` (`produceBlockV4`), publishes the block bare, then signs
+the envelope with the proposer's own key under the builder domain and publishes
+it with its blobs and cell proofs (`Eth-Blob-Data-Included: true`). Both go out as
+SSZ. The envelope shares the proposal's budget (the attester offset, below), so
+a proposal that overruns it is abandoned wherever it is. A failure to publish
+the envelope is logged at error and counted, and does not fail the proposal. A
+block that commits to a builder's bid is left alone.
+
+Each epoch it also fetches the payload timeliness committee duties for the
+validators it holds, for this epoch and the next when they are gloas ones. A member sleeps until `PAYLOAD_ATTESTATION_DUE_BPS` of the
+slot, asks the node for the
+payload attestation data, signs it under the PTC domain and submits it. A `204`
+(the node knows no block for the slot) means no vote. So a gloas slot runs in
+this order: propose at the boundary, attest at `ATTESTATION_DUE_BPS_GLOAS`,
+aggregate at `AGGREGATE_DUE_BPS_GLOAS`, then the committee vote. The attestation
+and the committee vote are each bounded by the end of the slot.
+
 Not implemented: the builder flow and blinded blocks (the client asks for an
 unblinded block and refuses a blinded one), sync-committee duties, voluntary
 exits, doppelganger protection and remote signing.
 
 ### Duty offsets come from the network
 
-The slot length and the two duty offsets are read from the beacon node's
+The slot length and the duty offsets are read from the beacon node's
 `/eth/v1/config/spec`, not divided out of a compiled-in constant. The
 specification states them as `SLOT_DURATION_MS` plus basis points of it,
 `ATTESTATION_DUE_BPS` and `AGGREGATE_DUE_BPS`, which on mainnet's 12-second slot
-work out at 3999 ms and 8000 ms.
+work out at 3999 ms and 8000 ms. Gloas moves both earlier
+(`ATTESTATION_DUE_BPS_GLOAS`, `AGGREGATE_DUE_BPS_GLOAS`) and adds
+`PAYLOAD_ATTESTATION_DUE_BPS` (and `PAYLOAD_DUE_BPS`, which the node uses), so
+the clock picks the pair by the fork of each slot's own epoch.
 
 `SECONDS_PER_SLOT` no longer exists in the specification and is accepted only as
 a fallback, since deployed nodes still send it. A node sending both is required

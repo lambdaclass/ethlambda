@@ -259,7 +259,17 @@ pub struct BuilderExitRequest {
 /// What the payload timeliness committee attests to: whether the slot's
 /// payload was revealed on time and whether its blob data is available.
 #[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct PayloadAttestationData {
     pub beacon_block_root: Root,
@@ -281,7 +291,17 @@ pub struct PayloadAttestation {
 
 /// One payload timeliness committee member's unaggregated vote, gossiped
 /// before an aggregator folds it into a [`PayloadAttestation`].
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 pub struct PayloadAttestationMessage {
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub validator_index: ValidatorIndex,
@@ -464,15 +484,72 @@ pub struct NewPayloadRequest {
 /// Electra's shape (EIP-7549's wide `committee_bits`/`aggregation_bits`),
 /// with `aggregation_bits` now the unbounded [`AggregationBits`] rather than
 /// electra's bounded `SszBitlist<MAX_VALIDATORS_PER_SLOT>`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 #[ssz(progressive_container)]
 pub struct Attestation {
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
     pub aggregation_bits: AggregationBits,
     pub data: AttestationData,
     pub signature: BlsSignature,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
     pub committee_bits: CommitteeBits,
+}
+
+impl From<&super::electra::Attestation> for Attestation {
+    /// The same vote in gloas's container: every field carries over unchanged,
+    /// only `aggregation_bits` moves from electra's bounded bitlist to the
+    /// progressive one. A pool that holds electra-shaped aggregates (the
+    /// shape gossip and the Beacon API agree on until the fork) serves gloas
+    /// readers through this.
+    fn from(attestation: &super::electra::Attestation) -> Self {
+        let source = &attestation.aggregation_bits;
+        let mut aggregation_bits = AggregationBits::with_length(source.len());
+        for index in (0..source.len()).filter(|&index| source.get(index) == Some(true)) {
+            aggregation_bits
+                .set(index, true)
+                .expect("the index is below the length the bitlist was built with");
+        }
+        Self {
+            aggregation_bits,
+            data: attestation.data,
+            signature: attestation.signature,
+            committee_bits: attestation.committee_bits.clone(),
+        }
+    }
+}
+
+impl TryFrom<&Attestation> for super::electra::Attestation {
+    type Error = libssz_types::TypeError;
+
+    /// The inverse of the conversion above, for a gloas aggregate entering a
+    /// pool that stores electra's shape. Fails only when the bits exceed
+    /// electra's `MAX_VALIDATORS_PER_SLOT` bound, which no aggregate a real
+    /// committee assignment produces can reach.
+    fn try_from(attestation: &Attestation) -> Result<Self, Self::Error> {
+        let source = &attestation.aggregation_bits;
+        let mut aggregation_bits = super::electra::AggregationBits::with_length(source.len())?;
+        for index in (0..source.len()).filter(|&index| source.get(index) == Some(true)) {
+            aggregation_bits
+                .set(index, true)
+                .expect("the index is below the length the bitlist was built with");
+        }
+        Ok(Self {
+            aggregation_bits,
+            data: attestation.data,
+            signature: attestation.signature,
+            committee_bits: attestation.committee_bits.clone(),
+        })
+    }
 }
 
 /// An attestation with its attesters named rather than bit-encoded, the same
@@ -499,7 +576,17 @@ pub struct AttesterSlashing {
 /// An aggregate together with proof that its aggregator was selected to
 /// produce it. Unchanged in shape from electra: `aggregate` simply carries
 /// gloas's own, wider [`Attestation`] now.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 pub struct AggregateAndProof {
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub aggregator_index: ValidatorIndex,
@@ -507,7 +594,17 @@ pub struct AggregateAndProof {
     pub selection_proof: BlsSignature,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 pub struct SignedAggregateAndProof {
     pub message: AggregateAndProof,
     pub signature: BlsSignature,
