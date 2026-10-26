@@ -64,6 +64,17 @@ same keys, already signed.
   close the shapes reachable through ordinary operation: a backward wall-clock
   step, or a duty schedule replaced mid-epoch. Both are held in memory only, so
   a restart empties them and neither knows anything about any other process.
+- **Gloas messages:** a gloas proposer also signs an execution payload
+  envelope, and a payload timeliness committee member signs a payload
+  attestation. Neither is slashable, so neither has a guard. An envelope is
+  published once per proposal, right after its block, and a failure to publish it
+  is logged at error and counted without failing the proposal. A PTC vote has an
+  in-memory dedup of `(validator, slot)` pairs recorded at signing time
+  (`PayloadAttestationService`), so a duty abandoned between signing and
+  submission is lost rather than re-signed. It is emptied by a restart and says
+  nothing about another process, so it is not slashing protection either: a
+  second, different vote for one slot is equivocation that peers penalize in
+  gossip, not a slashing.
 - **Why a proposer slashing is the worse of the two:** a double vote needs a
   second validator's attestation to be caught. Two signed block headers for one
   slot are the whole of the evidence on their own.
@@ -81,6 +92,91 @@ same keys, already signed.
 - **Operationally:** do not run these keys in any other client while this one
   runs, and treat a restart as an event that needs the same care a manual key
   move would. The client warns about this at startup on every run.
+
+## Self-build only
+
+The gloas validator duties are served for a proposer that builds its own
+payload, and for no one else.
+
+- **The specification:** a gloas proposer may take a builder's signed bid
+  (`SignedExecutionPayloadBid`, from gossip or a builder API) instead of building
+  its own payload, and publishes a `SignedProposerPreferences` so builders know
+  its fee recipient and gas limit target. `produceBlockV4` takes a
+  `BuilderConfig` (`min_bid`, `builder_boost_factor`, `builders`) to steer that
+  choice.
+- **ethlambda:** the beacon node never takes a bid, from gossip or otherwise, and
+  never builds or reads a `SignedProposerPreferences`. `produceBlockV4` decodes
+  the `BuilderConfig` body (a missing or undecodable one is a `400`, as the
+  specification requires) and ignores it, logging at debug when it names
+  builders. Every block commits to a zero-value self-build bid
+  (`BUILDER_INDEX_SELF_BUILD`, the G2 point at infinity as signature), and
+  `Eth-Consensus-Block-Value` is always `0` since there is nothing to compare.
+  The validator client signs the envelope with the proposer's own key under
+  `DOMAIN_BEACON_BUILDER`, and leaves a block that commits to anyone else's bid
+  alone.
+- **Why:** a scope decision for the first gloas duties: taking bids needs a bid
+  pool, builder payment handling and a builder-facing API, none of which this
+  node has.
+- **Consequence:** a validator run through this node never earns a builder's
+  payment, and an execution client's own block value is what
+  `Eth-Execution-Payload-Value` reports.
+
+## `target_gas_limit` is the parent bid's gas limit
+
+- **The specification:** the payload is built toward the `target_gas_limit` of
+  the proposer's `SignedProposerPreferences`, and `bid.gas_limit` must be
+  compatible with it (`is_gas_limit_target_compatible`).
+- **ethlambda:** with no preferences to read, `PayloadAttributesV4.targetGasLimit`
+  is the `gas_limit` of `latest_execution_payload_bid` of the state being built
+  on (`gloas_payload_inputs`), so the execution client holds the gas limit where
+  it is.
+- **Equivalence:** the bid is built from the payload the execution client
+  returns, so `bid.gas_limit` is whatever that payload carries and is always
+  consistent with the block. A validator that wants the limit to move cannot say
+  so through this node: it follows the previous block's.
+
+## `skip_randao_verification` is ignored
+
+- **The specification:** `produceBlockV4`'s `skip_randao_verification` lets a
+  caller skip the node's check of `randao_reveal`; when it is set, the reveal
+  must be the point at infinity.
+- **ethlambda:** the parameter is accepted and not honored. The block's state
+  root comes from running it through the state transition, which verifies the
+  reveal, so the endpoint checks the reveal against the slot's proposer up front
+  and answers `400` (`invalid randao_reveal`) for one that does not verify,
+  infinity included.
+- **Consequence:** a caller cannot get a block without a real reveal. Every
+  caller this client knows of (including its own validator client) sends one.
+
+## A pre-gloas head counts as FULL in `attestation_data.index`
+
+- **The specification:** at a gloas slot `data.index` is `0` when the attested
+  block is from the attestation's own slot, and otherwise `0` for an `EMPTY` and
+  `1` for a `FULL` payload status in the validator's fork choice. It does not say
+  which a pre-gloas block is.
+- **ethlambda:** at a gloas slot `data.index` is `0` when the head block is from
+  the requested slot, `1` when fork choice holds the head's payload as FULL
+  (`Store::head_payload_status`, or one `get_head_node` walk when none is
+  recorded), and `1` for a pre-gloas head, the same boundary rule
+  [fork choice applies](#the-fulu-to-gloas-fork-choice-boundary). So the first
+  gloas slots vote for the last fulu block's payload.
+- **Why:** the vote should name the node fork choice itself walks to, and
+  that rule makes a pre-gloas block's one node FULL.
+
+## `payload_present` is judged by the envelope's arrival time
+
+- **The specification:** a PTC member sets `payload_present` when it has
+  received the block's envelope by `get_payload_due_ms()` into the slot.
+- **ethlambda:** `GET payload_attestation_data` compares the time the envelope
+  reached the node (`Store::beacon_envelope_seen_ms`, recorded by the chain
+  actor from the arrival time of the envelope, not the time it finished
+  verifying; the earliest arrival wins) with the slot's start plus
+  `get_payload_due_ms()`. An envelope held for its block or columns is
+  therefore judged by when it came, as the rule intends. The record lives in
+  memory only, pruned with the execution block hash cache.
+- **Consequence:** a restart forgets it. Only the slot in flight can be wrong
+  (a member asked after a restart answers `payload_present = false` for an
+  envelope that arrived before it), and the next slot's record starts fresh.
 
 ## `/eth/v1/node/identity` reports no ENR
 
@@ -174,3 +270,224 @@ processing here even where the specification never reaches the failing check.
   same `safe_sub`. The randomized equivalence tests keep the finalized epoch
   behind the previous one for this reason: past it, the fast path and the
   specification-shaped reference fail at different points.
+
+## The fulu-to-gloas fork-choice boundary
+
+The gloas fork-choice text describes only a store anchored at a gloas block, so
+it says nothing about a tree that crosses from fulu into gloas, which is the
+tree every live follower holds at the fork epoch.
+
+- **The specification:** `get_parent_payload_status` reads the parent block's
+  execution payload bid, which a fulu parent does not have. Consensus-specs
+  issue #5096 asked what a pre-gloas parent should answer and was closed as
+  not planned. Pull request #5125 is open, as of this writing, and proposes
+  `PENDING`.
+- **ethlambda:** a pre-gloas block is a single node whose payload status is
+  `FULL`, since its payload ran inside the block and never had an empty branch.
+  Concretely, `get_parent_payload_status` of a gloas block with a pre-gloas
+  parent answers `FULL`; a pre-gloas block's only child (`get_node_children`) is
+  its `FULL` node; a vote for one (`get_supported_node`) supports that node
+  whatever its `payload_present` says; and `gloas_get_ancestor` stepping onto
+  one lands on `FULL`. Its payload also counts as verified, timely and available
+  (`is_payload_verified`, `payload_timeliness`, `payload_data_availability`), so
+  the first gloas block passes `on_block` and an `index == 1` vote for the last
+  fulu block passes `validate_on_attestation`.
+- **Which rules the head uses:** `get_head_node` runs one bottom-up walk for
+  every fork, and the current slot's fork, not the head block's or the
+  justified checkpoint's, selects its two fork-dependent rules. From
+  `GLOAS_FORK_EPOCH` on, blocks carry the payload dimension their bids give
+  them and the proposer boost is gated by `should_apply_proposer_boost`; before
+  it, every block is a single full node and the boost applies whenever it is
+  set. `compute_head` and `gloas_get_head` are the references the walk is
+  tested against.
+- **Other clients:** Lodestar and Prysm also treat a pre-gloas parent as
+  `FULL`. Lighthouse (v8.2.2) answers `EMPTY` for a pre-gloas parent, although
+  #5125 describes its handling as `PENDING`.
+- **Consequence:** if #5125 lands, only the answers above change, and each is
+  named in the header comment of `fork_choice.rs`'s gloas section.
+
+## The gloas head tolerates state the specification asserts on
+
+Three places in the gloas head read something the specification would abort on,
+because a live node holds gaps a fixture tree never has. Each is marked
+"Implementation choice, not spec text" at its definition. The head the node
+runs is `walk_head` (through `get_head_node`) over the weights of
+`compute_node_weights`; the spec-literal references carry the same tolerances so
+that the tests compare like with like.
+
+- **Pruned votes** (`compute_node_weights`; in the references,
+  `get_attestation_score`, and through it `is_head_weak` and
+  `is_parent_strong`, the latter reached from `get_proposer_head`). A vote
+  for a root missing from the block index contributes nothing, where
+  `get_ancestor` would raise. Pruning removes only entries below the finalized
+  slot, and every root scored is indexed at or above it, so such a vote cannot
+  descend from the scored root and the specification's own contribution for it
+  is zero too.
+- **Unknown voters** (`compute_node_weights`; `gloas_get_attestation_score` in
+  the reference). A vote for a root the store never held is skipped, where
+  `get_supported_node` would raise, so one stale voter cannot abort a head
+  computation. The walk drops a block pruned from the index but still in the
+  store the same way, with the pruned votes above; the reference does not skip
+  it, and its vote walks the block table and contributes nothing.
+- **Missing timeliness** (`should_apply_proposer_boost`). A candidate with no
+  `block_timeliness` entry reads as not timely by either deadline, where the
+  specification indexes the entry directly. A gloas block's entry is persisted
+  (`Table::BlockTimeliness`) and reloaded on resume; a pre-gloas block's is in
+  memory only, so a restart empties it. The reading can only miss withholding a boost from an
+  early equivocation, never withhold one wrongly.
+- **Equivalence:** each is the specification's answer wherever the specification
+  has one; they differ only where it would have raised.
+
+## The envelope check reads the cached state root
+
+`verify_execution_payload_envelope` compares `envelope.beacon_block_root` with
+the root of the state's latest block header.
+
+- **The specification:** sets `header.state_root = hash_tree_root(state)` on a
+  copy of the header. That is exact for a state fresh out of block processing,
+  whose `latest_block_header.state_root` is still zero.
+- **ethlambda:** uses `BeaconState::compute_state_root`. The function's caller
+  hands it a stored state, and this repository writes the real root into that
+  header field as soon as the block's transition returns. Hashing such a state
+  would hash a header whose `state_root` is already set, a different value from
+  the one the header committed to, and every stored state's envelope would fail.
+  `compute_state_root` returns the cached value only while the state is still
+  at that block's slot and the field is set, and hashes otherwise, so both
+  shapes give the same root.
+- **Equivalence:** the same check, on both kinds of state.
+
+## The attestation deadline takes the epoch that picks the fork's rule
+
+- **The specification:** `get_attestation_due_ms()` takes no argument, and
+  gloas replaces it with a function that reads `ATTESTATION_DUE_BPS_GLOAS`.
+- **ethlambda:** one `get_attestation_due_ms(epoch, config)`
+  (`fork_choice.rs`) that reads the basis points of the fork `epoch` falls in
+  (`ForkRules::of`), so both sides of the fulu-to-gloas boundary share it.
+- **Equivalence:** the same deadline for every slot, since the epoch is the
+  one the specification's own per-fork function would have been selected for.
+
+## The head is one bottom-up walk, not the specification's per-node `get_weight`
+
+The specification's gloas `get_head` calls `get_weight` for every candidate
+node, and each call walks every latest message and every ancestor step.
+
+- **ethlambda:** `get_head_node` computes every node's attestation score in one
+  pass over the latest messages and one over the blocks (highest slot first),
+  folding each block's total into the payload node of its parent that it builds
+  on, then descends from the justified checkpoint over that table. The proof
+  that the fold equals `get_attestation_score` for every node, from
+  `is_ancestor`'s definition, is in the `fork_choice.rs` section "The head
+  computation". The proposer boost is added along the boosted block's chain
+  after `should_apply_proposer_boost` has read the parent's score from the same
+  table, so that gate no longer re-walks the votes either.
+- **Few decodes:** a block's fork and parent payload status are recorded as a
+  `BlockPayloadLink` when `on_block` imports it, and the head's slot reads
+  come from the block index, so a head computation decodes no block in the
+  ordinary case. Two cases still decode. A block imported before a restart has
+  no entry (the scratch is in memory), and the walk derives it once by
+  decoding the block and its parent and records it; the actor does the same for
+  each new finalized root before pruning links. And a weak boosted-block parent
+  from the previous slot scans same-slot candidates for an early equivocation,
+  which needs their proposer indexes; that scan is rare and bounded by the
+  candidates at one slot.
+- **Bounded at the finalized block:** vote placement, the fold and the boost
+  chain stop at the least of the finalized block's slot, the justified block's
+  slot and the boosted block's parent's slot, which on a live node is the
+  finalized block's. The other two terms make the bound safe without assuming
+  that the justified block and the boosted block's parent are at or above the
+  finalized block. Finality pruning drops the block index rows below the
+  finalized block's own slot, so on a live node the index already starts
+  there; the bound holds the walk to that window whatever the index still
+  keeps below it. Links below the finalized block are pruned because nothing
+  reads them.
+- **No boost outside the justified subtree:** the specification evaluates
+  `should_apply_proposer_boost` whenever a boost root is set. The walk skips
+  the boost, gate included, when the boosted block is not under the justified
+  root: the boost reaches only that block's ancestors, none of which the
+  descent compares, so the head is the same. It also keeps the gate from
+  reading a parent that finality pruning removed after the boost was set,
+  which would otherwise fail the head computation until the next slot.
+- **Cost:** work is proportional to the latest messages plus the indexed
+  blocks at or above the finalized block, the unfinalized window. The
+  spec-literal form is proportional to the messages times the
+  candidate nodes, with block decodes at each ancestor step and for each voter,
+  which would wedge the chain actor on a large tree.
+- **Equivalence:** the walk names the head and gives every node at or above the
+  finalized block the weight the specification's `get_head` and `get_weight`
+  do, wherever they do not raise; the tolerances above are the only
+  differences. The fixture harness checks the head at every `head` step and
+  every viable leaf's weight, and a seeded randomized test checks both over
+  trees that cross the fork boundary.
+- **Why still tested against the spec-literal form:** `gloas_get_head` and
+  `gloas_get_weight` remain, as the references the walk is compared with, at
+  every `head` check of every fork-choice fixture and on randomized trees;
+  `compute_head` is the pre-gloas reference.
+
+## The execution client judges a gloas payload before the envelope is applied
+
+`verify_execution_payload_envelope` asks the execution engine last, as part of
+one boolean function. The follower runs the pure consensus checks first
+(`check_execution_payload_envelope`: signature, bid, state, data availability),
+then asks the engine with `engine_newPayloadV5` only about an envelope that
+passed them, and records it with `accept_execution_payload_envelope`. The
+engine's part is answered "valid" inside the checks because its answer has
+three outcomes and the specification's `ExecutionEngine` has two.
+
+- **`VALID`:** applied; the payload is recorded `VALID`.
+- **`SYNCING` / `ACCEPTED`:** applied, since the consensus checks passed and the
+  payload is `NOT_VALIDATED` (`optimistic-sync.md`); recorded `SYNCING`, which
+  the attestation gossip rules already read as not yet validated. A later
+  `forkchoiceUpdated` `VALID` for the head, or for a descendant payload, moves
+  it and every optimistic payload on that chain to `VALID`. Unlike a pre-gloas
+  block there is no `is_optimistic_candidate_block` gate: a payload is applied
+  to a block the consensus layer already imported, so there is no
+  merge-transition poisoning to guard against.
+- **`INVALID`:** not applied, so the FULL node of the block never exists; the
+  payload is recorded `INVALID`, children held for it are dropped and later
+  blocks that name it as their FULL parent are dropped instead of held. The
+  block itself and its EMPTY branch stay. `latestValidHash` can reach further
+  back, in which case the first payload after it is condemned the same way
+  (`beacon_payloads::resolve_invalid_payload`, which skips blocks that carry no
+  payload, unlike the pre-gloas `resolve_invalid_block`). A `forkchoiceUpdated`
+  `INVALID` for a payload already applied removes it again (its FULL node, its
+  stored envelope, and every child built on it).
+- **A hash mismatch (`INVALID_BLOCK_HASH`, or `INVALID` with a null
+  `latestValidHash`):** the envelope's contents do not hash to the block hash it
+  claims, so only that envelope (by its own root) is refused; the root's
+  payload is not condemned, since the builder's real envelope may still arrive.
+  ethrex has no `INVALID_BLOCK_HASH` status: it answers a block hash mismatch
+  with `INVALID` and a null `latestValidHash`, and an executed-and-failed
+  payload with `INVALID` and its last valid ancestor. So a null one is read as
+  a mismatch and a non-null one as the payload being invalid. A payload that
+  failed with no valid ancestor to name is read as a mismatch too, which only
+  costs a refused envelope.
+- **No answer after the retry ladder:** the payload is not applied, as for a
+  block, but unlike a block the envelope is consensus-valid and already held,
+  so it is kept and the per-slot redrive asks again, about the oldest held
+  envelope only and the rest once that ask is answered, so a down client costs
+  one retry ladder per slot however many wait. It is not fetched again:
+  that would repeat the ladder for every copy that arrives.
+
+`latestValidHash` and `VALID` follow the execution-layer chain, not every
+verified ancestor: a gloas block's EL parent is the ancestor whose payload hash
+is its `bid.parent_block_hash`, skipping blocks it built past on their EMPTY
+node, and a pre-gloas block's is its parent. Both walks stop at finality.
+
+## `forkchoiceUpdated` for a gloas head
+
+- The head hash follows the head node: `bid.block_hash` for a FULL head,
+  `bid.parent_block_hash` for an EMPTY one. A head whose payload status has not
+  been computed yet is skipped.
+- `finalized_block_hash` is the finalized block's `bid.parent_block_hash`, as
+  the specification has it.
+- `safe_block_hash` is the justified block's `bid.parent_block_hash`. The
+  specification's `get_safe_execution_block_hash` is built on fast
+  confirmation, which the follower does not run, so this is the fallback. It
+  can only be older than the confirmed block, which keeps it safe.
+- A pre-gloas checkpoint block, including one beneath a gloas head, keeps its
+  own payload hash.
+- The call is V4 with the node's custody columns when the head block is gloas,
+  and V3 before; `engine_newPayloadV5` is for envelopes and V4 for pre-gloas
+  blocks.
+- A hash of zero is "nothing to say" on either fork, so a payload whose hash is
+  zero (the fixtures' placeholder) sends no `forkchoiceUpdated`.

@@ -231,7 +231,12 @@ mod tests {
         BeaconWire {
             fork_digest: [0x8c, 0x9f, 0x62, 0xfe],
             fork: ForkName::Fulu,
+            schedule: crate::beacon::fork_schedule::ForkSchedule::new(
+                &Config::mainnet(),
+                Root::ZERO,
+            ),
             topics: topics::BeaconTopics::new([0x8c, 0x9f, 0x62, 0xfe], &[], &[]),
+            window_topics: Vec::new(),
             config: Config::mainnet(),
             genesis_time: 1_606_824_023,
             genesis_validators_root: Root::ZERO,

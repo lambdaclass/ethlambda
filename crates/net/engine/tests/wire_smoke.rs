@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use ethlambda_engine::types::{ForkchoiceStateV1, PayloadStatusValue};
+use ethlambda_engine::types::{CustodyColumns, ForkchoiceStateV1, PayloadStatusValue};
 use ethlambda_engine::{EngineClient, EngineError, JwtSecret};
 use ethlambda_types::beacon::primitives::ExecutionBlockHash;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -133,4 +133,91 @@ async fn an_rpc_error_envelope_surfaces_typed_and_is_not_retried() {
         }
         other => panic!("expected an Rpc error, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn new_payload_v5_sends_four_params_under_its_own_method() {
+    use ethlambda_types::beacon::containers::{bellatrix, gloas};
+    use ethlambda_types::beacon::preset;
+    use ethlambda_types::beacon::primitives::{Bytes32, ExecutionAddress, Root, Uint256};
+
+    let (endpoint, seen) = serve_once(
+        r#"{"jsonrpc":"2.0","id":1,"result":{"status":"VALID","latestValidHash":"0x0505050505050505050505050505050505050505050505050505050505050505","validationError":null}}"#,
+    )
+    .await;
+
+    let payload = gloas::ExecutionPayload {
+        parent_hash: ExecutionBlockHash::ZERO,
+        fee_recipient: ExecutionAddress::ZERO,
+        state_root: Bytes32::ZERO,
+        receipts_root: Bytes32::ZERO,
+        logs_bloom: bellatrix::LogsBloom::try_from(vec![0u8; preset::BYTES_PER_LOGS_BLOOM])
+            .expect("built at exactly BYTES_PER_LOGS_BLOOM"),
+        prev_randao: Bytes32::ZERO,
+        block_number: 1,
+        gas_limit: 1,
+        gas_used: 0,
+        timestamp: 1,
+        extra_data: Default::default(),
+        base_fee_per_gas: Uint256::ZERO,
+        block_hash: ExecutionBlockHash::repeat_byte(5),
+        transactions: Default::default(),
+        withdrawals: Default::default(),
+        blob_gas_used: 0,
+        excess_blob_gas: 0,
+        // 0xc0 is the RLP of an empty list, the smallest BAL an execution
+        // client accepts as well-formed.
+        block_access_list: vec![0xc0u8].try_into().expect("fits"),
+        slot_number: 77,
+    };
+    let status = client(endpoint)
+        .new_payload_v5(
+            &payload,
+            &[Bytes32::repeat_byte(1)],
+            Root::repeat_byte(2),
+            &[vec![0x00, 0xaa]],
+        )
+        .await
+        .expect("the mock answers");
+
+    assert_eq!(status.status, PayloadStatusValue::Valid);
+
+    let request = seen.lock().await.clone().expect("the mock saw a request");
+    let (_, body) = request.split_once("\r\n\r\n").expect("a request body");
+    let body: serde_json::Value = serde_json::from_str(body).expect("a JSON body");
+    assert_eq!(body["method"], "engine_newPayloadV5");
+    let params = body["params"].as_array().expect("an array of params");
+    assert_eq!(params.len(), 4);
+    assert_eq!(params[0]["slotNumber"], "0x4d");
+    assert_eq!(params[0]["blockAccessList"], "0xc0");
+    assert_eq!(params[1][0], format!("0x{}", "01".repeat(32)));
+    assert_eq!(params[2], format!("0x{}", "02".repeat(32)));
+    assert_eq!(params[3][0], "0x00aa");
+}
+
+#[tokio::test]
+async fn forkchoice_updated_v4_sends_three_params_and_parses_syncing() {
+    let (endpoint, seen) = serve_once(
+        r#"{"jsonrpc":"2.0","id":1,"result":{"payloadStatus":{"status":"SYNCING","latestValidHash":null,"validationError":null},"payloadId":null}}"#,
+    )
+    .await;
+
+    let state = ForkchoiceStateV1 {
+        head_block_hash: ExecutionBlockHash::repeat_byte(1),
+        safe_block_hash: ExecutionBlockHash::repeat_byte(2),
+        finalized_block_hash: ExecutionBlockHash::repeat_byte(3),
+    };
+    let columns = CustodyColumns::from_indices([0, 9]);
+    let status = client(endpoint)
+        .forkchoice_updated_v4(&state, columns)
+        .await
+        .expect("the mock answers");
+
+    assert_eq!(status.status, PayloadStatusValue::Syncing);
+
+    let request = seen.lock().await.clone().expect("the mock saw a request");
+    assert!(request.contains("engine_forkchoiceUpdatedV4"));
+    assert!(request.contains("headBlockHash"));
+    // The attributes are null and the bitmap follows them.
+    assert!(request.contains(",null,\"0x01020000000000000000000000000000\"]"));
 }

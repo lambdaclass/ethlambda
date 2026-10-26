@@ -10,7 +10,6 @@
 use sha2::{Digest as _, Sha256};
 
 use crate::beacon::config::Config;
-use crate::beacon::constants;
 use crate::beacon::containers::shared::ForkData;
 use crate::beacon::fork::ForkName;
 use crate::beacon::primitives::{Epoch, ForkDigest, HashTreeRoot as _, Root, Version};
@@ -54,21 +53,6 @@ pub fn compute_fork_digest(
     let mask = hasher.finalize();
 
     core::array::from_fn(|index| base.0[index] ^ mask[index])
-}
-
-/// The next epoch at which [`compute_fork_digest`] changes, if there is one.
-///
-/// Both fork activations and blob-schedule entries qualify: crossing either one
-/// strands a running node on topic names no peer is publishing to. Unscheduled
-/// forks carry [`constants::FAR_FUTURE_EPOCH`], a real value rather than a
-/// `None`, so they are filtered out before the minimum is taken.
-pub fn next_fork_boundary(config: &Config, epoch: Epoch) -> Option<Epoch> {
-    ForkName::ALL
-        .into_iter()
-        .map(|fork| config.fork_epoch(fork))
-        .chain(config.blob_schedule.iter().map(|entry| entry.epoch))
-        .filter(|&boundary| boundary != constants::FAR_FUTURE_EPOCH && boundary > epoch)
-        .min()
 }
 
 #[cfg(test)]
@@ -128,26 +112,6 @@ mod tests {
             compute_fork_digest(&config, gvr, 419_071),
             compute_fork_digest(&config, gvr, 419_072)
         );
-    }
-
-    #[test]
-    fn next_boundary_covers_both_fork_and_blob_schedule_epochs() {
-        let config = Config::mainnet();
-        // A plain fork boundary.
-        assert_eq!(next_fork_boundary(&config, 0), Some(74_240));
-        // A blob-parameter-only fork is a boundary too: it moves the digest.
-        assert_eq!(next_fork_boundary(&config, 411_392), Some(412_672));
-        assert_eq!(next_fork_boundary(&config, 412_672), Some(419_072));
-        // Past the last scheduled boundary there is nothing left to warn about.
-        assert_eq!(next_fork_boundary(&config, 419_072), None);
-    }
-
-    #[test]
-    fn far_future_forks_are_not_boundaries() {
-        // Minimal leaves every fork after phase0 at FAR_FUTURE_EPOCH, which is a
-        // real, enormous Epoch rather than a None; treating it as a boundary
-        // would schedule a warning for the heat death of the universe.
-        assert_eq!(next_fork_boundary(&Config::minimal(), 0), None);
     }
 
     #[test]
