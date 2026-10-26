@@ -1,6 +1,7 @@
-//! The BLS fixture vectors (`general/.../bls/eth_*`) for the wrapper that now
-//! lives in `ethlambda_crypto::bls`. They stay in this crate because the
-//! fixture tree and the `beacon-spec-tests` feature that gates them are here.
+//! The BLS fixture vectors (`cryptography-specs/tests/bls/eth_*`) for the
+//! wrapper that now lives in `ethlambda_crypto::bls`. They stay in this crate
+//! because the `beacon-spec-tests` feature that gates them is here, beside the
+//! rest of the fixture-driven tests.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,39 +15,36 @@ use super::bls::{eth_aggregate_pubkeys, eth_fast_aggregate_verify, verify};
 /// The root the two BLS handlers this module tests live under.
 ///
 /// BLS test vectors are configuration-independent (they do not touch any
-/// preset constant), so they live under `general` rather than under a
-/// preset name; see `crates/blockchain/state_transition/tests/beacon_spec/mod.rs` for the layout the
-/// rest of the crate's spec tests share. This module keeps its own tiny,
-/// local copy of just enough of that layout to run these two suites,
-/// rather than depending on that harness.
+/// preset constant). Since v1.7.0-alpha.13 (consensus-specs #5398) they ship
+/// from `ethereum/cryptography-specs` rather than consensus-spec-tests, in a
+/// flat `tests/bls/<handler>/<case>/` layout with no suite level; see
+/// `crates/blockchain/state_transition/tests/beacon_spec/mod.rs` for the
+/// layout the rest of the crate's spec tests share. This module keeps its
+/// own tiny, local copy of just enough of that layout to run these two
+/// suites, rather than depending on that harness.
 fn handler_root(handler: &str) -> PathBuf {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../consensus-spec-tests/tests/general/altair/bls")
+        .join("../../../cryptography-specs/tests/bls")
         .join(handler);
     assert!(
         root.is_dir(),
-        "BLS spec fixtures are missing from {}; run `make consensus-spec-tests`",
+        "BLS spec fixtures are missing from {}; run `make cryptography-specs`",
         root.display()
     );
     root
 }
 
-/// Every case's `data.yaml` under a handler: one directory level for the
-/// handler's suite (named `bls` in every release seen so far), one for the
-/// case itself.
+/// Every case's `data.yaml` under a handler.
 fn fixture_cases(handler: &str) -> Vec<PathBuf> {
     let mut cases = Vec::new();
-    for suite in fs::read_dir(handler_root(handler)).unwrap() {
-        let suite_path = suite.unwrap().path();
-        if !suite_path.is_dir() {
+    for case in fs::read_dir(handler_root(handler)).unwrap() {
+        let case_path = case.unwrap().path();
+        if !case_path.is_dir() {
             continue;
         }
-        for case in fs::read_dir(&suite_path).unwrap() {
-            let case_path = case.unwrap().path();
-            let data = case_path.join("data.yaml");
-            if data.is_file() {
-                cases.push(data);
-            }
+        let data = case_path.join("data.yaml");
+        if data.is_file() {
+            cases.push(data);
         }
     }
     cases
@@ -78,7 +76,7 @@ struct EthAggregatePubkeysCase {
 #[test]
 #[cfg_attr(
     not(feature = "beacon-spec-tests"),
-    ignore = "needs the consensus-spec fixture tree; run `make consensus-spec-tests`"
+    ignore = "needs the BLS test vectors; run `make cryptography-specs`"
 )]
 fn eth_aggregate_pubkeys_matches_spec_fixtures() {
     let mut executed = 0;
@@ -150,7 +148,7 @@ fn parse_fast_aggregate_verify_case(path: &Path) -> (Vec<BlsPubkey>, Root, BlsSi
 #[test]
 #[cfg_attr(
     not(feature = "beacon-spec-tests"),
-    ignore = "needs the consensus-spec fixture tree; run `make consensus-spec-tests`"
+    ignore = "needs the BLS test vectors; run `make cryptography-specs`"
 )]
 fn eth_fast_aggregate_verify_matches_spec_fixtures() {
     let mut executed = 0;
@@ -170,7 +168,7 @@ fn eth_fast_aggregate_verify_matches_spec_fixtures() {
 #[test]
 #[cfg_attr(
     not(feature = "beacon-spec-tests"),
-    ignore = "needs the consensus-spec fixture tree; run `make consensus-spec-tests`"
+    ignore = "needs the BLS test vectors; run `make cryptography-specs`"
 )]
 fn verify_accepts_a_known_good_vector_from_the_fixtures() {
     // `eth_fast_aggregate_verify_valid_0` has exactly one signer. A
@@ -179,7 +177,6 @@ fn verify_accepts_a_known_good_vector_from_the_fixtures() {
     // known-good input for `verify` without this module needing its own
     // signing function to produce one.
     let path = handler_root("eth_fast_aggregate_verify")
-        .join("bls")
         .join("eth_fast_aggregate_verify_valid_0")
         .join("data.yaml");
     let (pubkeys, message, signature, expected) = parse_fast_aggregate_verify_case(&path);

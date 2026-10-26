@@ -19,6 +19,7 @@ use crate::beacon::containers::BeaconState;
 use crate::beacon::error::Result;
 use crate::beacon::fork::ForkName;
 use crate::beacon::hash::hash;
+use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
     Bytes32, CommitteeIndex, Domain, DomainType, Epoch, Gwei, Root, Slot, ValidatorIndex,
@@ -82,8 +83,7 @@ pub fn get_randao_mix(state: &BeaconState, epoch: Epoch) -> Bytes32 {
 /// The validators active at `epoch`.
 pub fn get_active_validator_indices(state: &BeaconState, epoch: Epoch) -> Vec<ValidatorIndex> {
     state
-        .validators()
-        .iter()
+        .iter_validators()
         .enumerate()
         .filter(|(_, validator)| is_active_validator(validator, epoch))
         .map(|(index, _)| index as ValidatorIndex)
@@ -171,7 +171,7 @@ pub fn get_committee_count_per_slot(state: &BeaconState, epoch: Epoch) -> u64 {
 /// # Why the active set is not memoized on `epoch` or `seed` alone
 ///
 /// [`get_active_validator_indices`] reads `activation_epoch` and `exit_epoch`
-/// off every validator in `state.validators()`, so it is a function of the
+/// off every validator in `state.iter_validators()`, so it is a function of the
 /// state's registry, not of `epoch` or `seed` alone. Two different states can
 /// share an epoch number, or even a seed (it comes from a RANDAO mix fixed
 /// before either state's fork point, so two sibling branches diverging
@@ -358,8 +358,18 @@ pub fn get_beacon_proposer_index(state: &BeaconState) -> Result<ValidatorIndex> 
     // than a shuffle run now. See `crate::beacon::helpers::fulu`'s own module docs for
     // why a seed, and therefore a proposer, is only ever knowable that far
     // ahead of time in the first place.
-    if state.fork_name() == ForkName::Fulu {
-        return super::fulu::get_beacon_proposer_index(state);
+    match state.fork_name() {
+        // Gloas's own `proposer_lookahead` is unchanged from fulu (see
+        // `containers::gloas`'s module doc) and gloas does not redefine
+        // this function, so both forks share fulu's exact same lookup.
+        ForkName::Fulu | ForkName::Gloas => return super::fulu::get_beacon_proposer_index(state),
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb
+        | ForkName::Electra => {}
+        ForkName::Lean => lean_state_unreachable("get_beacon_proposer_index"),
     }
 
     let epoch = get_current_epoch(state);
@@ -371,17 +381,23 @@ pub fn get_beacon_proposer_index(state: &BeaconState) -> Result<ValidatorIndex> 
     let seed = hash(&input);
 
     let indices = get_active_validator_indices(state, epoch);
-    if state.fork_name() == ForkName::Electra {
-        super::electra::compute_proposer_index(&indices, seed, |index| {
+    match state.fork_name() {
+        ForkName::Electra => super::electra::compute_proposer_index(&indices, seed, |index| {
             Ok(state.validator(index)?.effective_balance)
-        })
-    } else {
-        super::shuffling::compute_proposer_index(
+        }),
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb => super::shuffling::compute_proposer_index(
             &indices,
             seed,
             preset::MAX_EFFECTIVE_BALANCE,
             |index| Ok(state.validator(index)?.effective_balance),
-        )
+        ),
+        ForkName::Fulu => unreachable!("Fulu returns via the dispatch match above"),
+        ForkName::Gloas => unreachable!("Gloas returns via the dispatch match above"),
+        ForkName::Lean => lean_state_unreachable("get_beacon_proposer_index"),
     }
 }
 

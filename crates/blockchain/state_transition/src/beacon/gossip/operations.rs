@@ -286,7 +286,7 @@ fn attester_slashing(state: &BeaconState, slashing: &AttesterSlashing) -> Verdic
     // REJECT, so running the cheap ones first cannot change a verdict, and a
     // forged slashing is rejected before any pairing work.
     let attestations = [&slashing.attestation_1, &slashing.attestation_2];
-    let validator_count = state.validators().len() as u64;
+    let validator_count = state.validator_count() as u64;
     // [REJECT] Every index is a validator.
     if attestations.iter().any(|attestation| {
         attestation

@@ -139,6 +139,42 @@ static BLOCK_PROPOSAL_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Envelopes of self-built gloas payloads the node accepted.
+static ENVELOPES_PUBLISHED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_envelopes_published_total",
+        "Execution payload envelopes published for blocks this client proposed"
+    )
+    .unwrap()
+});
+
+/// Gloas proposals whose block went out but whose envelope did not: the slot's
+/// payload is then withheld, which costs the proposer its execution rewards and
+/// the chain a payload.
+static ENVELOPE_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_envelope_failures_total",
+        "Proposed blocks whose self-built envelope was not published"
+    )
+    .unwrap()
+});
+
+static PAYLOAD_ATTESTATIONS_PUBLISHED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_payload_attestations_published_total",
+        "Payload timeliness committee votes the beacon node accepted"
+    )
+    .unwrap()
+});
+
+static PAYLOAD_ATTESTATION_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_payload_attestation_failures_total",
+        "Slots whose payload timeliness committee duty did not result in published votes"
+    )
+    .unwrap()
+});
+
 /// End to end, from the slot's start to the node accepting the block.
 ///
 /// The buckets are tighter at the low end than the attestation histogram's,
@@ -242,6 +278,10 @@ pub fn init() {
     LazyLock::force(&BLOCKS_BROADCAST_NOT_IMPORTED_TOTAL);
     LazyLock::force(&BLOCKS_REFUSED_TOTAL);
     LazyLock::force(&BLOCK_PROPOSAL_FAILURES_TOTAL);
+    LazyLock::force(&ENVELOPES_PUBLISHED_TOTAL);
+    LazyLock::force(&ENVELOPE_FAILURES_TOTAL);
+    LazyLock::force(&PAYLOAD_ATTESTATIONS_PUBLISHED_TOTAL);
+    LazyLock::force(&PAYLOAD_ATTESTATION_FAILURES_TOTAL);
     LazyLock::force(&BLOCK_PUBLICATION_DELAY_SECONDS);
     LazyLock::force(&AGGREGATES_PUBLISHED_TOTAL);
     LazyLock::force(&AGGREGATION_FAILURES_TOTAL);
@@ -297,6 +337,22 @@ pub fn inc_blocks_refused() {
 
 pub fn inc_block_proposal_failures() {
     BLOCK_PROPOSAL_FAILURES_TOTAL.inc();
+}
+
+pub fn inc_envelopes_published() {
+    ENVELOPES_PUBLISHED_TOTAL.inc();
+}
+
+pub fn inc_envelope_failures() {
+    ENVELOPE_FAILURES_TOTAL.inc();
+}
+
+pub fn inc_payload_attestations_published(count: u64) {
+    PAYLOAD_ATTESTATIONS_PUBLISHED_TOTAL.inc_by(count);
+}
+
+pub fn inc_payload_attestation_failures() {
+    PAYLOAD_ATTESTATION_FAILURES_TOTAL.inc();
 }
 
 /// Record how long after a slot's start its block was accepted.

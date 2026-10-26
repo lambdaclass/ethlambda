@@ -45,6 +45,7 @@ use super::helpers::electra::{
     get_attesting_indices, get_indexed_attestation, is_valid_indexed_attestation,
 };
 use super::helpers::predicates::is_slashable_validator;
+use super::lean_boundary::lean_state_unreachable;
 use super::stf::{self, ExecutionEngine};
 use ethlambda_storage::pools::single_committee;
 
@@ -77,7 +78,19 @@ pub fn payload_inputs(state: &BeaconState, config: &Config) -> Result<PayloadInp
     let parent_hash = match state {
         BeaconState::Electra(state) => state.latest_execution_payload_header.block_hash,
         BeaconState::Fulu(state) => state.latest_execution_payload_header.block_hash,
-        _ => return Err(Error::SpecAssert("block production is electra and later")),
+        BeaconState::Phase0(_)
+        | BeaconState::Altair(_)
+        | BeaconState::Bellatrix(_)
+        | BeaconState::Capella(_)
+        | BeaconState::Deneb(_) => {
+            return Err(Error::SpecAssert("block production is electra and later"));
+        }
+        // Gloas builds its block around a builder's bid rather than an
+        // execution payload the proposer requests, which nothing here models.
+        BeaconState::Gloas(_) => {
+            return Err(Error::SpecAssert("block production does not support gloas"));
+        }
+        BeaconState::Lean(_) => lean_state_unreachable("payload_inputs"),
     };
     Ok(PayloadInputs {
         timestamp: stf::bellatrix::compute_timestamp_at_slot(state, state.slot(), config),
@@ -506,7 +519,17 @@ pub fn assemble_block(
     let wrapped = match state {
         BeaconState::Electra(_) => SignedBeaconBlock::Electra(signed),
         BeaconState::Fulu(_) => SignedBeaconBlock::Fulu(signed),
-        _ => return Err(Error::SpecAssert("block production is electra and later")),
+        BeaconState::Phase0(_)
+        | BeaconState::Altair(_)
+        | BeaconState::Bellatrix(_)
+        | BeaconState::Capella(_)
+        | BeaconState::Deneb(_) => {
+            return Err(Error::SpecAssert("block production is electra and later"));
+        }
+        BeaconState::Gloas(_) => {
+            return Err(Error::SpecAssert("block production does not support gloas"));
+        }
+        BeaconState::Lean(_) => lean_state_unreachable("assemble_block"),
     };
     let mut post = state.clone();
     stf::block::process_block(
