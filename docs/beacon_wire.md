@@ -85,14 +85,28 @@ after a boundary read the stale digest and reject the record.
 Seven global topics, `/eth2/{digest}/{name}/ssz_snappy`, plus two subnet
 families this node's own node id selects a narrow slice of: the data column
 subnets it custodies and the attestation subnets it backbones, both described
-below. A gloas digest adds two more, `execution_payload` and
-`payload_attestation_message`, which `BeaconTopics::for_fork` subscribes under
-gloas digests and not under earlier ones. An envelope is validated like a block
+below. A gloas digest adds four more, `execution_payload`,
+`payload_attestation_message`, `execution_payload_bid` and
+`proposer_preferences`, which `BeaconTopics::for_fork` subscribes under gloas
+digests and not under earlier ones (so one epoch before the fork, when the
+digest is joined). An envelope is validated like a block
 (its stateful half on the blocking pool) and goes to the chain actor on `Accept`
 and on `Queue`, since the actor holds an envelope whose block is not imported
 yet. A payload attestation is validated on the attestation permit pool and goes
 to the actor on `Accept` only: a vote for a block not imported here is dropped,
-since it is valid only within its own slot.
+since it is valid only within its own slot. Bids and preferences are the
+builder market: they never reach the chain actor. Their rules live in
+`state_transition::beacon::gossip::{execution_payload_bid, proposer_preferences}`,
+the cheap half runs in p2p's triage (`p2p/src/beacon/builder_market.rs`) and the
+stateful half on a permit pool of their own (`builder_validation_permits`), so
+a bid burst cannot starve blocks, columns or attestations. Whatever is accepted
+goes into the node's one shared `BuilderMarket`, which the Beacon API and block
+production read. Neither is ever queued: a message whose parent or dependent
+block is unknown is ignored. A bid is capped at 196,932 decompressed bytes
+(`Reject(Malformed)` above that). The node publishes both: a bid on the digest of
+its slot, preferences on the digest of the proposal slot, which in the epoch
+before gloas is the gloas digest already joined. Envelopes the node publishes
+itself are recorded as known payloads, since gossip never echoes them.
 
 | Topic | Decoded as |
 | --- | --- |
@@ -106,6 +120,8 @@ since it is valid only within its own slot.
 | `beacon_attestation_{subnet_id}` | `Attestation`, phase0 or electra's `SingleAttestation` (gloas keeps the latter) |
 | `execution_payload` | `SignedExecutionPayloadEnvelope`, gloas digests only |
 | `payload_attestation_message` | `PayloadAttestationMessage`, gloas digests only |
+| `execution_payload_bid` | `SignedExecutionPayloadBid`, gloas digests only |
+| `proposer_preferences` | `SignedProposerPreferences`, gloas digests only |
 
 `beacon_attestation_{0..63}` is no longer wholly unsubscribed. This node holds
 `SUBNETS_PER_NODE` (2 on mainnet) long-lived subscriptions from that family,
