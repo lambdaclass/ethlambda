@@ -40,6 +40,7 @@ pub mod http_api;
 pub mod keys;
 pub mod metrics;
 pub mod payload_attestation;
+pub mod preferences;
 pub mod proposal;
 pub mod proposal_guard;
 pub mod proposer_settings;
