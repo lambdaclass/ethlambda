@@ -24,11 +24,10 @@
 //! all. `node`'s checkpoint sync is untouched: a lean node fetches a
 //! *finalized* anchor, which genuinely has no local source.
 
+use ethlambda_p2p::beacon::fork_schedule::ForkSchedule;
 use ethlambda_p2p::beacon::swarm::BeaconWireConfig;
 use ethlambda_types::beacon::config::Config;
-use ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
 use ethlambda_types::beacon::containers::BeaconState;
-use ethlambda_types::beacon::fork_digest::{compute_fork_digest, next_fork_boundary};
 use ethlambda_types::beacon::preset;
 use ethlambda_types::beacon::primitives::{Epoch, Root};
 use ethlambda_types::enr::EnrForkId;
@@ -47,22 +46,11 @@ pub fn time_at_epoch(config: &Config, genesis_time: u64, epoch: Epoch) -> u64 {
     genesis_time + epoch * config.seconds_per_slot * preset::SLOTS_PER_EPOCH
 }
 
-/// The `eth2` ENR entry for this chain at this epoch.
-///
-/// `next_fork_*` point at the next boundary that moves the digest, which
-/// includes blob-parameter-only forks. Peers tolerate a difference here by
-/// design: only `fork_digest` has to match.
+/// The `eth2` ENR entry for this chain at this epoch, from the same schedule
+/// the running node follows, so the record it starts with and the one it would
+/// switch to name the same boundaries.
 pub fn enr_fork_id(config: &Config, genesis_validators_root: Root, epoch: Epoch) -> EnrForkId {
-    let fork_digest = compute_fork_digest(config, genesis_validators_root, epoch);
-    // With no boundary ahead, the spec says to repeat the current fork's own
-    // version and name `FAR_FUTURE_EPOCH` as the epoch it activates at.
-    let boundary = next_fork_boundary(config, epoch);
-    let named_epoch = boundary.unwrap_or(epoch);
-    EnrForkId {
-        fork_digest,
-        next_fork_version: config.fork_version(config.fork_at_epoch(named_epoch)),
-        next_fork_epoch: boundary.unwrap_or(FAR_FUTURE_EPOCH),
-    }
+    ForkSchedule::new(config, genesis_validators_root).enr_fork_id(epoch)
 }
 
 /// Ethereum mainnet's genesis `BeaconState`, SSZ-encoded: a test fixture.
@@ -187,13 +175,32 @@ pub fn wire_params(
     );
     ethlambda_p2p::metrics::set_beacon_fork_digest(&digest_hex);
 
-    // The digest is computed once. Crossing a boundary while running strands
-    // this node on topic names nobody publishes to, so say when that is.
-    match next_fork_boundary(&chain, epoch) {
-        Some(boundary) => info!(
-            boundary_epoch = boundary,
-            boundary_unix_time = time_at_epoch(&chain, genesis.genesis_time, boundary),
-            "The fork digest changes at this boundary; restart the node to cross it"
+    // The digest moves at every fork and blob-schedule boundary, and the p2p
+    // actor follows it without a restart (`ethlambda_p2p::beacon::transition`):
+    // the next digest's topics are joined ahead of the boundary, the switch
+    // happens at it, and the old topics are left after it, per
+    // `SUBSCRIBE_LEAD_EPOCHS` and `UNSUBSCRIBE_LAG_EPOCHS`. Say what is coming.
+    //
+    // A fork the node does not follow keeps its own warning: crossing its
+    // digest works like any other, but the node stops tracking the chain
+    // there regardless. No fork is in that state today, since gloas is
+    // followed, so the warning is the guard for the next one.
+    let schedule = ForkSchedule::new(&chain, genesis.genesis_validators_root);
+    match schedule.next_boundary_after(epoch) {
+        Some(next) if !next.fork.is_followed() => warn!(
+            boundary_epoch = next.activation_epoch,
+            boundary_unix_time = time_at_epoch(&chain, genesis.genesis_time, next.activation_epoch),
+            fork = next.fork.as_str(),
+            fork_digest = %hex::encode(next.digest),
+            "The fork digest changes at this boundary and the node will switch topics, but this \
+             build cannot follow the fork itself"
+        ),
+        Some(next) => info!(
+            boundary_epoch = next.activation_epoch,
+            boundary_unix_time = time_at_epoch(&chain, genesis.genesis_time, next.activation_epoch),
+            fork = next.fork.as_str(),
+            fork_digest = %hex::encode(next.digest),
+            "The fork digest changes at this boundary; the node will cross it without a restart"
         ),
         None => info!("No fork or blob-schedule boundary is scheduled"),
     }
@@ -278,7 +285,7 @@ pub fn wire_params(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT;
+    use ethlambda_types::beacon::constants::{CUSTODY_REQUIREMENT, FAR_FUTURE_EPOCH};
     use ethlambda_types::beacon::fork::ForkName;
 
     /// Mainnet's genesis, 2020-12-01 12:00:23 UTC.

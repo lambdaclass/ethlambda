@@ -130,7 +130,7 @@ pub fn process_rewards_and_penalties(state: &mut BeaconState, config: &Config) -
     }
     deltas.push(get_inactivity_penalty_deltas(state, config)?);
 
-    let validator_count = state.validators().len() as ValidatorIndex;
+    let validator_count = state.validator_count() as ValidatorIndex;
     for (rewards, penalties) in deltas {
         for index in 0..validator_count {
             increase_balance(state, index, rewards[index as usize])?;

@@ -96,7 +96,7 @@ async fn get_state(
         // borrow.
         Encoding::Json => crate::json_response(Envelope {
             version: fork.as_str(),
-            execution_optimistic: store.is_beacon_optimistic(root),
+            execution_optimistic: crate::shared::optimistic::block_is_optimistic(&store, root),
             finalized: is_finalized(&store, state.slot()),
             data: state.as_ref(),
         }),
@@ -113,7 +113,7 @@ async fn get_fork(Path(state_id): Path<String>, State(store): State<Store>) -> R
         Err(err) => return err.into_response(),
     };
     crate::json_response(serde_json::json!({
-        "execution_optimistic": store.is_beacon_optimistic(root),
+        "execution_optimistic": crate::shared::optimistic::block_is_optimistic(&store, root),
         "finalized": is_finalized(&store, state.slot()),
         "data": state.fork(),
     }))
@@ -133,7 +133,7 @@ async fn get_finality_checkpoints(
     // the state is the only place a *previous* justified checkpoint is kept
     // at all: the store keeps one justified row and one finalized row.
     crate::json_response(serde_json::json!({
-        "execution_optimistic": store.is_beacon_optimistic(root),
+        "execution_optimistic": crate::shared::optimistic::block_is_optimistic(&store, root),
         "finalized": is_finalized(&store, state.slot()),
         "data": {
             "previous_justified": state.previous_justified_checkpoint(),
@@ -238,14 +238,26 @@ impl ValidatorId {
     }
 }
 
-/// The body of `POST .../validators`. Both fields are optional, and an absent
-/// or empty one does not filter.
+/// The body of `POST .../validators`. Both fields are optional, and an absent,
+/// `null` or empty one does not filter.
+///
+/// `null` is spelled out in the Beacon API ("Either or both may be `null` to
+/// signal that no filtering on that attribute is desired"), and `default`
+/// alone covers only an absent field: serde reads an explicit `null` as the
+/// wrong type for a `Vec` and fails the whole body.
 #[derive(Debug, Default, Deserialize)]
 struct ValidatorsRequest {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     ids: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     statuses: Vec<String>,
+}
+
+fn null_as_empty<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Serialize)]
@@ -322,12 +334,11 @@ fn validators_response(store: &Store, state_id: &str, request: ValidatorsRequest
             })
     };
     let entries: Vec<ValidatorEntry> = state
-        .validators()
-        .iter()
-        .zip(state.balances().iter())
+        .iter_validators()
+        .zip(state.iter_balances())
         .enumerate()
         .filter(|(index, (validator, _))| selected(*index as ValidatorIndex, validator))
-        .map(|(index, (validator, &balance))| {
+        .map(|(index, (validator, balance))| {
             let status = ValidatorStatus::of(validator, balance, epoch);
             (index as ValidatorIndex, balance, status, validator)
         })
@@ -344,7 +355,7 @@ fn validators_response(store: &Store, state_id: &str, request: ValidatorsRequest
         .collect();
 
     crate::json_response(serde_json::json!({
-        "execution_optimistic": store.is_beacon_optimistic(root),
+        "execution_optimistic": crate::shared::optimistic::block_is_optimistic(store, root),
         "finalized": is_finalized(store, state.slot()),
         "data": entries,
     }))
@@ -377,8 +388,7 @@ fn validator_response(
     let index = match id {
         ValidatorId::Index(index) => index,
         ValidatorId::Pubkey(pubkey) => state
-            .validators()
-            .iter()
+            .iter_validators()
             .position(|validator| validator.pubkey == pubkey)
             .ok_or(ApiError::NotFound("validator not found"))?
             as ValidatorIndex,
@@ -386,15 +396,12 @@ fn validator_response(
     let validator = state
         .validator(index)
         .map_err(|_| ApiError::NotFound("validator not found"))?;
-    let balance = *state
-        .balances()
-        .get(index as usize)
-        .ok_or(ApiError::Internal(
-            "the registry and balances disagree in length",
-        ))?;
+    let balance = state
+        .balance(index)
+        .map_err(|_| ApiError::Internal("the registry and balances disagree in length"))?;
     let status = ValidatorStatus::of(validator, balance, compute_epoch_at_slot(state.slot()));
     Ok(serde_json::json!({
-        "execution_optimistic": store.is_beacon_optimistic(root),
+        "execution_optimistic": crate::shared::optimistic::block_is_optimistic(store, root),
         "finalized": is_finalized(store, state.slot()),
         "data": ValidatorEntry {
             index,
@@ -575,7 +582,10 @@ mod tests {
         }
 
         fn pubkey_hex(state: &BeaconState, index: usize) -> String {
-            format!("0x{}", hex::encode(state.validators()[index].pubkey.0))
+            format!(
+                "0x{}",
+                hex::encode(state.validator(index as u64).unwrap().pubkey.0)
+            )
         }
 
         /// What `ethlambda validator` sends: its keys, to learn their indices.
@@ -633,6 +643,23 @@ mod tests {
             assert_eq!(data[0]["status"], "active_ongoing");
             assert_eq!(data[0]["validator"]["pubkey"], pubkey_hex(&state, 5));
             assert!(data[0]["balance"].is_string(), "integers are quoted");
+        }
+
+        /// A `null` filter is the Beacon API's "no filtering on that
+        /// attribute", not a malformed body.
+        #[tokio::test]
+        async fn a_null_filter_does_not_filter() {
+            let (_, state) = app();
+            let body = serde_json::json!({ "ids": [pubkey_hex(&state, 5)], "statuses": null });
+            let response = post(body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let json = body_json(response).await;
+            assert_eq!(json["data"].as_array().unwrap().len(), 1);
+
+            let response = post(serde_json::json!({ "ids": null, "statuses": null })).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let json = body_json(response).await;
+            assert_eq!(json["data"].as_array().unwrap().len(), COUNT);
         }
 
         #[tokio::test]
