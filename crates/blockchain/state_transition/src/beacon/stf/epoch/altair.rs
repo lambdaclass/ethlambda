@@ -102,6 +102,14 @@ pub(super) fn weigh_with_totals(
 ///
 /// Skipped at the genesis epoch, since the score update reads the previous
 /// epoch's participation and genesis has none.
+///
+/// Shared by every fork from altair on, gloas included: reading
+/// [`crate::beacon::containers::BeaconState::inactivity_scores_mut`] rather than
+/// [`crate::beacon::containers::BeaconState::altair_validator_lists_mut`] is what
+/// makes that so, since this only ever writes a score in place and never
+/// grows or replaces the list, and that narrower accessor extends to a gloas
+/// state's progressive `inactivity_scores` where the wider one cannot (see
+/// its own doc).
 pub fn process_inactivity_updates(state: &mut BeaconState, config: &Config) -> Result<()> {
     if get_current_epoch(state) == constants::GENESIS_EPOCH {
         return Ok(());
@@ -121,7 +129,7 @@ fn update_inactivity_scores(
 ) -> Result<()> {
     let leaking = is_in_inactivity_leak(state)?;
 
-    let (_, _, inactivity_scores) = state.altair_validator_lists_mut()?;
+    let inactivity_scores = state.inactivity_scores_mut()?;
     let score_count = inactivity_scores.len();
     for (index, (flags, _)) in summary.iter().enumerate() {
         if !flags.is_eligible() {
@@ -187,10 +195,10 @@ pub(super) fn next_inactivity_score(
 /// penalty, computed from [`crate::beacon::helpers::altair::get_inactivity_penalty_deltas`]
 /// against the scores [`process_inactivity_updates`] just brought up to date.
 /// Rewards and penalties are applied as separate saturating steps, in spec
-/// order (see [`crate::beacon::helpers::mutators::apply_balance_deltas`]), not
-/// as one netted delta: that is unchanged from phase0, and for the same reason:
-/// a penalty floors at zero, so netting first would let a reward mask a penalty
-/// that should have driven a low balance all the way down.
+/// order (see [`crate::beacon::helpers::mutators::apply_balance_deltas`]), not as one netted delta: that is
+/// unchanged from phase0, and for the same reason: a penalty floors at zero,
+/// so netting first would let a reward mask a penalty that should have driven
+/// a low balance all the way down.
 ///
 /// Skipped entirely at the genesis epoch: rewards pay for participation
 /// recorded during the previous epoch, and genesis has none.
@@ -207,9 +215,9 @@ pub fn process_rewards_and_penalties(state: &mut BeaconState, config: &Config) -
 /// Step 3 over an already-built summary and reward context.
 ///
 /// Reads the scores step 2 wrote, so a driver must call this after it. The new
-/// balances are decided over flat slices and only the ones that changed are
-/// written back, so an ineligible validator's leaf in the balances tree stays
-/// shared with the parent state.
+/// balances are decided over one sequential walk and only the ones that
+/// changed are written back, so an ineligible validator's leaf in the balances
+/// tree stays shared with the parent state.
 fn apply_rewards_and_penalties(
     state: &mut BeaconState,
     config: &Config,
@@ -217,12 +225,12 @@ fn apply_rewards_and_penalties(
     context: &RewardContext,
 ) -> Result<()> {
     let (_, _, inactivity_scores) = state.altair_validator_lists()?;
-    let balances = state.balances();
 
-    let mut balance_iter = balances.iter();
+    let mut balance_iter = state.iter_balances();
+    let balance_count = balance_iter.len();
     let mut changes: Vec<(usize, Gwei)> = Vec::new();
     for (index, (flags, effective_balance)) in summary.iter().enumerate() {
-        let balance = balance_iter.next().copied();
+        let balance = balance_iter.next();
         if !flags.is_eligible() {
             continue;
         }
@@ -249,16 +257,18 @@ fn apply_rewards_and_penalties(
             }
         }
     }
-    if balances.len() < summary.len() {
+    if balance_count < summary.len() {
         // The specification touches every validator's balance, so a short list
         // fails at its first missing entry.
-        return Err(Error::UnknownValidator(balances.len() as ValidatorIndex));
+        return Err(Error::UnknownValidator(balance_count as ValidatorIndex));
     }
 
+    // The iterator is opaque, so its borrow of `state` lasts until it drops.
+    drop(balance_iter);
     // The changes are in index order, so one cursor pass applies them: nothing
     // is buffered per change, and the leaves it does not touch keep their hash.
     let mut changes = changes.into_iter().peekable();
-    state.balances_mut().try_update_each(|balance| {
+    state.try_update_balances(|balance| {
         if let Some(&(index, updated)) = changes.peek()
             && index == balance.index()
         {
@@ -288,7 +298,7 @@ pub(super) fn process_participation_steps(state: &mut BeaconState, config: &Conf
         /// Registries above this size skip the check: the reference is the
         /// slow path this replaces.
         const CHECK_LIMIT: usize = 4096;
-        if state.validators().len() <= CHECK_LIMIT {
+        if state.validator_count() <= CHECK_LIMIT {
             let mut expected = state.clone();
             let expected_result =
                 super::altair_reference::process_participation_steps(&mut expected, config);
@@ -327,7 +337,10 @@ fn run_participation_steps(state: &mut BeaconState, config: &Config) -> Result<(
 /// reference's `expected`.
 #[cfg(debug_assertions)]
 fn assert_participation_outcome_matches(state: &BeaconState, expected: &BeaconState) {
-    assert_eq!(state.balances(), expected.balances(), "balances");
+    assert!(
+        state.iter_balances().eq(expected.iter_balances()),
+        "balances"
+    );
     let (_, _, scores) = state.altair_validator_lists().expect("altair lists");
     let (_, _, expected_scores) = expected.altair_validator_lists().expect("altair lists");
     assert_eq!(scores, expected_scores, "inactivity scores");
@@ -368,7 +381,7 @@ fn assert_participation_outcome_matches(state: &BeaconState, expected: &BeaconSt
 /// the moment it can be attested for, and `process_attestation` (not
 /// implemented in this file) indexes into it directly rather than appending.
 pub fn process_participation_flag_updates(state: &mut BeaconState) -> Result<()> {
-    let validator_count = state.validators().len();
+    let validator_count = state.validator_count();
     let (previous_epoch_participation, current_epoch_participation, _) =
         state.altair_validator_lists_mut()?;
 
@@ -404,7 +417,7 @@ mod tests {
     use super::*;
     use crate::beacon::fork::ForkName;
     use crate::beacon::helpers::altair::add_flag;
-    use crate::beacon::primitives::{BlsPubkey, ValidatorIndex};
+    use crate::beacon::primitives::{BlsPubkey, Gwei};
 
     /// A deterministic but genuinely valid BLS public key for validator
     /// `index`.
@@ -492,13 +505,17 @@ mod tests {
     fn inactivity_updates_are_a_no_op_at_genesis() {
         let mut state = altair_state_with_validators(4);
         *state.slot_mut() = 0;
+        // Owned, not `.clone()`: `altair_validator_lists` now hands back a
+        // slice borrowed from `state`, and `<&[u64]>::clone()` would just
+        // copy the reference, not the contents, which could not outlive the
+        // `&mut state` call below anyway.
         let (_, _, scores) = state.altair_validator_lists().unwrap();
-        let before = scores.clone();
+        let before = scores.to_vec();
 
         process_inactivity_updates(&mut state, &Config::mainnet()).unwrap();
 
         let (_, _, scores) = state.altair_validator_lists().unwrap();
-        assert_eq!(*scores, before);
+        assert_eq!(scores, before);
     }
 
     #[test]
@@ -562,13 +579,13 @@ mod tests {
         let config = Config::mainnet();
         let mut state = altair_state_with_validators(4);
         *state.slot_mut() = 0;
-        let balances_before = state.balances().clone();
+        let balances_before: Vec<Gwei> = state.iter_balances().collect();
 
         process_rewards_and_penalties(&mut state, &config).unwrap();
 
         assert_eq!(
-            state.balances(),
-            &balances_before,
+            state.iter_balances().collect::<Vec<_>>(),
+            balances_before,
             "the genesis epoch has no previous epoch to reward"
         );
     }

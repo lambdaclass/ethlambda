@@ -143,6 +143,9 @@ pub struct IterCow<'a, T: Value> {
     state: LeafState<T>,
     /// Leaves that changed, in order, with their first index.
     replaced: Vec<(usize, Arc<Tree<T>>)>,
+    /// Added to every index handed out: where this tree starts in a list made
+    /// of several (a progressive list's subtrees).
+    base: usize,
 }
 
 impl<'a, T: Value> IterCow<'a, T> {
@@ -165,27 +168,53 @@ impl<'a, T: Value> IterCow<'a, T> {
             next_first: 0,
             state: LeafState::empty(),
             replaced: Vec::new(),
+            base: 0,
         }
+    }
+
+    /// Reports indices offset by `base`, for a tree that is not the start of
+    /// its list.
+    pub(crate) fn with_base(mut self, base: usize) -> Self {
+        self.base = base;
+        self
     }
 
     /// The next element, to read or to write, or `None` after the last.
     pub fn next_cow(&mut self) -> Option<ElemCow<'_, T>> {
-        loop {
-            if self.state.next < self.state.len {
-                let offset = self.state.next;
-                self.state.next += 1;
-                let index = self.state.first + offset;
-                return Some(ElemCow {
-                    state: &mut self.state,
-                    offset,
-                    index,
-                });
-            }
+        if self.advance() {
+            Some(self.take())
+        } else {
+            None
+        }
+    }
+
+    /// Positions the pass on the next element, loading the next leaf when the
+    /// current one is spent. `false` once the data ends.
+    ///
+    /// Split from [`IterCow::take`] so a caller chaining several passes can
+    /// ask whether one has an element without holding a borrow of it.
+    pub(crate) fn advance(&mut self) -> bool {
+        while self.state.next >= self.state.len {
             self.finish_leaf();
-            let leaf = self.next_leaf()?;
+            let Some(leaf) = self.next_leaf() else {
+                return false;
+            };
             let first = self.next_first;
             self.next_first += crate::packing_factor::<T>() << crate::leaf_height::<T>(self.depth);
             self.state.load(leaf, first);
+        }
+        true
+    }
+
+    /// The element [`IterCow::advance`] positioned on.
+    pub(crate) fn take(&mut self) -> ElemCow<'_, T> {
+        let offset = self.state.next;
+        self.state.next += 1;
+        let index = self.base + self.state.first + offset;
+        ElemCow {
+            state: &mut self.state,
+            offset,
+            index,
         }
     }
 
@@ -522,5 +551,34 @@ mod tests {
         assert_eq!(list[3], 77);
         assert_eq!(list[1000], 5);
         assert_eq!(list.len(), 1001);
+    }
+
+    #[test]
+    fn a_progressive_list_pass_crosses_subtrees_with_global_indices() {
+        use crate::ProgressiveList;
+        // 3000 u64s span several subtrees (4, 16, 64, ... chunks).
+        let values: Vec<u64> = (0..3000).collect();
+        let mut list = ProgressiveList::<u64>::from(values.clone());
+        *list.get_mut(7).unwrap() = 70;
+        list.push(3000).unwrap();
+        list.try_update_each(|e| -> Result<(), ()> {
+            let index = e.index();
+            assert_eq!(**e, if index == 7 { 70 } else { index as u64 });
+            if index % 3 == 0 {
+                e.set(index as u64 + 1);
+            }
+            Ok(())
+        })
+        .unwrap();
+        let expected: Vec<u64> = (0..=3000u64)
+            .map(|i| match i {
+                7 => 70,
+                i if i % 3 == 0 => i + 1,
+                i => i,
+            })
+            .collect();
+        assert_eq!(list.to_vec(), expected);
+        let reference = libssz_types::ProgressiveList::from(expected);
+        assert_eq!(list_root(&list), list_root(&reference));
     }
 }

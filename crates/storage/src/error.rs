@@ -81,4 +81,13 @@ pub enum Error {
         .checkpoint.slot, .checkpoint.root
     )]
     AnchorStateLost { checkpoint: Checkpoint },
+    /// A stored data column sidecar did not decode as the fork its slot
+    /// names. The table keeps no tag beside the bytes, so the fork is read off
+    /// the row's slot and the config's schedule; a disagreement means the
+    /// row was written under another schedule or corrupted at rest.
+    #[error("data column sidecar at slot {slot} does not decode as a {fork:?} sidecar")]
+    UndecodableDataColumn {
+        slot: u64,
+        fork: ethlambda_types::beacon::fork::ForkName,
+    },
 }

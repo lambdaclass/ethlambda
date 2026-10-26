@@ -181,6 +181,59 @@ pub mod quoted_u64_seq {
     }
 }
 
+/// A sequence of sequences of integers, each innermost value written quoted.
+///
+/// [`quoted_u64_seq`] drives one flat sequence of `Display` scalars; this
+/// drives it once per outer element, for a field like
+/// `gloas::BeaconState.ptc_window`
+/// (`SszVector<SszVector<ValidatorIndex, PTC_SIZE>, PTC_WINDOW_LENGTH>`)
+/// whose elements are themselves a foreign `SszVector` with no `Serialize`
+/// of their own. Neither [`seq`] (which needs the element itself to already
+/// implement `Serialize`) nor [`quoted_u64_seq`] alone (which needs the
+/// element to already be the scalar) applies to a field shaped like this.
+pub mod nested_quoted_u64_seq {
+    use serde::ser::SerializeSeq as _;
+
+    /// Wraps one inner sequence so [`serde::ser::SerializeSeq::serialize_element`]
+    /// drives it through [`super::quoted_u64_seq::serialize`] instead of
+    /// requiring the inner sequence itself to implement `Serialize`.
+    struct Inner<C>(C);
+
+    impl<C, T> serde::Serialize for Inner<C>
+    where
+        C: IntoIterator<Item = T> + Copy,
+        C::IntoIter: ExactSizeIterator,
+        T: std::fmt::Display,
+    {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            super::quoted_u64_seq::serialize(self.0, serializer)
+        }
+    }
+
+    pub fn serialize<S, C, D, T>(values: C, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+        C: IntoIterator<Item = D>,
+        C::IntoIter: ExactSizeIterator,
+        // `D` is the outer iterator's item, an inner sequence reached by
+        // reference (e.g. `&SszVector<u64, N>`), so it is `Copy` the same
+        // way any shared reference is.
+        D: IntoIterator<Item = T> + Copy,
+        D::IntoIter: ExactSizeIterator,
+        T: std::fmt::Display,
+    {
+        let iter = values.into_iter();
+        let mut seq = serializer.serialize_seq(Some(iter.len()))?;
+        for item in iter {
+            seq.serialize_element(&Inner(item))?;
+        }
+        seq.end()
+    }
+}
+
 /// Anything SSZ-encodable, written as `0x`-prefixed hex of that encoding.
 ///
 /// This is how the Beacon API carries bitfields: `SszBitlist` and

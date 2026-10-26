@@ -62,11 +62,20 @@
 //! always use SHA-256 (`libssz_merkle::Sha2Hasher`). A cached hash is only
 //! valid for the function that produced it, and SHA-256 is the only one the
 //! consensus specs use.
+//!
+//! # Progressive lists
+//!
+//! [`ProgressiveList`] is an unbounded SSZ list (EIP-7916): instead of one
+//! tree padded to a fixed limit, it is a chain of balanced subtrees holding
+//! 1, 4, 16, ... chunks, each an ordinary [`List`]-style tree in its own
+//! right, so writes, hash caching and rebasing all work per subtree exactly
+//! as they do for [`List`].
 
 mod cursor;
 mod interface;
 mod iter;
 mod list;
+mod progressive_list;
 mod rebase;
 mod tree;
 mod update_map;
@@ -75,6 +84,7 @@ mod vector;
 pub use cursor::{ElemCow, IterCow};
 pub use iter::Iter;
 pub use list::List;
+pub use progressive_list::{ProgressiveIter, ProgressiveIterCow, ProgressiveList};
 pub use update_map::{UpdateMap, VecMap};
 pub use vector::Vector;
 
