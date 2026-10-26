@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-29c2506e.js";
+            window.path_to_searchindex_js = "searchindex-da047b23.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -650,6 +650,22 @@ pool would let that burst answer <code>Ignore(Overloaded)</code> for a block or 
 instead. Neither pool has a metric of its own yet; a permit exhausted on
 either shows up as <code>outcome="ignore",reason="overloaded"</code> on
 <code>lean_beacon_gossip_validation_total</code>, for the topics that draw from it.</p>
+<h3 id="beacon-block-publication"><a class="header" href="#beacon-block-publication">Beacon Block Publication</a></h3>
+<p><code>POST /eth/v2/beacon/blocks</code> computes every blob’s cells and batch-verifies all
+its cell proofs on a blocking thread before it gossips anything, then builds the
+block’s data column sidecars; at the blob cap that is thousands of cells on the
+proposal’s critical path. See <a href="./rpc.html#validator-endpoints">rpc.md</a>. This is
+ethlambda-specific, not part of the leanMetrics spec.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th><th>Buckets</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_beacon_publish_data_columns_seconds</code></td><td>Histogram</td><td>Time to compute and verify a published block’s cells and build its data column sidecars</td><td>On every published block that carries blobs and whose cells verify</td><td></td><td>0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5</td></tr>
+</tbody>
+</table>
+</div>
 <h3 id="beacon-committee-cache"><a class="header" href="#beacon-committee-cache">Beacon Committee Cache</a></h3>
 <p><code>ethlambda beacon</code> derives an epoch’s attester committees with one whole-epoch
 shuffle and keeps the result in <code>CommitteeCache</code>, keyed by epoch and the block

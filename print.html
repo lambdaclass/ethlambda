@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-29c2506e.js";
+            window.path_to_searchindex_js = "searchindex-da047b23.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -2495,7 +2495,8 @@ gossip announces and what range sync fetches, and the two block protocols serve
 other peers from the same store. Fork choice learns its votes from block bodies
 and from the aggregate topic, which is how it sees votes for the <em>current</em> head
 rather than only ones at least a block old; see <a href="#aggregate-attestations">Aggregate
-attestations</a>. It publishes nothing. It also custodies
+attestations</a>. It publishes only what its Beacon API clients submit (attestations, aggregates,
+blocks with their columns, operations) and relays validated gossip. It also custodies
 and serves a slice of the fulu data column matrix, and backbones a slice of the
 attestation subnets, both sized and selected by its own node id; see <a href="#data-column-sidecars">Data
 column sidecars</a>.</p>
@@ -2623,14 +2624,16 @@ forwards it are described just below. How a kept sidecar is later served back
 out over req/resp is under <a href="#data-column-sidecars">Data column sidecars</a>.</p>
 <p>Every beacon message is held by gossipsub until it has a verdict
 (<code>validate_messages()</code> is on for this wire only). Blocks, data column
-sidecars, aggregates and subnet attestations are all validated by fulu’s
-gossip rules, or gloas’s modified ones from the fork on (<code>ethlambda_state_transition::beacon::gossip</code>, one module per
+sidecars, aggregates, subnet attestations and the four operation topics are all
+validated by fulu’s gossip rules, or (operations aside) gloas’s modified ones
+from the fork on (<code>ethlambda_state_transition::beacon::gossip</code>, one module per
 topic family): the checks that need no state run inline in the p2p actor, the
 rest on a bounded <code>spawn_blocking</code> task whose verdict comes back to the actor
 (<code>crate::beacon::verdict</code>). Two permit pools bound how many of these run at
 once, so a burst on one family cannot starve another:
 <code>gossip_validation_permits</code> for blocks and columns,
-<code>attestation_validation_permits</code> for aggregates and subnet attestations. A
+<code>attestation_validation_permits</code> for aggregates, subnet attestations and the
+operation topics. A
 mainnet slot carries up to <code>MAX_COMMITTEES_PER_SLOT * TARGET_AGGREGATORS_PER_COMMITTEE</code> aggregates alone, arriving every slot rather
 than only during a range sync, which is why that traffic needs a pool of its
 own rather than sharing the block and column one. Accept propagates the
@@ -2670,10 +2673,32 @@ verifies every envelope itself, without being propagated. And a
 <code>payload_attestation_message</code> is applied to fork choice after p2p verified its
 signature, with the actor re-checking only the store-state conditions (known
 block, current slot, committee seat).</p>
-<p>The remaining five global topics are decoded, logged at <code>debug</code>, and IGNOREd,
-since nothing consumes them; an undecodable payload on any topic is REJECTed.
-Nothing is published on any topic, columns included: nothing this node can
-produce today would be signature-valid.</p>
+<p><code>voluntary_exit</code>, <code>proposer_slashing</code>, <code>attester_slashing</code> and
+<code>bls_to_execution_change</code> are validated in p2p like aggregates, by
+<code>gossip::operations</code>: the specification’s <code>validate_*_gossip</code> functions
+(consensus-specs v1.7.0-beta.1), run against the fork-choice head’s post-state
+as it is, with no state advance and no <code>process_*</code>. The seen records (the
+first valid exit or credential change per validator, proposer slashing per
+proposer, and the validators an attester slashing slashes) live in
+<code>SeenOperations</code>, are recorded only on <code>Accept</code> and never pruned, so an
+operation a block already included and a peer re-gossips is IGNOREd rather than
+REJECTed. An attester slashing’s range and slashability checks run before its
+BLS checks. What Accepts goes into <code>Store::operation_pool</code>, which block
+production packs from (see <a href="#validator-endpoints">rpc.md</a>). The rules
+are electra’s shapes against an electra or fulu head: under a gloas head every
+operation is IGNOREd (<code>state_unavailable</code>), and a gloas-shaped attester
+slashing is IGNOREd (<code>no_consumer</code>) at decode, like a phase0-shaped one.</p>
+<p><code>sync_committee_contribution_and_proof</code> is decoded, logged at <code>debug</code>, and
+IGNOREd, since nothing consumes it; an undecodable payload on any topic is
+REJECTed.</p>
+<p>Publication runs on the Beacon API’s <code>POST /eth/v2/beacon/blocks</code>, the only
+path that puts a block of this node’s own on the wire. It gossips the block on
+<code>beacon_block</code>, then, if it carries blobs, all 128 data column sidecars, each on
+<code>data_column_sidecar_{compute_subnet_for_data_column_sidecar(index)}</code> whether or
+not this node custodies that subnet (publishing to a subnet one has not joined
+goes through fanout), all under the digest the block’s slot falls in. Operations
+posted to the <code>pool/*</code> routes are published on their topics the same way, under
+the digest of the wall-clock slot.</p>
 <h2 id="aggregate-attestations"><a class="header" href="#aggregate-attestations">Aggregate attestations</a></h2>
 <p><code>beacon_aggregate_and_proof</code> reaches fork choice. It is how a follower learns
 votes for the <em>current</em> head rather than only the votes a block body carries,
@@ -3130,6 +3155,7 @@ as a query filter, so a <code>quic</code>-only record is invisible to it.</p>
 <tr><td><code>lean_beacon_aggregate_end_to_end_seconds</code></td><td>Wire to fork choice, for aggregates applied on arrival</td></tr>
 <tr><td><code>lean_beacon_aggregate_total{outcome}</code></td><td>Aggregates by <code>applied</code>, <code>invalid</code>, <code>known_subset</code> or <code>queue_full</code></td></tr>
 <tr><td><code>lean_beacon_aggregates_deferred</code></td><td>Aggregates held until their own slot has passed</td></tr>
+<tr><td><code>lean_beacon_publish_data_columns_seconds</code></td><td>Time to compute and verify a published block’s cells and build its sidecars; see <a href="#metrics-2">metrics.md</a></td></tr>
 </tbody>
 </table>
 </div>
@@ -3181,6 +3207,9 @@ Local ENR  enr=enr:-…
 subscribes to no sync-committee subnet at startup, and joins one only when a
 validator client asks (see <a href="#sync-committee-subnets">Sync committee
 subnets</a>).</p>
+<p>It publishes only what its Beacon API clients submit (attestations, aggregates,
+sync committee messages, blocks with their columns, operations), plus relayed
+validated gossip.</p>
 <p><code>seeds=17</code> proves the built-in list parsed; a lower number means a bootnode
 ENR was skipped with a warning. <code>topics=17</code> proves the subscription set: the 7
 global topics, the 8 column subnets this run’s (randomly generated) node id
@@ -4273,6 +4302,10 @@ surface rather than sitting beside it; a <code>/lean/v0</code> path on a beacon 
 <tr><td><code>GET</code></td><td><code>/eth/v1/validator/attestation_data</code></td><td>JSON</td><td>What to attest to at <code>slot</code></td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/validator/payload_attestation_data</code></td><td>JSON or SSZ</td><td>What a committee member signs for <code>slot</code> (gloas)</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v2/beacon/pool/attestations</code></td><td><em>(status only)</em></td><td>Validate and gossip <code>SingleAttestation</code>s</td></tr>
+<tr><td><code>GET</code>, <code>POST</code></td><td><code>/eth/v1/beacon/pool/proposer_slashings</code></td><td>JSON</td><td>The operation pool’s <code>ProposerSlashing</code>s; validate, pool and gossip one</td></tr>
+<tr><td><code>GET</code>, <code>POST</code></td><td><code>/eth/v2/beacon/pool/attester_slashings</code></td><td>JSON</td><td>The pool’s <code>AttesterSlashing</code>s (GET carries <code>Eth-Consensus-Version</code>, the fork of the wall clock’s current epoch); validate, pool and gossip one</td></tr>
+<tr><td><code>GET</code>, <code>POST</code></td><td><code>/eth/v1/beacon/pool/voluntary_exits</code></td><td>JSON</td><td>The pool’s <code>SignedVoluntaryExit</code>s; validate, pool and gossip one</td></tr>
+<tr><td><code>GET</code>, <code>POST</code></td><td><code>/eth/v1/beacon/pool/bls_to_execution_changes</code></td><td>JSON</td><td>The pool’s <code>SignedBLSToExecutionChange</code>s; POST takes an array</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/beacon/pool/payload_attestations</code></td><td><em>(status only)</em></td><td>Validate, pool and gossip <code>PayloadAttestationMessage</code>s (gloas)</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/beacon/pool/payload_attestations</code></td><td>JSON</td><td>The pool’s votes as aggregated <code>PayloadAttestation</code>s (gloas)</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/validator/beacon_committee_subscriptions</code></td><td><em>(status only)</em></td><td>Aggregators’ entries join their committee’s subnet</td></tr>
@@ -4416,15 +4449,20 @@ into one EIP-7549 attestation, up to <code>MAX_ATTESTATIONS_ELECTRA</code>). A c
 is packed only if its target root is the advanced state’s own block root for
 that epoch and its aggregate signature verifies against that state, so an
 aggregate made on another branch cannot fail the whole block. The body also
-votes the state’s own <code>eth1_data</code>, and carries the sync aggregate described
-under <a href="#sync-committee">Sync committee</a> (empty when nothing verifiable is
-pooled) and no slashings, exits or credential changes. The state root comes from running
-the block through <code>process_block</code>. The answer is fulu <code>BlockContents</code>, with
+votes the state’s own <code>eth1_data</code>, and carries the operation pool’s
+slashings, exits and BLS changes, packed by <code>pack_operations</code> (each kept only
+if its <code>process_*</code> succeeds on a scratch copy of the state with everything
+packed before it applied, up to the preset’s maximums), and the sync
+aggregate described under <a href="#sync-committee">Sync committee</a> (empty when
+nothing verifiable is pooled). The payload bundle’s KZG commitments go in the body. The state
+root comes from running the block through <code>process_block</code>. The answer is
+fulu <code>BlockContents</code>: the block, the bundle’s cell proofs and its blobs, with
 <code>Eth-Execution-Payload-Blinded: false</code>; there is no builder flow. It is a
-<strong><code>503</code></strong> without a configured execution client, or when the payload carries
-blobs. A slot the schedule does not place at fulu (gloas included) is a
-<code>400</code>, checked before the execution client; <code>produceBlockV3</code> is the fulu
-endpoint, and a gloas slot goes to <code>produceBlockV4</code>.</li>
+<strong><code>503</code></strong> without a configured execution client, or when the bundle is
+malformed (its commitments, proofs and blobs disagree in count). A slot the
+schedule does not place at fulu (gloas included) is a <code>400</code>, checked before
+the execution client; <code>produceBlockV3</code> is the fulu endpoint, and a gloas slot
+goes to <code>produceBlockV4</code>.</li>
 <li><strong>Graffiti</strong> is the validator client’s, with both clients’ codes and
 commits appended as far as they fit: <code>hello RH1a2bLA3c4d</code> for reth at
 <code>1a2b…</code> under ethlambda at <code>3c4d…</code>. The execution client’s half comes from
@@ -4438,22 +4476,39 @@ Lighthouse’s tiers, and is appended to every block with no opt-out; the
 lets an unlisted client pick any two letters no listed client uses.</li>
 <li><strong><code>POST beacon/blocks</code></strong> takes SSZ and the <code>Eth-Consensus-Version</code> header
 (<code>fulu</code> or <code>gloas</code>, else <code>400</code>; a non-SSZ content type is a <code>415</code>). Fulu: a
-<code>SignedBlockContents</code>; the node checks the block is after the head and its
-proposer signature, then gossips it on <code>beacon_block</code> and hands it to the
-chain actor to import. A slot the schedule does not place at fulu is a <code>400</code>,
-checked before the head state is advanced. Gloas: a bare
-<code>gloas::SignedBeaconBlock</code> (a gloas block carries no payload or blobs; they
-follow in the envelope). The slot must be scheduled at gloas, the parent must
-be held, the slot must be after the parent’s, and the proposer and signature
-are checked against the parent’s state advanced to the slot (all <code>400</code>
-otherwise), before the block is gossiped and handed to the chain actor.</li>
+<code>SignedBlockContents</code>. A slot the schedule does not place at fulu is a <code>400</code>,
+checked before any state is advanced. The block is then checked against its
+<strong>parent’s</strong> state advanced to its slot: an unknown parent, a slot not after
+the parent’s, the wrong proposer or a bad proposer signature is a <code>400</code>. Then
+every blob’s cells are computed and all cell proofs batch-verified on a
+blocking thread (<code>400</code> on any failure, nothing gossiped); the time that takes
+is <code>lean_beacon_publish_data_columns_seconds</code>. Then the block is gossiped on
+<code>beacon_block</code>, then, if it carries blobs, all 128 data column sidecars, each
+on <code>data_column_sidecar_{compute_subnet_for_data_column_sidecar(index)}</code>, and
+last the chain actor gets this node’s custody columns, then the block, to
+import. Gloas: a bare <code>gloas::SignedBeaconBlock</code> (a gloas block carries no
+payload or blobs, so no sidecars go with it; they follow in the envelope). The
+slot must be scheduled at gloas, the parent must be held, the slot must be
+after the parent’s, and the proposer and signature are checked against the
+parent’s state advanced to the slot (all <code>400</code> otherwise), before the block is
+gossiped and handed to the chain actor.</li>
+<li><strong>The operation pool</strong> holds, beside the attestation pool and in memory in
+the same <code>Store</code> (<code>Store::operation_pool</code>): proposer slashings (one per
+proposer), attester slashings (one per <code>hash_tree_root</code>), voluntary exits and
+BLS changes (one per validator), first one wins. Entries come from the four
+<code>pool/*</code> POST routes and from gossip P2P accepts, so each has passed the
+topic’s gossip rules; the pool never checks a signature. Entries the head
+state has made pointless are pruned.</li>
+<li><strong><code>pool/proposer_slashings</code>, <code>pool/attester_slashings</code>, <code>pool/voluntary_exits</code>
+and <code>pool/bls_to_execution_changes</code></strong>: <code>GET</code> lists the pool. <code>POST</code> runs the
+specification’s <code>validate_*_gossip</code> rule for the topic against the head’s
+post-state as it is (consensus-specs v1.7.0-beta.1; no <code>process_*</code> and no
+state advance, and an attester slashing’s range and slashability checks run
+before its BLS checks), pools the operation and gossips it on the topic. A
+rejected operation is a <code>400</code>. <code>bls_to_execution_changes</code> takes an array: on
+partial failure the response is a <code>400</code> listing the failures by index, and
+the valid entries are still pooled and published.</li>
 </ul>
-<p><strong>Fulu blobs are not supported.</strong> Publishing a blob-carrying fulu block means
-computing and gossiping its data column sidecars, which this node does not do
-for fulu, and peers will not import a block they cannot sample. Such payloads
-are refused at production (<code>503</code>, which a validator client fails over on) and
-such blocks at publication (<code>400</code>). Gloas blobs are supported: the envelope
-publication below builds and gossips the columns.</p>
 <h3 id="gloas-block-production"><a class="header" href="#gloas-block-production">Gloas block production</a></h3>
 <p>A gloas proposer signs two things on their own, the block and the envelope that
 reveals its payload, and this node serves both halves. It only builds for
@@ -4615,7 +4670,8 @@ is left out.</li>
 gossip, so a block this node builds carries the votes its peers sent too.</p>
 <p><code>tooling/kurtosis-validator/network_params_ethlambda_beacon.yaml</code> points the
 validator client at this node alone, so every block on that devnet is one this
-node built.</p>
+node built; it also runs spamoor, whose blob traffic makes those blocks carry
+blobs.</p>
 <h3 id="encoding"><a class="header" href="#encoding">Encoding</a></h3>
 <p><strong>JSON is the default</strong>; SSZ is served on <code>Accept: application/octet-stream</code>,
 which is the order lighthouse serves. An <code>Accept</code> listing both is ranked by its
@@ -5303,6 +5359,22 @@ pool would let that burst answer <code>Ignore(Overloaded)</code> for a block or 
 instead. Neither pool has a metric of its own yet; a permit exhausted on
 either shows up as <code>outcome="ignore",reason="overloaded"</code> on
 <code>lean_beacon_gossip_validation_total</code>, for the topics that draw from it.</p>
+<h3 id="beacon-block-publication"><a class="header" href="#beacon-block-publication">Beacon Block Publication</a></h3>
+<p><code>POST /eth/v2/beacon/blocks</code> computes every blob’s cells and batch-verifies all
+its cell proofs on a blocking thread before it gossips anything, then builds the
+block’s data column sidecars; at the blob cap that is thousands of cells on the
+proposal’s critical path. See <a href="#validator-endpoints">rpc.md</a>. This is
+ethlambda-specific, not part of the leanMetrics spec.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th><th>Buckets</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_beacon_publish_data_columns_seconds</code></td><td>Histogram</td><td>Time to compute and verify a published block’s cells and build its data column sidecars</td><td>On every published block that carries blobs and whose cells verify</td><td></td><td>0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5</td></tr>
+</tbody>
+</table>
+</div>
 <h3 id="beacon-committee-cache"><a class="header" href="#beacon-committee-cache">Beacon Committee Cache</a></h3>
 <p><code>ethlambda beacon</code> derives an epoch’s attester committees with one whole-epoch
 shuffle and keeps the result in <code>CommitteeCache</code>, keyed by epoch and the block
