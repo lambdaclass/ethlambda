@@ -43,6 +43,7 @@ pub mod payload_attestation;
 pub mod proposal;
 pub mod proposal_guard;
 pub mod proposer_settings;
+pub mod registration;
 pub(crate) mod secure_fs;
 pub mod signing;
 pub mod slot_clock;
