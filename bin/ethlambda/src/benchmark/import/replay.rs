@@ -107,6 +107,9 @@ pub(crate) async fn replay_corpus(dir: &Path, options: &ReplayOptions) -> eyre::
             options.data_dir.display()
         )
     })?);
+    // The same refusal startup makes, so a gloas corpus fails with its real
+    // reason rather than partway through replay.
+    crate::refuse_unfollowable_fork(anchor_state.fork_name())?;
     let store = fork_choice::get_forkchoice_store(backend, anchor_state, anchor_block, &config)?;
     // A clone, not a borrow: `Store::set_time_ms` writes to the shared
     // backend's metadata, so this clone's write is the write every other

@@ -14,6 +14,10 @@
 //! it replaces `transactions` with `transactions_root`, the same substitution
 //! [`super::shared::BeaconBlockHeader`] makes for a beacon block's body.
 //!
+//! [`NewPayloadRequest`] is what `process_execution_payload` hands the
+//! execution engine to validate a proposed payload; bellatrix's carries only
+//! `execution_payload`, and later forks append to it.
+//!
 //! [`PowBlock`] is unrelated to either: it is transcribed from
 //! `fork-choice.md` rather than `beacon-chain.md`, and exists only to let fork
 //! choice check a candidate terminal proof-of-work block's total difficulty
@@ -143,6 +147,19 @@ pub struct ExecutionPayloadHeader {
     /// would have carried, so the header stays a fixed shape regardless of
     /// how many transactions the block had.
     pub transactions_root: Root,
+}
+
+/// What `process_execution_payload` hands `execution_engine.verify_and_notify_new_payload`
+/// to validate a proposed payload, bellatrix `beacon-chain.md`.
+///
+/// One field: bellatrix has nothing else to check yet. Later forks append to
+/// this (deneb's blob versioned hashes and beacon root, electra's execution
+/// requests); each fork whose own [`ExecutionPayload`] differs from its
+/// predecessor's needs its own `NewPayloadRequest` too, since the field's type
+/// is that fork's own payload shape.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+pub struct NewPayloadRequest {
+    pub execution_payload: ExecutionPayload,
 }
 
 // ---------------------------------------------------------------------------
