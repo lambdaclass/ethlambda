@@ -2,11 +2,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::http::StatusCode;
 use axum::http::header::ACCEPT;
-use ethlambda_types::beacon::builder::BuilderBid;
+use ethlambda_types::beacon::builder::{BlindedBeaconBlock, BuilderBid, SignedBlindedBeaconBlock};
 use ethlambda_types::beacon::containers::deneb::{ExecutionPayloadHeader, KzgCommitments};
 use ethlambda_types::beacon::containers::electra::{self, ExecutionRequests};
 use ethlambda_types::beacon::fork::ForkName;
-use ethlambda_types::beacon::primitives::{BlsPubkey, ExecutionBlockHash, Uint256, Version};
+use ethlambda_types::beacon::primitives::{
+    BlsPubkey, BlsSignature, ExecutionBlockHash, Root, Uint256, Version,
+};
 
 use super::mock_relay::{MockRelay, signed_registration};
 use super::{BuilderClient, BuilderError, VersionedBid};
@@ -319,4 +321,75 @@ async fn a_registration_the_relay_refuses_is_a_bad_request() {
         Err(BuilderError::BadRequest(message)) if message == "invalid signature"
     ));
     assert!(relay.registrations().is_empty());
+}
+
+fn blinded_block() -> SignedBlindedBeaconBlock {
+    let block = electra::BeaconBlock {
+        slot: SLOT,
+        proposer_index: 3,
+        parent_root: Root::repeat_byte(1),
+        state_root: Root::repeat_byte(2),
+        body: electra::BeaconBlockBody::empty(),
+    };
+    SignedBlindedBeaconBlock {
+        message: BlindedBeaconBlock::from(block),
+        signature: BlsSignature::default(),
+    }
+}
+
+#[tokio::test]
+async fn a_blinded_block_reaches_the_relay_in_ssz_with_its_fork() {
+    let relay = MockRelay::start(GENESIS_FORK_VERSION).await;
+    let block = blinded_block();
+    client_for(&relay)
+        .submit_blinded_block(&block, ForkName::Fulu)
+        .await
+        .unwrap();
+    // The relay refuses an SSZ submission that does not name its fork.
+    assert_eq!(relay.blinded_blocks(), [block]);
+    assert_eq!(relay.ssz_submissions(), 1);
+}
+
+#[tokio::test]
+async fn a_relay_that_refuses_ssz_blocks_is_sent_json_from_then_on() {
+    let relay = MockRelay::start(GENESIS_FORK_VERSION).await;
+    relay.refuse_ssz();
+    let client = client_for(&relay);
+    let block = blinded_block();
+
+    client
+        .submit_blinded_block(&block, ForkName::Fulu)
+        .await
+        .unwrap();
+    client
+        .submit_blinded_block(&block, ForkName::Fulu)
+        .await
+        .unwrap();
+
+    assert_eq!(relay.blinded_blocks(), [block.clone(), block]);
+    // The first submission tried SSZ, was refused and went again in JSON;
+    // the second went straight to JSON.
+    assert_eq!(relay.ssz_submissions(), 1);
+}
+
+#[tokio::test]
+async fn a_relay_that_refuses_a_block_says_why() {
+    let relay = MockRelay::start(GENESIS_FORK_VERSION).await;
+    relay.answer_submissions_with(StatusCode::BAD_REQUEST);
+    assert!(matches!(
+        client_for(&relay).submit_blinded_block(&blinded_block(), ForkName::Fulu).await,
+        Err(BuilderError::BadRequest(message)) if message == "block refused"
+    ));
+}
+
+#[tokio::test]
+async fn only_202_is_a_successful_submission() {
+    for status in [StatusCode::OK, StatusCode::INTERNAL_SERVER_ERROR] {
+        let relay = MockRelay::start(GENESIS_FORK_VERSION).await;
+        relay.answer_submissions_with(status);
+        assert!(matches!(
+            client_for(&relay).submit_blinded_block(&blinded_block(), ForkName::Fulu).await,
+            Err(BuilderError::Status { status: answered, .. }) if answered == status.as_u16()
+        ));
+    }
 }

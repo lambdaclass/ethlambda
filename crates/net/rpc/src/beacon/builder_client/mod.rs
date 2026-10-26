@@ -14,10 +14,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ethlambda_types::beacon::builder::{SignedBuilderBid, SignedValidatorRegistrationV1};
+use ethlambda_types::beacon::builder::{
+    SignedBlindedBeaconBlock, SignedBuilderBid, SignedValidatorRegistrationV1,
+};
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{BlsPubkey, ExecutionBlockHash, Slot};
-use libssz::SszDecode as _;
+use libssz::{SszDecode as _, SszEncode as _};
 use reqwest::StatusCode;
 use reqwest::header::{self, HeaderMap};
 use tracing::info;
@@ -49,6 +51,10 @@ const ACCEPT_SSZ_FIRST: &str = "application/octet-stream;q=1.0,application/json;
 /// builder-specs gives `registerValidator` no deadline. Ten seconds covers a
 /// batch of a few thousand registrations.
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// At least MEV-Boost's own default of four seconds, which it spends
+/// fetching the payload from its relays before it answers.
+const SUBMIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A builder API endpoint: a relay, or MEV-Boost in front of several.
 #[derive(Debug, Clone)]
@@ -204,6 +210,63 @@ impl BuilderClient {
         }
     }
 
+    /// `submitBlindedBlockV2`: hands a signed blinded block to the builder,
+    /// which publishes the full block and its blobs itself.
+    ///
+    /// Only a 202 is success. The proposer is committed once this is sent,
+    /// so a caller has no local block to fall back on whatever this returns.
+    pub async fn submit_blinded_block(
+        &self,
+        block: &SignedBlindedBeaconBlock,
+        fork: ForkName,
+    ) -> Result<(), BuilderError> {
+        let started = Instant::now();
+        let result = self.try_submit_blinded_block(block, fork).await;
+        observe_builder_request("submit_blinded_block", outcome(&result), started.elapsed());
+        result
+    }
+
+    async fn try_submit_blinded_block(
+        &self,
+        block: &SignedBlindedBeaconBlock,
+        fork: ForkName,
+    ) -> Result<(), BuilderError> {
+        let path = "/eth/v2/builder/blinded_blocks";
+        if !self.json_only.load(Ordering::Relaxed) {
+            let response = self
+                .send_block(path, crate::SSZ_CONTENT_TYPE, block.to_ssz(), fork)
+                .await?;
+            // A 415 is this URL refusing SSZ, answered at once: send the
+            // same block again in JSON, and JSON from now on.
+            if response.status() != StatusCode::UNSUPPORTED_MEDIA_TYPE {
+                return submission_result(response).await;
+            }
+            self.fall_back_to_json();
+        }
+        let body =
+            serde_json::to_vec(block).map_err(|err| BuilderError::Encode(err.to_string()))?;
+        let response = self.send_block(path, JSON_CONTENT_TYPE, body, fork).await?;
+        submission_result(response).await
+    }
+
+    async fn send_block(
+        &self,
+        path: &str,
+        content_type: &'static str,
+        body: Vec<u8>,
+        fork: ForkName,
+    ) -> Result<reqwest::Response, BuilderError> {
+        self.http
+            .post(self.url(path))
+            .timeout(SUBMIT_TIMEOUT)
+            .header(header::CONTENT_TYPE, content_type)
+            .header("eth-consensus-version", fork.as_str())
+            .body(body)
+            .send()
+            .await
+            .map_err(|err| BuilderError::from_reqwest(err, SUBMIT_TIMEOUT))
+    }
+
     fn fall_back_to_json(&self) {
         info!("Builder refused SSZ; using JSON from now on");
         self.json_only.store(true, Ordering::Relaxed);
@@ -312,6 +375,14 @@ fn is_ssz(headers: &HeaderMap) -> bool {
 /// How a call that returns nothing on success ended, as a metric label.
 fn outcome<T>(result: &Result<T, BuilderError>) -> &'static str {
     result.as_ref().map_or_else(BuilderError::label, |_| "ok")
+}
+
+/// A submission's answer: only 202 is success.
+async fn submission_result(response: reqwest::Response) -> Result<(), BuilderError> {
+    match response.status() {
+        StatusCode::ACCEPTED => Ok(()),
+        _ => Err(BuilderError::from_status(response, SUBMIT_TIMEOUT).await),
+    }
 }
 
 fn unix_millis() -> u128 {

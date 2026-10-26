@@ -16,13 +16,14 @@ use axum::routing::{get, post};
 use ethlambda_state_transition::beacon::bls;
 use ethlambda_state_transition::beacon::helpers::test_state::{secret_key_for, sign_for};
 use ethlambda_types::beacon::builder::{
-    BuilderBid, SignedBuilderBid, SignedValidatorRegistrationV1, ValidatorRegistrationV1,
+    BuilderBid, SignedBlindedBeaconBlock, SignedBuilderBid, SignedValidatorRegistrationV1,
+    ValidatorRegistrationV1,
 };
 use ethlambda_types::beacon::primitives::{
     BlsPubkey, ExecutionAddress, HashTreeRoot as _, Version,
 };
 use ethlambda_types::beacon::signing::{compute_builder_domain, compute_signing_root};
-use libssz::SszEncode as _;
+use libssz::{SszDecode as _, SszEncode as _};
 
 use super::VersionedBid;
 
@@ -42,6 +43,11 @@ struct RelayState {
     header_requests: Vec<HeaderRequest>,
     raw_answer: Option<RawAnswer>,
     registrations: Vec<SignedValidatorRegistrationV1>,
+    blinded_blocks: Vec<SignedBlindedBeaconBlock>,
+    /// What `submitBlindedBlockV2` answers; `None` is 202.
+    submit_status: Option<StatusCode>,
+    /// Submissions that arrived SSZ-encoded, refused or not.
+    ssz_submissions: usize,
 }
 
 /// A fixed answer to every `getHeader`.
@@ -82,6 +88,7 @@ impl MockRelay {
                 get(header),
             )
             .route("/eth/v1/builder/validators", post(register))
+            .route("/eth/v2/builder/blinded_blocks", post(submit))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -91,6 +98,7 @@ impl MockRelay {
 
     /// Refuse SSZ outright: 406 to an `Accept` that starts with SSZ, as a
     /// builder that reads only the first media type does.
+    /// An SSZ `submitBlindedBlockV2` is refused too, with 415.
     pub(crate) fn refuse_ssz(&self) {
         self.state.lock().unwrap().refuses_ssz = true;
     }
@@ -130,6 +138,19 @@ impl MockRelay {
     /// Serve `bid` to every `getHeader`.
     pub(crate) fn offer(&self, bid: VersionedBid) {
         self.state.lock().unwrap().bid = Some(bid);
+    }
+
+    /// Answer every `submitBlindedBlockV2` with `status` instead of 202.
+    pub(crate) fn answer_submissions_with(&self, status: StatusCode) {
+        self.state.lock().unwrap().submit_status = Some(status);
+    }
+
+    pub(crate) fn blinded_blocks(&self) -> Vec<SignedBlindedBeaconBlock> {
+        self.state.lock().unwrap().blinded_blocks.clone()
+    }
+
+    pub(crate) fn ssz_submissions(&self) -> usize {
+        self.state.lock().unwrap().ssz_submissions
     }
 
     pub(crate) fn registrations(&self) -> Vec<SignedValidatorRegistrationV1> {
@@ -238,6 +259,35 @@ async fn register(State(state): State<Shared>, headers: HeaderMap, body: Bytes) 
     }
     state.registrations.extend(registrations);
     StatusCode::OK.into_response()
+}
+
+async fn submit(State(state): State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
+    let mut state = state.lock().unwrap();
+    let ssz = is_ssz_request(&headers);
+    if ssz {
+        state.ssz_submissions += 1;
+        if state.refuses_ssz {
+            return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+        }
+        // builder-specs requires the header on an SSZ submission.
+        if !headers.contains_key("eth-consensus-version") {
+            return bad_request("missing Eth-Consensus-Version");
+        }
+    }
+    let block = if ssz {
+        SignedBlindedBeaconBlock::from_ssz_bytes(&body).ok()
+    } else {
+        serde_json::from_slice(&body).ok()
+    };
+    let Some(block) = block else {
+        return bad_request("invalid block encoding");
+    };
+    state.blinded_blocks.push(block);
+    match state.submit_status {
+        None => StatusCode::ACCEPTED.into_response(),
+        Some(StatusCode::BAD_REQUEST) => bad_request("block refused"),
+        Some(status) => status.into_response(),
+    }
 }
 
 /// Test validator `index`'s registration, signed with its key for the chain
