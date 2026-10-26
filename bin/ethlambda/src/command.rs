@@ -15,6 +15,7 @@ use clap::Parser;
 
 use crate::benchmark::BenchmarkOptions;
 use crate::cli::{BeaconOptions, NodeOptions};
+use crate::era::ReplayEraOptions;
 use crate::keygen::KeygenOptions;
 use crate::version;
 
@@ -27,6 +28,7 @@ const EXPLICIT: &[&str] = &[
     NODE,
     BEACON,
     BENCHMARK,
+    REPLAY_ERA,
     VALIDATOR,
     KEYGEN,
     "help",
@@ -39,6 +41,7 @@ const EXPLICIT: &[&str] = &[
 const NODE: &str = "node";
 const BEACON: &str = "beacon";
 const BENCHMARK: &str = "benchmark";
+const REPLAY_ERA: &str = "replay-era";
 const VALIDATOR: &str = "validator";
 const KEYGEN: &str = "keygen";
 
@@ -77,6 +80,8 @@ pub(crate) enum Command {
     Beacon(BeaconOptions),
     /// Benchmark block building offline against a controlled workload.
     Benchmark(BenchmarkOptions),
+    /// Replay real chain history from `.era` files and check it against the stored states.
+    ReplayEra(ReplayEraOptions),
     /// Run the beacon-chain validator client against a beacon node's HTTP API.
     Validator(crate::validator::ValidatorOptions),
     /// Generate validator XMSS keys for a genesis.
