@@ -173,13 +173,50 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
     where
         F: Fn(&'p B) -> BoxFuture<'p, Result<()>>,
     {
+        self.try_all_inner(what, node_effect, all_failed, true, call)
+            .await
+    }
+
+    /// [`Self::try_all`] logging each node's refusal at `debug!` instead of
+    /// `warn!`, for a call the caller retries every slot and reports itself
+    /// (once per entry): a per-node warning here would repeat on every retry
+    /// for as long as the refusal lasts. Always without an `all_failed`
+    /// message, for the same reason.
+    async fn try_all_quiet<'p, F>(
+        &'p self,
+        what: &'static str,
+        node_effect: &'static str,
+        call: F,
+    ) -> Result<()>
+    where
+        F: Fn(&'p B) -> BoxFuture<'p, Result<()>>,
+    {
+        self.try_all_inner(what, node_effect, None, false, call)
+            .await
+    }
+
+    async fn try_all_inner<'p, F>(
+        &'p self,
+        what: &'static str,
+        node_effect: &'static str,
+        all_failed: Option<&'static str>,
+        warn_per_node: bool,
+        call: F,
+    ) -> Result<()>
+    where
+        F: Fn(&'p B) -> BoxFuture<'p, Result<()>>,
+    {
         let mut accepted = 0;
         let mut last = None;
         for (position, node) in self.nodes.iter().enumerate() {
             match call(node).await {
                 Ok(()) => accepted += 1,
                 Err(err) => {
-                    warn!(%what, position, %err, node_effect, "Beacon node did not accept");
+                    if warn_per_node {
+                        warn!(%what, position, %err, node_effect, "Beacon node did not accept");
+                    } else {
+                        debug!(%what, position, %err, node_effect, "Beacon node did not accept");
+                    }
                     last = Some(err);
                 }
             }
@@ -385,11 +422,11 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
         fork: ForkName,
         preferences: &[gloas::SignedProposerPreferences],
     ) -> Result<()> {
-        self.try_all(
+        // Quiet: the service retries a refused preference every slot and warns
+        // once per entry, with what it costs.
+        self.try_all_quiet(
             "submit_proposer_preferences",
             "it will not gossip these proposer preferences",
-            // The service reports it, per preference, with what it costs.
-            None,
             |node| node.submit_proposer_preferences(fork, preferences),
         )
         .await

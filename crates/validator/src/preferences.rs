@@ -184,7 +184,7 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
             Ok(duties) => duties,
             Err(err) => {
                 debug!(epoch = target, %err, "Could not fetch proposer duties for preferences");
-                crate::metrics::inc_proposer_preferences_failures();
+                crate::metrics::inc_proposer_preferences_duty_fetch_failures();
                 if lock(&self.fetch_warned).insert(target) {
                     warn!(
                         epoch = target,
@@ -641,6 +641,13 @@ mod tests {
             Root::repeat_byte(0x11),
             vec![duty(&pubkeys[0], 3, slot_in(GLOAS_EPOCH, 10))],
         );
+        // Both target epochs have duties, and the failure is injected on the
+        // call itself, so neither fetch fails for want of data.
+        node.set_proposers_v2(
+            GLOAS_EPOCH + 1,
+            Root::repeat_byte(0x22),
+            vec![duty(&pubkeys[0], 3, slot_in(GLOAS_EPOCH + 1, 4))],
+        );
         node.failures
             .lock()
             .expect("lock")
@@ -651,12 +658,23 @@ mod tests {
         service.clone().poll(current, store.clone()).await;
         service.clone().poll(current + 1, store.clone()).await;
         assert!(submitted(&node).is_empty());
-        let warned: Vec<Epoch> = lock(&service.fetch_warned).iter().copied().collect();
-        assert_eq!(warned.len(), 2, "one entry per target epoch, not per poll");
+        assert_eq!(
+            *lock(&service.fetch_warned),
+            HashSet::from([GLOAS_EPOCH, GLOAS_EPOCH + 1]),
+            "one entry per target epoch, not per poll"
+        );
 
         node.failures.lock().expect("lock").clear();
         service.poll(current + 2, store).await;
-        assert_eq!(submitted(&node).len(), 1);
+        let mut slots: Vec<Slot> = submitted(&node)
+            .iter()
+            .flat_map(|(_, entries)| entries.iter().map(|entry| entry.message.proposal_slot))
+            .collect();
+        slots.sort();
+        assert_eq!(
+            slots,
+            vec![slot_in(GLOAS_EPOCH, 10), slot_in(GLOAS_EPOCH + 1, 4)]
+        );
     }
 
     #[tokio::test]

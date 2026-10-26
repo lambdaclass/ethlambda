@@ -355,13 +355,6 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             }
         }
 
-        // First in the slot, ahead of the proposal: the preferences for the
-        // slots after this one must be out before those slots start (gossip
-        // IGNOREs a started slot), and a poll queued behind a duty could land
-        // late. Off the slot loop, since it is single-flight and a slow node
-        // must not delay this slot's duties.
-        tokio::spawn(preferences.clone().poll(slot, store.clone()));
-
         // A block is due now, at the boundary this iteration woke on.
         //
         // Cloned out of `duties` so the borrow ends before the await: the duty
@@ -370,6 +363,15 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         if let Some(duty) = duties.proposer_at_slot(slot, epoch).cloned() {
             propose(&proposal, &clock, slot, &duty, &store).await;
         }
+
+        // Right after the proposal and ahead of the slot's other duties: the
+        // preferences for the slots after this one must be out before those
+        // slots start (gossip IGNOREs a started slot), and the poll's v2 duties
+        // fetch for the next epoch can make the node advance a state, which
+        // should not compete with it producing this slot's block. Off the slot
+        // loop, since it is single-flight and a slow node must not delay this
+        // slot's duties.
+        tokio::spawn(preferences.clone().poll(slot, store.clone()));
 
         // The rest of the way to the first of the slot's remaining duties:
         // the attester offset, or the sync committee offset when the network
