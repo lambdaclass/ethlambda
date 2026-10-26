@@ -864,8 +864,11 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   `SlotClock` picks the
   offsets by each slot's own fork, and `/eth/v1/config/spec` supplies them. With
   `--builder-proposals`, pre-gloas slots register validators with the node's builder
-  and may sign a blinded block, published to the producing node only. It
-  still keeps no slashing-protection record; PTC votes have an in-memory
+  and may sign a blinded block, published to the producing node only. From the
+  epoch before gloas it signs proposer preferences every slot for its proposals in
+  the current and next epoch (`PreferencesService`, v2 duties, the gossip rule's
+  signing domain), unconditionally, and `produceBlockV4` carries the boost factor.
+  It still keeps no slashing-protection record; PTC votes have an in-memory
   `(validator, slot)` dedup only, and envelopes are unguarded.
   `get_head_node` is one bottom-up walk for every fork, with
   the current slot's fork selecting the payload rules and the boost gate, so a
