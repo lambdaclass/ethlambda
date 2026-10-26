@@ -24,6 +24,8 @@
 # built with the builder support understands. The workflow rewrites the
 # `cl_image` and `vc_image` of the ethlambda entries (selected by type, not
 # position) to the image under test; the values below are what a local run uses.
+# If the battery ever changes `network_id`, the preset or the fork epochs, the
+# explicit Commit-Boost chain under `mev_params` must change with it.
 participants:
   - el_type: geth
     cl_type: lighthouse
@@ -53,3 +55,28 @@ mev_params:
   mev_builder_image: ethpandaops/reth-rbuilder@sha256:916ba84da2690e3e368f57da5b0c73bfd919b452de8b95f64895846e0f3a8308
   # ghcr.io/commit-boost/pbs:latest
   mev_boost_image: ghcr.io/commit-boost/pbs@sha256:8612c03681d390ab7d0154f5db1581584cd265563b723947da90cd00ba7ca415
+  # Commit-Boost reads the chain from the package's config.yaml by default,
+  # and its parser requires SECONDS_PER_SLOT, which the genesis generator no
+  # longer writes (it writes SLOT_DURATION_MS). So the chain is given
+  # explicitly: kurtosis's defaults for this network (12 s slots, genesis fork
+  # version 0x10000038, fulu from genesis, chain id 3151908 = 0x301824).
+  # chain_id must be a hex string; a bare integer does not parse. The rest is
+  # the package's own template (static_files/mev/commit-boost/cb-config.toml.tmpl).
+  commit_boost_config: |
+    chain = { genesis_time_secs = {{ .Timestamp }}, slot_time_secs = 12, genesis_fork_version = "0x10000038", fulu_fork_slot = 0, chain_id = "0x301824" }
+
+    [pbs]
+    host = "0.0.0.0"
+    port = {{ .Port }}
+
+    {{ range $index, $relay := .Relays }}
+    [[relays]]
+    id = "mev_relay_{{$index}}"
+    url = "{{ $relay }}"
+    {{- end }}
+
+    [logs.stdout]
+    level = "debug"
+
+    [logs.file]
+    enabled=false

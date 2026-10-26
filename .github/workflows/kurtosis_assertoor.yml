@@ -45,9 +45,10 @@ env:
   ENCLAVE: ethlambda-assertoor
   # The Commit-Boost check needs the fork's `--builder` / `--builder-proposals`
   # wiring for ethlambda, which the commit above lacks. It has its own pin so
-  # the base battery stays where it is. This commit is on the fork branch
-  # feat/ethlambda-builder-flags; see the README before changing it.
-  COMMIT_BOOST_PACKAGE_REF: 37fe57ea309b954361c0f33ac6efc570313ffaf6
+  # the base battery stays where it is. Fork PR #22 (that wiring) is merged as
+  # a15e7df; this commit adds PR #23's fix for the builder's enode bootnodes on
+  # top. Re-pin to #23's merge commit once it lands; see the README.
+  COMMIT_BOOST_PACKAGE_REF: 7fa7d1225fe5d975300ecc5584bf28ca6d42d451
   COMMIT_BOOST_ENCLAVE: ethlambda-commit-boost
 
 jobs:

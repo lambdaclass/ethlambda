@@ -111,7 +111,7 @@ is needed; do not pass `--image-download always`. From the repository root:
 
 ```bash
 git clone https://github.com/lambdaclass/ethereum-package.git /tmp/ethereum-package
-git -C /tmp/ethereum-package checkout 37fe57ea309b954361c0f33ac6efc570313ffaf6
+git -C /tmp/ethereum-package checkout 7fa7d1225fe5d975300ecc5584bf28ca6d42d451
 
 kurtosis run /tmp/ethereum-package --enclave ethlambda-commit-boost \
   --args-file tooling/kurtosis-assertoor/commit_boost_params.yaml
@@ -138,10 +138,30 @@ on push and on pull requests.
 
 ### The fork pin
 
-`COMMIT_BOOST_PACKAGE_REF` is `37fe57ea309b954361c0f33ac6efc570313ffaf6`, the
-commit on the `lambdaclass/ethereum-package` branch `feat/ethlambda-builder-flags`
-that adds ethlambda to `apply_external_builder_flags` (`--builder=<url>` for the
-beacon node, `--builder-proposals` for the validator client). That branch is
-lambdaclass/ethereum-package#22. If the fork PR is
-squash-merged, the commit is no longer reachable from the fork's default branch
-and may be garbage collected, so re-pin to the squash commit.
+lambdaclass/ethereum-package#22 added ethlambda to `apply_external_builder_flags`
+(`--builder=<url>` for the beacon node, `--builder-proposals` for the validator
+client) and is merged (`a15e7df`). `COMMIT_BOOST_PACKAGE_REF` is
+`7fa7d1225fe5d975300ecc5584bf28ca6d42d451`, from
+lambdaclass/ethereum-package#23, which adds the builder's enode bootnode fix on
+top of it. Re-pin to #23's merge commit once it lands: a squash-merge leaves the
+current commit unreachable from the fork's default branch, so it may be garbage
+collected.
+
+### Upstream workarounds
+
+A local run found two breakages in images and packages we do not control:
+
+| Breakage | Worked around in |
+|---|---|
+| `ethpandaops/reth-rbuilder:develop` (newest image, 2026-07-17) parses only enode URLs as bootnodes, and the package has passed ENRs since its 08-05 refactor, so the builder's execution client refused them | fork PR #23, through the `COMMIT_BOOST_PACKAGE_REF` pin |
+| Commit-Boost's PBS requires `SECONDS_PER_SLOT` in the chain config, and the genesis generator now writes only `SLOT_DURATION_MS` | `mev_params.commit_boost_config` in `commit_boost_params.yaml`, which gives the chain explicitly (`chain_id` has to be a hex string) |
+
+Drop each once the upstream is fixed. The explicit chain must change with the
+network parameters.
+
+### Startup noise
+
+The Commit-Boost PBS modules start after the consensus clients, so at startup
+ethlambda's beacon node logs "Builder is not answering" and its first
+registration batch fails. The validator client re-sends registrations every
+epoch, so this clears within an epoch and is not a failure.
