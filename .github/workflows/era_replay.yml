@@ -1,0 +1,216 @@
+name: Era replay
+
+# Replays real chain history from nimbus .era files through the beacon state
+# transition and checks the result against the states stored in the files.
+# Nothing is built here: it runs the image docker_publish.yaml pushes for the
+# same commit. See docs/era_replay.md.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/blockchain/state_transition/**"
+      - "crates/common/types/**"
+      - "crates/common/ssz-tree/**"
+      - "bin/ethlambda/src/era/**"
+      - ".github/workflows/era_replay.yml"
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "Image to run (default: the sha tag of the dispatched ref)"
+        required: false
+        type: string
+      eras:
+        description: >-
+          Override the matrix: space-separated `network:era[+era...][@K]`
+          entries, e.g. `mainnet:290 hoodi:199 hoodi:9@512`. `latest` is
+          accepted as an era. `@K` makes the entry a smoke run of K blocks
+          (a single era only, since a smoke run stops mid-era).
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  wait-for-image:
+    name: Wait for image
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - name: Name the image
+        id: image
+        env:
+          INPUT_IMAGE: ${{ inputs.image }}
+          SHA: ${{ github.sha }}
+        run: |
+          echo "image=${INPUT_IMAGE:-ghcr.io/lambdaclass/ethlambda:sha-${SHA::7}}" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for the image tag to exist
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          deadline=$((SECONDS + 75 * 60))
+          until docker manifest inspect "$IMAGE" > /dev/null 2>&1; do
+            if (( SECONDS >= deadline )); then
+              echo "::error::$IMAGE was not published within 75 minutes"
+              exit 1
+            fi
+            echo "$IMAGE not published yet, retrying in 60 s"
+            sleep 60
+          done
+          echo "$IMAGE is available"
+
+  matrix:
+    name: Select eras
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.select.outputs.include }}
+    steps:
+      - name: Build the matrix
+        id: select
+        env:
+          OVERRIDE: ${{ inputs.eras }}
+        run: |
+          # Era file N holds slots [(N-1)*8192, N*8192), so the file of a fork
+          # epoch E (N = E/256) holds the LAST pre-fork blocks and the upgrade
+          # runs in our own closing process_slots. The `F+F+1` entries add the
+          # first post-fork blocks.
+          #
+          # Mainnet era 290 (the last phase0 file, closing in altair) is left
+          # out: phase0 epoch processing is quadratic in the registry
+          # (get_base_reward recomputes get_total_active_balance per
+          # validator, stf/epoch/rewards.rs), and ~280k validators did not get
+          # through one epoch boundary in 30 minutes. Re-add `290` once that is
+          # fixed; the `eras` dispatch override can still request it.
+          #
+          # Hoodi: era 8 holds the last deneb blocks (electra epoch 2048) and
+          # the electra upgrade runs in our closing process_slots; 198+199 is
+          # the fulu upgrade (fulu epoch 50688 = file 198) plus the first fulu
+          # era. Full Hoodi eras fit the job limit only with the per-epoch
+          # total-active-balance cache from #648; without it a deneb-era block
+          # costs about 4.6 s, because get_base_reward_per_increment scans the
+          # registry per attestation.
+          default='[
+            {"network":"mainnet","eras":"566"},
+            {"network":"mainnet","eras":"758"},
+            {"network":"mainnet","eras":"1053"},
+            {"network":"mainnet","eras":"1422"},
+            {"network":"mainnet","eras":"1607+1608"},
+            {"network":"mainnet","eras":"latest"},
+            {"network":"hoodi","eras":"8"},
+            {"network":"hoodi","eras":"198+199"},
+            {"network":"hoodi","eras":"latest"},
+            {"network":"sepolia","eras":"222"},
+            {"network":"sepolia","eras":"518"},
+            {"network":"sepolia","eras":"869"},
+            {"network":"sepolia","eras":"1065+1066"},
+            {"network":"sepolia","eras":"1378"}
+          ]'
+          if [[ -n "$OVERRIDE" ]]; then
+            include=$(printf '%s\n' $OVERRIDE | jq -R -s -c '
+              split("\n") | map(select(length > 0)
+                | split(":") as [$network, $rest]
+                | ($rest | split("@")) as [$eras, $max]
+                | {network: $network, eras: $eras}
+                  + (if $max then {max_blocks: $max} else {} end))')
+          else
+            include=$(jq -c . <<< "$default")
+          fi
+          echo "include=$include" >> "$GITHUB_OUTPUT"
+
+  replay:
+    name: ${{ matrix.network }} era ${{ matrix.eras }}${{ matrix.max_blocks && format(' (first {0} blocks)', matrix.max_blocks) || '' }}
+    needs: [wait-for-image, matrix]
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.matrix.outputs.include) }}
+    steps:
+      - name: Replay
+        env:
+          IMAGE: ${{ needs.wait-for-image.outputs.image }}
+          NETWORK: ${{ matrix.network }}
+          ERAS: ${{ matrix.eras }}
+          MAX_BLOCKS: ${{ matrix.max_blocks }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/eras"
+          era_args=()
+          for era in ${ERAS//+/ }; do
+            era_args+=(--era "$era")
+          done
+          if [[ -n "$MAX_BLOCKS" ]]; then
+            era_args+=(--max-blocks "$MAX_BLOCKS")
+          fi
+          docker run --rm -v "$RUNNER_TEMP/eras:/eras" "$IMAGE" replay-era \
+            --network "$NETWORK" --era-dir /eras --download \
+            --report /eras/report.json "${era_args[@]}"
+
+      - name: Name the report
+        if: always()
+        env:
+          NETWORK: ${{ matrix.network }}
+          ERAS: ${{ matrix.eras }}
+        run: |
+          if [[ -f "$RUNNER_TEMP/eras/report.json" ]]; then
+            mv "$RUNNER_TEMP/eras/report.json" "$RUNNER_TEMP/report-$NETWORK-${ERAS//+/-}.json"
+          fi
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: era-replay-${{ matrix.network }}-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/report-*.json
+          if-no-files-found: ignore
+
+  notify:
+    name: Post failure to Slack
+    needs: [wait-for-image, matrix, replay]
+    if: failure() && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Find the failing entries
+        id: failed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          names=$(gh api --paginate \
+            "repos/$REPOSITORY/actions/runs/$RUN_ID/jobs" \
+            --jq '.jobs[] | select(.conclusion == "failure") | .name' \
+            | paste -sd, - | sed 's/,/, /g')
+          echo "names=$names" >> "$GITHUB_OUTPUT"
+
+      - name: Build Slack payload
+        # Context values go through the environment and `jq` assembles the
+        # JSON, so a name containing `"` or a newline cannot break the payload.
+        env:
+          FAILED: ${{ steps.failed.outputs.names }}
+          SHA: ${{ github.sha }}
+          COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # The backticks are literal Slack mrkdwn, not command substitution.
+          # shellcheck disable=SC2016
+          text=$(printf '❌ *Era replay* failed on <%s|`%s`>\nFailing: %s\n<%s|View run>' \
+            "$COMMIT_URL" "${SHA::7}" "${FAILED:-see the run}" "$RUN_URL")
+          jq -n --arg text "$text" \
+            '{blocks: [{type: "section", text: {type: "mrkdwn", text: $text}}]}' \
+            > era_replay_slack.json
+
+      - name: Post to Slack
+        env:
+          SLACK_WEBHOOK: ${{ secrets.ETHLAMBDA_GENERAL_SLACK_WEBHOOK }}
+        run: bash .github/scripts/publish_slack.sh era_replay_slack.json
