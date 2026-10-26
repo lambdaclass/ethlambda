@@ -1,0 +1,203 @@
+name: Kurtosis Assertoor
+
+# Starts a devnet with ethlambda beacon and validator clients next to
+# lighthouse, then runs assertoor's stability, block-proposal and sync checks
+# against every client pair. See tooling/kurtosis-assertoor/README.md.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "tooling/kurtosis-assertoor/**"
+      - ".github/workflows/kurtosis_assertoor.yml"
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "ethlambda image to test (default: ghcr.io/lambdaclass/ethlambda:unstable)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# A newer push to main (or to the PR) makes this run's result stale.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_REPO: ghcr.io/lambdaclass/ethlambda
+  KURTOSIS_VERSION: "1.20.0"
+  # The fork of ethpandaops/ethereum-package that adds `cl_type: ethlambda` and
+  # `vc_type: ethlambda`, pinned to a commit. Bump it deliberately.
+  ETHEREUM_PACKAGE_REPO: https://github.com/lambdaclass/ethereum-package.git
+  ETHEREUM_PACKAGE_REF: 67cb0e02dc0bd49ec9461cbf2ef7ac4a3232755f
+  ENCLAVE: ethlambda-assertoor
+
+jobs:
+  image:
+    name: Select ethlambda image
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    outputs:
+      image: ${{ steps.select.outputs.image }}
+    steps:
+      - name: Select image
+        id: select
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_IMAGE: ${{ inputs.image }}
+          SHA: ${{ github.sha }}
+        run: |
+          case "$EVENT" in
+            push)              image="$IMAGE_REPO:sha-${SHA::7}";;
+            workflow_dispatch) image="${INPUT_IMAGE:-$IMAGE_REPO:unstable}";;
+            *)                 image="$IMAGE_REPO:unstable";;
+          esac
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "Testing $image"
+
+      # docker_publish.yaml pushes sha-<7> a while after the push lands, so
+      # wait for it. Giving up after 75 minutes is a failure, not a pass.
+      - name: Wait for the image of this commit
+        if: github.event_name == 'push'
+        env:
+          IMAGE: ${{ steps.select.outputs.image }}
+        run: |
+          deadline=$((SECONDS + 75 * 60))
+          until docker manifest inspect "$IMAGE" > /dev/null 2>&1; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::$IMAGE was not published within 75 minutes"
+              exit 1
+            fi
+            echo "Waiting for $IMAGE"
+            sleep 60
+          done
+          echo "$IMAGE is available"
+
+  assertoor:
+    name: Assertoor
+    needs: image
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      failed: ${{ steps.collect.outputs.failed }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Free up disk space
+        uses: ./.github/actions/free-disk
+
+      - name: Install kurtosis
+        run: |
+          echo "deb [trusted=yes] https://sdk.kurtosis.com/kurtosis-cli-release-artifacts/ /" \
+            | sudo tee /etc/apt/sources.list.d/kurtosis.list
+          sudo apt-get update
+          sudo apt-get install -y "kurtosis-cli=$KURTOSIS_VERSION"
+          kurtosis analytics disable
+          kurtosis version
+
+      # Run the package from a clone, not as `github.com/...@<ref>`: kurtosis
+      # refuses a remote package whose kurtosis.yml names another repository,
+      # and the fork's still says ethpandaops/ethereum-package.
+      - name: Fetch ethereum-package at the pinned commit
+        run: |
+          git init "$RUNNER_TEMP/ethereum-package"
+          cd "$RUNNER_TEMP/ethereum-package"
+          git fetch --depth 1 "$ETHEREUM_PACKAGE_REPO" "$ETHEREUM_PACKAGE_REF"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$ETHEREUM_PACKAGE_REF"
+
+      - name: Point the args at the image under test
+        env:
+          IMAGE: ${{ needs.image.outputs.image }}
+        run: |
+          cp tooling/kurtosis-assertoor/network_params.yaml "$RUNNER_TEMP/args.yaml"
+          yq -i '
+            (.participants[] | select(.cl_type == "ethlambda") | .cl_image) = strenv(IMAGE) |
+            (.participants[] | select(.vc_type == "ethlambda") | .vc_image) = strenv(IMAGE)
+          ' "$RUNNER_TEMP/args.yaml"
+          cat "$RUNNER_TEMP/args.yaml"
+
+      - name: Start the devnet
+        run: |
+          kurtosis run "$RUNNER_TEMP/ethereum-package" \
+            --enclave "$ENCLAVE" --args-file "$RUNNER_TEMP/args.yaml" \
+            | tee "$RUNNER_TEMP/kurtosis_output.txt"
+
+      - name: Wait for the assertoor tests
+        id: tests
+        run: |
+          url=$(kurtosis port print "$ENCLAVE" assertoor http)
+          expected=$(yq '.assertoor_params.tests | length' "$RUNNER_TEMP/args.yaml")
+          tooling/kurtosis-assertoor/scripts/wait-assertoor.sh \
+            "$url" "$expected" 95 "$RUNNER_TEMP/assertoor-results"
+
+      # Runs after a failure too: the notify job names the failed tests.
+      - name: Collect failed tests
+        id: collect
+        if: always()
+        run: |
+          failed="$RUNNER_TEMP/assertoor-results/failed.txt"
+          {
+            echo "failed<<EOF"
+            if [ -s "$failed" ]; then cat "$failed"; else echo "assertoor did not produce a result (the devnet did not start?)"; fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Dump the enclave
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/dump"
+          cp "$RUNNER_TEMP/args.yaml" "$RUNNER_TEMP/dump/args.yaml"
+          cp "$RUNNER_TEMP/kurtosis_output.txt" "$RUNNER_TEMP/dump/" || true
+          cp -r "$RUNNER_TEMP/assertoor-results" "$RUNNER_TEMP/dump/" || true
+          cd "$RUNNER_TEMP/dump"
+          kurtosis enclave dump "$ENCLAVE" || true
+
+      - name: Upload the dump and results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: enclave-dump-${{ github.run_id }}
+          path: ${{ runner.temp }}/dump
+          if-no-files-found: warn
+
+      - name: Remove the enclave
+        if: always()
+        run: kurtosis enclave rm -f "$ENCLAVE" || true
+
+  notify:
+    name: Post failure to Slack
+    needs: [image, assertoor]
+    if: failure() && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build Slack payload
+        # Values go through the environment and the JSON is built with jq, as in
+        # daily_ci.yml, so a failed-test name cannot break the payload.
+        env:
+          SHA: ${{ github.sha }}
+          FAILED: ${{ needs.assertoor.outputs.failed }}
+          IMAGE_RESULT: ${{ needs.image.result }}
+          COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$IMAGE_RESULT" != "success" ]; then
+            FAILED="no image: the sha-${SHA::7} tag never appeared"
+          fi
+          # The backticks are literal Slack mrkdwn, not command substitution.
+          # shellcheck disable=SC2016
+          text=$(printf '❌ *Kurtosis Assertoor* failed on <%s|`%s`>\nFailed: %s\n<%s|View run>' \
+            "$COMMIT_URL" "${SHA::7}" "$(echo "$FAILED" | paste -sd, - | sed 's/,/, /g')" "$RUN_URL")
+          jq -n --arg text "$text" \
+            '{blocks: [{type: "section", text: {type: "mrkdwn", text: $text}}]}' \
+            > assertoor_slack.json
+
+      - name: Post to Slack
+        env:
+          SLACK_WEBHOOK: ${{ secrets.ETHLAMBDA_GENERAL_SLACK_WEBHOOK }}
+        run: bash .github/scripts/publish_slack.sh assertoor_slack.json

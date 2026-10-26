@@ -117,6 +117,9 @@ See `.claude/skills/devnet-runner/SKILL.md` for running a local multi-client dev
 (node roster, image tags, pause/unpause instability testing) and
 `.claude/skills/devnet-log-review/SKILL.md` for analyzing the dumped logs.
 
+The kurtosis + assertoor battery (ethlambda beacon and validator next to lighthouse, run on
+every push to `main`) is in `tooling/kurtosis-assertoor/README.md`.
+
 ## Important Patterns & Idioms
 
 ### Trait Implementations
