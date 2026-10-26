@@ -258,14 +258,12 @@ pub fn wire_params(
         "Backboning attestation subnets"
     );
 
-    // Say plainly what is still advertised without being backed by behavior,
-    // so a running node never implies more than it does. Storing and serving
-    // the custodied columns logged above is no longer in that gap, and neither
-    // is the attestation subnet backbone; sync committee subnet subscription,
-    // and publishing, still are.
-    warn!(
-        "Advertising cgc={custody_group_count} while subscribing to no sync committee \
-         subnet, and publishing only what its Beacon API clients submit"
+    // Say plainly what the node does about sync committees, so a running node
+    // never implies more than it does: its subnets are joined only when a
+    // validator client asks, and `syncnets` advertises exactly those.
+    info!(
+        "Advertising cgc={custody_group_count}; sync committee subnets are joined only on a \
+         validator client's request"
     );
 
     Ok(BeaconWireParams {
