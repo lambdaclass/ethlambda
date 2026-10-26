@@ -30,6 +30,7 @@ mod spec;
 pub mod test_driver;
 
 pub use beacon::builder_client::{BuilderClient, BuilderError, VersionedBid};
+pub use beacon::builder_flow::breaker::FallbackThresholds;
 
 pub(crate) use base::json_response;
 
@@ -245,6 +246,9 @@ pub struct BeaconApiHandles {
     /// The builder `--builder` names, for the builder flow's endpoints.
     /// `None` when the node runs without one.
     pub builder: Option<BuilderClient>,
+    /// When block production skips the builder for a local block
+    /// (`--builder-fallback-*`). Unused without a builder.
+    pub builder_fallback: FallbackThresholds,
 }
 
 /// Start the HTTP servers for a beacon node.
@@ -261,6 +265,13 @@ pub async fn start_beacon_rpc_server(
     peer_id: String,
     shutdown: CancellationToken,
 ) -> Result<(), std::io::Error> {
+    let builder = handles.builder.map(|client| {
+        Arc::new(beacon::builder_flow::Builder::new(
+            client,
+            handles.builder_fallback,
+            sync_status.clone(),
+        ))
+    });
     let api_router = build_beacon_api_router(store, config.version, peer_id)
         .layer(Extension(sync_status))
         .layer(Extension(handles.p2p))
@@ -270,12 +281,17 @@ pub async fn start_beacon_rpc_server(
         .layer(Extension(handles.custody_columns))
         .layer(Extension(beacon::validator::FeeRecipients::default()))
         .layer(Extension(handles.engine))
-        .layer(Extension(handles.builder))
         .layer(Extension(handles.events))
         .layer(Extension(handles.identity))
         .layer(Extension(beacon::graffiti::OwnVersion(Arc::new(
             handles.client_version,
         ))));
+    // Layered only when `--builder` is set, so every handler reads it as an
+    // `Option<Extension<_>>` and a node without one keeps the local path.
+    let api_router = match builder {
+        Some(builder) => api_router.layer(Extension(builder)),
+        None => api_router,
+    };
     start_http_servers(config, Some(api_router), shutdown).await
 }
 

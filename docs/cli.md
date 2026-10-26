@@ -116,6 +116,9 @@ from a normal build.
 | `--safe-slots-to-import-optimistically` | the specification's own value | How far behind the wall clock a block must be before it may be imported optimistically on age alone |
 | `--builder` | none | Base URL of a builder API endpoint, normally MEV-Boost (e.g. `http://127.0.0.1:18550`). Without it every block is built locally |
 | `--builder-header-timeout` | `1000` | Milliseconds block production waits for the builder's bid; also sent to the builder as `X-Timeout-Ms`. Requires `--builder` |
+| `--builder-fallback-skips` | `3` | Build locally when more than this many consecutive slots right before the proposal had no block (the circuit breaker). Requires `--builder` |
+| `--builder-fallback-skips-per-epoch` | `8` | Build locally when more than this many of the slots in the epoch's worth before the proposal had no block. Requires `--builder` |
+| `--builder-fallback-epochs-since-finalization` | `3` | Build locally when the proposal is more than this many epochs past the finalized checkpoint. Requires `--builder` |
 
 Accepted range is `CUSTODY_REQUIREMENT` to `NUMBER_OF_CUSTODY_GROUPS` (4 to
 128), enforced at parse time rather than clamped: serving a different set than

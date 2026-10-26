@@ -465,6 +465,14 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             })
             .transpose()?,
     };
+    let builder_fallback = match &network {
+        Network::Lean(_) => ethlambda_rpc::FallbackThresholds::DEFAULT,
+        Network::Mainnet { mainnet, .. } => ethlambda_rpc::FallbackThresholds {
+            skips: mainnet.builder_fallback_skips,
+            skips_per_epoch: mainnet.builder_fallback_skips_per_epoch,
+            epochs_since_finalization: mainnet.builder_fallback_epochs_since_finalization,
+        },
+    };
     if let Some(builder) = builder.clone() {
         tokio::spawn(async move {
             let _ = builder
@@ -872,6 +880,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     client_version: version::engine_client_version(),
                     identity: rpc_identity,
                     builder,
+                    builder_fallback,
                 },
                 local_peer_id,
                 rpc_shutdown,
