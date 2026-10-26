@@ -5,8 +5,7 @@ use axum::{Extension, Router};
 use ethlambda_blockchain::{EventBus, SyncStatusController};
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
-    attestation_pool::SharedAttestationPool,
-    builder_market::SharedBuilderMarket,
+    attestation_pool::SharedAttestationPool, builder_market::SharedBuilderMarket,
     payload_attestation_pool::SharedPayloadAttestationPool,
     sync_committee_pool::SharedSyncCommitteePool,
 };

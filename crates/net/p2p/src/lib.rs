@@ -47,8 +47,8 @@ use ethlambda_network_api::{
         PublishBeaconAggregate, PublishBeaconAttestation, PublishBeaconBlock,
         PublishExecutionPayloadBid, PublishExecutionPayloadEnvelope,
         PublishPayloadAttestationMessage, PublishProposerPreferences,
-        PublishSyncCommitteeContribution, PublishSyncCommitteeMessage,
-        SubscribeAttestationSubnets, SubscribeSyncCommitteeSubnets,
+        PublishSyncCommitteeContribution, PublishSyncCommitteeMessage, SubscribeAttestationSubnets,
+        SubscribeSyncCommitteeSubnets,
     },
 };
 use ethlambda_state_transition::beacon::aggregate::MAX_AGGREGATES_PER_SLOT;
@@ -61,8 +61,7 @@ use ethlambda_state_transition::beacon::gossip::{
     sync_committee::{SeenSyncCommitteeMessages, SeenSyncContributions},
 };
 use ethlambda_state_transition::beacon::{
-    attestation_pool::SharedAttestationPool,
-    builder_market::SharedBuilderMarket,
+    attestation_pool::SharedAttestationPool, builder_market::SharedBuilderMarket,
     payload_attestation_pool::SharedPayloadAttestationPool,
     sync_committee_pool::SharedSyncCommitteePool,
 };
