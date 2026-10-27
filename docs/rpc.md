@@ -240,7 +240,7 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `GET` | `/eth/v1/node/syncing` | JSON | Head slot, sync distance, whether the head is optimistic |
 | `GET` | `/eth/v1/node/health` | *(status only)* | `200` caught up, `206` syncing or on an optimistic head |
 | `GET` | `/eth/v1/node/version` | JSON | Client version string |
-| `GET` | `/eth/v1/node/identity` | JSON | Peer ID and metadata only (see below) |
+| `GET` | `/eth/v1/node/identity` | JSON | Peer ID, ENR and listen multiaddrs (see below) |
 | `GET`, `POST` | `/eth/v1/beacon/states/{state_id}/validators` | JSON | Registry entries by index or pubkey, with status |
 | `GET` | `/eth/v1/beacon/states/{state_id}/validators/{validator_id}` | JSON | One registry entry, by index or pubkey; `404` if there is none |
 | `GET` | `/eth/v1/validator/duties/proposer/{epoch}` | JSON | Proposers for any epoch from the head's up to one past the wall clock's |
@@ -838,8 +838,11 @@ the block under it really sits at that slot. This matters because it is the
 slot a checkpoint-syncing peer asks for right after reading the finalized
 state. A slot the store holds nothing at is still a `404`.
 
-`/eth/v1/node/identity` reports `peer_id` and `metadata`; `enr`,
-`p2p_addresses` and `discovery_addresses` are empty.
+`/eth/v1/node/identity` reports the peer id, the ENR discv5 publishes, and the
+node's QUIC, TCP and discv5 multiaddrs. The multiaddrs need
+`--discovery.advertise-ip`, since a node bound to `0.0.0.0` does not know the
+address peers reach it on; without the flag they are empty and the ENR carries
+no IP. `metadata` is still a placeholder.
 
 ### `GET /eth/v1/events`
 
