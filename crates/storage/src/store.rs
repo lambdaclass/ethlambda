@@ -793,7 +793,9 @@ pub(crate) struct BeaconScratch {
     /// production path carries its verdict as an `on_block` parameter instead.
     pub(crate) payload_statuses: HashMap<ExecutionBlockHash, PayloadStatusV1>,
     /// Beacon root to `(slot, execution block hash)`. A cache, not a source of
-    /// truth: every entry is recoverable by decoding the block. Unlike its
+    /// truth: every entry is recoverable by decoding the block. Filled at
+    /// import, for the checkpoint anchor (the one block never imported), and on
+    /// resume for the unfinalized window. Unlike its
     /// neighbours it *is* bounded, by `prune_beacon_el_block_hashes`, because
     /// forkchoiceUpdated reads it once per head move for the whole life of the
     /// process.
@@ -3808,6 +3810,7 @@ impl Store {
         let mut timeliness = HashMap::new();
         let mut payloads = HashSet::new();
         let mut gloas_roots = Vec::new();
+        let mut el_hashes = Vec::new();
         for (key, _) in view
             .prefix_iterator(Table::LiveChain, &[])
             .expect("iterator")
@@ -3826,6 +3829,20 @@ impl Store {
                     .try_into()
                     .expect("a stored timeliness has one byte per deadline");
                 timeliness.insert(root, bytes.map(|byte| byte != 0));
+            }
+            // `el_block_hashes` is a cache of what the block body says, and a
+            // restart empties it; without it every stored block would read as
+            // "not an execution block" to `is_optimistic_candidate_block` and
+            // the `latestValidHash` walk. Cached against the block's own slot,
+            // so `prune_beacon_el_block_hashes` still bounds it.
+            if let Some(hash) = view
+                .read_with(Table::BlockHeaders, &root.to_ssz(), |bytes| {
+                    decode_beacon_block_value(bytes).execution_block_hash_if_execution_block()
+                })
+                .expect("read")
+                .flatten()
+            {
+                el_hashes.push((root, slot, hash));
             }
             let fork = view
                 .get(Table::BlockHeaders, &root.to_ssz())
@@ -3864,6 +3881,9 @@ impl Store {
         let mut scratch = self.beacon.lock().unwrap();
         scratch.block_timeliness.extend(timeliness);
         scratch.verified_payloads.extend(payloads);
+        for (root, slot, hash) in el_hashes {
+            scratch.el_block_hashes.insert(root, (slot, hash));
+        }
         for root in gloas_roots {
             scratch
                 .payload_timeliness_vote
@@ -8243,6 +8263,63 @@ mod tests {
             Some(empty)
         );
         assert_eq!(reopened.payload_timeliness_vote(&phase0_root), None);
+    }
+
+    fn fulu_test_block(
+        slot: u64,
+        parent_root: H256,
+        el_hash: ExecutionBlockHash,
+    ) -> SignedBeaconBlock {
+        use ethlambda_types::beacon::containers::electra;
+
+        let mut body = electra::BeaconBlockBody::empty();
+        body.execution_payload.block_hash = el_hash;
+        SignedBeaconBlock::Fulu(electra::SignedBeaconBlock {
+            message: electra::BeaconBlock {
+                slot,
+                proposer_index: 0,
+                parent_root,
+                state_root: H256::ZERO,
+                body,
+            },
+            signature: Default::default(),
+        })
+    }
+
+    #[test]
+    fn resume_rebuilds_execution_hashes_for_the_unfinalized_window() {
+        let old = H256::from([1u8; 32]);
+        let finalized = H256::from([2u8; 32]);
+        let child = H256::from([3u8; 32]);
+        let premerge = H256::from([4u8; 32]);
+        let backend = beacon_backend_finalized_at(finalized);
+        let mut store = reopen(backend.clone());
+        let rows = [
+            (old, SLOTS_PER_EPOCH - 3, H256::ZERO, 0xa1),
+            (finalized, SLOTS_PER_EPOCH - 2, old, 0xa2),
+            (child, SLOTS_PER_EPOCH - 1, finalized, 0xa3),
+            // A zero payload hash is a pre-merge shape: no entry.
+            (premerge, SLOTS_PER_EPOCH, child, 0),
+        ];
+        for (root, slot, parent, byte) in rows {
+            let hash = ExecutionBlockHash::repeat_byte(byte);
+            store
+                .insert_signed_block(root, fulu_test_block(slot, parent, hash))
+                .expect("insert block");
+        }
+
+        let reopened = reopen(backend);
+
+        assert_eq!(reopened.beacon_el_block_hash(old), None);
+        assert_eq!(
+            reopened.beacon_el_block_hash(finalized),
+            Some(ExecutionBlockHash::repeat_byte(0xa2))
+        );
+        assert_eq!(
+            reopened.beacon_el_block_hash(child),
+            Some(ExecutionBlockHash::repeat_byte(0xa3))
+        );
+        assert_eq!(reopened.beacon_el_block_hash(premerge), None);
     }
 
     #[test]

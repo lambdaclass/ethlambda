@@ -1390,6 +1390,20 @@ impl SignedBeaconBlock {
         }
     }
 
+    /// This block's payload hash when the specification's `is_execution_block`
+    /// holds for it, so the one rule that decides which blocks have an
+    /// execution hash to cache.
+    ///
+    /// [`Self::execution_block_hash`] minus the all-zero hash: a pre-merge
+    /// bellatrix block carries a payload field whose every byte is zero, and
+    /// that is "not an execution block", not a block with a zero hash. Testing
+    /// the hash alone is enough, since it is a keccak digest in a real payload
+    /// and zero in the empty one. `None` for phase0, altair and gloas too (see
+    /// [`Self::execution_block_hash`]).
+    pub fn execution_block_hash_if_execution_block(&self) -> Option<ExecutionBlockHash> {
+        self.execution_block_hash().filter(|hash| !hash.is_zero())
+    }
+
     /// How many blob KZG commitments this block's body carries: zero before
     /// deneb, which introduced them.
     ///
@@ -2298,6 +2312,21 @@ mod tests {
         let expected = ExecutionBlockHash::repeat_byte(7);
         let block = SignedBeaconBlock::Fulu(empty_electra_signed_block(expected));
         assert_eq!(block.execution_block_hash(), Some(expected));
+    }
+
+    #[test]
+    fn execution_block_hash_if_execution_block_gives_post_merge_hashes_only() {
+        let expected = ExecutionBlockHash::repeat_byte(7);
+        let electra = SignedBeaconBlock::Electra(empty_electra_signed_block(expected));
+        assert_eq!(
+            electra.execution_block_hash_if_execution_block(),
+            Some(expected)
+        );
+        let deneb_like =
+            SignedBeaconBlock::Electra(empty_electra_signed_block(ExecutionBlockHash::ZERO));
+        assert_eq!(deneb_like.execution_block_hash_if_execution_block(), None);
+        let phase0 = SignedBeaconBlock::Phase0(empty_phase0_signed_block());
+        assert_eq!(phase0.execution_block_hash_if_execution_block(), None);
     }
 
     // -- body_root --
