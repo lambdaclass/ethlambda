@@ -77,6 +77,7 @@ pub fn process_block(
     config: &Config,
     engine: &ExecutionEngine,
     committees: &CommitteeCache,
+    options: super::block::BlockProcessingOptions,
 ) -> Result<()> {
     super::block::process_block_header(
         state,
@@ -93,7 +94,7 @@ pub fn process_block(
         config,
         engine,
     )?;
-    super::block::process_randao(state, &block.body.randao_reveal)?;
+    super::block::process_randao(state, &block.body.randao_reveal, options.randao)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
     process_operations(
         state,
