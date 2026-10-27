@@ -42,6 +42,11 @@ pub(crate) enum ConfigFileError {
         "SLOT_DURATION_MS is {millis}, but a beacon slot is a non-zero whole number of seconds"
     )]
     SlotDurationNotWholeSeconds { millis: u64 },
+    #[error(
+        "SECONDS_PER_SLOT is {seconds}, too large for its SLOT_DURATION_MS \
+         (SECONDS_PER_SLOT * 1000) to fit in a u64"
+    )]
+    SlotDurationOverflow { seconds: u64 },
 }
 
 impl ConfigFile {
@@ -96,7 +101,9 @@ impl ConfigFile {
 ///   guessing would run every duty at the wrong time;
 /// - only `SLOT_DURATION_MS`: it must be a non-zero whole number of seconds,
 ///   and the seconds are derived from it, rather than left at mainnet's 12;
-/// - only `SECONDS_PER_SLOT`: the milliseconds are derived from it;
+/// - only `SECONDS_PER_SLOT`: the milliseconds are derived from it, and a
+///   value whose milliseconds do not fit in a `u64` is refused rather than
+///   saturated, which would leave the two fields disagreeing;
 /// - neither: the defaults stand.
 ///
 /// Shared by a loaded directory and the built-in networks, which both parse
@@ -123,7 +130,10 @@ fn reconcile_slot_time(
             config.seconds_per_slot = millis / 1_000;
         }
         (true, false) => {
-            config.slot_duration_ms = config.seconds_per_slot.saturating_mul(1_000);
+            let seconds = config.seconds_per_slot;
+            config.slot_duration_ms = seconds
+                .checked_mul(1_000)
+                .ok_or(ConfigFileError::SlotDurationOverflow { seconds })?;
         }
         (false, false) => {}
     }
@@ -208,6 +218,21 @@ mod tests {
 
         let millis_only = ConfigFile::parse("SLOT_DURATION_MS: 6000").unwrap();
         assert_eq!(millis_only.config.seconds_per_slot, 6);
+    }
+
+    #[test]
+    fn seconds_only_is_refused_once_its_milliseconds_overflow() {
+        let largest = u64::MAX / 1_000;
+        let at_limit = ConfigFile::parse(&format!("SECONDS_PER_SLOT: {largest}")).unwrap();
+        assert_eq!(at_limit.config.seconds_per_slot, largest);
+        assert_eq!(at_limit.config.slot_duration_ms, largest * 1_000);
+
+        let past_limit = largest + 1;
+        let err = ConfigFile::parse(&format!("SECONDS_PER_SLOT: {past_limit}")).unwrap_err();
+        assert!(
+            matches!(err, ConfigFileError::SlotDurationOverflow { seconds } if seconds == past_limit),
+            "got {err}"
+        );
     }
 
     #[test]
