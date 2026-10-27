@@ -1645,6 +1645,9 @@ impl DataColumnSidecar {
 }
 
 #[cfg(test)]
+mod json_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::beacon::constants;

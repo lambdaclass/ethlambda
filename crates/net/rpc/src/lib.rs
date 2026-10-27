@@ -5,7 +5,7 @@ use axum::{Extension, Router};
 use ethlambda_blockchain::{EventBus, SyncStatusController};
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
-    payload_attestation_pool::SharedPayloadAttestationPool,
+    builder_market::SharedBuilderMarket, payload_attestation_pool::SharedPayloadAttestationPool,
     sync_committee_pool::SharedSyncCommitteePool,
 };
 use ethlambda_storage::Store;
@@ -201,6 +201,9 @@ pub struct BeaconApiHandles {
     /// Filled by gossip and the payload attestation pool endpoint, read by
     /// block production and the pool's GET.
     pub payload_attestation_pool: SharedPayloadAttestationPool,
+    /// Bids, proposer preferences and known payloads: filled by the bid and
+    /// preferences endpoints and by gossip, read by block production.
+    pub builder_market: SharedBuilderMarket,
     /// Filled by gossip and the sync committee endpoints, read by block
     /// production and the contribution endpoint.
     pub sync_committee_pool: SharedSyncCommitteePool,
@@ -240,6 +243,7 @@ pub async fn start_beacon_rpc_server(
         .layer(Extension(sync_status))
         .layer(Extension(handles.p2p))
         .layer(Extension(handles.payload_attestation_pool))
+        .layer(Extension(handles.builder_market))
         .layer(Extension(handles.sync_committee_pool))
         .layer(Extension(handles.custody_columns))
         .layer(Extension(beacon::validator::FeeRecipients::default()))
@@ -469,6 +473,12 @@ pub(crate) mod test_utils {
         pub(crate) payload_attestations: std::sync::Mutex<
             Vec<ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage>,
         >,
+        pub(crate) bids: std::sync::Mutex<
+            Vec<ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadBid>,
+        >,
+        pub(crate) proposer_preferences: std::sync::Mutex<
+            Vec<ethlambda_types::beacon::containers::gloas::SignedProposerPreferences>,
+        >,
         /// `(subnet ids, message)` per sync committee message published.
         pub(crate) sync_messages: std::sync::Mutex<
             Vec<(
@@ -548,6 +558,22 @@ pub(crate) mod test_utils {
             sidecars: Vec<ethlambda_types::beacon::containers::DataColumnSidecar>,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
             self.envelopes.lock().unwrap().push((*envelope, sidecars));
+            Ok(())
+        }
+
+        fn publish_execution_payload_bid(
+            &self,
+            bid: ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadBid,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.bids.lock().unwrap().push(bid);
+            Ok(())
+        }
+
+        fn publish_proposer_preferences(
+            &self,
+            preferences: ethlambda_types::beacon::containers::gloas::SignedProposerPreferences,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.proposer_preferences.lock().unwrap().push(preferences);
             Ok(())
         }
 
