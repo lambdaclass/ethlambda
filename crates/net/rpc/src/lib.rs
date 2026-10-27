@@ -5,7 +5,6 @@ use axum::{Extension, Router};
 use ethlambda_blockchain::{EventBus, SyncStatusController};
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
-    attestation_pool::SharedAttestationPool,
     payload_attestation_pool::SharedPayloadAttestationPool,
     sync_committee_pool::SharedSyncCommitteePool,
 };
@@ -199,9 +198,6 @@ pub struct BeaconApiHandles {
     /// Through which the pool, aggregate and block endpoints gossip what a
     /// validator client hands them.
     pub p2p: RpcToP2PRef,
-    /// Filled by the attestation pool endpoint and the aggregator subnets,
-    /// read by the aggregate endpoint and block production.
-    pub attestation_pool: SharedAttestationPool,
     /// Filled by gossip and the payload attestation pool endpoint, read by
     /// block production and the pool's GET.
     pub payload_attestation_pool: SharedPayloadAttestationPool,
@@ -243,7 +239,6 @@ pub async fn start_beacon_rpc_server(
     let api_router = build_beacon_api_router(store, config.version, peer_id)
         .layer(Extension(sync_status))
         .layer(Extension(handles.p2p))
-        .layer(Extension(handles.attestation_pool))
         .layer(Extension(handles.payload_attestation_pool))
         .layer(Extension(handles.sync_committee_pool))
         .layer(Extension(handles.custody_columns))
@@ -456,9 +451,15 @@ pub(crate) mod test_utils {
                 Vec<ethlambda_types::beacon::primitives::ValidatorIndex>,
             )>,
         >,
+        pub(crate) operations:
+            std::sync::Mutex<Vec<ethlambda_types::beacon::operation::BeaconOperation>>,
         pub(crate) subscriptions: std::sync::Mutex<Vec<(u64, u64)>>,
         pub(crate) blocks:
             std::sync::Mutex<Vec<ethlambda_types::beacon::containers::SignedBeaconBlock>>,
+        pub(crate) sidecars:
+            std::sync::Mutex<Vec<ethlambda_types::beacon::containers::DataColumnSidecar>>,
+        /// When set, `publish_beacon_operation` fails as a stopped actor would.
+        pub(crate) fail_operations: std::sync::atomic::AtomicBool,
         pub(crate) envelopes: std::sync::Mutex<
             Vec<(
                 ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope,
@@ -507,6 +508,20 @@ pub(crate) mod test_utils {
             Ok(())
         }
 
+        fn publish_beacon_operation(
+            &self,
+            operation: ethlambda_types::beacon::operation::BeaconOperation,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            if self
+                .fail_operations
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(spawned_concurrency::error::ActorError::ActorStopped);
+            }
+            self.operations.lock().unwrap().push(operation);
+            Ok(())
+        }
+
         fn subscribe_attestation_subnets(
             &self,
             subnets: Vec<(u64, u64)>,
@@ -518,8 +533,10 @@ pub(crate) mod test_utils {
         fn publish_beacon_block(
             &self,
             block: ethlambda_types::beacon::containers::SignedBeaconBlock,
+            sidecars: Vec<ethlambda_types::beacon::containers::DataColumnSidecar>,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
             self.blocks.lock().unwrap().push(block);
+            self.sidecars.lock().unwrap().extend(sidecars);
             Ok(())
         }
 
