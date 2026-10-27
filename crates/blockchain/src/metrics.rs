@@ -59,6 +59,7 @@ pub const BLOCK_IMPORT_PHASES: &[&str] = &[
     "verify_struct",
     "verify_crypto",
     "stf",
+    "writer_wait",
     "db_write",
     "fc_head",
     "block_atts",
