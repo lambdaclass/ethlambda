@@ -18,7 +18,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ethlambda_blockchain::metrics::{BLOCK_ARRIVAL_PHASES, BLOCK_IMPORT_PHASES};
 use ethlambda_blockchain::{BlockChainServer, ImportOutcome};
@@ -133,6 +133,7 @@ pub(crate) async fn replay_corpus(dir: &Path, options: &ReplayOptions) -> eyre::
             position + 1,
             format_ms(wall_seconds)
         );
+        pause_between_blocks(options.block_delay).await;
     }
 
     let total = manifest.slots.len();
@@ -156,11 +157,14 @@ pub(crate) async fn replay_corpus(dir: &Path, options: &ReplayOptions) -> eyre::
             phases,
             outcome: "imported",
         });
+        // After `finish_at_most_once` and the sample are recorded, so the
+        // sleep is in no phase delta and no `wall_seconds`.
+        pause_between_blocks(options.block_delay).await;
     }
 
     Ok(Report::new(
         Environment::collect(),
-        params_from(&manifest, dir),
+        params_from(&manifest, dir, options.block_delay),
         samples,
     ))
 }
@@ -236,7 +240,7 @@ fn read_anchor(dir: &Path, config: &Config) -> eyre::Result<(BeaconState, Signed
 
 /// The report parameters a manifest already carries, so the loop above never
 /// has to reconstruct them from samples.
-fn params_from(manifest: &Manifest, dir: &Path) -> Params {
+fn params_from(manifest: &Manifest, dir: &Path, block_delay_ms: u64) -> Params {
     Params {
         mode: "import",
         corpus: dir.display().to_string(),
@@ -247,6 +251,19 @@ fn params_from(manifest: &Manifest, dir: &Path) -> Params {
         range_start: manifest.range_start,
         range_end: manifest.range_end,
         blocks: manifest.slots.len(),
+        block_delay_ms,
+    }
+}
+
+/// Sleep `delay_ms` so the state writer can drain before the next block.
+///
+/// Called only between measured spans: a replay feeds blocks back to back,
+/// faster than a live node's one block per slot, so without a pause the
+/// importer can wait on the writer's queue and measure the writer instead of
+/// the import.
+async fn pause_between_blocks(delay_ms: u64) {
+    if delay_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
 }
 

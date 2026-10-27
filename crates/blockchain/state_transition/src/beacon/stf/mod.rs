@@ -155,7 +155,14 @@ pub fn state_transition(
         )?;
     }
 
-    block::process_block(state, signed_block, config, engine, committees)?;
+    block::process_block(
+        state,
+        signed_block,
+        config,
+        engine,
+        committees,
+        block::BlockProcessingOptions::default(),
+    )?;
     // As in `process_slot`: the post-state's root, checked below and needed
     // again in the next slot, is then computed on the state's own nodes.
     state.apply_pending_mutations();
