@@ -15,7 +15,7 @@ use crate::beacon::error::Result;
 use crate::beacon::helpers::accessors::{CommitteeCache, CommitteeCacheExt, get_domain};
 use crate::beacon::helpers::misc::{compute_epoch_at_slot, compute_signing_root};
 use crate::beacon::helpers::predicates::are_indices_sorted_and_unique;
-use crate::beacon::primitives::{HashTreeRoot as _, ValidatorIndex};
+use crate::beacon::primitives::{Domain, HashTreeRoot as _, ValidatorIndex};
 use crate::beacon::{bls, constants};
 
 /// The committee members whose bit is set in `attestation`, in ascending order.
@@ -79,6 +79,24 @@ pub fn is_valid_indexed_attestation(
     state: &BeaconState,
     indexed_attestation: &IndexedAttestation,
 ) -> bool {
+    let domain = get_domain(
+        state,
+        constants::DOMAIN_BEACON_ATTESTER,
+        Some(indexed_attestation.data.target.epoch),
+    );
+    is_valid_indexed_attestation_with_domain(state, indexed_attestation, domain)
+}
+
+/// [`is_valid_indexed_attestation`] under a signing domain the caller chose.
+///
+/// For gossip, which checks against a state that may not have reached the
+/// attestation's fork: see
+/// [`crate::beacon::helpers::accessors::get_domain_from_schedule`].
+pub fn is_valid_indexed_attestation_with_domain(
+    state: &BeaconState,
+    indexed_attestation: &IndexedAttestation,
+    domain: Domain,
+) -> bool {
     let indices: &[ValidatorIndex] = &indexed_attestation.attesting_indices;
     if indices.is_empty() || !are_indices_sorted_and_unique(indices) {
         return false;
@@ -92,11 +110,6 @@ pub fn is_valid_indexed_attestation(
         }
     }
 
-    let domain = get_domain(
-        state,
-        constants::DOMAIN_BEACON_ATTESTER,
-        Some(indexed_attestation.data.target.epoch),
-    );
     let signing_root = compute_signing_root(indexed_attestation.data.hash_tree_root(), domain);
     bls::fast_aggregate_verify(&pubkeys, signing_root, &indexed_attestation.signature)
 }
