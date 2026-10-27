@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-07e448bd.js";
+            window.path_to_searchindex_js = "searchindex-31b61dfe.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -857,10 +857,11 @@ is left out.</li>
 </ul>
 <p>The payload attestation pool is shared with P2P, which fills it from accepted
 gossip, so a block this node builds carries the votes its peers sent too.</p>
-<p><code>tooling/kurtosis-validator/network_params_ethlambda_beacon.yaml</code> points the
-validator client at this node alone, so every block on that devnet is one this
-node built; it also runs spamoor, whose blob traffic makes those blocks carry
-blobs.</p>
+<p>A <code>cl_type: ethlambda</code> participant in our ethereum-package fork
+(<a href="https://github.com/lambdaclass/ethereum-package/tree/add-ethlambda"><code>lambdaclass/ethereum-package</code></a>,
+branch <code>add-ethlambda</code>) runs an ethlambda validator client that, by default,
+talks to this node alone, so every block its validators propose is one this
+node built.</p>
 <h3 id="encoding"><a class="header" href="#encoding">Encoding</a></h3>
 <p><strong>JSON is the default</strong>; SSZ is served on <code>Accept: application/octet-stream</code>,
 which is the order lighthouse serves. An <code>Accept</code> listing both is ranked by its
