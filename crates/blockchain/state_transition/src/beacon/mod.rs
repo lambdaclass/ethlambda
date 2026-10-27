@@ -70,6 +70,7 @@
 
 pub mod aggregate;
 pub mod block_production;
+pub mod builder_market;
 /// The specification's `bls` module, which lives in `ethlambda-crypto` so the
 /// beacon pools in `ethlambda-storage` can aggregate signatures.
 pub use ethlambda_crypto::bls;
