@@ -365,6 +365,11 @@ actual_slot = finalized_slot + 1 + relative_index
     **Known gap**: ethrex's `DiscoveryServer` cannot replace the served ENR at runtime, so its
     `eth2` entry keeps the startup digest until a restart; peers discovering the node after a
     boundary reject the record
+  - `voluntary_exit`, `proposer_slashing`, `attester_slashing` and `bls_to_execution_change`
+    validate in p2p like aggregates (`gossip::operations`, against the unadvanced head state,
+    which must be electra or fulu: under a gloas head every operation is IGNOREd) and feed
+    `Store::operation_pool`; the attestation pool is in `Store` too. Both are in memory, and
+    block production packs the operation pool through `pack_operations`
 - **Req/Resp**: Status, BlocksByRoot, BlocksByRange (snappy frame compression + varint length)
   - Beacon adds `beacon_blocks_by_{range,root}/2` alongside its Status/Ping/MetaData/Goodbye set.
     Both serve from the checkpoint-anchored store, and `build_status` advertises it
@@ -675,6 +680,11 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   `ethlambda-blockchain`, `ethlambda-rpc` and `ethlambda-test-fixtures` all
   depend on this crate. That is the cost of one crate holding both chains'
   rules; the module is not feature-gated.
+- The BLS wrapper lives in `ethlambda_crypto::bls` and is re-exported as
+  `beacon::bls`, so p2p's operation validation and `ethlambda-rpc` can verify
+  signatures without depending on this crate: `ethlambda-storage`'s attestation
+  pool (now owned by `Store`) aggregates signatures, and storage cannot depend
+  on `ethlambda-state-transition`.
 - The `beacon_aggregate_and_proof`/`beacon_attestation_{subnet_id}` gossip rules
   (committees, `is_aggregator`, all the signatures) live in
   `gossip::{aggregate,attestation}`, validated in `ethlambda-p2p` off the vote
@@ -843,8 +853,9 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
 - Nothing is ignored for being unimplemented in the state transition or fork
   choice. Ignored cases are the `LightClient*` containers (a different layer,
   out of scope), `networking/gossip_*` cases outside what the node validates
-  (every fork's cases for topics it has no validator for, non-fulu cases of the
-  four it validates, and the fulu vectors in `SKIPPED`, which assume a
+  (every fork's cases for topics it has no validator for, cases from forks a
+  validated topic's rules do not cover per `validated_forks`, gloas's
+  operation vectors among them, and the vectors in `SKIPPED`, which assume a
   bad-block cache), and the `heze` fixture tree. `heze` does
   not parse as a `ForkName`, so `collect` would skip it silently;
   `UNMODELED_FORKS` names it and
