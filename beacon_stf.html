@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-f2b6cd32.js";
+            window.path_to_searchindex_js = "searchindex-07e448bd.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -670,6 +670,28 @@ crosses the boundary, so that page also records the rule this module chose.
 Two new handlers, <code>on_execution_payload_envelope</code> and
 <code>on_payload_attestation_message</code>, join the spec’s list of ways to change the
 store.</p>
+<p>Fork choice has the same problem on a longer loop: <code>get_head</code> weighs every
+validator’s latest vote by the voter’s balance at the justified checkpoint, and
+the boost needs the total balance of that state’s active, unslashed
+validators. Both read one
+<code>JustifiedBalances</code> snapshot (<code>ethlambda-types</code>, held in the store’s
+<code>BeaconScratch</code>) instead of a <code>validator(i)</code> descent per vote and a registry
+scan per boost. It is built from <code>checkpoint_state(justified)</code> only, keyed by
+the checkpoint it came from, so a moved justified checkpoint is a miss with no
+hook on the writers; it holds a zero for validators that are inactive or
+slashed, and the sum of what it holds, floored at one increment. That sum
+leaves slashed-but-active validators out, as <code>calculate_committee_fraction</code>
+does since consensus-specs #5679 (v1.7.0-beta.4), so it is not
+<code>get_total_active_balance</code>.
+Equivocations stay out of it: they are store-level and can change at any time,
+so they are filtered per vote. <code>get_weight</code> stays as the specification’s
+per-root definition, and the fork-choice fixture runner checks
+<code>compute_weights</code> against it at every <code>checks</code> step.</p>
+<p>The latest votes are stored the same way, as a dense table indexed by validator
+index rather than a hash map, so the vote loop reads votes and snapshot
+balances in index order. The table grows to the highest voting index, which is
+why <code>set_latest_message</code> only takes indices from validated attestations (a
+debug assertion bounds it).</p>
 <h2 id="macros-and-traits"><a class="header" href="#macros-and-traits">Macros and traits</a></h2>
 <p>Two <code>macro_rules!</code> in the whole crate, both local, both replacing boilerplate that
 would otherwise run to hundreds of near-identical lines: the fixed-length byte
@@ -733,6 +755,38 @@ parallel cannot reduce the total CPU time it takes:</p>
 eleven cores busy to about eight. The 3.3x understates the hashing change,
 because the later run does strictly more work: <code>transition</code> went from failing
 immediately to running every case.</p>
+<h2 id="epoch-transition-precompute"><a class="header" href="#epoch-transition-precompute">Epoch-transition precompute</a></h2>
+<p>The first block of an epoch used to run <code>process_epoch</code> inline on the import
+path (<code>fork_choice::on_block</code>, then <code>process_slots</code>), followed by the rehash
+the state-root check needs. The beacon chain actor now does that work ahead of
+time, on a blocking worker, and the import resumes from the result.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Step</th><th>What happens</th></tr>
+</thead>
+<tbody>
+<tr><td>Trigger: head</td><td>An import leaves a block at the last slot of epoch <code>E</code> as head: precompute <code>(E+1, head_root)</code>. Covers a late last-slot block.</td></tr>
+<tr><td>Trigger: timer</td><td>Three quarters into the last slot of <code>E</code> (derived from the configured slot duration), if nothing for the current head is cached or running: precompute from the head, which is an earlier block when the last slot was skipped.</td></tr>
+<tr><td>Gate</td><td>Skipped while the sync tracker says syncing. The head trigger skips a head more than a slot behind the wall clock; the timer trigger skips a head before <code>E</code>’s first slot, since the tracker reports a stalled network as synced and advancing such a head would replay every epoch it missed. Either way a worker crosses one epoch boundary at most. At most one worker runs; a key already cached is not recomputed.</td></tr>
+<tr><td>Work</td><td>Clone the head state, <code>process_slots</code> to the first slot of <code>E+1</code>, flush pending writes, <code>hash_tree_root</code> (so the tree nodes’ hashes are memoized), send the state back to the actor.</td></tr>
+<tr><td>Store</td><td>The store’s state cache under <code>CacheKey::CheckpointState { epoch: E+1, root: head_root }</code>. <code>fork_choice::checkpoint_state</code> derives the same value for that checkpoint (the checkpoint block’s post-state advanced to the epoch’s first slot), so attestation targets for <code>E+1</code> hit it too.</td></tr>
+<tr><td>Consume</td><td><code>on_block</code> looks up <code>CheckpointState { block_epoch, parent_root }</code> when the parent’s slot is before the epoch’s first slot and the block is at or after it. A hit clones the entry, advances any remaining skipped slots, and applies the block with <code>stf::apply_block</code>; the post-state is identical to the inline path’s.</td></tr>
+<tr><td>Miss</td><td>Today’s path: clone the parent state and run <code>stf::state_transition</code>. A block that arrives while the worker is still running takes this path too; the late result is stored and goes unused by it.</td></tr>
+</tbody>
+</table>
+</div>
+<p>The code lives in <code>crates/blockchain/src/epoch_precompute.rs</code> (triggers, worker,
+actor handlers) and <code>fork_choice::advance_to_epoch_start</code> /
+<code>fork_choice::transition_block</code> in the state-transition crate. The upgrade to a
+new fork at the boundary happens inside <code>process_slots</code>, so the precompute needs
+no fork-specific code. Gloas is covered by the same key: a gloas block’s
+post-state never contains its own payload (the next block applies it inside
+<code>process_block</code>, after <code>process_slots</code>), and the store keeps exactly one state
+per root, so the entry for <code>(E+1, root)</code> is advanced from the same state an
+import of a child of <code>root</code> would clone. Hits and misses, worker time and
+trigger counts are exported as <code>lean_beacon_epoch_precompute_*</code>; see
+<a href="metrics.html">metrics</a>.</p>
 <h2 id="one-test-per-fixture-case"><a class="header" href="#one-test-per-fixture-case">One test per fixture case</a></h2>
 <p>The suites were once one test apiece, each looping over its own cases and
 aggregating outcomes. That made every failure a failure of the whole suite: the

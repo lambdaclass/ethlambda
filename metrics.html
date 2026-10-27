@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-f2b6cd32.js";
+            window.path_to_searchindex_js = "searchindex-07e448bd.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -663,6 +663,29 @@ pool would let that burst answer <code>Ignore(Overloaded)</code> for a block or 
 instead. Neither pool has a metric of its own yet; a permit exhausted on
 either shows up as <code>outcome="ignore",reason="overloaded"</code> on
 <code>lean_beacon_gossip_validation_total</code>, for the topics that draw from it.</p>
+<h3 id="beacon-peer-scoring"><a class="header" href="#beacon-peer-scoring">Beacon Peer Scoring</a></h3>
+<p>Gossipsub peer scoring runs on the beacon wire only; see
+<a href="./beacon_wire.html#peer-scoring">beacon_wire.md</a> for the parameters and the
+mesh-delivery gate. These are ethlambda-specific, not part of the leanMetrics
+spec.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th><th>Buckets</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_gossipsub_peers_by_score</code></td><td>Gauge</td><td>Gossipsub peers by score band</td><td>Every 10 s, in the swarm task</td><td>band=non_negative,negative,below_gossip,below_publish,below_graylist</td><td></td></tr>
+<tr><td><code>lean_gossipsub_score_disconnects_total</code></td><td>Counter</td><td>Peers disconnected for a gossipsub score below the graylist (-16000)</td><td>When the 10 s check disconnects one</td><td></td><td></td></tr>
+<tr><td><code>lean_gossipsub_mesh_delivery_scoring</code></td><td>Gauge</td><td>1 while mesh message deliveries (P3) are scored, 0 while the head lags the wall clock or is warming up after catching up</td><td>Every slot, on the scoring refresh</td><td></td><td></td></tr>
+</tbody>
+</table>
+</div>
+<p>The bands are mutually exclusive and split at the gossip (-4000), publish
+(-8000) and graylist (-16000) thresholds, so they add up to the peers
+gossipsub knows. <code>below_graylist</code> counts the peers that same pass is about to
+disconnect, so it should not hold a value across passes. A persistent
+<code>below_gossip</code>/<code>below_publish</code> population points at slow peers first: a full
+send queue costs a peer 10 points per dropped message.</p>
 <h3 id="beacon-block-publication"><a class="header" href="#beacon-block-publication">Beacon Block Publication</a></h3>
 <p><code>POST /eth/v2/beacon/blocks</code> computes every blob’s cells and batch-verifies all
 its cell proofs on a blocking thread before it gossips anything, then builds the
@@ -730,6 +753,51 @@ not part of the leanMetrics spec.</p>
 <p>Expect one miss per epoch per chain, and hits otherwise. <code>unkeyable</code> is the
 genesis state asking about its own epoch, and should be zero on a
 checkpoint-synced follower.</p>
+<h3 id="beacon-justified-balances"><a class="header" href="#beacon-justified-balances">Beacon Justified Balances</a></h3>
+<p>Beacon fork choice weighs every vote by the voter’s effective balance at the
+justified checkpoint. <code>justified_balances</code> (in
+<code>crates/blockchain/state_transition/src/beacon/fork_choice.rs</code>) flattens that
+state into one array, keyed by the justified checkpoint and rebuilt on the first
+<code>get_head</code> after the checkpoint moves. This is ethlambda-specific, not part of
+the leanMetrics spec.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_beacon_justified_balances_lookups_total</code></td><td>Counter</td><td>Snapshot lookups, by whether the cached snapshot served them</td><td>On every <code>justified_balances</code> call: <code>get_head</code>’s weights, the proposer boost, and the reorg helpers</td><td>result=hit,miss</td></tr>
+<tr><td><code>lean_beacon_justified_balances_build_seconds</code></td><td>Histogram</td><td>Time to build one snapshot from the checkpoint state</td><td>On every miss, around the registry pass (the checkpoint state lookup is not included)</td><td></td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Read the miss rate against the justified-checkpoint rate</strong>: about one miss
+per justified checkpoint change, so a handful per hour on a healthy chain.
+Misses that track <code>get_head</code> calls mean the justified checkpoint is flapping
+between branches, or the snapshot is being replaced between two readers.</p>
+<h3 id="beacon-epoch-precompute"><a class="header" href="#beacon-epoch-precompute">Beacon Epoch Precompute</a></h3>
+<p>The beacon chain actor advances the head state across the next epoch boundary
+ahead of time, so the first block of an epoch does not run <code>process_epoch</code> on
+the import path. See “Epoch-transition precompute” in
+<a href="beacon_stf.html"><code>beacon_stf.md</code></a>. This is ethlambda-specific, not part of the
+leanMetrics spec.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th><th>Buckets</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_beacon_epoch_precompute_lookups_total</code></td><td>Counter</td><td>Epoch-crossing imports, by whether a precomputed boundary state was cached</td><td>On each import whose parent is before the block’s epoch start and whose block is at or after it</td><td>result=hit,miss</td><td></td></tr>
+<tr><td><code>lean_beacon_epoch_precompute_seconds</code></td><td>Histogram</td><td>Worker time to advance, flush and hash one state</td><td>When a precompute worker finishes</td><td></td><td>0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 8</td></tr>
+<tr><td><code>lean_beacon_epoch_precompute_started_total</code></td><td>Counter</td><td>Workers started, by trigger</td><td>When a worker is spawned</td><td>trigger=head,timer</td><td></td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Read the hit ratio against epochs.</strong> On a synced follower nearly every
+epoch-crossing import should hit. Misses mean the worker had not finished (the
+block raced it, see <code>lean_beacon_epoch_precompute_seconds</code> against the slot
+duration), the node was syncing, or the entry was evicted from the state cache.
+A <code>timer</code> start with no matching <code>head</code> start means the last slot was skipped.</p>
 <h3 id="beacon-pubkey-cache"><a class="header" href="#beacon-pubkey-cache">Beacon Pubkey Cache</a></h3>
 <p>Every BLS signature check <code>ethlambda beacon</code> runs (block import, fork choice,
 gossip validation) resolves its signers’ compressed public keys to validated

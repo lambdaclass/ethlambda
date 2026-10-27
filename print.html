@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-f2b6cd32.js";
+            window.path_to_searchindex_js = "searchindex-07e448bd.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -2272,6 +2272,28 @@ crosses the boundary, so that page also records the rule this module chose.
 Two new handlers, <code>on_execution_payload_envelope</code> and
 <code>on_payload_attestation_message</code>, join the spec’s list of ways to change the
 store.</p>
+<p>Fork choice has the same problem on a longer loop: <code>get_head</code> weighs every
+validator’s latest vote by the voter’s balance at the justified checkpoint, and
+the boost needs the total balance of that state’s active, unslashed
+validators. Both read one
+<code>JustifiedBalances</code> snapshot (<code>ethlambda-types</code>, held in the store’s
+<code>BeaconScratch</code>) instead of a <code>validator(i)</code> descent per vote and a registry
+scan per boost. It is built from <code>checkpoint_state(justified)</code> only, keyed by
+the checkpoint it came from, so a moved justified checkpoint is a miss with no
+hook on the writers; it holds a zero for validators that are inactive or
+slashed, and the sum of what it holds, floored at one increment. That sum
+leaves slashed-but-active validators out, as <code>calculate_committee_fraction</code>
+does since consensus-specs #5679 (v1.7.0-beta.4), so it is not
+<code>get_total_active_balance</code>.
+Equivocations stay out of it: they are store-level and can change at any time,
+so they are filtered per vote. <code>get_weight</code> stays as the specification’s
+per-root definition, and the fork-choice fixture runner checks
+<code>compute_weights</code> against it at every <code>checks</code> step.</p>
+<p>The latest votes are stored the same way, as a dense table indexed by validator
+index rather than a hash map, so the vote loop reads votes and snapshot
+balances in index order. The table grows to the highest voting index, which is
+why <code>set_latest_message</code> only takes indices from validated attestations (a
+debug assertion bounds it).</p>
 <h2 id="macros-and-traits"><a class="header" href="#macros-and-traits">Macros and traits</a></h2>
 <p>Two <code>macro_rules!</code> in the whole crate, both local, both replacing boilerplate that
 would otherwise run to hundreds of near-identical lines: the fixed-length byte
@@ -2335,6 +2357,38 @@ parallel cannot reduce the total CPU time it takes:</p>
 eleven cores busy to about eight. The 3.3x understates the hashing change,
 because the later run does strictly more work: <code>transition</code> went from failing
 immediately to running every case.</p>
+<h2 id="epoch-transition-precompute"><a class="header" href="#epoch-transition-precompute">Epoch-transition precompute</a></h2>
+<p>The first block of an epoch used to run <code>process_epoch</code> inline on the import
+path (<code>fork_choice::on_block</code>, then <code>process_slots</code>), followed by the rehash
+the state-root check needs. The beacon chain actor now does that work ahead of
+time, on a blocking worker, and the import resumes from the result.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Step</th><th>What happens</th></tr>
+</thead>
+<tbody>
+<tr><td>Trigger: head</td><td>An import leaves a block at the last slot of epoch <code>E</code> as head: precompute <code>(E+1, head_root)</code>. Covers a late last-slot block.</td></tr>
+<tr><td>Trigger: timer</td><td>Three quarters into the last slot of <code>E</code> (derived from the configured slot duration), if nothing for the current head is cached or running: precompute from the head, which is an earlier block when the last slot was skipped.</td></tr>
+<tr><td>Gate</td><td>Skipped while the sync tracker says syncing. The head trigger skips a head more than a slot behind the wall clock; the timer trigger skips a head before <code>E</code>’s first slot, since the tracker reports a stalled network as synced and advancing such a head would replay every epoch it missed. Either way a worker crosses one epoch boundary at most. At most one worker runs; a key already cached is not recomputed.</td></tr>
+<tr><td>Work</td><td>Clone the head state, <code>process_slots</code> to the first slot of <code>E+1</code>, flush pending writes, <code>hash_tree_root</code> (so the tree nodes’ hashes are memoized), send the state back to the actor.</td></tr>
+<tr><td>Store</td><td>The store’s state cache under <code>CacheKey::CheckpointState { epoch: E+1, root: head_root }</code>. <code>fork_choice::checkpoint_state</code> derives the same value for that checkpoint (the checkpoint block’s post-state advanced to the epoch’s first slot), so attestation targets for <code>E+1</code> hit it too.</td></tr>
+<tr><td>Consume</td><td><code>on_block</code> looks up <code>CheckpointState { block_epoch, parent_root }</code> when the parent’s slot is before the epoch’s first slot and the block is at or after it. A hit clones the entry, advances any remaining skipped slots, and applies the block with <code>stf::apply_block</code>; the post-state is identical to the inline path’s.</td></tr>
+<tr><td>Miss</td><td>Today’s path: clone the parent state and run <code>stf::state_transition</code>. A block that arrives while the worker is still running takes this path too; the late result is stored and goes unused by it.</td></tr>
+</tbody>
+</table>
+</div>
+<p>The code lives in <code>crates/blockchain/src/epoch_precompute.rs</code> (triggers, worker,
+actor handlers) and <code>fork_choice::advance_to_epoch_start</code> /
+<code>fork_choice::transition_block</code> in the state-transition crate. The upgrade to a
+new fork at the boundary happens inside <code>process_slots</code>, so the precompute needs
+no fork-specific code. Gloas is covered by the same key: a gloas block’s
+post-state never contains its own payload (the next block applies it inside
+<code>process_block</code>, after <code>process_slots</code>), and the store keeps exactly one state
+per root, so the entry for <code>(E+1, root)</code> is advanced from the same state an
+import of a child of <code>root</code> would clone. Hits and misses, worker time and
+trigger counts are exported as <code>lean_beacon_epoch_precompute_*</code>; see
+<a href="#metrics-2">metrics</a>.</p>
 <h2 id="one-test-per-fixture-case"><a class="header" href="#one-test-per-fixture-case">One test per fixture case</a></h2>
 <p>The suites were once one test apiece, each looping over its own cases and
 aggregating outcomes. That made every failure a failure of the whole suite: the
@@ -2743,6 +2797,103 @@ not this node custodies that subnet (publishing to a subnet one has not joined
 goes through fanout), all under the digest the block’s slot falls in. Operations
 posted to the <code>pool/*</code> routes are published on their topics the same way, under
 the digest of the wall-clock slot.</p>
+<h3 id="peer-scoring"><a class="header" href="#peer-scoring">Peer scoring</a></h3>
+<p>Gossipsub peer scoring is on for this wire only
+(<code>crate::beacon::scoring</code>). The parameters are lighthouse’s
+(<code>gossipsub_scoring_parameters.rs</code>), ported formula for formula; Grandine,
+Teku and Lodestar use the same constants, so thresholds mean the same thing
+here as on most of mainnet.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Threshold</th><th>Score</th><th>Effect</th></tr>
+</thead>
+<tbody>
+<tr><td>gossip</td><td>-4000</td><td>no IHAVE/IWANT to or from the peer</td></tr>
+<tr><td>publish</td><td>-8000</td><td>left out of this node’s publishes</td></tr>
+<tr><td>graylist</td><td>-16000</td><td>every RPC ignored, and the peer is disconnected</td></tr>
+</tbody>
+</table>
+</div>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Topic</th><th>Weight</th><th>Mesh deliveries (P3)</th></tr>
+</thead>
+<tbody>
+<tr><td><code>beacon_block</code></td><td>0.5</td><td>scored</td></tr>
+<tr><td><code>beacon_aggregate_and_proof</code></td><td>0.5</td><td>scored</td></tr>
+<tr><td><code>beacon_attestation_{0..63}</code></td><td>1/64 each</td><td>scored</td></tr>
+<tr><td><code>voluntary_exit</code>, <code>proposer_slashing</code>, <code>attester_slashing</code></td><td>0.05 each</td><td>off</td></tr>
+</tbody>
+</table>
+</div>
+<p>Columns, sync committee contributions and BLS changes carry no topic
+parameters. Only Prysm scores columns. This node <code>Ignore</code>s every contribution
+and change (no consumer), and a delivery is only credited once accepted, so
+scoring P3 there would penalize every mesh peer for this node’s own gap. All
+64 attestation subnets get parameters, not just the backbone ones, because
+aggregator duties join others at runtime.</p>
+<p>Two differences from lighthouse:</p>
+<ul>
+<li><code>mesh_n</code> is this node’s <code>D</code> (8), not lighthouse’s 5. It only enters the
+first-message-delivery cap.</li>
+<li><strong>P3 waits for this node to keep up.</strong> Lighthouse joins these topics only
+once synced, so it has no mesh while it catches up. This node subscribes at
+startup, and while catching up it <code>Ignore</code>s every aggregate and attestation
+voting for a block it has not imported. A mesh peer credited with no
+aggregates scores below the graylist, so a restart would graylist the whole
+aggregate mesh because of this node’s lag. <code>MeshDeliveryGate</code> turns P3 off
+while the head lags the wall clock by more than
+<code>MESH_DELIVERY_MAX_HEAD_LAG</code> slots, and back on only after an epoch within
+that lag, so the counters have refilled. While P3 is off its threshold and
+weight are zero but its cap is not, so the counters keep counting to their
+real ceiling. <code>SyncStatus</code> cannot serve as this gate: on the mainnet
+follower it reported <code>synced</code> through a 10-minute catch-up up to 98 slots
+behind, since its network-stall rule reads a lagging freshest-known block
+as a stalled network.</li>
+</ul>
+<p>The block, aggregate and attestation parameters depend on the active
+validator count, so the p2p actor rebuilds them every slot from the head’s
+pinned current-epoch shuffling (<code>CommitteeCache::head_current_committees</code>)
+and hands them to the swarm. The swarm starts on lighthouse’s placeholder (32
+validators, P3 off) until the first refresh, which runs at startup. Every 10
+s the swarm task disconnects peers below the graylist. There is no ban list:
+a peer’s negative score is kept for <code>retain_score</code> (100 epochs) after it
+leaves, so a peer that reconnects comes back graylisted and is dropped again.</p>
+<p>Around a fork-digest boundary the node holds two digests’ topics, and every
+held digest gets the whole parameter set (exits and slashings included),
+scored by its role:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Digest</th><th>Topic weights</th><th>P3</th></tr>
+</thead>
+<tbody>
+<tr><td>upcoming, joined <code>SUBSCRIBE_LEAD_EPOCHS</code> ahead</td><td>as above</td><td>off: nothing is published under it yet</td></tr>
+<tr><td>current</td><td>as above</td><td>gated as above</td></tr>
+<tr><td>previous, held <code>UNSUBSCRIBE_LAG_EPOCHS</code> after</td><td>0</td><td>off</td></tr>
+</tbody>
+</table>
+</div>
+<ul>
+<li><strong>Parameters before joins.</strong> <code>transition::apply</code> hands the swarm every held
+digest’s parameters before it subscribes, on the same command channel.
+Gossipsub tracks a mesh peer on a topic only if the topic had parameters
+when the peer was grafted; parameters installed later never reach that
+mesh.</li>
+<li><strong>The previous digest weighs nothing.</strong> Its traffic moves to the new
+digest at the boundary, so its delivery counters drain. Still scored, the
+aggregate topic alone would graylist an honest mesh peer 53 slots after the
+boundary (at 1M validators), before the topic is left, and leaving it would
+charge every mesh peer the sticky P3b. Lighthouse zeroes the same weights
+(<code>remove_topic_weight_except</code>).</li>
+<li><strong>A switch restarts the warmup.</strong> The new digest’s counters start empty,
+but its mesh, formed before the boundary, can already be past the
+deliveries’ activation (one epoch for blocks and aggregates). P3 on the new
+digest therefore waits <code>MESH_DELIVERY_WARMUP_SLOTS</code>, as after a catch-up.
+Lighthouse joins two slots ahead, so activation alone covers it there.</li>
+</ul>
 <h2 id="aggregate-attestations"><a class="header" href="#aggregate-attestations">Aggregate attestations</a></h2>
 <p><code>beacon_aggregate_and_proof</code> reaches fork choice. It is how a follower learns
 votes for the <em>current</em> head rather than only the votes a block body carries,
@@ -3199,6 +3350,9 @@ as a query filter, so a <code>quic</code>-only record is invisible to it.</p>
 <tr><td><code>lean_beacon_aggregate_end_to_end_seconds</code></td><td>Wire to fork choice, for aggregates applied on arrival</td></tr>
 <tr><td><code>lean_beacon_aggregate_total{outcome}</code></td><td>Aggregates by <code>applied</code>, <code>invalid</code>, <code>known_subset</code> or <code>queue_full</code></td></tr>
 <tr><td><code>lean_beacon_aggregates_deferred</code></td><td>Aggregates held until their own slot has passed</td></tr>
+<tr><td><code>lean_gossipsub_peers_by_score{band}</code></td><td>Gossipsub peers by score band; see <a href="#peer-scoring">Peer scoring</a></td></tr>
+<tr><td><code>lean_gossipsub_score_disconnects_total</code></td><td>Peers disconnected for a score below the graylist</td></tr>
+<tr><td><code>lean_gossipsub_mesh_delivery_scoring</code></td><td>1 while P3 is scored, 0 while the head lags or is warming up</td></tr>
 <tr><td><code>lean_beacon_publish_data_columns_seconds</code></td><td>Time to compute and verify a published block’s cells and build its sidecars; see <a href="#metrics-2">metrics.md</a></td></tr>
 </tbody>
 </table>
@@ -5508,6 +5662,29 @@ pool would let that burst answer <code>Ignore(Overloaded)</code> for a block or 
 instead. Neither pool has a metric of its own yet; a permit exhausted on
 either shows up as <code>outcome="ignore",reason="overloaded"</code> on
 <code>lean_beacon_gossip_validation_total</code>, for the topics that draw from it.</p>
+<h3 id="beacon-peer-scoring"><a class="header" href="#beacon-peer-scoring">Beacon Peer Scoring</a></h3>
+<p>Gossipsub peer scoring runs on the beacon wire only; see
+<a href="#peer-scoring">beacon_wire.md</a> for the parameters and the
+mesh-delivery gate. These are ethlambda-specific, not part of the leanMetrics
+spec.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th><th>Buckets</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_gossipsub_peers_by_score</code></td><td>Gauge</td><td>Gossipsub peers by score band</td><td>Every 10 s, in the swarm task</td><td>band=non_negative,negative,below_gossip,below_publish,below_graylist</td><td></td></tr>
+<tr><td><code>lean_gossipsub_score_disconnects_total</code></td><td>Counter</td><td>Peers disconnected for a gossipsub score below the graylist (-16000)</td><td>When the 10 s check disconnects one</td><td></td><td></td></tr>
+<tr><td><code>lean_gossipsub_mesh_delivery_scoring</code></td><td>Gauge</td><td>1 while mesh message deliveries (P3) are scored, 0 while the head lags the wall clock or is warming up after catching up</td><td>Every slot, on the scoring refresh</td><td></td><td></td></tr>
+</tbody>
+</table>
+</div>
+<p>The bands are mutually exclusive and split at the gossip (-4000), publish
+(-8000) and graylist (-16000) thresholds, so they add up to the peers
+gossipsub knows. <code>below_graylist</code> counts the peers that same pass is about to
+disconnect, so it should not hold a value across passes. A persistent
+<code>below_gossip</code>/<code>below_publish</code> population points at slow peers first: a full
+send queue costs a peer 10 points per dropped message.</p>
 <h3 id="beacon-block-publication"><a class="header" href="#beacon-block-publication">Beacon Block Publication</a></h3>
 <p><code>POST /eth/v2/beacon/blocks</code> computes every blob’s cells and batch-verifies all
 its cell proofs on a blocking thread before it gossips anything, then builds the
@@ -5575,6 +5752,51 @@ not part of the leanMetrics spec.</p>
 <p>Expect one miss per epoch per chain, and hits otherwise. <code>unkeyable</code> is the
 genesis state asking about its own epoch, and should be zero on a
 checkpoint-synced follower.</p>
+<h3 id="beacon-justified-balances"><a class="header" href="#beacon-justified-balances">Beacon Justified Balances</a></h3>
+<p>Beacon fork choice weighs every vote by the voter’s effective balance at the
+justified checkpoint. <code>justified_balances</code> (in
+<code>crates/blockchain/state_transition/src/beacon/fork_choice.rs</code>) flattens that
+state into one array, keyed by the justified checkpoint and rebuilt on the first
+<code>get_head</code> after the checkpoint moves. This is ethlambda-specific, not part of
+the leanMetrics spec.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_beacon_justified_balances_lookups_total</code></td><td>Counter</td><td>Snapshot lookups, by whether the cached snapshot served them</td><td>On every <code>justified_balances</code> call: <code>get_head</code>’s weights, the proposer boost, and the reorg helpers</td><td>result=hit,miss</td></tr>
+<tr><td><code>lean_beacon_justified_balances_build_seconds</code></td><td>Histogram</td><td>Time to build one snapshot from the checkpoint state</td><td>On every miss, around the registry pass (the checkpoint state lookup is not included)</td><td></td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Read the miss rate against the justified-checkpoint rate</strong>: about one miss
+per justified checkpoint change, so a handful per hour on a healthy chain.
+Misses that track <code>get_head</code> calls mean the justified checkpoint is flapping
+between branches, or the snapshot is being replaced between two readers.</p>
+<h3 id="beacon-epoch-precompute"><a class="header" href="#beacon-epoch-precompute">Beacon Epoch Precompute</a></h3>
+<p>The beacon chain actor advances the head state across the next epoch boundary
+ahead of time, so the first block of an epoch does not run <code>process_epoch</code> on
+the import path. See “Epoch-transition precompute” in
+<a href="#beacon-chain-state-transition"><code>beacon_stf.md</code></a>. This is ethlambda-specific, not part of the
+leanMetrics spec.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th><th>Buckets</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_beacon_epoch_precompute_lookups_total</code></td><td>Counter</td><td>Epoch-crossing imports, by whether a precomputed boundary state was cached</td><td>On each import whose parent is before the block’s epoch start and whose block is at or after it</td><td>result=hit,miss</td><td></td></tr>
+<tr><td><code>lean_beacon_epoch_precompute_seconds</code></td><td>Histogram</td><td>Worker time to advance, flush and hash one state</td><td>When a precompute worker finishes</td><td></td><td>0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 8</td></tr>
+<tr><td><code>lean_beacon_epoch_precompute_started_total</code></td><td>Counter</td><td>Workers started, by trigger</td><td>When a worker is spawned</td><td>trigger=head,timer</td><td></td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Read the hit ratio against epochs.</strong> On a synced follower nearly every
+epoch-crossing import should hit. Misses mean the worker had not finished (the
+block raced it, see <code>lean_beacon_epoch_precompute_seconds</code> against the slot
+duration), the node was syncing, or the entry was evicted from the state cache.
+A <code>timer</code> start with no matching <code>head</code> start means the last slot was skipped.</p>
 <h3 id="beacon-pubkey-cache"><a class="header" href="#beacon-pubkey-cache">Beacon Pubkey Cache</a></h3>
 <p>Every BLS signature check <code>ethlambda beacon</code> runs (block import, fork choice,
 gossip validation) resolves its signers’ compressed public keys to validated
@@ -6224,8 +6446,8 @@ is built from it, and clones are handed to the BlockChain and P2P actors.</p>
 <tr><td><code>BlockBodies</code></td><td>root</td><td><code>BlockBody</code> (lean only)</td><td>never</td></tr>
 <tr><td><code>BlockProof</code></td><td>slot ‖ root</td><td>aggregate proof (<code>MultiMessageAggregate</code>)</td><td>yes: finalized older than ~1 day</td></tr>
 <tr><td><code>BlockRoots</code></td><td>slot</td><td>block root (<code>H256</code>)</td><td>never</td></tr>
-<tr><td><code>States</code></td><td>root</td><td>full <code>State</code> snapshot</td><td>never</td></tr>
-<tr><td><code>StateDiffs</code></td><td>root</td><td><code>StateDiff</code></td><td>never</td></tr>
+<tr><td><code>States</code></td><td>slot ‖ root</td><td>full <code>State</code> snapshot</td><td>yes: finalized snapshot intervals</td></tr>
+<tr><td><code>StateDiffs</code></td><td>slot ‖ root</td><td><code>StateDiff</code></td><td>yes: finalized snapshot intervals</td></tr>
 <tr><td><code>Metadata</code></td><td>string</td><td>SSZ scalars</td><td>never</td></tr>
 <tr><td><code>LiveChain</code></td><td>slot ‖ root</td><td><code>parent_root</code></td><td>yes: below finalized</td></tr>
 <tr><td><code>DataColumns</code></td><td>slot ‖ root ‖ column_index</td><td><code>DataColumnSidecar</code> (SSZ-encoded)</td><td>no (see <a href="#datacolumns">DataColumns</a> below)</td></tr>
@@ -6241,11 +6463,17 @@ is built from it, and clones are handed to the BlockChain and P2P actors.</p>
 <ul>
 <li><strong>Root-keyed</strong> tables use the 32-byte SSZ encoding of the block root
 (<code>root.to_ssz()</code>).</li>
-<li><strong>Slot-prefixed</strong> tables (<code>BlockProof</code>, <code>LiveChain</code>) use
-<code>encode_slot_root_key</code>: an 8-byte <strong>big-endian</strong> slot followed by the
-32-byte root. Big-endian means lexicographic key order equals numeric slot
-order, so pruning can iterate from the start of the table and stop at the
-first key past its cutoff instead of scanning everything.</li>
+<li><strong>Slot-prefixed</strong> tables (<code>BlockProof</code>, <code>LiveChain</code>, <code>States</code>,
+<code>StateDiffs</code>) use <code>encode_slot_root_key</code>: an 8-byte <strong>big-endian</strong> slot
+followed by the 32-byte root. Big-endian means lexicographic key order
+equals numeric slot order, so pruning can iterate from the start of the
+table and stop at the first key past its cutoff, or drop a whole slot range
+with one range delete. For <code>States</code> and <code>StateDiffs</code> the slot is the slot of
+the block the state belongs to (the slot in that root’s <code>BlockHeaders</code> row,
+equal to the state’s <code>latest_block_header.slot</code>), not <code>state.slot()</code>: a
+beacon anchor state can be advanced past its block. A reader that only has
+a root looks the slot up in <code>BlockHeaders</code>; a root with no block row has no
+state.</li>
 <li><strong>Slot-prefixed, then column</strong> (<code>DataColumns</code>) extends the same
 <code>slot ‖ root</code> prefix with an 8-byte big-endian <code>column_index</code>, via
 <code>data_column_key</code>. A block’s own sidecars therefore share one lexicographic
@@ -6318,20 +6546,23 @@ slot through the head state’s <code>historical_block_hashes</code> instead
 (<code>resolve_slot</code> in <code>crates/net/rpc/src/blocks.rs</code>), so a block on a side fork
 is reachable there only by root, never by slot.</p>
 <h3 id="states"><a class="header" href="#states">States</a></h3>
-<p><code>root → State</code> (full SSZ snapshot). Holds full-state snapshots <strong>only</strong>: the
-bootstrap anchor written at initialization, plus one anchor whenever a block
-crosses a <code>SNAPSHOT_ANCHOR_INTERVAL</code>-slot boundary. Never pruned — these
+<p><code>slot ‖ root → State</code> (full SSZ snapshot). Holds full-state snapshots
+<strong>only</strong>: the bootstrap anchor written at initialization, plus one anchor
+whenever a block crosses a <code>SNAPSHOT_ANCHOR_INTERVAL</code>-slot boundary. These
 anchors are the base every diff chain resolves against, so reconstruction
-always terminates.</p>
+always terminates. Pruned below the finalized block’s snapshot interval (see
+<a href="#pruning">Pruning</a>), which never removes a snapshot a kept state’s chain
+still needs.</p>
 <p>The genesis validator registry is constant for the life of the chain
 (<code>validators</code> is fixed at genesis; the lean STF never mutates it), but it has
 no table of its own: it rides inside every <code>States</code> snapshot alongside
 <code>config</code>, which <code>StateDiff</code> reconstruction relies on (see
 <a href="#state-storage-snapshots--diffs">State Storage</a>).</p>
 <h3 id="statediffs"><a class="header" href="#statediffs">StateDiffs</a></h3>
-<p><code>root → StateDiff</code>. A parent-linked diff written for <strong>every</strong> non-genesis
-state. Never pruned, so together with the snapshots this preserves the full
-state history. See <a href="#state-storage-snapshots--diffs">State Storage</a> for what a
+<p><code>slot ‖ root → StateDiff</code>. A diff written for <strong>every</strong> non-anchor state,
+pruned together with <code>States</code>. Lean’s is parent-linked; a beacon diff is a
+byte delta against the nearest snapshot on its branch, so a beacon state is one
+snapshot plus one delta. See <a href="#state-storage-snapshots--diffs">State Storage</a> for what a
 diff contains and how states are rebuilt.</p>
 <h3 id="metadata"><a class="header" href="#metadata">Metadata</a></h3>
 <p>String keys mapping to (mostly) SSZ-encoded scalars — the <code>Store</code>’s own
@@ -6351,6 +6582,7 @@ different checkpoints.</p>
 <tr><td><code>config</code></td><td><code>Config</code></td><td>both</td><td>The node’s runtime configuration</td></tr>
 <tr><td><code>head</code></td><td><code>H256</code></td><td>both</td><td>Current fork choice head</td></tr>
 <tr><td><code>anchor_slot</code></td><td><code>u64</code></td><td>both</td><td>The slot this directory’s chain begins at</td></tr>
+<tr><td><code>states_pruned_below</code></td><td><code>u64</code></td><td>both</td><td>Exclusive upper bound of the <code>States</code>/<code>StateDiffs</code> slots already range-deleted; absent means 0</td></tr>
 <tr><td><code>safe_target</code></td><td><code>H256</code></td><td>lean</td><td>Current safe target (see <a href="#-lmd-ghost-fork-choice-algorithm">lmd_ghost.md</a>)</td></tr>
 <tr><td><code>latest_justified</code></td><td><code>Checkpoint</code></td><td>both</td><td>Latest justified checkpoint</td></tr>
 <tr><td><code>latest_finalized</code></td><td><code>Checkpoint</code></td><td>both</td><td>Latest finalized checkpoint</td></tr>
@@ -6653,13 +6885,24 @@ has to work with.</p>
 <p>Storing a full <code>State</code> per block would be wasteful: most fields never change
 or change predictably. Instead, <code>insert_state</code> writes:</p>
 <ol>
-<li><strong>Always</strong> a <code>StateDiff</code> keyed by the block root, linked to its parent via
+<li><strong>Always</strong> a <code>StateDiff</code> keyed by the block’s slot and root, linked to its parent via
 <code>base_root</code> (the block’s <code>parent_root</code>).</li>
 <li><strong>Only at anchors</strong> a full snapshot into <code>States</code>. A block is an anchor
 when it crosses a <code>SNAPSHOT_ANCHOR_INTERVAL</code> slot boundary relative
 to its parent (~68 minutes at 4-second slots). This bounds any
 reconstruction walk to at most <code>SNAPSHOT_ANCHOR_INTERVAL</code> diff applications.</li>
 </ol>
+<p>This is the lean arm. A beacon state is also a diff or, at an anchor, a
+snapshot, but the diff is a byte delta (<code>beacon_state_delta</code>) taken against the
+<strong>nearest snapshot on its branch</strong>, not against its parent, and its frame names
+that snapshot as <code>base_root</code>. Reading a beacon state is therefore one snapshot
+plus exactly one delta, however far into the interval the state sits; the cost
+is that a delta carries every change since its snapshot, so it grows across
+the interval. The reader follows each frame’s <code>base_root</code> and does not assume
+one hop, so a directory whose diffs were written parent-linked by an earlier
+build still reads correctly (no <code>DB_VERSION</code> bump was needed), and a diff after
+a restart or on a fork finds its snapshot by walking <code>StateDiffs</code> frames until
+a root with no diff row.</p>
 <p>A <code>StateDiff</code> stores only what cannot be recovered elsewhere: the target slot,
 justified/finalized checkpoints, and the justification fields
 (<code>justified_slots</code>, <code>justifications_roots</code>, <code>justifications_validators</code>,
@@ -6691,7 +6934,8 @@ needs invalidation. The common case — reading the parent state right
 after importing its block — is a cache hit.</li>
 <li>A full snapshot in <code>States</code>.</li>
 <li>Reconstruction: walk <code>base_root</code> pointers back through <code>StateDiffs</code> until
-a snapshot is found, then replay the diffs forward.</li>
+a snapshot is found, then replay the diffs forward. On lean that is a chain
+of parent-linked diffs; on beacon it is one hop, to the interval’s snapshot.</li>
 </ol>
 <pre><code class="language-text">                    STATE RECONSTRUCTION
                     ────────────────────
@@ -6737,8 +6981,8 @@ sequence of independent write batches:</p>
    ├─ 3. insert_state()                 cache + PendingStates insert (synchronous),
    │      (hands the state to the        then a hand-off to the background writer
    │       storage crate's own writer     thread, which commits
-   │       thread; see below)                   StateDiffs[root]
-   │                                            States[root]         (anchors only)
+   │       thread; see below)                   StateDiffs[slot‖root]
+   │                                            States[slot‖root]    (anchors only)
    │                                      on its own schedule, not this one
    │
    └─ 4. update_head()                 Metadata: head
@@ -6796,18 +7040,39 @@ from the in-memory cache, keeping the finalized block’s own entry.</li>
 <p><strong>Deferred</strong> (<code>prune_old_data</code>, called after a batch of blocks has been
 processed):</p>
 <ul>
-<li><code>prune_old_block_proofs</code>: deletes <code>BlockProof</code> entries below
+<li>
+<p><code>prune_old_block_proofs</code>: deletes <code>BlockProof</code> entries below
 <code>cutoff = tip_slot − BLOCK_PROOF_PRUNING_RANGE</code> (21,600 slots, ~1 day at
 4-second slots) — but <strong>only</strong> when <code>cutoff ≤ finalized_slot</code>, i.e. the
 entire pruned range lies within finalized history. Non-finalized proofs
 are never touched. Finalized blocks can never revert, so their proofs are
 not needed for fork choice, reorg safety, or re-aggregation once outside
-the window.</li>
+the window.</p>
+</li>
+<li>
+<p><code>prune_finalized_states</code>: range-deletes <code>States</code> and <code>StateDiffs</code> over
+<code>[watermark, cut)</code>, where <code>cut</code> is the start of the snapshot interval that
+holds the finalized <strong>block</strong> (its own slot from <code>BlockHeaders</code>, not the
+checkpoint’s epoch-start slot) and <code>watermark</code> is <code>states_pruned_below</code>, the
+previous call’s <code>cut</code>. The watermark is written in the same atomic batch as
+the deletes, so consecutive ranges are adjacent and never overlap, even
+across restarts. Safe because a diff-chain walk stops at the first snapshot
+on its branch, and the first block of any branch inside an interval is a
+snapshot, so every walk from a kept state stops at or after <code>cut</code>; blocks
+below finality are never imported again, so nothing is written below the
+watermark afterwards. A state handed to the writer thread <em>before</em> finality
+moved can still be queued, though, so a call that has a range to delete
+first flushes that thread (<code>StateWriterHandle::flush</code>), and every earlier
+write commits before the tombstones do. Lean runs it inside
+<code>prune_old_data</code>; beacon runs it from the chain actor’s finality horizon,
+after every tick and import, where the common case is one metadata read.</p>
+</li>
 </ul>
-<p><strong>Never pruned, by design:</strong> <code>BlockHeaders</code>, <code>BlockBodies</code>, <code>BlockRoots</code>,
-<code>States</code>, <code>StateDiffs</code>, and <code>Metadata</code>. Headers, bodies, the canonical slot
-index, and the snapshot+diff chain are the full historical record; only the
-proof blobs and the (non-finalized) fork choice index are disposable.</p>
+<p><strong>Never pruned, by design:</strong> <code>BlockHeaders</code>, <code>BlockBodies</code>, <code>BlockRoots</code>, and
+<code>Metadata</code>. Headers, bodies and the canonical slot index are the full
+historical record (and the slot lookup every state read depends on); only the
+proof blobs, the finalized states and the (non-finalized) fork choice index are
+disposable.</p>
 <p><strong>Not pruned yet, unlike the six above:</strong> <code>DataColumns</code>. It is not part of the
 historical-record set above; it simply has no pruning rule written for it,
 which is a gap rather than a decision — see <a href="#datacolumns">DataColumns</a> for
@@ -6864,7 +7129,7 @@ network. Everything persisted in the thirteen tables survives, except <code>Pend
 atomic batch</strong>: the <code>Metadata</code> keys a lean directory needs (the format version
 and the chain and preset tags, time, config, head = safe_target = anchor root,
 justified = finalized = anchor checkpoint), the anchor header, its
-<code>BlockRoots</code> entry, the body if non-empty, a full snapshot into <code>States</code> (the
+<code>BlockRoots</code> entry, the body if non-empty, a full snapshot into <code>States</code> keyed by the anchor’s slot and root (the
 base of every future diff chain), and the anchor’s <code>LiveChain</code> entry. <code>time</code>
 starts at genesis rather than at zero because it is an absolute timestamp, so
 genesis is the value that means “the clock has not moved yet”; every derived
@@ -8284,6 +8549,30 @@ trees that cross the fork boundary.</li>
 <code>gloas_get_weight</code> remain, as the references the walk is compared with, at
 every <code>head</code> check of every fork-choice fixture and on randomized trees;
 <code>compute_head</code> is the pre-gloas reference.</li>
+</ul>
+<h2 id="the-committee-fraction-leaves-slashed-validators-out-ahead-of-the-pinned-release"><a class="header" href="#the-committee-fraction-leaves-slashed-validators-out-ahead-of-the-pinned-release">The committee fraction leaves slashed validators out, ahead of the pinned release</a></h2>
+<p>The proposer boost and both reorg thresholds follow a consensus-specs change
+newer than the release the fixtures are pinned to.</p>
+<ul>
+<li><strong>The pinned release (<code>v1.7.0-beta.2</code>):</strong> <code>calculate_committee_fraction</code>
+divides <code>get_total_active_balance</code>, which counts a validator that is slashed
+but still active, and <code>get_proposer_score</code> does the same arithmetic inline.</li>
+<li><strong>ethlambda:</strong> both divide the total balance of the active, unslashed
+validators, as consensus-specs #5679 does (first released in
+<code>v1.7.0-beta.4</code>). Fork choice weighs no vote from a slashed validator, so
+during a mass slashing a boost sized against their stake outweighs a larger
+share of the votes that still count, which makes a reorg easier. The
+<code>JustifiedBalances</code> snapshot carries that total (<code>total_balance</code>)
+beside each validator’s raw effective balance,
+which <code>is_head_weak</code> still adds back for equivocators in the head slot’s
+committees, slashed or not.</li>
+<li><strong>Other clients:</strong> Lighthouse’s <code>JustifiedBalances::from_justified_state</code>
+already sums active, unslashed validators only.</li>
+<li><strong>Consequence:</strong> none while no active validator in the justified state is
+slashed. No <code>v1.7.0-beta.2</code> fork-choice fixture distinguishes the two: the
+one that slashes validators in its anchor state ticks past the boosted slot
+before it checks the head. Remove this entry when the pin reaches
+<code>v1.7.0-beta.4</code>.</li>
 </ul>
 <h2 id="the-execution-client-judges-a-gloas-payload-before-the-envelope-is-applied"><a class="header" href="#the-execution-client-judges-a-gloas-payload-before-the-envelope-is-applied">The execution client judges a gloas payload before the envelope is applied</a></h2>
 <p><code>verify_execution_payload_envelope</code> asks the execution engine last, as part of

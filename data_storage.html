@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-f2b6cd32.js";
+            window.path_to_searchindex_js = "searchindex-07e448bd.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -302,8 +302,8 @@ is built from it, and clones are handed to the BlockChain and P2P actors.</p>
 <tr><td><code>BlockBodies</code></td><td>root</td><td><code>BlockBody</code> (lean only)</td><td>never</td></tr>
 <tr><td><code>BlockProof</code></td><td>slot ‖ root</td><td>aggregate proof (<code>MultiMessageAggregate</code>)</td><td>yes: finalized older than ~1 day</td></tr>
 <tr><td><code>BlockRoots</code></td><td>slot</td><td>block root (<code>H256</code>)</td><td>never</td></tr>
-<tr><td><code>States</code></td><td>root</td><td>full <code>State</code> snapshot</td><td>never</td></tr>
-<tr><td><code>StateDiffs</code></td><td>root</td><td><code>StateDiff</code></td><td>never</td></tr>
+<tr><td><code>States</code></td><td>slot ‖ root</td><td>full <code>State</code> snapshot</td><td>yes: finalized snapshot intervals</td></tr>
+<tr><td><code>StateDiffs</code></td><td>slot ‖ root</td><td><code>StateDiff</code></td><td>yes: finalized snapshot intervals</td></tr>
 <tr><td><code>Metadata</code></td><td>string</td><td>SSZ scalars</td><td>never</td></tr>
 <tr><td><code>LiveChain</code></td><td>slot ‖ root</td><td><code>parent_root</code></td><td>yes: below finalized</td></tr>
 <tr><td><code>DataColumns</code></td><td>slot ‖ root ‖ column_index</td><td><code>DataColumnSidecar</code> (SSZ-encoded)</td><td>no (see <a href="#datacolumns">DataColumns</a> below)</td></tr>
@@ -319,11 +319,17 @@ is built from it, and clones are handed to the BlockChain and P2P actors.</p>
 <ul>
 <li><strong>Root-keyed</strong> tables use the 32-byte SSZ encoding of the block root
 (<code>root.to_ssz()</code>).</li>
-<li><strong>Slot-prefixed</strong> tables (<code>BlockProof</code>, <code>LiveChain</code>) use
-<code>encode_slot_root_key</code>: an 8-byte <strong>big-endian</strong> slot followed by the
-32-byte root. Big-endian means lexicographic key order equals numeric slot
-order, so pruning can iterate from the start of the table and stop at the
-first key past its cutoff instead of scanning everything.</li>
+<li><strong>Slot-prefixed</strong> tables (<code>BlockProof</code>, <code>LiveChain</code>, <code>States</code>,
+<code>StateDiffs</code>) use <code>encode_slot_root_key</code>: an 8-byte <strong>big-endian</strong> slot
+followed by the 32-byte root. Big-endian means lexicographic key order
+equals numeric slot order, so pruning can iterate from the start of the
+table and stop at the first key past its cutoff, or drop a whole slot range
+with one range delete. For <code>States</code> and <code>StateDiffs</code> the slot is the slot of
+the block the state belongs to (the slot in that root’s <code>BlockHeaders</code> row,
+equal to the state’s <code>latest_block_header.slot</code>), not <code>state.slot()</code>: a
+beacon anchor state can be advanced past its block. A reader that only has
+a root looks the slot up in <code>BlockHeaders</code>; a root with no block row has no
+state.</li>
 <li><strong>Slot-prefixed, then column</strong> (<code>DataColumns</code>) extends the same
 <code>slot ‖ root</code> prefix with an 8-byte big-endian <code>column_index</code>, via
 <code>data_column_key</code>. A block’s own sidecars therefore share one lexicographic
@@ -396,20 +402,23 @@ slot through the head state’s <code>historical_block_hashes</code> instead
 (<code>resolve_slot</code> in <code>crates/net/rpc/src/blocks.rs</code>), so a block on a side fork
 is reachable there only by root, never by slot.</p>
 <h3 id="states"><a class="header" href="#states">States</a></h3>
-<p><code>root → State</code> (full SSZ snapshot). Holds full-state snapshots <strong>only</strong>: the
-bootstrap anchor written at initialization, plus one anchor whenever a block
-crosses a <code>SNAPSHOT_ANCHOR_INTERVAL</code>-slot boundary. Never pruned — these
+<p><code>slot ‖ root → State</code> (full SSZ snapshot). Holds full-state snapshots
+<strong>only</strong>: the bootstrap anchor written at initialization, plus one anchor
+whenever a block crosses a <code>SNAPSHOT_ANCHOR_INTERVAL</code>-slot boundary. These
 anchors are the base every diff chain resolves against, so reconstruction
-always terminates.</p>
+always terminates. Pruned below the finalized block’s snapshot interval (see
+<a href="#pruning">Pruning</a>), which never removes a snapshot a kept state’s chain
+still needs.</p>
 <p>The genesis validator registry is constant for the life of the chain
 (<code>validators</code> is fixed at genesis; the lean STF never mutates it), but it has
 no table of its own: it rides inside every <code>States</code> snapshot alongside
 <code>config</code>, which <code>StateDiff</code> reconstruction relies on (see
 <a href="#state-storage-snapshots--diffs">State Storage</a>).</p>
 <h3 id="statediffs"><a class="header" href="#statediffs">StateDiffs</a></h3>
-<p><code>root → StateDiff</code>. A parent-linked diff written for <strong>every</strong> non-genesis
-state. Never pruned, so together with the snapshots this preserves the full
-state history. See <a href="#state-storage-snapshots--diffs">State Storage</a> for what a
+<p><code>slot ‖ root → StateDiff</code>. A diff written for <strong>every</strong> non-anchor state,
+pruned together with <code>States</code>. Lean’s is parent-linked; a beacon diff is a
+byte delta against the nearest snapshot on its branch, so a beacon state is one
+snapshot plus one delta. See <a href="#state-storage-snapshots--diffs">State Storage</a> for what a
 diff contains and how states are rebuilt.</p>
 <h3 id="metadata"><a class="header" href="#metadata">Metadata</a></h3>
 <p>String keys mapping to (mostly) SSZ-encoded scalars — the <code>Store</code>’s own
@@ -429,6 +438,7 @@ different checkpoints.</p>
 <tr><td><code>config</code></td><td><code>Config</code></td><td>both</td><td>The node’s runtime configuration</td></tr>
 <tr><td><code>head</code></td><td><code>H256</code></td><td>both</td><td>Current fork choice head</td></tr>
 <tr><td><code>anchor_slot</code></td><td><code>u64</code></td><td>both</td><td>The slot this directory’s chain begins at</td></tr>
+<tr><td><code>states_pruned_below</code></td><td><code>u64</code></td><td>both</td><td>Exclusive upper bound of the <code>States</code>/<code>StateDiffs</code> slots already range-deleted; absent means 0</td></tr>
 <tr><td><code>safe_target</code></td><td><code>H256</code></td><td>lean</td><td>Current safe target (see <a href="lmd_ghost.html">lmd_ghost.md</a>)</td></tr>
 <tr><td><code>latest_justified</code></td><td><code>Checkpoint</code></td><td>both</td><td>Latest justified checkpoint</td></tr>
 <tr><td><code>latest_finalized</code></td><td><code>Checkpoint</code></td><td>both</td><td>Latest finalized checkpoint</td></tr>
@@ -731,13 +741,24 @@ has to work with.</p>
 <p>Storing a full <code>State</code> per block would be wasteful: most fields never change
 or change predictably. Instead, <code>insert_state</code> writes:</p>
 <ol>
-<li><strong>Always</strong> a <code>StateDiff</code> keyed by the block root, linked to its parent via
+<li><strong>Always</strong> a <code>StateDiff</code> keyed by the block’s slot and root, linked to its parent via
 <code>base_root</code> (the block’s <code>parent_root</code>).</li>
 <li><strong>Only at anchors</strong> a full snapshot into <code>States</code>. A block is an anchor
 when it crosses a <code>SNAPSHOT_ANCHOR_INTERVAL</code> slot boundary relative
 to its parent (~68 minutes at 4-second slots). This bounds any
 reconstruction walk to at most <code>SNAPSHOT_ANCHOR_INTERVAL</code> diff applications.</li>
 </ol>
+<p>This is the lean arm. A beacon state is also a diff or, at an anchor, a
+snapshot, but the diff is a byte delta (<code>beacon_state_delta</code>) taken against the
+<strong>nearest snapshot on its branch</strong>, not against its parent, and its frame names
+that snapshot as <code>base_root</code>. Reading a beacon state is therefore one snapshot
+plus exactly one delta, however far into the interval the state sits; the cost
+is that a delta carries every change since its snapshot, so it grows across
+the interval. The reader follows each frame’s <code>base_root</code> and does not assume
+one hop, so a directory whose diffs were written parent-linked by an earlier
+build still reads correctly (no <code>DB_VERSION</code> bump was needed), and a diff after
+a restart or on a fork finds its snapshot by walking <code>StateDiffs</code> frames until
+a root with no diff row.</p>
 <p>A <code>StateDiff</code> stores only what cannot be recovered elsewhere: the target slot,
 justified/finalized checkpoints, and the justification fields
 (<code>justified_slots</code>, <code>justifications_roots</code>, <code>justifications_validators</code>,
@@ -769,7 +790,8 @@ needs invalidation. The common case — reading the parent state right
 after importing its block — is a cache hit.</li>
 <li>A full snapshot in <code>States</code>.</li>
 <li>Reconstruction: walk <code>base_root</code> pointers back through <code>StateDiffs</code> until
-a snapshot is found, then replay the diffs forward.</li>
+a snapshot is found, then replay the diffs forward. On lean that is a chain
+of parent-linked diffs; on beacon it is one hop, to the interval’s snapshot.</li>
 </ol>
 <pre><code class="language-text">                    STATE RECONSTRUCTION
                     ────────────────────
@@ -815,8 +837,8 @@ sequence of independent write batches:</p>
    ├─ 3. insert_state()                 cache + PendingStates insert (synchronous),
    │      (hands the state to the        then a hand-off to the background writer
    │       storage crate's own writer     thread, which commits
-   │       thread; see below)                   StateDiffs[root]
-   │                                            States[root]         (anchors only)
+   │       thread; see below)                   StateDiffs[slot‖root]
+   │                                            States[slot‖root]    (anchors only)
    │                                      on its own schedule, not this one
    │
    └─ 4. update_head()                 Metadata: head
@@ -874,18 +896,39 @@ from the in-memory cache, keeping the finalized block’s own entry.</li>
 <p><strong>Deferred</strong> (<code>prune_old_data</code>, called after a batch of blocks has been
 processed):</p>
 <ul>
-<li><code>prune_old_block_proofs</code>: deletes <code>BlockProof</code> entries below
+<li>
+<p><code>prune_old_block_proofs</code>: deletes <code>BlockProof</code> entries below
 <code>cutoff = tip_slot − BLOCK_PROOF_PRUNING_RANGE</code> (21,600 slots, ~1 day at
 4-second slots) — but <strong>only</strong> when <code>cutoff ≤ finalized_slot</code>, i.e. the
 entire pruned range lies within finalized history. Non-finalized proofs
 are never touched. Finalized blocks can never revert, so their proofs are
 not needed for fork choice, reorg safety, or re-aggregation once outside
-the window.</li>
+the window.</p>
+</li>
+<li>
+<p><code>prune_finalized_states</code>: range-deletes <code>States</code> and <code>StateDiffs</code> over
+<code>[watermark, cut)</code>, where <code>cut</code> is the start of the snapshot interval that
+holds the finalized <strong>block</strong> (its own slot from <code>BlockHeaders</code>, not the
+checkpoint’s epoch-start slot) and <code>watermark</code> is <code>states_pruned_below</code>, the
+previous call’s <code>cut</code>. The watermark is written in the same atomic batch as
+the deletes, so consecutive ranges are adjacent and never overlap, even
+across restarts. Safe because a diff-chain walk stops at the first snapshot
+on its branch, and the first block of any branch inside an interval is a
+snapshot, so every walk from a kept state stops at or after <code>cut</code>; blocks
+below finality are never imported again, so nothing is written below the
+watermark afterwards. A state handed to the writer thread <em>before</em> finality
+moved can still be queued, though, so a call that has a range to delete
+first flushes that thread (<code>StateWriterHandle::flush</code>), and every earlier
+write commits before the tombstones do. Lean runs it inside
+<code>prune_old_data</code>; beacon runs it from the chain actor’s finality horizon,
+after every tick and import, where the common case is one metadata read.</p>
+</li>
 </ul>
-<p><strong>Never pruned, by design:</strong> <code>BlockHeaders</code>, <code>BlockBodies</code>, <code>BlockRoots</code>,
-<code>States</code>, <code>StateDiffs</code>, and <code>Metadata</code>. Headers, bodies, the canonical slot
-index, and the snapshot+diff chain are the full historical record; only the
-proof blobs and the (non-finalized) fork choice index are disposable.</p>
+<p><strong>Never pruned, by design:</strong> <code>BlockHeaders</code>, <code>BlockBodies</code>, <code>BlockRoots</code>, and
+<code>Metadata</code>. Headers, bodies and the canonical slot index are the full
+historical record (and the slot lookup every state read depends on); only the
+proof blobs, the finalized states and the (non-finalized) fork choice index are
+disposable.</p>
 <p><strong>Not pruned yet, unlike the six above:</strong> <code>DataColumns</code>. It is not part of the
 historical-record set above; it simply has no pruning rule written for it,
 which is a gap rather than a decision — see <a href="#datacolumns">DataColumns</a> for
@@ -942,7 +985,7 @@ network. Everything persisted in the thirteen tables survives, except <code>Pend
 atomic batch</strong>: the <code>Metadata</code> keys a lean directory needs (the format version
 and the chain and preset tags, time, config, head = safe_target = anchor root,
 justified = finalized = anchor checkpoint), the anchor header, its
-<code>BlockRoots</code> entry, the body if non-empty, a full snapshot into <code>States</code> (the
+<code>BlockRoots</code> entry, the body if non-empty, a full snapshot into <code>States</code> keyed by the anchor’s slot and root (the
 base of every future diff chain), and the anchor’s <code>LiveChain</code> entry. <code>time</code>
 starts at genesis rather than at zero because it is an absolute timestamp, so
 genesis is the value that means “the clock has not moved yet”; every derived

@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-f2b6cd32.js";
+            window.path_to_searchindex_js = "searchindex-07e448bd.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -677,6 +677,30 @@ trees that cross the fork boundary.</li>
 <code>gloas_get_weight</code> remain, as the references the walk is compared with, at
 every <code>head</code> check of every fork-choice fixture and on randomized trees;
 <code>compute_head</code> is the pre-gloas reference.</li>
+</ul>
+<h2 id="the-committee-fraction-leaves-slashed-validators-out-ahead-of-the-pinned-release"><a class="header" href="#the-committee-fraction-leaves-slashed-validators-out-ahead-of-the-pinned-release">The committee fraction leaves slashed validators out, ahead of the pinned release</a></h2>
+<p>The proposer boost and both reorg thresholds follow a consensus-specs change
+newer than the release the fixtures are pinned to.</p>
+<ul>
+<li><strong>The pinned release (<code>v1.7.0-beta.2</code>):</strong> <code>calculate_committee_fraction</code>
+divides <code>get_total_active_balance</code>, which counts a validator that is slashed
+but still active, and <code>get_proposer_score</code> does the same arithmetic inline.</li>
+<li><strong>ethlambda:</strong> both divide the total balance of the active, unslashed
+validators, as consensus-specs #5679 does (first released in
+<code>v1.7.0-beta.4</code>). Fork choice weighs no vote from a slashed validator, so
+during a mass slashing a boost sized against their stake outweighs a larger
+share of the votes that still count, which makes a reorg easier. The
+<code>JustifiedBalances</code> snapshot carries that total (<code>total_balance</code>)
+beside each validator’s raw effective balance,
+which <code>is_head_weak</code> still adds back for equivocators in the head slot’s
+committees, slashed or not.</li>
+<li><strong>Other clients:</strong> Lighthouse’s <code>JustifiedBalances::from_justified_state</code>
+already sums active, unslashed validators only.</li>
+<li><strong>Consequence:</strong> none while no active validator in the justified state is
+slashed. No <code>v1.7.0-beta.2</code> fork-choice fixture distinguishes the two: the
+one that slashes validators in its anchor state ticks past the boosted slot
+before it checks the head. Remove this entry when the pin reaches
+<code>v1.7.0-beta.4</code>.</li>
 </ul>
 <h2 id="the-execution-client-judges-a-gloas-payload-before-the-envelope-is-applied"><a class="header" href="#the-execution-client-judges-a-gloas-payload-before-the-envelope-is-applied">The execution client judges a gloas payload before the envelope is applied</a></h2>
 <p><code>verify_execution_payload_envelope</code> asks the execution engine last, as part of
