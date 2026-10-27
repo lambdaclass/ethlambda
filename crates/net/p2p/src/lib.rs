@@ -45,7 +45,7 @@ use ethlambda_network_api::{
     },
     rpc_to_p2p::{
         PublishBeaconAggregate, PublishBeaconAttestation, PublishBeaconBlock,
-        PublishExecutionPayloadEnvelope, PublishPayloadAttestationMessage,
+        PublishBeaconOperation, PublishExecutionPayloadEnvelope, PublishPayloadAttestationMessage,
         PublishSyncCommitteeContribution, PublishSyncCommitteeMessage, SubscribeAttestationSubnets,
         SubscribeSyncCommitteeSubnets,
     },
@@ -56,11 +56,11 @@ use ethlambda_state_transition::beacon::gossip::{
     aggregate::SeenAggregates,
     attestation::SeenAttestations,
     envelope::SeenEnvelopes,
+    operations::SeenOperations,
     payload_attestation::SeenPayloadAttestations,
     sync_committee::{SeenSyncCommitteeMessages, SeenSyncContributions},
 };
 use ethlambda_state_transition::beacon::{
-    attestation_pool::SharedAttestationPool,
     payload_attestation_pool::SharedPayloadAttestationPool,
     sync_committee_pool::SharedSyncCommitteePool,
 };
@@ -98,7 +98,7 @@ use crate::{
     gossipsub::{
         aggregation_topic, attestation_subnet_topic, block_topic, publish_aggregated_attestation,
         publish_attestation, publish_beacon_aggregate, publish_beacon_attestation,
-        publish_beacon_block, publish_block,
+        publish_beacon_block, publish_beacon_operation, publish_block,
     },
     lean::protocols::MAX_REQUEST_BLOCKS,
     req_resp::{
@@ -1125,7 +1125,6 @@ impl P2P {
         store: Store,
         node_names: HashMap<PeerId, String>,
         discovery: Option<DiscoverySpawnConfig>,
-        attestation_pool: SharedAttestationPool,
         payload_attestation_pool: SharedPayloadAttestationPool,
         sync_committee_pool: SharedSyncCommitteePool,
     ) -> Result<P2P, DiscoveryError> {
@@ -1182,6 +1181,7 @@ impl P2P {
             seen_attestations: SeenAttestations::new(seen_attestations_capacity(
                 backbone_attestation_subnets,
             )),
+            seen_operations: SeenOperations::default(),
             seen_sync_messages: SeenSyncCommitteeMessages::new(SEEN_SYNC_MESSAGES_CAPACITY),
             seen_sync_contributions: SeenSyncContributions::new(
                 SEEN_SYNC_AGGREGATORS_CAPACITY,
@@ -1195,7 +1195,6 @@ impl P2P {
             attestation_validation_permits: Arc::new(tokio::sync::Semaphore::new(
                 ATTESTATION_VALIDATION_PERMITS,
             )),
-            attestation_pool,
             payload_attestation_pool,
             sync_committee_pool,
             aggregator_subnets: HashMap::new(),
@@ -1317,6 +1316,12 @@ pub struct P2PServer {
     /// Accepted `beacon_attestation_{subnet_id}`s, by `(target_epoch,
     /// attester_index)`.
     pub(crate) seen_attestations: SeenAttestations,
+    /// The first valid operation per validator (or per attesting index, for
+    /// attester slashings) accepted from gossip on the four operation topics.
+    /// Recorded only after the stateful check passes and never pruned: an
+    /// entry needs a validator to really exit, be slashed or change
+    /// credentials, so it is bounded by the registry.
+    pub(crate) seen_operations: SeenOperations,
     /// Accepted `sync_committee_{subnet_id}` messages, by `(slot, validator
     /// index, subnet)`.
     pub(crate) seen_sync_messages: SeenSyncCommitteeMessages,
@@ -1337,12 +1342,6 @@ pub struct P2PServer {
     /// checks in flight on blocking threads. Separate from the other two
     /// pools; see [`SYNC_VALIDATION_PERMITS`].
     pub(crate) sync_validation_permits: Arc<tokio::sync::Semaphore>,
-
-    /// Unaggregated attestations for this node's validator clients'
-    /// aggregators, shared with the Beacon API that aggregates from it. Filled
-    /// by `verdict::forward` from the aggregator subnets below; lean never
-    /// touches it.
-    pub(crate) attestation_pool: SharedAttestationPool,
 
     /// Accepted `payload_attestation_message` votes, shared with the Beacon
     /// API that serves and fills the same pool. Filled by `verdict::forward`;
@@ -1563,6 +1562,7 @@ impl P2PServer {
         );
         gossipsub::leave_expired_aggregator_subnets(self);
         gossipsub::prune_attestation_pool(self);
+        gossipsub::prune_operation_pool(self);
         beacon::sync_committee::leave_expired_sync_committee_subnets(self);
         beacon::sync_committee::prune_sync_committee_pool(self);
     }
@@ -1654,9 +1654,15 @@ impl Handler<PublishBeaconAggregate> for P2PServer {
     }
 }
 
+impl Handler<PublishBeaconOperation> for P2PServer {
+    async fn handle(&mut self, msg: PublishBeaconOperation, _ctx: &Context<Self>) {
+        publish_beacon_operation(self, msg.operation).await;
+    }
+}
+
 impl Handler<PublishBeaconBlock> for P2PServer {
     async fn handle(&mut self, msg: PublishBeaconBlock, _ctx: &Context<Self>) {
-        publish_beacon_block(self, msg.block).await;
+        publish_beacon_block(self, msg.block, msg.sidecars).await;
     }
 }
 
@@ -2930,6 +2936,7 @@ pub(crate) mod test_support {
                 ethlambda_state_transition::beacon::gossip::attestation::SeenAttestations::new(
                     crate::seen_attestations_capacity(backbone_attestation_subnets),
                 ),
+            seen_operations: Default::default(),
             gossip_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::GOSSIP_VALIDATION_PERMITS,
             )),
@@ -2951,7 +2958,6 @@ pub(crate) mod test_support {
             sync_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::SYNC_VALIDATION_PERMITS,
             )),
-            attestation_pool: Default::default(),
             payload_attestation_pool: Default::default(),
             sync_committee_pool: Default::default(),
             aggregator_subnets: HashMap::new(),
