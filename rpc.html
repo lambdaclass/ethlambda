@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-da047b23.js";
+            window.path_to_searchindex_js = "searchindex-41b0ffbf.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -395,6 +395,7 @@ surface rather than sitting beside it; a <code>/lean/v0</code> path on a beacon 
 <tr><td><code>GET</code></td><td><code>/eth/v1/beacon/genesis</code></td><td>JSON</td><td>Genesis time, validators root, fork version</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/config/spec</code></td><td>JSON</td><td>The store’s <code>Config</code>, plus <code>PRESET_BASE</code>, <code>CONFIG_NAME</code>, the preset and the constants (see below)</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/config/deposit_contract</code></td><td>JSON</td><td>The <code>Config</code>’s deposit chain id and contract address</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/config/fork_schedule</code></td><td>JSON</td><td>Every scheduled fork as <code>{previous_version, current_version, epoch}</code></td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/node/syncing</code></td><td>JSON</td><td>Head slot, sync distance, whether the head is optimistic</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/node/health</code></td><td><em>(status only)</em></td><td><code>200</code> caught up, <code>206</code> syncing or on an optimistic head</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/node/version</code></td><td>JSON</td><td>Client version string</td></tr>
@@ -409,25 +410,28 @@ surface rather than sitting beside it; a <code>/lean/v0</code> path on a beacon 
 <tr><td><code>POST</code></td><td><code>/eth/v1/validator/duties/ptc/{epoch}</code></td><td>JSON</td><td>Payload timeliness committee seats for the given indices (gloas)</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/validator/attestation_data</code></td><td>JSON</td><td>What to attest to at <code>slot</code></td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/validator/payload_attestation_data</code></td><td>JSON or SSZ</td><td>What a committee member signs for <code>slot</code> (gloas)</td></tr>
-<tr><td><code>POST</code></td><td><code>/eth/v2/beacon/pool/attestations</code></td><td><em>(status only)</em></td><td>Validate and gossip <code>SingleAttestation</code>s</td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v2/beacon/pool/attestations</code></td><td><em>(status only)</em></td><td>Validate and gossip <code>SingleAttestation</code>s (JSON or SSZ body)</td></tr>
 <tr><td><code>GET</code>, <code>POST</code></td><td><code>/eth/v1/beacon/pool/proposer_slashings</code></td><td>JSON</td><td>The operation pool’s <code>ProposerSlashing</code>s; validate, pool and gossip one</td></tr>
 <tr><td><code>GET</code>, <code>POST</code></td><td><code>/eth/v2/beacon/pool/attester_slashings</code></td><td>JSON</td><td>The pool’s <code>AttesterSlashing</code>s (GET carries <code>Eth-Consensus-Version</code>, the fork of the wall clock’s current epoch); validate, pool and gossip one</td></tr>
 <tr><td><code>GET</code>, <code>POST</code></td><td><code>/eth/v1/beacon/pool/voluntary_exits</code></td><td>JSON</td><td>The pool’s <code>SignedVoluntaryExit</code>s; validate, pool and gossip one</td></tr>
 <tr><td><code>GET</code>, <code>POST</code></td><td><code>/eth/v1/beacon/pool/bls_to_execution_changes</code></td><td>JSON</td><td>The pool’s <code>SignedBLSToExecutionChange</code>s; POST takes an array</td></tr>
-<tr><td><code>POST</code></td><td><code>/eth/v1/beacon/pool/payload_attestations</code></td><td><em>(status only)</em></td><td>Validate, pool and gossip <code>PayloadAttestationMessage</code>s (gloas)</td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v1/beacon/pool/payload_attestations</code></td><td><em>(status only)</em></td><td>Validate, pool and gossip <code>PayloadAttestationMessage</code>s (gloas; JSON or SSZ body)</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/beacon/pool/payload_attestations</code></td><td>JSON</td><td>The pool’s votes as aggregated <code>PayloadAttestation</code>s (gloas)</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/validator/beacon_committee_subscriptions</code></td><td><em>(status only)</em></td><td>Aggregators’ entries join their committee’s subnet</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v2/validator/aggregate_attestation</code></td><td>JSON</td><td>The pooled votes for a data root and committee, aggregated</td></tr>
-<tr><td><code>POST</code></td><td><code>/eth/v2/validator/aggregate_and_proofs</code></td><td><em>(status only)</em></td><td>Validate and gossip <code>SignedAggregateAndProof</code>s</td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v2/validator/aggregate_and_proofs</code></td><td><em>(status only)</em></td><td>Validate and gossip <code>SignedAggregateAndProof</code>s (JSON or SSZ body)</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/beacon/pool/sync_committees</code></td><td><em>(status only)</em></td><td>Validate, pool and gossip <code>SyncCommitteeMessage</code>s</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/validator/sync_committee_contribution</code></td><td>JSON</td><td>The pooled messages for <code>(slot, subcommittee_index, beacon_block_root)</code>, aggregated</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/validator/contribution_and_proofs</code></td><td><em>(status only)</em></td><td>Validate, pool and gossip <code>SignedContributionAndProof</code>s</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/validator/sync_committee_subscriptions</code></td><td><em>(status only)</em></td><td>Join sync committee subnets until an epoch</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v3/validator/blocks/{slot}</code></td><td>SSZ or JSON</td><td>An unsigned fulu block built on the head (<code>produceBlockV3</code>)</td></tr>
-<tr><td><code>POST</code></td><td><code>/eth/v4/validator/blocks/{slot}</code></td><td>SSZ or JSON</td><td>An unsigned self-built gloas block, with its envelope and blobs when asked (<code>produceBlockV4</code>)</td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v4/validator/blocks/{slot}</code></td><td>SSZ or JSON</td><td>An unsigned gloas block: self-built, with its envelope and blobs when asked, or on a pooled builder bid (<code>produceBlockV4</code>)</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/validator/execution_payload_envelopes/{slot}/{beacon_block_root}</code></td><td>SSZ or JSON</td><td>The unsigned envelope <code>produceBlockV4</code> built (gloas)</td></tr>
-<tr><td><code>POST</code></td><td><code>/eth/v2/beacon/blocks</code></td><td><em>(status only)</em></td><td>Gossip and import a signed fulu or gloas block (<code>publishBlockV2</code>, SSZ)</td></tr>
-<tr><td><code>POST</code></td><td><code>/eth/v1/beacon/execution_payload_envelopes</code></td><td><em>(status only)</em></td><td>Gossip a signed envelope and its data columns (gloas, SSZ)</td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v2/beacon/blocks</code></td><td><em>(status only)</em></td><td>Gossip and import a signed fulu or gloas block (<code>publishBlockV2</code>; JSON or SSZ body)</td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v1/beacon/execution_payload_envelopes</code></td><td><em>(status only)</em></td><td>Gossip a signed envelope and its data columns (gloas; JSON or SSZ body)</td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v1/beacon/execution_payload_bids</code></td><td><em>(status only)</em></td><td>Validate, pool and gossip a builder’s <code>SignedExecutionPayloadBid</code> (gloas; JSON or SSZ body)</td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v1/validator/proposer_preferences</code></td><td><em>(status only)</em></td><td>Validate, cache and gossip <code>SignedProposerPreferences</code> (gloas; JSON or SSZ body)</td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v1/beacon/states/{state_id}/builders</code></td><td>JSON</td><td>The gloas builder registry, filtered by id and status</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/validator/prepare_beacon_proposer</code></td><td><em>(status only)</em></td><td>Record each validator’s fee recipient for block production (see below)</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/events</code></td><td>SSE</td><td>Live stream of chain events (see below)</td></tr>
 </tbody>
@@ -502,6 +506,12 @@ exactly when fork choice holds the head block’s payload as FULL
 (<code>Store::head_payload_status</code>, or one fresh <code>get_head_node</code> walk when none is
 recorded for this head). A pre-gloas head counts as FULL (see
 <a href="./spec_deviations.html#a-pre-gloas-head-counts-as-full-in-attestation_dataindex">Spec Deviations</a>).</li>
+<li><strong><code>states/{state_id}/validators/{validator_id}</code></strong> is one entry of the list
+endpoint, in the same shape and with the same <code>state_id</code> handling,
+<code>execution_optimistic</code> and <code>finalized</code>. The id is an index or a <code>0x</code> pubkey;
+one naming no validator is a <code>404</code> (the list form omits it), a malformed one
+a <code>400</code>. Lighthouse’s validator client resolves each key to its index this
+way, and stays inactive without it.</li>
 <li><strong><code>pool/attestations</code></strong> checks each attestation against the electra
 <code>beacon_attestation_{subnet_id}</code> gossip conditions it can evaluate (clock
 window, <code>data.index == 0</code>, target epoch, the voted block known and the target
@@ -540,6 +550,16 @@ pool, and is handed to the chain actor, which applies it to fork choice and
 announces it on <code>/eth/v1/events</code>’s <code>attestation</code>. The <code>Eth-Consensus-Version</code>
 header picks the decoder: <code>gloas</code> takes gloas’s <code>SignedAggregateAndProof</code>,
 the others electra’s.</li>
+<li><strong>Request body encodings.</strong> <code>pool/attestations</code>, <code>pool/payload_attestations</code>
+and <code>aggregate_and_proofs</code> take either JSON (<code>application/json</code>, also the
+reading of a request with no <code>Content-Type</code>) or the SSZ <code>List[...]</code> of the
+same items (<code>application/octet-stream</code>): the offset-table encoding every
+variable-size list uses, which is what prysm sends for aggregates and payload
+votes, with a JSON retry only on a <code>415</code>, and what nimbus can send for
+attestations. Any other content type is a <code>415</code>, and a body that does not
+decode in the type’s encoding a <code>400</code>. <code>POST beacon/blocks</code> and
+<code>POST beacon/execution_payload_envelopes</code> choose the same way (below); the
+other validator-client submissions are JSON.</li>
 <li><strong>The attestation pool</strong> holds, the best-covered per data root and
 committee: votes from <code>pool/attestations</code> and the aggregator subnets,
 aggregates from <code>aggregate_and_proofs</code>, and every electra gossip aggregate
@@ -582,8 +602,11 @@ Lighthouse’s tiers, and is appended to every block with no opt-out; the
 <code>graffiti_policy</code> parameter Lighthouse’s validator client sends is not read.
 <code>LA</code> is ethlambda’s own code: <code>identification.md</code> reserves none for it and
 lets an unlisted client pick any two letters no listed client uses.</li>
-<li><strong><code>POST beacon/blocks</code></strong> takes SSZ and the <code>Eth-Consensus-Version</code> header
-(<code>fulu</code> or <code>gloas</code>, else <code>400</code>; a non-SSZ content type is a <code>415</code>). Fulu: a
+<li><strong><code>POST beacon/blocks</code></strong> takes JSON or SSZ, by <code>Content-Type</code> as above, and
+the <code>Eth-Consensus-Version</code> header (<code>fulu</code> or <code>gloas</code>, else <code>400</code>; any other
+content type is a <code>415</code>). The JSON is the specification’s: lodestar’s and
+nimbus’s validator clients post it, teku’s falls back to it, and lighthouse
+and prysm post SSZ. Both reach the same checks after decoding. Fulu: a
 <code>SignedBlockContents</code>. A slot the schedule does not place at fulu is a <code>400</code>,
 checked before any state is advanced. The block is then checked against its
 <strong>parent’s</strong> state advanced to its slot: an unknown parent, a slot not after
@@ -619,10 +642,12 @@ the valid entries are still pooled and published.</li>
 </ul>
 <h3 id="gloas-block-production"><a class="header" href="#gloas-block-production">Gloas block production</a></h3>
 <p>A gloas proposer signs two things on their own, the block and the envelope that
-reveals its payload, and this node serves both halves. It only builds for
-itself: no builder bid is taken from gossip or a builder API, and no
-<code>SignedProposerPreferences</code> is read (see
-<a href="./spec_deviations.html#self-build-only">Spec Deviations</a>).</p>
+reveals its payload, and this node serves both halves for a block it builds
+itself. It may instead build on a builder’s bid it holds in the shared builder
+market (see <a href="#builder-market">Builder market</a>); then the builder, not this node,
+reveals the payload. The builder-API path (a bid requested from a builder’s URL
+through the <code>BuilderConfig</code>’s <code>builders</code> entries) is not implemented: those
+entries are decoded and not consulted.</p>
 <p><strong><code>POST /eth/v4/validator/blocks/{slot}</code></strong> (<code>produceBlockV4</code>):</p>
 <div class="table-wrapper">
 <table>
@@ -632,25 +657,43 @@ itself: no builder bid is taken from gossip or a builder API, and no
 <tbody>
 <tr><td>Query</td><td><code>randao_reveal</code> (required), <code>include_payload</code> (required, <code>true</code> or <code>false</code>), <code>graffiti</code> (optional, 32-byte hex), <code>skip_randao_verification</code> (accepted, ignored)</td></tr>
 <tr><td>Request headers</td><td><code>Eth-Consensus-Version</code> is optional but must be <code>gloas</code> when present. <code>Accept: application/octet-stream</code> for SSZ, JSON otherwise</td></tr>
-<tr><td>Body</td><td>A <code>BuilderConfig</code> (<code>min_bid</code>, <code>builder_boost_factor</code>, <code>builders</code>), JSON, or SSZ with <code>Content-Type: application/octet-stream</code>. It is decoded and otherwise ignored; a missing or undecodable one is a <code>400</code></td></tr>
-<tr><td><code>200</code> SSZ</td><td>With <code>include_payload=true</code>, <code>BlockContents</code> (<code>block</code>, <code>execution_payload_envelope</code>, <code>kzg_proofs</code>, <code>blobs</code>); with <code>false</code>, the bare <code>gloas::BeaconBlock</code></td></tr>
+<tr><td>Body</td><td>A <code>BuilderConfig</code>, JSON or SSZ with <code>Content-Type: application/octet-stream</code>: <code>min_bid</code> and <code>builder_boost_factor</code> (govern the bids seen over p2p) and <code>builders</code> (up to 64 entries, decoded and ignored). Integers are quoted strings, as everywhere in the Beacon API. A missing or undecodable one is a <code>400</code></td></tr>
+<tr><td><code>200</code> SSZ</td><td>Self-built with <code>include_payload=true</code>: <code>BlockContents</code> (<code>block</code>, <code>execution_payload_envelope</code>, <code>kzg_proofs</code>, <code>blobs</code>). Otherwise, and for every bid-won block, the bare <code>gloas::BeaconBlock</code></td></tr>
 <tr><td><code>200</code> JSON</td><td><code>{version: "gloas", consensus_block_value, execution_payload_value, execution_payload_included, data}</code>, where <code>data</code> is the same container as the SSZ body</td></tr>
-<tr><td>Response headers</td><td><code>Eth-Consensus-Version: gloas</code>, <code>Eth-Execution-Payload-Included</code> (<code>true</code> or <code>false</code>), <code>Eth-Execution-Payload-Value</code> (wei, decimal), <code>Eth-Consensus-Block-Value</code> (always <code>0</code>: no builder comparison happens on this node)</td></tr>
+<tr><td>Response headers</td><td><code>Eth-Consensus-Version: gloas</code>, <code>Eth-Execution-Payload-Included</code> (<code>true</code> or <code>false</code>; always <code>false</code> for a bid-won block), <code>Eth-Execution-Payload-Value</code> (wei, decimal; a bid’s value times <code>10^9</code> when it won), <code>Eth-Consensus-Block-Value</code> (always <code>0</code>: the comparison is of execution payload values only). No <code>Eth-Builder-Url</code>: that is for builder-API bids</td></tr>
 <tr><td><code>400</code></td><td>A slot the schedule does not place at gloas, a missing or malformed query, a wrong <code>Eth-Consensus-Version</code>, a bad body, a slot not after the head block, or a <code>randao_reveal</code> that does not verify against the slot’s proposer. The slot check precedes the execution-client check, so it is a <code>400</code> on any node</td></tr>
-<tr><td><code>503</code></td><td>No execution client configured, the execution client did not start or return a build, or the node is building on a FULL parent whose envelope it does not hold</td></tr>
+<tr><td><code>503</code></td><td>No execution client and no viable pooled bid for the slot, the execution client did not start or return a build (and no bid took its place), the node is building on a FULL parent whose envelope it does not hold, or the winning bid failed to build and there is no local payload to fall back on</td></tr>
 </tbody>
 </table>
 </div>
 <p>The node advances the head state to the slot, and decides which parent payload
 to build on with <code>should_build_on_full</code> over the payload status fork choice
 recorded for the head. It then asks its execution client to build
-(<code>forkchoiceUpdatedV4</code> with <code>PayloadAttributesV4</code>, then <code>getPayloadV6</code>) with the
-proposer’s <code>prepare_beacon_proposer</code> fee recipient. The body packs the
+(<code>forkchoiceUpdatedV4</code> with <code>PayloadAttributesV4</code>, then <code>getPayloadV6</code>). The
+fee recipient and gas target of that build come from the proposer’s signed
+<code>ProposerPreferences</code> for the slot when the market holds them under the slot’s
+dependent root, else from <code>prepare_beacon_proposer</code> (fee recipient, or the zero
+address with a warning) and the parent bid’s gas limit. The body packs the
 attestation pool’s best aggregates and the payload attestation pool’s votes for
 the parent block (an aggregate that does not verify against the advanced state
 is dropped, since one bad operation fails the block), and the state root comes
 from running the block through <code>process_block</code>. The bid is a zero-value
 self-build bid read off the built payload. What was built is cached by <code>(slot, block root)</code>, for the current and previous slot only.</p>
+<p><strong>Choosing between the local payload and a bid.</strong> The bids considered are the
+market’s for <code>(slot, head root, parent payload hash)</code> with this build’s
+<code>prev_randao</code>, packable into a block on the advanced state, and paying the
+preferences’ fee recipient when those are held. The best bid is the highest
+whose <code>value + execution_payment</code> is at least the config’s <code>min_bid</code>. It wins iff
+<code>builder_boost_factor * bid_gwei &gt; floor(local_value_wei / 10^7)</code> (the
+specification’s weighting of the local value by 100, in integers), and the local
+payload wins a tie, so a factor of <code>0</code> prefers it and <code>2^64 - 1</code> prefers the bid.
+An engine that sets <code>shouldOverrideBuilder</code> keeps the local payload. Without a
+local payload (no engine, or the build failed) the best bid is taken whatever its
+weight. A bid-won block caches nothing, so the envelope <code>GET</code> below answers
+<code>404</code> for it, and <code>POST /eth/v1/beacon/execution_payload_envelopes</code> refuses a
+proposer-signed (self-build) envelope for it because the builder index differs
+from the bid’s. The builder’s own envelope goes through that endpoint as for any
+block.</p>
 <p><strong><code>GET /eth/v1/validator/execution_payload_envelopes/{slot}/{beacon_block_root}</code></strong>
 serves the cached unsigned envelope, for a client that asked for the block with
 <code>include_payload=false</code>: <code>{version: "gloas", data}</code> as JSON, or the SSZ
@@ -659,8 +702,11 @@ serves the cached unsigned envelope, for a client that asked for the block with
 (unknown, or older than the previous slot); <code>400</code> for an unparseable slot or
 root.</p>
 <p><strong><code>POST /eth/v1/beacon/execution_payload_envelopes</code></strong> takes the signed envelope,
-SSZ only (<code>415</code> otherwise), with <code>Eth-Consensus-Version: gloas</code> and
-<code>Eth-Blob-Data-Included</code> (both required, else <code>400</code>):</p>
+as JSON or SSZ by <code>Content-Type</code> (any other is a <code>415</code>; teku’s validator client
+posts JSON, nimbus posts the bare envelope as JSON and the contents as SSZ,
+lighthouse posts SSZ, prysm posts SSZ and retries as JSON on a <code>415</code>), with
+<code>Eth-Consensus-Version: gloas</code> and <code>Eth-Blob-Data-Included</code> (both required, else
+<code>400</code>):</p>
 <ul>
 <li><code>true</code>: the body is <code>SignedExecutionPayloadEnvelopeContents</code> (the signed
 envelope, <code>kzg_proofs</code>, <code>blobs</code>).</li>
@@ -679,6 +725,41 @@ commitments and cell proofs; any failure is a <code>400</code>. A success is <co
 envelope and all <code>NUMBER_OF_COLUMNS</code> gloas data column sidecars are handed to
 P2P, which gossips them together. A node that does not subscribe to a column’s
 subnet publishes through gossipsub fanout.</p>
+<h3 id="builder-market"><a class="header" href="#builder-market">Builder market</a></h3>
+<p>Three endpoints serve the gloas builder market. Bids and preferences go through
+the same rules as the <code>execution_payload_bid</code> and <code>proposer_preferences</code> gossip
+topics and are held in one shared builder market that p2p also fills, so a
+message accepted from either side is seen by both.</p>
+<ul>
+<li><strong><code>POST /eth/v1/beacon/execution_payload_bids</code></strong> takes one
+<code>SignedExecutionPayloadBid</code>, as JSON (or no <code>Content-Type</code>) or SSZ
+(<code>application/octet-stream</code>, at most 196,932 bytes; any other type is <code>415</code>).
+<code>Eth-Consensus-Version</code> is optional and must be <code>gloas</code> when present. An
+identical bid already pooled is <code>200</code> and is not republished. Otherwise the
+gossip rules run (a known parent, the preferences for the slot and their fee
+recipient and gas limit, a known parent payload, an active funded builder, the
+signature), and a bid that is anything but accepted is a <code>400</code> whose message is
+<code>"{outcome}: {reason}"</code> (for instance <code>reject: bad_signature</code> or <code>ignore: preferences_unseen</code>), because there is no status for a valid bid this node
+would not relay. An accepted bid is pooled for block production and gossiped.
+<code>500</code> when the network actor is down.</li>
+<li><strong><code>POST /eth/v1/validator/proposer_preferences</code></strong> takes a list of
+<code>SignedProposerPreferences</code> (at most <code>(MIN_SEED_LOOKAHEAD + 1) * SLOTS_PER_EPOCH</code>, 64 on mainnet), as a JSON array or an SSZ list.
+<code>Eth-Consensus-Version</code> is optional and may be <code>fulu</code> or <code>gloas</code>, since a
+validator client submits during the epoch before the fork. Each entry runs the
+gossip rules in order; an entry already cached, identical, succeeds without a
+republish. Accepted entries are cached (the first per <code>(proposal slot, dependent root)</code> wins) and gossiped. If any entry fails the answer is <code>400</code>
+<code>{code, message, failures: [{index, message}]}</code> and the others were still
+published. The endpoint is not gated on the sync status. A node whose
+dependent block is unknown answers <code>ignore: unknown_block</code> for that entry.</li>
+<li><strong><code>POST /eth/v1/beacon/states/{state_id}/builders</code></strong> takes an optional JSON
+body <code>{ids?: [index | 0x pubkey], statuses?: [pending | active | exited]}</code>
+(empty or absent selects everything) and answers <code>{execution_optimistic, finalized, data: [{index, status, builder}]}</code> in registry order, integers
+quoted. An id naming no builder is omitted. <code>exited</code> is a set
+<code>withdrawable_epoch</code>, else <code>active</code> per <code>is_active_builder</code>, else <code>pending</code>.
+<code>400</code> for a malformed body, id or status, or a pre-gloas state; <code>404</code> for an
+unknown state. The Beacon API defines no <code>GET</code> form.</li>
+</ul>
+<p><code>POST /eth/v1/validator/builder_preferences</code> is not served (<code>404</code>).</p>
 <h3 id="sync-committee"><a class="header" href="#sync-committee">Sync committee</a></h3>
 <p>All four endpoints are JSON only (beacon-APIs lists no SSZ body for them), and
 read integers quoted or bare. All share one <code>SharedSyncCommitteePool</code>, which
@@ -833,6 +914,18 @@ payload does not make the chain look unverified.</li>
 <p>Pre-gloas responses are unchanged. One helper implements both rules
 (<code>shared/optimistic.rs</code>) and every response that carries the flag goes through
 it.</p>
+<h3 id="get-ethv1configfork_schedule"><a class="header" href="#get-ethv1configfork_schedule"><code>GET /eth/v1/config/fork_schedule</code></a></h3>
+<p>The <code>Fork</code> objects of the <code>Config</code>’s schedule, oldest first, as
+<code>{previous_version, current_version, epoch}</code> with the epoch quoted. Phase0 is
+first, at epoch <code>0</code> and its own predecessor; every later fork whose epoch is not
+<code>FAR_FUTURE_EPOCH</code> follows, and an unscheduled fork is skipped without breaking
+the chain, so each entry’s <code>previous_version</code> is the one before it in the list.
+Nimbus’s validator client reads this every epoch, requires that linked-list
+shape, and marks a node it cannot decode as incompatible. Nimbus also compares
+<code>/eth/v1/config/spec</code> against its own constants before use: the 13 preset
+values, the 7 domain types, <code>SECONDS_PER_SLOT</code> (or <code>SLOT_DURATION_MS</code>, which
+this node does not report) and every fork’s <code>*_FORK_VERSION</code> and <code>*_FORK_EPOCH</code>,
+with altair scheduled. All are served (a unit test pins the list).</p>
 <h3 id="get-ethv1configspec"><a class="header" href="#get-ethv1configspec"><code>GET /eth/v1/config/spec</code></a></h3>
 <p>One flat object holding the network’s configuration, the compiled preset, and
 the specification’s constants, as the Beacon API asks. Validator clients depend

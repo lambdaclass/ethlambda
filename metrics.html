@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-da047b23.js";
+            window.path_to_searchindex_js = "searchindex-41b0ffbf.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -604,15 +604,17 @@ own section. These are ethlambda-specific, not part of the leanMetrics spec.</p>
 <p><code>kind</code> is the topic kind, with every <code>data_column_sidecar_{subnet}</code> sharing the
 label <code>data_column_sidecar</code>, every <code>beacon_attestation_{subnet_id}</code> sharing
 <code>beacon_attestation</code> and every <code>sync_committee_{subnet_id}</code> sharing
-<code>sync_committee</code>. The gloas topics <code>execution_payload</code> and
-<code>payload_attestation_message</code> are labelled by their own name. <code>queue</code> means
+<code>sync_committee</code>. The gloas topics <code>execution_payload</code>,
+<code>payload_attestation_message</code>, <code>execution_payload_bid</code> and
+<code>proposer_preferences</code> are labelled by their own name. <code>queue</code> means
 IGNORE to gossipsub while the chain actor still receives the object and parks
 it; of the gloas topics only <code>execution_payload</code> answers it, for an envelope
 whose block is not known yet (<code>block_unknown</code>), has no post-state yet
 (<code>block_not_ready</code>), or has one that is not in the cache the checks read
 (<code>state_not_cached</code>, as when the block was imported moments ago; the actor
-verifies the signature itself, so the envelope is forwarded rather than dropped). The aggregate, attestation and
-<code>payload_attestation_message</code> topics never answer <code>queue</code>, since the vote
+verifies the signature itself, so the envelope is forwarded rather than dropped). The aggregate, attestation,
+<code>payload_attestation_message</code>, <code>execution_payload_bid</code> and <code>proposer_preferences</code>
+topics never answer <code>queue</code>, since the vote
 block’s post-state is either cached or it is not
 (<code>IgnoreReason::UnknownBlock</code>/<code>StateUnavailable</code>), with nothing to hold the
 message for. <strong><code>verdict_expired_total</code> should stay at
@@ -630,7 +632,16 @@ only), <code>not_aggregator</code> (aggregate only), <code>not_in_committee</cod
 <code>aggregator_signature</code> (aggregate only), <code>aggregate_signature</code> (aggregate
 only), <code>target_not_ancestor</code>, <code>wrong_subnet</code> (attestation only), and gloas’s
 <code>data_index_out_of_range</code>, <code>same_slot_payload_flag</code> and <code>payload_invalid</code> on the
-reject side. The sync committee topics add <code>sync_committee_unavailable</code> (the head
+reject side. The builder market topics add, on the ignore side,
+<code>pre_gloas_slot</code>, <code>not_current_or_next_slot</code>, <code>not_highest_bid</code>,
+<code>beyond_lookahead</code>, <code>preferences_unseen</code>, <code>fee_recipient_mismatch</code>,
+<code>parent_payload_unknown</code>, <code>gas_limit_incompatible</code>, <code>not_on_head_branch</code>,
+<code>builder_cannot_cover</code>, <code>builder_may_exit</code>, <code>slot_started</code> and
+<code>impossible_dependent_root</code>, and on the reject side <code>execution_payment_nonzero</code>,
+<code>block_hash_equals_parent</code>, <code>prev_randao</code>, <code>unknown_builder</code>,
+<code>not_payload_builder</code>, <code>inactive_builder</code> and <code>dependent_root_too_late</code>; a bid
+over its size cap is <code>malformed</code>.
+The sync committee topics add <code>sync_committee_unavailable</code> (the head
 state’s committees cannot answer for the message’s period) on the ignore side
 and <code>subcommittee_index</code> (contribution only) on the reject side; they reuse
 <code>not_current_slot</code>, <code>already_seen</code>, <code>covered_bits</code>, <code>no_participants</code>,
@@ -641,10 +652,11 @@ other topics: <code>unsupported_fork</code> is an ignore reason for a message of
 build has no gossip rules for, so an honest peer past the fork epoch is not
 scored as a bad decoder. Gloas blocks, data columns, aggregates and attestations
 are validated, so they carry their own verdict reasons instead.</p>
-<p>Two permit pools bound the blocking-thread half of validation:
-<code>gossip_validation_permits</code> for blocks and columns,
-<code>attestation_validation_permits</code> for aggregates and subnet attestations. They
-are deliberately separate: a mainnet slot’s worth of aggregates and backbone
+<p>Three permit pools bound the blocking-thread half of validation:
+<code>gossip_validation_permits</code> for blocks, columns and envelopes,
+<code>attestation_validation_permits</code> for aggregates, subnet attestations and
+payload votes, and <code>builder_validation_permits</code> for bids and proposer
+preferences. They are deliberately separate: a mainnet slot’s worth of aggregates and backbone
 attestations arrives every slot, not only during a range sync, and sharing one
 pool would let that burst answer <code>Ignore(Overloaded)</code> for a block or a column
 instead. Neither pool has a metric of its own yet; a permit exhausted on

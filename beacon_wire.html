@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-da047b23.js";
+            window.path_to_searchindex_js = "searchindex-41b0ffbf.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -249,14 +249,28 @@ after a boundary read the stale digest and reject the record.</p>
 <p>Seven global topics, <code>/eth2/{digest}/{name}/ssz_snappy</code>, plus two subnet
 families this node’s own node id selects a narrow slice of: the data column
 subnets it custodies and the attestation subnets it backbones, both described
-below. A gloas digest adds two more, <code>execution_payload</code> and
-<code>payload_attestation_message</code>, which <code>BeaconTopics::for_fork</code> subscribes under
-gloas digests and not under earlier ones. An envelope is validated like a block
+below. A gloas digest adds four more, <code>execution_payload</code>,
+<code>payload_attestation_message</code>, <code>execution_payload_bid</code> and
+<code>proposer_preferences</code>, which <code>BeaconTopics::for_fork</code> subscribes under gloas
+digests and not under earlier ones (so one epoch before the fork, when the
+digest is joined). An envelope is validated like a block
 (its stateful half on the blocking pool) and goes to the chain actor on <code>Accept</code>
 and on <code>Queue</code>, since the actor holds an envelope whose block is not imported
 yet. A payload attestation is validated on the attestation permit pool and goes
 to the actor on <code>Accept</code> only: a vote for a block not imported here is dropped,
-since it is valid only within its own slot.</p>
+since it is valid only within its own slot. Bids and preferences are the
+builder market: they never reach the chain actor. Their rules live in
+<code>state_transition::beacon::gossip::{execution_payload_bid, proposer_preferences}</code>,
+the cheap half runs in p2p’s triage (<code>p2p/src/beacon/builder_market.rs</code>) and the
+stateful half on a permit pool of their own (<code>builder_validation_permits</code>), so
+a bid burst cannot starve blocks, columns or attestations. Whatever is accepted
+goes into the node’s one shared <code>BuilderMarket</code>, which the Beacon API and block
+production read. Neither is ever queued: a message whose parent or dependent
+block is unknown is ignored. A bid is capped at 196,932 decompressed bytes
+(<code>Reject(Malformed)</code> above that). The node publishes both: a bid on the digest of
+its slot, preferences on the digest of the proposal slot, which in the epoch
+before gloas is the gloas digest already joined. Envelopes the node publishes
+itself are recorded as known payloads, since gossip never echoes them.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -274,6 +288,8 @@ since it is valid only within its own slot.</p>
 <tr><td><code>beacon_attestation_{subnet_id}</code></td><td><code>Attestation</code>, phase0 or electra’s <code>SingleAttestation</code> (gloas keeps the latter)</td></tr>
 <tr><td><code>execution_payload</code></td><td><code>SignedExecutionPayloadEnvelope</code>, gloas digests only</td></tr>
 <tr><td><code>payload_attestation_message</code></td><td><code>PayloadAttestationMessage</code>, gloas digests only</td></tr>
+<tr><td><code>execution_payload_bid</code></td><td><code>SignedExecutionPayloadBid</code>, gloas digests only</td></tr>
+<tr><td><code>proposer_preferences</code></td><td><code>SignedProposerPreferences</code>, gloas digests only</td></tr>
 </tbody>
 </table>
 </div>
