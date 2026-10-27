@@ -711,10 +711,11 @@ Fulu (`blocks/{slot}`) and gloas (`produceBlockV4`) do the same, and the
 The payload attestation pool is shared with P2P, which fills it from accepted
 gossip, so a block this node builds carries the votes its peers sent too.
 
-`tooling/kurtosis-validator/network_params_ethlambda_beacon.yaml` points the
-validator client at this node alone, so every block on that devnet is one this
-node built; it also runs spamoor, whose blob traffic makes those blocks carry
-blobs.
+A `cl_type: ethlambda` participant in our ethereum-package fork
+([`lambdaclass/ethereum-package`](https://github.com/lambdaclass/ethereum-package/tree/add-ethlambda),
+branch `add-ethlambda`) runs an ethlambda validator client that, by default,
+talks to this node alone, so every block its validators propose is one this
+node built.
 
 ### Encoding
 
