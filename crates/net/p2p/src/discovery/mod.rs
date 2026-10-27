@@ -191,10 +191,7 @@ pub async fn spawn_discovery(
     };
     let local_node = params.local_node();
     let local_record = build_local_enr(&params)?;
-    // EIP-778's text form is URL-safe base64 *without* padding. ethrex's
-    // `enr_url` pads, and lighthouse refuses a padded record outright ("Not
-    // valid as ENR nor Multiaddr"), which is the form this string is handed to
-    // peers in: `/eth/v1/node/identity`, and through it devnet bootnode lists.
+    // EIP-778's text form is URL-safe base64 *without* padding
     let local_enr = local_record
         .enr_url()
         .map_err(DiscoveryError::EncodeEnr)?
