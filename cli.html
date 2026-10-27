@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-8151027b.js";
+            window.path_to_searchindex_js = "searchindex-1f05bc4d.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -474,7 +474,7 @@ same care as a manual key move. The client repeats this warning at startup.</p>
 </thead>
 <tbody>
 <tr><td><code>--beacon-nodes</code></td><td>required</td><td>Base URLs of the beacon nodes to use, comma-separated or repeated. Tried in list order; the first that answers serves the request, so the order is a preference, not load balancing</td></tr>
-<tr><td><code>--validators-dir</code></td><td>required</td><td>Directory holding the EIP-2335 keystores and <code>validator_definitions.yml</code></td></tr>
+<tr><td><code>--validators-dir</code></td><td>required</td><td>Directory holding the EIP-2335 keystores and <code>validator_definitions.yml</code>. Without that file, keystores in the Lighthouse layout (<code>&lt;0xpubkey&gt;/voting-keystore.json</code>, password in <code>--secrets-dir/&lt;0xpubkey&gt;</code>) are discovered and the file is written</td></tr>
 <tr><td><code>--secrets-dir</code></td><td>required</td><td>Directory holding one password file per keystore, named after the validator’s public key</td></tr>
 <tr><td><code>--http-address</code></td><td><code>127.0.0.1</code></td><td>Bind address for the metrics and keymanager servers</td></tr>
 <tr><td><code>--metrics-port</code></td><td><code>5064</code></td><td>Prometheus metrics port</td></tr>

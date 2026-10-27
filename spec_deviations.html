@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-8151027b.js";
+            window.path_to_searchindex_js = "searchindex-1f05bc4d.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -459,22 +459,6 @@ memory only, pruned with the execution block hash cache.</li>
 <li><strong>Consequence:</strong> a restart forgets it. Only the slot in flight can be wrong
 (a member asked after a restart answers <code>payload_present = false</code> for an
 envelope that arrived before it), and the next slot’s record starts fresh.</li>
-</ul>
-<h2 id="ethv1nodeidentity-reports-no-enr"><a class="header" href="#ethv1nodeidentity-reports-no-enr"><code>/eth/v1/node/identity</code> reports no ENR</a></h2>
-<p>The endpoint’s <code>enr</code>, <code>p2p_addresses</code> and <code>discovery_addresses</code> are empty
-rather than populated, which is not spec-valid.</p>
-<ul>
-<li><strong>ethlambda:</strong> <code>get_identity</code> (<code>crates/net/rpc/src/beacon/node.rs</code>) reports
-<code>peer_id</code> and a placeholder <code>metadata</code> block and nothing else. The ENR is
-built for discv5 and owned by the P2P actor; <code>BuiltSwarm</code> hands <code>run_node</code>
-only a <code>local_peer_id</code>, so serving the record means widening the
-<code>ethlambda-p2p</code> surface and threading it through startup.</li>
-<li><strong>Beacon API:</strong> <code>enr</code> is the node’s base64 ENR and the two lists are its
-libp2p multiaddrs.</li>
-<li><strong>Consequence:</strong> a consumer reading <code>enr</code> to dial this node gets an empty
-string rather than a record, so peer discovery through this endpoint does not
-work. Everything that reads <code>peer_id</code> is unaffected. Out of scope for the
-change that added the Beacon API surface; a follow-up exposes the record.</li>
 </ul>
 <h2 id="sync-duties-are-not-served-for-a-period-before-the-heads"><a class="header" href="#sync-duties-are-not-served-for-a-period-before-the-heads">Sync duties are not served for a period before the head’s</a></h2>
 <p><code>POST /eth/v1/validator/duties/sync/{epoch}</code> refuses a period before the head

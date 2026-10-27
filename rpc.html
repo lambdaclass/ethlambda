@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-8151027b.js";
+            window.path_to_searchindex_js = "searchindex-1f05bc4d.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -399,7 +399,7 @@ surface rather than sitting beside it; a <code>/lean/v0</code> path on a beacon 
 <tr><td><code>GET</code></td><td><code>/eth/v1/node/syncing</code></td><td>JSON</td><td>Head slot, sync distance, whether the head is optimistic</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/node/health</code></td><td><em>(status only)</em></td><td><code>200</code> caught up, <code>206</code> syncing or on an optimistic head</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/node/version</code></td><td>JSON</td><td>Client version string</td></tr>
-<tr><td><code>GET</code></td><td><code>/eth/v1/node/identity</code></td><td>JSON</td><td>Peer ID and metadata only (see below)</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/node/identity</code></td><td>JSON</td><td>Peer ID, ENR and listen multiaddrs (see below)</td></tr>
 <tr><td><code>GET</code>, <code>POST</code></td><td><code>/eth/v1/beacon/states/{state_id}/validators</code></td><td>JSON</td><td>Registry entries by index or pubkey, with status</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/beacon/states/{state_id}/validators/{validator_id}</code></td><td>JSON</td><td>One registry entry, by index or pubkey; <code>404</code> if there is none</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/validator/duties/proposer/{epoch}</code></td><td>JSON</td><td>Proposers for any epoch from the head’s up to one past the wall clock’s</td></tr>
@@ -971,8 +971,11 @@ the lookup falls back to the roots the store can name and accepts one only when
 the block under it really sits at that slot. This matters because it is the
 slot a checkpoint-syncing peer asks for right after reading the finalized
 state. A slot the store holds nothing at is still a <code>404</code>.</p>
-<p><code>/eth/v1/node/identity</code> reports <code>peer_id</code> and <code>metadata</code>; <code>enr</code>,
-<code>p2p_addresses</code> and <code>discovery_addresses</code> are empty.</p>
+<p><code>/eth/v1/node/identity</code> reports the peer id, the ENR discv5 publishes, and the
+node’s QUIC, TCP and discv5 multiaddrs. The multiaddrs need
+<code>--discovery.advertise-ip</code>, since a node bound to <code>0.0.0.0</code> does not know the
+address peers reach it on; without the flag they are empty and the ENR carries
+no IP. <code>metadata</code> is still a placeholder.</p>
 <h3 id="get-ethv1events"><a class="header" href="#get-ethv1events"><code>GET /eth/v1/events</code></a></h3>
 <p>The Beacon API eventstream: the same Server-Sent Events stream as
 <a href="#get-leanv0events"><code>/lean/v0/events</code></a> (topic on the <code>event:</code> line, payload on
