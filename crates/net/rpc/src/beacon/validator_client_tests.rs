@@ -407,7 +407,7 @@ fn valid_blob(seed: u8) -> Vec<u8> {
 ///
 /// The fulu bundle carries `blob_count` valid blobs with their commitments and
 /// cell proofs (flattened blob by blob, as `BlobsBundleV2` does).
-async fn fake_execution_client(blob_count: usize) -> ethlambda_engine::EngineClient {
+pub(super) async fn fake_execution_client(blob_count: usize) -> ethlambda_engine::EngineClient {
     fake_execution_client_with(blob_count, None).await
 }
 
