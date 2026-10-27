@@ -676,7 +676,10 @@ impl TryFrom<&Attestation> for super::electra::Attestation {
 )]
 #[ssz(progressive_container)]
 pub struct IndexedAttestation {
-    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
+    #[serde(
+        serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize",
+        deserialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::deserialize_progressive"
+    )]
     pub attesting_indices: AttestingIndices,
     pub data: AttestationData,
     pub signature: BlsSignature,

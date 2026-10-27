@@ -175,7 +175,10 @@ pub struct Attestation {
 pub struct IndexedAttestation {
     /// The attesters, which the specification requires to be sorted and
     /// unique.
-    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
+    #[serde(
+        serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize",
+        deserialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::deserialize"
+    )]
     pub attesting_indices: AttestingIndices,
     pub data: AttestationData,
     pub signature: BlsSignature,

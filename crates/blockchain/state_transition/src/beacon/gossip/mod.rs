@@ -12,6 +12,7 @@ pub mod block;
 pub mod column;
 pub mod envelope;
 pub mod execution_payload_bid;
+pub mod operations;
 pub mod payload_attestation;
 pub mod proposer_preferences;
 pub mod sync_committee;
@@ -114,6 +115,8 @@ impl QueueReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IgnoreReason {
     FutureSlot,
+    /// An operation's epoch has not begun yet on the wall clock.
+    FutureEpoch,
     Finalized,
     AlreadySeen,
     AlreadyStored,
@@ -187,6 +190,10 @@ pub enum IgnoreReason {
     /// The head state's payload timeliness committee window cannot answer for
     /// the attested slot.
     PtcUnavailable,
+    /// The wall clock is before the fork that introduced the topic's message.
+    BeforeFork,
+    /// A voluntary exit for a validator that has already initiated its exit.
+    AlreadyExiting,
     /// The head state's sync committees cannot answer for the message's period.
     SyncCommitteeUnavailable,
 }
@@ -195,6 +202,7 @@ impl IgnoreReason {
     pub fn label(&self) -> &'static str {
         match self {
             Self::FutureSlot => "future_slot",
+            Self::FutureEpoch => "future_epoch",
             Self::Finalized => "finalized",
             Self::AlreadySeen => "already_seen",
             Self::AlreadyStored => "already_stored",
@@ -227,6 +235,8 @@ impl IgnoreReason {
             Self::NotCurrentSlot => "not_current_slot",
             Self::BlockNotAtSlot => "block_not_at_slot",
             Self::PtcUnavailable => "ptc_unavailable",
+            Self::BeforeFork => "before_fork",
+            Self::AlreadyExiting => "already_exiting",
             Self::SyncCommitteeUnavailable => "sync_committee_unavailable",
         }
     }
@@ -320,6 +330,9 @@ pub enum RejectReason {
     /// A payload attestation's validator is not in its slot's payload
     /// timeliness committee.
     NotInPtc,
+    /// A voluntary exit, slashing or credentials change that fails its gossip
+    /// rule against the head state.
+    InvalidOperation,
     /// A sync committee contribution's subcommittee index is not below
     /// `SYNC_COMMITTEE_SUBNET_COUNT`.
     SubcommitteeIndex,
@@ -375,6 +388,7 @@ impl RejectReason {
             Self::TooManyWithdrawals => "too_many_withdrawals",
             Self::PreGloasSlot => "pre_gloas_slot",
             Self::NotInPtc => "not_in_ptc",
+            Self::InvalidOperation => "invalid_operation",
             Self::SubcommitteeIndex => "subcommittee_index",
         }
     }
@@ -512,6 +526,16 @@ pub(crate) fn is_current_slot(config: &Config, slot: Slot, now_ms: u64) -> bool 
     }
     slot_start_ms(config, slot.saturating_add(1)).saturating_add(MAXIMUM_GOSSIP_CLOCK_DISPARITY)
         >= now_ms
+}
+
+/// The specification's `is_future_epoch`: the wall clock, with the gossip
+/// clock disparity allowance, has not yet reached `epoch`.
+pub(crate) fn is_future_epoch(config: &Config, epoch: Epoch, now_ms: u64) -> bool {
+    let since_genesis_ms = now_ms
+        .saturating_sub(config.genesis_time_ms())
+        .saturating_add(MAXIMUM_GOSSIP_CLOCK_DISPARITY);
+    let current_slot = since_genesis_ms / config.slot_duration_ms;
+    compute_epoch_at_slot(current_slot) < epoch
 }
 
 /// The specification's `is_within_epoch`: the clock, with the gossip clock

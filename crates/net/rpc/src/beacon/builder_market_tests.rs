@@ -17,7 +17,6 @@ use axum::{
 use ethlambda_engine::{EngineClient, JwtSecret};
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
-    attestation_pool::SharedAttestationPool,
     block_production::advance_to_slot,
     builder_market::SharedBuilderMarket,
     gloas_block_production::test_support::{
@@ -267,7 +266,6 @@ impl World {
             .with_state(self.store.clone())
             .layer(Extension(p2p))
             .layer(Extension(engine.map(|engine| engine.client.clone())))
-            .layer(Extension(SharedAttestationPool::default()))
             .layer(Extension(SharedPayloadAttestationPool::default()))
             .layer(Extension(SharedSyncCommitteePool::default()))
             .layer(Extension(crate::beacon::graffiti::OwnVersion(Arc::new(
@@ -1217,7 +1215,6 @@ async fn the_new_routes_are_wired_with_the_production_layers() {
         crate::build_beacon_api_router(world.store.clone(), "ethlambda/test", "peer".into())
             .layer(Extension(SyncStatusController::new(SyncStatus::Synced)))
             .layer(Extension::<RpcToP2PRef>(world.network.clone()))
-            .layer(Extension(SharedAttestationPool::default()))
             .layer(Extension(SharedPayloadAttestationPool::default()))
             .layer(Extension(SharedSyncCommitteePool::default()))
             .layer(Extension(crate::beacon::graffiti::OwnVersion(Arc::new(
