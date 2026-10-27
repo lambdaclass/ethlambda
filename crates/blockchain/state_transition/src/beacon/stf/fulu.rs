@@ -65,6 +65,7 @@ pub fn process_block(
     config: &Config,
     engine: &ExecutionEngine,
     committees: &CommitteeCache,
+    options: super::block::BlockProcessingOptions,
 ) -> Result<()> {
     super::block::process_block_header(
         state,
@@ -75,7 +76,7 @@ pub fn process_block(
     )?;
     super::electra::process_withdrawals(state, &block.body.execution_payload)?;
     process_execution_payload(state, &block.body, config, engine)?;
-    super::block::process_randao(state, &block.body.randao_reveal)?;
+    super::block::process_randao(state, &block.body.randao_reveal, options.randao)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
     process_operations(state, &block.body, config, committees)?;
     super::altair::process_sync_aggregate(state, &block.body.sync_aggregate)?;
