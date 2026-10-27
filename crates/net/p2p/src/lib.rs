@@ -45,7 +45,8 @@ use ethlambda_network_api::{
     },
     rpc_to_p2p::{
         PublishBeaconAggregate, PublishBeaconAttestation, PublishBeaconBlock,
-        PublishBeaconOperation, PublishExecutionPayloadEnvelope, PublishPayloadAttestationMessage,
+        PublishBeaconOperation, PublishExecutionPayloadBid, PublishExecutionPayloadEnvelope,
+        PublishPayloadAttestationMessage, PublishProposerPreferences,
         PublishSyncCommitteeContribution, PublishSyncCommitteeMessage, SubscribeAttestationSubnets,
         SubscribeSyncCommitteeSubnets,
     },
@@ -61,7 +62,7 @@ use ethlambda_state_transition::beacon::gossip::{
     sync_committee::{SeenSyncCommitteeMessages, SeenSyncContributions},
 };
 use ethlambda_state_transition::beacon::{
-    payload_attestation_pool::SharedPayloadAttestationPool,
+    builder_market::SharedBuilderMarket, payload_attestation_pool::SharedPayloadAttestationPool,
     sync_committee_pool::SharedSyncCommitteePool,
 };
 use ethlambda_storage::{Chain, Store};
@@ -249,6 +250,11 @@ const COLUMN_CHECK_PERMITS: usize = 16;
 /// `lean_beacon_gossip_validation_seconds{kind="beacon_aggregate_and_proof"}`
 /// has data from a follower.
 const ATTESTATION_VALIDATION_PERMITS: usize = 128;
+
+/// How many `execution_payload_bid` and `proposer_preferences` stateful checks
+/// may run at once. A pool of its own, so a burst of bids (each costs a BLS
+/// verification) cannot starve blocks, columns or attestations of permits.
+const BUILDER_VALIDATION_PERMITS: usize = 32;
 
 /// How many `sync_committee_{subnet_id}` and
 /// `sync_committee_contribution_and_proof` stateful checks may run at once.
@@ -1120,12 +1126,14 @@ impl P2P {
     /// published mainnet bootnode ENRs carry no `quic` entry, so none of them
     /// is statically dialable. Opt-in on lean, where nothing else speaks discv5
     /// and co-located devnet nodes would otherwise all claim one UDP port.
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn(
         built: BuiltSwarm,
         store: Store,
         node_names: HashMap<PeerId, String>,
         discovery: Option<DiscoverySpawnConfig>,
         payload_attestation_pool: SharedPayloadAttestationPool,
+        builder_market: SharedBuilderMarket,
         sync_committee_pool: SharedSyncCommitteePool,
     ) -> Result<P2P, DiscoveryError> {
         let discovery = match discovery {
@@ -1196,6 +1204,10 @@ impl P2P {
                 ATTESTATION_VALIDATION_PERMITS,
             )),
             payload_attestation_pool,
+            builder_market,
+            builder_validation_permits: Arc::new(tokio::sync::Semaphore::new(
+                BUILDER_VALIDATION_PERMITS,
+            )),
             sync_committee_pool,
             aggregator_subnets: HashMap::new(),
         };
@@ -1347,6 +1359,15 @@ pub struct P2PServer {
     /// API that serves and fills the same pool. Filled by `verdict::forward`;
     /// lean never touches it.
     pub(crate) payload_attestation_pool: SharedPayloadAttestationPool,
+
+    /// Bids, proposer preferences and known payloads, shared with the Beacon
+    /// API (which posts bids and preferences, and builds blocks from the pool).
+    /// Gossip's stateful checks read it from blocking threads, so it cannot
+    /// live in the chain actor; lean never touches it.
+    pub(crate) builder_market: SharedBuilderMarket,
+    /// Permits for `execution_payload_bid` and `proposer_preferences` stateful
+    /// checks, see [`BUILDER_VALIDATION_PERMITS`].
+    pub(crate) builder_validation_permits: Arc<tokio::sync::Semaphore>,
 
     /// Accepted sync committee messages and contributions, shared with the
     /// Beacon API that serves and fills the same pool (block production reads
@@ -1669,6 +1690,18 @@ impl Handler<PublishBeaconBlock> for P2PServer {
 impl Handler<PublishExecutionPayloadEnvelope> for P2PServer {
     async fn handle(&mut self, msg: PublishExecutionPayloadEnvelope, _ctx: &Context<Self>) {
         gossipsub::publish_execution_payload_envelope(self, *msg.envelope, msg.sidecars).await;
+    }
+}
+
+impl Handler<PublishExecutionPayloadBid> for P2PServer {
+    async fn handle(&mut self, msg: PublishExecutionPayloadBid, _ctx: &Context<Self>) {
+        beacon::builder_market::publish_execution_payload_bid(self, msg.bid);
+    }
+}
+
+impl Handler<PublishProposerPreferences> for P2PServer {
+    async fn handle(&mut self, msg: PublishProposerPreferences, _ctx: &Context<Self>) {
+        beacon::builder_market::publish_proposer_preferences(self, msg.preferences);
     }
 }
 
@@ -2959,6 +2992,10 @@ pub(crate) mod test_support {
                 crate::SYNC_VALIDATION_PERMITS,
             )),
             payload_attestation_pool: Default::default(),
+            builder_market: Default::default(),
+            builder_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::BUILDER_VALIDATION_PERMITS,
+            )),
             sync_committee_pool: Default::default(),
             aggregator_subnets: HashMap::new(),
         }
