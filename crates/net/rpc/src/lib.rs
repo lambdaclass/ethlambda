@@ -193,6 +193,17 @@ pub fn build_beacon_api_router(store: Store, version: &'static str, peer_id: Str
 #[derive(Clone, Debug, Default)]
 pub struct CustodyColumns(pub Vec<u64>);
 
+/// How peers reach this node, as `/eth/v1/node/identity` reports it.
+#[derive(Debug, Clone, Default)]
+pub struct BeaconIdentity {
+    /// The node's ENR, `enr:`-prefixed.
+    pub enr: String,
+    /// libp2p multiaddrs the node listens on, each ending in `/p2p/<peer id>`.
+    pub p2p_addresses: Vec<String>,
+    /// discv5 multiaddrs, likewise.
+    pub discovery_addresses: Vec<String>,
+}
+
 /// What the Beacon API's endpoints reach beyond the store.
 pub struct BeaconApiHandles {
     /// Through which the pool, aggregate and block endpoints gossip what a
@@ -223,6 +234,8 @@ pub struct BeaconApiHandles {
     /// its code and commit, with the execution client's, to every block's
     /// graffiti.
     pub client_version: ethlambda_engine::types::ClientVersionV1,
+    /// What `/eth/v1/node/identity` reports beyond the peer id.
+    pub identity: BeaconIdentity,
 }
 
 /// Start the HTTP servers for a beacon node.
@@ -249,6 +262,7 @@ pub async fn start_beacon_rpc_server(
         .layer(Extension(beacon::validator::FeeRecipients::default()))
         .layer(Extension(handles.engine))
         .layer(Extension(handles.events))
+        .layer(Extension(handles.identity))
         .layer(Extension(beacon::graffiti::OwnVersion(Arc::new(
             handles.client_version,
         ))));

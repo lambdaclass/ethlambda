@@ -118,6 +118,36 @@ fn main() -> eyre::Result<()> {
     }
 }
 
+/// What `/eth/v1/node/identity` reports beyond the peer id: the ENR discv5
+/// publishes, and the multiaddrs peers reach this node on. The addresses need
+/// the node's externally reachable IP, which only `--discovery.advertise-ip`
+/// supplies (a node bound to `0.0.0.0` does not know it), so without the flag
+/// they are left empty rather than guessed.
+fn beacon_identity(
+    enr: &str,
+    advertise_ip: Option<IpAddr>,
+    gossipsub_port: u16,
+    discovery_port: u16,
+    peer_id: &str,
+) -> ethlambda_rpc::BeaconIdentity {
+    let Some(ip) = advertise_ip else {
+        return ethlambda_rpc::BeaconIdentity {
+            enr: enr.to_string(),
+            ..Default::default()
+        };
+    };
+    let family = if ip.is_ipv4() { "ip4" } else { "ip6" };
+    ethlambda_rpc::BeaconIdentity {
+        enr: enr.to_string(),
+        // QUIC first, matching the order this node dials in.
+        p2p_addresses: vec![
+            format!("/{family}/{ip}/udp/{gossipsub_port}/quic-v1/p2p/{peer_id}"),
+            format!("/{family}/{ip}/tcp/{gossipsub_port}/p2p/{peer_id}"),
+        ],
+        discovery_addresses: vec![format!("/{family}/{ip}/udp/{discovery_port}/p2p/{peer_id}")],
+    }
+}
+
 /// Node logging: INFO and above, on stdout.
 fn init_node_logging() -> eyre::Result<()> {
     let filter = EnvFilter::builder()
@@ -738,6 +768,13 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         } => ethlambda_rpc::CustodyColumns(custody_columns.clone()),
         ChainActor::Lean(..) => ethlambda_rpc::CustodyColumns::default(),
     };
+    let rpc_identity = beacon_identity(
+        p2p.local_enr().unwrap_or_default(),
+        common.discovery.advertise_ip,
+        common.gossipsub_port,
+        common.discovery.port,
+        &local_peer_id,
+    );
     // Block production builds its payloads with the same execution client the
     // chain actor validates them with.
     let rpc_engine = match &setup.chain {
@@ -767,6 +804,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     engine: rpc_engine,
                     events: rpc_events,
                     client_version: version::engine_client_version(),
+                    identity: rpc_identity,
                 },
                 local_peer_id,
                 rpc_shutdown,
