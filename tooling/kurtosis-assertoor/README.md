@@ -75,8 +75,10 @@ Starts the same three participants with `mev_type: commit-boost`
 (`commit_boost_params.yaml`): a flashbots mev-boost-relay, a reth-rbuilder
 builder with its own lighthouse beacon node, and one
 [Commit-Boost](https://github.com/Commit-Boost/commit-boost-client) PBS module
-per participant, which stands in for MEV-Boost. It also starts spamoor, since
-rbuilder submits no bid for a block without transactions. The package gives the ethlambda
+per participant, which stands in for MEV-Boost. It also starts spamoor at a
+light load, since rbuilder submits no bid for a block without transactions and
+a heavy load slows the relay past Commit-Boost's getHeader timeout (see the
+comment in the params file). The package gives the ethlambda
 beacon node `--builder <pbs url>` and the ethlambda validator client
 `--builder-proposals`. There is no assertoor: the base battery's checks fail on
 the spec-endpoint gap above, so `scripts/check-builder-blocks.sh` polls the

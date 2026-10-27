@@ -46,14 +46,38 @@ network_params:
   fulu_fork_epoch: 0
 mev_type: commit-boost
 # rbuilder submits nothing for a block with no transactions, so without a
-# spammer the relay never holds a bid and every getHeader answers 204. spamoor's
-# package defaults send type-2 transfers and blob transactions every slot, so
-# bids also carry blob commitments.
+# spammer the relay never holds a bid and every getHeader answers 204. The load
+# is kept light on purpose: under spamoor's defaults (a chain-load group plus
+# 200 transfers and 6 blob transactions a slot) the relay's getHeader slowed
+# past Commit-Boost's 950 ms timeout on a local run, so most proposals got no
+# bid. The package also always adds 100 Uniswap swaps a slot, sent to the
+# builder's own execution client; that is not configurable. The blob spammer
+# stays so bids carry blob commitments.
 additional_services:
   - spamoor
 spamoor_params:
   # ethpandaops/spamoor:master on 2026-10-27
   image: ethpandaops/spamoor@sha256:e890785f5814218bbcb544c495820ff7b02dd554e6d714f82849a0ac8de680c5
+  start_chainload: false
+  spammers:
+    - name: "EOA transfers"
+      description: "10 type-2 transfers a slot"
+      scenario: "eoatx"
+      config:
+        throughput: 10
+        max_pending: 20
+        max_wallets: 10
+        base_fee: 20
+    - name: "Blob transactions"
+      description: "1 type-4 transaction a slot with 1 sidecar"
+      scenario: "blob-combined"
+      config:
+        throughput: 1
+        sidecars: 1
+        max_pending: 2
+        max_wallets: 2
+        base_fee: 20
+        blob_fee: 20
 # The package defaults are floating tags (`main`, `develop`, `latest`), so a
 # run would change under us. These pin what the tags pointed to on 2026-10-26;
 # bump them deliberately.
