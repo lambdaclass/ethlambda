@@ -130,6 +130,9 @@ pub struct BuiltGloasPayload {
     pub blobs_bundle: BlobsBundle,
     /// The EIP-7685 request list, each entry its type byte then its data.
     pub execution_requests: Vec<Vec<u8>>,
+    /// The engine's `shouldOverrideBuilder`: it wants this payload built
+    /// locally whatever a builder bid pays. Absent from an answer means false.
+    pub should_override_builder: bool,
 }
 
 /// `BlobsBundleV2`: the payload's blobs, their commitments, and every blob's
@@ -158,6 +161,8 @@ pub(crate) struct GetPayloadV6Response {
     execution_payload: ExecutionPayloadJson,
     block_value: String,
     blobs_bundle: BlobsBundleJson,
+    #[serde(default)]
+    should_override_builder: bool,
     #[serde(default)]
     execution_requests: Vec<String>,
 }
@@ -307,6 +312,7 @@ impl TryFrom<GetPayloadV6Response> for BuiltGloasPayload {
             block_value: parse_uint256(&response.block_value)?,
             blobs_bundle: decode_blobs_bundle(response.blobs_bundle)?,
             execution_requests: decode_requests(&response.execution_requests)?,
+            should_override_builder: response.should_override_builder,
         })
     }
 }
@@ -526,6 +532,30 @@ mod tests {
         assert_eq!(
             built.execution_requests,
             vec![vec![0x00, 0x11], vec![0x02, 0xff]]
+        );
+        assert!(!built.should_override_builder);
+    }
+
+    #[test]
+    fn a_v6_answer_carries_should_override_builder_and_defaults_it_to_false() {
+        let mut json = v6_json();
+        json["shouldOverrideBuilder"] = true.into();
+        let response: GetPayloadV6Response = serde_json::from_value(json).unwrap();
+        assert!(
+            BuiltGloasPayload::try_from(response)
+                .unwrap()
+                .should_override_builder
+        );
+
+        let mut json = v6_json();
+        json.as_object_mut()
+            .unwrap()
+            .remove("shouldOverrideBuilder");
+        let response: GetPayloadV6Response = serde_json::from_value(json).unwrap();
+        assert!(
+            !BuiltGloasPayload::try_from(response)
+                .unwrap()
+                .should_override_builder
         );
     }
 
