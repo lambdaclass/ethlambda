@@ -45,6 +45,15 @@ network_params:
   electra_fork_epoch: 0
   fulu_fork_epoch: 0
 mev_type: commit-boost
+# rbuilder submits nothing for a block with no transactions, so without a
+# spammer the relay never holds a bid and every getHeader answers 204. spamoor's
+# package defaults send type-2 transfers and blob transactions every slot, so
+# bids also carry blob commitments.
+additional_services:
+  - spamoor
+spamoor_params:
+  # ethpandaops/spamoor:master on 2026-10-27
+  image: ethpandaops/spamoor@sha256:e890785f5814218bbcb544c495820ff7b02dd554e6d714f82849a0ac8de680c5
 # The package defaults are floating tags (`main`, `develop`, `latest`), so a
 # run would change under us. These pin what the tags pointed to on 2026-10-26;
 # bump them deliberately.

@@ -75,7 +75,8 @@ Starts the same three participants with `mev_type: commit-boost`
 (`commit_boost_params.yaml`): a flashbots mev-boost-relay, a reth-rbuilder
 builder with its own lighthouse beacon node, and one
 [Commit-Boost](https://github.com/Commit-Boost/commit-boost-client) PBS module
-per participant, which stands in for MEV-Boost. The package gives the ethlambda
+per participant, which stands in for MEV-Boost. It also starts spamoor, since
+rbuilder submits no bid for a block without transactions. The package gives the ethlambda
 beacon node `--builder <pbs url>` and the ethlambda validator client
 `--builder-proposals`. There is no assertoor: the base battery's checks fail on
 the spec-endpoint gap above, so `scripts/check-builder-blocks.sh` polls the
@@ -96,7 +97,7 @@ through lighthouse. The script writes every `lean_beacon_builder_*` and
 `<output-dir>/<service>.prom`, pass or fail, and the unmet conditions to
 `failed.txt`.
 
-The relay, builder and PBS images are pinned by digest in
+The relay, builder, PBS and spamoor images are pinned by digest in
 `commit_boost_params.yaml` (the package's defaults are floating tags).
 
 ### Run it locally
@@ -165,3 +166,8 @@ The Commit-Boost PBS modules start after the consensus clients, so at startup
 ethlambda's beacon node logs "Builder is not answering" and its first
 registration batch fails. The validator client re-sends registrations every
 epoch, so this clears within an epoch and is not a failure.
+
+From epoch 4 until the chain first finalizes, the beacon node builds locally and
+counts `lean_beacon_builder_fallback_total{reason="no_finality"}`: like
+Lighthouse, it skips the builder when the proposal is more than 3 epochs past
+the finalized checkpoint, and the genesis checkpoint counts as one.
