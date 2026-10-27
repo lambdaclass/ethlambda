@@ -28,7 +28,6 @@ use axum::{
 use ethlambda_engine::EngineClient;
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
-    attestation_pool::SharedAttestationPool,
     bls,
     gossip::attestation::compute_subnet_for_attestation,
     gossip::{IgnoreReason, Outcome, RejectReason, aggregate, verify_attestation_payload_status},
@@ -84,15 +83,14 @@ struct Checked {
 /// One rejected attestation, in the Beacon API's `IndexedErrorMessage` shape:
 /// its position in the submitted array, and why.
 #[derive(Debug, Serialize)]
-struct Failure {
-    index: usize,
-    message: &'static str,
+pub(crate) struct Failure {
+    pub(crate) index: usize,
+    pub(crate) message: std::borrow::Cow<'static, str>,
 }
 
 async fn post_pool_attestations(
     State(store): State<Store>,
     Extension(p2p): Extension<RpcToP2PRef>,
-    Extension(pool): Extension<SharedAttestationPool>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -131,7 +129,7 @@ async fn post_pool_attestations(
             store
                 .observed_liveness()
                 .record(attestation.data.target.epoch, validator);
-            pool.lock().expect("attestation pool lock poisoned").insert(
+            store.attestation_pool().insert(
                 &attestation,
                 checked.committee_position,
                 checked.committee_len,
@@ -143,7 +141,10 @@ async fn post_pool_attestations(
             Ok(()) => debug!(%slot, validator, "Accepted attestation for gossip"),
             Err(message) => {
                 warn!(%slot, validator, reason = message, "Refused a submitted attestation");
-                failures.push(Failure { index, message });
+                failures.push(Failure {
+                    index,
+                    message: message.into(),
+                });
             }
         }
     }
@@ -318,7 +319,7 @@ fn header_matches_slot(store: &Store, header: ForkName, slot: Slot) -> bool {
 
 /// `200` when nothing failed, else the Beacon API's `IndexedErrorMessage`
 /// naming each failed item by position; the rest were still published.
-fn batch_response(failures: Vec<Failure>, message: &'static str) -> Response {
+pub(crate) fn batch_response(failures: Vec<Failure>, message: &'static str) -> Response {
     if failures.is_empty() {
         return StatusCode::OK.into_response();
     }
@@ -341,7 +342,6 @@ fn batch_response(failures: Vec<Failure>, message: &'static str) -> Response {
 async fn post_aggregate_and_proofs(
     State(store): State<Store>,
     Extension(p2p): Extension<RpcToP2PRef>,
-    Extension(pool): Extension<SharedAttestationPool>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -411,16 +411,17 @@ async fn post_aggregate_and_proofs(
                 SignedAggregateAndProof::Phase0(_) => None,
             };
             if let Some(pooled) = pooled {
-                pool.lock()
-                    .expect("attestation pool lock poisoned")
-                    .insert_aggregate(pooled);
+                store.attestation_pool().insert_aggregate(pooled);
             }
             p2p.publish_beacon_aggregate(aggregate, attesting_indices)
                 .map_err(|_| "the network actor is not running")
         });
         match published {
             Ok(()) => debug!(%slot, aggregator, "Accepted aggregate for gossip"),
-            Err(message) => failures.push(Failure { index, message }),
+            Err(message) => failures.push(Failure {
+                index,
+                message: message.into(),
+            }),
         }
     }
     batch_response(
@@ -448,7 +449,6 @@ struct AggregateQuery {
 /// go unvalidated.
 async fn get_aggregate_attestation(
     State(store): State<Store>,
-    Extension(pool): Extension<SharedAttestationPool>,
     Extension(engine): Extension<Option<EngineClient>>,
     Query(query): Query<AggregateQuery>,
 ) -> Response {
@@ -458,14 +458,11 @@ async fn get_aggregate_attestation(
     let fork = store
         .config()
         .fork_at_epoch(compute_epoch_at_slot(query.slot));
-    let aggregate = pool
-        .lock()
-        .expect("attestation pool lock poisoned")
-        .aggregate(
-            query.attestation_data_root,
-            query.slot,
-            query.committee_index,
-        );
+    let aggregate = store.attestation_pool().aggregate(
+        query.attestation_data_root,
+        query.slot,
+        query.committee_index,
+    );
     let Some(aggregate) = aggregate else {
         return ApiError::NotFound("no matching attestations to aggregate").into_response();
     };
@@ -521,7 +518,6 @@ mod tests {
         state: BeaconState,
         head_root: Root,
         network: Arc<RecordingNetwork>,
-        pool: SharedAttestationPool,
         /// The `Eth-Consensus-Version` the fixture's fork submits under.
         version: &'static str,
     }
@@ -557,7 +553,6 @@ mod tests {
             state,
             head_root,
             network: Arc::new(RecordingNetwork::default()),
-            pool: SharedAttestationPool::default(),
             version: if fork == ForkName::Gloas {
                 "gloas"
             } else {
@@ -628,8 +623,7 @@ mod tests {
         let network: RpcToP2PRef = fixture.network.clone();
         let app = routes()
             .with_state(fixture.store.clone())
-            .layer(Extension(network))
-            .layer(Extension(fixture.pool.clone()));
+            .layer(Extension(network));
         let request = Request::post("/eth/v2/beacon/pool/attestations")
             .header("content-type", "application/json")
             .header("eth-consensus-version", version)
@@ -737,7 +731,6 @@ mod tests {
     ) -> (StatusCode, serde_json::Value) {
         let app = routes()
             .with_state(fixture.store.clone())
-            .layer(Extension(fixture.pool.clone()))
             .layer(Extension(engine));
         let uri = format!(
             "/eth/v2/validator/aggregate_attestation?attestation_data_root={data_root}&slot={slot}&committee_index={committee}"
@@ -884,8 +877,7 @@ mod tests {
         let network: RpcToP2PRef = fixture.network.clone();
         let app = routes()
             .with_state(fixture.store.clone())
-            .layer(Extension(network))
-            .layer(Extension(fixture.pool.clone()));
+            .layer(Extension(network));
         let request = Request::post("/eth/v2/validator/aggregate_and_proofs")
             .header("content-type", "application/json")
             .header("eth-consensus-version", "fulu")
@@ -912,9 +904,8 @@ mod tests {
             .collect();
         submit(&fixture, &votes).await;
         let aggregate = fixture
-            .pool
-            .lock()
-            .unwrap()
+            .store
+            .attestation_pool()
             .aggregate(votes[0].data.hash_tree_root(), slot, 0)
             .unwrap();
 
@@ -945,9 +936,8 @@ mod tests {
             .collect();
         submit(&fixture, &votes).await;
         let aggregate = fixture
-            .pool
-            .lock()
-            .unwrap()
+            .store
+            .attestation_pool()
             .aggregate(votes[0].data.hash_tree_root(), slot, 0)
             .unwrap();
 
@@ -999,9 +989,8 @@ mod tests {
             .collect();
         submit(&builder, &votes).await;
         let aggregate = builder
-            .pool
-            .lock()
-            .unwrap()
+            .store
+            .attestation_pool()
             .aggregate(votes[0].data.hash_tree_root(), slot, 0)
             .unwrap();
 
@@ -1022,8 +1011,7 @@ mod tests {
         let network: RpcToP2PRef = fixture.network.clone();
         let app = routes()
             .with_state(fixture.store.clone())
-            .layer(Extension(network))
-            .layer(Extension(fixture.pool.clone()));
+            .layer(Extension(network));
         let request = Request::post("/eth/v2/beacon/pool/attestations")
             .header("eth-consensus-version", "deneb")
             .body(Body::from("[]"))
@@ -1181,9 +1169,8 @@ mod tests {
         assert_eq!(json["version"], "gloas");
         let served: gloas::Attestation = serde_json::from_value(json["data"].clone()).unwrap();
         let pooled = fixture
-            .pool
-            .lock()
-            .unwrap()
+            .store
+            .attestation_pool()
             .aggregate(data.hash_tree_root(), slot, 0)
             .unwrap();
         assert_eq!(served, gloas::Attestation::from(&pooled));
@@ -1192,8 +1179,7 @@ mod tests {
         let network: RpcToP2PRef = fixture.network.clone();
         let app = routes()
             .with_state(fixture.store.clone())
-            .layer(Extension(network))
-            .layer(Extension(fixture.pool.clone()));
+            .layer(Extension(network));
         let request = Request::post("/eth/v2/validator/aggregate_and_proofs")
             .header("content-type", "application/json")
             .header("eth-consensus-version", "gloas")
@@ -1220,9 +1206,8 @@ mod tests {
             .collect();
         submit(&fixture, &votes).await;
         let pooled = fixture
-            .pool
-            .lock()
-            .unwrap()
+            .store
+            .attestation_pool()
             .aggregate(votes[0].data.hash_tree_root(), slot, 0)
             .unwrap();
         let mut forged = signed_gloas_aggregate(&fixture, committee[0], &pooled);
@@ -1230,8 +1215,7 @@ mod tests {
         let network: RpcToP2PRef = fixture.network.clone();
         let app = routes()
             .with_state(fixture.store.clone())
-            .layer(Extension(network))
-            .layer(Extension(fixture.pool.clone()));
+            .layer(Extension(network));
         let request = Request::post("/eth/v2/validator/aggregate_and_proofs")
             .header("eth-consensus-version", "gloas")
             .body(Body::from(serde_json::to_vec(&[forged]).unwrap()))
@@ -1253,8 +1237,7 @@ mod tests {
         let network: RpcToP2PRef = fixture.network.clone();
         let app = routes()
             .with_state(fixture.store.clone())
-            .layer(Extension(network))
-            .layer(Extension(fixture.pool.clone()));
+            .layer(Extension(network));
         let mut request = Request::post(uri).header("eth-consensus-version", version);
         if let Some(content_type) = content_type {
             request = request.header("content-type", content_type);
@@ -1327,9 +1310,8 @@ mod tests {
             .collect();
         submit(&fixture, &votes).await;
         let aggregate = fixture
-            .pool
-            .lock()
-            .unwrap()
+            .store
+            .attestation_pool()
             .aggregate(votes[0].data.hash_tree_root(), slot, 0)
             .unwrap();
         // Two entries, so the list's offset table is exercised.
@@ -1367,9 +1349,8 @@ mod tests {
             .collect();
         submit(&fixture, &votes).await;
         let pooled = fixture
-            .pool
-            .lock()
-            .unwrap()
+            .store
+            .attestation_pool()
             .aggregate(votes[0].data.hash_tree_root(), slot, 0)
             .unwrap();
         let signed = signed_gloas_aggregate(&fixture, committee[0], &pooled);

@@ -1,6 +1,22 @@
 use axum::{Router, http::HeaderValue, http::header, response::IntoResponse, routing::get};
-use ethlambda_metrics::gather_default_metrics;
+use ethlambda_metrics::{Histogram, gather_default_metrics, register_histogram};
+use std::{sync::LazyLock, time::Duration};
 use tracing::warn;
+
+/// Record the time a published block's cells and proofs took to compute and
+/// verify, and its data column sidecars to build. At mainnet's blob cap that
+/// is thousands of cells, on the proposal's critical path.
+pub(crate) fn observe_publish_data_columns(elapsed: Duration) {
+    static LEAN_BEACON_PUBLISH_DATA_COLUMNS_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
+        register_histogram!(
+            "lean_beacon_publish_data_columns_seconds",
+            "Time to compute and verify a published block's cells and build its data column sidecars",
+            vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]
+        )
+        .unwrap()
+    });
+    LEAN_BEACON_PUBLISH_DATA_COLUMNS_SECONDS.observe(elapsed.as_secs_f64());
+}
 
 pub fn start_prometheus_metrics_api() -> Router {
     Router::new()

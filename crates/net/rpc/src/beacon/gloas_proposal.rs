@@ -52,7 +52,6 @@ use ethlambda_engine::{
 };
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
-    attestation_pool::SharedAttestationPool,
     block_production::{advance_to_slot, empty_sync_aggregate, verified_sync_aggregate},
     bls,
     builder_market::SharedBuilderMarket,
@@ -221,7 +220,6 @@ async fn post_produce_block(
     query: Result<Query<ProduceQuery>, QueryRejection>,
     State(store): State<Store>,
     Extension(engine): Extension<Option<EngineClient>>,
-    Extension(pool): Extension<SharedAttestationPool>,
     Extension(ptc_pool): Extension<SharedPayloadAttestationPool>,
     Extension(market): Extension<SharedBuilderMarket>,
     Extension(sync_pool): Extension<SharedSyncCommitteePool>,
@@ -285,7 +283,6 @@ async fn post_produce_block(
         engine.as_ref(),
         &market,
         &builder_config,
-        &pool,
         &ptc_pool,
         &sync_pool,
         &fee_recipients,
@@ -445,7 +442,6 @@ async fn produce(
     engine: Option<&EngineClient>,
     market: &SharedBuilderMarket,
     builder_config: &BuilderConfig,
-    pool: &SharedAttestationPool,
     ptc_pool: &SharedPayloadAttestationPool,
     sync_pool: &SharedSyncCommitteePool,
     fee_recipients: &FeeRecipients,
@@ -503,10 +499,7 @@ async fn produce(
         builder_config.builder_boost_factor,
     );
 
-    let candidates = pool
-        .lock()
-        .expect("attestation pool lock poisoned")
-        .block_candidates();
+    let candidates = store.attestation_pool().block_candidates();
     let messages = ptc_pool
         .lock()
         .expect("payload attestation pool lock poisoned")
@@ -1208,7 +1201,6 @@ mod tests {
         routes()
             .with_state(store)
             .layer(Extension(engine))
-            .layer(Extension(SharedAttestationPool::default()))
             .layer(Extension(SharedSyncCommitteePool::default()))
             .layer(Extension(SharedPayloadAttestationPool::default()))
             .layer(Extension(SharedBuilderMarket::default()))

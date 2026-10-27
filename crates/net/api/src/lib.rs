@@ -11,6 +11,7 @@ use ethlambda_types::{
             SignedProposerPreferences,
         },
     },
+    beacon::operation::BeaconOperation,
     beacon::primitives::ValidatorIndex,
     block::SignedBlock,
     primitives::H256,
@@ -400,6 +401,8 @@ pub trait RpcToP2P: Send + Sync {
         aggregate: SignedAggregateAndProof,
         attesting_indices: Vec<ValidatorIndex>,
     ) -> Result<(), ActorError>;
+    /// Gossip one operation on its topic, already validated by the caller.
+    fn publish_beacon_operation(&self, operation: BeaconOperation) -> Result<(), ActorError>;
     /// Join attestation subnets a validator client's aggregators need, each
     /// until the end of the paired slot, so their committees' attestations
     /// reach this node's pool. `(subnet_id, slot)` pairs.
@@ -422,10 +425,17 @@ pub trait RpcToP2P: Send + Sync {
     /// validator client's committee members can publish on them and its
     /// aggregators hear their subcommittee. `(subnet_id, until_epoch)` pairs.
     fn subscribe_sync_committee_subnets(&self, subnets: Vec<(u64, u64)>) -> Result<(), ActorError>;
-    /// Gossip a block a validator client signed, and import it: gossip never
-    /// delivers a node its own messages, so without the second half this node
-    /// would not follow its own proposal. Checked by the caller as above.
-    fn publish_beacon_block(&self, block: SignedBeaconBlock) -> Result<(), ActorError>;
+    /// Gossip a block a validator client signed, then every one of its data
+    /// column sidecars, and import it with this node's custody columns: gossip
+    /// never delivers a node its own messages, so without the second half
+    /// this node would not follow its own proposal. Checked by the caller as
+    /// above, the sidecars included. `sidecars` is empty for a block without
+    /// blobs.
+    fn publish_beacon_block(
+        &self,
+        block: SignedBeaconBlock,
+        sidecars: Vec<DataColumnSidecar>,
+    ) -> Result<(), ActorError>;
     /// Gossip a gloas execution payload envelope a validator client signed on
     /// `execution_payload`, and its blobs' data column sidecars on their
     /// subnets, then hand both to the chain actor: as for a block, gossip never

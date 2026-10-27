@@ -46,6 +46,12 @@ pub fn sampling_size(custody_group_count: u64) -> u64 {
     custody_group_count.max(constants::SAMPLES_PER_SLOT)
 }
 
+/// The gossip subnet a data column sidecar travels on:
+/// `p2p-interface.md`, `compute_subnet_for_data_column_sidecar`.
+pub fn compute_subnet_for_data_column_sidecar(column_index: ColumnIndex) -> u64 {
+    column_index % constants::DATA_COLUMN_SIDECAR_SUBNET_COUNT
+}
+
 /// The custody groups `node_id` is assigned, sorted ascending.
 ///
 /// `node_id` is the discv5 node id, 32 bytes big endian, which is how a peer
