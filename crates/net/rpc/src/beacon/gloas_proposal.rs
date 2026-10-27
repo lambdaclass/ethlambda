@@ -71,7 +71,10 @@ use ethlambda_state_transition::beacon::{
         misc::compute_signing_root,
     },
     payload_attestation_pool::SharedPayloadAttestationPool,
-    stf::gloas::verify_execution_payload_envelope_signature,
+    stf::{
+        block::{BlockProcessingOptions, RandaoVerification},
+        gloas::verify_execution_payload_envelope_signature,
+    },
     sync_committee_pool::SharedSyncCommitteePool,
 };
 use ethlambda_storage::Store;
@@ -106,7 +109,7 @@ use crate::beacon::{
     bid_selection::{LocalCandidate, PayloadChoice, bid_total_gwei, choose_payload, wei_u128},
     builder_config::{BuilderConfig, decode_builder_config},
     graffiti::{self, OwnVersion},
-    proposal::{Blobs, CellKzgProofs, decimal, require_gloas_slot},
+    proposal::{Blobs, CellKzgProofs, decimal, randao_verification, require_gloas_slot},
     validator::{FeeRecipients, head},
 };
 use crate::shared::content::{Encoding, ssz_response, with_consensus_version};
@@ -203,10 +206,10 @@ struct ProduceQuery {
     #[serde(default)]
     graffiti: Option<H256>,
     include_payload: bool,
-    /// Accepted for compatibility. Not honored: the block's state root comes
-    /// from running it through the state transition, which verifies the reveal.
+    /// A flag with no value, validated by [`randao_verification`] rather than
+    /// parsed here, so a bad value gets its own message and not the generic
+    /// query rejection.
     #[serde(default)]
-    #[allow(dead_code)]
     skip_randao_verification: Option<String>,
 }
 
@@ -239,6 +242,15 @@ async fn post_produce_block(
     if consensus_version(&headers).is_some_and(|fork| fork != ForkName::Gloas) {
         return ApiError::BadRequest("Eth-Consensus-Version must be gloas").into_response();
     }
+    // Ahead of the engine check, like the slot check below: a bad flag is the
+    // caller's mistake, a 400 on any node.
+    let randao = match randao_verification(
+        query.skip_randao_verification.as_deref(),
+        &query.randao_reveal,
+    ) {
+        Ok(randao) => randao,
+        Err(err) => return err.into_response(),
+    };
     // Ahead of the engine check: a slot this node cannot build is a 400 on any
     // node, not a 503 on one with no execution client.
     if let Err(err) = require_gloas_slot(
@@ -278,6 +290,7 @@ async fn post_produce_block(
         &own_version,
         slot,
         query.randao_reveal,
+        randao,
         graffiti,
     )
     .await;
@@ -418,6 +431,9 @@ struct Prepared {
     /// The proposer's signed preferences for the slot, when this node holds
     /// them under the slot's dependent root.
     preferences: Option<SignedProposerPreferences>,
+    /// What the block's state transition may leave unchecked: the reveal, when
+    /// the caller set `skip_randao_verification`.
+    options: BlockProcessingOptions,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -433,12 +449,13 @@ async fn produce(
     own_version: &ClientVersionV1,
     slot: Slot,
     randao_reveal: BlsSignature,
+    randao: RandaoVerification,
     graffiti: Bytes32,
 ) -> Result<Production, ApiError> {
     let prepare_store = store.clone();
     let prepare_market = market.clone();
     let prepared = tokio::task::spawn_blocking(move || {
-        prepare(&prepare_store, &prepare_market, slot, randao_reveal)
+        prepare(&prepare_store, &prepare_market, slot, randao_reveal, randao)
     })
     .await
     .map_err(|_| ApiError::Internal("preparing the block failed"))??;
@@ -618,6 +635,7 @@ fn prepare(
     market: &SharedBuilderMarket,
     slot: Slot,
     randao_reveal: BlsSignature,
+    randao: RandaoVerification,
 ) -> Result<Prepared, ApiError> {
     let config = store.config();
     let (head_root, head_state) = head(store)?;
@@ -665,7 +683,9 @@ fn prepare(
         .map_err(|_| ApiError::Internal("advancing the head state failed"))?;
     let proposer = get_beacon_proposer_index(&state)
         .map_err(|_| ApiError::Internal("no proposer for the slot"))?;
-    verify_randao_reveal(&state, proposer, randao_reveal)?;
+    if randao == RandaoVerification::Verify {
+        verify_randao_reveal(&state, proposer, randao_reveal)?;
+    }
     let mut inputs = gloas_payload_inputs(&state, build_on_full, &parent_requests, &config)
         .map_err(|_| ApiError::Internal("computing the payload attributes failed"))?;
 
@@ -686,6 +706,7 @@ fn prepare(
         head_slot,
         parent_requests,
         preferences,
+        options: BlockProcessingOptions { randao },
     })
 }
 
@@ -843,6 +864,7 @@ fn assemble(
         head_root,
         head_slot,
         parent_requests,
+        options,
         ..
     } = prepared;
     let attestations = pack_gloas_attestations(state, candidates);
@@ -869,7 +891,7 @@ fn assemble(
     };
     let operations = attestations.len() + payload_attestations.len();
     let attempt = inputs(attestations, payload_attestations, sync_aggregate);
-    match assemble_gloas_block(state, attempt, config) {
+    match assemble_gloas_block(state, attempt, config, *options) {
         Ok(produced) => Ok(produced),
         // The packers check every operation's signature against this state, and
         // the sync aggregate was verified above, so this should not happen; but
@@ -877,7 +899,7 @@ fn assemble(
         Err(err) if operations > 0 || has_sync_aggregate => {
             warn!(slot = state.slot(), %err, "Block with operations failed to build; retrying without");
             let bare = inputs(Vec::new(), Vec::new(), empty_sync_aggregate());
-            assemble_gloas_block(state, bare, config)
+            assemble_gloas_block(state, bare, config, *options)
                 .map_err(|_| ApiError::Internal("the block failed to build"))
         }
         Err(_) => Err(ApiError::Internal("the block failed to build")),
@@ -900,6 +922,7 @@ fn assemble_on_bid(
         head_root,
         head_slot,
         parent_requests,
+        options,
         ..
     } = prepared;
     let attestations = pack_gloas_attestations(state, candidates);
@@ -914,11 +937,16 @@ fn assemble_on_bid(
         signed_bid: signed_bid.clone(),
     };
     let operations = attestations.len() + payload_attestations.len();
-    match assemble_gloas_block_on_bid(state, inputs(attestations, payload_attestations), config) {
+    match assemble_gloas_block_on_bid(
+        state,
+        inputs(attestations, payload_attestations),
+        config,
+        *options,
+    ) {
         Ok(block) => Ok(block),
         Err(err) if operations > 0 => {
             warn!(slot = state.slot(), %err, "Bid block with operations failed to build; retrying without");
-            assemble_gloas_block_on_bid(state, inputs(Vec::new(), Vec::new()), config)
+            assemble_gloas_block_on_bid(state, inputs(Vec::new(), Vec::new()), config, *options)
                 .map_err(|_| ApiError::Internal("the block failed to build"))
         }
         Err(_) => Err(ApiError::Internal("the block failed to build")),
@@ -1243,6 +1271,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_randao_skip_flag_is_refused_with_a_value_or_a_real_reveal() {
+        let (store, head_slot) = gloas_scheduled_store();
+        let slot = head_slot + 1;
+        let infinity = hex::encode(bls::G2_POINT_AT_INFINITY);
+        let with_reveal = |reveal: &str, flag: &str| {
+            Request::post(format!(
+                "/eth/v4/validator/blocks/{slot}?randao_reveal=0x{reveal}&include_payload=true{flag}"
+            ))
+            .header("eth-consensus-version", "gloas")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(EMPTY_CONFIG))
+            .unwrap()
+        };
+
+        // A reveal that is not the point at infinity cannot ask to skip.
+        let (status, json) = respond(
+            produce_app(store.clone(), None),
+            with_reveal(&"00".repeat(96), "&skip_randao_verification"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json["message"],
+            "randao_reveal must be the point at infinity when skip_randao_verification is set"
+        );
+
+        // The flag takes no value, `true` included.
+        let (status, json) = respond(
+            produce_app(store.clone(), None),
+            with_reveal(&infinity, "&skip_randao_verification=true"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json["message"],
+            "skip_randao_verification does not take a value"
+        );
+
+        // Without the flag the infinity reveal is checked like any other, and
+        // the request gets as far as the engine check.
+        let (status, _) = respond(produce_app(store, None), with_reveal(&infinity, "")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
     async fn a_missing_include_payload_or_an_undecodable_body_is_a_400() {
         let (store, head_slot) = gloas_scheduled_store();
         let (status, _) = respond(
@@ -1460,6 +1533,7 @@ mod tests {
                 execution_requests: ExecutionRequests::default(),
             },
             &config(),
+            ethlambda_state_transition::beacon::stf::block::BlockProcessingOptions::default(),
         )
         .unwrap()
     }
@@ -1513,6 +1587,7 @@ mod tests {
             head_slot: state.slot() - 1,
             parent_requests: requests.clone(),
             preferences: None,
+            options: BlockProcessingOptions::default(),
         };
         assemble(
             &config(),
@@ -1795,6 +1870,7 @@ mod tests {
                 execution_requests: ExecutionRequests::default(),
             },
             &config(),
+            ethlambda_state_transition::beacon::stf::block::BlockProcessingOptions::default(),
         )
         .unwrap();
         WithBlob {
