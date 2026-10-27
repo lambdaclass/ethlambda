@@ -570,8 +570,8 @@ mod tests {
         };
         // Distinct roots per slot, so a `dependent_root` read from the wrong
         // slot shows up.
-        for (slot, root) in inner.block_roots.iter_mut().enumerate() {
-            *root = H256::repeat_byte(slot as u8 + 1);
+        for slot in 0..inner.block_roots.len() {
+            inner.block_roots[slot] = H256::repeat_byte(slot as u8 + 1);
         }
         for index in 0..preset::PTC_WINDOW_LENGTH {
             inner.ptc_window[index] = vec![index as u64; preset::PTC_SIZE]
