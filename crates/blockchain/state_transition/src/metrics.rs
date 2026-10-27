@@ -62,6 +62,24 @@ pub fn inc_committee_cache_lookups(result: &str) {
         .inc();
 }
 
+static LEAN_BEACON_TOTAL_ACTIVE_BALANCE_LOOKUPS_TOTAL: LazyLock<IntCounterVec> =
+    LazyLock::new(|| {
+        register_int_counter_vec!(
+            "lean_beacon_total_active_balance_lookups_total",
+            "Total active balance lookups, by whether the active balance cache served them",
+            &["result"]
+        )
+        .unwrap()
+    });
+
+/// Count one `ActiveBalanceCache` lookup: `hit`, `miss` (a registry pass was
+/// run and cached), or `unkeyable` (computed for one caller, not cached).
+pub fn inc_total_active_balance_lookups(result: &str) {
+    LEAN_BEACON_TOTAL_ACTIVE_BALANCE_LOOKUPS_TOTAL
+        .with_label_values(&[result])
+        .inc();
+}
+
 static LEAN_STATE_TRANSITION_TIME_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
     register_histogram!(
         "lean_state_transition_time_seconds",

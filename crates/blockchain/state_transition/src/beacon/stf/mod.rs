@@ -67,7 +67,7 @@ pub mod operations;
 use crate::beacon::containers;
 use crate::beacon::containers::{BeaconState, phase0};
 use crate::beacon::error::{Error, Result, verify};
-use crate::beacon::helpers::accessors::{CommitteeCache, get_domain};
+use crate::beacon::helpers::accessors::{ActiveBalanceCache, CommitteeCache, get_domain};
 use crate::beacon::helpers::misc::compute_signing_root;
 use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
@@ -134,6 +134,7 @@ pub fn state_transition(
     config: &Config,
     engine: &ExecutionEngine,
     committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     process_slots(state, signed_block.slot(), config)?;
 
@@ -161,6 +162,7 @@ pub fn state_transition(
         config,
         engine,
         committees,
+        active_balances,
         block::BlockProcessingOptions::default(),
     )?;
     // As in `process_slot`: the post-state's root, checked below and needed
