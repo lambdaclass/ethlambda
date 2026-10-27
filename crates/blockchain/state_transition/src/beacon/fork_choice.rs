@@ -6132,6 +6132,8 @@ mod tests {
         let root = block.message_hash_tree_root();
         let slot = block.slot();
         *post_state.slot_mut() = slot;
+        // The state is keyed by its block's slot, which is the header's.
+        post_state.latest_block_header_mut().slot = slot;
         store.insert_signed_block(root, block).unwrap();
         store.insert_state(root, post_state).unwrap();
         compute_pulled_up_tip(store, root, slot, config).expect("pulled-up tip");
@@ -8590,6 +8592,8 @@ mod tests {
             unreachable!("with_validators_at(Gloas) builds a gloas state");
         };
         inner.slot = 1;
+        // The state is keyed by its block's slot, which is the header's.
+        inner.latest_block_header.slot = 1;
         let mut committee = vec![0; preset::PTC_SIZE];
         committee[2] = 3;
         let window_index = (preset::SLOTS_PER_EPOCH + 1) as usize;

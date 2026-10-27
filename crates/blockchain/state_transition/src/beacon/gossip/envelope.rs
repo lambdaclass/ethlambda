@@ -331,7 +331,14 @@ mod tests {
         store
             .insert_pending_block(BLOCK_ROOT, SignedBeaconBlock::Gloas(block))
             .expect("insert the block");
-        let state = fulu_parent(3);
+        // The block's post-state names the block in its header, and the store
+        // keys a state's row by that header's slot: a state for the slot-5
+        // block must say slot 5 there, or a read after the writer flushes it
+        // looks under another key.
+        let mut state = fulu_parent(3);
+        if let crate::beacon::containers::BeaconState::Fulu(inner) = &mut state {
+            inner.latest_block_header.slot = 5;
+        }
         store
             .insert_state(BLOCK_ROOT, state.clone())
             .expect("insert the state");

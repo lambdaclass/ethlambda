@@ -28,6 +28,11 @@
 //!   [`StateWriterHandle`]'s doc), which is what makes "dropped" and
 //!   "settled" the same event for every test in this crate, and what makes a
 //!   drop on an async executor's worker thread a blocking call elsewhere.
+//! - **[`StateWriterHandle::flush`] is the only way to wait for a write.** It
+//!   queues a marker behind every write handed off so far and blocks until
+//!   the thread reaches it, which is how
+//!   [`Store::prune_finalized_states`](crate::store::Store::prune_finalized_states)
+//!   keeps a queued write below its cut from landing after its range delete.
 //! - **A write that panics is not retried, hidden, or cleaned up after.** The
 //!   entry stays in [`PendingStates`] (see its doc), and the next hand-off
 //!   observes the closed channel and fails loudly, rather than silently
@@ -61,8 +66,7 @@ use crate::beacon_state_delta;
 use crate::error::Error;
 use crate::state_codec::{decode_lean_state_value, decode_state_value, encode_state_value};
 use crate::state_diff::StateDiff;
-use crate::store::Chain;
-use crate::store::beacon_block_slot;
+use crate::store::{Chain, beacon_block_slot, block_slot, block_slot_in, encode_slot_root_key};
 
 /// What a state insert will write, decided but not yet committed.
 ///
@@ -169,9 +173,15 @@ pub(crate) fn read_state(
     let state = match chain {
         Chain::Lean => {
             // Anchor snapshot in `States`, otherwise reconstruct from the diff chain.
+            // `States` is keyed by block slot then root, so a root with no
+            // block row has no state to find.
+            let Some(slot) = block_slot(backend, chain, root) else {
+                return Ok(None);
+            };
             let snapshot = {
                 let view = backend.begin_read().expect("read view");
-                view.read_with(Table::States, &root.to_ssz(), decode_lean_state_value)
+                let key = encode_slot_root_key(slot, root);
+                view.read_with(Table::States, &key, decode_lean_state_value)
                     .expect("read")
             };
             let state = match snapshot {
@@ -258,10 +268,15 @@ fn rebase_onto_resident(cache: &StateCache, state: &mut BeaconState) {
 /// [`Cow::Owned`], so taking ownership costs no further copy either way
 /// beyond the one a borrowed snapshot needs.
 ///
+/// Both tables are keyed by block slot then root, so each hop looks up its
+/// own slot from that root's `BlockHeaders` row.
+///
 /// `Ok(None)` when `root` is unknown, or the chain runs off the retained
 /// window before reaching a snapshot: a missing `StateDiffs` record below
-/// the pruned boundary, matching how the lean walk in
-/// [`reconstruct_state`] handles both cases.
+/// the pruned boundary (see
+/// [`Store::prune_finalized_states`](crate::store::Store::prune_finalized_states)),
+/// matching how the lean walk in [`reconstruct_state`] handles both cases. A
+/// hop whose block row is absent ends the walk the same way.
 pub(crate) fn reconstruct_beacon_state_bytes<T>(
     backend: &dyn StorageBackend,
     root: &H256,
@@ -272,7 +287,10 @@ pub(crate) fn reconstruct_beacon_state_bytes<T>(
     let mut consume = Some(consume);
     let mut cursor = *root;
     loop {
-        let key = cursor.to_ssz();
+        let Some(slot) = block_slot_in(view.as_ref(), Chain::Beacon, &cursor) else {
+            return Ok(None);
+        };
+        let key = encode_slot_root_key(slot, &cursor);
         // The walk ends at the first snapshot, so the deltas collected so
         // far are folded onto it while it is still borrowed.
         let folded = view
@@ -345,7 +363,10 @@ pub(crate) fn reconstruct_state(
     let mut diffs: Vec<StateDiff> = Vec::new();
     let mut cursor = *root;
     let snapshot = loop {
-        let key = cursor.to_ssz();
+        let Some(slot) = block_slot_in(view.as_ref(), Chain::Lean, &cursor) else {
+            return Ok(None);
+        };
+        let key = encode_slot_root_key(slot, &cursor);
         if let Some(snapshot) = view
             .read_with(Table::States, &key, decode_lean_state_value)
             .expect("read")
@@ -494,6 +515,17 @@ pub(crate) struct StateWriteRequest {
     pub state: Arc<BeaconState>,
 }
 
+/// What travels down the writer's channel, served strictly in order.
+enum Message {
+    Write(StateWriteRequest),
+    /// Answered once every message queued before it has been served; see
+    /// [`StateWriterHandle::flush`].
+    Flush(SyncSender<()>),
+    /// Test-only: parks the thread until the paired sender sends or drops.
+    #[cfg(test)]
+    Pause(Receiver<()>),
+}
+
 /// The writer thread's own state.
 ///
 /// Holds the individual `Arc`s it needs rather than a `Store`, which would be
@@ -514,14 +546,23 @@ struct StateWriter {
 }
 
 impl StateWriter {
-    fn run(mut self, rx: Receiver<StateWriteRequest>) {
-        for request in rx {
-            self.write(&request);
-            // Only now, after the commit returned: until this line both the
-            // buffer and the backend can answer for this root, and after it
-            // the backend alone can. There is no instant where neither does.
-            self.pending.remove(&request.root);
-            crate::metrics::dec_state_write_queue_depth();
+    fn run(mut self, rx: Receiver<Message>) {
+        for message in rx {
+            match message {
+                Message::Write(request) => {
+                    self.write(&request);
+                    // Only now, after the commit returned: until this line both
+                    // the buffer and the backend can answer for this root, and
+                    // after it the backend alone can. There is no instant where
+                    // neither does.
+                    self.pending.remove(&request.root);
+                    crate::metrics::dec_state_write_queue_depth();
+                }
+                // The flusher may have given up waiting; nothing to do then.
+                Message::Flush(done) => drop(done.send(())),
+                #[cfg(test)]
+                Message::Pause(resume) => drop(resume.recv()),
+            }
         }
     }
 
@@ -561,7 +602,14 @@ impl StateWriter {
             write.snapshot.is_some() || write.diff.is_some(),
             "a state write that persists nothing would silently drop the state"
         );
-        let key = root.to_ssz();
+        // Keyed by the slot of the block the state belongs to, which is what a
+        // reader holding only a root recovers from `BlockHeaders`. Not
+        // `state.slot()`: a beacon anchor state can be advanced past its block.
+        let block_slot = match &*request.state {
+            BeaconState::Lean(lean) => lean.latest_block_header.slot,
+            beacon_state => beacon_state.latest_block_header().slot,
+        };
+        let key = encode_slot_root_key(block_slot, &root);
         let mut batch = self.backend.begin_write().expect("write batch");
         if let Some(diff) = write.diff {
             batch
@@ -625,7 +673,7 @@ pub(crate) struct StateWriterHandle {
     /// `Option` so [`Drop`] can take it. Dropping the sender is what ends the
     /// thread's `recv` loop, and it has to happen before the join or the join
     /// waits forever.
-    tx: Option<SyncSender<StateWriteRequest>>,
+    tx: Option<SyncSender<Message>>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -667,12 +715,44 @@ impl StateWriterHandle {
     /// learning about it, one state later.
     pub(crate) fn send(&self, request: StateWriteRequest) -> (Instant, Instant) {
         let start = Instant::now();
+        self.send_message(Message::Write(request));
+        (start, Instant::now())
+    }
+
+    /// Blocks until every state handed off before this call has committed.
+    ///
+    /// The marker queues behind those writes like any other message, so this
+    /// waits for at most a full queue plus the write in flight, the same bound
+    /// a blocked [`send`](Self::send) already has. The writer never waits on a
+    /// caller, so this cannot deadlock.
+    ///
+    /// # Panics
+    ///
+    /// If the writer thread is gone or dies before reaching the marker, for
+    /// the same reason [`send`](Self::send) does.
+    pub(crate) fn flush(&self) {
+        let (done_tx, done_rx) = sync_channel(1);
+        self.send_message(Message::Flush(done_tx));
+        done_rx
+            .recv()
+            .expect("the state writer thread died; see the logged panic above");
+    }
+
+    /// Test-only: parks the writer once it reaches this point in the queue,
+    /// until the returned sender sends or is dropped.
+    #[cfg(test)]
+    pub(crate) fn pause(&self) -> SyncSender<()> {
+        let (resume_tx, resume_rx) = sync_channel(1);
+        self.send_message(Message::Pause(resume_rx));
+        resume_tx
+    }
+
+    fn send_message(&self, message: Message) {
         self.tx
             .as_ref()
             .expect("the sender is taken only in Drop")
-            .send(request)
+            .send(message)
             .expect("the state writer thread died; see the logged panic above");
-        (start, Instant::now())
     }
 }
 
