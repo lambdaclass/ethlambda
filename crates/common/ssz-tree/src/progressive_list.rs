@@ -9,6 +9,7 @@ use libssz::{BYTES_PER_LENGTH_OFFSET, DecodeError, SszDecode, SszEncode};
 use libssz_merkle::{HashTreeRoot, Sha2Hasher, Sha256Hasher, hash_nodes, mix_in_length};
 use libssz_types::TypeError;
 
+use crate::cursor::{ElemCow, IterCow};
 use crate::interface::Interface;
 use crate::iter::Iter;
 use crate::update_map::{UpdateMap, VecMap};
@@ -132,6 +133,32 @@ impl<T: Value, U: UpdateMap<T>> ProgressiveList<T, U> {
         }
     }
 
+    /// An in-order pass that can rewrite any element, subtree after subtree.
+    /// See [`List::iter_cow`](crate::List::iter_cow): pending writes are
+    /// applied first, and each subtree's changed leaves reach it when the
+    /// pass leaves that subtree or is dropped.
+    pub fn iter_cow(&mut self) -> ProgressiveIterCow<'_, T, U> {
+        self.apply_updates();
+        ProgressiveIterCow {
+            subtrees: self.subtrees.iter_mut(),
+            current: None,
+            base: 0,
+        }
+    }
+
+    /// Runs `f` on every element in order, stopping at the first error and
+    /// keeping the writes made before it.
+    pub fn try_update_each<E>(
+        &mut self,
+        mut f: impl FnMut(&mut ElemCow<'_, T>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut pass = self.iter_cow();
+        while let Some(mut element) = pass.next_cow() {
+            f(&mut element)?;
+        }
+        Ok(())
+    }
+
     /// The elements, copied out.
     pub fn to_vec(&self) -> Vec<T> {
         self.iter().cloned().collect()
@@ -174,6 +201,32 @@ impl<T: Value, U: UpdateMap<T>> ProgressiveList<T, U> {
         self.subtrees.iter().rev().fold([0u8; 32], |rest, subtree| {
             hash_nodes(&Sha2Hasher, &subtree.root(), &rest)
         })
+    }
+}
+
+/// An in-order rewriting pass over a [`ProgressiveList`], made by
+/// [`ProgressiveList::iter_cow`]: one [`IterCow`] per subtree, in turn.
+pub struct ProgressiveIterCow<'a, T: Value, U> {
+    subtrees: std::slice::IterMut<'a, Interface<T, U>>,
+    current: Option<IterCow<'a, T>>,
+    /// Elements in the subtrees already started.
+    base: usize,
+}
+
+impl<T: Value, U: UpdateMap<T>> ProgressiveIterCow<'_, T, U> {
+    /// The next element, to read or to write, or `None` after the last.
+    pub fn next_cow(&mut self) -> Option<ElemCow<'_, T>> {
+        loop {
+            if self.current.as_mut().is_some_and(IterCow::advance) {
+                return self.current.as_mut().map(IterCow::take);
+            }
+            // Dropping the spent pass swaps its changed leaves into its subtree.
+            self.current = None;
+            let subtree = self.subtrees.next()?;
+            let len = subtree.len();
+            self.current = Some(subtree.iter_cow().with_base(self.base));
+            self.base += len;
+        }
     }
 }
 
