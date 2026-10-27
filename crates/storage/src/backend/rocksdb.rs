@@ -49,10 +49,15 @@ fn enable_blob_files(cf_opts: &mut Options) {
     // compression, so moving the values out would otherwise grow the tables
     // on disk. The values are raw SSZ.
     cf_opts.set_blob_compression_type(DBCompressionType::Lz4);
-    // No blob garbage collection: nothing deletes or overwrites a state, so it
-    // would only relocate live blobs during compaction. Revisit if states are
-    // ever pruned. No blob cache either: the store caches decoded states
-    // itself, and a snapshot-sized entry would evict the whole block cache.
+    // No blob garbage collection, even though finalized states are pruned.
+    // RocksDB drops a blob file once no SST links to it and every blob in it
+    // is garbage (`AddBlobFileIfNeeded` in `db/version_builder.cc`), and
+    // compaction marks blobs garbage as it drops the keys a range tombstone
+    // covers. Prunes delete whole slot ranges, and a blob file holds the
+    // values of one flush, so the files written for pruned slots empty out and
+    // are deleted without GC; GC would only relocate live blobs. No blob cache
+    // either: the store caches decoded states itself, and a snapshot-sized
+    // entry would evict the whole block cache.
 }
 
 /// RocksDB storage backend.
