@@ -253,6 +253,89 @@ goes through fanout), all under the digest the block's slot falls in. Operations
 posted to the `pool/*` routes are published on their topics the same way, under
 the digest of the wall-clock slot.
 
+### Peer scoring
+
+Gossipsub peer scoring is on for this wire only
+(`crate::beacon::scoring`). The parameters are lighthouse's
+(`gossipsub_scoring_parameters.rs`), ported formula for formula; Grandine,
+Teku and Lodestar use the same constants, so thresholds mean the same thing
+here as on most of mainnet.
+
+| Threshold | Score | Effect |
+| --- | --- | --- |
+| gossip | -4000 | no IHAVE/IWANT to or from the peer |
+| publish | -8000 | left out of this node's publishes |
+| graylist | -16000 | every RPC ignored, and the peer is disconnected |
+
+| Topic | Weight | Mesh deliveries (P3) |
+| --- | --- | --- |
+| `beacon_block` | 0.5 | scored |
+| `beacon_aggregate_and_proof` | 0.5 | scored |
+| `beacon_attestation_{0..63}` | 1/64 each | scored |
+| `voluntary_exit`, `proposer_slashing`, `attester_slashing` | 0.05 each | off |
+
+Columns, sync committee contributions and BLS changes carry no topic
+parameters. Only Prysm scores columns. This node `Ignore`s every contribution
+and change (no consumer), and a delivery is only credited once accepted, so
+scoring P3 there would penalize every mesh peer for this node's own gap. All
+64 attestation subnets get parameters, not just the backbone ones, because
+aggregator duties join others at runtime.
+
+Two differences from lighthouse:
+
+- `mesh_n` is this node's `D` (8), not lighthouse's 5. It only enters the
+  first-message-delivery cap.
+- **P3 waits for this node to keep up.** Lighthouse joins these topics only
+  once synced, so it has no mesh while it catches up. This node subscribes at
+  startup, and while catching up it `Ignore`s every aggregate and attestation
+  voting for a block it has not imported. A mesh peer credited with no
+  aggregates scores below the graylist, so a restart would graylist the whole
+  aggregate mesh because of this node's lag. `MeshDeliveryGate` turns P3 off
+  while the head lags the wall clock by more than
+  `MESH_DELIVERY_MAX_HEAD_LAG` slots, and back on only after an epoch within
+  that lag, so the counters have refilled. While P3 is off its threshold and
+  weight are zero but its cap is not, so the counters keep counting to their
+  real ceiling. `SyncStatus` cannot serve as this gate: on the mainnet
+  follower it reported `synced` through a 10-minute catch-up up to 98 slots
+  behind, since its network-stall rule reads a lagging freshest-known block
+  as a stalled network.
+
+The block, aggregate and attestation parameters depend on the active
+validator count, so the p2p actor rebuilds them every slot from the head's
+pinned current-epoch shuffling (`CommitteeCache::head_current_committees`)
+and hands them to the swarm. The swarm starts on lighthouse's placeholder (32
+validators, P3 off) until the first refresh, which runs at startup. Every 10
+s the swarm task disconnects peers below the graylist. There is no ban list:
+a peer's negative score is kept for `retain_score` (100 epochs) after it
+leaves, so a peer that reconnects comes back graylisted and is dropped again.
+
+Around a fork-digest boundary the node holds two digests' topics, and every
+held digest gets the whole parameter set (exits and slashings included),
+scored by its role:
+
+| Digest | Topic weights | P3 |
+| --- | --- | --- |
+| upcoming, joined `SUBSCRIBE_LEAD_EPOCHS` ahead | as above | off: nothing is published under it yet |
+| current | as above | gated as above |
+| previous, held `UNSUBSCRIBE_LAG_EPOCHS` after | 0 | off |
+
+- **Parameters before joins.** `transition::apply` hands the swarm every held
+  digest's parameters before it subscribes, on the same command channel.
+  Gossipsub tracks a mesh peer on a topic only if the topic had parameters
+  when the peer was grafted; parameters installed later never reach that
+  mesh.
+- **The previous digest weighs nothing.** Its traffic moves to the new
+  digest at the boundary, so its delivery counters drain. Still scored, the
+  aggregate topic alone would graylist an honest mesh peer 53 slots after the
+  boundary (at 1M validators), before the topic is left, and leaving it would
+  charge every mesh peer the sticky P3b. Lighthouse zeroes the same weights
+  (`remove_topic_weight_except`).
+- **A switch restarts the warmup.** The new digest's counters start empty,
+  but its mesh, formed before the boundary, can already be past the
+  deliveries' activation (one epoch for blocks and aggregates). P3 on the new
+  digest therefore waits `MESH_DELIVERY_WARMUP_SLOTS`, as after a catch-up.
+  Lighthouse joins two slots ahead, so activation alone covers it there.
+
 ## Aggregate attestations
 
 `beacon_aggregate_and_proof` reaches fork choice. It is how a follower learns
@@ -720,6 +803,9 @@ as a query filter, so a `quic`-only record is invisible to it.
 | `lean_beacon_aggregate_end_to_end_seconds` | Wire to fork choice, for aggregates applied on arrival |
 | `lean_beacon_aggregate_total{outcome}` | Aggregates by `applied`, `invalid`, `known_subset` or `queue_full` |
 | `lean_beacon_aggregates_deferred` | Aggregates held until their own slot has passed |
+| `lean_gossipsub_peers_by_score{band}` | Gossipsub peers by score band; see [Peer scoring](#peer-scoring) |
+| `lean_gossipsub_score_disconnects_total` | Peers disconnected for a score below the graylist |
+| `lean_gossipsub_mesh_delivery_scoring` | 1 while P3 is scored, 0 while the head lags or is warming up |
 | `lean_beacon_publish_data_columns_seconds` | Time to compute and verify a published block's cells and build its sidecars; see [metrics.md](./metrics.md) |
 
 The four aggregate histograms no longer cover what they used to: gossip
