@@ -46,7 +46,6 @@ use ethlambda_engine::{
 };
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
-    attestation_pool::SharedAttestationPool,
     block_production::{advance_to_slot, empty_sync_aggregate, verified_sync_aggregate},
     bls,
     fork_choice::{
@@ -246,7 +245,6 @@ async fn post_produce_block(
     query: Result<Query<ProduceQuery>, QueryRejection>,
     State(store): State<Store>,
     Extension(engine): Extension<Option<EngineClient>>,
-    Extension(pool): Extension<SharedAttestationPool>,
     Extension(ptc_pool): Extension<SharedPayloadAttestationPool>,
     Extension(sync_pool): Extension<SharedSyncCommitteePool>,
     Extension(fee_recipients): Extension<FeeRecipients>,
@@ -295,7 +293,6 @@ async fn post_produce_block(
     let produced = produce(
         &store,
         &engine,
-        &pool,
         &ptc_pool,
         &sync_pool,
         &fee_recipients,
@@ -411,7 +408,6 @@ struct Prepared {
 async fn produce(
     store: &Store,
     engine: &EngineClient,
-    pool: &SharedAttestationPool,
     ptc_pool: &SharedPayloadAttestationPool,
     sync_pool: &SharedSyncCommitteePool,
     fee_recipients: &FeeRecipients,
@@ -450,10 +446,7 @@ async fn produce(
         .map_err(|_| ApiError::Internal("the execution client's request list is malformed"))?;
     let payload_value = decimal(&built.block_value);
 
-    let candidates = pool
-        .lock()
-        .expect("attestation pool lock poisoned")
-        .block_candidates();
+    let candidates = store.attestation_pool().block_candidates();
     let messages = ptc_pool
         .lock()
         .expect("payload attestation pool lock poisoned")
@@ -958,7 +951,6 @@ mod tests {
         routes()
             .with_state(store)
             .layer(Extension(engine))
-            .layer(Extension(SharedAttestationPool::default()))
             .layer(Extension(SharedSyncCommitteePool::default()))
             .layer(Extension(SharedPayloadAttestationPool::default()))
             .layer(Extension(FeeRecipients::default()))
