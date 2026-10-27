@@ -13,6 +13,7 @@
 //! written once and handed the two things the chains disagree about: how wide
 //! the `<context-bytes>` field is, and how a chunk body becomes a block.
 
+pub mod builder_market;
 pub mod column_checks;
 pub mod decode;
 pub mod encoding;
