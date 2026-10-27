@@ -337,6 +337,18 @@ impl serde::Serialize for U256 {
     }
 }
 
+impl<'de> serde::Deserialize<'de> for U256 {
+    /// The inverse of [`serde::Serialize`] above: a decimal string, quoted or
+    /// bare like every integer [`super::serde_helpers::quoted_or_bare`] reads.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let text = <String as serde::Deserialize>::deserialize(deserializer)?;
+        U256::from_dec_str(text.trim()).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Why a decimal string was not a [`U256`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ParseU256Error {
@@ -490,8 +502,9 @@ impl_hex_serialize!(H160, BlsPubkey, BlsSignature, KzgCommitment, KzgProof);
 
 /// The `Deserialize` counterpart of [`impl_hex_serialize`], for the types the
 /// Beacon API accepts in a request body: a validator's public key (as a
-/// validator id), a signature (inside a submitted attestation) and an execution
-/// address (a proposer's fee recipient). Hex with or
+/// validator id), a signature (inside a submitted attestation), an execution
+/// address (a proposer's fee recipient) and a block's KZG commitments and
+/// proofs. Hex with or
 /// without the `0x` prefix, of exactly the type's width.
 macro_rules! impl_hex_deserialize {
     ($($ty:ty),* $(,)?) => {
@@ -508,7 +521,7 @@ macro_rules! impl_hex_deserialize {
     };
 }
 
-impl_hex_deserialize!(BlsPubkey, BlsSignature, H160);
+impl_hex_deserialize!(BlsPubkey, BlsSignature, H160, KzgCommitment, KzgProof);
 
 #[cfg(test)]
 mod tests {
