@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-41b0ffbf.js";
+            window.path_to_searchindex_js = "searchindex-8151027b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -5325,7 +5325,8 @@ samples nothing and publishes no series here.</p>
 <tr><td><code>engine</code></td><td>The <code>engine_newPayload</code> round trip, including its retry ladder</td><td>beacon</td></tr>
 <tr><td><code>verify_struct</code></td><td>Participant bounds checks and pubkey resolution</td><td>lean</td></tr>
 <tr><td><code>verify_crypto</code></td><td>The leanVM multi-message aggregate verification</td><td>lean</td></tr>
-<tr><td><code>stf</code></td><td>The state transition. On beacon this bundles the transition, the state root and the state write</td><td>both</td></tr>
+<tr><td><code>stf</code></td><td>The state transition. On beacon this bundles the transition and the state root, and excludes <code>writer_wait</code>, which is nested inside it</td><td>both</td></tr>
+<tr><td><code>writer_wait</code></td><td>Beacon only: the importer’s blocking hand-off of the post-state to the storage crate’s background writer, which waits while the writer’s queue is full. Subtracted from <code>stf</code>, so <code>stf</code> and <code>writer_wait</code> do not overlap</td><td>beacon</td></tr>
 <tr><td><code>db_write</code></td><td>The block write and handing the post-state off to the storage crate’s background writer; the state’s own encode/diff/commit cost is <code>lean_state_write_seconds</code> instead, not this row</td><td>lean</td></tr>
 <tr><td><code>fc_head</code></td><td><code>update_head</code></td><td>lean</td></tr>
 <tr><td><code>block_atts</code></td><td>Replaying the block’s own attestations and slashings into fork choice</td><td>beacon</td></tr>
@@ -7462,6 +7463,17 @@ seconds and a long corpus would otherwise run silent for hours.</p>
   --network mainnet \
   --format json --output report.json
 </code></pre>
+<p><strong><code>--block-delay &lt;MILLISECONDS&gt;</code></strong> (default 0) sleeps after each block’s import
+before the next block is fed. Use it to measure import work when the build
+outpaces the state writer: the replay feeds blocks back to back, while a live
+node gets one per slot, so a fast build can fill the writer’s queue and
+<code>writer_wait</code> then measures the writer rather than the import. A delay longer
+than one state write (about a second on mainnet) lets the writer drain fully
+between blocks. The sleep runs after the block’s phases and <code>wall_seconds</code> are
+recorded, so it appears in no per-block number and no summary row; the report
+has no end-to-end figure to adjust. The value is recorded as
+<code>params.block_delay_ms</code> in the JSON report and printed in the human header, so
+compare only reports made with the same delay.</p>
 <h3 id="what-is-measured"><a class="header" href="#what-is-measured">What is measured</a></h3>
 <p>The measured span is one <code>BlockChainServer::import_block</code> call per block, the
 same <code>on_block</code> entry a live node’s own cascade uses. That covers the state
@@ -7476,10 +7488,16 @@ workload reads its own histogram. A replayed block reports under
 without passing for a gossip or sync arrival. The phases are the
 <code>BLOCK_IMPORT_PHASES</code> labels: <code>decode</code>, <code>queue</code>, <code>defer</code>, <code>admit</code>, <code>guards</code>,
 <code>preamble</code>, <code>parent_wait</code>, <code>cascade_wait</code>, <code>da_check</code>, <code>columns_wait</code>, <code>engine</code>,
-<code>verify_struct</code>, <code>verify_crypto</code>, <code>stf</code>, <code>db_write</code>, <code>fc_head</code>, <code>block_atts</code>;
-plus the per-arrival sections that are not spans around the others, <code>prune</code>,
+<code>verify_struct</code>, <code>verify_crypto</code>, <code>stf</code>, <code>writer_wait</code>, <code>db_write</code>, <code>fc_head</code>,
+<code>block_atts</code>; plus the per-arrival sections that are not spans around the others, <code>prune</code>,
 <code>get_head</code> and <code>fcu</code>, since each <code>import_block</code> call is one arrival. <code>get_head</code>
 is where the head recomputation after every import is charged.</p>
+<p>On beacon, <code>writer_wait</code> is the importer’s blocking hand-off of the post-state
+to the storage crate’s background writer, which waits while the writer’s queue
+is full. It happens inside <code>fork_choice::on_block</code>, so <code>stf</code> excludes it: <code>stf</code>
+is state-transition work and the two phases do not overlap. When blocks import
+faster than the writer persists them, the wait shows up here rather than in
+<code>stf</code>.</p>
 <h3 id="what-is-excluded-and-why"><a class="header" href="#what-is-excluded-and-why">What is excluded, and why</a></h3>
 <p>Replay runs nothing that a corpus already answers for:</p>
 <ul>

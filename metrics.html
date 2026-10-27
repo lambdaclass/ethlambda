@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-41b0ffbf.js";
+            window.path_to_searchindex_js = "searchindex-8151027b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -507,7 +507,8 @@ samples nothing and publishes no series here.</p>
 <tr><td><code>engine</code></td><td>The <code>engine_newPayload</code> round trip, including its retry ladder</td><td>beacon</td></tr>
 <tr><td><code>verify_struct</code></td><td>Participant bounds checks and pubkey resolution</td><td>lean</td></tr>
 <tr><td><code>verify_crypto</code></td><td>The leanVM multi-message aggregate verification</td><td>lean</td></tr>
-<tr><td><code>stf</code></td><td>The state transition. On beacon this bundles the transition, the state root and the state write</td><td>both</td></tr>
+<tr><td><code>stf</code></td><td>The state transition. On beacon this bundles the transition and the state root, and excludes <code>writer_wait</code>, which is nested inside it</td><td>both</td></tr>
+<tr><td><code>writer_wait</code></td><td>Beacon only: the importer’s blocking hand-off of the post-state to the storage crate’s background writer, which waits while the writer’s queue is full. Subtracted from <code>stf</code>, so <code>stf</code> and <code>writer_wait</code> do not overlap</td><td>beacon</td></tr>
 <tr><td><code>db_write</code></td><td>The block write and handing the post-state off to the storage crate’s background writer; the state’s own encode/diff/commit cost is <code>lean_state_write_seconds</code> instead, not this row</td><td>lean</td></tr>
 <tr><td><code>fc_head</code></td><td><code>update_head</code></td><td>lean</td></tr>
 <tr><td><code>block_atts</code></td><td>Replaying the block’s own attestations and slashings into fork choice</td><td>beacon</td></tr>
