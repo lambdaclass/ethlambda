@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-1f05bc4d.js";
+            window.path_to_searchindex_js = "searchindex-cd8875c9.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -711,6 +711,25 @@ more branches are being imported at once than the cache has room for; each miss
 is a registry scan plus a whole-epoch shuffle on the import thread. <code>unkeyable</code>
 is a lookup the cache could not key at all, mostly the genesis state asking
 about its own first epochs, and should be zero on a checkpoint-synced follower.</p>
+<h3 id="beacon-total-active-balance-cache"><a class="header" href="#beacon-total-active-balance-cache">Beacon Total Active Balance Cache</a></h3>
+<p>The total active balance (the divisor of every attestation’s base reward and of
+the sync aggregate’s rewards) is one registry pass, and an ordinary block asks
+for it about nine times. <code>ActiveBalanceCache</code> in the <code>Store</code> keeps it per epoch,
+keyed by the epoch and the block root that fixes it. This is ethlambda-specific,
+not part of the leanMetrics spec.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_beacon_total_active_balance_lookups_total</code></td><td>Counter</td><td>Total active balance lookups, by whether the cache served them</td><td>On every <code>ActiveBalanceCacheExt::total_active_balance</code> call: block processing’s attestations and sync aggregate</td><td>result=hit,miss,unkeyable</td></tr>
+</tbody>
+</table>
+</div>
+<p>Expect one miss per epoch per chain, and hits otherwise. <code>unkeyable</code> is the
+genesis state asking about its own epoch, and should be zero on a
+checkpoint-synced follower.</p>
 <h3 id="beacon-pubkey-cache"><a class="header" href="#beacon-pubkey-cache">Beacon Pubkey Cache</a></h3>
 <p>Every BLS signature check <code>ethlambda beacon</code> runs (block import, fork choice,
 gossip validation) resolves its signers’ compressed public keys to validated
