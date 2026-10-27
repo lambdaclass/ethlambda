@@ -79,6 +79,66 @@ impl ValidatorDefinitions {
     }
 
     /// The entries that should be loaded and signed with.
+    /// Write a definitions file for a validators directory that has none, by
+    /// discovering the keystores laid out the way Lighthouse lays them out:
+    /// `<validators_dir>/<0xpubkey>/voting-keystore.json`, each with its
+    /// password in `<secrets_dir>/<0xpubkey>`. This is the layout
+    /// `eth2-val-tools`, `staking-deposit-cli` imports and ethereum-package
+    /// produce, and what Lighthouse's own client discovers without a
+    /// definitions file.
+    ///
+    /// Does nothing when the file already exists: it is the operator's (and the
+    /// keymanager's) record of which validators run, and rescanning would
+    /// resurrect a key the keymanager deleted. The public key is read from each
+    /// keystore; `ValidatorStore::load` then checks it against the decrypted
+    /// secret as it does for every definition. Returns how many were written.
+    pub fn discover_if_absent(validators_dir: &Path, secrets_dir: &Path) -> Result<usize> {
+        if validators_dir.join(DEFINITIONS_FILE).exists() {
+            return Ok(0);
+        }
+        let entries = std::fs::read_dir(validators_dir).map_err(|source| Error::Io {
+            path: validators_dir.display().to_string(),
+            source,
+        })?;
+        let mut definitions = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| Error::Io {
+                path: validators_dir.display().to_string(),
+                source,
+            })?;
+            let keystore_path = entry.path().join("voting-keystore.json");
+            if !keystore_path.is_file() {
+                continue;
+            }
+            let json = std::fs::read_to_string(&keystore_path).map_err(|source| Error::Io {
+                path: keystore_path.display().to_string(),
+                source,
+            })?;
+            let pubkey = crate::keys::keystore::Keystore::from_json(&json)
+                .ok()
+                .and_then(|keystore| keystore.pubkey)
+                .ok_or_else(|| Error::Keystore {
+                    path: keystore_path.display().to_string(),
+                    reason: "a discovered keystore must name its public key".to_string(),
+                })?;
+            let pubkey = format!("0x{}", pubkey.trim_start_matches("0x"));
+            definitions.push(ValidatorDefinition {
+                enabled: true,
+                voting_keystore_password_path: secrets_dir.join(&pubkey),
+                voting_public_key: pubkey,
+                voting_keystore_path: keystore_path,
+            });
+        }
+        // Directory order is not stable across filesystems; sorting makes the
+        // written file reproducible.
+        definitions.sort_by(|a, b| a.voting_public_key.cmp(&b.voting_public_key));
+        let count = definitions.len();
+        if count > 0 {
+            Self(definitions).save(validators_dir)?;
+        }
+        Ok(count)
+    }
+
     pub fn enabled(&self) -> impl Iterator<Item = &ValidatorDefinition> {
         self.0.iter().filter(|definition| definition.enabled)
     }
@@ -87,6 +147,64 @@ impl ValidatorDefinitions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A keystore file naming `pubkey`, in the minimal shape discovery reads.
+    fn write_keystore(dir: &Path, pubkey: &str) {
+        let key_dir = dir.join(format!("0x{pubkey}"));
+        std::fs::create_dir_all(&key_dir).unwrap();
+        let json = serde_json::json!({
+            "crypto": {
+                "kdf": { "function": "pbkdf2", "params": { "dklen": 32, "c": 1, "prf": "hmac-sha256", "salt": "00" }, "message": "" },
+                "checksum": { "function": "sha256", "params": {}, "message": "00" },
+                "cipher": { "function": "aes-128-ctr", "params": { "iv": "00" }, "message": "00" }
+            },
+            "pubkey": pubkey,
+            "path": "",
+            "uuid": "00000000-0000-0000-0000-000000000000",
+            "version": 4
+        });
+        std::fs::write(key_dir.join("voting-keystore.json"), json.to_string()).unwrap();
+    }
+
+    #[test]
+    fn keystores_in_the_lighthouse_layout_are_discovered_when_no_file_exists() {
+        let validators = tempfile::tempdir().unwrap();
+        let secrets = tempfile::tempdir().unwrap();
+        write_keystore(validators.path(), "bb");
+        write_keystore(validators.path(), "aa");
+        std::fs::create_dir(validators.path().join("not-a-key")).unwrap();
+
+        let written =
+            ValidatorDefinitions::discover_if_absent(validators.path(), secrets.path()).unwrap();
+        assert_eq!(written, 2);
+        let definitions = ValidatorDefinitions::open(validators.path()).unwrap();
+        assert_eq!(definitions.0[0].voting_public_key, "0xaa");
+        assert_eq!(
+            definitions.0[0].voting_keystore_password_path,
+            secrets.path().join("0xaa")
+        );
+        assert!(definitions.0.iter().all(|definition| definition.enabled));
+    }
+
+    #[test]
+    fn an_existing_definitions_file_is_never_rescanned() {
+        let validators = tempfile::tempdir().unwrap();
+        let secrets = tempfile::tempdir().unwrap();
+        write_keystore(validators.path(), "aa");
+        ValidatorDefinitions(Vec::new())
+            .save(validators.path())
+            .unwrap();
+
+        let written =
+            ValidatorDefinitions::discover_if_absent(validators.path(), secrets.path()).unwrap();
+        assert_eq!(written, 0);
+        assert!(
+            ValidatorDefinitions::open(validators.path())
+                .unwrap()
+                .0
+                .is_empty()
+        );
+    }
 
     fn definition(pubkey: &str, enabled: bool) -> ValidatorDefinition {
         ValidatorDefinition {

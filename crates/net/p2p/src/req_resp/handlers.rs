@@ -2840,6 +2840,7 @@ pub(crate) mod tests {
             )),
             sync_committee_pool: Default::default(),
             aggregator_subnets: HashMap::new(),
+            peer_scoring: None,
         }
     }
 
