@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-cd8875c9.js";
+            window.path_to_searchindex_js = "searchindex-f2b6cd32.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -318,26 +318,22 @@ vote for a block the execution client has not validated (see
 <li>have a parent this node has already recorded an execution hash for, or</li>
 <li>be at least <code>--safe-slots-to-import-optimistically</code> behind the wall clock.</li>
 </ol>
-<p>Condition 1 is <code>store.beacon_el_block_hash(parent_root).is_some()</code>, and that hash
-is written when a block is <em>imported</em>. So it asks whether this node imported the
-parent and saw its payload, not whether the parent is post-merge.</p>
+<p>Condition 1 is <code>store.beacon_el_block_hash(parent_root).is_some()</code>: the
+specification’s <code>is_execution_block(parent)</code>, read off a cache of the parent’s
+payload hash rather than by decoding the block. The cache holds a hash for every
+post-merge block the store has, and none for a pre-merge block (a zero payload
+hash is not an execution block). It is filled at import, for the checkpoint
+anchor when the store is built, and on resume for the unfinalized window.</p>
 <p>The horizon guards against a poisoned <em>merge transition</em> block, whose parent hash
-names an execution block nobody can produce. Once a node is importing a
-post-merge chain every block’s parent carries a recorded hash, so condition 1
-carries each one and condition 2 stops mattering.</p>
-<p>The exception is the first block after a checkpoint-sync anchor. The anchor is
-never imported and never asked about (see <a href="#the-anchor-is-assumed-valid">The anchor is assumed
-valid</a>), so no execution hash is recorded for it
-and its child fails condition 1. Paired with an execution client that is itself
-still syncing, and so answers <code>SYNCING</code> to every <code>newPayload</code>, that child has
-only condition 2 left and the follower’s head sits at the anchor until the
-horizon admits it.</p>
-<p>The wait is <code>--safe-slots-to-import-optimistically</code> minus however far the anchor
-already trails the wall clock, which for a finalized anchor is most of it:
-measured against mainnet on 2026-09-15, an anchor 85 slots back cleared in about
-9 minutes rather than the full 128 slots. It costs that once per sync. Importing
-that block records its hash, so every descendant takes condition 1 and the
-backlog cascades.</p>
+names an execution block nobody can produce. Once a node is on a post-merge chain
+every block’s parent has a recorded hash, so condition 1 carries each one and
+condition 2 stops mattering.</p>
+<p>The anchor is never imported and never asked about (see <a href="#the-anchor-is-assumed-valid">The anchor is assumed
+valid</a>), so its hash is cached when the store is
+built; only the hash, not a verdict. That is what lets the first block after a
+checkpoint-sync anchor take condition 1 even while the execution client is still
+syncing and answers <code>SYNCING</code> to every <code>newPayload</code>. A restart empties the cache,
+so resume rebuilds it from the stored blocks.</p>
 <h3 id="latestvalidhash"><a class="header" href="#latestvalidhash"><code>latestValidHash</code></a></h3>
 <p>An <code>INVALID</code> answer names the last execution block that was valid. Resolving
 which beacon block that condemns is a walk up the <strong>rejected block’s own
