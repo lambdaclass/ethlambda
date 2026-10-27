@@ -15,16 +15,27 @@ pub enum Table {
     BlockProof,
     /// Canonical block index: slot -> block root
     BlockRoots,
-    /// State storage: H256 -> State
+    /// State storage: slot || root -> State
     ///
     /// Holds full-state snapshots only: the bootstrap anchor plus one anchor
-    /// every `SNAPSHOT_ANCHOR_INTERVAL` slots. Never pruned. Non-anchor states live in `StateDiffs` and
-    /// are reconstructed on demand (memoized by an in-memory cache).
-    States,
-    /// State diffs: H256 -> StateDiff
+    /// every `SNAPSHOT_ANCHOR_INTERVAL` slots. Non-anchor states live in
+    /// `StateDiffs` and are reconstructed on demand (memoized by an in-memory
+    /// cache).
     ///
-    /// Parent-linked diff written for every non-genesis state. Never pruned, so
-    /// it preserves full state history. See `get_state` for reconstruction.
+    /// The key is the slot (big-endian) of the block the state belongs to,
+    /// then that block's root. The slot comes first so that everything below
+    /// a finalized slot is one contiguous key range that
+    /// `Store::prune_finalized_states` drops with a range delete; a bare root
+    /// key would scatter finalized states across the keyspace. Readers holding
+    /// only a root recover the slot from its `BlockHeaders` row.
+    States,
+    /// State diffs: slot || root -> StateDiff
+    ///
+    /// Diff written for every non-anchor state, keyed like `States`. Lean's is
+    /// parent-linked; a beacon diff is taken against the nearest snapshot on
+    /// its branch, so a beacon state is one snapshot plus one delta. Pruned
+    /// below the finalized snapshot interval together with `States`. See
+    /// `get_state` for reconstruction.
     StateDiffs,
     /// Metadata: string keys -> various scalar values
     Metadata,

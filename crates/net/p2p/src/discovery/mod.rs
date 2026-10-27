@@ -191,7 +191,12 @@ pub async fn spawn_discovery(
     };
     let local_node = params.local_node();
     let local_record = build_local_enr(&params)?;
-    let local_enr = local_record.enr_url().map_err(DiscoveryError::EncodeEnr)?;
+    // EIP-778's text form is URL-safe base64 *without* padding
+    let local_enr = local_record
+        .enr_url()
+        .map_err(DiscoveryError::EncodeEnr)?
+        .trim_end_matches('=')
+        .to_string();
 
     // `spawn` rather than `spawn_with_filter` would install ethrex's own filter,
     // which wants an EIP-2124 `eth` entry compatible with an execution chain lean
@@ -331,6 +336,9 @@ mod tests {
             .expect("discovery spawns");
 
         assert!(handle.local_enr.starts_with("enr:"));
+        // EIP-778's text form carries no base64 padding, and lighthouse
+        // refuses a record that does.
+        assert!(!handle.local_enr.contains('='), "{}", handle.local_enr);
         let record = decode_enr(&handle.local_enr);
 
         // With discovery_port: 0 the OS picks the real port, and the published

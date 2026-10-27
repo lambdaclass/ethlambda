@@ -335,6 +335,7 @@ actual_slot = finalized_slot + 1 + relative_index
   - `fork_digest` is a 4-byte hex string (no `0x` prefix); currently the dummy `12345678` agreed across clients
   - Mesh size: 8 (6-12 bounds), heartbeat: 700ms
   - Beacon wire: `validate_messages()` is on, so every beacon message waits for a verdict (~4.2s before gossipsub's cache evicts it). Rules in `state_transition::beacon::gossip` (cheap half inline, stateful half on a bounded `spawn_blocking` task); plumbing in `p2p/src/beacon/verdict.rs`. Lean gossip still auto-forwards
+  - Beacon peer scoring: lighthouse's parameters ported in `p2p/src/beacon/scoring.rs` (block, aggregate, 64 attestation subnets, exits, slashings; columns and sync contributions unscored), refreshed every slot from the head's active validator count. Mesh-delivery scoring (P3) is gated off while the head lags more than 4 slots and for an epoch after, because a catching-up node `Ignore`s every aggregate and would otherwise graylist its own mesh. Every held fork digest is parametrized before `transition::apply` joins it (gossipsub never scores a mesh grafted before its topic had parameters); the previous digest's weights are zeroed at the switch, and the switch restarts the P3 warmup. The swarm disconnects peers below the graylist (-16000) every 10 s. Lean runs unscored. See [`docs/beacon_wire.md`](docs/beacon_wire.md#peer-scoring)
   - Data columns: every check runs in p2p. A column gossip did not accept (`Queue`/`Overloaded`), every fetched column, and parked columns replayed after their parent imports go through `column::chain_checks` in `p2p/src/beacon/column_checks.rs`. The chain actor stores what it gets unchecked; only debug builds re-run `chain_checks` there
   - Beacon subscribes seven global topics plus two node-id-derived subnet families: custody
     columns and backbone attestation subnets. One of the seven is
@@ -647,7 +648,10 @@ existing once per chain.
 - **`Validators` and `Balances` are `ethlambda_ssz_tree::List`s** (gloas:
   `ethlambda_ssz_tree::ProgressiveList`, same method set), persistent
   Merkle trees that cache node hashes and share unchanged subtrees between
-  states through `Arc`; they have no slices and no `iter_mut`. The registry is
+  states through `Arc`; they have no slices and no `iter_mut` (a pass that
+  rewrites most of a list uses the lazy copy-on-write cursor, `iter_cow` /
+  `try_update_each`, with `BeaconState::registry_mut` for disjoint borrows of
+  both lists). The registry is
   therefore reached through element-level `BeaconState` accessors
   (`validator`/`validator_mut`, `balance`/`balance_mut`, `push_validator`,
   `iter_validators`/`iter_balances`, `validator_count`, `validators_root`), so
@@ -958,6 +962,10 @@ behavior.
   justifications) lands; that is not gloas-specific.
 - `BlockProof` is the only pruned block table (below the finalized
   boundary); `get_signed_block` returns `None` for a pruned finalized block.
+- `States`/`StateDiffs` are pruned below the finalized block's snapshot interval
+  by `prune_finalized_states` (lean: in `prune_old_data`; beacon: in
+  `evict_held_blocks_at_or_below_finality`), watermarked by
+  `KEY_STATES_PRUNED_BELOW` so ranges are adjacent and never overlap.
 - A `StateDiff` omits `config` and `validators`, trusting they never mutate;
   breaking that invariant would silently corrupt every reconstructed state.
 - `Metadata["config"]` is written at bootstrap; it doubles as the DB's
@@ -984,14 +992,16 @@ behavior.
   in-memory map stays as a write-through cache in front of the table. Pruned
   on finalization to the same horizon as `LiveChain` (the finalized block's
   own slot, keeping that block's own entry).
-- `DB_VERSION` is 6: `Config` gained the gloas schedule, timing and churn
-  keys, and it is SSZ-encoded under `KEY_CONFIG`, so a data directory written
-  by an earlier version decodes into the wrong fields. (5 was the
-  unrealized-justifications table, since a directory written before it has no
-  row there for any block it already imported; 4 was
-  `PRESET_BASE`/`CONFIG_NAME` at the front of `Config`; 3 was the runtime keys
-  a `config.yaml` supplies.) `Store::from_db_state` refuses any other version
-  outright; there is no migration.
+- `DB_VERSION` is 7: `States` and `StateDiffs` moved from root keys to
+  slot||root keys (the block's slot, looked up from `BlockHeaders` by readers)
+  so `Store::prune_finalized_states` can range-delete finalized states; a
+  directory written by an earlier version holds rows no lookup finds. (6 was
+  the gloas schedule, timing and churn keys in `Config`, which is SSZ-encoded
+  under `KEY_CONFIG`; 5 was the unrealized-justifications table, since a
+  directory written before it has no row there for any block it already
+  imported; 4 was `PRESET_BASE`/`CONFIG_NAME` at the front of `Config`; 3 was
+  the runtime keys a `config.yaml` supplies.) `Store::from_db_state` refuses
+  any other version outright; there is no migration.
 
 ### State Root Computation
 - Always computed via `hash_tree_root()` after full state transition

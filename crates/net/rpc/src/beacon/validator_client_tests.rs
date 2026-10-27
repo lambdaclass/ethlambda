@@ -994,8 +994,12 @@ fn assert_full_sync_aggregate(
         "every member signed the parent"
     );
     let mut state = advanced.clone();
-    ethlambda_state_transition::beacon::stf::altair::process_sync_aggregate(&mut state, aggregate)
-        .expect("the packed aggregate verifies as the state transition checks it");
+    ethlambda_state_transition::beacon::stf::altair::process_sync_aggregate(
+        &mut state,
+        aggregate,
+        &ethlambda_state_transition::beacon::helpers::accessors::ActiveBalanceCache::default(),
+    )
+    .expect("the packed aggregate verifies as the state transition checks it");
 }
 
 /// A sync committee member's slot through this node: the duties and
