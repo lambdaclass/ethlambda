@@ -37,9 +37,13 @@ use ethlambda_state_transition::beacon::{
         pack_attestations, pack_operations, parse_execution_requests, payload_inputs,
         verified_sync_aggregate,
     },
+    bls,
     data_columns::{self, SidecarError},
     helpers::accessors::get_beacon_proposer_index,
-    stf::verify_block_signature,
+    stf::{
+        block::{BlockProcessingOptions, RandaoVerification},
+        verify_block_signature,
+    },
     sync_committee_pool::SharedSyncCommitteePool,
 };
 use ethlambda_storage::Store;
@@ -329,6 +333,39 @@ struct ProduceQuery {
     randao_reveal: BlsSignature,
     #[serde(default)]
     graffiti: Option<H256>,
+    /// A flag with no value, validated by [`randao_verification`].
+    #[serde(default)]
+    skip_randao_verification: Option<String>,
+}
+
+/// Whether the block's RANDAO reveal is verified, from the request's
+/// `skip_randao_verification` flag, the way Lighthouse reads it.
+///
+/// The flag takes no value, so `?skip_randao_verification` and
+/// `?skip_randao_verification=` set it and any other value is refused rather
+/// than guessed at. Skipping is only for a reveal that cannot verify against
+/// any key (`bls::G2_POINT_AT_INFINITY`), so a caller that sets the flag with a
+/// real reveal has misunderstood it, and the block would otherwise be produced
+/// against a reveal that was never checked.
+pub(super) fn randao_verification(
+    skip: Option<&str>,
+    randao_reveal: &BlsSignature,
+) -> Result<RandaoVerification, ApiError> {
+    match skip {
+        None => Ok(RandaoVerification::Verify),
+        Some("") => {
+            if randao_reveal.0 == bls::G2_POINT_AT_INFINITY {
+                Ok(RandaoVerification::Skip)
+            } else {
+                Err(ApiError::BadRequest(
+                    "randao_reveal must be the point at infinity when skip_randao_verification is set",
+                ))
+            }
+        }
+        Some(_) => Err(ApiError::BadRequest(
+            "skip_randao_verification does not take a value",
+        )),
+    }
 }
 
 /// Refuses a slot the schedule does not place at fulu, before anything
@@ -363,6 +400,15 @@ async fn get_block(
     let Ok(slot) = slot.parse::<Slot>() else {
         return ApiError::BadRequest("invalid slot").into_response();
     };
+    // Ahead of the engine check, like the slot check below: a bad flag is the
+    // caller's mistake, a 400 on any node.
+    let randao = match randao_verification(
+        query.skip_randao_verification.as_deref(),
+        &query.randao_reveal,
+    ) {
+        Ok(randao) => randao,
+        Err(err) => return err.into_response(),
+    };
     // Ahead of the engine check: a slot this node cannot build is a 400 on
     // any node, not a 503 on one with no execution client.
     if let Err(err) = require_fulu_slot(
@@ -387,6 +433,7 @@ async fn get_block(
         &own_version,
         slot,
         query.randao_reveal,
+        BlockProcessingOptions { randao },
         graffiti,
     )
     .await;
@@ -431,6 +478,7 @@ async fn produce(
     own_version: &ClientVersionV1,
     slot: Slot,
     randao_reveal: BlsSignature,
+    options: BlockProcessingOptions,
     graffiti: Bytes32,
 ) -> Result<(FuluBlockContents, String, ForkName), ApiError> {
     let config = store.config();
@@ -528,6 +576,7 @@ async fn produce(
         &state,
         inputs(attestations, operations, sync_aggregate),
         &config,
+        options,
     ) {
         Ok(block) => block,
         // `pack_attestations` and `pack_operations` check every candidate
@@ -540,6 +589,7 @@ async fn produce(
                 &state,
                 inputs(Vec::new(), Operations::default(), empty_sync_aggregate()),
                 &config,
+                options,
             )
             .map_err(|_| ApiError::Internal("the block failed to build"))?
         }
@@ -669,6 +719,114 @@ mod tests {
         let status = response.status();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         (status, serde_json::from_slice(&body).unwrap_or_default())
+    }
+
+    /// A fulu head with its proposer lookahead and sync committee filled in,
+    /// which a block built on it needs, under a schedule that puts every slot
+    /// at fulu.
+    fn fulu_store() -> (Store, Slot) {
+        use ethlambda_state_transition::beacon::helpers::{
+            altair::get_next_sync_committee, fulu::initialize_proposer_lookahead,
+        };
+        let mut state = with_signing_validators_at(ForkName::Fulu, 64);
+        let lookahead = initialize_proposer_lookahead(&state).unwrap();
+        let sync_committee = get_next_sync_committee(&state).unwrap();
+        let BeaconState::Fulu(inner) = &mut state else {
+            unreachable!("built as fulu")
+        };
+        inner.proposer_lookahead = lookahead.try_into().unwrap();
+        inner.current_sync_committee = sync_committee.clone();
+        inner.next_sync_committee = sync_committee;
+        let head_slot = state.slot();
+        let (store, _root) =
+            beacon_store_with_config(state, Config::mainnet().with_fork_epoch(ForkName::Fulu, 0));
+        (store, head_slot)
+    }
+
+    fn produce_app(store: Store, engine: Option<EngineClient>) -> Router {
+        routes()
+            .with_state(store)
+            .layer(Extension(engine))
+            .layer(Extension(SharedSyncCommitteePool::default()))
+            .layer(Extension(FeeRecipients::default()))
+            .layer(Extension(OwnVersion(Arc::new(
+                ethlambda_engine::types::ClientVersionV1 {
+                    code: "LA".to_string(),
+                    name: "ethlambda".to_string(),
+                    version: "ethlambda/test".to_string(),
+                    commit: "0x3c4d7e8f".to_string(),
+                },
+            ))))
+    }
+
+    fn infinity_reveal() -> String {
+        hex::encode(bls::G2_POINT_AT_INFINITY)
+    }
+
+    fn produce_uri(slot: Slot, reveal: &str, flag: &str) -> String {
+        format!("/eth/v3/validator/blocks/{slot}?randao_reveal=0x{reveal}{flag}")
+    }
+
+    #[tokio::test]
+    async fn the_infinity_reveal_is_produced_only_when_the_flag_skips_its_verification() {
+        let (store, head_slot) = fulu_store();
+        let slot = head_slot + 1;
+        let engine = super::super::validator_client_tests::fake_execution_client(0).await;
+
+        for flag in ["&skip_randao_verification=", "&skip_randao_verification"] {
+            let app = produce_app(store.clone(), Some(engine.clone()));
+            let uri = produce_uri(slot, &infinity_reveal(), flag);
+            let (status, json) = respond(app, Request::get(uri).body(Body::empty()).unwrap()).await;
+            assert_eq!(status, StatusCode::OK, "{flag}: {json}");
+            assert_eq!(
+                json["data"]["block"]["body"]["randao_reveal"],
+                format!("0x{}", infinity_reveal()),
+                "{flag}"
+            );
+        }
+
+        // Without the flag the reveal is verified, and the infinity one fails.
+        let app = produce_app(store, Some(engine));
+        let uri = produce_uri(slot, &infinity_reveal(), "");
+        let (status, _) = respond(app, Request::get(uri).body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn the_randao_skip_flag_is_refused_with_a_value_or_a_real_reveal() {
+        let (store, head_slot) = fulu_store();
+        let slot = head_slot + 1;
+        let get = |uri: String| Request::get(uri).body(Body::empty()).unwrap();
+
+        let (status, json) = respond(
+            produce_app(store.clone(), None),
+            get(produce_uri(
+                slot,
+                &"00".repeat(96),
+                "&skip_randao_verification",
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json["message"],
+            "randao_reveal must be the point at infinity when skip_randao_verification is set"
+        );
+
+        let (status, json) = respond(
+            produce_app(store, None),
+            get(produce_uri(
+                slot,
+                &infinity_reveal(),
+                "&skip_randao_verification=true",
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json["message"],
+            "skip_randao_verification does not take a value"
+        );
     }
 
     #[tokio::test]
