@@ -705,6 +705,10 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     // by block production and `GET .../pool/payload_attestations`.
     let payload_attestation_pool =
         ethlambda_state_transition::beacon::payload_attestation_pool::SharedPayloadAttestationPool::default();
+    // Bids, proposer preferences and known payloads: filled by gossip and the
+    // Beacon API's bid and preferences endpoints, read by block production.
+    let builder_market =
+        ethlambda_state_transition::beacon::builder_market::SharedBuilderMarket::default();
     // Filled by gossip and the Beacon API's sync committee endpoints, read by
     // block production and the contribution endpoint.
     let sync_committee_pool =
@@ -715,6 +719,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         setup.node_names,
         discovery,
         payload_attestation_pool.clone(),
+        builder_market.clone(),
         sync_committee_pool.clone(),
     )
     .await
@@ -756,6 +761,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                 ethlambda_rpc::BeaconApiHandles {
                     p2p: rpc_p2p,
                     payload_attestation_pool: payload_attestation_pool.clone(),
+                    builder_market: builder_market.clone(),
                     sync_committee_pool: sync_committee_pool.clone(),
                     custody_columns: rpc_custody_columns,
                     engine: rpc_engine,
