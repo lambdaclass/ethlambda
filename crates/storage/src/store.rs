@@ -7179,6 +7179,9 @@ mod tests {
             electra.historical_summaries.push(summary).unwrap();
         }
         let mut parent = BeaconState::Electra(electra);
+        // States are keyed by their header's slot and read back by their
+        // block's, so each state names its own block's slot there.
+        parent.latest_block_header_mut().slot = 10;
         parent.apply_pending_mutations();
         store
             .insert_signed_block(parent_root, beacon_test_block(10, H256::ZERO))
@@ -7190,6 +7193,7 @@ mod tests {
         let mut child = parent;
         *child.slot_mut() += 1;
         child.latest_block_header_mut().parent_root = parent_root;
+        child.latest_block_header_mut().slot = 11;
         *child.balance_mut(0).unwrap() += 1;
         child.block_roots_mut()[10] = parent_root;
         child.apply_pending_mutations();
