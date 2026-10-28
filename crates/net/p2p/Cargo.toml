@@ -26,7 +26,7 @@ futures = "0.3"
 tokio-stream = "0.1"
 
 # Fork with request-response feature for outbound protocol selection
-libp2p = { git = "https://github.com/lambdaclass/rust-libp2p.git", rev = "2f14d0ec9665a01cfb6a02326c90628c4bba521c", features = [
+libp2p = { git = "https://github.com/lambdaclass/rust-libp2p.git", rev = "da14117765c24f7a90634d841f649fb4adf82bfb", features = [
     "full",
 ] }
 
@@ -34,7 +34,7 @@ libp2p = { git = "https://github.com/lambdaclass/rust-libp2p.git", rev = "2f14d0
 # has to offer mplex too. The libp2p facade dropped its `mplex` re-export when
 # the muxer was deprecated, so it is taken directly from the same pinned tree.
 # See the `muxers` module for the measurement.
-libp2p-mplex = { git = "https://github.com/lambdaclass/rust-libp2p.git", rev = "2f14d0ec9665a01cfb6a02326c90628c4bba521c" }
+libp2p-mplex = { git = "https://github.com/lambdaclass/rust-libp2p.git", rev = "da14117765c24f7a90634d841f649fb4adf82bfb" }
 
 snap = "1.1"
 
