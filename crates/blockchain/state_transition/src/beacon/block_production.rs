@@ -38,8 +38,8 @@ use super::bls;
 use super::config::Config;
 use super::error::{Error, Result, verify};
 use super::helpers::accessors::{
-    CommitteeCache, get_beacon_proposer_index, get_block_root, get_block_root_at_slot,
-    get_current_epoch, get_domain, get_previous_epoch, get_randao_mix,
+    ActiveBalanceCache, CommitteeCache, get_beacon_proposer_index, get_block_root,
+    get_block_root_at_slot, get_current_epoch, get_domain, get_previous_epoch, get_randao_mix,
 };
 use super::helpers::electra::{
     get_attesting_indices, get_indexed_attestation, is_valid_indexed_attestation,
@@ -591,8 +591,13 @@ pub fn assemble_block(
         config,
         &ExecutionEngine::valid(),
         &CommitteeCache::default(),
+        &ActiveBalanceCache::default(),
         options,
     )?;
+    // Fold the block's writes into their trees first, so the root is computed
+    // on (and cached in) the state's own nodes rather than a throwaway copy,
+    // as `state_transition` does before it checks a block's state root.
+    post.apply_pending_mutations();
     block.state_root = post.hash_tree_root();
     Ok(block)
 }
@@ -696,6 +701,7 @@ mod tests {
             &Config::mainnet(),
             &ExecutionEngine::valid(),
             &CommitteeCache::default(),
+            &ActiveBalanceCache::default(),
             BlockProcessingOptions::default(),
         )
         .unwrap();
@@ -759,6 +765,7 @@ mod tests {
             &config,
             &ExecutionEngine::valid(),
             &CommitteeCache::default(),
+            &ActiveBalanceCache::default(),
             skip_randao(),
         )
         .unwrap();

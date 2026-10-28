@@ -63,6 +63,7 @@ mod beacon_payloads;
 pub use beacon_payloads::checkpoint_hash;
 pub mod block_builder;
 pub(crate) mod coverage;
+mod epoch_precompute;
 pub mod events;
 pub(crate) mod fork_choice_tree;
 pub mod import_timing;
@@ -422,6 +423,7 @@ impl BlockChain {
             engine,
             safe_slots_to_import_optimistically,
             last_tick_instant: None,
+            epoch_precompute_in_flight: None,
             sync_status,
             sync_status_controller,
             events,
@@ -547,6 +549,10 @@ pub struct BlockChainServer {
 
     /// Last tick instant for measuring interval duration.
     last_tick_instant: Option<Instant>,
+
+    /// The epoch precompute worker running right now, if any (beacon only). At
+    /// most one runs at a time; see [`epoch_precompute`].
+    epoch_precompute_in_flight: Option<epoch_precompute::PrecomputeKey>,
 
     /// Stateful sync heuristic used by `lean_node_sync_status`. Also gates
     /// validator duties while syncing, unless that gating was disabled at
@@ -1091,6 +1097,12 @@ impl BlockChainServer {
         self.redrive_envelopes_awaiting_engine();
         self.redrive_missing_envelopes();
         self.settle_envelopes().await;
+
+        // Beacon only (both calls are no-ops on lean): a last slot arms its
+        // three-quarter precompute check, and a redrive above may have made a
+        // last-slot block the head without passing through the block handler.
+        self.arm_epoch_precompute_check(slot, ctx);
+        self.maybe_start_epoch_precompute(epoch_precompute::Trigger::Head, ctx);
 
         // Per-interval duties for this tick. Lean-only, so this is where a
         // beacon follower's tick ends: it has no validator duties (see
@@ -2029,6 +2041,7 @@ impl BlockChainServer {
             engine,
             safe_slots_to_import_optimistically,
             last_tick_instant: None,
+            epoch_precompute_in_flight: None,
             sync_status: SyncStatusTracker::new(false),
             sync_status_controller: SyncStatusController::default(),
             events: ChainEvents::new(EventBus::default(), &store),
@@ -3294,6 +3307,10 @@ impl BlockChainServer {
     /// import — the two places beacon finality can move — bounds that by the
     /// unfinalized window rather than by this node's uptime.
     ///
+    /// Also prunes the states of finalized snapshot intervals on beacon (see
+    /// [`Store::prune_finalized_states`]), which shares this horizon and these
+    /// two call sites; lean does that in `Store::prune_old_data` instead.
+    ///
     /// Also bounds the three beacon scratch caches with the same horizon, the
     /// execution-hash cache, the payload-link cache and the optimistic-root
     /// set, which is why the finalized slot is read before the "nothing is
@@ -3345,6 +3362,23 @@ impl BlockChainServer {
             .prune_beacon_optimistic_roots(finalized_slot, finalized.root);
         self.store
             .prune_beacon_block_payload_statuses(finalized_slot);
+
+        // Same horizon again: the states of finalized snapshot intervals. Beacon
+        // only, since lean prunes them inside `Store::prune_old_data`, and doing
+        // it here too would prune twice. A call with unchanged finality is one
+        // metadata read, which is what makes running it after every tick safe.
+        if self.store.chain() == Chain::Beacon
+            && let Some(pruned) = self
+                .store
+                .prune_finalized_states()
+                .expect("prune finalized states")
+        {
+            info!(
+                from_slot = pruned.start,
+                below_slot = pruned.end,
+                "Pruned finalized states"
+            );
+        }
 
         if self.blocks_awaiting_columns.is_empty() {
             return;
@@ -3969,6 +4003,10 @@ impl Handler<NewBlock> for BlockChainServer {
         self.on_block(msg.block, timings).await;
         // A gloas envelope that arrived ahead of this block is judgeable now.
         self.settle_envelopes().await;
+
+        // The import above may have left a last-slot block as head: the
+        // moment to start the next epoch's transition (no-op on lean).
+        self.maybe_start_epoch_precompute(epoch_precompute::Trigger::Head, ctx);
     }
 }
 
@@ -4513,6 +4551,7 @@ mod tests {
             engine: None,
             safe_slots_to_import_optimistically: constants::SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY,
             last_tick_instant: None,
+            epoch_precompute_in_flight: None,
             sync_status: SyncStatusTracker::new(false),
             sync_status_controller: SyncStatusController::default(),
             duties: ChainDuties::Beacon,
