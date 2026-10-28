@@ -16,15 +16,17 @@ Follows Ethereum mainnet from a checkpoint-synced anchor and serves the
 standard Beacon API on port 5052, paired with an
 [ethrex](https://github.com/lambdaclass/ethrex) execution client that validates
 each block's execution payload. Both run from pre-built images
-(`ghcr.io/lambdaclass/ethlambda:beacon` and `ghcr.io/lambdaclass/ethrex`), so
-only [Docker](https://www.docker.com/get-started) is needed.
+(`ghcr.io/lambdaclass/ethlambda:latest` and `ghcr.io/lambdaclass/ethrex`), so
+only [Docker](https://www.docker.com/get-started) is needed. To run the release
+binary without Docker, see
+[Running from a release binary](#running-from-a-release-binary) below.
 
 > **Warning:** this uses a lot of disk. ethrex needs at least 500 GB for
 > mainnet (1 TB recommended; see its
 > [hardware requirements](https://docs.ethrex.xyz/getting-started/hardware_requirements.html)).
 
 ```sh
-docker pull ghcr.io/lambdaclass/ethlambda:beacon
+docker pull ghcr.io/lambdaclass/ethlambda:latest
 docker pull ghcr.io/lambdaclass/ethrex
 
 mkdir -p beacon-data ethrex-data
@@ -55,7 +57,7 @@ docker run -d --name ethlambda-beacon --network ethereum --stop-signal SIGINT \
   -p 127.0.0.1:5052:5052 \
   -v "$PWD/beacon-data:/data" \
   -v "$PWD/jwt.hex:/jwt.hex:ro" \
-  ghcr.io/lambdaclass/ethlambda:beacon beacon \
+  ghcr.io/lambdaclass/ethlambda:latest beacon \
   --network                mainnet \
   --checkpoint-sync-url    https://beaconstate.ethstaker.cc \
   --node-key               /data/node-key \
@@ -76,7 +78,7 @@ answers attestation data, aggregation and block production requests with
 `503`:
 
 ```sh
-docker pull ghcr.io/lambdaclass/ethlambda:beacon
+docker pull ghcr.io/lambdaclass/ethlambda:latest
 
 mkdir -p beacon-data
 # A persisted key keeps the node's identity, and so its custody set, stable across restarts
@@ -89,7 +91,7 @@ docker run -d --name ethlambda-beacon --stop-signal SIGINT \
   -p 9000:9000/udp -p 9001:9001/udp -p 9001:9001/tcp \
   -p 127.0.0.1:5052:5052 \
   -v "$PWD/beacon-data:/data" \
-  ghcr.io/lambdaclass/ethlambda:beacon beacon \
+  ghcr.io/lambdaclass/ethlambda:latest beacon \
   --network                mainnet \
   --checkpoint-sync-url    https://beaconstate.ethstaker.cc \
   --node-key               /data/node-key \
@@ -135,10 +137,57 @@ provider. See
 the remaining flags.
 
 `--network plataberget` (the Glamsterdam testnet) is built in as well. It has
-run gloas since its `GLOAS_FORK_EPOCH`, which the follower follows: a gloas
-checkpoint anchor is accepted, and payload envelopes are fetched and imported.
-It stays a follower, so the validator-client endpoints still refuse a gloas
-epoch.
+run gloas since its `GLOAS_FORK_EPOCH`, which the node follows: a gloas
+checkpoint anchor is accepted, payload envelopes are fetched and imported, and
+the validator-client endpoints serve gloas duties, the payload envelope and the
+payload timeliness vote included.
+
+### Running from a release binary
+
+Every release attaches binaries for Linux (x86_64, aarch64) and macOS (Apple
+silicon); see [Releases](#releases) below. This is the beacon node from the
+quickstart above, run from one of them, with ethrex already listening on
+`127.0.0.1:8551`:
+
+```sh
+# Pick the asset for your platform: ethlambda-linux-x86_64, ethlambda-linux-aarch64 or ethlambda-macos-aarch64
+curl -LO https://github.com/lambdaclass/ethlambda/releases/latest/download/ethlambda-linux-x86_64
+chmod +x ethlambda-linux-x86_64 && mv ethlambda-linux-x86_64 ethlambda
+./ethlambda --version
+
+mkdir -p beacon-data
+# A persisted key keeps the node's identity, and so its custody set, stable across restarts
+openssl rand -hex 32 > beacon-data/node-key
+# The secret both clients authenticate the Engine API with; pass ethrex the same file
+openssl rand -hex 32 > jwt.hex
+
+./ethlambda beacon \
+  --network                mainnet \
+  --checkpoint-sync-url    https://beaconstate.ethstaker.cc \
+  --node-key               beacon-data/node-key \
+  --data-dir               beacon-data/db \
+  --discovery.advertise-ip "$(curl -s https://ifconfig.me)" \
+  --execution-endpoint     http://127.0.0.1:8551 \
+  --execution-jwt-secret   jwt.hex
+```
+
+Drop the two `--execution-*` flags to follow the chain without an execution
+client, with the limits described above. The Beacon API binds `127.0.0.1:5052`
+by default, so `--http-address` is only needed to reach it from another host.
+`--discovery.advertise-ip` still applies: without it the node advertises
+`0.0.0.0`. Stop the node with `Ctrl+C`; it shuts down gracefully on SIGINT
+only, so a systemd unit needs `KillSignal=SIGINT`.
+
+- `ethlambda-linux-x86_64` targets x86-64-v3, so it needs a CPU with AVX2
+  (Haswell or later), and glibc 2.35 or newer.
+- The macOS binary is not notarized. A browser download is quarantined, which
+  `xattr -d com.apple.quarantine <file>` lifts; a `curl` download is not.
+- [`RELEASE.md`](./RELEASE.md#verifying-a-release) shows how to verify a
+  binary's provenance attestation.
+
+The same binary runs [`ethlambda node`](#ethlambda-node--the-lean-consensus-chain)
+and [`ethlambda validator`](#ethlambda-validator--the-validator-client); their
+flags are below.
 
 ### Lean consensus devnet
 
@@ -151,8 +200,9 @@ To run a local lean devnet with ethlambda, follow the instructions on the
 
 - [Rust](https://rust-lang.org/tools/install)
 - [Git](https://git-scm.com/install)
-- [Docker](https://www.docker.com/get-started)
-- [yq](https://github.com/mikefarah/yq#install)
+- For `make run-devnet` and `make docker-build` only:
+  [Docker](https://www.docker.com/get-started) and
+  [yq](https://github.com/mikefarah/yq#install)
 
 ### Building and testing
 
@@ -173,14 +223,16 @@ Run `make help` or take a look at our [`Makefile`](./Makefile) for other useful 
 
 ### Running the node
 
-The binary follows one of two chains, chosen by a sub-command:
+The binary carries both chains and the validator client as sub-commands:
 
 ```sh
 cargo build --release
-./target/release/ethlambda <node|beacon> [flags]
+./target/release/ethlambda <node|beacon|validator> [flags]
 ```
 
-[`docs/cli.md`](./docs/cli.md) is the full flag reference for both.
+[`docs/cli.md`](./docs/cli.md) is the full flag reference for every sub-command,
+`benchmark` and `replay-era` included. A
+[release binary](#running-from-a-release-binary) takes the same arguments.
 
 #### `ethlambda node` — the Lean consensus chain
 
@@ -217,13 +269,16 @@ under `lean-quickstart/local-devnet/genesis/`. See
 
 #### `ethlambda beacon` — the Ethereum Beacon Chain
 
-A beacon chain follower. It anchors at a finalized checkpoint fetched from a
-Beacon API, then follows the chain to its tip: blocks arriving over gossip and
-range sync are imported through fork choice, and it custodies its slice of the
-fulu data column matrix. What it stores it serves back, to peers over
+A beacon node. It anchors at a finalized checkpoint fetched from a Beacon API,
+then follows the chain to its tip: blocks arriving over gossip and range sync
+are imported through fork choice, and it custodies its slice of the fulu data
+column matrix. What it stores it serves back, to peers over
 `beacon_blocks_by_{range,root}` and to anyone over the standard Beacon API on
-`--api-port`. It has no validator duties: it publishes nothing and subscribes to
-no attestation or sync committee subnet.
+`--api-port`. It performs no validator duties of its own: those belong to
+[`ethlambda validator`](#ethlambda-validator--the-validator-client), which it
+serves over that API once paired with an execution client, joining the
+attestation and sync committee subnets its validators ask for and publishing
+what they sign.
 
 ```sh
 ./target/release/ethlambda beacon \
@@ -259,6 +314,42 @@ See [`docs/beacon_wire.md`](./docs/beacon_wire.md) for what goes on the wire,
 [`docs/checkpoint_sync.md`](./docs/checkpoint_sync.md) for how the anchor is
 chosen and verified, and [`docs/rpc.md`](./docs/rpc.md) for the Beacon API
 endpoints.
+
+#### `ethlambda validator` — the validator client
+
+A separate process that holds the keys and performs the duties: attestations,
+block proposals, aggregation, sync committee messages and, from gloas on, the
+payload envelope and the payload timeliness vote. It talks to a beacon node over
+the standard Beacon API, so it works against `ethlambda beacon` (run with the
+`--execution-*` flags) or any other conformant beacon node.
+
+> **Warning:** the validator client keeps no slashing-protection record. Do not
+> run the same keys in another client while this one runs, and treat a restart
+> with the same care as a manual key move. Read
+> [Spec deviations](./docs/spec_deviations.md#the-validator-client-keeps-no-slashing-protection-record)
+> before using keys that hold real stake. The client repeats this warning at
+> startup.
+
+```sh
+./target/release/ethlambda validator \
+  --beacon-nodes            http://127.0.0.1:5052 \
+  --validators-dir          ./validators \
+  --secrets-dir             ./secrets \
+  --suggested-fee-recipient 0x<your-address>
+```
+
+| Flag | Meaning |
+|---|---|
+| `--beacon-nodes` | Base URLs of the beacon nodes to use, comma-separated or repeated. Tried in order, so the order is a preference |
+| `--validators-dir` | Directory of EIP-2335 keystores and `validator_definitions.yml`. Without that file, keystores in the Lighthouse layout (`<0xpubkey>/voting-keystore.json`) are discovered and the file is written |
+| `--secrets-dir` | One password file per keystore, named after the validator's public key |
+| `--suggested-fee-recipient` | Execution address for block rewards, `0x`-prefixed. Optional, but without it the beacon node picks an address that is not yours |
+| `--graffiti` | Text for proposed blocks, at most 32 bytes |
+| `--enable-keymanager` | Serve the keymanager API on `--keymanager-port` (default `5062`). Off by default, since it mutates key material |
+
+Metrics are served on `--metrics-port` (default `5064`). See
+[`docs/cli.md`](./docs/cli.md#validator-flags) for the remaining flags and what
+the client does each slot.
 
 ### Running in a devnet
 
@@ -318,9 +409,10 @@ Full documentation is available in the [`docs/`](./docs) directory. Please refer
 
 ethlambda is a Beacon Chain and Lean Chain client. On the Beacon Chain
 (`ethlambda beacon`), it follows a network from a checkpoint-synced anchor and serves
-the standard Beacon API; see the [Beacon Chain follower](#beacon-chain-follower)
-quickstart. On the Lean Chain (`ethlambda node`), it implements the core features of a
-Lean consensus client:
+the standard Beacon API; paired with an execution client it validates payloads and
+serves the [validator client](#ethlambda-validator--the-validator-client). See the
+[Beacon Chain follower](#beacon-chain-follower) quickstart. On the Lean Chain
+(`ethlambda node`), it implements the core features of a Lean consensus client:
 
 - **Networking** — libp2p peer connections, STATUS message handling, gossipsub for blocks and attestations
 - **State management** — genesis state generation, state transition function, block processing
@@ -373,9 +465,8 @@ We wrote a [blogpost](https://blog.lambdaclass.com/ethlambda-devnet-5-and-beyond
 Some features we are looking to implement in the near future, in order of priority:
 
 - [Optimize block building](https://github.com/lambdaclass/ethlambda/issues/465)
-- [Use state-diffs for storing states in the database](https://github.com/lambdaclass/ethlambda/issues/238)
 - [Prototype Goldfish + RLMD GHOST + BFT — devnet-6](https://github.com/lambdaclass/ethlambda/pull/434)
-- [Integrate with execution clients](https://github.com/lambdaclass/ethlambda/pull/367), in particular [ethrex](https://github.com/lambdaclass/ethrex) — devnet-7
+- Integrate the Lean Chain with execution clients, in particular [ethrex](https://github.com/lambdaclass/ethrex) — devnet-7 ([first prototype](https://github.com/lambdaclass/ethlambda/pull/367)). The beacon node already pairs with one over the Engine API; see [`docs/beacon_engine.md`](./docs/beacon_engine.md)
 - Replace libp2p with the experimental [ethp2p](https://github.com/ethp2p/ethp2p), which we are porting to Rust
 - [Add a guest program and ZK proving of the STF](https://github.com/lambdaclass/ethlambda/issues/156)
 - Rewrite the STF in the concrete programming language to enable formal verification
