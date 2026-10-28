@@ -1,6 +1,6 @@
 # Contributing to ethlambda
 
-Thanks for your interest in contributing to ethlambda — a minimalist Lean Consensus client for Ethereum, written in Rust.
+Thanks for your interest in contributing to ethlambda — a minimalist Beacon Chain and Lean Chain client for Ethereum, written in Rust.
 
 Before diving in, we recommend reading [our introductory blog post](https://blog.lambdaclass.com/introducing-ethlambda-a-lean-consensus-client-for-ethereums-next-era/) to understand the project's goals and philosophy.
 

@@ -4,7 +4,7 @@
 
 # ethlambda
 
-Minimalist, fast and modular implementation of the Lean Ethereum client written in Rust.
+Minimalist, fast and modular implementation of a Beacon Chain and Lean Chain client written in Rust.
 
 🌐 Visit our website at [**ethlambda.xyz**](https://ethlambda.xyz) to learn more about the project.
 
@@ -184,8 +184,8 @@ cargo build --release
 
 #### `ethlambda node` — the Lean consensus chain
 
-This is what the rest of this README is about, and it is the default: a bare
-flag list with no sub-command still runs the node, so existing scripts and
+The [devnet section](#running-in-a-devnet) below runs this sub-command, and it
+is the default: a bare flag list with no sub-command still runs the node, so existing scripts and
 Docker entrypoints keep working unchanged.
 
 It needs a genesis config, a validator registry, a bootnode list and this
@@ -316,7 +316,11 @@ Full documentation is available in the [`docs/`](./docs) directory. Please refer
 
 ## Current status
 
-The client implements the core features of a Lean Ethereum consensus client:
+ethlambda is a Beacon Chain and Lean Chain client. On the Beacon Chain
+(`ethlambda beacon`), it follows a network from a checkpoint-synced anchor and serves
+the standard Beacon API; see the [Beacon Chain follower](#beacon-chain-follower)
+quickstart. On the Lean Chain (`ethlambda node`), it implements the core features of a
+Lean consensus client:
 
 - **Networking** — libp2p peer connections, STATUS message handling, gossipsub for blocks and attestations
 - **State management** — genesis state generation, state transition function, block processing

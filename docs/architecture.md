@@ -12,6 +12,12 @@ genservers: each owns its state, and the only way in is a message.
 Everything else hangs off those two: an aggregation worker on a blocking thread, the libp2p
 swarm loop on its own task, and the axum servers that expose the node to the outside world.
 
+This page describes the Lean Chain node, `ethlambda node`. `ethlambda beacon` runs the
+same two actors over its own `Store`, but its chain actor (`BlockChain::spawn_beacon`) has
+no validator keys, no aggregator role and no duties for the sync gate to hold back: it
+imports blocks and runs the Beacon Chain's fork choice. [The mainnet wire](./beacon_wire.md)
+and [Beacon Chain state transition](./beacon_stf.md) cover that side.
+
 > Note: for what a genserver is, read [this blogpost on the `spawned` crate](https://blog.lambdaclass.com/introducing-spawned-erlang-style-actors-for-rust/).
 
 ```text

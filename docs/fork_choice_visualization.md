@@ -9,7 +9,9 @@ A browser-based real-time visualization of the LMD GHOST fork choice tree, serve
 | `GET /lean/v0/fork_choice/ui` | Interactive D3.js visualization page |
 | `GET /lean/v0/fork_choice` | JSON snapshot of the fork choice tree |
 
-Both endpoints are served on the API port (`--api-port`, default `5052`).
+Both endpoints are served on the API port (`--api-port`, default `5052`), by `ethlambda node`
+only: they show the Lean Chain's fork choice tree, and on `ethlambda beacon` every `/lean/v0`
+path returns 404.
 
 ## Quick Start
 

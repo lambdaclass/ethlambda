@@ -4,27 +4,31 @@
 
 # Introduction
 
-**ethlambda** is a minimalist, fast and modular implementation of the Lean Ethereum
-consensus client, written in Rust.
+**ethlambda** is a minimalist, fast and modular implementation of a Beacon Chain and
+Lean Chain client, written in Rust.
 
 This book collects the design notes and operator-facing references for ethlambda.
-It is split into four parts:
+It is split into five parts:
 
 - **Design** describes the shape of a running node: the
   [architecture](./architecture.md) of its actors, workers and shared storage,
   and how they are wired together at startup.
-- **Consensus** explains how the chain advances: the
+- **Consensus** explains how the Lean Chain advances: the
   [slot and interval structure](./slots_and_intervals.md) that schedules every
   validator duty, the [3SF-mini](./3sf_mini.md) justification and finalization
   rules, and the [LMD-GHOST](./lmd_ghost.md) fork choice algorithm. These
   documents are implementation-agnostic; ethlambda-specific behaviour is called
   out in blockquotes.
+- **Beacon Chain** covers the Ethereum Beacon Chain side: its
+  [state transition](./beacon_stf.md), the [mainnet wire](./beacon_wire.md),
+  and the [execution layer pairing](./beacon_engine.md).
 - **Operations** documents observable surfaces of a running node:
   [Prometheus metrics](./metrics.md), [checkpoint sync](./checkpoint_sync.md),
   and the [fork choice visualization](./fork_choice_visualization.md) served
   by the API.
 - **Development** collects notes for contributors, starting with the
-  [spec deviations](./spec_deviations.md) where ethlambda departs from leanSpec.
+  [spec deviations](./spec_deviations.md) where ethlambda departs from leanSpec (Lean
+  Chain) or consensus-specs (Beacon Chain).
 
 For build and contribution instructions, see the
 [`README`](https://github.com/lambdaclass/ethlambda/blob/main/README.md) and
@@ -48,7 +52,7 @@ into the rendered output:
 
 ## Related projects
 
-ethlambda is one of several Lean Ethereum consensus clients under active development.
+On the Lean Chain, ethlambda is one of several clients under active development.
 For comparison and cross-client testing:
 
 - [zeam](https://github.com/blockblaz/zeam) (Zig)
