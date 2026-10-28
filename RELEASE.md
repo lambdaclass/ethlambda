@@ -254,8 +254,9 @@ export V=X.Y.Z   # no `v` prefix
 4. In the tap's `Formula/ethlambda.rb`, update the `url`, both `sha256` values
    and the bottle's `root_url`, plus the `rustup toolchain install` version if
    `rust-toolchain.toml` changed. Open a PR: its `Formula CI` installs the
-   formula from the bottle and from source, and `brew test-bot` builds it on
-   Linux and Intel macOS.
+   formula from the bottle and from source on macOS Sonoma, and `brew test-bot`
+   builds it on Linux and on Apple silicon macOS. test-bot skips Intel macOS,
+   which has no `rustup` bottle, so no CI builds the formula there.
 
 ### 7. Merge the release branch
 
