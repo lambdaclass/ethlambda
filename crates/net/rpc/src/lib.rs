@@ -857,10 +857,11 @@ pub(crate) mod test_utils {
     /// Build a beacon store anchored at `anchor_slot`, with a real child block
     /// at `anchor_slot + 1` whose import moves the head for real.
     ///
-    /// `Table::BlockRoots` is written only by `Store::update_checkpoints`
-    /// (see `BlockId::resolve_beacon`'s doc), so a fixture that wants that
-    /// table populated has to move the head through the real API rather than
-    /// poke the backend directly. That is what distinguishes this from
+    /// `Table::BlockRoots` is written only by `Store::index_beacon_anchor`
+    /// and `Store::update_checkpoints`, so a fixture that wants that table
+    /// populated has to index the anchor and move the head through the real
+    /// API, the way `get_forkchoice_store` and an import do, rather than poke
+    /// the backend directly. That is what distinguishes this from
     /// `beacon_test_state`/`beacon_test_block` in `ethlambda_storage::store`'s
     /// own tests, which this otherwise mirrors.
     pub(crate) fn beacon_fixture(anchor_slot: u64) -> BeaconFixture {
@@ -882,6 +883,9 @@ pub(crate) mod test_utils {
         store
             .insert_signed_block(anchor_root, anchor_block)
             .expect("insert anchor block");
+        store
+            .index_beacon_anchor(anchor_root)
+            .expect("index anchor block");
         store
             .insert_state(anchor_root, BeaconState::Phase0(anchor_state))
             .expect("insert anchor state");
