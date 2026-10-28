@@ -848,6 +848,10 @@ cargo run --profile release-fast -p ethlambda --bin ethlambda -- beacon \
   --gossipsub-port 9001
 ```
 
+gossipsub's own warnings, chiefly the send-queue-full line a slow peer earns
+once per heartbeat, are capped at ERROR by default; add
+`libp2p_gossipsub=warn` to `RUST_LOG` to see them.
+
 Within 5 seconds:
 
 ```

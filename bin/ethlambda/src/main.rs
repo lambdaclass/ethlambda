@@ -148,14 +148,47 @@ fn beacon_identity(
     }
 }
 
-/// Node logging: INFO and above, on stdout.
+/// The level the node logs at when `RUST_LOG` says nothing.
+const NODE_LOG_LEVEL: &str = "info";
+
+/// gossipsub's warnings are dropped; only its errors show.
+///
+/// gossipsub warns once per heartbeat for every peer whose send queue is full,
+/// and each line lists every IHAVE id it dropped: a screenful per slow peer on
+/// a beacon node. The drop is already counted in the peer's failed-message
+/// tally and charged to its score, and the crate's other warnings are
+/// per-peer protocol violations (bad signatures, substream limits) that the
+/// scoring handles too, so none of them is an operator's concern.
+const GOSSIPSUB_LOG_CAP: &str = "libp2p_gossipsub=error";
+
+/// Node logging: [`NODE_LOG_LEVEL`] and [`GOSSIPSUB_LOG_CAP`], amended by
+/// `RUST_LOG`, on stdout.
 fn init_node_logging() -> eyre::Result<()> {
-    let filter = EnvFilter::builder()
-        .with_default_directive(tracing::Level::INFO.into())
-        .from_env_lossy();
-    let subscriber = Registry::default().with(tracing_subscriber::fmt::layer().with_filter(filter));
+    let rust_log = std::env::var(EnvFilter::DEFAULT_ENV).ok();
+    let subscriber = Registry::default()
+        .with(tracing_subscriber::fmt::layer().with_filter(node_log_filter(rust_log.as_deref())));
     tracing::subscriber::set_global_default(subscriber)
         .wrap_err("failed to set global tracing subscriber")
+}
+
+/// The node's log filter: [`GOSSIPSUB_LOG_CAP`], then the `RUST_LOG`
+/// directives when there are any, else [`NODE_LOG_LEVEL`].
+///
+/// A `RUST_LOG` directive on a target the defaults name replaces the default
+/// (`libp2p_gossipsub=warn` brings the warnings back), one on any other target
+/// adds to them, and `RUST_LOG` keeps replacing the `info` floor the way
+/// `from_env_lossy` always let it: `RUST_LOG=ethlambda_p2p=debug` alone still
+/// shows nothing else. `EnvFilter` only falls back to a default level when it
+/// was given no directive at all, which is why the floor is spelled out here
+/// rather than passed as the default directive. A bare `RUST_LOG=debug` leaves
+/// the cap in place, since the more specific directive wins; name the crate to
+/// see its chatter.
+fn node_log_filter(rust_log: Option<&str>) -> EnvFilter {
+    let directives = match rust_log.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(rust_log) => format!("{GOSSIPSUB_LOG_CAP},{rust_log}"),
+        None => format!("{NODE_LOG_LEVEL},{GOSSIPSUB_LOG_CAP}"),
+    };
+    EnvFilter::builder().parse_lossy(directives)
 }
 
 /// Benchmark logging: WARN and above, on stderr, so that the report owns stdout
@@ -2274,6 +2307,82 @@ mod tests {
     use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use ethlambda_types::genesis::GenesisValidatorEntry;
     use ethlambda_types::state::PUBLIC_KEY_SIZE;
+
+    /// Emits one event per (target, level) of interest under a subscriber
+    /// built from `node_log_filter(rust_log)` and returns what got written.
+    fn logged_with(rust_log: Option<&str>) -> String {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("sink lock").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let sink = Sink::default();
+        let writer = sink.clone();
+        let subscriber = Registry::default().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .with_filter(node_log_filter(rust_log)),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: "libp2p_gossipsub::behaviour", "gossipsub-warn");
+            tracing::error!(target: "libp2p_gossipsub::behaviour", "gossipsub-error");
+            tracing::info!(target: "ethlambda_p2p", "p2p-info");
+            tracing::debug!(target: "ethlambda_p2p", "p2p-debug");
+        });
+        let bytes = sink.0.lock().expect("sink lock").clone();
+        String::from_utf8(bytes).expect("log output is UTF-8")
+    }
+
+    /// With no `RUST_LOG`, the node logs at INFO except for gossipsub's
+    /// warnings, which are the send-queue-full flood; its errors still show.
+    #[test]
+    fn node_logging_drops_gossipsub_warnings_by_default() {
+        let out = logged_with(None);
+        assert!(out.contains("p2p-info"), "INFO floor missing: {out}");
+        assert!(
+            out.contains("gossipsub-error"),
+            "gossipsub errors must survive: {out}"
+        );
+        assert!(
+            !out.contains("gossipsub-warn"),
+            "gossipsub warnings leaked: {out}"
+        );
+        assert!(
+            !out.contains("p2p-debug"),
+            "DEBUG leaked at the INFO floor: {out}"
+        );
+    }
+
+    /// A `RUST_LOG` directive on the capped target replaces the cap, while
+    /// its other directives are honored as before.
+    #[test]
+    fn rust_log_lifts_the_gossipsub_cap_and_keeps_its_other_directives() {
+        let out = logged_with(Some("info,libp2p_gossipsub=warn,ethlambda_p2p=debug"));
+        assert!(out.contains("gossipsub-warn"), "cap not lifted: {out}");
+        assert!(out.contains("p2p-debug"), "other directive dropped: {out}");
+    }
+
+    /// `RUST_LOG` without an `info` of its own replaces the floor, as
+    /// `from_env_lossy` always did, and the cap stays in place.
+    #[test]
+    fn rust_log_without_a_floor_still_replaces_it() {
+        let out = logged_with(Some("ethlambda_p2p=debug"));
+        assert!(out.contains("p2p-debug"), "{out}");
+        assert!(!out.contains("gossipsub-warn"), "cap lost: {out}");
+    }
 
     /// The duty subnet is the first explicitly assigned subnet, so an operator
     /// can place co-located aggregators on different subnets deliberately.
