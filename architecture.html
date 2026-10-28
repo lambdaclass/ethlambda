@@ -8,7 +8,7 @@
 
         <!-- Custom HTML head -->
 
-        <meta name="description" content="Minimalist, fast and modular implementation of the Lean Ethereum client written in Rust">
+        <meta name="description" content="Minimalist, fast and modular implementation of a Beacon Chain and Lean Chain client written in Rust">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-c3d33808.js";
+            window.path_to_searchindex_js = "searchindex-9d2d1f8a.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -191,6 +191,11 @@ request/response, peer bookkeeping and long-range sync.</li>
 </ul>
 <p>Everything else hangs off those two: an aggregation worker on a blocking thread, the libp2p
 swarm loop on its own task, and the axum servers that expose the node to the outside world.</p>
+<p>This page describes the Lean Chain node, <code>ethlambda node</code>. <code>ethlambda beacon</code> runs the
+same two actors over its own <code>Store</code>, but its chain actor (<code>BlockChain::spawn_beacon</code>) has
+no validator keys, no aggregator role and no duties for the sync gate to hold back: it
+imports blocks and runs the Beacon Chain’s fork choice. <a href="./beacon_wire.html">The mainnet wire</a>
+and <a href="./beacon_stf.html">Beacon Chain state transition</a> cover that side.</p>
 <blockquote>
 <p>Note: for what a genserver is, read <a href="https://blog.lambdaclass.com/introducing-spawned-erlang-style-actors-for-rust/">this blogpost on the <code>spawned</code> crate</a>.</p>
 </blockquote>

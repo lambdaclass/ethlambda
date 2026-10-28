@@ -8,7 +8,7 @@
 
         <!-- Custom HTML head -->
 
-        <meta name="description" content="Minimalist, fast and modular implementation of the Lean Ethereum client written in Rust">
+        <meta name="description" content="Minimalist, fast and modular implementation of a Beacon Chain and Lean Chain client written in Rust">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-c3d33808.js";
+            window.path_to_searchindex_js = "searchindex-9d2d1f8a.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -184,26 +184,30 @@
 </p>
 
 <h1 id="introduction"><a class="header" href="#introduction">Introduction</a></h1>
-<p><strong>ethlambda</strong> is a minimalist, fast and modular implementation of the Lean Ethereum
-consensus client, written in Rust.</p>
+<p><strong>ethlambda</strong> is a minimalist, fast and modular implementation of a Beacon Chain and
+Lean Chain client, written in Rust.</p>
 <p>This book collects the design notes and operator-facing references for ethlambda.
-It is split into four parts:</p>
+It is split into five parts:</p>
 <ul>
 <li><strong>Design</strong> describes the shape of a running node: the
 <a href="./architecture.html">architecture</a> of its actors, workers and shared storage,
 and how they are wired together at startup.</li>
-<li><strong>Consensus</strong> explains how the chain advances: the
+<li><strong>Consensus</strong> explains how the Lean Chain advances: the
 <a href="./slots_and_intervals.html">slot and interval structure</a> that schedules every
 validator duty, the <a href="./3sf_mini.html">3SF-mini</a> justification and finalization
 rules, and the <a href="./lmd_ghost.html">LMD-GHOST</a> fork choice algorithm. These
 documents are implementation-agnostic; ethlambda-specific behaviour is called
 out in blockquotes.</li>
+<li><strong>Beacon Chain</strong> covers the Ethereum Beacon Chain side: its
+<a href="./beacon_stf.html">state transition</a>, the <a href="./beacon_wire.html">mainnet wire</a>,
+and the <a href="./beacon_engine.html">execution layer pairing</a>.</li>
 <li><strong>Operations</strong> documents observable surfaces of a running node:
 <a href="./metrics.html">Prometheus metrics</a>, <a href="./checkpoint_sync.html">checkpoint sync</a>,
 and the <a href="./fork_choice_visualization.html">fork choice visualization</a> served
 by the API.</li>
 <li><strong>Development</strong> collects notes for contributors, starting with the
-<a href="./spec_deviations.html">spec deviations</a> where ethlambda departs from leanSpec.</li>
+<a href="./spec_deviations.html">spec deviations</a> where ethlambda departs from leanSpec (Lean
+Chain) or consensus-specs (Beacon Chain).</li>
 </ul>
 <p>For build and contribution instructions, see the
 <a href="https://github.com/lambdaclass/ethlambda/blob/main/README.md"><code>README</code></a> and
@@ -224,7 +228,7 @@ into the rendered output:</p>
 <li><strong>Ecosystem coordination</strong>: the <a href="https://github.com/ethereum/pm/issues?q=is%3Aissue+%22PQ+Interop%22+in%3Atitle">PQ Interop calls</a> on <code>ethereum/pm</code> cover cross-client Lean Ethereum work and related updates; the meeting links are posted on each issue.</li>
 </ul>
 <h2 id="related-projects"><a class="header" href="#related-projects">Related projects</a></h2>
-<p>ethlambda is one of several Lean Ethereum consensus clients under active development.
+<p>On the Lean Chain, ethlambda is one of several clients under active development.
 For comparison and cross-client testing:</p>
 <ul>
 <li><a href="https://github.com/blockblaz/zeam">zeam</a> (Zig)</li>

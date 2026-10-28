@@ -9,7 +9,7 @@
 
         <!-- Custom HTML head -->
 
-        <meta name="description" content="Minimalist, fast and modular implementation of the Lean Ethereum client written in Rust">
+        <meta name="description" content="Minimalist, fast and modular implementation of a Beacon Chain and Lean Chain client written in Rust">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-c3d33808.js";
+            window.path_to_searchindex_js = "searchindex-9d2d1f8a.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -182,26 +182,30 @@
 </p>
 
 <h1 id="introduction"><a class="header" href="#introduction">Introduction</a></h1>
-<p><strong>ethlambda</strong> is a minimalist, fast and modular implementation of the Lean Ethereum
-consensus client, written in Rust.</p>
+<p><strong>ethlambda</strong> is a minimalist, fast and modular implementation of a Beacon Chain and
+Lean Chain client, written in Rust.</p>
 <p>This book collects the design notes and operator-facing references for ethlambda.
-It is split into four parts:</p>
+It is split into five parts:</p>
 <ul>
 <li><strong>Design</strong> describes the shape of a running node: the
 <a href="#architecture">architecture</a> of its actors, workers and shared storage,
 and how they are wired together at startup.</li>
-<li><strong>Consensus</strong> explains how the chain advances: the
+<li><strong>Consensus</strong> explains how the Lean Chain advances: the
 <a href="#slots-and-intervals">slot and interval structure</a> that schedules every
 validator duty, the <a href="#3sf-mini-justification--finalization">3SF-mini</a> justification and finalization
 rules, and the <a href="#-lmd-ghost-fork-choice-algorithm">LMD-GHOST</a> fork choice algorithm. These
 documents are implementation-agnostic; ethlambda-specific behaviour is called
 out in blockquotes.</li>
+<li><strong>Beacon Chain</strong> covers the Ethereum Beacon Chain side: its
+<a href="#beacon-chain-state-transition">state transition</a>, the <a href="#the-mainnet-wire">mainnet wire</a>,
+and the <a href="#the-execution-layer-pairing">execution layer pairing</a>.</li>
 <li><strong>Operations</strong> documents observable surfaces of a running node:
 <a href="#metrics-2">Prometheus metrics</a>, <a href="#checkpoint-sync">checkpoint sync</a>,
 and the <a href="#fork-choice-visualization">fork choice visualization</a> served
 by the API.</li>
 <li><strong>Development</strong> collects notes for contributors, starting with the
-<a href="#spec-deviations">spec deviations</a> where ethlambda departs from leanSpec.</li>
+<a href="#spec-deviations">spec deviations</a> where ethlambda departs from leanSpec (Lean
+Chain) or consensus-specs (Beacon Chain).</li>
 </ul>
 <p>For build and contribution instructions, see the
 <a href="https://github.com/lambdaclass/ethlambda/blob/main/README.md"><code>README</code></a> and
@@ -222,7 +226,7 @@ into the rendered output:</p>
 <li><strong>Ecosystem coordination</strong>: the <a href="https://github.com/ethereum/pm/issues?q=is%3Aissue+%22PQ+Interop%22+in%3Atitle">PQ Interop calls</a> on <code>ethereum/pm</code> cover cross-client Lean Ethereum work and related updates; the meeting links are posted on each issue.</li>
 </ul>
 <h2 id="related-projects"><a class="header" href="#related-projects">Related projects</a></h2>
-<p>ethlambda is one of several Lean Ethereum consensus clients under active development.
+<p>On the Lean Chain, ethlambda is one of several clients under active development.
 For comparison and cross-client testing:</p>
 <ul>
 <li><a href="https://github.com/blockblaz/zeam">zeam</a> (Zig)</li>
@@ -245,6 +249,11 @@ request/response, peer bookkeeping and long-range sync.</li>
 </ul>
 <p>Everything else hangs off those two: an aggregation worker on a blocking thread, the libp2p
 swarm loop on its own task, and the axum servers that expose the node to the outside world.</p>
+<p>This page describes the Lean Chain node, <code>ethlambda node</code>. <code>ethlambda beacon</code> runs the
+same two actors over its own <code>Store</code>, but its chain actor (<code>BlockChain::spawn_beacon</code>) has
+no validator keys, no aggregator role and no duties for the sync gate to hold back: it
+imports blocks and runs the Beacon Chain’s fork choice. <a href="#the-mainnet-wire">The mainnet wire</a>
+and <a href="#beacon-chain-state-transition">Beacon Chain state transition</a> cover that side.</p>
 <blockquote>
 <p>Note: for what a genserver is, read <a href="https://blog.lambdaclass.com/introducing-spawned-erlang-style-actors-for-rust/">this blogpost on the <code>spawned</code> crate</a>.</p>
 </blockquote>
@@ -503,7 +512,7 @@ knows which duty is due. The order is a dependency chain, since each interval co
 what the previous one produced. A duty that overruns its interval is not rescheduled: it
 lands late, and the slot moves on without it.</p>
 <blockquote>
-<p><strong>In ethlambda:</strong> the intervals are the <code>SlotInterval</code> variants in
+<p><strong>In ethlambda’s Lean Chain:</strong> the intervals are the <code>SlotInterval</code> variants in
 <code>crates/blockchain/src/lib.rs</code>. <code>INTERVALS_PER_SLOT</code> is fixed in
 <code>crates/common/types/src/constants.rs</code> (each interval carries a distinct duty, so
 the count is not a knob), while the slot duration is read from the network’s config
@@ -527,7 +536,7 @@ Genesis occupies slot 0, so proposals start at slot 1, and nothing forces a slot
 filled: a proposer that is offline or too slow leaves an empty slot, and the next block
 simply points its parent root at an older block.</p>
 <blockquote>
-<p><strong>In ethlambda:</strong> block proposal is merged into the previous slot’s head-update
+<p><strong>In ethlambda’s Lean Chain:</strong> block proposal is merged into the previous slot’s head-update
 interval: the proposer advances its store to the next slot, builds the block there,
 and holds publication until the slot boundary. That buys the build one extra interval
 of headroom and leaves no actor work at the block-proposal tick itself.</p>
@@ -538,7 +547,7 @@ append to it a <code>(source, target)</code> <a href="#recap-attestation-anatomy
 These votes are in aggregation subnets and are imported by aggregators. Aggregators verify
 the votes in their subnet and store them for later aggregation.</p>
 <blockquote>
-<p><strong>In ethlambda:</strong> a validator’s subnet is <code>validator_index % attestation_committee_count</code>,
+<p><strong>In ethlambda’s Lean Chain:</strong> a validator’s subnet is <code>validator_index % attestation_committee_count</code>,
 and a node only aggregates for subnets it subscribed to at startup. Aggregation is also
 gated on the aggregator role, seeded by <code>--is-aggregator</code> and flippable at runtime
 through the admin API. A chain whose validators all decline the role still gossips votes
@@ -554,7 +563,7 @@ into one proof is the heaviest recurring computation in the client. It is also w
 block affordable, since a block carrying raw votes would need one full XMSS signature per
 voter, quickly going over the network bandwidth limit.</p>
 <blockquote>
-<p><strong>In ethlambda:</strong> the proofs run on an off-thread worker so the blockchain actor’s
+<p><strong>In ethlambda’s Lean Chain:</strong> the proofs run on an off-thread worker so the blockchain actor’s
 message loop stays responsive, and a session may start up to <code>EARLY_AGGREGATION_WINDOW</code>
 before the interval boundary once two thirds of the signatures are in. At the session’s
 soft deadline the actor stops handing out new jobs, but a proof already in flight
@@ -580,9 +589,10 @@ this slot alone. See <a href="#why-staged-promotion">why staged promotion</a> fo
 reasoning.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="3sf-mini-justification--finalization"><a class="header" href="#3sf-mini-justification--finalization">3SF-mini: Justification &amp; Finalization</a></h1>
-<p>ethlambda uses <strong>3SF-mini</strong> (Three-Stage Finality, minimal version) for justification
-and finalization. Unlike the Ethereum Beacon Chain’s epoch-based Casper FFG, 3SF-mini
-operates at the <strong>slot level</strong>: any slot can be justified, not just epoch boundaries.</p>
+<p>ethlambda’s Lean Chain (<code>ethlambda node</code>) uses <strong>3SF-mini</strong> (Three-Stage Finality,
+minimal version) for justification and finalization. Unlike the Ethereum Beacon Chain’s
+epoch-based Casper FFG, which <code>ethlambda beacon</code> follows, 3SF-mini operates at the
+<strong>slot level</strong>: any slot can be justified, not just epoch boundaries.</p>
 <h2 id="quick-example-three-slots-to-finality"><a class="header" href="#quick-example-three-slots-to-finality">Quick Example: Three Slots to Finality</a></h2>
 <p>4 validators, slot N already finalized and justified.</p>
 <pre><code class="language-text">                             source  target
@@ -653,7 +663,7 @@ make this work, and what happens when things go wrong.</p>
 </code></pre>
 <p>The threshold is computed as: <code>3 × vote_count &gt;= 2 × validator_count</code></p>
 <blockquote>
-<p><strong>In ethlambda:</strong> Justification and finalization are processed inside
+<p><strong>In ethlambda’s Lean Chain:</strong> Justification and finalization are processed inside
 <code>process_attestations()</code> in <code>crates/blockchain/state_transition/src/lib.rs</code>,
 called from <code>process_block()</code>. The supermajority check is
 <code>3 * vote_count &gt;= 2 * validator_count</code>.</p>
@@ -672,7 +682,7 @@ called from <code>process_block()</code>. The supermajority check is
 finalized slot. This is the novel part of 3SF-mini.</p>
 <p>A slot is <strong>justifiable</strong> if <code>delta = slot - finalized_slot</code> matches any rule:</p>
 <blockquote>
-<p><strong>In ethlambda:</strong> The function <code>slot_is_justifiable_after(slot, finalized_slot)</code> in
+<p><strong>In ethlambda’s Lean Chain:</strong> The function <code>slot_is_justifiable_after(slot, finalized_slot)</code> in
 <code>crates/blockchain/state_transition/src/lib.rs</code> implements this check. It uses
 <code>isqrt()</code> for perfect square detection and the identity <code>4n(n+1) + 1 = (2n+1)²</code>
 for pronic number detection.</p>
@@ -728,7 +738,7 @@ whose target is the <strong>next justifiable slot</strong>. In other words, ther
 justifiable slots between source and target</strong>: the two must be consecutive entries in
 the justifiability schedule.</p>
 <blockquote>
-<p><strong>In ethlambda:</strong> The <code>try_finalize()</code> function iterates over slots between
+<p><strong>In ethlambda’s Lean Chain:</strong> The <code>try_finalize()</code> function iterates over slots between
 source and target and calls <code>slot_is_justifiable_after</code> on each. If any slot
 is justifiable, finalization fails (source and target aren’t consecutive).
 The check uses <code>original_finalized_slot</code> (the finalized slot at the start of
@@ -857,7 +867,7 @@ time when synchrony is restored.</p>
 <li>Future fork choice runs start from the finalized slot’s successor</li>
 </ul>
 <blockquote>
-<p><strong>In ethlambda:</strong> The <code>justified_slots</code> bitlist uses relative indexing (index 0 =
+<p><strong>In ethlambda’s Lean Chain:</strong> The <code>justified_slots</code> bitlist uses relative indexing (index 0 =
 <code>finalized_slot + 1</code>). When finalization advances, <code>shift_window()</code> in
 <code>crates/blockchain/state_transition/src/justified_slots_ops.rs</code> drops the
 now-finalized prefix. The attestation target is also walked back to the nearest
@@ -889,7 +899,7 @@ behind the head. The attestation <strong>target</strong> is derived by walking b
 toward the safe target (max 3 steps), then to the nearest justifiable slot. See
 <a href="#safe-target-selection">Safe Target Selection</a> for details.</p>
 <blockquote>
-<p><strong>In ethlambda:</strong> <code>get_attestation_target()</code> in <code>crates/blockchain/src/store.rs</code>
+<p><strong>In ethlambda’s Lean Chain:</strong> <code>get_attestation_target()</code> in <code>crates/blockchain/src/store.rs</code>
 implements this walk-back. <code>JUSTIFICATION_LOOKBACK_SLOTS = 3</code> provides a liveness
 guarantee: even if the safe target is stuck, the target eventually advances once
 the head moves far enough ahead.</p>
@@ -1091,8 +1101,10 @@ same whether the network is healthy or partitioned. See
 fork choice algorithm works. LMD-GHOST is the fork choice rule used by Ethereum’s consensus layer
 and its derivatives. Each validator’s <strong>latest attestation</strong> is their single active vote, and the
 algorithm follows the heaviest branch at every fork.</p>
-<p>This document is implementation-agnostic, with ethlambda-specific details called out in
-blockquotes marked <strong>“In ethlambda”</strong>.</p>
+<p>This document is implementation-agnostic, with details of ethlambda’s Lean Chain
+(<code>ethlambda node</code>) called out in blockquotes marked <strong>“In ethlambda’s Lean Chain”</strong>.
+ethlambda’s Beacon Chain follower (<code>ethlambda beacon</code>) runs the consensus-specs fork
+choice instead; see <a href="#fork-choice">its section of the Beacon Chain state transition</a>.</p>
 <blockquote>
 <p>Much of the conceptual framing in this document is inspired by Ben Edgington’s
 <a href="https://eth2book.info/">Eth2 Book</a>, particularly the
@@ -1237,7 +1249,7 @@ the chain.</p>
 </table>
 </div>
 <blockquote>
-<p><strong>In ethlambda:</strong> The function is <code>compute_lmd_ghost_head()</code> in
+<p><strong>In ethlambda’s Lean Chain:</strong> The function is <code>compute_lmd_ghost_head()</code> in
 <code>crates/blockchain/fork_choice/src/lib.rs</code>. The block tree comes from
 the <code>LiveChain</code> storage index, and <code>min_score</code> is 0 for head selection
 or ⌈2V/3⌉ for safe target computation.</p>
@@ -1265,7 +1277,7 @@ effective balance is added instead.</p>
                 └ start_root (not weighted, used as the descent origin)
 </code></pre>
 <blockquote>
-<p><strong>In ethlambda:</strong> All validators have equal weight (+1 per vote). The Ethereum
+<p><strong>In ethlambda’s Lean Chain:</strong> All validators have equal weight (+1 per vote). The Ethereum
 Beacon Chain instead weights votes by effective balance (up to 2048 ETH).</p>
 </blockquote>
 <p>Then, <strong>greedily descend.</strong> Starting from the start root, at each node pick the child
@@ -1435,7 +1447,7 @@ finality gadget (e.g., Casper FFG in the Ethereum Beacon Chain, or <a href="#3sf
     └────────────────────────────────────────────────────┘
 </code></pre>
 <blockquote>
-<p><strong>In ethlambda:</strong> The finality gadget is <a href="#3sf-mini-justification--finalization">3SF-mini</a>, which operates at
+<p><strong>In ethlambda’s Lean Chain:</strong> The finality gadget is <a href="#3sf-mini-justification--finalization">3SF-mini</a>, which operates at
 the slot level rather than epoch boundaries.</p>
 </blockquote>
 <p>The two layers interact: LMD-GHOST runs its greedy descent <strong>starting from the latest
@@ -1455,7 +1467,7 @@ tree.</strong> Without finality, fork choice would need to consider every block 
 and the tree would grow without bound. With finality, all blocks at or before the finalized
 checkpoint can be discarded from the fork choice’s working set.</p>
 <blockquote>
-<p><strong>In ethlambda:</strong> The <code>LiveChain</code> index (the in-memory block tree used by fork choice)
+<p><strong>In ethlambda’s Lean Chain:</strong> The <code>LiveChain</code> index (the in-memory block tree used by fork choice)
 is pruned every time finalization advances, keeping it bounded to only the non-finalized
 portion of the chain.</p>
 </blockquote>
@@ -1483,7 +1495,7 @@ designated moments. This ensures all validators operate on a consistent view.</p
                           fixed points
 </code></pre>
 <blockquote>
-<p><strong>In ethlambda:</strong> The two stages are called “new” and “known” attestations, held in
+<p><strong>In ethlambda’s Lean Chain:</strong> The two stages are called “new” and “known” attestations, held in
 the in-memory <code>new_payloads</code> and <code>known_payloads</code> buffers of the <code>Store</code> respectively.
 Promotion happens at tick intervals 0 (if proposing) and 4 (end of slot).</p>
 </blockquote>
@@ -1595,7 +1607,7 @@ than the current head’s branch.</p>
 operation. They cannot cross a finalization boundary: once a block is finalized, it is
 permanently part of the canonical chain.</p>
 <blockquote>
-<p><strong>In ethlambda:</strong> Reorgs are detected by checking whether the old and new heads
+<p><strong>In ethlambda’s Lean Chain:</strong> Reorgs are detected by checking whether the old and new heads
 share a common prefix, and tracked via Prometheus metrics
 (<code>lean_fork_choice_reorgs_total</code>).</p>
 </blockquote>
@@ -1692,12 +1704,14 @@ at specific intervals:</p>
     └── Run fork choice → update_head()
 </code></pre>
 <h3 id="differences-from-the-ethereum-beacon-chain"><a class="header" href="#differences-from-the-ethereum-beacon-chain">Differences from the Ethereum Beacon Chain</a></h3>
-<p>ethlambda is a lean consensus client with several simplifications compared to the
-Ethereum Beacon Chain:</p>
+<p>Lean consensus simplifies several parts of the Ethereum Beacon Chain’s fork choice. This
+section describes ethlambda’s Lean Chain (<code>ethlambda node</code>); its Beacon Chain follower
+(<code>ethlambda beacon</code>) runs the Beacon Chain’s own fork choice, proposer boost and
+equivocation discounting included.</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Aspect</th><th>ethlambda</th><th>Ethereum Beacon Chain</th></tr>
+<tr><th>Aspect</th><th>Lean Chain</th><th>Ethereum Beacon Chain</th></tr>
 </thead>
 <tbody>
 <tr><td><strong>Vote weight</strong></td><td>Equal: 1 vote per validator</td><td>Proportional to effective balance (up to 32 ETH)</td></tr>
@@ -1710,16 +1724,16 @@ Ethereum Beacon Chain:</p>
 </table>
 </div>
 <p><strong>No proposer boost.</strong> The Beacon Chain adds a “proposer boost”, a temporary weight bonus
-given to newly proposed blocks to prevent balancing attacks. ethlambda does not implement
-this. Instead, proposer fairness is handled through the two-stage attestation pipeline
+given to newly proposed blocks to prevent balancing attacks. The Lean Chain has no such
+boost. Instead, proposer fairness is handled through the two-stage attestation pipeline
 (the proposer’s own attestation enters as “new”, not “known”).</p>
 <p><strong>No balance weighting.</strong> In the Beacon Chain, a validator with 32 ETH of effective balance
-has more fork choice weight than one with 16 ETH. In ethlambda, every validator has exactly
+has more fork choice weight than one with 16 ETH. On the Lean Chain, every validator has exactly
 equal weight (1 vote = 1 unit of weight), simplifying the algorithm and analysis.</p>
 <p><strong>No equivocation discounting.</strong> The Beacon Chain’s fork choice detects validators who
 equivocate (attest to conflicting blocks in the same slot) and excludes their weight. This
 addresses the “nothing at stake” problem where validators can costlessly vote for multiple
-forks. ethlambda does not implement this in its fork choice.</p>
+forks. The Lean Chain’s fork choice does not do this.</p>
 <h3 id="key-files"><a class="header" href="#key-files">Key Files</a></h3>
 <div class="table-wrapper">
 <table>
@@ -5181,8 +5195,8 @@ topics that client asked for; with none, the stream costs nothing.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="metrics-2"><a class="header" href="#metrics-2">Metrics</a></h1>
 <p>We collect various metrics and serve them via a Prometheus-compatible HTTP endpoint at <code>http://&lt;http_address&gt;:&lt;metrics_port&gt;/metrics</code> (default: <code>http://127.0.0.1:5054/metrics</code>).</p>
-<p>A ready-to-use Grafana + Prometheus monitoring stack with pre-configured <a href="https://github.com/leanEthereum/leanMetrics">leanMetrics</a> dashboards is available in <a href="https://github.com/blockblaz/lean-quickstart">lean-quickstart</a>.</p>
-<p>The exposed metrics follow <a href="https://github.com/leanEthereum/leanMetrics/blob/2719baad8351c9ad5eaf3c8621f33fcec20a1dc7/metrics.md">the leanMetrics specification</a>, with some metrics not yet implemented. We have a full list of implemented metrics below, with a checkbox indicating whether each metric is currently supported or not.</p>
+<p>For the Lean Chain, a ready-to-use Grafana + Prometheus monitoring stack with pre-configured <a href="https://github.com/leanEthereum/leanMetrics">leanMetrics</a> dashboards is available in <a href="https://github.com/blockblaz/lean-quickstart">lean-quickstart</a>.</p>
+<p>The Lean Chain’s metrics follow <a href="https://github.com/leanEthereum/leanMetrics/blob/2719baad8351c9ad5eaf3c8621f33fcec20a1dc7/metrics.md">the leanMetrics specification</a>, with some metrics not yet implemented. The Beacon Chain side has no such specification: its own metrics are among the <a href="#custom-metrics-non-leanmetrics">Custom Metrics</a> (the “Beacon” sections and Data Column Sidecars), and the validator client’s are under <a href="#validator-client">Validator client</a>. We have a full list of implemented metrics below, with a checkbox indicating whether each metric is currently supported or not.</p>
 <h2 id="node-info-metrics"><a class="header" href="#node-info-metrics">Node Info Metrics</a></h2>
 <div class="table-wrapper">
 <table>
@@ -6237,7 +6251,9 @@ its payload, and the node never imports past it.</p>
 </tbody>
 </table>
 </div>
-<p>Both endpoints are served on the API port (<code>--api-port</code>, default <code>5052</code>).</p>
+<p>Both endpoints are served on the API port (<code>--api-port</code>, default <code>5052</code>), by <code>ethlambda node</code>
+only: they show the Lean Chain’s fork choice tree, and on <code>ethlambda beacon</code> every <code>/lean/v0</code>
+path returns 404.</p>
 <h2 id="quick-start"><a class="header" href="#quick-start">Quick Start</a></h2>
 <h3 id="local-devnet"><a class="header" href="#local-devnet">Local devnet</a></h3>
 <pre><code class="language-bash">make run-devnet
@@ -7566,13 +7582,13 @@ genesis is therefore tens of minutes, and worth doing once and keeping.</p>
 leanVM operation, far slower. See the aarch64 entry in <code>.cargo/config.toml</code>.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="benchmarking"><a class="header" href="#benchmarking">Benchmarking</a></h1>
-<p><code>ethlambda benchmark</code> measures two things the node does in production, each
-against a reproducible offline workload, with no devnet running:</p>
+<p><code>ethlambda benchmark</code> measures two things the node does in production, one per
+chain, each against a reproducible offline workload, with no devnet running:</p>
 <ul>
-<li><strong><code>synthetic</code></strong>: block building, the way the node performs it when it
-proposes, on a synthetic in-memory chain built for the run.</li>
-<li><strong><code>import</code></strong>: block import, replaying a corpus of real blocks through the
-node’s own import path. See <a href="#import-workload">Import workload</a> below.</li>
+<li><strong><code>synthetic</code></strong>: Lean Chain block building, the way <code>ethlambda node</code> performs
+it when it proposes, on a synthetic in-memory chain built for the run.</li>
+<li><strong><code>import</code></strong>: Beacon Chain block import, replaying a corpus of real blocks
+through <code>ethlambda beacon</code>’s own import path. See <a href="#import-workload">Import workload</a> below.</li>
 </ul>
 <p>Both are otherwise only observable through the Prometheus histograms a live
 node exports. Those are noisy, depend on whatever the network happened to be

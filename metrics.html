@@ -8,7 +8,7 @@
 
         <!-- Custom HTML head -->
 
-        <meta name="description" content="Minimalist, fast and modular implementation of the Lean Ethereum client written in Rust">
+        <meta name="description" content="Minimalist, fast and modular implementation of a Beacon Chain and Lean Chain client written in Rust">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-c3d33808.js";
+            window.path_to_searchindex_js = "searchindex-9d2d1f8a.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -181,8 +181,8 @@
                     <main>
                         <h1 id="metrics"><a class="header" href="#metrics">Metrics</a></h1>
 <p>We collect various metrics and serve them via a Prometheus-compatible HTTP endpoint at <code>http://&lt;http_address&gt;:&lt;metrics_port&gt;/metrics</code> (default: <code>http://127.0.0.1:5054/metrics</code>).</p>
-<p>A ready-to-use Grafana + Prometheus monitoring stack with pre-configured <a href="https://github.com/leanEthereum/leanMetrics">leanMetrics</a> dashboards is available in <a href="https://github.com/blockblaz/lean-quickstart">lean-quickstart</a>.</p>
-<p>The exposed metrics follow <a href="https://github.com/leanEthereum/leanMetrics/blob/2719baad8351c9ad5eaf3c8621f33fcec20a1dc7/metrics.md">the leanMetrics specification</a>, with some metrics not yet implemented. We have a full list of implemented metrics below, with a checkbox indicating whether each metric is currently supported or not.</p>
+<p>For the Lean Chain, a ready-to-use Grafana + Prometheus monitoring stack with pre-configured <a href="https://github.com/leanEthereum/leanMetrics">leanMetrics</a> dashboards is available in <a href="https://github.com/blockblaz/lean-quickstart">lean-quickstart</a>.</p>
+<p>The Lean Chain’s metrics follow <a href="https://github.com/leanEthereum/leanMetrics/blob/2719baad8351c9ad5eaf3c8621f33fcec20a1dc7/metrics.md">the leanMetrics specification</a>, with some metrics not yet implemented. The Beacon Chain side has no such specification: its own metrics are among the <a href="#custom-metrics-non-leanmetrics">Custom Metrics</a> (the “Beacon” sections and Data Column Sidecars), and the validator client’s are under <a href="#validator-client">Validator client</a>. We have a full list of implemented metrics below, with a checkbox indicating whether each metric is currently supported or not.</p>
 <h2 id="node-info-metrics"><a class="header" href="#node-info-metrics">Node Info Metrics</a></h2>
 <div class="table-wrapper">
 <table>

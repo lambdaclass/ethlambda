@@ -8,7 +8,7 @@
 
         <!-- Custom HTML head -->
 
-        <meta name="description" content="Minimalist, fast and modular implementation of the Lean Ethereum client written in Rust">
+        <meta name="description" content="Minimalist, fast and modular implementation of a Beacon Chain and Lean Chain client written in Rust">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-c3d33808.js";
+            window.path_to_searchindex_js = "searchindex-9d2d1f8a.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -180,13 +180,13 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="benchmarking"><a class="header" href="#benchmarking">Benchmarking</a></h1>
-<p><code>ethlambda benchmark</code> measures two things the node does in production, each
-against a reproducible offline workload, with no devnet running:</p>
+<p><code>ethlambda benchmark</code> measures two things the node does in production, one per
+chain, each against a reproducible offline workload, with no devnet running:</p>
 <ul>
-<li><strong><code>synthetic</code></strong>: block building, the way the node performs it when it
-proposes, on a synthetic in-memory chain built for the run.</li>
-<li><strong><code>import</code></strong>: block import, replaying a corpus of real blocks through the
-node’s own import path. See <a href="#import-workload">Import workload</a> below.</li>
+<li><strong><code>synthetic</code></strong>: Lean Chain block building, the way <code>ethlambda node</code> performs
+it when it proposes, on a synthetic in-memory chain built for the run.</li>
+<li><strong><code>import</code></strong>: Beacon Chain block import, replaying a corpus of real blocks
+through <code>ethlambda beacon</code>’s own import path. See <a href="#import-workload">Import workload</a> below.</li>
 </ul>
 <p>Both are otherwise only observable through the Prometheus histograms a live
 node exports. Those are noisy, depend on whatever the network happened to be

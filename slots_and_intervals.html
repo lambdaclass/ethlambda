@@ -8,7 +8,7 @@
 
         <!-- Custom HTML head -->
 
-        <meta name="description" content="Minimalist, fast and modular implementation of the Lean Ethereum client written in Rust">
+        <meta name="description" content="Minimalist, fast and modular implementation of a Beacon Chain and Lean Chain client written in Rust">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-c3d33808.js";
+            window.path_to_searchindex_js = "searchindex-9d2d1f8a.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -216,7 +216,7 @@ knows which duty is due. The order is a dependency chain, since each interval co
 what the previous one produced. A duty that overruns its interval is not rescheduled: it
 lands late, and the slot moves on without it.</p>
 <blockquote>
-<p><strong>In ethlambda:</strong> the intervals are the <code>SlotInterval</code> variants in
+<p><strong>In ethlambda’s Lean Chain:</strong> the intervals are the <code>SlotInterval</code> variants in
 <code>crates/blockchain/src/lib.rs</code>. <code>INTERVALS_PER_SLOT</code> is fixed in
 <code>crates/common/types/src/constants.rs</code> (each interval carries a distinct duty, so
 the count is not a knob), while the slot duration is read from the network’s config
@@ -240,7 +240,7 @@ Genesis occupies slot 0, so proposals start at slot 1, and nothing forces a slot
 filled: a proposer that is offline or too slow leaves an empty slot, and the next block
 simply points its parent root at an older block.</p>
 <blockquote>
-<p><strong>In ethlambda:</strong> block proposal is merged into the previous slot’s head-update
+<p><strong>In ethlambda’s Lean Chain:</strong> block proposal is merged into the previous slot’s head-update
 interval: the proposer advances its store to the next slot, builds the block there,
 and holds publication until the slot boundary. That buys the build one extra interval
 of headroom and leaves no actor work at the block-proposal tick itself.</p>
@@ -251,7 +251,7 @@ append to it a <code>(source, target)</code> <a href="./3sf_mini.html#recap-atte
 These votes are in aggregation subnets and are imported by aggregators. Aggregators verify
 the votes in their subnet and store them for later aggregation.</p>
 <blockquote>
-<p><strong>In ethlambda:</strong> a validator’s subnet is <code>validator_index % attestation_committee_count</code>,
+<p><strong>In ethlambda’s Lean Chain:</strong> a validator’s subnet is <code>validator_index % attestation_committee_count</code>,
 and a node only aggregates for subnets it subscribed to at startup. Aggregation is also
 gated on the aggregator role, seeded by <code>--is-aggregator</code> and flippable at runtime
 through the admin API. A chain whose validators all decline the role still gossips votes
@@ -267,7 +267,7 @@ into one proof is the heaviest recurring computation in the client. It is also w
 block affordable, since a block carrying raw votes would need one full XMSS signature per
 voter, quickly going over the network bandwidth limit.</p>
 <blockquote>
-<p><strong>In ethlambda:</strong> the proofs run on an off-thread worker so the blockchain actor’s
+<p><strong>In ethlambda’s Lean Chain:</strong> the proofs run on an off-thread worker so the blockchain actor’s
 message loop stays responsive, and a session may start up to <code>EARLY_AGGREGATION_WINDOW</code>
 before the interval boundary once two thirds of the signatures are in. At the session’s
 soft deadline the actor stops handing out new jobs, but a proof already in flight
