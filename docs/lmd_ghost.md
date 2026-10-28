@@ -684,10 +684,12 @@ at specific intervals:
 
 ### Differences from the Ethereum Beacon Chain
 
-ethlambda is a lean consensus client with several simplifications compared to the
-Ethereum Beacon Chain:
+Lean consensus simplifies several parts of the Ethereum Beacon Chain's fork choice. This
+section describes ethlambda's Lean Chain (`ethlambda node`); its Beacon Chain follower
+(`ethlambda beacon`) runs the Beacon Chain's own fork choice, proposer boost and
+equivocation discounting included.
 
-| Aspect | ethlambda | Ethereum Beacon Chain |
+| Aspect | Lean Chain | Ethereum Beacon Chain |
 |--------|-----------|----------------------|
 | **Vote weight** | Equal: 1 vote per validator | Proportional to effective balance (up to 32 ETH) |
 | **Proposer boost** | None | Yes: newly proposed blocks get temporary bonus weight |
@@ -697,18 +699,18 @@ Ethereum Beacon Chain:
 | **Slot duration** | 4 seconds (configurable) | 12 seconds |
 
 **No proposer boost.** The Beacon Chain adds a "proposer boost", a temporary weight bonus
-given to newly proposed blocks to prevent balancing attacks. ethlambda does not implement
-this. Instead, proposer fairness is handled through the two-stage attestation pipeline
+given to newly proposed blocks to prevent balancing attacks. The Lean Chain has no such
+boost. Instead, proposer fairness is handled through the two-stage attestation pipeline
 (the proposer's own attestation enters as "new", not "known").
 
 **No balance weighting.** In the Beacon Chain, a validator with 32 ETH of effective balance
-has more fork choice weight than one with 16 ETH. In ethlambda, every validator has exactly
+has more fork choice weight than one with 16 ETH. On the Lean Chain, every validator has exactly
 equal weight (1 vote = 1 unit of weight), simplifying the algorithm and analysis.
 
 **No equivocation discounting.** The Beacon Chain's fork choice detects validators who
 equivocate (attest to conflicting blocks in the same slot) and excludes their weight. This
 addresses the "nothing at stake" problem where validators can costlessly vote for multiple
-forks. ethlambda does not implement this in its fork choice.
+forks. The Lean Chain's fork choice does not do this.
 
 ### Key Files
 
