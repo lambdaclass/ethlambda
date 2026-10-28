@@ -950,6 +950,17 @@ static LEAN_BLOCKS_HELD_FOR_COLUMNS: std::sync::LazyLock<IntGauge> =
         .unwrap()
     });
 
+static LEAN_BEACON_BLOCKS_REFUSED_BEFORE_WAITING_TOTAL: std::sync::LazyLock<IntCounterVec> =
+    std::sync::LazyLock::new(|| {
+        register_int_counter_vec!(
+            "lean_beacon_blocks_refused_before_waiting_total",
+            "Beacon blocks the chain actor refused instead of keeping them waiting, by the \
+             precheck rule they broke and what they would have waited for",
+            &["reason", "wait"]
+        )
+        .unwrap()
+    });
+
 static LEAN_ENVELOPES_AWAITING_BLOCK: std::sync::LazyLock<IntGauge> =
     std::sync::LazyLock::new(|| {
         register_int_gauge!(
@@ -1453,6 +1464,15 @@ pub fn inc_data_column_stored() {
 /// decremented independently of the map it reports on.
 pub fn set_blocks_held_for_columns(count: u64) {
     LEAN_BLOCKS_HELD_FOR_COLUMNS.set(count as i64);
+}
+
+/// A beacon block refused before it waited for its parent or its custody
+/// columns. `reason` is a `PrecheckError` label and `wait` one of `parent`,
+/// `columns`: both are fixed sets, so a block's contents add no label value.
+pub fn inc_beacon_blocks_refused_before_waiting(reason: &'static str, wait: &'static str) {
+    LEAN_BEACON_BLOCKS_REFUSED_BEFORE_WAITING_TOTAL
+        .with_label_values(&[reason, wait])
+        .inc();
 }
 
 /// Execution payload envelopes held until their block is imported.
