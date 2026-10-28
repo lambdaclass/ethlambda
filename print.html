@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-31b61dfe.js";
+            window.path_to_searchindex_js = "searchindex-c3d33808.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -5563,6 +5563,7 @@ samples nothing and publishes no series here.</p>
 <tr><td><code>lean_table_bytes</code></td><td>Gauge</td><td>Estimated byte size of a storage table (key + value bytes)</td><td>After each processed block (one update per table); retains its previous value on empty slots</td><td>table=<code>&lt;table_name&gt;</code></td></tr>
 <tr><td><code>lean_state_write_queue_depth</code></td><td>Gauge</td><td>States handed to the background writer but not yet committed</td><td>On every hand-off and on every commit</td><td></td></tr>
 <tr><td><code>lean_state_write_seconds</code></td><td>Histogram</td><td>Time the background writer spends encoding, diffing and committing one state</td><td>Per state written</td><td></td></tr>
+<tr><td><code>lean_state_cache_lookups_total</code></td><td>Counter</td><td>State cache lookups, by the <code>Store</code> method that made them, the kind of state asked for, and whether the cache held it</td><td>On every <code>get_state</code> (and the writer’s own parent read), <code>has_state</code> and <code>cached_state</code> call</td><td>method=get_state,has_state,cached_state<br>kind=block,checkpoint<br>result=hit,miss</td></tr>
 </tbody>
 </table>
 </div>
@@ -5582,6 +5583,14 @@ three means <code>insert_state</code> blocked on the full channel waiting for th
 and <code>lean_state_write_seconds</code> says whether that time went into the encode or
 the commit. A depth that stays at zero means the writer has nothing
 outstanding.</p>
+<p><strong>Read <code>lean_state_cache_lookups_total</code> per <code>method</code>, not summed.</strong>
+<code>cached_state</code> with <code>kind="block"</code> is gossip validation’s lookup of the voted
+or parent block’s state, made once per attestation and aggregate, so it runs far
+more often than the other two and a summed rate is mostly its own. A <code>get_state</code>
+or <code>has_state</code> miss means the state was not resident and came from the writer’s
+buffer or RocksDB. A <code>cached_state</code> miss with <code>kind="checkpoint"</code> means fork
+choice’s <code>checkpoint_state</code> rebuilt the state, running <code>process_slots</code> up to the
+epoch boundary when the checkpoint’s block precedes it.</p>
 <h3 id="beacon-gossip-validation"><a class="header" href="#beacon-gossip-validation">Beacon Gossip Validation</a></h3>
 <p>Every beacon gossip message gets a verdict before gossipsub forwards it
 (<code>validate_messages()</code> is on for the beacon wire only), <code>beacon_aggregate_and_proof</code>
