@@ -4,6 +4,8 @@ use std::sync::LazyLock;
 
 use ethlambda_metrics::*;
 
+use crate::state_writer::CacheKey;
+
 static LEAN_STATE_WRITE_QUEUE_DEPTH: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!(
         "lean_state_write_queue_depth",
@@ -44,4 +46,58 @@ pub(crate) fn dec_state_write_queue_depth() {
 /// Time one state write; the guard records on drop.
 pub(crate) fn time_state_write() -> TimingGuard {
     TimingGuard::new(&LEAN_STATE_WRITE_SECONDS)
+}
+
+static LEAN_STATE_CACHE_LOOKUPS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "lean_state_cache_lookups_total",
+        "State cache lookups, by the Store method that made them, the kind of state asked \
+         for, and whether the cache held it",
+        &["method", "kind", "result"]
+    )
+    .unwrap()
+});
+
+/// The `Store` method a state-cache lookup was made for.
+///
+/// A label rather than one series, because the callers' rates mean different
+/// things: gossip validation calls `cached_state` once per attestation and
+/// aggregate, far more often than a block is imported, so a single rate would
+/// be dominated by it and hide the import path's misses.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum StateCacheMethod {
+    /// `Store::get_state`, and the writer thread's own parent read, which
+    /// shares its read path (`state_writer::read_state`). A miss falls back
+    /// to the write buffer, then to storage.
+    Get,
+    /// `Store::has_state`. An existence check, so it peeks rather than
+    /// promoting the entry; a miss falls back to the write buffer, then to
+    /// key-existence checks against storage.
+    Has,
+    /// `Store::cached_state`, the memoization lookup fork choice's
+    /// `checkpoint_state` and gossip validation use. A miss is the caller's
+    /// to handle; nothing here falls back to storage.
+    Cached,
+}
+
+impl StateCacheMethod {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Get => "get_state",
+            Self::Has => "has_state",
+            Self::Cached => "cached_state",
+        }
+    }
+}
+
+/// Count one state-cache lookup for `key`, made by `method`.
+pub(crate) fn inc_state_cache_lookups(method: StateCacheMethod, key: &CacheKey, hit: bool) {
+    let kind = match key {
+        CacheKey::BlockState(_) => "block",
+        CacheKey::CheckpointState { .. } => "checkpoint",
+    };
+    let result = if hit { "hit" } else { "miss" };
+    LEAN_STATE_CACHE_LOOKUPS_TOTAL
+        .with_label_values(&[method.label(), kind, result])
+        .inc();
 }
