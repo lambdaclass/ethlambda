@@ -251,12 +251,20 @@ export V=X.Y.Z   # no `v` prefix
      "ethlambda-$V.arm64_sonoma.bottle.tar.gz"
    ```
 
-4. In the tap's `Formula/ethlambda.rb`, update the `url`, both `sha256` values
-   and the bottle's `root_url`, plus the `rustup toolchain install` version if
-   `rust-toolchain.toml` changed. Open a PR: its `Formula CI` installs the
-   formula from the bottle and from source on macOS Sonoma, and `brew test-bot`
-   builds it on Linux and on Apple silicon macOS. test-bot skips Intel macOS,
-   which has no `rustup` bottle, so no CI builds the formula there.
+4. In the tap's `Formula/ethlambda.rb`, update the `url`, both `sha256` values,
+   the bottle's `root_url`, and `VERGEN_GIT_SHA`, plus the `rustup toolchain
+   install` version if `rust-toolchain.toml` changed. A source build has no
+   checkout to read its commit from, so `VERGEN_GIT_SHA` is what its
+   `--version` reports; set it to the tag's abbreviated commit:
+
+   ```bash
+   gh api "repos/lambdaclass/ethlambda/commits/v$V" --jq '.sha[0:7]'
+   ```
+
+   Open a PR: its `Formula CI` installs the formula from the bottle and from
+   source on macOS Sonoma, and fails if either `--version` misses that commit.
+   `brew test-bot` builds it on Linux and on Apple silicon macOS. test-bot skips
+   Intel macOS, which has no `rustup` bottle, so no CI builds the formula there.
 
 ### 7. Merge the release branch
 
