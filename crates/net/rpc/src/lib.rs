@@ -202,6 +202,10 @@ pub struct BeaconIdentity {
     pub p2p_addresses: Vec<String>,
     /// discv5 multiaddrs, likewise.
     pub discovery_addresses: Vec<String>,
+    /// The `MetaData` the p2p layer answers peers with, read per request
+    /// since its sequence number and `syncnets` change at runtime. `None`
+    /// without a beacon p2p layer, which leaves `metadata` all-zero.
+    pub metadata: Option<ethlambda_network_api::MetaDataController>,
 }
 
 /// What the Beacon API's endpoints reach beyond the store.

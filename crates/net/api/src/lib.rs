@@ -1,3 +1,4 @@
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use ethlambda_types::{
@@ -468,6 +469,50 @@ pub trait RpcToP2P: Send + Sync {
         &self,
         message: PayloadAttestationMessage,
     ) -> Result<(), ActorError>;
+}
+
+// --- Shared state: P2P -> RPC ---
+
+/// The beacon `MetaData` this node answers its peers with.
+///
+/// The two bitfields are kept as their SSZ bytes, which is also what the
+/// Beacon API's `/eth/v1/node/identity` reports (hex-encoded), so a reader
+/// needs neither the subnet counts nor the bitvector types.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AdvertisedMetaData {
+    pub seq_number: u64,
+    /// `attnets`: the attestation subnets this node serves.
+    pub attnets: Vec<u8>,
+    /// `syncnets`: the sync committee subnets this node serves.
+    pub syncnets: Vec<u8>,
+}
+
+/// Shared, runtime-readable copy of the node's [`AdvertisedMetaData`].
+///
+/// The p2p layer is the sole writer: it publishes whenever the `MetaData` it
+/// answers peers with changes, which is also every time it bumps
+/// `seq_number`. Read paths outside it, the Beacon API's
+/// `/eth/v1/node/identity` in particular, clone the handle and read the
+/// current value, so that endpoint reports what peers are told rather than a
+/// copy taken at startup.
+#[derive(Clone, Debug, Default)]
+pub struct MetaDataController {
+    metadata: Arc<RwLock<AdvertisedMetaData>>,
+}
+
+impl MetaDataController {
+    /// Publish the current `MetaData`.
+    pub fn set(&self, metadata: AdvertisedMetaData) {
+        *self.metadata.write().expect("metadata lock poisoned") = metadata;
+    }
+
+    /// Read the current `MetaData`.
+    pub fn get(&self) -> AdvertisedMetaData {
+        self.metadata
+            .read()
+            .expect("metadata lock poisoned")
+            .clone()
+    }
 }
 
 // --- Init messages ---

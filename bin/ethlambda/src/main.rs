@@ -145,6 +145,7 @@ fn beacon_identity(
             format!("/{family}/{ip}/tcp/{gossipsub_port}/p2p/{peer_id}"),
         ],
         discovery_addresses: vec![format!("/{family}/{ip}/udp/{discovery_port}/p2p/{peer_id}")],
+        metadata: None,
     }
 }
 
@@ -768,13 +769,16 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         } => ethlambda_rpc::CustodyColumns(custody_columns.clone()),
         ChainActor::Lean(..) => ethlambda_rpc::CustodyColumns::default(),
     };
-    let rpc_identity = beacon_identity(
-        p2p.local_enr().unwrap_or_default(),
-        common.discovery.advertise_ip,
-        common.gossipsub_port,
-        common.discovery.port,
-        &local_peer_id,
-    );
+    let rpc_identity = ethlambda_rpc::BeaconIdentity {
+        metadata: p2p.local_metadata(),
+        ..beacon_identity(
+            p2p.local_enr().unwrap_or_default(),
+            common.discovery.advertise_ip,
+            common.gossipsub_port,
+            common.discovery.port,
+            &local_peer_id,
+        )
+    };
     // Block production builds its payloads with the same execution client the
     // chain actor validates them with.
     let rpc_engine = match &setup.chain {

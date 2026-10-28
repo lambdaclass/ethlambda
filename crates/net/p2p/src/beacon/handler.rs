@@ -7,9 +7,11 @@
 //! [`build_status`] and [`build_metadata`] for the bodies they cannot construct
 //! themselves.
 
+use ethlambda_network_api::AdvertisedMetaData;
 use ethlambda_storage::Store;
 use ethlambda_types::beacon::primitives::Root;
 use libp2p::PeerId;
+use libssz::SszEncode;
 use tracing::debug;
 
 use super::messages::{
@@ -148,6 +150,16 @@ pub fn build_metadata(wire: &BeaconWire, protocol: &str) -> Option<BeaconMetaDat
     }
 }
 
+/// The fields of [`build_metadata`]'s answer that the Beacon API's
+/// `/eth/v1/node/identity` reports, computed the same way so the two agree.
+pub(crate) fn advertised_metadata(wire: &BeaconWire) -> AdvertisedMetaData {
+    AdvertisedMetaData {
+        seq_number: wire.metadata_seq_number,
+        attnets: attnets(wire).to_ssz(),
+        syncnets: syncnets(wire).to_ssz(),
+    }
+}
+
 /// The `attnets` bitfield for this node's backbone subscription.
 ///
 /// A subnet id past the bitfield's width is dropped rather than wrapped: the
@@ -254,6 +266,7 @@ mod tests {
             genesis_time: 1_606_824_023,
             genesis_validators_root: Root::ZERO,
             metadata_seq_number: 0,
+            metadata: Default::default(),
             custody_columns: Vec::new(),
             attestation_subnets: Vec::new(),
             sync_committee_subnets: Default::default(),

@@ -38,7 +38,7 @@ use std::{
 
 use either::Either;
 use ethlambda_network_api::{
-    FetchRequest, InitBlockChain, P2PToBlockChainRef,
+    FetchRequest, InitBlockChain, MetaDataController, P2PToBlockChainRef,
     block_chain_to_p2p::{
         CheckDataColumnSidecars, FetchBlock, PublishAggregatedAttestation, PublishAttestation,
         PublishBlock,
@@ -1099,7 +1099,7 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
                 &beacon.config,
                 beacon.genesis_validators_root,
             );
-            Wire::Beacon(Box::new(beacon::BeaconWire {
+            let wire = beacon::BeaconWire {
                 fork_digest: beacon.fork_digest,
                 fork: beacon.fork,
                 schedule,
@@ -1112,7 +1112,10 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
                 custody_columns: beacon.custody_columns,
                 attestation_subnets: beacon.attestation_subnets,
                 sync_committee_subnets: std::collections::BTreeMap::new(),
-            }))
+                metadata: MetaDataController::default(),
+            };
+            wire.publish_metadata();
+            Wire::Beacon(Box::new(wire))
         }
     };
 
@@ -1132,6 +1135,9 @@ pub struct P2P {
     /// This node's ENR as published at startup, for the Beacon API's
     /// `/eth/v1/node/identity`. `None` when discovery is disabled.
     local_enr: Option<String>,
+    /// The beacon `MetaData` this node answers peers with, for the same
+    /// endpoint. `None` on a lean wire, which has no `MetaData`.
+    local_metadata: Option<MetaDataController>,
 }
 
 impl P2P {
@@ -1189,6 +1195,7 @@ impl P2P {
             .wire
             .beacon()
             .map(|beacon| beacon::scoring::PeerScoring::new(&beacon.config, beacon.fork_digest));
+        let local_metadata = built.wire.beacon().map(|beacon| beacon.metadata.clone());
 
         let server = P2PServer {
             swarm_handle,
@@ -1276,7 +1283,11 @@ impl P2P {
             .send(p2p_protocol::AdvanceForkSchedule)
             .inspect_err(|err| warn!(%err, "Could not schedule the fork schedule"));
         spawn_listener(handle.context(), swarm_stream.map(WrappedSwarmEvent));
-        Ok(P2P { handle, local_enr })
+        Ok(P2P {
+            handle,
+            local_enr,
+            local_metadata,
+        })
     }
 
     pub fn actor_ref(&self) -> &ActorRef<P2PServer> {
@@ -1289,6 +1300,12 @@ impl P2P {
     /// disabled, since then no ENR is published.
     pub fn local_enr(&self) -> Option<&str> {
         self.local_enr.as_deref()
+    }
+
+    /// A live view of the beacon `MetaData` this node answers peers with,
+    /// updated whenever it changes. `None` on a lean wire.
+    pub fn local_metadata(&self) -> Option<MetaDataController> {
+        self.local_metadata.clone()
     }
 }
 

@@ -843,7 +843,10 @@ state. A slot the store holds nothing at is still a `404`.
 node's QUIC, TCP and discv5 multiaddrs. The multiaddrs need
 `--discovery.advertise-ip`, since a node bound to `0.0.0.0` does not know the
 address peers reach it on; without the flag they are empty and the ENR carries
-no IP. `metadata` is still a placeholder.
+no IP. `metadata` is the `MetaData` the node answers peers with over req/resp,
+read at request time, so `syncnets` and `seq_number` follow the sync committee
+subnets a validator client asks for. That `seq_number` versions `MetaData`
+alone: the p2p specification counts it separately from the ENR's `seq`.
 
 ### `GET /eth/v1/events`
 
