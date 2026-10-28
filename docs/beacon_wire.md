@@ -281,7 +281,7 @@ scoring P3 there would penalize every mesh peer for this node's own gap. All
 64 attestation subnets get parameters, not just the backbone ones, because
 aggregator duties join others at runtime.
 
-Two differences from lighthouse:
+Three differences from lighthouse:
 
 - `mesh_n` is this node's `D` (8), not lighthouse's 5. It only enters the
   first-message-delivery cap.
@@ -299,6 +299,17 @@ Two differences from lighthouse:
   follower it reported `synced` through a 10-minute catch-up up to 98 slots
   behind, since its network-stall rule reads a lagging freshest-known block
   as a stalled network.
+- **Leaving a topic waits out the peers' backoff.** Gossipsub's default
+  backoff after unsubscribing (10 s) is shorter than its prune backoff
+  (60 s), and a rust-libp2p peer that sees a mesh peer unsubscribe backs off
+  from it for the longer one, which the leaver's PRUNE cannot shorten. An
+  aggregator subnet left when its duty expires and rejoined within that
+  window for the next one (a duty in the last slots of epoch N, none in N+1,
+  one in N+2) re-grafts into peers that reject the graft and charge a
+  behaviour penalty. `PRUNE_BACKOFF` sets both backoffs to the prune value,
+  so the node waits out the same window and is not penalized. Neither
+  consensus-specs nor lighthouse sets these: the spec defers gossipsub v1.1's
+  extra parameters, and lighthouse keeps the defaults.
 
 The block, aggregate and attestation parameters depend on the active
 validator count, so the p2p actor rebuilds them every slot from the head's

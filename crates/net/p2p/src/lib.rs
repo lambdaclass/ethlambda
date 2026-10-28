@@ -817,6 +817,20 @@ pub enum SwarmBuildError {
 /// [`beacon::scoring::ScoreSettings`].
 pub(crate) const MESH_N: usize = 8;
 
+/// How long gossipsub waits before grafting a peer again after either side
+/// pruned the other, and, for this node, after leaving a topic before grafting
+/// into it again.
+///
+/// The two are the same on purpose. A rust-libp2p peer (another ethlambda,
+/// lighthouse) that sees a mesh peer unsubscribe backs off from it for its own
+/// prune backoff, and the shorter one carried by the leaver's PRUNE cannot
+/// shorten that. With gossipsub's shorter default for leaving, rejoining a topic
+/// inside that window sends grafts every such peer rejects and penalizes, so
+/// the mesh stays empty either way and the node pays a behaviour penalty for
+/// it. Leaving an aggregator subnet at the end of a duty and rejoining it for
+/// one two epochs later does exactly that.
+const PRUNE_BACKOFF: Duration = Duration::from_secs(60);
+
 /// The gossipsub parameters both wires share.
 ///
 /// `mesh_n` 8, low 6, high 12, the 700ms heartbeat, and the 6/3 history already
@@ -846,6 +860,8 @@ pub(crate) fn gossipsub_config(
         .fanout_ttl(Duration::from_secs(60))
         .history_length(6)
         .history_gossip(3)
+        .prune_backoff(PRUNE_BACKOFF)
+        .unsubscribe_backoff(PRUNE_BACKOFF)
         .duplicate_cache_time(seen_ttl)
         .validation_mode(ValidationMode::Anonymous)
         .message_id_fn(compute_message_id)
@@ -3357,6 +3373,15 @@ mod tests {
         let ttl = Duration::from_secs(1);
         assert!(gossipsub_config(ttl, true).validate_messages());
         assert!(!gossipsub_config(ttl, false).validate_messages());
+    }
+
+    #[test]
+    fn rejoining_a_topic_waits_out_the_backoff_peers_apply_to_a_leaver() {
+        // Lighthouse leaves gossipsub's prune backoff at its default.
+        let peers_backoff = libp2p::gossipsub::Config::default().prune_backoff();
+        let config = gossipsub_config(Duration::from_secs(1), true);
+        assert!(config.unsubscribe_backoff() >= peers_backoff);
+        assert!(config.unsubscribe_backoff() >= config.prune_backoff());
     }
 
     /// How many times [`concurrent_beacon_requests_on_different_protocols_never_cross`]
