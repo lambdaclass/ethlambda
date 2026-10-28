@@ -15,15 +15,112 @@ Minimalist, fast and modular implementation of a Beacon Chain and Lean Chain cli
 Follows Ethereum mainnet from a checkpoint-synced anchor and serves the
 standard Beacon API on port 5052, paired with an
 [ethrex](https://github.com/lambdaclass/ethrex) execution client that validates
-each block's execution payload. Both run from pre-built images
-(`ghcr.io/lambdaclass/ethlambda:latest` and `ghcr.io/lambdaclass/ethrex`), so
-only [Docker](https://www.docker.com/get-started) is needed. To run the release
-binary without Docker, see
-[Running from a release binary](#running-from-a-release-binary) below.
+each block's execution payload. Both ship release binaries for Linux (x86_64,
+aarch64) and macOS (Apple silicon): ethlambda's are listed under
+[Releases](#releases) below and ethrex's on
+[its releases page](https://github.com/lambdaclass/ethrex/releases/latest).
+To run both from pre-built Docker images instead, see
+[Running with Docker](#running-with-docker) below.
 
 > **Warning:** this uses a lot of disk. ethrex needs at least 500 GB for
 > mainnet (1 TB recommended; see its
 > [hardware requirements](https://docs.ethrex.xyz/getting-started/hardware_requirements.html)).
+
+```sh
+# Pick the assets for your platform: linux-x86_64, linux-aarch64 or macos-aarch64
+curl -LO https://github.com/lambdaclass/ethlambda/releases/latest/download/ethlambda-linux-x86_64
+curl -LO https://github.com/lambdaclass/ethrex/releases/latest/download/ethrex-linux-x86_64
+chmod +x ethlambda-linux-x86_64 ethrex-linux-x86_64
+mv ethlambda-linux-x86_64 ethlambda && mv ethrex-linux-x86_64 ethrex
+./ethlambda --version && ./ethrex --version
+
+mkdir -p beacon-data ethrex-data
+# A persisted key keeps the node's identity, and so its custody set, stable across restarts
+openssl rand -hex 32 > beacon-data/node-key
+# The secret both clients authenticate the Engine API with
+openssl rand -hex 32 > jwt.hex
+
+# In one terminal: ethrex, serving the Engine API on 127.0.0.1:8551
+./ethrex \
+  --network           mainnet \
+  --datadir           ethrex-data \
+  --authrpc.jwtsecret jwt.hex
+
+# In another: the beacon node
+./ethlambda beacon \
+  --network                mainnet \
+  --checkpoint-sync-url    https://beaconstate.ethstaker.cc \
+  --node-key               beacon-data/node-key \
+  --data-dir               beacon-data/db \
+  --discovery.advertise-ip "$(curl -s https://ifconfig.me)" \
+  --execution-endpoint     http://127.0.0.1:8551 \
+  --execution-jwt-secret   jwt.hex
+```
+
+`--discovery.advertise-ip` is the address published in the node's ENR. Without
+it the node advertises `0.0.0.0` and logs a warning. It still dials out and
+follows the chain, but peers cannot reach it until discovery learns the address
+from their replies. The Beacon API binds `127.0.0.1:5052` by default, so
+`--http-address` is only needed to reach it from another host. Stop the node
+with `Ctrl+C`; it shuts down gracefully on SIGINT only, so a systemd unit needs
+`KillSignal=SIGINT`.
+
+- `ethlambda-linux-x86_64` targets x86-64-v3, so it needs a CPU with AVX2
+  (Haswell or later), and glibc 2.35 or newer.
+- The macOS binaries are not notarized. A browser download is quarantined, which
+  `xattr -d com.apple.quarantine <file>` lifts; a `curl` download is not.
+- [`RELEASE.md`](./RELEASE.md#verifying-a-release) shows how to verify an
+  ethlambda binary's provenance attestation.
+
+To run the consensus layer only, drop ethrex, the JWT secret and the two
+`--execution-*` flags. The node then follows the chain without validating
+execution payloads. It cannot serve a validator client, since it answers
+attestation data, aggregation and block production requests with `503`.
+
+The first start downloads the finalized state (several hundred MB) and logs
+`Beacon checkpoint sync complete`, then a few minutes of
+`Block parent missing, storing as pending` before `Block imported successfully`
+lines start. Later starts resume from `beacon-data/db`.
+
+ethrex logs `No messages from the consensus layer` until the beacon node's
+first fork choice update, then starts snap sync. Until that finishes, which
+takes hours on mainnet, ethrex answers each payload `SYNCING` and the beacon
+node imports blocks optimistically.
+
+Check progress from another terminal:
+
+```sh
+curl -s localhost:5052/eth/v1/node/syncing
+```
+
+The node has caught up once `sync_distance` (the chain's current slot minus
+`head_slot`) is near 0. Don't rely on `is_syncing` yet: it currently reads
+`false` during catch-up as well.
+
+For Sepolia or Hoodi, change `--network mainnet` to `--network sepolia` or
+`--network hoodi` in both the ethrex and the beacon node arguments, and point
+`--checkpoint-sync-url` at that network's provider. See
+[`ethlambda beacon`](#ethlambda-beacon--the-ethereum-beacon-chain) below for
+the remaining flags.
+
+`--network plataberget` (the Glamsterdam testnet) is built in as well. It has
+run Gloas since its `GLOAS_FORK_EPOCH`, which the node follows: a Gloas
+checkpoint anchor is accepted, payload envelopes are fetched and imported, and
+the validator-client endpoints serve Gloas duties, the payload envelope and the
+payload timeliness vote included.
+
+The same binary runs [`ethlambda node`](#ethlambda-node--the-lean-consensus-chain)
+and [`ethlambda validator`](#ethlambda-validator--the-validator-client); their
+flags are below.
+
+### Running with Docker
+
+The same two nodes from pre-built images (`ghcr.io/lambdaclass/ethlambda:latest`
+and `ghcr.io/lambdaclass/ethrex`), so only
+[Docker](https://www.docker.com/get-started) is needed. Follow the logs with
+`docker logs -f ethlambda-beacon` and `docker logs -f ethrex`. For another
+network, change `--network mainnet` in both containers' arguments, not Docker's
+own `--network ethereum`.
 
 ```sh
 docker pull ghcr.io/lambdaclass/ethlambda:latest
@@ -34,7 +131,7 @@ mkdir -p beacon-data ethrex-data
 openssl rand -hex 32 > beacon-data/node-key
 # The secret both clients authenticate the Engine API with
 openssl rand -hex 32 > jwt.hex
-# This host's public address, published in the node's ENR (see below)
+# This host's public address, published in the node's ENR (see above)
 PUBLIC_IP=$(curl -s https://ifconfig.me)
 
 # A private network, so the beacon node reaches ethrex's Engine API by name
@@ -71,11 +168,8 @@ docker run -d --name ethlambda-beacon --network ethereum --stop-signal SIGINT \
 <details>
 <summary>Running without an execution client</summary>
 
-To run the consensus layer only, drop ethrex, the shared network, the JWT secret
-and the two `--execution-*` flags. The node then follows the chain without
-validating execution payloads. It cannot serve a validator client, since it
-answers attestation data, aggregation and block production requests with
-`503`:
+The consensus layer only, as described above: no ethrex, no shared network, no
+JWT secret and no `--execution-*` flags.
 
 ```sh
 docker pull ghcr.io/lambdaclass/ethlambda:latest
@@ -83,7 +177,7 @@ docker pull ghcr.io/lambdaclass/ethlambda:latest
 mkdir -p beacon-data
 # A persisted key keeps the node's identity, and so its custody set, stable across restarts
 openssl rand -hex 32 > beacon-data/node-key
-# This host's public address, published in the node's ENR (see below)
+# This host's public address, published in the node's ENR (see above)
 PUBLIC_IP=$(curl -s https://ifconfig.me)
 
 # The node shuts down gracefully on SIGINT only, so this makes `docker stop` flush its state
@@ -101,93 +195,6 @@ docker run -d --name ethlambda-beacon --stop-signal SIGINT \
 ```
 
 </details>
-
-`--discovery.advertise-ip` is the address published in the node's ENR. Behind
-Docker's port mapping the node cannot see its own public address, so without
-the flag it advertises `0.0.0.0` and logs a warning. It still dials out and
-follows the chain, but peers cannot reach it until discovery learns the address
-from their replies.
-
-Follow the logs with `docker logs -f ethlambda-beacon`. The first start
-downloads the finalized state (several hundred MB) and logs
-`Beacon checkpoint sync complete`, then a few minutes of
-`Block parent missing, storing as pending` before `Block imported successfully`
-lines start. Later starts resume from `beacon-data/db`.
-
-ethrex logs `No messages from the consensus layer` until the beacon node's
-first fork choice update, then starts snap sync (`docker logs -f ethrex`).
-Until that finishes, which takes hours on mainnet, ethrex answers each payload
-`SYNCING` and the beacon node imports blocks optimistically.
-
-Check progress from another terminal:
-
-```sh
-curl -s localhost:5052/eth/v1/node/syncing
-```
-
-The node has caught up once `sync_distance` (the chain's current slot minus
-`head_slot`) is near 0. Don't rely on `is_syncing` yet: it currently reads
-`false` during catch-up as well.
-
-For Sepolia or Hoodi, change `--network mainnet` to `--network sepolia` or
-`--network hoodi` in both the ethrex and the beacon node arguments (not Docker's
-own `--network ethereum`), and point `--checkpoint-sync-url` at that network's
-provider. See
-[`ethlambda beacon`](#ethlambda-beacon--the-ethereum-beacon-chain) below for
-the remaining flags.
-
-`--network plataberget` (the Glamsterdam testnet) is built in as well. It has
-run gloas since its `GLOAS_FORK_EPOCH`, which the node follows: a gloas
-checkpoint anchor is accepted, payload envelopes are fetched and imported, and
-the validator-client endpoints serve gloas duties, the payload envelope and the
-payload timeliness vote included.
-
-### Running from a release binary
-
-Every release attaches binaries for Linux (x86_64, aarch64) and macOS (Apple
-silicon); see [Releases](#releases) below. This is the beacon node from the
-quickstart above, run from one of them, with ethrex already listening on
-`127.0.0.1:8551`:
-
-```sh
-# Pick the asset for your platform: ethlambda-linux-x86_64, ethlambda-linux-aarch64 or ethlambda-macos-aarch64
-curl -LO https://github.com/lambdaclass/ethlambda/releases/latest/download/ethlambda-linux-x86_64
-chmod +x ethlambda-linux-x86_64 && mv ethlambda-linux-x86_64 ethlambda
-./ethlambda --version
-
-mkdir -p beacon-data
-# A persisted key keeps the node's identity, and so its custody set, stable across restarts
-openssl rand -hex 32 > beacon-data/node-key
-# The secret both clients authenticate the Engine API with; pass ethrex the same file
-openssl rand -hex 32 > jwt.hex
-
-./ethlambda beacon \
-  --network                mainnet \
-  --checkpoint-sync-url    https://beaconstate.ethstaker.cc \
-  --node-key               beacon-data/node-key \
-  --data-dir               beacon-data/db \
-  --discovery.advertise-ip "$(curl -s https://ifconfig.me)" \
-  --execution-endpoint     http://127.0.0.1:8551 \
-  --execution-jwt-secret   jwt.hex
-```
-
-Drop the two `--execution-*` flags to follow the chain without an execution
-client, with the limits described above. The Beacon API binds `127.0.0.1:5052`
-by default, so `--http-address` is only needed to reach it from another host.
-`--discovery.advertise-ip` still applies: without it the node advertises
-`0.0.0.0`. Stop the node with `Ctrl+C`; it shuts down gracefully on SIGINT
-only, so a systemd unit needs `KillSignal=SIGINT`.
-
-- `ethlambda-linux-x86_64` targets x86-64-v3, so it needs a CPU with AVX2
-  (Haswell or later), and glibc 2.35 or newer.
-- The macOS binary is not notarized. A browser download is quarantined, which
-  `xattr -d com.apple.quarantine <file>` lifts; a `curl` download is not.
-- [`RELEASE.md`](./RELEASE.md#verifying-a-release) shows how to verify a
-  binary's provenance attestation.
-
-The same binary runs [`ethlambda node`](#ethlambda-node--the-lean-consensus-chain)
-and [`ethlambda validator`](#ethlambda-validator--the-validator-client); their
-flags are below.
 
 ### Lean consensus devnet
 
@@ -231,8 +238,8 @@ cargo build --release
 ```
 
 [`docs/cli.md`](./docs/cli.md) is the full flag reference for every sub-command,
-`benchmark` and `replay-era` included. A
-[release binary](#running-from-a-release-binary) takes the same arguments.
+`benchmark` and `replay-era` included. The
+[quickstart](#beacon-chain-follower) runs a release binary with the same arguments.
 
 #### `ethlambda node` — the Lean consensus chain
 
@@ -318,14 +325,15 @@ endpoints.
 #### `ethlambda validator` — the validator client
 
 A separate process that holds the keys and performs the duties: attestations,
-block proposals, aggregation, sync committee messages and, from gloas on, the
+block proposals, aggregation, sync committee messages and, from Gloas on, the
 payload envelope and the payload timeliness vote. It talks to a beacon node over
 the standard Beacon API, so it works against `ethlambda beacon` (run with the
 `--execution-*` flags) or any other conformant beacon node.
 
-> **Warning:** the validator client keeps no slashing-protection record. Do not
-> run the same keys in another client while this one runs, and treat a restart
-> with the same care as a manual key move. Read
+> **Warning:** the validator client keeps no slashing-protection record yet.
+> Slashing protection is a work in progress and will be added soon. Until then,
+> do not run the same keys in another client while this one runs, and treat a
+> restart with the same care as a manual key move. Read
 > [Spec deviations](./docs/spec_deviations.md#the-validator-client-keeps-no-slashing-protection-record)
 > before using keys that hold real stake. The client repeats this warning at
 > startup.
