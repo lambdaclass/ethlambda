@@ -25,16 +25,13 @@ spawned-concurrency.workspace = true
 futures = "0.3"
 tokio-stream = "0.1"
 
-# Fork with request-response feature for outbound protocol selection
-libp2p = { git = "https://github.com/lambdaclass/rust-libp2p.git", rev = "2f14d0ec9665a01cfb6a02326c90628c4bba521c", features = [
-    "full",
-] }
+libp2p = { version = "0.57.1", features = ["full"] }
 
 # Mainnet beacon peers refuse a yamux-only muxer proposal, so the TCP transport
 # has to offer mplex too. The libp2p facade dropped its `mplex` re-export when
-# the muxer was deprecated, so it is taken directly from the same pinned tree.
-# See the `muxers` module for the measurement.
-libp2p-mplex = { git = "https://github.com/lambdaclass/rust-libp2p.git", rev = "2f14d0ec9665a01cfb6a02326c90628c4bba521c" }
+# the muxer was deprecated, so it is taken directly, at the release that
+# libp2p's own dev-dependency names. See the `muxers` module for the measurement.
+libp2p-mplex = "0.44.0"
 
 snap = "1.1"
 

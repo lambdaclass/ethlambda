@@ -626,9 +626,24 @@ pub(crate) struct Behaviour {
     /// connection the swarm never had (libp2p/rust-libp2p#4773, #4870).
     connection_limits: libp2p::connection_limits::Behaviour,
     identify: libp2p::identify::Behaviour,
-    gossipsub: libp2p::gossipsub::Behaviour,
+    gossipsub: Gossipsub,
     req_resp: ReqResp,
 }
+
+/// Gossipsub with no cap on how many topics a peer may subscribe to.
+///
+/// libp2p-gossipsub 0.50 made `MaxCountSubscriptionFilter` the default, with
+/// upstream limits of 100 topics per peer and per RPC, and a peer over either
+/// limit has its whole subscription RPC ignored. A mainnet beacon peer
+/// custodying every column subscribes to all `DATA_COLUMN_SIDECAR_SUBNET_COUNT`
+/// column subnets alone, and every peer doubles its topic set around a
+/// fork-digest rollover, so that default would leave such peers out of every
+/// mesh. Naming `AllowAllSubscriptionFilter` keeps the behaviour this node had
+/// before the default changed.
+pub(crate) type Gossipsub = libp2p::gossipsub::Behaviour<
+    libp2p::gossipsub::IdentityTransform,
+    libp2p::gossipsub::AllowAllSubscriptionFilter,
+>;
 
 /// No connection limits, which is what the lean network has always run with: a
 /// devnet's peer count is bounded by the size of the devnet itself, so a cap
@@ -851,7 +866,10 @@ pub(crate) fn gossipsub_config(
         .message_id_fn(compute_message_id)
         // Taken from ream
         .max_transmit_size(MAX_COMPRESSED_PAYLOAD_SIZE)
-        .max_messages_per_rpc(Some(500))
+        // Since libp2p-gossipsub 0.50, an RPC over this limit fails to decode
+        // and its inbound stream is closed; earlier releases processed
+        // messages up to the limit and dropped the rest.
+        .max_publish_messages(500)
         .allow_self_origin(true)
         .idontwant_message_size_threshold(1000);
     if validate_messages {
@@ -901,7 +919,7 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
     };
 
     let validate_messages = matches!(wire, WireConfig::Beacon(_));
-    let mut gossipsub = libp2p::gossipsub::Behaviour::new(
+    let mut gossipsub = Gossipsub::new(
         MessageAuthenticity::Anonymous,
         gossipsub_config(seen_ttl, validate_messages),
     )
@@ -2165,7 +2183,7 @@ async fn handle_swarm_event(
 ///
 /// Deliberately exhaustive, with no wildcard arm: `handle_swarm_event`'s own
 /// catch-all would otherwise silently swallow a `BehaviourEvent` variant this
-/// function forgot to name, for the same reason the fork's own `DialError`
+/// function forgot to name, for the same reason libp2p's `DialError`
 /// conversion is matched exhaustively (see `DialOutcome`'s `From` impl in
 /// `swarm_adapter.rs`). Adding a fifteenth [`ReqResp`] field forces this to
 /// grow an arm rather than falling through unnoticed.
@@ -3378,12 +3396,12 @@ mod tests {
     /// own protocol's framing, never swapped.
     ///
     /// Before the per-protocol split, both requests travelled through one
-    /// shared `req_resp: request_response::Behaviour<Codec>` field via the fork's
-    /// `send_request_with_protocol`, which only narrows the *offered*
-    /// protocol per call; the outbound `Handler` still pairs a negotiated
-    /// substream with the *next unpaired* queued request
-    /// (`requested_outbound.pop_front()` in the pinned fork's
-    /// `protocols/request-response/src/handler.rs`), which is the send
+    /// shared `req_resp: request_response::Behaviour<Codec>` field via the
+    /// since-dropped lambdaclass libp2p fork's `send_request_with_protocol`,
+    /// which only narrows the *offered* protocol per call; the outbound
+    /// `Handler` still pairs a negotiated substream with the *next unpaired*
+    /// queued request (`requested_outbound.pop_front()` in
+    /// libp2p-request-response's `src/handler.rs`), which is the send
     /// order only when negotiation happens to complete in send order too.
     /// When it doesn't, `write_request` is handed the wrong (protocol,
     /// request) pair: a `Status` value written under the `metadata/3`
