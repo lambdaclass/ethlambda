@@ -1,12 +1,12 @@
 # Benchmarking
 
-`ethlambda benchmark` measures two things the node does in production, each
-against a reproducible offline workload, with no devnet running:
+`ethlambda benchmark` measures two things the node does in production, one per
+chain, each against a reproducible offline workload, with no devnet running:
 
-- **`synthetic`**: block building, the way the node performs it when it
-  proposes, on a synthetic in-memory chain built for the run.
-- **`import`**: block import, replaying a corpus of real blocks through the
-  node's own import path. See [Import workload](#import-workload) below.
+- **`synthetic`**: Lean Chain block building, the way `ethlambda node` performs
+  it when it proposes, on a synthetic in-memory chain built for the run.
+- **`import`**: Beacon Chain block import, replaying a corpus of real blocks
+  through `ethlambda beacon`'s own import path. See [Import workload](#import-workload) below.
 
 Both are otherwise only observable through the Prometheus histograms a live
 node exports. Those are noisy, depend on whatever the network happened to be

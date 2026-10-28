@@ -27,7 +27,8 @@ It is split into five parts:
   and the [fork choice visualization](./fork_choice_visualization.md) served
   by the API.
 - **Development** collects notes for contributors, starting with the
-  [spec deviations](./spec_deviations.md) where ethlambda departs from leanSpec.
+  [spec deviations](./spec_deviations.md) where ethlambda departs from leanSpec (Lean
+  Chain) or consensus-specs (Beacon Chain).
 
 For build and contribution instructions, see the
 [`README`](https://github.com/lambdaclass/ethlambda/blob/main/README.md) and

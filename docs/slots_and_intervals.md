@@ -33,7 +33,7 @@ knows which duty is due. The order is a dependency chain, since each interval co
 what the previous one produced. A duty that overruns its interval is not rescheduled: it
 lands late, and the slot moves on without it.
 
-> **In ethlambda:** the intervals are the `SlotInterval` variants in
+> **In ethlambda's Lean Chain:** the intervals are the `SlotInterval` variants in
 > `crates/blockchain/src/lib.rs`. `INTERVALS_PER_SLOT` is fixed in
 > `crates/common/types/src/constants.rs` (each interval carries a distinct duty, so
 > the count is not a knob), while the slot duration is read from the network's config
@@ -59,7 +59,7 @@ Genesis occupies slot 0, so proposals start at slot 1, and nothing forces a slot
 filled: a proposer that is offline or too slow leaves an empty slot, and the next block
 simply points its parent root at an older block.
 
-> **In ethlambda:** block proposal is merged into the previous slot's head-update
+> **In ethlambda's Lean Chain:** block proposal is merged into the previous slot's head-update
 > interval: the proposer advances its store to the next slot, builds the block there,
 > and holds publication until the slot boundary. That buys the build one extra interval
 > of headroom and leaves no actor work at the block-proposal tick itself.
@@ -71,7 +71,7 @@ append to it a `(source, target)` [finality vote](./3sf_mini.md#recap-attestatio
 These votes are in aggregation subnets and are imported by aggregators. Aggregators verify
 the votes in their subnet and store them for later aggregation.
 
-> **In ethlambda:** a validator's subnet is `validator_index % attestation_committee_count`,
+> **In ethlambda's Lean Chain:** a validator's subnet is `validator_index % attestation_committee_count`,
 > and a node only aggregates for subnets it subscribed to at startup. Aggregation is also
 > gated on the aggregator role, seeded by `--is-aggregator` and flippable at runtime
 > through the admin API. A chain whose validators all decline the role still gossips votes
@@ -89,7 +89,7 @@ into one proof is the heaviest recurring computation in the client. It is also w
 block affordable, since a block carrying raw votes would need one full XMSS signature per
 voter, quickly going over the network bandwidth limit.
 
-> **In ethlambda:** the proofs run on an off-thread worker so the blockchain actor's
+> **In ethlambda's Lean Chain:** the proofs run on an off-thread worker so the blockchain actor's
 > message loop stays responsive, and a session may start up to `EARLY_AGGREGATION_WINDOW`
 > before the interval boundary once two thirds of the signatures are in. At the session's
 > soft deadline the actor stops handing out new jobs, but a proof already in flight

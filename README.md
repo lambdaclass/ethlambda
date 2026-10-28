@@ -184,8 +184,8 @@ cargo build --release
 
 #### `ethlambda node` — the Lean consensus chain
 
-This is what the rest of this README is about, and it is the default: a bare
-flag list with no sub-command still runs the node, so existing scripts and
+The [devnet section](#running-in-a-devnet) below runs this sub-command, and it
+is the default: a bare flag list with no sub-command still runs the node, so existing scripts and
 Docker entrypoints keep working unchanged.
 
 It needs a genesis config, a validator registry, a bootnode list and this
