@@ -1284,7 +1284,7 @@ mod tests {
         node: &mut BuiltSwarm,
         peer: &mut BuiltSwarm,
         limit: Duration,
-        done: impl Fn(&libp2p::gossipsub::Behaviour) -> bool,
+        done: impl Fn(&crate::Gossipsub) -> bool,
     ) -> bool {
         let deadline = tokio::time::Instant::now() + limit;
         while tokio::time::Instant::now() < deadline {
@@ -1351,7 +1351,7 @@ mod tests {
             let gossipsub = &mut peer.swarm.behaviour_mut().gossipsub;
             gossipsub.subscribe(topic).expect("peer subscribes");
         }
-        let peer_on_both = |gossipsub: &libp2p::gossipsub::Behaviour| {
+        let peer_on_both = |gossipsub: &crate::Gossipsub| {
             gossipsub.all_peers().any(|(id, topics)| {
                 *id == peer_id
                     && topics.contains(&&control.hash())
@@ -1361,7 +1361,7 @@ mod tests {
         let announced =
             poll_until(&mut node, &mut peer, Duration::from_secs(10), peer_on_both).await;
         assert!(announced, "the peer's subscriptions reach the node");
-        let in_mesh = |gossipsub: &libp2p::gossipsub::Behaviour, topic: &IdentTopic| {
+        let in_mesh = |gossipsub: &crate::Gossipsub, topic: &IdentTopic| {
             gossipsub.mesh_peers(&topic.hash()).any(|id| *id == peer_id)
         };
 

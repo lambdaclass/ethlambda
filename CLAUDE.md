@@ -1025,7 +1025,7 @@ behavior.
 - `libssz` / `libssz-derive` / `libssz-types`: SSZ serialization
 - `libssz-merkle`: Merkle tree hashing (`hash_tree_root()`)
 - `spawned-concurrency`: Actor model
-- `libp2p`: P2P networking (custom LambdaClass fork)
+- `libp2p`: P2P networking (upstream crates.io release)
 - `vergen-git2`: Build-time git commit/branch info embedded in binary
 
 **Storage:**

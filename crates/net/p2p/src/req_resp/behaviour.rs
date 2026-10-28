@@ -18,13 +18,12 @@ use crate::{
 ///
 /// A field per id, rather than one field registering every id: a shared
 /// behaviour hands an outbound request to a positional FIFO queue
-/// (`requested_outbound` in the pinned fork's
-/// `protocols/request-response/src/handler.rs`) that is drained in
-/// substream-negotiation order, not send order, so two requests on different
-/// protocols sent back to back on one connection can be matched to each
-/// other's substreams once their negotiations complete out of order. A field
-/// per protocol makes that structurally unreachable: `NetworkBehaviour`'s
-/// derive nests each field's `ConnectionHandler` behind
+/// (`requested_outbound` in libp2p-request-response's `src/handler.rs`) that
+/// is drained in substream-negotiation order, not send order, so two requests
+/// on different protocols sent back to back on one connection can be matched
+/// to each other's substreams once their negotiations complete out of order.
+/// A field per protocol makes that structurally unreachable:
+/// `NetworkBehaviour`'s derive nests each field's `ConnectionHandler` behind
 /// `ConnectionHandlerSelect`, which offers the union of every child's protocol
 /// ids to multistream-select and routes a negotiated substream back to exactly
 /// the one child that offered it (`swarm/src/handler/select.rs`), so each

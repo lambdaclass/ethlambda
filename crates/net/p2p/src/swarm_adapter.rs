@@ -87,7 +87,7 @@ pub enum DialOutcome {
 
 impl From<&libp2p::swarm::DialError> for DialOutcome {
     /// Matched exhaustively on purpose. `DialError` is not `#[non_exhaustive]`
-    /// in the pinned fork, so a variant added on a fork upgrade breaks the build
+    /// in libp2p-swarm, so a variant added on a libp2p upgrade breaks the build
     /// here and forces a decision, rather than being absorbed by a wildcard as
     /// `Unreachable` — the classification that leaks bookkeeping if it is wrong.
     fn from(err: &libp2p::swarm::DialError) -> Self {
@@ -380,11 +380,10 @@ pub(crate) fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCo
             protocol,
             request_id_tx,
         } => {
-            // Upstream `send_request`, never the fork's own
-            // `send_request_with_protocol`: each field already offers exactly
-            // the one protocol `protocol` names, so pinning to it per call is
-            // no longer needed. Which field is exhaustive on purpose; see
-            // `ReqRespProtocol`'s doc comment.
+            // Plain `send_request`: each field already offers exactly the one
+            // protocol `protocol` names, so there is nothing to pin per call.
+            // Which field is exhaustive on purpose; see `ReqRespProtocol`'s
+            // doc comment.
             let behaviour = &mut swarm.behaviour_mut().req_resp;
             let id = match protocol {
                 ReqRespProtocol::LeanStatus => behaviour.lean_status.send_request(&peer, request),
@@ -439,11 +438,10 @@ pub(crate) fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCo
         SwarmCommand::SendResponse { channel, response } => {
             // `Behaviour::send_response` is a passthrough to the oneshot
             // sender the `ResponseChannel` already carries
-            // (`ch.sender.send(rs)` in the pinned fork, untouched from
-            // upstream); it reads no state of the `Behaviour` instance it is
-            // called on, so any field answers identically. `lean_status` is
-            // picked as a stable, arbitrary anchor rather than routing this by
-            // protocol too.
+            // (`ch.sender.send(rs)` in libp2p-request-response); it reads no
+            // state of the `Behaviour` instance it is called on, so any field
+            // answers identically. `lean_status` is picked as a stable,
+            // arbitrary anchor rather than routing this by protocol too.
             let _ = swarm
                 .behaviour_mut()
                 .req_resp
