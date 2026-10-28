@@ -5,6 +5,7 @@ name: verify-lockfile
 
 on:
   pull_request:
+  merge_group:
   push:
     branches:
       - main
@@ -18,9 +19,9 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@v6.1.0
         with:
           persist-credentials: false
-      - run: gh extension install github/gh-actions-lock --pin v0.2.0
+      - run: gh extension install github/gh-actions-lock --pin v0.4.0
       - run: gh actions-lock --verify
 

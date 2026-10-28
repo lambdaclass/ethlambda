@@ -22,8 +22,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6.1.0
 
+      # Script pinned to a commit and binary to a release, so lint results change only with this file.
       - name: Install actionlint
-        run: bash <(curl -s https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+        run: bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/914e7df21a07ef503a81201c76d2b11c789d3fca/scripts/download-actionlint.bash) 1.7.12
 
+      # actionlint does not parse the lockfile's `uses: $/...` same-repo form yet (rhysd/actionlint#711).
       - name: Run actionlint
-        run: ./actionlint -ignore SC2086
+        run: ./actionlint -ignore SC2086 -ignore 'specifying action "\$/'
