@@ -370,14 +370,10 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         return run_test_driver(rpc_config).await;
     }
 
-    let node_p2p_key = resolve_node_key(common.node_key.as_deref())?;
-
     #[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
     info!("Using jemalloc allocator with heap profiling enabled");
     #[cfg(any(target_env = "msvc", not(feature = "jemalloc")))]
     info!("Using system allocator");
-
-    info!(node_key=?common.node_key, "got node key");
 
     let p2p_socket = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), common.gossipsub_port);
 
@@ -439,6 +435,12 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             .map_err(|err| eyre::eyre!("{err}"))
             .wrap_err_with(|| format!("failed to open RocksDB at {}", data_dir.display()))?,
     );
+
+    // Resolved after the DB open rather than before it, because a generated
+    // key is stored in `data_dir`: RocksDB's lock on that directory is what
+    // stops two processes started on it from both generating a key and racing
+    // to store theirs.
+    let node_p2p_key = resolve_node_key(common.node_key.as_deref(), &data_dir)?;
 
     let clean_checkpoint_urls = checkpoint_sync::clean_urls(&common.checkpoint_sync_url);
 
@@ -606,12 +608,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             // the same computation, so the two cannot disagree about this
             // node's identity.
             let node_id = beacon::beacon_node_id(&node_p2p_key)?;
-            let params = beacon::wire_params(
-                &source,
-                node_id,
-                common.node_key.is_some(),
-                mainnet.custody_group_count,
-            )?;
+            let params = beacon::wire_params(&source, node_id, mainnet.custody_group_count)?;
 
             // Cloned ahead of the move into `WireConfig::Beacon` below: the
             // chain actor needs its own copy to gate fulu import on, the same
@@ -1312,36 +1309,70 @@ fn read_hex_file_bytes(path: impl AsRef<Path>) -> eyre::Result<Vec<u8>> {
         .wrap_err_with(|| format!("failed to decode hex file from {}", path.display()))
 }
 
-/// Resolve a sub-command's node key: read `--node-key` if given, otherwise
-/// generate a fresh secp256k1 key in memory.
+/// Name of the file, inside `--data-dir`, holding the node key generated when
+/// `--node-key` is absent.
+const STORED_NODE_KEY_FILE: &str = "node.key";
+
+/// Resolve a sub-command's node key: read `--node-key` if given, otherwise the
+/// key stored in `data_dir`, generating and storing one first if the directory
+/// has none yet.
 ///
-/// Shared by both sub-commands, since `--node-key` is optional on both. There
-/// is no precedent elsewhere in this binary for writing generated key material
-/// to `--data-dir`, and doing so would need file permissions this repo does
-/// not otherwise establish; keeping it in memory only is the conservative
-/// choice, so a generated identity does not survive a restart.
+/// Shared by both sub-commands, since `--node-key` is optional on both. A
+/// supplied `--node-key` is only read; nothing is written. Without one, the
+/// identity is kept beside the chain data it belongs to, so it survives a
+/// restart: a lean node keeps its `PeerId`, and with it its place in every
+/// peer's scoring and in any ENR its neighbours cached, and a `beacon` node
+/// keeps its custody columns, which are a function of this same node id, so
+/// the sidecars already on disk stay the ones it advertises and serves.
+/// Wiping the data directory resets the identity together with that data.
 ///
-/// The warning below is about `PeerId`/ENR churn, which costs a lean node its
-/// place in every peer's scoring and in any ENR its neighbours cached.
-/// `beacon` has no validator identity to protect, but it is not exempt
-/// either: its custody columns are a function of this same node id, so an
-/// unstable identity there means a different custody set on every restart.
-/// `beacon::wire_params` carries its own, more specific warning about that;
-/// see it for why `beacon` needs a second one.
-fn resolve_node_key(node_key_path: Option<&Path>) -> eyre::Result<Vec<u8>> {
-    match node_key_path {
-        Some(path) => read_hex_file_bytes(path)
-            .wrap_err_with(|| format!("failed to load node key from {}", path.display())),
-        None => {
-            let generated = secp256k1::SecretKey::new(&mut secp256k1::rand::rngs::OsRng);
-            warn!(
-                "No --node-key supplied: generated an ephemeral secp256k1 key in memory for \
-                 this run only. This node's PeerId and ENR will be different on the next \
-                 start; pass --node-key with a persisted key file for a stable identity."
-            );
-            Ok(generated.secret_bytes().to_vec())
-        }
+/// The stored file is hex, the format `--node-key` reads, so it can be passed
+/// as `--node-key` to another run. It is written at mode `0600` on unix
+/// through [`ethlambda_validator::secure_fs::write_private`], and through a
+/// `.tmp` sibling renamed into place, so an interrupted first start leaves no
+/// partial key behind. A stored file that fails to load is an error, never a
+/// cue to generate a replacement, since that would silently discard an
+/// identity that was working.
+fn resolve_node_key(node_key_path: Option<&Path>, data_dir: &Path) -> eyre::Result<Vec<u8>> {
+    if let Some(path) = node_key_path {
+        let key = read_node_key(path)
+            .wrap_err_with(|| format!("failed to load node key from {}", path.display()))?;
+        info!(path = %path.display(), "Loaded the node key from --node-key");
+        return Ok(key);
     }
+
+    let stored = data_dir.join(STORED_NODE_KEY_FILE);
+    let exists = stored
+        .try_exists()
+        .wrap_err_with(|| format!("failed to look for a node key at {}", stored.display()))?;
+    if exists {
+        let key = read_node_key(&stored).wrap_err_with(|| {
+            format!("failed to load the node key stored at {}", stored.display())
+        })?;
+        info!(path = %stored.display(), "Loaded the node key stored in the data directory");
+        return Ok(key);
+    }
+
+    let generated = secp256k1::SecretKey::new(&mut secp256k1::rand::rngs::OsRng).secret_bytes();
+    let contents = format!("{}\n", hex::encode(generated));
+    let temporary = data_dir.join(format!("{STORED_NODE_KEY_FILE}.tmp"));
+    ethlambda_validator::secure_fs::write_private(&temporary, contents)
+        .and_then(|()| std::fs::rename(&temporary, &stored))
+        .wrap_err_with(|| format!("failed to store a node key at {}", stored.display()))?;
+    info!(
+        path = %stored.display(),
+        "No --node-key supplied: generated a node key and stored it in the data directory"
+    );
+    Ok(generated.to_vec())
+}
+
+/// Read a hex node key file, refusing bytes that are not a valid secp256k1
+/// secret key here rather than leaving `build_swarm` to panic on them.
+fn read_node_key(path: &Path) -> eyre::Result<Vec<u8>> {
+    let key = read_hex_file_bytes(path)?;
+    secp256k1::SecretKey::from_slice(&key)
+        .wrap_err("the file does not hold a valid secp256k1 secret key")?;
+    Ok(key)
 }
 
 /// Fetch the initial state for the node.
@@ -3260,50 +3291,106 @@ validators:
         }
     }
 
-    /// A unique path under the OS temp dir, so parallel test runs cannot
-    /// collide on the same file.
-    fn temp_key_path(label: &str) -> std::path::PathBuf {
-        let nanos = SystemTime::UNIX_EPOCH
-            .elapsed()
-            .expect("already past the unix epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("ethlambda-test-node-key-{label}-{nanos}.key"))
-    }
-
     #[test]
-    fn a_supplied_node_key_is_read_verbatim_and_stable_across_calls() {
+    fn a_supplied_node_key_is_read_verbatim_and_nothing_is_stored() {
         // A `PeerId` is a pure function of the key bytes (see
         // `ethlambda_p2p::derive_peer_ids`), so two calls returning the same
         // bytes for the same file is exactly what "the same PeerId across two
         // runs" comes down to, without pulling libp2p's key derivation into
         // this crate's tests.
-        let path = temp_key_path("supplied");
+        let keys = tempfile::tempdir().expect("temp dir");
+        let data_dir = tempfile::tempdir().expect("temp dir");
+        let path = keys.path().join("supplied.key");
         std::fs::write(&path, "01".repeat(32)).expect("temp key file writes");
 
-        let first = resolve_node_key(Some(path.as_path())).expect("reads the supplied key");
-        let second = resolve_node_key(Some(path.as_path())).expect("reads the supplied key");
+        let first = resolve_node_key(Some(&path), data_dir.path()).expect("reads the key");
+        let second = resolve_node_key(Some(&path), data_dir.path()).expect("reads the key");
 
-        let _ = std::fs::remove_file(&path);
+        assert_eq!(first, vec![0x01; 32]);
         assert_eq!(first, second);
+        let entries = std::fs::read_dir(data_dir.path()).expect("data dir reads");
+        assert_eq!(
+            entries.count(),
+            0,
+            "a supplied key must not be copied anywhere"
+        );
     }
 
     #[test]
-    fn a_missing_node_key_generates_a_valid_key_that_differs_from_a_supplied_one() {
-        let path = temp_key_path("baseline");
-        std::fs::write(&path, "01".repeat(32)).expect("temp key file writes");
-        let supplied = resolve_node_key(Some(path.as_path())).expect("reads the supplied key");
-        let _ = std::fs::remove_file(&path);
+    fn a_missing_node_key_is_generated_once_and_reloaded_from_the_data_dir() {
+        let data_dir = tempfile::tempdir().expect("temp dir");
 
-        let generated_a = resolve_node_key(None).expect("generates a key");
-        let generated_b = resolve_node_key(None).expect("generates a key");
-
+        let generated = resolve_node_key(None, data_dir.path()).expect("generates a key");
         // "Accepted": the bytes are a valid secp256k1 secret key, the same
         // check `build_swarm` performs before deriving the swarm identity.
-        secp256k1::SecretKey::from_slice(&generated_a)
+        secp256k1::SecretKey::from_slice(&generated)
             .expect("generated key is a valid secp256k1 secret key");
 
-        assert_ne!(generated_a, supplied);
-        assert_ne!(generated_a, generated_b, "two generations must not collide");
+        let reloaded = resolve_node_key(None, data_dir.path()).expect("reloads the key");
+        assert_eq!(generated, reloaded, "a restart must keep the identity");
+
+        // The stored file is in `--node-key`'s own format, so an operator can
+        // hand it to another run as that flag.
+        let stored = data_dir.path().join(STORED_NODE_KEY_FILE);
+        let other_data_dir = tempfile::tempdir().expect("temp dir");
+        let as_flag = resolve_node_key(Some(&stored), other_data_dir.path())
+            .expect("the stored file reads as --node-key");
+        assert_eq!(generated, as_flag);
+        assert!(
+            !data_dir.path().join("node.key.tmp").exists(),
+            "the temporary sibling is renamed into place"
+        );
+
+        let elsewhere = resolve_node_key(None, other_data_dir.path()).expect("generates a key");
+        assert_ne!(
+            generated, elsewhere,
+            "two data directories must not share a key"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_generated_node_key_is_stored_at_mode_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let data_dir = tempfile::tempdir().expect("temp dir");
+        resolve_node_key(None, data_dir.path()).expect("generates a key");
+
+        let mode = std::fs::metadata(data_dir.path().join(STORED_NODE_KEY_FILE))
+            .expect("the key is stored")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "got {mode:o}");
+    }
+
+    #[test]
+    fn a_stored_node_key_that_fails_to_load_is_an_error_not_a_new_key() {
+        let data_dir = tempfile::tempdir().expect("temp dir");
+        let stored = data_dir.path().join(STORED_NODE_KEY_FILE);
+
+        // Not hex, then hex of the wrong length: neither may be replaced,
+        // since that would silently change the node's identity.
+        for contents in ["not hex", "0102"] {
+            std::fs::write(&stored, contents).expect("writes");
+            let err = resolve_node_key(None, data_dir.path()).expect_err("must refuse the file");
+            assert!(err.to_string().contains(STORED_NODE_KEY_FILE), "{err:#}");
+            assert_eq!(std::fs::read_to_string(&stored).unwrap(), contents);
+        }
+    }
+
+    /// The key is stored in the RocksDB directory itself, after the DB is
+    /// opened, so RocksDB must tolerate a file it did not write there when
+    /// the directory is opened again.
+    #[test]
+    fn rocksdb_reopens_a_data_dir_holding_a_stored_node_key() {
+        let data_dir = tempfile::tempdir().expect("temp dir");
+        let backend = RocksDBBackend::open(data_dir.path()).expect("opens a fresh DB");
+        let generated = resolve_node_key(None, data_dir.path()).expect("generates a key");
+        drop(backend);
+
+        let _backend = RocksDBBackend::open(data_dir.path()).expect("reopens with the key present");
+        let reloaded = resolve_node_key(None, data_dir.path()).expect("reloads the key");
+        assert_eq!(generated, reloaded);
     }
 
     /// Write `contents` to a scratch file and read it back as a bootnode list.

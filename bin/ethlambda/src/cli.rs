@@ -46,10 +46,10 @@ pub(crate) struct CommonOptions {
     /// Hex file holding the secp256k1 key that is this node's libp2p and
     /// discv5 identity.
     ///
-    /// Optional on both sub-commands. When omitted, a fresh key is generated
-    /// in memory at startup (logged as a warning) and used for that run only,
-    /// so the PeerId and ENR differ on the next start. Pass a persisted key
-    /// file for a stable identity.
+    /// Optional on both sub-commands. When omitted, the key stored in
+    /// `--data-dir` as `node.key` is used, and on the directory's first start
+    /// one is generated and stored there (hex, mode `0600`), so the PeerId
+    /// and ENR stay the same across restarts until the directory is wiped.
     #[arg(long)]
     pub(crate) node_key: Option<PathBuf>,
     /// Path to a bootnode list: ENRs, one per YAML entry.
@@ -894,9 +894,10 @@ mod tests {
 
     #[test]
     fn an_absent_node_key_parses_on_both_sub_commands() {
-        // Both generate an ephemeral in-memory key instead (`main`'s
-        // `resolve_node_key`), so neither rejects the argv. On `node` that is
-        // a behavior change: `--node-key` used to be required there.
+        // Both use a key stored in `--data-dir` instead, generating it on
+        // the first start (`main`'s `resolve_node_key`), so neither rejects
+        // the argv. On `node` that is a behavior change: `--node-key` used to
+        // be required there.
         assert_eq!(
             parse_node(without(&base_args(), "--node-key"))
                 .common
