@@ -1,0 +1,115 @@
+# The Commit-Boost check for ethlambda: the same three participants as
+# network_params.yaml, plus `mev_type: commit-boost`, so ethlambda's beacon node
+# and validator client build blocks through a Commit-Boost PBS module. There is
+# no assertoor: the check is scripts/check-builder-blocks.sh, which reads the
+# builder metrics of every ethlambda service. See README.md ("Commit-Boost
+# check") for the steps. The package comes from a clone of
+# lambdaclass/ethereum-package at the commit pinned in
+# .github/workflows/kurtosis_assertoor.yml (COMMIT_BOOST_PACKAGE_REF).
+#
+# Participants, in the order ethereum-package launches them (the order fixes the
+# service names check-builder-blocks.sh reads):
+#   1. lighthouse + geth, lighthouse validator. It has to come first: the first
+#      participant is the network's bootnode, and ethlambda does not report an
+#      ENR over the beacon API.
+#   2. lighthouse + geth, validated by the ethlambda validator client, so the
+#      validator client proposes blinded blocks through a beacon node that is
+#      not ethlambda.
+#   3. ethlambda beacon node + geth, validated by the ethlambda validator client.
+#
+# `mev_type: commit-boost` adds a flashbots mev-boost-relay, a reth-rbuilder
+# builder (with its own lighthouse beacon node) and one Commit-Boost PBS module
+# per participant. The package passes each ethlambda beacon node `--builder` and
+# each ethlambda validator client `--builder-proposals`, which only an image
+# built with the builder support understands. The workflow rewrites the
+# `cl_image` and `vc_image` of the ethlambda entries (selected by type, not
+# position) to the image under test; the values below are what a local run uses.
+# If the battery ever changes `network_id`, the preset or the fork epochs, the
+# explicit Commit-Boost chain under `mev_params` must change with it.
+participants:
+  - el_type: geth
+    cl_type: lighthouse
+  - el_type: geth
+    cl_type: lighthouse
+    vc_type: ethlambda
+    vc_image: ghcr.io/lambdaclass/ethlambda:unstable
+  - el_type: geth
+    cl_type: ethlambda
+    cl_image: ghcr.io/lambdaclass/ethlambda:unstable
+    vc_type: ethlambda
+    vc_image: ghcr.io/lambdaclass/ethlambda:unstable
+network_params:
+  # ethlambda only supports the mainnet preset: 32-slot epochs of 12 s.
+  preset: mainnet
+  # Fulu is the last fork ethlambda processes; gloas stays unscheduled.
+  electra_fork_epoch: 0
+  fulu_fork_epoch: 0
+mev_type: commit-boost
+# rbuilder submits nothing for a block with no transactions, so without a
+# spammer the relay never holds a bid and every getHeader answers 204. The load
+# is kept light on purpose: under spamoor's defaults (a chain-load group plus
+# 200 transfers and 6 blob transactions a slot) the relay's getHeader slowed
+# past Commit-Boost's 950 ms timeout on a local run, so most proposals got no
+# bid. The package also always adds 100 Uniswap swaps a slot, sent to the
+# builder's own execution client; that is not configurable. The blob spammer
+# stays so bids carry blob commitments.
+additional_services:
+  - spamoor
+spamoor_params:
+  # ethpandaops/spamoor:master on 2026-10-27
+  image: ethpandaops/spamoor@sha256:e890785f5814218bbcb544c495820ff7b02dd554e6d714f82849a0ac8de680c5
+  start_chainload: false
+  spammers:
+    - name: "EOA transfers"
+      description: "10 type-2 transfers a slot"
+      scenario: "eoatx"
+      config:
+        throughput: 10
+        max_pending: 20
+        max_wallets: 10
+        base_fee: 20
+    - name: "Blob transactions"
+      description: "1 type-4 transaction a slot with 1 sidecar"
+      scenario: "blob-combined"
+      config:
+        throughput: 1
+        sidecars: 1
+        max_pending: 2
+        max_wallets: 2
+        base_fee: 20
+        blob_fee: 20
+# The package defaults are floating tags (`main`, `develop`, `latest`), so a
+# run would change under us. These pin what the tags pointed to on 2026-10-26;
+# bump them deliberately.
+mev_params:
+  # ethpandaops/mev-boost-relay:main
+  mev_relay_image: ethpandaops/mev-boost-relay@sha256:3600f04fcaf0bbb231f4737470f094fdf2314db54b4853197fa369aea90f8b19
+  # ethpandaops/reth-rbuilder:develop
+  mev_builder_image: ethpandaops/reth-rbuilder@sha256:916ba84da2690e3e368f57da5b0c73bfd919b452de8b95f64895846e0f3a8308
+  # ghcr.io/commit-boost/pbs:latest
+  mev_boost_image: ghcr.io/commit-boost/pbs@sha256:8612c03681d390ab7d0154f5db1581584cd265563b723947da90cd00ba7ca415
+  # Commit-Boost reads the chain from the package's config.yaml by default,
+  # and its parser requires SECONDS_PER_SLOT, which the genesis generator no
+  # longer writes (it writes SLOT_DURATION_MS). So the chain is given
+  # explicitly: kurtosis's defaults for this network (12 s slots, genesis fork
+  # version 0x10000038, fulu from genesis, chain id 3151908 = 0x301824).
+  # chain_id must be a hex string; a bare integer does not parse. The rest is
+  # the package's own template (static_files/mev/commit-boost/cb-config.toml.tmpl).
+  commit_boost_config: |
+    chain = { genesis_time_secs = {{ .Timestamp }}, slot_time_secs = 12, genesis_fork_version = "0x10000038", fulu_fork_slot = 0, chain_id = "0x301824" }
+
+    [pbs]
+    host = "0.0.0.0"
+    port = {{ .Port }}
+
+    {{ range $index, $relay := .Relays }}
+    [[relays]]
+    id = "mev_relay_{{$index}}"
+    url = "{{ $relay }}"
+    {{- end }}
+
+    [logs.stdout]
+    level = "debug"
+
+    [logs.file]
+    enabled=false
