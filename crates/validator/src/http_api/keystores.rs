@@ -147,7 +147,7 @@ pub async fn import(
     if request.slashing_protection.is_some() {
         warn!(
             "Ignoring slashing_protection on import: importing EIP-3076 history is not \
-             supported yet, so every new key starts as never having signed"
+             supported yet, so every new key starts at the current slot and epoch"
         );
     }
 
@@ -212,6 +212,36 @@ pub async fn import(
         prepared.push(prepare_import(&context, &mut definitions, json, password));
     }
 
+    // Every persisted key is registered in the slashing-protection record in
+    // one write, before any of them is loaded: the duty path must never meet a
+    // key with no record. After persisting rather than before, so a key whose
+    // persist failed leaves no record behind to let a hand-copied keystore
+    // past the startup check later. A crash in between leaves a key on disk
+    // with no record, which the next start refuses: closed, not open. Still
+    // under the definitions guard, so a concurrent delete cannot interleave.
+    let persisted: Vec<BlsPubkey> = prepared
+        .iter()
+        .filter_map(|result| result.as_ref().ok().map(|(pubkey, _)| *pubkey))
+        .collect();
+    let now = context.clock.now();
+    let registration = if persisted.is_empty() {
+        Ok(0)
+    } else {
+        crate::slashing_protection::blocking(&context.protection, move |protection| {
+            protection.register(&persisted, now)
+        })
+        .await
+    };
+    if let Ok(registered) = registration
+        && registered > 0
+    {
+        warn!(
+            registered,
+            "Imported validator keys with no slashing-protection history; each starts as if it \
+             had signed at the current slot and epoch"
+        );
+    }
+
     // The definitions file is fully written by this point; nothing below
     // touches it, so the guard can be released before the store lock is
     // taken rather than held across it too.
@@ -220,9 +250,15 @@ pub async fn import(
     let mut store = context.store.write().await;
     let data = prepared
         .into_iter()
-        .map(|result| match result {
-            Ok(secret) => finish_import(&mut store, &secret),
-            Err(status) => status,
+        .map(|result| match (result, &registration) {
+            (Ok((_, secret)), Ok(_)) => finish_import(&mut store, &secret),
+            // Persisted but not registered: not loaded now, and refused at the
+            // next start until it has a record.
+            (Ok(_), Err(err)) => KeyStatus::error(format!(
+                "saved, but not loaded: its slashing-protection record could not be written: \
+                 {err}"
+            )),
+            (Err(status), _) => status,
         })
         .collect();
     drop(store);
@@ -231,13 +267,13 @@ pub async fn import(
 }
 
 /// Decrypt one keystore and persist it to disk: everything an import can do
-/// before it needs the store's write lock.
+/// before it needs the store's write lock and its slashing-protection record.
 fn prepare_import(
     context: &KeymanagerContext,
     definitions: &mut ValidatorDefinitions,
     json: &str,
     password: Option<&str>,
-) -> std::result::Result<Zeroizing<[u8; 32]>, KeyStatus> {
+) -> std::result::Result<(BlsPubkey, Zeroizing<[u8; 32]>), KeyStatus> {
     let Some(password) = password else {
         return Err(KeyStatus::error("no password supplied for this keystore"));
     };
@@ -246,25 +282,6 @@ fn prepare_import(
     let secret = keystore.decrypt(password).map_err(KeyStatus::error)?;
     let pubkey = ValidatorStore::derive_pubkey(&secret).map_err(KeyStatus::error)?;
 
-    // Registered before the key is written to disk or reachable through the
-    // store, so the duty path never meets a key it has no record for, and a
-    // restart finds a record for every key on disk. A key that already has a
-    // record keeps it. The history the request may carry is not imported yet,
-    // so a key arriving from another client starts as never having signed:
-    // see the warning in `import`.
-    let registered = context
-        .protection
-        .lock()
-        .map_err(|_| KeyStatus::error("slashing protection is poisoned"))?
-        .register(&[pubkey])
-        .map_err(KeyStatus::error)?;
-    if registered > 0 {
-        warn!(
-            pubkey = %encode_hex(&pubkey.0),
-            "Imported a validator key with no slashing-protection history"
-        );
-    }
-
     // Persisted before the key is reachable through the store: a validator
     // this process is willing to sign with must already be durable, or a
     // crash right after "imported" is reported silently loses it, with
@@ -272,7 +289,7 @@ fn prepare_import(
     // vanish on the next restart.
     persist_import(context, definitions, &pubkey, json, password).map_err(KeyStatus::error)?;
 
-    Ok(secret)
+    Ok((pubkey, secret))
 }
 
 /// Add an already-decrypted, already-persisted key to the live store. The
@@ -587,6 +604,7 @@ mod tests {
             secrets_dir: dir.to_path_buf(),
             definitions_lock: Arc::new(tokio::sync::Mutex::new(())),
             protection: crate::slashing_protection::SlashingProtection::in_memory(),
+            clock: crate::slot_clock::SlotClock::new(0, 12_000, 3_333, 6_667),
         }
     }
 
@@ -930,9 +948,14 @@ mod tests {
     async fn an_imported_key_is_registered_for_slashing_protection() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = ethlambda_types::beacon::primitives::Root::ZERO;
-        let protection =
-            crate::slashing_protection::SlashingProtection::open(dir.path(), root, &[], false)
-                .expect("opens with no keys");
+        let protection = crate::slashing_protection::SlashingProtection::open(
+            dir.path(),
+            root,
+            &[],
+            false,
+            None,
+        )
+        .expect("opens with no keys");
         let mut context =
             context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
         context.protection = Arc::new(std::sync::Mutex::new(protection));
@@ -958,8 +981,52 @@ mod tests {
         // registered.
         drop(protection);
         let keys = ValidatorStore::load(dir.path()).expect("loads").pubkeys();
-        crate::slashing_protection::SlashingProtection::open(dir.path(), root, &keys, false)
+        crate::slashing_protection::SlashingProtection::open(dir.path(), root, &keys, false, None)
             .expect("the imported key has a record");
+    }
+
+    /// A key that fails to persist must leave no slashing-protection record
+    /// behind: a record would later let the same keystore, copied in by hand,
+    /// past the startup check as if it had been registered on purpose.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_import_leaves_no_slashing_protection_record() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // A symlink at the keystore's path makes `persist_import` refuse.
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, "untouched").expect("writes target");
+        let pubkey = "0x9612d7a727c9d0a22e185a1c768478dfe919cada9266988cb32359c11f2b7b27f4ae4040902382ae2910c15e2b420d07";
+        std::os::unix::fs::symlink(&target, dir.path().join(format!("{pubkey}.json")))
+            .expect("symlinks");
+
+        let root = ethlambda_types::beacon::primitives::Root::ZERO;
+        let protection = crate::slashing_protection::SlashingProtection::open(
+            dir.path(),
+            root,
+            &[],
+            false,
+            None,
+        )
+        .expect("opens with no keys");
+        let mut context =
+            context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
+        context.protection = Arc::new(std::sync::Mutex::new(protection));
+        let protection = context.protection.clone();
+
+        let (_, body) = send(
+            router(context, TOKEN.to_string()),
+            authed(
+                "POST",
+                "/eth/v1/keystores",
+                serde_json::json!({ "keystores": [keystore_json()], "passwords": [PASSWORD] }),
+            ),
+        )
+        .await;
+        assert_eq!(body["data"][0]["status"], "error", "got {body}");
+        assert!(
+            protection.lock().expect("not poisoned").is_empty(),
+            "the failed key must not have been registered"
+        );
     }
 
     #[tokio::test]

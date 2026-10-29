@@ -1,6 +1,6 @@
 //! Helpers for writing files that hold secrets or decide what a validator
 //! signs: the API token, imported keystores and their passwords, and the
-//! validator definitions file.
+//! validator definitions file, and the slashing-protection record.
 //!
 //! `std::fs::write` and `File::create` land at whatever mode the platform
 //! default gives them, `0644` under a standard umask on unix, which makes
@@ -75,6 +75,72 @@ pub(crate) fn write_private_no_symlink(
     std::fs::write(path, contents)
 }
 
+/// Replace the file at `path` with `contents` so that a crash or power loss
+/// leaves either the old file or the new one, never a mixture, and so that a
+/// return of `Ok` means the new one is on disk.
+///
+/// Written to a sibling `.tmp` at mode `0600` (through [`write_private`]'s
+/// rules), flushed, renamed over `path`, and then the directory is flushed so
+/// the rename itself survives. For files whose loss or truncation would change
+/// what a validator signs: the slashing-protection record and the validator
+/// definitions file.
+pub(crate) fn write_private_durably(
+    path: &Path,
+    contents: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    let temporary = path.with_file_name(name);
+
+    let mut file = open_private(&temporary)?;
+    file.write_all(contents.as_ref())?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&temporary, path)?;
+    sync_directory(path.parent().unwrap_or(Path::new(".")))
+}
+
+#[cfg(unix)]
+fn open_private(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_private(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+}
+
+/// `fsync` on the directory, so a rename into it is itself durable. Called
+/// through `libc` rather than `File::sync_all`, which on macOS issues
+/// `F_FULLFSYNC`, a request some filesystems refuse for a directory.
+#[cfg(unix)]
+fn sync_directory(directory: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let directory = std::fs::File::open(directory)?;
+    // SAFETY: the descriptor is owned by `directory`, which outlives the call.
+    if unsafe { libc::fsync(directory.as_raw_fd()) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_directory: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -92,6 +158,25 @@ mod tests {
             .mode();
         assert_eq!(mode & 0o777, 0o600, "got {mode:o}");
         assert_eq!(std::fs::read_to_string(&path).expect("reads"), "shh");
+    }
+
+    #[test]
+    fn write_private_durably_replaces_the_file_at_mode_0600() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("record");
+        write_private_durably(&path, "first").expect("writes");
+        write_private_durably(&path, "second").expect("replaces");
+
+        assert_eq!(std::fs::read_to_string(&path).expect("reads"), "second");
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "got {mode:o}");
+        assert!(
+            !dir.path().join("record.tmp").exists(),
+            "the temporary file is renamed away"
+        );
     }
 
     #[test]

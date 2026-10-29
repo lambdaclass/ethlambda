@@ -175,15 +175,19 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         "Validator client starting"
     );
 
+    let clock = SlotClock::from_config(genesis.genesis_time, &spec);
+
     // After the beacon node names the chain, which the record must belong to,
     // and before any service that signs exists. Every loaded key must already
-    // have a record, unless the operator said otherwise.
+    // have a record, unless the operator said otherwise; the clock dates the
+    // records `--init-slashing-protection` creates.
     let keys = store.read().await.pubkeys();
     let protection = slashing_protection::SlashingProtection::open(
         &config.validators_dir,
         genesis.genesis_validators_root,
         &keys,
         config.init_slashing_protection,
+        clock.now(),
     )?;
     info!(
         validators = protection.len(),
@@ -192,7 +196,6 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     );
     let protection = Arc::new(std::sync::Mutex::new(protection));
 
-    let clock = SlotClock::from_config(genesis.genesis_time, &spec);
     let context = Arc::new(SigningContext {
         config: spec,
         genesis_validators_root: genesis.genesis_validators_root,
@@ -220,6 +223,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             secrets_dir: config.secrets_dir.clone(),
             definitions_lock: Arc::new(Mutex::new(())),
             protection: protection.clone(),
+            clock: clock.clone(),
         };
         let router = http_api::router(context, token);
         let listener = tokio::net::TcpListener::bind(address)
