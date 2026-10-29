@@ -1,4 +1,4 @@
-.PHONY: help fmt lint bench update cooldown-check docker-build shadow-build shadow-docker-build run-devnet test test-consensus test-node test-beacon test-beacon-mainnet test-beacon-minimal consensus-spec-tests cryptography-specs docs docs-deps docs-serve
+.PHONY: help fmt lint bench update cooldown-check docker-build shadow-build shadow-docker-build run-devnet test test-consensus test-node test-beacon test-beacon-mainnet test-beacon-minimal consensus-spec-tests cryptography-specs docs docs-deps docs-serve slashing-protection-interchange-tests
 
 help: ## 📚 Show help for each of the Makefile recipes
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
@@ -38,7 +38,7 @@ test: test-consensus test-node ## 🧪 Run all tests
 test-consensus: leanSpec/fixtures ## 🧪 Run the consensus half of the workspace suite
 	$(TEST) $(addprefix -p ,$(CONSENSUS_CRATES))
 
-test-node: leanSpec/fixtures ## 🧪 Run the node half of the workspace suite
+test-node: leanSpec/fixtures slashing-protection-interchange-tests ## 🧪 Run the node half of the workspace suite
 	$(TEST) --workspace $(addprefix --exclude ,$(CONSENSUS_CRATES))
 
 # --lib as well as the spec target: the BLS and KZG modules keep their fixture
@@ -209,6 +209,33 @@ $(CRYPTOGRAPHY_SPECS_STAMP):
 	echo "Downloading BLS/KZG test vectors ($(CRYPTOGRAPHY_SPECS_VERSION))"; \
 	curl -L -f -o "$$tmpdir/tests.zip" "$(CRYPTOGRAPHY_SPECS_URL)" || exit 1; \
 	unzip -q "$$tmpdir/tests.zip" -d cryptography-specs || exit 1
+	@touch $@
+
+# EIP-3076 slashing-protection interchange test vectors, for the validator
+# client's `slashing_protection` module (crates/validator/tests/
+# interchange_vectors.rs). Pinned, and stamped by version like the fixture trees
+# above, so a bump re-downloads rather than passing against the old cases. The
+# release ships no asset for this tag, so the tag's source archive is fetched
+# and checked against a pinned SHA-256 instead.
+SLASHING_PROTECTION_TESTS_VERSION ?= v5.3.0
+SLASHING_PROTECTION_TESTS_SHA256 ?= 516d551cfb3e50e4ac2f42db0992f4ceb573a7cb1616d727a725c8161485329f
+SLASHING_PROTECTION_TESTS_URL ?= https://github.com/eth-clients/slashing-protection-interchange-tests/archive/refs/tags/$(SLASHING_PROTECTION_TESTS_VERSION).tar.gz
+SLASHING_PROTECTION_TESTS_STAMP=slashing-protection-interchange-tests/.version-$(SLASHING_PROTECTION_TESTS_VERSION)
+
+slashing-protection-interchange-tests: $(SLASHING_PROTECTION_TESTS_STAMP) ## ⬇️ Download the EIP-3076 interchange test vectors
+
+$(SLASHING_PROTECTION_TESTS_STAMP):
+	@rm -rf slashing-protection-interchange-tests
+	@mkdir -p slashing-protection-interchange-tests
+	@tmpdir=$$(mktemp -d); trap 'rm -rf "$$tmpdir"' EXIT; \
+	echo "Downloading EIP-3076 interchange test vectors ($(SLASHING_PROTECTION_TESTS_VERSION))"; \
+	curl -L -f -o "$$tmpdir/tests.tar.gz" "$(SLASHING_PROTECTION_TESTS_URL)" || exit 1; \
+	actual=$$(sha256sum "$$tmpdir/tests.tar.gz" | awk '{print $$1}'); \
+	if [ "$$actual" != "$(SLASHING_PROTECTION_TESTS_SHA256)" ]; then \
+		echo "SHA256 mismatch: expected $(SLASHING_PROTECTION_TESTS_SHA256), got $$actual" >&2; \
+		exit 1; \
+	fi; \
+	tar -xzf "$$tmpdir/tests.tar.gz" -C slashing-protection-interchange-tests --strip-components=1 || exit 1
 	@touch $@
 
 # lambdaclass fork of lean-quickstart: genesis keys come from `ethlambda keygen`, and the
