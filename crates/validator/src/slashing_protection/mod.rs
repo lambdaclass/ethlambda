@@ -29,9 +29,11 @@
 //!
 //! - **A restart.** The record outlives the process; see [`file`] for how it
 //!   is written and why reading it fails closed.
-//! - **A second process.** [`SlashingProtection::open`] takes an exclusive
-//!   lock in the validators directory for the life of the process, so a second
-//!   validator client pointed at the same keys refuses to start.
+//! - **A second process on the same directory.** [`SlashingProtection::open`]
+//!   takes an exclusive lock in the validators directory for the life of the
+//!   process, so a second validator client pointed at that directory refuses
+//!   to start. The lock is per directory, not per key: the same keystore
+//!   copied into a second directory gets a second record and a second lock.
 //! - **Another chain.** The record names the chain's `genesis_validators_root`
 //!   and is refused for any other.
 //! - **A backward clock step or a duty schedule replaced mid-epoch**, the two
@@ -40,7 +42,9 @@
 //! It cannot see keys running in another client on another machine: no record
 //! kept here can. A key moved here from elsewhere must bring its history with
 //! it, which is why a key with no record is refused at startup unless the
-//! operator says otherwise (see [`SlashingProtection::open`]).
+//! operator says otherwise, and why a key registered with no history starts at
+//! the current slot and epoch rather than as never having signed (see
+//! [`Record::seeded`]).
 
 pub mod file;
 
@@ -50,6 +54,7 @@ use std::sync::{Arc, Mutex};
 
 use ethlambda_types::beacon::containers::shared::AttestationData;
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, Root, Slot};
+use ethlambda_types::beacon::signing::compute_epoch_at_slot;
 use tracing::warn;
 
 use crate::beacon_node::dto::encode_hex;
@@ -58,10 +63,35 @@ use crate::error::{Error, Result};
 /// The handle the duty services and the keymanager share.
 ///
 /// A `std::sync::Mutex`: every critical section is a lookup, an insert and, on
-/// a change, a file write, with no `.await` inside. Callers on the async duty
-/// path take it inside `spawn_blocking`, so the write does not hold up the
-/// executor.
+/// a change, a file write, with no `.await` inside. Async callers go through
+/// [`blocking`], so neither the write nor waiting for another holder's write
+/// holds up the executor.
 pub type SharedProtection = Arc<Mutex<SlashingProtection>>;
+
+/// Run `operation` on the record on tokio's blocking pool, and wait for it.
+///
+/// Every async caller goes through here, including ones that only read: the
+/// mutex can be held by another caller's write, a full rewrite and two
+/// flushes, and waiting for it on an executor thread would stall whatever else
+/// that thread runs. The error is a reason, for the caller to log.
+///
+/// The operation runs to completion even if the caller is dropped, as a duty
+/// abandoned at its deadline is: that is safe, since a record written for a
+/// message that is then never signed only costs that message.
+pub async fn blocking<T: Send + 'static>(
+    protection: &SharedProtection,
+    operation: impl FnOnce(&mut SlashingProtection) -> Result<T> + Send + 'static,
+) -> std::result::Result<T, String> {
+    let protection = protection.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut protection = protection
+            .lock()
+            .map_err(|_| "slashing protection is poisoned".to_string())?;
+        operation(&mut protection).map_err(|err| err.to_string())
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
 
 /// The highest source and target epoch signed for one validator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +122,29 @@ pub(crate) struct Record {
 }
 
 impl Record {
+    /// The record a key gets when it is registered with no history.
+    ///
+    /// "Never signed" when there is no current slot yet (before genesis,
+    /// nothing can have been signed). Otherwise the current slot and epoch, as
+    /// if a block and an attestation had just been signed there: the key may
+    /// have signed both elsewhere a moment ago, and taking those as signed
+    /// costs at most the rest of the epoch's duties. The source stays at zero,
+    /// since the source a beacon node offers is the justified epoch, which lags
+    /// the current one, and seeding it higher would refuse every attestation
+    /// until justification caught up.
+    fn seeded(now: Option<Slot>) -> Record {
+        let Some(slot) = now else {
+            return Record::default();
+        };
+        Record {
+            block_slot: Some(slot),
+            attestation: Some(Signed {
+                source: 0,
+                target: compute_epoch_at_slot(slot),
+            }),
+        }
+    }
+
     fn check_block(&self, slot: Slot) -> std::result::Result<(), Refusal> {
         match self.block_slot {
             Some(signed) if slot <= signed => Err(Refusal::SlotNotAdvanced {
@@ -233,15 +286,17 @@ impl SlashingProtection {
     /// `genesis_validators_root`, and hold its lock until this is dropped.
     ///
     /// Every key in `keys` must already have a record. A key without one is
-    /// refused unless `init` is set, in which case it is registered as never
-    /// having signed: the operator's statement that this key has not signed
-    /// anything on this chain that the record should know about. A missing file
-    /// is created only on the same terms, or when there are no keys at all.
+    /// refused unless `init` is set, in which case it is registered as of
+    /// `now`, the current slot (see [`Record::seeded`]): the operator's
+    /// statement that this key has signed nothing the record should know about.
+    /// A missing file is created only on the same terms, or when there are no
+    /// keys at all.
     pub fn open(
         validators_dir: &Path,
         genesis_validators_root: Root,
         keys: &[BlsPubkey],
         init: bool,
+        now: Option<Slot>,
     ) -> Result<Self> {
         let lock = file::lock(validators_dir)?;
         let path = validators_dir.join(file::FILE_NAME);
@@ -250,7 +305,7 @@ impl SlashingProtection {
             reason,
         };
 
-        let existed = path.exists();
+        let existed = file::exists(&path)?;
         let mut records = if existed {
             let (stored_root, records) = file::read(&path)?;
             if stored_root != genesis_validators_root {
@@ -275,9 +330,9 @@ impl SlashingProtection {
             let first = encode_hex(&missing[0].0);
             return Err(refused(format!(
                 "{} validator key(s) have no slashing-protection record (first: {first}). \
-                 Import their history from the client that last ran them, or, only if they \
-                 have not signed anything for at least two epochs, start once with \
-                 --init-slashing-protection",
+                 Start once with --init-slashing-protection only once they have signed \
+                 nothing anywhere for at least two epochs: stop the client that last ran \
+                 them and wait",
                 missing.len()
             )));
         }
@@ -287,11 +342,11 @@ impl SlashingProtection {
                 "Registering a validator with no slashing-protection history \
                  (--init-slashing-protection)"
             );
-            records.insert(*key, Record::default());
+            records.insert(*key, Record::seeded(now));
         }
 
         if !existed || !missing.is_empty() {
-            file::write(&path, genesis_validators_root, &records)?;
+            file::write(&path, genesis_validators_root, records.iter())?;
         }
         Ok(Self {
             genesis_validators_root,
@@ -398,16 +453,17 @@ impl SlashingProtection {
         Ok(verdicts)
     }
 
-    /// Register keys with no record as never having signed, and persist.
+    /// Register keys with no record as of `now`, the current slot (see
+    /// [`Record::seeded`]), and persist them in one write.
     ///
     /// For keys added at runtime through the keymanager API, which loads a key
     /// only after this returns. A key that already has a record keeps it:
     /// registering never lowers a watermark. Returns how many were new.
-    pub fn register(&mut self, pubkeys: &[BlsPubkey]) -> Result<usize> {
+    pub fn register(&mut self, pubkeys: &[BlsPubkey], now: Option<Slot>) -> Result<usize> {
         let new: HashMap<BlsPubkey, Record> = pubkeys
             .iter()
             .filter(|pubkey| !self.records.contains_key(*pubkey))
-            .map(|pubkey| (*pubkey, Record::default()))
+            .map(|pubkey| (*pubkey, Record::seeded(now)))
             .collect();
         let count = new.len();
         if count > 0 {
@@ -420,16 +476,19 @@ impl SlashingProtection {
     /// memory only once the write has succeeded, so a failed write leaves both
     /// exactly as they were.
     fn commit(&mut self, changes: HashMap<BlsPubkey, Record>) -> Result<()> {
-        let Some(storage) = &self.storage else {
-            self.records.extend(changes);
-            return Ok(());
-        };
-        let mut next = self.records.clone();
-        next.extend(changes);
-        let _timing = crate::metrics::time_slashing_protection_write();
-        file::write(&storage.path, self.genesis_validators_root, &next)
-            .inspect_err(|_| crate::metrics::inc_slashing_protection_write_failures())?;
-        self.records = next;
+        if let Some(storage) = &self.storage {
+            // What the record will hold, written without copying it: every
+            // unchanged entry, then the changed ones.
+            let next = self
+                .records
+                .iter()
+                .filter(|(pubkey, _)| !changes.contains_key(*pubkey))
+                .chain(changes.iter());
+            let _timing = crate::metrics::time_slashing_protection_write();
+            file::write(&storage.path, self.genesis_validators_root, next)
+                .inspect_err(|_| crate::metrics::inc_slashing_protection_write_failures())?;
+        }
+        self.records.extend(changes);
         Ok(())
     }
 }
@@ -499,9 +558,20 @@ mod tests {
             .expect("not poisoned")
     }
 
+    /// Opened before genesis, so a key `init` registers starts as never having
+    /// signed; the seeding is tested on its own below.
     fn open(dir: &Path, keys: &[u8], init: bool) -> Result<SlashingProtection> {
         let keys: Vec<BlsPubkey> = keys.iter().map(|byte| pubkey(*byte)).collect();
-        SlashingProtection::open(dir, root(0x42), &keys, init)
+        SlashingProtection::open(dir, root(0x42), &keys, init, None)
+    }
+
+    /// Whether the permission-based failure tests can run: root bypasses
+    /// directory permissions, so as root the write they expect to fail
+    /// succeeds. Docker CI commonly runs as root.
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        // SAFETY: `geteuid` reads a process attribute and cannot fail.
+        unsafe { libc::geteuid() == 0 }
     }
 
     // The rule. Carried over from the in-memory guards this replaces.
@@ -716,7 +786,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         drop(open(dir.path(), &[1], true).expect("init"));
 
-        let err = SlashingProtection::open(dir.path(), root(0x99), &[pubkey(1)], true)
+        let err = SlashingProtection::open(dir.path(), root(0x99), &[pubkey(1)], true, None)
             .expect_err("another genesis_validators_root");
         assert!(err.to_string().contains("another chain"), "{err}");
     }
@@ -778,6 +848,10 @@ mod tests {
     fn a_failed_write_refuses_and_changes_nothing() {
         use std::os::unix::fs::PermissionsExt as _;
 
+        if running_as_root() {
+            eprintln!("skipped: root bypasses directory permissions");
+            return;
+        }
         let dir = tempfile::tempdir().expect("temp dir");
         let mut protection = open(dir.path(), &[1], true).expect("init");
         attest(&mut protection, 1, &data(96, 2, 3, 0xaa)).expect("attest");
@@ -827,12 +901,61 @@ mod tests {
 
         assert_eq!(
             protection
-                .register(&[pubkey(1), pubkey(2)])
+                .register(&[pubkey(1), pubkey(2)], None)
                 .expect("register"),
             1
         );
         assert!(propose(&mut protection, 1, 97).is_err());
         assert!(propose(&mut protection, 2, 97).is_ok());
+    }
+
+    /// A key registered with no history after genesis is taken as having
+    /// signed a block and an attestation at the current slot and epoch: it may
+    /// have done so elsewhere a moment ago.
+    #[test]
+    fn a_key_registered_after_genesis_starts_at_the_current_slot() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // Slot 100 is in epoch 3.
+        let mut protection =
+            SlashingProtection::open(dir.path(), root(0x42), &[pubkey(1)], true, Some(100))
+                .expect("init");
+        protection
+            .register(&[pubkey(2)], Some(100))
+            .expect("register");
+
+        for key in [1, 2] {
+            assert!(propose(&mut protection, key, 100).is_err(), "key {key}");
+            assert!(propose(&mut protection, key, 101).is_ok(), "key {key}");
+            assert!(
+                attest(&mut protection, key, &data(96, 2, 3, 0xaa)).is_err(),
+                "key {key}: the current epoch's target may already be signed"
+            );
+            assert!(
+                attest(&mut protection, key, &data(128, 2, 4, 0xaa)).is_ok(),
+                "key {key}: the next epoch, with a lagging source, is allowed"
+            );
+        }
+    }
+
+    /// A symlink in the record's place, perhaps to a volume that is not
+    /// mounted, must not be taken for "no record" and replaced.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_that_is_not_a_regular_file_fails_closed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(file::FILE_NAME);
+        std::os::unix::fs::symlink(dir.path().join("unmounted/record.json"), &path)
+            .expect("symlinks");
+
+        let err = open(dir.path(), &[], true).expect_err("a dangling symlink");
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .expect("still there")
+                .file_type()
+                .is_symlink(),
+            "the symlink must not have been replaced"
+        );
     }
 
     #[test]

@@ -79,15 +79,16 @@ pub(crate) struct ValidatorOptions {
     #[arg(long, default_value = "false")]
     pub(crate) enable_keymanager: bool,
 
-    /// Register every loaded key that has no slashing-protection record as
-    /// never having signed, instead of refusing to start.
+    /// Register every loaded key that has no slashing-protection record,
+    /// instead of refusing to start.
     ///
     /// DANGEROUS. Use it only for keys that are brand new, or that have signed
-    /// nothing anywhere for at least two epochs. A key that recently signed in
-    /// another client must bring that history instead: starting it here as
-    /// "never signed" can produce a slashable double vote. Keys that already
-    /// have a record keep it, so the flag never lowers one; remove it once the
-    /// keys are registered.
+    /// nothing anywhere for at least two epochs. A key is registered as if it
+    /// had signed a block and an attestation at the current slot and epoch,
+    /// which closes the double-vote window for a key that signed a moment ago
+    /// elsewhere, but not a surround vote against older history. Keys that
+    /// already have a record keep it, so the flag never lowers one; remove it
+    /// once the keys are registered.
     #[arg(long, default_value = "false")]
     pub(crate) init_slashing_protection: bool,
 }

@@ -391,6 +391,10 @@ pub fn inc_attestations_refused() {
     ATTESTATIONS_REFUSED_TOTAL.inc();
 }
 
+pub fn inc_attestations_refused_by(count: u64) {
+    ATTESTATIONS_REFUSED_TOTAL.inc_by(count);
+}
+
 pub fn inc_attestation_deadline_missed() {
     ATTESTATION_DEADLINE_MISSED_TOTAL.inc();
 }

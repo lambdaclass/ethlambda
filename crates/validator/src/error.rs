@@ -72,13 +72,15 @@ pub enum Error {
     /// abandoned attestation itself is never retried, by design.
     #[error("attestation duty for slot {slot} ran past the end of its slot")]
     AttestationDeadline { slot: u64 },
-    /// The proposal guard refused to sign a block for this slot.
+    /// Slashing protection refused to sign a block for this slot, or could not
+    /// record it.
     ///
-    /// Not a beacon-node failure and not retryable: the whole point of a
-    /// refusal is that trying again produces the same answer. It is an error
-    /// rather than a quiet `Ok` because a refusal means the duty loop asked for
-    /// something it should not have, which is worth surfacing even though the
-    /// block was correctly suppressed.
+    /// Not a beacon-node failure and not retryable within the slot: a refusal
+    /// gives the same answer again, and a record that could not be written
+    /// needs an operator, not a retry. It is an error rather than a quiet `Ok`
+    /// because either way the duty loop asked for something that was not
+    /// signed, which is worth surfacing even though the block was correctly
+    /// suppressed.
     #[error("refused to propose a block for slot {slot}: {reason}")]
     ProposalRefused { slot: u64, reason: String },
     #[error("beacon node returned an inconsistent response: {0}")]
@@ -137,8 +139,8 @@ impl Error {
             | Self::InconsistentResponse(_)
             | Self::AttestationDeadline { .. }
             | Self::Decode(_) => true,
-            // A refusal is deterministic: the guard will refuse the same slot
-            // again, so retrying only repeats it.
+            // A refusal repeats itself, and a record that could not be written
+            // needs an operator: retrying within the slot helps neither.
             Self::ProposalRefused { .. }
             | Self::Keystore { .. }
             | Self::KeystoreVersion(_)

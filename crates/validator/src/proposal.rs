@@ -162,35 +162,33 @@ impl<B: BeaconNodeApi> ProposalService<B> {
         let pubkey = parse_pubkey(&duty.pubkey)?;
         let epoch = compute_epoch_at_slot(slot);
 
-        // Before paying for a block, not after. See the module doc.
-        //
-        // A poisoned lock is treated as a refusal rather than unwrapped: a
-        // crash in the duty path would be a worse outcome than a skipped
-        // proposal.
-        match self.protection.lock() {
-            Ok(protection) => {
-                if let Err(refusal) = protection.check_block(&pubkey, slot) {
-                    warn!(
-                        %slot,
-                        validator = duty.validator_index,
-                        %refusal,
-                        "Refusing to propose: slashing protection judged this block unsafe"
-                    );
-                    crate::metrics::inc_blocks_refused();
-                    return Err(Error::ProposalRefused {
-                        slot,
-                        reason: refusal.to_string(),
-                    });
-                }
+        // Before paying for a block, not after. See the module doc. Off the
+        // executor even though it only reads: the record may be mid-write for
+        // another caller. A record that cannot be consulted is a refusal, not
+        // a crash in the duty path.
+        let checked = crate::slashing_protection::blocking(&self.protection, move |protection| {
+            Ok(protection.check_block(&pubkey, slot))
+        })
+        .await;
+        let refusal = match checked {
+            Ok(Ok(())) => None,
+            Ok(Err(refusal)) => {
+                warn!(
+                    %slot,
+                    validator = duty.validator_index,
+                    %refusal,
+                    "Refusing to propose: slashing protection judged this block unsafe"
+                );
+                Some(refusal.to_string())
             }
             Err(err) => {
-                warn!(%slot, %err, "Slashing protection is poisoned; refusing to propose");
-                crate::metrics::inc_blocks_refused();
-                return Err(Error::ProposalRefused {
-                    slot,
-                    reason: "slashing protection is poisoned".to_string(),
-                });
+                warn!(%slot, %err, "Slashing protection could not be consulted; refusing to propose");
+                Some(err)
             }
+        };
+        if let Some(reason) = refusal {
+            crate::metrics::inc_blocks_refused();
+            return Err(Error::ProposalRefused { slot, reason });
         }
 
         // Scoped away from every await, the way the attestation path's read
@@ -223,11 +221,11 @@ impl<B: BeaconNodeApi> ProposalService<B> {
         // implementation that failed to honour its contract can be stopped
         // before it becomes a signature.
         //
-        // It matters more here than it reads. The guard records the *requested*
-        // slot while the signature covers the *produced* header's slot. If
-        // those ever diverged and both fell in one epoch, the domain would be
-        // identical and the result would be a valid, unguarded second block for
-        // a slot already proposed.
+        // It matters more here than it reads. Slashing protection records the
+        // *requested* slot while the signature covers the *produced* header's
+        // slot. If those ever diverged and both fell in one epoch, the domain
+        // would be identical and the result would be a valid, unrecorded
+        // second block for a slot already proposed.
         validate_produced_block(&request, &produced)?;
 
         // The node's fork and this client's must agree, or the signature is
@@ -263,7 +261,7 @@ impl<B: BeaconNodeApi> ProposalService<B> {
 
         // The root is taken from the decoded container, never from anything
         // reassembled here, and it is taken once: the same value is what the
-        // guard's slot is recorded against and what the signature covers.
+        // recorded slot belongs to and what the signature covers.
         let block_root = produced.block_root();
 
         // The check that matters, and the one that records, durably, before
@@ -271,18 +269,10 @@ impl<B: BeaconNodeApi> ProposalService<B> {
         // without risk, because the record already counts this slot as
         // proposed. Off the executor, and before the store's read lock below,
         // so the disk flush never holds up a keymanager writer.
-        let protection = self.protection.clone();
-        let recorded = tokio::task::spawn_blocking(move || {
-            let mut protection = protection
-                .lock()
-                .map_err(|_| "slashing protection is poisoned".to_string())?;
-            protection
-                .check_and_record_block(&pubkey, slot)
-                .map_err(|err| err.to_string())
+        let recorded = crate::slashing_protection::blocking(&self.protection, move |protection| {
+            protection.check_and_record_block(&pubkey, slot)
         })
-        .await
-        .map_err(|err| err.to_string())
-        .and_then(|recorded| recorded);
+        .await;
         let refusal = match recorded {
             Ok(Ok(())) => None,
             Ok(Err(refusal)) => Some(refusal.to_string()),
@@ -650,7 +640,7 @@ mod tests {
         );
     }
 
-    /// The guard is consulted before the block is asked for, not after, so a
+    /// Slashing protection is consulted before the block is asked for, not after, so a
     /// slot already proposed costs the beacon node nothing.
     #[tokio::test]
     async fn a_repeated_slot_is_refused_without_asking_for_a_block() {
@@ -684,8 +674,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let settings = Arc::new(ProposerSettings::new(Bytes32::repeat_byte(0xab), None));
         let protection = || {
-            let opened =
-                SlashingProtection::open(dir.path(), Root::ZERO, &[pubkey], true).expect("opens");
+            let opened = SlashingProtection::open(dir.path(), Root::ZERO, &[pubkey], true, None)
+                .expect("opens");
             Arc::new(std::sync::Mutex::new(opened))
         };
 
@@ -797,12 +787,12 @@ mod tests {
         );
     }
 
-    /// A failed production must leave the guard untouched, so the slot can
-    /// still be proposed if a later attempt succeeds. Recording on the early
-    /// check rather than at signing time would have burned it.
+    /// A failed production must leave slashing protection untouched, so the
+    /// slot can still be proposed if a later attempt succeeds. Recording on
+    /// the early check rather than at signing time would have burned it.
     ///
     /// The same service and the same node throughout, deliberately: a second
-    /// service would carry a second, empty guard and the test would pass
+    /// service would carry a second, empty record and the test would pass
     /// whether or not the first one recorded.
     #[tokio::test]
     async fn a_failed_production_does_not_burn_the_slot() {
@@ -1069,8 +1059,9 @@ mod gloas_tests {
         assert!(node.published_envelopes().is_empty());
     }
 
-    /// The guard's semantics are unchanged: a second proposal for the slot is
-    /// refused before asking for anything, and reveals no second envelope.
+    /// Slashing protection's semantics are unchanged at gloas: a second
+    /// proposal for the slot is refused before asking for anything, and
+    /// reveals no second envelope.
     #[tokio::test]
     async fn a_repeated_gloas_slot_is_refused_and_reveals_nothing_more() {
         let (store, pubkey) = store();

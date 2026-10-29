@@ -156,11 +156,11 @@ pub enum Published {
 /// stuck on a stale head is never failed over from.
 ///
 /// Both fields are checked because both end up signed. The slot selects the
-/// signing domain and is the whole of what the proposal guard keys on. The
+/// signing domain and is the whole of what slashing protection keys a block on. The
 /// proposer index is not something this client chooses either: a node on a
 /// different fork computes a different proposer, and a block naming someone
 /// else is one this client's key can only sign uselessly, while still burning
-/// the guard's record for that slot.
+/// the slot in slashing protection's record.
 pub fn validate_produced_block(request: &BlockRequest, block: &ProducedBlock) -> Result<()> {
     if block.slot() != request.slot {
         return Err(crate::error::Error::InconsistentResponse(format!(

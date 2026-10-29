@@ -27,8 +27,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, Root, Slot};
 use ethlambda_types::beacon::serde_helpers::{hex_array, quoted_or_bare};
@@ -175,17 +174,41 @@ fn record_of(entry: &Entry) -> std::result::Result<Record, String> {
     })
 }
 
+/// Whether the record at `path` exists, failing closed.
+///
+/// Only "no such file" is absence. Anything else that is not a regular file
+/// (a symlink, perhaps to a volume that is not mounted, or a directory), and
+/// any error reading its metadata, is an error: taking any of them for absence
+/// would create a fresh record and orphan the real one.
+pub(crate) fn exists(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+        Ok(_) => Err(Error::SlashingProtection {
+            path: path.display().to_string(),
+            reason: "is not a regular file (a symlink or a directory); refusing to read or \
+                     replace it"
+                .to_string(),
+        }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(Error::Io {
+            path: path.display().to_string(),
+            source,
+        }),
+    }
+}
+
 /// Durably replace the record at `path` with `records`.
 ///
-/// Entries are written in pubkey order so the file's bytes depend only on its
-/// content, which keeps a diff of two files meaningful.
-pub(crate) fn write(
+/// Compact rather than pretty: the file is rewritten once per slot and per
+/// block, and its size grows with the number of validators. Entries are
+/// written in pubkey order so the bytes depend only on the content, which
+/// keeps a diff of two files meaningful.
+pub(crate) fn write<'a>(
     path: &Path,
     genesis_validators_root: Root,
-    records: &HashMap<BlsPubkey, Record>,
+    records: impl Iterator<Item = (&'a BlsPubkey, &'a Record)>,
 ) -> Result<()> {
     let mut data: Vec<Entry> = records
-        .iter()
         .map(|(pubkey, record)| Entry {
             pubkey: pubkey.0,
             signed_blocks: record
@@ -216,74 +239,14 @@ pub(crate) fn write(
         },
         data,
     };
-    let contents =
-        serde_json::to_vec_pretty(&interchange).map_err(|err| Error::SlashingProtection {
-            path: path.display().to_string(),
-            reason: format!("could not encode the record: {err}"),
-        })?;
-    write_durably(path, &contents).map_err(|source| Error::Io {
+    let contents = serde_json::to_vec(&interchange).map_err(|err| Error::SlashingProtection {
+        path: path.display().to_string(),
+        reason: format!("could not encode the record: {err}"),
+    })?;
+    crate::secure_fs::write_private_durably(path, contents).map_err(|source| Error::Io {
         path: path.display().to_string(),
         source,
     })
-}
-
-/// Temporary file, flush, rename, flush the directory.
-fn write_durably(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    let temporary = temporary_path(path);
-    let mut file = open_private(&temporary)?;
-    file.write_all(contents)?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&temporary, path)?;
-    sync_directory(path.parent().unwrap_or(Path::new(".")))
-}
-
-fn temporary_path(path: &Path) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".tmp");
-    path.with_file_name(name)
-}
-
-/// Created, or truncated if it exists, at mode `0600` on unix: the record says
-/// which keys this client holds.
-#[cfg(unix)]
-fn open_private(path: &Path) -> std::io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-}
-
-#[cfg(not(unix))]
-fn open_private(path: &Path) -> std::io::Result<File> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
-}
-
-/// `fsync` on the directory, so the rename that replaced the record is itself
-/// durable. Called through `libc` rather than `File::sync_all`, which on macOS
-/// issues `F_FULLFSYNC`, a request some filesystems refuse for a directory.
-#[cfg(unix)]
-fn sync_directory(directory: &Path) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd as _;
-    let directory = File::open(directory)?;
-    // SAFETY: the descriptor is owned by `directory`, which outlives the call.
-    if unsafe { libc::fsync(directory.as_raw_fd()) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_directory: &Path) -> std::io::Result<()> {
-    Ok(())
 }
 
 /// Take the exclusive lock in `directory`, held until the returned file is

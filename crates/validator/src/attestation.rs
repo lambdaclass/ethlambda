@@ -155,25 +155,16 @@ impl<B: BeaconNodeApi> AttestationService<B> {
         // and before the store's read lock below is taken, so the disk flush
         // never holds up a keymanager writer queued behind it.
         let pubkeys: Vec<BlsPubkey> = candidates.iter().map(|(_, pubkey)| *pubkey).collect();
-        let protection = self.protection.clone();
-        let recorded_data = data;
-        let verdicts = tokio::task::spawn_blocking(move || {
-            let mut protection = protection
-                .lock()
-                .map_err(|_| "slashing protection is poisoned".to_string())?;
-            protection
-                .check_and_record_attestations(&pubkeys, &recorded_data)
-                .map_err(|err| err.to_string())
+        let verdicts = crate::slashing_protection::blocking(&self.protection, move |protection| {
+            protection.check_and_record_attestations(&pubkeys, &data)
         })
-        .await
-        .map_err(|err| err.to_string())
-        .and_then(|verdicts| verdicts);
+        .await;
         let verdicts = match verdicts {
             Ok(verdicts) => verdicts,
             Err(err) => {
                 // Nothing was recorded, so nothing may be signed.
                 error!(%slot, %err, "Slashing protection could not record this slot's attestations; refusing to sign any");
-                crate::metrics::inc_attestations_refused();
+                crate::metrics::inc_attestations_refused_by(candidates.len() as u64);
                 return Ok(Attested {
                     published: 0,
                     data: Some(data),
@@ -344,7 +335,7 @@ mod tests {
         );
     }
 
-    /// The guard engaging in the real signing path, not just in isolation.
+    /// Slashing protection engaging in the real signing path, not just in isolation.
     ///
     /// This is the backward-clock-step shape: the duty loop derives its slot
     /// from the wall clock, so an NTP correction can re-enter a slot already
@@ -383,7 +374,8 @@ mod tests {
         dir: &std::path::Path,
         keys: &[ethlambda_types::beacon::primitives::BlsPubkey],
     ) -> SharedProtection {
-        let protection = SlashingProtection::open(dir, Root::ZERO, keys, true).expect("opens");
+        let protection =
+            SlashingProtection::open(dir, Root::ZERO, keys, true, None).expect("opens");
         Arc::new(std::sync::Mutex::new(protection))
     }
 
@@ -430,6 +422,11 @@ mod tests {
     async fn a_record_that_cannot_be_written_signs_nothing() {
         use std::os::unix::fs::PermissionsExt as _;
 
+        // SAFETY: `geteuid` reads a process attribute and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root bypasses directory permissions");
+            return;
+        }
         let mut store = ValidatorStore::new();
         let pubkey = store.insert_secret("test", &secret()).expect("inserts");
         let store = RwLock::new(store);
