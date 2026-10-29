@@ -1,8 +1,9 @@
 # Releasing ethlambda
 
 This document describes how we publish and distribute ethlambda: Docker images on
-GitHub Container Registry (`ghcr.io/lambdaclass/ethlambda`) and binaries attached
-to [GitHub Releases](https://github.com/lambdaclass/ethlambda/releases).
+GitHub Container Registry (`ghcr.io/lambdaclass/ethlambda`), binaries attached
+to [GitHub Releases](https://github.com/lambdaclass/ethlambda/releases), and a
+Homebrew formula in [lambdaclass/homebrew-tap](https://github.com/lambdaclass/homebrew-tap).
 
 A release is cut as a **release candidate** (`vX.Y.Z-rc.N`), tested, and then
 **promoted** to the final version (`vX.Y.Z`). Promotion re-publishes the tested
@@ -203,19 +204,75 @@ in this order, and drop the boxes that do not apply:
 > - <highlight>
 ```
 
-### 6. Merge the release branch
+### 6. Update the Homebrew formula
+
+The `ethlambda` formula in [lambdaclass/homebrew-tap](https://github.com/lambdaclass/homebrew-tap)
+builds from the final tag's source tarball. Apple silicon gets a bottle instead,
+repackaged from the release's `ethlambda-macos-aarch64` binary, so it installs
+the same binary the release ships; every other platform builds from source. The
+bottle is attached to a tap release tagged `ethlambda-vX.Y.Z`, because the tap's
+bare `vX.Y.Z` tags are ethrex's.
+
+Set the released version once; the commands below are then copy/paste:
+
+```bash
+export V=X.Y.Z   # no `v` prefix
+```
+
+1. Hash the source tarball. GitHub generates it from the final tag, so the tag
+   must be on the tested commit (step 5) before this hash is taken:
+
+   ```bash
+   gh release download "v$V" -R lambdaclass/ethlambda --archive=tar.gz
+   shasum -a 256 "ethlambda-$V.tar.gz"
+   ```
+
+2. Build the bottle from the release binary and hash it. The `ethlambda`
+   directory is the bottle root, laid out as `ethlambda/<version>/bin/ethlambda`:
+
+   ```bash
+   gh release download "v$V" -R lambdaclass/ethlambda -p ethlambda-macos-aarch64 -p SHA256SUMS
+   shasum -a 256 -c --ignore-missing SHA256SUMS
+   chmod +x ethlambda-macos-aarch64
+   mkdir -p "ethlambda/$V/bin"
+   mv ethlambda-macos-aarch64 "ethlambda/$V/bin/ethlambda"
+   # Keep macOS extended attributes (quarantine, provenance) out of the archive.
+   tar --no-xattrs --no-mac-metadata -czf "ethlambda-$V.arm64_sonoma.bottle.tar.gz" ethlambda
+   shasum -a 256 "ethlambda-$V.arm64_sonoma.bottle.tar.gz"
+   ```
+
+3. Create the tap release with the bottle attached. It must exist before the
+   formula PR is opened, since the tap's CI installs from it. `--latest=false`
+   leaves the tap's latest release on ethrex's:
+
+   ```bash
+   gh release create "ethlambda-v$V" -R lambdaclass/homebrew-tap --latest=false \
+     --title "ethlambda v$V" --notes "ethlambda v$V bottle (arm64_sonoma)." \
+     "ethlambda-$V.arm64_sonoma.bottle.tar.gz"
+   ```
+
+4. In the tap's `Formula/ethlambda.rb`, update the `url`, both `sha256` values
+   and the bottle's `root_url`, plus the `rustup toolchain install` version if
+   `rust-toolchain.toml` changed. Open a PR: its `Formula CI` installs the
+   formula from the bottle and from source on macOS Sonoma, and `brew test-bot`
+   builds it on Linux and on Apple silicon macOS. test-bot skips Intel macOS,
+   which has no `rustup` bottle, so no CI builds the formula there.
+
+### 7. Merge the release branch
 
 Open a PR from `release/vX.Y.Z` into `main` and merge it, so the version bump and
 any candidate fixes land on `main`.
 
 ## Distribution channels
 
-Releases are published to GitHub Releases and GHCR only. Not covered yet:
+Releases are published to GitHub Releases, GHCR, and the
+[lambdaclass/tap](https://github.com/lambdaclass/homebrew-tap) Homebrew tap
+(`brew install lambdaclass/tap/ethlambda`). Not covered yet:
 
 - **crates.io**: not possible while the workspace depends on `leanvm` from git,
   since crates.io rejects crates with git dependencies.
-- **apt and Homebrew**: future work. Either would be fed from the promoted
-  release's binaries, after the release is promoted.
+- **apt**: future work. It would be fed from the promoted release's binaries,
+  after the release is promoted.
 
 ## Troubleshooting
 
