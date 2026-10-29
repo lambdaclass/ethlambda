@@ -270,9 +270,10 @@ implementation's, so none of the [common flags](#common-flags) apply to it.
 
 > **Slashing protection** lives in `--validators-dir/slashing_protection.json`,
 > locked to one process, so `--validators-dir` must be writable: a read-only
-> mount of the keys (a Kubernetes Secret, a `:ro` volume) fails at startup. A key with no record is refused at startup unless
-> `--init-slashing-protection` is passed. Importing another client's history is
-> not supported yet. See
+> mount of the keys (a Kubernetes Secret, a `:ro` volume) fails at startup. A
+> key with no record is refused at startup unless `--init-slashing-protection`
+> is passed. A key moving here from another client brings its history with
+> [`slashing-protection import`](#slashing-protection) or the keymanager API. See
 > [Spec Deviations](./spec_deviations.md#the-validator-client-keeps-eip-3076s-minimal-watermarks-not-full-history).
 
 | Flag | Default | Meaning |
@@ -428,6 +429,12 @@ specification requires; `POST graffiti` refuses text over 32 bytes rather than
 truncating it; and every route answers `404` for a key this client does not
 hold.
 
+The keystore routes carry slashing-protection history. `POST` imports the
+request's `slashing_protection` before any key, and refuses every key in the
+request if that interchange does not parse or is for another chain. `DELETE`
+returns the deleted keys' records as a minimal EIP-3076 interchange, answering
+`not_active` for a key that is gone but still has a record.
+
 The specification requires TLS. This binds to `--http-address`, loopback by
 default; exposing it further means putting a TLS terminator in front.
 
@@ -438,6 +445,27 @@ Served on `--metrics-port`, prefixed `ethlambda_validator_` rather than the
 beacon chain. Every series is registered at startup so it reads zero rather
 than being absent before its first event, which is what lets an alert fire on
 "attestations stopped". See [Metrics](./metrics.md#validator-client).
+
+## `slashing-protection`
+
+Moves the validator client's EIP-3076 history in and out of its
+`--validators-dir`, offline. It takes the lock the client holds while running,
+so it refuses while a client runs on that directory, and it needs no beacon
+node: the record names its own chain.
+
+```sh
+# Bring a key's history from another client before its first start here.
+ethlambda slashing-protection import --validators-dir ./validators interchange.json
+
+# Hand the history over before running the keys elsewhere.
+ethlambda slashing-protection export --validators-dir ./validators out.json
+ethlambda slashing-protection export --validators-dir ./validators --pubkeys 0xab..,0xcd.. out.json
+```
+
+| Sub-command | Does |
+|---|---|
+| `import <file>` | Merges a version 5 interchange, complete or minimal, into the record. Each validator is reduced to its highest slot, source and target and merged by maximum, so nothing already recorded is lowered and slashable data in the file is absorbed rather than refused. All or nothing. With no record yet, one is created for the interchange's chain; the client refuses it at its next start if that is not its beacon node's chain |
+| `export [--pubkeys ...] <file>` | Writes the record, or the named validators' part of it, as a minimal version 5 interchange. Refuses to overwrite an existing file |
 
 ## `benchmark import` flags
 
