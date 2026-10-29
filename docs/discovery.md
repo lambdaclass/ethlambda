@@ -92,7 +92,7 @@ compare-and-swap. Nothing takes a lock.
 
 | Who | Reads or edits | How |
 | --- | --- | --- |
-| discv5 IP voting | the `ip` and `udp`/`tcp` entries | ethrex, internally |
+| discv5 IP voting | the `ip` (or `ip6`) entry | ethrex, internally |
 | A fork-digest boundary | the `eth2` entry | `discovery::LocalEnrWriter::publish_fork_id`, from `beacon::transition::apply` |
 | `/eth/v1/node/identity` | reads the whole record | `discovery::LocalEnr` |
 
