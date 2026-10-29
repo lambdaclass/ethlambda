@@ -5,11 +5,13 @@
 //! The specification lets these routes carry a validator's EIP-3076 history in
 //! and out, and both do:
 //!
-//! - `POST` imports the request's `slashing_protection` before any key, so a
-//!   key never starts signing ahead of its history. An interchange that does
-//!   not parse, or is for another chain, fails every key in the request and
-//!   imports none of them. A key that arrives with no history at all is
-//!   registered as never having signed, with a warning.
+//! - `POST` judges the request's `slashing_protection` before touching
+//!   anything: one that does not parse, or is for another chain, fails every
+//!   key in the request and imports none of them. It is written once the keys
+//!   are saved, together with their registration and before any is loaded, so
+//!   a key never starts signing ahead of its history and a key that failed to
+//!   import leaves none behind. A key with no history at all is registered as
+//!   of the current slot and epoch, with a warning.
 //! - `DELETE` returns the deleted keys' records as a minimal interchange,
 //!   taken after the keys are out of the store, so it covers every signature
 //!   this process made with them. A key that is gone but still has a record is
@@ -160,31 +162,26 @@ pub async fn import(
         return Json(StatusResponse { data });
     }
 
-    // History first, keys second: a key must never be able to sign ahead of
-    // the history it came with. All or nothing, so a request whose history is
-    // refused imports no key at all, rather than some keys without it.
+    // The history is judged before anything is touched, so a request whose
+    // history would be refused imports no key at all, rather than some keys
+    // without it. It is written later, together with the keys' registration,
+    // once the keys it came with are known to be saved: written now, a key
+    // that then failed to import would leave history behind for nothing.
     if let Some(interchange) = &request.slashing_protection {
-        let imported = context
-            .protection
-            .lock()
-            .map_err(|_| "slashing protection is poisoned".to_string())
-            .and_then(|mut protection| {
-                protection
-                    .import(interchange)
-                    .map_err(|err| err.to_string())
-            });
-        match imported {
-            Ok(validators) => info!(validators, "Imported slashing-protection history"),
-            Err(err) => {
-                let message = format!("slashing_protection was not imported: {err}");
-                warn!(%err, "Refusing an import whose slashing-protection history was refused");
-                let data = request
-                    .keystores
-                    .iter()
-                    .map(|_| KeyStatus::error(&message))
-                    .collect();
-                return Json(StatusResponse { data });
-            }
+        let interchange = interchange.clone();
+        let judged = crate::slashing_protection::blocking(&context.protection, move |protection| {
+            protection.check_import(&interchange)
+        })
+        .await;
+        if let Err(err) = judged {
+            let message = format!("slashing_protection was not imported: {err}");
+            warn!(%err, "Refusing an import whose slashing-protection history was refused");
+            let data = request
+                .keystores
+                .iter()
+                .map(|_| KeyStatus::error(&message))
+                .collect();
+            return Json(StatusResponse { data });
         }
     }
 
@@ -243,11 +240,18 @@ pub async fn import(
         .iter()
         .filter_map(|result| result.as_ref().ok().map(|(pubkey, _)| *pubkey))
         .collect();
+    // The request's history goes in first, in the same critical section, so
+    // a key it covers is registered with that history rather than as of now.
     let now = context.clock.now();
+    let history = request.slashing_protection.clone();
     let registration = if persisted.is_empty() {
         Ok(0)
     } else {
         crate::slashing_protection::blocking(&context.protection, move |protection| {
+            if let Some(history) = &history {
+                let validators = protection.import(history)?;
+                info!(validators, "Imported slashing-protection history");
+            }
             protection.register(&persisted, now)
         })
         .await
@@ -457,27 +461,33 @@ pub async fn delete(
     // Exported only now, with the keys out of the store: a signature with one
     // of them either finished before the write lock above was granted, and is
     // in the record, or can no longer happen.
-    let pubkeys: Vec<BlsPubkey> = results.iter().filter_map(|(pubkey, _)| *pubkey).collect();
-    let exported = context
-        .protection
-        .lock()
-        .map_err(|_| "slashing protection is poisoned".to_string())
-        .and_then(|protection| {
-            let interchange = protection.export(&pubkeys).map_err(|err| err.to_string())?;
-            let recorded: Vec<bool> = results
-                .iter()
-                .map(|(pubkey, _)| pubkey.is_some_and(|pubkey| protection.contains(&pubkey)))
-                .collect();
-            Ok((interchange, recorded))
-        });
+    let requested: Vec<Option<BlsPubkey>> = results.iter().map(|(pubkey, _)| *pubkey).collect();
+    let exported = crate::slashing_protection::blocking(&context.protection, move |protection| {
+        let pubkeys: Vec<BlsPubkey> = requested.iter().flatten().copied().collect();
+        let interchange = protection.export(&pubkeys)?;
+        let recorded: Vec<bool> = requested
+            .iter()
+            .map(|pubkey| pubkey.is_some_and(|pubkey| protection.contains(&pubkey)))
+            .collect();
+        Ok((interchange, recorded))
+    })
+    .await;
     let (slashing_protection, recorded) = match exported {
         Ok(exported) => exported,
         Err(err) => {
-            // The keys are already deleted, but their history cannot be handed
-            // over, so no caller may treat any of them as safe to move.
+            // A key that was deleted, or is gone with a record, cannot have its
+            // history handed over, so no caller may treat it as safe to move:
+            // it becomes an error. Every other status (`not_found`, a malformed
+            // pubkey) was decided before the export and still stands.
             warn!(%err, "Deleted keys whose slashing-protection history could not be exported");
             let message = format!("deleted, but slashing_protection could not be exported: {err}");
-            let data = results.iter().map(|_| KeyStatus::error(&message)).collect();
+            let data = results
+                .into_iter()
+                .map(|(_, status)| match status.status.as_str() {
+                    "deleted" => KeyStatus::error(&message),
+                    _ => status,
+                })
+                .collect();
             return Json(DeleteResponse {
                 data,
                 slashing_protection: String::new(),
@@ -1186,11 +1196,14 @@ mod tests {
         )
         .await;
         assert_eq!(body["data"][0]["status"], "imported", "got {body}");
+        // Imported with no history, so the key starts at the current slot;
+        // a proposal must come after it.
+        const SLOT: u64 = 1 << 40;
         let pubkey = parse_pubkey(KEYSTORE_PUBKEY).expect("pubkey");
         protection
             .lock()
             .expect("not poisoned")
-            .check_and_record_block(&pubkey, 97)
+            .check_and_record_block(&pubkey, SLOT)
             .expect("written")
             .expect("allowed");
 
@@ -1212,7 +1225,10 @@ mod tests {
             ZERO_ROOT
         );
         assert_eq!(interchange["data"][0]["pubkey"], KEYSTORE_PUBKEY);
-        assert_eq!(interchange["data"][0]["signed_blocks"][0]["slot"], "97");
+        assert_eq!(
+            interchange["data"][0]["signed_blocks"][0]["slot"],
+            SLOT.to_string()
+        );
 
         // Gone from this client, but its record is still here and still
         // returned: the specification's `not_active`.
@@ -1230,9 +1246,39 @@ mod tests {
             protection
                 .lock()
                 .expect("not poisoned")
-                .check_block(&pubkey, 97)
+                .check_block(&pubkey, SLOT)
                 .is_err()
         );
+    }
+
+    /// History that came with a key that then failed to import is not
+    /// written: nothing it describes is held here.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn history_whose_key_failed_to_import_is_not_written() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // A symlink at the keystore's path makes `persist_import` refuse.
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, "untouched").expect("writes target");
+        std::os::unix::fs::symlink(&target, dir.path().join(format!("{KEYSTORE_PUBKEY}.json")))
+            .expect("symlinks");
+        let (context, protection) = context_with_record(dir.path());
+
+        let (_, body) = send(
+            router(context, TOKEN.to_string()),
+            authed(
+                "POST",
+                "/eth/v1/keystores",
+                serde_json::json!({
+                    "keystores": [keystore_json()],
+                    "passwords": [PASSWORD],
+                    "slashing_protection": history(ZERO_ROOT, 100, 5, 10),
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(body["data"][0]["status"], "error", "got {body}");
+        assert!(protection.lock().expect("not poisoned").is_empty());
     }
 
     #[tokio::test]

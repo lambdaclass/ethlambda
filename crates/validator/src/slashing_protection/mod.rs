@@ -605,6 +605,23 @@ impl SlashingProtection {
         Ok(count)
     }
 
+    /// Whether [`Self::import`] would accept `interchange`, changing nothing:
+    /// it parses, is of the right version, and is for this record's chain.
+    pub fn check_import(&self, interchange: &str) -> Result<()> {
+        let chain = Self::interchange_chain(interchange)?;
+        if chain != self.genesis_validators_root {
+            return Err(Error::SlashingProtection {
+                path: "interchange".to_string(),
+                reason: format!(
+                    "it is for genesis_validators_root {}, but this record is for {}",
+                    encode_hex(&chain.0),
+                    encode_hex(&self.genesis_validators_root.0)
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// The records of `pubkeys` as a minimal EIP-3076 version 5 interchange.
     ///
     /// A key with no record is left out rather than listed as never having

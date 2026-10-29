@@ -429,9 +429,10 @@ specification requires; `POST graffiti` refuses text over 32 bytes rather than
 truncating it; and every route answers `404` for a key this client does not
 hold.
 
-The keystore routes carry slashing-protection history. `POST` imports the
-request's `slashing_protection` before any key, and refuses every key in the
-request if that interchange does not parse or is for another chain. `DELETE`
+The keystore routes carry slashing-protection history. `POST` refuses every
+key in the request if its `slashing_protection` does not parse or is for
+another chain, and otherwise writes that history once the keys are saved and
+before any is loaded. `DELETE`
 returns the deleted keys' records as a minimal EIP-3076 interchange, answering
 `not_active` for a key that is gone but still has a record.
 

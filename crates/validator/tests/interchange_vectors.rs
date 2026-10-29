@@ -99,7 +99,8 @@ fn run(case: &Case) -> Result<(), String> {
     let root = parse_root(&case.genesis_validators_root)?;
 
     // The vectors start from an empty database in which any validator may
-    // sign, so every key a case signs for is registered as never having signed.
+    // sign, so every key a case signs for is registered as never having signed:
+    // with no current slot, as before genesis.
     let mut keys: Vec<BlsPubkey> = Vec::new();
     let mut seen = HashSet::new();
     for step in &case.steps {
@@ -117,8 +118,8 @@ fn run(case: &Case) -> Result<(), String> {
     }
 
     let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
-    let mut protection =
-        SlashingProtection::open(dir.path(), root, &keys, true).map_err(|err| err.to_string())?;
+    let mut protection = SlashingProtection::open(dir.path(), root, &keys, true, None)
+        .map_err(|err| err.to_string())?;
 
     for (index, step) in case.steps.iter().enumerate() {
         let imported = protection.import(&step.interchange.to_string());
