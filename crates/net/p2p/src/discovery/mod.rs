@@ -1,27 +1,33 @@
 //! discv5 peer discovery, built on ethrex's discovery stack.
 //!
-//! ethrex's `DiscoveryServer` runs discv5-only on its own UDP socket and writes
-//! what it finds into an ethrex `PeerTable`. ethlambda's `P2PServer` polls that
-//! table, applies the spec checks in [`admission`], and dials the survivors over
-//! libp2p. Both dial paths, discovered peers and static bootnodes alike, hand
+//! ethrex's `DiscoveryServer` runs discv5-only on its own UDP socket and keeps
+//! what it finds to itself. ethlambda asks it for dial candidates, applies the
+//! spec checks in [`admission`] as each ENR arrives, and dials the survivors
+//! over libp2p. Both dial paths, discovered peers and static bootnodes alike, hand
 //! the swarm every address a peer advertises (`quic` and `tcp`) in one attempt
 //! and let libp2p race them.
+//!
+//! The traffic across that boundary runs one way, into discovery: a request for
+//! the next candidate, and a cast per connection opened or closed. Those casts
+//! are what let discovery pace its own lookups, since a libp2p connection is
+//! otherwise invisible to it.
 //!
 //! See `docs/discovery.md` for the operator-facing description.
 
 pub mod admission;
 pub(crate) mod dial;
 pub mod enr;
+pub(crate) mod node_id;
 
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use ethrex_p2p::discovery::{DiscoveryConfig, DiscoveryServer};
-use ethrex_p2p::peer_table::{PeerTable, PeerTableServer};
-use ethrex_p2p::types::Node;
+use ethrex_p2p::discovery::{DiscoveryConfig, DiscoveryHandle, DiscoveryServer};
+use ethrex_p2p::types::{LocalNode, Node};
 use tokio::net::UdpSocket;
+use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::Bootnode;
@@ -63,24 +69,11 @@ pub const DIAL_INTERVAL_AT_TARGET: Duration =
 /// Overridable per node via [`DiscoverySpawnConfig::target_peers`].
 pub const DEFAULT_DISCOVERY_TARGET_PEERS: usize = 200;
 
-/// The target we hand ethrex's peer table, which is not
-/// [`DiscoverySpawnConfig::target_peers`] and deliberately so.
-///
-/// ethrex's table counts only peers registered through `NewConnectedPeer`, which
-/// carries an RLPx `PeerConnection`. ethlambda connects over libp2p and never
-/// registers anything, so `peers.len()` is permanently 0 and the table's target
-/// cannot mean "how many peers we have". Its one live consumer here is the discv5
-/// lookup pacing, which divides by it: passing 0 would yield `0/0 = NaN`, and
-/// `NaN as u64` saturates to zero, turning the lookup timer into an unthrottled
-/// re-fire loop. Any non-zero value gives the same pacing, so this is 1 with the
-/// reason attached rather than a number pretending to be a peer budget.
-const PEER_TABLE_TARGET_PEERS: usize = 1;
-
 /// Admitted contacts [`dial::spawn_contact_poll`] keeps buffered ahead of the
 /// dial loop, and so the most one refill can draw.
 ///
-/// A bound rather than a batch size, because the peer table marks every contact
-/// tried on the way out: this is how far ahead of the dialing the table may be
+/// A bound rather than a batch size, because discovery marks every node tried
+/// on the way out: this is how far ahead of the dialing its eligible set may be
 /// drawn down. See [`dial::spawn_contact_poll`].
 pub const DISCOVERY_CANDIDATE_BATCH: usize = 8;
 
@@ -124,9 +117,9 @@ pub struct DiscoverySpawnConfig {
     /// [`DEFAULT_DISCOVERY_TARGET_PEERS`]; a target of 0 leaves the dial loop
     /// ticking without ever dialing.
     ///
-    /// Governs the dial loop only. ethrex's peer table is handed a fixed value
-    /// instead, because it counts only peers registered over RLPx and so can
-    /// never see ours; see `PEER_TABLE_TARGET_PEERS`.
+    /// The same number governs how hard discovery looks: it eases its lookups
+    /// off the startup rate as our connected count approaches this, which it can
+    /// only do because we report those connections to it.
     pub target_peers: usize,
     /// The `eth2` entry to publish and to compare discovered peers against.
     pub fork_id: EnrForkId,
@@ -135,20 +128,24 @@ pub struct DiscoverySpawnConfig {
 }
 
 /// What the P2P actor needs from a running discovery server.
-pub struct DiscoveryHandle {
-    pub peer_table: PeerTable,
+pub struct SpawnedDiscovery {
+    /// The running server. Three things travel over it: a request for the next
+    /// dial candidate, and a report for each connection opened and closed.
+    pub handle: DiscoveryHandle,
+    /// A clone of the admission policy discovery runs. Clones share their
+    /// policy and their [`DialTargets`](admission::DialTargets), so this is
+    /// both how a fork boundary moves what discovery admits and how the dial
+    /// loop reads what discovery filed.
+    pub(crate) filter: LeanFilter,
     /// This node's ENR as an `enr:`-prefixed string. `spawn_discovery` already
     /// logs it; this copy is what the tests assert the published record against,
     /// and what a future RPC identity endpoint would read. Reflects startup
     /// state; discv5 may bump the sequence number later if PONG voting changes
     /// our external IP.
     pub local_enr: String,
-    /// The admission policy the peer table judges records with, kept so the dial
-    /// loop can apply the same rules when it turns a contact into a dial target.
-    /// See [`LeanFilter`].
-    pub filter: LeanFilter,
     /// The configured [`DiscoverySpawnConfig::target_peers`], carried through to
-    /// the dial loop, which is the only thing it governs.
+    /// the dial loop's cutoff. Discovery is handed the same number separately,
+    /// for its lookup pacing.
     pub target_peers: usize,
 }
 
@@ -165,7 +162,7 @@ pub struct DiscoveryHandle {
 /// neither.
 pub async fn spawn_discovery(
     config: DiscoverySpawnConfig,
-) -> Result<DiscoveryHandle, DiscoveryError> {
+) -> Result<SpawnedDiscovery, DiscoveryError> {
     let signer =
         secp256k1::SecretKey::from_slice(&config.node_key).map_err(DiscoveryError::NodeKey)?;
 
@@ -198,20 +195,15 @@ pub async fn spawn_discovery(
         .trim_end_matches('=')
         .to_string();
 
-    // `spawn` rather than `spawn_with_filter` would install ethrex's own filter,
-    // which wants an EIP-2124 `eth` entry compatible with an execution chain lean
-    // does not have and rejects any record without one, so every lean contact
-    // would be stamped rejected and never dialed.
+    // Our own filter rather than ethrex's `EthForkIdFilter`, which wants an
+    // EIP-2124 `eth` entry compatible with an execution chain we do not judge
+    // peers by, and rejects any record without one, so every lean contact would
+    // be stamped rejected and never dialed. `AcceptAllFilter` would go the other
+    // way and hand us every node on the DHT.
     //
-    // The peer table owns the filter it runs, so the dial loop keeps a clone
-    // rather than sharing one: the two carry the same fork id and committee
-    // count, which is what makes their judgments agree.
+    // Discovery takes the filter by value, so the dial loop keeps a clone: the
+    // two share one policy and one map of filed dial targets.
     let filter = LeanFilter::new(config.fork_id, config.attestation_committee_count);
-    let peer_table = PeerTableServer::spawn_with_filter(
-        local_node.node_id(),
-        PEER_TABLE_TARGET_PEERS,
-        filter.clone(),
-    );
 
     let seeds: Vec<Node> = config
         .bootnodes
@@ -231,20 +223,56 @@ pub async fn spawn_discovery(
     // lean peer applying our own admission rules to it admits us. ethrex
     // re-signs it under `params.signer` whenever IP voting bumps the sequence
     // number, keeping the extra entries.
-    DiscoveryServer::spawn(
+    //
+    // `shared_local_node` is ethrex's live mirror of that identity, which its RPC
+    // layer serves the current record from. Nothing on this side reads it yet, so
+    // it is written and dropped; it costs one `Arc`.
+    //
+    // `fork_id` publishes an EIP-2124 fork id for discovery to stamp on the ENR
+    // when the chain crosses a fork. Neither chain here keys its peers on an
+    // `eth` entry (both carry their digest in `eth2`), so there is nothing to
+    // publish: the sender is dropped straight away, which discovery reads as
+    // "the publisher is gone" and stops checking.
+    let (fork_id_tx, fork_id_rx) = watch::channel(None);
+    drop(fork_id_tx);
+    let shared_local_node = Arc::new(RwLock::new(LocalNode {
+        node: local_node.clone(),
+        record: local_record.clone(),
+    }));
+
+    let server = DiscoveryServer::spawn(
         local_node,
         local_record,
         params.signer,
         Arc::new(socket),
-        peer_table.clone(),
+        Box::new(filter.clone()),
         seeds,
         DiscoveryConfig {
             discv4_enabled: false,
             discv5_enabled: true,
+            // The real target, unlike the placeholder this replaces: discovery
+            // divides our reported connection count by it to decide how hard to
+            // keep looking. A target of 0 is answered as "complete" upstream, so
+            // it no longer has to be worked around here.
+            target_peers: config.target_peers,
+            // `--discovery.advertise-ip` is this node's `--nat extip:`: an
+            // operator naming the address peers should reach it on. Locking the
+            // predictor keeps discv5's PONG voting from overwriting it, which is
+            // the whole point of having said it.
+            nat_extip_set: config.advertise_ip.is_some(),
         },
+        shared_local_node,
+        fork_id_rx,
     )
     .await
     .map_err(|err| DiscoveryError::Server(err.to_string()))?;
+
+    // The handle exists to be published once and cloned everywhere, which is how
+    // ethrex's own consumer starts discovery after the context that reaches it.
+    // We have the running server in hand, so the publish is unconditional and its
+    // "already set" answer cannot be anything but true.
+    let discovery = DiscoveryHandle::new();
+    discovery.set(server);
 
     info!(enr = %local_enr, "Local ENR");
     if advertise_ip.is_unspecified() {
@@ -256,10 +284,10 @@ pub async fn spawn_discovery(
         );
     }
 
-    Ok(DiscoveryHandle {
-        peer_table,
-        local_enr,
+    Ok(SpawnedDiscovery {
+        handle: discovery,
         filter,
+        local_enr,
         target_peers: config.target_peers,
     })
 }
@@ -299,6 +327,10 @@ mod tests {
     use ethrex_rlp::decode::RLPDecode;
     use std::net::Ipv4Addr;
 
+    /// The committee count `config` below spawns with, named so the filter the
+    /// self-admission test rebuilds cannot silently drift from it.
+    const TEST_COMMITTEE_COUNT: u64 = 4;
+
     fn config(discovery_port: u16, advertise_ip: Option<IpAddr>) -> DiscoverySpawnConfig {
         DiscoverySpawnConfig {
             node_key: secp256k1::SecretKey::new(&mut rand::rngs::OsRng)
@@ -308,7 +340,7 @@ mod tests {
             discovery_port,
             p2p_port: 9001,
             subscription_subnets: HashSet::from([0u64]),
-            attestation_committee_count: 4,
+            attestation_committee_count: TEST_COMMITTEE_COUNT,
             bootnodes: Vec::new(),
             advertise_ip,
             target_peers: DEFAULT_DISCOVERY_TARGET_PEERS,
@@ -347,10 +379,13 @@ mod tests {
         let advertised_port = record.pairs().udp_port.expect("udp entry");
         assert_ne!(advertised_port, 0);
 
-        // The policy handed to the peer table must admit our own record. A peer
+        // The policy handed to discovery must admit our own record. A peer
         // running this code applies exactly these rules to what we publish, so a
-        // record we would reject ourselves is one nobody dials.
-        assert!(handle.filter.accepts(&record));
+        // record we would reject ourselves is one nobody dials. Rebuilt here
+        // from the same two values `spawn_discovery` constructs it with, since
+        // the filter itself was moved into the discovery server.
+        let filter = LeanFilter::new(EnrForkId::local(), TEST_COMMITTEE_COUNT);
+        assert!(filter.accepts(&record));
     }
 
     #[tokio::test]
