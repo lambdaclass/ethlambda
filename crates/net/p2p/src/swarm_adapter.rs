@@ -269,14 +269,14 @@ async fn swarm_loop(
 ) {
     let mut mesh_metric_tick = tokio::time::interval(MESH_METRIC_REFRESH_INTERVAL);
     mesh_metric_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    loop {
+    let exit = loop {
         tokio::select! {
             event = swarm.next() => {
-                let Some(event) = event else { break };
-                if event_tx.send(event).is_err() { break }
+                let Some(event) = event else { break LoopExit::SwarmEnded };
+                if event_tx.send(event).is_err() { break LoopExit::ActorStopped }
             }
             cmd = cmd_rx.recv() => {
-                let Some(cmd) = cmd else { break };
+                let Some(cmd) = cmd else { break LoopExit::ActorStopped };
                 execute_command(&mut swarm, cmd);
             }
             _ = mesh_metric_tick.tick() => {
@@ -301,8 +301,27 @@ async fn swarm_loop(
                 disconnect_graylisted_peers(&mut swarm);
             }
         }
+    };
+    match exit {
+        LoopExit::ActorStopped => info!("Swarm adapter loop stopped: the P2P actor shut down"),
+        LoopExit::SwarmEnded => {
+            error!(
+                "Swarm adapter loop exited: the swarm stopped, so P2P networking is no longer functional"
+            )
+        }
     }
-    error!("Swarm adapter loop exited — P2P networking is no longer functional");
+}
+
+/// Why [`swarm_loop`] returned.
+///
+/// The P2P actor dropping its end of either channel is how a graceful
+/// shutdown reaches this task, so that exit is routine. An actor that panicked
+/// instead of stopping looks the same from here, but `spawned-concurrency`
+/// already logs that panic as an error. The swarm's own event stream never
+/// ends while the swarm lives, so its end is the one exit worth an error.
+enum LoopExit {
+    ActorStopped,
+    SwarmEnded,
 }
 
 /// Disconnect every peer gossipsub scores below the graylist, and publish how

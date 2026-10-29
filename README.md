@@ -72,6 +72,10 @@ with `Ctrl+C`; it shuts down gracefully on SIGINT only, so a systemd unit needs
   `xattr -d com.apple.quarantine <file>` lifts; a `curl` download is not.
 - [`RELEASE.md`](./RELEASE.md#verifying-a-release) shows how to verify an
   ethlambda binary's provenance attestation.
+- A release binary is the tested release candidate's build, so `--version`
+  names that candidate (`vX.Y.Z-rc.N-<sha>`), while the same release's Docker
+  image reports `vX.Y.Z-stable-<sha>`. Both run the same code; see
+  [`RELEASE.md`](./RELEASE.md#version-string).
 
 To skip payload validation, run the node without ethrex: drop it, the JWT
 secret and the two `--execution-*` flags. The node then follows the chain and
@@ -96,8 +100,9 @@ curl -s localhost:5052/eth/v1/node/syncing
 ```
 
 The node has caught up once `sync_distance` (the chain's current slot minus
-`head_slot`) is near 0. Don't rely on `is_syncing` yet: it currently reads
-`false` during catch-up as well.
+`head_slot`) is near 0. Don't rely on `is_syncing` or `/eth/v1/node/health`
+yet: during catch-up `is_syncing` can read `false` or switch back and forth,
+and the health endpoint can answer `200` rather than `206`.
 
 For Sepolia or Hoodi, change `--network mainnet` to `--network sepolia` or
 `--network hoodi` in both the ethrex and the beacon node arguments, and point
@@ -150,8 +155,10 @@ docker run -d --name ethrex --network ethereum \
   --authrpc.addr      0.0.0.0 \
   --authrpc.jwtsecret /jwt.hex
 
-# The node shuts down gracefully on SIGINT only, so this makes `docker stop` flush its state
-docker run -d --name ethlambda-beacon --network ethereum --stop-signal SIGINT \
+# The node shuts down gracefully on SIGINT only, so `--stop-signal` makes `docker stop` send it.
+# Flushing its state can outlast Docker's default 10 s, after which Docker kills it and the
+# unflushed state is lost, so `--stop-timeout` gives it a minute.
+docker run -d --name ethlambda-beacon --network ethereum --stop-signal SIGINT --stop-timeout 60 \
   -p 9000:9000/udp -p 9001:9001/udp -p 9001:9001/tcp \
   -p 127.0.0.1:5052:5052 \
   -v "$PWD/beacon-data:/data" \
@@ -182,8 +189,10 @@ openssl rand -hex 32 > beacon-data/node-key
 # This host's public address, published in the node's ENR (see above)
 PUBLIC_IP=$(curl -s https://ifconfig.me)
 
-# The node shuts down gracefully on SIGINT only, so this makes `docker stop` flush its state
-docker run -d --name ethlambda-beacon --stop-signal SIGINT \
+# The node shuts down gracefully on SIGINT only, so `--stop-signal` makes `docker stop` send it.
+# Flushing its state can outlast Docker's default 10 s, after which Docker kills it and the
+# unflushed state is lost, so `--stop-timeout` gives it a minute.
+docker run -d --name ethlambda-beacon --stop-signal SIGINT --stop-timeout 60 \
   -p 9000:9000/udp -p 9001:9001/udp -p 9001:9001/tcp \
   -p 127.0.0.1:5052:5052 \
   -v "$PWD/beacon-data:/data" \

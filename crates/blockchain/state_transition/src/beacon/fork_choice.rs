@@ -1282,6 +1282,11 @@ pub fn get_forkchoice_store(
     store
         .insert_signed_block(anchor_root, anchor_block)
         .expect("insert");
+    // The anchor heads the canonical chain, but the head-diff that maintains
+    // `BlockRoots` never writes the block it starts from.
+    store
+        .index_beacon_anchor(anchor_root)
+        .expect("index anchor");
     // Only the hash, not a verdict: the specification's `is_execution_block`
     // reads the block body, and the anchor is the one block that never goes
     // through `on_block`, which is what fills this cache. Without it the first
