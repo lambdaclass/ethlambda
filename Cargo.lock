@@ -193,6 +193,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "ark-bn254"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1870,7 +1879,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2254,7 +2263,7 @@ dependencies = [
 [[package]]
 name = "ethrex-blockchain"
 version = "30.0.1"
-source = "git+https://github.com/lambdaclass/ethrex?rev=8f84752408a126cfa8a9c21c3ebaa76658023cb7#8f84752408a126cfa8a9c21c3ebaa76658023cb7"
+source = "git+https://github.com/lambdaclass/ethrex?rev=80308d0df591f97a3bb1f81cd868f13b9729b48e#80308d0df591f97a3bb1f81cd868f13b9729b48e"
 dependencies = [
  "bytes",
  "crossbeam",
@@ -2279,7 +2288,7 @@ dependencies = [
 [[package]]
 name = "ethrex-common"
 version = "30.0.1"
-source = "git+https://github.com/lambdaclass/ethrex?rev=8f84752408a126cfa8a9c21c3ebaa76658023cb7#8f84752408a126cfa8a9c21c3ebaa76658023cb7"
+source = "git+https://github.com/lambdaclass/ethrex?rev=80308d0df591f97a3bb1f81cd868f13b9729b48e#80308d0df591f97a3bb1f81cd868f13b9729b48e"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -2314,7 +2323,7 @@ dependencies = [
 [[package]]
 name = "ethrex-crypto"
 version = "30.0.1"
-source = "git+https://github.com/lambdaclass/ethrex?rev=8f84752408a126cfa8a9c21c3ebaa76658023cb7#8f84752408a126cfa8a9c21c3ebaa76658023cb7"
+source = "git+https://github.com/lambdaclass/ethrex?rev=80308d0df591f97a3bb1f81cd868f13b9729b48e#80308d0df591f97a3bb1f81cd868f13b9729b48e"
 dependencies = [
  "ark-bn254",
  "ark-ec",
@@ -2336,7 +2345,7 @@ dependencies = [
 [[package]]
 name = "ethrex-guest-program"
 version = "30.0.1"
-source = "git+https://github.com/lambdaclass/ethrex?rev=8f84752408a126cfa8a9c21c3ebaa76658023cb7#8f84752408a126cfa8a9c21c3ebaa76658023cb7"
+source = "git+https://github.com/lambdaclass/ethrex?rev=80308d0df591f97a3bb1f81cd868f13b9729b48e#80308d0df591f97a3bb1f81cd868f13b9729b48e"
 dependencies = [
  "bytes",
  "ethereum-types",
@@ -2359,7 +2368,7 @@ dependencies = [
 [[package]]
 name = "ethrex-l2-common"
 version = "30.0.1"
-source = "git+https://github.com/lambdaclass/ethrex?rev=8f84752408a126cfa8a9c21c3ebaa76658023cb7#8f84752408a126cfa8a9c21c3ebaa76658023cb7"
+source = "git+https://github.com/lambdaclass/ethrex?rev=80308d0df591f97a3bb1f81cd868f13b9729b48e#80308d0df591f97a3bb1f81cd868f13b9729b48e"
 dependencies = [
  "bytes",
  "ethereum-types",
@@ -2377,7 +2386,7 @@ dependencies = [
 [[package]]
 name = "ethrex-levm"
 version = "30.0.1"
-source = "git+https://github.com/lambdaclass/ethrex?rev=8f84752408a126cfa8a9c21c3ebaa76658023cb7#8f84752408a126cfa8a9c21c3ebaa76658023cb7"
+source = "git+https://github.com/lambdaclass/ethrex?rev=80308d0df591f97a3bb1f81cd868f13b9729b48e#80308d0df591f97a3bb1f81cd868f13b9729b48e"
 dependencies = [
  "bytes",
  "derive_more 1.0.0",
@@ -2395,7 +2404,7 @@ dependencies = [
 [[package]]
 name = "ethrex-metrics"
 version = "30.0.1"
-source = "git+https://github.com/lambdaclass/ethrex?rev=8f84752408a126cfa8a9c21c3ebaa76658023cb7#8f84752408a126cfa8a9c21c3ebaa76658023cb7"
+source = "git+https://github.com/lambdaclass/ethrex?rev=80308d0df591f97a3bb1f81cd868f13b9729b48e#80308d0df591f97a3bb1f81cd868f13b9729b48e"
 dependencies = [
  "ethrex-common",
  "serde",
@@ -2407,10 +2416,11 @@ dependencies = [
 [[package]]
 name = "ethrex-p2p"
 version = "30.0.1"
-source = "git+https://github.com/lambdaclass/ethrex?rev=8f84752408a126cfa8a9c21c3ebaa76658023cb7#8f84752408a126cfa8a9c21c3ebaa76658023cb7"
+source = "git+https://github.com/lambdaclass/ethrex?rev=80308d0df591f97a3bb1f81cd868f13b9729b48e#80308d0df591f97a3bb1f81cd868f13b9729b48e"
 dependencies = [
  "aes",
  "aes-gcm",
+ "arc-swap",
  "bytes",
  "concat-kdf",
  "crossbeam",
@@ -2449,7 +2459,7 @@ dependencies = [
 [[package]]
 name = "ethrex-rlp"
 version = "30.0.1"
-source = "git+https://github.com/lambdaclass/ethrex?rev=8f84752408a126cfa8a9c21c3ebaa76658023cb7#8f84752408a126cfa8a9c21c3ebaa76658023cb7"
+source = "git+https://github.com/lambdaclass/ethrex?rev=80308d0df591f97a3bb1f81cd868f13b9729b48e#80308d0df591f97a3bb1f81cd868f13b9729b48e"
 dependencies = [
  "bytes",
  "ethereum-types",
@@ -2459,7 +2469,7 @@ dependencies = [
 [[package]]
 name = "ethrex-storage"
 version = "30.0.1"
-source = "git+https://github.com/lambdaclass/ethrex?rev=8f84752408a126cfa8a9c21c3ebaa76658023cb7#8f84752408a126cfa8a9c21c3ebaa76658023cb7"
+source = "git+https://github.com/lambdaclass/ethrex?rev=80308d0df591f97a3bb1f81cd868f13b9729b48e#80308d0df591f97a3bb1f81cd868f13b9729b48e"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2482,7 +2492,7 @@ dependencies = [
 [[package]]
 name = "ethrex-trie"
 version = "30.0.1"
-source = "git+https://github.com/lambdaclass/ethrex?rev=8f84752408a126cfa8a9c21c3ebaa76658023cb7#8f84752408a126cfa8a9c21c3ebaa76658023cb7"
+source = "git+https://github.com/lambdaclass/ethrex?rev=80308d0df591f97a3bb1f81cd868f13b9729b48e#80308d0df591f97a3bb1f81cd868f13b9729b48e"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2502,7 +2512,7 @@ dependencies = [
 [[package]]
 name = "ethrex-vm"
 version = "30.0.1"
-source = "git+https://github.com/lambdaclass/ethrex?rev=8f84752408a126cfa8a9c21c3ebaa76658023cb7#8f84752408a126cfa8a9c21c3ebaa76658023cb7"
+source = "git+https://github.com/lambdaclass/ethrex?rev=80308d0df591f97a3bb1f81cd868f13b9729b48e#80308d0df591f97a3bb1f81cd868f13b9729b48e"
 dependencies = [
  "bytes",
  "derive_more 1.0.0",
@@ -3284,7 +3294,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.57.0",
 ]
 
 [[package]]
@@ -6398,7 +6408,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7152,7 +7162,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7964,7 +7974,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
