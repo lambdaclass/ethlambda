@@ -2,8 +2,8 @@
 //!
 //! # Deviation
 //!
-//! This client keeps no slashing-protection record, so the interchange data the
-//! specification requires cannot be produced. `DELETE` declares
+//! This client does not yet import or export EIP-3076 history, so the
+//! interchange data the specification requires is not produced. `DELETE` declares
 //! `slashing_protection` a required response field, so an empty but well-formed
 //! EIP-3076 interchange is returned; `POST` accepts the optional
 //! `slashing_protection` field and ignores it. A caller migrating keys between
@@ -12,8 +12,8 @@
 //! The empty interchange [`DELETE`] returns is deliberately unusable as one:
 //! its `genesis_validators_root` is all-zero rather than the chain's real
 //! value. A real root would make the file look like legitimate, if empty,
-//! history, which is worse than what it actually is (no history at all,
-//! because this client never recorded any). The all-zero root is chosen so a
+//! history, which is worse than what it actually is (none of the history this
+//! client recorded, since it does not export it yet). The all-zero root is chosen so a
 //! conformant importer rejects the file outright instead of trusting it, on
 //! the theory that a loud, obvious failure at import time beats a tool
 //! silently believing a validator has never signed.
@@ -72,7 +72,7 @@ pub struct ImportRequest {
     /// memory until decryption runs, and a plain `Vec<String>` would leave
     /// those bytes sitting in the allocator's freed memory afterwards.
     pub passwords: Zeroizing<Vec<String>>,
-    /// Accepted and ignored: this client keeps no slashing-protection record.
+    /// Accepted and ignored: importing EIP-3076 history is not supported yet.
     #[serde(default)]
     pub slashing_protection: Option<String>,
 }
@@ -145,7 +145,10 @@ pub async fn import(
     Json(request): Json<ImportRequest>,
 ) -> Json<StatusResponse> {
     if request.slashing_protection.is_some() {
-        warn!("Ignoring slashing_protection on import: this client keeps no signing history");
+        warn!(
+            "Ignoring slashing_protection on import: importing EIP-3076 history is not \
+             supported yet, so every new key starts as never having signed"
+        );
     }
 
     if request.keystores.len() > MAX_KEYSTORES_PER_IMPORT {
@@ -243,6 +246,25 @@ fn prepare_import(
     let secret = keystore.decrypt(password).map_err(KeyStatus::error)?;
     let pubkey = ValidatorStore::derive_pubkey(&secret).map_err(KeyStatus::error)?;
 
+    // Registered before the key is written to disk or reachable through the
+    // store, so the duty path never meets a key it has no record for, and a
+    // restart finds a record for every key on disk. A key that already has a
+    // record keeps it. The history the request may carry is not imported yet,
+    // so a key arriving from another client starts as never having signed:
+    // see the warning in `import`.
+    let registered = context
+        .protection
+        .lock()
+        .map_err(|_| KeyStatus::error("slashing protection is poisoned"))?
+        .register(&[pubkey])
+        .map_err(KeyStatus::error)?;
+    if registered > 0 {
+        warn!(
+            pubkey = %encode_hex(&pubkey.0),
+            "Imported a validator key with no slashing-protection history"
+        );
+    }
+
     // Persisted before the key is reachable through the store: a validator
     // this process is willing to sign with must already be durable, or a
     // crash right after "imported" is reported silently loses it, with
@@ -321,9 +343,9 @@ fn persist_import(
     // and re-saves it. Leaving a failed key's mutation in place would let the
     // *next* key's successful save write it to disk, so a key this request
     // reports as `error` would be enabled on the next restart and start
-    // signing. With no slashing-protection record, a validator the operator
-    // believes was never imported is exactly the kind that ends up running in
-    // two places.
+    // signing. A validator the operator believes was never imported is exactly
+    // the kind that ends up running in two places, which no local record can
+    // see.
     enum Undo {
         Appended,
         Replaced {
@@ -564,6 +586,7 @@ mod tests {
             validators_dir: dir.to_path_buf(),
             secrets_dir: dir.to_path_buf(),
             definitions_lock: Arc::new(tokio::sync::Mutex::new(())),
+            protection: crate::slashing_protection::SlashingProtection::in_memory(),
         }
     }
 
@@ -898,6 +921,45 @@ mod tests {
             hex::encode(reloaded.pubkeys()[0].0),
             "9612d7a727c9d0a22e185a1c768478dfe919cada9266988cb32359c11f2b7b27f4ae4040902382ae2910c15e2b420d07"
         );
+    }
+
+    /// An imported key is registered in the slashing-protection record before
+    /// it is loaded, so the next start finds a record for it instead of
+    /// refusing it.
+    #[tokio::test]
+    async fn an_imported_key_is_registered_for_slashing_protection() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = ethlambda_types::beacon::primitives::Root::ZERO;
+        let protection =
+            crate::slashing_protection::SlashingProtection::open(dir.path(), root, &[], false)
+                .expect("opens with no keys");
+        let mut context =
+            context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
+        context.protection = Arc::new(std::sync::Mutex::new(protection));
+        let protection = context.protection.clone();
+
+        let (_, body) = send(
+            router(context, TOKEN.to_string()),
+            authed(
+                "POST",
+                "/eth/v1/keystores",
+                serde_json::json!({
+                    "keystores": [keystore_json()],
+                    "passwords": [PASSWORD],
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(body["data"][0]["status"], "imported", "got {body}");
+        assert_eq!(protection.lock().expect("not poisoned").len(), 1);
+
+        // The next start: same directory, the imported key loaded, no
+        // --init-slashing-protection. It must open, because the key is
+        // registered.
+        drop(protection);
+        let keys = ValidatorStore::load(dir.path()).expect("loads").pubkeys();
+        crate::slashing_protection::SlashingProtection::open(dir.path(), root, &keys, false)
+            .expect("the imported key has a record");
     }
 
     #[tokio::test]

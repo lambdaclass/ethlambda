@@ -262,17 +262,17 @@ Both chains run a chain actor, so `RunningNode` carries a plain `BlockChain`.
 
 ## `validator` flags
 
-`ethlambda validator` is not a node. It binds no libp2p port, opens no
+`ethlambda validator` is not a node. It binds no libp2p port, opens no chain
 database, runs no discovery and follows no chain: it holds validator keys and
 performs duties against a beacon node's standard REST API. It works against any
 conformant beacon node, this repository's `beacon` subcommand or another
 implementation's, so none of the [common flags](#common-flags) apply to it.
 
-> **It keeps no slashing-protection record.** Read
-> [Spec Deviations](./spec_deviations.md#the-validator-client-keeps-no-slashing-protection-record)
-> before running it with keys that hold real stake. In short: do not run these
-> keys in any other client while this one runs, and treat a restart with the
-> same care as a manual key move. The client repeats this warning at startup.
+> **Slashing protection** lives in `--validators-dir/slashing_protection.json`,
+> locked to one process. A key with no record is refused at startup unless
+> `--init-slashing-protection` is passed. Importing another client's history is
+> not supported yet. See
+> [Spec Deviations](./spec_deviations.md#the-validator-client-keeps-eip-3076s-minimal-watermarks-not-full-history).
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -285,6 +285,7 @@ implementation's, so none of the [common flags](#common-flags) apply to it.
 | `--suggested-fee-recipient` | none | Execution address to receive block rewards, `0x`-prefixed, for every validator the keymanager API gives no address of its own. Optional, and startup warns when it is absent: without it the beacon node picks an address, and it will not be yours |
 | `--graffiti` | empty | Text for the graffiti field of proposed blocks, for every validator the keymanager API gives no graffiti of its own. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer. An ethlambda beacon node appends both clients' versions to it (see [`rpc.md`](rpc.md#validator-endpoints)) |
 | `--enable-keymanager` | off | Serve the keymanager API: keystores, plus each validator's own fee recipient, graffiti and gas limit. Off by default because it mutates key material |
+| `--init-slashing-protection` | off | Register every loaded key with no slashing-protection record as never having signed, instead of refusing to start. Dangerous: only for keys that have signed nothing anywhere for at least two epochs. Never lowers an existing record; remove it once the keys are registered |
 
 ### What it does today
 

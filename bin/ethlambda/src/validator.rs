@@ -78,6 +78,18 @@ pub(crate) struct ValidatorOptions {
     /// beyond localhost must front it with TLS.
     #[arg(long, default_value = "false")]
     pub(crate) enable_keymanager: bool,
+
+    /// Register every loaded key that has no slashing-protection record as
+    /// never having signed, instead of refusing to start.
+    ///
+    /// DANGEROUS. Use it only for keys that are brand new, or that have signed
+    /// nothing anywhere for at least two epochs. A key that recently signed in
+    /// another client must bring that history instead: starting it here as
+    /// "never signed" can produce a slashable double vote. Keys that already
+    /// have a record keep it, so the flag never lowers one; remove it once the
+    /// keys are registered.
+    #[arg(long, default_value = "false")]
+    pub(crate) init_slashing_protection: bool,
 }
 
 impl ValidatorOptions {
@@ -154,6 +166,7 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
         keymanager: options
             .enable_keymanager
             .then(|| std::net::SocketAddr::new(options.http_address, options.keymanager_port)),
+        init_slashing_protection: options.init_slashing_protection,
     })
     .await
     .map_err(Into::into)
@@ -174,6 +187,7 @@ mod tests {
             graffiti: graffiti.to_string(),
             suggested_fee_recipient: None,
             enable_keymanager: false,
+            init_slashing_protection: false,
         }
     }
 
