@@ -839,11 +839,14 @@ the block under it really sits at that slot. This matters because it is the
 slot a checkpoint-syncing peer asks for right after reading the finalized
 state. A slot the store holds nothing at is still a `404`.
 
-`/eth/v1/node/identity` reports the peer id, the ENR discv5 publishes, and the
-node's QUIC, TCP and discv5 multiaddrs. The multiaddrs need
-`--discovery.advertise-ip`, since a node bound to `0.0.0.0` does not know the
-address peers reach it on; without the flag they are empty and the ENR carries
-no IP. `metadata` is still a placeholder.
+`/eth/v1/node/identity` reports the peer id, the ENR discv5 serves at the moment
+of the request, and the node's QUIC, TCP and discv5 multiaddrs. The ENR is read
+from discovery's own copy, so once discv5's IP voting re-signs it with the
+external address, the endpoint reports that record rather than the startup one.
+The multiaddrs need `--discovery.advertise-ip`, since a node bound to `0.0.0.0`
+does not know the address peers reach it on; without the flag they are empty,
+and the ENR carries no usable IP until IP voting supplies one. `metadata` is
+still a placeholder.
 
 ### `GET /eth/v1/events`
 

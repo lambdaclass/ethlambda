@@ -51,13 +51,20 @@ rand = "0.8"
 
 # Required for NodeEnr parsing.
 #
-# Pinned to an ethrex release tag, for the unified discovery module, the peer
-# table, and the `PeerFilter` seam this crate builds on. A tag rather than a
-# branch: a `main` that moves under us would change what this crate builds
-# against with nothing in the manifest saying so.
-ethrex-p2p = { git = "https://github.com/lambdaclass/ethrex", tag = "v25.0.0" }
-ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex", tag = "v25.0.0" }
-ethrex-common = { git = "https://github.com/lambdaclass/ethrex", tag = "v25.0.0" }
+# Pinned to the head of ethrex's `feat/discv5-predicate-queries`, which builds
+# on PR #7217. #7217 moves the contact table into the discovery server and gives
+# a consumer `DiscoveryHandle::record_peer_event` to report its own connections
+# with, which is what lets a libp2p client feed ethrex's lookup pacing. The
+# branch adds `DiscoveryHandle::find_nodes`/`records_matching`, the predicate
+# queries the subnet hunt in `discovery/subnets.rs` runs on. See
+# `docs/discovery.md`.
+#
+# A commit rather than a branch, for the reason the release tag it replaces was
+# chosen over `main`: what this crate builds against must not move without the
+# manifest saying so. Goes back to a tag once both are in a release.
+ethrex-p2p = { git = "https://github.com/lambdaclass/ethrex", rev = "8f84752408a126cfa8a9c21c3ebaa76658023cb7" }
+ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex", rev = "8f84752408a126cfa8a9c21c3ebaa76658023cb7" }
+ethrex-common = { git = "https://github.com/lambdaclass/ethrex", rev = "8f84752408a126cfa8a9c21c3ebaa76658023cb7" }
 
 # `rand` seeds the throwaway signing keys the ENR tests build records with.
 secp256k1.workspace = true

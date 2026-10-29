@@ -196,12 +196,46 @@ pub struct CustodyColumns(pub Vec<u64>);
 /// How peers reach this node, as `/eth/v1/node/identity` reports it.
 #[derive(Debug, Clone, Default)]
 pub struct BeaconIdentity {
-    /// The node's ENR, `enr:`-prefixed.
-    pub enr: String,
+    /// The node's ENR, `enr:`-prefixed, read when the endpoint is asked.
+    pub enr: EnrSource,
     /// libp2p multiaddrs the node listens on, each ending in `/p2p/<peer id>`.
     pub p2p_addresses: Vec<String>,
     /// discv5 multiaddrs, likewise.
     pub discovery_addresses: Vec<String>,
+}
+
+/// Where `/eth/v1/node/identity` reads the node's ENR from.
+///
+/// A reader rather than a string because the record changes after startup:
+/// discv5's IP voting re-signs it with a new address and a higher `seq`, and a
+/// copy taken at startup would go on reporting a record peers no longer get.
+/// The default reads nothing, which the endpoint reports as an empty ENR, the
+/// answer for a node that publishes none.
+#[derive(Clone, Default)]
+pub struct EnrSource(Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>);
+
+impl EnrSource {
+    pub fn new(read: impl Fn() -> Option<String> + Send + Sync + 'static) -> Self {
+        Self(Some(Arc::new(read)))
+    }
+
+    /// The ENR right now, or an empty string when there is none to read.
+    pub fn current(&self) -> String {
+        self.0.as_ref().and_then(|read| read()).unwrap_or_default()
+    }
+}
+
+/// A fixed ENR, for a record that never changes.
+impl From<String> for EnrSource {
+    fn from(enr: String) -> Self {
+        Self::new(move || Some(enr.clone()))
+    }
+}
+
+impl std::fmt::Debug for EnrSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("EnrSource").field(&self.current()).finish()
+    }
 }
 
 /// What the Beacon API's endpoints reach beyond the store.

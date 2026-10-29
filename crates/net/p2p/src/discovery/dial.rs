@@ -1,65 +1,87 @@
 //! The dial loop: turn what discv5 found into libp2p connections.
 //!
-//! Runs as a `P2PServer` tick paced by [`dial_interval`], drawing candidates
-//! from the ethrex peer table, ranking them by subnet coverage, and dialing one
-//! per tick until [`DiscoveryState::target_peers`] are connected.
+//! Runs as a `P2PServer` tick paced by [`dial_interval`], asking discovery for
+//! candidates, ranking them by subnet coverage, and dialing one per tick until
+//! [`DiscoveryState::target_peers`] are connected.
+//!
+//! Also the other direction: [`report_peer_connected`] and
+//! [`report_peer_disconnected`] tell discovery what the swarm did, which is the
+//! only way a libp2p connection becomes visible to it.
+//!
+//! Every tick also tells the subnet hunt ([`SubnetHunt`]) which subscribed
+//! attestation subnets are short of peers, and ranks what it found in with the
+//! rest.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
-use ethrex_p2p::discovery::lookup_interval_function;
-use ethrex_p2p::peer_table::{PeerTable, PeerTableServerProtocol as _};
+use ethrex_p2p::discovery::{DiscoveryHandle, PeerEvent, lookup_interval_function};
 use libp2p::PeerId;
 use libp2p::swarm::dial_opts::DialOpts;
 use tokio::sync::mpsc;
 use tracing::trace;
 
-use super::admission::{DiscoveredPeer, LeanFilter, rank_candidates};
+use super::admission::{DialTargets, DiscoveredPeer, LeanFilter, rank_candidates};
+use super::node_id::node_id_from_peer_id;
+use super::subnets::SubnetHunt;
 use super::{
     DIAL_INTERVAL_AT_TARGET, DIAL_INTERVAL_AT_ZERO_PEERS, DISCOVERY_CANDIDATE_BATCH,
-    DiscoveryHandle,
+    SpawnedDiscovery,
 };
 use crate::swarm_adapter::DialOutcome;
 use crate::{ConnectionDirection, P2PServer, metrics};
 
 /// Everything the dial loop needs from a running discovery server.
 pub(crate) struct DiscoveryState {
-    /// Contacts [`spawn_contact_poll`]'s task has drawn from the peer table and
-    /// passed through admission, waiting to be ranked into `candidates`.
+    /// The running discovery server, kept for the connection reports; see
+    /// [`report_peer_connected`].
+    handle: DiscoveryHandle,
+    /// Nodes [`spawn_contact_poll`]'s task has drawn from discovery and found a
+    /// dial target for, waiting to be ranked into `candidates`.
     ///
-    /// A receiver rather than the `PeerTable` itself, because drawing a contact
-    /// is an actor round trip and this side of it must never await one: the dial
-    /// loop holds `&mut P2PServer` for the length of a tick.
+    /// A receiver rather than the handle itself, because drawing a node is an
+    /// actor round trip and this side of it must never await one: the dial loop
+    /// holds `&mut P2PServer` for the length of a tick.
     contacts: mpsc::Receiver<DiscoveredPeer>,
     /// Admitted candidates, best first, drained one per tick. Refilled from
-    /// `contacts` when empty.
+    /// `contacts` when empty, and joined by the subnet hunt's finds whenever
+    /// some arrive.
     candidates: VecDeque<DiscoveredPeer>,
+    /// The search for peers on subscribed subnets this node is short of.
+    hunt: SubnetHunt,
     /// Subnets advertised by peers we dialed from discovery.
     peer_attnets: HashMap<PeerId, Vec<u64>>,
     /// Our own peer ID, so the loop never dials itself.
     local_peer_id: PeerId,
     /// Connected-peer count above which the loop stops dialing.
     target_peers: usize,
-    /// A handle on the admission policy the peer table also runs, so a fork
+    /// A handle on the admission policy discovery also runs, so a fork
     /// boundary can move both with one call. See [`LeanFilter::set_fork_id`].
     filter: LeanFilter,
 }
 
 impl DiscoveryState {
-    /// Starts the contact poll task, so it must be called from inside a tokio
-    /// runtime. Every call site builds a `P2PServer` from an async context.
-    pub(crate) fn new(handle: DiscoveryHandle, local_peer_id: PeerId) -> Self {
+    /// Starts the contact poll and subnet hunt tasks, so it must be called from
+    /// inside a tokio runtime. Every call site builds a `P2PServer` from an
+    /// async context.
+    pub(crate) fn new(spawned: SpawnedDiscovery, local_peer_id: PeerId) -> Self {
         Self {
-            contacts: spawn_contact_poll(handle.peer_table, handle.filter.clone()),
+            contacts: spawn_contact_poll(spawned.handle.clone(), spawned.filter.dial_targets()),
+            hunt: SubnetHunt::spawn(
+                spawned.handle.clone(),
+                spawned.filter.clone(),
+                spawned.subscription_subnets,
+            ),
+            handle: spawned.handle,
             candidates: VecDeque::new(),
             peer_attnets: HashMap::new(),
             local_peer_id,
-            target_peers: handle.target_peers,
-            filter: handle.filter,
+            target_peers: spawned.target_peers,
+            filter: spawned.filter,
         }
     }
 
-    /// The admission policy shared with the peer table.
+    /// The admission policy shared with discovery.
     pub(crate) fn filter(&self) -> &LeanFilter {
         &self.filter
     }
@@ -70,7 +92,37 @@ impl DiscoveryState {
     }
 }
 
-/// How long the poll task waits after the peer table offers nothing.
+/// Tell discovery we are connected to `peer_id`.
+///
+/// Two things follow upstream: the peer stops being offered as a dial
+/// candidate, and it counts towards the completion figure that paces discv5
+/// lookups, which eases off the startup rate as we approach `target_peers`.
+/// Without this a libp2p node looks permanently peerless to discovery and keeps
+/// looking at the startup rate for the life of the process.
+///
+/// A no-op when discovery is off, or for a peer whose id carries no secp256k1
+/// key to name it by; see [`node_id_from_peer_id`].
+pub(crate) fn report_peer_connected(server: &P2PServer, peer_id: &PeerId) {
+    report(server, peer_id, PeerEvent::Connected);
+}
+
+/// Tell discovery our connection to `peer_id` is gone, so it is dialable again
+/// and no longer counted.
+pub(crate) fn report_peer_disconnected(server: &P2PServer, peer_id: &PeerId) {
+    report(server, peer_id, PeerEvent::Disconnected);
+}
+
+fn report(server: &P2PServer, peer_id: &PeerId, event: PeerEvent) {
+    let Some(discovery) = server.discovery.as_ref() else {
+        return;
+    };
+    let Some(node_id) = node_id_from_peer_id(peer_id) else {
+        return;
+    };
+    discovery.handle.record_peer_event(node_id, event);
+}
+
+/// How long the poll task waits after discovery offers nothing.
 ///
 /// Not an end: ethrex clears its tried set once a full scan finds nothing
 /// eligible, and discv5 keeps crawling underneath, so contacts reappear on
@@ -245,7 +297,7 @@ fn dial_budget_from(
 /// shortfall permanently open. Pacing on the shortfall alone would then hold
 /// the loop at the floor forever, emptying the contact buffer tens of times a
 /// second for peers it is already connected to and keeping
-/// [`spawn_contact_poll`] drawing the peer table down to refill it.
+/// [`spawn_contact_poll`] drawing discovery's eligible set down to refill it.
 ///
 /// `target_peers` is the running loop's own [`DiscoveryState::target_peers`],
 /// read by the caller that already had to check discovery is on.
@@ -255,6 +307,13 @@ pub(crate) async fn dial_tick(server: &mut P2PServer, target_peers: usize) -> bo
     // borrow held across it keeps any swarm event from touching
     // `connected_peers` for the length of the tick.
     let budget = dial_budget(server, target_peers);
+    // Before the early return, so a loop with no budget tells the hunt to
+    // stand down rather than leaving it walking for peers nobody will dial.
+    if let Some(discovery) = server.discovery.as_ref() {
+        discovery
+            .hunt
+            .update(&discovery.peer_attnets, &server.connected_peers, budget > 0);
+    }
     if budget == 0 {
         return false;
     }
@@ -334,50 +393,60 @@ pub(crate) async fn dial_tick(server: &mut P2PServer, target_peers: usize) -> bo
 }
 
 /// Rank whatever [`spawn_contact_poll`] has admitted since the last refill
-/// into the candidate queue, once that queue has run out.
+/// into the candidate queue, once that queue has run out, and whatever the
+/// subnet hunt found into it at once.
 ///
-/// Refilled only when empty, which is what leaves `spawn_contact_poll`'s
-/// bounded channel able to do its job: draining on every tick would move
-/// contacts into this unbounded queue as fast as the table could serve them,
-/// and the backpressure that stops it being drawn down for nobody would be
-/// gone. Ranking is per refill either way, since it scores a batch against
-/// coverage this node has right now.
+/// The poll's contacts are taken only when the queue is empty, which is what
+/// leaves `spawn_contact_poll`'s bounded channel able to do its job: draining
+/// on every tick would move contacts into this unbounded queue as fast as the
+/// table could serve them, and the backpressure that stops it being drawn down
+/// for nobody would be gone. The hunt's finds need no such wait, since a hunt
+/// hands over a handful at most, and they are worth more than what is queued:
+/// the queue is ranked again with them in it, so they go ahead of it.
 fn refill_candidates(server: &mut P2PServer) {
     let Some(discovery) = server.discovery.as_mut() else {
         return;
     };
-    if !discovery.candidates.is_empty() {
-        return;
-    }
-    let mut admitted = Vec::with_capacity(DISCOVERY_CANDIDATE_BATCH);
-    while let Ok(peer) = discovery.contacts.try_recv() {
-        admitted.push(peer);
+    let mut admitted = discovery.hunt.drain_found();
+    if discovery.candidates.is_empty() {
+        while let Ok(peer) = discovery.contacts.try_recv() {
+            admitted.push(peer);
+        }
     }
     if admitted.is_empty() {
         return;
     }
+    admitted.extend(discovery.candidates.drain(..));
     let covered = covered_subnets(&discovery.peer_attnets, &server.connected_peers);
-    let wanted = undersupplied_custody_columns(server);
-    rank_candidates(&mut admitted, &covered, &wanted);
+    let wanted_subnets = discovery.hunt.wanted();
+    let wanted_columns = undersupplied_custody_columns(server);
+    rank_candidates(&mut admitted, &covered, &wanted_columns, &wanted_subnets);
     if let Some(discovery) = server.discovery.as_mut() {
         discovery.candidates.extend(admitted);
     }
 }
 
-/// Draw dialable peers from the peer table, off the p2p actor's thread.
+/// Draw dialable peers from discovery, off the p2p actor's thread.
 ///
-/// `get_contact_to_initiate` is an actor round trip, and the dial loop used to
+/// `next_dial_candidate` is an actor round trip, and the dial loop used to
 /// await up to [`DISCOVERY_CANDIDATE_BATCH`] of them inline, holding
 /// `&mut P2PServer` across every one. That parked the entire actor — gossip
-/// forwarding, req/resp, swarm events, every tick — behind the peer table for
-/// the length of a refill. The round trips happen in this task now, and what
+/// forwarding, req/resp, swarm events, every tick — behind discovery for the
+/// length of a refill. The round trips happen in this task now, and what
 /// reaches the loop is a channel of already-admitted [`DiscoveredPeer`]s it can
 /// drain without awaiting anything.
 ///
-/// ethrex serves one contact per call, skipping anything its `PeerFilter`
-/// (ours: [`LeanFilter`]) already rejected, and records each as *tried* before
-/// returning it. So successive calls never repeat, and everything that arrives
-/// here has already passed admission.
+/// ethrex serves one node per call, skipping anything it has written off, is
+/// already connected to, or whose ENR our
+/// [`LeanFilter`](super::admission::LeanFilter) turned down, and records each
+/// as *tried* before returning it. So successive calls never repeat, and
+/// everything that arrives here has already passed admission.
+///
+/// What arrives is a `Node`, which knows an address and a key and nothing about
+/// `quic`, `tcp` or `attnets`, so the dial target is looked back up in
+/// [`DialTargets`] under the node's id. A miss is ordinary: bootnodes are
+/// dialable to ethrex before they have published an ENR, and one we never read
+/// a record for is one we cannot build a libp2p multiaddr for.
 ///
 /// That "marked tried on the way out" is why the channel is bounded and why the
 /// task reserves its slot before asking. A contact drawn with nowhere to put it
@@ -388,25 +457,24 @@ fn refill_candidates(server: &mut P2PServer) {
 ///
 /// The task ends when the receiver does, which is when the `P2PServer` holding
 /// [`DiscoveryState`] is dropped.
-fn spawn_contact_poll(peer_table: PeerTable, filter: LeanFilter) -> mpsc::Receiver<DiscoveredPeer> {
+fn spawn_contact_poll(
+    handle: DiscoveryHandle,
+    dial_targets: DialTargets,
+) -> mpsc::Receiver<DiscoveredPeer> {
     let (contacts, receiver) = mpsc::channel(DISCOVERY_CANDIDATE_BATCH);
     tokio::spawn(async move {
         while let Ok(permit) = contacts.reserve().await {
-            let Ok(Some(contact)) = peer_table.get_contact_to_initiate().await else {
+            let Some(node) = handle.next_dial_candidate().await else {
                 drop(permit);
                 tokio::time::sleep(CONTACT_POLL_IDLE).await;
                 continue;
             };
-            // A contact whose ENR has not arrived is unjudged, so the peer table
-            // still offers it, but it carries no address or peer id to dial.
-            // Skipping it costs nothing: it was marked tried on the way out
-            // either way. The permit is released with it, so the slot goes to
-            // the next contact rather than to this one's absence.
-            if let Some(peer) = contact
-                .record
-                .as_ref()
-                .and_then(|record| filter.dial_target(record))
-            {
+            // A node with no dial target filed is one whose ENR we never read,
+            // so it carries no address or peer id to dial. Skipping it costs
+            // nothing: it was marked tried on the way out either way. The
+            // permit is released with it, so the slot goes to the next node
+            // rather than to this one's absence.
+            if let Some(peer) = dial_targets.get(&node.node_id()) {
                 permit.send(peer);
             }
         }

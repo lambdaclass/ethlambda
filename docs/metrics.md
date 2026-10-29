@@ -143,6 +143,7 @@ here: a discovery dial that succeeds or fails shows up in
 | Name | Type | Usage | Sample collection event | Labels |
 |------|------|-------|-------------------------|--------|
 | `lean_discovered_peers_dialed_total` | Counter | Peers dialed as a result of discv5 discovery | On dialing a discovered peer | |
+| `lean_discovery_subnet_hunt_peers_total` | Counter | Peers found by discv5 subnet hunts, for subscribed attestation subnets short of peers | On each subnet hunt, by the peers it handed the dial loop | |
 
 ### Transport Mix
 

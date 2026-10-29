@@ -92,7 +92,10 @@ use tracing::{debug, info, trace, warn};
 use crate::{
     discovery::{
         DIAL_INTERVAL_AT_TARGET, DIAL_INTERVAL_AT_ZERO_PEERS, DiscoveryError, DiscoverySpawnConfig,
-        dial::{DiscoveryState, dial_interval, dial_progress, dial_tick, forget_discovered_peer},
+        dial::{
+            DiscoveryState, dial_interval, dial_progress, dial_tick, forget_discovered_peer,
+            report_peer_connected, report_peer_disconnected,
+        },
         enr::{dialable_port, read_ip, read_public_key, read_quic_port, read_tcp_port},
         spawn_discovery,
     },
@@ -1129,9 +1132,9 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
 /// Public handle to the P2P actor.
 pub struct P2P {
     handle: ActorRef<P2PServer>,
-    /// This node's ENR as published at startup, for the Beacon API's
+    /// This node's ENR as discovery currently serves it, for the Beacon API's
     /// `/eth/v1/node/identity`. `None` when discovery is disabled.
-    local_enr: Option<String>,
+    local_enr: Option<discovery::LocalEnr>,
 }
 
 impl P2P {
@@ -1283,12 +1286,11 @@ impl P2P {
         &self.handle
     }
 
-    /// This node's ENR, `enr:`-prefixed, as published at startup. discv5 may
-    /// re-sign it later with a higher sequence number if IP voting changes the
-    /// external address; this is the startup record. `None` when discovery is
-    /// disabled, since then no ENR is published.
-    pub fn local_enr(&self) -> Option<&str> {
-        self.local_enr.as_deref()
+    /// A reader for this node's ENR as discovery serves it, which follows the
+    /// re-signed record when discv5's IP voting changes the external address.
+    /// `None` when discovery is disabled, since then no ENR is published.
+    pub fn local_enr(&self) -> Option<discovery::LocalEnr> {
+        self.local_enr.clone()
     }
 }
 
@@ -1939,6 +1941,7 @@ async fn handle_swarm_event(
             if num_established.get() == 1 {
                 server.connected_peers.insert(peer_id, direction);
                 server.refresh_peer_metrics();
+                report_peer_connected(server, &peer_id);
                 let peer_count = server.connected_peers.len();
                 metrics::notify_peer_connected(
                     server.resolve_node_name(Some(&peer_id)),
@@ -2038,6 +2041,7 @@ async fn handle_swarm_event(
                     .connected_peers
                     .remove(&peer_id)
                     .unwrap_or(closed_direction);
+                report_peer_disconnected(server, &peer_id);
                 forget_discovered_peer(server, &peer_id);
                 server.refresh_peer_metrics();
                 let peer_count = server.connected_peers.len();
