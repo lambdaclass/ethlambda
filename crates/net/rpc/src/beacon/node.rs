@@ -108,7 +108,7 @@ async fn get_identity(peer_id: String, identity: Option<crate::BeaconIdentity>) 
     crate::json_response(serde_json::json!({
         "data": {
             "peer_id": peer_id,
-            "enr": identity.enr,
+            "enr": identity.enr.current(),
             "p2p_addresses": identity.p2p_addresses,
             "discovery_addresses": identity.discovery_addresses,
             "metadata": {
@@ -239,7 +239,7 @@ mod tests {
     async fn identity_reports_the_enr_and_listen_addresses() {
         let fixture = beacon_fixture(ANCHOR_SLOT);
         let identity = crate::BeaconIdentity {
-            enr: "enr:-abc".to_string(),
+            enr: "enr:-abc".to_string().into(),
             p2p_addresses: vec!["/ip4/10.0.0.1/tcp/9001/p2p/test-peer".to_string()],
             discovery_addresses: vec!["/ip4/10.0.0.1/udp/9000/p2p/test-peer".to_string()],
         };

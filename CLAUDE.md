@@ -366,9 +366,10 @@ actual_slot = finalized_slot + 1 + relative_index
   - Fork-digest rollover happens at runtime (`ForkSchedule`, `beacon::transition`): the next
     digest's topics are joined `SUBSCRIBE_LEAD_EPOCHS` before its boundary and the previous
     one's left `UNSUBSCRIBE_LAG_EPOCHS` after, blob-parameter (BPO) boundaries included.
-    **Known gap**: ethrex's `DiscoveryServer` cannot replace the served ENR at runtime, so its
-    `eth2` entry keeps the startup digest until a restart; peers discovering the node after a
-    boundary reject the record
+    **Known gap**: ethrex's `DiscoveryServer` has no message that edits the served ENR (its one
+    consumer-driven edit, the `fork_id` watch, writes `eth`, not `eth2`), so its `eth2` entry
+    keeps the startup digest until a restart; peers discovering the node after a boundary
+    reject the record. See `discovery::update_served_enr`
   - `voluntary_exit`, `proposer_slashing`, `attester_slashing` and `bls_to_execution_change`
     validate in p2p like aggregates (`gossip::operations`, against the unadvanced head state,
     which must be electra or fulu: under a gloas head every operation is IGNOREd) and feed
@@ -394,12 +395,13 @@ actual_slot = finalized_slot + 1 + relative_index
 ### Peer Discovery (discv5)
 - Always on for `beacon` (mainnet bootnode ENRs are not statically dialable, so a crawl is its only way to find a peer); opt-in for `node` behind the lean-only `--discovery.enable`, off by default, so a lean node peers from `--bootnodes` alone and binds no discovery socket. `Network::discovery_enabled` is the one answer; `P2P::spawn` takes `Option<DiscoverySpawnConfig>` and `P2PServer.discovery` is an `Option`, `None` leaving the dial loop unscheduled
 - Where it runs: `DEFAULT_DISCOVERY_PORT` (9000) unless `--discovery.port` says otherwise (own UDP socket, must differ from `--gossipsub-port`; checked once by `Options::validate_ports`, which skips the discovery rules when it is off). Co-located nodes that run discovery must each pass `--discovery.port`
-- Reuses ethrex's `DiscoveryServer` with discv4 disabled; `spawn` takes the prepared lean ENR, so the record ethrex serves is the one we report
+- Reuses ethrex's `DiscoveryServer` with discv4 disabled, pinned to a commit of ethrex's `feat/discv5-predicate-queries` (on top of ethrex PR #7217) until both are in a release; `spawn` takes the prepared lean ENR. ethrex re-signs it on IP voting and mirrors it into the `SharedLocalNode` it was spawned with; `discovery::LocalEnr` reads that mirror, so `/eth/v1/node/identity` reports the record discv5 currently serves. Read-only: nothing written there reaches discv5
 - ENR follows the beacon phase0 spec: `ip`/`udp`/`quic`/`tcp`/`secp256k1`/`eth2`/`attnets`
 - Admission mirrors lighthouse: `eth2.fork_digest` must match, `next_fork_*` may differ, a `quic` or `tcp` entry required. Handed to discovery as `LeanFilter: PeerFilter`, so records are judged on arrival, not at dial time; a reject is re-judged on a higher-`seq` ENR
 - The filter files each admitted peer in `DialTargets`, since discovery hands back a `Node` that carries no `quic`/`tcp`/`attnets`; the dial loop looks the node id back up there
 - Every libp2p connection is reported with `DiscoveryHandle::record_peer_event`, which is what lets discovery pace its lookups against `--discovery.target-peers`
-- Candidates ranked by uncovered attestation subnets. See [`docs/discovery.md`](docs/discovery.md)
+- Candidates ranked by custody gaps, then the subnet hunt's wanted subnets, then uncovered attestation subnets
+- Subnet hunt (`discovery/subnets.rs`): subscribed subnets with fewer than `TARGET_SUBNET_PEERS` (3) connected peers advertising them are searched with `DiscoveryHandle::records_matching` then `find_nodes` (ethrex's predicate queries), one hunt at a time on its own task; finds join the dial loop's candidate queue. Duty subnets from `beacon_committee_subscriptions` are not fed to it. See [`docs/discovery.md`](docs/discovery.md)
 
 ### Retry Strategy on Block Requests
 - Exponential backoff: doubling from `INITIAL_BACKOFF_MS` (5ms → 2560ms)

@@ -7,6 +7,10 @@
 //! Also the other direction: [`report_peer_connected`] and
 //! [`report_peer_disconnected`] tell discovery what the swarm did, which is the
 //! only way a libp2p connection becomes visible to it.
+//!
+//! Every tick also tells the subnet hunt ([`SubnetHunt`]) which subscribed
+//! attestation subnets are short of peers, and ranks what it found in with the
+//! rest.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -19,6 +23,7 @@ use tracing::trace;
 
 use super::admission::{DialTargets, DiscoveredPeer, LeanFilter, rank_candidates};
 use super::node_id::node_id_from_peer_id;
+use super::subnets::SubnetHunt;
 use super::{
     DIAL_INTERVAL_AT_TARGET, DIAL_INTERVAL_AT_ZERO_PEERS, DISCOVERY_CANDIDATE_BATCH,
     SpawnedDiscovery,
@@ -39,8 +44,11 @@ pub(crate) struct DiscoveryState {
     /// holds `&mut P2PServer` for the length of a tick.
     contacts: mpsc::Receiver<DiscoveredPeer>,
     /// Admitted candidates, best first, drained one per tick. Refilled from
-    /// `contacts` when empty.
+    /// `contacts` when empty, and joined by the subnet hunt's finds whenever
+    /// some arrive.
     candidates: VecDeque<DiscoveredPeer>,
+    /// The search for peers on subscribed subnets this node is short of.
+    hunt: SubnetHunt,
     /// Subnets advertised by peers we dialed from discovery.
     peer_attnets: HashMap<PeerId, Vec<u64>>,
     /// Our own peer ID, so the loop never dials itself.
@@ -53,11 +61,17 @@ pub(crate) struct DiscoveryState {
 }
 
 impl DiscoveryState {
-    /// Starts the contact poll task, so it must be called from inside a tokio
-    /// runtime. Every call site builds a `P2PServer` from an async context.
+    /// Starts the contact poll and subnet hunt tasks, so it must be called from
+    /// inside a tokio runtime. Every call site builds a `P2PServer` from an
+    /// async context.
     pub(crate) fn new(spawned: SpawnedDiscovery, local_peer_id: PeerId) -> Self {
         Self {
             contacts: spawn_contact_poll(spawned.handle.clone(), spawned.filter.dial_targets()),
+            hunt: SubnetHunt::spawn(
+                spawned.handle.clone(),
+                spawned.filter.clone(),
+                spawned.subscription_subnets,
+            ),
             handle: spawned.handle,
             candidates: VecDeque::new(),
             peer_attnets: HashMap::new(),
@@ -293,6 +307,13 @@ pub(crate) async fn dial_tick(server: &mut P2PServer, target_peers: usize) -> bo
     // borrow held across it keeps any swarm event from touching
     // `connected_peers` for the length of the tick.
     let budget = dial_budget(server, target_peers);
+    // Before the early return, so a loop with no budget tells the hunt to
+    // stand down rather than leaving it walking for peers nobody will dial.
+    if let Some(discovery) = server.discovery.as_ref() {
+        discovery
+            .hunt
+            .update(&discovery.peer_attnets, &server.connected_peers, budget > 0);
+    }
     if budget == 0 {
         return false;
     }
@@ -372,31 +393,34 @@ pub(crate) async fn dial_tick(server: &mut P2PServer, target_peers: usize) -> bo
 }
 
 /// Rank whatever [`spawn_contact_poll`] has admitted since the last refill
-/// into the candidate queue, once that queue has run out.
+/// into the candidate queue, once that queue has run out, and whatever the
+/// subnet hunt found into it at once.
 ///
-/// Refilled only when empty, which is what leaves `spawn_contact_poll`'s
-/// bounded channel able to do its job: draining on every tick would move
-/// contacts into this unbounded queue as fast as the table could serve them,
-/// and the backpressure that stops it being drawn down for nobody would be
-/// gone. Ranking is per refill either way, since it scores a batch against
-/// coverage this node has right now.
+/// The poll's contacts are taken only when the queue is empty, which is what
+/// leaves `spawn_contact_poll`'s bounded channel able to do its job: draining
+/// on every tick would move contacts into this unbounded queue as fast as the
+/// table could serve them, and the backpressure that stops it being drawn down
+/// for nobody would be gone. The hunt's finds need no such wait, since a hunt
+/// hands over a handful at most, and they are worth more than what is queued:
+/// the queue is ranked again with them in it, so they go ahead of it.
 fn refill_candidates(server: &mut P2PServer) {
     let Some(discovery) = server.discovery.as_mut() else {
         return;
     };
-    if !discovery.candidates.is_empty() {
-        return;
-    }
-    let mut admitted = Vec::with_capacity(DISCOVERY_CANDIDATE_BATCH);
-    while let Ok(peer) = discovery.contacts.try_recv() {
-        admitted.push(peer);
+    let mut admitted = discovery.hunt.drain_found();
+    if discovery.candidates.is_empty() {
+        while let Ok(peer) = discovery.contacts.try_recv() {
+            admitted.push(peer);
+        }
     }
     if admitted.is_empty() {
         return;
     }
+    admitted.extend(discovery.candidates.drain(..));
     let covered = covered_subnets(&discovery.peer_attnets, &server.connected_peers);
-    let wanted = undersupplied_custody_columns(server);
-    rank_candidates(&mut admitted, &covered, &wanted);
+    let wanted_subnets = discovery.hunt.wanted();
+    let wanted_columns = undersupplied_custody_columns(server);
+    rank_candidates(&mut admitted, &covered, &wanted_columns, &wanted_subnets);
     if let Some(discovery) = server.discovery.as_mut() {
         discovery.candidates.extend(admitted);
     }

@@ -1132,9 +1132,9 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
 /// Public handle to the P2P actor.
 pub struct P2P {
     handle: ActorRef<P2PServer>,
-    /// This node's ENR as published at startup, for the Beacon API's
+    /// This node's ENR as discovery currently serves it, for the Beacon API's
     /// `/eth/v1/node/identity`. `None` when discovery is disabled.
-    local_enr: Option<String>,
+    local_enr: Option<discovery::LocalEnr>,
 }
 
 impl P2P {
@@ -1286,12 +1286,11 @@ impl P2P {
         &self.handle
     }
 
-    /// This node's ENR, `enr:`-prefixed, as published at startup. discv5 may
-    /// re-sign it later with a higher sequence number if IP voting changes the
-    /// external address; this is the startup record. `None` when discovery is
-    /// disabled, since then no ENR is published.
-    pub fn local_enr(&self) -> Option<&str> {
-        self.local_enr.as_deref()
+    /// A reader for this node's ENR as discovery serves it, which follows the
+    /// re-signed record when discv5's IP voting changes the external address.
+    /// `None` when discovery is disabled, since then no ENR is published.
+    pub fn local_enr(&self) -> Option<discovery::LocalEnr> {
+        self.local_enr.clone()
     }
 }
 

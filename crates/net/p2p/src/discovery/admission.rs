@@ -206,6 +206,15 @@ impl LeanFilter {
         self.dial_targets.clone()
     }
 
+    /// What to dial for `record`, or `None` if it would not be admitted.
+    ///
+    /// Judges without filing: the subnet hunt reads records out of
+    /// discovery's answers, which hand back the record itself rather than a
+    /// node id to look up in [`DialTargets`].
+    pub(crate) fn dial_target(&self, record: &NodeRecord) -> Option<DiscoveredPeer> {
+        self.judge(record).ok()
+    }
+
     fn judge(&self, record: &NodeRecord) -> Result<DiscoveredPeer, RejectReason> {
         let policy = self.policy.read().expect("admission policy lock poisoned");
         admit(
@@ -345,8 +354,14 @@ impl DiscoveredPeer {
 
 /// Order candidates so the ones filling this node's gaps are dialed first:
 /// custody columns it samples that are undersupplied (fewer connected
-/// custodians than `dial::CUSTODY_REDUNDANCY_TARGET`), then attestation
-/// subnets no connected peer covers.
+/// custodians than `dial::CUSTODY_REDUNDANCY_TARGET`), then the subscribed
+/// attestation subnets the subnet hunt is looking for (`wanted_subnets`, see
+/// [`super::subnets`]), then attestation subnets no connected peer covers.
+///
+/// A wanted subnet outranks any other uncovered one because this node needs
+/// it: it subscribes to it, and publishes its own attestations there. The
+/// subnet hunt's finds land in the same queue and rank here like any other
+/// candidate, which is what puts them ahead of the crawl's random draws.
 ///
 /// Custody outranks subnets because the two shortfalls do not cost the same.
 /// At the extreme, a column no connected peer custodies cannot be fetched by
@@ -370,6 +385,7 @@ pub(crate) fn rank_candidates(
     candidates: &mut [DiscoveredPeer],
     covered_subnets: &HashSet<u64>,
     wanted_columns: &HashSet<u64>,
+    wanted_subnets: &HashSet<u64>,
 ) {
     candidates.sort_by_key(|candidate| {
         // Skipped rather than computed and discarded when nothing is wanted,
@@ -381,12 +397,21 @@ pub(crate) fn rank_candidates(
         } else {
             candidate.custody_coverage(wanted_columns)
         };
+        let wanted = candidate
+            .subnets
+            .iter()
+            .filter(|subnet| wanted_subnets.contains(subnet))
+            .count();
         let subnets = candidate
             .subnets
             .iter()
             .filter(|subnet| !covered_subnets.contains(subnet))
             .count();
-        (std::cmp::Reverse(columns), std::cmp::Reverse(subnets))
+        (
+            std::cmp::Reverse(columns),
+            std::cmp::Reverse(wanted),
+            std::cmp::Reverse(subnets),
+        )
     });
 }
 
@@ -727,7 +752,7 @@ mod tests {
 
     #[test]
     fn a_fork_boundary_moves_what_every_clone_admits() {
-        // The peer table owns a clone of the filter, so a boundary has to reach
+        // Discovery owns a clone of the filter, so a boundary has to reach
         // it through the shared policy rather than through the dial loop's copy.
         let table_copy = filter();
         let dial_copy = table_copy.clone();
@@ -828,7 +853,12 @@ mod tests {
             "no admitted peer may advertise a subnet outside the local committee"
         );
 
-        rank_candidates(&mut admitted, &HashSet::new(), &HashSet::new());
+        rank_candidates(
+            &mut admitted,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
         assert_eq!(
             admitted[0].subnets,
             vec![3],
@@ -845,9 +875,44 @@ mod tests {
             DiscoveredPeer::for_test(vec![2]),
             DiscoveredPeer::for_test(vec![2, 3]),
         ];
-        rank_candidates(&mut candidates, &HashSet::from([0u64, 1]), &HashSet::new());
+        rank_candidates(
+            &mut candidates,
+            &HashSet::from([0u64, 1]),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
         let order: Vec<_> = candidates.iter().map(|c| c.subnets.clone()).collect();
         assert_eq!(order, vec![vec![2, 3], vec![2], vec![0]]);
+    }
+
+    #[test]
+    fn a_wanted_subnet_outranks_more_uncovered_ones() {
+        // Nothing is covered, so `[1, 2, 3]` fills three gaps and `[0]` one.
+        // But subnet 0 is one this node subscribes to and is hunting peers
+        // for, and the others are not, so the one peer on it goes first.
+        let mut candidates = vec![
+            DiscoveredPeer::for_test(vec![1, 2, 3]),
+            DiscoveredPeer::for_test(vec![0]),
+        ];
+        rank_candidates(
+            &mut candidates,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::from([0u64]),
+        );
+        let order: Vec<_> = candidates.iter().map(|c| c.subnets.clone()).collect();
+        assert_eq!(order, vec![vec![0], vec![1, 2, 3]]);
+
+        // A column gap still comes first: the hunt sits below custody.
+        let supernode = custodian(constants::NUMBER_OF_CUSTODY_GROUPS);
+        let mut candidates = vec![DiscoveredPeer::for_test(vec![0]), supernode.clone()];
+        rank_candidates(
+            &mut candidates,
+            &HashSet::new(),
+            &HashSet::from([97u64]),
+            &HashSet::from([0u64]),
+        );
+        assert_eq!(candidates[0].peer_id, supernode.peer_id);
     }
 
     /// A candidate whose peer id is a real secp256k1 key, so the node id
@@ -880,7 +945,12 @@ mod tests {
         let well_subnetted = DiscoveredPeer::for_test(vec![0, 1, 2, 3]);
 
         let mut candidates = vec![well_subnetted.clone(), supernode.clone()];
-        rank_candidates(&mut candidates, &HashSet::new(), &HashSet::from([97u64]));
+        rank_candidates(
+            &mut candidates,
+            &HashSet::new(),
+            &HashSet::from([97u64]),
+            &HashSet::new(),
+        );
         assert_eq!(
             candidates[0].peer_id, supernode.peer_id,
             "a column no peer holds stops the chain; an uncovered subnet only narrows the view"
@@ -888,7 +958,12 @@ mod tests {
 
         // With every column covered, subnet coverage decides again.
         let mut candidates = vec![supernode.clone(), well_subnetted.clone()];
-        rank_candidates(&mut candidates, &HashSet::new(), &HashSet::new());
+        rank_candidates(
+            &mut candidates,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
         assert_eq!(candidates[0].peer_id, well_subnetted.peer_id);
     }
 
@@ -908,7 +983,12 @@ mod tests {
             DiscoveredPeer::for_test(vec![]),
             DiscoveredPeer::for_test(vec![7]),
         ];
-        rank_candidates(&mut candidates, &HashSet::new(), &HashSet::new());
+        rank_candidates(
+            &mut candidates,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
         let order: Vec<_> = candidates.iter().map(|c| c.subnets.clone()).collect();
         assert_eq!(
             order,

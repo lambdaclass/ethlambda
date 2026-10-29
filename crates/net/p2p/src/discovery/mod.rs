@@ -8,9 +8,13 @@
 //! and let libp2p race them.
 //!
 //! The traffic across that boundary runs one way, into discovery: a request for
-//! the next candidate, and a cast per connection opened or closed. Those casts
-//! are what let discovery pace its own lookups, since a libp2p connection is
-//! otherwise invisible to it.
+//! the next candidate, a cast per connection opened or closed, and the
+//! [`subnets`] hunt's predicate queries. The casts are what let discovery pace
+//! its own lookups, since a libp2p connection is otherwise invisible to it.
+//!
+//! Discovery owns this node's ENR once it starts: it re-signs the record when
+//! discv5's IP voting moves the address. [`LocalEnr`] reads the record it
+//! currently serves, which is what the Beacon API reports.
 //!
 //! See `docs/discovery.md` for the operator-facing description.
 
@@ -18,6 +22,7 @@ pub mod admission;
 pub(crate) mod dial;
 pub mod enr;
 pub(crate) mod node_id;
+pub(crate) mod subnets;
 
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
@@ -25,7 +30,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use ethrex_p2p::discovery::{DiscoveryConfig, DiscoveryHandle, DiscoveryServer};
-use ethrex_p2p::types::{LocalNode, Node};
+use ethrex_p2p::types::{LocalNode, Node, SharedLocalNode};
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -129,20 +134,20 @@ pub struct DiscoverySpawnConfig {
 
 /// What the P2P actor needs from a running discovery server.
 pub struct SpawnedDiscovery {
-    /// The running server. Three things travel over it: a request for the next
-    /// dial candidate, and a report for each connection opened and closed.
+    /// The running server. Over it travel a request for the next dial
+    /// candidate, a report for each connection opened and closed, and the
+    /// subnet hunt's queries.
     pub handle: DiscoveryHandle,
     /// A clone of the admission policy discovery runs. Clones share their
     /// policy and their [`DialTargets`](admission::DialTargets), so this is
     /// both how a fork boundary moves what discovery admits and how the dial
     /// loop reads what discovery filed.
     pub(crate) filter: LeanFilter,
-    /// This node's ENR as an `enr:`-prefixed string. `spawn_discovery` already
-    /// logs it; this copy is what the tests assert the published record against,
-    /// and what a future RPC identity endpoint would read. Reflects startup
-    /// state; discv5 may bump the sequence number later if PONG voting changes
-    /// our external IP.
-    pub local_enr: String,
+    /// The ENR discovery serves, read live; see [`LocalEnr`].
+    pub local_enr: LocalEnr,
+    /// The attestation subnets this node subscribes to, which its ENR's
+    /// `attnets` advertises. What the subnet hunt keeps supplied with peers.
+    pub(crate) subscription_subnets: HashSet<u64>,
     /// The configured [`DiscoverySpawnConfig::target_peers`], carried through to
     /// the dial loop's cutoff. Discovery is handed the same number separately,
     /// for its lookup pacing.
@@ -176,6 +181,7 @@ pub async fn spawn_discovery(
     let bound = socket.local_addr().map_err(DiscoveryError::SocketAddr)?;
 
     let advertise_ip = config.advertise_ip.unwrap_or(config.bind_ip);
+    let subscription_subnets = config.subscription_subnets.clone();
     let params = LocalEnrParams {
         signer,
         ip: advertise_ip,
@@ -188,12 +194,10 @@ pub async fn spawn_discovery(
     };
     let local_node = params.local_node();
     let local_record = build_local_enr(&params)?;
-    // EIP-778's text form is URL-safe base64 *without* padding
-    let local_enr = local_record
-        .enr_url()
-        .map_err(DiscoveryError::EncodeEnr)?
-        .trim_end_matches('=')
-        .to_string();
+    // Encoded once up front so a record that cannot be is a startup error, not
+    // an empty answer from the identity endpoint later. ethrex writes EIP-778's
+    // unpadded base64, which lighthouse requires.
+    let startup_enr = local_record.enr_url().map_err(DiscoveryError::EncodeEnr)?;
 
     // Our own filter rather than ethrex's `EthForkIdFilter`, which wants an
     // EIP-2124 `eth` entry compatible with an execution chain we do not judge
@@ -224,9 +228,9 @@ pub async fn spawn_discovery(
     // re-signs it under `params.signer` whenever IP voting bumps the sequence
     // number, keeping the extra entries.
     //
-    // `shared_local_node` is ethrex's live mirror of that identity, which its RPC
-    // layer serves the current record from. Nothing on this side reads it yet, so
-    // it is written and dropped; it costs one `Arc`.
+    // `shared_local_node` is ethrex's live mirror of that identity: every
+    // re-signed record is written back into it. [`LocalEnr`] keeps a clone, so
+    // the identity endpoint reports the record discv5 actually serves.
     //
     // `fork_id` publishes an EIP-2124 fork id for discovery to stamp on the ENR
     // when the chain crosses a fork. Neither chain here keys its peers on an
@@ -239,6 +243,7 @@ pub async fn spawn_discovery(
         node: local_node.clone(),
         record: local_record.clone(),
     }));
+    let local_enr = LocalEnr(shared_local_node.clone());
 
     let server = DiscoveryServer::spawn(
         local_node,
@@ -274,7 +279,7 @@ pub async fn spawn_discovery(
     let discovery = DiscoveryHandle::new();
     discovery.set(server);
 
-    info!(enr = %local_enr, "Local ENR");
+    info!(enr = %startup_enr, "Local ENR");
     if advertise_ip.is_unspecified() {
         warn!(
             "Local ENR advertises an unspecified IP; peers can still reach us once \
@@ -288,24 +293,61 @@ pub async fn spawn_discovery(
         handle: discovery,
         filter,
         local_enr,
+        subscription_subnets,
         target_peers: config.target_peers,
     })
+}
+
+/// This node's ENR as discovery serves it right now.
+///
+/// discv5's IP voting re-signs the record at runtime with a new address and a
+/// higher `seq`, and ethrex writes every record it re-signs into the
+/// [`SharedLocalNode`] it was started with. Reading through that, instead of
+/// keeping the string built at startup, is what keeps the Beacon API's
+/// `/eth/v1/node/identity` reporting the record peers get over discv5.
+///
+/// One direction only: nothing written here would reach discv5, which serves
+/// its own copy and overwrites this one on its next edit. See
+/// [`update_served_enr`] for the other direction.
+#[derive(Clone)]
+pub struct LocalEnr(SharedLocalNode);
+
+impl LocalEnr {
+    /// The served record as an `enr:` string, or `None` if it cannot be read.
+    ///
+    /// Encoding cannot fail for a record `spawn_discovery` already encoded,
+    /// since IP voting edits only the address. A poisoned lock means ethrex
+    /// panicked mid-edit; this answers `None` rather than spread the panic
+    /// into whichever caller asked.
+    pub fn current(&self) -> Option<String> {
+        // Cloned out so the guard, which is `!Send`, is dropped right here.
+        let record = self.0.read().ok()?.record.clone();
+        record
+            .enr_url()
+            .inspect_err(|err| warn!(%err, "Could not encode the local ENR"))
+            .ok()
+    }
 }
 
 /// Publish a new `eth2` entry in the ENR this node serves over discv5.
 ///
 /// Not possible with the discovery stack this node is built on, so this only
-/// says so. [`DiscoveryServer::spawn`] takes the local record by value, moves it
-/// into an actor it starts itself, and returns `()`: no actor handle comes back,
-/// and `DiscoveryServerProtocol` (`raw_packet`, `lookup_*`, `revalidate_*`,
-/// `enr_lookup`, `prune`, `shutdown`) has no message that replaces the record.
-/// The record is re-signed only internally, by discv5 IP voting
-/// (`update_local_ip`), which edits the address and nothing else. What would
-/// close the gap is a protocol message on `DiscoveryServer` that edits the
-/// local record and bumps its `seq`, or `spawn` returning the actor's handle.
+/// says so. [`DiscoveryServer::spawn`] now returns the actor's handle, but
+/// `DiscoveryServerProtocol` still has no message that edits the local record:
+/// its consumer-facing messages report peer events, prune, ask for dial
+/// candidates, run predicate queries and refresh a *remote* ENR. ethrex edits
+/// its own record in two places only, both internal: discv5 IP voting
+/// (`update_local_ip`, the address) and `refresh_fork_id`, fed by the `fork_id`
+/// watch channel `spawn` takes. That one is consumer-driven, but it writes the
+/// EIP-2124 `eth` entry, an execution-chain fork id, not the consensus `eth2`
+/// entry this node needs moved. Writing into the [`SharedLocalNode`] mirror
+/// does not help either: discovery serves its own copy and overwrites the
+/// mirror on its next edit. What would close the gap is a protocol message
+/// that applies an edit through `NodeRecord::edit` (one `seq` bump, re-signed)
+/// and mirrors the result, as `refresh_fork_id` already does for `eth`.
 ///
 /// Until then the record served to discv5 queries keeps the `eth2` entry it
-/// started with. Peers already connected are unaffected (they handshake on
+/// started with, and so does [`LocalEnr`], which reads what discovery serves. Peers already connected are unaffected (they handshake on
 /// `Status`, which does follow the switch) and the admission filter does move,
 /// but a peer that discovers this node after a boundary reads the stale digest
 /// and rejects the record, so a long-running node becomes harder to find until
@@ -327,10 +369,6 @@ mod tests {
     use ethrex_rlp::decode::RLPDecode;
     use std::net::Ipv4Addr;
 
-    /// The committee count `config` below spawns with, named so the filter the
-    /// self-admission test rebuilds cannot silently drift from it.
-    const TEST_COMMITTEE_COUNT: u64 = 4;
-
     fn config(discovery_port: u16, advertise_ip: Option<IpAddr>) -> DiscoverySpawnConfig {
         DiscoverySpawnConfig {
             node_key: secp256k1::SecretKey::new(&mut rand::rngs::OsRng)
@@ -340,7 +378,7 @@ mod tests {
             discovery_port,
             p2p_port: 9001,
             subscription_subnets: HashSet::from([0u64]),
-            attestation_committee_count: TEST_COMMITTEE_COUNT,
+            attestation_committee_count: 4,
             bootnodes: Vec::new(),
             advertise_ip,
             target_peers: DEFAULT_DISCOVERY_TARGET_PEERS,
@@ -367,11 +405,12 @@ mod tests {
             .await
             .expect("discovery spawns");
 
-        assert!(handle.local_enr.starts_with("enr:"));
+        let local_enr = handle.local_enr.current().expect("the served ENR encodes");
+        assert!(local_enr.starts_with("enr:"));
         // EIP-778's text form carries no base64 padding, and lighthouse
         // refuses a record that does.
-        assert!(!handle.local_enr.contains('='), "{}", handle.local_enr);
-        let record = decode_enr(&handle.local_enr);
+        assert!(!local_enr.contains('='), "{local_enr}");
+        let record = decode_enr(&local_enr);
 
         // With discovery_port: 0 the OS picks the real port, and the published
         // ENR must advertise that one: were it built from the requested 0
@@ -381,11 +420,8 @@ mod tests {
 
         // The policy handed to discovery must admit our own record. A peer
         // running this code applies exactly these rules to what we publish, so a
-        // record we would reject ourselves is one nobody dials. Rebuilt here
-        // from the same two values `spawn_discovery` constructs it with, since
-        // the filter itself was moved into the discovery server.
-        let filter = LeanFilter::new(EnrForkId::local(), TEST_COMMITTEE_COUNT);
-        assert!(filter.accepts(&record));
+        // record we would reject ourselves is one nobody dials.
+        assert!(handle.filter.accepts(&record));
     }
 
     #[tokio::test]
@@ -400,7 +436,8 @@ mod tests {
             .await
             .expect("discovery spawns");
 
-        assert_eq!(decode_enr(&handle.local_enr).pairs().ip, Some(advertised));
+        let local_enr = handle.local_enr.current().expect("the served ENR encodes");
+        assert_eq!(decode_enr(&local_enr).pairs().ip, Some(advertised));
     }
 
     #[tokio::test]
