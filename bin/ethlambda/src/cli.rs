@@ -115,8 +115,23 @@ pub(crate) enum Network {
     /// common flag.
     Mainnet {
         mainnet: MainnetOptions,
-        execution: Option<ExecutionOptions>,
+        execution: Execution,
     },
+}
+
+/// Which execution client a beacon node validates payloads against.
+#[derive(Debug)]
+pub(crate) enum Execution {
+    /// None: blocks import without any payload validation. Only a build
+    /// without `include-ethrex` can run this way, since that build's
+    /// fallback for an absent endpoint is the embedded client.
+    #[cfg(not(feature = "include-ethrex"))]
+    None,
+    /// A separate process, reached over its authenticated Engine API port.
+    External(ExecutionOptions),
+    /// ethrex, started in this process from the `--ethrex.*` flags.
+    #[cfg(feature = "include-ethrex")]
+    Embedded(Box<ethlambda_ethrex::EthrexArgs>),
 }
 
 /// The execution client pairing, present only when both flags were supplied.
@@ -184,11 +199,14 @@ impl From<NodeOptions> for Options {
 impl From<BeaconOptions> for Options {
     fn from(options: BeaconOptions) -> Self {
         let execution = match (options.execution_endpoint, options.execution_jwt_secret) {
-            (Some(endpoint), Some(jwt_secret)) => Some(ExecutionOptions {
+            (Some(endpoint), Some(jwt_secret)) => Execution::External(ExecutionOptions {
                 endpoint,
                 jwt_secret,
             }),
-            (None, None) => None,
+            #[cfg(not(feature = "include-ethrex"))]
+            (None, None) => Execution::None,
+            #[cfg(feature = "include-ethrex")]
+            (None, None) => Execution::Embedded(Box::new(options.ethrex)),
             // Unreachable: `requires` on each of the two flags is what rules a
             // half-configured Engine API out, so the parser answers a mismatch
             // with a usage error long before this conversion runs.
@@ -243,9 +261,10 @@ pub(crate) struct BeaconOptions {
     ///
     /// Paired with `--execution-jwt-secret`: supplying one without the other is
     /// a usage error, since an Engine API endpoint always requires
-    /// authentication. With neither, this node imports blocks without asking
-    /// any execution client about their payloads, which is what it did before
-    /// this flag existed.
+    /// authentication. With neither, a build with `include-ethrex` starts its
+    /// embedded ethrex, and any other build imports blocks without asking any
+    /// execution client about their payloads, which is what it did before this
+    /// flag existed.
     #[arg(long, requires = "execution_jwt_secret")]
     pub(crate) execution_endpoint: Option<String>,
 
@@ -253,6 +272,12 @@ pub(crate) struct BeaconOptions {
     /// client.
     #[arg(long, requires = "execution_endpoint")]
     pub(crate) execution_jwt_secret: Option<PathBuf>,
+
+    /// The embedded ethrex's flags, read only when no `--execution-endpoint`
+    /// is given.
+    #[cfg(feature = "include-ethrex")]
+    #[command(flatten)]
+    pub(crate) ethrex: ethlambda_ethrex::EthrexArgs,
 }
 
 /// Flags only the beacon chain takes.
@@ -546,6 +571,51 @@ impl CommonOptions {
         }
         Ok(())
     }
+
+    /// Reject an embedded ethrex port that collides with one of this node's
+    /// own, or with another of ethrex's, before either binds.
+    ///
+    /// Separate from [`Self::validate_ports`] because ethrex's ports are only
+    /// known once its flags resolve, which needs the data directory and the
+    /// network. Port `0` is skipped for the reason given there.
+    #[cfg(feature = "include-ethrex")]
+    pub(crate) fn validate_embedded_ports(
+        &self,
+        discovery_enabled: bool,
+        ethrex: &ethlambda_ethrex::EthrexConfig,
+    ) -> eyre::Result<()> {
+        let ours_tcp = [
+            ("--gossipsub-port", self.gossipsub_port),
+            ("--api-port", self.api_port),
+            ("--metrics-port", self.metrics_port),
+        ];
+        let mut ours_udp = vec![("--gossipsub-port", self.gossipsub_port)];
+        if discovery_enabled {
+            ours_udp.push(("--discovery.port", self.discovery.port));
+        }
+        check_no_clash("TCP", &ours_tcp, &ethrex.tcp_ports())?;
+        check_no_clash("UDP", &ours_udp, &ethrex.udp_ports())
+    }
+}
+
+/// Fails on the first of `theirs` that shares a non-zero port with any of
+/// `ours` or with an earlier entry of `theirs`.
+#[cfg(feature = "include-ethrex")]
+fn check_no_clash(
+    protocol: &str,
+    ours: &[(&str, u16)],
+    theirs: &[(&str, u16)],
+) -> eyre::Result<()> {
+    for (index, (flag, port)) in theirs.iter().enumerate() {
+        if *port == 0 {
+            continue;
+        }
+        let earlier = ours.iter().chain(&theirs[..index]);
+        if let Some((other, _)) = earlier.into_iter().find(|(_, other)| other == port) {
+            eyre::bail!("{flag} ({port}) must differ from {other}: both bind {protocol}");
+        }
+    }
+    Ok(())
 }
 
 /// Shadow-simulator sim-cost + fake-XMSS flags. Compiled only under the
@@ -1034,7 +1104,7 @@ mod tests {
 
         match options.network {
             Network::Mainnet {
-                execution: Some(execution),
+                execution: Execution::External(execution),
                 ..
             } => {
                 assert_eq!(execution.endpoint, "http://127.0.0.1:8551");
@@ -1042,5 +1112,83 @@ mod tests {
             }
             other => panic!("expected a paired execution client, got {other:?}"),
         }
+    }
+
+    /// Without an endpoint, what a beacon node falls back to depends on the
+    /// build: the embedded ethrex where it is compiled in, no execution
+    /// client otherwise.
+    #[test]
+    fn no_endpoint_falls_back_to_the_build_default() {
+        let options: Options = parse_beacon(beacon_args()).into();
+
+        let Network::Mainnet { execution, .. } = options.network else {
+            panic!("the beacon argv must resolve to the beacon chain");
+        };
+        #[cfg(feature = "include-ethrex")]
+        assert!(matches!(execution, Execution::Embedded(_)), "{execution:?}");
+        #[cfg(not(feature = "include-ethrex"))]
+        assert!(matches!(execution, Execution::None), "{execution:?}");
+    }
+
+    #[cfg(feature = "include-ethrex")]
+    #[test]
+    fn ethrex_flags_parse_on_the_beacon_command() {
+        let mut args = beacon_args();
+        args.extend(["--ethrex.http-port", "8545", "--ethrex.syncmode", "full"]);
+
+        let beacon = parse_beacon(args);
+        assert_eq!(beacon.ethrex.http_port, Some(8545));
+        assert!(beacon.ethrex.syncmode.is_some());
+    }
+
+    #[cfg(feature = "include-ethrex")]
+    #[test]
+    fn an_embedded_port_clashing_with_ours_is_refused() {
+        let mut args = beacon_args();
+        args.extend(["--ethrex.http-port", "5052"]);
+        let beacon = parse_beacon(args);
+        let config = beacon
+            .ethrex
+            .resolve(std::path::Path::new("/data"), "mainnet")
+            .expect("mainnet resolves");
+
+        let err = beacon
+            .common
+            .validate_embedded_ports(true, &config)
+            .expect_err("--ethrex.http-port 5052 is the default --api-port");
+        assert!(err.to_string().contains("--api-port"), "{err}");
+    }
+
+    #[cfg(feature = "include-ethrex")]
+    #[test]
+    fn embedded_ports_clashing_with_each_other_are_refused() {
+        let mut args = beacon_args();
+        args.extend(["--ethrex.http-port", "30303"]);
+        let beacon = parse_beacon(args);
+        let config = beacon
+            .ethrex
+            .resolve(std::path::Path::new("/data"), "mainnet")
+            .expect("mainnet resolves");
+
+        let err = beacon
+            .common
+            .validate_embedded_ports(true, &config)
+            .expect_err("--ethrex.http-port 30303 is ethrex's default p2p port");
+        assert!(err.to_string().contains("--ethrex.p2p-port"), "{err}");
+    }
+
+    #[cfg(feature = "include-ethrex")]
+    #[test]
+    fn default_embedded_ports_do_not_clash() {
+        let beacon = parse_beacon(beacon_args());
+        let config = beacon
+            .ethrex
+            .resolve(std::path::Path::new("/data"), "mainnet")
+            .expect("mainnet resolves");
+
+        beacon
+            .common
+            .validate_embedded_ports(true, &config)
+            .expect("defaults are disjoint");
     }
 }

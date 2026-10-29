@@ -51,13 +51,12 @@ rand = "0.8"
 
 # Required for NodeEnr parsing.
 #
-# Pinned to an ethrex release tag, for the unified discovery module, the peer
-# table, and the `PeerFilter` seam this crate builds on. A tag rather than a
-# branch: a `main` that moves under us would change what this crate builds
-# against with nothing in the manifest saying so.
-ethrex-p2p = { git = "https://github.com/lambdaclass/ethrex", tag = "v25.0.0" }
-ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex", tag = "v25.0.0" }
-ethrex-common = { git = "https://github.com/lambdaclass/ethrex", tag = "v25.0.0" }
+# For the unified discovery module, the peer table, and the `PeerFilter` seam
+# this crate builds on. The tag lives in the workspace manifest, shared with the
+# embedded execution client.
+ethrex-p2p.workspace = true
+ethrex-rlp.workspace = true
+ethrex-common.workspace = true
 
 # `rand` seeds the throwaway signing keys the ENR tests build records with.
 secp256k1.workspace = true

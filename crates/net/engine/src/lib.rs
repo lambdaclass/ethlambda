@@ -26,6 +26,8 @@ pub mod auth;
 pub mod building;
 pub mod client;
 pub mod error;
+#[cfg(feature = "include-ethrex")]
+mod in_process;
 pub mod types;
 
 pub use auth::JwtSecret;

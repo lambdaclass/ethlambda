@@ -1,4 +1,11 @@
-//! The JSON-RPC client, its retry ladder, and the four methods.
+//! The Engine API client: its two transports, the HTTP retry ladder, and the
+//! methods.
+//!
+//! [`EngineClient`] is one type whichever way it reaches the execution client,
+//! so the chain actor and the Beacon API handlers that hold one never learn
+//! which. Over HTTP it speaks JSON-RPC with a JWT; with the `include-ethrex`
+//! feature it can instead call an embedded ethrex's handlers directly (see
+//! [`crate::in_process`]).
 
 use std::time::Duration;
 
@@ -48,9 +55,27 @@ pub const ENGINE_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 
 const BACKOFF_MULTIPLIER: u32 = 2;
 
-/// A connection to one execution client's Engine API endpoint.
+/// A connection to one execution client's Engine API.
 #[derive(Debug, Clone)]
 pub struct EngineClient {
+    transport: Transport,
+}
+
+/// How an [`EngineClient`] reaches its execution client.
+#[derive(Debug, Clone)]
+enum Transport {
+    /// JSON-RPC over HTTP to a separate process, authenticated by JWT.
+    Http(HttpTransport),
+    /// Direct calls into an ethrex embedded in this process.
+    ///
+    /// Behind an `Arc` because ethrex's RPC context is several times the size
+    /// of the HTTP variant, and every Beacon API request clones the client.
+    #[cfg(feature = "include-ethrex")]
+    InProcess(std::sync::Arc<crate::in_process::InProcessEngine>),
+}
+
+#[derive(Debug, Clone)]
+struct HttpTransport {
     http: reqwest::Client,
     endpoint: String,
     secret: JwtSecret,
@@ -63,17 +88,335 @@ impl EngineClient {
             .build()
             .map_err(|err| EngineError::Transport(err.to_string()))?;
         Ok(Self {
-            http,
-            endpoint,
-            secret,
+            transport: Transport::Http(HttpTransport {
+                http,
+                endpoint,
+                secret,
+            }),
         })
     }
 
-    /// The endpoint this client posts to, for a startup log line.
-    pub fn endpoint(&self) -> &str {
-        &self.endpoint
+    /// A client for an ethrex running in this process, driven through the
+    /// node's own RPC context instead of its authenticated RPC port.
+    #[cfg(feature = "include-ethrex")]
+    pub fn in_process(context: ethrex_rpc::RpcApiContext) -> Self {
+        Self {
+            transport: Transport::InProcess(std::sync::Arc::new(
+                crate::in_process::InProcessEngine::new(context),
+            )),
+        }
     }
 
+    /// The endpoint this client posts to, for a startup log line. `None` for an
+    /// embedded execution client, which has no endpoint.
+    pub fn endpoint(&self) -> Option<&str> {
+        match &self.transport {
+            Transport::Http(http) => Some(&http.endpoint),
+            #[cfg(feature = "include-ethrex")]
+            Transport::InProcess(_) => None,
+        }
+    }
+
+    /// `engine_newPayloadV4`.
+    ///
+    /// Osaka's `newPayload`: Osaka adds no version of its own, and V5 is
+    /// Amsterdam's. The four parameters are the payload, the versioned hashes
+    /// the block's blob commitments imply, the parent beacon block root, and the
+    /// EIP-7685 execution requests list.
+    pub async fn new_payload(
+        &self,
+        payload: &deneb::ExecutionPayload,
+        versioned_hashes: &[Bytes32],
+        parent_beacon_block_root: Root,
+        execution_requests: &[Vec<u8>],
+    ) -> Result<PayloadStatusV1, EngineError> {
+        match &self.transport {
+            Transport::Http(http) => {
+                let params = new_payload_v4_params(
+                    payload,
+                    versioned_hashes,
+                    parent_beacon_block_root,
+                    execution_requests,
+                );
+                http.call("engine_newPayloadV4", params).await
+            }
+            #[cfg(feature = "include-ethrex")]
+            Transport::InProcess(engine) => {
+                engine
+                    .new_payload(
+                        payload,
+                        versioned_hashes,
+                        parent_beacon_block_root,
+                        execution_requests,
+                    )
+                    .await
+            }
+        }
+    }
+
+    /// `engine_newPayloadV5`: Amsterdam's `newPayload`, which gloas asks about
+    /// a revealed execution payload envelope.
+    ///
+    /// The parameters are the same four as V4's, with the payload as
+    /// `ExecutionPayloadV4` (adding `blockAccessList` and `slotNumber`). The
+    /// response is V4's. An execution client answers `-38005` when the
+    /// payload's timestamp is not Amsterdam's, which surfaces as
+    /// [`EngineError::Rpc`] and is not retried.
+    pub async fn new_payload_v5(
+        &self,
+        payload: &gloas::ExecutionPayload,
+        versioned_hashes: &[Bytes32],
+        parent_beacon_block_root: Root,
+        execution_requests: &[Vec<u8>],
+    ) -> Result<PayloadStatusV1, EngineError> {
+        match &self.transport {
+            Transport::Http(http) => {
+                let params = new_payload_v5_params(
+                    payload,
+                    versioned_hashes,
+                    parent_beacon_block_root,
+                    execution_requests,
+                );
+                http.call_with_timeout("engine_newPayloadV5", params, ENGINE_NEW_PAYLOAD_V5_TIMEOUT)
+                    .await
+            }
+            #[cfg(feature = "include-ethrex")]
+            Transport::InProcess(engine) => {
+                engine
+                    .new_payload_v5(
+                        payload,
+                        versioned_hashes,
+                        parent_beacon_block_root,
+                        execution_requests,
+                    )
+                    .await
+            }
+        }
+    }
+
+    /// `engine_forkchoiceUpdatedV3`, always with a `null` `payloadAttributes`.
+    ///
+    /// A follower never proposes, so it never asks an execution client to start
+    /// building. That also keeps this call outside the fork-scheduling rules
+    /// attached to `payloadAttributes.timestamp`.
+    pub async fn forkchoice_updated(
+        &self,
+        state: &ForkchoiceStateV1,
+    ) -> Result<PayloadStatusV1, EngineError> {
+        let response = match &self.transport {
+            Transport::Http(http) => {
+                let params = json!([state, serde_json::Value::Null]);
+                http.call::<ForkchoiceUpdatedResponse>("engine_forkchoiceUpdatedV3", params)
+                    .await?
+            }
+            #[cfg(feature = "include-ethrex")]
+            Transport::InProcess(engine) => engine.forkchoice_updated(state, None).await?,
+        };
+        Ok(response.payload_status)
+    }
+
+    /// `engine_forkchoiceUpdatedV4`: Amsterdam's fork choice notification, with
+    /// a `null` `payloadAttributes` and the consensus client's custody set.
+    ///
+    /// Follower only: there is no variant taking `PayloadAttributesV4`, since a
+    /// follower never asks for a build. `custody_columns` of `None` sends
+    /// `null`, meaning the consensus client provides no custody. The response
+    /// is V3's.
+    pub async fn forkchoice_updated_v4(
+        &self,
+        state: &ForkchoiceStateV1,
+        custody_columns: Option<CustodyColumns>,
+    ) -> Result<PayloadStatusV1, EngineError> {
+        let response = match &self.transport {
+            Transport::Http(http) => {
+                let params = forkchoice_updated_v4_params(state, custody_columns);
+                http.call::<ForkchoiceUpdatedResponse>("engine_forkchoiceUpdatedV4", params)
+                    .await?
+            }
+            #[cfg(feature = "include-ethrex")]
+            Transport::InProcess(engine) => {
+                engine
+                    .forkchoice_updated_v4(state, None, custody_columns)
+                    .await?
+            }
+        };
+        Ok(response.payload_status)
+    }
+
+    /// `engine_forkchoiceUpdatedV3` with `payloadAttributes`: the same fork
+    /// choice notification, plus a request to start building a payload on the
+    /// head for the slot the attributes describe.
+    ///
+    /// Returns the head's status and the build process's id; the id is `None`
+    /// when the execution client declined to build.
+    pub async fn forkchoice_updated_with_attributes(
+        &self,
+        state: &ForkchoiceStateV1,
+        attributes: &crate::building::PayloadAttributesV3,
+    ) -> Result<(PayloadStatusV1, Option<crate::building::PayloadId>), EngineError> {
+        let response = match &self.transport {
+            Transport::Http(http) => {
+                let params = json!([state, attributes]);
+                http.call::<ForkchoiceUpdatedResponse>("engine_forkchoiceUpdatedV3", params)
+                    .await?
+            }
+            #[cfg(feature = "include-ethrex")]
+            Transport::InProcess(engine) => {
+                engine.forkchoice_updated(state, Some(attributes)).await?
+            }
+        };
+        Ok((response.payload_status, response.payload_id))
+    }
+
+    /// `engine_getPayloadV5`: the payload a build process has assembled so
+    /// far, with its blobs bundle and execution requests.
+    pub async fn get_payload(
+        &self,
+        payload_id: crate::building::PayloadId,
+    ) -> Result<crate::building::BuiltPayload, EngineError> {
+        let response: crate::building::GetPayloadV5Response = match &self.transport {
+            Transport::Http(http) => {
+                http.call("engine_getPayloadV5", json!([payload_id]))
+                    .await?
+            }
+            #[cfg(feature = "include-ethrex")]
+            Transport::InProcess(engine) => engine.get_payload(payload_id).await?,
+        };
+        response.try_into()
+    }
+
+    /// `engine_forkchoiceUpdatedV4` with `payloadAttributes`: Amsterdam's fork
+    /// choice notification plus a request to build a payload for the slot the
+    /// attributes name, with the consensus client's custody set.
+    ///
+    /// Returns the head's status and the build process's id; the id is `None`
+    /// when the execution client declined to build.
+    pub async fn forkchoice_updated_v4_with_attributes(
+        &self,
+        state: &ForkchoiceStateV1,
+        attributes: &crate::building::PayloadAttributesV4,
+        custody_columns: Option<CustodyColumns>,
+    ) -> Result<(PayloadStatusV1, Option<crate::building::PayloadId>), EngineError> {
+        let response = match &self.transport {
+            Transport::Http(http) => {
+                let params = json!([state, attributes, custody_columns]);
+                http.call::<ForkchoiceUpdatedResponse>("engine_forkchoiceUpdatedV4", params)
+                    .await?
+            }
+            #[cfg(feature = "include-ethrex")]
+            Transport::InProcess(engine) => {
+                engine
+                    .forkchoice_updated_v4(state, Some(attributes), custody_columns)
+                    .await?
+            }
+        };
+        Ok((response.payload_status, response.payload_id))
+    }
+
+    /// `engine_getPayloadV6`: [`Self::get_payload`] for Amsterdam, answering
+    /// with `ExecutionPayloadV4` (`blockAccessList` and `slotNumber` included).
+    pub async fn get_payload_v6(
+        &self,
+        payload_id: crate::building::PayloadId,
+    ) -> Result<crate::building::BuiltGloasPayload, EngineError> {
+        let response: crate::building::GetPayloadV6Response = match &self.transport {
+            Transport::Http(http) => {
+                http.call("engine_getPayloadV6", json!([payload_id]))
+                    .await?
+            }
+            #[cfg(feature = "include-ethrex")]
+            Transport::InProcess(engine) => engine.get_payload_v6(payload_id).await?,
+        };
+        response.try_into()
+    }
+
+    /// `engine_exchangeCapabilities`. Returns what the execution client says it
+    /// supports.
+    pub async fn exchange_capabilities(&self, ours: &[&str]) -> Result<Vec<String>, EngineError> {
+        match &self.transport {
+            Transport::Http(http) => {
+                http.call("engine_exchangeCapabilities", json!([ours]))
+                    .await
+            }
+            #[cfg(feature = "include-ethrex")]
+            Transport::InProcess(engine) => engine.exchange_capabilities(ours).await,
+        }
+    }
+
+    /// `engine_getClientVersionV1`.
+    pub async fn client_version(
+        &self,
+        ours: &ClientVersionV1,
+    ) -> Result<Vec<ClientVersionV1>, EngineError> {
+        match &self.transport {
+            Transport::Http(http) => http.call("engine_getClientVersionV1", json!([ours])).await,
+            #[cfg(feature = "include-ethrex")]
+            Transport::InProcess(engine) => engine.client_version(ours).await,
+        }
+    }
+
+    /// Runs the startup handshake, logging what the execution client is and
+    /// warning about any method this client needs that it does not advertise.
+    ///
+    /// `gloas_scheduled` says whether the network's fork schedule includes
+    /// gloas, which is what makes `engine_newPayloadV5` a needed method.
+    ///
+    /// Warns rather than refuses: an execution client that under-reports its
+    /// capabilities still works, and refusing to start over a handshake would
+    /// turn a cosmetic mismatch into an outage.
+    pub async fn handshake(
+        &self,
+        ours: &ClientVersionV1,
+        gloas_scheduled: bool,
+    ) -> Result<(), EngineError> {
+        let theirs = self
+            .exchange_capabilities(crate::ETHLAMBDA_ENGINE_CAPABILITIES)
+            .await?;
+        for required in ["engine_newPayloadV4", "engine_forkchoiceUpdatedV3"] {
+            if !theirs.iter().any(|method| method == required) {
+                warn!(
+                    method = required,
+                    "The execution client does not advertise a method this node needs"
+                );
+            }
+        }
+        // Kept out of the list above: these are only called from gloas on, so a
+        // network that does not schedule gloas never needs it, and an
+        // execution client that predates Amsterdam is right not to offer it.
+        if gloas_scheduled {
+            for required in [
+                "engine_newPayloadV5",
+                "engine_forkchoiceUpdatedV4",
+                "engine_getPayloadV6",
+            ] {
+                if !theirs.iter().any(|method| method == required) {
+                    warn!(
+                        method = required,
+                        "The execution client does not advertise a method this node needs from gloas on"
+                    );
+                }
+            }
+        }
+        match self.client_version(ours).await {
+            Ok(versions) => {
+                for version in versions {
+                    debug!(
+                        code = %version.code,
+                        name = %version.name,
+                        version = %version.version,
+                        commit = %version.commit,
+                        "Execution client"
+                    );
+                }
+            }
+            // Optional by the specification's own word ("SHOULD support").
+            Err(err) => debug!(%err, "The execution client did not report its version"),
+        }
+        Ok(())
+    }
+}
+
+impl HttpTransport {
     /// One JSON-RPC call, retried up to [`ENGINE_MAX_ATTEMPTS`] times.
     ///
     /// Only failures to get an answer are retried. An [`EngineError::Rpc`] is
@@ -191,230 +534,50 @@ impl EngineClient {
 
         serde_json::from_value(result.clone()).map_err(|err| EngineError::Decode(err.to_string()))
     }
+}
 
-    /// `engine_newPayloadV4`.
-    ///
-    /// Osaka's `newPayload`: Osaka adds no version of its own, and V5 is
-    /// Amsterdam's. The four parameters are the payload, the versioned hashes
-    /// the block's blob commitments imply, the parent beacon block root, and the
-    /// EIP-7685 execution requests list.
-    pub async fn new_payload(
-        &self,
-        payload: &deneb::ExecutionPayload,
-        versioned_hashes: &[Bytes32],
-        parent_beacon_block_root: Root,
-        execution_requests: &[Vec<u8>],
-    ) -> Result<PayloadStatusV1, EngineError> {
-        let hashes: Vec<String> = versioned_hashes.iter().map(|hash| data(&hash.0)).collect();
-        let requests: Vec<String> = execution_requests
-            .iter()
-            .map(|request| data(request))
-            .collect();
-        let params = json!([
-            ExecutionPayloadV3(payload),
-            hashes,
-            data(&parent_beacon_block_root.0),
-            requests,
-        ]);
-        self.call("engine_newPayloadV4", params).await
-    }
+/// The four positional parameters of `engine_newPayloadV4`.
+///
+/// Shared with the in-process transport, which hands them to ethrex's own
+/// `parse` for a payload it cannot build as a typed request.
+pub(crate) fn new_payload_v4_params(
+    payload: &deneb::ExecutionPayload,
+    versioned_hashes: &[Bytes32],
+    parent_beacon_block_root: Root,
+    execution_requests: &[Vec<u8>],
+) -> serde_json::Value {
+    let hashes: Vec<String> = versioned_hashes.iter().map(|hash| data(&hash.0)).collect();
+    let requests: Vec<String> = execution_requests
+        .iter()
+        .map(|request| data(request))
+        .collect();
+    json!([
+        ExecutionPayloadV3(payload),
+        hashes,
+        data(&parent_beacon_block_root.0),
+        requests,
+    ])
+}
 
-    /// `engine_newPayloadV5`: Amsterdam's `newPayload`, which gloas asks about
-    /// a revealed execution payload envelope.
-    ///
-    /// The parameters are the same four as V4's, with the payload as
-    /// `ExecutionPayloadV4` (adding `blockAccessList` and `slotNumber`). The
-    /// response is V4's. An execution client answers `-38005` when the
-    /// payload's timestamp is not Amsterdam's, which surfaces as
-    /// [`EngineError::Rpc`] and is not retried.
-    pub async fn new_payload_v5(
-        &self,
-        payload: &gloas::ExecutionPayload,
-        versioned_hashes: &[Bytes32],
-        parent_beacon_block_root: Root,
-        execution_requests: &[Vec<u8>],
-    ) -> Result<PayloadStatusV1, EngineError> {
-        let hashes: Vec<String> = versioned_hashes.iter().map(|hash| data(&hash.0)).collect();
-        let requests: Vec<String> = execution_requests
-            .iter()
-            .map(|request| data(request))
-            .collect();
-        let params = json!([
-            ExecutionPayloadV4(payload),
-            hashes,
-            data(&parent_beacon_block_root.0),
-            requests,
-        ]);
-        self.call_with_timeout("engine_newPayloadV5", params, ENGINE_NEW_PAYLOAD_V5_TIMEOUT)
-            .await
-    }
-
-    /// `engine_forkchoiceUpdatedV3`, always with a `null` `payloadAttributes`.
-    ///
-    /// A follower never proposes, so it never asks an execution client to start
-    /// building. That also keeps this call outside the fork-scheduling rules
-    /// attached to `payloadAttributes.timestamp`.
-    pub async fn forkchoice_updated(
-        &self,
-        state: &ForkchoiceStateV1,
-    ) -> Result<PayloadStatusV1, EngineError> {
-        let params = json!([state, serde_json::Value::Null]);
-        let response: ForkchoiceUpdatedResponse =
-            self.call("engine_forkchoiceUpdatedV3", params).await?;
-        Ok(response.payload_status)
-    }
-
-    /// `engine_forkchoiceUpdatedV4`: Amsterdam's fork choice notification, with
-    /// a `null` `payloadAttributes` and the consensus client's custody set.
-    ///
-    /// Follower only: there is no variant taking `PayloadAttributesV4`, since a
-    /// follower never asks for a build. `custody_columns` of `None` sends
-    /// `null`, meaning the consensus client provides no custody. The response
-    /// is V3's.
-    pub async fn forkchoice_updated_v4(
-        &self,
-        state: &ForkchoiceStateV1,
-        custody_columns: Option<CustodyColumns>,
-    ) -> Result<PayloadStatusV1, EngineError> {
-        let params = forkchoice_updated_v4_params(state, custody_columns);
-        let response: ForkchoiceUpdatedResponse =
-            self.call("engine_forkchoiceUpdatedV4", params).await?;
-        Ok(response.payload_status)
-    }
-
-    /// `engine_forkchoiceUpdatedV3` with `payloadAttributes`: the same fork
-    /// choice notification, plus a request to start building a payload on the
-    /// head for the slot the attributes describe.
-    ///
-    /// Returns the head's status and the build process's id; the id is `None`
-    /// when the execution client declined to build.
-    pub async fn forkchoice_updated_with_attributes(
-        &self,
-        state: &ForkchoiceStateV1,
-        attributes: &crate::building::PayloadAttributesV3,
-    ) -> Result<(PayloadStatusV1, Option<crate::building::PayloadId>), EngineError> {
-        let params = json!([state, attributes]);
-        let response: ForkchoiceUpdatedResponse =
-            self.call("engine_forkchoiceUpdatedV3", params).await?;
-        Ok((response.payload_status, response.payload_id))
-    }
-
-    /// `engine_getPayloadV5`: the payload a build process has assembled so
-    /// far, with its blobs bundle and execution requests.
-    pub async fn get_payload(
-        &self,
-        payload_id: crate::building::PayloadId,
-    ) -> Result<crate::building::BuiltPayload, EngineError> {
-        let response: crate::building::GetPayloadV5Response = self
-            .call("engine_getPayloadV5", json!([payload_id]))
-            .await?;
-        response.try_into()
-    }
-
-    /// `engine_forkchoiceUpdatedV4` with `payloadAttributes`: Amsterdam's fork
-    /// choice notification plus a request to build a payload for the slot the
-    /// attributes name, with the consensus client's custody set.
-    ///
-    /// Returns the head's status and the build process's id; the id is `None`
-    /// when the execution client declined to build.
-    pub async fn forkchoice_updated_v4_with_attributes(
-        &self,
-        state: &ForkchoiceStateV1,
-        attributes: &crate::building::PayloadAttributesV4,
-        custody_columns: Option<CustodyColumns>,
-    ) -> Result<(PayloadStatusV1, Option<crate::building::PayloadId>), EngineError> {
-        let params = json!([state, attributes, custody_columns]);
-        let response: ForkchoiceUpdatedResponse =
-            self.call("engine_forkchoiceUpdatedV4", params).await?;
-        Ok((response.payload_status, response.payload_id))
-    }
-
-    /// `engine_getPayloadV6`: [`Self::get_payload`] for Amsterdam, answering
-    /// with `ExecutionPayloadV4` (`blockAccessList` and `slotNumber` included).
-    pub async fn get_payload_v6(
-        &self,
-        payload_id: crate::building::PayloadId,
-    ) -> Result<crate::building::BuiltGloasPayload, EngineError> {
-        let response: crate::building::GetPayloadV6Response = self
-            .call("engine_getPayloadV6", json!([payload_id]))
-            .await?;
-        response.try_into()
-    }
-
-    /// `engine_exchangeCapabilities`. Returns what the execution client says it
-    /// supports.
-    pub async fn exchange_capabilities(&self, ours: &[&str]) -> Result<Vec<String>, EngineError> {
-        self.call("engine_exchangeCapabilities", json!([ours]))
-            .await
-    }
-
-    /// `engine_getClientVersionV1`.
-    pub async fn client_version(
-        &self,
-        ours: &ClientVersionV1,
-    ) -> Result<Vec<ClientVersionV1>, EngineError> {
-        self.call("engine_getClientVersionV1", json!([ours])).await
-    }
-
-    /// Runs the startup handshake, logging what the execution client is and
-    /// warning about any method this client needs that it does not advertise.
-    ///
-    /// `gloas_scheduled` says whether the network's fork schedule includes
-    /// gloas, which is what makes `engine_newPayloadV5` a needed method.
-    ///
-    /// Warns rather than refuses: an execution client that under-reports its
-    /// capabilities still works, and refusing to start over a handshake would
-    /// turn a cosmetic mismatch into an outage.
-    pub async fn handshake(
-        &self,
-        ours: &ClientVersionV1,
-        gloas_scheduled: bool,
-    ) -> Result<(), EngineError> {
-        let theirs = self
-            .exchange_capabilities(crate::ETHLAMBDA_ENGINE_CAPABILITIES)
-            .await?;
-        for required in ["engine_newPayloadV4", "engine_forkchoiceUpdatedV3"] {
-            if !theirs.iter().any(|method| method == required) {
-                warn!(
-                    method = required,
-                    "The execution client does not advertise a method this node needs"
-                );
-            }
-        }
-        // Kept out of the list above: these are only called from gloas on, so a
-        // network that does not schedule gloas never needs it, and an
-        // execution client that predates Amsterdam is right not to offer it.
-        if gloas_scheduled {
-            for required in [
-                "engine_newPayloadV5",
-                "engine_forkchoiceUpdatedV4",
-                "engine_getPayloadV6",
-            ] {
-                if !theirs.iter().any(|method| method == required) {
-                    warn!(
-                        method = required,
-                        "The execution client does not advertise a method this node needs from gloas on"
-                    );
-                }
-            }
-        }
-        match self.client_version(ours).await {
-            Ok(versions) => {
-                for version in versions {
-                    debug!(
-                        code = %version.code,
-                        name = %version.name,
-                        version = %version.version,
-                        commit = %version.commit,
-                        "Execution client"
-                    );
-                }
-            }
-            // Optional by the specification's own word ("SHOULD support").
-            Err(err) => debug!(%err, "The execution client did not report its version"),
-        }
-        Ok(())
-    }
+/// The four positional parameters of `engine_newPayloadV5`; see
+/// [`new_payload_v4_params`].
+pub(crate) fn new_payload_v5_params(
+    payload: &gloas::ExecutionPayload,
+    versioned_hashes: &[Bytes32],
+    parent_beacon_block_root: Root,
+    execution_requests: &[Vec<u8>],
+) -> serde_json::Value {
+    let hashes: Vec<String> = versioned_hashes.iter().map(|hash| data(&hash.0)).collect();
+    let requests: Vec<String> = execution_requests
+        .iter()
+        .map(|request| data(request))
+        .collect();
+    json!([
+        ExecutionPayloadV4(payload),
+        hashes,
+        data(&parent_beacon_block_root.0),
+        requests,
+    ])
 }
 
 /// The three positional parameters of `engine_forkchoiceUpdatedV4`: the state,

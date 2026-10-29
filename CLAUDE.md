@@ -10,7 +10,7 @@ Ethereum Beacon Chain (AKA Eth2), and `ethlambda node` runs Lean consensus.
 **Rust version:** 1.97.1 (edition 2024)
 **Test fixtures release:** Download latest production fixtures from leanSpec releases
 
-## Codebase Structure (13 workspace crates)
+## Codebase Structure (14 workspace crates)
 
 ```
 bin/ethlambda/              # Entry point, CLI, orchestration
@@ -44,8 +44,11 @@ crates/
     ├─ ssz-tree/            # Persistent Merkle tree (List/Vector) behind the beacon registry and balances
     ├─ metrics/             # Prometheus re-exports, TimingGuard, gather utilities
     └─ test-fixtures/       # Spec-fixture loading (prod dep of rpc's Hive test driver)
+  execution/
+    └─ ethrex/              # [include-ethrex] ethrex in-process: bootstrap, --ethrex.* flags, eth_ server (docs/ethrex.md)
   net/
     ├─ api/                 # Actor protocol traits wiring BlockChain ↔ P2P
+    ├─ engine/              # Engine API client: JSON-RPC over HTTP, or typed in-process ethrex calls (include-ethrex)
     ├─ p2p/                 # libp2p: gossipsub + req-resp (Status, BlocksByRoot, BlocksByRange, gloas envelopes)
     │   ├─ src/gossipsub/   # Topic encoding, message handling
     │   ├─ src/req_resp/    # Request/response codec and handlers
@@ -921,6 +924,16 @@ incremental, and line-tables-only debuginfo, so rebuilds are much faster than
 `cargo build --release`.
 
 ## Common Gotchas
+
+### Embedded ethrex (`include-ethrex`)
+- In a feature build, `ethlambda beacon` without `--execution-endpoint` starts ethrex
+  in-process; with the endpoint it uses HTTP as before. A feature build has no
+  "no execution client" mode. See [`docs/ethrex.md`](docs/ethrex.md)
+- One ethrex tag for the whole workspace (`[workspace.dependencies]`), shared with
+  p2p's discovery. Bumping it means re-diffing ethrex's `init_l1`/`init_rpc_api`/
+  `server_shutdown` against `crates/execution/ethrex/src/lib.rs`, which repeats them
+- `make test-node` excludes `ethlambda-ethrex`; `make test-ethrex` (own CI job) runs
+  it plus the engine and binary with the feature on
 
 ### Aggregator Flag Required for Finalization
 - At least one node **must** be started with `--is-aggregator` to finalize blocks

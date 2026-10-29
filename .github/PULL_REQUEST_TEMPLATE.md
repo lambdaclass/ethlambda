@@ -23,4 +23,4 @@
 
 - [ ] Ran `make fmt` — clean
 - [ ] Ran `make lint` (clippy with `-D warnings`) — clean
-- [ ] Ran `make test` (`test-consensus` plus `test-node`, at `release-fast`) — all passing
+- [ ] Ran `make test` (`test-consensus`, `test-node` and `test-ethrex`, at `release-fast`) — all passing

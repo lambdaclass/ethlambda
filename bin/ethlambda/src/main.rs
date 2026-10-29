@@ -39,7 +39,7 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-use cli::{Network, Options};
+use cli::{Execution, Network, Options};
 use command::Command;
 
 use ethlambda_blockchain::block_builder::ProposerConfig;
@@ -238,6 +238,9 @@ struct RunningNode {
     http: tokio::task::JoinHandle<()>,
     /// Cancelled by [`wait_for_shutdown`] to stop `http`.
     shutdown: CancellationToken,
+    /// The in-process execution client, when the beacon node started one.
+    #[cfg(feature = "include-ethrex")]
+    embedded_ethrex: Option<ethlambda_ethrex::EmbeddedEthrex>,
 }
 
 /// What one chain claims to serve, in the entries its ENR publishes and its
@@ -475,6 +478,11 @@ async fn run_node(options: Options) -> eyre::Result<()> {
 
     let clean_checkpoint_urls = checkpoint_sync::clean_urls(&common.checkpoint_sync_url);
 
+    // Set by the beacon arm below when it starts ethrex in-process, so that
+    // `wait_for_shutdown` can stop it after the chain actor.
+    #[cfg(feature = "include-ethrex")]
+    let mut embedded_ethrex: Option<ethlambda_ethrex::EmbeddedEthrex> = None;
+
     // The one place the two chains diverge. Everything above is shared setup;
     // everything below is shared startup and, in `wait_for_shutdown`, shared
     // teardown.
@@ -667,33 +675,48 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
 
             let engine = match &execution {
-                None => {
+                #[cfg(not(feature = "include-ethrex"))]
+                Execution::None => {
                     info!(
                         "No execution client configured; beacon blocks import without \
                          payload validation"
                     );
                     None
                 }
-                Some(options) => {
+                Execution::External(options) => {
                     let secret = JwtSecret::from_file(&options.jwt_secret)
                         .map_err(|err| eyre::eyre!("reading --execution-jwt-secret: {err}"))?;
                     let client = EngineClient::new(options.endpoint.clone(), secret)
                         .map_err(|err| eyre::eyre!("building the engine client: {err}"))?;
                     info!(endpoint = %options.endpoint, "Execution client configured");
-
-                    // A handshake failure is not a reason to refuse to run: the
-                    // execution client may simply be starting up, and every
-                    // call that matters has its own retry ladder.
-                    let gloas_scheduled = store.config().gloas_fork_epoch
-                        != ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
-                    let _ = client
-                        .handshake(&version::engine_client_version(), gloas_scheduled)
+                    Some(client)
+                }
+                #[cfg(feature = "include-ethrex")]
+                Execution::Embedded(args) => {
+                    let config = args
+                        .resolve(&data_dir, &mainnet.network)
+                        .map_err(|err| eyre::eyre!("configuring the embedded ethrex: {err}"))?;
+                    common.validate_embedded_ports(true, &config)?;
+                    let started = ethlambda_ethrex::start(config)
                         .await
-                        .inspect_err(|err| warn!(%err, "Engine API handshake failed"));
-
+                        .map_err(|err| eyre::eyre!("starting the embedded ethrex: {err}"))?;
+                    let client = EngineClient::in_process(started.rpc_context());
+                    info!("Embedded ethrex configured as the execution client");
+                    embedded_ethrex = Some(started);
                     Some(client)
                 }
             };
+            if let Some(client) = &engine {
+                // A handshake failure is not a reason to refuse to run: the
+                // execution client may simply be starting up, and every call
+                // that matters has its own retry ladder.
+                let gloas_scheduled = store.config().gloas_fork_epoch
+                    != ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
+                let _ = client
+                    .handshake(&version::engine_client_version(), gloas_scheduled)
+                    .await
+                    .inspect_err(|err| warn!(%err, "Engine API handshake failed"));
+            }
 
             ChainSetup {
                 wire: WireConfig::Beacon(Box::new(params.wire)),
@@ -925,9 +948,10 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         blockchain,
         http,
         shutdown,
+        #[cfg(feature = "include-ethrex")]
+        embedded_ethrex,
     })
-    .await;
-    Ok(())
+    .await
 }
 
 /// The root of the anchor block when it is a gloas block whose execution
@@ -971,13 +995,24 @@ fn check_custody_set(custody_columns: &[u64]) -> eyre::Result<()> {
 /// Shared by both chains. Mainnet used to park on `pending()` here, so a
 /// follower killed mid-write left recovery to do; it now tears down the same
 /// way the lean node does.
-async fn wait_for_shutdown(node: RunningNode) {
+///
+/// An embedded execution client that stops on its own starts the same
+/// teardown, and the node then exits with an error: it cannot validate a
+/// payload without one.
+async fn wait_for_shutdown(node: RunningNode) -> eyre::Result<()> {
     info!("Node initialized");
 
     // 1st ctrl+c: start graceful shutdown
-    tokio::signal::ctrl_c().await.ok();
+    let execution_client_stopped = tokio::select! {
+        _ = tokio::signal::ctrl_c() => false,
+        () = execution_client_stopped(&node) => true,
+    };
 
-    info!("Shutdown signal received, stopping actors and servers...");
+    if execution_client_stopped {
+        error!("The embedded execution client stopped; shutting down");
+    } else {
+        info!("Shutdown signal received, stopping actors and servers...");
+    }
 
     tokio::spawn(async move {
         // This can be turned into a loop
@@ -1005,7 +1040,31 @@ async fn wait_for_shutdown(node: RunningNode) {
     p2p_ref.join().await;
     let _ = node.http.await;
 
+    // Last, once the chain actor has joined: no Engine API call can be in
+    // flight while ethrex flushes its database.
+    #[cfg(feature = "include-ethrex")]
+    if let Some(embedded) = node.embedded_ethrex {
+        embedded.shutdown().await;
+    }
+
     info!("Shutdown complete");
+    eyre::ensure!(
+        !execution_client_stopped,
+        "the embedded execution client stopped"
+    );
+    Ok(())
+}
+
+/// Resolves when the embedded execution client cancels itself, which an ethrex
+/// subsystem does on a failure the node cannot run past. Never resolves for a
+/// node without one.
+async fn execution_client_stopped(node: &RunningNode) {
+    #[cfg(feature = "include-ethrex")]
+    if let Some(embedded) = &node.embedded_ethrex {
+        return embedded.cancelled().await;
+    }
+    let _ = node;
+    std::future::pending().await
 }
 
 /// The ENRs to start from when `--bootnodes` was not given.
