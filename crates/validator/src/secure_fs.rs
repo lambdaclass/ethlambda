@@ -7,9 +7,9 @@
 //! every one of those files readable by any other local account. Lighthouse's
 //! convention here is `0600`; everything in this crate that writes such a
 //! file must go through one of these two functions instead, to actually
-//! follow that convention rather than only claim to. [`write_private`] is
-//! public for the binary's one secret of its own, the node key it stores in
-//! `--data-dir` when `--node-key` is absent.
+//! follow that convention rather than only claim to.
+//! [`write_private_no_symlink`] is public for the binary's one secret of its
+//! own, the node key it stores in `--data-dir` when `--node-key` is absent.
 
 use std::path::Path;
 
@@ -17,13 +17,13 @@ use std::path::Path;
 /// if it does, at mode `0600` on unix.
 ///
 /// For files this crate is always the sole, trusted writer of and is willing
-/// to overwrite outright: the API token, and the `.tmp` siblings of the
-/// validator definitions file and of the binary's stored node key (each is
-/// renamed into place, which preserves the mode set here). None is named from
-/// attacker-influenced input, so there is no symlink concern for these; see
+/// to overwrite outright: the API token, and the validator definitions file's
+/// `.tmp` sibling (`ValidatorDefinitions::save` renames it into place, which
+/// preserves the mode set here). Neither is named from attacker-influenced
+/// input, so there is no symlink concern for these; see
 /// [`write_private_no_symlink`] for the ones that are.
 #[cfg(unix)]
-pub fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+pub(crate) fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     let mut file = std::fs::OpenOptions::new()
@@ -36,7 +36,7 @@ pub fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result
 }
 
 #[cfg(not(unix))]
-pub fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+pub(crate) fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
     std::fs::write(path, contents)
 }
 
@@ -52,11 +52,15 @@ pub fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result
 /// file, so re-importing the same key (the common case: rotating its
 /// password, or simply retrying) overwrites its files exactly as before
 /// rather than failing.
+///
+/// Also for the `.tmp` sibling of the binary's stored node key, which is
+/// renamed into place (preserving the mode set here). Its name is fixed, and
+/// the RocksDB lock the binary holds while writing it only keeps out another
+/// ethlambda process, not any other local writer that could place a symlink
+/// there; a leftover regular file from an interrupted start is still
+/// truncated and reused.
 #[cfg(unix)]
-pub(crate) fn write_private_no_symlink(
-    path: &Path,
-    contents: impl AsRef<[u8]>,
-) -> std::io::Result<()> {
+pub fn write_private_no_symlink(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     let mut file = std::fs::OpenOptions::new()
@@ -70,10 +74,7 @@ pub(crate) fn write_private_no_symlink(
 }
 
 #[cfg(not(unix))]
-pub(crate) fn write_private_no_symlink(
-    path: &Path,
-    contents: impl AsRef<[u8]>,
-) -> std::io::Result<()> {
+pub fn write_private_no_symlink(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
     std::fs::write(path, contents)
 }
 

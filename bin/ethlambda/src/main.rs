@@ -1328,11 +1328,13 @@ const STORED_NODE_KEY_FILE: &str = "node.key";
 ///
 /// The stored file is hex, the format `--node-key` reads, so it can be passed
 /// as `--node-key` to another run. It is written at mode `0600` on unix
-/// through [`ethlambda_validator::secure_fs::write_private`], and through a
-/// `.tmp` sibling renamed into place, so an interrupted first start leaves no
-/// partial key behind. A stored file that fails to load is an error, never a
-/// cue to generate a replacement, since that would silently discard an
-/// identity that was working.
+/// through [`ethlambda_validator::secure_fs::write_private_no_symlink`], and
+/// through a `.tmp` sibling renamed into place, so an interrupted first start
+/// leaves no partial key behind and a symlink planted at the `.tmp` path is
+/// refused rather than followed. A stored file that fails to load is an
+/// error, never a cue to generate a replacement, since that would silently
+/// discard an identity that was working; the error says that deleting the
+/// file is how to ask for a new one.
 fn resolve_node_key(node_key_path: Option<&Path>, data_dir: &Path) -> eyre::Result<Vec<u8>> {
     if let Some(path) = node_key_path {
         let key = read_node_key(path)
@@ -1347,7 +1349,11 @@ fn resolve_node_key(node_key_path: Option<&Path>, data_dir: &Path) -> eyre::Resu
         .wrap_err_with(|| format!("failed to look for a node key at {}", stored.display()))?;
     if exists {
         let key = read_node_key(&stored).wrap_err_with(|| {
-            format!("failed to load the node key stored at {}", stored.display())
+            format!(
+                "failed to load the node key stored at {}; deleting the file makes the next \
+                 start generate a new one, which gives this node a new identity",
+                stored.display()
+            )
         })?;
         info!(path = %stored.display(), "Loaded the node key stored in the data directory");
         return Ok(key);
@@ -1356,7 +1362,7 @@ fn resolve_node_key(node_key_path: Option<&Path>, data_dir: &Path) -> eyre::Resu
     let generated = secp256k1::SecretKey::new(&mut secp256k1::rand::rngs::OsRng).secret_bytes();
     let contents = format!("{}\n", hex::encode(generated));
     let temporary = data_dir.join(format!("{STORED_NODE_KEY_FILE}.tmp"));
-    ethlambda_validator::secure_fs::write_private(&temporary, contents)
+    ethlambda_validator::secure_fs::write_private_no_symlink(&temporary, contents)
         .and_then(|()| std::fs::rename(&temporary, &stored))
         .wrap_err_with(|| format!("failed to store a node key at {}", stored.display()))?;
     info!(
@@ -3374,8 +3380,29 @@ validators:
             std::fs::write(&stored, contents).expect("writes");
             let err = resolve_node_key(None, data_dir.path()).expect_err("must refuse the file");
             assert!(err.to_string().contains(STORED_NODE_KEY_FILE), "{err:#}");
+            assert!(err.to_string().contains("deleting the file"), "{err:#}");
             assert_eq!(std::fs::read_to_string(&stored).unwrap(), contents);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_at_the_temporary_node_key_path_is_not_followed() {
+        let data_dir = tempfile::tempdir().expect("temp dir");
+        let elsewhere = tempfile::tempdir().expect("temp dir");
+        let target = elsewhere.path().join("target");
+        std::fs::write(&target, "untouched").expect("writes target");
+        let temporary = data_dir.path().join(format!("{STORED_NODE_KEY_FILE}.tmp"));
+        std::os::unix::fs::symlink(&target, &temporary).expect("symlinks");
+
+        let err = resolve_node_key(None, data_dir.path()).expect_err("must refuse the symlink");
+        let io = err
+            .root_cause()
+            .downcast_ref::<std::io::Error>()
+            .expect("an I/O error");
+        assert_eq!(io.raw_os_error(), Some(libc::ELOOP), "{err:#}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+        assert!(!data_dir.path().join(STORED_NODE_KEY_FILE).exists());
     }
 
     /// The key is stored in the RocksDB directory itself, after the DB is

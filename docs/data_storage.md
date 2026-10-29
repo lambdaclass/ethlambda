@@ -923,7 +923,9 @@ libp2p and discv5 identity. When `--node-key` is absent, `run_node` reads it on
 every start and generates it on the first (hex, mode `0600`). It never goes
 through the `StorageBackend`, is written only after the DB is open so RocksDB's
 lock covers it, and is lost with the directory when the directory is wiped,
-together with the custody columns that identity selected.
+together with the custody columns that identity selected. A `node.key` that
+fails to load stops startup rather than being replaced; deleting it is how to
+ask for a new identity.
 
 ## Key Files
 
