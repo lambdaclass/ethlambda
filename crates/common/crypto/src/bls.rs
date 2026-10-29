@@ -96,8 +96,8 @@
 use std::collections::HashMap;
 use std::sync::{LazyLock, RwLock};
 
-use blst::BLST_ERROR;
-use blst::min_pk::{AggregatePublicKey, AggregateSignature, PublicKey, Signature};
+use blst::min_pk::{AggregateSignature, PublicKey, Signature};
+use blst::{BLST_ERROR, MultiPoint};
 use rayon::prelude::*;
 
 use ethlambda_types::beacon::error::{Error, Result};
@@ -261,6 +261,35 @@ fn validated_pubkeys(pubkeys: &[BlsPubkey]) -> Option<Vec<PublicKey>> {
     points.into_iter().collect()
 }
 
+/// The sum of `points` as one public key, or `None` for an empty slice.
+///
+/// Every point must already have passed [`PublicKey::key_validate`] (they come
+/// from [`validated_pubkeys`]), so the sum skips re-checking them. It goes
+/// through blst's `MultiPoint::add`, which hands the whole slice to
+/// `blst_p1s_add`: a batched affine addition that shares one field inversion
+/// across many additions, instead of paying a projective addition per key the
+/// way folding the keys one by one through blst's `AggregatePublicKey::aggregate`
+/// does. A committee's key sum is the largest cost left in verifying an
+/// attestation once the keys are cached, so this is where the saving is.
+///
+/// The batched routine handles equal points (`P + P` is a doubling, and sync
+/// committees are drawn with replacement, so one sum can name the same key
+/// twice) and returns the same group element as the sequential sum; only the
+/// order of additions differs, and the group is commutative.
+///
+/// From 384 points up, blst splits the work over its own thread pool, which is
+/// separate from rayon's; below that it runs on the calling thread. Either way
+/// the answer is the same, so the caller needs no size check.
+///
+/// The empty slice is guarded here because `MultiPoint::add` indexes the
+/// slice's first element and would panic on it.
+fn sum_validated_points(points: &[PublicKey]) -> Option<PublicKey> {
+    if points.is_empty() {
+        return None;
+    }
+    Some(points.add().to_public_key())
+}
+
 /// Builds `specs/altair/bls.md`'s `G2_POINT_AT_INFINITY` constant: the
 /// compressed encoding of the identity element of G2, which is the
 /// specification's sentinel value for "no one signed anything".
@@ -378,8 +407,13 @@ pub fn fast_aggregate_verify(
     let Some(points) = validated_pubkeys(pubkeys) else {
         return false;
     };
-    let point_refs: Vec<&PublicKey> = points.iter().collect();
-    let result = signature.fast_aggregate_verify(false, message.as_slice(), DST, &point_refs);
+    // `pubkeys` is non-empty, so there is always a sum. The signature was
+    // validated above, which is why the group check stays off here.
+    let Some(aggregated) = sum_validated_points(&points) else {
+        return false;
+    };
+    let result =
+        signature.fast_aggregate_verify_pre_aggregated(false, message.as_slice(), DST, &aggregated);
     result == BLST_ERROR::BLST_SUCCESS
 }
 
@@ -397,12 +431,10 @@ pub fn eth_aggregate_pubkeys(pubkeys: &[BlsPubkey]) -> Result<BlsPubkey> {
     let points = validated_pubkeys(pubkeys).ok_or(Error::SpecAssert(
         "all(bls.KeyValidate(pubkey) for pubkey in pubkeys)",
     ))?;
-    let point_refs: Vec<&PublicKey> = points.iter().collect();
     // Every point above already passed `key_validate`, so the sum skips
     // re-checking them.
-    let aggregated = AggregatePublicKey::aggregate(&point_refs, false)
-        .map_err(|_| Error::SpecAssert("len(pubkeys) > 0"))?;
-    Ok(BlsPubkey(aggregated.to_public_key().to_bytes()))
+    let aggregated = sum_validated_points(&points).ok_or(Error::SpecAssert("len(pubkeys) > 0"))?;
+    Ok(BlsPubkey(aggregated.to_bytes()))
 }
 
 /// `specs/altair/bls.md`'s
@@ -442,6 +474,7 @@ pub fn key_validate(pubkey: &BlsPubkey) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use blst::min_pk::AggregatePublicKey;
 
     #[test]
     fn key_validate_rejects_the_all_zero_pubkey() {
@@ -542,6 +575,103 @@ mod tests {
         for _ in 0..2 {
             assert_eq!(eth_aggregate_pubkeys(&pubkeys).unwrap().0, expected);
         }
+    }
+
+    /// The sequential sum `sum_validated_points` must equal, through blst's
+    /// own `AggregatePublicKey::aggregate`.
+    fn sequential_sum(points: &[PublicKey]) -> [u8; BLS_PUBKEY_SIZE] {
+        let refs: Vec<&PublicKey> = points.iter().collect();
+        AggregatePublicKey::aggregate(&refs, false)
+            .expect("a non-empty run of valid points sums")
+            .to_public_key()
+            .to_bytes()
+    }
+
+    fn validated_run(seeds: impl Iterator<Item = u64>) -> Vec<PublicKey> {
+        let pubkeys: Vec<BlsPubkey> = seeds.map(fresh_pubkey).collect();
+        validated_pubkeys(&pubkeys).expect("every key above is valid")
+    }
+
+    #[test]
+    fn the_batched_sum_of_nothing_is_none() {
+        assert!(sum_validated_points(&[]).is_none());
+    }
+
+    #[test]
+    fn the_batched_sum_matches_the_sequential_one_at_every_size() {
+        // One point, a pair, then both sides of blst's 384-point thread-pool
+        // threshold (and the first multi-chunk size), then a large run.
+        for count in [1u64, 2, 3, 17, 383, 384, 385, 767, 2000] {
+            let points = validated_run(1000..1000 + count);
+            assert_eq!(
+                sum_validated_points(&points).map(|sum| sum.to_bytes()),
+                Some(sequential_sum(&points)),
+                "{count} distinct points"
+            );
+        }
+    }
+
+    #[test]
+    fn the_batched_sum_doubles_equal_points() {
+        let one = validated_run(5000..5001)[0];
+        let pair = [one, one];
+        assert_eq!(
+            sum_validated_points(&pair).map(|sum| sum.to_bytes()),
+            Some(sequential_sum(&pair)),
+            "P + P is a doubling"
+        );
+
+        // Several repeats scattered through a run, the shape of a committee
+        // drawn with replacement, at sizes either side of the threshold.
+        for count in [10u64, 400, 1000] {
+            let distinct = validated_run(6000..6000 + count);
+            let mut points = Vec::new();
+            for (index, point) in distinct.iter().enumerate() {
+                points.push(*point);
+                if index % 3 == 0 {
+                    points.push(*point);
+                }
+                if index % 7 == 0 {
+                    points.push(distinct[0]);
+                }
+            }
+            assert_eq!(
+                sum_validated_points(&points).map(|sum| sum.to_bytes()),
+                Some(sequential_sum(&points)),
+                "{count} keys with repeats"
+            );
+        }
+    }
+
+    #[test]
+    fn fast_aggregate_verify_with_a_repeated_signer_still_verifies() {
+        // Two signatures from the same key over one message aggregate to twice
+        // its signature, which only verifies if the doubled key sum is right.
+        let message = ethlambda_types::beacon::primitives::H256([9u8; 32]);
+        let mut ikm = [0x33u8; 32];
+        ikm[..8].copy_from_slice(&7u64.to_le_bytes());
+        let secret = blst::min_pk::SecretKey::key_gen(&ikm, &[]).unwrap();
+        let pubkey = BlsPubkey(secret.sk_to_pk().to_bytes());
+        let one = BlsSignature(secret.sign(message.as_slice(), DST, &[]).to_bytes());
+        let signature = aggregate(&[one, one]).unwrap();
+        assert!(fast_aggregate_verify(
+            &[pubkey, pubkey],
+            message,
+            &signature
+        ));
+        assert!(!fast_aggregate_verify(&[pubkey], message, &signature));
+    }
+
+    #[test]
+    fn eth_aggregate_pubkeys_matches_the_sequential_sum_with_repeats() {
+        let mut pubkeys: Vec<BlsPubkey> = (30..40).map(fresh_pubkey).collect();
+        pubkeys.push(pubkeys[2]);
+        pubkeys.push(pubkeys[2]);
+        let points = validated_pubkeys(&pubkeys).unwrap();
+        assert_eq!(
+            eth_aggregate_pubkeys(&pubkeys).unwrap().0,
+            sequential_sum(&points)
+        );
     }
 
     #[test]
