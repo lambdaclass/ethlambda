@@ -366,10 +366,10 @@ actual_slot = finalized_slot + 1 + relative_index
   - Fork-digest rollover happens at runtime (`ForkSchedule`, `beacon::transition`): the next
     digest's topics are joined `SUBSCRIBE_LEAD_EPOCHS` before its boundary and the previous
     one's left `UNSUBSCRIBE_LAG_EPOCHS` after, blob-parameter (BPO) boundaries included.
-    **Known gap**: ethrex's `DiscoveryServer` has no message that edits the served ENR (its one
-    consumer-driven edit, the `fork_id` watch, writes `eth`, not `eth2`), so its `eth2` entry
-    keeps the startup digest until a restart; peers discovering the node after a boundary
-    reject the record. See `discovery::update_served_enr`
+    Every `apply` also offers the schedule's `ENRForkID` to the served ENR
+    (`discovery::LocalEnrWriter::publish_fork_id`), which edits it only when it differs, so the
+    record is re-signed once per boundary and peers discovering the node afterwards read the
+    digest it is on now
   - `voluntary_exit`, `proposer_slashing`, `attester_slashing` and `bls_to_execution_change`
     validate in p2p like aggregates (`gossip::operations`, against the unadvanced head state,
     which must be electra or fulu: under a gloas head every operation is IGNOREd) and feed
@@ -395,7 +395,7 @@ actual_slot = finalized_slot + 1 + relative_index
 ### Peer Discovery (discv5)
 - Always on for `beacon` (mainnet bootnode ENRs are not statically dialable, so a crawl is its only way to find a peer); opt-in for `node` behind the lean-only `--discovery.enable`, off by default, so a lean node peers from `--bootnodes` alone and binds no discovery socket. `Network::discovery_enabled` is the one answer; `P2P::spawn` takes `Option<DiscoverySpawnConfig>` and `P2PServer.discovery` is an `Option`, `None` leaving the dial loop unscheduled
 - Where it runs: `DEFAULT_DISCOVERY_PORT` (9000) unless `--discovery.port` says otherwise (own UDP socket, must differ from `--gossipsub-port`; checked once by `Options::validate_ports`, which skips the discovery rules when it is off). Co-located nodes that run discovery must each pass `--discovery.port`
-- Reuses ethrex's `DiscoveryServer` with discv4 disabled, pinned to a commit of ethrex's `feat/discv5-predicate-queries` (on top of ethrex PR #7217) until both are in a release; `spawn` takes the prepared lean ENR. ethrex re-signs it on IP voting and mirrors it into the `SharedLocalNode` it was spawned with; `discovery::LocalEnr` reads that mirror, so `/eth/v1/node/identity` reports the record discv5 currently serves. Read-only: nothing written there reaches discv5
+- Reuses ethrex's `DiscoveryServer` with discv4 disabled, pinned to a commit of ethrex's `feat/discv5-lock-free-local-enr` (on `feat/discv5-predicate-queries`, on ethrex PR #7217) until all three are in a release; `spawn` takes the prepared lean ENR in a `SharedLocalNode`, a lock-free `ArcSwap` slot that is the only copy of the record. Discovery serves from it and swaps in every record IP voting re-signs; `discovery::LocalEnr` reads it (so `/eth/v1/node/identity` reports the record discv5 currently serves), and `discovery::LocalEnrWriter`, which holds the node key and stays crate-private, edits it by compare-and-swap (`edit_record`: one `seq` bump, re-signed, retried on a concurrent IP update)
 - ENR follows the beacon phase0 spec: `ip`/`udp`/`quic`/`tcp`/`secp256k1`/`eth2`/`attnets`
 - Admission mirrors lighthouse: `eth2.fork_digest` must match, `next_fork_*` may differ, a `quic` or `tcp` entry required. Handed to discovery as `LeanFilter: PeerFilter`, so records are judged on arrival, not at dial time; a reject is re-judged on a higher-`seq` ENR
 - The filter files each admitted peer in `DialTargets`, since discovery hands back a `Node` that carries no `quic`/`tcp`/`attnets`; the dial loop looks the node id back up there

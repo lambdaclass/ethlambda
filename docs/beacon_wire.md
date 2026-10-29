@@ -76,10 +76,10 @@ message's fork comes from its own topic's digest, and a `Status` on either
 digest is answered, but range sync starts only from a peer on the current
 digest (or the next one, within clock skew of the boundary).
 
-One gap: the ENR this node serves over discv5 keeps the `eth2` entry it started
-with, because ethrex's `DiscoveryServer` offers no way to replace its record at
-runtime. Peers already connected are unaffected; peers discovering the node
-after a boundary read the stale digest and reject the record.
+The ENR this node serves over discv5 moves too: at the boundary its `eth2`
+entry is replaced with the new `ENRForkID` and the record is re-signed under a
+higher `seq`, so peers discovering the node afterwards read the digest it is on
+now. See [discovery.md](./discovery.md#the-enr).
 
 ## Gossip
 
@@ -431,7 +431,7 @@ verifications per slot, so nothing is joined without a request.
 | Piece | Behaviour |
 | --- | --- |
 | State | `BeaconWire::sync_committee_subnets`: subnet to `until_epoch`, extended with the later of two requests; ids of 4 or more are dropped |
-| Advertised | MetaData v2 and v3 `syncnets` is built from that set, and the sequence number moves whenever the set does. The ENR carries no `syncnets` entry: ethrex's `DiscoveryServer` cannot replace the served record at runtime, the same known gap as the `eth2` entry |
+| Advertised | MetaData v2 and v3 `syncnets` is built from that set, and the sequence number moves whenever the set does. The ENR carries no `syncnets` entry: the served record can be edited at runtime now (`discovery::LocalEnrWriter`, which moves `eth2` at a boundary), but nothing writes the subscription set to it |
 | Left | the 12 s sweep leaves a subnet once the wall epoch reaches its `until_epoch`, and prunes the sync committee pool |
 | Fork boundaries | `beacon::transition::apply` subscribes the set under each digest it joins and unsubscribes it under each it leaves, like the aggregator attestation subnets |
 | Validation | the cheap half runs inline, the stateful half on `spawn_blocking` under `SYNC_VALIDATION_PERMITS`, a pool of its own since the burst coincides with the attestations'. An accepted message is pooled with the seats its signature verified; neither it nor a contribution reaches the chain actor |
