@@ -7,23 +7,20 @@
 //! everything it knows about the chain arrives through the `BeaconNodeApi`
 //! trait, so it runs against any conformant node.
 //!
-//! # Deviations from the specifications
+//! # Slashing protection
 //!
-//! This client implements **no slashing protection**. It keeps no durable
-//! record of what it has signed, so a restart, or a second instance sharing the
-//! same keystores, can double-vote or propose twice for one slot. On a live
-//! network either is a slashable offence. This is a deliberate, recorded scope decision, not an oversight;
-//! see [`docs/spec_deviations.md`] for the full entry, including what is and is
-//! not covered.
-//!
-//! [`crate::attestation_guard`] and [`crate::proposal_guard`] close the part of
-//! this that is reachable within a single run: a backward wall-clock step, or a
-//! duty schedule replaced mid-epoch. Both are in-memory only and neither is a
-//! substitute for the real thing.
+//! Every block and attestation is checked against a durable, per-validator
+//! record before it is signed, and the record is on disk before the signature
+//! exists. The record keeps EIP-3076's minimal watermarks, lives next to the
+//! keys, names the chain it belongs to, and is locked to one process. See
+//! [`crate::slashing_protection`] for the rule and its guarantees, and
+//! [`docs/spec_deviations.md`] for where the minimal rule is stricter than the
+//! specification.
 //!
 //! [`docs/spec_deviations.md`]: https://github.com/lambdaclass/ethlambda/blob/main/docs/spec_deviations.md
 //!
-//! The keymanager API is affected by the same decision. Its specification makes
+//! The keymanager API registers a key it imports before loading it. It does
+//! not yet carry history in or out: its specification makes
 //! `slashing_protection` a required field of the `DELETE /eth/v1/keystores`
 //! response, so this implementation returns a well-formed but empty EIP-3076
 //! interchange, and accepts and ignores the optional `slashing_protection`
@@ -32,7 +29,6 @@
 pub mod aggregation;
 pub mod aggregation_selection;
 pub mod attestation;
-pub mod attestation_guard;
 pub mod beacon_node;
 pub mod duties;
 pub mod error;
@@ -41,10 +37,10 @@ pub mod keys;
 pub mod metrics;
 pub mod payload_attestation;
 pub mod proposal;
-pub mod proposal_guard;
 pub mod proposer_settings;
 pub(crate) mod secure_fs;
 pub mod signing;
+pub mod slashing_protection;
 pub mod slot_clock;
 pub mod subscriptions;
 pub mod sync_committee;
@@ -95,29 +91,17 @@ pub struct ValidatorConfig {
     /// Bind address for the keymanager API. `None` when `--enable-keymanager`
     /// was not passed, in which case it is never spawned.
     pub keymanager: Option<std::net::SocketAddr>,
+    /// Register keys that have no slashing-protection record as never having
+    /// signed, instead of refusing to start. See
+    /// [`slashing_protection::SlashingProtection::open`].
+    pub init_slashing_protection: bool,
 }
 
 /// Run the validator client until the process is stopped.
 pub async fn run(config: ValidatorConfig) -> Result<()> {
     metrics::init();
 
-    // Said once, at startup, before anything is loaded or signed.
-    //
-    // Until now this client's most consequential property was recorded only in
-    // a rustdoc comment on this module, which nobody running a binary reads.
-    // An operator can build this, point it at mainnet keys, and never meet the
-    // warning. `warn!` rather than `info!` because the consequence is losing
-    // stake, and it is unconditional rather than behind a flag because a
-    // warning an operator can silence is one they will.
-    warn!(
-        "This validator client keeps NO slashing-protection record. It cannot detect that a \
-         previous run, or another client holding these keys, already signed. Running the same \
-         keys here and anywhere else, or restarting into a state where the chain has moved, can \
-         produce a slashable double vote or a double block proposal. Do not use these keys in \
-         any other client while this one runs. See docs/spec_deviations.md."
-    );
-
-    // Said at startup for the same reason the warning above is: an operator
+    // Said at startup, where an operator reads it: an operator
     // who never sets this proposes blocks that pay their execution-layer
     // rewards to whatever address their beacon node was configured with, which
     // on a default configuration is nobody useful. It is silent money, and
@@ -191,6 +175,23 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         "Validator client starting"
     );
 
+    // After the beacon node names the chain, which the record must belong to,
+    // and before any service that signs exists. Every loaded key must already
+    // have a record, unless the operator said otherwise.
+    let keys = store.read().await.pubkeys();
+    let protection = slashing_protection::SlashingProtection::open(
+        &config.validators_dir,
+        genesis.genesis_validators_root,
+        &keys,
+        config.init_slashing_protection,
+    )?;
+    info!(
+        validators = protection.len(),
+        path = %protection.path().map(|path| path.display().to_string()).unwrap_or_default(),
+        "Slashing protection loaded"
+    );
+    let protection = Arc::new(std::sync::Mutex::new(protection));
+
     let clock = SlotClock::from_config(genesis.genesis_time, &spec);
     let context = Arc::new(SigningContext {
         config: spec,
@@ -198,11 +199,17 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     });
 
     let mut duties = DutiesService::new(beacon_node.clone(), Vec::new());
-    let attestation = AttestationService::new(beacon_node.clone(), context.clone());
+    let attestation =
+        AttestationService::new(beacon_node.clone(), context.clone(), protection.clone());
     let aggregation = AggregationService::new(beacon_node.clone(), context.clone());
     let payload_attestation = PayloadAttestationService::new(beacon_node.clone(), context.clone());
     let sync_committee = SyncCommitteeService::new(beacon_node.clone(), context.clone());
-    let proposal = ProposalService::new(beacon_node.clone(), context.clone(), settings.clone());
+    let proposal = ProposalService::new(
+        beacon_node.clone(),
+        context.clone(),
+        settings.clone(),
+        protection.clone(),
+    );
 
     if let Some(address) = config.keymanager {
         let token = http_api::load_or_create_token(&config.validators_dir)?;
@@ -212,6 +219,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             validators_dir: config.validators_dir.clone(),
             secrets_dir: config.secrets_dir.clone(),
             definitions_lock: Arc::new(Mutex::new(())),
+            protection: protection.clone(),
         };
         let router = http_api::router(context, token);
         let listener = tokio::net::TcpListener::bind(address)
@@ -462,7 +470,7 @@ async fn attest_and_aggregate<B: BeaconNodeApi>(
     // also delays the next slot's is worth less than nothing.
     //
     // Dropping the future mid-flight is safe here specifically because of
-    // `AttestationGuard`: it records at signing time, so a duty abandoned
+    // slashing protection: it records before signing, so a duty abandoned
     // between signing and submission cannot be re-signed next slot under
     // the same target. That is the intended outcome and matches `attest`'s
     // own "do not retry within a slot" rule; the attestation is simply
@@ -620,8 +628,8 @@ async fn aggregate<B: BeaconNodeApi>(
 /// So: a proposal that overruns is abandoned, and the slot's attesters still
 /// vote. Dropping the future mid-flight is safe for the same reason it is on
 /// the attestation path, and only for that reason: `ProposalService` records
-/// the slot in its guard at signing time, so a block abandoned between signing
-/// and publication cannot be signed a second time.
+/// the slot in slashing protection before signing, so a block abandoned between
+/// signing and publication cannot be signed a second time.
 ///
 /// Failures are logged and counted rather than propagated. A proposal is one
 /// slot's work; losing it must not stop the client attesting for the rest of
@@ -1197,7 +1205,11 @@ mod tests {
         }];
 
         serve_slot_duties(
-            &AttestationService::new(node.clone(), context.clone()),
+            &AttestationService::new(
+                node.clone(),
+                context.clone(),
+                slashing_protection::SlashingProtection::in_memory(),
+            ),
             &AggregationService::new(node.clone(), context.clone()),
             &PayloadAttestationService::new(node.clone(), context.clone()),
             &SyncCommitteeService::new(node.clone(), context.clone()),
@@ -1335,7 +1347,11 @@ mod tests {
         }];
 
         serve_slot_duties(
-            &AttestationService::new(node.clone(), context.clone()),
+            &AttestationService::new(
+                node.clone(),
+                context.clone(),
+                slashing_protection::SlashingProtection::in_memory(),
+            ),
             &AggregationService::new(node.clone(), context.clone()),
             &PayloadAttestationService::new(node.clone(), context.clone()),
             &SyncCommitteeService::new(node.clone(), context.clone()),
@@ -1371,7 +1387,11 @@ mod tests {
         let store = empty_store();
 
         serve_slot_duties(
-            &AttestationService::new(node.clone(), context.clone()),
+            &AttestationService::new(
+                node.clone(),
+                context.clone(),
+                slashing_protection::SlashingProtection::in_memory(),
+            ),
             &AggregationService::new(node.clone(), context.clone()),
             &PayloadAttestationService::new(node.clone(), context.clone()),
             &SyncCommitteeService::new(node.clone(), context.clone()),

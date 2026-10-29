@@ -58,6 +58,9 @@ pub struct KeymanagerContext {
     /// it takes this one first and `store` second, consistently, so the two
     /// never deadlock against each other.
     pub definitions_lock: Arc<Mutex<()>>,
+    /// The record every key must be registered in before it is loaded, so the
+    /// duty path never meets a key it has no record for.
+    pub protection: crate::slashing_protection::SharedProtection,
 }
 
 /// The file the generated token is written to, inside the validators directory.

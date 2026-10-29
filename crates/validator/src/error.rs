@@ -104,6 +104,15 @@ pub enum Error {
     #[error("signing failed for {pubkey:?}: {reason}")]
     Signing { pubkey: BlsPubkey, reason: String },
 
+    /// The slashing-protection record could not be opened, read or written,
+    /// or refuses to start: a key with no record, another chain's record,
+    /// another process holding it.
+    ///
+    /// Never retryable: every one of these means nothing may be signed until
+    /// an operator looks.
+    #[error("slashing protection {path}: {reason}")]
+    SlashingProtection { path: String, reason: String },
+
     #[error("{path}: {source}")]
     Io {
         path: String,
@@ -136,6 +145,7 @@ impl Error {
             | Self::KeystoreBadPassword
             | Self::UnknownValidator(_)
             | Self::Signing { .. }
+            | Self::SlashingProtection { .. }
             | Self::Io { .. } => false,
         }
     }

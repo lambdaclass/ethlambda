@@ -367,6 +367,7 @@ mod tests {
             validators_dir: dir.path().to_path_buf(),
             secrets_dir: dir.path().to_path_buf(),
             definitions_lock: Arc::new(tokio::sync::Mutex::new(())),
+            protection: crate::slashing_protection::SlashingProtection::in_memory(),
         };
         Harness {
             app: router(context, TOKEN.to_string()),

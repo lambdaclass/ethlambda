@@ -322,9 +322,10 @@ pub trait BeaconNodeApi: Send + Sync {
     ///
     /// An implementation must reject data whose `slot` is not the one asked
     /// for, and whose `target.epoch` is not that slot's epoch. Both are
-    /// signable material, and this client keeps no slashing-protection record,
+    /// signable material, and slashing protection records whatever it allows,
     /// so a node answering about the wrong slot must never reach the signing
-    /// path.
+    /// path: a target from the future would raise the validator's watermark
+    /// and cost it every attestation until the chain caught up.
     ///
     /// It matters that this is the *implementation's* job rather than the
     /// caller's, because of where failover sits.
