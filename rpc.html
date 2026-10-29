@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-7a12ae9d.js";
+            window.path_to_searchindex_js = "searchindex-3d4bc094.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -976,7 +976,10 @@ state. A slot the store holds nothing at is still a <code>404</code>.</p>
 node’s QUIC, TCP and discv5 multiaddrs. The multiaddrs need
 <code>--discovery.advertise-ip</code>, since a node bound to <code>0.0.0.0</code> does not know the
 address peers reach it on; without the flag they are empty and the ENR carries
-no IP. <code>metadata</code> is still a placeholder.</p>
+no IP. <code>metadata</code> is the <code>MetaData</code> the node answers peers with over req/resp,
+read at request time, so <code>syncnets</code> and <code>seq_number</code> follow the sync committee
+subnets a validator client asks for. That <code>seq_number</code> versions <code>MetaData</code>
+alone: the p2p specification counts it separately from the ENR’s <code>seq</code>.</p>
 <h3 id="get-ethv1events"><a class="header" href="#get-ethv1events"><code>GET /eth/v1/events</code></a></h3>
 <p>The Beacon API eventstream: the same Server-Sent Events stream as
 <a href="#get-leanv0events"><code>/lean/v0/events</code></a> (topic on the <code>event:</code> line, payload on

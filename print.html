@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-7a12ae9d.js";
+            window.path_to_searchindex_js = "searchindex-3d4bc094.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -2848,7 +2848,7 @@ and change (no consumer), and a delivery is only credited once accepted, so
 scoring P3 there would penalize every mesh peer for this node’s own gap. All
 64 attestation subnets get parameters, not just the backbone ones, because
 aggregator duties join others at runtime.</p>
-<p>Two differences from lighthouse:</p>
+<p>Three differences from lighthouse:</p>
 <ul>
 <li><code>mesh_n</code> is this node’s <code>D</code> (8), not lighthouse’s 5. It only enters the
 first-message-delivery cap.</li>
@@ -2866,6 +2866,17 @@ real ceiling. <code>SyncStatus</code> cannot serve as this gate: on the mainnet
 follower it reported <code>synced</code> through a 10-minute catch-up up to 98 slots
 behind, since its network-stall rule reads a lagging freshest-known block
 as a stalled network.</li>
+<li><strong>Leaving a topic waits out the peers’ backoff.</strong> Gossipsub’s default
+backoff after unsubscribing (10 s) is shorter than its prune backoff
+(60 s), and a rust-libp2p peer that sees a mesh peer unsubscribe backs off
+from it for the longer one, which the leaver’s PRUNE cannot shorten. An
+aggregator subnet left when its duty expires and rejoined within that
+window for the next one (a duty in the last slots of epoch N, none in N+1,
+one in N+2) re-grafts into peers that reject the graft and charge a
+behaviour penalty. <code>PRUNE_BACKOFF</code> sets both backoffs to the prune value,
+so the node waits out the same window and is not penalized. Neither
+consensus-specs nor lighthouse sets these: the spec defers gossipsub v1.1’s
+extra parameters, and lighthouse keeps the defaults.</li>
 </ul>
 <p>The block, aggregate and attestation parameters depend on the active
 validator count, so the p2p actor rebuilds them every slot from the head’s
@@ -5079,7 +5090,10 @@ state. A slot the store holds nothing at is still a <code>404</code>.</p>
 node’s QUIC, TCP and discv5 multiaddrs. The multiaddrs need
 <code>--discovery.advertise-ip</code>, since a node bound to <code>0.0.0.0</code> does not know the
 address peers reach it on; without the flag they are empty and the ENR carries
-no IP. <code>metadata</code> is still a placeholder.</p>
+no IP. <code>metadata</code> is the <code>MetaData</code> the node answers peers with over req/resp,
+read at request time, so <code>syncnets</code> and <code>seq_number</code> follow the sync committee
+subnets a validator client asks for. That <code>seq_number</code> versions <code>MetaData</code>
+alone: the p2p specification counts it separately from the ENR’s <code>seq</code>.</p>
 <h3 id="get-ethv1events"><a class="header" href="#get-ethv1events"><code>GET /eth/v1/events</code></a></h3>
 <p>The Beacon API eventstream: the same Server-Sent Events stream as
 <a href="#get-leanv0events"><code>/lean/v0/events</code></a> (topic on the <code>event:</code> line, payload on
@@ -6568,6 +6582,12 @@ and new head’s branches back to their common ancestor, deleting the slots
 that leave the canonical chain and writing the ones that join it. A reorg
 therefore touches only the affected slot range, not the whole table. Never
 pruned.</p>
+<p>That walk never writes the common ancestor itself, and at bootstrap the head
+is the anchor, so the anchor’s own slot is written separately: by <code>init_store</code>
+on a lean directory, and by <code>index_beacon_anchor</code> (called from the beacon
+<code>get_forkchoice_store</code>) on a beacon one, keyed by the anchor block’s slot
+rather than the anchor state’s. A beacon directory bootstrapped before
+<code>index_beacon_anchor</code> existed has no row for its anchor.</p>
 <p>Backs <code>get_signed_blocks_by_slot_range</code>, which serves BlocksByRange requests
 over req/resp (<code>crates/net/p2p/src/req_resp/handlers.rs</code>). It does <strong>not</strong>
 back the RPC <code>GET /lean/v0/blocks/:slot</code> endpoint: that handler resolves a
@@ -7169,7 +7189,9 @@ entries are written by its caller instead, through the same <code>insert_state</
 <code>insert_signed_block</code> an ordinary block import uses, followed by the anchor’s
 own <code>BeaconUnrealizedJustifications</code> row (<code>set_unrealized_justification</code>), the
 same order every later block’s import follows too — see
-<a href="#beaconunrealizedjustifications">BeaconUnrealizedJustifications</a> above.</p>
+<a href="#beaconunrealizedjustifications">BeaconUnrealizedJustifications</a> above. The
+one row an import does not write is the anchor’s <code>BlockRoots</code> entry, which
+<code>index_beacon_anchor</code> adds right after the block (see <a href="#blockroots">BlockRoots</a>).</p>
 <p><code>from_db_state</code> is the restore path: it reads <code>db_version</code>, <code>preset</code>, <code>chain</code>,
 <code>config</code> and <code>anchor_slot</code> from <code>Metadata</code>, returning <code>None</code> for an empty DB. A format
 mismatch is still fatal, failing with <code>Error::DbVersionMismatch</code> or

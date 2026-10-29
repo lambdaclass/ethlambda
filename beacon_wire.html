@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-7a12ae9d.js";
+            window.path_to_searchindex_js = "searchindex-3d4bc094.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -446,7 +446,7 @@ and change (no consumer), and a delivery is only credited once accepted, so
 scoring P3 there would penalize every mesh peer for this node’s own gap. All
 64 attestation subnets get parameters, not just the backbone ones, because
 aggregator duties join others at runtime.</p>
-<p>Two differences from lighthouse:</p>
+<p>Three differences from lighthouse:</p>
 <ul>
 <li><code>mesh_n</code> is this node’s <code>D</code> (8), not lighthouse’s 5. It only enters the
 first-message-delivery cap.</li>
@@ -464,6 +464,17 @@ real ceiling. <code>SyncStatus</code> cannot serve as this gate: on the mainnet
 follower it reported <code>synced</code> through a 10-minute catch-up up to 98 slots
 behind, since its network-stall rule reads a lagging freshest-known block
 as a stalled network.</li>
+<li><strong>Leaving a topic waits out the peers’ backoff.</strong> Gossipsub’s default
+backoff after unsubscribing (10 s) is shorter than its prune backoff
+(60 s), and a rust-libp2p peer that sees a mesh peer unsubscribe backs off
+from it for the longer one, which the leaver’s PRUNE cannot shorten. An
+aggregator subnet left when its duty expires and rejoined within that
+window for the next one (a duty in the last slots of epoch N, none in N+1,
+one in N+2) re-grafts into peers that reject the graft and charge a
+behaviour penalty. <code>PRUNE_BACKOFF</code> sets both backoffs to the prune value,
+so the node waits out the same window and is not penalized. Neither
+consensus-specs nor lighthouse sets these: the spec defers gossipsub v1.1’s
+extra parameters, and lighthouse keeps the defaults.</li>
 </ul>
 <p>The block, aggregate and attestation parameters depend on the active
 validator count, so the p2p actor rebuilds them every slot from the head’s

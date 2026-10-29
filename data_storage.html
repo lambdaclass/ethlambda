@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-7a12ae9d.js";
+            window.path_to_searchindex_js = "searchindex-3d4bc094.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -395,6 +395,12 @@ and new head’s branches back to their common ancestor, deleting the slots
 that leave the canonical chain and writing the ones that join it. A reorg
 therefore touches only the affected slot range, not the whole table. Never
 pruned.</p>
+<p>That walk never writes the common ancestor itself, and at bootstrap the head
+is the anchor, so the anchor’s own slot is written separately: by <code>init_store</code>
+on a lean directory, and by <code>index_beacon_anchor</code> (called from the beacon
+<code>get_forkchoice_store</code>) on a beacon one, keyed by the anchor block’s slot
+rather than the anchor state’s. A beacon directory bootstrapped before
+<code>index_beacon_anchor</code> existed has no row for its anchor.</p>
 <p>Backs <code>get_signed_blocks_by_slot_range</code>, which serves BlocksByRange requests
 over req/resp (<code>crates/net/p2p/src/req_resp/handlers.rs</code>). It does <strong>not</strong>
 back the RPC <code>GET /lean/v0/blocks/:slot</code> endpoint: that handler resolves a
@@ -996,7 +1002,9 @@ entries are written by its caller instead, through the same <code>insert_state</
 <code>insert_signed_block</code> an ordinary block import uses, followed by the anchor’s
 own <code>BeaconUnrealizedJustifications</code> row (<code>set_unrealized_justification</code>), the
 same order every later block’s import follows too — see
-<a href="#beaconunrealizedjustifications">BeaconUnrealizedJustifications</a> above.</p>
+<a href="#beaconunrealizedjustifications">BeaconUnrealizedJustifications</a> above. The
+one row an import does not write is the anchor’s <code>BlockRoots</code> entry, which
+<code>index_beacon_anchor</code> adds right after the block (see <a href="#blockroots">BlockRoots</a>).</p>
 <p><code>from_db_state</code> is the restore path: it reads <code>db_version</code>, <code>preset</code>, <code>chain</code>,
 <code>config</code> and <code>anchor_slot</code> from <code>Metadata</code>, returning <code>None</code> for an empty DB. A format
 mismatch is still fatal, failing with <code>Error::DbVersionMismatch</code> or
