@@ -839,10 +839,10 @@ fn local_block(
         options,
     ) {
         Ok(block) => block,
-        // `pack_attestations` and `pack_operations` check every candidate
-        // against this state, and the sync aggregate is verified against it
-        // too, so this should not happen; but a block without them still earns
-        // the proposal, and one that fails to build earns nothing.
+        // `pack` checked every attestation and operation against this state
+        // and verified the sync aggregate against it, so this should not
+        // happen; but a block without them still earns the proposal, and one
+        // that fails to build earns nothing.
         Err(err) if packed.droppable() => {
             warn!(%slot, %err, "Block with attestations, operations or a sync aggregate failed to build; retrying without");
             assemble_block(
