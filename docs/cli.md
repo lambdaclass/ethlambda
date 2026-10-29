@@ -435,9 +435,9 @@ give one validator its own value in place of the command line's default:
 
 | Setting | Default | Takes effect |
 |---|---|---|
-| `feerecipient` | `--suggested-fee-recipient` | At the next epoch boundary, when the fee recipients are registered with the beacon node again. A block proposed before then pays the address the node was last given, and the check before signing reports the mismatch |
+| `feerecipient` | `--suggested-fee-recipient` | At the next epoch boundary, when the fee recipients are registered with the beacon node again. A block proposed before then pays the address the node was last given, and the check before signing reports the mismatch. With `--builder-proposals`, the next slot's builder registration carries it too, and an ethlambda beacon node takes it from there |
 | `graffiti` | `--graffiti` | The next proposal |
-| `gas_limit` | `DEFAULT_GAS_LIMIT` | Stored and served only: it matters to builder registrations, and there is no builder flow |
+| `gas_limit` | `DEFAULT_GAS_LIMIT` | With `--builder-proposals`, the next slot's builder registration, which the builder builds toward. Otherwise stored and served only |
 
 **These are held in memory only.** A restart puts every validator back on the
 defaults, so an operator driving these endpoints must set them again after one.
