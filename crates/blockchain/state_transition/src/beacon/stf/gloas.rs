@@ -47,7 +47,7 @@
 
 use libssz::SszEncode as _;
 
-use crate::beacon::bls;
+use crate::beacon::bls::{self, SignatureSet};
 use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::shared::{DepositMessage, ProposerSlashing};
@@ -64,9 +64,9 @@ use crate::beacon::helpers::gloas::{
     add_builder_to_registry, can_builder_cover_bid, convert_builder_index_to_validator_index,
     convert_validator_index_to_builder_index, get_attestation_participation_flag_indices,
     get_indexed_attestation, get_indexed_payload_attestation, gloas_state, gloas_state_ref,
+    indexed_attestation_signature_set, indexed_payload_attestation_signature_set,
     initiate_builder_exit, is_active_builder, is_attestation_same_slot, is_builder_index,
-    is_builder_withdrawal_credential, is_valid_indexed_attestation,
-    is_valid_indexed_payload_attestation, settle_builder_payment,
+    is_builder_withdrawal_credential, settle_builder_payment,
 };
 use crate::beacon::helpers::misc::{compute_domain, compute_epoch_at_slot, compute_signing_root};
 use crate::beacon::helpers::mutators::{decrease_balance, increase_balance, slash_validator};
@@ -76,6 +76,7 @@ use crate::beacon::primitives::{
     Bytes32, ExecutionAddress, Gwei, HashTreeRoot as _, ParticipationFlags, Root, Slot,
     ValidatorIndex, WithdrawalIndex,
 };
+use crate::beacon::stf::signatures::SignatureBatch;
 
 use super::ExecutionEngine;
 
@@ -105,6 +106,7 @@ pub fn process_block(
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
     options: super::block::BlockProcessingOptions,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     // [New in Gloas:EIP7732]
     let parent_slot = state.latest_block_header().slot;
@@ -122,8 +124,13 @@ pub fn process_block(
     process_withdrawals(state)?;
     // [Modified in Gloas:EIP7732] Removed `process_execution_payload`.
     // [New in Gloas:EIP7732]
-    process_execution_payload_bid(state, &block.body.signed_execution_payload_bid, config)?;
-    super::block::process_randao(state, &block.body.randao_reveal, options.randao)?;
+    process_execution_payload_bid(
+        state,
+        &block.body.signed_execution_payload_bid,
+        config,
+        signatures,
+    )?;
+    super::block::process_randao(state, &block.body.randao_reveal, options.randao, signatures)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
     // [Modified in Gloas:EIP7732]
     process_operations(
@@ -133,9 +140,43 @@ pub fn process_block(
         config,
         committees,
         active_balances,
+        signatures,
     )?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
+    super::altair::process_sync_aggregate(
+        state,
+        &block.body.sync_aggregate,
+        active_balances,
+        signatures,
+    )?;
     Ok(())
+}
+
+/// [`process_block`] followed by the check of every signature it deferred:
+/// the whole of what the specification's `process_block` means.
+///
+/// For the callers that run a gloas block through its own driver rather than
+/// through [`super::block::process_block`] (block production, which builds a
+/// block's state root this way), and have no signature of their own to add to
+/// the batch.
+pub fn process_block_and_verify(
+    state: &mut BeaconState,
+    block: &gloas::BeaconBlock,
+    config: &Config,
+    committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
+    options: super::block::BlockProcessingOptions,
+) -> Result<()> {
+    SignatureBatch::deferred(|signatures| {
+        process_block(
+            state,
+            block,
+            config,
+            committees,
+            active_balances,
+            options,
+            signatures,
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -745,6 +786,17 @@ pub fn verify_execution_payload_bid_signature(
     state: &BeaconState,
     signed_bid: &gloas::SignedExecutionPayloadBid,
 ) -> Result<bool> {
+    Ok(execution_payload_bid_signature_set(state, signed_bid)?.is_some_and(|set| set.verify()))
+}
+
+/// The signature check [`verify_execution_payload_bid_signature`] makes,
+/// resolved but not yet run, so a block can verify it with the rest of its
+/// signatures in one batch. `Ok(None)` is a builder key or a signature that
+/// does not validate: the bid is invalid without needing a pairing.
+pub fn execution_payload_bid_signature_set(
+    state: &BeaconState,
+    signed_bid: &gloas::SignedExecutionPayloadBid,
+) -> Result<Option<SignatureSet>> {
     let builder_index = signed_bid.message.builder_index;
     let inner = gloas_state_ref(state, "verify_execution_payload_bid_signature")?;
     let builder = inner
@@ -756,7 +808,7 @@ pub fn verify_execution_payload_bid_signature(
         })?;
     let domain = get_domain(state, constants::DOMAIN_BEACON_BUILDER, None);
     let signing_root = compute_signing_root(signed_bid.message.hash_tree_root(), domain);
-    Ok(bls::verify(
+    Ok(SignatureSet::single(
         &builder.pubkey,
         signing_root,
         &signed_bid.signature,
@@ -768,6 +820,7 @@ pub fn process_execution_payload_bid(
     state: &mut BeaconState,
     signed_bid: &gloas::SignedExecutionPayloadBid,
     config: &Config,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let bid = signed_bid.message.clone();
     let builder_index = bid.builder_index;
@@ -816,8 +869,8 @@ pub fn process_execution_payload_bid(
             "process_execution_payload_bid: can_builder_cover_bid(state, builder_index, amount)",
         )?;
         // Verify that the bid signature is valid.
-        verify(
-            verify_execution_payload_bid_signature(state, signed_bid)?,
+        signatures.push(
+            execution_payload_bid_signature_set(state, signed_bid)?,
             "process_execution_payload_bid: verify_execution_payload_bid_signature(state, signed_bid)",
         )?;
     }
@@ -1186,9 +1239,13 @@ pub fn process_proposer_slashing(
     state: &mut BeaconState,
     proposer_slashing: &ProposerSlashing,
     config: &Config,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
-    let (proposer_index, current_epoch) =
-        crate::beacon::stf::operations::verify_proposer_slashing(state, proposer_slashing)?;
+    let (proposer_index, current_epoch) = crate::beacon::stf::operations::verify_proposer_slashing(
+        state,
+        proposer_slashing,
+        signatures,
+    )?;
 
     // [New in Gloas:EIP7732] Remove the `BuilderPendingPayment` corresponding
     // to this proposal if it is still in the 2-epoch window.
@@ -1249,6 +1306,7 @@ pub fn process_attester_slashing(
     state: &mut BeaconState,
     attester_slashing: &gloas::AttesterSlashing,
     config: &Config,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let attestation_1 = &attester_slashing.attestation_1;
     let attestation_2 = &attester_slashing.attestation_2;
@@ -1257,12 +1315,12 @@ pub fn process_attester_slashing(
         is_slashable_attestation_data(&attestation_1.data, &attestation_2.data),
         "process_attester_slashing: is_slashable_attestation_data(attestation_1.data, attestation_2.data)",
     )?;
-    verify(
-        is_valid_indexed_attestation(state, attestation_1),
+    signatures.push(
+        indexed_attestation_signature_set(state, attestation_1),
         "process_attester_slashing: is_valid_indexed_attestation(state, attestation_1)",
     )?;
-    verify(
-        is_valid_indexed_attestation(state, attestation_2),
+    signatures.push(
+        indexed_attestation_signature_set(state, attestation_2),
         "process_attester_slashing: is_valid_indexed_attestation(state, attestation_2)",
     )?;
 
@@ -1303,6 +1361,7 @@ pub fn process_attestation(
     parent_slot: Slot,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let data = attestation.data;
     let current_epoch = get_current_epoch(state);
@@ -1363,8 +1422,8 @@ pub fn process_attestation(
         get_attestation_participation_flag_indices(state, &data, inclusion_delay, parent_slot)?;
 
     let indexed_attestation = get_indexed_attestation(state, attestation, committees)?;
-    verify(
-        is_valid_indexed_attestation(state, &indexed_attestation),
+    signatures.push(
+        indexed_attestation_signature_set(state, &indexed_attestation),
         "process_attestation: is_valid_indexed_attestation(state, get_indexed_attestation(state, attestation))",
     )?;
 
@@ -1541,6 +1600,7 @@ pub fn process_payload_attestation(
     state: &mut BeaconState,
     payload_attestation: &gloas::PayloadAttestation,
     config: &Config,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let data = payload_attestation.data;
 
@@ -1561,8 +1621,8 @@ pub fn process_payload_attestation(
     // Verify signature.
     let indexed_payload_attestation =
         get_indexed_payload_attestation(state, payload_attestation, config)?;
-    verify(
-        is_valid_indexed_payload_attestation(state, &indexed_payload_attestation),
+    signatures.push(
+        indexed_payload_attestation_signature_set(state, &indexed_payload_attestation),
         "process_payload_attestation: is_valid_indexed_payload_attestation(state, indexed_payload_attestation)",
     )?;
     Ok(())
@@ -1588,6 +1648,7 @@ pub fn process_operations(
     config: &Config,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     verify(
         body.deposits.is_empty(),
@@ -1622,26 +1683,43 @@ pub fn process_operations(
 
     // [Modified in Gloas:EIP7732]
     for proposer_slashing in body.proposer_slashings.iter() {
-        process_proposer_slashing(state, proposer_slashing, config)?;
+        process_proposer_slashing(state, proposer_slashing, config, signatures)?;
     }
     for attester_slashing in body.attester_slashings.iter() {
-        process_attester_slashing(state, attester_slashing, config)?;
+        process_attester_slashing(state, attester_slashing, config, signatures)?;
     }
     // [Modified in Gloas:EIP7732]
     for attestation in body.attestations.iter() {
-        process_attestation(state, attestation, parent_slot, committees, active_balances)?;
+        process_attestation(
+            state,
+            attestation,
+            parent_slot,
+            committees,
+            active_balances,
+            signatures,
+        )?;
     }
     for voluntary_exit in body.voluntary_exits.iter() {
-        crate::beacon::stf::electra::process_voluntary_exit(state, voluntary_exit, config)?;
+        crate::beacon::stf::electra::process_voluntary_exit(
+            state,
+            voluntary_exit,
+            config,
+            signatures,
+        )?;
     }
     for signed_change in body.bls_to_execution_changes.iter() {
-        crate::beacon::stf::capella::process_bls_to_execution_change(state, signed_change, config)?;
+        crate::beacon::stf::capella::process_bls_to_execution_change(
+            state,
+            signed_change,
+            config,
+            signatures,
+        )?;
     }
     // [Modified in Gloas:EIP7732] Removed `process_deposit_request`,
     // `process_withdrawal_request`, and `process_consolidation_request`.
     // [New in Gloas:EIP7732]
     for payload_attestation in body.payload_attestations.iter() {
-        process_payload_attestation(state, payload_attestation, config)?;
+        process_payload_attestation(state, payload_attestation, config, signatures)?;
     }
 
     Ok(())
@@ -1677,7 +1755,10 @@ mod tests {
             signature: g2_point_at_infinity(),
         };
 
-        process_execution_payload_bid(&mut state, &signed_bid, &config).unwrap();
+        crate::beacon::stf::signatures::checked(|s| {
+            process_execution_payload_bid(&mut state, &signed_bid, &config, s)
+        })
+        .unwrap();
         assert_eq!(
             gloas_state_ref(&state, "test")
                 .unwrap()
@@ -1706,7 +1787,9 @@ mod tests {
             signature: g2_point_at_infinity(),
         };
 
-        let result = process_execution_payload_bid(&mut state, &signed_bid, &config);
+        let result = crate::beacon::stf::signatures::checked(|s| {
+            process_execution_payload_bid(&mut state, &signed_bid, &config, s)
+        });
         assert!(
             matches!(
                 result,
@@ -1922,14 +2005,17 @@ mod tests {
         for (expected_message, body) in cases {
             let mut state = state.clone();
             let committees = CommitteeCache::default();
-            let result = process_operations(
-                &mut state,
-                &body,
-                0,
-                &config,
-                &committees,
-                &ActiveBalanceCache::default(),
-            );
+            let result = crate::beacon::stf::signatures::checked(|s| {
+                process_operations(
+                    &mut state,
+                    &body,
+                    0,
+                    &config,
+                    &committees,
+                    &ActiveBalanceCache::default(),
+                    s,
+                )
+            });
             assert!(
                 matches!(result, Err(Error::SpecAssert(message)) if message == expected_message),
                 "expected {expected_message:?} to fail, got {result:?}"
