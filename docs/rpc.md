@@ -241,6 +241,9 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `GET` | `/eth/v1/node/health` | *(status only)* | `200` caught up, `206` syncing or on an optimistic head |
 | `GET` | `/eth/v1/node/version` | JSON | Client version string |
 | `GET` | `/eth/v1/node/identity` | JSON | Peer ID, ENR and listen multiaddrs (see below) |
+| `GET` | `/eth/v1/node/peers` | JSON | Connected peers, filterable by `state` and `direction` (see below) |
+| `GET` | `/eth/v1/node/peers/{peer_id}` | JSON | One connected peer; `400` for a malformed id, `404` if it is not connected |
+| `GET` | `/eth/v1/node/peer_count` | JSON | Peers per connection state, as quoted integers |
 | `GET`, `POST` | `/eth/v1/beacon/states/{state_id}/validators` | JSON | Registry entries by index or pubkey, with status |
 | `GET` | `/eth/v1/beacon/states/{state_id}/validators/{validator_id}` | JSON | One registry entry, by index or pubkey; `404` if there is none |
 | `GET` | `/eth/v1/validator/duties/proposer/{epoch}` | JSON | Proposers for any epoch from the head's up to one past the wall clock's |
@@ -847,6 +850,25 @@ no IP. `metadata` is the `MetaData` the node answers peers with over req/resp,
 read at request time, so `syncnets` and `seq_number` follow the sync committee
 subnets a validator client asks for. That `seq_number` versions `MetaData`
 alone: the p2p specification counts it separately from the ENR's `seq`.
+
+`/eth/v1/node/peers`, `/eth/v1/node/peers/{peer_id}` and
+`/eth/v1/node/peer_count` read the p2p layer's table of connected peers at
+request time. Only **connected** peers are tracked: a peer enters the table when
+its first connection is established and leaves when its last one closes, so
+`state` is always `connected`. A `state` filter naming `disconnected`,
+`connecting` or `disconnecting` is valid and returns an empty list, and
+`peer_count` reports `"0"` for those states. A `state` or `direction` value
+outside the specification's enum is a `400`; the parameters may be repeated or
+comma-separated, values of one parameter are alternatives, and the two
+parameters are AND-combined. `meta.count` is the length of the filtered list,
+and peers are ordered by peer id.
+
+`direction` is that of the peer's first connection, and `last_seen_p2p_address`
+is that connection's remote address ending in `/p2p/<peer id>`. `enr` is the
+record discovery supplied before this node dialed the peer, and `null` when
+there is none: inbound peers, and bootnodes dialed from `--bootnodes`. No
+request is made to obtain it. A `peer_id` that is not base58 is a `400`; a
+well-formed one that is not connected is a `404`.
 
 ### `GET /eth/v1/events`
 
