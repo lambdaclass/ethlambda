@@ -166,17 +166,17 @@ pub fn process_block_and_verify(
     active_balances: &ActiveBalanceCache,
     options: super::block::BlockProcessingOptions,
 ) -> Result<()> {
-    let mut signatures = SignatureBatch::new();
-    process_block(
-        state,
-        block,
-        config,
-        committees,
-        active_balances,
-        options,
-        &mut signatures,
-    )?;
-    signatures.verify()
+    SignatureBatch::deferred(|signatures| {
+        process_block(
+            state,
+            block,
+            config,
+            committees,
+            active_balances,
+            options,
+            signatures,
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
