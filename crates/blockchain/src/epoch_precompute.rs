@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ethlambda_state_transition::beacon::fork_choice;
+use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCacheExt as _;
 use ethlambda_state_transition::beacon::helpers::misc::compute_start_slot_at_epoch;
 use ethlambda_state_transition::metrics as stf_metrics;
 use ethlambda_storage::{CacheKey, Chain};
@@ -220,13 +221,21 @@ impl BlockChainServer {
 
         let config = self.store.config();
         let actor = ctx.actor_ref();
+        let committee_cache = self.store.committee_cache();
         tokio::task::spawn_blocking(move || {
             let result = {
                 let _timing = stf_metrics::time_epoch_precompute();
                 fork_choice::advance_to_epoch_start(&head_state, key.epoch, &config)
             };
             let result = result.map(Arc::new).map_err(|err| err.to_string());
+            let advanced = result.as_ref().ok().map(Arc::clone);
+            // The state goes to the actor first: the epoch's first block must
+            // not wait for key sums, which only make its attestations cheaper.
             let _ = actor.send(EpochPrecomputed { key, result });
+            if let Some(state) = advanced {
+                let _timing = stf_metrics::time_key_sums_warm();
+                committee_cache.warm_key_sums(&state, key.epoch);
+            }
         });
     }
 }

@@ -545,6 +545,7 @@ leanMetrics spec.
 |------|------|-------|-------------------------|--------|---------|
 | `lean_beacon_epoch_precompute_lookups_total` | Counter | Epoch-crossing imports, by whether a precomputed boundary state was cached | On each import whose parent is before the block's epoch start and whose block is at or after it | result=hit,miss | |
 | `lean_beacon_epoch_precompute_seconds` | Histogram | Worker time to advance, flush and hash one state | When a precompute worker finishes | | 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 8 |
+| `lean_beacon_committee_key_sums_warm_seconds` | Histogram | Worker time to sum every committee's keys for one epoch, after its precomputed state was handed to the actor | When a warm-up finishes | | 0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8 |
 | `lean_beacon_epoch_precompute_started_total` | Counter | Workers started, by trigger | When a worker is spawned | trigger=head,timer | |
 
 **Read the hit ratio against epochs.** On a synced follower nearly every
