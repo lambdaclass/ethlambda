@@ -595,3 +595,25 @@ pub fn check_transition(
         (false, Err(_)) => Ok(()),
     }
 }
+
+/// Warms `committees`' key sums for the epochs a block applied to `state` can
+/// reach: its previous, current and next epochs, the same three the node pins
+/// for its head. A case that crosses an epoch boundary asks the next epoch's
+/// shuffling after `process_slots`, whose key `state` already names.
+///
+/// The fixture runners run an electra-or-later attestation twice, once with a
+/// fresh cache and once after this, because a fresh cache only ever exercises
+/// the cold branch of the attestation key builder. Both runs must reach the
+/// same verdict and the same post-state.
+pub fn warm_key_sums_around(
+    committees: &ethlambda_state_transition::beacon::helpers::accessors::CommitteeCache,
+    state: &BeaconState,
+) {
+    use ethlambda_state_transition::beacon::helpers::accessors::{
+        CommitteeCacheExt as _, get_current_epoch, get_previous_epoch,
+    };
+    let current = get_current_epoch(state);
+    for epoch in [get_previous_epoch(state), current, current + 1] {
+        committees.warm_key_sums(state, epoch);
+    }
+}

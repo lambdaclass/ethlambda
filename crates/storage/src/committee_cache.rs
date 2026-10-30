@@ -13,6 +13,11 @@
 //! runner, a one-off lookup, a unit test) holds a fresh
 //! [`CommitteeCache::default`] for as long as that work lasts instead.
 //!
+//! Each resident shuffling also carries a second, independently filled slot
+//! for its [`CommitteeKeySums`] (the sum of every committee's public keys),
+//! built off the import path and only ever looked up on it; see
+//! [`CommitteeCache::get_or_init_key_sums`].
+//!
 //! This module knows nothing about a `BeaconState`: it is handed a
 //! [`ShufflingKey`] and, on a miss, runs a builder closure that hands back
 //! the finished [`EpochCommittees`]. The consensus logic that derives both
@@ -25,6 +30,7 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
+use ethlambda_crypto::bls::CommitteeKeySums;
 use ethlambda_types::beacon::committees::EpochCommittees;
 use ethlambda_types::beacon::primitives::{Epoch, Root};
 
@@ -107,16 +113,29 @@ pub enum Lookup {
     Miss,
 }
 
-/// One resident shuffling's slot: empty until some call's builder fills it.
+/// One resident shuffling's slot: its committees and their key sums, each
+/// empty until some call's builder fills it.
 ///
-/// An `Arc` around the `OnceLock` (rather than the `OnceLock` sitting
-/// directly in the entry list) is what lets [`CommitteeCache::evict_one`]
-/// drop the entry list's own reference to a slot while a waiter elsewhere
-/// still holds a clone of the same `Arc`, taken before eviction ran: the
-/// waiter's `get_or_init` call keeps running against a slot that is no
-/// longer reachable from the cache at all, exactly as safely as if it had
-/// never been evicted.
-type Slot = Arc<OnceLock<Arc<EpochCommittees>>>;
+/// The key sums sit beside the committees, rather than in a second cache, so
+/// that eviction and head pinning stay in one place and a shuffling's sums die
+/// with it: nothing can hold sums for a shuffling the cache no longer holds.
+/// The two fill independently. The committees are built on the import path as
+/// soon as any block needs them; the sums are built off it by
+/// [`CommitteeCache::get_or_init_key_sums`] and only ever read on it, since
+/// building them costs a pass over the whole active set.
+#[derive(Debug, Default)]
+struct Resident {
+    committees: OnceLock<Arc<EpochCommittees>>,
+    key_sums: OnceLock<Arc<CommitteeKeySums>>,
+}
+
+/// A [`Resident`] behind an `Arc`, which is what lets
+/// [`CommitteeCache::evict_one`] drop the entry list's own reference to a slot
+/// while a waiter elsewhere still holds a clone of the same `Arc`, taken
+/// before eviction ran: the waiter's `get_or_init` call keeps running against
+/// a slot that is no longer reachable from the cache at all, exactly as safely
+/// as if it had never been evicted.
+type Slot = Arc<Resident>;
 
 /// The state one [`Mutex`] in [`CommitteeCache`] guards: the resident entries
 /// and the current head's pins. One lock over both, rather than two, because
@@ -215,7 +234,7 @@ impl CommitteeCache {
             {
                 Arc::clone(slot)
             } else {
-                let slot: Slot = Arc::new(OnceLock::new());
+                let slot: Slot = Arc::new(Resident::default());
                 if state.entries.len() >= COMMITTEE_CACHE_CAPACITY {
                     state.evict_one();
                 }
@@ -230,12 +249,12 @@ impl CommitteeCache {
         // just inserted, or one a concurrent call inserted a moment ago and
         // has not finished building yet, is a `Miss` regardless of which of
         // the racing calls ends up actually running `build`.
-        let lookup = if slot.get().is_some() {
+        let lookup = if slot.committees.get().is_some() {
             Lookup::Hit
         } else {
             Lookup::Miss
         };
-        let committees = Arc::clone(slot.get_or_init(|| Arc::new(build())));
+        let committees = Arc::clone(slot.committees.get_or_init(|| Arc::new(build())));
         (committees, lookup)
     }
 
@@ -285,7 +304,55 @@ impl CommitteeCache {
         let (_, keys) = state.head.as_ref()?;
         let current = keys[HEAD_CURRENT_EPOCH]?;
         let (_, slot) = state.entries.iter().find(|(key, _)| *key == current)?;
-        slot.get().cloned()
+        slot.committees.get().cloned()
+    }
+
+    /// `key`'s committee key sums, if that shuffling is resident and its sums
+    /// have been built.
+    ///
+    /// Never builds, and never inserts: block import must not pay for a pass
+    /// over the active set that costs more than it saves for committees
+    /// attested once. A cold lookup is an answer, and the caller falls back to
+    /// summing the attesters directly. Named apart from
+    /// `CommitteeCacheExt::key_sums` for the reason [`Self::pin_head`] gives.
+    pub fn resident_key_sums(&self, key: ShufflingKey) -> Option<Arc<CommitteeKeySums>> {
+        let slot = self.resident_slot(key)?;
+        slot.key_sums.get().cloned()
+    }
+
+    /// `key`'s committee key sums, running `build` if they are not there yet
+    /// and sharing the result with every call naming the same `key`.
+    ///
+    /// `None`, without running `build`, when the shuffling is not resident:
+    /// the sums belong to a resident entry and this never creates one, so a
+    /// caller warms the committees first (the entry's own `get_or_init`) and
+    /// the sums second. An entry evicted between the two simply loses the
+    /// warm-up, which costs a later import the direct sum and nothing else.
+    ///
+    /// The same concurrency rule as [`Self::get_or_init`]: the entry-list lock
+    /// is held only to find the slot, never while `build` runs, since `build`
+    /// is a pass over every active validator's key. Concurrent callers race
+    /// [`OnceLock::get_or_init`] on the slot: one runs `build`, the rest wait
+    /// on it. A slot evicted while `build` runs is built into regardless and
+    /// dropped with its last holder.
+    pub fn get_or_init_key_sums(
+        &self,
+        key: ShufflingKey,
+        build: impl FnOnce() -> CommitteeKeySums,
+    ) -> Option<Arc<CommitteeKeySums>> {
+        let slot = self.resident_slot(key)?;
+        Some(Arc::clone(slot.key_sums.get_or_init(|| Arc::new(build()))))
+    }
+
+    /// `key`'s slot, if resident, found under the entry-list lock and handed
+    /// back as an owned `Arc` so the lock is released before it is used.
+    fn resident_slot(&self, key: ShufflingKey) -> Option<Slot> {
+        let state = self.state.lock().unwrap();
+        state
+            .entries
+            .iter()
+            .find(|(entry_key, _)| *entry_key == key)
+            .map(|(_, slot)| Arc::clone(slot))
     }
 }
 
@@ -467,6 +534,59 @@ mod tests {
         for committees in &results[1..] {
             assert!(Arc::ptr_eq(&results[0], committees));
         }
+    }
+
+    /// `resident_key_sums` is a lookup: it never creates an entry and never
+    /// builds sums, however often it is asked.
+    #[test]
+    fn key_sums_lookup_never_builds_or_inserts() {
+        let cache = CommitteeCache::default();
+        let k = key(3, 3);
+        assert!(cache.resident_key_sums(k).is_none(), "not resident");
+        assert!(cache.state.lock().unwrap().entries.is_empty());
+
+        cache.get_or_init(k, || dummy_committees(3));
+        assert!(cache.resident_key_sums(k).is_none(), "resident but cold");
+    }
+
+    /// Sums are built into a resident shuffling only, once, and then served.
+    #[test]
+    fn key_sums_are_built_once_into_a_resident_shuffling() {
+        let cache = CommitteeCache::default();
+        let k = key(3, 3);
+        let refused = cache.get_or_init_key_sums(k, || panic!("no entry to build into"));
+        assert!(refused.is_none());
+        assert!(cache.state.lock().unwrap().entries.is_empty());
+
+        cache.get_or_init(k, || dummy_committees(3));
+        let first = cache
+            .get_or_init_key_sums(k, || CommitteeKeySums::new(vec![None]))
+            .expect("resident");
+        let second = cache
+            .get_or_init_key_sums(k, || panic!("should not rebuild"))
+            .expect("resident");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(Arc::ptr_eq(&first, &cache.resident_key_sums(k).unwrap()));
+    }
+
+    /// The sums leave with their shuffling: once the entry is evicted, a
+    /// lookup finds nothing, and a fresh entry for the key starts cold.
+    #[test]
+    fn key_sums_are_evicted_with_their_shuffling() {
+        let cache = CommitteeCache::default();
+        let oldest = key(0, 0);
+        cache.get_or_init(oldest, || dummy_committees(0));
+        cache.get_or_init_key_sums(oldest, || CommitteeKeySums::new(Vec::new()));
+        assert!(cache.resident_key_sums(oldest).is_some());
+
+        for n in 1..=COMMITTEE_CACHE_CAPACITY {
+            let k = key(n as Epoch, n as u8);
+            cache.get_or_init(k, move || dummy_committees(k.epoch));
+        }
+        assert!(cache.resident_key_sums(oldest).is_none());
+
+        cache.get_or_init(oldest, || dummy_committees(0));
+        assert!(cache.resident_key_sums(oldest).is_none(), "starts cold");
     }
 
     /// Every clone of a `CommitteeCache` shares one underlying cache: a

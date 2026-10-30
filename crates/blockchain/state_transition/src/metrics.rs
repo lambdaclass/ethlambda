@@ -145,6 +145,21 @@ pub fn time_epoch_precompute() -> TimingGuard {
     TimingGuard::new(&LEAN_BEACON_EPOCH_PRECOMPUTE_SECONDS)
 }
 
+static LEAN_BEACON_COMMITTEE_KEY_SUMS_WARM_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
+    register_histogram!(
+        "lean_beacon_committee_key_sums_warm_seconds",
+        "Duration of warming one epoch's committee key sums, off the import path",
+        vec![0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
+    )
+    .unwrap()
+});
+
+/// Start timing one committee key-sum warm-up. Records duration when the
+/// guard is dropped.
+pub fn time_key_sums_warm() -> TimingGuard {
+    TimingGuard::new(&LEAN_BEACON_COMMITTEE_KEY_SUMS_WARM_SECONDS)
+}
+
 static LEAN_BEACON_EPOCH_PRECOMPUTE_STARTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "lean_beacon_epoch_precompute_started_total",
