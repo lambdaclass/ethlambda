@@ -95,7 +95,7 @@ spawned-rt = "0.5.0"
 tokio = "1.0"
 tokio-util = "0.7"
 
-prometheus = "0.14"
+prometheus = { version = "0.14", features = ["process"] }
 
 clap = { version = "4.3", features = ["derive", "env"] }
 
