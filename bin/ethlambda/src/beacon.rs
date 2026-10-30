@@ -120,7 +120,7 @@ pub struct BeaconWireParams {
     pub fork_id: EnrForkId,
 }
 
-/// The discv5 node id for this process's `--node-key` bytes.
+/// The discv5 node id for this process's node key bytes.
 ///
 /// A thin pass-through, kept as its own function so `run_node`'s exact
 /// composition — resolve the key, derive the id, feed it to [`wire_params`] —
@@ -141,15 +141,9 @@ pub fn beacon_node_id(node_key: &[u8]) -> eyre::Result<[u8; 32]> {
 /// custody set off the identity we publish. The anchor state itself belongs to
 /// the anchor-and-follow work, and must be checked against the genesis values
 /// used here when it lands.
-///
-/// `node_key_supplied` carries no key material, only whether `node_id` came
-/// from a persisted `--node-key` or one generated fresh for this run: this
-/// function has no other way to tell the two apart, and that is exactly what
-/// the startup warning below needs to know.
 pub fn wire_params(
     source: &crate::network::NetworkSource,
     node_id: [u8; 32],
-    node_key_supplied: bool,
     custody_group_count: u64,
 ) -> eyre::Result<BeaconWireParams> {
     let chain = source.config().clone();
@@ -206,9 +200,9 @@ pub fn wire_params(
     }
 
     // The node id is the discv5 one, so what this node custodies here is what
-    // any peer computes for it from its ENR. A node without a persistent
-    // --node-key gets a new identity and therefore a new custody set on every
-    // restart, which is why startup warns about it right below.
+    // any peer computes for it from its ENR. It stays the same across restarts
+    // because the node key does: `--node-key`, or the key `resolve_node_key`
+    // stored in the data directory beside the columns it custodies.
     //
     // `sampling_size` is the larger of the advertised count and
     // `SAMPLES_PER_SLOT`, so the default advertisement still custodies
@@ -225,28 +219,9 @@ pub fn wire_params(
         "Custodying data columns"
     );
 
-    // The columns above are stored under this identity and served to peers
-    // who compute the same set from it. An ephemeral identity makes both
-    // sides of that agreement stale on the next restart: the sidecars already
-    // on disk belong to a node id nobody, including this node, will select
-    // again, and the fresh id this run advertises has nothing custodied for
-    // it yet. Placed next to the custody log line above so an operator reads
-    // the two together rather than finding this warning buried in startup
-    // noise.
-    if !node_key_supplied {
-        warn!(
-            "No --node-key supplied: this node's custody columns are a function of its \
-             discv5 node id, so a fresh identity on every restart means the columns already \
-             stored on disk belong to a different custody set than the one this run \
-             advertises and serves. Pass --node-key with a persisted key file to keep one \
-             identity, and therefore one custody set, across restarts."
-        );
-    }
-
-    // The same node id again, and the same consequence of an ephemeral one:
-    // `p2p-interface.md` makes this a public function of the node id so that a
-    // peer can compute what this node should be listening to from its ENR
-    // alone. Computed at the current epoch and then kept for the process's
+    // The same node id again: `p2p-interface.md` makes this a public function
+    // of the node id so that a peer can compute what this node should be
+    // listening to from its ENR alone. Computed at the current epoch and then kept for the process's
     // lifetime; see `subnets`'s module documentation for why this does not
     // rotate.
     let attestation_subnets =
@@ -352,8 +327,8 @@ mod tests {
     #[test]
     fn the_wire_parameters_are_derived_offline() {
         let source = crate::network::NetworkSource::built_in_mainnet().unwrap();
-        let params = wire_params(&source, [0x11; 32], true, CUSTODY_REQUIREMENT)
-            .expect("no network is needed");
+        let params =
+            wire_params(&source, [0x11; 32], CUSTODY_REQUIREMENT).expect("no network is needed");
         assert_eq!(params.wire.genesis_time, MAINNET_GENESIS_TIME);
         // The digest is whatever fork the wall clock lands in, so it is not
         // pinned here; that it agrees with the ENR entry is the invariant.
@@ -374,12 +349,12 @@ mod tests {
 
         let source = crate::network::NetworkSource::built_in_mainnet().unwrap();
 
-        let a = wire_params(&source, [0x11; 32], true, CUSTODY_REQUIREMENT)
-            .expect("no network is needed");
+        let a =
+            wire_params(&source, [0x11; 32], CUSTODY_REQUIREMENT).expect("no network is needed");
         assert_eq!(a.wire.custody_columns.len(), sampling as usize);
 
-        let b = wire_params(&source, [0x22; 32], true, CUSTODY_REQUIREMENT)
-            .expect("no network is needed");
+        let b =
+            wire_params(&source, [0x22; 32], CUSTODY_REQUIREMENT).expect("no network is needed");
         assert_ne!(a.wire.custody_columns, b.wire.custody_columns);
     }
 
@@ -391,7 +366,7 @@ mod tests {
         let node_id = beacon_node_id(&[0x33; 32]).expect("a well-formed key");
         let source = crate::network::NetworkSource::built_in_mainnet().unwrap();
         let params =
-            wire_params(&source, node_id, true, CUSTODY_REQUIREMENT).expect("no network is needed");
+            wire_params(&source, node_id, CUSTODY_REQUIREMENT).expect("no network is needed");
         let sampling = ethlambda_state_transition::beacon::das::sampling_size(
             ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT,
         );
