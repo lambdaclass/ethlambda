@@ -348,6 +348,33 @@ mod tests {
     }
 
     #[test]
+    fn data_is_available_only_from_sidecars_of_the_block_itself() {
+        use crate::beacon::fork_choice::{DataAvailability, is_data_available_columns};
+
+        let config = Config::mainnet();
+        let (block, proofs) = block_with(&[blob(1)]);
+        let sidecars = verified_sidecars(&block, &[blob(1)], &proofs).unwrap();
+        let (other_block, other_proofs) = block_with(&[blob(2)]);
+        let other_sidecars = verified_sidecars(&other_block, &[blob(2)], &other_proofs).unwrap();
+        let root = block.message.hash_tree_root();
+        let available = |sidecar: &DataColumnSidecar| {
+            let evidence = DataAvailability::Columns(vec![sidecar.clone()]);
+            is_data_available_columns(root, &evidence, &config).unwrap()
+        };
+
+        assert!(available(&sidecars[0]));
+        // A well-formed sidecar of another block: its header does not hash to the root.
+        assert!(!available(&other_sidecars[0]));
+        // Column, commitments and proofs agree with each other, but the block never committed to them.
+        let mut swapped = sidecars[0].clone();
+        swapped.column = other_sidecars[0].column.clone();
+        swapped.kzg_commitments = other_sidecars[0].kzg_commitments.clone();
+        swapped.kzg_proofs = other_sidecars[0].kzg_proofs.clone();
+        assert!(verify_data_column_sidecar_kzg_proofs(&swapped).unwrap());
+        assert!(!available(&swapped));
+    }
+
+    #[test]
     fn mismatched_lengths_are_refused_before_any_kzg_work() {
         let blobs = [blob(1)];
         let (block, proofs) = block_with(&blobs);

@@ -4396,7 +4396,15 @@ pub fn verify_data_column_sidecar_inclusion_proof(sidecar: &fulu::DataColumnSide
 /// required columns have been sampled" must reject the block itself rather
 /// than relying on this to do it, since nothing about an empty list is
 /// distinguishable here from "this block needed no sampling at all".
-pub fn is_data_available_columns(evidence: &DataAvailability, config: &Config) -> Result<bool> {
+///
+/// Each sidecar must also belong to the block.
+/// Its header must hash to the block root, and its inclusion proof must tie its commitments to that header.
+/// Without these, sidecars built from unrelated blobs under another header would pass (consensus-specs #5765).
+pub fn is_data_available_columns(
+    beacon_block_root: Root,
+    evidence: &DataAvailability,
+    config: &Config,
+) -> Result<bool> {
     let sidecars = match evidence {
         DataAvailability::Columns(sidecars) => sidecars,
         DataAvailability::NotRequired => return Ok(true),
@@ -4407,7 +4415,9 @@ pub fn is_data_available_columns(evidence: &DataAvailability, config: &Config) -
         }
     };
     for sidecar in sidecars {
-        if !(verify_data_column_sidecar(sidecar, config)
+        if !(sidecar.signed_block_header.message.hash_tree_root() == beacon_block_root
+            && verify_data_column_sidecar(sidecar, config)
+            && verify_data_column_sidecar_inclusion_proof(sidecar)
             && verify_data_column_sidecar_kzg_proofs(sidecar)?)
         {
             return Ok(false);
@@ -5091,7 +5101,7 @@ pub fn on_block(
         }
         SignedBeaconBlock::Fulu(_) => {
             verify(
-                is_data_available_columns(blob_evidence, config)?,
+                is_data_available_columns(block_root, blob_evidence, config)?,
                 "is_data_available(hash_tree_root(block))",
             )?;
             None
@@ -9596,6 +9606,7 @@ pub(crate) mod tests {
         let config = Config::active();
         assert!(
             is_data_available_columns(
+                Root::ZERO,
                 &DataAvailability::Blobs {
                     blobs: Vec::new(),
                     proofs: Vec::new(),
