@@ -125,7 +125,18 @@ from the Beacon API, and no other way.
   the bid's.
 - **Why:** gossip and API bids need only a pool and the gossip rules. A builder
   API client is a separate crate with its own failure modes and timeouts, and
-  is left for a later phase.
+  is left for a later phase for gloas. Fulu's builder API (MEV-Boost) is now
+  served (`produceBlockV3` and `blinded_blocks`); gloas's is not.
+
+## Builder bids: the fee recipient is not checked
+
+- **The specification:** builder-specs' `process_bid` asserts
+  `header.fee_recipient == fee_recipient`.
+- **ethlambda:** a mismatch is logged at `debug` only.
+- **Why:** relays pay the proposer with a transaction in the payload and name
+  the builder's address as the coinbase, so the assertion would refuse nearly
+  every real bid. Every client reviewed (Lighthouse, Teku, Prysm, Nimbus,
+  Lodestar, Grandine) skips it.
 
 ## Fee recipient and gas target come from proposer preferences, with fallbacks
 

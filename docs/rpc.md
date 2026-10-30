@@ -265,10 +265,11 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `GET` | `/eth/v1/validator/sync_committee_contribution` | JSON | The pooled messages for `(slot, subcommittee_index, beacon_block_root)`, aggregated |
 | `POST` | `/eth/v1/validator/contribution_and_proofs` | *(status only)* | Validate, pool and gossip `SignedContributionAndProof`s |
 | `POST` | `/eth/v1/validator/sync_committee_subscriptions` | *(status only)* | Join sync committee subnets until an epoch |
-| `GET` | `/eth/v3/validator/blocks/{slot}` | SSZ or JSON | An unsigned fulu block built on the head (`produceBlockV3`) |
+| `GET` | `/eth/v3/validator/blocks/{slot}` | SSZ or JSON | An unsigned fulu block built on the head, or, with `--builder`, the blinded block around a winning bid (`produceBlockV3`) |
 | `POST` | `/eth/v4/validator/blocks/{slot}` | SSZ or JSON | An unsigned gloas block: self-built, with its envelope and blobs when asked, or on a pooled builder bid (`produceBlockV4`) |
 | `GET` | `/eth/v1/validator/execution_payload_envelopes/{slot}/{beacon_block_root}` | SSZ or JSON | The unsigned envelope `produceBlockV4` built (gloas) |
 | `POST` | `/eth/v2/beacon/blocks` | *(status only)* | Gossip and import a signed fulu or gloas block (`publishBlockV2`; JSON or SSZ body) |
+| `POST` | `/eth/v2/beacon/blinded_blocks` | *(status only)* | Hand a signed fulu blinded block to the builder to reveal (`publishBlindedBlockV2`; JSON or SSZ body) |
 | `POST` | `/eth/v1/beacon/execution_payload_envelopes` | *(status only)* | Gossip a signed envelope and its data columns (gloas; JSON or SSZ body) |
 | `POST` | `/eth/v1/beacon/execution_payload_bids` | *(status only)* | Validate, pool and gossip a builder's `SignedExecutionPayloadBid` (gloas; JSON or SSZ body) |
 | `POST` | `/eth/v1/validator/proposer_preferences` | *(status only)* | Validate, cache and gossip `SignedProposerPreferences` (gloas; JSON or SSZ body) |
@@ -437,12 +438,35 @@ the chain actor writes, so no request waits on the actor.
   nothing verifiable is pooled). The payload bundle's KZG commitments go in the body. The state
   root comes from running the block through `process_block`. The answer is
   fulu `BlockContents`: the block, the bundle's cell proofs and its blobs, with
-  `Eth-Execution-Payload-Blinded: false`; there is no builder flow. It is a
+  `Eth-Execution-Payload-Blinded: false`. It is a
   **`503`** without a configured execution client, or when the bundle is
   malformed (its commitments, proofs and blobs disagree in count). A slot the
   schedule does not place at fulu (gloas included) is a `400`, checked before
   the execution client; `produceBlockV3` is the fulu endpoint, and a gloas slot
   goes to `produceBlockV4`.
+
+  **The builder path** is taken only when `--builder` is set, the proposer
+  registered through this node (`register_validator`, remembered for two
+  epochs after it was last sent), and the circuit breaker is quiet: it keeps
+  the builder out while the node is syncing, the head is optimistic, finality
+  is too far behind, or too many slots were skipped (the `--builder-fallback-*`
+  flags set the thresholds). The builder's `getHeader` is then asked
+  concurrently with the local build, bounded by its own timeout, and an error
+  or a timeout means no bid. A bid is checked before it competes: a non-zero
+  value, the head's execution block as its parent, the proposal's `prev_randao`
+  and timestamp, the parent's block number plus one, the withdrawals root,
+  the blob commitment and blob gas bounds, a gas limit within one step of the parent's toward the registered target,
+  and the builder's signature. Its fee recipient is not checked (see
+  `spec_deviations.md`). A bid that passes goes through `assemble_blinded_block`
+  with the packed attestations, operations and sync aggregate, so the blinded
+  block's state root comes from running the block through `process_block`.
+  `builder_boost_factor` (percent, default 100) then weighs the two: the local
+  payload wins iff its value is at least `factor * bid / 100`, so a tie and a
+  factor of 0 keep it and `u64::MAX` takes the bid; the execution client's
+  `shouldOverrideBuilder` keeps the local payload whatever the bid pays. If one
+  side fails the other is served. A blinded answer is the blinded block as SSZ
+  or JSON, with `Eth-Execution-Payload-Blinded: true` and
+  `Eth-Execution-Payload-Value` set to the bid's value in wei.
 - **Graffiti** is the validator client's, with both clients' codes and
   commits appended as far as they fit: `hello RH1a2bLA3c4d` for reth at
   `1a2b…` under ethlambda at `3c4d…`. The execution client's half comes from
@@ -474,7 +498,27 @@ the chain actor writes, so no request waits on the actor.
   slot must be scheduled at gloas, the parent must be held, the slot must be
   after the parent's, and the proposer and signature are checked against the
   parent's state advanced to the slot (all `400` otherwise), before the block is
-  gossiped and handed to the chain actor.
+  gossiped and handed to the chain actor. This node publishes one block per
+  slot: a second block for a slot whose root differs from the first, through
+  this endpoint or `blinded_blocks`, is a `400`, since a validator that signed
+  two would be slashed. The same block again is a retry and passes. A slot
+  below the finalized one is refused too, since claims there are forgotten.
+- **`POST beacon/blinded_blocks`** takes a fulu `SignedBlindedBeaconBlock` as
+  JSON or SSZ, by `Content-Type` as above, with `Eth-Consensus-Version: fulu`.
+  It is checked as a fulu `beacon/blocks` is, before anything leaves this node:
+  the slot is scheduled at fulu, the parent is held and before the block, the
+  proposer is the one the parent's state names for the slot, and the proposer's
+  signature verifies (a blinded block has its full block's root, so the check
+  is the same). Then the slot is claimed, shared with `beacon/blocks`, and the
+  block goes to the builder (`submitBlindedBlockV2`) on its own task, so a
+  validator client that hangs up cannot cancel the reveal. The builder
+  publishes the full block and its data columns; it returns over gossip and
+  imports like any block, and nothing is gossiped here. The body limit is
+  the one `beacon/blocks` has (`413` over it). The builder's answer is logged
+  from the submission task, an error when it did not take a signed block.
+  The status is the builder's: 202 becomes `200`, a builder `400` stays `400`, and anything else
+  is a `500`. There is no local fallback, since a second block would be an
+  equivocation. With no `--builder` the answer is `500`.
 - **The operation pool** holds, beside the attestation pool and in memory in
   the same `Store` (`Store::operation_pool`): proposer slashings (one per
   proposer), attester slashings (one per `hash_tree_root`), voluntary exits and

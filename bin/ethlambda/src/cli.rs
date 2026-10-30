@@ -325,6 +325,21 @@ pub(crate) struct MainnetOptions {
         value_parser = clap::value_parser!(u64).range(1..),
     )]
     pub(crate) builder_header_timeout: u64,
+
+    /// Build locally, skipping the builder, after more than this many
+    /// consecutive empty slots right before the proposal (the circuit breaker).
+    #[arg(long, default_value_t = ethlambda_rpc::FallbackThresholds::DEFAULT.skips, requires = "builder")]
+    pub(crate) builder_fallback_skips: u64,
+
+    /// Build locally after more than this many empty slots in the epoch's
+    /// worth of slots before the proposal.
+    #[arg(long, default_value_t = ethlambda_rpc::FallbackThresholds::DEFAULT.skips_per_epoch, requires = "builder")]
+    pub(crate) builder_fallback_skips_per_epoch: u64,
+
+    /// Build locally when the proposal is more than this many epochs past the
+    /// finalized checkpoint.
+    #[arg(long, default_value_t = ethlambda_rpc::FallbackThresholds::DEFAULT.epochs_since_finalization, requires = "builder")]
+    pub(crate) builder_fallback_epochs_since_finalization: u64,
 }
 
 /// Flags only the lean chain takes.
@@ -1064,6 +1079,58 @@ mod tests {
                 assert_eq!(mainnet.builder_header_timeout, 750);
             }
             other => panic!("expected the mainnet network, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_fallback_flags_parse_and_default_to_lighthouses() {
+        let beacon = parse_beacon(beacon_args());
+        assert_eq!(beacon.mainnet.builder_fallback_skips, 3);
+        assert_eq!(beacon.mainnet.builder_fallback_skips_per_epoch, 8);
+        assert_eq!(beacon.mainnet.builder_fallback_epochs_since_finalization, 3);
+
+        let mut args = beacon_args();
+        args.extend([
+            "--builder",
+            "http://127.0.0.1:18550",
+            "--builder-fallback-skips",
+            "5",
+            "--builder-fallback-skips-per-epoch",
+            "12",
+            "--builder-fallback-epochs-since-finalization",
+            "2",
+        ]);
+        let beacon = parse_beacon(args);
+        assert_eq!(beacon.mainnet.builder_fallback_skips, 5);
+        assert_eq!(beacon.mainnet.builder_fallback_skips_per_epoch, 12);
+        assert_eq!(beacon.mainnet.builder_fallback_epochs_since_finalization, 2);
+    }
+
+    #[test]
+    fn each_fallback_flag_needs_a_builder() {
+        for flag in [
+            "--builder-fallback-skips",
+            "--builder-fallback-skips-per-epoch",
+            "--builder-fallback-epochs-since-finalization",
+        ] {
+            let mut args = beacon_args();
+            args.extend([flag, "5"]);
+            try_parse_from(args).expect_err(flag);
+        }
+    }
+
+    #[test]
+    fn a_bad_fallback_value_is_refused() {
+        for flag in [
+            "--builder-fallback-skips",
+            "--builder-fallback-skips-per-epoch",
+            "--builder-fallback-epochs-since-finalization",
+        ] {
+            for value in ["-1", "many"] {
+                let mut args = beacon_args();
+                args.extend(["--builder", "http://127.0.0.1:18550", flag, value]);
+                try_parse_from(args).expect_err(flag);
+            }
         }
     }
 

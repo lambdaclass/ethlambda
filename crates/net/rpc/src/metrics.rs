@@ -84,3 +84,51 @@ pub(crate) fn inc_builder_registrations(outcome: &str, count: u64) {
         .with_label_values(&[outcome])
         .inc_by(count);
 }
+
+/// Count builder bids refused before selection, by reason.
+pub(crate) fn inc_bid_rejection(reason: &str) {
+    static LEAN_BEACON_BUILDER_BID_REJECTIONS_TOTAL: LazyLock<IntCounterVec> =
+        LazyLock::new(|| {
+            register_int_counter_vec!(
+                "lean_beacon_builder_bid_rejections_total",
+                "Builder bids refused before selection, by reason",
+                &["reason"]
+            )
+            .unwrap()
+        });
+    LEAN_BEACON_BUILDER_BID_REJECTIONS_TOTAL
+        .with_label_values(&[reason])
+        .inc();
+}
+
+/// Count blocks produced with a builder configured, by where the payload
+/// came from.
+pub(crate) fn inc_payload_source(source: &str) {
+    static LEAN_BEACON_BUILDER_PAYLOAD_SOURCE_TOTAL: LazyLock<IntCounterVec> =
+        LazyLock::new(|| {
+            register_int_counter_vec!(
+                "lean_beacon_builder_payload_source_total",
+                "Blocks produced with a builder configured, by where the payload came from",
+                &["source"]
+            )
+            .unwrap()
+        });
+    LEAN_BEACON_BUILDER_PAYLOAD_SOURCE_TOTAL
+        .with_label_values(&[source])
+        .inc();
+}
+
+/// Count proposals the circuit breaker kept from the builder, by reason.
+pub(crate) fn inc_builder_fallback(reason: &str) {
+    static LEAN_BEACON_BUILDER_FALLBACK_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+        register_int_counter_vec!(
+            "lean_beacon_builder_fallback_total",
+            "Proposals the circuit breaker kept from the builder, by reason",
+            &["reason"]
+        )
+        .unwrap()
+    });
+    LEAN_BEACON_BUILDER_FALLBACK_TOTAL
+        .with_label_values(&[reason])
+        .inc();
+}
