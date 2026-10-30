@@ -243,10 +243,13 @@ fn validate(
     // [REJECT] The signature is valid, under the attester domain at the target
     // epoch. The schedule's domain, not the head state's: the head may still be
     // the previous fork's while the target epoch's first slots are empty.
-    let pubkey = state
-        .validator(attestation.attester_index)
-        .map_err(|_| "attester index is unknown")?
-        .pubkey;
+    let pubkey = bls::IndexedPubkey {
+        index: attestation.attester_index,
+        pubkey: state
+            .validator(attestation.attester_index)
+            .map_err(|_| "attester index is unknown")?
+            .pubkey,
+    };
     let domain =
         get_domain_from_schedule(&config, state, DOMAIN_BEACON_ATTESTER, data.target.epoch);
     let signing_root = compute_signing_root(data.hash_tree_root(), domain);

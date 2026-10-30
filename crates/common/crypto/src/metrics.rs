@@ -21,10 +21,26 @@ static LEAN_BEACON_PUBKEY_CACHE_HITS: LazyLock<IntCounter> =
 static LEAN_BEACON_PUBKEY_CACHE_MISSES: LazyLock<IntCounter> =
     LazyLock::new(|| LEAN_BEACON_PUBKEY_CACHE_LOOKUPS_TOTAL.with_label_values(&["miss"]));
 
-static LEAN_BEACON_PUBKEY_CACHE_ENTRIES: LazyLock<IntGauge> = LazyLock::new(|| {
-    register_int_gauge!(
+static LEAN_BEACON_PUBKEY_CACHE_ENTRIES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
         "lean_beacon_pubkey_cache_entries",
-        "Validated BLS public keys held by the process-wide pubkey cache"
+        "Validated BLS public keys held by the process-wide pubkey cache, by the structure \
+         holding them (a key reached both by index and by bytes is held in both)",
+        &["structure"]
+    )
+    .unwrap()
+});
+
+static LEAN_BEACON_PUBKEY_CACHE_MAP_ENTRIES: LazyLock<IntGauge> =
+    LazyLock::new(|| LEAN_BEACON_PUBKEY_CACHE_ENTRIES.with_label_values(&["map"]));
+static LEAN_BEACON_PUBKEY_CACHE_TABLE_ENTRIES: LazyLock<IntGauge> =
+    LazyLock::new(|| LEAN_BEACON_PUBKEY_CACHE_ENTRIES.with_label_values(&["table"]));
+
+static LEAN_BEACON_PUBKEY_CACHE_INDEX_CHUNKS: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "lean_beacon_pubkey_cache_index_chunks",
+        "Chunks of the pubkey cache's index table allocated so far; the table's memory follows \
+         this, not its entry count"
     )
     .unwrap()
 });
@@ -40,7 +56,19 @@ pub(crate) fn inc_pubkey_cache_lookups(hits: u64, misses: u64) {
     }
 }
 
-/// Count one key added to the pubkey cache. The cache never removes one.
-pub(crate) fn inc_pubkey_cache_entries() {
-    LEAN_BEACON_PUBKEY_CACHE_ENTRIES.inc();
+/// Count one key added to the pubkey cache's byte-keyed map. The cache never
+/// removes one.
+pub(crate) fn inc_pubkey_cache_map_entries() {
+    LEAN_BEACON_PUBKEY_CACHE_MAP_ENTRIES.inc();
+}
+
+/// Count one key added to the pubkey cache's index table. The cache never
+/// removes one.
+pub(crate) fn inc_pubkey_cache_table_entries() {
+    LEAN_BEACON_PUBKEY_CACHE_TABLE_ENTRIES.inc();
+}
+
+/// Count one chunk of the index table allocated. Chunks are never freed.
+pub(crate) fn inc_pubkey_cache_index_chunks() {
+    LEAN_BEACON_PUBKEY_CACHE_INDEX_CHUNKS.inc();
 }

@@ -557,21 +557,25 @@ A `timer` start with no matching `head` start means the last slot was skipped.
 
 Every BLS signature check `ethlambda beacon` runs (block import, fork choice,
 gossip validation) resolves its signers' compressed public keys to validated
-curve points through one process-wide cache, keyed by the compressed bytes. See
-`PubkeyCache` in `crates/blockchain/state_transition/src/beacon/bls.rs`. This is
+curve points through one process-wide cache: an index table for keys read from
+the registry by validator index, and a map keyed by the compressed bytes for
+every other key. See `PubkeyCache` in `crates/common/crypto/src/bls.rs`. This is
 ethlambda-specific, not part of the leanMetrics spec.
 
 | Name | Type | Usage | Sample collection event | Labels |
 |------|------|-------|-------------------------|--------|
 | `lean_beacon_pubkey_cache_lookups_total` | Counter | Public keys resolved for a signature check, by whether the cache already held them | Once per signature check, counting every signer | result=hit,miss |
-| `lean_beacon_pubkey_cache_entries` | Gauge | Validated public keys the cache holds | On each key added; the cache never removes one | |
+| `lean_beacon_pubkey_cache_entries` | Gauge | Validated public keys the cache holds, by structure: `table` for keys looked up by validator index, `map` for keys looked up by bytes. A key reached both ways is counted in both | On each key added; the cache never removes one | structure=map,table |
+| `lean_beacon_pubkey_cache_index_chunks` | Gauge | Chunks of the index table allocated. The table's memory follows this rather than its entry count, since a chunk is allocated in full on its first key | On each chunk allocated; chunks are never freed | |
 
 **Misses should fall to near zero within an epoch of a start**, once every
 active validator has signed something the node checked. A steady miss rate
 after that means keys the cache is refusing to hold: either the entry bound is
 reached (the gauge stops rising), or the keys are invalid, which are never
-cached and pay the full check every time. `entries` is also the cache's memory
-footprint, roughly a decompressed point plus its compressed key per entry.
+cached and pay the full check every time. `entries{structure="map"}` is the
+map's memory footprint, roughly a decompressed point plus its compressed key per
+entry. The table's is `index_chunks` times a chunk's size, since a chunk is
+allocated whole and a registry's exited validators leave slots in it empty.
 
 ### Data Column Sidecars (Fulu DAS)
 
