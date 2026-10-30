@@ -245,7 +245,11 @@ pub fn check_message(
         message.slot,
         message.beacon_block_root,
     );
-    if !bls::verify(&validator.pubkey, signing_root, &message.signature) {
+    let validator = bls::IndexedPubkey {
+        index: message.validator_index,
+        pubkey: validator.pubkey,
+    };
+    if !bls::verify(&validator, signing_root, &message.signature) {
         return Err(Outcome::Reject(RejectReason::BadSignature));
     }
     Ok(seats)
@@ -353,12 +357,16 @@ pub fn check_contribution(
         contribution.slot,
         contribution.subcommittee_index,
     );
-    if !bls::verify(&aggregator.pubkey, selection_root, &message.selection_proof) {
+    let aggregator_pubkey = bls::IndexedPubkey {
+        index: message.aggregator_index,
+        pubkey: aggregator.pubkey,
+    };
+    if !bls::verify(&aggregator_pubkey, selection_root, &message.selection_proof) {
         return Outcome::Reject(RejectReason::SelectionProof);
     }
     // [REJECT] The aggregator's signature over the envelope is valid.
     let envelope_root = contribution_and_proof_signing_root(config, gvr, message);
-    if !bls::verify(&aggregator.pubkey, envelope_root, &signed.signature) {
+    if !bls::verify(&aggregator_pubkey, envelope_root, &signed.signature) {
         return Outcome::Reject(RejectReason::AggregatorSignature);
     }
     // [REJECT] The aggregate signature is valid over the participants.

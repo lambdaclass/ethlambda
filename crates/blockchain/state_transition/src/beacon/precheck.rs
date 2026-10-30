@@ -111,7 +111,10 @@ pub fn precheck_block(
     };
 
     let pubkey = match (state.validator(proposer), reference) {
-        (Ok(validator), _) => &validator.pubkey,
+        (Ok(validator), _) => bls::IndexedPubkey {
+            index: proposer,
+            pubkey: validator.pubkey,
+        },
         (Err(_), Reference::Parent(_)) => {
             return Err(PrecheckError::UnknownProposer { proposer });
         }
@@ -125,7 +128,7 @@ pub fn precheck_block(
         state.genesis_validators_root(),
     );
     let signing_root = compute_signing_root(block_root, domain);
-    if !bls::verify(pubkey, signing_root, &signed_block.signature()) {
+    if !bls::verify(&pubkey, signing_root, &signed_block.signature()) {
         return Err(PrecheckError::BadSignature);
     }
     Ok(())

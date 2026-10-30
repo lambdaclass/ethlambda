@@ -60,8 +60,18 @@
 //! A key first validated through the byte path and later looked up by index is
 //! copied into its slot, and stays in the map as well: byte-path callers cannot
 //! see the table, so dropping the map entry would make them validate it again.
-//! A key reached through both paths is therefore held twice (about 300 bytes
-//! rather than 150), which is the price of both kinds of caller hitting.
+//! A key reached through both paths is therefore held twice. That is why every
+//! caller that read a key from the registry by index passes the index, gossip
+//! validation included: the byte path is left to keys with no registry index
+//! (deposits, BLS-to-execution changes, builders) and to the sync committee's
+//! own key list, so the keys held twice stay few.
+//!
+//! The table's memory follows the span of indices it serves, not the number of
+//! keys in it: a chunk is allocated whole on its first key, and a registry's
+//! exited validators are spread through every chunk, so the table costs one
+//! slot per registry index, filled or not. A slot is smaller than a map entry,
+//! so on a registry where about half the validators have exited the table costs
+//! somewhat more than a map of the active keys alone would.
 //! A key that fails is never cached in either structure, so an invalid key
 //! costs a full check every time, exactly as before, and cannot grow either.
 //!
@@ -162,8 +172,9 @@ const KEY_VALIDATE_MIN_PAR_LEN: usize = 16;
 /// those reads on the same cache line; a shard per lock spreads them out.
 const PUBKEY_CACHE_SHARDS: usize = 64;
 
-/// The most validated public keys [`VALIDATED_PUBKEYS`] holds, across all of
-/// its shards.
+/// The most validated public keys each of [`VALIDATED_PUBKEYS`]'s two
+/// structures holds: the map across all of its shards, and the index table,
+/// whose bound on indices it serves is this same number.
 ///
 /// Far above any real validator registry: the bound is not there to evict
 /// anything a registry needs, but so that inputs which are not a registry
@@ -269,8 +280,9 @@ pub struct IndexedPubkey {
 ///
 /// The index table holds a key resolved through an [`IndexedPubkey`] and the
 /// map holds every other. A key reached through both paths is held in both,
-/// since byte-path callers cannot see the table; every other key lives in one
-/// structure, so the memory per key is that of the map's entry or less.
+/// since byte-path callers cannot see the table, which is why registry callers
+/// pass the index. The table's memory is its allocated chunks', not its
+/// entries'; see the module documentation.
 struct PubkeyCache {
     shards: [RwLock<HashMap<BlsPubkey, PublicKey>>; PUBKEY_CACHE_SHARDS],
     /// The most entries one shard takes, so the whole cache stays within the
@@ -303,19 +315,34 @@ impl PubkeyCache {
         &self.shards[byte % PUBKEY_CACHE_SHARDS]
     }
 
-    /// The table slot for `index`, if the index is inside the bound and its
-    /// chunk exists (`allocate` creates it).
-    fn slot(&self, index: ValidatorIndex, allocate: bool) -> Option<&OnceLock<IndexedEntry>> {
+    /// The chunk cell covering `index` and the slot's offset in it, if the
+    /// index is inside the bound.
+    fn chunk_cell(&self, index: ValidatorIndex) -> Option<(&OnceLock<IndexChunk>, usize)> {
         let index = usize::try_from(index)
             .ok()
             .filter(|&i| i < self.index_bound)?;
-        let cell = &self.chunks[index / INDEX_CHUNK_LEN];
-        let chunk = if allocate {
-            cell.get_or_init(|| (0..INDEX_CHUNK_LEN).map(|_| OnceLock::new()).collect())
-        } else {
-            cell.get()?
-        };
-        Some(&chunk[index % INDEX_CHUNK_LEN])
+        Some((
+            &self.chunks[index / INDEX_CHUNK_LEN],
+            index % INDEX_CHUNK_LEN,
+        ))
+    }
+
+    /// The table slot for `index`, if the index is inside the bound and its
+    /// chunk exists. A lookup never allocates.
+    fn slot(&self, index: ValidatorIndex) -> Option<&OnceLock<IndexedEntry>> {
+        let (cell, offset) = self.chunk_cell(index)?;
+        Some(&cell.get()?[offset])
+    }
+
+    /// The table slot for `index`, allocating its chunk if this is the
+    /// chunk's first key, if the index is inside the bound.
+    fn slot_or_allocate(&self, index: ValidatorIndex) -> Option<&OnceLock<IndexedEntry>> {
+        let (cell, offset) = self.chunk_cell(index)?;
+        let chunk = cell.get_or_init(|| {
+            crate::metrics::inc_pubkey_cache_index_chunks();
+            (0..INDEX_CHUNK_LEN).map(|_| OnceLock::new()).collect()
+        });
+        Some(&chunk[offset])
     }
 
     fn get_by_bytes(&self, pubkey: &BlsPubkey) -> Option<PublicKey> {
@@ -330,7 +357,7 @@ impl PubkeyCache {
     fn get<K: PubkeySource>(&self, key: &K) -> Option<PublicKey> {
         let pubkey = key.pubkey();
         if let Some(index) = key.index()
-            && let Some((bytes, point)) = self.slot(index, false).and_then(OnceLock::get)
+            && let Some((bytes, point)) = self.slot(index).and_then(OnceLock::get)
             && bytes == pubkey
         {
             return Some(*point);
@@ -342,10 +369,10 @@ impl PubkeyCache {
         // the table and would have to validate again. Set-once, first writer
         // wins; a slot holding other bytes is left alone.
         if let Some(index) = key.index()
-            && let Some(slot) = self.slot(index, true)
+            && let Some(slot) = self.slot_or_allocate(index)
             && slot.set((*pubkey, point)).is_ok()
         {
-            crate::metrics::inc_pubkey_cache_entries();
+            crate::metrics::inc_pubkey_cache_table_entries();
         }
         Some(point)
     }
@@ -356,11 +383,11 @@ impl PubkeyCache {
     fn insert<K: PubkeySource>(&self, key: &K, point: PublicKey) {
         let pubkey = *key.pubkey();
         if let Some(index) = key.index()
-            && let Some(slot) = self.slot(index, true)
+            && let Some(slot) = self.slot_or_allocate(index)
         {
             match slot.set((pubkey, point)) {
                 Ok(()) => {
-                    crate::metrics::inc_pubkey_cache_entries();
+                    crate::metrics::inc_pubkey_cache_table_entries();
                     return;
                 }
                 // First writer wins; a racing writer of the same bytes is done.
@@ -371,7 +398,7 @@ impl PubkeyCache {
         }
         let mut shard = self.shard(&pubkey).write().unwrap();
         if shard.len() < self.shard_capacity && shard.insert(pubkey, point).is_none() {
-            crate::metrics::inc_pubkey_cache_entries();
+            crate::metrics::inc_pubkey_cache_map_entries();
         }
     }
 
@@ -958,7 +985,7 @@ mod tests {
     /// The table slot for `index` in `cache`, if it holds anything.
     fn held_at(cache: &PubkeyCache, index: ValidatorIndex) -> Option<BlsPubkey> {
         cache
-            .slot(index, false)
+            .slot(index)
             .and_then(OnceLock::get)
             .map(|(bytes, _)| *bytes)
     }
@@ -1033,6 +1060,20 @@ mod tests {
     }
 
     #[test]
+    fn a_cold_lookup_allocates_nothing() {
+        let cache = PubkeyCache::new(2 * INDEX_CHUNK_LEN);
+        let key = indexed(INDEX_CHUNK_LEN as u64 + 5, 9401);
+        assert!(cache.get(&key).is_none());
+        assert!(cache.chunks.iter().all(|chunk| chunk.get().is_none()));
+
+        // Only a key that validated allocates its chunk, and only that one.
+        let point = PublicKey::key_validate(key.pubkey.as_ref()).unwrap();
+        cache.insert(&key, point);
+        assert!(cache.chunks[0].get().is_none());
+        assert!(cache.chunks[1].get().is_some());
+    }
+
+    #[test]
     fn a_byte_path_key_is_copied_into_the_table_on_its_first_index_lookup() {
         let cache = PubkeyCache::new(INDEX_CHUNK_LEN);
         let key = indexed(17, 9301);
@@ -1061,7 +1102,7 @@ mod tests {
     fn an_index_past_the_bound_uses_the_map() {
         for index in [MAX_CACHED_PUBKEYS as u64, u64::MAX] {
             let key = indexed(index, 9100);
-            assert!(VALIDATED_PUBKEYS.slot(index, true).is_none());
+            assert!(VALIDATED_PUBKEYS.slot_or_allocate(index).is_none());
             for _ in 0..2 {
                 assert_eq!(
                     validated_pubkey(&key).map(|point| point.to_bytes()),

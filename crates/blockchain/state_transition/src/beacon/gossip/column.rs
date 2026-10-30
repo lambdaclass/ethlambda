@@ -585,8 +585,12 @@ fn header_signature_is_valid(
         state.genesis_validators_root(),
     );
     let signing_root = compute_signing_root(header.hash_tree_root(), domain);
+    let proposer = bls::IndexedPubkey {
+        index: header.proposer_index,
+        pubkey: proposer.pubkey,
+    };
     if !bls::verify(
-        &proposer.pubkey,
+        &proposer,
         signing_root,
         &sidecar.signed_block_header.signature,
     ) {
