@@ -49,11 +49,14 @@
 //!
 //! # Why `Store::block_index` never needs to be a `BTreeMap`
 //!
-//! The one place this file iterates every block the store holds is
-//! `filter_block_tree`'s scan of [`Store::block_index`](ethlambda_storage::Store::block_index)
-//! for a block's children, and [`get_head`]'s equivalent scan of the tree
-//! `filter_block_tree` already filtered down. Both immediately reduce that
-//! scan to a single winner via an explicit, fully-ordered sort key
+//! The places this file iterates every block the store holds are the one-pass
+//! parent-to-children map builds over
+//! [`Store::block_index`](ethlambda_storage::Store::block_index)
+//! (`get_filtered_block_tree`, `walk_head`, `invalidate_subtree`), and
+//! [`compute_head`]'s scan of the tree `filter_block_tree` already filtered
+//! down. A child map's `Vec`s hold the children in whatever order the map
+//! yielded them, and every reader either visits all of them or reduces them
+//! to a single winner via an explicit, fully-ordered sort key
 //! (`(weight, root)`, with `root` breaking ties the same way Python compares
 //! two `bytes` values, since [`Root`]'s `Ord` compares its bytes in the same
 //! order). Two distinct blocks never share a root, so that key never actually
@@ -1878,16 +1881,18 @@ pub fn get_voting_source(
 ///
 /// Takes `index`, [`Store::block_index`] built once by
 /// [`get_filtered_block_tree`] and threaded through every recursive call,
-/// rather than re-scanning the store's blocks at each node: the children scan
-/// below is exactly the whole-map iteration the module documentation says
-/// this file never needs a `BTreeMap` for, and it runs once per node visited,
-/// not once per node per DB round trip. `blocks`' value is `index`'s own
-/// `(slot, parent_root)` shape rather than a whole [`SignedBeaconBlock`],
-/// since [`get_head`], the only reader of this function's output, never needs
-/// more than that.
+/// rather than re-scanning the store's blocks at each node, and `children_of`,
+/// the parent-to-children map [`get_filtered_block_tree`] builds from `index`
+/// in one pass. The specification finds a block's children by scanning every
+/// block in the store; doing that here at every node visited made the walk
+/// quadratic in the live window, which is what a finality stall or a range
+/// catch-up grows. `blocks`' value is `index`'s own `(slot, parent_root)`
+/// shape rather than a whole [`SignedBeaconBlock`], since [`get_head`], the
+/// only reader of this function's output, never needs more than that.
 pub fn filter_block_tree(
     store: &Store,
     index: &HashMap<Root, (Slot, Root)>,
+    children_of: &HashMap<Root, Vec<Root>>,
     block_root: Root,
     blocks: &mut HashMap<Root, (Slot, Root)>,
     config: &Config,
@@ -1896,18 +1901,17 @@ pub fn filter_block_tree(
         .get(&block_root)
         .ok_or(Error::SpecAssert("block_root in store.blocks"))?;
 
-    let children: Vec<Root> = index
-        .iter()
-        .filter(|&(_, &(_, parent_root))| parent_root == block_root)
-        .map(|(&root, _)| root)
-        .collect();
+    let children = children_of
+        .get(&block_root)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
 
     // If any children branches contain expected finalized/justified
     // checkpoints, add to filtered block-tree and signal viability to parent.
     if !children.is_empty() {
         let mut any_viable = false;
-        for child in children {
-            if filter_block_tree(store, index, child, blocks, config)? {
+        for &child in children {
+            if filter_block_tree(store, index, children_of, child, blocks, config)? {
                 any_viable = true;
             }
         }
@@ -1947,14 +1951,22 @@ pub fn filter_block_tree(
 
 /// The filtered block tree: every block, from the justified checkpoint down,
 /// whose leaf state's justified/finalized info agrees with `store`'s own.
+///
+/// One index scan builds the whole child map before the walk starts, the way
+/// [`invalidate_subtree`] and [`walk_head`] do, so [`filter_block_tree`] does
+/// a lookup per node rather than a scan per node.
 pub fn get_filtered_block_tree(
     store: &Store,
     index: &HashMap<Root, (Slot, Root)>,
     config: &Config,
 ) -> Result<HashMap<Root, (Slot, Root)>> {
+    let mut children_of: HashMap<Root, Vec<Root>> = HashMap::new();
+    for (&root, &(_, parent_root)) in index {
+        children_of.entry(parent_root).or_default().push(root);
+    }
     let base = store.beacon_justified_checkpoint().root;
     let mut blocks = HashMap::new();
-    filter_block_tree(store, index, base, &mut blocks, config)?;
+    filter_block_tree(store, index, &children_of, base, &mut blocks, config)?;
     Ok(blocks)
 }
 
@@ -1970,8 +1982,8 @@ pub fn get_filtered_block_tree(
 ///
 /// The children scan in the loop below reads `blocks`, [`get_filtered_block_tree`]'s
 /// already-filtered, already in-memory result, not [`Store::block_index`]
-/// itself: it is the specification's own second whole-`Dict` scan the module
-/// documentation calls out, but it never costs a further backend round trip.
+/// itself: it is the specification's own whole-`Dict` scan, kept literal here
+/// because this is the reference, and it never costs a backend round trip.
 ///
 /// Takes `&Store` rather than `&mut Store`: nothing here records the head it
 /// finds. No node code calls it; only tests do.
@@ -9915,6 +9927,87 @@ mod tests {
         assert!(
             stats.branches_filtered_out > 0,
             "the block filter never dropped a branch: {stats:?}"
+        );
+    }
+
+    /// The specification's `filter_block_tree` finds a block's children by
+    /// scanning every block in the store. The node's version looks them up in
+    /// a parent-to-children map built once per call, so this keeps the scan
+    /// as the reference and checks the two agree on every random tree, at
+    /// current slots where the filter keeps everything and where it drops a
+    /// branch.
+    fn filter_block_tree_by_scan(
+        store: &Store,
+        index: &HashMap<Root, (Slot, Root)>,
+        block_root: Root,
+        blocks: &mut HashMap<Root, (Slot, Root)>,
+        config: &Config,
+    ) -> Result<bool> {
+        let children: Vec<Root> = index
+            .iter()
+            .filter(|&(_, &(_, parent_root))| parent_root == block_root)
+            .map(|(&root, _)| root)
+            .collect();
+        if children.is_empty() {
+            // A leaf's viability is the same question either way, so the
+            // reference asks the node's own code for it: an empty child map
+            // makes `filter_block_tree` take its leaf branch.
+            let no_children = HashMap::new();
+            return filter_block_tree(store, index, &no_children, block_root, blocks, config);
+        }
+        let mut any_viable = false;
+        for child in children {
+            if filter_block_tree_by_scan(store, index, child, blocks, config)? {
+                any_viable = true;
+            }
+        }
+        if any_viable {
+            blocks.insert(block_root, index[&block_root]);
+        }
+        Ok(any_viable)
+    }
+
+    #[test]
+    fn the_filtered_tree_matches_the_spec_literal_children_scan_on_random_trees() {
+        let mut branches_filtered_out = 0;
+        for seed in 0..100 {
+            let mut tree = random_tree(seed, Arc::new(InMemoryBackend::new()));
+            let config = tree.config.clone();
+            let max_slot = tree.slots.iter().copied().max().unwrap();
+            let mut current_slots = vec![max_slot + 1];
+            if tree.justified_moved {
+                current_slots.push(tree.first_gloas_slot + 3 * preset::SLOTS_PER_EPOCH);
+            }
+            for current_slot in current_slots {
+                tree.store
+                    .set_time_ms(current_slot * config.slot_duration_ms)
+                    .unwrap();
+                let index = tree.store.block_index();
+                let justified = tree.store.beacon_justified_checkpoint().root;
+
+                let mut by_scan = HashMap::new();
+                filter_block_tree_by_scan(&tree.store, &index, justified, &mut by_scan, &config)
+                    .unwrap_or_else(|err| panic!("seed {seed}: scan reference: {err:?}"));
+                let by_map = get_filtered_block_tree(&tree.store, &index, &config)
+                    .unwrap_or_else(|err| panic!("seed {seed}: filtered tree: {err:?}"));
+
+                assert_eq!(
+                    by_map, by_scan,
+                    "seed {seed} slot {current_slot}: filtered tree differs from the scan"
+                );
+                let justified_subtree = tree
+                    .roots
+                    .iter()
+                    .filter(|&&root| descends_from_justified(&index, root, justified))
+                    .count();
+                if by_map.len() < justified_subtree {
+                    branches_filtered_out += 1;
+                }
+            }
+        }
+        assert!(
+            branches_filtered_out > 0,
+            "the filter never dropped a branch, so the comparison covered only full trees"
         );
     }
 
