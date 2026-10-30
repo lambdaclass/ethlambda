@@ -75,7 +75,8 @@ pub struct ImportRequest {
     /// memory until decryption runs, and a plain `Vec<String>` would leave
     /// those bytes sitting in the allocator's freed memory afterwards.
     pub passwords: Zeroizing<Vec<String>>,
-    /// An EIP-3076 interchange, imported before any of the keys.
+    /// An EIP-3076 interchange, written once the keys are saved and before
+    /// any of them is loaded; see the module documentation.
     #[serde(default)]
     pub slashing_protection: Option<String>,
 }
