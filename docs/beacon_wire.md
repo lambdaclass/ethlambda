@@ -655,6 +655,21 @@ NUMBER_OF_COLUMNS`) bounds what one request may ask for; an answer over that
 is truncated, not refused, matching how the block protocols treat a peer
 built to an older, wider ceiling.
 
+*Checking* what arrives over req/resp, and what gossip left unjudged, is
+`beacon/column_checks.rs`. The sidecars of one call are grouped by block (a
+fulu sidecar's signed header root, a gloas sidecar's `beacon_block_root`) and
+each group is judged on one blocking thread holding one `column_check_permits`
+permit. Per sidecar the rules before the KZG proofs run first, in the order
+`chain_checks` has always run them (`chain_precheck`); the proofs of every
+sidecar still standing then go through one `verify_cell_kzg_proof_batch` call
+(`kzg_verdicts`), and the proofs are the last rule on this path, so each
+sidecar's verdict is the one it would have had alone. A batch that fails says
+nothing about which sidecar is at fault, so each is verified again by itself
+and only the ones that fail are rejected. A group is forwarded to the chain
+actor when it finishes, not when the whole call has: the sidecars to store as
+one batch, the ones waiting on a block as another. Gossip keeps one message,
+one verdict, and is not batched.
+
 *Asking* happens on two paths, bulk and per block.
 
 The bulk one rides with range sync: every `BeaconBlocksByRange` batch sends a

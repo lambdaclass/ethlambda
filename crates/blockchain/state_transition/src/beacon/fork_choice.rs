@@ -4142,6 +4142,45 @@ fn verify_column_cells(
     kzg::verify_cell_kzg_proof_batch(commitments, &cell_indices, &cells, proofs)
 }
 
+/// One column's worth of input to [`verify_column_cells_batch`]: the cell
+/// position every cell of the column sits at, the cells, and the commitments
+/// and proofs they are checked against.
+pub struct ColumnCells<'a> {
+    pub index: u64,
+    pub column: &'a [fulu::Cell],
+    pub commitments: &'a [KzgCommitment],
+    pub proofs: &'a [KzgProof],
+}
+
+/// [`verify_column_cells`] over several columns at once: one
+/// `verify_cell_kzg_proof_batch` call whose entries are every cell of every
+/// column, in order.
+///
+/// `Ok(true)` means every cell of every column verifies. Anything else (a
+/// cell that fails, or a malformed entry) does not say which column is at
+/// fault, so a caller that must tell them apart verifies the columns one by
+/// one afterwards. Each column's three lists must have equal length, as
+/// [`verify_data_column_sidecar`] and its gloas counterpart guarantee.
+pub fn verify_column_cells_batch(columns: &[ColumnCells<'_>]) -> Result<bool> {
+    let total: usize = columns.iter().map(|column| column.column.len()).sum();
+    let mut cell_indices = Vec::with_capacity(total);
+    let mut cells = Vec::with_capacity(total);
+    let mut commitments = Vec::with_capacity(total);
+    let mut proofs = Vec::with_capacity(total);
+    for column in columns {
+        cell_indices.extend(std::iter::repeat_n(column.index, column.column.len()));
+        for cell in column.column {
+            cells.push(
+                c_kzg::Cell::from_bytes(&cell[..])
+                    .map_err(|_| Error::SpecAssert("len(cell) == BYTES_PER_CELL"))?,
+            );
+        }
+        commitments.extend_from_slice(column.commitments);
+        proofs.extend_from_slice(column.proofs);
+    }
+    kzg::verify_cell_kzg_proof_batch(&commitments, &cell_indices, &cells, &proofs)
+}
+
 /// `verify_data_column_sidecar` (gloas `p2p-interface.md`, modified): the
 /// structural checks a gloas column sidecar must pass before its KZG proofs
 /// are worth checking, against `kzg_commitments` from the bid of the block the

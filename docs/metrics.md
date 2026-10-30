@@ -458,12 +458,13 @@ ethlambda-specific, not part of the leanMetrics spec.
 | `lean_beacon_validation_permit_exhausted_total` | Counter | Objects reported `Ignore(Overloaded)` because their pool had no free permit | On each failed `try_acquire` | pool=gossip,attestation,builder,sync | |
 | `lean_beacon_validation_queue_seconds` | Histogram | Time from `spawn_blocking` being called to the closure starting (tokio blocking-pool queueing) | When the closure starts | kind | 0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4 |
 | `lean_beacon_validation_run_seconds` | Histogram | Run time of the closure itself | When the closure ends (panic included) | kind | same as above |
-| `lean_beacon_column_check_permit_wait_seconds` | Histogram | Time a fetched sidecar or envelope waited for a `column_check` permit | When the permit is granted | kind=column_check,envelope_check | same as above |
+| `lean_beacon_column_check_permit_wait_seconds` | Histogram | Time a fetched block's group of sidecars, or an envelope, waited for a `column_check` permit | When the permit is granted | kind=column_check,envelope_check | same as above |
 | `lean_beacon_epoch_precompute_running` | Gauge | 1 while an epoch precompute worker runs its advance | Worker start / end | | |
 
 `kind` on the queue and run histograms is the gossip topic kind above for gossip
 validation. `column_check` and `envelope_check` are the tasks of
-`check_and_forward` (fetched and replayed columns) and of the envelope checks:
+`check_and_forward` (fetched and replayed columns, one task per block's group of
+sidecars) and of the envelope checks:
 their queue delay is measured from `spawn_blocking`, after the permit wait, which
 has its own histogram, so the two add up. The in-use gauge counts a task from its
 permit being taken, so one waiting in the blocking pool counts too; it is a count
@@ -657,7 +658,7 @@ spec.
 |------|------|-------|-------------------------|--------|---------|
 | `lean_data_columns_stored_total` | Counter | Data column sidecars verified and written to `Table::DataColumns` | On the chain actor storing a sidecar the p2p layer verified | | |
 | `lean_data_columns_rejected_total` | Counter | Sidecars the p2p layer's chain checks dropped, by reason | On each drop in `beacon::column_checks`, except an already stored sidecar | reason=malformed,future_slot,finalized,not_after_parent,unknown_proposer,bad_signature,wrong_proposer,finalized_not_ancestor,parent_not_ready,inclusion_proof,kzg,internal | |
-| `lean_data_column_kzg_verify_seconds` | Histogram | Time spent batch-verifying one sidecar's cells against its own commitments | On each KZG batch verification, in gossip validation or the chain checks | | 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0 |
+| `lean_data_column_kzg_verify_seconds` | Histogram | Time spent in one KZG cell-proof batch verification: one sidecar's cells in gossip validation, every still-standing sidecar of one block's group in the chain checks (see [Data column sidecars](beacon_wire.md#data-column-sidecars)), plus one observation per sidecar if that batch fails and each is re-verified alone | On each KZG batch verification, in gossip validation or the chain checks | | 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0 |
 | `lean_data_column_fetch_failures_total` | Counter | `DataColumnsByRoot` lookups this node gave up on, by reason | On lookup abandonment | reason=no_peers,max_retries | |
 | `lean_blocks_held_for_columns` | Gauge | Blocks held out of fork choice pending their custody columns | On every hold, release, and finality eviction of the held-block set | | |
 | `lean_sidecars_awaiting_parent` | Gauge | Sidecars parked until their block's parent has a post-state | On every park, replay, and finality eviction of the parked set | | |
