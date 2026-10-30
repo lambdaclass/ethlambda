@@ -24,9 +24,13 @@ use ethlambda_types::{
 /// [`ForkName::Lean`]'s selector is not a variant index, so the byte must go
 /// back through [`ForkName::from_selector`] rather than being cast.
 pub(crate) fn encode_state_value(state: &BeaconState) -> Vec<u8> {
-    let mut bytes = Vec::new();
+    // Encoded straight into the tagged buffer, sized so the encoder never
+    // regrows it: the state writer runs this on every import, and either a
+    // separate `Vec` or a regrowth would hold two copies of a mainnet state
+    // at once.
+    let mut bytes = Vec::with_capacity(1 + state.ssz_append_capacity());
     bytes.push(state.fork_name().selector());
-    bytes.extend_from_slice(&state.to_ssz());
+    state.ssz_append(&mut bytes);
     bytes
 }
 
@@ -63,6 +67,22 @@ mod tests {
     fn a_tagged_state_value_round_trips() {
         let state = BeaconState::Lean(State::from_genesis(7, vec![]));
         let bytes = encode_state_value(&state);
+        assert_eq!(decode_state_value(&bytes), state);
+    }
+
+    #[test]
+    fn a_beacon_state_value_is_its_tag_then_its_ssz_in_one_buffer() {
+        let electra = crate::beacon_state_delta::tests::electra_state_with_validators(64);
+        let state = BeaconState::Electra(electra);
+        let bytes = encode_state_value(&state);
+
+        assert_eq!(bytes[0], ForkName::Electra.selector());
+        assert_eq!(bytes[1..], state.to_ssz());
+        assert_eq!(
+            bytes.capacity(),
+            1 + state.ssz_append_capacity(),
+            "the buffer was regrown"
+        );
         assert_eq!(decode_state_value(&bytes), state);
     }
 
