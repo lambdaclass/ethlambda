@@ -29,13 +29,15 @@ use ethlambda_blockchain::{EventBus, Topic};
 use ethlambda_storage::Store;
 
 use super::ApiError;
+use crate::events::ShutdownSignal;
 
 async fn get_events(
     Extension(events): Extension<EventBus>,
+    Extension(shutdown): Extension<ShutdownSignal>,
     Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
     match requested_topics(&params) {
-        Ok(topics) => crate::events::sse_response(&events, topics),
+        Ok(topics) => crate::events::sse_response(&events, topics, shutdown),
         Err(err) => err.into_response(),
     }
 }
@@ -96,7 +98,8 @@ mod tests {
         let fixture = beacon_fixture(64);
         let app = routes()
             .with_state(fixture.store)
-            .layer(Extension(events.clone()));
+            .layer(Extension(events.clone()))
+            .layer(Extension(ShutdownSignal::default()));
         app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await
             .unwrap()

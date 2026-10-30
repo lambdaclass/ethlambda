@@ -133,6 +133,8 @@ Valid values are exactly the event names above: `head`, `block`, `justified_chec
 
 Events are fanned out over a single bounded broadcast channel shared by all topics. A client that reads too slowly skips past the events it missed: they are dropped for that subscriber rather than back-pressured onto the actor, so treat the stream as best-effort and re-sync via the blocks endpoints after a gap. A client that falls behind receives an SSE comment line `: error - dropped N messages` marking the gap (wire-compatible with Lighthouse) before the stream continues; re-sync via the blocks endpoints rather than trusting the skipped range. Keep-alive comments are sent periodically to hold idle connections open.
 
+The stream ends when the node shuts down, so a connected client never holds up a graceful shutdown; expect the connection to close and reconnect once the node is back.
+
 Because the ring buffer is shared, the high-rate `attestation` events (roughly one per validator per slot) dominate its occupancy: a subscriber's tolerable stall is `capacity / total_event_rate`, not per-topic, so filtering with `?topics=` narrows what you receive but does **not** widen the lag window against an attestation flood. Subscribers that only need low-rate topics (`head`, `finalized_checkpoint`, …) are still evicted at the aggregate rate. If real usage shows this biting, the fix is a per-topic channel split behind the event bus (the `subscribe(TopicSet)` API is unaffected).
 
 ### `GET /lean/v0/blocks/{block_id}` and `/header`
@@ -852,7 +854,8 @@ alone: the p2p specification counts it separately from the ENR's `seq`.
 
 The Beacon API eventstream: the same Server-Sent Events stream as
 [`/lean/v0/events`](#get-leanv0events) (topic on the `event:` line, payload on
-`data:`, one shared best-effort ring, `: error - dropped N messages` on a gap),
+`data:`, one shared best-effort ring, `: error - dropped N messages` on a gap,
+ended at shutdown),
 with the Beacon API's own topics and payloads. The response also sets
 `X-Accel-Buffering: no`, so a reverse proxy does not hold events back.
 
