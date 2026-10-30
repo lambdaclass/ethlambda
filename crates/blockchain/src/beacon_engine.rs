@@ -19,6 +19,8 @@
 //! Gloas is the exception: its payload is revealed in an envelope, so its
 //! request ([`gloas_new_payload_request`]) needs the block and the envelope.
 
+use std::time::Instant;
+
 use ethlambda_engine::types::PayloadStatusValue;
 use ethlambda_engine::{EngineClient, EngineError, PayloadStatusV1};
 use ethlambda_state_transition::beacon::containers::{self, SignedBeaconBlock};
@@ -176,6 +178,74 @@ pub fn verdict(status: &PayloadStatusV1) -> PayloadValidity {
         latest_valid_hash: status.latest_valid_hash,
         validation_error: status.validation_error.clone(),
     })
+}
+
+/// [`NewPayloadRequest`] with its own copy of the payload, so it can move into
+/// a spawned task.
+///
+/// The chain actor sends the question from a task of its own and runs the
+/// block's state transition meanwhile (see `process_block`), and a task cannot
+/// borrow the block the actor goes on using. Only the payload is copied: the
+/// rest of the request is already owned, and the block itself, which also
+/// carries the attestations and the other operations, is never cloned.
+pub struct OwnedNewPayloadRequest {
+    execution_payload: containers::deneb::ExecutionPayload,
+    versioned_hashes: Vec<Bytes32>,
+    parent_beacon_block_root: Root,
+    execution_requests: Vec<Vec<u8>>,
+}
+
+impl NewPayloadRequest<'_> {
+    /// Copies the borrowed payload so the request outlives the block.
+    pub fn into_owned(self) -> OwnedNewPayloadRequest {
+        OwnedNewPayloadRequest {
+            execution_payload: self.execution_payload.clone(),
+            versioned_hashes: self.versioned_hashes,
+            parent_beacon_block_root: self.parent_beacon_block_root,
+            execution_requests: self.execution_requests,
+        }
+    }
+}
+
+/// [`ask`] for a request already built with [`new_payload_request`], which is
+/// how the actor sends it from a task while it computes the transition.
+///
+/// The answer is read exactly as [`ask`] reads it: `Err` means no answer after
+/// the client's whole retry ladder, and there is no `Ok(None)` because a
+/// request existing means there was something to ask.
+///
+/// The time from sending the request to the answer is observed as
+/// `lean_engine_new_payload_seconds`, under the answer's [`outcome_label`].
+pub async fn ask_request(
+    client: &EngineClient,
+    request: OwnedNewPayloadRequest,
+) -> Result<PayloadValidity, EngineError> {
+    let sent = Instant::now();
+    let answer = client
+        .new_payload(
+            &request.execution_payload,
+            &request.versioned_hashes,
+            request.parent_beacon_block_root,
+            &request.execution_requests,
+        )
+        .await
+        .map(|status| verdict(&status));
+    crate::metrics::observe_engine_new_payload(outcome_label(&answer), sent.elapsed());
+    answer
+}
+
+/// The `outcome` an answer from [`ask_request`] is counted under.
+///
+/// `not_required` is listed for completeness: a status from the execution
+/// client always reads as one of the other three verdicts.
+pub fn outcome_label(answer: &Result<PayloadValidity, EngineError>) -> &'static str {
+    match answer {
+        Ok(PayloadValidity::Validated) => "valid",
+        Ok(PayloadValidity::Optimistic) => "optimistic",
+        Ok(PayloadValidity::Invalidated { .. }) => "invalidated",
+        Ok(PayloadValidity::NotRequired) => "not_required",
+        Err(_) => "no_verdict",
+    }
 }
 
 /// Asks the execution client about `block`'s payload.

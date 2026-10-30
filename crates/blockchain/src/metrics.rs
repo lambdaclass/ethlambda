@@ -1507,6 +1507,66 @@ pub fn inc_engine_no_verdict() {
     LEAN_ENGINE_NO_VERDICT_TOTAL.inc();
 }
 
+/// Speculative state transitions, by what became of them.
+///
+/// With an execution client, the chain actor runs a block's state transition
+/// while the `engine_newPayload` round trip is in flight. `outcome` is `used`
+/// (handed to `fork_choice::on_block` with a verdict that lets it stand in for
+/// the transition; a block that then fails one of `on_block`'s earlier checks
+/// still counts, since the work was spent either way), `discarded_invalidated`
+/// (the verdict was `INVALIDATED`, so `on_block` runs its own), `discarded_held`
+/// (no verdict, or a non-candidate `SYNCING`/`ACCEPTED`, so the block is not
+/// imported) or `discarded_mismatch` (computed for another root or parent;
+/// not expected from the actor). A high `discarded_*` share means the overlap
+/// is buying nothing.
+pub fn inc_engine_speculation(outcome: &str) {
+    static LEAN_ENGINE_SPECULATION_TOTAL: std::sync::LazyLock<IntCounterVec> =
+        std::sync::LazyLock::new(|| {
+            register_int_counter_vec!(
+                "lean_engine_speculation_total",
+                "Speculative state transitions run during the engine round trip, by outcome",
+                &["outcome"]
+            )
+            .unwrap()
+        });
+    LEAN_ENGINE_SPECULATION_TOTAL
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+/// How long the execution client took to answer `engine_newPayload` for a
+/// block's payload, from sending the request to its answer, retry ladder
+/// included.
+///
+/// The import computes the block's state transition meanwhile, so this is not
+/// what the import waited: that is `lean_block_import_phase_seconds`'s
+/// `engine` phase, zero whenever the answer was in before the transition
+/// finished. This is the execution client's own processing time, observed for
+/// pre-gloas blocks only (a gloas payload is asked about with its envelope).
+/// `outcome` is `valid`, `optimistic`, `invalidated` or `no_verdict` (no
+/// answer after the whole ladder, so the time is the ladder's).
+pub fn observe_engine_new_payload(outcome: &str, duration: Duration) {
+    static LEAN_ENGINE_NEW_PAYLOAD_SECONDS: std::sync::LazyLock<HistogramVec> =
+        std::sync::LazyLock::new(|| {
+            register_histogram_vec!(
+                "lean_engine_new_payload_seconds",
+                "Time the execution client took to answer engine_newPayload for a block, \
+                 retries included",
+                &["outcome"],
+                // Up to the retry ladder's worst case: three attempts at the
+                // per-attempt timeout plus the backoff between them.
+                vec![
+                    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                    8.0, 12.0, 16.0, 32.0,
+                ]
+            )
+            .unwrap()
+        });
+    LEAN_ENGINE_NEW_PAYLOAD_SECONDS
+        .with_label_values(&[outcome])
+        .observe(duration.as_secs_f64());
+}
+
 /// Blocks not imported because the execution client has not validated them and
 /// they do not qualify for an optimistic import.
 ///

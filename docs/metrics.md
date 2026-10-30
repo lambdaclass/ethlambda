@@ -260,7 +260,7 @@ The bookkeeping an import triggers (chain-event emission, the finality eviction 
 
 On the beacon wire, `decode` for `source="gossip"` spans more than its name says. `BlockArrival::decode_start` is still the wire arrival, but `handed_off` is stamped only once the block has a gossip verdict, so the section also covers the cheap, stateless checks, the stateful check's own `spawn_blocking` task, and the verdict's trip back through the p2p actor's mailbox. There is no wait for a free validation slot to attribute here either: `try_acquire_owned` never blocks, and a message arriving with none free is reported `Ignore(Overloaded)` (and still forwarded to the chain actor) rather than queued. A rising `decode` on the beacon wire alone therefore does not mean decoding got slower; check `lean_beacon_gossip_validation_seconds` before assuming so.
 
-`engine` and `fcu` are execution-client round trips. They are I/O waits rather than work, so a node whose import time is dominated by them is waiting on its execution client, not spending CPU.
+`engine` and `fcu` are execution-client waits. They are I/O waits rather than work, so a node whose import time is dominated by them is waiting on its execution client, not spending CPU. `engine` is only the part of the `engine_newPayload` round trip the import could not hide behind its own state transition, so it is zero for most blocks; the round trip itself is `lean_engine_new_payload_seconds`.
 
 The `source` label has two values, `gossip` and `sync` (req/resp backfill). Two populations are deliberately absent. A block re-delivered to itself because its slot had not started reports under the source it first arrived on, since the hold is already visible as its `defer` section and a third label value would take the block out of the population it belongs to for every section it has left. A block this node built itself is not measured at all: it crossed no wire, so it has no `decode` and an empty `queue` taken when the import began. Both still appear in the log, which names them `deferred` and `local`.
 
@@ -269,6 +269,8 @@ Series appear as blocks arrive rather than being seeded, since a third of the ph
 | Name | Type | Usage | Sample collection event | Labels | Buckets |
 |------|------|-------|-------------------------|--------|---------|
 | `lean_block_import_phase_seconds` | Histogram | Time one section of a block's import, or of the arrival carrying it, took | Per section that ran, on each import, hold or failure | phase (see below); source=gossip,sync | 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8, 12, 16, 32 |
+| `lean_engine_speculation_total` | Counter | State transitions the chain actor ran while the `engine_newPayload` round trip was in flight, by what became of them | Per beacon block asked of an execution client | outcome=used,discarded_invalidated,discarded_held,discarded_mismatch | |
+| `lean_engine_new_payload_seconds` | Histogram | Time the execution client took to answer `engine_newPayload` for a pre-gloas block, from the request to the answer, retry ladder included. The import runs the state transition meanwhile, so this is the execution client's processing time, not what the import waited (the `engine` phase) | Per beacon block asked of an execution client | outcome=valid,optimistic,invalidated,no_verdict | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8, 12, 16, 32 |
 | `lean_block_import_cascade_blocks` | Histogram | Blocks one arrival put through the import path (attempts, so a block that ends held or pended counts) | Once per arriving block message | | 1, 2, 3, 5, 8, 16, 32, 64, 128 |
 
 Per-block phases, in the order a block crosses them, plus `total` for a completed import:
@@ -284,10 +286,10 @@ Per-block phases, in the order a block crosses them, plus `total` for a complete
 | `cascade_wait` | Between the parent's import finishing and this block being popped off the cascade queue | both |
 | `da_check` | The custody-column availability check itself, not the wait | beacon |
 | `columns_wait` | Held because custody columns had not all arrived | beacon |
-| `engine` | The `engine_newPayload` round trip, including its retry ladder | beacon |
+| `engine` | The wait for the `engine_newPayload` verdict left once the state transition that ran meanwhile finished. Observed as `0` for every beacon block whose answer was already in by then, and for every block with no request to send (no execution client, pre-merge, gloas). Non-zero only when the execution client was slower than the transition, or gave no answer (the rest of its retry ladder, block held) | beacon |
 | `verify_struct` | Participant bounds checks and pubkey resolution | lean |
 | `verify_crypto` | The leanVM multi-message aggregate verification | lean |
-| `stf` | The state transition. On beacon this bundles the transition and the state root, and excludes `writer_wait`, which is nested inside it | both |
+| `stf` | The state transition. On beacon this bundles the transition and the state root, and excludes `writer_wait`, which is nested inside it. It includes the transition that ran during the `engine_newPayload` round trip, also when that one was then discarded and run again (an `INVALIDATED` verdict) or the block was held | both |
 | `writer_wait` | Beacon only: the importer's blocking hand-off of the post-state to the storage crate's background writer, which waits while the writer's queue is full. Subtracted from `stf`, so `stf` and `writer_wait` do not overlap | beacon |
 | `db_write` | The block write and handing the post-state off to the storage crate's background writer; the state's own encode/diff/commit cost is `lean_state_write_seconds` instead, not this row | lean |
 | `fc_head` | `update_head` | lean |

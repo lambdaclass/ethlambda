@@ -1796,40 +1796,108 @@ impl BlockChainServer {
                 // `is_data_available` runs before `state_transition`, so a
                 // block about to be held for its custody columns is never one
                 // this node asks an execution client about.
-                timings.engine_start = Some(Instant::now());
-                let validity = match &self.engine {
-                    None => fork_choice::PayloadValidity::NotRequired,
-                    Some(client) => match beacon_engine::ask(client, &beacon_block).await {
-                        Ok(None) => fork_choice::PayloadValidity::NotRequired,
-                        Ok(Some(validity)) => validity,
-                        // No answer after the whole ladder.
-                        // `optimistic-sync.md`: a consensus engine MUST NOT
-                        // import the block and MUST NOT apply it to the fork
-                        // choice store. Returning `Held` leaves the block out
-                        // of the store without marking it imported, so the
-                        // cascade does not treat it as having produced a
-                        // post-state.
-                        Err(err) => {
-                            warn!(
-                                %slot,
-                                block_root = %ShortRoot(&block_root.0),
-                                %err,
-                                "No verdict from the execution client; not importing"
-                            );
-                            metrics::inc_engine_no_verdict();
-                            timings.engine_end = Some(Instant::now());
-                            return (timings, Ok(ImportOutcome::Held));
+                //
+                // With an execution client the question is sent from a task
+                // of its own and this actor computes the block's state
+                // transition while the answer is awaited, so the two cost
+                // `max(engine wait, transition)` instead of their sum. The
+                // result stays a local value: it reaches the store only
+                // through `fork_choice::on_block_speculative`, after every
+                // check `on_block` makes and only for a verdict that agrees
+                // with the transition it assumed (see `SpeculativeTransition`).
+                // Without an engine, or without a request to send (pre-merge
+                // forks, gloas), nothing overlaps and the path is the old one.
+                //
+                // The `engine` section is what the import waited once it had
+                // nothing left to do, so it starts as a recorded zero and only
+                // a request still unanswered when the transition is done
+                // widens it. The execution client's own time is
+                // `lean_engine_new_payload_seconds`, observed in
+                // `ask_request`.
+                let no_wait = Instant::now();
+                (timings.engine_start, timings.engine_end) = (Some(no_wait), Some(no_wait));
+                let parent_root = beacon_block.parent_root();
+                let mut speculation: Option<fork_choice::SpeculativeTransition> = None;
+                let verdict: Result<Option<fork_choice::PayloadValidity>, String> = match &self
+                    .engine
+                {
+                    None => Ok(None),
+                    Some(client) => {
+                        match beacon_engine::new_payload_request(&beacon_block)
+                            .map(|request| request.into_owned())
+                        {
+                            None => Ok(None),
+                            Some(request) => {
+                                let client = client.clone();
+                                let task = tokio::spawn(async move {
+                                    let answer = beacon_engine::ask_request(&client, request).await;
+                                    (answer, Instant::now())
+                                });
+                                let spec_start = Instant::now();
+                                let computed = fork_choice::speculate_transition(
+                                    &self.store,
+                                    &beacon_block,
+                                    &config,
+                                    &committees,
+                                );
+                                let spec_end = Instant::now();
+                                // Charged to `stf` whether or not the
+                                // import ends up using it: it is
+                                // state-transition work either way.
+                                if computed.is_some() {
+                                    timings.stf_spec_start = Some(spec_start);
+                                    timings.stf_spec_end = Some(spec_end);
+                                }
+                                speculation = computed;
+                                // A panicked or cancelled task is no
+                                // answer, like an exhausted retry ladder.
+                                let (answer, answered_at) = match task.await {
+                                    Ok((answer, answered_at)) => (
+                                        answer.map(Some).map_err(|err| err.to_string()),
+                                        answered_at,
+                                    ),
+                                    Err(err) => (Err(err.to_string()), Instant::now()),
+                                };
+                                // The wait begins once the transition is
+                                // done; an answer already in by then
+                                // leaves it at zero.
+                                timings.engine_start = Some(spec_end);
+                                timings.engine_end = Some(answered_at.max(spec_end));
+                                answer
+                            }
                         }
-                    },
+                    }
                 };
-                timings.engine_end = Some(Instant::now());
+                let validity = match verdict {
+                    Ok(None) => fork_choice::PayloadValidity::NotRequired,
+                    Ok(Some(validity)) => validity,
+                    // No answer after the whole ladder.
+                    // `optimistic-sync.md`: a consensus engine MUST NOT
+                    // import the block and MUST NOT apply it to the fork
+                    // choice store. Returning `Held` leaves the block out
+                    // of the store without marking it imported, so the
+                    // cascade does not treat it as having produced a
+                    // post-state.
+                    Err(err) => {
+                        warn!(
+                            %slot,
+                            block_root = %ShortRoot(&block_root.0),
+                            %err,
+                            "No verdict from the execution client; not importing"
+                        );
+                        metrics::inc_engine_no_verdict();
+                        if speculation.is_some() {
+                            metrics::inc_engine_speculation("discarded_held");
+                        }
+                        return (timings, Ok(ImportOutcome::Held));
+                    }
+                };
 
                 // An optimistic import is only permitted for a block that
                 // qualifies. A block that does not, and got a NOT_VALIDATED
                 // answer, is not imported at all.
                 if matches!(validity, fork_choice::PayloadValidity::Optimistic) {
                     let current_slot = self.wall_clock_slot();
-                    let parent_root = beacon_block.parent_root();
                     if !fork_choice::is_optimistic_candidate_block(
                         &self.store,
                         current_slot,
@@ -1844,21 +1912,49 @@ impl BlockChainServer {
                              block and it is not an optimistic candidate"
                         );
                         metrics::inc_engine_not_optimistic_candidate();
+                        if speculation.is_some() {
+                            metrics::inc_engine_speculation("discarded_held");
+                        }
                         return (timings, Ok(ImportOutcome::Held));
                     }
                 }
+
+                // The speculation is only worth handing on for a verdict its
+                // `valid()` engine agrees with. `INVALIDATED` makes `on_block`
+                // run the transition itself with `invalid()`, exactly as
+                // before. A discarded speculation stays in the `stf` row, so
+                // the transition run twice shows as twice.
+                let speculation = match speculation {
+                    Some(spec) => {
+                        if !spec.is_for(block_root, parent_root) {
+                            metrics::inc_engine_speculation("discarded_mismatch");
+                            None
+                        } else if matches!(
+                            validity,
+                            fork_choice::PayloadValidity::Invalidated { .. }
+                        ) {
+                            metrics::inc_engine_speculation("discarded_invalidated");
+                            None
+                        } else {
+                            metrics::inc_engine_speculation("used");
+                            Some(spec)
+                        }
+                    }
+                    None => None,
+                };
 
                 // Drop any hand-off span left by an insert outside this call,
                 // so the one taken below is this block's alone.
                 let _ = self.store.take_state_handoff();
                 timings.stf_start = Some(Instant::now());
-                let imported = fork_choice::on_block(
+                let imported = fork_choice::on_block_speculative(
                     &mut self.store,
                     beacon_block,
                     &config,
                     &evidence,
                     &validity,
                     &committees,
+                    speculation,
                 );
                 timings.stf_end = Some(Instant::now());
                 (timings.writer_wait_start, timings.writer_wait_end) =
