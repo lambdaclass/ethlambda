@@ -91,6 +91,28 @@ pub fn checkpoint_hash(store: &Store, root: H256) -> ExecutionBlockHash {
     store.beacon_el_block_hash(root).unwrap_or(H256::ZERO)
 }
 
+/// `get_safe_execution_block_hash` (bellatrix `fast-confirmation.md`, modified
+/// by gloas): the execution block hash of the most recent block the Fast
+/// Confirmation Rule confirmed, which `forkchoiceUpdated` carries as the safe
+/// block.
+///
+/// Bellatrix through fulu name the confirmed block's own payload hash; gloas
+/// names its `bid.parent_block_hash`, since only the parent payload of a
+/// confirmed beacon block is safe. [`checkpoint_hash`] is exactly that pair,
+/// including for a pre-gloas block under a gloas head, and it answers zero for
+/// a block with no known payload (a pre-bellatrix block), the way the
+/// finalized hash does.
+///
+/// The rule has not run yet (or was reset while the node is syncing) when the
+/// store holds no confirmed root, and then its own initialization applies: the
+/// finalized block.
+pub(crate) fn get_safe_execution_block_hash(store: &Store) -> ExecutionBlockHash {
+    let confirmed_root = store
+        .fast_confirmed_root()
+        .unwrap_or_else(|| store.beacon_finalized_checkpoint().root);
+    checkpoint_hash(store, confirmed_root)
+}
+
 /// What `forkchoiceUpdated` should carry for the current head, or `None` when
 /// there is nothing to say yet.
 pub(crate) struct ForkchoicePlan {
@@ -109,11 +131,10 @@ pub(crate) struct ForkchoicePlan {
 /// hash is zero, as before.
 ///
 /// Finalized: the finalized block's `bid.parent_block_hash` (spec). Safe: the
-/// spec's `get_safe_execution_block_hash` is fast-confirmation based, which
-/// this follower does not run, so the justified checkpoint block's
-/// `bid.parent_block_hash` stands in (see `docs/spec_deviations.md`). A
-/// pre-gloas checkpoint block, including one under a gloas head, uses its own
-/// payload hash.
+/// spec's `get_safe_execution_block_hash`, the payload hash of the most recent
+/// block the Fast Confirmation Rule confirmed ([`get_safe_execution_block_hash`]).
+/// Before the rule's first run its confirmed root is the finalized block, as
+/// its initialization sets it.
 pub(crate) fn forkchoice_plan(store: &Store, head_root: H256) -> Option<ForkchoicePlan> {
     let head_block = store.get_signed_block(&head_root).ok().flatten();
     let head_bid = head_block.as_ref().and_then(bid_of);
@@ -129,7 +150,7 @@ pub(crate) fn forkchoice_plan(store: &Store, head_root: H256) -> Option<Forkchoi
     }
     let state = ForkchoiceStateV1 {
         head_block_hash,
-        safe_block_hash: checkpoint_hash(store, store.beacon_justified_checkpoint().root),
+        safe_block_hash: get_safe_execution_block_hash(store),
         finalized_block_hash: checkpoint_hash(store, store.beacon_finalized_checkpoint().root),
     };
     Some(ForkchoicePlan {
@@ -422,5 +443,151 @@ impl BlockChainServer {
             removed |= fork_choice::invalidate_subtree(&mut self.store, child) > 0;
         }
         removed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ethlambda_types::beacon::containers::{SignedBeaconBlock, gloas};
+    use ethlambda_types::beacon::fork_choice::FastConfirmationVariables;
+
+    use super::*;
+    use crate::tests::{beacon_store, fulu_block};
+
+    /// Makes `head_root` the store's head, which `head_payload_status` needs
+    /// to agree with before it answers. The zero anchor gets a block of its
+    /// own so the canonical-index diff can walk down to it.
+    fn make_head(store: &mut Store, head_root: H256, status: PayloadStatus) {
+        store
+            .insert_pending_block(H256::ZERO, fulu_block(H256::ZERO, 0, 0))
+            .expect("insert anchor");
+        store
+            .update_checkpoints(ethlambda_storage::ForkCheckpoints::head_only(head_root))
+            .expect("move head");
+        store.set_head_payload_status(head_root, status);
+    }
+
+    fn confirm(store: &Store, root: H256) {
+        let checkpoint = ethlambda_types::beacon::containers::Checkpoint { epoch: 0, root };
+        store.set_fast_confirmation(FastConfirmationVariables::at_finalized(checkpoint));
+    }
+
+    fn gloas_block(
+        slot: u64,
+        parent_root: H256,
+        parent_hash: H256,
+        hash: H256,
+    ) -> SignedBeaconBlock {
+        SignedBeaconBlock::Gloas(gloas::SignedBeaconBlock {
+            message: gloas::BeaconBlock {
+                slot,
+                parent_root,
+                body: gloas::BeaconBlockBody {
+                    signed_execution_payload_bid: gloas::SignedExecutionPayloadBid {
+                        message: gloas::ExecutionPayloadBid {
+                            parent_block_hash: parent_hash,
+                            block_hash: hash,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            signature: Default::default(),
+        })
+    }
+
+    /// `get_safe_execution_block_hash` before gloas: the confirmed block's own
+    /// payload hash, whatever the justified checkpoint says.
+    #[test]
+    fn safe_follows_the_confirmed_root_for_a_pre_gloas_head() {
+        let mut store = beacon_store(0, 0);
+        let (hash_1, hash_2) = (H256::repeat_byte(1), H256::repeat_byte(2));
+        let block_1 = fulu_block(H256::ZERO, 1, 0);
+        let root_1 = block_1.message_hash_tree_root();
+        let block_2 = fulu_block(root_1, 2, 0);
+        let root_2 = block_2.message_hash_tree_root();
+        for (root, block, slot, hash) in
+            [(root_1, block_1, 1, hash_1), (root_2, block_2, 2, hash_2)]
+        {
+            store.insert_pending_block(root, block).expect("insert");
+            store.insert_beacon_el_block_hash(root, slot, hash);
+        }
+
+        // The rule has not run: its own initialization, the finalized block
+        // (here the unknown zero anchor, which has no payload).
+        let plan = forkchoice_plan(&store, root_2).expect("a plan");
+        assert_eq!(plan.state.head_block_hash, hash_2);
+        assert_eq!(plan.state.safe_block_hash, plan.state.finalized_block_hash);
+
+        // Once it has, safe follows the confirmed root.
+        confirm(&store, root_1);
+        let plan = forkchoice_plan(&store, root_2).expect("a plan");
+        assert_eq!(plan.state.safe_block_hash, hash_1);
+        confirm(&store, root_2);
+        let plan = forkchoice_plan(&store, root_2).expect("a plan");
+        assert_eq!(plan.state.safe_block_hash, hash_2);
+        // Finalized is the checkpoint's, untouched.
+        assert_eq!(plan.state.finalized_block_hash, H256::ZERO);
+        assert!(!plan.gloas);
+    }
+
+    /// Gloas modifies it: only the parent payload of a confirmed beacon block
+    /// is safe, so the bid's `parent_block_hash`.
+    #[test]
+    fn safe_is_the_confirmed_blocks_parent_payload_for_a_gloas_head() {
+        let mut store = beacon_store(0, 0);
+        let (parent_hash, hash_1, hash_2) = (
+            H256::repeat_byte(0x10),
+            H256::repeat_byte(0x11),
+            H256::repeat_byte(0x12),
+        );
+        let block_1 = gloas_block(1, H256::ZERO, parent_hash, hash_1);
+        let root_1 = block_1.message_hash_tree_root();
+        let block_2 = gloas_block(2, root_1, hash_1, hash_2);
+        let root_2 = block_2.message_hash_tree_root();
+        store.insert_pending_block(root_1, block_1).expect("insert");
+        store.insert_pending_block(root_2, block_2).expect("insert");
+        make_head(&mut store, root_2, PayloadStatus::Full);
+
+        confirm(&store, root_2);
+        let plan = forkchoice_plan(&store, root_2).expect("a plan");
+        assert!(plan.gloas);
+        assert_eq!(plan.state.head_block_hash, hash_2, "a FULL head");
+        assert_eq!(
+            plan.state.safe_block_hash, hash_1,
+            "the confirmed bid's parent"
+        );
+
+        confirm(&store, root_1);
+        let plan = forkchoice_plan(&store, root_2).expect("a plan");
+        assert_eq!(plan.state.safe_block_hash, parent_hash);
+    }
+
+    /// A pre-gloas confirmed block under a gloas head keeps its own payload
+    /// hash, as the finalized hash does for a pre-gloas finalized block.
+    #[test]
+    fn a_pre_gloas_confirmed_block_under_a_gloas_head_uses_its_own_hash() {
+        let mut store = beacon_store(0, 0);
+        let fulu_hash = H256::repeat_byte(0x20);
+        let fulu = fulu_block(H256::ZERO, 1, 0);
+        let fulu_root = fulu.message_hash_tree_root();
+        store.insert_pending_block(fulu_root, fulu).expect("insert");
+        store.insert_beacon_el_block_hash(fulu_root, 1, fulu_hash);
+        let gloas = gloas_block(2, fulu_root, fulu_hash, H256::repeat_byte(0x21));
+        let gloas_root = gloas.message_hash_tree_root();
+        store
+            .insert_pending_block(gloas_root, gloas)
+            .expect("insert");
+        make_head(&mut store, gloas_root, PayloadStatus::Full);
+
+        confirm(&store, fulu_root);
+        let plan = forkchoice_plan(&store, gloas_root).expect("a plan");
+        assert_eq!(plan.state.safe_block_hash, fulu_hash);
+        // A confirmed block with no known payload is zero, like finalized.
+        confirm(&store, H256::repeat_byte(0x99));
+        assert_eq!(get_safe_execution_block_hash(&store), H256::ZERO);
     }
 }
