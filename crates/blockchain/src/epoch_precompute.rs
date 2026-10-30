@@ -183,13 +183,10 @@ impl BlockChainServer {
             Trigger::Head => head_slot / preset::SLOTS_PER_EPOCH + 1,
             Trigger::Timer { slot } => slot / preset::SLOTS_PER_EPOCH + 1,
         };
-        let already_cached = self
-            .store
-            .cached_state(CacheKey::CheckpointState {
-                epoch: candidate_epoch,
-                root: head_root,
-            })
-            .is_some();
+        let cached = self.store.cached_state(CacheKey::CheckpointState {
+            epoch: candidate_epoch,
+            root: head_root,
+        });
         let inputs = DecisionInputs {
             trigger,
             syncing: self.sync_status.is_syncing(),
@@ -197,9 +194,24 @@ impl BlockChainServer {
             head_root,
             current_slot: self.wall_clock_slot(),
             in_flight: self.epoch_precompute_in_flight,
-            already_cached,
+            already_cached: cached.is_some(),
         };
         let Some(key) = decide(&inputs) else {
+            // Someone else advanced the state already (a gloas bid for the
+            // epoch's first slot does), so no worker runs: warm the sums from
+            // that state instead, or the epoch would import without them.
+            if let Some(state) = cached
+                && decide(&DecisionInputs {
+                    already_cached: false,
+                    ..inputs
+                })
+                .is_some()
+            {
+                let committee_cache = self.store.committee_cache();
+                tokio::task::spawn_blocking(move || {
+                    warm_epoch_key_sums(&committee_cache, &state, candidate_epoch)
+                });
+            }
             return;
         };
         // The head's post-state is resident (it was just imported); a read that
@@ -233,11 +245,24 @@ impl BlockChainServer {
             // not wait for key sums, which only make its attestations cheaper.
             let _ = actor.send(EpochPrecomputed { key, result });
             if let Some(state) = advanced {
-                let _timing = stf_metrics::time_key_sums_warm();
-                committee_cache.warm_key_sums(&state, key.epoch);
+                warm_epoch_key_sums(&committee_cache, &state, key.epoch);
             }
         });
     }
+}
+
+/// Warms the key sums `epoch`'s blocks read: `epoch`'s own, and the previous
+/// epoch's for the attestations those blocks carry from it. The previous
+/// epoch's are normally warm already, from the last boundary; after a restart
+/// mid-epoch, or a boundary whose worker did not run, they are not. Both calls
+/// return at once when the sums are resident.
+fn warm_epoch_key_sums(
+    committee_cache: &ethlambda_storage::CommitteeCache,
+    state: &BeaconState,
+    epoch: u64,
+) {
+    committee_cache.warm_key_sums(state, epoch);
+    committee_cache.warm_key_sums(state, epoch.saturating_sub(1));
 }
 
 impl Handler<EpochPrecomputeCheck> for BlockChainServer {

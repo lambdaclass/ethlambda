@@ -178,14 +178,20 @@ pub fn apply_block(
         "the block's fork matches the state's",
     )?;
 
-    // One batch for the whole block, the proposer's signature first so a block
-    // whose only defect is that signature is still rejected with its label.
-    let mut signatures = signatures::SignatureBatch::new();
+    // The proposer's signature on its own, before the body runs, rather than in
+    // the body's batch: a block nobody but its sender signed then costs one
+    // pairing to reject instead of a whole body's processing. Gossip checked it
+    // already (`precheck_block`), but a block fetched by request arrives here
+    // unchecked. `process_block` batches the body's own signatures and checks
+    // them before returning, so before the state root below is computed.
     if validate_result {
-        signatures.push(block_signature_set(state, signed_block), "block signature")?;
+        verify(
+            verify_block_signature(state, signed_block),
+            "block signature",
+        )?;
     }
 
-    block::process_block_with_signatures(
+    block::process_block(
         state,
         signed_block,
         config,
@@ -193,11 +199,7 @@ pub fn apply_block(
         committees,
         active_balances,
         block::BlockProcessingOptions::default(),
-        &mut signatures,
     )?;
-    // Before the state root is computed: a block rejected here would otherwise
-    // pay for hashing a state it is about to discard.
-    signatures.verify()?;
     // As in `process_slot`: the post-state's root, checked below and needed
     // again in the next slot, is then computed on the state's own nodes.
     state.apply_pending_mutations();
@@ -221,9 +223,8 @@ pub fn verify_block_signature(
 }
 
 /// The proposer's signature check [`verify_block_signature`] makes, resolved
-/// but not yet run, so [`apply_block`] can verify it with the block's other
-/// signatures in one batch. `None` is a proposer index outside the registry,
-/// or a key or signature that does not validate.
+/// but not yet run. `None` is a proposer index outside the registry, or a key
+/// or signature that does not validate.
 pub fn block_signature_set(
     state: &BeaconState,
     signed_block: &containers::SignedBeaconBlock,

@@ -488,9 +488,12 @@ fn validated_pubkeys<K: PubkeySource>(pubkeys: &[K]) -> Option<Vec<PublicKey>> {
 /// twice) and returns the same group element as the sequential sum; only the
 /// order of additions differs, and the group is commutative.
 ///
-/// From 384 points up, blst splits the work over its own thread pool, which is
-/// separate from rayon's; below that it runs on the calling thread. Either way
-/// the answer is the same, so the caller needs no size check.
+/// From 384 points up, on a host with two or more CPUs, blst splits the work
+/// over its own thread pool, which is separate from rayon's; below that, or on
+/// one CPU, it runs on the calling thread. The pool is the one blst's pairing
+/// already ran on before this helper existed, so the sums join the same queue
+/// rather than adding threads. Either way the answer is the same, so the
+/// caller needs no size check.
 ///
 /// The empty slice is guarded here because `MultiPoint::add` indexes the
 /// slice's first element and would panic on it.
@@ -797,8 +800,8 @@ mod tests {
         }
     }
 
-    /// The sequential sum `sum_validated_points` must equal, through blst's
-    /// own `AggregatePublicKey::aggregate`.
+    /// The sequential sum, through blst's own `AggregatePublicKey::aggregate`:
+    /// what `sum_validated_points` must equal.
     fn sequential_sum(points: &[PublicKey]) -> [u8; BLS_PUBKEY_SIZE] {
         let refs: Vec<&PublicKey> = points.iter().collect();
         AggregatePublicKey::aggregate(&refs, false)
@@ -820,7 +823,11 @@ mod tests {
     #[test]
     fn the_batched_sum_matches_the_sequential_one_at_every_size() {
         // One point, a pair, then both sides of blst's 384-point thread-pool
-        // threshold (and the first multi-chunk size), then a large run.
+        // threshold, then larger runs. Which side of the threshold runs also
+        // depends on the host: on one CPU everything stays on the calling
+        // thread. On more, every pool worker's chunk stays below
+        // `blst_p1s_add`'s scratch stride, so that inner loop is never
+        // reached through the safe API.
         for count in [1u64, 2, 3, 17, 383, 384, 385, 767, 2000] {
             let points = validated_run(1000..1000 + count);
             assert_eq!(
@@ -880,6 +887,66 @@ mod tests {
             &signature
         ));
         assert!(!fast_aggregate_verify(&[pubkey], message, &signature));
+    }
+
+    /// `-P`, from `P`'s compressed encoding: flipping the sort flag (bit 5 of
+    /// the first byte) picks the other `y` for the same `x`. Both are valid
+    /// keys, so a registry can hold both: whoever holds `P`'s secret signs
+    /// `-P`'s deposit with its negation.
+    fn negated(pubkey: BlsPubkey) -> BlsPubkey {
+        let mut bytes = pubkey.0;
+        bytes[0] ^= 0b0010_0000;
+        BlsPubkey(bytes)
+    }
+
+    #[test]
+    fn a_key_and_its_negation_sum_to_the_identity_and_never_verify() {
+        let pubkey = fresh_pubkey(7000);
+        let pair = [pubkey, negated(pubkey)];
+        assert!(key_validate(&pair[1]), "-P is a valid key");
+
+        // Both paths sum to the identity, and `eth_aggregate_pubkeys` hands it
+        // back as the spec's own pseudocode would.
+        let points = validated_pubkeys(&pair).unwrap();
+        assert_eq!(sequential_sum(&points), identity_pubkey().0);
+        assert_eq!(eth_aggregate_pubkeys(&pair).unwrap(), identity_pubkey());
+
+        // The identity's signature is G2's identity, which blst refuses to pair
+        // against an identity key.
+        let message = ethlambda_types::beacon::primitives::H256([5u8; 32]);
+        let signature = BlsSignature(G2_POINT_AT_INFINITY);
+        assert!(!fast_aggregate_verify(&pair, message, &signature));
+        assert!(!eth_fast_aggregate_verify(&pair, message, &signature));
+    }
+
+    #[test]
+    fn the_batched_sum_matches_the_sequential_one_when_keys_cancel() {
+        // Cancelling pairs next to each other, and two halves that cancel each
+        // other, either side of the thread-pool threshold.
+        for count in [8u64, 200, 400, 1100] {
+            let pubkeys: Vec<BlsPubkey> = (8000..8000 + count).map(fresh_pubkey).collect();
+
+            let adjacent: Vec<BlsPubkey> = pubkeys
+                .iter()
+                .flat_map(|&pubkey| [pubkey, negated(pubkey)])
+                .chain([pubkeys[0]])
+                .collect();
+            let halves: Vec<BlsPubkey> = pubkeys
+                .iter()
+                .copied()
+                .chain(pubkeys.iter().map(|&pubkey| negated(pubkey)))
+                .chain([pubkeys[1]])
+                .collect();
+
+            for (shape, run) in [("adjacent", adjacent), ("halves", halves)] {
+                let points = validated_pubkeys(&run).unwrap();
+                assert_eq!(
+                    sum_validated_points(&points).map(|sum| sum.to_bytes()),
+                    Some(sequential_sum(&points)),
+                    "{count} cancelling pairs, {shape}"
+                );
+            }
+        }
     }
 
     #[test]

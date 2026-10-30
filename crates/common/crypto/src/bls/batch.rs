@@ -377,6 +377,56 @@ mod tests {
     }
 
     #[test]
+    fn an_infinity_signature_among_valid_sets_fails_the_batch() {
+        let mut sets = valid_sets(4);
+        let key = secret_key(1);
+        let infinity = BlsSignature(bls::G2_POINT_AT_INFINITY);
+        sets[1] = SignatureSet::single(&pubkey_of(&key), message(1), &infinity).unwrap();
+        assert!(!verify_signature_sets(&sets));
+    }
+
+    /// `-P`, from `P`'s compressed encoding (the sort flag picks the other
+    /// `y`). Valid on its own, so a registry can hold both.
+    fn negated(pubkey: BlsPubkey) -> BlsPubkey {
+        let mut bytes = pubkey.0;
+        bytes[0] ^= 0b0010_0000;
+        BlsPubkey(bytes)
+    }
+
+    #[test]
+    fn keys_that_cancel_never_verify_alone_or_in_a_batch() {
+        // `[P, -P]` sums to the identity, and with the identity signature that
+        // is the cancellation the rule against identity keys exists for. A
+        // real signature over the message must not pass either.
+        let key = secret_key(20);
+        let pubkey = pubkey_of(&key);
+        let pair = [pubkey, negated(pubkey)];
+        let msg = message(20);
+        let infinity = BlsSignature(bls::G2_POINT_AT_INFINITY);
+        for signature in [infinity, sign(&key, msg)] {
+            let set = SignatureSet::fast_aggregate(&pair, msg, &signature).unwrap();
+            assert!(set.key_is_identity());
+            assert!(!set.verify());
+            assert_eq!(
+                set.verify(),
+                bls::fast_aggregate_verify(&pair, msg, &signature)
+            );
+
+            let mut sets = valid_sets(3);
+            sets.push(set);
+            assert!(!verify_signature_sets(&sets));
+        }
+
+        // `P + P - P` is `P`, so `P`'s own signature verifies.
+        let three = [pubkey, pubkey, negated(pubkey)];
+        let set = SignatureSet::fast_aggregate(&three, msg, &sign(&key, msg)).unwrap();
+        assert!(!set.key_is_identity());
+        let mut sets = valid_sets(3);
+        sets.push(set);
+        assert!(verify_signature_sets(&sets));
+    }
+
+    #[test]
     fn random_weights_are_never_zero() {
         let mut rng = rand::rng();
         for _ in 0..10_000 {
