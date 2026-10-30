@@ -46,6 +46,7 @@ use super::shared::{
     StateRoots, Validators,
 };
 use crate::beacon::preset;
+use crate::beacon::primitives::HashTreeRoot as _;
 use crate::beacon::primitives::{
     BlobIndex, BlsSignature, Bytes32, ExecutionAddress, ExecutionBlockHash, KzgCommitment,
     KzgProof, Root, Slot, Uint256, ValidatorIndex, VersionedHash, WithdrawalIndex,
@@ -134,7 +135,17 @@ pub struct ExecutionPayload {
 
 /// [`ExecutionPayload`] with the bulky fields replaced by their roots, which
 /// is what the state retains once a payload is no longer the newest one.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 pub struct ExecutionPayloadHeader {
     pub parent_hash: ExecutionBlockHash,
     pub fee_recipient: ExecutionAddress,
@@ -161,6 +172,34 @@ pub struct ExecutionPayloadHeader {
     pub blob_gas_used: u64,
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub excess_blob_gas: u64,
+}
+
+/// The header the state caches for `payload`, and what a blinded block carries
+/// in its place: every field copied, the two lists replaced by their roots.
+/// Built the same way `process_execution_payload` builds the cached header, so
+/// `hash_tree_root(header) == hash_tree_root(payload)`.
+impl From<&ExecutionPayload> for ExecutionPayloadHeader {
+    fn from(payload: &ExecutionPayload) -> Self {
+        Self {
+            parent_hash: payload.parent_hash,
+            fee_recipient: payload.fee_recipient,
+            state_root: payload.state_root,
+            receipts_root: payload.receipts_root,
+            logs_bloom: payload.logs_bloom.clone(),
+            prev_randao: payload.prev_randao,
+            block_number: payload.block_number,
+            gas_limit: payload.gas_limit,
+            gas_used: payload.gas_used,
+            timestamp: payload.timestamp,
+            extra_data: payload.extra_data.clone(),
+            base_fee_per_gas: payload.base_fee_per_gas,
+            block_hash: payload.block_hash,
+            transactions_root: payload.transactions.hash_tree_root(),
+            withdrawals_root: payload.withdrawals.hash_tree_root(),
+            blob_gas_used: payload.blob_gas_used,
+            excess_blob_gas: payload.excess_blob_gas,
+        }
+    }
 }
 
 /// What `process_execution_payload` hands `execution_engine.verify_and_notify_new_payload`
@@ -457,7 +496,55 @@ pub struct BlobSidecar {
 mod tests {
     use libssz::{SszDecode as _, SszEncode as _};
 
+    use super::super::bellatrix::Transaction;
+    use super::super::capella::Withdrawal;
     use super::*;
+
+    /// A payload whose every field differs from the empty one, with a
+    /// transaction and a withdrawal, so both list roots are non-trivial.
+    fn sample_payload() -> ExecutionPayload {
+        let transaction: Transaction = vec![0xde, 0xad, 0xbe, 0xef].try_into().unwrap();
+        let withdrawal = Withdrawal {
+            index: 1,
+            validator_index: 2,
+            address: ExecutionAddress::repeat_byte(3),
+            amount: 4,
+        };
+        ExecutionPayload {
+            parent_hash: ExecutionBlockHash::repeat_byte(1),
+            fee_recipient: ExecutionAddress::repeat_byte(2),
+            state_root: Bytes32::repeat_byte(3),
+            receipts_root: Bytes32::repeat_byte(4),
+            logs_bloom: LogsBloom::try_from(vec![5u8; preset::BYTES_PER_LOGS_BLOOM]).unwrap(),
+            prev_randao: Bytes32::repeat_byte(6),
+            block_number: 7,
+            gas_limit: 8,
+            gas_used: 9,
+            timestamp: 10,
+            extra_data: vec![11u8; 4].try_into().unwrap(),
+            base_fee_per_gas: Uint256::from(12u64),
+            block_hash: ExecutionBlockHash::repeat_byte(13),
+            transactions: vec![transaction].try_into().unwrap(),
+            withdrawals: vec![withdrawal].try_into().unwrap(),
+            blob_gas_used: 14,
+            excess_blob_gas: 15,
+        }
+    }
+
+    #[test]
+    fn a_payloads_header_has_the_payloads_root() {
+        let payload = sample_payload();
+        let header = ExecutionPayloadHeader::from(&payload);
+        assert_eq!(header.hash_tree_root(), payload.hash_tree_root());
+        assert_eq!(
+            header.transactions_root,
+            payload.transactions.hash_tree_root()
+        );
+        assert_eq!(
+            header.withdrawals_root,
+            payload.withdrawals.hash_tree_root()
+        );
+    }
 
     #[test]
     fn blob_identifier_round_trips_through_ssz() {

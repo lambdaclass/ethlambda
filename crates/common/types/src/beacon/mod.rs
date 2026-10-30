@@ -6,6 +6,7 @@
 //! transition lives
 //! under this module so both sets can coexist.
 
+pub mod builder;
 pub mod committees;
 pub mod config;
 pub mod constants;

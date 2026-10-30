@@ -7,18 +7,20 @@
 //! electra's block containers unchanged.
 //!
 //! The pieces the execution client supplies (the payload, its blob commitments
-//! and its request list) arrive already built; this module decides everything
+//! and its request list) arrive already built; `assemble_blinded_block` takes
+//! them from a builder's bid instead, fulu only. This module decides everything
 //! the consensus layer decides, and computes the state root by running the
 //! block through `process_block` on a copy of the state, the way
 //! `validator.md` describes (`compute_new_state_root`).
 
 use ethlambda_types::beacon::{
+    builder::BlindedBeaconBlock,
     constants,
     containers::{
         BeaconState, SignedBeaconBlock,
         altair::SyncAggregate,
         capella::{self, Withdrawal},
-        deneb::ExecutionPayload,
+        deneb::{ExecutionPayload, ExecutionPayloadHeader},
         electra::{
             self, AggregationBits, Attestation, BeaconBlock, BeaconBlockBody, CommitteeBits,
             ConsolidationRequest, DepositRequest, ExecutionRequests, WithdrawalRequest,
@@ -44,6 +46,7 @@ use super::helpers::accessors::{
 use super::helpers::electra::{
     get_attesting_indices, get_indexed_attestation, is_valid_indexed_attestation,
 };
+use super::helpers::fulu::fulu_state;
 use super::helpers::misc::compute_signing_root;
 use super::helpers::predicates::is_slashable_validator;
 use super::lean_boundary::lean_state_unreachable;
@@ -514,7 +517,21 @@ pub fn assemble_block(
     config: &Config,
     options: stf::block::BlockProcessingOptions,
 ) -> Result<BeaconBlock> {
-    let body = BeaconBlockBody {
+    let body = full_body(state, inputs)?;
+    let mut block = unsigned_block(state, body)?;
+    let mut post = post_state(state, &block, config, options)?;
+    // Fold the block's writes into their trees first, so the root is computed
+    // on (and cached in) the state's own nodes rather than a throwaway copy,
+    // as `state_transition` does before it checks a block's state root.
+    post.apply_pending_mutations();
+    block.state_root = post.hash_tree_root();
+    Ok(block)
+}
+
+/// The body for `inputs`, voting the state's own `eth1_data` and carrying no
+/// deposits; see [`assemble_block`].
+fn full_body(state: &BeaconState, inputs: BlockInputs) -> Result<BeaconBlockBody> {
+    Ok(BeaconBlockBody {
         randao_reveal: inputs.randao_reveal,
         eth1_data: state.eth1_data().clone(),
         graffiti: inputs.graffiti,
@@ -554,8 +571,13 @@ pub fn assemble_block(
             .map_err(|_| Error::SpecAssert("len(blob_kzg_commitments) within bound"))?,
         execution_requests: inputs.execution_requests,
         ..BeaconBlockBody::empty()
-    };
-    let mut block = BeaconBlock {
+    })
+}
+
+/// `body` framed as the block for the slot `state` has been advanced to, its
+/// state root still zero.
+fn unsigned_block(state: &BeaconState, body: BeaconBlockBody) -> Result<BeaconBlock> {
+    Ok(BeaconBlock {
         slot: state.slot(),
         proposer_index: get_beacon_proposer_index(state)?,
         // `process_slots` filled the header's state root on the way out of
@@ -563,8 +585,19 @@ pub fn assemble_block(
         parent_root: state.latest_block_header().hash_tree_root(),
         state_root: Root::ZERO,
         body,
-    };
+    })
+}
 
+/// A copy of `state` with `block` applied by `process_block`, under an
+/// execution engine that accepts its payload. Pending mutations are left
+/// unapplied, so the caller can still edit the state before computing its
+/// root.
+fn post_state(
+    state: &BeaconState,
+    block: &BeaconBlock,
+    config: &Config,
+    options: stf::block::BlockProcessingOptions,
+) -> Result<BeaconState> {
     let signed = electra::SignedBeaconBlock {
         message: block.clone(),
         signature: BlsSignature::default(),
@@ -582,7 +615,7 @@ pub fn assemble_block(
         BeaconState::Gloas(_) => {
             return Err(Error::SpecAssert("block production does not support gloas"));
         }
-        BeaconState::Lean(_) => lean_state_unreachable("assemble_block"),
+        BeaconState::Lean(_) => lean_state_unreachable("post_state"),
     };
     let mut post = state.clone();
     stf::block::process_block(
@@ -594,12 +627,115 @@ pub fn assemble_block(
         &ActiveBalanceCache::default(),
         options,
     )?;
-    // Fold the block's writes into their trees first, so the root is computed
-    // on (and cached in) the state's own nodes rather than a throwaway copy,
-    // as `state_transition` does before it checks a block's state root.
+    Ok(post)
+}
+
+/// What a blinded block's body carries: [`BlockInputs`] with a builder's
+/// payload header, and the bid's blob commitments and execution requests, in
+/// place of a payload this node built.
+#[derive(Debug, Clone)]
+pub struct BlindedBlockInputs {
+    pub randao_reveal: BlsSignature,
+    pub graffiti: Bytes32,
+    pub attestations: Vec<Attestation>,
+    /// Slashings, exits and credential changes, as [`pack_operations`] returns
+    /// them.
+    pub operations: Operations,
+    pub execution_payload_header: ExecutionPayloadHeader,
+    pub blob_kzg_commitments: Vec<KzgCommitment>,
+    pub execution_requests: ExecutionRequests,
+    /// The block's sync aggregate: [`empty_sync_aggregate`], or what
+    /// [`verified_sync_aggregate`] vouched for.
+    pub sync_aggregate: SyncAggregate,
+}
+
+/// The unsigned blinded block for the slot `state` has been advanced to,
+/// around a builder's payload header, with its state root computed.
+///
+/// # A state root without the payload
+///
+/// The state transition takes full payloads only, so this runs it on a body
+/// whose payload is a *stand-in*, then patches the post-state fields that
+/// depend on the payload itself rather than on what `process_block` checks of
+/// it. Fulu's `process_block`, step by step:
+///
+/// | Step | Reads of the payload | With the stand-in |
+/// |---|---|---|
+/// | `process_block_header` | the body's root | wrong `body_root`: patched |
+/// | `process_withdrawals` | `payload.withdrawals == expected` | identical: every write uses the expected withdrawals |
+/// | `process_execution_payload` | parent hash, prev_randao, timestamp; then caches the header | checks run on the header's own values; wrong cached header: patched |
+/// | the execution engine | the whole payload, in the specification | a constant here, as for a local block: no one checks the builder's payload |
+/// | randao, eth1, operations, sync aggregate | none | identical |
+///
+/// Two things follow:
+/// - The stand-in copies the three checked fields **from the header**. Copied
+///   from the state, they would let any header through.
+/// - The stand-in carries the expected withdrawals, so the state transition's
+///   own withdrawals check passes trivially. That is why this function checks
+///   the header's `withdrawals_root` against them itself.
+///
+/// This is not bid validation. Beyond what the table checks, the header is
+/// trusted as given: the caller verifies everything else it needs from the bid
+/// (at least the response's fork version, the signature, the value, the gas
+/// limit and `blob_gas_used`) before building on it.
+///
+/// `options` is as in [`assemble_block`].
+///
+/// Fulu only. The table describes fulu's `process_block`, and fulu is the last
+/// fork with blinded blocks (gloas has none), so it cannot change under this
+/// function. `blinded_and_full_blocks_reach_the_same_state_root` is the guard.
+pub fn assemble_blinded_block(
+    state: &BeaconState,
+    inputs: BlindedBlockInputs,
+    config: &Config,
+    options: stf::block::BlockProcessingOptions,
+) -> Result<BlindedBeaconBlock> {
+    if !matches!(state, BeaconState::Fulu(_)) {
+        return Err(Error::SpecAssert("blinded block production is fulu only"));
+    }
+    let header = inputs.execution_payload_header;
+
+    let expected_withdrawals: capella::Withdrawals = stf::electra::get_expected_withdrawals(state)?
+        .0
+        .try_into()
+        .map_err(|_| {
+            Error::SpecAssert("len(expected_withdrawals) <= MAX_WITHDRAWALS_PER_PAYLOAD")
+        })?;
+    verify(
+        header.withdrawals_root == expected_withdrawals.hash_tree_root(),
+        "header.withdrawals_root == hash_tree_root(get_expected_withdrawals(state))",
+    )?;
+
+    let stand_in = ExecutionPayload {
+        parent_hash: header.parent_hash,
+        prev_randao: header.prev_randao,
+        timestamp: header.timestamp,
+        withdrawals: expected_withdrawals,
+        ..BeaconBlockBody::empty().execution_payload
+    };
+    let body = full_body(
+        state,
+        BlockInputs {
+            randao_reveal: inputs.randao_reveal,
+            graffiti: inputs.graffiti,
+            attestations: inputs.attestations,
+            operations: inputs.operations,
+            execution_payload: stand_in,
+            blob_kzg_commitments: inputs.blob_kzg_commitments,
+            execution_requests: inputs.execution_requests,
+            sync_aggregate: inputs.sync_aggregate,
+        },
+    )?;
+    let block = unsigned_block(state, body)?;
+    let mut post = post_state(state, &block, config, options)?;
+
+    let mut blinded = BlindedBeaconBlock::from_parts(block, header);
+    let fields = fulu_state(&mut post, "assemble_blinded_block")?;
+    fields.latest_execution_payload_header = blinded.body.execution_payload_header.clone();
+    fields.latest_block_header.body_root = blinded.body.hash_tree_root();
     post.apply_pending_mutations();
-    block.state_root = post.hash_tree_root();
-    Ok(block)
+    blinded.state_root = post.hash_tree_root();
+    Ok(blinded)
 }
 
 #[cfg(test)]
@@ -612,9 +748,11 @@ mod tests {
     use crate::beacon::helpers::misc::compute_signing_root;
     use crate::beacon::helpers::test_state::{sign_for, with_signing_validators_at};
     use crate::beacon::stf::block::{BlockProcessingOptions, RandaoVerification};
+    use ethlambda_types::beacon::containers::bellatrix::Transaction;
     use ethlambda_types::beacon::containers::shared::{
         AttestationData, BeaconBlockHeader, Checkpoint, SignedBeaconBlockHeader, VoluntaryExit,
     };
+    use ethlambda_types::beacon::primitives::{BlsPubkey, ExecutionAddress};
 
     /// A fulu state one epoch in, its lookahead and sync committee filled from
     /// its real registry (the builder leaves both as placeholders), advanced one
@@ -1260,6 +1398,204 @@ mod tests {
             aggregate.sync_committee_signature.0[1..]
                 .iter()
                 .all(|b| *b == 0)
+        );
+    }
+
+    /// [`payload_for`], with every field the stand-in payload does not copy
+    /// from the header set to something else, so a missed patch changes the
+    /// state root instead of passing unnoticed.
+    fn distinctive_payload_for(state: &BeaconState) -> ExecutionPayload {
+        let transaction: Transaction = vec![0xde, 0xad].try_into().unwrap();
+        ExecutionPayload {
+            fee_recipient: ExecutionAddress::repeat_byte(0x11),
+            state_root: Bytes32::repeat_byte(0x22),
+            block_number: 42,
+            gas_limit: 60_000_000,
+            gas_used: 21_000,
+            block_hash: ExecutionBlockHash::repeat_byte(0x33),
+            transactions: vec![transaction].try_into().unwrap(),
+            receipts_root: Bytes32::repeat_byte(0x44),
+            logs_bloom: vec![0x55; preset::BYTES_PER_LOGS_BLOOM].try_into().unwrap(),
+            extra_data: vec![0x66, 0x77].try_into().unwrap(),
+            base_fee_per_gas: 7.into(),
+            // Any distinct non-zero value; no gas-per-blob constant exists here.
+            blob_gas_used: 131_072,
+            excess_blob_gas: 262_144,
+            ..payload_for(state)
+        }
+    }
+
+    /// [`state_to_build_on`] with one validator due a partial withdrawal: ETH1
+    /// credentials and a balance above what it may keep.
+    fn state_with_a_withdrawal_due() -> BeaconState {
+        let mut state = state_to_build_on();
+        let validator = state.validator_mut(3).unwrap();
+        validator.withdrawal_credentials = {
+            let mut credentials = Bytes32::repeat_byte(0x12);
+            credentials.0[0] = constants::ETH1_ADDRESS_WITHDRAWAL_PREFIX;
+            credentials
+        };
+        validator.effective_balance = preset::MIN_ACTIVATION_BALANCE;
+        *state.balance_mut(3).unwrap() = preset::MIN_ACTIVATION_BALANCE + 1_000_000_000;
+        state.apply_pending_mutations();
+        state
+    }
+
+    fn full_inputs(state: &BeaconState) -> BlockInputs {
+        BlockInputs {
+            sync_aggregate: empty_sync_aggregate(),
+            randao_reveal: randao_reveal(state),
+            graffiti: Bytes32::repeat_byte(7),
+            attestations: Vec::new(),
+            operations: Operations::default(),
+            execution_payload: distinctive_payload_for(state),
+            blob_kzg_commitments: vec![KzgCommitment::default()],
+            execution_requests: ExecutionRequests {
+                deposits: vec![DepositRequest {
+                    pubkey: BlsPubkey([0x88; 48]),
+                    withdrawal_credentials: Bytes32::repeat_byte(0x99),
+                    amount: preset::MIN_ACTIVATION_BALANCE,
+                    signature: BlsSignature::default(),
+                    index: 0,
+                }]
+                .try_into()
+                .unwrap(),
+                ..ExecutionRequests::default()
+            },
+        }
+    }
+
+    /// `inputs` as a builder would offer them: the payload's header instead
+    /// of the payload.
+    fn blinded(inputs: &BlockInputs) -> BlindedBlockInputs {
+        BlindedBlockInputs {
+            randao_reveal: inputs.randao_reveal,
+            graffiti: inputs.graffiti,
+            attestations: inputs.attestations.clone(),
+            operations: inputs.operations.clone(),
+            execution_payload_header: ExecutionPayloadHeader::from(&inputs.execution_payload),
+            blob_kzg_commitments: inputs.blob_kzg_commitments.clone(),
+            execution_requests: inputs.execution_requests.clone(),
+            sync_aggregate: inputs.sync_aggregate.clone(),
+        }
+    }
+
+    /// The guard for [`assemble_blinded_block`]'s two patches: around the same
+    /// payload, the blinded block lands on the full block's state root and
+    /// has its block root, so a signature over one is a signature over the
+    /// other.
+    #[test]
+    fn blinded_and_full_blocks_reach_the_same_state_root() {
+        let state = state_with_a_withdrawal_due();
+        assert!(
+            !stf::electra::get_expected_withdrawals(&state)
+                .unwrap()
+                .0
+                .is_empty(),
+            "the guard needs a withdrawal due"
+        );
+        let inputs = full_inputs(&state);
+        let blinded_inputs = blinded(&inputs);
+        let config = Config::mainnet();
+
+        let full =
+            assemble_block(&state, inputs, &config, BlockProcessingOptions::default()).unwrap();
+        let blinded = assemble_blinded_block(
+            &state,
+            blinded_inputs,
+            &config,
+            BlockProcessingOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(blinded.state_root, full.state_root);
+        assert_eq!(blinded.hash_tree_root(), full.hash_tree_root());
+        assert_eq!(blinded, BlindedBeaconBlock::from(full));
+    }
+
+    /// The specification condition a refused blinded block failed.
+    fn refusal(state: &BeaconState, inputs: BlindedBlockInputs) -> &'static str {
+        match assemble_blinded_block(
+            state,
+            inputs,
+            &Config::mainnet(),
+            BlockProcessingOptions::default(),
+        ) {
+            Err(Error::SpecAssert(what)) => what,
+            other => panic!("expected a SpecAssert refusal, got {other:?}"),
+        }
+    }
+
+    fn blinded_inputs_for(state: &BeaconState) -> BlindedBlockInputs {
+        blinded(&full_inputs(state))
+    }
+
+    #[test]
+    fn a_header_with_the_wrong_withdrawals_root_is_refused() {
+        let state = state_to_build_on();
+        let mut inputs = blinded_inputs_for(&state);
+        inputs.execution_payload_header.withdrawals_root = Root::repeat_byte(0xee);
+        assert_eq!(
+            refusal(&state, inputs),
+            "header.withdrawals_root == hash_tree_root(get_expected_withdrawals(state))"
+        );
+    }
+
+    #[test]
+    fn a_header_on_the_wrong_parent_is_refused() {
+        let state = state_to_build_on();
+        let mut inputs = blinded_inputs_for(&state);
+        inputs.execution_payload_header.parent_hash = ExecutionBlockHash::repeat_byte(0xee);
+        assert_eq!(
+            refusal(&state, inputs),
+            "payload.parent_hash == state.latest_execution_payload_header.block_hash"
+        );
+    }
+
+    #[test]
+    fn a_header_with_the_wrong_prev_randao_is_refused() {
+        let state = state_to_build_on();
+        let mut inputs = blinded_inputs_for(&state);
+        inputs.execution_payload_header.prev_randao = Bytes32::repeat_byte(0xee);
+        assert_eq!(
+            refusal(&state, inputs),
+            "payload.prev_randao == get_randao_mix(state, get_current_epoch(state))"
+        );
+    }
+
+    #[test]
+    fn a_header_with_the_wrong_timestamp_is_refused() {
+        let state = state_to_build_on();
+        let mut inputs = blinded_inputs_for(&state);
+        inputs.execution_payload_header.timestamp += 1;
+        assert_eq!(
+            refusal(&state, inputs),
+            "payload.timestamp == compute_time_at_slot(state, state.slot)"
+        );
+    }
+
+    #[test]
+    fn a_bid_over_the_blob_limit_is_refused() {
+        let state = state_to_build_on();
+        let limit = Config::mainnet().max_blobs_per_block(get_current_epoch(&state));
+        let mut inputs = blinded_inputs_for(&state);
+        inputs.blob_kzg_commitments = vec![KzgCommitment::default(); limit as usize + 1];
+        assert_eq!(
+            refusal(&state, inputs),
+            "len(body.blob_kzg_commitments) <= get_blob_parameters(get_current_epoch(state)).max_blobs_per_block"
+        );
+    }
+
+    #[test]
+    fn a_state_before_fulu_is_refused() {
+        // Only the fork gate runs: it comes before anything reads the inputs,
+        // so building them from a fulu state does not matter, and no electra
+        // state transition is exercised.
+        let inputs = blinded_inputs_for(&state_to_build_on());
+        let electra = with_signing_validators_at(ForkName::Electra, 64);
+        assert_eq!(
+            refusal(&electra, inputs),
+            "blinded block production is fulu only"
         );
     }
 }
