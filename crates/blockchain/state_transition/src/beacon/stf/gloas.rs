@@ -101,6 +101,8 @@ pub struct Operations<'a> {
     pub voluntary_exits: &'a gloas::VoluntaryExits,
     pub bls_to_execution_changes: &'a gloas::BlsToExecutionChanges,
     pub payload_attestations: &'a gloas::PayloadAttestations,
+    /// `None` at gloas, whose body has no post-quantum key registrations (EIP-8450).
+    pub pq_key_registrations: Option<&'a heze::PQKeyRegistrations>,
 }
 
 /// What `process_block` reads of a gloas-family block, borrowed, so gloas's and
@@ -166,6 +168,7 @@ impl<'a> From<&'a gloas::BeaconBlockBody> for Operations<'a> {
             voluntary_exits: &body.voluntary_exits,
             bls_to_execution_changes: &body.bls_to_execution_changes,
             payload_attestations: &body.payload_attestations,
+            pq_key_registrations: None,
         }
     }
 }
@@ -180,6 +183,7 @@ impl<'a> From<&'a heze::BeaconBlockBody> for Operations<'a> {
             voluntary_exits: &body.voluntary_exits,
             bls_to_execution_changes: &body.bls_to_execution_changes,
             payload_attestations: &body.payload_attestations,
+            pq_key_registrations: Some(&body.pq_key_registrations),
         }
     }
 }
@@ -1721,6 +1725,13 @@ pub fn process_operations<'a>(
         body.payload_attestations.len() as u64 <= preset::MAX_PAYLOAD_ATTESTATIONS,
         "process_operations: len(body.payload_attestations) <= MAX_PAYLOAD_ATTESTATIONS",
     )?;
+    // [New in EIP-8450]
+    verify(
+        body.pq_key_registrations.is_none_or(|registrations| {
+            registrations.len() as u64 <= preset::MAX_PQ_KEY_REGISTRATIONS
+        }),
+        "process_operations: len(body.pq_key_registrations) <= MAX_PQ_KEY_REGISTRATIONS",
+    )?;
 
     // [Modified in Gloas:EIP7732]
     for proposer_slashing in body.proposer_slashings.iter() {
@@ -1744,6 +1755,10 @@ pub fn process_operations<'a>(
     // [New in Gloas:EIP7732]
     for payload_attestation in body.payload_attestations.iter() {
         process_payload_attestation(state, payload_attestation, config)?;
+    }
+    // [New in EIP-8450] Last, so a registrant exiting earlier in the block is refused.
+    for registration in body.pq_key_registrations.into_iter().flatten() {
+        crate::beacon::stf::heze::process_pq_key_registration(state, registration, config)?;
     }
 
     Ok(())

@@ -193,7 +193,7 @@ pub fn trials() -> Vec<Trial> {
         let config = Arc::clone(&config);
         trials.push(super::case_trial("transition", case, move |case| {
             let meta: Meta = case.yaml("meta");
-            let post_fork = ForkName::parse(&meta.post_fork).unwrap_or_else(|| {
+            let post_fork = super::fixture_fork(&meta.post_fork).unwrap_or_else(|| {
                 panic!(
                     "{}: meta.yaml's post_fork ({}) is not a fork this crate recognizes",
                     case.id(),

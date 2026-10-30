@@ -863,8 +863,13 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   (every fork's cases for topics it has no validator for, cases from forks a
   validated topic's rules do not cover per `validated_forks`, gloas's
   operation vectors among them, and the vectors in `SKIPPED`, which assume a
-  bad-block cache). `UNMODELED_FORKS` is empty: every fork directory at the
-  pinned release parses, `heze` included, and
+  bad-block cache). `UNMODELED_FORKS` is `["heze"]`: the release's heze has no
+  EIP-8450 registry, so its containers are not this crate's heze. Heze's cases
+  come from the `eip8450` directory instead (`fixture_fork` maps it to
+  `ForkName::Heze`), which no release ships yet: `make eip8450-spec-tests`
+  generates it from consensus-specs#5782's pyspec, pinned by commit. Without it
+  the run reports `fixture_forks/missing/eip8450` as ignored. Its `fork` and
+  `transition` cases start from the registryless heze and are ignored.
   `fixture_forks/every_directory_is_accounted_for` fails on any fork directory
   that is neither parseable nor listed, so a new fork forces a decision.
 - **Heze** (EIP-7805 FOCIL, EIP-8015) is gloas plus inclusion lists, without the
@@ -900,6 +905,23 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   `PayloadAttributesV5` and the self-build bid's bits, the Beacon API's IL
   duties/produce/publish endpoints, and the validator client's IL duty. See
   `docs/spec_deviations.md`.
+- **EIP-8450** (post-quantum key registry) is part of heze here, where
+  consensus-specs builds it as the `eip8450` feature on top of heze. Heze's
+  body appends `pq_key_registrations` and its state four lists parallel to the
+  validator and builder registries (`post_quantum_key_material`,
+  `post_quantum_key_change_epochs` and their builder twins), read through
+  `BeaconState::pq_registry()` (`None` before heze), so gloas-family code asks
+  the state, not the fork, whether there is a registry to update. The gloas
+  upgrade into heze fills them. `stf::heze::process_pq_key_registration` runs
+  last in `process_operations` (`Operations::pq_key_registrations` is `None` at
+  gloas); proofs of possession verify through `ethlambda_crypto::lean_xmss`, the
+  `lean-pq` bindings (leanXMSS over Keccak-256, not the lean chain's XMSS).
+  Registrations travel as `BeaconOperation::PqKeyRegistration` on the
+  `pq_key_registration` topic (heze digests only), validated by
+  `gossip::pq_key_registration` on a heze head, pooled per (index, change
+  epoch), packed by gloas-family production when they apply after the other
+  operations, and submitted through `/eth/v1/beacon/pool/pq_key_registrations`
+  (not yet a Beacon API route).
 - A fixture case with no `post` state asserts the input must be **rejected**. That
   rule lives in `check_transition`; do not add a runner that ignores it.
 
@@ -1012,8 +1034,9 @@ behavior.
   in-memory map stays as a write-through cache in front of the table. Pruned
   on finalization to the same horizon as `LiveChain` (the finalized block's
   own slot, keeping that block's own entry).
-- `DB_VERSION` is 7: heze's own state and block containers (EIP-8015) mean a heze
-  row written by version 6 no longer decodes. (6 was the unrealized-justifications table: a directory
+- `DB_VERSION` is 8: EIP-8450 appended its registry to heze's state and block
+  body, so a heze row written by version 7 no longer decodes. (7 was heze's own
+  state and block containers, EIP-8015; 6 was the unrealized-justifications table: a directory
   written by an earlier version has no row there for any block it already
   imported, which would otherwise look identical to "no unrealized
   justification computed yet" rather than "this directory predates the

@@ -62,6 +62,8 @@ use std::path::{Path, PathBuf};
 use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::config::Config;
 use ethlambda_state_transition::beacon::containers::BeaconState;
+use ethlambda_state_transition::beacon::primitives::{Epoch, Version};
+use ethlambda_types::beacon::serde_helpers::hex_array;
 use libssz::SszDecode;
 use libtest_mimic::{Failed, Trial};
 use serde::de::DeserializeOwned;
@@ -125,7 +127,34 @@ pub fn case_config(case: &Case) -> Config {
         .yaml_opt("config")
         .unwrap_or_else(|| fork_active_from_genesis(case));
     config.seconds_per_slot = config.slot_duration_ms / 1000;
+    // An `eip8450` case signs under that feature fork's own version, which this crate's heze plays.
+    if let Some(schedule) = case.yaml_opt::<Eip8450Schedule>("config")
+        && let (Some(version), Some(epoch)) = (schedule.version, schedule.epoch)
+    {
+        config.heze_fork_version = version;
+        config.heze_fork_epoch = epoch;
+    }
     config
+}
+
+/// The schedule of the specification's `eip8450` feature fork, when a case's config names it.
+#[derive(serde::Deserialize)]
+struct Eip8450Schedule {
+    #[serde(
+        rename = "EIP8450_FORK_VERSION",
+        default,
+        deserialize_with = "hex_version"
+    )]
+    version: Option<Version>,
+    #[serde(rename = "EIP8450_FORK_EPOCH", default)]
+    epoch: Option<Epoch>,
+}
+
+/// A fork version written as `0x` and eight hex digits.
+fn hex_version<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Version>, D::Error> {
+    hex_array::deserialize(deserializer).map(Some)
 }
 
 /// The newest fork whose state transition this crate implements.
@@ -300,7 +329,20 @@ impl Case {
     /// case ignored rather than running it, so a fixture release this crate has
     /// only partially caught up with is never misreported as fully covered.
     pub fn in_scope(&self) -> bool {
-        self.fork <= HIGHEST_IMPLEMENTED_FORK
+        self.fork <= HIGHEST_IMPLEMENTED_FORK && !self.starts_from_registryless_heze()
+    }
+
+    /// Whether the case starts from the specification's heze without the key registry.
+    ///
+    /// The `eip8450` directory's fork and transition cases upgrade from that heze, a shape this
+    /// crate no longer has: its heze carries the registry from the gloas upgrade on.
+    fn starts_from_registryless_heze(&self) -> bool {
+        let runner = |name: &str| {
+            self.path
+                .components()
+                .any(|component| component.as_os_str() == name)
+        };
+        runner(EIP8450_FIXTURE_FORK) && (runner("fork") || runner("transition"))
     }
 }
 
@@ -320,7 +362,7 @@ fn collect_in(root: &Path, config: &str, runner: &str, handler: &str) -> Vec<Cas
     let mut cases = Vec::new();
 
     for fork_entry in read_dir_sorted(&root) {
-        let Some(fork) = fork_entry.file_name().to_str().and_then(ForkName::parse) else {
+        let Some(fork) = fork_entry.file_name().to_str().and_then(fixture_fork) else {
             continue;
         };
 
@@ -340,7 +382,7 @@ pub fn collect_all_handlers(config: &str, runner: &str) -> Vec<(String, Case)> {
     let mut out = Vec::new();
 
     for fork_entry in read_dir_sorted(&root) {
-        let Some(fork) = fork_entry.file_name().to_str().and_then(ForkName::parse) else {
+        let Some(fork) = fork_entry.file_name().to_str().and_then(fixture_fork) else {
             continue;
         };
         let runner_dir = fork_entry.path().join(runner);
@@ -396,13 +438,34 @@ fn read_dir_sorted(path: &Path) -> Vec<fs::DirEntry> {
     entries
 }
 
+/// The fixture directory of the specification's EIP-8450 feature fork.
+pub const EIP8450_FIXTURE_FORK: &str = "eip8450";
+
+/// The fork a fixture directory's cases run as, or none for a directory this crate does not model.
+///
+/// This crate's heze includes EIP-8450's post-quantum key registry.
+/// The specification builds that registry as a feature on top of its heze, the `eip8450` fork.
+/// So `eip8450` cases run as heze, and the registryless `heze` directory is not modeled.
+pub fn fixture_fork(name: &str) -> Option<ForkName> {
+    match name {
+        EIP8450_FIXTURE_FORK => Some(ForkName::Heze),
+        "heze" => None,
+        other => ForkName::parse(other),
+    }
+}
+
+/// Whether the fixture tree holds the `eip8450` directory, the only source of heze cases.
+pub fn eip8450_vectors_present() -> bool {
+    fixture_root()
+        .join(PRESET)
+        .join(EIP8450_FIXTURE_FORK)
+        .is_dir()
+}
+
 /// Fixture fork directories this crate deliberately does not model.
 ///
-/// Empty at `v1.7.0-beta.2`: `heze` moved out once [`ForkName`] gained that
-/// variant, the way `gloas` did before it, so every fork directory the
-/// release ships under either preset tree now parses. No in-flight-EIP
-/// directory (`eipNNNN`) remains either, unlike at `v1.6.1`, where `eip7805`
-/// was one.
+/// `heze` is one: its containers lack EIP-8450's registry, which this crate's heze carries.
+/// The `eip8450` directory, the same heze with the registry, runs in its place.
 ///
 /// Naming one here is not bookkeeping for its own sake. A directory [`ForkName::parse`]
 /// does not recognize is how [`collect`] skips a fork, and that skip is *silent*
@@ -412,7 +475,7 @@ fn read_dir_sorted(path: &Path) -> Vec<fs::DirEntry> {
 /// matching fails rather than reporting green, and an unparsed fork slips past
 /// [`HIGHEST_IMPLEMENTED_FORK`] entirely because the gate never sees the case.
 /// So [`fixture_fork_trials`] checks this list against the tree instead.
-pub const UNMODELED_FORKS: &[&str] = &[];
+pub const UNMODELED_FORKS: &[&str] = &["heze"];
 
 /// Panics: a fixture case cannot be a lean case.
 ///
@@ -458,7 +521,7 @@ pub fn fixture_fork_trials() -> Vec<Trial> {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            if ForkName::parse(&name).is_some() {
+            if fixture_fork(&name).is_some() {
                 continue;
             }
             if UNMODELED_FORKS.contains(&name.as_str()) {
@@ -476,6 +539,17 @@ pub fn fixture_fork_trials() -> Vec<Trial> {
                 .with_ignored_flag(true)
         })
         .collect();
+    // No release ships the EIP-8450 vectors yet; `make eip8450-spec-tests` generates them.
+    // Their absence is reported here, so heze's missing coverage shows in the output.
+    if !eip8450_vectors_present() {
+        trials.push(
+            Trial::test(
+                format!("fixture_forks/missing/{EIP8450_FIXTURE_FORK}"),
+                || Ok(()),
+            )
+            .with_ignored_flag(true),
+        );
+    }
 
     trials.push(Trial::test(
         "fixture_forks/every_directory_is_accounted_for",

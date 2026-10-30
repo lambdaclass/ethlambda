@@ -48,6 +48,7 @@ pub mod fulu;
 pub mod gloas;
 pub mod heze;
 pub mod phase0;
+pub mod pq_registry;
 pub mod shared;
 
 pub use shared::*;
@@ -2150,6 +2151,15 @@ impl<'a> GloasBlockRef<'a> {
         match self {
             GloasBlockRef::Gloas(block) => block.body.deposits.len(),
             GloasBlockRef::Heze(_) => 0,
+        }
+    }
+
+    /// The post-quantum key registrations the body carries: none at gloas,
+    /// which predates them (EIP-8450).
+    pub fn pq_key_registrations(&self) -> &'a [heze::SignedPQKeyRegistration] {
+        match self {
+            GloasBlockRef::Gloas(_) => &[],
+            GloasBlockRef::Heze(block) => &block.body.pq_key_registrations,
         }
     }
 }

@@ -504,6 +504,12 @@ pub fn trials() -> Vec<Trial> {
                 "InclusionList" => check::<heze::InclusionList>(case),
                 "SignedInclusionList" => check::<heze::SignedInclusionList>(case),
 
+                // EIP-8450's key registry, part of heze here.
+                "PQKeyMaterial" => check::<heze::PQKeyMaterial>(case),
+                "PQKeyRegistration" => check::<heze::PQKeyRegistration>(case),
+                "PQKeyPossession" => check::<heze::PQKeyPossession>(case),
+                "SignedPQKeyRegistration" => check::<heze::SignedPQKeyRegistration>(case),
+
                 // No arm matched, so this crate has no container for this
                 // handler/fork pair, and this is not `LightClient*` (that
                 // prefix is filtered out above before this trial is even

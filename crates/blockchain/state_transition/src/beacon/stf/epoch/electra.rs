@@ -698,7 +698,12 @@ fn add_validator_from_pending_deposit(
 
     state.push_validator(validator, amount)?;
     pending_queue_fields(state, "add_validator_from_pending_deposit")?
-        .push_empty_participation_and_inactivity()
+        .push_empty_participation_and_inactivity()?;
+    // [New in EIP-8450] The new validator starts without post-quantum keys.
+    if let Some(mut registry) = state.pq_registry_mut() {
+        registry.push_validator();
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

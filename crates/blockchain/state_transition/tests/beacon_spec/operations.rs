@@ -140,6 +140,7 @@ use ethlambda_state_transition::beacon::stf::deneb as deneb_stf;
 use ethlambda_state_transition::beacon::stf::electra as electra_stf;
 use ethlambda_state_transition::beacon::stf::fulu as fulu_stf;
 use ethlambda_state_transition::beacon::stf::gloas as gloas_stf;
+use ethlambda_state_transition::beacon::stf::heze as heze_stf;
 use ethlambda_state_transition::beacon::stf::{ExecutionEngine, block, operations};
 use libtest_mimic::{Failed, Trial};
 
@@ -655,6 +656,11 @@ fn apply(
             let request: gloas::BuilderExitRequest = case.ssz("builder_exit_request");
             gloas_stf::process_builder_exit_request(state, &request, config)
         }
+        // New in EIP-8450, part of heze here: a post-quantum key registration.
+        "pq_key_registration" => {
+            let registration: heze::SignedPQKeyRegistration = case.ssz("pq_key_registration");
+            heze_stf::process_pq_key_registration(state, &registration, config)
+        }
         // New in gloas (EIP-7732): the payload timeliness committee's vote on
         // whether the *previous* slot's payload showed up on time.
         "payload_attestation" => {
@@ -715,6 +721,7 @@ fn every_shipped_handler_is_dispatched() -> Result<(), Failed> {
         "execution_payload_bid",
         "parent_execution_payload",
         "payload_attestation",
+        "pq_key_registration",
         "proposer_slashing",
         "sync_aggregate",
         "voluntary_exit",

@@ -2758,8 +2758,13 @@ pub fn seconds_to_milliseconds(seconds: u64) -> u64 {
 
 /// The duration, in milliseconds, that `basis_points` out of
 /// [`constants::BASIS_POINTS`] of a slot spans.
+///
+/// Rounded to the nearest millisecond, half up (consensus-specs #5756).
 pub fn get_slot_component_duration_ms(basis_points: u64, config: &Config) -> u64 {
-    basis_points.saturating_mul(config.slot_duration_ms) / constants::BASIS_POINTS
+    basis_points
+        .saturating_mul(config.slot_duration_ms)
+        .saturating_add(constants::BASIS_POINTS / 2)
+        / constants::BASIS_POINTS
 }
 
 /// How far into a slot, in milliseconds, an attestation is due.
@@ -4391,7 +4396,15 @@ pub fn verify_data_column_sidecar_inclusion_proof(sidecar: &fulu::DataColumnSide
 /// required columns have been sampled" must reject the block itself rather
 /// than relying on this to do it, since nothing about an empty list is
 /// distinguishable here from "this block needed no sampling at all".
-pub fn is_data_available_columns(evidence: &DataAvailability, config: &Config) -> Result<bool> {
+///
+/// Each sidecar must also belong to the block.
+/// Its header must hash to the block root, and its inclusion proof must tie its commitments to that header.
+/// Without these, sidecars built from unrelated blobs under another header would pass (consensus-specs #5765).
+pub fn is_data_available_columns(
+    beacon_block_root: Root,
+    evidence: &DataAvailability,
+    config: &Config,
+) -> Result<bool> {
     let sidecars = match evidence {
         DataAvailability::Columns(sidecars) => sidecars,
         DataAvailability::NotRequired => return Ok(true),
@@ -4402,7 +4415,9 @@ pub fn is_data_available_columns(evidence: &DataAvailability, config: &Config) -
         }
     };
     for sidecar in sidecars {
-        if !(verify_data_column_sidecar(sidecar, config)
+        if !(sidecar.signed_block_header.message.hash_tree_root() == beacon_block_root
+            && verify_data_column_sidecar(sidecar, config)
+            && verify_data_column_sidecar_inclusion_proof(sidecar)
             && verify_data_column_sidecar_kzg_proofs(sidecar)?)
         {
             return Ok(false);
@@ -5086,7 +5101,7 @@ pub fn on_block(
         }
         SignedBeaconBlock::Fulu(_) => {
             verify(
-                is_data_available_columns(blob_evidence, config)?,
+                is_data_available_columns(block_root, blob_evidence, config)?,
                 "is_data_available(hash_tree_root(block))",
             )?;
             None
@@ -5831,6 +5846,23 @@ pub(crate) mod tests {
     /// Tests populate only what the function under test actually reads.
     pub(crate) fn empty_store() -> Store {
         store_anchored_at(Root::ZERO)
+    }
+
+    #[test]
+    fn slot_component_durations_round_to_the_nearest_millisecond() {
+        let mut config = Config::mainnet();
+        config.slot_duration_ms = 12_000;
+        // 3333 basis points of 12 s is 3999.6 ms, and 1667 is 2000.4 ms.
+        assert_eq!(get_slot_component_duration_ms(3_333, &config), 4_000);
+        assert_eq!(get_slot_component_duration_ms(6_667, &config), 8_000);
+        assert_eq!(get_slot_component_duration_ms(1_667, &config), 2_000);
+        // At 6 s slots, 3333 basis points is 1999.8 ms.
+        config.slot_duration_ms = 6_000;
+        assert_eq!(get_slot_component_duration_ms(3_333, &config), 2_000);
+        // An exact half millisecond rounds up.
+        config.slot_duration_ms = 1;
+        assert_eq!(get_slot_component_duration_ms(5_000, &config), 1);
+        assert_eq!(get_slot_component_duration_ms(4_999, &config), 0);
     }
 
     #[test]
@@ -9574,6 +9606,7 @@ pub(crate) mod tests {
         let config = Config::active();
         assert!(
             is_data_available_columns(
+                Root::ZERO,
                 &DataAvailability::Blobs {
                     blobs: Vec::new(),
                     proofs: Vec::new(),
