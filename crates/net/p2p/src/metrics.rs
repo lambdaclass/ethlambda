@@ -450,6 +450,10 @@ pub fn init() {
     for &reason in DATA_COLUMN_REJECT_REASONS {
         LEAN_DATA_COLUMNS_REJECTED_TOTAL.with_label_values(&[reason]);
     }
+    for &pool in VALIDATION_POOLS {
+        LEAN_BEACON_VALIDATION_PERMITS_IN_USE.with_label_values(&[pool]);
+        LEAN_BEACON_VALIDATION_PERMIT_EXHAUSTED_TOTAL.with_label_values(&[pool]);
+    }
 }
 
 /// Count one beacon gossip verdict and how long it took from arrival.
@@ -465,6 +469,151 @@ pub fn observe_beacon_gossip_verdict(
     LEAN_BEACON_GOSSIP_VALIDATION_SECONDS
         .with_label_values(&[kind])
         .observe(elapsed.as_secs_f64());
+}
+
+/// Labels of the permit pools that bound blocking-thread validation work.
+/// `column_check` is [`P2PServer::column_check_permits`](crate::P2PServer),
+/// shared by the fetched-column and fetched-envelope checks; the rest are the
+/// four gossip pools.
+pub(crate) const VALIDATION_POOLS: &[&str] =
+    &["gossip", "attestation", "builder", "sync", "column_check"];
+
+static LEAN_BEACON_VALIDATION_PERMITS_IN_USE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "lean_beacon_validation_permits_in_use",
+        "Permits held right now, per validation permit pool (one per blocking task queued or running)",
+        &["pool"]
+    )
+    .unwrap()
+});
+
+static LEAN_BEACON_VALIDATION_PERMIT_EXHAUSTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(
+    || {
+        register_int_counter_vec!(
+            "lean_beacon_validation_permit_exhausted_total",
+            "Gossip objects reported Ignore(Overloaded) because their permit pool had no free permit",
+            &["pool"]
+        )
+        .unwrap()
+    },
+);
+
+/// Buckets for blocking-pool queue delay and closure run time: from a
+/// scheduler hop to a verdict that has eaten a whole gossip deadline.
+const VALIDATION_TASK_BUCKETS: &[f64] = &[
+    0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0,
+];
+
+static LEAN_BEACON_VALIDATION_QUEUE_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "lean_beacon_validation_queue_seconds",
+        "Time from spawn_blocking being called for a validation task to its closure starting",
+        &["kind"],
+        VALIDATION_TASK_BUCKETS.to_vec()
+    )
+    .unwrap()
+});
+
+static LEAN_BEACON_VALIDATION_RUN_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "lean_beacon_validation_run_seconds",
+        "Run time of a validation task's blocking closure",
+        &["kind"],
+        VALIDATION_TASK_BUCKETS.to_vec()
+    )
+    .unwrap()
+});
+
+static LEAN_BEACON_COLUMN_CHECK_PERMIT_WAIT_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "lean_beacon_column_check_permit_wait_seconds",
+        "Time a fetched sidecar or envelope waited for a column_check permit",
+        &["kind"],
+        VALIDATION_TASK_BUCKETS.to_vec()
+    )
+    .unwrap()
+});
+
+/// A held permit of the pool `pool`, counted in
+/// `lean_beacon_validation_permits_in_use` for as long as the guard lives.
+/// Move it into the blocking closure next to the permit itself, so the gauge
+/// falls when the permit is released (including on a panic's unwind).
+pub(crate) struct PoolInUse(&'static str);
+
+impl PoolInUse {
+    pub(crate) fn new(pool: &'static str) -> Self {
+        LEAN_BEACON_VALIDATION_PERMITS_IN_USE
+            .with_label_values(&[pool])
+            .inc();
+        Self(pool)
+    }
+}
+
+impl Drop for PoolInUse {
+    fn drop(&mut self) {
+        LEAN_BEACON_VALIDATION_PERMITS_IN_USE
+            .with_label_values(&[self.0])
+            .dec();
+    }
+}
+
+/// Count one object refused for want of a permit in `pool`.
+pub(crate) fn inc_validation_permit_exhausted(pool: &str) {
+    LEAN_BEACON_VALIDATION_PERMIT_EXHAUSTED_TOTAL
+        .with_label_values(&[pool])
+        .inc();
+}
+
+/// Record how long a fetched sidecar or envelope (`kind`) awaited a
+/// `column_check` permit.
+pub(crate) fn observe_column_check_permit_wait(kind: &str, waited: std::time::Duration) {
+    LEAN_BEACON_COLUMN_CHECK_PERMIT_WAIT_SECONDS
+        .with_label_values(&[kind])
+        .observe(waited.as_secs_f64());
+}
+
+/// Times one `spawn_blocking` validation task. Create it immediately before
+/// the `spawn_blocking` call, move it into the closure and call
+/// [`Self::start`] first thing there: the gap is the tokio blocking pool's
+/// queueing, and the returned guard observes the closure's run time when it
+/// drops, a panic's unwind included.
+pub(crate) struct BlockingTask {
+    kind: &'static str,
+    spawned_at: std::time::Instant,
+}
+
+impl BlockingTask {
+    pub(crate) fn new(kind: &'static str) -> Self {
+        Self {
+            kind,
+            spawned_at: std::time::Instant::now(),
+        }
+    }
+
+    pub(crate) fn start(self) -> BlockingRun {
+        let started_at = std::time::Instant::now();
+        LEAN_BEACON_VALIDATION_QUEUE_SECONDS
+            .with_label_values(&[self.kind])
+            .observe(started_at.duration_since(self.spawned_at).as_secs_f64());
+        BlockingRun {
+            kind: self.kind,
+            started_at,
+        }
+    }
+}
+
+/// Observes a blocking validation closure's run time on drop.
+pub(crate) struct BlockingRun {
+    kind: &'static str,
+    started_at: std::time::Instant,
+}
+
+impl Drop for BlockingRun {
+    fn drop(&mut self) {
+        LEAN_BEACON_VALIDATION_RUN_SECONDS
+            .with_label_values(&[self.kind])
+            .observe(self.started_at.elapsed().as_secs_f64());
+    }
 }
 
 /// Count one verdict gossipsub could no longer act on.
@@ -697,5 +846,42 @@ mod tests {
         set_only_label(&gauge, "bbbbbbbb");
         assert_eq!(gauge.with_label_values(&["bbbbbbbb"]).get(), 1);
         assert_eq!(gauge.with_label_values(&["aaaaaaaa"]).get(), 0);
+    }
+
+    #[test]
+    fn a_held_permit_is_counted_until_its_guard_drops() {
+        // A pool label no real pool uses, so parallel tests cannot move it.
+        let gauge = || {
+            LEAN_BEACON_VALIDATION_PERMITS_IN_USE
+                .with_label_values(&["test_pool"])
+                .get()
+        };
+        let first = PoolInUse::new("test_pool");
+        let second = PoolInUse::new("test_pool");
+        assert_eq!(gauge(), 2);
+        drop(first);
+        assert_eq!(gauge(), 1);
+        drop(second);
+        assert_eq!(gauge(), 0);
+    }
+
+    #[test]
+    fn a_blocking_task_observes_queue_delay_and_run_time_once() {
+        let queue = || {
+            LEAN_BEACON_VALIDATION_QUEUE_SECONDS
+                .with_label_values(&["test_kind"])
+                .get_sample_count()
+        };
+        let run = || {
+            LEAN_BEACON_VALIDATION_RUN_SECONDS
+                .with_label_values(&["test_kind"])
+                .get_sample_count()
+        };
+        let task = BlockingTask::new("test_kind");
+        assert_eq!((queue(), run()), (0, 0));
+        let running = task.start();
+        assert_eq!((queue(), run()), (1, 0));
+        drop(running);
+        assert_eq!((queue(), run()), (1, 1));
     }
 }

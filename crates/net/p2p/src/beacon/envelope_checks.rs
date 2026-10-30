@@ -32,7 +32,7 @@ use ethlambda_storage::Store;
 use ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope;
 use tracing::{debug, error, warn};
 
-use crate::P2PServer;
+use crate::{P2PServer, metrics};
 
 /// Whether a fetched envelope goes to the chain actor.
 pub(crate) fn forwards(outcome: &Outcome) -> bool {
@@ -103,15 +103,21 @@ pub(crate) fn check_and_forward_then(
         for envelope in envelopes {
             // The semaphore is never closed, so this only returns once a
             // permit is free.
+            let waiting_since = std::time::Instant::now();
             let Ok(permit) = permits.clone().acquire_owned().await else {
                 if let Some(done) = done {
                     done();
                 }
                 return;
             };
+            metrics::observe_column_check_permit_wait("envelope_check", waiting_since.elapsed());
+            let in_use = metrics::PoolInUse::new("column_check");
+            let task = metrics::BlockingTask::new("envelope_check");
             let store = store.clone();
             checks.push(tokio::task::spawn_blocking(move || {
                 let _permit = permit;
+                let _in_use = in_use;
+                let _run = task.start();
                 let outcome = judge(&store, &envelope);
                 (envelope, outcome)
             }));

@@ -235,6 +235,7 @@ impl BlockChainServer {
         let actor = ctx.actor_ref();
         let committee_cache = self.store.committee_cache();
         tokio::task::spawn_blocking(move || {
+            let _running = crate::metrics::EpochPrecomputeRunning::start();
             let result = {
                 let _timing = stf_metrics::time_epoch_precompute();
                 fork_choice::advance_to_epoch_start(&head_state, key.epoch, &config)
