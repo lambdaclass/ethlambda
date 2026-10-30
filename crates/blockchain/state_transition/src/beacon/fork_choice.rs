@@ -4829,6 +4829,119 @@ pub fn on_block(
     payload_validity: &PayloadValidity,
     committees: &CommitteeCache,
 ) -> Result<()> {
+    on_block_speculative(
+        store,
+        signed_block,
+        config,
+        blob_evidence,
+        payload_validity,
+        committees,
+        None,
+    )
+}
+
+/// The state transition of one block, computed before the execution client's
+/// verdict on its payload is known.
+///
+/// Opaque on purpose: the only thing a holder can do with one is hand it to
+/// [`on_block_speculative`], which decides whether it may stand in for the
+/// transition `on_block` would otherwise run. Until then it is a local value;
+/// nothing here has reached the store, and dropping it costs only the work.
+///
+/// # Why it is the transition `on_block` would run
+///
+/// `on_block` reads the verdict in one place, to pick the
+/// [`stf::ExecutionEngine`] the transition consults: `invalid()` for
+/// [`PayloadValidity::Invalidated`], `valid()` for every other verdict
+/// (`NotRequired`, `Validated` and `Optimistic` alike). So a transition run
+/// with `valid()` is byte for byte the one `on_block` runs for every verdict
+/// except `Invalidated`, and for that one the speculation is simply not used.
+///
+/// The inputs are the same too. [`transition_block`] takes the store by shared
+/// reference and reads two things off it: the epoch-boundary state the
+/// precompute worker cached, and, through [`cache_boundary_balances`], the
+/// boundary balance cache it fills. Both are keyed by content (a checkpoint,
+/// that is an epoch and a block root), so what they hold does not depend on
+/// when they are consulted. Everything else is the parent's post-state, the
+/// block, the config and the committee and active-balance caches, which are
+/// content-keyed as well. The chain actor handles one message at a time, so
+/// nothing mutates the store between this computation and `on_block`'s own.
+pub struct SpeculativeTransition {
+    block_root: Root,
+    parent_root: Root,
+    state: BeaconState,
+    outcome: Result<()>,
+}
+
+impl SpeculativeTransition {
+    /// Whether this was computed for the block with this root and parent root.
+    ///
+    /// [`on_block_speculative`] makes the same comparison before using one; a
+    /// caller asks it first only to tell a mismatch from a use when counting.
+    pub fn is_for(&self, block_root: Root, parent_root: Root) -> bool {
+        self.block_root == block_root && self.parent_root == parent_root
+    }
+}
+
+/// Runs `signed_block`'s state transition against its parent's post-state with
+/// the execution engine assumed valid, without touching the store.
+///
+/// `None` when the parent has no post-state, the same condition under which
+/// `on_block` fails with `block.parent_root in store.block_states`; the caller
+/// then gets that failure from `on_block` itself. The parent state is looked up
+/// exactly as `on_block` looks it up.
+///
+/// None of `on_block`'s own checks run here. They run, unchanged and in the
+/// same order, when the speculation is handed to [`on_block_speculative`], so a
+/// block that fails one of them is rejected exactly as it is today and the
+/// speculation is dropped.
+pub fn speculate_transition(
+    store: &Store,
+    signed_block: &SignedBeaconBlock,
+    config: &Config,
+    committees: &CommitteeCache,
+) -> Option<SpeculativeTransition> {
+    let block_root = signed_block.message_hash_tree_root();
+    let parent_root = signed_block.parent_root();
+    let parent_state = store.get_state(&parent_root).expect("get")?;
+    let active_balances = store.active_balance_cache();
+    let (state, outcome) = transition_block(
+        store,
+        &parent_state,
+        parent_root,
+        signed_block,
+        true,
+        config,
+        &stf::ExecutionEngine::valid(),
+        committees,
+        &active_balances,
+    );
+    Some(SpeculativeTransition {
+        block_root,
+        parent_root,
+        state,
+        outcome,
+    })
+}
+
+/// [`on_block`] with an optional transition computed ahead of time.
+///
+/// Every check `on_block` makes runs unchanged and in the same order. The only
+/// difference is the one `transition_block` call: when `speculation` was
+/// computed for this block's own root and parent root, and the verdict is not
+/// `Invalidated` (the one verdict the speculation's `valid()` engine would
+/// disagree with), its result stands in for that call. In every other case it
+/// is dropped and the transition runs here as it always has, so the
+/// invalidation path in particular is the one `on_block` has today.
+pub fn on_block_speculative(
+    store: &mut Store,
+    signed_block: SignedBeaconBlock,
+    config: &Config,
+    blob_evidence: &DataAvailability,
+    payload_validity: &PayloadValidity,
+    committees: &CommitteeCache,
+    speculation: Option<SpeculativeTransition>,
+) -> Result<()> {
     let block_root = signed_block.message_hash_tree_root();
     let parent_root = signed_block.parent_root();
 
@@ -5000,17 +5113,24 @@ pub fn on_block(
     // The store's own cache, so every block of this chain shares one entry per
     // epoch; see `ActiveBalanceCacheExt`.
     let active_balances = store.active_balance_cache();
-    let (mut state, transition) = transition_block(
-        store,
-        &parent_state,
-        parent_root,
-        &signed_block,
-        true,
-        config,
-        &engine,
-        committees,
-        &active_balances,
-    );
+    let usable = speculation.filter(|speculation| {
+        speculation.is_for(block_root, parent_root)
+            && !matches!(payload_validity, PayloadValidity::Invalidated { .. })
+    });
+    let (mut state, transition) = match usable {
+        Some(speculation) => (speculation.state, speculation.outcome),
+        None => transition_block(
+            store,
+            &parent_state,
+            parent_root,
+            &signed_block,
+            true,
+            config,
+            &engine,
+            committees,
+            &active_balances,
+        ),
+    };
 
     // `optimistic-sync.md`: a block deemed `INVALIDATED` MUST NOT be included
     // in the canonical chain. That is stated here, on the verdict, rather than
@@ -7162,34 +7282,13 @@ mod tests {
         assert!(store.is_err());
     }
 
-    /// [`on_block`]'s early-return guard must read `Store::has_state`, not
-    /// `Store::has_block`: a block the actor is holding for missing data
-    /// columns is written with
-    /// [`Store::insert_pending_block`](ethlambda_storage::Store::insert_pending_block)
-    /// before it ever imports, which stores the whole signed block in one
-    /// `BlockHeaders` row (so `has_block` answers true) but writes no
-    /// `LiveChain` entry (so [`Store::block_index`](ethlambda_storage::Store::block_index),
-    /// a `LiveChain` scan, does not name it). Guarding on `has_block` instead
-    /// of `has_state` made `on_block` answer `Ok(())` for a held block
-    /// without importing it, so every later delivery naming it as an
-    /// ancestor found it "already known" and gave up without importing
-    /// anything either -- forever, since nothing ever gave the root a
-    /// post-state.
+    /// A store anchored one slot before a genuinely valid child block, with the
+    /// clock at that block's slot, and the block itself.
     ///
-    /// Delivered timely (the first block for its slot, before the
-    /// attestation deadline), so this also proves `on_block`'s pre-import
-    /// `compute_head` call (walking `Store::block_index`, for the new
-    /// proposer-boost dependent-root gate) tolerates a held block sitting
-    /// unindexed in the store: that walk never sees it, being a `LiveChain`
-    /// scan, so it is untouched by the held block's absent post-state.
-    ///
-    /// Builds a genuinely valid child block (correct proposer, RANDAO reveal,
-    /// and state root, all real BLS signatures over
-    /// [`test_state::secret_key_for`]'s key) rather than the zero-signature
-    /// [`block`] helper, since this exercises the real, signature-checking
-    /// [`on_block`], not a fixture harness that can skip verification.
-    #[test]
-    fn on_block_imports_a_block_already_persisted_with_no_post_state() {
+    /// Valid means correct proposer, RANDAO reveal and state root, all real BLS
+    /// signatures over [`test_state::secret_key_for`]'s key, so the real,
+    /// signature-checking [`on_block`] accepts it.
+    fn store_with_valid_child() -> (Config, Store, SignedBeaconBlock) {
         let config = Config::active();
         let (anchor_state, anchor_block) = anchor_pair_with(1);
         let anchor_root = anchor_block.message_hash_tree_root();
@@ -7255,7 +7354,6 @@ mod tests {
                 .to_bytes(),
         );
         let signed_block = draft;
-        let block_root = signed_block.message_hash_tree_root();
 
         // The store holds the child block already, exactly the shape
         // `hold_block_for_columns` leaves it in: one `BlockHeaders` row (so
@@ -7280,6 +7378,39 @@ mod tests {
                 config.seconds_per_slot * target_slot,
             ))
             .expect("set time");
+        (config, store, signed_block)
+    }
+
+    /// [`on_block`]'s early-return guard must read `Store::has_state`, not
+    /// `Store::has_block`: a block the actor is holding for missing data
+    /// columns is written with
+    /// [`Store::insert_pending_block`](ethlambda_storage::Store::insert_pending_block)
+    /// before it ever imports, which stores the whole signed block in one
+    /// `BlockHeaders` row (so `has_block` answers true) but writes no
+    /// `LiveChain` entry (so [`Store::block_index`](ethlambda_storage::Store::block_index),
+    /// a `LiveChain` scan, does not name it). Guarding on `has_block` instead
+    /// of `has_state` made `on_block` answer `Ok(())` for a held block
+    /// without importing it, so every later delivery naming it as an
+    /// ancestor found it "already known" and gave up without importing
+    /// anything either -- forever, since nothing ever gave the root a
+    /// post-state.
+    ///
+    /// Delivered timely (the first block for its slot, before the
+    /// attestation deadline), so this also proves `on_block`'s pre-import
+    /// `compute_head` call (walking `Store::block_index`, for the new
+    /// proposer-boost dependent-root gate) tolerates a held block sitting
+    /// unindexed in the store: that walk never sees it, being a `LiveChain`
+    /// scan, so it is untouched by the held block's absent post-state.
+    ///
+    /// Builds a genuinely valid child block (correct proposer, RANDAO reveal,
+    /// and state root, all real BLS signatures over
+    /// [`test_state::secret_key_for`]'s key) rather than the zero-signature
+    /// [`block`] helper, since this exercises the real, signature-checking
+    /// [`on_block`], not a fixture harness that can skip verification.
+    #[test]
+    fn on_block_imports_a_block_already_persisted_with_no_post_state() {
+        let (config, mut store, signed_block) = store_with_valid_child();
+        let block_root = signed_block.message_hash_tree_root();
         store
             .insert_pending_block(block_root, signed_block.clone())
             .expect("insert");
@@ -7308,6 +7439,161 @@ mod tests {
             store.has_state(&block_root).expect("get"),
             "on_block must not mistake a persisted-but-unimported (held) \
              block for an already-imported one"
+        );
+    }
+
+    /// Imports the valid child with `validity` and `speculation` and reports
+    /// everything an import writes that a later reader could tell apart.
+    fn import_valid_child(
+        validity: &PayloadValidity,
+        speculate: impl FnOnce(&Store, &SignedBeaconBlock, &Config) -> Option<SpeculativeTransition>,
+    ) -> (Result<()>, Store, Root) {
+        let (config, mut store, signed_block) = store_with_valid_child();
+        let block_root = signed_block.message_hash_tree_root();
+        let committees = CommitteeCache::default();
+        let speculation = speculate(&store, &signed_block, &config);
+        let result = on_block_speculative(
+            &mut store,
+            signed_block,
+            &config,
+            &DataAvailability::NotRequired,
+            validity,
+            &committees,
+            speculation,
+        );
+        (result, store, block_root)
+    }
+
+    fn honest_speculation(
+        store: &Store,
+        block: &SignedBeaconBlock,
+        config: &Config,
+    ) -> Option<SpeculativeTransition> {
+        speculate_transition(store, block, config, &CommitteeCache::default())
+    }
+
+    /// What the store holds after an import, as comparable values.
+    fn observed(
+        store: &mut Store,
+        block_root: Root,
+        config: &Config,
+    ) -> (
+        Option<Root>,
+        Option<[bool; constants::NUM_BLOCK_TIMELINESS_DEADLINES]>,
+        Root,
+        Root,
+        Vec<Root>,
+    ) {
+        let post_state_root = store
+            .get_state(&block_root)
+            .expect("get")
+            .map(|state| state.hash_tree_root());
+        let mut roots: Vec<Root> = store.block_index().keys().copied().collect();
+        roots.sort();
+        (
+            post_state_root,
+            store.block_timeliness(&block_root),
+            store.proposer_boost_root(),
+            get_head(store, config).expect("head"),
+            roots,
+        )
+    }
+
+    #[test]
+    fn a_matching_speculation_leaves_the_store_as_importing_without_one() {
+        let config = Config::active();
+        let (plain_result, mut plain, root) =
+            import_valid_child(&PayloadValidity::NotRequired, |_, _, _| None);
+        plain_result.expect("the plain import succeeds");
+        for validity in [
+            PayloadValidity::NotRequired,
+            PayloadValidity::Validated,
+            PayloadValidity::Optimistic,
+        ] {
+            let (result, mut speculated, speculated_root) =
+                import_valid_child(&validity, honest_speculation);
+            result.expect("the speculated import succeeds");
+            assert_eq!(speculated_root, root);
+            assert_eq!(
+                observed(&mut speculated, root, &config),
+                observed(&mut plain, root, &config),
+                "{validity:?}: head, post-state root, timeliness, proposer boost and the \
+                 block index must be identical"
+            );
+        }
+    }
+
+    /// A speculation whose outcome is a marker nothing else produces, so the
+    /// result of the import says whether the speculation or a fresh transition
+    /// supplied it.
+    const POISON: &str = "poisoned speculation";
+
+    fn poisoned(
+        store: &Store,
+        block: &SignedBeaconBlock,
+        config: &Config,
+    ) -> Option<SpeculativeTransition> {
+        let mut speculation = honest_speculation(store, block, config)?;
+        speculation.outcome = Err(Error::SpecAssert(POISON));
+        Some(speculation)
+    }
+
+    #[test]
+    fn a_matching_speculation_is_the_transition_on_block_uses() {
+        let (result, store, root) = import_valid_child(&PayloadValidity::Validated, poisoned);
+        assert_eq!(failed_assertion(result), Some(POISON));
+        assert!(
+            !store.has_state(&root).unwrap(),
+            "a failed import writes nothing"
+        );
+    }
+
+    #[test]
+    fn a_speculation_for_another_root_or_parent_is_ignored() {
+        for tamper in [0u8, 1] {
+            let (result, store, root) =
+                import_valid_child(&PayloadValidity::NotRequired, |store, block, config| {
+                    let mut speculation = poisoned(store, block, config)?;
+                    match tamper {
+                        0 => speculation.block_root = Root::repeat_byte(0xee),
+                        _ => speculation.parent_root = Root::repeat_byte(0xee),
+                    }
+                    Some(speculation)
+                });
+            result.expect("the stale speculation is dropped and the real transition runs");
+            assert!(store.has_state(&root).unwrap());
+        }
+    }
+
+    #[test]
+    fn an_invalidated_verdict_ignores_the_speculation_and_matches_today() {
+        let invalidated = PayloadValidity::Invalidated {
+            latest_valid_hash: None,
+        };
+        let (without, plain_store, root) = import_valid_child(&invalidated, |_, _, _| None);
+        let (with_honest, honest_store, _) = import_valid_child(&invalidated, honest_speculation);
+        let (with_poison, poison_store, _) = import_valid_child(&invalidated, poisoned);
+        let without = format!("{:?}", without.expect_err("an invalidated block fails"));
+        assert_eq!(format!("{:?}", with_honest.expect_err("fails")), without);
+        assert_eq!(
+            format!("{:?}", with_poison.expect_err("fails")),
+            without,
+            "the speculation must not supply the transition under Invalidated"
+        );
+        for store in [&plain_store, &honest_store, &poison_store] {
+            assert!(!store.has_state(&root).unwrap());
+        }
+    }
+
+    #[test]
+    fn no_speculation_without_a_parent_state() {
+        let (config, store, mut block) = store_with_valid_child();
+        let SignedBeaconBlock::Phase0(inner) = &mut block else {
+            unreachable!("phase0");
+        };
+        inner.message.parent_root = Root::repeat_byte(0xcd);
+        assert!(
+            speculate_transition(&store, &block, &config, &CommitteeCache::default()).is_none()
         );
     }
 

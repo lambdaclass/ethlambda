@@ -269,6 +269,7 @@ Series appear as blocks arrive rather than being seeded, since a third of the ph
 | Name | Type | Usage | Sample collection event | Labels | Buckets |
 |------|------|-------|-------------------------|--------|---------|
 | `lean_block_import_phase_seconds` | Histogram | Time one section of a block's import, or of the arrival carrying it, took | Per section that ran, on each import, hold or failure | phase (see below); source=gossip,sync | 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8, 12, 16, 32 |
+| `lean_engine_speculation_total` | Counter | State transitions the chain actor ran while the `engine_newPayload` round trip was in flight, by what became of them | Per beacon block asked of an execution client | outcome=used,discarded_invalidated,discarded_held,discarded_mismatch | |
 | `lean_block_import_cascade_blocks` | Histogram | Blocks one arrival put through the import path (attempts, so a block that ends held or pended counts) | Once per arriving block message | | 1, 2, 3, 5, 8, 16, 32, 64, 128 |
 
 Per-block phases, in the order a block crosses them, plus `total` for a completed import:
@@ -284,10 +285,10 @@ Per-block phases, in the order a block crosses them, plus `total` for a complete
 | `cascade_wait` | Between the parent's import finishing and this block being popped off the cascade queue | both |
 | `da_check` | The custody-column availability check itself, not the wait | beacon |
 | `columns_wait` | Held because custody columns had not all arrived | beacon |
-| `engine` | The `engine_newPayload` round trip, including its retry ladder | beacon |
+| `engine` | The `engine_newPayload` round trip, including its retry ladder. When the state transition ran meanwhile and was used, only the wait left after it finished | beacon |
 | `verify_struct` | Participant bounds checks and pubkey resolution | lean |
 | `verify_crypto` | The leanVM multi-message aggregate verification | lean |
-| `stf` | The state transition. On beacon this bundles the transition and the state root, and excludes `writer_wait`, which is nested inside it | both |
+| `stf` | The state transition. On beacon this bundles the transition and the state root, and excludes `writer_wait`, which is nested inside it. It includes a transition that ran during the `engine` round trip | both |
 | `writer_wait` | Beacon only: the importer's blocking hand-off of the post-state to the storage crate's background writer, which waits while the writer's queue is full. Subtracted from `stf`, so `stf` and `writer_wait` do not overlap | beacon |
 | `db_write` | The block write and handing the post-state off to the storage crate's background writer; the state's own encode/diff/commit cost is `lean_state_write_seconds` instead, not this row | lean |
 | `fc_head` | `update_head` | lean |

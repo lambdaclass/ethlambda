@@ -178,6 +178,54 @@ pub fn verdict(status: &PayloadStatusV1) -> PayloadValidity {
     })
 }
 
+/// [`NewPayloadRequest`] with its own copy of the payload, so it can move into
+/// a spawned task.
+///
+/// The chain actor sends the question from a task of its own and runs the
+/// block's state transition meanwhile (see `process_block`), and a task cannot
+/// borrow the block the actor goes on using. Only the payload is copied: the
+/// rest of the request is already owned, and the block itself, which also
+/// carries the attestations and the other operations, is never cloned.
+pub struct OwnedNewPayloadRequest {
+    execution_payload: containers::deneb::ExecutionPayload,
+    versioned_hashes: Vec<Bytes32>,
+    parent_beacon_block_root: Root,
+    execution_requests: Vec<Vec<u8>>,
+}
+
+impl NewPayloadRequest<'_> {
+    /// Copies the borrowed payload so the request outlives the block.
+    pub fn into_owned(self) -> OwnedNewPayloadRequest {
+        OwnedNewPayloadRequest {
+            execution_payload: self.execution_payload.clone(),
+            versioned_hashes: self.versioned_hashes,
+            parent_beacon_block_root: self.parent_beacon_block_root,
+            execution_requests: self.execution_requests,
+        }
+    }
+}
+
+/// [`ask`] for a request already built with [`new_payload_request`], which is
+/// how the actor sends it from a task while it computes the transition.
+///
+/// The answer is read exactly as [`ask`] reads it: `Err` means no answer after
+/// the client's whole retry ladder, and there is no `Ok(None)` because a
+/// request existing means there was something to ask.
+pub async fn ask_request(
+    client: &EngineClient,
+    request: OwnedNewPayloadRequest,
+) -> Result<PayloadValidity, EngineError> {
+    let status = client
+        .new_payload(
+            &request.execution_payload,
+            &request.versioned_hashes,
+            request.parent_beacon_block_root,
+            &request.execution_requests,
+        )
+        .await?;
+    Ok(verdict(&status))
+}
+
 /// Asks the execution client about `block`'s payload.
 ///
 /// `Ok(None)` means there was nothing to ask, which is not a failure:

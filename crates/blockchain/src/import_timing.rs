@@ -177,7 +177,9 @@ pub struct ImportTimings {
     pub columns_wait_end: Option<Instant>,
 
     /// Beacon: the `engine_newPayload` round trip, including its retry ladder.
-    /// I/O wait, not work.
+    /// I/O wait, not work. When the state transition ran meanwhile and was
+    /// used, this pair starts where that transition ended and so covers only
+    /// the wait that remained; see [`Self::stf_spec_start`].
     pub engine_start: Option<Instant>,
     pub engine_end: Option<Instant>,
 
@@ -196,6 +198,21 @@ pub struct ImportTimings {
     /// reports it minus [`Self::writer_wait_start`]..[`Self::writer_wait_end`].
     pub stf_start: Option<Instant>,
     pub stf_end: Option<Instant>,
+
+    /// Beacon: a state transition computed while the execution client's
+    /// verdict was still in flight, and then used by the import.
+    ///
+    /// It runs before the `stf` pair above and overlaps the `engine_newPayload`
+    /// round trip, so it is neither inside `stf_start`..`stf_end` nor a
+    /// section of its own: the `stf` row adds it, since it is the same
+    /// state-transition work done earlier. Meanwhile `engine_start` is moved to
+    /// this pair's end, so the `engine` row reports only the wait that was left
+    /// once the transition finished, and the rows still sum to the end-to-end
+    /// time instead of counting the overlap twice. `None` whenever the import
+    /// ran its own transition, which is every import without an execution
+    /// client and every one whose speculation was discarded.
+    pub stf_spec_start: Option<Instant>,
+    pub stf_spec_end: Option<Instant>,
 
     /// Beacon: the blocking hand-off of the post-state to the storage crate's
     /// background writer, which waits while the writer's queue is full. It
@@ -375,6 +392,11 @@ impl ImportTimings {
         let writer_wait = Row::new("writer_wait", self.writer_wait_start, self.writer_wait_end);
         if let (Some(total), Some(wait)) = (stf.elapsed, writer_wait.elapsed) {
             stf.elapsed = Some(total.saturating_sub(wait));
+        }
+        if let (Some(total), Some(spec)) =
+            (stf.elapsed, span(self.stf_spec_start, self.stf_spec_end))
+        {
+            stf.elapsed = Some(total + spec);
         }
         vec![
             Row::new("decode", self.decode_start, self.decode_end),
@@ -895,6 +917,37 @@ mod tests {
             Some(Duration::from_millis(90))
         );
         assert_eq!(row_elapsed(&timings, "writer_wait"), None);
+    }
+
+    #[test]
+    fn an_overlapped_transition_is_charged_to_stf_and_not_to_engine() {
+        // A 100 ms round trip with a 70 ms transition running inside it, then
+        // 20 ms of import. Un-overlapped, that is 100 + 20 ms; overlapped, the
+        // engine row keeps the 30 ms that was left and stf gains the 70 ms.
+        let base = Instant::now();
+        let mut timings = ImportTimings::default();
+        (timings.stf_spec_start, timings.stf_spec_end) = pair(base, 0, 70);
+        (timings.engine_start, timings.engine_end) = pair(base, 70, 30);
+        (timings.stf_start, timings.stf_end) = pair(base, 100, 20);
+
+        assert_eq!(
+            row_elapsed(&timings, "engine"),
+            Some(Duration::from_millis(30))
+        );
+        assert_eq!(
+            row_elapsed(&timings, "stf"),
+            Some(Duration::from_millis(90))
+        );
+        let rows: Duration = timings
+            .rows()
+            .into_iter()
+            .filter_map(|row| row.elapsed)
+            .sum();
+        assert_eq!(
+            rows,
+            Duration::from_millis(120),
+            "the rows still tile the span"
+        );
     }
 
     #[test]
