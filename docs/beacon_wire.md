@@ -320,6 +320,20 @@ s the swarm task disconnects peers below the graylist. There is no ban list:
 a peer's negative score is kept for `retain_score` (100 epochs) after it
 leaves, so a peer that reconnects comes back graylisted and is dropped again.
 
+The same check also disconnects a peer gossipsub reported as slow (`SlowPeer`:
+its send queue refused a message, or a message expired in it) in each of the
+last `SLOW_PEER_CHECK_LIMIT` checks. This is for a dead gossipsub stream, not
+for slowness in general. The connection handler disables itself for good after
+a few substream negotiations on one connection, successful ones included, and
+then never takes another message off the queue. Gossipsub keeps queueing for
+the peer until the queue is full, and a queued message is only dropped when
+the handler takes it off, so the queue's message copies stay in memory for as
+long as other protocols keep the connection open. On the mainnet follower,
+such queues held about 490 MB. Gossipsub's own penalty for these failures
+(`slow_peer_weight`) left the peer in the `negative` band, never near the
+graylist. Lighthouse penalizes `SlowPeer` reports through its peer manager
+instead.
+
 Around a fork-digest boundary the node holds two digests' topics, and every
 held digest gets the whole parameter set (exits and slashings included),
 scored by its role:
@@ -816,6 +830,7 @@ as a query filter, so a `quic`-only record is invisible to it.
 | `lean_beacon_aggregates_deferred` | Aggregates held until their own slot has passed |
 | `lean_gossipsub_peers_by_score{band}` | Gossipsub peers by score band; see [Peer scoring](#peer-scoring) |
 | `lean_gossipsub_score_disconnects_total` | Peers disconnected for a score below the graylist |
+| `lean_gossipsub_slow_peer_disconnects_total` | Peers disconnected for persistently failing to take gossipsub messages; see [Peer scoring](#peer-scoring) |
 | `lean_gossipsub_mesh_delivery_scoring` | 1 while P3 is scored, 0 while the head lags or is warming up |
 | `lean_beacon_publish_data_columns_seconds` | Time to compute and verify a published block's cells and build its sidecars; see [metrics.md](./metrics.md) |
 

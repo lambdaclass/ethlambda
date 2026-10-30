@@ -447,6 +447,7 @@ spec.
 |------|------|-------|-------------------------|--------|---------|
 | `lean_gossipsub_peers_by_score` | Gauge | Gossipsub peers by score band | Every 10 s, in the swarm task | band=non_negative,negative,below_gossip,below_publish,below_graylist | |
 | `lean_gossipsub_score_disconnects_total` | Counter | Peers disconnected for a gossipsub score below the graylist (-16000) | When the 10 s check disconnects one | | |
+| `lean_gossipsub_slow_peer_disconnects_total` | Counter | Peers disconnected for failing to take gossipsub messages in every 10 s check for a minute (a dead gossipsub stream pins its send queue in memory) | When the 10 s check disconnects one | | |
 | `lean_gossipsub_mesh_delivery_scoring` | Gauge | 1 while mesh message deliveries (P3) are scored, 0 while the head lags the wall clock or is warming up after catching up | Every slot, on the scoring refresh | | |
 
 The bands are mutually exclusive and split at the gossip (-4000), publish
