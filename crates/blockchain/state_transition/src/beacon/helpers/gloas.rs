@@ -941,11 +941,16 @@ pub fn add_builder_to_registry(
         deposit_epoch: compute_epoch_at_slot(slot),
         withdrawable_epoch: constants::FAR_FUTURE_EPOCH,
     };
+    let deposit_epoch = builder.deposit_epoch;
     let builders = state.builders_mut()?;
     if index == builders.len() as gloas::BuilderIndex {
         builders.push(builder);
     } else {
         builders[index as usize] = builder;
+    }
+    // [New in EIP-8450] The builder at this index, new or reusing it, starts without keys.
+    if let Some(mut registry) = state.pq_registry_mut() {
+        registry.reset_builder(index, deposit_epoch)?;
     }
     Ok(index)
 }

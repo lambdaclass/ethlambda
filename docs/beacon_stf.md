@@ -736,7 +736,17 @@ state and block containers (EIP-8015 removes the eth1 fields and the body's
 runs its fixtures through the fork-generic accessors, `upgrade_to_heze`
 included.
 
-`UNMODELED_FORKS` is empty at the pinned release, and
+Heze here includes EIP-8450's post-quantum key registry, which consensus-specs
+builds as the `eip8450` feature fork on top of its heze. So `fixture_fork` maps
+the `eip8450` directory to `ForkName::Heze`, and `UNMODELED_FORKS` lists `heze`,
+whose containers lack the registry. No release ships `eip8450` yet:
+`make eip8450-spec-tests` generates it from the pyspec of
+consensus-specs#5782, pinned by commit. Without that directory the run reports
+`fixture_forks/missing/eip8450` as ignored, and the coverage check stops
+requiring heze cases. The `eip8450` directory's `fork` and `transition` cases
+start from the registryless heze, a shape this crate does not have, so they are
+ignored.
+
 `fixture_forks/every_directory_is_accounted_for` fails if the tree holds a fork
 directory that is neither parseable nor listed. A release that adds a fork
 forces a decision instead of quietly widening the gap.

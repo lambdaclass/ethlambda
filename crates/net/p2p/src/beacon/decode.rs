@@ -69,6 +69,8 @@ pub enum BeaconGossip {
     ProposerSlashing(Box<shared::ProposerSlashing>),
     BlsToExecutionChange(capella::SignedBLSToExecutionChange),
     SyncCommitteeContribution(Box<altair::SignedContributionAndProof>),
+    /// Boxed: its leanXMSS proof of possession is 2404 bytes (EIP-8450).
+    PqKeyRegistration(Box<heze::SignedPQKeyRegistration>),
 }
 
 impl BeaconGossip {
@@ -84,6 +86,7 @@ impl BeaconGossip {
             BeaconGossip::SyncCommitteeContribution(_) => {
                 topics::SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF
             }
+            BeaconGossip::PqKeyRegistration(_) => topics::PQ_KEY_REGISTRATION,
         }
     }
 }
@@ -419,6 +422,10 @@ pub fn decode_gossip(
                 .map(|value| BeaconGossip::SyncCommitteeContribution(Box::new(value)))
                 .map_err(|_| DecodeError::Ssz)
         }
+        // One container whatever the fork: only heze digests carry the topic.
+        topics::PQ_KEY_REGISTRATION => heze::SignedPQKeyRegistration::from_ssz_bytes(bytes)
+            .map(|value| BeaconGossip::PqKeyRegistration(Box::new(value)))
+            .map_err(|_| DecodeError::Ssz),
         _ => Err(DecodeError::UnknownTopic),
     }
 }

@@ -76,6 +76,19 @@ fn fork_case(case: &Case, config: &Config) -> Result<(), String> {
     Ok(())
 }
 
+/// Gloas fork cases whose expected post-state consensus-specs #5736 changed after
+/// v1.7.0-beta.4: at the fork, only builder-credential deposits fund builders now.
+///
+/// The pinned release still expects the old onboarding, so these run as ignored.
+/// The same cases, regenerated at #5736, pass.
+const SUPERSEDED_BY_5736: &[&str] = &[
+    "fork_builder_deposit_followed_by_non_builder_credentials",
+    "fork_invalid_then_valid_validator_then_builder_deposit",
+    "fork_mixed_validity_validator_deposits_surrounding_builder_deposits",
+    "fork_valid_then_invalid_validator_then_builder_deposit",
+    "fork_validator_deposit_followed_by_builder_credentials",
+];
+
 pub fn trials() -> Vec<Trial> {
     let config = Arc::new(Config::active());
     let cases = collect(PRESET, "fork", "fork");
@@ -83,9 +96,13 @@ pub fn trials() -> Vec<Trial> {
 
     for case in cases {
         let config = Arc::clone(&config);
-        trials.push(super::case_trial("fork", case, move |case| {
-            fork_case(case, &config)
-        }));
+        let superseded = SUPERSEDED_BY_5736.contains(&case.name.as_str());
+        let trial = super::case_trial("fork", case, move |case| fork_case(case, &config));
+        trials.push(if superseded {
+            trial.with_ignored_flag(true)
+        } else {
+            trial
+        });
     }
 
     trials

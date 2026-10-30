@@ -15,6 +15,7 @@ pub mod execution_payload_bid;
 pub mod inclusion_list;
 pub mod operations;
 pub mod payload_attestation;
+pub mod pq_key_registration;
 pub mod proposer_preferences;
 pub mod sync_committee;
 #[cfg(test)]
@@ -205,6 +206,16 @@ pub enum IgnoreReason {
     /// A heze bid's `inclusion_list_bits` leaves out a committee member whose
     /// timely list this node holds.
     InclusionListBitsNotInclusive,
+    /// No validator or builder holds the registration's index in the head state (EIP-8450).
+    UnknownRegistrant,
+    /// The registering builder's deposit epoch is not yet finalized in the head state.
+    BuilderNotActive,
+    /// The registration names another change than the head state's stored one.
+    ChangeEpochMismatch,
+    /// The registrant changed its keys less than the change delay ago.
+    PqKeyChangeTooSoon,
+    /// Another validator or builder holds the leanXMSS key in the head state.
+    PqKeyInUse,
 }
 
 impl IgnoreReason {
@@ -250,6 +261,11 @@ impl IgnoreReason {
             Self::SyncCommitteeUnavailable => "sync_committee_unavailable",
             Self::EmptyInclusionList => "empty_inclusion_list",
             Self::InclusionListBitsNotInclusive => "inclusion_list_bits_not_inclusive",
+            Self::UnknownRegistrant => "unknown_registrant",
+            Self::BuilderNotActive => "builder_not_active",
+            Self::ChangeEpochMismatch => "change_epoch_mismatch",
+            Self::PqKeyChangeTooSoon => "pq_key_change_too_soon",
+            Self::PqKeyInUse => "pq_key_in_use",
         }
     }
 }
@@ -359,6 +375,14 @@ pub enum RejectReason {
     /// A message's shape belongs to a different fork than the one its slot
     /// is in: a gloas-shaped bid at a heze slot, or the reverse.
     WrongForkShape,
+    /// The registrant initiated an exit (EIP-8450).
+    RegistrantExiting,
+    /// A builder registered a nonzero VRF root, though builders make no selection proofs.
+    BuilderVrfRoot,
+    /// The registered leanXMSS key is all-zero, the marker of an index without keys.
+    ZeroPqKey,
+    /// The leanXMSS proof of possession does not verify.
+    PossessionProof,
 }
 
 impl RejectReason {
@@ -417,6 +441,10 @@ impl RejectReason {
             Self::EmptyTransaction => "empty_transaction",
             Self::NotInInclusionListCommittee => "not_in_inclusion_list_committee",
             Self::WrongForkShape => "wrong_fork_shape",
+            Self::RegistrantExiting => "registrant_exiting",
+            Self::BuilderVrfRoot => "builder_vrf_root",
+            Self::ZeroPqKey => "zero_pq_key",
+            Self::PossessionProof => "possession_proof",
         }
     }
 }

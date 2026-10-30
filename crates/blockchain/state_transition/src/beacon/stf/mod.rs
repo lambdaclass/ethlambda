@@ -62,6 +62,9 @@ pub mod electra;
 pub mod epoch;
 pub mod fulu;
 pub mod gloas;
+pub mod heze;
+#[cfg(test)]
+pub(crate) mod heze_fixture;
 pub mod operations;
 
 use crate::beacon::containers;

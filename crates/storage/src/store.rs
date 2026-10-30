@@ -198,7 +198,10 @@ const KEY_ANCHOR_SLOT: &[u8] = b"anchor_slot";
 /// 7 gave heze its own state and block containers (EIP-8015 removes the eth1
 /// and deposit-index fields): a heze state or block written by the previous
 /// version is gloas-shaped bytes under a heze fork tag, which no longer decode.
-pub const DB_VERSION: u64 = 7;
+///
+/// 8 appended EIP-8450's post-quantum key registry to heze's block body and
+/// state, so a heze block or state written by version 7 no longer decodes.
+pub const DB_VERSION: u64 = 8;
 
 /// The consensus protocol a data directory holds.
 ///

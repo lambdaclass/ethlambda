@@ -266,6 +266,7 @@ fn handle_beacon_gossip(
             | beacon_topics::PROPOSER_SLASHING
             | beacon_topics::ATTESTER_SLASHING
             | beacon_topics::BLS_TO_EXECUTION_CHANGE
+            | beacon_topics::PQ_KEY_REGISTRATION
     ) {
         triage_operation(server, wire, kind, payload)
     } else if let Some(subnet_id) = beacon_topics::sync_committee_subnet(kind) {
@@ -626,6 +627,9 @@ fn triage_operation(server: &P2PServer, wire: &BeaconWire, kind: &str, payload: 
         Ok(BeaconGossip::BlsToExecutionChange(change)) => {
             BeaconOperation::BlsToExecutionChange(change)
         }
+        Ok(BeaconGossip::PqKeyRegistration(registration)) => {
+            BeaconOperation::PqKeyRegistration(registration)
+        }
         Ok(other) => {
             // `handle_beacon_gossip` routes only the four operation kinds
             // here, and `decode_gossip` answers by topic, so this is a bug.
@@ -647,15 +651,21 @@ fn triage_operation(server: &P2PServer, wire: &BeaconWire, kind: &str, payload: 
     // line adds nothing the counters do not already say.
     debug!(kind, bytes = payload.len(), "Beacon operation decoded");
 
+    let received_ms = unix_now_ms();
     if let Err(outcome) = gossip::operations::cheap_checks(
         &server.seen_operations,
         &server.store,
         &operation,
-        unix_now_ms(),
+        received_ms,
     ) {
         return Dispatch::Report(outcome);
     }
-    Dispatch::Validate(Validated::Operation(Box::new(operation)))
+    let first_seen = server.seen_operations.is_new(&operation);
+    Dispatch::Validate(Validated::Operation {
+        operation: Box::new(operation),
+        first_seen,
+        received_ms,
+    })
 }
 
 /// Decode a `sync_committee_{subnet_id}` message and run its cheap gossip
@@ -1286,6 +1296,7 @@ pub(crate) fn operation_kind(operation: &BeaconOperation) -> &'static str {
         BeaconOperation::AttesterSlashing(_) => beacon_topics::ATTESTER_SLASHING,
         BeaconOperation::VoluntaryExit(_) => beacon_topics::VOLUNTARY_EXIT,
         BeaconOperation::BlsToExecutionChange(_) => beacon_topics::BLS_TO_EXECUTION_CHANGE,
+        BeaconOperation::PqKeyRegistration(_) => beacon_topics::PQ_KEY_REGISTRATION,
     }
 }
 
@@ -1785,7 +1796,7 @@ mod tests {
 
         assert!(matches!(
             triage_operation(&server, wire, beacon_topics::VOLUNTARY_EXIT, &payload),
-            Dispatch::Validate(Validated::Operation(_))
+            Dispatch::Validate(Validated::Operation { .. })
         ));
     }
 

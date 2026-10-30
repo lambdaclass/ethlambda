@@ -364,6 +364,9 @@ pub struct GloasBlockInputs {
     /// bid is inclusive of the proposer's whole view). `None` at a gloas slot,
     /// whose bid has no such field; `Some` at a heze one.
     pub inclusion_list_bits: Option<InclusionListBits>,
+    /// Heze (EIP-8450): candidate key registrations, packed while they apply after the other operations.
+    /// Ignored at a gloas slot, whose body has no such field.
+    pub pq_key_registrations: Vec<heze::SignedPQKeyRegistration>,
 }
 
 /// The `eth1_data` a gloas body votes: the state's own. Heze has none (EIP-8015),
@@ -376,7 +379,11 @@ fn eth1_vote(state: &BeaconState) -> ethlambda_types::beacon::containers::Eth1Da
 /// The unsigned block for `state`'s slot around `body`, in `state`'s fork: gloas's
 /// as is, heze's with the two fields EIP-8015 removes dropped. `state_root` is
 /// left zero for the caller to fill from a `process_block` run.
-fn unsigned_block(state: &BeaconState, body: BeaconBlockBody) -> Result<GloasBlock> {
+fn unsigned_block(
+    state: &BeaconState,
+    body: BeaconBlockBody,
+    pq_key_registrations: Vec<heze::SignedPQKeyRegistration>,
+) -> Result<GloasBlock> {
     let slot = state.slot();
     let proposer_index = get_beacon_proposer_index(state)?;
     // `process_slots` filled the header's state root on the way out of the
@@ -395,7 +402,10 @@ fn unsigned_block(state: &BeaconState, body: BeaconBlockBody) -> Result<GloasBlo
             proposer_index,
             parent_root,
             state_root: Root::ZERO,
-            body: body.into(),
+            body: heze::BeaconBlockBody {
+                pq_key_registrations: pq_key_registrations.into(),
+                ..body.into()
+            },
         }),
         _ => {
             return Err(Error::SpecAssert(
@@ -403,6 +413,66 @@ fn unsigned_block(state: &BeaconState, body: BeaconBlockBody) -> Result<GloasBlo
             ));
         }
     })
+}
+
+/// The block around `body`, with its state root, and the post-state that root names.
+///
+/// Key registrations come last in block processing (EIP-8450), and change only the registry.
+/// So the block is built once without them, and the candidates are judged on that post-state:
+///
+/// 1. process the block without registrations;
+/// 2. apply each candidate in order to a copy of that post-state, keeping those that apply;
+/// 3. if any were kept, process the block with them, to get its state root.
+///
+/// Applying in order catches two candidates for one key or one registrant.
+/// Without candidates, the block is processed once.
+fn block_with_registrations(
+    state: &BeaconState,
+    body: BeaconBlockBody,
+    candidates: Vec<heze::SignedPQKeyRegistration>,
+    config: &Config,
+) -> Result<(GloasBlock, BeaconState)> {
+    let process = |block: &GloasBlock| -> Result<BeaconState> {
+        let mut post = state.clone();
+        stf::gloas::process_block(
+            &mut post,
+            block,
+            config,
+            &CommitteeCache::default(),
+            &ActiveBalanceCache::default(),
+        )?;
+        Ok(post)
+    };
+    let mut block = unsigned_block(state, body.clone(), Vec::new())?;
+    let mut post = process(&block)?;
+    let registrations = pack_pq_key_registrations(&post, candidates, config);
+    if !registrations.is_empty() {
+        block = unsigned_block(state, body, registrations)?;
+        post = process(&block)?;
+    }
+    block.set_state_root(post.hash_tree_root());
+    Ok((block, post))
+}
+
+/// The candidate registrations that apply in order to `post`, up to the per-block bound.
+///
+/// Before heze, `post` has no registry and every candidate fails, so none is kept.
+pub fn pack_pq_key_registrations(
+    post: &BeaconState,
+    candidates: Vec<heze::SignedPQKeyRegistration>,
+    config: &Config,
+) -> Vec<heze::SignedPQKeyRegistration> {
+    if candidates.is_empty() {
+        return candidates;
+    }
+    let mut scratch = post.clone();
+    candidates
+        .into_iter()
+        .filter(|registration| {
+            stf::heze::process_pq_key_registration(&mut scratch, registration, config).is_ok()
+        })
+        .take(preset::MAX_PQ_KEY_REGISTRATIONS as usize)
+        .collect()
 }
 
 /// What a gloas block body carries when it commits to another builder's bid
@@ -418,6 +488,8 @@ pub struct GloasBidBlockInputs {
     /// The block's sync aggregate: `empty_sync_aggregate`, or what
     /// `verified_sync_aggregate` vouched for.
     pub sync_aggregate: SyncAggregate,
+    /// Heze (EIP-8450): candidate key registrations, as for a self-built block.
+    pub pq_key_registrations: Vec<heze::SignedPQKeyRegistration>,
 }
 
 /// The unsigned block for `state.slot()` committing to `inputs.signed_bid`, a
@@ -449,16 +521,8 @@ pub fn assemble_gloas_block_on_bid(
         parent_execution_requests: inputs.parent_execution_requests,
         ..BeaconBlockBody::empty()
     };
-    let mut block = unsigned_block(state, body)?;
-    let mut post = state.clone();
-    stf::gloas::process_block(
-        &mut post,
-        &block,
-        config,
-        &CommitteeCache::default(),
-        &ActiveBalanceCache::default(),
-    )?;
-    block.set_state_root(post.hash_tree_root());
+    let (block, _post) =
+        block_with_registrations(state, body, inputs.pq_key_registrations, config)?;
     Ok(block)
 }
 
@@ -564,17 +628,7 @@ pub fn assemble_gloas_block(
         parent_execution_requests: inputs.parent_execution_requests,
         ..BeaconBlockBody::empty()
     };
-    let mut block = unsigned_block(state, body)?;
-
-    let mut post = state.clone();
-    stf::gloas::process_block(
-        &mut post,
-        &block,
-        config,
-        &CommitteeCache::default(),
-        &ActiveBalanceCache::default(),
-    )?;
-    block.set_state_root(post.hash_tree_root());
+    let (block, post) = block_with_registrations(state, body, inputs.pq_key_registrations, config)?;
 
     let envelope = ExecutionPayloadEnvelope {
         payload: inputs.execution_payload,
@@ -773,6 +827,7 @@ pub mod test_support {
                 blob_kzg_commitments: vec![KzgCommitment([5; 48])],
                 execution_requests: ExecutionRequests::default(),
                 inclusion_list_bits: None,
+                pq_key_registrations: Vec::new(),
             },
             &config(),
         )
@@ -912,6 +967,7 @@ mod gloas_block_production_tests {
                 blob_kzg_commitments: Vec::new(),
                 execution_requests: ExecutionRequests::default(),
                 inclusion_list_bits: None,
+                pq_key_registrations: Vec::new(),
             },
             &config(),
         )
@@ -1055,6 +1111,7 @@ mod gloas_block_production_tests {
                 blob_kzg_commitments: Vec::new(),
                 execution_requests: ExecutionRequests::default(),
                 inclusion_list_bits: None,
+                pq_key_registrations: Vec::new(),
             },
             &config(),
         );
@@ -1087,6 +1144,7 @@ mod gloas_block_production_tests {
                 blob_kzg_commitments: Vec::new(),
                 execution_requests: ExecutionRequests::default(),
                 inclusion_list_bits: None,
+                pq_key_registrations: Vec::new(),
             },
             &config(),
         );
@@ -1242,6 +1300,7 @@ mod gloas_block_production_tests {
                 blob_kzg_commitments: Vec::new(),
                 execution_requests: ExecutionRequests::default(),
                 inclusion_list_bits: None,
+                pq_key_registrations: Vec::new(),
             },
             &config(),
         )
@@ -1363,6 +1422,7 @@ mod bid_assembly_tests {
             parent_execution_requests: ExecutionRequests::default(),
             signed_bid,
             sync_aggregate: empty_sync_aggregate(),
+            pq_key_registrations: Vec::new(),
         }
     }
 
@@ -1502,5 +1562,83 @@ mod bid_assembly_tests {
             &bid,
             &ExecutionRequests::default()
         ));
+    }
+}
+
+#[cfg(test)]
+mod pq_key_registration_tests {
+    use ethlambda_storage::pools::OperationPool;
+    use ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
+    use ethlambda_types::beacon::operation::BeaconOperation;
+
+    use super::*;
+    use crate::beacon::fork::ForkName;
+    use crate::beacon::helpers::test_state::with_signing_validators_at;
+    use crate::beacon::stf::heze::process_pq_key_registration;
+    use crate::beacon::stf::heze_fixture::{EPOCH, config, registration, state};
+
+    #[test]
+    fn packing_keeps_candidates_that_apply_in_order() {
+        // Fixture state: no registered key.
+        //
+        //     candidate 0  validator 1, key 0   applies
+        //     candidate 1  validator 2, key 0   key 0 is now held: dropped
+        //     candidate 2  validator 1, key 1   names the marker, now stale: dropped
+        //     candidate 3  validator 3, key 2   applies
+        let state = state();
+        let candidates = vec![
+            registration(&state, 1, 0, FAR_FUTURE_EPOCH),
+            registration(&state, 2, 0, FAR_FUTURE_EPOCH),
+            registration(&state, 1, 1, FAR_FUTURE_EPOCH),
+            registration(&state, 3, 2, FAR_FUTURE_EPOCH),
+        ];
+        let expected = vec![candidates[0].clone(), candidates[3].clone()];
+
+        assert_eq!(
+            pack_pq_key_registrations(&state, candidates, &config()),
+            expected
+        );
+    }
+
+    #[test]
+    fn packing_on_a_gloas_state_keeps_nothing() {
+        // A gloas state has no registry, so no candidate can apply.
+        let heze = state();
+        let candidate = registration(&heze, 1, 0, FAR_FUTURE_EPOCH);
+        let gloas = with_signing_validators_at(ForkName::Gloas, 4);
+
+        assert_eq!(
+            pack_pq_key_registrations(&gloas, vec![candidate], &config()),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn the_pool_keeps_one_registration_per_pair_and_drops_stale_ones() {
+        // Fixture state: two registrations for the pair (1, far future), one for (2, far future).
+        let mut state = state();
+        let first = registration(&state, 1, 0, FAR_FUTURE_EPOCH);
+        let rival = registration(&state, 1, 1, FAR_FUTURE_EPOCH);
+        let other = registration(&state, 2, 2, FAR_FUTURE_EPOCH);
+        let mut pool = OperationPool::default();
+        assert!(pool.insert(BeaconOperation::PqKeyRegistration(Box::new(first.clone()))));
+        assert!(!pool.insert(BeaconOperation::PqKeyRegistration(Box::new(rival))));
+        assert!(pool.insert(BeaconOperation::PqKeyRegistration(Box::new(other.clone()))));
+
+        // The head applies validator 1's registration: its change epoch moves to 20.
+        process_pq_key_registration(&mut state, &first, &config()).unwrap();
+        assert_eq!(
+            state
+                .pq_registry()
+                .unwrap()
+                .validator(1)
+                .unwrap()
+                .change_epoch,
+            EPOCH
+        );
+
+        // Validator 1's pooled registration names a stale epoch and goes; validator 2's stays.
+        pool.prune(&state);
+        assert_eq!(pool.pq_key_registrations(), vec![other]);
     }
 }
