@@ -249,6 +249,19 @@ has no end-to-end figure to adjust. The value is recorded as
 `params.block_delay_ms` in the JSON report and printed in the human header, so
 compare only reports made with the same delay.
 
+**`--warm-committee-sums`** (default off) warms each epoch's committee key
+sums before the epoch's first block is imported. A live node does this on the
+epoch precompute worker between slots; a replay drives `import_block`
+directly with no tick loop, so that worker never runs and the sums stay cold,
+which hides the committee-sum saving. This flag reproduces only the worker's
+committee-sum warm-up (not its state advance, which the import still does
+inside the measured span). It runs before a block whose epoch is later than the
+previous block's, and for both the first block's epoch and the one before it
+ahead of the first block. The warm-up runs outside every measured span, so it
+is in no phase and no `wall_seconds`. The flag is recorded as
+`params.warm_committee_sums` in the JSON report and printed in the human
+header; compare only reports made with the same setting.
+
 ### What is measured
 
 The measured span is one `BlockChainServer::import_block` call per block, the
