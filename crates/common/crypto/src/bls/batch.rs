@@ -36,7 +36,7 @@
 
 use blst::BLST_ERROR;
 use blst::blst_scalar;
-use blst::min_pk::{AggregatePublicKey, PublicKey, Signature};
+use blst::min_pk::{PublicKey, Signature};
 use rand::RngExt;
 
 use ethlambda_types::beacon::primitives::{BlsPubkey, BlsSignature, Root};
@@ -99,12 +99,9 @@ impl SignatureSet {
         }
         let signature = Signature::sig_validate(signature.as_ref(), false).ok()?;
         let points = validated_pubkeys(pubkeys)?;
-        let point_refs: Vec<&PublicKey> = points.iter().collect();
-        // Every point above already passed `key_validate`, so the sum skips
-        // re-checking them.
-        let pubkey = AggregatePublicKey::aggregate(&point_refs, false)
-            .ok()?
-            .to_public_key();
+        // Every point above already passed `key_validate`, so the sum does
+        // not re-check them.
+        let pubkey = super::sum_validated_points(&points)?;
         Some(Self {
             pubkey,
             message,
@@ -139,6 +136,10 @@ impl SignatureSet {
     /// Whether the key is the identity, which no signature can validly be
     /// made under. Only a sum of keys can be: a single registry key is
     /// rejected by `key_validate` if it is.
+    ///
+    /// blst rejects the same input itself (`BLST_PK_IS_INFINITY`, from the
+    /// pairing aggregation both the single and the batch check go through),
+    /// so this makes the existing rule explicit and changes no behavior.
     fn key_is_identity(&self) -> bool {
         self.pubkey.to_bytes()[0] & INFINITY_FLAG != 0
     }
@@ -164,8 +165,8 @@ fn random_weight(rng: &mut impl RngExt) -> blst_scalar {
 /// See the module documentation for why the weights are random. A single set
 /// skips them and is verified directly, since one equation needs no
 /// combining. A set whose key is the identity fails the batch, as it fails
-/// [`SignatureSet::verify`]: the weighted equation would otherwise let an
-/// identity key over an identity signature through.
+/// [`SignatureSet::verify`]. blst rejects that input itself, so the explicit
+/// check only states the rule where a reader of the batch looks for it.
 pub fn verify_signature_sets(sets: &[SignatureSet]) -> bool {
     match sets {
         [] => return true,
