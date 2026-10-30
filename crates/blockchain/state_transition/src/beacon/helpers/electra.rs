@@ -123,7 +123,7 @@
 //! single easiest mistake to make copying that shape without also copying
 //! the reasoning behind it.
 
-use crate::beacon::bls;
+use crate::beacon::bls::{self, AggregatePubkey};
 use crate::beacon::config::Config;
 use crate::beacon::constants::{self, FAR_FUTURE_EPOCH};
 use crate::beacon::containers::shared::Validator;
@@ -139,8 +139,8 @@ use crate::beacon::primitives::{
 };
 
 use super::accessors::{
-    CommitteeCache, CommitteeCacheExt, get_active_validator_indices, get_current_epoch, get_domain,
-    get_seed, get_total_active_balance,
+    CommitteeCache, CommitteeCacheExt, committee_number, get_active_validator_indices,
+    get_current_epoch, get_domain, get_seed, get_total_active_balance,
 };
 use super::math::bytes_to_uint64;
 use super::misc::{compute_activation_exit_epoch, compute_epoch_at_slot, compute_signing_root};
@@ -511,6 +511,93 @@ pub(crate) fn attesting_indices_from_committee_bits(
 
     indices.sort_unstable();
     Ok(indices)
+}
+
+/// The aggregate key of the attesters an electra-shaped attestation names:
+/// the sum of their public keys, which is what `bls.FastAggregateVerify`
+/// checks the signature against. `Ok(None)` when a key fails validation, a
+/// named attester is outside the registry, or no attester is set.
+///
+/// Walks the committees the way [`attesting_indices_from_committee_bits`]
+/// does, `is_set` being the same closure over the aggregation bits (gloas
+/// passes its progressive bitlist through it, so one builder serves both).
+/// Per committee, when the shuffling's key sums are warm
+/// ([`CommitteeCacheExt::key_sums`], lookup only: import never builds them)
+/// and more than half of the committee attested, the committee's part is its
+/// sum minus the keys of the non-attesters; otherwise it is the sum of the
+/// attesters. A committee whose sum is `None` (a member's key fails
+/// validation) takes the second branch, so only the attesters' own keys decide
+/// it, exactly as with cold sums. The parts are then added.
+/// Subtracting is the same group element as summing the attesters, so the
+/// pairing check cannot tell the two apart; only the point additions differ,
+/// absentees' instead of attesters'.
+///
+/// Phase0 through deneb attestations stay on the direct path: each names one
+/// committee, and the live chain is past electra.
+#[allow(
+    dead_code,
+    reason = "wired into process_attestation by the next change"
+)]
+pub(crate) fn attesters_aggregate_pubkey(
+    state: &BeaconState,
+    slot: Slot,
+    committee_bits: &electra::CommitteeBits,
+    is_set: impl Fn(usize) -> bool,
+    committees: &CommitteeCache,
+) -> Result<Option<AggregatePubkey>> {
+    let epoch = compute_epoch_at_slot(slot);
+    let epoch_committees = committees.committees(state, epoch);
+    let key_sums = committees.key_sums(state, epoch);
+    let committees_per_slot = epoch_committees.committees_per_slot();
+
+    let pubkey_of = |index: ValidatorIndex| state.validator(index).ok().map(|v| v.pubkey);
+
+    let mut total: Option<AggregatePubkey> = None;
+    let mut committee_offset = 0usize;
+    for committee_index in get_committee_indices(committee_bits) {
+        let committee = epoch_committees.committee(slot, committee_index)?;
+        let first_bit = committee_offset;
+        committee_offset += committee.len();
+
+        let attested: Vec<bool> = (0..committee.len())
+            .map(|position| is_set(first_bit + position))
+            .collect();
+        let attester_count = attested.iter().filter(|set| **set).count();
+        if attester_count == 0 {
+            continue;
+        }
+
+        let number = committee_number(slot, committees_per_slot, committee_index)?;
+        let sum = key_sums.as_ref().and_then(|sums| sums.get(number as usize));
+        let part = match sum {
+            Some(sum) if attester_count * 2 > committee.len() => {
+                let absent: Option<Vec<_>> = committee
+                    .iter()
+                    .zip(&attested)
+                    .filter(|(_, set)| !**set)
+                    .map(|(index, _)| pubkey_of(*index))
+                    .collect();
+                absent.and_then(|absent| sum.minus(&absent))
+            }
+            _ => {
+                let present: Option<Vec<_>> = committee
+                    .iter()
+                    .zip(&attested)
+                    .filter(|(_, set)| **set)
+                    .map(|(index, _)| pubkey_of(*index))
+                    .collect();
+                present.and_then(|present| AggregatePubkey::sum(&present))
+            }
+        };
+        let Some(part) = part else {
+            return Ok(None);
+        };
+        total = Some(match total {
+            Some(total) => total.plus(&part),
+            None => part,
+        });
+    }
+    Ok(total)
 }
 
 /// The committee members whose bit is set in `attestation`, in ascending
@@ -1989,5 +2076,174 @@ mod tests {
                 .unwrap()
         );
         assert_ne!(electra_limit, gloas_limit);
+    }
+
+    // -- attesters_aggregate_pubkey ------------------------------------------
+
+    use crate::beacon::helpers::accessors::get_current_epoch;
+    use crate::beacon::helpers::misc::compute_start_slot_at_epoch;
+    use crate::beacon::helpers::test_state::{sign_for, with_signing_validators_at};
+    use crate::beacon::primitives::Root;
+
+    /// Enough validators for two committees per slot, so one attestation can
+    /// name two committees; mainnet's preset is the only one these run under.
+    fn two_committees_per_slot_state() -> BeaconState {
+        let count = (preset::SLOTS_PER_EPOCH * preset::TARGET_COMMITTEE_SIZE * 2) as usize;
+        with_signing_validators_at(ForkName::Electra, count)
+    }
+
+    /// A reproducible xorshift stream, so a failing mask can be replayed.
+    fn next(seed: &mut u64) -> u64 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed
+    }
+
+    fn bits_naming(indices: &[usize]) -> electra::CommitteeBits {
+        let mut bits = electra::CommitteeBits::default();
+        for index in indices {
+            bits.set(*index, true).unwrap();
+        }
+        bits
+    }
+
+    /// Whether `key` is exactly the sum of the validators `attesters` names, by
+    /// the only check available from outside the crypto crate: it verifies the
+    /// aggregate of those validators' signatures over one message, which a
+    /// different group element would not.
+    fn is_sum_of(key: &AggregatePubkey, attesters: &[ValidatorIndex], message: Root) -> bool {
+        let signatures: Vec<_> = attesters
+            .iter()
+            .map(|index| sign_for(*index as usize, message))
+            .collect();
+        let aggregate = bls::aggregate(&signatures).unwrap();
+        key.verify(message, &aggregate)
+    }
+
+    /// For random committee sizes and masks of every shape the majority rule
+    /// distinguishes, the builder's key is the attesters' sum, with the sums
+    /// cold and with them warm.
+    #[test]
+    fn the_builder_key_is_the_attesters_sum_with_cold_and_warm_sums() {
+        let state = two_committees_per_slot_state();
+        let epoch = get_current_epoch(&state);
+        let message = Root::repeat_byte(0x42);
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+
+        let cold = CommitteeCache::default();
+        let warm = CommitteeCache::default();
+        warm.warm_key_sums(&state, epoch);
+        assert!(warm.key_sums(&state, epoch).is_some());
+        assert!(cold.key_sums(&state, epoch).is_none());
+
+        for slot_offset in [0u64, 7, 31] {
+            let slot = compute_start_slot_at_epoch(epoch) + slot_offset;
+            let committee_sets: [&[usize]; 3] = [&[0], &[1], &[0, 1]];
+            for named in committee_sets {
+                let bits = bits_naming(named);
+                let epoch_committees = warm.committees(&state, epoch);
+                let members: Vec<ValidatorIndex> = named
+                    .iter()
+                    .flat_map(|c| {
+                        epoch_committees
+                            .committee(slot, *c as u64)
+                            .unwrap()
+                            .to_vec()
+                    })
+                    .collect();
+                let len = members.len();
+
+                let mut masks: Vec<Vec<bool>> = vec![
+                    vec![false; len],
+                    vec![true; len],
+                    (0..len).map(|p| p == len / 3).collect(),
+                    (0..len).map(|p| p < len / 2).collect(),
+                    (0..len).map(|p| p <= len / 2).collect(),
+                ];
+                for _ in 0..4 {
+                    masks.push(
+                        (0..len)
+                            .map(|_| !next(&mut seed).is_multiple_of(5))
+                            .collect(),
+                    );
+                    masks.push(
+                        (0..len)
+                            .map(|_| next(&mut seed).is_multiple_of(2))
+                            .collect(),
+                    );
+                }
+
+                for mask in masks {
+                    let attesters: Vec<ValidatorIndex> = members
+                        .iter()
+                        .zip(&mask)
+                        .filter(|(_, set)| **set)
+                        .map(|(index, _)| *index)
+                        .collect();
+                    for cache in [&cold, &warm] {
+                        let key = attesters_aggregate_pubkey(
+                            &state,
+                            slot,
+                            &bits,
+                            |bit| mask.get(bit).copied().unwrap_or(false),
+                            cache,
+                        )
+                        .unwrap();
+                        match key {
+                            None => assert!(attesters.is_empty(), "slot {slot} {named:?}"),
+                            Some(key) => assert!(
+                                is_sum_of(&key, &attesters, message),
+                                "slot {slot} committees {named:?} with {} of {len} set",
+                                attesters.len()
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A committee with a member whose key fails validation gets no sum, its
+    /// neighbours keep theirs, and the builder falls back to the attesters:
+    /// valid when the bad member did not attest, refused when it did.
+    #[test]
+    fn a_committee_with_an_invalid_member_key_falls_back() {
+        let mut state = two_committees_per_slot_state();
+        let epoch = get_current_epoch(&state);
+        let slot = compute_start_slot_at_epoch(epoch) + 3;
+        let message = Root::repeat_byte(0x17);
+
+        let probe = CommitteeCache::default();
+        let members = probe
+            .committees(&state, epoch)
+            .committee(slot, 0)
+            .unwrap()
+            .to_vec();
+        let bad = members[5];
+        state.validator_mut(bad).unwrap().pubkey = Default::default();
+
+        let committees = CommitteeCache::default();
+        committees.warm_key_sums(&state, epoch);
+        let sums = committees.key_sums(&state, epoch).expect("warmed");
+        let per_slot = committees.committees(&state, epoch).committees_per_slot();
+        let number = |index| committee_number(slot, per_slot, index).unwrap() as usize;
+        assert!(
+            sums.get(number(0)).is_none(),
+            "the bad committee has no sum"
+        );
+        assert!(sums.get(number(1)).is_some(), "its neighbour keeps one");
+
+        let bits = bits_naming(&[0]);
+        let without_bad: Vec<bool> = members.iter().map(|m| *m != bad).collect();
+        let key = attesters_aggregate_pubkey(&state, slot, &bits, |b| without_bad[b], &committees)
+            .unwrap()
+            .expect("the bad member did not attest");
+        let attesters: Vec<ValidatorIndex> =
+            members.iter().copied().filter(|m| *m != bad).collect();
+        assert!(is_sum_of(&key, &attesters, message));
+
+        let everyone = attesters_aggregate_pubkey(&state, slot, &bits, |_| true, &committees);
+        assert!(everyone.unwrap().is_none(), "the bad member attested");
     }
 }

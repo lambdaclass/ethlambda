@@ -439,6 +439,9 @@ pub fn key_validate(pubkey: &BlsPubkey) -> bool {
     validated_pubkey(pubkey).is_some()
 }
 
+mod committee_sums;
+pub use committee_sums::{AggregatePubkey, CommitteeKeySums};
+
 #[cfg(test)]
 mod tests {
     use super::*;
