@@ -680,6 +680,11 @@ impl GossipSignatureBuffer {
 /// per index up to the highest seen.
 const MAX_PLAUSIBLE_VALIDATOR_INDEX: u64 = 1 << 26;
 
+/// Spare entries [`Store::set_latest_message`] reserves past the index that
+/// outgrew the dense vote table, so a registry growing by a few validators an
+/// epoch reallocates the table rarely rather than on every new index.
+const LATEST_MESSAGES_HEADROOM: usize = 1 << 12;
+
 /// How many epoch-boundary [`JustifiedBalances`] snapshots the store keeps.
 const JUSTIFIED_BALANCES_CAPACITY: usize = 8;
 
@@ -4275,10 +4280,19 @@ impl Store {
         );
         let slot = usize::try_from(index).expect("validator index fits in usize");
         let mut beacon = self.beacon.lock().unwrap();
-        if beacon.latest_messages.len() <= slot {
-            beacon.latest_messages.resize(slot + 1, None);
+        let messages = &mut beacon.latest_messages;
+        if messages.len() <= slot {
+            // Exact growth plus headroom rather than `resize`'s amortized
+            // doubling: attestations name validators in no particular order,
+            // so the table is first sized by one high index and then doubled
+            // by a slightly higher one, leaving about half of a
+            // registry-sized table unused for the life of the process.
+            if messages.capacity() <= slot {
+                messages.reserve_exact(slot + 1 + LATEST_MESSAGES_HEADROOM - messages.len());
+            }
+            messages.resize(slot + 1, None);
         }
-        beacon.latest_messages[slot] = Some(message);
+        messages[slot] = Some(message);
     }
 
     /// Gloas: the payload timeliness committee's per-member votes on whether
@@ -9113,6 +9127,37 @@ mod tests {
         assert_eq!(store.latest_message(3), None, "a gap is not a vote");
         assert_eq!(store.latest_message(1_000), None, "past the table");
         assert_eq!(store.latest_message(u64::MAX), None);
+    }
+
+    #[test]
+    fn the_latest_message_table_grows_exactly_rather_than_doubling() {
+        let mut store = Store::test_store();
+        let message = LatestMessage {
+            epoch: 1,
+            slot: SLOTS_PER_EPOCH,
+            root: H256::from([1u8; 32]),
+            payload_present: false,
+        };
+        let capacity = |store: &Store| store.beacon.lock().unwrap().latest_messages.capacity();
+
+        // The first vote sizes the table, and a higher index inside the
+        // headroom fits without a reallocation.
+        let first = 100_000;
+        store.set_latest_message(first, message);
+        let sized = capacity(&store);
+        assert!(sized > usize::try_from(first).unwrap());
+        assert!(sized <= usize::try_from(first).unwrap() + 1 + LATEST_MESSAGES_HEADROOM);
+        store.set_latest_message(first + 10, message);
+        assert_eq!(capacity(&store), sized);
+
+        // Past the headroom, the table grows to the new index plus headroom,
+        // not to twice what it was.
+        let higher = first + u64::try_from(LATEST_MESSAGES_HEADROOM).unwrap() + 1_000;
+        store.set_latest_message(higher, message);
+        let grown = capacity(&store);
+        assert!(grown <= usize::try_from(higher).unwrap() + 1 + LATEST_MESSAGES_HEADROOM);
+        assert!(grown < 2 * sized);
+        assert_eq!(store.latest_message(higher).map(|vote| vote.epoch), Some(1));
     }
 
     #[test]
