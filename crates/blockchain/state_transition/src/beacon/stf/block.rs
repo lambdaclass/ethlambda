@@ -17,7 +17,7 @@
 //! every driver, present and future, call the identical function regardless of
 //! what else that fork's body carries.
 
-use crate::beacon::bls;
+use crate::beacon::bls::SignatureSet;
 use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::{self, BeaconBlockHeader, BeaconState, Eth1Data, altair, phase0};
@@ -31,16 +31,29 @@ use crate::beacon::helpers::math::xor;
 use crate::beacon::helpers::misc::compute_signing_root;
 use crate::beacon::preset;
 use crate::beacon::primitives::{BlsSignature, HashTreeRoot as _, Root, Slot, ValidatorIndex};
+use crate::beacon::stf::signatures::SignatureBatch;
 
 use super::{ExecutionEngine, bellatrix, capella, deneb, electra, fulu, gloas};
 
-/// Dispatches on the block's fork and runs that fork's own block processing.
+/// Dispatches on the block's fork and runs that fork's own block processing,
+/// then verifies every signature the processing deferred.
 ///
 /// Matches [`containers::SignedBeaconBlock`]'s variant once, then hands the
 /// unwrapped, fork-specific `BeaconBlock` to the function written for it. Called
 /// after [`super::process_slots`] has already advanced the state to the block's
 /// slot, so every arm validates and mutates a state already positioned at
 /// `signed_block`'s slot.
+///
+/// Means what it always did, that the block is valid: it builds the
+/// [`SignatureBatch`] the drivers push into and checks it before returning
+/// `Ok`, so a caller that has nothing to add to the batch (block production
+/// re-running its own block) needs no knowledge of it. A caller with a
+/// signature of its own to check alongside, such as the proposer's, calls
+/// [`process_block_with_signatures`] and verifies the batch itself.
+///
+/// An `Err` leaves `state` partly mutated, as it always could: an operation
+/// whose signature is deferred has already written when a bad signature is
+/// found at the end. Every caller discards the state after an error.
 pub fn process_block(
     state: &mut BeaconState,
     signed_block: &containers::SignedBeaconBlock,
@@ -50,6 +63,38 @@ pub fn process_block(
     active_balances: &ActiveBalanceCache,
     options: BlockProcessingOptions,
 ) -> Result<()> {
+    let mut signatures = SignatureBatch::new();
+    process_block_with_signatures(
+        state,
+        signed_block,
+        config,
+        engine,
+        committees,
+        active_balances,
+        options,
+        &mut signatures,
+    )?;
+    signatures.verify()
+}
+
+/// [`process_block`] without the final signature check: every signature the
+/// block's processing needs is pushed into `signatures`, and the caller
+/// verifies them.
+///
+/// For [`super::apply_block`], which adds the proposer's block signature to the
+/// same batch so the whole block costs one pairing check. The block is only
+/// valid once `signatures.verify()` has returned `Ok`.
+#[allow(clippy::too_many_arguments)]
+pub fn process_block_with_signatures(
+    state: &mut BeaconState,
+    signed_block: &containers::SignedBeaconBlock,
+    config: &Config,
+    engine: &ExecutionEngine,
+    committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
+    options: BlockProcessingOptions,
+    signatures: &mut SignatureBatch,
+) -> Result<()> {
     match signed_block {
         containers::SignedBeaconBlock::Phase0(signed) => process_block_phase0(
             state,
@@ -58,6 +103,7 @@ pub fn process_block(
             committees,
             active_balances,
             options,
+            signatures,
         ),
         containers::SignedBeaconBlock::Altair(signed) => process_block_altair(
             state,
@@ -66,6 +112,7 @@ pub fn process_block(
             committees,
             active_balances,
             options,
+            signatures,
         ),
         containers::SignedBeaconBlock::Bellatrix(signed) => bellatrix::process_block(
             state,
@@ -75,6 +122,7 @@ pub fn process_block(
             committees,
             active_balances,
             options,
+            signatures,
         ),
         containers::SignedBeaconBlock::Capella(signed) => capella::process_block(
             state,
@@ -84,6 +132,7 @@ pub fn process_block(
             committees,
             active_balances,
             options,
+            signatures,
         ),
         containers::SignedBeaconBlock::Deneb(signed) => deneb::process_block(
             state,
@@ -93,6 +142,7 @@ pub fn process_block(
             committees,
             active_balances,
             options,
+            signatures,
         ),
         containers::SignedBeaconBlock::Electra(signed) => electra::process_block(
             state,
@@ -102,6 +152,7 @@ pub fn process_block(
             committees,
             active_balances,
             options,
+            signatures,
         ),
         containers::SignedBeaconBlock::Fulu(signed) => fulu::process_block(
             state,
@@ -111,6 +162,7 @@ pub fn process_block(
             committees,
             active_balances,
             options,
+            signatures,
         ),
         // ePBS (EIP-7732) restructures block processing around a builder's
         // bid rather than an embedded payload: a gloas block carries no
@@ -122,6 +174,7 @@ pub fn process_block(
             committees,
             active_balances,
             options,
+            signatures,
         ),
         containers::SignedBeaconBlock::Lean(_) => {
             crate::beacon::lean_block_unreachable("process_block")
@@ -138,6 +191,7 @@ pub fn process_block_phase0(
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
     options: BlockProcessingOptions,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     process_block_header(
         state,
@@ -146,7 +200,7 @@ pub fn process_block_phase0(
         block.parent_root,
         block.body.hash_tree_root(),
     )?;
-    process_randao(state, &block.body.randao_reveal, options.randao)?;
+    process_randao(state, &block.body.randao_reveal, options.randao, signatures)?;
     process_eth1_data(state, &block.body.eth1_data)?;
     crate::beacon::stf::operations::process_operations(
         state,
@@ -158,6 +212,7 @@ pub fn process_block_phase0(
         config,
         committees,
         active_balances,
+        signatures,
     )?;
     Ok(())
 }
@@ -175,6 +230,7 @@ pub fn process_block_altair(
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
     options: BlockProcessingOptions,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     process_block_header(
         state,
@@ -183,7 +239,7 @@ pub fn process_block_altair(
         block.parent_root,
         block.body.hash_tree_root(),
     )?;
-    process_randao(state, &block.body.randao_reveal, options.randao)?;
+    process_randao(state, &block.body.randao_reveal, options.randao, signatures)?;
     process_eth1_data(state, &block.body.eth1_data)?;
     crate::beacon::stf::operations::process_operations(
         state,
@@ -195,8 +251,14 @@ pub fn process_block_altair(
         config,
         committees,
         active_balances,
+        signatures,
     )?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
+    super::altair::process_sync_aggregate(
+        state,
+        &block.body.sync_aggregate,
+        active_balances,
+        signatures,
+    )?;
     Ok(())
 }
 
@@ -276,8 +338,9 @@ pub enum RandaoVerification {
     Skip,
 }
 
-/// Verifies the proposer's RANDAO reveal (unless `verification` skips it) and
-/// mixes it into the current epoch's randao mix.
+/// Defers the check of the proposer's RANDAO reveal (unless `verification`
+/// skips it) to `signatures`, and mixes the reveal into the current epoch's
+/// randao mix.
 ///
 /// The reveal signs the epoch rather than the slot, so the same signature would
 /// verify for every slot of the epoch: the mix it feeds is per-epoch, not
@@ -287,6 +350,7 @@ pub fn process_randao(
     state: &mut BeaconState,
     randao_reveal: &BlsSignature,
     verification: RandaoVerification,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let epoch = get_current_epoch(state);
     let proposer_index = get_beacon_proposer_index(state)?;
@@ -295,8 +359,8 @@ pub fn process_randao(
 
     let proposer = state.validator(proposer_index)?;
     if verification == RandaoVerification::Verify {
-        verify(
-            bls::verify(&proposer.pubkey, signing_root, randao_reveal),
+        signatures.push(
+            SignatureSet::single(&proposer.pubkey, signing_root, randao_reveal),
             "RANDAO reveal signature",
         )?;
     }
@@ -333,7 +397,9 @@ pub fn process_eth1_data(state: &mut BeaconState, eth1_data: &Eth1Data) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::beacon::bls;
     use crate::beacon::primitives::Bytes32;
+    use crate::beacon::stf::signatures::checked;
 
     /// An otherwise-empty block body, since the header, RANDAO, and eth1 checks
     /// below never look past its `hash_tree_root`.
@@ -410,9 +476,63 @@ mod tests {
         let reveal = BlsSignature(bls::G2_POINT_AT_INFINITY);
         let expected = xor(get_randao_mix(&state, epoch), hash(&reveal.0));
 
-        process_randao(&mut state, &reveal, RandaoVerification::Skip).unwrap();
+        checked(|s| process_randao(&mut state, &reveal, RandaoVerification::Skip, s)).unwrap();
 
         assert_eq!(get_randao_mix(&state, epoch), expected);
+    }
+
+    /// A reveal signed by the right proposer over the wrong message.
+    fn reveal_over(state: &BeaconState, signed: Root) -> BlsSignature {
+        let proposer = get_beacon_proposer_index(state).unwrap();
+        crate::beacon::helpers::test_state::sign_for(proposer as usize, signed)
+    }
+
+    #[test]
+    fn a_bad_randao_reveal_is_deferred_and_rejected_by_the_batch() {
+        let mut state = crate::beacon::helpers::test_state::with_validators(8);
+        let reveal = reveal_over(&state, Root::repeat_byte(7));
+        let mut signatures = SignatureBatch::new();
+
+        // Nothing is checked while processing; the batch is what rejects.
+        process_randao(
+            &mut state,
+            &reveal,
+            RandaoVerification::Verify,
+            &mut signatures,
+        )
+        .unwrap();
+        let err = signatures.verify().unwrap_err();
+        assert!(
+            format!("{err:?}").contains("RANDAO reveal signature"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_valid_randao_reveal_passes_the_batch() {
+        let mut state = crate::beacon::helpers::test_state::with_validators(8);
+        let epoch = get_current_epoch(&state);
+        let domain = get_domain(&state, constants::DOMAIN_RANDAO, None);
+        let signing_root = compute_signing_root(epoch.hash_tree_root(), domain);
+        let reveal = reveal_over(&state, signing_root);
+
+        checked(|s| process_randao(&mut state, &reveal, RandaoVerification::Verify, s)).unwrap();
+    }
+
+    #[test]
+    fn skipping_randao_verification_pushes_nothing() {
+        let mut state = crate::beacon::helpers::test_state::with_validators(8);
+        let reveal = BlsSignature(bls::G2_POINT_AT_INFINITY);
+        let mut signatures = SignatureBatch::immediate();
+
+        process_randao(
+            &mut state,
+            &reveal,
+            RandaoVerification::Skip,
+            &mut signatures,
+        )
+        .unwrap();
+        signatures.verify().unwrap();
     }
 
     #[test]
@@ -420,6 +540,9 @@ mod tests {
         let mut state = crate::beacon::helpers::test_state::with_validators(8);
         let reveal = BlsSignature(bls::G2_POINT_AT_INFINITY);
 
-        assert!(process_randao(&mut state, &reveal, RandaoVerification::Verify).is_err());
+        assert!(
+            checked(|s| process_randao(&mut state, &reveal, RandaoVerification::Verify, s))
+                .is_err()
+        );
     }
 }

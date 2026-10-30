@@ -20,27 +20,11 @@
 //! `key_validate` is never summed, and a failure is reported as `None` rather
 //! than as a sum that silently omits the key.
 
-use blst::BLST_ERROR;
-use blst::MultiPoint;
-use blst::min_pk::{AggregatePublicKey, PublicKey, Signature};
+use blst::min_pk::{AggregatePublicKey, PublicKey};
 
 use ethlambda_types::beacon::primitives::{BlsPubkey, BlsSignature, Root};
 
-use super::{DST, validated_pubkeys};
-
-/// The sum of `points`, or `None` for an empty slice.
-///
-/// `blst`'s batched addition indexes its first element, so an empty input has
-/// to be refused here rather than reaching it. Every point passed already
-/// cleared `key_validate`, so nothing is re-checked. Equal points are fine: the
-/// addition doubles where it must, which matters because committees drawn with
-/// replacement (sync and payload timeliness committees) can hold one key twice.
-fn sum_points(points: &[PublicKey]) -> Option<AggregatePublicKey> {
-    if points.is_empty() {
-        return None;
-    }
-    Some(points.add())
-}
+use super::{SignatureSet, sum_validated_projective, validated_pubkeys};
 
 /// A sum of validated public keys, kept as a curve point. Never serialized.
 ///
@@ -57,7 +41,7 @@ impl AggregatePubkey {
     /// `pubkeys` is empty or any key fails validation.
     pub fn sum(pubkeys: &[BlsPubkey]) -> Option<Self> {
         let points = validated_pubkeys(pubkeys)?;
-        sum_points(&points).map(Self)
+        sum_validated_projective(&points).map(Self)
     }
 
     /// `self - sum(pubkeys)`, with each key validated through the pubkey
@@ -71,7 +55,7 @@ impl AggregatePubkey {
             return Some(*self);
         }
         let points = validated_pubkeys(pubkeys)?;
-        let removed = sum_points(&points)?;
+        let removed = sum_validated_projective(&points)?;
         let mut result = self.0;
         result.sub_aggregate(&removed);
         Some(Self(result))
@@ -94,12 +78,13 @@ impl AggregatePubkey {
     /// of validated points is in the subgroup; the identity is the one value
     /// that is not a valid key, and `blst` rejects it at pairing time.
     pub fn verify(&self, message: Root, signature: &BlsSignature) -> bool {
-        let Ok(signature) = Signature::sig_validate(signature.as_ref(), false) else {
-            return false;
-        };
-        let key = self.0.to_public_key();
-        signature.fast_aggregate_verify_pre_aggregated(false, message.as_slice(), DST, &key)
-            == BLST_ERROR::BLST_SUCCESS
+        SignatureSet::from_aggregate(*self, message, signature).is_some_and(|set| set.verify())
+    }
+
+    /// The sum as an affine key, the form a [`SignatureSet`] holds. One field
+    /// inversion, which is why the sums stay projective until they are checked.
+    pub(super) fn to_public_key(self) -> PublicKey {
+        self.0.to_public_key()
     }
 
     /// The sum compressed, for comparing two sums in tests.
@@ -147,6 +132,7 @@ impl std::fmt::Debug for CommitteeKeySums {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::DST;
     use blst::min_pk::SecretKey;
 
     fn secret(seed: u64) -> SecretKey {
