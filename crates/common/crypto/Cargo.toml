@@ -13,6 +13,7 @@ version.workspace = true
 blst = "0.3.16"
 ethlambda-metrics.workspace = true
 ethlambda-types.workspace = true
+rand.workspace = true
 rayon.workspace = true
 
 leanvm.workspace = true

@@ -403,7 +403,7 @@ pub fn assemble_gloas_block_on_bid(
         body,
     };
     let mut post = state.clone();
-    stf::gloas::process_block(
+    stf::gloas::process_block_and_verify(
         &mut post,
         &block,
         config,
@@ -529,7 +529,7 @@ pub fn assemble_gloas_block(
     let BeaconState::Gloas(_) = &post else {
         unreachable!("checked above")
     };
-    stf::gloas::process_block(
+    stf::gloas::process_block_and_verify(
         &mut post,
         &block,
         config,
@@ -745,7 +745,7 @@ pub mod test_support {
     /// The state after `block` is applied to `state`, as the chain stores it.
     pub fn post_state(state: &BeaconState, block: &BeaconBlock) -> BeaconState {
         let mut post = state.clone();
-        stf::gloas::process_block(
+        stf::gloas::process_block_and_verify(
             &mut post,
             block,
             &config(),
@@ -1042,7 +1042,7 @@ mod gloas_block_production_tests {
 
         // Importing it with the same option lands on the state root it names.
         let mut post = state.clone();
-        stf::gloas::process_block(
+        stf::gloas::process_block_and_verify(
             &mut post,
             &produced.block,
             &config(),

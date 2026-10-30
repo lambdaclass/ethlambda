@@ -47,6 +47,7 @@ use super::helpers::electra::{
 use super::helpers::misc::compute_signing_root;
 use super::helpers::predicates::is_slashable_validator;
 use super::lean_boundary::lean_state_unreachable;
+use super::stf::signatures::SignatureBatch;
 use super::stf::{self, ExecutionEngine};
 use ethlambda_storage::pools::single_committee;
 
@@ -442,7 +443,7 @@ fn pack_each<T>(
     candidates: Vec<T>,
     max: usize,
     config: &Config,
-    apply: impl Fn(&mut BeaconState, &T, &Config) -> Result<()>,
+    apply: impl Fn(&mut BeaconState, &T, &Config, &mut SignatureBatch) -> Result<()>,
 ) -> Vec<T> {
     let mut packed = Vec::new();
     // Bounds the work if the pool is full of stale entries.
@@ -450,7 +451,11 @@ fn pack_each<T>(
         if packed.len() == max {
             break;
         }
-        if apply(scratch, &candidate, config).is_ok() {
+        // An immediate batch, so a bad signature rejects the candidate before
+        // it writes, which is what lets a rejected candidate leave `scratch`
+        // untouched (see above); a deferred batch would only fail at the end.
+        let mut signatures = SignatureBatch::immediate();
+        if apply(scratch, &candidate, config, &mut signatures).is_ok() {
             packed.push(candidate);
         }
     }
