@@ -88,14 +88,14 @@ anything that does not advance past them.
   slot is equivocation that peers penalize in gossip, not a slashing.
 - **What is not covered:** the same keys running in another client on another
   machine. No local record can see that.
-- **Keymanager consequences:** history is not carried in or out yet.
-  `DELETE /eth/v1/keystores` must return an EIP-3076 interchange; this client
-  returns a well-formed but empty one whose `genesis_validators_root` is
-  deliberately all-zero, so a conformant importer rejects it outright rather
-  than trusting an empty history. `POST` accepts the `slashing_protection`
-  field and ignores it, with a server-side warning, so an imported key starts
-  at the current slot and epoch, like one registered by
-  `--init-slashing-protection`.
+- **Interchange:** an import (`ethlambda slashing-protection import`, or the
+  keymanager API's `POST /eth/v1/keystores`) reduces each validator to its
+  highest slot, source and target and merges them with the record by maximum,
+  so slashable data in the file is absorbed rather than refused, as Lighthouse
+  and Nimbus do. An export (`ethlambda slashing-protection export`, or `DELETE
+  /eth/v1/keystores`) is the record itself, in the minimal format. Both pass
+  the shared `eth-clients/slashing-protection-interchange-tests` v5.3.0 vectors
+  under their `should_succeed` (minimal) expectations.
 
 ## Builder bids: gossip and API only (no builder API)
 

@@ -19,12 +19,10 @@
 //!
 //! [`docs/spec_deviations.md`]: https://github.com/lambdaclass/ethlambda/blob/main/docs/spec_deviations.md
 //!
-//! The keymanager API registers a key it imports before loading it. It does
-//! not yet carry history in or out: its specification makes
-//! `slashing_protection` a required field of the `DELETE /eth/v1/keystores`
-//! response, so this implementation returns a well-formed but empty EIP-3076
-//! interchange, and accepts and ignores the optional `slashing_protection`
-//! field on import.
+//! History moves in and out as EIP-3076 interchange files: through the
+//! keymanager API's `POST` and `DELETE /eth/v1/keystores`, and offline through
+//! `ethlambda slashing-protection`. A key imported with no history is
+//! registered as never having signed before it is loaded.
 
 pub mod aggregation;
 pub mod aggregation_selection;

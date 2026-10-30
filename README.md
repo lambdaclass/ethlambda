@@ -240,7 +240,7 @@ cargo build --release
 ```
 
 [`docs/cli.md`](./docs/cli.md) is the full flag reference for every sub-command,
-`benchmark` and `replay-era` included. The
+`benchmark`, `replay-era` and `slashing-protection` included. The
 [quickstart](#beacon-chain-follower) runs a release binary with the same arguments.
 
 #### `ethlambda node` — the Lean consensus chain
@@ -337,8 +337,9 @@ the standard Beacon API, so it works against `ethlambda beacon` (run with the
 > second validator client pointed at the same directory refuses to start. A key
 > with no record is refused at startup: pass `--init-slashing-protection` once,
 > and only for keys that have signed nothing anywhere for at least two epochs.
-> Importing history from another client is not supported yet, so never run
-> these keys in another client at the same time. See
+> A key moving from another client brings its history with
+> `ethlambda slashing-protection import`, or in the same keymanager API request
+> that imports the key, and never runs in two clients at once. See
 > [Spec deviations](./docs/spec_deviations.md#the-validator-client-keeps-eip-3076s-minimal-watermarks-not-full-history).
 
 ```sh

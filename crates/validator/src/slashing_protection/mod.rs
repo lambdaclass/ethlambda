@@ -205,6 +205,18 @@ impl Record {
         }
     }
 
+    /// Both records' maxima: what an import leaves when it meets an existing
+    /// record. Never less strict than either.
+    fn merged(self, other: Record) -> Record {
+        Record {
+            block_slot: self.block_slot.max(other.block_slot),
+            attestation: match (self.attestation, other.attestation) {
+                (Some(ours), Some(theirs)) => Some(ours.max_with(theirs)),
+                (ours, theirs) => ours.or(theirs),
+            },
+        }
+    }
+
     fn with_attestation(self, data: &AttestationData) -> Record {
         let next = Signed {
             source: data.source.epoch,
@@ -303,7 +315,8 @@ pub struct SlashingProtection {
 
 impl SlashingProtection {
     /// Open the record in `validators_dir` for the chain named by
-    /// `genesis_validators_root`, and hold its lock until this is dropped.
+    /// `genesis_validators_root`, and hold its lock until the returned record is
+    /// dropped.
     ///
     /// Every key in `keys` must already have a record. A key without one is
     /// refused unless `init` is set, in which case it is registered as of
@@ -368,6 +381,37 @@ impl SlashingProtection {
         if !existed || !missing.is_empty() {
             file::write(&path, genesis_validators_root, records.iter())?;
         }
+        Ok(Self {
+            genesis_validators_root,
+            records,
+            storage: Some(Storage { path, _lock: lock }),
+        })
+    }
+
+    /// Open the record in `validators_dir` without a beacon node, for the
+    /// `slashing-protection` command, holding its lock until the returned record
+    /// is dropped.
+    ///
+    /// The chain is whatever the record names. With no record yet, one is
+    /// started for `create_for` if given, which is how an interchange is
+    /// imported into a directory before the client first runs there; with
+    /// neither, this is an error. The file itself is only written by the
+    /// first change, so an import that fails, or imports nothing, leaves the
+    /// directory as it found it. A record created for the wrong chain is not
+    /// dangerous either: [`Self::open`] refuses it at the client's next start.
+    pub fn open_offline(validators_dir: &Path, create_for: Option<Root>) -> Result<Self> {
+        let lock = file::lock(validators_dir)?;
+        let path = validators_dir.join(file::FILE_NAME);
+        let (genesis_validators_root, records) = if file::exists(&path)? {
+            file::read(&path)?
+        } else if let Some(root) = create_for {
+            (root, HashMap::new())
+        } else {
+            return Err(Error::SlashingProtection {
+                path: path.display().to_string(),
+                reason: "there is no slashing-protection record in this directory".to_string(),
+            });
+        };
         Ok(Self {
             genesis_validators_root,
             records,
@@ -491,6 +535,110 @@ impl SlashingProtection {
             self.commit(new)?;
         }
         Ok(count)
+    }
+
+    /// The chain an EIP-3076 interchange names, read without importing it: what
+    /// a record created for it must belong to.
+    pub fn interchange_chain(interchange: &str) -> Result<Root> {
+        file::parse(interchange)
+            .map(|(root, _)| root)
+            .map_err(|reason| Error::SlashingProtection {
+                path: "interchange".to_string(),
+                reason,
+            })
+    }
+
+    /// The chain this record belongs to.
+    pub fn genesis_validators_root(&self) -> Root {
+        self.genesis_validators_root
+    }
+
+    /// Whether `pubkey` has a record.
+    pub fn contains(&self, pubkey: &BlsPubkey) -> bool {
+        self.records.contains_key(pubkey)
+    }
+
+    /// Every validator with a record.
+    pub fn pubkeys(&self) -> Vec<BlsPubkey> {
+        self.records.keys().copied().collect()
+    }
+
+    /// Merge an EIP-3076 version 5 interchange, complete or minimal, into the
+    /// record, in one durable write.
+    ///
+    /// Each validator in it is reduced to its highest slot, source and target
+    /// and merged with any existing record by taking the maximum of each, so an
+    /// import never lowers a watermark, and slashable data inside it (two
+    /// blocks for one slot, a surround, a source after its target) is absorbed
+    /// rather than refused: the result is at least as strict as every
+    /// message the file lists. A validator it names that has no record yet is
+    /// registered with the imported watermarks.
+    ///
+    /// All or nothing: an interchange for another chain or of another version,
+    /// or one that does not parse, changes nothing. Returns how many distinct
+    /// validators it named.
+    pub fn import(&mut self, interchange: &str) -> Result<usize> {
+        let refused = |reason: String| Error::SlashingProtection {
+            path: "interchange".to_string(),
+            reason,
+        };
+        let (root, entries) = file::parse(interchange).map_err(refused)?;
+        if root != self.genesis_validators_root {
+            return Err(refused(format!(
+                "it is for genesis_validators_root {}, but this record is for {}",
+                encode_hex(&root.0),
+                encode_hex(&self.genesis_validators_root.0)
+            )));
+        }
+
+        let mut staged: HashMap<BlsPubkey, Record> = HashMap::new();
+        for (pubkey, imported) in entries {
+            let current = staged
+                .get(&pubkey)
+                .or_else(|| self.records.get(&pubkey))
+                .copied()
+                .unwrap_or_default();
+            staged.insert(pubkey, current.merged(imported));
+        }
+        let count = staged.len();
+        if count > 0 {
+            self.commit(staged)?;
+        }
+        Ok(count)
+    }
+
+    /// Whether [`Self::import`] would accept `interchange`, changing nothing:
+    /// it parses, is of the right version, and is for this record's chain.
+    pub fn check_import(&self, interchange: &str) -> Result<()> {
+        let chain = Self::interchange_chain(interchange)?;
+        if chain != self.genesis_validators_root {
+            return Err(Error::SlashingProtection {
+                path: "interchange".to_string(),
+                reason: format!(
+                    "it is for genesis_validators_root {}, but this record is for {}",
+                    encode_hex(&chain.0),
+                    encode_hex(&self.genesis_validators_root.0)
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// The records of `pubkeys` as a minimal EIP-3076 version 5 interchange.
+    ///
+    /// A key with no record is left out rather than listed as never having
+    /// signed: an empty entry would tell the importer something this client
+    /// does not know.
+    pub fn export(&self, pubkeys: &[BlsPubkey]) -> Result<String> {
+        let selected = pubkeys
+            .iter()
+            .filter_map(|pubkey| self.records.get_key_value(pubkey));
+        file::render(self.genesis_validators_root, selected).map_err(|err| {
+            Error::SlashingProtection {
+                path: "interchange".to_string(),
+                reason: format!("could not encode the export: {err}"),
+            }
+        })
     }
 
     /// Apply `changes` to the record: written to disk first, and taken into
@@ -977,6 +1125,125 @@ mod tests {
                 .is_symlink(),
             "the symlink must not have been replaced"
         );
+    }
+
+    /// A minimal interchange for `key` on `root`.
+    fn interchange(root_byte: u8, key: u8, slot: Slot, source: Epoch, target: Epoch) -> String {
+        format!(
+            r#"{{"metadata":{{"interchange_format_version":"5","genesis_validators_root":"{}"}},"data":[{{"pubkey":"{}","signed_blocks":[{{"slot":"{slot}"}}],"signed_attestations":[{{"source_epoch":"{source}","target_epoch":"{target}"}}]}}]}}"#,
+            encode_hex(&root(root_byte).0),
+            encode_hex(&pubkey(key).0)
+        )
+    }
+
+    #[test]
+    fn an_import_raises_the_watermarks_and_survives_a_restart() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        {
+            let mut protection = open(dir.path(), &[], false).expect("opens");
+            assert_eq!(
+                protection
+                    .import(&interchange(0x42, 1, 97, 2, 3))
+                    .expect("imports"),
+                1
+            );
+        }
+        let mut protection = open(dir.path(), &[1], false).expect("the imported key has a record");
+        assert!(propose(&mut protection, 1, 97).is_err());
+        assert!(attest(&mut protection, 1, &data(96, 2, 3, 0xaa)).is_err());
+        assert!(attest(&mut protection, 1, &data(128, 3, 4, 0xaa)).is_ok());
+    }
+
+    /// An older history imported over a newer record must not lower it.
+    #[test]
+    fn an_import_never_lowers_a_watermark() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut protection = open(dir.path(), &[1], true).expect("init");
+        propose(&mut protection, 1, 200).expect("propose");
+        attest(&mut protection, 1, &data(320, 9, 10, 0xaa)).expect("attest");
+
+        protection
+            .import(&interchange(0x42, 1, 97, 2, 3))
+            .expect("imports");
+        assert!(propose(&mut protection, 1, 150).is_err());
+        assert!(attest(&mut protection, 1, &data(160, 4, 5, 0xaa)).is_err());
+    }
+
+    #[test]
+    fn an_import_for_another_chain_changes_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut protection = open(dir.path(), &[], false).expect("opens");
+        let err = protection
+            .import(&interchange(0x99, 1, 97, 2, 3))
+            .expect_err("another chain");
+        assert!(err.to_string().contains("genesis_validators_root"), "{err}");
+        assert!(protection.is_empty());
+    }
+
+    #[test]
+    fn an_export_lists_only_keys_with_a_record() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut protection = open(dir.path(), &[1], true).expect("init");
+        propose(&mut protection, 1, 97).expect("propose");
+
+        let exported = protection.export(&[pubkey(1), pubkey(2)]).expect("exports");
+        let json: serde_json::Value = serde_json::from_str(&exported).expect("json");
+        assert_eq!(json["data"].as_array().expect("array").len(), 1);
+        assert_eq!(json["data"][0]["signed_blocks"][0]["slot"], "97");
+
+        // And it imports back into a fresh record as the same watermarks.
+        let other = tempfile::tempdir().expect("temp dir");
+        let mut fresh = open(other.path(), &[], false).expect("opens");
+        fresh.import(&exported).expect("round trip");
+        assert!(propose(&mut fresh, 1, 97).is_err());
+    }
+
+    #[test]
+    fn opening_offline_needs_a_record_or_a_chain_to_create_one_for() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(file::FILE_NAME);
+        SlashingProtection::open_offline(dir.path(), None).expect_err("nothing to open");
+        let mut created =
+            SlashingProtection::open_offline(dir.path(), Some(root(0x42))).expect("creates");
+        assert_eq!(created.genesis_validators_root(), root(0x42));
+        // Nothing is on disk until something is recorded, so an import that
+        // fails leaves no record behind for a chain nothing then runs on.
+        assert!(!path.exists(), "the record is not written at open");
+        created
+            .import(&interchange(0x42, 1, 97, 2, 3))
+            .expect("imports");
+        assert!(path.exists(), "the first change writes the record");
+        drop(created);
+        let reopened = SlashingProtection::open_offline(dir.path(), Some(root(0x99)))
+            .expect("an existing record keeps its own chain");
+        assert_eq!(reopened.genesis_validators_root(), root(0x42));
+    }
+
+    /// Importing a history twice is the same as importing it once: the merge
+    /// takes maxima, so the second pass changes nothing.
+    #[test]
+    fn an_import_is_idempotent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut protection = open(dir.path(), &[], false).expect("opens");
+        let history = interchange(0x42, 1, 97, 2, 3);
+        protection.import(&history).expect("imports");
+        let once = protection.export(&[pubkey(1)]).expect("exports");
+        assert_eq!(protection.import(&history).expect("imports again"), 1);
+        let twice = protection.export(&[pubkey(1)]).expect("exports");
+        assert_eq!(once, twice);
+        assert!(propose(&mut protection, 1, 97).is_err());
+        assert!(propose(&mut protection, 1, 98).is_ok());
+    }
+
+    #[test]
+    fn an_empty_interchange_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut protection = open(dir.path(), &[], false).expect("opens");
+        for text in ["", "{}", "[]"] {
+            protection.import(text).expect_err("not an interchange");
+            SlashingProtection::interchange_chain(text).expect_err("not an interchange");
+        }
+        assert!(protection.is_empty());
     }
 
     #[test]

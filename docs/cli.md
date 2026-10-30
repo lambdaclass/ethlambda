@@ -8,7 +8,7 @@
 | `ethlambda beacon <flags>` | The Ethereum Beacon Chain, as a gossip follower |
 | `ethlambda <flags>` | `node`: the subcommand is injected |
 
-Three subcommands follow no chain. `ethlambda replay-era` replays real chain
+Four subcommands follow no chain. `ethlambda replay-era` replays real chain
 history from `.era` files and checks it against the states stored in them; see
 [`era_replay.md`](./era_replay.md) for its flags and checks. `ethlambda benchmark` is the offline
 benchmarking harness, covering block building (`benchmark synthetic`, run
@@ -18,7 +18,9 @@ what each workload measures; `benchmark import`'s flags are in
 [their own section](#benchmark-import-flags) below. `ethlambda validator` is
 the validator client: a separate process that holds keys and performs duties
 against a beacon node over the standard REST API, documented in
-[its own section](#validator-flags) below.
+[its own section](#validator-flags) below. `ethlambda slashing-protection`
+moves that client's EIP-3076 history in and out of its directory, offline; see
+[its section](#slashing-protection) below.
 
 ## `node` is the default
 
@@ -270,9 +272,11 @@ implementation's, so none of the [common flags](#common-flags) apply to it.
 
 > **Slashing protection** lives in `--validators-dir/slashing_protection.json`,
 > locked to one process, so `--validators-dir` must be writable: a read-only
-> mount of the keys (a Kubernetes Secret, a `:ro` volume) fails at startup. A key with no record is refused at startup unless
-> `--init-slashing-protection` is passed. Importing another client's history is
-> not supported yet. See
+> mount of the keys (a Kubernetes Secret, a `:ro` volume) fails at startup. A
+> key with no record is refused at startup unless `--init-slashing-protection`
+> is passed. A key moving here from another client brings its history with
+> [`slashing-protection import`](#slashing-protection), or in the same keymanager
+> API request that imports the key. See
 > [Spec Deviations](./spec_deviations.md#the-validator-client-keeps-eip-3076s-minimal-watermarks-not-full-history).
 
 | Flag | Default | Meaning |
@@ -428,6 +432,14 @@ specification requires; `POST graffiti` refuses text over 32 bytes rather than
 truncating it; and every route answers `404` for a key this client does not
 hold.
 
+The keystore routes carry slashing-protection history. `POST` refuses every
+key in the request if its `slashing_protection` does not parse or is for
+another chain, and otherwise writes that history once the keys are saved and
+before any is loaded; a validator the history names without a keystore in the
+request gets a record too. `DELETE`
+returns the deleted keys' records as a minimal EIP-3076 interchange, answering
+`not_active` for a key that is gone but still has a record.
+
 The specification requires TLS. This binds to `--http-address`, loopback by
 default; exposing it further means putting a TLS terminator in front.
 
@@ -438,6 +450,27 @@ Served on `--metrics-port`, prefixed `ethlambda_validator_` rather than the
 beacon chain. Every series is registered at startup so it reads zero rather
 than being absent before its first event, which is what lets an alert fire on
 "attestations stopped". See [Metrics](./metrics.md#validator-client).
+
+## `slashing-protection`
+
+Moves the validator client's EIP-3076 history in and out of its
+`--validators-dir`, offline. It takes the lock the client holds while running,
+so it refuses while a client runs on that directory, and it needs no beacon
+node: the record names its own chain.
+
+```sh
+# Bring a key's history from another client before its first start here.
+ethlambda slashing-protection import --validators-dir ./validators interchange.json
+
+# Hand the history over before running the keys elsewhere.
+ethlambda slashing-protection export --validators-dir ./validators out.json
+ethlambda slashing-protection export --validators-dir ./validators --pubkeys 0xab..,0xcd.. out.json
+```
+
+| Sub-command | Does |
+|---|---|
+| `import <file>` | Merges a version 5 interchange, complete or minimal, into the record. Each validator is reduced to its highest slot, source and target and merged by maximum, so nothing already recorded is lowered and slashable data in the file is absorbed rather than refused. All or nothing. With no record yet, the import creates one for the interchange's chain, and a failed import creates nothing; the client refuses the record at its next start if that is not its beacon node's chain |
+| `export [--pubkeys ...] <file>` | Writes the record, or the named validators' part of it, as a minimal version 5 interchange, readable by its owner only. A named validator with no record is left out, with a warning. Refuses to overwrite an existing file |
 
 ## `benchmark import` flags
 

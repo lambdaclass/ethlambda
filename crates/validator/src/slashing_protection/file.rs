@@ -98,6 +98,35 @@ struct SignedAttestation {
     signing_root: Option<String>,
 }
 
+/// Parse an EIP-3076 version 5 interchange, complete or minimal, into its
+/// chain and each entry's watermarks, in file order.
+///
+/// A pubkey listed more than once is returned more than once: an import merges
+/// them, while the record this client writes must never contain one twice.
+/// The error is a reason, for the caller to attach to whatever it was reading.
+pub(crate) fn parse(text: &str) -> std::result::Result<(Root, Vec<(BlsPubkey, Record)>), String> {
+    if text.trim().is_empty() {
+        return Err("empty; refusing to treat it as \"nothing signed\"".to_string());
+    }
+    let interchange: Interchange =
+        serde_json::from_str(text).map_err(|err| format!("malformed: {err}"))?;
+    if interchange.metadata.interchange_format_version != INTERCHANGE_VERSION {
+        return Err(format!(
+            "interchange format version {:?}, expected {INTERCHANGE_VERSION:?}",
+            interchange.metadata.interchange_format_version
+        ));
+    }
+    let entries = interchange
+        .data
+        .iter()
+        .map(|entry| (BlsPubkey(entry.pubkey), record_of(entry)))
+        .collect();
+    Ok((
+        Root::from(interchange.metadata.genesis_validators_root),
+        entries,
+    ))
+}
+
 /// Read and validate the record at `path`.
 pub(crate) fn read(path: &Path) -> Result<(Root, HashMap<BlsPubkey, Record>)> {
     let invalid = |reason: String| Error::SlashingProtection {
@@ -109,29 +138,10 @@ pub(crate) fn read(path: &Path) -> Result<(Root, HashMap<BlsPubkey, Record>)> {
         path: path.display().to_string(),
         source,
     })?;
-    if text.trim().is_empty() {
-        return Err(invalid(
-            "the file is empty; refusing to treat it as \"nothing signed\"".to_string(),
-        ));
-    }
-    let interchange: Interchange =
-        serde_json::from_str(&text).map_err(|err| invalid(format!("malformed: {err}")))?;
-    if interchange.metadata.interchange_format_version != INTERCHANGE_VERSION {
-        return Err(invalid(format!(
-            "interchange format version {:?}, expected {INTERCHANGE_VERSION:?}",
-            interchange.metadata.interchange_format_version
-        )));
-    }
+    let (root, entries) = parse(&text).map_err(invalid)?;
 
-    let mut records = HashMap::with_capacity(interchange.data.len());
-    for entry in interchange.data {
-        let pubkey = BlsPubkey(entry.pubkey);
-        let record = record_of(&entry).map_err(|reason| {
-            invalid(format!(
-                "validator {}: {reason}",
-                crate::beacon_node::dto::encode_hex(&pubkey.0)
-            ))
-        })?;
+    let mut records = HashMap::with_capacity(entries.len());
+    for (pubkey, record) in entries {
         if records.insert(pubkey, record).is_some() {
             return Err(invalid(format!(
                 "validator {} appears more than once",
@@ -139,39 +149,31 @@ pub(crate) fn read(path: &Path) -> Result<(Root, HashMap<BlsPubkey, Record>)> {
             )));
         }
     }
-    Ok((
-        Root::from(interchange.metadata.genesis_validators_root),
-        records,
-    ))
+    Ok((root, records))
 }
 
-/// The watermarks one entry stands for: the highest slot, source and target it
-/// lists. More than one entry of a kind is reduced rather than refused, since
-/// taking the maximum is never less strict than any one of them.
-fn record_of(entry: &Entry) -> std::result::Result<Record, String> {
+/// The watermarks one entry stands for: its highest slot, its highest source
+/// and its highest target, each taken on its own.
+///
+/// Taken independently, so the source can end up above the target: an
+/// interchange may carry slashable data, including an attestation whose source
+/// is after its target, and the importer is expected to absorb it rather than
+/// refuse it. The resulting watermarks are never less strict than any entry
+/// they were taken from.
+fn record_of(entry: &Entry) -> Record {
     let block_slot = entry.signed_blocks.iter().map(|block| block.slot).max();
-
-    let mut attestation: Option<Signed> = None;
-    for signed in &entry.signed_attestations {
-        if signed.source_epoch > signed.target_epoch {
-            return Err(format!(
-                "attestation source epoch {} is after its target epoch {}",
-                signed.source_epoch, signed.target_epoch
-            ));
-        }
-        let next = Signed {
+    let attestation = entry
+        .signed_attestations
+        .iter()
+        .map(|signed| Signed {
             source: signed.source_epoch,
             target: signed.target_epoch,
-        };
-        attestation = Some(match attestation {
-            Some(current) => current.max_with(next),
-            None => next,
-        });
-    }
-    Ok(Record {
+        })
+        .reduce(Signed::max_with);
+    Record {
         block_slot,
         attestation,
-    })
+    }
 }
 
 /// Whether the record at `path` exists, failing closed.
@@ -197,17 +199,17 @@ pub(crate) fn exists(path: &Path) -> Result<bool> {
     }
 }
 
-/// Durably replace the record at `path` with `records`.
+/// `records` as a minimal EIP-3076 interchange for the chain named by
+/// `genesis_validators_root`.
 ///
-/// Compact rather than pretty: the file is rewritten once per slot and per
+/// Compact rather than pretty: the record is rewritten once per slot and per
 /// block, and its size grows with the number of validators. Entries are
 /// written in pubkey order so the bytes depend only on the content, which
 /// keeps a diff of two files meaningful.
-pub(crate) fn write<'a>(
-    path: &Path,
+pub(crate) fn render<'a>(
     genesis_validators_root: Root,
     records: impl Iterator<Item = (&'a BlsPubkey, &'a Record)>,
-) -> Result<()> {
+) -> serde_json::Result<String> {
     let mut data: Vec<Entry> = records
         .map(|(pubkey, record)| Entry {
             pubkey: pubkey.0,
@@ -239,10 +241,20 @@ pub(crate) fn write<'a>(
         },
         data,
     };
-    let contents = serde_json::to_vec(&interchange).map_err(|err| Error::SlashingProtection {
-        path: path.display().to_string(),
-        reason: format!("could not encode the record: {err}"),
-    })?;
+    serde_json::to_string(&interchange)
+}
+
+/// Durably replace the record at `path` with `records`.
+pub(crate) fn write<'a>(
+    path: &Path,
+    genesis_validators_root: Root,
+    records: impl Iterator<Item = (&'a BlsPubkey, &'a Record)>,
+) -> Result<()> {
+    let contents =
+        render(genesis_validators_root, records).map_err(|err| Error::SlashingProtection {
+            path: path.display().to_string(),
+            reason: format!("could not encode the record: {err}"),
+        })?;
     crate::secure_fs::write_private_durably(path, contents).map_err(|source| Error::Io {
         path: path.display().to_string(),
         source,

@@ -30,6 +30,7 @@ const EXPLICIT: &[&str] = &[
     BENCHMARK,
     REPLAY_ERA,
     VALIDATOR,
+    SLASHING_PROTECTION,
     KEYGEN,
     "help",
     "-h",
@@ -43,6 +44,7 @@ const BEACON: &str = "beacon";
 const BENCHMARK: &str = "benchmark";
 const REPLAY_ERA: &str = "replay-era";
 const VALIDATOR: &str = "validator";
+const SLASHING_PROTECTION: &str = "slashing-protection";
 const KEYGEN: &str = "keygen";
 
 #[derive(Debug, clap::Parser)]
@@ -84,6 +86,9 @@ pub(crate) enum Command {
     ReplayEra(ReplayEraOptions),
     /// Run the beacon-chain validator client against a beacon node's HTTP API.
     Validator(crate::validator::ValidatorOptions),
+    /// Import or export the validator client's EIP-3076 slashing-protection
+    /// history, offline.
+    SlashingProtection(crate::slashing_protection::SlashingProtectionOptions),
     /// Generate validator XMSS keys for a genesis.
     Keygen(KeygenOptions),
 }
@@ -415,13 +420,44 @@ mod tests {
     /// `ethlambda node keygen ...`, which fails on a stray positional.
     #[test]
     fn sub_command_tokens_do_not_get_the_default_inserted() {
-        for token in [NODE, BEACON, BENCHMARK, VALIDATOR, KEYGEN] {
+        for token in [
+            NODE,
+            BEACON,
+            BENCHMARK,
+            VALIDATOR,
+            SLASHING_PROTECTION,
+            KEYGEN,
+        ] {
             let args = [OsString::from("ethlambda"), OsString::from(token)];
             assert_eq!(
                 default_subcommand(&args),
                 None,
                 "`{token}` must be recognised as a sub-command"
             );
+        }
+    }
+
+    #[test]
+    fn slashing_protection_parses_as_its_own_sub_command() {
+        let args = [
+            "ethlambda",
+            SLASHING_PROTECTION,
+            "export",
+            "--validators-dir",
+            "/tmp/validators",
+            "--pubkeys",
+            "0xaa,0xbb",
+            "out.json",
+        ];
+        match try_parse_from(args.iter().map(OsString::from)).expect("parses") {
+            Command::SlashingProtection(options) => match options.action {
+                crate::slashing_protection::Action::Export { pubkeys, file, .. } => {
+                    assert_eq!(pubkeys, vec!["0xaa", "0xbb"]);
+                    assert_eq!(file, PathBuf::from("out.json"));
+                }
+                other => panic!("expected an export, got {other:?}"),
+            },
+            other => panic!("expected a slashing-protection invocation, got {other:?}"),
         }
     }
 
