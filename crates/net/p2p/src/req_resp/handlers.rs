@@ -2773,6 +2773,7 @@ pub(crate) mod tests {
             blockchain: None,
             wire: built.wire,
             connected_peers: HashMap::new(),
+            peer_table: ethlambda_network_api::PeerTableController::default(),
             peer_custody: HashMap::new(),
             pending_root_requests: HashMap::new(),
             pending_envelope_requests: HashMap::new(),

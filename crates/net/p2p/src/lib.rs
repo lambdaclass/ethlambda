@@ -38,7 +38,8 @@ use std::{
 
 use either::Either;
 use ethlambda_network_api::{
-    FetchRequest, InitBlockChain, MetaDataController, P2PToBlockChainRef,
+    ConnectedPeer, FetchRequest, InitBlockChain, MetaDataController, P2PToBlockChainRef,
+    PeerDirection, PeerTableController,
     block_chain_to_p2p::{
         CheckDataColumnSidecars, FetchBlock, PublishAggregatedAttestation, PublishAttestation,
         PublishBlock,
@@ -1154,6 +1155,9 @@ pub struct P2P {
     /// The beacon `MetaData` this node answers peers with, for the same
     /// endpoint. `None` on a lean wire, which has no `MetaData`.
     local_metadata: Option<MetaDataController>,
+    /// The peers this node is connected to, for the Beacon API's
+    /// `/eth/v1/node/peers`.
+    peer_table: PeerTableController,
 }
 
 impl P2P {
@@ -1212,6 +1216,7 @@ impl P2P {
             .beacon()
             .map(|beacon| beacon::scoring::PeerScoring::new(&beacon.config, beacon.fork_digest));
         let local_metadata = built.wire.beacon().map(|beacon| beacon.metadata.clone());
+        let peer_table = PeerTableController::default();
 
         let server = P2PServer {
             swarm_handle,
@@ -1219,6 +1224,7 @@ impl P2P {
             blockchain: None,
             wire: built.wire,
             connected_peers: HashMap::new(),
+            peer_table: peer_table.clone(),
             peer_custody: HashMap::new(),
             pending_root_requests: HashMap::new(),
             pending_envelope_requests: HashMap::new(),
@@ -1303,6 +1309,7 @@ impl P2P {
             handle,
             local_enr,
             local_metadata,
+            peer_table,
         })
     }
 
@@ -1322,6 +1329,12 @@ impl P2P {
     /// updated whenever it changes. `None` on a lean wire.
     pub fn local_metadata(&self) -> Option<MetaDataController> {
         self.local_metadata.clone()
+    }
+
+    /// A live view of the peers this node is connected to. Written only by
+    /// the P2P actor.
+    pub fn peer_table(&self) -> PeerTableController {
+        self.peer_table.clone()
     }
 }
 
@@ -1351,6 +1364,9 @@ pub struct P2PServer {
     /// direction is the first connection's, which is the one that decides
     /// whether this peer was our choice or the network's.
     pub(crate) connected_peers: HashMap<PeerId, ConnectionDirection>,
+    /// [`Self::connected_peers`] plus what the Beacon API reports about each
+    /// peer, shared with the RPC layer. This actor is its only writer.
+    pub(crate) peer_table: PeerTableController,
     /// The columns each peer custodies, as computed from its own node id and
     /// its advertised custody group count.
     ///
@@ -1501,6 +1517,40 @@ impl P2PServer {
         }
         metrics::set_peers_by_direction(inbound, outbound);
         self.refresh_custody_column_metrics();
+    }
+
+    /// Publish a newly connected peer to the table the Beacon API reads.
+    ///
+    /// `remote` is the address of the connection that made the peer connected;
+    /// `/p2p/<peer id>` is appended unless the transport already carries it.
+    /// The ENR is whatever the dial loop kept from discovery, so it is absent
+    /// for an inbound peer and for a bootnode dialed from `--bootnodes`.
+    fn publish_connected_peer(
+        &self,
+        peer_id: PeerId,
+        direction: ConnectionDirection,
+        remote: &Multiaddr,
+    ) {
+        let mut address = remote.clone();
+        if !address
+            .iter()
+            .any(|protocol| matches!(protocol, Protocol::P2p(_)))
+        {
+            address.push(Protocol::P2p(peer_id));
+        }
+        let direction = match direction {
+            ConnectionDirection::Inbound => PeerDirection::Inbound,
+            ConnectionDirection::Outbound => PeerDirection::Outbound,
+        };
+        self.peer_table.insert(ConnectedPeer {
+            peer_id: peer_id.to_string(),
+            direction,
+            last_seen_p2p_address: address.to_string(),
+            enr: self
+                .discovery
+                .as_ref()
+                .and_then(|discovery| discovery.enr_of(&peer_id)),
+        });
     }
 
     /// Publish, per column this node samples, how many connected peers are
@@ -1971,6 +2021,7 @@ async fn handle_swarm_event(
             metrics::inc_peer_connection_transport(direction.as_str(), transport);
             if num_established.get() == 1 {
                 server.connected_peers.insert(peer_id, direction);
+                server.publish_connected_peer(peer_id, direction, endpoint.get_remote_address());
                 server.refresh_peer_metrics();
                 let peer_count = server.connected_peers.len();
                 metrics::notify_peer_connected(
@@ -2071,6 +2122,7 @@ async fn handle_swarm_event(
                     .connected_peers
                     .remove(&peer_id)
                     .unwrap_or(closed_direction);
+                server.peer_table.remove(&peer_id.to_string());
                 forget_discovered_peer(server, &peer_id);
                 server.refresh_peer_metrics();
                 let peer_count = server.connected_peers.len();
@@ -3035,6 +3087,7 @@ pub(crate) mod test_support {
             blockchain: None,
             wire: built.wire,
             connected_peers: HashMap::new(),
+            peer_table: ethlambda_network_api::PeerTableController::default(),
             peer_custody: HashMap::new(),
             pending_root_requests: HashMap::new(),
             pending_envelope_requests: HashMap::new(),

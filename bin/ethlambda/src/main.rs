@@ -146,6 +146,7 @@ fn beacon_identity(
         ],
         discovery_addresses: vec![format!("/{family}/{ip}/udp/{discovery_port}/p2p/{peer_id}")],
         metadata: None,
+        peers: None,
     }
 }
 
@@ -804,6 +805,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     };
     let rpc_identity = ethlambda_rpc::BeaconIdentity {
         metadata: p2p.local_metadata(),
+        peers: Some(p2p.peer_table()),
         ..beacon_identity(
             p2p.local_enr().unwrap_or_default(),
             common.discovery.advertise_ip,
