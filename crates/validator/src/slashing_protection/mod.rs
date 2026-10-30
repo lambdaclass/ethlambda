@@ -315,7 +315,8 @@ pub struct SlashingProtection {
 
 impl SlashingProtection {
     /// Open the record in `validators_dir` for the chain named by
-    /// `genesis_validators_root`, and hold its lock until this is dropped.
+    /// `genesis_validators_root`, and hold its lock until the returned record is
+    /// dropped.
     ///
     /// Every key in `keys` must already have a record. A key without one is
     /// refused unless `init` is set, in which case it is registered as of
@@ -388,22 +389,23 @@ impl SlashingProtection {
     }
 
     /// Open the record in `validators_dir` without a beacon node, for the
-    /// `slashing-protection` command, holding its lock until this is dropped.
+    /// `slashing-protection` command, holding its lock until the returned record
+    /// is dropped.
     ///
     /// The chain is whatever the record names. With no record yet, one is
-    /// created for `create_for` if given, which is how an interchange is
+    /// started for `create_for` if given, which is how an interchange is
     /// imported into a directory before the client first runs there; with
-    /// neither, this is an error. A record created for the wrong chain is not
-    /// dangerous: [`Self::open`] refuses it at the client's next start.
+    /// neither, this is an error. The file itself is only written by the
+    /// first change, so an import that fails, or imports nothing, leaves the
+    /// directory as it found it. A record created for the wrong chain is not
+    /// dangerous either: [`Self::open`] refuses it at the client's next start.
     pub fn open_offline(validators_dir: &Path, create_for: Option<Root>) -> Result<Self> {
         let lock = file::lock(validators_dir)?;
         let path = validators_dir.join(file::FILE_NAME);
         let (genesis_validators_root, records) = if file::exists(&path)? {
             file::read(&path)?
         } else if let Some(root) = create_for {
-            let records = HashMap::new();
-            file::write(&path, root, records.iter())?;
-            (root, records)
+            (root, HashMap::new())
         } else {
             return Err(Error::SlashingProtection {
                 path: path.display().to_string(),
@@ -1199,14 +1201,49 @@ mod tests {
     #[test]
     fn opening_offline_needs_a_record_or_a_chain_to_create_one_for() {
         let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(file::FILE_NAME);
         SlashingProtection::open_offline(dir.path(), None).expect_err("nothing to open");
-        let created =
+        let mut created =
             SlashingProtection::open_offline(dir.path(), Some(root(0x42))).expect("creates");
         assert_eq!(created.genesis_validators_root(), root(0x42));
+        // Nothing is on disk until something is recorded, so an import that
+        // fails leaves no record behind for a chain nothing then runs on.
+        assert!(!path.exists(), "the record is not written at open");
+        created
+            .import(&interchange(0x42, 1, 97, 2, 3))
+            .expect("imports");
+        assert!(path.exists(), "the first change writes the record");
         drop(created);
         let reopened = SlashingProtection::open_offline(dir.path(), Some(root(0x99)))
             .expect("an existing record keeps its own chain");
         assert_eq!(reopened.genesis_validators_root(), root(0x42));
+    }
+
+    /// Importing a history twice is the same as importing it once: the merge
+    /// takes maxima, so the second pass changes nothing.
+    #[test]
+    fn an_import_is_idempotent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut protection = open(dir.path(), &[], false).expect("opens");
+        let history = interchange(0x42, 1, 97, 2, 3);
+        protection.import(&history).expect("imports");
+        let once = protection.export(&[pubkey(1)]).expect("exports");
+        assert_eq!(protection.import(&history).expect("imports again"), 1);
+        let twice = protection.export(&[pubkey(1)]).expect("exports");
+        assert_eq!(once, twice);
+        assert!(propose(&mut protection, 1, 97).is_err());
+        assert!(propose(&mut protection, 1, 98).is_ok());
+    }
+
+    #[test]
+    fn an_empty_interchange_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut protection = open(dir.path(), &[], false).expect("opens");
+        for text in ["", "{}", "[]"] {
+            protection.import(text).expect_err("not an interchange");
+            SlashingProtection::interchange_chain(text).expect_err("not an interchange");
+        }
+        assert!(protection.is_empty());
     }
 
     #[test]

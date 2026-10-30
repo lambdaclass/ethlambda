@@ -273,7 +273,8 @@ implementation's, so none of the [common flags](#common-flags) apply to it.
 > mount of the keys (a Kubernetes Secret, a `:ro` volume) fails at startup. A
 > key with no record is refused at startup unless `--init-slashing-protection`
 > is passed. A key moving here from another client brings its history with
-> [`slashing-protection import`](#slashing-protection) or the keymanager API. See
+> [`slashing-protection import`](#slashing-protection), or in the same keymanager
+> API request that imports the key. See
 > [Spec Deviations](./spec_deviations.md#the-validator-client-keeps-eip-3076s-minimal-watermarks-not-full-history).
 
 | Flag | Default | Meaning |
@@ -432,7 +433,8 @@ hold.
 The keystore routes carry slashing-protection history. `POST` refuses every
 key in the request if its `slashing_protection` does not parse or is for
 another chain, and otherwise writes that history once the keys are saved and
-before any is loaded. `DELETE`
+before any is loaded; a validator the history names without a keystore in the
+request gets a record too. `DELETE`
 returns the deleted keys' records as a minimal EIP-3076 interchange, answering
 `not_active` for a key that is gone but still has a record.
 
@@ -465,8 +467,8 @@ ethlambda slashing-protection export --validators-dir ./validators --pubkeys 0xa
 
 | Sub-command | Does |
 |---|---|
-| `import <file>` | Merges a version 5 interchange, complete or minimal, into the record. Each validator is reduced to its highest slot, source and target and merged by maximum, so nothing already recorded is lowered and slashable data in the file is absorbed rather than refused. All or nothing. With no record yet, one is created for the interchange's chain; the client refuses it at its next start if that is not its beacon node's chain |
-| `export [--pubkeys ...] <file>` | Writes the record, or the named validators' part of it, as a minimal version 5 interchange. Refuses to overwrite an existing file |
+| `import <file>` | Merges a version 5 interchange, complete or minimal, into the record. Each validator is reduced to its highest slot, source and target and merged by maximum, so nothing already recorded is lowered and slashable data in the file is absorbed rather than refused. All or nothing. With no record yet, the import creates one for the interchange's chain, and a failed import creates nothing; the client refuses the record at its next start if that is not its beacon node's chain |
+| `export [--pubkeys ...] <file>` | Writes the record, or the named validators' part of it, as a minimal version 5 interchange, readable by its owner only. A named validator with no record is left out, with a warning. Refuses to overwrite an existing file |
 
 ## `benchmark import` flags
 

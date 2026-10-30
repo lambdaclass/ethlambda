@@ -12,9 +12,9 @@
 use std::io::Write as _;
 use std::path::PathBuf;
 
-use ethlambda_validator::beacon_node::dto::parse_pubkey;
+use ethlambda_validator::beacon_node::dto::{encode_hex, parse_pubkey};
 use ethlambda_validator::slashing_protection::SlashingProtection;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct SlashingProtectionOptions {
@@ -75,25 +75,56 @@ pub(crate) fn run(options: SlashingProtectionOptions) -> eyre::Result<()> {
             } else {
                 pubkeys
                     .iter()
-                    .map(|text| parse_pubkey(text))
+                    .map(|text| {
+                        parse_pubkey(text).map_err(|err| eyre::eyre!("--pubkeys {text}: {err}"))
+                    })
                     .collect::<Result<Vec<_>, _>>()?
             };
+            // A requested key with no record is left out of the file rather
+            // than listed as never having signed, so say so: an operator
+            // moving that key would otherwise find out at the other end.
+            let mut exported = 0;
+            for pubkey in &pubkeys {
+                if protection.contains(pubkey) {
+                    exported += 1;
+                } else {
+                    warn!(
+                        pubkey = %encode_hex(&pubkey.0),
+                        "No slashing-protection record for this validator; it is not in the export"
+                    );
+                }
+            }
             let interchange = protection.export(&pubkeys)?;
-            let mut output = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&file)
-                .map_err(|err| eyre::eyre!("{}: {err}", file.display()))?;
-            output
-                .write_all(interchange.as_bytes())
-                .and_then(|()| output.sync_all())
+            write_export(&file, &interchange)
                 .map_err(|err| eyre::eyre!("{}: {err}", file.display()))?;
             info!(
-                validators = pubkeys.len(),
+                validators = exported,
                 file = %file.display(),
                 "Exported slashing-protection history"
             );
         }
     }
     Ok(())
+}
+
+/// Write `interchange` to a new file at `path`, refusing an existing one.
+///
+/// Private to the owner, like the record it was taken from. A write that
+/// fails partway removes what it left, so the retry is not refused for a file
+/// this run created and never finished.
+fn write_export(path: &std::path::Path, interchange: &str) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut output = options.open(path)?;
+    output
+        .write_all(interchange.as_bytes())
+        .and_then(|()| output.sync_all())
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(path);
+        })
 }
