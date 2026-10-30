@@ -183,7 +183,10 @@ operation topics. A
 mainnet slot carries up to `MAX_COMMITTEES_PER_SLOT *
 TARGET_AGGREGATORS_PER_COMMITTEE` aggregates alone, arriving every slot rather
 than only during a range sync, which is why that traffic needs a pool of its
-own rather than sharing the block and column one. Accept propagates the
+own rather than sharing the block and column one. Each pool's occupancy,
+refusals and blocking-pool queue delay are metrics, with the queries that tell
+whether validation competes with block import: see "Validation contention" in
+[`metrics.md`](metrics.md). Accept propagates the
 message; a message whose dependency is not ready yet is IGNOREd. See
 [Aggregate attestations](#aggregate-attestations) for the two topics with
 their own section.
