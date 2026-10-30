@@ -40,21 +40,39 @@ use crate::beacon::error::{Result, verify};
 
 /// The signatures a block's processing defers, checked together once it ends.
 ///
-/// See the module documentation for what may be deferred and why. A batch
-/// built with [`Self::new`] verifies nothing until [`Self::verify`]; one built
-/// with [`Self::immediate`] checks each set as it is pushed, which is for the
+/// See the module documentation for what may be deferred and why. Outside
+/// this crate there are two ways to get one, and both check every set pushed:
+/// [`Self::deferred`] verifies the batch once its closure returns, and
+/// [`Self::immediate`] checks each set as it is pushed, which is for the
 /// callers that apply an operation to a scratch state and must learn at once
-/// whether it was accepted.
+/// whether it was accepted. A deferring batch that could be dropped
+/// unverified would turn every function taking one into "valid except for
+/// its signatures".
 #[derive(Default)]
 pub struct SignatureBatch {
-    sets: Vec<(SignatureSet, &'static str)>,
+    sets: Vec<SignatureSet>,
+    /// `sets[i]`'s label, apart from the sets so the batch check reads them
+    /// without a copy.
+    labels: Vec<&'static str>,
     immediate: bool,
 }
 
 impl SignatureBatch {
-    /// An empty batch that defers every set pushed to it.
-    pub fn new() -> Self {
+    /// An empty batch that defers every set pushed to it. Crate-internal: the
+    /// caller must [`Self::verify`] it, which [`Self::deferred`] guarantees.
+    pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Runs `f` with a batch that defers every set pushed to it, then verifies
+    /// them all: what a block's driver does, and the only way outside this
+    /// crate to defer signatures. An error from `f` is returned as is, since
+    /// it rejects whatever `f` was processing whatever the signatures say.
+    pub fn deferred<T>(f: impl FnOnce(&mut SignatureBatch) -> Result<T>) -> Result<T> {
+        let mut batch = Self::new();
+        let out = f(&mut batch)?;
+        batch.verify()?;
+        Ok(out)
     }
 
     /// An empty batch that checks each set the moment it is pushed.
@@ -67,8 +85,8 @@ impl SignatureBatch {
     /// immediate checks did.
     pub fn immediate() -> Self {
         Self {
-            sets: Vec::new(),
             immediate: true,
+            ..Self::default()
         }
     }
 
@@ -82,39 +100,42 @@ impl SignatureBatch {
         if self.immediate {
             return verify(set.verify(), what);
         }
-        self.sets.push((set, what));
+        self.sets.push(set);
+        self.labels.push(what);
         Ok(())
     }
 
     /// One batch check. On failure, re-checks the sets one by one and rejects with
     /// the first failing set's `what`, so the error names the same check it does
     /// today.
-    pub fn verify(self) -> Result<()> {
-        let sets: Vec<SignatureSet> = self.sets.iter().map(|(set, _)| *set).collect();
-        if verify_signature_sets(&sets) {
+    pub(crate) fn verify(self) -> Result<()> {
+        if verify_signature_sets(&self.sets) {
             return Ok(());
         }
         // A batch of valid sets always passes, so one of these fails. Should
         // none do (which would be a bug in the batch check), the block is
         // still rejected, with the last label, rather than accepted.
         let mut last = "block signatures";
-        for (set, what) in &self.sets {
+        for (set, what) in self.sets.iter().zip(self.labels) {
             last = what;
             verify(set.verify(), what)?;
         }
         verify(false, last)
     }
+
+    /// Whether no set has been deferred.
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.sets.is_empty()
+    }
 }
 
-/// Runs `f` against a fresh batch and verifies the batch, the way a block's
-/// driver does: for tests of a single operation, which only mean "accepted"
-/// once their deferred signatures have been checked.
+/// [`SignatureBatch::deferred`], under the short name the single-operation
+/// tests use: they only mean "accepted" once their deferred signatures have
+/// been checked.
 #[cfg(test)]
 pub(crate) fn checked<T>(f: impl FnOnce(&mut SignatureBatch) -> Result<T>) -> Result<T> {
-    let mut batch = SignatureBatch::new();
-    let out = f(&mut batch)?;
-    batch.verify()?;
-    Ok(out)
+    SignatureBatch::deferred(f)
 }
 
 #[cfg(test)]
