@@ -29,6 +29,13 @@ use crate::slashing_protection::SharedProtection;
 pub struct Attested {
     /// How many attestations the beacon node accepted.
     pub published: usize,
+    /// How many of the slot's duties slashing protection withheld: judged
+    /// unsafe to sign, or, when the record could not be written, the whole
+    /// batch, since nothing may be signed then. Kept apart from `published`
+    /// so that a slot with nothing published can be told from a slot with
+    /// nothing to publish, which an `Ok` with a count of zero alone cannot.
+    /// The cause is logged, and counted, where it is decided.
+    pub refused: usize,
     /// The data every attestation in this slot was signed over, or `None` when
     /// there was no duty to fetch it for.
     ///
@@ -98,6 +105,7 @@ impl<B: BeaconNodeApi> AttestationService<B> {
         if duties.is_empty() {
             return Ok(Attested {
                 published: 0,
+                refused: 0,
                 data: None,
             });
         }
@@ -167,6 +175,7 @@ impl<B: BeaconNodeApi> AttestationService<B> {
                 crate::metrics::inc_attestations_refused_by(candidates.len() as u64);
                 return Ok(Attested {
                     published: 0,
+                    refused: candidates.len(),
                     data: Some(data),
                 });
             }
@@ -180,6 +189,7 @@ impl<B: BeaconNodeApi> AttestationService<B> {
         // EIP-2335 derivation outside it (see `http_api::keystores::import`),
         // so this is the duty path keeping its half of the same bargain.
         let mut attestations = Vec::with_capacity(candidates.len());
+        let mut refused = 0;
         {
             let _timing = crate::metrics::time_signing();
             let store = store.read().await;
@@ -192,6 +202,7 @@ impl<B: BeaconNodeApi> AttestationService<B> {
                         "Refusing to sign: slashing protection judged this attestation unsafe"
                     );
                     crate::metrics::inc_attestations_refused();
+                    refused += 1;
                     continue;
                 }
 
@@ -217,6 +228,7 @@ impl<B: BeaconNodeApi> AttestationService<B> {
         if attestations.is_empty() {
             return Ok(Attested {
                 published: 0,
+                refused,
                 data: Some(data),
             });
         }
@@ -238,6 +250,7 @@ impl<B: BeaconNodeApi> AttestationService<B> {
         crate::metrics::inc_attestations_published(published as u64);
         Ok(Attested {
             published,
+            refused,
             data: Some(data),
         })
     }
@@ -360,8 +373,9 @@ mod tests {
             .await
             .expect("the second call is not an error, it simply signs nothing");
 
-        assert_eq!(first.published, 1);
+        assert_eq!((first.published, first.refused), (1, 0));
         assert_eq!(second.published, 0, "the second attempt must be refused");
+        assert_eq!(second.refused, 1, "and reported as refused, not as absent");
         assert_eq!(
             node.submitted().len(),
             1,
@@ -442,7 +456,12 @@ mod tests {
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
             .expect("chmod back");
 
-        assert_eq!(attested.expect("not an error").published, 0);
+        let attested = attested.expect("not an error");
+        assert_eq!(attested.published, 0);
+        assert_eq!(
+            attested.refused, 1,
+            "a record that could not be written refuses the whole batch, visibly"
+        );
         assert!(
             node.submitted().is_empty(),
             "nothing may reach the beacon node"

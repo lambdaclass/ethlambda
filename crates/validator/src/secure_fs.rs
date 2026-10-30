@@ -14,12 +14,12 @@ use std::path::Path;
 /// Write `contents`, creating the file if it does not exist and truncating it
 /// if it does, at mode `0600` on unix.
 ///
-/// For files this crate is always the sole, trusted writer of and is willing
-/// to overwrite outright: the API token, and the validator definitions file's
-/// `.tmp` sibling (`ValidatorDefinitions::save` renames it into place, which
-/// preserves the mode set here). Neither is named from attacker-influenced
-/// input, so there is no symlink concern for these; see
-/// [`write_private_no_symlink`] for the ones that are.
+/// For a file this crate is the sole, trusted writer of and is willing to
+/// overwrite outright: the API token. It is not named from
+/// attacker-influenced input, so there is no symlink concern; see
+/// [`write_private_no_symlink`] for the files that are, and
+/// [`write_private_durably`] for the ones whose loss would change what a
+/// validator signs.
 #[cfg(unix)]
 pub(crate) fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
     use std::io::Write as _;
@@ -79,11 +79,17 @@ pub(crate) fn write_private_no_symlink(
 /// leaves either the old file or the new one, never a mixture, and so that a
 /// return of `Ok` means the new one is on disk.
 ///
-/// Written to a sibling `.tmp` at mode `0600` (through [`write_private`]'s
-/// rules), flushed, renamed over `path`, and then the directory is flushed so
-/// the rename itself survives. For files whose loss or truncation would change
-/// what a validator signs: the slashing-protection record and the validator
-/// definitions file.
+/// Written to a sibling `.tmp` created fresh at mode `0600`, flushed, renamed
+/// over `path`, and then the directory is flushed so the rename itself
+/// survives. For files whose loss or truncation would change what a validator
+/// signs: the slashing-protection record and the validator definitions file.
+///
+/// The temporary is always a new file: whatever is at its path first, a
+/// leftover of a write that crashed partway, or something planted there, is
+/// removed, never reopened. A mode given at creation applies only at
+/// creation, so reopening a leftover would carry its mode, whatever that was,
+/// into the renamed record; and `O_EXCL` does not follow a symlink, so the
+/// write cannot be redirected through one either.
 pub(crate) fn write_private_durably(
     path: &Path,
     contents: impl AsRef<[u8]>,
@@ -93,7 +99,12 @@ pub(crate) fn write_private_durably(
     name.push(".tmp");
     let temporary = path.with_file_name(name);
 
-    let mut file = open_private(&temporary)?;
+    match std::fs::remove_file(&temporary) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    let mut file = create_private(&temporary)?;
     file.write_all(contents.as_ref())?;
     file.sync_all()?;
     drop(file);
@@ -102,38 +113,43 @@ pub(crate) fn write_private_durably(
 }
 
 #[cfg(unix)]
-fn open_private(path: &Path) -> std::io::Result<std::fs::File> {
+fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
     std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(path)
 }
 
 #[cfg(not(unix))]
-fn open_private(path: &Path) -> std::io::Result<std::fs::File> {
+fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .open(path)
 }
 
-/// `fsync` on the directory, so a rename into it is itself durable. Called
-/// through `libc` rather than `File::sync_all`, which on macOS issues
-/// `F_FULLFSYNC`, a request some filesystems refuse for a directory.
+/// Flush the directory, so a rename into it is itself durable.
+///
+/// `File::sync_all` first: `fsync` everywhere but macOS, where it is
+/// `F_FULLFSYNC`, the only request there that reaches the disk rather than
+/// the drive's cache, and the one the file's own flush above already relies
+/// on. Some filesystems refuse that request for a directory, so a plain
+/// `fsync` is tried next: it is the best those offer, and the original error
+/// is kept if even that fails.
 #[cfg(unix)]
 fn sync_directory(directory: &Path) -> std::io::Result<()> {
     use std::os::fd::AsRawFd as _;
     let directory = std::fs::File::open(directory)?;
-    // SAFETY: the descriptor is owned by `directory`, which outlives the call.
-    if unsafe { libc::fsync(directory.as_raw_fd()) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+    directory.sync_all().or_else(|full_sync| {
+        // SAFETY: the descriptor is owned by `directory`, which outlives the call.
+        if unsafe { libc::fsync(directory.as_raw_fd()) } == 0 {
+            Ok(())
+        } else {
+            Err(full_sync)
+        }
+    })
 }
 
 #[cfg(not(unix))]
@@ -176,6 +192,43 @@ mod tests {
         assert!(
             !dir.path().join("record.tmp").exists(),
             "the temporary file is renamed away"
+        );
+    }
+
+    #[test]
+    fn write_private_durably_never_inherits_a_leftover_temporary_file_mode() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("record");
+        // A write that crashed partway, under a permissive umask.
+        let leftover = dir.path().join("record.tmp");
+        std::fs::write(&leftover, "half").expect("writes leftover");
+        std::fs::set_permissions(&leftover, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        write_private_durably(&path, "whole").expect("writes");
+
+        assert_eq!(std::fs::read_to_string(&path).expect("reads"), "whole");
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "got {mode:o}");
+    }
+
+    #[test]
+    fn write_private_durably_does_not_write_through_a_symlink_at_the_temporary_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let target = dir.path().join("target");
+        std::fs::write(&target, "untouched").expect("writes target");
+        let path = dir.path().join("record");
+        std::os::unix::fs::symlink(&target, dir.path().join("record.tmp")).expect("symlinks");
+
+        write_private_durably(&path, "whole").expect("writes");
+
+        assert_eq!(std::fs::read_to_string(&path).expect("reads"), "whole");
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("reads"),
+            "untouched",
+            "the symlink target must be untouched"
         );
     }
 

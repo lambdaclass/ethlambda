@@ -73,7 +73,16 @@ pub type SharedProtection = Arc<Mutex<SlashingProtection>>;
 /// Every async caller goes through here, including ones that only read: the
 /// mutex can be held by another caller's write, a full rewrite and two
 /// flushes, and waiting for it on an executor thread would stall whatever else
-/// that thread runs. The error is a reason, for the caller to log.
+/// that thread runs.
+///
+/// The operation's own error comes back as it is, so a caller can still tell
+/// a write that failed (`Error::Io`, a disk to look at) from a record that
+/// could not be reached at all (`Error::SlashingProtectionUnusable`): the
+/// lock is poisoned, because an operation panicked while holding it, and
+/// stays so until the process restarts, since nothing here recovers a record
+/// that a panic may have left half-updated in memory. The panic that poisons
+/// it is reported the same way on the call that raised it, which sees it as
+/// the blocking task's `JoinError`.
 ///
 /// The operation runs to completion even if the caller is dropped, as a duty
 /// abandoned at its deadline is: that is safe, since a record written for a
@@ -81,16 +90,27 @@ pub type SharedProtection = Arc<Mutex<SlashingProtection>>;
 pub async fn blocking<T: Send + 'static>(
     protection: &SharedProtection,
     operation: impl FnOnce(&mut SlashingProtection) -> Result<T> + Send + 'static,
-) -> std::result::Result<T, String> {
+) -> Result<T> {
+    let poisoned = || Error::SlashingProtectionUnusable {
+        reason: "an earlier access panicked while holding the record, so nothing is signed \
+                 until the validator client is restarted"
+            .to_string(),
+    };
     let protection = protection.clone();
     tokio::task::spawn_blocking(move || {
-        let mut protection = protection
-            .lock()
-            .map_err(|_| "slashing protection is poisoned".to_string())?;
-        operation(&mut protection).map_err(|err| err.to_string())
+        let mut protection = protection.lock().map_err(|_| poisoned())?;
+        operation(&mut protection)
     })
     .await
-    .map_err(|err| err.to_string())?
+    .map_err(|err| {
+        if err.is_panic() {
+            poisoned()
+        } else {
+            Error::SlashingProtectionUnusable {
+                reason: format!("the record could not be consulted: {err}"),
+            }
+        }
+    })?
 }
 
 /// The highest source and target epoch signed for one validator.
@@ -425,8 +445,9 @@ impl SlashingProtection {
     /// Check one slot's attestations, all over `data`, and durably record every
     /// one that may be signed, in a single write.
     ///
-    /// The verdicts are in `pubkeys` order. A key listed twice is judged
-    /// against its first verdict, so it is refused the second time. The outer
+    /// The verdicts are in `pubkeys` order. A key listed twice is judged, at
+    /// its later position, against the verdict of its earlier one, so it is
+    /// refused the second time: same target as the one just staged. The outer
     /// `Err` is a record that could not be written, in which case nothing
     /// changed and none of them may be signed.
     pub fn check_and_record_attestations(
