@@ -4,6 +4,7 @@ use ethlambda_network_api::{
     DeferredFrom, FetchRequest, InitP2P,
 };
 use ethlambda_state_transition::beacon::error::Error as BeaconError;
+use ethlambda_state_transition::beacon::fast_confirmation;
 use ethlambda_state_transition::beacon::fork_choice;
 use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCacheExt;
 use ethlambda_state_transition::is_proposer;
@@ -1065,7 +1066,12 @@ impl BlockChainServer {
                 // votes have to be in fork choice before the head this tick
                 // reports is chosen.
                 self.drain_deferred_aggregates();
-                self.recompute_beacon_head().await;
+                // The Fast Confirmation Rule runs inside this recompute, once
+                // per slot: after the clock advance and the deferred
+                // aggregates (so past slots' attestations are applied) and
+                // after the head, but before `forkchoiceUpdated`, whose safe
+                // block it decides.
+                self.recompute_beacon_head_with(true).await;
             }
         }
 
@@ -2307,7 +2313,19 @@ impl BlockChainServer {
     /// `forkchoiceUpdated` round trip, so `execution_optimistic` reflects the
     /// verdict it carried.
     async fn recompute_beacon_head(&mut self) -> HeadTimings {
+        self.recompute_beacon_head_with(false).await
+    }
+
+    /// [`Self::recompute_beacon_head`], optionally running the Fast
+    /// Confirmation Rule between the head computation and the
+    /// `forkchoiceUpdated` that carries its confirmed block as the safe one.
+    /// Only the per-slot tick passes `true`: the rule must run exactly once per
+    /// slot, and imports recompute the head many times a slot.
+    async fn recompute_beacon_head_with(&mut self, run_fast_confirmation: bool) -> HeadTimings {
         let mut timings = self.update_head_from_fork_choice();
+        if run_fast_confirmation && !timings.head_failed {
+            self.run_fast_confirmation();
+        }
         if let Some((start, end)) = self.notify_forkchoice_updated().await {
             timings.fcu_start = Some(start);
             timings.fcu_end = Some(end);
@@ -2503,6 +2521,7 @@ impl BlockChainServer {
             // what this does: the head simply does not move.
             warn!(%err, "Failed to compute beacon head");
             timings.head_end = Some(Instant::now());
+            timings.head_failed = true;
             return timings;
         }
         timings.head_end = Some(Instant::now());
@@ -2511,6 +2530,39 @@ impl BlockChainServer {
         }
         self.pin_head_shufflings();
         timings
+    }
+
+    /// Run the Fast Confirmation Rule once and publish its `fast_confirmation`
+    /// event, from the head fork choice just recorded.
+    ///
+    /// Skipped, and the rule's variables reset to the finalized checkpoint,
+    /// while the head is more than [`events::HEAD_EVENT_RECENCY_SLOTS`] behind
+    /// the wall clock: the rule assumes synchrony from the start of the
+    /// previous slot, a catching-up node has none, and its stored heads would
+    /// be stale (and eventually pruned). Same staleness gate as the `head`
+    /// event. A failure is logged and the event withheld; the next slot runs
+    /// again from the variables as they were.
+    fn run_fast_confirmation(&mut self) {
+        let Some((head_slot, head_root)) = self.store.beacon_head() else {
+            return;
+        };
+        if head_slot + events::HEAD_EVENT_RECENCY_SLOTS < self.wall_clock_slot() {
+            self.store.reset_fast_confirmation();
+            return;
+        }
+        let config = self.store.config();
+        let result = {
+            let _timing = metrics::time_beacon_fast_confirmation();
+            fast_confirmation::run_fast_confirmation(&self.store, &config, head_root)
+        };
+        match result {
+            Ok(confirmation) => self.events.publish_fast_confirmation(
+                confirmation.block,
+                confirmation.slot,
+                confirmation.current_slot,
+            ),
+            Err(err) => warn!(%err, "Fast confirmation run failed"),
+        }
     }
 
     /// Point the committee cache's eviction at the head fork choice just

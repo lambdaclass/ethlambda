@@ -595,10 +595,13 @@ node, and a pre-gloas block's is its parent. Both walks stop at finality.
   been computed yet is skipped.
 - `finalized_block_hash` is the finalized block's `bid.parent_block_hash`, as
   the specification has it.
-- `safe_block_hash` is the justified block's `bid.parent_block_hash`. The
-  specification's `get_safe_execution_block_hash` is built on fast
-  confirmation, which the follower does not run, so this is the fallback. It
-  can only be older than the confirmed block, which keeps it safe.
+- `safe_block_hash` is the Fast Confirmation Rule's confirmed block's
+  `bid.parent_block_hash`, the specification's gloas
+  `get_safe_execution_block_hash`. (It used to be the justified block's, a
+  stand-in from before the rule was implemented; there is no deviation left
+  here.) Before the rule's first run, or while the node is far behind the clock
+  and the rule is not run, the confirmed root is the finalized block, which is
+  what the rule's own initialization sets it to.
 - A pre-gloas checkpoint block, including one beneath a gloas head, keeps its
   own payload hash.
 - The call is V4 with the node's custody columns when the head block is gloas,
