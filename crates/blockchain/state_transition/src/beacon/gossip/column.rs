@@ -10,6 +10,8 @@
 //! actor stores whatever reaches it without checking it
 //! again, so these are the only checks such a sidecar gets.
 
+use std::collections::HashMap;
+
 use ethlambda_storage::CacheKey;
 
 use super::{
@@ -34,7 +36,7 @@ use crate::beacon::lean_boundary::lean_block_unreachable;
 use crate::beacon::precheck;
 use crate::beacon::preset;
 use crate::beacon::primitives::HashTreeRoot as _;
-use crate::beacon::primitives::{KzgCommitment, Root, Slot, ValidatorIndex};
+use crate::beacon::primitives::{BlsSignature, KzgCommitment, Root, Slot, ValidatorIndex};
 use crate::beacon::stf;
 use crate::metrics;
 
@@ -85,6 +87,7 @@ pub fn cheap_checks(
 /// while they run.
 pub fn stateful_checks(store: &Store, sidecar: &DataColumnSidecar) -> Outcome {
     let header = &sidecar.signed_block_header.message;
+    let mut memo = SignatureMemo::default();
     let parent_known = store.has_block(&header.parent_root);
     let parent_state = if parent_known {
         store.cached_state(CacheKey::BlockState(header.parent_root))
@@ -101,9 +104,15 @@ pub fn stateful_checks(store: &Store, sidecar: &DataColumnSidecar) -> Outcome {
         } else {
             QueueReason::ParentUnknown
         };
-        return queue_unless_forged(store, sidecar, reason);
+        return queue_unless_forged(store, sidecar, reason, &mut memo);
     };
-    judge_against_parent(store, sidecar, &parent_state, PastLookahead::Queue)
+    judge_against_parent(
+        store,
+        sidecar,
+        &parent_state,
+        PastLookahead::Queue,
+        &mut memo,
+    )
 }
 
 /// What the chain may do with a sidecar [`chain_checks`] judged.
@@ -151,6 +160,18 @@ pub fn chain_checks(store: &Store, sidecar: &DataColumnSidecar, now_ms: u64) -> 
 /// is final whatever the proofs say, and [`ChainPrecheck::Pending`] means the
 /// sidecar is [`ChainVerdict::Keep`] exactly when its proofs verify.
 pub fn chain_precheck(store: &Store, sidecar: &DataColumnSidecar, now_ms: u64) -> ChainPrecheck {
+    chain_precheck_with(store, sidecar, now_ms, &mut SignatureMemo::default())
+}
+
+/// [`chain_precheck`] sharing `memo` with the other sidecars of the same
+/// block, so their identical header signature is verified once. See
+/// [`SignatureMemo`] for what is and is not remembered.
+pub fn chain_precheck_with(
+    store: &Store,
+    sidecar: &DataColumnSidecar,
+    now_ms: u64,
+    memo: &mut SignatureMemo,
+) -> ChainPrecheck {
     let config = store.config();
     // [REJECT] The sidecar is structurally valid. First, so a peer answering
     // a fetch with garbage cannot make this pay for a state read or a KZG
@@ -189,13 +210,13 @@ pub fn chain_precheck(store: &Store, sidecar: &DataColumnSidecar, now_ms: u64) -
         // signature check keeps a forged header from taking a
         // `PendingDataColumns` row while it waits.
         return ChainPrecheck::Settled(
-            match queue_unless_forged(store, sidecar, QueueReason::ParentUnknown) {
+            match queue_unless_forged(store, sidecar, QueueReason::ParentUnknown, memo) {
                 Outcome::Queue(_) => ChainVerdict::AwaitParent,
                 outcome => ChainVerdict::Drop(outcome),
             },
         );
     };
-    match judge_before_kzg(store, sidecar, &parent_state, PastLookahead::Advance) {
+    match judge_before_kzg(store, sidecar, &parent_state, PastLookahead::Advance, memo) {
         Ok(()) => ChainPrecheck::Pending(PendingKzg {
             commitments: sidecar.kzg_commitments.iter().cloned().collect(),
         }),
@@ -218,8 +239,20 @@ pub fn chain_precheck_for(
     sidecar: &AnyDataColumnSidecar,
     now_ms: u64,
 ) -> ChainPrecheck {
+    chain_precheck_for_with(store, sidecar, now_ms, &mut SignatureMemo::default())
+}
+
+/// [`chain_precheck_for`] sharing `memo` across the sidecars of one block.
+/// Only a fulu sidecar has a header signature to remember; a gloas sidecar
+/// carries none, so `memo` goes unused for it.
+pub fn chain_precheck_for_with(
+    store: &Store,
+    sidecar: &AnyDataColumnSidecar,
+    now_ms: u64,
+    memo: &mut SignatureMemo,
+) -> ChainPrecheck {
     match sidecar {
-        AnyDataColumnSidecar::Fulu(sidecar) => chain_precheck(store, sidecar, now_ms),
+        AnyDataColumnSidecar::Fulu(sidecar) => chain_precheck_with(store, sidecar, now_ms, memo),
         AnyDataColumnSidecar::Gloas(sidecar) => chain_precheck_gloas(store, sidecar, now_ms),
     }
 }
@@ -440,8 +473,9 @@ fn judge_against_parent(
     sidecar: &DataColumnSidecar,
     parent_state: &BeaconState,
     past_lookahead: PastLookahead,
+    memo: &mut SignatureMemo,
 ) -> Outcome {
-    if let Err(outcome) = judge_before_kzg(store, sidecar, parent_state, past_lookahead) {
+    if let Err(outcome) = judge_before_kzg(store, sidecar, parent_state, past_lookahead, memo) {
         return outcome;
     }
     let header = &sidecar.signed_block_header.message;
@@ -476,6 +510,7 @@ fn judge_before_kzg(
     sidecar: &DataColumnSidecar,
     parent_state: &BeaconState,
     past_lookahead: PastLookahead,
+    memo: &mut SignatureMemo,
 ) -> Result<(), Outcome> {
     let config = store.config();
     let header = &sidecar.signed_block_header.message;
@@ -485,7 +520,7 @@ fn judge_before_kzg(
     }
     // [REJECT] Signed by a validator the parent's state knows, over this
     // header.
-    header_signature_is_valid(sidecar, parent_state, &config)?;
+    header_signature_is_valid(sidecar, parent_state, &config, memo, None)?;
     // [REJECT] Proposed by the proposer the parent's state fixes for the
     // slot. Read from its lookahead when that covers the slot; past it, only
     // the chain path pays to find out.
@@ -512,6 +547,34 @@ fn judge_before_kzg(
         return Err(Outcome::Reject(RejectReason::InclusionProof));
     }
     Ok(())
+}
+
+/// What [`header_signature_is_valid`] answered for the sidecars of one block,
+/// so the BLS verification of a header the block's sidecars all carry runs
+/// once rather than once per sidecar.
+///
+/// Keyed on the header's root, the signature bytes and, for the head-state
+/// check [`queue_unless_forged`] makes, the head it read: two sidecars with
+/// one header and different signatures are two entries, so a forged signature
+/// is judged on its own, and the same header judged against a different state
+/// is a different question. Only that function's answer is remembered; every
+/// other rule runs for every sidecar in its usual order. Built fresh for each
+/// group of one `spawn_blocking` closure and dropped with it, so nothing
+/// outlives a block's checks.
+#[derive(Default)]
+pub struct SignatureMemo {
+    answers: HashMap<(Root, BlsSignature, Option<Root>), Result<(), Outcome>>,
+    /// How many verifications actually ran: what a test reads to see that the
+    /// memo is used.
+    verified: usize,
+}
+
+impl SignatureMemo {
+    /// The number of header signatures verified, as opposed to answered from
+    /// the memo.
+    pub fn verified(&self) -> usize {
+        self.verified
+    }
 }
 
 /// The proposer `parent_state`, advanced to `slot`, names for it: the answer
@@ -542,15 +605,18 @@ fn advanced_proposer(
 /// the *expected* one for the slot. A column queued here is written to the
 /// chain actor's `PendingDataColumns`, so without this check a forged one
 /// would sit there rather than being refused up front.
-fn queue_unless_forged(store: &Store, sidecar: &DataColumnSidecar, reason: QueueReason) -> Outcome {
-    let head_state = store
-        .head()
-        .ok()
-        .and_then(|head| store.cached_state(CacheKey::BlockState(head)));
+fn queue_unless_forged(
+    store: &Store,
+    sidecar: &DataColumnSidecar,
+    reason: QueueReason,
+    memo: &mut SignatureMemo,
+) -> Outcome {
+    let head = store.head().ok();
+    let head_state = head.and_then(|head| store.cached_state(CacheKey::BlockState(head)));
     let Some(head_state) = head_state else {
         return Outcome::Queue(reason);
     };
-    match header_signature_is_valid(sidecar, &head_state, &store.config()) {
+    match header_signature_is_valid(sidecar, &head_state, &store.config(), memo, head) {
         Err(Outcome::Reject(RejectReason::BadSignature)) => {
             Outcome::Reject(RejectReason::BadSignature)
         }
@@ -772,6 +838,30 @@ fn lookahead_covers(parent_state: &BeaconState, slot: Slot) -> Result<(), Outcom
 /// only what the signature alone can tell them: an unknown proposer or a bad
 /// signature, never `WrongProposer`.
 fn header_signature_is_valid(
+    sidecar: &DataColumnSidecar,
+    state: &BeaconState,
+    config: &Config,
+    memo: &mut SignatureMemo,
+    head: Option<Root>,
+) -> Result<(), Outcome> {
+    let header = &sidecar.signed_block_header.message;
+    let key = (
+        header.hash_tree_root(),
+        sidecar.signed_block_header.signature,
+        head,
+    );
+    if let Some(answer) = memo.answers.get(&key) {
+        return *answer;
+    }
+    let answer = verify_header_signature(sidecar, state, config);
+    memo.verified += 1;
+    memo.answers.insert(key, answer);
+    answer
+}
+
+/// The work behind [`header_signature_is_valid`], run once per distinct
+/// answer.
+fn verify_header_signature(
     sidecar: &DataColumnSidecar,
     state: &BeaconState,
     config: &Config,
@@ -1312,6 +1402,63 @@ mod tests {
             chain_checks(&store, &card, slot_start_ms(&store, slot)),
             ChainVerdict::Drop(Outcome::Reject(RejectReason::WrongProposer))
         );
+    }
+
+    /// The sidecars of one block share a header, so a group's checks verify
+    /// its signature once; a sidecar carrying a different signature over the
+    /// same header is its own entry and fails on its own, with the verdict it
+    /// has when checked alone.
+    #[test]
+    fn a_groups_shared_header_signature_is_verified_once() {
+        let parent = fulu_parent(3);
+        let parent_root = Root::repeat_byte(0x99);
+        let store = store_with_parent(&parent, parent_root);
+        let config = store.config();
+        let slot = parent.slot() + 1;
+        let now = slot_start_ms(&store, slot);
+        // Signed by the validator it names, which is not the slot's proposer:
+        // the signature passes and `WrongProposer` follows.
+        let good = signed_child(&parent, parent_root, slot, 5, 5, &config);
+        let mut forged = signed_child(&parent, parent_root, slot, 5, 6, &config);
+        forged.index = 3;
+        let columns: Vec<DataColumnSidecar> = (0..3)
+            .map(|index| DataColumnSidecar {
+                index,
+                ..good.clone()
+            })
+            .collect();
+
+        let mut memo = SignatureMemo::default();
+        for sidecar in &columns {
+            assert_eq!(
+                chain_precheck_with(&store, sidecar, now, &mut memo),
+                ChainPrecheck::Settled(ChainVerdict::Drop(Outcome::Reject(
+                    RejectReason::WrongProposer
+                )))
+            );
+        }
+        assert_eq!(memo.verified(), 1);
+
+        assert_eq!(
+            chain_precheck_with(&store, &forged, now, &mut memo),
+            ChainPrecheck::Settled(ChainVerdict::Drop(Outcome::Reject(
+                RejectReason::BadSignature
+            )))
+        );
+        assert_eq!(memo.verified(), 2);
+        // The forged one's answer is what it is alone, and does not leak onto
+        // the sidecars that carry the good signature.
+        assert_eq!(
+            chain_checks(&store, &forged, now),
+            ChainVerdict::Drop(Outcome::Reject(RejectReason::BadSignature))
+        );
+        assert_eq!(
+            chain_precheck_with(&store, &columns[0], now, &mut memo),
+            ChainPrecheck::Settled(ChainVerdict::Drop(Outcome::Reject(
+                RejectReason::WrongProposer
+            )))
+        );
+        assert_eq!(memo.verified(), 2);
     }
 
     /// Where gossip queues, `chain_checks` drops: the parent already has a
