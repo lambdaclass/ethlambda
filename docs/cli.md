@@ -290,8 +290,8 @@ implementation's, so none of the [common flags](#common-flags) apply to it.
 | `--suggested-fee-recipient` | none | Execution address to receive block rewards, `0x`-prefixed, for every validator the keymanager API gives no address of its own. Optional, and startup warns when it is absent: without it the beacon node picks an address, and it will not be yours |
 | `--graffiti` | empty | Text for the graffiti field of proposed blocks, for every validator the keymanager API gives no graffiti of its own. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer. An ethlambda beacon node appends both clients' versions to it (see [`rpc.md`](rpc.md#validator-endpoints)) |
 | `--enable-keymanager` | off | Serve the keymanager API: keystores, plus each validator's own fee recipient, graffiti and gas limit. Off by default because it mutates key material |
-| `--builder-proposals` | off | Propose builder blocks: register each validator with the beacon node's builder (an ethlambda node: `--builder`) and accept a blinded block when the builder's bid wins. Fulu and earlier only; from gloas the builder market works through proposer preferences instead |
-| `--builder-boost-factor` | `100` | How a builder's bid is weighed against the local payload: the local payload wins iff `local >= factor * bid / 100`. `0` prefers the local payload unless it cannot be built. Requires `--builder-proposals`; conflicts with `--prefer-builder-proposals` |
+| `--builder-proposals` | off | Propose builder blocks: register each validator with the beacon node's builder (an ethlambda node: `--builder`) and accept a blinded block when the builder's bid wins. Registrations and blinded blocks are fulu and earlier only; from gloas the builder market works through proposer preferences, and the boost factor weighs p2p bids in `produceBlockV4` |
+| `--builder-boost-factor` | `100` | How a builder's bid is weighed against the local payload: the local payload wins iff `local >= factor * bid / 100`. `0` prefers the local payload unless it cannot be built. From gloas it is also sent in `produceBlockV4`'s body, so a pooled p2p bid can win on value; without `--builder-proposals` the body carries `0`. Requires `--builder-proposals`; conflicts with `--prefer-builder-proposals` |
 | `--prefer-builder-proposals` | off | Take the builder's block whenever there is a valid bid, unless the execution client asks to override the builder (sends `builder_boost_factor = u64::MAX`). Requires `--builder-proposals`; conflicts with `--builder-boost-factor` |
 
 ### What it does today
@@ -316,6 +316,19 @@ signed like a full one and published to `blinded_blocks` on the node that
 produced it, with no failover. A publish that node does not confirm is logged
 at error and counted as unconfirmed, not as a missed proposal, since the relay
 may still publish the block.
+
+From the epoch before gloas on, it also signs a proposer preferences message
+(fee recipient and target gas limit) for each of its proposal slots in the
+current and next gloas epoch, and sends them to every node. This happens every
+slot, whether or not `--builder-proposals` is set: from gloas the preferences
+are what carry a proposal's fee recipient, and a node ignores builders' bids
+for a slot with none. It reads those duties from the v2 proposer duties
+endpoint, whose dependent root the preferences must carry, and publishes each
+`(slot, dependent root)` once, again after a reorg changes the root. A
+validator with no fee recipient is skipped, with one warning per epoch naming
+the count. A preference cannot be replaced for the same slot and root, so a
+fee recipient changed through the keymanager API applies from the next
+dependent root.
 
 Each slot it wakes at the boundary. If one of its validators proposes that
 slot, it signs the RANDAO reveal, asks the beacon node for a block, checks that
@@ -435,9 +448,9 @@ give one validator its own value in place of the command line's default:
 
 | Setting | Default | Takes effect |
 |---|---|---|
-| `feerecipient` | `--suggested-fee-recipient` | At the next epoch boundary, when the fee recipients are registered with the beacon node again. A block proposed before then pays the address the node was last given, and the check before signing reports the mismatch. With `--builder-proposals`, the next slot's builder registration carries it too, and an ethlambda beacon node takes it from there |
+| `feerecipient` | `--suggested-fee-recipient` | At the next epoch boundary, when the fee recipients are registered with the beacon node again. A block proposed before then pays the address the node was last given, and the check before signing reports the mismatch. With `--builder-proposals`, the next slot's builder registration carries it too, and an ethlambda beacon node takes it from there. From gloas, the proposer preferences carry it, from the next dependent root on |
 | `graffiti` | `--graffiti` | The next proposal |
-| `gas_limit` | `DEFAULT_GAS_LIMIT` | With `--builder-proposals`, the next slot's builder registration, which the builder builds toward. Otherwise stored and served only |
+| `gas_limit` | `DEFAULT_GAS_LIMIT` | Before gloas, the next slot's builder registration with `--builder-proposals`, and stored and served only without it. From gloas, the proposer preferences' target gas limit, from the next dependent root on, flag or not |
 
 **These are held in memory only.** A restart puts every validator back on the
 defaults, so an operator driving these endpoints must set them again after one.

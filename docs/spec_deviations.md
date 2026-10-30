@@ -706,6 +706,30 @@ the beacon node's builder and may sign a blinded block (builder-specs and
   relay may still publish the block.
 - **Registrations stop at gloas.** The client sends no `register_validator` from
   the gloas fork epoch on: the builder market works through proposer
-  preferences there, and `produceBlockV4` keeps its self-build configuration.
+  preferences there (see the next section), and `produceBlockV4` sends the
+  configured boost factor with no minimum bid and no builders.
   Validators with no fee recipient are not registered either (the field is
   required), and only validators the beacon node resolved are signed for.
+
+## The validator client signs proposer preferences under the gossip rule's domain
+
+`validator.md` ("Broadcasting `SignedProposerPreferences`") signs with
+`get_domain(state, DOMAIN_PROPOSER_PREFERENCES, compute_epoch_at_slot(proposal_slot))`
+on the head state. `p2p-interface.md`'s `validate_proposer_preferences_gossip`
+verifies against the dependent block's state advanced to the lookahead start,
+so the fork version it uses is the one in force an epoch before the proposal's.
+
+- **ethlambda:** the validator client signs at the epoch before the proposal's
+  (`SigningContext::sign_proposer_preferences`), which is the domain the gossip
+  rule verifies.
+- **Why:** `get_domain` reads `state.fork`, not the schedule, so the two agree
+  everywhere except for a proposal in the first epoch of a fork, signed during
+  that epoch. There the head state already carries the new fork version, while
+  the gossip rule's state (at the start of the previous epoch) still carries the
+  old one, so the guide's signature would fail the rule peers apply. During the
+  epoch before the fork both give the old version. This node's own
+  `proposer_preferences` endpoint accepts both.
+- **Published unconditionally,** not gated on `--builder-proposals`, since from
+  gloas the preferences carry every proposal's fee recipient. Validators with no
+  fee recipient are skipped (the field is required), and a preference cannot be
+  replaced for the same slot and dependent root.

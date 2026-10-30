@@ -40,6 +40,7 @@ pub mod http_api;
 pub mod keys;
 pub mod metrics;
 pub mod payload_attestation;
+pub mod preferences;
 pub mod proposal;
 pub mod proposal_guard;
 pub mod proposer_settings;
@@ -49,6 +50,8 @@ pub mod signing;
 pub mod slot_clock;
 pub mod subscriptions;
 pub mod sync_committee;
+#[cfg(test)]
+mod test_support;
 
 pub use error::{Error, Result};
 
@@ -69,6 +72,7 @@ use crate::beacon_node::{BeaconNodeApi, Published};
 use crate::duties::DutiesService;
 use crate::keys::ValidatorStore;
 use crate::payload_attestation::PayloadAttestationService;
+use crate::preferences::PreferencesService;
 use crate::proposal::ProposalService;
 use crate::proposer_settings::ProposerSettings;
 use crate::registration::RegistrationService;
@@ -105,9 +109,10 @@ pub struct ValidatorConfig {
 /// and accept a blinded block when the builder's bid wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuilderProposals {
-    /// The `builder_boost_factor` sent with every pre-gloas block request:
-    /// 100 compares the bid and the local payload as they are; `u64::MAX`
-    /// takes the builder whenever there is a bid.
+    /// The `builder_boost_factor` sent with every block request (in the query
+    /// before gloas, in `produceBlockV4`'s body from gloas): 100 compares the
+    /// bid and the local payload as they are; `u64::MAX` takes the builder
+    /// whenever there is a bid.
     pub boost_factor: u64,
 }
 
@@ -235,6 +240,14 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         ))
     });
 
+    // Unconditional, as Lighthouse does: from gloas the preferences carry the
+    // fee recipient of every proposal, builders or not. See the module doc.
+    let preferences = Arc::new(PreferencesService::new(
+        beacon_node.clone(),
+        context.clone(),
+        settings.clone(),
+    ));
+
     if let Some(address) = config.keymanager {
         let token = http_api::load_or_create_token(&config.validators_dir)?;
         let context = http_api::KeymanagerContext {
@@ -350,6 +363,15 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         if let Some(duty) = duties.proposer_at_slot(slot, epoch).cloned() {
             propose(&proposal, &clock, slot, &duty, &store).await;
         }
+
+        // Right after the proposal and ahead of the slot's other duties: the
+        // preferences for the slots after this one must be out before those
+        // slots start (gossip IGNOREs a started slot), and the poll's v2 duties
+        // fetch for the next epoch can make the node advance a state, which
+        // should not compete with it producing this slot's block. Off the slot
+        // loop, since it is single-flight and a slow node must not delay this
+        // slot's duties.
+        tokio::spawn(preferences.clone().poll(slot, store.clone()));
 
         // The rest of the way to the first of the slot's remaining duties:
         // the attester offset, or the sync committee offset when the network

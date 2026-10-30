@@ -9,14 +9,15 @@ use ethlambda_types::beacon::builder::ValidatorRegistrationV1;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::constants::{
     DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_BUILDER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
-    DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PROPOSER_PREFERENCES,
+    DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE,
+    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
 };
 use ethlambda_types::beacon::containers::altair::{
     ContributionAndProof, SyncAggregatorSelectionData,
 };
 use ethlambda_types::beacon::containers::gloas::{
-    ExecutionPayloadEnvelope, PayloadAttestationData,
+    ExecutionPayloadEnvelope, PayloadAttestationData, ProposerPreferences,
 };
 use ethlambda_types::beacon::containers::shared::AttestationData;
 use ethlambda_types::beacon::primitives::{
@@ -25,6 +26,7 @@ use ethlambda_types::beacon::primitives::{
 };
 // `AttestationData`, `Checkpoint`, `Fork` and `SigningData` all live in
 // `containers::shared`, verified against `containers/shared.rs:158,120,97,220`.
+use ethlambda_types::beacon::preset;
 use ethlambda_types::beacon::signing::{
     compute_builder_domain, compute_domain, compute_epoch_at_slot, compute_signing_root,
 };
@@ -316,6 +318,35 @@ impl SigningContext {
         self.sign_root(store, &registration.pubkey, root)
     }
 
+    /// A proposer preferences message's signature, under
+    /// `DOMAIN_PROPOSER_PREFERENCES` at the fork version of the epoch before
+    /// the proposal's.
+    ///
+    /// That is the domain the `proposer_preferences` gossip rule verifies
+    /// against: `get_domain(state, .., proposal_epoch)` on the dependent
+    /// block's state advanced to the lookahead start, whose fork is the one
+    /// in force an epoch before the proposal. The validator guide signs with
+    /// the head state (`get_domain` reads `state.fork`, not the schedule);
+    /// the two agree everywhere except for a proposal in the first epoch of a
+    /// fork, signed during that epoch: the head state already carries the new
+    /// version, while the gossip rule's state, at the start of the previous
+    /// epoch, still carries the old one. This signer takes the gossip rule's,
+    /// which is the one peers verify. Not slashable.
+    pub fn sign_proposer_preferences(
+        &self,
+        store: &ValidatorStore,
+        pubkey: &BlsPubkey,
+        preferences: &ProposerPreferences,
+    ) -> Result<BlsSignature> {
+        let proposal_epoch = compute_epoch_at_slot(preferences.proposal_slot);
+        let domain = self.domain(
+            DOMAIN_PROPOSER_PREFERENCES,
+            proposal_epoch.saturating_sub(preset::MIN_SEED_LOOKAHEAD),
+        );
+        let root = compute_signing_root(preferences.hash_tree_root(), domain);
+        self.sign_root(store, pubkey, root)
+    }
+
     /// Sign a payload timeliness committee vote on behalf of `pubkey`.
     ///
     /// Not slashable by the specification, and deduplicated per validator and
@@ -588,6 +619,90 @@ mod tests {
             context.domain(DOMAIN_BEACON_BUILDER, 0),
         );
         assert!(!verify(&pubkey, &signature, envelope_root));
+    }
+
+    /// A config whose gloas fork starts at epoch 500000, fulu being active
+    /// well before it, with a non-zero validators root.
+    fn gloas_scheduled_context() -> (SigningContext, Epoch) {
+        const GLOAS_EPOCH: Epoch = 500_000;
+        let mut config = Config::mainnet();
+        config.gloas_fork_epoch = GLOAS_EPOCH;
+        (
+            SigningContext {
+                config,
+                genesis_validators_root: Root::repeat_byte(0x42),
+            },
+            GLOAS_EPOCH,
+        )
+    }
+
+    fn preferences_for(slot: Slot) -> ProposerPreferences {
+        ProposerPreferences {
+            dependent_root: Root::repeat_byte(0x11),
+            proposal_slot: slot,
+            validator_index: 3,
+            fee_recipient: ethlambda_types::beacon::primitives::H160([0xab; 20]),
+            target_gas_limit: 36_000_000,
+        }
+    }
+
+    /// The first gloas epoch's preference is signed at the fork of the epoch
+    /// before it (fulu), which is what the gossip rule verifies against. The
+    /// validator guide's head-state signer would give gloas for a preference
+    /// signed during that epoch, which the gossip rule's state (still fulu)
+    /// would reject.
+    #[test]
+    fn a_preference_for_the_first_gloas_epoch_is_signed_under_the_fulu_version() {
+        let (store, pubkey) = store_with_key();
+        let (context, gloas_epoch) = gloas_scheduled_context();
+        let preferences = preferences_for(gloas_epoch * preset::SLOTS_PER_EPOCH + 2);
+
+        let signature = context
+            .sign_proposer_preferences(&store, &pubkey, &preferences)
+            .expect("signs");
+
+        let under = |version| {
+            compute_signing_root(
+                preferences.hash_tree_root(),
+                compute_domain(
+                    DOMAIN_PROPOSER_PREFERENCES,
+                    version,
+                    context.genesis_validators_root,
+                ),
+            )
+        };
+        assert!(verify(
+            &pubkey,
+            &signature,
+            under(context.config.fulu_fork_version)
+        ));
+        assert!(!verify(
+            &pubkey,
+            &signature,
+            under(context.config.gloas_fork_version)
+        ));
+    }
+
+    /// One epoch later the epoch before the proposal's is itself gloas.
+    #[test]
+    fn a_preference_for_the_second_gloas_epoch_is_signed_under_the_gloas_version() {
+        let (store, pubkey) = store_with_key();
+        let (context, gloas_epoch) = gloas_scheduled_context();
+        let preferences = preferences_for((gloas_epoch + 1) * preset::SLOTS_PER_EPOCH);
+
+        let signature = context
+            .sign_proposer_preferences(&store, &pubkey, &preferences)
+            .expect("signs");
+
+        let root = compute_signing_root(
+            preferences.hash_tree_root(),
+            compute_domain(
+                DOMAIN_PROPOSER_PREFERENCES,
+                context.config.gloas_fork_version,
+                context.genesis_validators_root,
+            ),
+        );
+        assert!(verify(&pubkey, &signature, root));
     }
 
     #[test]

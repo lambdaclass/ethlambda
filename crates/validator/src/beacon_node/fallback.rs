@@ -89,6 +89,32 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
     where
         F: Fn(&'p B) -> BoxFuture<'p, Result<T>>,
     {
+        self.try_each_at_inner(what, true, call).await
+    }
+
+    /// [`Self::try_each`] without the final `warn!`, for a caller whose own
+    /// duty did not depend on the answer and which reports the failure itself
+    /// (the counterpart of [`Self::try_all`]'s `all_failed: None`). A node that
+    /// is syncing, or lacks the endpoint, would otherwise make this warn on
+    /// every call for as long as it lasts.
+    async fn try_each_quiet<'p, T, F>(&'p self, what: &'static str, call: F) -> Result<T>
+    where
+        F: Fn(&'p B) -> BoxFuture<'p, Result<T>>,
+    {
+        self.try_each_at_inner(what, false, call)
+            .await
+            .map(|(_, value)| value)
+    }
+
+    async fn try_each_at_inner<'p, T, F>(
+        &'p self,
+        what: &'static str,
+        warn_when_all_fail: bool,
+        call: F,
+    ) -> Result<(usize, T)>
+    where
+        F: Fn(&'p B) -> BoxFuture<'p, Result<T>>,
+    {
         let mut last = None;
         for (position, node) in self.nodes.iter().enumerate() {
             match call(node).await {
@@ -106,7 +132,9 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
         let detail = last
             .map(|err| err.to_string())
             .unwrap_or_else(|| "no nodes configured".to_string());
-        warn!(%what, %detail, "All configured beacon nodes failed; duty likely missed");
+        if warn_when_all_fail {
+            warn!(%what, %detail, "All configured beacon nodes failed; duty likely missed");
+        }
         Err(Error::AllBeaconNodesFailed(detail))
     }
 
@@ -145,13 +173,50 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
     where
         F: Fn(&'p B) -> BoxFuture<'p, Result<()>>,
     {
+        self.try_all_inner(what, node_effect, all_failed, true, call)
+            .await
+    }
+
+    /// [`Self::try_all`] logging each node's refusal at `debug!` instead of
+    /// `warn!`, for a call the caller retries every slot and reports itself
+    /// (once per entry): a per-node warning here would repeat on every retry
+    /// for as long as the refusal lasts. Always without an `all_failed`
+    /// message, for the same reason.
+    async fn try_all_quiet<'p, F>(
+        &'p self,
+        what: &'static str,
+        node_effect: &'static str,
+        call: F,
+    ) -> Result<()>
+    where
+        F: Fn(&'p B) -> BoxFuture<'p, Result<()>>,
+    {
+        self.try_all_inner(what, node_effect, None, false, call)
+            .await
+    }
+
+    async fn try_all_inner<'p, F>(
+        &'p self,
+        what: &'static str,
+        node_effect: &'static str,
+        all_failed: Option<&'static str>,
+        warn_per_node: bool,
+        call: F,
+    ) -> Result<()>
+    where
+        F: Fn(&'p B) -> BoxFuture<'p, Result<()>>,
+    {
         let mut accepted = 0;
         let mut last = None;
         for (position, node) in self.nodes.iter().enumerate() {
             match call(node).await {
                 Ok(()) => accepted += 1,
                 Err(err) => {
-                    warn!(%what, position, %err, node_effect, "Beacon node did not accept");
+                    if warn_per_node {
+                        warn!(%what, position, %err, node_effect, "Beacon node did not accept");
+                    } else {
+                        debug!(%what, position, %err, node_effect, "Beacon node did not accept");
+                    }
                     last = Some(err);
                 }
             }
@@ -256,6 +321,13 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
             .await
     }
 
+    async fn proposer_duties_v2(&self, epoch: Epoch) -> Result<ProposerDuties> {
+        // Quiet: the preferences service reports its own failure once per
+        // epoch, and no duty depends on this answer.
+        self.try_each_quiet("proposer_duties_v2", |node| node.proposer_duties_v2(epoch))
+            .await
+    }
+
     async fn attestation_data(&self, slot: Slot, fork: ForkName) -> Result<AttestationData> {
         self.try_each("attestation_data", |node| node.attestation_data(slot, fork))
             .await
@@ -338,6 +410,24 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
             "it will not hold these registrations",
             None,
             |node| node.register_validators(registrations),
+        )
+        .await
+    }
+
+    /// To every node, since each one gossips what it accepts: a preference
+    /// only the first node heard reaches the mesh through that node alone, and
+    /// builders subscribed elsewhere would ignore the slot.
+    async fn submit_proposer_preferences(
+        &self,
+        fork: ForkName,
+        preferences: &[gloas::SignedProposerPreferences],
+    ) -> Result<()> {
+        // Quiet: the service retries a refused preference every slot and warns
+        // once per entry, with what it costs.
+        self.try_all_quiet(
+            "submit_proposer_preferences",
+            "it will not gossip these proposer preferences",
+            |node| node.submit_proposer_preferences(fork, preferences),
         )
         .await
     }
@@ -1059,6 +1149,49 @@ mod tests {
             .publish_blinded_block(5, ForkName::Electra, &[1])
             .await
             .expect_err("the record is gone");
+    }
+
+    #[tokio::test]
+    async fn proposer_preferences_reach_every_node_past_a_failing_one() {
+        use ethlambda_types::beacon::containers::gloas::{
+            ProposerPreferences, SignedProposerPreferences,
+        };
+
+        let preference = SignedProposerPreferences {
+            message: ProposerPreferences {
+                proposal_slot: 70,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let fallback = FallbackBeaconNode::new(vec![
+            MockBeaconNode::new(),
+            MockBeaconNode::failing("middle down"),
+            MockBeaconNode::new(),
+        ]);
+
+        fallback
+            .submit_proposer_preferences(ForkName::Fulu, std::slice::from_ref(&preference))
+            .await
+            .expect("two of three accepted");
+
+        for position in [0, 2] {
+            assert_eq!(
+                *fallback.nodes[position]
+                    .submitted_preferences
+                    .lock()
+                    .expect("lock"),
+                vec![(ForkName::Fulu, vec![preference.clone()])],
+                "node {position}"
+            );
+        }
+        assert!(
+            fallback.nodes[1]
+                .submitted_preferences
+                .lock()
+                .expect("lock")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
