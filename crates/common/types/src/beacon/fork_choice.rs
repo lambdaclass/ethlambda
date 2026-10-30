@@ -209,6 +209,46 @@ pub struct PayloadStatusV1 {
     pub validation_error: Option<String>,
 }
 
+/// The variables the Fast Confirmation Rule carries between slots: every field
+/// of consensus-specs' `FastConfirmationStore` except its read-only `store`.
+///
+/// Held in the `ethlambda_storage::Store` (beside the rest of the beacon
+/// fork-choice scratch), hence here rather than in `ethlambda-state-transition`,
+/// which owns the algorithm and builds a `FastConfirmationStore` around one of
+/// these for each run. `ethlambda-storage` cannot depend on that crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FastConfirmationVariables {
+    /// Root of the most recent confirmed block.
+    pub confirmed_root: Root,
+    /// A justified checkpoint observed by all honest nodes at the beginning of
+    /// the previous epoch, assuming synchrony.
+    pub previous_epoch_observed_justified_checkpoint: Checkpoint,
+    /// The same, at the beginning of the current epoch.
+    pub current_epoch_observed_justified_checkpoint: Checkpoint,
+    /// The greatest unrealized justified checkpoint at the start of the last
+    /// slot of the previous epoch, in the local view.
+    pub previous_epoch_greatest_unrealized_checkpoint: Checkpoint,
+    /// The head at the start of the previous slot.
+    pub previous_slot_head: Root,
+    /// The head at the start of the current slot.
+    pub current_slot_head: Root,
+}
+
+impl FastConfirmationVariables {
+    /// `get_fast_confirmation_store`'s values: conservatively the finalized
+    /// checkpoint for every variable.
+    pub fn at_finalized(finalized: Checkpoint) -> Self {
+        Self {
+            confirmed_root: finalized.root,
+            previous_epoch_observed_justified_checkpoint: finalized,
+            current_epoch_observed_justified_checkpoint: finalized,
+            previous_epoch_greatest_unrealized_checkpoint: finalized,
+            previous_slot_head: finalized.root,
+            current_slot_head: finalized.root,
+        }
+    }
+}
+
 /// The justified checkpoint state's balances, flattened for the fork-choice
 /// vote loop: `store.checkpoint_states[checkpoint]` as `get_weight` and
 /// `get_proposer_score` read it.

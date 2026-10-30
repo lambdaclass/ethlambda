@@ -246,14 +246,16 @@ per tick, not once per block. It is sent even when nothing moved: an execution
 client doing state sync needs to keep being fed a recent head or its sync cannot
 converge.
 
-Its three hashes come from the cached execution hash of the head, the justified
-checkpoint's root and the finalized checkpoint's root. A root with no cached hash
-contributes the zero hash, which is a meaningful value here rather than an
-absence: EIP-3675 requires `finalized_block_hash` to be zero before a
-post-transition block is finalized, and the specification's own
-`get_safe_execution_block_hash` returns zero when no payload is justified yet. A
-follower whose *head* has no cached hash is still sitting on its checkpoint
-anchor and sends nothing at all.
+Its three hashes come from the cached execution hash of the head, the root of
+the block the Fast Confirmation Rule last confirmed (see
+[`beacon_stf.md`](beacon_stf.md#fast-confirmation-rule)) and the finalized
+checkpoint's root. The rule's confirmed root starts at the finalized block and
+is updated once per slot, in the same tick, before this call. A root with no
+cached hash contributes the zero hash, which is a meaningful value here rather
+than an absence: EIP-3675 requires `finalized_block_hash` to be zero before a
+post-transition block is finalized, and a confirmed block before the merge has
+no payload. A follower whose *head* has no cached hash is still sitting on its
+checkpoint anchor and sends nothing at all.
 
 The cache is pruned to the unfinalized window on every tick and every import,
 with the finalized checkpoint's own root exempted by name. The slot bound alone
@@ -266,9 +268,9 @@ execution client advancing its own finalized block for the life of the process.
 For a gloas head the hashes come from bids rather than from a cached payload
 hash: the head node's `bid.block_hash` when it is FULL and its
 `bid.parent_block_hash` when it is EMPTY, the finalized block's
-`bid.parent_block_hash`, and the justified block's `bid.parent_block_hash` as
-the safe hash. The last is a fallback, since the specification builds the safe
-hash on fast confirmation, which the follower does not run. The call is V4 with
+`bid.parent_block_hash`, and the confirmed block's `bid.parent_block_hash` as
+the safe hash (the specification's gloas `get_safe_execution_block_hash`: only
+the parent payload of a confirmed beacon block is safe). The call is V4 with
 the node's custody columns. A head whose payload status has not been computed
 yet (the first moments after a restart) sends nothing.
 
