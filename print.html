@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-3d4bc094.js";
+            window.path_to_searchindex_js = "searchindex-5c34d081.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -5226,6 +5226,12 @@ topics that client asked for; with none, the stream costs nothing.</p>
 </tbody>
 </table>
 </div>
+<p>On Linux the endpoint also serves the <code>prometheus</code> crate’s process collector,
+read from <code>/proc/self</code> at each scrape: <code>process_resident_memory_bytes</code>,
+<code>process_virtual_memory_bytes</code>, <code>process_cpu_seconds_total</code>,
+<code>process_open_fds</code>, <code>process_max_fds</code>, <code>process_threads</code> and
+<code>process_start_time_seconds</code>. They are not part of the leanMetrics spec, and
+other platforms do not export them.</p>
 <h2 id="pq-signature-metrics"><a class="header" href="#pq-signature-metrics">PQ Signature Metrics</a></h2>
 <div class="table-wrapper">
 <table>
