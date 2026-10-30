@@ -196,6 +196,8 @@ pub enum IgnoreReason {
     BeforeFork,
     /// A voluntary exit for a validator that has already initiated its exit.
     AlreadyExiting,
+    /// A voluntary exit for a validator with a pending partial withdrawal.
+    PendingPartialWithdrawals,
     /// The head state's sync committees cannot answer for the message's period.
     SyncCommitteeUnavailable,
     /// An inclusion list carries no transaction bytes at all.
@@ -244,6 +246,7 @@ impl IgnoreReason {
             Self::PtcUnavailable => "ptc_unavailable",
             Self::BeforeFork => "before_fork",
             Self::AlreadyExiting => "already_exiting",
+            Self::PendingPartialWithdrawals => "pending_partial_withdrawals",
             Self::SyncCommitteeUnavailable => "sync_committee_unavailable",
             Self::EmptyInclusionList => "empty_inclusion_list",
             Self::InclusionListBitsNotInclusive => "inclusion_list_bits_not_inclusive",
