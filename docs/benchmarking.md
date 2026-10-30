@@ -295,6 +295,91 @@ transition that ran while `engine_newPayload` was in flight, and `engine` then
 reports only the wait left after it. A replay has no client, so neither applies
 to its numbers.
 
+### Where `stf` goes: the report's `stf_phases`, `class` and resource fields
+
+`stf` is one number for a block's whole state transition, and on a mainnet
+block it is most of the import. Each sample therefore also carries what it was
+made of, so a baseline says which step to attack and for which kind of block.
+The report's `schema_version` is 2; version 1 had none of what follows, and every
+field below that a sample or the summary can lack is **absent, not zero**.
+
+**`stf_phases`** (per sample, seconds). The steps of the beacon state
+transition, read from `lean_beacon_stf_phase_seconds` the same way `phases`
+reads the import histogram: its `sum` before and after each import. The names are
+`BEACON_STF_PHASES`, described in [`metrics.md`](metrics.md#beacon-state-transition-phases):
+`process_slots` (excluding epoch work), `process_epoch`, `block_signature`,
+`block_header`, `randao`, `eth1_data`, `execution_payload`, one per operation list
+(`proposer_slashings`, `attester_slashings`, `attestations`, `deposits`,
+`voluntary_exits`, `bls_to_execution_changes`, `execution_requests`,
+`payload_attestations`), `sync_aggregate`, `batch_signatures` (every deferred signature
+of the block, verified together) and `state_root`. Unlike `phases`, a
+step may be observed more than once in one import (`process_epoch` once per
+boundary a long skip crosses, the gloas payload steps twice), so a value is the
+**sum** of that import's observations, not a single one.
+
+Only the import path's observations are read. The epoch precompute worker runs
+`process_epoch` on another thread while an import runs, and the histogram has a
+`context` label (`import` or `other`) so the replay reads `context="import"`
+alone; see the metrics page for what sets each. A replay runs no precompute
+worker, so for these blocks the filter changes nothing; it is what keeps the
+same reading honest on any binary that does.
+
+For the same reason an `epoch_boundary` block in a replay always pays
+`process_epoch` inline: nothing has precomputed it (the report's
+`caches.epoch_precompute` shows the misses). On a live follower a precompute hit
+takes that cost off the import path, so the replay is the upper bound.
+
+**`stf_unattributed_seconds`** is `stf` minus the sum of `stf_phases`: the part
+of the transition no step covers, such as cloning the parent's state and
+building the epoch-boundary balances. Absent when `stf` did not run.
+
+**`class`** is what the block's `process_slots` had to do, decided from the
+block's slot and its parent's (`parent_slot`, also in the sample):
+
+| `class` | Meaning |
+|---------|---------|
+| `epoch_boundary` | The block's slot is in a later epoch than its parent's, so `process_epoch` runs. Takes precedence over a skip |
+| `after_skip` | Same epoch, but the parent is more than one slot back |
+| `ordinary` | The parent is the previous slot, in the same epoch |
+
+A corpus is linear (`fetch` refuses a block whose parent is not the one before
+it), so there is no class for a reorg: a block is always applied to the block
+imported just before it. The class describes the work the block asked for, not
+what a cache spared it.
+
+**`cpu_seconds`** is the user plus system CPU time the whole process used during
+the import (`getrusage(RUSAGE_SELF)`, delta around the call). It is the process,
+not the importing thread: the merkle fold's workers, the state writer and
+RocksDB's background threads are in it, which is the point (an import whose CPU
+time is well above its wall time ran in parallel) and also the caveat (nothing
+else may run in the process). **`rss_bytes`** is the resident set size right
+after the import, read from `/proc/self/status`, so it is **Linux only** and
+absent elsewhere. **`peak_rss_bytes`** is the process's high-water mark so far
+(`ru_maxrss`), present on Linux and macOS; being a running maximum it moves only
+on the block that set a new peak.
+
+**Summary.** `summary` keeps its old paths (`phases`, `wall`) and gains
+`stf_phases`, `stf_unattributed` and `cpu`, each a distribution over the blocks
+that have the field, and `by_class`: for each class at least one block fell into
+(`epoch_boundary`, `after_skip`, `ordinary`) its `blocks` count and the same
+distributions (`phases`, `stf_phases`, `stf_unattributed`, `wall`, `cpu`)
+restricted to that class. Every distribution (`Stats`) now has `p95_seconds` and
+`p99_seconds` beside `p50_seconds` and `p90_seconds`, in both workloads' reports.
+Percentiles are nearest-rank, so a short run reports its maximum for the tail:
+the p99 is the maximum up to 51 samples, the p95 up to 11.
+
+**`caches`** (per run, not per block) is the lookups the state transition's
+caches served during the measured blocks, as deltas of the counters in
+[`metrics.md`](metrics.md) taken after the warm-up so each cache's cold start is
+not counted: `epoch_precompute`, `committee_cache`, `total_active_balance` and
+`justified_balances`, each with `hit`, `miss`, `hit_rate` (`hit / (hit + miss)`,
+absent when nothing was looked up) and, for the two caches that have the outcome,
+`unkeyable` (computed for one caller and not cached, so not in the rate).
+
+The human table shows the per-block `phases`, the class, CPU and unattributed
+time, then the summaries; the per-block `stf_phases` are in the JSON only,
+since close to twenty more columns would not fit a terminal.
+
 ### What is excluded, and why
 
 Replay runs nothing that a corpus already answers for:

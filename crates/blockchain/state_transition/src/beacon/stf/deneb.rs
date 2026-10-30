@@ -56,6 +56,8 @@ use crate::beacon::primitives::{
 };
 use crate::beacon::stf::signatures::SignatureBatch;
 
+use crate::metrics::{StfPhase, timed, try_for_each_timed};
+
 use super::ExecutionEngine;
 
 // ---------------------------------------------------------------------------
@@ -86,21 +88,27 @@ pub fn process_block(
     options: super::block::BlockProcessingOptions,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
-    super::block::process_block_header(
-        state,
-        block.slot,
-        block.proposer_index,
-        block.parent_root,
-        block.body.hash_tree_root(),
-    )?;
-    process_withdrawals(state, &block.body.execution_payload)?;
-    process_execution_payload(
-        state,
-        &block.body.execution_payload,
-        &block.body.blob_kzg_commitments,
-        config,
-        engine,
-    )?;
+    // The body's root is an argument, so it is hashed inside the timed span:
+    // it is part of what a header costs.
+    timed(StfPhase::BlockHeader, || {
+        super::block::process_block_header(
+            state,
+            block.slot,
+            block.proposer_index,
+            block.parent_root,
+            block.body.hash_tree_root(),
+        )
+    })?;
+    timed(StfPhase::ExecutionPayload, || -> Result<()> {
+        process_withdrawals(state, &block.body.execution_payload)?;
+        process_execution_payload(
+            state,
+            &block.body.execution_payload,
+            &block.body.blob_kzg_commitments,
+            config,
+            engine,
+        )
+    })?;
     super::block::process_randao(state, &block.body.randao_reveal, options.randao, signatures)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
     process_operations(
@@ -177,24 +185,41 @@ fn process_operations(
         "len(body.deposits) == min(MAX_DEPOSITS, eth1_data.deposit_count - eth1_deposit_index)",
     )?;
 
-    for proposer_slashing in proposer_slashings {
-        super::operations::process_proposer_slashing(state, proposer_slashing, config, signatures)?;
-    }
-    for attester_slashing in attester_slashings {
-        super::operations::process_attester_slashing(state, attester_slashing, config, signatures)?;
-    }
-    for attestation in attestations {
-        process_attestation(state, attestation, committees, active_balances, signatures)?;
-    }
-    for deposit in deposits {
-        super::operations::process_deposit(state, deposit, config)?;
-    }
-    for voluntary_exit in voluntary_exits {
-        process_voluntary_exit(state, voluntary_exit, config, signatures)?;
-    }
-    for signed_change in bls_to_execution_changes {
-        super::capella::process_bls_to_execution_change(state, signed_change, config, signatures)?;
-    }
+    try_for_each_timed(
+        StfPhase::ProposerSlashings,
+        proposer_slashings,
+        |slashing| {
+            super::operations::process_proposer_slashing(state, slashing, config, signatures)
+        },
+    )?;
+    try_for_each_timed(
+        StfPhase::AttesterSlashings,
+        attester_slashings,
+        |slashing| {
+            super::operations::process_attester_slashing(state, slashing, config, signatures)
+        },
+    )?;
+    try_for_each_timed(StfPhase::Attestations, attestations, |attestation| {
+        process_attestation(state, attestation, committees, active_balances, signatures)
+    })?;
+    try_for_each_timed(StfPhase::Deposits, deposits, |deposit| {
+        super::operations::process_deposit(state, deposit, config)
+    })?;
+    try_for_each_timed(StfPhase::VoluntaryExits, voluntary_exits, |exit| {
+        process_voluntary_exit(state, exit, config, signatures)
+    })?;
+    try_for_each_timed(
+        StfPhase::BlsToExecutionChanges,
+        bls_to_execution_changes,
+        |signed_change| {
+            super::capella::process_bls_to_execution_change(
+                state,
+                signed_change,
+                config,
+                signatures,
+            )
+        },
+    )?;
 
     Ok(())
 }

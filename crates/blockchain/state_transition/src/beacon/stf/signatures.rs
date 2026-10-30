@@ -37,6 +37,7 @@
 use ethlambda_crypto::bls::{SignatureSet, verify_signature_sets};
 
 use crate::beacon::error::{Result, verify};
+use crate::metrics::{StfPhase, timed};
 
 /// The signatures a block's processing defers, checked together once it ends.
 ///
@@ -109,6 +110,10 @@ impl SignatureBatch {
     /// the first failing set's `what`, so the error names the same check it does
     /// today.
     pub(crate) fn verify(self) -> Result<()> {
+        timed(StfPhase::BatchSignatures, || self.check())
+    }
+
+    fn check(self) -> Result<()> {
         if verify_signature_sets(&self.sets) {
             return Ok(());
         }

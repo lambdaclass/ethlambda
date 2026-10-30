@@ -312,6 +312,19 @@ pub fn process_sync_aggregate(
     active_balances: &ActiveBalanceCache,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
+    // Timed here, not at the six forks' call sites, since every fork from
+    // altair on reaches this one function.
+    crate::metrics::timed(crate::metrics::StfPhase::SyncAggregate, || {
+        apply_sync_aggregate(state, sync_aggregate, active_balances, signatures)
+    })
+}
+
+fn apply_sync_aggregate(
+    state: &mut BeaconState,
+    sync_aggregate: &altair::SyncAggregate,
+    active_balances: &ActiveBalanceCache,
+    signatures: &mut SignatureBatch,
+) -> Result<()> {
     let committee_bits = &sync_aggregate.sync_committee_bits;
 
     let (current_sync_committee, _) = state.sync_committees()?;

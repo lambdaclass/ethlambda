@@ -60,6 +60,8 @@ use crate::beacon::preset;
 use crate::beacon::primitives::{H256, HashTreeRoot as _};
 use crate::beacon::stf::signatures::SignatureBatch;
 
+use crate::metrics::{StfPhase, timed, try_for_each_timed};
+
 use super::ExecutionEngine;
 
 // ---------------------------------------------------------------------------
@@ -84,15 +86,21 @@ pub fn process_block(
     options: super::block::BlockProcessingOptions,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
-    super::block::process_block_header(
-        state,
-        block.slot,
-        block.proposer_index,
-        block.parent_root,
-        block.body.hash_tree_root(),
-    )?;
-    process_withdrawals(state, &block.body.execution_payload)?;
-    process_execution_payload(state, &block.body.execution_payload, config, engine)?;
+    // The body's root is an argument, so it is hashed inside the timed span:
+    // it is part of what a header costs.
+    timed(StfPhase::BlockHeader, || {
+        super::block::process_block_header(
+            state,
+            block.slot,
+            block.proposer_index,
+            block.parent_root,
+            block.body.hash_tree_root(),
+        )
+    })?;
+    timed(StfPhase::ExecutionPayload, || -> Result<()> {
+        process_withdrawals(state, &block.body.execution_payload)?;
+        process_execution_payload(state, &block.body.execution_payload, config, engine)
+    })?;
     super::block::process_randao(state, &block.body.randao_reveal, options.randao, signatures)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
     process_operations(
@@ -392,9 +400,11 @@ pub fn process_operations(
         active_balances,
         signatures,
     )?;
-    for signed_change in bls_to_execution_changes {
-        process_bls_to_execution_change(state, signed_change, config, signatures)?;
-    }
+    try_for_each_timed(
+        StfPhase::BlsToExecutionChanges,
+        bls_to_execution_changes,
+        |signed_change| process_bls_to_execution_change(state, signed_change, config, signatures),
+    )?;
     Ok(())
 }
 
