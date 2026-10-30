@@ -57,6 +57,11 @@
 //! lookup to the byte-keyed map, which needs no argument about indices at all.
 //! A slot is written once and never replaced, so a reader never sees a torn or
 //! changing entry; a key that lost the race for its slot goes to the map.
+//! A key first validated through the byte path and later looked up by index is
+//! copied into its slot, and stays in the map as well: byte-path callers cannot
+//! see the table, so dropping the map entry would make them validate it again.
+//! A key reached through both paths is therefore held twice (about 300 bytes
+//! rather than 150), which is the price of both kinds of caller hitting.
 //! A key that fails is never cached in either structure, so an invalid key
 //! costs a full check every time, exactly as before, and cannot grow either.
 //!
@@ -263,8 +268,9 @@ pub struct IndexedPubkey {
 /// that is sound.
 ///
 /// The index table holds a key resolved through an [`IndexedPubkey`] and the
-/// map holds every other, so a key lives in one structure and the memory per
-/// key stays that of the map's entry or less.
+/// map holds every other. A key reached through both paths is held in both,
+/// since byte-path callers cannot see the table; every other key lives in one
+/// structure, so the memory per key is that of the map's entry or less.
 struct PubkeyCache {
     shards: [RwLock<HashMap<BlsPubkey, PublicKey>>; PUBKEY_CACHE_SHARDS],
     /// The most entries one shard takes, so the whole cache stays within the
@@ -329,7 +335,19 @@ impl PubkeyCache {
         {
             return Some(*point);
         }
-        self.get_by_bytes(pubkey)
+        let point = self.get_by_bytes(pubkey)?;
+        // A key first seen through the byte path (gossip, sync committee
+        // messages) is copied into its empty slot, so later lookups by index
+        // hit the table. The map keeps its entry: byte-path callers cannot see
+        // the table and would have to validate again. Set-once, first writer
+        // wins; a slot holding other bytes is left alone.
+        if let Some(index) = key.index()
+            && let Some(slot) = self.slot(index, true)
+            && slot.set((*pubkey, point)).is_ok()
+        {
+            crate::metrics::inc_pubkey_cache_entries();
+        }
+        Some(point)
     }
 
     /// Records that `key`'s bytes validated to `point`: in the index table
@@ -945,6 +963,31 @@ mod tests {
         ])
         .unwrap();
         assert!(fast_aggregate_verify(&[first, second], message, &signature));
+    }
+
+    #[test]
+    fn a_byte_path_key_is_copied_into_the_table_on_its_first_index_lookup() {
+        let cache = PubkeyCache::new(INDEX_CHUNK_LEN);
+        let key = indexed(17, 9301);
+        let point = PublicKey::key_validate(key.pubkey.as_ref()).unwrap();
+        cache.insert(&key.pubkey, point);
+        assert!(held_at(&cache, key.index).is_none());
+
+        assert_eq!(
+            cache.get(&key).map(|point| point.to_bytes()),
+            Some(point.to_bytes())
+        );
+        assert_eq!(held_at(&cache, key.index), Some(key.pubkey));
+        // Held in both: byte-path callers still hit.
+        assert!(cache.get_by_bytes(&key.pubkey).is_some());
+        assert_eq!(cache.len(), 2);
+
+        // A slot holding other bytes is not overwritten by a promotion.
+        let other = indexed(17, 9302);
+        let other_point = PublicKey::key_validate(other.pubkey.as_ref()).unwrap();
+        cache.insert(&other.pubkey, other_point);
+        assert!(cache.get(&other).is_some());
+        assert_eq!(held_at(&cache, 17), Some(key.pubkey));
     }
 
     #[test]
