@@ -277,6 +277,11 @@ is state-transition work and the two phases do not overlap. When blocks import
 faster than the writer persists them, the wait shows up here rather than in
 `stf`.
 
+With an execution client the beacon `stf` row also includes a state
+transition that ran while `engine_newPayload` was in flight, and `engine` then
+reports only the wait left after it. A replay has no client, so neither applies
+to its numbers.
+
 ### What is excluded, and why
 
 Replay runs nothing that a corpus already answers for:

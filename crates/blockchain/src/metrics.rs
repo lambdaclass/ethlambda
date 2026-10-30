@@ -1507,6 +1507,33 @@ pub fn inc_engine_no_verdict() {
     LEAN_ENGINE_NO_VERDICT_TOTAL.inc();
 }
 
+/// Speculative state transitions, by what became of them.
+///
+/// With an execution client, the chain actor runs a block's state transition
+/// while the `engine_newPayload` round trip is in flight. `outcome` is `used`
+/// (handed to `fork_choice::on_block` with a verdict that lets it stand in for
+/// the transition; a block that then fails one of `on_block`'s earlier checks
+/// still counts, since the work was spent either way), `discarded_invalidated`
+/// (the verdict was `INVALIDATED`, so `on_block` runs its own), `discarded_held`
+/// (no verdict, or a non-candidate `SYNCING`/`ACCEPTED`, so the block is not
+/// imported) or `discarded_mismatch` (computed for another root or parent;
+/// not expected from the actor). A high `discarded_*` share means the overlap
+/// is buying nothing.
+pub fn inc_engine_speculation(outcome: &str) {
+    static LEAN_ENGINE_SPECULATION_TOTAL: std::sync::LazyLock<IntCounterVec> =
+        std::sync::LazyLock::new(|| {
+            register_int_counter_vec!(
+                "lean_engine_speculation_total",
+                "Speculative state transitions run during the engine round trip, by outcome",
+                &["outcome"]
+            )
+            .unwrap()
+        });
+    LEAN_ENGINE_SPECULATION_TOTAL
+        .with_label_values(&[outcome])
+        .inc();
+}
+
 /// Blocks not imported because the execution client has not validated them and
 /// they do not qualify for an optimistic import.
 ///

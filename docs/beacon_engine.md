@@ -91,6 +91,40 @@ already `INVALIDATED`, which costs one merkleization on a path that should never
 run and buys the failure arriving where a reviewer checks this code against the
 specification.
 
+### The transition runs while the answer is in flight
+
+With an execution client, `process_block` does not wait idle for the answer. It
+builds the request on the actor (copying only the payload, never the block),
+sends it from a spawned task so the HTTP exchange keeps progressing, and runs
+`fork_choice::speculate_transition` on the actor meanwhile: the block's state
+transition against its parent's post-state, with the engine assumed valid. The
+import then costs `max(engine wait, transition)` instead of their sum.
+
+Why that is the transition `on_block` would run: `on_block` derives the
+`ExecutionEngine` from the verdict in one place, `invalid()` for `INVALIDATED`
+and `valid()` for `NOT_REQUIRED`, `VALID` and optimistic alike, and the
+transition reads nothing else off the store except content-keyed caches. What
+keeps it harmless:
+
+- The result is a local value (`SpeculativeTransition`). Nothing reaches the
+  store, a cache that is not content-addressed, or the network until
+  `on_block_speculative` accepts it, and that runs every check `on_block` makes,
+  unchanged and in the same order.
+- It stands in for the transition only when it was computed for this block's
+  root and parent root and the verdict is not `INVALIDATED`. For `INVALIDATED`
+  it is dropped and `on_block` recomputes with `invalid()`, so the invalidation
+  path is the one described above, unchanged.
+- A block that ends up held (no verdict, or `SYNCING`/`ACCEPTED` for a block
+  that is not an optimistic candidate) drops it. The attempt is counted in
+  `lean_engine_speculation_total{outcome}`.
+- A panicked or cancelled request task is treated as no verdict, like an
+  exhausted retry ladder.
+
+The overlap shows in the import timing tree: the transition that ran during the
+round trip is reported under `stf`, and `engine` reports only the wait that was
+left once it finished. Without an execution client, and for forks that have no
+request to send (pre-merge, gloas), nothing overlaps and the path is the old one.
+
 ## The verdicts
 
 `optimistic-sync.md` groups the five wire statuses into three outcomes:
