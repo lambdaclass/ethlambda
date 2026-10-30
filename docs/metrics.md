@@ -552,6 +552,42 @@ block raced it, see `lean_beacon_epoch_precompute_seconds` against the slot
 duration), the node was syncing, or the entry was evicted from the state cache.
 A `timer` start with no matching `head` start means the last slot was skipped.
 
+### Beacon State Transition Phases
+
+Where the time of one beacon state transition goes. `lean_block_import_phase_seconds{phase="stf"}`
+says how long an import's transition took; this says which step.
+
+| Name | Type | Usage | Sample collection event | Labels | Buckets |
+|------|------|-------|-------------------------|--------|---------|
+| `lean_beacon_stf_phase_seconds` | Histogram | Time one step of the beacon state transition took | Once per step per transition, when the step finishes (a step that did not run writes nothing) | context=import,other; phase (see below) | 0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4 |
+
+`phase` is one of `BEACON_STF_PHASES` (`crates/blockchain/state_transition/src/metrics.rs`):
+
+| Phase | Covers |
+|-------|--------|
+| `process_slots` | Advancing the state to the block's slot, **excluding** epoch work: per-slot root bookkeeping, fork upgrades, the closing flush |
+| `process_epoch` | The epoch transition, once per boundary crossed (a long skip observes it several times) |
+| `block_signature` | The proposer's signature over the block, when the caller asked for result validation |
+| `block_header` | The header check, including the hash of the block body it commits to |
+| `randao` | The reveal's verification and the mix update |
+| `eth1_data` | The eth1 vote |
+| `execution_payload` | Withdrawals and the execution payload; gloas: the parent payload, then the withdrawals and the bid, two observations per block |
+| `proposer_slashings`, `attester_slashings`, `attestations`, `deposits`, `voluntary_exits`, `bls_to_execution_changes`, `payload_attestations` | One observation per block for the whole list, absent when the list is empty; the fork must have the list |
+| `execution_requests` | Electra and fulu's requests of the execution layer |
+| `sync_aggregate` | The sync aggregate, altair onward |
+| `state_root` | The post-state flush and `hash_tree_root` that checks `block.state_root`; only observed when the caller validates the result |
+
+**`context` keeps background work out of an import's numbers.** The epoch
+precompute worker runs `process_epoch` on its own thread while an import runs,
+so one series would charge the worker's seconds to whichever import was in
+flight. `context="import"` is written only by the import path
+(`fork_choice::on_block`'s transition); every other caller (the precompute
+worker, checkpoint-state advances, block production, gossip validation) writes
+`context="other"`. A dashboard that wants an import's cost reads
+`context="import"`; one that wants the precompute worker's reads `other`, which
+also holds the other callers, so `lean_beacon_epoch_precompute_seconds` is the
+cleaner series for the worker alone.
+
 ### Beacon Pubkey Cache
 
 Every BLS signature check `ethlambda beacon` runs (block import, fork choice,

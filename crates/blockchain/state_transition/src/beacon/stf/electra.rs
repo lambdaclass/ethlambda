@@ -82,6 +82,8 @@ use crate::beacon::primitives::{
     WithdrawalIndex,
 };
 
+use crate::metrics::{StfPhase, timed, try_for_each_timed};
+
 use super::ExecutionEngine;
 
 // ---------------------------------------------------------------------------
@@ -1802,28 +1804,40 @@ pub fn process_operations(
         verify(body.deposits.is_empty(), "len(body.deposits) == 0")?;
     }
 
-    for proposer_slashing in body.proposer_slashings.iter() {
-        super::operations::process_proposer_slashing(state, proposer_slashing, config)?;
-    }
-    for attester_slashing in body.attester_slashings.iter() {
-        process_attester_slashing(state, attester_slashing, config)?;
-    }
+    try_for_each_timed(
+        StfPhase::ProposerSlashings,
+        body.proposer_slashings.iter(),
+        |slashing| super::operations::process_proposer_slashing(state, slashing, config),
+    )?;
+    try_for_each_timed(
+        StfPhase::AttesterSlashings,
+        body.attester_slashings.iter(),
+        |slashing| process_attester_slashing(state, slashing, config),
+    )?;
     // [Modified in Electra:EIP7549]
-    for attestation in body.attestations.iter() {
-        process_attestation(state, attestation, committees, active_balances)?;
-    }
-    for deposit in body.deposits.iter() {
-        process_deposit(state, deposit, config)?;
-    }
+    try_for_each_timed(
+        StfPhase::Attestations,
+        body.attestations.iter(),
+        |attestation| process_attestation(state, attestation, committees, active_balances),
+    )?;
+    try_for_each_timed(StfPhase::Deposits, body.deposits.iter(), |deposit| {
+        process_deposit(state, deposit, config)
+    })?;
     // [Modified in Electra:EIP7251]
-    for voluntary_exit in body.voluntary_exits.iter() {
-        process_voluntary_exit(state, voluntary_exit, config)?;
-    }
-    for signed_change in body.bls_to_execution_changes.iter() {
-        process_bls_to_execution_change(state, signed_change, config)?;
-    }
+    try_for_each_timed(
+        StfPhase::VoluntaryExits,
+        body.voluntary_exits.iter(),
+        |exit| process_voluntary_exit(state, exit, config),
+    )?;
+    try_for_each_timed(
+        StfPhase::BlsToExecutionChanges,
+        body.bls_to_execution_changes.iter(),
+        |signed_change| process_bls_to_execution_change(state, signed_change, config),
+    )?;
     // [New in Electra:EIP6110:EIP7002:EIP7251]
-    process_execution_requests(state, &body.execution_requests, config)?;
+    timed(StfPhase::ExecutionRequests, || {
+        process_execution_requests(state, &body.execution_requests, config)
+    })?;
 
     Ok(())
 }
@@ -1854,15 +1868,21 @@ pub fn process_block(
     active_balances: &ActiveBalanceCache,
     options: super::block::BlockProcessingOptions,
 ) -> Result<()> {
-    super::block::process_block_header(
-        state,
-        block.slot,
-        block.proposer_index,
-        block.parent_root,
-        block.body.hash_tree_root(),
-    )?;
-    process_withdrawals(state, &block.body.execution_payload)?;
-    process_execution_payload(state, &block.body, config, engine)?;
+    // The body's root is an argument, so it is hashed inside the timed span:
+    // it is part of what a header costs.
+    timed(StfPhase::BlockHeader, || {
+        super::block::process_block_header(
+            state,
+            block.slot,
+            block.proposer_index,
+            block.parent_root,
+            block.body.hash_tree_root(),
+        )
+    })?;
+    timed(StfPhase::ExecutionPayload, || -> Result<()> {
+        process_withdrawals(state, &block.body.execution_payload)?;
+        process_execution_payload(state, &block.body, config, engine)
+    })?;
     super::block::process_randao(state, &block.body.randao_reveal, options.randao)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
     process_operations(state, &block.body, config, committees, active_balances)?;
