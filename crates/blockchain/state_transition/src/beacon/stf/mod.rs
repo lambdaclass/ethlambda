@@ -229,10 +229,15 @@ pub fn block_signature_set(
     state: &BeaconState,
     signed_block: &containers::SignedBeaconBlock,
 ) -> Option<bls::SignatureSet> {
-    let proposer = state.validator(signed_block.proposer_index()).ok()?;
+    let index = signed_block.proposer_index();
+    let proposer = state.validator(index).ok()?;
     let domain = get_domain(state, constants::DOMAIN_BEACON_PROPOSER, None);
     let signing_root = compute_signing_root(signed_block.message_hash_tree_root(), domain);
-    bls::SignatureSet::single(&proposer.pubkey, signing_root, &signed_block.signature())
+    let proposer = bls::IndexedPubkey {
+        index,
+        pubkey: proposer.pubkey,
+    };
+    bls::SignatureSet::single(&proposer, signing_root, &signed_block.signature())
 }
 
 /// Advances the state to `slot`, running epoch processing at each boundary and

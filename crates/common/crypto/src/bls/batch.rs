@@ -39,9 +39,9 @@ use blst::blst_scalar;
 use blst::min_pk::{PublicKey, Signature};
 use rand::RngExt;
 
-use ethlambda_types::beacon::primitives::{BlsPubkey, BlsSignature, Root};
+use ethlambda_types::beacon::primitives::{BlsSignature, Root};
 
-use super::{AggregatePubkey, DST, validated_pubkey, validated_pubkeys};
+use super::{AggregatePubkey, DST, PubkeySource, validated_pubkey, validated_pubkeys};
 
 /// How many bits of each random weight the batch check uses.
 const RAND_BITS: usize = 64;
@@ -73,7 +73,11 @@ impl SignatureSet {
     ///
     /// `None` when the key or the signature fails validation, which is exactly
     /// when [`super::verify`] returns false before reaching the pairing.
-    pub fn single(pubkey: &BlsPubkey, message: Root, signature: &BlsSignature) -> Option<Self> {
+    pub fn single<K: PubkeySource>(
+        pubkey: &K,
+        message: Root,
+        signature: &BlsSignature,
+    ) -> Option<Self> {
         let pubkey = validated_pubkey(pubkey)?;
         let signature = Signature::sig_validate(signature.as_ref(), false).ok()?;
         Some(Self {
@@ -89,8 +93,8 @@ impl SignatureSet {
     /// `None` for an empty `pubkeys`, any key that fails `key_validate`, or a
     /// signature that fails `sig_validate`: the cases
     /// [`super::fast_aggregate_verify`] answers false for before the pairing.
-    pub fn fast_aggregate(
-        pubkeys: &[BlsPubkey],
+    pub fn fast_aggregate<K: PubkeySource>(
+        pubkeys: &[K],
         message: Root,
         signature: &BlsSignature,
     ) -> Option<Self> {
@@ -222,6 +226,7 @@ mod tests {
 
     use super::*;
     use crate::bls;
+    use ethlambda_types::beacon::primitives::BlsPubkey;
 
     fn secret_key(seed: u8) -> SecretKey {
         let mut ikm = [seed; 32];
@@ -362,7 +367,7 @@ mod tests {
 
         assert!(SignatureSet::single(&garbage_key, msg, &signature).is_none());
         assert!(SignatureSet::single(&pubkey, msg, &garbage_signature).is_none());
-        assert!(SignatureSet::fast_aggregate(&[], msg, &signature).is_none());
+        assert!(SignatureSet::fast_aggregate::<BlsPubkey>(&[], msg, &signature).is_none());
         assert!(SignatureSet::fast_aggregate(&[pubkey, garbage_key], msg, &signature).is_none());
         assert!(SignatureSet::fast_aggregate(&[pubkey], msg, &garbage_signature).is_none());
         // The identity signature is a valid encoding: it builds a set that fails.

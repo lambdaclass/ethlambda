@@ -17,7 +17,7 @@ pub use ethlambda_storage::{
     ActiveBalanceCache, ActiveBalanceKey, CommitteeCache, Lookup, ShufflingKey,
 };
 
-use crate::beacon::bls::{AggregatePubkey, CommitteeKeySums};
+use crate::beacon::bls::{AggregatePubkey, CommitteeKeySums, IndexedPubkey};
 use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::BeaconState;
@@ -416,9 +416,14 @@ fn build_committee_key_sums(
     let sums = members
         .par_iter()
         .map(|committee| {
-            let keys: Option<Vec<BlsPubkey>> = committee
+            // The index is attached per committee rather than stored in the
+            // flat list, which spans the whole registry.
+            let keys: Option<Vec<IndexedPubkey>> = committee
                 .iter()
-                .map(|index| pubkeys.get(*index as usize).copied())
+                .map(|&index| {
+                    let pubkey = *pubkeys.get(index as usize)?;
+                    Some(IndexedPubkey { index, pubkey })
+                })
                 .collect();
             AggregatePubkey::sum(&keys?)
         })

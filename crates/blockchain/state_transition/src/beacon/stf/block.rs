@@ -17,7 +17,7 @@
 //! every driver, present and future, call the identical function regardless of
 //! what else that fork's body carries.
 
-use crate::beacon::bls::SignatureSet;
+use crate::beacon::bls::{IndexedPubkey, SignatureSet};
 use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::{self, BeaconBlockHeader, BeaconState, Eth1Data, altair, phase0};
@@ -352,7 +352,14 @@ pub fn process_randao(
     let proposer = state.validator(proposer_index)?;
     if verification == RandaoVerification::Verify {
         signatures.push(
-            SignatureSet::single(&proposer.pubkey, signing_root, randao_reveal),
+            SignatureSet::single(
+                &IndexedPubkey {
+                    index: proposer_index,
+                    pubkey: proposer.pubkey,
+                },
+                signing_root,
+                randao_reveal,
+            ),
             "RANDAO reveal signature",
         )?;
     }
