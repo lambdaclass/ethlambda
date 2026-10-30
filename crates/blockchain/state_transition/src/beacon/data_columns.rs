@@ -146,6 +146,10 @@ pub fn get_data_column_sidecars(
         kzg_commitments.len(),
         "one cells-and-proofs entry per commitment"
     );
+    // A block without blobs has no sidecars (consensus-specs #5767).
+    if kzg_commitments.is_empty() {
+        return Vec::new();
+    }
     (0..NUMBER_OF_COLUMNS)
         .map(|column_index| {
             let column: Vec<fulu::Cell> = cells_and_proofs
@@ -345,6 +349,7 @@ mod tests {
     fn a_block_without_blobs_has_no_sidecars() {
         let (block, proofs) = block_with(&[]);
         assert!(verified_sidecars(&block, &[], &proofs).unwrap().is_empty());
+        assert_eq!(get_data_column_sidecars_from_block(&block, &[]), vec![]);
     }
 
     #[test]
