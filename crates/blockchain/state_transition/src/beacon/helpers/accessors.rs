@@ -332,7 +332,9 @@ pub trait CommitteeCacheExt {
     /// A committee with a member whose key fails validation gets no sum
     /// (`None` in its slot), so lookups of it fall back to the direct path
     /// rather than to a sum that omits the member. Does nothing for an epoch
-    /// `state` cannot key, since there is nowhere to file the result.
+    /// `state` cannot key, since there is nowhere to file the result, nor
+    /// before electra, whose attestations never read the sums. Idempotent, so
+    /// a caller unsure whether an epoch is warm can just ask again.
     fn warm_key_sums(&self, state: &BeaconState, epoch: Epoch);
 }
 
@@ -365,6 +367,9 @@ impl CommitteeCacheExt for CommitteeCache {
     }
 
     fn warm_key_sums(&self, state: &BeaconState, epoch: Epoch) {
+        if state.fork_name() < ForkName::Electra {
+            return;
+        }
         let Some(key) = shuffling_key(state, epoch) else {
             return;
         };
@@ -374,7 +379,12 @@ impl CommitteeCacheExt for CommitteeCache {
         // Resident before the sums are filed into it; a no-op when the import
         // path already built them.
         let committees = self.committees(state, epoch);
-        self.get_or_init_key_sums(key, || build_committee_key_sums(state, &committees, epoch));
+        self.get_or_init_key_sums(key, || {
+            // The sums alone: not the committees above, nor a lookup that
+            // found the work already done.
+            let _timing = crate::metrics::time_key_sums_warm();
+            build_committee_key_sums(state, &committees, epoch)
+        });
     }
 }
 

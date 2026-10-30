@@ -553,13 +553,18 @@ pub(crate) fn attesting_indices_from_committee_bits(
 /// Per committee, when the shuffling's key sums are warm
 /// ([`CommitteeCacheExt::key_sums`], lookup only: import never builds them)
 /// and more than half of the committee attested, the committee's part is its
-/// sum minus the keys of the non-attesters; otherwise it is the sum of the
-/// attesters. A committee whose sum is `None` (a member's key fails
-/// validation) takes the second branch, so only the attesters' own keys decide
-/// it, exactly as with cold sums. The parts are then added.
-/// Subtracting is the same group element as summing the attesters, so the
-/// pairing check cannot tell the two apart; only the point additions differ,
-/// absentees' instead of attesters'.
+/// sum minus the keys of the non-attesters; otherwise its attesters' keys are
+/// summed directly. A committee whose sum is `None` (a member's key fails
+/// validation) is summed directly, so only the attesters' own keys decide it,
+/// exactly as with cold sums. Subtracting is the same group element as summing
+/// the attesters, so the pairing check cannot tell the two apart; only the
+/// point additions differ, absentees' instead of attesters'.
+///
+/// Every directly summed attester, across all committees, goes into one sum
+/// rather than one per committee. With cold sums that is the single sum of
+/// every attester the plain path makes, at its cost: blst splits a large sum
+/// over its pool, and one sum per committee would pay that pool's dispatch
+/// once per committee for a few hundred keys each.
 ///
 /// Phase0 through deneb attestations stay on the direct path: each names one
 /// committee, and the live chain is past electra.
@@ -582,7 +587,10 @@ pub(crate) fn attesters_aggregate_pubkey(
         })
     };
 
+    // Committees derived from their sums, added as they come, and the keys of
+    // every committee summed directly, summed once at the end.
     let mut total: Option<AggregatePubkey> = None;
+    let mut direct = Vec::new();
     let mut committee_offset = 0usize;
     for committee_index in get_committee_indices(committee_bits) {
         let committee = epoch_committees.committee(slot, committee_index)?;
@@ -599,7 +607,7 @@ pub(crate) fn attesters_aggregate_pubkey(
 
         let number = committee_number(slot, committees_per_slot, committee_index)?;
         let sum = key_sums.as_ref().and_then(|sums| sums.get(number as usize));
-        let part = match sum {
+        match sum {
             Some(sum) if attester_count * 2 > committee.len() => {
                 let absent: Option<Vec<_>> = committee
                     .iter()
@@ -607,19 +615,26 @@ pub(crate) fn attesters_aggregate_pubkey(
                     .filter(|(_, set)| !**set)
                     .map(|(index, _)| pubkey_of(*index))
                     .collect();
-                absent.and_then(|absent| sum.minus(&absent))
+                let Some(part) = absent.and_then(|absent| sum.minus(&absent)) else {
+                    return Ok(None);
+                };
+                total = Some(match total {
+                    Some(total) => total.plus(&part),
+                    None => part,
+                });
             }
             _ => {
-                let present: Option<Vec<_>> = committee
-                    .iter()
-                    .zip(&attested)
-                    .filter(|(_, set)| **set)
-                    .map(|(index, _)| pubkey_of(*index))
-                    .collect();
-                present.and_then(|present| AggregatePubkey::sum(&present))
+                for (index, _) in committee.iter().zip(&attested).filter(|(_, set)| **set) {
+                    let Some(pubkey) = pubkey_of(*index) else {
+                        return Ok(None);
+                    };
+                    direct.push(pubkey);
+                }
             }
-        };
-        let Some(part) = part else {
+        }
+    }
+    if !direct.is_empty() {
+        let Some(part) = AggregatePubkey::sum(&direct) else {
             return Ok(None);
         };
         total = Some(match total {
