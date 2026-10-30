@@ -201,6 +201,33 @@ mod tests {
         assert_eq!(total.minus(&[]).unwrap().to_bytes(), total.to_bytes());
     }
 
+    /// The same over random masks of a committee-sized run, with the attesters
+    /// scattered rather than a prefix: `sum - absentees` and the direct sum of
+    /// the attesters are the same bytes.
+    #[test]
+    fn minus_agrees_with_the_direct_sum_over_random_masks() {
+        let keys = pubkeys(64);
+        let total = AggregatePubkey::sum(&keys).unwrap();
+        // xorshift64, fixed seed: reproducible without a seeded-RNG dependency.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for round in 0..40 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let (attesters, absentees): (Vec<_>, Vec<_>) = keys
+                .iter()
+                .enumerate()
+                .partition(|(position, _)| state >> position & 1 == 1);
+            let attesters: Vec<BlsPubkey> = attesters.into_iter().map(|(_, key)| *key).collect();
+            let absentees: Vec<BlsPubkey> = absentees.into_iter().map(|(_, key)| *key).collect();
+            if attesters.is_empty() {
+                continue;
+            }
+            let derived = total.minus(&absentees).unwrap();
+            assert_eq!(derived.to_bytes(), direct(&attesters), "round {round}");
+        }
+    }
+
     #[test]
     fn minus_with_an_invalid_key_is_none() {
         let keys = pubkeys(4);
