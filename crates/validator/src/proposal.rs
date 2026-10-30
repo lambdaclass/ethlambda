@@ -183,7 +183,7 @@ impl<B: BeaconNodeApi> ProposalService<B> {
             }
             Err(err) => {
                 warn!(%slot, %err, "Slashing protection could not be consulted; refusing to propose");
-                Some(err)
+                Some(err.to_string())
             }
         };
         if let Some(reason) = refusal {
@@ -278,7 +278,7 @@ impl<B: BeaconNodeApi> ProposalService<B> {
             Ok(Err(refusal)) => Some(refusal.to_string()),
             Err(err) => {
                 error!(%slot, %err, "Slashing protection could not record this block; refusing to sign");
-                Some(err)
+                Some(err.to_string())
             }
         };
         if let Some(reason) = refusal {

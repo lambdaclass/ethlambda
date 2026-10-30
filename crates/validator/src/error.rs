@@ -114,6 +114,18 @@ pub enum Error {
     /// an operator looks.
     #[error("slashing protection {path}: {reason}")]
     SlashingProtection { path: String, reason: String },
+    /// The record cannot be reached at all, as opposed to a record that
+    /// answered: its lock is poisoned because an earlier access panicked
+    /// while holding it, or the runtime is shutting down under the blocking
+    /// task.
+    ///
+    /// Kept apart from `SlashingProtection` and `Io` because the remedy
+    /// differs: those name a file to look at, this one names a process to
+    /// restart. A poisoned lock is a bug, never a disk, and it stays poisoned
+    /// for the life of the process, so every duty is refused until it is
+    /// restarted. Never retryable.
+    #[error("slashing protection is unusable: {reason}")]
+    SlashingProtectionUnusable { reason: String },
 
     #[error("{path}: {source}")]
     Io {
@@ -148,6 +160,7 @@ impl Error {
             | Self::UnknownValidator(_)
             | Self::Signing { .. }
             | Self::SlashingProtection { .. }
+            | Self::SlashingProtectionUnusable { .. }
             | Self::Io { .. } => false,
         }
     }
