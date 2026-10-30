@@ -63,6 +63,7 @@ pub mod epoch;
 pub mod fulu;
 pub mod gloas;
 pub mod operations;
+pub mod signatures;
 
 use crate::beacon::containers;
 use crate::beacon::containers::{BeaconState, phase0};
@@ -177,14 +178,14 @@ pub fn apply_block(
         "the block's fork matches the state's",
     )?;
 
+    // One batch for the whole block, the proposer's signature first so a block
+    // whose only defect is that signature is still rejected with its label.
+    let mut signatures = signatures::SignatureBatch::new();
     if validate_result {
-        verify(
-            verify_block_signature(state, signed_block),
-            "block signature",
-        )?;
+        signatures.push(block_signature_set(state, signed_block), "block signature")?;
     }
 
-    block::process_block(
+    block::process_block_with_signatures(
         state,
         signed_block,
         config,
@@ -192,7 +193,11 @@ pub fn apply_block(
         committees,
         active_balances,
         block::BlockProcessingOptions::default(),
+        &mut signatures,
     )?;
+    // Before the state root is computed: a block rejected here would otherwise
+    // pay for hashing a state it is about to discard.
+    signatures.verify()?;
     // As in `process_slot`: the post-state's root, checked below and needed
     // again in the next slot, is then computed on the state's own nodes.
     state.apply_pending_mutations();
@@ -212,12 +217,21 @@ pub fn verify_block_signature(
     state: &BeaconState,
     signed_block: &containers::SignedBeaconBlock,
 ) -> bool {
-    let Ok(proposer) = state.validator(signed_block.proposer_index()) else {
-        return false;
-    };
+    block_signature_set(state, signed_block).is_some_and(|set| set.verify())
+}
+
+/// The proposer's signature check [`verify_block_signature`] makes, resolved
+/// but not yet run, so [`apply_block`] can verify it with the block's other
+/// signatures in one batch. `None` is a proposer index outside the registry,
+/// or a key or signature that does not validate.
+pub fn block_signature_set(
+    state: &BeaconState,
+    signed_block: &containers::SignedBeaconBlock,
+) -> Option<bls::SignatureSet> {
+    let proposer = state.validator(signed_block.proposer_index()).ok()?;
     let domain = get_domain(state, constants::DOMAIN_BEACON_PROPOSER, None);
     let signing_root = compute_signing_root(signed_block.message_hash_tree_root(), domain);
-    bls::verify(&proposer.pubkey, signing_root, &signed_block.signature())
+    bls::SignatureSet::single(&proposer.pubkey, signing_root, &signed_block.signature())
 }
 
 /// Advances the state to `slot`, running epoch processing at each boundary and

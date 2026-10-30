@@ -9,6 +9,8 @@
 //! the aggregation bits from one committee to a whole slot's worth and adding a
 //! committee bitfield, so it gets its own versions rather than reusing these.
 
+use crate::beacon::bls::SignatureSet;
+use crate::beacon::constants;
 use crate::beacon::containers::BeaconState;
 use crate::beacon::containers::phase0::{Attestation, AttestingIndices, IndexedAttestation};
 use crate::beacon::error::Result;
@@ -16,7 +18,6 @@ use crate::beacon::helpers::accessors::{CommitteeCache, CommitteeCacheExt, get_d
 use crate::beacon::helpers::misc::{compute_epoch_at_slot, compute_signing_root};
 use crate::beacon::helpers::predicates::are_indices_sorted_and_unique;
 use crate::beacon::primitives::{Domain, HashTreeRoot as _, ValidatorIndex};
-use crate::beacon::{bls, constants};
 
 /// The committee members whose bit is set in `attestation`, in ascending order.
 ///
@@ -79,12 +80,27 @@ pub fn is_valid_indexed_attestation(
     state: &BeaconState,
     indexed_attestation: &IndexedAttestation,
 ) -> bool {
+    indexed_attestation_signature_set(state, indexed_attestation).is_some_and(|set| set.verify())
+}
+
+/// The signature check [`is_valid_indexed_attestation`] makes, resolved but
+/// not yet run, so a block can verify every attestation's signature in one
+/// batch.
+///
+/// Every structural check [`is_valid_indexed_attestation`] makes (the
+/// attester set's shape and range) happens here, at once: `None` means the
+/// attestation is invalid without needing a pairing. Only the pairing is left
+/// to the caller.
+pub fn indexed_attestation_signature_set(
+    state: &BeaconState,
+    indexed_attestation: &IndexedAttestation,
+) -> Option<SignatureSet> {
     let domain = get_domain(
         state,
         constants::DOMAIN_BEACON_ATTESTER,
         Some(indexed_attestation.data.target.epoch),
     );
-    is_valid_indexed_attestation_with_domain(state, indexed_attestation, domain)
+    indexed_attestation_signature_set_with_domain(state, indexed_attestation, domain)
 }
 
 /// [`is_valid_indexed_attestation`] under a signing domain the caller chose.
@@ -97,19 +113,30 @@ pub fn is_valid_indexed_attestation_with_domain(
     indexed_attestation: &IndexedAttestation,
     domain: Domain,
 ) -> bool {
+    indexed_attestation_signature_set_with_domain(state, indexed_attestation, domain)
+        .is_some_and(|set| set.verify())
+}
+
+/// [`indexed_attestation_signature_set`] under a signing domain the caller
+/// chose.
+pub fn indexed_attestation_signature_set_with_domain(
+    state: &BeaconState,
+    indexed_attestation: &IndexedAttestation,
+    domain: Domain,
+) -> Option<SignatureSet> {
     let indices: &[ValidatorIndex] = &indexed_attestation.attesting_indices;
     if indices.is_empty() || !are_indices_sorted_and_unique(indices) {
-        return false;
+        return None;
     }
 
     let mut pubkeys = Vec::with_capacity(indices.len());
     for index in indices {
         match state.validator(*index) {
             Ok(validator) => pubkeys.push(validator.pubkey),
-            Err(_) => return false,
+            Err(_) => return None,
         }
     }
 
     let signing_root = compute_signing_root(indexed_attestation.data.hash_tree_root(), domain);
-    bls::fast_aggregate_verify(&pubkeys, signing_root, &indexed_attestation.signature)
+    SignatureSet::fast_aggregate(&pubkeys, signing_root, &indexed_attestation.signature)
 }
