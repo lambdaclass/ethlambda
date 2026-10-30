@@ -26,10 +26,11 @@ serde_yaml_ng.workspace = true
 hex.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-# `time` for the duty loop's sleep between slots. Declared here rather than
-# relied on through workspace feature unification, so this crate still builds
-# if it is ever compiled on its own.
-tokio = { workspace = true, features = ["time", "macros"] }
+# `time` for the duty loop's sleep between slots, `rt` for `spawn_blocking`,
+# which keeps the slashing-protection record's disk flush off the executor.
+# Declared here rather than relied on through workspace feature unification,
+# so this crate still builds if it is ever compiled on its own.
+tokio = { workspace = true, features = ["time", "macros", "rt"] }
 reqwest = { workspace = true, features = ["json"] }
 
 # BLS12-381. Same version and backend the state transition verifies with, so a

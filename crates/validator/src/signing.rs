@@ -367,8 +367,9 @@ impl SigningContext {
     /// This one *is* slashable, and is the most expensive signature this
     /// client can get wrong: two distinct blocks for one slot need no second
     /// validator to be caught, since the two signed headers are the whole
-    /// evidence. Callers must pass it through
-    /// [`crate::proposal_guard::ProposalGuard`] first.
+    /// evidence. Callers must have it allowed and recorded by
+    /// [`crate::slashing_protection::SlashingProtection::check_and_record_block`]
+    /// first.
     pub fn sign_block(
         &self,
         store: &ValidatorStore,

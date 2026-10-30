@@ -341,13 +341,14 @@ payload envelope and the payload timeliness vote. It talks to a beacon node over
 the standard Beacon API, so it works against `ethlambda beacon` (run with the
 `--execution-*` flags) or any other conformant beacon node.
 
-> **Warning:** the validator client keeps no slashing-protection record yet.
-> Slashing protection is a work in progress and will be added soon. Until then,
-> do not run the same keys in another client while this one runs, and treat a
-> restart with the same care as a manual key move. Read
-> [Spec deviations](./docs/spec_deviations.md#the-validator-client-keeps-no-slashing-protection-record)
-> before using keys that hold real stake. The client repeats this warning at
-> startup.
+> **Slashing protection:** every block and attestation is checked against a
+> durable per-validator record in `--validators-dir` before it is signed, and a
+> second validator client pointed at the same directory refuses to start. A key
+> with no record is refused at startup: pass `--init-slashing-protection` once,
+> and only for keys that have signed nothing anywhere for at least two epochs.
+> Importing history from another client is not supported yet, so never run
+> these keys in another client at the same time. See
+> [Spec deviations](./docs/spec_deviations.md#the-validator-client-keeps-eip-3076s-minimal-watermarks-not-full-history).
 
 ```sh
 ./target/release/ethlambda validator \

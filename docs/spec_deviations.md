@@ -40,58 +40,62 @@ target-slot order as they are scanned.
 - **Equivalence:** both produce a valid block. ethlambda front-loads the attestations that advance justification and finality, and within those tiers prefers the *newest* target where leanSpec takes the *oldest*; combined with the smaller default budget, an older entry can be outranked by newer ones round after round, so which votes reach peers through blocks differs even though every block stays valid. The smaller budget yields smaller blocks and lower build times.
 - **Upstream status:** the tiered strategy is proposed upstream as leanSpec [PR #1149](https://github.com/leanEthereum/leanSpec/pull/1149) (open at the time of writing), so this deviation may converge; the recursive-merge collapse follows leanSpec #510.
 
-## The validator client keeps no slashing-protection record
+## The validator client keeps EIP-3076's minimal watermarks, not full history
 
-`ethlambda validator` signs attestations and blocks without recording what it
-has signed. It cannot detect that a previous run, or another client holding the
-same keys, already signed.
+`ethlambda validator` records, per validator, only the highest block slot and
+the highest attestation source and target epochs it has signed, and refuses
+anything that does not advance past them.
 
 - **The specification:** [EIP-3076](https://eips.ethereum.org/EIPS/eip-3076)
-  defines an interchange format and the conditions a validator client must never
-  violate. For attestations: signing two *distinct* attestations with the same
-  target epoch (a double vote), and signing one whose source and target surround
-  or are surrounded by another's. For blocks: signing two distinct ones for the
-  same slot. Enforcing any of them requires a durable record, written before the
-  signature leaves the process.
-- **ethlambda:** there is no such record and no store to hold one. This is a
-  deliberate scope decision for the client's first phase, not an oversight.
-- **What partially covers it:** two in-memory guards, one per message kind.
-  `crate::attestation_guard::AttestationGuard` refuses to sign a second
-  conflicting attestation for a validator *within one run*, using EIP-3076's
-  minimal rule (the target must advance, the source must not regress).
-  `crate::proposal_guard::ProposalGuard` does the same for blocks, with the
-  minimal rule for those (the slot must strictly advance). Between them they
-  close the shapes reachable through ordinary operation: a backward wall-clock
-  step, or a duty schedule replaced mid-epoch. Both are held in memory only, so
-  a restart empties them and neither knows anything about any other process.
+  forbids signing two *distinct* attestations with the same target epoch (a
+  double vote), one whose source and target surround or are surrounded by
+  another's, and two distinct blocks for one slot. It allows enforcing those
+  either against the full signing history or with the stricter minimal rule
+  over watermarks.
+- **ethlambda:** the minimal rule. An attestation is signed only if its target
+  is above the recorded target and its source is not below the recorded source;
+  a block only if its slot is above the recorded slot. The record is
+  `<validators-dir>/slashing_protection.json`, an EIP-3076 version 5 minimal
+  interchange naming the chain's `genesis_validators_root`. It is written to a
+  temporary file, flushed, renamed into place and the directory flushed, all
+  before the signature exists, and a write that fails leaves the message
+  unsigned. A file that is empty, malformed, of another version or for another
+  chain stops the client at startup rather than being read as "nothing
+  signed". An exclusive lock (`slashing_protection.lock`) keeps a second process
+  away from it. See `crate::slashing_protection`.
+- **What the strictness costs:** a byte-identical re-sign is refused. A client
+  that recorded an attestation, crashed before publishing it, and restarted
+  into the same slot loses that attestation rather than publishing it; the same
+  holds for a block. An honest validator's messages otherwise advance this way,
+  so nothing else is refused. Lighthouse and Prysm keep signing roots to allow
+  the identical re-sign; Teku keeps the same watermarks as this client.
+- **Keys with no record:** refused at startup. `--init-slashing-protection`
+  registers them as if each had signed a block and an attestation at the
+  current slot and epoch, and a key imported through the keymanager API with
+  no history is registered the same way before it is loaded. That closes the
+  double-vote window for a key that signed elsewhere a moment ago, at the cost
+  of the rest of the epoch's duties, but not a surround against older history,
+  so the flag is still only for keys that have signed nothing anywhere for at
+  least two epochs.
 - **Gloas messages:** a gloas proposer also signs an execution payload
   envelope, and a payload timeliness committee member signs a payload
-  attestation. Neither is slashable, so neither has a guard. An envelope is
+  attestation. Neither is slashable, so neither is recorded. An envelope is
   published once per proposal, right after its block, and a failure to publish it
   is logged at error and counted without failing the proposal. A PTC vote has an
   in-memory dedup of `(validator, slot)` pairs recorded at signing time
   (`PayloadAttestationService`), so a duty abandoned between signing and
-  submission is lost rather than re-signed. It is emptied by a restart and says
-  nothing about another process, so it is not slashing protection either: a
-  second, different vote for one slot is equivocation that peers penalize in
-  gossip, not a slashing.
-- **Why a proposer slashing is the worse of the two:** a double vote needs a
-  second validator's attestation to be caught. Two signed block headers for one
-  slot are the whole of the evidence on their own.
-- **What is therefore not covered:** restarting into a state where the chain has
-  moved, and running these keys in two places at once. Both can produce a
-  slashable double vote or a double proposal, and nothing in this client will
-  stop them.
-- **Keymanager consequences:** `DELETE /eth/v1/keystores` must return an
-  EIP-3076 interchange. This client returns a well-formed but empty one whose
-  `genesis_validators_root` is deliberately all-zero, so a conformant importer
-  rejects it outright rather than trusting an empty history that was never
-  recorded. `POST` accepts the `slashing_protection` field and ignores it, with
-  a server-side warning. A key migrated in or out through this API does not
-  carry its history.
-- **Operationally:** do not run these keys in any other client while this one
-  runs, and treat a restart as an event that needs the same care a manual key
-  move would. The client warns about this at startup on every run.
+  submission is lost rather than re-signed. A second, different vote for one
+  slot is equivocation that peers penalize in gossip, not a slashing.
+- **What is not covered:** the same keys running in another client on another
+  machine. No local record can see that.
+- **Keymanager consequences:** history is not carried in or out yet.
+  `DELETE /eth/v1/keystores` must return an EIP-3076 interchange; this client
+  returns a well-formed but empty one whose `genesis_validators_root` is
+  deliberately all-zero, so a conformant importer rejects it outright rather
+  than trusting an empty history. `POST` accepts the `slashing_protection`
+  field and ignores it, with a server-side warning, so an imported key starts
+  at the current slot and epoch, like one registered by
+  `--init-slashing-protection`.
 
 ## Builder bids: gossip and API only (no builder API)
 

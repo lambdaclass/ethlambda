@@ -718,11 +718,11 @@ and absent is not the same as zero.
 | `ethlambda_validator_attestations_published_total` | Counter | Attestations a beacon node accepted |
 | `ethlambda_validator_attestation_failures_total` | Counter | Slots whose attestation duty failed and returned |
 | `ethlambda_validator_attestation_deadline_missed_total` | Counter | Slots whose duty never returned in time and was abandoned. Points at a slow or hung beacon node rather than a rejected attestation |
-| `ethlambda_validator_attestations_refused_total` | Counter | Signatures deliberately not attempted, because this process had already signed a conflicting attestation for that validator. Should normally read zero |
+| `ethlambda_validator_attestations_refused_total` | Counter | Signatures deliberately not attempted, because slashing protection judged the attestation unsafe or could not record it. Should normally read zero |
 | `ethlambda_validator_signing_failures_total` | Counter | Signatures attempted and failed |
 | `ethlambda_validator_blocks_proposed_total` | Counter | Blocks signed and accepted by a beacon node |
 | `ethlambda_validator_blocks_broadcast_not_imported_total` | Counter | Blocks a node broadcast but could not import into its own database, which is what a 202 means. A subset of `blocks_proposed_total`, not a failure: the block reached the network. Points at that node's execution layer |
-| `ethlambda_validator_blocks_refused_total` | Counter | Blocks deliberately not signed, because this process had already proposed that slot for that validator. Should normally read zero |
+| `ethlambda_validator_blocks_refused_total` | Counter | Blocks deliberately not signed, because slashing protection judged the block unsafe or could not record it. Should normally read zero |
 | `ethlambda_validator_block_proposal_failures_total` | Counter | Proposal duties that did not end in a published block, including ones abandoned for overrunning |
 | `ethlambda_validator_envelopes_published_total` | Counter | Execution payload envelopes a beacon node accepted for blocks this client proposed (gloas) |
 | `ethlambda_validator_envelope_failures_total` | Counter | Proposed gloas blocks whose self-built envelope was not published. The block is out and the proposal counts as made, but the slot's payload is withheld, so this is the failure that costs the payload. Should read zero |
@@ -739,6 +739,8 @@ and absent is not the same as zero.
 | `ethlambda_validator_block_publication_delay_seconds` | Histogram | Slot start to block accepted. Its buckets are tighter than the attestation histogram's, because a block is due at the slot boundary rather than a third of the way in |
 | `ethlambda_validator_beacon_node_available` | Gauge | 1 when a beacon node answered the last duty refresh or attestation |
 | `ethlambda_validator_signing_duration_seconds` | Histogram | Time to sign one slot's batch, store read lock included |
+| `ethlambda_validator_slashing_protection_write_seconds` | Histogram | Time to durably write the slashing-protection record, once per slot's attestation batch and once per block, before signing |
+| `ethlambda_validator_slashing_protection_write_failures_total` | Counter | Slashing-protection writes that failed, each leaving its messages unsigned. Should read zero; anything else points at the disk under `--validators-dir` |
 | `ethlambda_validator_publication_delay_seconds` | Histogram | Slot start to attestations accepted. The headline health number: it should sit near the one-third-slot duty offset |
 
 Three of these distinguish failures that look alike on a dashboard but have

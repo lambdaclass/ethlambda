@@ -156,11 +156,11 @@ pub enum Published {
 /// stuck on a stale head is never failed over from.
 ///
 /// Both fields are checked because both end up signed. The slot selects the
-/// signing domain and is the whole of what the proposal guard keys on. The
+/// signing domain and is the whole of what slashing protection keys a block on. The
 /// proposer index is not something this client chooses either: a node on a
 /// different fork computes a different proposer, and a block naming someone
 /// else is one this client's key can only sign uselessly, while still burning
-/// the guard's record for that slot.
+/// the slot in slashing protection's record.
 pub fn validate_produced_block(request: &BlockRequest, block: &ProducedBlock) -> Result<()> {
     if block.slot() != request.slot {
         return Err(crate::error::Error::InconsistentResponse(format!(
@@ -322,9 +322,10 @@ pub trait BeaconNodeApi: Send + Sync {
     ///
     /// An implementation must reject data whose `slot` is not the one asked
     /// for, and whose `target.epoch` is not that slot's epoch. Both are
-    /// signable material, and this client keeps no slashing-protection record,
+    /// signable material, and slashing protection records whatever it allows,
     /// so a node answering about the wrong slot must never reach the signing
-    /// path.
+    /// path: a target from the future would raise the validator's watermark
+    /// and cost it every attestation until the chain caught up.
     ///
     /// It matters that this is the *implementation's* job rather than the
     /// caller's, because of where failover sits.

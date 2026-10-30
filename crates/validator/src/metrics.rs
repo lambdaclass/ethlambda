@@ -74,19 +74,19 @@ static ATTESTATION_DEADLINE_MISSED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|
     .unwrap()
 });
 
-/// Attestations this process declined to sign because it had already signed a
-/// conflicting one for that validator in this run.
+/// Attestations this process declined to sign because slashing protection
+/// judged them unsafe, or could not record them.
 ///
 /// Separate from `signing_failures_total`, which counts signatures that were
 /// attempted and failed. This counts signatures deliberately not attempted, and
 /// it should normally read zero: a non-zero value means the duty loop tried to
-/// sign something the guard judged a double vote, which is worth investigating
-/// even though the attestation was correctly suppressed. See
-/// `crate::attestation_guard`.
+/// sign something slashing protection judged a double or surround vote, which
+/// is worth investigating even though the attestation was correctly
+/// suppressed. See `crate::slashing_protection`.
 static ATTESTATIONS_REFUSED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "ethlambda_validator_attestations_refused_total",
-        "Attestations refused because this process already signed a conflicting one"
+        "Attestations refused by slashing protection"
     )
     .unwrap()
 });
@@ -113,18 +113,18 @@ static BLOCKS_BROADCAST_NOT_IMPORTED_TOTAL: LazyLock<IntCounter> = LazyLock::new
     .unwrap()
 });
 
-/// Blocks this process declined to sign because it had already proposed that
-/// slot for that validator in this run.
+/// Blocks this process declined to sign because slashing protection judged
+/// them unsafe, or could not record them.
 ///
 /// The proposal-shaped counterpart to `attestations_refused_total`, and it
 /// should read zero for the same reason: a non-zero value means the duty loop
-/// tried to propose a slot the guard judged already proposed, which is worth
-/// investigating even though the block was correctly suppressed. See
-/// `crate::proposal_guard`.
+/// tried to propose a slot slashing protection judged already proposed, which
+/// is worth investigating even though the block was correctly suppressed. See
+/// `crate::slashing_protection`.
 static BLOCKS_REFUSED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "ethlambda_validator_blocks_refused_total",
-        "Blocks refused because this process already proposed that slot"
+        "Blocks refused by slashing protection"
     )
     .unwrap()
 });
@@ -248,6 +248,31 @@ static SIGNING_DURATION_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Time spent durably writing the slashing-protection record: one write per
+/// slot's attestation batch and one per block, each flushed to disk before
+/// anything is signed. See `crate::slashing_protection`.
+static SLASHING_PROTECTION_WRITE_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
+    register_histogram!(
+        "ethlambda_validator_slashing_protection_write_seconds",
+        "Time spent durably writing the slashing-protection record",
+        vec![
+            0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5
+        ]
+    )
+    .unwrap()
+});
+
+/// Slashing-protection writes that failed, each of which left its messages
+/// unsigned. Should read zero; anything else points at the disk under the
+/// validators directory.
+static SLASHING_PROTECTION_WRITE_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_slashing_protection_write_failures_total",
+        "Slashing-protection writes that failed, leaving their messages unsigned"
+    )
+    .unwrap()
+});
+
 static PUBLICATION_DELAY_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
     register_histogram!(
         "ethlambda_validator_publication_delay_seconds",
@@ -334,6 +359,8 @@ pub fn init() {
     LazyLock::force(&BEACON_NODE_AVAILABLE);
     LazyLock::force(&SIGNING_DURATION_SECONDS);
     LazyLock::force(&PUBLICATION_DELAY_SECONDS);
+    LazyLock::force(&SLASHING_PROTECTION_WRITE_SECONDS);
+    LazyLock::force(&SLASHING_PROTECTION_WRITE_FAILURES_TOTAL);
 }
 
 pub fn set_validators_loaded(count: u64) {
@@ -362,6 +389,10 @@ pub fn inc_signing_failures() {
 
 pub fn inc_attestations_refused() {
     ATTESTATIONS_REFUSED_TOTAL.inc();
+}
+
+pub fn inc_attestations_refused_by(count: u64) {
+    ATTESTATIONS_REFUSED_TOTAL.inc_by(count);
 }
 
 pub fn inc_attestation_deadline_missed() {
@@ -448,6 +479,14 @@ pub fn set_beacon_node_available(available: bool) {
 /// the signing took plus whatever else shared the guard's scope".
 pub fn time_signing() -> TimingGuard {
     TimingGuard::new(&SIGNING_DURATION_SECONDS)
+}
+
+pub fn time_slashing_protection_write() -> TimingGuard {
+    TimingGuard::new(&SLASHING_PROTECTION_WRITE_SECONDS)
+}
+
+pub fn inc_slashing_protection_write_failures() {
+    SLASHING_PROTECTION_WRITE_FAILURES_TOTAL.inc();
 }
 
 /// Record how long after a slot's start its attestations were accepted.

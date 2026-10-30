@@ -606,8 +606,8 @@ mod tests {
 
     /// The proposal-shaped version of the stale-head finding above, and the
     /// more expensive one to get wrong: a block signed against a stale node's
-    /// answer is a block for the wrong slot, and it burns the proposal guard's
-    /// record for that validator on the way out.
+    /// answer is a block for the wrong slot, and it burns slashing
+    /// protection's record for that validator on the way out.
     #[tokio::test]
     async fn a_node_producing_a_block_for_the_wrong_slot_is_failed_over_from() {
         let stale = MockBeaconNode::new().with_block(90, 7);
@@ -622,8 +622,8 @@ mod tests {
     }
 
     /// A node on a different fork computes a different proposer. Signing its
-    /// block would produce a signature the network discards, while the guard
-    /// records the slot as proposed and refuses the real duty.
+    /// block would produce a signature the network discards, while slashing
+    /// protection records the slot as proposed and refuses the real duty.
     #[tokio::test]
     async fn a_node_naming_the_wrong_proposer_is_failed_over_from() {
         let wrong = MockBeaconNode::new().with_block(96, 11);

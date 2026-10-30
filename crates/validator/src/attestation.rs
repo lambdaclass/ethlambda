@@ -3,12 +3,11 @@
 use std::sync::Arc;
 
 use ethlambda_types::beacon::containers::shared::AttestationData;
-use ethlambda_types::beacon::primitives::Slot;
+use ethlambda_types::beacon::primitives::{BlsPubkey, Slot};
 use ethlambda_types::beacon::signing::compute_epoch_at_slot;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-use crate::attestation_guard::AttestationGuard;
 use crate::beacon_node::dto::{
     AttestationDataOutDto, AttesterDutyDto, SingleAttestationDto, encode_hex, parse_pubkey,
 };
@@ -16,6 +15,7 @@ use crate::beacon_node::{BeaconNodeApi, validate_attestation_data};
 use crate::error::Result;
 use crate::keys::ValidatorStore;
 use crate::signing::SigningContext;
+use crate::slashing_protection::SharedProtection;
 
 /// What one slot's attestation duty produced.
 ///
@@ -29,6 +29,13 @@ use crate::signing::SigningContext;
 pub struct Attested {
     /// How many attestations the beacon node accepted.
     pub published: usize,
+    /// How many of the slot's duties slashing protection withheld: judged
+    /// unsafe to sign, or, when the record could not be written, the whole
+    /// batch, since nothing may be signed then. Kept apart from `published`
+    /// so that a slot with nothing published can be told from a slot with
+    /// nothing to publish, which an `Ok` with a count of zero alone cannot.
+    /// The cause is logged, and counted, where it is decided.
+    pub refused: usize,
     /// The data every attestation in this slot was signed over, or `None` when
     /// there was no duty to fetch it for.
     ///
@@ -43,25 +50,21 @@ pub struct Attested {
 pub struct AttestationService<B> {
     beacon_node: Arc<B>,
     context: Arc<SigningContext>,
-    /// What this process has already signed, per validator.
-    ///
-    /// A `std::sync::Mutex` rather than a `tokio` one on purpose: the critical
-    /// section is a hash lookup and an insert with no `.await` inside it, so an
-    /// async mutex would buy nothing and cost a scheduling point. The guard is
-    /// taken and dropped per validator inside the signing loop, which already
-    /// holds the store's read lock, so it must not be the thing that blocks.
-    ///
-    /// Not slashing protection. See [`AttestationGuard`] for exactly what it
-    /// does and does not cover.
-    guard: std::sync::Mutex<AttestationGuard>,
+    /// What every validator has signed, shared with the proposal service and
+    /// the keymanager. See [`crate::slashing_protection`].
+    protection: SharedProtection,
 }
 
 impl<B: BeaconNodeApi> AttestationService<B> {
-    pub fn new(beacon_node: Arc<B>, context: Arc<SigningContext>) -> Self {
+    pub fn new(
+        beacon_node: Arc<B>,
+        context: Arc<SigningContext>,
+        protection: SharedProtection,
+    ) -> Self {
         Self {
             beacon_node,
             context,
-            guard: std::sync::Mutex::new(AttestationGuard::new()),
+            protection,
         }
     }
 
@@ -80,9 +83,9 @@ impl<B: BeaconNodeApi> AttestationService<B> {
     /// On a submission failure every signature in the batch has already been
     /// produced. Calling this again re-fetches the attestation data, and if the
     /// head moved in between it signs a *different* message for the same
-    /// validator and slot. This client keeps no slashing-protection record, so
-    /// nothing would catch that, and two distinct attestations for one slot from
-    /// one validator is a slashable offence.
+    /// validator and slot. Slashing protection refuses it, since the first call
+    /// already recorded that target, so a retry here publishes nothing: the
+    /// attestations are lost rather than doubled.
     ///
     /// A caller that wants to retry must resubmit the batch this call already
     /// built, not call this again. Today's duty loop does neither: it logs the
@@ -102,6 +105,7 @@ impl<B: BeaconNodeApi> AttestationService<B> {
         if duties.is_empty() {
             return Ok(Attested {
                 published: 0,
+                refused: 0,
                 data: None,
             });
         }
@@ -142,6 +146,41 @@ impl<B: BeaconNodeApi> AttestationService<B> {
 
         let data_dto = AttestationDataOutDto::from(&data);
 
+        let candidates: Vec<(&AttesterDutyDto, BlsPubkey)> = duties
+            .iter()
+            .filter_map(|duty| match parse_pubkey(&duty.pubkey) {
+                Ok(pubkey) => Some((duty, pubkey)),
+                Err(err) => {
+                    error!(%slot, validator = duty.validator_index, %err, "Duty carried an unreadable pubkey");
+                    None
+                }
+            })
+            .collect();
+
+        // Check and durably record the whole batch before any signature exists:
+        // a signature that exists is a signature that can escape, whatever the
+        // code after it intended. One write for the slot, off the executor,
+        // and before the store's read lock below is taken, so the disk flush
+        // never holds up a keymanager writer queued behind it.
+        let pubkeys: Vec<BlsPubkey> = candidates.iter().map(|(_, pubkey)| *pubkey).collect();
+        let verdicts = crate::slashing_protection::blocking(&self.protection, move |protection| {
+            protection.check_and_record_attestations(&pubkeys, &data)
+        })
+        .await;
+        let verdicts = match verdicts {
+            Ok(verdicts) => verdicts,
+            Err(err) => {
+                // Nothing was recorded, so nothing may be signed.
+                error!(%slot, %err, "Slashing protection could not record this slot's attestations; refusing to sign any");
+                crate::metrics::inc_attestations_refused_by(candidates.len() as u64);
+                return Ok(Attested {
+                    published: 0,
+                    refused: candidates.len(),
+                    data: Some(data),
+                });
+            }
+        };
+
         // The read guard is scoped to this block alone and must never be widened to cover an
         // await. `tokio::sync::RwLock` is write-preferring, so a keymanager
         // import or delete queuing for the write lock blocks every read behind
@@ -149,50 +188,22 @@ impl<B: BeaconNodeApi> AttestationService<B> {
         // import holds its own write lock for the inserts alone, doing the slow
         // EIP-2335 derivation outside it (see `http_api::keystores::import`),
         // so this is the duty path keeping its half of the same bargain.
-        let mut attestations = Vec::with_capacity(duties.len());
+        let mut attestations = Vec::with_capacity(candidates.len());
+        let mut refused = 0;
         {
             let _timing = crate::metrics::time_signing();
             let store = store.read().await;
-            for duty in duties {
-                let pubkey = match parse_pubkey(&duty.pubkey) {
-                    Ok(pubkey) => pubkey,
-                    Err(err) => {
-                        error!(%slot, validator = duty.validator_index, %err, "Duty carried an unreadable pubkey");
-                        continue;
-                    }
-                };
-
-                // Refuse before signing, not after: a signature that exists is
-                // a signature that can escape, whatever the code after it
-                // intended. This closes the double-vote shapes reachable
-                // within one run (a backward clock step, a schedule replaced
-                // mid-epoch); it is not slashing protection and does not
-                // pretend to be. See `AttestationGuard`.
-                //
-                // Held per validator, and dropped before the next iteration.
-                // The lock is poisoned only by a panic while it is held, and
-                // nothing inside can panic; `unwrap` on it would still be a
-                // crash in the duty path, so a poisoned lock is treated as a
-                // refusal for every remaining validator instead.
-                match self.guard.lock() {
-                    Ok(mut guard) => {
-                        if let Err(refusal) = guard.check_and_record(&pubkey, &data) {
-                            warn!(
-                                %slot,
-                                validator = duty.validator_index,
-                                %refusal,
-                                "Refusing to sign: this process already signed a conflicting \
-                                 attestation for this validator"
-                            );
-                            crate::metrics::inc_attestations_refused();
-                            continue;
-                        }
-                    }
-                    Err(err) => {
-                        error!(%slot, %err, "Attestation guard is poisoned; refusing to sign");
-                        crate::metrics::inc_attestations_refused();
-                        continue;
-                    }
+            for ((duty, pubkey), verdict) in candidates.into_iter().zip(verdicts) {
+                if let Err(refusal) = verdict {
+                    warn!(
+                        %slot,
+                        validator = duty.validator_index,
+                        %refusal,
+                        "Refusing to sign: slashing protection judged this attestation unsafe"
+                    );
+                    crate::metrics::inc_attestations_refused();
+                    refused += 1;
+                    continue;
                 }
 
                 // One validator failing must not cost the others their attestation.
@@ -217,6 +228,7 @@ impl<B: BeaconNodeApi> AttestationService<B> {
         if attestations.is_empty() {
             return Ok(Attested {
                 published: 0,
+                refused,
                 data: Some(data),
             });
         }
@@ -238,6 +250,7 @@ impl<B: BeaconNodeApi> AttestationService<B> {
         crate::metrics::inc_attestations_published(published as u64);
         Ok(Attested {
             published,
+            refused,
             data: Some(data),
         })
     }
@@ -250,6 +263,7 @@ mod tests {
     // error, since `validate_attestation_data` produces them now.
     use crate::beacon_node::mock::MockBeaconNode;
     use crate::error::Error;
+    use crate::slashing_protection::SlashingProtection;
     use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::containers::shared::{AttestationData, Checkpoint};
     use ethlambda_types::beacon::preset;
@@ -268,8 +282,8 @@ mod tests {
     /// one key used twice. A pubkey resolves to exactly one validator index on
     /// chain, and `ValidatorStore` is keyed by pubkey so a duplicate collapses,
     /// so one key under two indices is a shape that cannot occur. It also now
-    /// trips `AttestationGuard`, correctly: two duties for one validator in one
-    /// epoch is the double-vote shape the guard exists to refuse.
+    /// trips slashing protection, correctly: two duties for one validator in
+    /// one epoch is the double-vote shape it exists to refuse.
     fn other_secret() -> [u8; 32] {
         let mut bytes = secret();
         // Perturb a low byte: still a valid scalar, comfortably below the
@@ -311,7 +325,8 @@ mod tests {
             .expect("inserts");
 
         let node = Arc::new(MockBeaconNode::new().with_attestation_data(96));
-        let service = AttestationService::new(node.clone(), context());
+        let service =
+            AttestationService::new(node.clone(), context(), SlashingProtection::in_memory());
 
         let duties = vec![
             duty(&encode_hex(&first.0), 1337, 96, 3),
@@ -333,7 +348,7 @@ mod tests {
         );
     }
 
-    /// The guard engaging in the real signing path, not just in isolation.
+    /// Slashing protection engaging in the real signing path, not just in isolation.
     ///
     /// This is the backward-clock-step shape: the duty loop derives its slot
     /// from the wall clock, so an NTP correction can re-enter a slot already
@@ -346,7 +361,8 @@ mod tests {
         let pubkey = store.insert_secret("test", &secret()).expect("inserts");
 
         let node = Arc::new(MockBeaconNode::new().with_attestation_data(96));
-        let service = AttestationService::new(node.clone(), context());
+        let service =
+            AttestationService::new(node.clone(), context(), SlashingProtection::in_memory());
 
         let duties = vec![duty(&encode_hex(&pubkey.0), 1337, 96, 3)];
         let store = RwLock::new(store);
@@ -357,12 +373,98 @@ mod tests {
             .await
             .expect("the second call is not an error, it simply signs nothing");
 
-        assert_eq!(first.published, 1);
+        assert_eq!((first.published, first.refused), (1, 0));
         assert_eq!(second.published, 0, "the second attempt must be refused");
+        assert_eq!(second.refused, 1, "and reported as refused, not as absent");
         assert_eq!(
             node.submitted().len(),
             1,
             "only one signature may ever reach the beacon node"
+        );
+    }
+
+    /// A record kept in `dir`, with every key in `keys` registered.
+    fn persisted(
+        dir: &std::path::Path,
+        keys: &[ethlambda_types::beacon::primitives::BlsPubkey],
+    ) -> SharedProtection {
+        let protection =
+            SlashingProtection::open(dir, Root::ZERO, keys, true, None).expect("opens");
+        Arc::new(std::sync::Mutex::new(protection))
+    }
+
+    /// The restart shape the old in-memory guard could not cover: a fresh
+    /// service over the same directory still refuses the double vote, and
+    /// reaches the beacon node with nothing.
+    #[tokio::test]
+    async fn a_restart_does_not_forget_what_was_attested() {
+        let mut store = ValidatorStore::new();
+        let pubkey = store.insert_secret("test", &secret()).expect("inserts");
+        let store = RwLock::new(store);
+        let duties = vec![duty(&encode_hex(&pubkey.0), 1337, 96, 3)];
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        let node = Arc::new(MockBeaconNode::new().with_attestation_data(96));
+        let first =
+            AttestationService::new(node.clone(), context(), persisted(dir.path(), &[pubkey]))
+                .attest(96, &duties, &store)
+                .await
+                .expect("attests");
+        assert_eq!(first.published, 1);
+
+        // The first service, and with it the lock on the record, is gone.
+        let node_again = Arc::new(MockBeaconNode::new().with_attestation_data(96));
+        let second = AttestationService::new(
+            node_again.clone(),
+            context(),
+            persisted(dir.path(), &[pubkey]),
+        )
+        .attest(96, &duties, &store)
+        .await
+        .expect("not an error, simply signs nothing");
+        assert_eq!(
+            second.published, 0,
+            "the double vote must be refused after a restart"
+        );
+        assert!(node_again.submitted().is_empty());
+    }
+
+    /// A record that cannot be written means nothing is signed: the write is
+    /// what makes a signature safe to exist.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_record_that_cannot_be_written_signs_nothing() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // SAFETY: `geteuid` reads a process attribute and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root bypasses directory permissions");
+            return;
+        }
+        let mut store = ValidatorStore::new();
+        let pubkey = store.insert_secret("test", &secret()).expect("inserts");
+        let store = RwLock::new(store);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let protection = persisted(dir.path(), &[pubkey]);
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500))
+            .expect("chmod");
+        let node = Arc::new(MockBeaconNode::new().with_attestation_data(96));
+        let attested = AttestationService::new(node.clone(), context(), protection)
+            .attest(96, &[duty(&encode_hex(&pubkey.0), 1337, 96, 3)], &store)
+            .await;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod back");
+
+        let attested = attested.expect("not an error");
+        assert_eq!(attested.published, 0);
+        assert_eq!(
+            attested.refused, 1,
+            "a record that could not be written refuses the whole batch, visibly"
+        );
+        assert!(
+            node.submitted().is_empty(),
+            "nothing may reach the beacon node"
         );
     }
 
@@ -377,7 +479,8 @@ mod tests {
 
         // 96 and 101 are both in epoch 3 (96 / 32 == 101 / 32 == 3).
         let node = Arc::new(MockBeaconNode::new().with_attestation_data(96));
-        let service = AttestationService::new(node.clone(), context());
+        let service =
+            AttestationService::new(node.clone(), context(), SlashingProtection::in_memory());
         let store = RwLock::new(store);
 
         let first = service
@@ -387,12 +490,12 @@ mod tests {
         assert_eq!(first.published, 1);
 
         let node_again = Arc::new(MockBeaconNode::new().with_attestation_data(101));
-        // Same service, so the same guard; a new mock only because the mock
+        // Same slashing-protection record; a new mock only because the mock
         // pins one slot's data at a time.
         let service = AttestationService {
             beacon_node: node_again.clone(),
             context: context(),
-            guard: service.guard,
+            protection: service.protection,
         };
         let second = service
             .attest(101, &[duty(&pubkey_hex, 1337, 101, 3)], &store)
@@ -420,7 +523,8 @@ mod tests {
             .expect("inserts");
 
         let node = Arc::new(MockBeaconNode::new().with_attestation_data(96));
-        let service = AttestationService::new(node.clone(), context());
+        let service =
+            AttestationService::new(node.clone(), context(), SlashingProtection::in_memory());
 
         let duties = vec![
             duty(&encode_hex(&first.0), 1337, 96, 3),
@@ -446,7 +550,8 @@ mod tests {
         let known = store.insert_secret("test", &secret()).expect("inserts");
 
         let node = Arc::new(MockBeaconNode::new().with_attestation_data(96));
-        let service = AttestationService::new(node.clone(), context());
+        let service =
+            AttestationService::new(node.clone(), context(), SlashingProtection::in_memory());
 
         let duties = vec![
             duty(&encode_hex(&[0x99; 48]), 1, 96, 3),
@@ -467,7 +572,8 @@ mod tests {
         // after the signing loop, where the loop produced nothing to send.
         let store = RwLock::new(ValidatorStore::new());
         let node = Arc::new(MockBeaconNode::new().with_attestation_data(96));
-        let service = AttestationService::new(node.clone(), context());
+        let service =
+            AttestationService::new(node.clone(), context(), SlashingProtection::in_memory());
 
         let duties = vec![
             duty(&encode_hex(&[0x99; 48]), 1, 96, 3),
@@ -494,7 +600,7 @@ mod tests {
         let pubkey = store.insert_secret("test", &secret()).expect("inserts");
         let store = RwLock::new(store);
         let node = Arc::new(MockBeaconNode::new().with_attestation_data(96));
-        let service = AttestationService::new(node, context());
+        let service = AttestationService::new(node, context(), SlashingProtection::in_memory());
 
         let attested = service
             .attest(96, &[duty(&encode_hex(&pubkey.0), 1337, 96, 3)], &store)
@@ -511,7 +617,11 @@ mod tests {
     /// aggregate of an attestation nobody made.
     #[tokio::test]
     async fn no_duties_means_no_data_to_aggregate_against() {
-        let service = AttestationService::new(Arc::new(MockBeaconNode::new()), context());
+        let service = AttestationService::new(
+            Arc::new(MockBeaconNode::new()),
+            context(),
+            SlashingProtection::in_memory(),
+        );
         let attested = service
             .attest(96, &[], &RwLock::new(ValidatorStore::new()))
             .await
@@ -522,7 +632,8 @@ mod tests {
     #[tokio::test]
     async fn no_duties_means_no_request_at_all() {
         let node = Arc::new(MockBeaconNode::new());
-        let service = AttestationService::new(node.clone(), context());
+        let service =
+            AttestationService::new(node.clone(), context(), SlashingProtection::in_memory());
         let published = service
             .attest(96, &[], &RwLock::new(ValidatorStore::new()))
             .await
@@ -534,7 +645,7 @@ mod tests {
     #[tokio::test]
     async fn a_failing_attestation_data_fetch_is_reported() {
         let node = Arc::new(MockBeaconNode::new());
-        let service = AttestationService::new(node, context());
+        let service = AttestationService::new(node, context(), SlashingProtection::in_memory());
         let mut store = ValidatorStore::new();
         let pubkey = store.insert_secret("test", &secret()).expect("inserts");
         let store = RwLock::new(store);
@@ -558,7 +669,8 @@ mod tests {
         let pubkey_hex = encode_hex(&pubkey.0);
 
         let node = Arc::new(MockBeaconNode::new().with_attestation_data(96));
-        let service = AttestationService::new(node.clone(), context());
+        let service =
+            AttestationService::new(node.clone(), context(), SlashingProtection::in_memory());
 
         let duties = vec![duty(&pubkey_hex, 1337, 97, 3)];
         let err = service
@@ -601,7 +713,8 @@ mod tests {
             },
         });
         let node = Arc::new(node);
-        let service = AttestationService::new(node.clone(), context());
+        let service =
+            AttestationService::new(node.clone(), context(), SlashingProtection::in_memory());
 
         let duties = vec![duty(&pubkey_hex, 1337, 96, 3)];
         let err = service
@@ -632,24 +745,32 @@ mod tests {
         let first_altair_slot = altair_fork_epoch * preset::SLOTS_PER_EPOCH;
 
         let phase0_node = Arc::new(MockBeaconNode::new().with_attestation_data(last_phase0_slot));
-        AttestationService::new(phase0_node.clone(), context())
-            .attest(
-                last_phase0_slot,
-                &[duty(&pubkey_hex, 1337, last_phase0_slot, 3)],
-                &store,
-            )
-            .await
-            .expect("attests");
+        AttestationService::new(
+            phase0_node.clone(),
+            context(),
+            SlashingProtection::in_memory(),
+        )
+        .attest(
+            last_phase0_slot,
+            &[duty(&pubkey_hex, 1337, last_phase0_slot, 3)],
+            &store,
+        )
+        .await
+        .expect("attests");
 
         let altair_node = Arc::new(MockBeaconNode::new().with_attestation_data(first_altair_slot));
-        AttestationService::new(altair_node.clone(), context())
-            .attest(
-                first_altair_slot,
-                &[duty(&pubkey_hex, 1337, first_altair_slot, 3)],
-                &store,
-            )
-            .await
-            .expect("attests");
+        AttestationService::new(
+            altair_node.clone(),
+            context(),
+            SlashingProtection::in_memory(),
+        )
+        .attest(
+            first_altair_slot,
+            &[duty(&pubkey_hex, 1337, first_altair_slot, 3)],
+            &store,
+        )
+        .await
+        .expect("attests");
 
         assert_eq!(
             phase0_node.last_submitted_fork_name().as_deref(),
@@ -688,10 +809,14 @@ mod tests {
                 .with_attestation_data(slot)
                 .with_attestation_index(1),
         );
-        let attested = AttestationService::new(node.clone(), gloas_context())
-            .attest(slot, &[duty(&pubkey_hex, 1337, slot, 3)], &store)
-            .await
-            .expect("attests");
+        let attested = AttestationService::new(
+            node.clone(),
+            gloas_context(),
+            SlashingProtection::in_memory(),
+        )
+        .attest(slot, &[duty(&pubkey_hex, 1337, slot, 3)], &store)
+        .await
+        .expect("attests");
 
         assert_eq!(attested.data.expect("data").index, 1);
         let submitted = node.submitted();
@@ -744,10 +869,14 @@ mod tests {
 
         let slot = 9 * preset::SLOTS_PER_EPOCH + 3;
         let node = Arc::new(MockBeaconNode::new().with_attestation_data(slot));
-        AttestationService::new(node.clone(), gloas_context())
-            .attest(slot, &[duty(&pubkey_hex, 1337, slot, 3)], &store)
-            .await
-            .expect("attests");
+        AttestationService::new(
+            node.clone(),
+            gloas_context(),
+            SlashingProtection::in_memory(),
+        )
+        .attest(slot, &[duty(&pubkey_hex, 1337, slot, 3)], &store)
+        .await
+        .expect("attests");
         assert_eq!(node.attestation_data_forks(), vec![ForkName::Phase0]);
     }
 }
