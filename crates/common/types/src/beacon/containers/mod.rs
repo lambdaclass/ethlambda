@@ -366,8 +366,49 @@ impl BeaconState {
     /// unlike the accessors that read a beacon field: this is the inverse of
     /// [`BeaconState::from_ssz`], which builds that variant, so refusing here
     /// would make decoding a state and re-encoding it panic.
+    ///
+    /// Appends into a buffer with [`BeaconState::ssz_append_capacity`] rather
+    /// than calling libssz's own `to_ssz`, which reserves only the encoding's
+    /// length and so holds a fulu or gloas state twice while encoding it (see
+    /// there).
     pub fn to_ssz(&self) -> Vec<u8> {
-        dispatch_state_including_lean!(self, |state| state.to_ssz())
+        let mut buf = Vec::with_capacity(self.ssz_append_capacity());
+        self.ssz_append(&mut buf);
+        buf
+    }
+
+    /// The spare capacity [`BeaconState::ssz_append`] needs in `buf` for the
+    /// append never to regrow it: the encoding's own length plus the largest
+    /// fixed-size field any fork's state has.
+    ///
+    /// The headroom is for libssz's container encoder, which writes each
+    /// fixed-size field past the end of the buffer and then moves it into
+    /// place. A fixed-size field written after every variable-size one
+    /// (fulu's `proposer_lookahead`, gloas's `ptc_window`) therefore needs
+    /// room beyond the encoding's length, and without it a buffer the size of
+    /// the whole state is regrown to twice that, copying it, for the last few
+    /// hundred bytes.
+    pub fn ssz_append_capacity(&self) -> usize {
+        let largest_fixed_field = [
+            <shared::RandaoMixes as libssz::SszEncode>::fixed_size(),
+            <shared::BlockRoots as libssz::SszEncode>::fixed_size(),
+            <altair::SyncCommittee as libssz::SszEncode>::fixed_size(),
+            <gloas::PayloadTimelinessCommitteeWindow as libssz::SszEncode>::fixed_size(),
+        ]
+        .into_iter()
+        .max()
+        .expect("the list is not empty");
+        dispatch_state_including_lean!(self, |state| state.encoded_len()) + largest_fixed_field
+    }
+
+    /// Appends [`BeaconState::to_ssz`]'s output to `buf`.
+    ///
+    /// For a caller that frames the encoding (the storage layer's fork tag):
+    /// a mainnet state encodes to hundreds of megabytes, and appending to a
+    /// buffer with [`BeaconState::ssz_append_capacity`] to spare holds one
+    /// copy of it, never two.
+    pub fn ssz_append(&self, buf: &mut Vec<u8>) {
+        dispatch_state_including_lean!(self, |state| state.ssz_append(buf))
     }
 
     /// The state's merkle root, which a block's `state_root` must equal.
@@ -2177,6 +2218,25 @@ mod tests {
                 .try_into()
                 .expect("the vector is built at its exact length"),
         })
+    }
+
+    /// Fulu and gloas end on a fixed-size field, which is where libssz's
+    /// encoder writes past the encoding's length.
+    #[test]
+    fn ssz_append_never_regrows_a_buffer_with_its_capacity_to_spare() {
+        for state in [small_fulu_state(3), small_gloas_state(3)] {
+            let fork = state.fork_name();
+            let expected = dispatch_state_including_lean!(&state, |state| state.to_ssz());
+            let capacity = state.ssz_append_capacity();
+            let mut buf = Vec::with_capacity(capacity);
+            state.ssz_append(&mut buf);
+            assert_eq!(buf, expected, "{fork}");
+            assert_eq!(buf.capacity(), capacity, "{fork}: ssz_append regrew");
+
+            let encoded = state.to_ssz();
+            assert_eq!(encoded, expected, "{fork}");
+            assert_eq!(encoded.capacity(), capacity, "{fork}: to_ssz regrew");
+        }
     }
 
     #[test]
