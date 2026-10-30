@@ -13,6 +13,13 @@ The Lean Chain's metrics follow [the leanMetrics specification](https://github.c
 | `lean_node_info` | Gauge | Node information (always 1) | On node start | name, version | ✅ |
 | `lean_node_start_time_seconds` | Gauge | Start timestamp | On node start | | ✅ |
 
+On Linux the endpoint also serves the `prometheus` crate's process collector,
+read from `/proc/self` at each scrape: `process_resident_memory_bytes`,
+`process_virtual_memory_bytes`, `process_cpu_seconds_total`,
+`process_open_fds`, `process_max_fds`, `process_threads` and
+`process_start_time_seconds`. They are not part of the leanMetrics spec, and
+other platforms do not export them.
+
 
 ## PQ Signature Metrics
 
