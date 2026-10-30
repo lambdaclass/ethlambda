@@ -121,9 +121,13 @@ keeps it harmless:
   exhausted retry ladder.
 
 The overlap shows in the import timing tree: the transition that ran during the
-round trip is reported under `stf`, and `engine` reports only the wait that was
-left once it finished. Without an execution client, and for forks that have no
-request to send (pre-merge, gloas), nothing overlaps and the path is the old one.
+round trip is reported under `stf` (used or discarded), and `engine` reports only
+the wait that was left once it finished, a recorded zero when the answer was
+already in. Without an execution client, and for forks that have no request to
+send (pre-merge, gloas), nothing overlaps, `engine` is zero, and the path is the
+old one. How long the execution client itself took to answer is
+`lean_engine_new_payload_seconds{outcome}`, timed around the request in
+`ask_request`.
 
 ## The verdicts
 

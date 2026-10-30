@@ -1807,46 +1807,67 @@ impl BlockChainServer {
                 // with the transition it assumed (see `SpeculativeTransition`).
                 // Without an engine, or without a request to send (pre-merge
                 // forks, gloas), nothing overlaps and the path is the old one.
-                timings.engine_start = Some(Instant::now());
+                //
+                // The `engine` section is what the import waited once it had
+                // nothing left to do, so it starts as a recorded zero and only
+                // a request still unanswered when the transition is done
+                // widens it. The execution client's own time is
+                // `lean_engine_new_payload_seconds`, observed in
+                // `ask_request`.
+                let no_wait = Instant::now();
+                (timings.engine_start, timings.engine_end) = (Some(no_wait), Some(no_wait));
                 let parent_root = beacon_block.parent_root();
-                let mut speculation: Option<(
-                    fork_choice::SpeculativeTransition,
-                    Instant,
-                    Instant,
-                )> = None;
-                let verdict: Result<Option<fork_choice::PayloadValidity>, String> =
-                    match &self.engine {
-                        None => Ok(None),
-                        Some(client) => {
-                            match beacon_engine::new_payload_request(&beacon_block)
-                                .map(|request| request.into_owned())
-                            {
-                                None => Ok(None),
-                                Some(request) => {
-                                    let client = client.clone();
-                                    let task = tokio::spawn(async move {
-                                        beacon_engine::ask_request(&client, request).await
-                                    });
-                                    let spec_start = Instant::now();
-                                    let computed = fork_choice::speculate_transition(
-                                        &self.store,
-                                        &beacon_block,
-                                        &config,
-                                        &committees,
-                                    );
-                                    let spec_end = Instant::now();
-                                    speculation = computed.map(|spec| (spec, spec_start, spec_end));
-                                    // A panicked or cancelled task is no
-                                    // answer, like an exhausted retry ladder.
-                                    match task.await {
-                                        Ok(Ok(validity)) => Ok(Some(validity)),
-                                        Ok(Err(err)) => Err(err.to_string()),
-                                        Err(err) => Err(err.to_string()),
-                                    }
+                let mut speculation: Option<fork_choice::SpeculativeTransition> = None;
+                let verdict: Result<Option<fork_choice::PayloadValidity>, String> = match &self
+                    .engine
+                {
+                    None => Ok(None),
+                    Some(client) => {
+                        match beacon_engine::new_payload_request(&beacon_block)
+                            .map(|request| request.into_owned())
+                        {
+                            None => Ok(None),
+                            Some(request) => {
+                                let client = client.clone();
+                                let task = tokio::spawn(async move {
+                                    let answer = beacon_engine::ask_request(&client, request).await;
+                                    (answer, Instant::now())
+                                });
+                                let spec_start = Instant::now();
+                                let computed = fork_choice::speculate_transition(
+                                    &self.store,
+                                    &beacon_block,
+                                    &config,
+                                    &committees,
+                                );
+                                let spec_end = Instant::now();
+                                // Charged to `stf` whether or not the
+                                // import ends up using it: it is
+                                // state-transition work either way.
+                                if computed.is_some() {
+                                    timings.stf_spec_start = Some(spec_start);
+                                    timings.stf_spec_end = Some(spec_end);
                                 }
+                                speculation = computed;
+                                // A panicked or cancelled task is no
+                                // answer, like an exhausted retry ladder.
+                                let (answer, answered_at) = match task.await {
+                                    Ok((answer, answered_at)) => (
+                                        answer.map(Some).map_err(|err| err.to_string()),
+                                        answered_at,
+                                    ),
+                                    Err(err) => (Err(err.to_string()), Instant::now()),
+                                };
+                                // The wait begins once the transition is
+                                // done; an answer already in by then
+                                // leaves it at zero.
+                                timings.engine_start = Some(spec_end);
+                                timings.engine_end = Some(answered_at.max(spec_end));
+                                answer
                             }
                         }
-                    };
+                    }
+                };
                 let validity = match verdict {
                     Ok(None) => fork_choice::PayloadValidity::NotRequired,
                     Ok(Some(validity)) => validity,
@@ -1868,11 +1889,9 @@ impl BlockChainServer {
                         if speculation.is_some() {
                             metrics::inc_engine_speculation("discarded_held");
                         }
-                        timings.engine_end = Some(Instant::now());
                         return (timings, Ok(ImportOutcome::Held));
                     }
                 };
-                timings.engine_end = Some(Instant::now());
 
                 // An optimistic import is only permitted for a block that
                 // qualifies. A block that does not, and got a NOT_VALIDATED
@@ -1903,11 +1922,10 @@ impl BlockChainServer {
                 // The speculation is only worth handing on for a verdict its
                 // `valid()` engine agrees with. `INVALIDATED` makes `on_block`
                 // run the transition itself with `invalid()`, exactly as
-                // before. A discarded speculation leaves `engine_start` where
-                // it was, so the `engine` row covers the whole overlap and
-                // the wasted transition is not hidden from the tree.
+                // before. A discarded speculation stays in the `stf` row, so
+                // the transition run twice shows as twice.
                 let speculation = match speculation {
-                    Some((spec, spec_start, spec_end)) => {
+                    Some(spec) => {
                         if !spec.is_for(block_root, parent_root) {
                             metrics::inc_engine_speculation("discarded_mismatch");
                             None
@@ -1919,11 +1937,6 @@ impl BlockChainServer {
                             None
                         } else {
                             metrics::inc_engine_speculation("used");
-                            // The wait that remained once the transition was
-                            // done; see `ImportTimings::stf_spec_start`.
-                            timings.engine_start = Some(spec_end);
-                            timings.stf_spec_start = Some(spec_start);
-                            timings.stf_spec_end = Some(spec_end);
                             Some(spec)
                         }
                     }

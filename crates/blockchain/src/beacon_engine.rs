@@ -19,6 +19,8 @@
 //! Gloas is the exception: its payload is revealed in an envelope, so its
 //! request ([`gloas_new_payload_request`]) needs the block and the envelope.
 
+use std::time::Instant;
+
 use ethlambda_engine::types::PayloadStatusValue;
 use ethlambda_engine::{EngineClient, EngineError, PayloadStatusV1};
 use ethlambda_state_transition::beacon::containers::{self, SignedBeaconBlock};
@@ -211,19 +213,39 @@ impl NewPayloadRequest<'_> {
 /// The answer is read exactly as [`ask`] reads it: `Err` means no answer after
 /// the client's whole retry ladder, and there is no `Ok(None)` because a
 /// request existing means there was something to ask.
+///
+/// The time from sending the request to the answer is observed as
+/// `lean_engine_new_payload_seconds`, under the answer's [`outcome_label`].
 pub async fn ask_request(
     client: &EngineClient,
     request: OwnedNewPayloadRequest,
 ) -> Result<PayloadValidity, EngineError> {
-    let status = client
+    let sent = Instant::now();
+    let answer = client
         .new_payload(
             &request.execution_payload,
             &request.versioned_hashes,
             request.parent_beacon_block_root,
             &request.execution_requests,
         )
-        .await?;
-    Ok(verdict(&status))
+        .await
+        .map(|status| verdict(&status));
+    crate::metrics::observe_engine_new_payload(outcome_label(&answer), sent.elapsed());
+    answer
+}
+
+/// The `outcome` an answer from [`ask_request`] is counted under.
+///
+/// `not_required` is listed for completeness: a status from the execution
+/// client always reads as one of the other three verdicts.
+pub fn outcome_label(answer: &Result<PayloadValidity, EngineError>) -> &'static str {
+    match answer {
+        Ok(PayloadValidity::Validated) => "valid",
+        Ok(PayloadValidity::Optimistic) => "optimistic",
+        Ok(PayloadValidity::Invalidated { .. }) => "invalidated",
+        Ok(PayloadValidity::NotRequired) => "not_required",
+        Err(_) => "no_verdict",
+    }
 }
 
 /// Asks the execution client about `block`'s payload.
