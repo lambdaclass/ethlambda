@@ -75,7 +75,7 @@ pub struct GloasPayloadInputs {
 /// The payload inputs for the block at `state`'s slot, from `prepare_execution_payload`
 /// (gloas `validator.md`).
 ///
-/// `build_on_full` is `should_build_on_full(store, head, current_slot)`: the
+/// `build_on_full` is `should_build_on_full(store, head, state.slot)`: the
 /// proposer builds on the parent's revealed payload, so the parent's requests
 /// (`parent_requests`, empty when the parent is pre-gloas) are applied to a
 /// copy of the state first, and the withdrawals are those of that copy. Else
