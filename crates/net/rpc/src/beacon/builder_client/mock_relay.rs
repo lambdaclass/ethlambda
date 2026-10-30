@@ -6,6 +6,7 @@
 //! registration signatures and refuses SSZ registrations, records blinded
 //! block submissions, and has `answer_headers_with` and
 //! `answer_submissions_with` to answer a call with exactly what a test needs.
+//! It serves `status` with 200, or 503 after `make_unavailable`.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -51,6 +52,10 @@ struct RelayState {
     submit_status: Option<StatusCode>,
     /// Submissions that arrived SSZ-encoded, refused or not.
     ssz_submissions: usize,
+    /// Whether `status` answers 503.
+    unavailable: bool,
+    /// `registerValidator` calls received, whatever their outcome.
+    registration_calls: usize,
 }
 
 /// A fixed answer to every `getHeader`.
@@ -92,6 +97,7 @@ impl MockRelay {
             )
             .route("/eth/v1/builder/validators", post(register))
             .route("/eth/v2/builder/blinded_blocks", post(submit))
+            .route("/eth/v1/builder/status", get(status))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -148,12 +154,22 @@ impl MockRelay {
         self.state.lock().unwrap().submit_status = Some(status);
     }
 
+    /// Answer `status` with 503, as a builder that is not ready does.
+    pub(crate) fn make_unavailable(&self) {
+        self.state.lock().unwrap().unavailable = true;
+    }
+
     pub(crate) fn blinded_blocks(&self) -> Vec<SignedBlindedBeaconBlock> {
         self.state.lock().unwrap().blinded_blocks.clone()
     }
 
     pub(crate) fn ssz_submissions(&self) -> usize {
         self.state.lock().unwrap().ssz_submissions
+    }
+
+    /// How many `registerValidator` calls arrived, whatever their outcome.
+    pub(crate) fn registration_calls(&self) -> usize {
+        self.state.lock().unwrap().registration_calls
     }
 
     pub(crate) fn registrations(&self) -> Vec<SignedValidatorRegistrationV1> {
@@ -244,6 +260,7 @@ async fn header(
 
 async fn register(State(state): State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
     let mut state = state.lock().unwrap();
+    state.registration_calls += 1;
     // The client always registers in JSON (see `register_validators`); an
     // SSZ registration here is a regression.
     if is_ssz_request(&headers) {
@@ -262,6 +279,14 @@ async fn register(State(state): State<Shared>, headers: HeaderMap, body: Bytes) 
     }
     state.registrations.extend(registrations);
     StatusCode::OK.into_response()
+}
+
+async fn status(State(state): State<Shared>) -> Response {
+    if state.lock().unwrap().unavailable {
+        StatusCode::SERVICE_UNAVAILABLE.into_response()
+    } else {
+        StatusCode::OK.into_response()
+    }
 }
 
 async fn submit(State(state): State<Shared>, headers: HeaderMap, body: Bytes) -> Response {

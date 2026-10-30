@@ -14,6 +14,8 @@
 //! Responses are decoded by their own `Content-Type`, not by what was asked
 //! for: a builder may answer JSON to an SSZ request without refusing it.
 //!
+//! `status` is a liveness probe the node calls once at startup.
+//!
 //! Every call is timed into `lean_beacon_builder_request_seconds`, by call
 //! and outcome.
 
@@ -62,6 +64,9 @@ const REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
 /// At least MEV-Boost's own default of four seconds, which it spends
 /// fetching the payload from its relays before it answers.
 const SUBMIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `status` is a liveness probe; a builder that takes longer is not ready.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A builder API endpoint: a relay, or MEV-Boost in front of several.
 #[derive(Debug, Clone)]
@@ -272,6 +277,30 @@ impl BuilderClient {
             .send()
             .await
             .map_err(|err| BuilderError::from_reqwest(err, SUBMIT_TIMEOUT))
+    }
+
+    /// `status`: whether the builder is up. The node calls it once at
+    /// startup, so a wrong `--builder` shows before the first proposal
+    /// rather than at it.
+    pub async fn status(&self) -> Result<(), BuilderError> {
+        let started = Instant::now();
+        let result = self.try_status().await;
+        observe_builder_request("status", outcome(&result), started.elapsed());
+        result
+    }
+
+    async fn try_status(&self) -> Result<(), BuilderError> {
+        let response = self
+            .http
+            .get(self.url("/eth/v1/builder/status"))
+            .timeout(STATUS_TIMEOUT)
+            .send()
+            .await
+            .map_err(|err| BuilderError::from_reqwest(err, STATUS_TIMEOUT))?;
+        match response.status() {
+            StatusCode::OK => Ok(()),
+            _ => Err(BuilderError::from_status(response, STATUS_TIMEOUT).await),
+        }
     }
 
     fn fall_back_to_json(&self) {

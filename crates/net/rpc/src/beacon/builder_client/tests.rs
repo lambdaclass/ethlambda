@@ -393,3 +393,19 @@ async fn only_202_is_a_successful_submission() {
         ));
     }
 }
+
+#[tokio::test]
+async fn a_running_builder_reports_its_status() {
+    let relay = MockRelay::start(GENESIS_FORK_VERSION).await;
+    client_for(&relay).status().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_unavailable_builder_reports_its_503() {
+    let relay = MockRelay::start(GENESIS_FORK_VERSION).await;
+    relay.make_unavailable();
+    assert!(matches!(
+        client_for(&relay).status().await,
+        Err(BuilderError::Status { status: 503, .. })
+    ));
+}

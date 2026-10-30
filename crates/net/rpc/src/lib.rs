@@ -242,6 +242,9 @@ pub struct BeaconApiHandles {
     pub client_version: ethlambda_engine::types::ClientVersionV1,
     /// What `/eth/v1/node/identity` reports beyond the peer id.
     pub identity: BeaconIdentity,
+    /// The builder `--builder` names, for the builder flow's endpoints.
+    /// `None` when the node runs without one.
+    pub builder: Option<BuilderClient>,
 }
 
 /// Start the HTTP servers for a beacon node.
@@ -267,6 +270,7 @@ pub async fn start_beacon_rpc_server(
         .layer(Extension(handles.custody_columns))
         .layer(Extension(beacon::validator::FeeRecipients::default()))
         .layer(Extension(handles.engine))
+        .layer(Extension(handles.builder))
         .layer(Extension(handles.events))
         .layer(Extension(handles.identity))
         .layer(Extension(beacon::graffiti::OwnVersion(Arc::new(

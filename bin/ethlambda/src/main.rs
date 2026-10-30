@@ -448,6 +448,35 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         Network::Mainnet { .. } => false,
     });
 
+    // A malformed URL fails here, at startup, rather than at the first
+    // proposal; an unreachable builder only warns, since it may come up
+    // after this node does.
+    let builder = match &network {
+        Network::Lean(_) => None,
+        Network::Mainnet { mainnet, .. } => mainnet
+            .builder
+            .as_deref()
+            .map(|url| {
+                ethlambda_rpc::BuilderClient::new(
+                    url,
+                    std::time::Duration::from_millis(mainnet.builder_header_timeout),
+                    version::client_version(),
+                )
+            })
+            .transpose()?,
+    };
+    if let Some(builder) = builder.clone() {
+        tokio::spawn(async move {
+            let _ = builder
+                .status()
+                .await
+                .inspect(|()| info!("Builder is up"))
+                .inspect_err(|err| {
+                    warn!(%err, "Builder is not answering; proposals build locally until it does")
+                });
+        });
+    }
+
     // Shared, runtime-readable sync status. The blockchain actor writes it each
     // tick (alongside the `lean_node_sync_status` metric); the RPC
     // `/lean/v0/node/syncing` endpoint reads it. Seeded to Idle, matching the
@@ -842,6 +871,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     events: rpc_events,
                     client_version: version::engine_client_version(),
                     identity: rpc_identity,
+                    builder,
                 },
                 local_peer_id,
                 rpc_shutdown,
