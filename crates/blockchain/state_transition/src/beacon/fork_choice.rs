@@ -2758,8 +2758,13 @@ pub fn seconds_to_milliseconds(seconds: u64) -> u64 {
 
 /// The duration, in milliseconds, that `basis_points` out of
 /// [`constants::BASIS_POINTS`] of a slot spans.
+///
+/// Rounded to the nearest millisecond, half up (consensus-specs #5756).
 pub fn get_slot_component_duration_ms(basis_points: u64, config: &Config) -> u64 {
-    basis_points.saturating_mul(config.slot_duration_ms) / constants::BASIS_POINTS
+    basis_points
+        .saturating_mul(config.slot_duration_ms)
+        .saturating_add(constants::BASIS_POINTS / 2)
+        / constants::BASIS_POINTS
 }
 
 /// How far into a slot, in milliseconds, an attestation is due.
@@ -5831,6 +5836,23 @@ pub(crate) mod tests {
     /// Tests populate only what the function under test actually reads.
     pub(crate) fn empty_store() -> Store {
         store_anchored_at(Root::ZERO)
+    }
+
+    #[test]
+    fn slot_component_durations_round_to_the_nearest_millisecond() {
+        let mut config = Config::mainnet();
+        config.slot_duration_ms = 12_000;
+        // 3333 basis points of 12 s is 3999.6 ms, and 1667 is 2000.4 ms.
+        assert_eq!(get_slot_component_duration_ms(3_333, &config), 4_000);
+        assert_eq!(get_slot_component_duration_ms(6_667, &config), 8_000);
+        assert_eq!(get_slot_component_duration_ms(1_667, &config), 2_000);
+        // At 6 s slots, 3333 basis points is 1999.8 ms.
+        config.slot_duration_ms = 6_000;
+        assert_eq!(get_slot_component_duration_ms(3_333, &config), 2_000);
+        // An exact half millisecond rounds up.
+        config.slot_duration_ms = 1;
+        assert_eq!(get_slot_component_duration_ms(5_000, &config), 1);
+        assert_eq!(get_slot_component_duration_ms(4_999, &config), 0);
     }
 
     #[test]

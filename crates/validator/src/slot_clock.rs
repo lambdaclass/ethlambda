@@ -25,12 +25,11 @@ const BASIS_POINTS: u64 = 10_000;
 /// `SECONDS_PER_SLOT`. Both halves of that are gone. The slot length is
 /// `SLOT_DURATION_MS`, and the offsets are basis points of it:
 /// `ATTESTATION_DUE_BPS` and `AGGREGATE_DUE_BPS`, evaluated with
-/// `bps * SLOT_DURATION_MS // BASIS_POINTS`.
+/// `(bps * SLOT_DURATION_MS + BASIS_POINTS // 2) // BASIS_POINTS`.
 ///
-/// It is not a cosmetic change. On mainnet the attester offset is 3999 ms, not
-/// the 4000 that a third of a 12-second slot gives, and the gloas fork moves
-/// both offsets to 2500 and 5000 basis points, which no fixed fraction
-/// expresses. Holding the basis points means this clock follows the network it
+/// It is not a cosmetic change. The gloas fork moves both offsets to 2500 and
+/// 5000 basis points, which no fixed fraction expresses. Holding the basis
+/// points means this clock follows the network it
 /// was told about rather than the one it was compiled for.
 ///
 /// # The offsets depend on the fork of the slot
@@ -205,13 +204,16 @@ impl SlotClock {
 
     /// `bps` basis points of the way into `slot`.
     ///
-    /// The specification's own `get_slot_component_duration_ms`, which is
-    /// `bps * SLOT_DURATION_MS // BASIS_POINTS`: integer arithmetic on
-    /// milliseconds, multiplying before dividing. Doing it in `Duration`
-    /// instead would keep nanoseconds and land 0.4 ms past the spec's answer on
-    /// mainnet, which is wrong in the direction that matters for a deadline.
+    /// The specification's own `get_slot_component_duration_ms`: integer
+    /// arithmetic on milliseconds, multiplying before dividing.
+    /// It rounds to the nearest millisecond, half up (consensus-specs #5756).
+    /// Doing it in `Duration` instead would keep sub-millisecond fractions the
+    /// specification rounds away.
     fn offset_into(&self, slot: Slot, bps: u64) -> SystemTime {
-        let offset_ms = bps.saturating_mul(self.slot_duration_ms) / BASIS_POINTS;
+        let offset_ms = bps
+            .saturating_mul(self.slot_duration_ms)
+            .saturating_add(BASIS_POINTS / 2)
+            / BASIS_POINTS;
         self.start_of(slot) + Duration::from_millis(offset_ms)
     }
 
@@ -461,10 +463,8 @@ mod tests {
         assert_eq!(clock.epoch_of(SLOTS_PER_EPOCH), 1);
     }
 
-    /// 3333 basis points of a 12-second slot is 3999 ms, not the 4000 a third
-    /// would give. The one-millisecond difference is what the integer floor in
-    /// the specification's own formula produces, and getting it by dividing
-    /// into thirds instead is how this was wrong before.
+    /// 3333 basis points of a 12-second slot is 3999.6 ms, which rounds to 4000.
+    /// A floor would give 3999, a millisecond short of the intended third.
     #[test]
     fn the_attester_duty_runs_at_the_specifications_basis_points() {
         let clock = clock();
@@ -472,7 +472,7 @@ mod tests {
         let start = clock.start_of(10);
         assert_eq!(
             duty.duration_since(start).expect("after the start"),
-            Duration::from_millis(3_999)
+            Duration::from_millis(4_000)
         );
     }
 
@@ -666,7 +666,7 @@ mod tests {
         assert!(clock.is_gloas(first_gloas));
         assert_eq!(
             ms(clock.attestation_time(last_fulu), last_fulu),
-            Duration::from_millis(3_999)
+            Duration::from_millis(4_000)
         );
         assert_eq!(
             ms(clock.aggregation_time(last_fulu), last_fulu),
@@ -693,7 +693,7 @@ mod tests {
 
         assert_eq!(
             ms(clock.sync_message_time(last_fulu), last_fulu),
-            Duration::from_millis(3_999)
+            Duration::from_millis(4_000)
         );
         assert_eq!(
             ms(clock.contribution_time(last_fulu), last_fulu),
@@ -715,7 +715,7 @@ mod tests {
         let now = at(5 * SECONDS_PER_SLOT + 1);
         assert_eq!(
             clock.until_sync_message(5, now),
-            Duration::from_millis(2_999)
+            Duration::from_millis(3_000)
         );
         assert_eq!(
             clock.until_contribution(5, now),
@@ -788,11 +788,11 @@ mod tests {
     #[test]
     fn the_wait_until_the_attester_duty_is_the_rest_of_the_offset() {
         let clock = clock();
-        // One second into slot 5, whose duty runs 3999 ms in.
+        // One second into slot 5, whose duty runs 4000 ms in.
         let now = at(5 * SECONDS_PER_SLOT + 1);
         assert_eq!(
             clock.until_attestation(5, now),
-            Duration::from_millis(2_999)
+            Duration::from_millis(3_000)
         );
     }
 
@@ -801,7 +801,7 @@ mod tests {
         let clock = clock();
         assert_eq!(
             clock.until_attestation(5, clock.start_of(5)),
-            Duration::from_millis(3_999)
+            Duration::from_millis(4_000)
         );
     }
 
