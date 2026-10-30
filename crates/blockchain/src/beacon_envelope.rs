@@ -574,6 +574,14 @@ impl BlockChainServer {
             held.envelope.message.payload.block_hash,
         );
         self.envelopes.verified.push_back(root);
+        let message = &held.envelope.message;
+        self.events.publish_envelope_imported(
+            &self.store,
+            slot,
+            message.builder_index,
+            message.payload.block_hash,
+            root,
+        );
         true
     }
 
@@ -2327,6 +2335,60 @@ mod tests {
 
     fn payload_hash(envelope: &gloas::SignedExecutionPayloadEnvelope) -> H256 {
         envelope.message.payload.block_hash
+    }
+
+    /// The actor's import of an envelope is what publishes `execution_payload`,
+    /// and `execution_payload_available` right after it.
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn an_imported_envelope_emits_execution_payload_then_available() {
+        let case = Case::new("on_execution_payload_envelope", FULL_CHILD_CASE);
+        let mut server = case.server(12);
+        server
+            .on_block(case.block(FULL_PARENT), ImportTimings::default())
+            .await;
+        let mut rx = server.events.subscribe();
+        let envelope = valid_envelope_for_full_parent();
+        let builder_index = envelope.message.builder_index;
+        let block_hash = payload_hash(&envelope);
+
+        server.receive_envelope(envelope, 0).await;
+
+        let payload_events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|event| {
+                matches!(
+                    event,
+                    crate::ChainEvent::ExecutionPayload(_)
+                        | crate::ChainEvent::ExecutionPayloadAvailable(_)
+                )
+            })
+            .collect();
+        let slot = server
+            .store
+            .block_slot_and_state_root(&root(FULL_PARENT))
+            .expect("the parent is imported")
+            .0;
+        match payload_events.as_slice() {
+            [
+                crate::ChainEvent::ExecutionPayload(payload),
+                crate::ChainEvent::ExecutionPayloadAvailable(available),
+            ] => {
+                assert_eq!(
+                    (payload.slot, payload.builder_index, payload.block_hash),
+                    (slot, builder_index, block_hash)
+                );
+                assert_eq!(payload.block_root, root(FULL_PARENT));
+                assert!(!payload.execution_optimistic);
+                assert_eq!(
+                    (available.slot, available.block_root),
+                    (slot, root(FULL_PARENT))
+                );
+            }
+            other => panic!("expected execution_payload then available, got {other:?}"),
+        }
     }
 
     #[tokio::test]

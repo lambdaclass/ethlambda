@@ -785,6 +785,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         payload_attestation_pool.clone(),
         builder_market.clone(),
         sync_committee_pool.clone(),
+        Some(Arc::new(events.clone())),
     )
     .await
     .wrap_err("failed to start discv5 discovery")?;
