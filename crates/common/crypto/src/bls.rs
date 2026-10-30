@@ -34,17 +34,31 @@
 //! key validation, and because every active validator's key signs again each
 //! epoch, almost all of it was repeated work.
 //!
-//! So [`PublicKey::key_validate`]'s answer is memoized, keyed by the exact
-//! compressed bytes it was asked about (see [`PubkeyCache`]). That keeps the
-//! guarantee above intact rather than trading it away: `key_validate` is a
-//! pure function of those bytes, so a hit hands back precisely the point a
-//! fresh call would have produced, and a byte string only ever enters the
-//! cache by passing it. Keying by the bytes rather than by validator index is
-//! what makes that true without further argument: an index names whatever key
-//! the state at hand says it does, which two forks need not agree on, while a
-//! byte string names one point everywhere. A key that fails is never cached,
-//! so an invalid key costs a full check every time, exactly as before, and
-//! cannot grow the cache.
+//! So [`PublicKey::key_validate`]'s answer is memoized in [`PubkeyCache`],
+//! which holds it in two structures. Both are keyed, in the end, by the exact
+//! compressed bytes the answer was asked about:
+//!
+//! - a byte-keyed map, sharded across locks, for a key with no index to its
+//!   name (a gossiped aggregate's, a deposit's, a sync committee's);
+//! - an index-keyed table for a key a caller read from the registry, given as
+//!   an [`IndexedPubkey`]: one set-once slot per validator index, read without
+//!   a lock or a hash, holding the bytes next to the point.
+//!
+//! That keeps the guarantee above intact rather than trading it away:
+//! `key_validate` is a pure function of those bytes, so a hit hands back
+//! precisely the point a fresh call would have produced, and a byte string only
+//! ever enters either structure by passing it. The table does not weaken that
+//! by naming slots by index. An index names whatever key the state at hand says
+//! it does, which two forks (or two spec-fixture states in one process) need
+//! not agree on, so a slot is never trusted for its index alone: a lookup hits
+//! only when the bytes stored in the slot equal the bytes the caller just read
+//! from its own state, and then the stored point is the point for those bytes.
+//! A slot holding other bytes, or an index past the table's bound, sends the
+//! lookup to the byte-keyed map, which needs no argument about indices at all.
+//! A slot is written once and never replaced, so a reader never sees a torn or
+//! changing entry; a key that lost the race for its slot goes to the map.
+//! A key that fails is never cached in either structure, so an invalid key
+//! costs a full check every time, exactly as before, and cannot grow either.
 //!
 //! # `bool` versus `Result`
 //!
@@ -94,7 +108,7 @@
 //! validated.
 
 use std::collections::HashMap;
-use std::sync::{LazyLock, RwLock};
+use std::sync::{LazyLock, OnceLock, RwLock};
 
 use blst::min_pk::{AggregatePublicKey, AggregateSignature, PublicKey, Signature};
 use blst::{BLST_ERROR, MultiPoint};
@@ -102,7 +116,7 @@ use rayon::prelude::*;
 
 use ethlambda_types::beacon::error::{Error, Result};
 use ethlambda_types::beacon::primitives::{
-    BLS_PUBKEY_SIZE, BLS_SIGNATURE_SIZE, BlsPubkey, BlsSignature, Root,
+    BLS_PUBKEY_SIZE, BLS_SIGNATURE_SIZE, BlsPubkey, BlsSignature, Root, ValidatorIndex,
 };
 
 mod batch;
@@ -165,17 +179,102 @@ const MAX_CACHED_PUBKEYS: usize = 1 << 22;
 static VALIDATED_PUBKEYS: LazyLock<PubkeyCache> =
     LazyLock::new(|| PubkeyCache::new(MAX_CACHED_PUBKEYS));
 
-/// Validated, decompressed public keys, keyed by their compressed encoding.
+/// How many validator indices one lazily allocated chunk of the index table
+/// covers.
+///
+/// Registry indices are dense, so a chunk fills as the registry is walked, and
+/// a chunk is the unit of allocation: small enough that a test or a small
+/// devnet pays for a few of them, large enough that a mainnet registry is a few
+/// hundred.
+const INDEX_CHUNK_LEN: usize = 1 << 12;
+
+/// A validated key as the index table stores it: the bytes it was validated
+/// from, next to the point, so a lookup can check the bytes before trusting
+/// the point.
+type IndexedEntry = (BlsPubkey, PublicKey);
+
+/// One lazily allocated run of [`INDEX_CHUNK_LEN`] set-once slots.
+type IndexChunk = Box<[OnceLock<IndexedEntry>]>;
+
+/// What a key-taking function accepts: a bare [`BlsPubkey`], resolved through
+/// the byte-keyed map, or an [`IndexedPubkey`], resolved through the index
+/// table first.
+///
+/// Sealed, because the cache's soundness argument (see the module
+/// documentation) is about exactly these two shapes. Both carry the bytes the
+/// caller read; the index is only a hint about where to look for them.
+pub trait PubkeySource: sealed::Sealed {}
+
+impl PubkeySource for BlsPubkey {}
+impl PubkeySource for IndexedPubkey {}
+
+mod sealed {
+    use super::*;
+
+    /// The accessors the cache needs; kept out of [`PubkeySource`] so that
+    /// nothing outside this crate can implement it.
+    pub trait Sealed: Sync {
+        /// The compressed bytes the caller read from its state.
+        fn pubkey(&self) -> &BlsPubkey;
+        /// The registry index to try first, if the caller knows one.
+        fn index(&self) -> Option<ValidatorIndex>;
+    }
+
+    impl Sealed for BlsPubkey {
+        fn pubkey(&self) -> &BlsPubkey {
+            self
+        }
+        fn index(&self) -> Option<ValidatorIndex> {
+            None
+        }
+    }
+
+    impl Sealed for IndexedPubkey {
+        fn pubkey(&self) -> &BlsPubkey {
+            &self.pubkey
+        }
+        fn index(&self) -> Option<ValidatorIndex> {
+            Some(self.index)
+        }
+    }
+}
+
+/// A public key together with the validator index the caller read it at.
+///
+/// The index is a hint that lets the cache answer from its index-keyed table
+/// instead of hashing the bytes. It is never trusted on its own: the table
+/// hits only when the bytes held for that index equal `pubkey`, so a caller
+/// whose state names a different key at that index than another state did
+/// still gets the point for the bytes it passed. See the module documentation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexedPubkey {
+    /// The validator's index in the registry the key was read from.
+    pub index: ValidatorIndex,
+    /// The key's compressed bytes, as that registry holds them.
+    pub pubkey: BlsPubkey,
+}
+
+/// Validated, decompressed public keys, by their compressed encoding or by the
+/// registry index they were read at.
 ///
 /// A bounded, append-only memo of [`PublicKey::key_validate`]: an entry is
 /// only ever added for a key that passed, never changed, and never removed,
 /// since its answer can never change. See the module documentation for why
 /// that is sound.
+///
+/// The index table holds a key resolved through an [`IndexedPubkey`] and the
+/// map holds every other, so a key lives in one structure and the memory per
+/// key stays that of the map's entry or less.
 struct PubkeyCache {
     shards: [RwLock<HashMap<BlsPubkey, PublicKey>>; PUBKEY_CACHE_SHARDS],
     /// The most entries one shard takes, so the whole cache stays within the
     /// capacity it was built with.
     shard_capacity: usize,
+    /// Set-once slots by validator index, in chunks allocated on first write.
+    /// Its length times [`INDEX_CHUNK_LEN`] is the bound on indices it serves.
+    chunks: Box<[OnceLock<IndexChunk>]>,
+    /// The first index the table does not serve.
+    index_bound: usize,
 }
 
 impl PubkeyCache {
@@ -183,6 +282,10 @@ impl PubkeyCache {
         Self {
             shards: std::array::from_fn(|_| RwLock::new(HashMap::new())),
             shard_capacity: capacity.div_ceil(PUBKEY_CACHE_SHARDS),
+            chunks: (0..capacity.div_ceil(INDEX_CHUNK_LEN))
+                .map(|_| OnceLock::new())
+                .collect(),
+            index_bound: capacity,
         }
     }
 
@@ -194,40 +297,95 @@ impl PubkeyCache {
         &self.shards[byte % PUBKEY_CACHE_SHARDS]
     }
 
-    /// The validated point for `pubkey`, if it has passed before.
-    fn get(&self, pubkey: &BlsPubkey) -> Option<PublicKey> {
+    /// The table slot for `index`, if the index is inside the bound and its
+    /// chunk exists (`allocate` creates it).
+    fn slot(&self, index: ValidatorIndex, allocate: bool) -> Option<&OnceLock<IndexedEntry>> {
+        let index = usize::try_from(index)
+            .ok()
+            .filter(|&i| i < self.index_bound)?;
+        let cell = &self.chunks[index / INDEX_CHUNK_LEN];
+        let chunk = if allocate {
+            cell.get_or_init(|| (0..INDEX_CHUNK_LEN).map(|_| OnceLock::new()).collect())
+        } else {
+            cell.get()?
+        };
+        Some(&chunk[index % INDEX_CHUNK_LEN])
+    }
+
+    fn get_by_bytes(&self, pubkey: &BlsPubkey) -> Option<PublicKey> {
         self.shard(pubkey).read().unwrap().get(pubkey).copied()
     }
 
-    /// Records that `pubkey` validated to `point`, unless its shard is full.
-    fn insert(&self, pubkey: BlsPubkey, point: PublicKey) {
+    /// The validated point for `key`, if its bytes have passed before.
+    ///
+    /// The index table answers only when the slot's stored bytes equal the
+    /// bytes in `key`; anything else, including an index outside the bound,
+    /// goes to the byte-keyed map.
+    fn get<K: PubkeySource>(&self, key: &K) -> Option<PublicKey> {
+        let pubkey = key.pubkey();
+        if let Some(index) = key.index()
+            && let Some((bytes, point)) = self.slot(index, false).and_then(OnceLock::get)
+            && bytes == pubkey
+        {
+            return Some(*point);
+        }
+        self.get_by_bytes(pubkey)
+    }
+
+    /// Records that `key`'s bytes validated to `point`: in the index table
+    /// when `key` has an index whose slot is free (or already holds these
+    /// bytes), otherwise in the map, unless that shard is full.
+    fn insert<K: PubkeySource>(&self, key: &K, point: PublicKey) {
+        let pubkey = *key.pubkey();
+        if let Some(index) = key.index()
+            && let Some(slot) = self.slot(index, true)
+        {
+            match slot.set((pubkey, point)) {
+                Ok(()) => {
+                    crate::metrics::inc_pubkey_cache_entries();
+                    return;
+                }
+                // First writer wins; a racing writer of the same bytes is done.
+                Err(_) if slot.get().is_some_and(|(bytes, _)| *bytes == pubkey) => return,
+                // The slot holds other bytes: this key lives in the map.
+                Err(_) => {}
+            }
+        }
         let mut shard = self.shard(&pubkey).write().unwrap();
         if shard.len() < self.shard_capacity && shard.insert(pubkey, point).is_none() {
             crate::metrics::inc_pubkey_cache_entries();
         }
     }
 
-    /// The number of keys held, across every shard.
+    /// The number of keys held, across the map and the table.
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.shards
+        let mapped: usize = self
+            .shards
             .iter()
             .map(|shard| shard.read().unwrap().len())
-            .sum()
+            .sum();
+        let indexed: usize = self
+            .chunks
+            .iter()
+            .filter_map(|chunk| chunk.get())
+            .map(|chunk| chunk.iter().filter(|slot| slot.get().is_some()).count())
+            .sum();
+        mapped + indexed
     }
 }
 
 /// `pubkey` as a validated point, or `None` if it is not a valid,
 /// subgroup-correct, non-identity key: [`PublicKey::key_validate`], through
 /// [`VALIDATED_PUBKEYS`].
-fn validated_pubkey(pubkey: &BlsPubkey) -> Option<PublicKey> {
+fn validated_pubkey<K: PubkeySource>(pubkey: &K) -> Option<PublicKey> {
     if let Some(point) = VALIDATED_PUBKEYS.get(pubkey) {
         crate::metrics::inc_pubkey_cache_lookups(1, 0);
         return Some(point);
     }
     crate::metrics::inc_pubkey_cache_lookups(0, 1);
-    let point = PublicKey::key_validate(pubkey.as_ref()).ok()?;
-    VALIDATED_PUBKEYS.insert(*pubkey, point);
+    let point = PublicKey::key_validate(pubkey.pubkey().as_ref()).ok()?;
+    VALIDATED_PUBKEYS.insert(pubkey, point);
     Some(point)
 }
 
@@ -237,7 +395,7 @@ fn validated_pubkey(pubkey: &BlsPubkey) -> Option<PublicKey> {
 /// Hits resolve on the calling thread and only the misses go to rayon; see
 /// the module documentation for why. Each miss that validates is added to
 /// [`VALIDATED_PUBKEYS`] before returning.
-fn validated_pubkeys(pubkeys: &[BlsPubkey]) -> Option<Vec<PublicKey>> {
+fn validated_pubkeys<K: PubkeySource>(pubkeys: &[K]) -> Option<Vec<PublicKey>> {
     let mut points: Vec<Option<PublicKey>> = pubkeys
         .iter()
         .map(|pubkey| VALIDATED_PUBKEYS.get(pubkey))
@@ -254,10 +412,10 @@ fn validated_pubkeys(pubkeys: &[BlsPubkey]) -> Option<Vec<PublicKey>> {
         let fresh: Vec<PublicKey> = misses
             .par_iter()
             .with_min_len(KEY_VALIDATE_MIN_PAR_LEN)
-            .map(|&index| PublicKey::key_validate(pubkeys[index].as_ref()).ok())
+            .map(|&index| PublicKey::key_validate(pubkeys[index].pubkey().as_ref()).ok())
             .collect::<Option<_>>()?;
         for (&index, point) in misses.iter().zip(fresh) {
-            VALIDATED_PUBKEYS.insert(pubkeys[index], point);
+            VALIDATED_PUBKEYS.insert(&pubkeys[index], point);
             points[index] = Some(point);
         }
     }
@@ -333,7 +491,7 @@ pub const G2_POINT_AT_INFINITY: [u8; BLS_SIGNATURE_SIZE] = g2_point_at_infinity(
 /// here rather than panicking or returning an error: an unparseable or
 /// invalid-point key is treated exactly like a valid key over the wrong
 /// signature, since the specification never distinguishes the two.
-pub fn verify(pubkey: &BlsPubkey, message: Root, signature: &BlsSignature) -> bool {
+pub fn verify<K: PubkeySource>(pubkey: &K, message: Root, signature: &BlsSignature) -> bool {
     let Some(pubkey) = validated_pubkey(pubkey) else {
         return false;
     };
@@ -407,8 +565,8 @@ pub fn aggregate_verify(
 /// Electra block's attestations, where a single aggregate can carry
 /// thousands of signers behind one shared message; keys go through
 /// [`PubkeyCache`], see the module documentation for why that is safe.
-pub fn fast_aggregate_verify(
-    pubkeys: &[BlsPubkey],
+pub fn fast_aggregate_verify<K: PubkeySource>(
+    pubkeys: &[K],
     message: Root,
     signature: &BlsSignature,
 ) -> bool {
@@ -440,7 +598,7 @@ pub fn fast_aggregate_verify(
 /// contribute nothing (or something unintended) to the sum instead of failing
 /// the aggregation outright, which is why this returns [`Result`] rather
 /// than substituting a default.
-pub fn eth_aggregate_pubkeys(pubkeys: &[BlsPubkey]) -> Result<BlsPubkey> {
+pub fn eth_aggregate_pubkeys<K: PubkeySource>(pubkeys: &[K]) -> Result<BlsPubkey> {
     ethlambda_types::beacon::error::verify(!pubkeys.is_empty(), "len(pubkeys) > 0")?;
     let points = validated_pubkeys(pubkeys).ok_or(Error::SpecAssert(
         "all(bls.KeyValidate(pubkey) for pubkey in pubkeys)",
@@ -463,8 +621,8 @@ pub fn eth_aggregate_pubkeys(pubkeys: &[BlsPubkey]) -> Result<BlsPubkey> {
 /// the identity element by convention rather than "no signature was
 /// provided"; [`fast_aggregate_verify`] itself has no such case, since the
 /// underlying IETF ciphersuite it wraps was never given one.
-pub fn eth_fast_aggregate_verify(
-    pubkeys: &[BlsPubkey],
+pub fn eth_fast_aggregate_verify<K: PubkeySource>(
+    pubkeys: &[K],
     message: Root,
     signature: &BlsSignature,
 ) -> bool {
@@ -481,7 +639,7 @@ pub fn eth_fast_aggregate_verify(
 /// Exposed standalone because the spec calls `KeyValidate` directly in more
 /// than one place (deposit processing, [`eth_aggregate_pubkeys`]'s own
 /// assertion), not only as a step inside a signature check.
-pub fn key_validate(pubkey: &BlsPubkey) -> bool {
+pub fn key_validate<K: PubkeySource>(pubkey: &K) -> bool {
     validated_pubkey(pubkey).is_some()
 }
 
@@ -700,16 +858,187 @@ mod tests {
             .collect();
         for pubkey in &pubkeys {
             let point = PublicKey::key_validate(pubkey.as_ref()).unwrap();
-            cache.insert(*pubkey, point);
+            cache.insert(pubkey, point);
             // Inserting the same key again must not take a second slot.
-            cache.insert(*pubkey, point);
+            cache.insert(pubkey, point);
         }
         assert!(cache.len() <= PUBKEY_CACHE_SHARDS);
         let held = pubkeys
             .iter()
-            .filter(|pubkey| cache.get(pubkey).is_some())
+            .filter(|pubkey| cache.get(*pubkey).is_some())
             .count();
         assert_eq!(held, cache.len());
+    }
+
+    /// The table slot for `index` in `cache`, if it holds anything.
+    fn held_at(cache: &PubkeyCache, index: ValidatorIndex) -> Option<BlsPubkey> {
+        cache
+            .slot(index, false)
+            .and_then(OnceLock::get)
+            .map(|(bytes, _)| *bytes)
+    }
+
+    fn indexed(index: ValidatorIndex, seed: u64) -> IndexedPubkey {
+        IndexedPubkey {
+            index,
+            pubkey: fresh_pubkey(seed),
+        }
+    }
+
+    #[test]
+    fn an_indexed_key_hits_the_table_after_warming_and_stays_out_of_the_map() {
+        let cache = PubkeyCache::new(2 * INDEX_CHUNK_LEN);
+        let key = indexed(INDEX_CHUNK_LEN as u64 + 3, 9001);
+        assert!(cache.get(&key).is_none());
+
+        let point = PublicKey::key_validate(key.pubkey.as_ref()).unwrap();
+        cache.insert(&key, point);
+        assert_eq!(
+            cache.get(&key).map(|point| point.to_bytes()),
+            Some(point.to_bytes())
+        );
+        assert_eq!(held_at(&cache, key.index), Some(key.pubkey));
+        assert!(cache.get_by_bytes(&key.pubkey).is_none());
+        assert_eq!(cache.len(), 1);
+        // The same bytes with no index are not in the byte map, and the
+        // answer through the global API is the same as a fresh validation.
+        assert_eq!(
+            validated_pubkey(&key).map(|point| point.to_bytes()),
+            uncached(&key.pubkey)
+        );
+    }
+
+    /// `fresh_pubkey(seed)`'s signature over `message`.
+    fn fresh_signature(seed: u64, message: Root) -> BlsSignature {
+        let mut ikm = [0xa5u8; 32];
+        ikm[..8].copy_from_slice(&seed.to_le_bytes());
+        let secret = blst::min_pk::SecretKey::key_gen(&ikm, &[]).unwrap();
+        BlsSignature(secret.sign(message.as_slice(), DST, &[]).to_bytes())
+    }
+
+    #[test]
+    fn a_different_key_at_a_warmed_index_falls_back_and_verifies() {
+        let index = 3_000_001;
+        let message = ethlambda_types::beacon::primitives::H256([5u8; 32]);
+        let first = indexed(index, 9201);
+        let second = indexed(index, 9202);
+        assert!(key_validate(&first));
+        assert_eq!(held_at(&VALIDATED_PUBKEYS, index), Some(first.pubkey));
+
+        // Another state names a different key at the same index: the slot's
+        // bytes differ, so it must not answer.
+        assert!(VALIDATED_PUBKEYS.get(&second).is_none());
+        assert!(verify(&second, message, &fresh_signature(9202, message)));
+        assert!(!verify(&second, message, &fresh_signature(9201, message)));
+        assert!(verify(&first, message, &fresh_signature(9201, message)));
+        assert!(!verify(&first, message, &fresh_signature(9202, message)));
+
+        // The slot kept its first writer; the loser lives in the byte map.
+        assert_eq!(held_at(&VALIDATED_PUBKEYS, index), Some(first.pubkey));
+        assert!(VALIDATED_PUBKEYS.get_by_bytes(&second.pubkey).is_some());
+        assert!(VALIDATED_PUBKEYS.get_by_bytes(&first.pubkey).is_none());
+
+        // An aggregate mixing the two states' keys verifies too.
+        let signature = aggregate(&[
+            fresh_signature(9201, message),
+            fresh_signature(9202, message),
+        ])
+        .unwrap();
+        assert!(fast_aggregate_verify(&[first, second], message, &signature));
+    }
+
+    #[test]
+    fn an_index_past_the_bound_uses_the_map() {
+        for index in [MAX_CACHED_PUBKEYS as u64, u64::MAX] {
+            let key = indexed(index, 9100);
+            assert!(VALIDATED_PUBKEYS.slot(index, true).is_none());
+            for _ in 0..2 {
+                assert_eq!(
+                    validated_pubkey(&key).map(|point| point.to_bytes()),
+                    uncached(&key.pubkey)
+                );
+            }
+            assert!(VALIDATED_PUBKEYS.get_by_bytes(&key.pubkey).is_some());
+        }
+        // The last index inside the bound is served by the table.
+        let last = MAX_CACHED_PUBKEYS as u64 - 1;
+        let key = indexed(last, 9101);
+        assert!(key_validate(&key));
+        assert_eq!(held_at(&VALIDATED_PUBKEYS, last), Some(key.pubkey));
+    }
+
+    #[test]
+    fn an_invalid_indexed_key_is_cached_nowhere() {
+        let cache = PubkeyCache::new(INDEX_CHUNK_LEN);
+        for (offset, invalid) in [BlsPubkey::default(), identity_pubkey()]
+            .into_iter()
+            .enumerate()
+        {
+            let key = IndexedPubkey {
+                index: 3_100_000 + offset as u64,
+                pubkey: invalid,
+            };
+            for _ in 0..2 {
+                assert!(!key_validate(&key));
+                assert!(!verify(
+                    &key,
+                    ethlambda_types::beacon::primitives::H256([0u8; 32]),
+                    &BlsSignature::default()
+                ));
+                assert!(eth_aggregate_pubkeys(&[key]).is_err());
+            }
+            assert!(held_at(&VALIDATED_PUBKEYS, key.index).is_none());
+            assert!(VALIDATED_PUBKEYS.get_by_bytes(&invalid).is_none());
+            assert!(cache.get(&key).is_none());
+        }
+    }
+
+    #[test]
+    fn concurrent_readers_and_writers_agree_with_key_validate() {
+        const KEYS: u64 = 48;
+        const BASE: u64 = 3_200_000;
+        let pubkeys: Vec<BlsPubkey> = (0..KEYS).map(|seed| fresh_pubkey(20_000 + seed)).collect();
+        let expected: Vec<_> = pubkeys.iter().map(uncached).collect();
+
+        std::thread::scope(|scope| {
+            for thread in 0..8u64 {
+                let pubkeys = &pubkeys;
+                let expected = &expected;
+                scope.spawn(move || {
+                    for round in 0..20 {
+                        for (position, pubkey) in pubkeys.iter().enumerate() {
+                            // Even threads agree on one index per key; odd
+                            // threads rotate, so every slot is contested by
+                            // different bytes, and some pass no index at all.
+                            let index = BASE + (position as u64 + thread * (thread % 2)) % KEYS;
+                            let got = match (thread + round) % 3 {
+                                0 => validated_pubkey(pubkey),
+                                _ => validated_pubkey(&IndexedPubkey {
+                                    index,
+                                    pubkey: *pubkey,
+                                }),
+                            };
+                            assert_eq!(got.map(|point| point.to_bytes()), expected[position]);
+                        }
+                    }
+                });
+            }
+        });
+
+        // Whoever won each slot, it holds a key that validates to its own point.
+        for index in BASE..BASE + KEYS {
+            if let Some(bytes) = held_at(&VALIDATED_PUBKEYS, index) {
+                assert_eq!(
+                    VALIDATED_PUBKEYS
+                        .get(&IndexedPubkey {
+                            index,
+                            pubkey: bytes
+                        })
+                        .map(|point| point.to_bytes()),
+                    uncached(&bytes)
+                );
+            }
+        }
     }
 
     /// Builds a realistic attestation aggregate of `count` independent
