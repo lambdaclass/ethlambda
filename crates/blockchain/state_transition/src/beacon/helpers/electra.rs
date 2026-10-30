@@ -126,7 +126,7 @@
 use crate::beacon::bls::{AggregatePubkey, SignatureSet};
 use crate::beacon::config::Config;
 use crate::beacon::constants::{self, FAR_FUTURE_EPOCH};
-use crate::beacon::containers::shared::Validator;
+use crate::beacon::containers::shared::{AttestationData, Validator};
 use crate::beacon::containers::{BeaconState, electra, fulu, gloas};
 use crate::beacon::error::{Error, Result};
 use crate::beacon::fork::ForkName;
@@ -560,10 +560,6 @@ pub(crate) fn attesting_indices_from_committee_bits(
 ///
 /// Phase0 through deneb attestations stay on the direct path: each names one
 /// committee, and the live chain is past electra.
-#[allow(
-    dead_code,
-    reason = "wired into process_attestation by the next change"
-)]
 pub(crate) fn attesters_aggregate_pubkey(
     state: &BeaconState,
     slot: Slot,
@@ -624,6 +620,64 @@ pub(crate) fn attesters_aggregate_pubkey(
         });
     }
     Ok(total)
+}
+
+/// The signature check for an electra-shaped attestation, with the key taken
+/// from the shuffling's committee key sums when they are warm: the counterpart
+/// of [`indexed_attestation_signature_set`] for a caller that still holds the
+/// bit-encoded attestation next to the indexed one it built.
+///
+/// Makes the structural checks [`indexed_attestation_signature_set_with_domain`]
+/// makes on `attesting_indices` (non-empty, sorted and unique) and signs over
+/// the same root under the same domain (`DOMAIN_BEACON_ATTESTER` at the
+/// target epoch). The key comes from [`attesters_aggregate_pubkey`], the same
+/// group element as the sum of `attesting_indices`' keys: the indices are
+/// read off the same bits, and a committee member is drawn from the state's own
+/// active set, so every index is in the registry by construction.
+///
+/// `None` means the attestation is invalid without needing a pairing, as for
+/// [`indexed_attestation_signature_set`]. A bound on the number of indices
+/// (gloas's `MAX_VALIDATORS_PER_SLOT`) is the caller's to check first.
+pub(crate) fn attestation_signature_set(
+    state: &BeaconState,
+    data: &AttestationData,
+    signature: &BlsSignature,
+    attesting_indices: &[ValidatorIndex],
+    committee_bits: &electra::CommitteeBits,
+    is_set: impl Fn(usize) -> bool,
+    committees: &CommitteeCache,
+) -> Option<SignatureSet> {
+    if attesting_indices.is_empty() || !are_indices_sorted_and_unique(attesting_indices) {
+        return None;
+    }
+    let key =
+        attesters_aggregate_pubkey(state, data.slot, committee_bits, is_set, committees).ok()??;
+    let domain = get_domain(
+        state,
+        constants::DOMAIN_BEACON_ATTESTER,
+        Some(data.target.epoch),
+    );
+    let signing_root = compute_signing_root(data.hash_tree_root(), domain);
+    SignatureSet::from_aggregate(key, signing_root, signature)
+}
+
+/// [`attestation_signature_set`] for an electra or fulu attestation and the
+/// indexed attestation built from it.
+pub fn electra_attestation_signature_set(
+    state: &BeaconState,
+    attestation: &electra::Attestation,
+    indexed_attestation: &electra::IndexedAttestation,
+    committees: &CommitteeCache,
+) -> Option<SignatureSet> {
+    attestation_signature_set(
+        state,
+        &indexed_attestation.data,
+        &indexed_attestation.signature,
+        &indexed_attestation.attesting_indices,
+        &attestation.committee_bits,
+        |bit| attestation.aggregation_bits.get(bit).unwrap_or(false),
+        committees,
+    )
 }
 
 /// The committee members whose bit is set in `attestation`, in ascending

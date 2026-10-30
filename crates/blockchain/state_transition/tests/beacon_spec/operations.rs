@@ -173,11 +173,11 @@ fn apply(
     case: &Case,
     state: &mut BeaconState,
     config: &Config,
+    committees: &CommitteeCache,
 ) -> Result<(), String> {
-    // Only the `attestation` handler reads this. Bound up here so each of its
-    // calls fits on one line; a case processes a single attestation, so there
-    // is nothing for the cache to share between calls.
-    let committees = CommitteeCache::default();
+    // `committees` is only read by the `attestation` handler. The caller owns
+    // it so that an electra-or-later attestation can be run once with a cold
+    // cache and once with a warmed one; see [`trials`].
     let active_balances = ActiveBalanceCache::default();
     // Every signature an operation defers lands here and is checked once the
     // operation has run, which is how a block's own driver treats them: a
@@ -283,7 +283,7 @@ fn apply(
                     state,
                     &attestation,
                     config,
-                    &committees,
+                    committees,
                     &mut signatures,
                 )
             }
@@ -295,7 +295,7 @@ fn apply(
                 altair_stf::process_attestation(
                     state,
                     &attestation,
-                    &committees,
+                    committees,
                     &active_balances,
                     &mut signatures,
                 )
@@ -307,7 +307,7 @@ fn apply(
                 deneb_stf::process_attestation(
                     state,
                     &attestation,
-                    &committees,
+                    committees,
                     &active_balances,
                     &mut signatures,
                 )
@@ -320,7 +320,7 @@ fn apply(
                 electra_stf::process_attestation(
                     state,
                     &attestation,
-                    &committees,
+                    committees,
                     &active_balances,
                     &mut signatures,
                 )
@@ -338,7 +338,7 @@ fn apply(
                     state,
                     &attestation,
                     meta.parent_slot,
-                    &committees,
+                    committees,
                     &active_balances,
                     &mut signatures,
                 )
@@ -696,7 +696,26 @@ pub fn trials() -> Vec<Trial> {
                 .map_err(|err| format!("the fixture's pre-state does not decode: {err:?}"))?;
 
             let config = super::case_config(case);
-            let outcome = apply(&handler, case, &mut state, &config);
+            // An electra-or-later attestation picks its aggregate key from the
+            // shuffling's committee key sums when they are warm, and a fresh
+            // cache is never warm, so the case runs a second time on a copy
+            // of the pre-state with the sums built. Both runs must agree.
+            let warm_run = (handler == "attestation" && case.fork >= ForkName::Electra)
+                .then(|| state.clone());
+
+            let outcome = apply(&handler, case, &mut state, &config, &CommitteeCache::default());
+            if let Some(mut warm_state) = warm_run {
+                let committees = CommitteeCache::default();
+                super::warm_key_sums_around(&committees, &warm_state);
+                let warm = apply(&handler, case, &mut warm_state, &config, &committees);
+                if warm != outcome {
+                    return Err(format!(
+                        "the warm-sums run answered {warm:?} where the cold run answered {outcome:?}"
+                    ));
+                }
+                super::check_transition(case, warm, &warm_state)
+                    .map_err(|err| format!("warm sums: {err}"))?;
+            }
             super::check_transition(case, outcome, &state)
         }));
     }

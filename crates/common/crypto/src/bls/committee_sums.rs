@@ -131,8 +131,8 @@ impl std::fmt::Debug for CommitteeKeySums {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::DST;
+    use super::*;
     use blst::min_pk::SecretKey;
 
     fn secret(seed: u64) -> SecretKey {
