@@ -824,8 +824,9 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   payload via the execution-chain walk; an engine error keeps the envelope and
   retries once a slot, probing with the oldest), and a gloas head sends
   `engine_forkchoiceUpdatedV4` with the custody columns (head hash by the head
-  node's FULL or EMPTY status, finalized and safe from the checkpoint blocks'
-  `bid.parent_block_hash`, safe being a fallback for fast confirmation). Building
+  node's FULL or EMPTY status, finalized from the finalized block's and safe
+  from the Fast Confirmation Rule's confirmed block's `bid.parent_block_hash`).
+  Building
   a gloas payload for `produceBlockV4` uses `PayloadAttributesV4` (V3's fields
   plus `slot_number` and `target_gas_limit`, the parent bid's gas limit) through
   `forkchoice_updated_v4_with_attributes` and `get_payload_v6`
@@ -859,6 +860,12 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   [`docs/beacon_stf.md`](docs/beacon_stf.md) has the design and
   [`docs/spec_deviations.md`](docs/spec_deviations.md) the deliberate departures
   from the spec, in particular the fulu-to-gloas fork-choice boundary rule.
+- **Fast Confirmation Rule** (`beacon/fast_confirmation.rs`, consensus-specs
+  `master` @ `f993cf2`, not the pinned release): run once per slot by the beacon
+  actor's tick after the head recompute and before `forkchoiceUpdated`; its
+  confirmed root is the engine's safe hash and feeds the `fast_confirmation`
+  event. State lives in `Store` (`fast_confirmation`), per-run sums are shared
+  in a `RunContext`. See [`docs/beacon_stf.md`](docs/beacon_stf.md#fast-confirmation-rule).
 - Nothing is ignored for being unimplemented in the state transition or fork
   choice. Ignored cases are the `LightClient*` containers (a different layer,
   out of scope), `networking/gossip_*` cases outside what the node validates

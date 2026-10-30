@@ -549,6 +549,42 @@ balances in index order. The table grows to the highest voting index, which is
 why `set_latest_message` only takes indices from validated attestations (a
 debug assertion bounds it).
 
+## Fast Confirmation Rule
+
+`beacon::fast_confirmation` implements the Fast Confirmation Rule (FCR) of
+consensus-specs' `phase0`, `bellatrix` and `gloas` `fast-confirmation.md`, at
+**consensus-specs `master`, commit `f993cf2`** rather than the pinned
+`v1.7.0-beta.2`. The release ships no FCR fixtures, and `master` has fixes it
+lacks (the gloas empty-slot support discount, precise committee weight, the
+restart-resilient confirmed root, the `support_discount <= maximum_support`
+assertion). A later bump should diff those three files against that commit.
+
+- **Shape.** One Rust function per specification function, named as the
+  specification names it. `FastConfirmationStore` is the specification's own
+  store: a borrowed fork-choice `Store` plus the six variables. The variables
+  live in the `Store` between runs (`Store::fast_confirmation`, beside the rest
+  of the beacon fork-choice scratch); only `confirmed_root` is persisted.
+- **When it runs.** Once per slot, in the beacon actor's tick, after the clock
+  advance, the deferred aggregates and the head recompute (so past slots'
+  attestations are applied) and before `forkchoiceUpdated`, whose safe block it
+  decides. Not on imports, which recompute the head many times a slot. It is
+  skipped, and its variables reset to the finalized checkpoint, while the head
+  is more than 32 slots behind the wall clock (the `head` event's gate): the
+  rule assumes synchrony from the start of the previous slot.
+- **Outputs.** The `fast_confirmation` Beacon API event, after every run, and
+  the engine's safe block hash (`get_safe_execution_block_hash`).
+- **Cost.** One run is `O(V + M + B log B)`: a pass over each of at most three
+  balance sources' registries (`V` validators), one bottom-up fold of the latest
+  messages (`M`) into every block's attestation score, and a sort of the live
+  chain (`B` blocks), plus committee-range work that is a sum over cached slot
+  weights except for ranges that cross an epoch boundary without covering an
+  epoch. `lean_beacon_fast_confirmation_time_seconds` times a run.
+- **Restart.** The confirmed root is persisted when it changes, and the first
+  synced run of a process offers it to `get_restart_resilient_confirmed_root`.
+- **Tests.** No fixtures exist; the pyspec scenarios are ported as unit tests in
+  the module, on a store built directly (see the comment above them for what
+  they emulate and which scenarios are not ported).
+
 ## Macros and traits
 
 Two `macro_rules!` in the whole crate, both local, both replacing boilerplate that
