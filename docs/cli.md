@@ -8,7 +8,7 @@
 | `ethlambda beacon <flags>` | The Ethereum Beacon Chain, as a gossip follower |
 | `ethlambda <flags>` | `node`: the subcommand is injected |
 
-Three subcommands follow no chain. `ethlambda replay-era` replays real chain
+Four subcommands follow no chain. `ethlambda replay-era` replays real chain
 history from `.era` files and checks it against the states stored in them; see
 [`era_replay.md`](./era_replay.md) for its flags and checks. `ethlambda benchmark` is the offline
 benchmarking harness, covering block building (`benchmark synthetic`, run
@@ -18,7 +18,9 @@ what each workload measures; `benchmark import`'s flags are in
 [their own section](#benchmark-import-flags) below. `ethlambda validator` is
 the validator client: a separate process that holds keys and performs duties
 against a beacon node over the standard REST API, documented in
-[its own section](#validator-flags) below.
+[its own section](#validator-flags) below. `ethlambda slashing-protection`
+moves that client's EIP-3076 history in and out of its directory, offline; see
+[its section](#slashing-protection) below.
 
 ## `node` is the default
 

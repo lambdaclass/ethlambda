@@ -240,7 +240,7 @@ cargo build --release
 ```
 
 [`docs/cli.md`](./docs/cli.md) is the full flag reference for every sub-command,
-`benchmark` and `replay-era` included. The
+`benchmark`, `replay-era` and `slashing-protection` included. The
 [quickstart](#beacon-chain-follower) runs a release binary with the same arguments.
 
 #### `ethlambda node` — the Lean consensus chain
