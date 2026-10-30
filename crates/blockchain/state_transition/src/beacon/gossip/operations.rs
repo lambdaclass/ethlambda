@@ -16,8 +16,9 @@
 //! advanced: an operation has no block of its own to name one, and the
 //! specification checks it against the head without a slot transition. The
 //! rules do not run `process_*`, so they also do not apply a block's own
-//! extra conditions (an exit's pending balance, say); block packing filters
-//! those.
+//! extra conditions; block packing filters those. Electra's modified
+//! `validate_voluntary_exit_gossip` is the exception: it ignores an exit while
+//! the validator has a pending partial withdrawal (consensus-specs #5764).
 
 use std::collections::HashSet;
 
@@ -38,7 +39,9 @@ use crate::beacon::containers::BeaconState;
 use crate::beacon::fork_choice::Store;
 use crate::beacon::hash::hash;
 use crate::beacon::helpers::accessors::{get_current_epoch, get_domain};
-use crate::beacon::helpers::electra::is_valid_indexed_attestation;
+use crate::beacon::helpers::electra::{
+    get_pending_balance_to_withdraw, is_valid_indexed_attestation,
+};
 use crate::beacon::helpers::misc::{compute_domain, compute_epoch_at_slot, compute_signing_root};
 use crate::beacon::helpers::predicates::{
     is_active_validator, is_slashable_attestation_data, is_slashable_validator,
@@ -239,6 +242,13 @@ fn voluntary_exit(state: &BeaconState, signed: &SignedVoluntaryExit, config: &Co
                 .saturating_add(config.shard_committee_period)
     {
         return Err(Outcome::Reject(RejectReason::InvalidOperation));
+    }
+    // [New in Electra:EIP7251] [IGNORE] The validator has no pending partial
+    // withdrawals (consensus-specs #5764).
+    let pending_balance = get_pending_balance_to_withdraw(state, exit.validator_index)
+        .map_err(|_| Outcome::Ignore(IgnoreReason::StateUnavailable))?;
+    if pending_balance != 0 {
+        return Err(Outcome::Ignore(IgnoreReason::PendingPartialWithdrawals));
     }
     // [Modified in Deneb:EIP7044] [REJECT] The signature, under the capella
     // fork version so exits stay valid across forks.
@@ -508,11 +518,39 @@ mod tests {
 
     #[test]
     fn a_validly_signed_exit_is_accepted() {
+        assert_eq!(check_signed_exit(None), Outcome::Accept);
+    }
+
+    #[test]
+    fn an_exit_with_a_pending_partial_withdrawal_is_ignored() {
+        // Validator 2 still waits on a partial withdrawal.
+        assert_eq!(
+            check_signed_exit(Some(2)),
+            Outcome::Ignore(IgnoreReason::PendingPartialWithdrawals)
+        );
+    }
+
+    #[test]
+    fn another_validators_pending_partial_withdrawal_does_not_block_an_exit() {
+        assert_eq!(check_signed_exit(Some(3)), Outcome::Accept);
+    }
+
+    // Validator 2's signed exit, against a head past its shard committee period.
+    // `withdrawing` names a validator with a pending partial withdrawal.
+    fn check_signed_exit(withdrawing: Option<ValidatorIndex>) -> Outcome {
         let mut state = fulu_parent(0);
         // Past `SHARD_COMMITTEE_PERIOD` epochs since activation.
         let config = crate::beacon::config::Config::mainnet();
         *state.slot_mut() =
             (config.shard_committee_period + 1) * crate::beacon::preset::SLOTS_PER_EPOCH;
+        if let (Some(validator_index), BeaconState::Fulu(inner)) = (withdrawing, &mut state) {
+            let withdrawal = electra::PendingPartialWithdrawal {
+                validator_index,
+                amount: 1,
+                withdrawable_epoch: 0,
+            };
+            inner.pending_partial_withdrawals.push(withdrawal).unwrap();
+        }
         let message = shared::VoluntaryExit {
             epoch: 0,
             validator_index: 2,
@@ -530,6 +568,6 @@ mod tests {
             message,
             signature: sign_for(2, signing_root),
         });
-        assert_eq!(stateful_checks(&store, &exit), Outcome::Accept);
+        stateful_checks(&store, &exit)
     }
 }
