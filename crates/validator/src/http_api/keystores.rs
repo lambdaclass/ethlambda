@@ -11,7 +11,9 @@
 //!   are saved, together with their registration and before any is loaded, so
 //!   a key never starts signing ahead of its history and a key that failed to
 //!   import leaves none behind. A key with no history at all is registered as
-//!   of the current slot and epoch, with a warning.
+//!   of the current slot and epoch, with a warning. The history may also name
+//!   validators that are not in the request: they get records too, and a
+//!   later `DELETE` of one answers `not_active`.
 //! - `DELETE` returns the deleted keys' records as a minimal interchange,
 //!   taken after the keys are out of the store, so it covers every signature
 //!   this process made with them. A key that is gone but still has a record is

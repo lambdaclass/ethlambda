@@ -349,8 +349,8 @@ the standard Beacon API, so it works against `ethlambda beacon` (run with the
 > even then it rules out a double vote, not a surround of an older vote, which
 > only the key's own history can.
 > A key moving from another client brings its history with
-> `ethlambda slashing-protection import` (or the keymanager API), and never runs
-> in two clients at once. See
+> `ethlambda slashing-protection import`, or in the same keymanager API request
+> that imports the key, and never runs in two clients at once. See
 > [Spec deviations](./docs/spec_deviations.md#the-validator-client-keeps-eip-3076s-minimal-watermarks-not-full-history).
 
 ```sh
