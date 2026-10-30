@@ -39,6 +39,7 @@ use crate::beacon::helpers::predicates::{
 use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{Epoch, Gwei, HashTreeRoot as _, ValidatorIndex};
+use crate::metrics::{StfPhase, try_for_each_timed};
 
 /// Runs every operation in a block, in the specification's order.
 ///
@@ -117,13 +118,17 @@ pub fn process_operations(
         "len(body.deposits) == min(MAX_DEPOSITS, eth1_data.deposit_count - eth1_deposit_index)",
     )?;
 
-    for proposer_slashing in proposer_slashings {
-        process_proposer_slashing(state, proposer_slashing, config)?;
-    }
-    for attester_slashing in attester_slashings {
-        process_attester_slashing(state, attester_slashing, config)?;
-    }
-    for attestation in attestations {
+    try_for_each_timed(
+        StfPhase::ProposerSlashings,
+        proposer_slashings,
+        |slashing| process_proposer_slashing(state, slashing, config),
+    )?;
+    try_for_each_timed(
+        StfPhase::AttesterSlashings,
+        attester_slashings,
+        |slashing| process_attester_slashing(state, slashing, config),
+    )?;
+    try_for_each_timed(StfPhase::Attestations, attestations, |attestation| {
         // Phase0 defers an attestation's reward to the epoch boundary, so it
         // needs its own version of this step; altair scores one the moment
         // it is processed instead, and nothing about that changed through
@@ -139,17 +144,17 @@ pub fn process_operations(
                 attestation,
                 committees,
                 active_balances,
-            )?;
+            )
         } else {
-            process_attestation(state, attestation, config, committees)?;
+            process_attestation(state, attestation, config, committees)
         }
-    }
-    for deposit in deposits {
-        process_deposit(state, deposit, config)?;
-    }
-    for voluntary_exit in voluntary_exits {
-        process_voluntary_exit(state, voluntary_exit, config)?;
-    }
+    })?;
+    try_for_each_timed(StfPhase::Deposits, deposits, |deposit| {
+        process_deposit(state, deposit, config)
+    })?;
+    try_for_each_timed(StfPhase::VoluntaryExits, voluntary_exits, |exit| {
+        process_voluntary_exit(state, exit, config)
+    })?;
 
     Ok(())
 }
