@@ -46,10 +46,7 @@ use super::{ExecutionEngine, bellatrix, capella, deneb, electra, fulu, gloas};
 ///
 /// Means what it always did, that the block is valid: it builds the
 /// [`SignatureBatch`] the drivers push into and checks it before returning
-/// `Ok`, so a caller that has nothing to add to the batch (block production
-/// re-running its own block) needs no knowledge of it. A caller with a
-/// signature of its own to check alongside, such as the proposer's, calls
-/// [`process_block_with_signatures`] and verifies the batch itself.
+/// `Ok`, so a caller needs no knowledge of it.
 ///
 /// An `Err` leaves `state` partly mutated, as it always could: an operation
 /// whose signature is deferred has already written when a bad signature is
@@ -63,29 +60,24 @@ pub fn process_block(
     active_balances: &ActiveBalanceCache,
     options: BlockProcessingOptions,
 ) -> Result<()> {
-    let mut signatures = SignatureBatch::new();
-    process_block_with_signatures(
-        state,
-        signed_block,
-        config,
-        engine,
-        committees,
-        active_balances,
-        options,
-        &mut signatures,
-    )?;
-    signatures.verify()
+    SignatureBatch::deferred(|signatures| {
+        process_block_with_signatures(
+            state,
+            signed_block,
+            config,
+            engine,
+            committees,
+            active_balances,
+            options,
+            signatures,
+        )
+    })
 }
 
-/// [`process_block`] without the final signature check: every signature the
-/// block's processing needs is pushed into `signatures`, and the caller
-/// verifies them.
-///
-/// For [`super::apply_block`], which adds the proposer's block signature to the
-/// same batch so the whole block costs one pairing check. The block is only
-/// valid once `signatures.verify()` has returned `Ok`.
+/// [`process_block`]'s dispatch: every signature the block's processing needs
+/// is pushed into `signatures`, which [`process_block`] then verifies.
 #[allow(clippy::too_many_arguments)]
-pub fn process_block_with_signatures(
+fn process_block_with_signatures(
     state: &mut BeaconState,
     signed_block: &containers::SignedBeaconBlock,
     config: &Config,
@@ -530,7 +522,7 @@ mod tests {
     fn skipping_randao_verification_pushes_nothing() {
         let mut state = crate::beacon::helpers::test_state::with_validators(8);
         let reveal = BlsSignature(bls::G2_POINT_AT_INFINITY);
-        let mut signatures = SignatureBatch::immediate();
+        let mut signatures = SignatureBatch::new();
 
         process_randao(
             &mut state,
@@ -539,7 +531,7 @@ mod tests {
             &mut signatures,
         )
         .unwrap();
-        signatures.verify().unwrap();
+        assert!(signatures.is_empty());
     }
 
     #[test]
