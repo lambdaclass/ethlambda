@@ -1293,3 +1293,87 @@ async fn the_infinity_reveal_is_produced_only_when_the_flag_skips_its_verificati
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
     assert_eq!(reply.json()["message"], "invalid randao_reveal");
 }
+
+// ---------------------------------------------------------------------------
+// Event stream: what the POST endpoints accept is announced
+// ---------------------------------------------------------------------------
+
+/// The events a router layered with the bus published, in order, as
+/// `{topic, body}`.
+fn drained(
+    rx: &mut tokio::sync::broadcast::Receiver<ethlambda_blockchain::ChainEvent>,
+) -> Vec<serde_json::Value> {
+    std::iter::from_fn(|| rx.try_recv().ok())
+        .map(|event| {
+            serde_json::json!({
+                "topic": event.topic().as_str(),
+                "body": serde_json::to_value(&event).unwrap(),
+            })
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn an_accepted_bid_is_announced_once_in_its_version_wrapper() {
+    let events = ethlambda_blockchain::EventBus::new(8);
+    let mut rx = events.subscribe();
+    let world = world_ready_for_bids();
+    let app = world.app(None).layer(Extension(events));
+    let bid = world.bid(5, address(0xaa));
+
+    let reply = send(&app, bid_request(&bid)).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    // The identical bid again is answered without a publish, and so without
+    // an event.
+    let reply = send(&app, bid_request(&bid)).await;
+    assert_eq!(reply.status, StatusCode::OK);
+
+    let emitted = drained(&mut rx);
+    assert_eq!(emitted.len(), 1, "{emitted:?}");
+    assert_eq!(emitted[0]["topic"], "execution_payload_bid");
+    assert_eq!(emitted[0]["body"]["version"], "gloas");
+    assert_eq!(
+        emitted[0]["body"]["data"],
+        serde_json::to_value(&bid).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn a_refused_bid_is_not_announced() {
+    let events = ethlambda_blockchain::EventBus::new(8);
+    let mut rx = events.subscribe();
+    let world = world_ready_for_bids();
+    let app = world.app(None).layer(Extension(events));
+    let mut bid = world.bid(5, address(0xaa));
+    bid.signature = BlsSignature::default();
+
+    let reply = send(&app, bid_request(&bid)).await;
+
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert!(drained(&mut rx).is_empty());
+}
+
+#[tokio::test]
+async fn accepted_preferences_are_announced() {
+    let events = ethlambda_blockchain::EventBus::new(8);
+    let mut rx = events.subscribe();
+    let world = World::new();
+    let app = world.app(None).layer(Extension(events));
+    let signed = world.preferences(address(0xaa), 30_000_000);
+
+    let reply = send(
+        &app,
+        preferences_request(std::slice::from_ref(&signed), Some("gloas")),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+
+    let emitted = drained(&mut rx);
+    assert_eq!(emitted.len(), 1, "{emitted:?}");
+    assert_eq!(emitted[0]["topic"], "proposer_preferences");
+    assert_eq!(emitted[0]["body"]["version"], "gloas");
+    assert_eq!(
+        emitted[0]["body"]["data"],
+        serde_json::to_value(&signed).unwrap()
+    );
+}

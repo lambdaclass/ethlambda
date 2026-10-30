@@ -157,6 +157,23 @@ impl BodyEncoding {
 
 /// Decode the array a batch-submission endpoint takes, as JSON or as the SSZ
 /// `List[T, ...]` of the same elements, by the request's `Content-Type`.
+/// Report an object the API accepted on the event stream, when the node has an
+/// [`EventBus`](ethlambda_blockchain::EventBus) and anyone listens.
+///
+/// `event` builds the payload only behind that check, since a bid or an
+/// envelope's fields are cloned into it. The bus is an `Option<Extension<_>>`
+/// on the handlers that call this, so a router built without one (the
+/// handlers' own tests) still serves.
+pub(crate) fn emit_accepted(
+    events: Option<&ethlambda_blockchain::EventBus>,
+    event: impl FnOnce() -> ethlambda_network_api::GossipEvent,
+) {
+    use ethlambda_network_api::GossipEventSink;
+    if let Some(events) = events.filter(|events| events.has_subscribers()) {
+        GossipEventSink::emit(events, event());
+    }
+}
+
 pub(crate) fn decode_list<T>(
     headers: &axum::http::HeaderMap,
     body: &[u8],

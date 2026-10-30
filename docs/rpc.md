@@ -872,20 +872,40 @@ these are ever sent:
 
 | Event | Payload | Emitted when |
 |-------|---------|--------------|
-| `head` | `{"slot":"10", "block":"0x…", "state":"0x…", "epoch_transition":false, "previous_duty_dependent_root":"0x…", "current_duty_dependent_root":"0x…", "execution_optimistic":false}` | The head changed, and is within 32 slots of the wall clock |
-| `block` | `{"slot":"10", "block":"0x…", "execution_optimistic":false}` | A block is imported |
+| `head` | `{"slot":"10", "block":"0x…", "state":"0x…", "epoch_transition":false, "previous_duty_dependent_root":"0x…", "current_duty_dependent_root":"0x…", "execution_optimistic":false}` | The head changed, and is within 32 slots of the wall clock. Deprecated by the specification in favour of `head_v2`, and still emitted |
+| `head_v2` | `{"version":"gloas", "data":{"slot":"10", "block":"0x…", "state":"0x…", "payload_status":"full", "epoch_transition":false, "current_epoch_dependent_root":"0x…", "next_epoch_dependent_root":"0x…", "execution_optimistic":false}}` | Right after every `head` (before gloas too, with `payload_status` `full`), and a second time for the same block when its payload status goes from empty to full. `version` is the head state's fork |
+| `block` | `{"slot":"10", "block":"0x…", "execution_optimistic":false}`; from gloas on also `"builder_index":"42", "block_hash":"0x…"` (the block's bid's), absent before | A block is imported |
 | `block_gossip` | `{"slot":"10", "block":"0x…"}` | A block passed gossip validation, or was published through `POST /eth/v2/beacon/blocks` |
 | `finalized_checkpoint` | `{"block":"0x…", "state":"0x…", "epoch":"2", "execution_optimistic":false}` | The finalized checkpoint advanced |
 | `chain_reorg` | `{"slot":"200", "depth":"50", "old_head_block":"0x…", "new_head_block":"0x…", "old_head_state":"0x…", "new_head_state":"0x…", "epoch":"2", "execution_optimistic":false}` | The new head does not descend from the previous one |
 | `attestation` | the aggregate's `Attestation` | An aggregate passed the `beacon_aggregate_and_proof` rules: accepted from gossip, or submitted through `POST /eth/v2/validator/aggregate_and_proofs` |
 | `data_column_sidecar` | `{"block_root":"0x…", "index":"1", "slot":"1"}` | A column this node custodies is stored, from any source |
+| `execution_payload` | `{"slot":"10", "builder_index":"42", "block_hash":"0x…", "block_root":"0x…", "execution_optimistic":false}` | The chain actor imported a gloas envelope (from gossip, req/resp or `POST /eth/v1/beacon/execution_payload_envelopes`) |
+| `execution_payload_gossip` | `{"slot":"10", "builder_index":"42", "block_hash":"0x…", "block_root":"0x…"}` | An envelope passed the `execution_payload` gossip rules, or was accepted by `POST /eth/v1/beacon/execution_payload_envelopes` |
+| `execution_payload_available` | `{"slot":"10", "block_root":"0x…"}` | Right after `execution_payload` (see below) |
+| `execution_payload_bid` | `{"version":"gloas", "data":<SignedExecutionPayloadBid>}` | A bid passed the `execution_payload_bid` gossip rules, or was accepted by `POST /eth/v1/beacon/execution_payload_bids` |
+| `payload_attestation_message` | `{"version":"gloas", "data":<PayloadAttestationMessage>}` | A message passed the `payload_attestation_message` gossip rules, or was accepted by `POST /eth/v1/beacon/pool/payload_attestations` |
+| `proposer_preferences` | `{"version":"gloas", "data":<SignedProposerPreferences>}` | Preferences passed the `proposer_preferences` gossip rules, or were accepted by `POST /eth/v1/validator/proposer_preferences` |
 
 Never emitted: `single_attestation` (subnet votes are verified and relayed but
 never reach the chain actor), the operation topics (`voluntary_exit`,
 `proposer_slashing`, `attester_slashing`, `bls_to_execution_change`,
 `contribution_and_proof`: no operation pools), `payload_attributes`, the light
-client topics, `blob_sidecar`, and `head_v2` with every other gloas topic (this
-build stops at fulu).
+client topics, `blob_sidecar`, and `fast_confirmation` (no producer).
+
+The gloas topics are emitted by whichever part of the node accepted the object,
+since several never reach the chain actor: the actor publishes `execution_payload`
+and `execution_payload_available`; p2p publishes the gossip-accepted
+`execution_payload_gossip`, `execution_payload_bid`,
+`payload_attestation_message` and `proposer_preferences`; and the API handlers
+publish what a validator client or builder submits.
+
+**`execution_payload_available` is not a separate moment.** The specification
+asks for it when the payload and its blobs are verified available. The chain
+actor imports an envelope only once both hold (the payload verified, and every
+sampled column of a bid with commitments stored), so `execution_payload` and
+`execution_payload_available` are emitted back to back from the same import,
+`execution_payload` first.
 
 How head and finality events behave:
 
@@ -900,7 +920,7 @@ How head and finality events behave:
 - **Stale heads are not reported.** A head more than 32 slots behind the wall
   clock (catch-up) sends no `head`; `block` events still show progress.
   `chain_reorg` and `finalized_checkpoint` are not gated.
-- **Order:** each `block` as it imports, then `chain_reorg`, `head`,
+- **Order:** each `block` as it imports, then `chain_reorg`, `head`, `head_v2`,
   `finalized_checkpoint`.
 - `epoch_transition` is whether the head's epoch is later than the previous
   head's. The dependent roots follow the specification, with the genesis block
