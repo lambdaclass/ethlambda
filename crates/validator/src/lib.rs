@@ -43,6 +43,7 @@ pub mod payload_attestation;
 pub mod proposal;
 pub mod proposal_guard;
 pub mod proposer_settings;
+pub mod registration;
 pub(crate) mod secure_fs;
 pub mod signing;
 pub mod slot_clock;
@@ -61,15 +62,16 @@ use tracing::{error, info, warn};
 
 use crate::aggregation::AggregationService;
 use crate::attestation::AttestationService;
-use crate::beacon_node::BeaconNodeApi;
 use crate::beacon_node::dto::ProposerPreparationDto;
 use crate::beacon_node::fallback::FallbackBeaconNode;
 use crate::beacon_node::http::HttpBeaconNode;
+use crate::beacon_node::{BeaconNodeApi, Published};
 use crate::duties::DutiesService;
 use crate::keys::ValidatorStore;
 use crate::payload_attestation::PayloadAttestationService;
 use crate::proposal::ProposalService;
 use crate::proposer_settings::ProposerSettings;
+use crate::registration::RegistrationService;
 use crate::signing::SigningContext;
 use crate::slot_clock::SlotClock;
 use crate::sync_committee::SyncCommitteeService;
@@ -95,6 +97,18 @@ pub struct ValidatorConfig {
     /// Bind address for the keymanager API. `None` when `--enable-keymanager`
     /// was not passed, in which case it is never spawned.
     pub keymanager: Option<std::net::SocketAddr>,
+    /// Builder proposals, or `None` when `--builder-proposals` is off.
+    pub builder: Option<BuilderProposals>,
+}
+
+/// Builder proposals: register each validator with the beacon node's builder
+/// and accept a blinded block when the builder's bid wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuilderProposals {
+    /// The `builder_boost_factor` sent with every pre-gloas block request:
+    /// 100 compares the bid and the local payload as they are; `u64::MAX`
+    /// takes the builder whenever there is a bid.
+    pub boost_factor: u64,
 }
 
 /// Run the validator client until the process is stopped.
@@ -202,7 +216,24 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     let aggregation = AggregationService::new(beacon_node.clone(), context.clone());
     let payload_attestation = PayloadAttestationService::new(beacon_node.clone(), context.clone());
     let sync_committee = SyncCommitteeService::new(beacon_node.clone(), context.clone());
-    let proposal = ProposalService::new(beacon_node.clone(), context.clone(), settings.clone());
+    let proposal = ProposalService::new(
+        beacon_node.clone(),
+        context.clone(),
+        settings.clone(),
+        config.builder.map(|builder| builder.boost_factor),
+    )
+    .with_clock(clock.clone());
+    let registration = config.builder.map(|builder| {
+        info!(
+            boost_factor = builder.boost_factor,
+            "Builder proposals on: registering validators and accepting blinded blocks"
+        );
+        Arc::new(RegistrationService::new(
+            beacon_node.clone(),
+            context.clone(),
+            settings.clone(),
+        ))
+    });
 
     if let Some(address) = config.keymanager {
         let token = http_api::load_or_create_token(&config.validators_dir)?;
@@ -276,7 +307,19 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                 &context,
             );
             match refreshed.await {
-                Ok(()) => last_epoch = Some(epoch),
+                Ok(resolved) => {
+                    last_epoch = Some(epoch);
+                    // Only after a refresh that got all the way through, so a
+                    // failing one does not respawn a full send every slot, and
+                    // spawned so a slow or hung node never delays this epoch's
+                    // duties: a missed registration costs at most a builder
+                    // block, never a duty.
+                    if let Some(registration) = &registration {
+                        let registration = registration.clone();
+                        let store = store.clone();
+                        tokio::spawn(registration.register_all(epoch, resolved, store));
+                    }
+                }
                 // A beacon node that is down, syncing or answering badly will
                 // likely answer next epoch, so keep the schedule already held
                 // and try again. Anything else will not fix itself, and looping
@@ -331,6 +374,13 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             &store,
         )
         .await;
+
+        // Off the slot loop, like the epoch's full send: a keymanager change
+        // to a fee recipient or gas limit reaches the builder within a slot,
+        // and a slow node cannot delay the next slot's duties.
+        if let Some(registration) = &registration {
+            tokio::spawn(registration.clone().register_changed(epoch, store.clone()));
+        }
     }
 }
 
@@ -626,7 +676,7 @@ async fn aggregate<B: BeaconNodeApi>(
 /// Failures are logged and counted rather than propagated. A proposal is one
 /// slot's work; losing it must not stop the client attesting for the rest of
 /// the epoch.
-async fn propose<B: BeaconNodeApi>(
+async fn propose<B: BeaconNodeApi + 'static>(
     proposal: &ProposalService<B>,
     clock: &SlotClock,
     slot: u64,
@@ -636,15 +686,36 @@ async fn propose<B: BeaconNodeApi>(
     let budget = clock.until_attestation(slot, SystemTime::now());
     let attempt = tokio::time::timeout(budget, proposal.propose(slot, duty, store));
     match attempt.await {
+        // Already logged at error and counted on its own series; the block
+        // may well be out, so it is neither a published-in-time delay nor a
+        // failure.
+        Ok(Ok(Published::BuilderUnconfirmed)) => {}
+        // A blinded publish observes its own delay, on the task that ran it.
+        Ok(Ok(_)) if proposal.signed_blinded_at(slot) => {}
         Ok(Ok(_)) => {
             let elapsed = SystemTime::now()
                 .duration_since(clock.start_of(slot))
                 .unwrap_or_default();
             metrics::observe_block_publication_delay(elapsed.as_secs_f64());
         }
+        // Once a blinded block is signed, only its publish task reports an
+        // error (and counts the failure), so it is not counted twice here.
+        Ok(Err(_)) if proposal.signed_blinded_at(slot) => {}
         Ok(Err(err)) => {
             error!(%slot, validator = duty.validator_index, %err, "Failed to propose this slot's block");
             metrics::inc_block_proposal_failures();
+        }
+        // A blinded block is signed, and its publish runs on its own task: the
+        // beacon node waits up to 5 s for the relay, which can outlast this
+        // budget. That is not a missed proposal, and the task counts the real
+        // outcome.
+        Err(_) if proposal.signed_blinded_at(slot) => {
+            info!(
+                %slot,
+                validator = duty.validator_index,
+                budget_ms = budget.as_millis() as u64,
+                "Blinded block signed; its publish outlived the proposal budget and continues"
+            );
         }
         Err(_) => {
             warn!(
@@ -660,6 +731,9 @@ async fn propose<B: BeaconNodeApi>(
 
 /// Resolve any newly activated validators, refresh the duty schedule, and
 /// re-send subnet subscriptions if it moved.
+///
+/// Returns the pubkeys the beacon node resolved to an index, which is who a
+/// builder registration is signed for: the node drops the rest anyway.
 async fn refresh_epoch<B: BeaconNodeApi>(
     beacon_node: &Arc<B>,
     duties: &mut DutiesService<B>,
@@ -668,12 +742,12 @@ async fn refresh_epoch<B: BeaconNodeApi>(
     settings: &ProposerSettings,
     store: &RwLock<ValidatorStore>,
     context: &SigningContext,
-) -> Result<()> {
+) -> Result<Vec<BlsPubkey>> {
     // Nothing to resolve, nothing to schedule, nothing to register. Returning
     // here also keeps an empty pubkey list away from `validator_indices`, whose
     // endpoint reads one as "every validator on the chain".
     if pubkeys.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     if beacon_node.is_optimistic_or_syncing().await? {
@@ -744,7 +818,7 @@ async fn refresh_epoch<B: BeaconNodeApi>(
         subscriptions::subscribe(beacon_node, &duties.all(), store, context).await?;
     }
     metrics::set_beacon_node_available(true);
-    Ok(())
+    Ok(entries.iter().map(|entry| entry.pubkey).collect())
 }
 
 /// Fetch the payload timeliness committee schedule for this epoch and the next,

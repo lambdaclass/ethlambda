@@ -22,6 +22,7 @@
 //! signing reports as a mismatch.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{PoisonError, RwLock};
 
 use ethlambda_types::beacon::primitives::{BlsPubkey, Bytes32, ExecutionAddress, H256};
@@ -59,9 +60,9 @@ pub fn graffiti_to_text(graffiti: &Bytes32) -> String {
 
 /// The gas limit a validator with no override reports.
 ///
-/// Lighthouse's and Nimbus's default. Nothing in this client uses it yet: it
-/// matters only to builder registrations, and there is no builder flow. It is
-/// held so the keymanager API can serve it as the specification requires.
+/// Lighthouse's and Nimbus's default. Builder registrations carry it as the
+/// gas limit the builder should target, and the keymanager API serves it as the
+/// specification requires.
 pub const DEFAULT_GAS_LIMIT: u64 = 60_000_000;
 
 /// One validator's overrides; `None` means the default applies.
@@ -98,6 +99,10 @@ struct Inner {
 #[derive(Debug)]
 pub struct ProposerSettings {
     inner: RwLock<Inner>,
+    /// Bumped on every override write or delete, so a reader that caches
+    /// something derived from the settings (the builder registrations) can
+    /// tell that nothing changed without reading every key.
+    generation: AtomicU64,
 }
 
 impl ProposerSettings {
@@ -111,7 +116,14 @@ impl ProposerSettings {
                 default_gas_limit: DEFAULT_GAS_LIMIT,
                 overrides: HashMap::new(),
             }),
+            generation: AtomicU64::new(0),
         }
+    }
+
+    /// A counter that moves whenever any override is written, cleared or
+    /// forgotten. Equal readings mean no per-key setting changed between them.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     fn read<T>(&self, f: impl FnOnce(&Inner) -> T) -> T {
@@ -127,6 +139,9 @@ impl ProposerSettings {
         if entry.is_empty() {
             inner.overrides.remove(pubkey);
         }
+        // Inside the write lock, so a reader that sees the new generation also
+        // sees the new value.
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
     /// Where `pubkey`'s execution-layer rewards should go, or `None` when
@@ -183,6 +198,7 @@ impl ProposerSettings {
     pub fn forget(&self, pubkey: &BlsPubkey) {
         let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         inner.overrides.remove(pubkey);
+        self.generation.fetch_add(1, Ordering::Release);
     }
 }
 

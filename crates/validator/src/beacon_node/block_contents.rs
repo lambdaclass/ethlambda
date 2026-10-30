@@ -21,7 +21,7 @@
 //!
 //! The endpoints support it: `Accept: application/octet-stream` on
 //! `produceBlockV3`, `Content-Type: application/octet-stream` on
-//! `publishBlockV2`.
+//! `publishBlockV2` and `publishBlindedBlockV2`.
 //!
 //! # `BlockContents` is not a consensus container
 //!
@@ -42,7 +42,19 @@
 //! | Fork | Produced | Published |
 //! |---|---|---|
 //! | Deneb, Electra, Fulu | `BlockContents` | `SignedBlockContents` |
+//! | Blinded (electra, fulu) | `BlindedBeaconBlock` | `SignedBlindedBeaconBlock` |
 //! | Gloas and later | `GloasBlockContents` (block and self-built envelope) or a bare block | bare signed block, then the envelope separately |
+//!
+//! # Blinded blocks
+//!
+//! When the beacon node's builder wins the slot, `produceBlockV3` answers with
+//! a [`BlindedBeaconBlock`] (`Eth-Execution-Payload-Blinded: true`): the block
+//! carries the payload's header, and the builder reveals the payload once this
+//! client has signed. No blobs travel with it, since the builder publishes
+//! them. Its root is the full block's, so signing and the proposal guard work
+//! as for any other block. Electra and fulu share one blinded container.
+//! Electra blinded blocks are for third-party beacon nodes: an ethlambda node
+//! serves blinded blocks for fulu only.
 //!
 //! # Gloas
 //!
@@ -85,6 +97,7 @@
 //! thirty-two blobs would fail to decode, in a client that had been correct for
 //! months.
 
+use ethlambda_types::beacon::builder::{BlindedBeaconBlock, SignedBlindedBeaconBlock};
 use ethlambda_types::beacon::containers::deneb::Blob;
 use ethlambda_types::beacon::containers::electra::{BeaconBlock, SignedBeaconBlock};
 use ethlambda_types::beacon::containers::gloas;
@@ -256,6 +269,10 @@ pub enum Contents {
         block: gloas::BeaconBlock,
         payload: Option<Box<GloasPayload>>,
     },
+    /// Electra or fulu, when a builder supplied the payload: the block carries
+    /// the payload's header, and the builder reveals the payload after this
+    /// client signs. No blobs travel with it; the builder publishes them.
+    Blinded { block: BlindedBeaconBlock },
 }
 
 impl ProducedBlock {
@@ -326,6 +343,45 @@ impl ProducedBlock {
         }
     }
 
+    /// Decode a blinded `produceBlockV3` body (`Eth-Execution-Payload-Blinded:
+    /// true`). Electra and fulu share one blinded container; every other fork is
+    /// refused, as [`Self::from_ssz`] refuses them.
+    pub fn from_blinded_ssz(fork: ForkName, bytes: &[u8]) -> crate::error::Result<Self> {
+        match fork {
+            ForkName::Electra | ForkName::Fulu => {
+                let block = BlindedBeaconBlock::from_ssz_bytes(bytes).map_err(|err| {
+                    Error::Decode(format!(
+                        "produced blinded block for fork {} did not decode: {err:?}",
+                        fork.as_str()
+                    ))
+                })?;
+                Ok(Self {
+                    fork,
+                    contents: Contents::Blinded { block },
+                })
+            }
+            // Named, as `from_ssz` names its arms, so a new fork forces a
+            // decision here instead of being refused by default.
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb
+            | ForkName::Gloas
+            | ForkName::Lean => Err(Error::InconsistentResponse(format!(
+                "beacon node produced a blinded block for fork {}; blinded blocks exist for \
+                 electra and fulu only",
+                fork.as_str()
+            ))),
+        }
+    }
+
+    /// Whether a builder supplied the payload, so the block is published to
+    /// `blinded_blocks` and its fee recipient is the builder's.
+    pub fn is_blinded(&self) -> bool {
+        matches!(self.contents, Contents::Blinded { .. })
+    }
+
     /// Decode a gloas `produceBlockV4` body. `payload_included` is the node's
     /// `Eth-Execution-Payload-Included`, which selects between
     /// [`GloasBlockContents`] and a bare block: SSZ carries no tag, so a wrong
@@ -365,6 +421,7 @@ impl ProducedBlock {
                 block.slot
             }
             Contents::Gloas { block, .. } => block.slot,
+            Contents::Blinded { block } => block.slot,
         }
     }
 
@@ -375,6 +432,7 @@ impl ProducedBlock {
                 block.proposer_index
             }
             Contents::Gloas { block, .. } => block.proposer_index,
+            Contents::Blinded { block } => block.proposer_index,
         }
     }
 
@@ -387,11 +445,13 @@ impl ProducedBlock {
                 block.hash_tree_root()
             }
             Contents::Gloas { block, .. } => block.hash_tree_root(),
+            Contents::Blinded { block } => block.hash_tree_root(),
         }
     }
 
     /// Where the block pays its execution-layer rewards: the payload's fee
-    /// recipient before gloas, the bid's from it on.
+    /// recipient before gloas, the bid's from it on. For a blinded block, the
+    /// header's, which is the builder's address rather than the validator's.
     pub fn fee_recipient(&self) -> ethlambda_types::beacon::primitives::ExecutionAddress {
         match &self.contents {
             Contents::WithBlobProofs { block, .. } | Contents::WithCellProofs { block, .. } => {
@@ -404,6 +464,7 @@ impl ProducedBlock {
                     .message
                     .fee_recipient
             }
+            Contents::Blinded { block } => block.body.execution_payload_header.fee_recipient,
         }
     }
 
@@ -441,10 +502,12 @@ impl ProducedBlock {
             Contents::Gloas { payload, .. } => {
                 payload.as_ref().map_or(0, |payload| payload.blobs.len())
             }
+            Contents::Blinded { block } => block.body.blob_kzg_commitments.len(),
         }
     }
 
-    /// Attach `signature` and encode the body `publishBlockV2` expects.
+    /// Attach `signature` and encode the body `publishBlockV2` expects, or
+    /// `publishBlindedBlockV2` for a blinded block.
     ///
     /// Consumes the block: the proofs and blobs are moved into the published
     /// body rather than copied, and a blob is 128 KiB, so a six-blob block
@@ -481,6 +544,11 @@ impl ProducedBlock {
             // this body, and are expected to have been taken out already by
             // `take_gloas_payload`.
             Contents::Gloas { block, .. } => gloas::SignedBeaconBlock {
+                message: block,
+                signature,
+            }
+            .to_ssz(),
+            Contents::Blinded { block } => SignedBlindedBeaconBlock {
                 message: block,
                 signature,
             }
@@ -767,6 +835,46 @@ mod tests {
         for fork in [ForkName::Capella, ForkName::Deneb] {
             let err =
                 ProducedBlock::from_ssz(fork, &contents_bytes(0, 0)).expect_err("must refuse");
+            assert!(
+                matches!(err, Error::InconsistentResponse(_)),
+                "{} gave {err:?}",
+                fork.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn a_blinded_block_decodes_and_keeps_the_full_blocks_root() {
+        let full = empty_block_for(5, 7);
+        let blinded = BlindedBeaconBlock::from(full.clone());
+
+        let produced =
+            ProducedBlock::from_blinded_ssz(ForkName::Fulu, &blinded.to_ssz()).expect("decodes");
+
+        assert!(produced.is_blinded());
+        assert_eq!(produced.slot(), 5);
+        assert_eq!(produced.proposer_index(), 7);
+        assert_eq!(produced.block_root(), full.hash_tree_root());
+        assert_eq!(produced.blob_count(), 0);
+    }
+
+    #[test]
+    fn a_signed_blinded_block_encodes_as_signed_blinded_beacon_block() {
+        let blinded = BlindedBeaconBlock::from(empty_block_for(5, 7));
+        let produced =
+            ProducedBlock::from_blinded_ssz(ForkName::Electra, &blinded.to_ssz()).expect("ok");
+
+        let signed = produced.into_signed_ssz(BlsSignature([6; 96]));
+        let decoded = SignedBlindedBeaconBlock::from_ssz_bytes(&signed).expect("decodes");
+        assert_eq!(decoded.message, blinded);
+        assert_eq!(decoded.signature, BlsSignature([6; 96]));
+    }
+
+    #[test]
+    fn a_blinded_block_for_gloas_or_deneb_is_refused() {
+        let bytes = BlindedBeaconBlock::from(empty_block_for(5, 7)).to_ssz();
+        for fork in [ForkName::Gloas, ForkName::Deneb] {
+            let err = ProducedBlock::from_blinded_ssz(fork, &bytes).expect_err("must refuse");
             assert!(
                 matches!(err, Error::InconsistentResponse(_)),
                 "{} gave {err:?}",

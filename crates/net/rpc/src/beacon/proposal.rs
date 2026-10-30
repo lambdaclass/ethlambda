@@ -1083,6 +1083,7 @@ pub(crate) fn decimal(value: &ethlambda_types::beacon::primitives::Uint256) -> S
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::*;
     use super::*;
     use crate::test_utils::{RecordingNetwork, beacon_store_with_config};
     use axum::{body::Body, http::Request};
@@ -1107,28 +1108,6 @@ mod tests {
         let status = response.status();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         (status, serde_json::from_slice(&body).unwrap_or_default())
-    }
-
-    /// A fulu head with its proposer lookahead and sync committee filled in,
-    /// which a block built on it needs, under a schedule that puts every slot
-    /// at fulu.
-    fn fulu_store() -> (Store, Slot) {
-        use ethlambda_state_transition::beacon::helpers::{
-            altair::get_next_sync_committee, fulu::initialize_proposer_lookahead,
-        };
-        let mut state = with_signing_validators_at(ForkName::Fulu, 64);
-        let lookahead = initialize_proposer_lookahead(&state).unwrap();
-        let sync_committee = get_next_sync_committee(&state).unwrap();
-        let BeaconState::Fulu(inner) = &mut state else {
-            unreachable!("built as fulu")
-        };
-        inner.proposer_lookahead = lookahead.try_into().unwrap();
-        inner.current_sync_committee = sync_committee.clone();
-        inner.next_sync_committee = sync_committee;
-        let head_slot = state.slot();
-        let (store, _root) =
-            beacon_store_with_config(state, Config::mainnet().with_fork_epoch(ForkName::Fulu, 0));
-        (store, head_slot)
     }
 
     fn produce_app(store: Store, engine: Option<EngineClient>) -> Router {
@@ -1414,116 +1393,14 @@ mod tests {
         assert!(rejected.blocks.lock().unwrap().is_empty());
     }
 
-    use crate::beacon::builder_client::mock_relay::MockRelay;
-    use crate::beacon::builder_client::{BuilderClient, VersionedBid};
-    use crate::beacon::builder_flow::breaker::FallbackThresholds;
+    use crate::beacon::builder_client::BuilderClient;
     use ethlambda_blockchain::SyncStatusController;
-    use ethlambda_types::beacon::builder::{BuilderBid, ValidatorRegistrationV1};
-    use ethlambda_types::beacon::containers::capella;
-    use ethlambda_types::beacon::containers::deneb::{ExecutionPayloadHeader, KzgCommitments};
-    use ethlambda_types::beacon::containers::electra::{self, ExecutionRequests};
+    use ethlambda_types::beacon::builder::ValidatorRegistrationV1;
+    use ethlambda_types::beacon::containers::electra;
     use libssz::SszDecode as _;
     use std::time::Duration;
 
-    const ETH: u64 = 1_000_000_000_000_000_000;
-    /// The registered gas limit the test proposer asks for.
-    const TARGET_GAS_LIMIT: u64 = 60_000_000;
-
-    /// Thresholds that never trip, so a test state's history does not decide
-    /// whether the builder is asked.
-    const NEVER_TRIP: FallbackThresholds = FallbackThresholds {
-        skips: u64::MAX,
-        skips_per_epoch: u64::MAX,
-        epochs_since_finalization: u64::MAX,
-    };
-
-    /// A builder world for the next slot on `fulu_store()`: a mock relay, a
-    /// `Builder` pointing at it with the proposer registered, and the
-    /// advanced proposal state.
-    struct BuilderWorld {
-        store: Store,
-        slot: Slot,
-        state: BeaconState,
-        relay: MockRelay,
-        builder: Arc<Builder>,
-    }
-
-    async fn builder_world(registered: bool, sync: SyncStatus) -> BuilderWorld {
-        let (store, head_slot) = fulu_store();
-        let slot = head_slot + 1;
-        let config = store.config();
-        let (_, head_state) = super::super::validator::head(&store).unwrap();
-        let state = advance_to_slot(&head_state, slot, &config).unwrap();
-        let proposer = get_beacon_proposer_index(&state).unwrap();
-        let pubkey = state.validator(proposer).unwrap().pubkey;
-        let relay = MockRelay::start(config.genesis_fork_version).await;
-        let client =
-            BuilderClient::new(relay.url.clone(), Duration::from_secs(1), "ethlambda/test")
-                .unwrap();
-        let builder = Arc::new(Builder::new(
-            client,
-            NEVER_TRIP,
-            SyncStatusController::new(sync),
-        ));
-        if registered {
-            let registration = ValidatorRegistrationV1 {
-                fee_recipient: ExecutionAddress::repeat_byte(0x11),
-                gas_limit: TARGET_GAS_LIMIT,
-                timestamp: 1,
-                pubkey,
-            };
-            builder
-                .registrations
-                .record([&registration], compute_epoch_at_slot(slot));
-        }
-        BuilderWorld {
-            store,
-            slot,
-            state,
-            relay,
-            builder,
-        }
-    }
-
     impl BuilderWorld {
-        /// A bid of `value` wei that passes every check for this slot, with
-        /// `edit` applied before the relay signs it.
-        fn offer(&self, value: u64, edit: impl FnOnce(&mut BuilderBid)) {
-            let config = self.store.config();
-            let inputs = payload_inputs(&self.state, &config).unwrap();
-            let BeaconState::Fulu(fulu) = &self.state else {
-                unreachable!("built as fulu")
-            };
-            let parent_gas_limit = fulu.latest_execution_payload_header.gas_limit;
-            let step = (parent_gas_limit / 1024).saturating_sub(1);
-            let withdrawals: capella::Withdrawals = inputs.withdrawals.clone().try_into().unwrap();
-            let mut header =
-                ExecutionPayloadHeader::from(&electra::BeaconBlockBody::empty().execution_payload);
-            header.parent_hash = inputs.parent_hash;
-            header.prev_randao = inputs.prev_randao;
-            header.timestamp = inputs.timestamp;
-            header.block_number = fulu.latest_execution_payload_header.block_number + 1;
-            header.withdrawals_root = withdrawals.hash_tree_root();
-            header.gas_limit = TARGET_GAS_LIMIT.clamp(
-                parent_gas_limit - step,
-                parent_gas_limit.saturating_add(step),
-            );
-            header.block_hash = ExecutionBlockHash::repeat_byte(0xbb);
-            let mut message = BuilderBid {
-                header,
-                blob_kzg_commitments: KzgCommitments::default(),
-                execution_requests: ExecutionRequests::default(),
-                value: Uint256::from(value),
-                pubkey: self.relay.pubkey(),
-            };
-            edit(&mut message);
-            let bid = self.relay.sign_bid(message);
-            self.relay.offer(VersionedBid {
-                fork: ForkName::Fulu,
-                bid,
-            });
-        }
-
         fn app(&self, engine: Option<EngineClient>) -> Router {
             produce_app(self.store.clone(), engine).layer(Extension(self.builder.clone()))
         }
@@ -2021,5 +1898,147 @@ mod tests {
             .unwrap();
         let (status, _) = respond(publish_app(&world), request).await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+}
+
+/// The builder world the proposal tests build on: a fulu head, a mock relay and
+/// a `Builder` pointing at it. Shared with the validator client's end-to-end
+/// tests, which drive the same routes through a real socket.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use crate::beacon::builder_client::BuilderClient;
+    use crate::beacon::builder_client::mock_relay::MockRelay;
+    use crate::beacon::builder_flow::breaker::FallbackThresholds;
+    use crate::test_utils::beacon_store_with_config;
+    use ethlambda_blockchain::SyncStatusController;
+    use ethlambda_state_transition::beacon::helpers::test_state::with_signing_validators_at;
+    use ethlambda_types::beacon::builder::ValidatorRegistrationV1;
+    use ethlambda_types::beacon::config::Config;
+    use ethlambda_types::beacon::containers::capella;
+    use ethlambda_types::beacon::containers::deneb::{ExecutionPayloadHeader, KzgCommitments};
+    use ethlambda_types::beacon::containers::electra;
+    use std::time::Duration;
+
+    /// A fulu head with its proposer lookahead and sync committee filled in,
+    /// which a block built on it needs, under a schedule that puts every slot
+    /// at fulu.
+    pub(crate) fn fulu_store() -> (Store, Slot) {
+        use ethlambda_state_transition::beacon::helpers::{
+            altair::get_next_sync_committee, fulu::initialize_proposer_lookahead,
+        };
+        let mut state = with_signing_validators_at(ForkName::Fulu, 64);
+        let lookahead = initialize_proposer_lookahead(&state).unwrap();
+        let sync_committee = get_next_sync_committee(&state).unwrap();
+        let BeaconState::Fulu(inner) = &mut state else {
+            unreachable!("built as fulu")
+        };
+        inner.proposer_lookahead = lookahead.try_into().unwrap();
+        inner.current_sync_committee = sync_committee.clone();
+        inner.next_sync_committee = sync_committee;
+        let head_slot = state.slot();
+        let (store, _root) =
+            beacon_store_with_config(state, Config::mainnet().with_fork_epoch(ForkName::Fulu, 0));
+        (store, head_slot)
+    }
+
+    pub(crate) const ETH: u64 = 1_000_000_000_000_000_000;
+    /// The registered gas limit the test proposer asks for.
+    pub(crate) const TARGET_GAS_LIMIT: u64 = 60_000_000;
+
+    /// Thresholds that never trip, so a test state's history does not decide
+    /// whether the builder is asked.
+    pub(crate) const NEVER_TRIP: FallbackThresholds = FallbackThresholds {
+        skips: u64::MAX,
+        skips_per_epoch: u64::MAX,
+        epochs_since_finalization: u64::MAX,
+    };
+
+    /// A builder world for the next slot on `fulu_store()`: a mock relay, a
+    /// `Builder` pointing at it with the proposer registered, and the
+    /// advanced proposal state.
+    pub(crate) struct BuilderWorld {
+        pub(crate) store: Store,
+        pub(crate) slot: Slot,
+        pub(crate) state: BeaconState,
+        pub(crate) relay: MockRelay,
+        pub(crate) builder: Arc<Builder>,
+    }
+
+    pub(crate) async fn builder_world(registered: bool, sync: SyncStatus) -> BuilderWorld {
+        let (store, head_slot) = fulu_store();
+        let slot = head_slot + 1;
+        let config = store.config();
+        let (_, head_state) = super::super::validator::head(&store).unwrap();
+        let state = advance_to_slot(&head_state, slot, &config).unwrap();
+        let proposer = get_beacon_proposer_index(&state).unwrap();
+        let pubkey = state.validator(proposer).unwrap().pubkey;
+        let relay = MockRelay::start(config.genesis_fork_version).await;
+        let client =
+            BuilderClient::new(relay.url.clone(), Duration::from_secs(1), "ethlambda/test")
+                .unwrap();
+        let builder = Arc::new(Builder::new(
+            client,
+            NEVER_TRIP,
+            SyncStatusController::new(sync),
+        ));
+        if registered {
+            let registration = ValidatorRegistrationV1 {
+                fee_recipient: ExecutionAddress::repeat_byte(0x11),
+                gas_limit: TARGET_GAS_LIMIT,
+                timestamp: 1,
+                pubkey,
+            };
+            builder
+                .registrations
+                .record([&registration], compute_epoch_at_slot(slot));
+        }
+        BuilderWorld {
+            store,
+            slot,
+            state,
+            relay,
+            builder,
+        }
+    }
+
+    impl BuilderWorld {
+        /// A bid of `value` wei that passes every check for this slot, with
+        /// `edit` applied before the relay signs it.
+        pub(crate) fn offer(&self, value: u64, edit: impl FnOnce(&mut BuilderBid)) {
+            let config = self.store.config();
+            let inputs = payload_inputs(&self.state, &config).unwrap();
+            let BeaconState::Fulu(fulu) = &self.state else {
+                unreachable!("built as fulu")
+            };
+            let parent_gas_limit = fulu.latest_execution_payload_header.gas_limit;
+            let step = (parent_gas_limit / 1024).saturating_sub(1);
+            let withdrawals: capella::Withdrawals = inputs.withdrawals.clone().try_into().unwrap();
+            let mut header =
+                ExecutionPayloadHeader::from(&electra::BeaconBlockBody::empty().execution_payload);
+            header.parent_hash = inputs.parent_hash;
+            header.prev_randao = inputs.prev_randao;
+            header.timestamp = inputs.timestamp;
+            header.block_number = fulu.latest_execution_payload_header.block_number + 1;
+            header.withdrawals_root = withdrawals.hash_tree_root();
+            header.gas_limit = TARGET_GAS_LIMIT.clamp(
+                parent_gas_limit - step,
+                parent_gas_limit.saturating_add(step),
+            );
+            header.block_hash = ExecutionBlockHash::repeat_byte(0xbb);
+            let mut message = BuilderBid {
+                header,
+                blob_kzg_commitments: KzgCommitments::default(),
+                execution_requests: ExecutionRequests::default(),
+                value: Uint256::from(value),
+                pubkey: self.relay.pubkey(),
+            };
+            edit(&mut message);
+            let bid = self.relay.sign_bid(message);
+            self.relay.offer(VersionedBid {
+                fork: ForkName::Fulu,
+                bid,
+            });
+        }
     }
 }

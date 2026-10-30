@@ -62,6 +62,23 @@ pub enum Error {
     BeaconNodeStatus { status: u16, body: String },
     #[error("beacon node is syncing")]
     BeaconNodeSyncing,
+    /// A signed blinded block was sent and the node's answer does not say
+    /// whether it went out: a 5xx, or no answer at all.
+    ///
+    /// Distinct from [`Self::BeaconNodeStatus`], which for this call means a
+    /// definite refusal (a 4xx: the block was not published). Here the node
+    /// may have handed the block to its builder before failing, and the relay
+    /// publishes on receipt, so the block may well be on the network. Nothing
+    /// can safely be retried: the slot is signed, and a second block for it
+    /// would be an equivocation. `status` is `None` for a transport failure.
+    ///
+    /// Classified retryable like the other beacon-node errors, but that governs
+    /// only whether the next duty is attempted, not this block: it is never
+    /// sent again.
+    #[error(
+        "the beacon node did not confirm the blinded block (it may still be published): {detail}"
+    )]
+    BlindedUnconfirmed { status: Option<u16>, detail: String },
     /// The slot's attestation work ran past the end of the slot and was
     /// abandoned.
     ///
@@ -125,6 +142,7 @@ impl Error {
             | Self::AllBeaconNodesFailed(_)
             | Self::BeaconNodeStatus { .. }
             | Self::BeaconNodeSyncing
+            | Self::BlindedUnconfirmed { .. }
             | Self::InconsistentResponse(_)
             | Self::AttestationDeadline { .. }
             | Self::Decode(_) => true,

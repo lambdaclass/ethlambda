@@ -113,6 +113,46 @@ static BLOCKS_BROADCAST_NOT_IMPORTED_TOTAL: LazyLock<IntCounter> = LazyLock::new
     .unwrap()
 });
 
+/// Builder registrations a beacon node accepted, counted per registration so a
+/// full `REGISTRATION_BATCH` reads as that many.
+static BUILDER_REGISTRATIONS_SENT_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_builder_registrations_sent_total",
+        "Builder registrations a beacon node accepted"
+    )
+    .unwrap()
+});
+
+/// Registration batches no beacon node accepted. A missed registration costs
+/// at most a builder block, never a duty, so this is a warning sign rather
+/// than a failure.
+static BUILDER_REGISTRATION_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_builder_registration_failures_total",
+        "Registration batches no beacon node accepted"
+    )
+    .unwrap()
+});
+
+/// Blinded blocks a beacon node handed to its builder.
+static BLINDED_BLOCKS_PROPOSED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_blinded_blocks_proposed_total",
+        "Blinded blocks a beacon node handed to its builder"
+    )
+    .unwrap()
+});
+
+/// Blinded blocks the beacon node did not confirm. The relay may still have
+/// published them, so this is not a count of missed proposals.
+static BLINDED_BLOCKS_UNCONFIRMED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_blinded_blocks_unconfirmed_total",
+        "Blinded blocks the beacon node did not confirm, which the relay may still have published"
+    )
+    .unwrap()
+});
+
 /// Blocks this process declined to sign because it had already proposed that
 /// slot for that validator in this run.
 ///
@@ -316,6 +356,10 @@ pub fn init() {
     LazyLock::force(&ATTESTATION_DEADLINE_MISSED_TOTAL);
     LazyLock::force(&BLOCKS_PROPOSED_TOTAL);
     LazyLock::force(&BLOCKS_BROADCAST_NOT_IMPORTED_TOTAL);
+    LazyLock::force(&BUILDER_REGISTRATIONS_SENT_TOTAL);
+    LazyLock::force(&BUILDER_REGISTRATION_FAILURES_TOTAL);
+    LazyLock::force(&BLINDED_BLOCKS_PROPOSED_TOTAL);
+    LazyLock::force(&BLINDED_BLOCKS_UNCONFIRMED_TOTAL);
     LazyLock::force(&BLOCKS_REFUSED_TOTAL);
     LazyLock::force(&BLOCK_PROPOSAL_FAILURES_TOTAL);
     LazyLock::force(&ENVELOPES_PUBLISHED_TOTAL);
@@ -374,6 +418,22 @@ pub fn inc_blocks_proposed() {
 
 pub fn inc_blocks_broadcast_not_imported() {
     BLOCKS_BROADCAST_NOT_IMPORTED_TOTAL.inc();
+}
+
+pub fn inc_builder_registrations_sent(count: usize) {
+    BUILDER_REGISTRATIONS_SENT_TOTAL.inc_by(count as u64);
+}
+
+pub fn inc_builder_registration_failures() {
+    BUILDER_REGISTRATION_FAILURES_TOTAL.inc();
+}
+
+pub fn inc_blinded_blocks_proposed() {
+    BLINDED_BLOCKS_PROPOSED_TOTAL.inc();
+}
+
+pub fn inc_blinded_blocks_unconfirmed() {
+    BLINDED_BLOCKS_UNCONFIRMED_TOTAL.inc();
 }
 
 pub fn inc_blocks_refused() {

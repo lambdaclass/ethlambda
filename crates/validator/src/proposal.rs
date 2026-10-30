@@ -39,6 +39,28 @@
 //!
 //! The envelope is not slashable, so the guard is untouched by it.
 //!
+//! # Blinded blocks
+//!
+//! With builder proposals on, the node may answer with a blinded block: the
+//! payload's header in place of the payload. Its root is the full block's, so
+//! the guard, the signing root and the signature are exactly what a full block
+//! gets, and the same slot-level protections apply.
+//!
+//! The fee recipient is not compared for a blinded block. The header names the
+//! builder's address, and the relay pays the validator inside the payload, so
+//! a mismatch there is the flow working rather than a node paying someone else.
+//!
+//! The signed block goes to `blinded_blocks` on the node that produced it and
+//! on no other: only that node's builder holds the payload. A publish the node
+//! fails to confirm is reported as [`Published::BuilderUnconfirmed`] rather
+//! than as a missed proposal, since the relay may still publish the block.
+//!
+//! The publish runs on its own task. The beacon node waits up to 5 s for the
+//! relay, which can outlast the proposal's budget (see `lib.rs`), and dropping
+//! the proposal future must neither cancel the request nor lose its outcome: the
+//! task logs and counts it itself, and [`ProposalService::signed_blinded_at`]
+//! lets the caller tell an overrun after signing from a block never signed.
+//!
 //! # Do not retry this call within a slot
 //!
 //! For the same reason [`crate::attestation::AttestationService::attest`] must
@@ -49,6 +71,7 @@
 //! dangerous, but the caller should not be relying on the guard for that.
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use ethlambda_types::beacon::constants::BUILDER_INDEX_SELF_BUILD;
 use ethlambda_types::beacon::fork::ForkName;
@@ -65,6 +88,7 @@ use crate::keys::ValidatorStore;
 use crate::proposal_guard::ProposalGuard;
 use crate::proposer_settings::ProposerSettings;
 use crate::signing::SigningContext;
+use crate::slot_clock::SlotClock;
 
 pub struct ProposalService<B> {
     beacon_node: Arc<B>,
@@ -84,20 +108,62 @@ pub struct ProposalService<B> {
     ///
     /// Not slashing protection. See [`ProposalGuard`].
     guard: std::sync::Mutex<ProposalGuard>,
+    /// The `builder_boost_factor` sent with each block request, or `None` when
+    /// builder proposals are off, in which case a blinded answer is refused.
+    builder_boost_factor: Option<u64>,
+    /// The slot of the latest blinded block this service signed, set before
+    /// its publish starts. A `std::sync::Mutex` for the reason `guard` is one.
+    last_blinded_slot: std::sync::Mutex<Option<Slot>>,
+    /// Where a slot starts, so a blinded publish that outlives the proposal
+    /// can observe its own publication delay. `None` observes nothing.
+    clock: Option<SlotClock>,
 }
 
-impl<B: BeaconNodeApi> ProposalService<B> {
+impl<B: BeaconNodeApi + 'static> ProposalService<B> {
     pub fn new(
         beacon_node: Arc<B>,
         context: Arc<SigningContext>,
         settings: Arc<ProposerSettings>,
+        builder_boost_factor: Option<u64>,
     ) -> Self {
         Self {
             beacon_node,
             context,
             settings,
+            builder_boost_factor,
+            last_blinded_slot: std::sync::Mutex::new(None),
+            clock: None,
             guard: std::sync::Mutex::new(ProposalGuard::new()),
         }
+    }
+
+    /// Give the service the slot clock, so a blinded block's publication delay
+    /// is observed by the task that publishes it (which may outlive
+    /// [`Self::propose`]).
+    pub fn with_clock(mut self, clock: SlotClock) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
+    /// Whether this service signed a blinded block for `slot`, whose publish
+    /// may therefore still be in flight on its own task.
+    pub fn signed_blinded_at(&self, slot: Slot) -> bool {
+        *self
+            .last_blinded_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            == Some(slot)
+    }
+
+    /// Whether the produced block's fee recipient is this client's to compare.
+    ///
+    /// Not for a blinded block: its header names the builder's address, and the
+    /// relay pays the validator inside the payload it reveals, so a difference
+    /// there is the flow working, not a node paying someone else.
+    fn compares_fee_recipient(
+        produced: &crate::beacon_node::block_contents::ProducedBlock,
+    ) -> bool {
+        !produced.is_blinded()
     }
 
     /// Compare the produced block's fee recipient against what was asked for,
@@ -215,6 +281,7 @@ impl<B: BeaconNodeApi> ProposalService<B> {
             proposer_index: duty.validator_index,
             randao_reveal,
             graffiti,
+            builder_boost_factor: self.builder_boost_factor,
         };
         let mut produced = self.beacon_node.produce_block(&request).await?;
 
@@ -252,13 +319,23 @@ impl<B: BeaconNodeApi> ProposalService<B> {
             )));
         }
 
-        Self::check_fee_recipient(&produced, fee_recipient, slot);
+        if Self::compares_fee_recipient(&produced) {
+            Self::check_fee_recipient(&produced, fee_recipient, slot);
+        } else {
+            tracing::debug!(
+                %slot,
+                "Blinded block: its header names the builder's address; the relay pays the \
+                 validator in the payload"
+            );
+        }
 
         let fork = produced.fork;
+        let blinded = produced.is_blinded();
         info!(
             %slot,
             validator = duty.validator_index,
             fork = fork.as_str(),
+            blinded,
             blobs = produced.blob_count(),
             "Block produced; signing"
         );
@@ -292,7 +369,16 @@ impl<B: BeaconNodeApi> ProposalService<B> {
                 }
             }
 
-            self.context.sign_block(&store, &pubkey, block_root, slot)?
+            let signature = self.context.sign_block(&store, &pubkey, block_root, slot)?;
+            // Before the first await after signing, so an overrun of the
+            // proposal's budget from here on is known to be a signed block.
+            if blinded {
+                *self
+                    .last_blinded_slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(slot);
+            }
+            signature
         };
 
         // Taken out before the block is signed into its body: the envelope is
@@ -302,10 +388,18 @@ impl<B: BeaconNodeApi> ProposalService<B> {
         let builder_index = produced.builder_index();
 
         let body = produced.into_signed_ssz(signature);
-        let published = self
-            .publish(fork, &body, slot, duty.validator_index)
-            .await?;
-        crate::metrics::inc_blocks_proposed();
+        // A blinded block counts itself on its own task (see
+        // `publish_blinded`); a full one is counted here.
+        let published = if blinded {
+            self.publish_blinded(slot, fork, body, duty.validator_index)
+                .await?
+        } else {
+            let published = self
+                .publish(fork, &body, slot, duty.validator_index)
+                .await?;
+            crate::metrics::inc_blocks_proposed();
+            published
+        };
 
         // Only a self-built payload is this client's to reveal.
         if builder_index == Some(BUILDER_INDEX_SELF_BUILD) {
@@ -400,6 +494,105 @@ impl<B: BeaconNodeApi> ProposalService<B> {
         Ok(())
     }
 
+    /// Send a signed blinded block to the node that produced it.
+    ///
+    /// # On its own task
+    ///
+    /// The request, its logging and its counters run on a spawned task, so a
+    /// proposal future dropped at the duty loop's budget (the node may wait up
+    /// to 5 s on the relay) neither cancels the request nor loses its outcome.
+    /// This method only awaits the task.
+    ///
+    /// # Why an unconfirmed publish is not an error
+    ///
+    /// A 5xx or a missing answer does not say the block was not published: the
+    /// node may have handed it to the relay, which publishes regardless of what
+    /// the node then replied. So that outcome is logged loudly and counted on
+    /// its own series, and returned as [`Published::BuilderUnconfirmed`]. It is
+    /// not retried: the slot is signed, and a second block for it would be an
+    /// equivocation. A 4xx is a definite refusal and propagates as a failed
+    /// proposal.
+    async fn publish_blinded(
+        &self,
+        slot: Slot,
+        fork: ForkName,
+        body: Vec<u8>,
+        validator: u64,
+    ) -> Result<Published> {
+        let beacon_node = self.beacon_node.clone();
+        let slot_start = self.clock.as_ref().map(|clock| clock.start_of(slot));
+        let task = tokio::spawn(async move {
+            let bytes = body.len();
+            match beacon_node.publish_blinded_block(slot, fork, &body).await {
+                Ok(published) => {
+                    match published {
+                        Published::HandedToBuilder => {
+                            info!(%slot, validator, bytes, "Blinded block handed to the builder");
+                        }
+                        Published::BroadcastNotImported => {
+                            warn!(
+                                %slot,
+                                validator,
+                                "Block was broadcast but the beacon node could not import it; \
+                                 check that node's execution layer"
+                            );
+                            crate::metrics::inc_blocks_broadcast_not_imported();
+                        }
+                        // Neither belongs to this path: a full block's outcome,
+                        // and one only this service builds. Reported rather
+                        // than assumed away.
+                        Published::Imported | Published::BuilderUnconfirmed => warn!(
+                            %slot,
+                            validator,
+                            ?published,
+                            "Beacon node API answered a blinded publish with an outcome that \
+                             belongs to another call"
+                        ),
+                    }
+                    if published != Published::BuilderUnconfirmed {
+                        crate::metrics::inc_blocks_proposed();
+                        crate::metrics::inc_blinded_blocks_proposed();
+                        // Here rather than in the duty loop, which has stopped
+                        // waiting if the relay was slow.
+                        if let Some(start) = slot_start {
+                            let elapsed =
+                                SystemTime::now().duration_since(start).unwrap_or_default();
+                            crate::metrics::observe_block_publication_delay(elapsed.as_secs_f64());
+                        }
+                    }
+                    Ok(published)
+                }
+                Err(err @ Error::BlindedUnconfirmed { .. }) => {
+                    tracing::error!(
+                        %slot,
+                        validator,
+                        %err,
+                        "The beacon node did not confirm the blinded block; the relay may still \
+                         publish it. Not retried: the slot is signed, and a second block would be \
+                         an equivocation"
+                    );
+                    crate::metrics::inc_blinded_blocks_unconfirmed();
+                    Ok(Published::BuilderUnconfirmed)
+                }
+                // A definite refusal. Reported here and not left to the caller,
+                // which may have stopped waiting at the proposal's budget: this
+                // task is the only one that knows the slot was missed.
+                Err(err) => {
+                    tracing::error!(%slot, validator, %err, "The beacon node refused the blinded block");
+                    crate::metrics::inc_block_proposal_failures();
+                    Err(err)
+                }
+            }
+        });
+        // A task that panicked has no outcome to report; the block may or may
+        // not have gone out, which is what "unconfirmed" says.
+        task.await.unwrap_or_else(|err| {
+            tracing::error!(%slot, validator, %err, "The blinded publish task failed");
+            crate::metrics::inc_blinded_blocks_unconfirmed();
+            Ok(Published::BuilderUnconfirmed)
+        })
+    }
+
     /// Send the signed body and report what the node made of it.
     ///
     /// Split out so the 202 case has one place to be explained rather than
@@ -431,6 +624,10 @@ impl<B: BeaconNodeApi> ProposalService<B> {
                 );
                 crate::metrics::inc_blocks_broadcast_not_imported();
             }
+            // `publish_block` never answers with these: a blinded block goes
+            // through `publish_blinded_block`, and `BuilderUnconfirmed` is
+            // built by this service, not by an implementation.
+            Published::HandedToBuilder | Published::BuilderUnconfirmed => {}
         }
         Ok(published)
     }
@@ -477,7 +674,7 @@ mod tests {
 
     fn service(node: Arc<MockBeaconNode>) -> ProposalService<MockBeaconNode> {
         let settings = ProposerSettings::new(Bytes32::repeat_byte(0xab), None);
-        ProposalService::new(node, context(), Arc::new(settings))
+        ProposalService::new(node, context(), Arc::new(settings), None)
     }
 
     fn service_expecting(
@@ -485,7 +682,7 @@ mod tests {
         fee_recipient: ExecutionAddress,
     ) -> ProposalService<MockBeaconNode> {
         let settings = ProposerSettings::new(Bytes32::repeat_byte(0xab), Some(fee_recipient));
-        ProposalService::new(node, context(), Arc::new(settings))
+        ProposalService::new(node, context(), Arc::new(settings), None)
     }
 
     /// A slot inside mainnet's electra era.
@@ -582,7 +779,7 @@ mod tests {
         let (store, pubkey) = store();
         let node = Arc::new(MockBeaconNode::new().with_block(slot(), 7));
         let settings = Arc::new(ProposerSettings::new(Bytes32::repeat_byte(0xab), None));
-        let service = ProposalService::new(node.clone(), context(), settings.clone());
+        let service = ProposalService::new(node.clone(), context(), settings.clone(), None);
 
         settings.set_graffiti(&pubkey, Bytes32::repeat_byte(0xcd));
         service
@@ -668,6 +865,178 @@ mod tests {
             .await
             .expect("202 is not an error");
         assert_eq!(published, Published::BroadcastNotImported);
+    }
+
+    fn builder_service(
+        node: Arc<MockBeaconNode>,
+        fee_recipient: Option<ExecutionAddress>,
+    ) -> ProposalService<MockBeaconNode> {
+        let settings = ProposerSettings::new(Bytes32::repeat_byte(0xab), fee_recipient);
+        ProposalService::new(node, context(), Arc::new(settings), Some(100))
+    }
+
+    /// A blinded block takes the `blinded_blocks` route and nothing else. Its
+    /// header names the builder's address, so a configured fee recipient that
+    /// differs is not a mismatch for it. The mismatch counter is process-global
+    /// and shared with the test above, so it cannot be asserted on here; what
+    /// is asserted is that the proposal goes through unchanged.
+    #[tokio::test]
+    async fn a_blinded_block_is_published_to_the_builder_route() {
+        let (store, pubkey) = store();
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_block(slot(), 7)
+                .with_blinded_block(),
+        );
+
+        let service = builder_service(node.clone(), Some(H160([0xfe; 20])));
+        assert!(!service.signed_blinded_at(slot()));
+        let published = service
+            .propose(slot(), &duty(&pubkey, 7, slot()), &store)
+            .await
+            .expect("proposes");
+        assert_eq!(published, Published::HandedToBuilder);
+        assert!(
+            service.signed_blinded_at(slot()),
+            "the duty loop reads this to tell an overrun after signing from one before"
+        );
+        assert!(!service.signed_blinded_at(slot() + 1));
+
+        assert_eq!(node.block_requests()[0].builder_boost_factor, Some(100));
+        assert!(node.published_blocks().is_empty());
+        let sent = node.published_blinded.lock().expect("lock").clone();
+        assert_eq!(sent.len(), 1);
+        assert_eq!((sent[0].0, sent[0].1), (slot(), ForkName::Electra));
+    }
+
+    /// The fee-recipient comparison is for a full block only: a blinded
+    /// block's header names the builder's address.
+    #[tokio::test]
+    async fn only_a_full_block_has_its_fee_recipient_compared() {
+        use crate::beacon_node::block_contents::{Contents, ProducedBlock, empty_block_for};
+        use ethlambda_types::beacon::builder::BlindedBeaconBlock;
+
+        let blinded = ProducedBlock {
+            fork: ForkName::Electra,
+            contents: Contents::Blinded {
+                block: BlindedBeaconBlock::from(empty_block_for(slot(), 7)),
+            },
+        };
+        assert!(!ProposalService::<MockBeaconNode>::compares_fee_recipient(
+            &blinded
+        ));
+
+        let full = MockBeaconNode::new().with_block(slot(), 7);
+        let request = BlockRequest {
+            slot: slot(),
+            fork: ForkName::Electra,
+            proposer_index: 7,
+            randao_reveal: Default::default(),
+            graffiti: Default::default(),
+            builder_boost_factor: None,
+        };
+        let full = full.produce_block(&request).await.expect("produces");
+        assert!(ProposalService::<MockBeaconNode>::compares_fee_recipient(
+            &full
+        ));
+    }
+
+    /// A node that does not confirm the publish may still have handed the block
+    /// to its relay, so it is not a missed proposal, and the slot is spent: a
+    /// second block would be an equivocation.
+    #[tokio::test]
+    async fn an_unconfirmed_blinded_publish_is_reported_and_the_slot_is_spent() {
+        let (store, pubkey) = store();
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_block(slot(), 7)
+                .with_blinded_block()
+                .with_unconfirmed_blinded_publish("relay timed out"),
+        );
+        let service = builder_service(node.clone(), None);
+
+        let published = service
+            .propose(slot(), &duty(&pubkey, 7, slot()), &store)
+            .await
+            .expect("an unconfirmed publish is not an error");
+        assert_eq!(published, Published::BuilderUnconfirmed);
+
+        let err = service
+            .propose(slot(), &duty(&pubkey, 7, slot()), &store)
+            .await
+            .expect_err("the guard must refuse a second block for the slot");
+        assert!(matches!(err, Error::ProposalRefused { .. }), "got {err:?}");
+    }
+
+    /// The duty loop drops the proposal at its budget while the node is still
+    /// waiting on the relay. The publish runs on its own task, so the block is
+    /// still sent, and the slot is known to be signed.
+    #[tokio::test]
+    async fn a_blinded_publish_survives_a_dropped_proposal() {
+        let (store, pubkey) = store();
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_block(slot(), 7)
+                .with_blinded_block()
+                .with_blinded_publish_delay(std::time::Duration::from_millis(300)),
+        );
+        let service = builder_service(node.clone(), None);
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            service.propose(slot(), &duty(&pubkey, 7, slot()), &store),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "the proposal must be dropped at the budget"
+        );
+        assert!(service.signed_blinded_at(slot()));
+        assert!(node.published_blinded.lock().expect("lock").is_empty());
+
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert_eq!(
+            node.published_blinded.lock().expect("lock").len(),
+            1,
+            "the publish must complete although the proposal future is gone"
+        );
+    }
+
+    /// A 4xx is a definite refusal: the block was not published, so the
+    /// proposal failed.
+    #[tokio::test]
+    async fn a_definitely_refused_blinded_publish_is_an_error() {
+        let (store, pubkey) = store();
+        let node = MockBeaconNode::new()
+            .with_block(slot(), 7)
+            .with_blinded_block()
+            .with_refused_blinded_publish(400);
+
+        let result = builder_service(Arc::new(node), None)
+            .propose(slot(), &duty(&pubkey, 7, slot()), &store)
+            .await;
+        assert!(
+            matches!(result, Err(Error::BeaconNodeStatus { status: 400, .. })),
+            "got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_builder_proposals_the_request_carries_no_factor() {
+        let (store, pubkey) = store();
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_block(slot(), 7)
+                .with_blinded_block(),
+        );
+
+        let published = service(node.clone())
+            .propose(slot(), &duty(&pubkey, 7, slot()), &store)
+            .await
+            .expect("proposes");
+        assert_eq!(published, Published::Imported);
+        assert_eq!(node.block_requests()[0].builder_boost_factor, None);
+        assert!(node.published_blinded.lock().expect("lock").is_empty());
     }
 
     /// A duty naming a key this client does not hold must fail before anything
@@ -827,7 +1196,7 @@ mod gloas_tests {
             ethlambda_types::beacon::primitives::Bytes32::repeat_byte(0xab),
             None,
         );
-        ProposalService::new(node, context(), Arc::new(settings))
+        ProposalService::new(node, context(), Arc::new(settings), None)
     }
 
     fn verifies(pubkey: &BlsPubkey, signature: &[u8; 96], root: Root) -> bool {
@@ -904,7 +1273,7 @@ mod gloas_tests {
         ));
         let settings = Arc::new(ProposerSettings::new(Bytes32::repeat_byte(0xab), None));
         settings.set_graffiti(&pubkey, Bytes32::repeat_byte(0xcd));
-        ProposalService::new(node.clone(), context(), settings)
+        ProposalService::new(node.clone(), context(), settings, None)
             .propose(slot(), &duty(&pubkey), &store)
             .await
             .expect("proposes");

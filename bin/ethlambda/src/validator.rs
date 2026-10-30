@@ -6,8 +6,8 @@
 use std::path::PathBuf;
 
 use ethlambda_types::beacon::primitives::{Bytes32, ExecutionAddress, H160};
-use ethlambda_validator::ValidatorConfig;
 use ethlambda_validator::proposer_settings::{GRAFFITI_BYTES, graffiti_from_text};
+use ethlambda_validator::{BuilderProposals, ValidatorConfig};
 
 /// An execution address is exactly this wide.
 const ADDRESS_BYTES: usize = 20;
@@ -78,6 +78,31 @@ pub(crate) struct ValidatorOptions {
     /// beyond localhost must front it with TLS.
     #[arg(long, default_value = "false")]
     pub(crate) enable_keymanager: bool,
+
+    /// Propose builder blocks: register each validator with the beacon node's
+    /// builder and accept a blinded block when the builder's bid wins. Requires
+    /// a beacon node started with a builder (ethlambda: `--builder`). Fulu and
+    /// earlier only; from gloas the builder market works through proposer
+    /// preferences instead.
+    #[arg(long, default_value = "false")]
+    pub(crate) builder_proposals: bool,
+
+    /// How a builder's bid is weighed against the local payload: the local
+    /// payload wins iff `local >= factor * bid / 100`. 100 compares them as
+    /// they are; 0 prefers the local payload unless it cannot be built.
+    #[arg(
+        long,
+        default_value = "100",
+        requires = "builder_proposals",
+        conflicts_with = "prefer_builder_proposals"
+    )]
+    pub(crate) builder_boost_factor: u64,
+
+    /// Take the builder's block whenever there is a valid bid, unless the
+    /// execution client asks to override the builder (sends
+    /// `builder_boost_factor = u64::MAX`).
+    #[arg(long, default_value = "false", requires = "builder_proposals")]
+    pub(crate) prefer_builder_proposals: bool,
 }
 
 impl ValidatorOptions {
@@ -121,6 +146,21 @@ impl ValidatorOptions {
         Ok(Some(H160(bytes)))
     }
 
+    /// The builder configuration these flags describe, or `None` when builder
+    /// proposals are off.
+    ///
+    /// `--prefer-builder-proposals` wins over the factor by construction:
+    /// clap refuses the two together, so at most one is ever set.
+    pub(crate) fn builder(&self) -> Option<BuilderProposals> {
+        self.builder_proposals.then_some(BuilderProposals {
+            boost_factor: if self.prefer_builder_proposals {
+                u64::MAX
+            } else {
+                self.builder_boost_factor
+            },
+        })
+    }
+
     /// Reject a port clash before anything binds, the way the node's own
     /// options do.
     pub(crate) fn validate_ports(&self) -> eyre::Result<()> {
@@ -144,6 +184,7 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
     options.validate_ports()?;
     let graffiti = options.graffiti()?;
     let suggested_fee_recipient = options.suggested_fee_recipient()?;
+    let builder = options.builder();
     ethlambda_validator::run(ValidatorConfig {
         beacon_nodes: options.beacon_nodes,
         graffiti,
@@ -154,6 +195,7 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
         keymanager: options
             .enable_keymanager
             .then(|| std::net::SocketAddr::new(options.http_address, options.keymanager_port)),
+        builder,
     })
     .await
     .map_err(Into::into)
@@ -174,7 +216,87 @@ mod tests {
             graffiti: graffiti.to_string(),
             suggested_fee_recipient: None,
             enable_keymanager: false,
+            builder_proposals: false,
+            builder_boost_factor: 100,
+            prefer_builder_proposals: false,
         }
+    }
+
+    /// Parse a command line the way the binary does, so `requires` and
+    /// `conflicts_with` are exercised rather than assumed.
+    fn parse(extra: &[&str]) -> Result<ValidatorOptions, clap::Error> {
+        use clap::Parser as _;
+
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            options: ValidatorOptions,
+        }
+        let base = [
+            "ethlambda",
+            "--beacon-nodes",
+            "http://localhost:5052",
+            "--validators-dir",
+            "/tmp/v",
+            "--secrets-dir",
+            "/tmp/s",
+        ];
+        Cli::try_parse_from(base.iter().chain(extra)).map(|cli| cli.options)
+    }
+
+    #[test]
+    fn builder_proposals_are_off_by_default() {
+        assert_eq!(parse(&[]).expect("parses").builder(), None);
+    }
+
+    #[test]
+    fn builder_proposals_default_to_a_factor_of_100() {
+        let options = parse(&["--builder-proposals"]).expect("parses");
+        assert_eq!(
+            options.builder(),
+            Some(BuilderProposals { boost_factor: 100 })
+        );
+    }
+
+    #[test]
+    fn an_explicit_factor_is_used() {
+        let options =
+            parse(&["--builder-proposals", "--builder-boost-factor", "250"]).expect("parses");
+        assert_eq!(
+            options.builder(),
+            Some(BuilderProposals { boost_factor: 250 })
+        );
+    }
+
+    #[test]
+    fn preferring_the_builder_sends_the_maximum_factor() {
+        let options =
+            parse(&["--builder-proposals", "--prefer-builder-proposals"]).expect("parses");
+        assert_eq!(
+            options.builder(),
+            Some(BuilderProposals {
+                boost_factor: u64::MAX
+            })
+        );
+    }
+
+    #[test]
+    fn the_factor_and_the_preference_need_builder_proposals() {
+        parse(&["--builder-boost-factor", "250"])
+            .expect_err("a factor with builder proposals off is a mistake");
+        parse(&["--prefer-builder-proposals"])
+            .expect_err("a preference with builder proposals off is a mistake");
+    }
+
+    #[test]
+    fn the_factor_and_the_preference_conflict() {
+        parse(&[
+            "--builder-proposals",
+            "--builder-boost-factor",
+            "250",
+            "--prefer-builder-proposals",
+        ])
+        .expect_err("the two say different things");
     }
 
     #[test]

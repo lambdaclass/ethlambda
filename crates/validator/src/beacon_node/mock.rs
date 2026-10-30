@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use ethlambda_types::beacon::builder::{BlindedBeaconBlock, SignedValidatorRegistrationV1};
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::altair;
 use ethlambda_types::beacon::containers::electra::{Attestation, SignedAggregateAndProof};
@@ -79,6 +80,28 @@ pub struct MockBeaconNode {
     /// What `publish_block` reports. Defaults to `Imported`; a test that cares
     /// about the 202 path sets it.
     pub publish_outcome: Option<Published>,
+    /// When set, `produce_block` answers a pre-gloas request that carries a
+    /// `builder_boost_factor` with a blinded block (for the slot and proposer
+    /// `produces_block` names), as a node whose builder won the slot does. A
+    /// request with no factor still gets a full block, as the contract on
+    /// `BeaconNodeApi::produce_block` requires.
+    pub produces_blinded: bool,
+    /// Every registration `register_validators` received, in call order.
+    pub registrations: Mutex<Vec<SignedValidatorRegistrationV1>>,
+    /// The size of each `register_validators` call, in call order, so a test
+    /// can see how a send was batched.
+    pub registration_batches: Mutex<Vec<usize>>,
+    /// Every blinded block published, as (slot, fork, body).
+    pub published_blinded: Mutex<Vec<(Slot, ForkName, Vec<u8>)>>,
+    /// What `publish_blinded_block` reports. `None` is `Ok(HandedToBuilder)`;
+    /// `Err(detail)` is a `BlindedUnconfirmed` carrying `detail`.
+    pub blinded_publish_outcome: Option<std::result::Result<Published, String>>,
+    /// When set, `publish_blinded_block` answers with this status as a node
+    /// that definitely refused the block (a 4xx) does: `BeaconNodeStatus`.
+    pub blinded_publish_refusal: Option<u16>,
+    /// How long `publish_blinded_block` takes before it records the block and
+    /// answers, as a slow relay makes the node.
+    pub blinded_publish_delay: Option<std::time::Duration>,
 
     /// What the test asserts against.
     pub submitted: Mutex<Vec<SingleAttestationDto>>,
@@ -255,6 +278,33 @@ impl MockBeaconNode {
     /// bug pass here and fail in production.
     pub fn with_block(mut self, slot: Slot, proposer_index: ValidatorIndex) -> Self {
         self.produces_block = Some((slot, proposer_index));
+        self
+    }
+
+    /// Answer a `produce_block` that carries a `builder_boost_factor` with a
+    /// blinded block, for the slot and proposer `with_block` names.
+    pub fn with_blinded_block(mut self) -> Self {
+        self.produces_blinded = true;
+        self
+    }
+
+    /// Make `publish_blinded_block` fail as a node that did not confirm the
+    /// block, carrying `detail`.
+    pub fn with_unconfirmed_blinded_publish(mut self, detail: &str) -> Self {
+        self.blinded_publish_outcome = Some(Err(detail.to_string()));
+        self
+    }
+
+    /// Make `publish_blinded_block` take `delay` before it records the block.
+    pub fn with_blinded_publish_delay(mut self, delay: std::time::Duration) -> Self {
+        self.blinded_publish_delay = Some(delay);
+        self
+    }
+
+    /// Make `publish_blinded_block` fail as a node that definitely refused the
+    /// block, with `status`.
+    pub fn with_refused_blinded_publish(mut self, status: u16) -> Self {
+        self.blinded_publish_refusal = Some(status);
         self
     }
 
@@ -640,6 +690,16 @@ impl BeaconNodeApi for MockBeaconNode {
             failure: BeaconNodeFailure::Request,
             detail: "no block set".into(),
         })?;
+        if self.produces_blinded && request.builder_boost_factor.is_some() {
+            let block = ProducedBlock {
+                fork: ForkName::Electra,
+                contents: Contents::Blinded {
+                    block: BlindedBeaconBlock::from(empty_block_for(slot, proposer_index)),
+                },
+            };
+            crate::beacon_node::validate_produced_block(request, &block)?;
+            return Ok(block);
+        }
         // Electra, matching the block shape `empty_block_for` builds. A test
         // that needs a fork mismatch constructs one itself rather than getting
         // it by accident here.
@@ -662,6 +722,59 @@ impl BeaconNodeApi for MockBeaconNode {
             .expect("lock")
             .push((fork, body.to_vec()));
         Ok(self.publish_outcome.unwrap_or(Published::Imported))
+    }
+
+    async fn publish_blinded_block(
+        &self,
+        slot: Slot,
+        fork: ForkName,
+        body: &[u8],
+    ) -> Result<Published> {
+        // `failures` and `fail_everything` stand for a node that could not be
+        // reached or answered badly: over HTTP that is an unconfirmed publish,
+        // never a definite refusal (see `with_refused_blinded_publish`).
+        self.guard("publish_blinded_block")
+            .map_err(|err| Error::BlindedUnconfirmed {
+                status: None,
+                detail: err.to_string(),
+            })?;
+        if let Some(status) = self.blinded_publish_refusal {
+            return Err(Error::BeaconNodeStatus {
+                status,
+                body: "refused".to_string(),
+            });
+        }
+        if let Some(delay) = self.blinded_publish_delay {
+            tokio::time::sleep(delay).await;
+        }
+        self.published_blinded
+            .lock()
+            .expect("lock")
+            .push((slot, fork, body.to_vec()));
+        match &self.blinded_publish_outcome {
+            None => Ok(Published::HandedToBuilder),
+            Some(Ok(published)) => Ok(*published),
+            Some(Err(detail)) => Err(Error::BlindedUnconfirmed {
+                status: None,
+                detail: detail.clone(),
+            }),
+        }
+    }
+
+    async fn register_validators(
+        &self,
+        registrations: &[SignedValidatorRegistrationV1],
+    ) -> Result<()> {
+        self.guard("register_validators")?;
+        self.registration_batches
+            .lock()
+            .expect("lock")
+            .push(registrations.len());
+        self.registrations
+            .lock()
+            .expect("lock")
+            .extend(registrations.iter().cloned());
+        Ok(())
     }
 
     async fn execution_payload_envelope(

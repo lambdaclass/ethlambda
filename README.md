@@ -365,6 +365,7 @@ the standard Beacon API, so it works against `ethlambda beacon` (run with the
 | `--secrets-dir` | One password file per keystore, named after the validator's public key |
 | `--suggested-fee-recipient` | Execution address for block rewards, `0x`-prefixed. Optional, but without it the beacon node picks an address that is not yours |
 | `--graffiti` | Text for proposed blocks, at most 32 bytes |
+| `--builder-proposals` | Propose builder blocks before gloas: register each validator with the beacon node's builder (`--builder` on an ethlambda node) and sign a blinded block when the builder's bid wins. Off by default |
 | `--enable-keymanager` | Serve the keymanager API on `--keymanager-port` (default `5062`). Off by default, since it mutates key material |
 
 Metrics are served on `--metrics-port` (default `5064`). See
