@@ -279,16 +279,19 @@ faster than the writer persists them, the wait shows up here rather than in
 
 With an execution client the beacon `stf` row also includes a state
 transition that ran while `engine_newPayload` was in flight, and `engine` then
-reports only the wait left after it. A replay has no client, so neither applies
-to its numbers.
+reports only the wait left after it, zero when the answer was already in. The
+execution client's own time is `lean_engine_new_payload_seconds`. A replay has
+no client, so none of this applies to its numbers.
 
 ### What is excluded, and why
 
 Replay runs nothing that a corpus already answers for:
 
-- **No execution client**, so `engine` reports a near-zero section with nothing
-  to call and `fcu` never runs. On a live follower paired with one, `engine` was
-  31ms p50, about 0.5% of an import; a replay's numbers are complete without it.
+- **No execution client**, so `engine` reports a zero section with nothing to
+  call and `fcu` never runs. On a live follower paired with one, the
+  `engine_newPayload` round trip was 31ms p50, about 0.5% of an import, before
+  the state transition was overlapped with it; a replay's numbers are complete
+  without it.
 - **An empty custody set**, so `columns_wait` never runs and no block is ever
   held waiting on data availability. A corpus supplies every block directly;
   there are no columns to wait for.

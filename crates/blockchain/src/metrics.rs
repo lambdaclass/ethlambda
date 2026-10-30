@@ -1534,6 +1534,39 @@ pub fn inc_engine_speculation(outcome: &str) {
         .inc();
 }
 
+/// How long the execution client took to answer `engine_newPayload` for a
+/// block's payload, from sending the request to its answer, retry ladder
+/// included.
+///
+/// The import computes the block's state transition meanwhile, so this is not
+/// what the import waited: that is `lean_block_import_phase_seconds`'s
+/// `engine` phase, zero whenever the answer was in before the transition
+/// finished. This is the execution client's own processing time, observed for
+/// pre-gloas blocks only (a gloas payload is asked about with its envelope).
+/// `outcome` is `valid`, `optimistic`, `invalidated` or `no_verdict` (no
+/// answer after the whole ladder, so the time is the ladder's).
+pub fn observe_engine_new_payload(outcome: &str, duration: Duration) {
+    static LEAN_ENGINE_NEW_PAYLOAD_SECONDS: std::sync::LazyLock<HistogramVec> =
+        std::sync::LazyLock::new(|| {
+            register_histogram_vec!(
+                "lean_engine_new_payload_seconds",
+                "Time the execution client took to answer engine_newPayload for a block, \
+                 retries included",
+                &["outcome"],
+                // Up to the retry ladder's worst case: three attempts at the
+                // per-attempt timeout plus the backoff between them.
+                vec![
+                    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                    8.0, 12.0, 16.0, 32.0,
+                ]
+            )
+            .unwrap()
+        });
+    LEAN_ENGINE_NEW_PAYLOAD_SECONDS
+        .with_label_values(&[outcome])
+        .observe(duration.as_secs_f64());
+}
+
 /// Blocks not imported because the execution client has not validated them and
 /// they do not qualify for an optimistic import.
 ///
