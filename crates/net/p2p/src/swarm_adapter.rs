@@ -4,7 +4,7 @@ use std::time::Duration;
 use libp2p::{
     PeerId,
     futures::StreamExt,
-    gossipsub::{IdentTopic, TopicScoreParams},
+    gossipsub::{FailedMessages, IdentTopic, TopicScoreParams},
     request_response,
     swarm::{SwarmEvent, dial_opts::DialOpts},
 };
@@ -17,8 +17,12 @@ use crate::{
 };
 
 /// Interval between gossipsub mesh peer metric refreshes, and between the
-/// checks that disconnect peers scored below the graylist.
+/// checks that disconnect peers scored below the graylist or persistently slow.
 const MESH_METRIC_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How many consecutive [`MESH_METRIC_REFRESH_INTERVAL`] checks a peer must
+/// have failed gossipsub sends in before it is disconnected; see [`SlowPeers`].
+const SLOW_PEER_CHECK_LIMIT: u32 = 6;
 
 pub enum SwarmCommand {
     Publish {
@@ -269,10 +273,17 @@ async fn swarm_loop(
 ) {
     let mut mesh_metric_tick = tokio::time::interval(MESH_METRIC_REFRESH_INTERVAL);
     mesh_metric_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut slow_peers = SlowPeers::default();
     let exit = loop {
         tokio::select! {
             event = swarm.next() => {
                 let Some(event) = event else { break LoopExit::SwarmEnded };
+                if let SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
+                    libp2p::gossipsub::Event::SlowPeer { peer_id, failed_messages },
+                )) = &event
+                {
+                    slow_peers.record(*peer_id, failed_messages);
+                }
                 if event_tx.send(event).is_err() { break LoopExit::ActorStopped }
             }
             cmd = cmd_rx.recv() => {
@@ -299,6 +310,7 @@ async fn swarm_loop(
                     counters.num_established_outgoing(),
                 );
                 disconnect_graylisted_peers(&mut swarm);
+                disconnect_slow_peers(&mut swarm, &mut slow_peers);
             }
         }
     };
@@ -322,6 +334,92 @@ async fn swarm_loop(
 enum LoopExit {
     ActorStopped,
     SwarmEnded,
+}
+
+/// Peers gossipsub reported as failing to take messages, tracked across the
+/// periodic checks so that only a persistent failure costs a peer its
+/// connection.
+///
+/// The failure this exists for is a dead gossipsub stream. The connection
+/// handler disables itself for good after a handful of substream
+/// negotiations on one connection, successful ones included, and from then
+/// on never takes another message off the peer's send queue. The behaviour is
+/// not told: it keeps queueing for the peer up to the queue's capacity, and
+/// queued messages are only dropped when the handler takes them off, so a
+/// full queue of message copies stays in memory for as long as the connection
+/// lives, which other protocols keep open. The one trace this leaves is
+/// gossipsub's `SlowPeer` report, emitted every heartbeat for each peer whose
+/// queue refused a message (or that let a message expire in it, which the
+/// report does not tell apart). Disconnecting frees the queue; a peer that
+/// reconnects gets a fresh handler.
+///
+/// A peer reported in fewer than [`SLOW_PEER_CHECK_LIMIT`] consecutive checks
+/// keeps its connection, so a burst of expiries from a peer that catches up is
+/// not enough.
+#[derive(Default)]
+struct SlowPeers {
+    /// Failed messages per peer reported since the last check.
+    reported: HashMap<PeerId, usize>,
+    /// Per peer, the consecutive checks it has been reported in and the
+    /// failed messages across them.
+    streaks: HashMap<PeerId, (u32, usize)>,
+}
+
+impl SlowPeers {
+    fn record(&mut self, peer_id: PeerId, failed_messages: &FailedMessages) {
+        let failed = failed_messages.priority + failed_messages.non_priority;
+        *self.reported.entry(peer_id).or_default() += failed;
+    }
+
+    /// Closes one check: a peer reported since the last one extends its
+    /// streak, every other peer loses it. Returns each peer whose streak
+    /// reached [`SLOW_PEER_CHECK_LIMIT`], with its failed messages across the
+    /// streak, and forgets it.
+    fn check(&mut self) -> Vec<(PeerId, usize)> {
+        let reported = std::mem::take(&mut self.reported);
+        self.streaks
+            .retain(|peer_id, _| reported.contains_key(peer_id));
+        let mut persistent = Vec::new();
+        for (peer_id, failed) in reported {
+            let (checks, total) = self.streaks.entry(peer_id).or_default();
+            *checks += 1;
+            *total += failed;
+            if *checks >= SLOW_PEER_CHECK_LIMIT {
+                persistent.push((peer_id, *total));
+            }
+        }
+        for (peer_id, _) in &persistent {
+            self.streaks.remove(peer_id);
+        }
+        persistent
+    }
+}
+
+/// Disconnect every peer [`SlowPeers`] finds persistently failing to take
+/// gossipsub messages.
+///
+/// Beacon only, like [`disconnect_graylisted_peers`]: the check still runs on
+/// lean, so the reports do not pile up, but nothing is disconnected.
+fn disconnect_slow_peers(swarm: &mut libp2p::Swarm<Behaviour>, slow_peers: &mut SlowPeers) {
+    let persistent = slow_peers.check();
+    if swarm
+        .behaviour()
+        .gossipsub
+        .peer_score(swarm.local_peer_id())
+        .is_none()
+    {
+        return;
+    }
+    for (peer_id, failed) in persistent {
+        if swarm.disconnect_peer_id(peer_id).is_ok() {
+            metrics::inc_gossipsub_slow_peer_disconnects();
+            info!(
+                %peer_id,
+                failed,
+                "Disconnecting peer that kept failing to take gossipsub messages"
+            );
+        }
+    }
 }
 
 /// Disconnect every peer gossipsub scores below the graylist, and publish how
@@ -495,5 +593,65 @@ pub(crate) fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCo
                 metrics::inc_beacon_gossip_verdict_expired(kind);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failed(non_priority: usize) -> FailedMessages {
+        FailedMessages {
+            priority: 0,
+            non_priority,
+        }
+    }
+
+    #[test]
+    fn a_peer_failing_in_every_check_is_returned_at_the_limit() {
+        let peer = PeerId::random();
+        let mut slow_peers = SlowPeers::default();
+        for _ in 1..SLOW_PEER_CHECK_LIMIT {
+            slow_peers.record(peer, &failed(2));
+            assert!(slow_peers.check().is_empty());
+        }
+        slow_peers.record(peer, &failed(2));
+        let expected = 2 * usize::try_from(SLOW_PEER_CHECK_LIMIT).unwrap();
+        assert_eq!(slow_peers.check(), vec![(peer, expected)]);
+    }
+
+    #[test]
+    fn a_check_without_a_report_resets_the_streak() {
+        let peer = PeerId::random();
+        let mut slow_peers = SlowPeers::default();
+        for _ in 1..SLOW_PEER_CHECK_LIMIT {
+            slow_peers.record(peer, &failed(1));
+            assert!(slow_peers.check().is_empty());
+        }
+        assert!(slow_peers.check().is_empty());
+        slow_peers.record(peer, &failed(1));
+        assert!(slow_peers.check().is_empty());
+    }
+
+    #[test]
+    fn several_reports_within_one_check_count_once_towards_the_streak() {
+        let peer = PeerId::random();
+        let mut slow_peers = SlowPeers::default();
+        for _ in 0..usize::try_from(SLOW_PEER_CHECK_LIMIT).unwrap() {
+            slow_peers.record(peer, &failed(1));
+        }
+        assert!(slow_peers.check().is_empty());
+    }
+
+    #[test]
+    fn a_returned_peer_starts_a_new_streak() {
+        let peer = PeerId::random();
+        let mut slow_peers = SlowPeers::default();
+        for _ in 0..SLOW_PEER_CHECK_LIMIT {
+            slow_peers.record(peer, &failed(1));
+            slow_peers.check();
+        }
+        slow_peers.record(peer, &failed(1));
+        assert!(slow_peers.check().is_empty());
     }
 }
