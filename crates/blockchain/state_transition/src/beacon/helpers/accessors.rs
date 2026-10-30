@@ -17,7 +17,7 @@ pub use ethlambda_storage::{
     ActiveBalanceCache, ActiveBalanceKey, CommitteeCache, Lookup, ShufflingKey,
 };
 
-use crate::beacon::bls::{AggregatePubkey, CommitteeKeySums};
+use crate::beacon::bls::{AggregatePubkey, CommitteeKeySums, IndexedPubkey};
 use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::BeaconState;
@@ -27,7 +27,7 @@ use crate::beacon::hash::hash;
 use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
-    BlsPubkey, Bytes32, CommitteeIndex, Domain, DomainType, Epoch, Gwei, Root, Slot, ValidatorIndex,
+    Bytes32, CommitteeIndex, Domain, DomainType, Epoch, Gwei, Root, Slot, ValidatorIndex,
 };
 
 use super::misc::{
@@ -390,7 +390,14 @@ fn build_committee_key_sums(
     committees: &EpochCommittees,
     epoch: Epoch,
 ) -> CommitteeKeySums {
-    let pubkeys: Vec<BlsPubkey> = state.iter_validators().map(|v| v.pubkey).collect();
+    let pubkeys: Vec<IndexedPubkey> = state
+        .iter_validators()
+        .enumerate()
+        .map(|(index, v)| IndexedPubkey {
+            index: index as ValidatorIndex,
+            pubkey: v.pubkey,
+        })
+        .collect();
     let per_slot = committees.committees_per_slot();
     let first_slot = compute_start_slot_at_epoch(epoch);
 
@@ -406,7 +413,7 @@ fn build_committee_key_sums(
     let sums = members
         .par_iter()
         .map(|committee| {
-            let keys: Option<Vec<BlsPubkey>> = committee
+            let keys: Option<Vec<IndexedPubkey>> = committee
                 .iter()
                 .map(|index| pubkeys.get(*index as usize).copied())
                 .collect();

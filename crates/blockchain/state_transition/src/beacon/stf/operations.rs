@@ -12,7 +12,7 @@
 
 use std::collections::HashSet;
 
-use crate::beacon::bls::{self, SignatureSet};
+use crate::beacon::bls::{self, IndexedPubkey, SignatureSet};
 use crate::beacon::config::Config;
 use crate::beacon::constants::{self, FAR_FUTURE_EPOCH};
 use crate::beacon::containers::BeaconState;
@@ -208,7 +208,10 @@ pub(crate) fn verify_proposer_slashing(
     // Copied out rather than re-borrowed per iteration below: both signatures
     // are checked against the same proposer, and holding the borrow across
     // the loop would conflict with `get_domain`'s borrow of `state`.
-    let pubkey = proposer.pubkey;
+    let pubkey = IndexedPubkey {
+        index: proposer_index,
+        pubkey: proposer.pubkey,
+    };
 
     for signed_header in [
         &proposer_slashing.signed_header_1,
@@ -673,7 +676,10 @@ pub fn process_voluntary_exit(
     let signing_root = compute_signing_root(voluntary_exit.hash_tree_root(), domain);
     signatures.push(
         SignatureSet::single(
-            &validator.pubkey,
+            &IndexedPubkey {
+                index: voluntary_exit.validator_index,
+                pubkey: validator.pubkey,
+            },
             signing_root,
             &signed_voluntary_exit.signature,
         ),
