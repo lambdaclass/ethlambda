@@ -301,6 +301,10 @@ pub fn gloas_data_column_sidecars(
     blobs: &[Vec<u8>],
     cell_proofs: &[ethlambda_types::beacon::primitives::KzgProof],
 ) -> Result<Vec<gloas::DataColumnSidecar>> {
+    // A payload without blobs has no sidecars (consensus-specs #5767).
+    if blobs.is_empty() {
+        return Ok(Vec::new());
+    }
     verify(
         cell_proofs.len() == blobs.len() * preset::CELLS_PER_EXT_BLOB,
         "a blob carries CELLS_PER_EXT_BLOB cell proofs",
@@ -1279,6 +1283,11 @@ mod gloas_block_production_tests {
         // A proof count that does not fit the blobs is refused.
         assert!(
             gloas_data_column_sidecars(root, 33, &[vec![0; preset::BYTES_PER_BLOB]], &[]).is_err()
+        );
+        // A payload without blobs has no sidecars.
+        assert_eq!(
+            gloas_data_column_sidecars(root, 33, &[], &[]).unwrap(),
+            vec![]
         );
     }
 
