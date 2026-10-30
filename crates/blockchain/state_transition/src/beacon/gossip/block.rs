@@ -121,6 +121,8 @@ fn body_operations_within_limits(block: GloasBlockRef<'_>) -> bool {
         && block.voluntary_exits().len() <= preset::MAX_VOLUNTARY_EXITS
         && block.bls_to_execution_changes().len() <= preset::MAX_BLS_TO_EXECUTION_CHANGES
         && block.payload_attestations().len() as u64 <= preset::MAX_PAYLOAD_ATTESTATIONS
+        // [New in EIP-8450]
+        && block.pq_key_registrations().len() as u64 <= preset::MAX_PQ_KEY_REGISTRATIONS
 }
 
 /// The rules that need the parent's post-state. Runs on a blocking thread.

@@ -16,6 +16,7 @@ ethlambda-types.workspace = true
 rayon.workspace = true
 
 leanvm.workspace = true
+lean-pq.workspace = true
 postcard.workspace = true
 
 thiserror.workspace = true

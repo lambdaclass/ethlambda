@@ -10,11 +10,12 @@ use std::collections::{BTreeMap, HashSet};
 
 use ethlambda_types::{
     beacon::{
-        constants::{BLS_WITHDRAWAL_PREFIX, FAR_FUTURE_EPOCH},
+        constants::{BLS_WITHDRAWAL_PREFIX, BUILDER_INDEX_FLAG, FAR_FUTURE_EPOCH},
         containers::{
             BeaconState,
             capella::SignedBLSToExecutionChange,
             electra::AttesterSlashing,
+            heze::SignedPQKeyRegistration,
             shared::{ProposerSlashing, SignedVoluntaryExit, Validator},
         },
         operation::BeaconOperation,
@@ -35,6 +36,8 @@ pub struct OperationPool {
     voluntary_exits: BTreeMap<ValidatorIndex, SignedVoluntaryExit>,
     /// Keyed by the validator whose credentials change.
     bls_to_execution_changes: BTreeMap<ValidatorIndex, SignedBLSToExecutionChange>,
+    /// Keyed by the registrant's index and the change it names (EIP-8450).
+    pq_key_registrations: BTreeMap<(ValidatorIndex, Epoch), SignedPQKeyRegistration>,
 }
 
 /// The specification's `is_slashable_validator`.
@@ -73,6 +76,14 @@ impl OperationPool {
         insert_first(&mut self.bls_to_execution_changes, key, change)
     }
 
+    /// Keeps the first registration per registrant and named change. Returns
+    /// whether this one was new. Callers insert only validated operations.
+    pub fn insert_pq_key_registration(&mut self, registration: SignedPQKeyRegistration) -> bool {
+        let message = &registration.message;
+        let key = (message.index, message.previous_change_epoch);
+        insert_first(&mut self.pq_key_registrations, key, registration)
+    }
+
     /// Insert `operation` into its list. `false` if its key was already held.
     pub fn insert(&mut self, operation: BeaconOperation) -> bool {
         match operation {
@@ -80,6 +91,7 @@ impl OperationPool {
             BeaconOperation::AttesterSlashing(op) => self.insert_attester_slashing(op),
             BeaconOperation::VoluntaryExit(op) => self.insert_voluntary_exit(op),
             BeaconOperation::BlsToExecutionChange(op) => self.insert_bls_to_execution_change(op),
+            BeaconOperation::PqKeyRegistration(op) => self.insert_pq_key_registration(*op),
         }
     }
 
@@ -103,6 +115,11 @@ impl OperationPool {
         self.bls_to_execution_changes.values().cloned().collect()
     }
 
+    /// Every post-quantum key registration held, in index order.
+    pub fn pq_key_registrations(&self) -> Vec<SignedPQKeyRegistration> {
+        self.pq_key_registrations.values().cloned().collect()
+    }
+
     /// Drop what `state` (the head state) already makes pointless: exits of
     /// validators whose `exit_epoch != FAR_FUTURE_EPOCH`, proposer slashings
     /// whose proposer is no longer slashable, attester slashings whose
@@ -111,6 +128,8 @@ impl OperationPool {
     /// `BLS_WITHDRAWAL_PREFIX`. Slashable is the specification's
     /// `is_slashable_validator` at the state's current epoch. An index the
     /// state does not know is treated as pointless.
+    /// A key registration goes once its registrant exits, or once the change it names is stale.
+    /// Before the registry exists, registrations are kept, since none can be judged yet.
     pub fn prune(&mut self, state: &BeaconState) {
         let epoch = compute_epoch_at_slot(state.slot());
         let slashable = |index: ValidatorIndex| {
@@ -129,6 +148,10 @@ impl OperationPool {
                 validator.withdrawal_credentials.0[0] == BLS_WITHDRAWAL_PREFIX
             })
         });
+        self.pq_key_registrations
+            .retain(|&(index, change_epoch), _| {
+                pq_registration_applies(state, index, change_epoch)
+            });
         self.proposer_slashings.retain(|&index, _| slashable(index));
         self.attester_slashings.retain(|_, slashing| {
             let first: HashSet<ValidatorIndex> = slashing
@@ -144,6 +167,34 @@ impl OperationPool {
                 .any(|index| first.contains(index) && slashable(*index))
         });
     }
+}
+
+/// Whether a registration naming `change_epoch` can still apply to `index` on `state`.
+///
+/// It can while the registrant exists, has not initiated an exit, and still holds that change.
+fn pq_registration_applies(
+    state: &BeaconState,
+    index: ValidatorIndex,
+    change_epoch: Epoch,
+) -> bool {
+    let Some(registry) = state.pq_registry() else {
+        return true;
+    };
+    let not_exiting = if index & BUILDER_INDEX_FLAG != 0 {
+        state.builders().is_ok_and(|builders| {
+            builders
+                .get((index & !BUILDER_INDEX_FLAG) as usize)
+                .is_some_and(|builder| builder.withdrawable_epoch == FAR_FUTURE_EPOCH)
+        })
+    } else {
+        state
+            .validator(index)
+            .is_ok_and(|validator| validator.exit_epoch == FAR_FUTURE_EPOCH)
+    };
+    not_exiting
+        && registry
+            .registrant(index)
+            .is_some_and(|entry| entry.change_epoch == change_epoch)
 }
 
 /// Inserts `value` unless `key` is taken; returns whether it was inserted.

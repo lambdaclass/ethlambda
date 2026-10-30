@@ -24,10 +24,11 @@ use std::collections::HashSet;
 
 use ethlambda_types::beacon::containers::capella::SignedBLSToExecutionChange;
 use ethlambda_types::beacon::containers::electra::AttesterSlashing;
+use ethlambda_types::beacon::containers::heze::SignedPQKeyRegistration;
 use ethlambda_types::beacon::containers::shared::{ProposerSlashing, SignedVoluntaryExit};
 use ethlambda_types::beacon::operation::BeaconOperation;
 
-use super::{IgnoreReason, Outcome, RejectReason, is_future_epoch};
+use super::{IgnoreReason, Outcome, RejectReason, is_future_epoch, pq_key_registration};
 use crate::beacon::ForkName;
 use crate::beacon::bls;
 use crate::beacon::config::Config;
@@ -46,7 +47,7 @@ use crate::beacon::helpers::misc::{compute_domain, compute_epoch_at_slot, comput
 use crate::beacon::helpers::predicates::{
     is_active_validator, is_slashable_attestation_data, is_slashable_validator,
 };
-use crate::beacon::primitives::{HashTreeRoot as _, ValidatorIndex};
+use crate::beacon::primitives::{Epoch, HashTreeRoot as _, ValidatorIndex};
 
 /// What `voluntary_exit`, `proposer_slashing`, `attester_slashing` and
 /// `bls_to_execution_change` have already accepted: the specification's
@@ -60,6 +61,8 @@ pub struct SeenOperations {
     proposer_slashings: HashSet<ValidatorIndex>,
     attester_slashed: HashSet<ValidatorIndex>,
     bls_to_execution_changes: HashSet<ValidatorIndex>,
+    /// Keyed by the registrant and the change it names (EIP-8450): a later change is a new pair.
+    pq_key_registrations: HashSet<(ValidatorIndex, Epoch)>,
 }
 
 /// The indices both of an attester slashing's attestations name: the
@@ -96,6 +99,9 @@ impl SeenOperations {
             BeaconOperation::BlsToExecutionChange(change) => !self
                 .bls_to_execution_changes
                 .contains(&change.message.validator_index),
+            BeaconOperation::PqKeyRegistration(registration) => !self
+                .pq_key_registrations
+                .contains(&registration_pair(registration)),
         }
     }
 
@@ -123,8 +129,17 @@ impl SeenOperations {
             BeaconOperation::BlsToExecutionChange(change) => self
                 .bls_to_execution_changes
                 .insert(change.message.validator_index),
+            BeaconOperation::PqKeyRegistration(registration) => self
+                .pq_key_registrations
+                .insert(registration_pair(registration)),
         }
     }
+}
+
+/// The pair a registration's first-seen record keys on: its index and the change it names.
+fn registration_pair(registration: &SignedPQKeyRegistration) -> (ValidatorIndex, Epoch) {
+    let message = &registration.message;
+    (message.index, message.previous_change_epoch)
 }
 
 /// Everything the specification checks before it reads the head state: the
@@ -190,6 +205,10 @@ pub fn cheap_checks(
                 return Err(Outcome::Ignore(IgnoreReason::BeforeFork));
             }
         }
+        // The first-seen record is judged later, at its place in the specification's order.
+        BeaconOperation::PqKeyRegistration(_) => {
+            pq_key_registration::cheap_checks(&config, now_ms)?
+        }
     }
     Ok(())
 }
@@ -201,14 +220,25 @@ pub fn cheap_checks(
 /// electra or fulu. That is a deliberate deviation: this build only serves
 /// electra-shaped operations, where the specification would validate older
 /// forks' shapes too.
-pub fn stateful_checks(store: &Store, operation: &BeaconOperation) -> Outcome {
+/// A post-quantum key registration is the exception: it is judged on a heze head.
+///
+/// `first_seen` tells whether the seen records held no entry for the operation when it arrived.
+/// Only the registration reads it, at its place in the specification's order.
+pub fn stateful_checks(
+    store: &Store,
+    operation: &BeaconOperation,
+    first_seen: bool,
+    now_ms: u64,
+) -> Outcome {
     let Some((_slot, head_root)) = store.beacon_head() else {
         return Outcome::Ignore(IgnoreReason::StateUnavailable);
     };
     let Ok(Some(state)) = store.get_state(&head_root) else {
         return Outcome::Ignore(IgnoreReason::StateUnavailable);
     };
-    if !matches!(state.fork_name(), ForkName::Electra | ForkName::Fulu) {
+    // A registration carries its own fork rule: the head state must have the registry.
+    let electra_shaped = matches!(state.fork_name(), ForkName::Electra | ForkName::Fulu);
+    if !electra_shaped && !matches!(operation, BeaconOperation::PqKeyRegistration(_)) {
         return Outcome::Ignore(IgnoreReason::StateUnavailable);
     }
     let config = store.config();
@@ -217,6 +247,9 @@ pub fn stateful_checks(store: &Store, operation: &BeaconOperation) -> Outcome {
         BeaconOperation::ProposerSlashing(op) => proposer_slashing(&state, op),
         BeaconOperation::AttesterSlashing(op) => attester_slashing(&state, op),
         BeaconOperation::BlsToExecutionChange(op) => bls_to_execution_change(&state, op, &config),
+        BeaconOperation::PqKeyRegistration(op) => {
+            pq_key_registration::stateful_checks(&state, op, first_seen, &config, now_ms)
+        }
     };
     verdict.map_or_else(|outcome| outcome, |()| Outcome::Accept)
 }
@@ -375,7 +408,7 @@ pub fn validate(
     if let Err(outcome) = cheap_checks(seen, store, operation, now_ms) {
         return outcome;
     }
-    stateful_checks(store, operation)
+    stateful_checks(store, operation, seen.is_new(operation), now_ms)
 }
 
 #[cfg(test)]
@@ -502,7 +535,7 @@ mod tests {
     fn no_head_state_is_ignored() {
         let store = store(0);
         assert_eq!(
-            stateful_checks(&store, &exit_for(0)),
+            stateful_checks(&store, &exit_for(0), true, 0),
             Outcome::Ignore(IgnoreReason::StateUnavailable)
         );
     }
@@ -511,7 +544,7 @@ mod tests {
     fn an_exit_for_an_unknown_validator_is_rejected() {
         let store = store_with_head(fulu_parent(0));
         assert_eq!(
-            stateful_checks(&store, &exit_for(1_000)),
+            stateful_checks(&store, &exit_for(1_000), true, 0),
             Outcome::Reject(RejectReason::UnknownValidator)
         );
     }
@@ -568,6 +601,6 @@ mod tests {
             message,
             signature: sign_for(2, signing_root),
         });
-        stateful_checks(&store, &exit)
+        stateful_checks(&store, &exit, true, 0)
     }
 }

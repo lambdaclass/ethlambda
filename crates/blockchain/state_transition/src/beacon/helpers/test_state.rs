@@ -46,7 +46,7 @@ use crate::beacon::{lean_fork_unreachable, lean_state_unreachable};
 /// committee, which aggregates its members' keys, and it would silently limit
 /// every later fork's tests in the same way. Deriving a real key from the index
 /// keeps the state reproducible while letting the BLS paths run.
-fn pubkey_for(index: usize) -> BlsPubkey {
+pub fn pubkey_for(index: usize) -> BlsPubkey {
     BlsPubkey(secret_key_for(index).sk_to_pk().to_bytes())
 }
 

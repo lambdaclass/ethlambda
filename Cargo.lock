@@ -464,7 +464,7 @@ dependencies = [
  "nom",
  "num-traits",
  "rusticata-macros",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "time",
 ]
 
@@ -1087,7 +1087,7 @@ version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fa961b519f0b462e3a3b4a34b64d119eeaca1d59af726fe450bbba07a9fc0a1"
 dependencies = [
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1484,7 +1484,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 2.0.117",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -1527,7 +1527,7 @@ version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "10d60334b3b2e7c9d91ef8150abfb6fa4c1c39ebbcf4a81c2e346aad939fee3e"
 dependencies = [
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1964,7 +1964,7 @@ dependencies = [
  "serde_yaml_ng",
  "sha2",
  "tempfile",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tikv-jemallocator",
  "tokio",
  "tokio-util",
@@ -1994,7 +1994,7 @@ dependencies = [
  "serde_json",
  "snap",
  "spawned-concurrency",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-util",
  "tracing",
@@ -2008,10 +2008,11 @@ dependencies = [
  "ethlambda-metrics",
  "ethlambda-types",
  "hex",
- "leanvm",
+ "lean-pq",
+ "leanvm 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
  "postcard",
  "rayon",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
  "zk_alloc",
 ]
@@ -2028,7 +2029,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
 ]
@@ -2045,7 +2046,7 @@ name = "ethlambda-metrics"
 version = "0.1.0"
 dependencies = [
  "prometheus",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2082,7 +2083,7 @@ dependencies = [
  "sha2",
  "snap",
  "spawned-concurrency",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -2157,7 +2158,7 @@ dependencies = [
  "serde_yaml_ng",
  "sha2",
  "snap",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
@@ -2176,7 +2177,7 @@ dependencies = [
  "proptest",
  "rocksdb",
  "tempfile",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
  "xdelta3",
 ]
@@ -2211,7 +2212,7 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "sha2",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2241,7 +2242,7 @@ dependencies = [
  "sha2",
  "subtle",
  "tempfile",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tower",
  "tracing",
@@ -2269,7 +2270,7 @@ dependencies = [
  "libssz-merkle 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "rayon",
  "rustc-hash",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-util",
  "tracing",
@@ -2305,7 +2306,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
@@ -2327,7 +2328,7 @@ dependencies = [
  "ripemd",
  "secp256k1 0.30.0",
  "sha2",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tiny-keccak",
 ]
 
@@ -2351,7 +2352,7 @@ dependencies = [
  "rkyv",
  "serde",
  "serde_with",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2368,7 +2369,7 @@ dependencies = [
  "rkyv",
  "serde",
  "serde_with",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
@@ -2387,7 +2388,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "strum",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2398,7 +2399,7 @@ dependencies = [
  "ethrex-common",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing-subscriber",
 ]
 
@@ -2437,7 +2438,7 @@ dependencies = [
  "snap",
  "spawned-concurrency",
  "spawned-rt",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -2451,7 +2452,7 @@ source = "git+https://github.com/lambdaclass/ethrex?tag=v25.0.0#f3b90bc6dc577049
 dependencies = [
  "bytes",
  "ethereum-types",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2471,7 +2472,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
 ]
@@ -2493,7 +2494,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "spin",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2510,7 +2511,7 @@ dependencies = [
  "ethrex-rlp",
  "rustc-hash",
  "serde",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
@@ -2617,8 +2618,18 @@ name = "fiat_shamir"
 version = "0.1.0"
 source = "git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad#48a904208d682848dac0e18ef8b01ebfc40df9ad"
 dependencies = [
- "parallel",
- "primitives",
+ "parallel 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
+ "primitives 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
+ "serde",
+]
+
+[[package]]
+name = "fiat_shamir"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a#a39758de10f35c7b34023d061cc05dfc0b36d43a"
+dependencies = [
+ "parallel 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a)",
+ "primitives 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a)",
  "serde",
 ]
 
@@ -2655,10 +2666,10 @@ name = "flock"
 version = "0.1.0"
 source = "git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad#48a904208d682848dac0e18ef8b01ebfc40df9ad"
 dependencies = [
- "fiat_shamir",
- "parallel",
- "pcs",
- "primitives",
+ "fiat_shamir 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
+ "parallel 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
+ "pcs 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
+ "primitives 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
  "zk_alloc",
 ]
 
@@ -3108,7 +3119,7 @@ dependencies = [
  "rand 0.9.4",
  "ring",
  "socket2 0.5.10",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tinyvec",
  "tokio",
  "tracing",
@@ -3131,7 +3142,7 @@ dependencies = [
  "rand 0.9.4",
  "resolv-conf",
  "smallvec",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
 ]
@@ -3763,6 +3774,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "keccak_gkr"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a#a39758de10f35c7b34023d061cc05dfc0b36d43a"
+dependencies = [
+ "fiat_shamir 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a)",
+ "parallel 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a)",
+ "pcs 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a)",
+ "primitives 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a)",
+ "tracing",
+]
+
+[[package]]
 name = "konst"
 version = "0.2.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3812,12 +3835,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
+name = "lean-pq"
+version = "0.8.0"
+source = "git+https://github.com/ethereum/lean-pq-bindings?rev=e61ca5576e878ea549095eb1a875a11de7fa51d3#e61ca5576e878ea549095eb1a875a11de7fa51d3"
+dependencies = [
+ "leanvm 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a)",
+ "rand 0.9.4",
+ "signatures",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "lean_compiler"
 version = "0.1.0"
 source = "git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad#48a904208d682848dac0e18ef8b01ebfc40df9ad"
 dependencies = [
  "lean_vm",
- "primitives",
+ "primitives 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
+]
+
+[[package]]
+name = "lean_compiler"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a#a39758de10f35c7b34023d061cc05dfc0b36d43a"
+dependencies = [
+ "leanvm_core",
+ "primitives 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a)",
 ]
 
 [[package]]
@@ -3825,10 +3868,23 @@ name = "lean_da"
 version = "0.1.0"
 source = "git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad#48a904208d682848dac0e18ef8b01ebfc40df9ad"
 dependencies = [
- "fiat_shamir",
- "parallel",
- "pcs",
- "primitives",
+ "fiat_shamir 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
+ "parallel 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
+ "pcs 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
+ "primitives 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
+ "serde",
+ "tracing",
+]
+
+[[package]]
+name = "lean_da"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a#a39758de10f35c7b34023d061cc05dfc0b36d43a"
+dependencies = [
+ "fiat_shamir 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a)",
+ "parallel 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a)",
+ "pcs 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a)",
+ "primitives 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a)",
  "serde",
  "tracing",
 ]
@@ -3838,11 +3894,11 @@ name = "lean_vm"
 version = "0.1.0"
 source = "git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad#48a904208d682848dac0e18ef8b01ebfc40df9ad"
 dependencies = [
- "fiat_shamir",
+ "fiat_shamir 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
  "flock",
- "parallel",
- "pcs",
- "primitives",
+ "parallel 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
+ "pcs 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
+ "primitives 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
  "tracing",
  "zk_alloc",
 ]
@@ -3853,14 +3909,40 @@ version = "0.1.0"
 source = "git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad#48a904208d682848dac0e18ef8b01ebfc40df9ad"
 dependencies = [
  "clap",
- "lean_da",
+ "lean_da 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
  "lean_vm",
- "primitives",
+ "primitives 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
  "rand 0.9.4",
- "rec_aggregation",
+ "rec_aggregation 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
  "sphincs",
  "xmss",
  "zk_alloc",
+]
+
+[[package]]
+name = "leanvm"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a#a39758de10f35c7b34023d061cc05dfc0b36d43a"
+dependencies = [
+ "lean_da 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a)",
+ "leanvm_core",
+ "rand 0.9.4",
+ "rec_aggregation 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a)",
+ "signatures",
+]
+
+[[package]]
+name = "leanvm_core"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a#a39758de10f35c7b34023d061cc05dfc0b36d43a"
+dependencies = [
+ "fiat_shamir 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a)",
+ "keccak_gkr",
+ "parallel 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a)",
+ "pcs 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a)",
+ "primitives 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a)",
+ "tracing",
+ "verifier",
 ]
 
 [[package]]
@@ -3948,7 +4030,7 @@ dependencies = [
  "multiaddr",
  "pin-project",
  "rw-stream-sink",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -3979,7 +4061,7 @@ dependencies = [
  "quick-protobuf-codec",
  "rand 0.8.6",
  "rand_core 0.6.4",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
  "web-time",
 ]
@@ -4012,7 +4094,7 @@ dependencies = [
  "quick-protobuf",
  "rand 0.8.6",
  "rw-stream-sink",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
  "unsigned-varint",
  "web-time",
@@ -4034,7 +4116,7 @@ dependencies = [
  "libp2p-swarm",
  "quick-protobuf",
  "quick-protobuf-codec",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
  "web-time",
 ]
@@ -4070,7 +4152,7 @@ dependencies = [
  "quick-protobuf-codec",
  "rand 0.8.6",
  "smallvec",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
@@ -4121,7 +4203,7 @@ dependencies = [
  "quick-protobuf",
  "quick-protobuf-codec",
  "smallvec",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
@@ -4144,7 +4226,7 @@ dependencies = [
  "sec1",
  "serde",
  "sha2",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
  "zeroize",
 ]
@@ -4170,7 +4252,7 @@ dependencies = [
  "serde",
  "sha2",
  "smallvec",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
  "uint 0.10.0",
  "web-time",
@@ -4261,7 +4343,7 @@ dependencies = [
  "rand 0.8.6",
  "snow",
  "static_assertions",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
  "x25519-dalek",
  "zeroize",
@@ -4326,7 +4408,7 @@ dependencies = [
  "ring",
  "rustls",
  "socket2 0.6.3",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
 ]
@@ -4349,7 +4431,7 @@ dependencies = [
  "quick-protobuf-codec",
  "rand 0.8.6",
  "static_assertions",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
  "web-time",
 ]
@@ -4371,7 +4453,7 @@ dependencies = [
  "quick-protobuf",
  "quick-protobuf-codec",
  "rand 0.8.6",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
  "web-time",
 ]
@@ -4455,7 +4537,7 @@ dependencies = [
  "ring",
  "rustls",
  "rustls-webpki",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "x509-parser",
  "yasna",
 ]
@@ -4519,7 +4601,7 @@ dependencies = [
  "libp2p-identity",
  "libp2p-webrtc-utils",
  "send_wrapper",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -4540,7 +4622,7 @@ dependencies = [
  "pin-project-lite",
  "rw-stream-sink",
  "soketto",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
  "url",
  "webpki-roots 0.26.11",
@@ -4556,7 +4638,7 @@ dependencies = [
  "js-sys",
  "libp2p-core",
  "send_wrapper",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
  "wasm-bindgen",
  "web-sys",
@@ -4575,7 +4657,7 @@ dependencies = [
  "multiaddr",
  "multihash",
  "send_wrapper",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -4590,7 +4672,7 @@ dependencies = [
  "either",
  "futures",
  "libp2p-core",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
  "yamux 0.12.1",
  "yamux 0.13.10",
@@ -5022,7 +5104,7 @@ dependencies = [
  "log",
  "netlink-packet-core",
  "netlink-sys",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -5287,6 +5369,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "parallel"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a#a39758de10f35c7b34023d061cc05dfc0b36d43a"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "parity-scale-codec"
 version = "3.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5364,12 +5454,23 @@ name = "pcs"
 version = "0.1.0"
 source = "git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad#48a904208d682848dac0e18ef8b01ebfc40df9ad"
 dependencies = [
- "fiat_shamir",
- "parallel",
- "primitives",
+ "fiat_shamir 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
+ "parallel 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
+ "primitives 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
  "serde",
  "tracing",
  "zk_alloc",
+]
+
+[[package]]
+name = "pcs"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a#a39758de10f35c7b34023d061cc05dfc0b36d43a"
+dependencies = [
+ "fiat_shamir 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a)",
+ "parallel 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a)",
+ "primitives 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a)",
+ "tracing",
 ]
 
 [[package]]
@@ -5602,11 +5703,20 @@ version = "0.1.0"
 source = "git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad#48a904208d682848dac0e18ef8b01ebfc40df9ad"
 dependencies = [
  "libc",
- "parallel",
+ "parallel 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
  "serde",
  "tracing-forest",
  "tracing-subscriber",
  "zk_alloc",
+]
+
+[[package]]
+name = "primitives"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a#a39758de10f35c7b34023d061cc05dfc0b36d43a"
+dependencies = [
+ "parallel 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a)",
+ "serde",
 ]
 
 [[package]]
@@ -5639,7 +5749,7 @@ dependencies = [
  "memchr",
  "parking_lot",
  "protobuf",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -5770,7 +5880,7 @@ dependencies = [
  "asynchronous-codec",
  "bytes",
  "quick-protobuf",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "unsigned-varint",
 ]
 
@@ -5798,7 +5908,7 @@ dependencies = [
  "rustc-hash",
  "rustls",
  "socket2 0.6.3",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "web-time",
@@ -5819,7 +5929,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "slab",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tinyvec",
  "tracing",
  "web-time",
@@ -6052,17 +6162,37 @@ source = "git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac
 dependencies = [
  "bincode",
  "flock",
- "lean_compiler",
- "lean_da",
+ "lean_compiler 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
+ "lean_da 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
  "lean_vm",
- "parallel",
- "pcs",
- "primitives",
+ "parallel 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
+ "pcs 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
+ "primitives 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
  "rand 0.9.4",
  "serde",
  "sphincs",
  "tracing",
  "xmss",
+]
+
+[[package]]
+name = "rec_aggregation"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a#a39758de10f35c7b34023d061cc05dfc0b36d43a"
+dependencies = [
+ "bincode",
+ "keccak_gkr",
+ "lean_compiler 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a)",
+ "lean_da 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a)",
+ "leanvm_core",
+ "parallel 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a)",
+ "pcs 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a)",
+ "primitives 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a)",
+ "rand 0.9.4",
+ "serde",
+ "signatures",
+ "tracing",
+ "verifier",
 ]
 
 [[package]]
@@ -6822,6 +6952,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "signatures"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a#a39758de10f35c7b34023d061cc05dfc0b36d43a"
+dependencies = [
+ "parallel 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a)",
+ "primitives 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a)",
+ "rand 0.9.4",
+ "serde",
+]
+
+[[package]]
 name = "simd-adler32"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6919,7 +7060,7 @@ dependencies = [
  "pin-project-lite",
  "spawned-macros",
  "spawned-rt",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
@@ -6953,8 +7094,8 @@ name = "sphincs"
 version = "0.1.0"
 source = "git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad#48a904208d682848dac0e18ef8b01ebfc40df9ad"
 dependencies = [
- "parallel",
- "primitives",
+ "parallel 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
+ "primitives 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
  "rand 0.9.4",
  "serde",
 ]
@@ -7153,11 +7294,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.18"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4"
+checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
- "thiserror-impl 2.0.18",
+ "thiserror-impl 2.0.21",
 ]
 
 [[package]]
@@ -7173,13 +7314,13 @@ dependencies = [
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.18"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebc4ee7f67670e9b64d05fa4253e753e016c6c95ff35b89b7941d6b856dec1d5"
+checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -7489,7 +7630,7 @@ checksum = "f09cb459317a3811f76644334473239d696cd8efc606963ae7d1c308cead3b74"
 dependencies = [
  "ansi_term",
  "smallvec",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
  "tracing-subscriber",
 ]
@@ -7715,6 +7856,11 @@ dependencies = [
  "derive_builder",
  "rustversion",
 ]
+
+[[package]]
+name = "verifier"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a#a39758de10f35c7b34023d061cc05dfc0b36d43a"
 
 [[package]]
 name = "version_check"
@@ -8433,7 +8579,7 @@ dependencies = [
  "nom",
  "oid-registry",
  "rusticata-macros",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "time",
 ]
 
@@ -8470,8 +8616,8 @@ version = "0.1.0"
 source = "git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad#48a904208d682848dac0e18ef8b01ebfc40df9ad"
 dependencies = [
  "ethereum_ssz",
- "parallel",
- "primitives",
+ "parallel 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
+ "primitives 0.1.0 (git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad)",
  "rand 0.9.4",
  "serde",
 ]

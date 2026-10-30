@@ -45,6 +45,8 @@ use tracing::error;
 
 /// Beacon Chain BLS12-381 signatures (the specification's `bls` module).
 pub mod bls;
+/// leanXMSS over Keccak-256, the scheme of EIP-8450's post-quantum key registry.
+pub mod lean_xmss;
 mod metrics;
 pub mod signature;
 

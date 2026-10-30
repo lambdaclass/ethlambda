@@ -256,6 +256,7 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `GET`, `POST` | `/eth/v2/beacon/pool/attester_slashings` | JSON | The pool's `AttesterSlashing`s (GET carries `Eth-Consensus-Version`, the fork of the wall clock's current epoch); validate, pool and gossip one |
 | `GET`, `POST` | `/eth/v1/beacon/pool/voluntary_exits` | JSON | The pool's `SignedVoluntaryExit`s; validate, pool and gossip one |
 | `GET`, `POST` | `/eth/v1/beacon/pool/bls_to_execution_changes` | JSON | The pool's `SignedBLSToExecutionChange`s; POST takes an array |
+| `GET`, `POST` | `/eth/v1/beacon/pool/pq_key_registrations` | JSON | The pool's `SignedPQKeyRegistration`s (EIP-8450, not yet a Beacon API route); POST takes an array |
 | `POST` | `/eth/v1/beacon/pool/payload_attestations` | *(status only)* | Validate, pool and gossip `PayloadAttestationMessage`s (gloas; JSON or SSZ body) |
 | `GET` | `/eth/v1/beacon/pool/payload_attestations` | JSON | The pool's votes as aggregated `PayloadAttestation`s (gloas) |
 | `POST` | `/eth/v1/validator/beacon_committee_subscriptions` | *(status only)* | Aggregators' entries join their committee's subnet |
@@ -478,6 +479,11 @@ the chain actor writes, so no request waits on the actor.
   rejected operation is a `400`. `bls_to_execution_changes` takes an array: on
   partial failure the response is a `400` listing the failures by index, and
   the valid entries are still pooled and published.
+- **`pool/pq_key_registrations`** (EIP-8450, not yet a Beacon API route):
+  shaped like `pool/bls_to_execution_changes`. `POST` takes an array of
+  `SignedPQKeyRegistration`s and runs `validate_pq_key_registration_gossip`
+  against the head's post-state, so it needs a heze head. Each accepted
+  registration is pooled and gossiped on `pq_key_registration`.
 
 ### Gloas block production
 

@@ -1,4 +1,4 @@
-.PHONY: help fmt lint bench update cooldown-check docker-build shadow-build shadow-docker-build run-devnet test test-consensus test-node test-beacon test-beacon-mainnet test-beacon-minimal consensus-spec-tests cryptography-specs docs docs-deps docs-serve
+.PHONY: eip8450-spec-tests help fmt lint bench update cooldown-check docker-build shadow-build shadow-docker-build run-devnet test test-consensus test-node test-beacon test-beacon-mainnet test-beacon-minimal consensus-spec-tests cryptography-specs docs docs-deps docs-serve
 
 help: ## 📚 Show help for each of the Makefile recipes
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
@@ -209,6 +209,41 @@ $(CRYPTOGRAPHY_SPECS_STAMP):
 	echo "Downloading BLS/KZG test vectors ($(CRYPTOGRAPHY_SPECS_VERSION))"; \
 	curl -L -f -o "$$tmpdir/tests.zip" "$(CRYPTOGRAPHY_SPECS_URL)" || exit 1; \
 	unzip -q "$$tmpdir/tests.zip" -d cryptography-specs || exit 1
+	@touch $@
+
+# EIP-8450 vectors. Heze here carries EIP-8450's post-quantum key registry, which
+# consensus-specs builds as the `eip8450` feature fork on top of its heze, so the
+# beacon suite runs those cases as heze. No release ships them yet: this generates
+# them with the pyspec of the consensus-specs PR that specifies the registry
+# (ethereum/consensus-specs#5782), pinned by commit, into the fixture tree beside
+# the released forks. Needs `uv` (0.13.4 or newer) and takes a while: every heze
+# test runs again at `eip8450`. `ssz_static` is generated only for the forks listed
+# in TESTGEN_FORKS, so the copy this target generates from adds `eip8450` there.
+EIP8450_SPECS_REPO ?= https://github.com/ethereum/consensus-specs.git
+EIP8450_SPECS_COMMIT ?= b1b194cb1c1eeacc6226a4d21442305f477f88ce
+EIP8450_SPECS_WORKERS ?= 8
+EIP8450_SPEC_TESTS_STAMP=consensus-spec-tests/.eip8450-$(EIP8450_SPECS_COMMIT)-$(subst $(space),-,$(sort $(CONSENSUS_SPEC_TESTS_CONFIGS)))
+
+eip8450-spec-tests: $(EIP8450_SPEC_TESTS_STAMP) ## 🧬 Generate the EIP-8450 (heze) spec test vectors
+
+$(EIP8450_SPEC_TESTS_STAMP): $(CONSENSUS_SPEC_TESTS_STAMP)
+	@tmpdir=$$(mktemp -d); trap 'rm -rf "$$tmpdir"' EXIT; \
+	git clone -q $(EIP8450_SPECS_REPO) "$$tmpdir/specs" || exit 1; \
+	git -C "$$tmpdir/specs" fetch -q origin $(EIP8450_SPECS_COMMIT) || exit 1; \
+	git -C "$$tmpdir/specs" checkout -q $(EIP8450_SPECS_COMMIT) || exit 1; \
+	sed -i 's/^TESTGEN_FORKS = (\*MAINNET_FORKS, GLOAS, HEZE)$$/TESTGEN_FORKS = (*MAINNET_FORKS, GLOAS, HEZE, EIP8450)/' \
+		"$$tmpdir/specs/tests/core/pyspec/eth_consensus_specs/test/helpers/constants.py"; \
+	grep -q 'GLOAS, HEZE, EIP8450)' "$$tmpdir/specs/tests/core/pyspec/eth_consensus_specs/test/helpers/constants.py" \
+		|| { echo "TESTGEN_FORKS moved; update the eip8450-spec-tests recipe"; exit 1; }; \
+	$(MAKE) -C "$$tmpdir/specs" build || exit 1; \
+	for config in $(CONSENSUS_SPEC_TESTS_CONFIGS); do \
+		echo "Generating $$config EIP-8450 spec test vectors"; \
+		(cd "$$tmpdir/specs" && uv run pytest -q -n $(EIP8450_SPECS_WORKERS) --dist=worksteal \
+			--fork=eip8450 --preset=$$config --reftests --reftests-output="$$tmpdir/out" \
+			tests/core/pyspec/eth_consensus_specs) || exit 1; \
+		rm -rf consensus-spec-tests/tests/$$config/eip8450; \
+		cp -r "$$tmpdir/out/$$config/eip8450" consensus-spec-tests/tests/$$config/eip8450 || exit 1; \
+	done
 	@touch $@
 
 # lambdaclass fork of lean-quickstart: genesis keys come from `ethlambda keygen`, and the

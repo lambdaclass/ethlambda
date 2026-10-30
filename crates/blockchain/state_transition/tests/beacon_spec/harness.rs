@@ -16,7 +16,7 @@ use libssz::{SszDecode as _, SszEncode as _};
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libtest_mimic::Trial;
 
-use super::{Case, PRESET, collect, crypto_root, fixture_root};
+use super::{Case, PRESET, collect, crypto_root, eip8450_vectors_present, fixture_root};
 
 #[derive(serde::Deserialize)]
 struct RootFile {
@@ -69,7 +69,11 @@ pub fn trials() -> Vec<Trial> {
         }),
         Trial::test("harness/discovery_covers_every_supported_fork", || {
             let cases = collect(PRESET, "ssz_static", "Checkpoint");
-            for fork in ForkName::ALL {
+            // Heze's cases come only from generated EIP-8450 vectors, reported as missing otherwise.
+            let required = ForkName::ALL
+                .into_iter()
+                .filter(|fork| *fork != ForkName::Heze || eip8450_vectors_present());
+            for fork in required {
                 assert!(
                     cases.iter().any(|case| case.fork == fork),
                     "discovery found no {fork} cases; the fixture release is expected to \

@@ -58,6 +58,7 @@ const HANDLERS: &[&str] = &[
     "gossip_execution_payload_bid",
     "gossip_proposer_preferences",
     "gossip_inclusion_list",
+    "gossip_pq_key_registration",
 ];
 
 /// The forks each of [`HANDLERS`] validates. A case from any other fork is
@@ -83,6 +84,8 @@ fn validated_forks(handler: &str) -> &'static [ForkName] {
         | "gossip_execution_payload_bid"
         | "gossip_proposer_preferences" => &[ForkName::Gloas, ForkName::Heze],
         "gossip_inclusion_list" => &[ForkName::Heze],
+        // EIP-8450's registrations, judged on a heze head whatever its shape of operations.
+        "gossip_pq_key_registration" => &[ForkName::Heze],
         // `gossip::operations` validates electra-shaped operations against an
         // electra or fulu head state and ignores every other one, so gloas's
         // vectors (builder exits included) are a known gap rather than a run.
@@ -118,6 +121,7 @@ const OPERATION_TOPICS: &[&str] = &[
     "proposer_slashing",
     "attester_slashing",
     "bls_to_execution_change",
+    "pq_key_registration",
 ];
 
 /// Vectors that disagree with a deliberate deviation, by case name.
@@ -363,7 +367,7 @@ fn deliver_payload(
 /// `hash_tree_root(anchor_state.latest_block_header) ==
 /// hash_tree_root(anchor_block.message)`, after filling the header's
 /// `state_root`. That is looser for a state advanced past its block, but these
-/// vectors' stale headers fail it. Rewriting is safe for these four topics
+/// vectors' stale headers fail it. Rewriting is safe for these five topics
 /// because their rules read only the state's slot, validators, fork and
 /// `genesis_validators_root`, never its header or the anchor block's contents. So the header is made to name
 /// the anchor block with the state root left for the store to fill in, and the
@@ -372,21 +376,46 @@ fn rebase_stale_header(state: &mut BeaconState, anchor: &mut SignedBeaconBlock) 
     use ethlambda_state_transition::beacon::containers::BeaconBlockHeader;
     use ethlambda_state_transition::beacon::primitives::HashTreeRoot as _;
 
-    let SignedBeaconBlock::Fulu(block) = anchor else {
-        return;
+    // The key registration rules read the registries and the genesis root, never the header either.
+    let (slot, proposer_index, parent_root, body_root) = match anchor {
+        SignedBeaconBlock::Fulu(block) => {
+            let message = &block.message;
+            let body_root = message.body.hash_tree_root();
+            (
+                message.slot,
+                message.proposer_index,
+                message.parent_root,
+                body_root,
+            )
+        }
+        SignedBeaconBlock::Heze(block) => {
+            let message = &block.message;
+            let body_root = message.body.hash_tree_root();
+            (
+                message.slot,
+                message.proposer_index,
+                message.parent_root,
+                body_root,
+            )
+        }
+        _ => return,
     };
-    if state.slot() != block.message.slot {
+    if state.slot() != slot {
         return;
     }
-    let message = &mut block.message;
     *state.latest_block_header_mut() = BeaconBlockHeader {
-        slot: message.slot,
-        proposer_index: message.proposer_index,
-        parent_root: message.parent_root,
+        slot,
+        proposer_index,
+        parent_root,
         state_root: Root::ZERO,
-        body_root: message.body.hash_tree_root(),
+        body_root,
     };
-    message.state_root = state.hash_tree_root();
+    let state_root = state.hash_tree_root();
+    match anchor {
+        SignedBeaconBlock::Fulu(block) => block.message.state_root = state_root,
+        SignedBeaconBlock::Heze(block) => block.message.state_root = state_root,
+        _ => {}
+    }
 }
 
 /// The two topics whose cases share one store setup and one market.
@@ -756,6 +785,17 @@ fn run_case(case: &Case) -> Result<(), String> {
                     &mut seen_operations,
                     &store,
                     BeaconOperation::BlsToExecutionChange(change),
+                    now_ms,
+                )
+            }
+            "pq_key_registration" => {
+                let bytes = case.ssz_bytes(&message.message);
+                let registration = heze::SignedPQKeyRegistration::from_ssz_bytes(&bytes)
+                    .map_err(|err| format!("decoding {}: {err:?}", message.message))?;
+                validate_operation(
+                    &mut seen_operations,
+                    &store,
+                    BeaconOperation::PqKeyRegistration(Box::new(registration)),
                     now_ms,
                 )
             }

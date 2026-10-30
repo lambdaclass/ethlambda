@@ -151,6 +151,23 @@ pub const DOMAIN_PROPOSER_PREFERENCES: DomainType = [0x0d, 0x00, 0x00, 0x00];
 pub const DOMAIN_BUILDER_DEPOSIT: DomainType = [0x0e, 0x00, 0x00, 0x00];
 /// Domain for a `SignedInclusionList` (heze, EIP-7805).
 pub const DOMAIN_INCLUSION_LIST_COMMITTEE: DomainType = [0x10, 0x00, 0x00, 0x00];
+/// Domain for the BLS authorization of a post-quantum key registration (EIP-8450).
+///
+/// Computed against the genesis fork version, so a registration stays valid across forks.
+pub const DOMAIN_PQ_KEY_REGISTRATION: DomainType = [0x12, 0x00, 0x00, 0x00];
+/// Domain for the leanXMSS proof of possession of a registered key (EIP-8450).
+///
+/// Computed against the genesis fork version, as the authorization's domain is.
+pub const DOMAIN_PQ_KEY_POSSESSION: DomainType = [0x13, 0x00, 0x00, 0x00];
+
+// ---------------------------------------------------------------------------
+// Post-quantum key registry (EIP-8450)
+// ---------------------------------------------------------------------------
+
+/// The leaf index a proof of possession is signed at (EIP-8450).
+///
+/// Reserved for the proof: a signer signs nothing else there, so no duty can reuse its one-time key.
+pub const PQ_POSSESSION_XMSS_INDEX: u32 = 0;
 
 // ---------------------------------------------------------------------------
 // Participation flags and incentivization weights (altair)
@@ -453,6 +470,8 @@ mod tests {
             DOMAIN_PROPOSER_PREFERENCES,
             DOMAIN_BUILDER_DEPOSIT,
             DOMAIN_INCLUSION_LIST_COMMITTEE,
+            DOMAIN_PQ_KEY_REGISTRATION,
+            DOMAIN_PQ_KEY_POSSESSION,
         ] {
             let masked = [
                 domain[0] & DOMAIN_APPLICATION_MASK[0],

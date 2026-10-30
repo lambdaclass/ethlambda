@@ -88,7 +88,7 @@ use ethlambda_types::{
                 self, ExecutionPayloadEnvelope, ExecutionRequests, SignedExecutionPayloadBid,
                 SignedExecutionPayloadEnvelope, SignedProposerPreferences,
             },
-            heze::{self, InclusionListBits},
+            heze::{self, InclusionListBits, SignedPQKeyRegistration},
         },
         fork::ForkName,
         fork_choice::{ForkChoiceNode, PayloadStatus},
@@ -469,6 +469,9 @@ struct Prepared {
     /// Heze: the previous slot's inclusion list transactions, which the built
     /// payload must satisfy (`PayloadAttributesV5`). `None` at a gloas slot.
     inclusion_list_transactions: Option<Vec<Vec<u8>>>,
+    /// Heze (EIP-8450): the pooled key registrations, candidates the assembly packs if they apply.
+    /// Empty at a gloas slot, which has no registry.
+    pq_key_registrations: Vec<SignedPQKeyRegistration>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -753,6 +756,11 @@ fn prepare(
             Some((bits, transactions)) => (Some(bits), Some(transactions)),
             None => (None, None),
         };
+    let pq_key_registrations = if state.pq_registry().is_some() {
+        store.operation_pool().pq_key_registrations()
+    } else {
+        Vec::new()
+    };
     Ok(Prepared {
         state,
         inputs,
@@ -763,6 +771,7 @@ fn prepare(
         preferences,
         inclusion_list_bits,
         inclusion_list_transactions,
+        pq_key_registrations,
     })
 }
 
@@ -1005,6 +1014,7 @@ fn assemble(
         blob_kzg_commitments: commitments.clone(),
         execution_requests: execution_requests.clone(),
         inclusion_list_bits: prepared.inclusion_list_bits.clone(),
+        pq_key_registrations: prepared.pq_key_registrations.clone(),
     };
     let operations = attestations.len() + payload_attestations.len();
     let attempt = inputs(attestations, payload_attestations, sync_aggregate);
@@ -1060,6 +1070,7 @@ fn assemble_on_bid(
         parent_execution_requests: parent_requests.clone(),
         signed_bid: signed_bid.clone(),
         sync_aggregate,
+        pq_key_registrations: prepared.pq_key_registrations.clone(),
     };
     let operations = attestations.len() + payload_attestations.len();
     let attempt = inputs(attestations, payload_attestations, sync_aggregate);
@@ -1609,6 +1620,7 @@ mod tests {
                 blob_kzg_commitments: Vec::new(),
                 execution_requests: ExecutionRequests::default(),
                 inclusion_list_bits: None,
+                pq_key_registrations: Vec::new(),
             },
             &config(),
         )
@@ -1666,6 +1678,7 @@ mod tests {
             preferences: None,
             inclusion_list_bits: None,
             inclusion_list_transactions: None,
+            pq_key_registrations: Vec::new(),
         };
         assemble(
             &config(),
@@ -1741,6 +1754,7 @@ mod tests {
             preferences: None,
             inclusion_list_bits: None,
             inclusion_list_transactions: None,
+            pq_key_registrations: Vec::new(),
         };
         let build = |candidate| {
             assemble_on_bid(
@@ -2012,6 +2026,7 @@ mod tests {
                 blob_kzg_commitments: vec![commitment],
                 execution_requests: ExecutionRequests::default(),
                 inclusion_list_bits: None,
+                pq_key_registrations: Vec::new(),
             },
             &config(),
         )

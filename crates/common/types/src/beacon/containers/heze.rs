@@ -10,9 +10,16 @@
 //! eth1 and deposit-index fields from the state, so the block body, block,
 //! signed block and state are heze's own containers, with the removed fields
 //! left as gaps in their progressive layouts.
+//!
+//! EIP-8450 adds the post-quantum key registry:
+//!
+//! - a leanXMSS key and a VRF root per validator, and a leanXMSS key per builder, in the state;
+//! - a block operation that registers or replaces them.
+//!
+//! Its fields are appended at the end, so every earlier field keeps its generalized index.
 
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
-use libssz_types::{SszBitvector, SszVector};
+use libssz_types::{ProgressiveList, SszBitvector, SszVector};
 
 use super::altair::{SyncAggregate, SyncCommittee};
 use super::fulu::ProposerLookahead;
@@ -29,10 +36,11 @@ use super::shared::{
     JustificationBits, ProgressiveBalances, ProgressiveValidators, RandaoMixes, Slashings,
     StateRoots,
 };
+use crate::beacon::constants;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
-    BlsSignature, Bytes32, Epoch, ExecutionBlockHash, Gwei, Root, Slot, ValidatorIndex,
-    WithdrawalIndex,
+    BlsPubkey, BlsSignature, Bytes32, Epoch, ExecutionBlockHash, Gwei, Root, Slot, ValidatorIndex,
+    VrfRoot, WithdrawalIndex, XmssPublicKey, XmssSignature,
 };
 
 /// A bitfield over the inclusion list committee, one bit per member in
@@ -89,6 +97,117 @@ pub struct SignedInclusionList {
     pub signature: BlsSignature,
 }
 
+// ---------------------------------------------------------------------------
+// Post-quantum key registry (EIP-8450)
+// ---------------------------------------------------------------------------
+
+/// The post-quantum keys of one validator or builder, as the registry stores them.
+///
+/// Serializes to 32 + 32 = 64 bytes.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
+pub struct PQKeyMaterial {
+    /// The leanXMSS public key.
+    pub xmss_public_key: XmssPublicKey,
+    /// The root of the VRF tree, zero for a builder.
+    pub vrf_root: VrfRoot,
+}
+
+/// The message of a registration: which registrant, which keys, and after which change.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
+pub struct PQKeyRegistration {
+    /// The validator index, or the builder index with the builder flag set.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub index: ValidatorIndex,
+    /// The keys being registered.
+    pub key_material: PQKeyMaterial,
+    /// The epoch of the registrant's last change, or its never-registered marker.
+    ///
+    /// The marker is the far future epoch for a validator, the deposit epoch for a builder.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub previous_change_epoch: Epoch,
+}
+
+/// The message a proof of possession signs: which registrant, and which leanXMSS key.
+///
+/// It names the registrant by its BLS public key, which never changes.
+/// So a key's proof does not depend on the rest of a registration, and is signed once.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
+pub struct PQKeyPossession {
+    /// The registrant's BLS public key.
+    pub pubkey: BlsPubkey,
+    /// The key whose possession is proven.
+    pub xmss_public_key: XmssPublicKey,
+}
+
+/// A registration as a beacon block carries it.
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
+pub struct SignedPQKeyRegistration {
+    /// The registration the BLS signature authorizes.
+    pub message: PQKeyRegistration,
+    /// The registered key's leanXMSS signature of its possession message, at the reserved leaf.
+    pub possession: XmssSignature,
+    /// The registrant's BLS signature of the registration.
+    pub signature: BlsSignature,
+}
+
+/// Each validator's post-quantum keys, by validator index.
+pub type ValidatorPQKeyMaterial = ProgressiveList<PQKeyMaterial>;
+/// The epoch of each validator's last key change, by validator index.
+pub type ValidatorPQKeyChangeEpochs = ProgressiveList<Epoch>;
+/// Each builder's post-quantum key, by builder index.
+pub type BuilderPQKeyMaterial = ProgressiveList<PQKeyMaterial>;
+/// The epoch of each builder's last key change, by builder index.
+pub type BuilderPQKeyChangeEpochs = ProgressiveList<Epoch>;
+/// The key registrations a block carries.
+pub type PQKeyRegistrations = ProgressiveList<SignedPQKeyRegistration>;
+
 /// Heze's block body: gloas's without `eth1_data` and `deposits` (EIP-8015).
 ///
 /// The two removed fields stay as gaps in the progressive container's
@@ -105,7 +224,7 @@ pub struct SignedInclusionList {
     SszDecode,
     HashTreeRoot,
 )]
-#[ssz(progressive_container, active_fields = [1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1])]
+#[ssz(progressive_container, active_fields = [1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1])]
 pub struct BeaconBlockBody {
     /// The proposer's contribution to the chain's randomness, which is a
     /// signature over the current epoch and so cannot be chosen freely.
@@ -137,6 +256,9 @@ pub struct BeaconBlockBody {
     /// forward so `process_payload_attestation` and friends do not need a
     /// separate fetch of the previous envelope.
     pub parent_execution_requests: ExecutionRequests,
+    /// Post-quantum key registrations (EIP-8450), processed after every other operation.
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
+    pub pq_key_registrations: PQKeyRegistrations,
 }
 
 impl BeaconBlockBody {
@@ -202,7 +324,7 @@ pub struct SignedBeaconBlock {
 /// `latest_execution_payload_bid`, whose heze shape carries
 /// `inclusion_list_bits` (see [`super::gloas::ExecutionPayloadBid`]).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
-#[ssz(progressive_container, active_fields = [1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])]
+#[ssz(progressive_container, active_fields = [1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])]
 pub struct BeaconState {
     // -- Versioning --
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
@@ -334,12 +456,27 @@ pub struct BeaconState {
     /// `process_ptc_window`.
     #[serde(serialize_with = "crate::beacon::serde_helpers::nested_quoted_u64_seq::serialize")]
     pub ptc_window: PayloadTimelinessCommitteeWindow,
+
+    // -- Post-quantum key registry (EIP-8450) --
+    /// Each validator's registered keys, the all-zero entry for one without.
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
+    pub post_quantum_key_material: ValidatorPQKeyMaterial,
+    /// The epoch of each validator's last key change, the far future epoch if it never registered.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
+    pub post_quantum_key_change_epochs: ValidatorPQKeyChangeEpochs,
+    /// Each builder's registered key, the all-zero entry for one without.
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
+    pub builder_post_quantum_key_material: BuilderPQKeyMaterial,
+    /// The epoch of each builder's last key change, its deposit epoch if it never registered.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
+    pub builder_post_quantum_key_change_epochs: BuilderPQKeyChangeEpochs,
 }
 
 impl From<super::gloas::BeaconBlockBody> for BeaconBlockBody {
     /// Drops `eth1_data` and `deposits`, the two fields EIP-8015 removes. The
     /// bid is carried over as is: a caller building a heze body gives it its
     /// heze shape (`inclusion_list_bits`) first.
+    /// The body starts with no key registration (EIP-8450).
     fn from(body: super::gloas::BeaconBlockBody) -> Self {
         Self {
             randao_reveal: body.randao_reveal,
@@ -353,6 +490,7 @@ impl From<super::gloas::BeaconBlockBody> for BeaconBlockBody {
             signed_execution_payload_bid: body.signed_execution_payload_bid,
             payload_attestations: body.payload_attestations,
             parent_execution_requests: body.parent_execution_requests,
+            pq_key_registrations: PQKeyRegistrations::default(),
         }
     }
 }
@@ -360,6 +498,7 @@ impl From<super::gloas::BeaconBlockBody> for BeaconBlockBody {
 impl From<BeaconBlockBody> for super::gloas::BeaconBlockBody {
     /// The reverse of the conversion above, with the removed fields at their
     /// defaults, for code that reads a body through gloas's shape.
+    /// The key registrations, which gloas has no field for, are dropped.
     fn from(body: BeaconBlockBody) -> Self {
         Self {
             randao_reveal: body.randao_reveal,
@@ -384,7 +523,21 @@ impl From<super::gloas::BeaconState> for BeaconState {
     /// `eth1_deposit_index`, `deposit_requests_start_index`) and keeps the rest
     /// untouched, `fork` and the bid's shape included: `upgrade_to_heze` sets
     /// those two itself.
+    /// It also builds EIP-8450's empty key registry: one unset entry per validator and per builder.
     fn from(pre: super::gloas::BeaconState) -> Self {
+        // EIP-8450: every validator and builder starts without keys.
+        // A builder's never-registered marker is its deposit epoch.
+        let post_quantum_key_material = vec![PQKeyMaterial::default(); pre.validators.len()].into();
+        let post_quantum_key_change_epochs =
+            vec![constants::FAR_FUTURE_EPOCH; pre.validators.len()].into();
+        let builder_post_quantum_key_material =
+            vec![PQKeyMaterial::default(); pre.builders.len()].into();
+        let builder_post_quantum_key_change_epochs = pre
+            .builders
+            .iter()
+            .map(|builder| builder.deposit_epoch)
+            .collect::<Vec<_>>()
+            .into();
         Self {
             genesis_time: pre.genesis_time,
             genesis_validators_root: pre.genesis_validators_root,
@@ -428,6 +581,10 @@ impl From<super::gloas::BeaconState> for BeaconState {
             latest_execution_payload_bid: pre.latest_execution_payload_bid,
             payload_expected_withdrawals: pre.payload_expected_withdrawals,
             ptc_window: pre.ptc_window,
+            post_quantum_key_material,
+            post_quantum_key_change_epochs,
+            builder_post_quantum_key_material,
+            builder_post_quantum_key_change_epochs,
         }
     }
 }
