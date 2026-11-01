@@ -72,15 +72,18 @@ pub const GLOAS_TOPIC_KINDS: [&str; 4] = [
 
 /// Topic kind for heze inclusion lists (EIP-7805).
 pub const INCLUSION_LIST: &str = "inclusion_list";
+/// Topic kind for heze post-quantum key registrations (EIP-8450).
+pub const PQ_KEY_REGISTRATION: &str = "pq_key_registration";
 
-/// The topic kinds heze subscribes to: gloas's, plus the inclusion list
-/// topic, which no earlier digest carries.
-pub const HEZE_TOPIC_KINDS: [&str; 5] = [
+/// The topic kinds heze subscribes to: gloas's, plus the inclusion list and
+/// key registration topics, which no earlier digest carries.
+pub const HEZE_TOPIC_KINDS: [&str; 6] = [
     EXECUTION_PAYLOAD,
     PAYLOAD_ATTESTATION_MESSAGE,
     EXECUTION_PAYLOAD_BID,
     PROPOSER_PREFERENCES,
     INCLUSION_LIST,
+    PQ_KEY_REGISTRATION,
 ];
 
 /// Every topic kind this node subscribes to at every fork, in the order they

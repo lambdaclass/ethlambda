@@ -572,6 +572,19 @@ pub mod mainnet {
     /// `InclusionListCommittee` (`Vector<ValidatorIndex, INCLUSION_LIST_COMMITTEE_SIZE>`)
     /// and `InclusionListBits` (`Bitvector[INCLUSION_LIST_COMMITTEE_SIZE]`).
     pub const INCLUSION_LIST_COMMITTEE_SIZE: usize = 16;
+
+    // --- Post-quantum key registry (EIP-8450) ---
+
+    /// Bounds `BeaconBlockBody.pq_key_registrations` (EIP-8450).
+    ///
+    /// Each registration carries a 2404-byte leanXMSS proof, so eight cap a block's near 20 KB.
+    pub const MAX_PQ_KEY_REGISTRATIONS: u64 = 8;
+
+    /// Minimum epochs between two changes of one index's post-quantum keys (EIP-8450).
+    ///
+    /// 256 epochs last about 27 hours at 12-second slots.
+    /// It must be at least 1: replay protection relies on each change landing in a later epoch.
+    pub const MIN_PQ_KEY_CHANGE_DELAY: u64 = 256;
 }
 
 /// The minimal preset: the same shape as [`mainnet`], scaled down so spec test
@@ -1090,6 +1103,14 @@ pub mod minimal {
     /// Members of a slot's inclusion list committee. Not customized: equal to
     /// mainnet's.
     pub const INCLUSION_LIST_COMMITTEE_SIZE: usize = 16;
+
+    // --- Post-quantum key registry (EIP-8450) ---
+
+    /// Bounds `BeaconBlockBody.pq_key_registrations`. Not customized: equal to mainnet's.
+    pub const MAX_PQ_KEY_REGISTRATIONS: u64 = 8;
+
+    /// Minimum epochs between two changes of one index's keys, customized down from 256.
+    pub const MIN_PQ_KEY_CHANGE_DELAY: u64 = 8;
 }
 
 #[cfg(not(feature = "preset-minimal"))]
@@ -1671,6 +1692,7 @@ mod tests {
 
         in_both!(usize: PTC_SIZE, PTC_WINDOW_LENGTH, BUILDER_PENDING_PAYMENTS_LENGTH);
         in_both!(usize: INCLUSION_LIST_COMMITTEE_SIZE);
+        in_both!(u64: MAX_PQ_KEY_REGISTRATIONS, MIN_PQ_KEY_CHANGE_DELAY);
         in_both!(u64:
             MAX_PAYLOAD_ATTESTATIONS, MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD,
             MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD, MAX_BUILDERS_PER_WITHDRAWALS_SWEEP,

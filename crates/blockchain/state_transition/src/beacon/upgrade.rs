@@ -959,17 +959,15 @@ fn requeue(
 /// builder. From the fork onward, a builder is created or topped up only
 /// through a `BuilderDepositRequest` (EIP-8282).
 ///
-/// A deposit for an already-registered validator stays queued untouched. A
-/// deposit whose pubkey neither registry recognizes yet is onboarded as a
-/// builder only if its withdrawal credential is builder-prefixed, no deposit
-/// already re-queued in this same pass could still turn that pubkey into a
-/// validator instead (the specification's `is_pending_validator`),
-/// and its signature checks out. A deposit that fails the credential or
-/// pending-validator check stays queued instead; one that fails the
-/// signature check is dropped outright, matching phase0's own "an invalid
-/// signature just means the deposit is not credited" rule one level up. A
-/// deposit for an already-registered builder tops up its balance directly
-/// instead of registering a second record.
+/// Only a deposit with a builder withdrawal credential can fund a builder.
+/// Any other deposit stays queued, even when a builder holds its pubkey.
+/// A builder deposit for a registered builder tops up that builder.
+/// A builder deposit for a new pubkey registers a builder if its signature checks out.
+/// That holds even when a validator already uses the pubkey.
+/// A new-pubkey deposit with a bad signature stays queued if it can still fund a validator.
+/// It can when a validator holds the pubkey or `is_pending_validator` says one will.
+/// Otherwise it is dropped.
+/// These rules are consensus-specs #5736.
 ///
 /// The pending deposit queue might be large at the fork, so every
 /// membership question this asks per deposit is kept O(1) amortized rather
@@ -1020,23 +1018,16 @@ fn onboard_builders_from_pending_deposits(state: &mut BeaconState, config: &Conf
     let queued = crate::beacon::helpers::electra::pending_queue_fields(state, "onboard_builders")?
         .take_pending_deposits();
     for deposit in queued {
-        if validator_pubkeys.contains(&deposit.pubkey) {
+        // consensus-specs #5736: only builder-credentialed deposits can fund builders.
+        if !crate::beacon::helpers::gloas::is_builder_withdrawal_credential(
+            deposit.withdrawal_credentials,
+        ) {
             requeue(&mut pending_deposits, &mut pending_index, deposit);
             continue;
         }
 
         match builder_indices.get(&deposit.pubkey).copied() {
             None => {
-                if !crate::beacon::helpers::gloas::is_builder_withdrawal_credential(
-                    deposit.withdrawal_credentials,
-                ) {
-                    requeue(&mut pending_deposits, &mut pending_index, deposit);
-                    continue;
-                }
-                if pending_index.is_pending_validator(&pending_deposits, deposit.pubkey, config) {
-                    requeue(&mut pending_deposits, &mut pending_index, deposit);
-                    continue;
-                }
                 if !crate::beacon::stf::electra::is_valid_deposit_signature(
                     deposit.pubkey,
                     deposit.withdrawal_credentials,
@@ -1044,6 +1035,16 @@ fn onboard_builders_from_pending_deposits(state: &mut BeaconState, config: &Conf
                     &deposit.signature,
                     config,
                 ) {
+                    // Preserve validator top-ups when no builder can receive them.
+                    if validator_pubkeys.contains(&deposit.pubkey)
+                        || pending_index.is_pending_validator(
+                            &pending_deposits,
+                            deposit.pubkey,
+                            config,
+                        )
+                    {
+                        requeue(&mut pending_deposits, &mut pending_index, deposit);
+                    }
                     continue;
                 }
 
@@ -1706,5 +1707,208 @@ mod tests {
         // (not just each function in isolation) is wired correctly.
         let (fulu_state, _config) = advance_to(ForkName::Fulu, 4);
         assert_eq!(fulu_state.fork_name(), ForkName::Fulu);
+    }
+
+    // A deposit for key `key`, with `prefix` credentials, validly signed only when `signed`.
+    fn onboarding_deposit(
+        key: usize,
+        prefix: u8,
+        amount: crate::beacon::primitives::Gwei,
+        signed: bool,
+        config: &Config,
+    ) -> electra::PendingDeposit {
+        use crate::beacon::containers::shared::DepositMessage;
+        use crate::beacon::helpers::misc::{compute_deposit_domain, compute_signing_root};
+
+        let secret_key = crate::beacon::helpers::test_state::secret_key_for(key);
+        let pubkey = BlsPubkey(secret_key.sk_to_pk().to_bytes());
+        let mut withdrawal_credentials = Bytes32::ZERO;
+        withdrawal_credentials.0[0] = prefix;
+        withdrawal_credentials.0[12..].fill(key as u8 + 1);
+        let message = DepositMessage {
+            pubkey,
+            withdrawal_credentials,
+            amount,
+        };
+        let domain = compute_deposit_domain(config.genesis_fork_version);
+        let signing_root = compute_signing_root(message.hash_tree_root(), domain);
+        let signature = if signed {
+            let signature = secret_key.sign(signing_root.as_slice(), crate::beacon::bls::DST, &[]);
+            BlsSignature(signature.to_bytes())
+        } else {
+            BlsSignature::default()
+        };
+        electra::PendingDeposit {
+            pubkey,
+            withdrawal_credentials,
+            amount,
+            signature,
+            slot: constants::GENESIS_SLOT,
+        }
+    }
+
+    // Runs the onboarding pass over `deposits` on a gloas state whose validators hold keys 0 and 1.
+    fn onboard(
+        deposits: Vec<electra::PendingDeposit>,
+        config: &Config,
+    ) -> (Vec<gloas::Builder>, Vec<electra::PendingDeposit>) {
+        let mut state =
+            crate::beacon::helpers::test_state::with_signing_validators_at(ForkName::Gloas, 2);
+        state.apply_pending_mutations();
+        let BeaconState::Gloas(inner) = &mut state else {
+            unreachable!("built as gloas");
+        };
+        for deposit in deposits {
+            inner.pending_deposits.push(deposit);
+        }
+        onboard_builders_from_pending_deposits(&mut state, config).unwrap();
+        let BeaconState::Gloas(inner) = state else {
+            unreachable!("built as gloas");
+        };
+        let builders = inner.builders.iter().cloned().collect();
+        let pending = inner.pending_deposits.iter().cloned().collect();
+        (builders, pending)
+    }
+
+    #[test]
+    fn onboarding_registers_a_builder_under_a_validators_pubkey() {
+        let config = Config::mainnet();
+        let amount = preset::MIN_DEPOSIT_AMOUNT;
+        // Key 0 is already a validator.
+        let deposit = onboarding_deposit(
+            0,
+            constants::BUILDER_WITHDRAWAL_PREFIX,
+            amount,
+            true,
+            &config,
+        );
+
+        let (builders, pending) = onboard(vec![deposit.clone()], &config);
+
+        assert_eq!(builders.len(), 1);
+        assert_eq!(builders[0].pubkey, deposit.pubkey);
+        assert_eq!(builders[0].balance, amount);
+        assert_eq!(
+            builders[0].execution_address,
+            ExecutionAddress::from_slice(&deposit.withdrawal_credentials.0[12..])
+        );
+        assert_eq!(pending, vec![]);
+    }
+
+    #[test]
+    fn onboarding_tops_up_a_builder_from_an_unsigned_builder_deposit() {
+        let config = Config::mainnet();
+        let amount = preset::MIN_DEPOSIT_AMOUNT;
+        let prefix = constants::BUILDER_WITHDRAWAL_PREFIX;
+        let registration = onboarding_deposit(0, prefix, amount, true, &config);
+        let topup = onboarding_deposit(0, prefix, amount * 2, false, &config);
+
+        let (builders, pending) = onboard(vec![registration, topup], &config);
+
+        // The top-up funds the builder, not the validator under the same key.
+        assert_eq!(builders.len(), 1);
+        assert_eq!(builders[0].balance, amount * 3);
+        assert_eq!(pending, vec![]);
+    }
+
+    #[test]
+    fn onboarding_keeps_a_non_builder_deposit_queued_for_a_builders_pubkey() {
+        let config = Config::mainnet();
+        let amount = preset::MIN_DEPOSIT_AMOUNT;
+        // Key 5 is not a validator.
+        let registration = onboarding_deposit(
+            5,
+            constants::BUILDER_WITHDRAWAL_PREFIX,
+            amount,
+            true,
+            &config,
+        );
+        let validator_deposit = onboarding_deposit(
+            5,
+            constants::COMPOUNDING_WITHDRAWAL_PREFIX,
+            amount,
+            true,
+            &config,
+        );
+
+        let (builders, pending) = onboard(vec![registration, validator_deposit.clone()], &config);
+
+        assert_eq!(builders.len(), 1);
+        assert_eq!(builders[0].balance, amount);
+        assert_eq!(pending, vec![validator_deposit]);
+    }
+
+    #[test]
+    fn onboarding_registers_a_builder_behind_a_pending_validator_deposit() {
+        let config = Config::mainnet();
+        let amount = preset::MIN_DEPOSIT_AMOUNT;
+        let validator_deposit = onboarding_deposit(
+            5,
+            constants::COMPOUNDING_WITHDRAWAL_PREFIX,
+            amount,
+            true,
+            &config,
+        );
+        let registration = onboarding_deposit(
+            5,
+            constants::BUILDER_WITHDRAWAL_PREFIX,
+            amount,
+            true,
+            &config,
+        );
+
+        let (builders, pending) = onboard(vec![validator_deposit.clone(), registration], &config);
+
+        assert_eq!(builders.len(), 1);
+        assert_eq!(builders[0].pubkey, validator_deposit.pubkey);
+        assert_eq!(builders[0].balance, amount);
+        assert_eq!(pending, vec![validator_deposit]);
+    }
+
+    #[test]
+    fn onboarding_keeps_an_invalid_builder_deposit_only_when_it_can_fund_a_validator() {
+        let config = Config::mainnet();
+        let amount = preset::MIN_DEPOSIT_AMOUNT;
+        let builder = constants::BUILDER_WITHDRAWAL_PREFIX;
+        // Key 0 is a registered validator.
+        let for_validator = onboarding_deposit(0, builder, amount, false, &config);
+        let validator_topup = onboarding_deposit(
+            0,
+            constants::ETH1_ADDRESS_WITHDRAWAL_PREFIX,
+            amount,
+            false,
+            &config,
+        );
+        // Key 5 has a valid validator deposit queued ahead of its invalid builder deposit.
+        let pending_validator = onboarding_deposit(
+            5,
+            constants::COMPOUNDING_WITHDRAWAL_PREFIX,
+            amount,
+            true,
+            &config,
+        );
+        let for_pending_validator = onboarding_deposit(5, builder, amount, false, &config);
+        // Key 6 can fund nothing, so its invalid builder deposit is dropped.
+        let unclaimed = onboarding_deposit(6, builder, amount, false, &config);
+        let deposits = vec![
+            for_validator.clone(),
+            validator_topup.clone(),
+            pending_validator.clone(),
+            for_pending_validator.clone(),
+            unclaimed,
+        ];
+
+        let (builders, pending) = onboard(deposits, &config);
+
+        assert_eq!(builders, vec![]);
+        assert_eq!(
+            pending,
+            vec![
+                for_validator,
+                validator_topup,
+                pending_validator,
+                for_pending_validator,
+            ]
+        );
     }
 }

@@ -202,7 +202,10 @@ const KEY_ANCHOR_SLOT: &[u8] = b"anchor_slot";
 /// 8 appended `SLOT_DURATION_MS_HEZE` and `MIN_BLOB_DATA_RETENTION_MS` to
 /// `Config` (EIP-8198), so a directory written by version 7 decodes its stored
 /// config into the wrong fields.
-pub const DB_VERSION: u64 = 8;
+///
+/// 9 appended EIP-8450's post-quantum key registry to heze's block body and
+/// state, so a heze block or state written by version 8 no longer decodes.
+pub const DB_VERSION: u64 = 9;
 
 /// The consensus protocol a data directory holds.
 ///

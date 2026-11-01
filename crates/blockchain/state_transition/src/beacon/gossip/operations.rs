@@ -16,17 +16,19 @@
 //! advanced: an operation has no block of its own to name one, and the
 //! specification checks it against the head without a slot transition. The
 //! rules do not run `process_*`, so they also do not apply a block's own
-//! extra conditions (an exit's pending balance, say); block packing filters
-//! those.
+//! extra conditions; block packing filters those. Electra's modified
+//! `validate_voluntary_exit_gossip` is the exception: it ignores an exit while
+//! the validator has a pending partial withdrawal (consensus-specs #5764).
 
 use std::collections::HashSet;
 
 use ethlambda_types::beacon::containers::capella::SignedBLSToExecutionChange;
 use ethlambda_types::beacon::containers::electra::AttesterSlashing;
+use ethlambda_types::beacon::containers::heze::SignedPQKeyRegistration;
 use ethlambda_types::beacon::containers::shared::{ProposerSlashing, SignedVoluntaryExit};
 use ethlambda_types::beacon::operation::BeaconOperation;
 
-use super::{IgnoreReason, Outcome, RejectReason, is_future_epoch};
+use super::{IgnoreReason, Outcome, RejectReason, is_future_epoch, pq_key_registration};
 use crate::beacon::ForkName;
 use crate::beacon::bls;
 use crate::beacon::config::Config;
@@ -38,12 +40,14 @@ use crate::beacon::containers::BeaconState;
 use crate::beacon::fork_choice::Store;
 use crate::beacon::hash::hash;
 use crate::beacon::helpers::accessors::{get_current_epoch, get_domain};
-use crate::beacon::helpers::electra::is_valid_indexed_attestation;
+use crate::beacon::helpers::electra::{
+    get_pending_balance_to_withdraw, is_valid_indexed_attestation,
+};
 use crate::beacon::helpers::misc::{compute_domain, compute_epoch_at_slot, compute_signing_root};
 use crate::beacon::helpers::predicates::{
     is_active_validator, is_slashable_attestation_data, is_slashable_validator,
 };
-use crate::beacon::primitives::{HashTreeRoot as _, ValidatorIndex};
+use crate::beacon::primitives::{Epoch, HashTreeRoot as _, ValidatorIndex};
 
 /// What `voluntary_exit`, `proposer_slashing`, `attester_slashing` and
 /// `bls_to_execution_change` have already accepted: the specification's
@@ -57,6 +61,8 @@ pub struct SeenOperations {
     proposer_slashings: HashSet<ValidatorIndex>,
     attester_slashed: HashSet<ValidatorIndex>,
     bls_to_execution_changes: HashSet<ValidatorIndex>,
+    /// Keyed by the registrant and the change it names (EIP-8450): a later change is a new pair.
+    pq_key_registrations: HashSet<(ValidatorIndex, Epoch)>,
 }
 
 /// The indices both of an attester slashing's attestations name: the
@@ -93,6 +99,9 @@ impl SeenOperations {
             BeaconOperation::BlsToExecutionChange(change) => !self
                 .bls_to_execution_changes
                 .contains(&change.message.validator_index),
+            BeaconOperation::PqKeyRegistration(registration) => !self
+                .pq_key_registrations
+                .contains(&registration_pair(registration)),
         }
     }
 
@@ -120,8 +129,17 @@ impl SeenOperations {
             BeaconOperation::BlsToExecutionChange(change) => self
                 .bls_to_execution_changes
                 .insert(change.message.validator_index),
+            BeaconOperation::PqKeyRegistration(registration) => self
+                .pq_key_registrations
+                .insert(registration_pair(registration)),
         }
     }
+}
+
+/// The pair a registration's first-seen record keys on: its index and the change it names.
+fn registration_pair(registration: &SignedPQKeyRegistration) -> (ValidatorIndex, Epoch) {
+    let message = &registration.message;
+    (message.index, message.previous_change_epoch)
 }
 
 /// Everything the specification checks before it reads the head state: the
@@ -187,6 +205,10 @@ pub fn cheap_checks(
                 return Err(Outcome::Ignore(IgnoreReason::BeforeFork));
             }
         }
+        // The first-seen record is judged later, at its place in the specification's order.
+        BeaconOperation::PqKeyRegistration(_) => {
+            pq_key_registration::cheap_checks(&config, now_ms)?
+        }
     }
     Ok(())
 }
@@ -198,14 +220,25 @@ pub fn cheap_checks(
 /// electra or fulu. That is a deliberate deviation: this build only serves
 /// electra-shaped operations, where the specification would validate older
 /// forks' shapes too.
-pub fn stateful_checks(store: &Store, operation: &BeaconOperation) -> Outcome {
+/// A post-quantum key registration is the exception: it is judged on a heze head.
+///
+/// `first_seen` tells whether the seen records held no entry for the operation when it arrived.
+/// Only the registration reads it, at its place in the specification's order.
+pub fn stateful_checks(
+    store: &Store,
+    operation: &BeaconOperation,
+    first_seen: bool,
+    now_ms: u64,
+) -> Outcome {
     let Some((_slot, head_root)) = store.beacon_head() else {
         return Outcome::Ignore(IgnoreReason::StateUnavailable);
     };
     let Ok(Some(state)) = store.get_state(&head_root) else {
         return Outcome::Ignore(IgnoreReason::StateUnavailable);
     };
-    if !matches!(state.fork_name(), ForkName::Electra | ForkName::Fulu) {
+    // A registration carries its own fork rule: the head state must have the registry.
+    let electra_shaped = matches!(state.fork_name(), ForkName::Electra | ForkName::Fulu);
+    if !electra_shaped && !matches!(operation, BeaconOperation::PqKeyRegistration(_)) {
         return Outcome::Ignore(IgnoreReason::StateUnavailable);
     }
     let config = store.config();
@@ -214,6 +247,9 @@ pub fn stateful_checks(store: &Store, operation: &BeaconOperation) -> Outcome {
         BeaconOperation::ProposerSlashing(op) => proposer_slashing(&state, op),
         BeaconOperation::AttesterSlashing(op) => attester_slashing(&state, op),
         BeaconOperation::BlsToExecutionChange(op) => bls_to_execution_change(&state, op, &config),
+        BeaconOperation::PqKeyRegistration(op) => {
+            pq_key_registration::stateful_checks(&state, op, first_seen, &config, now_ms)
+        }
     };
     verdict.map_or_else(|outcome| outcome, |()| Outcome::Accept)
 }
@@ -239,6 +275,13 @@ fn voluntary_exit(state: &BeaconState, signed: &SignedVoluntaryExit, config: &Co
                 .saturating_add(config.shard_committee_period)
     {
         return Err(Outcome::Reject(RejectReason::InvalidOperation));
+    }
+    // [New in Electra:EIP7251] [IGNORE] The validator has no pending partial
+    // withdrawals (consensus-specs #5764).
+    let pending_balance = get_pending_balance_to_withdraw(state, exit.validator_index)
+        .map_err(|_| Outcome::Ignore(IgnoreReason::StateUnavailable))?;
+    if pending_balance != 0 {
+        return Err(Outcome::Ignore(IgnoreReason::PendingPartialWithdrawals));
     }
     // [Modified in Deneb:EIP7044] [REJECT] The signature, under the capella
     // fork version so exits stay valid across forks.
@@ -365,7 +408,7 @@ pub fn validate(
     if let Err(outcome) = cheap_checks(seen, store, operation, now_ms) {
         return outcome;
     }
-    stateful_checks(store, operation)
+    stateful_checks(store, operation, seen.is_new(operation), now_ms)
 }
 
 #[cfg(test)]
@@ -492,7 +535,7 @@ mod tests {
     fn no_head_state_is_ignored() {
         let store = store(0);
         assert_eq!(
-            stateful_checks(&store, &exit_for(0)),
+            stateful_checks(&store, &exit_for(0), true, 0),
             Outcome::Ignore(IgnoreReason::StateUnavailable)
         );
     }
@@ -501,18 +544,46 @@ mod tests {
     fn an_exit_for_an_unknown_validator_is_rejected() {
         let store = store_with_head(fulu_parent(0));
         assert_eq!(
-            stateful_checks(&store, &exit_for(1_000)),
+            stateful_checks(&store, &exit_for(1_000), true, 0),
             Outcome::Reject(RejectReason::UnknownValidator)
         );
     }
 
     #[test]
     fn a_validly_signed_exit_is_accepted() {
+        assert_eq!(check_signed_exit(None), Outcome::Accept);
+    }
+
+    #[test]
+    fn an_exit_with_a_pending_partial_withdrawal_is_ignored() {
+        // Validator 2 still waits on a partial withdrawal.
+        assert_eq!(
+            check_signed_exit(Some(2)),
+            Outcome::Ignore(IgnoreReason::PendingPartialWithdrawals)
+        );
+    }
+
+    #[test]
+    fn another_validators_pending_partial_withdrawal_does_not_block_an_exit() {
+        assert_eq!(check_signed_exit(Some(3)), Outcome::Accept);
+    }
+
+    // Validator 2's signed exit, against a head past its shard committee period.
+    // `withdrawing` names a validator with a pending partial withdrawal.
+    fn check_signed_exit(withdrawing: Option<ValidatorIndex>) -> Outcome {
         let mut state = fulu_parent(0);
         // Past `SHARD_COMMITTEE_PERIOD` epochs since activation.
         let config = crate::beacon::config::Config::mainnet();
         *state.slot_mut() =
             (config.shard_committee_period + 1) * crate::beacon::preset::SLOTS_PER_EPOCH;
+        if let (Some(validator_index), BeaconState::Fulu(inner)) = (withdrawing, &mut state) {
+            let withdrawal = electra::PendingPartialWithdrawal {
+                validator_index,
+                amount: 1,
+                withdrawable_epoch: 0,
+            };
+            inner.pending_partial_withdrawals.push(withdrawal).unwrap();
+        }
         let message = shared::VoluntaryExit {
             epoch: 0,
             validator_index: 2,
@@ -530,6 +601,6 @@ mod tests {
             message,
             signature: sign_for(2, signing_root),
         });
-        assert_eq!(stateful_checks(&store, &exit), Outcome::Accept);
+        stateful_checks(&store, &exit, true, 0)
     }
 }

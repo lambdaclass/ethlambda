@@ -80,6 +80,10 @@ pub const BLS_PUBKEY_SIZE: usize = 48;
 pub const BLS_SIGNATURE_SIZE: usize = 96;
 /// The number of bytes in a KZG commitment or proof, both compressed G1 points.
 pub const KZG_POINT_SIZE: usize = 48;
+/// Bytes in a leanXMSS public key: the top tree's root, then the public parameter (EIP-8450).
+pub const XMSS_PUBLIC_KEY_SIZE: usize = 32;
+/// Bytes in a leanXMSS signature: the leaf index, then two 1200-byte layers (EIP-8450).
+pub const XMSS_SIGNATURE_SIZE: usize = 2404;
 
 /// Formats a fixed-length byte string as `Name(0xabcd…)`.
 ///
@@ -465,6 +469,76 @@ impl fmt::Debug for KzgProof {
     }
 }
 
+/// The root of a VRF tree, which fixes one verifiable random output per index (EIP-8450).
+///
+/// An alias rather than a newtype, like every other 32-byte root here.
+pub type VrfRoot = H256;
+
+/// A leanXMSS public key (EIP-8450).
+///
+/// Not validated on construction: any 32 bytes are a key.
+/// A key that does not decode only fails its proof of possession.
+#[derive(
+    Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, SszEncode, SszDecode, HashTreeRoot,
+)]
+#[ssz(transparent)]
+pub struct XmssPublicKey(pub [u8; XMSS_PUBLIC_KEY_SIZE]);
+
+impl XmssPublicKey {
+    /// Whether this is the all-zero key, which marks an index without registered keys.
+    pub fn is_zero(&self) -> bool {
+        self.0 == [0; XMSS_PUBLIC_KEY_SIZE]
+    }
+}
+
+impl AsRef<[u8]> for XmssPublicKey {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for XmssPublicKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        debug_byte_vector(f, "XmssPublicKey", &self.0)
+    }
+}
+
+/// A leanXMSS signature (EIP-8450): opaque bytes whose first four name the leaf index.
+///
+/// Not validated on construction.
+/// A signature that does not decode only fails verification.
+#[derive(Clone, PartialEq, Eq, Hash, SszEncode, SszDecode, HashTreeRoot)]
+#[ssz(transparent)]
+pub struct XmssSignature(pub [u8; XMSS_SIGNATURE_SIZE]);
+
+impl XmssSignature {
+    /// The leaf index the signature carries, in its first four bytes, little-endian.
+    ///
+    /// See `get_xmss_signature_index` in EIP-8450.
+    pub fn leaf_index(&self) -> u32 {
+        let [b0, b1, b2, b3, ..] = self.0;
+        u32::from_le_bytes([b0, b1, b2, b3])
+    }
+}
+
+impl Default for XmssSignature {
+    fn default() -> Self {
+        Self([0; XMSS_SIGNATURE_SIZE])
+    }
+}
+
+impl AsRef<[u8]> for XmssSignature {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for XmssSignature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        debug_byte_vector(f, "XmssSignature", &self.0)
+    }
+}
+
 /// Implements the Beacon API's `Serialize` for a fixed-width byte newtype:
 /// `0x`-prefixed lowercase hex, always, of the inner bytes.
 ///
@@ -498,7 +572,15 @@ macro_rules! impl_hex_serialize {
     };
 }
 
-impl_hex_serialize!(H160, BlsPubkey, BlsSignature, KzgCommitment, KzgProof);
+impl_hex_serialize!(
+    H160,
+    BlsPubkey,
+    BlsSignature,
+    KzgCommitment,
+    KzgProof,
+    XmssPublicKey,
+    XmssSignature,
+);
 
 /// The `Deserialize` counterpart of [`impl_hex_serialize`], for the types the
 /// Beacon API accepts in a request body: a validator's public key (as a
@@ -521,7 +603,15 @@ macro_rules! impl_hex_deserialize {
     };
 }
 
-impl_hex_deserialize!(BlsPubkey, BlsSignature, H160, KzgCommitment, KzgProof);
+impl_hex_deserialize!(
+    BlsPubkey,
+    BlsSignature,
+    H160,
+    KzgCommitment,
+    KzgProof,
+    XmssPublicKey,
+    XmssSignature,
+);
 
 #[cfg(test)]
 mod tests {
@@ -534,6 +624,39 @@ mod tests {
     /// here and its own `hash_tree_root` takes no hasher.
     fn ssz_root<T: libssz_merkle::HashTreeRoot>(value: &T) -> libssz_merkle::Node {
         libssz_merkle::HashTreeRoot::hash_tree_root(value, &Sha2Hasher)
+    }
+
+    #[test]
+    fn an_xmss_signature_reads_its_leaf_index_little_endian() {
+        // Fixture state: the first four bytes are 01 02 00 00, the rest 0xff.
+        let mut bytes = [0xff; XMSS_SIGNATURE_SIZE];
+        bytes[..4].copy_from_slice(&[0x01, 0x02, 0x00, 0x00]);
+
+        // 0x0201 = 513: little-endian, so the first byte is the lowest.
+        assert_eq!(XmssSignature(bytes).leaf_index(), 513);
+    }
+
+    #[test]
+    fn an_xmss_signature_is_its_2404_bytes_on_the_wire_and_in_json() {
+        let signature = XmssSignature([0xab; XMSS_SIGNATURE_SIZE]);
+
+        // SSZ: the bytes alone, a fixed-size vector.
+        assert_eq!(signature.to_ssz(), vec![0xab; XMSS_SIGNATURE_SIZE]);
+        assert_eq!(
+            XmssSignature::from_ssz_bytes(&signature.to_ssz()).unwrap(),
+            signature
+        );
+
+        // JSON: one 0x-prefixed hex string, which decodes back.
+        let json = serde_json::to_value(&signature).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!(format!("0x{}", "ab".repeat(XMSS_SIGNATURE_SIZE)))
+        );
+        assert_eq!(
+            serde_json::from_value::<XmssSignature>(json).unwrap(),
+            signature
+        );
     }
 
     #[test]

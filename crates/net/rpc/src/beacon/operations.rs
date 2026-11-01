@@ -35,7 +35,9 @@ use ethlambda_state_transition::beacon::gossip::{
 };
 use ethlambda_storage::Store;
 use ethlambda_types::beacon::{
-    containers::{capella::SignedBLSToExecutionChange, electra, shared},
+    containers::{
+        capella::SignedBLSToExecutionChange, electra, heze::SignedPQKeyRegistration, shared,
+    },
     operation::BeaconOperation,
     signing::compute_epoch_at_slot,
 };
@@ -65,6 +67,11 @@ pub(crate) fn routes() -> Router<Store> {
         .route(
             "/eth/v1/beacon/pool/bls_to_execution_changes",
             get(get_bls_to_execution_changes).post(post_bls_to_execution_changes),
+        )
+        // Not yet in the Beacon API: shaped like the BLS change route above (EIP-8450).
+        .route(
+            "/eth/v1/beacon/pool/pq_key_registrations",
+            get(get_pq_key_registrations).post(post_pq_key_registrations),
         )
 }
 
@@ -103,6 +110,11 @@ async fn get_voluntary_exits(State(store): State<Store>) -> Response {
 
 async fn get_bls_to_execution_changes(State(store): State<Store>) -> Response {
     let data = store.operation_pool().bls_to_execution_changes();
+    crate::json_response(serde_json::json!({ "data": data }))
+}
+
+async fn get_pq_key_registrations(State(store): State<Store>) -> Response {
+    let data = store.operation_pool().pq_key_registrations();
     crate::json_response(serde_json::json!({ "data": data }))
 }
 
@@ -165,6 +177,38 @@ async fn post_bls_to_execution_changes(
     batch_response(
         failures,
         "some BLS to execution changes failed validation and were not published",
+    )
+}
+
+/// Validates, pools and publishes each post-quantum key registration of a batch.
+///
+/// The batch answers like the BLS change route: one failure entry per refused registration.
+async fn post_pq_key_registrations(
+    State(store): State<Store>,
+    Extension(p2p): Extension<RpcToP2PRef>,
+    body: Bytes,
+) -> Response {
+    let Ok(registrations) = serde_json::from_slice::<Vec<SignedPQKeyRegistration>>(&body) else {
+        return ApiError::BadRequest("invalid request body").into_response();
+    };
+    let mut failures = Vec::new();
+    for (index, registration) in registrations.into_iter().enumerate() {
+        let registrant = registration.message.index;
+        let operation = BeaconOperation::PqKeyRegistration(Box::new(registration));
+        if let Err(rejection) =
+            accept(&store, &p2p, operation, "post-quantum key registration").await
+        {
+            let message = rejection.message();
+            warn!(registrant, reason = %message, "Refused a submitted post-quantum key registration");
+            failures.push(Failure {
+                index,
+                message: message.to_string().into(),
+            });
+        }
+    }
+    batch_response(
+        failures,
+        "some post-quantum key registrations failed validation and were not published",
     )
 }
 

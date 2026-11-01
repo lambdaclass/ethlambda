@@ -1,18 +1,20 @@
-//! The four operations a block carries besides attestations, as one value for
-//! the code that moves them between gossip, the Beacon API and the pool.
+//! The operations a block carries besides attestations, as one value for the
+//! code that moves them between gossip, the Beacon API and the pool.
 
 use libssz::SszEncode as _;
 
-use super::containers::{capella, electra, shared};
+use super::containers::{capella, electra, heze, shared};
 
-/// One proposer slashing, attester slashing, voluntary exit or BLS change, in
-/// the shapes fulu's gossip topics carry.
+/// One proposer slashing, attester slashing, voluntary exit, BLS change, or
+/// post-quantum key registration, in the shapes their gossip topics carry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BeaconOperation {
     ProposerSlashing(shared::ProposerSlashing),
     AttesterSlashing(electra::AttesterSlashing),
     VoluntaryExit(shared::SignedVoluntaryExit),
     BlsToExecutionChange(capella::SignedBLSToExecutionChange),
+    /// Boxed: its leanXMSS proof makes it about 2.6 KB, far wider than the others.
+    PqKeyRegistration(Box<heze::SignedPQKeyRegistration>),
 }
 
 impl BeaconOperation {
@@ -23,6 +25,7 @@ impl BeaconOperation {
             Self::AttesterSlashing(op) => op.to_ssz(),
             Self::VoluntaryExit(op) => op.to_ssz(),
             Self::BlsToExecutionChange(op) => op.to_ssz(),
+            Self::PqKeyRegistration(op) => op.to_ssz(),
         }
     }
 }

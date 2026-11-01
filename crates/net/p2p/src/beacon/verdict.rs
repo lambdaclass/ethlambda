@@ -105,8 +105,15 @@ pub(crate) enum Validated {
         signed: Box<SignedInclusionList>,
         received_ms: u64,
     },
-    /// One of the four operation topics. Boxed like the other wide payloads.
-    Operation(Box<BeaconOperation>),
+    /// One of the operation topics. Boxed like the other wide payloads.
+    Operation {
+        operation: Box<BeaconOperation>,
+        /// Whether the seen records held nothing for the operation when it arrived.
+        /// A key registration judges it at its place in the specification's order.
+        first_seen: bool,
+        /// The wall-clock milliseconds it arrived at, which time a key change's delay.
+        received_ms: u64,
+    },
     /// A `sync_committee_{subnet_id}` message.
     SyncCommitteeMessage {
         message: SyncCommitteeMessage,
@@ -165,7 +172,11 @@ impl Validated {
             Self::InclusionList { signed, .. } => {
                 gossip::inclusion_list::stateful_checks(store, signed)
             }
-            Self::Operation(operation) => gossip::operations::stateful_checks(store, operation),
+            Self::Operation {
+                operation,
+                first_seen,
+                received_ms,
+            } => gossip::operations::stateful_checks(store, operation, *first_seen, *received_ms),
             Self::SyncCommitteeMessage {
                 message,
                 subnet_id,
@@ -245,7 +256,7 @@ impl Validated {
                 server.seen_inclusion_lists.record(signed);
                 true
             }
-            Self::Operation(operation) => server.seen_operations.record(operation),
+            Self::Operation { operation, .. } => server.seen_operations.record(operation),
             Self::SyncCommitteeMessage {
                 message, subnet_id, ..
             } => {
@@ -310,7 +321,7 @@ impl Validated {
         {
             pool_aggregator_attestation(server, attestation);
         }
-        if let Self::Operation(operation) = &self {
+        if let Self::Operation { operation, .. } = &self {
             // Only an accepted operation is pooled; the chain actor consumes
             // nothing on these topics, so nothing is forwarded to it.
             if outcome == Outcome::Accept {
@@ -447,7 +458,7 @@ impl Validated {
             | Self::Envelope(_)
             | Self::PayloadAttestation(_)
             | Self::InclusionList { .. }
-            | Self::Operation(_)
+            | Self::Operation { .. }
             | Self::SyncCommitteeMessage { .. }
             | Self::SyncContribution(_)
             // The SSE `execution_payload_bid` and `proposer_preferences` events
@@ -486,7 +497,7 @@ fn record_liveness(server: &P2PServer, object: &Validated) {
         | Validated::Envelope(_)
         | Validated::PayloadAttestation(_)
         | Validated::InclusionList { .. }
-        | Validated::Operation(_)
+        | Validated::Operation { .. }
         | Validated::SyncCommitteeMessage { .. }
         | Validated::SyncContribution(_)
         | Validated::ExecutionPayloadBid { .. }
@@ -665,7 +676,7 @@ fn permits_for<'a>(
         | Validated::Attestation { .. }
         | Validated::PayloadAttestation(_)
         | Validated::InclusionList { .. }
-        | Validated::Operation(_) => &server.attestation_validation_permits,
+        | Validated::Operation { .. } => &server.attestation_validation_permits,
         Validated::SyncCommitteeMessage { .. } | Validated::SyncContribution(_) => {
             &server.sync_validation_permits
         }
