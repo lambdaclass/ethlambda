@@ -19,7 +19,7 @@ static ROWS: LazyLock<IntCounterVec> = LazyLock::new(|| {
 static INSERT_FAILURES: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "lean_telemetry_insert_failures_total",
-        "ClickHouse requests (schema or insert) that failed"
+        "Failed ClickHouse insert attempts, refusals included"
     )
     .unwrap()
 });

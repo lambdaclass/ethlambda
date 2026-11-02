@@ -6,8 +6,9 @@
 //! At most one request is in flight, and it starts on a tick, so a steady
 //! trickle is one insert per tick: ClickHouse writes a part per insert. A
 //! failed request leaves its rows at the front of the buffer for the next
-//! tick, and the buffer drops its oldest rows past a cap, so an unreachable
-//! ClickHouse costs bounded memory.
+//! tick, except a batch ClickHouse refuses as malformed (HTTP 400), which is
+//! dropped since a retry would be refused again. The buffer drops its oldest
+//! rows past a cap, so an unreachable ClickHouse costs bounded memory.
 
 use std::collections::VecDeque;
 use std::error::Error as _;
@@ -17,7 +18,7 @@ use reqwest::{Client, RequestBuilder, Url};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::event::{Anchor, BlockEvent, TelemetryConfig, encode};
 use crate::metrics;
@@ -101,10 +102,11 @@ pub(crate) async fn run(
     let urls = Urls::new(&config.url);
     let mut pending: VecDeque<String> = VecDeque::new();
     let mut in_flight: Option<InFlight> = None;
-    // Before the first insert and after every failure: the statement is
+    // Before the first insert and after every failure but a refusal: the statement is
     // idempotent, and rerunning it recreates a table dropped under us.
     let mut needs_schema = true;
     let mut failing = false;
+    let mut rejecting = false;
     let mut tick = tokio::time::interval(limits.flush_interval);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -133,6 +135,7 @@ pub(crate) async fn run(
                     Ok(()) => {
                         metrics::inc_rows_inserted(batch.len() as u64);
                         needs_schema = false;
+                        rejecting = false;
                         if failing {
                             failing = false;
                             info!("Telemetry inserts recovered");
@@ -148,7 +151,13 @@ pub(crate) async fn run(
                     Err(Failure { message, rejected: true }) => {
                         metrics::inc_insert_failures();
                         metrics::inc_rows_dropped(batch.len() as u64);
-                        warn!(rows = batch.len(), err = %message, "ClickHouse rejected a telemetry batch; dropping it");
+                        let rows = batch.len();
+                        if rejecting {
+                            debug!(rows, err = %message, "ClickHouse rejected a telemetry batch");
+                        } else {
+                            rejecting = true;
+                            warn!(rows, err = %message, "ClickHouse rejected a batch; dropping it");
+                        }
                     }
                     Err(Failure { message, rejected: false }) => {
                         metrics::inc_insert_failures();
@@ -229,7 +238,7 @@ async fn insert(
     )
     .await
     .map_err(|mut failure| {
-        if let Some(schema) = schema_error {
+        if let Some(schema) = schema_error.filter(|schema| schema.message != failure.message) {
             failure.message = format!(
                 "{}; the schema statement also failed: {}",
                 failure.message, schema.message
