@@ -614,6 +614,28 @@ mod tests {
     }
 
     #[test]
+    fn repeated_participation_hashes_like_the_flat_list() {
+        use crate::primitives::HashTreeRoot as _;
+        type Flat = libssz_types::SszList<ParticipationFlags, { preset::VALIDATOR_REGISTRY_LIMIT }>;
+
+        for len in LENGTHS {
+            let flat = Flat::try_from(vec![0; len]).unwrap();
+            let bounded = EpochParticipation::repeat(0, len).unwrap();
+            assert_eq!(bounded.hash_tree_root(), flat.hash_tree_root(), "len {len}");
+            assert_eq!(bounded.to_ssz(), flat.to_ssz(), "len {len}");
+
+            let flat = libssz_types::ProgressiveList::<ParticipationFlags>::from(vec![0; len]);
+            let progressive = ProgressiveEpochParticipation::repeat(0, len);
+            assert_eq!(
+                progressive.hash_tree_root(),
+                flat.hash_tree_root(),
+                "len {len}"
+            );
+            assert_eq!(progressive.to_ssz(), flat.to_ssz(), "len {len}");
+        }
+    }
+
+    #[test]
     fn participation_writes_rehash_like_a_rebuilt_list() {
         use crate::primitives::HashTreeRoot as _;
         type Flat = libssz_types::SszList<ParticipationFlags, { preset::VALIDATOR_REGISTRY_LIMIT }>;
