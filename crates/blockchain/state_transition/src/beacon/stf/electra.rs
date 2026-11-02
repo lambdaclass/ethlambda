@@ -76,6 +76,7 @@ use crate::beacon::helpers::misc::{
 };
 use crate::beacon::helpers::mutators::{decrease_balance, increase_balance};
 use crate::beacon::helpers::predicates::{is_active_validator, is_slashable_attestation_data};
+use crate::beacon::helpers::target_balances::TargetBalanceDelta;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
     BlsPubkey, BlsSignature, Bytes32, Gwei, HashTreeRoot as _, ParticipationFlags, ValidatorIndex,
@@ -641,6 +642,7 @@ pub fn process_attestation(
     attestation: &electra::Attestation,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    target_delta: Option<&TargetBalanceDelta>,
 ) -> Result<()> {
     let data = attestation.data;
     let current_epoch = get_current_epoch(state);
@@ -791,6 +793,11 @@ pub fn process_attestation(
             proposer_reward_numerator = proposer_reward_numerator
                 .checked_add(reward)
                 .ok_or(Error::ArithmeticOverflow("proposer_reward_numerator"))?;
+        }
+        if let Some(delta) = target_delta
+            && has_flag(new_flags, constants::TIMELY_TARGET_FLAG_INDEX)
+        {
+            delta.record_new_target(current_epoch_target, state.validator(index)?);
         }
         if new_flags != 0 {
             updates.push((index, new_flags));
@@ -1785,6 +1792,7 @@ pub fn process_operations(
     config: &Config,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    target_delta: Option<&TargetBalanceDelta>,
 ) -> Result<()> {
     let deposit_requests_start_index =
         block_ref(state, "process_operations")?.deposit_requests_start_index();
@@ -1810,7 +1818,13 @@ pub fn process_operations(
     }
     // [Modified in Electra:EIP7549]
     for attestation in body.attestations.iter() {
-        process_attestation(state, attestation, committees, active_balances)?;
+        process_attestation(
+            state,
+            attestation,
+            committees,
+            active_balances,
+            target_delta,
+        )?;
     }
     for deposit in body.deposits.iter() {
         process_deposit(state, deposit, config)?;
@@ -1865,7 +1879,14 @@ pub fn process_block(
     process_execution_payload(state, &block.body, config, engine)?;
     super::block::process_randao(state, &block.body.randao_reveal, options.randao)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
-    process_operations(state, &block.body, config, committees, active_balances)?;
+    process_operations(
+        state,
+        &block.body,
+        config,
+        committees,
+        active_balances,
+        options.target_delta,
+    )?;
     super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
     Ok(())
 }

@@ -71,6 +71,7 @@ use crate::beacon::helpers::gloas::{
 use crate::beacon::helpers::misc::{compute_domain, compute_epoch_at_slot, compute_signing_root};
 use crate::beacon::helpers::mutators::{decrease_balance, increase_balance, slash_validator};
 use crate::beacon::helpers::predicates::is_slashable_attestation_data;
+use crate::beacon::helpers::target_balances::TargetBalanceDelta;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
     Bytes32, ExecutionAddress, Gwei, HashTreeRoot as _, ParticipationFlags, Root, Slot,
@@ -133,6 +134,7 @@ pub fn process_block(
         config,
         committees,
         active_balances,
+        options.target_delta,
     )?;
     super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
     Ok(())
@@ -1303,6 +1305,7 @@ pub fn process_attestation(
     parent_slot: Slot,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    target_delta: Option<&TargetBalanceDelta>,
 ) -> Result<()> {
     let data = attestation.data;
     let current_epoch = get_current_epoch(state);
@@ -1469,6 +1472,11 @@ pub fn process_attestation(
                     Error::ArithmeticOverflow("process_attestation: proposer_reward_numerator"),
                 )?;
             }
+            if let Some(delta) = target_delta
+                && has_flag(new_flags, constants::TIMELY_TARGET_FLAG_INDEX)
+            {
+                delta.record_new_target(current_epoch_target, state.validator(index)?);
+            }
             let will_set_new_flag = new_flags != 0;
 
             if will_set_new_flag
@@ -1588,6 +1596,7 @@ pub fn process_operations(
     config: &Config,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    target_delta: Option<&TargetBalanceDelta>,
 ) -> Result<()> {
     verify(
         body.deposits.is_empty(),
@@ -1629,7 +1638,14 @@ pub fn process_operations(
     }
     // [Modified in Gloas:EIP7732]
     for attestation in body.attestations.iter() {
-        process_attestation(state, attestation, parent_slot, committees, active_balances)?;
+        process_attestation(
+            state,
+            attestation,
+            parent_slot,
+            committees,
+            active_balances,
+            target_delta,
+        )?;
     }
     for voluntary_exit in body.voluntary_exits.iter() {
         crate::beacon::stf::electra::process_voluntary_exit(state, voluntary_exit, config)?;
@@ -1929,6 +1945,7 @@ mod tests {
                 &config,
                 &committees,
                 &ActiveBalanceCache::default(),
+                None,
             );
             assert!(
                 matches!(result, Err(Error::SpecAssert(message)) if message == expected_message),

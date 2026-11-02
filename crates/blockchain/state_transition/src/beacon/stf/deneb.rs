@@ -48,6 +48,7 @@ use crate::beacon::helpers::mutators::{
     decrease_balance, increase_balance, initiate_validator_exit,
 };
 use crate::beacon::helpers::predicates::is_active_validator;
+use crate::beacon::helpers::target_balances::TargetBalanceDelta;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
     Bytes32, Gwei, H256, HashTreeRoot as _, KzgCommitment, ParticipationFlags, ValidatorIndex,
@@ -109,6 +110,7 @@ pub fn process_block(
         config,
         committees,
         active_balances,
+        options.target_delta,
     )?;
     super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
     Ok(())
@@ -152,6 +154,7 @@ fn process_operations(
     config: &Config,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    target_delta: Option<&TargetBalanceDelta>,
 ) -> Result<()> {
     let outstanding = state
         .eth1_data()
@@ -172,7 +175,13 @@ fn process_operations(
         super::operations::process_attester_slashing(state, attester_slashing, config)?;
     }
     for attestation in attestations {
-        process_attestation(state, attestation, committees, active_balances)?;
+        process_attestation(
+            state,
+            attestation,
+            committees,
+            active_balances,
+            target_delta,
+        )?;
     }
     for deposit in deposits {
         super::operations::process_deposit(state, deposit, config)?;
@@ -287,6 +296,7 @@ pub fn process_attestation(
     attestation: &phase0::Attestation,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    target_delta: Option<&TargetBalanceDelta>,
 ) -> Result<()> {
     let data = attestation.data;
     let current_epoch = get_current_epoch(state);
@@ -410,6 +420,11 @@ pub fn process_attestation(
             proposer_reward_numerator = proposer_reward_numerator
                 .checked_add(reward)
                 .ok_or(Error::ArithmeticOverflow("proposer_reward_numerator"))?;
+        }
+        if let Some(delta) = target_delta
+            && has_flag(new_flags, constants::TIMELY_TARGET_FLAG_INDEX)
+        {
+            delta.record_new_target(current_epoch_target, state.validator(index)?);
         }
         if new_flags != 0 {
             updates.push((index, new_flags));

@@ -94,6 +94,7 @@ pub fn process_block(
         config,
         committees,
         active_balances,
+        options.target_delta,
     )?;
     super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
     Ok(())

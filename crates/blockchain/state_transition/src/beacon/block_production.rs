@@ -708,9 +708,10 @@ mod tests {
         assert_eq!(block.state_root, post.hash_tree_root());
     }
 
-    fn skip_randao() -> BlockProcessingOptions {
+    fn skip_randao() -> BlockProcessingOptions<'static> {
         BlockProcessingOptions {
             randao: RandaoVerification::Skip,
+            ..Default::default()
         }
     }
 

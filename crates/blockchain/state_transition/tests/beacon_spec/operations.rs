@@ -281,20 +281,38 @@ fn apply(
             // so altair's own function serves both.
             ForkName::Altair | ForkName::Bellatrix | ForkName::Capella => {
                 let attestation: phase0::Attestation = case.ssz("attestation");
-                altair_stf::process_attestation(state, &attestation, &committees, &active_balances)
+                altair_stf::process_attestation(
+                    state,
+                    &attestation,
+                    &committees,
+                    &active_balances,
+                    None,
+                )
             }
             // Deneb widens the inclusion window and the timely-target
             // condition (EIP-7045); the container is still phase0's.
             ForkName::Deneb => {
                 let attestation: phase0::Attestation = case.ssz("attestation");
-                deneb_stf::process_attestation(state, &attestation, &committees, &active_balances)
+                deneb_stf::process_attestation(
+                    state,
+                    &attestation,
+                    &committees,
+                    &active_balances,
+                    None,
+                )
             }
             // Electra reshapes the container itself (EIP-7549's
             // `committee_bits`), and fulu's specification makes no further
             // change to either the container or the function.
             ForkName::Electra | ForkName::Fulu => {
                 let attestation: electra::Attestation = case.ssz("attestation");
-                electra_stf::process_attestation(state, &attestation, &committees, &active_balances)
+                electra_stf::process_attestation(
+                    state,
+                    &attestation,
+                    &committees,
+                    &active_balances,
+                    None,
+                )
             }
             // Gloas reshapes the container a third time (EIP-7688's unbounded
             // `AttestingIndices`) and modifies the function again (the new
@@ -311,6 +329,7 @@ fn apply(
                     meta.parent_slot,
                     &committees,
                     &active_balances,
+                    None,
                 )
             }
             ForkName::Lean => lean_is_not_a_fixture_fork("attestation"),
