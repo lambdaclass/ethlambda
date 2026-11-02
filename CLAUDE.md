@@ -590,6 +590,16 @@ default** on its two SSZ endpoints and bare integers in JSON, because
 
 See [`docs/rpc.md`](docs/rpc.md) for the full reference: CLI flags and defaults, the lean API endpoints (health, finalized state/block, justified checkpoint, blocks by root/slot, fork-choice tree + D3.js UI, runtime aggregator toggle), the Beacon API endpoints and the three ids they refuse, the metrics/debug endpoints (Prometheus `/metrics`, jemalloc heap profiling), the Hive test-driver endpoints, plus request/response shapes, status codes, and content types.
 
+## Block telemetry (`crates/common/telemetry`)
+
+`--telemetry.clickhouse-url` writes Silver's `block_events` rows (one per point in a block's
+life, per data column arrival) to ClickHouse over HTTP. A global sink, installed in `run_node`
+before `P2P::spawn`; `ethlambda_telemetry::emit(|| ...)` builds nothing when it is off. Rows
+come from `BlockImportReport::telemetry_events` (final pass only, `imported_here`),
+`CascadeTelemetry` (arrival rows, and beacon `attestable` at the per-arrival head
+recomputation), and p2p's `column_checks::column_rows` (after the check). See
+[`docs/telemetry.md`](docs/telemetry.md).
+
 ## Beacon Chain types (`crates/common/types/src/beacon/`)
 
 `ethlambda-types` carries the **Ethereum Beacon Chain** containers (phase0

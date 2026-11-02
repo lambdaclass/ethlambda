@@ -304,6 +304,15 @@ Per-arrival phases, charged once per arriving message however many blocks its ca
 | `get_head` | `fork_choice::get_head` (beacon) |
 | `fcu` | The `engine_forkchoiceUpdated` round trip (beacon) |
 
+### Block Telemetry
+
+Present only with `--telemetry.clickhouse-url`; see [Block telemetry](./telemetry.md). Both series are published at zero at startup, so a node whose inserts never succeed shows a rising failure count next to zero inserted rows instead of no series.
+
+| Name | Type | Usage | Sample collection event | Labels |
+|------|------|-------|-------------------------|--------|
+| `lean_telemetry_rows_total` | Counter | `block_events` rows, by what became of them | On every successful insert, and on every row dropped (channel full, backlog past its cap, a batch ClickHouse refused, or rows still pending when the writer's channel closes) | outcome=inserted,dropped |
+| `lean_telemetry_insert_failures_total` | Counter | Failed ClickHouse insert attempts, refusals included | On every failed insert; a failed best-effort schema statement alone is not counted | |
+
 ### Gossip Arrival Timing
 
 These histograms record the absolute distance between a gossip message's arrival and the start of the interval it was due in, so an arrival that is early by some amount and one that is late by the same amount land in the same bucket; the counters' `position` label is what tells them apart. `inside` means the message arrived within the interval it was due in, not merely somewhere in the right slot: an attestation for slot 10 that lands during slot 10's interval 2 is `after`, not `inside`, since it missed the AttestationProduction interval it was actually due in.
