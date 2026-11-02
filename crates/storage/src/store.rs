@@ -9134,7 +9134,7 @@ mod tests {
     }
 
     #[test]
-    fn the_latest_message_table_grows_exactly_rather_than_doubling() {
+    fn the_latest_message_table_grows_with_headroom_rather_than_doubling() {
         let mut store = Store::test_store();
         let message = LatestMessage {
             epoch: 1,
