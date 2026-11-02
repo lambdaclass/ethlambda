@@ -2377,6 +2377,15 @@ fn resolve_aggregation_duty_subnet(
 mod tests {
     use super::*;
     use crate::command::{Command, try_parse_from};
+    use ethlambda_storage::ForkCheckpoints;
+    use ethlambda_storage::backend::InMemoryBackend;
+    use ethlambda_types::beacon::config::BlobScheduleEntry;
+    use ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
+    use ethlambda_types::block::{Block, BlockBody, MultiMessageAggregate, SignedBlock};
+    use ethlambda_types::checkpoint::Checkpoint;
+    use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
+    use ethlambda_types::genesis::GenesisValidatorEntry;
+    use ethlambda_types::state::PUBLIC_KEY_SIZE;
 
     #[test]
     fn an_explicit_telemetry_name_wins() {
@@ -2409,15 +2418,6 @@ mod tests {
         let (_, network) = telemetry_names(None, None, ethlambda_storage::Chain::Beacon, "");
         assert_eq!(network, "unknown");
     }
-    use ethlambda_storage::ForkCheckpoints;
-    use ethlambda_storage::backend::InMemoryBackend;
-    use ethlambda_types::beacon::config::BlobScheduleEntry;
-    use ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
-    use ethlambda_types::block::{Block, BlockBody, MultiMessageAggregate, SignedBlock};
-    use ethlambda_types::checkpoint::Checkpoint;
-    use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
-    use ethlambda_types::genesis::GenesisValidatorEntry;
-    use ethlambda_types::state::PUBLIC_KEY_SIZE;
 
     /// Emits one event per (target, level) of interest under a subscriber
     /// built from `node_log_filter(rust_log)` and returns what got written.

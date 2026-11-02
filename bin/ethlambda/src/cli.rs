@@ -49,7 +49,10 @@ impl clap::builder::TypedValueParser for ClickHouseUrlParser {
             let flag = arg.map_or_else(String::new, |arg| arg.to_string());
             cmd.clone().error(
                 clap::error::ErrorKind::ValueValidation,
-                format!("invalid {flag}: {why} (the value is not shown, it may hold a password)"),
+                format!(
+                    "invalid {flag} (or ETHLAMBDA_TELEMETRY_CLICKHOUSE_URL): {why} \
+                     (the value is not shown, it may hold a password)"
+                ),
             )
         };
         let raw = value.to_str().ok_or_else(|| reject("not valid UTF-8"))?;
@@ -1109,11 +1112,12 @@ mod tests {
     fn the_clickhouse_url_must_be_http_and_errors_do_not_echo_it() {
         for raw in [
             "tcp://user:hunter2@127.0.0.1:9000",
-            "user:hunter2@not a url",
+            "http://user:hunter2@host:notaport",
         ] {
             let mut args = beacon_args();
             args.extend(["--telemetry.clickhouse-url", raw]);
             let err = try_parse_from(args).expect_err("must be refused");
+            assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
             let shown = err.to_string();
             assert!(
                 !shown.contains("hunter2"),
