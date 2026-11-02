@@ -5,6 +5,64 @@ use ethlambda_types::beacon::constants::SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY;
 use std::net::IpAddr;
 use std::path::PathBuf;
 
+/// The ClickHouse endpoint, wrapped so the options' derived `Debug` cannot
+/// print its credentials: `reqwest::Url`'s own `Debug` includes the password
+/// and the query.
+#[derive(Clone)]
+pub(crate) struct ClickHouseUrl(reqwest::Url);
+
+impl ClickHouseUrl {
+    pub(crate) fn into_inner(self) -> reqwest::Url {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for ClickHouseUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClickHouseUrl")
+            .field("scheme", &self.0.scheme())
+            .field("host", &self.0.host_str())
+            .field("port", &self.0.port_or_known_default())
+            .finish()
+    }
+}
+
+/// Parses `--telemetry.clickhouse-url`.
+///
+/// A plain `value_parser` function would leave clap to print
+/// `invalid value '<raw>'` around its message, and the value may carry a
+/// password. A `TypedValueParser` builds the whole `clap::Error` itself, so
+/// the raw value never reaches the output.
+#[derive(Clone)]
+struct ClickHouseUrlParser;
+
+impl clap::builder::TypedValueParser for ClickHouseUrlParser {
+    type Value = ClickHouseUrl;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<ClickHouseUrl, clap::Error> {
+        let reject = |why: &str| {
+            let flag = arg.map_or_else(String::new, |arg| arg.to_string());
+            cmd.clone().error(
+                clap::error::ErrorKind::ValueValidation,
+                format!("invalid {flag}: {why} (the value is not shown, it may hold a password)"),
+            )
+        };
+        let raw = value.to_str().ok_or_else(|| reject("not valid UTF-8"))?;
+        let url = reqwest::Url::parse(raw).map_err(|_| reject("not a valid URL"))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(reject(
+                "only http and https are supported (ClickHouse's HTTP interface, usually port 8123)",
+            ));
+        }
+        Ok(ClickHouseUrl(url))
+    }
+}
+
 /// Flags every sub-command takes, with the same meaning on each.
 ///
 /// `--node-key`, `--bootnodes` and `--checkpoint-sync-url` used to be declared
@@ -105,9 +163,10 @@ pub(crate) struct CommonOptions {
     #[arg(
         long = "telemetry.clickhouse-url",
         env = "ETHLAMBDA_TELEMETRY_CLICKHOUSE_URL",
-        hide_env_values = true
+        hide_env_values = true,
+        value_parser = ClickHouseUrlParser
     )]
-    pub(crate) telemetry_clickhouse_url: Option<reqwest::Url>,
+    pub(crate) telemetry_clickhouse_url: Option<ClickHouseUrl>,
     /// `meta_client_name` on every telemetry row.
     ///
     /// Defaults to `--node-id` on `node`, since devnets run several nodes per
@@ -996,12 +1055,18 @@ mod tests {
 
     /// A client name alone configures nothing, so it is a usage error rather
     /// than a flag silently ignored.
+    ///
+    /// The first half is skipped when the URL variable is exported: clap reads
+    /// the environment itself, has no per-parse override, and `set_var` is
+    /// unsafe and racy across tests, so the flag would be satisfied by it.
     #[test]
     fn the_telemetry_client_name_needs_a_clickhouse_url() {
-        let mut args = beacon_args();
-        args.extend(["--telemetry.client-name", "x"]);
-        let err = try_parse_from(args).expect_err("a client name needs a URL");
-        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        if std::env::var_os("ETHLAMBDA_TELEMETRY_CLICKHOUSE_URL").is_none() {
+            let mut args = beacon_args();
+            args.extend(["--telemetry.client-name", "x"]);
+            let err = try_parse_from(args).expect_err("a client name needs a URL");
+            assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        }
 
         let mut args = beacon_args();
         args.extend([
@@ -1014,9 +1079,50 @@ mod tests {
         let url = beacon
             .common
             .telemetry_clickhouse_url
-            .expect("the URL parses");
+            .expect("the URL parses")
+            .into_inner();
         assert_eq!(url.username(), "u");
         assert_eq!(beacon.common.telemetry_client_name.as_deref(), Some("x"));
+    }
+
+    /// `reqwest::Url`'s `Debug` prints the password, and the options derive
+    /// `Debug`.
+    #[test]
+    fn the_clickhouse_url_keeps_its_credentials_out_of_debug() {
+        let mut args = beacon_args();
+        args.extend([
+            "--telemetry.clickhouse-url",
+            "http://user:hunter2@clickhouse.example:8123/?database=secret_db",
+        ]);
+        let beacon = parse_beacon(args);
+        let debug = format!("{beacon:?}");
+        for secret in ["hunter2", "user:", "secret_db"] {
+            assert!(!debug.contains(secret), "Debug leaked {secret}: {debug}");
+        }
+        assert!(debug.contains("clickhouse.example"));
+    }
+
+    /// Only the HTTP interface is spoken, so another scheme is a startup
+    /// error rather than endless insert failures, and the message does not
+    /// echo the value, which may hold a password.
+    #[test]
+    fn the_clickhouse_url_must_be_http_and_errors_do_not_echo_it() {
+        for raw in [
+            "tcp://user:hunter2@127.0.0.1:9000",
+            "user:hunter2@not a url",
+        ] {
+            let mut args = beacon_args();
+            args.extend(["--telemetry.clickhouse-url", raw]);
+            let err = try_parse_from(args).expect_err("must be refused");
+            let shown = err.to_string();
+            assert!(
+                !shown.contains("hunter2"),
+                "error echoed the value: {shown}"
+            );
+        }
+        let mut args = beacon_args();
+        args.extend(["--telemetry.clickhouse-url", "https://127.0.0.1:8443"]);
+        parse_beacon(args);
     }
 
     /// The invariant `From<BeaconOptions>`'s `unreachable!` rests on. Each

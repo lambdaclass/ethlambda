@@ -349,13 +349,12 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     let Options { common, network } = options;
     // Read before the chain match below moves `network`.
     let discovery_enabled = network.discovery_enabled();
-    // Read before the chain match below moves `network`.
-    let telemetry_default_name = match &network {
-        Network::Lean(lean) => lean.node_id.clone(),
-        Network::Mainnet { .. } => format!("ethlambda@{}", hostname()),
+    let lean_node_id = match &network {
+        Network::Lean(lean) => Some(lean.node_id.clone()),
+        Network::Mainnet { .. } => None,
     };
-    let telemetry_url = common.telemetry_clickhouse_url.clone();
-    let telemetry_client_name = common.telemetry_client_name.clone();
+    let telemetry_url = common.telemetry_clickhouse_url;
+    let telemetry_client_name = common.telemetry_client_name;
 
     #[cfg(feature = "shadow-integration")]
     if let Network::Lean(lean) = &network {
@@ -786,15 +785,23 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         ethlambda_state_transition::beacon::sync_committee_pool::SharedSyncCommitteePool::default();
     // Before the P2P actor starts, so its first column rows are not lost.
     if let Some(url) = telemetry_url {
+        let url = url.into_inner();
         let config = setup.store.config();
         let grid = config.time_grid();
-        let network_name = match setup.store.chain() {
-            ethlambda_storage::Chain::Lean => "lean".to_owned(),
-            ethlambda_storage::Chain::Beacon => config.config_name.as_str().to_owned(),
-        };
-        let client_name = telemetry_client_name.unwrap_or(telemetry_default_name);
-        // The URL is not logged: it may carry credentials.
-        info!(%client_name, %network_name, "Writing block telemetry to ClickHouse");
+        let (client_name, network_name) = telemetry_names(
+            lean_node_id.as_deref(),
+            telemetry_client_name,
+            setup.store.chain(),
+            config.config_name.as_str(),
+        );
+        // Only the host and port: the URL may carry credentials.
+        info!(
+            %client_name,
+            %network_name,
+            host = url.host_str(),
+            port = url.port_or_known_default(),
+            "Writing block telemetry to ClickHouse"
+        );
         ethlambda_telemetry::install(ethlambda_telemetry::TelemetryConfig {
             url,
             client_name,
@@ -962,13 +969,40 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     Ok(())
 }
 
+/// `(meta_client_name, meta_network_name)` for the telemetry rows.
+///
+/// An explicit `--telemetry.client-name` wins. Otherwise a lean node uses its
+/// `--node-id` (devnets run several nodes per host) and a beacon node
+/// `ethlambda@<hostname>`. The hostname is read only on that last path, so a
+/// node with telemetry off never asks. A loaded `--network` directory may have
+/// no `CONFIG_NAME`, hence the beacon fallback.
+fn telemetry_names(
+    lean_node_id: Option<&str>,
+    explicit: Option<String>,
+    chain: ethlambda_storage::Chain,
+    config_name: &str,
+) -> (String, String) {
+    let client_name = explicit.unwrap_or_else(|| match lean_node_id {
+        Some(node_id) => node_id.to_owned(),
+        None => format!("ethlambda@{}", hostname()),
+    });
+    let network_name = match chain {
+        ethlambda_storage::Chain::Lean => "lean".to_owned(),
+        ethlambda_storage::Chain::Beacon if config_name.is_empty() => "unknown".to_owned(),
+        ethlambda_storage::Chain::Beacon => config_name.to_owned(),
+    };
+    (client_name, network_name)
+}
+
 /// This machine's hostname, for the default telemetry client name.
 fn hostname() -> String {
     let mut buf = [0u8; 256];
     // SAFETY: `buf` is valid for writes of `buf.len()` bytes, and
-    // `gethostname` writes at most that many.
+    // `gethostname` writes at most that many. It may leave no NUL when the
+    // name fills the buffer; the `position` fallback below handles that.
     let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
     if rc != 0 {
+        warn!("gethostname failed; telemetry client name falls back to \"unknown\"");
         return "unknown".to_owned();
     }
     let len = buf.iter().position(|&byte| byte == 0).unwrap_or(buf.len());
@@ -2343,6 +2377,38 @@ fn resolve_aggregation_duty_subnet(
 mod tests {
     use super::*;
     use crate::command::{Command, try_parse_from};
+
+    #[test]
+    fn an_explicit_telemetry_name_wins() {
+        let (client, network) = telemetry_names(
+            Some("node-1"),
+            Some("mine".to_owned()),
+            ethlambda_storage::Chain::Lean,
+            "",
+        );
+        assert_eq!((client.as_str(), network.as_str()), ("mine", "lean"));
+    }
+
+    #[test]
+    fn a_lean_node_is_named_by_its_node_id() {
+        let (client, network) =
+            telemetry_names(Some("node-1"), None, ethlambda_storage::Chain::Lean, "");
+        assert_eq!((client.as_str(), network.as_str()), ("node-1", "lean"));
+    }
+
+    #[test]
+    fn a_beacon_node_is_named_by_host_and_config() {
+        let (client, network) =
+            telemetry_names(None, None, ethlambda_storage::Chain::Beacon, "mainnet");
+        assert!(client.starts_with("ethlambda@"), "{client}");
+        assert_eq!(network, "mainnet");
+    }
+
+    #[test]
+    fn a_beacon_network_without_a_config_name_is_unknown() {
+        let (_, network) = telemetry_names(None, None, ethlambda_storage::Chain::Beacon, "");
+        assert_eq!(network, "unknown");
+    }
     use ethlambda_storage::ForkCheckpoints;
     use ethlambda_storage::backend::InMemoryBackend;
     use ethlambda_types::beacon::config::BlobScheduleEntry;
