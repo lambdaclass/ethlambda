@@ -9144,23 +9144,26 @@ mod tests {
         };
         let capacity = |store: &Store| store.beacon.lock().unwrap().latest_messages.capacity();
 
-        // The first vote sizes the table, and a higher index inside the
-        // headroom fits without a reallocation.
+        let headroom = u64::try_from(LATEST_MESSAGES_HEADROOM).unwrap();
+        let slot = |index: u64| usize::try_from(index).unwrap();
+
+        // The first vote sizes the table to its index plus the headroom.
         let first = 100_000;
         store.set_latest_message(first, message);
         let sized = capacity(&store);
-        assert!(sized > usize::try_from(first).unwrap());
-        assert!(sized <= usize::try_from(first).unwrap() + 1 + LATEST_MESSAGES_HEADROOM);
-        store.set_latest_message(first + 10, message);
+        assert!(sized > slot(first));
+        assert!(sized <= slot(first) + 1 + LATEST_MESSAGES_HEADROOM);
+
+        // The highest index inside the headroom fits without a reallocation.
+        store.set_latest_message(first + headroom, message);
         assert_eq!(capacity(&store), sized);
 
-        // Past the headroom, the table grows to the new index plus headroom,
-        // not to twice what it was.
-        let higher = first + u64::try_from(LATEST_MESSAGES_HEADROOM).unwrap() + 1_000;
+        // Past the headroom, the table grows to the new index plus headroom.
+        let higher = first + headroom + 1_000;
         store.set_latest_message(higher, message);
         let grown = capacity(&store);
-        assert!(grown <= usize::try_from(higher).unwrap() + 1 + LATEST_MESSAGES_HEADROOM);
-        assert!(grown < 2 * sized);
+        assert!(grown > slot(higher));
+        assert!(grown <= slot(higher) + 1 + LATEST_MESSAGES_HEADROOM);
         assert_eq!(store.latest_message(higher).map(|vote| vote.epoch), Some(1));
     }
 
