@@ -1495,7 +1495,7 @@ pub fn process_attestation(
 
     // Write phase: apply exactly the flags the read phase decided on.
     {
-        let participation_mut = state.epoch_participation_mut(current_epoch_target)?;
+        let mut participation_mut = state.epoch_participation_mut(current_epoch_target)?;
         let participation_len = participation_mut.len();
         for (index, new_flags) in flag_updates {
             let flags =

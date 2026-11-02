@@ -498,7 +498,8 @@ mod tests {
         // none has yet this epoch: only the previous epoch should justify.
         {
             let (previous_epoch_participation, _, _) = state.altair_validator_lists_mut().unwrap();
-            for flags in previous_epoch_participation.iter_mut() {
+            for index in 0..previous_epoch_participation.len() {
+                let flags = &mut previous_epoch_participation[index];
                 *flags = add_flag(*flags, constants::TIMELY_TARGET_FLAG_INDEX);
             }
         }

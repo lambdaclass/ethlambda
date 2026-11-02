@@ -108,7 +108,16 @@ pub type Attestations = SszList<Attestation, { preset::MAX_ATTESTATIONS_ELECTRA 
 pub type AttesterSlashings = SszList<AttesterSlashing, { preset::MAX_ATTESTER_SLASHINGS_ELECTRA }>;
 
 /// Deposits queued in the state, not yet credited to the validator registry.
-pub type PendingDeposits = SszList<PendingDeposit, { preset::PENDING_DEPOSITS_LIMIT }>;
+///
+/// Tree-backed: a block only appends (deposit requests) and the epoch drops a
+/// prefix, so every other block leaves the list untouched and the state root
+/// reuses its cached hash instead of re-merkleizing every queued deposit.
+/// Writes are buffered in a `BTreeMap`, since they are a handful of pushes.
+pub type PendingDeposits = ethlambda_ssz_tree::List<
+    PendingDeposit,
+    { preset::PENDING_DEPOSITS_LIMIT },
+    std::collections::BTreeMap<usize, PendingDeposit>,
+>;
 
 /// Partial withdrawals queued in the state, not yet paid out.
 pub type PendingPartialWithdrawals =
@@ -873,5 +882,41 @@ mod tests {
         assert!(!<BeaconState as libssz::SszEncode>::is_fixed_size());
         assert!(!<AggregateAndProof as libssz::SszEncode>::is_fixed_size());
         assert!(!<SignedAggregateAndProof as libssz::SszEncode>::is_fixed_size());
+    }
+
+    fn pending_deposit(i: u64) -> PendingDeposit {
+        PendingDeposit {
+            pubkey: BlsPubkey([i as u8; 48]),
+            withdrawal_credentials: [(i >> 8) as u8; 32].into(),
+            amount: i,
+            signature: BlsSignature([i as u8; 96]),
+            slot: i,
+        }
+    }
+
+    #[test]
+    fn tree_backed_pending_deposits_hash_like_the_flat_list() {
+        use crate::primitives::HashTreeRoot as _;
+        type Flat = SszList<PendingDeposit, { preset::PENDING_DEPOSITS_LIMIT }>;
+
+        for len in [0usize, 1, 2, 3, 17, 1000] {
+            let values: Vec<_> = (0..len as u64).map(pending_deposit).collect();
+            let flat = Flat::try_from(values.clone()).unwrap();
+            let mut tree = PendingDeposits::try_from(values).unwrap();
+            assert_eq!(tree.hash_tree_root(), flat.hash_tree_root(), "len {len}");
+            assert_eq!(tree.to_ssz(), flat.to_ssz(), "len {len}");
+
+            // An append, the one per-block write, rehashes like a rebuild.
+            tree.push(pending_deposit(9_999)).unwrap();
+            tree.apply_updates();
+            let mut grown: Vec<_> = flat.iter().cloned().collect();
+            grown.push(pending_deposit(9_999));
+            let flat = Flat::try_from(grown).unwrap();
+            assert_eq!(
+                tree.hash_tree_root(),
+                flat.hash_tree_root(),
+                "len {len} + 1"
+            );
+        }
     }
 }

@@ -1020,7 +1020,7 @@ fn onboard_builders_from_pending_deposits(
     // and taking ownership here is what lets the loop body hold `state`
     // mutably (`add_builder_to_registry`, the balance top-up) without a
     // lingering borrow of one of its own fields.
-    for deposit in std::mem::take(&mut state.pending_deposits) {
+    for deposit in std::mem::take(&mut state.pending_deposits).to_vec() {
         if validator_pubkeys.contains(&deposit.pubkey) {
             requeue(&mut pending_deposits, &mut pending_index, deposit);
             continue;
