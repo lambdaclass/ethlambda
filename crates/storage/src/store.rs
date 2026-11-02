@@ -4293,6 +4293,7 @@ impl Store {
                     .expect("validator index plus headroom fits in usize");
                 messages.reserve_exact(target - messages.len());
             }
+            // Capacity now exceeds `slot`, so this cannot reallocate.
             messages.resize(slot + 1, None);
         }
         messages[slot] = Some(message);
