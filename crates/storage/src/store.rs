@@ -4288,7 +4288,10 @@ impl Store {
             // by a slightly higher one, leaving about half of a
             // registry-sized table unused for the life of the process.
             if messages.capacity() <= slot {
-                messages.reserve_exact(slot + 1 + LATEST_MESSAGES_HEADROOM - messages.len());
+                let target = slot
+                    .checked_add(1 + LATEST_MESSAGES_HEADROOM)
+                    .expect("validator index plus headroom fits in usize");
+                messages.reserve_exact(target - messages.len());
             }
             messages.resize(slot + 1, None);
         }
