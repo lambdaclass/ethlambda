@@ -213,38 +213,51 @@ impl NewPayloadRequest<'_> {
 /// The answer is read exactly as [`ask`] reads it: `Err` means no answer after
 /// the client's whole retry ladder, and there is no `Ok(None)` because a
 /// request existing means there was something to ask.
-///
-/// The time from sending the request to the answer is observed as
-/// `lean_engine_new_payload_seconds`, under the answer's [`outcome_label`].
 pub async fn ask_request(
     client: &EngineClient,
     request: OwnedNewPayloadRequest,
 ) -> Result<PayloadValidity, EngineError> {
-    let sent = Instant::now();
-    let answer = client
-        .new_payload(
-            &request.execution_payload,
-            &request.versioned_hashes,
-            request.parent_beacon_block_root,
-            &request.execution_requests,
-        )
-        .await
-        .map(|status| verdict(&status));
-    crate::metrics::observe_engine_new_payload(outcome_label(&answer), sent.elapsed());
-    answer
+    let call = client.new_payload(
+        &request.execution_payload,
+        &request.versioned_hashes,
+        request.parent_beacon_block_root,
+        &request.execution_requests,
+    );
+    let status = timed_new_payload(call).await?;
+    Ok(verdict(&status))
 }
 
-/// The `outcome` an answer from [`ask_request`] is counted under.
+/// Awaits `call`, one `engine_newPayload*` request, and observes the time from
+/// sending it to its answer as `lean_engine_new_payload_seconds`, under the
+/// [`outcome_label`] of the verdict the answer reads as.
+///
+/// Every request this module sends goes through here, a block's payload and an
+/// envelope's alike, so the metric is the execution client's time for every
+/// payload it was asked about. A request refused before it is sent (an
+/// envelope that does not match its block) never reaches it.
+async fn timed_new_payload(
+    call: impl Future<Output = Result<PayloadStatusV1, EngineError>>,
+) -> Result<PayloadStatusV1, EngineError> {
+    let sent = Instant::now();
+    let status = call.await;
+    let validity = status.as_ref().ok().map(verdict);
+    let outcome = outcome_label(validity.as_ref());
+    crate::metrics::observe_engine_new_payload(outcome, sent.elapsed());
+    status
+}
+
+/// The `outcome` an answer is counted under: its verdict, or `no_verdict`
+/// when the retry ladder ran out without one.
 ///
 /// `not_required` is listed for completeness: a status from the execution
 /// client always reads as one of the other three verdicts.
-pub fn outcome_label(answer: &Result<PayloadValidity, EngineError>) -> &'static str {
-    match answer {
-        Ok(PayloadValidity::Validated) => "valid",
-        Ok(PayloadValidity::Optimistic) => "optimistic",
-        Ok(PayloadValidity::Invalidated { .. }) => "invalidated",
-        Ok(PayloadValidity::NotRequired) => "not_required",
-        Err(_) => "no_verdict",
+pub fn outcome_label(verdict: Option<&PayloadValidity>) -> &'static str {
+    match verdict {
+        Some(PayloadValidity::Validated) => "valid",
+        Some(PayloadValidity::Optimistic) => "optimistic",
+        Some(PayloadValidity::Invalidated { .. }) => "invalidated",
+        Some(PayloadValidity::NotRequired) => "not_required",
+        None => "no_verdict",
     }
 }
 
@@ -262,14 +275,13 @@ pub async fn ask(
     let Some(request) = new_payload_request(block) else {
         return Ok(None);
     };
-    let status = client
-        .new_payload(
-            request.execution_payload,
-            &request.versioned_hashes,
-            request.parent_beacon_block_root,
-            &request.execution_requests,
-        )
-        .await?;
+    let call = client.new_payload(
+        request.execution_payload,
+        &request.versioned_hashes,
+        request.parent_beacon_block_root,
+        &request.execution_requests,
+    );
+    let status = timed_new_payload(call).await?;
     Ok(Some(verdict(&status)))
 }
 
@@ -300,14 +312,13 @@ pub async fn ask_envelope_status(
     envelope: &containers::gloas::SignedExecutionPayloadEnvelope,
 ) -> Result<PayloadStatusV1, EngineError> {
     let request = gloas_new_payload_request(block, envelope)?;
-    client
-        .new_payload_v5(
-            request.execution_payload,
-            &request.versioned_hashes,
-            request.parent_beacon_block_root,
-            &request.execution_requests,
-        )
-        .await
+    let call = client.new_payload_v5(
+        request.execution_payload,
+        &request.versioned_hashes,
+        request.parent_beacon_block_root,
+        &request.execution_requests,
+    );
+    timed_new_payload(call).await
 }
 
 #[cfg(test)]
