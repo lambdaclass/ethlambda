@@ -54,7 +54,7 @@ use crate::beacon::containers::shared::{DepositMessage, ProposerSlashing};
 use crate::beacon::containers::{BeaconState, capella, gloas};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::helpers::accessors::{
-    ActiveBalanceCache, ActiveBalanceCacheExt, CommitteeCache, CommitteeCacheExt,
+    ActiveBalanceCache, ActiveBalanceCacheExt, CommitteeCache, CommitteeCacheExt, PubkeyIndexCache,
     get_beacon_proposer_index, get_block_root_at_slot, get_current_epoch, get_domain,
     get_previous_epoch, get_randao_mix,
 };
@@ -102,12 +102,14 @@ use super::ExecutionEngine;
 /// [`super::block::process_block_header`], two steps after that, overwrites
 /// the header with this block's own. Reading it any later would read this
 /// block's slot instead of its parent's.
+#[allow(clippy::too_many_arguments)]
 pub fn process_block(
     state: &mut BeaconState,
     block: &gloas::BeaconBlock,
     config: &Config,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
     options: super::block::BlockProcessingOptions,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
@@ -120,7 +122,7 @@ pub fn process_block(
     //
     // [New in Gloas:EIP7732]
     timed(StfPhase::ExecutionPayload, || {
-        process_parent_execution_payload(state, block, config)
+        process_parent_execution_payload(state, block, config, active_balances, pubkey_indices)
     })?;
     // The body's root is an argument, so it is hashed inside the timed span:
     // it is part of what a header costs.
@@ -161,6 +163,7 @@ pub fn process_block(
         state,
         &block.body.sync_aggregate,
         active_balances,
+        pubkey_indices,
         signatures,
     )?;
     Ok(())
@@ -179,6 +182,7 @@ pub fn process_block_and_verify(
     config: &Config,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
     options: super::block::BlockProcessingOptions,
 ) -> Result<()> {
     SignatureBatch::deferred(|signatures| {
@@ -188,6 +192,7 @@ pub fn process_block_and_verify(
             config,
             committees,
             active_balances,
+            pubkey_indices,
             options,
             signatures,
         )
@@ -972,6 +977,8 @@ pub fn apply_parent_execution_payload(
     state: &mut BeaconState,
     requests: &gloas::ExecutionRequests,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
 ) -> Result<()> {
     let (parent_bid, parent_slot, parent_epoch) = {
         let inner = gloas_state_ref(state, "apply_parent_execution_payload")?;
@@ -1011,10 +1018,22 @@ pub fn apply_parent_execution_payload(
         crate::beacon::stf::fulu::process_deposit_request(state, deposit)?;
     }
     for withdrawal in requests.withdrawals.iter() {
-        crate::beacon::stf::electra::process_withdrawal_request(state, withdrawal, config)?;
+        crate::beacon::stf::electra::process_withdrawal_request(
+            state,
+            withdrawal,
+            config,
+            active_balances,
+            pubkey_indices,
+        )?;
     }
     for consolidation in requests.consolidations.iter() {
-        crate::beacon::stf::electra::process_consolidation_request(state, consolidation, config)?;
+        crate::beacon::stf::electra::process_consolidation_request(
+            state,
+            consolidation,
+            config,
+            active_balances,
+            pubkey_indices,
+        )?;
     }
     for builder_deposit in requests.builder_deposits.iter() {
         process_builder_deposit_request(state, builder_deposit, config)?;
@@ -1078,6 +1097,8 @@ pub fn process_parent_execution_payload(
     state: &mut BeaconState,
     block: &gloas::BeaconBlock,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
 ) -> Result<()> {
     let bid = &block.body.signed_execution_payload_bid.message;
     let parent_bid = gloas_state_ref(state, "process_parent_execution_payload")?
@@ -1099,7 +1120,7 @@ pub fn process_parent_execution_payload(
         requests.hash_tree_root() == parent_bid.execution_requests_root,
         "process_parent_execution_payload: hash_tree_root(requests) == parent_bid.execution_requests_root",
     )?;
-    apply_parent_execution_payload(state, requests, config)
+    apply_parent_execution_payload(state, requests, config, active_balances, pubkey_indices)
 }
 
 // ---------------------------------------------------------------------------
@@ -1725,7 +1746,15 @@ pub fn process_operations(
     try_for_each_timed(
         StfPhase::VoluntaryExits,
         body.voluntary_exits.iter(),
-        |exit| crate::beacon::stf::electra::process_voluntary_exit(state, exit, config, signatures),
+        |exit| {
+            crate::beacon::stf::electra::process_voluntary_exit(
+                state,
+                exit,
+                config,
+                active_balances,
+                signatures,
+            )
+        },
     )?;
     try_for_each_timed(
         StfPhase::BlsToExecutionChanges,

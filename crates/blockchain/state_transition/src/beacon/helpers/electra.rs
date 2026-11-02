@@ -139,8 +139,9 @@ use crate::beacon::primitives::{
 };
 
 use super::accessors::{
-    CommitteeCache, CommitteeCacheExt, committee_number, get_active_validator_indices,
-    get_current_epoch, get_domain, get_seed, get_total_active_balance,
+    ActiveBalanceCache, CommitteeCache, CommitteeCacheExt, committee_number,
+    get_active_validator_indices, get_current_epoch, get_domain, get_seed,
+    get_total_active_balance, total_active_balance_or_compute,
 };
 use super::math::bytes_to_uint64;
 use super::misc::{compute_activation_exit_epoch, compute_epoch_at_slot, compute_signing_root};
@@ -438,11 +439,20 @@ pub(crate) fn activation_exit_churn_limit_for(total_active_balance: Gwei, config
 /// The portion of [`get_balance_churn_limit`] left over for consolidations
 /// once [`get_activation_exit_churn_limit`] has taken its share.
 pub fn get_consolidation_churn_limit(state: &BeaconState, config: &Config) -> Result<Gwei> {
-    let balance_churn_limit = get_balance_churn_limit(state, config)?;
-    let activation_exit_churn_limit = get_activation_exit_churn_limit(state, config)?;
-    // `get_activation_exit_churn_limit` is a `min` against `balance_churn_limit`,
+    Ok(consolidation_churn_limit_for(
+        get_total_active_balance(state)?,
+        config,
+    ))
+}
+
+/// [`get_consolidation_churn_limit`] for a caller that already holds the total
+/// active balance: one registry pass for both halves instead of one each.
+pub(crate) fn consolidation_churn_limit_for(total_active_balance: Gwei, config: &Config) -> Gwei {
+    let balance_churn_limit = balance_churn_limit_for(total_active_balance, config);
+    let activation_exit_churn_limit = activation_exit_churn_limit_for(total_active_balance, config);
+    // `activation_exit_churn_limit_for` is a `min` against `balance_churn_limit`,
     // so it can never exceed it, and this subtraction cannot underflow.
-    Ok(balance_churn_limit - activation_exit_churn_limit)
+    balance_churn_limit - activation_exit_churn_limit
 }
 
 /// The total amount queued in [`electra::PendingPartialWithdrawal`]s for
@@ -794,17 +804,23 @@ pub fn get_next_sync_committee_indices(state: &BeaconState) -> Result<Vec<Valida
 /// every validator's `exit_epoch` for the queue's current occupancy: that
 /// scan counted validators, which stopped being a valid proxy for churned
 /// balance the moment validators stopped all weighing the same.
+///
+/// `active_balances` is block processing's cache, or `None` for the uncached
+/// total (epoch processing, spec-shaped callers); see
+/// [`compute_exit_epoch_and_update_churn`].
 pub fn initiate_validator_exit(
     state: &mut BeaconState,
     index: ValidatorIndex,
     config: &Config,
+    active_balances: Option<&ActiveBalanceCache>,
 ) -> Result<()> {
     if state.validator(index)?.exit_epoch != FAR_FUTURE_EPOCH {
         return Ok(());
     }
 
     let effective_balance = state.validator(index)?.effective_balance;
-    let exit_queue_epoch = compute_exit_epoch_and_update_churn(state, effective_balance, config)?;
+    let exit_queue_epoch =
+        compute_exit_epoch_and_update_churn(state, effective_balance, config, active_balances)?;
 
     // See `crate::beacon::helpers::mutators::initiate_validator_exit` for why this is
     // checked rather than left to wrap: a validator already queued with an
@@ -846,15 +862,34 @@ pub fn initiate_validator_exit(
 /// ejections) nor `process_withdrawal_request`, so calling this from any
 /// of them already picks up gloas's churn automatically, the same way
 /// pyspec's unmodified callers do.
+///
+/// # The total active balance
+///
+/// Both churn limits are fractions of the total active balance, which costs a
+/// registry pass. Block processing passes its [`ActiveBalanceCache`] so a
+/// block's exits and withdrawal requests share one pass. Sound there because
+/// the total cannot change within an epoch: effective balances move only in
+/// epoch processing, and every activation or exit epoch assigned in a block is
+/// at least `MAX_SEED_LOOKAHEAD` epochs ahead, so none reaches the current
+/// epoch's active set (see `accessors::active_balance_key`). Epoch processing
+/// passes `None`, because the cache key is not sound once the epoch's
+/// effective-balance update has run.
 pub fn compute_exit_epoch_and_update_churn(
     state: &mut BeaconState,
     exit_balance: Gwei,
     config: &Config,
+    active_balances: Option<&ActiveBalanceCache>,
 ) -> Result<Epoch> {
     let current_epoch = get_current_epoch(state);
     let per_epoch_churn = match state.fork_name() {
-        ForkName::Electra | ForkName::Fulu => get_activation_exit_churn_limit(state, config)?,
-        ForkName::Gloas => crate::beacon::helpers::gloas::get_exit_churn_limit(state, config)?,
+        ForkName::Electra | ForkName::Fulu => activation_exit_churn_limit_for(
+            total_active_balance_or_compute(state, active_balances)?,
+            config,
+        ),
+        ForkName::Gloas => crate::beacon::helpers::gloas::exit_churn_limit_for(
+            total_active_balance_or_compute(state, active_balances)?,
+            config,
+        ),
         fork @ (ForkName::Phase0
         | ForkName::Altair
         | ForkName::Bellatrix
@@ -984,15 +1019,26 @@ impl ExitChurnCursor {
 /// [`compute_consolidation_epoch_and_update_churn`] and
 /// [`crate::beacon::stf::electra::process_consolidation_request`] both go
 /// through this rather than either raw formula directly.
+///
+/// `active_balances` is block processing's cache (see
+/// [`compute_exit_epoch_and_update_churn`] for why that is sound), or `None`
+/// for the uncached total.
 pub fn get_consolidation_churn_limit_for_fork(
     state: &BeaconState,
     config: &Config,
+    active_balances: Option<&ActiveBalanceCache>,
 ) -> Result<Gwei> {
     match state.fork_name() {
-        ForkName::Electra | ForkName::Fulu => get_consolidation_churn_limit(state, config),
-        ForkName::Gloas => {
-            crate::beacon::helpers::gloas::get_consolidation_churn_limit(state, config)
-        }
+        ForkName::Electra | ForkName::Fulu => Ok(consolidation_churn_limit_for(
+            total_active_balance_or_compute(state, active_balances)?,
+            config,
+        )),
+        ForkName::Gloas => Ok(
+            crate::beacon::helpers::gloas::consolidation_churn_limit_for(
+                total_active_balance_or_compute(state, active_balances)?,
+                config,
+            ),
+        ),
         fork @ (ForkName::Phase0
         | ForkName::Altair
         | ForkName::Bellatrix
@@ -1025,9 +1071,10 @@ pub fn compute_consolidation_epoch_and_update_churn(
     state: &mut BeaconState,
     consolidation_balance: Gwei,
     config: &Config,
+    active_balances: Option<&ActiveBalanceCache>,
 ) -> Result<Epoch> {
     let current_epoch = get_current_epoch(state);
-    let per_epoch_churn = get_consolidation_churn_limit_for_fork(state, config)?;
+    let per_epoch_churn = get_consolidation_churn_limit_for_fork(state, config, active_balances)?;
 
     let mut fields = churn_cursors_mut(state, "compute_consolidation_epoch_and_update_churn")?;
 
@@ -1950,7 +1997,7 @@ mod tests {
         let config = Config::mainnet();
         let mut state = electra_state_with_validators(4);
 
-        initiate_validator_exit(&mut state, 0, &config).unwrap();
+        initiate_validator_exit(&mut state, 0, &config, None).unwrap();
         let first_exit_epoch = state.validator(0).unwrap().exit_epoch;
         assert_ne!(first_exit_epoch, FAR_FUTURE_EPOCH);
         assert_eq!(
@@ -1958,7 +2005,7 @@ mod tests {
             first_exit_epoch + config.min_validator_withdrawability_delay,
         );
 
-        initiate_validator_exit(&mut state, 0, &config).unwrap();
+        initiate_validator_exit(&mut state, 0, &config, None).unwrap();
         assert_eq!(state.validator(0).unwrap().exit_epoch, first_exit_epoch);
     }
 
@@ -1971,7 +2018,8 @@ mod tests {
         let baseline = compute_activation_exit_epoch(get_current_epoch(&state));
 
         let exit_epoch =
-            compute_exit_epoch_and_update_churn(&mut state, per_epoch_churn * 2, &config).unwrap();
+            compute_exit_epoch_and_update_churn(&mut state, per_epoch_churn * 2, &config, None)
+                .unwrap();
         assert!(exit_epoch > baseline);
     }
 
@@ -1982,9 +2030,11 @@ mod tests {
         let per_epoch_churn = get_activation_exit_churn_limit(&state, &config).unwrap();
 
         let first_epoch =
-            compute_exit_epoch_and_update_churn(&mut state, per_epoch_churn / 4, &config).unwrap();
+            compute_exit_epoch_and_update_churn(&mut state, per_epoch_churn / 4, &config, None)
+                .unwrap();
         let second_epoch =
-            compute_exit_epoch_and_update_churn(&mut state, per_epoch_churn / 4, &config).unwrap();
+            compute_exit_epoch_and_update_churn(&mut state, per_epoch_churn / 4, &config, None)
+                .unwrap();
 
         // Together they are still under one epoch's churn limit, so the
         // cursor lets the second exit spend what the first left over instead
@@ -2122,7 +2172,7 @@ mod tests {
         let mut state = fulu_state_with_validators(4);
         let baseline = compute_activation_exit_epoch(get_current_epoch(&state));
 
-        let exit_epoch = compute_exit_epoch_and_update_churn(&mut state, 1, &config).unwrap();
+        let exit_epoch = compute_exit_epoch_and_update_churn(&mut state, 1, &config, None).unwrap();
         assert_eq!(exit_epoch, baseline);
     }
 
@@ -2147,7 +2197,7 @@ mod tests {
             crate::beacon::helpers::gloas::get_consolidation_churn_limit(&state, &config).unwrap();
         assert!(gloas_limit > 0, "the fixture must exercise a real budget");
 
-        compute_consolidation_epoch_and_update_churn(&mut state, 1, &config).unwrap();
+        compute_consolidation_epoch_and_update_churn(&mut state, 1, &config, None).unwrap();
 
         let fields = churn_cursors_mut(&mut state, "test").unwrap();
         assert_eq!(fields.consolidation_balance_to_consume(), gloas_limit - 1);
@@ -2166,8 +2216,9 @@ mod tests {
             crate::beacon::helpers::test_state::with_validators_at(ForkName::Gloas, 64);
 
         let electra_limit =
-            get_consolidation_churn_limit_for_fork(&electra_state, &config).unwrap();
-        let gloas_limit = get_consolidation_churn_limit_for_fork(&gloas_state, &config).unwrap();
+            get_consolidation_churn_limit_for_fork(&electra_state, &config, None).unwrap();
+        let gloas_limit =
+            get_consolidation_churn_limit_for_fork(&gloas_state, &config, None).unwrap();
 
         assert_eq!(
             electra_limit,

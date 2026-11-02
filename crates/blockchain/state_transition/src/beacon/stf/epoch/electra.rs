@@ -220,7 +220,7 @@ pub fn process_registry_updates(state: &mut BeaconState, config: &Config) -> Res
             Some(RegistryAction::QueueForActivation) => {
                 state.validator_mut(index)?.activation_eligibility_epoch = current_epoch + 1;
             }
-            Some(RegistryAction::Eject) => initiate_validator_exit(state, index, config)?,
+            Some(RegistryAction::Eject) => initiate_validator_exit(state, index, config, None)?,
             Some(RegistryAction::Activate) => {
                 state.validator_mut(index)?.activation_epoch = activation_epoch;
             }

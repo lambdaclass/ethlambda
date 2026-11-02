@@ -131,7 +131,9 @@ use ethlambda_state_transition::beacon::config::Config;
 use ethlambda_state_transition::beacon::containers::{
     BeaconState, altair, bellatrix, capella, deneb, electra, gloas, phase0, shared,
 };
-use ethlambda_state_transition::beacon::helpers::accessors::{ActiveBalanceCache, CommitteeCache};
+use ethlambda_state_transition::beacon::helpers::accessors::{
+    ActiveBalanceCache, CommitteeCache, PubkeyIndexCache,
+};
 use ethlambda_state_transition::beacon::primitives::{HashTreeRoot as _, Slot};
 use ethlambda_state_transition::beacon::stf::altair as altair_stf;
 use ethlambda_state_transition::beacon::stf::bellatrix as bellatrix_stf;
@@ -206,6 +208,7 @@ fn run(
     // it so that an electra-or-later attestation can be run once with a cold
     // cache and once with a warmed one; see [`trials`].
     let active_balances = ActiveBalanceCache::default();
+    let pubkey_indices = PubkeyIndexCache::default();
     let outcome = match handler {
         // Every fork's own `BeaconBlock` carries a different concrete body
         // (altair's adds a sync aggregate, bellatrix's an execution payload,
@@ -473,7 +476,13 @@ fn run(
             // `process_voluntary_exit`; see that function's own doc).
             ForkName::Electra | ForkName::Fulu | ForkName::Gloas => {
                 let exit: shared::SignedVoluntaryExit = case.ssz("voluntary_exit");
-                electra_stf::process_voluntary_exit(state, &exit, config, signatures)
+                electra_stf::process_voluntary_exit(
+                    state,
+                    &exit,
+                    config,
+                    &active_balances,
+                    signatures,
+                )
             }
             ForkName::Lean => lean_is_not_a_fixture_fork("voluntary_exit"),
         },
@@ -481,7 +490,13 @@ fn run(
         // further fork match.
         "sync_aggregate" => {
             let sync_aggregate: altair::SyncAggregate = case.ssz("sync_aggregate");
-            altair_stf::process_sync_aggregate(state, &sync_aggregate, &active_balances, signatures)
+            altair_stf::process_sync_aggregate(
+                state,
+                &sync_aggregate,
+                &active_balances,
+                &pubkey_indices,
+                signatures,
+            )
         }
         // The fixture's operation file is a whole `BeaconBlockBody`, not a
         // bare payload: checking one needs fields that live on the body
@@ -614,7 +629,13 @@ fn run(
         // `BeaconBlock`, named `block` like `block_header`'s.
         "parent_execution_payload" => {
             let block: gloas::BeaconBlock = case.ssz("block");
-            gloas_stf::process_parent_execution_payload(state, &block, config)
+            gloas_stf::process_parent_execution_payload(
+                state,
+                &block,
+                config,
+                &active_balances,
+                &pubkey_indices,
+            )
         }
         // `consolidation_request` and `withdrawal_request` are new in
         // electra, alongside `withdrawals`; neither fulu's nor gloas's own
@@ -627,7 +648,13 @@ fn run(
         // match is needed for either the type or the call.
         "consolidation_request" => {
             let request: electra::ConsolidationRequest = case.ssz("consolidation_request");
-            electra_stf::process_consolidation_request(state, &request, config)
+            electra_stf::process_consolidation_request(
+                state,
+                &request,
+                config,
+                &active_balances,
+                &pubkey_indices,
+            )
         }
         // `deposit_request` is new in electra too, but fulu's specification
         // does list a modified version (`beacon-chain.md`'s "Modified
@@ -660,7 +687,13 @@ fn run(
         },
         "withdrawal_request" => {
             let request: electra::WithdrawalRequest = case.ssz("withdrawal_request");
-            electra_stf::process_withdrawal_request(state, &request, config)
+            electra_stf::process_withdrawal_request(
+                state,
+                &request,
+                config,
+                &active_balances,
+                &pubkey_indices,
+            )
         }
         // New in gloas (EIP-8282): the builder registry's own onboarding and
         // exit requests, applied by `apply_parent_execution_payload` the same

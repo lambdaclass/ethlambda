@@ -14,7 +14,7 @@ use rayon::prelude::*;
 // is unaffected by its move to `ethlambda-storage`; see [`CommitteeCacheExt`]
 // below for what this crate still contributes.
 pub use ethlambda_storage::{
-    ActiveBalanceCache, ActiveBalanceKey, CommitteeCache, Lookup, ShufflingKey,
+    ActiveBalanceCache, ActiveBalanceKey, CommitteeCache, Lookup, PubkeyIndexCache, ShufflingKey,
 };
 
 use crate::beacon::bls::{AggregatePubkey, CommitteeKeySums, IndexedPubkey};
@@ -518,6 +518,88 @@ impl ActiveBalanceCacheExt for ActiveBalanceCache {
             );
         }
         Ok(total)
+    }
+}
+
+/// `state`'s total active balance for block processing: through `cache` when
+/// the caller holds one, the spec-shaped uncached pass when not.
+///
+/// The churn helpers take an `Option` so that block processing, which holds an
+/// [`ActiveBalanceCache`], shares one registry pass across a block's exits,
+/// consolidations and slashings, while epoch processing and the spec-shaped
+/// unit tests keep the uncached function. Passing `Some` is sound only for the
+/// callers [`active_balance_key`] documents: states advanced to their block's
+/// slot, never mid epoch processing.
+pub fn total_active_balance_or_compute(
+    state: &BeaconState,
+    cache: Option<&ActiveBalanceCache>,
+) -> Result<Gwei> {
+    match cache {
+        Some(cache) => cache.total_active_balance(state),
+        None => get_total_active_balance(state),
+    }
+}
+
+/// Extends `ethlambda-storage`'s [`PubkeyIndexCache`] with the consensus logic
+/// that feeds it a registry and checks its answers, for the same reason
+/// [`CommitteeCacheExt`] lives here and not in `ethlambda-storage`.
+///
+/// # Soundness
+///
+/// Pubkeys are unique within any reachable registry (a deposit for a pubkey
+/// already registered tops the existing validator up instead of appending),
+/// and a registry only ever grows by appending, so on one chain a pubkey's
+/// index is fixed from the block that registers it. The table is process-wide
+/// and so also holds positions from other forks, where an unfinalized index can
+/// differ. Every candidate is therefore checked against the asking state's own
+/// validator at that index, which is what makes a stale, foreign or
+/// prefix-colliding entry cost a scan instead of a wrong answer.
+pub trait PubkeyIndexCacheExt {
+    /// The index holding `pubkey` in `state`, from the cache only: `None` if
+    /// no candidate survives verification, which is *not* proof the pubkey is
+    /// absent. Brings the table up to `state`'s registry length first, then
+    /// does no scan.
+    fn verified_index(&self, state: &BeaconState, pubkey: &BlsPubkey) -> Option<ValidatorIndex>;
+
+    /// The index holding `pubkey` in `state`, exactly as a position search of
+    /// the registry would answer: the cache when it verifies, otherwise that
+    /// search. A pubkey that is not registered costs one search, never a
+    /// rebuild of the table. Counted in `lean_beacon_pubkey_index_lookups_total`.
+    fn validator_index(&self, state: &BeaconState, pubkey: &BlsPubkey) -> Option<ValidatorIndex>;
+}
+
+impl PubkeyIndexCacheExt for PubkeyIndexCache {
+    fn verified_index(&self, state: &BeaconState, pubkey: &BlsPubkey) -> Option<ValidatorIndex> {
+        let count = state.validator_count();
+        let covered = self.covered_len();
+        if count > covered {
+            // Scanned outside the table's lock; `extend` skips whatever a
+            // racing caller already ingested. The first call on a fresh table
+            // ingests the whole registry once.
+            let tail: Vec<u64> = state
+                .iter_validators_from(covered)
+                .map(|validator| PubkeyIndexCache::key_of(&validator.pubkey))
+                .collect();
+            self.extend(covered, &tail);
+        }
+        self.candidates(pubkey).into_iter().find(|index| {
+            *index < count as u64
+                && state
+                    .validator(*index)
+                    .is_ok_and(|validator| validator.pubkey == *pubkey)
+        })
+    }
+
+    fn validator_index(&self, state: &BeaconState, pubkey: &BlsPubkey) -> Option<ValidatorIndex> {
+        if let Some(index) = self.verified_index(state, pubkey) {
+            crate::metrics::inc_pubkey_index_lookups("hit", 1);
+            return Some(index);
+        }
+        crate::metrics::inc_pubkey_index_lookups("fallback", 1);
+        state
+            .iter_validators()
+            .position(|validator| validator.pubkey == *pubkey)
+            .map(|index| index as ValidatorIndex)
     }
 }
 
@@ -1130,5 +1212,108 @@ mod tests {
             get_validator_churn_limit(&state, &config),
             config.min_per_epoch_churn_limit
         );
+    }
+
+    // -- PubkeyIndexCache ----------------------------------------------------
+
+    fn pubkey_at(state: &BeaconState, index: u64) -> BlsPubkey {
+        state.validator(index).unwrap().pubkey
+    }
+
+    fn append_validator(state: &mut BeaconState, pubkey: BlsPubkey) {
+        let mut validator = state.validator(0).unwrap().clone();
+        validator.pubkey = pubkey;
+        state.push_validator(validator, 0).unwrap();
+    }
+
+    #[test]
+    fn a_pubkey_resolves_from_the_cache_after_one_ingest() {
+        let state = with_validators(20);
+        let cache = PubkeyIndexCache::default();
+        assert_eq!(cache.covered_len(), 0);
+
+        assert_eq!(cache.verified_index(&state, &pubkey_at(&state, 7)), Some(7));
+        assert_eq!(cache.covered_len(), 20);
+        assert_eq!(
+            cache.verified_index(&state, &pubkey_at(&state, 19)),
+            Some(19)
+        );
+    }
+
+    #[test]
+    fn appended_validators_are_ingested_without_a_rebuild() {
+        let mut state = with_validators(10);
+        let cache = PubkeyIndexCache::default();
+        assert_eq!(cache.verified_index(&state, &pubkey_at(&state, 3)), Some(3));
+
+        let fresh = BlsPubkey([0xAB; 48]);
+        append_validator(&mut state, fresh);
+        assert_eq!(cache.verified_index(&state, &fresh), Some(10));
+        assert_eq!(cache.covered_len(), 11);
+    }
+
+    #[test]
+    fn a_wrong_index_from_another_fork_fails_verification() {
+        let ours = with_validators(10);
+        let cache = PubkeyIndexCache::default();
+        // The table is fed by a fork where index 4 holds a different key.
+        let mut other_fork = ours.clone();
+        let foreign = BlsPubkey([0xCD; 48]);
+        other_fork.validator_mut(4).unwrap().pubkey = foreign;
+        assert_eq!(cache.verified_index(&other_fork, &foreign), Some(4));
+
+        // On our fork index 4 does not hold it: the candidate is refused, and
+        // the public lookup falls back to a scan that finds nothing.
+        assert_eq!(cache.verified_index(&ours, &foreign), None);
+        assert_eq!(cache.validator_index(&ours, &foreign), None);
+        // Our own key at that index, absent from the table's fork, is found by
+        // the scan.
+        let own = pubkey_at(&ours, 4);
+        assert_eq!(cache.validator_index(&ours, &own), Some(4));
+    }
+
+    #[test]
+    fn an_absent_pubkey_costs_a_scan_and_does_not_rebuild_the_table() {
+        let state = with_validators(10);
+        let cache = PubkeyIndexCache::default();
+        cache.verified_index(&state, &pubkey_at(&state, 0));
+        let covered = cache.covered_len();
+
+        let missing = BlsPubkey([0xEE; 48]);
+        assert_eq!(cache.validator_index(&state, &missing), None);
+        assert_eq!(cache.covered_len(), covered);
+        assert!(cache.candidates(&missing).is_empty());
+    }
+
+    #[test]
+    fn a_key_prefix_collision_falls_back_to_the_right_validator() {
+        let mut state = with_validators(10);
+        let cache = PubkeyIndexCache::default();
+        // Two distinct pubkeys sharing the eight bytes the table keys on.
+        let first = pubkey_at(&state, 2);
+        let mut twin = first;
+        twin.0[47] ^= 0xFF;
+        assert_eq!(
+            PubkeyIndexCache::key_of(&first),
+            PubkeyIndexCache::key_of(&twin)
+        );
+        append_validator(&mut state, twin);
+
+        assert_eq!(cache.validator_index(&state, &first), Some(2));
+        assert_eq!(cache.validator_index(&state, &twin), Some(10));
+    }
+
+    #[test]
+    fn the_cache_agrees_with_a_registry_scan_for_every_validator() {
+        let state = with_validators(64);
+        let cache = PubkeyIndexCache::default();
+        for index in 0..64u64 {
+            let pubkey = pubkey_at(&state, index);
+            let scanned = state
+                .iter_validators()
+                .position(|validator| validator.pubkey == pubkey)
+                .map(|position| position as u64);
+            assert_eq!(cache.validator_index(&state, &pubkey), scanned);
+        }
     }
 }

@@ -840,6 +840,17 @@ impl BeaconState {
         }
     }
 
+    /// The validators from index `start` on, in index order, pending writes
+    /// included; empty if `start` is past the end. For a pass over a
+    /// registry's appended tail that must not walk the part before it.
+    pub fn iter_validators_from(&self, start: usize) -> impl ExactSizeIterator<Item = &Validator> {
+        match self.registry() {
+            Some(Registry::Bounded(v, _)) => RegistryIter::Bounded(v.iter_from(start)),
+            Some(Registry::Progressive(v, _)) => RegistryIter::Progressive(v.iter_from(start)),
+            None => lean_state_unreachable("iter_validators_from"),
+        }
+    }
+
     /// Every balance, in index order, pending writes included. See
     /// [`Self::iter_validators`] for why this is an iterator.
     pub fn iter_balances(&self) -> impl ExactSizeIterator<Item = Gwei> {

@@ -69,7 +69,9 @@ use std::sync::Arc;
 use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::config::Config;
 use ethlambda_state_transition::beacon::containers::{BeaconState, SignedBeaconBlock};
-use ethlambda_state_transition::beacon::helpers::accessors::{ActiveBalanceCache, CommitteeCache};
+use ethlambda_state_transition::beacon::helpers::accessors::{
+    ActiveBalanceCache, CommitteeCache, PubkeyIndexCache,
+};
 use ethlambda_state_transition::beacon::helpers::misc::compute_start_slot_at_epoch;
 use ethlambda_state_transition::beacon::primitives::Epoch;
 use ethlambda_state_transition::beacon::stf::{self, ExecutionEngine};
@@ -139,6 +141,7 @@ fn apply_blocks(
     // imports, so consecutive blocks of an epoch share its shuffling.
     let committees = CommitteeCache::default();
     let active_balances = ActiveBalanceCache::default();
+    let pubkey_indices = PubkeyIndexCache::default();
 
     for index in 0..meta.blocks_count {
         let fork = if index < first_post_fork_index {
@@ -163,6 +166,7 @@ fn apply_blocks(
             &engine,
             &committees,
             &active_balances,
+            &pubkey_indices,
         )
         .map_err(|err| format!("block {index} rejected: {err:?}"))?;
 

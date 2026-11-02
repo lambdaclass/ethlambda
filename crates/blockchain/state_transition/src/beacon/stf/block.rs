@@ -24,8 +24,8 @@ use crate::beacon::containers::{self, BeaconBlockHeader, BeaconState, Eth1Data, 
 use crate::beacon::error::{Result, verify};
 use crate::beacon::hash::hash;
 use crate::beacon::helpers::accessors::{
-    ActiveBalanceCache, CommitteeCache, get_beacon_proposer_index, get_current_epoch, get_domain,
-    get_randao_mix,
+    ActiveBalanceCache, CommitteeCache, PubkeyIndexCache, get_beacon_proposer_index,
+    get_current_epoch, get_domain, get_randao_mix,
 };
 use crate::beacon::helpers::math::xor;
 use crate::beacon::helpers::misc::compute_signing_root;
@@ -53,6 +53,7 @@ use super::{ExecutionEngine, bellatrix, capella, deneb, electra, fulu, gloas};
 /// An `Err` leaves `state` partly mutated, as it always could: an operation
 /// whose signature is deferred has already written when a bad signature is
 /// found at the end. Every caller discards the state after an error.
+#[allow(clippy::too_many_arguments)]
 pub fn process_block(
     state: &mut BeaconState,
     signed_block: &containers::SignedBeaconBlock,
@@ -60,6 +61,7 @@ pub fn process_block(
     engine: &ExecutionEngine,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
     options: BlockProcessingOptions,
 ) -> Result<()> {
     SignatureBatch::deferred(|signatures| {
@@ -70,6 +72,7 @@ pub fn process_block(
             engine,
             committees,
             active_balances,
+            pubkey_indices,
             options,
             signatures,
         )
@@ -86,6 +89,7 @@ fn process_block_with_signatures(
     engine: &ExecutionEngine,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
     options: BlockProcessingOptions,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
@@ -105,6 +109,7 @@ fn process_block_with_signatures(
             config,
             committees,
             active_balances,
+            pubkey_indices,
             options,
             signatures,
         ),
@@ -115,6 +120,7 @@ fn process_block_with_signatures(
             engine,
             committees,
             active_balances,
+            pubkey_indices,
             options,
             signatures,
         ),
@@ -125,6 +131,7 @@ fn process_block_with_signatures(
             engine,
             committees,
             active_balances,
+            pubkey_indices,
             options,
             signatures,
         ),
@@ -135,6 +142,7 @@ fn process_block_with_signatures(
             engine,
             committees,
             active_balances,
+            pubkey_indices,
             options,
             signatures,
         ),
@@ -145,6 +153,7 @@ fn process_block_with_signatures(
             engine,
             committees,
             active_balances,
+            pubkey_indices,
             options,
             signatures,
         ),
@@ -155,6 +164,7 @@ fn process_block_with_signatures(
             engine,
             committees,
             active_balances,
+            pubkey_indices,
             options,
             signatures,
         ),
@@ -167,6 +177,7 @@ fn process_block_with_signatures(
             config,
             committees,
             active_balances,
+            pubkey_indices,
             options,
             signatures,
         ),
@@ -221,12 +232,14 @@ pub fn process_block_phase0(
 /// specification's own `process_block`, which appends
 /// `process_sync_aggregate(state, block.body.sync_aggregate)` to phase0's list
 /// rather than interleaving it earlier.
+#[allow(clippy::too_many_arguments)]
 pub fn process_block_altair(
     state: &mut BeaconState,
     block: &altair::BeaconBlock,
     config: &Config,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
     options: BlockProcessingOptions,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
@@ -259,6 +272,7 @@ pub fn process_block_altair(
         state,
         &block.body.sync_aggregate,
         active_balances,
+        pubkey_indices,
         signatures,
     )?;
     Ok(())

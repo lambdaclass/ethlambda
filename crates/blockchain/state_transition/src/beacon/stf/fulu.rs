@@ -44,7 +44,7 @@ use crate::beacon::config::Config;
 use crate::beacon::containers::{BeaconState, deneb, electra};
 use crate::beacon::error::{Result, verify};
 use crate::beacon::helpers::accessors::{
-    ActiveBalanceCache, CommitteeCache, get_current_epoch, get_randao_mix,
+    ActiveBalanceCache, CommitteeCache, PubkeyIndexCache, get_current_epoch, get_randao_mix,
 };
 use crate::beacon::helpers::electra::pending_queue_fields;
 use crate::beacon::helpers::fulu::{fulu_state, fulu_state_ref};
@@ -72,6 +72,7 @@ pub fn process_block(
     engine: &ExecutionEngine,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
     options: super::block::BlockProcessingOptions,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
@@ -98,12 +99,14 @@ pub fn process_block(
         config,
         committees,
         active_balances,
+        pubkey_indices,
         signatures,
     )?;
     super::altair::process_sync_aggregate(
         state,
         &block.body.sync_aggregate,
         active_balances,
+        pubkey_indices,
         signatures,
     )?;
     Ok(())
@@ -247,6 +250,7 @@ pub fn process_operations(
     config: &Config,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
     // [Modified in Fulu]
@@ -282,7 +286,9 @@ pub fn process_operations(
     try_for_each_timed(
         StfPhase::VoluntaryExits,
         body.voluntary_exits.iter(),
-        |exit| super::electra::process_voluntary_exit(state, exit, config, signatures),
+        |exit| {
+            super::electra::process_voluntary_exit(state, exit, config, active_balances, signatures)
+        },
     )?;
     try_for_each_timed(
         StfPhase::BlsToExecutionChanges,
@@ -297,7 +303,13 @@ pub fn process_operations(
         },
     )?;
     timed(StfPhase::ExecutionRequests, || {
-        process_execution_requests(state, &body.execution_requests, config)
+        process_execution_requests(
+            state,
+            &body.execution_requests,
+            config,
+            active_balances,
+            pubkey_indices,
+        )
     })?;
 
     Ok(())
@@ -315,15 +327,29 @@ pub fn process_execution_requests(
     state: &mut BeaconState,
     requests: &electra::ExecutionRequests,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
 ) -> Result<()> {
     for deposit in requests.deposits.iter() {
         process_deposit_request(state, deposit)?;
     }
     for withdrawal in requests.withdrawals.iter() {
-        super::electra::process_withdrawal_request(state, withdrawal, config)?;
+        super::electra::process_withdrawal_request(
+            state,
+            withdrawal,
+            config,
+            active_balances,
+            pubkey_indices,
+        )?;
     }
     for consolidation in requests.consolidations.iter() {
-        super::electra::process_consolidation_request(state, consolidation, config)?;
+        super::electra::process_consolidation_request(
+            state,
+            consolidation,
+            config,
+            active_balances,
+            pubkey_indices,
+        )?;
     }
     Ok(())
 }

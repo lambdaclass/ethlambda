@@ -38,8 +38,9 @@ use super::bls;
 use super::config::Config;
 use super::error::{Error, Result, verify};
 use super::helpers::accessors::{
-    ActiveBalanceCache, CommitteeCache, get_beacon_proposer_index, get_block_root,
-    get_block_root_at_slot, get_current_epoch, get_domain, get_previous_epoch, get_randao_mix,
+    ActiveBalanceCache, CommitteeCache, PubkeyIndexCache, get_beacon_proposer_index,
+    get_block_root, get_block_root_at_slot, get_current_epoch, get_domain, get_previous_epoch,
+    get_randao_mix,
 };
 use super::helpers::electra::{
     get_attesting_indices, get_indexed_attestation, is_valid_indexed_attestation,
@@ -403,12 +404,18 @@ pub fn pack_operations(state: &BeaconState, candidates: Operations, config: &Con
         stf::electra::process_attester_slashing,
     );
 
+    // One table for the whole scratch pass: the scratch state is at the
+    // block's own slot, so its total active balance cannot change between
+    // candidates.
+    let active_balances = ActiveBalanceCache::default();
     let voluntary_exits = pack_each(
         &mut scratch,
         candidates.voluntary_exits,
         preset::MAX_VOLUNTARY_EXITS,
         config,
-        stf::electra::process_voluntary_exit,
+        |state, exit, config, signatures| {
+            stf::electra::process_voluntary_exit(state, exit, config, &active_balances, signatures)
+        },
     );
     let bls_to_execution_changes = pack_each(
         &mut scratch,
@@ -597,6 +604,7 @@ pub fn assemble_block(
         &ExecutionEngine::valid(),
         &CommitteeCache::default(),
         &ActiveBalanceCache::default(),
+        &PubkeyIndexCache::default(),
         options,
     )?;
     // Fold the block's writes into their trees first, so the root is computed
@@ -707,6 +715,7 @@ mod tests {
             &ExecutionEngine::valid(),
             &CommitteeCache::default(),
             &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
             BlockProcessingOptions::default(),
         )
         .unwrap();
@@ -771,6 +780,7 @@ mod tests {
             &ExecutionEngine::valid(),
             &CommitteeCache::default(),
             &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
             skip_randao(),
         )
         .unwrap();

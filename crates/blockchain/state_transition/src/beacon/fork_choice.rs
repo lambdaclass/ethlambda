@@ -1069,6 +1069,10 @@ fn transition_block(
     // `metrics::StfContext` for why the series is split by caller.
     let _import_context = metrics::import_context();
 
+    // The store's own table, shared across forks; every hit is verified
+    // against the state in hand (see `PubkeyIndexCacheExt`).
+    let pubkey_cache = store.pubkey_index_cache();
+    let pubkey_indices = &*pubkey_cache;
     let block_slot = signed_block.slot();
     let epoch = compute_epoch_at_slot(block_slot);
     let epoch_start = compute_start_slot_at_epoch(epoch);
@@ -1094,6 +1098,7 @@ fn transition_block(
                 engine,
                 committees,
                 active_balances,
+                pubkey_indices,
             );
             return (state, outcome);
         }
@@ -1111,6 +1116,7 @@ fn transition_block(
                     engine,
                     committees,
                     active_balances,
+                    pubkey_indices,
                 )
             });
         return (state, outcome);
@@ -1136,6 +1142,7 @@ fn transition_block(
             engine,
             committees,
             active_balances,
+            pubkey_indices,
         )
     });
     (state, outcome)
@@ -5811,7 +5818,7 @@ mod tests {
     use super::*;
     use crate::beacon::bls;
     use crate::beacon::containers::BeaconBlockHeader;
-    use crate::beacon::helpers::accessors::{self, ActiveBalanceCache};
+    use crate::beacon::helpers::accessors::{self, ActiveBalanceCache, PubkeyIndexCache};
     use crate::beacon::helpers::misc::compute_signing_root;
     use crate::beacon::helpers::test_state;
     use crate::beacon::primitives::BlsSignature;
@@ -7342,6 +7349,7 @@ mod tests {
             &stf::ExecutionEngine::valid(),
             &trial_committees,
             &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
         )
         .expect("the drafted block must transition cleanly");
         let state_root = trial_state.hash_tree_root();

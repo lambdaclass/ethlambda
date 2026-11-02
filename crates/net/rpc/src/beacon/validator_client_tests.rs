@@ -1011,6 +1011,7 @@ fn assert_full_sync_aggregate(
             &mut state,
             aggregate,
             &ethlambda_state_transition::beacon::helpers::accessors::ActiveBalanceCache::default(),
+            &ethlambda_state_transition::beacon::helpers::accessors::PubkeyIndexCache::default(),
             signatures,
         )
     })

@@ -80,6 +80,24 @@ pub fn inc_total_active_balance_lookups(result: &str) {
         .inc();
 }
 
+static LEAN_BEACON_PUBKEY_INDEX_LOOKUPS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "lean_beacon_pubkey_index_lookups_total",
+        "Pubkey to validator-index lookups in block processing, by whether the pubkey index cache served them",
+        &["result"]
+    )
+    .unwrap()
+});
+
+/// Count `count` `PubkeyIndexCache` lookups: `hit` (a verified cache entry) or
+/// `fallback` (the registry was searched, whether or not the pubkey was
+/// found).
+pub fn inc_pubkey_index_lookups(result: &str, count: u64) {
+    LEAN_BEACON_PUBKEY_INDEX_LOOKUPS_TOTAL
+        .with_label_values(&[result])
+        .inc_by(count);
+}
+
 static LEAN_BEACON_JUSTIFIED_BALANCES_LOOKUPS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(
     || {
         register_int_counter_vec!(
