@@ -5519,6 +5519,98 @@ mod tests {
         );
     }
 
+    /// Through `on_block`: the arrival is the block that arrived, even though
+    /// the cascade then processes a stored ancestor the walk queued behind it,
+    /// and the record is reset once per arrival, not once per block.
+    #[tokio::test]
+    async fn the_arrival_is_the_block_on_block_was_called_with() {
+        let mut store = beacon_store_fulu_at_genesis(GENESIS_TIME, 0);
+        store
+            .insert_signed_block(H256::ZERO, bare_block(0, H256::repeat_byte(0xcc)))
+            .expect("insert");
+        store
+            .insert_state(H256::ZERO, bare_state())
+            .expect("insert");
+        store
+            .set_time_ms(seconds_to_milliseconds(
+                GENESIS_TIME + 5 * Config::mainnet().seconds_per_slot,
+            ))
+            .unwrap();
+        let mut server = beacon_server(store);
+        server.custody_columns = CUSTODY.to_vec();
+
+        // Stored as pending from an earlier session: the child's walk finds
+        // it, its parent has a state, and it is queued behind the child. It is
+        // then held for its columns, so no state transition is needed.
+        let first = fulu_block_with_commitments(&server.store, 2);
+        let first_root = first.message_hash_tree_root();
+        server
+            .store
+            .insert_pending_block(first_root, first.clone())
+            .expect("insert");
+        let child = fulu_block(first_root, first.slot() + 1, 0);
+        let child_root = child.message_hash_tree_root();
+        let child_slot = child.slot();
+
+        server
+            .on_block(
+                child,
+                ImportTimings {
+                    source: Some(BlockSource::Gossip),
+                    ..ImportTimings::starting_now()
+                },
+            )
+            .await;
+
+        assert!(
+            server.blocks_awaiting_columns.contains_key(&first_root),
+            "the walk queued the stored ancestor, which then held"
+        );
+        assert_eq!(
+            server.cascade_telemetry.arrival,
+            Some((child_slot, child_root))
+        );
+    }
+
+    /// `da_columns_required` says the check found columns to require, not
+    /// merely that it ran.
+    #[tokio::test]
+    async fn the_columns_required_flag_follows_the_commitments() {
+        let mut store = beacon_store_fulu_at_genesis(GENESIS_TIME, 0);
+        store
+            .insert_signed_block(H256::ZERO, bare_block(0, H256::repeat_byte(0xcc)))
+            .expect("insert");
+        store
+            .insert_state(H256::ZERO, bare_state())
+            .expect("insert");
+        store
+            .set_time_ms(seconds_to_milliseconds(
+                GENESIS_TIME + 5 * Config::mainnet().seconds_per_slot,
+            ))
+            .unwrap();
+        let mut server = beacon_server(store);
+        server.custody_columns = CUSTODY.to_vec();
+
+        let bare = fulu_block_with_commitments(&server.store, 0);
+        let (timings, _) = server.process_block(bare, ImportTimings::default()).await;
+        assert!(timings.da_check_end.is_some(), "inside the window");
+        assert!(!timings.da_columns_required, "nothing to make available");
+
+        let with_columns = fulu_block_with_commitments(&server.store, 2);
+        let root = with_columns.message_hash_tree_root();
+        for index in CUSTODY {
+            let sidecar = sidecar_for(&with_columns, index);
+            server
+                .store
+                .put_data_column_sidecar(with_columns.slot(), &root, index, sidecar.to_ssz())
+                .unwrap();
+        }
+        let (timings, _) = server
+            .process_block(with_columns, ImportTimings::default())
+            .await;
+        assert!(timings.da_columns_required, "columns were required");
+    }
+
     #[tokio::test]
     async fn the_descendants_of_a_held_block_wait_for_it_without_re_importing_it() {
         // A range batch hands the actor a whole chain at once. When its first

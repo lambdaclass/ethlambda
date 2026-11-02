@@ -503,8 +503,8 @@ impl BlockImportReport {
             _ => return Vec::new(),
         };
         let t = &self.timings;
-        // Only a block that waited on columns has made data available; the
-        // others' check ran and found nothing to require.
+        // Only a check that found columns to require made data available; for
+        // the others it ran and found nothing to require.
         let da_check_end = if t.da_columns_required {
             "da_available"
         } else {
