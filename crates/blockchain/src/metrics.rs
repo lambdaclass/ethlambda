@@ -1587,24 +1587,25 @@ pub fn inc_engine_speculation(outcome: &str) {
         .inc();
 }
 
-/// How long the execution client took to answer `engine_newPayload` for a
-/// block's payload, from sending the request to its answer, retry ladder
-/// included.
+/// How long the execution client took to answer `engine_newPayload*` for a
+/// payload, from sending the request to its answer, retry ladder included:
+/// a pre-gloas block's payload, and from gloas on the payload an envelope
+/// reveals.
 ///
-/// The import computes the block's state transition meanwhile, so this is not
-/// what the import waited: that is `lean_block_import_phase_seconds`'s
-/// `engine` phase, zero whenever the answer was in before the transition
-/// finished. This is the execution client's own processing time, observed for
-/// pre-gloas blocks only (a gloas payload is asked about with its envelope).
-/// `outcome` is `valid`, `optimistic`, `invalidated` or `no_verdict` (no
-/// answer after the whole ladder, so the time is the ladder's).
+/// For a pre-gloas block the import computes the state transition meanwhile,
+/// so this is not what the import waited: that is
+/// `lean_block_import_phase_seconds`'s `engine` phase, zero whenever the
+/// answer was in before the transition finished. This is the execution
+/// client's own processing time. `outcome` is `valid`, `optimistic`,
+/// `invalidated` or `no_verdict` (no answer after the whole ladder, so the
+/// time is the ladder's).
 pub fn observe_engine_new_payload(outcome: &str, duration: Duration) {
     static LEAN_ENGINE_NEW_PAYLOAD_SECONDS: std::sync::LazyLock<HistogramVec> =
         std::sync::LazyLock::new(|| {
             register_histogram_vec!(
                 "lean_engine_new_payload_seconds",
-                "Time the execution client took to answer engine_newPayload for a block, \
-                 retries included",
+                "Time the execution client took to answer engine_newPayload for a block's \
+                 or an envelope's payload, retries included",
                 &["outcome"],
                 // Up to the retry ladder's worst case: three attempts at the
                 // per-attempt timeout plus the backoff between them.

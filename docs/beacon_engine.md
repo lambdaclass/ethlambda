@@ -126,8 +126,8 @@ the wait that was left once it finished, a recorded zero when the answer was
 already in. Without an execution client, and for forks that have no request to
 send (pre-merge, gloas), nothing overlaps, `engine` is zero, and the path is the
 old one. How long the execution client itself took to answer is
-`lean_engine_new_payload_seconds{outcome}`, timed around the request in
-`ask_request`.
+`lean_engine_new_payload_seconds{outcome}`, timed around every `engine_newPayload*`
+request this module sends (`timed_new_payload`), a gloas envelope's included.
 
 ## The verdicts
 

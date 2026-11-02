@@ -1822,8 +1822,8 @@ impl BlockChainServer {
                 // nothing left to do, so it starts as a recorded zero and only
                 // a request still unanswered when the transition is done
                 // widens it. The execution client's own time is
-                // `lean_engine_new_payload_seconds`, observed in
-                // `ask_request`.
+                // `lean_engine_new_payload_seconds`, observed around the
+                // request itself.
                 let no_wait = Instant::now();
                 (timings.engine_start, timings.engine_end) = (Some(no_wait), Some(no_wait));
                 let parent_root = beacon_block.parent_root();
