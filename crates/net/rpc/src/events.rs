@@ -45,11 +45,13 @@ use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 /// `crate::serve`), so a response that would otherwise never finish can end
 /// itself when the server starts shutting down. It holds a child of the
 /// server's token and exposes only [`ShutdownSignal::cancelled`], so a handler
-/// can wait for shutdown but never trigger it. `Default`, a signal that never
-/// fires, exists only for tests: in production it would bring back the hang
-/// this type removes.
+/// can wait for shutdown but never trigger it.
+///
+/// Handlers extract it as an `Option`: a router served some other way (a
+/// test, or a caller of `build_beacon_api_router` serving it with plain
+/// `axum::serve`) has no signal, and its streams then end only when the
+/// client leaves, rather than the request failing for a missing extension.
 #[derive(Clone)]
-#[cfg_attr(test, derive(Default))]
 pub(crate) struct ShutdownSignal(CancellationToken);
 
 impl ShutdownSignal {
@@ -72,7 +74,7 @@ struct EventsParams {
 
 async fn get_events(
     Extension(events): Extension<EventBus>,
-    Extension(shutdown): Extension<ShutdownSignal>,
+    shutdown: Option<Extension<ShutdownSignal>>,
     Query(params): Query<EventsParams>,
 ) -> Response {
     // `topics` is required, matching the Beacon API: a missing or empty value
@@ -98,11 +100,12 @@ async fn get_events(
         },
     };
 
-    sse_response(&events, topics, shutdown)
+    sse_response(&events, topics, shutdown.map(|Extension(signal)| signal))
 }
 
 /// An SSE response streaming every event on `events` whose topic is in
-/// `topics`, from now on, until `shutdown` fires.
+/// `topics`, from now on, until `shutdown` fires. With no signal, the stream
+/// ends only when the client leaves; see [`ShutdownSignal`].
 ///
 /// `X-Accel-Buffering: no` tells an nginx reverse proxy not to buffer the
 /// stream, which would otherwise hold events back until a buffer fills; axum's
@@ -111,9 +114,15 @@ async fn get_events(
 pub(crate) fn sse_response(
     events: &EventBus,
     topics: Vec<Topic>,
-    shutdown: ShutdownSignal,
+    shutdown: Option<ShutdownSignal>,
 ) -> Response {
-    let stream = event_stream(events.subscribe(), topics).take_until(shutdown.cancelled());
+    let shutdown = async move {
+        match shutdown {
+            Some(signal) => signal.cancelled().await,
+            None => std::future::pending().await,
+        }
+    };
+    let stream = event_stream(events.subscribe(), topics).take_until(shutdown);
     let mut response = Sse::new(stream)
         .keep_alive(axum::response::sse::KeepAlive::default())
         .into_response();
@@ -199,9 +208,9 @@ mod tests {
             create_test_state(),
             DEFAULT_MILLISECONDS_PER_SLOT,
         );
-        let app = crate::test_utils::test_api_router(store)
-            .layer(Extension(events.clone()))
-            .layer(Extension(super::ShutdownSignal::default()));
+        // No `ShutdownSignal` layer: a router served outside `crate::serve`
+        // must still answer.
+        let app = crate::test_utils::test_api_router(store).layer(Extension(events.clone()));
         app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await
             .unwrap()
@@ -444,7 +453,7 @@ mod tests {
         let events = EventBus::new(16);
         let server = tokio_util::sync::CancellationToken::new();
         let shutdown = super::ShutdownSignal::of(&server);
-        let resp = super::sse_response(&events, vec![Topic::Head], shutdown);
+        let resp = super::sse_response(&events, vec![Topic::Head], Some(shutdown));
 
         server.cancel();
 
