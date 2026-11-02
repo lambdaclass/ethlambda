@@ -2183,6 +2183,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ethlambda-telemetry"
+version = "1.0.0"
+dependencies = [
+ "axum",
+ "ethlambda-metrics",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ethlambda-test-fixtures"
 version = "1.0.0"
 dependencies = [
