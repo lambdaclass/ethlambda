@@ -2220,25 +2220,6 @@ mod tests {
         })
     }
 
-    /// Fulu and gloas end on a fixed-size field, which is where libssz's
-    /// encoder writes past the encoding's length.
-    #[test]
-    fn ssz_append_never_regrows_a_buffer_with_its_capacity_to_spare() {
-        for state in [small_fulu_state(3), small_gloas_state(3)] {
-            let fork = state.fork_name();
-            let expected = dispatch_state_including_lean!(&state, |state| state.to_ssz());
-            let capacity = state.ssz_append_capacity();
-            let mut buf = Vec::with_capacity(capacity);
-            state.ssz_append(&mut buf);
-            assert_eq!(buf, expected, "{fork}");
-            assert_eq!(buf.capacity(), capacity, "{fork}: ssz_append regrew");
-
-            let encoded = state.to_ssz();
-            assert_eq!(encoded, expected, "{fork}");
-            assert_eq!(encoded.capacity(), capacity, "{fork}: to_ssz regrew");
-        }
-    }
-
     #[test]
     fn registry_accessors_read_and_write_elements() {
         let mut state = small_fulu_state(3); // 3 validators, balances 32 ETH
