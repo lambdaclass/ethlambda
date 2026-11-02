@@ -17,6 +17,10 @@
 //! The stream itself ([`sse_response`]) is shared with the Beacon API's
 //! `/eth/v1/events` (`crate::beacon::events`), which differs only in how it
 //! reads `topics` and words a refusal.
+//!
+//! Shutdown: a stream ends when the server's [`ShutdownSignal`] fires. Without
+//! that, a connected subscriber would keep graceful shutdown waiting forever,
+//! since the router's own [`EventBus`] clone keeps the channel open.
 
 use std::convert::Infallible;
 
@@ -29,9 +33,18 @@ use axum::{
 };
 use ethlambda_blockchain::{ChainEvent, EventBus, Topic};
 use ethlambda_storage::Store;
-use futures_util::{Stream, stream::unfold};
+use futures_util::{Stream, StreamExt as _, stream::unfold};
 use serde::Deserialize;
 use tokio::sync::broadcast::{self, error::RecvError};
+use tokio_util::sync::CancellationToken;
+
+/// The token that stops the HTTP server a request arrived on.
+///
+/// Every router the server serves carries it as an [`Extension`] (see
+/// `crate::serve`), so a response that would otherwise never finish can end
+/// itself when the server starts shutting down.
+#[derive(Clone, Default)]
+pub(crate) struct ShutdownSignal(pub(crate) CancellationToken);
 
 #[derive(Deserialize)]
 struct EventsParams {
@@ -40,6 +53,7 @@ struct EventsParams {
 
 async fn get_events(
     Extension(events): Extension<EventBus>,
+    Extension(shutdown): Extension<ShutdownSignal>,
     Query(params): Query<EventsParams>,
 ) -> Response {
     // `topics` is required, matching the Beacon API: a missing or empty value
@@ -65,18 +79,23 @@ async fn get_events(
         },
     };
 
-    sse_response(&events, topics)
+    sse_response(&events, topics, shutdown)
 }
 
 /// An SSE response streaming every event on `events` whose topic is in
-/// `topics`, from now on.
+/// `topics`, from now on, until `shutdown` fires.
 ///
 /// `X-Accel-Buffering: no` tells an nginx reverse proxy not to buffer the
 /// stream, which would otherwise hold events back until a buffer fills; axum's
 /// [`Sse`] already sets `content-type: text/event-stream` and
 /// `cache-control: no-cache`.
-pub(crate) fn sse_response(events: &EventBus, topics: Vec<Topic>) -> Response {
-    let mut response = Sse::new(event_stream(events.subscribe(), topics))
+pub(crate) fn sse_response(
+    events: &EventBus,
+    topics: Vec<Topic>,
+    shutdown: ShutdownSignal,
+) -> Response {
+    let stream = event_stream(events.subscribe(), topics).take_until(shutdown.0.cancelled_owned());
+    let mut response = Sse::new(stream)
         .keep_alive(axum::response::sse::KeepAlive::default())
         .into_response();
     response
@@ -125,7 +144,8 @@ fn event_stream(
                         Event::default().comment(format!("error - dropped {skipped} messages"));
                     return Some((Ok(frame), (rx, topics)));
                 }
-                // Publisher dropped: the node is shutting down.
+                // Every sender dropped. The router holds one, so in practice
+                // shutdown ends the stream through `ShutdownSignal` instead.
                 Err(RecvError::Closed) => return None,
             }
         }
@@ -143,12 +163,13 @@ mod tests {
         body::Body,
         http::{Request, StatusCode},
     };
-    use ethlambda_blockchain::{ChainEvent, EventBus};
+    use ethlambda_blockchain::{ChainEvent, EventBus, Topic};
     use ethlambda_storage::{Store, backend::InMemoryBackend};
     use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use futures_util::StreamExt;
     use http_body_util::BodyExt;
     use std::sync::Arc;
+    use std::time::Duration;
     use tower::ServiceExt;
 
     use crate::test_utils::create_test_state;
@@ -159,7 +180,9 @@ mod tests {
             create_test_state(),
             DEFAULT_MILLISECONDS_PER_SLOT,
         );
-        let app = crate::test_utils::test_api_router(store).layer(Extension(events.clone()));
+        let app = crate::test_utils::test_api_router(store)
+            .layer(Extension(events.clone()))
+            .layer(Extension(super::ShutdownSignal::default()));
         app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await
             .unwrap()
@@ -395,5 +418,21 @@ mod tests {
             let resp = events_response(&events, uri).await;
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "uri: {uri}");
         }
+    }
+
+    #[tokio::test]
+    async fn events_stream_ends_when_the_server_shuts_down() {
+        let events = EventBus::new(16);
+        let shutdown = super::ShutdownSignal::default();
+        let resp = super::sse_response(&events, vec![Topic::Head], shutdown.clone());
+
+        shutdown.0.cancel();
+
+        // The bus stays open (`events` is still alive), so only the signal
+        // can end the body; before it did, this waited forever.
+        tokio::time::timeout(Duration::from_secs(5), resp.into_body().collect())
+            .await
+            .expect("the stream ends once shutdown fires")
+            .expect("the body reads");
     }
 }

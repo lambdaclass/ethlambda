@@ -136,6 +136,10 @@ pub async fn start_http_servers(
 }
 
 /// Bind one listener and serve `app` on it until `shutdown` is cancelled.
+///
+/// Graceful shutdown waits for every in-flight response, so `app` gets the
+/// token as a [`events::ShutdownSignal`] too: the event streams, which never
+/// finish on their own, end on it.
 async fn serve(
     address: IpAddr,
     port: u16,
@@ -145,6 +149,7 @@ async fn serve(
     let addr = SocketAddr::new(address, port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "HTTP server listening");
+    let app = app.layer(Extension(events::ShutdownSignal(shutdown.clone())));
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown.cancelled().await;
