@@ -36,15 +36,34 @@ use ethlambda_storage::Store;
 use futures_util::{Stream, StreamExt as _, stream::unfold};
 use serde::Deserialize;
 use tokio::sync::broadcast::{self, error::RecvError};
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
-/// The token that stops the HTTP server a request arrived on.
+/// What a response waits on to learn that the HTTP server it arrived on is
+/// shutting down.
 ///
 /// Every router the server serves carries it as an [`Extension`] (see
 /// `crate::serve`), so a response that would otherwise never finish can end
-/// itself when the server starts shutting down.
-#[derive(Clone, Default)]
-pub(crate) struct ShutdownSignal(pub(crate) CancellationToken);
+/// itself when the server starts shutting down. It holds a child of the
+/// server's token and exposes only [`ShutdownSignal::cancelled`], so a handler
+/// can wait for shutdown but never trigger it. `Default`, a signal that never
+/// fires, exists only for tests: in production it would bring back the hang
+/// this type removes.
+#[derive(Clone)]
+#[cfg_attr(test, derive(Default))]
+pub(crate) struct ShutdownSignal(CancellationToken);
+
+impl ShutdownSignal {
+    /// A signal that fires when `server` is cancelled. It holds a child token,
+    /// which cannot cancel `server`.
+    pub(crate) fn of(server: &CancellationToken) -> Self {
+        Self(server.child_token())
+    }
+
+    /// Resolves once the server starts shutting down.
+    pub(crate) fn cancelled(self) -> WaitForCancellationFutureOwned {
+        self.0.cancelled_owned()
+    }
+}
 
 #[derive(Deserialize)]
 struct EventsParams {
@@ -94,7 +113,7 @@ pub(crate) fn sse_response(
     topics: Vec<Topic>,
     shutdown: ShutdownSignal,
 ) -> Response {
-    let stream = event_stream(events.subscribe(), topics).take_until(shutdown.0.cancelled_owned());
+    let stream = event_stream(events.subscribe(), topics).take_until(shutdown.cancelled());
     let mut response = Sse::new(stream)
         .keep_alive(axum::response::sse::KeepAlive::default())
         .into_response();
@@ -423,10 +442,11 @@ mod tests {
     #[tokio::test]
     async fn events_stream_ends_when_the_server_shuts_down() {
         let events = EventBus::new(16);
-        let shutdown = super::ShutdownSignal::default();
-        let resp = super::sse_response(&events, vec![Topic::Head], shutdown.clone());
+        let server = tokio_util::sync::CancellationToken::new();
+        let shutdown = super::ShutdownSignal::of(&server);
+        let resp = super::sse_response(&events, vec![Topic::Head], shutdown);
 
-        shutdown.0.cancel();
+        server.cancel();
 
         // The bus stays open (`events` is still alive), so only the signal
         // can end the body; before it did, this waited forever.
