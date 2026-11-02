@@ -367,19 +367,20 @@ impl BeaconState {
     /// [`BeaconState::from_ssz`], which builds that variant, so refusing here
     /// would make decoding a state and re-encoding it panic.
     ///
-    /// Appends into a buffer with [`BeaconState::ssz_append_capacity`] rather
-    /// than calling libssz's own `to_ssz`, which reserves only the encoding's
-    /// length and so holds a fulu or gloas state twice while encoding it (see
-    /// there).
+    /// Goes through [`BeaconState::ssz_append`] rather than libssz's own
+    /// `to_ssz`, which reserves only the encoding's length and so holds a fulu
+    /// or gloas state twice while encoding it (see
+    /// [`BeaconState::ssz_append_capacity`]).
     pub fn to_ssz(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(self.ssz_append_capacity());
+        let mut buf = Vec::new();
         self.ssz_append(&mut buf);
         buf
     }
 
-    /// The spare capacity [`BeaconState::ssz_append`] needs in `buf` for the
-    /// append never to regrow it: the encoding's own length plus the largest
-    /// fixed-size field any fork's state has.
+    /// How much [`BeaconState::ssz_append`] reserves past the end of the
+    /// buffer it appends to, so the append never regrows it: the encoding's
+    /// own length plus the largest fixed-size field any fork's state has.
+    /// Public for tests that check that bound.
     ///
     /// The headroom is for libssz's container encoder, which writes each
     /// fixed-size field past the end of the buffer and then moves it into
@@ -401,13 +402,16 @@ impl BeaconState {
         dispatch_state_including_lean!(self, |state| state.encoded_len()) + largest_fixed_field
     }
 
-    /// Appends [`BeaconState::to_ssz`]'s output to `buf`.
+    /// Appends [`BeaconState::to_ssz`]'s output to `buf`, after whatever it
+    /// already holds.
     ///
     /// For a caller that frames the encoding (the storage layer's fork tag):
-    /// a mainnet state encodes to hundreds of megabytes, and appending to a
-    /// buffer with [`BeaconState::ssz_append_capacity`] to spare holds one
-    /// copy of it, never two.
+    /// a mainnet state encodes to hundreds of megabytes, and the append holds
+    /// one copy of it, never two. It first reserves
+    /// [`BeaconState::ssz_append_capacity`] past `buf`'s length, so a caller
+    /// need not size `buf` itself.
     pub fn ssz_append(&self, buf: &mut Vec<u8>) {
+        buf.reserve_exact(self.ssz_append_capacity());
         dispatch_state_including_lean!(self, |state| state.ssz_append(buf))
     }
 

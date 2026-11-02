@@ -672,15 +672,18 @@ mod tests {
         for fork in ForkName::ALL {
             let state = with_validators_at(fork, 3);
             let capacity = state.ssz_append_capacity();
-            let mut buf = Vec::with_capacity(capacity);
-            state.ssz_append(&mut buf);
-            assert_eq!(buf.capacity(), capacity, "{fork}: ssz_append regrew");
-            let decoded = BeaconState::from_ssz(fork, &buf).expect("the encoding decodes");
-            assert_eq!(decoded, state, "{fork}");
 
             let encoded = state.to_ssz();
-            assert_eq!(encoded, buf, "{fork}");
             assert_eq!(encoded.capacity(), capacity, "{fork}: to_ssz regrew");
+            let decoded = BeaconState::from_ssz(fork, &encoded).expect("the encoding decodes");
+            assert_eq!(decoded, state, "{fork}");
+
+            // Appending after a prefix reserves past the prefix, not from the
+            // start of the buffer.
+            let mut framed = vec![0xAB];
+            state.ssz_append(&mut framed);
+            assert_eq!(framed.capacity(), 1 + capacity, "{fork}: ssz_append regrew");
+            assert_eq!(framed[1..], encoded, "{fork}");
         }
     }
 }

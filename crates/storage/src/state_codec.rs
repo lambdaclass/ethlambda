@@ -24,12 +24,10 @@ use ethlambda_types::{
 /// [`ForkName::Lean`]'s selector is not a variant index, so the byte must go
 /// back through [`ForkName::from_selector`] rather than being cast.
 pub(crate) fn encode_state_value(state: &BeaconState) -> Vec<u8> {
-    // Encoded straight into the tagged buffer, sized so the encoder never
-    // regrows it: the state writer runs this on every import, and either a
-    // separate `Vec` or a regrowth would hold two copies of a mainnet state
-    // at once.
-    let mut bytes = Vec::with_capacity(1 + state.ssz_append_capacity());
-    bytes.push(state.fork_name().selector());
+    // Encoded straight into the tagged buffer: the state writer runs this on
+    // every import, and a separate `Vec` would hold two copies of a mainnet
+    // state at once. `ssz_append` reserves its own room past the tag.
+    let mut bytes = vec![state.fork_name().selector()];
     state.ssz_append(&mut bytes);
     bytes
 }
