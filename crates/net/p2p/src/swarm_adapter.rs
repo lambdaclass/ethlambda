@@ -24,6 +24,19 @@ const MESH_METRIC_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 /// have failed gossipsub sends in before it is disconnected; see [`SlowPeers`].
 const SLOW_PEER_CHECK_LIMIT: u32 = 6;
 
+/// A `SlowPeer` report counts towards a peer's streak only when its priority
+/// or its non-priority failures exceed this. Lighthouse uses the same cut
+/// before it penalizes a slow peer. A few failures in one heartbeat are more
+/// likely late forwards that expired in the queue than a dead stream.
+const SLOW_PEER_REPORT_THRESHOLD: usize = 10;
+
+/// The most peers one check disconnects for being slow; see
+/// [`SlowPeers::check`]. Gossipsub reports a forward that waited too long in a
+/// peer's queue the same way it reports a full queue, so a saturated uplink or
+/// a stalled runtime on our side makes every peer look slow at once.
+/// Disconnecting them all in one check would leave the node without peers.
+const MAX_SLOW_PEER_DISCONNECTS_PER_CHECK: usize = 10;
+
 pub enum SwarmCommand {
     Publish {
         topic: libp2p::gossipsub::IdentTopic,
@@ -353,29 +366,55 @@ enum LoopExit {
 /// report does not tell apart). Disconnecting frees the queue; a peer that
 /// reconnects gets a fresh handler.
 ///
-/// A peer reported in fewer than [`SLOW_PEER_CHECK_LIMIT`] consecutive checks
-/// keeps its connection, so a burst of expiries from a peer that catches up is
-/// not enough.
+/// Three rules keep a slow but working peer, or a slow node of our own, from
+/// costing connections:
+/// - A report counts only above [`SLOW_PEER_REPORT_THRESHOLD`] failures.
+/// - A peer reported in fewer than [`SLOW_PEER_CHECK_LIMIT`] consecutive
+///   checks keeps its connection, so a burst of expiries from a peer that
+///   catches up is not enough.
+/// - One check disconnects at most [`MAX_SLOW_PEER_DISCONNECTS_PER_CHECK`]
+///   peers.
 #[derive(Default)]
 struct SlowPeers {
-    /// Failed messages per peer reported since the last check.
+    /// Failed messages per peer, from the reports since the last check that
+    /// passed [`SLOW_PEER_REPORT_THRESHOLD`].
     reported: HashMap<PeerId, usize>,
     /// Per peer, the consecutive checks it has been reported in and the
     /// failed messages across them.
     streaks: HashMap<PeerId, (u32, usize)>,
 }
 
+/// What one [`SlowPeers::check`] found.
+#[derive(Debug, PartialEq)]
+struct SlowPeerCheck {
+    /// Peers to disconnect, the most failed messages first, each with its
+    /// failed messages across the streak. At most
+    /// [`MAX_SLOW_PEER_DISCONNECTS_PER_CHECK`] of them.
+    disconnect: Vec<(PeerId, usize)>,
+    /// How many more peers reached [`SLOW_PEER_CHECK_LIMIT`] but were left for
+    /// a later check by the cap.
+    deferred: usize,
+}
+
 impl SlowPeers {
     fn record(&mut self, peer_id: PeerId, failed_messages: &FailedMessages) {
-        let failed = failed_messages.priority + failed_messages.non_priority;
-        *self.reported.entry(peer_id).or_default() += failed;
+        let FailedMessages {
+            priority,
+            non_priority,
+        } = *failed_messages;
+        if priority <= SLOW_PEER_REPORT_THRESHOLD && non_priority <= SLOW_PEER_REPORT_THRESHOLD {
+            return;
+        }
+        *self.reported.entry(peer_id).or_default() += priority + non_priority;
     }
 
     /// Closes one check: a peer reported since the last one extends its
-    /// streak, every other peer loses it. Returns each peer whose streak
-    /// reached [`SLOW_PEER_CHECK_LIMIT`], with its failed messages across the
-    /// streak, and forgets it.
-    fn check(&mut self) -> Vec<(PeerId, usize)> {
+    /// streak, every other peer loses it. Of the peers whose streak reached
+    /// [`SLOW_PEER_CHECK_LIMIT`], returns the ones with the most failed
+    /// messages, up to [`MAX_SLOW_PEER_DISCONNECTS_PER_CHECK`], and forgets
+    /// them. The rest keep their streak, so a peer still reported at the next
+    /// check is a candidate again then.
+    fn check(&mut self) -> SlowPeerCheck {
         let reported = std::mem::take(&mut self.reported);
         self.streaks
             .retain(|peer_id, _| reported.contains_key(peer_id));
@@ -388,20 +427,31 @@ impl SlowPeers {
                 persistent.push((peer_id, *total));
             }
         }
+        persistent.sort_unstable_by(|(_, a), (_, b)| b.cmp(a));
+        let deferred = persistent
+            .len()
+            .saturating_sub(MAX_SLOW_PEER_DISCONNECTS_PER_CHECK);
+        persistent.truncate(MAX_SLOW_PEER_DISCONNECTS_PER_CHECK);
         for (peer_id, _) in &persistent {
             self.streaks.remove(peer_id);
         }
-        persistent
+        SlowPeerCheck {
+            disconnect: persistent,
+            deferred,
+        }
     }
 }
 
-/// Disconnect every peer [`SlowPeers`] finds persistently failing to take
-/// gossipsub messages.
+/// Disconnect the peers [`SlowPeers`] finds persistently failing to take
+/// gossipsub messages, up to its per-check cap.
 ///
 /// Beacon only, like [`disconnect_graylisted_peers`]: the check still runs on
 /// lean, so the reports do not pile up, but nothing is disconnected.
 fn disconnect_slow_peers(swarm: &mut libp2p::Swarm<Behaviour>, slow_peers: &mut SlowPeers) {
-    let persistent = slow_peers.check();
+    let SlowPeerCheck {
+        disconnect,
+        deferred,
+    } = slow_peers.check();
     if swarm
         .behaviour()
         .gossipsub
@@ -410,7 +460,16 @@ fn disconnect_slow_peers(swarm: &mut libp2p::Swarm<Behaviour>, slow_peers: &mut 
     {
         return;
     }
-    for (peer_id, failed) in persistent {
+    if deferred > 0 {
+        let disconnecting = disconnect.len();
+        warn!(
+            disconnecting,
+            deferred,
+            "More peers kept failing to take gossipsub messages than one check disconnects, \
+             which points at our own uplink or runtime; the rest wait for a later check"
+        );
+    }
+    for (peer_id, failed) in disconnect {
         if swarm.disconnect_peer_id(peer_id).is_ok() {
             metrics::inc_gossipsub_slow_peer_disconnects();
             info!(
@@ -600,6 +659,9 @@ pub(crate) fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCo
 mod tests {
     use super::*;
 
+    /// The fewest failures in one count that make a report count.
+    const COUNTED: usize = SLOW_PEER_REPORT_THRESHOLD + 1;
+
     fn failed(non_priority: usize) -> FailedMessages {
         FailedMessages {
             priority: 0,
@@ -607,40 +669,59 @@ mod tests {
         }
     }
 
+    /// Runs the checks before the last one of a streak, each with `peers`
+    /// reported once with their failed messages.
+    fn checks_before_the_limit(slow_peers: &mut SlowPeers, peers: &[(PeerId, usize)]) {
+        for _ in 1..SLOW_PEER_CHECK_LIMIT {
+            for (peer, non_priority) in peers {
+                slow_peers.record(*peer, &failed(*non_priority));
+            }
+            assert_eq!(slow_peers.check(), nothing());
+        }
+    }
+
+    fn nothing() -> SlowPeerCheck {
+        SlowPeerCheck {
+            disconnect: Vec::new(),
+            deferred: 0,
+        }
+    }
+
+    fn checks_in_a_streak() -> usize {
+        usize::try_from(SLOW_PEER_CHECK_LIMIT).unwrap()
+    }
+
     #[test]
     fn a_peer_failing_in_every_check_is_returned_at_the_limit() {
         let peer = PeerId::random();
         let mut slow_peers = SlowPeers::default();
-        for _ in 1..SLOW_PEER_CHECK_LIMIT {
-            slow_peers.record(peer, &failed(2));
-            assert!(slow_peers.check().is_empty());
-        }
-        slow_peers.record(peer, &failed(2));
-        let expected = 2 * usize::try_from(SLOW_PEER_CHECK_LIMIT).unwrap();
-        assert_eq!(slow_peers.check(), vec![(peer, expected)]);
+        checks_before_the_limit(&mut slow_peers, &[(peer, COUNTED)]);
+        slow_peers.record(peer, &failed(COUNTED));
+        let expected = SlowPeerCheck {
+            disconnect: vec![(peer, COUNTED * checks_in_a_streak())],
+            deferred: 0,
+        };
+        assert_eq!(slow_peers.check(), expected);
     }
 
     #[test]
     fn a_check_without_a_report_resets_the_streak() {
         let peer = PeerId::random();
         let mut slow_peers = SlowPeers::default();
-        for _ in 1..SLOW_PEER_CHECK_LIMIT {
-            slow_peers.record(peer, &failed(1));
-            assert!(slow_peers.check().is_empty());
-        }
-        assert!(slow_peers.check().is_empty());
-        slow_peers.record(peer, &failed(1));
-        assert!(slow_peers.check().is_empty());
+        checks_before_the_limit(&mut slow_peers, &[(peer, COUNTED)]);
+        assert_eq!(slow_peers.check(), nothing());
+        slow_peers.record(peer, &failed(COUNTED));
+        assert_eq!(slow_peers.check(), nothing());
     }
 
     #[test]
     fn several_reports_within_one_check_count_once_towards_the_streak() {
         let peer = PeerId::random();
         let mut slow_peers = SlowPeers::default();
-        for _ in 0..usize::try_from(SLOW_PEER_CHECK_LIMIT).unwrap() {
-            slow_peers.record(peer, &failed(1));
+        for _ in 0..checks_in_a_streak() {
+            slow_peers.record(peer, &failed(COUNTED));
         }
-        assert!(slow_peers.check().is_empty());
+        assert_eq!(slow_peers.check(), nothing());
     }
 
     #[test]
@@ -648,10 +729,98 @@ mod tests {
         let peer = PeerId::random();
         let mut slow_peers = SlowPeers::default();
         for _ in 0..SLOW_PEER_CHECK_LIMIT {
-            slow_peers.record(peer, &failed(1));
+            slow_peers.record(peer, &failed(COUNTED));
             slow_peers.check();
         }
-        slow_peers.record(peer, &failed(1));
-        assert!(slow_peers.check().is_empty());
+        slow_peers.record(peer, &failed(COUNTED));
+        assert_eq!(slow_peers.check(), nothing());
+    }
+
+    #[test]
+    fn a_report_at_the_threshold_does_not_count_and_resets_the_streak() {
+        let peer = PeerId::random();
+        let mut slow_peers = SlowPeers::default();
+        checks_before_the_limit(&mut slow_peers, &[(peer, COUNTED)]);
+        slow_peers.record(peer, &failed(SLOW_PEER_REPORT_THRESHOLD));
+        assert_eq!(slow_peers.check(), nothing());
+        slow_peers.record(peer, &failed(COUNTED));
+        assert_eq!(slow_peers.check(), nothing());
+    }
+
+    #[test]
+    fn the_threshold_applies_to_each_count_on_its_own() {
+        let peer = PeerId::random();
+        let mut slow_peers = SlowPeers::default();
+        // Over the threshold only when the two counts are added up.
+        let split = FailedMessages {
+            priority: SLOW_PEER_REPORT_THRESHOLD,
+            non_priority: SLOW_PEER_REPORT_THRESHOLD,
+        };
+        for _ in 0..SLOW_PEER_CHECK_LIMIT {
+            slow_peers.record(peer, &split);
+            assert_eq!(slow_peers.check(), nothing());
+        }
+        // Priority failures alone are enough.
+        let priority = FailedMessages {
+            priority: COUNTED,
+            non_priority: 0,
+        };
+        for _ in 1..SLOW_PEER_CHECK_LIMIT {
+            slow_peers.record(peer, &priority);
+            assert_eq!(slow_peers.check(), nothing());
+        }
+        slow_peers.record(peer, &priority);
+        assert_eq!(slow_peers.check().disconnect.len(), 1);
+    }
+
+    #[test]
+    fn one_check_returns_at_most_the_cap_most_failed_first() {
+        let mut slow_peers = SlowPeers::default();
+        let peers: Vec<(PeerId, usize)> = (0..=MAX_SLOW_PEER_DISCONNECTS_PER_CHECK)
+            .map(|i| (PeerId::random(), COUNTED + i))
+            .collect();
+        checks_before_the_limit(&mut slow_peers, &peers);
+        for (peer, non_priority) in &peers {
+            slow_peers.record(*peer, &failed(*non_priority));
+        }
+        let check = slow_peers.check();
+
+        let mut most_failed_first = peers.clone();
+        most_failed_first.reverse();
+        let expected: Vec<(PeerId, usize)> = most_failed_first
+            .iter()
+            .take(MAX_SLOW_PEER_DISCONNECTS_PER_CHECK)
+            .map(|(peer, non_priority)| (*peer, non_priority * checks_in_a_streak()))
+            .collect();
+        assert_eq!(check.disconnect, expected);
+        assert_eq!(check.deferred, 1);
+
+        // The deferred peer kept its streak: still failing, it is returned at
+        // the next check.
+        let (deferred_peer, non_priority) = peers[0];
+        slow_peers.record(deferred_peer, &failed(non_priority));
+        let expected = SlowPeerCheck {
+            disconnect: vec![(deferred_peer, non_priority * (checks_in_a_streak() + 1))],
+            deferred: 0,
+        };
+        assert_eq!(slow_peers.check(), expected);
+    }
+
+    #[test]
+    fn a_deferred_peer_that_stops_failing_loses_its_streak() {
+        let mut slow_peers = SlowPeers::default();
+        let peers: Vec<(PeerId, usize)> = (0..=MAX_SLOW_PEER_DISCONNECTS_PER_CHECK)
+            .map(|i| (PeerId::random(), COUNTED + i))
+            .collect();
+        checks_before_the_limit(&mut slow_peers, &peers);
+        for (peer, non_priority) in &peers {
+            slow_peers.record(*peer, &failed(*non_priority));
+        }
+        assert_eq!(slow_peers.check().deferred, 1);
+
+        assert_eq!(slow_peers.check(), nothing());
+        let (deferred_peer, non_priority) = peers[0];
+        slow_peers.record(deferred_peer, &failed(non_priority));
+        assert_eq!(slow_peers.check(), nothing());
     }
 }

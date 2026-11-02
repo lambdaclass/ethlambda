@@ -334,6 +334,25 @@ such queues held about 490 MB. Gossipsub's own penalty for these failures
 graylist. Lighthouse penalizes `SlowPeer` reports through its peer manager
 instead.
 
+Two limits keep a slow node of our own from costing it its peers. Gossipsub
+counts a forward that waited too long in a peer's queue as the same failure as
+a full queue, so a saturated uplink or a stalled runtime on our side makes
+every peer look slow at once:
+
+- A report counts only when its priority or its non-priority failures exceed
+  `SLOW_PEER_REPORT_THRESHOLD`. Lighthouse applies the same cut. A dead stream
+  fails every message queued for the peer; a few failures in a heartbeat are
+  more likely late forwards.
+- One check disconnects at most `MAX_SLOW_PEER_DISCONNECTS_PER_CHECK` peers,
+  the ones with the most failed messages first. The others keep their streak,
+  so a peer still failing at the next check is disconnected then. Peers held
+  back this way are logged as a warning, since many peers failing together
+  points at our side.
+
+A dead stream on a peer that gets little traffic, such as one gossipsub has
+already pruned from the mesh, may stay under the threshold. Its queue then
+stays pinned until the connection closes, as it did before this check existed.
+
 Around a fork-digest boundary the node holds two digests' topics, and every
 held digest gets the whole parameter set (exits and slashings included),
 scored by its role:
