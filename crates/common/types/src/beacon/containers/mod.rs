@@ -713,6 +713,16 @@ impl<'a> ParticipationRef<'a> {
         }
     }
 
+    /// A reader for ascending indices, which descends the tree only when an
+    /// index leaves the leaf it last read. Prefer it to [`Self::get`] when
+    /// visiting many entries in order, such as one attestation's attesters.
+    pub fn sorted_reader(&self) -> ParticipationSortedReader<'a> {
+        match self {
+            Self::Bounded(list) => ParticipationSortedReader::Bounded(list.sorted_reader()),
+            Self::Progressive(list) => ParticipationSortedReader::Progressive(list.sorted_reader()),
+        }
+    }
+
     /// Whether a write is buffered and not yet folded into the tree.
     pub fn has_pending_updates(&self) -> bool {
         match self {
@@ -733,6 +743,38 @@ impl<'a> ParticipationRef<'a> {
     /// The entries, copied out.
     pub fn to_vec(&self) -> Vec<ParticipationFlags> {
         self.iter().copied().collect()
+    }
+}
+
+/// Reads a [`ParticipationRef`] at non-decreasing indices: see
+/// [`ParticipationRef::sorted_reader`].
+pub enum ParticipationSortedReader<'a> {
+    /// Altair through fulu.
+    Bounded(
+        ethlambda_ssz_tree::SortedReader<
+            'a,
+            ParticipationFlags,
+            ethlambda_ssz_tree::VecMap<ParticipationFlags>,
+        >,
+    ),
+    /// Gloas.
+    Progressive(
+        ethlambda_ssz_tree::ProgressiveSortedReader<
+            'a,
+            ParticipationFlags,
+            ethlambda_ssz_tree::VecMap<ParticipationFlags>,
+        >,
+    ),
+}
+
+impl<'a> ParticipationSortedReader<'a> {
+    /// The flags at `index`, or `None` past the end. `index` must not be
+    /// below the previous call's (checked in debug builds).
+    pub fn get(&mut self, index: usize) -> Option<&'a ParticipationFlags> {
+        match self {
+            Self::Bounded(reader) => reader.get(index),
+            Self::Progressive(reader) => reader.get(index),
+        }
     }
 }
 
