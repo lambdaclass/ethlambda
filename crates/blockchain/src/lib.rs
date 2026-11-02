@@ -1801,7 +1801,10 @@ impl BlockChainServer {
                     None => fork_choice::PayloadValidity::NotRequired,
                     Some(client) => match beacon_engine::ask(client, &beacon_block).await {
                         Ok(None) => fork_choice::PayloadValidity::NotRequired,
-                        Ok(Some(validity)) => validity,
+                        Ok(Some(validity)) => {
+                            timings.engine_verdict = Some(verdict_label(&validity));
+                            validity
+                        }
                         // No answer after the whole ladder.
                         // `optimistic-sync.md`: a consensus engine MUST NOT
                         // import the block and MUST NOT apply it to the fork
@@ -2232,6 +2235,7 @@ impl BlockChainServer {
             timings,
         };
         report.observe();
+        ethlambda_telemetry::emit(|| report.telemetry_events());
         report.log();
     }
 
@@ -4169,6 +4173,16 @@ impl Handler<AggregationDeadline> for BlockChainServer {
         {
             session.cancel.cancel();
         }
+    }
+}
+
+/// The `verdict` a `block_events` row records for an execution client's answer.
+fn verdict_label(validity: &fork_choice::PayloadValidity) -> &'static str {
+    match validity {
+        fork_choice::PayloadValidity::NotRequired => "NotRequired",
+        fork_choice::PayloadValidity::Validated => "Valid",
+        fork_choice::PayloadValidity::Optimistic => "Optimistic",
+        fork_choice::PayloadValidity::Invalidated { .. } => "Invalid",
     }
 }
 

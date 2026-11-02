@@ -66,6 +66,7 @@
 use std::time::{Duration, Instant};
 
 use ethlambda_network_api::BlockSource;
+use ethlambda_telemetry::BlockEvent;
 
 use crate::metrics;
 use ethlambda_types::{ShortRoot, primitives::H256};
@@ -180,6 +181,10 @@ pub struct ImportTimings {
     /// I/O wait, not work.
     pub engine_start: Option<Instant>,
     pub engine_end: Option<Instant>,
+    /// Beacon: the execution client's answer, as a `block_events` row records
+    /// it. `None` when no client was asked, which is what keeps the engine
+    /// rows off a node with no `--execution-endpoint`.
+    pub engine_verdict: Option<&'static str>,
 
     /// Lean: participant bounds checks and pubkey resolution.
     pub verify_structural_start: Option<Instant>,
@@ -459,6 +464,118 @@ impl BlockImportReport {
         match (self.timings.first_instant(), self.timings.last_instant()) {
             (Some(start), Some(end)) => Some(end.saturating_duration_since(start)),
             _ => None,
+        }
+    }
+
+    /// The block was imported by this pass's own state transition.
+    ///
+    /// Not merely `outcome == "imported"`: a block the store already holds
+    /// reports imported too (lean's `store::on_block` returns early with only
+    /// the guards marked), and a re-delivery is not a second import.
+    pub fn imported_here(&self) -> bool {
+        self.outcome == "imported" && self.timings.stf_start.is_some()
+    }
+
+    /// This report as `block_events` rows (`docs/telemetry.md`).
+    ///
+    /// Only a final pass is written: one that imported the block here, or
+    /// failed it. A held block's timings travel with it, so that pass carries
+    /// the whole timeline, and writing every held pass too would repeat its
+    /// early rows. The population is the histogram's: a source with no metric
+    /// label writes no rows.
+    ///
+    /// Silver's stage names stand in for ours where the meaning matches; the
+    /// two that claim success are only used for an imported block. Beacon's
+    /// `attestable` is not written here at all: Silver's means the new head
+    /// is published, and beacon recomputes the head once per arrival, after
+    /// the cascade (see [`CascadeTelemetry`]). Lean updates its head per
+    /// block, so its `fc_head` end is its `attestable`.
+    pub fn telemetry_events(&self) -> Vec<BlockEvent> {
+        let Some(source) = self.timings.source_label() else {
+            return Vec::new();
+        };
+        let imported = match self.outcome {
+            "imported" if self.imported_here() => true,
+            "failed" => false,
+            _ => return Vec::new(),
+        };
+        let t = &self.timings;
+        let (stf_end, fc_head_end) = if imported {
+            ("stf_done", "attestable")
+        } else {
+            ("stf_end", "fc_head_end")
+        };
+        // No `queue_start` row: it is always another row's instant, the
+        // hand-off that ends `decode` on gossip, or `received` itself on a
+        // block that was not decoded here.
+        let mut marks = vec![
+            ("received", t.first_instant()),
+            ("decode_end", t.decode_end),
+            ("queue_end", t.queue_end),
+            ("defer_start", t.defer_start),
+            ("defer_end", t.defer_end),
+            ("admit_start", t.admit_start),
+            ("admit_end", t.admit_end),
+            ("guards_start", t.guards_start),
+            ("guards_end", t.guards_end),
+            ("preamble_start", t.preamble_start),
+            ("preamble_end", t.preamble_end),
+            ("parent_wait_start", t.parent_wait_start),
+            ("parent_wait_end", t.parent_wait_end),
+            ("cascade_wait_start", t.cascade_wait_start),
+            ("cascade_wait_end", t.cascade_wait_end),
+            ("da_check_start", t.da_check_start),
+            ("da_available", t.da_check_end),
+            ("columns_wait_start", t.columns_wait_start),
+            ("columns_wait_end", t.columns_wait_end),
+            ("verify_struct_start", t.verify_structural_start),
+            ("verify_struct_end", t.verify_structural_end),
+            ("verify_crypto_start", t.verify_crypto_start),
+            ("verify_crypto_end", t.verify_crypto_end),
+            ("stf_start", t.stf_start),
+            (stf_end, t.stf_end),
+            ("writer_wait_start", t.writer_wait_start),
+            ("writer_wait_end", t.writer_wait_end),
+            ("db_write_start", t.db_write_start),
+            ("db_write_end", t.db_write_end),
+            ("fc_head_start", t.fc_head_start),
+            (fc_head_end, t.fc_head_end),
+            ("block_atts_start", t.block_atts_start),
+            ("block_atts_end", t.block_atts_end),
+        ];
+        if !imported {
+            marks.push(("failed", t.last_instant()));
+        }
+        let mut events: Vec<BlockEvent> = marks
+            .into_iter()
+            .filter_map(|(stage, at)| Some(self.event(stage, at?, source, None)))
+            .collect();
+        // Only when a client answered: without one the section is two
+        // adjacent instants with nothing asked between them.
+        if let Some(verdict) = t.engine_verdict
+            && let (Some(sent), Some(answered)) = (t.engine_start, t.engine_end)
+        {
+            events.push(self.event("el_sent", sent, source, None));
+            events.push(self.event("el_verdict", answered, source, Some(verdict)));
+        }
+        events
+    }
+
+    fn event(
+        &self,
+        stage: &'static str,
+        at: Instant,
+        source: &'static str,
+        verdict: Option<&'static str>,
+    ) -> BlockEvent {
+        BlockEvent {
+            stage,
+            at,
+            slot: self.slot,
+            block_root: self.block_root.0,
+            source,
+            verdict,
+            column_index: None,
         }
     }
 
@@ -1050,6 +1167,193 @@ mod tests {
     #[test]
     fn a_report_with_nothing_to_say_renders_nothing() {
         assert!(report(ImportTimings::default()).lines().is_empty());
+    }
+
+    fn at(base: Instant, ms: u64) -> Option<Instant> {
+        Some(base + Duration::from_millis(ms))
+    }
+
+    fn stages(report: &BlockImportReport) -> Vec<&'static str> {
+        report
+            .telemetry_events()
+            .iter()
+            .map(|event| event.stage)
+            .collect()
+    }
+
+    /// A gossip beacon block that waited for nothing, with an execution client.
+    fn beacon_gossip(base: Instant) -> ImportTimings {
+        ImportTimings {
+            source: Some(BlockSource::Gossip),
+            decode_start: Some(base),
+            decode_end: at(base, 1),
+            queue_start: at(base, 1),
+            queue_end: at(base, 2),
+            guards_start: at(base, 2),
+            guards_end: at(base, 3),
+            da_check_start: at(base, 3),
+            da_check_end: at(base, 4),
+            engine_start: at(base, 4),
+            engine_end: at(base, 40),
+            engine_verdict: Some("Valid"),
+            stf_start: at(base, 40),
+            stf_end: at(base, 45),
+            block_atts_start: at(base, 45),
+            block_atts_end: at(base, 46),
+            ..ImportTimings::default()
+        }
+    }
+
+    #[test]
+    fn an_imported_block_uses_silvers_names_where_they_match() {
+        let base = Instant::now();
+        let report = report(beacon_gossip(base));
+
+        assert_eq!(
+            stages(&report),
+            [
+                "received",
+                "decode_end",
+                "queue_end",
+                "guards_start",
+                "guards_end",
+                "da_check_start",
+                "da_available",
+                "stf_start",
+                "stf_done",
+                "block_atts_start",
+                // Beacon `attestable` waits for the head recomputation, which
+                // is per arrival: `CascadeTelemetry` writes it.
+                "block_atts_end",
+                "el_sent",
+                "el_verdict",
+            ]
+        );
+        let events = report.telemetry_events();
+        assert!(events.iter().all(|event| event.source == "gossip"
+            && event.slot == 12_345
+            && event.column_index.is_none()));
+        assert_eq!(events[0].at, base, "arrival is the wire, not the hand-off");
+        let verdict = events
+            .iter()
+            .find(|event| event.stage == "el_verdict")
+            .unwrap();
+        assert_eq!(verdict.verdict, Some("Valid"));
+        assert_eq!(verdict.at, base + Duration::from_millis(40));
+    }
+
+    #[test]
+    fn a_fetched_block_is_received_at_its_hand_off() {
+        let base = Instant::now();
+        let fetched = report(ImportTimings {
+            source: Some(BlockSource::Sync),
+            decode_start: None,
+            decode_end: None,
+            ..beacon_gossip(base)
+        });
+
+        assert_eq!(stages(&fetched)[..2], ["received", "queue_end"]);
+        let events = fetched.telemetry_events();
+        assert_eq!(events[0].at, base + Duration::from_millis(1));
+        assert!(events.iter().all(|event| event.source == "sync"));
+    }
+
+    #[test]
+    fn a_failed_import_keeps_our_names_and_adds_failed() {
+        let base = Instant::now();
+        let mut failed = report(beacon_gossip(base));
+        failed.outcome = "failed";
+
+        let stages = stages(&failed);
+        for name in ["stf_end", "block_atts_end", "failed"] {
+            assert!(stages.contains(&name), "missing {name}");
+        }
+        for name in ["stf_done", "attestable"] {
+            assert!(!stages.contains(&name), "{name} claims a success");
+        }
+        let failed_at = failed
+            .telemetry_events()
+            .into_iter()
+            .find(|event| event.stage == "failed")
+            .unwrap()
+            .at;
+        assert_eq!(
+            failed_at,
+            base + Duration::from_millis(46),
+            "the last instant recorded"
+        );
+    }
+
+    #[test]
+    fn a_held_pass_writes_nothing() {
+        let mut held = report(beacon_gossip(Instant::now()));
+        held.outcome = "held";
+        assert!(held.telemetry_events().is_empty());
+    }
+
+    /// Lean's store reports a block it already holds as imported, with only
+    /// the guards marked: a re-delivery, not a second import.
+    #[test]
+    fn a_block_already_imported_writes_nothing() {
+        let base = Instant::now();
+        let redelivered = report(ImportTimings {
+            source: Some(BlockSource::Gossip),
+            decode_start: Some(base),
+            decode_end: at(base, 1),
+            queue_start: at(base, 1),
+            queue_end: at(base, 2),
+            guards_start: at(base, 2),
+            guards_end: at(base, 3),
+            ..ImportTimings::default()
+        });
+        assert!(!redelivered.imported_here());
+        assert!(redelivered.telemetry_events().is_empty());
+    }
+
+    #[test]
+    fn a_source_the_histogram_skips_writes_nothing() {
+        let local = report(ImportTimings {
+            source: None,
+            ..beacon_gossip(Instant::now())
+        });
+        assert!(local.telemetry_events().is_empty());
+    }
+
+    #[test]
+    fn no_execution_client_means_no_el_rows() {
+        let no_engine = report(ImportTimings {
+            engine_verdict: None,
+            ..beacon_gossip(Instant::now())
+        });
+        let stages = stages(&no_engine);
+        assert!(!stages.contains(&"el_sent") && !stages.contains(&"el_verdict"));
+    }
+
+    #[test]
+    fn a_lean_block_becomes_attestable_at_its_head_update() {
+        let base = Instant::now();
+        let lean = report(ImportTimings {
+            source: Some(BlockSource::Gossip),
+            decode_start: Some(base),
+            decode_end: at(base, 1),
+            queue_start: at(base, 1),
+            queue_end: at(base, 2),
+            verify_crypto_start: at(base, 2),
+            verify_crypto_end: at(base, 30),
+            stf_start: at(base, 30),
+            stf_end: at(base, 35),
+            fc_head_start: at(base, 35),
+            fc_head_end: at(base, 36),
+            ..ImportTimings::default()
+        });
+
+        let events = lean.telemetry_events();
+        let attestable = events
+            .iter()
+            .find(|event| event.stage == "attestable")
+            .unwrap();
+        assert_eq!(attestable.at, base + Duration::from_millis(36));
+        assert!(events.iter().all(|event| event.verdict.is_none()));
     }
 
     fn report(timings: ImportTimings) -> BlockImportReport {

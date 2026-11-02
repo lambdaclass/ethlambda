@@ -1986,6 +1986,7 @@ dependencies = [
  "ethlambda-network-api",
  "ethlambda-state-transition",
  "ethlambda-storage",
+ "ethlambda-telemetry",
  "ethlambda-test-fixtures",
  "ethlambda-types",
  "hex",
