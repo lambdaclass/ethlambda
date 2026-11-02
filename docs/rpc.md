@@ -885,7 +885,7 @@ these are ever sent:
 | `execution_payload_available` | `{"slot":"10", "block_root":"0x…"}` | Right after `execution_payload` (see below) |
 | `execution_payload_bid` | `{"version":"gloas", "data":<SignedExecutionPayloadBid>}` | A bid passed the `execution_payload_bid` gossip rules, or was accepted by `POST /eth/v1/beacon/execution_payload_bids` |
 | `payload_attestation_message` | `{"version":"gloas", "data":<PayloadAttestationMessage>}` | A message passed the `payload_attestation_message` gossip rules, or was accepted by `POST /eth/v1/beacon/pool/payload_attestations` |
-| `single_attestation` | `{"committee_index":"1", "attester_index":"1", "data":<AttestationData>, "signature":"0x…"}` | A subnet attestation passed the `beacon_attestation_{subnet_id}` gossip rules. This is the highest-rate topic (every attestation on the node's backbone subnets), so nothing is built unless a client is subscribed |
+| `single_attestation` | `{"committee_index":"1", "attester_index":"1", "data":<AttestationData>, "signature":"0x…"}` | A subnet attestation passed the `beacon_attestation_{subnet_id}` gossip rules, or was accepted by `POST /eth/v2/beacon/pool/attestations`. This is the highest-rate topic (every attestation on the node's backbone subnets), so nothing is built unless a client is subscribed |
 | `proposer_preferences` | `{"version":"gloas", "data":<SignedProposerPreferences>}` | Preferences passed the `proposer_preferences` gossip rules, or were accepted by `POST /eth/v1/validator/proposer_preferences` |
 
 Never emitted: the operation topics (`voluntary_exit`,
