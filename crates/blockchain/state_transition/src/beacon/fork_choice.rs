@@ -4693,6 +4693,12 @@ pub fn update_latest_messages(
     let beacon_block_root = data.beacon_block_root;
     let payload_present = rules == ForkRules::Gloas && data.index == 1;
 
+    // One reservation for the whole batch: an indexed attestation's indices
+    // are sorted, and growing the table one ascending index at a time would
+    // copy it many times over.
+    if let Some(&highest) = attesting_indices.iter().max() {
+        store.reserve_latest_messages(highest);
+    }
     for &index in attesting_indices {
         if store.is_equivocating(index) {
             continue;
