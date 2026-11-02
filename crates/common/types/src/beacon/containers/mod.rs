@@ -476,33 +476,35 @@ tree_fields!(
     phase0::BeaconState => validators, balances, block_roots, state_roots, historical_roots, eth1_data_votes, randao_mixes, slashings
 );
 tree_fields!(
-    altair::BeaconState => validators, balances, block_roots, state_roots, historical_roots, eth1_data_votes, randao_mixes, slashings, inactivity_scores
+    altair::BeaconState => validators, balances, block_roots, state_roots, historical_roots, eth1_data_votes, randao_mixes, slashings, inactivity_scores,
+    previous_epoch_participation, current_epoch_participation
 );
 tree_fields!(
-    bellatrix::BeaconState => validators, balances, block_roots, state_roots, historical_roots, eth1_data_votes, randao_mixes, slashings, inactivity_scores
+    bellatrix::BeaconState => validators, balances, block_roots, state_roots, historical_roots, eth1_data_votes, randao_mixes, slashings, inactivity_scores,
+    previous_epoch_participation, current_epoch_participation
 );
 tree_fields!(
     capella::BeaconState => validators, balances, block_roots, state_roots, historical_roots, eth1_data_votes, randao_mixes, slashings, inactivity_scores,
-    historical_summaries
+    historical_summaries, previous_epoch_participation, current_epoch_participation
 );
 tree_fields!(
     deneb::BeaconState => validators, balances, block_roots, state_roots, historical_roots, eth1_data_votes, randao_mixes, slashings, inactivity_scores,
-    historical_summaries
+    historical_summaries, previous_epoch_participation, current_epoch_participation
 );
 tree_fields!(
     electra::BeaconState => validators, balances, block_roots, state_roots, historical_roots, eth1_data_votes, randao_mixes, slashings, inactivity_scores,
-    historical_summaries
+    historical_summaries, previous_epoch_participation, current_epoch_participation, pending_deposits
 );
 tree_fields!(
     fulu::BeaconState => validators, balances, block_roots, state_roots, historical_roots, eth1_data_votes, randao_mixes, slashings, inactivity_scores,
-    historical_summaries
+    historical_summaries, previous_epoch_participation, current_epoch_participation, pending_deposits
 );
 // Gloas keeps `validators` and `balances` in progressive trees, and its
 // `inactivity_scores` in a flat progressive list that buffers nothing, so the
 // scores are not listed. Every other field is the shared tree type.
 tree_fields!(
     gloas::BeaconState => validators, balances, block_roots, state_roots, historical_roots, eth1_data_votes, randao_mixes, slashings,
-    historical_summaries
+    historical_summaries, previous_epoch_participation, current_epoch_participation, pending_deposits
 );
 
 /// Generates read and write accessors for state fields that every fork shares.
@@ -652,6 +654,154 @@ enum Registry<'a> {
 enum RegistryMut<'a> {
     Bounded(&'a mut Validators, &'a mut Balances),
     Progressive(&'a mut ProgressiveValidators, &'a mut ProgressiveBalances),
+}
+
+/// One of a state's participation lists, whichever list kind its fork uses.
+///
+/// Every fork from altair on keeps them in a tree-backed list, a bounded one
+/// before gloas and a progressive one from gloas on. Neither has a slice
+/// view, and a read needs only length, element and in-order access, which
+/// this offers over both. Prefer [`Self::iter`] to [`Self::get`] when
+/// visiting many: each `get` on a tree is a descent.
+#[derive(Clone, Copy)]
+pub enum ParticipationRef<'a> {
+    /// Altair through fulu.
+    Bounded(&'a EpochParticipation),
+    /// Gloas.
+    Progressive(&'a gloas::EpochParticipation),
+}
+
+impl<'a> From<&'a EpochParticipation> for ParticipationRef<'a> {
+    fn from(list: &'a EpochParticipation) -> Self {
+        Self::Bounded(list)
+    }
+}
+
+impl<'a> From<&'a gloas::EpochParticipation> for ParticipationRef<'a> {
+    fn from(list: &'a gloas::EpochParticipation) -> Self {
+        Self::Progressive(list)
+    }
+}
+
+impl<'a> ParticipationRef<'a> {
+    /// The number of entries.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Bounded(list) => list.len(),
+            Self::Progressive(list) => list.len(),
+        }
+    }
+
+    /// Whether there are no entries.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The flags at `index`, or `None` past the end. A tree descent.
+    pub fn get(&self, index: usize) -> Option<&'a ParticipationFlags> {
+        match self {
+            Self::Bounded(list) => list.get(index),
+            Self::Progressive(list) => list.get(index),
+        }
+    }
+
+    /// Every entry in order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &'a ParticipationFlags> + use<'a> {
+        match self {
+            Self::Bounded(list) => RegistryIter::Bounded(list.iter()),
+            Self::Progressive(list) => RegistryIter::Progressive(list.iter()),
+        }
+    }
+
+    /// Whether a write is buffered and not yet folded into the tree.
+    pub fn has_pending_updates(&self) -> bool {
+        match self {
+            Self::Bounded(list) => list.has_pending_updates(),
+            Self::Progressive(list) => list.has_pending_updates(),
+        }
+    }
+
+    /// Whether both lists share one allocation. Never true across list kinds.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Bounded(a), Self::Bounded(b)) => a.ptr_eq(b),
+            (Self::Progressive(a), Self::Progressive(b)) => a.ptr_eq(b),
+            _ => false,
+        }
+    }
+
+    /// The entries, copied out.
+    pub fn to_vec(&self) -> Vec<ParticipationFlags> {
+        self.iter().copied().collect()
+    }
+}
+
+impl PartialEq for ParticipationRef<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.iter().eq(other.iter())
+    }
+}
+
+impl std::fmt::Debug for ParticipationRef<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl std::ops::Index<usize> for ParticipationRef<'_> {
+    type Output = ParticipationFlags;
+
+    fn index(&self, index: usize) -> &ParticipationFlags {
+        self.get(index)
+            .unwrap_or_else(|| panic!("index {index} out of bounds for {} entries", self.len()))
+    }
+}
+
+/// One of a state's participation lists, mutably, whichever list kind its
+/// fork uses: element writes only, so it cannot change the list's length.
+/// See [`BeaconState::epoch_participation_mut`].
+pub enum ParticipationMut<'a> {
+    /// Altair through fulu.
+    Bounded(&'a mut EpochParticipation),
+    /// Gloas.
+    Progressive(&'a mut gloas::EpochParticipation),
+}
+
+impl<'a> From<&'a mut EpochParticipation> for ParticipationMut<'a> {
+    fn from(list: &'a mut EpochParticipation) -> Self {
+        Self::Bounded(list)
+    }
+}
+
+impl<'a> From<&'a mut gloas::EpochParticipation> for ParticipationMut<'a> {
+    fn from(list: &'a mut gloas::EpochParticipation) -> Self {
+        Self::Progressive(list)
+    }
+}
+
+impl ParticipationMut<'_> {
+    /// The number of entries.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Bounded(list) => list.len(),
+            Self::Progressive(list) => list.len(),
+        }
+    }
+
+    /// Whether there are no entries.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The flags at `index`, mutably, or `None` past the end. The entry is
+    /// copied into the list's write buffer on first touch whether or not the
+    /// caller changes it, so write only when the value differs.
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut ParticipationFlags> {
+        match self {
+            Self::Bounded(list) => list.get_mut(index),
+            Self::Progressive(list) => list.get_mut(index),
+        }
+    }
 }
 
 /// The inactivity scores of a state, whichever list kind its fork uses.
@@ -1068,6 +1218,8 @@ impl BeaconState {
         self.randao_mixes_mut().rebase_on(base.randao_mixes());
         self.slashings_mut().rebase_on(base.slashings());
         self.rebase_inactivity_scores_on(base);
+        self.rebase_participation_on(base);
+        self.rebase_pending_deposits_on(base);
         self.rebase_historical_summaries_on(base);
     }
 
@@ -1096,6 +1248,55 @@ impl BeaconState {
             base.altair_validator_lists(),
         ) {
             scores.rebase_on(base_scores);
+        }
+    }
+
+    /// Shares both participation lists with `base`'s where both states keep
+    /// the same list kind (altair through fulu, or both gloas). Positional,
+    /// so across an epoch boundary (the child's previous list is the base's
+    /// current one) it finds little to share; the lists are rebuilt wholesale
+    /// there anyway.
+    fn rebase_participation_on(&mut self, base: &BeaconState) {
+        if let (Ok((previous, current, _)), Ok((base_previous, base_current, _))) = (
+            self.altair_validator_lists_mut(),
+            base.altair_validator_lists(),
+        ) {
+            if let (
+                ParticipationRef::Bounded(base_previous),
+                ParticipationRef::Bounded(base_current),
+            ) = (base_previous, base_current)
+            {
+                previous.rebase_on(base_previous);
+                current.rebase_on(base_current);
+            }
+        } else if let (BeaconState::Gloas(state), BeaconState::Gloas(base)) = (self, base) {
+            state
+                .previous_epoch_participation
+                .rebase_on(&base.previous_epoch_participation);
+            state
+                .current_epoch_participation
+                .rebase_on(&base.current_epoch_participation);
+        }
+    }
+
+    /// Shares `pending_deposits` with `base`'s where both keep the same list
+    /// kind (electra and fulu, or both gloas).
+    fn rebase_pending_deposits_on(&mut self, base: &BeaconState) {
+        let base_deposits = match base {
+            BeaconState::Electra(state) => &state.pending_deposits,
+            BeaconState::Fulu(state) => &state.pending_deposits,
+            BeaconState::Gloas(base) => {
+                if let BeaconState::Gloas(state) = self {
+                    state.pending_deposits.rebase_on(&base.pending_deposits);
+                }
+                return;
+            }
+            _ => return,
+        };
+        match self {
+            BeaconState::Electra(state) => state.pending_deposits.rebase_on(base_deposits),
+            BeaconState::Fulu(state) => state.pending_deposits.rebase_on(base_deposits),
+            _ => {}
         }
     }
 
@@ -1227,9 +1428,9 @@ impl BeaconState {
     }
 
     /// The three per-validator lists that exist from altair on, by reference and
-    /// all at once: the two participation lists as plain slices, the inactivity
-    /// scores as an [`InactivityScoresRef`] since a tree-backed list has no
-    /// slice to hand out.
+    /// all at once: the two participation lists as [`ParticipationRef`]s and
+    /// the inactivity scores as an [`InactivityScoresRef`], since a tree-backed
+    /// list has no slice to hand out.
     ///
     /// These cannot join `shared_state_accessors`' lists, since phase0 has
     /// none of them, and a per-fork projection to a concrete state struct (the
@@ -1242,11 +1443,10 @@ impl BeaconState {
     /// Gloas joins `carried_by` here, unlike [`Self::altair_validator_lists_mut`]:
     /// EIP-7688 makes all three progressive lists on a gloas state
     /// (`ProgressiveList` rather than `SszList`), a different concrete Rust
-    /// type from every earlier fork's, but both list kinds `Deref` to a plain
-    /// `[T]`, and a slice is all a *read* ever needs (`.get`, `.len`,
-    /// `.binary_search`, ...). Returning slices rather than the list types
-    /// themselves is what lets one `dispatch_state_from!` body serve both
-    /// kinds: the write side still needs the concrete container type, to grow
+    /// type from every earlier fork's. The `Ref` types are what let one
+    /// `dispatch_state_from!` body serve both kinds, since a read needs only
+    /// length, element and in-order access. The write side still needs the
+    /// concrete container type, to grow
     /// or replace the whole list, which is why [`Self::altair_validator_lists_mut`]
     /// stays bounded-only. On gloas, element writes go through
     /// [`Self::inactivity_score_mut`], and growing or replacing a list goes
@@ -1260,16 +1460,16 @@ impl BeaconState {
     pub fn altair_validator_lists(
         &self,
     ) -> Result<(
-        &[ParticipationFlags],
-        &[ParticipationFlags],
+        ParticipationRef<'_>,
+        ParticipationRef<'_>,
         InactivityScoresRef<'_>,
     )> {
         dispatch_state_from!(
             self,
             "BeaconState::altair_validator_lists",
             |state| (
-                &state.previous_epoch_participation[..],
-                &state.current_epoch_participation[..],
+                ParticipationRef::from(&state.previous_epoch_participation),
+                ParticipationRef::from(&state.current_epoch_participation),
                 InactivityScoresRef::from(&state.inactivity_scores),
             ),
             carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas],
@@ -1298,9 +1498,11 @@ impl BeaconState {
     /// accessor calls would each borrow the whole enum.
     ///
     /// Gloas is in `absent_from` here, not `carried_by`: the container type
-    /// this returns (`EpochParticipation`/`InactivityScores`, both `SszList`)
-    /// is fixed to the pre-gloas one, and `gloas::BeaconState`'s own three
-    /// lists are the progressive `ProgressiveList` instead, a different Rust
+    /// this returns (`EpochParticipation`/`InactivityScores`, both bounded
+    /// `ethlambda_ssz_tree::List`s) is fixed to the pre-gloas one, and
+    /// `gloas::BeaconState`'s own three lists are progressive instead
+    /// (`ethlambda_ssz_tree::ProgressiveList` for participation, a flat
+    /// `libssz_types::ProgressiveList` for the scores), a different Rust
     /// type a shared return type cannot name. A gloas caller either grows the
     /// registry through a per-fork projection
     /// (`PendingQueueFields::push_empty_participation_and_inactivity`), writes
@@ -1362,7 +1564,7 @@ impl BeaconState {
     }
 
     /// `previous_epoch_participation` or `current_epoch_participation`,
-    /// mutably and as a plain slice, whichever `current` selects: element
+    /// mutably and as a [`ParticipationMut`], whichever `current` selects: element
     /// writes only, the same contract [`Self::inactivity_score_mut`]'s own
     /// doc gives for why that is enough to include gloas where
     /// [`Self::altair_validator_lists_mut`] cannot.
@@ -1374,15 +1576,15 @@ impl BeaconState {
     /// [`Self::altair_validator_lists_mut`], on a fork that carries it, or
     /// through a gloas caller's own per-fork projection, the way
     /// [`Self::altair_validator_lists_mut`]'s own doc describes).
-    pub fn epoch_participation_mut(&mut self, current: bool) -> Result<&mut [ParticipationFlags]> {
+    pub fn epoch_participation_mut(&mut self, current: bool) -> Result<ParticipationMut<'_>> {
         dispatch_state_from!(
             self,
             "BeaconState::epoch_participation_mut",
-            |state| if current {
-                &mut state.current_epoch_participation[..]
+            |state| ParticipationMut::from(if current {
+                &mut state.current_epoch_participation
             } else {
-                &mut state.previous_epoch_participation[..]
-            },
+                &mut state.previous_epoch_participation
+            }),
             carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas],
             absent_from: [Phase0],
         )

@@ -326,7 +326,10 @@ mod tests {
             signature: Default::default(),
             slot: constants::GENESIS_SLOT,
         };
-        gloas_inner_mut(&mut state).pending_deposits.push(deposit);
+        gloas_inner_mut(&mut state)
+            .pending_deposits
+            .push(deposit)
+            .unwrap();
 
         let balance_before = state.balance(0).unwrap();
         process_pending_deposits(&mut state, &config).unwrap();
@@ -360,7 +363,8 @@ mod tests {
         };
         gloas_inner_mut(&mut state)
             .pending_deposits
-            .push(deposit.clone());
+            .push(deposit.clone())
+            .unwrap();
 
         let balance_before = state.balance(0).unwrap();
         process_pending_deposits(&mut state, &config).unwrap();
@@ -439,8 +443,8 @@ mod tests {
         };
         {
             let inner = gloas_inner_mut(&mut state);
-            inner.pending_deposits.push(first);
-            inner.pending_deposits.push(second.clone());
+            inner.pending_deposits.push(first).unwrap();
+            inner.pending_deposits.push(second.clone()).unwrap();
         }
 
         let balance_0_before = state.balance(0).unwrap();

@@ -1307,14 +1307,14 @@ impl<'a> PendingQueueFields<'a> {
 
     /// Queues one more [`electra::PendingDeposit`], pushed by
     /// [`queue_excess_active_balance`], [`queue_entire_balance_and_reset_validator`],
-    /// and the deposit-request processors. Infallible on gloas's unbounded
-    /// queue; electra's and fulu's bounded one can still reject a length over
-    /// its own SSZ limit.
+    /// and the deposit-request processors. Electra's and fulu's bounded queue
+    /// can reject a length over its own SSZ limit; gloas's progressive one
+    /// never does.
     pub(crate) fn push_pending_deposit(&mut self, deposit: electra::PendingDeposit) -> Result<()> {
         match self {
             PendingQueueFields::Electra(state) => state.pending_deposits.push(deposit)?,
             PendingQueueFields::Fulu(state) => state.pending_deposits.push(deposit)?,
-            PendingQueueFields::Gloas(state) => state.pending_deposits.push(deposit),
+            PendingQueueFields::Gloas(state) => state.pending_deposits.push(deposit)?,
         }
         Ok(())
     }
@@ -1330,19 +1330,19 @@ impl<'a> PendingQueueFields<'a> {
     pub(crate) fn take_pending_deposits(&mut self) -> Vec<electra::PendingDeposit> {
         match self {
             PendingQueueFields::Electra(state) => {
-                core::mem::take(&mut state.pending_deposits).into_inner()
+                core::mem::take(&mut state.pending_deposits).to_vec()
             }
             PendingQueueFields::Fulu(state) => {
-                core::mem::take(&mut state.pending_deposits).into_inner()
+                core::mem::take(&mut state.pending_deposits).to_vec()
             }
             PendingQueueFields::Gloas(state) => {
-                core::mem::take(&mut state.pending_deposits).into_inner()
+                core::mem::take(&mut state.pending_deposits).to_vec()
             }
         }
     }
 
     /// See [`Self::take_pending_deposits`]. Fallible only for electra's and
-    /// fulu's bounded `SszList`; gloas's progressive one never rejects a
+    /// fulu's bounded list; gloas's progressive one never rejects a
     /// length.
     pub(crate) fn set_pending_deposits(
         &mut self,
@@ -1467,9 +1467,9 @@ impl<'a> PendingQueueFields<'a> {
     /// and `inactivity_scores` by one all-zero entry each, keeping them
     /// exactly as long as the registry after a new validator is appended.
     ///
-    /// Gloas's own three lists are progressive (`libssz_types::ProgressiveList`),
-    /// so their `push` is infallible, unlike electra's and fulu's bounded
-    /// `SszList`.
+    /// Gloas's own lists are progressive, so their pushes cannot hit a length
+    /// limit; its inactivity scores are still a flat
+    /// `libssz_types::ProgressiveList`, whose `push` is infallible outright.
     pub(crate) fn push_empty_participation_and_inactivity(&mut self) -> Result<()> {
         match self {
             PendingQueueFields::Electra(state) => {
@@ -1483,8 +1483,8 @@ impl<'a> PendingQueueFields<'a> {
                 state.inactivity_scores.push(0)?;
             }
             PendingQueueFields::Gloas(state) => {
-                state.previous_epoch_participation.push(0);
-                state.current_epoch_participation.push(0);
+                state.previous_epoch_participation.push(0)?;
+                state.current_epoch_participation.push(0)?;
                 state.inactivity_scores.push(0);
             }
         }

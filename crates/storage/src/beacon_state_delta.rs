@@ -408,8 +408,8 @@ pub(crate) mod tests {
         // One slot's attesters: one epoch's worth of committees split across
         // SLOTS_PER_EPOCH slots.
         let attesters = VALIDATOR_COUNT / preset::SLOTS_PER_EPOCH as usize;
-        for participation in state.current_epoch_participation[..attesters].iter_mut() {
-            *participation = 0b0000_0111;
+        for index in 0..attesters {
+            state.current_epoch_participation[index] = 0b0000_0111;
         }
 
         state.latest_execution_payload_header = execution_payload_header_for_slot(state.slot);

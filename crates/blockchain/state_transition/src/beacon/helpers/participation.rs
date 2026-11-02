@@ -170,7 +170,16 @@ fn scan_raw(
     let mut previous_error = None;
     let mut current_error = None;
 
+    // Walked in lockstep with the registry, not indexed per validator: each
+    // `get` on a tree-backed list is a descent, which at mainnet size was the
+    // largest cost of this pass. A list shorter than the registry yields
+    // `None` from the index it runs out at, the same as `get` did.
+    let mut previous_flags_iter = previous_list.iter();
+    let mut current_flags_iter = current_list.iter();
+
     for (index, validator) in state.iter_validators().enumerate() {
+        let previous_entry = previous_flags_iter.next();
+        let current_entry = current_flags_iter.next();
         let effective_balance = validator.effective_balance;
         let active_now = is_active_validator(validator, current_epoch);
         let active_before = is_active_validator(validator, previous_epoch);
@@ -181,7 +190,7 @@ fn scan_raw(
 
         let mut bits = 0u8;
         if active_before {
-            match previous_list.get(index) {
+            match previous_entry {
                 Some(&participation) => {
                     if !validator.slashed {
                         for (flag_index, total) in previous_flags.iter_mut().enumerate() {
@@ -208,7 +217,7 @@ fn scan_raw(
         }
 
         if current_target && active_now {
-            match current_list.get(index) {
+            match current_entry {
                 Some(&participation) => {
                     if has_flag(participation, constants::TIMELY_TARGET_FLAG_INDEX)
                         && !validator.slashed
