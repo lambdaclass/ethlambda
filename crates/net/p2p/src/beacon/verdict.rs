@@ -18,6 +18,7 @@ use std::time::Instant;
 
 use ethlambda_network_api::{AggregateArrival, BlockAnnouncement, BlockArrival, BlockSource};
 use ethlambda_state_transition::beacon::builder_market::SharedBuilderMarket;
+use ethlambda_state_transition::beacon::gossip::column::ChainVerdict;
 use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome};
 use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCacheExt as _;
 use ethlambda_storage::{CacheKey, Store};
@@ -351,11 +352,23 @@ impl Validated {
                     .inspect_err(|err| warn!(%err, "Failed to forward a gossip block"));
             }
             Self::Column(sidecar) if outcome == Outcome::Accept => {
+                ethlambda_telemetry::emit(|| {
+                    column_checks::column_rows(
+                        &sidecar,
+                        column_checks::ColumnArrival::received("gossip", received_at),
+                        &ChainVerdict::Keep,
+                        Instant::now(),
+                    )
+                });
                 let _ = blockchain
                     .new_data_column_sidecars(vec![*sidecar])
                     .inspect_err(|err| warn!(%err, "Failed to forward a data column sidecar"));
             }
-            Self::Column(sidecar) => column_checks::check_and_forward(server, vec![*sidecar]),
+            Self::Column(sidecar) => column_checks::check_and_forward(
+                server,
+                vec![*sidecar],
+                column_checks::ColumnArrival::received("gossip", received_at),
+            ),
             Self::Aggregate {
                 aggregate,
                 attesting_indices,

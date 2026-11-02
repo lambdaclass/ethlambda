@@ -1853,7 +1853,11 @@ impl Handler<FetchBlock> for P2PServer {
 
 impl Handler<CheckDataColumnSidecars> for P2PServer {
     async fn handle(&mut self, msg: CheckDataColumnSidecars, _ctx: &Context<Self>) {
-        beacon::column_checks::check_and_forward(self, msg.sidecars);
+        beacon::column_checks::check_and_forward(
+            self,
+            msg.sidecars,
+            beacon::column_checks::ColumnArrival::RECHECK,
+        );
     }
 }
 

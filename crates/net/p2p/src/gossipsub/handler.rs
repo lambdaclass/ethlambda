@@ -9,6 +9,7 @@ use std::time::Instant;
 
 use ethlambda_network_api::{AggregateArrival, BlockAnnouncement, BlockArrival, BlockSource};
 use ethlambda_state_transition::beacon::das;
+use ethlambda_state_transition::beacon::gossip::column::ChainVerdict;
 use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome, RejectReason};
 use ethlambda_types::{
     ShortRoot,
@@ -981,6 +982,21 @@ pub async fn publish_beacon_block(
             .filter(|sidecar| beacon.custody_columns.contains(&sidecar.index()))
             .collect();
         if !custody.is_empty() {
+            let now = Instant::now();
+            ethlambda_telemetry::emit(|| {
+                let arrival = crate::beacon::column_checks::ColumnArrival::received("local", now);
+                custody
+                    .iter()
+                    .flat_map(|sidecar| {
+                        crate::beacon::column_checks::column_rows(
+                            sidecar,
+                            arrival,
+                            &ChainVerdict::Keep,
+                            now,
+                        )
+                    })
+                    .collect()
+            });
             let _ = blockchain
                 .new_data_column_sidecars(custody)
                 .inspect_err(|err| error!(%err, "Failed to hand the custody columns to the chain"));
@@ -1086,7 +1102,11 @@ pub async fn publish_execution_payload_envelope(
             .new_execution_payload_envelope(Box::new(envelope), BlockArrival::now())
             .inspect_err(|err| error!(%err, "Failed to hand the published envelope to the chain"));
     }
-    crate::beacon::column_checks::check_and_forward(server, sidecars);
+    crate::beacon::column_checks::check_and_forward(
+        server,
+        sidecars,
+        crate::beacon::column_checks::ColumnArrival::received("local", Instant::now()),
+    );
 }
 
 /// Gossip a payload attestation message a validator client signed, handed

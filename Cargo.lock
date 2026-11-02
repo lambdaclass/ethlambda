@@ -2067,6 +2067,7 @@ dependencies = [
  "ethlambda-network-api",
  "ethlambda-state-transition",
  "ethlambda-storage",
+ "ethlambda-telemetry",
  "ethlambda-types",
  "ethrex-common",
  "ethrex-p2p",

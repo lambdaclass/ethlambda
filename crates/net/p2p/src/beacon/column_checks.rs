@@ -18,13 +18,89 @@
 //! has a deadline, so a sidecar with no free permit waits for one rather than
 //! being dropped.
 
+use std::time::Instant;
+
 use ethlambda_state_transition::beacon::gossip::column::{self, ChainVerdict};
 use ethlambda_state_transition::beacon::gossip::{IgnoreReason, Outcome};
+use ethlambda_telemetry::BlockEvent;
 use ethlambda_types::beacon::containers::DataColumnSidecar;
 use ethlambda_types::time::unix_now_ms;
 use tracing::{error, warn};
 
 use crate::{P2PServer, metrics};
+
+/// How a batch of sidecars reached [`check_and_forward`], for the telemetry
+/// rows (`docs/telemetry.md`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ColumnArrival {
+    /// The rows' `source`: how the sidecars reached this node.
+    pub(crate) source: &'static str,
+    /// When they arrived, or `None` for sidecars checked again whose arrival
+    /// was already written.
+    pub(crate) received_at: Option<Instant>,
+}
+
+impl ColumnArrival {
+    /// Sidecars the chain actor parked and hands back once their block
+    /// imports: only their validation is new.
+    pub(crate) const RECHECK: Self = Self {
+        source: "recheck",
+        received_at: None,
+    };
+
+    pub(crate) fn received(source: &'static str, at: Instant) -> Self {
+        Self {
+            source,
+            received_at: Some(at),
+        }
+    }
+}
+
+/// One `block_events` row for `sidecar`.
+pub(crate) fn column_event(
+    stage: &'static str,
+    sidecar: &DataColumnSidecar,
+    source: &'static str,
+    at: Instant,
+) -> BlockEvent {
+    BlockEvent {
+        stage,
+        at,
+        slot: sidecar.slot(),
+        block_root: sidecar.block_root().0,
+        source,
+        verdict: None,
+        column_index: Some(sidecar.index()),
+    }
+}
+
+/// The rows one checked sidecar writes (see [`check_and_forward`]): its
+/// arrival unless already written, and its validation once kept. A dropped
+/// sidecar writes none, as Silver records a column only once it passed
+/// validation.
+pub(crate) fn column_rows(
+    sidecar: &DataColumnSidecar,
+    arrival: ColumnArrival,
+    verdict: &ChainVerdict,
+    checked_at: Instant,
+) -> Vec<BlockEvent> {
+    let received = arrival
+        .received_at
+        .map(|at| column_event("column_recv", sidecar, arrival.source, at));
+    match verdict {
+        ChainVerdict::Keep => received
+            .into_iter()
+            .chain([column_event(
+                "column_validated",
+                sidecar,
+                arrival.source,
+                checked_at,
+            )])
+            .collect(),
+        ChainVerdict::AwaitParent => received.into_iter().collect(),
+        ChainVerdict::Drop(_) => Vec::new(),
+    }
+}
 
 /// Run the chain checks on `sidecars`, then send the chain actor the ones that
 /// passed as one batch and the ones waiting on a block as another.
@@ -32,7 +108,15 @@ use crate::{P2PServer, metrics};
 /// Returns at once: the checks run on a task of their own, so the p2p actor
 /// goes on handling swarm events while a range batch's KZG proofs are
 /// verified.
-pub(crate) fn check_and_forward(server: &P2PServer, sidecars: Vec<DataColumnSidecar>) {
+///
+/// Each sidecar's `block_events` rows are written here once its check is done,
+/// by [`column_rows`]: after the check, so a re-delivered or rejected sidecar
+/// writes none, and off the p2p actor.
+pub(crate) fn check_and_forward(
+    server: &P2PServer,
+    sidecars: Vec<DataColumnSidecar>,
+    arrival: ColumnArrival,
+) {
     if sidecars.is_empty() {
         return;
     }
@@ -53,7 +137,7 @@ pub(crate) fn check_and_forward(server: &P2PServer, sidecars: Vec<DataColumnSide
             checks.push(tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 let verdict = column::chain_checks_for(&store, &sidecar, unix_now_ms());
-                (sidecar, verdict)
+                (sidecar, verdict, Instant::now())
             }));
         }
 
@@ -63,13 +147,14 @@ pub(crate) fn check_and_forward(server: &P2PServer, sidecars: Vec<DataColumnSide
             // A panic inside the checks (a `Store` read's `.expect()` on a DB
             // error, say) costs that one sidecar, which is what dropping it
             // would have done anyway. Tokio has already caught it.
-            let (sidecar, verdict) = match check.await {
+            let (sidecar, verdict, checked_at) = match check.await {
                 Ok(checked) => checked,
                 Err(err) => {
                     error!(%err, "A data column check panicked; dropping the sidecar");
                     continue;
                 }
             };
+            ethlambda_telemetry::emit(|| column_rows(&sidecar, arrival, &verdict, checked_at));
             match verdict {
                 ChainVerdict::Keep => keep.push(sidecar),
                 ChainVerdict::AwaitParent => awaiting_parent.push(sidecar),
@@ -108,6 +193,7 @@ fn count_drop(outcome: Outcome) {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use ethlambda_network_api::{
         AggregateArrival, BlockAnnouncement, BlockArrival, BlockSource, P2PToBlockChain,
@@ -211,6 +297,7 @@ mod tests {
                 DataColumnSidecar::Fulu(orphan.clone()),
                 DataColumnSidecar::Fulu(malformed),
             ],
+            ColumnArrival::RECHECK,
         );
 
         assert_eq!(
@@ -248,7 +335,11 @@ mod tests {
             ..Default::default()
         });
 
-        check_and_forward(&server, vec![unknown_block.clone(), future]);
+        check_and_forward(
+            &server,
+            vec![unknown_block.clone(), future],
+            ColumnArrival::RECHECK,
+        );
 
         assert_eq!(
             received.recv().await,
@@ -256,5 +347,70 @@ mod tests {
         );
         drop(server);
         assert_eq!(received.recv().await, None);
+    }
+
+    fn sidecar_48() -> DataColumnSidecar {
+        DataColumnSidecar::Gloas(gloas::DataColumnSidecar {
+            index: 48,
+            slot: 5,
+            beacon_block_root: Root::repeat_byte(9),
+            ..Default::default()
+        })
+    }
+
+    /// Silver records a column only once it passed validation: a parked one
+    /// writes its arrival now and its validation when the recheck keeps it,
+    /// and a dropped one (an already stored re-delivery included) writes none.
+    #[test]
+    fn a_column_writes_rows_only_once_it_passes() {
+        let sidecar = sidecar_48();
+        let arrived = Instant::now();
+        let checked = arrived + Duration::from_millis(3);
+        let fresh = ColumnArrival::received("by_root", arrived);
+        let rows = |rows: Vec<BlockEvent>| {
+            rows.into_iter()
+                .map(|row| (row.stage, row.at))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            rows(column_rows(&sidecar, fresh, &ChainVerdict::Keep, checked)),
+            [("column_recv", arrived), ("column_validated", checked)]
+        );
+        assert_eq!(
+            rows(column_rows(
+                &sidecar,
+                fresh,
+                &ChainVerdict::AwaitParent,
+                checked
+            )),
+            [("column_recv", arrived)]
+        );
+        let stored = ChainVerdict::Drop(Outcome::Ignore(IgnoreReason::AlreadyStored));
+        assert!(column_rows(&sidecar, fresh, &stored, checked).is_empty());
+        assert_eq!(
+            rows(column_rows(
+                &sidecar,
+                ColumnArrival::RECHECK,
+                &ChainVerdict::Keep,
+                checked
+            )),
+            [("column_validated", checked)]
+        );
+    }
+
+    #[test]
+    fn a_column_row_names_its_block_slot_and_index() {
+        let sidecar = sidecar_48();
+        let at = Instant::now();
+
+        let event = column_event("column_recv", &sidecar, "by_root", at);
+        assert_eq!(event.stage, "column_recv");
+        assert_eq!(event.slot, 5);
+        assert_eq!(event.block_root, [9; 32]);
+        assert_eq!(event.column_index, Some(48));
+        assert_eq!(event.source, "by_root");
+        assert_eq!(event.at, at);
+        assert_eq!(event.verdict, None);
     }
 }
