@@ -94,6 +94,27 @@ pub(crate) struct CommonOptions {
     /// directory, a URL, nor a loaded network's genesis, startup aborts.
     #[arg(long, value_delimiter = ',')]
     pub(crate) checkpoint_sync_url: Vec<String>,
+    /// ClickHouse HTTP endpoint that per-block telemetry rows are written to
+    /// (Silver's `block_events` table), e.g. `http://127.0.0.1:8123`.
+    ///
+    /// Off when unset. Credentials go in the URL (`http://user:pass@host:8123`)
+    /// and are sent as basic auth; a `?database=` parameter passes through.
+    /// A URL with a password is better passed through the environment
+    /// variable, since any local user can read a process's command line.
+    /// See `docs/telemetry.md`.
+    #[arg(
+        long = "telemetry.clickhouse-url",
+        env = "ETHLAMBDA_TELEMETRY_CLICKHOUSE_URL",
+        hide_env_values = true
+    )]
+    pub(crate) telemetry_clickhouse_url: Option<reqwest::Url>,
+    /// `meta_client_name` on every telemetry row.
+    ///
+    /// Defaults to `--node-id` on `node`, since devnets run several nodes per
+    /// host, and to `ethlambda@<hostname>` on `beacon`, which keeps its rows
+    /// apart from another client writing the same table from the same host.
+    #[arg(long = "telemetry.client-name", requires = "telemetry_clickhouse_url")]
+    pub(crate) telemetry_client_name: Option<String>,
     #[command(flatten)]
     pub(crate) discovery: DiscoveryConfig,
 }
@@ -971,6 +992,31 @@ mod tests {
             Command::Beacon(options) => options,
             other => panic!("the beacon argv must resolve to the beacon subcommand, got {other:?}"),
         }
+    }
+
+    /// A client name alone configures nothing, so it is a usage error rather
+    /// than a flag silently ignored.
+    #[test]
+    fn the_telemetry_client_name_needs_a_clickhouse_url() {
+        let mut args = beacon_args();
+        args.extend(["--telemetry.client-name", "x"]);
+        let err = try_parse_from(args).expect_err("a client name needs a URL");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+
+        let mut args = beacon_args();
+        args.extend([
+            "--telemetry.clickhouse-url",
+            "http://u:p@127.0.0.1:8123/?database=default",
+            "--telemetry.client-name",
+            "x",
+        ]);
+        let beacon = parse_beacon(args);
+        let url = beacon
+            .common
+            .telemetry_clickhouse_url
+            .expect("the URL parses");
+        assert_eq!(url.username(), "u");
+        assert_eq!(beacon.common.telemetry_client_name.as_deref(), Some("x"));
     }
 
     /// The invariant `From<BeaconOptions>`'s `unreachable!` rests on. Each

@@ -349,6 +349,13 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     let Options { common, network } = options;
     // Read before the chain match below moves `network`.
     let discovery_enabled = network.discovery_enabled();
+    // Read before the chain match below moves `network`.
+    let telemetry_default_name = match &network {
+        Network::Lean(lean) => lean.node_id.clone(),
+        Network::Mainnet { .. } => format!("ethlambda@{}", hostname()),
+    };
+    let telemetry_url = common.telemetry_clickhouse_url.clone();
+    let telemetry_client_name = common.telemetry_client_name.clone();
 
     #[cfg(feature = "shadow-integration")]
     if let Network::Lean(lean) = &network {
@@ -777,6 +784,27 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     // block production and the contribution endpoint.
     let sync_committee_pool =
         ethlambda_state_transition::beacon::sync_committee_pool::SharedSyncCommitteePool::default();
+    // Before the P2P actor starts, so its first column rows are not lost.
+    if let Some(url) = telemetry_url {
+        let config = setup.store.config();
+        let grid = config.time_grid();
+        let network_name = match setup.store.chain() {
+            ethlambda_storage::Chain::Lean => "lean".to_owned(),
+            ethlambda_storage::Chain::Beacon => config.config_name.as_str().to_owned(),
+        };
+        let client_name = telemetry_client_name.unwrap_or(telemetry_default_name);
+        // The URL is not logged: it may carry credentials.
+        info!(%client_name, %network_name, "Writing block telemetry to ClickHouse");
+        ethlambda_telemetry::install(ethlambda_telemetry::TelemetryConfig {
+            url,
+            client_name,
+            network_name,
+            clock: ethlambda_telemetry::SlotClock::new(
+                grid.genesis_time_ms(),
+                grid.milliseconds_per_slot,
+            ),
+        });
+    }
     let p2p = P2P::spawn(
         built,
         setup.store.clone(),
@@ -932,6 +960,19 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     })
     .await;
     Ok(())
+}
+
+/// This machine's hostname, for the default telemetry client name.
+fn hostname() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is valid for writes of `buf.len()` bytes, and
+    // `gethostname` writes at most that many.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return "unknown".to_owned();
+    }
+    let len = buf.iter().position(|&byte| byte == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..len]).into_owned()
 }
 
 /// The root of the anchor block when it is a gloas block whose execution
