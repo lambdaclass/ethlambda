@@ -3,7 +3,9 @@
 
 use std::sync::LazyLock;
 
-use ethlambda_metrics::{IntCounter, IntCounterVec, register_int_counter, register_int_counter_vec};
+use ethlambda_metrics::{
+    IntCounter, IntCounterVec, register_int_counter, register_int_counter_vec,
+};
 
 static ROWS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
