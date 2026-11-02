@@ -97,6 +97,16 @@ pub trait StorageWriteBatch: Send {
     /// Put multiple key-value pairs into a table.
     fn put_batch(&mut self, table: Table, batch: Vec<(Vec<u8>, Vec<u8>)>) -> Result<(), Error>;
 
+    /// Put one key-value pair into a table, from borrowed bytes.
+    ///
+    /// For a value the caller keeps after the write, so it need not clone one
+    /// only to hand it over: a beacon snapshot is hundreds of megabytes, and
+    /// RocksDB copies the value into its batch either way. The default goes
+    /// through [`put_batch`](Self::put_batch).
+    fn put(&mut self, table: Table, key: &[u8], value: &[u8]) -> Result<(), Error> {
+        self.put_batch(table, vec![(key.to_vec(), value.to_vec())])
+    }
+
     /// Delete multiple keys from a table.
     fn delete_batch(&mut self, table: Table, keys: Vec<Vec<u8>>) -> Result<(), Error>;
 
