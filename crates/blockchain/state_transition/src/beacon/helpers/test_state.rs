@@ -652,3 +652,35 @@ fn gloas_state(count: usize) -> gloas::BeaconState {
             .expect("the vector is built at its exact length"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`BeaconState::ssz_append_capacity`] for every fork. The test lives here
+    /// rather than beside that method in `ethlambda-types` because this module
+    /// is the one place a state of every fork is built.
+    ///
+    /// A small registry is the hard case. libssz's container encoder writes
+    /// each fixed-size field past the end of the buffer before moving it into
+    /// place, so a field needs room beyond the encoding's length unless enough
+    /// variable-size data still follows it, and a small state has little. A
+    /// fork that adds a fixed-size field larger than any the capacity counts
+    /// fails here rather than quietly regrowing a buffer the size of the state.
+    #[test]
+    fn ssz_append_never_regrows_a_buffer_with_its_capacity_to_spare() {
+        for fork in ForkName::ALL {
+            let state = with_validators_at(fork, 3);
+            let capacity = state.ssz_append_capacity();
+            let mut buf = Vec::with_capacity(capacity);
+            state.ssz_append(&mut buf);
+            assert_eq!(buf.capacity(), capacity, "{fork}: ssz_append regrew");
+            let decoded = BeaconState::from_ssz(fork, &buf).expect("the encoding decodes");
+            assert_eq!(decoded, state, "{fork}");
+
+            let encoded = state.to_ssz();
+            assert_eq!(encoded, buf, "{fork}");
+            assert_eq!(encoded.capacity(), capacity, "{fork}: to_ssz regrew");
+        }
+    }
+}
