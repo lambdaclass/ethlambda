@@ -1784,6 +1784,11 @@ impl BlockChainServer {
                     let evidence =
                         data_availability_for(&self.store, &beacon_block, &self.custody_columns);
                     timings.da_check_end = Some(Instant::now());
+                    // Only a block with columns to wait for has made data
+                    // available; a gloas block or one with no commitments is
+                    // answered `NotRequired`.
+                    timings.da_columns_required =
+                        matches!(evidence, Some(fork_choice::DataAvailability::Columns(_)));
                     match evidence {
                         Some(evidence) => evidence,
                         None => {
@@ -2246,6 +2251,9 @@ impl BlockChainServer {
         };
         report.observe();
         ethlambda_telemetry::emit(|| report.telemetry_events());
+        // `process_and_publish_block` also reaches here outside any
+        // `on_block`; harmless, since a locally built block has no source
+        // label and so is never recorded.
         if report.imported_here()
             && let Some(source) = report.timings.source_label()
         {
@@ -5445,8 +5453,10 @@ mod tests {
                 .is_empty()
         );
 
-        // A block the store already holds: the early return reports it
-        // imported, but nothing ran, so it is not recorded as imported.
+        // A re-delivery of a stored beacon block returns early at the
+        // `has_state` check, before any report is logged: it files no arrival
+        // rows. (`imported_here` itself is pinned by import_timing's
+        // `a_block_already_imported_writes_nothing`.)
         let stored = fulu_block(H256::ZERO, 1, 0);
         let stored_root = stored.message_hash_tree_root();
         server
@@ -5468,6 +5478,44 @@ mod tests {
                 .cascade_telemetry
                 .events(&cascade(Instant::now()))
                 .is_empty()
+        );
+    }
+
+    /// The arrival is the cascade's first block, not the latest one processed:
+    /// later blocks of the same cascade must not overwrite it.
+    #[tokio::test]
+    async fn the_arrival_is_the_first_block_a_cascade_processes() {
+        let mut store = beacon_store_fulu_at_genesis(GENESIS_TIME, 0);
+        store
+            .insert_signed_block(H256::ZERO, bare_block(0, H256::repeat_byte(0xcc)))
+            .expect("insert");
+        store
+            .insert_state(H256::ZERO, bare_state())
+            .expect("insert");
+        store
+            .set_time_ms(seconds_to_milliseconds(
+                GENESIS_TIME + 5 * Config::mainnet().seconds_per_slot,
+            ))
+            .unwrap();
+        let mut server = beacon_server(store);
+        server.custody_columns = CUSTODY.to_vec();
+
+        let first = fulu_block_with_commitments(&server.store, 2);
+        let first_root = first.message_hash_tree_root();
+        let first_slot = first.slot();
+        let child = fulu_block(first_root, first_slot + 1, 0);
+
+        server.cascade_telemetry = CascadeTelemetry::default();
+        for block in [first, child] {
+            let mut queue = VecDeque::new();
+            server
+                .process_or_pend_block(block, ImportTimings::default(), &mut queue)
+                .await;
+        }
+
+        assert_eq!(
+            server.cascade_telemetry.arrival,
+            Some((first_slot, first_root))
         );
     }
 

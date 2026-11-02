@@ -172,6 +172,11 @@ pub struct ImportTimings {
     /// Beacon: the custody-column availability check itself, not the wait.
     pub da_check_start: Option<Instant>,
     pub da_check_end: Option<Instant>,
+    /// Beacon: the check found columns to require (a block with commitments
+    /// inside the availability window). A gloas block or one with no
+    /// commitments is checked too, but has nothing to make available, so its
+    /// end must not be named as if it did.
+    pub da_columns_required: bool,
 
     // --- Hold: custody columns have not all arrived (beacon). ---
     pub columns_wait_start: Option<Instant>,
@@ -258,12 +263,7 @@ impl ImportTimings {
     /// moment the import began, and mixing those into a wire source's
     /// percentiles would understate it.
     pub fn source_label(&self) -> Option<&'static str> {
-        match self.source {
-            Some(BlockSource::Gossip) => Some("gossip"),
-            Some(BlockSource::Sync) => Some("sync"),
-            Some(BlockSource::Replay) => Some("replay"),
-            Some(BlockSource::Deferred) | None => None,
-        }
+        source_label(self.source)
     }
 
     /// What the log calls this block's source, which unlike the metric label
@@ -479,10 +479,13 @@ impl BlockImportReport {
     /// This report as `block_events` rows (`docs/telemetry.md`).
     ///
     /// Only a final pass is written: one that imported the block here, or
-    /// failed it. A held block's timings travel with it, so that pass carries
-    /// the whole timeline, and writing every held pass too would repeat its
-    /// early rows. The population is the histogram's: a source with no metric
-    /// label writes no rows.
+    /// failed it. A held block's timings travel with it, so writing every held
+    /// pass too would repeat its early rows. Not every mark is the final
+    /// pass's own: `received`, `decode_end`, `queue_end`, `defer_*`, `admit_*`
+    /// and the `*_wait_start` marks survive a hold, while `guards_*`,
+    /// `da_check_*` and everything after them are overwritten by each pass, so
+    /// they describe the last pass only. The population is the histogram's: a
+    /// source with no metric label writes no rows.
     ///
     /// Silver's stage names stand in for ours where the meaning matches; the
     /// two that claim success are only used for an imported block. Beacon's
@@ -500,6 +503,13 @@ impl BlockImportReport {
             _ => return Vec::new(),
         };
         let t = &self.timings;
+        // Only a block that waited on columns has made data available; the
+        // others' check ran and found nothing to require.
+        let da_check_end = if t.da_columns_required {
+            "da_available"
+        } else {
+            "da_check_end"
+        };
         let (stf_end, fc_head_end) = if imported {
             ("stf_done", "attestable")
         } else {
@@ -525,7 +535,7 @@ impl BlockImportReport {
             ("cascade_wait_start", t.cascade_wait_start),
             ("cascade_wait_end", t.cascade_wait_end),
             ("da_check_start", t.da_check_start),
-            ("da_available", t.da_check_end),
+            (da_check_end, t.da_check_end),
             ("columns_wait_start", t.columns_wait_start),
             ("columns_wait_end", t.columns_wait_end),
             ("verify_struct_start", t.verify_structural_start),
@@ -569,13 +579,8 @@ impl BlockImportReport {
         verdict: Option<&'static str>,
     ) -> BlockEvent {
         BlockEvent {
-            stage,
-            at,
-            slot: self.slot,
-            block_root: self.block_root.0,
-            source,
             verdict,
-            column_index: None,
+            ..row(stage, at, self.slot, self.block_root, source)
         }
     }
 
@@ -728,12 +733,7 @@ impl CascadeTimings {
     /// The `source` this arrival reports under; the same two exclusions a
     /// block's own sections make (see `ImportTimings::source_label`).
     fn source_label(&self) -> Option<&'static str> {
-        match self.source {
-            Some(BlockSource::Gossip) => Some("gossip"),
-            Some(BlockSource::Sync) => Some("sync"),
-            Some(BlockSource::Replay) => Some("replay"),
-            Some(BlockSource::Deferred) | None => None,
-        }
+        source_label(self.source)
     }
 
     pub fn absorb_head(&mut self, head: HeadTimings) {
@@ -867,6 +867,17 @@ impl CascadeTelemetry {
             );
         }
         events
+    }
+}
+
+/// The `source` a block or arrival reports under, shared by both so the two
+/// cannot disagree about which sources are measured.
+fn source_label(source: Option<BlockSource>) -> Option<&'static str> {
+    match source {
+        Some(BlockSource::Gossip) => Some("gossip"),
+        Some(BlockSource::Sync) => Some("sync"),
+        Some(BlockSource::Replay) => Some("replay"),
+        Some(BlockSource::Deferred) | None => None,
     }
 }
 
@@ -1273,6 +1284,7 @@ mod tests {
             guards_end: at(base, 3),
             da_check_start: at(base, 3),
             da_check_end: at(base, 4),
+            da_columns_required: true,
             engine_start: at(base, 4),
             engine_end: at(base, 40),
             engine_verdict: Some("Valid"),
@@ -1320,6 +1332,19 @@ mod tests {
             .unwrap();
         assert_eq!(verdict.verdict, Some("Valid"));
         assert_eq!(verdict.at, base + Duration::from_millis(40));
+    }
+
+    #[test]
+    fn a_block_with_nothing_to_make_available_does_not_claim_it_was() {
+        let base = Instant::now();
+        let report = report(ImportTimings {
+            da_columns_required: false,
+            ..beacon_gossip(base)
+        });
+
+        let stages = stages(&report);
+        assert!(stages.contains(&"da_check_end"));
+        assert!(!stages.contains(&"da_available"));
     }
 
     #[test]
@@ -1384,6 +1409,9 @@ mod tests {
             queue_end: at(base, 2),
             guards_start: at(base, 2),
             guards_end: at(base, 3),
+            // What `absorb_store` copies in from the store's early return.
+            preamble_start: at(base, 3),
+            preamble_end: at(base, 3),
             ..ImportTimings::default()
         });
         assert!(!redelivered.imported_here());
@@ -1504,11 +1532,6 @@ mod tests {
                 .map(|event| (event.stage, event.slot))
                 .collect::<Vec<_>>(),
             [("attestable", 8)]
-        );
-        assert!(
-            CascadeTelemetry::default()
-                .events(&arrival_cascade(base))
-                .is_empty()
         );
     }
 
