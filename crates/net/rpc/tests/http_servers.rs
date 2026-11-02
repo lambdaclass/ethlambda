@@ -182,7 +182,8 @@ async fn the_beacon_router_replaces_the_lean_one() {
     );
 }
 
-/// A subscriber left connected to `/eth/v1/events` does not hold up shutdown.
+/// A subscriber left connected to `/eth/v1/events` does not hold up shutdown,
+/// with the API and metrics routers merged onto one listener.
 ///
 /// Graceful shutdown waits for every in-flight response, and an event stream
 /// never finishes on its own: before the streams ended on the shutdown token, a
@@ -191,11 +192,33 @@ async fn the_beacon_router_replaces_the_lean_one() {
 #[tokio::test]
 async fn a_connected_event_stream_does_not_hold_up_shutdown() {
     let port = free_port().await;
+    assert_an_event_stream_ends_on_shutdown(port, port).await;
+}
+
+/// The same with the API and metrics routers on two listeners, the default
+/// ports' shape, which starts two servers rather than one.
+#[tokio::test]
+async fn a_connected_event_stream_does_not_hold_up_shutdown_on_separate_ports() {
+    let api_port = free_port().await;
+    let metrics_port = free_port().await;
+    assert_ne!(
+        api_port, metrics_port,
+        "the probe handed out one port twice"
+    );
+    assert_an_event_stream_ends_on_shutdown(api_port, metrics_port).await;
+}
+
+/// Opens `/eth/v1/events` on `api_port`, cancels the shutdown token, and
+/// checks the servers stop.
+///
+/// The bound is well under the servers' drain timeout, so it is the stream
+/// ending on the signal that lets them stop, not the servers giving up on it.
+async fn assert_an_event_stream_ends_on_shutdown(api_port: u16, metrics_port: u16) {
     let shutdown = CancellationToken::new();
     let config = RpcConfig {
         http_address: LOCALHOST,
-        api_port: port,
-        metrics_port: port,
+        api_port,
+        metrics_port,
         version: "ethlambda/test",
     };
     // Kept alive for the whole test, so the channel never closes and only the
@@ -206,9 +229,10 @@ async fn a_connected_event_stream_does_not_hold_up_shutdown() {
             .layer(axum::Extension(events.clone()));
     let served = tokio::spawn(start_http_servers(config, Some(router), shutdown.clone()));
 
-    // Wait for the metrics route so the socket is accepting, then subscribe.
-    assert!(status_line(&get(port, "/metrics").await).contains("200"));
-    let mut stream = TcpStream::connect(SocketAddr::new(LOCALHOST, port))
+    // Wait for both listeners to accept, then subscribe.
+    assert!(status_line(&get(metrics_port, "/metrics").await).contains("200"));
+    assert!(status_line(&get(api_port, "/eth/v1/node/version").await).contains("200"));
+    let mut stream = TcpStream::connect(SocketAddr::new(LOCALHOST, api_port))
         .await
         .expect("the server accepts");
     stream
@@ -223,9 +247,9 @@ async fn a_connected_event_stream_does_not_hold_up_shutdown() {
     );
 
     shutdown.cancel();
-    tokio::time::timeout(Duration::from_secs(5), served)
+    tokio::time::timeout(Duration::from_secs(2), served)
         .await
-        .expect("the server stops within five seconds despite the open stream")
+        .expect("the servers stop promptly despite the open stream")
         .expect("the server task joins")
         .expect("the server exits cleanly");
 }
