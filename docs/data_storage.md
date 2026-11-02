@@ -233,6 +233,13 @@ that leave the canonical chain and writing the ones that join it. A reorg
 therefore touches only the affected slot range, not the whole table. Never
 pruned.
 
+That walk never writes the common ancestor itself, and at bootstrap the head
+is the anchor, so the anchor's own slot is written separately: by `init_store`
+on a lean directory, and by `index_beacon_anchor` (called from the beacon
+`get_forkchoice_store`) on a beacon one, keyed by the anchor block's slot
+rather than the anchor state's. A beacon directory bootstrapped before
+`index_beacon_anchor` existed has no row for its anchor.
+
 Backs `get_signed_blocks_by_slot_range`, which serves BlocksByRange requests
 over req/resp (`crates/net/p2p/src/req_resp/handlers.rs`). It does **not**
 back the RPC `GET /lean/v0/blocks/:slot` endpoint: that handler resolves a
@@ -876,7 +883,9 @@ entries are written by its caller instead, through the same `insert_state` and
 `insert_signed_block` an ordinary block import uses, followed by the anchor's
 own `BeaconUnrealizedJustifications` row (`set_unrealized_justification`), the
 same order every later block's import follows too — see
-[BeaconUnrealizedJustifications](#beaconunrealizedjustifications) above.
+[BeaconUnrealizedJustifications](#beaconunrealizedjustifications) above. The
+one row an import does not write is the anchor's `BlockRoots` entry, which
+`index_beacon_anchor` adds right after the block (see [BlockRoots](#blockroots)).
 
 `from_db_state` is the restore path: it reads `db_version`, `preset`, `chain`,
 `config` and `anchor_slot` from `Metadata`, returning `None` for an empty DB. A format
