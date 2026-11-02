@@ -669,8 +669,12 @@ mod tests {
     /// fails here rather than quietly regrowing a buffer the size of the state.
     #[test]
     fn ssz_append_never_regrows_a_buffer_with_its_capacity_to_spare() {
-        for fork in ForkName::ALL {
-            let state = with_validators_at(fork, 3);
+        // A lean genesis with no validators: its fixed-size fields come before
+        // all of its variable-size ones, which hold almost nothing here.
+        let lean = BeaconState::Lean(ethlambda_types::state::State::from_genesis(7, vec![]));
+        let beacon = ForkName::ALL.map(|fork| with_validators_at(fork, 3));
+        for state in beacon.into_iter().chain([lean]) {
+            let fork = state.fork_name();
             let capacity = state.ssz_append_capacity();
 
             let encoded = state.to_ssz();
