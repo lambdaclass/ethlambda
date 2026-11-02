@@ -38,6 +38,7 @@ impl SlotClock {
     pub fn new(genesis_ms: u64, slot_ms: u64) -> Self {
         Self {
             genesis_ms,
+            // A zero slot length would make the live window empty.
             slot_ms: slot_ms.max(1),
         }
     }
@@ -60,7 +61,9 @@ impl SlotClock {
 }
 
 /// What every row carries besides its event, and where rows go.
-#[derive(Debug, Clone)]
+///
+/// No `Debug`: the URL may carry credentials, and its `Debug` prints them.
+#[derive(Clone)]
 pub struct TelemetryConfig {
     /// ClickHouse's HTTP interface. Credentials in the URL's userinfo are
     /// sent as basic auth; query parameters such as `database` pass through.
@@ -113,7 +116,9 @@ struct Row<'a> {
     event_date_time: u64,
     stage: &'static str,
     slot: u64,
-    slot_start_date_time: u64,
+    /// `None` past what `DateTime` holds: ClickHouse wraps a larger value
+    /// instead of rejecting it.
+    slot_start_date_time: Option<u64>,
     time_into_slot_ms: Option<f64>,
     block_root: String,
     source: &'static str,
@@ -130,7 +135,8 @@ pub(crate) fn encode(event: &BlockEvent, anchor: Anchor, config: &TelemetryConfi
         event_date_time: unix_ns,
         stage: event.stage,
         slot: event.slot,
-        slot_start_date_time: config.clock.slot_start_ms(event.slot) / 1_000,
+        slot_start_date_time: Some(config.clock.slot_start_ms(event.slot) / 1_000)
+            .filter(|seconds| *seconds <= u64::from(u32::MAX)),
         time_into_slot_ms: config.clock.offset_ms(unix_ns, event.slot),
         block_root: format!("0x{}", hex::encode(event.block_root)),
         source: event.source,
@@ -191,22 +197,15 @@ mod tests {
 
         let mut keys: Vec<_> = row.as_object().unwrap().keys().cloned().collect();
         keys.sort();
-        assert_eq!(
-            keys,
-            [
-                "block_root",
-                "column_index",
-                "event_date_time",
-                "meta_client_name",
-                "meta_network_name",
-                "slot",
-                "slot_start_date_time",
-                "source",
-                "stage",
-                "time_into_slot_ms",
-                "verdict",
-            ]
-        );
+        // The table definition is the source of truth for the columns.
+        let mut columns: Vec<_> = crate::writer::DDL
+            .lines()
+            .skip(1)
+            .take_while(|line| !line.starts_with(')'))
+            .map(|line| line.split_whitespace().next().unwrap().to_owned())
+            .collect();
+        columns.sort();
+        assert_eq!(keys, columns);
         assert_eq!(
             row["event_date_time"],
             (GENESIS_MS + 2 * SLOT_MS + 300) * 1_000_000
@@ -243,6 +242,19 @@ mod tests {
             .unwrap();
         let earlier = row(&event(earlier_at, 2), anchor);
         assert_eq!(earlier["time_into_slot_ms"], 200.0);
+    }
+
+    #[test]
+    fn the_slot_start_is_null_past_what_datetime_holds() {
+        // ClickHouse wraps a DateTime above u32::MAX seconds rather than
+        // rejecting it, so such a slot must not be sent as one.
+        let anchor = Anchor {
+            instant: Instant::now(),
+            unix_ns: 0,
+        };
+        let row = row(&event(anchor.instant, 1 << 40), anchor);
+        assert!(row["slot_start_date_time"].is_null());
+        assert!(row["time_into_slot_ms"].is_null());
     }
 
     #[test]

@@ -49,3 +49,22 @@ pub fn emit(build: impl FnOnce() -> Vec<BlockEvent>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    /// No test in this crate calls `install`, so the global stays empty here;
+    /// keep it that way, or this one would race it.
+    #[test]
+    fn emit_builds_nothing_when_telemetry_is_not_installed() {
+        let built = Cell::new(false);
+        emit(|| {
+            built.set(true);
+            Vec::new()
+        });
+        assert!(!built.get());
+    }
+}
