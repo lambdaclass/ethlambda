@@ -10,8 +10,8 @@
 //!   stateful checks stopped early or never ran;
 //! - every `DataColumnsByRoot` and `DataColumnsByRange` answer;
 //! - sidecars the chain actor was told to hold, handed back once the block
-//!   they wait on imported (`BlockChainToP2P::check_data_column_sidecars`): a fulu
-//!   sidecar's parent, a gloas sidecar's own block.
+//!   they wait on imported (`BlockChainToP2P::check_data_column_sidecars`): a
+//!   fulu sidecar's parent, a gloas sidecar's own block.
 //!
 //! Each sidecar is checked on a blocking thread, bounded by
 //! [`P2PServer::column_check_permits`]. Unlike a gossip verdict, nothing here
@@ -60,16 +60,15 @@ impl ColumnArrival {
     }
 }
 
-/// The rows of a sidecar that passed validation at `at`: its arrival (unless
-/// it is a re-check) and its validation. Gossip-accepted columns and this
-/// node's own call this directly, as they need no check of their own.
-pub(crate) fn passed_rows(
+/// One `block_events` row for `sidecar`: the one place its fields are named,
+/// so the root (a header hash for a fulu sidecar) is computed per row built.
+fn column_event(
+    stage: &'static str,
     sidecar: &DataColumnSidecar,
-    arrival: ColumnArrival,
+    source: &'static str,
     at: Instant,
-) -> Vec<BlockEvent> {
-    let source = arrival.source();
-    let row = |stage, at| BlockEvent {
+) -> BlockEvent {
+    BlockEvent {
         stage,
         at,
         slot: sidecar.slot(),
@@ -77,13 +76,30 @@ pub(crate) fn passed_rows(
         source,
         verdict: None,
         column_index: Some(sidecar.index()),
-    };
-    let mut rows = Vec::with_capacity(2);
-    if let ColumnArrival::Received { at, .. } = arrival {
-        rows.push(row("column_recv", at));
     }
-    rows.push(row("column_validated", at));
-    rows
+}
+
+/// The rows of a sidecar that passed validation at `validated_at`: its arrival
+/// (unless it is a re-check) and its validation. Gossip-accepted columns and
+/// this node's own columns call this directly, as they need no check of their
+/// own.
+pub(crate) fn passed_rows(
+    sidecar: &DataColumnSidecar,
+    arrival: ColumnArrival,
+    validated_at: Instant,
+) -> Vec<BlockEvent> {
+    let validated = column_event("column_validated", sidecar, arrival.source(), validated_at);
+    match arrival {
+        ColumnArrival::Received { at, .. } => vec![
+            BlockEvent {
+                stage: "column_recv",
+                at,
+                ..validated
+            },
+            validated,
+        ],
+        ColumnArrival::Recheck => vec![validated],
+    }
 }
 
 /// The rows one checked sidecar writes (see [`check_and_forward`]): its
@@ -99,15 +115,9 @@ pub(crate) fn column_rows(
     match verdict {
         ChainVerdict::Keep => passed_rows(sidecar, arrival, checked_at),
         ChainVerdict::AwaitParent => match arrival {
-            ColumnArrival::Received { source, at } => vec![BlockEvent {
-                stage: "column_recv",
-                at,
-                slot: sidecar.slot(),
-                block_root: sidecar.block_root().0,
-                source,
-                verdict: None,
-                column_index: Some(sidecar.index()),
-            }],
+            ColumnArrival::Received { source, at } => {
+                vec![column_event("column_recv", sidecar, source, at)]
+            }
             ColumnArrival::Recheck => Vec::new(),
         },
         ChainVerdict::Drop(_) => Vec::new(),
@@ -328,8 +338,8 @@ mod tests {
 
     /// A gloas sidecar is judged against its own block, not a parent: one
     /// whose block this node has not seen goes back to the chain actor to be
-    /// held for it, and one from a slot that has not started is dropped, so neither
-    /// reaches the batch the chain actor stores unchecked.
+    /// held for it, and one from a slot that has not started is dropped, so
+    /// neither reaches the batch the chain actor stores unchecked.
     #[tokio::test]
     async fn a_gloas_sidecar_for_an_unknown_block_is_held_and_a_future_one_dropped() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
@@ -392,14 +402,18 @@ mod tests {
             rows(column_rows(&sidecar, fresh, ChainVerdict::Keep, checked)),
             [("column_recv", arrived), ("column_validated", checked)]
         );
+        let awaiting = column_rows(&sidecar, fresh, ChainVerdict::AwaitParent, checked);
         assert_eq!(
-            rows(column_rows(
-                &sidecar,
-                fresh,
-                ChainVerdict::AwaitParent,
-                checked
-            )),
-            [("column_recv", arrived)]
+            awaiting,
+            [BlockEvent {
+                stage: "column_recv",
+                at: arrived,
+                slot: 5,
+                block_root: [9; 32],
+                source: "by_root",
+                verdict: None,
+                column_index: Some(48),
+            }]
         );
         let stored = ChainVerdict::Drop(Outcome::Ignore(IgnoreReason::AlreadyStored));
         assert!(column_rows(&sidecar, fresh, stored, checked).is_empty());
