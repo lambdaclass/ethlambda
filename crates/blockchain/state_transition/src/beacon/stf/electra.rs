@@ -780,9 +780,11 @@ pub fn process_attestation(
 
         let mut new_flags: ParticipationFlags = 0;
         // The attester's validator is read at most once, on the first flag
-        // it newly earns: each read is a tree descent, and the effective
-        // balance cannot change inside this read-only phase.
-        let mut attester_increments: Option<Gwei> = None;
+        // it newly earns: each read is a tree descent, and neither the
+        // effective balance nor `slashed` can change inside this read-only
+        // phase. The target-balance delta below needs the same two values, so
+        // both are kept rather than read again.
+        let mut attester: Option<(Gwei, bool)> = None;
         for &flag_index in &participation_flag_indices {
             if has_flag(current_flags, flag_index) {
                 continue;
@@ -792,15 +794,16 @@ pub fn process_attestation(
             // `get_base_reward(state, index)` inlined against the hoisted
             // per-increment value above, keeping the helper's own order of
             // operations so the result is bit-identical.
-            let increments = match attester_increments {
-                Some(increments) => increments,
+            let (effective_balance, _) = match attester {
+                Some(attester) => attester,
                 None => {
-                    let increments = state.validator(index)?.effective_balance
-                        / preset::EFFECTIVE_BALANCE_INCREMENT;
-                    attester_increments = Some(increments);
-                    increments
+                    let validator = state.validator(index)?;
+                    let read = (validator.effective_balance, validator.slashed);
+                    attester = Some(read);
+                    read
                 }
             };
+            let increments = effective_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
             let reward = (increments * base_reward_per_increment)
                 .checked_mul(weight)
                 .ok_or(Error::ArithmeticOverflow(
@@ -813,7 +816,11 @@ pub fn process_attestation(
         if let Some(delta) = target_delta
             && has_flag(new_flags, constants::TIMELY_TARGET_FLAG_INDEX)
         {
-            delta.record_new_target(current_epoch_target, state.validator(index)?);
+            // Earning the target flag means the loop above reached that flag
+            // and so read the attester.
+            let (effective_balance, slashed) =
+                attester.expect("a newly earned flag read the attester");
+            delta.record_new_target(current_epoch_target, effective_balance, slashed);
         }
         if new_flags != 0 {
             updates.push((index, new_flags));

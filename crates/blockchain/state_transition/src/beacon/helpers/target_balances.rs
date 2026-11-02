@@ -48,7 +48,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use ethlambda_storage::{TargetBalanceCache, TargetBalances};
 
 use crate::beacon::containers::BeaconState;
-use crate::beacon::containers::{SignedBeaconBlock, Validator};
+use crate::beacon::containers::SignedBeaconBlock;
 use crate::beacon::error::Result;
 use crate::beacon::primitives::{Epoch, Gwei, Root};
 
@@ -77,11 +77,21 @@ impl PartialEq for TargetBalanceDelta {
 impl Eq for TargetBalanceDelta {}
 
 impl TargetBalanceDelta {
-    /// Records that `validator` just earned TIMELY_TARGET in the current or
-    /// previous epoch's participation. A slashed validator is not counted, as
-    /// the specification's unslashed participating set excludes it.
-    pub fn record_new_target(&self, current_epoch_target: bool, validator: &Validator) {
-        if validator.slashed {
+    /// Records that a validator with `effective_balance` just earned
+    /// TIMELY_TARGET in the current or previous epoch's participation. A
+    /// `slashed` validator is not counted, as the specification's unslashed
+    /// participating set excludes it.
+    ///
+    /// Takes the two fields rather than the validator, so the caller, which
+    /// has already read the validator for the reward, does not descend the
+    /// registry a second time.
+    pub fn record_new_target(
+        &self,
+        current_epoch_target: bool,
+        effective_balance: Gwei,
+        slashed: bool,
+    ) {
+        if slashed {
             return;
         }
         let side = if current_epoch_target {
@@ -91,7 +101,7 @@ impl TargetBalanceDelta {
         };
         let total = side
             .load(Ordering::Relaxed)
-            .saturating_add(validator.effective_balance);
+            .saturating_add(effective_balance);
         side.store(total, Ordering::Relaxed);
     }
 
@@ -191,20 +201,12 @@ pub fn block_has_slashings(block: &SignedBeaconBlock) -> bool {
 mod tests {
     use super::*;
 
-    fn validator(effective_balance: Gwei, slashed: bool) -> Validator {
-        Validator {
-            effective_balance,
-            slashed,
-            ..Default::default()
-        }
-    }
-
     #[test]
     fn a_delta_skips_slashed_validators_and_splits_by_epoch() {
         let delta = TargetBalanceDelta::default();
-        delta.record_new_target(false, &validator(32, false));
-        delta.record_new_target(true, &validator(16, false));
-        delta.record_new_target(true, &validator(64, true));
+        delta.record_new_target(false, 32, false);
+        delta.record_new_target(true, 16, false);
+        delta.record_new_target(true, 64, true);
         assert_eq!((delta.previous(), delta.current()), (32, 16));
     }
 
@@ -219,7 +221,7 @@ mod tests {
         };
         cache.insert(parent, totals);
         let delta = TargetBalanceDelta::default();
-        delta.record_new_target(true, &validator(7, false));
+        delta.record_new_target(true, 7, false);
 
         let extended = extend_parent_totals(&cache, &parent, 5, &delta).unwrap();
         assert_eq!((extended.previous, extended.current), (100, 17));
