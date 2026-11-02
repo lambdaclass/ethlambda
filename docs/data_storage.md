@@ -480,7 +480,11 @@ import. That ordering is what lets the availability
 gate read a block's columns before the block itself is allowed to import (a
 column has to exist first for the gate to find it), and what lets a restart
 keep every sidecar this node already paid a KZG batch to verify rather than
-re-fetching and re-verifying them. One consequence: a sidecar is stored for
+re-fetching and re-verifying them. The same property is what lets block import
+(and a gloas envelope's import) treat a present column as verified: the availability
+gate checks presence only and hands fork choice `DataAvailability::ColumnsVerified`,
+so the stored sidecars are not decoded and their KZG proofs are not checked a second
+time. One consequence: a sidecar is stored for
 any block whose header, parent and proposer check out, whether or not that
 block ever actually imports — an equivocation or an orphaned fork's sidecars
 land here too, since gossip only requires a known, unfinalized parent, not a
