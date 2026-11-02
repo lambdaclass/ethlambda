@@ -18,7 +18,6 @@ use std::time::Instant;
 
 use ethlambda_network_api::{AggregateArrival, BlockAnnouncement, BlockArrival, BlockSource};
 use ethlambda_state_transition::beacon::builder_market::SharedBuilderMarket;
-use ethlambda_state_transition::beacon::gossip::column::ChainVerdict;
 use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome};
 use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCacheExt as _;
 use ethlambda_storage::{CacheKey, Store};
@@ -352,11 +351,14 @@ impl Validated {
                     .inspect_err(|err| warn!(%err, "Failed to forward a gossip block"));
             }
             Self::Column(sidecar) if outcome == Outcome::Accept => {
+                // Accept means gossip already ran every rule. This instant is
+                // taken in `forward`, after the verdict's trip back through
+                // the p2p actor, where `check_and_forward` takes the instant
+                // its check finished.
                 ethlambda_telemetry::emit(|| {
-                    column_checks::column_rows(
+                    column_checks::passed_rows(
                         &sidecar,
                         column_checks::ColumnArrival::received("gossip", received_at),
-                        &ChainVerdict::Keep,
                         Instant::now(),
                     )
                 });

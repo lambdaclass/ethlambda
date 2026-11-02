@@ -1856,7 +1856,7 @@ impl Handler<CheckDataColumnSidecars> for P2PServer {
         beacon::column_checks::check_and_forward(
             self,
             msg.sidecars,
-            beacon::column_checks::ColumnArrival::RECHECK,
+            beacon::column_checks::ColumnArrival::Recheck,
         );
     }
 }

@@ -9,7 +9,6 @@ use std::time::Instant;
 
 use ethlambda_network_api::{AggregateArrival, BlockAnnouncement, BlockArrival, BlockSource};
 use ethlambda_state_transition::beacon::das;
-use ethlambda_state_transition::beacon::gossip::column::ChainVerdict;
 use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome, RejectReason};
 use ethlambda_types::{
     ShortRoot,
@@ -35,6 +34,7 @@ use super::{
         attestation_subnet_topic, topic_kind,
     },
 };
+use crate::beacon::column_checks::{ColumnArrival, check_and_forward, passed_rows};
 use crate::beacon::constants::ATTESTATION_SUBNET_COUNT;
 use crate::beacon::decode::BeaconGossip;
 use crate::beacon::verdict::{self, Dispatch, GossipId, Validated};
@@ -983,18 +983,12 @@ pub async fn publish_beacon_block(
             .collect();
         if !custody.is_empty() {
             let now = Instant::now();
+            // This node built these columns, so they are trusted without a check.
             ethlambda_telemetry::emit(|| {
-                let arrival = crate::beacon::column_checks::ColumnArrival::received("local", now);
+                let arrival = ColumnArrival::received("local", now);
                 custody
                     .iter()
-                    .flat_map(|sidecar| {
-                        crate::beacon::column_checks::column_rows(
-                            sidecar,
-                            arrival,
-                            &ChainVerdict::Keep,
-                            now,
-                        )
-                    })
+                    .flat_map(|sidecar| passed_rows(sidecar, arrival, now))
                     .collect()
             });
             let _ = blockchain
@@ -1102,10 +1096,10 @@ pub async fn publish_execution_payload_envelope(
             .new_execution_payload_envelope(Box::new(envelope), BlockArrival::now())
             .inspect_err(|err| error!(%err, "Failed to hand the published envelope to the chain"));
     }
-    crate::beacon::column_checks::check_and_forward(
+    check_and_forward(
         server,
         sidecars,
-        crate::beacon::column_checks::ColumnArrival::received("local", Instant::now()),
+        ColumnArrival::received("local", Instant::now()),
     );
 }
 
