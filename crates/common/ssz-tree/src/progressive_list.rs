@@ -10,7 +10,7 @@ use libssz_merkle::{HashTreeRoot, Sha2Hasher, Sha256Hasher, hash_nodes, mix_in_l
 use libssz_types::TypeError;
 
 use crate::cursor::{ElemCow, IterCow};
-use crate::interface::Interface;
+use crate::interface::{Interface, SortedReader};
 use crate::iter::Iter;
 use crate::update_map::{UpdateMap, VecMap};
 use crate::{Hash256, Value, packing_factor};
@@ -95,6 +95,50 @@ impl<T: Value, U: UpdateMap<T>> ProgressiveList<T, U> {
     pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
         let (k, offset) = self.locate(index)?;
         self.subtrees[k].get_mut(offset)
+    }
+
+    /// Buffers `value` as the new value of the element at `index`, without
+    /// reading the old one. Returns `false`, writing nothing, past the end.
+    #[must_use = "a write past the end is refused"]
+    pub fn set(&mut self, index: usize, value: T) -> bool {
+        match self.locate(index) {
+            Some((k, offset)) => self.subtrees[k].set(offset, value),
+            None => false,
+        }
+    }
+
+    /// A reader for non-decreasing indices. See [`ProgressiveSortedReader`].
+    pub fn sorted_reader(&self) -> ProgressiveSortedReader<'_, T, U> {
+        let mut start = 0;
+        let subtrees = self
+            .subtrees
+            .iter()
+            .map(|subtree| {
+                let entry = (start, subtree.sorted_reader());
+                start += subtree.len();
+                entry
+            })
+            .collect();
+        ProgressiveSortedReader {
+            subtrees,
+            current: 0,
+            last: 0,
+        }
+    }
+
+    /// A list of `len` copies of `value`, sharing identical subtrees as
+    /// [`List::repeat`](crate::List::repeat) does, within each of its
+    /// subtrees.
+    pub fn repeat(value: T, len: usize) -> Self {
+        let mut subtrees = Vec::new();
+        let mut remaining = len;
+        while remaining > 0 {
+            let k = subtrees.len();
+            let count = remaining.min(Self::capacity(k));
+            subtrees.push(Interface::repeat(&value, count, Self::height(k)));
+            remaining -= count;
+        }
+        Self { subtrees }
     }
 
     /// Buffers `value` as the new last element.
@@ -201,6 +245,37 @@ impl<T: Value, U: UpdateMap<T>> ProgressiveList<T, U> {
         self.subtrees.iter().rev().fold([0u8; 32], |rest, subtree| {
             hash_nodes(&Sha2Hasher, &subtree.root(), &rest)
         })
+    }
+}
+
+/// Reads a [`ProgressiveList`] at non-decreasing indices, one
+/// [`SortedReader`] per subtree: see [`ProgressiveList::sorted_reader`].
+pub struct ProgressiveSortedReader<'a, T, U> {
+    /// Each subtree's first index and its reader.
+    subtrees: Vec<(usize, SortedReader<'a, T, U>)>,
+    /// The subtree the previous read was in.
+    current: usize,
+    /// The previous index, to check the order in debug builds.
+    last: usize,
+}
+
+impl<'a, T: Value, U: UpdateMap<T>> ProgressiveSortedReader<'a, T, U> {
+    /// The element at `index`, or `None` past the end. `index` must not be
+    /// below the previous call's (checked in debug builds).
+    pub fn get(&mut self, index: usize) -> Option<&'a T> {
+        debug_assert!(
+            index >= self.last,
+            "sorted reader read {index} after {}",
+            self.last
+        );
+        self.last = index;
+        while let Some((start, reader)) = self.subtrees.get_mut(self.current) {
+            if index < *start + reader.len() {
+                return reader.get(index - *start);
+            }
+            self.current += 1;
+        }
+        None
     }
 }
 
@@ -430,3 +505,56 @@ impl<'a, T: Value, U: UpdateMap<T>> Iterator for ProgressiveIter<'a, T, U> {
 impl<T: Value, U: UpdateMap<T>> ExactSizeIterator for ProgressiveIter<'_, T, U> {}
 
 impl<T: Value, U: UpdateMap<T>> FusedIterator for ProgressiveIter<'_, T, U> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn root<L: HashTreeRoot>(list: &L) -> Hash256 {
+        list.hash_tree_root(&Sha2Hasher)
+    }
+
+    #[test]
+    fn repeat_hashes_and_reads_like_the_list_built_from_a_vec() {
+        // Around each subtree's capacity (32, 128, 512, ... entries of u8).
+        for len in [
+            0usize, 1, 31, 32, 33, 159, 160, 161, 700, 2_720, 2_721, 50_000,
+        ] {
+            let repeated = ProgressiveList::<u8>::repeat(7, len);
+            let built = ProgressiveList::<u8>::from(vec![7u8; len]);
+            assert_eq!(repeated.len(), len, "len {len}");
+            assert_eq!(root(&repeated), root(&built), "len {len}");
+            assert_eq!(repeated.to_ssz(), built.to_ssz(), "len {len}");
+            assert_eq!(repeated, built, "len {len}");
+        }
+    }
+
+    #[test]
+    fn a_write_to_a_repeated_list_leaves_its_clone_and_siblings_alone() {
+        let mut list = ProgressiveList::<u8>::repeat(0, 9_000);
+        let snapshot = list.clone();
+        assert!(list.set(5_000, 3));
+        assert!(!list.set(9_000, 3));
+        list.apply_updates();
+        let mut expected = vec![0u8; 9_000];
+        expected[5_000] = 3;
+        assert_eq!(list.to_vec(), expected);
+        assert_eq!(snapshot.to_vec(), vec![0u8; 9_000]);
+        assert_eq!(root(&list), root(&ProgressiveList::<u8>::from(expected)));
+    }
+
+    #[test]
+    fn a_sorted_reader_agrees_with_get_across_subtrees_and_pending_writes() {
+        let values: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        let mut list = ProgressiveList::<u8>::from(values);
+        assert!(list.set(40, 200));
+        assert!(list.set(9_999, 201));
+        list.push(202).unwrap();
+        let mut reader = list.sorted_reader();
+        for index in (0..list.len() + 3).step_by(3) {
+            assert_eq!(reader.get(index), list.get(index), "index {index}");
+        }
+        assert_eq!(list.sorted_reader().get(10_000), Some(&202));
+        assert_eq!(list.sorted_reader().get(10_001), None);
+    }
+}

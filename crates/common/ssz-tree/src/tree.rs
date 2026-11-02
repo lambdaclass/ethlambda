@@ -163,6 +163,66 @@ impl<T: Value> Tree<T> {
         (Self::from_leaves(leaves, leaf_height, depth), len)
     }
 
+    /// Builds a tree of height `depth` holding `len` copies of `value`,
+    /// sharing every identical subtree instead of building it again.
+    ///
+    /// All full leaves are one allocation, and so are all the full inner nodes
+    /// at each level, each caching its hash once for every place it appears.
+    /// Building and hashing is therefore proportional to the tree's height
+    /// plus the partial leaf at the right edge, not to `len`. The nodes are
+    /// immutable and every write copies the path it touches, so the sharing is
+    /// never observable.
+    ///
+    /// # Panics
+    ///
+    /// If `len` elements do not fit in a tree of height `depth`. Callers check
+    /// the type's limit first.
+    pub(crate) fn repeat(value: &T, len: usize, depth: usize) -> Arc<Self> {
+        if len == 0 {
+            return Arc::new(Tree::Zero(depth));
+        }
+        let leaf_height = leaf_height::<T>(depth);
+        let per_leaf = packing_factor::<T>() << leaf_height;
+        let mut full_count = len / per_leaf;
+        let tail_len = len % per_leaf;
+        let levels = depth - leaf_height;
+        assert!(
+            levels >= usize::BITS as usize || full_count + usize::from(tail_len > 0) <= 1 << levels,
+            "{len} values do not fit in a tree of depth {depth}"
+        );
+        // The shared full node of the level being built, if it has any.
+        let mut full =
+            (full_count > 0).then(|| Arc::new(Self::leaf(vec![value.clone(); per_leaf], None)));
+        // The one partial node at the right edge of the level, if any.
+        let mut tail =
+            (tail_len > 0).then(|| Arc::new(Self::leaf(vec![value.clone(); tail_len], None)));
+        let mut height = leaf_height;
+        while height < depth {
+            let parent = (height + NODE_LEVELS).min(depth);
+            debug_assert_eq!(child_height::<T>(parent), height);
+            let fan_out = 1 << (parent - height);
+            let rest = full_count % fan_out;
+            let tail_children: Vec<Arc<Self>> = full
+                .iter()
+                .flat_map(|full| std::iter::repeat_n(Arc::clone(full), rest))
+                .chain(tail.take())
+                .collect();
+            let next_full = full
+                .as_ref()
+                .filter(|_| full_count >= fan_out)
+                .map(|full| Arc::new(Self::node(vec![Arc::clone(full); fan_out])));
+            tail = (!tail_children.is_empty()).then(|| Arc::new(Self::node(tail_children)));
+            full_count /= fan_out;
+            full = next_full;
+            height = parent;
+        }
+        match (full, tail) {
+            (Some(root), None) if full_count == 1 => root,
+            (None, Some(root)) => root,
+            _ => unreachable!("a tree that fits groups up into one root"),
+        }
+    }
+
     /// Groups `level`, left to right, from `leaf_height` up into a tree of
     /// height `depth`, [`NODE_LEVELS`] binary levels per inner node.
     fn from_leaves(mut level: Vec<Arc<Self>>, leaf_height: usize, depth: usize) -> Arc<Self> {
@@ -213,6 +273,32 @@ impl<T: Value> Tree<T> {
                 // The leaf covers an aligned run of `packing << height`
                 // elements, so the low bits of `index` are the offset in it.
                 Tree::Leaf(leaf) => return leaf.values.get(index & ((packing << height) - 1)),
+                Tree::Zero(_) => return None,
+            }
+        }
+    }
+
+    /// The leaf holding element `index` of a tree of height `depth`, as the
+    /// index of its first element and its run of elements, or `None` past the
+    /// end of the data. The element itself is `run.get(index - first)`: a
+    /// partial last leaf is shorter than the span it covers.
+    pub(crate) fn leaf_run(&self, index: usize, depth: usize) -> Option<(usize, &[T])> {
+        let packing = packing_factor::<T>();
+        let chunk_index = index / packing;
+        let mut node = self;
+        let mut height = depth;
+        loop {
+            match node {
+                Tree::Node(inner) => {
+                    let below = child_height::<T>(height);
+                    let slot = (chunk_index >> below) & ((1 << (height - below)) - 1);
+                    node = inner.children.get(slot)?;
+                    height = below;
+                }
+                Tree::Leaf(leaf) => {
+                    let first = index & !((packing << height) - 1);
+                    return Some((first, &leaf.values));
+                }
                 Tree::Zero(_) => return None,
             }
         }
