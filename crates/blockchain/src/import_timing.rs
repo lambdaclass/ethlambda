@@ -725,6 +725,17 @@ pub struct HeadTimings {
 }
 
 impl CascadeTimings {
+    /// The `source` this arrival reports under; the same two exclusions a
+    /// block's own sections make (see `ImportTimings::source_label`).
+    fn source_label(&self) -> Option<&'static str> {
+        match self.source {
+            Some(BlockSource::Gossip) => Some("gossip"),
+            Some(BlockSource::Sync) => Some("sync"),
+            Some(BlockSource::Replay) => Some("replay"),
+            Some(BlockSource::Deferred) | None => None,
+        }
+    }
+
     pub fn absorb_head(&mut self, head: HeadTimings) {
         self.head_start = head.head_start;
         self.head_end = head.head_end;
@@ -746,13 +757,8 @@ impl CascadeTimings {
     /// arrival, and dividing one by the other's count is the mistake keeping
     /// them in separate metrics prevents.
     pub fn observe(&self, blocks: usize) {
-        let source = match self.source {
-            Some(BlockSource::Gossip) => "gossip",
-            Some(BlockSource::Sync) => "sync",
-            Some(BlockSource::Replay) => "replay",
-            // Same two exclusions a block's own sections make; see
-            // `ImportTimings::source_label`.
-            Some(BlockSource::Deferred) | None => return,
+        let Some(source) = self.source_label() else {
+            return;
         };
         metrics::observe_block_import_cascade_blocks(blocks);
 
@@ -805,6 +811,80 @@ impl CascadeTimings {
             fcu_ms = fcu.map(|d| format!("{:.2}", ms(d))),
             "Block arrival timing"
         );
+    }
+}
+
+/// What one import cascade did, for its telemetry rows: filled while the
+/// cascade runs, read once its head is recomputed.
+///
+/// Lives on the chain actor rather than on [`CascadeTimings`] because the
+/// arriving block's root is only computed inside `process_or_pend_block`,
+/// and recording it there saves hashing the block a second time.
+#[derive(Debug, Default)]
+pub struct CascadeTelemetry {
+    /// Slot and root of the block whose arrival opened the cascade.
+    pub arrival: Option<(u64, H256)>,
+    /// Blocks this cascade's own state transitions imported, with the
+    /// `source` each reports under.
+    pub imported: Vec<(u64, H256, &'static str)>,
+}
+
+impl CascadeTelemetry {
+    /// The arrival-scope sections, filed under the arriving block when the
+    /// arriving block was imported here, and an `attestable` row at the head
+    /// recomputation's end for every block imported here.
+    pub fn events(&self, cascade: &CascadeTimings) -> Vec<BlockEvent> {
+        let mut events = Vec::new();
+        if let (Some((slot, root)), Some(source)) = (self.arrival, cascade.source_label())
+            && self
+                .imported
+                .iter()
+                .any(|&(_, imported, _)| imported == root)
+        {
+            let marks = [
+                ("cascade_start", cascade.cascade_start),
+                ("cascade_end", cascade.cascade_end),
+                ("prune_start", cascade.prune_start),
+                ("prune_end", cascade.prune_end),
+                ("get_head_start", cascade.head_start),
+                ("get_head_end", cascade.head_end),
+                ("fcu_start", cascade.fcu_start),
+                ("fcu_end", cascade.fcu_end),
+            ];
+            events.extend(
+                marks
+                    .into_iter()
+                    .filter_map(|(stage, at)| Some(row(stage, at?, slot, root, source))),
+            );
+        }
+        // Beacon only: lean recomputes no head per arrival, and its
+        // `attestable` is the block's own `fc_head` end.
+        if let Some(head_end) = cascade.head_end {
+            events.extend(
+                self.imported
+                    .iter()
+                    .map(|&(slot, root, source)| row("attestable", head_end, slot, root, source)),
+            );
+        }
+        events
+    }
+}
+
+fn row(
+    stage: &'static str,
+    at: Instant,
+    slot: u64,
+    root: H256,
+    source: &'static str,
+) -> BlockEvent {
+    BlockEvent {
+        stage,
+        at,
+        slot,
+        block_root: root.0,
+        source,
+        verdict: None,
+        column_index: None,
     }
 }
 
@@ -1354,6 +1434,109 @@ mod tests {
             .unwrap();
         assert_eq!(attestable.at, base + Duration::from_millis(36));
         assert!(events.iter().all(|event| event.verdict.is_none()));
+    }
+
+    fn arrival_cascade(base: Instant) -> CascadeTimings {
+        CascadeTimings {
+            source: Some(BlockSource::Gossip),
+            cascade_start: Some(base),
+            cascade_end: at(base, 50),
+            head_start: at(base, 50),
+            head_end: at(base, 52),
+            fcu_start: at(base, 52),
+            fcu_end: at(base, 60),
+            ..CascadeTimings::default()
+        }
+    }
+
+    #[test]
+    fn an_imported_arrival_files_its_rows_and_every_import_becomes_attestable() {
+        let base = Instant::now();
+        let arriving = H256::repeat_byte(3);
+        let child = H256::repeat_byte(4);
+        let telemetry = CascadeTelemetry {
+            arrival: Some((7, arriving)),
+            imported: vec![(7, arriving, "gossip"), (8, child, "sync")],
+        };
+
+        let events = telemetry.events(&arrival_cascade(base));
+        let rows: Vec<_> = events
+            .iter()
+            .map(|event| (event.stage, event.slot, event.block_root, event.source))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("cascade_start", 7, [3; 32], "gossip"),
+                ("cascade_end", 7, [3; 32], "gossip"),
+                ("get_head_start", 7, [3; 32], "gossip"),
+                ("get_head_end", 7, [3; 32], "gossip"),
+                ("fcu_start", 7, [3; 32], "gossip"),
+                ("fcu_end", 7, [3; 32], "gossip"),
+                ("attestable", 7, [3; 32], "gossip"),
+                ("attestable", 8, [4; 32], "sync"),
+            ]
+        );
+        let head_end = base + Duration::from_millis(52);
+        assert!(
+            events
+                .iter()
+                .filter(|event| event.stage == "attestable")
+                .all(|event| event.at == head_end)
+        );
+    }
+
+    /// A re-delivered block the store already holds reports imported without
+    /// running anything: no arrival rows under it. A child it released and
+    /// that did import is still attestable.
+    #[test]
+    fn a_re_delivered_arrival_files_nothing_under_itself() {
+        let base = Instant::now();
+        let telemetry = CascadeTelemetry {
+            arrival: Some((7, H256::repeat_byte(3))),
+            imported: vec![(8, H256::repeat_byte(4), "gossip")],
+        };
+
+        let events = telemetry.events(&arrival_cascade(base));
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.stage, event.slot))
+                .collect::<Vec<_>>(),
+            [("attestable", 8)]
+        );
+        assert!(
+            CascadeTelemetry::default()
+                .events(&arrival_cascade(base))
+                .is_empty()
+        );
+    }
+
+    /// Lean has no per-arrival head recomputation: its `attestable` comes
+    /// with the block's own rows, so none is written here.
+    #[test]
+    fn a_lean_cascade_writes_no_attestable() {
+        let base = Instant::now();
+        let lean = CascadeTimings {
+            source: Some(BlockSource::Gossip),
+            cascade_start: Some(base),
+            cascade_end: at(base, 40),
+            prune_start: at(base, 40),
+            prune_end: at(base, 41),
+            ..CascadeTimings::default()
+        };
+        let telemetry = CascadeTelemetry {
+            arrival: Some((7, H256::repeat_byte(3))),
+            imported: vec![(7, H256::repeat_byte(3), "gossip")],
+        };
+        assert_eq!(
+            telemetry
+                .events(&lean)
+                .iter()
+                .map(|event| event.stage)
+                .collect::<Vec<_>>(),
+            ["cascade_start", "cascade_end", "prune_start", "prune_end"]
+        );
     }
 
     fn report(timings: ImportTimings) -> BlockImportReport {
