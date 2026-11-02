@@ -34,7 +34,7 @@ use crate::beacon::constants;
 use crate::beacon::containers::{BeaconState, bellatrix};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::helpers::accessors::{
-    ActiveBalanceCache, CommitteeCache, get_current_epoch, get_randao_mix,
+    ActiveBalanceCache, CommitteeCache, PubkeyIndexCache, get_current_epoch, get_randao_mix,
 };
 use crate::beacon::preset;
 use crate::beacon::primitives::{
@@ -63,6 +63,7 @@ use super::ExecutionEngine;
 /// the one fork where a block might still legitimately carry no real payload,
 /// if this chain's merge transition has not happened yet. Every later fork
 /// drops the condition outright, since by then it is always true.
+#[allow(clippy::too_many_arguments)]
 pub fn process_block(
     state: &mut BeaconState,
     block: &bellatrix::BeaconBlock,
@@ -70,6 +71,7 @@ pub fn process_block(
     engine: &ExecutionEngine,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
     options: super::block::BlockProcessingOptions,
 ) -> Result<()> {
     super::block::process_block_header(
@@ -95,7 +97,12 @@ pub fn process_block(
         committees,
         active_balances,
     )?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
+    super::altair::process_sync_aggregate(
+        state,
+        &block.body.sync_aggregate,
+        active_balances,
+        pubkey_indices,
+    )?;
     Ok(())
 }
 

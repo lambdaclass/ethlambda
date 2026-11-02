@@ -24,8 +24,8 @@ use crate::beacon::containers::{self, BeaconBlockHeader, BeaconState, Eth1Data, 
 use crate::beacon::error::{Result, verify};
 use crate::beacon::hash::hash;
 use crate::beacon::helpers::accessors::{
-    ActiveBalanceCache, CommitteeCache, get_beacon_proposer_index, get_current_epoch, get_domain,
-    get_randao_mix,
+    ActiveBalanceCache, CommitteeCache, PubkeyIndexCache, get_beacon_proposer_index,
+    get_current_epoch, get_domain, get_randao_mix,
 };
 use crate::beacon::helpers::math::xor;
 use crate::beacon::helpers::misc::compute_signing_root;
@@ -41,6 +41,7 @@ use super::{ExecutionEngine, bellatrix, capella, deneb, electra, fulu, gloas};
 /// after [`super::process_slots`] has already advanced the state to the block's
 /// slot, so every arm validates and mutates a state already positioned at
 /// `signed_block`'s slot.
+#[allow(clippy::too_many_arguments)]
 pub fn process_block(
     state: &mut BeaconState,
     signed_block: &containers::SignedBeaconBlock,
@@ -48,6 +49,7 @@ pub fn process_block(
     engine: &ExecutionEngine,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
     options: BlockProcessingOptions,
 ) -> Result<()> {
     match signed_block {
@@ -65,6 +67,7 @@ pub fn process_block(
             config,
             committees,
             active_balances,
+            pubkey_indices,
             options,
         ),
         containers::SignedBeaconBlock::Bellatrix(signed) => bellatrix::process_block(
@@ -74,6 +77,7 @@ pub fn process_block(
             engine,
             committees,
             active_balances,
+            pubkey_indices,
             options,
         ),
         containers::SignedBeaconBlock::Capella(signed) => capella::process_block(
@@ -83,6 +87,7 @@ pub fn process_block(
             engine,
             committees,
             active_balances,
+            pubkey_indices,
             options,
         ),
         containers::SignedBeaconBlock::Deneb(signed) => deneb::process_block(
@@ -92,6 +97,7 @@ pub fn process_block(
             engine,
             committees,
             active_balances,
+            pubkey_indices,
             options,
         ),
         containers::SignedBeaconBlock::Electra(signed) => electra::process_block(
@@ -101,6 +107,7 @@ pub fn process_block(
             engine,
             committees,
             active_balances,
+            pubkey_indices,
             options,
         ),
         containers::SignedBeaconBlock::Fulu(signed) => fulu::process_block(
@@ -110,6 +117,7 @@ pub fn process_block(
             engine,
             committees,
             active_balances,
+            pubkey_indices,
             options,
         ),
         // ePBS (EIP-7732) restructures block processing around a builder's
@@ -121,6 +129,7 @@ pub fn process_block(
             config,
             committees,
             active_balances,
+            pubkey_indices,
             options,
         ),
         containers::SignedBeaconBlock::Lean(_) => {
@@ -174,6 +183,7 @@ pub fn process_block_altair(
     config: &Config,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
     options: BlockProcessingOptions,
 ) -> Result<()> {
     process_block_header(
@@ -196,7 +206,12 @@ pub fn process_block_altair(
         committees,
         active_balances,
     )?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
+    super::altair::process_sync_aggregate(
+        state,
+        &block.body.sync_aggregate,
+        active_balances,
+        pubkey_indices,
+    )?;
     Ok(())
 }
 

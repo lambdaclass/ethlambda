@@ -821,11 +821,19 @@ pub fn get_activation_churn_limit(state: &BeaconState, config: &Config) -> Resul
 /// draws from this on a gloas state
 /// rather than electra's combined budget.
 pub fn get_exit_churn_limit(state: &BeaconState, config: &Config) -> Result<Gwei> {
-    let total_active_balance = get_total_active_balance(state)?;
+    Ok(exit_churn_limit_for(
+        get_total_active_balance(state)?,
+        config,
+    ))
+}
+
+/// [`get_exit_churn_limit`] for a caller that already holds the total active
+/// balance, so block processing can take it from the `ActiveBalanceCache`.
+pub(crate) fn exit_churn_limit_for(total_active_balance: Gwei, config: &Config) -> Gwei {
     let churn = config
         .min_per_epoch_churn_limit_electra
         .max(total_active_balance / config.churn_limit_quotient_gloas);
-    Ok(churn - churn % preset::EFFECTIVE_BALANCE_INCREMENT)
+    churn - churn % preset::EFFECTIVE_BALANCE_INCREMENT
 }
 
 /// The per-epoch churn limit reserved for consolidations, in Gwei.
@@ -839,9 +847,17 @@ pub fn get_exit_churn_limit(state: &BeaconState, config: &Config) -> Result<Gwei
 /// [`Config::min_per_epoch_churn_limit_electra`] the way the activation and
 /// exit limits are.
 pub fn get_consolidation_churn_limit(state: &BeaconState, config: &Config) -> Result<Gwei> {
-    let total_active_balance = get_total_active_balance(state)?;
+    Ok(consolidation_churn_limit_for(
+        get_total_active_balance(state)?,
+        config,
+    ))
+}
+
+/// [`get_consolidation_churn_limit`] for a caller that already holds the total
+/// active balance.
+pub(crate) fn consolidation_churn_limit_for(total_active_balance: Gwei, config: &Config) -> Gwei {
     let churn = total_active_balance / config.consolidation_churn_limit_quotient;
-    Ok(churn - churn % preset::EFFECTIVE_BALANCE_INCREMENT)
+    churn - churn % preset::EFFECTIVE_BALANCE_INCREMENT
 }
 
 // ---------------------------------------------------------------------------

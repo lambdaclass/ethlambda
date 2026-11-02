@@ -31,9 +31,9 @@ use crate::beacon::constants;
 use crate::beacon::containers::{BeaconState, altair, phase0};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::helpers::accessors::{
-    ActiveBalanceCache, ActiveBalanceCacheExt, CommitteeCache, CommitteeCacheExt,
-    get_beacon_proposer_index, get_block_root_at_slot, get_current_epoch, get_domain,
-    get_previous_epoch,
+    ActiveBalanceCache, ActiveBalanceCacheExt, CommitteeCache, CommitteeCacheExt, PubkeyIndexCache,
+    PubkeyIndexCacheExt, get_beacon_proposer_index, get_block_root_at_slot, get_current_epoch,
+    get_domain, get_previous_epoch,
 };
 use crate::beacon::helpers::altair::{
     add_flag, base_reward_per_increment, get_attestation_participation_flag_indices, has_flag,
@@ -284,9 +284,10 @@ pub fn process_attestation(
 /// there is no independently-derived penalty formula that could drift out of
 /// sync with the reward one.
 ///
-/// Resolving each committee seat's validator index needs a linear scan of
-/// `state.validators` (sync committee membership is recorded as pubkeys, not
-/// indices), and the specification does that scan inside the very loop that
+/// Resolving each committee seat's validator index is, in the specification, a
+/// linear scan of `state.validators` (sync committee membership is recorded as
+/// pubkeys, not indices); here it goes through the [`PubkeyIndexCache`], with
+/// that scan as the fallback. The specification does the scan inside the very loop that
 /// also calls `get_beacon_proposer_index` and adjusts balances. Doing the scan
 /// there would need `state` borrowed immutably (to search) and mutably (to
 /// pay or penalize) at the same time, which does not borrow-check; this
@@ -304,6 +305,7 @@ pub fn process_sync_aggregate(
     state: &mut BeaconState,
     sync_aggregate: &altair::SyncAggregate,
     active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
 ) -> Result<()> {
     let committee_bits = &sync_aggregate.sync_committee_bits;
 
@@ -341,37 +343,25 @@ pub fn process_sync_aggregate(
     // own scan of `state.validators` the way the specification's single loop
     // does.
     //
-    // One pass over the registry, not one per seat. The specification writes
-    // this as a search per committee member, which is `SYNC_COMMITTEE_SIZE`
-    // scans of the whole validator set: at mainnet's ~1M validators that is
-    // hundreds of millions of 48-byte pubkey comparisons per block, and it was
-    // measured as the single largest cost in a live import, dwarfing the
-    // signature verification above it. Inverting the loop makes it one scan
-    // against a committee-sized map.
-    //
-    // A pubkey may hold more than one seat, since sync-committee selection
-    // samples with replacement, so each key maps to every seat it occupies
-    // rather than to one.
-    let mut seats_by_pubkey: HashMap<&BlsPubkey, Vec<usize>> = HashMap::new();
-    for (seat, pubkey) in committee_pubkeys.iter().enumerate() {
-        seats_by_pubkey.entry(pubkey).or_default().push(seat);
-    }
-    let mut resolved: Vec<Option<ValidatorIndex>> = vec![None; committee_pubkeys.len()];
-    for (index, validator) in state.iter_validators().enumerate() {
-        if let Some(seats) = seats_by_pubkey.get(&validator.pubkey) {
-            for &seat in seats {
-                resolved[seat] = Some(index as ValidatorIndex);
-            }
+    // Through the pubkey index cache: the specification writes this as a
+    // search per committee member, which at mainnet's registry size was the
+    // largest single cost of a live import (a hash probe per validator, every
+    // block), where the cache answers each seat with a lookup and one
+    // verifying tree descent.
+    let cached: Option<Vec<ValidatorIndex>> = committee_pubkeys
+        .iter()
+        .map(|pubkey| pubkey_indices.verified_index(state, pubkey))
+        .collect();
+    let committee_indices = match cached {
+        Some(indices) => {
+            crate::metrics::inc_pubkey_index_lookups("hit", indices.len() as u64);
+            indices
         }
-    }
-    let committee_indices: Vec<ValidatorIndex> = resolved
-        .into_iter()
-        .map(|index| {
-            index.ok_or(Error::SpecAssert(
-                "state.current_sync_committee.pubkeys[i] in [v.pubkey for v in state.validators]",
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
+        None => {
+            crate::metrics::inc_pubkey_index_lookups("fallback", committee_pubkeys.len() as u64);
+            resolve_sync_committee_by_scan(state, committee_pubkeys)?
+        }
+    };
 
     let total_active_balance = active_balances.total_active_balance(state)?;
     let total_active_increments = total_active_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
@@ -413,6 +403,44 @@ pub fn process_sync_aggregate(
     }
 
     Ok(())
+}
+
+/// Every committee seat's validator index, by one pass over the registry:
+/// the fallback for a seat the pubkey index cache could not verify.
+///
+/// One pass, not one per seat. The specification writes this as a search per
+/// committee member, which is `SYNC_COMMITTEE_SIZE` scans of the whole
+/// validator set: at mainnet's ~1M validators that is hundreds of millions of
+/// 48-byte pubkey comparisons per block. Inverting the loop makes it one scan
+/// against a committee-sized map.
+///
+/// A pubkey may hold more than one seat, since sync-committee selection
+/// samples with replacement, so each key maps to every seat it occupies
+/// rather than to one.
+fn resolve_sync_committee_by_scan(
+    state: &BeaconState,
+    committee_pubkeys: &[BlsPubkey],
+) -> Result<Vec<ValidatorIndex>> {
+    let mut seats_by_pubkey: HashMap<&BlsPubkey, Vec<usize>> = HashMap::new();
+    for (seat, pubkey) in committee_pubkeys.iter().enumerate() {
+        seats_by_pubkey.entry(pubkey).or_default().push(seat);
+    }
+    let mut resolved: Vec<Option<ValidatorIndex>> = vec![None; committee_pubkeys.len()];
+    for (index, validator) in state.iter_validators().enumerate() {
+        if let Some(seats) = seats_by_pubkey.get(&validator.pubkey) {
+            for &seat in seats {
+                resolved[seat] = Some(index as ValidatorIndex);
+            }
+        }
+    }
+    resolved
+        .into_iter()
+        .map(|index| {
+            index.ok_or(Error::SpecAssert(
+                "state.current_sync_committee.pubkeys[i] in [v.pubkey for v in state.validators]",
+            ))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -711,8 +739,13 @@ mod tests {
             .map(|index| state.balance(index).unwrap())
             .collect();
 
-        process_sync_aggregate(&mut state, &sync_aggregate, &ActiveBalanceCache::default())
-            .unwrap();
+        process_sync_aggregate(
+            &mut state,
+            &sync_aggregate,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
 
         // Independently derived expected rewards, sharing only the
         // already-tested building blocks (`get_total_active_balance`,
@@ -777,8 +810,13 @@ mod tests {
             sync_committee_signature: BlsSignature::default(),
         };
         assert!(
-            process_sync_aggregate(&mut state.clone(), &wrong, &ActiveBalanceCache::default())
-                .is_err(),
+            process_sync_aggregate(
+                &mut state.clone(),
+                &wrong,
+                &ActiveBalanceCache::default(),
+                &PubkeyIndexCache::default()
+            )
+            .is_err(),
             "the all-zero signature is not the point at infinity, so this must be rejected"
         );
 
@@ -787,7 +825,13 @@ mod tests {
             sync_committee_signature: g2_point_at_infinity(),
         };
         let balance_before = state.balance(0).unwrap();
-        process_sync_aggregate(&mut state, &correct, &ActiveBalanceCache::default()).unwrap();
+        process_sync_aggregate(
+            &mut state,
+            &correct,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
 
         // The sole validator holds every seat and none of them participated,
         // so it is penalized once per seat and the proposer (itself, the only

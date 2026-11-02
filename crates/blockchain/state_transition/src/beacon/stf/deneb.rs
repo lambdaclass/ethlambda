@@ -36,7 +36,7 @@ use crate::beacon::containers::{BeaconState, deneb, phase0};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::hash::hash;
 use crate::beacon::helpers::accessors::{
-    ActiveBalanceCache, ActiveBalanceCacheExt, CommitteeCache, CommitteeCacheExt,
+    ActiveBalanceCache, ActiveBalanceCacheExt, CommitteeCache, CommitteeCacheExt, PubkeyIndexCache,
     get_beacon_proposer_index, get_block_root, get_block_root_at_slot, get_current_epoch,
     get_previous_epoch, get_randao_mix,
 };
@@ -72,6 +72,7 @@ use super::ExecutionEngine;
 /// [`super::operations::process_operations`] has no fork check of its own to
 /// hang them on. See [`process_operations`]'s own documentation for why that
 /// is a full copy of the loop rather than a smaller patch.
+#[allow(clippy::too_many_arguments)]
 pub fn process_block(
     state: &mut BeaconState,
     block: &deneb::BeaconBlock,
@@ -79,6 +80,7 @@ pub fn process_block(
     engine: &ExecutionEngine,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
     options: super::block::BlockProcessingOptions,
 ) -> Result<()> {
     super::block::process_block_header(
@@ -110,7 +112,12 @@ pub fn process_block(
         committees,
         active_balances,
     )?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
+    super::altair::process_sync_aggregate(
+        state,
+        &block.body.sync_aggregate,
+        active_balances,
+        pubkey_indices,
+    )?;
     Ok(())
 }
 

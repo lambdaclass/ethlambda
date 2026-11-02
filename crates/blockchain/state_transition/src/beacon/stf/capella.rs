@@ -49,7 +49,7 @@ use crate::beacon::containers::{BeaconState, capella, phase0};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::hash::hash;
 use crate::beacon::helpers::accessors::{
-    ActiveBalanceCache, CommitteeCache, get_current_epoch, get_randao_mix,
+    ActiveBalanceCache, CommitteeCache, PubkeyIndexCache, get_current_epoch, get_randao_mix,
 };
 use crate::beacon::helpers::capella::{
     is_fully_withdrawable_validator, is_partially_withdrawable_validator, withdrawal_address,
@@ -72,6 +72,7 @@ use super::ExecutionEngine;
 /// See this module's own documentation for why [`process_withdrawals`] runs
 /// before [`process_operations`], and so before this same block's own
 /// `bls_to_execution_changes` are processed.
+#[allow(clippy::too_many_arguments)]
 pub fn process_block(
     state: &mut BeaconState,
     block: &capella::BeaconBlock,
@@ -79,6 +80,7 @@ pub fn process_block(
     engine: &ExecutionEngine,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
     options: super::block::BlockProcessingOptions,
 ) -> Result<()> {
     super::block::process_block_header(
@@ -104,7 +106,12 @@ pub fn process_block(
         committees,
         active_balances,
     )?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
+    super::altair::process_sync_aggregate(
+        state,
+        &block.body.sync_aggregate,
+        active_balances,
+        pubkey_indices,
+    )?;
     Ok(())
 }
 

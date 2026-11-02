@@ -67,7 +67,9 @@ pub mod operations;
 use crate::beacon::containers;
 use crate::beacon::containers::{BeaconState, phase0};
 use crate::beacon::error::{Error, Result, verify};
-use crate::beacon::helpers::accessors::{ActiveBalanceCache, CommitteeCache, get_domain};
+use crate::beacon::helpers::accessors::{
+    ActiveBalanceCache, CommitteeCache, PubkeyIndexCache, get_domain,
+};
 use crate::beacon::helpers::misc::compute_signing_root;
 use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
@@ -127,6 +129,7 @@ impl ExecutionEngine {
 /// specification requires instead of failing on it. Rejecting the mismatch
 /// before any of that runs is what keeps the failure legible: "wrong fork," not
 /// some unrelated-looking assertion three steps later.
+#[allow(clippy::too_many_arguments)]
 pub fn state_transition(
     state: &mut BeaconState,
     signed_block: &containers::SignedBeaconBlock,
@@ -135,6 +138,7 @@ pub fn state_transition(
     engine: &ExecutionEngine,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
 ) -> Result<()> {
     process_slots(state, signed_block.slot(), config)?;
     apply_block(
@@ -145,6 +149,7 @@ pub fn state_transition(
         engine,
         committees,
         active_balances,
+        pubkey_indices,
     )
 }
 
@@ -157,6 +162,7 @@ pub fn state_transition(
 /// when the block sits exactly on the boundary. A state at the wrong slot is
 /// still refused: the block header check in `process_block` compares the
 /// block's slot with the state's.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_block(
     state: &mut BeaconState,
     signed_block: &containers::SignedBeaconBlock,
@@ -165,6 +171,7 @@ pub fn apply_block(
     engine: &ExecutionEngine,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
 ) -> Result<()> {
     // After `process_slots`, never before it. A block proposed at the first slot
     // of a fork's activation epoch is the *post*-fork shape while the state
@@ -191,6 +198,7 @@ pub fn apply_block(
         engine,
         committees,
         active_balances,
+        pubkey_indices,
         block::BlockProcessingOptions::default(),
     )?;
     // As in `process_slot`: the post-state's root, checked below and needed

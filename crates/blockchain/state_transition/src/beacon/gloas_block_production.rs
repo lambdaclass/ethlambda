@@ -26,8 +26,8 @@ use super::bls;
 use super::config::Config;
 use super::error::{Error, Result, verify};
 use super::helpers::accessors::{
-    ActiveBalanceCache, CommitteeCache, get_beacon_proposer_index, get_current_epoch,
-    get_randao_mix,
+    ActiveBalanceCache, CommitteeCache, PubkeyIndexCache, get_beacon_proposer_index,
+    get_current_epoch, get_randao_mix,
 };
 use super::helpers::gloas::{
     can_builder_cover_bid, get_indexed_payload_attestation, get_ptc, gloas_state_ref,
@@ -91,7 +91,15 @@ pub fn gloas_payload_inputs(
     let parent_bid = &inner.latest_execution_payload_bid;
     let (withdrawals, head_block_hash) = if build_on_full {
         let mut applied = state.clone();
-        stf::gloas::apply_parent_execution_payload(&mut applied, parent_requests, config)?;
+        // A scratch copy used once: fresh caches, as for the rest of block
+        // production.
+        stf::gloas::apply_parent_execution_payload(
+            &mut applied,
+            parent_requests,
+            config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )?;
         (
             stf::gloas::get_expected_withdrawals(&applied)?.withdrawals,
             parent_bid.block_hash,
@@ -409,6 +417,7 @@ pub fn assemble_gloas_block_on_bid(
         config,
         &CommitteeCache::default(),
         &ActiveBalanceCache::default(),
+        &PubkeyIndexCache::default(),
         options,
     )?;
     block.state_root = post.hash_tree_root();
@@ -535,6 +544,7 @@ pub fn assemble_gloas_block(
         config,
         &CommitteeCache::default(),
         &ActiveBalanceCache::default(),
+        &PubkeyIndexCache::default(),
         options,
     )?;
     block.state_root = post.hash_tree_root();
@@ -751,6 +761,7 @@ pub mod test_support {
             &config(),
             &CommitteeCache::default(),
             &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
             BlockProcessingOptions::default(),
         )
         .unwrap();
@@ -915,6 +926,7 @@ mod gloas_block_production_tests {
             &ExecutionEngine::valid(),
             &CommitteeCache::default(),
             &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
             BlockProcessingOptions::default(),
         )
         .unwrap();
@@ -1048,6 +1060,7 @@ mod gloas_block_production_tests {
             &config(),
             &CommitteeCache::default(),
             &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
             skip,
         )
         .unwrap();

@@ -44,7 +44,7 @@ use crate::beacon::config::Config;
 use crate::beacon::containers::{BeaconState, deneb, electra};
 use crate::beacon::error::{Result, verify};
 use crate::beacon::helpers::accessors::{
-    ActiveBalanceCache, CommitteeCache, get_current_epoch, get_randao_mix,
+    ActiveBalanceCache, CommitteeCache, PubkeyIndexCache, get_current_epoch, get_randao_mix,
 };
 use crate::beacon::helpers::electra::pending_queue_fields;
 use crate::beacon::helpers::fulu::{fulu_state, fulu_state_ref};
@@ -61,6 +61,7 @@ use super::ExecutionEngine;
 /// for [`super::electra::process_execution_payload`] and
 /// [`super::electra::process_operations`]. See the module docs for why these
 /// are the only steps this fork's specification asks to change.
+#[allow(clippy::too_many_arguments)]
 pub fn process_block(
     state: &mut BeaconState,
     block: &electra::BeaconBlock,
@@ -68,6 +69,7 @@ pub fn process_block(
     engine: &ExecutionEngine,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
     options: super::block::BlockProcessingOptions,
 ) -> Result<()> {
     super::block::process_block_header(
@@ -81,8 +83,20 @@ pub fn process_block(
     process_execution_payload(state, &block.body, config, engine)?;
     super::block::process_randao(state, &block.body.randao_reveal, options.randao)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
-    process_operations(state, &block.body, config, committees, active_balances)?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
+    process_operations(
+        state,
+        &block.body,
+        config,
+        committees,
+        active_balances,
+        pubkey_indices,
+    )?;
+    super::altair::process_sync_aggregate(
+        state,
+        &block.body.sync_aggregate,
+        active_balances,
+        pubkey_indices,
+    )?;
     Ok(())
 }
 
@@ -224,6 +238,7 @@ pub fn process_operations(
     config: &Config,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
 ) -> Result<()> {
     // [Modified in Fulu]
     verify(body.deposits.is_empty(), "len(body.deposits) == 0")?;
@@ -240,12 +255,18 @@ pub fn process_operations(
     // [Modified in Fulu]
     // Removed `process_deposit`
     for voluntary_exit in body.voluntary_exits.iter() {
-        super::electra::process_voluntary_exit(state, voluntary_exit, config)?;
+        super::electra::process_voluntary_exit(state, voluntary_exit, config, active_balances)?;
     }
     for signed_change in body.bls_to_execution_changes.iter() {
         super::electra::process_bls_to_execution_change(state, signed_change, config)?;
     }
-    process_execution_requests(state, &body.execution_requests, config)?;
+    process_execution_requests(
+        state,
+        &body.execution_requests,
+        config,
+        active_balances,
+        pubkey_indices,
+    )?;
 
     Ok(())
 }
@@ -262,15 +283,29 @@ pub fn process_execution_requests(
     state: &mut BeaconState,
     requests: &electra::ExecutionRequests,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
 ) -> Result<()> {
     for deposit in requests.deposits.iter() {
         process_deposit_request(state, deposit)?;
     }
     for withdrawal in requests.withdrawals.iter() {
-        super::electra::process_withdrawal_request(state, withdrawal, config)?;
+        super::electra::process_withdrawal_request(
+            state,
+            withdrawal,
+            config,
+            active_balances,
+            pubkey_indices,
+        )?;
     }
     for consolidation in requests.consolidations.iter() {
-        super::electra::process_consolidation_request(state, consolidation, config)?;
+        super::electra::process_consolidation_request(
+            state,
+            consolidation,
+            config,
+            active_balances,
+            pubkey_indices,
+        )?;
     }
     Ok(())
 }

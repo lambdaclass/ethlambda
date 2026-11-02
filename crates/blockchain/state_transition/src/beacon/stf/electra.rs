@@ -54,9 +54,9 @@ use crate::beacon::containers::shared::{
 use crate::beacon::containers::{BeaconState, capella, deneb, electra, fulu};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::helpers::accessors::{
-    ActiveBalanceCache, ActiveBalanceCacheExt, CommitteeCache, CommitteeCacheExt,
-    get_beacon_proposer_index, get_block_root, get_block_root_at_slot, get_current_epoch,
-    get_previous_epoch, get_randao_mix,
+    ActiveBalanceCache, ActiveBalanceCacheExt, CommitteeCache, CommitteeCacheExt, PubkeyIndexCache,
+    PubkeyIndexCacheExt, get_beacon_proposer_index, get_block_root, get_block_root_at_slot,
+    get_current_epoch, get_previous_epoch, get_randao_mix,
 };
 use crate::beacon::helpers::altair::{add_flag, base_reward_per_increment, has_flag};
 use crate::beacon::helpers::capella::withdrawal_address;
@@ -489,6 +489,7 @@ pub fn process_voluntary_exit(
     state: &mut BeaconState,
     signed_voluntary_exit: &SignedVoluntaryExit,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     let voluntary_exit = signed_voluntary_exit.message;
     let current_epoch = get_current_epoch(state);
@@ -538,7 +539,12 @@ pub fn process_voluntary_exit(
     )?;
 
     // [Modified in Electra:EIP7251]
-    electra_initiate_validator_exit(state, voluntary_exit.validator_index, config)?;
+    electra_initiate_validator_exit(
+        state,
+        voluntary_exit.validator_index,
+        config,
+        Some(active_balances),
+    )?;
     Ok(())
 }
 
@@ -1188,15 +1194,23 @@ pub fn process_execution_requests(
     state: &mut BeaconState,
     requests: &electra::ExecutionRequests,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
 ) -> Result<()> {
     for deposit in requests.deposits.iter() {
         process_deposit_request(state, deposit)?;
     }
     for withdrawal in requests.withdrawals.iter() {
-        process_withdrawal_request(state, withdrawal, config)?;
+        process_withdrawal_request(state, withdrawal, config, active_balances, pubkey_indices)?;
     }
     for consolidation in requests.consolidations.iter() {
-        process_consolidation_request(state, consolidation, config)?;
+        process_consolidation_request(
+            state,
+            consolidation,
+            config,
+            active_balances,
+            pubkey_indices,
+        )?;
     }
     Ok(())
 }
@@ -1307,6 +1321,8 @@ pub fn process_withdrawal_request(
     state: &mut BeaconState,
     request: &electra::WithdrawalRequest,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
 ) -> Result<()> {
     let amount = request.amount;
     let is_full_exit_request = amount == constants::FULL_EXIT_REQUEST_AMOUNT;
@@ -1321,11 +1337,7 @@ pub fn process_withdrawal_request(
         return Ok(());
     }
 
-    let Some(index) = state
-        .iter_validators()
-        .position(|validator| validator.pubkey == request.validator_pubkey)
-        .map(|index| index as ValidatorIndex)
-    else {
+    let Some(index) = pubkey_indices.validator_index(state, &request.validator_pubkey) else {
         return Ok(());
     };
     let validator = state.validator(index)?;
@@ -1360,7 +1372,7 @@ pub fn process_withdrawal_request(
         // queue; either way, a full exit request never falls through to the
         // partial-withdrawal logic below.
         if pending_balance_to_withdraw == 0 {
-            electra_initiate_validator_exit(state, index, config)?;
+            electra_initiate_validator_exit(state, index, config, Some(active_balances))?;
         }
         return Ok(());
     }
@@ -1388,7 +1400,8 @@ pub fn process_withdrawal_request(
                 "state.balances[index] - MIN_ACTIVATION_BALANCE - pending_balance_to_withdraw",
             ))?
             .min(amount);
-        let exit_queue_epoch = compute_exit_epoch_and_update_churn(state, to_withdraw, config)?;
+        let exit_queue_epoch =
+            compute_exit_epoch_and_update_churn(state, to_withdraw, config, Some(active_balances))?;
         let withdrawable_epoch = exit_queue_epoch
             .checked_add(config.min_validator_withdrawability_delay)
             .ok_or(Error::ArithmeticOverflow(
@@ -1425,17 +1438,16 @@ pub fn process_withdrawal_request(
 pub fn is_valid_switch_to_compounding_request(
     state: &BeaconState,
     request: &electra::ConsolidationRequest,
+    pubkey_indices: &PubkeyIndexCache,
 ) -> Result<bool> {
     if request.source_pubkey != request.target_pubkey {
         return Ok(false);
     }
 
-    let Some(source_validator) = state
-        .iter_validators()
-        .find(|validator| validator.pubkey == request.source_pubkey)
-    else {
+    let Some(source_index) = pubkey_indices.validator_index(state, &request.source_pubkey) else {
         return Ok(false);
     };
+    let source_validator = state.validator(source_index)?;
 
     if withdrawal_address(source_validator) != request.source_address {
         return Ok(false);
@@ -1476,14 +1488,14 @@ pub fn process_consolidation_request(
     state: &mut BeaconState,
     request: &electra::ConsolidationRequest,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
 ) -> Result<()> {
-    if is_valid_switch_to_compounding_request(state, request)? {
+    if is_valid_switch_to_compounding_request(state, request, pubkey_indices)? {
         // Already known to resolve, by the check just above; state has not
         // been mutated since.
-        let source_index = state
-            .iter_validators()
-            .position(|validator| validator.pubkey == request.source_pubkey)
-            .map(|index| index as ValidatorIndex)
+        let source_index = pubkey_indices
+            .validator_index(state, &request.source_pubkey)
             .ok_or(Error::SpecAssert(
                 "is_valid_switch_to_compounding_request already resolved consolidation_request.source_pubkey",
             ))?;
@@ -1504,22 +1516,16 @@ pub fn process_consolidation_request(
     if pending_consolidations_len == preset::PENDING_CONSOLIDATIONS_LIMIT {
         return Ok(());
     }
-    if get_consolidation_churn_limit_for_fork(state, config)? <= preset::MIN_ACTIVATION_BALANCE {
+    if get_consolidation_churn_limit_for_fork(state, config, Some(active_balances))?
+        <= preset::MIN_ACTIVATION_BALANCE
+    {
         return Ok(());
     }
 
-    let Some(source_index) = state
-        .iter_validators()
-        .position(|validator| validator.pubkey == request.source_pubkey)
-        .map(|index| index as ValidatorIndex)
-    else {
+    let Some(source_index) = pubkey_indices.validator_index(state, &request.source_pubkey) else {
         return Ok(());
     };
-    let Some(target_index) = state
-        .iter_validators()
-        .position(|validator| validator.pubkey == request.target_pubkey)
-        .map(|index| index as ValidatorIndex)
-    else {
+    let Some(target_index) = pubkey_indices.validator_index(state, &request.target_pubkey) else {
         return Ok(());
     };
 
@@ -1568,6 +1574,7 @@ pub fn process_consolidation_request(
         state,
         source_effective_balance,
         config,
+        Some(active_balances),
     )?;
     let withdrawable_epoch = exit_epoch
         .checked_add(config.min_validator_withdrawability_delay)
@@ -1785,6 +1792,7 @@ pub fn process_operations(
     config: &Config,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
 ) -> Result<()> {
     let deposit_requests_start_index =
         block_ref(state, "process_operations")?.deposit_requests_start_index();
@@ -1817,13 +1825,19 @@ pub fn process_operations(
     }
     // [Modified in Electra:EIP7251]
     for voluntary_exit in body.voluntary_exits.iter() {
-        process_voluntary_exit(state, voluntary_exit, config)?;
+        process_voluntary_exit(state, voluntary_exit, config, active_balances)?;
     }
     for signed_change in body.bls_to_execution_changes.iter() {
         process_bls_to_execution_change(state, signed_change, config)?;
     }
     // [New in Electra:EIP6110:EIP7002:EIP7251]
-    process_execution_requests(state, &body.execution_requests, config)?;
+    process_execution_requests(
+        state,
+        &body.execution_requests,
+        config,
+        active_balances,
+        pubkey_indices,
+    )?;
 
     Ok(())
 }
@@ -1845,6 +1859,7 @@ pub fn process_operations(
 /// them taking those fields directly rather than a whole body (see
 /// `crate::beacon::stf`'s module documentation). [`super::altair::process_sync_aggregate`]
 /// is reused the same way, for the same reason.
+#[allow(clippy::too_many_arguments)]
 pub fn process_block(
     state: &mut BeaconState,
     block: &electra::BeaconBlock,
@@ -1852,6 +1867,7 @@ pub fn process_block(
     engine: &ExecutionEngine,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
     options: super::block::BlockProcessingOptions,
 ) -> Result<()> {
     super::block::process_block_header(
@@ -1865,8 +1881,20 @@ pub fn process_block(
     process_execution_payload(state, &block.body, config, engine)?;
     super::block::process_randao(state, &block.body.randao_reveal, options.randao)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
-    process_operations(state, &block.body, config, committees, active_balances)?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
+    process_operations(
+        state,
+        &block.body,
+        config,
+        committees,
+        active_balances,
+        pubkey_indices,
+    )?;
+    super::altair::process_sync_aggregate(
+        state,
+        &block.body.sync_aggregate,
+        active_balances,
+        pubkey_indices,
+    )?;
     Ok(())
 }
 
@@ -1944,8 +1972,14 @@ mod tests {
             validator_pubkey: BlsPubkey([0xff; 48]),
             amount: constants::FULL_EXIT_REQUEST_AMOUNT,
         };
-        process_withdrawal_request(&mut state, &request, &config)
-            .expect("an unresolved pubkey is dropped silently, not rejected");
+        process_withdrawal_request(
+            &mut state,
+            &request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .expect("an unresolved pubkey is dropped silently, not rejected");
         assert_eq!(
             state, before,
             "no validator should have been touched for a pubkey nobody holds"
@@ -1966,8 +2000,14 @@ mod tests {
             validator_pubkey: pubkey,
             amount: constants::FULL_EXIT_REQUEST_AMOUNT,
         };
-        process_withdrawal_request(&mut state, &request, &config)
-            .expect("a mismatched source address is dropped silently, not rejected");
+        process_withdrawal_request(
+            &mut state,
+            &request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .expect("a mismatched source address is dropped silently, not rejected");
         assert_eq!(state, before, "no validator should have been touched");
     }
 
@@ -1982,7 +2022,14 @@ mod tests {
             validator_pubkey: pubkey,
             amount: constants::FULL_EXIT_REQUEST_AMOUNT,
         };
-        process_withdrawal_request(&mut state, &request, &config).unwrap();
+        process_withdrawal_request(
+            &mut state,
+            &request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
 
         assert_ne!(
             state.validator(0).unwrap().exit_epoch,
@@ -2040,8 +2087,14 @@ mod tests {
             validator_pubkey: pubkey,
             amount: 1,
         };
-        process_withdrawal_request(&mut state, &partial_request, &config)
-            .expect("a full queue drops a partial request silently, not with an error");
+        process_withdrawal_request(
+            &mut state,
+            &partial_request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .expect("a full queue drops a partial request silently, not with an error");
         assert_eq!(
             block_mut(&mut state, "test assertion")
                 .unwrap()
@@ -2058,7 +2111,14 @@ mod tests {
             validator_pubkey: pubkey,
             amount: constants::FULL_EXIT_REQUEST_AMOUNT,
         };
-        process_withdrawal_request(&mut state, &full_exit_request, &config).unwrap();
+        process_withdrawal_request(
+            &mut state,
+            &full_exit_request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
         assert_ne!(
             state.validator(1).unwrap().exit_epoch,
             FAR_FUTURE_EPOCH,
@@ -2092,7 +2152,14 @@ mod tests {
             validator_pubkey: pubkey,
             amount: constants::FULL_EXIT_REQUEST_AMOUNT,
         };
-        process_withdrawal_request(&mut state, &full_exit_request, &config).unwrap();
+        process_withdrawal_request(
+            &mut state,
+            &full_exit_request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
         assert_ne!(
             state.validator(1).unwrap().exit_epoch,
             FAR_FUTURE_EPOCH,
@@ -2117,7 +2184,14 @@ mod tests {
             validator_pubkey: pubkey,
             amount: 500_000_000,
         };
-        process_withdrawal_request(&mut state, &request, &config).unwrap();
+        process_withdrawal_request(
+            &mut state,
+            &request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
 
         let queued =
             crate::beacon::helpers::electra::get_pending_balance_to_withdraw(&state, 0).unwrap();
@@ -2144,7 +2218,14 @@ mod tests {
             validator_pubkey: pubkey,
             amount: 500_000_000,
         };
-        process_withdrawal_request(&mut state, &request, &config).unwrap();
+        process_withdrawal_request(
+            &mut state,
+            &request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
 
         let queued =
             crate::beacon::helpers::electra::get_pending_balance_to_withdraw(&state, 0).unwrap();
@@ -2167,7 +2248,14 @@ mod tests {
             source_pubkey: pubkey,
             target_pubkey: pubkey,
         };
-        process_consolidation_request(&mut state, &request, &config).unwrap();
+        process_consolidation_request(
+            &mut state,
+            &request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
 
         assert!(has_compounding_withdrawal_credential(
             state.validator(0).unwrap()
@@ -2196,8 +2284,14 @@ mod tests {
             source_pubkey: pubkey,
             target_pubkey: pubkey,
         };
-        process_consolidation_request(&mut state, &request, &config)
-            .expect("neither branch applies, so this must be a silent no-op, not an error");
+        process_consolidation_request(
+            &mut state,
+            &request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .expect("neither branch applies, so this must be a silent no-op, not an error");
         assert_eq!(state, before, "no validator should have been touched");
     }
 
@@ -2232,8 +2326,14 @@ mod tests {
             source_pubkey,
             target_pubkey,
         };
-        process_consolidation_request(&mut state, &request, &config)
-            .expect("a full queue drops the request silently, not with an error");
+        process_consolidation_request(
+            &mut state,
+            &request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .expect("a full queue drops the request silently, not with an error");
 
         assert_eq!(
             pending_queue_fields(&mut state, "test assertion")
@@ -2280,7 +2380,14 @@ mod tests {
             source_pubkey,
             target_pubkey,
         };
-        process_consolidation_request(&mut state, &request, &config).unwrap();
+        process_consolidation_request(
+            &mut state,
+            &request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
 
         assert_ne!(
             state.validator(0).unwrap().exit_epoch,
