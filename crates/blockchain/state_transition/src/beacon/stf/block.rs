@@ -29,6 +29,7 @@ use crate::beacon::helpers::accessors::{
 };
 use crate::beacon::helpers::math::xor;
 use crate::beacon::helpers::misc::compute_signing_root;
+use crate::beacon::helpers::target_balances::TargetBalanceDelta;
 use crate::beacon::preset;
 use crate::beacon::primitives::{BlsSignature, HashTreeRoot as _, Root, Slot, ValidatorIndex};
 use crate::beacon::stf::signatures::SignatureBatch;
@@ -222,6 +223,7 @@ pub fn process_block_phase0(
         committees,
         active_balances,
         signatures,
+        options.target_delta,
     )?;
     Ok(())
 }
@@ -267,6 +269,7 @@ pub fn process_block_altair(
         committees,
         active_balances,
         signatures,
+        options.target_delta,
     )?;
     super::altair::process_sync_aggregate(
         state,
@@ -339,8 +342,15 @@ pub fn process_block_header(
 /// What `process_block` may leave unchecked. The default checks everything the
 /// specification does, and is the only value block import uses.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct BlockProcessingOptions {
+pub struct BlockProcessingOptions<'a> {
     pub randao: RandaoVerification,
+    /// Collects what the block's attestations add to the unslashed
+    /// TIMELY_TARGET balances, for fork choice's incremental pulled-up tip
+    /// (see [`crate::beacon::helpers::target_balances`]). `None` for every
+    /// caller that does not keep those totals. Carried here rather than as a
+    /// parameter of its own because this is the one per-call value every fork's
+    /// driver already receives.
+    pub target_delta: Option<&'a TargetBalanceDelta>,
 }
 
 /// Whether `process_randao` verifies the proposer's reveal before mixing it in.

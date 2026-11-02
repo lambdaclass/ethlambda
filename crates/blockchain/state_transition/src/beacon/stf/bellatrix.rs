@@ -108,6 +108,7 @@ pub fn process_block(
         committees,
         active_balances,
         signatures,
+        options.target_delta,
     )?;
     super::altair::process_sync_aggregate(
         state,

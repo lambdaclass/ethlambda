@@ -43,6 +43,7 @@ use crate::beacon::helpers::attestation::{
 };
 use crate::beacon::helpers::misc::{compute_epoch_at_slot, compute_signing_root};
 use crate::beacon::helpers::mutators::{decrease_balance, increase_balance};
+use crate::beacon::helpers::target_balances::TargetBalanceDelta;
 use crate::beacon::preset;
 use crate::beacon::primitives::{BlsPubkey, Gwei, ParticipationFlags, ValidatorIndex};
 use crate::beacon::stf::signatures::SignatureBatch;
@@ -90,6 +91,7 @@ pub fn process_attestation(
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
     signatures: &mut SignatureBatch,
+    target_delta: Option<&TargetBalanceDelta>,
 ) -> Result<()> {
     let data = attestation.data;
     let current_epoch = get_current_epoch(state);
@@ -216,6 +218,11 @@ pub fn process_attestation(
             proposer_reward_numerator = proposer_reward_numerator
                 .checked_add(reward)
                 .ok_or(Error::ArithmeticOverflow("proposer_reward_numerator"))?;
+        }
+        if let Some(delta) = target_delta
+            && has_flag(new_flags, constants::TIMELY_TARGET_FLAG_INDEX)
+        {
+            delta.record_new_target(current_epoch_target, state.validator(index)?);
         }
         if new_flags != 0 {
             updates.push((index, new_flags));
@@ -490,6 +497,7 @@ mod tests {
     use crate::beacon::containers::shared::{AttestationData, Checkpoint, Validator};
     use crate::beacon::helpers::accessors::{get_beacon_committee, get_total_active_balance};
     use crate::beacon::helpers::altair::get_base_reward_per_increment;
+    use crate::beacon::helpers::participation::ParticipationTotals;
     use crate::beacon::primitives::{
         BLS_SIGNATURE_SIZE, BlsPubkey, BlsSignature, Bytes32, HashTreeRoot as _, Root,
     };
@@ -666,6 +674,7 @@ mod tests {
                 &CommitteeCache::default(),
                 &ActiveBalanceCache::default(),
                 s,
+                None,
             )
         })
         .unwrap();
@@ -705,6 +714,7 @@ mod tests {
                 &CommitteeCache::default(),
                 &ActiveBalanceCache::default(),
                 s,
+                None,
             )
         })
         .unwrap();
@@ -712,6 +722,105 @@ mod tests {
         assert_eq!(
             balance_before_replay, balance_after_replay,
             "a repeat vote must earn nothing, since every flag it could set is already set"
+        );
+    }
+
+    /// A signed attestation by every member of `data_slot`'s first committee,
+    /// targeting that slot's epoch, for the all-zero synthetic root history.
+    fn full_committee_attestation(
+        state: &BeaconState,
+        secret_keys: &[SecretKey],
+        data_slot: u64,
+    ) -> phase0::Attestation {
+        let target_epoch = compute_epoch_at_slot(data_slot);
+        let committee = get_beacon_committee(state, data_slot, 0).expect("committee exists");
+        let data = AttestationData {
+            slot: data_slot,
+            index: 0,
+            beacon_block_root: Root::ZERO,
+            source: Checkpoint::default(),
+            target: Checkpoint {
+                epoch: target_epoch,
+                root: Root::ZERO,
+            },
+        };
+        let mut aggregation_bits =
+            crate::beacon::containers::phase0::AggregationBits::with_length(committee.len())
+                .expect("committee.len() is far below MAX_VALIDATORS_PER_COMMITTEE");
+        for position in 0..committee.len() {
+            aggregation_bits.set(position, true).unwrap();
+        }
+        let domain = get_domain(state, constants::DOMAIN_BEACON_ATTESTER, Some(target_epoch));
+        let signing_root = compute_signing_root(data.hash_tree_root(), domain);
+        const DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+        let signatures: Vec<BlsSignature> = committee
+            .iter()
+            .map(|&index| {
+                BlsSignature(
+                    secret_keys[index as usize]
+                        .sign(signing_root.as_slice(), DST, &[])
+                        .to_bytes(),
+                )
+            })
+            .collect();
+        phase0::Attestation {
+            aggregation_bits,
+            data,
+            signature: bls::aggregate(&signatures).unwrap(),
+        }
+    }
+
+    /// The invariant `compute_pulled_up_tip` relies on: the unslashed
+    /// timely-target balances after a block equal the balances before it plus
+    /// the delta `process_attestation` collected, for the previous and current
+    /// epoch alike, with a slashed attester left out and a repeated vote
+    /// counted once.
+    #[test]
+    fn the_target_delta_is_what_a_registry_scan_gains() {
+        let (mut state, secret_keys) = altair_state_with_keypairs(64);
+        // Slot after the first slot of epoch 1: both the previous epoch's last
+        // slot and the current epoch's first slot are attestable.
+        *state.slot_mut() = preset::SLOTS_PER_EPOCH + 1;
+        let previous_slot = preset::SLOTS_PER_EPOCH - 1;
+        let current_slot = preset::SLOTS_PER_EPOCH;
+
+        let previous_committee = get_beacon_committee(&state, previous_slot, 0).unwrap();
+        state.validator_mut(previous_committee[0]).unwrap().slashed = true;
+
+        let before = ParticipationTotals::compute_raw_target(&state).unwrap();
+        let committees = CommitteeCache::default();
+        let active_balances = ActiveBalanceCache::default();
+        let delta = TargetBalanceDelta::default();
+        for slot in [previous_slot, current_slot] {
+            let attestation = full_committee_attestation(&state, &secret_keys, slot);
+            // Twice: the second pass sets no new flag and must add nothing.
+            for _ in 0..2 {
+                checked(|s| {
+                    process_attestation(
+                        &mut state,
+                        &attestation,
+                        &committees,
+                        &active_balances,
+                        s,
+                        Some(&delta),
+                    )
+                })
+                .unwrap();
+            }
+        }
+        let after = ParticipationTotals::compute_raw_target(&state).unwrap();
+
+        assert!(
+            delta.previous() > 0 && delta.current() > 0,
+            "both epochs voted"
+        );
+        assert_eq!(after.0, before.0 + delta.previous());
+        assert_eq!(after.1, before.1 + delta.current());
+        let slashed_share = (previous_committee.len() as u64 - 1) * preset::MAX_EFFECTIVE_BALANCE;
+        assert_eq!(
+            delta.previous(),
+            slashed_share,
+            "the slashed attester adds nothing"
         );
     }
 

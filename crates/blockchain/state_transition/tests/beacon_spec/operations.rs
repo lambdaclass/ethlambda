@@ -318,6 +318,7 @@ fn run(
                     committees,
                     &active_balances,
                     signatures,
+                    None,
                 )
             }
             // Deneb widens the inclusion window and the timely-target
@@ -330,6 +331,7 @@ fn run(
                     committees,
                     &active_balances,
                     signatures,
+                    None,
                 )
             }
             // Electra reshapes the container itself (EIP-7549's
@@ -343,6 +345,7 @@ fn run(
                     committees,
                     &active_balances,
                     signatures,
+                    None,
                 )
             }
             // Gloas reshapes the container a third time (EIP-7688's unbounded
@@ -361,6 +364,7 @@ fn run(
                     committees,
                     &active_balances,
                     signatures,
+                    None,
                 )
             }
             ForkName::Lean => lean_is_not_a_fixture_fork("attestation"),

@@ -76,6 +76,7 @@ use crate::beacon::helpers::misc::{
 };
 use crate::beacon::helpers::mutators::{decrease_balance, increase_balance};
 use crate::beacon::helpers::predicates::{is_active_validator, is_slashable_attestation_data};
+use crate::beacon::helpers::target_balances::TargetBalanceDelta;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
     BlsPubkey, BlsSignature, Bytes32, Gwei, HashTreeRoot as _, ParticipationFlags, ValidatorIndex,
@@ -657,6 +658,7 @@ pub fn process_attestation(
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
     signatures: &mut SignatureBatch,
+    target_delta: Option<&TargetBalanceDelta>,
 ) -> Result<()> {
     let data = attestation.data;
     let current_epoch = get_current_epoch(state);
@@ -807,6 +809,11 @@ pub fn process_attestation(
             proposer_reward_numerator = proposer_reward_numerator
                 .checked_add(reward)
                 .ok_or(Error::ArithmeticOverflow("proposer_reward_numerator"))?;
+        }
+        if let Some(delta) = target_delta
+            && has_flag(new_flags, constants::TIMELY_TARGET_FLAG_INDEX)
+        {
+            delta.record_new_target(current_epoch_target, state.validator(index)?);
         }
         if new_flags != 0 {
             updates.push((index, new_flags));
@@ -1796,6 +1803,7 @@ pub fn get_execution_requests_list(requests: &electra::ExecutionRequests) -> Vec
 /// len(body.deposits) == 0`, unconditionally, with no `process_deposit` call
 /// at all), so it keeps its own copy, [`super::fulu::process_operations`],
 /// rather than calling this one.
+#[allow(clippy::too_many_arguments)]
 pub fn process_operations(
     state: &mut BeaconState,
     body: &electra::BeaconBlockBody,
@@ -1804,6 +1812,7 @@ pub fn process_operations(
     active_balances: &ActiveBalanceCache,
     pubkey_indices: &PubkeyIndexCache,
     signatures: &mut SignatureBatch,
+    target_delta: Option<&TargetBalanceDelta>,
 ) -> Result<()> {
     let deposit_requests_start_index =
         block_ref(state, "process_operations")?.deposit_requests_start_index();
@@ -1838,7 +1847,14 @@ pub fn process_operations(
         StfPhase::Attestations,
         body.attestations.iter(),
         |attestation| {
-            process_attestation(state, attestation, committees, active_balances, signatures)
+            process_attestation(
+                state,
+                attestation,
+                committees,
+                active_balances,
+                signatures,
+                target_delta,
+            )
         },
     )?;
     try_for_each_timed(StfPhase::Deposits, body.deposits.iter(), |deposit| {
@@ -1923,6 +1939,7 @@ pub fn process_block(
         active_balances,
         pubkey_indices,
         signatures,
+        options.target_delta,
     )?;
     super::altair::process_sync_aggregate(
         state,
@@ -2611,6 +2628,7 @@ mod tests {
             committees,
             &ActiveBalanceCache::default(),
             &mut signatures,
+            None,
         )?;
         signatures.verify()?;
         state.apply_pending_mutations();

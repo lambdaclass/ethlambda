@@ -72,6 +72,7 @@ use crate::beacon::helpers::gloas::{
 use crate::beacon::helpers::misc::{compute_domain, compute_epoch_at_slot, compute_signing_root};
 use crate::beacon::helpers::mutators::{decrease_balance, increase_balance, slash_validator};
 use crate::beacon::helpers::predicates::is_slashable_attestation_data;
+use crate::beacon::helpers::target_balances::TargetBalanceDelta;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
     Bytes32, ExecutionAddress, Gwei, HashTreeRoot as _, ParticipationFlags, Root, Slot,
@@ -158,6 +159,7 @@ pub fn process_block(
         committees,
         active_balances,
         signatures,
+        options.target_delta,
     )?;
     super::altair::process_sync_aggregate(
         state,
@@ -1398,6 +1400,7 @@ pub fn process_attestation(
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
     signatures: &mut SignatureBatch,
+    target_delta: Option<&TargetBalanceDelta>,
 ) -> Result<()> {
     let data = attestation.data;
     let current_epoch = get_current_epoch(state);
@@ -1564,6 +1567,11 @@ pub fn process_attestation(
                     Error::ArithmeticOverflow("process_attestation: proposer_reward_numerator"),
                 )?;
             }
+            if let Some(delta) = target_delta
+                && has_flag(new_flags, constants::TIMELY_TARGET_FLAG_INDEX)
+            {
+                delta.record_new_target(current_epoch_target, state.validator(index)?);
+            }
             let will_set_new_flag = new_flags != 0;
 
             if will_set_new_flag
@@ -1677,6 +1685,7 @@ pub fn process_payload_attestation(
 /// `assert len(body.deposits) == 0` unconditionally, with no `process_deposit`
 /// call at all: like fulu, gloas has no eth1-bridge deposit path left to
 /// drain (`crate::beacon::stf::fulu::process_operations`'s own doc explains why).
+#[allow(clippy::too_many_arguments)]
 pub fn process_operations(
     state: &mut BeaconState,
     body: &gloas::BeaconBlockBody,
@@ -1685,6 +1694,7 @@ pub fn process_operations(
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
     signatures: &mut SignatureBatch,
+    target_delta: Option<&TargetBalanceDelta>,
 ) -> Result<()> {
     verify(
         body.deposits.is_empty(),
@@ -1740,6 +1750,7 @@ pub fn process_operations(
                 committees,
                 active_balances,
                 signatures,
+                target_delta,
             )
         },
     )?;
@@ -2071,6 +2082,7 @@ mod tests {
                     &committees,
                     &ActiveBalanceCache::default(),
                     s,
+                    None,
                 )
             });
             assert!(

@@ -28,5 +28,6 @@ pub mod participation_reference;
 pub mod predicates;
 pub mod shuffling;
 pub mod sync_committee;
+pub mod target_balances;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_state;

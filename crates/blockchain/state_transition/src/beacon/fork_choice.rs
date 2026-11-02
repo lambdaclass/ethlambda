@@ -170,7 +170,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use ethlambda_storage::{CacheKey, ForkCheckpoints, StorageBackend};
+use ethlambda_storage::{CacheKey, ForkCheckpoints, StorageBackend, TargetBalances};
 use ethlambda_types::ShortRoot;
 use tracing::{debug, error, warn};
 
@@ -182,8 +182,8 @@ use crate::beacon::containers::{bellatrix, deneb, electra, fulu, gloas, phase0};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::{
-    ActiveBalanceCache, CommitteeCache, CommitteeCacheExt, get_active_validator_indices,
-    get_current_epoch,
+    ActiveBalanceCache, ActiveBalanceCacheExt, CommitteeCache, CommitteeCacheExt,
+    get_active_validator_indices, get_block_root, get_current_epoch,
 };
 use crate::beacon::helpers::attestation as phase0_attestation;
 use crate::beacon::helpers::electra as electra_helpers;
@@ -192,6 +192,10 @@ use crate::beacon::helpers::misc::{
     compute_epoch_at_slot, compute_start_slot_at_epoch, is_valid_merkle_branch,
 };
 use crate::beacon::helpers::predicates::{is_active_validator, is_slashable_attestation_data};
+use crate::beacon::helpers::target_balances::{
+    TargetBalanceDelta, block_has_slashings, compute_target_balances, extend_parent_totals,
+    tracks_epoch,
+};
 use crate::beacon::kzg;
 use crate::beacon::lean_boundary::{lean_block_unreachable, lean_fork_unreachable};
 use crate::beacon::preset;
@@ -200,6 +204,7 @@ use crate::beacon::primitives::{
     ValidatorIndex,
 };
 use crate::beacon::stf;
+use crate::beacon::stf::epoch::justification::JustificationState;
 use crate::metrics;
 
 // ---------------------------------------------------------------------------
@@ -1080,6 +1085,7 @@ fn transition_block(
     engine: &stf::ExecutionEngine,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    options: stf::block::BlockProcessingOptions,
 ) -> (BeaconState, Result<()>) {
     // Every STF phase observed below is the import's, and none of it belongs
     // to the epoch precompute worker, which runs `process_epoch` on its own
@@ -1108,7 +1114,7 @@ fn transition_block(
     else {
         let mut state = parent_state.clone();
         if !crosses_with_empty_slots {
-            let outcome = stf::state_transition(
+            let outcome = stf::state_transition_with_options(
                 &mut state,
                 signed_block,
                 validate_result,
@@ -1117,6 +1123,7 @@ fn transition_block(
                 committees,
                 active_balances,
                 pubkey_indices,
+                options,
             );
             return (state, outcome);
         }
@@ -1126,7 +1133,7 @@ fn transition_block(
             .inspect(|()| cache_boundary_balances(store, boundary, &state))
             .and_then(|()| stf::process_slots(&mut state, block_slot, config))
             .and_then(|()| {
-                stf::apply_block(
+                stf::apply_block_with_options(
                     &mut state,
                     signed_block,
                     validate_result,
@@ -1135,6 +1142,7 @@ fn transition_block(
                     committees,
                     active_balances,
                     pubkey_indices,
+                    options,
                 )
             });
         return (state, outcome);
@@ -1152,7 +1160,7 @@ fn transition_block(
         Ok(())
     }
     .and_then(|()| {
-        stf::apply_block(
+        stf::apply_block_with_options(
             &mut state,
             signed_block,
             validate_result,
@@ -1161,6 +1169,7 @@ fn transition_block(
             committees,
             active_balances,
             pubkey_indices,
+            options,
         )
     });
     (state, outcome)
@@ -4369,31 +4378,25 @@ pub fn is_data_available_gloas_columns(
 /// already having the checkpoint its own chain is clearly heading towards,
 /// rather than being stuck with whatever its post-state's
 /// `current_justified_checkpoint` was at the moment it was imported.
+///
+/// `extended_totals` is the block's unslashed target balances when the caller
+/// derived them from its parent's cached totals (see
+/// [`extend_parent_totals`]); `None` makes this scan the registry once and
+/// cache the result.
 pub fn compute_pulled_up_tip(
     store: &mut Store,
     block_root: Root,
     block_slot: Slot,
     config: &Config,
+    extended_totals: Option<TargetBalances>,
 ) -> Result<()> {
-    // `get_state` hands back a shared `Arc`, so this clones out of it,
-    // matching the specification's own `.copy()`: the clone advances to the
-    // next epoch boundary as a throwaway, and the store's own cached entry
-    // for `block_root` must be left exactly as the block itself produced it.
     let state = store
         .get_state(&block_root)
         .expect("get")
         .ok_or(Error::SpecAssert("block_root in store.block_states"))?;
-    let mut state = (*state).clone();
 
-    // Through the fork-dispatching wrapper rather than phase0's version
-    // directly. Altair rewrote this step to read participation flags instead of
-    // replaying stored attestations, so calling phase0's against an altair or
-    // later state fails outright, which is what made every `fork_choice` case
-    // that crosses an epoch boundary fail.
-    stf::epoch::process_justification_and_finalization(&mut state, config)?;
-
-    let current_justified = state.current_justified_checkpoint();
-    let finalized = state.finalized_checkpoint();
+    let (current_justified, finalized) =
+        pulled_up_checkpoints(store, &state, block_root, config, extended_totals)?;
 
     store.set_unrealized_justification(block_root, block_slot, current_justified);
     update_unrealized_checkpoints(store, current_justified, finalized);
@@ -4408,6 +4411,92 @@ pub fn compute_pulled_up_tip(
         update_checkpoints(store, current_justified, finalized);
     }
     Ok(())
+}
+
+/// The `(current_justified, finalized)` checkpoints `state` heads towards, the
+/// specification's `process_justification_and_finalization` run on a copy.
+///
+/// From altair on this clones nothing: the step reads and writes a handful of
+/// fields, so it runs on a [`JustificationState`] extracted from `state` and
+/// reads the total active balance from the store's cache. The registry is
+/// scanned only when `extended_totals` could not supply the two target
+/// balances. Phase0 keeps the specification's own shape, since it replays
+/// stored pending attestations instead of reading flags.
+///
+/// In debug builds every call also runs the full path and asserts it agrees,
+/// totals included, so the fork choice fixtures check the incremental ones on
+/// each block.
+fn pulled_up_checkpoints(
+    store: &Store,
+    state: &BeaconState,
+    block_root: Root,
+    config: &Config,
+    extended_totals: Option<TargetBalances>,
+) -> Result<(Checkpoint, Checkpoint)> {
+    if state.fork_name() == ForkName::Phase0 {
+        return full_pulled_up_checkpoints(state, config);
+    }
+
+    let mut justification = JustificationState::from_state(state);
+    if tracks_epoch(justification.current_epoch) {
+        let totals = match extended_totals {
+            Some(totals) => totals,
+            None => compute_target_balances(state)?,
+        };
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            totals,
+            compute_target_balances(state)?,
+            "incremental target balances diverged from a full scan"
+        );
+        store.target_balance_cache().insert(block_root, totals);
+
+        // Floored exactly as `ParticipationTotals` floors its three totals;
+        // the cached total active balance is floored already.
+        let floor = |total: Gwei| total.max(preset::EFFECTIVE_BALANCE_INCREMENT);
+        let total_active_balance = store.active_balance_cache().total_active_balance(state)?;
+        justification.weigh(
+            total_active_balance,
+            floor(totals.previous),
+            floor(totals.current),
+            |epoch| get_block_root(state, epoch),
+        )?;
+    }
+
+    let outcome = (
+        justification.current_justified_checkpoint,
+        justification.finalized_checkpoint,
+    );
+    #[cfg(debug_assertions)]
+    assert_eq!(
+        outcome,
+        full_pulled_up_checkpoints(state, config)?,
+        "state-free pulled-up tip diverged from the specification's copy"
+    );
+    Ok(outcome)
+}
+
+/// [`pulled_up_checkpoints`] the way the specification states it: advance a
+/// copy of `state` through `process_justification_and_finalization`.
+///
+/// `get_state` hands back a shared `Arc`, so the copy matches the
+/// specification's own `.copy()`: the store's cached entry for the block must
+/// be left exactly as the block itself produced it. Through the
+/// fork-dispatching wrapper rather than phase0's version directly: altair
+/// rewrote this step to read participation flags instead of replaying stored
+/// attestations, so calling phase0's against an altair or later state fails
+/// outright, which is what made every `fork_choice` case that crosses an epoch
+/// boundary fail.
+fn full_pulled_up_checkpoints(
+    state: &BeaconState,
+    config: &Config,
+) -> Result<(Checkpoint, Checkpoint)> {
+    let mut state = state.clone();
+    stf::epoch::process_justification_and_finalization(&mut state, config)?;
+    Ok((
+        state.current_justified_checkpoint(),
+        state.finalized_checkpoint(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -4905,6 +4994,10 @@ pub struct SpeculativeTransition {
     parent_root: Root,
     state: BeaconState,
     outcome: Result<()>,
+    /// What this transition's attestations added to the unslashed target
+    /// balances. It stands in for `on_block`'s own delta exactly when `state`
+    /// stands in for its post-state, since the two are produced together.
+    target_delta: TargetBalanceDelta,
 }
 
 impl SpeculativeTransition {
@@ -4939,6 +5032,7 @@ pub fn speculate_transition(
     let parent_root = signed_block.parent_root();
     let parent_state = store.get_state(&parent_root).expect("get")?;
     let active_balances = store.active_balance_cache();
+    let target_delta = TargetBalanceDelta::default();
     let (state, outcome) = transition_block(
         store,
         &parent_state,
@@ -4949,12 +5043,17 @@ pub fn speculate_transition(
         &stf::ExecutionEngine::valid(),
         committees,
         &active_balances,
+        stf::block::BlockProcessingOptions {
+            target_delta: Some(&target_delta),
+            ..Default::default()
+        },
     );
     Some(SpeculativeTransition {
         block_root,
         parent_root,
         state,
         outcome,
+        target_delta,
     })
 }
 
@@ -5151,19 +5250,37 @@ pub fn on_block_speculative(
         speculation.is_for(block_root, parent_root)
             && !matches!(payload_validity, PayloadValidity::Invalidated { .. })
     });
-    let (mut state, transition) = match usable {
-        Some(speculation) => (speculation.state, speculation.outcome),
-        None => transition_block(
-            store,
-            &parent_state,
-            parent_root,
-            &signed_block,
-            true,
-            config,
-            &engine,
-            committees,
-            &active_balances,
+    // What the block's attestations add to the unslashed target balances; with
+    // the parent's cached totals it spares `compute_pulled_up_tip` a registry
+    // scan. See `helpers::target_balances`. The delta must belong to the state
+    // that is imported: a speculation's own delta goes with its own state, and
+    // a fresh one is filled by the transition run here. Pairing a speculation's
+    // state with an empty delta would cache wrong totals.
+    let (mut state, transition, target_delta) = match usable {
+        Some(speculation) => (
+            speculation.state,
+            speculation.outcome,
+            speculation.target_delta,
         ),
+        None => {
+            let target_delta = TargetBalanceDelta::default();
+            let (state, transition) = transition_block(
+                store,
+                &parent_state,
+                parent_root,
+                &signed_block,
+                true,
+                config,
+                &engine,
+                committees,
+                &active_balances,
+                stf::block::BlockProcessingOptions {
+                    target_delta: Some(&target_delta),
+                    ..Default::default()
+                },
+            );
+            (state, transition, target_delta)
+        }
     };
 
     // `optimistic-sync.md`: a block deemed `INVALIDATED` MUST NOT be included
@@ -5207,6 +5324,20 @@ pub fn on_block_speculative(
     }
 
     transition?;
+
+    // The block's target balances when its parent's are cached for this epoch.
+    // Read before `signed_block` moves into the store. A block that slashes
+    // goes to the full scan: see `helpers::target_balances` for why.
+    let extended_totals = if block_has_slashings(&signed_block) {
+        None
+    } else {
+        extend_parent_totals(
+            &store.target_balance_cache(),
+            &parent_root,
+            compute_epoch_at_slot(signed_block.slot()),
+            &target_delta,
+        )
+    };
 
     // A block at its epoch's first slot is its own epoch-boundary block: its
     // post-state is the checkpoint state. Cached at import so the tick that
@@ -5349,7 +5480,7 @@ pub fn on_block_speculative(
     update_checkpoints(store, current_justified, finalized);
 
     // Eagerly compute unrealized justification and finality.
-    compute_pulled_up_tip(store, block_root, block_slot, config)?;
+    compute_pulled_up_tip(store, block_root, block_slot, config, extended_totals)?;
 
     Ok(())
 }
@@ -6543,6 +6674,7 @@ mod tests {
             &stf::ExecutionEngine::valid(),
             &CommitteeCache::default(),
             &ActiveBalanceCache::default(),
+            Default::default(),
         );
         outcome.expect("applies");
         post.apply_pending_mutations();
@@ -7097,7 +7229,7 @@ mod tests {
         post_state.latest_block_header_mut().slot = slot;
         store.insert_signed_block(root, block).unwrap();
         store.insert_state(root, post_state).unwrap();
-        compute_pulled_up_tip(store, root, slot, config).expect("pulled-up tip");
+        compute_pulled_up_tip(store, root, slot, config, None).expect("pulled-up tip");
         root
     }
 
@@ -7662,6 +7794,247 @@ mod tests {
         assert!(
             speculate_transition(&store, &block, &config, &CommitteeCache::default()).is_none()
         );
+    }
+
+    /// A store anchored on an altair state inside epoch 2 (the first epoch
+    /// whose justification weighs target balances), the clock at the slot of a
+    /// valid child block that carries one attestation from a full committee,
+    /// and the parent's target totals seeded in the cache so the child's are
+    /// derived from them plus the transition's delta rather than rescanned.
+    fn store_with_attesting_altair_child() -> (Config, Store, SignedBeaconBlock, Root) {
+        use crate::beacon::containers::{altair, phase0};
+
+        let config = Config::active();
+        let mut anchor_state = test_state::with_signing_validators_at(ForkName::Altair, 64);
+        // The epoch's first slot, so the anchor is also its own epoch-start
+        // checkpoint block, which the finalized-descent check looks up.
+        *anchor_state.slot_mut() = 2 * preset::SLOTS_PER_EPOCH;
+        // Even a sync aggregate with no participants resolves every seat of the
+        // committee to a validator, so the placeholder keys must be real ones.
+        let member = anchor_state.validator(0).expect("registry").pubkey;
+        let (current_sync_committee, _) = anchor_state.sync_committees_mut().expect("altair");
+        current_sync_committee.pubkeys = vec![member; preset::SYNC_COMMITTEE_SIZE]
+            .try_into()
+            .expect("built at exactly SYNC_COMMITTEE_SIZE");
+        let sync_aggregate = || altair::SyncAggregate {
+            sync_committee_bits: Default::default(),
+            sync_committee_signature: BlsSignature({
+                let mut bytes = [0u8; crate::beacon::primitives::BLS_SIGNATURE_SIZE];
+                bytes[0] = 0b1100_0000;
+                bytes
+            }),
+        };
+        let parent_root = anchor_state.latest_block_header().parent_root;
+        let anchor_body = altair::BeaconBlockBody {
+            sync_aggregate: sync_aggregate(),
+            ..Default::default()
+        };
+        *anchor_state.latest_block_header_mut() = BeaconBlockHeader {
+            slot: anchor_state.slot(),
+            proposer_index: 0,
+            parent_root,
+            state_root: Root::ZERO,
+            body_root: anchor_body.hash_tree_root(),
+        };
+        let anchor_block = SignedBeaconBlock::Altair(altair::SignedBeaconBlock {
+            message: altair::BeaconBlock {
+                slot: anchor_state.slot(),
+                proposer_index: 0,
+                parent_root,
+                state_root: anchor_state.hash_tree_root(),
+                body: anchor_body,
+            },
+            signature: Default::default(),
+        });
+        let anchor_root = anchor_block.message_hash_tree_root();
+        let data_slot = anchor_state.slot();
+        let target_slot = data_slot + 1;
+
+        let mut probe_state = anchor_state.clone();
+        stf::process_slots(&mut probe_state, target_slot, &config).expect("process_slots");
+        let proposer_index =
+            accessors::get_beacon_proposer_index(&probe_state).expect("get_beacon_proposer_index");
+        let proposer_key = test_state::secret_key_for(proposer_index as usize);
+        let sign = |key: &blst::min_pk::SecretKey, root: Root, domain| {
+            BlsSignature(
+                key.sign(compute_signing_root(root, domain).as_slice(), bls::DST, &[])
+                    .to_bytes(),
+            )
+        };
+        let randao_domain = accessors::get_domain(&probe_state, constants::DOMAIN_RANDAO, None);
+        let randao_reveal = sign(
+            &proposer_key,
+            get_current_epoch(&probe_state).hash_tree_root(),
+            randao_domain,
+        );
+
+        // Every member of the slot's first committee votes for the anchor as
+        // head and epoch target, so each earns the source and target flags: the
+        // new TIMELY_TARGET balance the delta must carry.
+        let target_epoch = compute_epoch_at_slot(data_slot);
+        let committee = accessors::get_beacon_committee(&probe_state, data_slot, 0)
+            .expect("the slot has a committee");
+        let data = crate::beacon::containers::AttestationData {
+            slot: data_slot,
+            index: 0,
+            beacon_block_root: anchor_root,
+            source: Checkpoint::default(),
+            target: Checkpoint {
+                epoch: target_epoch,
+                root: anchor_root,
+            },
+        };
+        let mut aggregation_bits = phase0::AggregationBits::with_length(committee.len())
+            .expect("a committee fits the bitlist bound");
+        for position in 0..committee.len() {
+            aggregation_bits.set(position, true).expect("in range");
+        }
+        let attester_domain = accessors::get_domain(
+            &probe_state,
+            constants::DOMAIN_BEACON_ATTESTER,
+            Some(target_epoch),
+        );
+        let signatures: Vec<BlsSignature> = committee
+            .iter()
+            .map(|&index| {
+                sign(
+                    &test_state::secret_key_for(index as usize),
+                    data.hash_tree_root(),
+                    attester_domain,
+                )
+            })
+            .collect();
+        let attestation = phase0::Attestation {
+            aggregation_bits,
+            data,
+            signature: bls::aggregate(&signatures).expect("aggregates"),
+        };
+
+        let body = altair::BeaconBlockBody {
+            randao_reveal,
+            sync_aggregate: sync_aggregate(),
+            attestations: vec![attestation]
+                .try_into()
+                .expect("one attestation is far below MAX_ATTESTATIONS"),
+            ..Default::default()
+        };
+        let mut message = altair::BeaconBlock {
+            slot: target_slot,
+            proposer_index,
+            parent_root: anchor_root,
+            state_root: Root::ZERO,
+            body,
+        };
+        let draft = SignedBeaconBlock::Altair(altair::SignedBeaconBlock {
+            message: message.clone(),
+            signature: Default::default(),
+        });
+        let mut trial_state = anchor_state.clone();
+        stf::state_transition(
+            &mut trial_state,
+            &draft,
+            false,
+            &config,
+            &stf::ExecutionEngine::valid(),
+            &CommitteeCache::default(),
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .expect("the drafted block must transition cleanly");
+        message.state_root = trial_state.hash_tree_root();
+        let proposer_domain =
+            accessors::get_domain(&probe_state, constants::DOMAIN_BEACON_PROPOSER, None);
+        let signature = sign(&proposer_key, message.hash_tree_root(), proposer_domain);
+        let signed_block =
+            SignedBeaconBlock::Altair(altair::SignedBeaconBlock { message, signature });
+
+        let mut store = get_forkchoice_store(
+            Arc::new(InMemoryBackend::new()),
+            anchor_state.clone(),
+            anchor_block,
+            &config,
+        )
+        .expect("the anchor pair matches");
+        store
+            .set_time_ms(seconds_to_milliseconds(
+                config.seconds_per_slot * target_slot,
+            ))
+            .expect("set time");
+        let parent_totals = compute_target_balances(&anchor_state).expect("altair scan");
+        store
+            .target_balance_cache()
+            .insert(anchor_root, parent_totals);
+        (config, store, signed_block, anchor_root)
+    }
+
+    /// Imports the attesting child through `speculate` and returns its
+    /// post-state's target totals as the cache holds them and as a full scan
+    /// computes them, plus the parent's totals.
+    fn import_attesting_child(
+        speculate: impl FnOnce(&Store, &SignedBeaconBlock, &Config) -> Option<SpeculativeTransition>,
+    ) -> (TargetBalances, TargetBalances, TargetBalances) {
+        let (config, mut store, signed_block, anchor_root) = store_with_attesting_altair_child();
+        let block_root = signed_block.message_hash_tree_root();
+        let committees = CommitteeCache::default();
+        let speculation = speculate(&store, &signed_block, &config);
+        on_block_speculative(
+            &mut store,
+            signed_block,
+            &config,
+            &DataAvailability::NotRequired,
+            &PayloadValidity::NotRequired,
+            &committees,
+            speculation,
+        )
+        .expect("the attesting child imports");
+        let post_state = store.get_state(&block_root).unwrap().expect("imported");
+        let cached = store
+            .target_balance_cache()
+            .get(&block_root)
+            .expect("the import caches the block's totals");
+        let parent = store.target_balance_cache().get(&anchor_root).unwrap();
+        (
+            cached,
+            compute_target_balances(&post_state).expect("altair scan"),
+            parent,
+        )
+    }
+
+    /// Totals derived from the parent's plus a delta are only right if the
+    /// delta is the one filled by the transition that produced the imported
+    /// state. An empty delta would leave the totals at the parent's and the
+    /// pulled-up tip would weigh justification on stale balances.
+    fn assert_cached_totals_match_a_scan(
+        (cached, scanned, parent): (TargetBalances, TargetBalances, TargetBalances),
+    ) {
+        assert!(
+            scanned.current > parent.current,
+            "the block's attestation must add to the current epoch's total, or this proves nothing"
+        );
+        assert_eq!(cached, scanned, "cached totals must equal a full scan");
+    }
+
+    #[test]
+    fn totals_after_an_import_through_a_used_speculation_equal_a_full_scan() {
+        let (config, store, block, _) = store_with_attesting_altair_child();
+        let speculation = honest_speculation(&store, &block, &config).expect("parent has a state");
+        assert!(
+            speculation.is_for(block.message_hash_tree_root(), block.parent_root()),
+            "the speculation stands in, so its own delta must carry the totals"
+        );
+        assert_cached_totals_match_a_scan(import_attesting_child(honest_speculation));
+    }
+
+    #[test]
+    fn totals_after_an_import_through_a_dropped_speculation_equal_a_full_scan() {
+        // A stale speculation is dropped and `on_block_speculative` runs its own
+        // transition with a fresh delta, as it does with no speculation at all.
+        assert_cached_totals_match_a_scan(import_attesting_child(|store, block, config| {
+            let mut speculation = honest_speculation(store, block, config)?;
+            speculation.parent_root = Root::repeat_byte(0xee);
+            Some(speculation)
+        }));
+        assert_cached_totals_match_a_scan(import_attesting_child(|_, _, _| None));
     }
 
     #[test]
@@ -10867,6 +11240,7 @@ mod tests {
             &stf::ExecutionEngine::valid(),
             &CommitteeCache::default(),
             &ActiveBalanceCache::default(),
+            Default::default(),
         );
         outcome.expect("the block applies");
         state.apply_pending_mutations();

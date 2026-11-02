@@ -143,8 +143,7 @@ pub fn state_transition(
     active_balances: &ActiveBalanceCache,
     pubkey_indices: &PubkeyIndexCache,
 ) -> Result<()> {
-    process_slots(state, signed_block.slot(), config)?;
-    apply_block(
+    state_transition_with_options(
         state,
         signed_block,
         validate_result,
@@ -153,6 +152,35 @@ pub fn state_transition(
         committees,
         active_balances,
         pubkey_indices,
+        block::BlockProcessingOptions::default(),
+    )
+}
+
+/// [`state_transition`] with explicit [`block::BlockProcessingOptions`], for
+/// the caller that collects the block's target-balance delta.
+#[allow(clippy::too_many_arguments)]
+pub fn state_transition_with_options(
+    state: &mut BeaconState,
+    signed_block: &containers::SignedBeaconBlock,
+    validate_result: bool,
+    config: &Config,
+    engine: &ExecutionEngine,
+    committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
+    options: block::BlockProcessingOptions,
+) -> Result<()> {
+    process_slots(state, signed_block.slot(), config)?;
+    apply_block_with_options(
+        state,
+        signed_block,
+        validate_result,
+        config,
+        engine,
+        committees,
+        active_balances,
+        pubkey_indices,
+        options,
     )
 }
 
@@ -175,6 +203,32 @@ pub fn apply_block(
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
     pubkey_indices: &PubkeyIndexCache,
+) -> Result<()> {
+    apply_block_with_options(
+        state,
+        signed_block,
+        validate_result,
+        config,
+        engine,
+        committees,
+        active_balances,
+        pubkey_indices,
+        block::BlockProcessingOptions::default(),
+    )
+}
+
+/// [`apply_block`] with explicit [`block::BlockProcessingOptions`].
+#[allow(clippy::too_many_arguments)]
+pub fn apply_block_with_options(
+    state: &mut BeaconState,
+    signed_block: &containers::SignedBeaconBlock,
+    validate_result: bool,
+    config: &Config,
+    engine: &ExecutionEngine,
+    committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
+    options: block::BlockProcessingOptions,
 ) -> Result<()> {
     // After `process_slots`, never before it. A block proposed at the first slot
     // of a fork's activation epoch is the *post*-fork shape while the state
@@ -208,7 +262,7 @@ pub fn apply_block(
         committees,
         active_balances,
         pubkey_indices,
-        block::BlockProcessingOptions::default(),
+        options,
     )?;
 
     // As in `process_slot`: the post-state's root, checked below and needed

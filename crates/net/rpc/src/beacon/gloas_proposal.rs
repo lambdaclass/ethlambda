@@ -434,7 +434,7 @@ struct Prepared {
     preferences: Option<SignedProposerPreferences>,
     /// What the block's state transition may leave unchecked: the reveal, when
     /// the caller set `skip_randao_verification`.
-    options: BlockProcessingOptions,
+    options: BlockProcessingOptions<'static>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -707,7 +707,10 @@ fn prepare(
         head_slot,
         parent_requests,
         preferences,
-        options: BlockProcessingOptions { randao },
+        options: BlockProcessingOptions {
+            randao,
+            ..Default::default()
+        },
     })
 }
 

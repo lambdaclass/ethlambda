@@ -99,10 +99,46 @@ impl ParticipationTotals {
     pub fn compute(state: &BeaconState) -> Result<Self> {
         scan(state, true, |_, _, _| {})
     }
+
+    /// The unslashed timely-target balances of the previous and current epoch
+    /// as raw sums (no one-increment floor), in one scan.
+    ///
+    /// What [`crate::beacon::helpers::target_balances`] caches per block: a
+    /// floored total cannot be extended by a later block's additions. Fails
+    /// like [`Self::compute`].
+    pub fn compute_raw_target(state: &BeaconState) -> Result<(Gwei, Gwei)> {
+        let raw = scan_raw(state, true, |_, _, _| {})?;
+        Ok((
+            raw.previous_flags[constants::TIMELY_TARGET_FLAG_INDEX],
+            raw.current_target,
+        ))
+    }
+}
+
+/// [`ParticipationTotals`] before the one-increment floor.
+struct RawTotals {
+    total_active: Gwei,
+    previous_flags: [Gwei; FLAG_COUNT],
+    current_target: Gwei,
+}
+
+/// [`scan_raw`] with the specification's one-increment floor applied.
+fn scan(
+    state: &BeaconState,
+    current_target: bool,
+    each: impl FnMut(usize, EpochFlags, Gwei),
+) -> Result<ParticipationTotals> {
+    let raw = scan_raw(state, current_target, each)?;
+    let floor = |total: Gwei| total.max(preset::EFFECTIVE_BALANCE_INCREMENT);
+    Ok(ParticipationTotals {
+        total_active_balance: floor(raw.total_active),
+        previous_epoch_flags: raw.previous_flags.map(floor),
+        current_epoch_target: floor(raw.current_target),
+    })
 }
 
 /// Walks the registry once, calling `each(index, flags, effective_balance)` per
-/// validator, and returns the totals.
+/// validator, and returns the raw totals.
 ///
 /// The only place the membership predicates live. `current_target` says
 /// whether the current epoch's list is read at all: the specification's
@@ -112,11 +148,11 @@ impl ParticipationTotals {
 /// At the genesis epoch "previous" and "current" coincide and the
 /// specification reads the CURRENT list for both, so the previous epoch's
 /// list aliases it there.
-fn scan(
+fn scan_raw(
     state: &BeaconState,
     current_target: bool,
     mut each: impl FnMut(usize, EpochFlags, Gwei),
-) -> Result<ParticipationTotals> {
+) -> Result<RawTotals> {
     let (previous_list, current_list, _) = state.altair_validator_lists()?;
     let current_epoch = get_current_epoch(state);
     let previous_epoch = get_previous_epoch(state);
@@ -197,11 +233,10 @@ fn scan(
         return Err(error);
     }
 
-    let floor = |total: Gwei| total.max(preset::EFFECTIVE_BALANCE_INCREMENT);
-    Ok(ParticipationTotals {
-        total_active_balance: floor(total_active),
-        previous_epoch_flags: previous_flags.map(floor),
-        current_epoch_target: floor(current_target_balance),
+    Ok(RawTotals {
+        total_active,
+        previous_flags,
+        current_target: current_target_balance,
     })
 }
 

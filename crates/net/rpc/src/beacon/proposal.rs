@@ -433,7 +433,10 @@ async fn get_block(
         &own_version,
         slot,
         query.randao_reveal,
-        BlockProcessingOptions { randao },
+        BlockProcessingOptions {
+            randao,
+            ..Default::default()
+        },
         graffiti,
     )
     .await;
@@ -478,7 +481,7 @@ async fn produce(
     own_version: &ClientVersionV1,
     slot: Slot,
     randao_reveal: BlsSignature,
-    options: BlockProcessingOptions,
+    options: BlockProcessingOptions<'static>,
     graffiti: Bytes32,
 ) -> Result<(FuluBlockContents, String, ForkName), ApiError> {
     let config = store.config();

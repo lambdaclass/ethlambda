@@ -38,6 +38,7 @@ use crate::beacon::helpers::mutators::{
 use crate::beacon::helpers::predicates::{
     is_active_validator, is_slashable_attestation_data, is_slashable_validator,
 };
+use crate::beacon::helpers::target_balances::TargetBalanceDelta;
 use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{Epoch, Gwei, HashTreeRoot as _, ValidatorIndex};
@@ -79,6 +80,7 @@ pub fn process_operations(
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
     signatures: &mut SignatureBatch,
+    target_delta: Option<&TargetBalanceDelta>,
 ) -> Result<()> {
     // Checked before anything below can mutate `state`, and unconditionally
     // rather than only when `attestations` is non-empty: a refused fork must
@@ -149,6 +151,7 @@ pub fn process_operations(
                 committees,
                 active_balances,
                 signatures,
+                target_delta,
             )
         } else {
             process_attestation(state, attestation, config, committees, signatures)
