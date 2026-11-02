@@ -766,24 +766,6 @@ pub enum ImportOutcome {
     Held,
 }
 
-/// The availability evidence for `block`, or `None` if a column this node
-/// custodies has not arrived yet.
-///
-/// `None` is not "unavailable": it means the question cannot be answered yet,
-/// which is why the caller holds the block rather than rejecting it. A partial
-/// set must never be passed on as evidence, because
-/// `is_data_available_columns` is vacuously true over an empty list and would
-/// import a block whose data nobody has.
-///
-/// Only fulu blocks reach the column shape. A deneb or electra block carrying
-/// blobs would need the blob-and-proof shape, which this node has no source
-/// for, so it is admitted with a log rather than held forever against a
-/// pipeline that does not exist.
-///
-/// `ethlambda_storage::Table::DataColumns` is never pruned today (see its own
-/// doc comment), which is what lets the sidecar-collecting `.expect()`s below
-/// assume a column confirmed present a moment ago by `custody_columns_present`
-/// is still there to decode; a future pruner has to keep that window safe too.
 /// Whether a block at `block_slot` still falls inside the window this node may
 /// insist on data availability for.
 ///
@@ -810,6 +792,28 @@ fn da_check_required_for_slot(block_slot: u64, current_slot: u64, config: &Confi
     block_epoch >= boundary
 }
 
+/// The availability evidence for `block`, or `None` if a column this node
+/// custodies has not arrived yet.
+///
+/// `None` is not "unavailable": it means the question cannot be answered yet,
+/// which is why the caller holds the block rather than rejecting it. A partial
+/// set must never be passed on as evidence, because
+/// `is_data_available_columns` is vacuously true over an empty list and would
+/// import a block whose data nobody has.
+///
+/// Only fulu blocks reach the column shape. A deneb or electra block carrying
+/// blobs would need the blob-and-proof shape, which this node has no source
+/// for, so it is admitted with a log rather than held forever against a
+/// pipeline that does not exist.
+///
+/// A fulu block whose custody columns are all present gets
+/// [`fork_choice::DataAvailability::ColumnsVerified`]: the sidecars are not
+/// read or decoded, because the table only ever holds ones the p2p layer
+/// already checked in full (structure, inclusion proof, KZG), and the spec's
+/// per-sidecar check would repeat that work on the import thread. Debug builds
+/// keep a safety net on the write side instead, in `on_checked_data_columns`.
+/// Mirrors lighthouse, whose verified-column types carry that proof so import
+/// never re-runs KZG.
 fn data_availability_for(
     store: &Store,
     block: &SignedBeaconBlock,
@@ -835,7 +839,7 @@ fn data_availability_for(
 
             // An empty custody set means there is nothing outstanding, not
             // that the question is unanswerable: `custody_columns_present`
-            // below is vacuously true and the resulting `Columns(vec![])` is
+            // below is vacuously true and the resulting evidence is
             // vacuously available, which is the right answer for a caller
             // that supplied every block itself. Only the replay harness
             // (`BlockChainServer::for_replay`) is in that position. A node
@@ -847,32 +851,18 @@ fn data_availability_for(
             let block_root = block.message_hash_tree_root();
 
             // Presence first, over the full set: a column this node has not
-            // yet verified must not even be looked up, since silently
-            // dropping the missing ones would hand back a shorter-but-still-
-            // non-empty list that reads as complete evidence to the caller.
+            // yet stored must not be waved through, since evidence built from
+            // a partial set would read as complete to the caller.
             if !custody_columns_present(store, slot, &block_root, custody_columns) {
                 return None;
             }
 
-            let sidecars = custody_columns
-                .iter()
-                .map(|&index| {
-                    let sidecar = store
-                        .get_data_column(slot, &block_root, index)
-                        .expect("a sidecar this node verified before storing decodes")
-                        .expect("presence just confirmed above");
-                    match sidecar {
-                        DataColumnSidecar::Fulu(sidecar) => sidecar,
-                        // The row decodes by its slot's fork, and this arm is
-                        // the fulu block at that slot.
-                        DataColumnSidecar::Gloas(_) => {
-                            unreachable!("a fulu block's slot decodes its rows as fulu")
-                        }
-                    }
-                })
-                .collect();
-
-            Some(fork_choice::DataAvailability::Columns(sidecars))
+            // Present means verified: `DataColumns` takes only sidecars the
+            // p2p layer's column checks accepted (see `on_checked_data_columns`),
+            // keyed by the root of the header those checks judged. So the
+            // sidecars are neither read back nor verified again here; the KZG
+            // batch they would cost is the one each already paid on arrival.
+            Some(fork_choice::DataAvailability::ColumnsVerified)
         }
         SignedBeaconBlock::Phase0(_)
         | SignedBeaconBlock::Altair(_)
@@ -5223,7 +5213,26 @@ mod tests {
         }
         assert!(matches!(
             data_availability_for(&store, &block, &CUSTODY).unwrap(),
-            fork_choice::DataAvailability::Columns(sidecars) if sidecars.len() == 2
+            fork_choice::DataAvailability::ColumnsVerified
+        ));
+    }
+
+    #[test]
+    fn complete_columns_are_vouched_for_without_being_read() {
+        // The rows are bytes no sidecar decodes from, so any read of them
+        // would fail: presence alone is what the evidence rests on, since the
+        // table holds only sidecars the p2p layer already checked.
+        let store = beacon_store_fulu_at_genesis(0, 0);
+        let block = fulu_block_with_commitments(&store, 2);
+        let root = block.message_hash_tree_root();
+        for index in CUSTODY {
+            store
+                .put_data_column_sidecar(block.slot(), &root, index, vec![0xff])
+                .unwrap();
+        }
+        assert!(matches!(
+            data_availability_for(&store, &block, &CUSTODY),
+            Some(fork_choice::DataAvailability::ColumnsVerified)
         ));
     }
 
@@ -5235,7 +5244,7 @@ mod tests {
         // where a node is configured, not re-derived per block.
         //
         // With no column to require, `custody_columns_present` is vacuously
-        // true and the collected evidence is `Columns(vec![])` rather than
+        // true and the evidence is `ColumnsVerified` rather than
         // `NotRequired`: the commitments are still there, so this is "nothing
         // outstanding", not "no check needed", but the two are equally
         // admissible to `is_data_available_columns`.
@@ -5247,7 +5256,7 @@ mod tests {
         assert!(
             matches!(
                 evidence,
-                Some(fork_choice::DataAvailability::Columns(sidecars)) if sidecars.is_empty()
+                Some(fork_choice::DataAvailability::ColumnsVerified)
             ),
             "an empty custody set has nothing outstanding, so the block is admissible"
         );
