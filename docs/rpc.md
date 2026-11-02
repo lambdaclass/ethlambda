@@ -911,12 +911,13 @@ these are ever sent:
 | `execution_payload_bid` | `{"version":"gloas", "data":<SignedExecutionPayloadBid>}` | A bid passed the `execution_payload_bid` gossip rules, or was accepted by `POST /eth/v1/beacon/execution_payload_bids` |
 | `payload_attestation_message` | `{"version":"gloas", "data":<PayloadAttestationMessage>}` | A message passed the `payload_attestation_message` gossip rules, or was accepted by `POST /eth/v1/beacon/pool/payload_attestations` |
 | `proposer_preferences` | `{"version":"gloas", "data":<SignedProposerPreferences>}` | Preferences passed the `proposer_preferences` gossip rules, or were accepted by `POST /eth/v1/validator/proposer_preferences` |
+| `fast_confirmation` | `{"block":"0x…", "slot":"1", "current_slot":"2"}` | The Fast Confirmation Rule ran, once per slot at the slot's tick, whether or not the confirmed block changed. `block` and `slot` are the most recent confirmed block's, `current_slot` the slot of the run. Not sent while the head is more than 32 slots behind the wall clock (the rule is not run then) |
 
 Never emitted: `single_attestation` (subnet votes are verified and relayed but
 never reach the chain actor), the operation topics (`voluntary_exit`,
 `proposer_slashing`, `attester_slashing`, `bls_to_execution_change`,
 `contribution_and_proof`: no operation pools), `payload_attributes`, the light
-client topics, `blob_sidecar`, and `fast_confirmation` (no producer).
+client topics and `blob_sidecar`.
 
 The gloas topics are emitted by whichever part of the node accepted the object,
 since several never reach the chain actor: the actor publishes `execution_payload`

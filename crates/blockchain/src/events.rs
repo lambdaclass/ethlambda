@@ -98,6 +98,8 @@ pub enum Topic {
     ExecutionPayloadAvailable,
     ExecutionPayloadBid,
     PayloadAttestationMessage,
+    /// Beacon only, and one of the few on this side of the line that is
+    /// emitted: once per run of the Fast Confirmation Rule.
     FastConfirmation,
     ProposerPreferences,
 }
@@ -340,6 +342,8 @@ pub enum ChainEvent {
     PayloadAttestationMessage(Versioned<gloas::PayloadAttestationMessage>),
     /// Beacon `proposer_preferences`.
     ProposerPreferences(Box<Versioned<gloas::SignedProposerPreferences>>),
+    /// Beacon `fast_confirmation`: the Fast Confirmation Rule ran.
+    BeaconFastConfirmation(BeaconFastConfirmationEvent),
 }
 
 impl ChainEvent {
@@ -363,6 +367,7 @@ impl ChainEvent {
             ChainEvent::ExecutionPayloadBid(_) => Topic::ExecutionPayloadBid,
             ChainEvent::PayloadAttestationMessage(_) => Topic::PayloadAttestationMessage,
             ChainEvent::ProposerPreferences(_) => Topic::ProposerPreferences,
+            ChainEvent::BeaconFastConfirmation(_) => Topic::FastConfirmation,
         }
     }
 }
@@ -563,6 +568,20 @@ impl From<&SignedAggregateAndProof> for BeaconAttestationEvent {
             SignedAggregateAndProof::Gloas(signed) => Self::Gloas(signed.message.aggregate.clone()),
         }
     }
+}
+
+/// The Beacon API `fast_confirmation` payload.
+///
+/// Emitted every time the rule runs, whether or not the confirmed block
+/// changed: `block` and `slot` are the most recent confirmed block's, and
+/// `current_slot` is the wall-clock slot of the run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BeaconFastConfirmationEvent {
+    pub block: H256,
+    #[serde(serialize_with = "quoted_or_bare::serialize")]
+    pub slot: u64,
+    #[serde(serialize_with = "quoted_or_bare::serialize")]
+    pub current_slot: u64,
 }
 
 /// The Beacon API `data_column_sidecar` payload.
@@ -781,6 +800,17 @@ impl ChainEvents {
     fn advance_view(&mut self, store: &Store) -> Option<EventView> {
         let previous = std::mem::replace(&mut self.view, EventView::capture(store));
         self.bus.has_subscribers().then_some(previous)
+    }
+
+    /// Beacon `fast_confirmation` for one run of the Fast Confirmation Rule.
+    pub(crate) fn publish_fast_confirmation(&self, block: H256, slot: u64, current_slot: u64) {
+        self.bus.emit(ChainEvent::BeaconFastConfirmation(
+            BeaconFastConfirmationEvent {
+                block,
+                slot,
+                current_slot,
+            },
+        ));
     }
 
     /// `block`: `block` was imported at `slot`, in the store's chain's shape.
@@ -2016,6 +2046,45 @@ mod tests {
             "empty"
         );
         assert_eq!(payload_status_label(ForkName::Gloas, None), "empty");
+    }
+
+    #[test]
+    fn beacon_fast_confirmation_matches_the_specification_example() {
+        let event = ChainEvent::BeaconFastConfirmation(BeaconFastConfirmationEvent {
+            block: root("0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2"),
+            slot: 1,
+            current_slot: 2,
+        });
+        assert_matches_example(
+            event,
+            Topic::FastConfirmation,
+            r#"{"block": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "slot": "1", "current_slot": "2"}"#,
+        );
+    }
+
+    #[test]
+    fn a_fast_confirmation_run_is_published_even_when_nothing_changed() {
+        let store = crate::tests::beacon_store(0, 0);
+        let events = ChainEvents::new(EventBus::default(), &store);
+        let mut receiver = events.subscribe();
+        let block = H256::repeat_byte(5);
+        events.publish_fast_confirmation(block, 7, 9);
+        events.publish_fast_confirmation(block, 7, 10);
+        for current_slot in [9, 10] {
+            match receiver.try_recv().expect("an event per run") {
+                ChainEvent::BeaconFastConfirmation(event) => {
+                    assert_eq!(
+                        event,
+                        BeaconFastConfirmationEvent {
+                            block,
+                            slot: 7,
+                            current_slot
+                        }
+                    );
+                }
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
     }
 
     #[test]
