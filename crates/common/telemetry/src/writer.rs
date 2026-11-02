@@ -402,32 +402,33 @@ mod tests {
         assert_eq!(slots(&mock.inserted().concat()), [0, 1, 2, 3, 4]);
     }
 
-    /// The schema statement succeeds and the insert fails, so the retry only
-    /// recreates the table if a failure re-arms `needs_schema`; a mock that
-    /// failed the schema statement too could not tell.
+    /// One insert succeeds first, so `needs_schema` is already false when the
+    /// next one fails: the retry only recreates the table if the failure
+    /// re-armed it.
     #[tokio::test]
     async fn retries_a_failed_insert_and_recreates_the_table_first() {
         let mock = Mock::default();
-        mock.fail_inserts.store(true, Ordering::SeqCst);
         let tx = start_writer(serve(mock.clone()).await, FAST, 64);
         tx.send(event(0)).await.unwrap();
+        wait_until("the first insert", || mock.inserted().len() == 1).await;
+
+        mock.fail_inserts.store(true, Ordering::SeqCst);
         tx.send(event(1)).await.unwrap();
         wait_until("a failed insert", || mock.failures() >= 1).await;
-
         mock.fail_inserts.store(false, Ordering::SeqCst);
         wait_until("both rows", || mock.inserted().concat().len() == 2).await;
+
         let requests = mock.requests();
         let is_schema = |seen: &Seen| {
             seen.body
                 .starts_with("CREATE TABLE IF NOT EXISTS block_events")
         };
-        assert!(is_schema(&requests[0]) && requests[0].ok);
         let retry = requests
             .iter()
-            .position(|seen| seen.ok && seen.query == INSERT)
+            .rposition(|seen| seen.ok && seen.query == INSERT)
             .unwrap();
         assert!(
-            retry >= 3 && is_schema(&requests[retry - 1]) && requests[retry - 1].ok,
+            is_schema(&requests[retry - 1]) && requests[retry - 1].ok,
             "after a failed insert the table is recreated before the retry"
         );
         assert_eq!(slots(&mock.inserted().concat()), [0, 1]);
