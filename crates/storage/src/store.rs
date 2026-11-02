@@ -4283,7 +4283,7 @@ impl Store {
         let messages = &mut beacon.latest_messages;
         if messages.len() <= slot {
             // Exact growth plus headroom rather than `resize`'s amortized
-            // doubling: attestations name validators in no particular order,
+            // doubling: attestations reference validators in no particular order,
             // so the table is first sized by one high index and then doubled
             // by a slightly higher one, leaving about half of a
             // registry-sized table unused for the life of the process.
