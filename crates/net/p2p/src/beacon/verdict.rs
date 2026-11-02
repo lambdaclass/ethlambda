@@ -405,10 +405,10 @@ impl Validated {
     }
 }
 
-/// Report an accepted gloas object on the Beacon API's event stream, for the
-/// four topics whose objects never reach the chain actor that publishes the
-/// rest (bids and preferences stop here, and a payload attestation message
-/// only ever feeds fork choice).
+/// Report an accepted object on the Beacon API's event stream, for the topics
+/// whose objects never reach the chain actor that publishes the rest (bids
+/// and preferences stop here, a payload attestation message only ever feeds
+/// fork choice, and a subnet attestation is relayed and nothing more).
 ///
 /// Only on `Accept`, since each event names objects that passed the topic's
 /// rules. A queued envelope has not, so `execution_payload_gossip` waits for
@@ -433,6 +433,11 @@ fn publish_gossip_event(server: &P2PServer, object: &Validated) {
         }
         Validated::PayloadAttestation(message) if sink.has_subscribers() => {
             GossipEvent::PayloadAttestationMessage(message.clone())
+        }
+        // The highest-rate event the node has (every attestation on its
+        // backbone subnets), so nothing is cloned for a node nobody listens to.
+        Validated::Attestation { attestation, .. } if sink.has_subscribers() => {
+            GossipEvent::SingleAttestation(attestation.clone())
         }
         _ => return,
     };
@@ -1160,6 +1165,57 @@ mod tests {
         object.forward(&server, Instant::now(), Outcome::Accept);
 
         assert!(chain.aggregates.lock().unwrap().is_empty());
+    }
+
+    /// A sink that keeps what p2p reported, with a switchable audience.
+    #[derive(Default)]
+    struct RecordingSink {
+        subscribed: bool,
+        events: std::sync::Mutex<Vec<GossipEvent>>,
+    }
+
+    impl ethlambda_network_api::GossipEventSink for RecordingSink {
+        fn has_subscribers(&self) -> bool {
+            self.subscribed
+        }
+
+        fn emit(&self, event: GossipEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    /// A subnet attestation reaches the event sink on `Accept` alone, and only
+    /// when someone listens.
+    #[tokio::test]
+    async fn an_accepted_subnet_attestation_reaches_the_event_sink_only_when_listened_to() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let forward = |server: &P2PServer, outcome| {
+            Validated::Attestation {
+                attestation: Box::new(electra_attestation(5, 1)),
+                subnet_id: 0,
+            }
+            .forward(server, Instant::now(), outcome)
+        };
+
+        let silent = Arc::new(RecordingSink::default());
+        server.gossip_events = Some(silent.clone());
+        forward(&server, Outcome::Accept);
+        assert!(silent.events.lock().unwrap().is_empty());
+
+        let sink = Arc::new(RecordingSink {
+            subscribed: true,
+            ..Default::default()
+        });
+        server.gossip_events = Some(sink.clone());
+        forward(&server, Outcome::Ignore(IgnoreReason::Overloaded));
+        forward(&server, Outcome::Reject(RejectReason::BadSignature));
+        assert!(sink.events.lock().unwrap().is_empty());
+        forward(&server, Outcome::Accept);
+        let events = sink.events.lock().unwrap();
+        let [GossipEvent::SingleAttestation(attestation)] = events.as_slice() else {
+            panic!("expected exactly one single attestation event, got {events:?}");
+        };
+        assert_eq!(**attestation, electra_attestation(5, 1));
     }
 
     /// What `forward` handed the chain actor, by method.

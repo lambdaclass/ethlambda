@@ -694,6 +694,11 @@ pub enum GossipEvent {
     PayloadAttestationMessage(PayloadAttestationMessage),
     /// A `proposer_preferences` message passed gossip validation.
     ProposerPreferences(Box<SignedProposerPreferences>),
+    /// A `beacon_attestation_{subnet_id}` single attestation passed gossip
+    /// validation (the `single_attestation` event). Boxed: it is the largest
+    /// payload here after the bids, and the event ring is sized for the
+    /// largest variant.
+    SingleAttestation(Box<SingleAttestation>),
 }
 
 /// Where `ethlambda-p2p` reports [`GossipEvent`]s.
