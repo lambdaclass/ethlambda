@@ -75,6 +75,21 @@
 //! A key that fails is never cached in either structure, so an invalid key
 //! costs a full check every time, exactly as before, and cannot grow either.
 //!
+//! # Why a message is hashed once
+//!
+//! Hashing a signing root to a G2 point costs about as much as a hundred
+//! microseconds of pairing work, and the same root is signed by every attester
+//! of a slot. [`verify`], [`aggregate_verify`], [`fast_aggregate_verify`] and
+//! [`SignatureSet`] therefore do not call `blst`'s one-shot verifiers, which
+//! hash on every call: they take the hash from a small two-generation cache
+//! (`hashed_messages`) and run the pairing equation over it themselves (in
+//! `primitives`, the only module with raw `blst` point calls). Decoding and
+//! validation are unchanged, and `primitives::pairing_check` refuses an
+//! identity key explicitly, since a hand-built pairing would otherwise skip it
+//! where `blst`'s verifier fails it. [`verify_signature_sets`] additionally
+//! groups its sets by message, so a batch pays one pairing per distinct
+//! message.
+//!
 //! # `bool` versus `Result`
 //!
 //! The verification functions ([`verify`], [`aggregate_verify`],
@@ -125,8 +140,8 @@
 use std::collections::HashMap;
 use std::sync::{LazyLock, OnceLock, RwLock};
 
+use blst::MultiPoint;
 use blst::min_pk::{AggregatePublicKey, AggregateSignature, PublicKey, Signature};
-use blst::{BLST_ERROR, MultiPoint};
 use rayon::prelude::*;
 
 use ethlambda_types::beacon::error::{Error, Result};
@@ -136,6 +151,9 @@ use ethlambda_types::beacon::primitives::{
 
 mod batch;
 pub use batch::{SignatureSet, verify_signature_sets};
+
+mod hashed_messages;
+mod primitives;
 
 /// The ciphersuite the specification pins BLS signatures to: the IETF BLS
 /// draft's proof-of-possession scheme over BLS12-381's G2, using SHA-256 in
@@ -546,8 +564,19 @@ pub fn verify<K: PubkeySource>(pubkey: &K, message: Root, signature: &BlsSignatu
     let Ok(signature) = Signature::sig_validate(signature.as_ref(), false) else {
         return false;
     };
-    let result = signature.verify(false, message.as_slice(), DST, &[], &pubkey, false);
-    result == BLST_ERROR::BLST_SUCCESS
+    pairing_verify(&pubkey, &message, &signature)
+}
+
+/// `e(pubkey, H(message)) == e(G1, signature)` for already validated points,
+/// with `H(message)` from [`hashed_messages`]'s cache.
+///
+/// The one pairing every single check goes through. An identity `pubkey` (a
+/// sum of cancelling keys) is refused by [`primitives::pairing_check`].
+fn pairing_verify(pubkey: &PublicKey, message: &Root, signature: &Signature) -> bool {
+    let hashed = hashed_messages::hashed_message(message);
+    let key = blst::blst_p1_affine::from(*pubkey);
+    let signature = blst::blst_p2_affine::from(*signature);
+    primitives::pairing_check(&[(&key, &hashed)], &signature)
 }
 
 /// The specification's `bls.Aggregate(signatures) -> BLSSignature`.
@@ -596,10 +625,17 @@ pub fn aggregate_verify(
     let Some(points) = validated_pubkeys(pubkeys) else {
         return false;
     };
-    let point_refs: Vec<&PublicKey> = points.iter().collect();
-    let message_refs: Vec<&[u8]> = messages.iter().map(Root::as_slice).collect();
-    let result = signature.aggregate_verify(false, &message_refs, DST, &point_refs, false);
-    result == BLST_ERROR::BLST_SUCCESS
+    // Hashing the distinct messages is the bulk of this check, and the cache
+    // is thread-safe, so the hashes (cached or not) fan out like blst's did.
+    let hashed: Vec<blst::blst_p2_affine> = messages
+        .par_iter()
+        .with_min_len(KEY_VALIDATE_MIN_PAR_LEN)
+        .map(hashed_messages::hashed_message)
+        .collect();
+    let keys: Vec<blst::blst_p1_affine> = points.iter().copied().map(Into::into).collect();
+    let pairs: Vec<(&blst::blst_p1_affine, &blst::blst_p2_affine)> =
+        keys.iter().zip(&hashed).collect();
+    primitives::pairing_check(&pairs, &signature.into())
 }
 
 /// The specification's
@@ -632,9 +668,7 @@ pub fn fast_aggregate_verify<K: PubkeySource>(
     let Some(aggregated) = sum_validated_points(&points) else {
         return false;
     };
-    let result =
-        signature.fast_aggregate_verify_pre_aggregated(false, message.as_slice(), DST, &aggregated);
-    result == BLST_ERROR::BLST_SUCCESS
+    pairing_verify(&aggregated, &message, &signature)
 }
 
 /// `specs/altair/bls.md`'s `eth_aggregate_pubkeys(pubkeys) -> BLSPubkey`.
@@ -701,6 +735,46 @@ pub use warm::warm_pubkeys;
 mod tests {
     use super::*;
     use blst::min_pk::AggregatePublicKey;
+
+    #[test]
+    fn aggregate_verify_agrees_with_blst_over_distinct_and_repeated_messages() {
+        // 40 signers is past the parallel hashing threshold; messages repeat
+        // in the second round.
+        for distinct in [40u8, 3] {
+            let keys: Vec<blst::min_pk::SecretKey> = (0..40u64)
+                .map(|seed| {
+                    let mut ikm = [0x3cu8; 32];
+                    ikm[..8].copy_from_slice(&seed.to_le_bytes());
+                    blst::min_pk::SecretKey::key_gen(&ikm, &[]).unwrap()
+                })
+                .collect();
+            let pubkeys: Vec<BlsPubkey> = keys
+                .iter()
+                .map(|key| BlsPubkey(key.sk_to_pk().to_bytes()))
+                .collect();
+            let messages: Vec<Root> = (0..40u8).map(|i| Root::from([i % distinct; 32])).collect();
+            let signatures: Vec<BlsSignature> = keys
+                .iter()
+                .zip(&messages)
+                .map(|(key, message)| {
+                    BlsSignature(key.sign(message.as_slice(), DST, &[]).to_bytes())
+                })
+                .collect();
+            let aggregated = aggregate(&signatures).unwrap();
+            assert!(aggregate_verify(&pubkeys, &messages, &aggregated));
+            let mut swapped = messages.clone();
+            swapped.swap(0, 1);
+            assert_eq!(
+                aggregate_verify(&pubkeys, &swapped, &aggregated),
+                messages[0] == messages[1]
+            );
+            assert!(!aggregate_verify(
+                &pubkeys[1..],
+                &messages[1..],
+                &aggregated
+            ));
+        }
+    }
 
     #[test]
     fn key_validate_rejects_the_all_zero_pubkey() {
