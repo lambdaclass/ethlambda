@@ -1,6 +1,6 @@
 //! The Ethereum Engine API, as a consensus-layer follower needs it.
 //!
-//! Wire concerns only: JWT authentication, the JSON-RPC envelope, and the four
+//! Wire concerns only: JWT authentication, the JSON-RPC envelope, and the
 //! methods a follower calls. Nothing here knows what a beacon block is beyond
 //! the containers it serializes, and nothing here decides what an answer means.
 //! Assembling a request from a block, and reading a status as a fork choice
@@ -17,9 +17,11 @@
 //!
 //! Payload building (`PayloadAttributesV3` on `forkchoiceUpdated`, and
 //! Osaka's `engine_getPayloadV5`) is in [`building`], for the Beacon API's
-//! block production. Two method families a full client would have are
-//! deliberately absent: `engine_getBlobs*`, because there is no blob-pool
-//! fetch path and data columns come from peers; and
+//! block production. `engine_getBlobsV2` is called for held fulu blocks, to
+//! rebuild data columns from the execution client's blob pool. `V3` is not:
+//! it answers partially, a column needs one cell from every blob, and without
+//! partial-column assembly a partial blob set yields no complete column. One
+//! method family a full client would have is deliberately absent:
 //! `engine_getPayloadBodies*`, because nothing consumes them.
 
 pub mod auth;
@@ -31,7 +33,9 @@ pub mod types;
 pub use auth::JwtSecret;
 pub use client::EngineClient;
 pub use error::EngineError;
-pub use types::{CustodyColumns, ForkchoiceStateV1, PayloadStatusV1, PayloadStatusValue};
+pub use types::{
+    BlobAndProofV2, CustodyColumns, ForkchoiceStateV1, PayloadStatusV1, PayloadStatusValue,
+};
 
 /// The methods this client will call, sent in the `engine_exchangeCapabilities`
 /// handshake.
@@ -45,5 +49,6 @@ pub const ETHLAMBDA_ENGINE_CAPABILITIES: &[&str] = &[
     "engine_forkchoiceUpdatedV4",
     "engine_getPayloadV5",
     "engine_getPayloadV6",
+    "engine_getBlobsV2",
     "engine_getClientVersionV1",
 ];
