@@ -46,7 +46,7 @@ interface. A rejected URL is never echoed back, since it may hold a password.
 | `slot`, `slot_start_date_time` | The block's slot and when it started |
 | `time_into_slot_ms` | Offset from the slot start; NULL outside the two slots after it (catch-up, backfill) |
 | `block_root` | `0x`-prefixed |
-| `source` | Blocks: `gossip`, `sync`, `replay`. Columns: `gossip`, `by_root`, `by_range`, `local`, `recheck` |
+| `source` | Blocks: `gossip`, `sync` (`replay` comes only from the offline benchmark and replay commands, which never install telemetry). Columns: `gossip`, `by_root`, `by_range`, `local`, `recheck` |
 | `verdict` | `el_verdict` rows only: `Valid`, `Optimistic`, `Invalid` |
 | `column_index` | `column_*` rows only |
 
@@ -57,9 +57,12 @@ state transition, or failed); a block that never leaves a hold has no rows, and
 a re-delivery of a block already stored writes none. Silver's names are used
 where the meaning matches; every other section of the
 [import timing](./metrics.md#block-import-timing) is written as
-`<section>_start` and `<section>_end`. A block that arrived by a path the import
-timing does not measure (one this node built, or one re-delivered after its slot
-had not started) writes no rows.
+`<section>_start` and `<section>_end`. The only block that writes no rows is
+lean's locally built one, which crossed no wire and carries no source. A block
+re-delivered after waiting for its slot reports under its original source and
+adds `defer_start` and `defer_end`. On `beacon`, a proposal handed over by a
+validator client enters as `gossip`, with `received` at the hand-off and no
+`decode_end` row.
 
 | Stage | Meaning |
 |---|---|
@@ -67,7 +70,7 @@ had not started) writes no rows.
 | `da_available` | The data-availability check passed for a block that needed columns. A block with nothing to wait for (no blobs, or gloas, whose data gates the envelope instead) writes `da_check_end` instead |
 | `el_sent`, `el_verdict` | `engine_newPayload` sent and answered; only when an execution client answered |
 | `stf_done` | The state transition finished |
-| `attestable` | The new head including the block is computed, as in Silver. Beacon recomputes the head once per arriving block, after the whole import cascade, so every block that cascade imported gets the same time; lean updates its head per block |
+| `attestable` | The new head including the block is computed, as in Silver. Beacon recomputes the head once per arriving block, after the whole import cascade, so every block that cascade imported gets the same time, and only when that head computation succeeded (a failed one moves nothing, so writes no `attestable`); lean updates its head per block |
 | `failed` | The import failed; `stf_done` and lean's `attestable` are then written as `stf_end` and `fc_head_end` |
 | `column_recv`, `column_validated` | A data column arrived, and passed validation. Written only for a column that passed (or, for `column_recv`, was judged to wait for its block), as Silver does, so rejected columns and re-delivered stored ones write nothing. At least once per block, column and stage: a column delivered again while it waits, or two copies passing at once, write again, so take the earliest. A column that waited writes `column_validated` with source `recheck`, so join the two on block root and column index, not on source. By-root and by-range answers stamp every column with the moment the whole answer reached the handler. A gossip-accepted column's `column_validated` comes after the verdict's trip back through the p2p actor; a checked one's when its check finished |
 | `cascade_*`, `prune_*`, `get_head_*`, `fcu_*` | Once per arrival, filed under the arriving block, when that block was imported in that cascade |
@@ -79,7 +82,25 @@ ethlambda waits for the execution client before the state transition, so
 (`Gossip`, `Rpc`, `Syncing`, ...); a query shared with Silver's rows must
 match both.
 
+## Every stage written
+
+| Group | Stages |
+|---|---|
+| Per block, in order | `received`, `decode_end`, `queue_end`, `defer_start`, `defer_end`, `admit_start`, `admit_end`, `guards_start`, `guards_end`, `preamble_start`, `preamble_end`, `parent_wait_start`, `parent_wait_end`, `cascade_wait_start`, `cascade_wait_end`, `da_check_start`, `da_available` (or `da_check_end`), `columns_wait_start`, `columns_wait_end`, `verify_struct_start`, `verify_struct_end`, `verify_crypto_start`, `verify_crypto_end`, `stf_start`, `stf_done`, `writer_wait_start`, `writer_wait_end`, `db_write_start`, `db_write_end`, `fc_head_start`, `attestable` (lean), `block_atts_start`, `block_atts_end` |
+| Per block, with an execution client | `el_sent`, `el_verdict` |
+| Per block, on failure | `stf_end` and `fc_head_end` in place of `stf_done` and `attestable`, plus `failed` |
+| Per arrival | `cascade_start`, `cascade_end`, `prune_start`, `prune_end`, `get_head_start`, `get_head_end`, `fcu_start`, `fcu_end`, and (beacon) `attestable` |
+| Per column | `column_recv`, `column_validated` |
+
+Only the stages a block actually crossed are written. `decode` and `queue` write
+only their `_end` rows, since `received` is their start. `admit_*` is the
+chain actor's admission section; it is written here and listed in no other doc.
+
 ## Known gaps
+
+- On a node with a validator client, its own beacon proposals appear under
+  `source = 'gossip'` with near-zero arrival latency. Filter them out by their
+  missing `decode_end` row when comparing with another client.
 
 - A held block keeps its arrival marks (`received`, `decode_end`,
   `queue_end`, `defer_*`, `admit_*`, the starts of its waits) across the

@@ -43,6 +43,7 @@ crates/
     ├─ crypto/              # XMSS sign/verify + aggregation (leanVM wrapper)
     ├─ ssz-tree/            # Persistent Merkle tree (List/Vector) behind the beacon registry and balances
     ├─ metrics/             # Prometheus re-exports, TimingGuard, gather utilities
+    ├─ telemetry/           # ClickHouse block_events rows (opt-in)
     └─ test-fixtures/       # Spec-fixture loading (prod dep of rpc's Hive test driver)
   net/
     ├─ api/                 # Actor protocol traits wiring BlockChain ↔ P2P
@@ -597,7 +598,8 @@ life, per data column arrival) to ClickHouse over HTTP. A global sink, installed
 before `P2P::spawn`; `ethlambda_telemetry::emit(|| ...)` builds nothing when it is off. Rows
 come from `BlockImportReport::telemetry_events` (final pass only, `imported_here`),
 `CascadeTelemetry` (arrival rows, and beacon `attestable` at the per-arrival head
-recomputation), and p2p's `column_checks::column_rows` (after the check). See
+recomputation), and p2p's column rows: `column_checks::column_rows` (after the check), and
+`passed_rows` called directly by the gossip-accept path and by this node's own fulu columns. See
 [`docs/telemetry.md`](docs/telemetry.md).
 
 ## Beacon Chain types (`crates/common/types/src/beacon/`)
