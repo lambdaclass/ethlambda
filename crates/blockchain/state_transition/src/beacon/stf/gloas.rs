@@ -1441,9 +1441,11 @@ pub fn process_attestation(
             let had_no_participation = current_flags == 0;
 
             // The attester's validator is read at most once, on the first
-            // flag it newly earns: each read is a tree descent, and the
-            // effective balance cannot change inside this read-only phase.
-            let mut attester_effective_balance: Option<Gwei> = None;
+            // flag it newly earns: each read is a tree descent, and neither
+            // the effective balance nor `slashed` can change inside this
+            // read-only phase. The target-balance delta below needs the same
+            // two values, so both are kept rather than read again.
+            let mut attester: Option<(Gwei, bool)> = None;
             let mut new_flags: ParticipationFlags = 0;
             for &flag_index in &participation_flag_indices {
                 if has_flag(current_flags, flag_index) {
@@ -1451,12 +1453,13 @@ pub fn process_attestation(
                 }
                 new_flags = add_flag(new_flags, flag_index);
                 let weight = constants::PARTICIPATION_FLAG_WEIGHTS[flag_index];
-                let effective_balance = match attester_effective_balance {
-                    Some(effective_balance) => effective_balance,
+                let (effective_balance, _) = match attester {
+                    Some(attester) => attester,
                     None => {
-                        let effective_balance = state.validator(index)?.effective_balance;
-                        attester_effective_balance = Some(effective_balance);
-                        effective_balance
+                        let validator = state.validator(index)?;
+                        let read = (validator.effective_balance, validator.slashed);
+                        attester = Some(read);
+                        read
                     }
                 };
                 let increments = effective_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
@@ -1475,7 +1478,11 @@ pub fn process_attestation(
             if let Some(delta) = target_delta
                 && has_flag(new_flags, constants::TIMELY_TARGET_FLAG_INDEX)
             {
-                delta.record_new_target(current_epoch_target, state.validator(index)?);
+                // Earning the target flag means the loop above reached that
+                // flag and so read the attester.
+                let (effective_balance, slashed) =
+                    attester.expect("a newly earned flag read the attester");
+                delta.record_new_target(current_epoch_target, effective_balance, slashed);
             }
             let will_set_new_flag = new_flags != 0;
 
@@ -1485,8 +1492,8 @@ pub fn process_attestation(
                 && payment.withdrawal.amount > 0
             {
                 // `will_set_new_flag` means the loop above read it already.
-                let effective_balance = match attester_effective_balance {
-                    Some(effective_balance) => effective_balance,
+                let effective_balance = match attester {
+                    Some((effective_balance, _)) => effective_balance,
                     None => state.validator(index)?.effective_balance,
                 };
                 payment.weight = payment.weight.checked_add(effective_balance).ok_or(
