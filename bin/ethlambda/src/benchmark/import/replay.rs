@@ -199,6 +199,14 @@ pub(crate) async fn replay_corpus(dir: &Path, options: &ReplayOptions) -> eyre::
     // The same refusal startup makes, so a gloas corpus fails with its real
     // reason rather than partway through replay.
     crate::refuse_unfollowable_fork(anchor_state.fork_name())?;
+    // Mirrors what node startup does on its head state, so the first imports
+    // do not pay for validating the registry's keys.
+    let warm_started = Instant::now();
+    let warmed = ethlambda_blockchain::warm_registry_pubkeys(&anchor_state);
+    eprintln!(
+        "registry warm-up: {warmed} keys validated in {:?}",
+        warm_started.elapsed()
+    );
     let store = fork_choice::get_forkchoice_store(backend, anchor_state, anchor_block, &config)?;
     // A clone, not a borrow: `Store::set_time_ms` writes to the shared
     // backend's metadata, so this clone's write is the write every other
