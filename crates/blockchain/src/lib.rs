@@ -49,7 +49,7 @@ use crate::beacon_envelope::EnvelopeQueues;
 use crate::block_builder::ProposerConfig;
 use crate::events::ChainEvents;
 use crate::import_timing::{
-    BlockImportReport, CascadeTelemetry, CascadeTimings, HeadTimings, ImportTimings,
+    BlockImportReport, CascadeTelemetry, CascadeTimings, EngineAnswer, HeadTimings, ImportTimings,
 };
 use crate::store::StoreError;
 
@@ -1784,11 +1784,17 @@ impl BlockChainServer {
                     let evidence =
                         data_availability_for(&self.store, &beacon_block, &self.custody_columns);
                     timings.da_check_end = Some(Instant::now());
-                    // Only a block with columns to wait for has made data
+                    // Only a block with data to wait for has made data
                     // available; a gloas block or one with no commitments is
-                    // answered `NotRequired`.
-                    timings.da_columns_required =
-                        matches!(evidence, Some(fork_choice::DataAvailability::Columns(_)));
+                    // answered `NotRequired`. Exhaustive, so a new kind of
+                    // evidence has to say which it is.
+                    timings.da_columns_required = match &evidence {
+                        Some(
+                            fork_choice::DataAvailability::Columns(_)
+                            | fork_choice::DataAvailability::Blobs { .. },
+                        ) => true,
+                        Some(fork_choice::DataAvailability::NotRequired) | None => false,
+                    };
                     match evidence {
                         Some(evidence) => evidence,
                         None => {
@@ -1808,13 +1814,18 @@ impl BlockChainServer {
                 // `is_data_available` runs before `state_transition`, so a
                 // block about to be held for its custody columns is never one
                 // this node asks an execution client about.
-                timings.engine_start = Some(Instant::now());
+                let sent = Instant::now();
+                timings.engine_start = Some(sent);
                 let validity = match &self.engine {
                     None => fork_choice::PayloadValidity::NotRequired,
                     Some(client) => match beacon_engine::ask(client, &beacon_block).await {
                         Ok(None) => fork_choice::PayloadValidity::NotRequired,
                         Ok(Some(validity)) => {
-                            timings.engine_verdict = Some(verdict_label(&validity));
+                            timings.engine_answer = Some(EngineAnswer {
+                                sent,
+                                answered: Instant::now(),
+                                verdict: verdict_label(&validity),
+                            });
                             validity
                         }
                         // No answer after the whole ladder.
