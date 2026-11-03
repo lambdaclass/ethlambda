@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::sync::{LazyLock, RwLock};
 
-use blst::blst_p2_affine;
+use silver_crypto_simd::bls::G2Point;
 
 use ethlambda_types::beacon::primitives::Root;
 
@@ -36,14 +36,14 @@ static HASHED_MESSAGES: LazyLock<HashedMessages> =
     LazyLock::new(|| HashedMessages::new(MAX_HASHED_MESSAGES));
 
 /// `root` hashed to G2 under the BLS DST, from the process-wide cache.
-pub(super) fn hashed_message(root: &Root) -> blst_p2_affine {
+pub(super) fn hashed_message(root: &Root) -> G2Point {
     HASHED_MESSAGES.get(root)
 }
 
 #[derive(Default)]
 struct Generations {
-    live: HashMap<Root, blst_p2_affine>,
-    prev: HashMap<Root, blst_p2_affine>,
+    live: HashMap<Root, G2Point>,
+    prev: HashMap<Root, G2Point>,
 }
 
 /// The two-generation cache; see the module documentation.
@@ -62,7 +62,7 @@ impl HashedMessages {
     }
 
     /// The hash of `root`, computed (outside any lock) on a miss.
-    fn get(&self, root: &Root) -> blst_p2_affine {
+    fn get(&self, root: &Root) -> G2Point {
         let promotable = {
             let generations = self.generations.read().unwrap();
             if let Some(point) = generations.live.get(root) {
@@ -84,7 +84,7 @@ impl HashedMessages {
 
     /// Adds `root` to `live`, retiring `live` into `prev` first if it is full.
     /// A racing writer of the same root leaves the first entry in place.
-    fn insert(&self, root: Root, point: blst_p2_affine) {
+    fn insert(&self, root: Root, point: G2Point) {
         let mut generations = self.generations.write().unwrap();
         if generations.live.contains_key(&root) {
             return;
@@ -119,8 +119,8 @@ mod tests {
         Root::from(bytes)
     }
 
-    fn bytes_of(point: &blst_p2_affine) -> [u8; 96] {
-        blst::min_pk::Signature::from(*point).to_bytes()
+    fn bytes_of(point: &G2Point) -> [u8; 96] {
+        blst::min_pk::Signature::from(*point.as_blst()).to_bytes()
     }
 
     #[test]
@@ -139,9 +139,9 @@ mod tests {
         let message = root(2);
         let signature = key.sign(message.as_slice(), super::super::DST, &[]);
         let hashed = hashed_message(&message);
-        let pk = blst::blst_p1_affine::from(key.sk_to_pk());
-        let sig = blst_p2_affine::from(signature);
-        assert!(primitives::pairing_check(&[(&pk, &hashed)], &sig));
+        let pk = primitives::g1_point(&key.sk_to_pk());
+        let sig = G2Point::from_blst(blst::blst_p2_affine::from(signature)).unwrap();
+        assert!(primitives::core_pairing_check(&pk, &hashed, &sig));
     }
 
     #[test]

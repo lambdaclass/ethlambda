@@ -18,6 +18,17 @@
 //! `verify_cell_kzg_proof_batch` and does not export them, so they are
 //! reimplemented here directly from the spec text.
 //!
+//! Two functions run on [`silver_crypto_simd`] instead of c-kzg:
+//! [`compute_cells`] and [`verify_cell_kzg_proof_batch`], the cell extension
+//! and the cell-proof batch check every data column goes through. On an x86-64
+//! CPU with AVX-512 IFMA they work on eight field elements, curve points or
+//! Miller loops at a time; elsewhere the same API runs portable Rust and blst.
+//! Both carry Ethereum's trusted setup themselves and return the
+//! specification's verdict. Everything else here (commitments, blob proofs,
+//! cell proofs and recovery) stays on c-kzg, which `silver_crypto_simd` does
+//! not replace. A cell is therefore this module's own [`Cell`], a byte array,
+//! converted to c-kzg's type only at the calls into c-kzg.
+//!
 //! Every function accepts untrusted bytes and returns [`Result`] rather than
 //! panicking. The deneb spec says as much of its own public functions: they
 //! "MUST accept raw bytes as input and perform the required cryptographic
@@ -29,19 +40,91 @@
 //! rejection directly: many cases have `output: null`, meaning the operation
 //! must fail rather than panic.
 
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex, PoisonError};
 
 use num_bigint::BigUint;
+use silver_crypto_simd::bls::{COMPRESSED_LEN, uncompress_in_g1};
+use silver_crypto_simd::kzg::{
+    BYTES_PER_BLOB, BYTES_PER_CELL, BYTES_PER_FIELD_ELEMENT, CELLS_PER_EXT_BLOB, CellBatchVerifier,
+    CellExtender,
+};
 
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::hash::hash;
 use crate::beacon::primitives::{Bytes32, H256, KzgCommitment, KzgProof};
 
+// The two libraries must agree on the shapes this module converts between.
+const _: () = assert!(BYTES_PER_CELL == c_kzg::BYTES_PER_CELL);
+const _: () = assert!(CELLS_PER_EXT_BLOB == c_kzg::CELLS_PER_EXT_BLOB);
+const _: () = assert!(BYTES_PER_BLOB == c_kzg::BYTES_PER_BLOB);
+
+/// One cell of an extended blob: the fulu spec's `Cell`, `BYTES_PER_CELL`
+/// bytes holding `FIELD_ELEMENTS_PER_CELL` big-endian field elements.
+pub type Cell = [u8; BYTES_PER_CELL];
 /// The cells (equivalently, proofs) produced from one extended blob: the
 /// fulu spec's `CELLS_PER_EXT_BLOB`-length vectors.
-pub type CellsPerExtBlob = [c_kzg::Cell; c_kzg::CELLS_PER_EXT_BLOB];
+pub type CellsPerExtBlob = [Cell; CELLS_PER_EXT_BLOB];
 /// A proof for each cell of an extended blob.
-type ProofsPerExtBlob = [KzgProof; c_kzg::CELLS_PER_EXT_BLOB];
+type ProofsPerExtBlob = [KzgProof; CELLS_PER_EXT_BLOB];
+
+/// The most idle instances a [`Pool`] keeps. More than this many callers at
+/// once still each get an instance; the extras are dropped on return.
+const POOL_MAX_IDLE: usize = 16;
+
+/// The largest batch, in cells, whose [`CellBatchVerifier`] goes back to its
+/// pool. A verifier keeps its buffers at the size of the largest batch it has
+/// checked, so one that checked a whole block's cells is dropped rather than
+/// kept: gossip checks one column at a time, which is far below this.
+const MAX_RETAINED_BATCH_CELLS: usize = 256;
+
+/// Reusable instances of a type that is costly to build and keeps buffers
+/// between uses: `silver_crypto_simd`'s cell verifier and cell extender, which
+/// precompute their domains and setup on construction and take `&mut self`.
+///
+/// A caller takes an idle instance or builds a new one, and gives it back when
+/// done, so concurrent callers (gossip's blocking threads, rayon's workers)
+/// wait on one another only for a `Vec` push or pop, never for a computation.
+struct Pool<T> {
+    idle: Mutex<Vec<T>>,
+    build: fn() -> T,
+}
+
+impl<T> Pool<T> {
+    const fn new(build: fn() -> T) -> Self {
+        Self {
+            idle: Mutex::new(Vec::new()),
+            build,
+        }
+    }
+
+    /// Runs `f` on an idle instance, or a new one, and returns the instance to
+    /// the pool afterwards if `retain` is set and the pool has room.
+    ///
+    /// A panic in `f` drops the instance instead of returning it, and a
+    /// poisoned lock is still usable: the `Vec` is never left half-updated.
+    fn with<R>(&self, retain: bool, f: impl FnOnce(&mut T) -> R) -> R {
+        let idle = self
+            .idle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop();
+        let mut instance = idle.unwrap_or_else(self.build);
+        let result = f(&mut instance);
+        if retain {
+            let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
+            if idle.len() < POOL_MAX_IDLE {
+                idle.push(instance);
+            }
+        }
+        result
+    }
+}
+
+/// Cell-proof batch verifiers for [`verify_cell_kzg_proof_batch`].
+static CELL_VERIFIERS: Pool<CellBatchVerifier> = Pool::new(CellBatchVerifier::new);
+
+/// Blob extenders for [`compute_cells`].
+static CELL_EXTENDERS: Pool<CellExtender> = Pool::new(CellExtender::new);
 
 /// The Ethereum mainnet trusted setup, parsed once.
 ///
@@ -73,6 +156,45 @@ static BLS_MODULUS: LazyLock<BigUint> = LazyLock::new(|| {
     BigUint::parse_bytes(BLS_MODULUS_DECIMAL.as_bytes(), 10)
         .expect("BLS_MODULUS_DECIMAL is a valid base-10 literal")
 });
+
+/// `BLS_MODULUS` as a big-endian field element's bytes, for checking that an
+/// element is canonical by comparing bytes.
+static BLS_MODULUS_BYTES: LazyLock<[u8; BYTES_PER_FIELD_ELEMENT]> = LazyLock::new(|| {
+    BLS_MODULUS
+        .to_bytes_be()
+        .try_into()
+        .expect("BLS_MODULUS is exactly BYTES_PER_FIELD_ELEMENT bytes wide")
+});
+
+/// Whether every field element of `cell` is below `BLS_MODULUS`: the check
+/// `cell_to_coset_evals` makes of each through `bytes_to_bls_field`.
+fn cell_is_canonical(cell: &Cell) -> bool {
+    let (elements, _) = cell.as_chunks::<BYTES_PER_FIELD_ELEMENT>();
+    elements.iter().all(|element| element < &*BLS_MODULUS_BYTES)
+}
+
+/// Whether every encoding is a G1 point the spec's `validate_kzg_g1` accepts:
+/// the point at infinity, or a point of the prime-order subgroup. That is
+/// exactly what `uncompress_in_g1` admits.
+fn all_valid_kzg_g1(encodings: &[[u8; COMPRESSED_LEN]]) -> bool {
+    let mut decoded = vec![None; encodings.len()];
+    uncompress_in_g1(encodings, &mut decoded);
+    decoded.iter().all(Option::is_some)
+}
+
+/// This module's cells as c-kzg's, for the calls into c-kzg.
+fn cells_to_c_kzg(cells: &[Cell]) -> Vec<c_kzg::Cell> {
+    cells.iter().map(|cell| c_kzg::Cell::new(*cell)).collect()
+}
+
+/// c-kzg's cells as this module's, kept on the heap throughout.
+fn cells_from_c_kzg(raw: Box<[c_kzg::Cell; CELLS_PER_EXT_BLOB]>) -> Box<CellsPerExtBlob> {
+    let converted: Vec<Cell> = raw.iter().map(c_kzg::Cell::to_bytes).collect();
+    converted
+        .into_boxed_slice()
+        .try_into()
+        .expect("converted has exactly CELLS_PER_EXT_BLOB elements, one per input cell")
+}
 
 /// Parses raw bytes into a c-kzg blob, rejecting anything but exactly
 /// `BYTES_PER_BLOB` bytes.
@@ -232,11 +354,20 @@ pub fn verify_blob_kzg_proof_batch(
 /// into `CELLS_PER_EXT_BLOB` cells, without the accompanying proofs; see
 /// [`compute_cells_and_kzg_proofs`] when the proofs are needed too. Fails if
 /// `blob` is invalid.
+///
+/// Runs on `silver_crypto_simd`'s extender, whose only refusal is a field
+/// element at or past `BLS_MODULUS`, exactly the blob the spec rejects.
 pub fn compute_cells(blob: &[u8]) -> Result<Box<CellsPerExtBlob>> {
-    let blob = to_blob(blob)?;
-    KZG_SETTINGS
-        .compute_cells(&blob)
-        .map_err(|_| Error::SpecAssert("blob is the evaluation of a valid polynomial"))
+    let blob: &[u8; BYTES_PER_BLOB] = blob
+        .try_into()
+        .map_err(|_| Error::SpecAssert("len(blob) == BYTES_PER_BLOB"))?;
+    let mut cells: Box<CellsPerExtBlob> = vec![[0; BYTES_PER_CELL]; CELLS_PER_EXT_BLOB]
+        .into_boxed_slice()
+        .try_into()
+        .expect("the vector has exactly CELLS_PER_EXT_BLOB cells");
+    let extended = CELL_EXTENDERS.with(true, |extender| extender.compute(blob, &mut cells));
+    verify(extended, "blob is the evaluation of a valid polynomial")?;
+    Ok(cells)
 }
 
 /// The specification's `compute_cells_and_kzg_proofs`
@@ -251,7 +382,7 @@ pub fn compute_cells_and_kzg_proofs(
     let (cells, proofs) = KZG_SETTINGS
         .compute_cells_and_kzg_proofs(&blob)
         .map_err(|_| Error::SpecAssert("blob is the evaluation of a valid polynomial"))?;
-    Ok((cells, proofs_from_c_kzg(proofs)))
+    Ok((cells_from_c_kzg(cells), proofs_from_c_kzg(proofs)))
 }
 
 /// The specification's `recover_cells_and_kzg_proofs`
@@ -263,12 +394,12 @@ pub fn compute_cells_and_kzg_proofs(
 /// cells are given to recover the rest.
 pub fn recover_cells_and_kzg_proofs(
     cell_indices: &[u64],
-    cells: &[c_kzg::Cell],
+    cells: &[Cell],
 ) -> Result<(Box<CellsPerExtBlob>, Box<ProofsPerExtBlob>)> {
     let (cells, proofs) = KZG_SETTINGS
-        .recover_cells_and_kzg_proofs(cell_indices, cells)
+        .recover_cells_and_kzg_proofs(cell_indices, &cells_to_c_kzg(cells))
         .map_err(|_| Error::SpecAssert("cell_indices and cells recover a valid extended blob"))?;
-    Ok((cells, proofs_from_c_kzg(proofs)))
+    Ok((cells_from_c_kzg(cells), proofs_from_c_kzg(proofs)))
 }
 
 /// The specification's `verify_cell_kzg_proof_batch`
@@ -279,25 +410,56 @@ pub fn recover_cells_and_kzg_proofs(
 /// `commitments`, `cell_indices`, `cells`, and `proofs` must have equal
 /// length; fails, rather than returning `false`, if they do not, or if any
 /// entry is malformed.
+///
+/// Runs on `silver_crypto_simd`'s batch verifier, which answers `true`
+/// exactly when the spec does and `false` for everything else, malformed
+/// input included. So a `false` is followed by the spec's own input
+/// assertions, which tell a malformed batch (`Err`) from a well-formed one
+/// that does not verify (`Ok(false)`). That second pass runs only on a
+/// rejection, which a valid column never meets.
 pub fn verify_cell_kzg_proof_batch(
     commitments: &[KzgCommitment],
     cell_indices: &[u64],
-    cells: &[c_kzg::Cell],
+    cells: &[Cell],
     proofs: &[KzgProof],
 ) -> Result<bool> {
-    let commitment_bytes: Vec<c_kzg::Bytes48> = commitments
-        .iter()
-        .map(|commitment| c_kzg::Bytes48::new(commitment.0))
-        .collect();
-    let proof_bytes: Vec<c_kzg::Bytes48> = proofs
-        .iter()
-        .map(|proof| c_kzg::Bytes48::new(proof.0))
-        .collect();
-    KZG_SETTINGS
-        .verify_cell_kzg_proof_batch(&commitment_bytes, cell_indices, cells, &proof_bytes)
-        .map_err(|_| {
-            Error::SpecAssert("commitments, cell_indices, cells, and proofs are consistent")
-        })
+    let commitment_bytes: Vec<[u8; COMPRESSED_LEN]> =
+        commitments.iter().map(|commitment| commitment.0).collect();
+    let proof_bytes: Vec<[u8; COMPRESSED_LEN]> = proofs.iter().map(|proof| proof.0).collect();
+    let retain = cells.len() <= MAX_RETAINED_BATCH_CELLS;
+    let verified = CELL_VERIFIERS.with(retain, |verifier| {
+        verifier.verify(&commitment_bytes, cell_indices, cells, &proof_bytes)
+    });
+    if verified {
+        return Ok(true);
+    }
+
+    // The assertions `verify_cell_kzg_proof_batch` makes of its inputs, in
+    // its own order; any that fails makes the call an error, not a `false`.
+    let n = cells.len();
+    verify(
+        commitment_bytes.len() == n && proof_bytes.len() == n && cell_indices.len() == n,
+        "len(commitments_bytes) == len(cells) == len(proofs_bytes) == len(cell_indices)",
+    )?;
+    verify(
+        cell_indices
+            .iter()
+            .all(|&index| index < CELLS_PER_EXT_BLOB as u64),
+        "cell_index < CELLS_PER_EXT_BLOB",
+    )?;
+    verify(
+        all_valid_kzg_g1(&commitment_bytes),
+        "bytes_to_kzg_commitment(commitment_bytes)",
+    )?;
+    verify(
+        cells.iter().all(cell_is_canonical),
+        "cell_to_coset_evals(cell)",
+    )?;
+    verify(
+        all_valid_kzg_g1(&proof_bytes),
+        "bytes_to_kzg_proof(proof_bytes)",
+    )?;
+    Ok(false)
 }
 
 /// Domain separator for `compute_challenge`: the deneb spec's
@@ -528,10 +690,10 @@ mod tests {
         Some(KzgProof(bytes))
     }
 
-    /// Decodes a `BYTES_PER_CELL`-byte hex string into a [`c_kzg::Cell`], or
-    /// `None` if the length is wrong.
-    fn hex_cell(value: &Value) -> Option<c_kzg::Cell> {
-        c_kzg::Cell::from_bytes(&hex_bytes(value)).ok()
+    /// Decodes a `BYTES_PER_CELL`-byte hex string into a [`Cell`], or `None`
+    /// if the length is wrong.
+    fn hex_cell(value: &Value) -> Option<Cell> {
+        hex_bytes(value).try_into().ok()
     }
 
     #[test]
@@ -790,7 +952,7 @@ mod tests {
                 .iter()
                 .map(|v| v.as_u64().expect("cell index is an integer"))
                 .collect();
-            let cells: Option<Vec<c_kzg::Cell>> = input["cells"]
+            let cells: Option<Vec<Cell>> = input["cells"]
                 .as_sequence()
                 .expect("cells is a list")
                 .iter()
@@ -846,7 +1008,7 @@ mod tests {
                 .iter()
                 .map(hex_commitment)
                 .collect();
-            let cells: Option<Vec<c_kzg::Cell>> = input["cells"]
+            let cells: Option<Vec<Cell>> = input["cells"]
                 .as_sequence()
                 .expect("cells is a list")
                 .iter()
@@ -969,5 +1131,152 @@ mod tests {
             "compute_verify_cell_kzg_proof_batch_challenge: {} cases",
             cases.len()
         );
+    }
+
+    /// A blob of canonical field elements, distinct per `seed`: every
+    /// element's top byte is cleared below `BLS_MODULUS`'s.
+    fn test_blob(seed: u64) -> Vec<u8> {
+        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut blob = vec![0u8; BYTES_PER_BLOB];
+        for chunk in blob.chunks_mut(8) {
+            // xorshift64*: deterministic, and enough to make the cells distinct.
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            chunk.copy_from_slice(&state.wrapping_mul(0x2545_f491_4f6c_dd1d).to_le_bytes());
+        }
+        for element in blob.chunks_mut(BYTES_PER_FIELD_ELEMENT) {
+            element[0] &= 0x3f;
+        }
+        blob
+    }
+
+    /// c-kzg's answer on a batch, as `Ok(verdict)` or `Err(())`.
+    fn c_kzg_verdict(
+        commitments: &[KzgCommitment],
+        cell_indices: &[u64],
+        cells: &[Cell],
+        proofs: &[KzgProof],
+    ) -> std::result::Result<bool, ()> {
+        let commitments: Vec<c_kzg::Bytes48> = commitments
+            .iter()
+            .map(|commitment| c_kzg::Bytes48::new(commitment.0))
+            .collect();
+        let proofs: Vec<c_kzg::Bytes48> = proofs
+            .iter()
+            .map(|proof| c_kzg::Bytes48::new(proof.0))
+            .collect();
+        KZG_SETTINGS
+            .verify_cell_kzg_proof_batch(
+                &commitments,
+                cell_indices,
+                &cells_to_c_kzg(cells),
+                &proofs,
+            )
+            .map_err(|_| ())
+    }
+
+    /// One batch to judge: commitments, cell indices, cells and proofs.
+    type Batch = (Vec<KzgCommitment>, Vec<u64>, Vec<Cell>, Vec<KzgProof>);
+
+    /// [`compute_cells`] (on `silver_crypto_simd`) produces c-kzg's cells for
+    /// valid blobs, and both refuse a blob with a non-canonical element.
+    #[test]
+    fn compute_cells_agrees_with_c_kzg() {
+        for seed in 0..3 {
+            let blob = test_blob(seed);
+            let ours = compute_cells(&blob).unwrap();
+            let theirs = KZG_SETTINGS
+                .compute_cells(&to_blob(&blob).unwrap())
+                .unwrap();
+            assert_eq!(*ours, *cells_from_c_kzg(theirs), "blob {seed}");
+        }
+        let mut invalid = test_blob(9);
+        invalid[BYTES_PER_FIELD_ELEMENT * 17] = 0xff;
+        assert!(compute_cells(&invalid).is_err());
+        assert!(
+            KZG_SETTINGS
+                .compute_cells(&to_blob(&invalid).unwrap())
+                .is_err()
+        );
+        assert!(compute_cells(&invalid[1..]).is_err());
+    }
+
+    /// [`verify_cell_kzg_proof_batch`] gives c-kzg's answer, `Ok(true)`,
+    /// `Ok(false)` or `Err`, on valid batches of several shapes and on every
+    /// way a batch can be wrong or malformed.
+    #[test]
+    fn verify_cell_kzg_proof_batch_agrees_with_c_kzg() {
+        let blobs: Vec<Vec<u8>> = (0..3).map(|seed| test_blob(100 + seed)).collect();
+        let mut commitments = Vec::new();
+        let mut all_cells = Vec::new();
+        let mut all_proofs = Vec::new();
+        for blob in &blobs {
+            commitments.push(blob_to_kzg_commitment(blob).unwrap());
+            let (cells, proofs) = compute_cells_and_kzg_proofs(blob).unwrap();
+            all_cells.push(cells);
+            all_proofs.push(proofs);
+        }
+        let batch = |entries: &[(usize, usize)]| -> Batch {
+            let mut batch: Batch = Default::default();
+            for &(blob, cell) in entries {
+                batch.0.push(commitments[blob]);
+                batch.1.push(cell as u64);
+                batch.2.push(all_cells[blob][cell]);
+                batch.3.push(all_proofs[blob][cell]);
+            }
+            batch
+        };
+        let every_cell: Vec<(usize, usize)> = (0..blobs.len())
+            .flat_map(|blob| (0..CELLS_PER_EXT_BLOB).map(move |cell| (blob, cell)))
+            .collect();
+        let one_column: Vec<(usize, usize)> = (0..blobs.len()).map(|blob| (blob, 5)).collect();
+        let a_few: Vec<(usize, usize)> = vec![(0, 0), (2, 127), (1, 64), (0, 3), (0, 3)];
+
+        let mut cases: Vec<(&str, Batch)> = vec![
+            ("every cell", batch(&every_cell)),
+            ("one column", batch(&one_column)),
+            ("a few, one repeated", batch(&a_few)),
+            ("empty", batch(&[])),
+        ];
+        let base = batch(&one_column);
+        let mut changed = |name: &'static str, edit: &dyn Fn(&mut Batch)| {
+            let mut batch = base.clone();
+            edit(&mut batch);
+            cases.push((name, batch));
+        };
+        changed("a cell's element changed, still canonical", &|b| {
+            b.2[1][31] ^= 1
+        });
+        changed("two proofs swapped", &|b| b.3.swap(0, 2));
+        changed("a cell index changed", &|b| b.1[0] = 6);
+        changed("a commitment swapped", &|b| b.0.swap(0, 1));
+        changed("a non-canonical element", &|b| b.2[2][0] = 0xff);
+        changed("a proof that does not decode", &|b| b.3[1].0[0] ^= 0x80);
+        changed("a commitment that does not decode", &|b| {
+            b.0[0].0[0] ^= 0x80
+        });
+        changed("the infinity commitment", &|b| {
+            b.0[0].0 = [0; COMPRESSED_LEN];
+            b.0[0].0[0] = 0xc0;
+        });
+        changed("a cell index past the extended blob", &|b| {
+            b.1[0] = CELLS_PER_EXT_BLOB as u64;
+        });
+        changed("one cell short", &|b| {
+            b.2.pop();
+        });
+        changed("one proof short", &|b| {
+            b.3.pop();
+        });
+
+        for (name, (commitments, indices, cells, proofs)) in &cases {
+            let ours =
+                verify_cell_kzg_proof_batch(commitments, indices, cells, proofs).map_err(|_| ());
+            let theirs = c_kzg_verdict(commitments, indices, cells, proofs);
+            assert_eq!(ours, theirs, "{name}");
+        }
+        // The valid shapes do verify, so the comparison above is not vacuous.
+        assert_eq!(c_kzg_verdict(&base.0, &base.1, &base.2, &base.3), Ok(true));
     }
 }

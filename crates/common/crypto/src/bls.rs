@@ -1,12 +1,32 @@
 //! The specification's `bls` module: `bls.Verify`, `bls.Aggregate`, and friends.
 //!
-//! The state transition never touches `blst` directly; it calls the functions
-//! here, named exactly as the spec names them (`specs/phase0/beacon-chain.md`'s
-//! "BLS signatures" section, extended by `specs/altair/bls.md`), so a reader can
-//! match a call site against the spec line by line. `blst` is the only backend:
-//! there is no trait to abstract over another one, since the consensus layer has
-//! settled on `blst` as the reference implementation and a second backend would
-//! only be dead code here.
+//! The state transition never touches a BLS library directly; it calls the
+//! functions here, named exactly as the spec names them
+//! (`specs/phase0/beacon-chain.md`'s "BLS signatures" section, extended by
+//! `specs/altair/bls.md`), so a reader can match a call site against the spec
+//! line by line.
+//!
+//! # Which library does what
+//!
+//! Two libraries sit behind these functions, split by operation rather than
+//! behind a trait, since each operation has exactly one implementation:
+//!
+//! - [`silver_crypto_simd`] decodes and subgroup-checks every point (public
+//!   keys and signatures), hashes messages to G2, evaluates every pairing
+//!   equation and computes the weighted sums of a batch. On an x86-64
+//!   CPU with AVX-512 IFMA it works on eight points or eight Miller loops at a
+//!   time; elsewhere it falls back to `blst` and portable Rust through the same
+//!   API. Its decoders return `blst`'s own verdict on every input, and its
+//!   pairing product checks the same equation `blst`'s pairing context does.
+//! - `blst` still adds points (key aggregates, committee sums, signature
+//!   aggregates), signs, and generates keys: `silver_crypto_simd` offers no
+//!   faster route for those, and its points convert to and from `blst`'s
+//!   affine form without a check.
+//!
+//! The one behavior the two disagree on is the identity in a pairing:
+//! `silver_crypto_simd`'s product drops a pair holding it, where `blst` refused
+//! an identity public key. [`core_verify`] and the batch check refuse that key
+//! themselves before any pairing runs; see there.
 //!
 //! # Why every function treats its inputs as unvalidated
 //!
@@ -34,7 +54,7 @@
 //! key validation, and because every active validator's key signs again each
 //! epoch, almost all of it was repeated work.
 //!
-//! So [`PublicKey::key_validate`]'s answer is memoized in [`PubkeyCache`],
+//! So the answer to `KeyValidate` is memoized in [`PubkeyCache`],
 //! which holds it in two structures. Both are keyed, in the end, by the exact
 //! compressed bytes the answer was asked about:
 //!
@@ -80,15 +100,14 @@
 //! Hashing a signing root to a G2 point costs about as much as a hundred
 //! microseconds of pairing work, and the same root is signed by every attester
 //! of a slot. [`verify`], [`aggregate_verify`], [`fast_aggregate_verify`] and
-//! [`SignatureSet`] therefore do not call `blst`'s one-shot verifiers, which
-//! hash on every call: they take the hash from a small two-generation cache
-//! (`hashed_messages`) and run the pairing equation over it themselves (in
-//! `primitives`, the only module with raw `blst` point calls). Decoding and
-//! validation are unchanged, and `primitives::pairing_check` refuses an
-//! identity key explicitly, since a hand-built pairing would otherwise skip it
-//! where `blst`'s verifier fails it. [`verify_signature_sets`] additionally
-//! groups its sets by message, so a batch pays one pairing per distinct
-//! message.
+//! [`SignatureSet`] therefore do not hash inside a one-shot verifier, which
+//! would hash on every call: they take the hash from a small two-generation
+//! cache (`hashed_messages`) and run the pairing equation over it themselves
+//! (in `primitives`, the one module with `silver_crypto_simd` point and
+//! pairing calls). Decoding and validation are unchanged, and the pairing
+//! check refuses an identity key explicitly. [`verify_signature_sets`]
+//! additionally groups its sets by message, so a batch pays one pairing per
+//! distinct message.
 //!
 //! # `bool` versus `Result`
 //!
@@ -123,19 +142,20 @@
 //! `crates/blockchain/src/lib.rs`), so on a multi-core host every one of those
 //! checks but the one currently running would leave a core idle. Validating one
 //! key never reads or writes anything another key's validation touches, so
-//! nothing depends on which order they run in or finish in: the misses go
-//! through `par_iter().map(...).collect::<Option<Vec<_>>>()`, which spreads the
-//! checks across rayon's global thread pool and still collapses to `None` the
-//! moment any key fails, without skipping or weakening [`key_validate`] for a
-//! single key. Each validated point is written back to its own index, which
-//! `aggregate_verify` relies on to keep `points[i]` paired with `messages[i]`.
+//! nothing depends on which order they run in or finish in: the misses are cut
+//! into chunks of [`KEY_DECODE_CHUNK`] keys, each chunk goes to
+//! `silver_crypto_simd`'s batch decoder (eight keys per step on an IFMA CPU) on
+//! rayon's global thread pool, and the result collapses to `None` if any key
+//! fails, without skipping or weakening [`key_validate`] for a single key. Each
+//! validated point is written back to its own index, which `aggregate_verify`
+//! relies on to keep `points[i]` paired with `messages[i]`.
 //!
 //! A hit is a hash-map read, far cheaper than handing work to another thread,
-//! so hits resolve on the calling thread. That matters beyond the saving
-//! itself: gossip validation runs many signature checks at once on blocking
-//! threads, and if every one of them queued its keys on rayon's single global
-//! pool, a burst of aggregates would stall there even with the keys already
-//! validated.
+//! so hits resolve on the calling thread, and so does a miss set no larger than
+//! one chunk. That matters beyond the saving itself: gossip validation runs many
+//! signature checks at once on blocking threads, and if every one of them
+//! queued its keys on rayon's single global pool, a burst of aggregates would
+//! stall there even with the keys already validated.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, OnceLock, RwLock};
@@ -143,6 +163,7 @@ use std::sync::{LazyLock, OnceLock, RwLock};
 use blst::MultiPoint;
 use blst::min_pk::{AggregatePublicKey, AggregateSignature, PublicKey, Signature};
 use rayon::prelude::*;
+use silver_crypto_simd::bls::{G1Point, G2Point, uncompress_in_g1, uncompress_in_g2};
 
 use ethlambda_types::beacon::error::{Error, Result};
 use ethlambda_types::beacon::primitives::{
@@ -166,21 +187,25 @@ mod primitives;
 /// signature reuse.
 pub const DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
-/// The minimum number of public keys rayon may put in one sequential chunk
-/// when [`aggregate_verify`] and [`fast_aggregate_verify`] validate the
-/// signers [`PubkeyCache`] has not seen yet in parallel.
+/// How many public keys [`PubkeyCache`] has not seen go to one call of
+/// `silver_crypto_simd`'s batch decoder when [`aggregate_verify`] and
+/// [`fast_aggregate_verify`] validate them in parallel.
 ///
-/// A devnet or a spec-fixture aggregate can be as small as a single signer,
-/// and splitting a handful of keys across worker threads would spend more
-/// time on task dispatch than [`PublicKey::key_validate`] itself takes to
-/// decompress and subgroup-check one key. `with_min_len` keeps that decision
-/// inside rayon's own splitting logic rather than a hand-rolled length check
-/// before choosing serial or parallel: sixteen is comfortably above the
-/// single-digit-signer inputs a fixture or a small devnet produces, so those
-/// stay on the calling thread, while a mainnet aggregate of hundreds to
-/// thousands of signers still splits into far more chunks than there are
-/// cores to run them on.
-const KEY_VALIDATE_MIN_PAR_LEN: usize = 16;
+/// On an IFMA CPU the decoder works on eight keys per step and finishes a
+/// partial step one key at a time, so a chunk is a multiple of eight. A chunk
+/// is also the unit rayon schedules: this size keeps a task well above rayon's
+/// dispatch cost, while a mainnet block's first import, with tens of thousands
+/// of keys not yet seen, still splits into far more chunks than the pool has
+/// threads. A miss set no larger than one chunk (a fixture's, a devnet's, most
+/// gossip's) is decoded on the calling thread.
+const KEY_DECODE_CHUNK: usize = 64;
+
+/// The fewest messages one rayon task hashes when [`aggregate_verify`] resolves
+/// its messages to G2 points. A hash costs far more than the dispatch of a
+/// task, but a handful of messages (a fixture's, a small devnet's) gain nothing
+/// from leaving the calling thread; `with_min_len` keeps that decision inside
+/// rayon's own splitting.
+const HASH_MIN_PAR_LEN: usize = 16;
 
 /// How many shards [`PubkeyCache`] splits its map across.
 ///
@@ -202,7 +227,7 @@ const PUBKEY_CACHE_SHARDS: usize = 64;
 /// cache existed.
 const MAX_CACHED_PUBKEYS: usize = 1 << 22;
 
-/// Every public key that has passed [`PublicKey::key_validate`], by its
+/// Every public key that has passed `KeyValidate`, by its
 /// compressed bytes, for the whole process.
 ///
 /// Process-wide rather than owned by a `Store`, because nothing about the
@@ -291,7 +316,7 @@ pub struct IndexedPubkey {
 /// Validated, decompressed public keys, by their compressed encoding or by the
 /// registry index they were read at.
 ///
-/// A bounded, append-only memo of [`PublicKey::key_validate`]: an entry is
+/// A bounded, append-only memo of `KeyValidate`: an entry is
 /// only ever added for a key that passed, never changed, and never removed,
 /// since its answer can never change. See the module documentation for why
 /// that is sound.
@@ -438,8 +463,68 @@ impl PubkeyCache {
     }
 }
 
+/// A decoded G1 point as a public key, or `None` for the identity.
+///
+/// `silver_crypto_simd`'s decoder admits the identity, since it is a point of
+/// the subgroup; `KeyValidate` refuses it, as `blst`'s `key_validate` did.
+fn admit_pubkey(point: G1Point) -> Option<PublicKey> {
+    (!point.is_infinity()).then(|| PublicKey::from(point.into_blst()))
+}
+
+/// `KeyValidate` on one encoding, uncached: the point, or `None` if the bytes
+/// do not decode to a subgroup point of G1 or decode to the identity.
+fn decode_pubkey(encoding: &[u8; BLS_PUBKEY_SIZE]) -> Option<PublicKey> {
+    let mut decoded = [None];
+    uncompress_in_g1(std::slice::from_ref(encoding), &mut decoded);
+    decoded[0].and_then(admit_pubkey)
+}
+
+/// `KeyValidate` on each encoding, uncached and in order.
+///
+/// Chunks of [`KEY_DECODE_CHUNK`] go to rayon's pool, unless there is only one;
+/// see the module documentation.
+fn decode_pubkeys(encodings: &[[u8; BLS_PUBKEY_SIZE]]) -> Vec<Option<PublicKey>> {
+    let mut decoded = vec![None; encodings.len()];
+    if encodings.len() <= KEY_DECODE_CHUNK {
+        uncompress_in_g1(encodings, &mut decoded);
+    } else {
+        encodings
+            .par_chunks(KEY_DECODE_CHUNK)
+            .zip(decoded.par_chunks_mut(KEY_DECODE_CHUNK))
+            .for_each(|(input, output)| uncompress_in_g1(input, output));
+    }
+    decoded
+        .into_iter()
+        .map(|point| point.and_then(admit_pubkey))
+        .collect()
+}
+
+/// `signature` as a subgroup point of G2, or `None` if it does not decode to
+/// one. The identity decodes: it is a valid signature encoding (the one an
+/// empty aggregate carries), which `blst`'s `sig_validate(_, false)` accepted
+/// too.
+fn decode_signature(signature: &BlsSignature) -> Option<G2Point> {
+    let mut decoded = [None];
+    uncompress_in_g2(std::slice::from_ref(&signature.0), &mut decoded);
+    decoded[0]
+}
+
+/// The pairing equation every single-message check comes down to,
+/// `e(pubkey, H(message)) == e(G1, signature)`, with `H(message)` from the
+/// hashed-message cache.
+///
+/// The identity key is refused by [`primitives::core_pairing_check`]: a set of
+/// keys that cancel (`P` and `-P`, both valid keys) would otherwise verify
+/// under no signature at all. IETF `CoreVerify` runs `KeyValidate` on the key
+/// it is given, which for `FastAggregateVerify` is the sum. Only a sum can be
+/// the identity: a single key is refused by `KeyValidate` first.
+fn core_verify(pubkey: &PublicKey, message: Root, signature: &G2Point) -> bool {
+    let hashed = hashed_messages::hashed_message(&message);
+    primitives::core_pairing_check(&primitives::g1_point(pubkey), &hashed, signature)
+}
+
 /// `pubkey` as a validated point, or `None` if it is not a valid,
-/// subgroup-correct, non-identity key: [`PublicKey::key_validate`], through
+/// subgroup-correct, non-identity key: `KeyValidate`, through
 /// [`VALIDATED_PUBKEYS`].
 fn validated_pubkey<K: PubkeySource>(pubkey: &K) -> Option<PublicKey> {
     if let Some(point) = VALIDATED_PUBKEYS.get(pubkey) {
@@ -447,7 +532,7 @@ fn validated_pubkey<K: PubkeySource>(pubkey: &K) -> Option<PublicKey> {
         return Some(point);
     }
     crate::metrics::inc_pubkey_cache_lookups(0, 1);
-    let point = PublicKey::key_validate(pubkey.pubkey().as_ref()).ok()?;
+    let point = decode_pubkey(&pubkey.pubkey().0)?;
     VALIDATED_PUBKEYS.insert(pubkey, point);
     Some(point)
 }
@@ -472,10 +557,12 @@ fn validated_pubkeys<K: PubkeySource>(pubkeys: &[K]) -> Option<Vec<PublicKey>> {
     crate::metrics::inc_pubkey_cache_lookups(hits as u64, misses.len() as u64);
 
     if !misses.is_empty() {
-        let fresh: Vec<PublicKey> = misses
-            .par_iter()
-            .with_min_len(KEY_VALIDATE_MIN_PAR_LEN)
-            .map(|&index| PublicKey::key_validate(pubkeys[index].pubkey().as_ref()).ok())
+        let encodings: Vec<[u8; BLS_PUBKEY_SIZE]> = misses
+            .iter()
+            .map(|&index| pubkeys[index].pubkey().0)
+            .collect();
+        let fresh: Vec<PublicKey> = decode_pubkeys(&encodings)
+            .into_iter()
             .collect::<Option<_>>()?;
         for (&index, point) in misses.iter().zip(fresh) {
             VALIDATED_PUBKEYS.insert(&pubkeys[index], point);
@@ -487,7 +574,7 @@ fn validated_pubkeys<K: PubkeySource>(pubkeys: &[K]) -> Option<Vec<PublicKey>> {
 
 /// The sum of `points` as a projective point, or `None` for an empty slice.
 ///
-/// Every point must already have passed [`PublicKey::key_validate`] (they come
+/// Every point must already have passed `KeyValidate` (they come
 /// from [`validated_pubkeys`]), so the sum skips re-checking them. It goes
 /// through blst's `MultiPoint::add`, which hands the whole slice to
 /// `blst_p1s_add`: a batched affine addition that shares one field inversion
@@ -561,22 +648,10 @@ pub fn verify<K: PubkeySource>(pubkey: &K, message: Root, signature: &BlsSignatu
     let Some(pubkey) = validated_pubkey(pubkey) else {
         return false;
     };
-    let Ok(signature) = Signature::sig_validate(signature.as_ref(), false) else {
+    let Some(signature) = decode_signature(signature) else {
         return false;
     };
-    pairing_verify(&pubkey, &message, &signature)
-}
-
-/// `e(pubkey, H(message)) == e(G1, signature)` for already validated points,
-/// with `H(message)` from [`hashed_messages`]'s cache.
-///
-/// The one pairing every single check goes through. An identity `pubkey` (a
-/// sum of cancelling keys) is refused by [`primitives::pairing_check`].
-fn pairing_verify(pubkey: &PublicKey, message: &Root, signature: &Signature) -> bool {
-    let hashed = hashed_messages::hashed_message(message);
-    let key = blst::blst_p1_affine::from(*pubkey);
-    let signature = blst::blst_p2_affine::from(*signature);
-    primitives::pairing_check(&[(&key, &hashed)], &signature)
+    core_verify(&pubkey, message, &signature)
 }
 
 /// The specification's `bls.Aggregate(signatures) -> BLSSignature`.
@@ -588,14 +663,24 @@ fn pairing_verify(pubkey: &PublicKey, message: &Root, signature: &Signature) -> 
 /// curve addition of two points outside the prime-order subgroup can still
 /// land back inside it: an invalid share could otherwise cancel against
 /// another invalid share and slip past a check performed only on the result.
+///
+/// The shares are decoded together, so an IFMA CPU checks eight per step; the
+/// sum is `blst`'s.
 pub fn aggregate(signatures: &[BlsSignature]) -> Result<BlsSignature> {
     ethlambda_types::beacon::error::verify(!signatures.is_empty(), "len(signatures) > 0")?;
-    let encoded: Vec<&[u8]> = signatures
-        .iter()
-        .map(|signature| signature.as_ref())
-        .collect();
-    let aggregated = AggregateSignature::aggregate_serialized(&encoded, true)
-        .map_err(|_| Error::InvalidSignature("aggregate: not a valid, subgroup-correct point"))?;
+    let invalid = || Error::InvalidSignature("aggregate: not a valid, subgroup-correct point");
+    let encodings: Vec<[u8; BLS_SIGNATURE_SIZE]> =
+        signatures.iter().map(|signature| signature.0).collect();
+    let mut decoded = vec![None; encodings.len()];
+    uncompress_in_g2(&encodings, &mut decoded);
+    let shares: Vec<Signature> = decoded
+        .into_iter()
+        .map(|point| point.map(|point| Signature::from(point.into_blst())))
+        .collect::<Option<_>>()
+        .ok_or_else(invalid)?;
+    let share_refs: Vec<&Signature> = shares.iter().collect();
+    // Every share was decoded and subgroup-checked above.
+    let aggregated = AggregateSignature::aggregate(&share_refs, false).map_err(|_| invalid())?;
     Ok(BlsSignature(aggregated.to_signature().to_bytes()))
 }
 
@@ -619,23 +704,27 @@ pub fn aggregate_verify(
     if pubkeys.is_empty() || pubkeys.len() != messages.len() {
         return false;
     }
-    let Ok(signature) = Signature::sig_validate(signature.as_ref(), false) else {
+    let Some(signature) = decode_signature(signature) else {
         return false;
     };
     let Some(points) = validated_pubkeys(pubkeys) else {
         return false;
     };
     // Hashing the distinct messages is the bulk of this check, and the cache
-    // is thread-safe, so the hashes (cached or not) fan out like blst's did.
-    let hashed: Vec<blst::blst_p2_affine> = messages
+    // is thread-safe, so the hashes (cached or not) fan out across rayon's
+    // workers.
+    let hashed: Vec<G2Point> = messages
         .par_iter()
-        .with_min_len(KEY_VALIDATE_MIN_PAR_LEN)
+        .with_min_len(HASH_MIN_PAR_LEN)
         .map(hashed_messages::hashed_message)
         .collect();
-    let keys: Vec<blst::blst_p1_affine> = points.iter().copied().map(Into::into).collect();
-    let pairs: Vec<(&blst::blst_p1_affine, &blst::blst_p2_affine)> =
-        keys.iter().zip(&hashed).collect();
-    primitives::pairing_check(&pairs, &signature.into())
+    // Every key passed `KeyValidate`, so none is the identity.
+    let pairs: Vec<(G1Point, G2Point)> = points
+        .iter()
+        .map(primitives::g1_point)
+        .zip(hashed)
+        .collect();
+    primitives::pairing_product_holds(&pairs, &signature)
 }
 
 /// The specification's
@@ -657,18 +746,18 @@ pub fn fast_aggregate_verify<K: PubkeySource>(
     if pubkeys.is_empty() {
         return false;
     }
-    let Ok(signature) = Signature::sig_validate(signature.as_ref(), false) else {
+    let Some(signature) = decode_signature(signature) else {
         return false;
     };
     let Some(points) = validated_pubkeys(pubkeys) else {
         return false;
     };
-    // `pubkeys` is non-empty, so there is always a sum. The signature was
-    // validated above, which is why the group check stays off here.
+    // `pubkeys` is non-empty, so there is always a sum. It may be the
+    // identity, which `core_verify` refuses.
     let Some(aggregated) = sum_validated_points(&points) else {
         return false;
     };
-    pairing_verify(&aggregated, &message, &signature)
+    core_verify(&aggregated, message, &signature)
 }
 
 /// `specs/altair/bls.md`'s `eth_aggregate_pubkeys(pubkeys) -> BLSPubkey`.
@@ -851,9 +940,11 @@ mod tests {
     fn mixed_hits_and_misses_keep_their_positions() {
         let warm = [fresh_pubkey(1), fresh_pubkey(2)];
         assert!(warm.iter().all(key_validate));
-        // Misses between hits, in a run long enough to go through rayon.
+        // Misses between hits, in a run long enough to go through rayon and to
+        // end on a partial chunk.
+        let misses = 2 * KEY_DECODE_CHUNK as u64 + 3;
         let mut pubkeys = vec![warm[0]];
-        pubkeys.extend((10..10 + 2 * KEY_VALIDATE_MIN_PAR_LEN as u64).map(fresh_pubkey));
+        pubkeys.extend((10..10 + misses).map(fresh_pubkey));
         pubkeys.push(warm[1]);
 
         let points = validated_pubkeys(&pubkeys).expect("every key above is valid");
@@ -1324,6 +1415,227 @@ mod tests {
                     result,
                     "a correctly-aggregated signature over {count} signers must verify ({pass})"
                 );
+            }
+        }
+    }
+
+    /// Encodings `KeyValidate` must judge, with every way to fail: valid keys,
+    /// the same keys with each flag bit flipped (no compression flag, a
+    /// spurious infinity flag, the other `y`), the identity and malformed
+    /// identities, an `x` at or past the field modulus, and random `x`
+    /// coordinates, about half of which are on the curve and almost none of
+    /// those in the subgroup.
+    fn key_encodings_to_judge() -> Vec<[u8; BLS_PUBKEY_SIZE]> {
+        use rand::RngExt;
+        let mut rng = rand::rng();
+        let mut encodings = Vec::new();
+        for seed in 0..40 {
+            let valid = fresh_pubkey(5000 + seed).0;
+            encodings.push(valid);
+            for flag in [0x80, 0x40, 0x20] {
+                let mut flipped = valid;
+                flipped[0] ^= flag;
+                encodings.push(flipped);
+            }
+            let mut last = valid;
+            last[BLS_PUBKEY_SIZE - 1] ^= 1;
+            encodings.push(last);
+        }
+        encodings.push(identity_pubkey().0);
+        let mut noisy_identity = identity_pubkey().0;
+        noisy_identity[BLS_PUBKEY_SIZE - 1] = 1;
+        encodings.push(noisy_identity);
+        encodings.push([0; BLS_PUBKEY_SIZE]);
+        encodings.push([0xff; BLS_PUBKEY_SIZE]);
+        let mut past_modulus = [0xff; BLS_PUBKEY_SIZE];
+        past_modulus[0] = 0x9f;
+        encodings.push(past_modulus);
+        for _ in 0..200 {
+            let mut random = [0u8; BLS_PUBKEY_SIZE];
+            rng.fill(&mut random[..]);
+            random[0] = (random[0] & 0x1f) | 0x80;
+            encodings.push(random);
+        }
+        encodings
+    }
+
+    /// The batch decoder, with its chunking and (on an IFMA CPU) its eight-lane
+    /// kernel, gives `blst`'s `key_validate` verdict on every encoding, and so
+    /// does the single-key path.
+    #[test]
+    fn key_decoding_agrees_with_blst_on_valid_and_corrupt_encodings() {
+        let encodings = key_encodings_to_judge();
+        assert!(encodings.len() > 2 * KEY_DECODE_CHUNK);
+        let reference: Vec<Option<[u8; BLS_PUBKEY_SIZE]>> = encodings
+            .iter()
+            .map(|bytes| PublicKey::key_validate(bytes).ok().map(|p| p.to_bytes()))
+            .collect();
+        assert!(reference.iter().any(Option::is_some));
+        assert!(reference.iter().filter(|r| r.is_none()).count() > encodings.len() / 2);
+
+        let batch = decode_pubkeys(&encodings);
+        for (index, bytes) in encodings.iter().enumerate() {
+            let batched = batch[index].map(|p| p.to_bytes());
+            let single = decode_pubkey(bytes).map(|p| p.to_bytes());
+            assert_eq!(
+                batched, reference[index],
+                "batch, encoding {index}: {bytes:02x?}"
+            );
+            assert_eq!(
+                single, reference[index],
+                "single, encoding {index}: {bytes:02x?}"
+            );
+        }
+    }
+
+    /// The G2 decoder gives `blst`'s `sig_validate(_, false)` verdict on valid
+    /// signatures, corrupted ones, the identity and random `x` coordinates,
+    /// alone and in batches long enough for the eight-lane kernel.
+    #[test]
+    fn signature_decoding_agrees_with_blst_on_valid_and_corrupt_encodings() {
+        use rand::RngExt;
+        let mut rng = rand::rng();
+        let (_, _, aggregate) = build_aggregate(3);
+        let mut encodings = Vec::new();
+        for seed in 0..24u8 {
+            let ikm = [seed.wrapping_add(7); 32];
+            let secret = blst::min_pk::SecretKey::key_gen(&ikm, &[]).unwrap();
+            let valid = secret.sign(&[seed; 32], DST, &[]).to_bytes();
+            encodings.push(valid);
+            for flag in [0x80, 0x40, 0x20] {
+                let mut flipped = valid;
+                flipped[0] ^= flag;
+                encodings.push(flipped);
+            }
+            let mut last = valid;
+            last[BLS_SIGNATURE_SIZE - 1] ^= 1;
+            encodings.push(last);
+        }
+        encodings.push(aggregate.0);
+        encodings.push(G2_POINT_AT_INFINITY);
+        let mut noisy_infinity = G2_POINT_AT_INFINITY;
+        noisy_infinity[BLS_SIGNATURE_SIZE - 1] = 1;
+        encodings.push(noisy_infinity);
+        encodings.push([0; BLS_SIGNATURE_SIZE]);
+        for _ in 0..64 {
+            let mut random = [0u8; BLS_SIGNATURE_SIZE];
+            rng.fill(&mut random[..]);
+            random[0] = (random[0] & 0x1f) | 0x80;
+            encodings.push(random);
+        }
+        let reference: Vec<Option<[u8; BLS_SIGNATURE_SIZE]>> = encodings
+            .iter()
+            .map(|bytes| {
+                Signature::sig_validate(bytes, false)
+                    .ok()
+                    .map(|s| s.to_bytes())
+            })
+            .collect();
+        assert!(reference.iter().any(Option::is_some));
+        assert!(reference.iter().any(Option::is_none));
+
+        let to_bytes = |point: G2Point| Signature::from(point.into_blst()).to_bytes();
+        let mut batch = vec![None; encodings.len()];
+        uncompress_in_g2(&encodings, &mut batch);
+        for (index, bytes) in encodings.iter().enumerate() {
+            let single = decode_signature(&BlsSignature(*bytes)).map(to_bytes);
+            let batched = batch[index].map(to_bytes);
+            assert_eq!(batched, reference[index], "batch, encoding {index}");
+            assert_eq!(single, reference[index], "single, encoding {index}");
+        }
+    }
+
+    /// `n` keypairs, distinct per `(tag, n)`, as secrets and as encodings.
+    fn keypairs(tag: u64, n: usize) -> (Vec<blst::min_pk::SecretKey>, Vec<BlsPubkey>) {
+        let secrets: Vec<blst::min_pk::SecretKey> = (0..n as u64)
+            .map(|i| {
+                let mut ikm = [0x3cu8; 32];
+                ikm[..8].copy_from_slice(&(tag * 1000 + i).to_le_bytes());
+                blst::min_pk::SecretKey::key_gen(&ikm, &[]).unwrap()
+            })
+            .collect();
+        let pubkeys = secrets
+            .iter()
+            .map(|secret| BlsPubkey(secret.sk_to_pk().to_bytes()))
+            .collect();
+        (secrets, pubkeys)
+    }
+
+    fn sign(secret: &blst::min_pk::SecretKey, message: Root) -> BlsSignature {
+        BlsSignature(secret.sign(message.as_slice(), DST, &[]).to_bytes())
+    }
+
+    /// `verify`, `fast_aggregate_verify` and `aggregate_verify` give the answer
+    /// `blst`'s own checks give, over valid inputs, wrong messages, short
+    /// aggregates, the identity signature, and signer counts on both sides of
+    /// the pairing kernel's eight lanes.
+    #[test]
+    fn verification_agrees_with_blst() {
+        use blst::BLST_ERROR::BLST_SUCCESS;
+        use ethlambda_types::beacon::primitives::H256;
+
+        let message = H256([0x51; 32]);
+        let other = H256([0x52; 32]);
+        let infinity = BlsSignature(G2_POINT_AT_INFINITY);
+        let blst_sig = |s: &BlsSignature| Signature::sig_validate(s.as_ref(), false).unwrap();
+        for count in [1usize, 2, 7, 8, 9, 17] {
+            let (secrets, pubkeys) = keypairs(count as u64, count);
+            let blst_keys: Vec<PublicKey> = secrets.iter().map(|s| s.sk_to_pk()).collect();
+            let key_refs: Vec<&PublicKey> = blst_keys.iter().collect();
+            let shares: Vec<BlsSignature> = secrets.iter().map(|s| sign(s, message)).collect();
+            let good = aggregate(&shares).unwrap();
+            let short = match count {
+                1 => infinity,
+                _ => aggregate(&shares[1..]).unwrap(),
+            };
+
+            let cases = [
+                (good, message),
+                (good, other),
+                (short, message),
+                (infinity, message),
+            ];
+            for (signature, msg) in cases {
+                let theirs = blst_sig(&signature).fast_aggregate_verify(
+                    false,
+                    msg.as_slice(),
+                    DST,
+                    &key_refs,
+                ) == BLST_SUCCESS;
+                let ours = fast_aggregate_verify(&pubkeys, msg, &signature);
+                assert_eq!(ours, theirs, "fast_aggregate_verify, {count} signers");
+            }
+            for ((pubkey, secret), point) in pubkeys.iter().zip(&secrets).zip(&blst_keys) {
+                let own = sign(secret, message);
+                for (signature, msg) in [(own, message), (own, other), (infinity, message)] {
+                    let theirs =
+                        blst_sig(&signature).verify(false, msg.as_slice(), DST, &[], point, false)
+                            == BLST_SUCCESS;
+                    assert_eq!(verify(pubkey, msg, &signature), theirs, "verify");
+                }
+            }
+
+            // Distinct messages, one per signer, and the same messages rotated.
+            let messages: Vec<Root> = (0..count).map(|i| H256([i as u8; 32])).collect();
+            let distinct: Vec<BlsSignature> = secrets
+                .iter()
+                .zip(&messages)
+                .map(|(secret, msg)| sign(secret, *msg))
+                .collect();
+            let combined = aggregate(&distinct).unwrap();
+            let mut rotated = messages.clone();
+            rotated.rotate_left(1);
+            for msgs in [&messages, &rotated] {
+                let message_refs: Vec<&[u8]> = msgs.iter().map(Root::as_slice).collect();
+                let theirs = blst_sig(&combined).aggregate_verify(
+                    false,
+                    &message_refs,
+                    DST,
+                    &key_refs,
+                    false,
+                ) == BLST_SUCCESS;
+                let ours = aggregate_verify(&pubkeys, msgs, &combined);
+                assert_eq!(ours, theirs, "aggregate_verify, {count} signers");
             }
         }
     }
