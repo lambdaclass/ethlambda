@@ -5,15 +5,9 @@
 //! with every key its committees touch. Doing the whole registry up front, in
 //! parallel, moves that cost to load time, where nothing waits on it.
 
-use blst::min_pk::PublicKey;
 use rayon::prelude::*;
 
-use super::{IndexedPubkey, VALIDATED_PUBKEYS};
-
-/// Keys one rayon task validates before it takes the next chunk: large enough
-/// that scheduling is noise next to the validations, small enough that the
-/// work still spreads across every core.
-const CHUNK_LEN: usize = 256;
+use super::{IndexedPubkey, KEY_DECODE_CHUNK, VALIDATED_PUBKEYS, decode_pubkeys};
 
 /// Validates and caches every key in `pubkeys`, returning how many passed
 /// `KeyValidate`, whether cached before the call or by it.
@@ -28,24 +22,32 @@ pub fn warm_pubkeys(pubkeys: &[IndexedPubkey]) -> usize {
 /// One pass over `pubkeys`: how many keys passed (cached before or by the
 /// pass) and how many it ran `KeyValidate` on, so a test can tell a cache hit
 /// from a fresh validation.
+///
+/// Each rayon task takes [`KEY_DECODE_CHUNK`] keys and hands the ones the cache
+/// lacks to the batched decoder in one call, which is the size that decoder
+/// keeps on the calling thread: the parallelism is across chunks here, so the
+/// decoder does not queue work on the pool from inside a pool task.
 fn warm(pubkeys: &[IndexedPubkey]) -> (usize, usize) {
     pubkeys
-        .par_chunks(CHUNK_LEN)
+        .par_chunks(KEY_DECODE_CHUNK)
         .map(|chunk| {
             let mut passed = 0;
-            let mut validated = 0;
+            let mut misses: Vec<&IndexedPubkey> = Vec::new();
             for key in chunk {
                 if VALIDATED_PUBKEYS.get(key).is_some() {
                     passed += 1;
-                    continue;
+                } else {
+                    misses.push(key);
                 }
-                validated += 1;
-                if let Ok(point) = PublicKey::key_validate(key.pubkey.as_ref()) {
-                    VALIDATED_PUBKEYS.insert(key, point);
+            }
+            let encodings: Vec<_> = misses.iter().map(|key| key.pubkey.0).collect();
+            for (key, point) in misses.iter().zip(decode_pubkeys(&encodings)) {
+                if let Some(point) = point {
+                    VALIDATED_PUBKEYS.insert(*key, point);
                     passed += 1;
                 }
             }
-            (passed, validated)
+            (passed, misses.len())
         })
         .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
 }

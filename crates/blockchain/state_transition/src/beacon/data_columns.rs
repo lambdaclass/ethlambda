@@ -151,8 +151,8 @@ pub fn get_data_column_sidecars(
             let column: Vec<fulu::Cell> = cells_and_proofs
                 .iter()
                 .map(|(cells, _)| {
-                    SszVector::try_from(cells[column_index].to_bytes().to_vec())
-                        .expect("a c-kzg cell is BYTES_PER_CELL bytes")
+                    SszVector::try_from(cells[column_index].to_vec())
+                        .expect("a cell is BYTES_PER_CELL bytes")
                 })
                 .collect();
             let kzg_proofs: Vec<KzgProof> = cells_and_proofs

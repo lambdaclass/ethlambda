@@ -171,6 +171,10 @@ vergen-git2 = { version = "9", features = ["rustc"] }
 git2 = { version = "0.20", default-features = false }
 
 rayon = "1.11"
+# BLS12-381 decoding and pairings plus PeerDAS cell checks and extension, on
+# AVX-512 IFMA where the CPU has it (runtime detection, no build flags). Used by
+# `ethlambda-crypto`'s `bls` and `ethlambda-state-transition`'s `beacon::kzg`.
+silver_crypto_simd = "0.1.0"
 rand = "0.10"
 lru = "0.16"
 rocksdb = "0.24"
