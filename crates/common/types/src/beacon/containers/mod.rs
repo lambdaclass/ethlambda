@@ -761,6 +761,17 @@ impl ParticipationMut<'_> {
             Self::Progressive(list) => list.get_mut(index),
         }
     }
+
+    /// Buffers `flags` as the entry at `index` without reading the old one,
+    /// which [`Self::get_mut`] does (a tree descent) even when the caller
+    /// already holds it. Returns `false`, writing nothing, past the end.
+    #[must_use = "a write past the end is refused"]
+    pub fn set(&mut self, index: usize, flags: ParticipationFlags) -> bool {
+        match self {
+            Self::Bounded(list) => list.set(index, flags),
+            Self::Progressive(list) => list.set(index, flags),
+        }
+    }
 }
 
 /// The inactivity scores of a state, whichever list kind its fork uses.
