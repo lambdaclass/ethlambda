@@ -261,9 +261,12 @@ fn chunk_holds(sets: &[SignatureSet], order: &[usize], runs: &[Range<usize>]) ->
         return false;
     }
 
+    // Each run's key sum and (on a cache miss) message hash are independent,
+    // and a hash costs about as much as a Miller loop, so they fan out rather
+    // than run one after another inside the chunk.
     let offset = first.start;
     let pairs: Vec<(G1Point, G2Point)> = runs
-        .iter()
+        .par_iter()
         .map(|run| {
             let span = run.start - offset..run.end - offset;
             let key = primitives::weighted_key_sum(&keys[span.clone()], &weights[span]);
