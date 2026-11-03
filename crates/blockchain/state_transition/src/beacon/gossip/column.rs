@@ -1766,10 +1766,8 @@ mod tests {
                 let column: Vec<fulu::Cell> = cells
                     .iter()
                     .map(|blob_cells| {
-                        libssz_types::SszVector::try_from(
-                            blob_cells[index as usize].to_bytes().to_vec(),
-                        )
-                        .expect("exact cell size")
+                        libssz_types::SszVector::try_from(blob_cells[index as usize].to_vec())
+                            .expect("exact cell size")
                     })
                     .collect();
                 let column_proofs: Vec<KzgProof> = proofs
