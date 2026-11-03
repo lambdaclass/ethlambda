@@ -2535,6 +2535,7 @@ impl BlockChainServer {
             return timings;
         }
         timings.head_end = Some(Instant::now());
+        timings.head_ok = true;
         if let Some((head_slot, _)) = self.store.beacon_head() {
             metrics::update_head_slot(head_slot);
         }
@@ -5434,6 +5435,7 @@ mod tests {
             cascade_end: Some(base),
             head_start: Some(base),
             head_end: Some(base),
+            head_ok: true,
             ..CascadeTimings::default()
         };
 

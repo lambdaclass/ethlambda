@@ -715,6 +715,9 @@ pub struct CascadeTimings {
     pub head_end: Option<Instant>,
     pub fcu_start: Option<Instant>,
     pub fcu_end: Option<Instant>,
+    /// The head computation succeeded. A failed one still spent the time, so
+    /// its instants are kept, but no block became attestable at it.
+    pub head_ok: bool,
 }
 
 /// Timings taken while re-running beacon fork choice after an import.
@@ -727,6 +730,7 @@ pub struct HeadTimings {
     pub head_end: Option<Instant>,
     pub fcu_start: Option<Instant>,
     pub fcu_end: Option<Instant>,
+    pub head_ok: bool,
 }
 
 impl CascadeTimings {
@@ -741,6 +745,7 @@ impl CascadeTimings {
         self.head_end = head.head_end;
         self.fcu_start = head.fcu_start;
         self.fcu_end = head.fcu_end;
+        self.head_ok = head.head_ok;
     }
 
     pub fn starting_now() -> Self {
@@ -859,7 +864,9 @@ impl CascadeTelemetry {
         }
         // Beacon only: lean recomputes no head per arrival, and its
         // `attestable` is the block's own `fc_head` end.
-        if let Some(head_end) = cascade.head_end {
+        if cascade.head_ok
+            && let Some(head_end) = cascade.head_end
+        {
             events.extend(
                 self.imported
                     .iter()
@@ -1473,6 +1480,7 @@ mod tests {
             head_end: at(base, 52),
             fcu_start: at(base, 52),
             fcu_end: at(base, 60),
+            head_ok: true,
             ..CascadeTimings::default()
         }
     }
@@ -1533,6 +1541,29 @@ mod tests {
                 .collect::<Vec<_>>(),
             [("attestable", 8)]
         );
+    }
+
+    /// A head computation that failed still spent its time, so the arrival's
+    /// `get_head` rows stay, but nothing became attestable at it.
+    #[test]
+    fn a_failed_head_computation_makes_nothing_attestable() {
+        let base = Instant::now();
+        let telemetry = CascadeTelemetry {
+            arrival: Some((7, H256::repeat_byte(3))),
+            imported: vec![(7, H256::repeat_byte(3), "gossip")],
+        };
+        let failed = CascadeTimings {
+            head_ok: false,
+            ..arrival_cascade(base)
+        };
+
+        let stages: Vec<_> = telemetry
+            .events(&failed)
+            .iter()
+            .map(|event| event.stage)
+            .collect();
+        assert!(stages.contains(&"get_head_end"));
+        assert!(!stages.contains(&"attestable"));
     }
 
     /// Lean has no per-arrival head recomputation: its `attestable` comes
