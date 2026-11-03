@@ -2116,6 +2116,7 @@ dependencies = [
  "ethrex-common",
  "ethrex-p2p",
  "ethrex-rlp",
+ "ethrex-trie",
  "futures",
  "hex",
  "libp2p",
