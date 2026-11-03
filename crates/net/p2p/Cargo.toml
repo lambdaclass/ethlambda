@@ -22,6 +22,9 @@ ethlambda-state-transition.workspace = true
 
 spawned-concurrency.workspace = true
 
+# Spreads the work inside one gossip batch across cores; see `beacon::batched`.
+rayon.workspace = true
+
 futures = "0.3"
 tokio-stream = "0.1"
 

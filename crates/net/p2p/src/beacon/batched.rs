@@ -23,8 +23,13 @@
 //! message pushed after that starts a new drainer instead of waiting on one
 //! that is already leaving.
 //!
-//! A drainer holds its permit for its whole run, so each kind has at most as
-//! many drainers as its pool has permits. A message that cannot be queued
+//! A drainer holds its permit for its whole run, and the `draining` flag
+//! allows one drainer per kind at a time: that single drainer is the batching
+//! point, since everything that arrives while it works lands in the next
+//! batch. The work inside a batch is not serial, though: preparing each
+//! message and, after a failed batch, checking each message on its own are
+//! spread across cores with rayon, and the one combined crypto call
+//! parallelises internally. A message that cannot be queued
 //! (the queue is at [`QUEUE_CAP`], or it needs a drainer and the pool has no
 //! permit) is answered `Ignore(Overloaded)` at once, as a message with no
 //! permit always was: it is never held past the time gossipsub can wait.
@@ -38,6 +43,7 @@ use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome};
 use ethlambda_storage::Store;
 use ethlambda_types::beacon::containers::DataColumnSidecar;
 use ethlambda_types::beacon::primitives::ValidatorIndex;
+use rayon::prelude::*;
 use spawned_concurrency::tasks::{ActorRef, Context};
 use tracing::warn;
 
@@ -254,7 +260,9 @@ pub(crate) fn enqueue(
     }
 }
 
-/// The drainer: verify batches until the queue is empty.
+/// The drainer: verify batches until the queue is empty. It is the only one
+/// running for its kind, which is what makes a batch; the per-message work
+/// inside [`verify_batch`] is spread across cores with rayon.
 fn drain(batcher: &Batcher<Queued>, kind: Kind, store: &Store, actor: &ActorRef<P2PServer>) {
     let _guard = DrainGuard(batcher);
     while let Some(batch) = batcher.take_batch() {
@@ -376,7 +384,7 @@ pub(crate) fn verify_batch(store: &Store, kind: Kind, objects: &mut [Validated])
         return verify_columns(store, objects);
     }
     let prepared: Vec<Prepared> = objects
-        .iter()
+        .par_iter()
         .map(|object| guarded_try(|| Prepared::new(store, object)).unwrap_or_else(Prepared::Done))
         .collect();
     let sets: Vec<SignatureSet> = prepared.iter().flat_map(Prepared::signature_sets).collect();
@@ -385,8 +393,8 @@ pub(crate) fn verify_batch(store: &Store, kind: Kind, objects: &mut [Validated])
         metrics::inc_gossip_batch_fallback(kind.label());
     }
     prepared
-        .into_iter()
-        .zip(objects.iter_mut())
+        .into_par_iter()
+        .zip(objects.par_iter_mut())
         .map(|(item, object)| {
             guarded_try(|| item.resolve(batch_passed, object)).unwrap_or_else(|outcome| outcome)
         })
@@ -404,7 +412,7 @@ fn verify_columns(store: &Store, objects: &[Validated]) -> Vec<Outcome> {
         })
         .collect();
     let prepared: Vec<ColumnPrepared> = sidecars
-        .iter()
+        .par_iter()
         .map(|sidecar| match sidecar {
             Some(sidecar) => guarded_try(|| column::prepare_stateful_checks(store, sidecar))
                 .unwrap_or_else(ColumnPrepared::Settled),
@@ -424,8 +432,8 @@ fn verify_columns(store: &Store, objects: &[Validated]) -> Vec<Outcome> {
         metrics::inc_gossip_batch_fallback(Kind::Columns.label());
     }
     prepared
-        .into_iter()
-        .zip(&sidecars)
+        .into_par_iter()
+        .zip(sidecars.par_iter())
         .map(|(item, sidecar)| {
             let proofs_verify = match (item.pending(), sidecar) {
                 (None, _) => true,
