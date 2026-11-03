@@ -1,0 +1,136 @@
+[package]
+name = "ethlambda-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+# ENR text is base64url without padding; encoding the raw input lets the
+# fuzzer reach the RLP decoder behind `parse_enrs` instead of stopping at the
+# base64 check.
+base64 = "0.22"
+# `Cursor` and `block_on`: the framing and the codec are async over an
+# `AsyncRead`, driven here from an in-memory buffer with no runtime.
+futures = "0.3"
+# The same fork and rev as `ethlambda-p2p` (see its Cargo.toml), or the
+# `StreamProtocol` and `gossipsub::Message` built here would be a different
+# type from the one the codec takes.
+libp2p = { git = "https://github.com/lambdaclass/rust-libp2p.git", rev = "2f14d0ec9665a01cfb6a02326c90628c4bba521c", features = [
+    "gossipsub",
+    "request-response",
+] }
+
+ethlambda-p2p = { path = "../crates/net/p2p", features = ["fuzzing"] }
+ethlambda-types = { path = "../crates/common/types" }
+ethlambda-crypto = { path = "../crates/common/crypto" }
+
+# The same pin as the workspace (see the root Cargo.toml): this is the decoder
+# every `from_ssz_bytes` below goes through, so the fuzz crate must not be
+# able to drift to a different one.
+libssz = { git = "https://github.com/lambdaclass/libssz", rev = "5cb14378ffdadcb51b387c003567e2630d0c7073" }
+
+# Its own workspace, so `libfuzzer-sys` and the nightly toolchain stay out of
+# the production lockfile and build graph.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "snappy_raw"
+path = "fuzz_targets/snappy_raw.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "topic_strings"
+path = "fuzz_targets/topic_strings.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "enr_parse"
+path = "fuzz_targets/enr_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "lean_gossip_ssz"
+path = "fuzz_targets/lean_gossip_ssz.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "lean_req_resp_ssz"
+path = "fuzz_targets/lean_req_resp_ssz.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "beacon_gossip_decode"
+path = "fuzz_targets/beacon_gossip_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "beacon_slot_readers"
+path = "fuzz_targets/beacon_slot_readers.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "beacon_status_metadata"
+path = "fuzz_targets/beacon_status_metadata.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "beacon_container_ssz"
+path = "fuzz_targets/beacon_container_ssz.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "xmss_decode"
+path = "fuzz_targets/xmss_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "varint"
+path = "fuzz_targets/varint.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "snappy_framed"
+path = "fuzz_targets/snappy_framed.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "chunked_response"
+path = "fuzz_targets/chunked_response.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "codec_lean"
+path = "fuzz_targets/codec_lean.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "codec_beacon"
+path = "fuzz_targets/codec_beacon.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "message_id"
+path = "fuzz_targets/message_id.rs"
+test = false
+doc = false
