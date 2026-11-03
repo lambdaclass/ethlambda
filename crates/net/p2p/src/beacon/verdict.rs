@@ -9,7 +9,11 @@
 //! that field's own documentation for why they must not share one), a sync
 //! committee message or contribution from
 //! [`P2PServer::sync_validation_permits`]. Either way
-//! the blocking task sends a [`GossipVerdict`] back to the actor. Every beacon
+//! the blocking task sends a [`GossipVerdict`] back to the actor. The kinds
+//! that arrive in bursts and cost a pairing or a KZG proof each (subnet
+//! attestations, aggregates, sync committee messages, data columns) are queued
+//! instead and verified in batches by [`crate::beacon::batched`], which draws
+//! its drainer's permit from the same pool. Every beacon
 //! gossip message ends in exactly one [`report`]: gossipsub holds each one
 //! until then.
 
@@ -42,7 +46,7 @@ use spawned_concurrency::message::Message;
 use spawned_concurrency::tasks::{Context, Handler};
 use tracing::{debug, error, warn};
 
-use crate::beacon::{builder_market, column_checks};
+use crate::beacon::{batched, builder_market, column_checks};
 use crate::gossipsub::operation_kind;
 use crate::{P2PServer, metrics};
 
@@ -570,6 +574,16 @@ pub(crate) struct GossipVerdict {
     object: Validated,
 }
 
+impl GossipVerdict {
+    pub(crate) fn new(id: GossipId, outcome: Outcome, object: Validated) -> Self {
+        Self {
+            id,
+            outcome,
+            object,
+        }
+    }
+}
+
 impl Message for GossipVerdict {
     type Result = ();
 }
@@ -638,7 +652,7 @@ pub(crate) fn report(server: &P2PServer, id: GossipId, outcome: Outcome) -> bool
 /// operation topics) from the attestation pool, and the sync committee's
 /// messages and contributions from a pool of their own, so no burst starves
 /// another.
-fn permits_for<'a>(
+pub(crate) fn permits_for<'a>(
     server: &'a P2PServer,
     object: &Validated,
 ) -> &'a std::sync::Arc<tokio::sync::Semaphore> {
@@ -653,7 +667,7 @@ fn permits_for<'a>(
 /// The label (see [`metrics::VALIDATION_POOLS`]) of the permit pool
 /// [`permits_for`] draws `object`'s permit from. The one `match` on the
 /// object kind, so the pool metrics and the pool actually used cannot differ.
-fn pool_of(object: &Validated) -> &'static str {
+pub(crate) fn pool_of(object: &Validated) -> &'static str {
     match object {
         Validated::Block { .. } | Validated::Column(_) | Validated::Envelope(_) => "gossip",
         Validated::Aggregate { .. }
@@ -690,13 +704,15 @@ pub(crate) fn spawn_stateful_checks(
     id: GossipId,
     object: Validated,
 ) {
+    // The kinds that arrive in bursts and cost a pairing or a KZG proof each
+    // are verified in batches; see [`batched`].
+    let object = match batched::Kind::of(&object) {
+        Some(kind) => return batched::enqueue(server, ctx, kind, id, object),
+        None => object,
+    };
     let pool = pool_of(&object);
     let Ok(permit) = permits_for(server, &object).clone().try_acquire_owned() else {
-        metrics::inc_validation_permit_exhausted(pool);
-        let received_at = id.received_at;
-        let outcome = Outcome::Ignore(IgnoreReason::Overloaded);
-        report(server, id, outcome);
-        object.forward(server, received_at, outcome);
+        report_overloaded(server, pool, id, object);
         return;
     };
     let store = server.store.clone();
@@ -719,6 +735,18 @@ pub(crate) fn spawn_stateful_checks(
     });
 }
 
+/// Answer `object` `Ignore(Overloaded)`: its pool had no permit (or its batch
+/// queue was full), and holding it for later would only make its verdict
+/// arrive after gossipsub's cache has evicted the message. Forwarded as
+/// [`Validated::forward`] documents for that outcome.
+pub(crate) fn report_overloaded(server: &P2PServer, pool: &str, id: GossipId, object: Validated) {
+    metrics::inc_validation_permit_exhausted(pool);
+    let received_at = id.received_at;
+    let outcome = Outcome::Ignore(IgnoreReason::Overloaded);
+    report(server, id, outcome);
+    object.forward(server, received_at, outcome);
+}
+
 /// `checks()`, with a panic turned into `Ignore(Internal)`.
 ///
 /// A panic inside validation (a `Store` read's `.expect()` on a DB error, say)
@@ -726,7 +754,14 @@ pub(crate) fn spawn_stateful_checks(
 /// cache evicts it. The blocking thread's permit is unaffected either way: it
 /// drops on unwind exactly as it would on a normal return.
 pub(crate) fn guarded(checks: impl FnOnce() -> Outcome) -> Outcome {
-    catch_unwind(AssertUnwindSafe(checks)).unwrap_or_else(|payload| {
+    guarded_try(checks).unwrap_or_else(|outcome| outcome)
+}
+
+/// `checks()`, with a panic turned into `Err(Ignore(Internal))`: [`guarded`]
+/// for a closure that returns more than a verdict, such as one stage of a
+/// batch, whose panic must cost only the object it was working on.
+pub(crate) fn guarded_try<T>(checks: impl FnOnce() -> T) -> Result<T, Outcome> {
+    catch_unwind(AssertUnwindSafe(checks)).map_err(|payload| {
         let panic_message = payload
             .downcast_ref::<&str>()
             .copied()

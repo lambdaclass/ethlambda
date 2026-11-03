@@ -56,8 +56,8 @@ use std::num::NonZeroUsize;
 use lru::LruCache;
 
 use super::{
-    IgnoreReason, Outcome, RejectReason, ancestor_at, is_current_or_previous_epoch, is_future_slot,
-    verify_attestation_payload_status,
+    IgnoreReason, Outcome, Prepared, RejectReason, ancestor_at, is_current_or_previous_epoch,
+    is_future_slot, verify_attestation_payload_status,
 };
 use crate::beacon::bls;
 use crate::beacon::constants::{
@@ -364,28 +364,45 @@ pub fn stateful_checks(
     store: &Store,
     aggregate: &SignedAggregateAndProof,
 ) -> Result<Vec<ValidatorIndex>, Outcome> {
+    prepare_stateful_checks(store, aggregate).resolve()
+}
+
+/// [`stateful_checks`] without evaluating any pairing: a [`Prepared`] whose
+/// steps are the rules in their original order (selection proof, aggregator
+/// signature, the committee rules, the aggregate signature, ancestry), the
+/// three signatures among them as deferred steps.
+///
+/// Every non-signature rule runs here, ahead of the pairings, so the
+/// committee cache is consulted even for an aggregate whose pubkey-only
+/// signatures turn out forged. That is the price of letting the pairings of
+/// many messages be batched; the verdict is unchanged, since resolution takes
+/// the first failure in the original order.
+pub fn prepare_stateful_checks(
+    store: &Store,
+    aggregate: &SignedAggregateAndProof,
+) -> Prepared<Vec<ValidatorIndex>> {
+    let mut prepared = Prepared::default();
     let data = aggregate.data();
     let beacon_block_root = data.beacon_block_root;
 
     // [IGNORE] The block being voted for has been seen.
     if !store.has_block(&beacon_block_root) {
-        return Err(Outcome::Ignore(IgnoreReason::UnknownBlock));
+        return prepared.fail(Outcome::Ignore(IgnoreReason::UnknownBlock));
     }
-    // See this function's own documentation for why this state, and the
+    // See `stateful_checks`'s own documentation for why this state, and the
     // module documentation for why an uncached state is `IGNORE` rather than
     // the specification's `REJECT`.
     let Some(state) = store.cached_state(CacheKey::BlockState(beacon_block_root)) else {
-        return Err(Outcome::Ignore(IgnoreReason::StateUnavailable));
+        return prepared.fail(Outcome::Ignore(IgnoreReason::StateUnavailable));
     };
 
     let target_epoch = data.target.epoch;
     let config = store.config();
 
-    // Pubkey-only signatures, before any committee derivation; see the
-    // module documentation for why this order.
+    // Pubkey-only signatures; see the module documentation.
     let aggregator_index = aggregate.aggregator_index();
     let Ok(aggregator) = state.validator(aggregator_index) else {
-        return Err(Outcome::Reject(RejectReason::UnknownValidator));
+        return prepared.fail(Outcome::Reject(RejectReason::UnknownValidator));
     };
     let aggregator_pubkey = bls::IndexedPubkey {
         index: aggregator_index,
@@ -396,21 +413,23 @@ pub fn stateful_checks(
     let selection_domain =
         get_domain_from_schedule(&config, &state, DOMAIN_SELECTION_PROOF, target_epoch);
     let selection_signing_root = compute_signing_root(data.slot.hash_tree_root(), selection_domain);
-    if !bls::verify(&aggregator_pubkey, selection_signing_root, &selection_proof) {
-        return Err(Outcome::Reject(RejectReason::SelectionProof));
-    }
+    prepared.signature(
+        bls::SignatureSet::single(&aggregator_pubkey, selection_signing_root, &selection_proof),
+        Outcome::Reject(RejectReason::SelectionProof),
+    );
     // [REJECT] The aggregator's own signature, over the whole envelope.
     let aggregator_domain =
         get_domain_from_schedule(&config, &state, DOMAIN_AGGREGATE_AND_PROOF, target_epoch);
     let aggregator_signing_root =
         compute_signing_root(aggregate_and_proof_root(aggregate), aggregator_domain);
-    if !bls::verify(
-        &aggregator_pubkey,
-        aggregator_signing_root,
-        &aggregate.signature(),
-    ) {
-        return Err(Outcome::Reject(RejectReason::AggregatorSignature));
-    }
+    prepared.signature(
+        bls::SignatureSet::single(
+            &aggregator_pubkey,
+            aggregator_signing_root,
+            &aggregate.signature(),
+        ),
+        Outcome::Reject(RejectReason::AggregatorSignature),
+    );
 
     // Committees for the target epoch, through the shared cache.
     let committees = store.committee_cache();
@@ -421,115 +440,120 @@ pub fn stateful_checks(
         .expect("cheap_checks rejects a message with no single named committee");
     // [REJECT] The committee index is within range.
     if committee_index >= epoch_committees.committees_per_slot() {
-        return Err(Outcome::Reject(RejectReason::CommitteeIndex));
+        return prepared.fail(Outcome::Reject(RejectReason::CommitteeIndex));
     }
     let Ok(committee) = epoch_committees.committee(data.slot, committee_index) else {
         // `committee_index` and `data.slot`'s epoch were both just checked
         // against this same `epoch_committees`, so this cannot fail; treated
         // as internal rather than unreachable so a future change here fails
         // safe instead of panicking.
-        return Err(Outcome::Ignore(IgnoreReason::Internal));
+        return prepared.fail(Outcome::Ignore(IgnoreReason::Internal));
     };
     // [REJECT] The aggregation bits match the committee's size.
     let aggregation_bits = aggregate.aggregation_bits();
     if aggregation_bits.len() != committee.len() {
-        return Err(Outcome::Reject(RejectReason::BitsLength));
+        return prepared.fail(Outcome::Reject(RejectReason::BitsLength));
     }
     // [REJECT] The selection proof selects this validator as an aggregator.
     if !is_aggregator(committee.len(), &selection_proof) {
-        return Err(Outcome::Reject(RejectReason::NotAggregator));
+        return prepared.fail(Outcome::Reject(RejectReason::NotAggregator));
     }
     // [REJECT] The aggregator is a member of the committee.
     if !committee.contains(&aggregator_index) {
-        return Err(Outcome::Reject(RejectReason::NotInCommittee));
+        return prepared.fail(Outcome::Reject(RejectReason::NotInCommittee));
     }
 
     // [REJECT] The aggregate's own signature is valid. Built from the same
     // (cached) committees, so this costs no further shuffle.
     let attester_domain =
         get_domain_from_schedule(&config, &state, DOMAIN_BEACON_ATTESTER, target_epoch);
-    let attesting_indices = match aggregate {
+    let (attesting_indices, aggregate_set) = match aggregate {
         SignedAggregateAndProof::Phase0(signed) => {
             let phase0_attestation = &signed.message.aggregate;
-            let indexed = crate::beacon::helpers::attestation::get_indexed_attestation(
+            let Ok(indexed) = crate::beacon::helpers::attestation::get_indexed_attestation(
                 &state,
                 phase0_attestation,
                 &committees,
-            )
-            .map_err(|_| Outcome::Ignore(IgnoreReason::Internal))?;
-            if !crate::beacon::helpers::attestation::is_valid_indexed_attestation_with_domain(
-                &state,
-                &indexed,
-                attester_domain,
-            ) {
-                return Err(Outcome::Reject(RejectReason::AggregateSignature));
-            }
-            indexed.attesting_indices.to_vec()
+            ) else {
+                return prepared.fail(Outcome::Ignore(IgnoreReason::Internal));
+            };
+            let set =
+                crate::beacon::helpers::attestation::indexed_attestation_signature_set_with_domain(
+                    &state,
+                    &indexed,
+                    attester_domain,
+                );
+            (indexed.attesting_indices.to_vec(), set)
         }
         SignedAggregateAndProof::Electra(signed) => {
             let electra_attestation = &signed.message.aggregate;
-            let indexed = crate::beacon::helpers::electra::get_indexed_attestation(
+            let Ok(indexed) = crate::beacon::helpers::electra::get_indexed_attestation(
                 &state,
                 electra_attestation,
                 &committees,
-            )
-            .map_err(|_| Outcome::Ignore(IgnoreReason::Internal))?;
-            if !crate::beacon::helpers::electra::is_valid_indexed_attestation_with_domain(
-                &state,
-                &indexed,
-                attester_domain,
-            ) {
-                return Err(Outcome::Reject(RejectReason::AggregateSignature));
-            }
-            indexed.attesting_indices.to_vec()
+            ) else {
+                return prepared.fail(Outcome::Ignore(IgnoreReason::Internal));
+            };
+            let set =
+                crate::beacon::helpers::electra::indexed_attestation_signature_set_with_domain(
+                    &state,
+                    &indexed,
+                    attester_domain,
+                );
+            (indexed.attesting_indices.to_vec(), set)
         }
         SignedAggregateAndProof::Gloas(signed) => {
             let gloas_attestation = &signed.message.aggregate;
-            let indexed = crate::beacon::helpers::gloas::get_indexed_attestation(
+            let Ok(indexed) = crate::beacon::helpers::gloas::get_indexed_attestation(
                 &state,
                 gloas_attestation,
                 &committees,
-            )
-            .map_err(|_| Outcome::Ignore(IgnoreReason::Internal))?;
-            if !crate::beacon::helpers::gloas::is_valid_indexed_attestation_with_domain(
+            ) else {
+                return prepared.fail(Outcome::Ignore(IgnoreReason::Internal));
+            };
+            let set = crate::beacon::helpers::gloas::indexed_attestation_signature_set_with_domain(
                 &state,
                 &indexed,
                 attester_domain,
-            ) {
-                return Err(Outcome::Reject(RejectReason::AggregateSignature));
-            }
-            indexed.attesting_indices.to_vec()
+            );
+            (indexed.attesting_indices.to_vec(), set)
         }
     };
+    prepared.signature(
+        aggregate_set,
+        Outcome::Reject(RejectReason::AggregateSignature),
+    );
 
-    // Ancestry, via the vote state's own history; see this function's
+    // Ancestry, via the vote state's own history; see `stateful_checks`'s
     // documentation for why this state can always answer both questions.
     let (target_checkpoint_epoch, target_root) = aggregate.target();
     let target_start_slot = compute_start_slot_at_epoch(target_checkpoint_epoch);
     // [REJECT] The target is the vote block's ancestor at the target epoch.
     let Some(checkpoint_block) = ancestor_at(&state, beacon_block_root, target_start_slot) else {
-        return Err(Outcome::Ignore(IgnoreReason::AncestryUnknown));
+        return prepared.fail(Outcome::Ignore(IgnoreReason::AncestryUnknown));
     };
     if checkpoint_block != target_root {
-        return Err(Outcome::Reject(RejectReason::TargetNotAncestor));
+        return prepared.fail(Outcome::Reject(RejectReason::TargetNotAncestor));
     }
     // [IGNORE] The finalized checkpoint is an ancestor of the vote block.
     let finalized = store.beacon_finalized_checkpoint();
     let finalized_start_slot = compute_start_slot_at_epoch(finalized.epoch);
     let Some(finalized_block) = ancestor_at(&state, beacon_block_root, finalized_start_slot) else {
-        return Err(Outcome::Ignore(IgnoreReason::AncestryUnknown));
+        return prepared.fail(Outcome::Ignore(IgnoreReason::AncestryUnknown));
     };
     if finalized_block != finalized.root {
-        return Err(Outcome::Ignore(IgnoreReason::FinalizedNotAncestor));
+        return prepared.fail(Outcome::Ignore(IgnoreReason::FinalizedNotAncestor));
     }
 
     // [New in Gloas:EIP7732] The attested payload status is consistent with the
     // block's execution payload.
-    if matches!(aggregate, SignedAggregateAndProof::Gloas(_)) {
-        verify_attestation_payload_status(store, &data)?;
+    if matches!(aggregate, SignedAggregateAndProof::Gloas(_))
+        && let Err(outcome) = verify_attestation_payload_status(store, &data)
+    {
+        return prepared.fail(outcome);
     }
 
-    Ok(attesting_indices)
+    prepared.accept(attesting_indices)
 }
 
 /// `cheap_checks` then `stateful_checks`, the order the p2p actor runs them
@@ -899,5 +923,222 @@ mod tests {
 
     fn preset_slots_per_epoch() -> Slot {
         crate::beacon::preset::SLOTS_PER_EPOCH
+    }
+
+    // -- prepare_stateful_checks ---------------------------------------------
+
+    /// What to get wrong in [`signed_aggregate`].
+    #[derive(Default)]
+    struct Mistakes {
+        /// The selection proof is another validator's.
+        selection_proof: bool,
+        /// The attesters' aggregate signature is another message's.
+        aggregate_signature: bool,
+        /// `target.root` names a block that is not the vote block's ancestor.
+        target_root: bool,
+        /// `committee_bits` names a committee the epoch does not have.
+        committee_bit: bool,
+    }
+
+    /// A store holding the vote block's state, and an aggregate for the first
+    /// committee of the first slot of the fork's epoch, signed correctly except
+    /// where `mistakes` says. Mirrors the attestation tests' fork-boundary
+    /// fixture, whose signing domain is the schedule's, not the state's.
+    fn signed_aggregate(mistakes: Mistakes) -> (Store, SignedAggregateAndProof) {
+        use crate::beacon::config::Config;
+        use crate::beacon::containers::SignedBeaconBlock;
+        use crate::beacon::containers::shared::{AttestationData, Checkpoint, Fork};
+        use crate::beacon::fork::ForkName;
+        use crate::beacon::gossip::test_support::store_with_config;
+        use crate::beacon::helpers::accessors::get_beacon_committee;
+        use crate::beacon::helpers::misc::compute_domain;
+        use crate::beacon::helpers::test_state::{sign_for, with_signing_validators_at};
+
+        let fulu_epoch = 2;
+        let config = Config::mainnet()
+            .with_fork_epoch(ForkName::Electra, 0)
+            .with_fork_epoch(ForkName::Fulu, fulu_epoch);
+        let mut state = with_signing_validators_at(ForkName::Electra, 64);
+        let pre_fork_slot = compute_start_slot_at_epoch(fulu_epoch) - 1;
+        *state.slot_mut() = pre_fork_slot;
+        *state.fork_mut() = Fork {
+            previous_version: config.deneb_fork_version,
+            current_version: config.electra_fork_version,
+            epoch: 0,
+        };
+        state.apply_pending_mutations();
+
+        let mut store = store_with_config(0, config.clone());
+        let block_root = Root::repeat_byte(7);
+        let block = SignedBeaconBlock::Electra(electra::SignedBeaconBlock {
+            message: electra::BeaconBlock {
+                slot: pre_fork_slot,
+                proposer_index: 0,
+                parent_root: Root::ZERO,
+                state_root: Root::ZERO,
+                body: electra::BeaconBlockBody::empty(),
+            },
+            signature: Default::default(),
+        });
+        store
+            .insert_pending_block(block_root, block)
+            .expect("insert the voted block");
+        store.cache_state(
+            CacheKey::BlockState(block_root),
+            std::sync::Arc::new(state.clone()),
+        );
+
+        let slot = compute_start_slot_at_epoch(fulu_epoch);
+        let committee = get_beacon_committee(&state, slot, 0).expect("committee");
+        let aggregator = committee[0];
+        let data = AttestationData {
+            slot,
+            index: 0,
+            beacon_block_root: block_root,
+            source: Default::default(),
+            target: Checkpoint {
+                epoch: fulu_epoch,
+                root: if mistakes.target_root {
+                    Root::repeat_byte(9)
+                } else {
+                    block_root
+                },
+            },
+        };
+        let domain = |domain_type| {
+            compute_domain(
+                domain_type,
+                config.fulu_fork_version,
+                state.genesis_validators_root(),
+            )
+        };
+        let attester_root =
+            compute_signing_root(data.hash_tree_root(), domain(DOMAIN_BEACON_ATTESTER));
+        let signatures: Vec<BlsSignature> = committee
+            .iter()
+            .map(|&member| {
+                let message = if mistakes.aggregate_signature {
+                    Root::repeat_byte(5)
+                } else {
+                    attester_root
+                };
+                sign_for(member as usize, message)
+            })
+            .collect();
+        let selector = if mistakes.selection_proof {
+            aggregator as usize + 1
+        } else {
+            aggregator as usize
+        };
+        let selection_proof = sign_for(
+            selector,
+            compute_signing_root(slot.hash_tree_root(), domain(DOMAIN_SELECTION_PROOF)),
+        );
+        let mut committee_bits = electra::CommitteeBits::default();
+        let bit = if mistakes.committee_bit {
+            crate::beacon::preset::MAX_COMMITTEES_PER_SLOT - 1
+        } else {
+            0
+        };
+        committee_bits.set(bit, true).expect("within the bound");
+        let message = electra::AggregateAndProof {
+            aggregator_index: aggregator,
+            aggregate: electra::Attestation {
+                aggregation_bits: vec![true; committee.len()]
+                    .try_into()
+                    .expect("within the committee bound"),
+                data,
+                signature: bls::aggregate(&signatures).expect("aggregate"),
+                committee_bits,
+            },
+            selection_proof,
+        };
+        let envelope_root =
+            compute_signing_root(message.hash_tree_root(), domain(DOMAIN_AGGREGATE_AND_PROOF));
+        let signed = electra::SignedAggregateAndProof {
+            signature: sign_for(aggregator as usize, envelope_root),
+            message,
+        };
+        (store, SignedAggregateAndProof::Electra(signed))
+    }
+
+    #[test]
+    fn a_valid_aggregate_prepares_three_pairings_and_resolves_either_way() {
+        let (store, aggregate) = signed_aggregate(Mistakes::default());
+        let prepared = prepare_stateful_checks(&store, &aggregate);
+        let sets = prepared.signature_sets();
+        assert_eq!(sets.len(), 3);
+        assert!(bls::verify_signature_sets(&sets));
+        let batched = prepared.resolve_batch_passed().expect("accepted");
+        assert!(!batched.is_empty());
+        assert_eq!(stateful_checks(&store, &aggregate), Ok(batched));
+    }
+
+    /// The signatures come before the committee rules, so an aggregate that
+    /// breaks both reports the signature, as it did when each was verified in
+    /// place.
+    #[test]
+    fn a_bad_selection_proof_outranks_a_later_committee_failure() {
+        let (store, aggregate) = signed_aggregate(Mistakes {
+            selection_proof: true,
+            committee_bit: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            stateful_checks(&store, &aggregate),
+            Err(Outcome::Reject(RejectReason::SelectionProof))
+        );
+    }
+
+    #[test]
+    fn a_good_selection_proof_lets_the_committee_failure_speak() {
+        let (store, aggregate) = signed_aggregate(Mistakes {
+            committee_bit: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            stateful_checks(&store, &aggregate),
+            Err(Outcome::Reject(RejectReason::CommitteeIndex))
+        );
+    }
+
+    #[test]
+    fn a_bad_aggregate_signature_outranks_a_later_ancestry_failure() {
+        let (store, aggregate) = signed_aggregate(Mistakes {
+            aggregate_signature: true,
+            target_root: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            stateful_checks(&store, &aggregate),
+            Err(Outcome::Reject(RejectReason::AggregateSignature))
+        );
+        let (store, aggregate) = signed_aggregate(Mistakes {
+            target_root: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            stateful_checks(&store, &aggregate),
+            Err(Outcome::Reject(RejectReason::TargetNotAncestor))
+        );
+    }
+
+    #[test]
+    fn a_failed_batch_resolves_each_aggregate_on_its_own() {
+        let (store, good) = signed_aggregate(Mistakes::default());
+        let (_, forged) = signed_aggregate(Mistakes {
+            aggregate_signature: true,
+            ..Default::default()
+        });
+        let good = prepare_stateful_checks(&store, &good);
+        let forged = prepare_stateful_checks(&store, &forged);
+        let mut sets = good.signature_sets();
+        sets.extend(forged.signature_sets());
+        assert!(!bls::verify_signature_sets(&sets));
+        assert!(good.resolve().is_ok());
+        assert_eq!(
+            forged.resolve(),
+            Err(Outcome::Reject(RejectReason::AggregateSignature))
+        );
     }
 }
