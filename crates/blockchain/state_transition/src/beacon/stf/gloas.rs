@@ -1428,13 +1428,18 @@ pub fn process_attestation(
         } else {
             previous_participation
         };
+        // `attesting_indices` is sorted ascending, so the reader walks each leaf
+        // once rather than descending the tree for every attester.
+        let mut reader = epoch_participation.sorted_reader();
         for index in attesting_indices {
-            let current_flags = epoch_participation.get(index as usize).copied().ok_or(
-                Error::IndexOutOfBounds {
-                    index: index as usize,
-                    len: epoch_participation.len(),
-                },
-            )?;
+            let current_flags =
+                reader
+                    .get(index as usize)
+                    .copied()
+                    .ok_or(Error::IndexOutOfBounds {
+                        index: index as usize,
+                        len: epoch_participation.len(),
+                    })?;
             let had_no_participation = current_flags == 0;
 
             // The attester's validator is read at most once, on the first
