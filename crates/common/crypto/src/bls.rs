@@ -694,6 +694,9 @@ pub fn key_validate<K: PubkeySource>(pubkey: &K) -> bool {
 mod committee_sums;
 pub use committee_sums::{AggregatePubkey, CommitteeKeySums};
 
+mod warm;
+pub use warm::warm_pubkeys;
+
 #[cfg(test)]
 mod tests {
     use super::*;
