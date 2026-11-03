@@ -1260,6 +1260,7 @@ impl P2P {
                 GOSSIP_VALIDATION_PERMITS,
             )),
             sync_validation_permits: Arc::new(tokio::sync::Semaphore::new(SYNC_VALIDATION_PERMITS)),
+            batchers: Default::default(),
             column_check_permits: Arc::new(tokio::sync::Semaphore::new(COLUMN_CHECK_PERMITS)),
             attestation_validation_permits: Arc::new(tokio::sync::Semaphore::new(
                 ATTESTATION_VALIDATION_PERMITS,
@@ -1455,6 +1456,10 @@ pub struct P2PServer {
     /// checks in flight on blocking threads. Separate from the other two
     /// pools; see [`SYNC_VALIDATION_PERMITS`].
     pub(crate) sync_validation_permits: Arc<tokio::sync::Semaphore>,
+    /// The queues the batched gossip kinds (attestations, aggregates, sync
+    /// committee messages, data columns) wait in for a drainer; see
+    /// [`beacon::batched`].
+    pub(crate) batchers: Arc<beacon::batched::Batchers>,
 
     /// Accepted `payload_attestation_message` votes, shared with the Beacon
     /// API that serves and fills the same pool. Filled by `verdict::forward`;
@@ -3151,6 +3156,7 @@ pub(crate) mod test_support {
                     crate::SEEN_SYNC_AGGREGATORS_CAPACITY,
                     crate::SEEN_SYNC_DATA_CAPACITY,
                 ),
+            batchers: Default::default(),
             sync_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::SYNC_VALIDATION_PERMITS,
             )),
