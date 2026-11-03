@@ -87,6 +87,11 @@ c-kzg = { version = "2.1.8", features = ["ethereum_kzg_settings"] }
 # functions that c-kzg does not export.
 num-bigint = "0.4.6"
 
+# The fork-choice vote tally hashes once per validator into a map of a few dozen
+# keys; std's SipHash was one of the largest costs in head computation. Already
+# in the lockfile through other crates, so this adds no new version.
+foldhash = "0.2.0"
+
 [dev-dependencies]
 ethlambda-test-fixtures.workspace = true
 serde.workspace = true
