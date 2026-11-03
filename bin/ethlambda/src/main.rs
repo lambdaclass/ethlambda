@@ -795,6 +795,13 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             setup.store.chain(),
             config.config_name.as_str(),
         );
+        if sends_credentials_in_clear(&url) {
+            warn!(
+                host = url.host_str(),
+                "The ClickHouse URL carries credentials over plain http to a host that is not \
+                 loopback; they cross the network unencrypted. Use https, or a loopback address"
+            );
+        }
         // Only the host and port: the URL may carry credentials.
         info!(
             %client_name,
@@ -995,6 +1002,20 @@ fn telemetry_names(
         ethlambda_storage::Chain::Beacon => config_name.to_owned(),
     };
     (client_name, network_name)
+}
+
+/// `url` sends a username or password as basic auth, unencrypted, to a host
+/// that is not this machine.
+fn sends_credentials_in_clear(url: &reqwest::Url) -> bool {
+    let has_credentials = !url.username().is_empty() || url.password().is_some();
+    // An IPv6 host comes back bracketed.
+    let host = url.host_str().unwrap_or_default();
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    has_credentials && url.scheme() == "http" && !loopback
 }
 
 /// This machine's hostname, for the default telemetry client name.
@@ -2414,6 +2435,18 @@ mod tests {
             telemetry_names(None, None, ethlambda_storage::Chain::Beacon, "mainnet");
         assert!(client.starts_with("ethlambda@"), "{client}");
         assert_eq!(network, "mainnet");
+    }
+
+    #[test]
+    fn credentials_in_clear_are_flagged_only_off_loopback_over_http() {
+        let flagged = |raw: &str| sends_credentials_in_clear(&raw.parse().unwrap());
+        assert!(flagged("http://u:p@10.0.0.5:8123/"));
+        assert!(flagged("http://u@clickhouse.example:8123/"));
+        assert!(!flagged("https://u:p@clickhouse.example:8443/"));
+        assert!(!flagged("http://u:p@127.0.0.1:8123/"));
+        assert!(!flagged("http://u:p@[::1]:8123/"));
+        assert!(!flagged("http://u:p@localhost:8123/"));
+        assert!(!flagged("http://10.0.0.5:8123/"));
     }
 
     #[test]

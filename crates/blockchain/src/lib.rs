@@ -50,7 +50,7 @@ use crate::beacon_envelope::EnvelopeQueues;
 use crate::block_builder::ProposerConfig;
 use crate::events::ChainEvents;
 use crate::import_timing::{
-    BlockImportReport, CascadeTelemetry, CascadeTimings, HeadTimings, ImportTimings,
+    BlockImportReport, CascadeTelemetry, CascadeTimings, EngineAnswer, HeadTimings, ImportTimings,
 };
 use crate::store::StoreError;
 
@@ -1784,17 +1784,20 @@ impl BlockChainServer {
                     let evidence =
                         data_availability_for(&self.store, &beacon_block, &self.custody_columns);
                     timings.da_check_end = Some(Instant::now());
-                    // Only a block with columns to wait for has made data
+                    // Only a block with data to wait for has made data
                     // available; a gloas block or one with no commitments is
                     // answered `NotRequired`. Stored columns come back as
                     // `ColumnsVerified`, since they were checked on arrival.
-                    timings.da_columns_required = matches!(
-                        evidence,
+                    // Exhaustive, so a new kind of evidence has to say which
+                    // it is.
+                    timings.da_columns_required = match &evidence {
                         Some(
                             fork_choice::DataAvailability::Columns(_)
-                                | fork_choice::DataAvailability::ColumnsVerified
-                        )
-                    );
+                            | fork_choice::DataAvailability::ColumnsVerified
+                            | fork_choice::DataAvailability::Blobs { .. },
+                        ) => true,
+                        Some(fork_choice::DataAvailability::NotRequired) | None => false,
+                    };
                     match evidence {
                         Some(evidence) => evidence,
                         None => {
@@ -1836,6 +1839,9 @@ impl BlockChainServer {
                 (timings.engine_start, timings.engine_end) = (Some(no_wait), Some(no_wait));
                 let parent_root = beacon_block.parent_root();
                 let mut speculation: Option<fork_choice::SpeculativeTransition> = None;
+                // When the request went out and its answer came back, for the
+                // `el_sent` and `el_verdict` rows (`EngineAnswer`).
+                let mut request_times: Option<(Instant, Instant)> = None;
                 let verdict: Result<Option<fork_choice::PayloadValidity>, String> = match &self
                     .engine
                 {
@@ -1847,7 +1853,7 @@ impl BlockChainServer {
                             None => Ok(None),
                             Some(request) => {
                                 let client = client.clone();
-                                timings.engine_sent = Some(Instant::now());
+                                let sent = Instant::now();
                                 let task = tokio::spawn(async move {
                                     let answer = beacon_engine::ask_request(&client, request).await;
                                     (answer, Instant::now())
@@ -1882,7 +1888,7 @@ impl BlockChainServer {
                                 // leaves it at zero.
                                 timings.engine_start = Some(spec_end);
                                 timings.engine_end = Some(answered_at.max(spec_end));
-                                timings.engine_answered = Some(answered_at);
+                                request_times = Some((sent, answered_at));
                                 answer
                             }
                         }
@@ -1891,7 +1897,14 @@ impl BlockChainServer {
                 let validity = match verdict {
                     Ok(None) => fork_choice::PayloadValidity::NotRequired,
                     Ok(Some(validity)) => {
-                        timings.engine_verdict = Some(verdict_label(&validity));
+                        // An answer means a request went out.
+                        if let Some((sent, answered)) = request_times {
+                            timings.engine_answer = Some(EngineAnswer {
+                                sent,
+                                answered,
+                                verdict: verdict_label(&validity),
+                            });
+                        }
                         validity
                     }
                     // No answer after the whole ladder.

@@ -196,16 +196,10 @@ pub struct ImportTimings {
     /// `lean_engine_new_payload_seconds`, not this.
     pub engine_start: Option<Instant>,
     pub engine_end: Option<Instant>,
-    /// Beacon: the execution client's answer, as a `block_events` row records
-    /// it. `None` when no client was asked, which is what keeps the engine
-    /// rows off a node with no `--execution-endpoint`.
-    pub engine_verdict: Option<&'static str>,
-    /// Beacon: when the `engine_newPayload` request was handed to its task,
-    /// and when its answer arrived: the `el_sent` and `el_verdict` rows.
-    /// Unlike the `engine` pair, which is only the wait left once the
-    /// overlapped state transition finished, these bracket the request.
-    pub engine_sent: Option<Instant>,
-    pub engine_answered: Option<Instant>,
+    /// Beacon: the execution client's answer, for the `el_sent` and
+    /// `el_verdict` rows. `None` when no client answered, which is what keeps
+    /// those rows off a node with no `--execution-endpoint`.
+    pub engine_answer: Option<EngineAnswer>,
 
     /// Lean: participant bounds checks and pubkey resolution.
     pub verify_structural_start: Option<Instant>,
@@ -600,13 +594,9 @@ impl BlockImportReport {
             .into_iter()
             .filter_map(|(stage, at)| Some(self.event(stage, at?, source, None)))
             .collect();
-        // Only when a client answered. Not the `engine` pair: that is the
-        // wait left after the overlapped state transition, not the request.
-        if let Some(verdict) = t.engine_verdict
-            && let (Some(sent), Some(answered)) = (t.engine_sent, t.engine_answered)
-        {
-            events.push(self.event("el_sent", sent, source, None));
-            events.push(self.event("el_verdict", answered, source, Some(verdict)));
+        if let Some(answer) = t.engine_answer {
+            events.push(self.event("el_sent", answer.sent, source, None));
+            events.push(self.event("el_verdict", answer.answered, source, Some(answer.verdict)));
         }
         events
     }
@@ -758,6 +748,22 @@ pub struct CascadeTimings {
     /// The head computation succeeded. A failed one still spent the time, so
     /// its instants are kept, but no block became attestable at it.
     pub head_ok: bool,
+}
+
+/// An `engine_newPayload` answer as the `el_sent` and `el_verdict` rows
+/// record it.
+///
+/// Its own instants rather than the `engine` pair: that pair is the time the
+/// import waited for the answer, which only brackets the request while
+/// nothing else runs during it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineAnswer {
+    /// The request went out.
+    pub sent: Instant,
+    /// The answer came back, retry ladder included.
+    pub answered: Instant,
+    /// The verdict, as the row's `verdict` column records it.
+    pub verdict: &'static str,
 }
 
 /// Timings taken while re-running beacon fork choice after an import.
@@ -1398,13 +1404,15 @@ mod tests {
             da_columns_required: true,
             // The request goes out as the speculative transition starts, and
             // the import then waits for the answer from the transition's end.
-            engine_sent: at(base, 4),
             stf_spec_start: at(base, 4),
             stf_spec_end: at(base, 30),
             engine_start: at(base, 30),
             engine_end: at(base, 40),
-            engine_answered: at(base, 40),
-            engine_verdict: Some("Valid"),
+            engine_answer: Some(EngineAnswer {
+                sent: base + Duration::from_millis(4),
+                answered: base + Duration::from_millis(40),
+                verdict: "Valid",
+            }),
             stf_start: at(base, 40),
             stf_end: at(base, 45),
             block_atts_start: at(base, 45),
@@ -1453,16 +1461,20 @@ mod tests {
         assert_eq!(verdict.at, base + Duration::from_millis(40));
     }
 
-    /// The request overlaps the state transition, so the `engine` pair is
-    /// only the wait left once that finished, and a zero when the answer was
-    /// already in. `el_sent` and `el_verdict` bracket the request itself.
+    /// The rows bracket the request, not the `engine` section: that section
+    /// is the time the import waited, which need not be the request's own
+    /// round trip (one overlapped by other work waits less than it lasts).
     #[test]
     fn the_engine_rows_bracket_the_request_not_the_wait() {
         let base = Instant::now();
         let report = report(ImportTimings {
             engine_start: at(base, 30),
             engine_end: at(base, 30),
-            engine_answered: at(base, 20),
+            engine_answer: Some(EngineAnswer {
+                sent: base + Duration::from_millis(4),
+                answered: base + Duration::from_millis(20),
+                verdict: "Valid",
+            }),
             ..beacon_gossip(base)
         });
 
@@ -1573,7 +1585,7 @@ mod tests {
     #[test]
     fn no_execution_client_means_no_el_rows() {
         let no_engine = report(ImportTimings {
-            engine_verdict: None,
+            engine_answer: None,
             ..beacon_gossip(Instant::now())
         });
         let stages = stages(&no_engine);
