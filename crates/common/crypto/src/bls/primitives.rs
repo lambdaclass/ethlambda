@@ -30,15 +30,6 @@ const WEIGHT_BITS: usize = u64::BITS as usize;
 /// infinity, the same position in G1 and G2 encodings.
 const INFINITY_FLAG: u8 = 0b0100_0000;
 
-/// The fewest pairs one [`Pairing`] accumulator takes when a check is spread
-/// across rayon's workers.
-///
-/// A Miller loop is cheap next to the final exponentiation, so a handful of
-/// pairs gain nothing from a second thread: at or below this the check stays
-/// on the calling thread, and above it the pairs are split into chunks no
-/// smaller than this.
-const MIN_PAIRS_PER_CHUNK: usize = 4;
-
 /// Whether a public key is the point at infinity. Only a sum of keys can be:
 /// a registry key that is the identity fails `key_validate`.
 pub(super) fn key_is_identity(key: &PublicKey) -> bool {
@@ -84,10 +75,11 @@ pub(super) fn hash_to_g2(message: &[u8]) -> blst_p2_affine {
 /// refuses it with `BLST_PK_IS_INFINITY`). Neither keys nor signature are
 /// validated here; callers pass points that already passed their checks.
 ///
-/// With enough pairs the Miller loops are split across rayon's workers, one
-/// [`Pairing`] per chunk, merged before the single final exponentiation. The
-/// check `blst`'s batch ran was parallel on its own pool, and one thread made
-/// large batches several times slower.
+/// With more than one pair the Miller loops are split across rayon's workers,
+/// one [`Pairing`] per chunk, merged before the single final exponentiation.
+/// The check `blst`'s batch ran was parallel on its own pool, one set per
+/// worker, and grouping several pairs on one thread made a block's batch
+/// slower than it.
 pub(super) fn pairing_check(
     pairs: &[(&blst_p1_affine, &blst_p2_affine)],
     signature: &blst_p2_affine,
@@ -107,13 +99,12 @@ pub(super) fn pairing_check(
         pairing.commit();
         pairing
     };
-    let mut accumulators: Vec<Pairing> = if pairs.len() <= MIN_PAIRS_PER_CHUNK {
+    // One Miller loop costs about as much as hashing a message, so every pair
+    // is worth a task: the pairs are spread over at most one chunk per worker.
+    let mut accumulators: Vec<Pairing> = if pairs.len() == 1 {
         vec![accumulate(pairs)]
     } else {
-        let chunk_len = pairs
-            .len()
-            .div_ceil(rayon::current_num_threads())
-            .max(MIN_PAIRS_PER_CHUNK);
+        let chunk_len = pairs.len().div_ceil(rayon::current_num_threads());
         pairs.par_chunks(chunk_len).map(accumulate).collect()
     };
     let Some(mut total) = accumulators.pop() else {

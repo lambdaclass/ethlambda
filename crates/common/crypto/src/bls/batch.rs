@@ -66,11 +66,6 @@ use super::{
     AggregatePubkey, PubkeySource, pairing_verify, primitives, validated_pubkey, validated_pubkeys,
 };
 
-/// The fewest distinct messages one rayon task takes when a batch computes its
-/// per-message key sums and hashes. Below this the work stays on the calling
-/// thread, as one sum and one hash are not worth a task.
-const GROUPS_MIN_PAR_LEN: usize = 4;
-
 /// One signature check, resolved and ready, that may be verified alone or in a
 /// batch.
 ///
@@ -229,7 +224,6 @@ pub fn verify_signature_sets(sets: &[SignatureSet]) -> bool {
     let runs = message_runs(sets, &order);
     let groups: Vec<(PublicKey, blst_p2_affine)> = runs
         .par_iter()
-        .with_min_len(GROUPS_MIN_PAR_LEN)
         .map(|run| {
             let key = primitives::weighted_key_sum(&keys[run.clone()], &weights[run.clone()]);
             (key, hashed_message(&sets[order[run.start]].message))
