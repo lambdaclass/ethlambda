@@ -32,6 +32,18 @@
 //! sum, and on each key through its own scalar multiplication, which in G1 is
 //! the cheaper group to multiply in.
 //!
+//! # Why a batch is split into chunks
+//!
+//! Hashing each message to G2 and weighting its key cost more than the
+//! pairing itself, and blst's batch, which this replaced, spread them over
+//! its thread pool. A batch here is cut into chunks of [`SETS_PER_CHUNK`]
+//! sets, each its own random linear combination with its own weights and its
+//! own final exponentiation, checked in parallel on rayon's pool with each
+//! chunk's hashes in parallel too. A chunk plus the pair for its signature sum
+//! fills one pass of the Miller-loop lanes. Splitting keeps the soundness
+//! argument per chunk: a forged set sits in one chunk, and that chunk passes
+//! with probability about 2^-64 whatever the other chunks hold.
+//!
 //! # What a batch answers
 //!
 //! Only whether every set holds. When it fails it cannot say which set did;
@@ -42,6 +54,8 @@
 
 use blst::min_pk::PublicKey;
 use rand::RngExt;
+use rayon::prelude::*;
+use silver_crypto_simd::bls::limbs::LANES;
 use silver_crypto_simd::bls::{G1Point, G2Point, PairingProduct};
 
 use ethlambda_types::beacon::primitives::{BlsSignature, Root};
@@ -162,12 +176,12 @@ fn random_weight(rng: &mut impl RngExt) -> u64 {
     }
 }
 
-/// Whether every set verifies, in one random-linear-combination check with
-/// 64-bit weights from the OS-seeded RNG and one final exponentiation. An
-/// empty slice verifies.
+/// Whether every set verifies, in random-linear-combination checks with
+/// 64-bit weights from the OS-seeded RNG, one per chunk of [`SETS_PER_CHUNK`]
+/// sets, each with one final exponentiation. An empty slice verifies.
 ///
-/// See the module documentation for why the weights are random and where they
-/// are applied. A single set skips them and is verified directly, since one
+/// See the module documentation for why the weights are random, where they are
+/// applied, and why the batch is chunked. A single set skips them and is verified directly, since one
 /// equation needs no combining. A set whose key is the identity fails the
 /// batch, as it fails [`SignatureSet::verify`]: the pairing product would drop
 /// that set's pair rather than refuse it.
@@ -180,18 +194,36 @@ pub fn verify_signature_sets(sets: &[SignatureSet]) -> bool {
     if sets.iter().any(SignatureSet::key_is_identity) {
         return false;
     }
+    sets.par_chunks(SETS_PER_CHUNK).all(chunk_holds)
+}
+
+/// How many sets one chunk of a batch holds: with the pair for the chunk's
+/// signature sum, exactly one pass of the pairing product's Miller-loop lanes.
+const SETS_PER_CHUNK: usize = LANES - 1;
+
+/// One chunk's random linear combination, with its own weights; see the module
+/// documentation. Every key is already known not to be the identity.
+fn chunk_holds(sets: &[SignatureSet]) -> bool {
     let mut rng = rand::rng();
     let weights: Vec<u64> = sets.iter().map(|_| random_weight(&mut rng)).collect();
+    // Hashing a message and weighting a key are each set's own work and the
+    // costly part of a chunk, so they run in parallel.
+    let pairs: Vec<(G1Point, G2Point)> = sets
+        .par_iter()
+        .zip(&weights)
+        .map(|(set, weight)| {
+            let key = G1Point::weighted_sum(&[g1_point(&set.pubkey)], &weight.to_le_bytes());
+            (key, G2Point::hash_to_curve(set.message.as_slice(), DST))
+        })
+        .collect();
     let scalars: Vec<u8> = weights.iter().flat_map(|w| w.to_le_bytes()).collect();
     let signatures: Vec<G2Point> = sets.iter().map(|set| set.signature).collect();
     let signature_sum = G2Point::weighted_sum(&signatures, &scalars);
 
     let mut product = PairingProduct::with_capacity(sets.len() + 1);
     product.push(&G1Point::negative_generator(), &signature_sum);
-    for (set, weight) in sets.iter().zip(&weights) {
-        let weighted_key = G1Point::weighted_sum(&[g1_point(&set.pubkey)], &weight.to_le_bytes());
-        let hash = G2Point::hash_to_curve(set.message.as_slice(), DST);
-        product.push(&weighted_key, &hash);
+    for (key, hash) in &pairs {
+        product.push(key, hash);
     }
     product.is_one()
 }
