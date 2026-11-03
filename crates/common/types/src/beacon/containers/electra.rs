@@ -894,6 +894,36 @@ mod tests {
         }
     }
 
+    /// Run with `--ignored --nocapture`. What `process_pending_deposits` costs
+    /// once per epoch on a queue of `len` deposits when it takes the queue out
+    /// as a `Vec`, drops a prefix and rebuilds the list from the rest: the
+    /// copy out, the rebuild, and the root that follows.
+    #[test]
+    #[ignore = "benchmark"]
+    fn pending_deposits_epoch_rebuild_bench() {
+        use crate::primitives::HashTreeRoot as _;
+        use std::time::Instant;
+
+        for len in [1_000usize, 20_000, 200_000] {
+            let values: Vec<_> = (0..len as u64).map(pending_deposit).collect();
+            let mut queue = PendingDeposits::try_from(values).unwrap();
+            queue.apply_updates();
+            let _ = queue.hash_tree_root();
+
+            let start = Instant::now();
+            let all = queue.to_vec();
+            let copy = start.elapsed();
+            let start = Instant::now();
+            let remaining: Vec<_> = all.into_iter().skip(16).collect();
+            let rebuilt = PendingDeposits::try_from(remaining).unwrap();
+            let build = start.elapsed();
+            let start = Instant::now();
+            let _ = rebuilt.hash_tree_root();
+            let hash = start.elapsed();
+            println!("{len} deposits: copy out {copy:?}, rebuild {build:?}, hash {hash:?}");
+        }
+    }
+
     #[test]
     fn tree_backed_pending_deposits_hash_like_the_flat_list() {
         use crate::primitives::HashTreeRoot as _;
