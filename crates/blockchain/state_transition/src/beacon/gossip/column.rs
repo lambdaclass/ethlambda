@@ -83,9 +83,24 @@ pub fn cheap_checks(
 
 /// The rules that need the parent's post-state. Runs on a blocking thread,
 /// and reads states only from the cache, as [`super::block::stateful_checks`]
-/// does. The rules themselves are [`judge_against_parent`]'s, a permit held
-/// while they run.
+/// does. The rules themselves are [`prepare_against_parent`]'s, a permit held
+/// while they run, with the KZG proofs verified on their own.
 pub fn stateful_checks(store: &Store, sidecar: &DataColumnSidecar) -> Outcome {
+    match prepare_stateful_checks_fulu(store, sidecar) {
+        ColumnPrepared::Settled(outcome) => outcome,
+        prepared @ ColumnPrepared::Kzg { .. } => {
+            let kzg = {
+                let _timing = metrics::time_data_column_kzg_verify();
+                fork_choice::verify_data_column_sidecar_kzg_proofs(sidecar)
+            };
+            prepared.settle(matches!(kzg, Ok(true)))
+        }
+    }
+}
+
+/// [`stateful_checks`] without verifying the KZG proofs; see
+/// [`ColumnPrepared`].
+pub fn prepare_stateful_checks_fulu(store: &Store, sidecar: &DataColumnSidecar) -> ColumnPrepared {
     let header = &sidecar.signed_block_header.message;
     let mut memo = SignatureMemo::default();
     let parent_known = store.has_block(&header.parent_root);
@@ -104,9 +119,9 @@ pub fn stateful_checks(store: &Store, sidecar: &DataColumnSidecar) -> Outcome {
         } else {
             QueueReason::ParentUnknown
         };
-        return queue_unless_forged(store, sidecar, reason, &mut memo);
+        return ColumnPrepared::Settled(queue_unless_forged(store, sidecar, reason, &mut memo));
     };
-    judge_against_parent(
+    prepare_against_parent(
         store,
         sidecar,
         &parent_state,
@@ -448,7 +463,7 @@ pub fn kzg_verdicts(items: &[(&AnyDataColumnSidecar, &PendingKzg)]) -> Vec<Chain
         .collect()
 }
 
-/// What [`judge_against_parent`] does when the parent state's proposer
+/// What [`prepare_against_parent`] does when the parent state's proposer
 /// lookahead has no answer for the sidecar's slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PastLookahead {
@@ -468,36 +483,117 @@ enum PastLookahead {
 /// real parent is caught by [`header_signature_is_valid`] before this pays
 /// for the finalized-ancestry walk (a full `LiveChain` scan) or the KZG
 /// proof.
-fn judge_against_parent(
+///
+/// Stops before the KZG proofs, like [`judge_before_kzg`], so the caller can
+/// verify the proofs of many sidecars in one batch: the result is
+/// [`ColumnPrepared::Settled`] when a rule before them decided, else a
+/// [`ColumnPrepared::Kzg`] carrying what the proofs are checked against and
+/// the verdict that stands if they verify. The only rule after the proofs is
+/// the lookahead one, which is evaluated here (it is a pure read) and kept as
+/// that verdict, so the proofs still come first in the order the rules apply.
+fn prepare_against_parent(
     store: &Store,
     sidecar: &DataColumnSidecar,
     parent_state: &BeaconState,
     past_lookahead: PastLookahead,
     memo: &mut SignatureMemo,
-) -> Outcome {
+) -> ColumnPrepared {
     if let Err(outcome) = judge_before_kzg(store, sidecar, parent_state, past_lookahead, memo) {
-        return outcome;
+        return ColumnPrepared::Settled(outcome);
     }
     let header = &sidecar.signed_block_header.message;
-    // [REJECT] Every cell matches its commitment and proof.
-    let kzg = {
-        let _timing = metrics::time_data_column_kzg_verify();
-        fork_choice::verify_data_column_sidecar_kzg_proofs(sidecar)
-    };
-    if !matches!(kzg, Ok(true)) {
-        return Outcome::Reject(RejectReason::Kzg);
-    }
     // [IGNORE] The sidecar's slot is outside the parent state's proposer
     // lookahead window (MAY queue).
-    if past_lookahead == PastLookahead::Queue
-        && let Err(outcome) = lookahead_covers(parent_state, header.slot)
-    {
-        return outcome;
+    let if_proofs_verify = match past_lookahead {
+        PastLookahead::Queue => lookahead_covers(parent_state, header.slot)
+            .err()
+            .unwrap_or(Outcome::Accept),
+        PastLookahead::Advance => Outcome::Accept,
+    };
+    ColumnPrepared::Kzg {
+        pending: PendingKzg {
+            commitments: sidecar.kzg_commitments.to_vec(),
+        },
+        if_proofs_verify,
     }
-    Outcome::Accept
 }
 
-/// Every rule [`judge_against_parent`] runs before the KZG proofs, in the same
+/// A gossip column's stateful rules evaluated up to, but not including, its
+/// KZG proofs. See [`prepare_stateful_checks`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ColumnPrepared {
+    /// A rule before the proofs decided: this is the verdict whatever they say.
+    Settled(Outcome),
+    /// Every rule before the proofs passed.
+    Kzg {
+        /// What the proofs are checked against.
+        pending: PendingKzg,
+        /// The verdict when they verify; [`RejectReason::Kzg`] when they do
+        /// not. `Accept` unless the lookahead rule (which comes after the
+        /// proofs) queues the sidecar.
+        if_proofs_verify: Outcome,
+    },
+}
+
+impl ColumnPrepared {
+    /// What the proofs must be verified against, if this still needs them.
+    pub fn pending(&self) -> Option<&PendingKzg> {
+        match self {
+            Self::Settled(_) => None,
+            Self::Kzg { pending, .. } => Some(pending),
+        }
+    }
+
+    /// The verdict, given whether the proofs verified. Ignored by a
+    /// [`Self::Settled`] one.
+    pub fn settle(self, proofs_verify: bool) -> Outcome {
+        match self {
+            Self::Settled(outcome) => outcome,
+            Self::Kzg {
+                if_proofs_verify, ..
+            } => {
+                if proofs_verify {
+                    if_proofs_verify
+                } else {
+                    Outcome::Reject(RejectReason::Kzg)
+                }
+            }
+        }
+    }
+}
+
+/// [`stateful_checks`] / [`stateful_checks_gloas`] without verifying the KZG
+/// proofs, for either fork's sidecar.
+pub fn prepare_stateful_checks(store: &Store, sidecar: &AnyDataColumnSidecar) -> ColumnPrepared {
+    match sidecar {
+        AnyDataColumnSidecar::Fulu(sidecar) => prepare_stateful_checks_fulu(store, sidecar),
+        AnyDataColumnSidecar::Gloas(sidecar) => prepare_stateful_checks_gloas(store, sidecar),
+    }
+}
+
+/// Whether one batched `verify_cell_kzg_proof_batch` call over all of `items`
+/// verifies. `false` does not say which sidecar is at fault: the caller
+/// verifies each with [`kzg_verdict`]'s rule ([`kzg_proofs_verify`]) after.
+pub fn kzg_batch_verifies(items: &[(&AnyDataColumnSidecar, &PendingKzg)]) -> bool {
+    let refs: Vec<ColumnRef<'_>> = items.iter().map(|(sidecar, _)| (*sidecar).into()).collect();
+    let columns: Vec<fork_choice::ColumnCells<'_>> = refs
+        .iter()
+        .zip(items)
+        .map(|(sidecar, (_, pending))| sidecar.cells(&pending.commitments))
+        .collect();
+    let batch = {
+        let _timing = metrics::time_data_column_kzg_verify();
+        fork_choice::verify_column_cells_batch(&columns)
+    };
+    matches!(batch, Ok(true))
+}
+
+/// Whether one sidecar's proofs verify on their own.
+pub fn kzg_proofs_verify(sidecar: &AnyDataColumnSidecar, pending: &PendingKzg) -> bool {
+    matches!(kzg_verdict(sidecar, pending), ChainVerdict::Keep)
+}
+
+/// Every rule [`prepare_against_parent`] runs before the KZG proofs, in the same
 /// order, so `Ok` means "accepted unless the proofs fail" and an `Err` is the
 /// verdict whatever the proofs say.
 ///
@@ -684,19 +780,41 @@ pub fn cheap_checks_gloas(
 /// is queued too where the specification rejects it, the same deviation
 /// fulu's parent rule makes until a bad-block cache exists.
 pub fn stateful_checks_gloas(store: &Store, sidecar: &gloas::DataColumnSidecar) -> Outcome {
-    let kzg_commitments = match gloas_before_kzg(store, sidecar) {
-        Ok(commitments) => commitments,
-        Err(outcome) => return outcome,
-    };
-    // [REJECT] The sidecar's column data passes KZG verification.
-    let kzg = {
-        let _timing = metrics::time_data_column_kzg_verify();
-        fork_choice::gloas_verify_data_column_sidecar_kzg_proofs(sidecar, &kzg_commitments)
-    };
-    if !matches!(kzg, Ok(true)) {
-        return Outcome::Reject(RejectReason::Kzg);
+    match prepare_stateful_checks_gloas(store, sidecar) {
+        ColumnPrepared::Settled(outcome) => outcome,
+        prepared @ ColumnPrepared::Kzg { .. } => {
+            // [REJECT] The sidecar's column data passes KZG verification.
+            let proofs_verify = {
+                let _timing = metrics::time_data_column_kzg_verify();
+                let commitments = prepared.pending().map(|pending| &pending.commitments[..]);
+                commitments.is_some_and(|commitments| {
+                    matches!(
+                        fork_choice::gloas_verify_data_column_sidecar_kzg_proofs(
+                            sidecar,
+                            commitments
+                        ),
+                        Ok(true)
+                    )
+                })
+            };
+            prepared.settle(proofs_verify)
+        }
     }
-    Outcome::Accept
+}
+
+/// [`stateful_checks_gloas`] without verifying the KZG proofs; see
+/// [`ColumnPrepared`].
+pub fn prepare_stateful_checks_gloas(
+    store: &Store,
+    sidecar: &gloas::DataColumnSidecar,
+) -> ColumnPrepared {
+    match gloas_before_kzg(store, sidecar) {
+        Ok(commitments) => ColumnPrepared::Kzg {
+            pending: PendingKzg { commitments },
+            if_proofs_verify: Outcome::Accept,
+        },
+        Err(outcome) => ColumnPrepared::Settled(outcome),
+    }
 }
 
 /// Every rule [`stateful_checks_gloas`] runs before the KZG proofs, in the
@@ -1846,6 +1964,51 @@ mod tests {
         assert_eq!(
             verdicts_of(&items),
             vec![ChainVerdict::Drop(Outcome::Reject(RejectReason::Kzg)); 2]
+        );
+    }
+
+    #[test]
+    fn the_batch_check_passes_for_valid_columns_and_fails_with_one_forged() {
+        let mut items = real_sidecars(2, &[0, 7]);
+        let refs = |items: &[(AnyDataColumnSidecar, PendingKzg)]| {
+            let pairs: Vec<_> = items.iter().map(|(s, p)| (s, p)).collect();
+            kzg_batch_verifies(&pairs)
+        };
+        assert!(refs(&items));
+        let AnyDataColumnSidecar::Fulu(forged) = &mut items[0].0 else {
+            unreachable!("real_sidecars builds fulu sidecars");
+        };
+        let mut cell = forged.column[0].to_vec();
+        cell[0] ^= 1;
+        forged.column[0] = libssz_types::SszVector::try_from(cell).expect("exact cell size");
+        assert!(!refs(&items));
+        assert!(!kzg_proofs_verify(&items[0].0, &items[0].1));
+        assert!(kzg_proofs_verify(&items[1].0, &items[1].1));
+    }
+
+    #[test]
+    fn a_prepared_column_settles_on_its_proofs_unless_a_rule_before_them_decided() {
+        let queued = Outcome::Queue(QueueReason::ParentNotReady);
+        let kzg = ColumnPrepared::Kzg {
+            pending: PendingKzg {
+                commitments: Vec::new(),
+            },
+            if_proofs_verify: queued,
+        };
+        assert!(kzg.pending().is_some());
+        // The lookahead rule comes after the proofs: forged proofs are
+        // rejected even where the lookahead would have queued the sidecar.
+        assert_eq!(kzg.clone().settle(true), queued);
+        assert_eq!(kzg.settle(false), Outcome::Reject(RejectReason::Kzg));
+        let settled = ColumnPrepared::Settled(Outcome::Reject(RejectReason::WrongProposer));
+        assert!(settled.pending().is_none());
+        assert_eq!(
+            settled.clone().settle(true),
+            Outcome::Reject(RejectReason::WrongProposer)
+        );
+        assert_eq!(
+            settled.settle(false),
+            Outcome::Reject(RejectReason::WrongProposer)
         );
     }
 
