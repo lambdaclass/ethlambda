@@ -2470,6 +2470,7 @@ async fn handle_data_column_sidecars_range_response(
     end_slot: u64,
     sidecars: Vec<DataColumnSidecar>,
 ) {
+    let received_at = Instant::now();
     let received = sidecars.len();
     trace!(%peer, start_slot, end_slot, received, "Received DataColumnsByRange response");
 
@@ -2498,7 +2499,11 @@ async fn handle_data_column_sidecars_range_response(
     // delivery of, and it arrives precisely when the chain actor is busiest
     // draining a backlog, so a message per sidecar would put that many
     // mailbox hops between the answer and the imports waiting on it.
-    column_checks::check_and_forward(server, in_range);
+    column_checks::check_and_forward(
+        server,
+        in_range,
+        column_checks::ColumnArrival::received("by_range", received_at),
+    );
 }
 
 /// Keep the sidecars of `sidecars` that answer the request: the requested
@@ -2531,6 +2536,7 @@ async fn handle_data_column_sidecars_response(
     sidecars: Vec<DataColumnSidecar>,
     ctx: &Context<P2PServer>,
 ) {
+    let received_at = Instant::now();
     let received = sidecars.len();
     trace!(%peer, %block_root, received, "Received DataColumnsByRoot response");
 
@@ -2560,7 +2566,11 @@ async fn handle_data_column_sidecars_response(
         return;
     }
 
-    column_checks::check_and_forward(server, sidecars);
+    column_checks::check_and_forward(
+        server,
+        sidecars,
+        column_checks::ColumnArrival::received("by_root", received_at),
+    );
 }
 
 /// Take delivery of a range answer, checking it against what was asked for,

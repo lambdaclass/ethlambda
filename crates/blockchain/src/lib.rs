@@ -49,7 +49,9 @@ use crate::beacon_columns::{ColumnParking, ParkedColumn};
 use crate::beacon_envelope::EnvelopeQueues;
 use crate::block_builder::ProposerConfig;
 use crate::events::ChainEvents;
-use crate::import_timing::{BlockImportReport, CascadeTimings, HeadTimings, ImportTimings};
+use crate::import_timing::{
+    BlockImportReport, CascadeTelemetry, CascadeTimings, HeadTimings, ImportTimings,
+};
 use crate::store::StoreError;
 
 pub use events::{ChainEvent, EventBus, Topic, UnknownTopic};
@@ -416,6 +418,7 @@ impl BlockChain {
             pending_block_parents: HashMap::new(),
             blocks_awaiting_columns: HashMap::new(),
             held_timings: HashMap::new(),
+            cascade_telemetry: CascadeTelemetry::default(),
             sidecars_awaiting_parent: HashMap::new(),
             column_parking: ColumnParking::default(),
             envelopes: EnvelopeQueues::default(),
@@ -490,6 +493,10 @@ pub struct BlockChainServer {
     /// `blocks_awaiting_columns`, so a block nobody ever redelivers cannot
     /// leave one behind.
     held_timings: HashMap<H256, ImportTimings>,
+
+    /// The running import cascade's telemetry record: reset when `on_block`
+    /// opens a cascade, read once its head is recomputed.
+    cascade_telemetry: CascadeTelemetry,
 
     /// Sidecars whose block's parent this node cannot yet transition from,
     /// keyed by that parent's root and replayed when it gains a post-state.
@@ -1777,6 +1784,17 @@ impl BlockChainServer {
                     let evidence =
                         data_availability_for(&self.store, &beacon_block, &self.custody_columns);
                     timings.da_check_end = Some(Instant::now());
+                    // Only a block with columns to wait for has made data
+                    // available; a gloas block or one with no commitments is
+                    // answered `NotRequired`. Stored columns come back as
+                    // `ColumnsVerified`, since they were checked on arrival.
+                    timings.da_columns_required = matches!(
+                        evidence,
+                        Some(
+                            fork_choice::DataAvailability::Columns(_)
+                                | fork_choice::DataAvailability::ColumnsVerified
+                        )
+                    );
                     match evidence {
                         Some(evidence) => evidence,
                         None => {
@@ -1829,6 +1847,7 @@ impl BlockChainServer {
                             None => Ok(None),
                             Some(request) => {
                                 let client = client.clone();
+                                timings.engine_sent = Some(Instant::now());
                                 let task = tokio::spawn(async move {
                                     let answer = beacon_engine::ask_request(&client, request).await;
                                     (answer, Instant::now())
@@ -1863,6 +1882,7 @@ impl BlockChainServer {
                                 // leaves it at zero.
                                 timings.engine_start = Some(spec_end);
                                 timings.engine_end = Some(answered_at.max(spec_end));
+                                timings.engine_answered = Some(answered_at);
                                 answer
                             }
                         }
@@ -1870,7 +1890,10 @@ impl BlockChainServer {
                 };
                 let validity = match verdict {
                     Ok(None) => fork_choice::PayloadValidity::NotRequired,
-                    Ok(Some(validity)) => validity,
+                    Ok(Some(validity)) => {
+                        timings.engine_verdict = Some(verdict_label(&validity));
+                        validity
+                    }
                     // No answer after the whole ladder.
                     // `optimistic-sync.md`: a consensus engine MUST NOT
                     // import the block and MUST NOT apply it to the fork
@@ -2107,6 +2130,7 @@ impl BlockChainServer {
             pending_block_parents: HashMap::new(),
             blocks_awaiting_columns: HashMap::new(),
             held_timings: HashMap::new(),
+            cascade_telemetry: CascadeTelemetry::default(),
             sidecars_awaiting_parent: HashMap::new(),
             column_parking: ColumnParking::default(),
             envelopes: EnvelopeQueues::default(),
@@ -2174,6 +2198,7 @@ impl BlockChainServer {
         };
         let mut queue = VecDeque::new();
         queue.push_back((signed_block, timings));
+        self.cascade_telemetry = CascadeTelemetry::default();
         let (outcome, blocks) = self.run_import_cascade(queue, &mut cascade).await;
 
         if self.store.chain() == Chain::Beacon {
@@ -2191,6 +2216,7 @@ impl BlockChainServer {
 
         cascade.observe(blocks);
         cascade.log(blocks);
+        ethlambda_telemetry::emit(|| self.cascade_telemetry.events(&cascade));
         outcome
     }
 
@@ -2309,7 +2335,7 @@ impl BlockChainServer {
     /// any of them is subtracted from another. `outcome` is borrowed rather
     /// than taken because the caller still has to act on it.
     fn log_import_report(
-        &self,
+        &mut self,
         slot: u64,
         block_root: H256,
         attestations: usize,
@@ -2329,6 +2355,17 @@ impl BlockChainServer {
             timings,
         };
         report.observe();
+        ethlambda_telemetry::emit(|| report.telemetry_events());
+        // `process_and_publish_block` also reaches here outside any
+        // `on_block`; harmless, since a locally built block has no source
+        // label and so is never recorded.
+        if report.imported_here()
+            && let Some(source) = report.timings.source_label()
+        {
+            self.cascade_telemetry
+                .imported
+                .push((report.slot, report.block_root, source));
+        }
         report.log();
     }
 
@@ -2616,6 +2653,7 @@ impl BlockChainServer {
             return timings;
         }
         timings.head_end = Some(Instant::now());
+        timings.head_ok = true;
         if let Some((head_slot, _)) = self.store.beacon_head() {
             metrics::update_head_slot(head_slot);
         }
@@ -2820,6 +2858,10 @@ impl BlockChainServer {
     ) -> Option<ImportOutcome> {
         let slot = signed_block.slot();
         let block_root = signed_block.message_hash_tree_root();
+        // The first block a cascade processes is the one that arrived.
+        self.cascade_telemetry
+            .arrival
+            .get_or_insert((slot, block_root));
         let parent_root = signed_block.parent_root();
         let proposer = signed_block.proposer_index();
         timings.guards_start = Some(Instant::now());
@@ -4315,6 +4357,16 @@ impl Handler<AggregationDeadline> for BlockChainServer {
     }
 }
 
+/// The `verdict` a `block_events` row records for an execution client's answer.
+fn verdict_label(validity: &fork_choice::PayloadValidity) -> &'static str {
+    match validity {
+        fork_choice::PayloadValidity::NotRequired => "NotRequired",
+        fork_choice::PayloadValidity::Validated => "Valid",
+        fork_choice::PayloadValidity::Optimistic => "Optimistic",
+        fork_choice::PayloadValidity::Invalidated { .. } => "Invalid",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -4623,6 +4675,7 @@ mod tests {
             pending_block_parents: HashMap::new(),
             blocks_awaiting_columns: HashMap::new(),
             held_timings: HashMap::new(),
+            cascade_telemetry: CascadeTelemetry::default(),
             sidecars_awaiting_parent: HashMap::new(),
             column_parking: ColumnParking::default(),
             envelopes: EnvelopeQueues::default(),
@@ -5520,6 +5573,214 @@ mod tests {
             .process_or_pend_block(block, ImportTimings::default(), &mut queue)
             .await;
         assert_eq!(outcome, None);
+    }
+
+    /// The arriving block is recorded whatever becomes of it, but only a
+    /// block whose own state transition ran counts as imported: a held one
+    /// does not, and neither does a re-delivery of a stored one, so neither
+    /// gets arrival rows filed under it.
+    #[tokio::test]
+    async fn only_a_block_imported_here_gets_arrival_rows() {
+        let mut store = beacon_store_fulu_at_genesis(GENESIS_TIME, 0);
+        store
+            .insert_signed_block(H256::ZERO, bare_block(0, H256::repeat_byte(0xcc)))
+            .expect("insert");
+        store
+            .insert_state(H256::ZERO, bare_state())
+            .expect("insert");
+        store
+            .set_time_ms(seconds_to_milliseconds(
+                GENESIS_TIME + 5 * Config::mainnet().seconds_per_slot,
+            ))
+            .unwrap();
+        let mut server = beacon_server(store);
+        server.custody_columns = CUSTODY.to_vec();
+        let gossip = || ImportTimings {
+            source: Some(BlockSource::Gossip),
+            ..ImportTimings::starting_now()
+        };
+        let cascade = |base: Instant| CascadeTimings {
+            source: Some(BlockSource::Gossip),
+            cascade_start: Some(base),
+            cascade_end: Some(base),
+            head_start: Some(base),
+            head_end: Some(base),
+            head_ok: true,
+            ..CascadeTimings::default()
+        };
+
+        // Held for its columns: recorded as the arrival, not imported.
+        let held = fulu_block_with_commitments(&server.store, 2);
+        let held_root = held.message_hash_tree_root();
+        server.on_block(held.clone(), gossip()).await;
+        assert_eq!(
+            server.cascade_telemetry.arrival,
+            Some((held.slot(), held_root))
+        );
+        assert!(server.cascade_telemetry.imported.is_empty());
+        assert!(
+            server
+                .cascade_telemetry
+                .events(&cascade(Instant::now()))
+                .is_empty()
+        );
+
+        // A re-delivery of a stored beacon block returns early at the
+        // `has_state` check, before any report is logged: it files no arrival
+        // rows. (`imported_here` itself is pinned by import_timing's
+        // `a_block_already_imported_writes_nothing`.)
+        let stored = fulu_block(H256::ZERO, 1, 0);
+        let stored_root = stored.message_hash_tree_root();
+        server
+            .store
+            .insert_signed_block(stored_root, stored.clone())
+            .expect("insert");
+        server
+            .store
+            .insert_state(stored_root, bare_state())
+            .expect("insert");
+        server.on_block(stored.clone(), gossip()).await;
+        assert_eq!(
+            server.cascade_telemetry.arrival,
+            Some((stored.slot(), stored_root))
+        );
+        assert!(server.cascade_telemetry.imported.is_empty());
+        assert!(
+            server
+                .cascade_telemetry
+                .events(&cascade(Instant::now()))
+                .is_empty()
+        );
+    }
+
+    /// The arrival is the cascade's first block, not the latest one processed:
+    /// later blocks of the same cascade must not overwrite it.
+    #[tokio::test]
+    async fn the_arrival_is_the_first_block_a_cascade_processes() {
+        let mut store = beacon_store_fulu_at_genesis(GENESIS_TIME, 0);
+        store
+            .insert_signed_block(H256::ZERO, bare_block(0, H256::repeat_byte(0xcc)))
+            .expect("insert");
+        store
+            .insert_state(H256::ZERO, bare_state())
+            .expect("insert");
+        store
+            .set_time_ms(seconds_to_milliseconds(
+                GENESIS_TIME + 5 * Config::mainnet().seconds_per_slot,
+            ))
+            .unwrap();
+        let mut server = beacon_server(store);
+        server.custody_columns = CUSTODY.to_vec();
+
+        let first = fulu_block_with_commitments(&server.store, 2);
+        let first_root = first.message_hash_tree_root();
+        let first_slot = first.slot();
+        let child = fulu_block(first_root, first_slot + 1, 0);
+
+        server.cascade_telemetry = CascadeTelemetry::default();
+        for block in [first, child] {
+            let mut queue = VecDeque::new();
+            server
+                .process_or_pend_block(block, ImportTimings::default(), &mut queue)
+                .await;
+        }
+
+        assert_eq!(
+            server.cascade_telemetry.arrival,
+            Some((first_slot, first_root))
+        );
+    }
+
+    /// Through `on_block`: the arrival is the block that arrived, even though
+    /// the cascade then processes a stored ancestor the walk queued behind it,
+    /// and the record is reset once per arrival, not once per block.
+    #[tokio::test]
+    async fn the_arrival_is_the_block_on_block_was_called_with() {
+        let mut store = beacon_store_fulu_at_genesis(GENESIS_TIME, 0);
+        store
+            .insert_signed_block(H256::ZERO, bare_block(0, H256::repeat_byte(0xcc)))
+            .expect("insert");
+        store
+            .insert_state(H256::ZERO, bare_state())
+            .expect("insert");
+        store
+            .set_time_ms(seconds_to_milliseconds(
+                GENESIS_TIME + 5 * Config::mainnet().seconds_per_slot,
+            ))
+            .unwrap();
+        let mut server = beacon_server(store);
+        server.custody_columns = CUSTODY.to_vec();
+
+        // Stored as pending from an earlier session: the child's walk finds
+        // it, its parent has a state, and it is queued behind the child. It is
+        // then held for its columns, so no state transition is needed.
+        let first = fulu_block_with_commitments(&server.store, 2);
+        let first_root = first.message_hash_tree_root();
+        server
+            .store
+            .insert_pending_block(first_root, first.clone())
+            .expect("insert");
+        let child = fulu_block(first_root, first.slot() + 1, 0);
+        let child_root = child.message_hash_tree_root();
+        let child_slot = child.slot();
+
+        server
+            .on_block(
+                child,
+                ImportTimings {
+                    source: Some(BlockSource::Gossip),
+                    ..ImportTimings::starting_now()
+                },
+            )
+            .await;
+
+        assert!(
+            server.blocks_awaiting_columns.contains_key(&first_root),
+            "the walk queued the stored ancestor, which then held"
+        );
+        assert_eq!(
+            server.cascade_telemetry.arrival,
+            Some((child_slot, child_root))
+        );
+    }
+
+    /// `da_columns_required` says the check found columns to require, not
+    /// merely that it ran.
+    #[tokio::test]
+    async fn the_columns_required_flag_follows_the_commitments() {
+        let mut store = beacon_store_fulu_at_genesis(GENESIS_TIME, 0);
+        store
+            .insert_signed_block(H256::ZERO, bare_block(0, H256::repeat_byte(0xcc)))
+            .expect("insert");
+        store
+            .insert_state(H256::ZERO, bare_state())
+            .expect("insert");
+        store
+            .set_time_ms(seconds_to_milliseconds(
+                GENESIS_TIME + 5 * Config::mainnet().seconds_per_slot,
+            ))
+            .unwrap();
+        let mut server = beacon_server(store);
+        server.custody_columns = CUSTODY.to_vec();
+
+        let bare = fulu_block_with_commitments(&server.store, 0);
+        let (timings, _) = server.process_block(bare, ImportTimings::default()).await;
+        assert!(timings.da_check_end.is_some(), "inside the window");
+        assert!(!timings.da_columns_required, "nothing to make available");
+
+        let with_columns = fulu_block_with_commitments(&server.store, 2);
+        let root = with_columns.message_hash_tree_root();
+        for index in CUSTODY {
+            let sidecar = sidecar_for(&with_columns, index);
+            server
+                .store
+                .put_data_column_sidecar(with_columns.slot(), &root, index, sidecar.to_ssz())
+                .unwrap();
+        }
+        let (timings, _) = server
+            .process_block(with_columns, ImportTimings::default())
+            .await;
+        assert!(timings.da_columns_required, "columns were required");
     }
 
     #[tokio::test]

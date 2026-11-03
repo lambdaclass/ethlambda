@@ -43,6 +43,7 @@ crates/
     ├─ crypto/              # XMSS sign/verify + aggregation (leanVM wrapper)
     ├─ ssz-tree/            # Persistent Merkle tree (List/Vector) behind the beacon registry and balances
     ├─ metrics/             # Prometheus re-exports, TimingGuard, gather utilities
+    ├─ telemetry/           # ClickHouse block_events rows (opt-in)
     └─ test-fixtures/       # Spec-fixture loading (prod dep of rpc's Hive test driver)
   net/
     ├─ api/                 # Actor protocol traits wiring BlockChain ↔ P2P
@@ -589,6 +590,17 @@ default** on its two SSZ endpoints and bare integers in JSON, because
 `Accept` at all; `/lean/v0/blocks/finalized` now answers JSON when asked for it by name.
 
 See [`docs/rpc.md`](docs/rpc.md) for the full reference: CLI flags and defaults, the lean API endpoints (health, finalized state/block, justified checkpoint, blocks by root/slot, fork-choice tree + D3.js UI, runtime aggregator toggle), the Beacon API endpoints and the three ids they refuse, the metrics/debug endpoints (Prometheus `/metrics`, jemalloc heap profiling), the Hive test-driver endpoints, plus request/response shapes, status codes, and content types.
+
+## Block telemetry (`crates/common/telemetry`)
+
+`--telemetry.clickhouse-url` writes Silver's `block_events` rows (one per point in a block's
+life, per data column arrival) to ClickHouse over HTTP. A global sink, installed in `run_node`
+before `P2P::spawn`; `ethlambda_telemetry::emit(|| ...)` builds nothing when it is off. Rows
+come from `BlockImportReport::telemetry_events` (final pass only, `imported_here`),
+`CascadeTelemetry` (arrival rows, and beacon `attestable` at the per-arrival head
+recomputation), and p2p's column rows: `column_checks::column_rows` (after the check), and
+`passed_rows` called directly by the gossip-accept path and by this node's own fulu columns. See
+[`docs/telemetry.md`](docs/telemetry.md).
 
 ## Beacon Chain types (`crates/common/types/src/beacon/`)
 
