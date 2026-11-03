@@ -714,4 +714,118 @@ mod tests {
         assert_eq!(flat_roots, tree_roots);
         println!("flat: {flat_time:?}, tree: {tree_time:?} ({TOUCHED} of {COUNT} entries written)");
     }
+
+    /// Run with `--ignored --nocapture`. Times the participation part of one
+    /// `process_attestation` at mainnet registry size: read the current flags
+    /// of ~75k ascending attesters, then write the new ones. "per-index" is
+    /// the first tree-backed version (a descent per `get`, then a `get_mut`
+    /// that copies the old value into the write buffer); the others swap in
+    /// the sorted reader and the blind `set`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn attestation_pass_bench() {
+        use crate::primitives::HashTreeRoot as _;
+        use std::time::Instant;
+
+        const COUNT: usize = 2_400_000;
+        const ATTESTERS: usize = COUNT / 32;
+        let mut state = 99u64;
+        let mut attesters: Vec<usize> = (0..ATTESTERS)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) as usize % COUNT
+            })
+            .collect();
+        attesters.sort_unstable();
+        attesters.dedup();
+
+        let fresh = || {
+            let mut list = EpochParticipation::try_from(flags(COUNT)).unwrap();
+            list.apply_updates();
+            let _ = list.hash_tree_root();
+            list
+        };
+
+        for (name, sorted_reads, blind_writes) in [
+            ("per-index get + get_mut", false, false),
+            ("per-index get + set", false, true),
+            ("sorted reader + get_mut", true, false),
+            ("sorted reader + set", true, true),
+        ] {
+            // Best of several runs: the first is cold.
+            let mut best = (std::time::Duration::MAX, std::time::Duration::MAX);
+            for _ in 0..5 {
+                let mut list = fresh();
+                let start = Instant::now();
+                let mut updates: Vec<(usize, ParticipationFlags)> = Vec::new();
+                if sorted_reads {
+                    let mut reader = list.sorted_reader();
+                    for &index in &attesters {
+                        let current = *reader.get(index).unwrap();
+                        updates.push((index, current));
+                    }
+                } else {
+                    for &index in &attesters {
+                        let current = *list.get(index).unwrap();
+                        updates.push((index, current));
+                    }
+                }
+                let read = start.elapsed();
+                let start = Instant::now();
+                for &(index, current) in &updates {
+                    if blind_writes {
+                        assert!(list.set(index, current | 0b100));
+                    } else {
+                        *list.get_mut(index).unwrap() |= 0b100;
+                    }
+                }
+                let write = start.elapsed();
+                best = (best.0.min(read), best.1.min(write));
+            }
+            println!(
+                "{name}: read {:?}, write {:?}, total {:?} ({} attesters)",
+                best.0,
+                best.1,
+                best.0 + best.1,
+                attesters.len()
+            );
+        }
+    }
+
+    /// Run with `--ignored --nocapture`. Times the epoch rotation's new
+    /// current-epoch participation list at mainnet registry size, then the
+    /// state root that follows: built from a zeroed `Vec` (what the rotation
+    /// did) against `List::repeat`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn participation_rotation_bench() {
+        use crate::primitives::HashTreeRoot as _;
+        use std::time::Instant;
+
+        const COUNT: usize = 2_400_000;
+        for _ in 0..3 {
+            let start = Instant::now();
+            let from_vec = EpochParticipation::try_from(vec![0u8; COUNT]).unwrap();
+            let build_vec = start.elapsed();
+            let start = Instant::now();
+            let root_vec = from_vec.hash_tree_root();
+            let hash_vec = start.elapsed();
+
+            let start = Instant::now();
+            let repeated = EpochParticipation::repeat(0, COUNT).unwrap();
+            let build_repeat = start.elapsed();
+            let start = Instant::now();
+            let root_repeat = repeated.hash_tree_root();
+            let hash_repeat = start.elapsed();
+
+            assert_eq!(root_vec, root_repeat);
+            println!(
+                "vec: build {build_vec:?} + hash {hash_vec:?} = {:?}; repeat: build {build_repeat:?} + hash {hash_repeat:?} = {:?}",
+                build_vec + hash_vec,
+                build_repeat + hash_repeat
+            );
+        }
+    }
 }
