@@ -9,7 +9,9 @@
 //! number crossing this boundary is `QUANTITY`, `0x`-prefixed with leading zeros
 //! stripped: `0x0` for zero, never `0x00` and never `0x`.
 
-use ethlambda_types::beacon::containers::deneb;
+use ethlambda_types::beacon::containers::capella::Withdrawal;
+use ethlambda_types::beacon::containers::{deneb, gloas};
+use ethlambda_types::beacon::preset;
 use ethlambda_types::beacon::primitives::{ExecutionBlockHash, Uint256};
 use ethlambda_types::beacon::serde_helpers::HexPrefixed;
 use serde::{Deserialize, Serialize, Serializer};
@@ -120,18 +122,8 @@ impl Serialize for ExecutionPayloadV3<'_> {
             .collect();
         out.serialize_field("transactions", &transactions)?;
 
-        let withdrawals: Vec<serde_json::Value> = payload
-            .withdrawals
-            .iter()
-            .map(|withdrawal| {
-                serde_json::json!({
-                    "index": quantity(withdrawal.index),
-                    "validatorIndex": quantity(withdrawal.validator_index),
-                    "address": data(&withdrawal.address.0),
-                    "amount": quantity(withdrawal.amount),
-                })
-            })
-            .collect();
+        let withdrawals: Vec<serde_json::Value> =
+            payload.withdrawals.iter().map(withdrawal_json).collect();
         out.serialize_field("withdrawals", &withdrawals)?;
 
         out.serialize_field("blobGasUsed", &quantity(payload.blob_gas_used))?;
@@ -140,9 +132,105 @@ impl Serialize for ExecutionPayloadV3<'_> {
     }
 }
 
+/// `ExecutionPayloadV4` (Amsterdam), borrowed from a decoded envelope.
+///
+/// `ExecutionPayloadV3`'s fields followed by `blockAccessList` (the RLP bytes
+/// the payload already carries, as `DATA`) and `slotNumber`. Gloas's payload
+/// has progressive `transactions` and `withdrawals`, a different type from
+/// deneb's, so it needs its own serializer; the wire shape of those two is
+/// unchanged.
+pub struct ExecutionPayloadV4<'a>(pub &'a gloas::ExecutionPayload);
+
+impl Serialize for ExecutionPayloadV4<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct as _;
+
+        let payload = self.0;
+        let mut out = serializer.serialize_struct("ExecutionPayloadV4", 19)?;
+        out.serialize_field("parentHash", &data(&payload.parent_hash.0))?;
+        out.serialize_field("feeRecipient", &data(&payload.fee_recipient.0))?;
+        out.serialize_field("stateRoot", &data(&payload.state_root.0))?;
+        out.serialize_field("receiptsRoot", &data(&payload.receipts_root.0))?;
+        out.serialize_field("logsBloom", &data(payload.logs_bloom.as_ref()))?;
+        out.serialize_field("prevRandao", &data(&payload.prev_randao.0))?;
+        out.serialize_field("blockNumber", &quantity(payload.block_number))?;
+        out.serialize_field("gasLimit", &quantity(payload.gas_limit))?;
+        out.serialize_field("gasUsed", &quantity(payload.gas_used))?;
+        out.serialize_field("timestamp", &quantity(payload.timestamp))?;
+        out.serialize_field("extraData", &data(payload.extra_data.as_ref()))?;
+        out.serialize_field("baseFeePerGas", &uint256(&payload.base_fee_per_gas))?;
+        out.serialize_field("blockHash", &data(&payload.block_hash.0))?;
+
+        let transactions: Vec<String> = payload
+            .transactions
+            .iter()
+            .map(|transaction| data(transaction.as_ref()))
+            .collect();
+        out.serialize_field("transactions", &transactions)?;
+
+        let withdrawals: Vec<serde_json::Value> =
+            payload.withdrawals.iter().map(withdrawal_json).collect();
+        out.serialize_field("withdrawals", &withdrawals)?;
+
+        out.serialize_field("blobGasUsed", &quantity(payload.blob_gas_used))?;
+        out.serialize_field("excessBlobGas", &quantity(payload.excess_blob_gas))?;
+        out.serialize_field("blockAccessList", &data(payload.block_access_list.as_ref()))?;
+        out.serialize_field("slotNumber", &quantity(payload.slot_number))?;
+        out.end()
+    }
+}
+
+/// `WithdrawalV1`.
+fn withdrawal_json(withdrawal: &Withdrawal) -> serde_json::Value {
+    serde_json::json!({
+        "index": quantity(withdrawal.index),
+        "validatorIndex": quantity(withdrawal.validator_index),
+        "address": data(&withdrawal.address.0),
+        "amount": quantity(withdrawal.amount),
+    })
+}
+
 /// Encodes a `DATA`: `0x`-prefixed, every byte rendered, no stripping.
 pub fn data(bytes: &[u8]) -> String {
     HexPrefixed(bytes).to_string()
+}
+
+/// The `custodyColumns` parameter of `engine_forkchoiceUpdatedV4`: a bitarray
+/// of `CELLS_PER_EXT_BLOB` bits marking the columns the consensus client
+/// custodies.
+///
+/// Little-endian bit order, as an SSZ `Bitvector` has it: column `i` is bit
+/// `i % 8` of byte `i / 8`. ethrex parses it the same way (`u128::from_le_bytes`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CustodyColumns([u8; Self::BYTES]);
+
+impl CustodyColumns {
+    /// Wire length of the bitmap, which the specification fixes at 16 bytes.
+    pub const BYTES: usize = 16;
+
+    /// Builds the bitmap from column indices, or `None` when any index is not
+    /// below `NUMBER_OF_COLUMNS`. Duplicates are harmless.
+    pub fn from_indices(indices: impl IntoIterator<Item = u64>) -> Option<Self> {
+        let mut bits = [0u8; Self::BYTES];
+        for index in indices {
+            if index >= preset::NUMBER_OF_COLUMNS as u64 {
+                return None;
+            }
+            bits[(index / 8) as usize] |= 1 << (index % 8);
+        }
+        Some(Self(bits))
+    }
+
+    /// The `DATA` encoding: `0x` and 32 hex digits.
+    pub fn to_data(self) -> String {
+        data(&self.0)
+    }
+}
+
+impl Serialize for CustodyColumns {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_data())
+    }
 }
 
 /// Encodes a `QUANTITY`: `0x`-prefixed, leading zeros stripped, `0x0` for zero.
@@ -170,10 +258,30 @@ pub fn uint256(value: &Uint256) -> String {
 #[cfg(test)]
 mod tests {
     use ethlambda_types::beacon::containers::bellatrix;
-    use ethlambda_types::beacon::preset;
     use ethlambda_types::beacon::primitives::{Bytes32, ExecutionAddress, U256};
 
     use super::*;
+
+    #[test]
+    fn custody_columns_use_little_endian_bit_order() {
+        // Column 0 is bit 0 of byte 0; column 9 is bit 1 of byte 1; column 127
+        // is bit 7 of byte 15.
+        let columns = CustodyColumns::from_indices([0, 9, 127]).unwrap();
+        assert_eq!(columns.to_data(), "0x01020000000000000000000000000080");
+    }
+
+    #[test]
+    fn custody_columns_reject_an_out_of_range_index() {
+        let bound = preset::NUMBER_OF_COLUMNS as u64;
+        assert!(CustodyColumns::from_indices([bound - 1]).is_some());
+        assert!(CustodyColumns::from_indices([0, bound]).is_none());
+    }
+
+    #[test]
+    fn empty_custody_columns_encode_as_sixteen_zero_bytes() {
+        let columns = CustodyColumns::from_indices([]).unwrap();
+        assert_eq!(columns.to_data(), format!("0x{}", "00".repeat(16)));
+    }
 
     /// An otherwise-zero deneb execution payload whose `block_hash` is
     /// `block_hash`.
@@ -292,6 +400,77 @@ mod tests {
             json["blockHash"],
             "0x0707070707070707070707070707070707070707070707070707070707070707"
         );
+    }
+
+    #[test]
+    fn a_gloas_payload_serializes_to_the_amsterdam_shape() {
+        let mut payload = gloas::ExecutionPayload {
+            parent_hash: ExecutionBlockHash::repeat_byte(1),
+            fee_recipient: ExecutionAddress::repeat_byte(2),
+            state_root: Bytes32::repeat_byte(3),
+            receipts_root: Bytes32::repeat_byte(4),
+            logs_bloom: bellatrix::LogsBloom::try_from(vec![0u8; preset::BYTES_PER_LOGS_BLOOM])
+                .expect("built at exactly BYTES_PER_LOGS_BLOOM"),
+            prev_randao: Bytes32::repeat_byte(5),
+            block_number: 16,
+            gas_limit: 30_000_000,
+            gas_used: 0,
+            timestamp: 255,
+            extra_data: Default::default(),
+            base_fee_per_gas: Uint256::from_u128(7),
+            block_hash: ExecutionBlockHash::repeat_byte(6),
+            transactions: Default::default(),
+            withdrawals: Default::default(),
+            blob_gas_used: 131072,
+            excess_blob_gas: 0,
+            block_access_list: Default::default(),
+            slot_number: 4096,
+        };
+        let transaction: gloas::Transaction = vec![0x02u8, 0xab].try_into().expect("fits");
+        payload.transactions.push(transaction);
+        payload.withdrawals.push(Withdrawal {
+            index: 9,
+            validator_index: 10,
+            address: ExecutionAddress::repeat_byte(8),
+            amount: 32,
+        });
+        for byte in [0xc1u8, 0x80] {
+            payload.block_access_list.push(byte);
+        }
+
+        let json = serde_json::to_value(ExecutionPayloadV4(&payload)).expect("serializes");
+
+        let expected = serde_json::json!({
+            "parentHash": format!("0x{}", "01".repeat(32)),
+            "feeRecipient": format!("0x{}", "02".repeat(20)),
+            "stateRoot": format!("0x{}", "03".repeat(32)),
+            "receiptsRoot": format!("0x{}", "04".repeat(32)),
+            "logsBloom": format!("0x{}", "00".repeat(256)),
+            "prevRandao": format!("0x{}", "05".repeat(32)),
+            "blockNumber": "0x10",
+            "gasLimit": "0x1c9c380",
+            "gasUsed": "0x0",
+            "timestamp": "0xff",
+            "extraData": "0x",
+            "baseFeePerGas": "0x7",
+            "blockHash": format!("0x{}", "06".repeat(32)),
+            "transactions": ["0x02ab"],
+            "withdrawals": [{
+                "index": "0x9",
+                "validatorIndex": "0xa",
+                "address": format!("0x{}", "08".repeat(20)),
+                "amount": "0x20",
+            }],
+            "blobGasUsed": "0x20000",
+            "excessBlobGas": "0x0",
+            "blockAccessList": "0xc180",
+            "slotNumber": "0x1000",
+        });
+        assert_eq!(json, expected);
+
+        // The spec's order, with the two Amsterdam fields last.
+        let text = serde_json::to_string(&ExecutionPayloadV4(&payload)).expect("serializes");
+        assert!(text.ends_with(r#""blockAccessList":"0xc180","slotNumber":"0x1000"}"#));
     }
 
     #[test]

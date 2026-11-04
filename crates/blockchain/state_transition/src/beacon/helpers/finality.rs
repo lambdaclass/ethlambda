@@ -57,8 +57,7 @@ pub fn is_in_inactivity_leak(state: &BeaconState) -> Result<bool> {
 pub fn get_eligible_validator_indices(state: &BeaconState) -> Vec<ValidatorIndex> {
     let previous_epoch = get_previous_epoch(state);
     state
-        .validators()
-        .iter()
+        .iter_validators()
         .enumerate()
         .filter(|(_, validator)| {
             is_active_validator(validator, previous_epoch)

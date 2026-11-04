@@ -42,7 +42,7 @@ pub type PendingAttestations = SszList<PendingAttestation, { preset::MAX_PENDING
 /// An aggregate attestation, as gossiped and as included in a block.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct Attestation {
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
     pub aggregation_bits: AggregationBits,
     pub data: AttestationData,
     /// The aggregate signature of every attester set in `aggregation_bits`, over
@@ -59,7 +59,7 @@ pub struct Attestation {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct IndexedAttestation {
     /// The attesters, which the specification requires to be sorted and unique.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub attesting_indices: AttestingIndices,
     pub data: AttestationData,
     pub signature: BlsSignature,
@@ -79,7 +79,7 @@ pub struct AttesterSlashing {
 /// two things it will need later and defers the work.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct PendingAttestation {
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
     pub aggregation_bits: AggregationBits,
     pub data: AttestationData,
     /// How many slots passed between the attested slot and the block that
@@ -109,15 +109,15 @@ pub struct BeaconBlockBody {
     pub eth1_data: Eth1Data,
     /// Arbitrary proposer-chosen bytes, which consensus never reads.
     pub graffiti: Bytes32,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub proposer_slashings: SszList<ProposerSlashing, { preset::MAX_PROPOSER_SLASHINGS }>,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub attester_slashings: SszList<AttesterSlashing, { preset::MAX_ATTESTER_SLASHINGS }>,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub attestations: SszList<Attestation, { preset::MAX_ATTESTATIONS }>,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub deposits: SszList<Deposit, { preset::MAX_DEPOSITS }>,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub voluntary_exits: SszList<SignedVoluntaryExit, { preset::MAX_VOLUNTARY_EXITS }>,
 }
 
@@ -167,16 +167,16 @@ pub struct BeaconState {
     /// advances, since a block cannot commit to the root of the state containing
     /// it.
     pub latest_block_header: BeaconBlockHeader,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub block_roots: BlockRoots,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub state_roots: StateRoots,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub historical_roots: HistoricalRoots,
 
     // -- Eth1 --
     pub eth1_data: Eth1Data,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub eth1_data_votes: Eth1DataVotes,
     /// How many deposits from the contract have been processed, which is where
     /// the next one will be read from.
@@ -184,31 +184,31 @@ pub struct BeaconState {
     pub eth1_deposit_index: u64,
 
     // -- Registry --
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub validators: Validators,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub balances: Balances,
 
     // -- Randomness --
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub randao_mixes: RandaoMixes,
 
     // -- Slashings --
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub slashings: Slashings,
 
     // -- Attestations --
     /// Attestations for the previous epoch, replayed at the epoch boundary. Only
     /// phase0 has these; altair replaces them with participation flags.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub previous_epoch_attestations: PendingAttestations,
     /// Attestations for the current epoch, which become
     /// `previous_epoch_attestations` at the next boundary.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub current_epoch_attestations: PendingAttestations,
 
     // -- Finality --
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
     pub justification_bits: JustificationBits,
     pub previous_justified_checkpoint: Checkpoint,
     pub current_justified_checkpoint: Checkpoint,

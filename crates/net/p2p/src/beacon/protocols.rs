@@ -9,6 +9,10 @@
 //! into, and an unregistered protocol is still refused at stream negotiation
 //! rather than answered with a lie.
 //!
+//! The two gloas execution payload envelope protocols are registered for the
+//! same reason the column ones are: the server side answers out of
+//! `Table::ExecutionPayloadEnvelopes`. Nothing requests them yet.
+//!
 //! Only version 2 of the two block protocols is registered. Version 1 is
 //! deprecated by the spec, which lets a client answer it with an empty list,
 //! and its chunks carry no `<context-bytes>`, so serving it would mean a second
@@ -31,6 +35,14 @@ pub const DATA_COLUMN_SIDECARS_BY_RANGE_V1: &str =
     "/eth2/beacon_chain/req/data_column_sidecars_by_range/1/ssz_snappy";
 pub const DATA_COLUMN_SIDECARS_BY_ROOT_V1: &str =
     "/eth2/beacon_chain/req/data_column_sidecars_by_root/1/ssz_snappy";
+pub const EXECUTION_PAYLOAD_ENVELOPES_BY_RANGE_V1: &str =
+    "/eth2/beacon_chain/req/execution_payload_envelopes_by_range/1/ssz_snappy";
+pub const EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT_V1: &str =
+    "/eth2/beacon_chain/req/execution_payload_envelopes_by_root/1/ssz_snappy";
+
+/// `MAX_REQUEST_PAYLOADS`: the ceiling on either gloas envelope request, and
+/// on the list a response carries.
+pub const MAX_REQUEST_PAYLOADS: u64 = 128;
 
 /// `MAX_REQUEST_BLOCKS`: the ceiling phase0 put on either block request.
 ///
@@ -99,6 +111,14 @@ pub fn registrations() -> Vec<(StreamProtocol, ProtocolSupport)> {
             StreamProtocol::new(DATA_COLUMN_SIDECARS_BY_ROOT_V1),
             ProtocolSupport::Full,
         ),
+        (
+            StreamProtocol::new(EXECUTION_PAYLOAD_ENVELOPES_BY_RANGE_V1),
+            ProtocolSupport::Full,
+        ),
+        (
+            StreamProtocol::new(EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT_V1),
+            ProtocolSupport::Full,
+        ),
     ]
 }
 
@@ -116,6 +136,12 @@ pub fn label(protocol: &str) -> Option<&'static str> {
         BLOCKS_BY_ROOT_V2 => Some("beacon_blocks_by_root_v2"),
         DATA_COLUMN_SIDECARS_BY_RANGE_V1 => Some("beacon_data_column_sidecars_by_range"),
         DATA_COLUMN_SIDECARS_BY_ROOT_V1 => Some("beacon_data_column_sidecars_by_root"),
+        EXECUTION_PAYLOAD_ENVELOPES_BY_RANGE_V1 => {
+            Some("beacon_execution_payload_envelopes_by_range")
+        }
+        EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT_V1 => {
+            Some("beacon_execution_payload_envelopes_by_root")
+        }
         _ => None,
     }
 }
@@ -155,6 +181,18 @@ mod tests {
         assert_eq!(
             DATA_COLUMN_SIDECARS_BY_RANGE_V1,
             "/eth2/beacon_chain/req/data_column_sidecars_by_range/1/ssz_snappy"
+        );
+    }
+
+    #[test]
+    fn the_envelope_protocol_ids_are_the_spec_strings() {
+        assert_eq!(
+            EXECUTION_PAYLOAD_ENVELOPES_BY_RANGE_V1,
+            "/eth2/beacon_chain/req/execution_payload_envelopes_by_range/1/ssz_snappy"
+        );
+        assert_eq!(
+            EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT_V1,
+            "/eth2/beacon_chain/req/execution_payload_envelopes_by_root/1/ssz_snappy"
         );
     }
 

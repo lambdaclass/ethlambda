@@ -12,9 +12,9 @@
 //! a fixed amount per validator regardless of how many there are.
 //!
 //! [`process_rewards_and_penalties`] applies the results as two separate
-//! passes, rewards then penalties, each through [`increase_balance`] and
-//! [`decrease_balance`] rather than a single netted delta. That distinction is
-//! load-bearing: [`decrease_balance`] floors at zero, and netting the two
+//! saturating steps, rewards then penalties (see [`apply_balance_deltas`]),
+//! rather than a single netted delta. That distinction is
+//! load-bearing: a penalty floors at zero, and netting the two
 //! before applying them would let a reward mask a penalty that should have
 //! driven a low balance all the way down.
 //!
@@ -48,7 +48,7 @@ use crate::beacon::helpers::finality::{
     get_eligible_validator_indices, get_finality_delay, is_in_inactivity_leak,
 };
 use crate::beacon::helpers::math::integer_squareroot;
-use crate::beacon::helpers::mutators::{decrease_balance, increase_balance};
+use crate::beacon::helpers::mutators::apply_balance_deltas;
 use crate::beacon::preset;
 use crate::beacon::primitives::{Gwei, ValidatorIndex};
 
@@ -101,8 +101,8 @@ pub fn get_attestation_component_deltas(
     state: &BeaconState,
     attestations: &[PendingAttestation],
 ) -> Result<(Vec<Gwei>, Vec<Gwei>)> {
-    let mut rewards = vec![0; state.validators().len()];
-    let mut penalties = vec![0; state.validators().len()];
+    let mut rewards = vec![0; state.validator_count()];
+    let mut penalties = vec![0; state.validator_count()];
 
     let total_balance = get_total_active_balance(state)?;
     let unslashed_attesting_indices = get_unslashed_attesting_indices(state, attestations)?;
@@ -170,7 +170,7 @@ pub fn get_inclusion_delay_deltas(
     state: &BeaconState,
     _config: &Config,
 ) -> Result<(Vec<Gwei>, Vec<Gwei>)> {
-    let mut rewards = vec![0; state.validators().len()];
+    let mut rewards = vec![0; state.validator_count()];
 
     let matching_source_attestations =
         get_matching_source_attestations(state, get_previous_epoch(state))?;
@@ -214,7 +214,7 @@ pub fn get_inclusion_delay_deltas(
     }
 
     // No penalties are associated with inclusion delay.
-    let penalties = vec![0; state.validators().len()];
+    let penalties = vec![0; state.validator_count()];
     Ok((rewards, penalties))
 }
 
@@ -234,7 +234,7 @@ pub fn get_inactivity_penalty_deltas(
     state: &BeaconState,
     _config: &Config,
 ) -> Result<(Vec<Gwei>, Vec<Gwei>)> {
-    let mut penalties = vec![0; state.validators().len()];
+    let mut penalties = vec![0; state.validator_count()];
 
     if is_in_inactivity_leak(state)? {
         let matching_target_attestations =
@@ -269,7 +269,7 @@ pub fn get_inactivity_penalty_deltas(
     }
 
     // No rewards are associated with inactivity penalties.
-    let rewards = vec![0; state.validators().len()];
+    let rewards = vec![0; state.validator_count()];
     Ok((rewards, penalties))
 }
 
@@ -290,7 +290,7 @@ pub fn get_attestation_deltas(
     let (inclusion_delay_rewards, _) = get_inclusion_delay_deltas(state, config)?;
     let (_, inactivity_penalties) = get_inactivity_penalty_deltas(state, config)?;
 
-    let validator_count = state.validators().len();
+    let validator_count = state.validator_count();
     let mut rewards = vec![0; validator_count];
     let mut penalties = vec![0; validator_count];
     for i in 0..validator_count {
@@ -308,8 +308,8 @@ pub fn get_attestation_deltas(
 ///
 /// Skipped entirely at the genesis epoch: rewards pay for attestations cast in
 /// the previous epoch, and genesis has none. Rewards and penalties are two
-/// separate passes over [`increase_balance`] and [`decrease_balance`], not one
-/// netted delta, because [`decrease_balance`] floors at zero: netting first
+/// separate saturating steps (see [`apply_balance_deltas`]), not one
+/// netted delta, because a penalty floors at zero: netting first
 /// would let a reward mask a penalty that should have driven a low balance all
 /// the way down.
 pub fn process_rewards_and_penalties(state: &mut BeaconState, config: &Config) -> Result<()> {
@@ -317,12 +317,8 @@ pub fn process_rewards_and_penalties(state: &mut BeaconState, config: &Config) -
         return Ok(());
     }
 
-    let (rewards, penalties) = get_attestation_deltas(state, config)?;
-    for index in 0..state.validators().len() as ValidatorIndex {
-        increase_balance(state, index, rewards[index as usize])?;
-        decrease_balance(state, index, penalties[index as usize])?;
-    }
-    Ok(())
+    let deltas = [get_attestation_deltas(state, config)?];
+    apply_balance_deltas(state, &deltas)
 }
 
 #[cfg(test)]
@@ -382,13 +378,13 @@ mod tests {
         let config = Config::mainnet();
         let mut state = crate::beacon::helpers::test_state::with_validators(4);
         *state.slot_mut() = 0;
-        let balances_before = state.balances().clone();
+        let balances_before: Vec<Gwei> = state.iter_balances().collect();
 
         process_rewards_and_penalties(&mut state, &config).unwrap();
 
         assert_eq!(
-            state.balances(),
-            &balances_before,
+            state.iter_balances().collect::<Vec<_>>(),
+            balances_before,
             "the genesis epoch has no previous epoch to reward"
         );
     }

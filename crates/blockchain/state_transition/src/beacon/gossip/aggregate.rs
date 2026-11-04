@@ -1,6 +1,9 @@
 //! `beacon_aggregate_and_proof` gossip validation: electra's
 //! `validate_beacon_aggregate_and_proof_gossip` (`specs/electra/p2p-interface.md`),
-//! which fulu (what mainnet runs) inherits unchanged.
+//! which fulu inherits unchanged, and gloas's modification of it
+//! (`specs/gloas/p2p-interface.md`). The aggregate's variant picks the
+//! `data.index` rule and whether the payload-status check runs; it runs last,
+//! as in the specification.
 //!
 //! # Deviations from the specification
 //!
@@ -54,23 +57,31 @@ use lru::LruCache;
 
 use super::{
     IgnoreReason, Outcome, RejectReason, ancestor_at, is_current_or_previous_epoch, is_future_slot,
+    verify_attestation_payload_status,
 };
 use crate::beacon::bls;
 use crate::beacon::constants::{
-    DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_SELECTION_PROOF, TARGET_AGGREGATORS_PER_COMMITTEE,
+    DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER, DOMAIN_SELECTION_PROOF,
+    TARGET_AGGREGATORS_PER_COMMITTEE,
 };
 use crate::beacon::containers::SignedAggregateAndProof;
 use crate::beacon::fork_choice::Store;
 use crate::beacon::hash::hash;
-use crate::beacon::helpers::accessors::{CommitteeCacheExt, get_domain};
+use crate::beacon::helpers::accessors::{CommitteeCacheExt, get_domain_from_schedule};
 use crate::beacon::helpers::math::bytes_to_uint64;
 use crate::beacon::helpers::misc::{
     compute_epoch_at_slot, compute_signing_root, compute_start_slot_at_epoch,
 };
+use crate::beacon::preset;
 use crate::beacon::primitives::{
     BlsSignature, CommitteeIndex, Epoch, HashTreeRoot as _, Root, ValidatorIndex,
 };
 use ethlambda_storage::CacheKey;
+
+/// The most aggregation bits a gloas aggregate may carry: electra's type
+/// bound (every committee of a slot at full size). Gloas's progressive bitlist
+/// has no bound of its own, so the gossip rules enforce this one.
+const MAX_AGGREGATION_BITS: usize = preset::MAX_VALIDATORS_PER_SLOT;
 
 /// One committee's worth of aggregation bits, packed a `u64` at a time.
 ///
@@ -240,6 +251,7 @@ fn aggregate_and_proof_root(aggregate: &SignedAggregateAndProof) -> Root {
     match aggregate {
         SignedAggregateAndProof::Phase0(signed) => signed.message.hash_tree_root(),
         SignedAggregateAndProof::Electra(signed) => signed.message.hash_tree_root(),
+        SignedAggregateAndProof::Gloas(signed) => signed.message.hash_tree_root(),
     }
 }
 
@@ -256,12 +268,36 @@ pub fn cheap_checks(
     let config = store.config();
     let data = aggregate.data();
 
-    // [New in Electra:EIP7549] [REJECT] `data.index` is zero: the committee
-    // now lives in `committee_bits` instead. Phase0 has no `committee_bits`
-    // and carries the real committee in `data.index`, so this only applies
-    // to the electra shape.
-    if matches!(aggregate, SignedAggregateAndProof::Electra(_)) && data.index != 0 {
-        return Err(Outcome::Reject(RejectReason::NonZeroDataIndex));
+    // [REJECT] The bitfield fits the type bound electra gave it. Gloas's
+    // `AggregationBits` is a progressive bitlist with no bound of its own, and
+    // everything below (the seen-set verdict first) expands the bits, so an
+    // oversized one is turned away before anything reads them. The length is
+    // read without expanding the list. Earlier forks' bitlists carry this bound
+    // in their type.
+    if matches!(aggregate, SignedAggregateAndProof::Gloas(_))
+        && aggregate.aggregation_bits_len() > MAX_AGGREGATION_BITS
+    {
+        return Err(Outcome::Reject(RejectReason::BitsLength));
+    }
+
+    match aggregate {
+        // Phase0 has no `committee_bits` and carries the real committee in
+        // `data.index`, so there is nothing to require of it.
+        SignedAggregateAndProof::Phase0(_) => {}
+        // [New in Electra:EIP7549] [REJECT] `data.index` is zero: the committee
+        // now lives in `committee_bits` instead.
+        SignedAggregateAndProof::Electra(_) => {
+            if data.index != 0 {
+                return Err(Outcome::Reject(RejectReason::NonZeroDataIndex));
+            }
+        }
+        // [New in Gloas:EIP7732] [REJECT] `data.index` is 0 or 1: it is the
+        // payload-present flag now.
+        SignedAggregateAndProof::Gloas(_) => {
+            if data.index > 1 {
+                return Err(Outcome::Reject(RejectReason::DataIndexOutOfRange));
+            }
+        }
     }
     // [New in Electra:EIP7549] [REJECT] Exactly one committee is named.
     // Always `Some` for phase0, whose `data.index` alone names the committee.
@@ -319,6 +355,11 @@ pub fn cheap_checks(
 ///   ([`super::ancestor_at`]) without a `Store::block_index` / `LiveChain`
 ///   scan, because a block's post-state always has history back through its
 ///   own ancestors.
+///
+/// What this state cannot answer is the signing domain: when the target
+/// epoch's first slots are empty, the vote block's state still carries the
+/// previous fork, so all three signatures are checked under the schedule's
+/// domain for the target epoch instead (see [`get_domain_from_schedule`]).
 pub fn stateful_checks(
     store: &Store,
     aggregate: &SignedAggregateAndProof,
@@ -338,6 +379,7 @@ pub fn stateful_checks(
     };
 
     let target_epoch = data.target.epoch;
+    let config = store.config();
 
     // Pubkey-only signatures, before any committee derivation; see the
     // module documentation for why this order.
@@ -347,13 +389,15 @@ pub fn stateful_checks(
     };
     // [REJECT] The selection proof selects the validator as an aggregator.
     let selection_proof = aggregate.selection_proof();
-    let selection_domain = get_domain(&state, DOMAIN_SELECTION_PROOF, Some(target_epoch));
+    let selection_domain =
+        get_domain_from_schedule(&config, &state, DOMAIN_SELECTION_PROOF, target_epoch);
     let selection_signing_root = compute_signing_root(data.slot.hash_tree_root(), selection_domain);
     if !bls::verify(&aggregator.pubkey, selection_signing_root, &selection_proof) {
         return Err(Outcome::Reject(RejectReason::SelectionProof));
     }
     // [REJECT] The aggregator's own signature, over the whole envelope.
-    let aggregator_domain = get_domain(&state, DOMAIN_AGGREGATE_AND_PROOF, Some(target_epoch));
+    let aggregator_domain =
+        get_domain_from_schedule(&config, &state, DOMAIN_AGGREGATE_AND_PROOF, target_epoch);
     let aggregator_signing_root =
         compute_signing_root(aggregate_and_proof_root(aggregate), aggregator_domain);
     if !bls::verify(
@@ -398,6 +442,8 @@ pub fn stateful_checks(
 
     // [REJECT] The aggregate's own signature is valid. Built from the same
     // (cached) committees, so this costs no further shuffle.
+    let attester_domain =
+        get_domain_from_schedule(&config, &state, DOMAIN_BEACON_ATTESTER, target_epoch);
     let attesting_indices = match aggregate {
         SignedAggregateAndProof::Phase0(signed) => {
             let phase0_attestation = &signed.message.aggregate;
@@ -407,8 +453,11 @@ pub fn stateful_checks(
                 &committees,
             )
             .map_err(|_| Outcome::Ignore(IgnoreReason::Internal))?;
-            if !crate::beacon::helpers::attestation::is_valid_indexed_attestation(&state, &indexed)
-            {
+            if !crate::beacon::helpers::attestation::is_valid_indexed_attestation_with_domain(
+                &state,
+                &indexed,
+                attester_domain,
+            ) {
                 return Err(Outcome::Reject(RejectReason::AggregateSignature));
             }
             indexed.attesting_indices.to_vec()
@@ -421,7 +470,28 @@ pub fn stateful_checks(
                 &committees,
             )
             .map_err(|_| Outcome::Ignore(IgnoreReason::Internal))?;
-            if !crate::beacon::helpers::electra::is_valid_indexed_attestation(&state, &indexed) {
+            if !crate::beacon::helpers::electra::is_valid_indexed_attestation_with_domain(
+                &state,
+                &indexed,
+                attester_domain,
+            ) {
+                return Err(Outcome::Reject(RejectReason::AggregateSignature));
+            }
+            indexed.attesting_indices.to_vec()
+        }
+        SignedAggregateAndProof::Gloas(signed) => {
+            let gloas_attestation = &signed.message.aggregate;
+            let indexed = crate::beacon::helpers::gloas::get_indexed_attestation(
+                &state,
+                gloas_attestation,
+                &committees,
+            )
+            .map_err(|_| Outcome::Ignore(IgnoreReason::Internal))?;
+            if !crate::beacon::helpers::gloas::is_valid_indexed_attestation_with_domain(
+                &state,
+                &indexed,
+                attester_domain,
+            ) {
                 return Err(Outcome::Reject(RejectReason::AggregateSignature));
             }
             indexed.attesting_indices.to_vec()
@@ -447,6 +517,12 @@ pub fn stateful_checks(
     };
     if finalized_block != finalized.root {
         return Err(Outcome::Ignore(IgnoreReason::FinalizedNotAncestor));
+    }
+
+    // [New in Gloas:EIP7732] The attested payload status is consistent with the
+    // block's execution payload.
+    if matches!(aggregate, SignedAggregateAndProof::Gloas(_)) {
+        verify_attestation_payload_status(store, &data)?;
     }
 
     Ok(attesting_indices)
@@ -516,6 +592,54 @@ mod tests {
                 root: Root::repeat_byte(2),
             },
         }
+    }
+
+    #[test]
+    fn a_gloas_aggregate_with_an_oversized_bitfield_is_rejected_first() {
+        use crate::beacon::containers::gloas;
+
+        let store = store(0);
+        let now_ms = slot_start_ms(&store, 1);
+        let mut committee_bits = electra::CommitteeBits::default();
+        committee_bits
+            .set(0, true)
+            .expect("within MAX_COMMITTEES_PER_SLOT");
+        let aggregate_with_len = |len: usize| {
+            SignedAggregateAndProof::Gloas(gloas::SignedAggregateAndProof {
+                message: gloas::AggregateAndProof {
+                    aggregator_index: 0,
+                    aggregate: gloas::Attestation {
+                        aggregation_bits: gloas::AggregationBits::with_length(len),
+                        data: shared_data(0),
+                        signature: Default::default(),
+                        committee_bits: committee_bits.clone(),
+                    },
+                    selection_proof: Default::default(),
+                },
+                signature: Default::default(),
+            })
+        };
+
+        assert_eq!(
+            cheap_checks(
+                &seen_aggregates(),
+                &store,
+                &aggregate_with_len(MAX_AGGREGATION_BITS + 1),
+                now_ms
+            ),
+            Err(Outcome::Reject(RejectReason::BitsLength))
+        );
+        // At the bound it is no longer this check's to reject; it goes on to
+        // the participants rule, which an empty bitfield fails.
+        assert_eq!(
+            cheap_checks(
+                &seen_aggregates(),
+                &store,
+                &aggregate_with_len(MAX_AGGREGATION_BITS),
+                now_ms
+            ),
+            Err(Outcome::Reject(RejectReason::NoParticipants))
+        );
     }
 
     // -- PackedBits / superset semantics --------------------------------

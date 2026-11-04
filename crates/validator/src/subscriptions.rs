@@ -13,7 +13,11 @@ use tracing::{info, warn};
 
 use crate::aggregation_selection::selection_for;
 use crate::beacon_node::BeaconNodeApi;
-use crate::beacon_node::dto::{AttesterDutyDto, CommitteeSubscriptionDto};
+use ethlambda_types::beacon::primitives::Epoch;
+
+use crate::beacon_node::dto::{
+    AttesterDutyDto, CommitteeSubscriptionDto, SyncCommitteeSubscriptionDto, SyncDutyDto,
+};
 use crate::error::Result;
 use crate::keys::ValidatorStore;
 use crate::signing::SigningContext;
@@ -86,6 +90,33 @@ pub async fn subscribe<B: BeaconNodeApi>(
     beacon_node.subscribe_committees(&subscriptions).await
 }
 
+/// Tell the node which sync committee seats this client holds, so it joins
+/// their subnets until `until_epoch` (exclusive). One entry per duty.
+///
+/// Re-sent every epoch by the caller, since a node forgets on restart.
+pub async fn subscribe_sync<B: BeaconNodeApi>(
+    beacon_node: &Arc<B>,
+    duties: &[SyncDutyDto],
+    until_epoch: Epoch,
+) -> Result<()> {
+    if duties.is_empty() {
+        return Ok(());
+    }
+    let subscriptions: Vec<SyncCommitteeSubscriptionDto> = duties
+        .iter()
+        .map(|duty| SyncCommitteeSubscriptionDto {
+            validator_index: duty.validator_index,
+            sync_committee_indices: duty.validator_sync_committee_indices.clone(),
+            until_epoch,
+        })
+        .collect();
+    info!(
+        count = subscriptions.len(),
+        until_epoch, "Subscribing to sync committee subnets"
+    );
+    beacon_node.subscribe_sync_committees(&subscriptions).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +184,30 @@ mod tests {
         );
         assert_eq!(sent[0].validator_index, 1);
         assert_eq!(sent[2].slot, 97);
+    }
+
+    #[tokio::test]
+    async fn one_sync_subscription_is_sent_per_duty() {
+        let node = Arc::new(MockBeaconNode::new());
+        let duties = vec![
+            SyncDutyDto {
+                pubkey: "0x00".to_string(),
+                validator_index: 1,
+                validator_sync_committee_indices: vec![3, 130],
+            },
+            SyncDutyDto {
+                pubkey: "0x00".to_string(),
+                validator_index: 2,
+                validator_sync_committee_indices: vec![400],
+            },
+        ];
+        subscribe_sync(&node, &duties, 256).await.expect("sends");
+        subscribe_sync(&node, &[], 256).await.expect("no-op");
+
+        let sent = node.sync_subscriptions();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].sync_committee_indices, vec![3, 130]);
+        assert_eq!(sent[1].until_epoch, 256);
     }
 
     #[tokio::test]

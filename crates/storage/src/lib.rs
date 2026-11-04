@@ -1,3 +1,4 @@
+mod active_balance_cache;
 mod api;
 pub mod backend;
 mod beacon_state_delta;
@@ -5,11 +6,13 @@ mod committee_cache;
 mod error;
 mod liveness;
 mod metrics;
+pub mod pools;
 mod state_codec;
 mod state_diff;
 mod state_writer;
 mod store;
 
+pub use active_balance_cache::{ActiveBalanceCache, ActiveBalanceKey};
 pub use api::{
     ALL_TABLES, StorageBackend, StorageReadView, StorageReadViewExt, StorageWriteBatch, Table,
 };

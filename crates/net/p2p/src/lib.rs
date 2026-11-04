@@ -38,20 +38,32 @@ use std::{
 
 use either::Either;
 use ethlambda_network_api::{
-    FetchRequest, InitBlockChain, P2PToBlockChainRef,
+    FetchRequest, InitBlockChain, MetaDataController, P2PToBlockChainRef,
     block_chain_to_p2p::{
         CheckDataColumnSidecars, FetchBlock, PublishAggregatedAttestation, PublishAttestation,
         PublishBlock,
     },
     rpc_to_p2p::{
         PublishBeaconAggregate, PublishBeaconAttestation, PublishBeaconBlock,
-        SubscribeAttestationSubnets,
+        PublishBeaconOperation, PublishExecutionPayloadBid, PublishExecutionPayloadEnvelope,
+        PublishPayloadAttestationMessage, PublishProposerPreferences,
+        PublishSyncCommitteeContribution, PublishSyncCommitteeMessage, SubscribeAttestationSubnets,
+        SubscribeSyncCommitteeSubnets,
     },
 };
 use ethlambda_state_transition::beacon::aggregate::MAX_AGGREGATES_PER_SLOT;
-use ethlambda_state_transition::beacon::attestation_pool::SharedAttestationPool;
 use ethlambda_state_transition::beacon::gossip::{
-    SeenBlocks, SeenColumns, aggregate::SeenAggregates, attestation::SeenAttestations,
+    SeenBlockColumns, SeenBlocks, SeenColumns,
+    aggregate::SeenAggregates,
+    attestation::SeenAttestations,
+    envelope::SeenEnvelopes,
+    operations::SeenOperations,
+    payload_attestation::SeenPayloadAttestations,
+    sync_committee::{SeenSyncCommitteeMessages, SeenSyncContributions},
+};
+use ethlambda_state_transition::beacon::{
+    builder_market::SharedBuilderMarket, payload_attestation_pool::SharedPayloadAttestationPool,
+    sync_committee_pool::SharedSyncCommitteePool,
 };
 use ethlambda_storage::{Chain, Store};
 use ethlambda_types::beacon::preset::{MAX_VALIDATORS_PER_COMMITTEE, SLOTS_PER_EPOCH};
@@ -87,12 +99,12 @@ use crate::{
     gossipsub::{
         aggregation_topic, attestation_subnet_topic, block_topic, publish_aggregated_attestation,
         publish_attestation, publish_beacon_aggregate, publish_beacon_attestation,
-        publish_beacon_block, publish_block,
+        publish_beacon_block, publish_beacon_operation, publish_block,
     },
     lean::protocols::MAX_REQUEST_BLOCKS,
     req_resp::{
         Codec, MAX_COMPRESSED_PAYLOAD_SIZE, ReqResp, ReqRespEvent, Request, build_status,
-        fetch_block_from_peer, fetch_data_columns_from_peer,
+        fetch_block_from_peer, fetch_data_columns_from_peer, fetch_envelope_from_peer,
         handlers::{columns_custodied_by, resume_range_batch_held_for_custody},
     },
     swarm_adapter::SwarmHandle,
@@ -239,6 +251,33 @@ const COLUMN_CHECK_PERMITS: usize = 16;
 /// has data from a follower.
 const ATTESTATION_VALIDATION_PERMITS: usize = 128;
 
+/// How many `execution_payload_bid` and `proposer_preferences` stateful checks
+/// may run at once. A pool of its own, so a burst of bids (each costs a BLS
+/// verification) cannot starve blocks, columns or attestations of permits.
+const BUILDER_VALIDATION_PERMITS: usize = 32;
+
+/// How many `sync_committee_{subnet_id}` and
+/// `sync_committee_contribution_and_proof` stateful checks may run at once.
+///
+/// A pool of its own: the sync committee's burst comes a third of the way into
+/// the slot, where the attestations' does, so sharing
+/// [`ATTESTATION_VALIDATION_PERMITS`] would let each starve the other. A
+/// message arriving with none free is ignored, like every other kind.
+const SYNC_VALIDATION_PERMITS: usize = 64;
+
+/// Capacity of the first-valid-sync-message cache, keyed by `(slot, validator
+/// index, subnet)`. A subnet carries one message per member per slot, at most
+/// a subcommittee's worth, so this holds a few slots of every subnet.
+const SEEN_SYNC_MESSAGES_CAPACITY: NonZeroUsize = NonZeroUsize::new(4096).expect("non-zero");
+
+/// Capacity of the accepted-contribution cache by `(slot, aggregator index,
+/// subcommittee)`. The rule only asks about the current slot.
+const SEEN_SYNC_AGGREGATORS_CAPACITY: NonZeroUsize = NonZeroUsize::new(4096).expect("non-zero");
+
+/// Capacity of the accepted-contribution cache by `(slot, root, subcommittee)`,
+/// which holds the participation bits seen for that key.
+const SEEN_SYNC_DATA_CAPACITY: NonZeroUsize = NonZeroUsize::new(256).expect("non-zero");
+
 /// Capacity of the first-valid-block cache, keyed by `(slot, proposer)`.
 /// How often to leave aggregator subnets whose slot has passed. One slot's
 /// worth: a subnet outlives its need by at most this, which costs a little
@@ -249,6 +288,17 @@ const SEEN_BLOCKS_CAPACITY: NonZeroUsize = NonZeroUsize::new(1024).expect("non-z
 
 /// Capacity of the first-valid-sidecar cache, keyed by `(slot, proposer, index)`.
 const SEEN_COLUMNS_CAPACITY: NonZeroUsize = NonZeroUsize::new(4096).expect("non-zero");
+
+/// Capacity of the first-valid-envelope cache, keyed by `(block root,
+/// builder index)`. One block a slot carries one envelope, so this is sized
+/// like [`SEEN_BLOCKS_CAPACITY`].
+const SEEN_ENVELOPES_CAPACITY: NonZeroUsize = NonZeroUsize::new(1024).expect("non-zero");
+
+/// Capacity of the first-valid-payload-attestation cache, keyed by `(slot,
+/// validator index)`. The rule only asks about the current slot, so one
+/// committee's worth of votes for a few slots is generous headroom, in the
+/// spirit of [`SEEN_COLUMNS_CAPACITY`].
+const SEEN_PAYLOAD_ATTESTATIONS_CAPACITY: NonZeroUsize = NonZeroUsize::new(4096).expect("non-zero");
 
 /// How many `(target_epoch, aggregator_index)` pairs the accepted-aggregate
 /// cache remembers, and how many `(hash_tree_root(data), committee_index)`
@@ -335,10 +385,12 @@ pub(crate) enum PendingRequestKind {
         end_slot: u64,
     },
     /// A `DataColumnsByRoot` lookup for this block's missing columns. Carries
-    /// only the root: the columns, attempts and failed-peer set live in
-    /// `pending_column_requests`, keyed the same way, so this is enough to
-    /// route the response and nothing this map needs to duplicate.
-    Columns(H256),
+    /// the root and the columns this one request asked its peer for: the
+    /// attempts and failed-peer set live in `pending_column_requests`, keyed
+    /// by the root, but one lookup fans out across peers with a subset each and
+    /// retires its entry on the first answer, so what a later answer may
+    /// contain has to travel with the request itself.
+    Columns(H256, Vec<u64>),
     /// A `DataColumnsByRange` sweep for a range sync batch, covering the same
     /// slots the matching `BlocksByRange` asked for.
     ///
@@ -348,6 +400,20 @@ pub(crate) enum PendingRequestKind {
     /// paired with arrive on their own request, and any column still missing
     /// when a block is held still gets the by-root path.
     ColumnRange {
+        start_slot: u64,
+        end_slot: u64,
+    },
+    /// An `ExecutionPayloadEnvelopesByRoot` lookup for this block root's
+    /// envelope. Its attempts and failed peers live in
+    /// `pending_envelope_requests`, keyed by the same root.
+    EnvelopeRoot(H256),
+    /// An `ExecutionPayloadEnvelopesByRange` sweep for a range sync batch,
+    /// asked for the slots a `BeaconBlocksByRange` answer just delivered.
+    ///
+    /// Like [`Self::ColumnRange`] it carries no per-root bookkeeping: a short
+    /// or empty answer is not a failure to retry, since the chain actor asks
+    /// again by root for every parent still missing its envelope.
+    EnvelopeRange {
         start_slot: u64,
         end_slot: u64,
     },
@@ -389,6 +455,8 @@ pub enum ReqRespProtocol {
     BeaconBlocksByRoot,
     DataColumnSidecarsByRange,
     DataColumnSidecarsByRoot,
+    ExecutionPayloadEnvelopesByRange,
+    ExecutionPayloadEnvelopesByRoot,
 }
 
 /// An outbound request id, namespaced by the protocol it was sent on.
@@ -408,6 +476,14 @@ pub(crate) struct RangeSyncState {
     /// Latest advertised head slot for each peer.
     pub(crate) peer_set: HashMap<PeerId, u64>,
     pub(crate) in_flight: bool,
+    /// Set while the envelopes of the batch just delivered are being fetched
+    /// and checked, which only gloas spans have.
+    ///
+    /// The chain actor holds an envelope whose block has not imported only
+    /// briefly and in small numbers, and imports a batch in order, so the next
+    /// batch's blocks must not reach it before this batch's envelopes have.
+    /// Holding the next request back on the answer is what guarantees that.
+    pub(crate) envelopes_pending: bool,
     /// When the next batch was first held back for custody, while it still is.
     /// Beacon-only; see [`RANGE_BATCH_CUSTODY_WAIT`].
     pub(crate) custody_wait_since: Option<Instant>,
@@ -432,6 +508,7 @@ impl RangeSyncState {
             current_range,
             peer_set: HashMap::from([(peer, peer_head)]),
             in_flight: false,
+            envelopes_pending: false,
             custody_wait_since: None,
         }
     }
@@ -476,7 +553,7 @@ impl RangeSyncState {
     }
 
     pub(crate) fn next_batch(&self) -> Option<(PeerId, Range<u64>)> {
-        if self.in_flight || self.current_range.is_empty() {
+        if self.in_flight || self.envelopes_pending || self.current_range.is_empty() {
             return None;
         }
 
@@ -580,9 +657,9 @@ pub struct SwarmConfig {
     /// Ignored on lean, which runs [`unlimited_connections`].
     pub target_peers: usize,
     /// Which network's wire to build. Decides the gossip topics, the req/resp
-    /// protocol set, the gossipsub `seen_ttl`, the identify protocol version and
-    /// the connection limits, and so decides the [`Wire`] the built swarm
-    /// carries.
+    /// protocol set, the gossipsub `seen_ttl`, the identify protocol version,
+    /// the connection limits and whether peers are scored, and so decides the
+    /// [`Wire`] the built swarm carries.
     pub wire: WireConfig,
     /// The identify `agentVersion`, which crawlers read to name a peer's
     /// client. Left unset, rust-libp2p reports its own crate version instead.
@@ -735,6 +812,25 @@ pub enum SwarmBuildError {
     Subscription(#[from] libp2p::gossipsub::SubscriptionError),
 }
 
+/// Gossipsub's target mesh size, the spec's `D`. Named because beacon peer
+/// scoring sizes its first-delivery caps by it; see
+/// [`beacon::scoring::ScoreSettings`].
+pub(crate) const MESH_N: usize = 8;
+
+/// How long gossipsub waits before grafting a peer again after either side
+/// pruned the other, and, for this node, after leaving a topic before grafting
+/// into it again.
+///
+/// The two are the same on purpose. A rust-libp2p peer (another ethlambda,
+/// lighthouse) that sees a mesh peer unsubscribe backs off from it for its own
+/// prune backoff, and the shorter one carried by the leaver's PRUNE cannot
+/// shorten that. With gossipsub's shorter default for leaving, rejoining a topic
+/// inside that window sends grafts every such peer rejects and penalizes, so
+/// the mesh stays empty either way and the node pays a behaviour penalty for
+/// it. Leaving an aggregator subnet at the end of a duty and rejoining it for
+/// one two epochs later does exactly that.
+const PRUNE_BACKOFF: Duration = Duration::from_secs(60);
+
 /// The gossipsub parameters both wires share.
 ///
 /// `mesh_n` 8, low 6, high 12, the 700ms heartbeat, and the 6/3 history already
@@ -753,7 +849,7 @@ pub(crate) fn gossipsub_config(
     let mut builder = libp2p::gossipsub::ConfigBuilder::default();
     builder
         // d
-        .mesh_n(8)
+        .mesh_n(MESH_N)
         // d_low
         .mesh_n_low(6)
         // d_high
@@ -764,6 +860,8 @@ pub(crate) fn gossipsub_config(
         .fanout_ttl(Duration::from_secs(60))
         .history_length(6)
         .history_gossip(3)
+        .prune_backoff(PRUNE_BACKOFF)
+        .unsubscribe_backoff(PRUNE_BACKOFF)
         .duplicate_cache_time(seen_ttl)
         .validation_mode(ValidationMode::Anonymous)
         .message_id_fn(compute_message_id)
@@ -781,9 +879,10 @@ pub(crate) fn gossipsub_config(
 /// Build and configure the libp2p swarm, dial bootnodes, subscribe to topics.
 ///
 /// One builder for both networks. Four things differ at the behaviour level and
-/// are resolved in the first match below; the topic set differs and is resolved
-/// in the last one. Everything in between, the transport, the QUIC and TCP
-/// listeners and the static bootnode dialing, is the same on either wire.
+/// are resolved in the first match below, peer scoring (beacon only) just after
+/// it; the topic set differs and is resolved in the last one. Everything in
+/// between, the transport, the QUIC and TCP listeners and the static bootnode
+/// dialing, is the same on either wire.
 pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
     let SwarmConfig {
         node_key,
@@ -818,11 +917,27 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
     };
 
     let validate_messages = matches!(wire, WireConfig::Beacon(_));
-    let gossipsub = libp2p::gossipsub::Behaviour::new(
+    let mut gossipsub = libp2p::gossipsub::Behaviour::new(
         MessageAuthenticity::Anonymous,
         gossipsub_config(seen_ttl, validate_messages),
     )
     .expect("failed to initiate behaviour");
+    // Beacon only: the parameters are sized from the beacon chain's topics
+    // and message rates, and lean has no set of its own. Without a verdict
+    // on each message (lean's are auto-accepted) the invalid-message term
+    // would have nothing to count either. Built for a placeholder validator
+    // count; `P2PServer`'s first scoring refresh, at startup, replaces the
+    // topic parameters with the head's.
+    if let WireConfig::Beacon(beacon) = &wire {
+        let settings = beacon::scoring::ScoreSettings::new(&beacon.config, MESH_N);
+        let params = settings.peer_score_params(
+            beacon.fork_digest,
+            beacon::scoring::ScoreInputs::placeholder(),
+        );
+        gossipsub
+            .with_peer_score(params, beacon::scoring::thresholds())
+            .expect("valid peer score parameters");
+    }
 
     let req_resp = ReqResp::new(codec, &wire);
 
@@ -843,8 +958,6 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
         gossipsub,
         req_resp,
     };
-
-    // TODO: set peer scoring params
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(identity)
         .with_tokio()
@@ -972,14 +1085,9 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
             // `column % DATA_COLUMN_SIDECAR_SUBNET_COUNT`, computed rather than
             // assumed so a network that ever separates the two counts still
             // subscribes to the right topic.
-            let column_subnets: Vec<u64> = beacon
-                .custody_columns
-                .iter()
-                .map(|column| {
-                    column % ethlambda_types::beacon::constants::DATA_COLUMN_SIDECAR_SUBNET_COUNT
-                })
-                .collect();
-            let topics = beacon::topics::BeaconTopics::new(
+            let column_subnets = beacon::topics::column_subnets(&beacon.custody_columns);
+            let topics = beacon::topics::BeaconTopics::for_fork(
+                beacon.fork,
                 beacon.fork_digest,
                 &column_subnets,
                 &beacon.attestation_subnets,
@@ -998,17 +1106,32 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
                 "Beacon P2P node started"
             );
 
-            Wire::Beacon(Box::new(beacon::BeaconWire {
+            // Only the current digest is joined here. The rest of the window
+            // around a boundary (the next digest's topics, or the previous
+            // one's if the node started just after one) is joined by the first
+            // `AdvanceForkSchedule`, which `P2P::spawn` sends at once, so that
+            // startup and a live crossing run one code path.
+            let schedule = beacon::fork_schedule::ForkSchedule::new(
+                &beacon.config,
+                beacon.genesis_validators_root,
+            );
+            let wire = beacon::BeaconWire {
                 fork_digest: beacon.fork_digest,
                 fork: beacon.fork,
+                schedule,
                 topics,
+                window_topics: Vec::new(),
                 config: beacon.config,
                 genesis_time: beacon.genesis_time,
                 genesis_validators_root: beacon.genesis_validators_root,
                 metadata_seq_number: 0,
                 custody_columns: beacon.custody_columns,
                 attestation_subnets: beacon.attestation_subnets,
-            }))
+                sync_committee_subnets: std::collections::BTreeMap::new(),
+                metadata: MetaDataController::default(),
+            };
+            wire.publish_metadata();
+            Wire::Beacon(Box::new(wire))
         }
     };
 
@@ -1025,6 +1148,12 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
 /// Public handle to the P2P actor.
 pub struct P2P {
     handle: ActorRef<P2PServer>,
+    /// This node's ENR as published at startup, for the Beacon API's
+    /// `/eth/v1/node/identity`. `None` when discovery is disabled.
+    local_enr: Option<String>,
+    /// The beacon `MetaData` this node answers peers with, for the same
+    /// endpoint. `None` on a lean wire, which has no `MetaData`.
+    local_metadata: Option<MetaDataController>,
 }
 
 impl P2P {
@@ -1042,18 +1171,25 @@ impl P2P {
     /// published mainnet bootnode ENRs carry no `quic` entry, so none of them
     /// is statically dialable. Opt-in on lean, where nothing else speaks discv5
     /// and co-located devnet nodes would otherwise all claim one UDP port.
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn(
         built: BuiltSwarm,
         store: Store,
         node_names: HashMap<PeerId, String>,
         discovery: Option<DiscoverySpawnConfig>,
-        attestation_pool: SharedAttestationPool,
+        payload_attestation_pool: SharedPayloadAttestationPool,
+        builder_market: SharedBuilderMarket,
+        sync_committee_pool: SharedSyncCommitteePool,
     ) -> Result<P2P, DiscoveryError> {
-        let discovery = match discovery {
-            Some(config) => Some(spawn_discovery(config).await?),
+        let (discovery, local_enr) = match discovery {
+            Some(config) => {
+                let discovery = spawn_discovery(config).await?;
+                let local_enr = discovery.local_enr.clone();
+                (Some(discovery), Some(local_enr))
+            }
             None => {
                 info!("discv5 discovery disabled; peering from the static bootnode list only");
-                None
+                (None, None)
             }
         };
         let (swarm_stream, swarm_handle) =
@@ -1071,6 +1207,11 @@ impl P2P {
             .wire
             .beacon()
             .map_or(0, |beacon| beacon.attestation_subnets.len());
+        let peer_scoring = built
+            .wire
+            .beacon()
+            .map(|beacon| beacon::scoring::PeerScoring::new(&beacon.config, beacon.fork_digest));
+        let local_metadata = built.wire.beacon().map(|beacon| beacon.metadata.clone());
 
         let server = P2PServer {
             swarm_handle,
@@ -1080,6 +1221,7 @@ impl P2P {
             connected_peers: HashMap::new(),
             peer_custody: HashMap::new(),
             pending_root_requests: HashMap::new(),
+            pending_envelope_requests: HashMap::new(),
             pending_column_requests: HashMap::new(),
             outbound_requests: HashMap::new(),
             range_sync_state: None,
@@ -1089,6 +1231,11 @@ impl P2P {
             discovery: discovery.map(|handle| DiscoveryState::new(handle, built.local_peer_id)),
             seen_blocks: SeenBlocks::new(SEEN_BLOCKS_CAPACITY),
             seen_columns: SeenColumns::new(SEEN_COLUMNS_CAPACITY),
+            seen_block_columns: SeenBlockColumns::new(SEEN_COLUMNS_CAPACITY),
+            seen_envelopes: SeenEnvelopes::new(SEEN_ENVELOPES_CAPACITY),
+            seen_payload_attestations: SeenPayloadAttestations::new(
+                SEEN_PAYLOAD_ATTESTATIONS_CAPACITY,
+            ),
             seen_aggregates: SeenAggregates::new(
                 SEEN_AGGREGATES_CAPACITY,
                 SEEN_AGGREGATES_CAPACITY,
@@ -1096,18 +1243,41 @@ impl P2P {
             seen_attestations: SeenAttestations::new(seen_attestations_capacity(
                 backbone_attestation_subnets,
             )),
+            seen_operations: SeenOperations::default(),
+            seen_sync_messages: SeenSyncCommitteeMessages::new(SEEN_SYNC_MESSAGES_CAPACITY),
+            seen_sync_contributions: SeenSyncContributions::new(
+                SEEN_SYNC_AGGREGATORS_CAPACITY,
+                SEEN_SYNC_DATA_CAPACITY,
+            ),
             gossip_validation_permits: Arc::new(tokio::sync::Semaphore::new(
                 GOSSIP_VALIDATION_PERMITS,
             )),
+            sync_validation_permits: Arc::new(tokio::sync::Semaphore::new(SYNC_VALIDATION_PERMITS)),
             column_check_permits: Arc::new(tokio::sync::Semaphore::new(COLUMN_CHECK_PERMITS)),
             attestation_validation_permits: Arc::new(tokio::sync::Semaphore::new(
                 ATTESTATION_VALIDATION_PERMITS,
             )),
-            attestation_pool,
+            payload_attestation_pool,
+            builder_market,
+            builder_validation_permits: Arc::new(tokio::sync::Semaphore::new(
+                BUILDER_VALIDATION_PERMITS,
+            )),
+            sync_committee_pool,
             aggregator_subnets: HashMap::new(),
+            peer_scoring,
         };
+        let scores_peers = server.peer_scoring.is_some();
         let discovery_enabled = server.discovery.is_some();
         let handle = server.start();
+        // At once rather than a slot in: the swarm starts on placeholder
+        // topic scores, and the head's are already known.
+        if scores_peers {
+            send_after(
+                Duration::ZERO,
+                handle.context(),
+                p2p_protocol::RefreshPeerScoring,
+            );
+        }
         send_after(
             AGGREGATOR_SUBNET_SWEEP_INTERVAL,
             handle.context(),
@@ -1122,12 +1292,36 @@ impl P2P {
                 p2p_protocol::DiscoverPeers,
             );
         }
+        // Immediate on a beacon wire: joins the rest of a window the node
+        // started inside, then keeps itself scheduled. A no-op on lean.
+        let _ = handle
+            .context()
+            .send(p2p_protocol::AdvanceForkSchedule)
+            .inspect_err(|err| warn!(%err, "Could not schedule the fork schedule"));
         spawn_listener(handle.context(), swarm_stream.map(WrappedSwarmEvent));
-        Ok(P2P { handle })
+        Ok(P2P {
+            handle,
+            local_enr,
+            local_metadata,
+        })
     }
 
     pub fn actor_ref(&self) -> &ActorRef<P2PServer> {
         &self.handle
+    }
+
+    /// This node's ENR, `enr:`-prefixed, as published at startup. discv5 may
+    /// re-sign it later with a higher sequence number if IP voting changes the
+    /// external address; this is the startup record. `None` when discovery is
+    /// disabled, since then no ENR is published.
+    pub fn local_enr(&self) -> Option<&str> {
+        self.local_enr.as_deref()
+    }
+
+    /// A live view of the beacon `MetaData` this node answers peers with,
+    /// updated whenever it changes. `None` on a lean wire.
+    pub fn local_metadata(&self) -> Option<MetaDataController> {
+        self.local_metadata.clone()
     }
 }
 
@@ -1174,6 +1368,11 @@ pub struct P2PServer {
     pub(crate) peer_custody: HashMap<PeerId, Vec<u64>>,
     pub(crate) pending_root_requests: HashMap<H256, PendingRequest>,
     /// One entry per block root with an in-flight or backed-off
+    /// `ExecutionPayloadEnvelopesByRoot` lookup: `pending_root_requests`'s
+    /// counterpart for envelopes, deduplicating a repeated ask and carrying
+    /// the retry ladder.
+    pub(crate) pending_envelope_requests: HashMap<H256, PendingRequest>,
+    /// One entry per block root with an in-flight or backed-off
     /// `DataColumnsByRoot` lookup. Mirrors `pending_root_requests`'s role for
     /// the block path: `fetch_missing_columns` dedupes against it, and
     /// `handle_column_fetch_failure` is the only place an entry is retired.
@@ -1197,12 +1396,33 @@ pub struct P2PServer {
     /// The first valid sidecar per `(slot, proposer, index)` accepted from
     /// gossip. Bounded by capacity, so a fabricated slot cannot grow it.
     pub(crate) seen_columns: SeenColumns,
+    /// Gloas's counterpart of [`Self::seen_columns`]: the first valid sidecar
+    /// per `(block root, index)`, since a gloas sidecar names no proposer.
+    pub(crate) seen_block_columns: SeenBlockColumns,
+    /// The first valid `execution_payload` per `(block root, builder index)`
+    /// accepted from gossip.
+    pub(crate) seen_envelopes: SeenEnvelopes,
+    /// The first valid `payload_attestation_message` per `(slot, validator
+    /// index)` accepted from gossip.
+    pub(crate) seen_payload_attestations: SeenPayloadAttestations,
     /// Accepted `beacon_aggregate_and_proof`s, by `(target_epoch,
     /// aggregator_index)` and by `(hash_tree_root(data), committee_index)`.
     pub(crate) seen_aggregates: SeenAggregates,
     /// Accepted `beacon_attestation_{subnet_id}`s, by `(target_epoch,
     /// attester_index)`.
     pub(crate) seen_attestations: SeenAttestations,
+    /// The first valid operation per validator (or per attesting index, for
+    /// attester slashings) accepted from gossip on the four operation topics.
+    /// Recorded only after the stateful check passes and never pruned: an
+    /// entry needs a validator to really exit, be slashed or change
+    /// credentials, so it is bounded by the registry.
+    pub(crate) seen_operations: SeenOperations,
+    /// Accepted `sync_committee_{subnet_id}` messages, by `(slot, validator
+    /// index, subnet)`.
+    pub(crate) seen_sync_messages: SeenSyncCommitteeMessages,
+    /// Accepted `sync_committee_contribution_and_proof`s, by aggregator and by
+    /// the bits seen for `(slot, root, subcommittee)`.
+    pub(crate) seen_sync_contributions: SeenSyncContributions,
     /// Permits for block and column stateful gossip checks in flight on
     /// blocking threads.
     pub(crate) gossip_validation_permits: Arc<tokio::sync::Semaphore>,
@@ -1213,18 +1433,39 @@ pub struct P2PServer {
     /// [`Self::gossip_validation_permits`]; see
     /// [`ATTESTATION_VALIDATION_PERMITS`].
     pub(crate) attestation_validation_permits: Arc<tokio::sync::Semaphore>,
+    /// Permits for sync committee message and contribution stateful gossip
+    /// checks in flight on blocking threads. Separate from the other two
+    /// pools; see [`SYNC_VALIDATION_PERMITS`].
+    pub(crate) sync_validation_permits: Arc<tokio::sync::Semaphore>,
 
-    /// Unaggregated attestations for this node's validator clients'
-    /// aggregators, shared with the Beacon API that aggregates from it. Filled
-    /// by `verdict::forward` from the aggregator subnets below; lean never
-    /// touches it.
-    pub(crate) attestation_pool: SharedAttestationPool,
+    /// Accepted `payload_attestation_message` votes, shared with the Beacon
+    /// API that serves and fills the same pool. Filled by `verdict::forward`;
+    /// lean never touches it.
+    pub(crate) payload_attestation_pool: SharedPayloadAttestationPool,
+
+    /// Bids, proposer preferences and known payloads, shared with the Beacon
+    /// API (which posts bids and preferences, and builds blocks from the pool).
+    /// Gossip's stateful checks read it from blocking threads, so it cannot
+    /// live in the chain actor; lean never touches it.
+    pub(crate) builder_market: SharedBuilderMarket,
+    /// Permits for `execution_payload_bid` and `proposer_preferences` stateful
+    /// checks, see [`BUILDER_VALIDATION_PERMITS`].
+    pub(crate) builder_validation_permits: Arc<tokio::sync::Semaphore>,
+
+    /// Accepted sync committee messages and contributions, shared with the
+    /// Beacon API that serves and fills the same pool (block production reads
+    /// it). Filled by `verdict::forward`; lean never touches it.
+    pub(crate) sync_committee_pool: SharedSyncCommitteePool,
 
     /// The attestation subnets joined for a validator client's aggregators,
     /// each with the last slot it is needed for. Short-lived by design: never
     /// advertised in `attnets`, and left once the slot has passed. The
     /// backbone subnets are separate and never left.
     pub(crate) aggregator_subnets: HashMap<u64, u64>,
+
+    /// Gossipsub scoring's inputs and gate. `None` on lean, which runs
+    /// without peer scoring. See [`beacon::scoring`].
+    pub(crate) peer_scoring: Option<beacon::scoring::PeerScoring>,
 }
 
 impl P2PServer {
@@ -1303,6 +1544,10 @@ pub(crate) trait P2PProtocol: Send + Sync {
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_data_column_fetch(&self, block_root: H256) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
+    fn retry_envelope_fetch(&self, block_root: H256) -> Result<(), ActorError>;
+    #[allow(dead_code)] // invoked via send_after, not called directly
+    fn resume_range_after_envelopes(&self) -> Result<(), ActorError>;
+    #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_peer_redial(&self, peer_id: PeerId) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn discover_peers(&self) -> Result<(), ActorError>;
@@ -1310,6 +1555,12 @@ pub(crate) trait P2PProtocol: Send + Sync {
     fn leave_expired_aggregator_subnets(&self) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_beacon_range_batch(&self) -> Result<(), ActorError>;
+    /// Apply the fork schedule at the wall-clock epoch. Sent once at startup and
+    /// then by its own timer for the next join, switch or leave.
+    #[allow(dead_code)] // invoked via send_after, not called directly
+    fn advance_fork_schedule(&self) -> Result<(), ActorError>;
+    #[allow(dead_code)] // invoked via send_after, not called directly
+    fn refresh_peer_scoring(&self) -> Result<(), ActorError>;
 }
 
 #[actor(protocol = P2PProtocol)]
@@ -1332,6 +1583,35 @@ impl P2PServer {
         if !fetch_block_from_peer(self, root).await {
             tracing::error!(%root, "Failed to retry block fetch, giving up");
             self.pending_root_requests.remove(&root);
+        }
+    }
+
+    #[send_handler]
+    async fn handle_resume_range_after_envelopes(
+        &mut self,
+        _msg: p2p_protocol::ResumeRangeAfterEnvelopes,
+        ctx: &Context<Self>,
+    ) {
+        req_resp::handlers::release_envelope_gate(self, ctx).await;
+    }
+
+    #[send_handler]
+    async fn handle_retry_envelope_fetch(
+        &mut self,
+        msg: p2p_protocol::RetryEnvelopeFetch,
+        _ctx: &Context<Self>,
+    ) {
+        let block_root = msg.block_root;
+        // Same "might have completed during backoff" guard as
+        // `handle_retry_block_fetch`.
+        if !self.pending_envelope_requests.contains_key(&block_root) {
+            trace!(%block_root, "Envelope fetch completed during backoff, skipping retry");
+            return;
+        }
+        trace!(%block_root, "Retrying envelope fetch after backoff");
+        if !fetch_envelope_from_peer(self, block_root).await {
+            tracing::error!(%block_root, "Failed to retry envelope fetch, giving up");
+            self.pending_envelope_requests.remove(&block_root);
         }
     }
 
@@ -1392,6 +1672,20 @@ impl P2PServer {
         );
         gossipsub::leave_expired_aggregator_subnets(self);
         gossipsub::prune_attestation_pool(self);
+        gossipsub::prune_operation_pool(self);
+        beacon::sync_committee::leave_expired_sync_committee_subnets(self);
+        beacon::sync_committee::prune_sync_committee_pool(self);
+    }
+
+    #[send_handler]
+    async fn handle_advance_fork_schedule(
+        &mut self,
+        _msg: p2p_protocol::AdvanceForkSchedule,
+        ctx: &Context<Self>,
+    ) {
+        if let Some(delay) = beacon::transition::advance(self) {
+            send_after(delay, ctx.clone(), p2p_protocol::AdvanceForkSchedule);
+        }
     }
 
     #[send_handler]
@@ -1423,6 +1717,21 @@ impl P2PServer {
             DIAL_INTERVAL_AT_TARGET
         };
         send_after(interval, ctx.clone(), p2p_protocol::DiscoverPeers);
+    }
+
+    /// Rebuild the gossipsub topic scores from the head, once a slot. Beacon
+    /// only: never scheduled on lean. See [`beacon::scoring::refresh`].
+    #[send_handler]
+    async fn handle_refresh_peer_scoring(
+        &mut self,
+        _msg: p2p_protocol::RefreshPeerScoring,
+        ctx: &Context<Self>,
+    ) {
+        if let Some(wire) = self.wire.beacon() {
+            let slot = Duration::from_millis(wire.config.slot_duration_ms);
+            send_after(slot, ctx.clone(), p2p_protocol::RefreshPeerScoring);
+        }
+        beacon::scoring::refresh(self);
     }
 
     /// The deadline of a range batch held back for custody. Scheduled once,
@@ -1470,15 +1779,63 @@ impl Handler<PublishBeaconAggregate> for P2PServer {
     }
 }
 
+impl Handler<PublishBeaconOperation> for P2PServer {
+    async fn handle(&mut self, msg: PublishBeaconOperation, _ctx: &Context<Self>) {
+        publish_beacon_operation(self, msg.operation).await;
+    }
+}
+
 impl Handler<PublishBeaconBlock> for P2PServer {
     async fn handle(&mut self, msg: PublishBeaconBlock, _ctx: &Context<Self>) {
-        publish_beacon_block(self, msg.block).await;
+        publish_beacon_block(self, msg.block, msg.sidecars).await;
+    }
+}
+
+impl Handler<PublishExecutionPayloadEnvelope> for P2PServer {
+    async fn handle(&mut self, msg: PublishExecutionPayloadEnvelope, _ctx: &Context<Self>) {
+        gossipsub::publish_execution_payload_envelope(self, *msg.envelope, msg.sidecars).await;
+    }
+}
+
+impl Handler<PublishExecutionPayloadBid> for P2PServer {
+    async fn handle(&mut self, msg: PublishExecutionPayloadBid, _ctx: &Context<Self>) {
+        beacon::builder_market::publish_execution_payload_bid(self, msg.bid);
+    }
+}
+
+impl Handler<PublishProposerPreferences> for P2PServer {
+    async fn handle(&mut self, msg: PublishProposerPreferences, _ctx: &Context<Self>) {
+        beacon::builder_market::publish_proposer_preferences(self, msg.preferences);
+    }
+}
+
+impl Handler<PublishPayloadAttestationMessage> for P2PServer {
+    async fn handle(&mut self, msg: PublishPayloadAttestationMessage, _ctx: &Context<Self>) {
+        gossipsub::publish_payload_attestation_message(self, msg.message).await;
     }
 }
 
 impl Handler<SubscribeAttestationSubnets> for P2PServer {
     async fn handle(&mut self, msg: SubscribeAttestationSubnets, _ctx: &Context<Self>) {
         gossipsub::join_aggregator_subnets(self, msg.subnets);
+    }
+}
+
+impl Handler<PublishSyncCommitteeMessage> for P2PServer {
+    async fn handle(&mut self, msg: PublishSyncCommitteeMessage, _ctx: &Context<Self>) {
+        beacon::sync_committee::publish_sync_committee_message(self, msg.subnet_ids, msg.message);
+    }
+}
+
+impl Handler<PublishSyncCommitteeContribution> for P2PServer {
+    async fn handle(&mut self, msg: PublishSyncCommitteeContribution, _ctx: &Context<Self>) {
+        beacon::sync_committee::publish_sync_committee_contribution(self, msg.contribution);
+    }
+}
+
+impl Handler<SubscribeSyncCommitteeSubnets> for P2PServer {
+    async fn handle(&mut self, msg: SubscribeSyncCommitteeSubnets, _ctx: &Context<Self>) {
+        beacon::sync_committee::join_sync_committee_subnets(self, msg.subnets);
     }
 }
 
@@ -1512,8 +1869,12 @@ async fn fetch_missing(server: &mut P2PServer, request: FetchRequest) {
     let FetchRequest {
         block_root,
         needs_block,
+        needs_envelope,
         columns,
     } = request;
+    if needs_envelope {
+        fetch_missing_envelope(server, block_root).await;
+    }
     if needs_block {
         fetch_missing_block(server, block_root).await;
     }
@@ -1530,6 +1891,17 @@ async fn fetch_missing_block(server: &mut P2PServer, root: H256) {
         return;
     }
     fetch_block_from_peer(server, root).await;
+}
+
+/// The by-root envelope half of a [`FetchRequest`].
+async fn fetch_missing_envelope(server: &mut P2PServer, block_root: H256) {
+    // The chain actor re-asks once per slot for every parent still missing its
+    // envelope, so a root already in flight is the normal case, not a fault.
+    if server.pending_envelope_requests.contains_key(&block_root) {
+        trace!(%block_root, "Envelope fetch already in progress, ignoring duplicate");
+        return;
+    }
+    fetch_envelope_from_peer(server, block_root).await;
 }
 
 /// The by-root column half of a [`FetchRequest`].
@@ -1875,6 +2247,12 @@ async fn handle_behaviour_event(
             }
             ReqRespEvent::DataColumnSidecarsByRoot(e) => {
                 (ReqRespProtocol::DataColumnSidecarsByRoot, e)
+            }
+            ReqRespEvent::ExecutionPayloadEnvelopesByRange(e) => {
+                (ReqRespProtocol::ExecutionPayloadEnvelopesByRange, e)
+            }
+            ReqRespEvent::ExecutionPayloadEnvelopesByRoot(e) => {
+                (ReqRespProtocol::ExecutionPayloadEnvelopesByRoot, e)
             }
         },
     };
@@ -2417,6 +2795,21 @@ fn compute_message_id(message: &libp2p::gossipsub::Message) -> libp2p::gossipsub
 /// keeps its own lean-flavored copy, since that one builds a different wire.
 #[cfg(test)]
 pub(crate) mod test_support {
+    /// Keep a test swarm's event stream consumed. The swarm task exits on
+    /// its first event once nothing receives them, which takes the command
+    /// channel down with it and leaves `send_request` racing a dead task.
+    pub(crate) fn drain_swarm_events(
+        stream: impl futures::Stream<Item = libp2p::swarm::SwarmEvent<crate::BehaviourEvent>>
+        + Send
+        + 'static,
+    ) {
+        use futures::StreamExt as _;
+        tokio::spawn(async move {
+            let mut stream = Box::pin(stream);
+            while stream.next().await.is_some() {}
+        });
+    }
+
     use std::collections::{HashMap, HashSet};
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
@@ -2474,13 +2867,13 @@ pub(crate) mod test_support {
         }
         fn new_data_column_sidecars(
             &self,
-            _sidecars: Vec<fulu::DataColumnSidecar>,
+            _sidecars: Vec<ethlambda_types::beacon::containers::DataColumnSidecar>,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
             Ok(())
         }
         fn data_column_sidecars_awaiting_parent(
             &self,
-            _sidecars: Vec<fulu::DataColumnSidecar>,
+            _sidecars: Vec<ethlambda_types::beacon::containers::DataColumnSidecar>,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
             Ok(())
         }
@@ -2495,6 +2888,67 @@ pub(crate) mod test_support {
                 .unwrap()
                 .push((*aggregate, attesting_indices));
             Ok(())
+        }
+        fn new_execution_payload_envelope(
+            &self,
+            _envelope: Box<
+                ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope,
+            >,
+            _arrival: ethlambda_network_api::BlockArrival,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            Ok(())
+        }
+        fn new_payload_attestation_message(
+            &self,
+            _message: ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage,
+            _arrival: ethlambda_network_api::BlockArrival,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            Ok(())
+        }
+    }
+
+    /// A gloas envelope for `(root_byte, builder)` at slot `slot_number`
+    /// zero. Only what the cheap gossip checks and the seen cache read is
+    /// meaningful; nothing here is signature-valid.
+    pub(crate) fn envelope(
+        root_byte: u8,
+        builder_index: u64,
+    ) -> ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope {
+        use ethlambda_types::beacon::containers::{bellatrix, gloas};
+        use ethlambda_types::beacon::primitives::{
+            Bytes32, ExecutionAddress, ExecutionBlockHash, Uint256,
+        };
+        let payload = gloas::ExecutionPayload {
+            parent_hash: ExecutionBlockHash::ZERO,
+            fee_recipient: ExecutionAddress::ZERO,
+            state_root: Bytes32::ZERO,
+            receipts_root: Bytes32::ZERO,
+            logs_bloom: bellatrix::LogsBloom::try_from(vec![0u8; preset::BYTES_PER_LOGS_BLOOM])
+                .expect("built at exactly BYTES_PER_LOGS_BLOOM"),
+            prev_randao: Bytes32::ZERO,
+            block_number: 0,
+            gas_limit: 0,
+            gas_used: 0,
+            timestamp: 0,
+            extra_data: Default::default(),
+            base_fee_per_gas: Uint256::ZERO,
+            block_hash: ExecutionBlockHash::ZERO,
+            transactions: Default::default(),
+            withdrawals: Default::default(),
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+            block_access_list: Default::default(),
+            slot_number: 0,
+        };
+        gloas::SignedExecutionPayloadEnvelope {
+            message: gloas::ExecutionPayloadEnvelope {
+                payload,
+                execution_requests: Default::default(),
+                builder_index,
+                beacon_block_root: Root::repeat_byte(root_byte),
+                parent_beacon_block_root: Root::ZERO,
+            },
+            signature: Default::default(),
         }
     }
 
@@ -2528,8 +2982,9 @@ pub(crate) mod test_support {
         })
         .expect("swarm builds");
 
-        let (_swarm_stream, swarm_handle) =
+        let (swarm_stream, swarm_handle) =
             crate::swarm_adapter::start_swarm_adapter(built.swarm, HashMap::new());
+        drain_swarm_events(swarm_stream);
 
         let discovery = crate::discovery::spawn_discovery(crate::discovery::DiscoverySpawnConfig {
             node_key: secp256k1::SecretKey::new(&mut rand::rngs::OsRng)
@@ -2582,6 +3037,7 @@ pub(crate) mod test_support {
             connected_peers: HashMap::new(),
             peer_custody: HashMap::new(),
             pending_root_requests: HashMap::new(),
+            pending_envelope_requests: HashMap::new(),
             pending_column_requests: HashMap::new(),
             outbound_requests: HashMap::new(),
             range_sync_state: None,
@@ -2598,6 +3054,16 @@ pub(crate) mod test_support {
             seen_columns: ethlambda_state_transition::beacon::gossip::SeenColumns::new(
                 crate::SEEN_COLUMNS_CAPACITY,
             ),
+            seen_block_columns: ethlambda_state_transition::beacon::gossip::SeenBlockColumns::new(
+                crate::SEEN_COLUMNS_CAPACITY,
+            ),
+            seen_envelopes: ethlambda_state_transition::beacon::gossip::envelope::SeenEnvelopes::new(
+                crate::SEEN_ENVELOPES_CAPACITY,
+            ),
+            seen_payload_attestations:
+                ethlambda_state_transition::beacon::gossip::payload_attestation::SeenPayloadAttestations::new(
+                    crate::SEEN_PAYLOAD_ATTESTATIONS_CAPACITY,
+                ),
             seen_aggregates:
                 ethlambda_state_transition::beacon::gossip::aggregate::SeenAggregates::new(
                     crate::SEEN_AGGREGATES_CAPACITY,
@@ -2607,6 +3073,7 @@ pub(crate) mod test_support {
                 ethlambda_state_transition::beacon::gossip::attestation::SeenAttestations::new(
                     crate::seen_attestations_capacity(backbone_attestation_subnets),
                 ),
+            seen_operations: Default::default(),
             gossip_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::GOSSIP_VALIDATION_PERMITS,
             )),
@@ -2616,8 +3083,26 @@ pub(crate) mod test_support {
             attestation_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::ATTESTATION_VALIDATION_PERMITS,
             )),
-            attestation_pool: Default::default(),
+            seen_sync_messages:
+                ethlambda_state_transition::beacon::gossip::sync_committee::SeenSyncCommitteeMessages::new(
+                    crate::SEEN_SYNC_MESSAGES_CAPACITY,
+                ),
+            seen_sync_contributions:
+                ethlambda_state_transition::beacon::gossip::sync_committee::SeenSyncContributions::new(
+                    crate::SEEN_SYNC_AGGREGATORS_CAPACITY,
+                    crate::SEEN_SYNC_DATA_CAPACITY,
+                ),
+            sync_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::SYNC_VALIDATION_PERMITS,
+            )),
+            payload_attestation_pool: Default::default(),
+            builder_market: Default::default(),
+            builder_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::BUILDER_VALIDATION_PERMITS,
+            )),
+            sync_committee_pool: Default::default(),
             aggregator_subnets: HashMap::new(),
+            peer_scoring: None,
         }
     }
 
@@ -2907,6 +3392,15 @@ mod tests {
         assert!(!gossipsub_config(ttl, false).validate_messages());
     }
 
+    #[test]
+    fn rejoining_a_topic_waits_out_the_backoff_peers_apply_to_a_leaver() {
+        // Lighthouse leaves gossipsub's prune backoff at its default.
+        let peers_backoff = libp2p::gossipsub::Config::default().prune_backoff();
+        let config = gossipsub_config(Duration::from_secs(1), true);
+        assert!(config.unsubscribe_backoff() >= peers_backoff);
+        assert!(config.unsubscribe_backoff() >= config.prune_backoff());
+    }
+
     /// How many times [`concurrent_beacon_requests_on_different_protocols_never_cross`]
     /// repeats its connect-and-fire cycle.
     ///
@@ -3007,6 +3501,12 @@ mod tests {
                 }
                 ReqRespEvent::DataColumnSidecarsByRoot(e) => {
                     (ReqRespProtocol::DataColumnSidecarsByRoot, e)
+                }
+                ReqRespEvent::ExecutionPayloadEnvelopesByRange(e) => {
+                    (ReqRespProtocol::ExecutionPayloadEnvelopesByRange, e)
+                }
+                ReqRespEvent::ExecutionPayloadEnvelopesByRoot(e) => {
+                    (ReqRespProtocol::ExecutionPayloadEnvelopesByRoot, e)
                 }
             })
         }

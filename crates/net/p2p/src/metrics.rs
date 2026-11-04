@@ -362,14 +362,14 @@ static LEAN_BEACON_STATUS_DIGEST_MISMATCH_TOTAL: LazyLock<IntCounter> = LazyLock
 static LEAN_BEACON_FORK_DIGEST: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "lean_beacon_fork_digest",
-        "The fork digest this node computed at startup, as a label",
+        "The fork digest this node currently publishes under, as a label",
         &["digest"]
     )
     .unwrap()
 });
 
-/// Count one gossip message. `result` is `decoded`, `decode_failed`, or
-/// `decompress_failed`.
+/// Count one gossip message. `result` is `decoded`, `decode_failed`,
+/// `decompress_failed`, or `unsupported_fork`.
 pub fn inc_beacon_gossip(topic: &str, result: &str) {
     LEAN_BEACON_GOSSIP_MESSAGES_TOTAL
         .with_label_values(&[topic, result])
@@ -478,10 +478,19 @@ pub fn inc_beacon_status_digest_mismatch() {
     LEAN_BEACON_STATUS_DIGEST_MISMATCH_TOTAL.inc();
 }
 
-/// Publish the computed fork digest as a label, so a dashboard can tell at a
+/// Publish the current fork digest as a label, so a dashboard can tell at a
 /// glance whether a node is stranded on a boundary it failed to cross.
+///
+/// Resets the vector first: the digest changes at runtime, and a label left
+/// behind at 1 would read as two current digests.
 pub fn set_beacon_fork_digest(digest: &str) {
-    LEAN_BEACON_FORK_DIGEST.with_label_values(&[digest]).set(1);
+    set_only_label(&LEAN_BEACON_FORK_DIGEST, digest);
+}
+
+/// Make `label` the one series of `gauge` that reads 1.
+fn set_only_label(gauge: &IntGaugeVec, label: &str) {
+    gauge.reset();
+    gauge.with_label_values(&[label]).set(1);
 }
 
 static LEAN_DATA_COLUMN_FETCH_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -582,6 +591,51 @@ pub fn set_swarm_established_connections(inbound: u32, outbound: u32) {
         .set(i64::from(outbound));
 }
 
+/// Set how many gossipsub peers fall in each score band. `bands` names every
+/// band, empty ones as zero, so a band that empties does not keep its last
+/// count. See `beacon::scoring::score_band`.
+pub fn set_gossipsub_peers_by_score(bands: &HashMap<&'static str, i64>) {
+    static LEAN_GOSSIPSUB_PEERS_BY_SCORE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+        register_int_gauge_vec!(
+            "lean_gossipsub_peers_by_score",
+            "Gossipsub peers by score band: non_negative, negative, below_gossip, below_publish, below_graylist",
+            &["band"]
+        )
+        .unwrap()
+    });
+    for (band, count) in bands {
+        LEAN_GOSSIPSUB_PEERS_BY_SCORE
+            .with_label_values(&[band])
+            .set(*count);
+    }
+}
+
+/// Count a peer disconnected for a gossipsub score below the graylist.
+pub fn inc_gossipsub_score_disconnects() {
+    static LEAN_GOSSIPSUB_SCORE_DISCONNECTS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+        register_int_counter!(
+            "lean_gossipsub_score_disconnects_total",
+            "Peers disconnected for a gossipsub score below the graylist threshold"
+        )
+        .unwrap()
+    });
+    LEAN_GOSSIPSUB_SCORE_DISCONNECTS_TOTAL.inc();
+}
+
+/// Whether gossipsub's mesh-delivery term (P3) is being scored: 0 while the
+/// head lags or is still warming up after catching up. See
+/// `beacon::scoring::MeshDeliveryGate`.
+pub fn set_gossipsub_mesh_delivery_scoring(scored: bool) {
+    static LEAN_GOSSIPSUB_MESH_DELIVERY_SCORING: LazyLock<IntGauge> = LazyLock::new(|| {
+        register_int_gauge!(
+            "lean_gossipsub_mesh_delivery_scoring",
+            "1 while gossipsub scores mesh message deliveries, 0 while the head lags or is warming up"
+        )
+        .unwrap()
+    });
+    LEAN_GOSSIPSUB_MESH_DELIVERY_SCORING.set(i64::from(scored));
+}
+
 /// Set how many connected peers are known to custody `column`.
 ///
 /// A peer counts only once it has answered `metadata/3` or arrived with a
@@ -614,4 +668,21 @@ pub fn observe_beacon_aggregate_decode(duration: std::time::Duration) {
         .unwrap()
     });
     LEAN_BEACON_AGGREGATE_DECODE_SECONDS.observe(duration.as_secs_f64());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_newest_label_reads_one() {
+        // A local vector: the global gauge is also written by every transition
+        // test running in parallel in this binary.
+        let gauge = register_int_gauge_vec!("lean_test_only_label_gauge", "test", &["digest"])
+            .expect("a unique name");
+        set_only_label(&gauge, "aaaaaaaa");
+        set_only_label(&gauge, "bbbbbbbb");
+        assert_eq!(gauge.with_label_values(&["bbbbbbbb"]).get(), 1);
+        assert_eq!(gauge.with_label_values(&["aaaaaaaa"]).get(), 0);
+    }
 }

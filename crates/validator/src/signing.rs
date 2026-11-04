@@ -7,8 +7,15 @@
 
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::constants::{
-    DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO,
-    DOMAIN_SELECTION_PROOF,
+    DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_BUILDER,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
+    DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+};
+use ethlambda_types::beacon::containers::altair::{
+    ContributionAndProof, SyncAggregatorSelectionData,
+};
+use ethlambda_types::beacon::containers::gloas::{
+    ExecutionPayloadEnvelope, PayloadAttestationData,
 };
 use ethlambda_types::beacon::containers::shared::AttestationData;
 use ethlambda_types::beacon::primitives::{
@@ -124,6 +131,67 @@ impl SigningContext {
         compute_signing_root(root, domain)
     }
 
+    /// The root an execution payload envelope's signature is computed over.
+    ///
+    /// `slot` is the slot of the block the envelope reveals the payload for,
+    /// not anything read out of the envelope: the domain is the builder's, at
+    /// the epoch containing that slot (`get_domain(state, DOMAIN_BEACON_BUILDER,
+    /// compute_epoch_at_slot(state.slot))` in the specification's
+    /// `process_execution_payload`, where the state is the block's own).
+    pub fn envelope_signing_root(&self, envelope: &ExecutionPayloadEnvelope, slot: Slot) -> Root {
+        let domain = self.domain(DOMAIN_BEACON_BUILDER, compute_epoch_at_slot(slot));
+        compute_signing_root(envelope.hash_tree_root(), domain)
+    }
+
+    /// The root a payload timeliness committee member's vote is computed over.
+    ///
+    /// The domain is taken at the epoch of `data.slot`, and the message is the
+    /// data alone: the validator index travels beside the signature in the
+    /// message wrapper and is deliberately not signed over.
+    pub fn payload_attestation_signing_root(&self, data: &PayloadAttestationData) -> Root {
+        let domain = self.domain(DOMAIN_PTC_ATTESTER, compute_epoch_at_slot(data.slot));
+        compute_signing_root(data.hash_tree_root(), domain)
+    }
+
+    /// The root a sync committee message is computed over: the block root
+    /// itself, under the sync committee domain at the epoch of `slot`.
+    ///
+    /// `slot` is the message's own slot. The domain comes from the fork
+    /// schedule at that epoch rather than from any state's `fork`, which is
+    /// what a node validating the message does too, so a head lagging across a
+    /// fork boundary cannot make an honest message invalid.
+    pub fn sync_committee_message_signing_root(&self, slot: Slot, beacon_block_root: Root) -> Root {
+        let domain = self.domain(DOMAIN_SYNC_COMMITTEE, compute_epoch_at_slot(slot));
+        compute_signing_root(beacon_block_root, domain)
+    }
+
+    /// The root a sync committee aggregator's selection proof is computed
+    /// over: the slot and the subcommittee, under the selection domain.
+    ///
+    /// Both are in the message, unlike an attestation aggregator's proof which
+    /// signs the slot alone, because every subcommittee holds its own draw.
+    pub fn sync_selection_proof_signing_root(&self, slot: Slot, subcommittee_index: u64) -> Root {
+        let data = SyncAggregatorSelectionData {
+            slot,
+            subcommittee_index,
+        };
+        let domain = self.domain(
+            DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+            compute_epoch_at_slot(slot),
+        );
+        compute_signing_root(data.hash_tree_root(), domain)
+    }
+
+    /// The root a signed contribution is computed over: the whole
+    /// `ContributionAndProof`, at the epoch of the contribution's slot.
+    pub fn contribution_and_proof_signing_root(&self, message: &ContributionAndProof) -> Root {
+        let domain = self.domain(
+            DOMAIN_CONTRIBUTION_AND_PROOF,
+            compute_epoch_at_slot(message.contribution.slot),
+        );
+        compute_signing_root(message.hash_tree_root(), domain)
+    }
+
     /// Sign an already-computed signing root on behalf of `pubkey`.
     ///
     /// Every public signing method funnels through here, so there is one place
@@ -208,6 +276,88 @@ impl SigningContext {
             store,
             pubkey,
             self.aggregate_and_proof_signing_root(root, slot),
+        )
+    }
+
+    /// Sign the envelope revealing the payload of the block proposed for `slot`
+    /// on behalf of `pubkey`, which for a self-built payload is the proposer's
+    /// own key.
+    ///
+    /// Not slashable and not guarded. The specification attaches no slashing
+    /// condition to an envelope: signing two for one slot is at worst a
+    /// payload the network ignores one of. The block it belongs to is the
+    /// guarded signature.
+    pub fn sign_execution_payload_envelope(
+        &self,
+        store: &ValidatorStore,
+        pubkey: &BlsPubkey,
+        envelope: &ExecutionPayloadEnvelope,
+        slot: Slot,
+    ) -> Result<BlsSignature> {
+        self.sign_root(store, pubkey, self.envelope_signing_root(envelope, slot))
+    }
+
+    /// Sign a payload timeliness committee vote on behalf of `pubkey`.
+    ///
+    /// Not slashable by the specification, and deduplicated per validator and
+    /// slot by [`crate::payload_attestation`] only to avoid publishing the same
+    /// vote twice.
+    pub fn sign_payload_attestation(
+        &self,
+        store: &ValidatorStore,
+        pubkey: &BlsPubkey,
+        data: &PayloadAttestationData,
+    ) -> Result<BlsSignature> {
+        self.sign_root(store, pubkey, self.payload_attestation_signing_root(data))
+    }
+
+    /// Sign a sync committee message for `slot` over `beacon_block_root`.
+    ///
+    /// Not slashable, and deduplicated per validator and slot by
+    /// [`crate::sync_committee`] only to avoid publishing the same message
+    /// twice.
+    pub fn sign_sync_committee_message(
+        &self,
+        store: &ValidatorStore,
+        pubkey: &BlsPubkey,
+        slot: Slot,
+        beacon_block_root: Root,
+    ) -> Result<BlsSignature> {
+        self.sign_root(
+            store,
+            pubkey,
+            self.sync_committee_message_signing_root(slot, beacon_block_root),
+        )
+    }
+
+    /// Sign the sync committee selection proof for `slot` and one
+    /// subcommittee. Deterministic, so not guarded, for the reason
+    /// [`Self::sign_selection_proof`] is not.
+    pub fn sign_sync_selection_proof(
+        &self,
+        store: &ValidatorStore,
+        pubkey: &BlsPubkey,
+        slot: Slot,
+        subcommittee_index: u64,
+    ) -> Result<BlsSignature> {
+        self.sign_root(
+            store,
+            pubkey,
+            self.sync_selection_proof_signing_root(slot, subcommittee_index),
+        )
+    }
+
+    /// Sign a `ContributionAndProof` on behalf of its aggregator `pubkey`.
+    pub fn sign_contribution_and_proof(
+        &self,
+        store: &ValidatorStore,
+        pubkey: &BlsPubkey,
+        message: &ContributionAndProof,
+    ) -> Result<BlsSignature> {
+        self.sign_root(
+            store,
+            pubkey,
+            self.contribution_and_proof_signing_root(message),
         )
     }
 
@@ -521,6 +671,91 @@ mod tests {
             &pubkey,
             &signature,
             context.aggregate_and_proof_signing_root(root, 3200)
+        ));
+    }
+
+    #[test]
+    fn a_sync_committee_message_verifies_under_its_own_root() {
+        let (store, pubkey) = store_with_key();
+        let context = context();
+        let root = Root::repeat_byte(5);
+
+        let signature = context
+            .sign_sync_committee_message(&store, &pubkey, 3200, root)
+            .expect("signs");
+        assert!(verify(
+            &pubkey,
+            &signature,
+            context.sync_committee_message_signing_root(3200, root)
+        ));
+        assert_eq!(
+            context.sync_committee_message_signing_root(3200, root),
+            compute_signing_root(root, context.domain(DOMAIN_SYNC_COMMITTEE, 100)),
+            "the root is signed bare, under the sync committee domain"
+        );
+    }
+
+    /// The domain follows the message's slot across a fork boundary.
+    #[test]
+    fn a_sync_message_domain_follows_the_fork_schedule_at_its_slot() {
+        let context = context();
+        let after = context.config.altair_fork_epoch * preset::SLOTS_PER_EPOCH;
+        assert_ne!(
+            context.sync_committee_message_signing_root(after - 1, Root::ZERO),
+            context.sync_committee_message_signing_root(after, Root::ZERO),
+        );
+    }
+
+    #[test]
+    fn a_sync_selection_proof_verifies_and_names_the_subcommittee() {
+        let (store, pubkey) = store_with_key();
+        let context = context();
+
+        let signature = context
+            .sign_sync_selection_proof(&store, &pubkey, 3200, 2)
+            .expect("signs");
+        assert!(verify(
+            &pubkey,
+            &signature,
+            context.sync_selection_proof_signing_root(3200, 2)
+        ));
+        assert_ne!(
+            context.sync_selection_proof_signing_root(3200, 2),
+            context.sync_selection_proof_signing_root(3200, 3),
+            "each subcommittee has its own draw"
+        );
+        assert_ne!(
+            context.sync_selection_proof_signing_root(3200, 0),
+            context.selection_proof_signing_root(3200),
+            "not replayable as an attestation selection proof"
+        );
+    }
+
+    #[test]
+    fn a_contribution_and_proof_verifies_under_its_own_root() {
+        use ethlambda_types::beacon::containers::altair::SyncCommitteeContribution;
+
+        let (store, pubkey) = store_with_key();
+        let context = context();
+        let message = ContributionAndProof {
+            aggregator_index: 9,
+            contribution: SyncCommitteeContribution {
+                slot: 3200,
+                beacon_block_root: Root::repeat_byte(1),
+                subcommittee_index: 1,
+                aggregation_bits: Default::default(),
+                signature: BlsSignature([2; 96]),
+            },
+            selection_proof: BlsSignature([3; 96]),
+        };
+
+        let signature = context
+            .sign_contribution_and_proof(&store, &pubkey, &message)
+            .expect("signs");
+        assert!(verify(
+            &pubkey,
+            &signature,
+            context.contribution_and_proof_signing_root(&message)
         ));
     }
 

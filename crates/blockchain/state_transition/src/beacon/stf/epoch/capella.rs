@@ -79,12 +79,13 @@ pub fn process_historical_summaries_update(state: &mut BeaconState) -> Result<()
 ///
 /// `historical_summaries` enters the state at capella and every later fork
 /// keeps the identical field: deneb reuses this whole driver unchanged (see
-/// this module's own documentation), and electra and fulu each fold this same
-/// step into their own, larger driver rather than redefining it, since
-/// neither fork's specification says anything about historical summaries at
-/// all. Matching every variant that actually has the field, rather than only
-/// [`BeaconState::Capella`], is what lets each of those reuse this function
-/// instead of a copy of it.
+/// this module's own documentation), electra and fulu each fold this same
+/// step into their own, larger driver rather than redefining it, and gloas
+/// keeps the field unchanged too (see `containers::gloas`'s module doc),
+/// since neither fork's specification says anything about historical
+/// summaries at all. Matching every variant that actually has the field,
+/// rather than only [`BeaconState::Capella`], is what lets each of those
+/// reuse this function instead of a copy of it.
 fn historical_summaries_mut<'a>(
     state: &'a mut BeaconState,
     function: &'static str,
@@ -94,6 +95,7 @@ fn historical_summaries_mut<'a>(
         BeaconState::Deneb(state) => Ok(&mut state.historical_summaries),
         BeaconState::Electra(state) => Ok(&mut state.historical_summaries),
         BeaconState::Fulu(state) => Ok(&mut state.historical_summaries),
+        BeaconState::Gloas(state) => Ok(&mut state.historical_summaries),
         other => Err(Error::UnsupportedForFork {
             function,
             fork: other.fork_name(),

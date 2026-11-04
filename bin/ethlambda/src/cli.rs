@@ -87,11 +87,11 @@ pub(crate) struct CommonOptions {
     /// published files) anchors at its own `genesis.ssz` when there is
     /// neither a resumable directory nor a URL, since a freshly started devnet
     /// has no checkpoint provider at slot 0 and this is the only way to join
-    /// one. The built-in networks (`mainnet`, `sepolia`, `hoodi`) still refuse
-    /// that fallback: each has been live for years, and this follower imports
-    /// nothing at startup, so anchoring there would park it at slot 0 while
-    /// claiming to follow a live chain. With neither a resumable directory, a
-    /// URL, nor a loaded network's genesis, startup aborts.
+    /// one. The built-in networks (`mainnet`, `sepolia`, `hoodi`,
+    /// `plataberget`) still refuse that fallback: each is a live chain, and
+    /// this follower imports nothing at startup, so anchoring there would park
+    /// it at slot 0 while claiming to follow it. With neither a resumable
+    /// directory, a URL, nor a loaded network's genesis, startup aborts.
     #[arg(long, value_delimiter = ',')]
     pub(crate) checkpoint_sync_url: Vec<String>,
     #[command(flatten)]
@@ -296,8 +296,9 @@ pub(crate) struct MainnetOptions {
     #[arg(long, default_value_t = SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY)]
     pub(crate) safe_slots_to_import_optimistically: u64,
 
-    /// Which network to follow: a built-in name (`mainnet`, `sepolia` or
-    /// `hoodi`), or a path to a directory of published network files.
+    /// Which network to follow: a built-in name (`mainnet`, `sepolia`,
+    /// `hoodi` or `plataberget`), or a path to a directory of published
+    /// network files.
     ///
     /// A value containing a slash is always read as a directory, so `mainnet`
     /// names the built-in network and `./mainnet` names a directory. The

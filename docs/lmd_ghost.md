@@ -5,8 +5,10 @@ fork choice algorithm works. LMD-GHOST is the fork choice rule used by Ethereum'
 and its derivatives. Each validator's **latest attestation** is their single active vote, and the
 algorithm follows the heaviest branch at every fork.
 
-This document is implementation-agnostic, with ethlambda-specific details called out in
-blockquotes marked **"In ethlambda"**.
+This document is implementation-agnostic, with details of ethlambda's Lean Chain
+(`ethlambda node`) called out in blockquotes marked **"In ethlambda's Lean Chain"**.
+ethlambda's Beacon Chain follower (`ethlambda beacon`) runs the consensus-specs fork
+choice instead; see [its section of the Beacon Chain state transition](./beacon_stf.md#fork-choice).
 
 > Much of the conceptual framing in this document is inspired by Ben Edgington's
 > [Eth2 Book](https://eth2book.info/), particularly the
@@ -176,7 +178,7 @@ the chain.
 | Attestations | Latest message per validator: validator_index → attestation |
 | Min score | Minimum weight for a branch to be considered (0 = follow any branch; higher = conservative) |
 
-> **In ethlambda:** The function is `compute_lmd_ghost_head()` in
+> **In ethlambda's Lean Chain:** The function is `compute_lmd_ghost_head()` in
 > `crates/blockchain/fork_choice/src/lib.rs`. The block tree comes from
 > the `LiveChain` storage index, and `min_score` is 0 for head selection
 > or ⌈2V/3⌉ for safe target computation.
@@ -207,7 +209,7 @@ effective balance is added instead.
                 └ start_root (not weighted, used as the descent origin)
 ```
 
-> **In ethlambda:** All validators have equal weight (+1 per vote). The Ethereum
+> **In ethlambda's Lean Chain:** All validators have equal weight (+1 per vote). The Ethereum
 > Beacon Chain instead weights votes by effective balance (up to 2048 ETH).
 
 Then, **greedily descend.** Starting from the start root, at each node pick the child
@@ -399,7 +401,7 @@ finality gadget (e.g., Casper FFG in the Ethereum Beacon Chain, or [3SF-mini](3s
     └────────────────────────────────────────────────────┘
 ```
 
-> **In ethlambda:** The finality gadget is [3SF-mini](3sf_mini.md), which operates at
+> **In ethlambda's Lean Chain:** The finality gadget is [3SF-mini](3sf_mini.md), which operates at
 > the slot level rather than epoch boundaries.
 
 The two layers interact: LMD-GHOST runs its greedy descent **starting from the latest
@@ -422,7 +424,7 @@ tree.** Without finality, fork choice would need to consider every block since g
 and the tree would grow without bound. With finality, all blocks at or before the finalized
 checkpoint can be discarded from the fork choice's working set.
 
-> **In ethlambda:** The `LiveChain` index (the in-memory block tree used by fork choice)
+> **In ethlambda's Lean Chain:** The `LiveChain` index (the in-memory block tree used by fork choice)
 > is pruned every time finalization advances, keeping it bounded to only the non-finalized
 > portion of the chain.
 
@@ -455,7 +457,7 @@ designated moments. This ensures all validators operate on a consistent view.
                           fixed points
 ```
 
-> **In ethlambda:** The two stages are called "new" and "known" attestations, held in
+> **In ethlambda's Lean Chain:** The two stages are called "new" and "known" attestations, held in
 > the in-memory `new_payloads` and `known_payloads` buffers of the `Store` respectively.
 > Promotion happens at tick intervals 0 (if proposing) and 4 (end of slot).
 
@@ -576,7 +578,7 @@ Reorgs are normal during transient network conditions but should be rare in stab
 operation. They cannot cross a finalization boundary: once a block is finalized, it is
 permanently part of the canonical chain.
 
-> **In ethlambda:** Reorgs are detected by checking whether the old and new heads
+> **In ethlambda's Lean Chain:** Reorgs are detected by checking whether the old and new heads
 > share a common prefix, and tracked via Prometheus metrics
 > (`lean_fork_choice_reorgs_total`).
 
@@ -684,10 +686,12 @@ at specific intervals:
 
 ### Differences from the Ethereum Beacon Chain
 
-ethlambda is a lean consensus client with several simplifications compared to the
-Ethereum Beacon Chain:
+Lean consensus simplifies several parts of the Ethereum Beacon Chain's fork choice. This
+section describes ethlambda's Lean Chain (`ethlambda node`); its Beacon Chain follower
+(`ethlambda beacon`) runs the Beacon Chain's own fork choice, proposer boost and
+equivocation discounting included.
 
-| Aspect | ethlambda | Ethereum Beacon Chain |
+| Aspect | Lean Chain | Ethereum Beacon Chain |
 |--------|-----------|----------------------|
 | **Vote weight** | Equal: 1 vote per validator | Proportional to effective balance (up to 32 ETH) |
 | **Proposer boost** | None | Yes: newly proposed blocks get temporary bonus weight |
@@ -697,18 +701,18 @@ Ethereum Beacon Chain:
 | **Slot duration** | 4 seconds (configurable) | 12 seconds |
 
 **No proposer boost.** The Beacon Chain adds a "proposer boost", a temporary weight bonus
-given to newly proposed blocks to prevent balancing attacks. ethlambda does not implement
-this. Instead, proposer fairness is handled through the two-stage attestation pipeline
+given to newly proposed blocks to prevent balancing attacks. The Lean Chain has no such
+boost. Instead, proposer fairness is handled through the two-stage attestation pipeline
 (the proposer's own attestation enters as "new", not "known").
 
 **No balance weighting.** In the Beacon Chain, a validator with 32 ETH of effective balance
-has more fork choice weight than one with 16 ETH. In ethlambda, every validator has exactly
+has more fork choice weight than one with 16 ETH. On the Lean Chain, every validator has exactly
 equal weight (1 vote = 1 unit of weight), simplifying the algorithm and analysis.
 
 **No equivocation discounting.** The Beacon Chain's fork choice detects validators who
 equivocate (attest to conflicting blocks in the same slot) and excludes their weight. This
 addresses the "nothing at stake" problem where validators can costlessly vote for multiple
-forks. ethlambda does not implement this in its fork choice.
+forks. The Lean Chain's fork choice does not do this.
 
 ### Key Files
 

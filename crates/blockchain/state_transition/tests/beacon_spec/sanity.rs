@@ -13,11 +13,9 @@
 //! Unlike the `operations` suite, these run the full [`state_transition`], so
 //! they check the proposer signature and the committed `state_root` too.
 
-use std::sync::Arc;
-
 use ethlambda_state_transition::beacon::config::Config;
 use ethlambda_state_transition::beacon::containers::{BeaconState, SignedBeaconBlock};
-use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCache;
+use ethlambda_state_transition::beacon::helpers::accessors::{ActiveBalanceCache, CommitteeCache};
 use ethlambda_state_transition::beacon::stf::{self, ExecutionEngine};
 use libtest_mimic::Trial;
 
@@ -50,6 +48,7 @@ fn apply_blocks(case: &Case, state: &mut BeaconState, config: &Config) -> Result
     // One cache across the case's blocks, as the node holds one across its
     // imports, so consecutive blocks of an epoch share its shuffling.
     let committees = CommitteeCache::default();
+    let active_balances = ActiveBalanceCache::default();
 
     for index in 0..meta.blocks_count {
         let bytes = case.ssz_bytes_indexed("blocks", index);
@@ -60,8 +59,16 @@ fn apply_blocks(case: &Case, state: &mut BeaconState, config: &Config) -> Result
             state.latest_block_header_mut().state_root = root;
         }
 
-        stf::state_transition(state, &block, true, config, &engine, &committees)
-            .map_err(|err| format!("block {index} rejected: {err:?}"))?;
+        stf::state_transition(
+            state,
+            &block,
+            true,
+            config,
+            &engine,
+            &committees,
+            &active_balances,
+        )
+        .map_err(|err| format!("block {index} rejected: {err:?}"))?;
 
         previous_state_root = Some(block.state_root());
     }
@@ -80,15 +87,14 @@ fn apply_slots(case: &Case, state: &mut BeaconState, config: &Config) -> Result<
 
 /// Builds one runner and handler pair's trials, since all four share this shape.
 fn run(runner: &str, handler: &str, slots: bool) -> Vec<Trial> {
-    let config = Arc::new(Config::active());
     let cases = collect(PRESET, runner, handler);
     let mut trials = vec![super::discovery_trial(runner, cases.len())];
 
     for case in cases {
-        let config = Arc::clone(&config);
         trials.push(super::case_trial(runner, case, move |case| {
             let mut state = BeaconState::from_ssz(case.fork, &case.ssz_bytes("pre"))
                 .map_err(|err| format!("the fixture's pre-state does not decode: {err:?}"))?;
+            let config = super::case_config(case);
 
             let outcome = if slots {
                 apply_slots(case, &mut state, &config)

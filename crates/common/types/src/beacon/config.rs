@@ -11,11 +11,19 @@
 //!
 //! # What is left out
 //!
-//! - **Forks this build cannot process.** `GLOAS_*`, `HEZE_*` and the timing
-//!   values that arrived with them, plus `GAS_LIMIT_SCHEDULE`, which is
-//!   gloas-era and is a list rather than a scalar. A fork version stored here
-//!   would give [`Config::fork_at_epoch`] a fork [`crate::beacon::fork::ForkName`]
-//!   has no variant for, so these are reported as unknown keys instead.
+//! - **Forks this build cannot process.** `HEZE_FORK_VERSION`/`HEZE_FORK_EPOCH`
+//!   and `EIP8321_FORK_VERSION`/`EIP8321_FORK_EPOCH` (its own later fork
+//!   schedule) stay out for the same reason `GLOAS_*` used to: a fork version
+//!   stored here would give [`Config::fork_at_epoch`] a fork
+//!   [`crate::beacon::fork::ForkName`] has no variant for, so each is
+//!   reported as an unknown key instead. `GAS_LIMIT_SCHEDULE` (gloas-era)
+//!   stays out too, since it is a list rather than a scalar. The rest are
+//!   heze-era data keys, not gloas's, with no reader in this build at all:
+//!   `INCLUSION_LIST_DUE_BPS`, `MAX_REQUEST_INCLUSION_LIST`,
+//!   `MIN_SLOTS_FOR_INCLUSION_LISTS_REQUESTS`, and
+//!   `MAX_TRANSACTIONS_BYTES_PER_INCLUSION_LIST` (EIP-7805's fork-choice-enforced
+//!   inclusion lists), and `CONFIRMATION_BYZANTINE_THRESHOLD` (the Fast
+//!   Confirmation Rule).
 //!
 //! `PRESET_BASE` and `CONFIG_NAME` used to be left out as well, because they
 //! are strings and this struct is SSZ-encoded into the database. They are here
@@ -309,6 +317,13 @@ pub struct Config {
     /// is not scheduled.
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub fulu_fork_epoch: Epoch,
+    /// The `Fork.current_version` a gloas block or attestation signs under.
+    #[serde(with = "crate::beacon::serde_helpers::hex_array")]
+    pub gloas_fork_version: Version,
+    /// The epoch gloas activates at, or [`constants::FAR_FUTURE_EPOCH`] if it
+    /// is not scheduled.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub gloas_fork_epoch: Epoch,
 
     // -- Time parameters ---------------------------------------------------
     /// Wall-clock seconds per slot. Deprecated in favor of
@@ -348,7 +363,9 @@ pub struct Config {
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub attestation_due_bps: u64,
     /// Basis points of [`Self::slot_duration_ms`] by which an aggregate
-    /// attestation is due; read by `get_aggregate_due_ms`.
+    /// attestation is due; the specification's `get_aggregate_due_ms`. Nothing
+    /// in the state transition's fork choice calls it: the reader is the
+    /// validator's `SlotClock`.
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub aggregate_due_bps: u64,
     /// Basis points of [`Self::slot_duration_ms`] past which a proposer must
@@ -364,6 +381,36 @@ pub struct Config {
     /// contribution is due (altair); read by `get_contribution_due_ms`.
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub contribution_due_bps: u64,
+    /// Gloas: [`Self::attestation_due_bps`]'s replacement, now that ePBS
+    /// (EIP-7732) moves the attestation deadline earlier in the slot to make
+    /// room for the payload and payload-attestation windows below.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub attestation_due_bps_gloas: u64,
+    /// Gloas: [`Self::aggregate_due_bps`]'s replacement, for the reason
+    /// [`Self::attestation_due_bps_gloas`] gives.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub aggregate_due_bps_gloas: u64,
+    /// Gloas: [`Self::sync_message_due_bps`]'s replacement, for the reason
+    /// [`Self::attestation_due_bps_gloas`] gives.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub sync_message_due_bps_gloas: u64,
+    /// Gloas: [`Self::contribution_due_bps`]'s replacement, for the reason
+    /// [`Self::attestation_due_bps_gloas`] gives.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub contribution_due_bps_gloas: u64,
+    /// Gloas (EIP-7732): basis points of [`Self::slot_duration_ms`] by which
+    /// the builder's execution payload is due.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub payload_due_bps: u64,
+    /// Gloas (EIP-7732): basis points of [`Self::slot_duration_ms`] by which
+    /// a payload attestation is due.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub payload_attestation_due_bps: u64,
+    /// Gloas: epochs a builder must wait after its exit is processed before
+    /// its collateral becomes withdrawable, the builder-registry counterpart
+    /// to [`Self::min_validator_withdrawability_delay`].
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub min_builder_withdrawability_delay: Epoch,
 
     // -- Validator cycle -----------------------------------------------------
     /// Score points added to a validator's inactivity score for each epoch it
@@ -406,6 +453,19 @@ pub struct Config {
     /// consolidations (`get_activation_exit_churn_limit`).
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub max_per_epoch_activation_exit_churn_limit: Gwei,
+    /// Gloas (EIP-8061): the *validator* registry's own churn quotient for
+    /// this fork, read by `get_activation_churn_limit`/`get_exit_churn_limit`.
+    /// Not a builder-registry value, despite the name pattern this crate uses
+    /// elsewhere for gloas-specific fields.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub churn_limit_quotient_gloas: u64,
+    /// Gloas (EIP-8061): the ceiling on how much validator activation churn
+    /// one epoch may admit, this fork's counterpart to
+    /// [`Self::max_per_epoch_activation_churn_limit`] (deneb) and
+    /// [`Self::max_per_epoch_activation_exit_churn_limit`] (electra). Not a
+    /// builder-registry value; see [`Self::churn_limit_quotient_gloas`].
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub max_per_epoch_activation_churn_limit_gloas: Gwei,
 
     // -- Fork choice ---------------------------------------------------------
     /// Percentage boost, relative to a single committee's weight, given to a
@@ -659,6 +719,8 @@ impl Config {
             electra_fork_epoch: 364_032,
             fulu_fork_version: [0x06, 0x00, 0x00, 0x00],
             fulu_fork_epoch: 411_392,
+            gloas_fork_version: [0x07, 0x00, 0x00, 0x00],
+            gloas_fork_epoch: constants::FAR_FUTURE_EPOCH,
 
             seconds_per_slot: 12,
             slot_duration_ms: 12_000,
@@ -671,6 +733,13 @@ impl Config {
             proposer_reorg_cutoff_bps: 1_667,
             sync_message_due_bps: 3_333,
             contribution_due_bps: 6_667,
+            attestation_due_bps_gloas: 2_500,
+            aggregate_due_bps_gloas: 5_000,
+            sync_message_due_bps_gloas: 2_500,
+            contribution_due_bps_gloas: 5_000,
+            payload_due_bps: 5_000,
+            payload_attestation_due_bps: 7_500,
+            min_builder_withdrawability_delay: 64,
 
             inactivity_score_bias: 4,
             inactivity_score_recovery_rate: 16,
@@ -680,6 +749,8 @@ impl Config {
             max_per_epoch_activation_churn_limit: 8,
             min_per_epoch_churn_limit_electra: 128_000_000_000,
             max_per_epoch_activation_exit_churn_limit: 256_000_000_000,
+            churn_limit_quotient_gloas: 32_768,
+            max_per_epoch_activation_churn_limit_gloas: 256_000_000_000,
 
             proposer_score_boost: 40,
             reorg_head_weight_threshold: 20,
@@ -782,6 +853,8 @@ impl Config {
             electra_fork_epoch: constants::FAR_FUTURE_EPOCH,
             fulu_fork_version: [0x06, 0x00, 0x00, 0x01],
             fulu_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            gloas_fork_version: [0x07, 0x00, 0x00, 0x01],
+            gloas_fork_epoch: constants::FAR_FUTURE_EPOCH,
 
             seconds_per_slot: 6,
             slot_duration_ms: 6_000,
@@ -794,6 +867,13 @@ impl Config {
             proposer_reorg_cutoff_bps: 1_667,
             sync_message_due_bps: 3_333,
             contribution_due_bps: 6_667,
+            attestation_due_bps_gloas: 2_500,
+            aggregate_due_bps_gloas: 5_000,
+            sync_message_due_bps_gloas: 2_500,
+            contribution_due_bps_gloas: 5_000,
+            payload_due_bps: 5_000,
+            payload_attestation_due_bps: 7_500,
+            min_builder_withdrawability_delay: 2,
 
             inactivity_score_bias: 4,
             inactivity_score_recovery_rate: 16,
@@ -803,6 +883,8 @@ impl Config {
             max_per_epoch_activation_churn_limit: 4,
             min_per_epoch_churn_limit_electra: 64_000_000_000,
             max_per_epoch_activation_exit_churn_limit: 128_000_000_000,
+            churn_limit_quotient_gloas: 16,
+            max_per_epoch_activation_churn_limit_gloas: 128_000_000_000,
 
             proposer_score_boost: 40,
             reorg_head_weight_threshold: 20,
@@ -837,11 +919,14 @@ impl Config {
             min_epochs_for_data_column_sidecars_requests: 4_096,
             subnets_per_node: 2,
 
-            deposit_chain_id: 1,
-            deposit_network_id: 1,
+            // configs/minimal.yaml: Ethereum Goerli testnet's chain and
+            // network id, not mainnet's; the contract address is not
+            // Goerli's real one, just the file's own repeating placeholder.
+            deposit_chain_id: 5,
+            deposit_network_id: 5,
             deposit_contract_address: [
-                0x00, 0x00, 0x00, 0x00, 0x21, 0x9a, 0xb5, 0x40, 0x35, 0x6c, 0xbb, 0x83, 0x9c, 0xbe,
-                0x05, 0x30, 0x3d, 0x77, 0x05, 0xfa,
+                0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78,
+                0x90, 0x12, 0x34, 0x56, 0x78, 0x90,
             ],
 
             balance_per_additional_custody_group: 32_000_000_000,
@@ -850,7 +935,7 @@ impl Config {
             samples_per_slot: 8,
             validator_custody_requirement: 8,
 
-            consolidation_churn_limit_quotient: 65_536,
+            consolidation_churn_limit_quotient: 32,
 
             attestation_subnet_prefix_bits: 6,
             max_request_blob_sidecars: 768,
@@ -870,7 +955,7 @@ impl Config {
     /// are chosen so that a beacon-shaped gate reading this by mistake fails
     /// closed: every fork epoch is `FAR_FUTURE_EPOCH`, so no fork ever reads as
     /// activated, rather than epoch 0, which would read as "activated at
-    /// genesis" for all seven of them.
+    /// genesis" for all eight of them.
     pub fn lean(genesis_time: u64, slot_duration_ms: u64) -> Self {
         Self {
             // A lean `config.yaml` has no `PRESET_BASE` or `CONFIG_NAME` key,
@@ -891,6 +976,7 @@ impl Config {
             deneb_fork_epoch: constants::FAR_FUTURE_EPOCH,
             electra_fork_epoch: constants::FAR_FUTURE_EPOCH,
             fulu_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            gloas_fork_epoch: constants::FAR_FUTURE_EPOCH,
             ..Config::mainnet()
         }
     }
@@ -973,6 +1059,7 @@ impl Config {
             ForkName::Deneb => self.deneb_fork_version,
             ForkName::Electra => self.electra_fork_version,
             ForkName::Fulu => self.fulu_fork_version,
+            ForkName::Gloas => self.gloas_fork_version,
             ForkName::Lean => lean_fork_unreachable("Config::fork_version"),
         }
     }
@@ -990,6 +1077,7 @@ impl Config {
             ForkName::Deneb => self.deneb_fork_epoch,
             ForkName::Electra => self.electra_fork_epoch,
             ForkName::Fulu => self.fulu_fork_epoch,
+            ForkName::Gloas => self.gloas_fork_epoch,
             ForkName::Lean => lean_fork_unreachable("Config::fork_epoch"),
         }
     }
@@ -1014,6 +1102,7 @@ impl Config {
             ForkName::Deneb => self.deneb_fork_epoch = epoch,
             ForkName::Electra => self.electra_fork_epoch = epoch,
             ForkName::Fulu => self.fulu_fork_epoch = epoch,
+            ForkName::Gloas => self.gloas_fork_epoch = epoch,
             ForkName::Lean => lean_fork_unreachable("Config::with_fork_epoch"),
         }
         self
@@ -1030,6 +1119,7 @@ impl Config {
             ForkName::Deneb => self.deneb_fork_version = version,
             ForkName::Electra => self.electra_fork_version = version,
             ForkName::Fulu => self.fulu_fork_version = version,
+            ForkName::Gloas => self.gloas_fork_version = version,
             // Matches `fork_version`'s own arm: reaching this means a caller
             // dispatched on the wrong chain, which is a bug in the caller.
             ForkName::Lean => lean_fork_unreachable("Config::with_fork_version"),
@@ -1145,6 +1235,18 @@ mod tests {
         // Every later fork is still unscheduled, so a far-future epoch still
         // resolves to the one fork that was actually overridden.
         assert_eq!(config.fork_at_epoch(1_000_000), ForkName::Altair);
+    }
+
+    #[test]
+    fn gloas_keys_are_claimed_and_parse() {
+        let yaml = "GLOAS_FORK_VERSION: 0x07000000\nGLOAS_FORK_EPOCH: 12\n\
+                    CHURN_LIMIT_QUOTIENT_GLOAS: 32768\nMIN_BUILDER_WITHDRAWABILITY_DELAY: 64\n\
+                    PAYLOAD_DUE_BPS: 5000\nPAYLOAD_ATTESTATION_DUE_BPS: 7500\nMAX_REQUEST_PAYLOADS: 128\n";
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(config.gloas_fork_version, [0x07, 0, 0, 0]);
+        assert_eq!(config.fork_epoch(ForkName::Gloas), 12);
+        assert_eq!(config.fork_at_epoch(12), ForkName::Gloas);
+        assert_eq!(config.max_request_payloads, 128);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Contributing to ethlambda
 
-Thanks for your interest in contributing to ethlambda — a minimalist Lean Consensus client for Ethereum, written in Rust.
+Thanks for your interest in contributing to ethlambda — a minimalist Beacon Chain and Lean Chain client for Ethereum, written in Rust.
 
 Before diving in, we recommend reading [our introductory blog post](https://blog.lambdaclass.com/introducing-ethlambda-a-lean-consensus-client-for-ethereums-next-era/) to understand the project's goals and philosophy.
 
@@ -150,7 +150,7 @@ If you discover a security vulnerability, **do not open a public issue**. Instea
 
 ## Communication
 
-- **Telegram**: [ethlambda group](https://t.me/ethlambda_client), where we post daily updates; drop by to ask questions or chat about anything Lean-related.
+- **Telegram**: [ethlambda group](https://t.me/lambdaconsensus), where we post daily updates; drop by to ask questions or chat about anything Lean-related.
 - **X (Twitter)**: [@ethlambda_lean](https://twitter.com/ethlambda_lean) for occasional updates.
 - **Weekly community call**: every Friday, streamed live on [@class_lambda](https://x.com/class_lambda); the call link is posted on Telegram beforehand.
 - **GitHub Issues**: bugs, feature requests, and technical discussion.

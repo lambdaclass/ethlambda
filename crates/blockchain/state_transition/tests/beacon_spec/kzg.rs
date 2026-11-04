@@ -12,16 +12,17 @@
 //! which predates this crate's shared fixture harness and is not wired into
 //! `spec_tests` or its per-case reporting.
 //!
-//! # Why `general`, not a preset
+//! # Why `cryptography-specs`, not a preset
 //!
 //! [`super::PRESET`] selects between `minimal` and `mainnet` because container
 //! bounds like `SLOTS_PER_EPOCH` are compiled in. Nothing about a blob, a cell,
 //! or a KZG point is preset-dependent in that sense: `BYTES_PER_BLOB`,
 //! `CELLS_PER_EXT_BLOB`, and the rest come from the KZG trusted setup and the
 //! EIP-4844/EIP-7594 scheme itself, which is one fixed size regardless of which
-//! preset the beacon state around it uses. So the release ships exactly one
-//! `kzg` tree per fork, under `general`, the same reason [`super::collect_all_handlers`]'s
-//! own doc gives for BLS.
+//! preset the beacon state around it uses. Since v1.7.0-alpha.13
+//! (consensus-specs #5398) these vectors ship from `ethereum/cryptography-specs`
+//! instead, one flat `kzg` tree with no fork level, the same reason
+//! [`super::collect_crypto`]'s own doc gives for BLS.
 //!
 //! # What `output: null` means
 //!
@@ -57,12 +58,13 @@
 //! ever need it.
 
 use c_kzg::Cell;
+use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::kzg;
 use ethlambda_state_transition::beacon::primitives::{Bytes32, H256, KzgCommitment, KzgProof};
 use libtest_mimic::Trial;
 use serde_yaml_ng::Value;
 
-use super::{Case, collect_all_handlers};
+use super::Case;
 
 /// Decodes a `0x`-prefixed hex string into bytes of whatever length it has.
 ///
@@ -459,8 +461,35 @@ fn run(handler: &str, case: &Case) -> Result<(), String> {
     }
 }
 
+/// The handlers EIP-7594 (fulu) added; the rest are EIP-4844 (deneb). Neither
+/// the fixture tree nor [`run`]'s own dispatch (see the module doc for why it
+/// matches on the handler alone) carries a fork, so this list is what
+/// [`trials`] hands [`super::collect_crypto`] to tag each case for
+/// [`super::Case::in_scope`].
+///
+/// A handler missing from this list falls to the `else` branch below and is
+/// tagged [`ForkName::Deneb`], not skipped: this list only ever needs a name
+/// *added* to move a handler from deneb to fulu, never removed to stop one
+/// being deneb. A release adding a thirteenth handler still reaches [`run`]'s
+/// own `other` arm and fails loudly there, the same as any other unhandled
+/// name; this list only decides which fork a *known* handler's cases are
+/// tagged with, not whether they run at all.
+const FULU_HANDLERS: &[&str] = &[
+    "compute_cells",
+    "compute_cells_and_kzg_proofs",
+    "compute_verify_cell_kzg_proof_batch_challenge",
+    "recover_cells_and_kzg_proofs",
+    "verify_cell_kzg_proof_batch",
+];
+
 pub fn trials() -> Vec<Trial> {
-    let cases = collect_all_handlers("general", "kzg");
+    let cases = super::collect_crypto("kzg", |handler| {
+        if FULU_HANDLERS.contains(&handler) {
+            ForkName::Fulu
+        } else {
+            ForkName::Deneb
+        }
+    });
     let mut trials = vec![super::discovery_trial("kzg", cases.len())];
 
     for (handler, case) in cases {

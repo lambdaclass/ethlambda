@@ -17,12 +17,13 @@ use ethlambda_types::beacon::{
     containers::{
         BeaconState, SignedBeaconBlock,
         altair::SyncAggregate,
-        capella::Withdrawal,
+        capella::{self, Withdrawal},
         deneb::ExecutionPayload,
         electra::{
             self, AggregationBits, Attestation, BeaconBlock, BeaconBlockBody, CommitteeBits,
             ConsolidationRequest, DepositRequest, ExecutionRequests, WithdrawalRequest,
         },
+        shared::{ProposerSlashing, SignedVoluntaryExit},
     },
     preset,
     primitives::{
@@ -33,18 +34,21 @@ use ethlambda_types::beacon::{
 use libssz::SszDecode as _;
 use libssz_types::SszList;
 
-use super::attestation_pool::single_committee;
 use super::bls;
 use super::config::Config;
 use super::error::{Error, Result, verify};
 use super::helpers::accessors::{
-    CommitteeCache, get_beacon_proposer_index, get_block_root, get_current_epoch,
-    get_previous_epoch, get_randao_mix,
+    ActiveBalanceCache, CommitteeCache, get_beacon_proposer_index, get_block_root,
+    get_block_root_at_slot, get_current_epoch, get_domain, get_previous_epoch, get_randao_mix,
 };
 use super::helpers::electra::{
     get_attesting_indices, get_indexed_attestation, is_valid_indexed_attestation,
 };
+use super::helpers::misc::compute_signing_root;
+use super::helpers::predicates::is_slashable_validator;
+use super::lean_boundary::lean_state_unreachable;
 use super::stf::{self, ExecutionEngine};
+use ethlambda_storage::pools::single_committee;
 
 /// `state` advanced through empty slots to `slot`, as a block for `slot` is
 /// applied to it. A state already at `slot` is returned as it is.
@@ -75,7 +79,19 @@ pub fn payload_inputs(state: &BeaconState, config: &Config) -> Result<PayloadInp
     let parent_hash = match state {
         BeaconState::Electra(state) => state.latest_execution_payload_header.block_hash,
         BeaconState::Fulu(state) => state.latest_execution_payload_header.block_hash,
-        _ => return Err(Error::SpecAssert("block production is electra and later")),
+        BeaconState::Phase0(_)
+        | BeaconState::Altair(_)
+        | BeaconState::Bellatrix(_)
+        | BeaconState::Capella(_)
+        | BeaconState::Deneb(_) => {
+            return Err(Error::SpecAssert("block production is electra and later"));
+        }
+        // Gloas builds its block around a builder's bid rather than an
+        // execution payload the proposer requests, which nothing here models.
+        BeaconState::Gloas(_) => {
+            return Err(Error::SpecAssert("block production does not support gloas"));
+        }
+        BeaconState::Lean(_) => lean_state_unreachable("payload_inputs"),
     };
     Ok(PayloadInputs {
         timestamp: stf::bellatrix::compute_timestamp_at_slot(state, state.slot(), config),
@@ -92,6 +108,52 @@ pub fn empty_sync_aggregate() -> SyncAggregate {
     SyncAggregate {
         sync_committee_bits: Default::default(),
         sync_committee_signature: BlsSignature(bls::G2_POINT_AT_INFINITY),
+    }
+}
+
+/// `candidate` when it passes exactly the check `process_sync_aggregate` will
+/// hold it to, else [`empty_sync_aggregate`].
+///
+/// `state` is the block's pre-state advanced to the block's slot. The
+/// participants are `current_sync_committee`'s members by bits, signing the
+/// block root at `state.slot - 1` under `DOMAIN_SYNC_COMMITTEE` at that slot's
+/// epoch. A pooled aggregate can fail this when the proposer's parent is not
+/// the root the committee signed, or when the head moved across a period: it
+/// then costs the rewards, never the block.
+pub fn verified_sync_aggregate(state: &BeaconState, candidate: SyncAggregate) -> SyncAggregate {
+    let Ok((committee, _)) = state.sync_committees() else {
+        return empty_sync_aggregate();
+    };
+    let participants: Vec<_> = committee
+        .pubkeys
+        .iter()
+        .enumerate()
+        .filter(|(position, _)| {
+            candidate
+                .sync_committee_bits
+                .get(*position)
+                .unwrap_or(false)
+        })
+        .map(|(_, pubkey)| *pubkey)
+        .collect();
+    let previous_slot = state.slot().saturating_sub(1);
+    let Ok(block_root) = get_block_root_at_slot(state, previous_slot) else {
+        return empty_sync_aggregate();
+    };
+    let domain = get_domain(
+        state,
+        constants::DOMAIN_SYNC_COMMITTEE,
+        Some(compute_epoch_at_slot(previous_slot)),
+    );
+    let signing_root = compute_signing_root(block_root, domain);
+    if bls::eth_fast_aggregate_verify(
+        &participants,
+        signing_root,
+        &candidate.sync_committee_signature,
+    ) {
+        candidate
+    } else {
+        empty_sync_aggregate()
     }
 }
 
@@ -274,31 +336,183 @@ fn merge_committees(group: Vec<(u64, Attestation)>) -> Option<Attestation> {
     })
 }
 
+/// The four operation lists a block body carries besides attestations. Both
+/// what the pool offers [`pack_operations`] and what it packs.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Operations {
+    pub proposer_slashings: Vec<ProposerSlashing>,
+    pub attester_slashings: Vec<electra::AttesterSlashing>,
+    pub voluntary_exits: Vec<SignedVoluntaryExit>,
+    pub bls_to_execution_changes: Vec<capella::SignedBLSToExecutionChange>,
+}
+
+impl Operations {
+    /// Whether all four lists are empty.
+    pub fn is_empty(&self) -> bool {
+        self.proposer_slashings.is_empty()
+            && self.attester_slashings.is_empty()
+            && self.voluntary_exits.is_empty()
+            && self.bls_to_execution_changes.is_empty()
+    }
+}
+
+/// The candidates a block for `state`'s slot can carry, in the order
+/// `process_operations` applies them, each kept only if its `process_*`
+/// succeeds on a scratch copy of `state` with everything kept before it
+/// already applied. That is what drops conflicting candidates, such as the
+/// exit of a validator a packed slashing has just slashed.
+///
+/// Attestations sit between the slashings and the exits in the real order;
+/// they change participation and credit the proposer's balance, and no later
+/// operation's validity reads either, so they are left out of the scratch run.
+///
+/// `process_withdrawals` runs before `process_operations` in a real block but
+/// not on the scratch state, so an exit whose pending partial withdrawal this
+/// block pays out is dropped though the block would accept it. That only ever
+/// drops valid exits, never admits invalid ones.
+///
+/// Attester slashings are ranked by how many validators each would slash on
+/// the scratch state (after the proposer slashings), most first, and packed up
+/// to `MAX_ATTESTER_SLASHINGS_ELECTRA`. Every list is capped at its preset
+/// maximum.
+pub fn pack_operations(state: &BeaconState, candidates: Operations, config: &Config) -> Operations {
+    let mut scratch = state.clone();
+    let proposer_slashings = pack_each(
+        &mut scratch,
+        candidates.proposer_slashings,
+        preset::MAX_PROPOSER_SLASHINGS,
+        config,
+        stf::operations::process_proposer_slashing,
+    );
+
+    let epoch = get_current_epoch(&scratch);
+    let mut ranked: Vec<(usize, electra::AttesterSlashing)> = candidates
+        .attester_slashings
+        .into_iter()
+        .map(|slashing| (would_slash(&scratch, &slashing, epoch), slashing))
+        .filter(|(count, _)| *count > 0)
+        .collect();
+    // Stable, so equally damaging slashings keep the order the pool offered.
+    ranked.sort_by_key(|(count, _)| std::cmp::Reverse(*count));
+    let attester_slashings = pack_each(
+        &mut scratch,
+        ranked.into_iter().map(|(_, slashing)| slashing).collect(),
+        preset::MAX_ATTESTER_SLASHINGS_ELECTRA,
+        config,
+        stf::electra::process_attester_slashing,
+    );
+
+    let voluntary_exits = pack_each(
+        &mut scratch,
+        candidates.voluntary_exits,
+        preset::MAX_VOLUNTARY_EXITS,
+        config,
+        stf::electra::process_voluntary_exit,
+    );
+    let bls_to_execution_changes = pack_each(
+        &mut scratch,
+        candidates.bls_to_execution_changes,
+        preset::MAX_BLS_TO_EXECUTION_CHANGES,
+        config,
+        stf::electra::process_bls_to_execution_change,
+    );
+    Operations {
+        proposer_slashings,
+        attester_slashings,
+        voluntary_exits,
+        bls_to_execution_changes,
+    }
+}
+
+/// The candidates `apply` accepts on `scratch`, in order, up to `max`; an
+/// accepted one stays applied for the candidates after it.
+///
+/// Candidates are applied in place, with no copy to roll back to. That is safe
+/// because every `process_*` used here runs all its checks (BLS verifies
+/// included) before its first write: `process_proposer_slashing` checks before
+/// `slash_validator`; electra's `process_attester_slashing` checks before its
+/// loop, and its final `slashed_any` check fails only if nothing was written;
+/// electra's `process_voluntary_exit` checks before `initiate_validator_exit`;
+/// `process_bls_to_execution_change` writes last. A rejected candidate
+/// therefore leaves the state untouched. Even a half-applied one could only
+/// cost the caller's fallback, since `assemble_block` re-runs `process_block`
+/// on a fresh copy of the state and never emits an invalid block.
+fn pack_each<T>(
+    scratch: &mut BeaconState,
+    candidates: Vec<T>,
+    max: usize,
+    config: &Config,
+    apply: impl Fn(&mut BeaconState, &T, &Config) -> Result<()>,
+) -> Vec<T> {
+    let mut packed = Vec::new();
+    // Bounds the work if the pool is full of stale entries.
+    for candidate in candidates.into_iter().take(4 * max) {
+        if packed.len() == max {
+            break;
+        }
+        if apply(scratch, &candidate, config).is_ok() {
+            packed.push(candidate);
+        }
+    }
+    packed
+}
+
+/// How many validators `slashing` would slash on `state` at `epoch`: those
+/// attesting in both of its attestations that are still slashable.
+fn would_slash(state: &BeaconState, slashing: &electra::AttesterSlashing, epoch: u64) -> usize {
+    let second: std::collections::HashSet<_> = slashing
+        .attestation_2
+        .attesting_indices
+        .iter()
+        .copied()
+        .collect();
+    slashing
+        .attestation_1
+        .attesting_indices
+        .iter()
+        .filter(|index| second.contains(*index))
+        .filter(|&&index| {
+            state
+                .validator(index)
+                .is_ok_and(|validator| is_slashable_validator(validator, epoch))
+        })
+        .count()
+}
+
 /// What a block body carries beyond what this module derives from the state.
 #[derive(Debug, Clone)]
 pub struct BlockInputs {
     pub randao_reveal: BlsSignature,
     pub graffiti: Bytes32,
     pub attestations: Vec<Attestation>,
+    /// Slashings, exits and credential changes, as [`pack_operations`] returns
+    /// them.
+    pub operations: Operations,
     pub execution_payload: ExecutionPayload,
     pub blob_kzg_commitments: Vec<KzgCommitment>,
     pub execution_requests: ExecutionRequests,
+    /// The block's sync aggregate: [`empty_sync_aggregate`], or what
+    /// [`verified_sync_aggregate`] vouched for.
+    pub sync_aggregate: SyncAggregate,
 }
 
 /// The unsigned block for the slot `state` has been advanced to, with its
 /// state root computed.
 ///
 /// The body votes the state's own `eth1_data` and carries no deposits (the
-/// deposit contract's log has been replaced by EIP-6110's requests), no
-/// slashings, exits or credential changes (this node pools none), and an empty
-/// sync aggregate. The block is run through `process_block` on a copy of
+/// deposit contract's log has been replaced by EIP-6110's requests), the
+/// slashings, exits and credential changes in `inputs.operations`, and the
+/// sync aggregate it is given. The block is run through `process_block` on a copy of
 /// `state` with an execution engine that accepts the payload, which is the
 /// node's own execution client's payload; that run is also what rejects a body
-/// the network would, before anything is signed.
+/// the network would, before anything is signed. `options` is what that run may
+/// leave unchecked: only a caller that set `skip_randao_verification` passes
+/// anything but the default.
 pub fn assemble_block(
     state: &BeaconState,
     inputs: BlockInputs,
     config: &Config,
+    options: stf::block::BlockProcessingOptions,
 ) -> Result<BeaconBlock> {
     let body = BeaconBlockBody {
         randao_reveal: inputs.randao_reveal,
@@ -308,7 +522,31 @@ pub fn assemble_block(
             .attestations
             .try_into()
             .map_err(|_| Error::SpecAssert("len(attestations) <= MAX_ATTESTATIONS_ELECTRA"))?,
-        sync_aggregate: empty_sync_aggregate(),
+        proposer_slashings: inputs
+            .operations
+            .proposer_slashings
+            .try_into()
+            .map_err(|_| Error::SpecAssert("len(proposer_slashings) <= MAX_PROPOSER_SLASHINGS"))?,
+        attester_slashings: inputs
+            .operations
+            .attester_slashings
+            .try_into()
+            .map_err(|_| {
+                Error::SpecAssert("len(attester_slashings) <= MAX_ATTESTER_SLASHINGS_ELECTRA")
+            })?,
+        voluntary_exits: inputs
+            .operations
+            .voluntary_exits
+            .try_into()
+            .map_err(|_| Error::SpecAssert("len(voluntary_exits) <= MAX_VOLUNTARY_EXITS"))?,
+        bls_to_execution_changes: inputs
+            .operations
+            .bls_to_execution_changes
+            .try_into()
+            .map_err(|_| {
+                Error::SpecAssert("len(bls_to_execution_changes) <= MAX_BLS_TO_EXECUTION_CHANGES")
+            })?,
+        sync_aggregate: inputs.sync_aggregate,
         execution_payload: inputs.execution_payload,
         blob_kzg_commitments: inputs
             .blob_kzg_commitments
@@ -334,7 +572,17 @@ pub fn assemble_block(
     let wrapped = match state {
         BeaconState::Electra(_) => SignedBeaconBlock::Electra(signed),
         BeaconState::Fulu(_) => SignedBeaconBlock::Fulu(signed),
-        _ => return Err(Error::SpecAssert("block production is electra and later")),
+        BeaconState::Phase0(_)
+        | BeaconState::Altair(_)
+        | BeaconState::Bellatrix(_)
+        | BeaconState::Capella(_)
+        | BeaconState::Deneb(_) => {
+            return Err(Error::SpecAssert("block production is electra and later"));
+        }
+        BeaconState::Gloas(_) => {
+            return Err(Error::SpecAssert("block production does not support gloas"));
+        }
+        BeaconState::Lean(_) => lean_state_unreachable("assemble_block"),
     };
     let mut post = state.clone();
     stf::block::process_block(
@@ -343,7 +591,13 @@ pub fn assemble_block(
         config,
         &ExecutionEngine::valid(),
         &CommitteeCache::default(),
+        &ActiveBalanceCache::default(),
+        options,
     )?;
+    // Fold the block's writes into their trees first, so the root is computed
+    // on (and cached in) the state's own nodes rather than a throwaway copy,
+    // as `state_transition` does before it checks a block's state root.
+    post.apply_pending_mutations();
     block.state_root = post.hash_tree_root();
     Ok(block)
 }
@@ -354,9 +608,13 @@ mod tests {
     use crate::beacon::ForkName;
     use crate::beacon::helpers::accessors::{get_beacon_committee, get_domain};
     use crate::beacon::helpers::fulu::initialize_proposer_lookahead;
+    use crate::beacon::helpers::misc::compute_domain;
     use crate::beacon::helpers::misc::compute_signing_root;
     use crate::beacon::helpers::test_state::{sign_for, with_signing_validators_at};
-    use ethlambda_types::beacon::containers::shared::{AttestationData, Checkpoint};
+    use crate::beacon::stf::block::{BlockProcessingOptions, RandaoVerification};
+    use ethlambda_types::beacon::containers::shared::{
+        AttestationData, BeaconBlockHeader, Checkpoint, SignedBeaconBlockHeader, VoluntaryExit,
+    };
 
     /// A fulu state one epoch in, its lookahead and sync committee filled from
     /// its real registry (the builder leaves both as placeholders), advanced one
@@ -408,14 +666,22 @@ mod tests {
     fn an_assembled_block_passes_process_block_and_names_its_post_state() {
         let state = state_to_build_on();
         let inputs = BlockInputs {
+            sync_aggregate: empty_sync_aggregate(),
             randao_reveal: randao_reveal(&state),
             graffiti: Bytes32::repeat_byte(7),
             attestations: Vec::new(),
+            operations: Operations::default(),
             execution_payload: payload_for(&state),
             blob_kzg_commitments: Vec::new(),
             execution_requests: ExecutionRequests::default(),
         };
-        let block = assemble_block(&state, inputs, &Config::mainnet()).unwrap();
+        let block = assemble_block(
+            &state,
+            inputs,
+            &Config::mainnet(),
+            BlockProcessingOptions::default(),
+        )
+        .unwrap();
 
         assert_eq!(block.slot, state.slot());
         assert_eq!(
@@ -435,6 +701,72 @@ mod tests {
             &Config::mainnet(),
             &ExecutionEngine::valid(),
             &CommitteeCache::default(),
+            &ActiveBalanceCache::default(),
+            BlockProcessingOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(block.state_root, post.hash_tree_root());
+    }
+
+    fn skip_randao() -> BlockProcessingOptions {
+        BlockProcessingOptions {
+            randao: RandaoVerification::Skip,
+        }
+    }
+
+    fn inputs_with_infinity_reveal(state: &BeaconState) -> BlockInputs {
+        BlockInputs {
+            randao_reveal: BlsSignature(bls::G2_POINT_AT_INFINITY),
+            graffiti: Bytes32::ZERO,
+            attestations: Vec::new(),
+            operations: Operations::default(),
+            execution_payload: payload_for(state),
+            blob_kzg_commitments: Vec::new(),
+            execution_requests: ExecutionRequests::default(),
+            sync_aggregate: empty_sync_aggregate(),
+        }
+    }
+
+    #[test]
+    fn a_block_with_the_infinity_reveal_is_produced_only_when_randao_is_skipped() {
+        let state = state_to_build_on();
+        let config = Config::mainnet();
+        assert!(
+            assemble_block(
+                &state,
+                inputs_with_infinity_reveal(&state),
+                &config,
+                BlockProcessingOptions::default(),
+            )
+            .is_err()
+        );
+
+        let block = assemble_block(
+            &state,
+            inputs_with_infinity_reveal(&state),
+            &config,
+            skip_randao(),
+        )
+        .unwrap();
+        assert_eq!(
+            block.body.randao_reveal,
+            BlsSignature(bls::G2_POINT_AT_INFINITY)
+        );
+
+        // Importing it with the same option lands on the state root it names.
+        let mut post = state.clone();
+        let signed = SignedBeaconBlock::Fulu(electra::SignedBeaconBlock {
+            message: block.clone(),
+            signature: BlsSignature::default(),
+        });
+        stf::block::process_block(
+            &mut post,
+            &signed,
+            &config,
+            &ExecutionEngine::valid(),
+            &CommitteeCache::default(),
+            &ActiveBalanceCache::default(),
+            skip_randao(),
         )
         .unwrap();
         assert_eq!(block.state_root, post.hash_tree_root());
@@ -446,14 +778,24 @@ mod tests {
         let mut payload = payload_for(&state);
         payload.parent_hash = ExecutionBlockHash::repeat_byte(9);
         let inputs = BlockInputs {
+            sync_aggregate: empty_sync_aggregate(),
             randao_reveal: randao_reveal(&state),
             graffiti: Bytes32::ZERO,
             attestations: Vec::new(),
+            operations: Operations::default(),
             execution_payload: payload,
             blob_kzg_commitments: Vec::new(),
             execution_requests: ExecutionRequests::default(),
         };
-        assert!(assemble_block(&state, inputs, &Config::mainnet()).is_err());
+        assert!(
+            assemble_block(
+                &state,
+                inputs,
+                &Config::mainnet(),
+                BlockProcessingOptions::default(),
+            )
+            .is_err()
+        );
     }
 
     /// An attestation at `slot` voting for this state's own chain: sourced from
@@ -629,6 +971,285 @@ mod tests {
         // Empty data, and an unknown type.
         assert!(parse_execution_requests(&[vec![constants::DEPOSIT_REQUEST_TYPE]]).is_err());
         assert!(parse_execution_requests(&[vec![0x7f, 0]]).is_err());
+    }
+
+    /// A config under which a validator active since genesis may exit at once.
+    fn config_allowing_young_exits() -> Config {
+        let mut config = Config::mainnet();
+        config.shard_committee_period = 0;
+        config
+    }
+
+    fn signed_exit(state: &BeaconState, index: u64, sign: bool) -> SignedVoluntaryExit {
+        let message = VoluntaryExit {
+            epoch: 0,
+            validator_index: index,
+        };
+        let domain = compute_domain(
+            constants::DOMAIN_VOLUNTARY_EXIT,
+            Config::mainnet().capella_fork_version,
+            state.genesis_validators_root(),
+        );
+        let signing_root = compute_signing_root(message.hash_tree_root(), domain);
+        SignedVoluntaryExit {
+            message,
+            signature: if sign {
+                sign_for(index as usize, signing_root)
+            } else {
+                BlsSignature::default()
+            },
+        }
+    }
+
+    fn proposer_slashing(state: &BeaconState, index: u64) -> ProposerSlashing {
+        let sign_header = |state_root: u8| {
+            let message = BeaconBlockHeader {
+                slot: state.slot(),
+                proposer_index: index,
+                state_root: Root::repeat_byte(state_root),
+                ..Default::default()
+            };
+            let domain = get_domain(
+                state,
+                constants::DOMAIN_BEACON_PROPOSER,
+                Some(compute_epoch_at_slot(message.slot)),
+            );
+            let signing_root = compute_signing_root(message.hash_tree_root(), domain);
+            SignedBeaconBlockHeader {
+                message,
+                signature: sign_for(index as usize, signing_root),
+            }
+        };
+        ProposerSlashing {
+            signed_header_1: sign_header(1),
+            signed_header_2: sign_header(2),
+        }
+    }
+
+    /// A double vote by `indices`: two attestations with the same target epoch
+    /// and different data, each signed by all of them.
+    fn attester_slashing(state: &BeaconState, indices: &[u64]) -> electra::AttesterSlashing {
+        let indexed = |beacon_block_root: u8| {
+            let data = AttestationData {
+                beacon_block_root: Root::repeat_byte(beacon_block_root),
+                ..attestation_data(state, state.slot() - 1)
+            };
+            let domain = get_domain(
+                state,
+                constants::DOMAIN_BEACON_ATTESTER,
+                Some(data.target.epoch),
+            );
+            let signing_root = compute_signing_root(data.hash_tree_root(), domain);
+            let signatures: Vec<_> = indices
+                .iter()
+                .map(|&index| sign_for(index as usize, signing_root))
+                .collect();
+            electra::IndexedAttestation {
+                attesting_indices: indices.to_vec().try_into().unwrap(),
+                data,
+                signature: bls::aggregate(&signatures).unwrap(),
+            }
+        };
+        electra::AttesterSlashing {
+            attestation_1: indexed(1),
+            attestation_2: indexed(2),
+        }
+    }
+
+    fn slashed_indices(slashing: &electra::AttesterSlashing) -> Vec<u64> {
+        slashing
+            .attestation_1
+            .attesting_indices
+            .iter()
+            .copied()
+            .filter(|index| slashing.attestation_2.attesting_indices.contains(index))
+            .collect()
+    }
+
+    #[test]
+    fn an_exit_by_a_validator_slashed_in_the_same_block_is_dropped() {
+        let state = state_to_build_on();
+        let config = config_allowing_young_exits();
+        let candidates = Operations {
+            proposer_slashings: vec![proposer_slashing(&state, 5)],
+            voluntary_exits: vec![signed_exit(&state, 5, true)],
+            ..Default::default()
+        };
+        let packed = pack_operations(&state, candidates, &config);
+        assert_eq!(packed.proposer_slashings.len(), 1);
+        assert!(packed.voluntary_exits.is_empty());
+    }
+
+    #[test]
+    fn the_attester_slashing_that_slashes_the_most_validators_is_packed() {
+        let state = state_to_build_on();
+        let candidates = Operations {
+            attester_slashings: vec![
+                attester_slashing(&state, &[3]),
+                attester_slashing(&state, &[1, 2]),
+            ],
+            ..Default::default()
+        };
+        let packed = pack_operations(&state, candidates, &Config::mainnet());
+        assert_eq!(packed.attester_slashings.len(), 1);
+        assert_eq!(slashed_indices(&packed.attester_slashings[0]), vec![1, 2]);
+    }
+
+    #[test]
+    fn attester_slashings_are_ranked_after_the_proposer_slashings() {
+        let state = state_to_build_on();
+        let candidates = Operations {
+            proposer_slashings: vec![proposer_slashing(&state, 1), proposer_slashing(&state, 2)],
+            attester_slashings: vec![
+                attester_slashing(&state, &[1, 2, 3]),
+                attester_slashing(&state, &[4, 5]),
+            ],
+            ..Default::default()
+        };
+        let packed = pack_operations(&state, candidates, &Config::mainnet());
+        assert_eq!(packed.proposer_slashings.len(), 2);
+        assert_eq!(packed.attester_slashings.len(), 1);
+        assert_eq!(slashed_indices(&packed.attester_slashings[0]), vec![4, 5]);
+    }
+
+    #[test]
+    fn exits_are_capped_at_max_voluntary_exits() {
+        let state = state_to_build_on();
+        let exits = (0..=preset::MAX_VOLUNTARY_EXITS as u64)
+            .map(|index| signed_exit(&state, index, true))
+            .collect();
+        let candidates = Operations {
+            voluntary_exits: exits,
+            ..Default::default()
+        };
+        let packed = pack_operations(&state, candidates, &config_allowing_young_exits());
+        assert_eq!(packed.voluntary_exits.len(), preset::MAX_VOLUNTARY_EXITS);
+    }
+
+    #[test]
+    fn an_invalid_candidate_is_skipped_not_fatal() {
+        let state = state_to_build_on();
+        let candidates = Operations {
+            voluntary_exits: vec![signed_exit(&state, 1, false), signed_exit(&state, 2, true)],
+            ..Default::default()
+        };
+        let packed = pack_operations(&state, candidates, &config_allowing_young_exits());
+        assert_eq!(packed.voluntary_exits.len(), 1);
+        assert_eq!(packed.voluntary_exits[0].message.validator_index, 2);
+    }
+
+    #[test]
+    fn assemble_block_carries_packed_operations() {
+        let state = state_to_build_on();
+        let config = config_allowing_young_exits();
+        let operations = pack_operations(
+            &state,
+            Operations {
+                voluntary_exits: vec![signed_exit(&state, 4, true)],
+                ..Default::default()
+            },
+            &config,
+        );
+        assert!(!operations.is_empty());
+        let inputs = BlockInputs {
+            randao_reveal: randao_reveal(&state),
+            graffiti: Bytes32::ZERO,
+            attestations: Vec::new(),
+            operations,
+            execution_payload: payload_for(&state),
+            blob_kzg_commitments: Vec::new(),
+            execution_requests: ExecutionRequests::default(),
+            sync_aggregate: empty_sync_aggregate(),
+        };
+        let block =
+            assemble_block(&state, inputs, &config, BlockProcessingOptions::default()).unwrap();
+        assert_eq!(block.body.voluntary_exits.len(), 1);
+        assert_eq!(block.body.voluntary_exits[0].message.validator_index, 4);
+    }
+
+    /// A pool holding messages from `positions` of the committee, signed the way
+    /// `process_sync_aggregate` will check them (over the block root at
+    /// `state.slot - 1`, under the state's own domain), plus that root.
+    fn pooled_aggregate(
+        state: &BeaconState,
+        signed_root: Option<Root>,
+        positions: &[usize],
+    ) -> (SyncAggregate, Root) {
+        use crate::beacon::sync_committee_pool::SyncCommitteePool;
+        use ethlambda_types::beacon::containers::altair::{
+            SYNC_SUBCOMMITTEE_SIZE, SyncCommitteeMessage,
+        };
+
+        let previous_slot = state.slot() - 1;
+        let parent_root = get_block_root_at_slot(state, previous_slot).unwrap();
+        let root = signed_root.unwrap_or(parent_root);
+        let domain = get_domain(
+            state,
+            constants::DOMAIN_SYNC_COMMITTEE,
+            Some(compute_epoch_at_slot(previous_slot)),
+        );
+        let signing_root = compute_signing_root(root, domain);
+        let (committee, _) = state.sync_committees().unwrap();
+        let mut pool = SyncCommitteePool::default();
+        for &position in positions {
+            let pubkey = committee.pubkeys[position];
+            let index = (0..64)
+                .find(|&index| state.validator(index).unwrap().pubkey == pubkey)
+                .expect("the committee is drawn from the registry");
+            let message = SyncCommitteeMessage {
+                slot: previous_slot,
+                beacon_block_root: parent_root,
+                validator_index: index,
+                signature: sign_for(index as usize, signing_root),
+            };
+            let seats = [(
+                (position / SYNC_SUBCOMMITTEE_SIZE) as u64,
+                position % SYNC_SUBCOMMITTEE_SIZE,
+            )];
+            pool.insert_message(&message, &seats);
+        }
+        (
+            pool.sync_aggregate(previous_slot, parent_root)
+                .expect("something was pooled"),
+            parent_root,
+        )
+    }
+
+    #[test]
+    fn a_pooled_sync_aggregate_passes_assemble_block() {
+        let state = state_to_build_on();
+        let (candidate, _) = pooled_aggregate(&state, None, &[0, 1, 5]);
+        let verified = verified_sync_aggregate(&state, candidate.clone());
+        assert_eq!(verified, candidate);
+        assert!(verified.sync_committee_bits.count_ones() >= 3);
+        let inputs = BlockInputs {
+            randao_reveal: randao_reveal(&state),
+            graffiti: Bytes32::repeat_byte(7),
+            attestations: Vec::new(),
+            operations: Operations::default(),
+            execution_payload: payload_for(&state),
+            blob_kzg_commitments: Vec::new(),
+            execution_requests: ExecutionRequests::default(),
+            sync_aggregate: verified.clone(),
+        };
+        let block = assemble_block(
+            &state,
+            inputs,
+            &Config::mainnet(),
+            BlockProcessingOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(block.body.sync_aggregate, verified);
+    }
+
+    #[test]
+    fn a_sync_aggregate_over_the_wrong_root_is_replaced_by_the_empty_one() {
+        let state = state_to_build_on();
+        let (wrong, _) = pooled_aggregate(&state, Some(Root::repeat_byte(1)), &[0, 1]);
+        assert_eq!(
+            verified_sync_aggregate(&state, wrong),
+            empty_sync_aggregate()
+        );
     }
 
     #[test]

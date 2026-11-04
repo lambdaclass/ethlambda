@@ -30,7 +30,20 @@
 use crate::beacon::constants;
 use crate::beacon::containers::shared::Validator;
 use crate::beacon::preset;
-use crate::beacon::primitives::{Epoch, Gwei};
+use crate::beacon::primitives::{Epoch, ExecutionAddress, Gwei};
+
+/// The execution address a validator's payout is sent to: the low bytes of
+/// its withdrawal credentials, present regardless of whether those
+/// credentials are eth1 or (from electra on) compounding, both of which are
+/// execution-form.
+///
+/// `pub(crate)`, not private: capella's, electra's, and gloas's own
+/// withdrawal sweeps (`crate::beacon::stf::capella`, `crate::beacon::stf::electra`,
+/// `crate::beacon::stf::gloas`) all read a withdrawable validator's payout
+/// address the same way, so this is the one copy rather than three.
+pub(crate) fn withdrawal_address(validator: &Validator) -> ExecutionAddress {
+    ExecutionAddress::from_slice(&validator.withdrawal_credentials.0[12..])
+}
 
 /// Whether `validator`'s withdrawal credentials have been upgraded to an
 /// execution address.
