@@ -25,9 +25,22 @@ spawned-concurrency.workspace = true
 futures = "0.3"
 tokio-stream = "0.1"
 
-# Fork with request-response feature for outbound protocol selection
+# Fork with request-response feature for outbound protocol selection.
+# Only the transports, muxers and behaviours the swarm is built from: `full`
+# would also pull dns, mdns, websocket, relay, kad and the rest, each with
+# its own dependency tree (hickory-dns among them) that nothing here uses.
 libp2p = { git = "https://github.com/lambdaclass/rust-libp2p.git", rev = "2f14d0ec9665a01cfb6a02326c90628c4bba521c", features = [
-    "full",
+    "ed25519",
+    "gossipsub",
+    "identify",
+    "macros",
+    "noise",
+    "quic",
+    "request-response",
+    "secp256k1",
+    "tcp",
+    "tokio",
+    "yamux",
 ] }
 
 # Mainnet beacon peers refuse a yamux-only muxer proposal, so the TCP transport
