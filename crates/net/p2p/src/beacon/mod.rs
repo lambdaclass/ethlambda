@@ -32,6 +32,7 @@ pub mod verdict;
 
 use std::collections::BTreeMap;
 
+use ethlambda_network_api::MetaDataController;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{Epoch, ForkDigest, Root, Slot};
@@ -69,8 +70,9 @@ pub struct BeaconWire {
     /// epoch, so serving history means computing digests this node never runs
     /// on. See [`encoding`]'s module docs for the rule.
     pub genesis_validators_root: Root,
-    /// Advertised in `Ping` responses and in `MetaData`. Bumped when the
-    /// digest switches, the one advertised value that changes at runtime.
+    /// Advertised in `Ping` responses and in `MetaData`. Bumped through
+    /// [`Self::bump_metadata_seq_number`] when the digest switches and when
+    /// `syncnets` changes.
     pub metadata_seq_number: u64,
     /// The columns this node custodies, carried alongside `topics` so the
     /// gossip handler and the request handlers can check what this node
@@ -88,9 +90,27 @@ pub struct BeaconWire {
     /// `build_metadata` derives `syncnets` from its keys. Never in the ENR,
     /// which cannot be replaced at runtime.
     pub sync_committee_subnets: BTreeMap<u64, Epoch>,
+    /// The `MetaData` above as the Beacon API's `/eth/v1/node/identity` reads
+    /// it, republished by [`Self::bump_metadata_seq_number`].
+    pub metadata: MetaDataController,
 }
 
 impl BeaconWire {
+    /// Bump `metadata_seq_number` after a change to what `MetaData`
+    /// advertises, and republish it for the Beacon API.
+    ///
+    /// The one way the sequence number moves, so the copy the Beacon API
+    /// reports cannot fall behind what peers are told.
+    pub fn bump_metadata_seq_number(&mut self) {
+        self.metadata_seq_number += 1;
+        self.publish_metadata();
+    }
+
+    /// Publish the current `MetaData` to [`Self::metadata`]'s readers.
+    pub fn publish_metadata(&self) {
+        self.metadata.set(handler::advertised_metadata(self));
+    }
+
     /// Every topic set this node is subscribed to: the current digest's, then
     /// the window's.
     pub fn held_topics(&self) -> impl Iterator<Item = &topics::BeaconTopics> {
