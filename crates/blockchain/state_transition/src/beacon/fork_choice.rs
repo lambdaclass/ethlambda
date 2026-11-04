@@ -2331,13 +2331,7 @@ pub fn compute_node_weights(
     // reads the store's own scratch may run inside the closure: see
     // `for_each_non_equivocating_latest_message` for why asking it per voter
     // from in here would deadlock, and a payload link is such a read.
-    //
-    // One hash per validator into a map of a few dozen keys, so the hasher is
-    // the cost. foldhash's `RandomState` is seeded per process, so a peer
-    // cannot precompute vote keys that collide; the sums are saturating adds,
-    // so the order the map is drained in below does not matter.
-    let mut votes: HashMap<(Root, Slot, bool), Gwei, foldhash::fast::RandomState> =
-        HashMap::default();
+    let mut votes: HashMap<(Root, Slot, bool), Gwei> = HashMap::new();
     store.for_each_non_equivocating_latest_message(|validator_index, message| {
         // An index past the snapshot is a validator that did not exist at the
         // justified checkpoint, and an inactive or slashed one is zero in it:
@@ -11393,48 +11387,6 @@ mod tests {
                 resumed.hash_tree_root(),
                 inline.hash_tree_root(),
                 "slot {slot}"
-            );
-        }
-    }
-
-    /// Prints the time to tally a mainnet-sized vote set (one hash per
-    /// validator, few distinct keys) under std's hasher and under the one
-    /// `compute_node_weights` uses. Run with `--ignored --nocapture`.
-    #[test]
-    #[ignore = "benchmark: prints timings"]
-    fn bench_vote_tally_hashers() {
-        use std::hash::BuildHasher;
-        use std::hint::black_box;
-        use std::time::Instant;
-
-        const VOTES: usize = 1_000_000;
-        const KEYS: usize = 64;
-        let keys: Vec<(Root, Slot, bool)> = (0..KEYS)
-            .map(|i| (Root::repeat_byte(i as u8), 1000 + i as u64, i % 2 == 0))
-            .collect();
-
-        fn tally<S: BuildHasher + Default>(keys: &[(Root, Slot, bool)]) -> usize {
-            let mut votes: HashMap<(Root, Slot, bool), Gwei, S> = HashMap::default();
-            for i in 0..VOTES {
-                let entry = votes.entry(keys[(i * 7) % KEYS]).or_default();
-                *entry = entry.saturating_add(32);
-            }
-            votes.len()
-        }
-
-        for _ in 0..6 {
-            let start = Instant::now();
-            let std_len = black_box(tally::<std::collections::hash_map::RandomState>(black_box(
-                &keys,
-            )));
-            let std_time = start.elapsed();
-            let start = Instant::now();
-            let fast_len = black_box(tally::<foldhash::fast::RandomState>(black_box(&keys)));
-            let fast_time = start.elapsed();
-            assert_eq!(std_len, fast_len);
-            println!(
-                "{VOTES} votes over {KEYS} keys: std {std_time:?}, foldhash {fast_time:?}, ratio {:.1}",
-                std_time.as_secs_f64() / fast_time.as_secs_f64()
             );
         }
     }
