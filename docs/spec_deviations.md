@@ -564,14 +564,15 @@ running follower does not wait for the answer at all
   choice. It already is, so it stays, optimistic, and is asked again once a
   slot. Taking it back out would need an un-import that re-holds its
   descendants, for a state the next answer resolves anyway.
-- `forkchoiceUpdated` never names a payload whose request is still queued or in
-  flight, and a payload is sent only once the one it builds on has been
-  answered, at most four at once: the Engine API orders only
-  `forkchoiceUpdated`, and a payload the execution client receives before its
-  parent is answered `SYNCING` and may start a sync from peers.
-- At most 128 payloads wait for an answer; past that the import waits (a
-  pre-gloas block is held, an envelope waits in `awaiting_engine`). Only
-  catch-up reaches it.
+- A payload is sent only once the one it builds on has been answered, at most
+  `MAX_NEW_PAYLOADS_IN_FLIGHT` at once, and `forkchoiceUpdated` names the newest
+  payload on the head's chain whose request is not queued or in flight: the
+  Engine API orders only `forkchoiceUpdated`, and a payload the execution client
+  receives before its parent is answered `SYNCING` and may start a sync from
+  peers.
+- At most `MAX_PAYLOADS_AWAITING_VERDICT` payloads wait for an answer; past that
+  the import waits (a pre-gloas block is held, an envelope waits in
+  `awaiting_engine`). Only catch-up reaches it.
 - A block that is not an optimistic candidate (around the merge transition)
   still waits for its answer inline, as does a server with no mailbox
   (offline replay): those are the specification's order.

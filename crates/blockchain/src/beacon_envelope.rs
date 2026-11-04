@@ -3178,6 +3178,41 @@ mod tests {
         assert_eq!(count(&mock, "engine_newPayloadV5"), 1);
     }
 
+    /// The other order: the child arrives after the envelope is applied but
+    /// before its answer. `on_block` alone would take it then; it waits.
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn a_child_arriving_while_its_parent_payload_awaits_an_answer_is_held() {
+        let (client, _mock) =
+            mock_engine(status_json("VALID", None), status_json("SYNCING", None)).await;
+        let case = Case::new("on_execution_payload_envelope", FULL_CHILD_CASE);
+        let mut server = case.server(12);
+        server.engine = Some(client);
+        let mut answers = answer_later(&mut server);
+        server
+            .on_block(case.block(FULL_PARENT), ImportTimings::default())
+            .await;
+        fork_choice::on_tick(&mut server.store, 24, &fixture_config());
+        server
+            .receive_envelope(valid_envelope_for_full_parent(), 0)
+            .await;
+        server.settle_envelopes().await;
+        assert!(server.store.has_verified_payload(&root(FULL_PARENT)));
+
+        server
+            .on_block(case.block(FULL_CHILD), ImportTimings::default())
+            .await;
+        assert!(server.envelopes.is_block_held(&root(FULL_CHILD)));
+        assert!(!server.store.has_state(&root(FULL_CHILD)).unwrap());
+
+        let answered = answers.recv().await.expect("an answer");
+        server.on_new_payload_answered(answered).await;
+        assert!(server.store.has_state(&root(FULL_CHILD)).unwrap());
+    }
+
     #[tokio::test]
     #[cfg_attr(
         not(feature = "beacon-spec-tests"),

@@ -31,8 +31,10 @@
 //! payload it builds on is outstanding, and at most
 //! [`MAX_NEW_PAYLOADS_IN_FLIGHT`] at once: siblings and forks go in parallel, a
 //! linear chain goes one at a time. For the same reason `forkchoiceUpdated`
-//! never names a payload whose request is still queued or in flight (see
-//! [`NewPayloads::holds_back_head`]).
+//! never names a payload whose request is still queued or in flight: it names
+//! the newest one on the head's chain the client was asked about (see
+//! [`NewPayloads::forkchoice_head`]), and is sent again when the head's own
+//! answer arrives.
 //!
 //! # Children of a gloas payload
 //!
@@ -212,14 +214,29 @@ impl NewPayloads {
             .is_some_and(|ask| ask.question.kind() == PayloadKind::Envelope)
     }
 
-    /// Whether `forkchoiceUpdated` must not name the payload `block_hash` yet:
-    /// its own request is queued or in flight, so the execution client may not
-    /// have it. One whose request got no answer does not hold the head back: an
-    /// execution client that cannot be reached answers neither call.
-    pub(crate) fn holds_back_head(&self, block_hash: &H256) -> bool {
-        self.asks
-            .values()
-            .any(|ask| ask.block_hash == *block_hash && ask.state != AskState::Unanswered)
+    /// The payload `forkchoiceUpdated` may name as the head, given the head's
+    /// own payload `block_hash`: that one, unless its request is queued or in
+    /// flight, and then the nearest payload it builds on whose request is not.
+    ///
+    /// Walks each held-back payload's parent hash, which is the chain the
+    /// execution client validates along. During catch-up the newest block's
+    /// request always waits behind its parent's, so skipping the call instead
+    /// would leave the client without a head for the whole catch-up.
+    pub(crate) fn forkchoice_head(&self, block_hash: H256) -> H256 {
+        // One that got no answer does not hold the head back: an execution
+        // client that cannot be reached answers neither call.
+        let mut head = block_hash;
+        for _ in 0..=self.asks.len() {
+            let Some(ask) = self
+                .asks
+                .values()
+                .find(|ask| ask.block_hash == head && ask.state != AskState::Unanswered)
+            else {
+                break;
+            };
+            head = ask.parent_hash;
+        }
+        head
     }
 
     pub(crate) fn defer_forkchoice_updated(&mut self) {
@@ -449,7 +466,11 @@ impl BlockChainServer {
             PayloadAnswer::Envelope {
                 envelope_root,
                 result,
-            } if tracked => self.apply_envelope_answer(root, envelope_root, result),
+            } if tracked => {
+                if self.apply_envelope_answer(root, envelope_root, result) {
+                    self.forget_payloads_left_behind();
+                }
+            }
             PayloadAnswer::Block(_) => metrics::inc_new_payload_answer("block", "stale"),
             PayloadAnswer::Envelope { .. } => metrics::inc_new_payload_answer("envelope", "stale"),
         }
@@ -529,12 +550,13 @@ impl BlockChainServer {
     }
 
     /// Apply the answer for a gloas payload whose envelope is already applied.
+    /// `true` when payloads or blocks left fork choice.
     fn apply_envelope_answer(
         &mut self,
         root: H256,
         envelope_root: H256,
         result: Result<PayloadStatusV1, EngineError>,
-    ) {
+    ) -> bool {
         let status = match result {
             Ok(status) => status,
             Err(err) => {
@@ -547,24 +569,24 @@ impl BlockChainServer {
                 metrics::inc_engine_no_verdict();
                 metrics::inc_new_payload_answer("envelope", "no_answer");
                 self.new_payloads.mark_unanswered(&root);
-                return;
+                return false;
             }
         };
         self.new_payloads.complete(&root);
         // Taken back out, or condemned with an ancestor, since it was asked.
         if !self.store.has_verified_payload(&root) {
             metrics::inc_new_payload_answer("envelope", "stale");
-            return;
+            return false;
         }
         let Some((slot, _parent)) = self.store.block_entry(&root) else {
             metrics::inc_new_payload_answer("envelope", "stale");
-            return;
+            return false;
         };
 
         if refuses_only_this_envelope(&status) {
             metrics::inc_new_payload_answer("envelope", "reverted");
             self.revert_envelope(root, envelope_root);
-            return;
+            return false;
         }
         match beacon_engine::verdict(&status) {
             PayloadValidity::Validated | PayloadValidity::NotRequired => {
@@ -573,10 +595,12 @@ impl BlockChainServer {
                     .insert_beacon_block_payload_status(root, slot, PayloadStatusEnum::Valid);
                 crate::beacon_payloads::mark_payloads_validated(&mut self.store, root);
                 self.release_children_of_answered_payload(root);
+                false
             }
             PayloadValidity::Optimistic => {
                 metrics::inc_new_payload_answer("envelope", "optimistic");
                 self.release_children_of_answered_payload(root);
+                false
             }
             PayloadValidity::Invalidated { latest_valid_hash } => {
                 metrics::inc_new_payload_answer("envelope", "invalid");
@@ -585,10 +609,25 @@ impl BlockChainServer {
                     block_root = %ShortRoot(&root.0),
                     "Execution client found an envelope's payload invalid"
                 );
-                self.condemn_payload_chain(root, latest_valid_hash);
                 self.envelopes.head_dirty = true;
+                self.condemn_payload_chain(root, latest_valid_hash)
             }
         }
+    }
+
+    /// The block at or above `root` on its chain whose payload is
+    /// `block_hash`, for a `forkchoiceUpdated` that names an ancestor's payload
+    /// instead of the head's (see [`NewPayloads::forkchoice_head`]). Pre-gloas
+    /// only: a block's payload is its own there.
+    pub(crate) fn ancestor_with_payload(&self, root: H256, block_hash: H256) -> Option<H256> {
+        let mut current = root;
+        for _ in 0..=self.new_payloads.len() {
+            if self.store.beacon_el_block_hash(current) == Some(block_hash) {
+                return Some(current);
+            }
+            current = self.store.block_entry(&current)?.1;
+        }
+        None
     }
 
     /// Asks whose block or payload is gone after blocks left fork choice: a
@@ -800,11 +839,37 @@ mod tests {
         assert_eq!(sent(&mut payloads), None, "the parent is still unanswered");
         // An unreachable client answers no forkchoiceUpdated either, so the
         // unanswered payload does not hold the head back; the queued one does.
-        assert!(!payloads.holds_back_head(&hash(0xa1)));
-        assert!(payloads.holds_back_head(&hash(0xa2)));
+        assert_eq!(payloads.forkchoice_head(hash(0xa1)), hash(0xa1));
+        assert_eq!(payloads.forkchoice_head(hash(0xa2)), hash(0xa1));
 
         payloads.requeue_unanswered();
         assert_eq!(sent(&mut payloads), Some(hash(1)));
+    }
+
+    #[test]
+    fn forkchoice_updated_names_the_newest_payload_the_client_was_asked_about() {
+        let mut payloads = NewPayloads::default();
+        ask(&mut payloads, 1, 0xa1, 0xa0);
+        ask(&mut payloads, 2, 0xa2, 0xa1);
+        ask(&mut payloads, 3, 0xa3, 0xa2);
+
+        // Nothing answered yet: the chain falls back to the payload the first
+        // one builds on, which the client already has.
+        assert_eq!(payloads.forkchoice_head(hash(0xa3)), hash(0xa0));
+
+        assert_eq!(sent(&mut payloads), Some(hash(1)));
+        assert!(payloads.finish(&hash(1)));
+        payloads.complete(&hash(1));
+        assert_eq!(payloads.forkchoice_head(hash(0xa3)), hash(0xa1));
+
+        // An unanswered request does not hold the head back.
+        assert_eq!(sent(&mut payloads), Some(hash(2)));
+        assert!(payloads.finish(&hash(2)));
+        payloads.mark_unanswered(&hash(2));
+        assert_eq!(payloads.forkchoice_head(hash(0xa3)), hash(0xa2));
+
+        // A payload nobody is waiting on is named as it is.
+        assert_eq!(payloads.forkchoice_head(hash(0xff)), hash(0xff));
     }
 
     #[test]

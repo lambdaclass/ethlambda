@@ -88,9 +88,11 @@ Fork choice head update
 block (optimistic candidate) imports as optimistic and a gloas envelope applies
 as `NOT_VALIDATED` before the EL answers; `engine_newPayload` goes out first from
 a tokio task that reports back with a `NewPayloadAnswered` message, applied as
-`optimistic-sync.md` applies a verdict. Sent parent-before-child, at most 4 in
-flight; `forkchoiceUpdated` never names a payload whose request is queued or in
-flight; at most 128 payloads wait (past that the import is held). No answer:
+`optimistic-sync.md` applies a verdict. Sent parent-before-child, at most
+`MAX_NEW_PAYLOADS_IN_FLIGHT` in flight; `forkchoiceUpdated` names the newest
+payload on the head's chain whose request is not queued or in flight (so catch-up
+still feeds the EL a head); at most `MAX_PAYLOADS_AWAITING_VERDICT` wait (past
+that the import is held). No answer:
 kept optimistic, re-asked once a slot (a documented deviation). Without a
 mailbox (offline replay) and for non-candidates the import still waits inline.
 The actor records its own `ActorRef` in a `#[started]` hook for this.

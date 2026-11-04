@@ -2625,16 +2625,28 @@ impl BlockChainServer {
         // for a pre-gloas head, which keeps its own cached payload hash;
         // `None` there means a follower still on its checkpoint anchor.
         let plan = beacon_payloads::forkchoice_plan(&self.store, head_root)?;
-        let state = plan.state;
+        let mut state = plan.state;
         let gloas = plan.gloas;
 
         // A head whose own `newPayload` is still queued or in flight is one the
         // execution client may not have yet: named as the head, it is answered
         // `SYNCING` and may send the client syncing from its peers. The call
-        // waits for that answer instead (`beacon_new_payload`), which sends it.
-        if self.new_payloads.holds_back_head(&state.head_block_hash) {
+        // names the nearest payload on its chain the client has been asked
+        // about instead, and the answer that releases the head sends it again
+        // (`beacon_new_payload`). The verdict it brings back is then about
+        // that ancestor: a pre-gloas one is found by its payload hash, a gloas
+        // one is resolved from the hash by `apply_gloas_forkchoice_verdict`.
+        let mut verdict_root = head_root;
+        let named = self.new_payloads.forkchoice_head(state.head_block_hash);
+        if named != state.head_block_hash {
             self.new_payloads.defer_forkchoice_updated();
-            return None;
+            if named.is_zero() {
+                return None;
+            }
+            if !gloas {
+                verdict_root = self.ancestor_with_payload(head_root, named)?;
+            }
+            state.head_block_hash = named;
         }
 
         // `head_root` stays valid across the await: this is a single-threaded
@@ -2656,7 +2668,7 @@ impl BlockChainServer {
         };
         match response {
             Ok(status) => {
-                self.apply_forkchoice_verdict(head_root, state.head_block_hash, gloas, &status)
+                self.apply_forkchoice_verdict(verdict_root, state.head_block_hash, gloas, &status)
             }
             Err(err) => warn!(%err, "forkchoiceUpdated failed"),
         }

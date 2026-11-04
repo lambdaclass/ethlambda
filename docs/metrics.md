@@ -559,6 +559,26 @@ block raced it, see `lean_beacon_epoch_precompute_seconds` against the slot
 duration), the node was syncing, or the entry was evicted from the state cache.
 A `timer` start with no matching `head` start means the last slot was skipped.
 
+### Beacon Execution Payload Verdicts
+
+A beacon block (before gloas) or envelope (from it) is imported before the
+execution client answers `engine_newPayload`, and the answer is applied when it
+arrives. See "Asking without waiting" in [`beacon_engine.md`](beacon_engine.md).
+This is ethlambda-specific, not part of the leanMetrics spec.
+
+| Name | Type | Usage | Sample collection event | Labels | Buckets |
+|------|------|-------|-------------------------|--------|---------|
+| `lean_engine_new_payload_in_flight` | Gauge | `engine_newPayload` requests sent and not yet answered | On every send, answer and per-slot redrive | | |
+| `lean_engine_payloads_awaiting_verdict` | Gauge | Imported payloads with no answer yet, in flight or queued | On every send, answer and per-slot redrive | | |
+| `lean_engine_new_payload_answers_total` | Counter | Answers by what was asked about and how it was answered | When an answer is applied | kind=block,envelope; outcome=valid,optimistic,invalid,reverted,no_answer,stale | |
+| `lean_engine_no_verdict_total` | Counter | Requests that got no answer after the whole retry ladder (the payload stays, and is asked again next slot) | When the ladder is exhausted | | |
+
+**Read the waiting gauge against `MAX_PAYLOADS_AWAITING_VERDICT`.** At the cap,
+imports are held for room: expected during catch-up, a sign of a slow or stuck
+execution client otherwise. `outcome=stale` is an answer for a payload that left
+fork choice (or was finalized) while its request was out, and `reverted` an
+envelope taken back out because its contents do not hash to its block hash.
+
 ### Beacon Pubkey Cache
 
 Every BLS signature check `ethlambda beacon` runs (block import, fork choice,
