@@ -2425,6 +2425,18 @@ impl Store {
         batch.commit().expect("commit");
     }
 
+    /// Whether `root`, a block at `slot`, has a live-chain row: whether it is
+    /// in fork choice. One point read, where [`block_index`](Self::block_index)
+    /// scans the whole table. A block removed by
+    /// [`delete_live_chain_entries`](Self::delete_live_chain_entries) answers
+    /// `false` while its block and state rows remain.
+    pub fn has_live_chain_entry(&self, slot: u64, root: &H256) -> bool {
+        let view = self.backend.begin_read().expect("read view");
+        view.get(Table::LiveChain, &encode_slot_root_key(slot, root))
+            .expect("get")
+            .is_some()
+    }
+
     /// Deletes the named live-chain index rows.
     ///
     /// Unlike [`prune_live_chain`](Self::prune_live_chain), which drops a whole
@@ -4457,6 +4469,18 @@ impl Store {
             .insert(root, (slot, status));
     }
 
+    /// Forgets `root`'s payload verdict, for an envelope taken back out of the
+    /// store before its payload was judged (see
+    /// [`Self::remove_verified_payload`]): the payload is unknown again, not
+    /// invalid, so a later envelope for the same block can still be applied.
+    pub fn remove_beacon_block_payload_status(&mut self, root: H256) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .block_payload_statuses
+            .remove(&root);
+    }
+
     /// Drops payload verdicts strictly below `finalized_slot`, which no
     /// attestation rule can ask about any more.
     pub fn prune_beacon_block_payload_statuses(&mut self, finalized_slot: u64) {
@@ -4573,6 +4597,13 @@ impl Store {
             .entry(root)
             .and_modify(|(_, held)| *held = (*held).min(seen_ms))
             .or_insert((slot, seen_ms));
+    }
+
+    /// Forgets when `root`'s envelope arrived, for an envelope taken back out
+    /// of the store: a refused envelope says nothing about whether the
+    /// payload was revealed on time.
+    pub fn remove_beacon_envelope_seen(&mut self, root: &H256) {
+        self.beacon.lock().unwrap().envelope_seen_ms.remove(root);
     }
 
     /// When `root`'s envelope reached this node, in milliseconds past genesis,
