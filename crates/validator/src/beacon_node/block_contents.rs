@@ -390,6 +390,33 @@ impl ProducedBlock {
         }
     }
 
+    /// The block's header: the block with its body replaced by the body's
+    /// root. It merkleizes to [`Self::block_root`], which is what lets the
+    /// signing path take the header (a remote signer reads it) and sign the
+    /// block's root all the same.
+    pub fn header(&self) -> ethlambda_types::beacon::containers::shared::BeaconBlockHeader {
+        use ethlambda_types::beacon::containers::shared::BeaconBlockHeader;
+        use ethlambda_types::beacon::primitives::HashTreeRoot as _;
+        match &self.contents {
+            Contents::WithBlobProofs { block, .. } | Contents::WithCellProofs { block, .. } => {
+                BeaconBlockHeader {
+                    slot: block.slot,
+                    proposer_index: block.proposer_index,
+                    parent_root: block.parent_root,
+                    state_root: block.state_root,
+                    body_root: block.body.hash_tree_root(),
+                }
+            }
+            Contents::Gloas { block, .. } => BeaconBlockHeader {
+                slot: block.slot,
+                proposer_index: block.proposer_index,
+                parent_root: block.parent_root,
+                state_root: block.state_root,
+                body_root: block.body.hash_tree_root(),
+            },
+        }
+    }
+
     /// Where the block pays its execution-layer rewards: the payload's fee
     /// recipient before gloas, the bid's from it on.
     pub fn fee_recipient(&self) -> ethlambda_types::beacon::primitives::ExecutionAddress {

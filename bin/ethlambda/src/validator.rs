@@ -78,6 +78,15 @@ pub(crate) struct ValidatorOptions {
     /// beyond localhost must front it with TLS.
     #[arg(long, default_value = "false")]
     pub(crate) enable_keymanager: bool,
+
+    /// Base URL of a Web3Signer remote signer (e.g. https://signer:9000),
+    /// the default for remote keys imported through the keymanager API's
+    /// `POST /eth/v1/remotekeys` without a `url` of their own.
+    ///
+    /// Optional: a remote key may name its own signer in that request or in
+    /// `validator_definitions.yml`, and local keystores never need one.
+    #[arg(long)]
+    pub(crate) web3signer_url: Option<String>,
 }
 
 impl ValidatorOptions {
@@ -154,6 +163,7 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
         keymanager: options
             .enable_keymanager
             .then(|| std::net::SocketAddr::new(options.http_address, options.keymanager_port)),
+        web3signer_url: options.web3signer_url,
     })
     .await
     .map_err(Into::into)
@@ -174,6 +184,7 @@ mod tests {
             graffiti: graffiti.to_string(),
             suggested_fee_recipient: None,
             enable_keymanager: false,
+            web3signer_url: None,
         }
     }
 

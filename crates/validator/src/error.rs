@@ -95,12 +95,14 @@ pub enum Error {
 
     #[error("no signing key for validator {0:?}")]
     UnknownValidator(BlsPubkey),
-    /// Not constructed today: the only `SigningMethod` is `LocalKeystore`,
-    /// whose signing call cannot fail once a key has been resolved. Kept for
-    /// the remote-signer variant `keys::store`'s module doc already commits
-    /// to supporting, whose call to an external signer can fail in ways a
-    /// local scalar multiplication cannot; remove this only if that plan is
-    /// dropped.
+    /// A remote signer did not produce the signature: it refused the message
+    /// (its slashing protection), does not hold the key, answered badly, or
+    /// could not be reached. A local key cannot raise this; its signing call
+    /// cannot fail once the key has been resolved.
+    ///
+    /// Not retryable: it costs one signature, the duty that needed it logs
+    /// and counts it, and none of its causes is something trying again
+    /// within the slot would change.
     #[error("signing failed for {pubkey:?}: {reason}")]
     Signing { pubkey: BlsPubkey, reason: String },
 

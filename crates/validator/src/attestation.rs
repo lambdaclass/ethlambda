@@ -48,8 +48,8 @@ pub struct AttestationService<B> {
     /// A `std::sync::Mutex` rather than a `tokio` one on purpose: the critical
     /// section is a hash lookup and an insert with no `.await` inside it, so an
     /// async mutex would buy nothing and cost a scheduling point. The guard is
-    /// taken and dropped per validator inside the signing loop, which already
-    /// holds the store's read lock, so it must not be the thing that blocks.
+    /// taken and dropped per validator before the signatures are requested,
+    /// so it is never held across one.
     ///
     /// Not slashing protection. See [`AttestationGuard`] for exactly what it
     /// does and does not cover.
@@ -142,76 +142,89 @@ impl<B: BeaconNodeApi> AttestationService<B> {
 
         let data_dto = AttestationDataOutDto::from(&data);
 
-        // The read guard is scoped to this block alone and must never be widened to cover an
-        // await. `tokio::sync::RwLock` is write-preferring, so a keymanager
-        // import or delete queuing for the write lock blocks every read behind
-        // it; keeping this guard narrow bounds how long that wait can be. The
-        // import holds its own write lock for the inserts alone, doing the slow
-        // EIP-2335 derivation outside it (see `http_api::keystores::import`),
-        // so this is the duty path keeping its half of the same bargain.
-        let mut attestations = Vec::with_capacity(duties.len());
-        {
-            let _timing = crate::metrics::time_signing();
-            let store = store.read().await;
-            for duty in duties {
-                let pubkey = match parse_pubkey(&duty.pubkey) {
-                    Ok(pubkey) => pubkey,
-                    Err(err) => {
-                        error!(%slot, validator = duty.validator_index, %err, "Duty carried an unreadable pubkey");
-                        continue;
-                    }
-                };
+        // Every duty is run through the guard before anything is signed, and
+        // the ones it lets through are signed together below.
+        let mut to_sign = Vec::with_capacity(duties.len());
+        for duty in duties {
+            let pubkey = match parse_pubkey(&duty.pubkey) {
+                Ok(pubkey) => pubkey,
+                Err(err) => {
+                    error!(%slot, validator = duty.validator_index, %err, "Duty carried an unreadable pubkey");
+                    continue;
+                }
+            };
 
-                // Refuse before signing, not after: a signature that exists is
-                // a signature that can escape, whatever the code after it
-                // intended. This closes the double-vote shapes reachable
-                // within one run (a backward clock step, a schedule replaced
-                // mid-epoch); it is not slashing protection and does not
-                // pretend to be. See `AttestationGuard`.
-                //
-                // Held per validator, and dropped before the next iteration.
-                // The lock is poisoned only by a panic while it is held, and
-                // nothing inside can panic; `unwrap` on it would still be a
-                // crash in the duty path, so a poisoned lock is treated as a
-                // refusal for every remaining validator instead.
-                match self.guard.lock() {
-                    Ok(mut guard) => {
-                        if let Err(refusal) = guard.check_and_record(&pubkey, &data) {
-                            warn!(
-                                %slot,
-                                validator = duty.validator_index,
-                                %refusal,
-                                "Refusing to sign: this process already signed a conflicting \
-                                 attestation for this validator"
-                            );
-                            crate::metrics::inc_attestations_refused();
-                            continue;
-                        }
-                    }
-                    Err(err) => {
-                        error!(%slot, %err, "Attestation guard is poisoned; refusing to sign");
+            // Refuse before signing, not after: a signature that exists is
+            // a signature that can escape, whatever the code after it
+            // intended. This closes the double-vote shapes reachable
+            // within one run (a backward clock step, a schedule replaced
+            // mid-epoch); it is not slashing protection and does not
+            // pretend to be. See `AttestationGuard`.
+            //
+            // Held per validator, and dropped before the next iteration.
+            // The lock is poisoned only by a panic while it is held, and
+            // nothing inside can panic; `unwrap` on it would still be a
+            // crash in the duty path, so a poisoned lock is treated as a
+            // refusal for every remaining validator instead.
+            match self.guard.lock() {
+                Ok(mut guard) => {
+                    if let Err(refusal) = guard.check_and_record(&pubkey, &data) {
+                        warn!(
+                            %slot,
+                            validator = duty.validator_index,
+                            %refusal,
+                            "Refusing to sign: this process already signed a conflicting \
+                             attestation for this validator"
+                        );
                         crate::metrics::inc_attestations_refused();
                         continue;
                     }
                 }
-
-                // One validator failing must not cost the others their attestation.
-                let signature = match self.context.sign_attestation(&store, &pubkey, &data) {
-                    Ok(signature) => signature,
-                    Err(err) => {
-                        error!(%slot, validator = duty.validator_index, %err, "Failed to sign attestation");
-                        crate::metrics::inc_signing_failures();
-                        continue;
-                    }
-                };
-
-                attestations.push(SingleAttestationDto {
-                    committee_index: duty.committee_index,
-                    attester_index: duty.validator_index,
-                    data: data_dto.clone(),
-                    signature: encode_hex(&signature.0),
-                });
+                Err(err) => {
+                    error!(%slot, %err, "Attestation guard is poisoned; refusing to sign");
+                    crate::metrics::inc_attestations_refused();
+                    continue;
+                }
             }
+            to_sign.push((duty, pubkey));
+        }
+
+        // Signed concurrently rather than one after another. A local key
+        // signs in microseconds either way; a remote signer costs a round
+        // trip per signature, and a hundred validators behind one signer
+        // must not pay a hundred of them in series inside one slot. Each
+        // signature takes the store's read guard for its own lookup only
+        // (see `SigningContext::sign`), so nothing here holds it across an
+        // await: `tokio::sync::RwLock` is write-preferring, and a keymanager
+        // import queuing for the write lock would otherwise stall every read
+        // behind it for as long as the guard was held.
+        let signatures = {
+            let _timing = crate::metrics::time_signing();
+            futures::future::join_all(
+                to_sign
+                    .iter()
+                    .map(|(_, pubkey)| self.context.sign_attestation(store, pubkey, &data)),
+            )
+            .await
+        };
+
+        let mut attestations = Vec::with_capacity(to_sign.len());
+        for ((duty, _), signature) in to_sign.iter().zip(signatures) {
+            // One validator failing must not cost the others their attestation.
+            let signature = match signature {
+                Ok(signature) => signature,
+                Err(err) => {
+                    error!(%slot, validator = duty.validator_index, %err, "Failed to sign attestation");
+                    crate::metrics::inc_signing_failures();
+                    continue;
+                }
+            };
+            attestations.push(SingleAttestationDto {
+                committee_index: duty.committee_index,
+                attester_index: duty.validator_index,
+                data: data_dto.clone(),
+                signature: encode_hex(&signature.0),
+            });
         }
 
         if attestations.is_empty() {

@@ -21,10 +21,38 @@ pub struct ValidatorDefinition {
     pub enabled: bool,
     /// The validator's BLS public key, `0x`-prefixed hex.
     pub voting_public_key: String,
-    /// Path to the EIP-2335 keystore.
-    pub voting_keystore_path: PathBuf,
-    /// Path to the file holding that keystore's password.
-    pub voting_keystore_password_path: PathBuf,
+    /// Where the key is and how it signs. Flattened, so a local entry keeps
+    /// the two path fields it always had at the top level and a remote one
+    /// has `url` there instead.
+    #[serde(flatten)]
+    pub signing: SigningDefinition,
+}
+
+/// How one definition's key signs.
+///
+/// Untagged rather than carrying a `type` field: the file predates remote
+/// signers, and every existing entry has the two keystore paths and nothing
+/// else, so the fields themselves are the tag. Deserialization tries the
+/// variants in order, and the field sets are disjoint, so an entry cannot
+/// match both.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SigningDefinition {
+    /// An EIP-2335 keystore on disk, decrypted into this process at startup.
+    LocalKeystore {
+        /// Path to the EIP-2335 keystore.
+        voting_keystore_path: PathBuf,
+        /// Path to the file holding that keystore's password.
+        voting_keystore_password_path: PathBuf,
+    },
+    /// A Web3Signer holding the key; `url` is the signer's base URL.
+    Web3Signer { url: String },
+}
+
+impl SigningDefinition {
+    pub fn is_remote(&self) -> bool {
+        matches!(self, Self::Web3Signer { .. })
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -124,9 +152,11 @@ impl ValidatorDefinitions {
             let pubkey = format!("0x{}", pubkey.trim_start_matches("0x"));
             definitions.push(ValidatorDefinition {
                 enabled: true,
-                voting_keystore_password_path: secrets_dir.join(&pubkey),
+                signing: SigningDefinition::LocalKeystore {
+                    voting_keystore_path: keystore_path,
+                    voting_keystore_password_path: secrets_dir.join(&pubkey),
+                },
                 voting_public_key: pubkey,
-                voting_keystore_path: keystore_path,
             });
         }
         // Directory order is not stable across filesystems; sorting makes the
@@ -180,8 +210,11 @@ mod tests {
         let definitions = ValidatorDefinitions::open(validators.path()).unwrap();
         assert_eq!(definitions.0[0].voting_public_key, "0xaa");
         assert_eq!(
-            definitions.0[0].voting_keystore_password_path,
-            secrets.path().join("0xaa")
+            definitions.0[0].signing,
+            SigningDefinition::LocalKeystore {
+                voting_keystore_path: validators.path().join("0xaa").join("voting-keystore.json"),
+                voting_keystore_password_path: secrets.path().join("0xaa"),
+            }
         );
         assert!(definitions.0.iter().all(|definition| definition.enabled));
     }
@@ -210,9 +243,70 @@ mod tests {
         ValidatorDefinition {
             enabled,
             voting_public_key: pubkey.to_string(),
-            voting_keystore_path: PathBuf::from("keystore.json"),
-            voting_keystore_password_path: PathBuf::from("password.txt"),
+            signing: SigningDefinition::LocalKeystore {
+                voting_keystore_path: PathBuf::from("keystore.json"),
+                voting_keystore_password_path: PathBuf::from("password.txt"),
+            },
         }
+    }
+
+    fn remote_definition(pubkey: &str, url: &str) -> ValidatorDefinition {
+        ValidatorDefinition {
+            enabled: true,
+            voting_public_key: pubkey.to_string(),
+            signing: SigningDefinition::Web3Signer {
+                url: url.to_string(),
+            },
+        }
+    }
+
+    /// A file written before remote signers existed has no `url` and no tag,
+    /// and must read back as the local entry it always was.
+    #[test]
+    fn a_pre_remote_signer_file_still_parses() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let legacy = "- enabled: true\n  voting_public_key: '0xaa'\n  \
+                      voting_keystore_path: keystore.json\n  \
+                      voting_keystore_password_path: password.txt\n";
+        std::fs::write(dir.path().join(DEFINITIONS_FILE), legacy).expect("writes");
+
+        let read = ValidatorDefinitions::open(dir.path()).expect("opens");
+        assert_eq!(read.0, vec![definition("0xaa", true)]);
+    }
+
+    #[test]
+    fn remote_and_local_entries_round_trip_together() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let written = ValidatorDefinitions(vec![
+            definition("0xaa", true),
+            remote_definition("0xbb", "https://signer:9000"),
+        ]);
+        written.save(dir.path()).expect("saves");
+
+        let text = std::fs::read_to_string(dir.path().join(DEFINITIONS_FILE)).expect("reads");
+        assert!(text.contains("url: https://signer:9000"), "{text}");
+        assert!(
+            !text.contains("type:"),
+            "the variant is told by its fields, not a tag: {text}"
+        );
+
+        let read = ValidatorDefinitions::open(dir.path()).expect("opens");
+        assert_eq!(read.0, written.0);
+        assert!(read.0[1].signing.is_remote());
+        assert!(!read.0[0].signing.is_remote());
+    }
+
+    /// An entry with neither a keystore nor a URL describes no way to sign,
+    /// and must be refused rather than read as one of the variants.
+    #[test]
+    fn an_entry_with_no_signing_method_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join(DEFINITIONS_FILE),
+            "- enabled: true\n  voting_public_key: '0xaa'\n",
+        )
+        .expect("writes");
+        assert!(ValidatorDefinitions::open(dir.path()).is_err());
     }
 
     #[test]

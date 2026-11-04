@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use blst::min_pk::SecretKey;
 use ethlambda_types::beacon::primitives::{BLS_PUBKEY_SIZE, BlsPubkey};
@@ -9,13 +10,15 @@ use tracing::info;
 
 use crate::beacon_node::dto::{encode_hex, parse_pubkey};
 use crate::error::{Error, Result};
-use crate::keys::definitions::ValidatorDefinitions;
+use crate::keys::definitions::{SigningDefinition, ValidatorDefinitions};
 use crate::keys::keystore::Keystore;
+use crate::keys::web3signer::Web3Signer;
 
 /// How one validator produces a signature.
 ///
-/// One variant today. It is an enum from the start so that adding a remote
-/// signer later is a new arm rather than a reshaping of every call site.
+/// Cheap to clone: both arms are an `Arc`, so a signing path can take a copy
+/// out of the store under a short read guard and sign after releasing it,
+/// which matters for the remote arm, whose signature is an HTTP round trip.
 ///
 /// **Never derive `Debug` on this type, or on anything holding it.**
 /// `blst::min_pk::SecretKey` zeroizes on drop but still derives a plain
@@ -23,20 +26,34 @@ use crate::keys::keystore::Keystore;
 /// chain would put a validator's signing key into a log line. `Zeroizing`
 /// is no protection either: it forwards `Debug` to the type it wraps, so it
 /// controls the key's lifetime in memory, not whether it can be printed.
+#[derive(Clone)]
 pub enum SigningMethod {
     /// The secret key is held in this process, decrypted from a local keystore.
-    LocalKeystore { secret_key: Box<SecretKey> },
+    LocalKeystore { secret_key: Arc<SecretKey> },
+    /// The key is held by a Web3Signer, which signs on this client's behalf.
+    Web3Signer { signer: Arc<Web3Signer> },
+}
+
+impl SigningMethod {
+    pub fn is_remote(&self) -> bool {
+        matches!(self, Self::Web3Signer { .. })
+    }
 }
 
 /// Every validator this client signs for, keyed by public key.
 pub struct ValidatorStore {
     validators: HashMap<BlsPubkey, SigningMethod>,
+    /// One client per remote signer URL, shared by every validator on it, so
+    /// a hundred keys behind one signer are one connection pool rather than a
+    /// hundred.
+    signers: HashMap<String, Arc<Web3Signer>>,
 }
 
 impl ValidatorStore {
     pub fn new() -> Self {
         Self {
             validators: HashMap::new(),
+            signers: HashMap::new(),
         }
     }
 
@@ -45,14 +62,35 @@ impl ValidatorStore {
     /// A keystore that fails to decrypt aborts startup rather than being
     /// skipped: a validator that silently does not attest looks exactly like a
     /// healthy one from inside this process, and the operator finds out from
-    /// missed-attestation penalties days later.
+    /// missed-attestation penalties days later. A remote entry is registered
+    /// without contacting its signer: the signer may well start after this
+    /// process does, and a key it turns out not to hold fails at its first
+    /// signature, where it is logged and counted, rather than at startup.
     pub fn load(validators_dir: &Path) -> Result<Self> {
         let definitions = ValidatorDefinitions::open(validators_dir)?;
         let mut store = Self::new();
 
         for definition in definitions.enabled() {
-            let keystore_path = resolve(validators_dir, &definition.voting_keystore_path);
-            let password_path = resolve(validators_dir, &definition.voting_keystore_password_path);
+            let (voting_keystore_path, voting_keystore_password_path) = match &definition.signing {
+                SigningDefinition::Web3Signer { url } => {
+                    let pubkey = parse_pubkey(&definition.voting_public_key).map_err(|err| {
+                        Error::Keystore {
+                            path: url.clone(),
+                            reason: format!(
+                                "the definitions entry's voting_public_key is unreadable: {err}"
+                            ),
+                        }
+                    })?;
+                    store.insert_remote(pubkey, url)?;
+                    continue;
+                }
+                SigningDefinition::LocalKeystore {
+                    voting_keystore_path,
+                    voting_keystore_password_path,
+                } => (voting_keystore_path, voting_keystore_password_path),
+            };
+            let keystore_path = resolve(validators_dir, voting_keystore_path);
+            let password_path = resolve(validators_dir, voting_keystore_password_path);
 
             let json = std::fs::read_to_string(&keystore_path).map_err(|source| Error::Io {
                 path: keystore_path.display().to_string(),
@@ -125,7 +163,11 @@ impl ValidatorStore {
             }
         }
 
-        info!(count = store.len(), "Loaded validator keys");
+        info!(
+            count = store.len(),
+            remote = store.remote_entries().len(),
+            "Loaded validator keys"
+        );
         Ok(store)
     }
 
@@ -142,10 +184,44 @@ impl ValidatorStore {
         self.validators.insert(
             pubkey,
             SigningMethod::LocalKeystore {
-                secret_key: Box::new(secret_key),
+                secret_key: Arc::new(secret_key),
             },
         );
+        self.drop_unused_signers();
         Ok(pubkey)
+    }
+
+    /// Add a validator whose key a Web3Signer at `url` holds, replacing any
+    /// method the store had for it.
+    ///
+    /// Nothing is asked of the signer here; see [`Self::load`] for why. The
+    /// URL is checked for shape, which is the one failure worth refusing up
+    /// front: an entry nobody could ever reach.
+    pub fn insert_remote(&mut self, pubkey: BlsPubkey, url: &str) -> Result<()> {
+        // Keyed by the URL as the client normalizes it, so `.../` and `...`
+        // name one signer rather than two.
+        let key = url.trim_end_matches('/');
+        let signer = match self.signers.get(key) {
+            Some(signer) => signer.clone(),
+            None => {
+                let signer = Arc::new(Web3Signer::new(url)?);
+                self.signers.insert(key.to_string(), signer.clone());
+                signer
+            }
+        };
+        self.validators
+            .insert(pubkey, SigningMethod::Web3Signer { signer });
+        self.drop_unused_signers();
+        Ok(())
+    }
+
+    /// Forget any signer client no validator uses any more. Called after
+    /// every mutation, since each can orphan one: an insert that replaces a
+    /// remote entry with a local one, a remove, a remote insert on a new URL
+    /// for a key that was the last on its old one.
+    fn drop_unused_signers(&mut self) {
+        self.signers
+            .retain(|_, signer| Arc::strong_count(signer) > 1);
     }
 
     /// Derive a validator's public key from its raw secret, without adding it
@@ -162,19 +238,53 @@ impl ValidatorStore {
     }
 
     pub fn remove(&mut self, pubkey: &BlsPubkey) -> bool {
-        self.validators.remove(pubkey).is_some()
+        let removed = self.validators.remove(pubkey).is_some();
+        self.drop_unused_signers();
+        removed
     }
 
     pub fn contains(&self, pubkey: &BlsPubkey) -> bool {
         self.validators.contains_key(pubkey)
     }
 
-    pub fn get(&self, pubkey: &BlsPubkey) -> Option<&SigningMethod> {
-        self.validators.get(pubkey)
+    /// How `pubkey` signs, as a copy the caller can hold after releasing
+    /// whatever lock guards this store. `None` for a validator it does not
+    /// hold.
+    pub fn signer(&self, pubkey: &BlsPubkey) -> Option<SigningMethod> {
+        self.validators.get(pubkey).cloned()
+    }
+
+    /// The remote signer's URL for `pubkey`, or `None` when the key is local
+    /// or unknown.
+    pub fn remote_url(&self, pubkey: &BlsPubkey) -> Option<String> {
+        match self.validators.get(pubkey)? {
+            SigningMethod::Web3Signer { signer } => Some(signer.url().to_string()),
+            SigningMethod::LocalKeystore { .. } => None,
+        }
     }
 
     pub fn pubkeys(&self) -> Vec<BlsPubkey> {
         self.validators.keys().copied().collect()
+    }
+
+    /// The validators whose key is in this process.
+    pub fn local_pubkeys(&self) -> Vec<BlsPubkey> {
+        self.validators
+            .iter()
+            .filter(|(_, method)| !method.is_remote())
+            .map(|(pubkey, _)| *pubkey)
+            .collect()
+    }
+
+    /// The validators a remote signer signs for, each with its signer's URL.
+    pub fn remote_entries(&self) -> Vec<(BlsPubkey, String)> {
+        self.validators
+            .iter()
+            .filter_map(|(pubkey, method)| match method {
+                SigningMethod::Web3Signer { signer } => Some((*pubkey, signer.url().to_string())),
+                SigningMethod::LocalKeystore { .. } => None,
+            })
+            .collect()
     }
 
     pub fn len(&self) -> usize {
@@ -220,7 +330,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::keys::definitions::{ValidatorDefinition, ValidatorDefinitions};
+    use crate::keys::definitions::{SigningDefinition, ValidatorDefinition, ValidatorDefinitions};
 
     /// The secret from the EIP-2335 test vectors.
     fn test_secret() -> [u8; 32] {
@@ -278,8 +388,10 @@ mod tests {
         let definitions = ValidatorDefinitions(vec![ValidatorDefinition {
             enabled: true,
             voting_public_key: "0x9612d7a727c9d0a22e185a1c768478dfe919cada9266988cb32359c11f2b7b27f4ae4040902382ae2910c15e2b420d07".to_string(),
-            voting_keystore_path: PathBuf::from("keystore.json"),
-            voting_keystore_password_path: PathBuf::from("password.txt"),
+            signing: SigningDefinition::LocalKeystore {
+                voting_keystore_path: PathBuf::from("keystore.json"),
+                voting_keystore_password_path: PathBuf::from("password.txt"),
+            },
         }]);
         definitions.save(dir.path()).expect("saves definitions");
 
@@ -304,11 +416,88 @@ mod tests {
         ValidatorDefinitions(vec![ValidatorDefinition {
             enabled: true,
             voting_public_key: voting_public_key.to_string(),
-            voting_keystore_path: PathBuf::from("keystore.json"),
-            voting_keystore_password_path: PathBuf::from("password.txt"),
+            signing: SigningDefinition::LocalKeystore {
+                voting_keystore_path: PathBuf::from("keystore.json"),
+                voting_keystore_password_path: PathBuf::from("password.txt"),
+            },
         }])
         .save(dir)
         .expect("saves definitions");
+    }
+
+    #[test]
+    fn a_remote_definition_loads_without_contacting_its_signer() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // A URL nothing listens on: loading must not care.
+        let url = "http://127.0.0.1:9";
+        ValidatorDefinitions(vec![ValidatorDefinition {
+            enabled: true,
+            voting_public_key: VECTOR_PUBKEY.to_string(),
+            signing: SigningDefinition::Web3Signer {
+                url: url.to_string(),
+            },
+        }])
+        .save(dir.path())
+        .expect("saves definitions");
+
+        let store = ValidatorStore::load(dir.path()).expect("loads");
+        let pubkey = parse_pubkey(VECTOR_PUBKEY).expect("pubkey");
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.remote_url(&pubkey).as_deref(), Some(url));
+        assert!(store.signer(&pubkey).expect("held").is_remote());
+        assert!(store.local_pubkeys().is_empty());
+        assert_eq!(store.remote_entries(), vec![(pubkey, url.to_string())]);
+    }
+
+    #[test]
+    fn a_remote_definition_with_a_bad_url_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        ValidatorDefinitions(vec![ValidatorDefinition {
+            enabled: true,
+            voting_public_key: VECTOR_PUBKEY.to_string(),
+            signing: SigningDefinition::Web3Signer {
+                url: "not a url".to_string(),
+            },
+        }])
+        .save(dir.path())
+        .expect("saves definitions");
+
+        assert!(ValidatorStore::load(dir.path()).is_err());
+    }
+
+    #[test]
+    fn remote_validators_on_one_url_share_a_client_and_release_it_together() {
+        let mut store = ValidatorStore::new();
+        let first = BlsPubkey([1; BLS_PUBKEY_SIZE]);
+        let second = BlsPubkey([2; BLS_PUBKEY_SIZE]);
+        store
+            .insert_remote(first, "http://signer:9000")
+            .expect("inserts");
+        store
+            .insert_remote(second, "http://signer:9000/")
+            .expect("inserts");
+        assert_eq!(store.signers.len(), 1, "one URL, one client");
+
+        assert!(store.remove(&first));
+        assert_eq!(store.signers.len(), 1, "still in use by the second key");
+        assert!(store.remove(&second));
+        assert!(store.signers.is_empty(), "nobody uses it any more");
+    }
+
+    #[test]
+    fn inserting_a_local_key_over_a_remote_one_replaces_it() {
+        let mut store = ValidatorStore::new();
+        let pubkey = parse_pubkey(VECTOR_PUBKEY).expect("pubkey");
+        store
+            .insert_remote(pubkey, "http://signer:9000")
+            .expect("inserts");
+        let derived = store
+            .insert_secret("test", &test_secret())
+            .expect("inserts");
+        assert_eq!(derived, pubkey);
+        assert_eq!(store.len(), 1);
+        assert!(store.remote_url(&pubkey).is_none());
+        assert!(store.signers.is_empty());
     }
 
     /// A definitions entry declaring a key its keystore does not hold must not
@@ -388,6 +577,7 @@ mod tests {
     #[test]
     fn an_unknown_pubkey_has_no_signing_method() {
         let store = ValidatorStore::new();
-        assert!(store.get(&BlsPubkey([7; BLS_PUBKEY_SIZE])).is_none());
+        assert!(store.signer(&BlsPubkey([7; BLS_PUBKEY_SIZE])).is_none());
+        assert!(store.remote_url(&BlsPubkey([7; BLS_PUBKEY_SIZE])).is_none());
     }
 }

@@ -132,7 +132,6 @@ impl<B: BeaconNodeApi> SyncCommitteeService<B> {
         let mut messages = Vec::with_capacity(pending.len());
         {
             let _timing = crate::metrics::time_signing();
-            let store = store.read().await;
             for duty in pending {
                 let pubkey = match parse_pubkey(&duty.pubkey) {
                     Ok(pubkey) => pubkey,
@@ -146,7 +145,8 @@ impl<B: BeaconNodeApi> SyncCommitteeService<B> {
                 }
                 match self
                     .context
-                    .sign_sync_committee_message(&store, &pubkey, slot, root)
+                    .sign_sync_committee_message(store, &pubkey, slot, root)
+                    .await
                 {
                     Ok(signature) => messages.push(SyncCommitteeMessage {
                         slot,
@@ -194,7 +194,6 @@ impl<B: BeaconNodeApi> SyncCommitteeService<B> {
         // (validator, pubkey, subnet, selection proof) for each selected pair.
         let mut selected: Vec<(ValidatorIndex, BlsPubkey, u64, BlsSignature)> = Vec::new();
         {
-            let store = store.read().await;
             for duty in duties {
                 let pubkey = match parse_pubkey(&duty.pubkey) {
                     Ok(pubkey) => pubkey,
@@ -206,7 +205,8 @@ impl<B: BeaconNodeApi> SyncCommitteeService<B> {
                 for subnet in subnets_of(duty) {
                     match self
                         .context
-                        .sign_sync_selection_proof(&store, &pubkey, slot, subnet)
+                        .sign_sync_selection_proof(store, &pubkey, slot, subnet)
+                        .await
                     {
                         Ok(proof) if is_sync_committee_aggregator(&proof) => {
                             selected.push((duty.validator_index, pubkey, subnet, proof));
@@ -260,7 +260,6 @@ impl<B: BeaconNodeApi> SyncCommitteeService<B> {
 
         let mut signed = Vec::new();
         {
-            let store = store.read().await;
             for (validator, pubkey, subnet, proof) in selected {
                 let Some(Some(contribution)) = fetched.get(&subnet) else {
                     continue;
@@ -272,7 +271,8 @@ impl<B: BeaconNodeApi> SyncCommitteeService<B> {
                 };
                 match self
                     .context
-                    .sign_contribution_and_proof(&store, &pubkey, &message)
+                    .sign_contribution_and_proof(store, &pubkey, &message)
+                    .await
                 {
                     Ok(signature) => signed.push(SignedContributionAndProof { message, signature }),
                     Err(err) => {
@@ -452,21 +452,38 @@ mod tests {
 
     /// Duty with a seat in every subnet, on the first slot where the selection
     /// is a mix, so "only selected pairs fetch" is not satisfied by all or none.
-    fn mixed_slot(context: &SigningContext, store: &ValidatorStore, pubkey: &BlsPubkey) -> Slot {
+    async fn mixed_slot(
+        context: &SigningContext,
+        store: &RwLock<ValidatorStore>,
+        pubkey: &BlsPubkey,
+    ) -> Slot {
         for slot in 3200..4200 {
-            let picks = (0..4)
-                .filter(|subnet| {
-                    let proof = context
-                        .sign_sync_selection_proof(store, pubkey, slot, *subnet)
-                        .expect("signs");
-                    is_sync_committee_aggregator(&proof)
-                })
-                .count();
+            let picks = picked_subnets(context, store, pubkey, slot).await.len();
             if picks > 0 && picks < 4 {
                 return slot;
             }
         }
         panic!("no mixed slot found");
+    }
+
+    /// The subnets whose selection proof selects this key at `slot`.
+    async fn picked_subnets(
+        context: &SigningContext,
+        store: &RwLock<ValidatorStore>,
+        pubkey: &BlsPubkey,
+        slot: Slot,
+    ) -> Vec<u64> {
+        let mut picked = Vec::new();
+        for subnet in 0..4 {
+            let proof = context
+                .sign_sync_selection_proof(store, pubkey, slot, subnet)
+                .await
+                .expect("signs");
+            if is_sync_committee_aggregator(&proof) {
+                picked.push(subnet);
+            }
+        }
+        picked
     }
 
     fn all_subnet_duty(pubkey: &BlsPubkey) -> SyncDutyDto {
@@ -478,10 +495,7 @@ mod tests {
     async fn only_selected_pairs_fetch_and_a_published_contribution_verifies() {
         let (store, pubkey) = store();
         let context = context();
-        let slot = {
-            let guard = store.read().await;
-            mixed_slot(&context, &guard, &pubkey)
-        };
+        let slot = mixed_slot(&context, &store, &pubkey).await;
         let root = Root::repeat_byte(4);
         let mut node = MockBeaconNode::new();
         for subnet in 0..4 {
@@ -495,15 +509,7 @@ mod tests {
             .await
             .expect("aggregates");
 
-        let guard = store.read().await;
-        let expected: Vec<u64> = (0..4)
-            .filter(|subnet| {
-                let proof = context
-                    .sign_sync_selection_proof(&guard, &pubkey, slot, *subnet)
-                    .expect("signs");
-                is_sync_committee_aggregator(&proof)
-            })
-            .collect();
+        let expected = picked_subnets(&context, &store, &pubkey, slot).await;
         let requested: Vec<u64> = node
             .contribution_requests()
             .iter()
@@ -535,10 +541,7 @@ mod tests {
     async fn a_mismatched_contribution_is_not_published() {
         let (store, pubkey) = store();
         let context = context();
-        let slot = {
-            let guard = store.read().await;
-            mixed_slot(&context, &guard, &pubkey)
-        };
+        let slot = mixed_slot(&context, &store, &pubkey).await;
         let root = Root::repeat_byte(4);
         let mut node = MockBeaconNode::new();
         for subnet in 0..4 {
@@ -561,22 +564,15 @@ mod tests {
         let (store, pubkey) = store();
         let context = context();
         // A slot where at least two subnets are selected.
-        let (slot, picked) = {
-            let guard = store.read().await;
-            (3200..6000)
-                .find_map(|slot| {
-                    let picked: Vec<u64> = (0..4)
-                        .filter(|subnet| {
-                            let proof = context
-                                .sign_sync_selection_proof(&guard, &pubkey, slot, *subnet)
-                                .expect("signs");
-                            is_sync_committee_aggregator(&proof)
-                        })
-                        .collect();
-                    (picked.len() >= 2).then_some((slot, picked))
-                })
-                .expect("a slot selecting two subnets")
-        };
+        let mut found = None;
+        for slot in 3200..6000 {
+            let picked = picked_subnets(&context, &store, &pubkey, slot).await;
+            if picked.len() >= 2 {
+                found = Some((slot, picked));
+                break;
+            }
+        }
+        let (slot, picked) = found.expect("a slot selecting two subnets");
         let root = Root::repeat_byte(4);
         // Only the last picked subnet has a contribution; the first answers 404.
         let kept = *picked.last().expect("nonempty");

@@ -48,7 +48,7 @@ use crate::beacon_node::dto::{AttesterDutyDto, parse_pubkey};
 use crate::beacon_node::{AggregateKind, BeaconNodeApi, SignedAggregates};
 use crate::error::{Error, Result};
 use crate::keys::ValidatorStore;
-use crate::signing::SigningContext;
+use crate::signing::{AggregateAndProofRef, SigningContext};
 
 /// An `AggregateAndProof` of either fork, held between building it and
 /// signing it.
@@ -91,30 +91,19 @@ impl<B: BeaconNodeApi> AggregationService<B> {
         }
 
         // Which of this client's validators aggregates, and with what proof.
-        //
-        // The read guard covers the whole selection pass and no await, the way
-        // the attestation path's does: `selection_for` signs, and the lock is
-        // write-preferring, so holding this across the fetches below would put
-        // every later duty behind any keymanager writer that queued meanwhile.
-        let selected: Vec<(AttesterDutyDto, _)> = {
-            let store = store.read().await;
-            duties
-                .iter()
-                .filter_map(|duty| match selection_for(&self.context, &store, duty) {
-                    Ok(Some(proof)) => Some((duty.clone(), proof)),
-                    Ok(None) => None,
-                    Err(err) => {
-                        warn!(
-                            %slot,
-                            validator = duty.validator_index,
-                            %err,
-                            "Could not compute aggregator selection; skipping this duty"
-                        );
-                        None
-                    }
-                })
-                .collect()
-        };
+        let mut selected: Vec<(AttesterDutyDto, _)> = Vec::new();
+        for duty in duties {
+            match selection_for(&self.context, store, duty).await {
+                Ok(Some(proof)) => selected.push((duty.clone(), proof)),
+                Ok(None) => {}
+                Err(err) => warn!(
+                    %slot,
+                    validator = duty.validator_index,
+                    %err,
+                    "Could not compute aggregator selection; skipping this duty"
+                ),
+            }
+        }
 
         if selected.is_empty() {
             return Ok(0);
@@ -162,7 +151,6 @@ impl<B: BeaconNodeApi> AggregationService<B> {
         let fork = self.batch_fork(&aggregates, slot)?;
 
         let signed = {
-            let store = store.read().await;
             let mut electra_signed = Vec::new();
             let mut gloas_signed = Vec::new();
             for (duty, selection_proof) in &selected {
@@ -177,34 +165,35 @@ impl<B: BeaconNodeApi> AggregationService<B> {
                     }
                 };
 
-                // The wrapper is the fork's own container, and its root is taken
-                // from it: gloas's `Attestation` hashes differently from
-                // electra's, so a root computed over the wrong one would sign a
-                // message no node can verify.
-                let (root, wrapper) = match &aggregate.attestation {
+                // The wrapper is the fork's own container, and the signing path
+                // takes its root from it: gloas's `Attestation` hashes
+                // differently from electra's, so a root computed over the
+                // wrong one would sign a message no node can verify.
+                let wrapper = match &aggregate.attestation {
                     AggregateKind::Electra(attestation) => {
-                        let message = electra::AggregateAndProof {
+                        Wrapper::Electra(electra::AggregateAndProof {
                             aggregator_index: duty.validator_index,
                             aggregate: attestation.clone(),
                             selection_proof: *selection_proof,
-                        };
-                        (message.hash_tree_root(), Wrapper::Electra(message))
+                        })
                     }
-                    AggregateKind::Gloas(attestation) => {
-                        let message = gloas::AggregateAndProof {
-                            aggregator_index: duty.validator_index,
-                            aggregate: attestation.clone(),
-                            selection_proof: *selection_proof,
-                        };
-                        (message.hash_tree_root(), Wrapper::Gloas(message))
-                    }
+                    AggregateKind::Gloas(attestation) => Wrapper::Gloas(gloas::AggregateAndProof {
+                        aggregator_index: duty.validator_index,
+                        aggregate: attestation.clone(),
+                        selection_proof: *selection_proof,
+                    }),
                 };
                 // Signed over the whole wrapper, not over the aggregate: that
                 // is what binds this validator's index and its selection proof
                 // to the votes it is republishing.
+                let message = match &wrapper {
+                    Wrapper::Electra(message) => AggregateAndProofRef::Electra(message),
+                    Wrapper::Gloas(message) => AggregateAndProofRef::Gloas(message),
+                };
                 let signature = match self
                     .context
-                    .sign_aggregate_and_proof(&store, &pubkey, root, slot)
+                    .sign_aggregate_and_proof(store, &pubkey, message)
+                    .await
                 {
                     Ok(signature) => signature,
                     Err(err) => {
@@ -333,13 +322,14 @@ mod tests {
     /// A slot this key is selected to aggregate at, and one it is not. Which
     /// slots those are is a property of SHA-256, so they are found rather than
     /// written down.
-    fn slots(pubkey: &BlsPubkey, store: &ValidatorStore) -> (Slot, Slot) {
+    async fn slots(pubkey: &BlsPubkey, store: &RwLock<ValidatorStore>) -> (Slot, Slot) {
         let context = context();
         let mut selected = None;
         let mut rejected = None;
         for slot in 3_200..3_400 {
             let proof = context
                 .sign_selection_proof(store, pubkey, slot)
+                .await
                 .expect("signs");
             if is_aggregator(128, &proof) {
                 selected.get_or_insert(slot);
@@ -358,10 +348,7 @@ mod tests {
 
     async fn fixture() -> (RwLock<ValidatorStore>, BlsPubkey, Slot, Slot) {
         let (store, pubkey) = store();
-        let (selected, rejected) = {
-            let guard = store.read().await;
-            slots(&pubkey, &guard)
-        };
+        let (selected, rejected) = slots(&pubkey, &store).await;
         (store, pubkey, selected, rejected)
     }
 
@@ -489,9 +476,9 @@ mod tests {
 
         let (_, list) = node.published_aggregates().remove(0);
 
-        let guard = store.read().await;
         let expected = context()
-            .sign_selection_proof(&guard, &pubkey, slot)
+            .sign_selection_proof(&store, &pubkey, slot)
+            .await
             .expect("signs");
         assert_eq!(list[0].message.selection_proof, expected);
         assert!(
@@ -539,16 +526,18 @@ mod tests {
 
     /// A slot in the gloas era at which this key is selected under the gloas
     /// fork version, found rather than written down for the reason `slots` is.
-    fn gloas_selected_slot(pubkey: &BlsPubkey, store: &ValidatorStore) -> Slot {
+    async fn gloas_selected_slot(pubkey: &BlsPubkey, store: &RwLock<ValidatorStore>) -> Slot {
         let context = gloas_context();
-        (3_200..3_600)
-            .find(|slot| {
-                let proof = context
-                    .sign_selection_proof(store, pubkey, *slot)
-                    .expect("signs");
-                is_aggregator(128, &proof)
-            })
-            .expect("some slot selects this key")
+        for slot in 3_200..3_600 {
+            let proof = context
+                .sign_selection_proof(store, pubkey, slot)
+                .await
+                .expect("signs");
+            if is_aggregator(128, &proof) {
+                return slot;
+            }
+        }
+        panic!("some slot selects this key")
     }
 
     /// At a gloas slot the aggregate is gloas's container, and the wrapper is
@@ -560,10 +549,7 @@ mod tests {
         use blst::min_pk::{PublicKey, Signature};
 
         let (store, pubkey) = store();
-        let slot = {
-            let guard = store.read().await;
-            gloas_selected_slot(&pubkey, &guard)
-        };
+        let slot = gloas_selected_slot(&pubkey, &store).await;
         let node = Arc::new(MockBeaconNode::new().with_gloas_aggregate(data(slot)));
 
         let published = AggregationService::new(node.clone(), gloas_context())

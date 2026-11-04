@@ -847,7 +847,14 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   `SlotClock` picks the
   offsets by each slot's own fork, and `/eth/v1/config/spec` supplies them. It
   still keeps no slashing-protection record; PTC votes have an in-memory
-  `(validator, slot)` dedup only, and envelopes are unguarded.
+  `(validator, slot)` dedup only, and envelopes are unguarded. A key can live
+  in a Web3Signer instead of the process (`SigningMethod::Web3Signer`,
+  `keys/web3signer.rs`): every `SigningContext::sign_*` is async, resolves the
+  signer under a read guard scoped to the lookup and signs after releasing it,
+  and sends the remote signer the message in full so its own slashing
+  protection applies. Remote keys are `url` entries in
+  `validator_definitions.yml` or `POST /eth/v1/remotekeys` (default signer
+  `--web3signer-url`); `/keystores` and `/remotekeys` partition the store.
   `get_head_node` is one bottom-up walk for every fork, with
   the current slot's fork selecting the payload rules and the boost gate, so a
   follower on any network that schedules gloas (Sepolia does) pays work
