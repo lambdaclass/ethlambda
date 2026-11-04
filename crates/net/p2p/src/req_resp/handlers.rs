@@ -2698,7 +2698,7 @@ pub(crate) mod tests {
     use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use ethlambda_types::enr::EnrForkId;
     use ethlambda_types::{
-        block::{Block, BlockBody, MultiMessageAggregate},
+        block::{Block, BlockBody, BlockProof},
         state::State,
     };
     use std::collections::HashMap;
@@ -3107,7 +3107,7 @@ pub(crate) mod tests {
                 state_root: H256::ZERO,
                 body: BlockBody::default(),
             },
-            proof: MultiMessageAggregate::default(),
+            proof: BlockProof::default(),
         }
     }
 

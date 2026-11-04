@@ -197,6 +197,12 @@ pub(crate) mod tests {
         ) -> Result<(), ActorError> {
             Ok(())
         }
+        fn new_block_body_proof(
+            &self,
+            _: ethlambda_types::block::BlockBodyProof,
+        ) -> Result<(), ActorError> {
+            Ok(())
+        }
         fn new_data_column_sidecars(&self, _: Vec<DataColumnSidecar>) -> Result<(), ActorError> {
             Ok(())
         }

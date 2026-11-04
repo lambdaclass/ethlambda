@@ -41,7 +41,7 @@ use ethlambda_network_api::{
     FetchRequest, InitBlockChain, MetaDataController, P2PToBlockChainRef,
     block_chain_to_p2p::{
         CheckDataColumnSidecars, FetchBlock, PublishAggregatedAttestation, PublishAttestation,
-        PublishBlock,
+        PublishBlock, PublishBlockBodyProof,
     },
     rpc_to_p2p::{
         PublishBeaconAggregate, PublishBeaconAttestation, PublishBeaconBlock,
@@ -97,9 +97,10 @@ use crate::{
         spawn_discovery,
     },
     gossipsub::{
-        aggregation_topic, attestation_subnet_topic, block_topic, publish_aggregated_attestation,
-        publish_attestation, publish_beacon_aggregate, publish_beacon_attestation,
-        publish_beacon_block, publish_beacon_operation, publish_block,
+        aggregation_topic, attestation_subnet_topic, block_body_proof_topic, block_topic,
+        publish_aggregated_attestation, publish_attestation, publish_beacon_aggregate,
+        publish_beacon_attestation, publish_beacon_block, publish_beacon_operation, publish_block,
+        publish_block_body_proof,
     },
     lean::protocols::MAX_REQUEST_BLOCKS,
     req_resp::{
@@ -751,6 +752,7 @@ pub struct LeanWire {
     pub(crate) attestation_committee_count: u64,
     pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
+    pub(crate) block_body_proof_topic: libp2p::gossipsub::IdentTopic,
 }
 
 impl Wire {
@@ -1052,6 +1054,16 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
                 .subscribe(&aggregation_topic)
                 .unwrap();
 
+            // Subscribe to the block-body-proof topic (all nodes: any node may be
+            // the next slot's proposer, and a proposer adopts a body proof it
+            // received).
+            let block_body_proof_topic = block_body_proof_topic();
+            swarm
+                .behaviour_mut()
+                .gossipsub
+                .subscribe(&block_body_proof_topic)
+                .unwrap();
+
             // The committee metric should reflect validator membership only, not
             // aggregator-only subscriptions.
             let metric_subnet = lean
@@ -1078,6 +1090,7 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
                 attestation_committee_count: lean.attestation_committee_count,
                 block_topic,
                 aggregation_topic,
+                block_body_proof_topic,
             })
         }
         WireConfig::Beacon(beacon) => {
@@ -1770,6 +1783,12 @@ impl Handler<PublishAttestation> for P2PServer {
 impl Handler<PublishAggregatedAttestation> for P2PServer {
     async fn handle(&mut self, msg: PublishAggregatedAttestation, _ctx: &Context<Self>) {
         publish_aggregated_attestation(self, msg.attestation).await;
+    }
+}
+
+impl Handler<PublishBlockBodyProof> for P2PServer {
+    async fn handle(&mut self, msg: PublishBlockBodyProof, _ctx: &Context<Self>) {
+        publish_block_body_proof(self, msg.body_proof).await;
     }
 }
 
@@ -2865,6 +2884,12 @@ pub(crate) mod test_support {
         ) -> Result<(), spawned_concurrency::error::ActorError> {
             Ok(())
         }
+        fn new_block_body_proof(
+            &self,
+            _body_proof: ethlambda_types::block::BlockBodyProof,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            Ok(())
+        }
         fn new_data_column_sidecars(
             &self,
             _sidecars: Vec<ethlambda_types::beacon::containers::DataColumnSidecar>,
@@ -3698,6 +3723,7 @@ mod tests {
             attestation_committee_count: 4,
             block_topic: block_topic(),
             aggregation_topic: aggregation_topic(),
+            block_body_proof_topic: block_body_proof_topic(),
         });
         assert!(wire.beacon().is_none());
         let lean = wire.lean().expect("a lean wire");

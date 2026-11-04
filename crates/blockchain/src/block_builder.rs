@@ -16,8 +16,8 @@ use std::{
 };
 
 use ethlambda_crypto::{
-    AggregationError, SignerSet, aggregate_proofs, aggregate_signatures, merge_type_1s_into_type_2,
-    signature::{SignatureParseError, ValidatorPublicKey, ValidatorSignature},
+    AggregationError, SignerSet, aggregate_proofs, merge_type_1s_into_type_2,
+    signature::ValidatorPublicKey,
 };
 use ethlambda_state_transition::{
     attestation_data_matches_chain, justified_slots_ops, process_block, process_slots,
@@ -28,7 +28,7 @@ use ethlambda_types::{
     ShortRoot,
     attestation::{AggregatedAttestation, AggregationBits, AttestationData},
     block::{
-        AggregatedAttestations, Block, BlockBody, MultiMessageAggregate,
+        AggregatedAttestations, Block, BlockBody, BlockProof, MultiMessageAggregate,
         MultiMessageAggregateError, SignedBlock, SingleMessageAggregate,
     },
     checkpoint::Checkpoint,
@@ -92,23 +92,9 @@ pub struct ProposerConfig {
 
 /// Build a valid block on top of this state.
 ///
-/// Selects attestations via `select_attestations`, collapses entries sharing
-/// the same `AttestationData` down to one (a block may carry at most one entry
-/// per data; `on_block` rejects duplicates), and runs the STF once to seal the
-/// state root. The proposer signature is NOT included; it is appended by the
-/// caller.
-///
-/// The collapse strategy is gated by `enable_proposer_aggregation`:
-/// - **enabled**: same-data proofs are merged via recursive single-message
-///   aggregation into a single union-coverage proof (leanSpec #510). Maximizes voter
-///   coverage per entry at the cost of a leanVM aggregation per duplicated
-///   data entry.
-/// - **disabled** (default): the single best-coverage proof per data is kept
-///   and the rest dropped. Skips the leanVM work; coverage is bounded by the
-///   best individual proof.
-///
-/// Either way the output has one entry per `AttestationData` and the
-/// attestation-to-proof correspondence stays 1:1.
+/// Picks the body's attestations via [`select_and_compact`], then runs the STF
+/// once to seal the state root. The proposer signature is NOT included; it is
+/// appended by the caller.
 ///
 /// `config.max_attestations_per_block` bounds how many distinct
 /// `AttestationData` entries are packed (a proposer-side self-limit). It is
@@ -124,6 +110,89 @@ pub(crate) fn build_block(
 ) -> Result<(Block, Vec<SingleMessageAggregate>, PostBlockCheckpoints), StoreError> {
     info!(slot, proposer_index, "Building block");
 
+    let (attestations, aggregated_signatures) =
+        select_and_compact(head_state, slot, parent_root, inputs, config)?;
+
+    let (final_block, post_checkpoints) = seal_block(
+        head_state,
+        slot,
+        proposer_index,
+        parent_root,
+        BlockBody { attestations },
+    )?;
+
+    metrics::observe_block_proposal_attestation_data_selected(final_block.body.attestations.len());
+    metrics::observe_block_proposal_aggregates_selected(aggregated_signatures.len());
+
+    Ok((final_block, aggregated_signatures, post_checkpoints))
+}
+
+/// Seal a block around `body`: run the state transition once to compute the
+/// state root, and report the post-state checkpoints.
+///
+/// The body need not be one this node packed. Running the STF is what makes
+/// adopting a gossiped [`ethlambda_types::block::BlockBodyProof`] safe: an
+/// `Err` here means those attestations are not valid on top of `head_state`,
+/// and the state root is computed from the transition rather than trusted.
+pub(crate) fn seal_block(
+    head_state: &State,
+    slot: u64,
+    proposer_index: u64,
+    parent_root: H256,
+    body: BlockBody,
+) -> Result<(Block, PostBlockCheckpoints), StoreError> {
+    let mut block = Block {
+        slot,
+        proposer_index,
+        parent_root,
+        state_root: H256::ZERO,
+        body,
+    };
+    let mut post_state = head_state.clone();
+    // ethlambda runs the STF once after selection (it projects justification
+    // incrementally instead of re-running the STF per loop round), so this is
+    // a single `stf_simulate` observation per build.
+    let stf_start = Instant::now();
+    process_slots(&mut post_state, slot)?;
+    process_block(&mut post_state, &block)?;
+    metrics::observe_block_proposal_phase("stf_simulate", stf_start.elapsed());
+    block.state_root = post_state.hash_tree_root();
+
+    let post_checkpoints = PostBlockCheckpoints {
+        justified: post_state.latest_justified,
+        finalized: post_state.latest_finalized,
+    };
+
+    Ok((block, post_checkpoints))
+}
+
+/// Pick the attestations a block at `slot` should carry, and the proof that
+/// goes with each.
+///
+/// Selection (`select_attestations`) followed by the collapse every block needs
+/// — one entry per `AttestationData`, since `on_block` rejects duplicates —
+/// with no state transition and no block assembled, so it serves both the
+/// proposer (`build_block`) and the aggregation worker building a candidate
+/// body proof.
+///
+/// The collapse strategy is gated by `enable_proposer_aggregation`:
+/// - **enabled**: same-data proofs are merged via recursive single-message
+///   aggregation into a single union-coverage proof (leanSpec #510). Maximizes
+///   voter coverage per entry at the cost of a leanVM aggregation per
+///   duplicated data entry.
+/// - **disabled** (default): the single best-coverage proof per data is kept
+///   and the rest dropped. Skips the leanVM work; coverage is bounded by the
+///   best individual proof.
+///
+/// Either way the output has one entry per `AttestationData` and the
+/// attestation-to-proof correspondence stays 1:1.
+pub(crate) fn select_and_compact(
+    head_state: &State,
+    slot: u64,
+    parent_root: H256,
+    inputs: ProposalInputs<'_>,
+    config: ProposerConfig,
+) -> Result<(AggregatedAttestations, Vec<SingleMessageAggregate>), StoreError> {
     let select_start = Instant::now();
     let selected = select_attestations(
         head_state,
@@ -136,13 +205,6 @@ pub(crate) fn build_block(
 
     let child_payloads_consumed = selected.len();
 
-    // Each AttestationData may appear at most once per block (`on_block`
-    // rejects duplicates), so same-data entries must be collapsed to one.
-    // Gated by `enable_proposer_aggregation`: when enabled, proofs sharing an
-    // AttestationData are merged via recursive single-message aggregation into
-    // a union-coverage proof (leanSpec #510); when disabled, we skip that leanVM
-    // work and keep only the single best-coverage proof per data. Both paths
-    // log the entry / unique-entry counts they already compute.
     let compact_start = Instant::now();
     let compacted = if config.enable_proposer_aggregation {
         compact_attestations(selected, head_state, slot)?
@@ -151,40 +213,32 @@ pub(crate) fn build_block(
         keep_best_proof_per_data(selected, &running_votes, slot)
     };
     metrics::observe_block_proposal_phase("compact", compact_start.elapsed());
+    metrics::inc_block_proposal_child_payloads_consumed(child_payloads_consumed as u64);
 
     let (aggregated_attestations, aggregated_signatures): (Vec<_>, Vec<_>) =
         compacted.into_iter().unzip();
-
     let attestations: AggregatedAttestations = aggregated_attestations
         .try_into()
         .expect("attestation count exceeds limit");
-    let mut final_block = Block {
-        slot,
-        proposer_index,
-        parent_root,
-        state_root: H256::ZERO,
-        body: BlockBody { attestations },
-    };
-    let mut post_state = head_state.clone();
-    // ethlambda runs the STF once after selection (it projects justification
-    // incrementally instead of re-running the STF per loop round), so this is
-    // a single `stf_simulate` observation per build.
-    let stf_start = Instant::now();
-    process_slots(&mut post_state, slot)?;
-    process_block(&mut post_state, &final_block)?;
-    metrics::observe_block_proposal_phase("stf_simulate", stf_start.elapsed());
-    final_block.state_root = post_state.hash_tree_root();
 
-    metrics::inc_block_proposal_child_payloads_consumed(child_payloads_consumed as u64);
-    metrics::observe_block_proposal_attestation_data_selected(final_block.body.attestations.len());
-    metrics::observe_block_proposal_aggregates_selected(aggregated_signatures.len());
+    Ok((attestations, aggregated_signatures))
+}
 
-    let post_checkpoints = PostBlockCheckpoints {
-        justified: post_state.latest_justified,
-        finalized: post_state.latest_finalized,
-    };
-
-    Ok((final_block, aggregated_signatures, post_checkpoints))
+/// The chain view `process_block_header` would produce on a candidate block at
+/// `slot`: covering `[0, slot - 1]` with `parent_root` at the parent's slot and
+/// `ZERO_HASH` for the empty slots in between.
+///
+/// Lets a caller validate a vote's head/source/target roots against the chain
+/// the block would extend, instead of waiting for the state transition — which
+/// does not check them at all, and would happily carry a vote for a root this
+/// node has never seen.
+pub(crate) fn extended_chain_view(head_state: &State, slot: u64, parent_root: H256) -> Vec<H256> {
+    let parent_slot = head_state.latest_block_header.slot;
+    let num_empty_slots = slot.saturating_sub(parent_slot).saturating_sub(1) as usize;
+    let mut hashes: Vec<H256> = head_state.historical_block_hashes.iter().copied().collect();
+    hashes.push(parent_root);
+    hashes.extend(std::iter::repeat_n(H256::ZERO, num_empty_slots));
+    hashes
 }
 
 /// Tiered greedy attestation selection for block proposal.
@@ -217,16 +271,7 @@ fn select_attestations(
         return selected;
     }
 
-    // Chain view that `process_block_header` would produce on the candidate
-    // block: covering [0, slot - 1] with parent_root at parent.slot and
-    // ZERO_HASH for empty slots in between. Lets us validate source/target
-    // roots without waiting for the STF to drop mismatches.
-    let parent_slot = head_state.latest_block_header.slot;
-    let num_empty_slots = slot.saturating_sub(parent_slot).saturating_sub(1) as usize;
-    let mut extended_historical_block_hashes: Vec<H256> =
-        head_state.historical_block_hashes.iter().copied().collect();
-    extended_historical_block_hashes.push(parent_root);
-    extended_historical_block_hashes.extend(std::iter::repeat_n(H256::ZERO, num_empty_slots));
+    let extended_historical_block_hashes = extended_chain_view(head_state, slot, parent_root);
 
     let chain = ChainContext {
         aggregated_payloads,
@@ -1231,10 +1276,6 @@ pub enum SealError {
     Signing(#[from] KeyManagerError),
     #[error("proposer index {0} out of range")]
     ProposerOutOfRange(u64),
-    #[error("failed to decode proposer proposal pubkey: {0}")]
-    ProposerPubkey(SignatureParseError),
-    #[error("failed to decode proposer signature bytes: {0}")]
-    ProposerSignature(SignatureParseError),
     #[error("failed to resolve participant pubkeys: {0}")]
     Participants(#[from] StoreError),
     #[error("proof list holds {aggregates} entries but the block body declares {attestations}")]
@@ -1244,29 +1285,32 @@ pub enum SealError {
     },
     #[error("attestation slot {0} out of range")]
     AttestationSlotOutOfRange(u64),
-    #[error("failed to wrap proposer signature as single-message aggregate: {0}")]
-    Wrap(AggregationError),
     #[error("failed to merge single-message aggregates into a multi-message aggregate: {0}")]
     Merge(AggregationError),
     #[error("failed to build multi-message aggregate: {0}")]
     Decode(#[from] MultiMessageAggregateError),
 }
 
-/// Seal a built block into a `SignedBlock`: sign the block root with the
-/// proposer's proposal key, wrap that raw XMSS signature into a singleton
-/// single-message aggregate SNARK, then merge it with every attestation
-/// single-message aggregate into the block's single multi-message aggregate.
+/// Sign a built block and prove its body: sign the block root with the
+/// proposer's proposal key, and merge every attestation single-message
+/// aggregate into the one Type-2 the body carries.
+///
+/// The proposer signature rides raw in [`BlockProof`] rather than inside the
+/// aggregate, so no singleton wrap and no block root enter the merge. This is
+/// the same envelope `propose_block` assembles, except that there the
+/// attestation aggregate normally comes pre-built from a
+/// [`ethlambda_types::block::BlockBodyProof`] candidate.
 ///
 /// `single_message_aggregates` are the proofs `build_block` returned alongside
 /// `block`, in the same order as `block.body.attestations`; they are consumed
 /// so their proof bytes move into the merge instead of being copied.
 /// Per-component claims (message, slot and participants) are rederived at
-/// verify time from `block.body.attestations[i]` plus `block.proposer_index`,
-/// so nothing else needs persisting.
+/// verify time from `block.body.attestations[i]`, so nothing else needs
+/// persisting.
 ///
 /// Each step is observed on the block-proposal phase histogram under
 /// [`metrics::BLOCK_PROPOSAL_SEAL_PHASES`].
-pub fn seal_block(
+pub fn sign_and_prove_block(
     head_state: &State,
     key_manager: &mut KeyManager,
     block: Block,
@@ -1281,27 +1325,12 @@ pub fn seal_block(
     metrics::observe_block_proposal_phase("sign_proposer", sign_start.elapsed());
 
     let validators = &head_state.validators;
-    let proposer_validator = validators
+    // Resolved even though the key never enters the merge: an out-of-range
+    // proposer means the block cannot be imported, and failing here keeps the
+    // benchmark from reporting a seal that import would reject.
+    validators
         .get(proposer_index as usize)
         .ok_or(SealError::ProposerOutOfRange(proposer_index))?;
-
-    // Decode the proposer's proposal pubkey once and reuse it both for the
-    // singleton single-message aggregate wrap and for the multi-message
-    // aggregate merge inputs.
-    let proposer_pubkey = ValidatorPublicKey::from_bytes(&proposer_validator.proposal_pubkey)
-        .map_err(SealError::ProposerPubkey)?;
-    let proposer_validator_signature = ValidatorSignature::from_bytes(&proposer_signature)
-        .map_err(SealError::ProposerSignature)?;
-
-    let wrap_start = Instant::now();
-    let proposer_proof_bytes = aggregate_signatures(
-        vec![proposer_pubkey.clone()],
-        vec![proposer_validator_signature],
-        &block_root,
-        slot,
-    )
-    .map_err(SealError::Wrap)?;
-    metrics::observe_block_proposal_phase("wrap_proposer", wrap_start.elapsed());
 
     // Each merge input pairs the proof bytes with the claim its Type-1 binds:
     // the message, the slot, and the participants' keys. Nothing of that is on
@@ -1318,7 +1347,16 @@ pub fn seal_block(
         });
     }
 
-    let mut merge_inputs = Vec::with_capacity(single_message_aggregates.len() + 1);
+    // An empty body carries no aggregate at all: `verify_block_signatures`
+    // rejects a stray proof on an attestation-free block.
+    if attestations.is_empty() {
+        return Ok(SignedBlock {
+            message: block,
+            proof: BlockProof::new(proposer_signature, MultiMessageAggregate::default()),
+        });
+    }
+
+    let mut merge_inputs = Vec::with_capacity(single_message_aggregates.len());
     for (attestation, sma) in attestations.iter().zip(single_message_aggregates) {
         let pubkeys = resolve_attestation_pubkeys(validators, &sma)?;
         let attestation_slot = u32::try_from(attestation.data.slot)
@@ -1326,19 +1364,15 @@ pub fn seal_block(
         let claim = SignerSet::new(attestation.data.hash_tree_root(), attestation_slot, pubkeys);
         merge_inputs.push((claim, sma.proof));
     }
-    merge_inputs.push((
-        SignerSet::new(block_root, slot, vec![proposer_pubkey]),
-        proposer_proof_bytes,
-    ));
 
     let merge_start = Instant::now();
     let merged_bytes = merge_type_1s_into_type_2(merge_inputs).map_err(SealError::Merge)?;
-    let proof = MultiMessageAggregate::from_bytes(merged_bytes.iter().as_slice())?;
+    let attestation_proof = MultiMessageAggregate::from_bytes(merged_bytes.iter().as_slice())?;
     metrics::observe_block_proposal_phase("merge_type2", merge_start.elapsed());
 
     Ok(SignedBlock {
         message: block,
-        proof,
+        proof: BlockProof::new(proposer_signature, attestation_proof),
     })
 }
 
@@ -1346,8 +1380,12 @@ pub fn seal_block(
 mod tests {
     use super::*;
     use ethlambda_types::{
-        attestation::{AggregatedAttestation, AggregationBits, AttestationData},
-        block::{ByteList512KiB, MultiMessageAggregate, SignedBlock, SingleMessageAggregate},
+        attestation::{
+            AggregatedAttestation, AggregationBits, AttestationData, blank_xmss_signature,
+        },
+        block::{
+            BlockProof, ByteList512KiB, MultiMessageAggregate, SignedBlock, SingleMessageAggregate,
+        },
         checkpoint::Checkpoint,
         state::State,
     };
@@ -2375,11 +2413,16 @@ mod tests {
         );
 
         // Substitute a worst-case-size proof to model what `propose_block`
-        // would attach. The actual SNARK can't be built without leanVM,
-        // but the size cap (`ByteList512KiB`) bounds the worst case.
+        // would attach: a 512 KiB attestation aggregate plus the fixed-size
+        // proposer signature. The actual SNARK can't be built without leanVM,
+        // but the size cap bounds the worst case.
         let _ = signatures;
-        let proof = MultiMessageAggregate::new(
-            ByteList512KiB::try_from(vec![0xAB; 512 * 1024]).expect("worst-case proof fits in cap"),
+        let proof = BlockProof::new(
+            blank_xmss_signature(),
+            MultiMessageAggregate::new(
+                ByteList512KiB::try_from(vec![0xAB; 512 * 1024])
+                    .expect("worst-case proof fits in cap"),
+            ),
         );
         let signed_block = SignedBlock {
             message: block,

@@ -126,7 +126,7 @@ The thirteen variants of the `Table` enum (`crates/storage/src/api/tables.rs`):
 | ------------------ | --------------------------- | ----------------------------------------- | --------------------------------- |
 | `BlockHeaders`     | root                        | `BlockHeader`, or a whole beacon block    | never                            |
 | `BlockBodies`      | root                        | `BlockBody` (lean only)                   | never                            |
-| `BlockProof`       | slot ‖ root                 | aggregate proof (`MultiMessageAggregate`) | yes: finalized older than ~1 day |
+| `BlockProof`       | slot ‖ root                 | `BlockProof` (proposer signature + attestation aggregate) | yes: finalized older than ~1 day |
 | `BlockRoots`       | slot                        | block root (`H256`)                       | never                            |
 | `States`           | slot ‖ root                 | full `State` snapshot                     | yes: finalized snapshot intervals |
 | `StateDiffs`       | slot ‖ root                 | `StateDiff`                               | yes: finalized snapshot intervals |
@@ -213,8 +213,9 @@ disagree.
 
 ### BlockProof
 
-`slot ‖ root → MultiMessageAggregate`. This table stores the block's **merged
-aggregate proof blob**. It is keyed by `slot ‖ root` so that pruning can scan in
+`slot ‖ root → BlockProof`. This table stores the block's **proof pair**: the
+proposer's raw XMSS signature over the block root, plus the aggregate over the
+body's attestations. It is keyed by `slot ‖ root` so that pruning can scan in
 slot order and stop early.
 
 Stored separately from headers/bodies because the genesis block has no proof.

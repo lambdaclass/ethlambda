@@ -1,7 +1,7 @@
 //! Offline block-building benchmark (`ethlambda benchmark`).
 //!
 //! Drives the exact production proposer path — `produce_block_with_signatures`
-//! then `seal_block`, the same entries `BlockChainServer::propose_block` uses —
+//! then `sign_and_prove_block`, the same entries `BlockChainServer::propose_block` uses —
 //! against a synthetic in-memory chain, and reports per-phase timing
 //! distributions. Gossip publish and the slot-alignment sleep are outside the
 //! measured span, matching the node's own `lean_block_building_time_seconds`
