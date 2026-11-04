@@ -277,14 +277,15 @@ implementation's, so none of the [common flags](#common-flags) apply to it.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--beacon-nodes` | required | Base URLs of the beacon nodes to use, comma-separated or repeated. Tried in list order; the first that answers serves the request, so the order is a preference, not load balancing |
-| `--validators-dir` | required | Directory holding the EIP-2335 keystores and `validator_definitions.yml`. Without that file, keystores in the Lighthouse layout (`<0xpubkey>/voting-keystore.json`, password in `--secrets-dir/<0xpubkey>`) are discovered and the file is written |
+| `--validators-dir` | required | Directory holding the EIP-2335 keystores and `validator_definitions.yml`, which also lists the keys a remote signer holds (see [Remote signing](#remote-signing-web3signer)). Without that file, keystores in the Lighthouse layout (`<0xpubkey>/voting-keystore.json`, password in `--secrets-dir/<0xpubkey>`) are discovered and the file is written |
 | `--secrets-dir` | required | Directory holding one password file per keystore, named after the validator's public key |
 | `--http-address` | `127.0.0.1` | Bind address for the metrics and keymanager servers |
 | `--metrics-port` | `5064` | Prometheus metrics port |
 | `--keymanager-port` | `5062` | Keymanager API port. Only bound with `--enable-keymanager` |
 | `--suggested-fee-recipient` | none | Execution address to receive block rewards, `0x`-prefixed, for every validator the keymanager API gives no address of its own. Optional, and startup warns when it is absent: without it the beacon node picks an address, and it will not be yours |
 | `--graffiti` | empty | Text for the graffiti field of proposed blocks, for every validator the keymanager API gives no graffiti of its own. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer. An ethlambda beacon node appends both clients' versions to it (see [`rpc.md`](rpc.md#validator-endpoints)) |
-| `--enable-keymanager` | off | Serve the keymanager API: keystores, plus each validator's own fee recipient, graffiti and gas limit. Off by default because it mutates key material |
+| `--enable-keymanager` | off | Serve the keymanager API: keystores, remote keys, plus each validator's own fee recipient, graffiti and gas limit. Off by default because it mutates key material |
+| `--web3signer-url` | none | Base URL of a Web3Signer (`https://signer:9000`): the signer a remote key imported through `POST /eth/v1/remotekeys` without a `url` of its own is assigned to. Checked for shape at startup. Keys whose definitions entry names a signer need no default |
 
 ### What it does today
 
@@ -397,6 +398,41 @@ attester duties untouched can still move a proposer between slots. This client
 fetches proposer duties once per epoch, at the boundary, so a reorg inside the
 epoch is not picked up until the next one.
 
+### Remote signing (Web3Signer)
+
+A validator's key can stay in a [Web3Signer](https://docs.web3signer.consensys.io/)
+instead of this process. Each signature is then one `POST
+/api/v1/eth2/sign/{pubkey}` carrying the message in full (the attestation
+data, the block header, the aggregate, and so on), the fork it is signed under
+and the signing root, and the signer answers with the signature. Every duty
+this client performs signs this way when the key is remote, the gloas envelope
+and payload attestation included; a slot's attestations are requested
+concurrently, so a hundred keys behind one signer cost one round trip rather
+than a hundred in series.
+
+Because the message travels in full, the signer's own slashing protection
+applies to it. This client keeps no record of its own (see
+[Spec Deviations](./spec_deviations.md#the-validator-client-keeps-no-slashing-protection-record)),
+so a Web3Signer with its slashing-protection database enabled is the way to
+get that protection today. A signer refusal (`412`) is logged, counted as a
+signing failure and never retried; so is a key the signer does not hold, and a
+signer that cannot be reached. Nothing is asked of the signer at startup or at
+import: a signer may start after this client does.
+
+A remote key is declared in `validator_definitions.yml` with a `url` where a
+local entry has its two keystore paths:
+
+```yaml
+- enabled: true
+  voting_public_key: "0x9612…0d07"
+  url: https://signer:9000
+```
+
+or imported at runtime through `POST /eth/v1/remotekeys` (below). A `url`
+left out of that request means `--web3signer-url`. The signer is reached over
+plain HTTPS with the system's trust roots; client certificates are not
+supported.
+
 ### The keymanager API
 
 Off unless `--enable-keymanager` is passed. It serves `GET`, `POST` and
@@ -404,6 +440,14 @@ Off unless `--enable-keymanager` is passed. It serves `GET`, `POST` and
 `api-token.txt` in the validators directory and generated there on first start
 if absent. The token file is written `0600` and a file too short to be a real
 token is refused rather than accepted.
+
+It serves `GET`, `POST` and `DELETE /eth/v1/remotekeys` for the keys a
+Web3Signer holds. The two routes partition the store: `/keystores` lists and
+deletes local keys only, `/remotekeys` remote keys only, and a key asked of the
+wrong route is `not_found`. An import of a key either route already holds is
+`duplicate`. `POST /remotekeys` persists each key to the definitions file
+before it starts signing, the same order the keystores import uses, and
+`readonly` is always `false`: this client has no key it cannot delete.
 
 It also serves `GET`, `POST` and `DELETE` on
 `/eth/v1/validator/{pubkey}/feerecipient`, `/graffiti` and `/gas_limit`, which

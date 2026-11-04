@@ -89,6 +89,12 @@ same keys, already signed.
   recorded. `POST` accepts the `slashing_protection` field and ignores it, with
   a server-side warning. A key migrated in or out through this API does not
   carry its history.
+- **What a remote signer covers:** a key held by a Web3Signer (see
+  [Remote signing](./cli.md#remote-signing-web3signer)) is signed by the
+  signer, which receives every message in full and keeps a slashing-protection
+  record of its own; a message it refuses is dropped here and never retried.
+  That record is the signer's, not this client's: it protects the keys behind
+  that signer, and nothing else changes on this page.
 - **Operationally:** do not run these keys in any other client while this one
   runs, and treat a restart as an event that needs the same care a manual key
   move would. The client warns about this at startup on every run.

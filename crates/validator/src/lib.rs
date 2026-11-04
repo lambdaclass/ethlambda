@@ -95,6 +95,10 @@ pub struct ValidatorConfig {
     /// Bind address for the keymanager API. `None` when `--enable-keymanager`
     /// was not passed, in which case it is never spawned.
     pub keymanager: Option<std::net::SocketAddr>,
+    /// `--web3signer-url`: the remote signer a key imported through
+    /// `POST /eth/v1/remotekeys` without a `url` of its own is assigned to.
+    /// Keys the definitions file already names a signer for need no default.
+    pub web3signer_url: Option<String>,
 }
 
 /// Run the validator client until the process is stopped.
@@ -146,6 +150,12 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
              directory"
         );
     }
+    // Checked for shape at startup rather than at the first import that
+    // leans on it, which could be days later.
+    if let Some(url) = &config.web3signer_url {
+        keys::Web3Signer::new(url)?;
+    }
+
     let store = ValidatorStore::load(&config.validators_dir)?;
     if store.is_empty() {
         warn!("No validators loaded; the client will idle");
@@ -212,6 +222,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             validators_dir: config.validators_dir.clone(),
             secrets_dir: config.secrets_dir.clone(),
             definitions_lock: Arc::new(Mutex::new(())),
+            default_remote_signer: config.web3signer_url.clone(),
         };
         let router = http_api::router(context, token);
         let listener = tokio::net::TcpListener::bind(address)

@@ -17,7 +17,8 @@ use ethlambda_types::beacon::containers::altair::{
 use ethlambda_types::beacon::containers::gloas::{
     ExecutionPayloadEnvelope, PayloadAttestationData,
 };
-use ethlambda_types::beacon::containers::shared::AttestationData;
+use ethlambda_types::beacon::containers::shared::{AttestationData, BeaconBlockHeader, Fork};
+use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{
     BLS_SIGNATURE_SIZE, BlsPubkey, BlsSignature, Domain, DomainType, Epoch, HashTreeRoot as _,
     Root, Slot,
@@ -28,8 +29,16 @@ use ethlambda_types::beacon::signing::{
     compute_domain, compute_epoch_at_slot, compute_signing_root,
 };
 
+use tokio::sync::RwLock;
+
 use crate::error::{Error, Result};
+use crate::keys::web3signer::{
+    AggregationSlot, ForkInfo, RandaoReveal, SigningBody, SigningRequest, SyncCommitteeMessage,
+    Versioned, VersionedHeader,
+};
 use crate::keys::{SigningMethod, ValidatorStore};
+
+pub use crate::keys::web3signer::AggregateAndProofRef;
 
 /// The ciphersuite the consensus layer pins BLS signatures to. It must match
 /// `ethlambda_state_transition::beacon::bls`'s own constant, or nothing this
@@ -192,38 +201,90 @@ impl SigningContext {
         compute_signing_root(message.hash_tree_root(), domain)
     }
 
+    /// The fork a message domained at `epoch` is signed under, told the way a
+    /// remote signer wants it: the fork active at that epoch as `current`,
+    /// the one before it as `previous`, and the epoch the current one took
+    /// effect. Phase0 has no predecessor and names itself twice, as the
+    /// genesis state's own `Fork` does.
+    pub fn fork_info(&self, epoch: Epoch) -> ForkInfo {
+        let fork = self.config.fork_at_epoch(epoch);
+        let current_version = self.config.fork_version(fork);
+        let previous_version = fork
+            .previous()
+            .map(|previous| self.config.fork_version(previous))
+            .unwrap_or(current_version);
+        ForkInfo {
+            fork: Fork {
+                previous_version,
+                current_version,
+                epoch: self.config.fork_epoch(fork),
+            },
+            genesis_validators_root: self.genesis_validators_root,
+        }
+    }
+
+    /// Web3Signer's name for the fork at `epoch`: the specification's
+    /// lowercase name in capitals (`ELECTRA`, `GLOAS`).
+    fn fork_label(&self, epoch: Epoch) -> String {
+        self.config.fork_at_epoch(epoch).as_str().to_uppercase()
+    }
+
     /// Sign an already-computed signing root on behalf of `pubkey`.
     ///
     /// Every public signing method funnels through here, so there is one place
-    /// a signature is actually produced and one place the remote-signer
-    /// variant will need to be added. Deliberately private: a caller that can
-    /// hand in an arbitrary root can make this client sign anything at all,
-    /// and the domain separation that keeps an attestation from being read as
-    /// a block lives in the callers above.
-    fn sign_root(
+    /// a signature is actually produced. Deliberately private: a caller that
+    /// can hand in an arbitrary root can make this client sign anything at
+    /// all, and the domain separation that keeps an attestation from being
+    /// read as a block lives in the callers above.
+    ///
+    /// `epoch` is the epoch the root's domain was taken at, and `body` the
+    /// message itself; a local key needs neither, a remote signer needs both.
+    ///
+    /// The store's read guard is held for the lookup alone and released before
+    /// anything is signed. `tokio::sync::RwLock` is write-preferring, so a
+    /// guard held across the remote signer's round trip would let one queued
+    /// keymanager writer stall every other duty behind it for that long.
+    async fn sign(
         &self,
-        store: &ValidatorStore,
+        store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
         root: Root,
+        epoch: Epoch,
+        body: SigningBody<'_>,
     ) -> Result<BlsSignature> {
-        let method = store.get(pubkey).ok_or(Error::UnknownValidator(*pubkey))?;
+        let method = store
+            .read()
+            .await
+            .signer(pubkey)
+            .ok_or(Error::UnknownValidator(*pubkey))?;
         match method {
             SigningMethod::LocalKeystore { secret_key } => {
                 let signature = secret_key.sign(root.as_slice(), DST, &[]);
                 let bytes: [u8; BLS_SIGNATURE_SIZE] = signature.to_bytes();
                 Ok(BlsSignature(bytes))
             }
+            SigningMethod::Web3Signer { signer } => {
+                let request = SigningRequest::new(self.fork_info(epoch), root, body);
+                signer.sign(pubkey, &request).await
+            }
         }
     }
 
     /// Sign `data` on behalf of `pubkey`.
-    pub fn sign_attestation(
+    pub async fn sign_attestation(
         &self,
-        store: &ValidatorStore,
+        store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
         data: &AttestationData,
     ) -> Result<BlsSignature> {
-        self.sign_root(store, pubkey, self.attestation_signing_root(data))
+        self.sign(
+            store,
+            pubkey,
+            self.attestation_signing_root(data),
+            data.target.epoch,
+            SigningBody::Attestation { attestation: data },
+        )
+        .await
     }
 
     /// Sign the RANDAO reveal for `epoch` on behalf of `pubkey`.
@@ -232,13 +293,22 @@ impl SigningContext {
     /// it commits to an epoch, not to a chain position, and producing one for
     /// an epoch a validator is not proposing in reveals nothing and risks
     /// nothing. It is therefore not guarded, and does not need to be.
-    pub fn sign_randao(
+    pub async fn sign_randao(
         &self,
-        store: &ValidatorStore,
+        store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
         epoch: Epoch,
     ) -> Result<BlsSignature> {
-        self.sign_root(store, pubkey, self.randao_signing_root(epoch))
+        self.sign(
+            store,
+            pubkey,
+            self.randao_signing_root(epoch),
+            epoch,
+            SigningBody::RandaoReveal {
+                randao_reveal: RandaoReveal { epoch },
+            },
+        )
+        .await
     }
 
     /// Sign the selection proof for `slot` on behalf of `pubkey`.
@@ -247,17 +317,26 @@ impl SigningContext {
     /// to a chain position, so producing one twice is producing the same bytes
     /// twice: BLS signatures are deterministic, which is the property the
     /// selection rule rests on.
-    pub fn sign_selection_proof(
+    pub async fn sign_selection_proof(
         &self,
-        store: &ValidatorStore,
+        store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
         slot: Slot,
     ) -> Result<BlsSignature> {
-        self.sign_root(store, pubkey, self.selection_proof_signing_root(slot))
+        self.sign(
+            store,
+            pubkey,
+            self.selection_proof_signing_root(slot),
+            compute_epoch_at_slot(slot),
+            SigningBody::AggregationSlot {
+                aggregation_slot: AggregationSlot { slot },
+            },
+        )
+        .await
     }
 
-    /// Sign the aggregate whose `AggregateAndProof` root is `root`, for `slot`,
-    /// on behalf of `pubkey`.
+    /// Sign `message`, an aggregator's `AggregateAndProof`, on behalf of
+    /// `pubkey`.
     ///
     /// Not slashable either, which is worth stating because it is the only
     /// signature here that covers an attestation and is not. The slashing
@@ -265,18 +344,34 @@ impl SigningContext {
     /// republishing other validators' votes with a wrapper saying who
     /// collected them, and publishing two different aggregates for one slot is
     /// wasteful rather than punishable.
-    pub fn sign_aggregate_and_proof(
+    ///
+    /// Takes the whole wrapper rather than its root: a remote signer wants to
+    /// read what it signs, and the wrapper's own fork decides its JSON shape.
+    pub async fn sign_aggregate_and_proof(
         &self,
-        store: &ValidatorStore,
+        store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
-        root: Root,
-        slot: Slot,
+        message: AggregateAndProofRef<'_>,
     ) -> Result<BlsSignature> {
-        self.sign_root(
+        let slot = message.slot();
+        let epoch = compute_epoch_at_slot(slot);
+        let version = match message {
+            AggregateAndProofRef::Gloas(_) => ForkName::Gloas.as_str().to_uppercase(),
+            AggregateAndProofRef::Electra(_) => self.fork_label(epoch),
+        };
+        self.sign(
             store,
             pubkey,
-            self.aggregate_and_proof_signing_root(root, slot),
+            self.aggregate_and_proof_signing_root(message.hash_tree_root(), slot),
+            epoch,
+            SigningBody::AggregateAndProof {
+                aggregate_and_proof: Versioned {
+                    version,
+                    data: message,
+                },
+            },
         )
+        .await
     }
 
     /// Sign the envelope revealing the payload of the block proposed for `slot`
@@ -287,14 +382,26 @@ impl SigningContext {
     /// condition to an envelope: signing two for one slot is at worst a
     /// payload the network ignores one of. The block it belongs to is the
     /// guarded signature.
-    pub fn sign_execution_payload_envelope(
+    pub async fn sign_execution_payload_envelope(
         &self,
-        store: &ValidatorStore,
+        store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
         envelope: &ExecutionPayloadEnvelope,
         slot: Slot,
     ) -> Result<BlsSignature> {
-        self.sign_root(store, pubkey, self.envelope_signing_root(envelope, slot))
+        self.sign(
+            store,
+            pubkey,
+            self.envelope_signing_root(envelope, slot),
+            compute_epoch_at_slot(slot),
+            SigningBody::ExecutionPayloadEnvelope {
+                execution_payload_envelope: Versioned {
+                    version: ForkName::Gloas.as_str().to_uppercase(),
+                    data: envelope,
+                },
+            },
+        )
+        .await
     }
 
     /// Sign a payload timeliness committee vote on behalf of `pubkey`.
@@ -302,13 +409,25 @@ impl SigningContext {
     /// Not slashable by the specification, and deduplicated per validator and
     /// slot by [`crate::payload_attestation`] only to avoid publishing the same
     /// vote twice.
-    pub fn sign_payload_attestation(
+    pub async fn sign_payload_attestation(
         &self,
-        store: &ValidatorStore,
+        store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
         data: &PayloadAttestationData,
     ) -> Result<BlsSignature> {
-        self.sign_root(store, pubkey, self.payload_attestation_signing_root(data))
+        self.sign(
+            store,
+            pubkey,
+            self.payload_attestation_signing_root(data),
+            compute_epoch_at_slot(data.slot),
+            SigningBody::PayloadAttestationMessage {
+                payload_attestation_message: Versioned {
+                    version: ForkName::Gloas.as_str().to_uppercase(),
+                    data,
+                },
+            },
+        )
+        .await
     }
 
     /// Sign a sync committee message for `slot` over `beacon_block_root`.
@@ -316,67 +435,105 @@ impl SigningContext {
     /// Not slashable, and deduplicated per validator and slot by
     /// [`crate::sync_committee`] only to avoid publishing the same message
     /// twice.
-    pub fn sign_sync_committee_message(
+    pub async fn sign_sync_committee_message(
         &self,
-        store: &ValidatorStore,
+        store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
         slot: Slot,
         beacon_block_root: Root,
     ) -> Result<BlsSignature> {
-        self.sign_root(
+        self.sign(
             store,
             pubkey,
             self.sync_committee_message_signing_root(slot, beacon_block_root),
+            compute_epoch_at_slot(slot),
+            SigningBody::SyncCommitteeMessage {
+                sync_committee_message: SyncCommitteeMessage {
+                    beacon_block_root,
+                    slot,
+                },
+            },
         )
+        .await
     }
 
     /// Sign the sync committee selection proof for `slot` and one
     /// subcommittee. Deterministic, so not guarded, for the reason
     /// [`Self::sign_selection_proof`] is not.
-    pub fn sign_sync_selection_proof(
+    pub async fn sign_sync_selection_proof(
         &self,
-        store: &ValidatorStore,
+        store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
         slot: Slot,
         subcommittee_index: u64,
     ) -> Result<BlsSignature> {
-        self.sign_root(
+        self.sign(
             store,
             pubkey,
             self.sync_selection_proof_signing_root(slot, subcommittee_index),
+            compute_epoch_at_slot(slot),
+            SigningBody::SyncCommitteeSelectionProof {
+                sync_aggregator_selection_data: SyncAggregatorSelectionData {
+                    slot,
+                    subcommittee_index,
+                },
+            },
         )
+        .await
     }
 
     /// Sign a `ContributionAndProof` on behalf of its aggregator `pubkey`.
-    pub fn sign_contribution_and_proof(
+    pub async fn sign_contribution_and_proof(
         &self,
-        store: &ValidatorStore,
+        store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
         message: &ContributionAndProof,
     ) -> Result<BlsSignature> {
-        self.sign_root(
+        self.sign(
             store,
             pubkey,
             self.contribution_and_proof_signing_root(message),
+            compute_epoch_at_slot(message.contribution.slot),
+            SigningBody::SyncCommitteeContributionAndProof {
+                contribution_and_proof: message,
+            },
         )
+        .await
     }
 
-    /// Sign the block whose root is `block_root`, proposed for `slot`, on
-    /// behalf of `pubkey`.
+    /// Sign the block whose header is `header` on behalf of `pubkey`.
+    ///
+    /// The root signed is the header's, which is the block's: a header is the
+    /// block with its body replaced by that body's root, and the two
+    /// merkleize to the same value. The header rather than the root travels
+    /// because a remote signer reads it to keep its slashing-protection
+    /// record.
     ///
     /// This one *is* slashable, and is the most expensive signature this
     /// client can get wrong: two distinct blocks for one slot need no second
     /// validator to be caught, since the two signed headers are the whole
     /// evidence. Callers must pass it through
     /// [`crate::proposal_guard::ProposalGuard`] first.
-    pub fn sign_block(
+    pub async fn sign_block(
         &self,
-        store: &ValidatorStore,
+        store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
-        block_root: Root,
-        slot: Slot,
+        header: &BeaconBlockHeader,
     ) -> Result<BlsSignature> {
-        self.sign_root(store, pubkey, self.block_signing_root(block_root, slot))
+        let epoch = compute_epoch_at_slot(header.slot);
+        self.sign(
+            store,
+            pubkey,
+            self.block_signing_root(header.hash_tree_root(), header.slot),
+            epoch,
+            SigningBody::Block {
+                beacon_block: VersionedHeader {
+                    version: self.fork_label(epoch),
+                    block_header: header.clone(),
+                },
+            },
+        )
+        .await
     }
 }
 
@@ -416,17 +573,17 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_signature_verifies_under_the_signing_root() {
+    #[tokio::test]
+    async fn a_signature_verifies_under_the_signing_root() {
         use blst::min_pk::{PublicKey, Signature};
 
-        let mut store = ValidatorStore::new();
-        let pubkey = store.insert_secret("test", &secret()).expect("inserts");
+        let (store, pubkey) = store_with_key();
         let context = context();
         let data = attestation_data(100);
 
         let signature = context
             .sign_attestation(&store, &pubkey, &data)
+            .await
             .expect("signs");
 
         let root = context.attestation_signing_root(&data);
@@ -479,11 +636,12 @@ mod tests {
         assert_eq!(context.attestation_signing_root(&data), from_target);
     }
 
-    #[test]
-    fn signing_for_an_unknown_validator_is_an_error() {
-        let store = ValidatorStore::new();
+    #[tokio::test]
+    async fn signing_for_an_unknown_validator_is_an_error() {
+        let store = RwLock::new(ValidatorStore::new());
         let err = context()
             .sign_attestation(&store, &BlsPubkey::default(), &attestation_data(1))
+            .await
             .expect_err("must fail");
         assert!(matches!(err, Error::UnknownValidator(_)), "got {err:?}");
     }
@@ -500,18 +658,31 @@ mod tests {
         sig.verify(true, root.as_slice(), DST, &[], &pk, true) == blst::BLST_ERROR::BLST_SUCCESS
     }
 
-    fn store_with_key() -> (ValidatorStore, BlsPubkey) {
+    fn store_with_key() -> (RwLock<ValidatorStore>, BlsPubkey) {
         let mut store = ValidatorStore::new();
         let pubkey = store.insert_secret("test", &secret()).expect("inserts");
-        (store, pubkey)
+        (RwLock::new(store), pubkey)
     }
 
-    #[test]
-    fn a_randao_reveal_verifies_under_the_randao_signing_root() {
+    fn header(slot: Slot) -> BeaconBlockHeader {
+        BeaconBlockHeader {
+            slot,
+            proposer_index: 7,
+            parent_root: Root::repeat_byte(1),
+            state_root: Root::repeat_byte(2),
+            body_root: Root::repeat_byte(3),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_randao_reveal_verifies_under_the_randao_signing_root() {
         let (store, pubkey) = store_with_key();
         let context = context();
 
-        let signature = context.sign_randao(&store, &pubkey, 100).expect("signs");
+        let signature = context
+            .sign_randao(&store, &pubkey, 100)
+            .await
+            .expect("signs");
         assert!(verify(
             &pubkey,
             &signature,
@@ -519,19 +690,20 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn a_block_signature_verifies_under_the_block_signing_root() {
+    #[tokio::test]
+    async fn a_block_signature_verifies_under_the_block_signing_root() {
         let (store, pubkey) = store_with_key();
         let context = context();
-        let block_root = Root::repeat_byte(7);
+        let header = header(3200);
 
         let signature = context
-            .sign_block(&store, &pubkey, block_root, 3200)
+            .sign_block(&store, &pubkey, &header)
+            .await
             .expect("signs");
         assert!(verify(
             &pubkey,
             &signature,
-            context.block_signing_root(block_root, 3200)
+            context.block_signing_root(header.hash_tree_root(), 3200)
         ));
     }
 
@@ -634,22 +806,24 @@ mod tests {
         );
     }
 
-    #[test]
-    fn signing_a_block_for_an_unknown_validator_is_an_error() {
-        let store = ValidatorStore::new();
+    #[tokio::test]
+    async fn signing_a_block_for_an_unknown_validator_is_an_error() {
+        let store = RwLock::new(ValidatorStore::new());
         let err = context()
-            .sign_block(&store, &BlsPubkey::default(), Root::ZERO, 1)
+            .sign_block(&store, &BlsPubkey::default(), &header(1))
+            .await
             .expect_err("must fail");
         assert!(matches!(err, Error::UnknownValidator(_)), "got {err:?}");
     }
 
-    #[test]
-    fn a_selection_proof_verifies_under_its_own_root() {
+    #[tokio::test]
+    async fn a_selection_proof_verifies_under_its_own_root() {
         let (store, pubkey) = store_with_key();
         let context = context();
 
         let signature = context
             .sign_selection_proof(&store, &pubkey, 3200)
+            .await
             .expect("signs");
         assert!(verify(
             &pubkey,
@@ -658,30 +832,43 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn an_aggregate_signature_verifies_under_its_own_root() {
+    #[tokio::test]
+    async fn an_aggregate_signature_verifies_under_its_own_root() {
+        use ethlambda_types::beacon::containers::electra;
+
         let (store, pubkey) = store_with_key();
         let context = context();
-        let root = Root::repeat_byte(4);
+        let message = electra::AggregateAndProof {
+            aggregator_index: 9,
+            aggregate: electra::Attestation {
+                aggregation_bits: Default::default(),
+                data: attestation_data(100),
+                signature: BlsSignature([2; 96]),
+                committee_bits: Default::default(),
+            },
+            selection_proof: BlsSignature([3; 96]),
+        };
 
         let signature = context
-            .sign_aggregate_and_proof(&store, &pubkey, root, 3200)
+            .sign_aggregate_and_proof(&store, &pubkey, AggregateAndProofRef::Electra(&message))
+            .await
             .expect("signs");
         assert!(verify(
             &pubkey,
             &signature,
-            context.aggregate_and_proof_signing_root(root, 3200)
+            context.aggregate_and_proof_signing_root(message.hash_tree_root(), 3200)
         ));
     }
 
-    #[test]
-    fn a_sync_committee_message_verifies_under_its_own_root() {
+    #[tokio::test]
+    async fn a_sync_committee_message_verifies_under_its_own_root() {
         let (store, pubkey) = store_with_key();
         let context = context();
         let root = Root::repeat_byte(5);
 
         let signature = context
             .sign_sync_committee_message(&store, &pubkey, 3200, root)
+            .await
             .expect("signs");
         assert!(verify(
             &pubkey,
@@ -706,13 +893,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_sync_selection_proof_verifies_and_names_the_subcommittee() {
+    #[tokio::test]
+    async fn a_sync_selection_proof_verifies_and_names_the_subcommittee() {
         let (store, pubkey) = store_with_key();
         let context = context();
 
         let signature = context
             .sign_sync_selection_proof(&store, &pubkey, 3200, 2)
+            .await
             .expect("signs");
         assert!(verify(
             &pubkey,
@@ -731,8 +919,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_contribution_and_proof_verifies_under_its_own_root() {
+    #[tokio::test]
+    async fn a_contribution_and_proof_verifies_under_its_own_root() {
         use ethlambda_types::beacon::containers::altair::SyncCommitteeContribution;
 
         let (store, pubkey) = store_with_key();
@@ -751,6 +939,7 @@ mod tests {
 
         let signature = context
             .sign_contribution_and_proof(&store, &pubkey, &message)
+            .await
             .expect("signs");
         assert!(verify(
             &pubkey,
@@ -759,12 +948,220 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn signing_a_randao_reveal_for_an_unknown_validator_is_an_error() {
-        let store = ValidatorStore::new();
+    #[tokio::test]
+    async fn signing_a_randao_reveal_for_an_unknown_validator_is_an_error() {
+        let store = RwLock::new(ValidatorStore::new());
         let err = context()
             .sign_randao(&store, &BlsPubkey::default(), 1)
+            .await
             .expect_err("must fail");
         assert!(matches!(err, Error::UnknownValidator(_)), "got {err:?}");
+    }
+
+    /// `fork_info` must describe the fork at the epoch the domain was taken
+    /// at, since the remote signer recomputes the domain from it. Mainnet's
+    /// altair boundary pins all three fields on either side.
+    #[test]
+    fn fork_info_names_the_fork_at_the_epoch_and_its_predecessor() {
+        let context = context();
+        let altair = context.config.altair_fork_epoch;
+
+        let before = context.fork_info(altair - 1);
+        assert_eq!(
+            before.fork.current_version,
+            context.config.genesis_fork_version
+        );
+        assert_eq!(
+            before.fork.previous_version, before.fork.current_version,
+            "phase0 has no predecessor and names itself twice"
+        );
+        assert_eq!(before.fork.epoch, 0);
+
+        let after = context.fork_info(altair);
+        assert_eq!(
+            after.fork.current_version,
+            context.config.altair_fork_version
+        );
+        assert_eq!(
+            after.fork.previous_version,
+            context.config.genesis_fork_version
+        );
+        assert_eq!(after.fork.epoch, altair);
+        assert_eq!(
+            after.genesis_validators_root,
+            context.genesis_validators_root
+        );
+    }
+
+    /// A remote signer, stood in for by a local HTTP server: the request it
+    /// receives is the one Web3Signer documents, and the signature it returns
+    /// is what the caller gets back.
+    mod remote {
+        use super::*;
+        use axum::Router;
+        use axum::extract::{Path, State};
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+
+        /// What the fake signer does: records every request and answers with
+        /// a fixed signature, or with a fixed status.
+        #[derive(Clone)]
+        struct Fake {
+            requests: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+            answer: Arc<Mutex<Answer>>,
+        }
+
+        #[derive(Clone, Copy)]
+        enum Answer {
+            Signature,
+            Status(u16),
+        }
+
+        async fn handle(
+            State(fake): State<Fake>,
+            Path(pubkey): Path<String>,
+            body: String,
+        ) -> (StatusCode, String) {
+            let json: serde_json::Value = serde_json::from_str(&body).expect("json body");
+            fake.requests.lock().expect("lock").push((pubkey, json));
+            match *fake.answer.lock().expect("lock") {
+                Answer::Signature => (
+                    StatusCode::OK,
+                    format!("{{\"signature\":\"0x{}\"}}", "ab".repeat(96)),
+                ),
+                Answer::Status(code) => (
+                    StatusCode::from_u16(code).expect("status"),
+                    "refused".to_string(),
+                ),
+            }
+        }
+
+        /// Start the fake on an ephemeral port and return it with its URL.
+        async fn serve(answer: Answer) -> (Fake, String) {
+            let fake = Fake {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                answer: Arc::new(Mutex::new(answer)),
+            };
+            let app = Router::new()
+                .route("/api/v1/eth2/sign/{pubkey}", post(handle))
+                .with_state(fake.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("binds");
+            let address = listener.local_addr().expect("address");
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("serves");
+            });
+            (fake, format!("http://{address}"))
+        }
+
+        fn remote_store(url: &str) -> (RwLock<ValidatorStore>, BlsPubkey) {
+            let pubkey = BlsPubkey([0x42; 48]);
+            let mut store = ValidatorStore::new();
+            store.insert_remote(pubkey, url).expect("inserts");
+            (RwLock::new(store), pubkey)
+        }
+
+        #[tokio::test]
+        async fn an_attestation_is_signed_by_the_remote_signer() {
+            let (fake, url) = serve(Answer::Signature).await;
+            let (store, pubkey) = remote_store(&url);
+            let context = context();
+            let data = attestation_data(context.config.altair_fork_epoch + 1);
+
+            let signature = context
+                .sign_attestation(&store, &pubkey, &data)
+                .await
+                .expect("signs");
+            assert_eq!(signature.0, [0xab; 96]);
+
+            let requests = fake.requests.lock().expect("lock");
+            assert_eq!(requests.len(), 1);
+            let (path_pubkey, body) = &requests[0];
+            assert_eq!(path_pubkey, &format!("0x{}", "42".repeat(48)));
+            assert_eq!(body["type"], "ATTESTATION");
+            assert_eq!(
+                body["signingRoot"],
+                serde_json::to_value(context.attestation_signing_root(&data)).expect("root")
+            );
+            assert_eq!(
+                body["attestation"]["target"]["epoch"],
+                data.target.epoch.to_string()
+            );
+            assert_eq!(
+                body["fork_info"],
+                serde_json::to_value(context.fork_info(data.target.epoch)).expect("fork info"),
+                "the fork is the target epoch's, where the domain came from"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_block_request_names_the_fork_and_carries_the_header() {
+            let (fake, url) = serve(Answer::Signature).await;
+            let (store, pubkey) = remote_store(&url);
+            let context = context();
+            let slot = context.config.altair_fork_epoch * preset::SLOTS_PER_EPOCH;
+            let header = header(slot);
+
+            context
+                .sign_block(&store, &pubkey, &header)
+                .await
+                .expect("signs");
+
+            let requests = fake.requests.lock().expect("lock");
+            let body = &requests[0].1;
+            assert_eq!(body["type"], "BLOCK_V2");
+            assert_eq!(body["beacon_block"]["version"], "ALTAIR");
+            assert_eq!(
+                body["beacon_block"]["block_header"]["slot"],
+                slot.to_string()
+            );
+            assert_eq!(
+                body["signingRoot"],
+                serde_json::to_value(context.block_signing_root(header.hash_tree_root(), slot))
+                    .expect("root")
+            );
+        }
+
+        #[tokio::test]
+        async fn a_slashing_protection_refusal_is_a_signing_error() {
+            let (_fake, url) = serve(Answer::Status(412)).await;
+            let (store, pubkey) = remote_store(&url);
+
+            let err = context()
+                .sign_attestation(&store, &pubkey, &attestation_data(100))
+                .await
+                .expect_err("must fail");
+            assert!(matches!(err, Error::Signing { .. }), "got {err:?}");
+            assert!(err.to_string().contains("slashing protection"), "{err}");
+            assert!(!err.is_retryable());
+        }
+
+        #[tokio::test]
+        async fn a_key_the_signer_does_not_hold_is_a_signing_error() {
+            let (_fake, url) = serve(Answer::Status(404)).await;
+            let (store, pubkey) = remote_store(&url);
+
+            let err = context()
+                .sign_randao(&store, &pubkey, 1)
+                .await
+                .expect_err("must fail");
+            assert!(matches!(err, Error::Signing { .. }), "got {err:?}");
+            assert!(err.to_string().contains("does not hold"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn an_unreachable_signer_is_a_signing_error() {
+            // Nothing listens on port 9 (discard), and a connection refused
+            // comes back at once rather than after the request timeout.
+            let (store, pubkey) = remote_store("http://127.0.0.1:9");
+
+            let err = context()
+                .sign_randao(&store, &pubkey, 1)
+                .await
+                .expect_err("must fail");
+            assert!(matches!(err, Error::Signing { .. }), "got {err:?}");
+        }
     }
 }

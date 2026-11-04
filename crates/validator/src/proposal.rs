@@ -52,7 +52,9 @@ use std::sync::Arc;
 
 use ethlambda_types::beacon::constants::BUILDER_INDEX_SELF_BUILD;
 use ethlambda_types::beacon::fork::ForkName;
-use ethlambda_types::beacon::primitives::{BlsPubkey, ExecutionAddress, Root, Slot};
+use ethlambda_types::beacon::primitives::{
+    BlsPubkey, ExecutionAddress, HashTreeRoot as _, Root, Slot,
+};
 use ethlambda_types::beacon::signing::compute_epoch_at_slot;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -195,15 +197,7 @@ impl<B: BeaconNodeApi> ProposalService<B> {
             }
         }
 
-        // Scoped away from every await, the way the attestation path's read
-        // guard is, and for the reason spelled out there: a write-preferring
-        // lock lets one queued keymanager writer block every reader behind it,
-        // so a guard held across the block production round trip below would
-        // put the whole duty path behind it.
-        let randao_reveal = {
-            let store = store.read().await;
-            self.context.sign_randao(&store, &pubkey, epoch)?
-        };
+        let randao_reveal = self.context.sign_randao(store, &pubkey, epoch).await?;
 
         // Both read once, before the block is asked for, so the check below
         // compares against the address in force when the request went out.
@@ -263,37 +257,39 @@ impl<B: BeaconNodeApi> ProposalService<B> {
             "Block produced; signing"
         );
 
-        // The root is taken from the decoded container, never from anything
-        // reassembled here, and it is taken once: the same value is what the
+        // The header is taken from the decoded container, never from anything
+        // reassembled here, and it is taken once: its root is what the
         // guard's slot is recorded against and what the signature covers.
+        let header = produced.header();
         let block_root = produced.block_root();
+        debug_assert_eq!(
+            header.hash_tree_root(),
+            block_root,
+            "a header merkleizes to its block's root"
+        );
 
-        let signature = {
-            let store = store.read().await;
-
-            // The check that matters, and the one that records. Everything
-            // after this point may be abandoned without risk, because the
-            // guard already counts this slot as proposed.
-            match self.guard.lock() {
-                Ok(mut guard) => guard.check_and_record(&pubkey, slot).map_err(|refusal| {
-                    crate::metrics::inc_blocks_refused();
-                    Error::ProposalRefused {
-                        slot,
-                        reason: refusal.to_string(),
-                    }
-                })?,
-                Err(err) => {
-                    warn!(%slot, %err, "Proposal guard is poisoned; refusing to sign");
-                    crate::metrics::inc_blocks_refused();
-                    return Err(Error::ProposalRefused {
-                        slot,
-                        reason: "the proposal guard is poisoned".to_string(),
-                    });
+        // The check that matters, and the one that records. Everything
+        // after this point may be abandoned without risk, because the
+        // guard already counts this slot as proposed.
+        match self.guard.lock() {
+            Ok(mut guard) => guard.check_and_record(&pubkey, slot).map_err(|refusal| {
+                crate::metrics::inc_blocks_refused();
+                Error::ProposalRefused {
+                    slot,
+                    reason: refusal.to_string(),
                 }
+            })?,
+            Err(err) => {
+                warn!(%slot, %err, "Proposal guard is poisoned; refusing to sign");
+                crate::metrics::inc_blocks_refused();
+                return Err(Error::ProposalRefused {
+                    slot,
+                    reason: "the proposal guard is poisoned".to_string(),
+                });
             }
+        }
 
-            self.context.sign_block(&store, &pubkey, block_root, slot)?
-        };
+        let signature = self.context.sign_block(store, &pubkey, &header).await?;
 
         // Taken out before the block is signed into its body: the envelope is
         // published on its own, after the block, and the bare gloas block body
@@ -384,11 +380,10 @@ impl<B: BeaconNodeApi> ProposalService<B> {
             )));
         }
 
-        let signature = {
-            let store = store.read().await;
-            self.context
-                .sign_execution_payload_envelope(&store, pubkey, &envelope, slot)?
-        };
+        let signature = self
+            .context
+            .sign_execution_payload_envelope(store, pubkey, &envelope, slot)
+            .await?;
         let body = match payload {
             Some(payload) => payload.into_signed_contents_ssz(signature),
             None => signed_envelope_ssz(envelope, signature),
@@ -442,7 +437,6 @@ mod tests {
     use crate::beacon_node::block_contents::SignedBlockContents;
     use crate::beacon_node::mock::MockBeaconNode;
     use ethlambda_types::beacon::config::Config;
-    use ethlambda_types::beacon::primitives::HashTreeRoot as _;
     use ethlambda_types::beacon::primitives::{BlsPubkey, Bytes32, H160, Root};
     use libssz::SszDecode as _;
 
@@ -784,7 +778,7 @@ mod gloas_tests {
     use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::containers::gloas;
     use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
-    use ethlambda_types::beacon::primitives::{BlsPubkey, HashTreeRoot as _};
+    use ethlambda_types::beacon::primitives::BlsPubkey;
     use libssz::SszDecode as _;
 
     const GLOAS_EPOCH: u64 = 10;
