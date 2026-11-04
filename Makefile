@@ -1,4 +1,4 @@
-.PHONY: help fmt lint bench update cooldown-check docker-build shadow-build shadow-docker-build run-devnet test test-consensus test-node test-beacon test-beacon-mainnet test-beacon-minimal consensus-spec-tests cryptography-specs docs docs-deps docs-serve
+.PHONY: help fmt lint bench update cooldown-check docker-build shadow-build shadow-docker-build run-devnet test test-consensus test-node test-ethrex test-beacon test-beacon-mainnet test-beacon-minimal consensus-spec-tests cryptography-specs docs docs-deps docs-serve
 
 help: ## 📚 Show help for each of the Makefile recipes
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
@@ -11,6 +11,8 @@ lint: ## 🔍 Run clippy on all workspace crates
 	# The spectests are `test = false` (stale leanSpec fixtures), which
 	# `--all-targets` skips: lint them by name so they keep compiling
 	cargo clippy --locked --workspace --test forkchoice_spectests --test signature_spectests --test stf_spectests --test ssz_spectests -- -D warnings
+	# The binary's `include-ethrex` code is cfg'd out of the passes above
+	cargo clippy --locked --workspace --all-targets --features ethlambda/include-ethrex -- -D warnings
 
 # release-fast: release-grade opt-level to avoid stack overflows during
 # signature verification/aggregation, without paying for LTO on every rebuild
@@ -33,13 +35,23 @@ TEST=cargo test --locked --profile release-fast
 # else.
 CONSENSUS_CRATES=ethlambda-types ethlambda-fork-choice ethlambda-state-transition ethlambda-blockchain ethlambda-crypto ethlambda-ssz-tree
 
-test: test-consensus test-node ## 🧪 Run all tests
+# The embedded execution client, tested apart from both halves: ethrex's RPC
+# and node crates are a large build neither half otherwise needs, and the node
+# half already sits at the runner's disk ceiling. `test-node` excludes it.
+ETHREX_CRATES=ethlambda-ethrex
+
+test: test-consensus test-node test-ethrex ## 🧪 Run all tests
 
 test-consensus: leanSpec/fixtures ## 🧪 Run the consensus half of the workspace suite
 	$(TEST) $(addprefix -p ,$(CONSENSUS_CRATES))
 
 test-node: leanSpec/fixtures ## 🧪 Run the node half of the workspace suite
-	$(TEST) --workspace $(addprefix --exclude ,$(CONSENSUS_CRATES))
+	$(TEST) --workspace $(addprefix --exclude ,$(CONSENSUS_CRATES) $(ETHREX_CRATES))
+
+# The engine and the binary run again with the feature on, for their
+# `include-ethrex` code: the in-process transport and the `--ethrex.*` flags.
+test-ethrex: ## 🧪 Run the embedded-ethrex tests (include-ethrex feature)
+	$(TEST) $(addprefix -p ,$(ETHREX_CRATES)) -p ethlambda-engine -p ethlambda --features ethlambda/include-ethrex
 
 # --lib as well as the spec target: the BLS and KZG modules keep their fixture
 # vectors as unit tests, which are `ignore`d unless this feature is on.

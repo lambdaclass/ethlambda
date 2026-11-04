@@ -11,6 +11,7 @@ members = [
     "crates/common/metrics",
     "crates/common/test-fixtures",
     "crates/common/types",
+    "crates/execution/ethrex",
     "crates/net/api",
     "crates/net/engine",
     "crates/net/p2p",
@@ -76,6 +77,7 @@ ethlambda-test-fixtures = { path = "crates/common/test-fixtures" }
 ethlambda-types = { path = "crates/common/types" }
 ethlambda-network-api = { path = "crates/net/api" }
 ethlambda-engine = { path = "crates/net/engine" }
+ethlambda-ethrex = { path = "crates/execution/ethrex" }
 ethlambda-p2p = { path = "crates/net/p2p" }
 ethlambda-rpc = { path = "crates/net/rpc" }
 ethlambda-storage = { path = "crates/storage" }
@@ -103,6 +105,22 @@ clap = { version = "4.3", features = ["derive", "env"] }
 # `rand` is re-exported as `secp256k1::rand`, so nothing needs a direct dep on it
 # to seed a key.
 secp256k1 = { version = "0.30.0", default-features = false, features = ["global-context", "rand"] }
+
+# ethrex, pinned to one release tag for every crate that uses it: discovery in
+# `ethlambda-p2p`, and the embedded execution client behind the
+# `include-ethrex` feature (`ethlambda-engine`, `ethlambda-ethrex`). One tag
+# keeps a single copy of ethrex in the graph. A tag rather than a branch: a
+# `main` that moves under us would change what we build against with nothing in
+# the manifest saying so.
+ethrex = { git = "https://github.com/lambdaclass/ethrex", tag = "v29.0.1", default-features = false }
+ethrex-blockchain = { git = "https://github.com/lambdaclass/ethrex", tag = "v29.0.1" }
+ethrex-common = { git = "https://github.com/lambdaclass/ethrex", tag = "v29.0.1" }
+ethrex-config = { git = "https://github.com/lambdaclass/ethrex", tag = "v29.0.1" }
+ethrex-crypto = { git = "https://github.com/lambdaclass/ethrex", tag = "v29.0.1" }
+ethrex-p2p = { git = "https://github.com/lambdaclass/ethrex", tag = "v29.0.1" }
+ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex", tag = "v29.0.1" }
+ethrex-rpc = { git = "https://github.com/lambdaclass/ethrex", tag = "v29.0.1" }
+ethrex-storage = { git = "https://github.com/lambdaclass/ethrex", tag = "v29.0.1" }
 
 # Merkleizing a beacon state is almost entirely SHA-256 compressions, so which
 # implementation `sha2` picks matters. What `asm` actually buys is aarch64: on
