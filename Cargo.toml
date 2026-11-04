@@ -27,7 +27,7 @@ license = "LICENSE"
 readme = "README.md"
 repository = "https://github.com/lambdaclass/ethlambda"
 rust-version = "1.97.1"
-version = "0.1.0"
+version = "1.0.0"
 
 # Cross-crate inlining matters here: the hot paths (SSZ encode/decode, hashing,
 # fork choice traversal) are split across workspace crates and their
@@ -95,7 +95,7 @@ spawned-rt = "0.5.0"
 tokio = "1.0"
 tokio-util = "0.7"
 
-prometheus = "0.14"
+prometheus = { version = "0.14", features = ["process"] }
 
 clap = { version = "4.3", features = ["derive", "env"] }
 

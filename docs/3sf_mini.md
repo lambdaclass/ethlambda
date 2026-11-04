@@ -1,8 +1,9 @@
 # 3SF-mini: Justification & Finalization
 
-ethlambda uses **3SF-mini** (Three-Stage Finality, minimal version) for justification
-and finalization. Unlike the Ethereum Beacon Chain's epoch-based Casper FFG, 3SF-mini
-operates at the **slot level**: any slot can be justified, not just epoch boundaries.
+ethlambda's Lean Chain (`ethlambda node`) uses **3SF-mini** (Three-Stage Finality,
+minimal version) for justification and finalization. Unlike the Ethereum Beacon Chain's
+epoch-based Casper FFG, which `ethlambda beacon` follows, 3SF-mini operates at the
+**slot level**: any slot can be justified, not just epoch boundaries.
 
 ## Quick Example: Three Slots to Finality
 
@@ -78,7 +79,7 @@ A checkpoint becomes **justified** when at least two-thirds of validators attest
 
 The threshold is computed as: `3 × vote_count >= 2 × validator_count`
 
-> **In ethlambda:** Justification and finalization are processed inside
+> **In ethlambda's Lean Chain:** Justification and finalization are processed inside
 > `process_attestations()` in `crates/blockchain/state_transition/src/lib.rs`,
 > called from `process_block()`. The supermajority check is
 > `3 * vote_count >= 2 * validator_count`.
@@ -98,7 +99,7 @@ finalized slot. This is the novel part of 3SF-mini.
 
 A slot is **justifiable** if `delta = slot - finalized_slot` matches any rule:
 
-> **In ethlambda:** The function `slot_is_justifiable_after(slot, finalized_slot)` in
+> **In ethlambda's Lean Chain:** The function `slot_is_justifiable_after(slot, finalized_slot)` in
 > `crates/blockchain/state_transition/src/lib.rs` implements this check. It uses
 > `isqrt()` for perfect square detection and the identity `4n(n+1) + 1 = (2n+1)²`
 > for pronic number detection.
@@ -155,7 +156,7 @@ whose target is the **next justifiable slot**. In other words, there must be **n
 justifiable slots between source and target**: the two must be consecutive entries in
 the justifiability schedule.
 
-> **In ethlambda:** The `try_finalize()` function iterates over slots between
+> **In ethlambda's Lean Chain:** The `try_finalize()` function iterates over slots between
 > source and target and calls `slot_is_justifiable_after` on each. If any slot
 > is justifiable, finalization fails (source and target aren't consecutive).
 > The check uses `original_finalized_slot` (the finalized slot at the start of
@@ -304,7 +305,7 @@ When finalization advances, the following cleanup occurs:
 - Gossip signatures and aggregation proofs for finalized blocks are cleaned up
 - Future fork choice runs start from the finalized slot's successor
 
-> **In ethlambda:** The `justified_slots` bitlist uses relative indexing (index 0 =
+> **In ethlambda's Lean Chain:** The `justified_slots` bitlist uses relative indexing (index 0 =
 > `finalized_slot + 1`). When finalization advances, `shift_window()` in
 > `crates/blockchain/state_transition/src/justified_slots_ops.rs` drops the
 > now-finalized prefix. The attestation target is also walked back to the nearest
@@ -342,7 +343,7 @@ behind the head. The attestation **target** is derived by walking back from the 
 toward the safe target (max 3 steps), then to the nearest justifiable slot. See
 [Safe Target Selection](lmd_ghost.md#safe-target-selection) for details.
 
-> **In ethlambda:** `get_attestation_target()` in `crates/blockchain/src/store.rs`
+> **In ethlambda's Lean Chain:** `get_attestation_target()` in `crates/blockchain/src/store.rs`
 > implements this walk-back. `JUSTIFICATION_LOOKBACK_SLOTS = 3` provides a liveness
 > guarantee: even if the safe target is stuck, the target eventually advances once
 > the head moves far enough ahead.

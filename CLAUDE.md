@@ -1,7 +1,8 @@
 # ethlambda Development Guide
 
-Development reference for ethlambda - minimalist Lean Ethereum consensus client.
-Not to be confused with Ethereum consensus clients AKA Beacon Chain clients AKA Eth2 clients.
+Development reference for ethlambda - minimalist Beacon Chain and Lean Chain client.
+The two are different protocols sharing one binary: `ethlambda beacon` follows the
+Ethereum Beacon Chain (AKA Eth2), and `ethlambda node` runs Lean consensus.
 
 ## Quick Reference
 

@@ -82,11 +82,12 @@ async fn get_header(Path(block_id): Path<String>, State(store): State<Store>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::beacon_fixture;
+    use crate::test_utils::{beacon_fixture, phase0_beacon_block};
     use axum::{
         body::Body,
         http::{Request, StatusCode},
     };
+    use ethlambda_types::beacon::containers::SignedBeaconBlock;
     use http_body_util::BodyExt as _;
     use tower::ServiceExt as _;
 
@@ -141,26 +142,48 @@ mod tests {
         );
     }
 
-    /// `canonical` is read off the index rather than assumed. The anchor is
-    /// reachable by root but is not in `BlockRoots`, so it answers `false`
-    /// while the head answers `true`.
+    /// `canonical` is read off the index rather than assumed. The anchor's
+    /// slot is indexed at bootstrap (`Store::index_beacon_anchor`), so it
+    /// answers `true` like the head does, and a root the index does not name
+    /// at its slot answers `false`.
     #[tokio::test]
     async fn canonical_is_checked_against_the_index() {
         let head = body_json(get("/eth/v1/beacon/headers/head".to_string()).await).await;
         assert_eq!(head["data"]["canonical"], true);
 
         let fixture = beacon_fixture(ANCHOR_SLOT);
-        let uri = format!("/eth/v1/beacon/headers/0x{:x}", fixture.anchor_root);
-        let app = routes().with_state(fixture.store);
-        let response = app
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        let anchor = body_json(response).await;
+        let mut store = fixture.store;
+        // A sibling of the head: stored, but not on the branch the head ends.
+        let SignedBeaconBlock::Phase0(mut sibling) =
+            phase0_beacon_block(fixture.head_slot, fixture.anchor_root)
+        else {
+            unreachable!("the helper builds a phase0 block");
+        };
+        sibling.message.proposer_index = 1;
+        let sibling = SignedBeaconBlock::Phase0(sibling);
+        let sibling_root = sibling.message_hash_tree_root();
+        store
+            .insert_signed_block(sibling_root, sibling)
+            .expect("insert sibling");
+
+        let app = routes().with_state(store);
+        let canonical = |root: H256| {
+            let app = app.clone();
+            async move {
+                let uri = format!("/eth/v1/beacon/headers/0x{root:x}");
+                let response = app
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                body_json(response).await["data"]["canonical"].clone()
+            }
+        };
         assert_eq!(
-            anchor["data"]["canonical"], false,
-            "the anchor's slot is not in BlockRoots, so the index cannot vouch for it"
+            canonical(fixture.anchor_root).await,
+            true,
+            "the anchor heads the canonical chain"
         );
+        assert_eq!(canonical(sibling_root).await, false);
     }
 
     #[tokio::test]

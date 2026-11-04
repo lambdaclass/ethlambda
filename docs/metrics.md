@@ -2,9 +2,9 @@
 
 We collect various metrics and serve them via a Prometheus-compatible HTTP endpoint at `http://<http_address>:<metrics_port>/metrics` (default: `http://127.0.0.1:5054/metrics`).
 
-A ready-to-use Grafana + Prometheus monitoring stack with pre-configured [leanMetrics](https://github.com/leanEthereum/leanMetrics) dashboards is available in [lean-quickstart](https://github.com/blockblaz/lean-quickstart).
+For the Lean Chain, a ready-to-use Grafana + Prometheus monitoring stack with pre-configured [leanMetrics](https://github.com/leanEthereum/leanMetrics) dashboards is available in [lean-quickstart](https://github.com/blockblaz/lean-quickstart).
 
-The exposed metrics follow [the leanMetrics specification](https://github.com/leanEthereum/leanMetrics/blob/2719baad8351c9ad5eaf3c8621f33fcec20a1dc7/metrics.md), with some metrics not yet implemented. We have a full list of implemented metrics below, with a checkbox indicating whether each metric is currently supported or not.
+The Lean Chain's metrics follow [the leanMetrics specification](https://github.com/leanEthereum/leanMetrics/blob/2719baad8351c9ad5eaf3c8621f33fcec20a1dc7/metrics.md), with some metrics not yet implemented. The Beacon Chain side has no such specification: its own metrics are among the [Custom Metrics](#custom-metrics-non-leanmetrics) (the "Beacon" sections and Data Column Sidecars), and the validator client's are under [Validator client](#validator-client). We have a full list of implemented metrics below, with a checkbox indicating whether each metric is currently supported or not.
 
 ## Node Info Metrics
 
@@ -12,6 +12,13 @@ The exposed metrics follow [the leanMetrics specification](https://github.com/le
 |--------|-------|-------|-------------------------|--------|---------------|
 | `lean_node_info` | Gauge | Node information (always 1) | On node start | name, version | ✅ |
 | `lean_node_start_time_seconds` | Gauge | Start timestamp | On node start | | ✅ |
+
+On Linux the endpoint also serves the `prometheus` crate's process collector,
+read from `/proc/self` at each scrape: `process_resident_memory_bytes`,
+`process_virtual_memory_bytes`, `process_cpu_seconds_total`,
+`process_open_fds`, `process_max_fds`, `process_threads` and
+`process_start_time_seconds`. They are not part of the leanMetrics spec, and
+other platforms do not export them.
 
 
 ## PQ Signature Metrics
@@ -327,6 +334,7 @@ In practice the distribution is bimodal and dominated by production rather than 
 | `lean_table_bytes` | Gauge | Estimated byte size of a storage table (key + value bytes) | After each processed block (one update per table); retains its previous value on empty slots | table=`<table_name>` |
 | `lean_state_write_queue_depth` | Gauge | States handed to the background writer but not yet committed | On every hand-off and on every commit | |
 | `lean_state_write_seconds` | Histogram | Time the background writer spends encoding, diffing and committing one state | Per state written | |
+| `lean_state_cache_lookups_total` | Counter | State cache lookups, by the `Store` method that made them, the kind of state asked for, and whether the cache held it | On every `get_state` (and the writer's own parent read), `has_state` and `cached_state` call | method=get_state,has_state,cached_state<br>kind=block,checkpoint<br>result=hit,miss |
 
 **On a beacon follower, watch `lean_table_bytes{table="data_columns"}`.** Every
 other table's series either stays flat or is bounded by pruning; `data_columns`
@@ -345,6 +353,15 @@ three means `insert_state` blocked on the full channel waiting for the writer,
 and `lean_state_write_seconds` says whether that time went into the encode or
 the commit. A depth that stays at zero means the writer has nothing
 outstanding.
+
+**Read `lean_state_cache_lookups_total` per `method`, not summed.**
+`cached_state` with `kind="block"` is gossip validation's lookup of the voted
+or parent block's state, made once per attestation and aggregate, so it runs far
+more often than the other two and a summed rate is mostly its own. A `get_state`
+or `has_state` miss means the state was not resident and came from the writer's
+buffer or RocksDB. A `cached_state` miss with `kind="checkpoint"` means fork
+choice's `checkpoint_state` rebuilt the state, running `process_slots` up to the
+epoch boundary when the checkpoint's block precedes it.
 
 ### Beacon Gossip Validation
 

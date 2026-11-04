@@ -3,7 +3,7 @@ authors = ["lambdaclass"]
 language = "en"
 src = "docs"
 title = "ethlambda"
-description = "Minimalist, fast and modular implementation of the Lean Ethereum client written in Rust"
+description = "Minimalist, fast and modular implementation of a Beacon Chain and Lean Chain client written in Rust"
 
 [rust]
 edition = "2024"
