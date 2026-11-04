@@ -2,7 +2,7 @@
 
 This doc explains how ethlambda saves data. Especially,
 the split between the fork choice `Store` and the `StorageBackend` trait,
-what each of the eleven tables holds, and which data is in-memory only.
+what each of the thirteen tables holds, and which data is in-memory only.
 
 ## Overview
 
@@ -108,8 +108,10 @@ is built from it, and clones are handed to the BlockChain and P2P actors.
    │   │ LiveChain                      │         │ (raw XMSS sigs       │    │
    │   │ DataColumns                    │         │ awaiting             │    │
    │   │ PendingDataColumns             │         │ aggregation)         │    │
-   │   │ BeaconUnrealizedJustifications │         │ state_cache (LRU)    │    │
-   │   └────────────────────────────────┘         └──────────────────────┘    │
+   │   │ ExecutionPayloadEnvelopes      │         │ state_cache (LRU)    │    │
+   │   │ BlockTimeliness                │         └──────────────────────┘    │
+   │   │ BeaconUnrealizedJustifications │                                     │
+   │   └────────────────────────────────┘                                     │
    │   Survives restarts, except                                              │
    │   PendingDataColumns, which                  Lost on restart.            │
    │   is cleared at startup.                                                 │
@@ -118,7 +120,7 @@ is built from it, and clones are handed to the BlockChain and P2P actors.
 
 ## The Tables
 
-The eleven variants of the `Table` enum (`crates/storage/src/api/tables.rs`):
+The thirteen variants of the `Table` enum (`crates/storage/src/api/tables.rs`):
 
 | Table              | Key                        | Value                                     | Pruned?                          |
 | ------------------ | --------------------------- | ----------------------------------------- | --------------------------------- |
@@ -126,12 +128,14 @@ The eleven variants of the `Table` enum (`crates/storage/src/api/tables.rs`):
 | `BlockBodies`      | root                        | `BlockBody` (lean only)                   | never                            |
 | `BlockProof`       | slot ‖ root                 | aggregate proof (`MultiMessageAggregate`) | yes: finalized older than ~1 day |
 | `BlockRoots`       | slot                        | block root (`H256`)                       | never                            |
-| `States`           | root                        | full `State` snapshot                     | never                            |
-| `StateDiffs`       | root                        | `StateDiff`                               | never                            |
+| `States`           | slot ‖ root                 | full `State` snapshot                     | yes: finalized snapshot intervals |
+| `StateDiffs`       | slot ‖ root                 | `StateDiff`                               | yes: finalized snapshot intervals |
 | `Metadata`         | string                      | SSZ scalars                               | never                            |
 | `LiveChain`        | slot ‖ root                 | `parent_root`                             | yes: below finalized             |
 | `DataColumns`      | slot ‖ root ‖ column_index  | `DataColumnSidecar` (SSZ-encoded)         | no (see [DataColumns](#datacolumns) below) |
 | `PendingDataColumns` | slot ‖ root ‖ column_index | `DataColumnSidecar` (SSZ-encoded), unverified | yes: on replay, below finalized, and wholly at startup |
+| `ExecutionPayloadEnvelopes` | slot ‖ root          | gloas `SignedExecutionPayloadEnvelope` (SSZ), verified only | no: beacon block rows are kept too |
+| `BlockTimeliness`  | root                        | one byte per timeliness deadline (0 or 1), gloas blocks only | no |
 | `BeaconUnrealizedJustifications` | root | `(slot, Checkpoint)` (beacon only) | yes: below the finalized block's own slot (see [below](#beaconunrealizedjustifications)) |
 
 ### Key encoding
@@ -140,11 +144,17 @@ Four key layouts are used:
 
 - **Root-keyed** tables use the 32-byte SSZ encoding of the block root
   (`root.to_ssz()`).
-- **Slot-prefixed** tables (`BlockProof`, `LiveChain`) use
-  `encode_slot_root_key`: an 8-byte **big-endian** slot followed by the
-  32-byte root. Big-endian means lexicographic key order equals numeric slot
-  order, so pruning can iterate from the start of the table and stop at the
-  first key past its cutoff instead of scanning everything.
+- **Slot-prefixed** tables (`BlockProof`, `LiveChain`, `States`,
+  `StateDiffs`) use `encode_slot_root_key`: an 8-byte **big-endian** slot
+  followed by the 32-byte root. Big-endian means lexicographic key order
+  equals numeric slot order, so pruning can iterate from the start of the
+  table and stop at the first key past its cutoff, or drop a whole slot range
+  with one range delete. For `States` and `StateDiffs` the slot is the slot of
+  the block the state belongs to (the slot in that root's `BlockHeaders` row,
+  equal to the state's `latest_block_header.slot`), not `state.slot()`: a
+  beacon anchor state can be advanced past its block. A reader that only has
+  a root looks the slot up in `BlockHeaders`; a root with no block row has no
+  state.
 - **Slot-prefixed, then column** (`DataColumns`) extends the same
   `slot ‖ root` prefix with an 8-byte big-endian `column_index`, via
   `data_column_key`. A block's own sidecars therefore share one lexicographic
@@ -223,6 +233,13 @@ that leave the canonical chain and writing the ones that join it. A reorg
 therefore touches only the affected slot range, not the whole table. Never
 pruned.
 
+That walk never writes the common ancestor itself, and at bootstrap the head
+is the anchor, so the anchor's own slot is written separately: by `init_store`
+on a lean directory, and by `index_beacon_anchor` (called from the beacon
+`get_forkchoice_store`) on a beacon one, keyed by the anchor block's slot
+rather than the anchor state's. A beacon directory bootstrapped before
+`index_beacon_anchor` existed has no row for its anchor.
+
 Backs `get_signed_blocks_by_slot_range`, which serves BlocksByRange requests
 over req/resp (`crates/net/p2p/src/req_resp/handlers.rs`). It does **not**
 back the RPC `GET /lean/v0/blocks/:slot` endpoint: that handler resolves a
@@ -232,11 +249,13 @@ is reachable there only by root, never by slot.
 
 ### States
 
-`root → State` (full SSZ snapshot). Holds full-state snapshots **only**: the
-bootstrap anchor written at initialization, plus one anchor whenever a block
-crosses a `SNAPSHOT_ANCHOR_INTERVAL`-slot boundary. Never pruned — these
+`slot ‖ root → State` (full SSZ snapshot). Holds full-state snapshots
+**only**: the bootstrap anchor written at initialization, plus one anchor
+whenever a block crosses a `SNAPSHOT_ANCHOR_INTERVAL`-slot boundary. These
 anchors are the base every diff chain resolves against, so reconstruction
-always terminates.
+always terminates. Pruned below the finalized block's snapshot interval (see
+[Pruning](#pruning)), which never removes a snapshot a kept state's chain
+still needs.
 
 The genesis validator registry is constant for the life of the chain
 (`validators` is fixed at genesis; the lean STF never mutates it), but it has
@@ -246,9 +265,10 @@ no table of its own: it rides inside every `States` snapshot alongside
 
 ### StateDiffs
 
-`root → StateDiff`. A parent-linked diff written for **every** non-genesis
-state. Never pruned, so together with the snapshots this preserves the full
-state history. See [State Storage](#state-storage-snapshots--diffs) for what a
+`slot ‖ root → StateDiff`. A diff written for **every** non-anchor state,
+pruned together with `States`. Lean's is parent-linked; a beacon diff is a
+byte delta against the nearest snapshot on its branch, so a beacon state is one
+snapshot plus one delta. See [State Storage](#state-storage-snapshots--diffs) for what a
 diff contains and how states are rebuilt.
 
 ### Metadata
@@ -267,6 +287,7 @@ different checkpoints.
 | `config`                       | `Config`     | both   | The node's runtime configuration                              |
 | `head`                         | `H256`       | both   | Current fork choice head                                      |
 | `anchor_slot`                  | `u64`        | both   | The slot this directory's chain begins at                     |
+| `states_pruned_below`          | `u64`        | both   | Exclusive upper bound of the `States`/`StateDiffs` slots already range-deleted; absent means 0 |
 | `safe_target`                  | `H256`       | lean   | Current safe target (see [lmd_ghost.md](lmd_ghost.md))        |
 | `latest_justified`             | `Checkpoint` | both   | Latest justified checkpoint                                   |
 | `latest_finalized`             | `Checkpoint` | both   | Latest finalized checkpoint                                   |
@@ -479,6 +500,32 @@ counts. `lean_table_bytes{table="data_columns"}` (see [metrics.md](./metrics.md)
 is that growth made visible; watch it, and size the disk against however long
 the node runs unattended before a pruner exists.
 
+### ExecutionPayloadEnvelopes and BlockTimeliness
+
+Gloas only. A row in `ExecutionPayloadEnvelopes` exists for an envelope that
+passed verification, keyed by the slot of the block it fulfills (the envelope
+has no slot of its own) so a by-range handler can scan a slot window. The
+table is the durable form of the store's `verified_payloads` set. Losing that
+set on restart would silently drop every full payload branch from fork choice.
+`BlockTimeliness` is the durable form of the gloas part of `block_timeliness`.
+Pre-gloas blocks write no row, since nothing reads their timeliness after a
+restart.
+
+`Store::from_db_state` reloads both for every `LiveChain` block at or above the
+finalized block's slot, and reseeds the in-memory payload-committee vote
+vectors empty for each gloas block in that window. The votes themselves are not
+persisted: the next block's payload attestations refill them. Neither table is
+pruned; rows outside the window are simply not read.
+
+The execution client's verdict on each reloaded payload is in-memory scratch
+too, so the chain actor seeds one at startup: `SYNCING` when an execution
+client is configured, so its first `forkchoiceUpdated` `VALID` for the head
+promotes them, and `VALID` without one, as the follower trusts every envelope it
+applies then. The head node's payload status (`Store::head_payload_status`) is
+likewise not stored; it is unknown until the first head computation after a
+restart, and the envelope by-range server withholds the head's envelope until it
+is known.
+
 ### PendingDataColumns
 
 Same key and same encoding as `DataColumns`, holding sidecars that have **not
@@ -578,12 +625,24 @@ has to work with.
 Storing a full `State` per block would be wasteful: most fields never change
 or change predictably. Instead, `insert_state` writes:
 
-1. **Always** a `StateDiff` keyed by the block root, linked to its parent via
+1. **Always** a `StateDiff` keyed by the block's slot and root, linked to its parent via
    `base_root` (the block's `parent_root`).
 2. **Only at anchors** a full snapshot into `States`. A block is an anchor
    when it crosses a `SNAPSHOT_ANCHOR_INTERVAL` slot boundary relative
    to its parent (~68 minutes at 4-second slots). This bounds any
    reconstruction walk to at most `SNAPSHOT_ANCHOR_INTERVAL` diff applications.
+
+This is the lean arm. A beacon state is also a diff or, at an anchor, a
+snapshot, but the diff is a byte delta (`beacon_state_delta`) taken against the
+**nearest snapshot on its branch**, not against its parent, and its frame names
+that snapshot as `base_root`. Reading a beacon state is therefore one snapshot
+plus exactly one delta, however far into the interval the state sits; the cost
+is that a delta carries every change since its snapshot, so it grows across
+the interval. The reader follows each frame's `base_root` and does not assume
+one hop, so a directory whose diffs were written parent-linked by an earlier
+build still reads correctly (no `DB_VERSION` bump was needed), and a diff after
+a restart or on a fork finds its snapshot by walking `StateDiffs` frames until
+a root with no diff row.
 
 A `StateDiff` stores only what cannot be recovered elsewhere: the target slot,
 justified/finalized checkpoints, and the justification fields
@@ -612,7 +671,8 @@ Reads go through `get_state`, which tries three levels:
    after importing its block — is a cache hit.
 2. A full snapshot in `States`.
 3. Reconstruction: walk `base_root` pointers back through `StateDiffs` until
-   a snapshot is found, then replay the diffs forward.
+   a snapshot is found, then replay the diffs forward. On lean that is a chain
+   of parent-linked diffs; on beacon it is one hop, to the interval's snapshot.
 
 ```text
                     STATE RECONSTRUCTION
@@ -664,8 +724,8 @@ sequence of independent write batches:
    ├─ 3. insert_state()                 cache + PendingStates insert (synchronous),
    │      (hands the state to the        then a hand-off to the background writer
    │       storage crate's own writer     thread, which commits
-   │       thread; see below)                   StateDiffs[root]
-   │                                            States[root]         (anchors only)
+   │       thread; see below)                   StateDiffs[slot‖root]
+   │                                            States[slot‖root]    (anchors only)
    │                                      on its own schedule, not this one
    │
    └─ 4. update_head()                 Metadata: head
@@ -736,10 +796,28 @@ processed):
   not needed for fork choice, reorg safety, or re-aggregation once outside
   the window.
 
-**Never pruned, by design:** `BlockHeaders`, `BlockBodies`, `BlockRoots`,
-`States`, `StateDiffs`, and `Metadata`. Headers, bodies, the canonical slot
-index, and the snapshot+diff chain are the full historical record; only the
-proof blobs and the (non-finalized) fork choice index are disposable.
+- `prune_finalized_states`: range-deletes `States` and `StateDiffs` over
+  `[watermark, cut)`, where `cut` is the start of the snapshot interval that
+  holds the finalized **block** (its own slot from `BlockHeaders`, not the
+  checkpoint's epoch-start slot) and `watermark` is `states_pruned_below`, the
+  previous call's `cut`. The watermark is written in the same atomic batch as
+  the deletes, so consecutive ranges are adjacent and never overlap, even
+  across restarts. Safe because a diff-chain walk stops at the first snapshot
+  on its branch, and the first block of any branch inside an interval is a
+  snapshot, so every walk from a kept state stops at or after `cut`; blocks
+  below finality are never imported again, so nothing is written below the
+  watermark afterwards. A state handed to the writer thread *before* finality
+  moved can still be queued, though, so a call that has a range to delete
+  first flushes that thread (`StateWriterHandle::flush`), and every earlier
+  write commits before the tombstones do. Lean runs it inside
+  `prune_old_data`; beacon runs it from the chain actor's finality horizon,
+  after every tick and import, where the common case is one metadata read.
+
+**Never pruned, by design:** `BlockHeaders`, `BlockBodies`, `BlockRoots`, and
+`Metadata`. Headers, bodies and the canonical slot index are the full
+historical record (and the slot lookup every state read depends on); only the
+proof blobs, the finalized states and the (non-finalized) fork choice index are
+disposable.
 
 **Not pruned yet, unlike the six above:** `DataColumns`. It is not part of the
 historical-record set above; it simply has no pruning rule written for it,
@@ -750,10 +828,10 @@ where a future pruner is meant to land
 
 ## In-Memory Only (Lost on Restart)
 
-Five `Store` fields never touch the backend directly, `beacon` with one
-exception (see its row below). All are bounded buffers (or, for `beacon`,
-bounded in practice by the validator set and the unfinalized window) shared
-across `Store` clones:
+Five `Store` fields never touch the backend directly, `beacon` with the
+exceptions its row below names. All are bounded buffers (or, for
+`beacon`, bounded in practice by the validator set and the unfinalized
+window) shared across `Store` clones:
 
 | Buffer              | Capacity        | Contents                                                                                 |
 | ------------------- | --------------- | ---------------------------------------------------------------------------------------- |
@@ -761,7 +839,7 @@ across `Store` clones:
 | `known_payloads`    | 512 messages    | Fork-choice-active aggregated proofs                                                     |
 | `gossip_signatures` | 2048 signatures | Raw per-validator XMSS signatures awaiting aggregation (each ~3 KB, so ~6 MB worst case) |
 | `state_cache`       | 32 states       | LRU memoization of block *and* checkpoint post-states (either chain), each held behind an `Arc` so a hit is not a copy; one bound covers both kinds, keyed apart by a small enum, and a miss is just a reconstruction rather than an error |
-| `beacon`            | unbounded       | Beacon fork-choice scratch: proposer boost root, block timeliness, equivocating validator indices, latest messages, PoW blocks, and unrealized justifications. Most of it is not persisted: proposer boost resets every slot, timeliness is read only by the same-slot reorg helpers, equivocators come back from replaying attester slashings on sync, latest messages from one epoch of attestations, and PoW blocks stand in for an execution-client call a restarted node would simply make again. Unrealized justifications are the exception: this map is a write-through cache in front of `BeaconUnrealizedJustifications` (see [that table](#beaconunrealizedjustifications) above), so it is not lost, only refilled lazily on the next miss |
+| `beacon`            | unbounded       | Beacon fork-choice scratch: proposer boost root, block timeliness, equivocating validator indices, latest messages, PoW blocks, and unrealized justifications. Most of it is not persisted: proposer boost resets every slot, pre-gloas timeliness is read only by the same-slot reorg helpers, equivocators come back from replaying attester slashings on sync, latest messages from one epoch of attestations, and PoW blocks stand in for an execution-client call a restarted node would simply make again. The exceptions are a gloas block's timeliness and verified payload (see [ExecutionPayloadEnvelopes and BlockTimeliness](#executionpayloadenvelopes-and-blocktimeliness)) and unrealized justifications: this map is a write-through cache in front of `BeaconUnrealizedJustifications` (see [that table](#beaconunrealizedjustifications) above), so it is not lost, only refilled lazily on the next miss |
 
 The payload buffers evict FIFO when full, and redundant proofs (whose
 participants are a subset of an existing proof for the same attestation data)
@@ -775,7 +853,7 @@ pools.
 
 After a restart these buffers start empty: pending attestations and
 un-aggregated gossip signatures are lost and must be re-collected from the
-network. Everything persisted in the eleven tables survives, except `PendingDataColumns`, which is cleared outright: its only index is in memory.
+network. Everything persisted in the thirteen tables survives, except `PendingDataColumns`, which is cleared outright: its only index is in memory.
 
 ## Startup and Restore
 
@@ -793,7 +871,7 @@ The first two funnel into `init_store`, which writes the anchor in **one
 atomic batch**: the `Metadata` keys a lean directory needs (the format version
 and the chain and preset tags, time, config, head = safe_target = anchor root,
 justified = finalized = anchor checkpoint), the anchor header, its
-`BlockRoots` entry, the body if non-empty, a full snapshot into `States` (the
+`BlockRoots` entry, the body if non-empty, a full snapshot into `States` keyed by the anchor's slot and root (the
 base of every future diff chain), and the anchor's `LiveChain` entry. `time`
 starts at genesis rather than at zero because it is an absolute timestamp, so
 genesis is the value that means "the clock has not moved yet"; every derived
@@ -805,7 +883,9 @@ entries are written by its caller instead, through the same `insert_state` and
 `insert_signed_block` an ordinary block import uses, followed by the anchor's
 own `BeaconUnrealizedJustifications` row (`set_unrealized_justification`), the
 same order every later block's import follows too — see
-[BeaconUnrealizedJustifications](#beaconunrealizedjustifications) above.
+[BeaconUnrealizedJustifications](#beaconunrealizedjustifications) above. The
+one row an import does not write is the anchor's `BlockRoots` entry, which
+`index_beacon_anchor` adds right after the block (see [BlockRoots](#blockroots)).
 
 `from_db_state` is the restore path: it reads `db_version`, `preset`, `chain`,
 `config` and `anchor_slot` from `Metadata`, returning `None` for an empty DB. A format

@@ -25,6 +25,12 @@
 //! the state transition document. Neither is ever stored in the state or a
 //! block body; a block only ever holds the commitments the sidecars are
 //! checked against.
+//!
+//! [`VersionedHash`] and [`VersionedHashes`] are new too: the versioned
+//! hashes `kzg_commitment_to_versioned_hash` derives from
+//! `blob_kzg_commitments`, which [`NewPayloadRequest`] passes to the
+//! execution engine alongside `parent_beacon_block_root` so it can check a
+//! payload's blob commitments without the blobs themselves.
 
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libssz_types::{SszList, SszVector};
@@ -42,7 +48,7 @@ use super::shared::{
 use crate::beacon::preset;
 use crate::beacon::primitives::{
     BlobIndex, BlsSignature, Bytes32, ExecutionAddress, ExecutionBlockHash, KzgCommitment,
-    KzgProof, Root, Slot, Uint256, ValidatorIndex, WithdrawalIndex,
+    KzgProof, Root, Slot, Uint256, ValidatorIndex, VersionedHash, WithdrawalIndex,
 };
 
 // ---------------------------------------------------------------------------
@@ -69,19 +75,34 @@ pub type KzgCommitments = SszList<KzgCommitment, { preset::MAX_BLOB_COMMITMENTS_
 pub type BlobKzgCommitmentInclusionProof =
     SszVector<Bytes32, { preset::KZG_COMMITMENT_INCLUSION_PROOF_DEPTH }>;
 
+/// The versioned hashes [`NewPayloadRequest`] passes to the execution engine,
+/// one per blob committed to by [`BeaconBlockBody::blob_kzg_commitments`],
+/// computed from those commitments by `kzg_commitment_to_versioned_hash`.
+pub type VersionedHashes = SszList<VersionedHash, { preset::MAX_BLOB_COMMITMENTS_PER_BLOCK }>;
+
 // ---------------------------------------------------------------------------
 // Execution payload
 // ---------------------------------------------------------------------------
 
 /// The execution layer's contribution to a block: [`super::capella::ExecutionPayload`]'s
 /// fields, with deneb's blob gas accounting appended.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 pub struct ExecutionPayload {
     pub parent_hash: ExecutionBlockHash,
     pub fee_recipient: ExecutionAddress,
     pub state_root: Bytes32,
     pub receipts_root: Bytes32,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
     pub logs_bloom: LogsBloom,
     pub prev_randao: Bytes32,
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
@@ -92,13 +113,13 @@ pub struct ExecutionPayload {
     pub gas_used: u64,
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub timestamp: u64,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
     pub extra_data: ExtraData,
     pub base_fee_per_gas: Uint256,
     pub block_hash: ExecutionBlockHash,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex_seq")]
     pub transactions: Transactions,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub withdrawals: Withdrawals,
     /// How much blob gas this block's blob transactions consumed.
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
@@ -119,7 +140,7 @@ pub struct ExecutionPayloadHeader {
     pub fee_recipient: ExecutionAddress,
     pub state_root: Bytes32,
     pub receipts_root: Bytes32,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
     pub logs_bloom: LogsBloom,
     pub prev_randao: Bytes32,
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
@@ -130,7 +151,7 @@ pub struct ExecutionPayloadHeader {
     pub gas_used: u64,
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub timestamp: u64,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
     pub extra_data: ExtraData,
     pub base_fee_per_gas: Uint256,
     pub block_hash: ExecutionBlockHash,
@@ -140,6 +161,21 @@ pub struct ExecutionPayloadHeader {
     pub blob_gas_used: u64,
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub excess_blob_gas: u64,
+}
+
+/// What `process_execution_payload` hands `execution_engine.verify_and_notify_new_payload`
+/// to validate a proposed payload, deneb `beacon-chain.md`.
+///
+/// Bellatrix's version carries only `execution_payload`; deneb appends
+/// `versioned_hashes` (EIP-4844, so the engine can check blob commitments
+/// against the payload without the blobs themselves) and
+/// `parent_beacon_block_root` (EIP-4788, exposing the beacon root to the EVM).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+pub struct NewPayloadRequest {
+    pub execution_payload: ExecutionPayload,
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
+    pub versioned_hashes: VersionedHashes,
+    pub parent_beacon_block_root: Root,
 }
 
 // ---------------------------------------------------------------------------
@@ -157,15 +193,15 @@ pub struct BeaconBlockBody {
     pub eth1_data: Eth1Data,
     /// Arbitrary proposer-chosen bytes, which consensus never reads.
     pub graffiti: Bytes32,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub proposer_slashings: SszList<ProposerSlashing, { preset::MAX_PROPOSER_SLASHINGS }>,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub attester_slashings: SszList<AttesterSlashing, { preset::MAX_ATTESTER_SLASHINGS }>,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub attestations: SszList<Attestation, { preset::MAX_ATTESTATIONS }>,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub deposits: SszList<Deposit, { preset::MAX_DEPOSITS }>,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub voluntary_exits: SszList<SignedVoluntaryExit, { preset::MAX_VOLUNTARY_EXITS }>,
     /// The aggregated sync committee signature over the previous slot's block
     /// root, plus which members contributed.
@@ -175,14 +211,14 @@ pub struct BeaconBlockBody {
     /// each [`SignedBLSToExecutionChange`] wraps a
     /// [`super::capella::BLSToExecutionChange`] with a signature proving its
     /// holder controls the credential being changed.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub bls_to_execution_changes:
         SszList<SignedBLSToExecutionChange, { preset::MAX_BLS_TO_EXECUTION_CHANGES }>,
     /// One KZG commitment per blob this block's proposer chose to include.
     /// Never the blobs themselves: those are propagated separately as
     /// [`BlobSidecar`]s, which is what keeps a block's own size independent
     /// of how much blob data it references.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub blob_kzg_commitments: KzgCommitments,
 }
 
@@ -281,16 +317,16 @@ pub struct BeaconState {
     /// slot advances, since a block cannot commit to the root of the state
     /// containing it.
     pub latest_block_header: BeaconBlockHeader,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub block_roots: BlockRoots,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub state_roots: StateRoots,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub historical_roots: HistoricalRoots,
 
     // -- Eth1 --
     pub eth1_data: Eth1Data,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub eth1_data_votes: Eth1DataVotes,
     /// How many deposits from the contract have been processed, which is
     /// where the next one will be read from.
@@ -298,31 +334,31 @@ pub struct BeaconState {
     pub eth1_deposit_index: u64,
 
     // -- Registry --
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub validators: Validators,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub balances: Balances,
 
     // -- Randomness --
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub randao_mixes: RandaoMixes,
 
     // -- Slashings --
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub slashings: Slashings,
 
     // -- Participation --
     /// Per-validator participation flags for the previous epoch, positionally
     /// parallel to `validators`.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub previous_epoch_participation: EpochParticipation,
     /// Flags for the current epoch, which become
     /// `previous_epoch_participation` at the next epoch boundary.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub current_epoch_participation: EpochParticipation,
 
     // -- Finality --
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
     pub justification_bits: JustificationBits,
     pub previous_justified_checkpoint: Checkpoint,
     pub current_justified_checkpoint: Checkpoint,
@@ -330,7 +366,7 @@ pub struct BeaconState {
 
     // -- Inactivity --
     /// Per-validator inactivity score, positionally parallel to `validators`.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub inactivity_scores: InactivityScores,
 
     // -- Sync committees --
@@ -358,7 +394,7 @@ pub struct BeaconState {
     // -- History --
     /// Capella's replacement for whole [`super::shared::HistoricalBatch`]
     /// roots: one summary per historical window, appended the same way.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub historical_summaries: HistoricalSummaries,
 }
 
@@ -404,7 +440,7 @@ pub struct BlobSidecar {
     /// is also its leaf index for `kzg_commitment_inclusion_proof`.
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub index: BlobIndex,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
     pub blob: Blob,
     pub kzg_commitment: KzgCommitment,
     /// A KZG proof that `blob` evaluates to `kzg_commitment`, checkable
@@ -413,7 +449,7 @@ pub struct BlobSidecar {
     /// The header of the block this blob belongs to, signed by its proposer,
     /// which is what `kzg_commitment_inclusion_proof` terminates at.
     pub signed_block_header: SignedBeaconBlockHeader,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub kzg_commitment_inclusion_proof: BlobKzgCommitmentInclusionProof,
 }
 

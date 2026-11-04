@@ -31,7 +31,7 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::Bootnode;
-use admission::{DialTargets, LeanFilter};
+use admission::LeanFilter;
 use enr::{EnrForkId, LocalEnrParams, build_local_enr};
 
 /// Dials per second the loop opens when this node has no peers at all.
@@ -132,8 +132,11 @@ pub struct SpawnedDiscovery {
     /// The running server. Three things travel over it: a request for the next
     /// dial candidate, and a report for each connection opened and closed.
     pub handle: DiscoveryHandle,
-    /// How to dial the peers the filter admitted; see [`DialTargets`].
-    pub(crate) dial_targets: DialTargets,
+    /// A clone of the admission policy discovery runs. It shares discovery's
+    /// [`DialTargets`](admission::DialTargets), which is how the dial loop knows
+    /// how to dial what was admitted, and its policy, which is how a fork
+    /// boundary moves what discovery admits. See [`LeanFilter`].
+    pub(crate) filter: LeanFilter,
     /// This node's ENR as an `enr:`-prefixed string. `spawn_discovery` already
     /// logs it; this copy is what the tests assert the published record against,
     /// and what a future RPC identity endpoint would read. Reflects startup
@@ -185,7 +188,12 @@ pub async fn spawn_discovery(
     };
     let local_node = params.local_node();
     let local_record = build_local_enr(&params)?;
-    let local_enr = local_record.enr_url().map_err(DiscoveryError::EncodeEnr)?;
+    // EIP-778's text form is URL-safe base64 *without* padding
+    let local_enr = local_record
+        .enr_url()
+        .map_err(DiscoveryError::EncodeEnr)?
+        .trim_end_matches('=')
+        .to_string();
 
     // Our own filter rather than ethrex's `EthForkIdFilter`, which wants an
     // EIP-2124 `eth` entry compatible with an execution chain we do not judge
@@ -193,10 +201,11 @@ pub async fn spawn_discovery(
     // be stamped rejected and never dialed. `AcceptAllFilter` would go the other
     // way and hand us every node on the DHT.
     //
-    // Discovery takes the filter by value, so what the dial loop keeps is the
-    // map the filter writes into, not a second copy of the policy.
+    // Discovery takes the filter by value, so the dial loop keeps a clone. The
+    // two share one policy and one dial-target map, so what discovery's copy
+    // files is what the dial loop reads, and a fork boundary set through the
+    // dial loop's copy moves what discovery's admits.
     let filter = LeanFilter::new(config.fork_id, config.attestation_committee_count);
-    let dial_targets = filter.dial_targets();
 
     let seeds: Vec<Node> = config
         .bootnodes
@@ -238,7 +247,7 @@ pub async fn spawn_discovery(
         local_record,
         params.signer,
         Arc::new(socket),
-        Box::new(filter),
+        Box::new(filter.clone()),
         seeds,
         DiscoveryConfig {
             discv4_enabled: false,
@@ -279,10 +288,38 @@ pub async fn spawn_discovery(
 
     Ok(SpawnedDiscovery {
         handle: discovery,
-        dial_targets,
+        filter,
         local_enr,
         target_peers: config.target_peers,
     })
+}
+
+/// Publish a new `eth2` entry in the ENR this node serves over discv5.
+///
+/// Not possible with the discovery stack this node is built on, so this only
+/// says so. [`DiscoveryServer::spawn`] takes the local record by value and moves
+/// it into the actor it starts. The handle it returns speaks
+/// `DiscoveryServerProtocol` (`raw_packet`, `record_peer_event`, `enr_lookup`,
+/// `prune`, `next_dial_candidate`, `shutdown`), none of which replaces the
+/// record. The record is re-signed only internally: by the `fork_id` watch
+/// `spawn` takes, which stamps an EIP-2124 `eth` entry rather than `eth2`, and by
+/// discv5 IP voting (`apply_predicted_ip`), which edits the address. What would
+/// close the gap is a protocol message on `DiscoveryServer` that edits the local
+/// record's `eth2` entry and bumps its `seq`.
+///
+/// Until then the record served to discv5 queries keeps the `eth2` entry it
+/// started with. Peers already connected are unaffected (they handshake on
+/// `Status`, which does follow the switch) and the admission filter does move,
+/// but a peer that discovers this node after a boundary reads the stale digest
+/// and rejects the record, so a long-running node becomes harder to find until
+/// it is restarted.
+pub(crate) fn update_served_enr(fork_id: &EnrForkId) {
+    warn!(
+        fork_digest = %hex::encode(fork_id.fork_digest),
+        next_fork_epoch = fork_id.next_fork_epoch,
+        "The served ENR keeps its startup eth2 entry: the discovery server offers no way to \
+         replace its record at runtime"
+    );
 }
 
 #[cfg(test)]
@@ -293,10 +330,6 @@ mod tests {
     use ethrex_rlp::decode::RLPDecode;
     use std::net::Ipv4Addr;
 
-    /// The committee count `config` below spawns with, named so the filter the
-    /// self-admission test rebuilds cannot silently drift from it.
-    const TEST_COMMITTEE_COUNT: u64 = 4;
-
     fn config(discovery_port: u16, advertise_ip: Option<IpAddr>) -> DiscoverySpawnConfig {
         DiscoverySpawnConfig {
             node_key: secp256k1::SecretKey::new(&mut rand::rngs::OsRng)
@@ -306,7 +339,7 @@ mod tests {
             discovery_port,
             p2p_port: 9001,
             subscription_subnets: HashSet::from([0u64]),
-            attestation_committee_count: TEST_COMMITTEE_COUNT,
+            attestation_committee_count: 4,
             bootnodes: Vec::new(),
             advertise_ip,
             target_peers: DEFAULT_DISCOVERY_TARGET_PEERS,
@@ -334,6 +367,9 @@ mod tests {
             .expect("discovery spawns");
 
         assert!(handle.local_enr.starts_with("enr:"));
+        // EIP-778's text form carries no base64 padding, and lighthouse
+        // refuses a record that does.
+        assert!(!handle.local_enr.contains('='), "{}", handle.local_enr);
         let record = decode_enr(&handle.local_enr);
 
         // With discovery_port: 0 the OS picks the real port, and the published
@@ -344,11 +380,8 @@ mod tests {
 
         // The policy handed to discovery must admit our own record. A peer
         // running this code applies exactly these rules to what we publish, so a
-        // record we would reject ourselves is one nobody dials. Rebuilt here
-        // from the same two values `spawn_discovery` constructs it with, since
-        // the filter itself was moved into the discovery server.
-        let filter = LeanFilter::new(EnrForkId::local(), TEST_COMMITTEE_COUNT);
-        assert!(filter.accepts(&record));
+        // record we would reject ourselves is one nobody dials.
+        assert!(handle.filter.accepts(&record));
     }
 
     #[tokio::test]

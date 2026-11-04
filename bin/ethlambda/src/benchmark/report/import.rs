@@ -21,6 +21,9 @@ pub(crate) struct Params {
     /// Inclusive, as `fetch --to` is.
     pub range_end: u64,
     pub blocks: usize,
+    /// Milliseconds slept after each block's import, outside every measured
+    /// span. 0 means blocks were fed back to back.
+    pub block_delay_ms: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -104,14 +107,15 @@ impl Report {
         let _ = writeln!(out, "Block-import benchmark — {} workload", params.mode);
         let _ = writeln!(
             out,
-            "  corpus={} network={} anchor_slot={} warmup_blocks={} range=[{}, {}] blocks={}",
+            "  corpus={} network={} anchor_slot={} warmup_blocks={} range=[{}, {}] blocks={} block_delay_ms={}",
             params.corpus,
             params.network,
             params.anchor_slot,
             params.warmup_blocks,
             params.range_start,
             params.range_end,
-            params.blocks
+            params.blocks,
+            params.block_delay_ms
         );
         let _ = writeln!(
             out,
@@ -212,7 +216,19 @@ mod tests {
             range_start: 1,
             range_end: 3,
             blocks: 2,
+            block_delay_ms: 0,
         }
+    }
+
+    #[test]
+    fn the_block_delay_is_recorded_in_the_json_and_the_header() {
+        let mut params = params();
+        params.block_delay_ms = 750;
+        let report = Report::new(Environment::collect(), params, Vec::new());
+
+        let json: serde_json::Value = serde_json::from_str(&report.to_json().unwrap()).unwrap();
+        assert_eq!(json["params"]["block_delay_ms"], 750);
+        assert!(report.human_table().contains("block_delay_ms=750"));
     }
 
     #[test]

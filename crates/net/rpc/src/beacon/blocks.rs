@@ -54,7 +54,7 @@ async fn get_block(
         Encoding::Ssz => ssz_response(block.to_ssz()),
         Encoding::Json => crate::json_response(Envelope {
             version: fork.as_str(),
-            execution_optimistic: store.is_beacon_optimistic(root),
+            execution_optimistic: crate::shared::optimistic::block_is_optimistic(&store, root),
             finalized: is_finalized(&store, block.slot()),
             data: block,
         }),
@@ -70,7 +70,7 @@ async fn get_block_root(Path(block_id): Path<String>, State(store): State<Store>
     };
 
     crate::json_response(serde_json::json!({
-        "execution_optimistic": store.is_beacon_optimistic(root),
+        "execution_optimistic": crate::shared::optimistic::block_is_optimistic(&store, root),
         "finalized": is_finalized(&store, block.slot()),
         "data": { "root": root },
     }))

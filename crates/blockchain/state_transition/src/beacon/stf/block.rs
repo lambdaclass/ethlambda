@@ -24,14 +24,15 @@ use crate::beacon::containers::{self, BeaconBlockHeader, BeaconState, Eth1Data, 
 use crate::beacon::error::{Result, verify};
 use crate::beacon::hash::hash;
 use crate::beacon::helpers::accessors::{
-    CommitteeCache, get_beacon_proposer_index, get_current_epoch, get_domain, get_randao_mix,
+    ActiveBalanceCache, CommitteeCache, get_beacon_proposer_index, get_current_epoch, get_domain,
+    get_randao_mix,
 };
 use crate::beacon::helpers::math::xor;
 use crate::beacon::helpers::misc::compute_signing_root;
 use crate::beacon::preset;
 use crate::beacon::primitives::{BlsSignature, HashTreeRoot as _, Root, Slot, ValidatorIndex};
 
-use super::{ExecutionEngine, bellatrix, capella, deneb, electra, fulu};
+use super::{ExecutionEngine, bellatrix, capella, deneb, electra, fulu, gloas};
 
 /// Dispatches on the block's fork and runs that fork's own block processing.
 ///
@@ -46,29 +47,82 @@ pub fn process_block(
     config: &Config,
     engine: &ExecutionEngine,
     committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
+    options: BlockProcessingOptions,
 ) -> Result<()> {
     match signed_block {
-        containers::SignedBeaconBlock::Phase0(signed) => {
-            process_block_phase0(state, &signed.message, config, committees)
-        }
-        containers::SignedBeaconBlock::Altair(signed) => {
-            process_block_altair(state, &signed.message, config, committees)
-        }
-        containers::SignedBeaconBlock::Bellatrix(signed) => {
-            bellatrix::process_block(state, &signed.message, config, engine, committees)
-        }
-        containers::SignedBeaconBlock::Capella(signed) => {
-            capella::process_block(state, &signed.message, config, engine, committees)
-        }
-        containers::SignedBeaconBlock::Deneb(signed) => {
-            deneb::process_block(state, &signed.message, config, engine, committees)
-        }
-        containers::SignedBeaconBlock::Electra(signed) => {
-            electra::process_block(state, &signed.message, config, engine, committees)
-        }
-        containers::SignedBeaconBlock::Fulu(signed) => {
-            fulu::process_block(state, &signed.message, config, engine, committees)
-        }
+        containers::SignedBeaconBlock::Phase0(signed) => process_block_phase0(
+            state,
+            &signed.message,
+            config,
+            committees,
+            active_balances,
+            options,
+        ),
+        containers::SignedBeaconBlock::Altair(signed) => process_block_altair(
+            state,
+            &signed.message,
+            config,
+            committees,
+            active_balances,
+            options,
+        ),
+        containers::SignedBeaconBlock::Bellatrix(signed) => bellatrix::process_block(
+            state,
+            &signed.message,
+            config,
+            engine,
+            committees,
+            active_balances,
+            options,
+        ),
+        containers::SignedBeaconBlock::Capella(signed) => capella::process_block(
+            state,
+            &signed.message,
+            config,
+            engine,
+            committees,
+            active_balances,
+            options,
+        ),
+        containers::SignedBeaconBlock::Deneb(signed) => deneb::process_block(
+            state,
+            &signed.message,
+            config,
+            engine,
+            committees,
+            active_balances,
+            options,
+        ),
+        containers::SignedBeaconBlock::Electra(signed) => electra::process_block(
+            state,
+            &signed.message,
+            config,
+            engine,
+            committees,
+            active_balances,
+            options,
+        ),
+        containers::SignedBeaconBlock::Fulu(signed) => fulu::process_block(
+            state,
+            &signed.message,
+            config,
+            engine,
+            committees,
+            active_balances,
+            options,
+        ),
+        // ePBS (EIP-7732) restructures block processing around a builder's
+        // bid rather than an embedded payload: a gloas block carries no
+        // payload for `engine` to answer for, so this arm never reaches it.
+        containers::SignedBeaconBlock::Gloas(signed) => gloas::process_block(
+            state,
+            &signed.message,
+            config,
+            committees,
+            active_balances,
+            options,
+        ),
         containers::SignedBeaconBlock::Lean(_) => {
             crate::beacon::lean_block_unreachable("process_block")
         }
@@ -82,6 +136,8 @@ pub fn process_block_phase0(
     block: &phase0::BeaconBlock,
     config: &Config,
     committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
+    options: BlockProcessingOptions,
 ) -> Result<()> {
     process_block_header(
         state,
@@ -90,7 +146,7 @@ pub fn process_block_phase0(
         block.parent_root,
         block.body.hash_tree_root(),
     )?;
-    process_randao(state, &block.body.randao_reveal)?;
+    process_randao(state, &block.body.randao_reveal, options.randao)?;
     process_eth1_data(state, &block.body.eth1_data)?;
     crate::beacon::stf::operations::process_operations(
         state,
@@ -101,6 +157,7 @@ pub fn process_block_phase0(
         &block.body.voluntary_exits,
         config,
         committees,
+        active_balances,
     )?;
     Ok(())
 }
@@ -116,6 +173,8 @@ pub fn process_block_altair(
     block: &altair::BeaconBlock,
     config: &Config,
     committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
+    options: BlockProcessingOptions,
 ) -> Result<()> {
     process_block_header(
         state,
@@ -124,7 +183,7 @@ pub fn process_block_altair(
         block.parent_root,
         block.body.hash_tree_root(),
     )?;
-    process_randao(state, &block.body.randao_reveal)?;
+    process_randao(state, &block.body.randao_reveal, options.randao)?;
     process_eth1_data(state, &block.body.eth1_data)?;
     crate::beacon::stf::operations::process_operations(
         state,
@@ -135,8 +194,9 @@ pub fn process_block_altair(
         &block.body.voluntary_exits,
         config,
         committees,
+        active_balances,
     )?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate)?;
+    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
     Ok(())
 }
 
@@ -198,24 +258,48 @@ pub fn process_block_header(
     Ok(())
 }
 
-/// Verifies the proposer's RANDAO reveal and mixes it into the current epoch's
-/// randao mix.
+/// What `process_block` may leave unchecked. The default checks everything the
+/// specification does, and is the only value block import uses.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BlockProcessingOptions {
+    pub randao: RandaoVerification,
+}
+
+/// Whether `process_randao` verifies the proposer's reveal before mixing it in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RandaoVerification {
+    #[default]
+    Verify,
+    /// Block production for a caller that set `skip_randao_verification`: the
+    /// reveal is the point at infinity, which verifies against no key, so the
+    /// state root can only be computed by mixing it in unchecked.
+    Skip,
+}
+
+/// Verifies the proposer's RANDAO reveal (unless `verification` skips it) and
+/// mixes it into the current epoch's randao mix.
 ///
 /// The reveal signs the epoch rather than the slot, so the same signature would
 /// verify for every slot of the epoch: the mix it feeds is per-epoch, not
 /// per-slot, and a skipped slot leaves nothing for the next proposer to reveal
 /// differently.
-pub fn process_randao(state: &mut BeaconState, randao_reveal: &BlsSignature) -> Result<()> {
+pub fn process_randao(
+    state: &mut BeaconState,
+    randao_reveal: &BlsSignature,
+    verification: RandaoVerification,
+) -> Result<()> {
     let epoch = get_current_epoch(state);
     let proposer_index = get_beacon_proposer_index(state)?;
     let domain = get_domain(state, constants::DOMAIN_RANDAO, None);
     let signing_root = compute_signing_root(epoch.hash_tree_root(), domain);
 
     let proposer = state.validator(proposer_index)?;
-    verify(
-        bls::verify(&proposer.pubkey, signing_root, randao_reveal),
-        "RANDAO reveal signature",
-    )?;
+    if verification == RandaoVerification::Verify {
+        verify(
+            bls::verify(&proposer.pubkey, signing_root, randao_reveal),
+            "RANDAO reveal signature",
+        )?;
+    }
 
     let mix = xor(get_randao_mix(state, epoch), hash(&randao_reveal.0));
     let position = epoch as usize % preset::EPOCHS_PER_HISTORICAL_VECTOR;
@@ -317,5 +401,25 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn skipping_randao_verification_mixes_in_the_infinity_reveal() {
+        let mut state = crate::beacon::helpers::test_state::with_validators(8);
+        let epoch = get_current_epoch(&state);
+        let reveal = BlsSignature(bls::G2_POINT_AT_INFINITY);
+        let expected = xor(get_randao_mix(&state, epoch), hash(&reveal.0));
+
+        process_randao(&mut state, &reveal, RandaoVerification::Skip).unwrap();
+
+        assert_eq!(get_randao_mix(&state, epoch), expected);
+    }
+
+    #[test]
+    fn verifying_randao_rejects_the_infinity_reveal() {
+        let mut state = crate::beacon::helpers::test_state::with_validators(8);
+        let reveal = BlsSignature(bls::G2_POINT_AT_INFINITY);
+
+        assert!(process_randao(&mut state, &reveal, RandaoVerification::Verify).is_err());
     }
 }

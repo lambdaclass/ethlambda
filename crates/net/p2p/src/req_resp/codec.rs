@@ -11,8 +11,8 @@ use super::{
 };
 
 use crate::beacon::messages::{
-    BeaconBlocksByRangeRequest, DataColumnsByRangeRequest, DataColumnsByRootIdentifiers, Goodbye,
-    Ping,
+    BeaconBlocksByRangeRequest, DataColumnsByRangeRequest, DataColumnsByRootIdentifiers,
+    ExecutionPayloadEnvelopeRoots, ExecutionPayloadEnvelopesByRangeRequest, Goodbye, Ping,
 };
 use crate::beacon::{BeaconContext, encoding as beacon_encoding, protocols};
 use crate::lean::messages::{BlocksByRootRequest, RequestedBlockRoots};
@@ -20,8 +20,8 @@ use crate::lean::{encoding as lean_encoding, protocols as lean_protocols};
 use crate::metrics;
 
 /// Protocols whose response payload has one shape forever write no context
-/// bytes, which is every protocol here except the two beacon block ones and
-/// the two beacon data column sidecar ones.
+/// bytes, which is every protocol here except the two beacon block ones, the
+/// two beacon data column sidecar ones and the two gloas envelope ones.
 const NO_CONTEXT: &[u8] = &[];
 
 /// Short label extracted from a libp2p protocol id, used as the `protocol`
@@ -197,6 +197,17 @@ impl libp2p::request_response::Codec for Codec {
                 DataColumnsByRangeRequest::from_ssz_bytes(&payload)
                     .map_err(|err| invalid(format!("{err:?}")))?,
             )),
+            protocols::EXECUTION_PAYLOAD_ENVELOPES_BY_RANGE_V1 => {
+                Ok(Request::ExecutionPayloadEnvelopesByRange(
+                    ExecutionPayloadEnvelopesByRangeRequest::from_ssz_bytes(&payload)
+                        .map_err(|err| invalid(format!("{err:?}")))?,
+                ))
+            }
+            protocols::EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT_V1 => {
+                let roots = ExecutionPayloadEnvelopeRoots::from_ssz_bytes(&payload)
+                    .map_err(|err| invalid(format!("{err:?}")))?;
+                Ok(Request::ExecutionPayloadEnvelopesByRoot(roots.into_inner()))
+            }
             _ => Err(invalid(format!("unknown protocol: {}", protocol.as_ref()))),
         }
     }
@@ -266,6 +277,20 @@ impl libp2p::request_response::Codec for Codec {
                     sidecars,
                 )))
             }
+            protocols::EXECUTION_PAYLOAD_ENVELOPES_BY_RANGE_V1
+            | protocols::EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT_V1 => {
+                let context = self.beacon_context(protocol.as_ref())?;
+                let envelopes = beacon_encoding::decode_execution_payload_envelopes_response(
+                    io,
+                    label,
+                    &context.config,
+                    context.genesis_validators_root,
+                )
+                .await?;
+                Ok(Response::success(
+                    ResponsePayload::ExecutionPayloadEnvelopes(envelopes),
+                ))
+            }
             _ => Err(invalid(format!("unknown protocol: {}", protocol.as_ref()))),
         }
     }
@@ -333,6 +358,12 @@ impl libp2p::request_response::Codec for Codec {
                     .to_ssz()
             }
             Request::DataColumnsByRange(request) => request.to_ssz(),
+            Request::ExecutionPayloadEnvelopesByRange(request) => request.to_ssz(),
+            Request::ExecutionPayloadEnvelopesByRoot(roots) => {
+                ExecutionPayloadEnvelopeRoots::try_from(roots.clone())
+                    .map_err(|err| invalid(format!("{err:?}")))?
+                    .to_ssz()
+            }
         };
 
         let compressed_size = write_payload(io, &encoded).await?;
@@ -395,6 +426,17 @@ impl libp2p::request_response::Codec for Codec {
                         &context.config,
                         context.genesis_validators_root,
                         sidecars,
+                    )
+                    .await
+                }
+                ResponsePayload::ExecutionPayloadEnvelopes(envelopes) => {
+                    let context = self.beacon_context(protocol.as_ref())?;
+                    beacon_encoding::write_execution_payload_envelopes_response(
+                        io,
+                        label,
+                        &context.config,
+                        context.genesis_validators_root,
+                        envelopes,
                     )
                     .await
                 }
@@ -470,6 +512,8 @@ mod tests {
         self, ColumnIndices, DataColumnsByRootIdentifier,
     };
     use ethlambda_types::beacon::containers::shared;
+    use ethlambda_types::beacon::containers::{DataColumnSidecar, gloas};
+    use ethlambda_types::beacon::fork_digest::compute_fork_digest;
     use ethlambda_types::beacon::preset;
     use ethlambda_types::beacon::primitives::Root;
     use futures::io::Cursor;
@@ -724,34 +768,75 @@ mod tests {
         }
     }
 
+    /// A config scheduling gloas shortly after mainnet's fulu, so fulu and gloas
+    /// sidecars get different digests.
+    fn gloas_config() -> Config {
+        let base = Config::mainnet();
+        Config {
+            gloas_fork_epoch: base.fulu_fork_epoch + 64,
+            ..base
+        }
+    }
+
+    fn codec_for(config: Config) -> Codec {
+        Codec::beacon(BeaconContext {
+            config,
+            genesis_validators_root: mainnet_gvr(),
+        })
+    }
+
+    fn fulu_slot() -> u64 {
+        Config::mainnet().fulu_fork_epoch * preset::SLOTS_PER_EPOCH + 1
+    }
+
+    fn gloas_slot() -> u64 {
+        gloas_config().gloas_fork_epoch * preset::SLOTS_PER_EPOCH + 1
+    }
+
+    fn gloas_data_column_sidecar(slot: u64, index: u64) -> gloas::DataColumnSidecar {
+        gloas::DataColumnSidecar {
+            index,
+            slot,
+            ..Default::default()
+        }
+    }
+
     /// Exercises `write_data_column_sidecars_response` into
     /// `decode_data_column_sidecars_response` directly, unlike
     /// [`a_by_range_column_request_round_trips`] and
     /// [`a_by_root_column_request_round_trips`] above, which only round-trip
     /// the thin SSZ-derive request wrappers and never touch this pair.
     ///
-    /// The two sidecars straddle mainnet's altair fork boundary on purpose,
-    /// so their digests actually differ: each chunk's `<context-bytes>` is
-    /// derived from *that sidecar's own* slot
-    /// (`write_data_column_sidecars_response`'s doc explains why — a
-    /// backfill answer labels each chunk with its own fork), so an
-    /// implementation that computed one digest for the whole response
-    /// (from, say, the first sidecar's epoch) would still round-trip a
-    /// batch that never crosses a fork boundary but fail this one.
+    /// The two sidecars straddle the fulu and gloas boundary on purpose, so
+    /// their digests actually differ and so do their shapes: each chunk's
+    /// `<context-bytes>` is derived from *that sidecar's own* slot
+    /// (`write_data_column_sidecars_response`'s doc explains why: a backfill
+    /// answer labels each chunk with its own fork), and the context is what
+    /// selects the decoder. An implementation that computed one digest for the
+    /// whole response would fail this batch.
     #[tokio::test]
     async fn a_data_column_sidecars_response_round_trips_with_a_per_item_context() {
-        let sidecar_a = data_column_sidecar(3, 0);
-        let post_altair_slot = Config::mainnet().altair_fork_epoch * preset::SLOTS_PER_EPOCH + 1;
-        let sidecar_b = data_column_sidecar(post_altair_slot, 7);
+        let sidecar_a = DataColumnSidecar::Fulu(data_column_sidecar(fulu_slot(), 0));
+        let sidecar_b = DataColumnSidecar::Gloas(gloas_data_column_sidecar(gloas_slot(), 7));
+        let stream_protocol = StreamProtocol::new(protocols::DATA_COLUMN_SIDECARS_BY_RANGE_V1);
 
-        let decoded = response_round_trip(
-            protocols::DATA_COLUMN_SIDECARS_BY_RANGE_V1,
-            Response::success(ResponsePayload::DataColumnSidecars(vec![
-                sidecar_a.clone(),
-                sidecar_b.clone(),
-            ])),
-        )
-        .await;
+        let mut buffer = Cursor::new(Vec::new());
+        codec_for(gloas_config())
+            .write_response(
+                &stream_protocol,
+                &mut buffer,
+                Response::success(ResponsePayload::DataColumnSidecars(vec![
+                    sidecar_a.clone(),
+                    sidecar_b.clone(),
+                ])),
+            )
+            .await
+            .expect("writes");
+        let mut buffer = Cursor::new(buffer.into_inner());
+        let decoded = codec_for(gloas_config())
+            .read_response(&stream_protocol, &mut buffer)
+            .await
+            .expect("reads");
 
         match decoded {
             Response::Success {
@@ -763,17 +848,78 @@ mod tests {
         }
     }
 
+    /// A gloas sidecar under a fulu chunk's context bytes is a shape the
+    /// context does not name, so the stream aborts rather than handing back a
+    /// sidecar decoded as the wrong fork.
+    #[tokio::test]
+    async fn a_gloas_sidecar_under_a_fulu_context_aborts_the_stream() {
+        let config = gloas_config();
+        let root = mainnet_gvr();
+        let fulu_digest = compute_fork_digest(&config, root, config.fulu_fork_epoch);
+        let payload = gloas_data_column_sidecar(gloas_slot(), 1).to_ssz();
+        let stream_protocol = StreamProtocol::new(protocols::DATA_COLUMN_SIDECARS_BY_RANGE_V1);
+
+        let mut buffer = Cursor::new(Vec::new());
+        write_success_chunk(&mut buffer, "test", &fulu_digest, payload)
+            .await
+            .expect("writes");
+        let mut buffer = Cursor::new(buffer.into_inner());
+        let result = codec_for(config)
+            .read_response(&stream_protocol, &mut buffer)
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    /// A chunk's context must also be the digest of its sidecar's own slot: a
+    /// fulu-shaped sidecar carrying a gloas slot, sent under the fulu digest,
+    /// decodes cleanly as fulu and is still refused.
+    #[tokio::test]
+    async fn a_fulu_shaped_sidecar_at_a_gloas_slot_under_the_fulu_digest_aborts_the_stream() {
+        let config = gloas_config();
+        let root = mainnet_gvr();
+        let fulu_digest = compute_fork_digest(&config, root, config.fulu_fork_epoch);
+        let payload = data_column_sidecar(gloas_slot(), 1).to_ssz();
+        let stream_protocol = StreamProtocol::new(protocols::DATA_COLUMN_SIDECARS_BY_RANGE_V1);
+
+        let mut buffer = Cursor::new(Vec::new());
+        write_success_chunk(&mut buffer, "test", &fulu_digest, payload)
+            .await
+            .expect("writes");
+        let mut buffer = Cursor::new(buffer.into_inner());
+        let result = codec_for(config)
+            .read_response(&stream_protocol, &mut buffer)
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    /// A digest no scheduled fork uses names no shape at all.
+    #[tokio::test]
+    async fn a_data_column_chunk_under_an_unscheduled_digest_aborts_the_stream() {
+        let payload = data_column_sidecar(fulu_slot(), 1).to_ssz();
+        let stream_protocol = StreamProtocol::new(protocols::DATA_COLUMN_SIDECARS_BY_RANGE_V1);
+
+        let mut buffer = Cursor::new(Vec::new());
+        write_success_chunk(&mut buffer, "test", &[0xde, 0xad, 0xbe, 0xef], payload)
+            .await
+            .expect("writes");
+        let mut buffer = Cursor::new(buffer.into_inner());
+        let result = codec().read_response(&stream_protocol, &mut buffer).await;
+
+        assert!(result.is_err());
+    }
+
     /// A peer's `genesis_validators_root` differing from ours means every
     /// digest it labels a chunk with is for the wrong chain, even though the
-    /// chunk decodes cleanly on its own. `decode_data_column_sidecars_response`
-    /// checks the digest against what *this* node's own root implies, so
-    /// reading the same bytes back through a codec built with a different
-    /// root must abort the stream rather than hand back a sidecar under the
-    /// wrong context — mirroring the block response's own fork-mismatch
-    /// check, which nothing here exercised before.
+    /// chunk decodes cleanly on its own. The digest matches no scheduled one
+    /// under our root, so reading the same bytes back through a codec built
+    /// with a different root must abort the stream rather than hand back a
+    /// sidecar under the wrong context, mirroring the block response's own
+    /// fork-mismatch check.
     #[tokio::test]
     async fn a_data_column_sidecars_response_aborts_on_a_fork_digest_mismatch() {
-        let sidecar = data_column_sidecar(3, 0);
+        let sidecar = DataColumnSidecar::Fulu(data_column_sidecar(fulu_slot(), 0));
         let stream_protocol = StreamProtocol::new(protocols::DATA_COLUMN_SIDECARS_BY_RANGE_V1);
 
         let mut buffer = Cursor::new(Vec::new());
@@ -799,5 +945,138 @@ mod tests {
             result.is_err(),
             "a fork digest mismatch must abort the stream rather than decode successfully"
         );
+    }
+
+    fn envelope_at(slot: u64, byte: u8) -> gloas::SignedExecutionPayloadEnvelope {
+        crate::beacon::encoding::test_support::envelope(
+            Root::repeat_byte(byte),
+            slot,
+            Root::repeat_byte(byte),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_envelope_by_range_request_round_trips() {
+        let request = Request::ExecutionPayloadEnvelopesByRange(
+            crate::beacon::messages::ExecutionPayloadEnvelopesByRangeRequest {
+                start_slot: 9,
+                count: 128,
+            },
+        );
+        let decoded =
+            request_round_trip(protocols::EXECUTION_PAYLOAD_ENVELOPES_BY_RANGE_V1, request).await;
+        match decoded {
+            Request::ExecutionPayloadEnvelopesByRange(wire) => {
+                assert_eq!((wire.start_slot, wire.count), (9, 128));
+            }
+            other => panic!("decoded as {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_envelope_by_root_request_round_trips_as_a_bare_list() {
+        let roots = vec![Root::repeat_byte(1), Root::repeat_byte(2)];
+        let decoded = request_round_trip(
+            protocols::EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT_V1,
+            Request::ExecutionPayloadEnvelopesByRoot(roots.clone()),
+        )
+        .await;
+        match decoded {
+            Request::ExecutionPayloadEnvelopesByRoot(decoded) => assert_eq!(decoded, roots),
+            other => panic!("decoded as {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_envelope_by_root_request_over_the_limit_is_refused_on_write() {
+        let roots = vec![Root::ZERO; protocols::MAX_REQUEST_PAYLOADS as usize + 1];
+        let stream_protocol =
+            StreamProtocol::new(protocols::EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT_V1);
+        let mut buffer = Cursor::new(Vec::new());
+        let result = codec()
+            .write_request(
+                &stream_protocol,
+                &mut buffer,
+                Request::ExecutionPayloadEnvelopesByRoot(roots),
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    /// Each chunk's context is the digest of its own envelope's epoch; for
+    /// gloas envelopes that is the gloas digest.
+    #[tokio::test]
+    async fn an_envelope_response_round_trips_under_the_gloas_digest() {
+        let envelopes = vec![
+            envelope_at(gloas_slot(), 1),
+            envelope_at(gloas_slot() + 1, 2),
+        ];
+        let stream_protocol =
+            StreamProtocol::new(protocols::EXECUTION_PAYLOAD_ENVELOPES_BY_RANGE_V1);
+
+        let mut buffer = Cursor::new(Vec::new());
+        codec_for(gloas_config())
+            .write_response(
+                &stream_protocol,
+                &mut buffer,
+                Response::success(ResponsePayload::ExecutionPayloadEnvelopes(
+                    envelopes.clone(),
+                )),
+            )
+            .await
+            .expect("writes");
+        let bytes = buffer.into_inner();
+        // The result code, then the four context bytes.
+        let config = gloas_config();
+        let expected = compute_fork_digest(&config, mainnet_gvr(), config.gloas_fork_epoch);
+        assert_eq!(bytes[0], 0);
+        assert_eq!(bytes[1..5], expected);
+
+        let decoded = codec_for(gloas_config())
+            .read_response(&stream_protocol, &mut Cursor::new(bytes))
+            .await
+            .expect("reads");
+        match decoded {
+            Response::Success {
+                payload: ResponsePayload::ExecutionPayloadEnvelopes(decoded),
+            } => assert_eq!(decoded, envelopes),
+            other => panic!("decoded as {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_envelope_chunk_under_a_fulu_digest_aborts_the_stream() {
+        let config = gloas_config();
+        let fulu_digest = compute_fork_digest(&config, mainnet_gvr(), config.fulu_fork_epoch);
+        let payload = envelope_at(gloas_slot(), 1).to_ssz();
+        let stream_protocol =
+            StreamProtocol::new(protocols::EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT_V1);
+
+        let mut buffer = Cursor::new(Vec::new());
+        write_success_chunk(&mut buffer, "test", &fulu_digest, payload)
+            .await
+            .expect("writes");
+        let result = codec_for(config)
+            .read_response(&stream_protocol, &mut Cursor::new(buffer.into_inner()))
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn an_envelope_chunk_under_an_unscheduled_digest_aborts_the_stream() {
+        let payload = envelope_at(gloas_slot(), 1).to_ssz();
+        let stream_protocol =
+            StreamProtocol::new(protocols::EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT_V1);
+
+        let mut buffer = Cursor::new(Vec::new());
+        write_success_chunk(&mut buffer, "test", &[0xde, 0xad, 0xbe, 0xef], payload)
+            .await
+            .expect("writes");
+        let result = codec_for(gloas_config())
+            .read_response(&stream_protocol, &mut Cursor::new(buffer.into_inner()))
+            .await;
+
+        assert!(result.is_err());
     }
 }

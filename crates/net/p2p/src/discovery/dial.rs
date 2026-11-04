@@ -17,7 +17,7 @@ use libp2p::swarm::dial_opts::DialOpts;
 use tokio::sync::mpsc;
 use tracing::trace;
 
-use super::admission::{DialTargets, DiscoveredPeer, rank_candidates};
+use super::admission::{DialTargets, DiscoveredPeer, LeanFilter, rank_candidates};
 use super::node_id::node_id_from_peer_id;
 use super::{
     DIAL_INTERVAL_AT_TARGET, DIAL_INTERVAL_AT_ZERO_PEERS, DISCOVERY_CANDIDATE_BATCH,
@@ -47,6 +47,9 @@ pub(crate) struct DiscoveryState {
     local_peer_id: PeerId,
     /// Connected-peer count above which the loop stops dialing.
     target_peers: usize,
+    /// A handle on the admission policy discovery also runs, so a fork
+    /// boundary can move both with one call. See [`LeanFilter::set_fork_id`].
+    filter: LeanFilter,
 }
 
 impl DiscoveryState {
@@ -54,13 +57,19 @@ impl DiscoveryState {
     /// runtime. Every call site builds a `P2PServer` from an async context.
     pub(crate) fn new(spawned: SpawnedDiscovery, local_peer_id: PeerId) -> Self {
         Self {
-            contacts: spawn_contact_poll(spawned.handle.clone(), spawned.dial_targets),
+            contacts: spawn_contact_poll(spawned.handle.clone(), spawned.filter.dial_targets()),
             handle: spawned.handle,
             candidates: VecDeque::new(),
             peer_attnets: HashMap::new(),
             local_peer_id,
             target_peers: spawned.target_peers,
+            filter: spawned.filter,
         }
+    }
+
+    /// The admission policy shared with discovery.
+    pub(crate) fn filter(&self) -> &LeanFilter {
+        &self.filter
     }
 
     /// Connected-peer count above which the loop stops dialing.

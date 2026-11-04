@@ -197,6 +197,7 @@ pub(crate) fn check_constants(config: &Config) -> Result<(), ConstantsMismatch> 
         maximum_gossip_clock_disparity == constants::MAXIMUM_GOSSIP_CLOCK_DISPARITY,
         max_request_blocks == protocols::MAX_REQUEST_BLOCKS,
         max_request_blocks_deneb == protocols::MAX_REQUEST_BLOCKS_DENEB,
+        max_request_payloads == protocols::MAX_REQUEST_PAYLOADS,
         max_request_data_column_sidecars == protocols::max_request_data_column_sidecars(),
         max_payload_size == ethlambda_p2p::MAX_PAYLOAD_SIZE as u64,
         message_domain_invalid_snappy == ethlambda_p2p::MESSAGE_DOMAIN_INVALID_SNAPPY,
@@ -210,7 +211,7 @@ pub(crate) fn check_constants(config: &Config) -> Result<(), ConstantsMismatch> 
     }
 }
 
-/// Fill in the two [`Config`] fields a `config.yaml` cannot be trusted for.
+/// Fill in the [`Config`] field a `config.yaml` cannot be trusted for.
 ///
 /// Shared by a loaded directory and the built-in networks, whose configs both
 /// come out of [`config_file::ConfigFile::parse`].
@@ -221,15 +222,47 @@ pub(crate) fn check_constants(config: &Config) -> Result<(), ConstantsMismatch> 
 /// before its actual genesis, so reading it from the file would put every slot
 /// boundary off by that much.
 ///
-/// `slot_duration_ms` is always derived, never read from the file. A beacon
-/// chain's slots are a whole number of seconds, so `SECONDS_PER_SLOT` is
-/// authoritative and the millisecond field exists for lean's sub-second
-/// cadence. A config carrying `SECONDS_PER_SLOT: 6` and no `SLOT_DURATION_MS`
-/// would otherwise keep mainnet's 12000 by default, and every duty would fire
-/// at the wrong time while the second-resolution field looked correct.
+/// The slot-time fields are not touched here: they are reconciled once, at
+/// parse time (see `config_file::reconcile_slot_time`), so built-in and
+/// loaded networks share the rule.
 fn derive_genesis_fields(config: &mut Config, genesis_time: u64) {
     config.genesis_time = genesis_time;
-    config.slot_duration_ms = config.seconds_per_slot * 1_000;
+}
+
+/// Warn at startup when `config` schedules a fork this build does not follow
+/// ([`ForkName::is_followed`](ethlambda_types::beacon::fork::ForkName::is_followed)),
+/// whichever way this network was resolved.
+///
+/// Shared by a loaded directory and the built-in networks for the same
+/// reason [`derive_genesis_fields`] is. The ignored-keys warning
+/// (`ConfigFile::warn_about_ignored_keys`) does not say this: it names keys
+/// the build does not claim, and the keys of a fork it does claim parse
+/// cleanly. So this says it explicitly instead of leaving it to be discovered
+/// as a stall: from that fork's epoch the chain actor refuses every block, so
+/// a follower stops making progress there regardless of how cleanly its
+/// config parsed. A loaded network reaches this the same as a built-in one,
+/// and can even schedule such a fork at epoch 0, in which case its own genesis
+/// state already decodes as that fork and startup refuses it outright
+/// (`refuse_unfollowable_fork` in `main.rs`); this warning fires first either
+/// way. Every fork `ForkName` models is followed today, gloas included, so
+/// this is the guard for the next fork the node cannot follow.
+fn warn_if_unfollowed_fork_scheduled(network: &str, config: &Config) {
+    let unfollowed = ethlambda_types::beacon::fork::ForkName::ALL
+        .into_iter()
+        .filter(|fork| !fork.is_followed());
+    for fork in unfollowed {
+        let fork_epoch = config.fork_epoch(fork);
+        if fork_epoch != ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH {
+            tracing::warn!(
+                network,
+                fork = fork.as_str(),
+                fork_epoch,
+                "This build stops following this chain at the epoch of a fork it does \
+                 not follow; crossing it is not a stall a restart clears, since the \
+                 chain actor refuses every block of that fork"
+            );
+        }
+    }
 }
 
 /// A resolved network: everything startup needs before it can build a swarm.
@@ -284,7 +317,8 @@ impl NetworkSource {
     }
 
     /// The resolved network's `CONFIG_NAME`, for logging. A built-in
-    /// network's is its own name, which `every_built_in_network_resolves`
+    /// network's is its own name, whatever its file says (see
+    /// [`BuiltInNetwork::resolve`]), which `every_built_in_network_resolves`
     /// checks.
     pub(crate) fn name(&self) -> &str {
         self.config().config_name.as_str()
@@ -321,6 +355,7 @@ mod tests {
             ("mainnet", BuiltInNetwork::Mainnet),
             ("sepolia", BuiltInNetwork::Sepolia),
             ("hoodi", BuiltInNetwork::Hoodi),
+            ("plataberget", BuiltInNetwork::Plataberget),
         ] {
             assert!(
                 matches!(
@@ -421,6 +456,15 @@ mod tests {
             err.contains("MESSAGE_DOMAIN_VALID_SNAPPY is [2, 0, 0, 0]"),
             "got {err}"
         );
+    }
+
+    #[test]
+    fn a_config_that_changes_the_envelope_request_ceiling_is_refused() {
+        let mut config = Config::mainnet();
+        config.max_request_payloads = 64;
+
+        let err = check_constants(&config).unwrap_err().to_string();
+        assert!(err.contains("MAX_REQUEST_PAYLOADS is 64"), "got {err}");
     }
 
     #[test]

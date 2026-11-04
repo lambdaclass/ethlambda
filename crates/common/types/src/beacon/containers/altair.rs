@@ -56,8 +56,15 @@ pub type SyncCommitteePubkeys = SszVector<BlsPubkey, { preset::SYNC_COMMITTEE_SI
 /// One bit per member of a single sync subcommittee (one
 /// `SYNC_COMMITTEE_SUBNET_COUNT`th of a full sync committee), recording who
 /// contributed to one [`SyncCommitteeContribution`].
-pub type SyncSubcommitteeBits =
-    SszBitvector<{ preset::SYNC_COMMITTEE_SIZE / constants::SYNC_COMMITTEE_SUBNET_COUNT }>;
+pub type SyncSubcommitteeBits = SszBitvector<SYNC_SUBCOMMITTEE_SIZE>;
+
+/// Members per sync subcommittee: `SYNC_COMMITTEE_SIZE // SYNC_COMMITTEE_SUBNET_COUNT`,
+/// the width of one [`SyncCommitteeContribution`]'s `aggregation_bits` and of
+/// one `sync_committee_{subnet_id}` subnet's share of the committee.
+pub const SYNC_SUBCOMMITTEE_SIZE: usize =
+    preset::SYNC_COMMITTEE_SIZE / constants::SYNC_COMMITTEE_SUBNET_COUNT;
+// Seen caches pack a subcommittee's bits into a `u128`.
+const _: () = assert!(SYNC_SUBCOMMITTEE_SIZE <= 128);
 
 // ---------------------------------------------------------------------------
 // Sync committees
@@ -70,10 +77,19 @@ pub type SyncSubcommitteeBits =
 /// needs one regardless of how many attestations or other operations it
 /// includes.
 #[derive(
-    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct SyncAggregate {
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
     pub sync_committee_bits: SyncCommitteeBits,
     /// The aggregate of every signature from a member set in
     /// `sync_committee_bits`, over the previous slot's block root.
@@ -85,7 +101,7 @@ pub struct SyncAggregate {
 /// participates.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct SyncCommittee {
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub pubkeys: SyncCommitteePubkeys,
     /// The aggregate of every key in `pubkeys`, so `process_sync_aggregate` does
     /// not have to re-aggregate from scratch when the whole committee signs.
@@ -109,15 +125,15 @@ pub struct BeaconBlockBody {
     pub eth1_data: Eth1Data,
     /// Arbitrary proposer-chosen bytes, which consensus never reads.
     pub graffiti: Bytes32,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub proposer_slashings: SszList<ProposerSlashing, { preset::MAX_PROPOSER_SLASHINGS }>,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub attester_slashings: SszList<AttesterSlashing, { preset::MAX_ATTESTER_SLASHINGS }>,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub attestations: SszList<Attestation, { preset::MAX_ATTESTATIONS }>,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub deposits: SszList<Deposit, { preset::MAX_DEPOSITS }>,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub voluntary_exits: SszList<SignedVoluntaryExit, { preset::MAX_VOLUNTARY_EXITS }>,
     /// The aggregated sync committee signature over the previous slot's block
     /// root, plus which members contributed. This is what lets a light client
@@ -180,16 +196,16 @@ pub struct BeaconState {
     /// slot advances, since a block cannot commit to the root of the state
     /// containing it.
     pub latest_block_header: BeaconBlockHeader,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub block_roots: BlockRoots,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub state_roots: StateRoots,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub historical_roots: HistoricalRoots,
 
     // -- Eth1 --
     pub eth1_data: Eth1Data,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub eth1_data_votes: Eth1DataVotes,
     /// How many deposits from the contract have been processed, which is where
     /// the next one will be read from.
@@ -197,17 +213,17 @@ pub struct BeaconState {
     pub eth1_deposit_index: u64,
 
     // -- Registry --
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub validators: Validators,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub balances: Balances,
 
     // -- Randomness --
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub randao_mixes: RandaoMixes,
 
     // -- Slashings --
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub slashings: Slashings,
 
     // -- Participation --
@@ -217,15 +233,15 @@ pub struct BeaconState {
     /// it is processed instead of deferring to the epoch boundary, so there is
     /// no longer a backlog of whole attestations to keep around, only a flag
     /// per validator per epoch.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub previous_epoch_participation: EpochParticipation,
     /// Flags for the current epoch, which become `previous_epoch_participation`
     /// at the next epoch boundary.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub current_epoch_participation: EpochParticipation,
 
     // -- Finality --
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
     pub justification_bits: JustificationBits,
     pub previous_justified_checkpoint: Checkpoint,
     pub current_justified_checkpoint: Checkpoint,
@@ -237,7 +253,7 @@ pub struct BeaconState {
     /// non-finalizing epoch and falls otherwise, which is what lets the
     /// inactivity leak single out validators who are actually offline rather
     /// than penalizing everyone during a stall.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub inactivity_scores: InactivityScores,
 
     // -- Sync committees --
@@ -264,7 +280,16 @@ pub struct BeaconState {
 /// committee member gossips one of these every slot, and an aggregator
 /// combines a subcommittee's worth into a [`SyncCommitteeContribution`].
 #[derive(
-    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct SyncCommitteeMessage {
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
@@ -282,14 +307,24 @@ pub struct SyncCommitteeMessage {
 /// `SYNC_COMMITTEE_SUBNET_COUNT` aggregators work in parallel on disjoint
 /// slices of the committee, the same way phase0 attestation aggregation is
 /// scoped to one committee rather than the whole active set.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 pub struct SyncCommitteeContribution {
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub slot: Slot,
     pub beacon_block_root: Root,
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub subcommittee_index: u64,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
     pub aggregation_bits: SyncSubcommitteeBits,
     /// The aggregate signature of every member set in `aggregation_bits`, over
     /// `beacon_block_root`.
@@ -300,7 +335,17 @@ pub struct SyncCommitteeContribution {
 /// selected to produce it.
 ///
 /// The sync committee analogue of phase0's `AggregateAndProof`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 pub struct ContributionAndProof {
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub aggregator_index: ValidatorIndex,
@@ -310,7 +355,17 @@ pub struct ContributionAndProof {
     pub selection_proof: BlsSignature,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 pub struct SignedContributionAndProof {
     pub message: ContributionAndProof,
     pub signature: BlsSignature,
@@ -322,7 +377,17 @@ pub struct SignedContributionAndProof {
 /// Separate from [`ContributionAndProof::selection_proof`]'s signature target
 /// only in name: this is the unsigned message that signature covers.
 #[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct SyncAggregatorSelectionData {
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
@@ -376,5 +441,70 @@ mod tests {
 
         let bytes = body.to_ssz();
         assert_eq!(BeaconBlockBody::from_ssz_bytes(&bytes).unwrap(), body);
+    }
+
+    /// Serializes `value` and reads it back, returning the JSON for shape checks.
+    fn json_round_trip<T>(value: &T) -> serde_json::Value
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+    {
+        let json = serde_json::to_value(value).unwrap();
+        let back: T = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(&back, value);
+        json
+    }
+
+    #[test]
+    fn sync_committee_containers_round_trip_through_json() {
+        // The Beacon API carries these as JSON in both directions: quoted
+        // integers, and bitvectors as `0x` hex of their SSZ bytes.
+        let mut aggregation_bits = SyncSubcommitteeBits::default();
+        aggregation_bits.set(0, true).unwrap();
+        aggregation_bits
+            .set(SYNC_SUBCOMMITTEE_SIZE - 1, true)
+            .unwrap();
+        let contribution = SyncCommitteeContribution {
+            slot: 7,
+            beacon_block_root: Root::repeat_byte(0x11),
+            subcommittee_index: 3,
+            aggregation_bits,
+            signature: BlsSignature([0x22; 96]),
+        };
+        let json = json_round_trip(&contribution);
+        assert_eq!(json["slot"], "7");
+        assert_eq!(json["subcommittee_index"], "3");
+        let bits = json["aggregation_bits"].as_str().unwrap();
+        assert_eq!(bits.len(), 2 + 2 * SYNC_SUBCOMMITTEE_SIZE / 8);
+
+        let message = SyncCommitteeMessage {
+            slot: 9,
+            beacon_block_root: Root::repeat_byte(0x33),
+            validator_index: 42,
+            signature: BlsSignature([0x44; 96]),
+        };
+        assert_eq!(json_round_trip(&message)["validator_index"], "42");
+
+        let signed = SignedContributionAndProof {
+            message: ContributionAndProof {
+                aggregator_index: 5,
+                contribution,
+                selection_proof: BlsSignature([0x55; 96]),
+            },
+            signature: BlsSignature([0x66; 96]),
+        };
+        json_round_trip(&signed);
+        json_round_trip(&SyncAggregatorSelectionData {
+            slot: 1,
+            subcommittee_index: 2,
+        });
+
+        let mut sync_committee_bits = SyncCommitteeBits::default();
+        sync_committee_bits
+            .set(preset::SYNC_COMMITTEE_SIZE - 1, true)
+            .unwrap();
+        json_round_trip(&SyncAggregate {
+            sync_committee_bits,
+            sync_committee_signature: BlsSignature([0x77; 96]),
+        });
     }
 }

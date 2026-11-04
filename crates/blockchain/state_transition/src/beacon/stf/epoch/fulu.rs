@@ -1,11 +1,14 @@
 //! Fulu-specific epoch processing.
 //!
-//! Electra's whole step list carries over unchanged: fulu's "Epoch processing"
-//! section (`beacon-chain.md`) redefines `process_epoch` only to append one new
-//! step, [`process_proposer_lookahead`] (EIP-7917), after electra's last one.
-//! Nothing about how any existing step behaves changes; the state simply grows
-//! one more piece of bookkeeping for [`process_proposer_lookahead`] to
-//! maintain.
+//! Fulu's "Epoch processing" section (`beacon-chain.md`) redefines
+//! `process_epoch` in two ways: it appends one new step,
+//! [`process_proposer_lookahead`] (EIP-7917), after electra's last one, and it
+//! retires the eth1-bridge deposit mechanism's last trace in
+//! [`process_pending_deposits`] (this module's own, not electra's shared one;
+//! see that function's own doc for why sharing it would be wrong here, not
+//! merely redundant). Every other step carries over unchanged: the state
+//! simply grows one more piece of bookkeeping for
+//! [`process_proposer_lookahead`] to maintain.
 //!
 //! [`process_proposer_lookahead`] keeps `BeaconState::proposer_lookahead`
 //! (`crate::beacon::containers::fulu::BeaconState`) a fixed-length rolling window: it
@@ -17,6 +20,13 @@
 //! at genesis and at the fulu upgrade. See that function's module docs for why
 //! a seed, and therefore a proposer, is only ever knowable that far ahead and
 //! no further.
+//!
+//! Gloas shares this exact function: `proposer_lookahead` keeps the identical
+//! field and type from fulu on (`containers::gloas`'s own module doc), and
+//! gloas's `beacon-chain.md` does not redefine this step either. Only the
+//! callee that draws the newly-visible epoch's proposers differs by fork
+//! (EIP-8045 excludes slashed validators for gloas), so
+//! [`process_proposer_lookahead`] picks it by fork rather than being copied.
 //!
 //! # Why this step runs last
 //!
@@ -44,18 +54,76 @@
 
 use crate::beacon::config::Config;
 use crate::beacon::containers::BeaconState;
-use crate::beacon::error::Result;
+use crate::beacon::error::{Error, Result};
+use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::get_current_epoch;
-use crate::beacon::helpers::fulu::{fulu_state, get_beacon_proposer_indices};
+use crate::beacon::helpers::electra::get_activation_exit_churn_limit;
+use crate::beacon::helpers::fulu::{get_beacon_proposer_indices, proposer_lookahead_mut};
+use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
 
 use super::electra;
 
-/// Fulu's epoch-boundary driver: electra's, unchanged, with
-/// [`process_proposer_lookahead`] appended at the end.
+/// Fulu's epoch-boundary driver, in the specification's own order
+/// (`beacon-chain.md`'s "Modified `process_epoch`"): electra's own steps,
+/// with this module's own [`process_pending_deposits`] standing in for
+/// [`electra::process_pending_deposits`], and [`process_proposer_lookahead`]
+/// appended at the end.
+///
+/// Steps 1-9 (justification through the effective-balance updates) run as one
+/// registry pass where the state allows it, the same driver electra uses. Both
+/// that pass and its step-by-step fallback read the state's fork to retire
+/// the eth1-bridge gate here; see `super::single_pass`.
 pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
-    electra::process_epoch(state, config)?;
+    super::single_pass::process_steps_through_effective_balances(state, config)?;
+    super::process_slashings_reset(state)?;
+    super::process_randao_mixes_reset(state)?;
+    super::capella::process_historical_summaries_update(state)?;
+    super::altair::process_participation_flag_updates(state)?;
+    super::altair::process_sync_committee_updates(state)?;
+    // [New in Fulu:EIP7917]
     process_proposer_lookahead(state)
+}
+
+// ---------------------------------------------------------------------------
+// Pending deposits
+// ---------------------------------------------------------------------------
+
+/// Drains a balance-churn-limited amount of [`crate::beacon::containers::electra::PendingDeposit`]s
+/// into the validator registry.
+///
+/// [`electra::process_pending_deposits`]'s own doc covers the shape this
+/// shares with it in full: strict front-to-back draining, the three outcomes
+/// a dequeued entry can have, and why a deposit that would blow this epoch's
+/// budget stops the whole pass rather than being skipped over.
+///
+/// The one thing this drops is that function's first gate, the one holding
+/// every deposit *request* back until every eth1-bridge deposit ahead of it
+/// (tracked by `deposit_requests_start_index`) has drained, which is exactly
+/// what `beacon-chain.md`'s "Modified `process_pending_deposits`" for this
+/// fork says to remove. That gate stalls the queue whenever
+/// `eth1_deposit_index < deposit_requests_start_index`: either
+/// `deposit_requests_start_index` is still
+/// [`crate::beacon::constants::UNSET_DEPOSIT_REQUESTS_START_INDEX`] (no
+/// deposit request has ever been seen), or it is set but `eth1_deposit_index`
+/// has not yet drained up to it. Once `eth1_deposit_index` *has* caught up,
+/// which every real network is expected to have well before it reaches fulu
+/// (the eth1-bridge drain itself takes on the order of a day; electra ran
+/// about seven months ahead of fulu on mainnet, sepolia, and hoodi), the gate
+/// is already a no-op, which is why dropping it here changes nothing
+/// observable on mainnet. The case this function actually exists for is a
+/// chain that reaches a deposit request under fulu with the field either
+/// still unset or set but not yet caught up: see
+/// [`super::super::fulu::process_deposit_request`]'s own doc for why fulu
+/// never writes it, and why pairing that with electra's gate here would stall
+/// the queue for good rather than merely once. The drain is
+/// `electra::drain_pending_deposits`, which derives from the state's fork that
+/// the gate is retired here and so reads neither `eth1_deposit_index` nor
+/// `deposit_requests_start_index`.
+// [Modified in Fulu]
+pub fn process_pending_deposits(state: &mut BeaconState, config: &Config) -> Result<()> {
+    let churn_limit = get_activation_exit_churn_limit(state, config)?;
+    electra::drain_pending_deposits(state, config, churn_limit)
 }
 
 /// Shifts `proposer_lookahead` forward by one epoch.
@@ -76,16 +144,37 @@ pub fn process_proposer_lookahead(state: &mut BeaconState) -> Result<()> {
     // The seed for this epoch is only just now fixed, per the module docs, so
     // this is the earliest moment its proposers could have been computed.
     let new_epoch = get_current_epoch(state) + preset::MIN_SEED_LOOKAHEAD + 1;
-    let new_epoch_proposers = get_beacon_proposer_indices(state, new_epoch)?;
+    let new_epoch_proposers = match state.fork_name() {
+        ForkName::Fulu => get_beacon_proposer_indices(state, new_epoch)?,
+        // EIP-8045: gloas's own draw excludes slashed validators before
+        // sampling; see `crate::beacon::helpers::gloas::get_beacon_proposer_indices`'s
+        // own doc. This is the one part of the step gloas cannot share
+        // unchanged; see this module's own module doc.
+        ForkName::Gloas => {
+            crate::beacon::helpers::gloas::get_beacon_proposer_indices(state, new_epoch)?
+        }
+        fork @ (ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb
+        | ForkName::Electra) => {
+            return Err(Error::UnsupportedForFork {
+                function: "process_proposer_lookahead",
+                fork,
+            });
+        }
+        ForkName::Lean => lean_state_unreachable("process_proposer_lookahead"),
+    };
 
-    let fulu_state = fulu_state(state, "process_proposer_lookahead")?;
     let slots_per_epoch = preset::SLOTS_PER_EPOCH as usize;
+    let lookahead = proposer_lookahead_mut(state, "process_proposer_lookahead")?;
 
     let mut window = Vec::with_capacity(preset::PROPOSER_LOOKAHEAD_LENGTH);
-    window.extend_from_slice(&fulu_state.proposer_lookahead[slots_per_epoch..]);
+    window.extend_from_slice(&lookahead[slots_per_epoch..]);
     window.extend(new_epoch_proposers);
 
-    fulu_state.proposer_lookahead = window.try_into().expect(
+    *lookahead = window.try_into().expect(
         "dropping SLOTS_PER_EPOCH entries and appending SLOTS_PER_EPOCH more preserves \
          PROPOSER_LOOKAHEAD_LENGTH",
     );
@@ -95,8 +184,12 @@ pub fn process_proposer_lookahead(state: &mut BeaconState) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::beacon::constants;
+    use crate::beacon::containers::electra as electra_containers;
     use crate::beacon::fork::ForkName;
+    use crate::beacon::helpers::electra::pending_queue_fields;
     use crate::beacon::helpers::fulu::initialize_proposer_lookahead;
+    use crate::beacon::primitives::BlsSignature;
 
     /// A fulu state with `count` fully active, full-balance validators and a
     /// `proposer_lookahead` filled by
@@ -176,5 +269,94 @@ mod tests {
     fn process_proposer_lookahead_rejects_a_state_older_than_fulu() {
         let mut phase0_state = crate::beacon::helpers::test_state::with_validators(4);
         assert!(process_proposer_lookahead(&mut phase0_state).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // process_pending_deposits
+    // -----------------------------------------------------------------------
+
+    /// A pending deposit shaped like one a deposit *request* would queue
+    /// (`slot > GENESIS_SLOT`), topping up `index`'s own existing balance so
+    /// [`electra::apply_pending_deposit`] takes the
+    /// signature-free top-up branch rather than needing a real one.
+    fn request_sourced_pending_deposit(
+        state: &BeaconState,
+        index: usize,
+    ) -> electra_containers::PendingDeposit {
+        let validator = state.validator(index as u64).unwrap();
+        electra_containers::PendingDeposit {
+            pubkey: validator.pubkey,
+            withdrawal_credentials: validator.withdrawal_credentials,
+            amount: preset::EFFECTIVE_BALANCE_INCREMENT,
+            signature: BlsSignature::default(),
+            slot: constants::GENESIS_SLOT + 1,
+        }
+    }
+
+    #[test]
+    fn a_test_state_starts_with_deposit_requests_start_index_unset() {
+        let mut state = fulu_state_with_validators(2);
+        assert_eq!(
+            pending_queue_fields(&mut state, "test assertion")
+                .unwrap()
+                .deposit_requests_start_index(),
+            constants::UNSET_DEPOSIT_REQUESTS_START_INDEX
+        );
+    }
+
+    #[test]
+    fn an_unset_start_index_does_not_stall_fulus_own_pending_deposits() {
+        let config = Config::mainnet();
+        let mut state = fulu_state_with_validators(2);
+        // Past the deposit's own slot, so the unrelated finality gate
+        // (`deposit.slot > finalized_slot`) cannot be what lets, or blocks,
+        // this deposit through; only the eth1-bridge gate is under test.
+        state.finalized_checkpoint_mut().epoch = 1;
+        let deposit = request_sourced_pending_deposit(&state, 0);
+        pending_queue_fields(&mut state, "test setup")
+            .unwrap()
+            .push_pending_deposit(deposit)
+            .unwrap();
+
+        let balance_before = state.balance(0).unwrap();
+        process_pending_deposits(&mut state, &config).unwrap();
+
+        // Applied: the queue's only entry was a top-up for an active,
+        // non-exited validator, so nothing here should postpone or block it.
+        assert_eq!(
+            state.balance(0).unwrap(),
+            balance_before + preset::EFFECTIVE_BALANCE_INCREMENT
+        );
+        let BeaconState::Fulu(inner) = &state else {
+            unreachable!("built as Fulu");
+        };
+        assert!(inner.pending_deposits.is_empty());
+    }
+
+    #[test]
+    fn electras_entry_point_applies_the_state_forks_gate_to_a_fulu_state() {
+        let config = Config::mainnet();
+        let mut state = fulu_state_with_validators(2);
+        // See the previous test: past the deposit's own slot, so only the
+        // eth1-bridge gate, not the unrelated finality gate, is under test.
+        state.finalized_checkpoint_mut().epoch = 1;
+        let deposit = request_sourced_pending_deposit(&state, 0);
+        pending_queue_fields(&mut state, "test setup")
+            .unwrap()
+            .push_pending_deposit(deposit)
+            .unwrap();
+
+        let balance_before = state.balance(0).unwrap();
+        // `electra::process_pending_deposits` accepts a fulu state too. The
+        // gate is derived from the state's fork, not chosen by the caller, so
+        // it cannot stall a fulu queue whose `deposit_requests_start_index`
+        // fulu never writes (the same scenario stalls on an electra state:
+        // see `electra::tests`).
+        electra::process_pending_deposits(&mut state, &config).unwrap();
+
+        assert_eq!(
+            state.balance(0).unwrap(),
+            balance_before + preset::EFFECTIVE_BALANCE_INCREMENT
+        );
     }
 }

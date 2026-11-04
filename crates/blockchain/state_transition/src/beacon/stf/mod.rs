@@ -61,13 +61,15 @@ pub mod deneb;
 pub mod electra;
 pub mod epoch;
 pub mod fulu;
+pub mod gloas;
 pub mod operations;
 
 use crate::beacon::containers;
 use crate::beacon::containers::{BeaconState, phase0};
 use crate::beacon::error::{Error, Result, verify};
-use crate::beacon::helpers::accessors::{CommitteeCache, get_domain};
+use crate::beacon::helpers::accessors::{ActiveBalanceCache, CommitteeCache, get_domain};
 use crate::beacon::helpers::misc::compute_signing_root;
+use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{HashTreeRoot as _, Slot};
 use crate::beacon::{bls, config::Config, constants};
@@ -132,9 +134,38 @@ pub fn state_transition(
     config: &Config,
     engine: &ExecutionEngine,
     committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     process_slots(state, signed_block.slot(), config)?;
+    apply_block(
+        state,
+        signed_block,
+        validate_result,
+        config,
+        engine,
+        committees,
+        active_balances,
+    )
+}
 
+/// [`state_transition`] from the point where `state` is already at the block's
+/// own slot: everything after `process_slots`.
+///
+/// For a caller that advanced the state itself (fork choice resuming from a
+/// precomputed epoch-boundary state). `process_slots` rejects a target equal to
+/// the current slot, so such a state cannot go through [`state_transition`]
+/// when the block sits exactly on the boundary. A state at the wrong slot is
+/// still refused: the block header check in `process_block` compares the
+/// block's slot with the state's.
+pub fn apply_block(
+    state: &mut BeaconState,
+    signed_block: &containers::SignedBeaconBlock,
+    validate_result: bool,
+    config: &Config,
+    engine: &ExecutionEngine,
+    committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
+) -> Result<()> {
     // After `process_slots`, never before it. A block proposed at the first slot
     // of a fork's activation epoch is the *post*-fork shape while the state
     // arriving here is still the pre-fork one, which is exactly the case a fork
@@ -153,7 +184,15 @@ pub fn state_transition(
         )?;
     }
 
-    block::process_block(state, signed_block, config, engine, committees)?;
+    block::process_block(
+        state,
+        signed_block,
+        config,
+        engine,
+        committees,
+        active_balances,
+        block::BlockProcessingOptions::default(),
+    )?;
     // As in `process_slot`: the post-state's root, checked below and needed
     // again in the next slot, is then computed on the state's own nodes.
     state.apply_pending_mutations();
@@ -280,6 +319,33 @@ pub fn process_slot(state: &mut BeaconState) -> Result<()> {
     let previous_block_root = state.latest_block_header().hash_tree_root();
     state.block_roots_mut()[position] = previous_block_root;
 
+    // [New in Gloas:EIP7732] Unset `slot + 1`'s payload availability bit:
+    // that next slot has not built (or revealed) a payload yet, so nothing
+    // has attested to one being available for it.
+    // `process_parent_execution_payload` sets the bit back once a payload
+    // for that slot is actually revealed by the following block.
+    match state {
+        BeaconState::Phase0(_)
+        | BeaconState::Altair(_)
+        | BeaconState::Bellatrix(_)
+        | BeaconState::Capella(_)
+        | BeaconState::Deneb(_)
+        | BeaconState::Electra(_)
+        | BeaconState::Fulu(_) => {}
+        BeaconState::Gloas(inner) => {
+            let next_slot = inner
+                .slot
+                .checked_add(1)
+                .ok_or(Error::ArithmeticOverflow("process_slot: slot + 1"))?;
+            let next_position = (next_slot % preset::SLOTS_PER_HISTORICAL_ROOT as u64) as usize;
+            inner
+                .execution_payload_availability
+                .set(next_position, false)
+                .expect("next_position is in [0, SLOTS_PER_HISTORICAL_ROOT)");
+        }
+        BeaconState::Lean(_) => lean_state_unreachable("process_slot"),
+    }
+
     Ok(())
 }
 
@@ -317,20 +383,90 @@ pub(crate) fn phase0_state_ref<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::beacon::fork::ForkName;
     use crate::beacon::helpers::test_state;
+    use crate::beacon::primitives::Root;
+
+    #[test]
+    fn process_slot_unsets_next_slots_payload_availability_on_gloas() {
+        let mut state = test_state::with_validators_at(ForkName::Gloas, 4);
+        let position = state.slot() as usize % preset::SLOTS_PER_HISTORICAL_ROOT;
+        let next_position = (position + 1) % preset::SLOTS_PER_HISTORICAL_ROOT;
+        let other_position = (next_position + 1) % preset::SLOTS_PER_HISTORICAL_ROOT;
+        let BeaconState::Gloas(inner) = &mut state else {
+            panic!("with_validators_at(Gloas) returns a gloas state");
+        };
+        // Every bit starts `false` (`Default::default()`); set both so the
+        // test can tell "process_slot cleared it" from "it was already
+        // clear".
+        inner
+            .execution_payload_availability
+            .set(next_position, true)
+            .unwrap();
+        inner
+            .execution_payload_availability
+            .set(other_position, true)
+            .unwrap();
+
+        // Taken from a clone before `process_slot` runs, so it still carries
+        // `next_position`'s bit `true`. `state_roots[position]` must cache
+        // exactly this root: if the implementation cleared the bit before
+        // caching that root instead of after, the cached root would reflect
+        // the bit already `false`, and the comparison below would catch it.
+        let expected_root = state.clone().hash_tree_root();
+
+        process_slot(&mut state).unwrap();
+
+        assert_eq!(state.state_roots()[position], expected_root);
+
+        let BeaconState::Gloas(inner) = &state else {
+            panic!("process_slot does not change the state's fork");
+        };
+        assert_eq!(
+            inner.execution_payload_availability.get(next_position),
+            Some(false)
+        );
+        // Only `slot + 1`'s bit is touched; every other bit is left alone.
+        assert_eq!(
+            inner.execution_payload_availability.get(other_position),
+            Some(true)
+        );
+    }
+
+    /// `next_position` wraps from `SLOTS_PER_HISTORICAL_ROOT - 1` back to
+    /// `0`, the same ring-buffer indexing `state_roots`/`block_roots` already
+    /// rely on.
+    #[test]
+    fn process_slot_wraps_the_payload_availability_index_at_the_end_of_the_window() {
+        let mut state = test_state::with_validators_at(ForkName::Gloas, 4);
+        *state.slot_mut() = preset::SLOTS_PER_HISTORICAL_ROOT as Slot - 1;
+        let BeaconState::Gloas(inner) = &mut state else {
+            panic!("with_validators_at(Gloas) returns a gloas state");
+        };
+        inner.execution_payload_availability.set(0, true).unwrap();
+
+        process_slot(&mut state).unwrap();
+
+        let BeaconState::Gloas(inner) = &state else {
+            panic!("process_slot does not change the state's fork");
+        };
+        assert_eq!(inner.execution_payload_availability.get(0), Some(false));
+    }
 
     #[test]
     fn process_slot_leaves_no_buffered_registry_writes() {
         let mut state = test_state::with_validators(4);
-        state.balances_mut()[0] += 1;
+        *state.balance_mut(0).unwrap() += 1;
         state.validator_mut(1).unwrap().effective_balance -= 1;
-        assert!(state.balances().has_pending_updates());
-        assert!(state.validators().has_pending_updates());
+        assert!(state.has_pending_mutations());
 
         process_slot(&mut state).unwrap();
 
-        assert!(!state.balances().has_pending_updates());
-        assert!(!state.validators().has_pending_updates());
+        assert!(!state.registry_has_pending_updates());
+        // Its own two roots writes stay buffered until the next flush, which
+        // the following slot (or `process_slots`' last step) performs.
+        assert!(state.state_roots().has_pending_updates());
+        assert!(state.block_roots().has_pending_updates());
     }
 
     /// Epoch processing (`process_rewards_and_penalties` here) writes every
@@ -347,7 +483,114 @@ mod tests {
 
         process_slots(&mut state, target_slot, &config).unwrap();
 
-        assert!(!state.balances().has_pending_updates());
-        assert!(!state.validators().has_pending_updates());
+        assert!(!state.has_pending_mutations());
+    }
+
+    #[test]
+    fn process_slots_flushes_the_roots_it_wrote_in_its_last_slot() {
+        for fork in BEACON_FORKS {
+            let mut state = test_state::with_validators_at(fork, 4);
+            let target_slot = state.slot() + 1;
+
+            process_slots(&mut state, target_slot, &Config::mainnet()).unwrap();
+
+            assert!(!state.has_pending_mutations(), "{fork:?}");
+        }
+    }
+
+    const BEACON_FORKS: [ForkName; 8] = [
+        ForkName::Phase0,
+        ForkName::Altair,
+        ForkName::Bellatrix,
+        ForkName::Capella,
+        ForkName::Deneb,
+        ForkName::Electra,
+        ForkName::Fulu,
+        ForkName::Gloas,
+    ];
+
+    /// Writes one element of the field a case names, or answers `false` if the
+    /// fork does not have it.
+    type Write = fn(&mut BeaconState) -> bool;
+
+    fn push_historical_summary(state: &mut BeaconState) -> bool {
+        let summary = containers::HistoricalSummary::default();
+        match state {
+            BeaconState::Capella(s) => s.historical_summaries.push(summary).unwrap(),
+            BeaconState::Deneb(s) => s.historical_summaries.push(summary).unwrap(),
+            BeaconState::Electra(s) => s.historical_summaries.push(summary).unwrap(),
+            BeaconState::Fulu(s) => s.historical_summaries.push(summary).unwrap(),
+            BeaconState::Gloas(s) => s.historical_summaries.push(summary).unwrap(),
+            _ => return false,
+        }
+        true
+    }
+
+    /// One write to every tree-backed field of every fork: the flush and the
+    /// pending check must both see all of them, since both come from one
+    /// field list.
+    #[test]
+    fn every_tree_field_of_every_fork_is_flushed_and_checked() {
+        let cases: [(&str, Write); 11] = [
+            ("validators", |s| {
+                s.validator_mut(0).unwrap().effective_balance -= 1;
+                true
+            }),
+            ("balances", |s| {
+                *s.balance_mut(0).unwrap() += 1;
+                true
+            }),
+            ("block_roots", |s| {
+                s.block_roots_mut()[0] = Root::repeat_byte(1);
+                true
+            }),
+            ("state_roots", |s| {
+                s.state_roots_mut()[0] = Root::repeat_byte(1);
+                true
+            }),
+            ("historical_roots", |s| {
+                s.historical_roots_mut().push(Root::repeat_byte(1)).unwrap();
+                true
+            }),
+            ("eth1_data_votes", |s| {
+                s.eth1_data_votes_mut().push(Default::default()).unwrap();
+                true
+            }),
+            ("randao_mixes", |s| {
+                s.randao_mixes_mut()[0] = Root::repeat_byte(1);
+                true
+            }),
+            ("slashings", |s| {
+                s.slashings_mut()[0] += 1;
+                true
+            }),
+            // Gloas keeps its scores in a flat progressive list that buffers
+            // nothing, so a write there leaves nothing pending.
+            ("inactivity_scores", |s| {
+                let buffered = !matches!(s, BeaconState::Gloas(_));
+                match s.inactivity_score_mut(0) {
+                    Ok(score) => {
+                        *score += 1;
+                        buffered
+                    }
+                    Err(_) => false,
+                }
+            }),
+            ("historical_summaries", push_historical_summary),
+            // A read-only pass writes nothing and must leave nothing pending.
+            ("none", |_| false),
+        ];
+
+        for fork in BEACON_FORKS {
+            let mut state = test_state::with_validators_at(fork, 4);
+            assert!(!state.has_pending_mutations(), "{fork:?} starts flushed");
+
+            for (name, write) in cases {
+                let wrote = write(&mut state);
+                assert_eq!(state.has_pending_mutations(), wrote, "{fork:?} {name}");
+                state.apply_pending_mutations();
+                assert!(!state.has_pending_mutations(), "{fork:?} {name} flushed");
+            }
+        }
     }
 }

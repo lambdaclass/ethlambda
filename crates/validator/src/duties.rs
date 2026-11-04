@@ -19,17 +19,30 @@
 //!   dropped as they come in rather than at every lookup.
 //! - **A change here is not a change for subscriptions.** Subnet subscriptions
 //!   follow committees, and a proposer has none.
+//!
+//! Payload timeliness committee (PTC) duties, which exist from gloas, are held
+//! in a third map on the attester schedule's terms: the current epoch and the
+//! next, replaced when the `dependent_root` changes. They are narrowed to this
+//! client's indices on arrival, and are not part of subnet subscriptions
+//! either. Whether an epoch is a gloas one is the caller's to decide, since
+//! this service holds no fork schedule.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use ethlambda_types::beacon::constants::GENESIS_SLOT;
+use ethlambda_types::beacon::preset::{EPOCHS_PER_SYNC_COMMITTEE_PERIOD, SLOTS_PER_EPOCH};
 use ethlambda_types::beacon::primitives::{Epoch, Root, Slot, ValidatorIndex};
 use tracing::{info, warn};
 
 use crate::beacon_node::BeaconNodeApi;
-use crate::beacon_node::dto::{AttesterDutyDto, ProposerDutyDto};
+use crate::beacon_node::dto::{AttesterDutyDto, ProposerDutyDto, PtcDutyDto, SyncDutyDto};
 use crate::error::Result;
+
+/// The sync committee period `epoch` belongs to.
+pub fn sync_committee_period(epoch: Epoch) -> u64 {
+    epoch / EPOCHS_PER_SYNC_COMMITTEE_PERIOD
+}
 
 /// One epoch's schedule of some kind, and the block root it is derived from.
 #[derive(Debug, Clone)]
@@ -46,6 +59,13 @@ pub struct DutiesService<B> {
     /// Proposer duties, already narrowed to `indices`. See the module doc for
     /// why this is a second map rather than another field on the first.
     proposers: HashMap<Epoch, EpochDuties<ProposerDutyDto>>,
+    /// Payload timeliness committee duties, already narrowed to `indices`.
+    ptc: HashMap<Epoch, EpochDuties<PtcDutyDto>>,
+    /// Sync committee duties by period, already narrowed to `indices`. Keyed
+    /// by period, not epoch, because a committee serves a whole period; and
+    /// with no `dependent_root` because the endpoint sends none: the committee
+    /// is fixed a period ahead, so each refresh simply replaces what is held.
+    sync: HashMap<u64, Vec<SyncDutyDto>>,
     /// Whether the "no validator indices resolved" warning has already fired.
     /// Without this, an idle client would repeat it every epoch forever; with
     /// it, the operator still gets exactly one signal that duties are not
@@ -60,6 +80,8 @@ impl<B: BeaconNodeApi> DutiesService<B> {
             indices,
             by_epoch: HashMap::new(),
             proposers: HashMap::new(),
+            ptc: HashMap::new(),
+            sync: HashMap::new(),
             warned_no_indices: false,
         }
     }
@@ -195,6 +217,120 @@ impl<B: BeaconNodeApi> DutiesService<B> {
             },
         );
         Ok(())
+    }
+
+    /// Fetch `epoch`'s payload timeliness committee duties for this client's
+    /// indices, replacing anything held for it if the `dependent_root` has
+    /// changed.
+    ///
+    /// Only to be called for a gloas epoch: an earlier one answers with no
+    /// duties, which is harmless but a request wasted every epoch.
+    pub async fn refresh_ptc(&mut self, epoch: Epoch) -> Result<()> {
+        if self.indices.is_empty() {
+            return Ok(());
+        }
+
+        let fetched = self.beacon_node.ptc_duties(epoch, &self.indices).await?;
+
+        let held = self.ptc.get(&epoch);
+        if held.is_some_and(|held| held.dependent_root == fetched.dependent_root) {
+            return Ok(());
+        }
+        if held.is_some() {
+            warn!(
+                %epoch,
+                "Payload timeliness committee duties invalidated by a reorg; replacing the schedule"
+            );
+        }
+
+        // The node was asked about these indices only, but a node that answers
+        // for more must not make this client vote for validators it does not
+        // hold.
+        let mine: Vec<PtcDutyDto> = fetched
+            .duties
+            .into_iter()
+            .filter(|duty| self.indices.contains(&duty.validator_index))
+            .collect();
+        if mine.is_empty() {
+            tracing::debug!(%epoch, "No payload timeliness committee duties this epoch");
+        } else {
+            info!(%epoch, count = mine.len(), "Payload timeliness committee duties updated");
+        }
+        self.ptc.insert(
+            epoch,
+            EpochDuties {
+                dependent_root: fetched.dependent_root,
+                duties: mine,
+            },
+        );
+        Ok(())
+    }
+
+    /// Fetch the sync committee duties of `period` for this client's indices,
+    /// replacing whatever is held for it.
+    ///
+    /// Asked at the period's first epoch, which the node answers from the
+    /// committee that serves the whole period. Narrowed to this client's
+    /// indices on arrival, for the reason [`Self::refresh_ptc`] is.
+    pub async fn refresh_sync(&mut self, period: u64) -> Result<()> {
+        if self.indices.is_empty() {
+            return Ok(());
+        }
+        let epoch = period * EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
+        let fetched = self.beacon_node.sync_duties(epoch, &self.indices).await?;
+        let mine: Vec<SyncDutyDto> = fetched
+            .into_iter()
+            .filter(|duty| self.indices.contains(&duty.validator_index))
+            .filter(|duty| !duty.validator_sync_committee_indices.is_empty())
+            .collect();
+        if mine.is_empty() {
+            tracing::debug!(period, "No sync committee duties this period");
+        } else {
+            info!(period, count = mine.len(), "Sync committee duties updated");
+        }
+        self.sync.insert(period, mine);
+        Ok(())
+    }
+
+    /// The sync committee duties held for `period`.
+    pub fn sync_for_period(&self, period: u64) -> Vec<SyncDutyDto> {
+        self.sync.get(&period).cloned().unwrap_or_default()
+    }
+
+    /// The sync committee duties to perform at wall slot `slot`.
+    ///
+    /// Those of the period containing `slot + 1`: a member assigned to slot
+    /// `S` signs for `S - 1` and the message is included at `S`, so at the
+    /// last slot of a period the next committee is the one that signs.
+    pub fn sync_at_slot(&self, slot: Slot) -> Vec<SyncDutyDto> {
+        let period = sync_committee_period((slot + 1) / SLOTS_PER_EPOCH);
+        self.sync_for_period(period)
+    }
+
+    /// Forget sync committee duties of periods before `period`.
+    pub fn prune_sync_before(&mut self, period: u64) {
+        self.sync.retain(|held, _| *held >= period);
+    }
+
+    /// Forget payload timeliness committee duties for epochs before `epoch`.
+    pub fn prune_ptc_before(&mut self, epoch: Epoch) {
+        self.ptc.retain(|held, _| *held >= epoch);
+    }
+
+    /// This client's committee duties at `slot`. More than one is ordinary: a
+    /// client holding several validators can have several seats in one slot's
+    /// committee.
+    pub fn ptc_at_slot(&self, slot: Slot, epoch: Epoch) -> Vec<PtcDutyDto> {
+        self.ptc
+            .get(&epoch)
+            .map(|held| {
+                held.duties
+                    .iter()
+                    .filter(|duty| duty.slot == slot)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// This client's proposer duty for `slot`, if it has one.
@@ -604,5 +740,163 @@ mod tests {
         let mut service = DutiesService::new(node.clone(), vec![]);
         service.refresh_proposers(3).await.expect("no-op");
         assert_eq!(node.proposer_duties_call_count(), 0);
+    }
+
+    fn ptc_duty(validator_index: ValidatorIndex, slot: Slot) -> PtcDutyDto {
+        PtcDutyDto {
+            pubkey: "0x00".to_string(),
+            validator_index,
+            slot,
+        }
+    }
+
+    #[tokio::test]
+    async fn payload_committee_duties_are_fetched_filtered_and_indexed_by_slot() {
+        let node = Arc::new(MockBeaconNode::new().with_ptc_duties(
+            12,
+            Root::repeat_byte(1),
+            // Validator 99 is not ours and must be dropped on arrival.
+            vec![ptc_duty(7, 390), ptc_duty(99, 390), ptc_duty(7, 395)],
+        ));
+        let mut service = DutiesService::new(node.clone(), vec![7]);
+
+        service.refresh_ptc(12).await.expect("refreshes");
+
+        let at_390 = service.ptc_at_slot(390, 12);
+        assert_eq!(at_390.len(), 1);
+        assert_eq!(at_390[0].validator_index, 7);
+        assert_eq!(service.ptc_at_slot(395, 12).len(), 1);
+        assert!(service.ptc_at_slot(391, 12).is_empty());
+        assert!(
+            service.ptc_at_slot(390, 13).is_empty(),
+            "scoped to the epoch"
+        );
+    }
+
+    /// A reorg past the dependent root replaces the schedule; an unchanged
+    /// root keeps it, which is what stops a refresh every epoch from churning.
+    #[tokio::test]
+    async fn a_changed_ptc_dependent_root_replaces_the_schedule() {
+        let node = Arc::new(MockBeaconNode::new().with_ptc_duties(
+            12,
+            Root::repeat_byte(1),
+            vec![ptc_duty(7, 390)],
+        ));
+        let mut service = DutiesService::new(node.clone(), vec![7]);
+        service.refresh_ptc(12).await.expect("first");
+
+        node.set_ptc_duties(12, Root::repeat_byte(1), vec![ptc_duty(7, 391)]);
+        service.refresh_ptc(12).await.expect("same root");
+        assert_eq!(
+            service.ptc_at_slot(390, 12).len(),
+            1,
+            "unchanged root keeps it"
+        );
+
+        node.set_ptc_duties(12, Root::repeat_byte(2), vec![ptc_duty(7, 391)]);
+        service.refresh_ptc(12).await.expect("new root");
+        assert!(service.ptc_at_slot(390, 12).is_empty());
+        assert_eq!(service.ptc_at_slot(391, 12).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pruning_forgets_earlier_payload_committee_epochs() {
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_ptc_duties(12, Root::repeat_byte(1), vec![ptc_duty(7, 390)])
+                .with_ptc_duties(13, Root::repeat_byte(1), vec![ptc_duty(7, 420)]),
+        );
+        let mut service = DutiesService::new(node, vec![7]);
+        service.refresh_ptc(12).await.expect("12");
+        service.refresh_ptc(13).await.expect("13");
+
+        service.prune_ptc_before(13);
+        assert!(service.ptc_at_slot(390, 12).is_empty());
+        assert_eq!(service.ptc_at_slot(420, 13).len(), 1);
+    }
+
+    fn sync_duty(validator_index: ValidatorIndex, seats: Vec<u64>) -> SyncDutyDto {
+        SyncDutyDto {
+            pubkey: "0x00".to_string(),
+            validator_index,
+            validator_sync_committee_indices: seats,
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_duties_are_fetched_at_the_periods_first_epoch_and_narrowed() {
+        let node = Arc::new(MockBeaconNode::new().with_sync_duties(
+            EPOCHS_PER_SYNC_COMMITTEE_PERIOD,
+            vec![sync_duty(7, vec![3]), sync_duty(99, vec![4])],
+        ));
+        let mut service = DutiesService::new(node, vec![7]);
+
+        service.refresh_sync(1).await.expect("refreshes");
+
+        let held = service.sync_for_period(1);
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].validator_index, 7);
+        assert!(service.sync_for_period(0).is_empty());
+    }
+
+    /// At a period's last slot the member signs for the slot after, which the
+    /// next committee owns.
+    #[tokio::test]
+    async fn the_last_slot_of_a_period_uses_the_next_periods_duties() {
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_sync_duties(0, vec![sync_duty(7, vec![1])])
+                .with_sync_duties(
+                    EPOCHS_PER_SYNC_COMMITTEE_PERIOD,
+                    vec![sync_duty(7, vec![200])],
+                ),
+        );
+        let mut service = DutiesService::new(node, vec![7]);
+        service.refresh_sync(0).await.expect("0");
+        service.refresh_sync(1).await.expect("1");
+
+        let period_slots = EPOCHS_PER_SYNC_COMMITTEE_PERIOD * SLOTS_PER_EPOCH;
+        assert_eq!(
+            service.sync_at_slot(period_slots - 2)[0].validator_sync_committee_indices,
+            vec![1]
+        );
+        assert_eq!(
+            service.sync_at_slot(period_slots - 1)[0].validator_sync_committee_indices,
+            vec![200]
+        );
+    }
+
+    #[tokio::test]
+    async fn pruning_forgets_earlier_sync_periods() {
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_sync_duties(0, vec![sync_duty(7, vec![1])])
+                .with_sync_duties(
+                    EPOCHS_PER_SYNC_COMMITTEE_PERIOD,
+                    vec![sync_duty(7, vec![2])],
+                ),
+        );
+        let mut service = DutiesService::new(node, vec![7]);
+        service.refresh_sync(0).await.expect("0");
+        service.refresh_sync(1).await.expect("1");
+        service.prune_sync_before(1);
+        assert!(service.sync_for_period(0).is_empty());
+        assert_eq!(service.sync_for_period(1).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn no_indices_means_no_sync_duties_request() {
+        let node = Arc::new(MockBeaconNode::new());
+        let mut service = DutiesService::new(node.clone(), Vec::new());
+        service.refresh_sync(0).await.expect("idles");
+        assert!(node.sync_duty_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_indices_means_no_payload_committee_request() {
+        let node = Arc::new(MockBeaconNode::new());
+        let mut service = DutiesService::new(node.clone(), Vec::new());
+        service.refresh_ptc(12).await.expect("idles");
+        assert_eq!(node.ptc_call_count(), 0);
     }
 }

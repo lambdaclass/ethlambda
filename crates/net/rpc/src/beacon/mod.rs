@@ -15,18 +15,41 @@ use serde::Serialize;
 
 use crate::shared::block_id::IdError;
 
+pub(crate) mod bid_selection;
+pub(crate) mod bids;
 pub(crate) mod blocks;
+pub(crate) mod builder_config;
+pub(crate) mod builders;
 pub(crate) mod config;
+pub(crate) mod envelopes;
 pub(crate) mod events;
 pub(crate) mod genesis;
+pub(crate) mod gloas_proposal;
+pub(crate) mod graffiti;
 pub(crate) mod headers;
 pub(crate) mod node;
+pub(crate) mod operations;
 pub(crate) mod pool;
 pub(crate) mod proposal;
+pub(crate) mod proposer_preferences;
+pub(crate) mod ptc;
 pub(crate) mod states;
+pub(crate) mod sync_committee;
 pub(crate) mod validator;
 #[cfg(test)]
 mod validator_client_tests;
+
+/// Request-body cap for the routes that accept blocks, envelopes and blobs.
+///
+/// Axum's default is 2 MiB, which a fulu `SignedBlockContents` outgrows at
+/// about 14 blobs (each blob is 131072 bytes, plus 128 cell proofs of 48 bytes,
+/// 6144 bytes, per blob). The preset's `MAX_BLOB_COMMITMENTS_PER_BLOCK` (4096,
+/// roughly 550 MB) is no practical bound, so this is sized from what the blob
+/// schedule allows in practice instead: a generous 128 blobs and their cell
+/// proofs come to about 17.5 MiB, a maximal execution payload (the gloas
+/// envelope carries it whole) takes up to roughly 16 MiB more, and the rest is
+/// margin for the block and its operations. Applied per route, never router-wide.
+pub(crate) const MAX_PUBLISH_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// The wrapper every fork-versioned Beacon API payload travels in.
 ///
@@ -61,6 +84,9 @@ pub(crate) enum ApiError {
     /// A request this node cannot answer right now, typically because its
     /// execution client did not (the Beacon API's 503).
     ServiceUnavailable(&'static str),
+    /// A request body in an encoding this endpoint does not take (415). A
+    /// client that posted SSZ and gets this one falls back to JSON.
+    UnsupportedMediaType(&'static str),
 }
 
 impl From<IdError> for ApiError {
@@ -80,11 +106,70 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m.into()),
             ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m.into()),
             ApiError::ServiceUnavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m.into()),
+            ApiError::UnsupportedMediaType(m) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, m.into()),
         };
         let body = serde_json::json!({ "code": status.as_u16(), "message": message });
         let mut response = crate::json_response(body);
         *response.status_mut() = status;
         response
+    }
+}
+
+/// How a request body is encoded, from its `Content-Type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BodyEncoding {
+    Json,
+    Ssz,
+}
+
+impl BodyEncoding {
+    /// An absent `Content-Type` is read as JSON, which is what every client
+    /// that predates SSZ submission sends. Anything else is a 415 rather than a
+    /// guess, so a client that tries SSZ first (prysm) learns this node wants
+    /// the other.
+    pub(crate) fn from_headers(headers: &axum::http::HeaderMap) -> Result<Self, ApiError> {
+        let content_type = headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.split(';').next().unwrap_or("").trim());
+        match content_type {
+            None | Some("application/json") => Ok(Self::Json),
+            Some(crate::SSZ_CONTENT_TYPE) => Ok(Self::Ssz),
+            Some(_) => Err(ApiError::UnsupportedMediaType(
+                "Content-Type must be application/json or application/octet-stream",
+            )),
+        }
+    }
+
+    /// Decode one container in this encoding, or `None` when the body is not
+    /// one. JSON and SSZ go through the same type, so what follows a decode
+    /// cannot depend on which one the client chose.
+    pub(crate) fn decode<T>(self, body: &[u8]) -> Option<T>
+    where
+        T: serde::de::DeserializeOwned + libssz::SszDecode,
+    {
+        match self {
+            Self::Json => serde_json::from_slice(body).ok(),
+            Self::Ssz => T::from_ssz_bytes(body).ok(),
+        }
+    }
+}
+
+/// Decode the array a batch-submission endpoint takes, as JSON or as the SSZ
+/// `List[T, ...]` of the same elements, by the request's `Content-Type`.
+pub(crate) fn decode_list<T>(
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+) -> Result<Vec<T>, ApiError>
+where
+    T: serde::de::DeserializeOwned + libssz::SszDecode,
+{
+    let invalid = || ApiError::BadRequest("invalid request body");
+    match BodyEncoding::from_headers(headers)? {
+        BodyEncoding::Json => serde_json::from_slice(body).map_err(|_| invalid()),
+        BodyEncoding::Ssz => {
+            <Vec<T> as libssz::SszDecode>::from_ssz_bytes(body).map_err(|_| invalid())
+        }
     }
 }
 
@@ -98,6 +183,7 @@ pub(crate) fn routes(version: &'static str, peer_id: String) -> Router<Store> {
     Router::new()
         .merge(blocks::routes())
         .merge(events::routes())
+        .merge(envelopes::routes())
         .merge(headers::routes())
         .merge(states::routes())
         .merge(genesis::routes())
@@ -105,7 +191,14 @@ pub(crate) fn routes(version: &'static str, peer_id: String) -> Router<Store> {
         .merge(node::routes(version, peer_id))
         .merge(validator::routes())
         .merge(pool::routes())
+        .merge(operations::routes())
         .merge(proposal::routes())
+        .merge(gloas_proposal::routes())
+        .merge(ptc::routes())
+        .merge(bids::routes())
+        .merge(proposer_preferences::routes())
+        .merge(builders::routes())
+        .merge(sync_committee::routes())
 }
 
 #[cfg(test)]

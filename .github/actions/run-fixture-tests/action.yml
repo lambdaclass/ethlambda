@@ -63,7 +63,7 @@ runs:
 
     - name: Restore test fixtures cache
       id: cache-fixtures
-      uses: actions/cache/restore@v5
+      uses: actions/cache/restore@v5.1.0
       with:
         path: leanSpec/fixtures
         key: leanspec-fixtures-${{ steps.fixtures-release.outputs.sha }}
@@ -98,7 +98,7 @@ runs:
         always()
         && steps.cache-fixtures.outputs.cache-hit != 'true'
         && steps.download-fixtures.outcome == 'success'
-      uses: actions/cache/save@v5
+      uses: actions/cache/save@v5.1.0
       with:
         path: leanSpec/fixtures
         key: ${{ steps.cache-fixtures.outputs.cache-primary-key }}
@@ -117,7 +117,7 @@ runs:
     # Keyed by target so the two halves do not evict each other: the default
     # key covers the job id, which is one value for every leg of a matrix.
     - name: Setup cache
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@v2.9.3
       with:
         key: ${{ inputs.make-target }}
 

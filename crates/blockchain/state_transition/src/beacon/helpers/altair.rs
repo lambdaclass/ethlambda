@@ -41,6 +41,7 @@ use crate::beacon::containers::{BeaconState, altair};
 use crate::beacon::error::{Error, Result};
 use crate::beacon::fork::ForkName;
 use crate::beacon::hash::hash;
+use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{Epoch, Gwei, ParticipationFlags, ValidatorIndex};
 
@@ -158,7 +159,17 @@ pub fn get_next_sync_committee(state: &BeaconState) -> Result<altair::SyncCommit
         ForkName::Electra | ForkName::Fulu => {
             crate::beacon::helpers::electra::get_next_sync_committee_indices(state)?
         }
-        _ => get_next_sync_committee_indices(state)?,
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb => get_next_sync_committee_indices(state)?,
+        // Modified in gloas (EIP-7732): the draw is
+        // `compute_balance_weighted_selection` rather than electra's inline
+        // rejection-sampling loop, though it keeps electra's effective-balance
+        // ceiling. See `crate::beacon::helpers::gloas`'s own module doc.
+        ForkName::Gloas => crate::beacon::helpers::gloas::get_next_sync_committee_indices(state)?,
+        ForkName::Lean => lean_state_unreachable("get_next_sync_committee"),
     };
     let mut pubkeys = Vec::with_capacity(indices.len());
     for index in &indices {
@@ -193,11 +204,14 @@ pub fn compute_sync_committee_period(epoch: Epoch) -> u64 {
 /// stake actually earned it rather than assuming every attestation splits the
 /// same fixed fraction.
 pub fn get_base_reward_per_increment(state: &BeaconState) -> Result<Gwei> {
-    let total_active_balance = get_total_active_balance(state)?;
-    Ok(
-        preset::EFFECTIVE_BALANCE_INCREMENT * preset::BASE_REWARD_FACTOR
-            / integer_squareroot(total_active_balance),
-    )
+    Ok(base_reward_per_increment(get_total_active_balance(state)?))
+}
+
+/// [`get_base_reward_per_increment`] for a total active balance the caller
+/// already holds, such as one served by an `ActiveBalanceCache`.
+pub fn base_reward_per_increment(total_active_balance: Gwei) -> Gwei {
+    preset::EFFECTIVE_BALANCE_INCREMENT * preset::BASE_REWARD_FACTOR
+        / integer_squareroot(total_active_balance)
 }
 
 /// The base reward for the validator at `index`.
@@ -246,7 +260,7 @@ pub fn get_unslashed_participating_indices(
     // One pass over the registry instead of an index list followed by a
     // descent per member.
     let mut participating_indices = Vec::new();
-    for (index, validator) in state.validators().iter().enumerate() {
+    for (index, validator) in state.iter_validators().enumerate() {
         if !is_active_validator(validator, epoch) {
             continue;
         }
