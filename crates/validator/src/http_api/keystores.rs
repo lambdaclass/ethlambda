@@ -51,7 +51,7 @@ use crate::Error;
 use crate::beacon_node::dto::{encode_hex, parse_pubkey};
 use crate::http_api::KeymanagerContext;
 use crate::keys::keystore::Keystore;
-use crate::keys::{ValidatorDefinition, ValidatorDefinitions, ValidatorStore};
+use crate::keys::{SigningDefinition, ValidatorDefinition, ValidatorDefinitions, ValidatorStore};
 use crate::secure_fs;
 
 /// The most keystores accepted in a single import request.
@@ -121,7 +121,7 @@ pub struct KeyStatus {
 }
 
 impl KeyStatus {
-    fn error(message: impl std::fmt::Display) -> Self {
+    pub(super) fn error(message: impl std::fmt::Display) -> Self {
         Self {
             status: "error".to_string(),
             message: Some(message.to_string()),
@@ -142,11 +142,13 @@ pub struct DeleteResponse {
     pub slashing_protection: String,
 }
 
+/// The keys this process holds itself. Remote ones are `/eth/v1/remotekeys`'s
+/// to list; the two routes partition the store.
 pub async fn list(State(context): State<KeymanagerContext>) -> Json<ListResponse> {
     let store = context.store.read().await;
     Json(ListResponse {
         data: store
-            .pubkeys()
+            .local_pubkeys()
             .into_iter()
             .map(|pubkey| ListedKeystore {
                 validating_pubkey: encode_hex(&pubkey.0),
@@ -503,7 +505,7 @@ fn put_back(path: &Path, previous: Option<&[u8]>) -> crate::Result<()> {
 /// Save the definitions file, keeping `definitions_unflushed` true from an
 /// after-rename flush failure until a later save flushes the directory, which
 /// makes every earlier rename in it durable too.
-fn save_definitions(
+pub(super) fn save_definitions(
     context: &KeymanagerContext,
     definitions: &ValidatorDefinitions,
 ) -> crate::Result<()> {
@@ -680,8 +682,10 @@ fn persist_import(
     let definition = ValidatorDefinition {
         enabled: true,
         voting_public_key: base.clone(),
-        voting_keystore_path: keystore_path.clone(),
-        voting_keystore_password_path: password_path.clone(),
+        signing: SigningDefinition::LocalKeystore {
+            voting_keystore_path: keystore_path.clone(),
+            voting_keystore_password_path: password_path.clone(),
+        },
     };
     // How to put `definitions` back if the save below fails.
     //
@@ -700,10 +704,6 @@ fn persist_import(
         },
     }
 
-    // Re-importing an already-known key updates its entry in place instead
-    // of appending a duplicate: `voting_public_key` is this file's natural
-    // key, and a duplicate would make `ValidatorStore::load` process the
-    // same keystore twice on the next restart.
     let undo = match definitions
         .0
         .iter()
@@ -751,6 +751,48 @@ fn persist_import(
     }
 }
 
+/// Record `definition` in the definitions file, replacing any entry for the
+/// same key, and save it. For the remote import, which writes no key files
+/// and so has none to put back.
+///
+/// A failed save puts `definitions` back as it was, for the reason
+/// `persist_import` gives: one vector is shared by every key in the batch,
+/// and a failed key's entry left in it would be written by the next key's
+/// save. A save whose directory flush failed counts as persisted, as it does
+/// there.
+pub(super) fn upsert_definition(
+    context: &KeymanagerContext,
+    definitions: &mut ValidatorDefinitions,
+    definition: ValidatorDefinition,
+) -> crate::Result<()> {
+    let position = definitions
+        .0
+        .iter()
+        .position(|existing| existing.voting_public_key == definition.voting_public_key);
+    let previous = match position {
+        Some(index) => Some((
+            index,
+            std::mem::replace(&mut definitions.0[index], definition),
+        )),
+        None => {
+            definitions.0.push(definition);
+            None
+        }
+    };
+    match save_definitions(context, definitions) {
+        Ok(()) | Err(Error::Unflushed { .. }) => Ok(()),
+        Err(err) => {
+            match previous {
+                Some((index, previous)) => definitions.0[index] = previous,
+                None => {
+                    definitions.0.pop();
+                }
+            }
+            Err(err)
+        }
+    }
+}
+
 fn absolute(path: PathBuf) -> crate::Result<PathBuf> {
     std::path::absolute(&path).map_err(|source| Error::Io {
         path: path.display().to_string(),
@@ -774,7 +816,20 @@ pub async fn delete(
         .pubkeys
         .iter()
         .map(|text| match parse_pubkey(text) {
-            Ok(pubkey) => (Some(pubkey), delete_one(&context, &mut store, &pubkey)),
+            Ok(pubkey) => match delete_one(&context, &mut store, &pubkey) {
+                Some(status) => (Some(pubkey), status),
+                // The other route's key: `not_found` here, and carried
+                // without its pubkey, so nothing below exports its record or
+                // reports it `not_active` while a remote signer still signs
+                // with it.
+                None => (
+                    None,
+                    KeyStatus {
+                        status: "not_found".to_string(),
+                        message: None,
+                    },
+                ),
+            },
             Err(err) => (None, KeyStatus::error(err)),
         })
         .collect();
@@ -860,23 +915,45 @@ pub async fn delete(
     })
 }
 
+/// Delete one of this route's keys. `None` is a key `/eth/v1/remotekeys`
+/// holds, which this route neither removes nor says anything about.
 fn delete_one(
     context: &KeymanagerContext,
     store: &mut ValidatorStore,
     pubkey: &BlsPubkey,
-) -> KeyStatus {
+) -> Option<KeyStatus> {
     // Whether this key is on disk, read before the in-memory removal makes the
     // store an unreliable witness. `not_found` has to mean "this client has no
     // definitions entry for it", not "it is not in memory right now": a key
     // removed from memory by an earlier failed attempt is still very much
     // present on disk, and reporting `not_found` for it tells an operator the
     // key is gone when a restart will bring it back signing.
-    let on_disk = match definitions_contain(context, pubkey) {
-        Ok(present) => present,
+    let entry = match definitions_entry(context, pubkey) {
+        Ok(entry) => entry,
         // Cannot tell. Report the failure rather than guessing either way: a
         // wrong `not_found` here is the dangerous direction.
-        Err(err) => return KeyStatus::error(err),
+        Err(err) => return Some(KeyStatus::error(err)),
     };
+    let on_disk = entry.as_ref().is_some_and(|signing| !signing.is_remote());
+    // A remote key is the other route's whatever its state: one the store
+    // holds, or one only the file lists, which the next start would load. It
+    // is `/eth/v1/remotekeys`'s to delete, and this route must not reach into
+    // the other's half of the store.
+    let remote_on_disk = entry.is_some_and(|signing| signing.is_remote());
+    if store.remote_url(pubkey).is_some() || (remote_on_disk && !store.contains(pubkey)) {
+        return None;
+    }
+    Some(delete_local(context, store, pubkey, on_disk))
+}
+
+/// Remove one of this route's keys: from the store first, then from the
+/// definitions file. `on_disk` is whether the file lists it as a local key.
+fn delete_local(
+    context: &KeymanagerContext,
+    store: &mut ValidatorStore,
+    pubkey: &BlsPubkey,
+    on_disk: bool,
+) -> KeyStatus {
     let in_memory = store.remove(pubkey);
     // Whatever becomes of the definitions file below, this process no longer
     // signs with the key, so its overrides have nothing left to apply to. A key
@@ -943,24 +1020,32 @@ fn delete_one(
     }
 }
 
-/// Whether the definitions file currently holds an entry for `pubkey`.
+/// How the definitions file says `pubkey` signs, or `None` when it holds no
+/// entry for it.
 ///
 /// Read from disk rather than from the in-memory store, because the two can
 /// disagree and it is the file that decides what the next restart loads. A
-/// disabled entry counts as present: it is still there, `delete` is still what
-/// removes it, and reporting `not_found` for one would leave the operator
-/// believing a key is gone while its entry waits to be re-enabled.
+/// disabled entry counts as present: it is still there, a delete is still
+/// what removes it, and reporting `not_found` for one would leave the
+/// operator believing a key is gone while its entry waits to be re-enabled.
 ///
 /// An unparseable `voting_public_key` cannot match, matching the filter in
 /// [`persist_delete`]: if that entry will not be removed, this must not claim
 /// it was found, or a delete would report success having removed nothing.
-fn definitions_contain(context: &KeymanagerContext, pubkey: &BlsPubkey) -> crate::Result<bool> {
+pub(super) fn definitions_entry(
+    context: &KeymanagerContext,
+    pubkey: &BlsPubkey,
+) -> crate::Result<Option<SigningDefinition>> {
     let definitions = ValidatorDefinitions::open(&context.validators_dir)?;
-    Ok(definitions.0.iter().any(|definition| {
-        parse_pubkey(&definition.voting_public_key)
-            .map(|parsed| parsed == *pubkey)
-            .unwrap_or(false)
-    }))
+    Ok(definitions
+        .0
+        .into_iter()
+        .find(|definition| {
+            parse_pubkey(&definition.voting_public_key)
+                .map(|parsed| parsed == *pubkey)
+                .unwrap_or(false)
+        })
+        .map(|definition| definition.signing))
 }
 
 /// Drop a deleted key's entry from the definitions file.
@@ -969,7 +1054,7 @@ fn definitions_contain(context: &KeymanagerContext, pubkey: &BlsPubkey) -> crate
 /// means this client has stopped using the key, not that it destroys operator
 /// key material on an HTTP call. A definitions file with no entry for them is
 /// enough to keep them from being loaded again.
-fn persist_delete(context: &KeymanagerContext, pubkey: &BlsPubkey) -> crate::Result<()> {
+pub(super) fn persist_delete(context: &KeymanagerContext, pubkey: &BlsPubkey) -> crate::Result<()> {
     let mut definitions = ValidatorDefinitions::open(&context.validators_dir)?;
     definitions.0.retain(|definition| {
         parse_pubkey(&definition.voting_public_key)
@@ -1028,6 +1113,7 @@ mod tests {
             definitions_lock: Arc::new(tokio::sync::Mutex::new(())),
             definitions_unflushed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             protection: crate::slashing_protection::SlashingProtection::in_memory(),
+            default_remote_signer: None,
         }
     }
 
@@ -1180,8 +1266,10 @@ mod tests {
         let existing = ValidatorDefinition {
             enabled: false,
             voting_public_key: encode_hex(&pubkey.0),
-            voting_keystore_path: PathBuf::from("old.json"),
-            voting_keystore_password_path: PathBuf::from("old.txt"),
+            signing: SigningDefinition::LocalKeystore {
+                voting_keystore_path: PathBuf::from("old.json"),
+                voting_keystore_password_path: PathBuf::from("old.txt"),
+            },
         };
         let mut definitions = ValidatorDefinitions(vec![existing.clone()]);
 
@@ -1485,8 +1573,10 @@ mod tests {
         let previous = ValidatorDefinition {
             enabled: false,
             voting_public_key: format!("0x{}", keystore["pubkey"].as_str().expect("pubkey")),
-            voting_keystore_path: dir.path().join("old.json"),
-            voting_keystore_password_path: dir.path().join("old"),
+            signing: SigningDefinition::LocalKeystore {
+                voting_keystore_path: dir.path().join("old.json"),
+                voting_keystore_password_path: dir.path().join("old"),
+            },
         };
         ValidatorDefinitions(vec![previous.clone()])
             .save(dir.path())
@@ -1554,8 +1644,10 @@ mod tests {
         let previous = ValidatorDefinition {
             enabled: true,
             voting_public_key: base.clone(),
-            voting_keystore_path: keystore_path.clone(),
-            voting_keystore_password_path: password_path.clone(),
+            signing: SigningDefinition::LocalKeystore {
+                voting_keystore_path: keystore_path.clone(),
+                voting_keystore_password_path: password_path.clone(),
+            },
         };
         ValidatorDefinitions(vec![previous.clone()])
             .save(dir.path())
@@ -1608,8 +1700,10 @@ mod tests {
         let previous = ValidatorDefinition {
             enabled: true,
             voting_public_key: base.clone(),
-            voting_keystore_path: keystore_path.clone(),
-            voting_keystore_password_path: dir.path().join("old"),
+            signing: SigningDefinition::LocalKeystore {
+                voting_keystore_path: keystore_path.clone(),
+                voting_keystore_password_path: dir.path().join("old"),
+            },
         };
         ValidatorDefinitions(vec![previous.clone()])
             .save(dir.path())

@@ -93,6 +93,10 @@ pub struct ValidatorConfig {
     /// signed, instead of refusing to start. See
     /// [`slashing_protection::SlashingProtection::open`].
     pub init_slashing_protection: bool,
+    /// `--web3signer-url`: the remote signer a key imported through
+    /// `POST /eth/v1/remotekeys` without a `url` of its own is assigned to.
+    /// Keys the definitions file already names a signer for need no default.
+    pub web3signer_url: Option<String>,
 }
 
 /// Run the validator client until the process is stopped.
@@ -133,6 +137,12 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
              directory"
         );
     }
+    // Checked for shape at startup rather than at the first import that
+    // leans on it, which could be days later.
+    if let Some(url) = &config.web3signer_url {
+        keys::Web3Signer::new(url)?;
+    }
+
     let store = ValidatorStore::load(&config.validators_dir)?;
     if store.is_empty() {
         warn!("No validators loaded; the client will idle");
@@ -226,6 +236,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             definitions_lock: Arc::new(Mutex::new(())),
             definitions_unflushed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             protection: protection.clone(),
+            default_remote_signer: config.web3signer_url.clone(),
         };
         let router = http_api::router(context, token);
         let listener = tokio::net::TcpListener::bind(address)

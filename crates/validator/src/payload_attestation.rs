@@ -120,7 +120,6 @@ impl<B: BeaconNodeApi> PayloadAttestationService<B> {
         let mut messages = Vec::with_capacity(pending.len());
         {
             let _timing = crate::metrics::time_signing();
-            let store = store.read().await;
             for duty in pending {
                 let pubkey = match parse_pubkey(&duty.pubkey) {
                     Ok(pubkey) => pubkey,
@@ -138,7 +137,8 @@ impl<B: BeaconNodeApi> PayloadAttestationService<B> {
 
                 match self
                     .context
-                    .sign_payload_attestation(&store, &pubkey, &data)
+                    .sign_payload_attestation(store, &pubkey, &data)
+                    .await
                 {
                     Ok(signature) => messages.push(PayloadAttestationMessage {
                         validator_index: duty.validator_index,

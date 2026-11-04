@@ -24,6 +24,7 @@ use crate::secure_fs;
 
 pub mod keystores;
 pub mod proposer;
+pub mod remotekeys;
 
 pub use keystores::SharedStore;
 
@@ -66,6 +67,9 @@ pub struct KeymanagerContext {
     /// The record every key must be registered in before it is loaded, so the
     /// duty path never meets a key it has no record for.
     pub protection: crate::slashing_protection::SharedProtection,
+    /// `--web3signer-url`: the signer a remote key imported without a `url`
+    /// of its own is assigned to. `None` makes such an import an error.
+    pub default_remote_signer: Option<String>,
 }
 
 /// The file the generated token is written to, inside the validators directory.
@@ -141,6 +145,12 @@ pub fn router(context: KeymanagerContext, token: String) -> Router {
             get(keystores::list)
                 .post(keystores::import)
                 .delete(keystores::delete),
+        )
+        .route(
+            "/eth/v1/remotekeys",
+            get(remotekeys::list)
+                .post(remotekeys::import)
+                .delete(remotekeys::delete),
         )
         .route(
             "/eth/v1/validator/{pubkey}/feerecipient",

@@ -47,37 +47,28 @@ pub async fn subscribe<B: BeaconNodeApi>(
         return Ok(());
     }
 
-    // The read guard is scoped to this block and never held across the await
-    // below, for the reason spelled out in `crate::attestation`: the lock is
-    // write-preferring, so one queued keymanager writer blocks every reader
-    // behind it.
-    let subscriptions: Vec<CommitteeSubscriptionDto> = {
-        let store = store.read().await;
-        duties
-            .iter()
-            .map(|duty| {
-                let is_aggregator = match selection_for(context, &store, duty) {
-                    Ok(selection) => selection.is_some(),
-                    Err(err) => {
-                        warn!(
-                            slot = duty.slot,
-                            validator = duty.validator_index,
-                            %err,
-                            "Could not compute aggregator selection; subscribing without the role"
-                        );
-                        false
-                    }
-                };
-                CommitteeSubscriptionDto {
-                    validator_index: duty.validator_index,
-                    committee_index: duty.committee_index,
-                    committees_at_slot: duty.committees_at_slot,
-                    slot: duty.slot,
-                    is_aggregator,
-                }
-            })
-            .collect()
-    };
+    let mut subscriptions = Vec::with_capacity(duties.len());
+    for duty in duties {
+        let is_aggregator = match selection_for(context, store, duty).await {
+            Ok(selection) => selection.is_some(),
+            Err(err) => {
+                warn!(
+                    slot = duty.slot,
+                    validator = duty.validator_index,
+                    %err,
+                    "Could not compute aggregator selection; subscribing without the role"
+                );
+                false
+            }
+        };
+        subscriptions.push(CommitteeSubscriptionDto {
+            validator_index: duty.validator_index,
+            committee_index: duty.committee_index,
+            committees_at_slot: duty.committees_at_slot,
+            slot: duty.slot,
+            is_aggregator,
+        });
+    }
 
     let aggregating = subscriptions
         .iter()
@@ -236,10 +227,10 @@ mod tests {
             .await
             .expect("subscribes");
 
-        let guard = store.read().await;
         for (duty, sent) in duties.iter().zip(node.subscriptions()) {
             let proof = context
-                .sign_selection_proof(&guard, &pubkey, duty.slot)
+                .sign_selection_proof(&store, &pubkey, duty.slot)
+                .await
                 .expect("signs");
             assert_eq!(
                 sent.is_aggregator,

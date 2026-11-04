@@ -91,6 +91,14 @@ pub(crate) struct ValidatorOptions {
     /// one; remove it once the keys are registered.
     #[arg(long, default_value = "false")]
     pub(crate) init_slashing_protection: bool,
+    /// Base URL of a Web3Signer remote signer (e.g. https://signer:9000),
+    /// the default for remote keys imported through the keymanager API's
+    /// `POST /eth/v1/remotekeys` without a `url` of their own.
+    ///
+    /// Optional: a remote key may name its own signer in that request or in
+    /// `validator_definitions.yml`, and local keystores never need one.
+    #[arg(long)]
+    pub(crate) web3signer_url: Option<String>,
 }
 
 impl ValidatorOptions {
@@ -168,6 +176,7 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
             .enable_keymanager
             .then(|| std::net::SocketAddr::new(options.http_address, options.keymanager_port)),
         init_slashing_protection: options.init_slashing_protection,
+        web3signer_url: options.web3signer_url,
     })
     .await
     .map_err(Into::into)
@@ -189,6 +198,7 @@ mod tests {
             suggested_fee_recipient: None,
             enable_keymanager: false,
             init_slashing_protection: false,
+            web3signer_url: None,
         }
     }
 

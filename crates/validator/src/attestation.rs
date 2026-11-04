@@ -195,8 +195,8 @@ impl<B: BeaconNodeApi> AttestationService<B> {
         // Check and durably record the whole batch before any signature exists:
         // a signature that exists is a signature that can escape, whatever the
         // code after it intended. One write for the slot, off the executor,
-        // and before the store's read lock below is taken, so the disk flush
-        // never holds up a keymanager writer queued behind it.
+        // and with no guard on the store held, so the disk flush never holds
+        // up a keymanager writer queued behind it.
         let pubkeys: Vec<BlsPubkey> = candidates.iter().map(|(_, pubkey)| *pubkey).collect();
         let verdicts = crate::slashing_protection::blocking(&self.protection, move |protection| {
             protection.check_and_record_attestations(&pubkeys, &data)
@@ -219,48 +219,60 @@ impl<B: BeaconNodeApi> AttestationService<B> {
             }
         };
 
-        // The read guard is scoped to this block alone and must never be widened to cover an
-        // await. `tokio::sync::RwLock` is write-preferring, so a keymanager
-        // import or delete queuing for the write lock blocks every read behind
-        // it; keeping this guard narrow bounds how long that wait can be. The
-        // import holds its own write lock for the inserts alone, doing the slow
-        // EIP-2335 derivation outside it (see `http_api::keystores::import`),
-        // so this is the duty path keeping its half of the same bargain.
-        let mut attestations = Vec::with_capacity(candidates.len());
+        // Every duty the record let through is signed together below.
+        let mut to_sign = Vec::with_capacity(candidates.len());
         let mut refused = 0;
-        {
+        for ((duty, pubkey), verdict) in candidates.into_iter().zip(verdicts) {
+            if let Err(refusal) = verdict {
+                warn!(
+                    %slot,
+                    validator = duty.validator_index,
+                    %refusal,
+                    "Refusing to sign: slashing protection judged this attestation unsafe"
+                );
+                crate::metrics::inc_attestations_refused();
+                refused += 1;
+                continue;
+            }
+            to_sign.push((duty, pubkey));
+        }
+
+        // Signed concurrently rather than one after another. A local key
+        // signs in microseconds either way; a remote signer costs a round
+        // trip per signature, and a hundred validators behind one signer
+        // must not pay a hundred of them in series inside one slot. Each
+        // signature takes the store's read guard for its own lookup only
+        // (see `SigningContext::sign`), so nothing here holds it across an
+        // await: `tokio::sync::RwLock` is write-preferring, and a keymanager
+        // import queuing for the write lock would otherwise stall every read
+        // behind it for as long as the guard was held.
+        let signatures = {
             let _timing = crate::metrics::time_signing();
-            let store = store.read().await;
-            for ((duty, pubkey), verdict) in candidates.into_iter().zip(verdicts) {
-                if let Err(refusal) = verdict {
-                    warn!(
-                        %slot,
-                        validator = duty.validator_index,
-                        %refusal,
-                        "Refusing to sign: slashing protection judged this attestation unsafe"
-                    );
-                    crate::metrics::inc_attestations_refused();
-                    refused += 1;
+            futures::future::join_all(
+                to_sign
+                    .iter()
+                    .map(|(_, pubkey)| self.context.sign_attestation(store, pubkey, &data)),
+            )
+            .await
+        };
+
+        let mut attestations = Vec::with_capacity(to_sign.len());
+        for ((duty, _), signature) in to_sign.iter().zip(signatures) {
+            // One validator failing must not cost the others their attestation.
+            let signature = match signature {
+                Ok(signature) => signature,
+                Err(err) => {
+                    error!(%slot, validator = duty.validator_index, %err, "Failed to sign attestation");
+                    crate::metrics::inc_signing_failures();
                     continue;
                 }
-
-                // One validator failing must not cost the others their attestation.
-                let signature = match self.context.sign_attestation(&store, &pubkey, &data) {
-                    Ok(signature) => signature,
-                    Err(err) => {
-                        error!(%slot, validator = duty.validator_index, %err, "Failed to sign attestation");
-                        crate::metrics::inc_signing_failures();
-                        continue;
-                    }
-                };
-
-                attestations.push(SingleAttestationDto {
-                    committee_index: duty.committee_index,
-                    attester_index: duty.validator_index,
-                    data: data_dto.clone(),
-                    signature: encode_hex(&signature.0),
-                });
-            }
+            };
+            attestations.push(SingleAttestationDto {
+                committee_index: duty.committee_index,
+                attester_index: duty.validator_index,
+                data: data_dto.clone(),
+                signature: encode_hex(&signature.0),
+            });
         }
 
         if attestations.is_empty() {
