@@ -27,3 +27,21 @@ pub fn gather_default_metrics() -> Result<String, GatherError> {
 
     Ok(res)
 }
+
+/// The process collector comes from the `prometheus` crate's `process`
+/// feature, which registers it with the default registry on Linux only.
+/// Dashboards read the node's memory from it, so dropping the feature would
+/// leave them blank without any build failing.
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_registry_serves_the_process_metrics() {
+        let metrics = gather_default_metrics().unwrap();
+        assert!(
+            metrics.contains("process_resident_memory_bytes"),
+            "{metrics}"
+        );
+    }
+}
