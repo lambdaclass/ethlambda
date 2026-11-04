@@ -3129,8 +3129,10 @@ impl Store {
     ///
     /// A `None` covers two cases the index cannot tell apart: a slot the
     /// canonical chain skipped, and a slot below the anchor this store was
-    /// bootstrapped from. Callers that use this to *reject* something must treat
-    /// `None` as "unknown" rather than "not canonical".
+    /// bootstrapped from (or, on a beacon directory bootstrapped before
+    /// [`index_beacon_anchor`](Self::index_beacon_anchor) existed, the
+    /// anchor's own slot). Callers that use this to *reject* something must
+    /// treat `None` as "unknown" rather than "not canonical".
     pub fn canonical_root_at_slot(&self, slot: u64) -> Result<Option<H256>, Error> {
         let view = self.backend.begin_read().expect("read view");
         Ok(view
@@ -3138,6 +3140,33 @@ impl Store {
                 H256::from_ssz_bytes(bytes).expect("valid block root")
             })
             .expect("read block root"))
+    }
+
+    /// Write a beacon anchor's own slot into the canonical `BlockRoots` index.
+    ///
+    /// [`update_checkpoints`](Self::update_checkpoints), the index's other
+    /// writer, records the blocks between the old head and the new one but
+    /// never their common ancestor, and at bootstrap the head *is* the anchor.
+    /// Without this row the anchor would be the one canonical block the index
+    /// never names, so `/eth/v1/beacon/headers/head` answered `canonical: false`
+    /// until the first import moved the head. Lean's `init_store` writes the
+    /// same row.
+    ///
+    /// Keyed by the block's own slot, read back from the block row the caller
+    /// has already written, rather than by the anchor state's: a checkpoint
+    /// state sits at an epoch's first slot, which is after its latest block
+    /// whenever that slot was empty.
+    pub fn index_beacon_anchor(&mut self, root: H256) -> Result<(), Error> {
+        let (slot, _parent_root) = self
+            .block_entry(&root)
+            .ok_or(Error::UnexpectedMissingBlockHeader(root))?;
+        let entries = vec![(encode_block_root_key(slot), root.to_ssz())];
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .put_batch(Table::BlockRoots, entries)
+            .expect("put anchor block root");
+        batch.commit().expect("commit");
+        Ok(())
     }
 
     /// Return canonical signed blocks for the slot range `[start_slot, end_slot]`.
@@ -6208,6 +6237,49 @@ mod tests {
             .expect("store exists");
         resumed.repair_head().expect("repair head");
         assert_eq!(resumed.head().expect("head"), r1);
+    }
+
+    /// The anchor's `BlockRoots` row is keyed by its block's slot. A checkpoint
+    /// state at an epoch's first slot sits above its latest block whenever
+    /// that slot was empty, and the state's slot would index the anchor at a
+    /// slot it was not proposed in.
+    #[test]
+    fn index_beacon_anchor_keys_the_row_by_the_blocks_slot() {
+        let anchor_root = H256::repeat_byte(0xaa);
+        let (block_slot, state_slot) = (30, 32);
+        let mut store = Store::init_beacon(
+            Arc::new(InMemoryBackend::new()),
+            0,
+            Config::mainnet(),
+            anchor_root,
+            Checkpoint {
+                root: anchor_root,
+                slot: state_slot,
+            },
+            state_slot,
+        );
+        let anchor_block = beacon_test_block(block_slot, H256::repeat_byte(0xbb));
+        store
+            .insert_signed_block(anchor_root, anchor_block)
+            .expect("insert anchor block");
+        assert_eq!(
+            store.canonical_root_at_slot(block_slot).expect("read"),
+            None,
+            "inserting a block does not index it"
+        );
+
+        store
+            .index_beacon_anchor(anchor_root)
+            .expect("index anchor");
+
+        assert_eq!(
+            store.canonical_root_at_slot(block_slot).expect("read"),
+            Some(anchor_root)
+        );
+        assert_eq!(
+            store.canonical_root_at_slot(state_slot).expect("read"),
+            None
+        );
     }
 
     /// The common case: nothing for `repair_head` to do when the recorded

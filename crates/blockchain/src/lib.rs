@@ -753,9 +753,12 @@ pub enum ImportOutcome {
     ///   re-imports it and reaches `collect_pending_children` for real.
     /// - No verdict from the execution client, or a `NOT_VALIDATED` verdict on
     ///   a block that is not an optimistic candidate. Nothing is recorded and
-    ///   the block is simply dropped: unlike a column hold, nothing re-drives
+    ///   the block is simply dropped: unlike a column hold, no timer re-drives
     ///   it, which is what the terminal retry policy on the engine ladder
-    ///   means. See `EngineClient::call`'s own documentation.
+    ///   means. See `EngineClient::call`'s own documentation. The next arrival
+    ///   whose missing ancestor is this block does: `process_or_pend_block`'s
+    ///   DB walk re-queues it if it was ever pended, and otherwise asks the
+    ///   network for it.
     ///
     /// The name reads as "held for columns" for historical reasons; it is the
     /// general "produced no post-state" outcome.
@@ -2777,8 +2780,22 @@ impl BlockChainServer {
             // Resolve the actual missing ancestor by walking the chain. A stale entry
             // can occur when a cached ancestor was itself received and became pending
             // with its own missing parent — the children still point to the old value.
+            //
+            // An entry also goes stale the other way: the recorded ancestor gets a
+            // post-state while a block between it and this one is still missing,
+            // e.g. one dropped for lack of an execution verdict after its parent
+            // imported. Following it would land on an imported block, which the
+            // DB walk below re-queues as a no-op, so the real gap would never be
+            // retried or requested. Stop there; the DB walk finds the gap.
             let mut missing_root = parent_root;
             while let Some(&ancestor) = self.pending_block_parents.get(&missing_root) {
+                if self
+                    .store
+                    .has_state(&ancestor)
+                    .expect("DB read should succeed")
+                {
+                    break;
+                }
                 missing_root = ancestor;
             }
 
@@ -5401,6 +5418,77 @@ mod tests {
         assert_eq!(
             server.pending_blocks.get(&child_root),
             Some(&HashSet::from([grandchild_root]))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_block_dropped_below_an_imported_ancestor_is_retried_by_the_next_arrival() {
+        // A Hoodi follower behind a snap-syncing geth: a run of blocks pended
+        // while their oldest ancestor was missing, so each recorded that
+        // ancestor in `pending_block_parents`. It then imported, its child got
+        // no execution verdict and was dropped, and every later arrival still
+        // resolved to the imported ancestor. The DB walk re-queued that
+        // ancestor as a no-op and never reached the dropped block, so the
+        // head stayed put for three hours.
+        let mut store = beacon_store(GENESIS_TIME, 0);
+        store
+            .insert_signed_block(H256::ZERO, bare_block(0, H256::repeat_byte(0xcc)))
+            .expect("insert");
+        store
+            .insert_state(H256::ZERO, bare_state())
+            .expect("insert");
+        let mut server = beacon_server(store);
+
+        // The ancestor the stale pointer names, imported since.
+        let imported = bare_block(1, H256::ZERO);
+        let imported_root = imported.message_hash_tree_root();
+        server
+            .store
+            .insert_pending_block(imported_root, imported)
+            .expect("insert");
+        server
+            .store
+            .insert_state(imported_root, bare_state())
+            .expect("insert");
+
+        // Its child, dropped without a verdict: stored, but with no state.
+        let dropped = bare_block(2, imported_root);
+        let dropped_root = dropped.message_hash_tree_root();
+        server
+            .store
+            .insert_pending_block(dropped_root, dropped)
+            .expect("insert");
+
+        // The dropped block's child, still pending and still pointing at the
+        // ancestor that was missing when it arrived.
+        let pending = bare_block(3, dropped_root);
+        let pending_root = pending.message_hash_tree_root();
+        server
+            .store
+            .insert_pending_block(pending_root, pending)
+            .expect("insert");
+        server
+            .pending_blocks
+            .insert(dropped_root, HashSet::from([pending_root]));
+        server
+            .pending_block_parents
+            .insert(pending_root, imported_root);
+
+        let arrival = bare_block(4, pending_root);
+        let mut queue = VecDeque::new();
+        let outcome = server
+            .process_or_pend_block(arrival, ImportTimings::default(), &mut queue)
+            .await;
+
+        assert_eq!(outcome, None, "the arrival itself still pends");
+        let queued: Vec<H256> = queue
+            .iter()
+            .map(|(block, _)| block.message_hash_tree_root())
+            .collect();
+        assert_eq!(
+            queued,
+            vec![dropped_root],
+            "the dropped block is retried, not the imported ancestor"
         );
     }
 

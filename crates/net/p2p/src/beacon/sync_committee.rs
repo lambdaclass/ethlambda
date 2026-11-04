@@ -153,7 +153,7 @@ fn join(server: &mut P2PServer, subnets: Vec<(u64, Epoch)>) -> Vec<String> {
     }
     if !joined.is_empty() {
         // The advertised `syncnets` changed.
-        wire.metadata_seq_number += 1;
+        wire.bump_metadata_seq_number();
     }
     subscribed
 }
@@ -197,7 +197,7 @@ fn leave_expired(server: &mut P2PServer, epoch: Epoch) -> Vec<String> {
         }
     }
     if !expired.is_empty() {
-        wire.metadata_seq_number += 1;
+        wire.bump_metadata_seq_number();
     }
     unsubscribed
 }
@@ -227,7 +227,7 @@ mod tests {
     use ethlambda_types::beacon::primitives::Root;
 
     use super::*;
-    use crate::beacon::handler::build_metadata;
+    use crate::beacon::handler::{advertised_metadata, build_metadata};
     use crate::beacon::messages::BeaconMetaData;
     use crate::beacon::protocols;
     use crate::beacon::transition::apply;
@@ -350,6 +350,28 @@ mod tests {
         leave_expired(&mut server, 100);
         assert_eq!(syncnets_of(&server), [false, false, true, false]);
         assert_eq!(seq(&server), start + 3);
+    }
+
+    /// The copy the Beacon API reports (`/eth/v1/node/identity`) is
+    /// republished with every change, so it never lags what a peer's
+    /// `MetaData` request is answered with.
+    #[tokio::test]
+    async fn the_beacon_api_copy_follows_every_change() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let in_step = |server: &P2PServer| {
+            let wire = server.wire.beacon().expect("beacon wire");
+            wire.metadata.get() == advertised_metadata(wire)
+        };
+        assert!(in_step(&server), "published at startup");
+
+        join(&mut server, vec![(1, 100)]);
+        assert!(in_step(&server));
+        let published = server.wire.beacon().expect("beacon wire").metadata.get();
+        assert_eq!(published.syncnets, vec![0b0000_0010]);
+        assert_eq!(published.seq_number, seq(&server));
+
+        leave_expired(&mut server, 100);
+        assert!(in_step(&server));
     }
 
     #[tokio::test]

@@ -13,12 +13,12 @@ use ethlambda_types::primitives::H256;
 
 /// The block at `slot` among the roots this store can name, or `None`.
 ///
-/// `Table::BlockRoots` is the slot index, and `Store::update_checkpoints` is
-/// its only writer. That writer diffs the old head against the new one and
-/// writes nothing when they are the same root, which is the situation at
-/// bootstrap: `Store::init_beacon` seeds `KEY_HEAD` with the anchor. So the
-/// anchor's own slot is missing from the index even though its block is on
-/// disk, and `canonical_root_at_slot` alone cannot find it.
+/// `Table::BlockRoots` is the slot index. `Store::update_checkpoints` keeps
+/// it by diffing the old head against the new one, which never writes the
+/// block they start from, so the anchor's own slot is indexed separately, by
+/// `Store::index_beacon_anchor` at bootstrap. A directory bootstrapped before
+/// that existed has no row for its anchor even though the block is on disk,
+/// and `canonical_root_at_slot` alone cannot find it there.
 ///
 /// That slot is not a curiosity. `bin/ethlambda/src/checkpoint_sync.rs` reads
 /// a peer's finalized state, takes the anchor slot from it, and asks that peer
@@ -116,14 +116,10 @@ impl BlockId {
                 .latest_justified()
                 .map_err(|_| IdError::NotFound)?
                 .root),
-            // A beacon store cannot answer `genesis`. `BlockRoots` indexes the
-            // canonical branch above the store's anchor, and the anchor's own
-            // slot is never written to it: `update_checkpoints` is that
-            // index's only writer and it walks from the old head to the new
-            // one, which at bootstrap are the same root. A checkpoint-synced
-            // directory has no genesis block to return either way. Refusing
-            // is better than resolving it to the anchor and calling that
-            // genesis.
+            // A beacon store does not answer `genesis`: `BlockRoots` starts at
+            // the store's anchor, and a checkpoint-synced directory has no
+            // genesis block to return. Refusing is better than resolving it to
+            // the anchor and calling that genesis.
             BlockId::Genesis => Err(IdError::NotFound),
             BlockId::Slot(slot) => {
                 if let Some(root) = store
