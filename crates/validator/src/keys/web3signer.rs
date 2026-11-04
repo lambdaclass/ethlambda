@@ -58,6 +58,16 @@ impl Web3Signer {
                 reason: "a remote signer URL must be http or https".to_string(),
             });
         }
+        // The URL is named in every error this client raises about the
+        // signer, and those are logged. Credentials embedded in it would be
+        // logged with them, so they are refused rather than redacted: the
+        // signer's own authentication is TLS, not basic auth.
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(Error::Keystore {
+                path: parsed.host_str().unwrap_or("").to_string(),
+                reason: "a remote signer URL must not carry credentials".to_string(),
+            });
+        }
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
@@ -122,12 +132,23 @@ impl Web3Signer {
             return Err(failed(format!(
                 "remote signer {} answered {status}: {}",
                 self.base_url,
-                body.trim()
+                truncate(body.trim())
             )));
         }
 
         parse_signature_body(&body)
             .map_err(|err| failed(format!("remote signer {}: {err}", self.base_url)))
+    }
+}
+
+/// The most of a failed response's body that goes into an error, and so into
+/// a log line: enough to say why, not a whole error page.
+const MAX_LOGGED_BODY: usize = 200;
+
+fn truncate(body: &str) -> String {
+    match body.char_indices().nth(MAX_LOGGED_BODY) {
+        Some((cut, _)) => format!("{}...", &body[..cut]),
+        None => body.to_string(),
     }
 }
 
@@ -520,6 +541,13 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_response_body_is_cut_short_before_it_is_reported() {
+        let long = "x".repeat(1_000);
+        assert_eq!(truncate(&long).len(), MAX_LOGGED_BODY + 3);
+        assert_eq!(truncate("short"), "short");
+    }
+
+    #[test]
     fn the_signature_is_read_from_json_or_from_a_bare_string() {
         let hex = format!("0x{}", "ab".repeat(BLS_SIGNATURE_SIZE));
         let from_json =
@@ -540,6 +568,10 @@ mod tests {
             "https://signer:9000"
         );
         assert!(Web3Signer::new("ftp://signer:9000").is_err());
+        let Err(err) = Web3Signer::new("https://user:secret@signer:9000") else {
+            panic!("a URL carrying credentials must be refused");
+        };
+        assert!(!err.to_string().contains("secret"), "{err}");
         assert!(Web3Signer::new("signer:9000").is_err());
         assert!(Web3Signer::new("not a url").is_err());
     }
