@@ -132,11 +132,10 @@ impl std::fmt::Display for HexPrefixed<'_> {
 
 /// A sequence of integers, each written quoted.
 ///
-/// Serialize-only: nothing reads one back yet. Takes any `IntoIterator` of
-/// `Display` by reference so it serves a `Vec<u64>` and an `SszList<u64, N>`
-/// alike, which is what the containers need — `libssz-types` has no serde
-/// support and is a foreign crate, so its collections cannot carry an impl of
-/// their own.
+/// Takes any `IntoIterator` of `Display` by reference so it serves a
+/// `Vec<u64>` and an `SszList<u64, N>` alike, which is what the containers
+/// need: `libssz-types` has no serde support and is a foreign crate, so its
+/// collections cannot carry an impl of their own.
 ///
 /// Carries the same caveat as [`quoted_or_bare::serialize`]: it is intended
 /// for sequences of the unsigned integer aliases (`Slot`, `Epoch`, `Gwei`,
@@ -176,6 +175,140 @@ pub mod quoted_u64_seq {
         let mut seq = serializer.serialize_seq(Some(iter.len()))?;
         for item in iter {
             seq.serialize_element(&Quoted(item))?;
+        }
+        seq.end()
+    }
+
+    /// The inverse, into an `SszList<u64, N>`: each element is read quoted or
+    /// bare, and a sequence past the list's bound fails as soon as the extra
+    /// element arrives rather than after buffering all of it.
+    pub fn deserialize<'de, D, const N: usize>(
+        deserializer: D,
+    ) -> Result<libssz_types::SszList<u64, N>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        /// One element, accepted as a bare integer or a decimal string.
+        struct Element(u64);
+
+        impl<'de> serde::Deserialize<'de> for Element {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct ElementVisitor;
+
+                impl serde::de::Visitor<'_> for ElementVisitor {
+                    type Value = Element;
+
+                    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        f.write_str("an unsigned integer, bare or quoted")
+                    }
+
+                    fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Element, E> {
+                        Ok(Element(value))
+                    }
+
+                    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Element, E> {
+                        value.trim().parse().map(Element).map_err(E::custom)
+                    }
+                }
+
+                deserializer.deserialize_any(ElementVisitor)
+            }
+        }
+
+        struct ListVisitor<const N: usize>;
+
+        impl<'de, const N: usize> serde::de::Visitor<'de> for ListVisitor<N> {
+            type Value = libssz_types::SszList<u64, N>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(f, "a sequence of at most {N} unsigned integers")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut list = libssz_types::SszList::new();
+                while let Some(Element(value)) = seq.next_element()? {
+                    list.push(value).map_err(|err| {
+                        serde::de::Error::custom(format!("sequence exceeds its bound: {err:?}"))
+                    })?;
+                }
+                Ok(list)
+            }
+        }
+
+        deserializer.deserialize_seq(ListVisitor::<N>)
+    }
+
+    /// The same read into a `ProgressiveList<u64>`, which has no bound to
+    /// check.
+    pub fn deserialize_progressive<'de, D>(
+        deserializer: D,
+    ) -> Result<libssz_types::ProgressiveList<u64>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let texts = <Vec<String> as serde::Deserialize>::deserialize(deserializer)?;
+        let values = texts
+            .iter()
+            .map(|text| text.trim().parse().map_err(serde::de::Error::custom))
+            .collect::<Result<Vec<u64>, _>>()?;
+        Ok(values.into())
+    }
+}
+
+/// A sequence of sequences of integers, each innermost value written quoted.
+///
+/// [`quoted_u64_seq`] drives one flat sequence of `Display` scalars; this
+/// drives it once per outer element, for a field like
+/// `gloas::BeaconState.ptc_window`
+/// (`SszVector<SszVector<ValidatorIndex, PTC_SIZE>, PTC_WINDOW_LENGTH>`)
+/// whose elements are themselves a foreign `SszVector` with no `Serialize`
+/// of their own. Neither [`seq`] (which needs the element itself to already
+/// implement `Serialize`) nor [`quoted_u64_seq`] alone (which needs the
+/// element to already be the scalar) applies to a field shaped like this.
+pub mod nested_quoted_u64_seq {
+    use serde::ser::SerializeSeq as _;
+
+    /// Wraps one inner sequence so [`serde::ser::SerializeSeq::serialize_element`]
+    /// drives it through [`super::quoted_u64_seq::serialize`] instead of
+    /// requiring the inner sequence itself to implement `Serialize`.
+    struct Inner<C>(C);
+
+    impl<C, T> serde::Serialize for Inner<C>
+    where
+        C: IntoIterator<Item = T> + Copy,
+        C::IntoIter: ExactSizeIterator,
+        T: std::fmt::Display,
+    {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            super::quoted_u64_seq::serialize(self.0, serializer)
+        }
+    }
+
+    pub fn serialize<S, C, D, T>(values: C, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+        C: IntoIterator<Item = D>,
+        C::IntoIter: ExactSizeIterator,
+        // `D` is the outer iterator's item, an inner sequence reached by
+        // reference (e.g. `&SszVector<u64, N>`), so it is `Copy` the same
+        // way any shared reference is.
+        D: IntoIterator<Item = T> + Copy,
+        D::IntoIter: ExactSizeIterator,
+        T: std::fmt::Display,
+    {
+        let iter = values.into_iter();
+        let mut seq = serializer.serialize_seq(Some(iter.len()))?;
+        for item in iter {
+            seq.serialize_element(&Inner(item))?;
         }
         seq.end()
     }
@@ -298,6 +431,31 @@ pub mod ssz_hex_seq {
         }
         seq.end()
     }
+
+    /// The inverse: an array of hex strings, each decoded through the
+    /// element's `SszDecode`, so a byte list's bound is checked as on the wire.
+    pub fn deserialize<'de, D, C, T>(deserializer: D) -> Result<C, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+        C: TryFrom<Vec<T>>,
+        C::Error: std::fmt::Debug,
+        T: libssz::SszDecode,
+    {
+        let texts = <Vec<String> as serde::Deserialize>::deserialize(deserializer)?;
+        let values = texts
+            .iter()
+            .map(|text| {
+                let digits = text.trim();
+                let bytes = hex::decode(digits.strip_prefix("0x").unwrap_or(digits))
+                    .map_err(serde::de::Error::custom)?;
+                T::from_ssz_bytes(&bytes).map_err(|err| {
+                    serde::de::Error::custom(format!("invalid SSZ encoding: {err:?}"))
+                })
+            })
+            .collect::<Result<Vec<T>, _>>()?;
+        C::try_from(values)
+            .map_err(|err| serde::de::Error::custom(format!("invalid sequence: {err:?}")))
+    }
 }
 
 /// A sequence of values that serialize themselves, from a foreign collection.
@@ -321,6 +479,21 @@ pub mod seq {
             seq.serialize_element(&item)?;
         }
         seq.end()
+    }
+
+    /// The inverse: a JSON array of elements, collected into the foreign
+    /// collection through its `TryFrom<Vec<T>>`, which is where a length bound
+    /// is checked (a progressive list's conversion cannot fail).
+    pub fn deserialize<'de, D, C, T>(deserializer: D) -> Result<C, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+        C: TryFrom<Vec<T>>,
+        C::Error: std::fmt::Debug,
+        T: serde::Deserialize<'de>,
+    {
+        let values = <Vec<T> as serde::Deserialize>::deserialize(deserializer)?;
+        C::try_from(values)
+            .map_err(|err| serde::de::Error::custom(format!("invalid sequence: {err:?}")))
     }
 }
 
@@ -484,5 +657,21 @@ mod tests {
         // an otherwise-empty byte, not an empty string and not an all-zero
         // byte.
         assert_eq!(json["bits"], serde_json::json!("0x01"));
+    }
+
+    #[test]
+    fn a_list_of_integers_reads_quoted_or_bare_and_stops_at_its_bound() {
+        #[derive(Debug, serde::Deserialize)]
+        struct Holder {
+            #[serde(deserialize_with = "super::quoted_u64_seq::deserialize")]
+            values: libssz_types::SszList<u64, 2>,
+        }
+
+        let ok: Holder = serde_json::from_str(r#"{"values": ["1", 2]}"#).unwrap();
+        assert_eq!(ok.values.iter().copied().collect::<Vec<_>>(), vec![1, 2]);
+        let err = serde_json::from_str::<Holder>(r#"{"values": [1, 2, 3]}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceeds its bound"), "got {err}");
     }
 }

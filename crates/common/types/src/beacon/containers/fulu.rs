@@ -13,12 +13,13 @@
 //! the per-column grouping a sidecar presents; [`DataColumnsByRootIdentifier`]
 //! is how a request-response peer asks for specific columns of a specific
 //! block. `BeaconBlockBody`, `BeaconBlock`, `SignedBeaconBlock`,
-//! `ExecutionPayload`, and `ExecutionPayloadHeader` are unchanged from electra:
-//! a block still commits to the same `blob_kzg_commitments` it always has,
-//! since sampling changes how the data behind those commitments travels over
-//! the network, not what the block itself contains. This module defines none
-//! of those five; state transition code should import them from
-//! [`super::electra`] and [`super::deneb`] instead.
+//! `ExecutionPayload`, `ExecutionPayloadHeader`, and `NewPayloadRequest` are
+//! unchanged from electra: a block still commits to the same
+//! `blob_kzg_commitments` it always has, since sampling changes how the data
+//! behind those commitments travels over the network, not what the block
+//! itself, or the request the execution engine validates it with, contains.
+//! This module defines none of those six; state transition code should import
+//! them from [`super::electra`] and [`super::deneb`] instead.
 //!
 //! The other change is [`BeaconState::proposer_lookahead`]. Every fork through
 //! electra computes each slot's proposer on demand from the active set and the
@@ -27,9 +28,16 @@
 //! window of upcoming proposers at each epoch boundary, so
 //! `get_beacon_proposer_index` becomes a lookup into that window rather than a
 //! shuffle.
+//!
+//! [`PartialDataColumnSidecar`], [`PartialDataColumnPartsMetadata`],
+//! [`PartialDataColumnHeader`], and [`PartialDataColumnGroupID`] are
+//! transcribed from `fulu/partial-columns/p2p-interface.md`: wire types for
+//! gossipsub's Partial Message Extension, which exchanges the individual
+//! cells and proofs behind a [`DataColumnSidecar`] instead of the whole
+//! thing.
 
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
-use libssz_types::{SszList, SszVector};
+use libssz_types::{SszBitlist, SszList, SszVector};
 
 use super::altair::SyncCommittee;
 use super::deneb::{ExecutionPayloadHeader, KzgCommitments};
@@ -116,17 +124,17 @@ pub struct DataColumnSidecar {
     /// (which requires each element to already implement `Serialize`) or
     /// [`ssz_hex`](crate::beacon::serde_helpers::ssz_hex) (which would hex-encode
     /// the whole list as one string instead of one string per cell).
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex_seq")]
     pub column: DataColumn,
     /// The block's full `blob_kzg_commitments`, repeated in every one of that
     /// block's sidecars rather than fetched separately, which is what lets a
     /// sidecar be checked on its own.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub kzg_commitments: KzgCommitments,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub kzg_proofs: KzgProofs,
     pub signed_block_header: SignedBeaconBlockHeader,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub kzg_commitments_inclusion_proof: KzgCommitmentsInclusionProof,
 }
 
@@ -145,7 +153,7 @@ pub struct MatrixEntry {
     /// what [`ssz_hex`](crate::beacon::serde_helpers::ssz_hex) exists for,
     /// unlike [`DataColumnSidecar::column`], which holds a whole list of
     /// cells.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
     pub cell: Cell,
     pub kzg_proof: KzgProof,
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
@@ -161,8 +169,93 @@ pub struct MatrixEntry {
 )]
 pub struct DataColumnsByRootIdentifier {
     pub block_root: Root,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub columns: ColumnIndices,
+}
+
+// ---------------------------------------------------------------------------
+// Partial columns
+// ---------------------------------------------------------------------------
+//
+// Transcribed from `fulu/partial-columns/p2p-interface.md` rather than
+// `beacon-chain.md`: gossipsub's Partial Message Extension lets a peer
+// exchange individual cells and proofs of a `DataColumnSidecar` instead of
+// the whole thing, and these are that mechanism's wire types. None of the
+// four is ever stored in the state or a block body, the same way
+// `DataColumnSidecar` itself is not: a node reconstructs the full sidecar
+// from these parts before forwarding it to peers that do not support partial
+// messages.
+
+/// A bitfield over the cells of one data column, one bit per blob in the
+/// block, `CellsBitList`.
+pub type CellsBitList = SszBitlist<{ preset::MAX_BLOB_COMMITMENTS_PER_BLOCK }>;
+
+/// A [`PartialDataColumnHeader`] that may or may not be present, encoded as a
+/// list of length zero or one, `OptionalPartialDataColumnHeader`.
+///
+/// A partial message can carry cells before its header has ever been sent, so
+/// the header field has to be optional; SSZ has no `Option`, so the
+/// specification spells "optional" as a list capped at one element instead.
+pub type OptionalPartialDataColumnHeader = SszList<PartialDataColumnHeader, 1>;
+
+/// One column's worth of cells and proofs sent as a gossipsub partial
+/// message, carrying only the cells `cells_present_bitmap` names rather than
+/// a full [`DataColumn`].
+///
+/// `header` is only ever set on an eager push: a peer can only request cells
+/// after it already has the header, so a request-driven response never needs
+/// to repeat it. The column index itself is not a field here; it is inferred
+/// from the gossipsub topic's subnet.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+pub struct PartialDataColumnSidecar {
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
+    pub cells_present_bitmap: CellsBitList,
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex_seq")]
+    pub partial_column: DataColumn,
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
+    pub kzg_proofs: KzgProofs,
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
+    pub header: OptionalPartialDataColumnHeader,
+}
+
+/// The two bitmaps peers exchange to negotiate which cells to send: `available`
+/// says which cells a peer holds, `requests` says which ones it wants.
+///
+/// Having a cell but declining to provide it is functionally the same as not
+/// having it, so no third state is needed beyond what the pair of bitmaps
+/// already encodes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+pub struct PartialDataColumnPartsMetadata {
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
+    pub available: CellsBitList,
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
+    pub requests: CellsBitList,
+}
+
+/// The header common to every column of one block: which blobs it commits to,
+/// proof that those commitments belong to the block, and enough of the block
+/// itself to check both.
+///
+/// Sent only on eager pushes, since a peer can only make a request once it
+/// already holds this. `verify_partial_data_column_header_inclusion_proof`
+/// checks `kzg_commitments_inclusion_proof` against
+/// `signed_block_header.message.body_root`, the same shallow proof
+/// [`DataColumnSidecar::kzg_commitments_inclusion_proof`] uses.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+pub struct PartialDataColumnHeader {
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
+    pub kzg_commitments: KzgCommitments,
+    pub signed_block_header: SignedBeaconBlockHeader,
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
+    pub kzg_commitments_inclusion_proof: KzgCommitmentsInclusionProof,
+}
+
+/// The gossipsub Partial Message group ID for a block's columns: the SSZ
+/// encoding of this container, prefixed by a version byte, names the group
+/// every partial message about that block's cells belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+pub struct PartialDataColumnGroupID {
+    pub beacon_block_root: Root,
 }
 
 // ---------------------------------------------------------------------------
@@ -197,20 +290,20 @@ pub struct BeaconState {
     /// slot advances, since a block cannot commit to the root of the state
     /// containing it.
     pub latest_block_header: BeaconBlockHeader,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub block_roots: BlockRoots,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub state_roots: StateRoots,
     /// Frozen since capella: further history is committed to by
     /// `historical_summaries` instead. Kept rather than removed so a fulu
     /// state's shape stays hash-tree-root-compatible with every root
     /// committed while this field was still growing.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub historical_roots: HistoricalRoots,
 
     // -- Eth1 --
     pub eth1_data: Eth1Data,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub eth1_data_votes: Eth1DataVotes,
     /// How many deposits from the contract have been processed, which is
     /// where the next one will be read from.
@@ -218,32 +311,32 @@ pub struct BeaconState {
     pub eth1_deposit_index: u64,
 
     // -- Registry --
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub validators: Validators,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub balances: Balances,
 
     // -- Randomness --
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub randao_mixes: RandaoMixes,
 
     // -- Slashings --
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub slashings: Slashings,
 
     // -- Participation --
     /// Per-validator participation flags for the previous epoch, positionally
     /// parallel to `validators`. See altair for why this replaces phase0's
     /// accumulated attestations.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub previous_epoch_participation: EpochParticipation,
     /// Flags for the current epoch, which become `previous_epoch_participation`
     /// at the next epoch boundary.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub current_epoch_participation: EpochParticipation,
 
     // -- Finality --
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
     pub justification_bits: JustificationBits,
     pub previous_justified_checkpoint: Checkpoint,
     pub current_justified_checkpoint: Checkpoint,
@@ -251,7 +344,7 @@ pub struct BeaconState {
 
     // -- Inactivity --
     /// Per-validator inactivity score, positionally parallel to `validators`.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub inactivity_scores: InactivityScores,
 
     // -- Sync committees --
@@ -280,7 +373,7 @@ pub struct BeaconState {
     // -- History (capella) --
     /// The commitment to history from capella onward, appended to instead of
     /// `historical_roots` once that field was frozen.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub historical_summaries: HistoricalSummaries,
 
     // -- Deposits, exits, and consolidations (electra) --
@@ -311,13 +404,13 @@ pub struct BeaconState {
     pub earliest_consolidation_epoch: Epoch,
     /// Deposits credited on the execution layer but not yet applied to the
     /// registry, drained a bounded number at a time each epoch.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub pending_deposits: PendingDeposits,
     /// Partial withdrawals requested but not yet paid out.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub pending_partial_withdrawals: PendingPartialWithdrawals,
     /// Validator consolidations requested but not yet applied.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub pending_consolidations: PendingConsolidations,
 
     // -- Proposer lookahead (fulu) --
@@ -326,7 +419,7 @@ pub struct BeaconState {
     /// epoch boundary by `process_proposer_lookahead` so that
     /// `get_beacon_proposer_index` becomes a lookup into this vector rather
     /// than a shuffle computed on demand.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub proposer_lookahead: ProposerLookahead,
 }
 

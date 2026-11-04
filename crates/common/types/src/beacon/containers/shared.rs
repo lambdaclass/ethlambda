@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use ethlambda_ssz_tree::List;
+use ethlambda_ssz_tree::{List, ProgressiveList as TreeProgressiveList, Vector};
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libssz_types::{SszBitvector, SszList, SszVector};
 
@@ -29,19 +29,29 @@ use crate::beacon::primitives::{
 
 /// The rolling window of recent block roots the state keeps, indexed by slot
 /// modulo its length so it acts as a ring buffer.
-pub type BlockRoots = SszVector<Root, { preset::SLOTS_PER_HISTORICAL_ROOT }>;
+///
+/// Tree-backed, like every large field: a slot writes one entry, so a derived
+/// state shares nearly all of the buffer with its parent and rehashes only the
+/// leaf it touched. Writes are buffered in a `BTreeMap`, since they are a
+/// handful per flush, until `BeaconState::apply_pending_mutations`.
+pub type BlockRoots = Vector<Root, { preset::SLOTS_PER_HISTORICAL_ROOT }, BTreeMap<usize, Root>>;
 
 /// The rolling window of recent state roots, indexed the same way as
 /// [`BlockRoots`].
-pub type StateRoots = SszVector<Root, { preset::SLOTS_PER_HISTORICAL_ROOT }>;
+pub type StateRoots = Vector<Root, { preset::SLOTS_PER_HISTORICAL_ROOT }, BTreeMap<usize, Root>>;
 
 /// Accumulated roots of [`HistoricalBatch`], one appended per historical batch,
 /// which is how the chain keeps a commitment to history older than the rolling
 /// windows without keeping the roots themselves.
-pub type HistoricalRoots = SszList<Root, { preset::HISTORICAL_ROOTS_LIMIT }>;
+///
+/// Tree-backed like [`BlockRoots`].
+pub type HistoricalRoots = List<Root, { preset::HISTORICAL_ROOTS_LIMIT }, BTreeMap<usize, Root>>;
 
 /// Eth1 data votes accumulated over one voting period, tallied and then reset.
-pub type Eth1DataVotes = SszList<Eth1Data, { preset::SLOTS_PER_ETH1_VOTING_PERIOD }>;
+///
+/// Tree-backed like [`BlockRoots`].
+pub type Eth1DataVotes =
+    List<Eth1Data, { preset::SLOTS_PER_ETH1_VOTING_PERIOD }, BTreeMap<usize, Eth1Data>>;
 
 /// The validator registry. Append-only: a validator is never removed, only
 /// exited, since indices are referenced by attestations and must stay stable.
@@ -66,13 +76,18 @@ pub type Balances = List<Gwei, { preset::VALIDATOR_REGISTRY_LIMIT }>;
 
 /// Past randao mixes, indexed by epoch modulo the vector length, so the state
 /// retains a bounded history of the beacon chain's randomness.
-pub type RandaoMixes = SszVector<Bytes32, { preset::EPOCHS_PER_HISTORICAL_VECTOR }>;
+///
+/// Tree-backed like [`BlockRoots`].
+pub type RandaoMixes =
+    Vector<Bytes32, { preset::EPOCHS_PER_HISTORICAL_VECTOR }, BTreeMap<usize, Bytes32>>;
 
 /// Slashed balance totals per epoch, indexed by epoch modulo the vector length.
 /// Epoch processing reads the whole vector to size the proportional slashing
 /// penalty, which is what makes correlated slashings cost more than isolated
 /// ones.
-pub type Slashings = SszVector<Gwei, { preset::EPOCHS_PER_SLASHINGS_VECTOR }>;
+///
+/// Tree-backed like [`BlockRoots`].
+pub type Slashings = Vector<Gwei, { preset::EPOCHS_PER_SLASHINGS_VECTOR }, BTreeMap<usize, Gwei>>;
 
 /// One bit per recent epoch recording whether it was justified, which is the
 /// state that lets finalization look back over several epochs at once.
@@ -91,11 +106,31 @@ pub type EpochParticipation = SszList<ParticipationFlags, { preset::VALIDATOR_RE
 
 /// Per-validator inactivity scores, positionally parallel to [`Validators`]
 /// (altair and later).
-pub type InactivityScores = SszList<u64, { preset::VALIDATOR_REGISTRY_LIMIT }>;
+///
+/// Tree-backed: outside a leak almost every score is zero and epoch processing
+/// skips writes that change nothing, so a state derived from another shares
+/// nearly the whole list with it and rehashes only the touched leaves. Writes
+/// are buffered in a `BTreeMap`, since they are sparse in that case.
+pub type InactivityScores = List<u64, { preset::VALIDATOR_REGISTRY_LIMIT }, BTreeMap<usize, u64>>;
 
 /// Accumulated [`HistoricalSummary`] entries, which replace [`HistoricalRoots`]
 /// as the commitment to history from capella onward.
-pub type HistoricalSummaries = SszList<HistoricalSummary, { preset::HISTORICAL_ROOTS_LIMIT }>;
+///
+/// Tree-backed like [`BlockRoots`].
+pub type HistoricalSummaries =
+    List<HistoricalSummary, { preset::HISTORICAL_ROOTS_LIMIT }, BTreeMap<usize, HistoricalSummary>>;
+
+/// The gloas validator registry (EIP-7688): unbounded and progressively
+/// merkleized, tree-backed like [`Validators`] for the same reason (a
+/// derived state shares the unchanged part of the registry, and re-hashing
+/// after a block only rehashes the records the block touched). Writes are
+/// buffered sparsely in a `BTreeMap`, the same as [`Validators`].
+pub type ProgressiveValidators = TreeProgressiveList<Validator, BTreeMap<usize, Validator>>;
+
+/// The gloas balances, positionally parallel to [`ProgressiveValidators`].
+/// Tree-backed like [`Balances`], with writes buffered densely (the default
+/// `VecMap`), since epoch processing writes every balance.
+pub type ProgressiveBalances = TreeProgressiveList<Gwei>;
 
 // ---------------------------------------------------------------------------
 // Misc
@@ -228,7 +263,16 @@ pub struct AttestationData {
 
 /// The execution chain's deposit state, as voted on by proposers.
 #[derive(
-    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct Eth1Data {
     /// The deposit contract's merkle root at this point.
@@ -260,9 +304,9 @@ pub struct Eth1Block {
 /// [`HistoricalRoots`] once the window is full.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct HistoricalBatch {
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub block_roots: BlockRoots,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub state_roots: StateRoots,
 }
 
@@ -312,7 +356,16 @@ pub struct DepositMessage {
 
 /// A deposit as recorded by the deposit contract.
 #[derive(
-    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct DepositData {
     pub pubkey: BlsPubkey,
@@ -327,9 +380,19 @@ pub struct DepositData {
 }
 
 /// A deposit together with its merkle proof against the deposit contract root.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 pub struct Deposit {
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub proof: DepositProof,
     pub data: DepositData,
 }
@@ -341,7 +404,16 @@ pub struct Deposit {
 /// A block without its body, which is what the state retains and what proposer
 /// slashings compare.
 #[derive(
-    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct BeaconBlockHeader {
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
@@ -359,7 +431,16 @@ pub struct BeaconBlockHeader {
 }
 
 #[derive(
-    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct SignedBeaconBlockHeader {
     pub message: BeaconBlockHeader,
@@ -368,7 +449,16 @@ pub struct SignedBeaconBlockHeader {
 
 /// Evidence that a proposer signed two different blocks for the same slot.
 #[derive(
-    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct ProposerSlashing {
     pub signed_header_1: SignedBeaconBlockHeader,
@@ -377,7 +467,17 @@ pub struct ProposerSlashing {
 
 /// A validator's request to stop validating.
 #[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct VoluntaryExit {
     /// The earliest epoch the exit may be processed at.
@@ -388,7 +488,16 @@ pub struct VoluntaryExit {
 }
 
 #[derive(
-    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct SignedVoluntaryExit {
     pub message: VoluntaryExit,

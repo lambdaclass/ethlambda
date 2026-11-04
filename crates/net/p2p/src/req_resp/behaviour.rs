@@ -61,6 +61,8 @@ pub(crate) struct ReqResp {
     pub(crate) beacon_blocks_by_root: request_response::Behaviour<Codec>,
     pub(crate) data_column_sidecars_by_range: request_response::Behaviour<Codec>,
     pub(crate) data_column_sidecars_by_root: request_response::Behaviour<Codec>,
+    pub(crate) execution_payload_envelopes_by_range: request_response::Behaviour<Codec>,
+    pub(crate) execution_payload_envelopes_by_root: request_response::Behaviour<Codec>,
 }
 
 impl ReqResp {
@@ -197,10 +199,28 @@ impl ReqResp {
                 fetch_protocol_config(),
             ),
             data_column_sidecars_by_root: request_response::Behaviour::with_codec(
-                codec,
+                codec.clone(),
                 one_protocol(
                     is_beacon,
                     beacon::protocols::DATA_COLUMN_SIDECARS_BY_ROOT_V1,
+                    request_response::ProtocolSupport::Full,
+                ),
+                fetch_protocol_config(),
+            ),
+            execution_payload_envelopes_by_range: request_response::Behaviour::with_codec(
+                codec.clone(),
+                one_protocol(
+                    is_beacon,
+                    beacon::protocols::EXECUTION_PAYLOAD_ENVELOPES_BY_RANGE_V1,
+                    request_response::ProtocolSupport::Full,
+                ),
+                fetch_protocol_config(),
+            ),
+            execution_payload_envelopes_by_root: request_response::Behaviour::with_codec(
+                codec,
+                one_protocol(
+                    is_beacon,
+                    beacon::protocols::EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT_V1,
                     request_response::ProtocolSupport::Full,
                 ),
                 fetch_protocol_config(),

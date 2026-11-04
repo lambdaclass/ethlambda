@@ -7,11 +7,10 @@
 //! validator a way to get its balance out without ever submitting anything:
 //! [`process_withdrawals`] sweeps a bounded slice of the validator registry
 //! on every single block, pays out anyone it finds fully or partially
-//! withdrawable, and [`BeaconState::next_withdrawal_index`] /
-//! [`BeaconState::next_withdrawal_validator_index`] (reached here through
-//! [`capella::BeaconState`]'s own fields) are the cursor that makes each
-//! block's share of that sweep bounded regardless of how large the registry
-//! grows. [`get_expected_withdrawals`] is the sweep itself;
+//! withdrawable, and [`capella::BeaconState::next_withdrawal_index`] /
+//! [`capella::BeaconState::next_withdrawal_validator_index`] are the cursor
+//! that makes each block's share of that sweep bounded regardless of how
+//! large the registry grows. [`get_expected_withdrawals`] is the sweep itself;
 //! [`process_bls_to_execution_change`] is the one new operation, a
 //! validator's one-time upgrade from a raw BLS withdrawal credential to an
 //! execution address, which is what makes it eligible for a payout in the
@@ -45,20 +44,20 @@
 use crate::beacon::bls;
 use crate::beacon::config::Config;
 use crate::beacon::constants;
-use crate::beacon::containers::shared::{
-    Deposit, ProposerSlashing, SignedVoluntaryExit, Validator,
-};
+use crate::beacon::containers::shared::{Deposit, ProposerSlashing, SignedVoluntaryExit};
 use crate::beacon::containers::{BeaconState, capella, phase0};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::hash::hash;
-use crate::beacon::helpers::accessors::{CommitteeCache, get_current_epoch, get_randao_mix};
+use crate::beacon::helpers::accessors::{
+    ActiveBalanceCache, CommitteeCache, get_current_epoch, get_randao_mix,
+};
 use crate::beacon::helpers::capella::{
-    is_fully_withdrawable_validator, is_partially_withdrawable_validator,
+    is_fully_withdrawable_validator, is_partially_withdrawable_validator, withdrawal_address,
 };
 use crate::beacon::helpers::misc::{compute_domain, compute_signing_root};
 use crate::beacon::helpers::mutators::decrease_balance;
 use crate::beacon::preset;
-use crate::beacon::primitives::{ExecutionAddress, H256, HashTreeRoot as _};
+use crate::beacon::primitives::{H256, HashTreeRoot as _};
 
 use super::ExecutionEngine;
 
@@ -79,6 +78,8 @@ pub fn process_block(
     config: &Config,
     engine: &ExecutionEngine,
     committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
+    options: super::block::BlockProcessingOptions,
 ) -> Result<()> {
     super::block::process_block_header(
         state,
@@ -89,7 +90,7 @@ pub fn process_block(
     )?;
     process_withdrawals(state, &block.body.execution_payload)?;
     process_execution_payload(state, &block.body.execution_payload, config, engine)?;
-    super::block::process_randao(state, &block.body.randao_reveal)?;
+    super::block::process_randao(state, &block.body.randao_reveal, options.randao)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
     process_operations(
         state,
@@ -101,22 +102,15 @@ pub fn process_block(
         &block.body.bls_to_execution_changes,
         config,
         committees,
+        active_balances,
     )?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate)?;
+    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Withdrawals
 // ---------------------------------------------------------------------------
-
-/// The execution address a validator's payout is sent to: the low bytes of
-/// its eth1 withdrawal credentials, the same bytes
-/// [`process_bls_to_execution_change`] writes when a validator upgrades into
-/// this form.
-fn withdrawal_address(validator: &Validator) -> ExecutionAddress {
-    ExecutionAddress::from_slice(&validator.withdrawal_credentials.0[12..])
-}
 
 /// The withdrawals this block's sweep owes, without applying them.
 ///
@@ -144,7 +138,7 @@ pub fn get_expected_withdrawals(state: &BeaconState) -> Result<Vec<capella::With
     // runtime.
     let (mut withdrawal_index, mut validator_index) = state.withdrawal_cursor()?;
 
-    let validator_count = state.validators().len() as u64;
+    let validator_count = state.validator_count() as u64;
     let bound = validator_count.min(preset::MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP);
 
     let mut withdrawals = Vec::new();
@@ -245,7 +239,7 @@ pub fn process_withdrawals(
     // this function's own documentation for why the two branches below do not
     // agree on where "next" is once the registry is smaller than
     // MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP.
-    let validator_count = state.validators().len() as u64;
+    let validator_count = state.validator_count() as u64;
     let next_validator_index = if expected_withdrawals.len() == preset::MAX_WITHDRAWALS_PER_PAYLOAD
     {
         // A full payload: the next sweep resumes right after the last
@@ -374,6 +368,7 @@ pub fn process_operations(
     bls_to_execution_changes: &[capella::SignedBLSToExecutionChange],
     config: &Config,
     committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     super::operations::process_operations(
         state,
@@ -384,6 +379,7 @@ pub fn process_operations(
         voluntary_exits,
         config,
         committees,
+        active_balances,
     )?;
     for signed_change in bls_to_execution_changes {
         process_bls_to_execution_change(state, signed_change, config)?;
@@ -509,7 +505,8 @@ mod tests {
     use super::*;
     use crate::beacon::fork::ForkName;
     use crate::beacon::primitives::{
-        BlsPubkey, BlsSignature, ExecutionBlockHash, Gwei, Root, Uint256, ValidatorIndex,
+        BlsPubkey, BlsSignature, ExecutionAddress, ExecutionBlockHash, Gwei, Root, Uint256,
+        ValidatorIndex,
     };
     use libssz_types::SszVector;
 
@@ -539,7 +536,7 @@ mod tests {
             validator.withdrawal_credentials.0[0] = constants::ETH1_ADDRESS_WITHDRAWAL_PREFIX;
             validator.withdrawable_epoch = 0;
         }
-        state.balances_mut()[index as usize] = balance;
+        *state.balance_mut(index).unwrap() = balance;
     }
 
     fn empty_execution_payload() -> capella::ExecutionPayload {

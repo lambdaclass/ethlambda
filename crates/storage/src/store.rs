@@ -1,13 +1,17 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::ops::Range;
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::time::Instant;
 
 use lru::LruCache;
 
+use crate::active_balance_cache::ActiveBalanceCache;
 use crate::api::{StorageBackend, StorageReadView, StorageReadViewExt, StorageWriteBatch, Table};
 use crate::committee_cache::CommitteeCache;
 use crate::error::Error;
 use crate::liveness::ObservedLiveness;
+use crate::pools::{AttestationPool, OperationPool};
 
 use ethlambda_crypto::signature::ValidatorSignature;
 use ethlambda_types::{
@@ -18,10 +22,17 @@ use ethlambda_types::{
     },
     beacon::{
         config::Config,
-        containers::{BeaconState, Checkpoint as BeaconCheckpoint, SignedBeaconBlock},
+        constants::NUM_BLOCK_TIMELINESS_DEADLINES,
+        containers::{
+            BeaconState, Checkpoint as BeaconCheckpoint, DataColumnSidecar, SignedBeaconBlock,
+            gloas,
+        },
         fork::ForkName,
-        fork_choice::{LatestMessage, PayloadStatusV1, PowBlock},
-        preset::{Preset, SLOTS_PER_EPOCH},
+        fork_choice::{
+            BlockPayloadLink, JustifiedBalances, LatestMessage, PayloadStatus, PayloadStatusEnum,
+            PayloadStatusV1, PowBlock,
+        },
+        preset::{PTC_SIZE, Preset, SLOTS_PER_EPOCH},
         primitives::ExecutionBlockHash,
     },
     block::{Block, BlockBody, BlockHeader, BlockProof, SignedBlock, SingleMessageAggregate},
@@ -31,10 +42,11 @@ use ethlambda_types::{
 };
 use libssz::{SszDecode, SszEncode};
 
+use crate::metrics::StateCacheMethod;
 use crate::state_codec::encode_state_value;
 use crate::state_writer::{
     CacheKey, PendingStates, STATE_WRITE_QUEUE_CAPACITY, StateCache, StateWriteRequest,
-    StateWriterHandle, read_state,
+    StateWriterHandle, cache_get, read_state,
 };
 use thiserror::Error;
 use tracing::{info, warn};
@@ -155,6 +167,15 @@ const KEY_BEACON_UNREALIZED_FINALIZED: &[u8] = b"beacon_unrealized_finalized";
 /// [`KEY_LATEST_FINALIZED`] is seeded to the anchor too, but moves with the
 /// chain, so after the first finalization nothing else on disk can answer this.
 const KEY_ANCHOR_SLOT: &[u8] = b"anchor_slot";
+/// The exclusive upper bound of every slot [`Store::prune_finalized_states`]
+/// has already deleted from `States` and `StateDiffs`, which is also the start
+/// of the next range it will delete. Its value has type [`u64`] and it's
+/// SSZ-encoded; absent means nothing has been pruned yet, i.e. zero.
+///
+/// Written in the same atomic batch as the range deletes it describes, so the
+/// watermark and the tombstones can never disagree, and consecutive ranges
+/// stay adjacent rather than overlapping, across restarts included.
+const KEY_STATES_PRUNED_BELOW: &[u8] = b"states_pruned_below";
 /// The on-disk format this build reads and writes.
 ///
 /// Bumped whenever a table's key or value layout changes. `from_db_state`
@@ -177,7 +198,17 @@ const KEY_ANCHOR_SLOT: &[u8] = b"anchor_slot";
 /// would otherwise look identical to "no unrealized justification computed
 /// yet" rather than "this directory predates the table", the same silent
 /// wrong answer every prior bump exists to rule out.
-pub const DB_VERSION: u64 = 5;
+///
+/// 6 widened `Config` with the gloas schedule, timing and churn keys
+/// (`max_request_payloads` was already claimed before this version bump), so a
+/// directory written by version 5 decodes into the wrong fields.
+///
+/// 7 moved `States` and `StateDiffs` from block-root keys to slot||root keys,
+/// so finalized states can be dropped with a range delete (see
+/// [`Store::prune_finalized_states`]). A directory written by the previous
+/// version holds rows no lookup can find, and there is no migration, by the
+/// same policy every previous change followed.
+pub const DB_VERSION: u64 = 7;
 
 /// The consensus protocol a data directory holds.
 ///
@@ -654,20 +685,88 @@ impl GossipSignatureBuffer {
     }
 }
 
+/// Bound on a validator index [`Store::set_latest_message`] accepts in debug
+/// builds. Far above any registry this client will meet, far below what a
+/// corrupt index would need to exhaust memory: the dense vote table has one slot
+/// per index up to the highest seen.
+const MAX_PLAUSIBLE_VALIDATOR_INDEX: u64 = 1 << 26;
+
+/// How many epoch-boundary [`JustifiedBalances`] snapshots the store keeps.
+const JUSTIFIED_BALANCES_CAPACITY: usize = 8;
+
+/// A small cache of [`JustifiedBalances`], keyed by their checkpoint.
+///
+/// Filled at block import, for the epoch-boundary checkpoint a block makes
+/// available, so that the tick which moves the justified checkpoint finds the
+/// snapshot already built and the head computation never has to rebuild a
+/// state. Lighthouse does the same with a plain 4-entry FIFO. Eviction here is
+/// smarter, since a network with many forks (several blocks crossing one
+/// boundary from different parents) could push the canonical entry out of a
+/// FIFO within one epoch:
+///
+/// 1. when full, the entry with the lowest epoch goes first (ties: the oldest
+///    insert), because an old boundary is the least likely to be justified;
+/// 2. the entry for the store's current justified checkpoint is never evicted.
+#[derive(Default)]
+pub(crate) struct JustifiedBalancesCache {
+    /// Insert sequence number (for tie-breaking) and the snapshot.
+    entries: Vec<(u64, Arc<JustifiedBalances>)>,
+    next_sequence: u64,
+}
+
+impl JustifiedBalancesCache {
+    fn get(&self, checkpoint: &BeaconCheckpoint) -> Option<Arc<JustifiedBalances>> {
+        self.entries
+            .iter()
+            .find(|(_, balances)| balances.checkpoint() == *checkpoint)
+            .map(|(_, balances)| Arc::clone(balances))
+    }
+
+    /// Adds `balances`, evicting by the policy above if the cache is full.
+    /// `current_justified` is the entry that must survive.
+    fn insert(&mut self, balances: Arc<JustifiedBalances>, current_justified: &BeaconCheckpoint) {
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        let checkpoint = balances.checkpoint();
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|(_, existing)| existing.checkpoint() == checkpoint)
+        {
+            *entry = (sequence, balances);
+            return;
+        }
+        if self.entries.len() >= JUSTIFIED_BALANCES_CAPACITY {
+            let victim = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, entry))| entry.checkpoint() != *current_justified)
+                .min_by_key(|(_, (sequence, entry))| (entry.checkpoint().epoch, *sequence))
+                .map(|(index, _)| index);
+            if let Some(victim) = victim {
+                self.entries.swap_remove(victim);
+            }
+        }
+        self.entries.push((sequence, balances));
+    }
+}
+
 /// Beacon fork-choice state that is per-slot or per-epoch scratch rather than
-/// chain history: most of it does not survive a restart, and is not worth the
-/// write amplification of persisting.
+/// chain history: apart from the entries named below, nothing here
+/// survives a restart, and nothing else here is worth the write
+/// amplification of persisting.
 ///
-/// `proposer_boost_root` resets every slot, `block_timeliness` is read only by
-/// the same-slot reorg helpers, `equivocating_indices` is rebuilt by replaying
-/// attester slashings on sync, `latest_messages` is rebuilt by the first epoch
-/// of attestations, and `pow_blocks` stands in for a call to an execution
-/// client that a restarted node would simply make again. `optimistic_roots`
-/// and `payload_statuses` are likewise answers an execution client can be
-/// asked for again, and `el_block_hashes` is a cache over data already
-/// decodable from the block itself.
+/// `proposer_boost_root` resets every slot, pre-gloas `block_timeliness` is
+/// read only by the same-slot reorg helpers, `equivocating_indices` is rebuilt
+/// by replaying attester slashings on sync, `latest_messages` is rebuilt by
+/// the first epoch of attestations, and `pow_blocks` stands in for a call to
+/// an execution client that a restarted node would simply make again.
+/// `optimistic_roots` and `payload_statuses` are likewise answers an execution
+/// client can be asked for again, and `el_block_hashes` and `payload_links`
+/// are caches over data already decodable from the block itself.
 ///
-/// `unrealized_justifications` is the one exception: it is a write-through
+/// `unrealized_justifications` is an exception: it is a write-through
 /// cache over `Table::BeaconUnrealizedJustifications`, not scratch that a
 /// restart may safely lose. A resumed node does *not* re-import the
 /// unfinalized window from its anchor the way a fresh sync would, so a value
@@ -677,26 +776,102 @@ impl GossipSignatureBuffer {
 /// [`Store::unrealized_justification`] and
 /// [`Store::set_unrealized_justification`].
 ///
+/// Gloas's `verified_payloads` and `block_timeliness` are exceptions too: they
+/// live in this scratch for reading, but a gloas block's entries are written
+/// through to `Table::ExecutionPayloadEnvelopes` and `Table::BlockTimeliness`,
+/// and [`Store::from_db_state`] rebuilds both for every block at or above the
+/// finalized one. Losing `verified_payloads` would not error, it would
+/// silently drop every full payload branch from fork choice. Losing a
+/// `block_timeliness` entry does not error either: a missing entry reads as
+/// not timely by either deadline, which quietly changes what
+/// `should_apply_proposer_boost` withholds. Pre-gloas timeliness is never
+/// persisted: nothing reads it after a restart.
+///
+/// `payload_timeliness_vote` and `payload_data_availability_vote` stay in
+/// memory on purpose. They are the payload timeliness committee's per-slot
+/// ballot, read only while the slot they were cast for is being decided. A
+/// resumed store reseeds them empty (every member `None`) for each restored
+/// gloas block, which is what a block just imported holds, and the next
+/// block's payload attestations refill them: the loss lasts about a slot.
+///
 /// Most of this is uncapped: the per-validator maps are bounded by the
-/// validator set, and the per-block ones (`block_timeliness`,
-/// `unrealized_justifications`) grow with the blocks this process has
-/// imported. Two are the exception, `el_block_hashes` and `optimistic_roots`,
-/// each pruned to the unfinalized window by its own `prune_*` method. Both
+/// validator set, and the per-block ones (`block_timeliness` and gloas's own
+/// three) grow with the blocks this process has imported. Three are the
+/// exception, `el_block_hashes`, `payload_links` and `optimistic_roots`, each
+/// pruned to the unfinalized window by its own `prune_*` method. All three
 /// fill on a path that runs for the whole life of the process and has no other
 /// way of emptying them: `forkchoiceUpdated` reads the first once per head
-/// move, and an execution client doing a long state sync answers
-/// `NOT_VALIDATED` to every block, which writes the second once per import.
+/// move, the head walk reads the second for every block it visits, and an
+/// execution client doing a long state sync answers `NOT_VALIDATED` to every
+/// block, which writes the third once per import. `unrealized_justifications`
+/// is bounded too: [`Store::prune_unrealized_justifications`] evicts it along
+/// with the table rows it caches.
 #[derive(Default)]
 pub(crate) struct BeaconScratch {
     pub(crate) proposer_boost_root: H256,
-    pub(crate) block_timeliness: HashMap<H256, bool>,
+    /// Gloas widens this from one bool to two, `[ATTESTATION_TIMELINESS_INDEX,
+    /// PTC_TIMELINESS_INDEX]`: a block is now timed against both the
+    /// attestation deadline and the (later) payload-attestation-committee
+    /// deadline. Pre-gloas code reads `ATTESTATION_TIMELINESS_INDEX` only,
+    /// the same deadline it always checked.
+    pub(crate) block_timeliness: HashMap<H256, [bool; NUM_BLOCK_TIMELINESS_DEADLINES]>,
     pub(crate) equivocating_indices: HashSet<u64>,
-    pub(crate) latest_messages: HashMap<u64, LatestMessage>,
+    /// Dense, indexed by validator index: the vote loop reads votes and
+    /// snapshot balances in index order, not hash order. `None` is a validator
+    /// that has not voted (or an index below the highest one seen).
+    pub(crate) latest_messages: Vec<Option<LatestMessage>>,
+    /// Epoch-boundary balances, flattened for the vote loop
+    /// and keyed by their own checkpoint. A derived cache: a miss is rebuilt
+    /// from `checkpoint_states`, so nothing needs to persist it.
+    pub(crate) justified_balances: JustifiedBalancesCache,
     pub(crate) pow_blocks: HashMap<H256, PowBlock>,
     /// In-memory half of `Table::BeaconUnrealizedJustifications`; see this
     /// struct's own documentation for why this map, unlike its neighbours,
     /// has a persisted backing table.
     pub(crate) unrealized_justifications: HashMap<H256, BeaconCheckpoint>,
+    /// Gloas: beacon block roots whose execution payload envelope has been
+    /// locally delivered and verified (`on_execution_payload_envelope`'s own
+    /// `store.payloads[root] = envelope`), the in-memory index of
+    /// `Table::ExecutionPayloadEnvelopes` for `is_payload_verified`'s
+    /// membership test. The envelopes themselves are read from the table.
+    pub(crate) verified_payloads: HashSet<H256>,
+    /// Each imported block's payload link (which rules it is handled under,
+    /// and which of its parent's payload branches it builds on), so the head
+    /// computation reads both without decoding a block. Written by `on_block`,
+    /// and by the head computation itself for a block it finds missing (a block
+    /// imported before a restart), the one decode that block ever costs.
+    ///
+    /// A cache over data already decodable from the block, like
+    /// `el_block_hashes`, and bounded the same way: each entry carries its
+    /// block's slot, and `prune_beacon_payload_links` drops the ones below
+    /// finality. A pruned link is derived again by decoding if anything asks
+    /// for it.
+    pub(crate) payload_links: HashMap<H256, (u64, BlockPayloadLink)>,
+    /// The head node fork choice last picked, as its block root and payload
+    /// branch: `Full` when the node is the block with the payload revealed,
+    /// `Empty` when it is the block alone. A pre-gloas head is `Full` (see
+    /// `fork_choice::get_head_node`).
+    ///
+    /// The root is stored with the status so a reader can tell whether the
+    /// status belongs to the head it sees: the head root lives in the backend
+    /// and this does not, so the two cannot be written atomically, and a
+    /// status alone could be paired with the wrong root. Readers compare roots
+    /// and treat a mismatch as unknown.
+    ///
+    /// `None` until the first head computation of this process: nothing
+    /// persists it, and a resumed directory recomputes it on the first tick
+    /// rather than storing a second source of truth for what the head walk
+    /// derives. Readers treat `None` as "not known to be `Full`".
+    pub(crate) head_node_payload_status: Option<(H256, PayloadStatus)>,
+    /// Gloas: the payload timeliness committee's per-member vote on whether
+    /// the block's payload showed up on time, one slot per `PTC_SIZE` index,
+    /// `None` until that member votes. Keyed by beacon block root, like
+    /// `block_timeliness`.
+    pub(crate) payload_timeliness_vote: HashMap<H256, Vec<Option<bool>>>,
+    /// Gloas: the payload timeliness committee's per-member vote on whether
+    /// the block's blob data was available, the sibling of
+    /// `payload_timeliness_vote`.
+    pub(crate) payload_data_availability_vote: HashMap<H256, Vec<Option<bool>>>,
     /// Beacon roots imported on an execution client's `NOT_VALIDATED` answer,
     /// against the slot the unfinalized-window bound prunes them by.
     ///
@@ -708,9 +883,11 @@ pub(crate) struct BeaconScratch {
     /// back out.
     ///
     /// Read through [`Store::is_beacon_optimistic`] by
-    /// `fork_choice::mark_validated`'s own ancestor walk, by the Beacon API's
-    /// `execution_optimistic` response field, and by the chain events that
-    /// carry the same field.
+    /// `fork_choice::mark_validated`'s ancestor walk, by the Beacon API (every
+    /// `execution_optimistic` response field, `/eth/v1/node/syncing` and
+    /// `/eth/v1/node/health`, and the validator endpoints that refuse with a
+    /// `503` rather than hand out a vote for an unvalidated block), and by the
+    /// chain events that carry the same field.
     pub(crate) optimistic_roots: HashMap<H256, u64>,
     /// Payload statuses keyed by execution block hash, standing in for a call
     /// to an execution client exactly as `pow_blocks` does. Written only by
@@ -718,17 +895,38 @@ pub(crate) struct BeaconScratch {
     /// production path carries its verdict as an `on_block` parameter instead.
     pub(crate) payload_statuses: HashMap<ExecutionBlockHash, PayloadStatusV1>,
     /// Beacon root to `(slot, execution block hash)`. A cache, not a source of
-    /// truth: every entry is recoverable by decoding the block. Unlike its
+    /// truth: every entry is recoverable by decoding the block. Filled at
+    /// import, for the checkpoint anchor (the one block never imported), and on
+    /// resume for the unfinalized window. Unlike its
     /// neighbours it *is* bounded, by `prune_beacon_el_block_hashes`, because
     /// forkchoiceUpdated reads it once per head move for the whole life of the
     /// process.
     pub(crate) el_block_hashes: HashMap<H256, (u64, ExecutionBlockHash)>,
+    /// Gloas: the execution client's verdict on each beacon block's payload,
+    /// against the block's slot for pruning. Keyed by beacon root because a
+    /// gloas block's payload hash lives in its bid and envelope rather than in
+    /// `el_block_hashes`. Read by the attestation gossip rules as the
+    /// specification's `block_payload_statuses`; an absent root reads as
+    /// `NOT_VALIDATED`.
+    pub(crate) block_payload_statuses: HashMap<H256, (u64, PayloadStatusEnum)>,
+    /// Gloas: beacon root to `(slot, milliseconds past genesis the block's
+    /// envelope reached this node)`. What the payload timeliness committee's
+    /// `payload_present` is decided from: the specification's vote is "an
+    /// envelope was seen before `get_payload_due_ms()` into the slot", and
+    /// nothing else this store keeps records *when*. A cache like
+    /// `el_block_hashes`, not chain history, and pruned with it by
+    /// `prune_beacon_el_block_hashes`; a restart forgets it, which can only
+    /// turn a late `payload_present` into `false` for the one slot in flight.
+    pub(crate) envelope_seen_ms: HashMap<H256, (u64, u64)>,
 }
 
 /// Encode a LiveChain key (slot, root) to bytes.
 /// Layout: slot (8 bytes big-endian) || root (32 bytes)
 /// Big-endian ensures lexicographic ordering matches numeric ordering.
-fn encode_slot_root_key(slot: u64, root: &H256) -> Vec<u8> {
+///
+/// Also the key of `States` and `StateDiffs`, where the slot is the slot of the
+/// block the state belongs to (see [`block_slot`]).
+pub(crate) fn encode_slot_root_key(slot: u64, root: &H256) -> Vec<u8> {
     let mut result = slot.to_be_bytes().to_vec();
     result.extend_from_slice(&root.0);
     result
@@ -811,6 +1009,47 @@ fn decode_beacon_block_value(bytes: &[u8]) -> SignedBeaconBlock {
     SignedBeaconBlock::from_ssz(fork, ssz).expect("valid signed block")
 }
 
+/// Whether `block` builds on the payload whose hash is `payload_block_hash`:
+/// gloas's bid `parent_block_hash` rule for a payload being part of the chain.
+fn builds_on_payload(block: &SignedBeaconBlock, payload_block_hash: &ExecutionBlockHash) -> bool {
+    match block {
+        SignedBeaconBlock::Gloas(block) => {
+            block
+                .message
+                .body
+                .signed_execution_payload_bid
+                .message
+                .parent_block_hash
+                == *payload_block_hash
+        }
+        // A pre-gloas block cannot follow a gloas one.
+        SignedBeaconBlock::Phase0(_)
+        | SignedBeaconBlock::Altair(_)
+        | SignedBeaconBlock::Bellatrix(_)
+        | SignedBeaconBlock::Capella(_)
+        | SignedBeaconBlock::Deneb(_)
+        | SignedBeaconBlock::Electra(_)
+        | SignedBeaconBlock::Fulu(_) => false,
+        SignedBeaconBlock::Lean(_) => Store::lean_only("builds_on_payload"),
+    }
+}
+
+/// Reads a beacon block's slot straight out of a `BlockHeaders` value, without
+/// decoding the block.
+///
+/// The value is a fork selector byte followed by the SSZ of a
+/// `SignedBeaconBlock`, which is `{ message: BeaconBlock (variable), signature }`:
+/// its fixed part opens with a 4-byte little-endian offset to `message`, and
+/// `BeaconBlock`'s first field is `slot: u64`. The offset is read rather than
+/// assumed, so a fork that grows the fixed part of the signed block keeps this
+/// correct. A full decode would materialise the whole body just to learn eight
+/// bytes, and this runs on every state read.
+pub(crate) fn peek_beacon_block_slot(value: &[u8]) -> u64 {
+    let (_, ssz) = value.split_first().expect("value is never empty");
+    let offset = u32::from_le_bytes(ssz[..4].try_into().expect("offset bytes")) as usize;
+    u64::from_le_bytes(ssz[offset..offset + 8].try_into().expect("slot bytes"))
+}
+
 /// `root`'s slot on a beacon chain, read without a `Store`, for the writer
 /// thread's anchor decision.
 ///
@@ -818,17 +1057,46 @@ fn decode_beacon_block_value(bytes: &[u8]) -> SignedBeaconBlock {
 /// first-ever beacon state is recognised: it has no parent block, so there is
 /// no base to diff against and it is always a snapshot.
 ///
-/// Beacon directories only: it decodes the row as a tagged
-/// [`SignedBeaconBlock`], which is the wrong shape for a lean directory's bare
-/// [`BlockHeader`] (unlike [`block_fields`](Store::block_fields), which
-/// dispatches on `self.chain`). Nothing does today: [`StateWriter::write`](crate::state_writer)'s
-/// non-`Lean` match arm is this function's only caller, so that invariant is
-/// enforced by having exactly one caller rather than by a runtime check.
+/// Beacon directories only: the row is a tagged [`SignedBeaconBlock`], which
+/// is the wrong shape for a lean directory's bare [`BlockHeader`]. Use
+/// [`block_slot`] when the chain is not known statically.
 pub(crate) fn beacon_block_slot(backend: &dyn StorageBackend, root: &H256) -> Option<u64> {
     let view = backend.begin_read().expect("read view");
-    view.read_with(Table::BlockHeaders, &root.to_ssz(), |bytes| {
-        decode_beacon_block_value(bytes).slot()
-    })
+    block_slot_in(view.as_ref(), Chain::Beacon, root)
+}
+
+/// `root`'s block slot on either chain, or `None` when no block is on record.
+///
+/// This is the slot `States` and `StateDiffs` are keyed by: a state lives at
+/// the slot of the block it belongs to, which is the slot in that root's
+/// `BlockHeaders` row and equals the state's own `latest_block_header.slot`.
+/// It is deliberately not `state.slot()`: a beacon checkpoint-sync anchor state
+/// can be advanced past its block (a skipped boundary slot), and a reader that
+/// only has a root can recover the block's slot but not the state's.
+///
+/// A root with no block row has no state either, so every state reader treats
+/// `None` as "absent" rather than as an error.
+pub(crate) fn block_slot(backend: &dyn StorageBackend, chain: Chain, root: &H256) -> Option<u64> {
+    let view = backend.begin_read().expect("read view");
+    block_slot_in(view.as_ref(), chain, root)
+}
+
+/// [`block_slot`] through a view the caller already holds.
+///
+/// A walk that keeps one view open across its hops has to use this: opening a
+/// second read view while holding the first can deadlock against a writer
+/// queued between the two on a backend whose read lock is not reentrant.
+pub(crate) fn block_slot_in(view: &dyn StorageReadView, chain: Chain, root: &H256) -> Option<u64> {
+    match chain {
+        Chain::Beacon => {
+            view.read_with(Table::BlockHeaders, &root.to_ssz(), peek_beacon_block_slot)
+        }
+        Chain::Lean => view.read_with(Table::BlockHeaders, &root.to_ssz(), |bytes| {
+            BlockHeader::from_ssz_bytes(bytes)
+                .expect("valid header")
+                .slot
+        }),
+    }
     .expect("read")
 }
 
@@ -839,7 +1107,7 @@ pub(crate) fn beacon_block_slot(backend: &dyn StorageBackend, root: &H256) -> Op
 /// - **Metadata**: time, config, head, safe_target, justified/finalized checkpoints
 /// - **Blocks**: headers and bodies stored separately for efficient header-only queries
 /// - **BlockRoots**: canonical block roots indexed by slot
-/// - **States**: beacon states indexed by block root
+/// - **States**: post-states indexed by block slot then root (finalized intervals pruned)
 /// - **Attestations**: latest known and pending ("new") attestations per validator
 /// - **Signatures**: gossip signatures and aggregated proofs for signature verification
 /// - **LiveChain**: slot index for efficient fork choice traversal (pruned on finalization)
@@ -887,6 +1155,10 @@ pub struct Store {
     fork_choice: Arc<Mutex<ForkChoiceState>>,
     /// In-memory gossip signatures, consumed at interval 2 aggregation.
     gossip_signatures: Arc<Mutex<GossipSignatureBuffer>>,
+    /// Beacon attestation pool. See [`Store::attestation_pool`].
+    attestation_pool: Arc<Mutex<AttestationPool>>,
+    /// Beacon operation pool. See [`Store::operation_pool`].
+    operation_pool: Arc<Mutex<OperationPool>>,
     /// LRU memoization of states by block root, shared across `Store` clones.
     ///
     /// Holds the same fork-ladder enum the `States` table stores, so a lean
@@ -935,11 +1207,22 @@ pub struct Store {
     /// node's own API), which is why it lives on the `Store` all three share.
     /// See [`ObservedLiveness`]. Always empty on lean.
     observed_liveness: Arc<ObservedLiveness>,
+    /// The total active balance per epoch, shared the way
+    /// [`Self::committee_cache`] is: by the chain actor's state transition
+    /// and anything else holding a `Store` clone. See
+    /// [`ActiveBalanceCache`], and `ethlambda-state-transition`'s
+    /// `beacon::helpers::accessors::ActiveBalanceCacheExt` for the
+    /// state-aware half. Always empty on lean.
+    active_balance_cache: Arc<ActiveBalanceCache>,
     /// Beacon fork-choice scratch. Empty and untouched on a lean chain.
     pub(crate) beacon: Arc<Mutex<BeaconScratch>>,
     /// The background writer, joined when the last clone of this `Store`
     /// drops. See [`StateWriterHandle`].
     state_writer: Arc<StateWriterHandle>,
+    /// The span [`Self::insert_state`] spent handing states to the writer
+    /// since the last [`Self::take_state_handoff`]: the first start and the
+    /// last end. Shared across clones, like the writer it describes.
+    state_handoff: Arc<Mutex<Option<(Instant, Instant)>>>,
 }
 
 /// Build an empty state cache sized to [`STATE_CACHE_CAPACITY`].
@@ -1096,12 +1379,12 @@ impl Store {
         };
 
         info!(?chain, anchor_slot, "Loaded store from persisted DB state");
-        Ok(Some(Self::from_parts(
-            backend,
-            Arc::new(config),
-            chain,
-            anchor_slot,
-        )))
+        let store = Self::from_parts(backend, Arc::new(config), chain, anchor_slot);
+        match chain {
+            Chain::Lean => {}
+            Chain::Beacon => store.restore_beacon_scratch(),
+        }
+        Ok(Some(store))
     }
 
     /// Checks that both the justified and finalized checkpoints have a
@@ -1433,9 +1716,11 @@ impl Store {
 
             // State snapshot. The anchor has no parent in the store, so it is
             // the base of every diff chain: store it as a full snapshot in
-            // `States` (never pruned) so reconstruction always terminates here.
+            // `States` so reconstruction always terminates here. It is only
+            // removed by `prune_finalized_states`, once a later snapshot
+            // interval is finalized and no kept state's walk reaches it.
             let state_entries = vec![(
-                anchor_block_root.to_ssz(),
+                encode_slot_root_key(anchor_slot, &anchor_block_root),
                 encode_state_value(&BeaconState::Lean(anchor_state.clone())),
             )];
             batch
@@ -1566,13 +1851,37 @@ impl Store {
             gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
                 GOSSIP_SIGNATURE_CAP,
             ))),
+            attestation_pool: Default::default(),
+            operation_pool: Default::default(),
             state_cache,
             pending_states,
             committee_cache: Arc::new(CommitteeCache::default()),
             observed_liveness: Arc::new(ObservedLiveness::default()),
+            active_balance_cache: Arc::new(ActiveBalanceCache::default()),
             beacon: Default::default(),
             state_writer,
+            state_handoff: Default::default(),
         }
+    }
+
+    /// The beacon attestation pool: validated votes and single-committee
+    /// aggregates, read by the aggregate endpoint and block production.
+    ///
+    /// Shared by every clone of this `Store`, so there is exactly one per
+    /// node. Hold the guard briefly and never across an `.await`. Always empty
+    /// on lean.
+    pub fn attestation_pool(&self) -> MutexGuard<'_, AttestationPool> {
+        self.attestation_pool
+            .lock()
+            .expect("attestation pool lock poisoned")
+    }
+
+    /// The beacon operation pool. Same sharing and locking rules as
+    /// [`Store::attestation_pool`].
+    pub fn operation_pool(&self) -> MutexGuard<'_, OperationPool> {
+        self.operation_pool
+            .lock()
+            .expect("operation pool lock poisoned")
     }
 
     // ============ Metadata Helpers ============
@@ -1938,11 +2247,14 @@ impl Store {
         Ok(())
     }
 
-    /// Prune finalized block proofs to keep proof storage bounded.
+    /// Prune finalized data to keep storage bounded.
     ///
-    /// State diffs, block headers, block bodies, and full-state snapshots are
-    /// all retained for the full history and are never pruned. Only proofs
-    /// of finalized blocks older than the pruning window are removed.
+    /// Block headers and bodies are retained for the full history. Proofs of
+    /// finalized blocks older than the pruning window are removed, and so are
+    /// the states (snapshots and diffs) of finalized snapshot intervals; see
+    /// [`prune_finalized_states`](Self::prune_finalized_states). This is the
+    /// lean call site for the latter; beacon prunes from the chain actor's
+    /// finality horizon instead.
     ///
     /// This is separated from `update_checkpoints` so callers can defer heavy
     /// pruning until after a batch of blocks has been fully processed.
@@ -1961,6 +2273,13 @@ impl Store {
             .expect("prune old block proofs");
         if pruned_below_slot > 0 {
             info!(pruned_below_slot, "Pruned old finalized block proofs");
+        }
+        if let Some(pruned) = self.prune_finalized_states()? {
+            info!(
+                from_slot = pruned.start,
+                below_slot = pruned.end,
+                "Pruned finalized states"
+            );
         }
         Ok(())
     }
@@ -2127,8 +2446,8 @@ impl Store {
     ///
     /// Dropping the row is the whole of "remove this block from fork choice":
     /// [`block_index`](Self::block_index) is the only source
-    /// `filter_block_tree`, `compute_weights` and `get_head` read, so a root
-    /// with no row contributes no weight to any ancestor and can never be
+    /// `filter_block_tree`, `compute_node_weights` and `walk_head` read, so a
+    /// root with no row contributes no weight to any ancestor and can never be
     /// walked to.
     ///
     /// The block and its state stay in their own tables. Nothing reads them
@@ -2215,6 +2534,119 @@ impl Store {
         batch.commit().expect("commit");
 
         Ok(cutoff)
+    }
+
+    /// Deletes the states of finalized snapshot intervals, as one range delete
+    /// per call, and returns the slot range it covered (`None` when nothing
+    /// new could be deleted).
+    ///
+    /// `States` and `StateDiffs` are keyed by slot||root, so everything below a
+    /// slot is one contiguous key range. Each call deletes
+    /// `[watermark, cut)`, where the watermark ([`KEY_STATES_PRUNED_BELOW`]) is
+    /// where the previous call stopped, and stores `cut` as the new watermark in
+    /// the same atomic batch. Consecutive ranges therefore start exactly where
+    /// the last one ended and never overlap, even across a restart, and a
+    /// repeated call with unchanged finality is a single metadata read.
+    ///
+    /// `cut` is the start of the snapshot interval that holds the finalized
+    /// **block**, `b / interval * interval`, where `b` is that block's own slot
+    /// taken from its `BlockHeaders` row. It is not
+    /// [`latest_finalized`](Self::latest_finalized)`().slot`: on beacon the
+    /// stored checkpoint is epoch-denominated, so its slot is the epoch start,
+    /// which sits above the block whenever the boundary slot was skipped, and
+    /// cutting there would delete the finalized state itself. The interval is
+    /// the one of the fork at the finalized block's epoch, so a future per-fork
+    /// interval is not silently wrong; on lean it is
+    /// [`ForkName::Lean`]'s.
+    ///
+    /// # Why nothing kept can reference a deleted key
+    ///
+    /// Every state the node can still be asked for is the finalized block's or
+    /// a descendant's. A diff-chain walk stops at the first snapshot on its
+    /// branch. The first block of any branch inside a snapshot interval is a
+    /// snapshot (`is_anchor`: its parent sits in an earlier interval), and the
+    /// store's first-ever state is always one, so every such walk stops at or
+    /// after `cut`: no kept row references a deleted key.
+    ///
+    /// Blocks below finality are never imported again (lean's
+    /// `process_or_pend_block` drops `slot <= finalized`; beacon's `on_block`
+    /// requires a finalized descendant), so no state is written below the
+    /// watermark after it moves. That is what makes "never revisit a range"
+    /// sound, provided nothing handed off *before* finality moved lands after
+    /// the delete. [`insert_state`](Self::insert_state) only queues its write,
+    /// so a state of a block imported just before finality advanced past it
+    /// may still be waiting on the writer thread; committed after the
+    /// tombstones, it would survive them below the watermark for good. The
+    /// writer is therefore flushed first, and only once there is a range to
+    /// delete, so the common no-op call never waits on it.
+    ///
+    /// The bare 8-byte slot prefixes are exact range bounds for slot||root
+    /// keys: keys below a slot sort before its prefix, and keys at that slot
+    /// extend it with a root and so sort after it (see
+    /// [`prune_old_block_proofs`](Self::prune_old_block_proofs)).
+    pub fn prune_finalized_states(&mut self) -> Result<Option<Range<u64>>, Error> {
+        let watermark = self.states_pruned_below();
+        let finalized = self.latest_finalized()?;
+
+        // The checkpoint's slot is never below its block's, so if even that
+        // upper bound's interval start is at or below the watermark there is
+        // nothing to prune, and the block read is skipped. This runs after
+        // every tick and import on beacon, so the common case is the two
+        // metadata reads above.
+        let hint_interval = self.snapshot_interval_at(finalized.slot);
+        if finalized.slot / hint_interval * hint_interval <= watermark {
+            return Ok(None);
+        }
+
+        let Some(block_slot) = block_slot(self.backend.as_ref(), self.chain, &finalized.root)
+        else {
+            return Ok(None);
+        };
+        let interval = self.snapshot_interval_at(block_slot);
+        let cut = block_slot / interval * interval;
+        if cut <= watermark {
+            return Ok(None);
+        }
+
+        // Every write queued before this call commits before the range delete
+        // below, so none can resurrect a key under the new watermark.
+        self.state_writer.flush();
+        let mut batch = self.backend.begin_write().expect("write batch");
+        for table in [Table::States, Table::StateDiffs] {
+            batch
+                .delete_range(table, &watermark.to_be_bytes(), &cut.to_be_bytes())
+                .expect("delete finalized states");
+        }
+        let watermark_entries = vec![(KEY_STATES_PRUNED_BELOW.to_vec(), cut.to_ssz())];
+        batch
+            .put_batch(Table::Metadata, watermark_entries)
+            .expect("put states pruned below");
+        batch.commit().expect("commit");
+
+        Ok(Some(watermark..cut))
+    }
+
+    /// The slot below which finalized states have already been deleted; zero
+    /// before the first prune.
+    fn states_pruned_below(&self) -> u64 {
+        let view = self.backend.begin_read().expect("read view");
+        view.read_with(Table::Metadata, KEY_STATES_PRUNED_BELOW, |bytes| {
+            u64::from_ssz_bytes(bytes).expect("valid states pruned below")
+        })
+        .expect("read")
+        .unwrap_or(0)
+    }
+
+    /// The snapshot interval of the fork in force at `slot`.
+    ///
+    /// Lean has one. On beacon it goes through the fork schedule rather than a
+    /// shared constant, so a per-fork interval would be picked up here.
+    fn snapshot_interval_at(&self, slot: u64) -> u64 {
+        let fork = match self.chain {
+            Chain::Lean => ForkName::Lean,
+            Chain::Beacon => self.config.fork_at_epoch(slot / SLOTS_PER_EPOCH),
+        };
+        fork.snapshot_interval()
     }
 
     /// Get the block header by root.
@@ -2458,6 +2890,34 @@ impl Store {
 
     // ============ Beacon Head ============
 
+    /// The payload status of the head node fork choice last picked, for the
+    /// store's *current* head root only: `None` before this process has
+    /// computed a head, and also while the recorded node is not the current
+    /// head (a head move whose status is not recorded yet). Never a status
+    /// belonging to another root.
+    pub fn head_payload_status(&self) -> Option<PayloadStatus> {
+        let head = self.head().ok()?;
+        self.payload_status_of_head_node(head)
+    }
+
+    /// The recorded status, if it was recorded for `head`.
+    fn payload_status_of_head_node(&self, head: H256) -> Option<PayloadStatus> {
+        self.beacon
+            .lock()
+            .unwrap()
+            .head_node_payload_status
+            .filter(|(root, _)| *root == head)
+            .map(|(_, status)| status)
+    }
+
+    /// Records the head node fork choice just picked: its block `root` and
+    /// payload `status`. Order against [`Store::update_checkpoints`] does not
+    /// matter, since readers only use the status for a head whose root equals
+    /// the recorded one.
+    pub fn set_head_payload_status(&self, root: H256, status: PayloadStatus) {
+        self.beacon.lock().unwrap().head_node_payload_status = Some((root, status));
+    }
+
     /// The beacon fork-choice head as `(slot, root)`, or `None` if the head
     /// row names a block this store has no header for.
     ///
@@ -2680,8 +3140,10 @@ impl Store {
     ///
     /// A `None` covers two cases the index cannot tell apart: a slot the
     /// canonical chain skipped, and a slot below the anchor this store was
-    /// bootstrapped from. Callers that use this to *reject* something must treat
-    /// `None` as "unknown" rather than "not canonical".
+    /// bootstrapped from (or, on a beacon directory bootstrapped before
+    /// [`index_beacon_anchor`](Self::index_beacon_anchor) existed, the
+    /// anchor's own slot). Callers that use this to *reject* something must
+    /// treat `None` as "unknown" rather than "not canonical".
     pub fn canonical_root_at_slot(&self, slot: u64) -> Result<Option<H256>, Error> {
         let view = self.backend.begin_read().expect("read view");
         Ok(view
@@ -2689,6 +3151,33 @@ impl Store {
                 H256::from_ssz_bytes(bytes).expect("valid block root")
             })
             .expect("read block root"))
+    }
+
+    /// Write a beacon anchor's own slot into the canonical `BlockRoots` index.
+    ///
+    /// [`update_checkpoints`](Self::update_checkpoints), the index's other
+    /// writer, records the blocks between the old head and the new one but
+    /// never their common ancestor, and at bootstrap the head *is* the anchor.
+    /// Without this row the anchor would be the one canonical block the index
+    /// never names, so `/eth/v1/beacon/headers/head` answered `canonical: false`
+    /// until the first import moved the head. Lean's `init_store` writes the
+    /// same row.
+    ///
+    /// Keyed by the block's own slot, read back from the block row the caller
+    /// has already written, rather than by the anchor state's: a checkpoint
+    /// state sits at an epoch's first slot, which is after its latest block
+    /// whenever that slot was empty.
+    pub fn index_beacon_anchor(&mut self, root: H256) -> Result<(), Error> {
+        let (slot, _parent_root) = self
+            .block_entry(&root)
+            .ok_or(Error::UnexpectedMissingBlockHeader(root))?;
+        let entries = vec![(encode_block_root_key(slot), root.to_ssz())];
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .put_batch(Table::BlockRoots, entries)
+            .expect("put anchor block root");
+        batch.commit().expect("commit");
+        Ok(())
     }
 
     /// Return canonical signed blocks for the slot range `[start_slot, end_slot]`.
@@ -2780,7 +3269,7 @@ impl Store {
 
     /// The memoized state for `key`, if it is still resident.
     pub fn cached_state(&self, key: CacheKey) -> Option<Arc<BeaconState>> {
-        self.state_cache.lock().unwrap().get(&key).cloned()
+        cache_get(&self.state_cache, key, StateCacheMethod::Cached)
     }
 
     /// Memoizes `state` under `key`.
@@ -2816,34 +3305,49 @@ impl Store {
         &self.observed_liveness
     }
 
+    /// The total-active-balance cache shared by every clone of this store.
+    ///
+    /// An owned `Arc` for the same reason as [`Self::committee_cache`].
+    pub fn active_balance_cache(&self) -> Arc<ActiveBalanceCache> {
+        Arc::clone(&self.active_balance_cache)
+    }
+
     /// Returns whether a state is available for the given block root.
     ///
-    /// True if `pending_states` or the state cache holds the state, a snapshot
+    /// True if the state cache or `pending_states` holds the state, a snapshot
     /// exists, or the state can be reconstructed from a diff. Never reads a
     /// value: existence checks only.
     pub fn has_state(&self, root: &H256) -> Result<bool, Error> {
+        // A cached block state is always one that was handed to the writer
+        // (`insert_state`, so in `pending_states` until committed) or read back
+        // from the backend (`read_state`). A cached state can be one whose rows
+        // `prune_finalized_states` has since deleted; that is fine, because
+        // nothing below finality is ever asked for as a parent again.
+        // `peek`, not `get`: an existence check must not reorder the LRU.
+        // Without this, a state stored as a snapshot only (a beacon epoch
+        // anchor) costs a full-value read from RocksDB just to be found.
+        //
+        // Cache first, the same order as `read_state`: a state in flight is in
+        // both, so the order changes no answer, and cache first is what makes
+        // every call a counted lookup rather than only the ones
+        // `pending_states` missed.
+        let key = CacheKey::BlockState(*root);
+        let cached = self.state_cache.lock().unwrap().peek(&key).is_some();
+        crate::metrics::inc_state_cache_lookups(StateCacheMethod::Has, &key, cached);
+        if cached {
+            return Ok(true);
+        }
         // Same pending-before-backend order as `read_state`; see its doc for
         // why the backend never has to consult `pending_states` on its own.
         if self.pending_states.get(root).is_some() {
             return Ok(true);
         }
-        // A cached block state is always one that was handed to the writer
-        // (`insert_state`, so in `pending_states` until committed) or read back
-        // from the backend (`read_state`); nothing deletes a persisted state.
-        // `peek`, not `get`: an existence check must not reorder the LRU.
-        // Without this, a state stored as a snapshot only (a beacon epoch
-        // anchor) costs a full-value read from RocksDB just to be found.
-        if self
-            .state_cache
-            .lock()
-            .unwrap()
-            .peek(&CacheKey::BlockState(*root))
-            .is_some()
-        {
-            return Ok(true);
-        }
+        // Both tables are keyed by block slot then root; no block row, no state.
+        let Some(slot) = block_slot(self.backend.as_ref(), self.chain, root) else {
+            return Ok(false);
+        };
         let view = self.backend.begin_read().expect("read view");
-        let key = root.to_ssz();
+        let key = encode_slot_root_key(slot, root);
         // Diffs first: every non-anchor state has one, so most roots never
         // touch `States`, where even a miss is costly (no bloom filter).
         Ok(view.contains(Table::StateDiffs, &key).expect("contains")
@@ -2859,15 +3363,16 @@ impl Store {
     /// counterpart dispatches reads on `self.chain`).
     ///
     /// The byte-producing half of each arm, and the backend reads, the
-    /// commit and the parent-bytes memo, all live on the background writer in
+    /// commit and the snapshot memo, all live on the background writer in
     /// [`crate::state_writer`]; this method only builds the request and hands
     /// it off.
     ///
     /// Lean: a parent-linked diff, snapshotting at anchors. Every non-genesis
-    /// state gets a `StateDiffs` entry (never pruned, so the full state
-    /// history is preserved). A full snapshot is written to `States` only
-    /// when the block crosses a [`ForkName::snapshot_interval`] boundary;
-    /// these anchors are never pruned and bound the reconstruction walk. The
+    /// state gets a `StateDiffs` entry. A full snapshot is written to `States`
+    /// only when the block crosses a [`ForkName::snapshot_interval`] boundary;
+    /// these anchors bound the reconstruction walk. Both tables are keyed by
+    /// the slot of the state's own block, then its root, and are pruned below
+    /// finality by [`prune_finalized_states`](Self::prune_finalized_states). The
     /// state is also inserted into the in-memory cache so the immediate next
     /// read (e.g. as a child block's parent state) is hot without
     /// reconstruction. The diff is built against the parent state, identified
@@ -2878,15 +3383,17 @@ impl Store {
     /// falls back to a snapshot read or a diff-chain reconstruction.
     ///
     /// Beacon: a byte-domain [`beacon_state_delta`](crate::beacon_state_delta)
-    /// diff, snapshotting at anchors, the same shape as lean's but working in
+    /// diff, snapshotting at anchors, similar to lean's but working in
     /// the SSZ byte domain rather than the field domain: a beacon validator
     /// registry breaks lean's [`StateDiff`](crate::state_diff::StateDiff)'s "`validators` never changes"
     /// assumption every epoch, so lean's diff cannot be reused as-is. The
-    /// parent is identified the same way lean's is, off the post-state's own
-    /// `latest_block_header.parent_root`, but its *encoded* bytes are what the
-    /// delta is computed against; the writer thread's parent-bytes lookup
-    /// (`StateWriter::encoded_parent_bytes`) explains how those are obtained
-    /// without an extra encode round trip. The store's first-ever beacon
+    /// delta is computed against the *encoded* bytes of the nearest snapshot
+    /// on the state's branch, not against its parent: the snapshot is found
+    /// from the post-state's own `latest_block_header.parent_root`, and every
+    /// diff in an interval names the same snapshot, so a cold read is one
+    /// snapshot plus one delta. The writer thread's `StateWriter::load_snapshot_base`
+    /// explains how that snapshot is found and kept without a read per import.
+    /// The store's first-ever beacon
     /// state (a bootstrap or checkpoint-sync anchor) has no parent block on
     /// record, so it is always a snapshot regardless of the interval math:
     /// there is no base to diff against.
@@ -2914,8 +3421,25 @@ impl Store {
         self.cache_state(CacheKey::BlockState(root), state.clone());
         self.pending_states.insert(root, state.clone());
         crate::metrics::inc_state_write_queue_depth();
-        self.state_writer.send(StateWriteRequest { root, state });
+        let (start, end) = self.state_writer.send(StateWriteRequest { root, state });
+        // Repeated hand-offs keep the first start and the last end, so the
+        // span covers every wait since the caller last took it.
+        let mut handoff = self.state_handoff.lock().unwrap();
+        *handoff = Some(match *handoff {
+            Some((first, _)) => (first, end),
+            None => (start, end),
+        });
         Ok(())
+    }
+
+    /// Takes the span `insert_state` spent handing states to the writer since
+    /// the last call, clearing it. `None` when no state was inserted.
+    ///
+    /// The span is the blocking `send` only, so it is the importer's wait for
+    /// the writer (a full queue), not the encode/diff/commit work, which runs
+    /// on the writer thread.
+    pub fn take_state_handoff(&self) -> Option<(Instant, Instant)> {
+        self.state_handoff.lock().unwrap().take()
     }
 
     // ============ Attestation Extraction ============
@@ -3317,9 +3841,11 @@ impl Store {
 
     // ============ Beacon Fork-Choice Scratch ============
     //
-    // None of these carry a `Result`: the beacon fork choice's error type
-    // lives in `ethlambda-types` and cannot name a storage error, so these
-    // accessors take and return plain values like the rest of this scratch.
+    // The accessors on in-memory scratch carry no `Result`: the beacon fork
+    // choice's error type lives in `ethlambda-types` and cannot name a storage
+    // error, so they take and return plain values. The gloas write-through
+    // ones (`set_gloas_block_timeliness`, `insert_verified_payload`) write a
+    // row and so `expect` on the backend like the other infallible writers.
 
     /// The block root proposer boost currently applies to. Resets every slot.
     pub fn proposer_boost_root(&self) -> H256 {
@@ -3331,9 +3857,17 @@ impl Store {
         self.beacon.lock().unwrap().proposer_boost_root = root;
     }
 
-    /// Whether `root` arrived within the same-slot reorg window. `None` when
-    /// no timeliness has been recorded for the block yet.
-    pub fn block_timeliness(&self, root: &H256) -> Option<bool> {
+    /// `root`'s two timeliness deadlines,
+    /// `[ATTESTATION_TIMELINESS_INDEX, PTC_TIMELINESS_INDEX]`. `None` when no
+    /// timeliness has been recorded for the block yet.
+    ///
+    /// A pre-gloas caller wants `ATTESTATION_TIMELINESS_INDEX`, the same-slot
+    /// reorg deadline this answered alone before gloas added the second;
+    /// `is_head_late` reads exactly that index rather than a narrower
+    /// accessor existing beside this one, since gloas and pre-gloas share
+    /// one record per block and pre-gloas code writes both entries of it
+    /// (see [`Store::set_block_timeliness`]).
+    pub fn block_timeliness(&self, root: &H256) -> Option<[bool; NUM_BLOCK_TIMELINESS_DEADLINES]> {
         self.beacon
             .lock()
             .unwrap()
@@ -3342,13 +3876,36 @@ impl Store {
             .copied()
     }
 
-    /// Records whether `root` arrived within the same-slot reorg window.
-    pub fn set_block_timeliness(&mut self, root: H256, timely: bool) {
+    /// Records `root`'s two timeliness deadlines in memory only. See
+    /// [`Store::block_timeliness`]. A gloas block uses
+    /// [`Store::set_gloas_block_timeliness`] instead, since only gloas reads
+    /// the entry back after a restart.
+    pub fn set_block_timeliness(
+        &mut self,
+        root: H256,
+        timely: [bool; NUM_BLOCK_TIMELINESS_DEADLINES],
+    ) {
         self.beacon
             .lock()
             .unwrap()
             .block_timeliness
             .insert(root, timely);
+    }
+
+    /// Records a gloas block's timeliness in memory and in
+    /// `Table::BlockTimeliness`, so a resumed store still has it.
+    pub fn set_gloas_block_timeliness(
+        &mut self,
+        root: H256,
+        timely: [bool; NUM_BLOCK_TIMELINESS_DEADLINES],
+    ) {
+        let entries = vec![(root.to_ssz(), timely.map(u8::from).to_vec())];
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .put_batch(Table::BlockTimeliness, entries)
+            .expect("put block timeliness");
+        batch.commit().expect("commit");
+        self.set_block_timeliness(root, timely);
     }
 
     /// Whether `index` has been observed equivocating (via a processed
@@ -3370,27 +3927,438 @@ impl Store {
             .insert(index);
     }
 
+    /// Gloas: whether `root`'s execution payload envelope has been locally
+    /// delivered and verified, the specification's `is_payload_verified`.
+    pub fn has_verified_payload(&self, root: &H256) -> bool {
+        self.beacon.lock().unwrap().verified_payloads.contains(root)
+    }
+
+    /// Gloas: stores a verified execution payload envelope and records that
+    /// its block's payload is verified.
+    ///
+    /// `slot` is the slot of the block the envelope fulfills, which the
+    /// caller has already read while verifying the envelope against it; the
+    /// envelope carries none and the row is keyed by it.
+    pub fn insert_verified_payload(
+        &mut self,
+        slot: u64,
+        envelope: &gloas::SignedExecutionPayloadEnvelope,
+    ) {
+        let root = envelope.message.beacon_block_root;
+        debug_assert_eq!(
+            beacon_block_slot(self.backend.as_ref(), &root),
+            Some(slot),
+            "the slot must be the envelope's block's own"
+        );
+        let entries = vec![(encode_slot_root_key(slot, &root), envelope.to_ssz())];
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .put_batch(Table::ExecutionPayloadEnvelopes, entries)
+            .expect("put execution payload envelope");
+        batch.commit().expect("commit");
+        self.beacon.lock().unwrap().verified_payloads.insert(root);
+    }
+
+    /// Gloas: forgets that `root`'s payload is verified and deletes its stored
+    /// envelope, for a payload the execution layer later found invalid.
+    ///
+    /// The FULL node of the block stops existing for fork choice (it is
+    /// derived from [`Self::has_verified_payload`]) and the envelope is no
+    /// longer served to peers. Returns whether `root` was verified.
+    pub fn remove_verified_payload(&mut self, root: &H256) -> bool {
+        let was_verified = {
+            let mut scratch = self.beacon.lock().unwrap();
+            // The cached hash goes too: nothing may resolve a payload this
+            // store no longer holds as a FULL node.
+            scratch.el_block_hashes.remove(root);
+            scratch.verified_payloads.remove(root)
+        };
+        if let Some(slot) = beacon_block_slot(self.backend.as_ref(), root) {
+            let keys = vec![encode_slot_root_key(slot, root)];
+            let mut batch = self.backend.begin_write().expect("write batch");
+            batch
+                .delete_batch(Table::ExecutionPayloadEnvelopes, keys)
+                .expect("delete execution payload envelope");
+            batch.commit().expect("commit");
+        }
+        was_verified
+    }
+
+    /// Gloas: the roots whose payload is verified, in no particular order.
+    pub fn verified_payload_roots(&self) -> Vec<H256> {
+        self.beacon
+            .lock()
+            .unwrap()
+            .verified_payloads
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    /// Gloas: the verified envelope stored for `root`, if any.
+    pub fn get_execution_payload_envelope(
+        &self,
+        root: &H256,
+    ) -> Result<Option<gloas::SignedExecutionPayloadEnvelope>, Error> {
+        let Some(slot) = beacon_block_slot(self.backend.as_ref(), root) else {
+            return Ok(None);
+        };
+        let view = self.backend.begin_read().expect("read view");
+        let bytes = view
+            .get(
+                Table::ExecutionPayloadEnvelopes,
+                &encode_slot_root_key(slot, root),
+            )
+            .expect("get");
+        Ok(bytes.map(|bytes| {
+            gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(&bytes)
+                .expect("a stored envelope decodes")
+        }))
+    }
+
+    /// Gloas: the stored envelopes of payloads on the canonical chain, for the
+    /// slots `start_slot..=end_slot`, in ascending slot order.
+    ///
+    /// Serves `ExecutionPayloadEnvelopesByRange`. A payload is part of the
+    /// chain when the next canonical block builds on it: that block's bid
+    /// `parent_block_hash` equals the payload's `block_hash`. A block whose
+    /// successor builds on its empty branch has its envelope left out, even
+    /// when this node holds one. The head has no successor, so its envelope is
+    /// served only when the head node fork choice picked is `Full`
+    /// ([`Self::head_payload_status`]); before this process has computed a head
+    /// the status is unknown and the head's envelope is withheld.
+    ///
+    /// Canonical blocks come from `BlockRoots` and the whole answer is read
+    /// from one view, like [`get_signed_blocks_by_slot_range`](Self::get_signed_blocks_by_slot_range).
+    /// The successor of the last block in the window may lie past `end_slot`,
+    /// so the index is read on beyond it, up to the head, until one is found;
+    /// that search is skipped when the last block holds no envelope to judge.
+    pub fn canonical_execution_payload_envelopes(
+        &self,
+        start_slot: u64,
+        end_slot: u64,
+    ) -> Result<Vec<gloas::SignedExecutionPayloadEnvelope>, Error> {
+        if self.chain != Chain::Beacon {
+            Self::lean_only("canonical_execution_payload_envelopes");
+        }
+        let recorded_head = self.beacon.lock().unwrap().head_node_payload_status;
+        let view = self.backend.begin_read().expect("read view");
+        let canonical_root = |slot: u64| -> Option<H256> {
+            view.get(Table::BlockRoots, &encode_block_root_key(slot))
+                .expect("get block root")
+                .map(|bytes| H256::from_ssz_bytes(&bytes).expect("valid block root"))
+        };
+
+        let envelope_row = |slot: u64, root: &H256| {
+            view.get(
+                Table::ExecutionPayloadEnvelopes,
+                &encode_slot_root_key(slot, root),
+            )
+            .expect("get")
+        };
+
+        let mut window: Vec<(u64, H256)> = (start_slot..=end_slot)
+            .filter_map(|slot| canonical_root(slot).map(|root| (slot, root)))
+            .collect();
+        // Head and its slot come out of the same view as the rest, so a head
+        // move partway through cannot pair one branch's index with another's.
+        let head_root = view
+            .get(Table::Metadata, KEY_HEAD)
+            .expect("get head")
+            .map(|bytes| H256::from_ssz_bytes(&bytes).expect("valid head root"));
+        // The head's envelope is served only when the recorded node is this
+        // view's head and FULL; a status recorded for another root says
+        // nothing about this one.
+        let head_is_full = head_root.is_some()
+            && recorded_head == head_root.map(|root| (root, PayloadStatus::Full));
+        let head_slot = head_root
+            .and_then(|head| view.get(Table::BlockHeaders, &head.to_ssz()).expect("get"))
+            .map(|bytes| decode_beacon_block_value(&bytes).slot());
+        if let Some(&(last_slot, last_root)) = window.last()
+            && envelope_row(last_slot, &last_root).is_some()
+            && let Some(head_slot) = head_slot
+        {
+            let successor = (end_slot.saturating_add(1)..=head_slot)
+                .find_map(|slot| canonical_root(slot).map(|root| (slot, root)));
+            window.extend(successor);
+        }
+
+        let mut envelopes = Vec::new();
+        for (index, &(slot, root)) in window.iter().enumerate() {
+            if slot > end_slot {
+                break;
+            }
+            let Some(bytes) = envelope_row(slot, &root) else {
+                continue;
+            };
+            let envelope = gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(&bytes)
+                .expect("a stored envelope decodes");
+            let builds_on_it = match window.get(index + 1) {
+                // No successor: this is the head, whose envelope is part of
+                // the chain only on the FULL node.
+                None => head_is_full,
+                Some((_, next_root)) => {
+                    let next = view
+                        .get(Table::BlockHeaders, &next_root.to_ssz())
+                        .expect("get")
+                        .map(|bytes| decode_beacon_block_value(&bytes));
+                    match next {
+                        Some(next) => {
+                            builds_on_payload(&next, &envelope.message.payload.block_hash)
+                        }
+                        None => false,
+                    }
+                }
+            };
+            if builds_on_it {
+                envelopes.push(envelope);
+            }
+        }
+        Ok(envelopes)
+    }
+
+    /// Rebuilds the in-memory `verified_payloads` and `block_timeliness` from
+    /// their tables, for every block fork choice can still reach.
+    ///
+    /// Walks `LiveChain` from the finalized block's slot up: the finalized
+    /// block is included because its payload status decides which branch its
+    /// children build on. Older rows stay on disk unread, but the walk still
+    /// iterates every `LiveChain` key to find the window (the index is not
+    /// pruned on a beacon directory), so the scan grows with chain length;
+    /// only the point reads are limited to the window.
+    ///
+    /// Also seeds both payload-committee vote vectors, empty, for every gloas
+    /// block in the window. Nothing persists the votes, and the head walk and
+    /// `notify_ptc_messages` read a gloas block's vectors, so an absent entry
+    /// would fail them with a `SpecAssert`. Empty is what `on_block` gives a
+    /// block it just imported, and is true here: this process has seen no
+    /// votes for it.
+    fn restore_beacon_scratch(&self) {
+        let finalized = self.beacon_finalized_checkpoint();
+        // Without the finalized block the epoch start would be wrong, since a
+        // finalized block can sit below its checkpoint's epoch start; the
+        // anchor is the lowest slot this directory holds.
+        let floor =
+            beacon_block_slot(self.backend.as_ref(), &finalized.root).unwrap_or(self.anchor_slot);
+
+        let view = self.backend.begin_read().expect("read view");
+        let mut timeliness = HashMap::new();
+        let mut payloads = HashSet::new();
+        let mut gloas_roots = Vec::new();
+        let mut el_hashes = Vec::new();
+        for (key, _) in view
+            .prefix_iterator(Table::LiveChain, &[])
+            .expect("iterator")
+            .filter_map(Result::ok)
+        {
+            let (slot, root) = decode_slot_root_key(&key);
+            if slot < floor {
+                continue;
+            }
+            if let Some(bytes) = view
+                .get(Table::BlockTimeliness, &root.to_ssz())
+                .expect("get")
+            {
+                let bytes: [u8; NUM_BLOCK_TIMELINESS_DEADLINES] = bytes
+                    .as_slice()
+                    .try_into()
+                    .expect("a stored timeliness has one byte per deadline");
+                timeliness.insert(root, bytes.map(|byte| byte != 0));
+            }
+            // `el_block_hashes` is a cache of what the block body says, and a
+            // restart empties it; without it every stored block would read as
+            // "not an execution block" to `is_optimistic_candidate_block` and
+            // the `latestValidHash` walk. Cached against the block's own slot,
+            // so `prune_beacon_el_block_hashes` still bounds it.
+            if let Some(hash) = view
+                .read_with(Table::BlockHeaders, &root.to_ssz(), |bytes| {
+                    decode_beacon_block_value(bytes).execution_block_hash_if_execution_block()
+                })
+                .expect("read")
+                .flatten()
+            {
+                el_hashes.push((root, slot, hash));
+            }
+            let fork = view
+                .get(Table::BlockHeaders, &root.to_ssz())
+                .expect("get")
+                .and_then(|bytes| bytes.first().copied())
+                .and_then(ForkName::from_selector);
+            let is_gloas = match fork {
+                Some(ForkName::Gloas) => true,
+                Some(
+                    ForkName::Phase0
+                    | ForkName::Altair
+                    | ForkName::Bellatrix
+                    | ForkName::Capella
+                    | ForkName::Deneb
+                    | ForkName::Electra
+                    | ForkName::Fulu,
+                ) => false,
+                // A beacon directory never holds a lean block row.
+                Some(ForkName::Lean) => unreachable!("lean block row in a beacon directory"),
+                // A LiveChain row with no block: nothing to seed.
+                None => false,
+            };
+            if is_gloas {
+                gloas_roots.push(root);
+            }
+            if view
+                .get(Table::ExecutionPayloadEnvelopes, &key)
+                .expect("get")
+                .is_some()
+            {
+                payloads.insert(root);
+            }
+        }
+        drop(view);
+
+        let mut scratch = self.beacon.lock().unwrap();
+        scratch.block_timeliness.extend(timeliness);
+        scratch.verified_payloads.extend(payloads);
+        for (root, slot, hash) in el_hashes {
+            scratch.el_block_hashes.insert(root, (slot, hash));
+        }
+        for root in gloas_roots {
+            scratch
+                .payload_timeliness_vote
+                .insert(root, vec![None; PTC_SIZE]);
+            scratch
+                .payload_data_availability_vote
+                .insert(root, vec![None; PTC_SIZE]);
+        }
+    }
+
+    /// `root`'s payload link, if one has been recorded. See
+    /// [`BlockPayloadLink`] for what it holds and why a missing entry is not
+    /// an error.
+    pub fn payload_link(&self, root: &H256) -> Option<BlockPayloadLink> {
+        self.beacon
+            .lock()
+            .unwrap()
+            .payload_links
+            .get(root)
+            .map(|(_slot, link)| *link)
+    }
+
+    /// Records `root`'s payload link, against the block's `slot` that the
+    /// unfinalized-window bound prunes it by.
+    ///
+    /// `&self`, unlike the other setters here: the head computation records the
+    /// link of a block it had to decode and only has a shared reference to the
+    /// store, and the scratch is behind its own lock either way.
+    pub fn set_payload_link(&self, root: H256, slot: u64, link: BlockPayloadLink) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .payload_links
+            .insert(root, (slot, link));
+    }
+
+    /// Drops payload links strictly below `finalized_slot`, always keeping
+    /// `keep`.
+    ///
+    /// The same bound and exemption as
+    /// [`Store::prune_beacon_el_block_hashes`], with one refinement. The head
+    /// walk weighs only blocks at or above the finalized block, so nothing
+    /// below that block's own slot is read again, and a link asked for after
+    /// all is derived again. That slot can be below `finalized_slot` (the
+    /// checkpoint's stored slot is its epoch's start, and a skipped boundary
+    /// leaves the block earlier), so the bound is the lower of the two, read
+    /// from `keep`'s own recorded link.
+    ///
+    /// Prunes nothing when `keep` has no recorded link, since the block's own
+    /// slot is then unknown and a bound taken from the checkpoint could drop
+    /// links the walk still reads. A caller records that link first (see
+    /// `fork_choice::ensure_payload_link`); it is missing after this method
+    /// only when the block is not stored at all.
+    pub fn prune_beacon_payload_links(&mut self, finalized_slot: u64, keep: H256) {
+        let mut beacon = self.beacon.lock().unwrap();
+        let Some(&(keep_slot, _link)) = beacon.payload_links.get(&keep) else {
+            return;
+        };
+        let bound = keep_slot.min(finalized_slot);
+        beacon
+            .payload_links
+            .retain(|root, (slot, _link)| *slot >= bound || *root == keep);
+    }
+
     /// The latest attestation recorded for validator `index`, if any.
     pub fn latest_message(&self, index: u64) -> Option<LatestMessage> {
         self.beacon
             .lock()
             .unwrap()
             .latest_messages
-            .get(&index)
+            .get(usize::try_from(index).ok()?)
             .copied()
+            .flatten()
     }
 
     /// Records the latest attestation for validator `index`.
+    ///
+    /// The table grows to hold `index`, so an index must come from a validated
+    /// attestation (a member of a committee of the registry), never from raw
+    /// input: a wild index would allocate a table to match. The assertion is
+    /// the tripwire for that in debug builds and fixtures.
     pub fn set_latest_message(&mut self, index: u64, message: LatestMessage) {
+        debug_assert!(
+            index < MAX_PLAUSIBLE_VALIDATOR_INDEX,
+            "validator index {index} would grow the dense vote table far past any registry"
+        );
+        let slot = usize::try_from(index).expect("validator index fits in usize");
+        let mut beacon = self.beacon.lock().unwrap();
+        if beacon.latest_messages.len() <= slot {
+            beacon.latest_messages.resize(slot + 1, None);
+        }
+        beacon.latest_messages[slot] = Some(message);
+    }
+
+    /// Gloas: the payload timeliness committee's per-member votes on whether
+    /// `root`'s payload was timely, one entry per PTC member and `None` for a
+    /// member that has not voted yet. `None` when `root` has no vote vector at
+    /// all yet (`get_forkchoice_store`/`on_block` seed one per block).
+    pub fn payload_timeliness_vote(&self, root: &H256) -> Option<Vec<Option<bool>>> {
         self.beacon
             .lock()
             .unwrap()
-            .latest_messages
-            .insert(index, message);
+            .payload_timeliness_vote
+            .get(root)
+            .cloned()
+    }
+
+    /// Replaces `root`'s payload-timeliness vote vector.
+    pub fn set_payload_timeliness_vote(&mut self, root: H256, votes: Vec<Option<bool>>) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .payload_timeliness_vote
+            .insert(root, votes);
+    }
+
+    /// Gloas: the payload timeliness committee's per-member votes on whether
+    /// `root`'s blob data was available. The sibling of
+    /// [`Store::payload_timeliness_vote`].
+    pub fn payload_data_availability_vote(&self, root: &H256) -> Option<Vec<Option<bool>>> {
+        self.beacon
+            .lock()
+            .unwrap()
+            .payload_data_availability_vote
+            .get(root)
+            .cloned()
+    }
+
+    /// Replaces `root`'s payload-data-availability vote vector.
+    pub fn set_payload_data_availability_vote(&mut self, root: H256, votes: Vec<Option<bool>>) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .payload_data_availability_vote
+            .insert(root, votes);
     }
 
     /// Calls `f` with `(validator_index, latest_message)` for every latest
-    /// message whose validator has not been observed equivocating.
+    /// message whose validator has not been observed equivocating, in
+    /// ascending validator index.
     ///
     /// Takes a closure rather than returning an iterator or a cloned map:
     /// the data lives behind a mutex, so a borrow of it cannot escape the
@@ -3399,11 +4367,48 @@ impl Store {
     /// let it count for either side of the fork it created.
     pub fn for_each_non_equivocating_latest_message(&self, mut f: impl FnMut(u64, LatestMessage)) {
         let beacon = self.beacon.lock().unwrap();
-        for (&index, &message) in &beacon.latest_messages {
-            if !beacon.equivocating_indices.contains(&index) {
-                f(index, message);
+        // Most of the time nobody has equivocated, so skip the set probe per vote.
+        let any_equivocators = !beacon.equivocating_indices.is_empty();
+        for (index, message) in beacon.latest_messages.iter().enumerate() {
+            let Some(message) = message else {
+                continue;
+            };
+            let index = index as u64;
+            if any_equivocators && beacon.equivocating_indices.contains(&index) {
+                continue;
             }
+            f(index, *message);
         }
+    }
+
+    /// The cached balances snapshot for exactly `checkpoint`, if there is one.
+    ///
+    /// The checkpoint is the whole key, so a caller never has to know which
+    /// code moved the justified checkpoint: an unknown checkpoint just misses.
+    pub fn justified_balances(
+        &self,
+        checkpoint: &BeaconCheckpoint,
+    ) -> Option<Arc<JustifiedBalances>> {
+        self.beacon
+            .lock()
+            .unwrap()
+            .justified_balances
+            .get(checkpoint)
+    }
+
+    /// Adds a balances snapshot to the cache, replacing one for the same
+    /// checkpoint. See [`JustifiedBalancesCache`] for the eviction policy.
+    ///
+    /// Takes `&self`, like [`Self::cache_state`]: the read-only fork-choice
+    /// helpers fill it on a miss.
+    pub fn insert_justified_balances(&self, balances: Arc<JustifiedBalances>) {
+        // Read before taking the lock: it is the one entry eviction must keep.
+        let current_justified = self.beacon_justified_checkpoint();
+        self.beacon
+            .lock()
+            .unwrap()
+            .justified_balances
+            .insert(balances, &current_justified);
     }
 
     /// Looks up a PoW block by its own hash, standing in for the
@@ -3432,6 +4437,66 @@ impl Store {
             .payload_statuses
             .get(&block_hash)
             .cloned()
+    }
+
+    /// The execution client's verdict on a gloas block's payload, as the
+    /// specification's `block_payload_statuses.get(root,
+    /// PAYLOAD_STATUS_NOT_VALIDATED)`: a root with no recorded verdict reads as
+    /// `Syncing`, which is `NOT_VALIDATED`.
+    ///
+    /// Gloas roots only: a pre-gloas root's verdict is its block's own, which
+    /// `fork_choice::block_payload_status` derives. Envelope import is what
+    /// records a gloas root's verdict; nothing else writes it. The map is
+    /// scratch, so after a restart the verdicts of gloas blocks imported before
+    /// it are absent and votes for their full payload are ignored until those
+    /// blocks age out of the attestation window. A known, bounded gap.
+    pub fn beacon_block_payload_status(&self, root: H256) -> PayloadStatusEnum {
+        self.beacon
+            .lock()
+            .unwrap()
+            .block_payload_statuses
+            .get(&root)
+            .map_or(PayloadStatusEnum::Syncing, |(_slot, status)| *status)
+    }
+
+    /// Whether any recorded gloas payload verdict is still `NOT_VALIDATED`.
+    ///
+    /// The cheap half of resolving optimistic payloads, like
+    /// [`Self::has_beacon_optimistic_roots`]: with a healthy execution client
+    /// it is always `false`, so callers can skip a `block_index` scan.
+    pub fn has_unvalidated_block_payloads(&self) -> bool {
+        self.beacon
+            .lock()
+            .unwrap()
+            .block_payload_statuses
+            .values()
+            .any(|(_slot, status)| status.is_not_validated())
+    }
+
+    /// Records the execution client's verdict on `root`'s payload, against the
+    /// block's slot. A later verdict replaces an earlier one, since an
+    /// optimistic payload is resolved one way or the other.
+    pub fn insert_beacon_block_payload_status(
+        &mut self,
+        root: H256,
+        slot: u64,
+        status: PayloadStatusEnum,
+    ) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .block_payload_statuses
+            .insert(root, (slot, status));
+    }
+
+    /// Drops payload verdicts strictly below `finalized_slot`, which no
+    /// attestation rule can ask about any more.
+    pub fn prune_beacon_block_payload_statuses(&mut self, finalized_slot: u64) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .block_payload_statuses
+            .retain(|_root, (slot, _status)| *slot >= finalized_slot);
     }
 
     /// Records an execution client's answer for a payload. The fixture format
@@ -3529,8 +4594,34 @@ impl Store {
             .insert(root, (slot, block_hash));
     }
 
+    /// Records when `root`'s envelope reached this node, in milliseconds past
+    /// genesis. The earliest arrival wins: a later copy says nothing about
+    /// whether the envelope was on time.
+    pub fn insert_beacon_envelope_seen(&mut self, root: H256, slot: u64, seen_ms: u64) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .envelope_seen_ms
+            .entry(root)
+            .and_modify(|(_, held)| *held = (*held).min(seen_ms))
+            .or_insert((slot, seen_ms));
+    }
+
+    /// When `root`'s envelope reached this node, in milliseconds past genesis,
+    /// if it has.
+    pub fn beacon_envelope_seen_ms(&self, root: &H256) -> Option<u64> {
+        self.beacon
+            .lock()
+            .unwrap()
+            .envelope_seen_ms
+            .get(root)
+            .map(|(_, seen_ms)| *seen_ms)
+    }
+
     /// Drops cached hashes strictly below `finalized_slot`, always keeping
-    /// `keep`.
+    /// `keep`. The envelope arrival times go with them, below the same bound
+    /// (they are only ever read for a slot in flight, so `keep` needs no
+    /// exemption there).
     ///
     /// Strictly below, not at or below: the justified and head blocks
     /// `forkchoiceUpdated` reads are at or above that slot, so this bound keeps
@@ -3552,6 +4643,11 @@ impl Store {
             .unwrap()
             .el_block_hashes
             .retain(|root, (slot, _hash)| *slot >= finalized_slot || *root == keep);
+        self.beacon
+            .lock()
+            .unwrap()
+            .envelope_seen_ms
+            .retain(|_, (slot, _)| *slot >= finalized_slot);
     }
 
     /// Returns `root`'s unrealized justification, if this store has computed
@@ -3794,6 +4890,66 @@ impl Store {
         Ok(())
     }
 
+    /// Decode a stored sidecar row, as the fork its slot's epoch names.
+    ///
+    /// The rows carry no fork tag (and gaining one would need a `DB_VERSION`
+    /// bump), but a fork is a function of the slot and the config, both known
+    /// here, so the schedule tells a fulu row from a gloas one.
+    pub fn decode_data_column_sidecar(
+        &self,
+        slot: u64,
+        encoded: &[u8],
+    ) -> Result<DataColumnSidecar, Error> {
+        let fork = self.config.fork_at_epoch(slot / SLOTS_PER_EPOCH);
+        DataColumnSidecar::from_ssz(fork, encoded)
+            .map_err(|_| Error::UndecodableDataColumn { slot, fork })
+    }
+
+    /// [`Self::put_data_column_sidecar`], for a sidecar in hand.
+    pub fn put_data_column(&self, sidecar: &DataColumnSidecar) -> Result<(), Error> {
+        self.put_data_column_sidecar(
+            sidecar.slot(),
+            &sidecar.block_root(),
+            sidecar.index(),
+            sidecar.to_ssz(),
+        )
+    }
+
+    /// [`Self::put_pending_data_column_sidecar`], for a sidecar in hand.
+    pub fn put_pending_data_column(&self, sidecar: &DataColumnSidecar) -> Result<(), Error> {
+        self.put_pending_data_column_sidecar(
+            sidecar.slot(),
+            &sidecar.block_root(),
+            sidecar.index(),
+            sidecar.to_ssz(),
+        )
+    }
+
+    /// [`Self::take_pending_data_column_sidecar`], decoded. A row that does not
+    /// decode is still taken, so it cannot be replayed into the same failure.
+    pub fn take_pending_data_column(
+        &self,
+        slot: u64,
+        block_root: &H256,
+        column_index: u64,
+    ) -> Result<Option<DataColumnSidecar>, Error> {
+        self.take_pending_data_column_sidecar(slot, block_root, column_index)?
+            .map(|encoded| self.decode_data_column_sidecar(slot, &encoded))
+            .transpose()
+    }
+
+    /// [`Self::get_data_column_sidecar`], decoded.
+    pub fn get_data_column(
+        &self,
+        slot: u64,
+        block_root: &H256,
+        column_index: u64,
+    ) -> Result<Option<DataColumnSidecar>, Error> {
+        self.get_data_column_sidecar(slot, block_root, column_index)?
+            .map(|encoded| self.decode_data_column_sidecar(slot, &encoded))
+            .transpose()
+    }
+
     /// Drop every parked row this directory holds.
     ///
     /// Called once at startup. The only index into `PendingDataColumns` is the
@@ -3959,6 +5115,22 @@ impl Store {
         end_slot: u64,
         columns: &[u64],
     ) -> Result<Vec<Vec<u8>>, Error> {
+        Ok(self
+            .data_column_rows_in_range(start_slot, end_slot, columns)?
+            .into_iter()
+            .map(|(_, encoded)| encoded)
+            .collect())
+    }
+
+    /// [`Self::data_column_sidecars_in_range`] with each row's slot beside its
+    /// bytes, which is what [`Self::decode_data_column_sidecar`] needs to pick
+    /// the fork a range spanning one boundary decodes each row as.
+    pub fn data_column_rows_in_range(
+        &self,
+        start_slot: u64,
+        end_slot: u64,
+        columns: &[u64],
+    ) -> Result<Vec<(u64, Vec<u8>)>, Error> {
         let view = self.backend.begin_read().expect("read view");
         let mut found = Vec::new();
         for slot in start_slot..end_slot {
@@ -3980,7 +5152,7 @@ impl Store {
                     .try_into()
                     .expect("a column key ends in an eight-byte index");
                 if columns.contains(&u64::from_be_bytes(index_bytes)) {
-                    found.push(value.to_vec());
+                    found.push((slot, value.to_vec()));
                 }
             }
         }
@@ -4105,7 +5277,7 @@ mod tests {
             .put_batch(
                 Table::States,
                 vec![(
-                    root.to_ssz(),
+                    encode_slot_root_key(state.latest_block_header.slot, &root),
                     encode_state_value(&BeaconState::Lean(state.clone())),
                 )],
             )
@@ -4122,10 +5294,11 @@ mod tests {
             .count()
     }
 
-    /// Check if a key exists in a table.
-    fn has_key(backend: &dyn StorageBackend, table: Table, root: &H256) -> bool {
+    /// Check if a state row exists at `slot || root` in `table`.
+    fn has_state_row(backend: &dyn StorageBackend, table: Table, slot: u64, root: &H256) -> bool {
         let view = backend.begin_read().expect("read view");
-        view.contains(table, &root.to_ssz()).expect("contains")
+        view.contains(table, &encode_slot_root_key(slot, root))
+            .expect("contains")
     }
 
     /// Check whether a block proof exists for a (slot, root) pair.
@@ -5098,6 +6271,49 @@ mod tests {
         assert_eq!(resumed.head().expect("head"), r1);
     }
 
+    /// The anchor's `BlockRoots` row is keyed by its block's slot. A checkpoint
+    /// state at an epoch's first slot sits above its latest block whenever
+    /// that slot was empty, and the state's slot would index the anchor at a
+    /// slot it was not proposed in.
+    #[test]
+    fn index_beacon_anchor_keys_the_row_by_the_blocks_slot() {
+        let anchor_root = H256::repeat_byte(0xaa);
+        let (block_slot, state_slot) = (30, 32);
+        let mut store = Store::init_beacon(
+            Arc::new(InMemoryBackend::new()),
+            0,
+            Config::mainnet(),
+            anchor_root,
+            Checkpoint {
+                root: anchor_root,
+                slot: state_slot,
+            },
+            state_slot,
+        );
+        let anchor_block = beacon_test_block(block_slot, H256::repeat_byte(0xbb));
+        store
+            .insert_signed_block(anchor_root, anchor_block)
+            .expect("insert anchor block");
+        assert_eq!(
+            store.canonical_root_at_slot(block_slot).expect("read"),
+            None,
+            "inserting a block does not index it"
+        );
+
+        store
+            .index_beacon_anchor(anchor_root)
+            .expect("index anchor");
+
+        assert_eq!(
+            store.canonical_root_at_slot(block_slot).expect("read"),
+            Some(anchor_root)
+        );
+        assert_eq!(
+            store.canonical_root_at_slot(state_slot).expect("read"),
+            None
+        );
+    }
+
     /// The common case: nothing for `repair_head` to do when the recorded
     /// head already has a persisted state. Same head back, and the slot-1
     /// `BlockRoots` entry survives untouched, which is what proves no rewind
@@ -5673,10 +6889,13 @@ mod tests {
         (store, counts)
     }
 
+    /// Writes a junk row for `root` at slot 1, with the block row a reader
+    /// needs to find the slot it is keyed under.
     fn put_raw(store: &Store, table: Table, root: H256) {
+        insert_header(store.backend.as_ref(), root, 1, H256::ZERO);
         let mut batch = store.backend.begin_write().expect("write batch");
         batch
-            .put_batch(table, vec![(root.to_ssz(), vec![1, 2, 3])])
+            .put_batch(table, vec![(encode_slot_root_key(1, &root), vec![1, 2, 3])])
             .expect("put");
         batch.commit().expect("commit");
     }
@@ -5875,7 +7094,7 @@ mod tests {
 
         let view = backend.begin_read().expect("read view");
         let value = view
-            .get(Table::States, &anchor.to_ssz())
+            .get(Table::States, &encode_slot_root_key(0, &anchor))
             .expect("get")
             .expect("anchor snapshot written at bootstrap");
         assert_eq!(value[0], ForkName::Lean.selector());
@@ -5897,7 +7116,12 @@ mod tests {
             genesis_validators_root: H256::ZERO,
             slot,
             fork: Default::default(),
-            latest_block_header: Default::default(),
+            // The state is keyed by its block's slot, which is this header's:
+            // the block is `beacon_test_block(slot, ..)`.
+            latest_block_header: ethlambda_types::beacon::containers::BeaconBlockHeader {
+                slot,
+                ..Default::default()
+            },
             block_roots: vec![H256::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
                 .try_into()
                 .expect("the vector is built at its exact length"),
@@ -5938,6 +7162,20 @@ mod tests {
         let read = store.get_state(&root).expect("get").expect("state present");
         assert_eq!(read.fork_name(), state.fork_name());
         assert_eq!(read.slot(), 7);
+    }
+
+    #[test]
+    fn insert_state_records_the_writer_handoff_and_taking_it_clears_it() {
+        let mut store = beacon_test_store(Arc::new(InMemoryBackend::new()));
+        assert!(store.take_state_handoff().is_none());
+
+        store
+            .insert_state(H256::from([1u8; 32]), beacon_test_state(7))
+            .expect("insert beacon state");
+
+        let (start, end) = store.take_state_handoff().expect("a hand-off was recorded");
+        assert!(start <= end);
+        assert!(store.take_state_handoff().is_none());
     }
 
     #[test]
@@ -6013,6 +7251,24 @@ mod tests {
         assert_eq!(first_lookup, Lookup::Miss);
         assert_eq!(second_lookup, Lookup::Hit);
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn the_active_balance_cache_is_shared_across_store_clones() {
+        let store = beacon_test_store(Arc::new(InMemoryBackend::new()));
+        let clone = store.clone();
+        let key = crate::ActiveBalanceKey {
+            epoch: 1,
+            decision_root: H256::from([1u8; 32]),
+        };
+
+        let (first, first_lookup) = clone.active_balance_cache().get_or_compute(key, || 42);
+        let (second, second_lookup) = store
+            .active_balance_cache()
+            .get_or_compute(key, || panic!("should not recompute"));
+
+        assert_eq!((first, first_lookup), (42, Lookup::Miss));
+        assert_eq!((second, second_lookup), (42, Lookup::Hit));
     }
 
     #[test]
@@ -6097,8 +7353,7 @@ mod tests {
                 effective_balance: i,
                 ..Default::default()
             };
-            parent.validators_mut().push(validator).unwrap();
-            parent.balances_mut().push(i).unwrap();
+            parent.push_validator(validator, i).unwrap();
         }
         parent.apply_pending_mutations();
         store
@@ -6111,7 +7366,9 @@ mod tests {
         let mut child = parent;
         *child.slot_mut() = 11;
         child.latest_block_header_mut().parent_root = parent_root;
-        child.balances_mut()[0] += 1;
+        // The state is keyed by its block's slot, which is the header's.
+        child.latest_block_header_mut().slot = 11;
+        *child.balance_mut(0).unwrap() += 1;
         child.apply_pending_mutations();
         store
             .insert_signed_block(child_root, beacon_test_block(11, parent_root))
@@ -6128,20 +7385,99 @@ mod tests {
         let resident_parent = cold.get_state(&parent_root).expect("get").expect("present");
         let decoded = cold.get_state(&child_root).expect("get").expect("present");
 
-        assert!(decoded.validators().ptr_eq(resident_parent.validators()));
+        assert!(decoded.validators_ptr_eq(&resident_parent));
+        assert_eq!(decoded.to_ssz(), child.to_ssz());
+    }
+
+    /// The tree-backed fields beyond the registry share with the resident
+    /// parent too, across a state whose scores and previous participation did
+    /// not change but whose balances did.
+    #[test]
+    fn a_decoded_electra_state_shares_its_tree_fields_with_the_resident_parent() {
+        use crate::beacon_state_delta::tests::electra_state_with_validators;
+        use ethlambda_types::beacon::containers::HistoricalSummary;
+
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        let mut store = beacon_test_store(backend.clone());
+        let parent_root = H256::from([1u8; 32]);
+        let child_root = H256::from([2u8; 32]);
+
+        let mut electra = electra_state_with_validators(600);
+        for i in 0..4u8 {
+            let summary = HistoricalSummary {
+                block_summary_root: H256::from([i; 32]),
+                state_summary_root: H256::from([i + 1; 32]),
+            };
+            electra.historical_summaries.push(summary).unwrap();
+        }
+        let mut parent = BeaconState::Electra(electra);
+        // States are keyed by their header's slot and read back by their
+        // block's, so each state names its own block's slot there.
+        parent.latest_block_header_mut().slot = 10;
+        parent.apply_pending_mutations();
+        store
+            .insert_signed_block(parent_root, beacon_test_block(10, H256::ZERO))
+            .expect("insert parent block");
+        store
+            .insert_state(parent_root, parent.clone())
+            .expect("insert parent state");
+
+        let mut child = parent;
+        *child.slot_mut() += 1;
+        child.latest_block_header_mut().parent_root = parent_root;
+        child.latest_block_header_mut().slot = 11;
+        *child.balance_mut(0).unwrap() += 1;
+        child.block_roots_mut()[10] = parent_root;
+        child.apply_pending_mutations();
+        store
+            .insert_signed_block(child_root, beacon_test_block(11, parent_root))
+            .expect("insert child block");
+        store
+            .insert_state(child_root, child.clone())
+            .expect("insert child state");
+
+        drop(store);
+        let cold = beacon_test_store(backend);
+        let resident = cold.get_state(&parent_root).expect("get").expect("present");
+        let decoded = cold.get_state(&child_root).expect("get").expect("present");
+
+        assert!(decoded.validators_ptr_eq(&resident));
+        let (_, _, decoded_scores) = decoded.altair_validator_lists().unwrap();
+        let (_, _, resident_scores) = resident.altair_validator_lists().unwrap();
+        assert!(decoded_scores.ptr_eq(&resident_scores));
+        assert!(decoded.randao_mixes().ptr_eq(resident.randao_mixes()));
+        assert!(decoded.slashings().ptr_eq(resident.slashings()));
+        assert!(
+            decoded
+                .historical_roots()
+                .ptr_eq(resident.historical_roots())
+        );
+        assert!(decoded.eth1_data_votes().ptr_eq(resident.eth1_data_votes()));
+        let (BeaconState::Electra(decoded_electra), BeaconState::Electra(resident_electra)) =
+            (decoded.as_ref(), resident.as_ref())
+        else {
+            panic!("both states are electra");
+        };
+        assert!(!resident_electra.historical_summaries.is_empty());
+        assert!(
+            decoded_electra
+                .historical_summaries
+                .ptr_eq(&resident_electra.historical_summaries)
+        );
         assert_eq!(decoded.to_ssz(), child.to_ssz());
     }
 
     #[test]
-    fn a_cold_beacon_state_folds_every_delta_back_from_its_snapshot() {
+    fn a_cold_beacon_state_reads_back_as_its_snapshot_plus_one_delta() {
         let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
         let mut store = beacon_test_store(backend.clone());
         let interval = ForkName::Electra.snapshot_interval();
 
         // Slot 0 and slot `interval` are snapshots (no parent, then a boundary
-        // crossing), and every slot between them is a delta on its parent. So
-        // the reads cover a borrowed snapshot with nothing to fold, and chains
-        // of 1 up to `interval - 1` deltas applied to the borrowed snapshot.
+        // crossing), and every slot between them is a delta on the interval's
+        // snapshot. So the reads cover a borrowed snapshot with nothing to
+        // fold, and a single delta applied to the borrowed snapshot however
+        // deep into the interval the state sits.
         let mut expected = Vec::new();
         let mut parent = H256::ZERO;
         for slot in 0..=interval {
@@ -6175,13 +7511,208 @@ mod tests {
         state
     }
 
+    /// The root `insert_beacon_chain` gives the block at `slot`.
+    fn beacon_chain_root(slot: u64) -> H256 {
+        H256::from([(slot + 1) as u8; 32])
+    }
+
+    /// Inserts a linear beacon chain over `slots`, each block's parent being
+    /// the previous slot's (the first one's being `parent`), and returns the
+    /// last root.
+    fn insert_beacon_chain(
+        store: &mut Store,
+        slots: std::ops::RangeInclusive<u64>,
+        mut parent: H256,
+    ) -> H256 {
+        for slot in slots {
+            let root = beacon_chain_root(slot);
+            store
+                .insert_signed_block(root, beacon_test_block(slot, parent))
+                .expect("insert block");
+            store
+                .insert_state(root, beacon_test_state_with_parent(slot, parent))
+                .expect("insert state");
+            parent = root;
+        }
+        parent
+    }
+
+    /// Every `StateDiffs` row on the backend as `(slot, root, base_root)`.
+    fn beacon_diff_bases(backend: &Arc<dyn StorageBackend>) -> Vec<(u64, H256, H256)> {
+        let view = backend.begin_read().expect("read view");
+        view.prefix_iterator(Table::StateDiffs, &[])
+            .expect("iterator")
+            .map(|row| {
+                let (key, value) = row.expect("row");
+                let slot = u64::from_be_bytes(key[..8].try_into().unwrap());
+                let root = H256::from_slice(&key[8..]);
+                (slot, root, crate::beacon_state_delta::unframe(&value).0)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_beacon_diff_in_an_interval_names_the_intervals_snapshot() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        let mut store = beacon_test_store(backend.clone());
+        let interval = ForkName::Electra.snapshot_interval();
+
+        insert_beacon_chain(&mut store, 0..=interval, H256::ZERO);
+        // Dropping the store joins the writer, which settles the backend.
+        drop(store);
+
+        let diffs = beacon_diff_bases(&backend);
+        assert_eq!(
+            diffs.len() as u64,
+            interval - 1,
+            "slots 1..interval are diffs"
+        );
+        for (slot, _, base_root) in diffs {
+            assert_eq!(
+                base_root,
+                beacon_chain_root(0),
+                "the diff at slot {slot} must name the snapshot, not its parent"
+            );
+        }
+    }
+
+    #[test]
+    fn two_children_of_a_mid_interval_block_both_diff_against_the_snapshot() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        let mut store = beacon_test_store(backend.clone());
+        let fork_parent = insert_beacon_chain(&mut store, 0..=5, H256::ZERO);
+
+        // Two siblings of one parent: the second skips a slot, so the two
+        // states differ. The writer's last-written state is the first sibling,
+        // not the second's parent, so this is the fork-off-an-older-block path.
+        let first = H256::from([100u8; 32]);
+        let second = H256::from([101u8; 32]);
+        let first_state = beacon_test_state_with_parent(6, fork_parent);
+        let second_state = beacon_test_state_with_parent(7, fork_parent);
+        let expected = [
+            (first, first_state.to_ssz()),
+            (second, second_state.to_ssz()),
+        ];
+        store
+            .insert_signed_block(first, beacon_test_block(6, fork_parent))
+            .expect("insert block");
+        store
+            .insert_state(first, first_state)
+            .expect("insert state");
+        store
+            .insert_signed_block(second, beacon_test_block(7, fork_parent))
+            .expect("insert block");
+        store
+            .insert_state(second, second_state)
+            .expect("insert state");
+        drop(store);
+
+        let bases = beacon_diff_bases(&backend);
+        for sibling in [first, second] {
+            let (_, _, base_root) = bases
+                .iter()
+                .find(|(_, root, _)| *root == sibling)
+                .expect("the sibling has a diff");
+            assert_eq!(*base_root, beacon_chain_root(0));
+        }
+
+        let cold = beacon_test_store(backend);
+        for (root, encoded) in expected {
+            let state = cold.get_state(&root).expect("get").expect("present");
+            assert_eq!(state.to_ssz(), encoded);
+        }
+    }
+
+    #[test]
+    fn a_restart_mid_interval_keeps_diffing_against_the_snapshot() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        let interval = ForkName::Electra.snapshot_interval();
+        let half = interval / 2;
+
+        let mut store = beacon_test_store(backend.clone());
+        let tip = insert_beacon_chain(&mut store, 0..=half, H256::ZERO);
+        drop(store);
+
+        // A fresh store has an empty snapshot memo and no last-written state,
+        // so the next write has to find its snapshot by walking the frames.
+        let mut store = beacon_test_store(backend.clone());
+        insert_beacon_chain(&mut store, half + 1..=interval, tip);
+        drop(store);
+
+        let diffs = beacon_diff_bases(&backend);
+        assert_eq!(diffs.len() as u64, interval - 1);
+        for (slot, _, base_root) in diffs {
+            assert_eq!(base_root, beacon_chain_root(0), "diff at slot {slot}");
+        }
+
+        let cold = beacon_test_store(backend);
+        for slot in 0..=interval {
+            let state = cold
+                .get_state(&beacon_chain_root(slot))
+                .expect("get")
+                .expect("present");
+            assert_eq!(state.slot(), slot);
+        }
+    }
+
+    #[test]
+    fn the_snapshot_walk_follows_old_parent_linked_rows_to_the_snapshot() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        let mut store = beacon_test_store(backend.clone());
+        let (s, a, b) = (
+            beacon_chain_root(10),
+            beacon_chain_root(11),
+            beacon_chain_root(12),
+        );
+        store
+            .insert_signed_block(s, beacon_test_block(10, H256::ZERO))
+            .expect("insert block");
+        store
+            .insert_signed_block(a, beacon_test_block(11, s))
+            .expect("insert block");
+        store
+            .insert_signed_block(b, beacon_test_block(12, a))
+            .expect("insert block");
+
+        // Hand-written rows: S is a snapshot (no diff row), A diffs against S,
+        // and B diffs against A, the way a parent-linked older build wrote it.
+        let mut batch = backend.begin_write().expect("write batch");
+        let snapshot = vec![(encode_slot_root_key(10, &s), b"snapshot".to_vec())];
+        batch.put_batch(Table::States, snapshot).expect("put");
+        let diffs = vec![
+            (
+                encode_slot_root_key(11, &a),
+                crate::beacon_state_delta::frame(s, 11, 0, b""),
+            ),
+            (
+                encode_slot_root_key(12, &b),
+                crate::beacon_state_delta::frame(a, 12, 0, b""),
+            ),
+        ];
+        batch.put_batch(Table::StateDiffs, diffs).expect("put");
+        batch.commit().expect("commit");
+
+        let view = backend.begin_read().expect("read view");
+        for root in [s, a, b] {
+            assert_eq!(
+                crate::state_writer::nearest_snapshot_root(view.as_ref(), &root),
+                Some(s)
+            );
+        }
+        assert_eq!(
+            crate::state_writer::nearest_snapshot_root(view.as_ref(), &H256::from([99u8; 32])),
+            None,
+            "a root with no block has no snapshot"
+        );
+    }
+
     #[test]
     fn a_beacon_state_reconstructs_across_a_whole_snapshot_interval() {
         let mut store = beacon_test_store(Arc::new(InMemoryBackend::new()));
         let interval = ForkName::Electra.snapshot_interval();
 
-        // A chain one slot longer than the interval, so the walk crosses a
-        // snapshot boundary and the fold has real work to do.
+        // A chain one slot longer than the interval, so the reads cross a
+        // snapshot boundary and the deltas have real work to do.
         let mut roots = Vec::new();
         let mut parent = H256::ZERO;
         for slot in 0..=interval {
@@ -7137,7 +8668,12 @@ mod tests {
         );
 
         let anchor_root = store.head().expect("Failed to get head block root");
-        assert!(has_key(backend.as_ref(), Table::States, &anchor_root));
+        assert!(has_state_row(
+            backend.as_ref(),
+            Table::States,
+            0,
+            &anchor_root
+        ));
     }
 
     // ============ from_db_state Tests ============
@@ -7274,9 +8810,368 @@ mod tests {
         assert!(store.is_equivocating(42));
         assert!(!store.is_equivocating(43));
 
-        clone.set_block_timeliness(H256::from([1u8; 32]), true);
-        assert_eq!(store.block_timeliness(&H256::from([1u8; 32])), Some(true));
+        clone.set_block_timeliness(H256::from([1u8; 32]), [true, false]);
+        assert_eq!(
+            store.block_timeliness(&H256::from([1u8; 32])),
+            Some([true, false])
+        );
         assert_eq!(store.block_timeliness(&H256::from([2u8; 32])), None);
+    }
+
+    /// An envelope for `root` with every field at its zero value.
+    fn test_envelope(root: H256) -> gloas::SignedExecutionPayloadEnvelope {
+        let payload = gloas::ExecutionPayload {
+            parent_hash: Default::default(),
+            fee_recipient: Default::default(),
+            state_root: Default::default(),
+            receipts_root: Default::default(),
+            logs_bloom: vec![0u8; ethlambda_types::beacon::preset::BYTES_PER_LOGS_BLOOM]
+                .try_into()
+                .expect("built at exactly BYTES_PER_LOGS_BLOOM"),
+            prev_randao: Default::default(),
+            block_number: 7,
+            gas_limit: 0,
+            gas_used: 0,
+            timestamp: 0,
+            extra_data: Default::default(),
+            base_fee_per_gas: Default::default(),
+            block_hash: Default::default(),
+            transactions: Default::default(),
+            withdrawals: Default::default(),
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+            block_access_list: Default::default(),
+            slot_number: 0,
+        };
+        gloas::SignedExecutionPayloadEnvelope {
+            message: gloas::ExecutionPayloadEnvelope {
+                payload,
+                execution_requests: Default::default(),
+                builder_index: 3,
+                beacon_block_root: root,
+                parent_beacon_block_root: H256::ZERO,
+            },
+            signature: Default::default(),
+        }
+    }
+
+    /// A beacon directory whose finalized checkpoint is the epoch-1 boundary
+    /// checkpoint naming `finalized_root`, so the finalized slot is the first
+    /// slot of that epoch.
+    fn beacon_backend_finalized_at(finalized_root: H256) -> Arc<InMemoryBackend> {
+        let backend = Arc::new(InMemoryBackend::new());
+        let finalized = BeaconCheckpoint {
+            epoch: 1,
+            root: finalized_root,
+        };
+        Store::init_beacon(
+            backend.clone(),
+            0,
+            Config::mainnet(),
+            finalized_root,
+            Store::beacon_checkpoint_as_stored(finalized),
+            0,
+        );
+        backend
+    }
+
+    fn reopen(backend: Arc<InMemoryBackend>) -> Store {
+        Store::from_db_state(backend)
+            .expect("reopen")
+            .expect("populated directory")
+    }
+
+    /// A gloas signed block with an empty body and a zero signature.
+    fn gloas_test_block(slot: u64, parent_root: H256) -> SignedBeaconBlock {
+        SignedBeaconBlock::Gloas(gloas::SignedBeaconBlock {
+            message: gloas::BeaconBlock {
+                slot,
+                proposer_index: 0,
+                parent_root,
+                state_root: H256::ZERO,
+                body: Default::default(),
+            },
+            signature: Default::default(),
+        })
+    }
+
+    /// The head's envelope belongs to the served chain only on the FULL node:
+    /// an EMPTY head, or a head whose status this process has not computed,
+    /// withholds it.
+    #[test]
+    fn the_heads_envelope_is_served_only_when_the_head_node_is_full() {
+        let mut store = Store::init_beacon(
+            Arc::new(InMemoryBackend::new()),
+            0,
+            Config::mainnet(),
+            H256::ZERO,
+            Store::beacon_checkpoint_as_stored(BeaconCheckpoint::default()),
+            0,
+        );
+        store
+            .insert_signed_block(H256::ZERO, gloas_test_block(0, H256::ZERO))
+            .expect("insert anchor");
+        let block = gloas_test_block(1, H256::ZERO);
+        let root = block.message_hash_tree_root();
+        store.insert_signed_block(root, block).expect("insert head");
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(root))
+            .expect("advance head");
+        let envelope = test_envelope(root);
+        store.insert_verified_payload(1, &envelope);
+
+        assert_eq!(store.head_payload_status(), None);
+        assert!(
+            store
+                .canonical_execution_payload_envelopes(1, 1)
+                .unwrap()
+                .is_empty()
+        );
+
+        store.set_head_payload_status(root, PayloadStatus::Empty);
+        assert_eq!(store.head_payload_status(), Some(PayloadStatus::Empty));
+        assert!(
+            store
+                .canonical_execution_payload_envelopes(1, 1)
+                .unwrap()
+                .is_empty()
+        );
+
+        // A FULL status recorded for another root (the previous head, say)
+        // must not release this head's envelope.
+        store.set_head_payload_status(H256::repeat_byte(0xee), PayloadStatus::Full);
+        assert_eq!(store.head_payload_status(), None);
+        assert!(
+            store
+                .canonical_execution_payload_envelopes(1, 1)
+                .unwrap()
+                .is_empty()
+        );
+
+        store.set_head_payload_status(root, PayloadStatus::Full);
+        assert_eq!(
+            store.canonical_execution_payload_envelopes(1, 1).unwrap(),
+            vec![envelope]
+        );
+    }
+
+    #[test]
+    fn an_unverified_payload_is_forgotten_across_reopen() {
+        let root = H256::from([1u8; 32]);
+        let backend = beacon_backend_finalized_at(root);
+        let mut store = reopen(backend.clone());
+        store
+            .insert_signed_block(root, gloas_test_block(SLOTS_PER_EPOCH, H256::ZERO))
+            .expect("insert block");
+        store.insert_verified_payload(SLOTS_PER_EPOCH, &test_envelope(root));
+        store.insert_beacon_el_block_hash(root, SLOTS_PER_EPOCH, H256::from([9u8; 32]));
+
+        assert!(store.remove_verified_payload(&root));
+        assert_eq!(store.beacon_el_block_hash(root), None);
+        assert!(!store.remove_verified_payload(&root));
+
+        assert!(!store.has_verified_payload(&root));
+        assert_eq!(store.get_execution_payload_envelope(&root).unwrap(), None);
+        assert!(!reopen(backend).has_verified_payload(&root));
+    }
+
+    #[test]
+    fn a_verified_payload_survives_reopen() {
+        let root = H256::from([1u8; 32]);
+        let backend = beacon_backend_finalized_at(root);
+        let mut store = reopen(backend.clone());
+        store
+            .insert_signed_block(root, gloas_test_block(SLOTS_PER_EPOCH, H256::ZERO))
+            .expect("insert block");
+        let envelope = test_envelope(root);
+        store.insert_verified_payload(SLOTS_PER_EPOCH, &envelope);
+        assert!(store.has_verified_payload(&root));
+
+        let reopened = reopen(backend);
+
+        assert!(reopened.has_verified_payload(&root));
+        assert_eq!(
+            reopened
+                .get_execution_payload_envelope(&root)
+                .expect("read"),
+            Some(envelope)
+        );
+    }
+
+    #[test]
+    fn block_timeliness_survives_reopen() {
+        let root = H256::from([1u8; 32]);
+        let backend = beacon_backend_finalized_at(root);
+        let mut store = reopen(backend.clone());
+        store
+            .insert_signed_block(root, gloas_test_block(SLOTS_PER_EPOCH, H256::ZERO))
+            .expect("insert block");
+        store.set_gloas_block_timeliness(root, [true, false]);
+
+        let reopened = reopen(backend);
+
+        assert_eq!(reopened.block_timeliness(&root), Some([true, false]));
+    }
+
+    #[test]
+    fn pre_gloas_timeliness_is_not_persisted() {
+        let root = H256::from([1u8; 32]);
+        let backend = beacon_backend_finalized_at(root);
+        let mut store = reopen(backend.clone());
+        store
+            .insert_signed_block(root, beacon_test_block(SLOTS_PER_EPOCH, H256::ZERO))
+            .expect("insert block");
+        store.set_block_timeliness(root, [true, true]);
+
+        let reopened = reopen(backend);
+
+        assert_eq!(reopened.block_timeliness(&root), None);
+    }
+
+    #[test]
+    fn resume_reseeds_empty_vote_vectors_for_gloas_blocks_only() {
+        let gloas_root = H256::from([1u8; 32]);
+        let phase0_root = H256::from([2u8; 32]);
+        let backend = beacon_backend_finalized_at(gloas_root);
+        let mut store = reopen(backend.clone());
+        store
+            .insert_signed_block(gloas_root, gloas_test_block(SLOTS_PER_EPOCH, H256::ZERO))
+            .expect("insert block");
+        store
+            .insert_signed_block(
+                phase0_root,
+                beacon_test_block(SLOTS_PER_EPOCH + 1, gloas_root),
+            )
+            .expect("insert block");
+
+        let reopened = reopen(backend);
+
+        let empty = vec![None; PTC_SIZE];
+        assert_eq!(
+            reopened.payload_timeliness_vote(&gloas_root),
+            Some(empty.clone())
+        );
+        assert_eq!(
+            reopened.payload_data_availability_vote(&gloas_root),
+            Some(empty)
+        );
+        assert_eq!(reopened.payload_timeliness_vote(&phase0_root), None);
+    }
+
+    fn fulu_test_block(
+        slot: u64,
+        parent_root: H256,
+        el_hash: ExecutionBlockHash,
+    ) -> SignedBeaconBlock {
+        use ethlambda_types::beacon::containers::electra;
+
+        let mut body = electra::BeaconBlockBody::empty();
+        body.execution_payload.block_hash = el_hash;
+        SignedBeaconBlock::Fulu(electra::SignedBeaconBlock {
+            message: electra::BeaconBlock {
+                slot,
+                proposer_index: 0,
+                parent_root,
+                state_root: H256::ZERO,
+                body,
+            },
+            signature: Default::default(),
+        })
+    }
+
+    #[test]
+    fn resume_rebuilds_execution_hashes_for_the_unfinalized_window() {
+        let old = H256::from([1u8; 32]);
+        let finalized = H256::from([2u8; 32]);
+        let child = H256::from([3u8; 32]);
+        let premerge = H256::from([4u8; 32]);
+        let backend = beacon_backend_finalized_at(finalized);
+        let mut store = reopen(backend.clone());
+        let rows = [
+            (old, SLOTS_PER_EPOCH - 3, H256::ZERO, 0xa1),
+            (finalized, SLOTS_PER_EPOCH - 2, old, 0xa2),
+            (child, SLOTS_PER_EPOCH - 1, finalized, 0xa3),
+            // A zero payload hash is a pre-merge shape: no entry.
+            (premerge, SLOTS_PER_EPOCH, child, 0),
+        ];
+        for (root, slot, parent, byte) in rows {
+            let hash = ExecutionBlockHash::repeat_byte(byte);
+            store
+                .insert_signed_block(root, fulu_test_block(slot, parent, hash))
+                .expect("insert block");
+        }
+
+        let reopened = reopen(backend);
+
+        assert_eq!(reopened.beacon_el_block_hash(old), None);
+        assert_eq!(
+            reopened.beacon_el_block_hash(finalized),
+            Some(ExecutionBlockHash::repeat_byte(0xa2))
+        );
+        assert_eq!(
+            reopened.beacon_el_block_hash(child),
+            Some(ExecutionBlockHash::repeat_byte(0xa3))
+        );
+        assert_eq!(reopened.beacon_el_block_hash(premerge), None);
+    }
+
+    #[test]
+    fn resume_skips_payloads_below_finality() {
+        // The finalized block sits below its checkpoint's epoch start, and its
+        // child sits between the two: a floor at the epoch start would skip
+        // both, so the child loading shows the floor is the block's own slot.
+        let old = H256::from([1u8; 32]);
+        let finalized = H256::from([2u8; 32]);
+        let child = H256::from([3u8; 32]);
+        let backend = beacon_backend_finalized_at(finalized);
+        let mut store = reopen(backend.clone());
+        let slots = [
+            (old, SLOTS_PER_EPOCH - 3, H256::ZERO),
+            (finalized, SLOTS_PER_EPOCH - 2, old),
+            (child, SLOTS_PER_EPOCH - 1, finalized),
+        ];
+        for (root, slot, parent) in slots {
+            store
+                .insert_signed_block(root, gloas_test_block(slot, parent))
+                .expect("insert block");
+            store.insert_verified_payload(slot, &test_envelope(root));
+            store.set_gloas_block_timeliness(root, [true, true]);
+        }
+
+        let reopened = reopen(backend);
+
+        assert!(!reopened.has_verified_payload(&old));
+        assert_eq!(reopened.block_timeliness(&old), None);
+        assert_eq!(reopened.payload_timeliness_vote(&old), None);
+        for root in [finalized, child] {
+            assert!(reopened.has_verified_payload(&root));
+            assert_eq!(reopened.block_timeliness(&root), Some([true, true]));
+        }
+        // Skipped in memory only: the row stays on disk.
+        assert!(
+            reopened
+                .get_execution_payload_envelope(&old)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn resume_without_the_finalized_block_floors_at_the_anchor_slot() {
+        // The finalized block has no row, so the floor falls back; a block
+        // below the checkpoint's epoch start must still load.
+        let finalized = H256::from([2u8; 32]);
+        let block = H256::from([3u8; 32]);
+        let backend = beacon_backend_finalized_at(finalized);
+        let mut store = reopen(backend.clone());
+        store
+            .insert_signed_block(block, gloas_test_block(5, H256::ZERO))
+            .expect("insert block");
+        store.set_gloas_block_timeliness(block, [true, true]);
+
+        let reopened = reopen(backend);
+
+        assert_eq!(reopened.block_timeliness(&block), Some([true, true]));
     }
 
     #[test]
@@ -7284,7 +9179,9 @@ mod tests {
         let mut store = Store::test_store();
         let message = LatestMessage {
             epoch: 3,
+            slot: 24,
             root: H256::from([7u8; 32]),
+            payload_present: false,
         };
 
         store.set_latest_message(1, message);
@@ -7297,6 +9194,33 @@ mod tests {
         let mut seen = Vec::new();
         store.for_each_non_equivocating_latest_message(|index, _| seen.push(index));
         assert_eq!(seen, vec![1]);
+    }
+
+    #[test]
+    fn latest_messages_are_visited_in_validator_index_order_and_gaps_are_skipped() {
+        let mut store = Store::test_store();
+        let message = |epoch| LatestMessage {
+            epoch,
+            slot: epoch * SLOTS_PER_EPOCH,
+            root: H256::from([epoch as u8; 32]),
+            payload_present: false,
+        };
+
+        // Written out of order, with a gap, and one overwritten.
+        store.set_latest_message(9, message(1));
+        store.set_latest_message(2, message(2));
+        store.set_latest_message(5, message(3));
+        store.set_latest_message(5, message(4));
+
+        let mut seen = Vec::new();
+        store
+            .for_each_non_equivocating_latest_message(|index, vote| seen.push((index, vote.epoch)));
+        assert_eq!(seen, vec![(2, 2), (5, 4), (9, 1)]);
+
+        assert_eq!(store.latest_message(5).map(|vote| vote.epoch), Some(4));
+        assert_eq!(store.latest_message(3), None, "a gap is not a vote");
+        assert_eq!(store.latest_message(1_000), None, "past the table");
+        assert_eq!(store.latest_message(u64::MAX), None);
     }
 
     #[test]
@@ -7393,6 +9317,50 @@ mod tests {
     }
 
     #[test]
+    fn block_payload_statuses_default_to_not_validated_and_prune_below_finality() {
+        let mut store = Store::test_store();
+        let below = H256::repeat_byte(1);
+        let at = H256::repeat_byte(2);
+        assert!(
+            store.beacon_block_payload_status(below).is_not_validated(),
+            "an absent root reads as the specification's default"
+        );
+
+        store.insert_beacon_block_payload_status(below, 4, PayloadStatusEnum::Valid);
+        store.insert_beacon_block_payload_status(at, 5, PayloadStatusEnum::Invalid);
+        assert_eq!(
+            store.beacon_block_payload_status(below),
+            PayloadStatusEnum::Valid
+        );
+
+        store.prune_beacon_block_payload_statuses(5);
+
+        assert!(store.beacon_block_payload_status(below).is_not_validated());
+        assert_eq!(
+            store.beacon_block_payload_status(at),
+            PayloadStatusEnum::Invalid
+        );
+    }
+
+    #[test]
+    fn envelope_arrival_keeps_the_earliest_and_is_pruned_with_the_hash_cache() {
+        let mut store = Store::test_store();
+        let old = H256::repeat_byte(1);
+        let fresh = H256::repeat_byte(2);
+        store.insert_beacon_envelope_seen(old, 4, 100);
+        store.insert_beacon_envelope_seen(fresh, 6, 900);
+        store.insert_beacon_envelope_seen(fresh, 6, 2_000);
+        store.insert_beacon_envelope_seen(fresh, 6, 500);
+
+        assert_eq!(store.beacon_envelope_seen_ms(&fresh), Some(500));
+        assert_eq!(store.beacon_envelope_seen_ms(&H256::repeat_byte(9)), None);
+
+        store.prune_beacon_el_block_hashes(5, H256::repeat_byte(7));
+        assert_eq!(store.beacon_envelope_seen_ms(&old), None);
+        assert_eq!(store.beacon_envelope_seen_ms(&fresh), Some(500));
+    }
+
+    #[test]
     fn el_block_hashes_prune_strictly_below_the_finalized_slot() {
         let mut store = Store::test_store();
         let below = H256::repeat_byte(1);
@@ -7445,6 +9413,50 @@ mod tests {
             store.beacon_el_block_hash(head),
             Some(ExecutionBlockHash::repeat_byte(0xb3))
         );
+    }
+
+    /// Payload links are pruned like the execution hashes: strictly below the
+    /// finalized slot, keeping the finalized root even when its block sits
+    /// below that slot.
+    #[test]
+    fn payload_links_prune_strictly_below_the_finalized_slot_and_keep_its_root() {
+        let mut store = Store::test_store();
+        let finalized = H256::repeat_byte(1);
+        let stale = H256::repeat_byte(2);
+        let at = H256::repeat_byte(3);
+        let above = H256::repeat_byte(4);
+        let link = BlockPayloadLink::PreGloas;
+        store.set_payload_link(finalized, 30, link);
+        let between = H256::repeat_byte(5);
+        store.set_payload_link(stale, 29, link);
+        // Between the finalized block (30) and the checkpoint's slot (32): a
+        // fork block the head walk still reads.
+        store.set_payload_link(between, 31, link);
+        store.set_payload_link(at, 32, link);
+        store.set_payload_link(above, 33, link);
+
+        store.prune_beacon_payload_links(32, finalized);
+
+        assert_eq!(store.payload_link(&finalized), Some(link));
+        assert_eq!(store.payload_link(&stale), None);
+        assert_eq!(store.payload_link(&between), Some(link));
+        assert_eq!(store.payload_link(&at), Some(link));
+        assert_eq!(store.payload_link(&above), Some(link));
+    }
+
+    /// Without a link for the finalized root its own slot is unknown, so the
+    /// prune leaves every link alone rather than bounding on the checkpoint.
+    #[test]
+    fn payload_links_are_not_pruned_when_the_finalized_root_has_none() {
+        let mut store = Store::test_store();
+        let finalized = H256::repeat_byte(1);
+        let stale = H256::repeat_byte(2);
+        let link = BlockPayloadLink::PreGloas;
+        store.set_payload_link(stale, 29, link);
+
+        store.prune_beacon_payload_links(32, finalized);
+
+        assert_eq!(store.payload_link(&stale), Some(link));
     }
 
     #[test]
@@ -7793,6 +9805,101 @@ mod tests {
         vec![marker; 16]
     }
 
+    /// A beacon store whose config puts gloas at epoch 2, so slots below
+    /// `2 * SLOTS_PER_EPOCH` are fulu and the rest gloas.
+    fn gloas_scheduled_store() -> Store {
+        let config = Config {
+            fulu_fork_epoch: 0,
+            gloas_fork_epoch: 2,
+            ..Config::mainnet()
+        };
+        Store::init_beacon(
+            Arc::new(InMemoryBackend::new()),
+            0,
+            config,
+            H256::ZERO,
+            Checkpoint::default(),
+            0,
+        )
+    }
+
+    fn fulu_sidecar_at(slot: u64, index: u64) -> DataColumnSidecar {
+        let mut sidecar = ethlambda_types::beacon::containers::fulu::DataColumnSidecar {
+            index,
+            column: Default::default(),
+            kzg_commitments: Default::default(),
+            kzg_proofs: Default::default(),
+            signed_block_header: Default::default(),
+            kzg_commitments_inclusion_proof: vec![
+                H256::ZERO;
+                ethlambda_types::beacon::preset::KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH
+            ]
+            .try_into()
+            .expect("exactly the required depth"),
+        };
+        sidecar.signed_block_header.message.slot = slot;
+        DataColumnSidecar::Fulu(sidecar)
+    }
+
+    fn gloas_sidecar_at(slot: u64, index: u64, root: H256) -> DataColumnSidecar {
+        DataColumnSidecar::Gloas(
+            ethlambda_types::beacon::containers::gloas::DataColumnSidecar {
+                index,
+                slot,
+                beacon_block_root: root,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn a_gloas_sidecar_round_trips_through_both_column_tables() {
+        let store = gloas_scheduled_store();
+        let root = H256::repeat_byte(7);
+        let slot = 2 * SLOTS_PER_EPOCH + 3;
+        let sidecar = gloas_sidecar_at(slot, 4, root);
+
+        store.put_data_column(&sidecar).unwrap();
+        assert!(store.has_data_column(slot, &root, 4));
+        assert_eq!(
+            store.get_data_column(slot, &root, 4).unwrap(),
+            Some(sidecar.clone())
+        );
+
+        let parked = gloas_sidecar_at(slot, 5, root);
+        store.put_pending_data_column(&parked).unwrap();
+        // Parked rows are not custodied ones.
+        assert!(!store.has_data_column(slot, &root, 5));
+        assert_eq!(
+            store.take_pending_data_column(slot, &root, 5).unwrap(),
+            Some(parked)
+        );
+        assert_eq!(
+            store.take_pending_data_column(slot, &root, 5).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_row_decodes_as_the_fork_its_slot_names() {
+        let store = gloas_scheduled_store();
+        let fulu = fulu_sidecar_at(SLOTS_PER_EPOCH, 1);
+        let root = fulu.block_root();
+        store.put_data_column(&fulu).unwrap();
+        assert_eq!(
+            store.get_data_column(SLOTS_PER_EPOCH, &root, 1).unwrap(),
+            Some(fulu)
+        );
+
+        // The same bytes filed under a gloas slot are not a gloas sidecar.
+        let gloas_slot = 2 * SLOTS_PER_EPOCH;
+        let encoded = fulu_sidecar_at(gloas_slot, 1).to_ssz();
+        assert!(matches!(
+            store.decode_data_column_sidecar(gloas_slot, &encoded),
+            Err(Error::UndecodableDataColumn { .. })
+        ));
+    }
+
     #[test]
     fn a_sidecar_round_trips_by_slot_root_and_index() {
         let store = beacon_test_store(Arc::new(InMemoryBackend::new()));
@@ -8084,5 +10191,420 @@ mod tests {
         let index = store.block_index();
         assert!(index.contains_key(&kept));
         assert!(!index.contains_key(&removed));
+    }
+
+    // ============ Finalized State Pruning Tests ============
+
+    /// The slot a beacon block's row yields through the cheap read must be the
+    /// slot a full decode yields, for every fork shape the table can hold.
+    #[test]
+    fn peeking_a_beacon_block_slot_equals_decoding_it() {
+        use ethlambda_types::beacon::containers::{altair, electra, gloas};
+
+        let altair_block = SignedBeaconBlock::Altair(altair::SignedBeaconBlock {
+            message: altair::BeaconBlock {
+                slot: 0x0102_0304_0506,
+                proposer_index: 3,
+                parent_root: root(1),
+                state_root: root(2),
+                body: Default::default(),
+            },
+            signature: Default::default(),
+        });
+        let electra_block = |slot| electra::SignedBeaconBlock {
+            message: electra::BeaconBlock {
+                slot,
+                proposer_index: 9,
+                parent_root: root(3),
+                state_root: root(4),
+                body: electra::BeaconBlockBody::empty(),
+            },
+            signature: Default::default(),
+        };
+        let blocks = [
+            beacon_test_block(0, H256::ZERO),
+            beacon_test_block(13_000_000, root(5)),
+            altair_block,
+            SignedBeaconBlock::Electra(electra_block(77)),
+            SignedBeaconBlock::Fulu(electra_block(u64::MAX - 1)),
+            SignedBeaconBlock::Gloas(gloas::SignedBeaconBlock {
+                message: gloas::BeaconBlock {
+                    slot: 0x0a0b_0c0d,
+                    proposer_index: 5,
+                    parent_root: root(6),
+                    state_root: root(7),
+                    body: gloas::BeaconBlockBody::empty(),
+                },
+                signature: Default::default(),
+            }),
+        ];
+        // The fork tag is part of the value; the newest fork in `ALL` is among
+        // the blocks above.
+        assert_eq!(blocks[5].fork_name(), *ForkName::ALL.last().unwrap());
+        for block in blocks {
+            let value = encode_beacon_block_value(&block);
+            assert_eq!(
+                peek_beacon_block_slot(&value),
+                decode_beacon_block_value(&value).slot(),
+                "fork {:?}",
+                block.fork_name()
+            );
+        }
+    }
+
+    /// Writes a lean block's header row and a snapshot for it, so a state
+    /// exists at `slot` and a reader can find its key.
+    fn seed_lean_snapshot(backend: &dyn StorageBackend, block_root: H256, slot: u64) -> State {
+        // `historical_block_hashes` is one entry per slot, which is what a
+        // child's diff is checked against.
+        let state = sample_state(slot, root(900), vec![H256::ZERO; slot as usize]);
+        insert_header(backend, block_root, slot, root(900));
+        insert_snapshot(backend, block_root, &state);
+        state
+    }
+
+    fn set_finalized(store: &Store, block_root: H256, slot: u64) {
+        store.set_metadata(
+            KEY_LATEST_FINALIZED,
+            &Checkpoint {
+                root: block_root,
+                slot,
+            },
+        );
+    }
+
+    #[test]
+    fn pruning_finalized_states_keeps_the_finalized_state_and_its_descendants() {
+        let interval = ForkName::Lean.snapshot_interval();
+        let backend = Arc::new(InMemoryBackend::new());
+        let store = Store::from_anchor_state(
+            backend.clone(),
+            State::from_genesis(1_000, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
+        let genesis_root = store.head().expect("head");
+        drop(store);
+
+        // Below the cut: an old snapshot, and a diff row (a junk value is fine,
+        // since it is only ever deleted).
+        let old = root(1);
+        seed_lean_snapshot(backend.as_ref(), old, 100);
+        let junk_diff = root(2);
+        let mut batch = backend.begin_write().expect("write batch");
+        batch
+            .put_batch(
+                Table::StateDiffs,
+                vec![(encode_slot_root_key(101, &junk_diff), vec![1, 2, 3])],
+            )
+            .expect("put diff");
+        batch.commit().expect("commit");
+
+        // The finalized block opens the interval that starts at `2 * interval`,
+        // so it is a snapshot; its child is a diff on it.
+        let finalized_slot = 2 * interval + 5;
+        // The root is the header's real hash: the child's diff appends it to
+        // `historical_block_hashes`, and that append is validated against it.
+        let finalized_state = sample_state(
+            finalized_slot,
+            root(900),
+            vec![H256::ZERO; finalized_slot as usize],
+        );
+        let finalized_root = finalized_state.latest_block_header.hash_tree_root();
+        insert_header(backend.as_ref(), finalized_root, finalized_slot, root(900));
+        insert_snapshot(backend.as_ref(), finalized_root, &finalized_state);
+        let mut child_hbh = finalized_state.historical_block_hashes.to_vec();
+        child_hbh.push(finalized_root);
+        let child_state = sample_state(finalized_slot + 1, finalized_root, child_hbh);
+        let child_root = root(4);
+        insert_header(
+            backend.as_ref(),
+            child_root,
+            finalized_slot + 1,
+            finalized_root,
+        );
+        let mut writer = Store::test_store_with_backend(backend.clone());
+        writer
+            .insert_state(child_root, BeaconState::Lean(child_state.clone()))
+            .expect("insert child state");
+        drop(writer);
+
+        let mut store = Store::test_store_with_backend(backend.clone());
+        set_finalized(&store, finalized_root, finalized_slot);
+
+        let pruned = store.prune_finalized_states().expect("prune");
+        assert_eq!(pruned, Some(0..2 * interval));
+        assert_eq!(
+            store.get_metadata::<u64>(KEY_STATES_PRUNED_BELOW),
+            2 * interval
+        );
+
+        // The deleted rows are gone, from both tables.
+        let b = backend.as_ref();
+        assert!(!has_state_row(b, Table::States, 0, &genesis_root));
+        assert!(!has_state_row(b, Table::States, 100, &old));
+        assert!(!has_state_row(b, Table::StateDiffs, 101, &junk_diff));
+        assert!(has_state_row(
+            b,
+            Table::States,
+            finalized_slot,
+            &finalized_root
+        ));
+
+        // A fresh store has an empty cache, so these reads really hit the
+        // tables: the finalized snapshot, and the child rebuilt from its diff.
+        let cold = Store::test_store_with_backend(backend.clone());
+        let read = cold
+            .get_state(&finalized_root)
+            .expect("get")
+            .expect("finalized state survives");
+        assert_eq!(read.to_ssz(), BeaconState::Lean(finalized_state).to_ssz());
+        let read = cold
+            .get_state(&child_root)
+            .expect("get")
+            .expect("descendant survives");
+        assert_eq!(read.to_ssz(), BeaconState::Lean(child_state).to_ssz());
+        assert!(cold.get_state(&old).expect("get").is_none());
+    }
+
+    #[test]
+    fn consecutive_state_prunes_cover_adjacent_ranges_and_persist_the_watermark() {
+        let interval = ForkName::Lean.snapshot_interval();
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::from_anchor_state(
+            backend.clone(),
+            State::from_genesis(1_000, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
+
+        // Finality still inside the anchor's own interval: nothing to prune.
+        assert_eq!(store.prune_finalized_states().expect("prune"), None);
+
+        let first = root(1);
+        let first_slot = 2 * interval + 1;
+        seed_lean_snapshot(backend.as_ref(), first, first_slot);
+        set_finalized(&store, first, first_slot);
+        assert_eq!(
+            store.prune_finalized_states().expect("prune"),
+            Some(0..2 * interval)
+        );
+        // Unchanged finality: the watermark answers without a second delete.
+        assert_eq!(store.prune_finalized_states().expect("prune"), None);
+
+        let second = root(2);
+        let second_slot = 5 * interval + 7;
+        seed_lean_snapshot(backend.as_ref(), second, second_slot);
+        set_finalized(&store, second, second_slot);
+        assert_eq!(
+            store.prune_finalized_states().expect("prune"),
+            Some(2 * interval..5 * interval)
+        );
+        assert_eq!(store.prune_finalized_states().expect("prune"), None);
+
+        // The watermark outlives the store: a reopened one carries on from it.
+        drop(store);
+        let mut reopened = Store::from_db_state(backend.clone())
+            .expect("restore store")
+            .expect("store exists");
+        assert_eq!(reopened.prune_finalized_states().expect("prune"), None);
+        let third = root(3);
+        let third_slot = 6 * interval;
+        seed_lean_snapshot(backend.as_ref(), third, third_slot);
+        set_finalized(&reopened, third, third_slot);
+        assert_eq!(
+            reopened.prune_finalized_states().expect("prune"),
+            Some(5 * interval..6 * interval)
+        );
+    }
+
+    /// `insert_state` only queues its write, so finality can move past a state
+    /// still waiting on the writer thread. Committed after the range delete,
+    /// that write would survive it below the watermark, and no later prune
+    /// would revisit the range.
+    #[test]
+    fn a_state_write_queued_before_a_prune_does_not_survive_it() {
+        let interval = ForkName::Lean.snapshot_interval();
+        let backend = Arc::new(InMemoryBackend::new());
+
+        // A parent with a snapshot, so the queued child's diff has a base.
+        let parent_state = sample_state(1, root(900), vec![H256::ZERO]);
+        let parent_root = parent_state.latest_block_header.hash_tree_root();
+        insert_header(backend.as_ref(), parent_root, 1, root(900));
+        insert_snapshot(backend.as_ref(), parent_root, &parent_state);
+        let child_state = sample_state(2, parent_root, vec![H256::ZERO, parent_root]);
+
+        let finalized = root(1);
+        let finalized_slot = 3 * interval + 1;
+        seed_lean_snapshot(backend.as_ref(), finalized, finalized_slot);
+
+        // Park the writer, then queue the child's write behind it. The parent
+        // is read first so it is cached: its snapshot is about to be pruned,
+        // and the writer needs it as the diff base either way.
+        let mut store = Store::test_store_with_backend(backend.clone());
+        store.get_state(&parent_root).expect("get").expect("parent");
+        let resume = store.state_writer.pause();
+        store
+            .insert_state(root(2), BeaconState::Lean(child_state))
+            .expect("insert child state");
+        set_finalized(&store, finalized, finalized_slot);
+
+        // Prune while that write is still queued. Give it time to finish
+        // ahead of the write if it does not wait for it, then let the writer
+        // go either way.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut pruner = store.clone();
+        let prune = std::thread::spawn(move || {
+            let pruned = pruner.prune_finalized_states().expect("prune");
+            done_tx.send(()).expect("test is waiting");
+            pruned
+        });
+        let _ = done_rx.recv_timeout(std::time::Duration::from_millis(500));
+        drop(resume);
+        let pruned = prune.join().expect("prune thread");
+        assert_eq!(pruned, Some(0..3 * interval));
+        // Dropping the last clone joins the writer, so every write has landed.
+        drop(store);
+
+        let cut = 3 * interval;
+        let view = backend.begin_read().expect("read view");
+        for table in [Table::States, Table::StateDiffs] {
+            let below_cut: Vec<_> = view
+                .prefix_iterator(table, &[])
+                .expect("iterator")
+                .map(|entry| entry.expect("entry").0)
+                .filter(|key| u64::from_be_bytes(key[..8].try_into().unwrap()) < cut)
+                .collect();
+            assert!(
+                below_cut.is_empty(),
+                "{table:?} kept {} row(s) below the watermark",
+                below_cut.len()
+            );
+        }
+    }
+
+    /// A beacon checkpoint is epoch-denominated: its slot is the epoch start,
+    /// above the finalized block's own slot whenever the boundary was skipped.
+    /// Cutting at the checkpoint's slot would delete the finalized state.
+    #[test]
+    fn a_beacon_finalized_block_below_its_epoch_start_is_not_pruned() {
+        let interval = ForkName::Phase0.snapshot_interval();
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        let mut store = beacon_test_store(backend.clone());
+
+        // `a` is in the first interval; `b` opens the third (a snapshot), and
+        // `c` is the finalized block, a diff on `b` just below epoch 3's start.
+        let (a_slot, b_slot, c_slot) = (10, 2 * interval + 1, 2 * interval + 5);
+        let (a, b, c) = (root(1), root(2), root(3));
+        let mut parent = H256::ZERO;
+        for (block_root, slot) in [(a, a_slot), (b, b_slot), (c, c_slot)] {
+            store
+                .insert_signed_block(block_root, beacon_test_block(slot, parent))
+                .expect("insert block");
+            store
+                .insert_state(block_root, beacon_test_state_with_parent(slot, parent))
+                .expect("insert state");
+            parent = block_root;
+        }
+        drop(store);
+
+        let mut cold = beacon_test_store(backend.clone());
+        set_finalized(&cold, c, 3 * interval);
+        assert!(3 * interval > c_slot);
+
+        let pruned = cold.prune_finalized_states().expect("prune");
+        assert_eq!(pruned, Some(0..2 * interval));
+
+        assert!(cold.get_state(&a).expect("get").is_none());
+        for (block_root, slot) in [(b, b_slot), (c, c_slot)] {
+            let state = cold
+                .get_state(&block_root)
+                .expect("get")
+                .expect("kept state is readable");
+            assert_eq!(state.slot(), slot);
+        }
+    }
+
+    // ---- justified-balances cache ----
+
+    fn snapshot(epoch: u64, root_byte: u8) -> Arc<JustifiedBalances> {
+        Arc::new(JustifiedBalances::new(
+            BeaconCheckpoint {
+                epoch,
+                root: H256::repeat_byte(root_byte),
+            },
+            vec![1].into(),
+            1,
+            vec![1].into(),
+        ))
+    }
+
+    fn cached(cache: &JustifiedBalancesCache, snapshot: &JustifiedBalances) -> bool {
+        cache.get(&snapshot.checkpoint()).is_some()
+    }
+
+    #[test]
+    fn the_balances_cache_is_bounded_and_evicts_the_lowest_epoch_first() {
+        let mut cache = JustifiedBalancesCache::default();
+        let current = snapshot(100, 0);
+        // Inserted in an order that is not epoch order, so "lowest epoch"
+        // differs from "oldest insert".
+        let epochs = [5, 3, 9, 4, 8, 7, 6, 10];
+        let entries: Vec<_> = epochs.iter().map(|&epoch| snapshot(epoch, 1)).collect();
+        for entry in &entries {
+            cache.insert(Arc::clone(entry), &current.checkpoint());
+        }
+        assert_eq!(cache.entries.len(), JUSTIFIED_BALANCES_CAPACITY);
+
+        let newest = snapshot(11, 1);
+        cache.insert(Arc::clone(&newest), &current.checkpoint());
+        assert_eq!(cache.entries.len(), JUSTIFIED_BALANCES_CAPACITY);
+        assert!(cached(&cache, &newest));
+        assert!(!cached(&cache, &entries[1]), "epoch 3, the lowest, is gone");
+        assert!(cached(&cache, &entries[3]), "epoch 4 survives for now");
+
+        cache.insert(snapshot(12, 1), &current.checkpoint());
+        assert!(!cached(&cache, &entries[3]), "then epoch 4");
+        assert_eq!(cache.entries.len(), JUSTIFIED_BALANCES_CAPACITY);
+    }
+
+    #[test]
+    fn equal_epochs_evict_the_oldest_insert_first() {
+        let mut cache = JustifiedBalancesCache::default();
+        let current = snapshot(100, 0);
+        let forks: Vec<_> = (0..JUSTIFIED_BALANCES_CAPACITY as u8)
+            .map(|byte| snapshot(7, byte))
+            .collect();
+        for fork in &forks {
+            cache.insert(Arc::clone(fork), &current.checkpoint());
+        }
+        cache.insert(snapshot(7, 200), &current.checkpoint());
+        assert!(!cached(&cache, &forks[0]), "the oldest of the tie goes");
+        assert!(cached(&cache, &forks[1]));
+    }
+
+    #[test]
+    fn the_current_justified_entry_is_never_evicted() {
+        let mut cache = JustifiedBalancesCache::default();
+        // The lowest epoch of all, and the one that must survive.
+        let current = snapshot(1, 0);
+        cache.insert(Arc::clone(&current), &current.checkpoint());
+        for epoch in 2..2 + 3 * JUSTIFIED_BALANCES_CAPACITY as u64 {
+            cache.insert(snapshot(epoch, 1), &current.checkpoint());
+            assert!(cached(&cache, &current), "after inserting epoch {epoch}");
+            assert!(cache.entries.len() <= JUSTIFIED_BALANCES_CAPACITY);
+        }
+    }
+
+    #[test]
+    fn inserting_a_known_checkpoint_replaces_it_without_evicting() {
+        let mut cache = JustifiedBalancesCache::default();
+        let current = snapshot(100, 0);
+        for epoch in 0..JUSTIFIED_BALANCES_CAPACITY as u64 {
+            cache.insert(snapshot(epoch, 1), &current.checkpoint());
+        }
+        let again = snapshot(0, 1);
+        cache.insert(Arc::clone(&again), &current.checkpoint());
+        assert_eq!(cache.entries.len(), JUSTIFIED_BALANCES_CAPACITY);
+        let found = cache.get(&again.checkpoint()).expect("still cached");
+        assert!(Arc::ptr_eq(&found, &again), "the new snapshot replaced it");
     }
 }

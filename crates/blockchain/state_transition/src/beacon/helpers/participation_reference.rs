@@ -60,7 +60,7 @@ pub fn get_flag_index_deltas(
     state: &BeaconState,
     flag_index: usize,
 ) -> Result<(Vec<Gwei>, Vec<Gwei>)> {
-    let validator_count = state.validators().len();
+    let validator_count = state.validator_count();
     let mut rewards = vec![0; validator_count];
     let mut penalties = vec![0; validator_count];
 
@@ -131,7 +131,7 @@ pub fn get_inactivity_penalty_deltas(
     state: &BeaconState,
     config: &Config,
 ) -> Result<(Vec<Gwei>, Vec<Gwei>)> {
-    let validator_count = state.validators().len();
+    let validator_count = state.validator_count();
     let rewards = vec![0; validator_count];
     let mut penalties = vec![0; validator_count];
 

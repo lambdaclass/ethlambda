@@ -33,7 +33,7 @@ knows which duty is due. The order is a dependency chain, since each interval co
 what the previous one produced. A duty that overruns its interval is not rescheduled: it
 lands late, and the slot moves on without it.
 
-> **In ethlambda:** the intervals are the `SlotInterval` variants in
+> **In ethlambda's Lean Chain:** the intervals are the `SlotInterval` variants in
 > `crates/blockchain/src/lib.rs`. `INTERVALS_PER_SLOT` is fixed in
 > `crates/common/types/src/constants.rs` (each interval carries a distinct duty, so
 > the count is not a knob), while the slot duration is read from the network's config
@@ -59,7 +59,7 @@ Genesis occupies slot 0, so proposals start at slot 1, and nothing forces a slot
 filled: a proposer that is offline or too slow leaves an empty slot, and the next block
 simply points its parent root at an older block.
 
-> **In ethlambda:** the proposer packs no body of its own. It adopts the most valuable
+> **In ethlambda's Lean Chain:** the proposer packs no body of its own. It adopts the most valuable
 > of the candidate [block body proofs](#block-body-proofs) gossiped during the previous
 > interval — validated against its own state, and only if it is worth more than an empty
 > body — or else signs an empty block, which costs no prover work at all. What is left of
@@ -74,7 +74,7 @@ append to it a `(source, target)` [finality vote](./3sf_mini.md#recap-attestatio
 These votes are in aggregation subnets and are imported by aggregators. Aggregators verify
 the votes in their subnet and store them for later aggregation.
 
-> **In ethlambda:** a validator's subnet is `validator_index % attestation_committee_count`,
+> **In ethlambda's Lean Chain:** a validator's subnet is `validator_index % attestation_committee_count`,
 > and a node only aggregates for subnets it subscribed to at startup. Aggregation is also
 > gated on the aggregator role, seeded by `--is-aggregator` and flippable at runtime
 > through the admin API. A chain whose validators all decline the role still gossips votes
@@ -92,7 +92,7 @@ into one proof is the heaviest recurring computation in the client. It is also w
 block affordable, since a block carrying raw votes would need one full XMSS signature per
 voter, quickly going over the network bandwidth limit.
 
-> **In ethlambda:** the proofs run on an off-thread worker that never stops: it keeps its
+> **In ethlambda's Lean Chain:** the proofs run on an off-thread worker that never stops: it keeps its
 > own store handle and works through the pool a job at a time, so proving is not confined
 > to this interval. What the interval still owns is publication — the actor buffers each
 > finished aggregate and gossips the lot here.
@@ -129,7 +129,7 @@ is the exception: it reads the unpromoted buffer directly, which is how it stays
 this slot alone. See [why staged promotion](./lmd_ghost.md#why-staged-promotion) for the
 reasoning.
 
-> **In ethlambda:** the promote is followed by a second duty for aggregators, described
+> **In ethlambda's Lean Chain:** the promote is followed by a second duty for aggregators, described
 > below: pack a candidate body for the next slot and gossip it as a block body proof.
 
 ## Block body proofs

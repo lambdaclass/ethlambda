@@ -2,9 +2,9 @@
 
 We collect various metrics and serve them via a Prometheus-compatible HTTP endpoint at `http://<http_address>:<metrics_port>/metrics` (default: `http://127.0.0.1:5054/metrics`).
 
-A ready-to-use Grafana + Prometheus monitoring stack with pre-configured [leanMetrics](https://github.com/leanEthereum/leanMetrics) dashboards is available in [lean-quickstart](https://github.com/blockblaz/lean-quickstart).
+For the Lean Chain, a ready-to-use Grafana + Prometheus monitoring stack with pre-configured [leanMetrics](https://github.com/leanEthereum/leanMetrics) dashboards is available in [lean-quickstart](https://github.com/blockblaz/lean-quickstart).
 
-The exposed metrics follow [the leanMetrics specification](https://github.com/leanEthereum/leanMetrics/blob/2719baad8351c9ad5eaf3c8621f33fcec20a1dc7/metrics.md), with some metrics not yet implemented. We have a full list of implemented metrics below, with a checkbox indicating whether each metric is currently supported or not.
+The Lean Chain's metrics follow [the leanMetrics specification](https://github.com/leanEthereum/leanMetrics/blob/2719baad8351c9ad5eaf3c8621f33fcec20a1dc7/metrics.md), with some metrics not yet implemented. The Beacon Chain side has no such specification: its own metrics are among the [Custom Metrics](#custom-metrics-non-leanmetrics) (the "Beacon" sections and Data Column Sidecars), and the validator client's are under [Validator client](#validator-client). We have a full list of implemented metrics below, with a checkbox indicating whether each metric is currently supported or not.
 
 ## Node Info Metrics
 
@@ -12,6 +12,13 @@ The exposed metrics follow [the leanMetrics specification](https://github.com/le
 |--------|-------|-------|-------------------------|--------|---------------|
 | `lean_node_info` | Gauge | Node information (always 1) | On node start | name, version | ✅ |
 | `lean_node_start_time_seconds` | Gauge | Start timestamp | On node start | | ✅ |
+
+On Linux the endpoint also serves the `prometheus` crate's process collector,
+read from `/proc/self` at each scrape: `process_resident_memory_bytes`,
+`process_virtual_memory_bytes`, `process_cpu_seconds_total`,
+`process_open_fds`, `process_max_fds`, `process_threads` and
+`process_start_time_seconds`. They are not part of the leanMetrics spec, and
+other platforms do not export them.
 
 
 ## PQ Signature Metrics
@@ -301,7 +308,8 @@ Per-block phases, in the order a block crosses them, plus `total` for a complete
 | `engine` | The `engine_newPayload` round trip, including its retry ladder | beacon |
 | `verify_struct` | Participant bounds checks and pubkey resolution | lean |
 | `verify_crypto` | The leanVM multi-message aggregate verification | lean |
-| `stf` | The state transition. On beacon this bundles the transition, the state root and the state write | both |
+| `stf` | The state transition. On beacon this bundles the transition and the state root, and excludes `writer_wait`, which is nested inside it | both |
+| `writer_wait` | Beacon only: the importer's blocking hand-off of the post-state to the storage crate's background writer, which waits while the writer's queue is full. Subtracted from `stf`, so `stf` and `writer_wait` do not overlap | beacon |
 | `db_write` | The block write and handing the post-state off to the storage crate's background writer; the state's own encode/diff/commit cost is `lean_state_write_seconds` instead, not this row | lean |
 | `fc_head` | `update_head` | lean |
 | `block_atts` | Replaying the block's own attestations and slashings into fork choice | beacon |
@@ -347,6 +355,7 @@ On an aggregator the distribution therefore carries a structural component: a sp
 | `lean_table_bytes` | Gauge | Estimated byte size of a storage table (key + value bytes) | After each processed block (one update per table); retains its previous value on empty slots | table=`<table_name>` |
 | `lean_state_write_queue_depth` | Gauge | States handed to the background writer but not yet committed | On every hand-off and on every commit | |
 | `lean_state_write_seconds` | Histogram | Time the background writer spends encoding, diffing and committing one state | Per state written | |
+| `lean_state_cache_lookups_total` | Counter | State cache lookups, by the `Store` method that made them, the kind of state asked for, and whether the cache held it | On every `get_state` (and the writer's own parent read), `has_state` and `cached_state` call | method=get_state,has_state,cached_state<br>kind=block,checkpoint<br>result=hit,miss |
 
 **On a beacon follower, watch `lean_table_bytes{table="data_columns"}`.** Every
 other table's series either stays flat or is bounded by pruning; `data_columns`
@@ -366,6 +375,15 @@ and `lean_state_write_seconds` says whether that time went into the encode or
 the commit. A depth that stays at zero means the writer has nothing
 outstanding.
 
+**Read `lean_state_cache_lookups_total` per `method`, not summed.**
+`cached_state` with `kind="block"` is gossip validation's lookup of the voted
+or parent block's state, made once per attestation and aggregate, so it runs far
+more often than the other two and a summed rate is mostly its own. A `get_state`
+or `has_state` miss means the state was not resident and came from the writer's
+buffer or RocksDB. A `cached_state` miss with `kind="checkpoint"` means fork
+choice's `checkpoint_state` rebuilt the state, running `process_slots` up to the
+epoch boundary when the checkpoint's block precedes it.
+
 ### Beacon Gossip Validation
 
 Every beacon gossip message gets a verdict before gossipsub forwards it
@@ -383,36 +401,100 @@ own section. These are ethlambda-specific, not part of the leanMetrics spec.
 | `lean_beacon_gossip_verdict_expired_total` | Counter | Verdicts that arrived after gossipsub evicted the message, so an Accept propagated nothing | When `report_message_validation_result` returns `false` | kind | |
 
 `kind` is the topic kind, with every `data_column_sidecar_{subnet}` sharing the
-label `data_column_sidecar` and every `beacon_attestation_{subnet_id}` sharing
-`beacon_attestation`. `queue` means IGNORE to gossipsub while the chain actor
-still receives the object and parks it; neither the aggregate nor the
-attestation topic ever answers `queue`, since the vote block's post-state is
-either cached or it is not (`IgnoreReason::UnknownBlock`/`StateUnavailable`),
-with nothing to hold the message for. **`verdict_expired_total` should stay at
+label `data_column_sidecar`, every `beacon_attestation_{subnet_id}` sharing
+`beacon_attestation` and every `sync_committee_{subnet_id}` sharing
+`sync_committee`. The gloas topics `execution_payload`,
+`payload_attestation_message`, `execution_payload_bid` and
+`proposer_preferences` are labelled by their own name. `queue` means
+IGNORE to gossipsub while the chain actor still receives the object and parks
+it; of the gloas topics only `execution_payload` answers it, for an envelope
+whose block is not known yet (`block_unknown`), has no post-state yet
+(`block_not_ready`), or has one that is not in the cache the checks read
+(`state_not_cached`, as when the block was imported moments ago; the actor
+verifies the signature itself, so the envelope is forwarded rather than dropped). The aggregate, attestation,
+`payload_attestation_message`, `execution_payload_bid` and `proposer_preferences`
+topics never answer `queue`, since the vote
+block's post-state is either cached or it is not
+(`IgnoreReason::UnknownBlock`/`StateUnavailable`), with nothing to hold the
+message for. **`verdict_expired_total` should stay at
 zero**: a rising count means validation is too slow for gossipsub's message
 cache.
 
 The two topics add reasons the others do not, all `reason` label values on
 `lean_beacon_gossip_validation_total`: `outside_epoch_window`, `covered_bits`
 (aggregate only), `unknown_block`, `state_unavailable`,
-`finalized_not_ancestor`, `ancestry_unknown` on the ignore side;
+`finalized_not_ancestor`, `ancestry_unknown`, `payload_envelope_unseen` and
+`payload_optimistic` (gloas only) on the ignore side;
 `epoch_mismatch`, `no_participants` (aggregate only), `non_zero_data_index`,
 `committee_bits` (aggregate only), `committee_index`, `bits_length` (aggregate
 only), `not_aggregator` (aggregate only), `not_in_committee`,
 `unknown_validator`, `selection_proof` (aggregate only),
 `aggregator_signature` (aggregate only), `aggregate_signature` (aggregate
-only), `target_not_ancestor`, `wrong_subnet` (attestation only) on the reject
-side. `already_seen` and `overloaded` are shared with every other topic.
+only), `target_not_ancestor`, `wrong_subnet` (attestation only), and gloas's
+`data_index_out_of_range`, `same_slot_payload_flag` and `payload_invalid` on the
+reject side. The builder market topics add, on the ignore side,
+`pre_gloas_slot`, `not_current_or_next_slot`, `not_highest_bid`,
+`beyond_lookahead`, `preferences_unseen`, `fee_recipient_mismatch`,
+`parent_payload_unknown`, `gas_limit_incompatible`, `not_on_head_branch`,
+`builder_cannot_cover`, `builder_may_exit`, `slot_started` and
+`impossible_dependent_root`, and on the reject side `execution_payment_nonzero`,
+`block_hash_equals_parent`, `prev_randao`, `unknown_builder`,
+`not_payload_builder`, `inactive_builder` and `dependent_root_too_late`; a bid
+over its size cap is `malformed`.
+The sync committee topics add `sync_committee_unavailable` (the head
+state's committees cannot answer for the message's period) on the ignore side
+and `subcommittee_index` (contribution only) on the reject side; they reuse
+`not_current_slot`, `already_seen`, `covered_bits`, `no_participants`,
+`not_aggregator`, `not_in_committee`, `unknown_validator`, `selection_proof`,
+`aggregator_signature`, `aggregate_signature`, `wrong_subnet` and
+`bad_signature`. `already_seen`, `overloaded` and `unsupported_fork` are shared with the
+other topics: `unsupported_fork` is an ignore reason for a message of a fork this
+build has no gossip rules for, so an honest peer past the fork epoch is not
+scored as a bad decoder. Gloas blocks, data columns, aggregates and attestations
+are validated, so they carry their own verdict reasons instead.
 
-Two permit pools bound the blocking-thread half of validation:
-`gossip_validation_permits` for blocks and columns,
-`attestation_validation_permits` for aggregates and subnet attestations. They
-are deliberately separate: a mainnet slot's worth of aggregates and backbone
+Three permit pools bound the blocking-thread half of validation:
+`gossip_validation_permits` for blocks, columns and envelopes,
+`attestation_validation_permits` for aggregates, subnet attestations and
+payload votes, and `builder_validation_permits` for bids and proposer
+preferences. They are deliberately separate: a mainnet slot's worth of aggregates and backbone
 attestations arrives every slot, not only during a range sync, and sharing one
 pool would let that burst answer `Ignore(Overloaded)` for a block or a column
 instead. Neither pool has a metric of its own yet; a permit exhausted on
 either shows up as `outcome="ignore",reason="overloaded"` on
 `lean_beacon_gossip_validation_total`, for the topics that draw from it.
+
+### Beacon Peer Scoring
+
+Gossipsub peer scoring runs on the beacon wire only; see
+[beacon_wire.md](./beacon_wire.md#peer-scoring) for the parameters and the
+mesh-delivery gate. These are ethlambda-specific, not part of the leanMetrics
+spec.
+
+| Name | Type | Usage | Sample collection event | Labels | Buckets |
+|------|------|-------|-------------------------|--------|---------|
+| `lean_gossipsub_peers_by_score` | Gauge | Gossipsub peers by score band | Every 10 s, in the swarm task | band=non_negative,negative,below_gossip,below_publish,below_graylist | |
+| `lean_gossipsub_score_disconnects_total` | Counter | Peers disconnected for a gossipsub score below the graylist (-16000) | When the 10 s check disconnects one | | |
+| `lean_gossipsub_mesh_delivery_scoring` | Gauge | 1 while mesh message deliveries (P3) are scored, 0 while the head lags the wall clock or is warming up after catching up | Every slot, on the scoring refresh | | |
+
+The bands are mutually exclusive and split at the gossip (-4000), publish
+(-8000) and graylist (-16000) thresholds, so they add up to the peers
+gossipsub knows. `below_graylist` counts the peers that same pass is about to
+disconnect, so it should not hold a value across passes. A persistent
+`below_gossip`/`below_publish` population points at slow peers first: a full
+send queue costs a peer 10 points per dropped message.
+
+### Beacon Block Publication
+
+`POST /eth/v2/beacon/blocks` computes every blob's cells and batch-verifies all
+its cell proofs on a blocking thread before it gossips anything, then builds the
+block's data column sidecars; at the blob cap that is thousands of cells on the
+proposal's critical path. See [rpc.md](./rpc.md#validator-endpoints). This is
+ethlambda-specific, not part of the leanMetrics spec.
+
+| Name | Type | Usage | Sample collection event | Labels | Buckets |
+|------|------|-------|-------------------------|--------|---------|
+| `lean_beacon_publish_data_columns_seconds` | Histogram | Time to compute and verify a published block's cells and build its data column sidecars | On every published block that carries blobs and whose cells verify | | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5 |
 
 ### Beacon Committee Cache
 
@@ -442,6 +524,61 @@ more branches are being imported at once than the cache has room for; each miss
 is a registry scan plus a whole-epoch shuffle on the import thread. `unkeyable`
 is a lookup the cache could not key at all, mostly the genesis state asking
 about its own first epochs, and should be zero on a checkpoint-synced follower.
+
+### Beacon Total Active Balance Cache
+
+The total active balance (the divisor of every attestation's base reward and of
+the sync aggregate's rewards) is one registry pass, and an ordinary block asks
+for it about nine times. `ActiveBalanceCache` in the `Store` keeps it per epoch,
+keyed by the epoch and the block root that fixes it. This is ethlambda-specific,
+not part of the leanMetrics spec.
+
+| Name | Type | Usage | Sample collection event | Labels |
+|------|------|-------|-------------------------|--------|
+| `lean_beacon_total_active_balance_lookups_total` | Counter | Total active balance lookups, by whether the cache served them | On every `ActiveBalanceCacheExt::total_active_balance` call: block processing's attestations and sync aggregate | result=hit,miss,unkeyable |
+
+Expect one miss per epoch per chain, and hits otherwise. `unkeyable` is the
+genesis state asking about its own epoch, and should be zero on a
+checkpoint-synced follower.
+
+### Beacon Justified Balances
+
+Beacon fork choice weighs every vote by the voter's effective balance at the
+justified checkpoint. `justified_balances` (in
+`crates/blockchain/state_transition/src/beacon/fork_choice.rs`) flattens that
+state into one array, keyed by the justified checkpoint and rebuilt on the first
+`get_head` after the checkpoint moves. This is ethlambda-specific, not part of
+the leanMetrics spec.
+
+| Name | Type | Usage | Sample collection event | Labels |
+|------|------|-------|-------------------------|--------|
+| `lean_beacon_justified_balances_lookups_total` | Counter | Snapshot lookups, by whether the cached snapshot served them | On every `justified_balances` call: `get_head`'s weights, the proposer boost, and the reorg helpers | result=hit,miss |
+| `lean_beacon_justified_balances_build_seconds` | Histogram | Time to build one snapshot from the checkpoint state | On every miss, around the registry pass (the checkpoint state lookup is not included) | |
+
+**Read the miss rate against the justified-checkpoint rate**: about one miss
+per justified checkpoint change, so a handful per hour on a healthy chain.
+Misses that track `get_head` calls mean the justified checkpoint is flapping
+between branches, or the snapshot is being replaced between two readers.
+
+### Beacon Epoch Precompute
+
+The beacon chain actor advances the head state across the next epoch boundary
+ahead of time, so the first block of an epoch does not run `process_epoch` on
+the import path. See "Epoch-transition precompute" in
+[`beacon_stf.md`](beacon_stf.md). This is ethlambda-specific, not part of the
+leanMetrics spec.
+
+| Name | Type | Usage | Sample collection event | Labels | Buckets |
+|------|------|-------|-------------------------|--------|---------|
+| `lean_beacon_epoch_precompute_lookups_total` | Counter | Epoch-crossing imports, by whether a precomputed boundary state was cached | On each import whose parent is before the block's epoch start and whose block is at or after it | result=hit,miss | |
+| `lean_beacon_epoch_precompute_seconds` | Histogram | Worker time to advance, flush and hash one state | When a precompute worker finishes | | 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 8 |
+| `lean_beacon_epoch_precompute_started_total` | Counter | Workers started, by trigger | When a worker is spawned | trigger=head,timer | |
+
+**Read the hit ratio against epochs.** On a synced follower nearly every
+epoch-crossing import should hit. Misses mean the worker had not finished (the
+block raced it, see `lean_beacon_epoch_precompute_seconds` against the slot
+duration), the node was syncing, or the entry was evicted from the state cache.
+A `timer` start with no matching `head` start means the last slot was skipped.
 
 ### Beacon Pubkey Cache
 
@@ -481,6 +618,9 @@ spec.
 | `lean_data_column_fetch_failures_total` | Counter | `DataColumnsByRoot` lookups this node gave up on, by reason | On lookup abandonment | reason=no_peers,max_retries | |
 | `lean_blocks_held_for_columns` | Gauge | Blocks held out of fork choice pending their custody columns | On every hold, release, and finality eviction of the held-block set | | |
 | `lean_sidecars_awaiting_parent` | Gauge | Sidecars parked until their block's parent has a post-state | On every park, replay, and finality eviction of the parked set | | |
+| `lean_envelopes_awaiting_block` | Gauge | Gloas execution payload envelopes held until their block is imported | On every hold, release, and finality eviction of the held envelopes | | |
+| `lean_envelopes_awaiting_columns` | Gauge | Gloas execution payload envelopes held until every sampled column is stored | On every hold, release, and finality eviction of the held envelopes | | |
+| `lean_blocks_awaiting_parent_payload` | Gauge | Gloas blocks held until their FULL parent's payload envelope is verified | On every hold, release, and finality eviction of the held blocks | | |
 
 `lean_data_columns_rejected_total` counts the chain checks, which run in the
 p2p layer on every sidecar gossip did not accept: every fetched sidecar, a
@@ -612,6 +752,15 @@ and absent is not the same as zero.
 | `ethlambda_validator_blocks_broadcast_not_imported_total` | Counter | Blocks a node broadcast but could not import into its own database, which is what a 202 means. A subset of `blocks_proposed_total`, not a failure: the block reached the network. Points at that node's execution layer |
 | `ethlambda_validator_blocks_refused_total` | Counter | Blocks deliberately not signed, because this process had already proposed that slot for that validator. Should normally read zero |
 | `ethlambda_validator_block_proposal_failures_total` | Counter | Proposal duties that did not end in a published block, including ones abandoned for overrunning |
+| `ethlambda_validator_envelopes_published_total` | Counter | Execution payload envelopes a beacon node accepted for blocks this client proposed (gloas) |
+| `ethlambda_validator_envelope_failures_total` | Counter | Proposed gloas blocks whose self-built envelope was not published. The block is out and the proposal counts as made, but the slot's payload is withheld, so this is the failure that costs the payload. Should read zero |
+| `ethlambda_validator_payload_attestations_published_total` | Counter | Payload timeliness committee votes a beacon node accepted (gloas) |
+| `ethlambda_validator_payload_attestation_failures_total` | Counter | Slots whose payload timeliness committee duty did not result in published votes |
+| `ethlambda_validator_sync_committee_messages_published_total` | Counter | Sync committee messages a beacon node accepted |
+| `ethlambda_validator_sync_committee_failures_total` | Counter | Slots whose sync committee message duty ended in an error or ran past its slot. A head the node reports optimistic is not a failure: nothing is signed |
+| `ethlambda_validator_sync_contributions_published_total` | Counter | Sync committee contributions this client published as an aggregator. Bursty, like `aggregates_published_total` |
+| `ethlambda_validator_sync_contribution_failures_total` | Counter | Sync aggregation duties that ended in an error or ran past their slot. A subnet with no contribution to fetch is skipped and not counted |
+| `ethlambda_validator_sync_duties_held` | Gauge | Sync committee duties held for the current period |
 | `ethlambda_validator_aggregates_published_total` | Counter | Aggregates accepted by a beacon node. Bursty rather than steady: a validator is selected a few times a day, so hours at zero are normal for a small deployment |
 | `ethlambda_validator_aggregation_failures_total` | Counter | Aggregation duties that ended in no published aggregate, including ones abandoned for overrunning the slot |
 | `ethlambda_validator_fee_recipient_mismatches_total` | Counter | Blocks paying execution rewards to an address this client did not request. Should read zero forever; a non-zero value means every proposal is paying somewhere else |
@@ -637,11 +786,20 @@ a failure. `blocks_proposed_total` counts blocks a node accepted;
 but that the node answering could not import, which is a beacon-node fault
 rather than a validator one and is why it is not folded into either.
 
+Gloas adds two pairs. A gloas proposal ends in a block and then an envelope,
+and the envelope's failure does not fail the proposal: `blocks_proposed_total`
+counts the block, and `envelope_failures_total` the reveal that did not follow.
+The committee vote has the same split as the attestation's: `payload_attestations_published_total`
+counts votes accepted and `payload_attestation_failures_total` the slots whose
+duty produced none. A slot where the node knows no block for the committee to
+vote on is neither, since there was nothing to sign.
+
 Two series should read zero for the life of a healthy deployment, and are the
 ones worth alerting on at any non-zero value rather than on a rate:
 `attestations_refused_total` and `blocks_refused_total` mean this client's own
 guards caught a duty they judged unsafe, and `fee_recipient_mismatches_total`
-means blocks are being proposed that pay someone else.
+means blocks are being proposed that pay someone else. `envelope_failures_total`
+belongs with them on a gloas network.
 
 ## Troubleshooting
 

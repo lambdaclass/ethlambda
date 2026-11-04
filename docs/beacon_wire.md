@@ -10,7 +10,8 @@ gossip announces and what range sync fetches, and the two block protocols serve
 other peers from the same store. Fork choice learns its votes from block bodies
 and from the aggregate topic, which is how it sees votes for the *current* head
 rather than only ones at least a block old; see [Aggregate
-attestations](#aggregate-attestations). It publishes nothing. It also custodies
+attestations](#aggregate-attestations). It publishes only what its Beacon API clients submit (attestations, aggregates,
+blocks with their columns, operations) and relays validated gossip. It also custodies
 and serves a slice of the fulu data column matrix, and backbones a slice of the
 attestation subnets, both sized and selected by its own node id; see [Data
 column sidecars](#data-column-sidecars).
@@ -25,7 +26,7 @@ ethlambda beacon \
 
 No flag is required, but that is only true for a built-in network:
 `ethlambda beacon` on its own follows mainnet, since `--network` defaults to
-`mainnet`. Sepolia and Hoodi are built in too, and any other network is a
+`mainnet`. Sepolia, Hoodi and Platåberget are built in too, and any other network is a
 `--network` naming a directory of published files (`config.yaml` and
 `genesis.ssz`, see [`cli.md`](./cli.md)):
 
@@ -36,16 +37,17 @@ ethlambda beacon --network ./my-network --node-key ./node-key
 
 `genesis_time` and `genesis_validators_root`, and therefore the fork digest,
 are derived from the resolved network: a built-in network (`mainnet`,
-`sepolia`, `hoodi`) carries the two values as constants beside its
-`eth-clients` `config.yaml` and bootnode list, and no genesis state; for a
+`sepolia`, `hoodi`, `plataberget`) carries the two values as constants beside
+its published `config.yaml` and bootnode list, and no genesis state; for a
 loaded network they are read off that directory's own `genesis.ssz`. Nothing
 about startup touches the network to get there. discv5 is forced on and needs no flag either: published mainnet
 bootnodes are largely seed-only, so a crawl is how a peer is reached.
 
 ## The fork digest
 
-Computed once at startup from the resolved network's genesis state, never
-hardcoded as a digest:
+Computed from the resolved network's genesis state and fork schedule, never
+hardcoded as a digest. Startup derives the first one and a running node follows
+the schedule from there (see below):
 
 ```
 epoch        = (now - genesis_time) / (SECONDS_PER_SLOT * SLOTS_PER_EPOCH)
@@ -61,27 +63,67 @@ digest       = base[..4]                                    if epoch <  FULU_FOR
 EIP-7892's, which is why mainnet's digest is `8c9f62fe` rather than fulu's bare
 `82fae541`.
 
-Startup logs the next boundary's epoch and wall-clock time. The digest is
-computed once, so crossing one strands the node on topic names nobody publishes
-to; restart it to pick up the new digest.
+Startup logs the next boundary's epoch, wall-clock time, fork and digest. A
+running node crosses it without a restart (`beacon::transition` in
+`ethlambda-p2p`, driven by `beacon::fork_schedule`). Both fork activations and
+blob-parameter-only forks move the digest, so both are boundaries. Following the
+spec's "Transitioning the gossip" rules, the next digest's topics are joined
+`SUBSCRIBE_LEAD_EPOCHS` before its boundary and the previous digest's topics
+are left `UNSUBSCRIBE_LAG_EPOCHS` after it. At the boundary the node
+publishes and advertises the new digest, bumps its metadata sequence number
+and moves its discv5 admission filter. While the window is open a gossip
+message's fork comes from its own topic's digest, and a `Status` on either
+digest is answered, but range sync starts only from a peer on the current
+digest (or the next one, within clock skew of the boundary).
+
+One gap: the ENR this node serves over discv5 keeps the `eth2` entry it started
+with, because ethrex's `DiscoveryServer` offers no way to replace its record at
+runtime. Peers already connected are unaffected; peers discovering the node
+after a boundary read the stale digest and reject the record.
 
 ## Gossip
 
 Seven global topics, `/eth2/{digest}/{name}/ssz_snappy`, plus two subnet
 families this node's own node id selects a narrow slice of: the data column
 subnets it custodies and the attestation subnets it backbones, both described
-below.
+below. A gloas digest adds four more, `execution_payload`,
+`payload_attestation_message`, `execution_payload_bid` and
+`proposer_preferences`, which `BeaconTopics::for_fork` subscribes under gloas
+digests and not under earlier ones (so one epoch before the fork, when the
+digest is joined). An envelope is validated like a block
+(its stateful half on the blocking pool) and goes to the chain actor on `Accept`
+and on `Queue`, since the actor holds an envelope whose block is not imported
+yet. A payload attestation is validated on the attestation permit pool and goes
+to the actor on `Accept` only: a vote for a block not imported here is dropped,
+since it is valid only within its own slot. Bids and preferences are the
+builder market: they never reach the chain actor. Their rules live in
+`state_transition::beacon::gossip::{execution_payload_bid, proposer_preferences}`,
+the cheap half runs in p2p's triage (`p2p/src/beacon/builder_market.rs`) and the
+stateful half on a permit pool of their own (`builder_validation_permits`), so
+a bid burst cannot starve blocks, columns or attestations. Whatever is accepted
+goes into the node's one shared `BuilderMarket`, which the Beacon API and block
+production read. Neither is ever queued: a message whose parent or dependent
+block is unknown is ignored. A bid is capped at 196,932 decompressed bytes
+(`Reject(Malformed)` above that). The node publishes both: a bid on the digest of
+its slot, preferences on the digest of the proposal slot, which in the epoch
+before gloas is the gloas digest already joined. Envelopes the node publishes
+itself are recorded as known payloads, since gossip never echoes them.
 
 | Topic | Decoded as |
 | --- | --- |
 | `beacon_block` | `SignedBeaconBlock`, fork chosen by the block's slot |
-| `beacon_aggregate_and_proof` | `SignedAggregateAndProof`, phase0 or electra |
+| `beacon_aggregate_and_proof` | `SignedAggregateAndProof`, phase0, electra or gloas |
 | `attester_slashing` | `AttesterSlashing`, phase0 or electra |
 | `voluntary_exit` | `SignedVoluntaryExit` |
 | `proposer_slashing` | `ProposerSlashing` |
 | `bls_to_execution_change` | `SignedBLSToExecutionChange` |
 | `sync_committee_contribution_and_proof` | `SignedContributionAndProof` |
-| `beacon_attestation_{subnet_id}` | `Attestation`, phase0 or electra |
+| `sync_committee_{subnet_id}` | `SyncCommitteeMessage` (joined on request only) |
+| `beacon_attestation_{subnet_id}` | `Attestation`, phase0 or electra's `SingleAttestation` (gloas keeps the latter) |
+| `execution_payload` | `SignedExecutionPayloadEnvelope`, gloas digests only |
+| `payload_attestation_message` | `PayloadAttestationMessage`, gloas digests only |
+| `execution_payload_bid` | `SignedExecutionPayloadBid`, gloas digests only |
+| `proposer_preferences` | `SignedProposerPreferences`, gloas digests only |
 
 `beacon_attestation_{0..63}` is no longer wholly unsubscribed. This node holds
 `SUBNETS_PER_NODE` (2 on mainnet) long-lived subscriptions from that family,
@@ -102,8 +144,9 @@ One deliberate shortfall: the set is computed once at startup and kept for the
 process's lifetime rather than rotating every `EPOCHS_PER_SUBNET_SUBSCRIPTION`
 epochs. Lighthouse does the same, and reads that constant nowhere.
 
-`sync_committee_{0..3}` stays unsubscribed and arrives with the work that reads
-it. `blob_sidecar_{subnet_id}` stays absent permanently: it is deneb's format
+`sync_committee_{0..3}` is not in the startup set either: those subnets are
+joined on demand, see [Sync committee subnets](#sync-committee-subnets).
+`blob_sidecar_{subnet_id}` stays absent permanently: it is deneb's format
 for blobs, deprecated at fulu in favor of the column matrix below.
 
 `data_column_sidecar_{0..127}` is no longer in that absent list. This node
@@ -118,20 +161,25 @@ plus `SUBNETS_PER_NODE`, still far short of a full subscription to every
 attestation, sync-committee and data-column subnet, and narrower still than
 `NUMBER_OF_CUSTODY_GROUPS` columns of custody, which is what a supernode
 would carry alone. A sidecar decodes as
-`fulu::DataColumnSidecar`; the checks it passes before this node keeps or
+the fork-agnostic `DataColumnSidecar` enum, its fork taken from the topic's
+digest (the bytes carry no tag): fulu's names its block by a signed header and
+inclusion proof, gloas's by a slot and block root, with the commitments it is
+checked against living in that block's bid. The checks it passes before this node keeps or
 forwards it are described just below. How a kept sidecar is later served back
 out over req/resp is under [Data column sidecars](#data-column-sidecars).
 
 Every beacon message is held by gossipsub until it has a verdict
 (`validate_messages()` is on for this wire only). Blocks, data column
-sidecars, aggregates and subnet attestations are all validated by fulu's
-gossip rules (`ethlambda_state_transition::beacon::gossip`, one module per
+sidecars, aggregates, subnet attestations and the four operation topics are all
+validated by fulu's gossip rules, or (operations aside) gloas's modified ones
+from the fork on (`ethlambda_state_transition::beacon::gossip`, one module per
 topic family): the checks that need no state run inline in the p2p actor, the
 rest on a bounded `spawn_blocking` task whose verdict comes back to the actor
 (`crate::beacon::verdict`). Two permit pools bound how many of these run at
 once, so a burst on one family cannot starve another:
 `gossip_validation_permits` for blocks and columns,
-`attestation_validation_permits` for aggregates and subnet attestations. A
+`attestation_validation_permits` for aggregates, subnet attestations and the
+operation topics. A
 mainnet slot carries up to `MAX_COMMITTEES_PER_SLOT *
 TARGET_AGGREGATORS_PER_COMMITTEE` aggregates alone, arriving every slot rather
 than only during a range sync, which is why that traffic needs a pool of its
@@ -149,10 +197,155 @@ reaches it at all, on any outcome: verifying and relaying it is the whole of
 what this node owes the topic (see above), so there is nothing further for the
 chain actor to do with one.
 
-The remaining five global topics are decoded, logged at `debug`, and IGNOREd,
-since nothing consumes them; an undecodable payload on any topic is REJECTed.
-Nothing is published on any topic, columns included: nothing this node can
-produce today would be signature-valid.
+The rules above are fulu's, except that blocks, data columns, aggregates and
+subnet attestations also have gloas rules. A gloas aggregate has electra's bytes
+but its own progressive `Attestation`, so it decodes to its own
+`SignedAggregateAndProof::Gloas` (the signed root differs); a gloas subnet
+attestation is electra's `SingleAttestation` unchanged. In both, `data.index` is
+the payload flag (0 or 1), and a vote for the full payload (1) is IGNOREd until
+the block's envelope has been seen and its payload validated
+(`verify_attestation_payload_status`). Gloas is a followed fork, so a block at
+a gloas slot that fails to decode is REJECTed like one at any other followed
+fork; `unsupported_fork` is kept for a fork the node does not follow
+(`ForkName::is_followed`), none today. A gloas aggregate's aggregation bits are
+an unbounded progressive bitlist, so one longer than electra's type bound is
+REJECTed first, reading its length without expanding it, since expanding is
+what the seen-set check does before any other.
+
+Three deliberate departures from the gloas gossip rules, each for want of state
+this node does not keep. Where the specification rejects a message whose block
+failed validation, this node (having no bad-block cache) cannot tell that from
+a block it has not finished importing, so it queues or ignores instead; the
+matching `reject_block_failed_validation` vectors are in `SKIPPED`. An
+`execution_payload` whose block state is not in the cache p2p reads (a parent
+imported moments ago, say) is queued and forwarded to the chain actor, which
+verifies every envelope itself, without being propagated. And a
+`payload_attestation_message` is applied to fork choice after p2p verified its
+signature, with the actor re-checking only the store-state conditions (known
+block, current slot, committee seat).
+
+`voluntary_exit`, `proposer_slashing`, `attester_slashing` and
+`bls_to_execution_change` are validated in p2p like aggregates, by
+`gossip::operations`: the specification's `validate_*_gossip` functions
+(consensus-specs v1.7.0-beta.1), run against the fork-choice head's post-state
+as it is, with no state advance and no `process_*`. The seen records (the
+first valid exit or credential change per validator, proposer slashing per
+proposer, and the validators an attester slashing slashes) live in
+`SeenOperations`, are recorded only on `Accept` and never pruned, so an
+operation a block already included and a peer re-gossips is IGNOREd rather than
+REJECTed. An attester slashing's range and slashability checks run before its
+BLS checks. What Accepts goes into `Store::operation_pool`, which block
+production packs from (see [rpc.md](./rpc.md#validator-endpoints)). The rules
+are electra's shapes against an electra or fulu head: under a gloas head every
+operation is IGNOREd (`state_unavailable`), and a gloas-shaped attester
+slashing is IGNOREd (`no_consumer`) at decode, like a phase0-shaped one.
+
+`sync_committee_contribution_and_proof` is decoded, logged at `debug`, and
+IGNOREd, since nothing consumes it; an undecodable payload on any topic is
+REJECTed.
+
+Publication runs on the Beacon API's `POST /eth/v2/beacon/blocks`, the only
+path that puts a block of this node's own on the wire. It gossips the block on
+`beacon_block`, then, if it carries blobs, all 128 data column sidecars, each on
+`data_column_sidecar_{compute_subnet_for_data_column_sidecar(index)}` whether or
+not this node custodies that subnet (publishing to a subnet one has not joined
+goes through fanout), all under the digest the block's slot falls in. Operations
+posted to the `pool/*` routes are published on their topics the same way, under
+the digest of the wall-clock slot.
+
+### Peer scoring
+
+Gossipsub peer scoring is on for this wire only
+(`crate::beacon::scoring`). The parameters are lighthouse's
+(`gossipsub_scoring_parameters.rs`), ported formula for formula; Grandine,
+Teku and Lodestar use the same constants, so thresholds mean the same thing
+here as on most of mainnet.
+
+| Threshold | Score | Effect |
+| --- | --- | --- |
+| gossip | -4000 | no IHAVE/IWANT to or from the peer |
+| publish | -8000 | left out of this node's publishes |
+| graylist | -16000 | every RPC ignored, and the peer is disconnected |
+
+| Topic | Weight | Mesh deliveries (P3) |
+| --- | --- | --- |
+| `beacon_block` | 0.5 | scored |
+| `beacon_aggregate_and_proof` | 0.5 | scored |
+| `beacon_attestation_{0..63}` | 1/64 each | scored |
+| `voluntary_exit`, `proposer_slashing`, `attester_slashing` | 0.05 each | off |
+
+Columns, sync committee contributions and BLS changes carry no topic
+parameters. Only Prysm scores columns. This node `Ignore`s every contribution
+and change (no consumer), and a delivery is only credited once accepted, so
+scoring P3 there would penalize every mesh peer for this node's own gap. All
+64 attestation subnets get parameters, not just the backbone ones, because
+aggregator duties join others at runtime.
+
+Three differences from lighthouse:
+
+- `mesh_n` is this node's `D` (8), not lighthouse's 5. It only enters the
+  first-message-delivery cap.
+- **P3 waits for this node to keep up.** Lighthouse joins these topics only
+  once synced, so it has no mesh while it catches up. This node subscribes at
+  startup, and while catching up it `Ignore`s every aggregate and attestation
+  voting for a block it has not imported. A mesh peer credited with no
+  aggregates scores below the graylist, so a restart would graylist the whole
+  aggregate mesh because of this node's lag. `MeshDeliveryGate` turns P3 off
+  while the head lags the wall clock by more than
+  `MESH_DELIVERY_MAX_HEAD_LAG` slots, and back on only after an epoch within
+  that lag, so the counters have refilled. While P3 is off its threshold and
+  weight are zero but its cap is not, so the counters keep counting to their
+  real ceiling. `SyncStatus` cannot serve as this gate: on the mainnet
+  follower it reported `synced` through a 10-minute catch-up up to 98 slots
+  behind, since its network-stall rule reads a lagging freshest-known block
+  as a stalled network.
+- **Leaving a topic waits out the peers' backoff.** Gossipsub's default
+  backoff after unsubscribing (10 s) is shorter than its prune backoff
+  (60 s), and a rust-libp2p peer that sees a mesh peer unsubscribe backs off
+  from it for the longer one, which the leaver's PRUNE cannot shorten. An
+  aggregator subnet left when its duty expires and rejoined within that
+  window for the next one (a duty in the last slots of epoch N, none in N+1,
+  one in N+2) re-grafts into peers that reject the graft and charge a
+  behaviour penalty. `PRUNE_BACKOFF` sets both backoffs to the prune value,
+  so the node waits out the same window and is not penalized. Neither
+  consensus-specs nor lighthouse sets these: the spec defers gossipsub v1.1's
+  extra parameters, and lighthouse keeps the defaults.
+
+The block, aggregate and attestation parameters depend on the active
+validator count, so the p2p actor rebuilds them every slot from the head's
+pinned current-epoch shuffling (`CommitteeCache::head_current_committees`)
+and hands them to the swarm. The swarm starts on lighthouse's placeholder (32
+validators, P3 off) until the first refresh, which runs at startup. Every 10
+s the swarm task disconnects peers below the graylist. There is no ban list:
+a peer's negative score is kept for `retain_score` (100 epochs) after it
+leaves, so a peer that reconnects comes back graylisted and is dropped again.
+
+Around a fork-digest boundary the node holds two digests' topics, and every
+held digest gets the whole parameter set (exits and slashings included),
+scored by its role:
+
+| Digest | Topic weights | P3 |
+| --- | --- | --- |
+| upcoming, joined `SUBSCRIBE_LEAD_EPOCHS` ahead | as above | off: nothing is published under it yet |
+| current | as above | gated as above |
+| previous, held `UNSUBSCRIBE_LAG_EPOCHS` after | 0 | off |
+
+- **Parameters before joins.** `transition::apply` hands the swarm every held
+  digest's parameters before it subscribes, on the same command channel.
+  Gossipsub tracks a mesh peer on a topic only if the topic had parameters
+  when the peer was grafted; parameters installed later never reach that
+  mesh.
+- **The previous digest weighs nothing.** Its traffic moves to the new
+  digest at the boundary, so its delivery counters drain. Still scored, the
+  aggregate topic alone would graylist an honest mesh peer 53 slots after the
+  boundary (at 1M validators), before the topic is left, and leaving it would
+  charge every mesh peer the sticky P3b. Lighthouse zeroes the same weights
+  (`remove_topic_weight_except`).
+- **A switch restarts the warmup.** The new digest's counters start empty,
+  but its mesh, formed before the boundary, can already be past the
+  deliveries' activation (one epoch for blocks and aggregates). P3 on the new
+  digest therefore waits `MESH_DELIVERY_WARMUP_SLOTS`, as after a catch-up.
+  Lighthouse joins two slots ahead, so activation alone covers it there.
 
 ## Aggregate attestations
 
@@ -236,6 +429,26 @@ lighthouse follower with no validators, which verifies and relays its own
 backbone subnets while `should_process_attestation` keeps them out of its fork
 choice.
 
+## Sync committee subnets
+
+Sync committee gossip is joined on demand, never at startup. A validator
+client's `POST /eth/v1/validator/sync_committee_subscriptions` reaches
+`P2PServer` as `subscribe_sync_committee_subnets`, which subscribes each
+subnet (`sync_committee_{0..3}`) immediately under every digest the node holds,
+until the request's `until_epoch` (exclusive). Validating all four subnets
+permanently would cost every follower up to a committee's worth of BLS
+verifications per slot, so nothing is joined without a request.
+
+| Piece | Behaviour |
+| --- | --- |
+| State | `BeaconWire::sync_committee_subnets`: subnet to `until_epoch`, extended with the later of two requests; ids of 4 or more are dropped |
+| Advertised | MetaData v2 and v3 `syncnets` is built from that set, and the sequence number moves whenever the set does. The ENR carries no `syncnets` entry: ethrex's `DiscoveryServer` cannot replace the served record at runtime, the same known gap as the `eth2` entry |
+| Left | the 12 s sweep leaves a subnet once the wall epoch reaches its `until_epoch`, and prunes the sync committee pool |
+| Fork boundaries | `beacon::transition::apply` subscribes the set under each digest it joins and unsubscribes it under each it leaves, like the aggregator attestation subnets |
+| Validation | the cheap half runs inline, the stateful half on `spawn_blocking` under `SYNC_VALIDATION_PERMITS`, a pool of its own since the burst coincides with the attestations'. An accepted message is pooled with the seats its signature verified; neither it nor a contribution reaches the chain actor |
+| Contributions | `sync_committee_contribution_and_proof` is always subscribed, validated, relayed and pooled for block production |
+| Publishing | the Beacon API pools its own submissions first, then publishes on each subnet its validator holds a seat in, under the digest the message's slot names, and marks them seen so a peer's echo is ignored |
+
 ## Request/response
 
 | Protocol | Direction |
@@ -248,6 +461,8 @@ choice.
 | `beacon_blocks_by_root/2` | both |
 | `data_column_sidecars_by_root/1` | both |
 | `data_column_sidecars_by_range/1` | both |
+| `execution_payload_envelopes_by_range/1` | both |
+| `execution_payload_envelopes_by_root/1` | both |
 
 The two data column sidecar protocols are registered because this node
 custodies the columns its node id selects and can answer for them out of
@@ -355,6 +570,41 @@ fails. A mismatch ends the stream, logged at `warn` with both digests: the one w
 reach it in good faith is a blob schedule of ours that has fallen behind the
 network's.
 
+### Execution payload envelopes
+
+Both gloas envelope protocols are registered `Full`: the server answers, and
+the client (`req_resp/envelope_client.rs`) asks. A chunk carries one
+`SignedExecutionPayloadEnvelope` under the fork digest of its block's epoch.
+The envelope has no slot of its own, so the epoch comes from
+`payload.slot_number`, which `verify_execution_payload_envelope` pins to the
+block's slot. A chunk whose digest names no gloas-or-later scheduled fork, or
+not the digest its slot implies, ends the stream.
+
+| Protocol | Served from |
+| --- | --- |
+| `execution_payload_envelopes_by_root/1` | a point lookup per root in `Table::ExecutionPayloadEnvelopes`; unknown roots are left out, answers follow the order asked |
+| `execution_payload_envelopes_by_range/1` | the canonical blocks of the window (`BlockRoots`), each envelope kept only when the next canonical block builds on its payload; the head's own envelope only when the head node is FULL (`Store::head_payload_status`, which pairs the status with the head root it describes, so a stale status reads as unknown and the envelope is withheld) |
+
+Both are bounded by `MAX_REQUEST_PAYLOADS`: a by-root list over it fails to
+decode, and a by-range `count` over it is truncated, which the specification's
+"Clients MAY limit the number of payload envelopes in the response" allows.
+A by-range request starting below `Store::anchor_slot` gets
+`RESOURCE_UNAVAILABLE`, and a window before gloas is simply empty.
+
+The client asks in two situations. By root: the chain actor's
+`FetchRequest.needs_envelope` (a block whose child waits on its payload) starts
+a lookup with the block fetch's dedup, peer choice and retry ladder; a give-up
+is recovered by the actor's per-slot re-ask. By range: after a
+`beacon_blocks_by_range/2` answer for a span that reaches gloas has been handed
+to the actor, the same peer is asked for that span's envelopes, and range sync
+holds the next block request until that answer is checked and forwarded (or has
+failed). The pause exists because the actor keeps an envelope whose block has
+not imported only briefly and in small numbers, so a batch's envelopes must
+arrive before the next batch's blocks do. Everything fetched goes through the
+same rules as an `execution_payload` gossip message
+(`beacon/envelope_checks.rs`) before the actor sees it; a `Queue` verdict is
+forwarded too.
+
 ### Data column sidecars
 
 Both protocols are registered `Full`, since with the columns on disk this node
@@ -402,9 +652,10 @@ the availability gate. Nothing waits on the answer, so a short, empty or
 refused one costs nothing and is not retried; the per-block path is the
 backstop.
 
-Since the column request is aimed by custody, a batch reaching fulu is held
-back, blocks included, until every custody column has a known custodian among
-the connected peers. Lighthouse's range sync holds its batches the same way.
+Since the column request is aimed by custody, a batch whose last slot is fulu
+or later is held back, blocks included, until every custody column has a known
+custodian among the connected peers. Lighthouse's range sync holds its batches
+the same way.
 Right after startup, custody is known for almost no peer, since a peer's
 custody arrives with its `metadata/3` answer after it connects. A mainnet
 follower's first batch after a fresh checkpoint sync went out 5 s after
@@ -533,6 +784,9 @@ Two of these advertise less, or more, than they look like:
   for silence there, and claiming none while serving two loses the peers
   looking for precisely that. It used to be all-unset, which was honest while
   this node held no subscription at all.
+- `syncnets` names the sync committee subnets joined on a validator client's
+  request, so it is all-unset until one asks. It is advertised in MetaData
+  only; the ENR has no `syncnets` entry.
 - `cgc` advertises `CUSTODY_REQUIREMENT`, the floor below which peers may
   reject a record outright, not `sampling_size(CUSTODY_REQUIREMENT)`, the
   larger number of columns this node actually custodies, stores and serves
@@ -549,7 +803,7 @@ as a query filter, so a `quic`-only record is invisible to it.
 
 | Metric | Meaning |
 | --- | --- |
-| `lean_beacon_gossip_messages_total{topic,result}` | Gossip received, by topic and by `decoded` / `decode_failed` / `decompress_failed` |
+| `lean_beacon_gossip_messages_total{topic,result}` | Gossip received, by topic and by `decoded` / `decode_failed` / `decompress_failed` / `unsupported_fork` |
 | `lean_beacon_gossip_validation_total{kind,outcome,reason}` | Gossip verdicts, now including `beacon_aggregate_and_proof` and `beacon_attestation`; see [metrics.md](./metrics.md#beacon-gossip-validation) |
 | `lean_beacon_gossip_verdict_expired_total{kind}` | Verdicts that came too late to propagate anything; should stay at zero |
 | `lean_beacon_status_digest_mismatch_total` | Handshakes seen from another fork digest |
@@ -560,6 +814,10 @@ as a query filter, so a `quic`-only record is invisible to it.
 | `lean_beacon_aggregate_end_to_end_seconds` | Wire to fork choice, for aggregates applied on arrival |
 | `lean_beacon_aggregate_total{outcome}` | Aggregates by `applied`, `invalid`, `known_subset` or `queue_full` |
 | `lean_beacon_aggregates_deferred` | Aggregates held until their own slot has passed |
+| `lean_gossipsub_peers_by_score{band}` | Gossipsub peers by score band; see [Peer scoring](#peer-scoring) |
+| `lean_gossipsub_score_disconnects_total` | Peers disconnected for a score below the graylist |
+| `lean_gossipsub_mesh_delivery_scoring` | 1 while P3 is scored, 0 while the head lags or is warming up |
+| `lean_beacon_publish_data_columns_seconds` | Time to compute and verify a published block's cells and build its sidecars; see [metrics.md](./metrics.md) |
 
 The four aggregate histograms no longer cover what they used to: gossip
 validation (committees, all three signatures, the seen caches) runs in p2p now
@@ -601,6 +859,10 @@ cargo run --profile release-fast -p ethlambda --bin ethlambda -- beacon \
   --gossipsub-port 9001
 ```
 
+gossipsub's own warnings, chiefly the send-queue-full line a slow peer earns
+once per heartbeat, are capped at ERROR by default; add
+`libp2p_gossipsub=warn` to `RUST_LOG` to see them.
+
 Within 5 seconds:
 
 ```
@@ -608,18 +870,21 @@ Derived the mainnet wire parameters  genesis_time=1606824023 genesis_validators_
 No fork or blob-schedule boundary is scheduled
 Custodying data columns  columns=[…]
 Backboning attestation subnets  subnets_per_node=2 subnets=[…]
-Advertising cgc=4 while subscribing to no sync committee subnet, and publishing nothing
+Advertising cgc=4; sync committee subnets are joined only on a validator client's request
 Beacon P2P node started  socket=0.0.0.0:9001 fork_digest=8c9f62fe topics=17 columns=8 attestation_subnets=[…]
 HTTP server listening  addr=127.0.0.1:5054
 Starting discv5 discovery  discovery_addr=0.0.0.0:9002 seeds=17 total_bootnodes=17
 Local ENR  enr=enr:-…
 ```
 
-The `Advertising cgc=…` line names what is still true: this node subscribes to
-no sync-committee subnet and publishes nothing of its own. Storing and serving
-the columns it custodies (see [Data column
-sidecars](#data-column-sidecars)) is no longer part of that gap, and neither is
-the attestation subnet backbone.
+The `Advertising cgc=…` line names what is true of sync committees: this node
+subscribes to no sync-committee subnet at startup, and joins one only when a
+validator client asks (see [Sync committee
+subnets](#sync-committee-subnets)).
+
+It publishes only what its Beacon API clients submit (attestations, aggregates,
+sync committee messages, blocks with their columns, operations), plus relayed
+validated gossip.
 
 `seeds=17` proves the built-in list parsed; a lower number means a bootnode
 ENR was skipped with a warning. `topics=17` proves the subscription set: the 7

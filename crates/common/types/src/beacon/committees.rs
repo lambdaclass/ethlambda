@@ -54,7 +54,7 @@ use crate::beacon::signing::compute_epoch_at_slot;
 /// # Why the active set is not memoized on `epoch` or `seed` alone
 ///
 /// `get_active_validator_indices` reads `activation_epoch` and `exit_epoch`
-/// off every validator in `state.validators()`, so it is a function of the
+/// off every validator in `state.iter_validators()`, so it is a function of the
 /// state's registry, not of `epoch` or `seed` alone. Two different states can
 /// share an epoch number, or even a seed (it comes from a RANDAO mix fixed
 /// before either state's fork point, so two sibling branches diverging
@@ -102,6 +102,13 @@ impl EpochCommittees {
     /// return, read off this type instead of rescanning the registry for it.
     pub fn committees_per_slot(&self) -> u64 {
         self.committees_per_slot
+    }
+
+    /// How many validators are active in this epoch: the shuffle is a
+    /// permutation of exactly that set, so its length is the count without
+    /// another registry scan.
+    pub fn active_validator_count(&self) -> u64 {
+        self.shuffled.len() as u64
     }
 
     /// The committee at `slot` with `index`.

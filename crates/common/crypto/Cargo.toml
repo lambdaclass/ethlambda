@@ -10,7 +10,10 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+blst = "0.3.16"
+ethlambda-metrics.workspace = true
 ethlambda-types.workspace = true
+rayon.workspace = true
 
 leanvm.workspace = true
 postcard.workspace = true

@@ -69,18 +69,26 @@
 //! [specs]: https://github.com/ethereum/consensus-specs
 
 pub mod aggregate;
-pub mod attestation_pool;
 pub mod block_production;
-pub mod bls;
+pub mod builder_market;
+/// The specification's `bls` module, which lives in `ethlambda-crypto` so the
+/// beacon pools in `ethlambda-storage` can aggregate signatures.
+pub use ethlambda_crypto::bls;
+#[cfg(test)]
+mod bls_fixtures;
 pub mod das;
+pub mod data_columns;
 pub mod fork_choice;
 pub mod genesis;
+pub mod gloas_block_production;
 pub mod gossip;
 pub mod hash;
 pub mod helpers;
 pub mod kzg;
+pub mod payload_attestation_pool;
 pub mod precheck;
 pub mod stf;
+pub mod sync_committee_pool;
 pub mod upgrade;
 
 mod lean_boundary;
