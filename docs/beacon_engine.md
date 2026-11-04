@@ -146,9 +146,11 @@ take the head from a `VALID` one on attestation weight, and then requires the
 head to fall back when the `SYNCING` branch turns out to be invalid.
 
 An invalidated block leaves fork choice by having its `LiveChain` index row
-deleted. That is sufficient because `Store::block_index()` is the only source
-`filter_block_tree`, `compute_node_weights` and `walk_head` read: a root with no
-row contributes no weight to any ancestor and can never be walked to. The block
+deleted. That is sufficient because `Store::block_index()` is the only block
+source `filter_block_tree`, `compute_node_weights` and `walk_head` read: a root
+with no row contributes no weight to any ancestor and can never be walked to.
+The deletion also marks the store's cached fork-choice weights stale, so the next
+head computation rebuilds them without the removed blocks. The block
 and its state stay in their own tables, so an operator can still inspect what
 was rejected.
 

@@ -402,8 +402,9 @@ Three places in the gloas head read something the specification would abort on,
 because a live node holds gaps a fixture tree never has. Each is marked
 "Implementation choice, not spec text" at its definition. The head the node
 runs is `walk_head` (through `get_head_node`) over the weights of
-`compute_node_weights`; the spec-literal references carry the same tolerances so
-that the tests compare like with like.
+`cached_node_weights`, the store's cached vote weights, which the tests hold
+equal to `compute_node_weights`; the spec-literal references carry the same
+tolerances so that the tests compare like with like.
 
 - **Pruned votes** (`compute_node_weights`; in the references,
   `get_attestation_score`, and through it `is_head_weak` and
