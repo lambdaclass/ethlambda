@@ -25,7 +25,22 @@ spawned-concurrency.workspace = true
 futures = "0.3"
 tokio-stream = "0.1"
 
-libp2p = { version = "0.57.1", features = ["full"] }
+# Only the transports, muxers and behaviours the swarm is built from: `full`
+# would also pull dns, mdns, websocket, relay, kad and the rest, each with
+# its own dependency tree (hickory-dns among them) that nothing here uses.
+libp2p = { version = "0.57.1", features = [
+    "ed25519",
+    "gossipsub",
+    "identify",
+    "macros",
+    "noise",
+    "quic",
+    "request-response",
+    "secp256k1",
+    "tcp",
+    "tokio",
+    "yamux",
+] }
 
 # Mainnet beacon peers refuse a yamux-only muxer proposal, so the TCP transport
 # has to offer mplex too. The libp2p facade dropped its `mplex` re-export when
