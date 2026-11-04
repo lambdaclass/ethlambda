@@ -291,39 +291,31 @@ pub fn process_eth1_data_reset(state: &mut BeaconState) -> Result<()> {
 /// and since effective balance feeds the shuffling seed's weighting and every
 /// reward, that would churn far more than it measures.
 pub fn process_effective_balance_updates(state: &mut BeaconState) -> Result<()> {
-    // Decided in one pass and applied in another: `validator_mut` clones the
-    // element into the update buffer on every call, whether or not it is
-    // then written (see its own doc), so deciding and writing in one combined
-    // pass would buffer and rehash the whole registry instead of only the
-    // validators that actually move. Collecting the decisions first also
-    // keeps this fork-independent, which matters because every fork runs
-    // this step unchanged.
     // The specification reads `state.balances[index]` for every validator, so
     // a balance list shorter than the registry fails at its first missing
-    // entry. Checked here because the zip below would stop at it silently.
+    // entry. Checked here because the paired pass below would stop at it
+    // silently.
     let balance_count = state.iter_balances().len();
     if balance_count < state.validator_count() {
         return Err(Error::UnknownValidator(balance_count as ValidatorIndex));
     }
-    let mut updates = Vec::new();
-    // Zipped rather than indexed: step 3 only writes the balances that changed,
-    // so `balance(index)` would be a tree descent for most validators.
-    for (index, (validator, balance)) in state
-        .iter_validators()
-        .zip(state.iter_balances())
-        .enumerate()
-    {
+    // One in-order pass through the registry's write cursor, with the balances
+    // read in step. It copies a leaf only for a validator whose effective
+    // balance changes and keeps every other leaf (and its hash) as it was;
+    // this stays fork-independent, which matters because every fork runs this
+    // step unchanged.
+    state.try_update_validators_with_balances(|validator, balance| {
         if leaves_hysteresis_band(validator.effective_balance, balance)? {
             let effective = (balance - balance % preset::EFFECTIVE_BALANCE_INCREMENT)
                 .min(preset::MAX_EFFECTIVE_BALANCE);
-            updates.push((index as ValidatorIndex, effective));
+            // Equal to the old value when capped at the maximum: checked before
+            // the copy, so a validator already at its ceiling dirties nothing.
+            if effective != validator.effective_balance {
+                validator.make_mut().effective_balance = effective;
+            }
         }
-    }
-
-    for (index, effective) in updates {
-        state.validator_mut(index)?.effective_balance = effective;
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Whether `balance` has moved far enough from `effective_balance` for the

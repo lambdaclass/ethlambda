@@ -148,29 +148,24 @@ A `NOT_VALIDATED` verdict is not enough on its own. The block must also either
 1. have a parent this node has already recorded an execution hash for, or
 2. be at least `--safe-slots-to-import-optimistically` behind the wall clock.
 
-Condition 1 is `store.beacon_el_block_hash(parent_root).is_some()`, and that hash
-is written when a block is *imported*. So it asks whether this node imported the
-parent and saw its payload, not whether the parent is post-merge.
+Condition 1 is `store.beacon_el_block_hash(parent_root).is_some()`: the
+specification's `is_execution_block(parent)`, read off a cache of the parent's
+payload hash rather than by decoding the block. The cache holds a hash for every
+post-merge block the store has, and none for a pre-merge block (a zero payload
+hash is not an execution block). It is filled at import, for the checkpoint
+anchor when the store is built, and on resume for the unfinalized window.
 
 The horizon guards against a poisoned *merge transition* block, whose parent hash
-names an execution block nobody can produce. Once a node is importing a
-post-merge chain every block's parent carries a recorded hash, so condition 1
-carries each one and condition 2 stops mattering.
+names an execution block nobody can produce. Once a node is on a post-merge chain
+every block's parent has a recorded hash, so condition 1 carries each one and
+condition 2 stops mattering.
 
-The exception is the first block after a checkpoint-sync anchor. The anchor is
-never imported and never asked about (see [The anchor is assumed
-valid](#the-anchor-is-assumed-valid)), so no execution hash is recorded for it
-and its child fails condition 1. Paired with an execution client that is itself
-still syncing, and so answers `SYNCING` to every `newPayload`, that child has
-only condition 2 left and the follower's head sits at the anchor until the
-horizon admits it.
-
-The wait is `--safe-slots-to-import-optimistically` minus however far the anchor
-already trails the wall clock, which for a finalized anchor is most of it:
-measured against mainnet on 2026-09-15, an anchor 85 slots back cleared in about
-9 minutes rather than the full 128 slots. It costs that once per sync. Importing
-that block records its hash, so every descendant takes condition 1 and the
-backlog cascades.
+The anchor is never imported and never asked about (see [The anchor is assumed
+valid](#the-anchor-is-assumed-valid)), so its hash is cached when the store is
+built; only the hash, not a verdict. That is what lets the first block after a
+checkpoint-sync anchor take condition 1 even while the execution client is still
+syncing and answers `SYNCING` to every `newPayload`. A restart empties the cache,
+so resume rebuilds it from the stored blocks.
 
 ### `latestValidHash`
 

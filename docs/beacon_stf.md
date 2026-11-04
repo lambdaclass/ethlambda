@@ -289,19 +289,48 @@ below): persistent Merkle trees in the shape of the SSZ one, modeled on the
   writes pending is still correct but computed on a throwaway copy, and the
   store flushes a state before caching it, since a shared `Arc` cannot be
   flushed later.
+- **A pass that writes most of a list uses the write cursor instead.**
+  `List::iter_cow` (and `try_update_each`, its closure form) walks the list in
+  order and copies a leaf only when a write in it changes something, comparing
+  against the original at the leaf's end and keeping the original leaf, its
+  `Arc` and its hash if nothing differs. Nothing goes through the buffer, so a
+  full sweep avoids a map entry and a sorted copy per element. The changed leaves are swapped into the tree
+  when the cursor is dropped, which rebuilds only the paths to them; a changed
+  composite element's root is computed then, on the state-transition thread. Writes pending
+  when the pass starts are applied first. `BeaconState::registry_mut` hands out
+  `validators` and `balances` as disjoint borrows, so a pass can write one while
+  reading the other. The balance application of `process_rewards_and_penalties`
+  and both `process_effective_balance_updates` run this way: they move
+  together, since once the rewards write bypasses the buffer, the effective
+  balance pass would otherwise pay a tree descent per `balances()[i]` instead of a
+  buffer hit.
 
 The access pattern matters. `state.validator(i)` and `state.balance(i)` are tree
 descents, cheap next to a hash but far from an array index, and they add up
 when a helper calls them once per validator:
-`get_total_active_balance` builds the active-index `Vec` and then reads every
-index back, and runs several times per block (once per attestation through
-`get_base_reward_per_increment`, once per execution request through the churn
-limits). In the 2026-09-28 import profile, those per-index reads and the
-repeated whole-registry scans were the largest cost left after hashing. A loop
-over the registry should walk `iter_validators()`, zipped with
-`iter_balances()` where it needs both. The total active balance is the obvious
-candidate for computing once per epoch rather than per call, once it is shown
-that no block operation changes it mid-epoch.
+`get_total_active_balance` used to build the active-index `Vec` and then read
+every index back, and runs several times per block (once per attestation through
+`get_base_reward_per_increment`, twice per sync aggregate, once per execution
+request through the churn limits). In the 2026-09-28 import profile, those
+per-index reads and the repeated whole-registry scans were the largest cost left
+after hashing. A loop over the registry should walk `iter_validators()`,
+zipped with `iter_balances()` where it needs both; `get_total_active_balance`
+now does, in one pass.
+
+Block processing does not even pay that pass more than once per epoch. The
+total is cached in `ActiveBalanceCache` (`crates/storage/src/active_balance_cache.rs`),
+held by the `Store` beside the committee cache and consulted through
+`ActiveBalanceCacheExt::total_active_balance`. The key is the epoch plus the
+block root at the last slot of the epoch before it: effective balances are
+written only by that epoch's `process_effective_balance_updates`, and every
+activation or exit lands at least `MAX_SEED_LOOKAHEAD` epochs ahead, so no block
+inside the epoch can move the total, and two states agreeing on that root agree
+on it. The cache lives outside the state, so it adds no field to `BeaconState`
+and no SSZ concern; callers with no store (spec runners, block production,
+tests) hold a fresh `ActiveBalanceCache::default()`. Epoch processing, churn
+helpers and fork choice keep calling the uncached one-pass
+`get_total_active_balance`. In debug builds every hit is cross-checked against a
+fresh computation.
 
 Epoch steps 1-3 (justification, inactivity updates, rewards) follow that rule
 through `helpers::participation`. One walk of `iter_validators()`, zipped with
@@ -496,6 +525,30 @@ Two new handlers, `on_execution_payload_envelope` and
 `on_payload_attestation_message`, join the spec's list of ways to change the
 store.
 
+Fork choice has the same problem on a longer loop: `get_head` weighs every
+validator's latest vote by the voter's balance at the justified checkpoint, and
+the boost needs the total balance of that state's active, unslashed
+validators. Both read one
+`JustifiedBalances` snapshot (`ethlambda-types`, held in the store's
+`BeaconScratch`) instead of a `validator(i)` descent per vote and a registry
+scan per boost. It is built from `checkpoint_state(justified)` only, keyed by
+the checkpoint it came from, so a moved justified checkpoint is a miss with no
+hook on the writers; it holds a zero for validators that are inactive or
+slashed, and the sum of what it holds, floored at one increment. That sum
+leaves slashed-but-active validators out, as `calculate_committee_fraction`
+does since consensus-specs #5679 (v1.7.0-beta.4), so it is not
+`get_total_active_balance`.
+Equivocations stay out of it: they are store-level and can change at any time,
+so they are filtered per vote. `get_weight` stays as the specification's
+per-root definition, and the fork-choice fixture runner checks
+`compute_weights` against it at every `checks` step.
+
+The latest votes are stored the same way, as a dense table indexed by validator
+index rather than a hash map, so the vote loop reads votes and snapshot
+balances in index order. The table grows to the highest voting index, which is
+why `set_latest_message` only takes indices from validated attestations (a
+debug assertion bounds it).
+
 ## Macros and traits
 
 Two `macro_rules!` in the whole crate, both local, both replacing boilerplate that
@@ -563,6 +616,35 @@ So parallelism accounts for the remaining 4.9x, taking the run from two of
 eleven cores busy to about eight. The 3.3x understates the hashing change,
 because the later run does strictly more work: `transition` went from failing
 immediately to running every case.
+
+## Epoch-transition precompute
+
+The first block of an epoch used to run `process_epoch` inline on the import
+path (`fork_choice::on_block`, then `process_slots`), followed by the rehash
+the state-root check needs. The beacon chain actor now does that work ahead of
+time, on a blocking worker, and the import resumes from the result.
+
+| Step | What happens |
+| --- | --- |
+| Trigger: head | An import leaves a block at the last slot of epoch `E` as head: precompute `(E+1, head_root)`. Covers a late last-slot block. |
+| Trigger: timer | Three quarters into the last slot of `E` (derived from the configured slot duration), if nothing for the current head is cached or running: precompute from the head, which is an earlier block when the last slot was skipped. |
+| Gate | Skipped while the sync tracker says syncing. The head trigger skips a head more than a slot behind the wall clock; the timer trigger skips a head before `E`'s first slot, since the tracker reports a stalled network as synced and advancing such a head would replay every epoch it missed. Either way a worker crosses one epoch boundary at most. At most one worker runs; a key already cached is not recomputed. |
+| Work | Clone the head state, `process_slots` to the first slot of `E+1`, flush pending writes, `hash_tree_root` (so the tree nodes' hashes are memoized), send the state back to the actor. |
+| Store | The store's state cache under `CacheKey::CheckpointState { epoch: E+1, root: head_root }`. `fork_choice::checkpoint_state` derives the same value for that checkpoint (the checkpoint block's post-state advanced to the epoch's first slot), so attestation targets for `E+1` hit it too. |
+| Consume | `on_block` looks up `CheckpointState { block_epoch, parent_root }` when the parent's slot is before the epoch's first slot and the block is at or after it. A hit clones the entry, advances any remaining skipped slots, and applies the block with `stf::apply_block`; the post-state is identical to the inline path's. |
+| Miss | Today's path: clone the parent state and run `stf::state_transition`. A block that arrives while the worker is still running takes this path too; the late result is stored and goes unused by it. |
+
+The code lives in `crates/blockchain/src/epoch_precompute.rs` (triggers, worker,
+actor handlers) and `fork_choice::advance_to_epoch_start` /
+`fork_choice::transition_block` in the state-transition crate. The upgrade to a
+new fork at the boundary happens inside `process_slots`, so the precompute needs
+no fork-specific code. Gloas is covered by the same key: a gloas block's
+post-state never contains its own payload (the next block applies it inside
+`process_block`, after `process_slots`), and the store keeps exactly one state
+per root, so the entry for `(E+1, root)` is advanced from the same state an
+import of a child of `root` would clone. Hits and misses, worker time and
+trigger counts are exported as `lean_beacon_epoch_precompute_*`; see
+[metrics](metrics.md).
 
 ## One test per fixture case
 

@@ -61,12 +61,13 @@ use super::{
 };
 use crate::beacon::bls;
 use crate::beacon::constants::{
-    DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_SELECTION_PROOF, TARGET_AGGREGATORS_PER_COMMITTEE,
+    DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER, DOMAIN_SELECTION_PROOF,
+    TARGET_AGGREGATORS_PER_COMMITTEE,
 };
 use crate::beacon::containers::SignedAggregateAndProof;
 use crate::beacon::fork_choice::Store;
 use crate::beacon::hash::hash;
-use crate::beacon::helpers::accessors::{CommitteeCacheExt, get_domain};
+use crate::beacon::helpers::accessors::{CommitteeCacheExt, get_domain_from_schedule};
 use crate::beacon::helpers::math::bytes_to_uint64;
 use crate::beacon::helpers::misc::{
     compute_epoch_at_slot, compute_signing_root, compute_start_slot_at_epoch,
@@ -354,6 +355,11 @@ pub fn cheap_checks(
 ///   ([`super::ancestor_at`]) without a `Store::block_index` / `LiveChain`
 ///   scan, because a block's post-state always has history back through its
 ///   own ancestors.
+///
+/// What this state cannot answer is the signing domain: when the target
+/// epoch's first slots are empty, the vote block's state still carries the
+/// previous fork, so all three signatures are checked under the schedule's
+/// domain for the target epoch instead (see [`get_domain_from_schedule`]).
 pub fn stateful_checks(
     store: &Store,
     aggregate: &SignedAggregateAndProof,
@@ -373,6 +379,7 @@ pub fn stateful_checks(
     };
 
     let target_epoch = data.target.epoch;
+    let config = store.config();
 
     // Pubkey-only signatures, before any committee derivation; see the
     // module documentation for why this order.
@@ -382,13 +389,15 @@ pub fn stateful_checks(
     };
     // [REJECT] The selection proof selects the validator as an aggregator.
     let selection_proof = aggregate.selection_proof();
-    let selection_domain = get_domain(&state, DOMAIN_SELECTION_PROOF, Some(target_epoch));
+    let selection_domain =
+        get_domain_from_schedule(&config, &state, DOMAIN_SELECTION_PROOF, target_epoch);
     let selection_signing_root = compute_signing_root(data.slot.hash_tree_root(), selection_domain);
     if !bls::verify(&aggregator.pubkey, selection_signing_root, &selection_proof) {
         return Err(Outcome::Reject(RejectReason::SelectionProof));
     }
     // [REJECT] The aggregator's own signature, over the whole envelope.
-    let aggregator_domain = get_domain(&state, DOMAIN_AGGREGATE_AND_PROOF, Some(target_epoch));
+    let aggregator_domain =
+        get_domain_from_schedule(&config, &state, DOMAIN_AGGREGATE_AND_PROOF, target_epoch);
     let aggregator_signing_root =
         compute_signing_root(aggregate_and_proof_root(aggregate), aggregator_domain);
     if !bls::verify(
@@ -433,6 +442,8 @@ pub fn stateful_checks(
 
     // [REJECT] The aggregate's own signature is valid. Built from the same
     // (cached) committees, so this costs no further shuffle.
+    let attester_domain =
+        get_domain_from_schedule(&config, &state, DOMAIN_BEACON_ATTESTER, target_epoch);
     let attesting_indices = match aggregate {
         SignedAggregateAndProof::Phase0(signed) => {
             let phase0_attestation = &signed.message.aggregate;
@@ -442,8 +453,11 @@ pub fn stateful_checks(
                 &committees,
             )
             .map_err(|_| Outcome::Ignore(IgnoreReason::Internal))?;
-            if !crate::beacon::helpers::attestation::is_valid_indexed_attestation(&state, &indexed)
-            {
+            if !crate::beacon::helpers::attestation::is_valid_indexed_attestation_with_domain(
+                &state,
+                &indexed,
+                attester_domain,
+            ) {
                 return Err(Outcome::Reject(RejectReason::AggregateSignature));
             }
             indexed.attesting_indices.to_vec()
@@ -456,7 +470,11 @@ pub fn stateful_checks(
                 &committees,
             )
             .map_err(|_| Outcome::Ignore(IgnoreReason::Internal))?;
-            if !crate::beacon::helpers::electra::is_valid_indexed_attestation(&state, &indexed) {
+            if !crate::beacon::helpers::electra::is_valid_indexed_attestation_with_domain(
+                &state,
+                &indexed,
+                attester_domain,
+            ) {
                 return Err(Outcome::Reject(RejectReason::AggregateSignature));
             }
             indexed.attesting_indices.to_vec()
@@ -469,7 +487,11 @@ pub fn stateful_checks(
                 &committees,
             )
             .map_err(|_| Outcome::Ignore(IgnoreReason::Internal))?;
-            if !crate::beacon::helpers::gloas::is_valid_indexed_attestation(&state, &indexed) {
+            if !crate::beacon::helpers::gloas::is_valid_indexed_attestation_with_domain(
+                &state,
+                &indexed,
+                attester_domain,
+            ) {
                 return Err(Outcome::Reject(RejectReason::AggregateSignature));
             }
             indexed.attesting_indices.to_vec()

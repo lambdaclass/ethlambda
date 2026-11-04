@@ -26,7 +26,8 @@ use super::bls;
 use super::config::Config;
 use super::error::{Error, Result, verify};
 use super::helpers::accessors::{
-    CommitteeCache, get_beacon_proposer_index, get_current_epoch, get_randao_mix,
+    ActiveBalanceCache, CommitteeCache, get_beacon_proposer_index, get_current_epoch,
+    get_randao_mix,
 };
 use super::helpers::gloas::{
     can_builder_cover_bid, get_indexed_payload_attestation, get_ptc, gloas_state_ref,
@@ -407,6 +408,7 @@ pub fn assemble_gloas_block_on_bid(
         &block,
         config,
         &CommitteeCache::default(),
+        &ActiveBalanceCache::default(),
         options,
     )?;
     block.state_root = post.hash_tree_root();
@@ -532,6 +534,7 @@ pub fn assemble_gloas_block(
         &block,
         config,
         &CommitteeCache::default(),
+        &ActiveBalanceCache::default(),
         options,
     )?;
     block.state_root = post.hash_tree_root();
@@ -747,6 +750,7 @@ pub mod test_support {
             block,
             &config(),
             &CommitteeCache::default(),
+            &ActiveBalanceCache::default(),
             BlockProcessingOptions::default(),
         )
         .unwrap();
@@ -910,6 +914,7 @@ mod gloas_block_production_tests {
             &config(),
             &ExecutionEngine::valid(),
             &CommitteeCache::default(),
+            &ActiveBalanceCache::default(),
             BlockProcessingOptions::default(),
         )
         .unwrap();
@@ -1042,6 +1047,7 @@ mod gloas_block_production_tests {
             &produced.block,
             &config(),
             &CommitteeCache::default(),
+            &ActiveBalanceCache::default(),
             skip,
         )
         .unwrap();

@@ -21,7 +21,7 @@ jobs:
     name: Verify License
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.1.0
 
       - name: Check LICENSE file exists
         run: |

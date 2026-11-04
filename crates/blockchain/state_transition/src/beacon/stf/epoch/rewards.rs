@@ -12,9 +12,9 @@
 //! a fixed amount per validator regardless of how many there are.
 //!
 //! [`process_rewards_and_penalties`] applies the results as two separate
-//! passes, rewards then penalties, each through [`increase_balance`] and
-//! [`decrease_balance`] rather than a single netted delta. That distinction is
-//! load-bearing: [`decrease_balance`] floors at zero, and netting the two
+//! saturating steps, rewards then penalties (see [`apply_balance_deltas`]),
+//! rather than a single netted delta. That distinction is
+//! load-bearing: a penalty floors at zero, and netting the two
 //! before applying them would let a reward mask a penalty that should have
 //! driven a low balance all the way down.
 //!
@@ -48,7 +48,7 @@ use crate::beacon::helpers::finality::{
     get_eligible_validator_indices, get_finality_delay, is_in_inactivity_leak,
 };
 use crate::beacon::helpers::math::integer_squareroot;
-use crate::beacon::helpers::mutators::{decrease_balance, increase_balance};
+use crate::beacon::helpers::mutators::apply_balance_deltas;
 use crate::beacon::preset;
 use crate::beacon::primitives::{Gwei, ValidatorIndex};
 
@@ -308,8 +308,8 @@ pub fn get_attestation_deltas(
 ///
 /// Skipped entirely at the genesis epoch: rewards pay for attestations cast in
 /// the previous epoch, and genesis has none. Rewards and penalties are two
-/// separate passes over [`increase_balance`] and [`decrease_balance`], not one
-/// netted delta, because [`decrease_balance`] floors at zero: netting first
+/// separate saturating steps (see [`apply_balance_deltas`]), not one
+/// netted delta, because a penalty floors at zero: netting first
 /// would let a reward mask a penalty that should have driven a low balance all
 /// the way down.
 pub fn process_rewards_and_penalties(state: &mut BeaconState, config: &Config) -> Result<()> {
@@ -317,12 +317,8 @@ pub fn process_rewards_and_penalties(state: &mut BeaconState, config: &Config) -
         return Ok(());
     }
 
-    let (rewards, penalties) = get_attestation_deltas(state, config)?;
-    for index in 0..state.validator_count() as ValidatorIndex {
-        increase_balance(state, index, rewards[index as usize])?;
-        decrease_balance(state, index, penalties[index as usize])?;
-    }
-    Ok(())
+    let deltas = [get_attestation_deltas(state, config)?];
+    apply_balance_deltas(state, &deltas)
 }
 
 #[cfg(test)]

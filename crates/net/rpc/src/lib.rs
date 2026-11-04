@@ -193,6 +193,21 @@ pub fn build_beacon_api_router(store: Store, version: &'static str, peer_id: Str
 #[derive(Clone, Debug, Default)]
 pub struct CustodyColumns(pub Vec<u64>);
 
+/// How peers reach this node, as `/eth/v1/node/identity` reports it.
+#[derive(Debug, Clone, Default)]
+pub struct BeaconIdentity {
+    /// The node's ENR, `enr:`-prefixed.
+    pub enr: String,
+    /// libp2p multiaddrs the node listens on, each ending in `/p2p/<peer id>`.
+    pub p2p_addresses: Vec<String>,
+    /// discv5 multiaddrs, likewise.
+    pub discovery_addresses: Vec<String>,
+    /// The `MetaData` the p2p layer answers peers with, read per request
+    /// since its sequence number and `syncnets` change at runtime. `None`
+    /// without a beacon p2p layer, which leaves `metadata` all-zero.
+    pub metadata: Option<ethlambda_network_api::MetaDataController>,
+}
+
 /// What the Beacon API's endpoints reach beyond the store.
 pub struct BeaconApiHandles {
     /// Through which the pool, aggregate and block endpoints gossip what a
@@ -223,6 +238,8 @@ pub struct BeaconApiHandles {
     /// its code and commit, with the execution client's, to every block's
     /// graffiti.
     pub client_version: ethlambda_engine::types::ClientVersionV1,
+    /// What `/eth/v1/node/identity` reports beyond the peer id.
+    pub identity: BeaconIdentity,
 }
 
 /// Start the HTTP servers for a beacon node.
@@ -249,6 +266,7 @@ pub async fn start_beacon_rpc_server(
         .layer(Extension(beacon::validator::FeeRecipients::default()))
         .layer(Extension(handles.engine))
         .layer(Extension(handles.events))
+        .layer(Extension(handles.identity))
         .layer(Extension(beacon::graffiti::OwnVersion(Arc::new(
             handles.client_version,
         ))));
@@ -288,7 +306,6 @@ pub(crate) mod test_utils {
         state::{JustificationValidators, JustifiedSlots, State, StateConfig},
     };
     use libssz::SszEncode;
-    use libssz_types::SszVector;
 
     /// Build the API router the way tests do, with placeholder client version
     /// and peer ID. Tests that assert on those identity values (e.g. the
@@ -397,9 +414,11 @@ pub(crate) mod test_utils {
                 state_root: H256::ZERO,
                 body_root: H256::ZERO,
             },
-            block_roots: SszVector::try_from(vec![H256::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT])
+            block_roots: vec![H256::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
+                .try_into()
                 .expect("exactly N elements by construction"),
-            state_roots: SszVector::try_from(vec![H256::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT])
+            state_roots: vec![H256::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
+                .try_into()
                 .expect("exactly N elements by construction"),
             historical_roots: Default::default(),
             eth1_data: Default::default(),
@@ -407,12 +426,11 @@ pub(crate) mod test_utils {
             eth1_deposit_index: 0,
             validators: Default::default(),
             balances: Default::default(),
-            randao_mixes: SszVector::try_from(vec![
-                H256::ZERO;
-                preset::EPOCHS_PER_HISTORICAL_VECTOR
-            ])
-            .expect("exactly N elements by construction"),
-            slashings: SszVector::try_from(vec![0u64; preset::EPOCHS_PER_SLASHINGS_VECTOR])
+            randao_mixes: vec![H256::ZERO; preset::EPOCHS_PER_HISTORICAL_VECTOR]
+                .try_into()
+                .expect("exactly N elements by construction"),
+            slashings: vec![0u64; preset::EPOCHS_PER_SLASHINGS_VECTOR]
+                .try_into()
                 .expect("exactly N elements by construction"),
             previous_epoch_attestations: Default::default(),
             current_epoch_attestations: Default::default(),
@@ -839,10 +857,11 @@ pub(crate) mod test_utils {
     /// Build a beacon store anchored at `anchor_slot`, with a real child block
     /// at `anchor_slot + 1` whose import moves the head for real.
     ///
-    /// `Table::BlockRoots` is written only by `Store::update_checkpoints`
-    /// (see `BlockId::resolve_beacon`'s doc), so a fixture that wants that
-    /// table populated has to move the head through the real API rather than
-    /// poke the backend directly. That is what distinguishes this from
+    /// `Table::BlockRoots` is written only by `Store::index_beacon_anchor`
+    /// and `Store::update_checkpoints`, so a fixture that wants that table
+    /// populated has to index the anchor and move the head through the real
+    /// API, the way `get_forkchoice_store` and an import do, rather than poke
+    /// the backend directly. That is what distinguishes this from
     /// `beacon_test_state`/`beacon_test_block` in `ethlambda_storage::store`'s
     /// own tests, which this otherwise mirrors.
     pub(crate) fn beacon_fixture(anchor_slot: u64) -> BeaconFixture {
@@ -864,6 +883,9 @@ pub(crate) mod test_utils {
         store
             .insert_signed_block(anchor_root, anchor_block)
             .expect("insert anchor block");
+        store
+            .index_beacon_anchor(anchor_root)
+            .expect("index anchor block");
         store
             .insert_state(anchor_root, BeaconState::Phase0(anchor_state))
             .expect("insert anchor state");

@@ -406,6 +406,64 @@ impl BeaconState {
     }
 }
 
+/// Lists the tree-backed fields of one fork's state, once, and derives from
+/// that list both the flush (`apply_pending_mutations`) and the pending check
+/// (`has_pending_mutations`), so the two cannot drift apart when a field moves
+/// onto the tree.
+///
+/// The fields are handed out as `dyn Buffered`, since they differ in element
+/// type and update map.
+macro_rules! tree_fields {
+    ($fork:ty => $($field:ident),+ $(,)?) => {
+        impl $fork {
+            fn buffered(&self) -> [&dyn ethlambda_ssz_tree::Buffered; tree_fields!(@count $($field)+)] {
+                [$(&self.$field),+]
+            }
+
+            fn buffered_mut(
+                &mut self,
+            ) -> [&mut dyn ethlambda_ssz_tree::Buffered; tree_fields!(@count $($field)+)] {
+                [$(&mut self.$field),+]
+            }
+        }
+    };
+    (@count) => { 0usize };
+    (@count $head:ident $($tail:ident)*) => { 1usize + tree_fields!(@count $($tail)*) };
+}
+
+tree_fields!(
+    phase0::BeaconState => validators, balances, block_roots, state_roots, historical_roots, eth1_data_votes, randao_mixes, slashings
+);
+tree_fields!(
+    altair::BeaconState => validators, balances, block_roots, state_roots, historical_roots, eth1_data_votes, randao_mixes, slashings, inactivity_scores
+);
+tree_fields!(
+    bellatrix::BeaconState => validators, balances, block_roots, state_roots, historical_roots, eth1_data_votes, randao_mixes, slashings, inactivity_scores
+);
+tree_fields!(
+    capella::BeaconState => validators, balances, block_roots, state_roots, historical_roots, eth1_data_votes, randao_mixes, slashings, inactivity_scores,
+    historical_summaries
+);
+tree_fields!(
+    deneb::BeaconState => validators, balances, block_roots, state_roots, historical_roots, eth1_data_votes, randao_mixes, slashings, inactivity_scores,
+    historical_summaries
+);
+tree_fields!(
+    electra::BeaconState => validators, balances, block_roots, state_roots, historical_roots, eth1_data_votes, randao_mixes, slashings, inactivity_scores,
+    historical_summaries
+);
+tree_fields!(
+    fulu::BeaconState => validators, balances, block_roots, state_roots, historical_roots, eth1_data_votes, randao_mixes, slashings, inactivity_scores,
+    historical_summaries
+);
+// Gloas keeps `validators` and `balances` in progressive trees, and its
+// `inactivity_scores` in a flat progressive list that buffers nothing, so the
+// scores are not listed. Every other field is the shared tree type.
+tree_fields!(
+    gloas::BeaconState => validators, balances, block_roots, state_roots, historical_roots, eth1_data_votes, randao_mixes, slashings,
+    historical_summaries
+);
+
 /// Generates read and write accessors for state fields that every fork shares.
 ///
 /// The `copy` and `reference` lists are this crate's statement of which state
@@ -554,6 +612,133 @@ enum RegistryMut<'a> {
     Bounded(&'a mut Validators, &'a mut Balances),
     Progressive(&'a mut ProgressiveValidators, &'a mut ProgressiveBalances),
 }
+
+/// The inactivity scores of a state, whichever list kind its fork uses.
+///
+/// Every fork before gloas keeps them in a tree-backed list, which has no
+/// slice view; gloas keeps a flat progressive list. A read needs only length,
+/// element and in-order access, which this offers over both.
+#[derive(Clone, Copy)]
+pub enum InactivityScoresRef<'a> {
+    /// A tree-backed list (altair through fulu).
+    Tree(&'a InactivityScores),
+    /// A flat list (gloas).
+    Flat(&'a [u64]),
+}
+
+impl<'a> From<&'a InactivityScores> for InactivityScoresRef<'a> {
+    fn from(scores: &'a InactivityScores) -> Self {
+        Self::Tree(scores)
+    }
+}
+
+impl<'a> From<&'a gloas::InactivityScores> for InactivityScoresRef<'a> {
+    fn from(scores: &'a gloas::InactivityScores) -> Self {
+        Self::Flat(&scores[..])
+    }
+}
+
+impl<'a> InactivityScoresRef<'a> {
+    /// The number of scores.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Tree(scores) => scores.len(),
+            Self::Flat(scores) => scores.len(),
+        }
+    }
+
+    /// Whether there are no scores.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The score at `index`, or `None` past the end. A tree descent for a
+    /// tree-backed list: walk [`Self::iter`] when visiting many.
+    pub fn get(&self, index: usize) -> Option<&'a u64> {
+        match self {
+            Self::Tree(scores) => scores.get(index),
+            Self::Flat(scores) => scores.get(index),
+        }
+    }
+
+    /// Every score in order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &'a u64> + use<'a> {
+        match self {
+            Self::Tree(scores) => ScoresIter::Tree(scores.iter()),
+            Self::Flat(scores) => ScoresIter::Flat(scores.iter()),
+        }
+    }
+
+    /// Whether a write is buffered and not yet folded into the tree. Always
+    /// `false` for a flat list, which buffers nothing.
+    pub fn has_pending_updates(&self) -> bool {
+        match self {
+            Self::Tree(scores) => scores.has_pending_updates(),
+            Self::Flat(_) => false,
+        }
+    }
+
+    /// Whether both are tree-backed lists sharing one allocation. Never true
+    /// for a flat list, which shares nothing.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Tree(a), Self::Tree(b)) => a.ptr_eq(b),
+            _ => false,
+        }
+    }
+
+    /// The scores, copied out.
+    pub fn to_vec(&self) -> Vec<u64> {
+        self.iter().copied().collect()
+    }
+}
+
+impl PartialEq for InactivityScoresRef<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.iter().eq(other.iter())
+    }
+}
+
+impl std::fmt::Debug for InactivityScoresRef<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl std::ops::Index<usize> for InactivityScoresRef<'_> {
+    type Output = u64;
+
+    fn index(&self, index: usize) -> &u64 {
+        self.get(index)
+            .unwrap_or_else(|| panic!("index {index} out of bounds for {} scores", self.len()))
+    }
+}
+
+/// The iterator behind [`InactivityScoresRef::iter`].
+enum ScoresIter<'a> {
+    Tree(ethlambda_ssz_tree::Iter<'a, u64, std::collections::BTreeMap<usize, u64>>),
+    Flat(std::slice::Iter<'a, u64>),
+}
+
+impl<'a> Iterator for ScoresIter<'a> {
+    type Item = &'a u64;
+
+    fn next(&mut self) -> Option<&'a u64> {
+        match self {
+            Self::Tree(it) => it.next(),
+            Self::Flat(it) => it.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Tree(it) => it.size_hint(),
+            Self::Flat(it) => it.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for ScoresIter<'_> {}
 
 /// An iterator over either registry list kind, so [`BeaconState::iter_validators`]
 /// and [`BeaconState::iter_balances`] can promise one return type across every
@@ -753,9 +938,9 @@ impl BeaconState {
         }
     }
 
-    /// Folds every buffered write into the tree-backed fields (`validators`,
-    /// `balances`), so the next `hash_tree_root` rehashes only the touched
-    /// paths and keeps the hashes it computes.
+    /// Folds every buffered write into the tree-backed fields (see
+    /// `tree_fields!` for which ones), so the next `hash_tree_root` rehashes
+    /// only the touched paths and keeps the hashes it computes.
     ///
     /// Hashing with writes still pending gives the right root but caches
     /// nothing for those paths, so the state transition calls this before
@@ -765,13 +950,13 @@ impl BeaconState {
         if matches!(self, BeaconState::Lean(_)) {
             return;
         }
-        dispatch_state!(self, "apply_pending_mutations", |state| {
-            state.validators.apply_updates();
-            state.balances.apply_updates();
-        })
+        dispatch_state!(self, "apply_pending_mutations", |state| state
+            .buffered_mut()
+            .into_iter()
+            .for_each(|field| field.apply_updates()))
     }
 
-    /// Whether `validators` or `balances` has a write [`apply_pending_mutations`]
+    /// Whether any tree-backed field has a write [`apply_pending_mutations`]
     /// has not folded into its tree yet.
     ///
     /// Always `false` on a lean state, which has no tree-backed fields. Meant
@@ -781,11 +966,13 @@ impl BeaconState {
     ///
     /// [`apply_pending_mutations`]: BeaconState::apply_pending_mutations
     pub fn has_pending_mutations(&self) -> bool {
-        match self.registry() {
-            Some(Registry::Bounded(v, b)) => v.has_pending_updates() || b.has_pending_updates(),
-            Some(Registry::Progressive(v, b)) => v.has_pending_updates() || b.has_pending_updates(),
-            None => false,
+        if matches!(self, BeaconState::Lean(_)) {
+            return false;
         }
+        dispatch_state!(self, "has_pending_mutations", |state| state
+            .buffered()
+            .into_iter()
+            .any(|field| field.has_pending_updates()))
     }
 
     /// Makes this state's tree-backed fields share every unchanged subtree
@@ -795,10 +982,12 @@ impl BeaconState {
     ///
     /// Works across every fork that shares a registry list kind with `base`,
     /// since `List::rebase_on` and `ProgressiveList::rebase_on` each take a
-    /// `&Self`, not some common trait object. A no-op if either state is
-    /// lean, or if the two disagree on list kind (a gloas state rebased onto
-    /// a pre-gloas one, or vice versa): that pairing only happens across the
-    /// fork boundary itself, where there is no shared tree to reuse anyway.
+    /// `&Self`, not some common trait object; the other tree-backed fields
+    /// have one type in every fork. A no-op if either state is lean, and the
+    /// registry is left alone if the two disagree on list kind (a gloas state
+    /// rebased onto a pre-gloas one, or vice versa): that pairing only
+    /// happens across the fork boundary itself, where there is no shared tree
+    /// to reuse anyway.
     pub fn rebase_on(&mut self, base: &BeaconState) {
         let Some(base_registry) = base.registry() else {
             return;
@@ -819,6 +1008,122 @@ impl BeaconState {
             | (Some(RegistryMut::Bounded(..)), Registry::Progressive(..))
             | (Some(RegistryMut::Progressive(..)), Registry::Bounded(..)) => {}
         }
+        self.block_roots_mut().rebase_on(base.block_roots());
+        self.state_roots_mut().rebase_on(base.state_roots());
+        self.historical_roots_mut()
+            .rebase_on(base.historical_roots());
+        self.eth1_data_votes_mut().rebase_on(base.eth1_data_votes());
+        self.randao_mixes_mut().rebase_on(base.randao_mixes());
+        self.slashings_mut().rebase_on(base.slashings());
+        self.rebase_inactivity_scores_on(base);
+        self.rebase_historical_summaries_on(base);
+    }
+
+    /// Whether `validators` or `balances` has a write
+    /// [`Self::apply_pending_mutations`] has not folded into its tree yet.
+    /// `false` on a lean state.
+    ///
+    /// The registry alone, unlike [`Self::has_pending_mutations`], which also
+    /// counts the other tree-backed fields: the per-slot roots writes stay
+    /// buffered by design until the next flush, so a caller asking whether
+    /// the registry is flushed cannot use that one.
+    pub fn registry_has_pending_updates(&self) -> bool {
+        match self.registry() {
+            Some(Registry::Bounded(v, b)) => v.has_pending_updates() || b.has_pending_updates(),
+            Some(Registry::Progressive(v, b)) => v.has_pending_updates() || b.has_pending_updates(),
+            None => false,
+        }
+    }
+
+    /// Shares `inactivity_scores` with `base`'s where both are tree-backed.
+    /// Phase0 has no scores, and gloas keeps a flat list with nothing to
+    /// share, so those pairings (and any mix of the two kinds) do nothing.
+    fn rebase_inactivity_scores_on(&mut self, base: &BeaconState) {
+        if let (Ok((_, _, scores)), Ok((_, _, InactivityScoresRef::Tree(base_scores)))) = (
+            self.altair_validator_lists_mut(),
+            base.altair_validator_lists(),
+        ) {
+            scores.rebase_on(base_scores);
+        }
+    }
+
+    /// Shares `historical_summaries` with `base`'s where both carry it, which
+    /// is every fork from capella on. Earlier forks have no summaries, so any
+    /// pairing with one of those does nothing.
+    fn rebase_historical_summaries_on(&mut self, base: &BeaconState) {
+        let base_summaries = match base {
+            BeaconState::Capella(state) => &state.historical_summaries,
+            BeaconState::Deneb(state) => &state.historical_summaries,
+            BeaconState::Electra(state) => &state.historical_summaries,
+            BeaconState::Fulu(state) => &state.historical_summaries,
+            BeaconState::Gloas(state) => &state.historical_summaries,
+            BeaconState::Phase0(_)
+            | BeaconState::Altair(_)
+            | BeaconState::Bellatrix(_)
+            | BeaconState::Lean(_) => return,
+        };
+        let summaries = match self {
+            BeaconState::Capella(state) => &mut state.historical_summaries,
+            BeaconState::Deneb(state) => &mut state.historical_summaries,
+            BeaconState::Electra(state) => &mut state.historical_summaries,
+            BeaconState::Fulu(state) => &mut state.historical_summaries,
+            BeaconState::Gloas(state) => &mut state.historical_summaries,
+            BeaconState::Phase0(_)
+            | BeaconState::Altair(_)
+            | BeaconState::Bellatrix(_)
+            | BeaconState::Lean(_) => return,
+        };
+        summaries.rebase_on(base_summaries);
+    }
+
+    /// Runs `f` over every balance in order through the list's write cursor
+    /// (`ethlambda_ssz_tree::List::iter_cow`, or the progressive list's
+    /// equivalent from gloas on), stopping at the first error and keeping the
+    /// writes made before it.
+    ///
+    /// For a pass that rewrites most balances: nothing is buffered per element,
+    /// and a leaf whose balances all come out unchanged keeps its hash.
+    pub fn try_update_balances<E>(
+        &mut self,
+        mut f: impl FnMut(&mut ethlambda_ssz_tree::ElemCow<'_, Gwei>) -> core::result::Result<(), E>,
+    ) -> core::result::Result<(), E> {
+        dispatch_state!(self, "BeaconState::try_update_balances", |state| state
+            .balances
+            .try_update_each(&mut f))
+    }
+
+    /// Runs `f` over every validator in order through the registry's write
+    /// cursor, with that validator's balance read in step.
+    ///
+    /// `validators` and `balances` are separate lists of the same state, so a
+    /// pass that rewrites one while reading the other cannot go through
+    /// [`Self::validator_mut`] and [`Self::balance`] one call at a time: this
+    /// splits the borrow. It stops at the first error, keeping the writes made
+    /// before it, and also stops (without error) when the balances run out
+    /// before the validators do: the caller decides whether a short balances
+    /// list is an error.
+    pub fn try_update_validators_with_balances<E>(
+        &mut self,
+        mut f: impl FnMut(
+            &mut ethlambda_ssz_tree::ElemCow<'_, Validator>,
+            Gwei,
+        ) -> core::result::Result<(), E>,
+    ) -> core::result::Result<(), E> {
+        dispatch_state!(
+            self,
+            "BeaconState::try_update_validators_with_balances",
+            |state| {
+                let mut balances = state.balances.iter();
+                let mut pass = state.validators.iter_cow();
+                while let Some(mut validator) = pass.next_cow() {
+                    let Some(&balance) = balances.next() else {
+                        break;
+                    };
+                    f(&mut validator, balance)?;
+                }
+                Ok(())
+            }
+        )
     }
 
     /// The randao mix for `epoch`, which the specification indexes modulo the
@@ -870,7 +1175,9 @@ impl BeaconState {
     }
 
     /// The three per-validator lists that exist from altair on, by reference and
-    /// all at once, as plain slices.
+    /// all at once: the two participation lists as plain slices, the inactivity
+    /// scores as an [`InactivityScoresRef`] since a tree-backed list has no
+    /// slice to hand out.
     ///
     /// These cannot join `shared_state_accessors`' lists, since phase0 has
     /// none of them, and a per-fork projection to a concrete state struct (the
@@ -890,7 +1197,7 @@ impl BeaconState {
     /// kinds: the write side still needs the concrete container type, to grow
     /// or replace the whole list, which is why [`Self::altair_validator_lists_mut`]
     /// stays bounded-only. On gloas, element writes go through
-    /// [`Self::inactivity_scores_mut`], and growing or replacing a list goes
+    /// [`Self::inactivity_score_mut`], and growing or replacing a list goes
     /// through a per-fork projection.
     ///
     /// Handed back together rather than one accessor per field for the same
@@ -900,14 +1207,18 @@ impl BeaconState {
     /// the rest away with `_`.
     pub fn altair_validator_lists(
         &self,
-    ) -> Result<(&[ParticipationFlags], &[ParticipationFlags], &[u64])> {
+    ) -> Result<(
+        &[ParticipationFlags],
+        &[ParticipationFlags],
+        InactivityScoresRef<'_>,
+    )> {
         dispatch_state_from!(
             self,
             "BeaconState::altair_validator_lists",
             |state| (
                 &state.previous_epoch_participation[..],
                 &state.current_epoch_participation[..],
-                &state.inactivity_scores[..],
+                InactivityScoresRef::from(&state.inactivity_scores),
             ),
             carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas],
             absent_from: [Phase0],
@@ -942,7 +1253,7 @@ impl BeaconState {
     /// registry through a per-fork projection
     /// (`PendingQueueFields::push_empty_participation_and_inactivity`), writes
     /// one score in place through
-    /// [`Self::inactivity_scores_mut`], or replaces a whole list outright
+    /// [`Self::inactivity_score_mut`], or replaces a whole list outright
     /// through its own state's own field, the way
     /// `stf::epoch::gloas::process_participation_flag_updates` does.
     pub fn altair_validator_lists_mut(
@@ -965,13 +1276,16 @@ impl BeaconState {
         )
     }
 
-    /// `inactivity_scores`, mutably, as a plain slice: element writes only, no
+    /// One of `inactivity_scores`, mutably: an element write only, no
     /// whole-list replace or length change, which is what lets this include
     /// gloas where [`Self::altair_validator_lists_mut`] cannot (see that
-    /// accessor's own doc). A `&mut [u64]` cannot grow or shrink, so handing
-    /// one out cannot break either list kind's own length invariant, the same
-    /// reasoning [`libssz_types::ProgressiveList`]'s own `DerefMut` doc gives
-    /// for allowing element mutation but not resizing through a slice.
+    /// accessor's own doc). A `&mut u64` cannot grow or shrink either list
+    /// kind, so handing one out cannot break its length invariant.
+    ///
+    /// On a tree-backed list (every fork before gloas) the element is copied
+    /// into the pending-write map on first touch, whether or not the caller
+    /// then changes it: write only when the value differs, so an unchanged
+    /// score leaves the list shared with its parent.
     ///
     /// `stf::epoch::altair::process_inactivity_updates` (shared by every fork
     /// from altair on, gloas included) is the one caller: it only ever writes
@@ -979,11 +1293,17 @@ impl BeaconState {
     /// `add_validator_to_registry` and `process_participation_flag_updates`
     /// do instead (see [`Self::altair_validator_lists_mut`]'s own doc for
     /// where each of those goes).
-    pub fn inactivity_scores_mut(&mut self) -> Result<&mut [u64]> {
+    pub fn inactivity_score_mut(&mut self, index: usize) -> Result<&mut u64> {
         dispatch_state_from!(
             self,
-            "BeaconState::inactivity_scores_mut",
-            |state| &mut state.inactivity_scores[..],
+            "BeaconState::inactivity_score_mut",
+            |state| {
+                let len = state.inactivity_scores.len();
+                state
+                    .inactivity_scores
+                    .get_mut(index)
+                    .ok_or(Error::IndexOutOfBounds { index, len })?
+            },
             carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas],
             absent_from: [Phase0],
         )
@@ -991,7 +1311,7 @@ impl BeaconState {
 
     /// `previous_epoch_participation` or `current_epoch_participation`,
     /// mutably and as a plain slice, whichever `current` selects: element
-    /// writes only, the same contract [`Self::inactivity_scores_mut`]'s own
+    /// writes only, the same contract [`Self::inactivity_score_mut`]'s own
     /// doc gives for why that is enough to include gloas where
     /// [`Self::altair_validator_lists_mut`] cannot.
     ///
@@ -1338,6 +1658,20 @@ impl SignedBeaconBlock {
                 Some(block.message.body.execution_payload.block_hash)
             }
         }
+    }
+
+    /// This block's payload hash when the specification's `is_execution_block`
+    /// holds for it, so the one rule that decides which blocks have an
+    /// execution hash to cache.
+    ///
+    /// [`Self::execution_block_hash`] minus the all-zero hash: a pre-merge
+    /// bellatrix block carries a payload field whose every byte is zero, and
+    /// that is "not an execution block", not a block with a zero hash. Testing
+    /// the hash alone is enough, since it is a keccak digest in a real payload
+    /// and zero in the empty one. `None` for phase0, altair and gloas too (see
+    /// [`Self::execution_block_hash`]).
+    pub fn execution_block_hash_if_execution_block(&self) -> Option<ExecutionBlockHash> {
+        self.execution_block_hash().filter(|hash| !hash.is_zero())
     }
 
     /// How many blob KZG commitments this block's body carries: zero before
@@ -2248,6 +2582,21 @@ mod tests {
         let expected = ExecutionBlockHash::repeat_byte(7);
         let block = SignedBeaconBlock::Fulu(empty_electra_signed_block(expected));
         assert_eq!(block.execution_block_hash(), Some(expected));
+    }
+
+    #[test]
+    fn execution_block_hash_if_execution_block_gives_post_merge_hashes_only() {
+        let expected = ExecutionBlockHash::repeat_byte(7);
+        let electra = SignedBeaconBlock::Electra(empty_electra_signed_block(expected));
+        assert_eq!(
+            electra.execution_block_hash_if_execution_block(),
+            Some(expected)
+        );
+        let deneb_like =
+            SignedBeaconBlock::Electra(empty_electra_signed_block(ExecutionBlockHash::ZERO));
+        assert_eq!(deneb_like.execution_block_hash_if_execution_block(), None);
+        let phase0 = SignedBeaconBlock::Phase0(empty_phase0_signed_block());
+        assert_eq!(phase0.execution_block_hash_if_execution_block(), None);
     }
 
     // -- body_root --

@@ -591,6 +591,51 @@ pub fn set_swarm_established_connections(inbound: u32, outbound: u32) {
         .set(i64::from(outbound));
 }
 
+/// Set how many gossipsub peers fall in each score band. `bands` names every
+/// band, empty ones as zero, so a band that empties does not keep its last
+/// count. See `beacon::scoring::score_band`.
+pub fn set_gossipsub_peers_by_score(bands: &HashMap<&'static str, i64>) {
+    static LEAN_GOSSIPSUB_PEERS_BY_SCORE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+        register_int_gauge_vec!(
+            "lean_gossipsub_peers_by_score",
+            "Gossipsub peers by score band: non_negative, negative, below_gossip, below_publish, below_graylist",
+            &["band"]
+        )
+        .unwrap()
+    });
+    for (band, count) in bands {
+        LEAN_GOSSIPSUB_PEERS_BY_SCORE
+            .with_label_values(&[band])
+            .set(*count);
+    }
+}
+
+/// Count a peer disconnected for a gossipsub score below the graylist.
+pub fn inc_gossipsub_score_disconnects() {
+    static LEAN_GOSSIPSUB_SCORE_DISCONNECTS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+        register_int_counter!(
+            "lean_gossipsub_score_disconnects_total",
+            "Peers disconnected for a gossipsub score below the graylist threshold"
+        )
+        .unwrap()
+    });
+    LEAN_GOSSIPSUB_SCORE_DISCONNECTS_TOTAL.inc();
+}
+
+/// Whether gossipsub's mesh-delivery term (P3) is being scored: 0 while the
+/// head lags or is still warming up after catching up. See
+/// `beacon::scoring::MeshDeliveryGate`.
+pub fn set_gossipsub_mesh_delivery_scoring(scored: bool) {
+    static LEAN_GOSSIPSUB_MESH_DELIVERY_SCORING: LazyLock<IntGauge> = LazyLock::new(|| {
+        register_int_gauge!(
+            "lean_gossipsub_mesh_delivery_scoring",
+            "1 while gossipsub scores mesh message deliveries, 0 while the head lags or is warming up"
+        )
+        .unwrap()
+    });
+    LEAN_GOSSIPSUB_MESH_DELIVERY_SCORING.set(i64::from(scored));
+}
+
 /// Set how many connected peers are known to custody `column`.
 ///
 /// A peer counts only once it has answered `metadata/3` or arrived with a

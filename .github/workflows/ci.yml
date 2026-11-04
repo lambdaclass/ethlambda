@@ -36,9 +36,9 @@ jobs:
     name: Lint
     runs-on: ${{ vars.ETHLAMBDA_RUNNER || 'ubuntu-latest' }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.1.0
 
-      - uses: ./.github/actions/free-disk
+      - uses: $/.github/actions/free-disk
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@master
@@ -47,7 +47,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Setup cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@v2.9.3
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -90,9 +90,9 @@ jobs:
     name: Test minimal preset
     runs-on: ${{ vars.ETHLAMBDA_RUNNER || 'ubuntu-latest' }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.1.0
 
-      - uses: ./.github/actions/free-disk
+      - uses: $/.github/actions/free-disk
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@master
@@ -104,7 +104,7 @@ jobs:
       # builds share almost no artifacts with `lint`'s, so on one key each run
       # would evict the other's.
       - name: Setup cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@v2.9.3
 
       - name: Check the beacon spec-test suite compiles
         run: |
@@ -127,7 +127,7 @@ jobs:
     name: Tooling
     runs-on: ${{ vars.ETHLAMBDA_RUNNER || 'ubuntu-latest' }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.1.0
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@master
@@ -136,7 +136,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Setup cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@v2.9.3
         with:
           workspaces: tooling/event-monitor
 
@@ -162,12 +162,12 @@ jobs:
       matrix:
         half: [consensus, node]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.1.0
 
-      - uses: ./.github/actions/free-disk
+      - uses: $/.github/actions/free-disk
 
       - name: Run fixture-based tests
-        uses: ./.github/actions/run-fixture-tests
+        uses: $/.github/actions/run-fixture-tests
         with:
           make-target: test-${{ matrix.half }}
 
@@ -185,9 +185,9 @@ jobs:
     name: Benchmark smoke
     runs-on: ${{ vars.ETHLAMBDA_RUNNER || 'ubuntu-latest' }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.1.0
 
-      - uses: ./.github/actions/free-disk
+      - uses: $/.github/actions/free-disk
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@master
@@ -195,7 +195,7 @@ jobs:
           toolchain: "1.97.1"
 
       - name: Setup cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@v2.9.3
 
       - name: Benchmark smoke (mock crypto)
         run: |
@@ -212,7 +212,7 @@ jobs:
     name: Dependency cooldown
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.1.0
 
       - name: Check lockfiles against the publish-age cooldown
         run: |
@@ -263,9 +263,9 @@ jobs:
       # vectors are a separate download (`make cryptography-specs`) below.
       CONSENSUS_SPEC_TESTS_CONFIGS: ${{ matrix.preset }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.1.0
 
-      - uses: ./.github/actions/free-disk
+      - uses: $/.github/actions/free-disk
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@master
@@ -276,7 +276,7 @@ jobs:
       # which are const-generic arguments, so the two legs share no artifacts at
       # all; on one key they would evict each other on every single run.
       - name: Setup cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@v2.9.3
         with:
           key: beacon-${{ matrix.preset }}
 

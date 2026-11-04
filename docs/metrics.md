@@ -2,9 +2,9 @@
 
 We collect various metrics and serve them via a Prometheus-compatible HTTP endpoint at `http://<http_address>:<metrics_port>/metrics` (default: `http://127.0.0.1:5054/metrics`).
 
-A ready-to-use Grafana + Prometheus monitoring stack with pre-configured [leanMetrics](https://github.com/leanEthereum/leanMetrics) dashboards is available in [lean-quickstart](https://github.com/blockblaz/lean-quickstart).
+For the Lean Chain, a ready-to-use Grafana + Prometheus monitoring stack with pre-configured [leanMetrics](https://github.com/leanEthereum/leanMetrics) dashboards is available in [lean-quickstart](https://github.com/blockblaz/lean-quickstart).
 
-The exposed metrics follow [the leanMetrics specification](https://github.com/leanEthereum/leanMetrics/blob/2719baad8351c9ad5eaf3c8621f33fcec20a1dc7/metrics.md), with some metrics not yet implemented. We have a full list of implemented metrics below, with a checkbox indicating whether each metric is currently supported or not.
+The Lean Chain's metrics follow [the leanMetrics specification](https://github.com/leanEthereum/leanMetrics/blob/2719baad8351c9ad5eaf3c8621f33fcec20a1dc7/metrics.md), with some metrics not yet implemented. The Beacon Chain side has no such specification: its own metrics are among the [Custom Metrics](#custom-metrics-non-leanmetrics) (the "Beacon" sections and Data Column Sidecars), and the validator client's are under [Validator client](#validator-client). We have a full list of implemented metrics below, with a checkbox indicating whether each metric is currently supported or not.
 
 ## Node Info Metrics
 
@@ -12,6 +12,13 @@ The exposed metrics follow [the leanMetrics specification](https://github.com/le
 |--------|-------|-------|-------------------------|--------|---------------|
 | `lean_node_info` | Gauge | Node information (always 1) | On node start | name, version | ✅ |
 | `lean_node_start_time_seconds` | Gauge | Start timestamp | On node start | | ✅ |
+
+On Linux the endpoint also serves the `prometheus` crate's process collector,
+read from `/proc/self` at each scrape: `process_resident_memory_bytes`,
+`process_virtual_memory_bytes`, `process_cpu_seconds_total`,
+`process_open_fds`, `process_max_fds`, `process_threads` and
+`process_start_time_seconds`. They are not part of the leanMetrics spec, and
+other platforms do not export them.
 
 
 ## PQ Signature Metrics
@@ -327,6 +334,7 @@ In practice the distribution is bimodal and dominated by production rather than 
 | `lean_table_bytes` | Gauge | Estimated byte size of a storage table (key + value bytes) | After each processed block (one update per table); retains its previous value on empty slots | table=`<table_name>` |
 | `lean_state_write_queue_depth` | Gauge | States handed to the background writer but not yet committed | On every hand-off and on every commit | |
 | `lean_state_write_seconds` | Histogram | Time the background writer spends encoding, diffing and committing one state | Per state written | |
+| `lean_state_cache_lookups_total` | Counter | State cache lookups, by the `Store` method that made them, the kind of state asked for, and whether the cache held it | On every `get_state` (and the writer's own parent read), `has_state` and `cached_state` call | method=get_state,has_state,cached_state<br>kind=block,checkpoint<br>result=hit,miss |
 
 **On a beacon follower, watch `lean_table_bytes{table="data_columns"}`.** Every
 other table's series either stays flat or is bounded by pruning; `data_columns`
@@ -345,6 +353,15 @@ three means `insert_state` blocked on the full channel waiting for the writer,
 and `lean_state_write_seconds` says whether that time went into the encode or
 the commit. A depth that stays at zero means the writer has nothing
 outstanding.
+
+**Read `lean_state_cache_lookups_total` per `method`, not summed.**
+`cached_state` with `kind="block"` is gossip validation's lookup of the voted
+or parent block's state, made once per attestation and aggregate, so it runs far
+more often than the other two and a summed rate is mostly its own. A `get_state`
+or `has_state` miss means the state was not resident and came from the writer's
+buffer or RocksDB. A `cached_state` miss with `kind="checkpoint"` means fork
+choice's `checkpoint_state` rebuilt the state, running `process_slots` up to the
+epoch boundary when the checkpoint's block precedes it.
 
 ### Beacon Gossip Validation
 
@@ -426,6 +443,26 @@ instead. Neither pool has a metric of its own yet; a permit exhausted on
 either shows up as `outcome="ignore",reason="overloaded"` on
 `lean_beacon_gossip_validation_total`, for the topics that draw from it.
 
+### Beacon Peer Scoring
+
+Gossipsub peer scoring runs on the beacon wire only; see
+[beacon_wire.md](./beacon_wire.md#peer-scoring) for the parameters and the
+mesh-delivery gate. These are ethlambda-specific, not part of the leanMetrics
+spec.
+
+| Name | Type | Usage | Sample collection event | Labels | Buckets |
+|------|------|-------|-------------------------|--------|---------|
+| `lean_gossipsub_peers_by_score` | Gauge | Gossipsub peers by score band | Every 10 s, in the swarm task | band=non_negative,negative,below_gossip,below_publish,below_graylist | |
+| `lean_gossipsub_score_disconnects_total` | Counter | Peers disconnected for a gossipsub score below the graylist (-16000) | When the 10 s check disconnects one | | |
+| `lean_gossipsub_mesh_delivery_scoring` | Gauge | 1 while mesh message deliveries (P3) are scored, 0 while the head lags the wall clock or is warming up after catching up | Every slot, on the scoring refresh | | |
+
+The bands are mutually exclusive and split at the gossip (-4000), publish
+(-8000) and graylist (-16000) thresholds, so they add up to the peers
+gossipsub knows. `below_graylist` counts the peers that same pass is about to
+disconnect, so it should not hold a value across passes. A persistent
+`below_gossip`/`below_publish` population points at slow peers first: a full
+send queue costs a peer 10 points per dropped message.
+
 ### Beacon Block Publication
 
 `POST /eth/v2/beacon/blocks` computes every blob's cells and batch-verifies all
@@ -466,6 +503,61 @@ more branches are being imported at once than the cache has room for; each miss
 is a registry scan plus a whole-epoch shuffle on the import thread. `unkeyable`
 is a lookup the cache could not key at all, mostly the genesis state asking
 about its own first epochs, and should be zero on a checkpoint-synced follower.
+
+### Beacon Total Active Balance Cache
+
+The total active balance (the divisor of every attestation's base reward and of
+the sync aggregate's rewards) is one registry pass, and an ordinary block asks
+for it about nine times. `ActiveBalanceCache` in the `Store` keeps it per epoch,
+keyed by the epoch and the block root that fixes it. This is ethlambda-specific,
+not part of the leanMetrics spec.
+
+| Name | Type | Usage | Sample collection event | Labels |
+|------|------|-------|-------------------------|--------|
+| `lean_beacon_total_active_balance_lookups_total` | Counter | Total active balance lookups, by whether the cache served them | On every `ActiveBalanceCacheExt::total_active_balance` call: block processing's attestations and sync aggregate | result=hit,miss,unkeyable |
+
+Expect one miss per epoch per chain, and hits otherwise. `unkeyable` is the
+genesis state asking about its own epoch, and should be zero on a
+checkpoint-synced follower.
+
+### Beacon Justified Balances
+
+Beacon fork choice weighs every vote by the voter's effective balance at the
+justified checkpoint. `justified_balances` (in
+`crates/blockchain/state_transition/src/beacon/fork_choice.rs`) flattens that
+state into one array, keyed by the justified checkpoint and rebuilt on the first
+`get_head` after the checkpoint moves. This is ethlambda-specific, not part of
+the leanMetrics spec.
+
+| Name | Type | Usage | Sample collection event | Labels |
+|------|------|-------|-------------------------|--------|
+| `lean_beacon_justified_balances_lookups_total` | Counter | Snapshot lookups, by whether the cached snapshot served them | On every `justified_balances` call: `get_head`'s weights, the proposer boost, and the reorg helpers | result=hit,miss |
+| `lean_beacon_justified_balances_build_seconds` | Histogram | Time to build one snapshot from the checkpoint state | On every miss, around the registry pass (the checkpoint state lookup is not included) | |
+
+**Read the miss rate against the justified-checkpoint rate**: about one miss
+per justified checkpoint change, so a handful per hour on a healthy chain.
+Misses that track `get_head` calls mean the justified checkpoint is flapping
+between branches, or the snapshot is being replaced between two readers.
+
+### Beacon Epoch Precompute
+
+The beacon chain actor advances the head state across the next epoch boundary
+ahead of time, so the first block of an epoch does not run `process_epoch` on
+the import path. See "Epoch-transition precompute" in
+[`beacon_stf.md`](beacon_stf.md). This is ethlambda-specific, not part of the
+leanMetrics spec.
+
+| Name | Type | Usage | Sample collection event | Labels | Buckets |
+|------|------|-------|-------------------------|--------|---------|
+| `lean_beacon_epoch_precompute_lookups_total` | Counter | Epoch-crossing imports, by whether a precomputed boundary state was cached | On each import whose parent is before the block's epoch start and whose block is at or after it | result=hit,miss | |
+| `lean_beacon_epoch_precompute_seconds` | Histogram | Worker time to advance, flush and hash one state | When a precompute worker finishes | | 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 8 |
+| `lean_beacon_epoch_precompute_started_total` | Counter | Workers started, by trigger | When a worker is spawned | trigger=head,timer | |
+
+**Read the hit ratio against epochs.** On a synced follower nearly every
+epoch-crossing import should hit. Misses mean the worker had not finished (the
+block raced it, see `lean_beacon_epoch_precompute_seconds` against the slot
+duration), the node was syncing, or the entry was evicted from the state cache.
+A `timer` start with no matching `head` start means the last slot was skipped.
 
 ### Beacon Pubkey Cache
 

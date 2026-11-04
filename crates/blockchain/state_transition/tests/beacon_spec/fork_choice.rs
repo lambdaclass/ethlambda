@@ -976,6 +976,108 @@ pub(super) fn apply_checks(
     if let Some(expected) = &checks.get_proposer_head {
         check_get_proposer_head(expected, store, config, committees)?;
     }
+    check_weights_against_the_spec(store, config)?;
+    check_node_weights_against_the_spec(store, config, committees)
+}
+
+/// The gloas counterpart of [`check_weights_against_the_spec`], run at every
+/// `checks` step of a case whose current slot is gloas.
+///
+/// The head walk weighs payload-aware nodes with `compute_node_weights`, whose
+/// vote loop reads the justified-balances snapshot; `gloas_get_weight` is the
+/// specification's per-node definition (payload status, the previous-slot
+/// rule, the gated proposer boost) and reads the justified checkpoint state
+/// itself. Every node under the justified root is compared, not only the
+/// leaves the `viable_for_head_roots_and_weights` check covers.
+fn check_node_weights_against_the_spec(
+    store: &Store,
+    config: &Config,
+    committees: &CommitteeCache,
+) -> Result<(), String> {
+    let current_slot = fork_choice::get_current_slot(store, config);
+    let fork = config.fork_at_epoch(current_slot / preset::SLOTS_PER_EPOCH);
+    if ForkRules::of(fork) != ForkRules::Gloas {
+        return Ok(());
+    }
+    let index = store.block_index();
+    let blocks = fork_choice::get_filtered_block_tree(store, &index, config)
+        .map_err(|err| format!("get_filtered_block_tree: {err:?}"))?;
+    let walked =
+        fork_choice::compute_node_weights(store, &index, config, committees, ForkRules::Gloas)
+            .map_err(|err| format!("compute_node_weights: {err:?}"))?;
+    let mut pending = vec![ForkChoiceNode {
+        root: store.beacon_justified_checkpoint().root,
+        payload_status: PayloadStatus::Pending,
+    }];
+    while let Some(node) = pending.pop() {
+        let spec = match fork_choice::gloas_get_weight(store, node, config, committees) {
+            Ok(spec) => Some(spec),
+            // A vote for a block that invalidation removed from the index: the
+            // spec-literal weight raises on it and the walk drops it on
+            // purpose, so the two are not comparable there.
+            Err(err) if format!("{err:?}").contains("root in store.blocks") => None,
+            Err(err) => {
+                return Err(format!(
+                    "gloas_get_weight(0x{}, {}): {err:?}",
+                    hex::encode(node.root.0),
+                    node.payload_status as u8
+                ));
+            }
+        };
+        if let Some(spec) = spec {
+            let block_slot = index
+                .get(&node.root)
+                .map(|&(slot, _)| slot)
+                .ok_or("a tree node is not in the block index")?;
+            let single_pass = walked.weight(node, block_slot);
+            if spec != single_pass {
+                return Err(format!(
+                    "weight of 0x{} ({}): spec gloas_get_weight {spec}, compute_node_weights {single_pass}",
+                    hex::encode(node.root.0),
+                    node.payload_status as u8
+                ));
+            }
+        }
+        pending.extend(
+            fork_choice::get_node_children(store, &blocks, node)
+                .map_err(|err| format!("get_node_children: {err:?}"))?,
+        );
+    }
+    Ok(())
+}
+
+/// Oracle for the fork-choice weights, run at every `checks` step.
+///
+/// No fixture checks weights directly, but `get_head` descends on
+/// `compute_weights` (one pass over the votes, balances from the justified-
+/// balances snapshot), while `get_weight` is the specification's per-root
+/// definition and reads the justified checkpoint state itself. Comparing the
+/// two for every block in the filtered tree puts the snapshot against the spec
+/// path on every fixture, whatever the fixture asserts.
+fn check_weights_against_the_spec(store: &Store, config: &Config) -> Result<(), String> {
+    let index = store.block_index();
+    let tree = fork_choice::get_filtered_block_tree(store, &index, config)
+        .map_err(|err| format!("get_filtered_block_tree: {err:?}"))?;
+    let weights = fork_choice::compute_weights(store, &index, config)
+        .map_err(|err| format!("compute_weights: {err:?}"))?;
+    for root in tree.keys() {
+        let spec = match fork_choice::get_weight(store, &index, *root, config) {
+            Ok(spec) => spec,
+            // A vote for a block that invalidation removed from the index
+            // (`sync/optimistic`): the specification's `get_weight` raises on
+            // it, and `compute_weights` drops such a vote on purpose, so the
+            // two are not comparable for that case.
+            Err(err) if format!("{err:?}").contains("root in store.blocks") => continue,
+            Err(err) => return Err(format!("get_weight(0x{}): {err:?}", hex::encode(root.0))),
+        };
+        let single_pass = weights.get(root).copied().unwrap_or_default();
+        if spec != single_pass {
+            return Err(format!(
+                "weight of 0x{}: spec get_weight {spec}, compute_weights {single_pass}",
+                hex::encode(root.0)
+            ));
+        }
+    }
     Ok(())
 }
 

@@ -118,14 +118,78 @@ fn main() -> eyre::Result<()> {
     }
 }
 
-/// Node logging: INFO and above, on stdout.
+/// What `/eth/v1/node/identity` reports beyond the peer id: the ENR discv5
+/// publishes, and the multiaddrs peers reach this node on. The addresses need
+/// the node's externally reachable IP, which only `--discovery.advertise-ip`
+/// supplies (a node bound to `0.0.0.0` does not know it), so without the flag
+/// they are left empty rather than guessed.
+fn beacon_identity(
+    enr: &str,
+    advertise_ip: Option<IpAddr>,
+    gossipsub_port: u16,
+    discovery_port: u16,
+    peer_id: &str,
+) -> ethlambda_rpc::BeaconIdentity {
+    let Some(ip) = advertise_ip else {
+        return ethlambda_rpc::BeaconIdentity {
+            enr: enr.to_string(),
+            ..Default::default()
+        };
+    };
+    let family = if ip.is_ipv4() { "ip4" } else { "ip6" };
+    ethlambda_rpc::BeaconIdentity {
+        enr: enr.to_string(),
+        // QUIC first, matching the order this node dials in.
+        p2p_addresses: vec![
+            format!("/{family}/{ip}/udp/{gossipsub_port}/quic-v1/p2p/{peer_id}"),
+            format!("/{family}/{ip}/tcp/{gossipsub_port}/p2p/{peer_id}"),
+        ],
+        discovery_addresses: vec![format!("/{family}/{ip}/udp/{discovery_port}/p2p/{peer_id}")],
+        metadata: None,
+    }
+}
+
+/// The level the node logs at when `RUST_LOG` says nothing.
+const NODE_LOG_LEVEL: &str = "info";
+
+/// gossipsub's warnings are dropped; only its errors show.
+///
+/// gossipsub warns once per heartbeat for every peer whose send queue is full,
+/// and each line lists every IHAVE id it dropped: a screenful per slow peer on
+/// a beacon node. The drop is already counted in the peer's failed-message
+/// tally and charged to its score, and the crate's other warnings are
+/// per-peer protocol violations (bad signatures, substream limits) that the
+/// scoring handles too, so none of them is an operator's concern.
+const GOSSIPSUB_LOG_CAP: &str = "libp2p_gossipsub=error";
+
+/// Node logging: [`NODE_LOG_LEVEL`] and [`GOSSIPSUB_LOG_CAP`], amended by
+/// `RUST_LOG`, on stdout.
 fn init_node_logging() -> eyre::Result<()> {
-    let filter = EnvFilter::builder()
-        .with_default_directive(tracing::Level::INFO.into())
-        .from_env_lossy();
-    let subscriber = Registry::default().with(tracing_subscriber::fmt::layer().with_filter(filter));
+    let rust_log = std::env::var(EnvFilter::DEFAULT_ENV).ok();
+    let subscriber = Registry::default()
+        .with(tracing_subscriber::fmt::layer().with_filter(node_log_filter(rust_log.as_deref())));
     tracing::subscriber::set_global_default(subscriber)
         .wrap_err("failed to set global tracing subscriber")
+}
+
+/// The node's log filter: [`GOSSIPSUB_LOG_CAP`], then the `RUST_LOG`
+/// directives when there are any, else [`NODE_LOG_LEVEL`].
+///
+/// A `RUST_LOG` directive on a target the defaults name replaces the default
+/// (`libp2p_gossipsub=warn` brings the warnings back), one on any other target
+/// adds to them, and `RUST_LOG` keeps replacing the `info` floor the way
+/// `from_env_lossy` always let it: `RUST_LOG=ethlambda_p2p=debug` alone still
+/// shows nothing else. `EnvFilter` only falls back to a default level when it
+/// was given no directive at all, which is why the floor is spelled out here
+/// rather than passed as the default directive. A bare `RUST_LOG=debug` leaves
+/// the cap in place, since the more specific directive wins; name the crate to
+/// see its chatter.
+fn node_log_filter(rust_log: Option<&str>) -> EnvFilter {
+    let directives = match rust_log.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(rust_log) => format!("{GOSSIPSUB_LOG_CAP},{rust_log}"),
+        None => format!("{NODE_LOG_LEVEL},{GOSSIPSUB_LOG_CAP}"),
+    };
+    EnvFilter::builder().parse_lossy(directives)
 }
 
 /// Benchmark logging: WARN and above, on stderr, so that the report owns stdout
@@ -738,6 +802,16 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         } => ethlambda_rpc::CustodyColumns(custody_columns.clone()),
         ChainActor::Lean(..) => ethlambda_rpc::CustodyColumns::default(),
     };
+    let rpc_identity = ethlambda_rpc::BeaconIdentity {
+        metadata: p2p.local_metadata(),
+        ..beacon_identity(
+            p2p.local_enr().unwrap_or_default(),
+            common.discovery.advertise_ip,
+            common.gossipsub_port,
+            common.discovery.port,
+            &local_peer_id,
+        )
+    };
     // Block production builds its payloads with the same execution client the
     // chain actor validates them with.
     let rpc_engine = match &setup.chain {
@@ -767,6 +841,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     engine: rpc_engine,
                     events: rpc_events,
                     client_version: version::engine_client_version(),
+                    identity: rpc_identity,
                 },
                 local_peer_id,
                 rpc_shutdown,
@@ -1658,9 +1733,12 @@ fn first_config_difference(
         reorg_parent_weight_threshold: _,
         reorg_max_epochs_since_finalization: _,
 
-        // Transition (bellatrix): mainnet crossed this in 2022 and every
-        // shipped network leaves it at its default; not worth chain-identity
-        // treatment for the same reason the fork-choice group above is not.
+        // Transition (bellatrix): these only judge the merge transition block
+        // (`validate_merge_block`), and every shipped network is past its
+        // merge. Sepolia's file does set the `TERMINAL_BLOCK_HASH` override
+        // its merge used, but no block a node imports today is checked
+        // against it. Not worth chain-identity treatment for the same reason
+        // the fork-choice group above is not.
         terminal_total_difficulty: _,
         terminal_block_hash: _,
         terminal_block_hash_activation_epoch: _,
@@ -2233,6 +2311,82 @@ mod tests {
     use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use ethlambda_types::genesis::GenesisValidatorEntry;
     use ethlambda_types::state::PUBLIC_KEY_SIZE;
+
+    /// Emits one event per (target, level) of interest under a subscriber
+    /// built from `node_log_filter(rust_log)` and returns what got written.
+    fn logged_with(rust_log: Option<&str>) -> String {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("sink lock").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let sink = Sink::default();
+        let writer = sink.clone();
+        let subscriber = Registry::default().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .with_filter(node_log_filter(rust_log)),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: "libp2p_gossipsub::behaviour", "gossipsub-warn");
+            tracing::error!(target: "libp2p_gossipsub::behaviour", "gossipsub-error");
+            tracing::info!(target: "ethlambda_p2p", "p2p-info");
+            tracing::debug!(target: "ethlambda_p2p", "p2p-debug");
+        });
+        let bytes = sink.0.lock().expect("sink lock").clone();
+        String::from_utf8(bytes).expect("log output is UTF-8")
+    }
+
+    /// With no `RUST_LOG`, the node logs at INFO except for gossipsub's
+    /// warnings, which are the send-queue-full flood; its errors still show.
+    #[test]
+    fn node_logging_drops_gossipsub_warnings_by_default() {
+        let out = logged_with(None);
+        assert!(out.contains("p2p-info"), "INFO floor missing: {out}");
+        assert!(
+            out.contains("gossipsub-error"),
+            "gossipsub errors must survive: {out}"
+        );
+        assert!(
+            !out.contains("gossipsub-warn"),
+            "gossipsub warnings leaked: {out}"
+        );
+        assert!(
+            !out.contains("p2p-debug"),
+            "DEBUG leaked at the INFO floor: {out}"
+        );
+    }
+
+    /// A `RUST_LOG` directive on the capped target replaces the cap, while
+    /// its other directives are honored as before.
+    #[test]
+    fn rust_log_lifts_the_gossipsub_cap_and_keeps_its_other_directives() {
+        let out = logged_with(Some("info,libp2p_gossipsub=warn,ethlambda_p2p=debug"));
+        assert!(out.contains("gossipsub-warn"), "cap not lifted: {out}");
+        assert!(out.contains("p2p-debug"), "other directive dropped: {out}");
+    }
+
+    /// `RUST_LOG` without an `info` of its own replaces the floor, as
+    /// `from_env_lossy` always did, and the cap stays in place.
+    #[test]
+    fn rust_log_without_a_floor_still_replaces_it() {
+        let out = logged_with(Some("ethlambda_p2p=debug"));
+        assert!(out.contains("p2p-debug"), "{out}");
+        assert!(!out.contains("gossipsub-warn"), "cap lost: {out}");
+    }
 
     /// The duty subnet is the first explicitly assigned subnet, so an operator
     /// can place co-located aggregators on different subnets deliberately.

@@ -185,15 +185,15 @@ fn apply(
         // module's own doc. `inactivity_updates` reads gloas too, below: its
         // participation and inactivity lists are progressive (EIP-7688), a
         // different Rust type from the bounded `SszList` altair's own copy
-        // used to need, but `BeaconState::inactivity_scores_mut` and
-        // `altair_validator_lists` both now reach either list kind through a
-        // shared slice type. `participation_flag_updates`, just below, is the
+        // used to need, but `BeaconState::inactivity_score_mut` and
+        // `altair_validator_lists` both now reach either list kind (the latter
+        // through `InactivityScoresRef`). `participation_flag_updates`, just below, is the
         // one exception: it *replaces* the whole list rather than writing an
         // element, which only the fork's own concrete container type can do,
         // so gloas keeps its own copy of that one step; see
         // `epoch::gloas`'s own module doc.
         "inactivity_updates" => match fork {
-            // `BeaconState::inactivity_scores_mut` reaches a gloas state's
+            // `BeaconState::inactivity_score_mut` reaches a gloas state's
             // scores too (element writes only, which both list kinds allow
             // through `DerefMut`; see that accessor's own doc), so this one
             // copy serves gloas as well.

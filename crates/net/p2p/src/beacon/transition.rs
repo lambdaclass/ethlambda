@@ -107,13 +107,16 @@ pub(crate) fn advance(server: &mut P2PServer) -> Option<Duration> {
 
 /// Move the node to the state the schedule prescribes at `epoch`.
 ///
-/// 1. Join the topics of every digest the window now covers, including the
+/// 1. Hand the swarm the peer-scoring parameters of every digest the window
+///    now covers, each by its role (beacon scoring only; see
+///    [`super::scoring::PeerScoring::hold`]).
+/// 2. Join the topics of every digest the window now covers, including the
 ///    aggregator-subnet topics already held for the current slot.
-/// 2. Leave the topics of every digest the window no longer covers.
-/// 3. If the current digest changed, switch what this node publishes and
+/// 3. Leave the topics of every digest the window no longer covers.
+/// 4. If the current digest changed, switch what this node publishes and
 ///    advertises: digest, fork, metadata sequence number, metric, and the
 ///    `eth2` entry.
-/// 4. Point the admission filter at the new entry, admitting every held digest.
+/// 5. Point the admission filter at the new entry, admitting every held digest.
 pub(crate) fn apply(server: &mut P2PServer, epoch: Epoch) -> Changes {
     let mut changes = Changes::default();
     let Wire::Beacon(wire) = &mut server.wire else {
@@ -131,6 +134,19 @@ pub(crate) fn apply(server: &mut P2PServer, epoch: Epoch) -> Changes {
         return changes;
     }
     let column_subnets = topics::column_subnets(&wire.custody_columns);
+
+    // Before any join: gossipsub tracks a mesh peer on a topic only if the
+    // topic had parameters when the peer was grafted, and joining grafts at
+    // once.
+    if let Some(scoring) = &mut server.peer_scoring {
+        let digests = held.iter().map(|entry| entry.digest).collect();
+        scoring.hold(
+            digests,
+            current.digest,
+            wire.wall_slot(),
+            &server.swarm_handle,
+        );
+    }
 
     let mut existing = std::mem::take(&mut wire.window_topics);
     existing.push(wire.topics.clone());
@@ -209,7 +225,7 @@ pub(crate) fn apply(server: &mut P2PServer, epoch: Epoch) -> Changes {
         let previous = wire.fork_digest;
         wire.fork_digest = current.digest;
         wire.fork = current.fork;
-        wire.metadata_seq_number += 1;
+        wire.bump_metadata_seq_number();
         let digest_hex = hex::encode(current.digest);
         metrics::set_beacon_fork_digest(&digest_hex);
         info!(

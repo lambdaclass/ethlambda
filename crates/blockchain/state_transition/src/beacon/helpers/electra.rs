@@ -134,8 +134,8 @@ use crate::beacon::hash::hash;
 use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
-    BLS_SIGNATURE_SIZE, BlsSignature, Bytes32, CommitteeIndex, Epoch, Gwei, HashTreeRoot as _,
-    Slot, ValidatorIndex,
+    BLS_SIGNATURE_SIZE, BlsSignature, Bytes32, CommitteeIndex, Domain, Epoch, Gwei,
+    HashTreeRoot as _, Slot, ValidatorIndex,
 };
 
 use super::accessors::{
@@ -280,6 +280,23 @@ pub fn is_valid_indexed_attestation(
     state: &BeaconState,
     indexed_attestation: &electra::IndexedAttestation,
 ) -> bool {
+    let domain = get_domain(
+        state,
+        constants::DOMAIN_BEACON_ATTESTER,
+        Some(indexed_attestation.data.target.epoch),
+    );
+    is_valid_indexed_attestation_with_domain(state, indexed_attestation, domain)
+}
+
+/// [`is_valid_indexed_attestation`] under a signing domain the caller chose.
+///
+/// For gossip, which checks against a state that may not have reached the
+/// attestation's fork: see [`super::accessors::get_domain_from_schedule`].
+pub fn is_valid_indexed_attestation_with_domain(
+    state: &BeaconState,
+    indexed_attestation: &electra::IndexedAttestation,
+    domain: Domain,
+) -> bool {
     let indices: &[ValidatorIndex] = &indexed_attestation.attesting_indices;
     if indices.is_empty() || !are_indices_sorted_and_unique(indices) {
         return false;
@@ -293,11 +310,6 @@ pub fn is_valid_indexed_attestation(
         }
     }
 
-    let domain = get_domain(
-        state,
-        constants::DOMAIN_BEACON_ATTESTER,
-        Some(indexed_attestation.data.target.epoch),
-    );
     let signing_root = compute_signing_root(indexed_attestation.data.hash_tree_root(), domain);
     bls::fast_aggregate_verify(&pubkeys, signing_root, &indexed_attestation.signature)
 }

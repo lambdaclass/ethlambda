@@ -31,7 +31,7 @@
 //!   [`super::altair::process_rewards_and_penalties`]) reach
 //!   `previous_epoch_participation`/`current_epoch_participation`/`inactivity_scores`
 //!   as plain slices, through [`crate::beacon::containers::BeaconState::altair_validator_lists`]
-//!   and [`crate::beacon::containers::BeaconState::inactivity_scores_mut`]: both
+//!   and [`crate::beacon::containers::BeaconState::inactivity_score_mut`]: both
 //!   `SszList` and `ProgressiveList` `Deref` to a plain `[T]`.
 //! - **[`super::electra::process_pending_consolidations`]** takes the queue
 //!   as a `Vec` and writes it back, through

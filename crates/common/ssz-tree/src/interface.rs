@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use libssz::{BYTES_PER_LENGTH_OFFSET, DecodeError, SszDecode, SszEncode};
 
+use crate::cursor::IterCow;
 use crate::iter::{Iter, TreeIter};
 use crate::tree::Tree;
 use crate::update_map::UpdateMap;
@@ -91,6 +92,16 @@ impl<T: Value, U: UpdateMap<T>> Interface<T, U> {
         self.tree = Tree::with_updated_leaves(&self.tree, self.depth, 0, &mut updates);
         debug_assert!(updates.next().is_none(), "every pending write is in range");
         self.committed_len = self.len;
+    }
+
+    /// Applies pending writes, then starts an in-order pass whose writes reach
+    /// the tree when it is dropped, bypassing the pending-write map.
+    ///
+    /// Applying first keeps the pass simple: it reads the tree alone, so a
+    /// write made earlier is never hidden by (or lost to) the pass.
+    pub(crate) fn iter_cow(&mut self) -> IterCow<'_, T> {
+        self.apply_updates();
+        IterCow::new(&mut self.tree, self.depth)
     }
 
     pub(crate) fn iter_from(&self, start: usize) -> Iter<'_, T, U> {

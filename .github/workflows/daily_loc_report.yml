@@ -34,7 +34,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.1.0
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@master
@@ -42,14 +42,14 @@ jobs:
           toolchain: "1.97.1"
 
       - name: Setup cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@v2.9.3
 
       - name: Install cargo-warloc
         run: cargo install cargo-warloc --locked --version 0.1.1
 
       - name: Restore previous LoC report
         id: cache-loc-report
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@v5.1.0
         with:
           path: loc_report.json
           key: loc-report-${{ github.ref_name }}-${{ github.run_id }}
@@ -65,7 +65,7 @@ jobs:
 
       - name: Save new LoC report to cache
         if: success()
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@v5.1.0
         with:
           path: loc_report.json
           key: loc-report-${{ github.ref_name }}-${{ github.run_id }}

@@ -285,23 +285,6 @@ from the Beacon API, and no other way.
   (a member asked after a restart answers `payload_present = false` for an
   envelope that arrived before it), and the next slot's record starts fresh.
 
-## `/eth/v1/node/identity` reports no ENR
-
-The endpoint's `enr`, `p2p_addresses` and `discovery_addresses` are empty
-rather than populated, which is not spec-valid.
-
-- **ethlambda:** `get_identity` (`crates/net/rpc/src/beacon/node.rs`) reports
-  `peer_id` and a placeholder `metadata` block and nothing else. The ENR is
-  built for discv5 and owned by the P2P actor; `BuiltSwarm` hands `run_node`
-  only a `local_peer_id`, so serving the record means widening the
-  `ethlambda-p2p` surface and threading it through startup.
-- **Beacon API:** `enr` is the node's base64 ENR and the two lists are its
-  libp2p multiaddrs.
-- **Consequence:** a consumer reading `enr` to dial this node gets an empty
-  string rather than a record, so peer discovery through this endpoint does not
-  work. Everything that reads `peer_id` is unaffected. Out of scope for the
-  change that added the Beacon API surface; a follow-up exposes the record.
-
 ## Sync duties are not served for a period before the head's
 
 `POST /eth/v1/validator/duties/sync/{epoch}` refuses a period before the head
@@ -529,6 +512,31 @@ node, and each call walks every latest message and every ancestor step.
   `gloas_get_weight` remain, as the references the walk is compared with, at
   every `head` check of every fork-choice fixture and on randomized trees;
   `compute_head` is the pre-gloas reference.
+
+## The committee fraction leaves slashed validators out, ahead of the pinned release
+
+The proposer boost and both reorg thresholds follow a consensus-specs change
+newer than the release the fixtures are pinned to.
+
+- **The pinned release (`v1.7.0-beta.2`):** `calculate_committee_fraction`
+  divides `get_total_active_balance`, which counts a validator that is slashed
+  but still active, and `get_proposer_score` does the same arithmetic inline.
+- **ethlambda:** both divide the total balance of the active, unslashed
+  validators, as consensus-specs #5679 does (first released in
+  `v1.7.0-beta.4`). Fork choice weighs no vote from a slashed validator, so
+  during a mass slashing a boost sized against their stake outweighs a larger
+  share of the votes that still count, which makes a reorg easier. The
+  `JustifiedBalances` snapshot carries that total (`total_balance`)
+  beside each validator's raw effective balance,
+  which `is_head_weak` still adds back for equivocators in the head slot's
+  committees, slashed or not.
+- **Other clients:** Lighthouse's `JustifiedBalances::from_justified_state`
+  already sums active, unslashed validators only.
+- **Consequence:** none while no active validator in the justified state is
+  slashed. No `v1.7.0-beta.2` fork-choice fixture distinguishes the two: the
+  one that slashes validators in its anchor state ticks past the boosted slot
+  before it checks the head. Remove this entry when the pin reaches
+  `v1.7.0-beta.4`.
 
 ## The execution client judges a gloas payload before the envelope is applied
 

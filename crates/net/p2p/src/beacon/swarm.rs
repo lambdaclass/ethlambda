@@ -1,10 +1,11 @@
 //! The beacon half of the swarm configuration.
 //!
-//! Five things differ from lean at the swarm level: the topic set, the protocol
-//! set, the `seen_ttl`, the identify protocol version and the connection limits.
-//! [`crate::build_swarm`] resolves all five from the variant it is handed, and
-//! every one of them that is a beacon *value* rather than a lean one lives here,
-//! so tuning the mainnet numbers never means editing the crate root.
+//! Six things differ from lean at the swarm level: the topic set, the protocol
+//! set, the `seen_ttl`, the identify protocol version, the connection limits and
+//! peer scoring. [`crate::build_swarm`] resolves all six from the variant it is
+//! handed, and every one of them that is a beacon *value* rather than a lean one
+//! lives here or, for scoring, in [`crate::beacon::scoring`], so tuning the
+//! mainnet numbers never means editing the crate root.
 
 use std::time::Duration;
 

@@ -1143,7 +1143,7 @@ pub async fn publish_payload_attestation_message(
 }
 
 /// The beacon wall-clock slot, from the wire's genesis and slot duration.
-fn beacon_wall_slot(wire: &BeaconWire) -> u64 {
+pub(crate) fn beacon_wall_slot(wire: &BeaconWire) -> u64 {
     wire.wall_slot()
 }
 

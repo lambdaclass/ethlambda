@@ -31,7 +31,7 @@ use ethlambda_state_transition::beacon::{
     bls,
     gossip::attestation::compute_subnet_for_attestation,
     gossip::{IgnoreReason, Outcome, RejectReason, aggregate, verify_attestation_payload_status},
-    helpers::accessors::{CommitteeCacheExt as _, get_domain},
+    helpers::accessors::{CommitteeCacheExt as _, get_domain_from_schedule},
 };
 use ethlambda_storage::Store;
 use ethlambda_types::{
@@ -241,12 +241,14 @@ fn validate(
     let committee_len = committee.len();
 
     // [REJECT] The signature is valid, under the attester domain at the target
-    // epoch.
+    // epoch. The schedule's domain, not the head state's: the head may still be
+    // the previous fork's while the target epoch's first slots are empty.
     let pubkey = state
         .validator(attestation.attester_index)
         .map_err(|_| "attester index is unknown")?
         .pubkey;
-    let domain = get_domain(state, DOMAIN_BEACON_ATTESTER, Some(data.target.epoch));
+    let domain =
+        get_domain_from_schedule(&config, state, DOMAIN_BEACON_ATTESTER, data.target.epoch);
     let signing_root = compute_signing_root(data.hash_tree_root(), domain);
     if !bls::verify(&pubkey, signing_root, &attestation.signature) {
         return Err("invalid signature");
@@ -505,11 +507,11 @@ mod tests {
     use crate::test_utils::{RecordingNetwork, idle_engine};
     use axum::{body::Body, http::Request};
     use ethlambda_state_transition::beacon::helpers::{
-        accessors::get_beacon_committee,
+        accessors::{get_beacon_committee, get_domain_from_schedule},
         test_state::{sign_for, with_signing_validators_at},
     };
     use ethlambda_types::beacon::config::Config;
-    use ethlambda_types::beacon::containers::shared::{AttestationData, Checkpoint};
+    use ethlambda_types::beacon::containers::shared::{AttestationData, Checkpoint, Fork};
     use http_body_util::BodyExt as _;
     use tower::ServiceExt as _;
 
@@ -561,6 +563,37 @@ mod tests {
         }
     }
 
+    /// A fulu head whose epoch is the last before a gloas fork the schedule
+    /// places at the wall clock's epoch: what a node holds while the new
+    /// fork's first slot has no block yet. The head sits at its epoch's first
+    /// slot, as [`fixture`]'s does, so it is its own checkpoint. Its votes are
+    /// gloas's, so it submits under that version.
+    fn fork_boundary_fixture() -> Fixture {
+        let mut state = with_signing_validators_at(ForkName::Fulu, 64);
+        let (probe, _) = crate::test_utils::beacon_store_at(state.clone());
+        let wall_epoch = compute_epoch_at_slot(crate::beacon::node::wall_slot(&probe));
+        let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, wall_epoch);
+        *state.slot_mut() = compute_start_slot_at_epoch(wall_epoch - 1);
+        *state.fork_mut() = Fork {
+            previous_version: config.fork_version(ForkName::Electra),
+            current_version: config.fork_version(ForkName::Fulu),
+            epoch: config.fulu_fork_epoch,
+        };
+        let (store, head_root) = crate::test_utils::beacon_store_with_config(state.clone(), config);
+        Fixture {
+            store,
+            state,
+            head_root,
+            network: Arc::new(RecordingNetwork::default()),
+            version: "gloas",
+        }
+    }
+
+    /// The first slot of the epoch after [`fork_boundary_fixture`]'s head.
+    fn first_slot_of_the_fork(fixture: &Fixture) -> u64 {
+        compute_start_slot_at_epoch(compute_epoch_at_slot(fixture.state.slot()) + 1)
+    }
+
     /// A correctly signed attestation from `committee`'s member at `position`,
     /// voting for the head at the head's own slot.
     fn attestation(fixture: &Fixture, committee_index: u64, position: usize) -> SingleAttestation {
@@ -576,7 +609,9 @@ mod tests {
     }
 
     /// A correctly signed vote at `slot` for the block and target roots in
-    /// `(block, target)`, carrying `index` as its `data.index`.
+    /// `(block, target)`, carrying `index` as its `data.index`. Signed the way
+    /// a validator client does: under the domain its fork schedule names for
+    /// the target epoch.
     fn attestation_for(
         fixture: &Fixture,
         slot: u64,
@@ -598,7 +633,12 @@ mod tests {
         };
         let committee = get_beacon_committee(&fixture.state, slot, committee_index).unwrap();
         let attester_index = committee[position];
-        let domain = get_domain(&fixture.state, DOMAIN_BEACON_ATTESTER, Some(epoch));
+        let domain = get_domain_from_schedule(
+            &fixture.store.config(),
+            &fixture.state,
+            DOMAIN_BEACON_ATTESTER,
+            epoch,
+        );
         let signing_root = compute_signing_root(data.hash_tree_root(), domain);
         SingleAttestation {
             committee_index,
@@ -776,10 +816,11 @@ mod tests {
             .collect();
         let signature: ethlambda_types::beacon::primitives::BlsSignature =
             serde_json::from_value(json["data"]["signature"].clone()).unwrap();
-        let domain = get_domain(
+        let domain = get_domain_from_schedule(
+            &fixture.store.config(),
             &fixture.state,
             DOMAIN_BEACON_ATTESTER,
-            Some(data.target.epoch),
+            data.target.epoch,
         );
         let signing_root = compute_signing_root(data.hash_tree_root(), domain);
         assert!(
@@ -852,7 +893,9 @@ mod tests {
         };
         let slot = aggregate.data.slot;
         let epoch = compute_epoch_at_slot(slot);
-        let selection_domain = get_domain(&fixture.state, DOMAIN_SELECTION_PROOF, Some(epoch));
+        let config = fixture.store.config();
+        let selection_domain =
+            get_domain_from_schedule(&config, &fixture.state, DOMAIN_SELECTION_PROOF, epoch);
         let selection_proof = sign_for(
             aggregator as usize,
             compute_signing_root(slot.hash_tree_root(), selection_domain),
@@ -862,7 +905,8 @@ mod tests {
             aggregate,
             selection_proof,
         };
-        let domain = get_domain(&fixture.state, DOMAIN_AGGREGATE_AND_PROOF, Some(epoch));
+        let domain =
+            get_domain_from_schedule(&config, &fixture.state, DOMAIN_AGGREGATE_AND_PROOF, epoch);
         let signature = sign_for(
             aggregator as usize,
             compute_signing_root(message.hash_tree_root(), domain),
@@ -1132,7 +1176,9 @@ mod tests {
         };
         let slot = aggregate.data.slot;
         let epoch = compute_epoch_at_slot(slot);
-        let selection_domain = get_domain(&fixture.state, DOMAIN_SELECTION_PROOF, Some(epoch));
+        let config = fixture.store.config();
+        let selection_domain =
+            get_domain_from_schedule(&config, &fixture.state, DOMAIN_SELECTION_PROOF, epoch);
         let selection_proof = sign_for(
             aggregator as usize,
             compute_signing_root(slot.hash_tree_root(), selection_domain),
@@ -1142,7 +1188,8 @@ mod tests {
             aggregate: gloas::Attestation::from(aggregate),
             selection_proof,
         };
-        let domain = get_domain(&fixture.state, DOMAIN_AGGREGATE_AND_PROOF, Some(epoch));
+        let domain =
+            get_domain_from_schedule(&config, &fixture.state, DOMAIN_AGGREGATE_AND_PROOF, epoch);
         let signature = sign_for(
             aggregator as usize,
             compute_signing_root(message.hash_tree_root(), domain),
@@ -1194,6 +1241,61 @@ mod tests {
         let published = fixture.network.aggregates.lock().unwrap();
         assert_eq!(published.len(), 1);
         assert_eq!(published[0].0, SignedAggregateAndProof::Gloas(signed));
+    }
+
+    /// A vote in a fork's first slot, before any block of that fork: checked
+    /// against the previous fork's head state, signed under the new fork.
+    #[tokio::test]
+    async fn an_attestation_in_a_forks_first_empty_slot_is_published() {
+        let fixture = fork_boundary_fixture();
+        let slot = first_slot_of_the_fork(&fixture);
+        let roots = (fixture.head_root, fixture.head_root);
+        let vote = attestation_for(&fixture, slot, roots, 0, 0, 0);
+        let (status, json) = submit(&fixture, std::slice::from_ref(&vote)).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let published = fixture.network.published.lock().unwrap();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].1, vote);
+    }
+
+    /// The aggregate counterpart: its selection proof, its aggregator's
+    /// signature and the aggregate's own signature are all the new fork's.
+    #[tokio::test]
+    async fn an_aggregate_in_a_forks_first_empty_slot_is_published() {
+        let fixture = fork_boundary_fixture();
+        let slot = first_slot_of_the_fork(&fixture);
+        let committee = get_beacon_committee(&fixture.state, slot, 0).unwrap();
+        let roots = (fixture.head_root, fixture.head_root);
+        let votes: Vec<SingleAttestation> = (0..committee.len())
+            .map(|position| attestation_for(&fixture, slot, roots, 0, 0, position))
+            .collect();
+        let (status, json) = submit(&fixture, &votes).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let pooled = fixture
+            .store
+            .attestation_pool()
+            .aggregate(votes[0].data.hash_tree_root(), slot, 0)
+            .unwrap();
+
+        // 64 validators give each committee fewer members than
+        // TARGET_AGGREGATORS_PER_COMMITTEE, so every member is an aggregator.
+        let signed = signed_gloas_aggregate(&fixture, committee[0], &pooled);
+        let network: RpcToP2PRef = fixture.network.clone();
+        let app = routes()
+            .with_state(fixture.store.clone())
+            .layer(Extension(network));
+        let request = Request::post("/eth/v2/validator/aggregate_and_proofs")
+            .header("content-type", "application/json")
+            .header("eth-consensus-version", "gloas")
+            .body(Body::from(
+                serde_json::to_vec(std::slice::from_ref(&signed)).unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(fixture.network.aggregates.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

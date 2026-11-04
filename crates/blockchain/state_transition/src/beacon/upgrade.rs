@@ -1411,8 +1411,8 @@ mod tests {
         // place rather than clearing it, since `historical_summaries` is
         // where new history accumulates from here on.
         assert_eq!(
-            post.historical_roots.into_inner(),
-            bellatrix_state.historical_roots.into_inner()
+            post.historical_roots.to_vec(),
+            bellatrix_state.historical_roots.to_vec()
         );
         assert_eq!(post.next_withdrawal_index, 0);
         assert_eq!(post.next_withdrawal_validator_index, 0);

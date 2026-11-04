@@ -23,8 +23,8 @@ use crate::beacon::containers::shared::{
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::{
-    CommitteeCache, CommitteeCacheExt, get_beacon_proposer_index, get_current_epoch, get_domain,
-    get_previous_epoch,
+    ActiveBalanceCache, CommitteeCache, CommitteeCacheExt, get_beacon_proposer_index,
+    get_current_epoch, get_domain, get_previous_epoch,
 };
 use crate::beacon::helpers::attestation::{get_indexed_attestation, is_valid_indexed_attestation};
 use crate::beacon::helpers::misc::{
@@ -73,6 +73,7 @@ pub fn process_operations(
     voluntary_exits: &[SignedVoluntaryExit],
     config: &Config,
     committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     // Checked before anything below can mutate `state`, and unconditionally
     // rather than only when `attestations` is non-empty: a refused fork must
@@ -133,7 +134,12 @@ pub fn process_operations(
         // `get_base_reward` implementations: neither is renamed, and the call
         // site picks between them by fully-qualified path.
         if altair_attestations {
-            crate::beacon::stf::altair::process_attestation(state, attestation, committees)?;
+            crate::beacon::stf::altair::process_attestation(
+                state,
+                attestation,
+                committees,
+                active_balances,
+            )?;
         } else {
             process_attestation(state, attestation, config, committees)?;
         }
