@@ -640,9 +640,10 @@ message's slot and the signing domain from the config's fork schedule.
   `until_epoch` (exclusive) clamped to the end of the next period. The node
   never subscribes without a request, because validating every subnet would
   cost each follower up to `SYNC_COMMITTEE_SIZE` BLS verifications a slot.
-  `syncnets` appears in MetaData, never in the ENR: ethrex's `DiscoveryServer`
-  cannot replace the served record at runtime, the same known gap as the
-  `eth2` entry. Peers therefore find this node's sync subnets by chance, while
+  `syncnets` appears in MetaData, never in the ENR: the served record can be
+  edited at runtime (`discovery::LocalEnrWriter` moves `eth2` at a fork
+  boundary), but nothing writes the subscription set to it yet. Peers
+  therefore find this node's sync subnets by chance, while
   publishing still reaches the mesh, because a joined subnet is subscribed.
 - The `sync_committee_contribution_and_proof` topic is the exception: it is
   subscribed under every digest and always validated, and accepted
