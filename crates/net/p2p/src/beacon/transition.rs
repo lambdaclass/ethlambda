@@ -225,7 +225,7 @@ pub(crate) fn apply(server: &mut P2PServer, epoch: Epoch) -> Changes {
         let previous = wire.fork_digest;
         wire.fork_digest = current.digest;
         wire.fork = current.fork;
-        wire.metadata_seq_number += 1;
+        wire.bump_metadata_seq_number();
         let digest_hex = hex::encode(current.digest);
         metrics::set_beacon_fork_digest(&digest_hex);
         info!(

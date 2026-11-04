@@ -102,20 +102,35 @@ async fn get_version(version: &'static str) -> Response {
 ///
 /// The addresses are only as good as `--discovery.advertise-ip`: without it the
 /// node does not know the address peers reach it on, so the lists are empty and
-/// the ENR carries no IP. `metadata` is still a placeholder.
+/// the ENR carries no IP.
+///
+/// `metadata` is the `MetaData` peers get over req/resp, read at request time.
+/// Its `seq_number` versions that `MetaData` alone, so it is not the ENR's
+/// `seq`: the p2p specification counts the two separately.
 async fn get_identity(peer_id: String, identity: Option<crate::BeaconIdentity>) -> Response {
     let identity = identity.unwrap_or_default();
+    let metadata = match identity.metadata {
+        Some(metadata) => {
+            let metadata = metadata.get();
+            serde_json::json!({
+                "seq_number": metadata.seq_number.to_string(),
+                "attnets": format!("0x{}", hex::encode(&metadata.attnets)),
+                "syncnets": format!("0x{}", hex::encode(&metadata.syncnets)),
+            })
+        }
+        None => serde_json::json!({
+            "seq_number": "0",
+            "attnets": "0x0000000000000000",
+            "syncnets": "0x00",
+        }),
+    };
     crate::json_response(serde_json::json!({
         "data": {
             "peer_id": peer_id,
             "enr": identity.enr,
             "p2p_addresses": identity.p2p_addresses,
             "discovery_addresses": identity.discovery_addresses,
-            "metadata": {
-                "seq_number": "0",
-                "attnets": "0x0000000000000000",
-                "syncnets": "0x00",
-            },
+            "metadata": metadata,
         }
     }))
 }
@@ -242,6 +257,7 @@ mod tests {
             enr: "enr:-abc".to_string(),
             p2p_addresses: vec!["/ip4/10.0.0.1/tcp/9001/p2p/test-peer".to_string()],
             discovery_addresses: vec!["/ip4/10.0.0.1/udp/9000/p2p/test-peer".to_string()],
+            metadata: None,
         };
         let app = routes("ethlambda/test", "test-peer".into())
             .with_state(fixture.store)
@@ -260,5 +276,35 @@ mod tests {
             json["data"]["discovery_addresses"][0],
             "/ip4/10.0.0.1/udp/9000/p2p/test-peer"
         );
+    }
+
+    /// `metadata` is read from the p2p layer's handle on each request, so a
+    /// change published after the router was built is what the next answer
+    /// reports.
+    #[tokio::test]
+    async fn identity_reports_the_metadata_peers_are_told() {
+        let fixture = beacon_fixture(ANCHOR_SLOT);
+        let metadata = ethlambda_network_api::MetaDataController::default();
+        let identity = crate::BeaconIdentity {
+            metadata: Some(metadata.clone()),
+            ..Default::default()
+        };
+        let app = routes("ethlambda/test", "test-peer".into())
+            .with_state(fixture.store)
+            .layer(Extension(identity));
+
+        metadata.set(ethlambda_network_api::AdvertisedMetaData {
+            seq_number: 3,
+            attnets: vec![0x00, 0x10, 0, 0, 0, 0, 0, 0x01],
+            syncnets: vec![0x04],
+        });
+        let request = Request::builder()
+            .uri("/eth/v1/node/identity")
+            .body(Body::empty())
+            .unwrap();
+        let json = body_json(app.oneshot(request).await.unwrap()).await;
+        assert_eq!(json["data"]["metadata"]["seq_number"], "3");
+        assert_eq!(json["data"]["metadata"]["attnets"], "0x0010000000000001");
+        assert_eq!(json["data"]["metadata"]["syncnets"], "0x04");
     }
 }
