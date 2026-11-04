@@ -127,6 +127,14 @@ impl KeyStatus {
             message: Some(message.to_string()),
         }
     }
+
+    /// The key is already known to this client, through either route.
+    pub(super) fn duplicate() -> Self {
+        Self {
+            status: "duplicate".to_string(),
+            message: None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -559,6 +567,20 @@ fn prepare_import(
     let secret = keystore.decrypt(password).map_err(KeyStatus::error)?;
     let pubkey = ValidatorStore::derive_pubkey(&secret).map_err(KeyStatus::error)?;
 
+    // A key a remote signer holds is `duplicate` here, the mirror of what
+    // `/eth/v1/remotekeys` answers for a local one: neither route silently
+    // replaces the other's entry. Re-importing a key this route already
+    // holds is still `imported`, since that is how a password is rotated.
+    let held_remotely = definitions.0.iter().any(|definition| {
+        definition.signing.is_remote()
+            && parse_pubkey(&definition.voting_public_key)
+                .map(|parsed| parsed == pubkey)
+                .unwrap_or(false)
+    });
+    if held_remotely {
+        return Err(KeyStatus::duplicate());
+    }
+
     // Persisted before the key is reachable through the store: a validator
     // this process is willing to sign with must already be durable, or a
     // crash right after "imported" is reported silently loses it, with
@@ -603,6 +625,13 @@ fn regular_file_bytes(path: &Path) -> crate::Result<Option<Vec<u8>>> {
 /// only step of an import that needs the write lock: a cheap, synchronous
 /// scalar validation and hashmap insert, never an await.
 fn finish_import(store: &mut ValidatorStore, secret: &[u8; 32]) -> KeyStatus {
+    // Checked again under the write lock: `prepare_import` judged the file,
+    // and a remote import can land between that and this insert.
+    match ValidatorStore::derive_pubkey(secret) {
+        Ok(pubkey) if store.remote_url(&pubkey).is_some() => return KeyStatus::duplicate(),
+        Ok(_) => {}
+        Err(err) => return KeyStatus::error(err),
+    }
     match store.insert_secret("keymanager import", secret) {
         Ok(pubkey) => {
             info!(pubkey = %encode_hex(&pubkey.0), "Imported validator key");
@@ -1067,10 +1096,15 @@ pub(super) fn persist_delete(context: &KeymanagerContext, pubkey: &BlsPubkey) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::http_api::router;
+
     use axum::body::Body;
+
     use axum::http::{Request, StatusCode};
+
     use http_body_util::BodyExt as _;
+
     use tower::ServiceExt as _;
 
     const TOKEN: &str = "test-token";
@@ -1449,6 +1483,86 @@ mod tests {
         assert_eq!(
             hex::encode(reloaded.pubkeys()[0].0),
             "9612d7a727c9d0a22e185a1c768478dfe919cada9266988cb32359c11f2b7b27f4ae4040902382ae2910c15e2b420d07"
+        );
+    }
+
+    /// The two routes must not replace each other's entries. A keystore for
+    /// a key a remote signer already holds is `duplicate`, and the remote
+    /// entry survives in memory and on disk; and a remote import of a key
+    /// the file already lists (here, a disabled local entry) is `duplicate`
+    /// too, rather than turning the disabled key into a signing one.
+    #[tokio::test]
+    async fn neither_route_replaces_the_others_entry() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Arc::new(RwLock::new(ValidatorStore::new()));
+        let app = router(
+            context_with_dirs(store.clone(), dir.path()),
+            TOKEN.to_string(),
+        );
+        let pubkey = "0x9612d7a727c9d0a22e185a1c768478dfe919cada9266988cb32359c11f2b7b27f4ae4040902382ae2910c15e2b420d07";
+        let signer = "https://signer.example:9000";
+
+        let (_, body) = send(
+            app.clone(),
+            authed(
+                "POST",
+                "/eth/v1/remotekeys",
+                serde_json::json!({ "remote_keys": [{ "pubkey": pubkey, "url": signer }] }),
+            ),
+        )
+        .await;
+        assert_eq!(body["data"][0]["status"], "imported");
+
+        let (_, body) = send(
+            app.clone(),
+            authed(
+                "POST",
+                "/eth/v1/keystores",
+                serde_json::json!({ "keystores": [keystore_json()], "passwords": [PASSWORD] }),
+            ),
+        )
+        .await;
+        assert_eq!(body["data"][0]["status"], "duplicate");
+        let parsed = parse_pubkey(pubkey).expect("pubkey");
+        assert_eq!(
+            store.read().await.remote_url(&parsed).as_deref(),
+            Some(signer),
+            "the remote entry must survive in memory"
+        );
+        let reloaded = ValidatorStore::load(dir.path()).expect("loads");
+        assert_eq!(reloaded.remote_url(&parsed).as_deref(), Some(signer));
+
+        // The other direction: a disabled local entry on disk, nothing in
+        // memory, and a remote import for the same key.
+        let other = tempfile::tempdir().expect("temp dir");
+        let mut definitions = ValidatorDefinitions::default();
+        definitions.0.push(ValidatorDefinition {
+            enabled: false,
+            voting_public_key: pubkey.to_string(),
+            signing: SigningDefinition::LocalKeystore {
+                voting_keystore_path: PathBuf::from("keystore.json"),
+                voting_keystore_password_path: PathBuf::from("password.txt"),
+            },
+        });
+        definitions.save(other.path()).expect("saves");
+        let app = router(
+            context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), other.path()),
+            TOKEN.to_string(),
+        );
+        let (_, body) = send(
+            app,
+            authed(
+                "POST",
+                "/eth/v1/remotekeys",
+                serde_json::json!({ "remote_keys": [{ "pubkey": pubkey, "url": signer }] }),
+            ),
+        )
+        .await;
+        assert_eq!(body["data"][0]["status"], "duplicate");
+        let on_disk = ValidatorDefinitions::open(other.path()).expect("opens");
+        assert!(
+            !on_disk.0[0].enabled && !on_disk.0[0].signing.is_remote(),
+            "the disabled local entry must be untouched"
         );
     }
 

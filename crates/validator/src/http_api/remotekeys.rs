@@ -181,10 +181,7 @@ pub async fn import(
             (Ok(Some(_)), Some(message)) => KeyStatus::error(message),
             (result, _) => match result {
                 Ok(Some((pubkey, url))) => finish_import(&mut store, pubkey, &url),
-                Ok(None) => KeyStatus {
-                    status: "duplicate".to_string(),
-                    message: None,
-                },
+                Ok(None) => KeyStatus::duplicate(),
                 Err(status) => status,
             },
         })
@@ -222,7 +219,16 @@ fn prepare_import(
     // otherwise be persisted and refuse the next startup.
     crate::keys::Web3Signer::new(&url).map_err(KeyStatus::error)?;
 
-    if store.contains(&pubkey) {
+    // Known to the store, or to the file: a disabled local entry, or one
+    // left behind by a failed delete, is still "already known", and
+    // overwriting it would turn a key the operator disabled into a signing
+    // one.
+    let on_disk = definitions.0.iter().any(|definition| {
+        parse_pubkey(&definition.voting_public_key)
+            .map(|parsed| parsed == pubkey)
+            .unwrap_or(false)
+    });
+    if on_disk || store.contains(&pubkey) {
         return Ok(None);
     }
 
@@ -252,10 +258,7 @@ fn finish_import(
     url: &str,
 ) -> KeyStatus {
     if store.contains(&pubkey) {
-        return KeyStatus {
-            status: "duplicate".to_string(),
-            message: None,
-        };
+        return KeyStatus::duplicate();
     }
     match store.insert_remote(pubkey, url) {
         Ok(()) => {
