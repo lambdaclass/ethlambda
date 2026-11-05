@@ -77,7 +77,9 @@ pub(crate) fn write_private_no_symlink(
 
 /// Replace the file at `path` with `contents` so that a crash or power loss
 /// leaves either the old file or the new one, never a mixture, and so that a
-/// return of `Ok` means the new one is on disk.
+/// return of `Ok` means the new one is on disk. Unix only: elsewhere the
+/// directory flush is not implemented, and the write fails rather than
+/// answer `Ok` for a rename that may not have reached the disk.
 ///
 /// Written to a sibling `.tmp` created fresh at mode `0600`, flushed, renamed
 /// over `path`, and then the directory is flushed so the rename itself
@@ -160,7 +162,10 @@ fn sync_directory(directory: &Path) -> std::io::Result<()> {
 
 #[cfg(not(unix))]
 fn sync_directory(_directory: &Path) -> std::io::Result<()> {
-    Ok(())
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "flushing a directory is only implemented on unix",
+    ))
 }
 
 #[cfg(all(test, unix))]

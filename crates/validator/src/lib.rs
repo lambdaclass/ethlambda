@@ -221,7 +221,6 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             secrets_dir: config.secrets_dir.clone(),
             definitions_lock: Arc::new(Mutex::new(())),
             protection: protection.clone(),
-            clock: clock.clone(),
         };
         let router = http_api::router(context, token);
         let listener = tokio::net::TcpListener::bind(address)

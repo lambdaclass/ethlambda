@@ -273,3 +273,52 @@ pub(crate) fn lock(directory: &Path) -> Result<File> {
         Err(std::fs::TryLockError::Error(source)) => Err(io_error(source)),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Several entries of a kind for one validator reduce to their maxima:
+    /// what keeps a file holding more than one from lowering a watermark.
+    #[test]
+    fn several_entries_of_a_kind_reduce_to_their_maxima() {
+        let entry = Entry {
+            pubkey: [1; 48],
+            signed_blocks: vec![
+                SignedBlock {
+                    slot: 7,
+                    signing_root: None,
+                },
+                SignedBlock {
+                    slot: 3,
+                    signing_root: None,
+                },
+            ],
+            signed_attestations: vec![
+                SignedAttestation {
+                    source_epoch: 5,
+                    target_epoch: 9,
+                    signing_root: None,
+                },
+                SignedAttestation {
+                    source_epoch: 2,
+                    target_epoch: 4,
+                    signing_root: None,
+                },
+            ],
+        };
+
+        let record = record_of(&entry).expect("valid");
+
+        assert_eq!(
+            record,
+            Record {
+                block_slot: Some(7),
+                attestation: Some(Signed {
+                    source: 5,
+                    target: 9
+                }),
+            }
+        );
+    }
+}

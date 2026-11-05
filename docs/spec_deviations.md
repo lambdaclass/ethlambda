@@ -70,13 +70,12 @@ anything that does not advance past them.
   so nothing else is refused. Lighthouse and Prysm keep signing roots to allow
   the identical re-sign; Teku keeps the same watermarks as this client.
 - **Keys with no record:** refused at startup. `--init-slashing-protection`
-  registers them as if each had signed a block and an attestation at the
-  current slot and epoch, and a key imported through the keymanager API with
-  no history is registered the same way before it is loaded. That closes the
-  double-vote window for a key that signed elsewhere a moment ago, at the cost
-  of the rest of the epoch's duties, but not a surround against older history,
-  so the flag is still only for keys that have signed nothing anywhere for at
-  least two epochs.
+  registers them as never having signed, and a key imported through the
+  keymanager API with no history is registered the same way before it is
+  loaded. Nothing here stops such a key from signing again what it signed
+  elsewhere a moment ago, so the flag is only for keys that have signed nothing
+  anywhere for at least two epochs; the migration window is doppelganger
+  protection's to close, which this client does not have yet.
 - **Gloas messages:** a gloas proposer also signs an execution payload
   envelope, and a payload timeliness committee member signs a payload
   attestation. Neither is slashable, so neither is recorded. An envelope is
@@ -94,8 +93,7 @@ anything that does not advance past them.
   deliberately all-zero, so a conformant importer rejects it outright rather
   than trusting an empty history. `POST` accepts the `slashing_protection`
   field and ignores it, with a server-side warning, so an imported key starts
-  at the current slot and epoch, like one registered by
-  `--init-slashing-protection`.
+  as never having signed, like one registered by `--init-slashing-protection`.
 
 ## Builder bids: gossip and API only (no builder API)
 

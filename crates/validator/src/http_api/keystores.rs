@@ -197,6 +197,15 @@ pub async fn import(
         }
     };
 
+    // The keys the file listed before this request adds any: what a failed
+    // registration below rolls back is this request's own additions, never an
+    // entry that was there before it.
+    let known_before: std::collections::HashSet<BlsPubkey> = definitions
+        .0
+        .iter()
+        .filter_map(|definition| parse_pubkey(&definition.voting_public_key).ok())
+        .collect();
+
     // Decrypt (deliberately slow: EIP-2335 key derivation) and persist every
     // key to disk before ever touching the store's write lock. The duty
     // loop's `attest` only ever holds a read lock across a short, synchronous
@@ -216,9 +225,8 @@ pub async fn import(
     // one write, before any of them is loaded: the duty path must never meet a
     // key with no record. After persisting rather than before, so a key whose
     // persist failed leaves no record behind to let a hand-copied keystore
-    // past the startup check later. A crash in between leaves a key on disk
-    // with no record, which the next start refuses: closed, not open. Still
-    // under the definitions guard, so a concurrent delete cannot interleave.
+    // past the startup check later. Still under the definitions guard, so a
+    // concurrent delete cannot interleave.
     let persisted: Vec<BlsPubkey> = prepared
         .iter()
         .filter_map(|result| result.as_ref().ok().map(|(pubkey, _)| *pubkey))
@@ -226,8 +234,9 @@ pub async fn import(
     let registration = if persisted.is_empty() {
         Ok(0)
     } else {
+        let registering = persisted.clone();
         crate::slashing_protection::blocking(&context.protection, move |protection| {
-            protection.register(&persisted)
+            protection.register(&registering)
         })
         .await
     };
@@ -241,28 +250,103 @@ pub async fn import(
         );
     }
 
-    // The definitions file is fully written by this point; nothing below
-    // touches it, so the guard can be released before the store lock is
-    // taken rather than held across it too.
-    drop(_definitions_guard);
+    // A key on disk with no record is refused at the next start, and
+    // `SlashingProtection::open` then refuses the whole client, not the one
+    // key. A crash between persisting and registering leaves exactly that,
+    // which is the closed side to fail on. Here the write is known to have
+    // failed, so the keys this request added are taken off disk again and the
+    // failure costs this request only. A key the file listed before is left
+    // as it is: its entry and keystore were rewritten, not added.
+    let rolled_back = match &registration {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            let added: Vec<BlsPubkey> = persisted
+                .iter()
+                .filter(|pubkey| !known_before.contains(*pubkey))
+                .copied()
+                .collect();
+            undo_import(&context, &mut definitions, &added)
+        }
+    };
+    if let Err(err) = &rolled_back {
+        tracing::error!(
+            %err,
+            "Could not remove the keys of a failed import; the next start refuses them until \
+             they have a slashing-protection record"
+        );
+    }
 
+    // The definitions guard stays held across the store lock, in the order
+    // `delete` takes the two. Released before it, a delete of the same key
+    // could run in between: it would find the key on disk but not in memory,
+    // remove it and answer `deleted`, and the insert below would then load a
+    // key the operator was told is gone.
     let mut store = context.store.write().await;
     let data = prepared
         .into_iter()
         .map(|result| match (result, &registration) {
             (Ok((_, secret)), Ok(_)) => finish_import(&mut store, &secret),
-            // Persisted but not registered: not loaded now, and refused at the
-            // next start until it has a record.
-            (Ok(_), Err(err)) => KeyStatus::error(format!(
-                "saved, but not loaded: its slashing-protection record could not be written: \
-                 {err}"
-            )),
+            (Ok((pubkey, _)), Err(err)) => {
+                if known_before.contains(&pubkey) || rolled_back.is_err() {
+                    // Still on disk, not loaded now, and refused at the next
+                    // start until it has a record.
+                    KeyStatus::error(format!(
+                        "saved, but not loaded: its slashing-protection record could not be \
+                         written: {err}"
+                    ))
+                } else {
+                    KeyStatus::error(format!(
+                        "not imported: its slashing-protection record could not be written: {err}"
+                    ))
+                }
+            }
             (Err(status), _) => status,
         })
         .collect();
     drop(store);
+    drop(_definitions_guard);
 
     Json(StatusResponse { data })
+}
+
+/// Take the keys a failed import added off disk again: their definitions
+/// entries in one save, then their keystore and password files. The entries
+/// go first, since the file is what the next start loads from, so a crash in
+/// between leaves orphan files and never a key that would be loaded without a
+/// record. A file that is already gone is not an error.
+fn undo_import(
+    context: &KeymanagerContext,
+    definitions: &mut ValidatorDefinitions,
+    pubkeys: &[BlsPubkey],
+) -> crate::Result<()> {
+    if pubkeys.is_empty() {
+        return Ok(());
+    }
+    definitions.0.retain(|definition| {
+        parse_pubkey(&definition.voting_public_key)
+            .map(|parsed| !pubkeys.contains(&parsed))
+            .unwrap_or(true)
+    });
+    definitions.save(&context.validators_dir)?;
+    for pubkey in pubkeys {
+        let base = encode_hex(&pubkey.0);
+        for path in [
+            context.validators_dir.join(format!("{base}.json")),
+            context.secrets_dir.join(&base),
+        ] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(Error::Io {
+                        path: path.display().to_string(),
+                        source,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Decrypt one keystore and persist it to disk: everything an import can do
@@ -603,7 +687,6 @@ mod tests {
             secrets_dir: dir.to_path_buf(),
             definitions_lock: Arc::new(tokio::sync::Mutex::new(())),
             protection: crate::slashing_protection::SlashingProtection::in_memory(),
-            clock: crate::slot_clock::SlotClock::new(0, 12_000, 3_333, 6_667),
         }
     }
 
@@ -977,6 +1060,69 @@ mod tests {
         let keys = ValidatorStore::load(dir.path()).expect("loads").pubkeys();
         crate::slashing_protection::SlashingProtection::open(dir.path(), root, &keys, false)
             .expect("the imported key has a record");
+    }
+
+    /// A key whose registration fails is taken off disk again, so the failed
+    /// write costs this request only and the next start loads nothing it
+    /// would refuse.
+    #[tokio::test]
+    async fn a_failed_registration_rolls_the_import_back() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = ethlambda_types::beacon::primitives::Root::ZERO;
+        let protection =
+            crate::slashing_protection::SlashingProtection::open(dir.path(), root, &[], false)
+                .expect("opens with no keys");
+        // A directory in the record's place makes the registration's rename
+        // fail, whoever runs the test.
+        let record = protection.path().expect("persisted").to_path_buf();
+        std::fs::remove_file(&record).expect("removes the record");
+        std::fs::create_dir(&record).expect("a directory in its place");
+        let mut context =
+            context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
+        context.protection = Arc::new(std::sync::Mutex::new(protection));
+        let store = context.store.clone();
+
+        let (_, body) = send(
+            router(context, TOKEN.to_string()),
+            authed(
+                "POST",
+                "/eth/v1/keystores",
+                serde_json::json!({
+                    "keystores": [keystore_json()],
+                    "passwords": [PASSWORD],
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(body["data"][0]["status"], "error", "got {body}");
+        assert!(
+            body["data"][0]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("not imported"),
+            "got {body}"
+        );
+        assert!(store.read().await.pubkeys().is_empty(), "not loaded");
+        assert!(
+            ValidatorStore::load(dir.path())
+                .expect("loads")
+                .pubkeys()
+                .is_empty(),
+            "the next start finds no key to refuse"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("lists")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| {
+                !name.starts_with("slashing_protection")
+                    && name != crate::keys::definitions::DEFINITIONS_FILE
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "keystore and password removed: {leftovers:?}"
+        );
     }
 
     /// A key that fails to persist must leave no slashing-protection record

@@ -67,7 +67,7 @@ use crate::error::{Error, Result};
 use crate::keys::ValidatorStore;
 use crate::proposer_settings::ProposerSettings;
 use crate::signing::SigningContext;
-use crate::slashing_protection::SharedProtection;
+use crate::slashing_protection::{Refusal, SharedProtection};
 
 pub struct ProposalService<B> {
     beacon_node: Arc<B>,
@@ -170,26 +170,7 @@ impl<B: BeaconNodeApi> ProposalService<B> {
             Ok(protection.check_block(&pubkey, slot))
         })
         .await;
-        let refusal = match checked {
-            Ok(Ok(())) => None,
-            Ok(Err(refusal)) => {
-                warn!(
-                    %slot,
-                    validator = duty.validator_index,
-                    %refusal,
-                    "Refusing to propose: slashing protection judged this block unsafe"
-                );
-                Some(refusal.to_string())
-            }
-            Err(err) => {
-                warn!(%slot, %err, "Slashing protection could not be consulted; refusing to propose");
-                Some(err.to_string())
-            }
-        };
-        if let Some(reason) = refusal {
-            crate::metrics::inc_blocks_refused();
-            return Err(Error::ProposalRefused { slot, reason });
-        }
+        refuse_unless_safe(slot, duty.validator_index, "consult", checked)?;
 
         // Scoped away from every await, the way the attestation path's read
         // guard is, and for the reason spelled out there: a write-preferring
@@ -273,18 +254,7 @@ impl<B: BeaconNodeApi> ProposalService<B> {
             protection.check_and_record_block(&pubkey, slot)
         })
         .await;
-        let refusal = match recorded {
-            Ok(Ok(())) => None,
-            Ok(Err(refusal)) => Some(refusal.to_string()),
-            Err(err) => {
-                error!(%slot, %err, "Slashing protection could not record this block; refusing to sign");
-                Some(err.to_string())
-            }
-        };
-        if let Some(reason) = refusal {
-            crate::metrics::inc_blocks_refused();
-            return Err(Error::ProposalRefused { slot, reason });
-        }
+        refuse_unless_safe(slot, duty.validator_index, "record", recorded)?;
 
         let signature = {
             let store = store.read().await;
@@ -430,6 +400,39 @@ impl<B: BeaconNodeApi> ProposalService<B> {
         }
         Ok(published)
     }
+}
+
+/// Slashing protection's answer about a block, as the duty's outcome: a judged
+/// refusal, or a record that could not be consulted or written (`what` names
+/// which), is a counted [`Error::ProposalRefused`].
+fn refuse_unless_safe(
+    slot: Slot,
+    validator: u64,
+    what: &'static str,
+    outcome: Result<std::result::Result<(), Refusal>>,
+) -> Result<()> {
+    let reason = match outcome {
+        Ok(Ok(())) => return Ok(()),
+        Ok(Err(refusal)) => {
+            warn!(
+                %slot,
+                validator,
+                %refusal,
+                "Refusing to propose: slashing protection judged this block unsafe"
+            );
+            refusal.to_string()
+        }
+        Err(err) => {
+            error!(
+                %slot,
+                %err,
+                "Slashing protection could not {what} this block; refusing to sign"
+            );
+            err.to_string()
+        }
+    };
+    crate::metrics::inc_blocks_refused();
+    Err(Error::ProposalRefused { slot, reason })
 }
 
 #[cfg(test)]
@@ -694,6 +697,35 @@ mod tests {
         assert!(matches!(err, Error::ProposalRefused { .. }), "got {err:?}");
         assert!(node_again.block_requests().is_empty());
         assert!(node_again.published_blocks().is_empty());
+    }
+
+    /// A persisted record holding nothing for the key refuses it before a
+    /// block is asked for. The in-memory record of the other tests registers
+    /// a key on first use; a real one does not.
+    #[tokio::test]
+    async fn an_unregistered_key_is_refused_before_a_block_is_requested() {
+        let (store, pubkey) = store();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let settings = Arc::new(ProposerSettings::new(Bytes32::repeat_byte(0xab), None));
+        let opened = SlashingProtection::open(dir.path(), Root::ZERO, &[], false)
+            .expect("opens with no keys");
+        let node = Arc::new(MockBeaconNode::new().with_block(slot(), 7));
+
+        let err = ProposalService::new(
+            node.clone(),
+            context(),
+            settings,
+            Arc::new(std::sync::Mutex::new(opened)),
+        )
+        .propose(slot(), &duty(&pubkey, 7, slot()), &store)
+        .await
+        .expect_err("the key has no record");
+        assert!(
+            matches!(&err, Error::ProposalRefused { reason, .. } if reason.contains("no slashing-protection record")),
+            "got {err:?}"
+        );
+        assert!(node.block_requests().is_empty());
+        assert!(node.published_blocks().is_empty());
     }
 
     #[tokio::test]
