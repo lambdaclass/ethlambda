@@ -652,3 +652,42 @@ fn gloas_state(count: usize) -> gloas::BeaconState {
             .expect("the vector is built at its exact length"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`BeaconState::ssz_append_capacity`] for every fork. The test lives here
+    /// rather than beside that method in `ethlambda-types` because this module
+    /// is the one place a state of every fork is built.
+    ///
+    /// A small registry is the hard case. libssz's container encoder writes
+    /// each fixed-size field past the end of the buffer before moving it into
+    /// place, so a field needs room beyond the encoding's length unless enough
+    /// variable-size data still follows it, and a small state has little. A
+    /// fork that adds a fixed-size field larger than any the capacity counts
+    /// fails here rather than quietly regrowing a buffer the size of the state.
+    #[test]
+    fn ssz_append_never_regrows_a_buffer_with_its_capacity_to_spare() {
+        // A lean genesis with no validators: its fixed-size fields come before
+        // all of its variable-size ones, which hold almost nothing here.
+        let lean = BeaconState::Lean(ethlambda_types::state::State::from_genesis(7, vec![]));
+        let beacon = ForkName::ALL.map(|fork| with_validators_at(fork, 3));
+        for state in beacon.into_iter().chain([lean]) {
+            let fork = state.fork_name();
+            let capacity = state.ssz_append_capacity();
+
+            let encoded = state.to_ssz();
+            assert_eq!(encoded.capacity(), capacity, "{fork}: to_ssz regrew");
+            let decoded = BeaconState::from_ssz(fork, &encoded).expect("the encoding decodes");
+            assert_eq!(decoded, state, "{fork}");
+
+            // Appending after a prefix reserves past the prefix, not from the
+            // start of the buffer.
+            let mut framed = vec![0xAB];
+            state.ssz_append(&mut framed);
+            assert_eq!(framed.capacity(), 1 + capacity, "{fork}: ssz_append regrew");
+            assert_eq!(framed[1..], encoded, "{fork}");
+        }
+    }
+}
