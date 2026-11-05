@@ -1871,7 +1871,7 @@ impl BlockChainServer {
                 }
                 let mut speculation: Option<fork_choice::SpeculativeTransition> = None;
                 let validity = if answered_later {
-                    self.ask_about_block_payload(&beacon_block);
+                    self.ask_about_block_payload(&beacon_block, timings.source_label());
                     fork_choice::PayloadValidity::Optimistic
                 } else {
                     // Waiting inline. With an execution client the question is
@@ -2282,7 +2282,12 @@ impl BlockChainServer {
 
         cascade.observe(blocks);
         cascade.log(blocks);
-        ethlambda_telemetry::emit(|| self.cascade_telemetry.events(&cascade));
+        ethlambda_telemetry::emit(|| {
+            self.cascade_telemetry
+                .events_except_awaiting(&cascade, |root| {
+                    self.new_payloads.awaits_block_answer(root)
+                })
+        });
         outcome
     }
 
@@ -4491,7 +4496,7 @@ impl Handler<AggregationDeadline> for BlockChainServer {
 }
 
 /// The `verdict` a `block_events` row records for an execution client's answer.
-fn verdict_label(validity: &fork_choice::PayloadValidity) -> &'static str {
+pub(crate) fn verdict_label(validity: &fork_choice::PayloadValidity) -> &'static str {
     match validity {
         fork_choice::PayloadValidity::NotRequired => "NotRequired",
         fork_choice::PayloadValidity::Validated => "Valid",

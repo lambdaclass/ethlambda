@@ -63,6 +63,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 
 use ethlambda_engine::types::PayloadStatusValue;
 use ethlambda_engine::{EngineError, PayloadStatusV1};
@@ -73,8 +74,8 @@ use spawned_concurrency::message::Message;
 use spawned_concurrency::tasks::{ActorRef, Context, Handler};
 use tracing::{info, warn};
 
-use crate::import_timing::ImportTimings;
-use crate::{BlockChainServer, beacon_engine, metrics};
+use crate::import_timing::{ImportTimings, row};
+use crate::{BlockChainServer, beacon_engine, metrics, verdict_label};
 
 /// How many `engine_newPayload` requests may be in flight at once.
 ///
@@ -135,6 +136,58 @@ struct Ask {
     parent_hash: H256,
     state: AskState,
     question: Arc<PayloadQuestion>,
+    /// The `block_events` source of the import that asked (`None` for a
+    /// source with no rows, and for envelopes, which write none).
+    source: Option<&'static str>,
+    /// When the last request for it went out.
+    sent: Option<Instant>,
+}
+
+/// What a block's `el_sent`, `el_verdict` and `attestable` rows need once its
+/// answer is applied: the import's slot and source, and when the request went
+/// out and its answer came back.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AnswerTelemetry {
+    pub(crate) slot: u64,
+    pub(crate) source: &'static str,
+    pub(crate) sent: Instant,
+    pub(crate) answered: Instant,
+}
+
+/// The `block_events` rows for a block's answer applied at `applied`:
+/// `el_sent` and `el_verdict` at the request's own instants, and, for a
+/// `VALID` answer, `attestable` at `applied`, the moment the block stopped
+/// being optimistic. The import wrote no `attestable` of its own for it (see
+/// `CascadeTelemetry::events_except_awaiting`), and this is always the later
+/// of the two moments an attestable block needs: the answer is applied by the
+/// actor only after the import that asked, head recomputation included.
+pub(crate) fn answer_events(
+    root: H256,
+    telemetry: AnswerTelemetry,
+    validity: &PayloadValidity,
+    applied: Instant,
+) -> Vec<ethlambda_telemetry::BlockEvent> {
+    let AnswerTelemetry {
+        slot,
+        source,
+        sent,
+        answered,
+    } = telemetry;
+    let mut events = vec![
+        row("el_sent", sent, slot, root, source),
+        ethlambda_telemetry::BlockEvent {
+            verdict: Some(verdict_label(validity)),
+            ..row("el_verdict", answered, slot, root, source)
+        },
+    ];
+    // The two answers `apply_block_answer` marks the block validated for.
+    if matches!(
+        validity,
+        PayloadValidity::Validated | PayloadValidity::NotRequired
+    ) {
+        events.push(row("attestable", applied, slot, root, source));
+    }
+    events
 }
 
 /// The execution client's answer, as the task that asked reports it.
@@ -152,6 +205,9 @@ pub(crate) enum PayloadAnswer {
 pub(crate) struct NewPayloadAnswered {
     pub(crate) root: H256,
     pub(crate) answer: PayloadAnswer,
+    /// When the task got the answer, before it waited in the actor's
+    /// mailbox: the `el_verdict` row's instant.
+    pub(crate) answered_at: Instant,
 }
 
 impl Message for NewPayloadAnswered {
@@ -207,6 +263,26 @@ impl NewPayloads {
         self.asks.len() < MAX_PAYLOADS_AWAITING_VERDICT
     }
 
+    /// Whether `root` is a pre-gloas block imported before its answer, which
+    /// is not in yet (queued, in flight or unanswered).
+    pub(crate) fn awaits_block_answer(&self, root: &H256) -> bool {
+        self.asks
+            .get(root)
+            .is_some_and(|ask| ask.question.kind() == PayloadKind::Block)
+    }
+
+    /// What `root`'s answer rows need, for an ask that has rows (a block
+    /// from a measured source) and whose request went out.
+    fn answer_telemetry(&self, root: &H256, answered: Instant) -> Option<AnswerTelemetry> {
+        let ask = self.asks.get(root)?;
+        Some(AnswerTelemetry {
+            slot: ask.slot,
+            source: ask.source?,
+            sent: ask.sent?,
+            answered,
+        })
+    }
+
     /// Whether `root`'s gloas payload is applied and its answer not in yet.
     pub(crate) fn awaits_envelope_answer(&self, root: &H256) -> bool {
         self.asks
@@ -254,6 +330,7 @@ impl NewPayloads {
         block_hash: H256,
         parent_hash: H256,
         question: PayloadQuestion,
+        source: Option<&'static str>,
     ) {
         if self.asks.contains_key(&root) {
             return;
@@ -267,6 +344,8 @@ impl NewPayloads {
                 parent_hash,
                 state: AskState::Queued,
                 question: Arc::new(question),
+                source,
+                sent: None,
             },
         );
     }
@@ -288,6 +367,9 @@ impl NewPayloads {
         let root = self.queue.remove(position)?;
         let ask = self.asks.get_mut(&root)?;
         ask.state = AskState::InFlight;
+        // A redrive after no answer overwrites it: `el_sent` is the request
+        // whose answer `el_verdict` reports.
+        ask.sent = Some(Instant::now());
         self.in_flight.insert(root);
         Some((root, Arc::clone(&ask.question)))
     }
@@ -385,7 +467,15 @@ impl BlockChainServer {
 
     /// Ask about `block`'s payload without waiting. The caller imports the
     /// block as optimistic right after.
-    pub(crate) fn ask_about_block_payload(&mut self, block: &SignedBeaconBlock) {
+    ///
+    /// `source` is the import's `block_events` source, under which the
+    /// answer's `el_sent`, `el_verdict` and `attestable` rows are written
+    /// (`None` writes none).
+    pub(crate) fn ask_about_block_payload(
+        &mut self,
+        block: &SignedBeaconBlock,
+        source: Option<&'static str>,
+    ) {
         let Some(request) = beacon_engine::new_payload_request(block) else {
             return;
         };
@@ -393,8 +483,14 @@ impl BlockChainServer {
         let parent_hash = request.execution_payload.parent_hash;
         let root = block.message_hash_tree_root();
         let question = PayloadQuestion::Block(block.clone());
-        self.new_payloads
-            .insert(root, block.slot(), block_hash, parent_hash, question);
+        self.new_payloads.insert(
+            root,
+            block.slot(),
+            block_hash,
+            parent_hash,
+            question,
+            source,
+        );
         self.send_new_payloads();
     }
 
@@ -416,8 +512,9 @@ impl BlockChainServer {
             envelope: Box::new(envelope.clone()),
             envelope_root,
         };
+        // An envelope writes no block rows.
         self.new_payloads
-            .insert(root, block.slot(), block_hash, parent_hash, question);
+            .insert(root, block.slot(), block_hash, parent_hash, question, None);
         self.send_new_payloads();
     }
 
@@ -444,7 +541,12 @@ impl BlockChainServer {
                         result: beacon_engine::ask_envelope_status(&client, block, envelope).await,
                     },
                 };
-                sink.send(NewPayloadAnswered { root, answer });
+                let answered_at = Instant::now();
+                sink.send(NewPayloadAnswered {
+                    root,
+                    answer,
+                    answered_at,
+                });
             });
         }
         self.publish_new_payload_gauges();
@@ -456,12 +558,16 @@ impl BlockChainServer {
 
     /// Apply an answer, then let through whatever it made room for.
     pub(crate) async fn on_new_payload_answered(&mut self, answered: NewPayloadAnswered) {
-        let NewPayloadAnswered { root, answer } = answered;
+        let NewPayloadAnswered {
+            root,
+            answer,
+            answered_at,
+        } = answered;
         let tracked = self.new_payloads.finish(&root);
         let mut head_moved = false;
         match answer {
             PayloadAnswer::Block(result) if tracked => {
-                head_moved = self.apply_block_answer(root, result);
+                head_moved = self.apply_block_answer(root, result, answered_at);
             }
             PayloadAnswer::Envelope {
                 envelope_root,
@@ -494,10 +600,16 @@ impl BlockChainServer {
 
     /// Apply the answer for a pre-gloas block already in fork choice. `true`
     /// when blocks left fork choice.
+    ///
+    /// Writes the block's `el_sent` and `el_verdict` rows, and its
+    /// `attestable` when the answer validates it ([`answer_events`]).
+    /// Nothing for no answer (the redrive's answer writes them) or for a
+    /// block that left fork choice meanwhile.
     fn apply_block_answer(
         &mut self,
         root: H256,
         result: Result<Option<PayloadValidity>, EngineError>,
+        answered_at: Instant,
     ) -> bool {
         let validity = match result {
             Ok(validity) => validity,
@@ -514,6 +626,8 @@ impl BlockChainServer {
                 return false;
             }
         };
+        // Read before `complete` drops the ask.
+        let telemetry = self.new_payloads.answer_telemetry(&root, answered_at);
         let slot = self.new_payloads.complete(&root);
         // The block failed its own import after the question went out, or
         // left fork choice since.
@@ -521,8 +635,21 @@ impl BlockChainServer {
             metrics::inc_new_payload_answer("block", "stale");
             return false;
         }
-        match validity {
-            Some(PayloadValidity::Validated) | Some(PayloadValidity::NotRequired) | None => {
+        // No request means no payload to validate, which `on_block` treats
+        // as validated too.
+        let validity = validity.unwrap_or(PayloadValidity::NotRequired);
+        let left_fork_choice = self.apply_block_validity(root, &validity);
+        if let Some(telemetry) = telemetry {
+            let applied = Instant::now();
+            ethlambda_telemetry::emit(|| answer_events(root, telemetry, &validity, applied));
+        }
+        left_fork_choice
+    }
+
+    /// [`Self::apply_block_answer`] once the block is known to be live.
+    fn apply_block_validity(&mut self, root: H256, validity: &PayloadValidity) -> bool {
+        match *validity {
+            PayloadValidity::Validated | PayloadValidity::NotRequired => {
                 let head = self.store.beacon_head().map(|(_, head)| head);
                 let head_was_optimistic =
                     head.is_some_and(|head| self.store.is_beacon_optimistic(head));
@@ -538,11 +665,11 @@ impl BlockChainServer {
                 }
                 false
             }
-            Some(PayloadValidity::Optimistic) => {
+            PayloadValidity::Optimistic => {
                 metrics::inc_new_payload_answer("block", "optimistic");
                 false
             }
-            Some(PayloadValidity::Invalidated { latest_valid_hash }) => {
+            PayloadValidity::Invalidated { latest_valid_hash } => {
                 metrics::inc_new_payload_answer("block", "invalid");
                 self.invalidate_block_payload(root, latest_valid_hash) > 0
             }
@@ -787,6 +914,7 @@ mod tests {
             hash(block_hash),
             hash(parent_hash),
             question(1),
+            None,
         );
     }
 
@@ -894,7 +1022,7 @@ mod tests {
         let mut payloads = NewPayloads::default();
         for root in 0..MAX_PAYLOADS_AWAITING_VERDICT {
             let root = numbered(root as u64 + 1);
-            payloads.insert(root, 1, root, H256::ZERO, question(1));
+            payloads.insert(root, 1, root, H256::ZERO, question(1), None);
         }
         assert!(!payloads.has_room());
         payloads.forget(&numbered(1));
@@ -913,7 +1041,7 @@ mod tests {
         let mut server = beacon_server(store);
         server
             .new_payloads
-            .insert(B, 2, hash(0xb2), hash(0xa1), question(2));
+            .insert(B, 2, hash(0xb2), hash(0xa1), question(2), Some("gossip"));
         assert_eq!(sent(&mut server.new_payloads), Some(B));
         server
     }
@@ -922,7 +1050,97 @@ mod tests {
         NewPayloadAnswered {
             root: B,
             answer: PayloadAnswer::Block(validity),
+            answered_at: Instant::now(),
         }
+    }
+
+    #[test]
+    fn an_answer_writes_its_request_rows_and_a_valid_one_attestable() {
+        let sent = Instant::now();
+        let answered = sent + std::time::Duration::from_millis(40);
+        let applied = answered + std::time::Duration::from_millis(5);
+        let telemetry = AnswerTelemetry {
+            slot: 2,
+            source: "gossip",
+            sent,
+            answered,
+        };
+        let stages = |validity: PayloadValidity| -> Vec<(&str, Instant, Option<&str>)> {
+            answer_events(B, telemetry, &validity, applied)
+                .into_iter()
+                .map(|event| {
+                    assert_eq!(
+                        (event.slot, event.block_root, event.source),
+                        (2, B.0, "gossip")
+                    );
+                    (event.stage, event.at, event.verdict)
+                })
+                .collect()
+        };
+
+        assert_eq!(
+            stages(PayloadValidity::Validated),
+            vec![
+                ("el_sent", sent, None),
+                ("el_verdict", answered, Some("Valid")),
+                ("attestable", applied, None),
+            ]
+        );
+        assert_eq!(
+            stages(PayloadValidity::Optimistic),
+            vec![
+                ("el_sent", sent, None),
+                ("el_verdict", answered, Some("Optimistic")),
+            ],
+            "still optimistic: not attestable"
+        );
+        let invalid = PayloadValidity::Invalidated {
+            latest_valid_hash: None,
+        };
+        assert_eq!(
+            stages(invalid),
+            vec![
+                ("el_sent", sent, None),
+                ("el_verdict", answered, Some("Invalid")),
+            ]
+        );
+    }
+
+    #[test]
+    fn answer_rows_need_a_measured_source_and_a_sent_request() {
+        let mut payloads = NewPayloads::default();
+        payloads.insert(
+            hash(1),
+            1,
+            hash(0xa1),
+            hash(0xa0),
+            question(1),
+            Some("sync"),
+        );
+        payloads.insert(hash(2), 1, hash(0xb1), hash(0xb0), question(1), None);
+        assert!(
+            payloads
+                .answer_telemetry(&hash(1), Instant::now())
+                .is_none(),
+            "not sent yet"
+        );
+        assert!(payloads.awaits_block_answer(&hash(1)));
+
+        assert_eq!(sent(&mut payloads), Some(hash(1)));
+        let answered = Instant::now();
+        let telemetry = payloads
+            .answer_telemetry(&hash(1), answered)
+            .expect("sent, with a source");
+        assert_eq!((telemetry.slot, telemetry.source), (1, "sync"));
+        assert!(telemetry.sent <= answered);
+
+        assert_eq!(sent(&mut payloads), Some(hash(2)));
+        assert!(
+            payloads.answer_telemetry(&hash(2), answered).is_none(),
+            "no source, no rows"
+        );
+        payloads.complete(&hash(1));
+        assert!(!payloads.awaits_block_answer(&hash(1)));
     }
 
     #[tokio::test]
@@ -1052,7 +1270,7 @@ mod tests {
             let root = numbered(root as u64 + 1);
             server
                 .new_payloads
-                .insert(root, 1, root, H256::ZERO, question(1));
+                .insert(root, 1, root, H256::ZERO, question(1), None);
         }
 
         let block = fulu_block(H256::ZERO, 1, 0);

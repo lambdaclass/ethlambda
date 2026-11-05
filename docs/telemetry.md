@@ -68,21 +68,33 @@ validator client enters as `gossip`, with `received` at the hand-off and no
 |---|---|
 | `received` | The block came off the wire (gossip) or was handed to the chain actor (req/resp) |
 | `da_available` | The data-availability check passed for a block that needed columns. A block with nothing to wait for (no blobs, or gloas, whose data gates the envelope instead) writes `da_check_end` instead |
-| `el_sent`, `el_verdict` | `engine_newPayload` sent and answered; only when an execution client answered |
+| `el_sent`, `el_verdict` | `engine_newPayload` sent and answered; only when an execution client answered. For a block imported before its answer, written when the answer is applied, at the instants the request went out and the answer came back (before it waited in the actor's mailbox) |
 | `stf_spec_start`, `stf_spec_end` | The state transition computed while `engine_newPayload` was in flight; only when a request was sent |
 | `stf_done` | The state transition finished |
-| `attestable` | The new head including the block is computed, as in Silver. Beacon recomputes the head once per arriving block, after the whole import cascade, so every block that cascade imported gets the same time, and only when that head computation succeeded (a failed one moves nothing, so writes no `attestable`); lean updates its head per block |
+| `attestable` | The new head including the block is computed and the block is no longer optimistic, so validators can attest to it. Beacon recomputes the head once per arriving block, after the whole import cascade, so every block that cascade imported gets the same time, and only when that head computation succeeded (a failed one moves nothing, so writes no `attestable`); lean updates its head per block. A beacon block imported before its execution client answered is optimistic at that recomputation, so its `attestable` is written instead when a `VALID` answer is applied, which is always later (see below); one never answered `VALID` has none |
 | `failed` | The import failed; `stf_done` and lean's `attestable` are then written as `stf_end` and `fc_head_end` |
 | `column_recv`, `column_validated` | A data column arrived, and passed validation. Written only for a column that passed (or, for `column_recv`, was judged to wait for its block), as Silver does, so rejected columns and re-delivered stored ones write nothing. At least once per block, column and stage: a column delivered again while it waits, or two copies passing at once, write again, so take the earliest. A column that waited writes `column_validated` with source `recheck`, so join the two on block root and column index, not on source. By-root and by-range answers stamp every column with the moment the whole answer reached the handler. A gossip-accepted column's `column_validated` comes after the verdict's trip back through the p2p actor; a checked one's when its check finished |
 | `cascade_*`, `prune_*`, `get_head_*`, `fcu_*` | Once per arrival, filed under the arriving block, when that block was imported in that cascade |
 
-ethlambda sends `engine_newPayload` from a task of its own and computes the
-state transition while the answer is in flight, so `el_sent` and
-`stf_spec_start` are a moment apart and the two overlap. `stf_start` to
-`stf_done` is the import that follows the verdict: it reuses the speculative
-transition when the verdict agrees with it and runs the transition again
-otherwise. The import's own wait for the execution client is
-`max(el_verdict, stf_spec_end)` minus `stf_spec_end`.
+On the running beacon node a block that may be imported optimistically does
+not wait for its execution client (`docs/beacon_engine.md`, "Asking without
+waiting"): `el_sent` is right before the state transition, `stf_done` is the
+transition alone, and the head recomputation after the cascade makes the block
+head while it is still optimistic. The answer comes back to the actor as a
+message of its own, handled only after the import that asked, head
+recomputation and `forkchoiceUpdated` included, so `attestable` (written when
+a `VALID` answer is applied) is always after `get_head_end`, and
+`attestable - el_verdict` is the time the answer waited in the mailbox. That
+`attestable` is what to compare with a client that validates the payload before
+it imports the block.
+
+A block that waits for its answer (offline replay, or one that may not be
+imported optimistically) has its request sent from a task of its own while the
+state transition runs, so `el_sent` and `stf_spec_start` are a moment apart and
+the two overlap. `stf_start` to `stf_done` is the import that follows the
+verdict: it reuses the speculative transition when the verdict agrees with it
+and runs the transition again otherwise. The import's own wait for the
+execution client is `max(el_verdict, stf_spec_end)` minus `stf_spec_end`.
 
 `source` and `verdict` are ethlambda's own values on every row, not Silver's
 (`Gossip`, `Rpc`, `Syncing`, ...); a query shared with Silver's rows must
@@ -93,7 +105,7 @@ match both.
 | Group | Stages |
 |---|---|
 | Per block, in order | `received`, `decode_end`, `queue_end`, `defer_start`, `defer_end`, `admit_start`, `admit_end`, `guards_start`, `guards_end`, `preamble_start`, `preamble_end`, `parent_wait_start`, `parent_wait_end`, `cascade_wait_start`, `cascade_wait_end`, `da_check_start`, `da_available` (or `da_check_end`), `columns_wait_start`, `columns_wait_end`, `verify_struct_start`, `verify_struct_end`, `verify_crypto_start`, `verify_crypto_end`, `stf_spec_start`, `stf_spec_end`, `stf_start`, `stf_done`, `writer_wait_start`, `writer_wait_end`, `db_write_start`, `db_write_end`, `fc_head_start`, `attestable` (lean), `block_atts_start`, `block_atts_end` |
-| Per block, with an execution client | `el_sent`, `el_verdict` |
+| Per block, with an execution client | `el_sent`, `el_verdict`, and (beacon, imported before its answer) `attestable` when a `VALID` answer is applied |
 | Per block, on failure | `stf_end` and `fc_head_end` in place of `stf_done` and `attestable`, plus `failed` |
 | Per arrival | `cascade_start`, `cascade_end`, `prune_start`, `prune_end`, `get_head_start`, `get_head_end`, `fcu_start`, `fcu_end`, and (beacon) `attestable` |
 | Per column | `column_recv`, `column_validated` |
