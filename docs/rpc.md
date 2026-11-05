@@ -418,9 +418,19 @@ the chain actor writes, so no request waits on the actor.
   let an exited validator through. The beacon-APIs say
   they must not reach the builder, not that the request fails. Each kept
   registration also sets its validator's fee recipient, so a block built
-  locally still pays the registered address. The kept ones go to `--builder` in
-  one call, skipped when none are left. A builder's 400 is passed through and
-  any other failure is a 500; with no `--builder` the answer is 500.
+  locally still pays the registered address. As in Lighthouse, that happens
+  before the builder is asked: it holds whatever the builder answers, and with
+  no `--builder` at all. Signatures are not checked here (Lighthouse does not
+  check them either); the builder does. A validator registered more than once
+  in one request keeps only its newest registration by `timestamp` (the later
+  one on a tie, as builders order them), counted as `duplicate`. The kept ones
+  go to `--builder` in one call, skipped when none are left. A builder's 400
+  is passed through and any other failure is a 500; with no `--builder` the
+  answer is 500, an empty list included, which is answered without reading
+  the head state. Future improvement: every other call walks the whole
+  registry once, with nothing bounding how many walks run at once; a
+  pubkey-to-index map beside the head state would make it a lookup per
+  registration.
 - **`blocks/{slot}`** advances the head state to the slot and asks the node's
   own execution client to build on the head (`forkchoiceUpdatedV3` with
   payload attributes, then `getPayloadV5`), with the proposer's fee recipient.

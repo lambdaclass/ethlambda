@@ -457,14 +457,17 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             .builder
             .as_deref()
             .map(|url| {
-                ethlambda_rpc::BuilderClient::new(
+                ethlambda_rpc::BuilderClient::with_redirects(
                     url,
                     std::time::Duration::from_millis(mainnet.builder_header_timeout),
                     version::client_version(),
+                    mainnet.builder_follow_redirects,
                 )
             })
             .transpose()?,
     };
+    // A one-off probe, for the log only: nothing waits on it or reads its
+    // answer, and every later call to the builder is tried on its own.
     if let Some(builder) = builder.clone() {
         tokio::spawn(async move {
             let _ = builder
@@ -472,7 +475,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                 .await
                 .inspect(|()| info!("Builder is up"))
                 .inspect_err(|err| {
-                    warn!(%err, "Builder is not answering; proposals build locally until it does")
+                    warn!(%err, "Builder did not answer the startup status check; each call to it is still tried")
                 });
         });
     }

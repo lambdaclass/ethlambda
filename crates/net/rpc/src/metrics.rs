@@ -69,8 +69,9 @@ pub(crate) async fn get_metrics() -> impl IntoResponse {
 }
 
 /// Count `register_validator` entries by what became of them: forwarded to
-/// the builder, failed at it, or dropped here as an unknown or exited
-/// validator.
+/// the builder, failed at it, dropped here as an unknown or exited validator,
+/// or superseded by a newer registration of the same validator in the same
+/// request (`duplicate`).
 pub(crate) fn inc_builder_registrations(outcome: &str, count: u64) {
     static LEAN_BEACON_BUILDER_REGISTRATIONS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
         register_int_counter_vec!(
