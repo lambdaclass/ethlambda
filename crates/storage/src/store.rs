@@ -4305,8 +4305,8 @@ impl Store {
             beacon.latest_messages.resize(slot + 1, None);
         }
         beacon.latest_messages[slot] = Some(message);
-        let equivocating = !beacon.equivocating_indices.is_empty()
-            && beacon.equivocating_indices.contains(&index);
+        let equivocating =
+            !beacon.equivocating_indices.is_empty() && beacon.equivocating_indices.contains(&index);
         if equivocating {
             beacon.proto_array.remove_vote(index);
         } else {
