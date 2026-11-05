@@ -153,6 +153,29 @@ impl ProposerSettings {
         })
     }
 
+    /// `pubkey`'s fee recipient and gas limit read together, under one lock, or
+    /// `None` when it has no fee recipient.
+    ///
+    /// For a signed message that carries both (a builder registration, proposer
+    /// preferences): two separate reads could straddle a keymanager write and
+    /// pair an old address with a new gas limit, a combination the operator
+    /// never configured, which the builder then keeps.
+    pub fn fee_recipient_and_gas_limit(
+        &self,
+        pubkey: &BlsPubkey,
+    ) -> Option<(ExecutionAddress, u64)> {
+        self.read(|inner| {
+            let overrides = inner.overrides.get(pubkey);
+            let fee_recipient = overrides
+                .and_then(|o| o.fee_recipient)
+                .or(inner.default_fee_recipient)?;
+            let gas_limit = overrides
+                .and_then(|o| o.gas_limit)
+                .unwrap_or(inner.default_gas_limit);
+            Some((fee_recipient, gas_limit))
+        })
+    }
+
     /// The graffiti `pubkey` proposes with.
     pub fn graffiti(&self, pubkey: &BlsPubkey) -> Bytes32 {
         self.read(|inner| {
@@ -237,6 +260,28 @@ mod tests {
         assert_eq!(settings.fee_recipient(&key(2)), Some(H160([0xaa; 20])));
         assert_eq!(settings.graffiti(&key(2)), Bytes32::repeat_byte(0x11));
         assert_eq!(settings.gas_limit(&key(2)), DEFAULT_GAS_LIMIT);
+    }
+
+    /// The pair a signed registration or preference carries agrees with the
+    /// two separate reads, and is `None` exactly when there is no address.
+    #[test]
+    fn the_fee_recipient_and_gas_limit_read_together_match_the_single_reads() {
+        let settings = ProposerSettings::new(Bytes32::ZERO, None);
+        assert_eq!(settings.fee_recipient_and_gas_limit(&key(1)), None);
+
+        settings.set_gas_limit(&key(1), 30_000_000);
+        assert_eq!(settings.fee_recipient_and_gas_limit(&key(1)), None);
+        settings.set_fee_recipient(&key(1), H160([0xbb; 20]));
+        assert_eq!(
+            settings.fee_recipient_and_gas_limit(&key(1)),
+            Some((H160([0xbb; 20]), 30_000_000))
+        );
+
+        let defaults = self::settings();
+        assert_eq!(
+            defaults.fee_recipient_and_gas_limit(&key(2)),
+            Some((H160([0xaa; 20]), DEFAULT_GAS_LIMIT))
+        );
     }
 
     /// Clearing one field leaves the others overridden.

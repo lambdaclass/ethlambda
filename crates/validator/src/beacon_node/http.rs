@@ -67,6 +67,48 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 /// would report a failure for a registration the node went on to install.
 const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(12);
 
+/// How much of a failed answer's body is read. Enough for a pool submission's
+/// 400, which lists each refused entry and is parsed for them.
+const ERROR_BODY_READ_LIMIT: usize = 1024 * 1024;
+
+/// How much of a failed answer's body an error carries, and so a log line.
+const ERROR_TEXT_LIMIT: usize = 1024;
+
+/// A failed answer's body, read up to [`ERROR_BODY_READ_LIMIT`] bytes, so a
+/// node answering with an endless body cannot hold the client on it.
+async fn read_error_body(mut response: reqwest::Response) -> String {
+    let mut bytes = Vec::new();
+    while bytes.len() < ERROR_BODY_READ_LIMIT {
+        match response.chunk().await {
+            Ok(Some(chunk)) => bytes.extend_from_slice(&chunk),
+            _ => break,
+        }
+    }
+    bytes.truncate(ERROR_BODY_READ_LIMIT);
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// A body as an error shows it: line breaks written out as `\n` and `\r`, so
+/// the log line it lands in stays one line, and cut to [`ERROR_TEXT_LIMIT`]
+/// bytes.
+fn error_text(body: String) -> String {
+    let mut text = body.replace('\n', "\\n").replace('\r', "\\r");
+    if text.len() > ERROR_TEXT_LIMIT {
+        let mut end = ERROR_TEXT_LIMIT;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str("...");
+    }
+    text
+}
+
+/// [`read_error_body`] as [`error_text`] shows it.
+async fn error_body(response: reqwest::Response) -> String {
+    error_text(read_error_body(response).await)
+}
+
 /// What an SSZ answer carries besides its bytes: the fork, which only a header
 /// can say, and the two booleans the block endpoints use to say what the bytes
 /// are.
@@ -184,7 +226,7 @@ impl HttpBeaconNode {
         if status.is_success() {
             return Ok(());
         }
-        let body = response.text().await.unwrap_or_default();
+        let body = error_body(response).await;
         Err(Error::BeaconNodeStatus {
             status: status.as_u16(),
             body,
@@ -283,7 +325,7 @@ impl HttpBeaconNode {
             return Err(Error::BeaconNodeSyncing);
         }
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
+            let body = error_body(response).await;
             return Err(Error::BeaconNodeStatus {
                 status: status.as_u16(),
                 body,
@@ -493,7 +535,7 @@ impl HttpBeaconNode {
 
         Err(Error::BeaconNodeStatus {
             status: status.as_u16(),
-            body,
+            body: error_text(body),
         })
     }
 
@@ -503,7 +545,7 @@ impl HttpBeaconNode {
             return Err(Error::BeaconNodeSyncing);
         }
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
+            let body = error_body(response).await;
             return Err(Error::BeaconNodeStatus {
                 status: status.as_u16(),
                 body,
@@ -727,7 +769,7 @@ impl BeaconNodeApi for HttpBeaconNode {
         if status.is_success() {
             return Ok(Published::Imported);
         }
-        let body = response.text().await.unwrap_or_default();
+        let body = error_body(response).await;
         Err(Error::BeaconNodeStatus {
             status: status.as_u16(),
             body,
@@ -744,9 +786,20 @@ impl BeaconNodeApi for HttpBeaconNode {
     /// anything to a builder). Every other 5xx, and any failure after the
     /// request was sent (a timeout, a reset), is [`Error::BlindedUnconfirmed`],
     /// since the relay may still publish.
+    ///
+    /// The status alone cannot always tell, and two edges are knowingly read
+    /// the wrong way. Some of ethlambda's own 500s are definite (no builder
+    /// configured, the blinded block failing the node's checks) and are read as
+    /// unconfirmed. A 503 from a proxy that had already forwarded the request
+    /// is read as definite. Neither changes what happens next: nothing is
+    /// retried and nothing is signed again either way. Only the log line and
+    /// the counter it lands on are wrong.
     async fn publish_blinded_block(
         &self,
+        // For the fallback, which picks the node that produced this block;
+        // one node has nothing to choose.
         _slot: Slot,
+        _block_root: Root,
         fork: ForkName,
         body: &[u8],
     ) -> Result<Published> {
@@ -775,7 +828,7 @@ impl BeaconNodeApi for HttpBeaconNode {
         if status.is_success() {
             return Ok(Published::HandedToBuilder);
         }
-        let body = response.text().await.unwrap_or_default();
+        let body = error_body(response).await;
         if status.is_server_error() && status != StatusCode::SERVICE_UNAVAILABLE {
             return Err(Error::BlindedUnconfirmed {
                 status: Some(status.as_u16()),
@@ -864,7 +917,7 @@ impl BeaconNodeApi for HttpBeaconNode {
         if status.is_success() {
             return Ok(());
         }
-        let body = response.text().await.unwrap_or_default();
+        let body = error_body(response).await;
         Err(Error::BeaconNodeStatus {
             status: status.as_u16(),
             body,
@@ -933,7 +986,7 @@ impl BeaconNodeApi for HttpBeaconNode {
         if status.is_success() {
             return Ok(messages.len());
         }
-        let body = response.text().await.unwrap_or_default();
+        let body = read_error_body(response).await;
         Self::handle_pool_submission(status, body, messages.len())
     }
 
@@ -963,7 +1016,7 @@ impl BeaconNodeApi for HttpBeaconNode {
         if status.is_success() {
             return Ok(attestations.len());
         }
-        let body = response.text().await.unwrap_or_default();
+        let body = read_error_body(response).await;
         Self::handle_pool_submission(status, body, attestations.len())
     }
 
@@ -1128,7 +1181,7 @@ impl BeaconNodeApi for HttpBeaconNode {
         if status.is_success() {
             return Ok(messages.len());
         }
-        let body = response.text().await.unwrap_or_default();
+        let body = read_error_body(response).await;
         Self::handle_pool_submission(status, body, messages.len())
     }
 
@@ -1469,6 +1522,31 @@ mod tests {
         assert!(served.seen.lock().expect("lock").is_empty());
     }
 
+    /// A node's error body reaches the logs on one line and cut short: a body
+    /// with line breaks cannot forge log lines, and a long one cannot flood
+    /// them.
+    #[tokio::test]
+    async fn an_error_body_is_one_line_and_capped() {
+        let reply = "first line\nsecond line\r\n".repeat(200).into_bytes();
+        let served = serve(400, vec![], reply).await;
+        let err = served.node.genesis().await.expect_err("a 400");
+        let Error::BeaconNodeStatus { status, body } = err else {
+            panic!("got {err:?}");
+        };
+        assert_eq!(status, 400);
+        assert!(body.starts_with("first line\\nsecond line\\r\\nfirst line"));
+        assert!(!body.contains('\n') && !body.contains('\r'));
+        assert_eq!(body.len(), ERROR_TEXT_LIMIT + "...".len());
+    }
+
+    #[test]
+    fn error_text_cuts_on_a_character_boundary() {
+        let text = error_text("é".repeat(ERROR_TEXT_LIMIT));
+        assert!(text.ends_with("..."));
+        assert!(text.len() <= ERROR_TEXT_LIMIT + "...".len());
+        assert_eq!(error_text("short".to_string()), "short");
+    }
+
     #[tokio::test]
     async fn a_blinded_publish_maps_each_status() {
         for (status, expected) in [
@@ -1478,7 +1556,7 @@ mod tests {
             let served = serve(status, vec![], vec![]).await;
             let published = served
                 .node
-                .publish_blinded_block(5, ForkName::Fulu, &[1, 2, 3])
+                .publish_blinded_block(5, Root::ZERO, ForkName::Fulu, &[1, 2, 3])
                 .await
                 .expect("accepted");
             assert_eq!(published, expected, "status {status}");
@@ -1492,7 +1570,7 @@ mod tests {
         let served = serve(400, vec![], b"bad".to_vec()).await;
         let err = served
             .node
-            .publish_blinded_block(5, ForkName::Fulu, &[1])
+            .publish_blinded_block(5, Root::ZERO, ForkName::Fulu, &[1])
             .await
             .expect_err("a refusal");
         assert!(
@@ -1503,7 +1581,7 @@ mod tests {
         let served = serve(500, vec![], b"boom".to_vec()).await;
         let err = served
             .node
-            .publish_blinded_block(5, ForkName::Fulu, &[1])
+            .publish_blinded_block(5, Root::ZERO, ForkName::Fulu, &[1])
             .await
             .expect_err("unconfirmed");
         assert!(
@@ -1525,7 +1603,7 @@ mod tests {
         // Nothing listens on port 1.
         let node = HttpBeaconNode::new("http://127.0.0.1:1").expect("builds");
         let err = node
-            .publish_blinded_block(5, ForkName::Fulu, &[1])
+            .publish_blinded_block(5, Root::ZERO, ForkName::Fulu, &[1])
             .await
             .expect_err("no answer");
         assert!(matches!(err, Error::BeaconNode { .. }), "got {err:?}");
@@ -1537,7 +1615,7 @@ mod tests {
         let served = serve(503, vec![], b"syncing".to_vec()).await;
         let err = served
             .node
-            .publish_blinded_block(5, ForkName::Fulu, &[1])
+            .publish_blinded_block(5, Root::ZERO, ForkName::Fulu, &[1])
             .await
             .expect_err("refused");
         assert!(

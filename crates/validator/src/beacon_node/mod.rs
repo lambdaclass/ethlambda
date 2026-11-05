@@ -387,8 +387,9 @@ pub trait BeaconNodeApi: Send + Sync {
     /// proposal, whether or not the first one succeeded.
     async fn publish_block(&self, fork: ForkName, body: &[u8]) -> Result<Published>;
 
-    /// Publish a signed blinded block, produced at `slot` under `fork`, to
-    /// `POST /eth/v2/beacon/blinded_blocks`. The node hands it to its builder.
+    /// Publish a signed blinded block, the one with root `block_root` produced
+    /// at `slot` under `fork`, to `POST /eth/v2/beacon/blinded_blocks`. The
+    /// node hands it to its builder.
     ///
     /// # Contract: the node that produced it, and no other
     ///
@@ -404,6 +405,7 @@ pub trait BeaconNodeApi: Send + Sync {
     async fn publish_blinded_block(
         &self,
         slot: Slot,
+        block_root: Root,
         fork: ForkName,
         body: &[u8],
     ) -> Result<Published>;
