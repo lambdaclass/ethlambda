@@ -7,7 +7,8 @@
 //! block submissions, and has `answer_headers_with` and
 //! `answer_submissions_with` to answer a call with exactly what a test needs.
 //! It serves `status` with 200, or 503 after `make_unavailable`, and answers
-//! every request with a 307 after `redirect_to`.
+//! every request with a 307 after `redirect_to`, or another status after
+//! `redirect_with`.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -58,9 +59,11 @@ struct RelayState {
     unavailable: bool,
     /// `registerValidator` calls received, whatever their outcome.
     registration_calls: usize,
-    /// Where every request is sent instead, with a 307: this base URL
-    /// followed by the request's own path.
-    redirect_to: Option<String>,
+    /// Where every request is sent instead, and with what status: this base
+    /// URL followed by the request's own path.
+    redirect_to: Option<(StatusCode, String)>,
+    /// Redirects answered, whether or not the client followed them.
+    redirects_served: usize,
 }
 
 /// A fixed answer to every `getHeader`.
@@ -169,7 +172,20 @@ impl MockRelay {
     /// own path, as a builder that moved does. A 307 keeps the method and the
     /// body, so a client that follows it lands a POST on `base` intact.
     pub(crate) fn redirect_to(&self, base: &str) {
-        self.state.lock().unwrap().redirect_to = Some(base.to_owned());
+        self.redirect_with(StatusCode::TEMPORARY_REDIRECT, base);
+    }
+
+    /// [`redirect_to`](Self::redirect_to), but answering with `status`. A
+    /// 301, 302 or 303 has a client that follows it resend a POST as a GET
+    /// without its body. `base` is sent as given, so it may be relative or
+    /// malformed.
+    pub(crate) fn redirect_with(&self, status: StatusCode, base: &str) {
+        self.state.lock().unwrap().redirect_to = Some((status, base.to_owned()));
+    }
+
+    /// How many requests were answered with a redirect.
+    pub(crate) fn redirects_served(&self) -> usize {
+        self.state.lock().unwrap().redirects_served
     }
 
     pub(crate) fn blinded_blocks(&self) -> Vec<SignedBlindedBeaconBlock> {
@@ -213,16 +229,19 @@ impl MockRelay {
 }
 
 async fn redirect(State(state): State<Shared>, request: Request, next: Next) -> Response {
-    let target = state.lock().unwrap().redirect_to.clone();
-    let Some(base) = target else {
+    let target = {
+        let mut state = state.lock().unwrap();
+        let target = state.redirect_to.clone();
+        if target.is_some() {
+            state.redirects_served += 1;
+        }
+        target
+    };
+    let Some((status, base)) = target else {
         return next.run(request).await;
     };
     let location = format!("{base}{}", request.uri().path());
-    (
-        StatusCode::TEMPORARY_REDIRECT,
-        [(header::LOCATION, location)],
-    )
-        .into_response()
+    (status, [(header::LOCATION, location)]).into_response()
 }
 
 async fn header(

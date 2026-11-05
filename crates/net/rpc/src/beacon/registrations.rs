@@ -19,6 +19,7 @@
 //! the head state.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, State};
@@ -34,6 +35,7 @@ use ethlambda_types::beacon::containers::BeaconState;
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, ValidatorIndex};
 use ethlambda_types::beacon::signing::compute_epoch_at_slot;
 use libssz::SszDecode as _;
+use tokio::sync::Semaphore;
 use tracing::warn;
 
 use super::builder_client::{BuilderClient, BuilderError};
@@ -41,23 +43,53 @@ use super::validator::{FeeRecipients, head};
 use super::{ApiError, BodyEncoding};
 use crate::metrics::inc_builder_registrations;
 
+/// How many registry walks (`active_or_pending`) may run at once.
+const CONCURRENT_REGISTRY_SCANS: usize = 2;
+
+/// The permits a registry walk takes, shared by every request this router
+/// serves.
+///
+/// Each non-empty request walks the whole registry on the blocking pool,
+/// which the duty endpoints share. Unbounded, a burst of requests (every
+/// validator client of a large operator re-registering at once, or a client
+/// that retries hard) would take every blocking thread for as long as the
+/// walks last. With the bound, a request beyond it waits for a permit as a
+/// suspended task, holding no thread. The walk itself is what a pubkey index
+/// would remove (see `active_or_pending`).
+#[derive(Clone)]
+struct RegistryScans(Arc<Semaphore>);
+
+impl Default for RegistryScans {
+    fn default() -> Self {
+        Self(Arc::new(Semaphore::new(CONCURRENT_REGISTRY_SCANS)))
+    }
+}
+
 pub(crate) fn routes() -> Router<Store> {
+    routes_with(RegistryScans::default())
+}
+
+fn routes_with(scans: RegistryScans) -> Router<Store> {
     // A validator client may send every key it holds at once, which is more
     // than axum's default body limit takes.
-    Router::new().route(
-        "/eth/v1/validator/register_validator",
-        post(post_register_validator).layer(DefaultBodyLimit::max(super::MAX_PUBLISH_BODY_BYTES)),
-    )
+    Router::new()
+        .route(
+            "/eth/v1/validator/register_validator",
+            post(post_register_validator)
+                .layer(DefaultBodyLimit::max(super::MAX_PUBLISH_BODY_BYTES)),
+        )
+        .layer(Extension(scans))
 }
 
 async fn post_register_validator(
     State(store): State<Store>,
     Extension(builder): Extension<Option<BuilderClient>>,
     Extension(fee_recipients): Extension<FeeRecipients>,
+    Extension(scans): Extension<RegistryScans>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    register(store, builder, fee_recipients, &headers, &body)
+    register(store, builder, fee_recipients, scans, &headers, &body)
         .await
         .map_or_else(IntoResponse::into_response, |()| {
             axum::http::StatusCode::OK.into_response()
@@ -71,6 +103,7 @@ async fn register(
     store: Store,
     builder: Option<BuilderClient>,
     fee_recipients: FeeRecipients,
+    scans: RegistryScans,
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<(), ApiError> {
@@ -90,9 +123,18 @@ async fn register(
     inc_builder_registrations("duplicate", (submitted - registrations.len()) as u64);
 
     // The head-state read and the walk over the whole registry are blocking
-    // work, as the duty endpoints' walks are.
+    // work, as the duty endpoints' walks are, and take a permit first (see
+    // `RegistryScans`). The permit moves into the walk, so it is released
+    // when the walk ends: a validator client that hangs up drops this
+    // handler, not the walk already running for it.
+    let permit = scans
+        .0
+        .acquire_owned()
+        .await
+        .map_err(|_| ApiError::Internal("checking the registrations failed"))?;
     let candidates = registrations.len();
     let kept = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let (_, state) = head(&store)?;
         // Judged at the later of the head's epoch and the wall clock's, so a
         // lagging head cannot let an exited validator through.
@@ -112,6 +154,11 @@ async fn register(
             recipients.insert(*index, registration.message.fee_recipient);
         }
     }
+    // The builder check comes before the empty one on purpose, so a request
+    // whose every validator was dropped is a 500 without a builder and a 200
+    // with one: the 500 is how a validator client configured for a builder
+    // learns there is none, whatever its body held, while a builder that is
+    // there has simply been sent nothing it would take.
     let builder = builder.ok_or(ApiError::Internal(NO_BUILDER))?;
     if kept.is_empty() {
         return Ok(());
@@ -195,8 +242,9 @@ fn newest_per_validator(
 /// index. One pass over the registry, whatever the number of registrations.
 ///
 /// Future improvement: that pass happens on every call, over the whole
-/// registry, with nothing bounding how many run at once. A pubkey-to-index
-/// map kept beside the head state would make it one lookup per registration.
+/// registry. `RegistryScans` bounds how many run at once, but each still
+/// costs a full walk; a pubkey-to-index map kept beside the head state would
+/// make it one lookup per registration, as Lighthouse's pubkey cache does.
 fn active_or_pending(
     state: &BeaconState,
     registrations: Vec<SignedValidatorRegistrationV1>,
@@ -661,6 +709,40 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(relay.registration_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_walk_beyond_the_bound_waits_for_a_permit() {
+        let store = store_with_exited(&[]);
+        let relay = MockRelay::start(genesis_fork_version(&store)).await;
+        let registration = signed_registration(0, genesis_fork_version(&store));
+        let scans = RegistryScans::default();
+        let app = routes_with(scans.clone())
+            .with_state(store)
+            .layer(Extension(client_for(&relay)))
+            .layer(Extension(FeeRecipients::default()));
+        let every_permit = CONCURRENT_REGISTRY_SCANS as u32;
+        let held = scans
+            .0
+            .clone()
+            .acquire_many_owned(every_permit)
+            .await
+            .unwrap();
+
+        // An empty request walks nothing, so it needs no permit.
+        let response = app.clone().oneshot(json_request(&[])).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let request = json_request(std::slice::from_ref(&registration));
+        let waiting = tokio::spawn(app.oneshot(request));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished(), "ran without a permit");
+        assert_eq!(relay.registration_calls(), 0);
+
+        drop(held);
+        let response = waiting.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(relay.registrations(), [registration]);
     }
 
     #[tokio::test]
