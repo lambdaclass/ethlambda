@@ -831,6 +831,20 @@ pub(crate) mod test_utils {
         (store, root)
     }
 
+    /// Finalizes `root` at `slot`'s epoch, leaving the head at `head`.
+    ///
+    /// For a store that keeps its anchor state under a second root, the one a
+    /// block built on it names as its parent: a real anchor's finalized
+    /// checkpoint names that root, and the publish endpoints refuse a parent
+    /// at the finalized slot that is not the finalized block.
+    pub(crate) fn finalize_at(store: &mut Store, head: H256, root: H256, slot: u64) {
+        let finalized = Checkpoint { root, slot };
+        let checkpoints = ForkCheckpoints::new(head, None, Some(finalized));
+        store
+            .update_checkpoints(checkpoints)
+            .expect("finalize the anchor's second root");
+    }
+
     /// A beacon store whose head is `block` (a block at `state`'s slot) with
     /// `state` as its post-state, on a clock whose slot `clock_slot` began a
     /// second ago.

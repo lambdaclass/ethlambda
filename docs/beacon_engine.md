@@ -322,6 +322,14 @@ An RPC *error* is not retried: that is the execution client answering, with a
 refusal but an answer, so asking again would get the same refusal and burn the
 ladder for nothing.
 
+`engine_getPayloadV5` and `engine_getPayloadV6` have no ladder: one attempt at
+`ENGINE_GET_PAYLOAD_TIMEOUT` (1 s). execution-apis #958 removed the method's
+timeout ("MUST respond immediately", and the consensus client "MAY abort such a
+call at its own discretion"); 1 s is the value it replaced and what Nimbus and
+Prysm (before gloas) use, where Lighthouse and Teku allow 2 s. A retry could not
+deliver the slot's payload in time, and an execution client may stop the build
+once it has served the call.
+
 After the last attempt the block is **dropped**. `optimistic-sync.md` requires
 exactly that much ("a consensus engine MUST NOT import the block and MUST NOT
 apply it to the fork choice store"), but nothing here re-drives the call

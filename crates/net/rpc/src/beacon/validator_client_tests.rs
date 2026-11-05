@@ -127,16 +127,22 @@ async fn serve_at(
     // A block built on this head names the head block's real root as its
     // parent, which the fixture's placeholder anchor block does not have:
     // keep the state under that root too, as a real anchor would be.
+    let parent_root = real_head_root(&state);
+    store.insert_state(parent_root, state.clone()).unwrap();
+    let (client, network, _pool, address) = spawn_server(store.clone(), engine, None).await;
+    (client, state, network, address, store)
+}
+
+/// The root a block built on `state` names as its parent: its latest block
+/// header's, which the fixtures' placeholder anchor block does not have.
+fn real_head_root(state: &BeaconState) -> ethlambda_types::primitives::H256 {
     let advanced = ethlambda_state_transition::beacon::block_production::advance_to_slot(
-        &state,
+        state,
         state.slot() + 1,
         &ethlambda_types::beacon::config::Config::mainnet(),
     )
     .unwrap();
-    let parent_root = advanced.latest_block_header().hash_tree_root();
-    store.insert_state(parent_root, state.clone()).unwrap();
-    let (client, network, _pool, address) = spawn_server(store.clone(), engine, None).await;
-    (client, state, network, address, store)
+    advanced.latest_block_header().hash_tree_root()
 }
 
 /// Serve `store` through the router the real server builds, over a socket on an
@@ -452,7 +458,8 @@ fn valid_blob(seed: u8) -> Vec<u8> {
 /// The fulu bundle carries `blob_count` valid blobs with their commitments and
 /// cell proofs (flattened blob by blob, as `BlobsBundleV2` does).
 pub(super) async fn fake_execution_client(blob_count: usize) -> ethlambda_engine::EngineClient {
-    fake_execution_client_with(blob_count, None, "0x2a", false).await
+    let delay = std::time::Duration::ZERO;
+    fake_execution_client_with(blob_count, None, "0x2a", false, delay).await
 }
 
 /// [`fake_execution_client`] with no blobs, whose fulu payload pays
@@ -461,13 +468,23 @@ pub(super) async fn fake_execution_client_paying(
     block_value: &'static str,
     should_override_builder: bool,
 ) -> ethlambda_engine::EngineClient {
-    fake_execution_client_with(0, None, block_value, should_override_builder).await
+    let delay = std::time::Duration::ZERO;
+    fake_execution_client_with(0, None, block_value, should_override_builder, delay).await
+}
+
+/// [`fake_execution_client`] with no blobs, holding every `forkchoiceUpdated`
+/// answer back for `delay`: an execution client slow to start a build.
+pub(super) async fn fake_execution_client_slow_to_build(
+    delay: std::time::Duration,
+) -> ethlambda_engine::EngineClient {
+    fake_execution_client_with(0, None, "0x2a", false, delay).await
 }
 
 /// [`fake_execution_client`] whose gloas payloads carry `blob`, with its real
 /// commitment and cell proofs, in the blobs bundle.
 async fn fake_execution_client_with_blob(blob: Option<Vec<u8>>) -> ethlambda_engine::EngineClient {
-    fake_execution_client_with(0, blob, "0x2a", false).await
+    let delay = std::time::Duration::ZERO;
+    fake_execution_client_with(0, blob, "0x2a", false, delay).await
 }
 
 async fn fake_execution_client_with(
@@ -475,6 +492,7 @@ async fn fake_execution_client_with(
     blob: Option<Vec<u8>>,
     block_value: &'static str,
     should_override_builder: bool,
+    forkchoice_delay: std::time::Duration,
 ) -> ethlambda_engine::EngineClient {
     use axum::{Json, routing::post};
     use ethlambda_state_transition::beacon::kzg;
@@ -540,7 +558,11 @@ async fn fake_execution_client_with(
                     "excessBlobGas": "0x0",
                 })
             };
-            let result = match request["method"].as_str() {
+            let method = request["method"].as_str();
+            if let Some("engine_forkchoiceUpdatedV3" | "engine_forkchoiceUpdatedV4") = method {
+                tokio::time::sleep(forkchoice_delay).await;
+            }
+            let result = match method {
                 Some("engine_forkchoiceUpdatedV3" | "engine_forkchoiceUpdatedV4") => {
                     let mut attributes = request["params"][1].clone();
                     attributes["parentHash"] = request["params"][0]["headBlockHash"].clone();
@@ -616,8 +638,15 @@ async fn produce_with_pool(
     };
     use ethlambda_types::beacon::constants::{DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO};
 
-    let (client, state, network, address, store) =
+    let (client, state, network, address, mut store) =
         serve_at(Some(fake_execution_client(blob_count).await)).await;
+    // The publish endpoints refuse a parent at the finalized slot other than
+    // the finalized block, so finalize the root the block names, as a real
+    // anchor's checkpoint does. Here only: the vote paths walk the block
+    // index, which holds the placeholder anchor.
+    let (anchor_root, _) = crate::beacon::validator::head(&store).unwrap();
+    let parent_root = real_head_root(&state);
+    crate::test_utils::finalize_at(&mut store, anchor_root, parent_root, state.slot());
     fill_pool(&store, &state);
     let slot = state.slot() + 1;
     let advanced = advance_to_slot(
@@ -1739,11 +1768,15 @@ mod builder_flow {
         // keep the head state under that root too, as `serve_at` does, so the
         // publish finds its parent.
         let mut store = world.store.clone();
-        let (_, head_state) = crate::beacon::validator::head(&store).unwrap();
+        let (anchor_root, head_state) = crate::beacon::validator::head(&store).unwrap();
         let parent_root = world.state.latest_block_header().hash_tree_root();
         store
             .insert_state(parent_root, (*head_state).clone())
             .unwrap();
+        // The publish endpoints refuse a parent at the finalized slot other
+        // than the finalized block, so finalize the root the block names, as a
+        // real anchor's checkpoint does.
+        crate::test_utils::finalize_at(&mut store, anchor_root, parent_root, head_state.slot());
 
         let (client, _network, _pool, _address) =
             spawn_server(store, Some(engine), Some(world.builder.clone())).await;

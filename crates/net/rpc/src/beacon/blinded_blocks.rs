@@ -27,7 +27,9 @@ use tracing::{error, info, warn};
 
 use super::builder_client::BuilderError;
 use super::builder_flow::Builder;
-use super::proposal::{refuse_future_slot, require_fulu_slot};
+use super::proposal::{
+    refuse_finalized_slot, refuse_future_slot, refuse_parent_behind_finality, require_fulu_slot,
+};
 use super::{ApiError, BodyEncoding};
 
 /// The 500's message when the builder answers a 2xx other than 202: not a
@@ -107,8 +109,10 @@ pub(crate) fn finalized_slot(store: &Store) -> Slot {
 }
 
 /// Checked like `post_block`'s fulu path, before anything leaves this node:
-/// the parent is held, the block is after it, its proposer is the one the
-/// parent's state names for the slot, and the proposer's signature verifies.
+/// the block is after the finalized slot, the parent is held and can descend
+/// from the finalized checkpoint, the block is after it, its proposer is the
+/// one the parent's state names for the slot, and the proposer's signature
+/// verifies.
 /// Then the slot is claimed, and the block goes to the builder.
 ///
 /// The submission runs on its own task. Once the proposer has signed it is
@@ -151,13 +155,18 @@ pub(crate) async fn post_blinded_block(
         "blinded blocks are accepted for fulu slots only",
     )
     .and_then(|()| refuse_future_slot(&store.config(), slot))
+    .and_then(|()| refuse_finalized_slot(&store, slot))
     {
         return err.into_response();
     }
-    let Some(parent_state) = store.get_state(&signed.message.parent_root).ok().flatten() else {
+    let parent_root = signed.message.parent_root;
+    let Some(parent_state) = store.get_state(&parent_root).ok().flatten() else {
         return ApiError::BadRequest("the block's parent is not known to this node")
             .into_response();
     };
+    if let Err(err) = refuse_parent_behind_finality(&store, parent_root, parent_state.slot()) {
+        return err.into_response();
+    }
     let config = store.config();
     let checked = tokio::task::spawn_blocking(move || {
         if slot <= parent_state.slot() {

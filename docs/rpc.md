@@ -472,11 +472,22 @@ the chain actor writes, so no request waits on the actor.
   is too far behind, or too many slots were skipped (the `--builder-fallback-*`
   flags set the thresholds). The builder's `getHeader` is then asked
   concurrently with the local build, bounded by its own timeout, and an error
-  or a timeout means no bid. A bid is checked before it competes: the head's
-  execution block as its parent, the proposal's `prev_randao`
+  or a timeout means no bid. Once a bid has passed its checks, the local build
+  has until two seconds after the two were asked for (`LOCAL_BUILD_DEADLINE`;
+  Lodestar's race cutoff and Lighthouse's `getPayload` timeout are both 2 s):
+  an execution client still silent then is given up on with a warning, and
+  the bid is served as for any failed local build. Without a valid bid the
+  local build is waited for as it is without a builder. A bid is checked
+  before it competes: the head's execution block as its parent, the
+  proposal's `prev_randao`
   and timestamp, the parent's block number plus one, the withdrawals root,
   the blob commitment and blob gas bounds, a gas limit within one step of the parent's toward the registered target,
-  and the builder's signature. Its fee recipient is not checked, since builders
+  and its signature, verified against the key the bid itself names. That
+  catches a corrupted bid and an honest endpoint's mistakes, not the endpoint
+  or a man in the middle on a plain-HTTP `--builder` signing a changed bid
+  again under a key of its own: the endpoint is trusted, as in every client
+  (Lighthouse, Teku, Prysm and Nimbus verify against the bid's own key too,
+  and Lodestar does not verify it). Its fee recipient is not checked, since builders
   name themselves there and pay the proposer with a transaction this node never
   sees before signing; the relay checks that payment (see
   `spec_deviations.md`). A bid that passes goes through `assemble_blinded_block`
@@ -511,9 +522,14 @@ the chain actor writes, so no request waits on the actor.
   content type is a `415`). The JSON is the specification's: lodestar's and
   nimbus's validator clients post it, teku's falls back to it, and lighthouse
   and prysm post SSZ. Both reach the same checks after decoding. Fulu: a
-  `SignedBlockContents`. A slot the schedule does not place at fulu, or one that
-  has not started yet (see `produceBlockV3`), is a `400`, checked before any
-  state is advanced. The block is then checked against its
+  `SignedBlockContents`. A slot the schedule does not place at fulu, one that
+  has not started yet (see `produceBlockV3`), or one at or below the finalized
+  checkpoint's first slot is a `400`, and so is a parent at or below that slot
+  that is not the finalized block itself, since the finalized checkpoint
+  cannot be its ancestor (gossip's IGNORE and REJECT rules for the two). All
+  are checked before any state is advanced, and so before the signature: they
+  bound how far an unauthenticated request can make this node advance an old
+  parent's state. The block is then checked against its
   **parent's** state advanced to its slot: an unknown parent, a slot not after
   the parent's, the wrong proposer or a bad proposer signature is a `400`. Then
   every blob's cells are computed and all cell proofs batch-verified on a
@@ -524,7 +540,8 @@ the chain actor writes, so no request waits on the actor.
   last the chain actor gets this node's custody columns, then the block, to
   import. Gloas: a bare `gloas::SignedBeaconBlock` (a gloas block carries no
   payload or blobs, so no sidecars go with it; they follow in the envelope). The
-  slot must be scheduled at gloas and have started, the parent must be held, the slot must be
+  slot must be scheduled at gloas, have started and be after the finalized
+  slot, the parent must be held and pass the same finality check, the slot must be
   after the parent's, and the proposer and signature are checked against the
   parent's state advanced to the slot (all `400` otherwise), before the block is
   gossiped and handed to the chain actor. This node publishes one block per
@@ -535,7 +552,8 @@ the chain actor writes, so no request waits on the actor.
 - **`POST beacon/blinded_blocks`** takes a fulu `SignedBlindedBeaconBlock` as
   JSON or SSZ, by `Content-Type` as above, with `Eth-Consensus-Version: fulu`.
   It is checked as a fulu `beacon/blocks` is, before anything leaves this node:
-  the slot is scheduled at fulu and has started, the parent is held and before the block, the
+  the slot is scheduled at fulu, has started and is after the finalized slot,
+  the parent is held, passes the finality check and is before the block, the
   proposer is the one the parent's state names for the slot, and the proposer's
   signature verifies (a blinded block has its full block's root, so the check
   is the same). Then the slot is claimed, shared with `beacon/blocks`, and the

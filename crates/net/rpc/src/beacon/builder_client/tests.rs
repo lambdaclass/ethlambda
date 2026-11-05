@@ -9,9 +9,11 @@ use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{
     BlsPubkey, BlsSignature, ExecutionBlockHash, Root, Uint256, Version,
 };
+use reqwest::Url;
 
+use super::error::shown_target;
 use super::mock_relay::{MockRelay, signed_registration, unreachable_url};
-use super::{BuilderClient, BuilderError, VersionedBid};
+use super::{BuilderClient, BuilderError, VersionedBid, follows};
 
 /// Any version will do: the relay and the signers only have to agree on it.
 const GENESIS_FORK_VERSION: Version = [0x10, 0x00, 0x00, 0x38];
@@ -200,20 +202,135 @@ async fn a_redirect_is_refused_and_names_its_target() {
     assert_eq!(target.registration_calls(), 0);
 }
 
+fn following_client_for(relay: &MockRelay) -> BuilderClient {
+    BuilderClient::with_redirects(relay.url.clone(), HEADER_TIMEOUT, "ethlambda/test", true)
+        .unwrap()
+}
+
 #[tokio::test]
-async fn a_redirect_is_followed_when_asked() {
-    let moved = MockRelay::start(GENESIS_FORK_VERSION).await;
-    let target = MockRelay::start(GENESIS_FORK_VERSION).await;
-    moved.redirect_to(&target.url);
-    let client =
-        BuilderClient::with_redirects(moved.url.clone(), HEADER_TIMEOUT, "ethlambda/test", true)
+async fn a_307_or_308_is_followed_when_asked() {
+    for status in [
+        StatusCode::TEMPORARY_REDIRECT,
+        StatusCode::PERMANENT_REDIRECT,
+    ] {
+        let moved = MockRelay::start(GENESIS_FORK_VERSION).await;
+        let target = MockRelay::start(GENESIS_FORK_VERSION).await;
+        moved.redirect_with(status, &target.url);
+        let registrations = vec![signed_registration(0, GENESIS_FORK_VERSION)];
+
+        following_client_for(&moved)
+            .register_validators(&registrations)
+            .await
             .unwrap();
-    let registrations = vec![signed_registration(0, GENESIS_FORK_VERSION)];
 
-    client.register_validators(&registrations).await.unwrap();
+        // Both keep the POST and its body, so the target got them whole.
+        assert_eq!(target.registrations(), registrations, "{status}");
+    }
+}
 
-    // A 307 keeps the POST and its body, so the target got them whole.
-    assert_eq!(target.registrations(), registrations);
+#[tokio::test]
+async fn a_301_302_or_303_is_not_followed_even_when_asked() {
+    for status in [
+        StatusCode::MOVED_PERMANENTLY,
+        StatusCode::FOUND,
+        StatusCode::SEE_OTHER,
+    ] {
+        let moved = MockRelay::start(GENESIS_FORK_VERSION).await;
+        let target = MockRelay::start(GENESIS_FORK_VERSION).await;
+        moved.redirect_with(status, &target.url);
+        let registrations = vec![signed_registration(0, GENESIS_FORK_VERSION)];
+
+        let err = following_client_for(&moved)
+            .register_validators(&registrations)
+            .await
+            .unwrap_err();
+
+        // Followed, the POST would have reached the target as an empty GET,
+        // and the call would have failed on the target's 405 instead.
+        let answered = status.as_u16();
+        assert!(
+            matches!(err, BuilderError::Redirected { status, .. } if status == answered),
+            "{err:?}"
+        );
+        assert_eq!(target.registration_calls(), 0, "{status}");
+    }
+}
+
+#[tokio::test]
+async fn a_redirect_loop_stops_after_ten_hops() {
+    let looping = MockRelay::start(GENESIS_FORK_VERSION).await;
+    looping.redirect_to(&looping.url);
+
+    let err = following_client_for(&looping).status().await.unwrap_err();
+
+    // The first request and ten followed redirects; the eleventh redirect is
+    // the answer, named rather than failed as a transport error.
+    assert!(
+        matches!(err, BuilderError::Redirected { status: 307, .. }),
+        "{err:?}"
+    );
+    assert_eq!(looping.redirects_served(), 11);
+}
+
+fn url(value: &str) -> Url {
+    Url::parse(value).unwrap()
+}
+
+#[test]
+fn only_a_307_or_308_is_followed() {
+    let next = url("https://relay.example/eth/v1/builder/validators");
+    let previous = [url("https://mev-boost.example/eth/v1/builder/validators")];
+    for status in [
+        StatusCode::TEMPORARY_REDIRECT,
+        StatusCode::PERMANENT_REDIRECT,
+    ] {
+        assert!(follows(status, &next, &previous), "{status}");
+    }
+    for status in [
+        StatusCode::MOVED_PERMANENTLY,
+        StatusCode::FOUND,
+        StatusCode::SEE_OTHER,
+    ] {
+        assert!(!follows(status, &next, &previous), "{status}");
+    }
+}
+
+#[test]
+fn a_downgrade_from_https_to_http_is_refused() {
+    // The mock relay serves plain http, so the downgrade is checked here
+    // rather than end to end.
+    let status = StatusCode::TEMPORARY_REDIRECT;
+    let https = url("https://relay.example/eth/v1/builder/status");
+    let http = url("http://relay.example/eth/v1/builder/status");
+
+    assert!(!follows(status, &http, std::slice::from_ref(&https)));
+    // Whatever came before: one https hop is enough to rule out http after it.
+    assert!(!follows(status, &http, &[http.clone(), https.clone()]));
+    // An upgrade, or staying on one scheme, is fine.
+    assert!(follows(status, &https, std::slice::from_ref(&http)));
+    assert!(follows(status, &https, std::slice::from_ref(&https)));
+    assert!(follows(status, &http, std::slice::from_ref(&http)));
+}
+
+#[test]
+fn a_redirect_to_a_scheme_other_than_http_is_not_followed() {
+    let previous = [url("http://relay.example/")];
+    let ftp = url("ftp://relay.example/eth/v1/builder/status");
+    assert!(!follows(StatusCode::TEMPORARY_REDIRECT, &ftp, &previous));
+}
+
+#[test]
+fn at_most_ten_redirects_are_followed() {
+    let status = StatusCode::TEMPORARY_REDIRECT;
+    let next = url("http://relay.example/next");
+    // `previous` starts with the URL the call was sent to, so ten URLs in it
+    // means nine redirects followed so far, and this one is the tenth.
+    let mut previous: Vec<Url> = (0..10)
+        .map(|hop| url(&format!("http://relay.example/{hop}")))
+        .collect();
+    assert!(follows(status, &next, &previous));
+    previous.push(url("http://relay.example/10"));
+    assert!(!follows(status, &next, &previous));
 }
 
 #[tokio::test]
@@ -230,6 +347,105 @@ async fn a_redirect_target_is_shown_without_its_credentials() {
     );
     assert!(!message.contains("hunter2"), "{message}");
     assert!(!message.contains("operator"), "{message}");
+}
+
+#[tokio::test]
+async fn a_scheme_relative_target_is_shown_absolute_without_its_credentials() {
+    // `//user:pass@host/x` does not parse as a URL on its own; it is only
+    // stripped once resolved against the URL that answered.
+    let moved = MockRelay::start(GENESIS_FORK_VERSION).await;
+    moved.redirect_to("//operator:hunter2@127.0.0.1:9");
+
+    let err = client_for(&moved).status().await.unwrap_err();
+
+    let message = err.to_string();
+    assert!(
+        message.contains("http://127.0.0.1:9/eth/v1/builder/status"),
+        "{message}"
+    );
+    assert!(!message.contains("hunter2"), "{message}");
+    assert!(!message.contains("operator"), "{message}");
+}
+
+#[tokio::test]
+async fn a_relative_target_is_shown_resolved_against_the_builder() {
+    let moved = MockRelay::start(GENESIS_FORK_VERSION).await;
+    moved.redirect_to("/moved");
+
+    let err = client_for(&moved).status().await.unwrap_err();
+
+    let location = format!("{}/moved/eth/v1/builder/status", moved.url);
+    assert!(
+        matches!(&err, BuilderError::Redirected { location: shown, .. } if *shown == location),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_unparsable_target_is_not_shown() {
+    // An unterminated IPv6 host: not a URL, resolved or not.
+    let moved = MockRelay::start(GENESIS_FORK_VERSION).await;
+    moved.redirect_to("http://operator:hunter2@[::1");
+
+    let err = client_for(&moved).status().await.unwrap_err();
+
+    let BuilderError::Redirected { location, .. } = &err else {
+        panic!("expected a redirect, got {err:?}");
+    };
+    assert_eq!(
+        location,
+        "a Location that does not resolve to a URL with a host"
+    );
+    let message = err.to_string();
+    assert!(!message.contains("hunter2"), "{message}");
+    assert!(!message.contains("operator"), "{message}");
+}
+
+#[test]
+fn a_relative_target_does_not_inherit_the_builders_credentials() {
+    let base = url("http://operator:hunter2@relay.example/eth/v1/builder/status");
+    assert_eq!(shown_target(&base, b"/moved"), "http://relay.example/moved");
+}
+
+#[test]
+fn a_target_with_no_host_is_not_shown() {
+    // It resolves, but to a URL with no host, so it has no user or password
+    // to remove and is not shown at all.
+    let base = url("http://relay.example/eth/v1/builder/status");
+    assert_eq!(
+        shown_target(&base, b"mailto:operator:hunter2@relay.example"),
+        "a Location that does not resolve to a URL with a host"
+    );
+}
+
+#[tokio::test]
+async fn a_3xx_that_is_not_a_redirect_is_an_unexpected_status() {
+    for status in [StatusCode::MULTIPLE_CHOICES, StatusCode::NOT_MODIFIED] {
+        let relay = MockRelay::start(GENESIS_FORK_VERSION).await;
+        relay.answer_headers_with(status, TEXT, Vec::new(), None);
+        let answered = status.as_u16();
+        let result = get_header(&client_for(&relay)).await;
+        assert!(
+            matches!(&result, Err(BuilderError::Status { status, .. }) if *status == answered),
+            "{result:?}"
+        );
+    }
+}
+
+#[test]
+fn debug_does_not_show_the_urls_credentials() {
+    let client = BuilderClient::new(
+        "http://operator:hunter2@127.0.0.1:18550",
+        HEADER_TIMEOUT,
+        "ethlambda/test",
+    )
+    .unwrap();
+
+    let shown = format!("{client:?}");
+
+    assert!(shown.contains("http://127.0.0.1:18550/"), "{shown}");
+    assert!(!shown.contains("hunter2"), "{shown}");
+    assert!(!shown.contains("operator"), "{shown}");
 }
 
 const JSON: &str = "application/json";
@@ -285,6 +501,47 @@ async fn line_breaks_in_an_error_are_written_out() {
         panic!("expected a bad request");
     };
     assert_eq!(message.len(), 1024);
+}
+
+/// Every other control character is written out too (an ESC would start an
+/// ANSI sequence in a terminal), and so are the Unicode line and paragraph
+/// separators, which `char::is_control` does not cover. Quotes and
+/// backslashes pass through.
+#[tokio::test]
+async fn control_characters_in_an_error_are_written_out() {
+    let relay = MockRelay::start(GENESIS_FORK_VERSION).await;
+    let body = "\x1b[31mred\x1b[0m\ttab\x07bell\u{85}nel\u{2028}ls\u{2029}ps \"q\" \\ ok";
+    relay.answer_headers_with(StatusCode::BAD_REQUEST, TEXT, body.into(), None);
+    let Err(BuilderError::BadRequest(message)) = get_header(&client_for(&relay)).await else {
+        panic!("expected a bad request");
+    };
+    assert_eq!(
+        message,
+        r#"\u{1b}[31mred\u{1b}[0m\ttab\u{7}bell\u{85}nel\u{2028}ls\u{2029}ps "q" \ ok"#
+    );
+
+    // The same escapes reach a JSON error's message, where the builder can
+    // send them as `\u001b`.
+    let relay = MockRelay::start(GENESIS_FORK_VERSION).await;
+    let body = br#"{"code":400,"message":"\u001b[2Jcleared"}"#.to_vec();
+    relay.answer_headers_with(StatusCode::BAD_REQUEST, JSON, body, None);
+    let Err(BuilderError::BadRequest(message)) = get_header(&client_for(&relay)).await else {
+        panic!("expected a bad request");
+    };
+    assert_eq!(message, r"\u{1b}[2Jcleared");
+}
+
+/// The cap never leaves half an escape behind.
+#[test]
+fn the_cap_never_cuts_an_escape_in_two() {
+    // 1020 bytes, then a six-byte escape that would end past the cap.
+    let text = format!("{}\x1b", "x".repeat(1020));
+    assert_eq!(super::error_text(text), "x".repeat(1020));
+    let text = format!("{}\x1b", "x".repeat(1018));
+    assert_eq!(
+        super::error_text(text),
+        format!("{}\\u{{1b}}", "x".repeat(1018))
+    );
 }
 
 #[tokio::test]
