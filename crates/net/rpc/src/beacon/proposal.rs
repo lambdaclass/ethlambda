@@ -75,7 +75,7 @@ use libssz_derive::{SszDecode, SszEncode};
 use libssz_types::SszList;
 use serde::Deserialize;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
 use crate::beacon::bid_selection::wei_u128;
@@ -141,13 +141,14 @@ pub(crate) fn routes() -> Router<Store> {
 /// `SignedBeaconBlock` (gloas), as SSZ or JSON by `Content-Type`.
 ///
 /// Checked before it goes anywhere: the fork is fulu (both the header and the
-/// slot's place in the schedule), its parent is a block this node holds (not
-/// necessarily the head), it is after that parent, its proposer is the one the
-/// parent's state advanced to its slot names, the proposer's signature
-/// verifies against that state, and its blobs and cell proofs match the
-/// block's commitments and verify. Then handed to P2P with the data column
-/// sidecars built from them,
-/// which gossips both and gives the block to the chain actor to import. The
+/// slot's place in the schedule), the slot is after the finalized one, its
+/// parent is a block this node holds (not necessarily the head) that can
+/// descend from the finalized checkpoint, it is after that parent, its
+/// proposer is the one the parent's state advanced to its slot names, the
+/// proposer's signature verifies against that state, and its blobs and cell
+/// proofs match the block's commitments and verify. Then handed to P2P with
+/// the data column sidecars built from them, which gossips both and gives
+/// the block to the chain actor to import. The
 /// full import runs there, so `200` here means validated and broadcast, the
 /// `gossip` level of `broadcast_validation`, which is the endpoint's default.
 async fn post_block(
@@ -176,12 +177,14 @@ async fn post_block(
     };
     // Before the parent's state is advanced: a fulu body at a gloas slot would
     // run `upgrade_to_gloas` only to be refused afterwards.
+    let slot = contents.signed_block.message.slot;
     if let Err(err) = require_fulu_slot(
         &store.config(),
-        contents.signed_block.message.slot,
+        slot,
         "blocks are accepted for fulu slots only",
     )
-    .and_then(|()| refuse_future_slot(&store.config(), contents.signed_block.message.slot))
+    .and_then(|()| refuse_future_slot(&store.config(), slot))
+    .and_then(|()| refuse_finalized_slot(&store, slot))
     {
         return err.into_response();
     }
@@ -191,14 +194,14 @@ async fn post_block(
         kzg_proofs,
         blobs,
     } = contents;
-    let Some(parent_state) = store
-        .get_state(&signed_block.message.parent_root)
-        .ok()
-        .flatten()
-    else {
+    let parent_root = signed_block.message.parent_root;
+    let Some(parent_state) = store.get_state(&parent_root).ok().flatten() else {
         return ApiError::BadRequest("the block's parent is not known to this node")
             .into_response();
     };
+    if let Err(err) = refuse_parent_behind_finality(&store, parent_root, parent_state.slot()) {
+        return err.into_response();
+    }
     let config = store.config();
     let checked = tokio::task::spawn_blocking(move || {
         let slot = signed_block.message.slot;
@@ -280,8 +283,9 @@ async fn post_block(
 /// gloas block carries no payload and no blobs of its own (the envelope and
 /// the data columns follow through `publishExecutionPayloadEnvelope`).
 ///
-/// Checked as the fulu one is, before it goes anywhere: the parent is held,
-/// the slot is after the parent's and scheduled at gloas, the proposer is the
+/// Checked as the fulu one is, before it goes anywhere: the parent is held
+/// and can descend from the finalized checkpoint, the slot is after the
+/// finalized one and the parent's and scheduled at gloas, the proposer is the
 /// slot's, and the proposer's signature verifies against the parent's state
 /// advanced to the slot. The advance and the signature are CPU-bound and run
 /// off the runtime.
@@ -303,6 +307,7 @@ async fn post_gloas_block(
         "blocks are accepted for gloas slots only",
     )
     .and_then(|()| refuse_future_slot(&config, block.slot()))
+    .and_then(|()| refuse_finalized_slot(store, block.slot()))
     {
         return err.into_response();
     }
@@ -311,6 +316,10 @@ async fn post_gloas_block(
         Ok(None) => return ApiError::BadRequest("the block's parent is not held").into_response(),
         Err(_) => return ApiError::Internal("store read failed").into_response(),
     };
+    if let Err(err) = refuse_parent_behind_finality(store, block.parent_root(), parent_state.slot())
+    {
+        return err.into_response();
+    }
     if block.slot() <= parent_state.slot() {
         return ApiError::BadRequest("the block is not after its parent").into_response();
     }
@@ -459,6 +468,51 @@ pub(super) fn refuse_future_slot(config: &Config, slot: Slot) -> Result<(), ApiE
         .map_or(0, |elapsed| elapsed.as_millis() as u64);
     if is_future_slot(config, slot, now_ms) {
         return Err(ApiError::BadRequest("the slot has not started yet"));
+    }
+    Ok(())
+}
+
+/// Refuses a published block at or below the finalized checkpoint's slot,
+/// before its parent's state is loaded: gossip's `[IGNORE] block.slot >
+/// compute_start_slot_at_epoch(finalized_checkpoint.epoch)`, which every peer
+/// would apply to it anyway.
+///
+/// With [`refuse_parent_behind_finality`] this bounds how far a publish
+/// endpoint advances a parent's state, which it does before the proposer's
+/// signature is checked, so for any caller. [`refuse_future_slot`] caps the
+/// block's slot; these cap how far back its parent may be.
+pub(super) fn refuse_finalized_slot(store: &Store, slot: Slot) -> Result<(), ApiError> {
+    if slot <= finalized_slot(store) {
+        return Err(ApiError::BadRequest(
+            "the block is not after the finalized slot",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses a parent the finalized checkpoint cannot be an ancestor of, before
+/// its state is advanced: gossip's `[REJECT]` for a block whose chain does not
+/// pass through the finalized checkpoint, for the parents it can be decided
+/// for from the parent alone.
+///
+/// A parent at or below the finalized checkpoint's slot is its own
+/// checkpoint block (`get_checkpoint_block` stops at it), so it descends from
+/// the finalized checkpoint only by being its block. The finalized block may
+/// itself sit below that slot, when the epoch's first slots were empty, which
+/// is why the root is compared rather than the slot alone. A parent above the
+/// slot is not walked back here; gossip validation and import walk it, and
+/// the advance from such a parent is bounded by the finalized slot below and
+/// the wall clock above.
+pub(super) fn refuse_parent_behind_finality(
+    store: &Store,
+    parent_root: H256,
+    parent_slot: Slot,
+) -> Result<(), ApiError> {
+    let finalized_root = store.beacon_finalized_checkpoint().root;
+    if parent_slot <= finalized_slot(store) && parent_root != finalized_root {
+        return Err(ApiError::BadRequest(
+            "the block's parent does not descend from the finalized checkpoint",
+        ));
     }
     Ok(())
 }
@@ -614,8 +668,9 @@ struct BuilderRequest<'a> {
 /// circuit breaker quiet, the builder's bid is fetched alongside the local
 /// payload. Both are checked without a state transition, [`choice::choose`]
 /// picks one, and only that one is built into a block; the other is built only
-/// if the first fails. Without a builder the block is built exactly as it is
-/// without one.
+/// if the first fails. A valid bid waits for the local payload only until
+/// [`LOCAL_BUILD_DEADLINE`] (see [`local_and_bid`]). Without a builder the
+/// block is built exactly as it is without one.
 #[allow(clippy::too_many_arguments)]
 async fn produce(
     store: &Store,
@@ -649,18 +704,20 @@ async fn produce(
     // Asked alongside the build rather than before it, so a healthy execution
     // client costs the block nothing for its version and a silent one costs it
     // at most the version's own timeout. The builder's bid is asked alongside
-    // as well, bounded by its own header timeout.
-    let (built, el_version, bid) = tokio::join!(
-        build_payload(store, engine, fee_recipients, &state, head_root, proposer),
+    // as well, bounded by its own header timeout, and checked as soon as it
+    // arrives, so a valid one can bound the wait for the local payload.
+    let local = build_payload(store, engine, fee_recipients, &state, head_root, proposer);
+    let bid = async {
+        let request = request.as_ref()?;
+        let bid = fetch_bid(request, slot).await?;
+        accepted_bid(&state, &config, request, bid)
+    };
+    let ((built, bid), el_version) = tokio::join!(
+        local_and_bid(local, bid, slot),
         graffiti::execution_client_version(engine, own_version),
-        fetch_bid(request.as_ref(), slot),
     );
     let graffiti = graffiti::with_client_versions(graffiti, el_version.as_ref(), own_version);
     let local = built.and_then(|built| local_parts(built, slot));
-    let bid = request
-        .as_ref()
-        .zip(bid)
-        .and_then(|(request, bid)| accepted_bid(&state, &config, request, bid));
     // Nothing to build a block from: skip the packing, whose sync aggregate
     // costs a BLS verification.
     let (local, mut bid) = match (local, bid) {
@@ -955,9 +1012,69 @@ fn builder_request<'a>(
     })
 }
 
-/// The builder's bid, or `None` when it was not asked, had none, or failed.
-async fn fetch_bid(request: Option<&BuilderRequest<'_>>, slot: Slot) -> Option<VersionedBid> {
-    let request = request?;
+/// How long, from when the payload and the bid are asked for, the local
+/// payload may keep a validated builder bid waiting.
+///
+/// Without a bound the wait is the execution client's own: `getPayload` is one
+/// attempt at 1 s, but `forkchoiceUpdated` is up to three attempts at
+/// `ENGINE_TIMEOUT` (8 s) with backoff, so a stalled execution client would
+/// hold a valid bid past the 12 s slot and the proposal would be missed.
+///
+/// Two seconds follows the other clients. Lodestar waits for both sources
+/// until 1667 bps of the slot (2 s of 12 s, `BLOCK_PRODUCTION_RACE_CUTOFF_BPS`,
+/// `api/impl/validator/index.ts:129`) and then takes whichever has answered
+/// (`resolveOrRacePromises`, `utils/src/promise.ts:100`), measuring from the
+/// slot's start where this measures from the request, the same instant for a
+/// validator client that asks at the slot boundary, as they do. Lighthouse
+/// waits for both (`execution_layer/src/lib.rs:1077`) with no deadline of its
+/// own, but makes each engine call once (`Engine::request`, `engines.rs:352`),
+/// `getPayload` at 2 s and `forkchoiceUpdated` at 8 s
+/// (`engine_api/http.rs:52,59`); it usually starts the build before the slot,
+/// so only `getPayload` is on the path. A healthy execution client answers in
+/// well under a second, so it is never cut off.
+const LOCAL_BUILD_DEADLINE: Duration = Duration::from_secs(2);
+
+/// The local payload and the accepted builder bid, both asked for at once.
+///
+/// Once a bid has passed its checks, the local build has until
+/// [`LOCAL_BUILD_DEADLINE`] after this was called; past it the build is
+/// dropped and answered as failed, so the bid is served through the same
+/// fallback as for any failed local build. Without a bid there is nothing to
+/// fall back on, so the local build is waited for exactly as it is without a
+/// builder: giving up on it then could only turn a late block into none.
+async fn local_and_bid(
+    local: impl Future<Output = Result<BuiltPayload, ApiError>>,
+    bid: impl Future<Output = Option<BuilderBid>>,
+    slot: Slot,
+) -> (Result<BuiltPayload, ApiError>, Option<BuilderBid>) {
+    let deadline = tokio::time::Instant::now() + LOCAL_BUILD_DEADLINE;
+    tokio::pin!(local, bid);
+    let bid = tokio::select! {
+        built = &mut local => return (built, bid.await),
+        bid = &mut bid => bid,
+    };
+    if bid.is_none() {
+        return (local.await, None);
+    }
+    match tokio::time::timeout_at(deadline, local).await {
+        Ok(built) => (built, bid),
+        Err(_) => {
+            let deadline_ms = LOCAL_BUILD_DEADLINE.as_millis() as u64;
+            warn!(
+                %slot,
+                deadline_ms,
+                "The execution client did not return a payload in time; the builder's bid stands in"
+            );
+            let err = ApiError::ServiceUnavailable(
+                "the execution client did not return a payload in time",
+            );
+            (Err(err), bid)
+        }
+    }
+}
+
+/// The builder's bid, or `None` when it had none or failed.
+async fn fetch_bid(request: &BuilderRequest<'_>, slot: Slot) -> Option<VersionedBid> {
     request
         .builder
         .client
@@ -1463,10 +1580,13 @@ mod tests {
         let parent = parent_state();
         let state = state_to_build_on();
         let produced = produce(&state, true, Vec::new()).unwrap();
-        let (mut store, _anchor) = beacon_store_with_config(parent.clone(), config());
+        let parent_slot = parent.slot();
+        let (mut store, anchor) = beacon_store_with_config(parent.clone(), config());
         store
             .insert_state(produced.block.parent_root, parent)
             .unwrap();
+        let parent_root = produced.block.parent_root;
+        crate::test_utils::finalize_at(&mut store, anchor, parent_root, parent_slot);
 
         let signed = containers::gloas::SignedBeaconBlock {
             signature: sign_block(&state, &produced.block),
@@ -1538,10 +1658,13 @@ mod tests {
         let parent = parent_state();
         let state = state_to_build_on();
         let produced = produce(&state, true, Vec::new()).unwrap();
-        let (mut store, _anchor) = beacon_store_with_config(parent.clone(), config());
+        let parent_slot = parent.slot();
+        let (mut store, anchor) = beacon_store_with_config(parent.clone(), config());
         store
             .insert_state(produced.block.parent_root, parent)
             .unwrap();
+        let parent_root = produced.block.parent_root;
+        crate::test_utils::finalize_at(&mut store, anchor, parent_root, parent_slot);
         let sign = |block: &containers::gloas::BeaconBlock| containers::gloas::SignedBeaconBlock {
             signature: sign_block(&state, block),
             message: block.clone(),
@@ -1787,6 +1910,67 @@ mod tests {
             ethlambda_engine::JwtSecret::new([0x0f; 32]),
         )
         .unwrap()
+    }
+
+    /// An execution client that takes every request and never answers.
+    async fn silent_engine() -> EngineClient {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = Router::new().route(
+            "/",
+            post(|| async { std::future::pending::<StatusCode>().await }),
+        );
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        EngineClient::new(
+            format!("http://{address}"),
+            ethlambda_engine::JwtSecret::new([0x0f; 32]),
+        )
+        .unwrap()
+    }
+
+    /// A stalled execution client holds a valid bid back only until the
+    /// local build's deadline, not for its own retry ladder (one
+    /// `forkchoiceUpdated` attempt alone is `ENGINE_TIMEOUT`).
+    #[tokio::test]
+    async fn a_silent_execution_client_gives_way_to_a_valid_bid_at_the_deadline() {
+        let world = builder_world(true, SyncStatus::Synced).await;
+        world.offer(ETH, |_| {});
+        let started = std::time::Instant::now();
+        let answer = produce_answer(&world, Some(silent_engine().await), None, "").await;
+        let elapsed = started.elapsed();
+        answer.assert(&world, true, &ETH.to_string(), 1);
+        assert!(elapsed >= LOCAL_BUILD_DEADLINE, "{elapsed:?}");
+        assert!(
+            elapsed < ethlambda_engine::client::ENGINE_TIMEOUT,
+            "{elapsed:?}"
+        );
+    }
+
+    /// Without a bid to fall back on, a slow local build is waited for past
+    /// the deadline, as it is without a builder.
+    #[tokio::test]
+    async fn without_a_bid_a_slow_local_build_is_waited_for() {
+        let world = builder_world(true, SyncStatus::Synced).await;
+        let delay = LOCAL_BUILD_DEADLINE + Duration::from_millis(500);
+        let engine =
+            super::super::validator_client_tests::fake_execution_client_slow_to_build(delay).await;
+        let started = std::time::Instant::now();
+        let answer = produce_answer(&world, Some(engine), None, "").await;
+        answer.assert(&world, false, "42", 1);
+        assert!(started.elapsed() >= delay, "{:?}", started.elapsed());
+    }
+
+    /// A local build that beats the deadline is weighed against the bid as
+    /// always, however late in the window it answers.
+    #[tokio::test]
+    async fn a_local_build_inside_the_deadline_still_competes() {
+        let world = builder_world(true, SyncStatus::Synced).await;
+        world.offer(ETH, |_| {});
+        let delay = LOCAL_BUILD_DEADLINE / 2;
+        let engine =
+            super::super::validator_client_tests::fake_execution_client_slow_to_build(delay).await;
+        let answer = produce_answer(&world, Some(engine), None, "&builder_boost_factor=0").await;
+        answer.assert(&world, false, "42", 1);
     }
 
     #[tokio::test]
@@ -2169,6 +2353,146 @@ mod tests {
     }
 
     const TAKEN: &str = "this node already published a different block for the slot";
+
+    const NOT_AFTER_FINALIZED: &str = "the block is not after the finalized slot";
+    const NOT_FROM_FINALIZED: &str =
+        "the block's parent does not descend from the finalized checkpoint";
+
+    /// A copy of the head state held under a made-up root. The test stores
+    /// finalize their head at its own slot, so this is a parent at the
+    /// finalized slot that is not the finalized block: one the finalized
+    /// checkpoint cannot be an ancestor of.
+    fn hold_parent_beside_finality(store: &mut Store) -> H256 {
+        let (head_root, head_state) = super::super::validator::head(store).unwrap();
+        assert_eq!(store.beacon_finalized_checkpoint().root, head_root);
+        assert_eq!(head_state.slot(), finalized_slot(store));
+        let root = H256::repeat_byte(7);
+        store.insert_state(root, (*head_state).clone()).unwrap();
+        root
+    }
+
+    /// An unsigned fulu block with no blobs.
+    fn fulu_contents(
+        slot: Slot,
+        parent_root: H256,
+        proposer_index: ValidatorIndex,
+    ) -> FuluSignedBlockContents {
+        FuluSignedBlockContents {
+            signed_block: SignedBeaconBlock {
+                message: BeaconBlock {
+                    slot,
+                    proposer_index,
+                    parent_root,
+                    state_root: H256::ZERO,
+                    body: containers::electra::BeaconBlockBody::empty(),
+                },
+                signature: Default::default(),
+            },
+            kzg_proofs: Default::default(),
+            blobs: Default::default(),
+        }
+    }
+
+    /// A block at the finalized slot, and one after it on a parent the
+    /// finalized checkpoint is not an ancestor of, are refused before the
+    /// parent's state is advanced, so before the signature is looked at.
+    #[tokio::test]
+    async fn a_fulu_block_behind_finality_is_refused_before_advancing() {
+        let (mut store, head_slot) = fulu_store();
+        let (head_root, _) = super::super::validator::head(&store).unwrap();
+        let stale = hold_parent_beside_finality(&mut store);
+        let network = Arc::new(RecordingNetwork::default());
+        let p2p: RpcToP2PRef = network.clone();
+        let app = routes().with_state(store).layer(Extension(p2p));
+        for (slot, parent_root, message) in [
+            (head_slot, head_root, NOT_AFTER_FINALIZED),
+            (head_slot + 1, stale, NOT_FROM_FINALIZED),
+        ] {
+            let contents = fulu_contents(slot, parent_root, 0);
+            let (status, json) = post_full(app.clone(), &contents).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+            assert_eq!(json["message"], message);
+        }
+        assert!(network.blocks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_gloas_block_behind_finality_is_refused_before_advancing() {
+        let (mut store, head_slot) = gloas_scheduled_store();
+        let (head_root, _) = super::super::validator::head(&store).unwrap();
+        let stale = hold_parent_beside_finality(&mut store);
+        let network = Arc::new(RecordingNetwork::default());
+        let p2p: RpcToP2PRef = network.clone();
+        let app = routes().with_state(store).layer(Extension(p2p));
+        for (slot, parent_root, message) in [
+            (head_slot, head_root, NOT_AFTER_FINALIZED),
+            (head_slot + 1, stale, NOT_FROM_FINALIZED),
+        ] {
+            let containers::SignedBeaconBlock::Gloas(block) =
+                crate::test_utils::gloas_beacon_block(slot, parent_root, H256::ZERO, H256::ZERO)
+            else {
+                unreachable!("built as gloas")
+            };
+            let request = Request::post("/eth/v2/beacon/blocks")
+                .header("eth-consensus-version", "gloas")
+                .header(header::CONTENT_TYPE, crate::SSZ_CONTENT_TYPE)
+                .body(Body::from(block.to_ssz()))
+                .unwrap();
+            let (status, json) = respond(app.clone(), request).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+            assert_eq!(json["message"], message);
+        }
+        assert!(network.blocks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_blinded_block_behind_finality_never_reaches_the_builder() {
+        let mut world = builder_world(true, SyncStatus::Synced).await;
+        let stale = hold_parent_beside_finality(&mut world.store);
+        let mut at_finalized = signed_blinded(&world, 1, None);
+        at_finalized.message.slot = world.slot - 1;
+        let mut on_stale = signed_blinded(&world, 1, None);
+        on_stale.message.parent_root = stale;
+        for (block, message) in [
+            (at_finalized, NOT_AFTER_FINALIZED),
+            (on_stale, NOT_FROM_FINALIZED),
+        ] {
+            let (status, json) = post_blinded(publish_app(&world), &block).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+            assert_eq!(json["message"], message);
+        }
+        assert!(world.relay.blinded_blocks().is_empty());
+    }
+
+    /// The finalized block sits below its epoch's first slot when that slot
+    /// was empty. A block on it descends from the finalized checkpoint, so it
+    /// passes both finality checks and is judged on its signature.
+    #[tokio::test]
+    async fn a_block_on_a_finalized_block_below_its_epoch_start_passes_the_finality_checks() {
+        use ethlambda_storage::ForkCheckpoints;
+        use ethlambda_types::checkpoint::Checkpoint;
+
+        let (mut store, head_slot) = fulu_store();
+        let (head_root, head_state) = super::super::validator::head(&store).unwrap();
+        let next_epoch_start = head_slot + preset::SLOTS_PER_EPOCH;
+        let finalized = Checkpoint {
+            root: head_root,
+            slot: next_epoch_start,
+        };
+        let checkpoints = ForkCheckpoints::new(head_root, None, Some(finalized));
+        store.update_checkpoints(checkpoints).unwrap();
+        assert_eq!(finalized_slot(&store), next_epoch_start);
+
+        let slot = next_epoch_start + 1;
+        let state = advance_to_slot(&head_state, slot, &store.config()).unwrap();
+        let proposer = get_beacon_proposer_index(&state).unwrap();
+        let network: RpcToP2PRef = Arc::new(RecordingNetwork::default());
+        let app = routes().with_state(store).layer(Extension(network));
+        let contents = fulu_contents(slot, head_root, proposer);
+        let (status, json) = post_full(app, &contents).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["message"], "invalid block signature");
+    }
 
     #[tokio::test]
     async fn a_block_published_in_full_blocks_a_different_blinded_one() {

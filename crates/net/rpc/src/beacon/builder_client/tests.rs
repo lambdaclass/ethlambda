@@ -503,6 +503,47 @@ async fn line_breaks_in_an_error_are_written_out() {
     assert_eq!(message.len(), 1024);
 }
 
+/// Every other control character is written out too (an ESC would start an
+/// ANSI sequence in a terminal), and so are the Unicode line and paragraph
+/// separators, which `char::is_control` does not cover. Quotes and
+/// backslashes pass through.
+#[tokio::test]
+async fn control_characters_in_an_error_are_written_out() {
+    let relay = MockRelay::start(GENESIS_FORK_VERSION).await;
+    let body = "\x1b[31mred\x1b[0m\ttab\x07bell\u{85}nel\u{2028}ls\u{2029}ps \"q\" \\ ok";
+    relay.answer_headers_with(StatusCode::BAD_REQUEST, TEXT, body.into(), None);
+    let Err(BuilderError::BadRequest(message)) = get_header(&client_for(&relay)).await else {
+        panic!("expected a bad request");
+    };
+    assert_eq!(
+        message,
+        r#"\u{1b}[31mred\u{1b}[0m\ttab\u{7}bell\u{85}nel\u{2028}ls\u{2029}ps "q" \ ok"#
+    );
+
+    // The same escapes reach a JSON error's message, where the builder can
+    // send them as `\u001b`.
+    let relay = MockRelay::start(GENESIS_FORK_VERSION).await;
+    let body = br#"{"code":400,"message":"\u001b[2Jcleared"}"#.to_vec();
+    relay.answer_headers_with(StatusCode::BAD_REQUEST, JSON, body, None);
+    let Err(BuilderError::BadRequest(message)) = get_header(&client_for(&relay)).await else {
+        panic!("expected a bad request");
+    };
+    assert_eq!(message, r"\u{1b}[2Jcleared");
+}
+
+/// The cap never leaves half an escape behind.
+#[test]
+fn the_cap_never_cuts_an_escape_in_two() {
+    // 1020 bytes, then a six-byte escape that would end past the cap.
+    let text = format!("{}\x1b", "x".repeat(1020));
+    assert_eq!(super::error_text(text), "x".repeat(1020));
+    let text = format!("{}\x1b", "x".repeat(1018));
+    assert_eq!(
+        super::error_text(text),
+        format!("{}\\u{{1b}}", "x".repeat(1018))
+    );
+}
+
 #[tokio::test]
 async fn a_server_error_is_an_unexpected_status() {
     let relay = MockRelay::start(GENESIS_FORK_VERSION).await;
