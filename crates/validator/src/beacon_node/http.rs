@@ -88,11 +88,21 @@ async fn read_error_body(mut response: reqwest::Response) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-/// A body as an error shows it: line breaks written out as `\n` and `\r`, so
-/// the log line it lands in stays one line, and cut to [`ERROR_TEXT_LIMIT`]
-/// bytes.
+/// A body as an error shows it: control characters written out (`\n`, `\r`,
+/// `\u{1b}`, ...), so the log line it lands in stays one line and carries no
+/// terminal escapes, and cut to [`ERROR_TEXT_LIMIT`] bytes.
 fn error_text(body: String) -> String {
-    let mut text = body.replace('\n', "\\n").replace('\r', "\\r");
+    let mut text = String::with_capacity(body.len());
+    for c in body.chars() {
+        // Every control character, and the two Unicode line separators, is
+        // written out, so neither a line break nor a terminal escape sequence
+        // reaches the log as itself.
+        if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+            text.extend(c.escape_default());
+        } else {
+            text.push(c);
+        }
+    }
     if text.len() > ERROR_TEXT_LIMIT {
         let mut end = ERROR_TEXT_LIMIT;
         while !text.is_char_boundary(end) {
@@ -1545,6 +1555,12 @@ mod tests {
         assert!(text.ends_with("..."));
         assert!(text.len() <= ERROR_TEXT_LIMIT + "...".len());
         assert_eq!(error_text("short".to_string()), "short");
+    }
+
+    #[test]
+    fn error_text_writes_out_every_control_character() {
+        let text = error_text("a\u{1b}[31mb\tc\u{2028}d".to_string());
+        assert_eq!(text, "a\\u{1b}[31mb\\tc\\u{2028}d");
     }
 
     #[tokio::test]
