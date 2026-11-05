@@ -443,6 +443,9 @@ mod tests {
                 voting_keystore_path: PathBuf::from("keystore.json"),
                 voting_keystore_password_path: PathBuf::from("password.txt"),
             },
+            suggested_fee_recipient: None,
+            graffiti: None,
+            gas_limit: None,
         }]);
         definitions.save(dir.path()).expect("saves definitions");
 
@@ -471,6 +474,9 @@ mod tests {
                 voting_keystore_path: PathBuf::from("keystore.json"),
                 voting_keystore_password_path: PathBuf::from("password.txt"),
             },
+            suggested_fee_recipient: None,
+            graffiti: None,
+            gas_limit: None,
         }])
         .save(dir)
         .expect("saves definitions");
@@ -487,6 +493,9 @@ mod tests {
             signing: SigningDefinition::Web3Signer {
                 url: url.to_string(),
             },
+            suggested_fee_recipient: None,
+            graffiti: None,
+            gas_limit: None,
         }])
         .save(dir.path())
         .expect("saves definitions");
@@ -509,6 +518,9 @@ mod tests {
             signing: SigningDefinition::Web3Signer {
                 url: "not a url".to_string(),
             },
+            suggested_fee_recipient: None,
+            graffiti: None,
+            gas_limit: None,
         }])
         .save(dir.path())
         .expect("saves definitions");
@@ -529,6 +541,9 @@ mod tests {
             signing: SigningDefinition::Web3Signer {
                 url: url.to_string(),
             },
+            suggested_fee_recipient: None,
+            graffiti: None,
+            gas_limit: None,
         };
         ValidatorDefinitions(vec![
             remote(VECTOR_PUBKEY, "http://127.0.0.1:9"),

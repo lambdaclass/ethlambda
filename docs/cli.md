@@ -631,9 +631,14 @@ give one validator its own value in place of the command line's default:
 | `graffiti` | `--graffiti` | The next proposal |
 | `gas_limit` | `--gas-limit` | Before gloas, the next builder registration with `--builder-proposals` (usually at the next slot, later while the epoch's full registration send is still running, and again every slot until a node accepts it or the epoch's full send carries it), and stored and served only without it. From gloas, the proposer preferences' target gas limit, from the next dependent root on, flag or not |
 
-**These are held in memory only.** A restart puts every validator back on the
-defaults, so an operator driving these endpoints must set them again after one.
-Deleting a keystore drops its values too.
+**These persist.** Each is written onto the validator's entry in
+`validator_definitions.yml` (`suggested_fee_recipient`, `graffiti`, `gas_limit`,
+Lighthouse's layout, so a file written by either client reads in the other)
+before the request is answered, and loaded again at startup, so a restart runs
+with what the operator set. A write that fails is a `500` that changes nothing.
+The fields may also be put in the file by hand before the client starts; a
+malformed one refuses startup. Deleting a keystore drops its entry and its
+values with it.
 
 A few answers worth knowing: `GET feerecipient` is a `500` when the validator
 has no address and there is no `--suggested-fee-recipient` default, as

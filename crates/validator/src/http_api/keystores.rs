@@ -822,6 +822,9 @@ fn persist_import(
             voting_keystore_path: keystore_path.clone(),
             voting_keystore_password_path: password_path.clone(),
         },
+        suggested_fee_recipient: None,
+        graffiti: None,
+        gas_limit: None,
     };
     // How to put `definitions` back if the save below fails.
     //
@@ -849,10 +852,15 @@ fn persist_import(
         .iter()
         .position(|existing| existing.voting_public_key == base)
     {
-        Some(index) => Undo::Replaced {
-            index,
-            previous: std::mem::replace(&mut definitions.0[index], definition),
-        },
+        Some(index) => {
+            // A re-imported key keeps the fee recipient, graffiti and gas
+            // limit its entry held: only the keystore and password move.
+            let definition = definition.with_overrides_of(&definitions.0[index]);
+            Undo::Replaced {
+                index,
+                previous: std::mem::replace(&mut definitions.0[index], definition),
+            }
+        }
         None => {
             definitions.0.push(definition);
             Undo::Appended
@@ -1526,6 +1534,9 @@ mod tests {
                 voting_keystore_path: PathBuf::from("old.json"),
                 voting_keystore_password_path: PathBuf::from("old.txt"),
             },
+            suggested_fee_recipient: None,
+            graffiti: Some("kept".to_string()),
+            gas_limit: None,
         };
         let mut definitions = ValidatorDefinitions(vec![existing.clone()]);
 
@@ -1673,6 +1684,41 @@ mod tests {
         assert!(store.read().await.is_empty());
     }
 
+    /// Re-importing a key (a password rotation, or a retry) rebuilds its
+    /// entry from the new keystore; the fee recipient, graffiti and gas limit
+    /// the entry held stay on it.
+    #[tokio::test]
+    async fn a_reimported_key_keeps_its_persisted_overrides() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Arc::new(RwLock::new(ValidatorStore::new()));
+        let context = context_with_dirs(store.clone(), dir.path());
+        let app = router(context.clone(), TOKEN.to_string());
+        let import = serde_json::json!({
+            "keystores": [keystore_json()],
+            "passwords": [PASSWORD],
+        });
+
+        let (status, body) = send(
+            app.clone(),
+            authed("POST", "/eth/v1/keystores", import.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "got {body}");
+        let pubkey = store.read().await.pubkeys()[0];
+        let set = serde_json::json!({ "graffiti": "kept" });
+        let path = format!("/eth/v1/validator/{}/graffiti", encode_hex(&pubkey.0));
+        let (status, _) = send(app.clone(), authed("POST", &path, set)).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let (status, body) = send(app, authed("POST", "/eth/v1/keystores", import)).await;
+        assert_eq!(status, StatusCode::OK, "got {body}");
+        assert_eq!(body["data"][0]["status"], "imported", "got {body}");
+
+        let definitions = ValidatorDefinitions::open(dir.path()).expect("opens");
+        assert_eq!(definitions.0.len(), 1, "one entry, not a duplicate");
+        assert_eq!(definitions.0[0].graffiti.as_deref(), Some("kept"));
+    }
+
     /// The regression test for the gap that let the keymanager mutate only
     /// the in-memory store: a fresh `ValidatorStore::load` from the same
     /// directory, independent of the one the API mutated, is the only way to
@@ -1765,6 +1811,9 @@ mod tests {
                 voting_keystore_path: PathBuf::from("keystore.json"),
                 voting_keystore_password_path: PathBuf::from("password.txt"),
             },
+            suggested_fee_recipient: None,
+            graffiti: None,
+            gas_limit: None,
         });
         definitions.save(other.path()).expect("saves");
         let app = router(
@@ -1826,6 +1875,9 @@ mod tests {
             signing: SigningDefinition::Web3Signer {
                 url: "https://signer.example:9000".to_string(),
             },
+            suggested_fee_recipient: None,
+            graffiti: None,
+            gas_limit: None,
         }])
         .save(dir.path())
         .expect("saves");
@@ -1886,6 +1938,9 @@ mod tests {
                     voting_keystore_path: PathBuf::from(format!("{hex}.json")),
                     voting_keystore_password_path: PathBuf::from(&hex),
                 },
+                suggested_fee_recipient: None,
+                graffiti: None,
+                gas_limit: None,
             });
             held.push(hex);
         }
@@ -2051,6 +2106,9 @@ mod tests {
                 voting_keystore_path: dir.path().join("old.json"),
                 voting_keystore_password_path: dir.path().join("old"),
             },
+            suggested_fee_recipient: None,
+            graffiti: None,
+            gas_limit: None,
         };
         ValidatorDefinitions(vec![previous.clone()])
             .save(dir.path())
@@ -2123,6 +2181,9 @@ mod tests {
                 voting_keystore_path: keystore_path.clone(),
                 voting_keystore_password_path: password_path.clone(),
             },
+            suggested_fee_recipient: None,
+            graffiti: None,
+            gas_limit: None,
         };
         ValidatorDefinitions(vec![previous.clone()])
             .save(dir.path())
@@ -2179,6 +2240,9 @@ mod tests {
                 voting_keystore_path: keystore_path.clone(),
                 voting_keystore_password_path: dir.path().join("old"),
             },
+            suggested_fee_recipient: None,
+            graffiti: None,
+            gas_limit: None,
         };
         ValidatorDefinitions(vec![previous.clone()])
             .save(dir.path())
@@ -2216,6 +2280,9 @@ mod tests {
                 voting_keystore_path: dir.join(format!("{base}.json")),
                 voting_keystore_password_path: dir.join(base),
             },
+            suggested_fee_recipient: None,
+            graffiti: None,
+            gas_limit: None,
         }
     }
 
