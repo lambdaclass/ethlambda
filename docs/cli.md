@@ -272,7 +272,8 @@ implementation's, so none of the [common flags](#common-flags) apply to it.
 > locked to one process, so `--validators-dir` must be writable: a read-only
 > mount of the keys (a Kubernetes Secret, a `:ro` volume) fails at startup, and
 > the directory should be a local disk, since every signature waits for the
-> record to be flushed to it. Unix only. A key with no record is refused at startup unless
+> record to be flushed to it, and the lock that keeps a second process off it
+> is an `flock`, which a network filesystem may not honour. Unix only. A key with no record is refused at startup unless
 > `--init-slashing-protection` is passed. Importing another client's history is
 > not supported yet. See
 > [Spec Deviations](./spec_deviations.md#the-validator-client-keeps-eip-3076s-minimal-watermarks-not-full-history).

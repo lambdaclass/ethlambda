@@ -63,11 +63,12 @@ pub fn validate_attestation_data(slot: Slot, data: &AttestationData) -> Result<(
         )));
     }
     // A source at or past the target is never valid outside genesis, where
-    // both are zero. Signing one would record a source the chain's justified
+    // both are zero: with unsigned epochs, `(0, 0)` is the only such pair
+    // that is. Signing one would record a source the chain's justified
     // checkpoint cannot have reached, and the record keeps it: every honest
     // attestation afterwards would be refused as a source regression until
     // justification caught up, or forever during non-finality.
-    if data.source.epoch >= data.target.epoch && data.target.epoch != 0 {
+    if data.source.epoch >= data.target.epoch && data.source.epoch != 0 {
         return Err(crate::error::Error::InconsistentResponse(format!(
             "attestation data for slot {slot} carries source epoch {} at or past its target \
              epoch {}",
@@ -621,5 +622,9 @@ mod tests {
     #[test]
     fn genesis_attestation_data_is_accepted() {
         assert!(validate_attestation_data(0, &data(0, 0, 0)).is_ok());
+        assert!(
+            validate_attestation_data(0, &data(0, 1, 0)).is_err(),
+            "a source past a genesis target is not the genesis shape"
+        );
     }
 }

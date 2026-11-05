@@ -65,7 +65,7 @@ use std::sync::{Arc, Mutex};
 
 use ethlambda_types::beacon::containers::shared::AttestationData;
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, Root, Slot};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::beacon_node::dto::encode_hex;
 use crate::error::{Error, Result};
@@ -164,6 +164,8 @@ impl Record {
 
     fn check_attestation(&self, data: &AttestationData) -> std::result::Result<(), Refusal> {
         let (source, target) = (data.source.epoch, data.target.epoch);
+        // Defence in depth: `validate_attestation_data` refuses this shape
+        // before it reaches the record.
         if source > target {
             return Err(Refusal::SourceAfterTarget { source, target });
         }
@@ -342,12 +344,18 @@ impl SlashingProtection {
             )));
         }
         for key in &missing {
-            warn!(
+            debug!(
                 pubkey = %encode_hex(&key.0),
-                "Registering a validator with no slashing-protection history \
-                 (--init-slashing-protection)"
+                "Registering a validator with no slashing-protection history"
             );
             records.insert(*key, Record::default());
+        }
+        if !missing.is_empty() {
+            warn!(
+                registered = missing.len(),
+                "Registered validators with no slashing-protection history \
+                 (--init-slashing-protection); each starts as never having signed"
+            );
         }
         if init && missing.is_empty() && !keys.is_empty() {
             warn!(

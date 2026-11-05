@@ -1,5 +1,6 @@
 //! Producing and publishing this slot's attestations.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use ethlambda_types::beacon::containers::shared::AttestationData;
@@ -154,6 +155,27 @@ impl<B: BeaconNodeApi> AttestationService<B> {
                     error!(%slot, validator = duty.validator_index, %err, "Duty carried an unreadable pubkey");
                     None
                 }
+            })
+            .collect();
+
+        // Only keys this client holds. A duty can name one the keymanager
+        // deleted since the schedule was fetched; recording it would burn its
+        // watermark for nothing, or, on a persisted record, refuse it as
+        // unregistered and count a refusal that was never going to be a
+        // signature. A snapshot, so the read guard is gone before the write.
+        let held: HashSet<BlsPubkey> = store.read().await.pubkeys().into_iter().collect();
+        let candidates: Vec<(&AttesterDutyDto, BlsPubkey)> = candidates
+            .into_iter()
+            .filter(|(duty, pubkey)| {
+                let held = held.contains(pubkey);
+                if !held {
+                    tracing::debug!(
+                        %slot,
+                        validator = duty.validator_index,
+                        "Duty names a key this client no longer holds; skipped"
+                    );
+                }
+                held
             })
             .collect();
 

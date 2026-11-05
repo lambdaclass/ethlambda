@@ -70,14 +70,19 @@ anything that does not advance past them.
   holds for a block. An honest validator's messages otherwise advance this way,
   so nothing else is refused. Lighthouse and Prysm keep signing roots to allow
   the identical re-sign; Teku keeps the same watermarks as this client.
-- **A wedged record:** the client refuses to sign an attestation whose source
-  is at or past its target (never valid outside genesis), so a beacon node
-  cannot talk it into recording a source the chain has not justified, which
-  would refuse every honest attestation after it. Should a record still end up
-  ahead of the chain, there is no tool that lowers a watermark, by design:
-  stop the client, edit `slashing_protection.json` by hand, and start it
-  again. Lowering a watermark is only safe for a key that has not signed past
-  the value written.
+- **A wedged record:** the client refuses attestation data whose source is at
+  or past its target, which is never valid outside genesis, so an impossible
+  answer from a beacon node is refused rather than recorded. What it cannot
+  tell is a possible one: a source below the target but ahead of what the
+  chain has justified passes, the record keeps it, and every honest
+  attestation after it is refused as `SourceRegressed` until justification
+  reaches it, which during non-finality may be never. That is trust in the
+  beacon node, the same trust every attestation already places in it; the
+  symptom is the `SourceRegressed` refusal in the log and a non-zero
+  `attestations_refused_total`. There is no tool that lowers a watermark, by
+  design: stop the client, edit `slashing_protection.json` by hand, and start
+  it again. Lowering a watermark is only safe for a key that has not signed
+  past the value written.
 - **Keys with no record:** refused at startup. `--init-slashing-protection`
   registers them as never having signed, and a key imported through the
   keymanager API with no history is registered the same way before it is
@@ -85,9 +90,10 @@ anything that does not advance past them.
   elsewhere a moment ago, so the flag is only for keys that have signed nothing
   anywhere for at least two epochs; the migration window is doppelganger
   protection's to close, which this client does not have yet.
-- **Gloas messages:** a gloas proposer also signs an execution payload
-  envelope, and a payload timeliness committee member signs a payload
-  attestation. Neither is slashable, so neither is recorded. An envelope is
+- **Messages outside the rule:** sync committee messages and contributions
+  are not slashable, and are not recorded. A gloas proposer also signs an
+  execution payload envelope, and a payload timeliness committee member signs
+  a payload attestation; neither is slashable, so neither is recorded. An envelope is
   published once per proposal, right after its block, and a failure to publish it
   is logged at error and counted without failing the proposal. A PTC vote has an
   in-memory dedup of `(validator, slot)` pairs recorded at signing time
