@@ -660,10 +660,13 @@ impl SlashingProtection {
     /// Each validator in it is reduced to its highest slot, source and target
     /// and merged with any existing record by taking the maximum of each, so an
     /// import never lowers a watermark, and slashable data inside it (two
-    /// blocks for one slot, a surround, a source after its target) is absorbed
-    /// rather than refused: the result is at least as strict as every
-    /// message the file lists. A validator it names that has no record yet is
-    /// registered with the imported watermarks.
+    /// blocks for one slot, a surround) is absorbed rather than refused: the
+    /// result is at least as strict as every message the file lists. The one
+    /// shape refused is an attestation whose source is at or past its target
+    /// outside genesis: never valid, and read into the record it would refuse
+    /// every honest attestation until the chain justified past that source.
+    /// A validator it names that has no record yet is registered with the
+    /// imported watermarks.
     ///
     /// All or nothing: an interchange for another chain or of another version,
     /// or one that does not parse, changes nothing. Returns how many distinct
@@ -1371,6 +1374,27 @@ mod tests {
         let created = protection.absorb(Some(&fresh), &[]).expect("absorbs");
         assert!(created.raised.is_empty());
         assert!(protection.contains(&pubkey(3)));
+    }
+
+    /// A source at or past its target is refused whole outside genesis, where
+    /// `(0, 0)` is what every validator's first attestation looks like.
+    #[test]
+    fn an_import_with_a_source_past_its_target_is_refused_whole() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut protection = open(dir.path(), &[], false).expect("opens");
+        let err = protection
+            .import(&interchange(0x42, 1, 97, 5, 2))
+            .expect_err("source past target");
+        assert!(err.to_string().contains("at or after"), "{err}");
+        protection
+            .import(&interchange(0x42, 1, 97, 5, 5))
+            .expect_err("source at target");
+        assert!(protection.is_empty(), "nothing of a refused import is held");
+
+        protection
+            .import(&interchange(0x42, 1, 0, 0, 0))
+            .expect("the genesis attestation imports");
+        assert!(attest(&mut protection, 1, &data(32, 0, 1, 0xaa)).is_ok());
     }
 
     /// An older history imported over a newer record must not lower it.

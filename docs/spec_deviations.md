@@ -118,7 +118,10 @@ anything that does not advance past them.
   keymanager API's `POST /eth/v1/keystores`) reduces each validator to its
   highest slot, source and target and merges them with the record by maximum,
   so slashable data in the file is absorbed rather than refused, as Lighthouse
-  and Nimbus do. An export (`ethlambda slashing-protection export`, or `DELETE
+  and Nimbus do. The one exception is an attestation whose source is at or
+  past its target outside genesis, which fails the whole import: it is never
+  valid, and read into the record it would refuse every honest attestation
+  until the chain justified past that source. An export (`ethlambda slashing-protection export`, or `DELETE
   /eth/v1/keystores`) is the record itself, in the minimal format. Both pass
   the shared `eth-clients/slashing-protection-interchange-tests` v5.3.0 vectors
   under their `should_succeed` (minimal) expectations.

@@ -127,9 +127,10 @@ fn run(case: &Case) -> Result<(), String> {
             (true, true) | (false, false) => {}
             // The README lets an importer refuse an interchange holding
             // slashable data, in which case the rest of the case is skipped.
-            // This one absorbs it instead, so reaching here is still a
-            // failure: it would mean an import was refused for some other
-            // reason.
+            // This one absorbs all of it but an attestation whose source is at
+            // or past its target, so a refusal on such a step ends the case,
+            // as it does in Lighthouse; on any other step it is a failure.
+            (false, true) if step.contains_slashable_data => return Ok(()),
             (false, true) => {
                 return Err(format!(
                     "step {index}: import failed but should succeed (slashable data: {}): {}",
