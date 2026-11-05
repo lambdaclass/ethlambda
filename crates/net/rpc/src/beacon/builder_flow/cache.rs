@@ -1,6 +1,5 @@
-//! The registrations this node forwarded to its builder, so block
-//! production knows which proposers use the builder, and with what gas
-//! limit.
+//! The registrations this node's builder accepted, so block production knows
+//! which proposers use the builder, and with what gas limit.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

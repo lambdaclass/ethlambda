@@ -9,9 +9,10 @@
 //! not reach the builder, not that the request fails. Each kept
 //! registration also becomes its validator's fee recipient, as
 //! `prepare_beacon_proposer` would make it, so a block built locally after
-//! all still pays the address the validator registered. The kept
-//! registrations are also remembered for block production, which asks the
-//! builder only for proposers that registered.
+//! all still pays the address the validator registered. Once the builder
+//! accepts them, the kept registrations are also remembered for block
+//! production, which asks the builder only for proposers that registered. Not
+//! before: this node does not verify their signatures, the builder does.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -98,23 +99,29 @@ async fn register(
             recipients.insert(*index, registration.message.fee_recipient);
         }
     }
-    // Remembered at the epoch the filter judged them at, so block production
-    // sees them for as long as the validator client keeps sending them.
-    builder.registrations.record(
-        kept.iter().map(|(_, registration)| &registration.message),
-        epoch,
-    );
     let kept: Vec<SignedValidatorRegistrationV1> = kept
         .into_iter()
         .map(|(_, registration)| registration)
         .collect();
     // On its own task: a validator client that hangs up drops this handler,
-    // and the forward, its count and its log must complete regardless.
+    // and the forward, its count, its log and the record must complete
+    // regardless.
     let forwarded = tokio::spawn(async move {
         let count = kept.len() as u64;
         let result = builder.client.register_validators(&kept).await;
         match &result {
-            Ok(()) => inc_builder_registrations("forwarded", count),
+            Ok(()) => {
+                inc_builder_registrations("forwarded", count);
+                // Remembered only once the builder took them: it verifies
+                // their signatures and this node does not, so one it refused
+                // (a forged gas limit, say) must not steer this node's bids.
+                // At the epoch the filter judged them at, so block production
+                // sees them for as long as the validator client keeps sending
+                // them.
+                builder
+                    .registrations
+                    .record(kept.iter().map(|registration| &registration.message), epoch);
+            }
             Err(err) => {
                 inc_builder_registrations("failed", count);
                 warn!(%err, count, "Builder did not take the registrations");
@@ -466,9 +473,9 @@ mod tests {
 
         let (status, _) = post(
             store,
-            Some(builder),
+            Some(builder.clone()),
             fee_recipients.clone(),
-            json_request(&[registration]),
+            json_request(std::slice::from_ref(&registration)),
         )
         .await;
 
@@ -476,6 +483,48 @@ mod tests {
         assert_eq!(
             fee_recipients.lock().unwrap().get(&0),
             Some(&ExecutionAddress::repeat_byte(0x11))
+        );
+        // The builder never took it, so block production never asks for it.
+        assert_eq!(
+            builder.registrations.get(&registration.message.pubkey, 0),
+            None
+        );
+    }
+
+    /// The review's attack: a registration under a later timestamp with a
+    /// forged gas limit, which the builder refuses since its signature does
+    /// not verify. It must not replace the one the builder accepted, or every
+    /// real bid would fail the gas-limit check.
+    #[tokio::test]
+    async fn a_registration_the_builder_refuses_is_not_remembered() {
+        let store = store_with_exited(&[]);
+        let relay = MockRelay::start(genesis_fork_version(&store)).await;
+        let builder = client_for(&relay).unwrap();
+        let genuine = signed_registration(0, genesis_fork_version(&store));
+        let (status, body) = post(
+            store.clone(),
+            Some(builder.clone()),
+            FeeRecipients::default(),
+            json_request(std::slice::from_ref(&genuine)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let mut forged = genuine.clone();
+        forged.message.gas_limit = 1;
+        forged.message.timestamp += 1;
+        let (status, _) = post(
+            store,
+            Some(builder.clone()),
+            FeeRecipients::default(),
+            json_request(&[forged]),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            builder.registrations.get(&genuine.message.pubkey, 0),
+            Some(genuine.message)
         );
     }
 

@@ -421,7 +421,11 @@ the chain actor writes, so no request waits on the actor.
   registration also sets its validator's fee recipient, so a block built
   locally still pays the registered address. The kept ones go to `--builder` in
   one call, skipped when none are left. A builder's 400 is passed through and
-  any other failure is a 500; with no `--builder` the answer is 500.
+  any other failure is a 500; with no `--builder` the answer is 500. Only
+  once the builder accepts them are they remembered for block production
+  (the proposer asks the builder for a bid, against the registered gas
+  limit): the builder verifies their signatures and this node does not, so a
+  registration it refuses must not steer this node's bids.
 - **`blocks/{slot}`** advances the head state to the slot and asks the node's
   own execution client to build on the head (`forkchoiceUpdatedV3` with
   payload attributes, then `getPayloadV5`), with the proposer's fee recipient.
@@ -469,7 +473,9 @@ the chain actor writes, so no request waits on the actor.
   with the packed attestations, operations and sync aggregate, so the blinded
   block's state root comes from running the block through `process_block`.
   `builder_boost_factor` (percent, default 100) then weighs the two: the local
-  payload wins iff its value is at least `factor * bid / 100`, so a tie and a
+  payload wins iff its value is at least `factor * bid / 100`, multiplied
+  first and rounded down once (the spec's text rounds the bid first; see
+  `spec_deviations.md`), so a tie and a
   factor of 0 keep it and `u64::MAX` takes the bid; the execution client's
   `shouldOverrideBuilder` keeps the local payload whatever the bid pays. If one
   side fails the other is served. A bid that pays nothing is not refused, but
