@@ -674,6 +674,7 @@ async fn produce(
         should_override_builder: parts.built.should_override_builder,
     });
     let bid_value = bid.as_ref().map(|bid| wei_u128(&bid.value));
+    let overriding = local_offer.is_some_and(|offer| offer.should_override_builder);
     let order = if choice::choose(local_offer, bid_value, boost_factor) == Some(Source::Builder) {
         [Source::Builder, Source::Local]
     } else {
@@ -700,6 +701,17 @@ async fn produce(
                     options,
                 );
                 if let Some(blinded) = blinded {
+                    // The override always puts the local block first, so the
+                    // builder is reached under it only once that block failed.
+                    // A block still beats a missed slot, but the execution
+                    // client asked for none of the builder's.
+                    if overriding {
+                        warn!(
+                            %slot,
+                            proposer,
+                            "The execution client set shouldOverrideBuilder, but the local block failed to build; serving the builder's block instead"
+                        );
+                    }
                     inc_payload_source(Source::Builder.label());
                     let value = decimal(&blinded.value);
                     info!(%slot, proposer, %value, "Produced a blinded block around the builder's bid");
@@ -886,9 +898,15 @@ fn local_block(
                 config,
                 options,
             )
-            .map_err(|_| ApiError::Internal("the block failed to build"))?
+            .map_err(|err| {
+                warn!(%slot, %err, "The local block failed to build");
+                ApiError::Internal("the block failed to build")
+            })?
         }
-        Err(_) => return Err(ApiError::Internal("the block failed to build")),
+        Err(err) => {
+            warn!(%slot, %err, "The local block failed to build");
+            return Err(ApiError::Internal("the block failed to build"));
+        }
     };
     let contents = FuluBlockContents {
         block,

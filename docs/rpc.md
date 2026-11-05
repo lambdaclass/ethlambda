@@ -478,7 +478,9 @@ the chain actor writes, so no request waits on the actor.
   `spec_deviations.md`), so a tie and a
   factor of 0 keep it and `u64::MAX` takes the bid; the execution client's
   `shouldOverrideBuilder` keeps the local payload whatever the bid pays. If one
-  side fails the other is served. A bid that pays nothing is not refused, but
+  side fails the other is served, even under the override: a local block that
+  fails to build then gives way to the builder's, with a warning, since a
+  block beats a missed slot. A bid that pays nothing is not refused, but
   it never beats a local payload, whatever the factor: it is served only when
   the local payload or its block fails. A blinded answer is the blinded block as SSZ
   or JSON, with `Eth-Execution-Payload-Blinded: true` and
