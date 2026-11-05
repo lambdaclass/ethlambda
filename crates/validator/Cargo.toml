@@ -62,6 +62,10 @@ axum = "0.8.1"
 # Constant-time comparison for the keymanager API's bearer token.
 subtle = "2.6"
 
+[features]
+# Exposes `SlashingProtection::in_memory` to other crates' tests.
+test-utils = []
+
 # `O_NOFOLLOW` for writing key material without following a pre-placed
 # symlink at a predictable, pubkey-derived path (see `secure_fs`). Already in
 # the workspace's dependency tree transitively; this makes it a direct one.

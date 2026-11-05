@@ -356,7 +356,9 @@ impl SlashingProtection {
     /// For tests, here and in other crates driving the duty services: it
     /// protects within one process and nothing more, which is exactly what the
     /// in-memory guards this module replaced did. The client itself only ever
-    /// uses [`Self::open`].
+    /// uses [`Self::open`], and this is behind the `test-utils` feature so no
+    /// production caller can reach it.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn in_memory() -> SharedProtection {
         Arc::new(Mutex::new(Self {
             genesis_validators_root: Root::ZERO,
@@ -365,7 +367,7 @@ impl SlashingProtection {
         }))
     }
 
-    /// The record's path, or `None` for [`Self::in_memory`].
+    /// The record's path, or `None` for the in-memory record of the tests.
     pub fn path(&self) -> Option<&Path> {
         self.storage.as_ref().map(|storage| storage.path.as_path())
     }
