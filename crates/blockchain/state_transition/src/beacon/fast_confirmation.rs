@@ -29,27 +29,37 @@
 //! `compute_committee_weight_between_slots` and `get_attestation_score` each
 //! walk the validator registry or the committees, and they are called once
 //! per block of the confirmed chain. On mainnet (about a million active
-//! validators) that would be tens of registry passes per slot, so the
-//! per-run work is shared instead, in a [`RunContext`] built with the
-//! [`FastConfirmationStore`] and dropped with it:
+//! validators) that would be tens of registry passes per slot. The rule runs
+//! on the chain actor at every slot tick, right after the head computation,
+//! so it reuses what the fork choice already keeps across slots, and shares
+//! the rest in a [`RunContext`] built with the [`FastConfirmationStore`] and
+//! dropped with it:
 //!
-//! - one pass over each balance source's registry ([`BalanceSource`]), at most
-//!   three per run (previous and current observed justified checkpoints, and
-//!   the pulled-up head state), shared by every later read;
-//! - one bottom-up fold over the latest messages per balance source gives
-//!   every block's `get_attestation_score` ([`attestation_scores`]), as
-//!   `compute_weights` does for the head, instead of one scan per block;
+//! - balance sources ([`BalanceSource`]) are the store's per-checkpoint
+//!   balances, the snapshot the head reads its justified balances from: a
+//!   registry pass once per checkpoint, usually paid when its boundary block
+//!   was imported, not once per source per run. The pulled-up head reads the
+//!   current target's entry, which is exact while the current epoch holds no
+//!   slashing (see [`pulled_up_head_balances`]);
+//! - every block's `get_attestation_score` ([`attestation_scores`]) is read
+//!   from the fork choice's cached vote weights when the source is the
+//!   justified checkpoint's, which it is on every run but the first of an
+//!   epoch; otherwise (the previous epoch's source, at an epoch's first slot)
+//!   one bottom-up fold over the latest messages gives every block's score;
 //! - one sum per `(source, slot)` of a slot's committee weight, so a range
-//!   inside one epoch is a sum over slots; a range crossing an epoch boundary
-//!   without covering an epoch is the only case that deduplicates validators,
-//!   and it is the smaller ranges;
+//!   inside one epoch is a sum over slots, and a range across an epoch
+//!   boundary sums its earlier epoch's slots less the members its later part
+//!   already counted, shared by every range ending at the same slot;
+//!   equivocators are a bitmap, collected once per slot;
 //! - committees come from the store's shared committee cache.
 //!
-//! A run is therefore `O(V + M + B log B)` for `V` validators (the registry
-//! passes), `M` latest messages and `B` unfinalized blocks, plus
-//! `O(committee range)` for the few epoch-crossing or empty-slot ranges and
-//! `O(votes * depth)` only in [`get_current_target_score`], which resolves
-//! one checkpoint per distinct `(root, epoch)` vote rather than per vote.
+//! A run is therefore `O(B + C)` for `B` unfinalized blocks and `C` committee
+//! members in the slots its ranges touch, plus `O(M)` latest messages on the
+//! runs that fold (an epoch's first slot) or reach
+//! [`get_current_target_score`] (its first few), which resolves one
+//! checkpoint per distinct root voted for in the current epoch, never one for
+//! a vote from another epoch. `fast_confirmation_timing` measures it beside
+//! the head computation on a million validators.
 //!
 //! # Where the Rust departs from the Python
 //!
@@ -69,11 +79,12 @@
 //!   persisted ([`Store::take_fast_confirmation_restart_root`]).
 
 use std::cell::{OnceCell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use ethlambda_storage::Store;
+use ethlambda_storage::{Store, WeightRules};
 pub use ethlambda_types::beacon::fork_choice::FastConfirmationVariables;
+use ethlambda_types::beacon::fork_choice::JustifiedBalances;
 
 use crate::beacon::committees::EpochCommittees;
 use crate::beacon::config::Config;
@@ -84,7 +95,6 @@ use crate::beacon::fork_choice::{
 };
 use crate::beacon::helpers::accessors::{CommitteeCacheExt, get_current_epoch};
 use crate::beacon::helpers::misc::{compute_epoch_at_slot, compute_start_slot_at_epoch};
-use crate::beacon::helpers::predicates::is_active_validator;
 use crate::beacon::preset;
 use crate::beacon::primitives::{Epoch, Gwei, Root, Slot, ValidatorIndex};
 
@@ -170,6 +180,15 @@ impl<'a> FastConfirmationStore<'a> {
     }
 }
 
+/// A map keyed by block root, hashed with foldhash rather than SipHash: the
+/// passes over the latest messages look one up per validator, about a million
+/// lookups on mainnet, where SipHash was most of the pass.
+type RootMap<V> = HashMap<Root, V, foldhash::fast::RandomState>;
+
+/// [`slot_committee_weight`]'s memo key: the balance source, the slot, and the
+/// later slot range whose committee members the weight leaves out.
+type SlotWeightKey = (BalanceKey, Slot, Option<(Slot, Slot)>);
+
 /// Which state a [`BalanceSource`] was built from, which is also its memo key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum BalanceKey {
@@ -185,61 +204,48 @@ impl BalanceKey {
     }
 }
 
-/// A registry flattened for the rule's sums, built in one pass over a state's
-/// validators.
+/// A balance source's registry, flattened for the rule's sums.
 ///
 /// Every sum the specification takes over a balance source is a sum of
 /// effective balances over validators that are active at the state's epoch,
 /// and, for most, unslashed. A validator that fails the condition contributes
-/// zero, so the two arrays below are all a sum needs, and "is this validator
-/// in the set" never has to be asked on its own: an active validator with a
-/// zero effective balance contributes the same zero either way.
+/// zero, so two per-validator figures are all a sum needs, and "is this
+/// validator in the set" never has to be asked on its own: an active validator
+/// with a zero effective balance contributes the same zero either way.
+///
+/// Both figures come from the store's per-checkpoint balances cache, the one
+/// the head computation reads its justified balances from
+/// ([`fork_choice::checkpoint_balances`]): the unslashed figure is exactly
+/// `get_weight`'s vote weight, and the snapshot carries the active set's
+/// figures beside it. A balance source therefore costs a registry pass once
+/// per checkpoint, usually already paid when its boundary block was imported,
+/// rather than once per source per run, which was a third of every run.
 pub struct BalanceSource {
     key: BalanceKey,
-    /// Effective balance if active at the state's epoch, else zero (slashed
-    /// validators included).
-    active: Vec<Gwei>,
-    /// Effective balance if active and not slashed, else zero.
-    unslashed: Vec<Gwei>,
-    /// The sum of `active`, before `get_total_balance`'s floor.
-    total_active: Gwei,
-    /// The sum of `unslashed`, before `get_total_balance`'s floor.
-    total_unslashed: Gwei,
+    balances: Arc<JustifiedBalances>,
 }
 
 impl BalanceSource {
-    fn build(key: BalanceKey, state: &BeaconState) -> Self {
-        let epoch = get_current_epoch(state);
-        let mut active = Vec::with_capacity(state.validator_count());
-        let mut unslashed = Vec::with_capacity(state.validator_count());
-        let (mut total_active, mut total_unslashed) = (0u64, 0u64);
-        for validator in state.iter_validators() {
-            let balance = if is_active_validator(validator, epoch) {
-                validator.effective_balance
-            } else {
-                0
-            };
-            let unslashed_balance = if validator.slashed { 0 } else { balance };
-            total_active = total_active.saturating_add(balance);
-            total_unslashed = total_unslashed.saturating_add(unslashed_balance);
-            active.push(balance);
-            unslashed.push(unslashed_balance);
-        }
-        Self {
-            key,
-            active,
-            unslashed,
-            total_active,
-            total_unslashed,
-        }
-    }
-
+    /// Effective balance if active at the state's epoch, else zero (slashed
+    /// validators included).
     fn active(&self, index: ValidatorIndex) -> Gwei {
-        self.active.get(index as usize).copied().unwrap_or(0)
+        self.balances.active_balance(index)
     }
 
+    /// Effective balance if active and not slashed, else zero.
     fn unslashed(&self, index: ValidatorIndex) -> Gwei {
-        self.unslashed.get(index as usize).copied().unwrap_or(0)
+        self.balances.get(index)
+    }
+
+    /// The sum of [`Self::active`], before `get_total_balance`'s floor.
+    fn total_active(&self) -> Gwei {
+        self.balances.total_active_balance()
+    }
+
+    /// The sum of [`Self::unslashed`], already floored as `get_total_balance`
+    /// floors it.
+    fn total_unslashed(&self) -> Gwei {
+        self.balances.total_balance()
     }
 }
 
@@ -253,16 +259,24 @@ struct RunContext {
     /// `root -> (slot, parent_root)` of the live chain.
     index: HashMap<Root, (Slot, Root)>,
     /// `store.equivocating_indices`, as one snapshot.
-    equivocating: HashSet<ValidatorIndex>,
+    equivocating: ValidatorSet,
     head_state: OnceCell<Arc<BeaconState>>,
     pulled_up_head_state: OnceCell<Arc<BeaconState>>,
     committees: RefCell<HashMap<Epoch, Arc<EpochCommittees>>>,
     slot_committees: RefCell<HashMap<Slot, Arc<Vec<ValidatorIndex>>>>,
+    /// [`committee_members`], by slot range.
+    committee_members: RefCell<HashMap<(Slot, Slot), Arc<ValidatorSet>>>,
+    /// [`slot_equivocators`], by slot.
+    slot_equivocators: RefCell<HashMap<Slot, Arc<Vec<ValidatorIndex>>>>,
     sources: RefCell<HashMap<BalanceKey, Arc<BalanceSource>>>,
-    scores: RefCell<HashMap<BalanceKey, Arc<HashMap<Root, Gwei>>>>,
-    slot_weights: RefCell<HashMap<(BalanceKey, Slot), Gwei>>,
+    scores: RefCell<HashMap<BalanceKey, Arc<RootMap<Gwei>>>>,
+    /// [`slot_committee_weight`], by source, slot and the later range it
+    /// leaves out.
+    slot_weights: RefCell<HashMap<SlotWeightKey, Gwei>>,
     range_weights: RefCell<HashMap<(BalanceKey, Slot, Slot), Gwei>>,
     equivocation_scores: RefCell<HashMap<(BalanceKey, Slot, Slot), Gwei>>,
+    current_target_score: OnceCell<Gwei>,
+    honest_ffg_support: OnceCell<Gwei>,
 }
 
 impl RunContext {
@@ -275,16 +289,20 @@ impl RunContext {
             current_epoch,
             rules: ForkRules::of(config.fork_at_epoch(current_epoch)),
             index: store.block_index(),
-            equivocating: store.equivocating_indices(),
+            equivocating: store.equivocating_indices().into_iter().collect(),
             head_state: OnceCell::new(),
             pulled_up_head_state: OnceCell::new(),
             committees: RefCell::default(),
             slot_committees: RefCell::default(),
+            committee_members: RefCell::default(),
+            slot_equivocators: RefCell::default(),
             sources: RefCell::default(),
             scores: RefCell::default(),
             slot_weights: RefCell::default(),
             range_weights: RefCell::default(),
             equivocation_scores: RefCell::default(),
+            current_target_score: OnceCell::new(),
+            honest_ffg_support: OnceCell::new(),
         }
     }
 }
@@ -475,9 +493,12 @@ pub fn get_slot_committee(
         return Ok(Arc::clone(participants));
     }
     let committees = epoch_committees(fcr_store, compute_epoch_at_slot(slot))?;
-    let mut participants = Vec::new();
-    for index in 0..committees.committees_per_slot() {
-        participants.extend_from_slice(committees.committee(slot, index)?);
+    let slot_committees = (0..committees.committees_per_slot())
+        .map(|index| committees.committee(slot, index))
+        .collect::<Result<Vec<_>>>()?;
+    let mut participants = Vec::with_capacity(slot_committees.iter().map(|c| c.len()).sum());
+    for committee in slot_committees {
+        participants.extend_from_slice(committee);
     }
     let participants = Arc::new(participants);
     fcr_store
@@ -547,7 +568,7 @@ pub fn get_pulled_up_head_state(fcr_store: &FastConfirmationStore) -> Result<Arc
     Ok(state)
 }
 
-/// The flattened registry of `key`'s state, built once per run.
+/// The flattened registry of `key`'s state, looked up once per run.
 fn balance_source(
     fcr_store: &FastConfirmationStore,
     key: BalanceKey,
@@ -555,21 +576,63 @@ fn balance_source(
     if let Some(source) = fcr_store.run.sources.borrow().get(&key) {
         return Ok(Arc::clone(source));
     }
-    let state = match key {
-        BalanceKey::Checkpoint(epoch, root) => fork_choice::checkpoint_state(
+    let balances = match key {
+        BalanceKey::Checkpoint(epoch, root) => fork_choice::checkpoint_balances(
             fcr_store.store,
             &Checkpoint { epoch, root },
             fcr_store.config,
         )?,
-        BalanceKey::PulledUpHead => get_pulled_up_head_state(fcr_store)?,
+        BalanceKey::PulledUpHead => pulled_up_head_balances(fcr_store)?,
     };
-    let source = Arc::new(BalanceSource::build(key, &state));
+    let source = Arc::new(BalanceSource { key, balances });
     fcr_store
         .run
         .sources
         .borrow_mut()
         .insert(key, Arc::clone(&source));
     Ok(source)
+}
+
+/// The balances of [`get_pulled_up_head_state`], from the per-checkpoint
+/// cache whenever they are the current target's.
+///
+/// The pulled-up head state is `checkpoint_state((current_epoch, head))`: the
+/// head's own state, advanced to the epoch's first slot if the head is from an
+/// earlier epoch. In that case, and when the head is the epoch's first block,
+/// it *is* the current target's checkpoint state, since the target is the
+/// head's ancestor at the epoch's first slot. Otherwise the two differ by the
+/// current epoch's blocks on the head's chain, and none of what those blocks
+/// can do to the registry moves a figure a balance source holds, except a
+/// slashing:
+///
+/// - activity at the current epoch is fixed at its start: a block can only set
+///   an exit epoch past the next one (an exit, a slashing, an exit request),
+///   and a validator a pre-electra deposit appends is not yet active;
+/// - effective balances change only in epoch processing.
+///
+/// A slashing zeroes the validator's unslashed figure, and adds its effective
+/// balance to `state.slashings[current_epoch % EPOCHS_PER_SLASHINGS_VECTOR]`,
+/// which epoch processing reset to zero on the way into the epoch. While that
+/// entry of the head's state is still zero, the target's cached balances are
+/// exactly the pulled-up head's; when it is not, which is rare, they are built
+/// from the state itself and kept for this run only, since a state that is not
+/// a checkpoint's has no place in the per-checkpoint cache.
+fn pulled_up_head_balances(fcr_store: &FastConfirmationStore) -> Result<Arc<JustifiedBalances>> {
+    let target = get_current_target(fcr_store)?;
+    let head = fcr_store.run.head;
+    let epoch = fcr_store.run.current_epoch;
+    let head_state = head_state(fcr_store)?;
+    let slashed_this_epoch = target.root != head
+        && get_current_epoch(&head_state) == epoch
+        && head_state.slashings()[epoch as usize % preset::EPOCHS_PER_SLASHINGS_VECTOR] != 0;
+    if !slashed_this_epoch {
+        return fork_choice::checkpoint_balances(fcr_store.store, &target, fcr_store.config);
+    }
+    let state = get_pulled_up_head_state(fcr_store)?;
+    let pulled_up = Checkpoint { epoch, root: head };
+    Ok(Arc::new(fork_choice::build_justified_balances(
+        pulled_up, &state,
+    )))
 }
 
 /// `get_previous_balance_source`: the state of the previous epoch's observed
@@ -598,7 +661,7 @@ fn total_balance(sum: Gwei) -> Gwei {
 
 /// `get_total_active_balance(balance_source)`.
 fn get_total_active_balance(balance_source: &BalanceSource) -> Gwei {
-    total_balance(balance_source.total_active)
+    total_balance(balance_source.total_active())
 }
 
 /// `compute_proposer_score(balance_source)`.
@@ -607,7 +670,7 @@ fn compute_proposer_score(
     balance_source: &BalanceSource,
 ) -> Gwei {
     fork_choice::committee_fraction(
-        total_balance(balance_source.total_unslashed),
+        total_balance(balance_source.total_unslashed()),
         fcr_store.config.proposer_score_boost,
     )
 }
@@ -659,7 +722,7 @@ pub fn get_node_support_between_slots(
     let mut support: Gwei = 0;
     for index in participants_between_slots(fcr_store, start_slot, end_slot)? {
         let balance = balance_source.unslashed(index);
-        if balance == 0 || fcr_store.run.equivocating.contains(&index) {
+        if balance == 0 || fcr_store.run.equivocating.contains(index) {
             continue;
         }
         let Some(message) = fcr_store.store.latest_message(index) else {
@@ -680,23 +743,113 @@ pub fn is_full_validator_set_covered(start_slot: Slot, end_slot: Slot) -> bool {
     start_full_epoch < end_full_epoch
 }
 
-/// The weight of one slot's committees in `balance_source`, memoized.
+/// The weight of one slot's committee members in `balance_source`, leaving
+/// out, when `later` names a slot range, the members that also sit in a
+/// committee of that range. Memoized for the run.
+///
+/// The leaving out is what a range crossing an epoch boundary needs: a
+/// validator sits in one committee per epoch, so within an epoch the slots'
+/// committees are disjoint and their weights add up, but across the boundary
+/// a validator can sit in both epochs' parts of the range. Every range that
+/// crosses the same boundary up to the same slot leaves out the same later
+/// part, so the per-slot figures it builds from are shared between those
+/// ranges, where building each range's participants anew paid for the whole
+/// range every time.
 fn slot_committee_weight(
     fcr_store: &FastConfirmationStore,
     balance_source: &BalanceSource,
     slot: Slot,
+    later: Option<(Slot, Slot)>,
 ) -> Result<Gwei> {
-    let key = (balance_source.key, slot);
+    let key = (balance_source.key, slot, later);
     if let Some(weight) = fcr_store.run.slot_weights.borrow().get(&key) {
         return Ok(*weight);
     }
-    let weight = get_slot_committee(fcr_store, slot)?
-        .iter()
-        .fold(0, |sum: Gwei, &index| {
+    let committee = get_slot_committee(fcr_store, slot)?;
+    let weight = match later {
+        None => committee.iter().fold(0, |sum: Gwei, &index| {
             sum.saturating_add(balance_source.active(index))
-        });
+        }),
+        Some((later_start, later_end)) => {
+            let counted = committee_members(fcr_store, later_start, later_end)?;
+            committee
+                .iter()
+                .filter(|&&index| !counted.contains(index))
+                .fold(0, |sum: Gwei, &index| {
+                    sum.saturating_add(balance_source.active(index))
+                })
+        }
+    };
     fcr_store.run.slot_weights.borrow_mut().insert(key, weight);
     Ok(weight)
+}
+
+/// Every member of the committees of `[start_slot, end_slot]`, as a bitmap,
+/// memoized for the run.
+fn committee_members(
+    fcr_store: &FastConfirmationStore,
+    start_slot: Slot,
+    end_slot: Slot,
+) -> Result<Arc<ValidatorSet>> {
+    let key = (start_slot, end_slot);
+    if let Some(members) = fcr_store.run.committee_members.borrow().get(&key) {
+        return Ok(Arc::clone(members));
+    }
+    let mut members = ValidatorSet::default();
+    for slot in start_slot..=end_slot {
+        for &index in get_slot_committee(fcr_store, slot)?.iter() {
+            members.insert(index);
+        }
+    }
+    let members = Arc::new(members);
+    fcr_store
+        .run
+        .committee_members
+        .borrow_mut()
+        .insert(key, Arc::clone(&members));
+    Ok(members)
+}
+
+/// A set of validator indices as a bitmap: a committee-sized membership test
+/// costs one bit read per validator instead of a hash.
+#[derive(Default)]
+struct ValidatorSet {
+    words: Vec<u64>,
+    len: usize,
+}
+
+impl ValidatorSet {
+    fn insert(&mut self, index: ValidatorIndex) {
+        let (word, bit) = ((index / 64) as usize, index % 64);
+        if self.words.len() <= word {
+            self.words.resize(word + 1, 0);
+        }
+        if self.words[word] & (1 << bit) == 0 {
+            self.words[word] |= 1 << bit;
+            self.len += 1;
+        }
+    }
+
+    fn contains(&self, index: ValidatorIndex) -> bool {
+        let (word, bit) = ((index / 64) as usize, index % 64);
+        self.words
+            .get(word)
+            .is_some_and(|word| word & (1 << bit) != 0)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl FromIterator<ValidatorIndex> for ValidatorSet {
+    fn from_iter<I: IntoIterator<Item = ValidatorIndex>>(indices: I) -> Self {
+        let mut set = Self::default();
+        for index in indices {
+            set.insert(index);
+        }
+        set
+    }
 }
 
 /// `compute_committee_weight_between_slots`: total weight of the committees
@@ -723,23 +876,52 @@ pub fn compute_committee_weight_between_slots(
     }
 
     // Validators assigned to committees of the range that are active in the
-    // balance source; `active` is zero for the others.
-    let weight = if compute_epoch_at_slot(start_slot) == compute_epoch_at_slot(end_slot) {
-        let mut sum: Gwei = 0;
-        for slot in start_slot..=end_slot {
-            sum = sum.saturating_add(slot_committee_weight(fcr_store, balance_source, slot)?);
-        }
-        sum
-    } else {
-        participants_between_slots(fcr_store, start_slot, end_slot)?
-            .into_iter()
-            .fold(0, |sum: Gwei, index| {
-                sum.saturating_add(balance_source.active(index))
-            })
-    };
+    // balance source; `active` is zero for the others. A range that covers no
+    // whole epoch spans one boundary at most: its later epoch's slots count
+    // whole, and its earlier epoch's slots count the members the later part
+    // has not already counted.
+    let boundary = compute_start_slot_at_epoch(compute_epoch_at_slot(end_slot));
+    let later_start = boundary.max(start_slot);
+    let later = (start_slot < boundary).then_some((later_start, end_slot));
+    debug_assert!(
+        start_slot >= boundary.saturating_sub(preset::SLOTS_PER_EPOCH),
+        "a range covering no whole epoch spans one boundary at most"
+    );
+    let mut weight: Gwei = 0;
+    for slot in later_start..=end_slot {
+        let slot_weight = slot_committee_weight(fcr_store, balance_source, slot, None)?;
+        weight = weight.saturating_add(slot_weight);
+    }
+    for slot in start_slot..later_start {
+        let slot_weight = slot_committee_weight(fcr_store, balance_source, slot, later)?;
+        weight = weight.saturating_add(slot_weight);
+    }
     let weight = total_balance(weight);
     fcr_store.run.range_weights.borrow_mut().insert(key, weight);
     Ok(weight)
+}
+
+/// The equivocating members of one slot's committees, memoized for the run.
+fn slot_equivocators(
+    fcr_store: &FastConfirmationStore,
+    slot: Slot,
+) -> Result<Arc<Vec<ValidatorIndex>>> {
+    if let Some(equivocators) = fcr_store.run.slot_equivocators.borrow().get(&slot) {
+        return Ok(Arc::clone(equivocators));
+    }
+    let equivocating = &fcr_store.run.equivocating;
+    let equivocators: Vec<ValidatorIndex> = get_slot_committee(fcr_store, slot)?
+        .iter()
+        .copied()
+        .filter(|&index| equivocating.contains(index))
+        .collect();
+    let equivocators = Arc::new(equivocators);
+    fcr_store
+        .run
+        .slot_equivocators
+        .borrow_mut()
+        .insert(slot, Arc::clone(&equivocators));
+    Ok(equivocators)
 }
 
 /// `get_equivocation_score`: total weight of the equivocating participants of
@@ -747,6 +929,10 @@ pub fn compute_committee_weight_between_slots(
 ///
 /// Like the specification, it does not look in `balance_source` for slashed
 /// validators: those are very likely already equivocators.
+///
+/// Built from each slot's few equivocating members ([`slot_equivocators`]),
+/// shared by every range over that slot, rather than from the range's whole
+/// participant list.
 pub fn get_equivocation_score(
     fcr_store: &FastConfirmationStore,
     balance_source: &BalanceSource,
@@ -761,12 +947,17 @@ pub fn get_equivocation_score(
     if let Some(score) = fcr_store.run.equivocation_scores.borrow().get(&key) {
         return Ok(*score);
     }
-    let score = participants_between_slots(fcr_store, start_slot, end_slot)?
-        .into_iter()
-        .filter(|index| fcr_store.run.equivocating.contains(index))
-        .fold(0, |sum: Gwei, index| {
-            sum.saturating_add(balance_source.active(index))
-        });
+    // A validator sits in one committee per epoch, so a range over several
+    // epochs can name one twice.
+    let mut equivocators: Vec<ValidatorIndex> = Vec::new();
+    for slot in start_slot..=end_slot {
+        equivocators.extend(slot_equivocators(fcr_store, slot)?.iter().copied());
+    }
+    equivocators.sort_unstable();
+    equivocators.dedup();
+    let score = equivocators.into_iter().fold(0, |sum: Gwei, index| {
+        sum.saturating_add(balance_source.active(index))
+    });
     fcr_store
         .run
         .equivocation_scores
@@ -905,7 +1096,81 @@ pub fn compute_safety_threshold(
 }
 
 /// `get_attestation_score(store, get_node_for_root(root), balance_source)`
-/// for every block at once.
+/// for every block at once, memoized per balance source for the run.
+///
+/// Read from the fork choice's cached vote weights when the source weighs
+/// votes as the head does ([`cached_attestation_scores`]), and folded from the
+/// latest messages otherwise ([`fold_attestation_scores`]); the two give the
+/// same table, which a test holds them to.
+fn attestation_scores(
+    fcr_store: &FastConfirmationStore,
+    balance_source: &BalanceSource,
+) -> Arc<RootMap<Gwei>> {
+    if let Some(scores) = fcr_store.run.scores.borrow().get(&balance_source.key) {
+        return Arc::clone(scores);
+    }
+    let scores = cached_attestation_scores(fcr_store, balance_source)
+        .unwrap_or_else(|| fold_attestation_scores(fcr_store, balance_source));
+    let scores = Arc::new(scores);
+    fcr_store
+        .run
+        .scores
+        .borrow_mut()
+        .insert(balance_source.key, Arc::clone(&scores));
+    scores
+}
+
+/// [`attestation_scores`] from the store's cached fork-choice vote weights,
+/// when `balance_source` holds the balances the head weighs votes by: the
+/// justified checkpoint's, as one shared snapshot.
+///
+/// The cache (`ethlambda-storage`'s proto-array) keeps, for every block, the
+/// summed vote weight of the non-equivocating latest messages that land on it
+/// or on a descendant, current as votes arrive. Its `PENDING` total covers
+/// both payload branches, which is `get_attestation_score` of
+/// [`get_node_for_root`] under either rule set: before gloas every vote and
+/// every child sits under a block's one node. Reading it is a pass over the
+/// blocks instead of one over every validator's latest message, the tally the
+/// head computation stopped paying for the same reason, and which was most of
+/// a run here.
+///
+/// The read follows the head's own: the same balances snapshot, the same rule
+/// set and the same window, so it never forces the cache to rebuild. `None`,
+/// to fold instead, for any other balance source, and when the read fails
+/// where the head's would (a vote on a block whose payload link is unknown).
+fn cached_attestation_scores(
+    fcr_store: &FastConfirmationStore,
+    balance_source: &BalanceSource,
+) -> Option<RootMap<Gwei>> {
+    let store = fcr_store.store;
+    let justified = store.beacon_justified_checkpoint();
+    if balance_source.key != BalanceKey::of(justified) {
+        return None;
+    }
+    // The head's snapshot, not merely equal balances: the cache follows one
+    // snapshot by identity, and a different one would rebuild it.
+    let balances = store.justified_balances(&justified)?;
+    if !Arc::ptr_eq(&balances, &balance_source.balances) {
+        return None;
+    }
+    let rules = match fcr_store.run.rules {
+        ForkRules::PreGloas => WeightRules::PreGloas,
+        ForkRules::Gloas => WeightRules::Gloas,
+    };
+    let index = &fcr_store.run.index;
+    let bound = fork_choice::walk_bound(store, index);
+    let weights = store
+        .proto_array_weights(index, &balances, bound, rules)
+        .ok()?;
+    let scores = weights
+        .into_iter()
+        .filter(|(node, _)| node.payload_status == PayloadStatus::Pending)
+        .map(|(node, weight)| (node.root, weight))
+        .collect();
+    Some(scores)
+}
+
+/// [`attestation_scores`] by a pass over the latest messages.
 ///
 /// A vote counts for a block exactly when the block it supports descends from
 /// it, so each vote is summed at its own block and every block's total is
@@ -914,14 +1179,11 @@ pub fn compute_safety_threshold(
 /// payload branch, so the walk is by root there too. A vote for a block
 /// outside the index (pruned below finality) descends from no block scored
 /// here, and the fold never reaches it.
-fn attestation_scores(
+fn fold_attestation_scores(
     fcr_store: &FastConfirmationStore,
     balance_source: &BalanceSource,
-) -> Arc<HashMap<Root, Gwei>> {
-    if let Some(scores) = fcr_store.run.scores.borrow().get(&balance_source.key) {
-        return Arc::clone(scores);
-    }
-    let mut scores: HashMap<Root, Gwei> = HashMap::new();
+) -> RootMap<Gwei> {
+    let mut scores = RootMap::<Gwei>::default();
     // Nothing may read the store's own scratch inside this closure.
     fcr_store
         .store
@@ -947,13 +1209,6 @@ fn attestation_scores(
             *entry = entry.saturating_add(score);
         }
     }
-
-    let scores = Arc::new(scores);
-    fcr_store
-        .run
-        .scores
-        .borrow_mut()
-        .insert(balance_source.key, Arc::clone(&scores));
     scores
 }
 
@@ -1047,42 +1302,77 @@ fn get_latest_message_epoch(fcr_store: &FastConfirmationStore, message: &LatestM
 /// `get_current_target_score`: the estimate of FFG support of the current
 /// epoch's target from LMD-GHOST votes. Must be used no later than the end of
 /// the current epoch.
+///
+/// Only a vote from the target's own epoch is walked. The checkpoint
+/// `get_checkpoint_for_block(root, epoch)` returns carries the vote's epoch,
+/// so a vote from any other epoch fails the equality with `target` whatever
+/// its root, and skipping it first changes no result. The skip is what keeps
+/// the walk off the votes the live index no longer holds: a validator quiet
+/// since before the finalized checkpoint still has a latest message, whose
+/// root [`block`] can only answer from the block table, which on the beacon
+/// chain decodes a whole block per parent hop. Walking those, one hop at a
+/// time back to their epoch's first slot, is what made the runs that reach
+/// this function (the first slots of an epoch) take over a second on mainnet.
+///
+/// Memoized for the run: both `will_*_be_justified` checks reach it, through
+/// [`compute_honest_ffg_support_for_current_target`].
 pub fn get_current_target_score(fcr_store: &FastConfirmationStore) -> Result<Gwei> {
+    if let Some(score) = fcr_store.run.current_target_score.get() {
+        return Ok(*score);
+    }
     let target = get_current_target(fcr_store)?;
     let balance_source = balance_source(fcr_store, BalanceKey::PulledUpHead)?;
 
-    // The weight behind each distinct `(root, epoch)` vote, so the checkpoint
-    // walk below runs once per distinct vote and not once per validator.
-    let mut by_vote: HashMap<(Root, Epoch), Gwei> = HashMap::new();
+    // The weight behind each distinct root voted for in the target's epoch,
+    // so the checkpoint walk below runs once per distinct vote and not once
+    // per validator.
+    let mut by_root = RootMap::<Gwei>::default();
     fcr_store
         .store
         .for_each_non_equivocating_latest_message(|index, message| {
+            if get_latest_message_epoch(fcr_store, &message) != target.epoch {
+                return;
+            }
             let balance = balance_source.unslashed(index);
             if balance != 0 {
-                let epoch = get_latest_message_epoch(fcr_store, &message);
-                let entry = by_vote.entry((message.root, epoch)).or_default();
+                let entry = by_root.entry(message.root).or_default();
                 *entry = entry.saturating_add(balance);
             }
         });
 
     let mut score: Gwei = 0;
-    for ((root, epoch), balance) in by_vote {
+    for (root, balance) in by_root {
         // A vote for a block this store no longer holds supports no target.
-        if let Ok(checkpoint) = get_checkpoint_for_block(fcr_store, root, epoch)
+        if let Ok(checkpoint) = get_checkpoint_for_block(fcr_store, root, target.epoch)
             && checkpoint == target
         {
             score = score.saturating_add(balance);
         }
     }
+    let _ = fcr_store.run.current_target_score.set(score);
     Ok(score)
 }
 
 /// `compute_honest_ffg_support_for_current_target`: the honest FFG support of
 /// the current epoch's target, assuming [`CONFIRMATION_BYZANTINE_THRESHOLD`]
 /// and synchrony, counting the votes received so far.
+///
+/// Memoized for the run, like [`get_current_target_score`]: nothing it reads
+/// moves within one.
 pub fn compute_honest_ffg_support_for_current_target(
     fcr_store: &FastConfirmationStore,
 ) -> Result<Gwei> {
+    if let Some(support) = fcr_store.run.honest_ffg_support.get() {
+        return Ok(*support);
+    }
+    let support = compute_honest_ffg_support_uncached(fcr_store)?;
+    let _ = fcr_store.run.honest_ffg_support.set(support);
+    Ok(support)
+}
+
+/// [`compute_honest_ffg_support_for_current_target`]'s computation, run once
+/// per run.
+fn compute_honest_ffg_support_uncached(fcr_store: &FastConfirmationStore) -> Result<Gwei> {
     let current_slot = fcr_store.run.current_slot;
     let current_epoch = compute_epoch_at_slot(current_slot);
     let balance_source = balance_source(fcr_store, BalanceKey::PulledUpHead)?;
@@ -1492,6 +1782,8 @@ pub fn run_fast_confirmation(
 #[cfg(test)]
 mod tests {
     use ethlambda_storage::backend::InMemoryBackend;
+
+    use std::collections::HashSet;
 
     use super::*;
     use crate::beacon::containers::{BeaconBlockHeader, SignedBeaconBlock, gloas, phase0};
@@ -2284,6 +2576,238 @@ mod tests {
         }
     }
 
+    /// The fork choice's cached vote weights give the justified balance source
+    /// the same scores as the fold over the latest messages, on a tree with a
+    /// fork whose two blocks split a committee and an equivocator among the
+    /// voters.
+    #[test]
+    fn the_cached_scores_match_the_fold() {
+        let mut chain = Chain::new();
+        chain.run_slots(SPE + 4, 80);
+        let fork_point = chain.head();
+        let slot = chain.current_slot();
+        let a = chain.add_block_with(fork_point, slot, Root::repeat_byte(1));
+        let b = chain.add_block_with(fork_point, slot, Root::repeat_byte(2));
+        let committee = chain.committee(slot);
+        let (voters_a, voters_b) = committee.split_at(committee.len() / 3);
+        chain.vote(voters_a.to_vec(), a, slot);
+        chain.vote(voters_b.to_vec(), b, slot);
+        chain.next_slot();
+        chain.store.insert_equivocating_index(voters_a[0]);
+        // The head computation reads the cache first, as the tick does.
+        chain.head();
+
+        let fcr = chain.fcr();
+        let justified = chain.store.beacon_justified_checkpoint();
+        let source = balance_source(&fcr, BalanceKey::of(justified)).expect("source");
+        let cached = cached_attestation_scores(&fcr, &source)
+            .expect("the justified balance source reads the cache");
+        let folded = fold_attestation_scores(&fcr, &source);
+        for root in fcr.run.index.keys() {
+            assert_eq!(
+                cached.get(root).copied().unwrap_or(0),
+                folded.get(root).copied().unwrap_or(0),
+                "score of {root}"
+            );
+        }
+        assert!(cached.get(&a).is_some_and(|&score| score > 0));
+        assert!(cached.get(&b).is_some_and(|&score| score > 0));
+    }
+
+    /// Every figure a balance source answers, for every validator.
+    fn assert_same_balances(source: &BalanceSource, expected: &JustifiedBalances) {
+        for index in 0..=validators() as ValidatorIndex {
+            assert_eq!(source.unslashed(index), expected.get(index), "{index}");
+            assert_eq!(
+                source.active(index),
+                expected.active_balance(index),
+                "{index}"
+            );
+        }
+        assert_eq!(source.total_active(), expected.total_active_balance());
+        assert_eq!(source.total_unslashed(), expected.total_balance());
+    }
+
+    /// The pulled-up head's balances, read from the current target's cache
+    /// entry, are the ones the pulled-up head state itself gives; a slashing
+    /// in the current epoch's blocks is the one change that would make the
+    /// target's wrong, and it sends the read to the state.
+    #[test]
+    fn the_pulled_up_balances_are_the_pulled_up_states() {
+        let mut chain = Chain::new();
+        // The head mid-epoch, past the epoch's first block (the target).
+        chain.run_slots(SPE + 3, 90);
+        let fcr = chain.fcr();
+        assert_ne!(get_current_target(&fcr).unwrap().root, chain.head());
+        let source = balance_source(&fcr, BalanceKey::PulledUpHead).unwrap();
+        let state = get_pulled_up_head_state(&fcr).unwrap();
+        let expected = fork_choice::build_justified_balances(Checkpoint::default(), &state);
+        assert_same_balances(&source, &expected);
+
+        // A block that slashes validator 3, built the way the state transition
+        // would leave it: the flag set, and the epoch's slashings entry raised.
+        let slashed: ValidatorIndex = 3;
+        let epoch = chain.current_epoch();
+        let effective_balance = chain.base.validator(slashed).unwrap().effective_balance;
+        chain.base.validator_mut(slashed).unwrap().slashed = true;
+        chain.base.slashings_mut()[epoch as usize % preset::EPOCHS_PER_SLASHINGS_VECTOR] =
+            effective_balance;
+        chain.next_slot_with_block_on(None, 90);
+
+        let fcr = chain.fcr();
+        let target = get_current_target(&fcr).unwrap();
+        assert_eq!(target.epoch, epoch, "still the same epoch");
+        let target_balances =
+            fork_choice::checkpoint_balances(&chain.store, &target, &chain.config).unwrap();
+        assert_ne!(
+            target_balances.get(slashed),
+            0,
+            "the target's state predates the slashing"
+        );
+        let source = balance_source(&fcr, BalanceKey::PulledUpHead).unwrap();
+        assert_eq!(source.unslashed(slashed), 0);
+        let state = get_pulled_up_head_state(&fcr).unwrap();
+        let expected = fork_choice::build_justified_balances(Checkpoint::default(), &state);
+        assert_same_balances(&source, &expected);
+    }
+
+    /// Mainnet-sized timing of the rule beside the head computation it follows
+    /// on the tick: a block every slot, 90% of each slot's committee voting for
+    /// the head, and one run per slot after two epochs of warm-up, reported by
+    /// slot of the epoch (the first slots of an epoch take the paths the rest
+    /// do not). Ignored: a measurement, not a check. `FCR_BENCH_VALIDATORS`
+    /// sets the registry size (default one million). Run with `cargo test -p
+    /// ethlambda-state-transition --profile release-fast --lib -- --ignored
+    /// --nocapture fast_confirmation_timing`.
+    ///
+    /// The harness inserts blocks without `on_block`, so the loop caches a
+    /// first-slot block's balances itself, outside the timing, as an import
+    /// does (`cache_first_slot_balances`).
+    #[test]
+    #[ignore = "benchmark"]
+    fn fast_confirmation_timing() {
+        use std::time::{Duration, Instant};
+
+        let validators = std::env::var("FCR_BENCH_VALIDATORS")
+            .ok()
+            .and_then(|count| count.parse().ok())
+            .unwrap_or(1_000_000);
+        let epochs = 3;
+        let setup = Instant::now();
+        let mut state = test_state::with_validators(validators);
+        for index in 0..preset::EPOCHS_PER_HISTORICAL_VECTOR {
+            state.randao_mixes_mut()[index] = Root::repeat_byte(index as u8 + 1);
+        }
+        let mut chain = Chain::from_state(state);
+        chain.run_slots(2 * SPE, 90);
+        eprintln!("setup {:?}", setup.elapsed());
+
+        let mean = |runs: &[Duration]| runs.iter().sum::<Duration>() / runs.len().max(1) as u32;
+        let max = |runs: &[Duration]| runs.iter().max().copied().unwrap_or_default();
+        // (head, rule) per run, by slot of the epoch.
+        let mut by_slot: Vec<(Vec<Duration>, Vec<Duration>)> =
+            vec![Default::default(); SPE as usize];
+        for _ in 0..epochs * SPE {
+            let block = chain.next_slot_with_block_on(None, 90);
+            let block_slot = chain.slot_of(block);
+            if is_start_slot_at_epoch(block_slot) {
+                let checkpoint = Checkpoint {
+                    epoch: compute_epoch_at_slot(block_slot),
+                    root: block,
+                };
+                fork_choice::checkpoint_balances(&chain.store, &checkpoint, &chain.config)
+                    .expect("the block's state is stored");
+            }
+            let slot = chain.current_slot();
+            let start = Instant::now();
+            let head = chain.head();
+            let head_time = start.elapsed();
+            let start = Instant::now();
+            run_fast_confirmation(&chain.store, &chain.config, head).expect("the rule runs");
+            let rule_time = start.elapsed();
+            let (heads, rules) = &mut by_slot[(slot % SPE) as usize];
+            heads.push(head_time);
+            rules.push(rule_time);
+        }
+
+        let confirmed = chain.slot_of(chain.confirmed_root());
+        eprintln!(
+            "validators {validators}, {epochs} epochs, head slot {}, confirmed slot {confirmed}",
+            chain.slot_of(chain.head())
+        );
+        eprintln!("slot of epoch: get_head mean | rule mean (max)");
+        for (slot, (heads, rules)) in by_slot.iter().enumerate() {
+            eprintln!(
+                "  {slot:2}: {:?} | {:?} ({:?})",
+                mean(heads),
+                mean(rules),
+                max(rules)
+            );
+        }
+        let heads: Vec<Duration> = by_slot
+            .iter()
+            .flat_map(|(heads, _)| heads.clone())
+            .collect();
+        let rules: Vec<Duration> = by_slot
+            .iter()
+            .flat_map(|(_, rules)| rules.clone())
+            .collect();
+        eprintln!(
+            "overall: get_head mean {:?} | rule mean {:?}",
+            mean(&heads),
+            mean(&rules)
+        );
+    }
+
+    /// `get_current_target_score` walks only the target epoch's votes; the
+    /// specification walks every vote. The two agree because the checkpoint
+    /// a vote names carries the vote's own epoch. The scenario holds all three
+    /// kinds of vote: earlier-epoch votes, current-epoch votes for the target,
+    /// and current-epoch votes for a sibling of the epoch's first block, which
+    /// name a different target root.
+    #[test]
+    fn the_target_score_matches_the_specifications_unfiltered_sum() {
+        let mut chain = Chain::new();
+        chain.run_slots(SPE + 3, 80);
+        let epoch_start = compute_start_slot_at_epoch(chain.current_epoch());
+        let before_start = get_ancestor_root(&chain.fcr(), chain.head(), epoch_start - 1)
+            .expect("the canonical chain is indexed");
+        let slot = chain.current_slot();
+        let sibling = chain.add_block_with(before_start, slot, Root::repeat_byte(3));
+        let committee = chain.committee(slot);
+        chain.vote(committee[..committee.len() / 2].to_vec(), sibling, slot);
+        chain.next_slot();
+
+        let fcr = chain.fcr();
+        let target = get_current_target(&fcr).expect("target");
+        let source = balance_source(&fcr, BalanceKey::PulledUpHead).expect("source");
+        let mut messages = Vec::new();
+        chain
+            .store
+            .for_each_non_equivocating_latest_message(|index, message| {
+                messages.push((index, message));
+            });
+        let (mut expected, mut matching, mut other_target, mut other_epoch) = (0, 0, 0, 0);
+        for (index, message) in messages {
+            let epoch = get_latest_message_epoch(&fcr, &message);
+            let names_target = get_checkpoint_for_block(&fcr, message.root, epoch)
+                .is_ok_and(|checkpoint| checkpoint == target);
+            if names_target {
+                expected += source.unslashed(index);
+                matching += 1;
+            } else if epoch == target.epoch {
+                other_target += 1;
+            } else {
+                other_epoch += 1;
+            }
+        }
+        assert!(
+            matching > 0 && other_target > 0 && other_epoch > 0,
+            "the scenario holds every kind of vote: {matching} {other_target} {other_epoch}"
+        );
+        assert_eq!(get_current_target_score(&fcr).expect("score"), expected);
+    }
+
     #[test]
     fn the_score_fold_matches_the_specifications_per_block_attestation_score() {
         let mut chain = Chain::new();
@@ -2586,6 +3110,113 @@ mod tests {
             },
             signature: Default::default(),
         })
+    }
+
+    /// Under the gloas rules the cached weights split every block into its
+    /// payload branches, and a child hands its weight to the branch it builds
+    /// on. The `PENDING` total the rule reads is still the fold's per-root
+    /// score: a vote for either branch of the parent counts for it, and so does
+    /// the child that builds on its FULL payload.
+    #[test]
+    fn the_cached_scores_match_the_fold_under_gloas() {
+        let config = Config::active().with_fork_epoch(ForkName::Gloas, 1);
+        let gloas_start = compute_start_slot_at_epoch(1);
+        let anchor_root = Root::repeat_byte(0xa0);
+        let anchor = Checkpoint {
+            epoch: 0,
+            root: anchor_root,
+        };
+        let mut store = Store::init_beacon(
+            Arc::new(InMemoryBackend::new()),
+            0,
+            config.clone(),
+            anchor_root,
+            Store::beacon_checkpoint_as_stored(anchor),
+            0,
+        );
+        let hash = |byte| ExecutionBlockHash::repeat_byte(byte);
+        let state = test_state::with_validators_at(ForkName::Gloas, validators());
+
+        // anchor -> parent (slot s) -> [empty slot] -> child (slot s + 2), the
+        // child building on the parent's FULL payload.
+        let parent_root = Root::repeat_byte(0xb0);
+        let child_root = Root::repeat_byte(0xc0);
+        let (parent_slot, child_slot) = (gloas_start, gloas_start + 2);
+        for (root, signed) in [
+            (
+                anchor_root,
+                gloas_block(0, Root::ZERO, ExecutionBlockHash::ZERO, hash(1)),
+            ),
+            (
+                parent_root,
+                gloas_block(parent_slot, anchor_root, hash(1), hash(2)),
+            ),
+            (
+                child_root,
+                gloas_block(child_slot, parent_root, hash(2), hash(3)),
+            ),
+        ] {
+            store.insert_signed_block(root, signed).expect("insert");
+            let mut post = state.clone();
+            *post.slot_mut() = store.block_entry(&root).unwrap().0.max(gloas_start);
+            store.insert_state(root, post).expect("insert state");
+            // What the head computation records before the rule runs.
+            fork_choice::ensure_payload_link(&store, root).expect("link");
+        }
+        store
+            .set_time_ms((child_slot + 2) * config.slot_duration_ms)
+            .unwrap();
+
+        // The empty slot's committee splits between the parent's two payload
+        // branches; the child's slot committee votes for the child.
+        let fcr = FastConfirmationStore::new(
+            &store,
+            &config,
+            FastConfirmationVariables::at_finalized(anchor),
+            child_root,
+        );
+        let empty_slot_committee = get_slot_committee(&fcr, parent_slot + 1).unwrap();
+        let child_slot_committee = get_slot_committee(&fcr, child_slot).unwrap();
+        drop(fcr);
+        let (full_voters, empty_voters) =
+            empty_slot_committee.split_at(empty_slot_committee.len() / 2);
+        let votes = [
+            (full_voters, parent_slot + 1, parent_root, true),
+            (empty_voters, parent_slot + 1, parent_root, false),
+            (&child_slot_committee[..], child_slot, child_root, false),
+        ];
+        for (voters, slot, root, payload_present) in votes {
+            for &index in voters {
+                let message = LatestMessage {
+                    epoch: 1,
+                    slot,
+                    root,
+                    payload_present,
+                };
+                store.set_latest_message(index, message);
+            }
+        }
+
+        let fcr = FastConfirmationStore::new(
+            &store,
+            &config,
+            FastConfirmationVariables::at_finalized(anchor),
+            child_root,
+        );
+        assert_eq!(fcr.run.rules, ForkRules::Gloas);
+        let justified = store.beacon_justified_checkpoint();
+        let source = balance_source(&fcr, BalanceKey::of(justified)).unwrap();
+        let cached = cached_attestation_scores(&fcr, &source)
+            .expect("the justified balance source reads the cache");
+        let folded = fold_attestation_scores(&fcr, &source);
+        for root in [anchor_root, parent_root, child_root] {
+            assert_eq!(
+                cached.get(&root).copied().unwrap_or(0),
+                folded.get(&root).copied().unwrap_or(0),
+                "score of {root}"
+            );
+        }
+        assert!(folded.get(&parent_root).copied().unwrap_or(0) > folded[&child_root]);
     }
 
     /// The gloas `test_is_one_confirmed_delayed_with_mixed_payload_votes_in_empty_slot`
