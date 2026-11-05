@@ -372,7 +372,7 @@ mod tests {
             ],
         };
 
-        let record = record_of(&entry).expect("valid");
+        let record = record_of(&entry);
 
         assert_eq!(
             record,
