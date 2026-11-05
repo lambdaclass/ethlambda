@@ -103,6 +103,12 @@ const RECORD_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 /// The operation runs to completion even if the caller is dropped, as a duty
 /// abandoned at its deadline is: that is safe, since a record written for a
 /// message that is then never signed only costs that message.
+///
+/// A caller that finds the record held for [`RECORD_WAIT`] is refused, and
+/// the duty is not retried within the slot: the holder is a flush still
+/// running, and a retry would wait on that same flush. Nothing was recorded
+/// for the refused duty, so the next slot's are unaffected; the write itself
+/// is not bounded, since a flush cannot be interrupted, only outwaited.
 pub async fn blocking<T: Send + 'static>(
     protection: &SharedProtection,
     operation: impl FnOnce(&mut SlashingProtection) -> Result<T> + Send + 'static,

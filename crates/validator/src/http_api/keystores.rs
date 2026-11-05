@@ -5,9 +5,11 @@
 //! This client does not yet import or export EIP-3076 history, so the
 //! interchange data the specification requires is not produced. `DELETE` declares
 //! `slashing_protection` a required response field, so an empty but well-formed
-//! EIP-3076 interchange is returned; `POST` accepts the optional
-//! `slashing_protection` field and ignores it. A caller migrating keys between
-//! clients must not rely on this client to carry that history.
+//! EIP-3076 interchange is returned; `POST` refuses a request that carries the
+//! optional `slashing_protection` field, importing none of its keys, since a
+//! caller that hands over history must not be told it was taken. A caller
+//! migrating keys between clients must not rely on this client to carry that
+//! history.
 //!
 //! The empty interchange [`DELETE`] returns is deliberately unusable as one:
 //! its `genesis_validators_root` is all-zero rather than the chain's real
@@ -144,11 +146,23 @@ pub async fn import(
     State(context): State<KeymanagerContext>,
     Json(request): Json<ImportRequest>,
 ) -> Json<StatusResponse> {
+    // Refused rather than ignored: the caller handed over history, and a
+    // `200` with `imported` would tell it the history was taken, which is the
+    // standard way to move an active key and the surest way to double-sign.
     if request.slashing_protection.is_some() {
         warn!(
-            "Ignoring slashing_protection on import: importing EIP-3076 history is not \
-             supported yet, so every new key starts as never having signed"
+            "Refusing an import that carries slashing_protection; importing history is not supported yet"
         );
+        let message = "not imported: this client does not import EIP-3076 history yet, so a \
+                       request carrying slashing_protection imports nothing; import the keys \
+                       without it only if they have signed nothing anywhere for at least two \
+                       epochs";
+        let data = request
+            .keystores
+            .iter()
+            .map(|_| KeyStatus::error(message))
+            .collect();
+        return Json(StatusResponse { data });
     }
 
     if request.keystores.len() > MAX_KEYSTORES_PER_IMPORT {
@@ -563,22 +577,41 @@ fn persist_import(
         keystore: regular_file_bytes(&keystore_path)?,
         password: regular_file_bytes(&password_path)?.map(Zeroizing::new),
     };
-    secure_fs::write_private_no_symlink(&keystore_path, keystore_json).map_err(|source| {
-        Error::Io {
+    // Both files, or neither: a failure after the first write puts both back
+    // as they were, so a re-import that fails on its second file does not
+    // leave the previous keystore destroyed under the previous entry.
+    let restore = |overwritten: &Overwritten| -> crate::Result<()> {
+        put_back(&keystore_path, overwritten.keystore.as_deref())?;
+        put_back(
+            &password_path,
+            overwritten.password.as_deref().map(|bytes| &bytes[..]),
+        )
+    };
+    let written = secure_fs::write_private_no_symlink(&keystore_path, keystore_json)
+        .map_err(|source| Error::Io {
             path: keystore_path.display().to_string(),
             source,
-        }
-    })?;
-    secure_fs::write_private_no_symlink(&password_path, password).map_err(|source| Error::Io {
-        path: password_path.display().to_string(),
-        source,
-    })?;
+        })
+        .and_then(|()| {
+            secure_fs::write_private_no_symlink(&password_path, password).map_err(|source| {
+                Error::Io {
+                    path: password_path.display().to_string(),
+                    source,
+                }
+            })
+        });
+    if let Err(err) = written {
+        restore(&overwritten).inspect_err(
+            |undo| tracing::error!(%undo, "Could not put a half-written keystore back"),
+        )?;
+        return Err(err);
+    }
 
     let definition = ValidatorDefinition {
         enabled: true,
         voting_public_key: base.clone(),
-        voting_keystore_path: keystore_path,
-        voting_keystore_password_path: password_path,
+        voting_keystore_path: keystore_path.clone(),
+        voting_keystore_password_path: password_path.clone(),
     };
     // How to put `definitions` back if the save below fails.
     //
@@ -633,13 +666,16 @@ fn persist_import(
         Err(err) => {
             // `Appended` pops rather than removing by index because this
             // function pushes and saves with nothing in between, so the
-            // entry it added is still the last one.
+            // entry it added is still the last one. The files go back too.
             match undo {
                 Undo::Appended => {
                     definitions.0.pop();
                 }
                 Undo::Replaced { index, previous } => definitions.0[index] = previous,
             }
+            restore(&overwritten).inspect_err(|undo| {
+                tracing::error!(%undo, "Could not put a keystore whose entry failed to save back")
+            })?;
             Err(err)
         }
     }
@@ -1434,6 +1470,84 @@ mod tests {
         );
         let definitions = ValidatorDefinitions::open(dir.path()).expect("opens");
         assert_eq!(definitions.0, vec![previous]);
+    }
+
+    /// A re-import whose password write fails puts the keystore it had already
+    /// replaced back, so the previous entry never points at a keystore
+    /// encrypted under a password that was never written.
+    #[tokio::test]
+    async fn a_failed_password_write_puts_the_replaced_keystore_back() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let keystore: serde_json::Value =
+            serde_json::from_str(&keystore_json()).expect("the vector is json");
+        let pubkey = parse_pubkey(keystore["pubkey"].as_str().expect("pubkey")).expect("parses");
+        let base = encode_hex(&pubkey.0);
+        let keystore_path = dir.path().join(format!("{base}.json"));
+        let password_path = dir.path().join(&base);
+        std::fs::write(&keystore_path, b"old keystore").expect("writes");
+        // A directory at the password's path makes its write fail, after the
+        // keystore's succeeded.
+        std::fs::create_dir(&password_path).expect("a directory in its place");
+        let previous = ValidatorDefinition {
+            enabled: true,
+            voting_public_key: base.clone(),
+            voting_keystore_path: keystore_path.clone(),
+            voting_keystore_password_path: dir.path().join("old"),
+        };
+        ValidatorDefinitions(vec![previous.clone()])
+            .save(dir.path())
+            .expect("saves");
+        let context = context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
+
+        let (_, body) = send(
+            router(context, TOKEN.to_string()),
+            authed(
+                "POST",
+                "/eth/v1/keystores",
+                serde_json::json!({
+                    "keystores": [keystore_json()],
+                    "passwords": [PASSWORD],
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(body["data"][0]["status"], "error", "got {body}");
+        assert_eq!(
+            std::fs::read(&keystore_path).expect("still there"),
+            b"old keystore"
+        );
+        let definitions = ValidatorDefinitions::open(dir.path()).expect("opens");
+        assert_eq!(definitions.0, vec![previous]);
+    }
+
+    /// A request that carries history is refused whole, importing nothing.
+    #[tokio::test]
+    async fn an_import_carrying_history_is_refused_whole() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let context = context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
+        let store = context.store.clone();
+
+        let (_, body) = send(
+            router(context, TOKEN.to_string()),
+            authed(
+                "POST",
+                "/eth/v1/keystores",
+                serde_json::json!({
+                    "keystores": [keystore_json()],
+                    "passwords": [PASSWORD],
+                    "slashing_protection": "{}",
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(body["data"][0]["status"], "error", "got {body}");
+        assert!(store.read().await.pubkeys().is_empty());
+        assert!(
+            ValidatorDefinitions::open(dir.path())
+                .expect("opens")
+                .0
+                .is_empty()
+        );
     }
 
     /// The same keystore twice in one request, with the registration failing:

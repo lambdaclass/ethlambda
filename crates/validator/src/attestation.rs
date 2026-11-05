@@ -37,8 +37,9 @@ pub struct Attested {
     /// nothing to publish, which an `Ok` with a count of zero alone cannot.
     /// The cause is logged, and counted, where it is decided.
     pub refused: usize,
-    /// The data every attestation in this slot was signed over, or `None` when
-    /// there was no duty to fetch it for.
+    /// The slot's attestation data, which any attestation of it is signed
+    /// over, or `None` when there was no duty to fetch it for. Not a record of
+    /// what was signed: `published` and `refused` are.
     ///
     /// An `Option` rather than a zeroed default, because a caller handed a
     /// default would ask for the aggregate of an attestation nobody made. It is

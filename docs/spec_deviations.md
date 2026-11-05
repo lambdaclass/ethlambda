@@ -87,6 +87,14 @@ anything that does not advance past them.
   that answers for a slot far ahead lets the record run ahead of the chain.
   A bound against the clock would be circular; the guard is the beacon
   node's own view of the head, which doppelganger protection will bring.
+- **No checksum, and rewritten minimal at every start:** the record is an
+  EIP-3076 minimal interchange and nothing more, by design: readable by other
+  tools and editable by the operator, which the hand edit above relies on. A
+  checksum or a generation counter would make it this client's private format
+  and refuse that edit, to guard against a flipped digit that still parses,
+  which the disk's and the filesystem's own integrity checks are there for.
+  Every start rewrites the file in the minimal shape, so signing roots and
+  extra entries dropped in by hand collapse to their maxima.
 - **Keys with no record:** refused at startup. `--init-slashing-protection`
   registers them as never having signed, and a key imported through the
   keymanager API with no history is registered the same way before it is
@@ -110,9 +118,11 @@ anything that does not advance past them.
   `DELETE /eth/v1/keystores` must return an EIP-3076 interchange; this client
   returns a well-formed but empty one whose `genesis_validators_root` is
   deliberately all-zero, so a conformant importer rejects it outright rather
-  than trusting an empty history. `POST` accepts the `slashing_protection`
-  field and ignores it, with a server-side warning, so an imported key starts
-  as never having signed, like one registered by `--init-slashing-protection`.
+  than trusting an empty history. `POST` refuses a request that carries the
+  `slashing_protection` field, importing none of its keys, so a migration that
+  hands over history fails loudly instead of starting the key as never having
+  signed; a key imported without it starts that way, like one registered by
+  `--init-slashing-protection`.
 
 ## Builder bids: gossip and API only (no builder API)
 
