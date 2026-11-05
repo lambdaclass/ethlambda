@@ -27,8 +27,13 @@ use tracing::{error, info, warn};
 
 use super::builder_client::BuilderError;
 use super::builder_flow::Builder;
-use super::proposal::require_fulu_slot;
+use super::proposal::{refuse_future_slot, require_fulu_slot};
 use super::{ApiError, BodyEncoding};
+
+/// The 500's message when the builder answers a 2xx other than 202: not a
+/// refusal, since the builder may still publish the block.
+pub(crate) const NOT_202: &str =
+    "the builder answered with a success other than 202 Accepted; it may still publish the block";
 
 /// The block root this node published or handed to the builder for each
 /// slot, so a second, different block for a slot is refused instead of
@@ -110,7 +115,10 @@ pub(crate) fn finalized_slot(store: &Store) -> Slot {
 /// committed, so a validator client that hangs up must not cancel the
 /// reveal. The answer is the builder's: 202 becomes 200 and a 400 is passed
 /// through. Anything else is a 500, with no local fallback, since a second
-/// block would be an equivocation.
+/// block would be an equivocation; another 2xx gets a 500 and a log line of
+/// its own, since that builder may have taken the block.
+/// `broadcast_validation` is not read: these checks always run, and the
+/// builder, not this node, broadcasts.
 pub(crate) async fn post_blinded_block(
     State(store): State<Store>,
     builder: Option<Extension<Arc<Builder>>>,
@@ -141,7 +149,9 @@ pub(crate) async fn post_blinded_block(
         &store.config(),
         slot,
         "blinded blocks are accepted for fulu slots only",
-    ) {
+    )
+    .and_then(|()| refuse_future_slot(&store.config(), slot))
+    {
         return err.into_response();
     }
     let Some(parent_state) = store.get_state(&signed.message.parent_root).ok().flatten() else {
@@ -153,8 +163,10 @@ pub(crate) async fn post_blinded_block(
         if slot <= parent_state.slot() {
             return Err("the block is not after its parent");
         }
-        let state = advance_to_slot(&parent_state, slot, &config)
-            .map_err(|_| "advancing the parent state failed")?;
+        let state = advance_to_slot(&parent_state, slot, &config).map_err(|err| {
+            warn!(slot, %err, "Advancing a published blinded block's parent state failed");
+            "advancing the parent state failed"
+        })?;
         let proposer = get_beacon_proposer_index(&state).map_err(|_| "no proposer for the slot")?;
         if signed.message.proposer_index != proposer {
             return Err("wrong proposer for the slot");
@@ -191,6 +203,11 @@ pub(crate) async fn post_blinded_block(
             Err(BuilderError::BadRequest(message)) => {
                 error!(slot, %message, "The builder refused the signed blinded block")
             }
+            Err(BuilderError::UnexpectedSuccess { status }) => error!(
+                slot,
+                status,
+                "The builder answered the signed blinded block with a success other than 202 Accepted, which submitBlindedBlockV2 requires; it may still publish the block, so check the chain before acting"
+            ),
             Err(err) => error!(slot, %err, "The builder did not take the signed blinded block"),
         }
         result
@@ -200,6 +217,9 @@ pub(crate) async fn post_blinded_block(
         Ok(Ok(())) => StatusCode::OK.into_response(),
         Ok(Err(BuilderError::BadRequest(message))) => {
             ApiError::BadRequestDetail(message).into_response()
+        }
+        Ok(Err(BuilderError::UnexpectedSuccess { .. })) => {
+            ApiError::Internal(NOT_202).into_response()
         }
         Ok(Err(_)) => ApiError::Internal("the builder did not take the block").into_response(),
         Err(err) => {

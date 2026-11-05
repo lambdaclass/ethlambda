@@ -5,9 +5,10 @@
 //! withdrawals, blob count) are checked here too, before
 //! `assemble_blinded_block` repeats them as a backstop, so a refusal has a
 //! reason to count and costs no state transition. What is left unchecked
-//! (the payload's execution validity, its block hash and the fields only an
-//! execution client could verify) is trusted to the relay, as every client
-//! does: the payload is revealed only after the proposer signs.
+//! (the payload's execution validity, its block hash, the fields only an
+//! execution client could verify, and the fee recipient and the payment to the
+//! proposer, see [`validate`]) is trusted to the relay, as every client does:
+//! the payload is revealed only after the proposer signs.
 
 use ethlambda_state_transition::beacon::block_production::PayloadInputs;
 use ethlambda_state_transition::beacon::bls;
@@ -16,8 +17,6 @@ use ethlambda_types::beacon::builder::SignedBuilderBid;
 use ethlambda_types::beacon::containers::capella;
 use ethlambda_types::beacon::primitives::{HashTreeRoot as _, Version};
 use ethlambda_types::beacon::signing::{compute_builder_domain, compute_signing_root};
-
-use crate::beacon::bid_selection::wei_u128;
 
 /// EIP-4844's blob gas per blob.
 pub(crate) const GAS_PER_BLOB: u64 = 1 << 17;
@@ -39,7 +38,6 @@ pub(crate) struct BidContext<'a> {
 /// Why a bid was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Rejection {
-    ZeroValue,
     ParentHash,
     PrevRandao,
     Timestamp,
@@ -55,7 +53,6 @@ impl Rejection {
     /// The metric label.
     pub(crate) fn label(self) -> &'static str {
         match self {
-            Self::ZeroValue => "zero_value",
             Self::ParentHash => "parent_hash",
             Self::PrevRandao => "prev_randao",
             Self::Timestamp => "timestamp",
@@ -74,13 +71,12 @@ impl Rejection {
 ///
 /// The bid's fork label is not checked here: an electra bid at a fulu slot is
 /// accepted on purpose (the containers are identical, so a lagging relay's bid
-/// stays usable), and `BuilderClient` already refuses every other fork.
+/// stays usable), and `BuilderClient` already refuses every other fork. Nor is
+/// its value: a bid that pays nothing still stands in for a local block that
+/// failed, and `choice::choose` keeps it from beating one that did not.
 pub(crate) fn validate(bid: &SignedBuilderBid, context: &BidContext) -> Result<(), Rejection> {
     let message = &bid.message;
     let header = &message.header;
-    if wei_u128(&message.value) == 0 {
-        return Err(Rejection::ZeroValue);
-    }
     if header.parent_hash != context.inputs.parent_hash {
         return Err(Rejection::ParentHash);
     }
@@ -118,6 +114,17 @@ pub(crate) fn validate(bid: &SignedBuilderBid, context: &BidContext) -> Result<(
     ) {
         return Err(Rejection::GasLimit);
     }
+    // Not checked: `header.fee_recipient` against the registered one, which
+    // builder-specs' `process_bid` asserts. A builder names itself as the
+    // payload's fee recipient, so fees and MEV accrue to it, and pays the
+    // proposer with the payload's last transaction, to the registered address
+    // and worth the bid's value. A mismatch is therefore the normal case, and
+    // the assertion would refuse nearly every real bid; no client reviewed
+    // makes it. Nor can the payment be checked here: the header carries no
+    // transactions, and the builder publishes the block after the proposer
+    // signs. The relay checks it, when it validates the builder's submission
+    // on an execution node before serving the bid. See
+    // `docs/spec_deviations.md`.
     let domain = compute_builder_domain(context.genesis_fork_version);
     let root = compute_signing_root(message.hash_tree_root(), domain);
     if !bls::verify(&message.pubkey, root, &bid.signature) {
@@ -207,11 +214,16 @@ mod tests {
         assert_eq!(rejection(&bid(|_| {})), None);
     }
 
+    /// What a bid pays is for `choice::choose` to weigh, not a check here.
+    #[test]
+    fn a_bid_that_pays_nothing_is_accepted() {
+        assert_eq!(rejection(&bid(|bid| bid.value = Uint256::from(0u64))), None);
+    }
+
     #[test]
     fn each_check_refuses_its_own_field() {
         type Edit = fn(&mut BuilderBid);
-        let cases: [(Rejection, Edit); 9] = [
-            (Rejection::ZeroValue, |bid| bid.value = Uint256::from(0u64)),
+        let cases: [(Rejection, Edit); 8] = [
             (Rejection::ParentHash, |bid| {
                 bid.header.parent_hash = ExecutionBlockHash::repeat_byte(9)
             }),
