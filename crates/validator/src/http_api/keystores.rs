@@ -151,7 +151,7 @@ pub async fn list(State(context): State<KeymanagerContext>) -> Json<ListResponse
 
 pub async fn import(
     State(context): State<KeymanagerContext>,
-    Json(request): Json<ImportRequest>,
+    Json(mut request): Json<ImportRequest>,
 ) -> Json<StatusResponse> {
     if request.keystores.len() > MAX_KEYSTORES_PER_IMPORT {
         let message = format!(
@@ -174,11 +174,23 @@ pub async fn import(
     // record's chain before anything is touched, so a request whose history
     // would be refused imports no key at all, rather than some keys without
     // it. It is written later, in the same write as the keys' registration,
-    // once the keys it came with are known to be saved.
-    let history = match &request.slashing_protection {
+    // once the keys it came with are known to be saved. Parsed on the
+    // blocking pool: a complete-format interchange runs to tens of megabytes
+    // (see `KEYMANAGER_BODY_LIMIT`), and the executor thread this handler
+    // runs on also drives the duty services.
+    let history = match request.slashing_protection.take() {
         None => None,
         Some(interchange) => {
-            let staged = crate::slashing_protection::SlashingProtection::stage(interchange);
+            let staged = tokio::task::spawn_blocking(move || {
+                crate::slashing_protection::SlashingProtection::stage(&interchange)
+            })
+            .await
+            .unwrap_or_else(|err| {
+                Err(Error::SlashingProtection {
+                    path: "interchange".to_string(),
+                    reason: format!("could not be parsed: {err}"),
+                })
+            });
             let judged = match staged {
                 Ok(staged) => {
                     let staged = Arc::new(staged);
@@ -744,10 +756,14 @@ pub async fn delete(
 
     // Exported only now, with the keys out of the store: a signature with one
     // of them either finished before the write lock above was granted, and is
-    // in the record, or can no longer happen. Only for the keys that are
-    // `deleted` or may become `not_active`, as the specification requires: a
-    // key whose delete failed is still on disk and comes back on restart, so
-    // its history is not handed over. Teku and Prysm filter the same way.
+    // in the record, or can no longer happen. That holds because the duty
+    // services record before they take the store's read lock to sign (see
+    // `attestation.rs` and `proposal.rs`), so no signature exists without its
+    // record already on disk. Only for the keys that are `deleted` or may
+    // become `not_active`, as the specification requires: a key whose delete
+    // failed is still on disk and comes back on restart, so its history is
+    // not handed over. Teku and Prysm filter the same way. A key listed twice
+    // is `deleted` once and `not_found` once; `export` lists it once.
     let requested: Vec<Option<BlsPubkey>> = results
         .iter()
         .map(|(pubkey, status)| match status.status.as_str() {
@@ -772,7 +788,11 @@ pub async fn delete(
             // history from one whose history could not be read, so every key
             // that parsed becomes an error, as Prysm answers: a `not_found`
             // here would tell a migrator there is nothing to carry. A
-            // malformed pubkey keeps its own error.
+            // malformed pubkey keeps its own error. The deletions themselves
+            // already happened and are not undone: the keys' records are
+            // kept, so a retry answers `not_active` with their history. The
+            // field is required, so it carries an empty string rather than
+            // an interchange that would read as "nothing signed".
             warn!(%err, "Deleted keys whose slashing-protection history could not be exported");
             let message = format!("slashing_protection could not be exported: {err}");
             let data = results
@@ -1736,10 +1756,14 @@ mod tests {
 
     /// A minimal interchange for `KEYSTORE_PUBKEY` on the chain `root`.
     fn history(root: &str, slot: u64, source: u64, target: u64) -> String {
+        history_for(KEYSTORE_PUBKEY, root, slot, source, target)
+    }
+
+    fn history_for(pubkey: &str, root: &str, slot: u64, source: u64, target: u64) -> String {
         serde_json::json!({
             "metadata": { "interchange_format_version": "5", "genesis_validators_root": root },
             "data": [{
-                "pubkey": KEYSTORE_PUBKEY,
+                "pubkey": pubkey,
                 "signed_blocks": [{ "slot": slot.to_string() }],
                 "signed_attestations": [{
                     "source_epoch": source.to_string(),
@@ -1879,6 +1903,94 @@ mod tests {
                 .check_block(&pubkey, SLOT)
                 .is_err()
         );
+    }
+
+    /// The history may name a validator that is not in the request: it gets a
+    /// record too, so a later delete of it answers `not_active` with that
+    /// history rather than `not_found`.
+    #[tokio::test]
+    async fn history_for_a_key_outside_the_request_gets_a_record() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (context, protection) = context_with_record(dir.path());
+        let app = router(context, TOKEN.to_string());
+        let other = format!("0x{}", "ab".repeat(48));
+
+        let (_, body) = send(
+            app.clone(),
+            authed(
+                "POST",
+                "/eth/v1/keystores",
+                serde_json::json!({
+                    "keystores": [keystore_json()],
+                    "passwords": [PASSWORD],
+                    "slashing_protection": history_for(&other, ZERO_ROOT, 100, 5, 10),
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(body["data"][0]["status"], "imported", "got {body}");
+
+        let other_pubkey = parse_pubkey(&other).expect("pubkey");
+        {
+            let protection = protection.lock().expect("not poisoned");
+            assert!(protection.contains(&other_pubkey));
+            assert!(protection.check_block(&other_pubkey, 100).is_err());
+            assert!(protection.contains(&parse_pubkey(KEYSTORE_PUBKEY).expect("pubkey")));
+        }
+
+        let (_, body) = send(
+            app,
+            authed(
+                "DELETE",
+                "/eth/v1/keystores",
+                serde_json::json!({ "pubkeys": [other] }),
+            ),
+        )
+        .await;
+        assert_eq!(body["data"][0]["status"], "not_active", "got {body}");
+        let interchange: serde_json::Value =
+            serde_json::from_str(body["slashing_protection"].as_str().expect("a string"))
+                .expect("json");
+        assert_eq!(interchange["data"][0]["pubkey"], other);
+        assert_eq!(interchange["data"][0]["signed_blocks"][0]["slot"], "100");
+    }
+
+    /// A key listed twice in one delete is `deleted` once and `not_active`
+    /// once, and the returned interchange names it once: one that named a
+    /// validator twice would be refused on import.
+    #[tokio::test]
+    async fn a_delete_listing_a_key_twice_exports_it_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (context, _) = context_with_record(dir.path());
+        let app = router(context, TOKEN.to_string());
+
+        let (_, body) = send(
+            app.clone(),
+            authed(
+                "POST",
+                "/eth/v1/keystores",
+                serde_json::json!({ "keystores": [keystore_json()], "passwords": [PASSWORD] }),
+            ),
+        )
+        .await;
+        assert_eq!(body["data"][0]["status"], "imported", "got {body}");
+
+        let (_, body) = send(
+            app,
+            authed(
+                "DELETE",
+                "/eth/v1/keystores",
+                serde_json::json!({ "pubkeys": [KEYSTORE_PUBKEY, KEYSTORE_PUBKEY] }),
+            ),
+        )
+        .await;
+        assert_eq!(body["data"][0]["status"], "deleted", "got {body}");
+        assert_eq!(body["data"][1]["status"], "not_active", "got {body}");
+        let interchange: serde_json::Value =
+            serde_json::from_str(body["slashing_protection"].as_str().expect("a string"))
+                .expect("json");
+        assert_eq!(interchange["data"].as_array().expect("array").len(), 1);
+        assert_eq!(interchange["data"][0]["pubkey"], KEYSTORE_PUBKEY);
     }
 
     /// History that came with a key that then failed to import is not

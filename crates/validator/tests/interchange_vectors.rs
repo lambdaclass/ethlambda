@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use ethlambda_types::beacon::containers::shared::{AttestationData, Checkpoint};
-use ethlambda_types::beacon::primitives::{BlsPubkey, H256, Root};
+use ethlambda_types::beacon::primitives::{BlsPubkey, Root};
 use ethlambda_validator::beacon_node::dto::parse_pubkey;
 use ethlambda_validator::slashing_protection::SlashingProtection;
 use serde::Deserialize;

@@ -59,7 +59,7 @@
 
 pub mod file;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -192,6 +192,14 @@ impl Signed {
 pub struct StagedHistory {
     root: Root,
     entries: Vec<(BlsPubkey, Record)>,
+}
+
+impl StagedHistory {
+    /// The chain the interchange names: what a record created for it must
+    /// belong to.
+    pub fn root(&self) -> Root {
+        self.root
+    }
 }
 
 /// What one validator has signed: its watermarks.
@@ -618,17 +626,6 @@ impl SlashingProtection {
         self.absorb(None, pubkeys).map(|(_, registered)| registered)
     }
 
-    /// The chain an EIP-3076 interchange names, read without importing it: what
-    /// a record created for it must belong to.
-    pub fn interchange_chain(interchange: &str) -> Result<Root> {
-        file::parse(interchange)
-            .map(|(root, _)| root)
-            .map_err(|reason| Error::SlashingProtection {
-                path: "interchange".to_string(),
-                reason,
-            })
-    }
-
     /// The chain this record belongs to.
     pub fn genesis_validators_root(&self) -> Root {
         self.genesis_validators_root
@@ -694,6 +691,11 @@ impl SlashingProtection {
     /// every key in `register` that then still has no record, in one durable
     /// write: either all of it is on disk or none of it is. Returns how many
     /// validators the history named and how many keys were newly registered.
+    ///
+    /// A key in `register` that already has a record and is not in the
+    /// history keeps that record, with a warning: it is what this client last
+    /// signed with the key, which says nothing about what the key signed
+    /// elsewhere since.
     pub fn absorb(
         &mut self,
         history: Option<&StagedHistory>,
@@ -714,10 +716,19 @@ impl SlashingProtection {
         let named = staged.len();
         let mut registered = 0;
         for pubkey in register {
-            if !staged.contains_key(pubkey) && !self.records.contains_key(pubkey) {
-                staged.insert(*pubkey, Record::default());
-                registered += 1;
+            if staged.contains_key(pubkey) {
+                continue;
             }
+            if self.records.contains_key(pubkey) {
+                warn!(
+                    pubkey = %encode_hex(&pubkey.0),
+                    "Registering a validator that already has a slashing-protection record and \
+                     brought no history; it continues from what this client last signed with it"
+                );
+                continue;
+            }
+            staged.insert(*pubkey, Record::default());
+            registered += 1;
         }
         if !staged.is_empty() {
             self.commit(staged)?;
@@ -729,10 +740,14 @@ impl SlashingProtection {
     ///
     /// A key with no record is left out rather than listed as never having
     /// signed: an empty entry would tell the importer something this client
-    /// does not know.
+    /// does not know. A key listed twice is exported once: an interchange that
+    /// names a validator twice is refused by stricter importers, this client's
+    /// own record reader among them.
     pub fn export(&self, pubkeys: &[BlsPubkey]) -> Result<String> {
+        let mut seen = HashSet::with_capacity(pubkeys.len());
         let selected = pubkeys
             .iter()
+            .filter(|pubkey| seen.insert(**pubkey))
             .filter_map(|pubkey| self.records.get_key_value(pubkey));
         file::render(self.genesis_validators_root, selected).map_err(|err| {
             Error::SlashingProtection {
@@ -1276,6 +1291,30 @@ mod tests {
         assert!(attest(&mut protection, 1, &data(128, 3, 4, 0xaa)).is_ok());
     }
 
+    /// A newer history imported over an older record raises it, and the raised
+    /// watermarks survive a restart: the merge updates an existing entry, not
+    /// only inserts a missing one.
+    #[test]
+    fn an_import_raises_an_existing_watermark() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        {
+            let mut protection = open(dir.path(), &[1], true).expect("init");
+            propose(&mut protection, 1, 10).expect("propose");
+            attest(&mut protection, 1, &data(96, 2, 3, 0xaa)).expect("attest");
+
+            protection
+                .import(&interchange(0x42, 1, 50, 4, 6))
+                .expect("imports");
+            assert!(propose(&mut protection, 1, 40).is_err());
+            assert!(attest(&mut protection, 1, &data(160, 3, 5, 0xaa)).is_err());
+        }
+        let mut protection = open(dir.path(), &[1], false).expect("reopens");
+        assert!(propose(&mut protection, 1, 50).is_err());
+        assert!(propose(&mut protection, 1, 51).is_ok());
+        assert!(attest(&mut protection, 1, &data(192, 4, 6, 0xaa)).is_err());
+        assert!(attest(&mut protection, 1, &data(224, 4, 7, 0xaa)).is_ok());
+    }
+
     /// An older history imported over a newer record must not lower it.
     #[test]
     fn an_import_never_lowers_a_watermark() {
@@ -1314,6 +1353,24 @@ mod tests {
         assert_eq!(json["data"][0]["signed_blocks"][0]["slot"], "97");
 
         // And it imports back into a fresh record as the same watermarks.
+        let other = tempfile::tempdir().expect("temp dir");
+        let mut fresh = open(other.path(), &[], false).expect("opens");
+        fresh.import(&exported).expect("round trip");
+        assert!(propose(&mut fresh, 1, 97).is_err());
+    }
+
+    /// A key requested twice is exported once: this client's own record
+    /// reader refuses a file naming a validator twice, and so may others'.
+    #[test]
+    fn an_export_lists_a_key_requested_twice_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut protection = open(dir.path(), &[1], true).expect("init");
+        propose(&mut protection, 1, 97).expect("propose");
+
+        let exported = protection.export(&[pubkey(1), pubkey(1)]).expect("exports");
+        let json: serde_json::Value = serde_json::from_str(&exported).expect("json");
+        assert_eq!(json["data"].as_array().expect("array").len(), 1);
+
         let other = tempfile::tempdir().expect("temp dir");
         let mut fresh = open(other.path(), &[], false).expect("opens");
         fresh.import(&exported).expect("round trip");
@@ -1363,7 +1420,7 @@ mod tests {
         let mut protection = open(dir.path(), &[], false).expect("opens");
         for text in ["", "{}", "[]"] {
             protection.import(text).expect_err("not an interchange");
-            SlashingProtection::interchange_chain(text).expect_err("not an interchange");
+            SlashingProtection::stage(text).expect_err("not an interchange");
         }
         assert!(protection.is_empty());
     }

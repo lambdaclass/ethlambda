@@ -55,9 +55,12 @@ pub(crate) fn run(options: SlashingProtectionOptions) -> eyre::Result<()> {
         } => {
             let interchange = std::fs::read_to_string(&file)
                 .map_err(|err| eyre::eyre!("{}: {err}", file.display()))?;
-            let chain = SlashingProtection::interchange_chain(&interchange)?;
-            let mut protection = SlashingProtection::open_offline(&validators_dir, Some(chain))?;
-            let validators = protection.import(&interchange)?;
+            // Parsed once: the file can be tens of megabytes in the complete
+            // format, and its chain is needed before the record is opened.
+            let staged = SlashingProtection::stage(&interchange)?;
+            let mut protection =
+                SlashingProtection::open_offline(&validators_dir, Some(staged.root()))?;
+            let (validators, _) = protection.absorb(Some(&staged), &[])?;
             info!(
                 validators,
                 file = %file.display(),
