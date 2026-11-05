@@ -135,7 +135,8 @@ static BUILDER_REGISTRATION_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new
 });
 
 /// Proposer preferences a beacon node accepted. Counted per preference, so a
-/// full epoch's worth reads as that many.
+/// full epoch's worth reads as that many, and once, when the first node
+/// accepts it: the re-sends to nodes that missed it do not count again.
 static PROPOSER_PREFERENCES_PUBLISHED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "ethlambda_validator_proposer_preferences_published_total",
@@ -146,7 +147,8 @@ static PROPOSER_PREFERENCES_PUBLISHED_TOTAL: LazyLock<IntCounter> = LazyLock::ne
 
 /// Proposer preferences no beacon node accepted, one count per preference per
 /// attempt. The next slot retries, so this is a warning sign: until one is
-/// accepted, builders' bids for the slot are ignored.
+/// accepted, builders' bids for the slot are ignored. A re-send of one some
+/// node already accepted is not counted, since that cost does not apply.
 static PROPOSER_PREFERENCES_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "ethlambda_validator_proposer_preferences_failures_total",

@@ -46,8 +46,8 @@ use crate::beacon_node::dto::{
     VersionedResponse, config_from_spec_response, encode_hex, parse_pubkey, parse_root,
 };
 use crate::beacon_node::{
-    AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Genesis,
-    ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorEntry,
+    AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery,
+    Genesis, ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorEntry,
     validate_attestation_data, validate_produced_block, validate_sync_contribution,
 };
 use crate::error::{BeaconNodeFailure, Error, Result};
@@ -885,13 +885,14 @@ impl BeaconNodeApi for HttpBeaconNode {
 
     /// JSON, which every beacon node must accept, an empty list never reaching
     /// the wire. The gloas container serialises as the endpoint's JSON itself.
+    /// One node, so an acceptance is always [`Delivery::Everywhere`].
     async fn submit_proposer_preferences(
         &self,
         fork: ForkName,
         preferences: &[gloas::SignedProposerPreferences],
-    ) -> Result<()> {
+    ) -> Result<Delivery> {
         if preferences.is_empty() {
-            return Ok(());
+            return Ok(Delivery::Everywhere);
         }
         self.post_no_content(
             "/eth/v1/validator/proposer_preferences",
@@ -899,6 +900,7 @@ impl BeaconNodeApi for HttpBeaconNode {
             Some(fork.as_str()),
         )
         .await
+        .map(|()| Delivery::Everywhere)
     }
 
     async fn execution_payload_envelope(
@@ -1625,11 +1627,12 @@ mod tests {
             signature: BlsSignature([5; 96]),
         }];
         let served = serve(200, vec![], vec![]).await;
-        served
+        let delivery = served
             .node
             .submit_proposer_preferences(ForkName::Fulu, &preferences)
             .await
             .expect("accepted");
+        assert_eq!(delivery, Delivery::Everywhere, "one node is every node");
 
         let seen = served.seen.lock().expect("lock");
         assert_eq!(seen.len(), 1);

@@ -162,6 +162,21 @@ pub enum Published {
     BuilderUnconfirmed,
 }
 
+/// How many of the configured nodes took something sent to every node.
+///
+/// The caller needs it when what it sends lives on each node separately and
+/// a node that missed it never hears it any other way. Proposer preferences
+/// are such a send: each node gossips only what it accepted, and the service
+/// stops sending a preference once it counts as delivered, so "some node
+/// accepted" must not be mistaken for "every node did".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// Every configured node accepted. The only answer a single node gives.
+    Everywhere,
+    /// At least one node accepted and at least one refused or did not answer.
+    Partly,
+}
+
 /// Check that `block` is the block that was asked for.
 ///
 /// The proposal-shaped counterpart to [`validate_attestation_data`], enforced
@@ -437,12 +452,13 @@ pub trait BeaconNodeApi: Send + Sync {
     /// holds for the same `(slot, dependent_root)` with other content fails
     /// every call that carries it. The caller therefore sends one preference
     /// per call. State on the node's gossip, so failover sends it to every
-    /// node.
+    /// node, and answers [`Delivery::Partly`] when only some of them accepted
+    /// it, so the caller knows to send it again.
     async fn submit_proposer_preferences(
         &self,
         fork: ForkName,
         preferences: &[gloas::SignedProposerPreferences],
-    ) -> Result<()>;
+    ) -> Result<Delivery>;
 
     /// The envelope the node cached for the self-built payload of the block
     /// whose root is `block_root`, proposed at `slot`.

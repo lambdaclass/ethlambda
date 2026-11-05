@@ -24,8 +24,8 @@ use crate::beacon_node::dto::{
     SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto,
 };
 use crate::beacon_node::{
-    AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Genesis,
-    ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorEntry,
+    AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery,
+    Genesis, ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorEntry,
     validate_sync_contribution,
 };
 use crate::error::{BeaconNodeFailure, Error, Result};
@@ -66,6 +66,11 @@ pub struct MockBeaconNode {
     pub proposers: Mutex<Vec<(Epoch, ProposerDuties)>>,
     /// What `proposer_duties_v2` answers with, by epoch, like `proposers`.
     pub proposers_v2: Mutex<Vec<(Epoch, ProposerDuties)>>,
+    /// Run inside every `proposer_duties_v2` call that gets past the
+    /// configured failures, before it answers: the point where a caller has
+    /// taken its own snapshot and waits on the node, so a test can change the
+    /// world under it there.
+    pub on_proposer_duties_v2: Option<Box<dyn Fn() + Send + Sync>>,
     /// Every proposer preferences batch `submit_proposer_preferences`
     /// received, with the fork it was sent under, in call order.
     pub submitted_preferences: Mutex<Vec<(ForkName, Vec<gloas::SignedProposerPreferences>)>>,
@@ -708,6 +713,9 @@ impl BeaconNodeApi for MockBeaconNode {
     async fn proposer_duties_v2(&self, epoch: Epoch) -> Result<ProposerDuties> {
         self.guard("proposer_duties_v2")?;
         *self.proposer_duties_v2_calls.lock().expect("lock") += 1;
+        if let Some(hook) = &self.on_proposer_duties_v2 {
+            hook();
+        }
         self.proposers_v2
             .lock()
             .expect("lock")
@@ -874,7 +882,7 @@ impl BeaconNodeApi for MockBeaconNode {
         &self,
         fork: ForkName,
         preferences: &[gloas::SignedProposerPreferences],
-    ) -> Result<()> {
+    ) -> Result<Delivery> {
         self.guard("submit_proposer_preferences")?;
         let refused = self.refused_preference_slots.lock().expect("lock").clone();
         if let Some(entry) = preferences
@@ -893,7 +901,7 @@ impl BeaconNodeApi for MockBeaconNode {
             .lock()
             .expect("lock")
             .push((fork, preferences.to_vec()));
-        Ok(())
+        Ok(Delivery::Everywhere)
     }
 
     async fn execution_payload_envelope(

@@ -325,7 +325,10 @@ slot, whether or not `--builder-proposals` is set: from gloas the preferences
 are what carry a proposal's fee recipient, and a node ignores builders' bids
 for a slot with none. It reads those duties from the v2 proposer duties
 endpoint, whose dependent root the preferences must carry, and publishes each
-`(slot, dependent root)` once, again after a reorg changes the root. A
+`(slot, dependent root)` until every node has accepted it, sending the message
+as first signed to all of them again each slot until then, and again after a
+reorg changes the root. Duties outside their epoch, and all but the first for
+a slot, are dropped before anything is signed. A
 validator with no fee recipient is skipped, with one warning per epoch naming
 the count. A preference cannot be replaced for the same slot and root, so a
 fee recipient changed through the keymanager API applies from the next

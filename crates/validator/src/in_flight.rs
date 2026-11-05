@@ -17,7 +17,14 @@ impl InFlight {
     /// The guard for a new run, or `None` when one is already going.
     pub(crate) fn enter(&self) -> Option<InFlightGuard<'_>> {
         let running = self.0.swap(true, Ordering::AcqRel);
-        (!running).then_some(InFlightGuard(&self.0))
+        // The guard is built only for a run that starts: `then_some` would
+        // build it either way and drop it on the refused path, and dropping
+        // it clears the flag of the run that is still going.
+        if running {
+            None
+        } else {
+            Some(InFlightGuard(&self.0))
+        }
     }
 }
 
@@ -40,6 +47,10 @@ mod tests {
         let in_flight = InFlight::default();
         let first = in_flight.enter().expect("nothing is running");
         assert!(in_flight.enter().is_none());
+        assert!(
+            in_flight.enter().is_none(),
+            "a refused run leaves the running one's flag set"
+        );
         drop(first);
         assert!(in_flight.enter().is_some());
     }
