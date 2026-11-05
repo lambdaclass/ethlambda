@@ -37,6 +37,21 @@
 //! registration whose send fails is cached anyway, so it is not re-sent at the
 //! next slot: it waits for the next epoch's full send.
 //!
+//! A batch a node refuses with a 400 is not split to find the entry it
+//! objects to: every entry is signed here by keys this client holds, so a
+//! refusal says more about the node or the relay than about one entry, and no
+//! other client splits either.
+//!
+//! # One send of each kind at a time
+//!
+//! Both sends are spawned off the slot loop, so nothing else would stop a new
+//! one starting while the last still waits on a slow node: a full send every
+//! epoch, each holding the whole registration set and sending it again to the
+//! healthy nodes. A send that finds the previous one of its kind still going
+//! is skipped (see [`crate::in_flight`]). A skipped full send waits for the
+//! next epoch, and a skipped per-slot one for the next slot, since it has not
+//! marked its change as sent.
+//!
 //! # Signing stays off the async runtime
 //!
 //! The first epoch signs one BLS signature per validator. That runs on the
@@ -64,6 +79,7 @@ use tracing::{debug, warn};
 
 use crate::beacon_node::BeaconNodeApi;
 use crate::beacon_node::dto::encode_hex;
+use crate::in_flight::InFlight;
 use crate::keys::ValidatorStore;
 use crate::proposer_settings::ProposerSettings;
 use crate::signing::SigningContext;
@@ -95,6 +111,27 @@ impl Current {
     }
 }
 
+/// The timestamp for a registration replacing `held`: `now_secs`, or one
+/// second past `held`'s when the clock does not say later.
+///
+/// A relay keeps a validator's registration with the latest timestamp and
+/// drops one that is not newer. Two settings changes within one second, or a
+/// wall clock stepped back between them, would otherwise sign the new settings
+/// under a timestamp the relay ignores. The cached registration is then re-sent
+/// every epoch while the builder keeps the old fee recipient or gas limit.
+///
+/// Two changes within a second put it one second ahead of the clock, which no
+/// relay refuses as being in the future. After a larger backward step it is
+/// further ahead: a relay may refuse it until its own clock catches up, and the
+/// epoch's full re-send then delivers it. With the clock's own reading
+/// instead, the relay would drop it as older on every re-send, since the
+/// cached signature keeps that timestamp until the settings change again.
+fn newer_than(held: Option<&SignedValidatorRegistrationV1>, now_secs: u64) -> u64 {
+    held.map_or(now_secs, |held| {
+        now_secs.max(held.message.timestamp.saturating_add(1))
+    })
+}
+
 /// Signs and sends builder registrations.
 pub struct RegistrationService<B> {
     beacon_node: Arc<B>,
@@ -107,6 +144,10 @@ pub struct RegistrationService<B> {
     /// The [`ProposerSettings::generation`] the cache was last brought up to
     /// date against.
     signed_generation: AtomicU64,
+    /// The epoch's full send, while it runs.
+    full_send: InFlight,
+    /// The per-slot send of changed keys, while it runs.
+    changed_send: InFlight,
 }
 
 impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
@@ -122,6 +163,8 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
             known: std::sync::Mutex::new(Vec::new()),
             signed: std::sync::Mutex::new(HashMap::new()),
             signed_generation: AtomicU64::new(0),
+            full_send: InFlight::default(),
+            changed_send: InFlight::default(),
         }
     }
 
@@ -142,13 +185,15 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
             no_fee_recipient: 0,
         };
         for pubkey in pubkeys {
-            let Some(fee_recipient) = self.settings.fee_recipient(pubkey) else {
+            let Some((fee_recipient, gas_limit)) =
+                self.settings.fee_recipient_and_gas_limit(pubkey)
+            else {
                 current.no_fee_recipient += 1;
                 continue;
             };
-            let gas_limit = self.settings.gas_limit(pubkey);
 
-            if let Some(held) = signed.get(pubkey)
+            let held = signed.get(pubkey);
+            if let Some(held) = held
                 && held.message.fee_recipient == fee_recipient
                 && held.message.gas_limit == gas_limit
             {
@@ -159,7 +204,7 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
             let message = ValidatorRegistrationV1 {
                 fee_recipient,
                 gas_limit,
-                timestamp: now_secs,
+                timestamp: newer_than(held, now_secs),
                 pubkey: *pubkey,
             };
             // A key the keymanager removed since the epoch refresh is the one
@@ -232,6 +277,13 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
         if self.is_gloas(epoch) {
             return;
         }
+        let Some(_running) = self.full_send.enter() else {
+            warn!(
+                epoch,
+                "The previous builder registration send is still running; skipping this epoch's"
+            );
+            return;
+        };
         // Read before signing, so a change that lands while this runs is seen
         // by the next `register_changed` rather than lost.
         let generation = self.settings.generation();
@@ -274,6 +326,10 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
         if self.is_gloas(epoch) {
             return;
         }
+        // Silently: the change stays unsent, so the next slot picks it up.
+        let Some(_running) = self.changed_send.enter() else {
+            return;
+        };
         let generation = self.settings.generation();
         if generation == self.signed_generation.load(Ordering::Acquire) {
             return;
@@ -383,6 +439,31 @@ mod tests {
         assert_eq!(second.all[2], first.all[2], "the third is untouched");
     }
 
+    /// A relay drops a registration that is not newer than the one it holds,
+    /// so a change signed within the same second, or after the clock stepped
+    /// back, still gets a later timestamp than the registration it replaces.
+    #[test]
+    fn a_re_signed_registration_is_always_newer_than_the_last() {
+        let (store, pubkeys) = store_with_keys(1);
+        let settings = settings(Some(H160([0xab; 20])));
+        let (service, _) = service(Config::mainnet(), settings.clone());
+        let first = service.current(&store, &pubkeys, 2_000);
+        assert_eq!(first.all[0].message.timestamp, 2_000);
+
+        settings.set_gas_limit(&pubkeys[0], 30_000_000);
+        let same_second = service.current(&store, &pubkeys, 2_000);
+        assert_eq!(same_second.changed[0].message.timestamp, 2_001);
+
+        settings.set_gas_limit(&pubkeys[0], 31_000_000);
+        let stepped_back = service.current(&store, &pubkeys, 1_000);
+        assert_eq!(stepped_back.changed[0].message.timestamp, 2_002);
+
+        // Once the clock is ahead again, its reading is used.
+        settings.set_gas_limit(&pubkeys[0], 32_000_000);
+        let caught_up = service.current(&store, &pubkeys, 5_000);
+        assert_eq!(caught_up.changed[0].message.timestamp, 5_000);
+    }
+
     #[test]
     fn a_validator_without_a_fee_recipient_is_not_registered() {
         let (store, pubkeys) = store_with_keys(2);
@@ -423,6 +504,47 @@ mod tests {
             *node.registration_batches.lock().expect("lock"),
             vec![REGISTRATION_BATCH, 1]
         );
+    }
+
+    /// A full send that is still waiting on a slow node makes the next one
+    /// skip, rather than both holding the set and sending it again; once it
+    /// ends, the next one runs.
+    #[tokio::test]
+    async fn an_epoch_send_still_running_makes_the_next_one_skip() {
+        let (store, pubkeys) = store_with_keys(2);
+        let node = Arc::new(
+            MockBeaconNode::new().with_registration_delay(std::time::Duration::from_millis(300)),
+        );
+        let service = Arc::new(RegistrationService::new(
+            node.clone(),
+            context(Config::mainnet()),
+            settings(Some(H160([0xab; 20]))),
+        ));
+        let store = Arc::new(RwLock::new(store));
+
+        let slow = tokio::spawn(
+            service
+                .clone()
+                .register_all(0, pubkeys.clone(), store.clone()),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            service
+                .clone()
+                .register_all(1, pubkeys.clone(), store.clone()),
+        )
+        .await
+        .expect("skips at once rather than waiting on the node");
+        slow.await.expect("the first send ends");
+        assert_eq!(
+            *node.registration_batches.lock().expect("lock"),
+            vec![2],
+            "only the first send reached the node"
+        );
+
+        service.register_all(2, pubkeys, store).await;
+        assert_eq!(*node.registration_batches.lock().expect("lock"), vec![2, 2]);
     }
 
     #[tokio::test]

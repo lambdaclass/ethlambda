@@ -37,6 +37,7 @@ pub mod beacon_node;
 pub mod duties;
 pub mod error;
 pub mod http_api;
+pub(crate) mod in_flight;
 pub mod keys;
 pub mod metrics;
 pub mod payload_attestation;
@@ -147,6 +148,18 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
              execution-layer rewards to an address chosen by the beacon node, which is very \
              unlikely to be yours, unless that validator is given its own address through the \
              keymanager API."
+        );
+    }
+    // Accepted, as every other client's flag accepts it, but said loudly:
+    // nobody holds the zero address's key, so what it is paid is burned, and
+    // a builder registration or proposer preference signs that into a
+    // commitment the builder honours. Only the default can be zero, since the
+    // keymanager API refuses it for a single validator.
+    if config.suggested_fee_recipient == Some(ExecutionAddress::ZERO) {
+        error!(
+            "--suggested-fee-recipient is the zero address. Every validator without its own \
+             address burns its execution-layer rewards, and builder registrations and proposer \
+             preferences sign that address for the builder to pay."
         );
     }
     let settings = Arc::new(ProposerSettings::new(

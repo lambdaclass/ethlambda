@@ -299,6 +299,17 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         // a slot already proposed.
         validate_produced_block(&request, &produced)?;
 
+        // Also the implementation's contract, and checked again for the same
+        // reason. With builder proposals off this client never publishes a
+        // blinded block, so signing one would record the slot in the guard for
+        // a block that can never be sent.
+        if produced.is_blinded() && self.builder_boost_factor.is_none() {
+            return Err(Error::InconsistentResponse(format!(
+                "node produced a blinded block for slot {slot}; builder proposals are off, so \
+                 this client cannot publish one"
+            )));
+        }
+
         // The node's fork and this client's must agree, or the signature is
         // computed under a fork version the network does not accept.
         //
@@ -391,7 +402,7 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         // A blinded block counts itself on its own task (see
         // `publish_blinded`); a full one is counted here.
         let published = if blinded {
-            self.publish_blinded(slot, fork, body, duty.validator_index)
+            self.publish_blinded(slot, block_root, fork, body, duty.validator_index)
                 .await?
         } else {
             let published = self
@@ -515,6 +526,7 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
     async fn publish_blinded(
         &self,
         slot: Slot,
+        block_root: Root,
         fork: ForkName,
         body: Vec<u8>,
         validator: u64,
@@ -523,7 +535,10 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         let slot_start = self.clock.as_ref().map(|clock| clock.start_of(slot));
         let task = tokio::spawn(async move {
             let bytes = body.len();
-            match beacon_node.publish_blinded_block(slot, fork, &body).await {
+            match beacon_node
+                .publish_blinded_block(slot, block_root, fork, &body)
+                .await
+            {
                 Ok(published) => {
                     match published {
                         Published::HandedToBuilder => {
@@ -1000,6 +1015,15 @@ mod tests {
             1,
             "the publish must complete although the proposal future is gone"
         );
+
+        // The guard recorded the slot before the publish started, so a retry
+        // after the dropped future is refused without asking for a block.
+        let err = service
+            .propose(slot(), &duty(&pubkey, 7, slot()), &store)
+            .await
+            .expect_err("the slot is signed");
+        assert!(matches!(err, Error::ProposalRefused { .. }), "got {err:?}");
+        assert_eq!(node.block_requests().len(), 1);
     }
 
     /// A 4xx is a definite refusal: the block was not published, so the
@@ -1037,6 +1061,113 @@ mod tests {
         assert_eq!(published, Published::Imported);
         assert_eq!(node.block_requests()[0].builder_boost_factor, None);
         assert!(node.published_blinded.lock().expect("lock").is_empty());
+    }
+
+    /// A node breaking its contract with a blinded answer to a request with no
+    /// factor is refused before signing. With builder proposals off this client
+    /// never publishes a blinded block, so signing would burn the slot for
+    /// nothing. The second attempt is refused for the same reason rather than
+    /// by the guard, which shows nothing was recorded.
+    #[tokio::test]
+    async fn a_blinded_block_is_refused_before_signing_with_builder_proposals_off() {
+        let (store, pubkey) = store();
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_block(slot(), 7)
+                .with_blinded_block_regardless(),
+        );
+        let service = service(node.clone());
+
+        for attempt in 0..2 {
+            let err = service
+                .propose(slot(), &duty(&pubkey, 7, slot()), &store)
+                .await
+                .expect_err("a blinded block must not be signed");
+            assert!(
+                matches!(err, Error::InconsistentResponse(_)),
+                "attempt {attempt}: got {err:?}"
+            );
+        }
+        assert!(!service.signed_blinded_at(slot()));
+        assert!(node.published_blinded.lock().expect("lock").is_empty());
+        assert!(node.published_blocks().is_empty());
+    }
+
+    /// The signature in the published blinded block verifies over the full
+    /// block's root. The blinded container's root equals it, which is what lets
+    /// the relay put the payload back under a signature over a block the
+    /// validator never saw whole.
+    #[tokio::test]
+    async fn a_blinded_block_is_signed_over_the_full_blocks_root() {
+        use crate::beacon_node::block_contents::empty_block_for;
+        use blst::min_pk::{PublicKey, Signature};
+        use ethlambda_types::beacon::builder::SignedBlindedBeaconBlock;
+
+        let (store, pubkey) = store();
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_block(slot(), 7)
+                .with_blinded_block(),
+        );
+        builder_service(node.clone(), None)
+            .propose(slot(), &duty(&pubkey, 7, slot()), &store)
+            .await
+            .expect("proposes");
+
+        let (_, _, body) = node.published_blinded.lock().expect("lock").remove(0);
+        let published = SignedBlindedBeaconBlock::from_ssz_bytes(&body).expect("decodes");
+        let full_root = empty_block_for(slot(), 7).hash_tree_root();
+        assert_eq!(published.message.hash_tree_root(), full_root);
+
+        let root = context().block_signing_root(full_root, slot());
+        let pk = PublicKey::from_bytes(&pubkey.0).expect("valid pubkey");
+        let sig = Signature::from_bytes(&published.signature.0).expect("valid signature");
+        assert_eq!(
+            sig.verify(
+                true,
+                root.as_slice(),
+                b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_",
+                &[],
+                &pk,
+                true
+            ),
+            blst::BLST_ERROR::BLST_SUCCESS
+        );
+    }
+
+    /// A blinded answer is held to what a full one is: the slot and proposer
+    /// asked for, and the fork this client's schedule puts the slot in. Each
+    /// is refused before signing, so none spends the slot.
+    #[tokio::test]
+    async fn a_blinded_block_for_another_slot_proposer_or_fork_is_refused() {
+        let (store, pubkey) = store();
+        // The mock always names electra, and slot 96 is phase0 on mainnet.
+        let cases = [
+            ("slot", (slot() + 1, 7), slot()),
+            ("proposer", (slot(), 8), slot()),
+            ("fork", (96, 7), 96),
+        ];
+        for (what, (block_slot, proposer), requested) in cases {
+            let node = Arc::new(
+                MockBeaconNode::new()
+                    .with_block(block_slot, proposer)
+                    .with_blinded_block(),
+            );
+            let service = builder_service(node.clone(), None);
+            let err = service
+                .propose(requested, &duty(&pubkey, 7, requested), &store)
+                .await
+                .expect_err(what);
+            assert!(
+                matches!(err, Error::InconsistentResponse(_)),
+                "{what}: got {err:?}"
+            );
+            assert!(!service.signed_blinded_at(requested), "{what}");
+            assert!(
+                node.published_blinded.lock().expect("lock").is_empty(),
+                "{what}"
+            );
+        }
     }
 
     /// A duty naming a key this client does not hold must fail before anything

@@ -41,6 +41,8 @@ blst = "0.3.16"
 # the `impl Future + Send` bounds at every method is noise this trait does not
 # need.
 async-trait = "0.1"
+# `join_all`, so the calls every beacon node must hear reach them all at once.
+futures-util = "0.3"
 
 # EIP-2335 keystore decryption.
 scrypt = { version = "0.11", default-features = false }

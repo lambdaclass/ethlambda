@@ -1836,6 +1836,105 @@ mod builder_flow {
             );
             produced.into_signed_ssz(signature)
         }
+
+        /// Registered, a bid taken at the maximum factor, and the blinded
+        /// block signed: its root and the body to publish.
+        async fn signed_blinded(&self) -> (ethlambda_types::primitives::H256, Vec<u8>) {
+            self.register().await;
+            self.world.offer(1, |_| {});
+            let produced = self.produce(Some(u64::MAX)).await;
+            assert!(produced.is_blinded());
+            let block_root = produced.block_root();
+            (block_root, self.sign(produced).await)
+        }
+
+        async fn publish_blinded(
+            &self,
+            block_root: ethlambda_types::primitives::H256,
+            body: &[u8],
+        ) -> ethlambda_validator::Result<Published> {
+            self.client
+                .publish_blinded_block(self.world.slot, block_root, ForkName::Fulu, body)
+                .await
+        }
+    }
+
+    /// A relay refusing the block is a definite refusal at the client: the
+    /// node passes the builder's 400 through.
+    #[tokio::test]
+    async fn a_relay_refusing_the_blinded_block_is_a_definite_refusal() {
+        let world = builder_world(false, SyncStatus::Synced).await;
+        world
+            .relay
+            .answer_submissions_with(axum::http::StatusCode::BAD_REQUEST);
+        let engine = fake_execution_client_paying("0x2a", false).await;
+        let h = harness(world, engine).await;
+
+        let (block_root, body) = h.signed_blinded().await;
+        let err = h
+            .publish_blinded(block_root, &body)
+            .await
+            .expect_err("the relay refused it");
+        assert!(
+            matches!(err, Error::BeaconNodeStatus { status: 400, .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// A relay failing without saying whether it published is unconfirmed at
+    /// the client, not a missed proposal: the relay may still publish.
+    #[tokio::test]
+    async fn a_relay_failing_on_the_blinded_block_leaves_it_unconfirmed() {
+        let world = builder_world(false, SyncStatus::Synced).await;
+        world
+            .relay
+            .answer_submissions_with(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        let engine = fake_execution_client_paying("0x2a", false).await;
+        let h = harness(world, engine).await;
+
+        let (block_root, body) = h.signed_blinded().await;
+        let err = h
+            .publish_blinded(block_root, &body)
+            .await
+            .expect_err("the relay did not confirm it");
+        assert!(
+            matches!(
+                err,
+                Error::BlindedUnconfirmed {
+                    status: Some(500),
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// Once the node handed a blinded block to its builder, it refuses a
+    /// different block for the slot from the same client, as a second
+    /// signature for it would be an equivocation.
+    #[tokio::test]
+    async fn the_node_refuses_a_second_block_after_a_blinded_one() {
+        let world = builder_world(false, SyncStatus::Synced).await;
+        let engine = fake_execution_client_paying("0x2a", false).await;
+        let h = harness(world, engine).await;
+
+        let (block_root, body) = h.signed_blinded().await;
+        let published = h.publish_blinded(block_root, &body).await.expect("handed");
+        assert_eq!(published, Published::HandedToBuilder);
+
+        let full = h.produce(None).await;
+        assert!(!full.is_blinded());
+        let full = h.sign(full).await;
+        let err = h
+            .client
+            .publish_block(ForkName::Fulu, &full)
+            .await
+            .expect_err("the slot is claimed by the blinded block");
+        assert!(
+            matches!(&err, Error::BeaconNodeStatus { status: 400, body }
+                if body.contains("already published a different block")),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -1857,10 +1956,11 @@ mod builder_flow {
             "the factor must reach the node and take the bid"
         );
 
+        let block_root = produced.block_root();
         let body = h.sign(produced).await;
         let published = h
             .client
-            .publish_blinded_block(h.world.slot, ForkName::Fulu, &body)
+            .publish_blinded_block(h.world.slot, block_root, ForkName::Fulu, &body)
             .await
             .expect("the node hands the block to its builder");
         assert_eq!(published, Published::HandedToBuilder);

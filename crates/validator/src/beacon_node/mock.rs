@@ -95,11 +95,18 @@ pub struct MockBeaconNode {
     /// request with no factor still gets a full block, as the contract on
     /// `BeaconNodeApi::produce_block` requires.
     pub produces_blinded: bool,
+    /// With [`Self::produces_blinded`], answer with the blinded block even
+    /// when the request carries no factor: a node breaking the contract, so a
+    /// test can see what the caller does with one.
+    pub blinded_regardless: bool,
     /// Every registration `register_validators` received, in call order.
     pub registrations: Mutex<Vec<SignedValidatorRegistrationV1>>,
     /// The size of each `register_validators` call, in call order, so a test
     /// can see how a send was batched.
     pub registration_batches: Mutex<Vec<usize>>,
+    /// How long `register_validators` takes before it records the batch, as
+    /// a slow node would.
+    pub registration_delay: Option<std::time::Duration>,
     /// Every blinded block published, as (slot, fork, body).
     pub published_blinded: Mutex<Vec<(Slot, ForkName, Vec<u8>)>>,
     /// What `publish_blinded_block` reports. `None` is `Ok(HandedToBuilder)`;
@@ -337,10 +344,24 @@ impl MockBeaconNode {
         self
     }
 
+    /// Answer every pre-gloas `produce_block` with a blinded block, factor or
+    /// not, as a node breaking the contract on `BeaconNodeApi::produce_block`.
+    pub fn with_blinded_block_regardless(mut self) -> Self {
+        self.produces_blinded = true;
+        self.blinded_regardless = true;
+        self
+    }
+
     /// Make `publish_blinded_block` fail as a node that did not confirm the
     /// block, carrying `detail`.
     pub fn with_unconfirmed_blinded_publish(mut self, detail: &str) -> Self {
         self.blinded_publish_outcome = Some(Err(detail.to_string()));
+        self
+    }
+
+    /// Make `register_validators` take `delay` before it records the batch.
+    pub fn with_registration_delay(mut self, delay: std::time::Duration) -> Self {
+        self.registration_delay = Some(delay);
         self
     }
 
@@ -756,7 +777,9 @@ impl BeaconNodeApi for MockBeaconNode {
             failure: BeaconNodeFailure::Request,
             detail: "no block set".into(),
         })?;
-        if self.produces_blinded && request.builder_boost_factor.is_some() {
+        if self.produces_blinded
+            && (request.builder_boost_factor.is_some() || self.blinded_regardless)
+        {
             let block = ProducedBlock {
                 fork: ForkName::Electra,
                 contents: Contents::Blinded {
@@ -793,6 +816,7 @@ impl BeaconNodeApi for MockBeaconNode {
     async fn publish_blinded_block(
         &self,
         slot: Slot,
+        _block_root: Root,
         fork: ForkName,
         body: &[u8],
     ) -> Result<Published> {
@@ -832,6 +856,9 @@ impl BeaconNodeApi for MockBeaconNode {
         registrations: &[SignedValidatorRegistrationV1],
     ) -> Result<()> {
         self.guard("register_validators")?;
+        if let Some(delay) = self.registration_delay {
+            tokio::time::sleep(delay).await;
+        }
         self.registration_batches
             .lock()
             .expect("lock")

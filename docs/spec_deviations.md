@@ -747,7 +747,20 @@ the beacon node's builder and may sign a blinded block (builder-specs and
   the guard has already recorded the slot, so nothing retries. A 5xx or no
   answer is reported as unconfirmed (logged at error, counted on
   `blinded_blocks_unconfirmed_total`) and not as a missed proposal, since the
-  relay may still publish the block.
+  relay may still publish the block. The producing node is recorded with the
+  block's slot and root, and a publish for any other block is refused, as
+  Teku does; Lighthouse, Lodestar and Nimbus fail over or broadcast instead.
+  Two status codes are read the wrong way: some of ethlambda's own 500s are
+  definite (no builder configured, the block failing the node's checks) and
+  count as unconfirmed, and a proxy's 503 sent after it forwarded the request
+  counts as definite. Neither leads to a retry or a second signature.
+- **A blinded block stays signed but undelivered for longer.** The node waits
+  up to 5 s on the relay and the client up to 8 s on the node, against well
+  under a second for a full block. The publish runs on its own task so the
+  proposal budget cannot cut it off, but the process handles no signals: a
+  SIGINT in that window ends the task with the request. The record of the
+  latest blinded block (`signed_blinded_at`) is one per process, not per
+  validator, since one slot has one proposer.
 - **Registrations stop at gloas.** The client sends no `register_validator` from
   the gloas fork epoch on: the builder market works through proposer
   preferences there (see the next section), and `produceBlockV4` sends the
