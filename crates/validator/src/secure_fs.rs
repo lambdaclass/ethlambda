@@ -75,11 +75,45 @@ pub(crate) fn write_private_no_symlink(
     std::fs::write(path, contents)
 }
 
+/// Why [`write_private_durably`] failed, and whether the file had already
+/// been replaced when it did.
+#[derive(Debug)]
+pub(crate) struct DurableWriteError {
+    pub(crate) source: std::io::Error,
+    /// The rename had happened: the new file is at its path, and only the
+    /// directory flush that makes the rename survive a power loss failed.
+    /// Until the next successful flush the file on disk may be either one.
+    pub(crate) after_rename: bool,
+}
+
+impl std::fmt::Display for DurableWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.after_rename {
+            write!(
+                f,
+                "written, but the directory could not be flushed, so the write may not survive \
+                 a power loss: {}",
+                self.source
+            )
+        } else {
+            self.source.fmt(f)
+        }
+    }
+}
+
+impl std::error::Error for DurableWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// Replace the file at `path` with `contents` so that a crash or power loss
 /// leaves either the old file or the new one, never a mixture, and so that a
-/// return of `Ok` means the new one is on disk. Unix only: elsewhere the
-/// directory flush is not implemented, and the write fails rather than
-/// answer `Ok` for a rename that may not have reached the disk.
+/// return of `Ok` means the new one is on disk. An error says whether the
+/// file was already replaced when it failed (see [`DurableWriteError`]):
+/// before the rename nothing at `path` changed; after it, only the flush that
+/// makes the rename durable is missing. Unix only: elsewhere nothing is
+/// touched and the write fails up front.
 ///
 /// Written to a sibling `.tmp` created fresh at mode `0600`, flushed, renamed
 /// over `path`, and then the directory is flushed so the rename itself
@@ -91,12 +125,18 @@ pub(crate) fn write_private_no_symlink(
 /// removed, never reopened. A mode given at creation applies only at
 /// creation, so reopening a leftover would carry its mode, whatever that was,
 /// into the renamed record; and `O_EXCL` does not follow a symlink, so the
-/// write cannot be redirected through one either.
+/// write cannot be redirected through one either. A write that fails before
+/// the rename removes its temporary again, best effort.
+#[cfg(unix)]
 pub(crate) fn write_private_durably(
     path: &Path,
     contents: impl AsRef<[u8]>,
-) -> std::io::Result<()> {
+) -> Result<(), DurableWriteError> {
     use std::io::Write as _;
+    let before = |source| DurableWriteError {
+        source,
+        after_rename: false,
+    };
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".tmp");
     let temporary = path.with_file_name(name);
@@ -104,14 +144,45 @@ pub(crate) fn write_private_durably(
     match std::fs::remove_file(&temporary) {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err),
+        Err(err) => return Err(before(err)),
     }
-    let mut file = create_private(&temporary)?;
-    file.write_all(contents.as_ref())?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&temporary, path)?;
-    sync_directory(path.parent().unwrap_or(Path::new(".")))
+    let staged = (|| {
+        let mut file = create_private(&temporary)?;
+        file.write_all(contents.as_ref())?;
+        file.sync_all()
+    })()
+    .and_then(|()| std::fs::rename(&temporary, path));
+    if let Err(source) = staged {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(before(source));
+    }
+    // `Path::new("record.json").parent()` is `Some("")`, not `None`, and
+    // opening "" fails; the current directory is what it means.
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    sync_directory(directory).map_err(|source| DurableWriteError {
+        source,
+        after_rename: true,
+    })
+}
+
+/// Off unix the directory flush is not implemented, so the write is refused
+/// before anything is touched rather than answer `Ok` for a rename that may
+/// not have reached the disk.
+#[cfg(not(unix))]
+pub(crate) fn write_private_durably(
+    _path: &Path,
+    _contents: impl AsRef<[u8]>,
+) -> Result<(), DurableWriteError> {
+    Err(DurableWriteError {
+        source: std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "durable writes are only implemented on unix",
+        ),
+        after_rename: false,
+    })
 }
 
 #[cfg(unix)]
@@ -121,14 +192,6 @@ fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)
-}
-
-#[cfg(not(unix))]
-fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
         .open(path)
 }
 
@@ -158,14 +221,6 @@ fn sync_directory(directory: &Path) -> std::io::Result<()> {
         }
     });
     result
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_directory: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "flushing a directory is only implemented on unix",
-    ))
 }
 
 #[cfg(all(test, unix))]
@@ -241,6 +296,21 @@ mod tests {
             "untouched",
             "the symlink target must be untouched"
         );
+    }
+
+    /// A write that fails before the rename takes its temporary with it, and
+    /// says the file was not replaced.
+    #[test]
+    fn a_write_that_fails_before_the_rename_leaves_no_temporary() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("record");
+        std::fs::create_dir(&path).expect("a directory in the file's place");
+
+        let err = write_private_durably(&path, "x").expect_err("cannot rename over a directory");
+
+        assert!(!err.after_rename, "{err}");
+        assert!(!path.with_file_name("record.tmp").exists());
+        assert!(path.is_dir(), "the directory is untouched");
     }
 
     #[test]

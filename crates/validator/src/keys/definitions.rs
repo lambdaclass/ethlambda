@@ -63,10 +63,22 @@ impl ValidatorDefinitions {
             reason: err.to_string(),
         })?;
 
-        secure_fs::write_private_durably(&path, contents).map_err(|source| Error::Io {
-            path: path.display().to_string(),
-            source,
-        })
+        match secure_fs::write_private_durably(&path, contents) {
+            Ok(()) => Ok(()),
+            // The file is replaced and every reader, this process included,
+            // sees the new one; only its survival of a power loss is in
+            // doubt. Counting that as written keeps what this process holds
+            // equal to what is on disk, and a lost entry after a power loss
+            // only removes a key, never a watermark.
+            Err(err) if err.after_rename => {
+                tracing::warn!(path = %path.display(), %err, "Validator definitions written");
+                Ok(())
+            }
+            Err(err) => Err(Error::Io {
+                path: path.display().to_string(),
+                source: err.source,
+            }),
+        }
     }
 
     /// The entries that should be loaded and signed with.

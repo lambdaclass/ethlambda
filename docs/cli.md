@@ -270,7 +270,9 @@ implementation's, so none of the [common flags](#common-flags) apply to it.
 
 > **Slashing protection** lives in `--validators-dir/slashing_protection.json`,
 > locked to one process, so `--validators-dir` must be writable: a read-only
-> mount of the keys (a Kubernetes Secret, a `:ro` volume) fails at startup. A key with no record is refused at startup unless
+> mount of the keys (a Kubernetes Secret, a `:ro` volume) fails at startup, and
+> the directory should be a local disk, since every signature waits for the
+> record to be flushed to it. Unix only. A key with no record is refused at startup unless
 > `--init-slashing-protection` is passed. Importing another client's history is
 > not supported yet. See
 > [Spec Deviations](./spec_deviations.md#the-validator-client-keeps-eip-3076s-minimal-watermarks-not-full-history).
@@ -286,7 +288,7 @@ implementation's, so none of the [common flags](#common-flags) apply to it.
 | `--suggested-fee-recipient` | none | Execution address to receive block rewards, `0x`-prefixed, for every validator the keymanager API gives no address of its own. Optional, and startup warns when it is absent: without it the beacon node picks an address, and it will not be yours |
 | `--graffiti` | empty | Text for the graffiti field of proposed blocks, for every validator the keymanager API gives no graffiti of its own. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer. An ethlambda beacon node appends both clients' versions to it (see [`rpc.md`](rpc.md#validator-endpoints)) |
 | `--enable-keymanager` | off | Serve the keymanager API: keystores, plus each validator's own fee recipient, graffiti and gas limit. Off by default because it mutates key material |
-| `--init-slashing-protection` | off | Register every loaded key with no slashing-protection record as never having signed, instead of refusing to start. Dangerous: only for keys that have signed nothing anywhere for at least two epochs. Never lowers an existing record; remove it once the keys are registered |
+| `--init-slashing-protection` | off | Register every loaded key with no slashing-protection record as never having signed, instead of refusing to start. Dangerous: only for keys that have signed nothing anywhere for at least two epochs, and even then it rules out a double vote only, not a surround of an older vote; a key with a history should bring it instead. Never lowers an existing record; remove it once the keys are registered, and startup warns while it is set for nothing |
 
 ### What it does today
 

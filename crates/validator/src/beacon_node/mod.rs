@@ -62,6 +62,18 @@ pub fn validate_attestation_data(slot: Slot, data: &AttestationData) -> Result<(
             data.target.epoch
         )));
     }
+    // A source at or past the target is never valid outside genesis, where
+    // both are zero. Signing one would record a source the chain's justified
+    // checkpoint cannot have reached, and the record keeps it: every honest
+    // attestation afterwards would be refused as a source regression until
+    // justification caught up, or forever during non-finality.
+    if data.source.epoch >= data.target.epoch && data.target.epoch != 0 {
+        return Err(crate::error::Error::InconsistentResponse(format!(
+            "attestation data for slot {slot} carries source epoch {} at or past its target \
+             epoch {}",
+            data.source.epoch, data.target.epoch
+        )));
+    }
     Ok(())
 }
 
@@ -571,4 +583,43 @@ pub fn validate_sync_contribution(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ethlambda_types::beacon::containers::shared::Checkpoint;
+
+    fn data(slot: Slot, source: Epoch, target: Epoch) -> AttestationData {
+        AttestationData {
+            slot,
+            index: 0,
+            beacon_block_root: Root::ZERO,
+            source: Checkpoint {
+                epoch: source,
+                root: Root::ZERO,
+            },
+            target: Checkpoint {
+                epoch: target,
+                root: Root::ZERO,
+            },
+        }
+    }
+
+    /// Slot 100 is in epoch 3 on the mainnet preset.
+    #[test]
+    fn attestation_data_with_a_source_at_or_past_its_target_is_refused() {
+        assert!(validate_attestation_data(100, &data(100, 2, 3)).is_ok());
+        assert!(validate_attestation_data(100, &data(100, 0, 3)).is_ok());
+        let err = validate_attestation_data(100, &data(100, 3, 3)).expect_err("source == target");
+        assert!(err.to_string().contains("source epoch 3"), "{err}");
+        assert!(validate_attestation_data(100, &data(100, 4, 3)).is_err());
+    }
+
+    /// At genesis both checkpoints are epoch 0, and that is the one valid
+    /// shape where the source does not precede the target.
+    #[test]
+    fn genesis_attestation_data_is_accepted() {
+        assert!(validate_attestation_data(0, &data(0, 0, 0)).is_ok());
+    }
 }

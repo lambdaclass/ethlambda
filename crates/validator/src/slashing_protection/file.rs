@@ -243,9 +243,19 @@ pub(crate) fn write<'a>(
         path: path.display().to_string(),
         reason: format!("could not encode the record: {err}"),
     })?;
-    crate::secure_fs::write_private_durably(path, contents).map_err(|source| Error::Io {
-        path: path.display().to_string(),
-        source,
+    crate::secure_fs::write_private_durably(path, contents).map_err(|err| {
+        let path = path.display().to_string();
+        if err.after_rename {
+            Error::Unflushed {
+                path,
+                source: err.source,
+            }
+        } else {
+            Error::Io {
+                path,
+                source: err.source,
+            }
+        }
     })
 }
 

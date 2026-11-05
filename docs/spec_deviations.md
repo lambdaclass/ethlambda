@@ -69,6 +69,14 @@ anything that does not advance past them.
   holds for a block. An honest validator's messages otherwise advance this way,
   so nothing else is refused. Lighthouse and Prysm keep signing roots to allow
   the identical re-sign; Teku keeps the same watermarks as this client.
+- **A wedged record:** the client refuses to sign an attestation whose source
+  is at or past its target (never valid outside genesis), so a beacon node
+  cannot talk it into recording a source the chain has not justified, which
+  would refuse every honest attestation after it. Should a record still end up
+  ahead of the chain, there is no tool that lowers a watermark, by design:
+  stop the client, edit `slashing_protection.json` by hand, and start it
+  again. Lowering a watermark is only safe for a key that has not signed past
+  the value written.
 - **Keys with no record:** refused at startup. `--init-slashing-protection`
   registers them as never having signed, and a key imported through the
   keymanager API with no history is registered the same way before it is

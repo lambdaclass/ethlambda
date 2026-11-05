@@ -425,6 +425,7 @@ fn refuse_unless_safe(
         Err(err) => {
             error!(
                 %slot,
+                validator,
                 %err,
                 "Slashing protection could not {what} this block; refusing to sign"
             );

@@ -39,6 +39,16 @@
 //! - **A backward clock step or a duty schedule replaced mid-epoch**, the two
 //!   in-run shapes the in-memory guards this replaces were written for.
 //!
+//! # What it costs
+//!
+//! Every write rewrites the whole record, one compact JSON file, and flushes
+//! it and its directory: the cost of a slot's attestation batch or a block
+//! grows with the number of keys, not with the batch, and sits on the signing
+//! path, off the executor. Fine for hundreds of keys on a local disk. For
+//! thousands, or on a network volume whose flush takes tens of milliseconds
+//! or more, `ethlambda_validator_slashing_protection_write_seconds` is the
+//! number to watch, and the directory should be a local disk.
+//!
 //! It cannot see keys running in another client on another machine: no record
 //! kept here can. A key moved here from elsewhere must bring its history with
 //! it, which is why a key with no record is refused at startup unless the
@@ -339,6 +349,13 @@ impl SlashingProtection {
             );
             records.insert(*key, Record::default());
         }
+        if init && missing.is_empty() && !keys.is_empty() {
+            warn!(
+                "--init-slashing-protection is set but every key already has a record; remove \
+                 the flag, or a keystore copied into the directory later is registered with no \
+                 history without anyone noticing"
+            );
+        }
 
         if !existed || !missing.is_empty() {
             file::write(&path, genesis_validators_root, records.iter())?;
@@ -472,7 +489,12 @@ impl SlashingProtection {
 
     /// Apply `changes` to the record: written to disk first, and taken into
     /// memory only once the write has succeeded, so a failed write leaves both
-    /// exactly as they were.
+    /// as they were and nothing is signed. One failure is the exception: a
+    /// write that replaced the file but could not flush the directory
+    /// ([`Error::Unflushed`]) has the new watermarks on disk, perhaps only
+    /// until a power loss, and memory takes them too, so that what this
+    /// process holds is never weaker than what a reader of the file sees.
+    /// Nothing is signed on that path either.
     fn commit(&mut self, changes: HashMap<BlsPubkey, Record>) -> Result<()> {
         if let Some(storage) = &self.storage {
             // What the record will hold, written without copying it: every
@@ -483,8 +505,13 @@ impl SlashingProtection {
                 .filter(|(pubkey, _)| !changes.contains_key(*pubkey))
                 .chain(changes.iter());
             let _timing = crate::metrics::time_slashing_protection_write();
-            file::write(&storage.path, self.genesis_validators_root, next)
-                .inspect_err(|_| crate::metrics::inc_slashing_protection_write_failures())?;
+            if let Err(err) = file::write(&storage.path, self.genesis_validators_root, next) {
+                crate::metrics::inc_slashing_protection_write_failures();
+                if matches!(err, Error::Unflushed { .. }) {
+                    self.records.extend(changes);
+                }
+                return Err(err);
+            }
         }
         self.records.extend(changes);
         Ok(())

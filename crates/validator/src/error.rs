@@ -133,6 +133,19 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+
+    /// A durable write that replaced its file but could not flush the
+    /// directory, so the new file is what a reader sees now and may not be
+    /// what survives a power loss (see `secure_fs::DurableWriteError`).
+    #[error(
+        "{path}: written, but the directory could not be flushed, so the write may not survive a \
+         power loss: {source}"
+    )]
+    Unflushed {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 impl Error {
@@ -161,7 +174,8 @@ impl Error {
             | Self::Signing { .. }
             | Self::SlashingProtection { .. }
             | Self::SlashingProtectionUnusable { .. }
-            | Self::Io { .. } => false,
+            | Self::Io { .. }
+            | Self::Unflushed { .. } => false,
         }
     }
 }

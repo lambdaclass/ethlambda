@@ -287,7 +287,15 @@ pub async fn import(
         .map(|result| match (result, &registration) {
             (Ok((_, secret)), Ok(_)) => finish_import(&mut store, &secret),
             (Ok((pubkey, _)), Err(err)) => {
-                if known_before.contains(&pubkey) || rolled_back.is_err() {
+                if known_before.contains(&pubkey) {
+                    // Its keystore was rewritten and it stays whatever it was,
+                    // loaded since startup in the ordinary case; nothing about
+                    // it changed in memory.
+                    KeyStatus::error(format!(
+                        "keystore rewritten, but the slashing-protection record could not be \
+                         written: {err}; the key stays as it was"
+                    ))
+                } else if rolled_back.is_err() {
                     // Still on disk, not loaded now, and refused at the next
                     // start until it has a record.
                     KeyStatus::error(format!(
