@@ -11,7 +11,7 @@
 //!   are saved, together with their registration and before any is loaded, so
 //!   a key never starts signing ahead of its history and a key that failed to
 //!   import leaves none behind. A key with no history at all is registered as
-//!   of the current slot and epoch, with a warning. The history may also name
+//!   never having signed, with a warning. The history may also name
 //!   validators that are not in the request: they get records too, and a
 //!   later `DELETE` of one answers `not_active`.
 //! - `DELETE` returns the deleted keys' records as a minimal interchange,
@@ -1295,14 +1295,9 @@ mod tests {
     async fn an_imported_key_is_registered_for_slashing_protection() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = ethlambda_types::beacon::primitives::Root::ZERO;
-        let protection = crate::slashing_protection::SlashingProtection::open(
-            dir.path(),
-            root,
-            &[],
-            false,
-            None,
-        )
-        .expect("opens with no keys");
+        let protection =
+            crate::slashing_protection::SlashingProtection::open(dir.path(), root, &[], false)
+                .expect("opens with no keys");
         let mut context =
             context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
         context.protection = Arc::new(std::sync::Mutex::new(protection));
@@ -1328,7 +1323,7 @@ mod tests {
         // registered.
         drop(protection);
         let keys = ValidatorStore::load(dir.path()).expect("loads").pubkeys();
-        crate::slashing_protection::SlashingProtection::open(dir.path(), root, &keys, false, None)
+        crate::slashing_protection::SlashingProtection::open(dir.path(), root, &keys, false)
             .expect("the imported key has a record");
     }
 
@@ -1664,14 +1659,9 @@ mod tests {
             .expect("symlinks");
 
         let root = ethlambda_types::beacon::primitives::Root::ZERO;
-        let protection = crate::slashing_protection::SlashingProtection::open(
-            dir.path(),
-            root,
-            &[],
-            false,
-            None,
-        )
-        .expect("opens with no keys");
+        let protection =
+            crate::slashing_protection::SlashingProtection::open(dir.path(), root, &[], false)
+                .expect("opens with no keys");
         let mut context =
             context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
         context.protection = Arc::new(std::sync::Mutex::new(protection));
@@ -1708,7 +1698,6 @@ mod tests {
             ethlambda_types::beacon::primitives::Root::ZERO,
             &[],
             false,
-            None,
         )
         .expect("opens with no keys");
         let mut context = context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir);

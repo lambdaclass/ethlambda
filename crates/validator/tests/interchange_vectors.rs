@@ -118,8 +118,8 @@ fn run(case: &Case) -> Result<(), String> {
     }
 
     let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
-    let mut protection = SlashingProtection::open(dir.path(), root, &keys, true, None)
-        .map_err(|err| err.to_string())?;
+    let mut protection =
+        SlashingProtection::open(dir.path(), root, &keys, true).map_err(|err| err.to_string())?;
 
     for (index, step) in case.steps.iter().enumerate() {
         let imported = protection.import(&step.interchange.to_string());
