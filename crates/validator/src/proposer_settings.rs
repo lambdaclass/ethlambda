@@ -4,13 +4,15 @@
 //! The keymanager API's `feerecipient`, `graffiti` and `gas_limit` endpoints
 //! override them per key, and `DELETE` puts a key back on the defaults.
 //!
-//! # In memory only
+//! # The definitions file is the record; this is the cache
 //!
-//! Overrides are not written anywhere, so a restart puts every validator back
-//! on the defaults. Unlike an imported key, which must survive a restart or a
-//! validator silently stops signing, an override that is lost is at worst a
-//! block paying the default address or carrying the default text, and an
-//! operator driving these endpoints can re-apply them after a restart.
+//! Each override is persisted on its validator's entry in
+//! `validator_definitions.yml` (`suggested_fee_recipient`, `graffiti`,
+//! `gas_limit`, Lighthouse's layout, so a file written by either client reads
+//! in the other). The keymanager writes the file before it changes anything
+//! here, and startup seeds this from the file, so what an operator set is what
+//! the next restart runs with. An operator may also put the fields in the file
+//! by hand before starting the client.
 //!
 //! # When a change takes effect
 //!
@@ -24,7 +26,7 @@
 use std::collections::HashMap;
 use std::sync::{PoisonError, RwLock};
 
-use ethlambda_types::beacon::primitives::{BlsPubkey, Bytes32, ExecutionAddress, H256};
+use ethlambda_types::beacon::primitives::{BlsPubkey, Bytes32, ExecutionAddress, H160, H256};
 
 /// A block's graffiti field is exactly this wide.
 pub const GRAFFITI_BYTES: usize = 32;
@@ -64,18 +66,63 @@ pub fn graffiti_to_text(graffiti: &Bytes32) -> String {
 /// held so the keymanager API can serve it as the specification requires.
 pub const DEFAULT_GAS_LIMIT: u64 = 60_000_000;
 
+/// `text` as a fee recipient: `0x` and forty hex digits, the keymanager
+/// specification's `EthAddress` pattern. The zero address is refused: the
+/// specification forbids it outright, since it would read as an address
+/// chosen on purpose and pays nobody.
+pub fn fee_recipient_from_text(text: &str) -> Result<ExecutionAddress, String> {
+    let Some(digits) = text.strip_prefix("0x") else {
+        return Err("must be 0x-prefixed hex".to_string());
+    };
+    let bytes = hex::decode(digits).map_err(|err| format!("is not hex: {err}"))?;
+    let bytes: [u8; ADDRESS_BYTES] = bytes
+        .try_into()
+        .map_err(|got: Vec<u8>| format!("is {} bytes, expected {ADDRESS_BYTES}", got.len()))?;
+    if bytes == [0; ADDRESS_BYTES] {
+        return Err("is the zero address, which cannot be a fee recipient".to_string());
+    }
+    Ok(H160(bytes))
+}
+
+/// A fee recipient as the `0x`-prefixed hex the file and the API carry.
+pub fn fee_recipient_to_text(address: &ExecutionAddress) -> String {
+    format!("0x{}", hex::encode(address.0))
+}
+
+/// An execution address is exactly this wide.
+pub const ADDRESS_BYTES: usize = 20;
+
 /// One validator's overrides; `None` means the default applies.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct Overrides {
-    fee_recipient: Option<ExecutionAddress>,
-    graffiti: Option<Bytes32>,
-    gas_limit: Option<u64>,
+pub struct Overrides {
+    pub fee_recipient: Option<ExecutionAddress>,
+    pub graffiti: Option<Bytes32>,
+    pub gas_limit: Option<u64>,
 }
 
 impl Overrides {
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
+
+    /// `change` applied on top of these.
+    pub fn apply(&mut self, change: SettingChange) {
+        match change {
+            SettingChange::FeeRecipient(address) => self.fee_recipient = address,
+            SettingChange::Graffiti(graffiti) => self.graffiti = graffiti,
+            SettingChange::GasLimit(gas_limit) => self.gas_limit = gas_limit,
+        }
+    }
+}
+
+/// One change to one validator's overrides: a new value, or `None` to put
+/// that setting back on the default. One type for the three, so the
+/// keymanager's persist-then-apply step is written once rather than six times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingChange {
+    FeeRecipient(Option<ExecutionAddress>),
+    Graffiti(Option<Bytes32>),
+    GasLimit(Option<u64>),
 }
 
 #[derive(Debug)]
@@ -154,28 +201,45 @@ impl ProposerSettings {
         })
     }
 
+    /// Every override `pubkey` holds, defaults left as `None`.
+    pub fn overrides(&self, pubkey: &BlsPubkey) -> Overrides {
+        self.read(|inner| inner.overrides.get(pubkey).copied().unwrap_or_default())
+    }
+
+    /// Apply one change to `pubkey`'s overrides. The keymanager calls this
+    /// only after the same change is in the definitions file.
+    pub fn apply(&self, pubkey: &BlsPubkey, change: SettingChange) {
+        self.update(pubkey, |entry| entry.apply(change));
+    }
+
+    /// Install `pubkey`'s overrides wholesale, replacing any it had. What
+    /// startup does with each entry read from the definitions file.
+    pub fn seed(&self, pubkey: &BlsPubkey, overrides: Overrides) {
+        self.update(pubkey, |entry| *entry = overrides);
+    }
+
     pub fn set_fee_recipient(&self, pubkey: &BlsPubkey, address: ExecutionAddress) {
-        self.update(pubkey, |entry| entry.fee_recipient = Some(address));
+        self.apply(pubkey, SettingChange::FeeRecipient(Some(address)));
     }
 
     pub fn clear_fee_recipient(&self, pubkey: &BlsPubkey) {
-        self.update(pubkey, |entry| entry.fee_recipient = None);
+        self.apply(pubkey, SettingChange::FeeRecipient(None));
     }
 
     pub fn set_graffiti(&self, pubkey: &BlsPubkey, graffiti: Bytes32) {
-        self.update(pubkey, |entry| entry.graffiti = Some(graffiti));
+        self.apply(pubkey, SettingChange::Graffiti(Some(graffiti)));
     }
 
     pub fn clear_graffiti(&self, pubkey: &BlsPubkey) {
-        self.update(pubkey, |entry| entry.graffiti = None);
+        self.apply(pubkey, SettingChange::Graffiti(None));
     }
 
     pub fn set_gas_limit(&self, pubkey: &BlsPubkey, gas_limit: u64) {
-        self.update(pubkey, |entry| entry.gas_limit = Some(gas_limit));
+        self.apply(pubkey, SettingChange::GasLimit(Some(gas_limit)));
     }
 
     pub fn clear_gas_limit(&self, pubkey: &BlsPubkey) {
-        self.update(pubkey, |entry| entry.gas_limit = None);
+        self.apply(pubkey, SettingChange::GasLimit(None));
     }
 
     /// Drop every override `pubkey` holds, for a key this client no longer
@@ -274,6 +338,44 @@ mod tests {
         // Sixteen two-byte characters fill the field; seventeen do not.
         assert!(graffiti_from_text(&"ñ".repeat(16)).is_some());
         assert!(graffiti_from_text(&"ñ".repeat(17)).is_none());
+    }
+
+    #[test]
+    fn seeding_replaces_a_keys_overrides_wholesale() {
+        let settings = settings();
+        settings.set_gas_limit(&key(1), 30_000_000);
+        settings.seed(
+            &key(1),
+            Overrides {
+                fee_recipient: Some(H160([0xbb; 20])),
+                graffiti: None,
+                gas_limit: None,
+            },
+        );
+        assert_eq!(settings.fee_recipient(&key(1)), Some(H160([0xbb; 20])));
+        assert_eq!(
+            settings.gas_limit(&key(1)),
+            DEFAULT_GAS_LIMIT,
+            "an override the seed does not carry is gone"
+        );
+        settings.seed(&key(1), Overrides::default());
+        assert!(settings.read(|inner| inner.overrides.is_empty()));
+    }
+
+    #[test]
+    fn a_fee_recipient_round_trips_through_text_and_the_zero_address_is_refused() {
+        let text = format!("0x{}", "ab".repeat(ADDRESS_BYTES));
+        let address = fee_recipient_from_text(&text).expect("valid");
+        assert_eq!(address, H160([0xab; ADDRESS_BYTES]));
+        assert_eq!(fee_recipient_to_text(&address), text);
+        for bad in [
+            "ab".repeat(ADDRESS_BYTES),
+            format!("0x{}", "ab".repeat(ADDRESS_BYTES - 1)),
+            format!("0x{}", "zz".repeat(ADDRESS_BYTES)),
+            format!("0x{}", "00".repeat(ADDRESS_BYTES)),
+        ] {
+            assert!(fee_recipient_from_text(&bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

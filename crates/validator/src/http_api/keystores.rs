@@ -314,6 +314,9 @@ fn persist_import(
         voting_public_key: base.clone(),
         voting_keystore_path: keystore_path,
         voting_keystore_password_path: password_path,
+        suggested_fee_recipient: None,
+        graffiti: None,
+        gas_limit: None,
     };
     // How to put `definitions` back if the save below fails.
     //
@@ -341,10 +344,15 @@ fn persist_import(
         .iter()
         .position(|existing| existing.voting_public_key == base)
     {
-        Some(index) => Undo::Replaced {
-            index,
-            previous: std::mem::replace(&mut definitions.0[index], definition),
-        },
+        Some(index) => {
+            // A re-imported key keeps the fee recipient, graffiti and gas
+            // limit its entry held: only the keystore and password move.
+            let definition = definition.with_overrides_of(&definitions.0[index]);
+            Undo::Replaced {
+                index,
+                previous: std::mem::replace(&mut definitions.0[index], definition),
+            }
+        }
         None => {
             definitions.0.push(definition);
             Undo::Appended
@@ -718,6 +726,9 @@ mod tests {
             voting_public_key: encode_hex(&pubkey.0),
             voting_keystore_path: PathBuf::from("old.json"),
             voting_keystore_password_path: PathBuf::from("old.txt"),
+            suggested_fee_recipient: None,
+            graffiti: Some("kept".to_string()),
+            gas_limit: None,
         };
         let mut definitions = ValidatorDefinitions(vec![existing.clone()]);
 
@@ -863,6 +874,41 @@ mod tests {
             "the field is required even when empty"
         );
         assert!(store.read().await.is_empty());
+    }
+
+    /// Re-importing a key (a password rotation, or a retry) rebuilds its
+    /// entry from the new keystore; the fee recipient, graffiti and gas limit
+    /// the entry held stay on it.
+    #[tokio::test]
+    async fn a_reimported_key_keeps_its_persisted_overrides() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Arc::new(RwLock::new(ValidatorStore::new()));
+        let context = context_with_dirs(store.clone(), dir.path());
+        let app = router(context.clone(), TOKEN.to_string());
+        let import = serde_json::json!({
+            "keystores": [keystore_json()],
+            "passwords": [PASSWORD],
+        });
+
+        let (status, body) = send(
+            app.clone(),
+            authed("POST", "/eth/v1/keystores", import.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "got {body}");
+        let pubkey = store.read().await.pubkeys()[0];
+        let set = serde_json::json!({ "graffiti": "kept" });
+        let path = format!("/eth/v1/validator/{}/graffiti", encode_hex(&pubkey.0));
+        let (status, _) = send(app.clone(), authed("POST", &path, set)).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let (status, body) = send(app, authed("POST", "/eth/v1/keystores", import)).await;
+        assert_eq!(status, StatusCode::OK, "got {body}");
+        assert_eq!(body["data"][0]["status"], "imported", "got {body}");
+
+        let definitions = ValidatorDefinitions::open(dir.path()).expect("opens");
+        assert_eq!(definitions.0.len(), 1, "one entry, not a duplicate");
+        assert_eq!(definitions.0[0].graffiti.as_deref(), Some("kept"));
     }
 
     /// The regression test for the gap that let the keymanager mutate only
