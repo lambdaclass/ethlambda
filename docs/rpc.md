@@ -23,6 +23,47 @@ carry. Roots are serialized as `0x`-prefixed hex strings on both.
 
 If `--api-port` and `--metrics-port` are equal, all routers are merged onto a single port.
 
+### What the servers trust
+
+Neither server authenticates its callers. Anyone who can open a connection to
+`--api-port` or `--metrics-port` is treated as this node's operator and its
+validator client, which is why `--http-address` defaults to `127.0.0.1`. Bind
+it anywhere else only behind something that decides who may call, such as a
+firewall rule or an authenticating reverse proxy, and never expose it to the
+internet.
+
+**What the node checks for itself.** Nothing it gossips on a caller's behalf
+is taken on the caller's word. A published block's proposer signature, an
+envelope's signature and data columns, attestations, aggregates, sync committee
+messages and contributions, slashings, exits, BLS changes, payload attestations,
+builder bids and proposer preferences are all checked against the chain,
+signatures included, before they reach the network; a failure is a `400`. A
+caller cannot make this node publish what its peers would refuse.
+
+**What it takes on the caller's word.** These carry no signature to check, or
+one the node does not check:
+
+- **Where a validator's execution rewards go.**
+  `POST /eth/v1/validator/prepare_beacon_proposer` sets the fee recipient of
+  any validator index, and `POST /eth/v1/validator/register_validator` sets it
+  for any registered key, for the blocks this node builds. A builder
+  registration is signed, but the node does not verify the signature (neither
+  does Lighthouse): it forwards the registration to `--builder`, which does,
+  and sets the fee recipient whatever the builder answers. A caller can
+  therefore redirect a validator's rewards from locally built blocks until the
+  validator client sends its own again, which validator clients normally do
+  every epoch.
+- **Which subnets the node joins.**
+  `POST /eth/v1/validator/beacon_committee_subscriptions` and
+  `/sync_committee_subscriptions` join gossip subnets on request, which costs
+  bandwidth and CPU until the subscription ends.
+- **When the node builds a block.** Every block production request has the
+  execution client build a payload.
+- **On a lean node, who aggregates.** `POST /lean/v0/admin/aggregator` switches
+  the aggregator role on or off.
+- **On the metrics server, heap profiles.** `/debug/pprof/allocs` and its
+  flamegraph take a jemalloc heap profile, where profiling is enabled.
+
 ## API Server (`:5052`)
 
 | Method | Path | Response | Description |
