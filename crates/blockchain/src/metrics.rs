@@ -1542,12 +1542,62 @@ pub fn set_sidecars_awaiting_parent(count: u64) {
     LEAN_SIDECARS_AWAITING_PARENT.set(count as i64);
 }
 
+/// `engine_newPayload` requests in flight right now, and payloads (blocks
+/// before gloas, envelopes from it) imported and still waiting for an
+/// answer, in flight or not.
+///
+/// The second is bounded by `MAX_PAYLOADS_AWAITING_VERDICT`; sitting at that
+/// bound means imports are being held for room, which is expected during
+/// catch-up and nowhere else.
+pub fn set_new_payloads(in_flight: usize, awaiting_verdict: usize) {
+    static LEAN_ENGINE_NEW_PAYLOAD_IN_FLIGHT: std::sync::LazyLock<IntGauge> =
+        std::sync::LazyLock::new(|| {
+            register_int_gauge!(
+                "lean_engine_new_payload_in_flight",
+                "engine_newPayload requests sent and not yet answered"
+            )
+            .unwrap()
+        });
+    static LEAN_ENGINE_PAYLOADS_AWAITING_VERDICT: std::sync::LazyLock<IntGauge> =
+        std::sync::LazyLock::new(|| {
+            register_int_gauge!(
+                "lean_engine_payloads_awaiting_verdict",
+                "Imported payloads the execution client has not answered for yet"
+            )
+            .unwrap()
+        });
+    LEAN_ENGINE_NEW_PAYLOAD_IN_FLIGHT.set(in_flight as i64);
+    LEAN_ENGINE_PAYLOADS_AWAITING_VERDICT.set(awaiting_verdict as i64);
+}
+
+/// One answer to an asynchronous `engine_newPayload`, by what was asked about
+/// (`block` before gloas, `envelope` from it) and how it was answered
+/// (`valid`, `optimistic`, `invalid`, `reverted`, `no_answer`, `stale`).
+pub fn inc_new_payload_answer(kind: &str, outcome: &str) {
+    static LEAN_ENGINE_NEW_PAYLOAD_ANSWERS_TOTAL: std::sync::LazyLock<IntCounterVec> =
+        std::sync::LazyLock::new(|| {
+            register_int_counter_vec!(
+                "lean_engine_new_payload_answers_total",
+                "Answers to engine_newPayload requests sent without waiting, by kind and outcome",
+                &["kind", "outcome"]
+            )
+            .unwrap()
+        });
+    LEAN_ENGINE_NEW_PAYLOAD_ANSWERS_TOTAL
+        .with_label_values(&[kind, outcome])
+        .inc();
+}
+
 /// Blocks not imported because no execution client verdict was obtained.
 ///
 /// A non-zero rate here means the follower is dropping blocks it cannot ask
 /// about, and its head will park behind the first one. Nothing re-drives a
 /// given-up call, so this is the metric that says the follower has stopped
 /// following rather than merely slowed down.
+///
+/// With answers taken asynchronously (the running actor's path) a payload
+/// already imported is kept and asked about again each slot instead, and this
+/// counts those failed asks.
 pub fn inc_engine_no_verdict() {
     static LEAN_ENGINE_NO_VERDICT_TOTAL: std::sync::LazyLock<IntCounter> =
         std::sync::LazyLock::new(|| {
