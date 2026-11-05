@@ -9,6 +9,23 @@
 //! execution client could verify, and the fee recipient and the payment to the
 //! proposer, see [`validate`]) is trusted to the relay, as every client does:
 //! the payload is revealed only after the proposer signs.
+//!
+//! The bid's signature is checked against the key the bid itself names, so it
+//! proves the bid arrived as some key signed it, not that a builder the
+//! operator chose sent it. That catches a bid corrupted on the way and an
+//! honest endpoint's mistakes. It does not stop the endpoint itself, or a
+//! man in the middle on a plain-HTTP `--builder`, from changing a bid and
+//! signing it again with a key of its own. Nothing here pins the builder's
+//! key, and no client reviewed does by default: Lighthouse
+//! (`SignedBuilderBid::verify_signature`, `types/src/builder/builder_bid.rs:196`),
+//! Teku (`BuilderBidValidatorImpl.java:58`), Prysm
+//! (`validateBuilderSignature`, `proposer_bellatrix.go:321`) and Nimbus
+//! (`block_payloads.nim:649`) all verify against the bid's own `pubkey`, and
+//! Lodestar (`execution/builder/http.ts:186`) does not verify it at all. The
+//! endpoint is trusted, as MEV-Boost is: one that lies can win the comparison
+//! with a value it never pays or withhold the payload, and either way costs
+//! the proposer the slot's reward, though the checks above hold whoever
+//! signed the bid.
 
 use ethlambda_state_transition::beacon::block_production::PayloadInputs;
 use ethlambda_state_transition::beacon::bls;
@@ -69,6 +86,10 @@ impl Rejection {
 /// Whether `bid` is acceptable for the proposal `context` describes.
 /// Cheap checks first; the signature, the one that costs a pairing, last.
 ///
+/// The signature is verified against `bid.message.pubkey`, the key the bid
+/// names, so it is an integrity check against an endpoint that is not
+/// adversarial, not an authentication of the builder (see the module doc).
+///
 /// The bid's fork label is not checked here: an electra bid at a fulu slot is
 /// accepted on purpose (the containers are identical, so a lagging relay's bid
 /// stays usable), and `BuilderClient` already refuses every other fork. Nor is
@@ -125,6 +146,9 @@ pub(crate) fn validate(bid: &SignedBuilderBid, context: &BidContext) -> Result<(
     // signs. The relay checks it, when it validates the builder's submission
     // on an execution node before serving the bid. See
     // `docs/spec_deviations.md`.
+    //
+    // Against the key the bid names: whoever can rewrite the bid can sign it
+    // again under a key of its own (see the module doc).
     let domain = compute_builder_domain(context.genesis_fork_version);
     let root = compute_signing_root(message.hash_tree_root(), domain);
     if !bls::verify(&message.pubkey, root, &bid.signature) {

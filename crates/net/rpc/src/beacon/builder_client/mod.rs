@@ -16,13 +16,16 @@
 //!
 //! Redirects are not followed unless `--builder-follow-redirects` asks for
 //! it, so the node sends registrations and signed blocks only to the URL the
-//! operator named. A refused redirect is an error naming its target.
+//! operator named. Even then only a 307 or 308 is followed, up to ten hops
+//! and never from https to http (see `follows`). A redirect not followed is
+//! an error naming its target.
 //!
 //! `status` is a liveness probe the node calls once at startup.
 //!
 //! Every call is timed into `lean_beacon_builder_request_seconds`, by call
 //! and outcome.
 
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -33,9 +36,9 @@ use ethlambda_types::beacon::builder::{
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{BlsPubkey, ExecutionBlockHash, Slot};
 use libssz::{SszDecode as _, SszEncode as _};
-use reqwest::StatusCode;
 use reqwest::header::{self, HeaderMap};
 use reqwest::redirect::Policy;
+use reqwest::{StatusCode, Url};
 use tracing::info;
 
 use crate::metrics::observe_builder_request;
@@ -73,8 +76,16 @@ const SUBMIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// `status` is a liveness probe; a builder that takes longer is not ready.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The most redirects one call follows with `--builder-follow-redirects`,
+/// which is reqwest's own default cap.
+const MAX_REDIRECTS: usize = 10;
+
 /// A builder API endpoint: a relay, or MEV-Boost in front of several.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is written out rather than derived: `base_url` may carry basic
+/// auth credentials from `--builder`, and a client logged with `{:?}` must
+/// not print them.
+#[derive(Clone)]
 pub struct BuilderClient {
     base_url: String,
     http: reqwest::Client,
@@ -106,13 +117,14 @@ impl BuilderClient {
         Self::with_redirects(base_url, header_timeout, user_agent, false)
     }
 
-    /// [`new`](Self::new), but following up to ten redirects (reqwest's
-    /// default) when `follow_redirects` is set.
+    /// [`new`](Self::new), but following a 307 or 308 redirect, up to ten
+    /// of them and never from https to http, when `follow_redirects` is set
+    /// (see `follows`).
     ///
     /// Without it every call goes exactly where `base_url` points. A redirect
-    /// fails the call as [`BuilderError::Redirected`], which names the target,
-    /// rather than carrying registrations or a signed block somewhere
-    /// `--builder` does not name.
+    /// not followed fails the call as [`BuilderError::Redirected`], which
+    /// names the target, rather than carrying registrations or a signed block
+    /// somewhere `--builder` does not name.
     pub fn with_redirects(
         base_url: impl Into<String>,
         header_timeout: Duration,
@@ -122,7 +134,17 @@ impl BuilderClient {
         let base_url = base_url.into();
         Self::check_url(&base_url)?;
         let redirects = if follow_redirects {
-            Policy::default()
+            // `stop`, never `error`: a stopped redirect comes back as the 3xx
+            // response itself, which `from_status` turns into `Redirected`
+            // naming its target, where an error would surface as a bare
+            // transport failure.
+            Policy::custom(|attempt| {
+                if follows(attempt.status(), attempt.url(), attempt.previous()) {
+                    attempt.follow()
+                } else {
+                    attempt.stop()
+                }
+            })
         } else {
             Policy::none()
         };
@@ -349,6 +371,47 @@ impl BuilderClient {
     }
 }
 
+impl fmt::Debug for BuilderClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let base_url = Url::parse(&self.base_url)
+            .ok()
+            .and_then(error::without_credentials)
+            .map_or_else(|| "<unparsable>".to_owned(), String::from);
+        f.debug_struct("BuilderClient")
+            .field("base_url", &base_url)
+            .field("header_timeout", &self.header_timeout)
+            .field("json_only", &self.json_only.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+/// Whether `--builder-follow-redirects` follows a redirect answered with
+/// `status` to `next`, after the chain of URLs `previous` (the first of which
+/// is the URL the call started at).
+///
+/// - Only a 307 or 308. reqwest turns a POST answered with a 301, 302 or 303
+///   into a GET without its body before asking, and does not say which
+///   method the request had, so following one would send `registerValidator`
+///   or `submitBlindedBlockV2` on as an empty GET. Those three are not
+///   followed for any call, GETs included.
+/// - Never from https to http, which would send registrations or a signed
+///   block in the clear after the operator chose TLS.
+/// - Only to http or https, the only schemes reqwest follows: it fails a call
+///   told to follow any other as a transport error, which would not name the
+///   target.
+/// - At most [`MAX_REDIRECTS`] hops, as reqwest's default policy: a custom
+///   policy catches no loop on its own.
+fn follows(status: StatusCode, next: &Url, previous: &[Url]) -> bool {
+    let keeps_method = matches!(
+        status,
+        StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT
+    );
+    let downgrade =
+        next.scheme() == "http" && previous.last().is_some_and(|url| url.scheme() == "https");
+    let followable = matches!(next.scheme(), "http" | "https");
+    keeps_method && !downgrade && followable && previous.len() <= MAX_REDIRECTS
+}
+
 /// A bid, decoded by the response's own `Content-Type`.
 async fn decode_bid(
     response: reqwest::Response,
@@ -404,26 +467,37 @@ pub(super) async fn read_body(
     Ok(body)
 }
 
-/// `text` on one line, its line breaks written out as `\n` and `\r`, then cut
-/// to at most [`MAX_ERROR_TEXT`] bytes at a char boundary.
+/// `text` with every character that could break or restyle a line written
+/// out, cut to at most [`MAX_ERROR_TEXT`] bytes.
 ///
 /// A builder's text reaches this node's logs and a validator client's error
-/// message, where a raw line break would start what reads as a log line of
-/// its own.
+/// message. There a raw line break would start what reads as a log line of
+/// its own, and an ESC would start an ANSI sequence that recolors, moves the
+/// cursor in or clears a terminal. So every control character
+/// (`char::is_control`: C0, DEL and C1) and the Unicode line and paragraph
+/// separators U+2028/U+2029, which some viewers break lines at, are written
+/// as Rust escapes: `\n`, `\r` and `\t`, and `\u{1b}` for the rest. Everything
+/// else passes through unchanged, quotes and backslashes included.
+///
+/// The cap is applied to the escaped text, and never cuts a character or an
+/// escape in two.
 pub(super) fn error_text(text: String) -> String {
-    let mut text = if text.contains(['\n', '\r']) {
-        text.replace('\n', "\\n").replace('\r', "\\r")
-    } else {
-        text
-    };
-    if text.len() > MAX_ERROR_TEXT {
-        let mut end = MAX_ERROR_TEXT;
-        while !text.is_char_boundary(end) {
-            end -= 1;
+    let mut written = String::with_capacity(text.len().min(MAX_ERROR_TEXT));
+    for c in text.chars() {
+        if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+            let escaped = c.escape_default();
+            if written.len() + escaped.len() > MAX_ERROR_TEXT {
+                break;
+            }
+            written.extend(escaped);
+        } else {
+            if written.len() + c.len_utf8() > MAX_ERROR_TEXT {
+                break;
+            }
+            written.push(c);
         }
-        text.truncate(end);
     }
-    text
+    written
 }
 
 /// The fork `version` names, if its bids have the shape [`SignedBuilderBid`]

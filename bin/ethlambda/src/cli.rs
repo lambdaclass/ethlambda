@@ -316,9 +316,13 @@ pub(crate) struct MainnetOptions {
     #[arg(long, value_parser = parse_builder_url)]
     pub(crate) builder: Option<String>,
 
-    /// Follow HTTP redirects from the builder. Off by default, so registrations
-    /// and signed blocks go only to the URL `--builder` names: a redirect fails
-    /// the call, with an error naming where it pointed.
+    /// Follow the builder's 307 and 308 redirects, up to ten per call and
+    /// never from https to http. A 301, 302 or 303 is not followed even then:
+    /// following one resends a POST as a GET without its body.
+    ///
+    /// Off by default, so registrations and signed blocks go only to the URL
+    /// `--builder` names. A redirect not followed fails the call, with an
+    /// error naming where it pointed.
     #[arg(long, requires = "builder")]
     pub(crate) builder_follow_redirects: bool,
 
