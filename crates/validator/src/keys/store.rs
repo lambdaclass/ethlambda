@@ -280,6 +280,9 @@ mod tests {
             voting_public_key: "0x9612d7a727c9d0a22e185a1c768478dfe919cada9266988cb32359c11f2b7b27f4ae4040902382ae2910c15e2b420d07".to_string(),
             voting_keystore_path: PathBuf::from("keystore.json"),
             voting_keystore_password_path: PathBuf::from("password.txt"),
+            suggested_fee_recipient: None,
+            graffiti: None,
+            gas_limit: None,
         }]);
         definitions.save(dir.path()).expect("saves definitions");
 
@@ -306,6 +309,9 @@ mod tests {
             voting_public_key: voting_public_key.to_string(),
             voting_keystore_path: PathBuf::from("keystore.json"),
             voting_keystore_password_path: PathBuf::from("password.txt"),
+            suggested_fee_recipient: None,
+            graffiti: None,
+            gas_limit: None,
         }])
         .save(dir)
         .expect("saves definitions");
