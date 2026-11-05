@@ -286,6 +286,50 @@ implementation's, so none of the [common flags](#common-flags) apply to it.
 | `--graffiti` | empty | Text for the graffiti field of proposed blocks, for every validator the keymanager API gives no graffiti of its own. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer. An ethlambda beacon node appends both clients' versions to it (see [`rpc.md`](rpc.md#validator-endpoints)) |
 | `--enable-keymanager` | off | Serve the keymanager API: keystores, plus each validator's own fee recipient, graffiti and gas limit. Off by default because it mutates key material |
 
+### `validator exit`: leaving the validator set
+
+`ethlambda validator exit` signs a voluntary exit for one validator and hands
+it to a beacon node, which validates it against its head and gossips it. It
+takes only its own flags; none of the client's flags above apply to it.
+
+```sh
+ethlambda validator exit \
+  --keystore ~/validators/0xabc.../voting-keystore.json \
+  --password-file ~/secrets/0xabc... \
+  --beacon-node http://localhost:5052
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--keystore` | required | The validator's EIP-2335 voting keystore |
+| `--password-file` | required | The file holding that keystore's password. A trailing newline is ignored |
+| `--beacon-node` | `http://localhost:5052` | Base URL of the beacon node's HTTP API. One node, not a list: this is a one-shot command, and an operator whose node is down picks another |
+| `--epoch` | the current epoch | The exit's epoch. A later one only makes sense with `--presign`, since a node refuses an exit whose epoch has not come |
+| `--presign` | off | Sign the exit and print it as JSON on stdout without publishing it, for an operator who wants to hold a signed exit for later. Logs go to stderr, so the JSON pipes cleanly into a file |
+| `--no-confirmation` | off | Publish without asking for the confirmation phrase. For scripts; use with care |
+| `--no-wait` | off | Return as soon as the beacon node has accepted the exit, without waiting for the chain to process it |
+
+**A voluntary exit is irreversible.** Once the chain processes it the
+validator is queued to leave, stops earning after its exit epoch, and the key
+can never validate again. So before publishing anything the command refuses a
+beacon node that is still syncing, refuses a validator the chain would refuse
+(one that is not `active_ongoing`, or not yet `SHARD_COMMITTEE_PERIOD` epochs
+past its activation, naming the epoch it becomes eligible at), and then prints
+a warning and asks for the phrase `Exit my validator` on stdin. Anything else
+aborts without publishing.
+
+After publishing, unless `--no-wait` is given, it polls the validator's status
+once a slot. When the chain reports `active_exiting` it prints the current,
+exit and withdrawable epochs and how long until the exit epoch, and returns;
+**keep the validator running until that epoch**, since it still has duties
+until then. A validator already `exited_unslashed` or `exited_slashed` is
+reported as such.
+
+From deneb on, exits are signed under `CAPELLA_FORK_VERSION` whatever their
+epoch (EIP-7044), so a pre-signed exit stays valid across every fork to come.
+The command signs that way, and the keymanager API's `voluntary_exit` route
+below does too.
+
 ### What it does today
 
 Attestations, block proposals and attestation aggregation, and from gloas on
@@ -405,7 +449,16 @@ Off unless `--enable-keymanager` is passed. It serves `GET`, `POST` and
 if absent. The token file is written `0600` and a file too short to be a real
 token is refused rather than accepted.
 
-It also serves `GET`, `POST` and `DELETE` on
+It also serves `POST /eth/v1/validator/{pubkey}/voluntary_exit`, which signs a
+voluntary exit for a validator this client holds and answers with the
+`SignedVoluntaryExit`, for the exit's `epoch` query parameter or the current
+epoch when none is given. **It does not publish the exit.** As the
+specification has it, the caller hands the message to a beacon node's
+`POST /eth/v1/beacon/pool/voluntary_exits`, or holds on to it. The validator
+index comes from the beacon node on each call, so a key whose deposit the chain
+has not processed yet is a `404` saying so.
+
+And it serves `GET`, `POST` and `DELETE` on
 `/eth/v1/validator/{pubkey}/feerecipient`, `/graffiti` and `/gas_limit`, which
 give one validator its own value in place of the command line's default:
 

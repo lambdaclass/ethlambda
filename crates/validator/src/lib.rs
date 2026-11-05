@@ -36,6 +36,7 @@ pub mod attestation_guard;
 pub mod beacon_node;
 pub mod duties;
 pub mod error;
+pub mod exit;
 pub mod http_api;
 pub mod keys;
 pub mod metrics;
@@ -212,6 +213,9 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             validators_dir: config.validators_dir.clone(),
             secrets_dir: config.secrets_dir.clone(),
             definitions_lock: Arc::new(Mutex::new(())),
+            beacon_node: beacon_node.clone(),
+            signing: context.clone(),
+            clock: clock.clone(),
         };
         let router = http_api::router(context, token);
         let listener = tokio::net::TcpListener::bind(address)
