@@ -41,6 +41,7 @@ use ethlambda_validator::{
         },
         http::HttpBeaconNode,
     },
+    exit::{ExitOptions, Outcome, run_with as run_exit},
     keys::ValidatorStore,
     signing::SigningContext,
     sync_committee::{SyncCommitteeService, subnets_of},
@@ -194,6 +195,87 @@ fn keys_for(state: &BeaconState, indices: &[u64]) -> RwLock<ValidatorStore> {
         );
     }
     RwLock::new(keys)
+}
+
+/// `ethlambda validator exit`, end to end: the client's own lookup of the
+/// validator, its signature, and this node's pool endpoint. The fixture's
+/// validators are all active since epoch 0 and the wall epoch is far past
+/// `SHARD_COMMITTEE_PERIOD`, so the node's gossip rules accept the exit.
+#[tokio::test]
+async fn the_validator_client_can_exit_a_validator_through_this_node() {
+    use ethlambda_types::beacon::{
+        containers::shared::{SignedVoluntaryExit, VoluntaryExit},
+        operation::BeaconOperation,
+    };
+
+    let (client, state, network) = serve().await;
+    let pubkey = state.validator(0).unwrap().pubkey;
+
+    let details = client
+        .validator(&pubkey)
+        .await
+        .expect("the node answers")
+        .expect("validator 0 is in the state");
+    assert_eq!(details.index, 0);
+    assert_eq!(details.status, "active_ongoing");
+    assert_eq!(
+        details.activation_epoch,
+        state.validator(0).unwrap().activation_epoch
+    );
+    assert_eq!(details.exit_epoch, state.validator(0).unwrap().exit_epoch);
+    assert!(
+        client
+            .validator(&BlsPubkey([9; 48]))
+            .await
+            .expect("a 404 is an answer, not an error")
+            .is_none(),
+        "a key the chain does not know is None"
+    );
+
+    // The whole command, minus the prompt, against this node over the socket.
+    let keys = {
+        let mut store = ValidatorStore::new();
+        store
+            .insert_secret("test", &secret_key_for(0).to_bytes())
+            .expect("valid key");
+        store
+    };
+    let options = ExitOptions {
+        no_confirmation: true,
+        no_wait: true,
+        ..ExitOptions::default()
+    };
+    let mut no_input = std::io::empty();
+    let mut no_input = std::io::BufReader::new(&mut no_input);
+    let outcome = run_exit(&client, &keys, pubkey, &options, &mut no_input)
+        .await
+        .expect("the node accepts the exit");
+    assert_eq!(outcome, Outcome::Published { accepted: None });
+
+    let published = network.operations.lock().unwrap().clone();
+    let [BeaconOperation::VoluntaryExit(exit)] = published.as_slice() else {
+        panic!("expected one published exit, got {published:?}");
+    };
+    assert_eq!(exit.message.validator_index, 0);
+    assert_eq!(exit.message.epoch, compute_epoch_at_slot(state.slot()));
+
+    // A refusal comes back as the node's 400 with its reason, not as a
+    // transport failure.
+    let forged = SignedVoluntaryExit {
+        message: VoluntaryExit {
+            epoch: exit.message.epoch,
+            validator_index: 1,
+        },
+        signature: exit.signature,
+    };
+    let err = client
+        .submit_voluntary_exit(&forged)
+        .await
+        .expect_err("validator 0's signature does not cover validator 1's exit");
+    assert!(
+        matches!(&err, Error::BeaconNodeStatus { status: 400, body } if body.contains("voluntary exit")),
+        "got {err:?}"
+    );
 }
 
 /// One slot of an attester's work, in the order `ethlambda validator` does it.

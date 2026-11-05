@@ -105,10 +105,18 @@ fn main() -> eyre::Result<()> {
             init_info_stderr_logging()?;
             era::run(options)
         }
-        Command::Validator(options) => {
-            init_node_logging()?;
-            validator::run(options)
-        }
+        Command::Validator(mut options) => match options.command.take() {
+            // A one-shot command whose stdout may carry a pre-signed exit, so
+            // its logs go to stderr like keygen's.
+            Some(validator::ValidatorCommand::Exit(exit)) => {
+                init_info_stderr_logging()?;
+                validator::exit(exit)
+            }
+            None => {
+                init_node_logging()?;
+                validator::run(options)
+            }
+        },
         // Key generation is synchronous, CPU-bound work whose product is files,
         // so it runs on this thread too and leaves stdout alone.
         Command::Keygen(options) => {

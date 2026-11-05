@@ -83,6 +83,10 @@ pub enum Error {
     ProposalRefused { slot: u64, reason: String },
     #[error("beacon node returned an inconsistent response: {0}")]
     InconsistentResponse(String),
+    /// `ethlambda validator exit` refused to sign: the chain would refuse the
+    /// exit too, for the reason given. Deterministic, like a proposal refusal.
+    #[error("voluntary exit refused: {0}")]
+    ExitRefused(String),
     #[error("malformed response: {0}")]
     Decode(String),
 
@@ -131,6 +135,7 @@ impl Error {
             // A refusal is deterministic: the guard will refuse the same slot
             // again, so retrying only repeats it.
             Self::ProposalRefused { .. }
+            | Self::ExitRefused(_)
             | Self::Keystore { .. }
             | Self::KeystoreVersion(_)
             | Self::KeystoreBadPassword

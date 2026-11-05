@@ -1,37 +1,51 @@
-//! `ethlambda validator`: the beacon-chain validator client.
+//! `ethlambda validator`: the beacon-chain validator client, and
+//! `ethlambda validator exit`, which signs and publishes one validator's
+//! voluntary exit.
 //!
-//! It talks to a beacon node over the standard REST Beacon API and depends on
-//! nothing else in this binary, so it runs against any conformant node.
+//! Both talk to a beacon node over the standard REST Beacon API and depend on
+//! nothing else in this binary, so they run against any conformant node.
 
 use std::path::PathBuf;
 
 use ethlambda_types::beacon::primitives::{Bytes32, ExecutionAddress, H160};
 use ethlambda_validator::ValidatorConfig;
+use ethlambda_validator::exit::{self, CONFIRMATION_PHRASE, ExitConfig, Outcome};
 use ethlambda_validator::proposer_settings::{GRAFFITI_BYTES, graffiti_from_text};
 
 /// An execution address is exactly this wide.
 const ADDRESS_BYTES: usize = 20;
 
+// The three required flags are `Option`s that clap still marks `required`.
+// `subcommand_negates_reqs` on `Command::Validator` lets `validator exit` omit
+// them, and clap's derive builds this struct for that invocation too, which a
+// plain `PathBuf` field refuses with its own "required argument was not
+// provided". Clap still refuses a client run without them, so `None` never
+// reaches [`run`]; [`ValidatorOptions::required`] says so rather than unwrap.
 #[derive(Debug, clap::Args)]
 pub(crate) struct ValidatorOptions {
+    /// `None` runs the client. See `Command::Validator` for why the client's
+    /// required flags are not demanded of, nor accepted beside, a sub-command.
+    #[command(subcommand)]
+    pub(crate) command: Option<ValidatorCommand>,
+
     /// Base URL(s) of the beacon node's HTTP API (e.g. http://localhost:5052).
     ///
     /// Several may be supplied, comma-separated or by repeating the flag. They
     /// are tried in order and the first that answers is used, so the order is
     /// a preference, not a load-balancing policy.
     #[arg(long, value_delimiter = ',', required = true)]
-    pub(crate) beacon_nodes: Vec<String>,
+    pub(crate) beacon_nodes: Option<Vec<String>>,
 
     /// Directory holding the EIP-2335 keystores and `validator_definitions.yml`.
     /// Without that file, keystores in the Lighthouse layout
     /// (`<0xpubkey>/voting-keystore.json`, password in
     /// `--secrets-dir/<0xpubkey>`) are discovered and the file is written.
-    #[arg(long)]
-    pub(crate) validators_dir: PathBuf,
+    #[arg(long, required = true)]
+    pub(crate) validators_dir: Option<PathBuf>,
 
     /// Directory holding one password file per keystore.
-    #[arg(long)]
-    pub(crate) secrets_dir: PathBuf,
+    #[arg(long, required = true)]
+    pub(crate) secrets_dir: Option<PathBuf>,
 
     /// Bind address for the metrics and keymanager servers.
     #[arg(long, default_value = "127.0.0.1")]
@@ -80,7 +94,66 @@ pub(crate) struct ValidatorOptions {
     pub(crate) enable_keymanager: bool,
 }
 
+/// What `ethlambda validator` can do besides run as a client.
+#[derive(Debug, clap::Subcommand)]
+pub(crate) enum ValidatorCommand {
+    /// Sign a voluntary exit for one validator and publish it to a beacon node.
+    ///
+    /// Irreversible once the chain processes it. Asks for a confirmation phrase
+    /// before publishing unless --no-confirmation is given.
+    Exit(ExitOptions),
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct ExitOptions {
+    /// Path to the validator's EIP-2335 voting keystore.
+    #[arg(long)]
+    pub(crate) keystore: PathBuf,
+
+    /// Path to the file holding the keystore's password.
+    #[arg(long)]
+    pub(crate) password_file: PathBuf,
+
+    /// Base URL of the beacon node's HTTP API.
+    #[arg(long, default_value = "http://localhost:5052")]
+    pub(crate) beacon_node: String,
+
+    /// The exit's epoch. Defaults to the current one. A later epoch only makes
+    /// sense with --presign, since a node refuses an exit whose epoch has not
+    /// come.
+    #[arg(long)]
+    pub(crate) epoch: Option<u64>,
+
+    /// Sign the exit and print it as JSON on stdout without publishing it.
+    #[arg(long, default_value = "false")]
+    pub(crate) presign: bool,
+
+    /// Publish without asking for the confirmation phrase. Use with care.
+    #[arg(long, default_value = "false")]
+    pub(crate) no_confirmation: bool,
+
+    /// Return as soon as the beacon node has accepted the exit, without
+    /// waiting for the chain to process it.
+    #[arg(long, default_value = "false")]
+    pub(crate) no_wait: bool,
+}
+
 impl ValidatorOptions {
+    /// The flags clap requires of a client run, which only `validator exit`
+    /// may omit (see the struct's comment). A `None` here is a bug in the
+    /// command-line wiring, reported as such rather than unwrapped.
+    fn required(self) -> eyre::Result<(Vec<String>, PathBuf, PathBuf)> {
+        match (self.beacon_nodes, self.validators_dir, self.secrets_dir) {
+            (Some(beacon_nodes), Some(validators_dir), Some(secrets_dir)) => {
+                Ok((beacon_nodes, validators_dir, secrets_dir))
+            }
+            _ => eyre::bail!(
+                "--beacon-nodes, --validators-dir and --secrets-dir are required to run the \
+                 validator client"
+            ),
+        }
+    }
+
     /// The graffiti bytes, or an error naming the limit if the text is too
     /// long.
     ///
@@ -144,19 +217,49 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
     options.validate_ports()?;
     let graffiti = options.graffiti()?;
     let suggested_fee_recipient = options.suggested_fee_recipient()?;
+    let metrics = std::net::SocketAddr::new(options.http_address, options.metrics_port);
+    let keymanager = options
+        .enable_keymanager
+        .then(|| std::net::SocketAddr::new(options.http_address, options.keymanager_port));
+    let (beacon_nodes, validators_dir, secrets_dir) = options.required()?;
     ethlambda_validator::run(ValidatorConfig {
-        beacon_nodes: options.beacon_nodes,
+        beacon_nodes,
         graffiti,
         suggested_fee_recipient,
-        validators_dir: options.validators_dir,
-        secrets_dir: options.secrets_dir,
-        metrics: std::net::SocketAddr::new(options.http_address, options.metrics_port),
-        keymanager: options
-            .enable_keymanager
-            .then(|| std::net::SocketAddr::new(options.http_address, options.keymanager_port)),
+        validators_dir,
+        secrets_dir,
+        metrics,
+        keymanager,
     })
     .await
     .map_err(Into::into)
+}
+
+/// Sign and publish one validator's voluntary exit, on its own runtime like
+/// [`run`]. A run the operator aborted at the confirmation prompt is a clean
+/// exit, not an error: nothing happened, and nothing needed to.
+#[tokio::main]
+pub(crate) async fn exit(options: ExitOptions) -> eyre::Result<()> {
+    let outcome = exit::run(ExitConfig {
+        keystore: options.keystore,
+        password_file: options.password_file,
+        beacon_node: options.beacon_node,
+        options: exit::ExitOptions {
+            epoch: options.epoch,
+            presign: options.presign,
+            no_confirmation: options.no_confirmation,
+            no_wait: options.no_wait,
+        },
+    })
+    .await?;
+    match outcome {
+        Outcome::Presigned(signed) => exit::print_presigned(&signed)?,
+        Outcome::NotConfirmed => {
+            eprintln!("Nothing was published. The phrase is \"{CONFIRMATION_PHRASE}\".");
+        }
+        Outcome::Published { .. } => {}
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -165,9 +268,10 @@ mod tests {
 
     fn options(graffiti: &str) -> ValidatorOptions {
         ValidatorOptions {
-            beacon_nodes: vec!["http://localhost:5052".to_string()],
-            validators_dir: PathBuf::from("/tmp/validators"),
-            secrets_dir: PathBuf::from("/tmp/secrets"),
+            command: None,
+            beacon_nodes: Some(vec!["http://localhost:5052".to_string()]),
+            validators_dir: Some(PathBuf::from("/tmp/validators")),
+            secrets_dir: Some(PathBuf::from("/tmp/secrets")),
             http_address: "127.0.0.1".parse().expect("valid address"),
             keymanager_port: 5062,
             metrics_port: 5064,

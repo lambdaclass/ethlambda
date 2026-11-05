@@ -7,7 +7,7 @@
 
 use async_trait::async_trait;
 use ethlambda_types::beacon::config::Config;
-use ethlambda_types::beacon::containers::shared::AttestationData;
+use ethlambda_types::beacon::containers::shared::{AttestationData, SignedVoluntaryExit};
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{
     BlsPubkey, BlsSignature, Bytes32, Epoch, Root, Slot, ValidatorIndex,
@@ -239,6 +239,21 @@ pub struct ValidatorEntry {
     pub index: ValidatorIndex,
     pub pubkey: BlsPubkey,
     pub status: String,
+}
+
+/// One validator's registry entry, as much of it as a voluntary exit needs.
+///
+/// `status` is the Beacon API's own string (`active_ongoing`,
+/// `active_exiting`, `exited_unslashed`, ...). The three epochs are what the
+/// exit command checks eligibility against before signing and reports once the
+/// chain has accepted the exit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatorDetails {
+    pub index: ValidatorIndex,
+    pub status: String,
+    pub activation_epoch: Epoch,
+    pub exit_epoch: Epoch,
+    pub withdrawable_epoch: Epoch,
 }
 
 #[async_trait]
@@ -549,6 +564,20 @@ pub trait BeaconNodeApi: Send + Sync {
         &self,
         subscriptions: &[SyncCommitteeSubscriptionDto],
     ) -> Result<()>;
+
+    /// One validator's registry entry at the node's head, or `None` when the
+    /// node knows no validator with that key (404), which is an ordinary
+    /// answer for a key whose deposit has not been processed, not an error.
+    ///
+    /// `GET /eth/v1/beacon/states/head/validators/{pubkey}`. Unlike
+    /// [`Self::validator_indices`] this carries the activation and exit
+    /// epochs, which is what a voluntary exit is checked against.
+    async fn validator(&self, pubkey: &BlsPubkey) -> Result<Option<ValidatorDetails>>;
+
+    /// Hand a signed voluntary exit to the node's pool, which validates it
+    /// against its head state and gossips it. A refusal (400) surfaces as
+    /// [`crate::error::Error::BeaconNodeStatus`] carrying the node's reason.
+    async fn submit_voluntary_exit(&self, exit: &SignedVoluntaryExit) -> Result<()>;
 }
 
 /// Check that `contribution` is the one asked for, as the contract on

@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::altair;
 use ethlambda_types::beacon::containers::gloas;
-use ethlambda_types::beacon::containers::shared::AttestationData;
+use ethlambda_types::beacon::containers::shared::{AttestationData, SignedVoluntaryExit};
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, Root, Slot, ValidatorIndex};
 use tracing::{debug, warn};
@@ -23,7 +23,7 @@ use crate::beacon_node::dto::{
 };
 use crate::beacon_node::{
     AggregateAttestation, AttesterDuties, BeaconNodeApi, BlockRequest, Genesis, ProposerDuties,
-    PtcDuties, Published, SignedAggregates, ValidatorEntry,
+    PtcDuties, Published, SignedAggregates, ValidatorDetails, ValidatorEntry,
 };
 use crate::error::{Error, Result};
 
@@ -425,6 +425,18 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
     ) -> Result<()> {
         self.try_all("subscribe_sync_committees", |node| {
             node.subscribe_sync_committees(subscriptions)
+        })
+        .await
+    }
+
+    async fn validator(&self, pubkey: &BlsPubkey) -> Result<Option<ValidatorDetails>> {
+        self.try_each("validator", |node| node.validator(pubkey))
+            .await
+    }
+
+    async fn submit_voluntary_exit(&self, exit: &SignedVoluntaryExit) -> Result<()> {
+        self.try_each("submit_voluntary_exit", |node| {
+            node.submit_voluntary_exit(exit)
         })
         .await
     }

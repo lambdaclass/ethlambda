@@ -27,7 +27,7 @@ use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::altair;
 use ethlambda_types::beacon::containers::electra::Attestation;
 use ethlambda_types::beacon::containers::gloas;
-use ethlambda_types::beacon::containers::shared::AttestationData;
+use ethlambda_types::beacon::containers::shared::{AttestationData, SignedVoluntaryExit};
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, Root, Slot, ValidatorIndex};
 use reqwest::{Client, StatusCode};
@@ -41,12 +41,13 @@ use crate::beacon_node::dto::{
     AttestationDataDto, AttestationDto, AttesterDutyDto, BlockRootResponse,
     CommitteeSubscriptionDto, DataResponse, DutiesResponse, GenesisDto, IndexedErrorResponse,
     ProposerDutyDto, ProposerPreparationDto, PtcDutyDto, SignedAggregateAndProofOutDto,
-    SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto, SyncingDto, ValidatorEntryDto,
-    VersionedResponse, config_from_spec_response, encode_hex, parse_pubkey, parse_root,
+    SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto, SyncingDto,
+    ValidatorDetailsDto, ValidatorEntryDto, VersionedResponse, config_from_spec_response,
+    encode_hex, parse_pubkey, parse_root,
 };
 use crate::beacon_node::{
     AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Genesis,
-    ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorEntry,
+    ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails, ValidatorEntry,
     validate_attestation_data, validate_produced_block, validate_sync_contribution,
 };
 use crate::error::{BeaconNodeFailure, Error, Result};
@@ -1046,6 +1047,54 @@ impl BeaconNodeApi for HttpBeaconNode {
             None,
         )
         .await
+    }
+
+    async fn validator(&self, pubkey: &BlsPubkey) -> Result<Option<ValidatorDetails>> {
+        let url = format!(
+            "{}/eth/v1/beacon/states/head/validators/{}",
+            self.base_url,
+            encode_hex(&pubkey.0)
+        );
+        debug!(%url, "Beacon API GET");
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|err| Error::BeaconNode {
+                url: url.clone(),
+                failure: BeaconNodeFailure::classify(&err),
+                detail: err.to_string(),
+            })?;
+        // `get_optional` reads a 204 as "nothing"; this endpoint says it with
+        // a 404, which the specification lists as "validator not found".
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let response: DataResponse<ValidatorDetailsDto> = Self::decode(response).await?;
+        let entry = response.data;
+        // The answer names the key it describes; a node answering about
+        // another validator must not have its index signed into an exit.
+        let answered = parse_pubkey(&entry.validator.pubkey)?;
+        if answered != *pubkey {
+            return Err(Error::InconsistentResponse(format!(
+                "asked about validator {}, node answered about {}",
+                encode_hex(&pubkey.0),
+                entry.validator.pubkey
+            )));
+        }
+        Ok(Some(ValidatorDetails {
+            index: entry.index,
+            status: entry.status,
+            activation_epoch: entry.validator.activation_epoch,
+            exit_epoch: entry.validator.exit_epoch,
+            withdrawable_epoch: entry.validator.withdrawable_epoch,
+        }))
+    }
+
+    async fn submit_voluntary_exit(&self, exit: &SignedVoluntaryExit) -> Result<()> {
+        self.post_no_content("/eth/v1/beacon/pool/voluntary_exits", exit, None)
+            .await
     }
 }
 

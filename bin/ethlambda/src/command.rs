@@ -83,6 +83,13 @@ pub(crate) enum Command {
     /// Replay real chain history from `.era` files and check it against the stored states.
     ReplayEra(ReplayEraOptions),
     /// Run the beacon-chain validator client against a beacon node's HTTP API.
+    //
+    // `subcommand_negates_reqs`: `ethlambda validator exit` carries only its
+    // own flags, so the client's required ones must not be demanded of it;
+    // `args_conflicts_with_subcommands`: and none of the client's flags may be
+    // given alongside it, since none applies. On the variant rather than on
+    // `ValidatorOptions`, where clap's derive does not pick them up.
+    #[command(subcommand_negates_reqs = true, args_conflicts_with_subcommands = true)]
     Validator(crate::validator::ValidatorOptions),
     /// Generate validator XMSS keys for a genesis.
     Keygen(KeygenOptions),
@@ -198,8 +205,74 @@ mod tests {
             Command::Validator(options) => options,
             other => panic!("expected a validator invocation, got {other:?}"),
         };
-        assert_eq!(options.beacon_nodes, vec!["http://localhost:5052"]);
-        assert_eq!(options.validators_dir, PathBuf::from("/tmp/validators"));
+        assert_eq!(
+            options.beacon_nodes.as_deref(),
+            Some(&["http://localhost:5052".to_string()][..])
+        );
+        assert_eq!(
+            options.validators_dir,
+            Some(PathBuf::from("/tmp/validators"))
+        );
+        assert!(options.command.is_none());
+    }
+
+    /// Without the sub-command the client's flags stay required: a bare
+    /// `ethlambda validator` must not start a client with nothing configured.
+    #[test]
+    fn a_client_run_still_requires_its_flags() {
+        let args = ["ethlambda", "validator", "--graffiti", "hello"];
+        assert!(try_parse_from(args.iter().map(OsString::from)).is_err());
+    }
+
+    /// `validator exit` carries only its own flags: the client's required
+    /// ones are not demanded of it.
+    #[test]
+    fn the_validator_exit_subcommand_parses_without_the_client_flags() {
+        let args = [
+            "ethlambda",
+            "validator",
+            "exit",
+            "--keystore",
+            "/tmp/keystore.json",
+            "--password-file",
+            "/tmp/password",
+            "--beacon-node",
+            "http://localhost:5052",
+            "--presign",
+            "--epoch",
+            "123",
+        ];
+        let command = try_parse_from(args.iter().map(OsString::from)).expect("invocation parses");
+        let Command::Validator(options) = command else {
+            panic!("expected a validator invocation, got {command:?}");
+        };
+        let Some(crate::validator::ValidatorCommand::Exit(exit)) = options.command else {
+            panic!("expected the exit sub-command, got {:?}", options.command);
+        };
+        assert_eq!(exit.keystore, PathBuf::from("/tmp/keystore.json"));
+        assert_eq!(exit.password_file, PathBuf::from("/tmp/password"));
+        assert_eq!(exit.beacon_node, "http://localhost:5052");
+        assert_eq!(exit.epoch, Some(123));
+        assert!(exit.presign);
+        assert!(!exit.no_confirmation);
+        assert!(!exit.no_wait);
+    }
+
+    /// And the client's own flags are refused beside it, since none applies.
+    #[test]
+    fn the_client_flags_are_refused_beside_validator_exit() {
+        let args = [
+            "ethlambda",
+            "validator",
+            "--graffiti",
+            "hello",
+            "exit",
+            "--keystore",
+            "/tmp/keystore.json",
+            "--password-file",
+            "/tmp/password",
+        ];
+        assert!(try_parse_from(args.iter().map(OsString::from)).is_err());
     }
 
     /// The historical flat form must keep working, unchanged.

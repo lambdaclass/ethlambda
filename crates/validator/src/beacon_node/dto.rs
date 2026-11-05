@@ -20,7 +20,7 @@
 //! | `AttesterDuty` | pubkey, validator_index, committee_index, committee_length, committees_at_slot, validator_committee_index, slot | all seven, all used |
 //! | Genesis | genesis_time, genesis_validators_root, genesis_fork_version | the first two; the fork version comes from `/config/spec` |
 //! | Syncing | head_slot, sync_distance, is_syncing, is_optimistic, el_offline | is_syncing and is_optimistic gate signing; el_offline is logged |
-//! | `ValidatorResponse` | index, balance, status, validator | index, status, validator.pubkey |
+//! | `ValidatorResponse` | index, balance, status, validator | index, status, validator.pubkey; the single-validator form also reads the activation, exit and withdrawable epochs |
 //! | `ProposerDuty` | pubkey, validator_index, slot | all three, all used |
 //! | `ProposerPreparation` | validator_index, fee_recipient | both, sent not read |
 //!
@@ -290,6 +290,27 @@ pub struct ValidatorEntryDto {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ValidatorInnerDto {
     pub pubkey: String,
+}
+
+/// `GET /eth/v1/beacon/states/{state_id}/validators/{validator_id}`: one
+/// `ValidatorResponse`, with the epochs a voluntary exit is checked against.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ValidatorDetailsDto {
+    #[serde(with = "quoted_u64")]
+    pub index: ValidatorIndex,
+    pub status: String,
+    pub validator: ValidatorDetailsInnerDto,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ValidatorDetailsInnerDto {
+    pub pubkey: String,
+    #[serde(with = "quoted_u64")]
+    pub activation_epoch: Epoch,
+    #[serde(with = "quoted_u64")]
+    pub exit_epoch: Epoch,
+    #[serde(with = "quoted_u64")]
+    pub withdrawable_epoch: Epoch,
 }
 
 /// What a validator client submits for one attester duty, from Electra on.
