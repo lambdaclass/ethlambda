@@ -58,6 +58,11 @@ pub struct KeymanagerContext {
     /// it takes this one first and `store` second, consistently, so the two
     /// never deadlock against each other.
     pub definitions_lock: Arc<Mutex<()>>,
+    /// Whether the last save of the definitions file replaced it without
+    /// flushing the directory, so its last change may not survive a power
+    /// loss. Set and cleared by `keystores::save_definitions`; read where a
+    /// retry would otherwise report that change as final.
+    pub definitions_unflushed: Arc<std::sync::atomic::AtomicBool>,
     /// The record every key must be registered in before it is loaded, so the
     /// duty path never meets a key it has no record for.
     pub protection: crate::slashing_protection::SharedProtection,

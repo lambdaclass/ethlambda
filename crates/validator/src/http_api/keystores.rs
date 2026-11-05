@@ -235,7 +235,7 @@ pub async fn import(
     // concurrent delete cannot interleave.
     let persisted: Vec<BlsPubkey> = prepared
         .iter()
-        .filter_map(|result| result.as_ref().ok().map(|(pubkey, _)| *pubkey))
+        .filter_map(|result| result.as_ref().ok().map(|(pubkey, _, _)| *pubkey))
         .collect();
     let registration = if persisted.is_empty() {
         Ok(0)
@@ -278,9 +278,9 @@ pub async fn import(
     // which is the closed side to fail on. Here the write is known to have
     // failed, so the keys this request added are taken off disk again, the
     // entries it replaced are put back as they were, and the failure costs
-    // this request only. A rewritten keystore at the paths a restored entry
-    // names stays: it is the same key. One at paths it does not name is
-    // removed with the added keys' files.
+    // this request only. The keystore and password files go back to what was
+    // at their paths before, as a pair, or are removed where there was
+    // nothing.
     let rolled_back = match &registration {
         Ok(_) => Ok(()),
         Err(_) => {
@@ -292,7 +292,16 @@ pub async fn import(
                     None => added.push(*pubkey),
                 }
             }
-            undo_import(&context, &mut definitions, &added, &replaced)
+            let files: Vec<(BlsPubkey, &Overwritten)> = prepared
+                .iter()
+                .filter_map(|result| {
+                    result
+                        .as_ref()
+                        .ok()
+                        .map(|(pubkey, _, overwritten)| (*pubkey, overwritten))
+                })
+                .collect();
+            undo_import(&context, &mut definitions, &added, &replaced, &files)
         }
     };
     if let Err(err) = &rolled_back {
@@ -312,8 +321,8 @@ pub async fn import(
     let data = prepared
         .into_iter()
         .map(|result| match (result, &registration) {
-            (Ok((_, secret)), Ok(_)) => finish_import(&mut store, &secret),
-            (Ok((pubkey, _)), Err(err)) => {
+            (Ok((_, secret, _)), Ok(_)) => finish_import(&mut store, &secret),
+            (Ok((pubkey, _, _)), Err(err)) => {
                 if before.contains_key(&pubkey) {
                     // Its keystore was rewritten; its entry is back as it was
                     // and nothing about it changed in memory, so it stays
@@ -350,9 +359,10 @@ pub async fn import(
     Json(StatusResponse { data })
 }
 
-/// Undo what a failed import did to the definitions file: the entries it
-/// added are removed and the ones it replaced put back, in one save, then
-/// the added keys' keystore and password files are removed. The file goes
+/// Undo what a failed import did: the definitions entries it added are
+/// removed and the ones it replaced put back, in one save, then every
+/// keystore and password file it wrote goes back to what was at its path
+/// before, as a pair, or is removed where there was nothing. The file goes
 /// first, since it is what the next start loads from, so a crash in between
 /// leaves orphan files and never a key that would be loaded without a
 /// record. A file that is already gone is not an error.
@@ -361,6 +371,7 @@ fn undo_import(
     definitions: &mut ValidatorDefinitions,
     added: &[BlsPubkey],
     replaced: &[(BlsPubkey, ValidatorDefinition)],
+    files: &[(BlsPubkey, &Overwritten)],
 ) -> crate::Result<()> {
     if added.is_empty() && replaced.is_empty() {
         return Ok(());
@@ -377,25 +388,49 @@ fn undo_import(
             *definition = previous.clone();
         }
     }
-    definitions.save(&context.validators_dir)?;
-    for pubkey in added {
-        for path in written_paths(context, pubkey)? {
-            remove_if_present(&path)?;
-        }
-    }
-    // A restored entry that names other paths does not reference what this
-    // request wrote; a restored entry naming the same paths keeps the
-    // rewritten keystore, which is the same key.
-    for (pubkey, previous) in replaced {
+    save_definitions(context, definitions)?;
+    for (pubkey, overwritten) in files {
         let [keystore, password] = written_paths(context, pubkey)?;
-        if absolute(previous.voting_keystore_path.clone())? != keystore {
-            remove_if_present(&keystore)?;
-        }
-        if absolute(previous.voting_keystore_password_path.clone())? != password {
-            remove_if_present(&password)?;
-        }
+        put_back(&keystore, overwritten.keystore.as_deref())?;
+        put_back(
+            &password,
+            overwritten.password.as_deref().map(|bytes| &bytes[..]),
+        )?;
     }
     Ok(())
+}
+
+/// Put `path` back to `previous`: its former bytes, or nothing.
+fn put_back(path: &Path, previous: Option<&[u8]>) -> crate::Result<()> {
+    match previous {
+        Some(bytes) => {
+            secure_fs::write_private_no_symlink(path, bytes).map_err(|source| Error::Io {
+                path: path.display().to_string(),
+                source,
+            })
+        }
+        None => remove_if_present(path),
+    }
+}
+
+/// Save the definitions file, keeping `definitions_unflushed` true from an
+/// after-rename flush failure until a later save flushes the directory, which
+/// makes every earlier rename in it durable too.
+fn save_definitions(
+    context: &KeymanagerContext,
+    definitions: &ValidatorDefinitions,
+) -> crate::Result<()> {
+    let saved = definitions.save(&context.validators_dir);
+    match &saved {
+        Ok(()) => context
+            .definitions_unflushed
+            .store(false, std::sync::atomic::Ordering::Release),
+        Err(Error::Unflushed { .. }) => context
+            .definitions_unflushed
+            .store(true, std::sync::atomic::Ordering::Release),
+        Err(_) => {}
+    }
+    saved
 }
 
 /// The keystore and password paths `persist_import` writes `pubkey` to.
@@ -426,7 +461,7 @@ fn prepare_import(
     definitions: &mut ValidatorDefinitions,
     json: &str,
     password: Option<&str>,
-) -> std::result::Result<(BlsPubkey, Zeroizing<[u8; 32]>), KeyStatus> {
+) -> std::result::Result<(BlsPubkey, Zeroizing<[u8; 32]>, Overwritten), KeyStatus> {
     let Some(password) = password else {
         return Err(KeyStatus::error("no password supplied for this keystore"));
     };
@@ -440,9 +475,39 @@ fn prepare_import(
     // crash right after "imported" is reported silently loses it, with
     // nothing about a live, signing validator hinting that it is about to
     // vanish on the next restart.
-    persist_import(context, definitions, &pubkey, json, password).map_err(KeyStatus::error)?;
+    let overwritten =
+        persist_import(context, definitions, &pubkey, json, password).map_err(KeyStatus::error)?;
 
-    Ok((pubkey, secret))
+    Ok((pubkey, secret, overwritten))
+}
+
+/// What `persist_import` found at the two paths it writes, so an undone
+/// import can put it back: the bytes of a regular file that was there, or
+/// `None` for nothing. Restored as a pair, so a keystore never ends up next
+/// to a password it was not encrypted under.
+struct Overwritten {
+    keystore: Option<Vec<u8>>,
+    password: Option<Zeroizing<Vec<u8>>>,
+}
+
+/// The bytes of the regular file at `path`, or `None` when there is none. A
+/// symlink or a directory reads as `None` too: the write that follows refuses
+/// those, so nothing of theirs is overwritten.
+fn regular_file_bytes(path: &Path) -> crate::Result<Option<Vec<u8>>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => {
+            std::fs::read(path).map(Some).map_err(|source| Error::Io {
+                path: path.display().to_string(),
+                source,
+            })
+        }
+        Ok(_) => Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(Error::Io {
+            path: path.display().to_string(),
+            source,
+        }),
+    }
 }
 
 /// Add an already-decrypted, already-persisted key to the live store. The
@@ -469,7 +534,7 @@ fn persist_import(
     pubkey: &BlsPubkey,
     keystore_json: &str,
     password: &str,
-) -> crate::Result<()> {
+) -> crate::Result<Overwritten> {
     // Named after the pubkey, the convention staking tools use, so an
     // operator can tell which file backs which validator without opening it.
     // That predictability is exactly why the writes below refuse to follow a
@@ -490,6 +555,11 @@ fn persist_import(
     // file, so re-importing the same key (rotating its password, or simply
     // retrying) behaves exactly as a plain `std::fs::write` would; it only
     // refuses to follow a symlink planted at the path ahead of time.
+    // Taken before the writes, to be put back if this import is undone.
+    let overwritten = Overwritten {
+        keystore: regular_file_bytes(&keystore_path)?,
+        password: regular_file_bytes(&password_path)?.map(Zeroizing::new),
+    };
     secure_fs::write_private_no_symlink(&keystore_path, keystore_json).map_err(|source| {
         Error::Io {
             path: keystore_path.display().to_string(),
@@ -543,8 +613,8 @@ fn persist_import(
         }
     };
 
-    match definitions.save(&context.validators_dir) {
-        Ok(()) => Ok(()),
+    match save_definitions(context, definitions) {
+        Ok(()) => Ok(overwritten),
         // The entry is on disk and every reader sees it; only its survival
         // of a power loss is in doubt, and an entry lost that way only
         // removes a key. Counted as persisted, and kept in memory, so what
@@ -555,7 +625,7 @@ fn persist_import(
                 %source,
                 "Validator definitions written, but the directory could not be flushed"
             );
-            Ok(())
+            Ok(overwritten)
         }
         Err(err) => {
             // `Appended` pops rather than removing by index because this
@@ -641,6 +711,25 @@ fn delete_one(
     context.settings.forget(pubkey);
 
     if !on_disk && !in_memory {
+        // A removal whose directory flush failed is on disk but may not
+        // survive a power loss, and a retry lands here. Answering `not_found`
+        // then would tell the operator the key is gone for good; flush first,
+        // by saving the file again, and keep the error until that works.
+        if context
+            .definitions_unflushed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            let definitions = match ValidatorDefinitions::open(&context.validators_dir) {
+                Ok(definitions) => definitions,
+                Err(err) => return KeyStatus::error(err),
+            };
+            if let Err(err) = save_definitions(context, &definitions) {
+                return KeyStatus::error(format!(
+                    "an earlier removal is on disk but the directory could not be flushed: \
+                     {err}; the key may come back after a power loss"
+                ));
+            }
+        }
         return KeyStatus {
             status: "not_found".to_string(),
             message: None,
@@ -714,7 +803,7 @@ fn persist_delete(context: &KeymanagerContext, pubkey: &BlsPubkey) -> crate::Res
             .map(|parsed| parsed != *pubkey)
             .unwrap_or(true)
     });
-    definitions.save(&context.validators_dir)
+    save_definitions(context, &definitions)
 }
 
 /// A well-formed EIP-3076 interchange holding no history.
@@ -781,6 +870,7 @@ mod tests {
             validators_dir: dir.to_path_buf(),
             secrets_dir: dir.to_path_buf(),
             definitions_lock: Arc::new(tokio::sync::Mutex::new(())),
+            definitions_unflushed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             protection: crate::slashing_protection::SlashingProtection::in_memory(),
         }
     }
@@ -1280,9 +1370,67 @@ mod tests {
             .collect();
         assert!(
             json_files.is_empty(),
-            "the keystore this request wrote, which the restored entry does not name, is \
-             removed: {json_files:?}"
+            "the keystore this request wrote goes back to what was there, nothing: {json_files:?}"
         );
+    }
+
+    /// A failed registration puts the keystore and password files a re-import
+    /// overwrote back as they were, as a pair, so the restored entry never
+    /// points at a keystore encrypted under a password that is gone.
+    #[tokio::test]
+    async fn a_failed_registration_restores_the_overwritten_files() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = ethlambda_types::beacon::primitives::Root::ZERO;
+        let protection =
+            crate::slashing_protection::SlashingProtection::open(dir.path(), root, &[], false)
+                .expect("opens with no keys");
+        let record = protection.path().expect("persisted").to_path_buf();
+        std::fs::remove_file(&record).expect("removes the record");
+        std::fs::create_dir(&record).expect("a directory in its place");
+        let keystore: serde_json::Value =
+            serde_json::from_str(&keystore_json()).expect("the vector is json");
+        let pubkey = parse_pubkey(keystore["pubkey"].as_str().expect("pubkey")).expect("parses");
+        let base = encode_hex(&pubkey.0);
+        let keystore_path = dir.path().join(format!("{base}.json"));
+        let password_path = dir.path().join(&base);
+        std::fs::write(&keystore_path, b"old keystore").expect("writes");
+        std::fs::write(&password_path, b"old password").expect("writes");
+        let previous = ValidatorDefinition {
+            enabled: true,
+            voting_public_key: base.clone(),
+            voting_keystore_path: keystore_path.clone(),
+            voting_keystore_password_path: password_path.clone(),
+        };
+        ValidatorDefinitions(vec![previous.clone()])
+            .save(dir.path())
+            .expect("saves");
+        let mut context =
+            context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
+        context.protection = Arc::new(std::sync::Mutex::new(protection));
+
+        let (_, body) = send(
+            router(context, TOKEN.to_string()),
+            authed(
+                "POST",
+                "/eth/v1/keystores",
+                serde_json::json!({
+                    "keystores": [keystore_json()],
+                    "passwords": [PASSWORD],
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(body["data"][0]["status"], "error", "got {body}");
+        assert_eq!(
+            std::fs::read(&keystore_path).expect("still there"),
+            b"old keystore"
+        );
+        assert_eq!(
+            std::fs::read(&password_path).expect("still there"),
+            b"old password"
+        );
+        let definitions = ValidatorDefinitions::open(dir.path()).expect("opens");
+        assert_eq!(definitions.0, vec![previous]);
     }
 
     /// A key that fails to persist must leave no slashing-protection record

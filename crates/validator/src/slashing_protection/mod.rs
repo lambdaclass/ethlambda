@@ -393,7 +393,8 @@ impl SlashingProtection {
                 "{} validator key(s) have no slashing-protection record (first: {first}). \
                  Start once with --init-slashing-protection only once they have signed \
                  nothing anywhere for at least two epochs: stop the client that last ran \
-                 them and wait",
+                 them and wait. That rules out a double vote, not a surround of an older \
+                 vote; a key with a history should bring it",
                 missing.len()
             )));
         }
@@ -419,9 +420,12 @@ impl SlashingProtection {
             );
         }
 
-        if !existed || !missing.is_empty() {
-            file::write(&path, genesis_validators_root, records.iter())?;
-        }
+        // Written once whatever its state, as a probe: a filesystem that
+        // refuses to flush a directory (some FUSE, CIFS and overlay mounts
+        // answer EINVAL) would otherwise fail every slot's write, with the
+        // records advancing in memory and nothing ever signed, and nothing at
+        // startup to say why. Here it is a startup error naming the path.
+        file::write(&path, genesis_validators_root, records.iter())?;
         Ok(Self {
             genesis_validators_root,
             records,

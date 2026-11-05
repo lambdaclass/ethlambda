@@ -146,9 +146,12 @@ fn record_of(entry: &Entry) -> std::result::Result<Record, String> {
 
     let mut attestation: Option<Signed> = None;
     for signed in &entry.signed_attestations {
-        if signed.source_epoch > signed.target_epoch {
+        // The same shape the record and the attestation-data check refuse:
+        // a source at or past its target, never valid outside genesis. Read
+        // into the record, it would refuse every honest attestation after it.
+        if signed.source_epoch >= signed.target_epoch && signed.source_epoch != 0 {
             return Err(format!(
-                "attestation source epoch {} is after its target epoch {}",
+                "attestation source epoch {} is at or after its target epoch {}",
                 signed.source_epoch, signed.target_epoch
             ));
         }
@@ -279,6 +282,34 @@ pub(crate) fn lock(directory: &Path) -> Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A source at its target, outside genesis, is refused on read as it is
+    /// on write: loaded, it would refuse every honest attestation after it.
+    #[test]
+    fn an_entry_with_a_source_at_its_target_is_refused() {
+        let entry = Entry {
+            pubkey: [1; 48],
+            signed_blocks: vec![],
+            signed_attestations: vec![SignedAttestation {
+                source_epoch: 5,
+                target_epoch: 5,
+                signing_root: None,
+            }],
+        };
+        let err = record_of(&entry).expect_err("source at target");
+        assert!(err.contains("at or after"), "{err}");
+
+        let genesis = Entry {
+            pubkey: [1; 48],
+            signed_blocks: vec![],
+            signed_attestations: vec![SignedAttestation {
+                source_epoch: 0,
+                target_epoch: 0,
+                signing_root: None,
+            }],
+        };
+        assert!(record_of(&genesis).is_ok());
+    }
 
     /// Several entries of a kind for one validator reduce to their maxima:
     /// what keeps a file holding more than one from lowering a watermark.

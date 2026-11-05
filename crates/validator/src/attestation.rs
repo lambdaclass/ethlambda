@@ -182,6 +182,15 @@ impl<B: BeaconNodeApi> AttestationService<B> {
             })
             .collect();
 
+        if candidates.is_empty() {
+            // Nothing to record or sign; the data still names the aggregate.
+            return Ok(Attested {
+                published: 0,
+                refused: 0,
+                data: Some(data),
+            });
+        }
+
         // Check and durably record the whole batch before any signature exists:
         // a signature that exists is a signature that can escape, whatever the
         // code after it intended. One write for the slot, off the executor,

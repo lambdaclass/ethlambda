@@ -226,6 +226,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             validators_dir: config.validators_dir.clone(),
             secrets_dir: config.secrets_dir.clone(),
             definitions_lock: Arc::new(Mutex::new(())),
+            definitions_unflushed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             protection: protection.clone(),
         };
         let router = http_api::router(context, token);

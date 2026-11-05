@@ -345,7 +345,9 @@ the standard Beacon API, so it works against `ethlambda beacon` (run with the
 > durable per-validator record in `--validators-dir` before it is signed, and a
 > second validator client pointed at the same directory refuses to start. A key
 > with no record is refused at startup: pass `--init-slashing-protection` once,
-> and only for keys that have signed nothing anywhere for at least two epochs.
+> and only for keys that have signed nothing anywhere for at least two epochs;
+> even then it rules out a double vote, not a surround of an older vote, which
+> only the key's own history can.
 > Importing history from another client is not supported yet, so never run
 > these keys in another client at the same time. See
 > [Spec deviations](./docs/spec_deviations.md#the-validator-client-keeps-eip-3076s-minimal-watermarks-not-full-history).
