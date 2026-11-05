@@ -697,18 +697,43 @@ const MAX_PLAUSIBLE_VALIDATOR_INDEX: u64 = 1 << 26;
 /// epoch reallocates the table rarely rather than on every new index.
 const LATEST_MESSAGES_HEADROOM: usize = 1 << 12;
 
-/// Grows the dense vote table to hold `slot`, for both vote writers
-/// ([`Store::set_latest_message`], [`Store::record_latest_messages`]).
+/// The dense vote table's slot for validator `index`.
+///
+/// The assertion is the tripwire for an index that did not come from a
+/// validated attestation; see [`Store::set_latest_message`].
+fn latest_message_slot(index: u64) -> usize {
+    debug_assert!(
+        index < MAX_PLAUSIBLE_VALIDATOR_INDEX,
+        "validator index {index} would grow the dense vote table far past any registry"
+    );
+    usize::try_from(index).expect("validator index fits in usize")
+}
+
+/// Grows the vote table's capacity to hold `slot`, plus
+/// [`LATEST_MESSAGES_HEADROOM`] spare entries; does nothing when it already
+/// holds `slot`.
 ///
 /// Exact growth plus headroom rather than `resize`'s amortized doubling:
-/// attestations name validators in no particular order, so the table is first
-/// sized by one high index and then doubled by a slightly higher one, leaving
-/// about half of a registry-sized table unused for the life of the process.
+/// successive attestations reference validators in no particular order, so the
+/// table is first sized by one high index and then doubled by a slightly higher one,
+/// leaving about half of a registry-sized table unused for the life of the
+/// process.
+fn reserve_latest_message_slot(messages: &mut Vec<Option<LatestMessage>>, slot: usize) {
+    if messages.capacity() <= slot {
+        let target = slot
+            .checked_add(1 + LATEST_MESSAGES_HEADROOM)
+            .expect("validator index plus headroom fits in usize");
+        // `len <= capacity <= slot < target`, so this cannot underflow.
+        messages.reserve_exact(target - messages.len());
+    }
+}
+
+/// Grows the dense vote table to hold `slot`, for both vote writers
+/// ([`Store::set_latest_message`], [`Store::record_latest_messages`]).
 fn grow_latest_messages(messages: &mut Vec<Option<LatestMessage>>, slot: usize) {
     if messages.len() <= slot {
-        if messages.capacity() <= slot {
-            messages.reserve_exact(slot + 1 + LATEST_MESSAGES_HEADROOM - messages.len());
-        }
+        reserve_latest_message_slot(messages, slot);
+        // Capacity now exceeds `slot`, so this cannot reallocate.
         messages.resize(slot + 1, None);
     }
 }
@@ -4364,12 +4389,11 @@ impl Store {
     /// A batch of one for the cached fork-choice weights; an equivocator's
     /// message is recorded but counts nowhere. The production path records a
     /// whole attestation at once through [`Store::record_latest_messages`].
+    ///
+    /// A caller recording a batch through this should call
+    /// [`Store::reserve_latest_messages`] first.
     pub fn set_latest_message(&mut self, index: u64, message: LatestMessage) {
-        debug_assert!(
-            index < MAX_PLAUSIBLE_VALIDATOR_INDEX,
-            "validator index {index} would grow the dense vote table far past any registry"
-        );
-        let slot = usize::try_from(index).expect("validator index fits in usize");
+        let slot = latest_message_slot(index);
         let mut guard = self.beacon.lock().unwrap();
         let beacon = &mut *guard;
         grow_latest_messages(&mut beacon.latest_messages, slot);
@@ -4402,19 +4426,21 @@ impl Store {
     ) {
         let mut guard = self.beacon.lock().unwrap();
         let beacon = &mut *guard;
+        // One reservation for the whole batch: an indexed attestation's
+        // indices are sorted, and growing the table one ascending index at a
+        // time would copy it many times over.
+        if let Some(&highest) = indices.iter().max() {
+            reserve_latest_message_slot(&mut beacon.latest_messages, latest_message_slot(highest));
+        }
         let mut recorded = Vec::with_capacity(indices.len());
         // Most of the time nobody has equivocated, so skip the set probe per
         // attester, as `for_each_non_equivocating_latest_message` does.
         let any_equivocators = !beacon.equivocating_indices.is_empty();
         for &index in indices {
-            debug_assert!(
-                index < MAX_PLAUSIBLE_VALIDATOR_INDEX,
-                "validator index {index} would grow the dense vote table far past any registry"
-            );
+            let slot = latest_message_slot(index);
             if any_equivocators && beacon.equivocating_indices.contains(&index) {
                 continue;
             }
-            let slot = usize::try_from(index).expect("validator index fits in usize");
             grow_latest_messages(&mut beacon.latest_messages, slot);
             let entry = &mut beacon.latest_messages[slot];
             if entry.as_ref().is_none_or(&should_replace) {
@@ -4423,6 +4449,21 @@ impl Store {
             }
         }
         beacon.proto_array.apply_votes(&recorded, &message);
+    }
+
+    /// Makes room in the vote table for every index up to `highest`, so the
+    /// batch of [`Store::set_latest_message`] calls that follows reallocates
+    /// the table once at most. [`Store::record_latest_messages`] does this
+    /// itself.
+    ///
+    /// An aggregate lists its attesters in ascending index order. Grown one
+    /// index at a time, the table would be copied whenever an index passed the
+    /// headroom: hundreds of copies of a table sized to the registry, for a
+    /// single aggregate that spans it.
+    pub fn reserve_latest_messages(&mut self, highest: u64) {
+        let slot = latest_message_slot(highest);
+        let mut beacon = self.beacon.lock().unwrap();
+        reserve_latest_message_slot(&mut beacon.latest_messages, slot);
     }
 
     /// Adds a block to the cached fork-choice weights, for `on_block` to call
@@ -9422,7 +9463,7 @@ mod tests {
     }
 
     #[test]
-    fn the_latest_message_table_grows_exactly_rather_than_doubling() {
+    fn the_latest_message_table_grows_with_headroom_rather_than_doubling() {
         let mut store = Store::test_store();
         let message = LatestMessage {
             epoch: 1,
@@ -9432,24 +9473,74 @@ mod tests {
         };
         let capacity = |store: &Store| store.beacon.lock().unwrap().latest_messages.capacity();
 
-        // The first vote sizes the table, and a higher index inside the
-        // headroom fits without a reallocation.
+        let headroom = u64::try_from(LATEST_MESSAGES_HEADROOM).unwrap();
+        let slot = |index: u64| usize::try_from(index).unwrap();
+
+        // The first vote sizes the table to its index plus the headroom.
         let first = 100_000;
         store.set_latest_message(first, message);
         let sized = capacity(&store);
-        assert!(sized > usize::try_from(first).unwrap());
-        assert!(sized <= usize::try_from(first).unwrap() + 1 + LATEST_MESSAGES_HEADROOM);
-        store.set_latest_message(first + 10, message);
+        assert!(sized > slot(first));
+        assert!(sized <= slot(first) + 1 + LATEST_MESSAGES_HEADROOM);
+
+        // The highest index inside the headroom fits without a reallocation.
+        store.set_latest_message(first + headroom, message);
         assert_eq!(capacity(&store), sized);
 
-        // Past the headroom, the table grows to the new index plus headroom,
-        // not to twice what it was.
-        let higher = first + u64::try_from(LATEST_MESSAGES_HEADROOM).unwrap() + 1_000;
+        // Past the headroom, the table grows to the new index plus headroom.
+        let higher = first + headroom + 1_000;
         store.set_latest_message(higher, message);
         let grown = capacity(&store);
-        assert!(grown <= usize::try_from(higher).unwrap() + 1 + LATEST_MESSAGES_HEADROOM);
-        assert!(grown < 2 * sized);
+        assert!(grown > slot(higher));
+        assert!(grown <= slot(higher) + 1 + LATEST_MESSAGES_HEADROOM);
         assert_eq!(store.latest_message(higher).map(|vote| vote.epoch), Some(1));
+    }
+
+    #[test]
+    fn a_reserved_batch_of_ascending_votes_never_moves_the_table() {
+        let mut store = Store::test_store();
+        let message = LatestMessage {
+            epoch: 1,
+            slot: SLOTS_PER_EPOCH,
+            root: H256::from([1u8; 32]),
+            payload_present: false,
+        };
+        let table = |store: &Store| {
+            let beacon = store.beacon.lock().unwrap();
+            (
+                beacon.latest_messages.as_ptr(),
+                beacon.latest_messages.capacity(),
+            )
+        };
+
+        // An aggregate's attesters, ascending and spread wider apart than
+        // the headroom: grown index by index, each would reallocate.
+        let stride = u64::try_from(LATEST_MESSAGES_HEADROOM).unwrap() + 1;
+        let attesters: Vec<u64> = (1..=64).map(|i| i * stride).collect();
+        let highest = *attesters.last().unwrap();
+
+        store.reserve_latest_messages(highest);
+        let reserved = table(&store);
+        assert!(reserved.1 > usize::try_from(highest).unwrap());
+        for &index in &attesters {
+            store.set_latest_message(index, message);
+            assert_eq!(table(&store), reserved, "index {index} moved the table");
+        }
+        assert_eq!(
+            store.latest_message(highest).map(|vote| vote.epoch),
+            Some(1)
+        );
+
+        // The batch writer reserves for its highest index itself.
+        let mut batched = Store::test_store();
+        batched.record_latest_messages(&attesters, message, |_| true);
+        let after = table(&batched);
+        assert!(after.1 > usize::try_from(highest).unwrap());
+        assert!(after.1 <= usize::try_from(highest).unwrap() + 1 + LATEST_MESSAGES_HEADROOM);
+        assert_eq!(
+            batched.latest_message(highest).map(|vote| vote.epoch),
+            Some(1)
+        );
     }
 
     #[test]
