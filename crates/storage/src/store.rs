@@ -10684,6 +10684,8 @@ mod tests {
             vec![1].into(),
             1,
             vec![1].into(),
+            Box::default(),
+            1,
         ))
     }
 
