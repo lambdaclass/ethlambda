@@ -11,18 +11,20 @@ use std::sync::Arc;
 
 use ethlambda_engine::types::{CustodyColumns, ForkchoiceStateV1, PayloadStatusValue};
 use ethlambda_engine::{EngineClient, EngineError, JwtSecret};
-use ethlambda_types::beacon::primitives::ExecutionBlockHash;
+use ethlambda_types::beacon::preset;
+use ethlambda_types::beacon::primitives::{Bytes32, ExecutionBlockHash};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
 /// Serves exactly one request, answering with `body`, and hands the caller the
 /// request it saw.
-async fn serve_once(body: &'static str) -> (String, Arc<Mutex<Option<String>>>) {
+async fn serve_once(body: impl Into<String>) -> (String, Arc<Mutex<Option<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("an ephemeral loopback port");
     let addr = listener.local_addr().expect("the bound address");
+    let body: String = body.into();
     let seen = Arc::new(Mutex::new(None));
     let seen_writer = Arc::clone(&seen);
 
@@ -138,8 +140,7 @@ async fn an_rpc_error_envelope_surfaces_typed_and_is_not_retried() {
 #[tokio::test]
 async fn new_payload_v5_sends_four_params_under_its_own_method() {
     use ethlambda_types::beacon::containers::{bellatrix, gloas};
-    use ethlambda_types::beacon::preset;
-    use ethlambda_types::beacon::primitives::{Bytes32, ExecutionAddress, Root, Uint256};
+    use ethlambda_types::beacon::primitives::{ExecutionAddress, Root, Uint256};
 
     let (endpoint, seen) = serve_once(
         r#"{"jsonrpc":"2.0","id":1,"result":{"status":"VALID","latestValidHash":"0x0505050505050505050505050505050505050505050505050505050505050505","validationError":null}}"#,
@@ -220,4 +221,80 @@ async fn forkchoice_updated_v4_sends_three_params_and_parses_syncing() {
     assert!(request.contains("headBlockHash"));
     // The attributes are null and the bitmap follows them.
     assert!(request.contains(",null,\"0x01020000000000000000000000000000\"]"));
+}
+
+/// A `getBlobsV2` result body with `blobs` blobs of `proof_count` proofs each.
+/// Proof `i` is 48 bytes of `i + 1`, so a reordering shows up.
+fn blobs_v2_body(blobs: usize, proof_count: usize) -> String {
+    let blob = format!("0x{}", "00".repeat(preset::BYTES_PER_BLOB));
+    let proofs: Vec<String> = (0..proof_count)
+        .map(|i| format!("0x{}", format!("{:02x}", i + 1).repeat(48)))
+        .collect();
+    let entry = serde_json::json!({ "blob": blob, "proofs": proofs });
+    serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": vec![entry; blobs] }).to_string()
+}
+
+#[tokio::test]
+async fn get_blobs_v2_null_is_none_and_the_request_carries_the_hashes() {
+    let (endpoint, seen) = serve_once(r#"{"jsonrpc":"2.0","id":1,"result":null}"#).await;
+
+    let hashes = [Bytes32::repeat_byte(1), Bytes32::repeat_byte(2)];
+    let answer = client(endpoint)
+        .get_blobs_v2(&hashes)
+        .await
+        .expect("null is an answer, not an error");
+    assert!(answer.is_none());
+
+    let request = seen.lock().await.clone().expect("the mock saw a request");
+    let (_, body) = request.split_once("\r\n\r\n").expect("a request body");
+    let body: serde_json::Value = serde_json::from_str(body).expect("a JSON body");
+    assert_eq!(body["method"], "engine_getBlobsV2");
+    assert_eq!(
+        body["params"],
+        serde_json::json!([[
+            format!("0x{}", "01".repeat(32)),
+            format!("0x{}", "02".repeat(32)),
+        ]])
+    );
+}
+
+#[tokio::test]
+async fn get_blobs_v2_decodes_a_full_answer_in_order() {
+    let (endpoint, _seen) = serve_once(blobs_v2_body(1, preset::CELLS_PER_EXT_BLOB)).await;
+
+    let blobs = client(endpoint)
+        .get_blobs_v2(&[Bytes32::repeat_byte(1)])
+        .await
+        .expect("a well-formed answer")
+        .expect("every blob is available");
+
+    assert_eq!(blobs.len(), 1);
+    assert_eq!(blobs[0].blob.len(), preset::BYTES_PER_BLOB);
+    assert!(blobs[0].blob.iter().all(|byte| *byte == 0));
+    assert_eq!(blobs[0].proofs.len(), preset::CELLS_PER_EXT_BLOB);
+    for (i, proof) in blobs[0].proofs.iter().enumerate() {
+        assert_eq!(proof.0, [(i + 1) as u8; 48], "proof {i} out of order");
+    }
+}
+
+#[tokio::test]
+async fn get_blobs_v2_with_the_wrong_proof_count_is_a_decode_error() {
+    let (endpoint, _seen) = serve_once(blobs_v2_body(1, preset::CELLS_PER_EXT_BLOB - 1)).await;
+
+    let err = client(endpoint)
+        .get_blobs_v2(&[Bytes32::repeat_byte(1)])
+        .await
+        .expect_err("a short proof list is malformed");
+    assert!(matches!(err, EngineError::Decode(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn get_blobs_v2_with_a_different_length_than_requested_is_a_decode_error() {
+    let (endpoint, _seen) = serve_once(blobs_v2_body(1, preset::CELLS_PER_EXT_BLOB)).await;
+
+    let err = client(endpoint)
+        .get_blobs_v2(&[Bytes32::repeat_byte(1), Bytes32::repeat_byte(2)])
+        .await
+        .expect_err("one blob for two hashes is malformed");
+    assert!(matches!(err, EngineError::Decode(_)), "got {err:?}");
 }

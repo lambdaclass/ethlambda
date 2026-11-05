@@ -17,6 +17,7 @@ pub mod builder_market;
 pub mod column_checks;
 pub mod decode;
 pub mod encoding;
+pub mod engine_columns;
 pub mod envelope_checks;
 pub mod fork_schedule;
 pub mod handler;

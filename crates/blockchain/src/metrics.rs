@@ -1764,3 +1764,55 @@ pub fn observe_beacon_aggregate_end_to_end(duration: Duration) {
         });
     LEAN_BEACON_AGGREGATE_END_TO_END_SECONDS.observe(duration.as_secs_f64());
 }
+
+/// Count one `engine_getBlobsV2` attempt for a held fulu block, by what came
+/// back: `hit` (every blob), `miss` (the execution client answered `null`, so
+/// at least one blob is not in its pool) or `error` (transport, timeout or a
+/// malformed answer).
+pub fn inc_engine_get_blobs(outcome: &str) {
+    static LEAN_ENGINE_GET_BLOBS_TOTAL: std::sync::LazyLock<IntCounterVec> =
+        std::sync::LazyLock::new(|| {
+            register_int_counter_vec!(
+                "lean_engine_get_blobs_total",
+                "engine_getBlobsV2 attempts for held blocks by outcome (hit, miss, error)",
+                &["outcome"]
+            )
+            .unwrap()
+        });
+    LEAN_ENGINE_GET_BLOBS_TOTAL
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+/// How long one `engine_getBlobsV2` round trip took, whatever its outcome.
+///
+/// The buckets stop at the call's own timeout, so a mass in the last bucket
+/// means the execution client is not answering inside the window the
+/// specification gives it.
+pub fn observe_engine_get_blobs_duration(duration: Duration) {
+    static LEAN_ENGINE_GET_BLOBS_DURATION_SECONDS: std::sync::LazyLock<Histogram> =
+        std::sync::LazyLock::new(|| {
+            register_histogram!(
+                "lean_engine_get_blobs_duration_seconds",
+                "Time for one engine_getBlobsV2 round trip",
+                vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]
+            )
+            .unwrap()
+        });
+    LEAN_ENGINE_GET_BLOBS_DURATION_SECONDS.observe(duration.as_secs_f64());
+}
+
+/// How long turning an execution client's blobs into custody column sidecars
+/// took: the cell computation plus the sidecar build, off the actor thread.
+pub fn observe_engine_blobs_to_columns(duration: Duration) {
+    static LEAN_ENGINE_BLOBS_TO_COLUMNS_SECONDS: std::sync::LazyLock<Histogram> =
+        std::sync::LazyLock::new(|| {
+            register_histogram!(
+                "lean_engine_blobs_to_columns_seconds",
+                "Time to build custody data column sidecars from execution-client blobs",
+                vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0]
+            )
+            .unwrap()
+        });
+    LEAN_ENGINE_BLOBS_TO_COLUMNS_SECONDS.observe(duration.as_secs_f64());
+}
