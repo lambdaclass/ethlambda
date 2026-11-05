@@ -159,10 +159,7 @@ pub(super) fn shown_target(base: &Url, location: &[u8]) -> String {
     base.join(&location)
         .ok()
         .and_then(without_credentials)
-        .map_or_else(
-            || UNSHOWN_LOCATION.to_owned(),
-            |url| error_text(url.into()),
-        )
+        .map_or_else(|| UNSHOWN_LOCATION.to_owned(), |url| error_text(url.into()))
 }
 
 /// `url` without its user and password, or `None` when it cannot hold them
