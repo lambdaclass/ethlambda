@@ -384,7 +384,13 @@ mod tests {
     use crate::{BACKOFF_MULTIPLIER, ConnectionDirection, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES};
 
     fn envelope_for(slot: u64, block_root: H256) -> SignedExecutionPayloadEnvelope {
-        crate::beacon::encoding::test_support::envelope(block_root, slot, H256::ZERO)
+        // Sealed: the fetched-envelope rules refuse a block hash that is not
+        // the payload's header's.
+        crate::beacon::payload_hash::seal_envelope(crate::beacon::encoding::test_support::envelope(
+            block_root,
+            slot,
+            H256::ZERO,
+        ))
     }
 
     fn fulu_block_at(slot: u64) -> SignedBeaconBlock {

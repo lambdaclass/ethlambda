@@ -71,6 +71,9 @@ rand = "0.8"
 # against with nothing in the manifest saying so.
 ethrex-p2p = { git = "https://github.com/lambdaclass/ethrex", tag = "v25.0.0" }
 ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex", tag = "v25.0.0" }
+# The ordered trie behind a payload's transactions root, which `ethrex-common`
+# only builds from decoded transactions, not the raw bytes a payload carries.
+ethrex-trie = { git = "https://github.com/lambdaclass/ethrex", tag = "v25.0.0" }
 ethrex-common = { git = "https://github.com/lambdaclass/ethrex", tag = "v25.0.0" }
 
 # `rand` seeds the throwaway signing keys the ENR tests build records with.
