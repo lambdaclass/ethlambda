@@ -204,7 +204,10 @@ impl<B: BeaconNodeApi> AttestationService<B> {
         let verdicts = match verdicts {
             Ok(verdicts) => verdicts,
             Err(err) => {
-                // Nothing was recorded, so nothing may be signed.
+                // Nothing may be signed. Nothing was recorded either, except
+                // after a rename whose directory flush failed, where the target
+                // is on disk and in memory and a retry is refused (see
+                // `SlashingProtection::check_and_record_attestations`).
                 error!(%slot, %err, "Slashing protection could not record this slot's attestations; refusing to sign any");
                 crate::metrics::inc_attestations_refused_by(candidates.len() as u64);
                 return Ok(Attested {
