@@ -78,6 +78,12 @@ use crate::error::{Error, Result};
 /// holds up the executor.
 pub type SharedProtection = Arc<Mutex<SlashingProtection>>;
 
+/// How long [`blocking`] waits for the record before refusing, and how often
+/// it looks. A flush takes milliseconds on a healthy disk; a quarter of a
+/// 12-second slot is what a slow one gets.
+const RECORD_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+const RECORD_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
 /// Run `operation` on the record on tokio's blocking pool, and wait for it.
 ///
 /// Every async caller goes through here, including ones that only read: the
@@ -97,12 +103,6 @@ pub type SharedProtection = Arc<Mutex<SlashingProtection>>;
 /// The operation runs to completion even if the caller is dropped, as a duty
 /// abandoned at its deadline is: that is safe, since a record written for a
 /// message that is then never signed only costs that message.
-/// How long [`blocking`] waits for the record before refusing, and how often
-/// it looks. A flush takes milliseconds on a healthy disk; a quarter of a
-/// 12-second slot is what a slow one gets.
-const RECORD_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
-const RECORD_POLL: std::time::Duration = std::time::Duration::from_millis(5);
-
 pub async fn blocking<T: Send + 'static>(
     protection: &SharedProtection,
     operation: impl FnOnce(&mut SlashingProtection) -> Result<T> + Send + 'static,
@@ -128,8 +128,8 @@ pub async fn blocking<T: Send + 'static>(
                     if std::time::Instant::now() >= deadline {
                         return Err(Error::SlashingProtectionUnusable {
                             reason: format!(
-                                "the record has been held by another access for {} s; its \
-                                 write to disk may be stuck",
+                                "the record has been held by other accesses for {} s: a write \
+                                 may be stuck, or the keymanager may be busy",
                                 RECORD_WAIT.as_secs()
                             ),
                         });
@@ -150,6 +150,15 @@ pub async fn blocking<T: Send + 'static>(
             }
         }
     })?
+}
+
+/// Whether an attestation's source epoch is at or past its target, which is
+/// never valid outside genesis: with unsigned epochs, `(0, 0)` is the only
+/// such pair that is. One predicate for the three places that refuse it,
+/// the attestation-data check, the record and the file reader, so they
+/// cannot drift.
+pub(crate) fn is_impossible_source(source: Epoch, target: Epoch) -> bool {
+    source >= target && source != 0
 }
 
 /// The highest source and target epoch signed for one validator.
@@ -193,12 +202,10 @@ impl Record {
 
     fn check_attestation(&self, data: &AttestationData) -> std::result::Result<(), Refusal> {
         let (source, target) = (data.source.epoch, data.target.epoch);
-        // A source at or past its target is never valid outside genesis,
-        // where both are zero. `validate_attestation_data` refuses the shape
-        // before it reaches the record; this is the record defending itself,
-        // since recording such a pair would refuse every honest attestation
-        // after it.
-        if source >= target && source != 0 {
+        // `validate_attestation_data` refuses the shape before it reaches the
+        // record; this is the record defending itself, since recording such a
+        // pair would refuse every honest attestation after it.
+        if is_impossible_source(source, target) {
             return Err(Refusal::SourceAfterTarget { source, target });
         }
         let Some(signed) = self.attestation else {

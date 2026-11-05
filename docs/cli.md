@@ -270,7 +270,9 @@ implementation's, so none of the [common flags](#common-flags) apply to it.
 
 > **Slashing protection** lives in `--validators-dir/slashing_protection.json`,
 > locked to one process, so `--validators-dir` must be writable: a read-only
-> mount of the keys (a Kubernetes Secret, a `:ro` volume) fails at startup, and
+> mount of the keys (a Kubernetes Secret, a `:ro` volume) fails at startup, as
+> does a record that is a symlink (say, onto another volume) rather than a
+> regular file, since a dangling one would read as "no record"; and
 > the directory should be a local disk, since every signature waits for the
 > record to be flushed to it, and the lock that keeps a second process off it
 > is an `flock`, which a network filesystem may not honour. Unix only. A key with no record is refused at startup unless

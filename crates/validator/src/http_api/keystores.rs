@@ -389,7 +389,10 @@ fn undo_import(
         }
     }
     save_definitions(context, definitions)?;
-    for (pubkey, overwritten) in files {
+    // Newest first: a key listed twice in one request snapshotted, the second
+    // time, what the first time wrote, so the earliest snapshot must be the
+    // one that lands last.
+    for (pubkey, overwritten) in files.iter().rev() {
         let [keystore, password] = written_paths(context, pubkey)?;
         put_back(&keystore, overwritten.keystore.as_deref())?;
         put_back(
@@ -1431,6 +1434,59 @@ mod tests {
         );
         let definitions = ValidatorDefinitions::open(dir.path()).expect("opens");
         assert_eq!(definitions.0, vec![previous]);
+    }
+
+    /// The same keystore twice in one request, with the registration failing:
+    /// the second copy snapshotted what the first one wrote, and the undo must
+    /// still end with what was there before the request.
+    #[tokio::test]
+    async fn a_failed_registration_restores_the_state_before_a_duplicated_import() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = ethlambda_types::beacon::primitives::Root::ZERO;
+        let protection =
+            crate::slashing_protection::SlashingProtection::open(dir.path(), root, &[], false)
+                .expect("opens with no keys");
+        let record = protection.path().expect("persisted").to_path_buf();
+        std::fs::remove_file(&record).expect("removes the record");
+        std::fs::create_dir(&record).expect("a directory in its place");
+        let mut context =
+            context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
+        context.protection = Arc::new(std::sync::Mutex::new(protection));
+
+        let (_, body) = send(
+            router(context, TOKEN.to_string()),
+            authed(
+                "POST",
+                "/eth/v1/keystores",
+                serde_json::json!({
+                    "keystores": [keystore_json(), keystore_json()],
+                    "passwords": [PASSWORD, PASSWORD],
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(body["data"][0]["status"], "error", "got {body}");
+        assert_eq!(body["data"][1]["status"], "error", "got {body}");
+        assert!(
+            ValidatorDefinitions::open(dir.path())
+                .expect("opens")
+                .0
+                .is_empty()
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("lists")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().is_file())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| {
+                !name.starts_with("slashing_protection")
+                    && name != crate::keys::definitions::DEFINITIONS_FILE
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "nothing was there before: {leftovers:?}"
+        );
     }
 
     /// A key that fails to persist must leave no slashing-protection record

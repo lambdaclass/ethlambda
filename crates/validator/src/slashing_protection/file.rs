@@ -42,6 +42,10 @@ pub const FILE_NAME: &str = "slashing_protection.json";
 /// The only EIP-3076 interchange version this client reads or writes.
 pub const INTERCHANGE_VERSION: &str = "5";
 
+/// This client's own file, read strictly: a field it did not write is an
+/// error, since nothing else should have written here. Not for reading
+/// other clients' interchange files, which may carry fields this refuses;
+/// an importer needs its own, lenient, types.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Interchange {
@@ -146,10 +150,10 @@ fn record_of(entry: &Entry) -> std::result::Result<Record, String> {
 
     let mut attestation: Option<Signed> = None;
     for signed in &entry.signed_attestations {
-        // The same shape the record and the attestation-data check refuse:
-        // a source at or past its target, never valid outside genesis. Read
-        // into the record, it would refuse every honest attestation after it.
-        if signed.source_epoch >= signed.target_epoch && signed.source_epoch != 0 {
+        // The same shape the record and the attestation-data check refuse.
+        // Read into the record, it would refuse every honest attestation
+        // after it.
+        if super::is_impossible_source(signed.source_epoch, signed.target_epoch) {
             return Err(format!(
                 "attestation source epoch {} is at or after its target epoch {}",
                 signed.source_epoch, signed.target_epoch
