@@ -484,8 +484,12 @@ impl SlashingProtection {
 
     /// Check a block for `slot` and, if it may be signed, record it durably.
     ///
-    /// The outer `Err` is a record that could not be written, in which case
-    /// nothing changed and nothing may be signed.
+    /// The outer `Err` is a record that could not be written, and nothing may
+    /// be signed. Nothing changed either, with one exception: on
+    /// [`Error::Unflushed`] the slot is on disk and in memory (see
+    /// [`Self::commit`]), so a retry is refused as already proposed. Treat
+    /// every `Err` as "do not sign"; none of them means the old watermark
+    /// is still the one in force.
     pub fn check_and_record_block(
         &mut self,
         pubkey: &BlsPubkey,
@@ -508,8 +512,12 @@ impl SlashingProtection {
     /// The verdicts are in `pubkeys` order. A key listed twice is judged, at
     /// its later position, against the verdict of its earlier one, so it is
     /// refused the second time: same target as the one just staged. The outer
-    /// `Err` is a record that could not be written, in which case nothing
-    /// changed and none of them may be signed.
+    /// `Err` is a record that could not be written, and none of them may be
+    /// signed. Nothing changed either, with one exception: on
+    /// [`Error::Unflushed`] the target is on disk and in memory (see
+    /// [`Self::commit`]), so a retry is refused as already signed. Treat every
+    /// `Err` as "do not sign"; none of them means the old watermarks are
+    /// still the ones in force.
     pub fn check_and_record_attestations(
         &mut self,
         pubkeys: &[BlsPubkey],
