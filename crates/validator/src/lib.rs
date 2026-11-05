@@ -179,15 +179,13 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
 
     // After the beacon node names the chain, which the record must belong to,
     // and before any service that signs exists. Every loaded key must already
-    // have a record, unless the operator said otherwise; the clock dates the
-    // records `--init-slashing-protection` creates.
+    // have a record, unless the operator said otherwise.
     let keys = store.read().await.pubkeys();
     let protection = slashing_protection::SlashingProtection::open(
         &config.validators_dir,
         genesis.genesis_validators_root,
         &keys,
         config.init_slashing_protection,
-        clock.now(),
     )?;
     info!(
         validators = protection.len(),

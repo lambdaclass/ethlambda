@@ -132,24 +132,30 @@ fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
 
 /// Flush the directory, so a rename into it is itself durable.
 ///
-/// `File::sync_all` first: `fsync` everywhere but macOS, where it is
+/// `File::sync_all` is `fsync` everywhere but macOS, where it is
 /// `F_FULLFSYNC`, the only request there that reaches the disk rather than
 /// the drive's cache, and the one the file's own flush above already relies
-/// on. Some filesystems refuse that request for a directory, so a plain
-/// `fsync` is tried next: it is the best those offer, and the original error
-/// is kept if even that fails.
+/// on. Some macOS filesystems refuse that request for a directory, so there a
+/// plain `fsync` is tried next: it is the best those offer, and the original
+/// error is kept if even that fails. Only there: on Linux the two are the
+/// same call, and a second `fsync` after a failed one can answer success
+/// while the kernel has already dropped the writeback error with the data,
+/// which would make a flush that did not happen look durable.
 #[cfg(unix)]
 fn sync_directory(directory: &Path) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd as _;
     let directory = std::fs::File::open(directory)?;
-    directory.sync_all().or_else(|full_sync| {
+    let result = directory.sync_all();
+    #[cfg(target_os = "macos")]
+    let result = result.or_else(|full_sync| {
+        use std::os::fd::AsRawFd as _;
         // SAFETY: the descriptor is owned by `directory`, which outlives the call.
         if unsafe { libc::fsync(directory.as_raw_fd()) } == 0 {
             Ok(())
         } else {
             Err(full_sync)
         }
-    })
+    });
+    result
 }
 
 #[cfg(not(unix))]

@@ -42,9 +42,10 @@
 //! It cannot see keys running in another client on another machine: no record
 //! kept here can. A key moved here from elsewhere must bring its history with
 //! it, which is why a key with no record is refused at startup unless the
-//! operator says otherwise, and why a key registered with no history starts at
-//! the current slot and epoch rather than as never having signed (see
-//! [`Record::seeded`]).
+//! operator says otherwise. A key registered with no history starts as never
+//! having signed: the migration window, where the key may have signed
+//! elsewhere a moment ago, is doppelganger protection's to close, not this
+//! record's.
 
 pub mod file;
 
@@ -54,7 +55,6 @@ use std::sync::{Arc, Mutex};
 
 use ethlambda_types::beacon::containers::shared::AttestationData;
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, Root, Slot};
-use ethlambda_types::beacon::signing::compute_epoch_at_slot;
 use tracing::warn;
 
 use crate::beacon_node::dto::encode_hex;
@@ -142,29 +142,6 @@ pub(crate) struct Record {
 }
 
 impl Record {
-    /// The record a key gets when it is registered with no history.
-    ///
-    /// "Never signed" when there is no current slot yet (before genesis,
-    /// nothing can have been signed). Otherwise the current slot and epoch, as
-    /// if a block and an attestation had just been signed there: the key may
-    /// have signed both elsewhere a moment ago, and taking those as signed
-    /// costs at most the rest of the epoch's duties. The source stays at zero,
-    /// since the source a beacon node offers is the justified epoch, which lags
-    /// the current one, and seeding it higher would refuse every attestation
-    /// until justification caught up.
-    fn seeded(now: Option<Slot>) -> Record {
-        let Some(slot) = now else {
-            return Record::default();
-        };
-        Record {
-            block_slot: Some(slot),
-            attestation: Some(Signed {
-                source: 0,
-                target: compute_epoch_at_slot(slot),
-            }),
-        }
-    }
-
     fn check_block(&self, slot: Slot) -> std::result::Result<(), Refusal> {
         match self.block_slot {
             Some(signed) if slot <= signed => Err(Refusal::SlotNotAdvanced {
@@ -306,17 +283,15 @@ impl SlashingProtection {
     /// `genesis_validators_root`, and hold its lock until this is dropped.
     ///
     /// Every key in `keys` must already have a record. A key without one is
-    /// refused unless `init` is set, in which case it is registered as of
-    /// `now`, the current slot (see [`Record::seeded`]): the operator's
-    /// statement that this key has signed nothing the record should know about.
-    /// A missing file is created only on the same terms, or when there are no
-    /// keys at all.
+    /// refused unless `init` is set, in which case it is registered as never
+    /// having signed: the operator's statement that this key has signed
+    /// nothing the record should know about. A missing file is created only
+    /// on the same terms, or when there are no keys at all.
     pub fn open(
         validators_dir: &Path,
         genesis_validators_root: Root,
         keys: &[BlsPubkey],
         init: bool,
-        now: Option<Slot>,
     ) -> Result<Self> {
         let lock = file::lock(validators_dir)?;
         let path = validators_dir.join(file::FILE_NAME);
@@ -362,7 +337,7 @@ impl SlashingProtection {
                 "Registering a validator with no slashing-protection history \
                  (--init-slashing-protection)"
             );
-            records.insert(*key, Record::seeded(now));
+            records.insert(*key, Record::default());
         }
 
         if !existed || !missing.is_empty() {
@@ -474,17 +449,17 @@ impl SlashingProtection {
         Ok(verdicts)
     }
 
-    /// Register keys with no record as of `now`, the current slot (see
-    /// [`Record::seeded`]), and persist them in one write.
+    /// Register keys with no record as never having signed, and persist them
+    /// in one write.
     ///
     /// For keys added at runtime through the keymanager API, which loads a key
     /// only after this returns. A key that already has a record keeps it:
     /// registering never lowers a watermark. Returns how many were new.
-    pub fn register(&mut self, pubkeys: &[BlsPubkey], now: Option<Slot>) -> Result<usize> {
+    pub fn register(&mut self, pubkeys: &[BlsPubkey]) -> Result<usize> {
         let new: HashMap<BlsPubkey, Record> = pubkeys
             .iter()
             .filter(|pubkey| !self.records.contains_key(*pubkey))
-            .map(|pubkey| (*pubkey, Record::seeded(now)))
+            .map(|pubkey| (*pubkey, Record::default()))
             .collect();
         let count = new.len();
         if count > 0 {
@@ -579,11 +554,9 @@ mod tests {
             .expect("not poisoned")
     }
 
-    /// Opened before genesis, so a key `init` registers starts as never having
-    /// signed; the seeding is tested on its own below.
     fn open(dir: &Path, keys: &[u8], init: bool) -> Result<SlashingProtection> {
         let keys: Vec<BlsPubkey> = keys.iter().map(|byte| pubkey(*byte)).collect();
-        SlashingProtection::open(dir, root(0x42), &keys, init, None)
+        SlashingProtection::open(dir, root(0x42), &keys, init)
     }
 
     /// Whether the permission-based failure tests can run: root bypasses
@@ -807,7 +780,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         drop(open(dir.path(), &[1], true).expect("init"));
 
-        let err = SlashingProtection::open(dir.path(), root(0x99), &[pubkey(1)], true, None)
+        let err = SlashingProtection::open(dir.path(), root(0x99), &[pubkey(1)], true)
             .expect_err("another genesis_validators_root");
         assert!(err.to_string().contains("another chain"), "{err}");
     }
@@ -922,7 +895,7 @@ mod tests {
 
         assert_eq!(
             protection
-                .register(&[pubkey(1), pubkey(2)], None)
+                .register(&[pubkey(1), pubkey(2)])
                 .expect("register"),
             1
         );
@@ -930,30 +903,24 @@ mod tests {
         assert!(propose(&mut protection, 2, 97).is_ok());
     }
 
-    /// A key registered with no history after genesis is taken as having
-    /// signed a block and an attestation at the current slot and epoch: it may
-    /// have done so elsewhere a moment ago.
+    /// A key registered with no history, at startup or at runtime, starts as
+    /// never having signed: slot 0 and epoch 0 are signable once.
     #[test]
-    fn a_key_registered_after_genesis_starts_at_the_current_slot() {
+    fn a_key_registered_with_no_history_starts_as_never_signed() {
         let dir = tempfile::tempdir().expect("temp dir");
-        // Slot 100 is in epoch 3.
-        let mut protection =
-            SlashingProtection::open(dir.path(), root(0x42), &[pubkey(1)], true, Some(100))
-                .expect("init");
-        protection
-            .register(&[pubkey(2)], Some(100))
-            .expect("register");
+        let mut protection = open(dir.path(), &[1], true).expect("init");
+        protection.register(&[pubkey(2)]).expect("register");
 
         for key in [1, 2] {
-            assert!(propose(&mut protection, key, 100).is_err(), "key {key}");
-            assert!(propose(&mut protection, key, 101).is_ok(), "key {key}");
+            assert!(propose(&mut protection, key, 0).is_ok(), "key {key}");
+            assert!(propose(&mut protection, key, 0).is_err(), "key {key}");
             assert!(
-                attest(&mut protection, key, &data(96, 2, 3, 0xaa)).is_err(),
-                "key {key}: the current epoch's target may already be signed"
+                attest(&mut protection, key, &data(0, 0, 0, 0xaa)).is_ok(),
+                "key {key}"
             );
             assert!(
-                attest(&mut protection, key, &data(128, 2, 4, 0xaa)).is_ok(),
-                "key {key}: the next epoch, with a lagging source, is allowed"
+                attest(&mut protection, key, &data(0, 0, 0, 0xbb)).is_err(),
+                "key {key}"
             );
         }
     }

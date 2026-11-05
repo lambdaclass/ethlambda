@@ -388,8 +388,7 @@ mod tests {
         dir: &std::path::Path,
         keys: &[ethlambda_types::beacon::primitives::BlsPubkey],
     ) -> SharedProtection {
-        let protection =
-            SlashingProtection::open(dir, Root::ZERO, keys, true, None).expect("opens");
+        let protection = SlashingProtection::open(dir, Root::ZERO, keys, true).expect("opens");
         Arc::new(std::sync::Mutex::new(protection))
     }
 

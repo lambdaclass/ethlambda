@@ -674,8 +674,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let settings = Arc::new(ProposerSettings::new(Bytes32::repeat_byte(0xab), None));
         let protection = || {
-            let opened = SlashingProtection::open(dir.path(), Root::ZERO, &[pubkey], true, None)
-                .expect("opens");
+            let opened =
+                SlashingProtection::open(dir.path(), Root::ZERO, &[pubkey], true).expect("opens");
             Arc::new(std::sync::Mutex::new(opened))
         };
 

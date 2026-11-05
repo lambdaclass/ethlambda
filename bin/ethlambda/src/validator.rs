@@ -83,12 +83,10 @@ pub(crate) struct ValidatorOptions {
     /// instead of refusing to start.
     ///
     /// DANGEROUS. Use it only for keys that are brand new, or that have signed
-    /// nothing anywhere for at least two epochs. A key is registered as if it
-    /// had signed a block and an attestation at the current slot and epoch,
-    /// which closes the double-vote window for a key that signed a moment ago
-    /// elsewhere, but not a surround vote against older history. Keys that
-    /// already have a record keep it, so the flag never lowers one; remove it
-    /// once the keys are registered.
+    /// nothing anywhere for at least two epochs. A key is registered as never
+    /// having signed, so nothing here stops it from signing again what it
+    /// signed elsewhere a moment ago. Keys that already have a record keep it,
+    /// so the flag never lowers one; remove it once the keys are registered.
     #[arg(long, default_value = "false")]
     pub(crate) init_slashing_protection: bool,
 }
