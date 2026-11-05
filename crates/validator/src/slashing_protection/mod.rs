@@ -500,7 +500,7 @@ impl SlashingProtection {
     /// directory as it found it. A record created for the wrong chain is not
     /// dangerous either: [`Self::open`] refuses it at the client's next start.
     pub fn open_offline(validators_dir: &Path, create_for: Option<Root>) -> Result<Self> {
-        let lock = file::lock(validators_dir)?;
+        let lock = Self::lock(validators_dir)?;
         let path = validators_dir.join(file::FILE_NAME);
         let (genesis_validators_root, records) = if file::exists(&path)? {
             file::read(&path)?

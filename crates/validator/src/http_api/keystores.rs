@@ -229,6 +229,11 @@ pub async fn import(
                     drop(store);
                     Some(staged)
                 }
+                // `Error::Unflushed` is refused here too, unlike at the keys'
+                // registration below: the history is on disk and in memory,
+                // but were it lost to a power loss, a key saved on the
+                // strength of it would load at the next start on the record
+                // it had before, which is the case writing it first closes.
                 Err(err) => {
                     let message = format!("slashing_protection was not imported: {err}");
                     warn!(%err, "Refusing an import whose slashing-protection history was refused");
@@ -783,8 +788,10 @@ pub async fn delete(
     // record already on disk. Only for the keys that are `deleted` or may
     // become `not_active`, as the specification requires: a key whose delete
     // failed is still on disk and comes back on restart, so its history is
-    // not handed over. Teku and Prysm filter the same way. A key listed twice
-    // is `deleted` once and `not_found` once; `export` lists it once.
+    // not handed over, and neither is one whose removal reached the disk but
+    // not a flush (`Error::Unflushed`, an `error` too), since it may come
+    // back. Teku and Prysm filter the same way. A key listed twice is
+    // `deleted` once and `not_found` once; `export` lists it once.
     let requested: Vec<Option<BlsPubkey>> = results
         .iter()
         .map(|(pubkey, status)| match status.status.as_str() {
