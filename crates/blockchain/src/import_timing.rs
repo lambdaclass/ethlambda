@@ -603,6 +603,9 @@ pub struct CascadeTimings {
 pub struct HeadTimings {
     pub head_start: Option<Instant>,
     pub head_end: Option<Instant>,
+    /// Whether fork choice failed to find a head, leaving the stored one
+    /// where it was. The Fast Confirmation Rule is not run on a stale head.
+    pub head_failed: bool,
     pub fcu_start: Option<Instant>,
     pub fcu_end: Option<Instant>,
 }

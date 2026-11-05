@@ -409,6 +409,24 @@ static LEAN_BEACON_HEAD_COMPUTE_TIME_SECONDS: std::sync::LazyLock<Histogram> =
         .unwrap()
     });
 
+/// One `on_fast_confirmation` run of the beacon Fast Confirmation Rule: the
+/// registry flattening, the per-block safety checks and the variable
+/// bookkeeping, excluding the head computation that precedes it.
+///
+/// Buckets reach a whole mainnet slot, since a run that costs seconds is one
+/// the chain actor cannot afford at the start of a slot.
+static LEAN_BEACON_FAST_CONFIRMATION_TIME_SECONDS: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_beacon_fast_confirmation_time_seconds",
+            "Duration of one beacon Fast Confirmation Rule run",
+            vec![
+                0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 12.0
+            ]
+        )
+        .unwrap()
+    });
+
 static LEAN_PQ_SIG_ATTESTATION_SIGNING_TIME_SECONDS: std::sync::LazyLock<Histogram> =
     std::sync::LazyLock::new(|| {
         register_histogram!(
@@ -1186,6 +1204,12 @@ pub fn time_attestation_validation() -> TimingGuard {
 /// fails still spent the time, and the failing one was the expensive one.
 pub fn time_beacon_head_compute() -> TimingGuard {
     TimingGuard::new(&LEAN_BEACON_HEAD_COMPUTE_TIME_SECONDS)
+}
+
+/// Start timing one beacon Fast Confirmation Rule run. Records when the guard
+/// is dropped, including on the error path, like [`time_beacon_head_compute`].
+pub fn time_beacon_fast_confirmation() -> TimingGuard {
+    TimingGuard::new(&LEAN_BEACON_FAST_CONFIRMATION_TIME_SECONDS)
 }
 
 /// Increment the PQ aggregated signatures counter.
