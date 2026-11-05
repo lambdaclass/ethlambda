@@ -878,7 +878,13 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   actor's tick after the head recompute and before `forkchoiceUpdated`; its
   confirmed root is the engine's safe hash and feeds the `fast_confirmation`
   event. State lives in `Store` (`fast_confirmation`), per-run sums are shared
-  in a `RunContext`. See [`docs/beacon_stf.md`](docs/beacon_stf.md#fast-confirmation-rule).
+  in a `RunContext`. It runs on the actor, so it must stay about as cheap as
+  `get_head`: it reads the fork choice's caches rather than the registry or
+  every vote (balance sources from the per-checkpoint `JustifiedBalances`,
+  attestation scores from the proto-array when the source is the justified
+  checkpoint's), and `get_current_target_score` walks only current-epoch votes
+  (an older vote's root may be below the live index, where each parent hop
+  decodes a block). See [`docs/beacon_stf.md`](docs/beacon_stf.md#fast-confirmation-rule).
 - Nothing is ignored for being unimplemented in the state transition or fork
   choice. Ignored cases are the `LightClient*` containers (a different layer,
   out of scope), `networking/gossip_*` cases outside what the node validates

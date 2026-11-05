@@ -647,6 +647,8 @@ mod tests {
             values.to_vec().into(),
             total,
             increments,
+            Box::default(),
+            total,
         ))
     }
 
