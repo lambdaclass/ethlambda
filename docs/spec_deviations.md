@@ -133,10 +133,33 @@ from the Beacon API, and no other way.
 - **The specification:** builder-specs' `process_bid` asserts
   `header.fee_recipient == fee_recipient`.
 - **ethlambda:** a mismatch is logged at `debug` only.
-- **Why:** relays pay the proposer with a transaction in the payload and name
-  the builder's address as the coinbase, so the assertion would refuse nearly
-  every real bid. Every client reviewed (Lighthouse, Teku, Prysm, Nimbus,
-  Lodestar, Grandine) skips it.
+- **Why:** a builder names its own address as the payload's fee recipient
+  (the coinbase), so priority fees and MEV accrue to it, and pays the proposer
+  with a transaction to the registered fee recipient, worth the bid's `value`,
+  as the payload's last transaction. A mismatch is therefore the normal case,
+  and the assertion would refuse nearly every real bid. Every client reviewed
+  (Lighthouse, Teku, Prysm, Nimbus, Lodestar, Grandine) skips it. A counter of
+  mismatches would rise on nearly every bid and tell an operator nothing.
+- **The payment itself is not checked either, by this node or any client
+  reviewed.** A bid carries only the payload's header: the transactions,
+  payment included, stay with the builder until the proposer has signed. After
+  signing, `submitBlindedBlockV2` returns no payload; the builder publishes
+  the block, which reaches this node over gossip like any other, by which time
+  nothing can be undone.
+- **Who does check it:** the relay. Before serving a builder's bid, a relay
+  validates the submission on an execution node, and that validation requires
+  the proposer payment. Flashbots' block-validation API
+  (`flashbots_validateBuilderSubmission*`) passes the registered fee
+  recipient and the bid's value to `ValidatePayload`, which requires the
+  block's last transaction to pay that address at least that much (or, if the
+  relay configures it, the address's balance to rise by it). The proposer
+  relies on the relay for this, as for the payload's validity. A relay
+  publishes what it delivered on its data API
+  (`/relay/v1/data/bidtraces/proposer_payload_delivered`), which is where an
+  underpayment would surface. An operator who wants more than that trust must
+  choose relays accordingly. A check after the fact, comparing a published
+  block's last transaction with the bid it won, is possible but not
+  implemented.
 
 ## Fee recipient and gas target come from proposer preferences, with fallbacks
 

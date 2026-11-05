@@ -5,9 +5,10 @@
 //! withdrawals, blob count) are checked here too, before
 //! `assemble_blinded_block` repeats them as a backstop, so a refusal has a
 //! reason to count and costs no state transition. What is left unchecked
-//! (the payload's execution validity, its block hash and the fields only an
-//! execution client could verify) is trusted to the relay, as every client
-//! does: the payload is revealed only after the proposer signs.
+//! (the payload's execution validity, its block hash, the fields only an
+//! execution client could verify, and the fee recipient and the payment to the
+//! proposer, see [`validate`]) is trusted to the relay, as every client does:
+//! the payload is revealed only after the proposer signs.
 
 use ethlambda_state_transition::beacon::block_production::PayloadInputs;
 use ethlambda_state_transition::beacon::bls;
@@ -113,6 +114,17 @@ pub(crate) fn validate(bid: &SignedBuilderBid, context: &BidContext) -> Result<(
     ) {
         return Err(Rejection::GasLimit);
     }
+    // Not checked: `header.fee_recipient` against the registered one, which
+    // builder-specs' `process_bid` asserts. A builder names itself as the
+    // payload's fee recipient, so fees and MEV accrue to it, and pays the
+    // proposer with the payload's last transaction, to the registered address
+    // and worth the bid's value. A mismatch is therefore the normal case, and
+    // the assertion would refuse nearly every real bid; no client reviewed
+    // makes it. Nor can the payment be checked here: the header carries no
+    // transactions, and the builder publishes the block after the proposer
+    // signs. The relay checks it, when it validates the builder's submission
+    // on an execution node before serving the bid. See
+    // `docs/spec_deviations.md`.
     let domain = compute_builder_domain(context.genesis_fork_version);
     let root = compute_signing_root(message.hash_tree_root(), domain);
     if !bls::verify(&message.pubkey, root, &bid.signature) {

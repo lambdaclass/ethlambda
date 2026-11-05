@@ -462,7 +462,9 @@ the chain actor writes, so no request waits on the actor.
   execution block as its parent, the proposal's `prev_randao`
   and timestamp, the parent's block number plus one, the withdrawals root,
   the blob commitment and blob gas bounds, a gas limit within one step of the parent's toward the registered target,
-  and the builder's signature. Its fee recipient is not checked (see
+  and the builder's signature. Its fee recipient is not checked, since builders
+  name themselves there and pay the proposer with a transaction this node never
+  sees before signing; the relay checks that payment (see
   `spec_deviations.md`). A bid that passes goes through `assemble_blinded_block`
   with the packed attestations, operations and sync aggregate, so the blinded
   block's state root comes from running the block through `process_block`.

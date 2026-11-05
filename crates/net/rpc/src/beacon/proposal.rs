@@ -977,8 +977,9 @@ fn accepted_bid(
     }
     let message = bid.bid.message;
     if message.header.fee_recipient != request.registration.fee_recipient {
-        // Expected: relays pay the proposer with a transaction in the payload
-        // and name the builder as its fee recipient (docs/spec_deviations.md).
+        // Expected, so not a refusal: the builder names itself and pays the
+        // registered address with a transaction. Why `bid::validate` does not
+        // check either is written where the check would go.
         debug!(%slot, "The bid's fee recipient is not the registered one");
     }
     Some(message)
