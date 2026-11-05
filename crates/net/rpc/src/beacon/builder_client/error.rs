@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use reqwest::StatusCode;
+use reqwest::header;
 
 use super::{read_body, truncate_error_text};
 
@@ -26,6 +27,12 @@ pub enum BuilderError {
     /// A status the call does not expect.
     #[error("builder answered {status}: {body}")]
     Status { status: u16, body: String },
+    /// A redirect, which the client does not follow unless told to.
+    #[error(
+        "builder redirected the request to {location} ({status}); redirects are not \
+         followed unless --builder-follow-redirects is set"
+    )]
+    Redirected { status: u16, location: String },
     /// A body that does not decode as what the call returns.
     #[error("builder response did not decode: {0}")]
     Decode(String),
@@ -60,8 +67,15 @@ impl BuilderError {
 
     /// The error a status other than the call's success stands for. A 400
     /// carries the builder's `message`, or its raw body if it sent no JSON.
+    /// A redirect carries its target.
     pub(super) async fn from_status(response: reqwest::Response, deadline: Duration) -> Self {
         let status = response.status();
+        if status.is_redirection() {
+            return Self::Redirected {
+                status: status.as_u16(),
+                location: shown_location(&response),
+            };
+        }
         let body = read_body(response, deadline).await.unwrap_or_default();
         let body = String::from_utf8_lossy(&body).into_owned();
         if status != StatusCode::BAD_REQUEST {
@@ -83,12 +97,34 @@ impl BuilderError {
             Self::Transport(_) => "unreachable",
             Self::BadRequest(_) => "bad_request",
             Self::Status { .. } => "unexpected_status",
+            Self::Redirected { .. } => "redirected",
             Self::Decode(_) | Self::Incomplete(_) | Self::TooLarge { .. } => "invalid_response",
             Self::InvalidUrl(_) => "invalid_url",
             Self::UnsupportedFork(_) => "unsupported_fork",
             Self::Encode(_) => "encode",
         }
     }
+}
+
+/// A redirect's target as an error shows it: without any user or password,
+/// since a URL may carry credentials (see `from_reqwest`), and cut to the
+/// error text cap.
+fn shown_location(response: &reqwest::Response) -> String {
+    let Some(value) = response.headers().get(header::LOCATION) else {
+        return "nowhere (no Location header)".to_owned();
+    };
+    let location = String::from_utf8_lossy(value.as_bytes()).into_owned();
+    let location = match reqwest::Url::parse(&location) {
+        Ok(mut url) if !url.username().is_empty() || url.password().is_some() => {
+            // Neither fails on a URL that already has a user or password.
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.to_string()
+        }
+        // A relative target, or one with nothing to hide, is shown as sent.
+        _ => location,
+    };
+    truncate_error_text(location)
 }
 
 /// builder-specs' `ErrorMessage`, of which only the message is kept.
