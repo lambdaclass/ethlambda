@@ -21,10 +21,11 @@
 //!
 //! # The signing domain
 //!
-//! See [`SigningContext::sign_proposer_preferences`]: the gossip rule's domain,
-//! at the fork of the epoch before the proposal's. The validator guide's
-//! head-state signer differs from it only for a proposal in the first epoch of
-//! a fork, signed during that epoch.
+//! See [`SigningContext::sign_proposer_preferences`]: the fork version of the
+//! proposal epoch itself, as consensus-specs v1.7.0-beta.4 signs and verifies
+//! and as every other client does. Beta.2's gossip rule took the fork of the
+//! epoch before the proposal's, which differs only for a proposal in the first
+//! epoch of a fork, and Lighthouse refuses a preference signed that way.
 //!
 //! # Why every slot
 //!
@@ -374,18 +375,13 @@ mod tests {
 
         let context = context();
         let proposal_epoch = compute_epoch_at_slot(entry.message.proposal_slot);
-        // Spelled out rather than asked of `SigningContext::domain`: the
-        // first gloas epoch's preference verifies under fulu's version (the
-        // fork of the epoch before it), every later one under gloas's.
-        let version = if proposal_epoch == GLOAS_EPOCH {
-            context.config.fulu_fork_version
-        } else {
-            assert!(proposal_epoch > GLOAS_EPOCH);
-            context.config.gloas_fork_version
-        };
+        // Spelled out rather than asked of `SigningContext::domain`: every
+        // preference, the first gloas epoch's included, verifies under the
+        // proposal epoch's version, which for every slot here is gloas's.
+        assert!(proposal_epoch >= GLOAS_EPOCH);
         let domain = compute_domain(
             DOMAIN_PROPOSER_PREFERENCES,
-            version,
+            context.config.gloas_fork_version,
             context.genesis_validators_root,
         );
         let root = compute_signing_root(entry.message.hash_tree_root(), domain);

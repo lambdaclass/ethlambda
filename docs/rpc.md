@@ -679,11 +679,13 @@ message accepted from either side is seen by both.
 - **`POST /eth/v1/validator/proposer_preferences`** takes a list of
   `SignedProposerPreferences` (at most `(MIN_SEED_LOOKAHEAD + 1) *
   SLOTS_PER_EPOCH`, 64 on mainnet), as a JSON array or an SSZ list.
-  `Eth-Consensus-Version` is optional and may be `fulu` or `gloas`, since a
-  validator client submits during the epoch before the fork. Each entry runs the
-  gossip rules in order; an entry already cached, identical, succeeds without a
-  republish. Accepted entries are cached (the first per `(proposal slot,
-  dependent root)` wins) and gossiped. If any entry fails the answer is `400`
+  `Eth-Consensus-Version` is optional and may be `fulu` or `gloas`. Validator
+  clients name `gloas` even during the epoch before the fork (the fork of the
+  preference's slot); `fulu` is accepted as leniency towards one that names its
+  wall clock's fork. Each entry runs the gossip rules in order; an entry already
+  cached, identical, succeeds without a republish. Accepted entries are cached
+  (the first per `(proposal slot, dependent root)` wins) and gossiped. If any
+  entry fails the answer is `400`
   `{code, message, failures: [{index, message}]}` and the others were still
   published. The endpoint is not gated on the sync status. A node whose
   dependent block is unknown answers `ignore: unknown_block` for that entry.

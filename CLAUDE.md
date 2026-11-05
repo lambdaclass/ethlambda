@@ -866,8 +866,9 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   `--builder-proposals`, pre-gloas slots register validators with the node's builder
   and may sign a blinded block, published to the producing node only. From the
   epoch before gloas it signs proposer preferences every slot for its proposals in
-  the current and next epoch (`PreferencesService`, v2 duties, the gossip rule's
-  signing domain), unconditionally, and `produceBlockV4` carries the boost factor.
+  the current and next epoch (`PreferencesService`, v2 duties, signed at the
+  proposal epoch's fork version as consensus-specs v1.7.0-beta.4 and every other
+  client do), unconditionally, and `produceBlockV4` carries the boost factor.
   It still keeps no slashing-protection record; PTC votes have an in-memory
   `(validator, slot)` dedup only, and envelopes are unguarded.
   `get_head_node` is one bottom-up walk for every fork, with

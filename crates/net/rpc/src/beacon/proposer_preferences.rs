@@ -65,8 +65,10 @@ async fn post_proposer_preferences(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    // A validator client submits during the epoch before gloas, when the
-    // consensus version it names is still fulu.
+    // Every validator client names gloas, even during the epoch before it:
+    // Prysm hardcodes it, the others (this one's too) take the fork of the
+    // preference's slot. Fulu is still accepted, as leniency towards a client
+    // that names the fork of its wall clock instead.
     if let Err(err) = require_version(&headers, &[ForkName::Fulu, ForkName::Gloas]) {
         return err.into_response();
     }
