@@ -41,6 +41,7 @@ use ethlambda_state_transition::beacon::{
     },
     bls,
     data_columns::{self, SidecarError},
+    gossip::is_future_slot,
     helpers::accessors::get_beacon_proposer_index,
     stf::{
         block::{BlockProcessingOptions, RandaoVerification},
@@ -74,6 +75,7 @@ use libssz_derive::{SszDecode, SszEncode};
 use libssz_types::SszList;
 use serde::Deserialize;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
 use crate::beacon::bid_selection::wei_u128;
@@ -178,7 +180,9 @@ async fn post_block(
         &store.config(),
         contents.signed_block.message.slot,
         "blocks are accepted for fulu slots only",
-    ) {
+    )
+    .and_then(|()| refuse_future_slot(&store.config(), contents.signed_block.message.slot))
+    {
         return err.into_response();
     }
 
@@ -201,8 +205,10 @@ async fn post_block(
         if slot <= parent_state.slot() {
             return Err(("the block is not after its parent", None));
         }
-        let state = advance_to_slot(&parent_state, slot, &config)
-            .map_err(|_| ("advancing the parent state failed", None))?;
+        let state = advance_to_slot(&parent_state, slot, &config).map_err(|err| {
+            warn!(slot, %err, "Advancing a published block's parent state failed");
+            ("advancing the parent state failed", None)
+        })?;
         let proposer =
             get_beacon_proposer_index(&state).map_err(|_| ("no proposer for the slot", None))?;
         if signed_block.message.proposer_index != proposer {
@@ -295,7 +301,9 @@ async fn post_gloas_block(
         &config,
         block.slot(),
         "blocks are accepted for gloas slots only",
-    ) {
+    )
+    .and_then(|()| refuse_future_slot(&config, block.slot()))
+    {
         return err.into_response();
     }
     let parent_state = match store.get_state(&block.parent_root()) {
@@ -309,8 +317,11 @@ async fn post_gloas_block(
     let verdict = {
         let block = block.clone();
         tokio::task::spawn_blocking(move || {
-            let state = advance_to_slot(&parent_state, block.slot(), &config)
-                .map_err(|_| ApiError::Internal("advancing the parent state failed"))?;
+            let state = advance_to_slot(&parent_state, block.slot(), &config).map_err(|err| {
+                let slot = block.slot();
+                warn!(slot, %err, "Advancing a published block's parent state failed");
+                ApiError::Internal("advancing the parent state failed")
+            })?;
             let expected =
                 ethlambda_state_transition::beacon::helpers::accessors::get_beacon_proposer_index(
                     &state,
@@ -432,6 +443,26 @@ pub(super) fn require_fulu_slot(
     }
 }
 
+/// Refuses a slot that has not started yet by this node's clock, before any
+/// state is advanced to it. Advancing runs every slot and epoch transition up
+/// to the slot, so with no bound a caller naming a far-future slot would hold
+/// a thread for as long as those take.
+///
+/// The bound is gossip's `is_future_slot`: the slot may start at most
+/// `MAXIMUM_GOSSIP_CLOCK_DISPARITY` (500 ms) after now. A validator client asks
+/// for its block and publishes it once the slot has started, so one on a
+/// correct clock never meets the bound, and a block for a slot further ahead
+/// would be ignored by every peer's gossip validation anyway.
+pub(super) fn refuse_future_slot(config: &Config, slot: Slot) -> Result<(), ApiError> {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64);
+    if is_future_slot(config, slot, now_ms) {
+        return Err(ApiError::BadRequest("the slot has not started yet"));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn get_block(
     Path(slot): Path<String>,
@@ -462,7 +493,9 @@ async fn get_block(
         &store.config(),
         slot,
         "block production is served for fulu only",
-    ) {
+    )
+    .and_then(|()| refuse_future_slot(&store.config(), slot))
+    {
         return err.into_response();
     }
     let Some(engine) = engine else {
@@ -602,8 +635,10 @@ async fn produce(
     if slot <= head_state.slot() {
         return Err(ApiError::BadRequest("slot is not after the head block"));
     }
-    let state = advance_to_slot(&head_state, slot, &config)
-        .map_err(|_| ApiError::Internal("advancing the head state failed"))?;
+    let state = advance_to_slot(&head_state, slot, &config).map_err(|err| {
+        warn!(%slot, %err, "Advancing the head state to the proposal slot failed");
+        ApiError::Internal("advancing the head state failed")
+    })?;
     let fork = state.fork_name();
     let proposer =
         ethlambda_state_transition::beacon::helpers::accessors::get_beacon_proposer_index(&state)
@@ -1272,6 +1307,66 @@ mod tests {
         assert_eq!(json["message"], "blocks are accepted for fulu slots only");
     }
 
+    /// Two slots past the wall clock: production and both publish paths
+    /// refuse it before any state is advanced, and before the missing
+    /// execution client or the unknown parent is noticed.
+    #[tokio::test]
+    async fn a_slot_that_has_not_started_is_refused_before_advancing() {
+        let (store, _) = fulu_store();
+        let future = crate::beacon::node::wall_slot(&store) + 2;
+
+        let uri = produce_uri(future, &infinity_reveal(), "&skip_randao_verification");
+        let request = Request::get(uri).body(Body::empty()).unwrap();
+        let (status, json) = respond(produce_app(store.clone(), None), request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["message"], "the slot has not started yet");
+
+        let contents = FuluSignedBlockContents {
+            signed_block: SignedBeaconBlock {
+                message: BeaconBlock {
+                    slot: future,
+                    proposer_index: 0,
+                    parent_root: H256::ZERO,
+                    state_root: H256::ZERO,
+                    body: containers::electra::BeaconBlockBody::empty(),
+                },
+                signature: Default::default(),
+            },
+            kzg_proofs: Default::default(),
+            blobs: Default::default(),
+        };
+        let network = Arc::new(RecordingNetwork::default());
+        let p2p: RpcToP2PRef = network.clone();
+        let app = routes().with_state(store).layer(Extension(p2p));
+        let request = Request::post("/eth/v2/beacon/blocks")
+            .header("eth-consensus-version", "fulu")
+            .header(header::CONTENT_TYPE, crate::SSZ_CONTENT_TYPE)
+            .body(Body::from(contents.to_ssz()))
+            .unwrap();
+        let (status, json) = respond(app, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["message"], "the slot has not started yet");
+
+        let (store, _) = gloas_scheduled_store();
+        let future = crate::beacon::node::wall_slot(&store) + 2;
+        let containers::SignedBeaconBlock::Gloas(block) =
+            crate::test_utils::gloas_beacon_block(future, H256::ZERO, H256::ZERO, H256::ZERO)
+        else {
+            unreachable!("built as gloas")
+        };
+        let p2p: RpcToP2PRef = network.clone();
+        let app = routes().with_state(store).layer(Extension(p2p));
+        let request = Request::post("/eth/v2/beacon/blocks")
+            .header("eth-consensus-version", "gloas")
+            .header(header::CONTENT_TYPE, crate::SSZ_CONTENT_TYPE)
+            .body(Body::from(block.to_ssz()))
+            .unwrap();
+        let (status, json) = respond(app, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["message"], "the slot has not started yet");
+        assert!(network.blocks.lock().unwrap().is_empty());
+    }
+
     /// A fulu body in either encoding reaches the same check and gets the same
     /// answer, here the refusal of a slot the schedule does not place at fulu.
     #[tokio::test]
@@ -1412,6 +1507,52 @@ mod tests {
         let (status, _) = post(store, rejected.clone(), &orphan).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(rejected.blocks.lock().unwrap().is_empty());
+    }
+
+    /// The gloas path claims the slot as the fulu ones do: the same block
+    /// again is a retry, and a different one the proposer signed is refused.
+    #[tokio::test]
+    async fn a_gloas_block_claims_its_slot() {
+        use ethlambda_state_transition::beacon::gloas_block_production::test_support::{
+            config, parent_state, produce, sign_block, state_to_build_on,
+        };
+        let parent = parent_state();
+        let state = state_to_build_on();
+        let produced = produce(&state, true, Vec::new()).unwrap();
+        let (mut store, _anchor) = beacon_store_with_config(parent.clone(), config());
+        store
+            .insert_state(produced.block.parent_root, parent)
+            .unwrap();
+        let sign = |block: &containers::gloas::BeaconBlock| containers::gloas::SignedBeaconBlock {
+            signature: sign_block(&state, block),
+            message: block.clone(),
+        };
+        let first = sign(&produced.block);
+        let mut other = produced.block.clone();
+        other.body.graffiti = Bytes32::repeat_byte(0x42);
+        let second = sign(&other);
+
+        let network = Arc::new(RecordingNetwork::default());
+        let p2p: RpcToP2PRef = network.clone();
+        let app = routes().with_state(store).layer(Extension(p2p));
+        let post = |signed: &containers::gloas::SignedBeaconBlock| {
+            let request = Request::post("/eth/v2/beacon/blocks")
+                .header("eth-consensus-version", "gloas")
+                .header(header::CONTENT_TYPE, crate::SSZ_CONTENT_TYPE)
+                .body(Body::from(signed.to_ssz()))
+                .unwrap();
+            respond(app.clone(), request)
+        };
+
+        assert_eq!(post(&first).await.0, StatusCode::OK);
+        assert_eq!(post(&first).await.0, StatusCode::OK);
+        let (status, json) = post(&second).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(
+            json["message"],
+            "this node already published a different block for the slot"
+        );
+        assert_eq!(network.blocks.lock().unwrap().len(), 2);
     }
 
     use crate::beacon::builder_client::mock_relay::MockRelay;
@@ -1723,6 +1864,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_bid_paying_nothing_stands_in_for_a_failed_local_payload() {
+        let world = builder_world(true, SyncStatus::Synced).await;
+        world.offer(0, |_| {});
+        let answer = produce_answer(&world, Some(dead_engine()), None, "").await;
+        answer.assert(&world, true, "0", 1);
+    }
+
+    #[tokio::test]
+    async fn a_bid_paying_nothing_never_beats_a_local_payload() {
+        let world = builder_world(true, SyncStatus::Synced).await;
+        world.offer(0, |_| {});
+        let query = format!("&builder_boost_factor={}", u64::MAX);
+        let answer = produce(&world, "0x0", false, &query).await;
+        answer.assert(&world, false, "0", 1);
+    }
+
+    #[tokio::test]
     async fn without_a_bid_or_a_local_payload_there_is_no_block() {
         let world = builder_world(true, SyncStatus::Synced).await;
         let answer = produce_answer(&world, Some(dead_engine()), None, "").await;
@@ -1946,12 +2104,11 @@ mod tests {
         assert_eq!(world.relay.blinded_blocks(), [first.clone(), first]);
     }
 
-    #[tokio::test]
-    async fn a_block_published_in_full_blocks_a_different_blinded_one() {
-        let world = builder_world(true, SyncStatus::Synced).await;
-        // A full block for the slot from the local path, signed by its proposer.
-        let answer = produce(&world, "0x2a", false, "").await;
-        answer.assert(&world, false, "42", 1);
+    /// A full block for `world`'s slot from the local path, signed by its
+    /// proposer.
+    async fn signed_full_block(world: &BuilderWorld) -> FuluSignedBlockContents {
+        let answer = produce(world, "0x2a", false, "").await;
+        answer.assert(world, false, "42", 1);
         let mut contents: FuluBlockContents =
             serde_json::from_value(answer.json["data"].clone()).unwrap();
         // The test store keys its head by a root that is not its header's, so
@@ -1961,38 +2118,139 @@ mod tests {
         let proposer = get_beacon_proposer_index(&world.state).unwrap();
         let domain = get_domain(&world.state, DOMAIN_BEACON_PROPOSER, None);
         let signing_root = compute_signing_root(contents.block.hash_tree_root(), domain);
-        let signed = FuluSignedBlockContents {
+        FuluSignedBlockContents {
             signed_block: electra::SignedBeaconBlock {
                 message: contents.block,
                 signature: sign_for(proposer as usize, signing_root),
             },
             kzg_proofs: contents.kzg_proofs,
             blobs: contents.blobs,
-        };
+        }
+    }
 
-        let network = Arc::new(RecordingNetwork::default());
+    /// Both publish routes over one guard, gossiping into `network`.
+    fn publish_app_into(world: &BuilderWorld, network: &Arc<RecordingNetwork>) -> Router {
         let p2p: RpcToP2PRef = network.clone();
-        let app = routes()
+        routes()
             .with_state(world.store.clone())
             .layer(Extension(p2p))
-            .layer(Extension(world.builder.clone()));
+            .layer(Extension(world.builder.clone()))
+    }
+
+    async fn post_full(
+        app: Router,
+        signed: &FuluSignedBlockContents,
+    ) -> (StatusCode, serde_json::Value) {
         let request = Request::post("/eth/v2/beacon/blocks")
             .header("content-type", "application/octet-stream")
             .header("eth-consensus-version", "fulu")
             .body(Body::from(signed.to_ssz()))
             .unwrap();
-        let (status, json) = respond(app.clone(), request).await;
+        respond(app, request).await
+    }
+
+    const TAKEN: &str = "this node already published a different block for the slot";
+
+    #[tokio::test]
+    async fn a_block_published_in_full_blocks_a_different_blinded_one() {
+        let world = builder_world(true, SyncStatus::Synced).await;
+        let signed = signed_full_block(&world).await;
+        let network = Arc::new(RecordingNetwork::default());
+        let app = publish_app_into(&world, &network);
+
+        let (status, json) = post_full(app.clone(), &signed).await;
         assert_eq!(status, StatusCode::OK, "{json}");
         assert_eq!(network.blocks.lock().unwrap().len(), 1);
 
         let blinded = signed_blinded(&world, 1, None);
         let (status, json) = post_blinded(app, &blinded).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
-        assert_eq!(
-            json["message"],
-            "this node already published a different block for the slot"
-        );
+        assert_eq!(json["message"], TAKEN);
         assert!(world.relay.blinded_blocks().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_blinded_block_handed_to_the_builder_blocks_a_different_full_one() {
+        let world = builder_world(true, SyncStatus::Synced).await;
+        let signed = signed_full_block(&world).await;
+        let network = Arc::new(RecordingNetwork::default());
+        let app = publish_app_into(&world, &network);
+
+        let blinded = signed_blinded(&world, 1, None);
+        let (status, json) = post_blinded(app.clone(), &blinded).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(world.relay.blinded_blocks(), [blinded]);
+
+        let (status, json) = post_full(app, &signed).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["message"], TAKEN);
+        assert!(network.blocks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_refused_blinded_block_leaves_the_slot_unclaimed() {
+        let world = builder_world(true, SyncStatus::Synced).await;
+        let app = publish_app(&world);
+        let proposer = get_beacon_proposer_index(&world.state).unwrap() as usize;
+        let forged = signed_blinded(&world, 1, Some(proposer + 1));
+        assert_eq!(
+            post_blinded(app.clone(), &forged).await.0,
+            StatusCode::BAD_REQUEST
+        );
+
+        let genuine = signed_blinded(&world, 2, None);
+        let (status, json) = post_blinded(app, &genuine).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(world.relay.blinded_blocks(), [genuine]);
+    }
+
+    /// Two different blocks for the slot in flight at once: the claim is
+    /// checked and taken under one lock, so exactly one reaches the builder.
+    #[tokio::test]
+    async fn of_two_different_blocks_posted_at_once_one_is_taken() {
+        let world = builder_world(true, SyncStatus::Synced).await;
+        let app = publish_app(&world);
+        let first = signed_blinded(&world, 1, None);
+        let second = signed_blinded(&world, 2, None);
+
+        let ((first_status, _), (second_status, _)) = tokio::join!(
+            post_blinded(app.clone(), &first),
+            post_blinded(app, &second)
+        );
+
+        let mut statuses = [first_status, second_status];
+        statuses.sort();
+        assert_eq!(statuses, [StatusCode::OK, StatusCode::BAD_REQUEST]);
+        let taken = if first_status == StatusCode::OK {
+            first
+        } else {
+            second
+        };
+        assert_eq!(world.relay.blinded_blocks(), [taken]);
+    }
+
+    #[tokio::test]
+    async fn a_blinded_block_for_a_slot_that_has_not_started_is_refused() {
+        let world = builder_world(true, SyncStatus::Synced).await;
+        let mut block = signed_blinded(&world, 1, None);
+        block.message.slot = crate::beacon::node::wall_slot(&world.store) + 2;
+        let (status, json) = post_blinded(publish_app(&world), &block).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["message"], "the slot has not started yet");
+        assert!(world.relay.blinded_blocks().is_empty());
+    }
+
+    /// A 200 is success for V1 but not for `submitBlindedBlockV2`: a 500, with
+    /// a message saying the builder may have taken the block anyway.
+    #[tokio::test]
+    async fn a_builder_answering_200_instead_of_202_is_a_server_error_of_its_own() {
+        let world = builder_world(true, SyncStatus::Synced).await;
+        world.relay.answer_submissions_with(StatusCode::OK);
+        let block = signed_blinded(&world, 1, None);
+        let (status, json) = post_blinded(publish_app(&world), &block).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{json}");
+        assert_eq!(json["message"], blinded_blocks::NOT_202);
+        assert_eq!(world.relay.blinded_blocks(), [block]);
     }
 
     /// The blinded route takes the publish limit, not axum's 2 MiB default.

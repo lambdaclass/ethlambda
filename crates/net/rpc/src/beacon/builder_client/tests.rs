@@ -212,6 +212,26 @@ async fn a_long_error_is_cut_short() {
     assert_eq!(message.len(), 1024);
 }
 
+/// Line breaks are written out, so a builder's text cannot start a log line of
+/// its own, and the escaped text is what the length cap applies to.
+#[tokio::test]
+async fn line_breaks_in_an_error_are_written_out() {
+    let relay = MockRelay::start(GENESIS_FORK_VERSION).await;
+    let body = b"bad block\r\nINFO forged line".to_vec();
+    relay.answer_headers_with(StatusCode::BAD_REQUEST, TEXT, body, None);
+    let Err(BuilderError::BadRequest(message)) = get_header(&client_for(&relay)).await else {
+        panic!("expected a bad request");
+    };
+    assert_eq!(message, r"bad block\r\nINFO forged line");
+
+    let relay = MockRelay::start(GENESIS_FORK_VERSION).await;
+    relay.answer_headers_with(StatusCode::BAD_REQUEST, TEXT, vec![b'\n'; 1000], None);
+    let Err(BuilderError::BadRequest(message)) = get_header(&client_for(&relay)).await else {
+        panic!("expected a bad request");
+    };
+    assert_eq!(message.len(), 1024);
+}
+
 #[tokio::test]
 async fn a_server_error_is_an_unexpected_status() {
     let relay = MockRelay::start(GENESIS_FORK_VERSION).await;
@@ -384,13 +404,32 @@ async fn a_relay_that_refuses_a_block_says_why() {
 
 #[tokio::test]
 async fn only_202_is_a_successful_submission() {
-    for status in [StatusCode::OK, StatusCode::INTERNAL_SERVER_ERROR] {
+    let relay = MockRelay::start(GENESIS_FORK_VERSION).await;
+    relay.answer_submissions_with(StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(matches!(
+        client_for(&relay)
+            .submit_blinded_block(&blinded_block(), ForkName::Fulu)
+            .await,
+        Err(BuilderError::Status { status: 500, .. })
+    ));
+}
+
+/// Another 2xx is still a failure, but one of its own, labelled apart from a
+/// refusal or a server error.
+#[tokio::test]
+async fn a_2xx_other_than_202_is_an_unexpected_success() {
+    for status in [StatusCode::OK, StatusCode::NO_CONTENT] {
         let relay = MockRelay::start(GENESIS_FORK_VERSION).await;
         relay.answer_submissions_with(status);
-        assert!(matches!(
-            client_for(&relay).submit_blinded_block(&blinded_block(), ForkName::Fulu).await,
-            Err(BuilderError::Status { status: answered, .. }) if answered == status.as_u16()
-        ));
+        let result = client_for(&relay)
+            .submit_blinded_block(&blinded_block(), ForkName::Fulu)
+            .await;
+        let Err(err @ BuilderError::UnexpectedSuccess { status: answered }) = result else {
+            panic!("{status}: expected an unexpected success, got {result:?}");
+        };
+        assert_eq!(answered, status.as_u16());
+        assert_eq!(err.label(), "unexpected_success");
+        assert!(err.to_string().contains("202 Accepted"), "{err}");
     }
 }
 

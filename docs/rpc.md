@@ -443,7 +443,13 @@ the chain actor writes, so no request waits on the actor.
   malformed (its commitments, proofs and blobs disagree in count). A slot the
   schedule does not place at fulu (gloas included) is a `400`, checked before
   the execution client; `produceBlockV3` is the fulu endpoint, and a gloas slot
-  goes to `produceBlockV4`.
+  goes to `produceBlockV4`. So is a slot that has not started yet: one starting
+  more than `MAXIMUM_GOSSIP_CLOCK_DISPARITY` (500 ms) after this node's clock,
+  gossip's `is_future_slot`, is refused before any state is advanced to it.
+  Every block endpoint here applies the same bound, since advancing to a
+  far-future slot would run every epoch transition up to it. A validator client
+  asks once its slot has started, and a block further ahead would be ignored on
+  gossip anyway.
 
   **The builder path** is taken only when `--builder` is set, the proposer
   registered through this node (`register_validator`, remembered for two
@@ -452,8 +458,8 @@ the chain actor writes, so no request waits on the actor.
   is too far behind, or too many slots were skipped (the `--builder-fallback-*`
   flags set the thresholds). The builder's `getHeader` is then asked
   concurrently with the local build, bounded by its own timeout, and an error
-  or a timeout means no bid. A bid is checked before it competes: a non-zero
-  value, the head's execution block as its parent, the proposal's `prev_randao`
+  or a timeout means no bid. A bid is checked before it competes: the head's
+  execution block as its parent, the proposal's `prev_randao`
   and timestamp, the parent's block number plus one, the withdrawals root,
   the blob commitment and blob gas bounds, a gas limit within one step of the parent's toward the registered target,
   and the builder's signature. Its fee recipient is not checked (see
@@ -464,7 +470,9 @@ the chain actor writes, so no request waits on the actor.
   payload wins iff its value is at least `factor * bid / 100`, so a tie and a
   factor of 0 keep it and `u64::MAX` takes the bid; the execution client's
   `shouldOverrideBuilder` keeps the local payload whatever the bid pays. If one
-  side fails the other is served. A blinded answer is the blinded block as SSZ
+  side fails the other is served. A bid that pays nothing is not refused, but
+  it never beats a local payload, whatever the factor: it is served only when
+  the local payload or its block fails. A blinded answer is the blinded block as SSZ
   or JSON, with `Eth-Execution-Payload-Blinded: true` and
   `Eth-Execution-Payload-Value` set to the bid's value in wei.
 - **Graffiti** is the validator client's, with both clients' codes and
@@ -483,8 +491,9 @@ the chain actor writes, so no request waits on the actor.
   content type is a `415`). The JSON is the specification's: lodestar's and
   nimbus's validator clients post it, teku's falls back to it, and lighthouse
   and prysm post SSZ. Both reach the same checks after decoding. Fulu: a
-  `SignedBlockContents`. A slot the schedule does not place at fulu is a `400`,
-  checked before any state is advanced. The block is then checked against its
+  `SignedBlockContents`. A slot the schedule does not place at fulu, or one that
+  has not started yet (see `produceBlockV3`), is a `400`, checked before any
+  state is advanced. The block is then checked against its
   **parent's** state advanced to its slot: an unknown parent, a slot not after
   the parent's, the wrong proposer or a bad proposer signature is a `400`. Then
   every blob's cells are computed and all cell proofs batch-verified on a
@@ -495,7 +504,7 @@ the chain actor writes, so no request waits on the actor.
   last the chain actor gets this node's custody columns, then the block, to
   import. Gloas: a bare `gloas::SignedBeaconBlock` (a gloas block carries no
   payload or blobs, so no sidecars go with it; they follow in the envelope). The
-  slot must be scheduled at gloas, the parent must be held, the slot must be
+  slot must be scheduled at gloas and have started, the parent must be held, the slot must be
   after the parent's, and the proposer and signature are checked against the
   parent's state advanced to the slot (all `400` otherwise), before the block is
   gossiped and handed to the chain actor. This node publishes one block per
@@ -506,7 +515,7 @@ the chain actor writes, so no request waits on the actor.
 - **`POST beacon/blinded_blocks`** takes a fulu `SignedBlindedBeaconBlock` as
   JSON or SSZ, by `Content-Type` as above, with `Eth-Consensus-Version: fulu`.
   It is checked as a fulu `beacon/blocks` is, before anything leaves this node:
-  the slot is scheduled at fulu, the parent is held and before the block, the
+  the slot is scheduled at fulu and has started, the parent is held and before the block, the
   proposer is the one the parent's state names for the slot, and the proposer's
   signature verifies (a blinded block has its full block's root, so the check
   is the same). Then the slot is claimed, shared with `beacon/blocks`, and the
@@ -517,8 +526,13 @@ the chain actor writes, so no request waits on the actor.
   the one `beacon/blocks` has (`413` over it). The builder's answer is logged
   from the submission task, an error when it did not take a signed block.
   The status is the builder's: 202 becomes `200`, a builder `400` stays `400`, and anything else
-  is a `500`. There is no local fallback, since a second block would be an
-  equivocation. With no `--builder` the answer is `500`.
+  is a `500`. Only 202 is success, as builder-specs defines `submitBlindedBlockV2`;
+  a builder answering another 2xx (200 is what V1 answered) gets a `500` too,
+  with an error log of its own saying the builder may have published the block
+  anyway, so an operator can tell it from a refusal. There is no local fallback, since a second block would be an
+  equivocation. With no `--builder` the answer is `500`. `broadcast_validation`
+  is not read: the checks above run whatever it names, and the builder, not
+  this node, broadcasts the block.
 - **The operation pool** holds, beside the attestation pool and in memory in
   the same `Store` (`Store::operation_pool`): proposer slashings (one per
   proposer), attester slashings (one per `hash_tree_root`), voluntary exits and
@@ -556,7 +570,7 @@ entries are decoded and not consulted.
 | `200` SSZ | Self-built with `include_payload=true`: `BlockContents` (`block`, `execution_payload_envelope`, `kzg_proofs`, `blobs`). Otherwise, and for every bid-won block, the bare `gloas::BeaconBlock` |
 | `200` JSON | `{version: "gloas", consensus_block_value, execution_payload_value, execution_payload_included, data}`, where `data` is the same container as the SSZ body |
 | Response headers | `Eth-Consensus-Version: gloas`, `Eth-Execution-Payload-Included` (`true` or `false`; always `false` for a bid-won block), `Eth-Execution-Payload-Value` (wei, decimal; a bid's value times `10^9` when it won), `Eth-Consensus-Block-Value` (always `0`: the comparison is of execution payload values only). No `Eth-Builder-Url`: that is for builder-API bids |
-| `400` | A slot the schedule does not place at gloas, a missing or malformed query, a wrong `Eth-Consensus-Version`, a bad body, a slot not after the head block, or a `randao_reveal` that does not verify against the slot's proposer. The slot check precedes the execution-client check, so it is a `400` on any node |
+| `400` | A slot the schedule does not place at gloas or that has not started yet (more than 500 ms ahead of this node's clock, as for `produceBlockV3`), a missing or malformed query, a wrong `Eth-Consensus-Version`, a bad body, a slot not after the head block, or a `randao_reveal` that does not verify against the slot's proposer. The slot check precedes the execution-client check, so it is a `400` on any node |
 | `503` | No execution client and no viable pooled bid for the slot, the execution client did not start or return a build (and no bid took its place), the node is building on a FULL parent whose envelope it does not hold, or the winning bid failed to build and there is no local payload to fall back on |
 
 The node advances the head state to the slot, and decides which parent payload

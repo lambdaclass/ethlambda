@@ -37,6 +37,10 @@ pub(crate) struct LocalOffer {
 /// A factor of `u64::MAX` always takes the builder, except that the execution
 /// client's `shouldOverrideBuilder` still wins. When one side failed, the
 /// other stands.
+///
+/// A bid that pays nothing never beats a local payload, whatever the factor:
+/// it stands only in for one that failed, here or when its block fails to
+/// assemble.
 pub(crate) fn choose(
     local: Option<LocalOffer>,
     bid_value: Option<u128>,
@@ -46,6 +50,7 @@ pub(crate) fn choose(
         (None, None) => None,
         (Some(_), None) => Some(Source::Local),
         (None, Some(_)) => Some(Source::Builder),
+        (Some(_), Some(0)) => Some(Source::Local),
         (Some(local), Some(_)) if local.should_override_builder => Some(Source::Local),
         (Some(_), Some(_)) if boost_factor == u64::MAX => Some(Source::Builder),
         (Some(local), Some(bid)) => {
@@ -137,6 +142,27 @@ mod tests {
                 Some(100 * ETH),
                 u64::MAX,
                 Some(Source::Local),
+            ),
+            (
+                "a bid paying nothing loses to local",
+                local(0),
+                Some(0),
+                100,
+                Some(Source::Local),
+            ),
+            (
+                "even under u64::MAX",
+                local(1),
+                Some(0),
+                u64::MAX,
+                Some(Source::Local),
+            ),
+            (
+                "a bid paying nothing stands in for no local",
+                None,
+                Some(0),
+                0,
+                Some(Source::Builder),
             ),
         ];
         for (name, local, bid, factor, expected) in cases {

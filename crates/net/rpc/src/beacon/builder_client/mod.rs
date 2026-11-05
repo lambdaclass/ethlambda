@@ -368,8 +368,18 @@ pub(super) async fn read_body(
     Ok(body)
 }
 
-/// `text` cut to at most [`MAX_ERROR_TEXT`] bytes, at a char boundary.
-pub(super) fn truncate_error_text(mut text: String) -> String {
+/// `text` on one line, its line breaks written out as `\n` and `\r`, then cut
+/// to at most [`MAX_ERROR_TEXT`] bytes at a char boundary.
+///
+/// A builder's text reaches this node's logs and a validator client's error
+/// message, where a raw line break would start what reads as a log line of
+/// its own.
+pub(super) fn error_text(text: String) -> String {
+    let mut text = if text.contains(['\n', '\r']) {
+        text.replace('\n', "\\n").replace('\r', "\\r")
+    } else {
+        text
+    };
     if text.len() > MAX_ERROR_TEXT {
         let mut end = MAX_ERROR_TEXT;
         while !text.is_char_boundary(end) {
@@ -413,10 +423,14 @@ fn outcome<T>(result: &Result<T, BuilderError>) -> &'static str {
     result.as_ref().map_or_else(BuilderError::label, |_| "ok")
 }
 
-/// A submission's answer: only 202 is success.
+/// A submission's answer: only 202 is success. Any other 2xx is an error of
+/// its own, since the builder may have taken the block all the same.
 async fn submission_result(response: reqwest::Response) -> Result<(), BuilderError> {
     match response.status() {
         StatusCode::ACCEPTED => Ok(()),
+        status if status.is_success() => Err(BuilderError::UnexpectedSuccess {
+            status: status.as_u16(),
+        }),
         _ => Err(BuilderError::from_status(response, SUBMIT_TIMEOUT).await),
     }
 }
