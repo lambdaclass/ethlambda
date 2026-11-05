@@ -9,10 +9,16 @@
 //! not reach the builder, not that the request fails. Each kept
 //! registration also becomes its validator's fee recipient, as
 //! `prepare_beacon_proposer` would make it, so a block built locally after
-//! all still pays the address the validator registered. Once the builder
-//! accepts them, the kept registrations are also remembered for block
-//! production, which asks the builder only for proposers that registered. Not
-//! before: this node does not verify their signatures, the builder does.
+//! all still pays the address the validator registered. As in Lighthouse,
+//! that holds with no builder configured (the answer is still a 500) and
+//! whatever the builder answers. Signatures are not verified here, also as
+//! in Lighthouse: the builder verifies them. So only once the builder accepts
+//! them are the kept registrations remembered for block production, which
+//! asks the builder only for proposers that registered.
+//!
+//! A validator registered more than once in one request keeps only its
+//! newest registration, and an empty request is answered without reading
+//! the head state.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -63,6 +69,9 @@ async fn post_register_validator(
         })
 }
 
+/// What a validator client hears when this node has no builder to forward to.
+const NO_BUILDER: &str = "no builder is configured (--builder)";
+
 async fn register(
     store: Store,
     builder: Option<Arc<Builder>>,
@@ -73,11 +82,21 @@ async fn register(
     // Decoded first, so a malformed body is a 400 whether or not a builder is
     // configured.
     let registrations = decode(headers, body)?;
-    let builder = builder.ok_or(ApiError::Internal("no builder is configured (--builder)"))?;
+    // Nothing to record or forward, so no registry walk: a stream of empty
+    // bodies would otherwise tie up the blocking pool the duty endpoints
+    // share. Still a 500 without a builder, as any other body is.
+    if registrations.is_empty() {
+        builder.ok_or(ApiError::Internal(NO_BUILDER))?;
+        return Ok(());
+    }
+
+    let submitted = registrations.len();
+    let registrations = newest_per_validator(registrations);
+    inc_builder_registrations("duplicate", (submitted - registrations.len()) as u64);
 
     // The head-state read and the walk over the whole registry are blocking
     // work, as the duty endpoints' walks are.
-    let submitted = registrations.len();
+    let candidates = registrations.len();
     let (kept, epoch) = tokio::task::spawn_blocking(move || {
         let (_, state) = head(&store)?;
         // Judged at the later of the head's epoch and the wall clock's, so a
@@ -88,17 +107,22 @@ async fn register(
     })
     .await
     .map_err(|_| ApiError::Internal("checking the registrations failed"))??;
-    inc_builder_registrations("dropped", (submitted - kept.len()) as u64);
-    if kept.is_empty() {
-        return Ok(());
-    }
+    inc_builder_registrations("dropped", (candidates - kept.len()) as u64);
 
+    // Recorded before the builder is even looked for, as Lighthouse records
+    // them: they hold with no builder configured and whatever the builder
+    // answers.
     {
         let mut recipients = fee_recipients.lock().expect("fee recipient lock poisoned");
         for (index, registration) in &kept {
             recipients.insert(*index, registration.message.fee_recipient);
         }
     }
+    let builder = builder.ok_or(ApiError::Internal(NO_BUILDER))?;
+    if kept.is_empty() {
+        return Ok(());
+    }
+
     let kept: Vec<SignedValidatorRegistrationV1> = kept
         .into_iter()
         .map(|(_, registration)| registration)
@@ -151,9 +175,47 @@ fn decode(
     }
 }
 
+/// One registration per validator: its newest by `timestamp`, the later one
+/// in the request on a tie, which is the one a builder keeps (builder-specs'
+/// `process_registration` takes any registration not older than the one it
+/// holds). The kept ones stay in request order.
+///
+/// So one validator repeated many times in a large body is forwarded once,
+/// and its fee recipient is the newest registration's, whatever the order.
+fn newest_per_validator(
+    registrations: Vec<SignedValidatorRegistrationV1>,
+) -> Vec<SignedValidatorRegistrationV1> {
+    let mut newest: HashMap<BlsPubkey, usize> = HashMap::with_capacity(registrations.len());
+    for (position, registration) in registrations.iter().enumerate() {
+        let message = &registration.message;
+        newest
+            .entry(message.pubkey)
+            .and_modify(|held| {
+                if message.timestamp >= registrations[*held].message.timestamp {
+                    *held = position;
+                }
+            })
+            .or_insert(position);
+    }
+    let mut keep = vec![false; registrations.len()];
+    for position in newest.into_values() {
+        keep[position] = true;
+    }
+    registrations
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(registration, keep)| keep.then_some(registration))
+        .collect()
+}
+
 /// The registrations whose validator `state` holds as active or pending at
-/// `epoch`, each with its validator index. One pass over the registry,
-/// whatever the number of registrations.
+/// `epoch` (the later of the head's epoch and the wall clock's), each with its
+/// validator index. One pass over the registry, whatever the number of
+/// registrations.
+///
+/// Future improvement: that pass happens on every call, over the whole
+/// registry, with nothing bounding how many run at once. A pubkey-to-index
+/// map kept beside the head state would make it one lookup per registration.
 fn active_or_pending(
     state: &BeaconState,
     registrations: Vec<SignedValidatorRegistrationV1>,
@@ -199,8 +261,10 @@ mod tests {
     use super::*;
     use crate::FallbackThresholds;
     use crate::beacon::builder_client::BuilderClient;
-    use crate::beacon::builder_client::mock_relay::{MockRelay, signed_registration};
-    use crate::test_utils::beacon_store_at;
+    use crate::beacon::builder_client::mock_relay::{
+        MockRelay, sign_registration, signed_registration, unreachable_url,
+    };
+    use crate::test_utils::{beacon_store_at, beacon_store_at_clock};
 
     const VALIDATORS: usize = 8;
 
@@ -252,6 +316,14 @@ mod tests {
             FallbackThresholds::DEFAULT,
             SyncStatusController::new(SyncStatus::Synced),
         ))
+    }
+
+    /// A builder on a local port nothing listens on.
+    fn unreachable_builder() -> Arc<Builder> {
+        let client =
+            BuilderClient::new(unreachable_url(), Duration::from_secs(1), "ethlambda/test")
+                .unwrap();
+        builder_for(client)
     }
 
     fn client_for(relay: &MockRelay) -> Option<Arc<Builder>> {
@@ -369,14 +441,7 @@ mod tests {
     async fn an_unreachable_builder_is_a_server_error() {
         let store = store_with_exited(&[]);
         let registration = signed_registration(0, genesis_fork_version(&store));
-        let builder = builder_for(
-            BuilderClient::new(
-                "http://127.0.0.1:1",
-                Duration::from_secs(1),
-                "ethlambda/test",
-            )
-            .unwrap(),
-        );
+        let builder = unreachable_builder();
         let (status, _) = post(
             store,
             Some(builder),
@@ -407,13 +472,18 @@ mod tests {
 
     /// A store whose validator `index` is pending: its activation is in the
     /// future and its exit is `FAR_FUTURE_EPOCH`.
+    ///
+    /// The wall clock is pinned to slot 0, as the head is. `beacon_store_at`
+    /// puts it at mainnet's current epoch instead, where an activation at
+    /// epoch 1000 is long past and the validator would be active, not
+    /// pending.
     fn store_with_pending(index: usize) -> Store {
         let mut state = with_signing_validators_at(ForkName::Fulu, VALIDATORS);
         let validator = state.validator_mut(index as ValidatorIndex).unwrap();
         validator.activation_epoch = 1_000;
         validator.exit_epoch = FAR_FUTURE_EPOCH;
         state.apply_pending_mutations();
-        beacon_store_at(state).0
+        beacon_store_at_clock(state, 0).0
     }
 
     #[tokio::test]
@@ -461,14 +531,7 @@ mod tests {
     async fn fee_recipients_are_set_even_when_the_builder_is_unreachable() {
         let store = store_with_exited(&[]);
         let registration = signed_registration(0, genesis_fork_version(&store));
-        let builder = builder_for(
-            BuilderClient::new(
-                "http://127.0.0.1:1",
-                Duration::from_secs(1),
-                "ethlambda/test",
-            )
-            .unwrap(),
-        );
+        let builder = unreachable_builder();
         let fee_recipients = FeeRecipients::default();
 
         let (status, _) = post(
@@ -553,6 +616,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fee_recipients_are_set_even_without_a_builder() {
+        let store = store_with_exited(&[]);
+        let registration = signed_registration(0, genesis_fork_version(&store));
+        let fee_recipients = FeeRecipients::default();
+
+        let (status, _) = post(
+            store,
+            None,
+            fee_recipients.clone(),
+            json_request(&[registration]),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            fee_recipients.lock().unwrap().get(&0),
+            Some(&ExecutionAddress::repeat_byte(0x11))
+        );
+    }
+
+    #[tokio::test]
     async fn a_malformed_body_is_a_400() {
         let store = store_with_exited(&[]);
         let request = Request::post("/eth/v1/validator/register_validator")
@@ -600,5 +684,153 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(relay.registrations(), [kept]);
+    }
+
+    /// Validator `index`'s registration at `timestamp`, paying an address of
+    /// `fee_byte` repeated, signed so the relay takes it.
+    fn registration_at(
+        store: &Store,
+        index: usize,
+        timestamp: u64,
+        fee_byte: u8,
+    ) -> SignedValidatorRegistrationV1 {
+        let version = genesis_fork_version(store);
+        let mut message = signed_registration(index, version).message;
+        message.timestamp = timestamp;
+        message.fee_recipient = ExecutionAddress::repeat_byte(fee_byte);
+        sign_registration(index, message, version)
+    }
+
+    #[tokio::test]
+    async fn only_the_newest_registration_of_a_validator_is_kept() {
+        let store = store_with_exited(&[]);
+        let relay = MockRelay::start(genesis_fork_version(&store)).await;
+        let oldest = registration_at(&store, 0, 100, 0x22);
+        let newest = registration_at(&store, 0, 300, 0x33);
+        let older = registration_at(&store, 0, 200, 0x44);
+        let other = signed_registration(1, genesis_fork_version(&store));
+        let fee_recipients = FeeRecipients::default();
+
+        let (status, body) = post(
+            store,
+            client_for(&relay),
+            fee_recipients.clone(),
+            json_request(&[oldest, newest.clone(), older, other.clone()]),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(relay.registrations(), [newest, other]);
+        assert_eq!(
+            fee_recipients.lock().unwrap().get(&0),
+            Some(&ExecutionAddress::repeat_byte(0x33))
+        );
+    }
+
+    #[tokio::test]
+    async fn on_a_timestamp_tie_the_later_registration_wins() {
+        let store = store_with_exited(&[]);
+        let relay = MockRelay::start(genesis_fork_version(&store)).await;
+        let first = registration_at(&store, 0, 100, 0x22);
+        let second = registration_at(&store, 0, 100, 0x33);
+
+        let (status, body) = post(
+            store,
+            client_for(&relay),
+            FeeRecipients::default(),
+            json_request(&[first, second.clone()]),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(relay.registrations(), [second]);
+    }
+
+    #[tokio::test]
+    async fn an_empty_list_is_a_success_without_a_call() {
+        let store = store_with_exited(&[]);
+        let relay = MockRelay::start(genesis_fork_version(&store)).await;
+
+        let (status, body) = post(
+            store,
+            client_for(&relay),
+            FeeRecipients::default(),
+            json_request(&[]),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(relay.registration_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_empty_list_without_a_builder_is_a_server_error() {
+        let store = store_with_exited(&[]);
+        let (status, _) = post(store, None, FeeRecipients::default(), json_request(&[])).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn a_slashed_validator_that_has_not_exited_is_kept() {
+        // Slashing sets an exit epoch; until the clock reaches it the
+        // validator is `active_slashed`, which builder-specs counts as active.
+        let mut state = with_signing_validators_at(ForkName::Fulu, VALIDATORS);
+        let validator = state.validator_mut(5).unwrap();
+        validator.slashed = true;
+        validator.exit_epoch = 10;
+        validator.withdrawable_epoch = 8_192;
+        state.apply_pending_mutations();
+        let (store, _) = beacon_store_at_clock(state, 0);
+        let relay = MockRelay::start(genesis_fork_version(&store)).await;
+        let slashed = signed_registration(5, genesis_fork_version(&store));
+
+        let (status, body) = post(
+            store,
+            client_for(&relay),
+            FeeRecipients::default(),
+            json_request(std::slice::from_ref(&slashed)),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(relay.registrations(), [slashed]);
+    }
+
+    #[tokio::test]
+    async fn the_last_fee_recipient_written_wins() {
+        let store = store_with_exited(&[]);
+        let relay = MockRelay::start(genesis_fork_version(&store)).await;
+        let registration = signed_registration(0, genesis_fork_version(&store));
+        let fee_recipients = FeeRecipients::default();
+        let app = crate::beacon::validator::routes()
+            .merge(routes())
+            .with_state(store)
+            .layer(Extension(client_for(&relay).unwrap()))
+            .layer(Extension(fee_recipients.clone()));
+        let prepare = || {
+            let body = serde_json::json!([
+                { "validator_index": "0", "fee_recipient": format!("0x{}", "ab".repeat(20)) }
+            ]);
+            Request::post("/eth/v1/validator/prepare_beacon_proposer")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let recipient = || fee_recipients.lock().unwrap().get(&0).copied();
+        let prepared = ExecutionAddress::repeat_byte(0xab);
+        let registered = ExecutionAddress::repeat_byte(0x11);
+
+        let response = app.clone().oneshot(prepare()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(recipient(), Some(prepared));
+
+        let request = json_request(&[registration]);
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(recipient(), Some(registered));
+
+        let response = app.oneshot(prepare()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(recipient(), Some(prepared));
     }
 }
