@@ -60,7 +60,7 @@ pub(crate) fn run(options: SlashingProtectionOptions) -> eyre::Result<()> {
             let staged = SlashingProtection::stage(&interchange)?;
             let mut protection =
                 SlashingProtection::open_offline(&validators_dir, Some(staged.root()))?;
-            let (validators, _) = protection.absorb(Some(&staged), &[])?;
+            let validators = protection.absorb(Some(&staged), &[])?.named;
             info!(
                 validators,
                 file = %file.display(),

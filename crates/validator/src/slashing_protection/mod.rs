@@ -202,6 +202,18 @@ impl StagedHistory {
     }
 }
 
+/// What [`SlashingProtection::absorb`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Absorbed {
+    /// How many distinct validators the history named.
+    pub named: usize,
+    /// How many keys were newly registered as never having signed.
+    pub registered: usize,
+    /// The validators that already had a record and whose watermarks the
+    /// history raised: a caller running some of them can say so.
+    pub raised: Vec<BlsPubkey>,
+}
+
 /// What one validator has signed: its watermarks.
 ///
 /// `None` is "never signed", kept distinct from zero so that slot 0 and epoch
@@ -623,7 +635,8 @@ impl SlashingProtection {
     /// only after this returns. A key that already has a record keeps it:
     /// registering never lowers a watermark. Returns how many were new.
     pub fn register(&mut self, pubkeys: &[BlsPubkey]) -> Result<usize> {
-        self.absorb(None, pubkeys).map(|(_, registered)| registered)
+        self.absorb(None, pubkeys)
+            .map(|absorbed| absorbed.registered)
     }
 
     /// The chain this record belongs to.
@@ -657,7 +670,8 @@ impl SlashingProtection {
     /// validators it named.
     pub fn import(&mut self, interchange: &str) -> Result<usize> {
         let staged = Self::stage(interchange)?;
-        self.absorb(Some(&staged), &[]).map(|(named, _)| named)
+        self.absorb(Some(&staged), &[])
+            .map(|absorbed| absorbed.named)
     }
 
     /// Parse `interchange` into what [`Self::absorb`] takes, off any lock:
@@ -688,8 +702,9 @@ impl SlashingProtection {
 
     /// Merge `history`, if any, as [`Self::import`] describes, and register
     /// every key in `register` that then still has no record, in one durable
-    /// write: either all of it is on disk or none of it is. Returns how many
-    /// validators the history named and how many keys were newly registered.
+    /// write: either all of it is on disk or none of it is. Reports how many
+    /// validators the history named, how many keys were newly registered,
+    /// and which existing records the history raised.
     ///
     /// A key in `register` that already has a record and is not in the
     /// history keeps that record, with a warning: it is what this client last
@@ -700,7 +715,7 @@ impl SlashingProtection {
         &mut self,
         history: Option<&StagedHistory>,
         register: &[BlsPubkey],
-    ) -> Result<(usize, usize)> {
+    ) -> Result<Absorbed> {
         let mut staged: HashMap<BlsPubkey, Record> = HashMap::new();
         if let Some(history) = history {
             self.check_staged(history)?;
@@ -731,10 +746,19 @@ impl SlashingProtection {
             registered += 1;
         }
         staged.retain(|pubkey, record| self.records.get(pubkey) != Some(record));
+        let raised = staged
+            .keys()
+            .filter(|pubkey| self.records.contains_key(*pubkey))
+            .copied()
+            .collect();
         if !staged.is_empty() {
             self.commit(staged)?;
         }
-        Ok((named, registered))
+        Ok(Absorbed {
+            named,
+            registered,
+            raised,
+        })
     }
 
     /// The records of `pubkeys` as a minimal EIP-3076 version 5 interchange.
@@ -1314,6 +1338,39 @@ mod tests {
         assert!(propose(&mut protection, 1, 51).is_ok());
         assert!(attest(&mut protection, 1, &data(192, 4, 6, 0xaa)).is_err());
         assert!(attest(&mut protection, 1, &data(224, 4, 7, 0xaa)).is_ok());
+    }
+
+    /// `absorb` says which existing records it raised, and only those: a
+    /// record the history creates, or leaves as it was, is not one.
+    #[test]
+    fn absorb_reports_the_records_it_raised() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut protection = open(dir.path(), &[1, 2], true).expect("init");
+        propose(&mut protection, 1, 10).expect("propose");
+        propose(&mut protection, 2, 200).expect("propose");
+
+        let staged = SlashingProtection::stage(&interchange(0x42, 1, 50, 4, 6)).expect("stages");
+        let absorbed = protection.absorb(Some(&staged), &[]).expect("absorbs");
+        assert_eq!(absorbed.raised, vec![pubkey(1)]);
+        assert_eq!(absorbed.named, 1);
+
+        // Already at these watermarks: nothing raised, nothing registered.
+        let again = protection
+            .absorb(Some(&staged), &[pubkey(1)])
+            .expect("absorbs");
+        assert_eq!(
+            again,
+            Absorbed {
+                named: 1,
+                ..Absorbed::default()
+            }
+        );
+
+        // A record the history creates is not a raised one.
+        let fresh = SlashingProtection::stage(&interchange(0x42, 3, 50, 4, 6)).expect("stages");
+        let created = protection.absorb(Some(&fresh), &[]).expect("absorbs");
+        assert!(created.raised.is_empty());
+        assert!(protection.contains(&pubkey(3)));
     }
 
     /// An older history imported over a newer record must not lower it.

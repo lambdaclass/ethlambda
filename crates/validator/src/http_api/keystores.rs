@@ -20,7 +20,11 @@
 //!   that fails takes the keys off disk again. A key with no history at all is
 //!   registered as never having signed, with a warning. The history may also
 //!   name validators that are not in the request: they get records too, and
-//!   a later `DELETE` of one answers `not_active`.
+//!   a later `DELETE` of one answers `not_active`. One of them may be a key
+//!   this client is running now; its watermarks are raised like any other,
+//!   since a history saying it signed elsewhere is exactly what the record
+//!   must know, and the raise is logged so the operator finds out that the
+//!   key ran in two places.
 //! - `DELETE` returns the deleted keys' records as a minimal interchange,
 //!   taken after the keys are out of the store, so it covers every signature
 //!   this process made with them. A key that is gone but still has a record is
@@ -202,13 +206,27 @@ pub async fn import(
                         protection.absorb(Some(&absorbed), &[])
                     })
                     .await
-                    .map(|(named, _)| (staged, named))
+                    .map(|absorbed| (staged, absorbed))
                 }
                 Err(err) => Err(err),
             };
             match written {
-                Ok((staged, named)) => {
-                    info!(validators = named, "Imported slashing-protection history");
+                Ok((staged, absorbed)) => {
+                    info!(
+                        validators = absorbed.named,
+                        "Imported slashing-protection history"
+                    );
+                    // A key running here whose watermarks this history raised
+                    // signed elsewhere while it ran here: worth knowing.
+                    let store = context.store.read().await;
+                    for pubkey in absorbed.raised.iter().filter(|key| store.contains(key)) {
+                        warn!(
+                            pubkey = %encode_hex(&pubkey.0),
+                            "Imported history raised the slashing-protection watermarks of a \
+                             validator this client is running; it has signed elsewhere too"
+                        );
+                    }
+                    drop(store);
                     Some(staged)
                 }
                 Err(err) => {
@@ -298,7 +316,7 @@ pub async fn import(
         .collect();
     // Nothing to register for a request that saved no key.
     let registration = if persisted.is_empty() {
-        Ok((0, 0))
+        Ok(crate::slashing_protection::Absorbed::default())
     } else {
         let registering = persisted.clone();
         let history = history.clone();
@@ -319,15 +337,15 @@ pub async fn import(
                 "Slashing-protection records written, but the directory could not be flushed; \
                  the imported keys are registered"
             );
-            Ok((0, 0))
+            Ok(crate::slashing_protection::Absorbed::default())
         }
         other => other,
     };
-    if let Ok((_, registered)) = registration
-        && registered > 0
+    if let Ok(absorbed) = &registration
+        && absorbed.registered > 0
     {
         warn!(
-            registered,
+            registered = absorbed.registered,
             "Imported validator keys with no slashing-protection history; each starts as \
              never having signed"
         );
