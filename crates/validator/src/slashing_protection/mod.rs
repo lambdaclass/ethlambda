@@ -661,8 +661,7 @@ impl SlashingProtection {
     }
 
     /// Parse `interchange` into what [`Self::absorb`] takes, off any lock:
-    /// its version and shape are judged here, its chain by
-    /// [`Self::check_staged`] or by `absorb` itself.
+    /// its version and shape are judged here, its chain by `absorb`.
     pub fn stage(interchange: &str) -> Result<StagedHistory> {
         let (root, entries) =
             file::parse(interchange).map_err(|reason| Error::SlashingProtection {
@@ -673,7 +672,7 @@ impl SlashingProtection {
     }
 
     /// Whether `staged` is for this record's chain, changing nothing.
-    pub fn check_staged(&self, staged: &StagedHistory) -> Result<()> {
+    fn check_staged(&self, staged: &StagedHistory) -> Result<()> {
         if staged.root != self.genesis_validators_root {
             return Err(Error::SlashingProtection {
                 path: "interchange".to_string(),
@@ -695,7 +694,8 @@ impl SlashingProtection {
     /// A key in `register` that already has a record and is not in the
     /// history keeps that record, with a warning: it is what this client last
     /// signed with the key, which says nothing about what the key signed
-    /// elsewhere since.
+    /// elsewhere since. Nothing is written when no watermark would change,
+    /// so absorbing a history twice costs one write, not two.
     pub fn absorb(
         &mut self,
         history: Option<&StagedHistory>,
@@ -730,6 +730,7 @@ impl SlashingProtection {
             staged.insert(*pubkey, Record::default());
             registered += 1;
         }
+        staged.retain(|pubkey, record| self.records.get(pubkey) != Some(record));
         if !staged.is_empty() {
             self.commit(staged)?;
         }

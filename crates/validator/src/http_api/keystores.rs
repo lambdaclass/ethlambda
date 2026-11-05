@@ -5,18 +5,22 @@
 //! The specification lets these routes carry a validator's EIP-3076 history in
 //! and out, and both do:
 //!
-//! - `POST` judges the request's `slashing_protection` before touching
-//!   anything: one that does not parse, or is for another chain, fails every
-//!   key in the request and imports none of them. It is written once at least
-//!   one key is saved, in the same durable write as the keys' registration
-//!   and before any is loaded, so a key never starts signing ahead of its
-//!   history, and a write that fails, or a request that saved no key, leaves
-//!   nothing behind. It is written whole, entries for keys of the request
-//!   that failed included: real history is never the dangerous direction, and
-//!   a later import of such a key merges with it. A key with no history at
-//!   all is registered as never having signed, with a warning. The history
-//!   may also name validators that are not in the request: they get records
-//!   too, and a later `DELETE` of one answers `not_active`.
+//! - `POST` judges and writes the request's `slashing_protection` before
+//!   touching any key: one that does not parse, or is for another chain,
+//!   fails every key in the request and imports none of them. Written first,
+//!   rather than with the keys' registration, because a key that was deleted
+//!   here earlier keeps its record: were the keys saved first, a crash before
+//!   the history landed would load such a key at its next start on the
+//!   watermarks it had before it left, with whatever it signed elsewhere
+//!   unknown. The history only ever raises watermarks, so writing it for keys
+//!   that then fail to save leaves nothing dangerous behind, and it is
+//!   written whole, entries for keys of the request that failed included: a
+//!   later import of such a key merges with it. The keys are registered after
+//!   they are saved, in one write, before any is loaded, and a registration
+//!   that fails takes the keys off disk again. A key with no history at all is
+//!   registered as never having signed, with a warning. The history may also
+//!   name validators that are not in the request: they get records too, and
+//!   a later `DELETE` of one answers `not_active`.
 //! - `DELETE` returns the deleted keys' records as a minimal interchange,
 //!   taken after the keys are out of the store, so it covers every signature
 //!   this process made with them. A key that is gone but still has a record is
@@ -80,8 +84,8 @@ pub struct ImportRequest {
     /// memory until decryption runs, and a plain `Vec<String>` would leave
     /// those bytes sitting in the allocator's freed memory afterwards.
     pub passwords: Zeroizing<Vec<String>>,
-    /// An EIP-3076 interchange, written once the keys are saved and before
-    /// any of them is loaded; see the module documentation.
+    /// An EIP-3076 interchange, written before any key is saved; see the
+    /// module documentation.
     #[serde(default)]
     pub slashing_protection: Option<String>,
 }
@@ -170,11 +174,10 @@ pub async fn import(
         return Json(StatusResponse { data });
     }
 
-    // The history is parsed once, off every lock, and judged against the
-    // record's chain before anything is touched, so a request whose history
-    // would be refused imports no key at all, rather than some keys without
-    // it. It is written later, in the same write as the keys' registration,
-    // once the keys it came with are known to be saved. Parsed on the
+    // The history is parsed once, off every lock, and written before any key
+    // is touched, so a request whose history is refused imports no key at
+    // all, and no key can be saved ahead of the history it came with (see the
+    // module documentation for the crash that ordering closes). Parsed on the
     // blocking pool: a complete-format interchange runs to tens of megabytes
     // (see `KEYMANAGER_BODY_LIMIT`), and the executor thread this handler
     // runs on also drives the duty services.
@@ -191,20 +194,23 @@ pub async fn import(
                     reason: format!("could not be parsed: {err}"),
                 })
             });
-            let judged = match staged {
+            let written = match staged {
                 Ok(staged) => {
                     let staged = Arc::new(staged);
-                    let checked = staged.clone();
+                    let absorbed = staged.clone();
                     crate::slashing_protection::blocking(&context.protection, move |protection| {
-                        protection.check_staged(&checked)
+                        protection.absorb(Some(&absorbed), &[])
                     })
                     .await
-                    .map(|()| staged)
+                    .map(|(named, _)| (staged, named))
                 }
                 Err(err) => Err(err),
             };
-            match judged {
-                Ok(staged) => Some(staged),
+            match written {
+                Ok((staged, named)) => {
+                    info!(validators = named, "Imported slashing-protection history");
+                    Some(staged)
+                }
                 Err(err) => {
                     let message = format!("slashing_protection was not imported: {err}");
                     warn!(%err, "Refusing an import whose slashing-protection history was refused");
@@ -278,19 +284,19 @@ pub async fn import(
         prepared.push(prepare_import(&context, &mut definitions, json, password));
     }
 
-    // The request's history is merged and every persisted key registered in
-    // one durable write, before any of them is loaded: the duty path must
-    // never meet a key with no record, and a key the history covers starts
-    // with that history rather than as never having signed. After persisting
-    // rather than before, so a key whose persist failed leaves no record
-    // behind to let a hand-copied keystore past the startup check later. Still
-    // under the definitions guard, so a concurrent delete cannot interleave.
+    // Every persisted key is registered in one durable write, before any of
+    // them is loaded: the duty path must never meet a key with no record.
+    // After persisting rather than before, so a key whose persist failed
+    // leaves no record behind to let a hand-copied keystore past the startup
+    // check later. The history goes along again so that a key it covers is
+    // left on it rather than warned about as having brought none; it was
+    // written above, so this costs nothing unless a key is new. Still under
+    // the definitions guard, so a concurrent delete cannot interleave.
     let persisted: Vec<BlsPubkey> = prepared
         .iter()
         .filter_map(|result| result.as_ref().ok().map(|(pubkey, _, _)| *pubkey))
         .collect();
-    // Nothing is written for a request that saved no key, its history
-    // included: such a request leaves nothing behind.
+    // Nothing to register for a request that saved no key.
     let registration = if persisted.is_empty() {
         Ok((0, 0))
     } else {
@@ -317,17 +323,14 @@ pub async fn import(
         }
         other => other,
     };
-    if let Ok((named, registered)) = registration {
-        if named > 0 {
-            info!(validators = named, "Imported slashing-protection history");
-        }
-        if registered > 0 {
-            warn!(
-                registered,
-                "Imported validator keys with no slashing-protection history; each starts as \
-                 never having signed"
-            );
-        }
+    if let Ok((_, registered)) = registration
+        && registered > 0
+    {
+        warn!(
+            registered,
+            "Imported validator keys with no slashing-protection history; each starts as \
+             never having signed"
+        );
     }
 
     // A key on disk with no record is refused at the next start, and
@@ -1993,11 +1996,14 @@ mod tests {
         assert_eq!(interchange["data"][0]["pubkey"], KEYSTORE_PUBKEY);
     }
 
-    /// History that came with a key that then failed to import is not
-    /// written: nothing it describes is held here.
+    /// The history is written before its key is saved, so it is held even
+    /// when the key then fails to save. The key here was deleted earlier and
+    /// kept an older record: had the key been saved first, a crash before the
+    /// history landed would have loaded it on that older record at the next
+    /// start, which is the case the ordering exists for.
     #[cfg(unix)]
     #[tokio::test]
-    async fn history_whose_key_failed_to_import_is_not_written() {
+    async fn history_is_written_before_its_key_is_saved() {
         let dir = tempfile::tempdir().expect("temp dir");
         // A symlink at the keystore's path makes `persist_import` refuse.
         let target = dir.path().join("elsewhere");
@@ -2005,6 +2011,16 @@ mod tests {
         std::os::unix::fs::symlink(&target, dir.path().join(format!("{KEYSTORE_PUBKEY}.json")))
             .expect("symlinks");
         let (context, protection) = context_with_record(dir.path());
+        let pubkey = parse_pubkey(KEYSTORE_PUBKEY).expect("pubkey");
+        {
+            let mut protection = protection.lock().expect("not poisoned");
+            protection.register(&[pubkey]).expect("registers");
+            protection
+                .check_and_record_block(&pubkey, 10)
+                .expect("written")
+                .expect("allowed");
+        }
+        let store = context.store.clone();
 
         let (_, body) = send(
             router(context, TOKEN.to_string()),
@@ -2020,14 +2036,24 @@ mod tests {
         )
         .await;
         assert_eq!(body["data"][0]["status"], "error", "got {body}");
-        assert!(protection.lock().expect("not poisoned").is_empty());
+        assert!(store.read().await.is_empty(), "the key did not load");
+        assert!(
+            !dir.path().join("validator_definitions.yml").exists(),
+            "nothing was saved"
+        );
+        let protection = protection.lock().expect("not poisoned");
+        assert!(
+            protection.check_block(&pubkey, 100).is_err(),
+            "the history raised the key's record"
+        );
+        assert!(protection.check_block(&pubkey, 101).is_ok());
     }
 
-    /// The history and the registration are one write: when it fails, the
-    /// history is not held either, so the keys it named do not load and sign
-    /// after a restart as if the import had half succeeded.
+    /// The history is written before any key is touched: when that write
+    /// fails, no key is saved or loaded, so nothing of the request is on disk
+    /// to load and sign after a restart as if the import had half succeeded.
     #[tokio::test]
-    async fn a_failed_write_holds_neither_history_nor_registration() {
+    async fn a_failed_history_write_saves_no_key() {
         let dir = tempfile::tempdir().expect("temp dir");
         let (context, protection) = context_with_record(dir.path());
         // A directory in the record's place makes the write's rename fail.
@@ -2058,10 +2084,14 @@ mod tests {
             body["data"][0]["message"]
                 .as_str()
                 .unwrap_or_default()
-                .starts_with("not imported"),
+                .starts_with("slashing_protection was not imported"),
             "got {body}"
         );
         assert!(protection.lock().expect("not poisoned").is_empty());
+        assert!(
+            !dir.path().join(format!("{KEYSTORE_PUBKEY}.json")).exists(),
+            "no keystore was saved"
+        );
     }
 
     #[tokio::test]

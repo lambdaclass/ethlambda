@@ -438,9 +438,9 @@ hold.
 
 The keystore routes carry slashing-protection history. `POST` refuses every
 key in the request if its `slashing_protection` does not parse or is for
-another chain, and otherwise writes that history once the keys are saved and
-before any is loaded; a validator the history names without a keystore in the
-request gets a record too. `DELETE`
+another chain, and otherwise writes that history before any key is saved, so a
+key never loads ahead of it; a validator the history names without a keystore
+in the request gets a record too. `DELETE`
 returns the deleted keys' records as a minimal EIP-3076 interchange, answering
 `not_active` for a key that is gone but still has a record.
 
