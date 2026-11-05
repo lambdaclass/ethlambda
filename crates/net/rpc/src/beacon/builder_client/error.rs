@@ -2,8 +2,8 @@
 
 use std::time::Duration;
 
-use reqwest::StatusCode;
 use reqwest::header;
+use reqwest::{StatusCode, Url};
 
 use super::{read_body, truncate_error_text};
 
@@ -27,10 +27,13 @@ pub enum BuilderError {
     /// A status the call does not expect.
     #[error("builder answered {status}: {body}")]
     Status { status: u16, body: String },
-    /// A redirect, which the client does not follow unless told to.
+    /// A redirect the client did not follow: any redirect without
+    /// `--builder-follow-redirects`, and with it a 301, 302 or 303, an https
+    /// to http downgrade, or the hop past the tenth.
     #[error(
-        "builder redirected the request to {location} ({status}); redirects are not \
-         followed unless --builder-follow-redirects is set"
+        "builder redirected the request to {location} ({status}), which was not followed; \
+         only --builder-follow-redirects follows a redirect, and then only a 307 or 308, \
+         up to ten, never from https to http"
     )]
     Redirected { status: u16, location: String },
     /// A body that does not decode as what the call returns.
@@ -70,7 +73,7 @@ impl BuilderError {
     /// A redirect carries its target.
     pub(super) async fn from_status(response: reqwest::Response, deadline: Duration) -> Self {
         let status = response.status();
-        if status.is_redirection() {
+        if is_redirect(status) {
             return Self::Redirected {
                 status: status.as_u16(),
                 location: shown_location(&response),
@@ -106,25 +109,60 @@ impl BuilderError {
     }
 }
 
-/// A redirect's target as an error shows it: without any user or password,
-/// since a URL may carry credentials (see `from_reqwest`), and cut to the
-/// error text cap.
+/// Whether `status` is a redirect: one of the five statuses a client
+/// follows, and the only ones reqwest consults its redirect policy on. Any
+/// other 3xx (a 304 answering a conditional request, a 300 offering choices)
+/// sends the client nowhere, so it is an ordinary unexpected status.
+fn is_redirect(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::SEE_OTHER
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT
+    )
+}
+
+/// What a redirect shows when its target cannot be shown safely.
+const UNSHOWN_LOCATION: &str = "a Location that does not resolve to a URL with a host";
+
+/// A redirect's target as an error shows it.
 fn shown_location(response: &reqwest::Response) -> String {
     let Some(value) = response.headers().get(header::LOCATION) else {
         return "nowhere (no Location header)".to_owned();
     };
-    let location = String::from_utf8_lossy(value.as_bytes()).into_owned();
-    let location = match reqwest::Url::parse(&location) {
-        Ok(mut url) if !url.username().is_empty() || url.password().is_some() => {
-            // Neither fails on a URL that already has a user or password.
-            let _ = url.set_username("");
-            let _ = url.set_password(None);
-            url.to_string()
-        }
-        // A relative target, or one with nothing to hide, is shown as sent.
-        _ => location,
-    };
-    truncate_error_text(location)
+    shown_target(response.url(), value.as_bytes())
+}
+
+/// `location` resolved against `base`, the URL that answered with it, as a
+/// client following it would, then shown without any user or password and
+/// cut to the error text cap: the error ends up in logs and response bodies
+/// (see `from_reqwest`).
+///
+/// Never the raw value. `//user:pass@host/x` is a relative reference, so it
+/// does not parse as a URL on its own, yet it carries credentials; resolved,
+/// it is an absolute URL whose credentials can be removed. Resolving also
+/// strips any `--builder` credentials a relative target would inherit from
+/// `base`. A value that does not resolve, or resolves to a URL with no host
+/// to hold credentials (`mailto:`), is shown as a fixed placeholder.
+pub(super) fn shown_target(base: &Url, location: &[u8]) -> String {
+    let location = String::from_utf8_lossy(location);
+    base.join(&location)
+        .ok()
+        .and_then(without_credentials)
+        .map_or_else(
+            || UNSHOWN_LOCATION.to_owned(),
+            |url| truncate_error_text(url.into()),
+        )
+}
+
+/// `url` without its user and password, or `None` when it cannot hold them
+/// and so cannot have them removed either.
+pub(super) fn without_credentials(mut url: Url) -> Option<Url> {
+    url.set_username("").ok()?;
+    url.set_password(None).ok()?;
+    Some(url)
 }
 
 /// builder-specs' `ErrorMessage`, of which only the message is kept.
