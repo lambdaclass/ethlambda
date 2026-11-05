@@ -162,7 +162,10 @@ impl<B: BeaconNodeApi> AttestationService<B> {
         // deleted since the schedule was fetched; recording it would burn its
         // watermark for nothing, or, on a persisted record, refuse it as
         // unregistered and count a refusal that was never going to be a
-        // signature. A snapshot, so the read guard is gone before the write.
+        // signature. A snapshot, so the read guard is gone before the write;
+        // a key deleted between it and the signing below fails there as
+        // unknown, and its watermark stays advanced, which only costs a key
+        // on its way out.
         let held: HashSet<BlsPubkey> = store.read().await.pubkeys().into_iter().collect();
         let candidates: Vec<(&AttesterDutyDto, BlsPubkey)> = candidates
             .into_iter()

@@ -119,6 +119,11 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         config.suggested_fee_recipient,
     ));
 
+    // The directory's lock first, before any key is read: held from here,
+    // nothing another process does to the directory can get between what
+    // this one loads and what it signs with. See `SlashingProtection::lock`.
+    let record_lock = slashing_protection::SlashingProtection::lock(&config.validators_dir)?;
+
     let discovered = keys::definitions::ValidatorDefinitions::discover_if_absent(
         &config.validators_dir,
         &config.secrets_dir,
@@ -181,7 +186,8 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     // and before any service that signs exists. Every loaded key must already
     // have a record, unless the operator said otherwise.
     let keys = store.read().await.pubkeys();
-    let protection = slashing_protection::SlashingProtection::open(
+    let protection = slashing_protection::SlashingProtection::open_locked(
+        record_lock,
         &config.validators_dir,
         genesis.genesis_validators_root,
         &keys,

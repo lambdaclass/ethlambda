@@ -82,7 +82,11 @@ anything that does not advance past them.
   `attestations_refused_total`. There is no tool that lowers a watermark, by
   design: stop the client, edit `slashing_protection.json` by hand, and start
   it again. Lowering a watermark is only safe for a key that has not signed
-  past the value written.
+  past the value written. The same holds for a clock that jumps forward: the
+  target is pinned to the slot the local clock asked for, so a beacon node
+  that answers for a slot far ahead lets the record run ahead of the chain.
+  A bound against the clock would be circular; the guard is the beacon
+  node's own view of the head, which doppelganger protection will bring.
 - **Keys with no record:** refused at startup. `--init-slashing-protection`
   registers them as never having signed, and a key imported through the
   keymanager API with no history is registered the same way before it is

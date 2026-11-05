@@ -97,6 +97,12 @@ pub type SharedProtection = Arc<Mutex<SlashingProtection>>;
 /// The operation runs to completion even if the caller is dropped, as a duty
 /// abandoned at its deadline is: that is safe, since a record written for a
 /// message that is then never signed only costs that message.
+/// How long [`blocking`] waits for the record before refusing, and how often
+/// it looks. A flush takes milliseconds on a healthy disk; a quarter of a
+/// 12-second slot is what a slow one gets.
+const RECORD_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+const RECORD_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
 pub async fn blocking<T: Send + 'static>(
     protection: &SharedProtection,
     operation: impl FnOnce(&mut SlashingProtection) -> Result<T> + Send + 'static,
@@ -108,7 +114,30 @@ pub async fn blocking<T: Send + 'static>(
     };
     let protection = protection.clone();
     tokio::task::spawn_blocking(move || {
-        let mut protection = protection.lock().map_err(|_| poisoned())?;
+        // A bounded wait rather than `lock()`: a write normally holds the
+        // record for milliseconds, so a wait this long means a flush is
+        // stuck, and refusing then keeps a stuck disk from piling up one
+        // blocking task per slot until the pool is full. Nothing is signed
+        // on a refusal.
+        let deadline = std::time::Instant::now() + RECORD_WAIT;
+        let mut protection = loop {
+            match protection.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(_)) => return Err(poisoned()),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(Error::SlashingProtectionUnusable {
+                            reason: format!(
+                                "the record has been held by another access for {} s; its \
+                                 write to disk may be stuck",
+                                RECORD_WAIT.as_secs()
+                            ),
+                        });
+                    }
+                    std::thread::sleep(RECORD_POLL);
+                }
+            }
+        };
         operation(&mut protection)
     })
     .await
@@ -164,9 +193,12 @@ impl Record {
 
     fn check_attestation(&self, data: &AttestationData) -> std::result::Result<(), Refusal> {
         let (source, target) = (data.source.epoch, data.target.epoch);
-        // Defence in depth: `validate_attestation_data` refuses this shape
-        // before it reaches the record.
-        if source > target {
+        // A source at or past its target is never valid outside genesis,
+        // where both are zero. `validate_attestation_data` refuses the shape
+        // before it reaches the record; this is the record defending itself,
+        // since recording such a pair would refuse every honest attestation
+        // after it.
+        if source >= target && source != 0 {
             return Err(Refusal::SourceAfterTarget { source, target });
         }
         let Some(signed) = self.attestation else {
@@ -260,7 +292,10 @@ impl std::fmt::Display for Refusal {
                 "source epoch {proposed} is below {signed}, already signed"
             ),
             Self::SourceAfterTarget { source, target } => {
-                write!(f, "source epoch {source} is after target epoch {target}")
+                write!(
+                    f,
+                    "source epoch {source} is at or after target epoch {target}"
+                )
             }
             Self::SlotNotAdvanced { signed, proposed } => write!(
                 f,
@@ -305,7 +340,26 @@ impl SlashingProtection {
         keys: &[BlsPubkey],
         init: bool,
     ) -> Result<Self> {
-        let lock = file::lock(validators_dir)?;
+        let lock = Self::lock(validators_dir)?;
+        Self::open_locked(lock, validators_dir, genesis_validators_root, keys, init)
+    }
+
+    /// Take the directory's exclusive lock ahead of [`Self::open_locked`], so
+    /// it can be held from before the keys are loaded: taken only at `open`,
+    /// a second process could load a key, wait for the first to delete it and
+    /// exit, then take the lock and sign with a key the file no longer lists.
+    pub fn lock(validators_dir: &Path) -> Result<std::fs::File> {
+        file::lock(validators_dir)
+    }
+
+    /// [`Self::open`] with the lock already held, from [`Self::lock`].
+    pub fn open_locked(
+        lock: std::fs::File,
+        validators_dir: &Path,
+        genesis_validators_root: Root,
+        keys: &[BlsPubkey],
+        init: bool,
+    ) -> Result<Self> {
         let path = validators_dir.join(file::FILE_NAME);
         let refused = |reason: String| Error::SlashingProtection {
             path: path.display().to_string(),

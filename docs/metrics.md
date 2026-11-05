@@ -746,7 +746,7 @@ and absent is not the same as zero.
 | `ethlambda_validator_block_publication_delay_seconds` | Histogram | Slot start to block accepted. Its buckets are tighter than the attestation histogram's, because a block is due at the slot boundary rather than a third of the way in |
 | `ethlambda_validator_beacon_node_available` | Gauge | 1 when a beacon node answered the last duty refresh or attestation |
 | `ethlambda_validator_signing_duration_seconds` | Histogram | Time to sign one slot's batch, store read lock included |
-| `ethlambda_validator_slashing_protection_write_seconds` | Histogram | Time to durably write the slashing-protection record, once per slot's attestation batch and once per block, before signing |
+| `ethlambda_validator_slashing_protection_write_seconds` | Histogram | Time to durably write the slashing-protection record, once per slot's attestation batch and once per block, before signing. Milliseconds on a local disk; worth an alert above about a second, since the duty waits for it and a write held past 3 s is refused |
 | `ethlambda_validator_slashing_protection_write_failures_total` | Counter | Slashing-protection writes that failed, each leaving its messages unsigned. Should read zero; anything else points at the disk under `--validators-dir` |
 | `ethlambda_validator_publication_delay_seconds` | Histogram | Slot start to attestations accepted. The headline health number: it should sit near the one-third-slot duty offset |
 

@@ -18,7 +18,7 @@
 //! the theory that a loud, obvious failure at import time beats a tool
 //! silently believing a validator has never signed.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::{Json, extract::State};
@@ -246,6 +246,22 @@ pub async fn import(
         })
         .await
     };
+    // The records are on disk and in memory (see `SlashingProtection::commit`),
+    // only their survival of a power loss is in doubt, and a registration lost
+    // that way is refused at the next start: closed. So the keys are loaded,
+    // rather than rolled back to leave records behind for keys never imported.
+    let registration = match registration {
+        Err(Error::Unflushed { path, source }) => {
+            warn!(
+                %path,
+                %source,
+                "Slashing-protection records written, but the directory could not be flushed; \
+                 the imported keys are registered"
+            );
+            Ok(0)
+        }
+        other => other,
+    };
     if let Ok(registered) = registration
         && registered > 0
     {
@@ -262,8 +278,9 @@ pub async fn import(
     // which is the closed side to fail on. Here the write is known to have
     // failed, so the keys this request added are taken off disk again, the
     // entries it replaced are put back as they were, and the failure costs
-    // this request only. A rewritten keystore stays rewritten: it is the same
-    // key, and the password it was written with is the one on disk.
+    // this request only. A rewritten keystore at the paths a restored entry
+    // names stays: it is the same key. One at paths it does not name is
+    // removed with the added keys' files.
     let rolled_back = match &registration {
         Ok(_) => Ok(()),
         Err(_) => {
@@ -362,24 +379,44 @@ fn undo_import(
     }
     definitions.save(&context.validators_dir)?;
     for pubkey in added {
-        let base = encode_hex(&pubkey.0);
-        for path in [
-            context.validators_dir.join(format!("{base}.json")),
-            context.secrets_dir.join(&base),
-        ] {
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(source) => {
-                    return Err(Error::Io {
-                        path: path.display().to_string(),
-                        source,
-                    });
-                }
-            }
+        for path in written_paths(context, pubkey)? {
+            remove_if_present(&path)?;
+        }
+    }
+    // A restored entry that names other paths does not reference what this
+    // request wrote; a restored entry naming the same paths keeps the
+    // rewritten keystore, which is the same key.
+    for (pubkey, previous) in replaced {
+        let [keystore, password] = written_paths(context, pubkey)?;
+        if absolute(previous.voting_keystore_path.clone())? != keystore {
+            remove_if_present(&keystore)?;
+        }
+        if absolute(previous.voting_keystore_password_path.clone())? != password {
+            remove_if_present(&password)?;
         }
     }
     Ok(())
+}
+
+/// The keystore and password paths `persist_import` writes `pubkey` to.
+fn written_paths(context: &KeymanagerContext, pubkey: &BlsPubkey) -> crate::Result<[PathBuf; 2]> {
+    let base = encode_hex(&pubkey.0);
+    Ok([
+        absolute(context.validators_dir.join(format!("{base}.json")))?,
+        absolute(context.secrets_dir.join(&base))?,
+    ])
+}
+
+/// Remove `path`; one that is already gone is not an error.
+fn remove_if_present(path: &Path) -> crate::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(Error::Io {
+            path: path.display().to_string(),
+            source,
+        }),
+    }
 }
 
 /// Decrypt one keystore and persist it to disk: everything an import can do
@@ -506,19 +543,33 @@ fn persist_import(
         }
     };
 
-    if let Err(err) = definitions.save(&context.validators_dir) {
-        // `Appended` pops rather than removing by index because this function
-        // pushes and saves with nothing in between, so the entry it added is
-        // still the last one.
-        match undo {
-            Undo::Appended => {
-                definitions.0.pop();
-            }
-            Undo::Replaced { index, previous } => definitions.0[index] = previous,
+    match definitions.save(&context.validators_dir) {
+        Ok(()) => Ok(()),
+        // The entry is on disk and every reader sees it; only its survival
+        // of a power loss is in doubt, and an entry lost that way only
+        // removes a key. Counted as persisted, and kept in memory, so what
+        // this request holds matches the file.
+        Err(Error::Unflushed { path, source }) => {
+            warn!(
+                %path,
+                %source,
+                "Validator definitions written, but the directory could not be flushed"
+            );
+            Ok(())
         }
-        return Err(err);
+        Err(err) => {
+            // `Appended` pops rather than removing by index because this
+            // function pushes and saves with nothing in between, so the
+            // entry it added is still the last one.
+            match undo {
+                Undo::Appended => {
+                    definitions.0.pop();
+                }
+                Undo::Replaced { index, previous } => definitions.0[index] = previous,
+            }
+            Err(err)
+        }
     }
-    Ok(())
 }
 
 fn absolute(path: PathBuf) -> crate::Result<PathBuf> {
@@ -608,8 +659,19 @@ fn delete_one(
     // a `not_found` that reads as "already gone": acting on that, by importing
     // the key elsewhere, is what turns a failed delete into two hosts signing
     // for one validator.
-    if let Err(err) = persist_delete(context, pubkey) {
-        return KeyStatus::error(err);
+    match persist_delete(context, pubkey) {
+        Ok(()) => {}
+        // The removal is on disk but may not survive a power loss, and the
+        // keystore stays, so the key could come back enabled, with its
+        // record, while the operator runs it elsewhere. An error, so no
+        // caller takes the key for gone; this process does not sign with it.
+        Err(Error::Unflushed { path, source }) => {
+            return KeyStatus::error(format!(
+                "removed from {path}, but the directory could not be flushed: {source}; the key \
+                 may come back after a power loss"
+            ));
+        }
+        Err(err) => return KeyStatus::error(err),
     }
 
     info!(pubkey = %encode_hex(&pubkey.0), "Deleted validator key");
@@ -1209,6 +1271,18 @@ mod tests {
         );
         let definitions = ValidatorDefinitions::open(dir.path()).expect("opens");
         assert_eq!(definitions.0, vec![previous], "the disabled entry is back");
+        let json_files: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("lists")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().is_file())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".json"))
+            .collect();
+        assert!(
+            json_files.is_empty(),
+            "the keystore this request wrote, which the restored entry does not name, is \
+             removed: {json_files:?}"
+        );
     }
 
     /// A key that fails to persist must leave no slashing-protection record

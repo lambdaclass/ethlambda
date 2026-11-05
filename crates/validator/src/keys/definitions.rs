@@ -63,22 +63,25 @@ impl ValidatorDefinitions {
             reason: err.to_string(),
         })?;
 
-        match secure_fs::write_private_durably(&path, contents) {
-            Ok(()) => Ok(()),
-            // The file is replaced and every reader, this process included,
-            // sees the new one; only its survival of a power loss is in
-            // doubt. Counting that as written keeps what this process holds
-            // equal to what is on disk, and a lost entry after a power loss
-            // only removes a key, never a watermark.
-            Err(err) if err.after_rename => {
-                tracing::warn!(path = %path.display(), %err, "Validator definitions written");
-                Ok(())
+        // An after-rename failure is `Error::Unflushed`: the file is replaced
+        // and every reader sees the new one, only its survival of a power loss
+        // is in doubt. What that means is the caller's to decide. An import
+        // can count it as written (a lost entry only removes a key), a delete
+        // cannot (a lost removal brings a key back).
+        secure_fs::write_private_durably(&path, contents).map_err(|err| {
+            let path = path.display().to_string();
+            if err.after_rename {
+                Error::Unflushed {
+                    path,
+                    source: err.source,
+                }
+            } else {
+                Error::Io {
+                    path,
+                    source: err.source,
+                }
             }
-            Err(err) => Err(Error::Io {
-                path: path.display().to_string(),
-                source: err.source,
-            }),
-        }
+        })
     }
 
     /// The entries that should be loaded and signed with.
