@@ -65,7 +65,8 @@ use crate::{
 
 /// The slot the block is built for. The head block sits one slot earlier, and
 /// the clock is at the head's slot, so this one is the next slot: the one bids
-/// and preferences are accepted for.
+/// and preferences are accepted for. Production runs once this slot has
+/// started, on [`World::proposing`]'s clock.
 const SLOT: u64 = 33;
 const HEAD_SLOT: u64 = SLOT - 1;
 const GWEI: u64 = 1_000_000_000;
@@ -225,8 +226,20 @@ struct World {
 }
 
 impl World {
-    /// The head block at slot 32 on a clock where that slot is running.
+    /// The head block at slot 32 on a clock where that slot is running: the
+    /// moment bids and preferences for the next slot arrive.
     fn new() -> Self {
+        Self::at_clock(HEAD_SLOT)
+    }
+
+    /// [`World::new`] on a clock where [`SLOT`] is running: the moment a
+    /// validator client asks for its block, since production refuses a slot
+    /// that has not started yet.
+    fn proposing() -> Self {
+        Self::at_clock(SLOT)
+    }
+
+    fn at_clock(clock_slot: u64) -> Self {
         let state = chain_state();
         let genesis = genesis_block();
         let genesis_root = genesis.message_hash_tree_root();
@@ -245,7 +258,7 @@ impl World {
             chain_config(),
             block,
             head_root,
-            HEAD_SLOT,
+            clock_slot,
         );
         store.insert_signed_block(genesis_root, genesis).unwrap();
         store.insert_state(genesis_root, state.clone()).unwrap();
@@ -484,7 +497,7 @@ fn self_built(reply: &Reply) -> bool {
 
 #[tokio::test]
 async fn a_bid_worth_more_than_the_local_payload_is_built_on_and_returned_bare() {
-    let world = World::new();
+    let world = World::proposing();
     let engine = fake_engine(GWEI, false).await;
     let bid = world.bid(5, address(0xcc));
     world.prime_bid(&bid);
@@ -516,7 +529,7 @@ async fn a_bid_worth_more_than_the_local_payload_is_built_on_and_returned_bare()
 
 #[tokio::test]
 async fn a_bid_won_block_is_served_as_ssz_too() {
-    let world = World::new();
+    let world = World::proposing();
     let engine = fake_engine(GWEI, false).await;
     let bid = world.bid(5, address(0xcc));
     world.prime_bid(&bid);
@@ -535,7 +548,7 @@ async fn a_bid_won_block_is_served_as_ssz_too() {
 
 #[tokio::test]
 async fn nothing_is_cached_for_a_bid_block_and_a_self_build_envelope_for_it_is_refused() {
-    let world = World::new();
+    let world = World::proposing();
     let engine = fake_engine(GWEI, false).await;
     world.prime_bid(&world.bid(5, address(0xcc)));
     let app = world.app(Some(&engine));
@@ -609,7 +622,7 @@ async fn the_local_payload_wins_ties_a_zero_factor_a_floor_and_an_override() {
         (1, true, 0, u64::MAX),
     ];
     for (local_wei, should_override, min_bid, factor) in cases {
-        let world = World::new();
+        let world = World::proposing();
         let engine = fake_engine(local_wei, should_override).await;
         world.prime_bid(&world.bid(5, address(0xcc)));
 
@@ -644,7 +657,7 @@ async fn the_local_payload_wins_ties_a_zero_factor_a_floor_and_an_override() {
 async fn a_bid_wins_when_the_local_build_is_below_it_by_one_unit_of_weight() {
     // 1e9 wei is 1 gwei: a tie at factor 100. One wei less and the bid wins.
     for (local_wei, bid_wins) in [(GWEI, false), (GWEI - 1, true)] {
-        let world = World::new();
+        let world = World::proposing();
         let engine = fake_engine(local_wei, false).await;
         world.prime_bid(&world.bid(1, address(0xcc)));
 
@@ -657,7 +670,7 @@ async fn a_bid_wins_when_the_local_build_is_below_it_by_one_unit_of_weight() {
 
 #[tokio::test]
 async fn without_an_engine_a_viable_bid_is_built_on_and_none_is_a_503() {
-    let world = World::new();
+    let world = World::proposing();
     let reply = produce(&world, None, true, &builder_config(0, 0)).await;
     assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
 
@@ -675,7 +688,7 @@ async fn without_an_engine_a_viable_bid_is_built_on_and_none_is_a_503() {
 
 #[tokio::test]
 async fn a_failed_local_build_falls_back_to_a_viable_bid() {
-    let world = World::new();
+    let world = World::proposing();
     let engine = dead_engine();
     let reply = produce(&world, Some(&engine), true, &builder_config(0, 0)).await;
     assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
@@ -701,7 +714,7 @@ async fn bids_that_do_not_fit_the_slot_are_left_to_the_local_payload() {
         }),
     ];
     for (name, change) in mismatches {
-        let world = World::new();
+        let world = World::proposing();
         let engine = fake_engine(1, false).await;
         let mut bid = world.bid(5, address(0xcc));
         change(&mut bid.message);
@@ -718,7 +731,7 @@ async fn bids_that_do_not_fit_the_slot_are_left_to_the_local_payload() {
 
 #[tokio::test]
 async fn a_bid_paying_someone_other_than_the_preferred_recipient_is_skipped() {
-    let world = World::new();
+    let world = World::proposing();
     let engine = fake_engine(1, false).await;
     world.prime_preferences(address(0xaa), 30_000_000);
     world.prime_bid(&world.bid(5, address(0xcc)));
@@ -731,7 +744,7 @@ async fn a_bid_paying_someone_other_than_the_preferred_recipient_is_skipped() {
 
 #[tokio::test]
 async fn a_bid_paying_the_preferred_recipient_is_taken() {
-    let world = World::new();
+    let world = World::proposing();
     let engine = fake_engine(1, false).await;
     world.prime_preferences(address(0xaa), 30_000_000);
     let bid = world.bid(5, address(0xaa));
@@ -745,7 +758,7 @@ async fn a_bid_paying_the_preferred_recipient_is_taken() {
 
 #[tokio::test]
 async fn the_self_build_takes_its_fee_recipient_and_gas_target_from_the_preferences() {
-    let world = World::new();
+    let world = World::proposing();
     let engine = fake_engine(GWEI, false).await;
     let proposer = world.prepared().proposer;
     world
@@ -775,7 +788,7 @@ async fn the_self_build_takes_its_fee_recipient_and_gas_target_from_the_preferen
 
 #[tokio::test]
 async fn without_preferences_the_self_build_falls_back_to_the_prepared_recipient_and_parent_gas() {
-    let world = World::new();
+    let world = World::proposing();
     let engine = fake_engine(GWEI, false).await;
     let proposer = world.prepared().proposer;
     world
@@ -799,7 +812,7 @@ async fn without_preferences_the_self_build_falls_back_to_the_prepared_recipient
     );
 
     // Neither: the zero address.
-    let world = World::new();
+    let world = World::proposing();
     let engine = fake_engine(GWEI, false).await;
     produce(&world, Some(&engine), true, &builder_config(0, 0)).await;
     assert_eq!(
@@ -810,7 +823,7 @@ async fn without_preferences_the_self_build_falls_back_to_the_prepared_recipient
 
 #[tokio::test]
 async fn preferences_of_another_validator_are_not_the_proposers() {
-    let world = World::new();
+    let world = World::proposing();
     let engine = fake_engine(GWEI, false).await;
     let proposer = world.prepared().proposer;
     let other = (proposer + 1) % 64;
@@ -832,7 +845,7 @@ async fn preferences_of_another_validator_are_not_the_proposers() {
 
 #[tokio::test]
 async fn the_existing_error_paths_are_unchanged() {
-    let world = World::new();
+    let world = World::proposing();
     let app = world.app(None);
     // A pre-existing client sends the empty local-preferred config.
     let reply = send(
@@ -844,6 +857,17 @@ async fn the_existing_error_paths_are_unchanged() {
     let reply = send(&app, produce_request(&world, true, "not a config", false)).await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
     assert_eq!(reply.json()["message"], "the body is not a BuilderConfig");
+}
+
+/// A validator client asks once its slot has started. Ahead of that, here a
+/// whole slot early, the slot is refused before the head state is advanced
+/// to it, and before the missing execution client is noticed.
+#[tokio::test]
+async fn a_slot_that_has_not_started_is_refused() {
+    let world = World::new();
+    let reply = produce(&world, None, false, &builder_config(0, 100)).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(reply.json()["message"], "the slot has not started yet");
 }
 
 // ---------------------------------------------------------------------------
@@ -1354,7 +1378,7 @@ async fn the_new_routes_are_wired_with_the_production_layers() {
 async fn the_infinity_reveal_is_produced_only_when_the_flag_skips_its_verification() {
     use ethlambda_state_transition::beacon::bls::G2_POINT_AT_INFINITY;
 
-    let world = World::new();
+    let world = World::proposing();
     let engine = fake_engine(GWEI, false).await;
     let app = world.app(Some(&engine));
     let infinity = BlsSignature(G2_POINT_AT_INFINITY);

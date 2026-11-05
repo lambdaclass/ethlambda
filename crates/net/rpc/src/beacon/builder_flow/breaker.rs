@@ -3,9 +3,11 @@
 //!
 //! builder-specs leaves the conditions to the client; these follow
 //! Lighthouse's. They read the proposal state alone, so two nodes holding
-//! the same state agree: a slot `i` before the proposal slot was empty iff
-//! `block_roots[i] == block_roots[i - 1]`, since `process_slots` carries the
-//! previous root forward over an empty slot.
+//! the same state agree. The empty slots right before the proposal are the
+//! ones since the head block, which the state keeps as its latest block
+//! header. Across the epoch's worth of slots before the proposal, a slot `i`
+//! was empty iff `block_roots[i] == block_roots[i - 1]`, since
+//! `process_slots` carries the previous root forward over an empty slot.
 
 use ethlambda_state_transition::beacon::helpers::accessors::get_block_root_at_slot;
 use ethlambda_types::beacon::containers::BeaconState;
@@ -87,7 +89,10 @@ pub(crate) fn check(
     if since_finalization > thresholds.epochs_since_finalization {
         return Err(Trip::NoFinality);
     }
-    let consecutive = (1..slot).rev().take_while(|&i| is_empty(state, i)).count() as u64;
+    // Every slot between the head block and the proposal was empty, so the
+    // run is the distance between them: Lighthouse's `head_skips`.
+    let head_slot = state.latest_block_header().slot;
+    let consecutive = slot.saturating_sub(1).saturating_sub(head_slot);
     if consecutive > thresholds.skips {
         return Err(Trip::ConsecutiveSkips);
     }
@@ -121,7 +126,8 @@ mod tests {
     use super::*;
 
     /// A fulu state at `slot` whose every earlier slot had a block except
-    /// those in `empty`, finalized at `finalized_epoch`.
+    /// those in `empty`, finalized at `finalized_epoch`. Its latest block
+    /// header is the last of those blocks, as slot processing leaves it.
     fn state_at(slot: Slot, empty: &[Slot], finalized_epoch: Epoch) -> BeaconState {
         let mut state = with_signing_validators_at(ForkName::Fulu, 8);
         let BeaconState::Fulu(fulu) = &mut state else {
@@ -136,6 +142,7 @@ mod tests {
                 let mut bytes = [0u8; 32];
                 bytes[..8].copy_from_slice(&(i + 1).to_le_bytes());
                 root = H256(bytes);
+                fulu.latest_block_header.slot = i;
             }
             fulu.block_roots[(i % history) as usize] = root;
         }
@@ -215,6 +222,36 @@ mod tests {
         // Slot 1 is out of the state's reach, so its roots are not compared.
         assert!(!is_empty(&state, 1));
         assert!(is_empty(&state, slot - 1));
+    }
+
+    /// Slot processing leaves the latest block header at the head block, so
+    /// the run counted from it holds on a state advanced the real way.
+    #[test]
+    fn the_run_is_counted_from_the_head_block_slot_processing_leaves() {
+        use ethlambda_state_transition::beacon::block_production::advance_to_slot;
+        use ethlambda_types::beacon::config::Config;
+
+        let config = Config::mainnet().with_fork_epoch(ForkName::Fulu, 0);
+        // A head state as its block leaves it: the header at the state's slot.
+        let mut head = with_signing_validators_at(ForkName::Fulu, 8);
+        let BeaconState::Fulu(fulu) = &mut head else {
+            unreachable!("built as fulu")
+        };
+        fulu.latest_block_header.slot = fulu.slot;
+        let head_slot = head.slot();
+        // The fixture's history is all zero roots, so only the consecutive
+        // count is judged here.
+        let thresholds = FallbackThresholds {
+            skips_per_epoch: u64::MAX,
+            ..FallbackThresholds::DEFAULT
+        };
+        let check_at = |slot| {
+            let state = advance_to_slot(&head, slot, &config).unwrap();
+            check(&state, &thresholds, false, false)
+        };
+        // Slots head+1 to head+3 empty: three in a row. Then four.
+        assert_eq!(check_at(head_slot + 4), Ok(()));
+        assert_eq!(check_at(head_slot + 5), Err(Trip::ConsecutiveSkips));
     }
 
     #[test]

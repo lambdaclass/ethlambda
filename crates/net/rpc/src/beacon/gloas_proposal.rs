@@ -109,7 +109,9 @@ use crate::beacon::{
     bid_selection::{LocalCandidate, PayloadChoice, bid_total_gwei, choose_payload, wei_u128},
     builder_config::{BuilderConfig, decode_builder_config},
     graffiti::{self, OwnVersion},
-    proposal::{Blobs, CellKzgProofs, decimal, randao_verification, require_gloas_slot},
+    proposal::{
+        Blobs, CellKzgProofs, decimal, randao_verification, refuse_future_slot, require_gloas_slot,
+    },
     validator::{FeeRecipients, head},
 };
 use crate::shared::content::{Encoding, ssz_response, with_consensus_version};
@@ -257,7 +259,9 @@ async fn post_produce_block(
         &store.config(),
         slot,
         "this endpoint serves gloas slots only",
-    ) {
+    )
+    .and_then(|()| refuse_future_slot(&store.config(), slot))
+    {
         return err.into_response();
     }
     let builder_config = match decode_builder_config(&headers, &body) {
@@ -679,8 +683,10 @@ fn prepare(
         ExecutionRequests::default()
     };
 
-    let state = advance_to_slot(&head_state, slot, &config)
-        .map_err(|_| ApiError::Internal("advancing the head state failed"))?;
+    let state = advance_to_slot(&head_state, slot, &config).map_err(|err| {
+        warn!(%slot, %err, "Advancing the head state to the proposal slot failed");
+        ApiError::Internal("advancing the head state failed")
+    })?;
     let proposer = get_beacon_proposer_index(&state)
         .map_err(|_| ApiError::Internal("no proposer for the slot"))?;
     if randao == RandaoVerification::Verify {

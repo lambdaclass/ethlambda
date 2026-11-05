@@ -3,8 +3,9 @@
 use std::time::Duration;
 
 use reqwest::StatusCode;
+use reqwest::header;
 
-use super::{read_body, truncate_error_text};
+use super::{error_text, read_body};
 
 /// A failed builder API call.
 ///
@@ -26,6 +27,19 @@ pub enum BuilderError {
     /// A status the call does not expect.
     #[error("builder answered {status}: {body}")]
     Status { status: u16, body: String },
+    /// A success status other than the 202 `submitBlindedBlockV2` succeeds
+    /// with. Told apart from [`Status`](Self::Status) because the builder may
+    /// well have taken the block: 200 is what the V1 call answered.
+    #[error(
+        "builder answered {status}, a success but not the 202 Accepted submitBlindedBlockV2 requires; it may have taken the block anyway"
+    )]
+    UnexpectedSuccess { status: u16 },
+    /// A redirect, which the client does not follow unless told to.
+    #[error(
+        "builder redirected the request to {location} ({status}); redirects are not \
+         followed unless --builder-follow-redirects is set"
+    )]
+    Redirected { status: u16, location: String },
     /// A body that does not decode as what the call returns.
     #[error("builder response did not decode: {0}")]
     Decode(String),
@@ -60,20 +74,27 @@ impl BuilderError {
 
     /// The error a status other than the call's success stands for. A 400
     /// carries the builder's `message`, or its raw body if it sent no JSON.
+    /// A redirect carries its target.
     pub(super) async fn from_status(response: reqwest::Response, deadline: Duration) -> Self {
         let status = response.status();
+        if status.is_redirection() {
+            return Self::Redirected {
+                status: status.as_u16(),
+                location: shown_location(&response),
+            };
+        }
         let body = read_body(response, deadline).await.unwrap_or_default();
         let body = String::from_utf8_lossy(&body).into_owned();
         if status != StatusCode::BAD_REQUEST {
             return Self::Status {
                 status: status.as_u16(),
-                body: truncate_error_text(body),
+                body: error_text(body),
             };
         }
         let message = serde_json::from_str::<ErrorMessage>(&body)
             .map(|error| error.message)
             .unwrap_or(body);
-        Self::BadRequest(truncate_error_text(message))
+        Self::BadRequest(error_text(message))
     }
 
     /// How the call ended, as a metric label.
@@ -83,12 +104,35 @@ impl BuilderError {
             Self::Transport(_) => "unreachable",
             Self::BadRequest(_) => "bad_request",
             Self::Status { .. } => "unexpected_status",
+            Self::UnexpectedSuccess { .. } => "unexpected_success",
+            Self::Redirected { .. } => "redirected",
             Self::Decode(_) | Self::Incomplete(_) | Self::TooLarge { .. } => "invalid_response",
             Self::InvalidUrl(_) => "invalid_url",
             Self::UnsupportedFork(_) => "unsupported_fork",
             Self::Encode(_) => "encode",
         }
     }
+}
+
+/// A redirect's target as an error shows it: without any user or password,
+/// since a URL may carry credentials (see `from_reqwest`), on one line and
+/// cut to the error text cap (see `error_text`).
+fn shown_location(response: &reqwest::Response) -> String {
+    let Some(value) = response.headers().get(header::LOCATION) else {
+        return "nowhere (no Location header)".to_owned();
+    };
+    let location = String::from_utf8_lossy(value.as_bytes()).into_owned();
+    let location = match reqwest::Url::parse(&location) {
+        Ok(mut url) if !url.username().is_empty() || url.password().is_some() => {
+            // Neither fails on a URL that already has a user or password.
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.to_string()
+        }
+        // A relative target, or one with nothing to hide, is shown as sent.
+        _ => location,
+    };
+    error_text(location)
 }
 
 /// builder-specs' `ErrorMessage`, of which only the message is kept.

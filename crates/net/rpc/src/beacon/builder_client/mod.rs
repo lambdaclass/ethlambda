@@ -14,6 +14,10 @@
 //! Responses are decoded by their own `Content-Type`, not by what was asked
 //! for: a builder may answer JSON to an SSZ request without refusing it.
 //!
+//! Redirects are not followed unless `--builder-follow-redirects` asks for
+//! it, so the node sends registrations and signed blocks only to the URL the
+//! operator named. A refused redirect is an error naming its target.
+//!
 //! `status` is a liveness probe the node calls once at startup.
 //!
 //! Every call is timed into `lean_beacon_builder_request_seconds`, by call
@@ -31,6 +35,7 @@ use ethlambda_types::beacon::primitives::{BlsPubkey, ExecutionBlockHash, Slot};
 use libssz::{SszDecode as _, SszEncode as _};
 use reqwest::StatusCode;
 use reqwest::header::{self, HeaderMap};
+use reqwest::redirect::Policy;
 use tracing::info;
 
 use crate::metrics::observe_builder_request;
@@ -87,7 +92,8 @@ pub struct VersionedBid {
 }
 
 impl BuilderClient {
-    /// A client for `base_url` that identifies itself as `user_agent`.
+    /// A client for `base_url` that identifies itself as `user_agent` and
+    /// does not follow redirects (see [`with_redirects`](Self::with_redirects)).
     ///
     /// `header_timeout` bounds `getHeader`. It is also sent to the builder as
     /// `X-Timeout-Ms`, so the builder can hold its answer for as long as the
@@ -97,18 +103,32 @@ impl BuilderClient {
         header_timeout: Duration,
         user_agent: &str,
     ) -> Result<Self, BuilderError> {
+        Self::with_redirects(base_url, header_timeout, user_agent, false)
+    }
+
+    /// [`new`](Self::new), but following up to ten redirects (reqwest's
+    /// default) when `follow_redirects` is set.
+    ///
+    /// Without it every call goes exactly where `base_url` points. A redirect
+    /// fails the call as [`BuilderError::Redirected`], which names the target,
+    /// rather than carrying registrations or a signed block somewhere
+    /// `--builder` does not name.
+    pub fn with_redirects(
+        base_url: impl Into<String>,
+        header_timeout: Duration,
+        user_agent: &str,
+        follow_redirects: bool,
+    ) -> Result<Self, BuilderError> {
         let base_url = base_url.into();
-        let url = reqwest::Url::parse(&base_url)
-            .map_err(|err| BuilderError::InvalidUrl(err.to_string()))?;
-        // `localhost:18550` parses, with `localhost` as its scheme.
-        if !matches!(url.scheme(), "http" | "https") {
-            return Err(BuilderError::InvalidUrl(format!(
-                "expected an http or https url, got scheme {:?}",
-                url.scheme()
-            )));
-        }
+        Self::check_url(&base_url)?;
+        let redirects = if follow_redirects {
+            Policy::default()
+        } else {
+            Policy::none()
+        };
         let http = reqwest::Client::builder()
             .user_agent(user_agent)
+            .redirect(redirects)
             .build()
             .map_err(|err| BuilderError::Transport(err.without_url().to_string()))?;
         let base_url = base_url.trim_end_matches('/').to_owned();
@@ -118,6 +138,22 @@ impl BuilderClient {
             header_timeout,
             json_only: Arc::default(),
         })
+    }
+
+    /// Whether `base_url` is a URL a client can be built for: one that
+    /// parses, with an http or https scheme. The CLI checks `--builder` with
+    /// this, so a bad value is refused while the flags are parsed.
+    pub fn check_url(base_url: &str) -> Result<(), BuilderError> {
+        let url = reqwest::Url::parse(base_url)
+            .map_err(|err| BuilderError::InvalidUrl(err.to_string()))?;
+        // `localhost:18550` parses, with `localhost` as its scheme.
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(BuilderError::InvalidUrl(format!(
+                "expected an http or https url, got scheme {:?}",
+                url.scheme()
+            )));
+        }
+        Ok(())
     }
 
     /// `getHeader`: the builder's best bid for `slot`, on top of
@@ -368,8 +404,18 @@ pub(super) async fn read_body(
     Ok(body)
 }
 
-/// `text` cut to at most [`MAX_ERROR_TEXT`] bytes, at a char boundary.
-pub(super) fn truncate_error_text(mut text: String) -> String {
+/// `text` on one line, its line breaks written out as `\n` and `\r`, then cut
+/// to at most [`MAX_ERROR_TEXT`] bytes at a char boundary.
+///
+/// A builder's text reaches this node's logs and a validator client's error
+/// message, where a raw line break would start what reads as a log line of
+/// its own.
+pub(super) fn error_text(text: String) -> String {
+    let mut text = if text.contains(['\n', '\r']) {
+        text.replace('\n', "\\n").replace('\r', "\\r")
+    } else {
+        text
+    };
     if text.len() > MAX_ERROR_TEXT {
         let mut end = MAX_ERROR_TEXT;
         while !text.is_char_boundary(end) {
@@ -413,10 +459,14 @@ fn outcome<T>(result: &Result<T, BuilderError>) -> &'static str {
     result.as_ref().map_or_else(BuilderError::label, |_| "ok")
 }
 
-/// A submission's answer: only 202 is success.
+/// A submission's answer: only 202 is success. Any other 2xx is an error of
+/// its own, since the builder may have taken the block all the same.
 async fn submission_result(response: reqwest::Response) -> Result<(), BuilderError> {
     match response.status() {
         StatusCode::ACCEPTED => Ok(()),
+        status if status.is_success() => Err(BuilderError::UnexpectedSuccess {
+            status: status.as_u16(),
+        }),
         _ => Err(BuilderError::from_status(response, SUBMIT_TIMEOUT).await),
     }
 }
