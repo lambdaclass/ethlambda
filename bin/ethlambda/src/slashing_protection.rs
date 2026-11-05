@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use ethlambda_validator::beacon_node::dto::{encode_hex, parse_pubkey};
 use ethlambda_validator::slashing_protection::SlashingProtection;
-use tracing::{info, warn};
+use tracing::info;
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct SlashingProtectionOptions {
@@ -80,20 +80,24 @@ pub(crate) fn run(options: SlashingProtectionOptions) -> eyre::Result<()> {
                     })
                     .collect::<Result<Vec<_>, _>>()?
             };
-            // A requested key with no record is left out of the file rather
-            // than listed as never having signed, so say so: an operator
-            // moving that key would otherwise find out at the other end.
-            let mut exported = 0;
-            for pubkey in &pubkeys {
-                if protection.contains(pubkey) {
-                    exported += 1;
-                } else {
-                    warn!(
-                        pubkey = %encode_hex(&pubkey.0),
-                        "No slashing-protection record for this validator; it is not in the export"
-                    );
-                }
+            // A requested key with no record fails the export, as Lighthouse
+            // does, rather than being left out of a file that then reads as
+            // complete: a typo, or the wrong directory, would otherwise be
+            // found out at the other end, after the keys moved.
+            let missing: Vec<String> = pubkeys
+                .iter()
+                .filter(|pubkey| !protection.contains(pubkey))
+                .map(|pubkey| encode_hex(&pubkey.0))
+                .collect();
+            if !missing.is_empty() {
+                eyre::bail!(
+                    "no slashing-protection record for {} requested validator(s) (first: {}); \
+                     nothing was written",
+                    missing.len(),
+                    missing[0]
+                );
             }
+            let exported = pubkeys.len();
             let interchange = protection.export(&pubkeys)?;
             write_export(&file, &interchange)
                 .map_err(|err| eyre::eyre!("{}: {err}", file.display()))?;

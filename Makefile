@@ -10,7 +10,7 @@ lint: ## 🔍 Run clippy on all workspace crates
 	cargo clippy --locked --workspace --all-targets -- -D warnings
 	# The spectests are `test = false` (stale leanSpec fixtures), which
 	# `--all-targets` skips: lint them by name so they keep compiling
-	cargo clippy --locked --workspace --test forkchoice_spectests --test signature_spectests --test stf_spectests --test ssz_spectests -- -D warnings
+	cargo clippy --locked --workspace --test forkchoice_spectests --test signature_spectests --test stf_spectests --test ssz_spectests --test interchange_vectors -- -D warnings
 
 # release-fast: release-grade opt-level to avoid stack overflows during
 # signature verification/aggregation, without paying for LTO on every rebuild
@@ -40,6 +40,7 @@ test-consensus: leanSpec/fixtures ## 🧪 Run the consensus half of the workspac
 
 test-node: leanSpec/fixtures slashing-protection-interchange-tests ## 🧪 Run the node half of the workspace suite
 	$(TEST) --workspace $(addprefix --exclude ,$(CONSENSUS_CRATES))
+	$(TEST) -p ethlambda-validator --test interchange_vectors
 
 # --lib as well as the spec target: the BLS and KZG modules keep their fixture
 # vectors as unit tests, which are `ignore`d unless this feature is on.

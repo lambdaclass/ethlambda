@@ -473,8 +473,8 @@ ethlambda slashing-protection export --validators-dir ./validators --pubkeys 0xa
 
 | Sub-command | Does |
 |---|---|
-| `import <file>` | Merges a version 5 interchange, complete or minimal, into the record. Each validator is reduced to its highest slot, source and target and merged by maximum, so nothing already recorded is lowered and slashable data in the file is absorbed rather than refused. All or nothing. With no record yet, the import creates one for the interchange's chain, and a failed import creates nothing; the client refuses the record at its next start if that is not its beacon node's chain |
-| `export [--pubkeys ...] <file>` | Writes the record, or the named validators' part of it, as a minimal version 5 interchange, readable by its owner only. A named validator with no record is left out, with a warning. Refuses to overwrite an existing file |
+| `import <file>` | Merges a version 5 interchange, complete or minimal, into the record. Each validator is reduced to its highest slot, source and target and merged by maximum, so nothing already recorded is lowered and slashable data in the file is absorbed rather than refused. All or nothing. With no record yet, the import creates one for the interchange's chain, and a failed import creates nothing but the lock file; the client refuses the record at its next start if that is not its beacon node's chain |
+| `export [--pubkeys ...] <file>` | Writes the record, or the named validators' part of it, as a minimal version 5 interchange, readable by its owner only. A named validator with no record fails the export, so a typo or the wrong directory cannot produce a file that reads as complete. Takes the record's lock, so the directory must be writable. Refuses to overwrite an existing file |
 
 ## `benchmark import` flags
 

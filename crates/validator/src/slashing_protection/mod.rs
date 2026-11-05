@@ -185,6 +185,15 @@ impl Signed {
     }
 }
 
+/// An EIP-3076 interchange parsed once, for [`SlashingProtection::absorb`]:
+/// the chain it names and each validator's watermarks, reduced as
+/// [`SlashingProtection::import`] describes.
+#[derive(Debug, Clone)]
+pub struct StagedHistory {
+    root: Root,
+    entries: Vec<(BlsPubkey, Record)>,
+}
+
 /// What one validator has signed: its watermarks.
 ///
 /// `None` is "never signed", kept distinct from zero so that slot 0 and epoch
@@ -606,16 +615,7 @@ impl SlashingProtection {
     /// only after this returns. A key that already has a record keeps it:
     /// registering never lowers a watermark. Returns how many were new.
     pub fn register(&mut self, pubkeys: &[BlsPubkey]) -> Result<usize> {
-        let new: HashMap<BlsPubkey, Record> = pubkeys
-            .iter()
-            .filter(|pubkey| !self.records.contains_key(*pubkey))
-            .map(|pubkey| (*pubkey, Record::default()))
-            .collect();
-        let count = new.len();
-        if count > 0 {
-            self.commit(new)?;
-        }
-        Ok(count)
+        self.absorb(None, pubkeys).map(|(_, registered)| registered)
     }
 
     /// The chain an EIP-3076 interchange names, read without importing it: what
@@ -659,50 +659,70 @@ impl SlashingProtection {
     /// or one that does not parse, changes nothing. Returns how many distinct
     /// validators it named.
     pub fn import(&mut self, interchange: &str) -> Result<usize> {
-        let refused = |reason: String| Error::SlashingProtection {
-            path: "interchange".to_string(),
-            reason,
-        };
-        let (root, entries) = file::parse(interchange).map_err(refused)?;
-        if root != self.genesis_validators_root {
-            return Err(refused(format!(
-                "it is for genesis_validators_root {}, but this record is for {}",
-                encode_hex(&root.0),
-                encode_hex(&self.genesis_validators_root.0)
-            )));
-        }
-
-        let mut staged: HashMap<BlsPubkey, Record> = HashMap::new();
-        for (pubkey, imported) in entries {
-            let current = staged
-                .get(&pubkey)
-                .or_else(|| self.records.get(&pubkey))
-                .copied()
-                .unwrap_or_default();
-            staged.insert(pubkey, current.merged(imported));
-        }
-        let count = staged.len();
-        if count > 0 {
-            self.commit(staged)?;
-        }
-        Ok(count)
+        let staged = Self::stage(interchange)?;
+        self.absorb(Some(&staged), &[]).map(|(named, _)| named)
     }
 
-    /// Whether [`Self::import`] would accept `interchange`, changing nothing:
-    /// it parses, is of the right version, and is for this record's chain.
-    pub fn check_import(&self, interchange: &str) -> Result<()> {
-        let chain = Self::interchange_chain(interchange)?;
-        if chain != self.genesis_validators_root {
+    /// Parse `interchange` into what [`Self::absorb`] takes, off any lock:
+    /// its version and shape are judged here, its chain by
+    /// [`Self::check_staged`] or by `absorb` itself.
+    pub fn stage(interchange: &str) -> Result<StagedHistory> {
+        let (root, entries) =
+            file::parse(interchange).map_err(|reason| Error::SlashingProtection {
+                path: "interchange".to_string(),
+                reason,
+            })?;
+        Ok(StagedHistory { root, entries })
+    }
+
+    /// Whether `staged` is for this record's chain, changing nothing.
+    pub fn check_staged(&self, staged: &StagedHistory) -> Result<()> {
+        if staged.root != self.genesis_validators_root {
             return Err(Error::SlashingProtection {
                 path: "interchange".to_string(),
                 reason: format!(
                     "it is for genesis_validators_root {}, but this record is for {}",
-                    encode_hex(&chain.0),
+                    encode_hex(&staged.root.0),
                     encode_hex(&self.genesis_validators_root.0)
                 ),
             });
         }
         Ok(())
+    }
+
+    /// Merge `history`, if any, as [`Self::import`] describes, and register
+    /// every key in `register` that then still has no record, in one durable
+    /// write: either all of it is on disk or none of it is. Returns how many
+    /// validators the history named and how many keys were newly registered.
+    pub fn absorb(
+        &mut self,
+        history: Option<&StagedHistory>,
+        register: &[BlsPubkey],
+    ) -> Result<(usize, usize)> {
+        let mut staged: HashMap<BlsPubkey, Record> = HashMap::new();
+        if let Some(history) = history {
+            self.check_staged(history)?;
+            for (pubkey, imported) in &history.entries {
+                let current = staged
+                    .get(pubkey)
+                    .or_else(|| self.records.get(pubkey))
+                    .copied()
+                    .unwrap_or_default();
+                staged.insert(*pubkey, current.merged(*imported));
+            }
+        }
+        let named = staged.len();
+        let mut registered = 0;
+        for pubkey in register {
+            if !staged.contains_key(pubkey) && !self.records.contains_key(pubkey) {
+                staged.insert(*pubkey, Record::default());
+                registered += 1;
+            }
+        }
+        if !staged.is_empty() {
+            self.commit(staged)?;
+        }
+        Ok((named, registered))
     }
 
     /// The records of `pubkeys` as a minimal EIP-3076 version 5 interchange.

@@ -203,9 +203,5 @@ fn parse_u64(text: &str) -> Result<u64, String> {
 }
 
 fn parse_root(text: &str) -> Result<Root, String> {
-    let bytes = hex::decode(text.trim_start_matches("0x")).map_err(|err| err.to_string())?;
-    let bytes: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| format!("{text} is not 32 bytes"))?;
-    Ok(H256(bytes))
+    ethlambda_validator::beacon_node::dto::parse_root(text).map_err(|err| err.to_string())
 }

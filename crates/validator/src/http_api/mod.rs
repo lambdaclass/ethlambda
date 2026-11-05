@@ -163,7 +163,15 @@ pub fn router(context: KeymanagerContext, token: String) -> Router {
         .with_state(context)
         .layer(middleware::from_fn(require_bearer))
         .layer(Extension(ApiToken(token)))
+        // `POST /eth/v1/keystores` carries a whole EIP-3076 interchange, which
+        // in the complete format for a batch of validators runs past axum's
+        // 2 MB default. Nimbus allows 16 MiB and Lodestar 20 MB; Lighthouse
+        // and Prysm set no limit.
+        .layer(axum::extract::DefaultBodyLimit::max(KEYMANAGER_BODY_LIMIT))
 }
+
+/// The largest request body the keymanager API reads.
+const KEYMANAGER_BODY_LIMIT: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 struct ApiToken(String);
