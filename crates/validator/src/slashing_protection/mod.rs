@@ -916,6 +916,25 @@ mod tests {
         assert_eq!(entry["signed_attestations"][0]["target_epoch"], "3");
     }
 
+    /// The lock is on the directory, so a second opener of the same one is
+    /// refused, with nothing beside the record an operator could delete to
+    /// get around it.
+    #[test]
+    fn a_second_opener_of_the_same_directory_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _first = open(dir.path(), &[1], true).expect("init");
+
+        let err = open(dir.path(), &[1], false).expect_err("locked");
+        assert!(
+            err.to_string().contains("in use by another process"),
+            "{err}"
+        );
+        assert!(
+            !dir.path().join("slashing_protection.lock").exists(),
+            "no lock file to delete"
+        );
+    }
+
     #[test]
     fn registering_keeps_an_existing_record() {
         let dir = tempfile::tempdir().expect("temp dir");

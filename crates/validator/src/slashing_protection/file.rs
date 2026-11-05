@@ -39,13 +39,6 @@ use crate::error::{Error, Result};
 /// The record's file name inside the validators directory.
 pub const FILE_NAME: &str = "slashing_protection.json";
 
-/// The lock's file name, next to the record.
-///
-/// A file of its own rather than a lock on the record: the record is replaced
-/// by a rename on every write, and a lock held on the old inode would not stop
-/// a second process from opening the new one.
-pub const LOCK_FILE_NAME: &str = "slashing_protection.lock";
-
 /// The only EIP-3076 interchange version this client reads or writes.
 pub const INTERCHANGE_VERSION: &str = "5";
 
@@ -262,21 +255,20 @@ pub(crate) fn write<'a>(
 /// Take the exclusive lock in `directory`, held until the returned file is
 /// dropped.
 pub(crate) fn lock(directory: &Path) -> Result<File> {
-    let path = directory.join(LOCK_FILE_NAME);
     let io_error = |source| Error::Io {
-        path: path.display().to_string(),
+        path: directory.display().to_string(),
         source,
     };
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-        .map_err(io_error)?;
+    // The directory itself, not a lock file beside the record: the record is
+    // replaced by a rename on every write, so a lock on it would be on a
+    // stale inode; and a lock file can be deleted, after which a second
+    // process locks a fresh one and both sign. The directory is the one
+    // inode nothing here replaces, and `flock` takes a directory descriptor.
+    let file = File::open(directory).map_err(io_error)?;
     match file.try_lock() {
         Ok(()) => Ok(file),
         Err(std::fs::TryLockError::WouldBlock) => Err(Error::SlashingProtection {
-            path: path.display().to_string(),
+            path: directory.display().to_string(),
             reason: "in use by another process; two processes must never sign with the same keys"
                 .to_string(),
         }),

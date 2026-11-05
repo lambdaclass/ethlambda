@@ -61,8 +61,9 @@ anything that does not advance past them.
   before the signature exists, and a write that fails leaves the message
   unsigned. A file that is empty, malformed, of another version or for another
   chain stops the client at startup rather than being read as "nothing
-  signed". An exclusive lock (`slashing_protection.lock`) keeps a second process
-  away from it. See `crate::slashing_protection`.
+  signed". An exclusive `flock` on the validators directory itself, the one
+  inode nothing replaces or deletes, keeps a second process away from it. See
+  `crate::slashing_protection`.
 - **What the strictness costs:** a byte-identical re-sign is refused. A client
   that recorded an attestation, crashed before publishing it, and restarted
   into the same slot loses that attestation rather than publishing it; the same
