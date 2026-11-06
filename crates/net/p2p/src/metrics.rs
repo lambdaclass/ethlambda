@@ -454,6 +454,10 @@ pub fn init() {
         LEAN_BEACON_VALIDATION_PERMITS_IN_USE.with_label_values(&[pool]);
         LEAN_BEACON_VALIDATION_PERMIT_EXHAUSTED_TOTAL.with_label_values(&[pool]);
     }
+    for &kind in BATCHED_KINDS {
+        LEAN_BEACON_GOSSIP_BATCH_SIZE.with_label_values(&[kind]);
+        LEAN_BEACON_GOSSIP_BATCH_FALLBACK_TOTAL.with_label_values(&[kind]);
+    }
 }
 
 /// Count one beacon gossip verdict and how long it took from arrival.
@@ -555,6 +559,49 @@ impl Drop for PoolInUse {
             .with_label_values(&[self.0])
             .dec();
     }
+}
+
+/// Gossip kinds verified in batches (see [`crate::beacon::batched`]), as the
+/// `kind` label of the two batch metrics.
+const BATCHED_KINDS: &[&str] = &["votes", "sync_committee", "column"];
+
+/// Buckets for how many messages one drain pass verified together, up to the
+/// largest batch a drainer takes.
+const GOSSIP_BATCH_SIZE_BUCKETS: &[f64] = &[
+    1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0,
+];
+
+static LEAN_BEACON_GOSSIP_BATCH_SIZE: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "lean_beacon_gossip_batch_size",
+        "Messages verified together in one drain pass of a batched gossip kind",
+        &["kind"],
+        GOSSIP_BATCH_SIZE_BUCKETS.to_vec()
+    )
+    .unwrap()
+});
+
+static LEAN_BEACON_GOSSIP_BATCH_FALLBACK_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "lean_beacon_gossip_batch_fallback_total",
+        "Batches whose combined check failed, so each message was checked on its own",
+        &["kind"]
+    )
+    .unwrap()
+});
+
+/// Record that a drain pass verified `size` messages together.
+pub(crate) fn observe_gossip_batch_size(kind: &str, size: usize) {
+    LEAN_BEACON_GOSSIP_BATCH_SIZE
+        .with_label_values(&[kind])
+        .observe(size as f64);
+}
+
+/// Count one batch that fell back to per-message checks.
+pub(crate) fn inc_gossip_batch_fallback(kind: &str) {
+    LEAN_BEACON_GOSSIP_BATCH_FALLBACK_TOTAL
+        .with_label_values(&[kind])
+        .inc();
 }
 
 /// Count one object refused for want of a permit in `pool`.

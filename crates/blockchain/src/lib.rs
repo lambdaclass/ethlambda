@@ -16,7 +16,9 @@ use ethlambda_types::{
     beacon::{
         config::Config,
         constants,
-        containers::{DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock, gloas},
+        containers::{
+            BeaconState, DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock, gloas,
+        },
         preset,
         primitives::ValidatorIndex,
         signing::compute_epoch_at_slot,
@@ -78,6 +80,34 @@ pub mod reaggregate;
 pub mod spec_test_runner;
 pub mod store;
 mod sync_status;
+
+/// Validates every public key in `state`'s registry in one parallel pass and
+/// returns how many passed.
+///
+/// Run when a state is loaded to run on, so the first imported block does not
+/// validate tens of thousands of keys inline. Keys are cached with their
+/// registry index, which is how the state transition looks them up.
+pub fn warm_registry_pubkeys(state: &BeaconState) -> usize {
+    let started = Instant::now();
+    let pubkeys: Vec<ethlambda_crypto::bls::IndexedPubkey> = state
+        .iter_validators()
+        .enumerate()
+        .map(|(index, validator)| ethlambda_crypto::bls::IndexedPubkey {
+            index: index as ValidatorIndex,
+            pubkey: validator.pubkey,
+        })
+        .collect();
+    let registry_size = pubkeys.len();
+    let count = ethlambda_crypto::bls::warm_pubkeys(&pubkeys);
+    let elapsed = started.elapsed();
+    info!(
+        count,
+        registry_size,
+        ?elapsed,
+        "Registry public keys validated"
+    );
+    count
+}
 
 pub struct BlockChain {
     handle: ActorRef<BlockChainServer>,
@@ -358,6 +388,15 @@ impl BlockChain {
         );
 
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
+
+        // Before the actor can import anything, so the first block does not
+        // validate the registry's keys inline.
+        match store.head().map(|head| store.get_state(&head)) {
+            Ok(Ok(Some(state))) => {
+                warm_registry_pubkeys(&state);
+            }
+            _ => warn!("Head state unavailable, skipping the registry key warm-up"),
+        }
 
         Self::start_actor(
             store,

@@ -2841,6 +2841,7 @@ pub(crate) mod tests {
                     crate::SEEN_SYNC_AGGREGATORS_CAPACITY,
                     crate::SEEN_SYNC_DATA_CAPACITY,
                 ),
+            batchers: Default::default(),
             sync_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::SYNC_VALIDATION_PERMITS,
             )),

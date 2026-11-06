@@ -23,6 +23,9 @@ ethlambda-state-transition.workspace = true
 
 spawned-concurrency.workspace = true
 
+# Spreads the work inside one gossip batch across cores; see `beacon::batched`.
+rayon.workspace = true
+
 futures = "0.3"
 tokio-stream = "0.1"
 
@@ -87,3 +90,8 @@ libssz-types.workspace = true
 
 sha2 = "0.10"
 hex.workspace = true
+
+[dev-dependencies]
+# The Beacon state builder and its signing keys, so the batched gossip checks
+# can be run against states that verify real signatures.
+ethlambda-state-transition = { workspace = true, features = ["test-utils"] }
