@@ -35,7 +35,7 @@ thiserror.workspace = true
 futures-util = "0.3"
 
 [dev-dependencies]
-ethlambda-validator.workspace = true
+ethlambda-validator = { workspace = true, features = ["test-utils"] }
 spawned-concurrency.workspace = true
 ethlambda-state-transition = { workspace = true, features = ["test-utils"] }
 ethlambda-types.workspace = true
