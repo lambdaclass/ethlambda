@@ -1,24 +1,41 @@
 //! `GET`, `POST` and `DELETE /eth/v1/keystores`.
 //!
-//! # Deviation
+//! # Slashing protection
 //!
-//! This client does not yet import or export EIP-3076 history, so the
-//! interchange data the specification requires is not produced. `DELETE` declares
-//! `slashing_protection` a required response field, so an empty but well-formed
-//! EIP-3076 interchange is returned; `POST` refuses a request that carries the
-//! optional `slashing_protection` field, importing none of its keys, since a
-//! caller that hands over history must not be told it was taken. A caller
-//! migrating keys between clients must not rely on this client to carry that
-//! history.
+//! The specification lets these routes carry a validator's EIP-3076 history in
+//! and out, and both do:
 //!
-//! The empty interchange [`DELETE`] returns is deliberately unusable as one:
-//! its `genesis_validators_root` is all-zero rather than the chain's real
-//! value. A real root would make the file look like legitimate, if empty,
-//! history, which is worse than what it actually is (none of the history this
-//! client recorded, since it does not export it yet). The all-zero root is chosen so a
-//! conformant importer rejects the file outright instead of trusting it, on
-//! the theory that a loud, obvious failure at import time beats a tool
-//! silently believing a validator has never signed.
+//! - `POST` judges and writes the request's `slashing_protection` before
+//!   touching any key: one that does not parse, or is for another chain,
+//!   fails every key in the request and imports none of them. Written first,
+//!   rather than with the keys' registration, because a key that was deleted
+//!   here earlier keeps its record: were the keys saved first, a crash before
+//!   the history landed would load such a key at its next start on the
+//!   watermarks it had before it left, with whatever it signed elsewhere
+//!   unknown. The history only ever raises watermarks, so writing it for keys
+//!   that then fail to save leaves nothing dangerous behind, and it is
+//!   written whole, entries for keys of the request that failed included: a
+//!   later import of such a key merges with it. The keys are registered after
+//!   they are saved, in one write, before any is loaded, and a registration
+//!   that fails takes the keys off disk again. A key with no history at all is
+//!   registered as never having signed, with a warning. The history may also
+//!   name validators that are not in the request: they get records too, and
+//!   a later `DELETE` of one answers `not_active`. One of them may be a key
+//!   this client is running now; its watermarks are raised like any other,
+//!   since a history saying it signed elsewhere is exactly what the record
+//!   must know, and the raise is logged so the operator finds out that the
+//!   key ran in two places.
+//! - `DELETE` returns the deleted keys' records as a minimal interchange,
+//!   taken after the keys are out of the store, so it covers every signature
+//!   this process made with them. A key that is gone but still has a record is
+//!   reported `not_active`, and its record is kept, so importing it back later
+//!   starts from what this client signed with it (not from what the key may
+//!   have signed elsewhere in between: see `docs/spec_deviations.md` on
+//!   doppelganger protection).
+//!
+//! The history is this client's EIP-3076 minimal watermarks (see
+//! [`crate::slashing_protection`]), so an export lists, per validator, its
+//! highest slot and its highest source and target rather than every message.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -36,9 +53,6 @@ use crate::http_api::KeymanagerContext;
 use crate::keys::keystore::Keystore;
 use crate::keys::{ValidatorDefinition, ValidatorDefinitions, ValidatorStore};
 use crate::secure_fs;
-
-/// The EIP-3076 interchange version this client reports when it has no history.
-const INTERCHANGE_VERSION: &str = "5";
 
 /// The most keystores accepted in a single import request.
 ///
@@ -74,7 +88,8 @@ pub struct ImportRequest {
     /// memory until decryption runs, and a plain `Vec<String>` would leave
     /// those bytes sitting in the allocator's freed memory afterwards.
     pub passwords: Zeroizing<Vec<String>>,
-    /// Accepted and ignored: importing EIP-3076 history is not supported yet.
+    /// An EIP-3076 interchange, written before any key is saved; see the
+    /// module documentation.
     #[serde(default)]
     pub slashing_protection: Option<String>,
 }
@@ -122,8 +137,8 @@ pub struct DeleteRequest {
 #[derive(Debug, Serialize)]
 pub struct DeleteResponse {
     pub data: Vec<KeyStatus>,
-    /// Required by the specification even though this client has no history to
-    /// report. See the module documentation.
+    /// The deleted keys' records, as a minimal EIP-3076 interchange. See the
+    /// module documentation.
     pub slashing_protection: String,
 }
 
@@ -144,27 +159,8 @@ pub async fn list(State(context): State<KeymanagerContext>) -> Json<ListResponse
 
 pub async fn import(
     State(context): State<KeymanagerContext>,
-    Json(request): Json<ImportRequest>,
+    Json(mut request): Json<ImportRequest>,
 ) -> Json<StatusResponse> {
-    // Refused rather than ignored: the caller handed over history, and a
-    // `200` with `imported` would tell it the history was taken, which is the
-    // standard way to move an active key and the surest way to double-sign.
-    if request.slashing_protection.is_some() {
-        warn!(
-            "Refusing an import that carries slashing_protection; importing history is not supported yet"
-        );
-        let message = "not imported: this client does not import EIP-3076 history yet, so a \
-                       request carrying slashing_protection imports nothing; import the keys \
-                       without it only if they have signed nothing anywhere for at least two \
-                       epochs";
-        let data = request
-            .keystores
-            .iter()
-            .map(|_| KeyStatus::error(message))
-            .collect();
-        return Json(StatusResponse { data });
-    }
-
     if request.keystores.len() > MAX_KEYSTORES_PER_IMPORT {
         let message = format!(
             "request carries {} keystores, more than the limit of {MAX_KEYSTORES_PER_IMPORT}",
@@ -181,6 +177,76 @@ pub async fn import(
             .collect();
         return Json(StatusResponse { data });
     }
+
+    // The history is parsed once, off every lock, and written before any key
+    // is touched, so a request whose history is refused imports no key at
+    // all, and no key can be saved ahead of the history it came with (see the
+    // module documentation for the crash that ordering closes). Parsed on the
+    // blocking pool: a complete-format interchange runs to tens of megabytes
+    // (see `KEYMANAGER_BODY_LIMIT`), and the executor thread this handler
+    // runs on also drives the duty services.
+    let history = match request.slashing_protection.take() {
+        None => None,
+        Some(interchange) => {
+            let staged = tokio::task::spawn_blocking(move || {
+                crate::slashing_protection::SlashingProtection::stage(&interchange)
+            })
+            .await
+            .unwrap_or_else(|err| {
+                Err(Error::SlashingProtection {
+                    path: "interchange".to_string(),
+                    reason: format!("could not be parsed: {err}"),
+                })
+            });
+            let written = match staged {
+                Ok(staged) => {
+                    let staged = Arc::new(staged);
+                    let absorbed = staged.clone();
+                    crate::slashing_protection::blocking(&context.protection, move |protection| {
+                        protection.absorb(Some(&absorbed), &[])
+                    })
+                    .await
+                    .map(|absorbed| (staged, absorbed))
+                }
+                Err(err) => Err(err),
+            };
+            match written {
+                Ok((staged, absorbed)) => {
+                    info!(
+                        validators = absorbed.named,
+                        "Imported slashing-protection history"
+                    );
+                    // A key running here whose watermarks this history raised
+                    // signed elsewhere while it ran here: worth knowing.
+                    let store = context.store.read().await;
+                    for pubkey in absorbed.raised.iter().filter(|key| store.contains(key)) {
+                        warn!(
+                            pubkey = %encode_hex(&pubkey.0),
+                            "Imported history raised the slashing-protection watermarks of a \
+                             validator this client is running; it has signed elsewhere too"
+                        );
+                    }
+                    drop(store);
+                    Some(staged)
+                }
+                // `Error::Unflushed` is refused here too, unlike at the keys'
+                // registration below: the history is on disk and in memory,
+                // but were it lost to a power loss, a key saved on the
+                // strength of it would load at the next start on the record
+                // it had before, which is the case writing it first closes.
+                Err(err) => {
+                    let message = format!("slashing_protection was not imported: {err}");
+                    warn!(%err, "Refusing an import whose slashing-protection history was refused");
+                    let data = request
+                        .keystores
+                        .iter()
+                        .map(|_| KeyStatus::error(&message))
+                        .collect();
+                    return Json(StatusResponse { data });
+                }
+            }
+        }
+    };
 
     // Held across this whole function: the entire open-mutate-save cycle
     // over the definitions file, including the slow decrypt-and-persist loop
@@ -241,22 +307,26 @@ pub async fn import(
         prepared.push(prepare_import(&context, &mut definitions, json, password));
     }
 
-    // Every persisted key is registered in the slashing-protection record in
-    // one write, before any of them is loaded: the duty path must never meet a
-    // key with no record. After persisting rather than before, so a key whose
-    // persist failed leaves no record behind to let a hand-copied keystore
-    // past the startup check later. Still under the definitions guard, so a
-    // concurrent delete cannot interleave.
+    // Every persisted key is registered in one durable write, before any of
+    // them is loaded: the duty path must never meet a key with no record.
+    // After persisting rather than before, so a key whose persist failed
+    // leaves no record behind to let a hand-copied keystore past the startup
+    // check later. The history goes along again so that a key it covers is
+    // left on it rather than warned about as having brought none; it was
+    // written above, so this costs nothing unless a key is new. Still under
+    // the definitions guard, so a concurrent delete cannot interleave.
     let persisted: Vec<BlsPubkey> = prepared
         .iter()
         .filter_map(|result| result.as_ref().ok().map(|(pubkey, _, _)| *pubkey))
         .collect();
+    // Nothing to register for a request that saved no key.
     let registration = if persisted.is_empty() {
-        Ok(0)
+        Ok(crate::slashing_protection::Absorbed::default())
     } else {
         let registering = persisted.clone();
+        let history = history.clone();
         crate::slashing_protection::blocking(&context.protection, move |protection| {
-            protection.register(&registering)
+            protection.absorb(history.as_deref(), &registering)
         })
         .await
     };
@@ -272,17 +342,17 @@ pub async fn import(
                 "Slashing-protection records written, but the directory could not be flushed; \
                  the imported keys are registered"
             );
-            Ok(0)
+            Ok(crate::slashing_protection::Absorbed::default())
         }
         other => other,
     };
-    if let Ok(registered) = registration
-        && registered > 0
+    if let Ok(absorbed) = &registration
+        && absorbed.registered > 0
     {
         warn!(
-            registered,
-            "Imported validator keys with no slashing-protection history; each starts as never \
-             having signed"
+            registered = absorbed.registered,
+            "Imported validator keys with no slashing-protection history; each starts as \
+             never having signed"
         );
     }
 
@@ -700,29 +770,93 @@ pub async fn delete(
     let _definitions_guard = context.definitions_lock.lock().await;
 
     let mut store = context.store.write().await;
-    let data = request
+    let results: Vec<(Option<BlsPubkey>, KeyStatus)> = request
         .pubkeys
         .iter()
         .map(|text| match parse_pubkey(text) {
-            Ok(pubkey) => delete_one(&context, &mut store, &pubkey),
-            Err(err) => KeyStatus::error(err),
+            Ok(pubkey) => (Some(pubkey), delete_one(&context, &mut store, &pubkey)),
+            Err(err) => (None, KeyStatus::error(err)),
         })
         .collect();
     drop(store);
 
-    // This interchange cannot be used to migrate the key(s) just deleted to
-    // another client: see the module doc for why `genesis_validators_root`
-    // is deliberately wrong rather than merely absent. Logged on every call,
-    // not just a failure, since a successful response is exactly the one a
-    // caller might mistake for "safe to import elsewhere".
-    warn!(
-        "DELETE /eth/v1/keystores returns an empty EIP-3076 interchange with no real signing \
-         history; it cannot be used to migrate these keys to another client without slashing risk"
-    );
+    // Exported only now, with the keys out of the store: a signature with one
+    // of them either finished before the write lock above was granted, and is
+    // in the record, or can no longer happen. That holds because the duty
+    // services record before they take the store's read lock to sign (see
+    // `attestation.rs` and `proposal.rs`), so no signature exists without its
+    // record already on disk. Only for the keys that are `deleted` or may
+    // become `not_active`, as the specification requires: a key whose delete
+    // failed is still on disk and comes back on restart, so its history is
+    // not handed over, and neither is one whose removal reached the disk but
+    // not a flush (`Error::Unflushed`, an `error` too), since it may come
+    // back. Teku and Prysm filter the same way. A key listed twice is
+    // `deleted` once and `not_found` once; `export` lists it once.
+    let requested: Vec<Option<BlsPubkey>> = results
+        .iter()
+        .map(|(pubkey, status)| match status.status.as_str() {
+            "deleted" | "not_found" => *pubkey,
+            _ => None,
+        })
+        .collect();
+    let exported = crate::slashing_protection::blocking(&context.protection, move |protection| {
+        let pubkeys: Vec<BlsPubkey> = requested.iter().flatten().copied().collect();
+        let interchange = protection.export(&pubkeys)?;
+        let recorded: Vec<bool> = requested
+            .iter()
+            .map(|pubkey| pubkey.is_some_and(|pubkey| protection.contains(&pubkey)))
+            .collect();
+        Ok((interchange, recorded))
+    })
+    .await;
+    let (slashing_protection, recorded) = match exported {
+        Ok(exported) => exported,
+        Err(err) => {
+            // With the record unreadable, nothing here can tell a key with no
+            // history from one whose history could not be read, so every key
+            // that parsed becomes an error, as Prysm answers: a `not_found`
+            // here would tell a migrator there is nothing to carry. A
+            // malformed pubkey keeps its own error. The deletions themselves
+            // already happened and are not undone: the keys' records are
+            // kept, so a retry answers `not_active` with their history. The
+            // field is required, so it carries an empty string rather than
+            // an interchange that would read as "nothing signed".
+            warn!(%err, "Deleted keys whose slashing-protection history could not be exported");
+            let message = format!("slashing_protection could not be exported: {err}");
+            let data = results
+                .into_iter()
+                .map(|(pubkey, status)| match pubkey {
+                    Some(_) => KeyStatus::error(&message),
+                    None => status,
+                })
+                .collect();
+            return Json(DeleteResponse {
+                data,
+                slashing_protection: String::new(),
+            });
+        }
+    };
+
+    // `not_active`: not held here, but with a record, which the response
+    // carries. The specification's word for "gone, history attached".
+    let data = results
+        .into_iter()
+        .zip(recorded)
+        .map(|((_, status), recorded)| {
+            if status.status == "not_found" && recorded {
+                KeyStatus {
+                    status: "not_active".to_string(),
+                    message: None,
+                }
+            } else {
+                status
+            }
+        })
+        .collect();
 
     Json(DeleteResponse {
         data,
-        slashing_protection: empty_interchange(),
+        slashing_protection,
     })
 }
 
@@ -843,23 +977,6 @@ fn persist_delete(context: &KeymanagerContext, pubkey: &BlsPubkey) -> crate::Res
             .unwrap_or(true)
     });
     save_definitions(context, &definitions)
-}
-
-/// A well-formed EIP-3076 interchange holding no history.
-///
-/// `genesis_validators_root` is deliberately all-zero rather than the
-/// chain's real value; see the module doc for why. Do not "fix" this to
-/// carry the real root: that would make an empty history look legitimate
-/// instead of getting it rejected.
-fn empty_interchange() -> String {
-    serde_json::json!({
-        "metadata": {
-            "interchange_format_version": INTERCHANGE_VERSION,
-            "genesis_validators_root": "0x0000000000000000000000000000000000000000000000000000000000000000"
-        },
-        "data": []
-    })
-    .to_string()
 }
 
 #[cfg(test)]
@@ -1642,6 +1759,366 @@ mod tests {
         );
     }
 
+    const KEYSTORE_PUBKEY: &str = "0x9612d7a727c9d0a22e185a1c768478dfe919cada9266988cb32359c11f2b7b27f4ae4040902382ae2910c15e2b420d07";
+
+    /// A context over `dir` whose slashing protection is a real record there,
+    /// for the chain `0x00..00`, and the handle to inspect it with.
+    fn context_with_record(
+        dir: &std::path::Path,
+    ) -> (
+        KeymanagerContext,
+        crate::slashing_protection::SharedProtection,
+    ) {
+        let protection = crate::slashing_protection::SlashingProtection::open(
+            dir,
+            ethlambda_types::beacon::primitives::Root::ZERO,
+            &[],
+            false,
+        )
+        .expect("opens with no keys");
+        let mut context = context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir);
+        context.protection = Arc::new(std::sync::Mutex::new(protection));
+        let protection = context.protection.clone();
+        (context, protection)
+    }
+
+    /// A minimal interchange for `KEYSTORE_PUBKEY` on the chain `root`.
+    fn history(root: &str, slot: u64, source: u64, target: u64) -> String {
+        history_for(KEYSTORE_PUBKEY, root, slot, source, target)
+    }
+
+    fn history_for(pubkey: &str, root: &str, slot: u64, source: u64, target: u64) -> String {
+        serde_json::json!({
+            "metadata": { "interchange_format_version": "5", "genesis_validators_root": root },
+            "data": [{
+                "pubkey": pubkey,
+                "signed_blocks": [{ "slot": slot.to_string() }],
+                "signed_attestations": [{
+                    "source_epoch": source.to_string(),
+                    "target_epoch": target.to_string()
+                }]
+            }]
+        })
+        .to_string()
+    }
+
+    const ZERO_ROOT: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+    /// History that arrives with a key is in force before the key can sign.
+    #[tokio::test]
+    async fn an_import_brings_its_slashing_protection_history() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (context, protection) = context_with_record(dir.path());
+
+        let (_, body) = send(
+            router(context, TOKEN.to_string()),
+            authed(
+                "POST",
+                "/eth/v1/keystores",
+                serde_json::json!({
+                    "keystores": [keystore_json()],
+                    "passwords": [PASSWORD],
+                    "slashing_protection": history(ZERO_ROOT, 100, 5, 10),
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(body["data"][0]["status"], "imported", "got {body}");
+
+        let pubkey = parse_pubkey(KEYSTORE_PUBKEY).expect("pubkey");
+        let protection = protection.lock().expect("not poisoned");
+        assert!(
+            protection.check_block(&pubkey, 100).is_err(),
+            "slot 100 was signed elsewhere"
+        );
+        assert!(protection.check_block(&pubkey, 101).is_ok());
+    }
+
+    /// History for another chain is refused, and with it every key in the
+    /// request: none may start signing without the history it came with.
+    #[tokio::test]
+    async fn an_import_whose_history_is_for_another_chain_imports_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (context, _) = context_with_record(dir.path());
+        let store = context.store.clone();
+        let other_chain = "0x0000000000000000000000000000000000000000000000000000000000000001";
+
+        let (_, body) = send(
+            router(context, TOKEN.to_string()),
+            authed(
+                "POST",
+                "/eth/v1/keystores",
+                serde_json::json!({
+                    "keystores": [keystore_json()],
+                    "passwords": [PASSWORD],
+                    "slashing_protection": history(other_chain, 100, 5, 10),
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(body["data"][0]["status"], "error", "got {body}");
+        assert!(store.read().await.is_empty(), "the key must not be loaded");
+    }
+
+    /// A delete hands over the record the key was protected by, so it can be
+    /// imported elsewhere, and keeps it here.
+    #[tokio::test]
+    async fn a_delete_returns_the_keys_history() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (context, protection) = context_with_record(dir.path());
+        let app = router(context, TOKEN.to_string());
+
+        let (_, body) = send(
+            app.clone(),
+            authed(
+                "POST",
+                "/eth/v1/keystores",
+                serde_json::json!({ "keystores": [keystore_json()], "passwords": [PASSWORD] }),
+            ),
+        )
+        .await;
+        assert_eq!(body["data"][0]["status"], "imported", "got {body}");
+        // Imported with no history, so the key starts at the current slot;
+        // a proposal must come after it.
+        const SLOT: u64 = 1 << 40;
+        let pubkey = parse_pubkey(KEYSTORE_PUBKEY).expect("pubkey");
+        protection
+            .lock()
+            .expect("not poisoned")
+            .check_and_record_block(&pubkey, SLOT)
+            .expect("written")
+            .expect("allowed");
+
+        let (_, body) = send(
+            app.clone(),
+            authed(
+                "DELETE",
+                "/eth/v1/keystores",
+                serde_json::json!({ "pubkeys": [KEYSTORE_PUBKEY] }),
+            ),
+        )
+        .await;
+        assert_eq!(body["data"][0]["status"], "deleted", "got {body}");
+        let interchange: serde_json::Value =
+            serde_json::from_str(body["slashing_protection"].as_str().expect("a string"))
+                .expect("json");
+        assert_eq!(
+            interchange["metadata"]["genesis_validators_root"],
+            ZERO_ROOT
+        );
+        assert_eq!(interchange["data"][0]["pubkey"], KEYSTORE_PUBKEY);
+        assert_eq!(
+            interchange["data"][0]["signed_blocks"][0]["slot"],
+            SLOT.to_string()
+        );
+
+        // Gone from this client, but its record is still here and still
+        // returned: the specification's `not_active`.
+        let (_, body) = send(
+            app,
+            authed(
+                "DELETE",
+                "/eth/v1/keystores",
+                serde_json::json!({ "pubkeys": [KEYSTORE_PUBKEY] }),
+            ),
+        )
+        .await;
+        assert_eq!(body["data"][0]["status"], "not_active", "got {body}");
+        assert!(
+            protection
+                .lock()
+                .expect("not poisoned")
+                .check_block(&pubkey, SLOT)
+                .is_err()
+        );
+    }
+
+    /// The history may name a validator that is not in the request: it gets a
+    /// record too, so a later delete of it answers `not_active` with that
+    /// history rather than `not_found`.
+    #[tokio::test]
+    async fn history_for_a_key_outside_the_request_gets_a_record() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (context, protection) = context_with_record(dir.path());
+        let app = router(context, TOKEN.to_string());
+        let other = format!("0x{}", "ab".repeat(48));
+
+        let (_, body) = send(
+            app.clone(),
+            authed(
+                "POST",
+                "/eth/v1/keystores",
+                serde_json::json!({
+                    "keystores": [keystore_json()],
+                    "passwords": [PASSWORD],
+                    "slashing_protection": history_for(&other, ZERO_ROOT, 100, 5, 10),
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(body["data"][0]["status"], "imported", "got {body}");
+
+        let other_pubkey = parse_pubkey(&other).expect("pubkey");
+        {
+            let protection = protection.lock().expect("not poisoned");
+            assert!(protection.contains(&other_pubkey));
+            assert!(protection.check_block(&other_pubkey, 100).is_err());
+            assert!(protection.contains(&parse_pubkey(KEYSTORE_PUBKEY).expect("pubkey")));
+        }
+
+        let (_, body) = send(
+            app,
+            authed(
+                "DELETE",
+                "/eth/v1/keystores",
+                serde_json::json!({ "pubkeys": [other] }),
+            ),
+        )
+        .await;
+        assert_eq!(body["data"][0]["status"], "not_active", "got {body}");
+        let interchange: serde_json::Value =
+            serde_json::from_str(body["slashing_protection"].as_str().expect("a string"))
+                .expect("json");
+        assert_eq!(interchange["data"][0]["pubkey"], other);
+        assert_eq!(interchange["data"][0]["signed_blocks"][0]["slot"], "100");
+    }
+
+    /// A key listed twice in one delete is `deleted` once and `not_active`
+    /// once, and the returned interchange names it once: one that named a
+    /// validator twice would be refused on import.
+    #[tokio::test]
+    async fn a_delete_listing_a_key_twice_exports_it_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (context, _) = context_with_record(dir.path());
+        let app = router(context, TOKEN.to_string());
+
+        let (_, body) = send(
+            app.clone(),
+            authed(
+                "POST",
+                "/eth/v1/keystores",
+                serde_json::json!({ "keystores": [keystore_json()], "passwords": [PASSWORD] }),
+            ),
+        )
+        .await;
+        assert_eq!(body["data"][0]["status"], "imported", "got {body}");
+
+        let (_, body) = send(
+            app,
+            authed(
+                "DELETE",
+                "/eth/v1/keystores",
+                serde_json::json!({ "pubkeys": [KEYSTORE_PUBKEY, KEYSTORE_PUBKEY] }),
+            ),
+        )
+        .await;
+        assert_eq!(body["data"][0]["status"], "deleted", "got {body}");
+        assert_eq!(body["data"][1]["status"], "not_active", "got {body}");
+        let interchange: serde_json::Value =
+            serde_json::from_str(body["slashing_protection"].as_str().expect("a string"))
+                .expect("json");
+        assert_eq!(interchange["data"].as_array().expect("array").len(), 1);
+        assert_eq!(interchange["data"][0]["pubkey"], KEYSTORE_PUBKEY);
+    }
+
+    /// The history is written before its key is saved, so it is held even
+    /// when the key then fails to save. The key here was deleted earlier and
+    /// kept an older record: had the key been saved first, a crash before the
+    /// history landed would have loaded it on that older record at the next
+    /// start, which is the case the ordering exists for.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn history_is_written_before_its_key_is_saved() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // A symlink at the keystore's path makes `persist_import` refuse.
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, "untouched").expect("writes target");
+        std::os::unix::fs::symlink(&target, dir.path().join(format!("{KEYSTORE_PUBKEY}.json")))
+            .expect("symlinks");
+        let (context, protection) = context_with_record(dir.path());
+        let pubkey = parse_pubkey(KEYSTORE_PUBKEY).expect("pubkey");
+        {
+            let mut protection = protection.lock().expect("not poisoned");
+            protection.register(&[pubkey]).expect("registers");
+            protection
+                .check_and_record_block(&pubkey, 10)
+                .expect("written")
+                .expect("allowed");
+        }
+        let store = context.store.clone();
+
+        let (_, body) = send(
+            router(context, TOKEN.to_string()),
+            authed(
+                "POST",
+                "/eth/v1/keystores",
+                serde_json::json!({
+                    "keystores": [keystore_json()],
+                    "passwords": [PASSWORD],
+                    "slashing_protection": history(ZERO_ROOT, 100, 5, 10),
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(body["data"][0]["status"], "error", "got {body}");
+        assert!(store.read().await.is_empty(), "the key did not load");
+        assert!(
+            !dir.path().join("validator_definitions.yml").exists(),
+            "nothing was saved"
+        );
+        let protection = protection.lock().expect("not poisoned");
+        assert!(
+            protection.check_block(&pubkey, 100).is_err(),
+            "the history raised the key's record"
+        );
+        assert!(protection.check_block(&pubkey, 101).is_ok());
+    }
+
+    /// The history is written before any key is touched: when that write
+    /// fails, no key is saved or loaded, so nothing of the request is on disk
+    /// to load and sign after a restart as if the import had half succeeded.
+    #[tokio::test]
+    async fn a_failed_history_write_saves_no_key() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (context, protection) = context_with_record(dir.path());
+        // A directory in the record's place makes the write's rename fail.
+        let record = protection
+            .lock()
+            .expect("not poisoned")
+            .path()
+            .expect("persisted")
+            .to_path_buf();
+        std::fs::remove_file(&record).expect("removes the record");
+        std::fs::create_dir(&record).expect("a directory in its place");
+
+        let (_, body) = send(
+            router(context, TOKEN.to_string()),
+            authed(
+                "POST",
+                "/eth/v1/keystores",
+                serde_json::json!({
+                    "keystores": [keystore_json()],
+                    "passwords": [PASSWORD],
+                    "slashing_protection": history(ZERO_ROOT, 100, 5, 10),
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(body["data"][0]["status"], "error", "got {body}");
+        assert!(
+            body["data"][0]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("slashing_protection was not imported"),
+            "got {body}"
+        );
+        assert!(protection.lock().expect("not poisoned").is_empty());
+        assert!(
+            !dir.path().join(format!("{KEYSTORE_PUBKEY}.json")).exists(),
+            "no keystore was saved"
+        );
+    }
+
     #[tokio::test]
     async fn deleting_an_unknown_key_reports_not_found() {
         let (_, body) = send(
@@ -1982,20 +2459,6 @@ mod tests {
             "version": 4
         })
         .to_string()
-    }
-
-    /// Finding 6: the interchange's `genesis_validators_root` must stay
-    /// all-zero. See the module doc: a real root would make an empty history
-    /// look legitimate, which is worse than the deliberately unusable file
-    /// this client returns instead.
-    #[test]
-    fn the_empty_interchange_root_stays_all_zero() {
-        let interchange: serde_json::Value =
-            serde_json::from_str(&empty_interchange()).expect("valid json");
-        assert_eq!(
-            interchange["metadata"]["genesis_validators_root"],
-            "0x0000000000000000000000000000000000000000000000000000000000000000",
-        );
     }
 
     /// Finding 3: `require_bearer` must reject a wrong token of a different
