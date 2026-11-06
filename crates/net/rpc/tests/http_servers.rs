@@ -146,12 +146,171 @@ async fn a_cancelled_token_stops_the_server() {
 #[tokio::test]
 async fn the_beacon_router_replaces_the_lean_one() {
     use axum::{body::Body, http::Request};
+    use tower::ServiceExt as _;
+
+    let router =
+        ethlambda_rpc::build_beacon_api_router(beacon_store(), "ethlambda/test", "peer".into())
+            .layer(axum::Extension(
+                ethlambda_blockchain::SyncStatusController::default(),
+            ));
+
+    let beacon = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/eth/v1/node/version")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(beacon.status(), axum::http::StatusCode::OK);
+
+    let lean = router
+        .oneshot(
+            Request::builder()
+                .uri("/lean/v0/node/syncing")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        lean.status(),
+        axum::http::StatusCode::NOT_FOUND,
+        "a beacon node must not serve the lean surface off a beacon store"
+    );
+}
+
+/// A subscriber left connected to `/eth/v1/events` does not hold up shutdown,
+/// with the API and metrics routers merged onto one listener.
+///
+/// Graceful shutdown waits for every in-flight response, and an event stream
+/// never finishes on its own: before the streams ended on the shutdown token, a
+/// node with any SSE client attached (a validator client, contributoor) hung on
+/// SIGINT until the client disconnected.
+#[tokio::test]
+async fn a_connected_event_stream_does_not_hold_up_shutdown() {
+    let port = free_port().await;
+    assert_an_event_stream_ends_on_shutdown(port, port).await;
+}
+
+/// The same with the API and metrics routers on two listeners, the default
+/// ports' shape, which starts two servers rather than one.
+#[tokio::test]
+async fn a_connected_event_stream_does_not_hold_up_shutdown_on_separate_ports() {
+    let api_port = free_port().await;
+    let metrics_port = free_port().await;
+    assert_ne!(
+        api_port, metrics_port,
+        "the probe handed out one port twice"
+    );
+    assert_an_event_stream_ends_on_shutdown(api_port, metrics_port).await;
+}
+
+/// Opens `/eth/v1/events` on `api_port`, cancels the shutdown token, and
+/// checks the servers stop.
+///
+/// The bound is well under the servers' drain timeout, so it is the stream
+/// ending on the signal that lets them stop, not the servers giving up on it.
+async fn assert_an_event_stream_ends_on_shutdown(api_port: u16, metrics_port: u16) {
+    let shutdown = CancellationToken::new();
+    let config = RpcConfig {
+        http_address: LOCALHOST,
+        api_port,
+        metrics_port,
+        version: "ethlambda/test",
+    };
+    // Kept alive for the whole test, so the channel never closes and only the
+    // shutdown token can end the stream.
+    let events = ethlambda_blockchain::EventBus::new(16);
+    let router =
+        ethlambda_rpc::build_beacon_api_router(beacon_store(), "ethlambda/test", "peer".into())
+            .layer(axum::Extension(events.clone()));
+    let served = tokio::spawn(start_http_servers(config, Some(router), shutdown.clone()));
+
+    // Wait for both listeners to accept, then subscribe.
+    assert!(status_line(&get(metrics_port, "/metrics").await).contains("200"));
+    assert!(status_line(&get(api_port, "/eth/v1/node/version").await).contains("200"));
+    let mut stream = TcpStream::connect(SocketAddr::new(LOCALHOST, api_port))
+        .await
+        .expect("the server accepts");
+    stream
+        .write_all(b"GET /eth/v1/events?topics=head HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .expect("the request writes");
+    let mut head = vec![0; 1024];
+    let read = stream.read(&mut head).await.expect("the headers read");
+    assert!(
+        String::from_utf8_lossy(&head[..read]).starts_with("HTTP/1.1 200"),
+        "the event stream opens"
+    );
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(2), served)
+        .await
+        .expect("the servers stop promptly despite the open stream")
+        .expect("the server task joins")
+        .expect("the server exits cleanly");
+}
+
+/// A response that never finishes does not hold up shutdown either.
+///
+/// The event streams end on the shutdown signal, but any response can stall
+/// for as long as its client stops reading, and axum's graceful shutdown waits
+/// for it with no limit. The server stops waiting after its drain timeout.
+#[tokio::test]
+async fn a_response_that_never_finishes_does_not_hold_up_shutdown() {
+    use axum::body::{Body, Bytes};
+    use std::convert::Infallible;
+
+    let port = free_port().await;
+    let shutdown = CancellationToken::new();
+    let config = RpcConfig {
+        http_address: LOCALHOST,
+        api_port: port,
+        metrics_port: port,
+        version: "ethlambda/test",
+    };
+    // A body that never yields and never ends, standing in for a client that
+    // stopped reading: nothing here knows about the shutdown signal.
+    let stalled = axum::routing::get(|| async {
+        Body::from_stream(futures_util::stream::pending::<Result<Bytes, Infallible>>())
+    });
+    let router = axum::Router::new().route("/stalled", stalled);
+    let served = tokio::spawn(start_http_servers(config, Some(router), shutdown.clone()));
+
+    assert!(status_line(&get(port, "/metrics").await).contains("200"));
+    let mut stream = TcpStream::connect(SocketAddr::new(LOCALHOST, port))
+        .await
+        .expect("the server accepts");
+    stream
+        .write_all(b"GET /stalled HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .expect("the request writes");
+    let mut head = vec![0; 1024];
+    let read = stream.read(&mut head).await.expect("the headers read");
+    assert!(
+        String::from_utf8_lossy(&head[..read]).starts_with("HTTP/1.1 200"),
+        "the stalled response has started"
+    );
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(30), served)
+        .await
+        .expect("the server stops waiting on the stalled response")
+        .expect("the server task joins")
+        .expect("the server exits cleanly");
+}
+
+/// A beacon `Store` anchored at a phase0 block, enough for the beacon router
+/// to build.
+fn beacon_store() -> ethlambda_storage::Store {
     use ethlambda_types::beacon::{
         config::Config,
         containers::{SignedBeaconBlock, phase0},
         primitives::Root,
     };
-    use tower::ServiceExt as _;
 
     const GENESIS_TIME: u64 = 1_606_824_023;
     let slot = 64;
@@ -180,35 +339,5 @@ async fn the_beacon_router_replaces_the_lean_one() {
         .insert_signed_block(root, block)
         .expect("insert anchor block");
 
-    let router = ethlambda_rpc::build_beacon_api_router(store, "ethlambda/test", "peer".into())
-        .layer(axum::Extension(
-            ethlambda_blockchain::SyncStatusController::default(),
-        ));
-
-    let beacon = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/eth/v1/node/version")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(beacon.status(), axum::http::StatusCode::OK);
-
-    let lean = router
-        .oneshot(
-            Request::builder()
-                .uri("/lean/v0/node/syncing")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        lean.status(),
-        axum::http::StatusCode::NOT_FOUND,
-        "a beacon node must not serve the lean surface off a beacon store"
-    );
+    store
 }
