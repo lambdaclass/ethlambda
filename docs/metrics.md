@@ -939,6 +939,34 @@ guards caught a duty they judged unsafe, and `fee_recipient_mismatches_total`
 means blocks are being proposed that pay someone else. `envelope_failures_total`
 belongs with them on a gloas network.
 
+### Actor Runtime (spawned)
+
+`/metrics` also carries the actor framework's own counters, appended after the
+prometheus registry text. They come from `spawned-concurrency`'s `metrics`
+feature (on in the workspace manifest), which keeps fixed process-wide
+aggregates with no per-actor labels: every series sums the BlockChain and P2P
+actors together. The collector has no exporter of its own, so `get_metrics`
+appends `spawned_concurrency::metrics::render_prometheus()` to the body.
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `spawned_mailbox_depth` | gauge | Messages waiting in actor mailboxes, excluding the handler currently running |
+| `spawned_queue_wait_seconds` | histogram | Enqueue to handler start, so the time a message spent behind the actor's other work |
+| `spawned_handler_duration_seconds` | histogram | Handler dispatch to completion, awaited time included |
+| `spawned_request_latency_seconds` | histogram | Caller-side `call` lifetime to reply, timeout or actor stop |
+| `spawned_messages_{enqueued,handled,rejected,discarded}_total` | counter | Delivery accounting; `rejected` is a send to a stopped actor, `discarded` a queued message dropped at stop |
+| `spawned_handlers_{completed,panicked,aborted}_total`, `spawned_handlers_active` | counter, gauge | Handler outcomes |
+| `spawned_requests_{started,replied,timed_out,actor_stopped,cancelled}_total`, `spawned_requests_active` | counter, gauge | `call` outcomes |
+| `spawned_actors_spawned_total`, `spawned_actors_active`, `spawned_actors_exited_{normal,shutdown,panic,kill}_total` | counter, gauge | Actor lifecycle |
+
+Every observation is timed (`timing_sample_every` is left at its default of 1):
+the lean actors see a few hundred messages per slot, and the `(slot, message)`
+periodicity of that traffic would bias a deterministic 1-in-N sample. The
+histograms use spawned's fixed power-of-two buckets from 1 µs to about 1 s.
+`spawned_queue_wait_seconds` is the one to watch: a rising p99 on it, with
+`lean_tick_interval_duration_seconds` steady, means the chain actor's mailbox is
+backing up behind long handlers rather than the handlers themselves getting slow.
+
 ## Troubleshooting
 
 ### Docker Desktop on MacOS

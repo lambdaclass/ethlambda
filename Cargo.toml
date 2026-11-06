@@ -92,7 +92,7 @@ hex = "0.4"
 hmac = "0.12"
 base64 = "0.22"
 
-spawned-concurrency = "0.6.0"
+spawned-concurrency = { version = "0.6.0", features = ["metrics"] }
 spawned-rt = "0.6.0"
 tokio = "1.0"
 tokio-util = "0.7"
