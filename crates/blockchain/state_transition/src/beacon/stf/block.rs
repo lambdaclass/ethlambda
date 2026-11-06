@@ -32,7 +32,7 @@ use crate::beacon::helpers::misc::compute_signing_root;
 use crate::beacon::preset;
 use crate::beacon::primitives::{BlsSignature, HashTreeRoot as _, Root, Slot, ValidatorIndex};
 
-use super::{ExecutionEngine, bellatrix, capella, deneb, electra, fulu, gloas};
+use super::{ExecutionEngine, bellatrix, capella, deneb, eip8453, electra, fulu, gloas};
 
 /// Dispatches on the block's fork and runs that fork's own block processing.
 ///
@@ -133,6 +133,11 @@ pub fn process_block(
             active_balances,
             options,
         ),
+        // EIP-8453 (decoupled consensus): heze's steps, with the finality
+        // gadget's operations and height events.
+        containers::SignedBeaconBlock::Eip8453(signed) => {
+            eip8453::process_block(state, &signed.message, config, active_balances, options)
+        }
         containers::SignedBeaconBlock::Lean(_) => {
             crate::beacon::lean_block_unreachable("process_block")
         }

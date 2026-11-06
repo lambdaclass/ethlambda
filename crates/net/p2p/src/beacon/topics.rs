@@ -310,8 +310,10 @@ impl BeaconTopics {
                 column_subnets,
                 attestation_subnets,
             ),
-            // Heze adds the inclusion list topic to gloas's.
-            ForkName::Heze => Self::with_extra_kinds(
+            // Heze adds the inclusion list topic to gloas's. EIP-8453 keeps
+            // heze's topics.
+            // TODO(eip8453): add the head vote topics (`p2p-interface.md`).
+            ForkName::Heze | ForkName::Eip8453 => Self::with_extra_kinds(
                 fork_digest,
                 &HEZE_TOPIC_KINDS,
                 column_subnets,

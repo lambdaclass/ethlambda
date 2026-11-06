@@ -91,6 +91,12 @@ pub fn payload_inputs(state: &BeaconState, config: &Config) -> Result<PayloadInp
         BeaconState::Gloas(_) | BeaconState::Heze(_) => {
             return Err(Error::SpecAssert("block production does not support gloas"));
         }
+        // TODO(eip8453): EIP-8453 block production is a later phase.
+        BeaconState::Eip8453(_) => {
+            return Err(Error::SpecAssert(
+                "block production does not support eip8453",
+            ));
+        }
         BeaconState::Lean(_) => lean_state_unreachable("payload_inputs"),
     };
     Ok(PayloadInputs {
@@ -232,6 +238,11 @@ pub fn pack_attestations(state: &BeaconState, candidates: Vec<Attestation>) -> V
             state.current_justified_checkpoint()
         } else {
             state.previous_justified_checkpoint()
+        };
+        // An EIP-8453 state has no Casper FFG checkpoints, and nothing to
+        // pack for this function's attestation shape.
+        let Ok(expected_source) = expected_source else {
+            return false;
         };
         data.slot + preset::MIN_ATTESTATION_INCLUSION_DELAY <= state.slot()
             && (target_epoch == current_epoch || target_epoch == previous_epoch)
@@ -582,6 +593,11 @@ pub fn assemble_block(
         BeaconState::Gloas(_) | BeaconState::Heze(_) => {
             return Err(Error::SpecAssert("block production does not support gloas"));
         }
+        BeaconState::Eip8453(_) => {
+            return Err(Error::SpecAssert(
+                "block production does not support eip8453",
+            ));
+        }
         BeaconState::Lean(_) => lean_state_unreachable("assemble_block"),
     };
     let mut post = state.clone();
@@ -807,7 +823,7 @@ mod tests {
             slot,
             index: 0,
             beacon_block_root: Root::repeat_byte(1),
-            source: state.current_justified_checkpoint(),
+            source: state.current_justified_checkpoint().unwrap(),
             target: Checkpoint {
                 epoch,
                 root: get_block_root(state, epoch).unwrap(),

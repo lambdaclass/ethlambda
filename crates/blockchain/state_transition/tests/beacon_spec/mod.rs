@@ -462,6 +462,23 @@ pub fn lean_is_not_a_fixture_fork(handler: &str) -> ! {
     )
 }
 
+/// Panics: no fixture release ships EIP-8453 cases.
+///
+/// [`ForkName::Eip8453`] parses (it is in `ForkName::ALL`), so a runner's
+/// match on a case's fork needs an arm for it, but the pinned release has no
+/// `eip8453` directory for a case to come from. Should one appear, every
+/// runner then fails loudly on its first case rather than running a fork it
+/// has no handler for, the decision [`fixture_fork_trials`] forces for a new
+/// directory.
+#[cold]
+#[track_caller]
+pub fn eip8453_has_no_fixtures(handler: &str) -> ! {
+    unreachable!(
+        "an EIP-8453 case reached the {handler} fixture handler; no consensus-spec-tests \
+         release this harness is pinned to ships one"
+    )
+}
+
 /// Accounts for every fork directory the fixture release ships.
 ///
 /// Reports each directory in [`UNMODELED_FORKS`] as an ignored test, so a

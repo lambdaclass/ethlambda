@@ -293,6 +293,7 @@ fn decode_signed_aggregate(case: &Case, name: &str) -> Result<SignedAggregateAnd
             gloas::SignedAggregateAndProof::from_ssz_bytes(&bytes)
                 .map_err(|err| format!("decoding {name}: {err:?}"))?,
         )),
+        ForkName::Eip8453 => Err(format!("no aggregate shape for fork {:?}", case.fork)),
         ForkName::Lean => Err(format!("no aggregate shape for fork {:?}", case.fork)),
     }
 }
@@ -537,7 +538,9 @@ fn build_store(
                     continue;
                 };
                 let mut state = (*state).clone();
-                *state.finalized_checkpoint_mut() = Checkpoint {
+                *state
+                    .finalized_checkpoint_mut()
+                    .map_err(|err| err.to_string())? = Checkpoint {
                     epoch: finalized.epoch,
                     root,
                 };

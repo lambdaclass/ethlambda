@@ -572,6 +572,88 @@ pub mod mainnet {
     /// `InclusionListCommittee` (`Vector<ValidatorIndex, INCLUSION_LIST_COMMITTEE_SIZE>`)
     /// and `InclusionListBits` (`Bitvector[INCLUSION_LIST_COMMITTEE_SIZE]`).
     pub const INCLUSION_LIST_COMMITTEE_SIZE: usize = 16;
+
+    // ================================================================
+    // EIP-8453 (decoupled consensus)
+    // ================================================================
+
+    // --- Finality gadget ---
+
+    /// How many unfinalized justifications the state keeps. Bounds
+    /// `BeaconState.pending_finality` (`List<PendingFinality,
+    /// PENDING_FINALITY_WINDOW>`); the specification requires at least 2.
+    pub const PENDING_FINALITY_WINDOW: usize = 4;
+
+    // --- Rounds ---
+
+    /// Slots per finality-gadget round: each active validator casts one FG
+    /// attestation per round, and `process_round` settles rewards and
+    /// inactivity at its end. Not a container bound by itself.
+    pub const SLOTS_PER_ROUND: u64 = 8;
+
+    /// `TIMEOUT_DELAY_SLOTS`, listed among the specification's constants as
+    /// `SLOTS_PER_ROUND`: how many slots after the target a quorum of target
+    /// votes and timeouts may move the chain to the next height.
+    pub const TIMEOUT_DELAY_SLOTS: u64 = SLOTS_PER_ROUND;
+
+    /// How many attestation committees an epoch's active validators are split
+    /// into, spread over a round's slots. Bounds `Attestation.committee_bits`
+    /// (`Bitvector[ATTESTATION_COMMITTEES_PER_ROUND]`); a multiple of
+    /// [`SLOTS_PER_ROUND`].
+    pub const ATTESTATION_COMMITTEES_PER_ROUND: usize = 2_048;
+
+    /// The most attesters one aggregate may name. A limit checked by
+    /// `is_valid_aggregation_bits` and `is_valid_indexed_attestation`, not a
+    /// container bound (both lists are progressive).
+    pub const MAX_VALIDATORS_PER_AGGREGATE: u64 = 131_072;
+
+    // --- Head votes ---
+
+    /// Members of a slot's head vote committee. Bounds `HeadVoteCommittee`,
+    /// `HeadVoteCommitteeBits` and `HeadVoteCommitteeIndices`.
+    pub const HEAD_VOTE_COMMITTEE_SIZE: usize = 1_024;
+
+    // --- Rewards ---
+
+    /// Scales `get_round_base_reward`, the per-round counterpart of
+    /// `BASE_REWARD_FACTOR`.
+    pub const ROUND_REWARD_FACTOR: u64 = 16;
+
+    // --- Inactivity leak ---
+
+    /// Rounds without finality after which the chain is in an inactivity
+    /// leak (no rewards are paid).
+    pub const MIN_ROUNDS_TO_INACTIVITY_LEAK: u64 = 16;
+
+    /// The inactivity score at which a validator's finality-gadget weight
+    /// reaches zero and it is exited.
+    pub const EJECTION_INACTIVITY_SCORE: u64 = 65_536;
+
+    // --- Max operations per block ---
+
+    /// Bounds the number of head votes in a block body, checked by
+    /// `process_operations` (the list itself is progressive).
+    pub const MAX_HEAD_VOTES: u64 = 8;
+
+    // --- Type-specific SSZ bounds ---
+
+    /// The largest SSZ encoding of an EIP-8453 `AttesterSlashing`, a gossip
+    /// size bound. Nothing in the state transition reads it.
+    pub const MAX_ATTESTER_SLASHING_SIZE_EIP8453: usize = 2_097_538;
+
+    // --- State list lengths ---
+
+    /// `(MIN_SEED_LOOKAHEAD + 2) * SLOTS_PER_EPOCH`, the length of
+    /// `BeaconState.head_vote_committee_window`
+    /// (`Vector<HeadVoteCommittee, HEAD_VOTE_COMMITTEE_WINDOW_LENGTH>`): the
+    /// previous, current, and lookahead epochs' committees.
+    pub const HEAD_VOTE_COMMITTEE_WINDOW_LENGTH: usize =
+        (MIN_SEED_LOOKAHEAD as usize + 2) * SLOTS_PER_EPOCH as usize;
+
+    /// `2 * SLOTS_PER_EPOCH`, the length of `BeaconState.head_vote_participation`
+    /// (`Vector<HeadVoteCommitteeBits, HEAD_VOTE_PARTICIPATION_LENGTH>`): the
+    /// previous and current epochs.
+    pub const HEAD_VOTE_PARTICIPATION_LENGTH: usize = 2 * SLOTS_PER_EPOCH as usize;
 }
 
 /// The minimal preset: the same shape as [`mainnet`], scaled down so spec test
@@ -1090,6 +1172,95 @@ pub mod minimal {
     /// Members of a slot's inclusion list committee. Not customized: equal to
     /// mainnet's.
     pub const INCLUSION_LIST_COMMITTEE_SIZE: usize = 16;
+
+    // ================================================================
+    // EIP-8453 (decoupled consensus)
+    // ================================================================
+
+    // --- Finality gadget ---
+
+    /// How many unfinalized justifications the state keeps. Bounds
+    /// `BeaconState.pending_finality` (`List<PendingFinality,
+    /// PENDING_FINALITY_WINDOW>`); the specification requires at least 2.
+    pub const PENDING_FINALITY_WINDOW: usize = 4;
+
+    // --- Rounds ---
+
+    /// Slots per finality-gadget round: each active validator casts one FG
+    /// attestation per round, and `process_round` settles rewards and
+    /// inactivity at its end. Not a container bound by itself. Customized in
+    /// minimal.
+    pub const SLOTS_PER_ROUND: u64 = 4;
+
+    /// `TIMEOUT_DELAY_SLOTS`, listed among the specification's constants as
+    /// `SLOTS_PER_ROUND`: how many slots after the target a quorum of target
+    /// votes and timeouts may move the chain to the next height.
+    pub const TIMEOUT_DELAY_SLOTS: u64 = SLOTS_PER_ROUND;
+
+    /// How many attestation committees an epoch's active validators are split
+    /// into, spread over a round's slots. Bounds `Attestation.committee_bits`
+    /// (`Bitvector[ATTESTATION_COMMITTEES_PER_ROUND]`); a multiple of
+    /// [`SLOTS_PER_ROUND`]. Customized in
+    /// minimal.
+    pub const ATTESTATION_COMMITTEES_PER_ROUND: usize = 8;
+
+    /// The most attesters one aggregate may name. A limit checked by
+    /// `is_valid_aggregation_bits` and `is_valid_indexed_attestation`, not a
+    /// container bound (both lists are progressive). Customized in
+    /// minimal.
+    pub const MAX_VALIDATORS_PER_AGGREGATE: u64 = 512;
+
+    // --- Head votes ---
+
+    /// Members of a slot's head vote committee. Bounds `HeadVoteCommittee`,
+    /// `HeadVoteCommitteeBits` and `HeadVoteCommitteeIndices`. Customized in
+    /// minimal.
+    pub const HEAD_VOTE_COMMITTEE_SIZE: usize = 16;
+
+    // --- Rewards ---
+
+    /// Scales `get_round_base_reward`, the per-round counterpart of
+    /// `BASE_REWARD_FACTOR`. Customized in
+    /// minimal.
+    pub const ROUND_REWARD_FACTOR: u64 = 32;
+
+    // --- Inactivity leak ---
+
+    /// Rounds without finality after which the chain is in an inactivity
+    /// leak (no rewards are paid). Customized in
+    /// minimal.
+    pub const MIN_ROUNDS_TO_INACTIVITY_LEAK: u64 = 8;
+
+    /// The inactivity score at which a validator's finality-gadget weight
+    /// reaches zero and it is exited.
+    pub const EJECTION_INACTIVITY_SCORE: u64 = 65_536;
+
+    // --- Max operations per block ---
+
+    /// Bounds the number of head votes in a block body, checked by
+    /// `process_operations` (the list itself is progressive).
+    pub const MAX_HEAD_VOTES: u64 = 8;
+
+    // --- Type-specific SSZ bounds ---
+
+    /// The largest SSZ encoding of an EIP-8453 `AttesterSlashing`, a gossip
+    /// size bound. Nothing in the state transition reads it. Customized in
+    /// minimal.
+    pub const MAX_ATTESTER_SLASHING_SIZE_EIP8453: usize = 8_578;
+
+    // --- State list lengths ---
+
+    /// `(MIN_SEED_LOOKAHEAD + 2) * SLOTS_PER_EPOCH`, the length of
+    /// `BeaconState.head_vote_committee_window`
+    /// (`Vector<HeadVoteCommittee, HEAD_VOTE_COMMITTEE_WINDOW_LENGTH>`): the
+    /// previous, current, and lookahead epochs' committees.
+    pub const HEAD_VOTE_COMMITTEE_WINDOW_LENGTH: usize =
+        (MIN_SEED_LOOKAHEAD as usize + 2) * SLOTS_PER_EPOCH as usize;
+
+    /// `2 * SLOTS_PER_EPOCH`, the length of `BeaconState.head_vote_participation`
+    /// (`Vector<HeadVoteCommitteeBits, HEAD_VOTE_PARTICIPATION_LENGTH>`): the
+    /// previous and current epochs.
+    pub const HEAD_VOTE_PARTICIPATION_LENGTH: usize = 2 * SLOTS_PER_EPOCH as usize;
 }
 
 #[cfg(not(feature = "preset-minimal"))]
@@ -1217,7 +1388,8 @@ pub mod retuned {
             | ForkName::Electra
             | ForkName::Fulu
             | ForkName::Gloas
-            | ForkName::Heze => super::PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX,
+            | ForkName::Heze
+            | ForkName::Eip8453 => super::PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX,
             ForkName::Lean => lean_fork_unreachable("proportional_slashing_multiplier"),
         }
     }
@@ -1239,9 +1411,11 @@ pub mod retuned {
             ForkName::Bellatrix | ForkName::Capella | ForkName::Deneb => {
                 super::MIN_SLASHING_PENALTY_QUOTIENT_BELLATRIX
             }
-            ForkName::Electra | ForkName::Fulu | ForkName::Gloas | ForkName::Heze => {
-                super::MIN_SLASHING_PENALTY_QUOTIENT_ELECTRA
-            }
+            ForkName::Electra
+            | ForkName::Fulu
+            | ForkName::Gloas
+            | ForkName::Heze
+            | ForkName::Eip8453 => super::MIN_SLASHING_PENALTY_QUOTIENT_ELECTRA,
             ForkName::Lean => lean_fork_unreachable("min_slashing_penalty_quotient"),
         }
     }
@@ -1255,9 +1429,11 @@ pub mod retuned {
     /// small one.
     pub fn whistleblower_reward_quotient(fork: ForkName) -> u64 {
         match fork {
-            ForkName::Electra | ForkName::Fulu | ForkName::Gloas | ForkName::Heze => {
-                super::WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA
-            }
+            ForkName::Electra
+            | ForkName::Fulu
+            | ForkName::Gloas
+            | ForkName::Heze
+            | ForkName::Eip8453 => super::WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA,
             ForkName::Phase0
             | ForkName::Altair
             | ForkName::Bellatrix
@@ -1284,7 +1460,8 @@ pub mod retuned {
             | ForkName::Electra
             | ForkName::Fulu
             | ForkName::Gloas
-            | ForkName::Heze => super::INACTIVITY_PENALTY_QUOTIENT_BELLATRIX,
+            | ForkName::Heze
+            | ForkName::Eip8453 => super::INACTIVITY_PENALTY_QUOTIENT_BELLATRIX,
             ForkName::Lean => lean_fork_unreachable("inactivity_penalty_quotient"),
         }
     }
@@ -1322,6 +1499,7 @@ pub mod retuned {
                 ForkName::Fulu,
                 ForkName::Gloas,
                 ForkName::Heze,
+                ForkName::Eip8453,
             ];
 
             assert_eq!(
@@ -1376,6 +1554,7 @@ pub mod retuned {
                 ForkName::Fulu,
                 ForkName::Gloas,
                 ForkName::Heze,
+                ForkName::Eip8453,
             ] {
                 assert_eq!(
                     min_slashing_penalty_quotient(fork),
@@ -1402,6 +1581,7 @@ pub mod retuned {
                 ForkName::Fulu,
                 ForkName::Gloas,
                 ForkName::Heze,
+                ForkName::Eip8453,
             ] {
                 assert_eq!(
                     whistleblower_reward_quotient(fork),
@@ -1671,6 +1851,15 @@ mod tests {
 
         in_both!(usize: PTC_SIZE, PTC_WINDOW_LENGTH, BUILDER_PENDING_PAYMENTS_LENGTH);
         in_both!(usize: INCLUSION_LIST_COMMITTEE_SIZE);
+        in_both!(usize:
+            PENDING_FINALITY_WINDOW, ATTESTATION_COMMITTEES_PER_ROUND, HEAD_VOTE_COMMITTEE_SIZE,
+            MAX_ATTESTER_SLASHING_SIZE_EIP8453, HEAD_VOTE_COMMITTEE_WINDOW_LENGTH,
+            HEAD_VOTE_PARTICIPATION_LENGTH,
+        );
+        in_both!(u64:
+            SLOTS_PER_ROUND, TIMEOUT_DELAY_SLOTS, MAX_VALIDATORS_PER_AGGREGATE, ROUND_REWARD_FACTOR,
+            MIN_ROUNDS_TO_INACTIVITY_LEAK, EJECTION_INACTIVITY_SCORE, MAX_HEAD_VOTES,
+        );
         in_both!(u64:
             MAX_PAYLOAD_ATTESTATIONS, MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD,
             MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD, MAX_BUILDERS_PER_WITHDRAWALS_SWEEP,

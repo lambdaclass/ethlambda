@@ -465,9 +465,9 @@ fn attestation_participation_flag_indices(
     inclusion_delay: u64,
 ) -> Result<Vec<usize>> {
     let justified_checkpoint = if data.target.epoch == get_current_epoch(state) {
-        state.current_justified_checkpoint()
+        state.current_justified_checkpoint()?
     } else {
-        state.previous_justified_checkpoint()
+        state.previous_justified_checkpoint()?
     };
     let is_matching_source = data.source == justified_checkpoint;
 

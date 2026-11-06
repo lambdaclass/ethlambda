@@ -143,7 +143,9 @@ use ethlambda_state_transition::beacon::stf::gloas as gloas_stf;
 use ethlambda_state_transition::beacon::stf::{ExecutionEngine, block, operations};
 use libtest_mimic::{Failed, Trial};
 
-use super::{Case, PRESET, collect_all_handlers, lean_is_not_a_fixture_fork};
+use super::{
+    Case, PRESET, collect_all_handlers, eip8453_has_no_fixtures, lean_is_not_a_fixture_fork,
+};
 
 /// The `{execution_valid: bool}` an `execution_payload` case ships alongside
 /// its block, standing in for whatever a real execution client would have
@@ -280,6 +282,7 @@ fn apply(
             // there is, so a catch-all here would be dead code rather than a
             // safety net. `Lean` is covered by name for the same reason, rather
             // than swept into one; see `lean_is_not_a_fixture_fork`.
+            ForkName::Eip8453 => eip8453_has_no_fixtures("block_header"),
             ForkName::Lean => lean_is_not_a_fixture_fork("block_header"),
         },
         "attestation" => match case.fork {
@@ -326,6 +329,7 @@ fn apply(
                     &active_balances,
                 )
             }
+            ForkName::Eip8453 => eip8453_has_no_fixtures("attestation"),
             ForkName::Lean => lean_is_not_a_fixture_fork("attestation"),
         },
         "attester_slashing" => match case.fork {
@@ -353,6 +357,7 @@ fn apply(
                 let slashing: gloas::AttesterSlashing = case.ssz("attester_slashing");
                 gloas_stf::process_attester_slashing(state, &slashing, config)
             }
+            ForkName::Eip8453 => eip8453_has_no_fixtures("attester_slashing"),
             ForkName::Lean => lean_is_not_a_fixture_fork("attester_slashing"),
         },
         // `ProposerSlashing` never changes shape, container included, gloas's
@@ -374,6 +379,7 @@ fn apply(
                 ForkName::Gloas | ForkName::Heze => {
                     gloas_stf::process_proposer_slashing(state, &slashing, config)
                 }
+                ForkName::Eip8453 => eip8453_has_no_fixtures("proposer_slashing"),
                 ForkName::Lean => lean_is_not_a_fixture_fork("proposer_slashing"),
             }
         }
@@ -409,6 +415,7 @@ fn apply(
                     fork: ForkName::Gloas,
                 },
             ),
+            ForkName::Eip8453 => eip8453_has_no_fixtures("deposit"),
             ForkName::Lean => lean_is_not_a_fixture_fork("deposit"),
         },
         // `voluntary_exit_churn` is a second gloas-only fixture handler
@@ -439,6 +446,7 @@ fn apply(
                 let exit: shared::SignedVoluntaryExit = case.ssz("voluntary_exit");
                 electra_stf::process_voluntary_exit(state, &exit, config)
             }
+            ForkName::Eip8453 => eip8453_has_no_fixtures("voluntary_exit"),
             ForkName::Lean => lean_is_not_a_fixture_fork("voluntary_exit"),
         },
         // New in altair, and never listed as modified again, so this needs no
@@ -520,6 +528,7 @@ fn apply(
                         fork: ForkName::Gloas,
                     },
                 ),
+                ForkName::Eip8453 => eip8453_has_no_fixtures("execution_payload"),
                 ForkName::Lean => lean_is_not_a_fixture_fork("execution_payload"),
             }
         }
@@ -565,6 +574,7 @@ fn apply(
             // deterministic from the state alone. This is the one fork whose
             // arm reads no operation file at all.
             ForkName::Gloas | ForkName::Heze => gloas_stf::process_withdrawals(state),
+            ForkName::Eip8453 => eip8453_has_no_fixtures("withdrawals"),
             ForkName::Lean => lean_is_not_a_fixture_fork("withdrawals"),
         },
         // New in gloas (EIP-7732): the block's binding commitment to a
@@ -638,6 +648,7 @@ fn apply(
                 let request: electra::DepositRequest = case.ssz("deposit_request");
                 electra_stf::process_deposit_request(state, &request)
             }
+            ForkName::Eip8453 => eip8453_has_no_fixtures("deposit_request"),
             ForkName::Lean => lean_is_not_a_fixture_fork("deposit_request"),
         },
         "withdrawal_request" => {

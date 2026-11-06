@@ -64,6 +64,7 @@ fn fork_schedule(config: &Config) -> Vec<Value> {
         (config.fulu_fork_version, config.fulu_fork_epoch),
         (config.gloas_fork_version, config.gloas_fork_epoch),
         (config.heze_fork_version, config.heze_fork_epoch),
+        (config.eip8453_fork_version, config.eip8453_fork_epoch),
     ];
     let fork = |previous: [u8; 4], current: [u8; 4], epoch: u64| {
         serde_json::json!({
@@ -586,6 +587,40 @@ mod tests {
             schedule.last().unwrap()["current_version"],
             hex_string(config.gloas_fork_version)
         );
+    }
+
+    #[test]
+    fn the_spec_reports_the_eip8453_keys() {
+        let config = Config {
+            eip8453_fork_epoch: 7,
+            head_vote_due_bps: 2_000,
+            ..Config::mainnet()
+        };
+        let data = spec(&config);
+        assert_eq!(data["EIP8453_FORK_VERSION"], "0xe8453000");
+        assert_eq!(data["EIP8453_FORK_EPOCH"], "7");
+        assert_eq!(data["HEAD_VOTE_DUE_BPS"], "2000");
+        assert_eq!(data["SUPPORT_CUTOFF_BPS"], "5000");
+        assert_eq!(data["VIEW_FREEZE_BPS"], "7500");
+    }
+
+    #[test]
+    fn eip8453_is_listed_after_heze_once_scheduled() {
+        let mut config = Config::mainnet();
+        config.gloas_fork_epoch = 0;
+        config.heze_fork_epoch = 1;
+        config.eip8453_fork_epoch = 2;
+        let schedule = fork_schedule(&config);
+        let last = schedule.last().unwrap();
+        assert_eq!(
+            last["current_version"],
+            hex_string(config.eip8453_fork_version)
+        );
+        assert_eq!(
+            last["previous_version"],
+            hex_string(config.heze_fork_version)
+        );
+        assert_eq!(last["epoch"], "2");
     }
 
     #[test]

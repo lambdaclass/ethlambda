@@ -137,7 +137,9 @@ use libssz::SszDecode;
 use libssz_types::SszList;
 use libtest_mimic::Trial;
 
-use super::{Case, PRESET, collect_all_handlers, lean_is_not_a_fixture_fork};
+use super::{
+    Case, PRESET, collect_all_handlers, eip8453_has_no_fixtures, lean_is_not_a_fixture_fork,
+};
 
 // ---------------------------------------------------------------------------
 // `steps.yaml` deserialization
@@ -349,6 +351,7 @@ pub(super) fn decode_anchor_block(case: &Case) -> Result<SignedBeaconBlock, Stri
             message: decode(case, "anchor_block")?,
             signature: Default::default(),
         })),
+        ForkName::Eip8453 => eip8453_has_no_fixtures("fork_choice"),
         ForkName::Lean => lean_is_not_a_fixture_fork("fork_choice"),
     }
 }
@@ -379,6 +382,7 @@ fn decode_attestation(case: &Case, name: &str) -> Result<fork_choice::Attestatio
         ForkName::Gloas | ForkName::Heze => {
             Ok(fork_choice::Attestation::Gloas(decode(case, name)?))
         }
+        ForkName::Eip8453 => eip8453_has_no_fixtures("fork_choice"),
         ForkName::Lean => lean_is_not_a_fixture_fork("fork_choice"),
     }
 }
@@ -401,6 +405,7 @@ fn decode_attester_slashing(
         ForkName::Gloas | ForkName::Heze => {
             Ok(fork_choice::AttesterSlashing::Gloas(decode(case, name)?))
         }
+        ForkName::Eip8453 => eip8453_has_no_fixtures("fork_choice"),
         ForkName::Lean => lean_is_not_a_fixture_fork("fork_choice"),
     }
 }

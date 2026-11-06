@@ -154,7 +154,8 @@ fn pre_gloas_payload(state: &BeaconState) -> Option<(ExecutionBlockHash, u64)> {
         BeaconState::Phase0(_)
         | BeaconState::Altair(_)
         | BeaconState::Gloas(_)
-        | BeaconState::Heze(_) => None,
+        | BeaconState::Heze(_)
+        | BeaconState::Eip8453(_) => None,
         BeaconState::Lean(_) => lean_state_unreachable("execution_payload_bid::pre_gloas_payload"),
     }
 }
@@ -188,7 +189,7 @@ fn head_view(store: &Store) -> Result<HeadView, Outcome> {
     };
     if let Some(state) = store.cached_state(CacheKey::BlockState(node.root)) {
         return match &*state {
-            BeaconState::Gloas(_) | BeaconState::Heze(_) => {
+            BeaconState::Gloas(_) | BeaconState::Heze(_) | BeaconState::Eip8453(_) => {
                 let bid = state
                     .latest_execution_payload_bid()
                     .map_err(|_| internal())?;
@@ -458,7 +459,10 @@ fn stateful_rules(
     }
     // [IGNORE] The parent's payload does not try to exit the builder. Only a
     // gloas parent has an envelope to carry the request.
-    let parent_is_gloas = matches!(&*parent_state, BeaconState::Gloas(_) | BeaconState::Heze(_));
+    let parent_is_gloas = matches!(
+        &*parent_state,
+        BeaconState::Gloas(_) | BeaconState::Heze(_) | BeaconState::Eip8453(_)
+    );
     if parent_is_gloas && bid.parent_block_hash == latest_bid.block_hash {
         let exits = parent_payload_exits(store, market, bid)
             .ok_or(ignore(IgnoreReason::ParentPayloadUnverified))?;

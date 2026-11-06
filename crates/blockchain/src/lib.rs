@@ -917,6 +917,9 @@ fn data_availability_for(
         SignedBeaconBlock::Gloas(_) | SignedBeaconBlock::Heze(_) => {
             Some(fork_choice::DataAvailability::NotRequired)
         }
+        // EIP-8453 keeps gloas's payload envelopes, so the same holds; its
+        // blocks are refused by fork choice for now anyway.
+        SignedBeaconBlock::Eip8453(_) => Some(fork_choice::DataAvailability::NotRequired),
         // `process_block` dispatches a lean block to `store::on_block` before
         // this function is ever reached, so this arm is never observed for
         // one; named on its own rather than folded into the group above so

@@ -300,6 +300,8 @@ fn submission_fork(headers: &HeaderMap) -> Result<ForkName, ApiError> {
             | ForkName::Bellatrix
             | ForkName::Capella
             | ForkName::Deneb
+            // TODO(eip8453): accept EIP-8453's attestations.
+            | ForkName::Eip8453
             | ForkName::Lean,
         )
         | None => Err(ApiError::BadRequest(
@@ -625,7 +627,7 @@ mod tests {
             slot,
             index,
             beacon_block_root: block,
-            source: fixture.state.current_justified_checkpoint(),
+            source: fixture.state.current_justified_checkpoint().unwrap(),
             target: Checkpoint {
                 epoch,
                 root: target,

@@ -145,7 +145,7 @@ fn fused(state: &mut BeaconState, config: &Config) -> Result<()> {
     let total_active_balance = summary.totals().total_active_balance;
     let rewards = RewardContext::new(state, summary.totals(), config)?;
 
-    let finalized_epoch = state.finalized_checkpoint().epoch;
+    let finalized_epoch = state.finalized_checkpoint()?.epoch;
     let activation_epoch = compute_activation_exit_epoch(current_epoch);
     let per_epoch_churn = activation_exit_churn_limit_for(total_active_balance, config);
     let slashings = SlashingsContext::new(state, total_active_balance)?;
@@ -410,7 +410,8 @@ impl DepositPlan {
                 )),
                 PendingQueueFields::Fulu(_)
                 | PendingQueueFields::Gloas(_)
-                | PendingQueueFields::Heze(_) => None,
+                | PendingQueueFields::Heze(_)
+                | PendingQueueFields::Eip8453(_) => None,
             };
             let available_for_processing = fields
                 .deposit_balance_to_consume()
@@ -638,19 +639,19 @@ pub(super) fn differing_fields(state: &mut BeaconState, expected: &mut BeaconSta
     }
     note(
         "finalized_checkpoint",
-        state.finalized_checkpoint() != expected.finalized_checkpoint(),
+        state.finalized_checkpoint().ok() != expected.finalized_checkpoint().ok(),
     );
     note(
         "current_justified_checkpoint",
-        state.current_justified_checkpoint() != expected.current_justified_checkpoint(),
+        state.current_justified_checkpoint().ok() != expected.current_justified_checkpoint().ok(),
     );
     note(
         "previous_justified_checkpoint",
-        state.previous_justified_checkpoint() != expected.previous_justified_checkpoint(),
+        state.previous_justified_checkpoint().ok() != expected.previous_justified_checkpoint().ok(),
     );
     note(
         "justification_bits",
-        state.justification_bits() != expected.justification_bits(),
+        state.justification_bits().ok() != expected.justification_bits().ok(),
     );
     note(
         "exit_churn_cursor",

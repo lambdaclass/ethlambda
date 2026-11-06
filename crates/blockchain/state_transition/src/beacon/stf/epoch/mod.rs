@@ -18,6 +18,7 @@ pub mod altair;
 #[cfg(any(test, debug_assertions))]
 pub mod altair_reference;
 pub mod capella;
+pub mod eip8453;
 pub mod electra;
 pub mod fulu;
 pub mod gloas;
@@ -107,6 +108,9 @@ pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
         // module doc for which), so gloas gets its own driver too.
         ForkName::Gloas => gloas::process_epoch(state, config),
         ForkName::Heze => gloas::process_epoch_heze(state, config),
+        // The finality gadget replaces Casper FFG; rewards and inactivity
+        // move to round processing.
+        ForkName::Eip8453 => eip8453::process_epoch(state, config),
         ForkName::Lean => lean_state_unreachable("process_epoch"),
     }
 }
@@ -143,6 +147,12 @@ pub fn process_justification_and_finalization(
         | ForkName::Fulu
         | ForkName::Gloas
         | ForkName::Heze => altair::process_justification_and_finalization(state),
+        // EIP-8453 has no Casper FFG justification: its finality gadget
+        // justifies and finalizes in block processing (`process_height_events`).
+        fork @ ForkName::Eip8453 => Err(Error::UnsupportedForFork {
+            function: "process_justification_and_finalization",
+            fork,
+        }),
         ForkName::Lean => lean_state_unreachable("process_justification_and_finalization"),
     }
 }

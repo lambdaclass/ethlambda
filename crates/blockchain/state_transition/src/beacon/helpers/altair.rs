@@ -168,7 +168,7 @@ pub fn get_next_sync_committee(state: &BeaconState) -> Result<altair::SyncCommit
         // `compute_balance_weighted_selection` rather than electra's inline
         // rejection-sampling loop, though it keeps electra's effective-balance
         // ceiling. See `crate::beacon::helpers::gloas`'s own module doc.
-        ForkName::Gloas | ForkName::Heze => {
+        ForkName::Gloas | ForkName::Heze | ForkName::Eip8453 => {
             crate::beacon::helpers::gloas::get_next_sync_committee_indices(state)?
         }
         ForkName::Lean => lean_state_unreachable("get_next_sync_committee"),
@@ -342,9 +342,9 @@ pub fn get_attestation_participation_flag_indices(
 ) -> Result<Vec<usize>> {
     // Matching source.
     let justified_checkpoint = if data.target.epoch == get_current_epoch(state) {
-        state.current_justified_checkpoint()
+        state.current_justified_checkpoint()?
     } else {
-        state.previous_justified_checkpoint()
+        state.previous_justified_checkpoint()?
     };
     let is_matching_source = data.source == justified_checkpoint;
 

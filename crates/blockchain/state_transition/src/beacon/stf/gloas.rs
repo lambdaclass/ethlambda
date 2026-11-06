@@ -1479,7 +1479,7 @@ pub fn process_attestation(
         (data.slot % preset::SLOTS_PER_EPOCH) as usize
     };
     let mut payment = {
-        ethlambda_types::gloas_family!(state, "process_attestation", |inner| {
+        ethlambda_types::gloas_heze!(state, "process_attestation", |inner| {
             let len = inner.builder_pending_payments.len();
             inner
                 .builder_pending_payments
@@ -1626,7 +1626,7 @@ pub fn process_attestation(
 
     // Update builder payment weight.
     {
-        ethlambda_types::gloas_family!(state, "process_attestation", |inner| {
+        ethlambda_types::gloas_heze!(state, "process_attestation", |inner| {
             let len = inner.builder_pending_payments.len();
             let entry = inner
                 .builder_pending_payments

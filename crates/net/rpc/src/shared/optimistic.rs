@@ -68,6 +68,8 @@ fn payload_link(store: &Store, root: H256) -> Option<BlockPayloadLink> {
             };
             Some(BlockPayloadLink::Gloas { parent_status })
         }
+        // TODO(eip8453): derive the payload link of an EIP-8453 block.
+        SignedBeaconBlock::Eip8453(_) => None,
         // A lean block is never in a beacon store.
         SignedBeaconBlock::Lean(_) => None,
     }

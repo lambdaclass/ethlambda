@@ -417,6 +417,49 @@ pub const PTC_TIMELINESS_INDEX: usize = 1;
 /// length every entry has, one slot per index above.
 pub const NUM_BLOCK_TIMELINESS_DEADLINES: usize = 2;
 
+// ---------------------------------------------------------------------------
+// EIP-8453 (decoupled consensus)
+// ---------------------------------------------------------------------------
+
+/// The round-participation bit a validator earns with a target vote or a
+/// timeout counted at the current height.
+pub const PROGRESS_FLAG_INDEX: usize = 0;
+/// The round-participation bit a validator earns with a finality pair counted
+/// for a pending justification.
+pub const FINALITY_FLAG_INDEX: usize = 1;
+
+/// Reward share of the progress flag, out of [`WEIGHT_DENOMINATOR`]: altair's
+/// source and target weights combined.
+pub const PROGRESS_WEIGHT: u64 = 40;
+/// Reward share of the finality flag, out of [`WEIGHT_DENOMINATOR`]: altair's
+/// head weight.
+pub const FINALITY_WEIGHT: u64 = 14;
+
+/// The two EIP-8453 flag weights, indexed by [`PROGRESS_FLAG_INDEX`] and
+/// [`FINALITY_FLAG_INDEX`]. With [`SYNC_REWARD_WEIGHT`] and
+/// [`PROPOSER_WEIGHT`] they still sum to [`WEIGHT_DENOMINATOR`].
+pub const PARTICIPATION_FLAG_WEIGHTS_EIP8453: [u64; 2] = [PROGRESS_WEIGHT, FINALITY_WEIGHT];
+
+/// Signs a head vote (`HeadVoteData`).
+pub const DOMAIN_HEAD_VOTE: DomainType = [0x12, 0x00, 0x00, 0x00];
+/// Seeds the head vote committee draw.
+pub const DOMAIN_HEAD_VOTE_COMMITTEE: DomainType = [0x13, 0x00, 0x00, 0x00];
+/// Signs a finality-gadget attestation (`AttestationData`), in place of
+/// [`DOMAIN_BEACON_ATTESTER`].
+pub const DOMAIN_FINALITY_ATTESTER: DomainType = [0x14, 0x00, 0x00, 0x00];
+
+/// The first round, `Round(0)`.
+pub const GENESIS_ROUND: u64 = 0;
+
+/// `PayloadStatus` values a `HeadVoteData` may carry (gloas `fork-choice.md`'s
+/// integers): the byte on the wire, so a head vote naming any other value is
+/// refused rather than decoded into an enum that cannot hold it.
+pub const PAYLOAD_STATUS_EMPTY: u8 = 0;
+/// See [`PAYLOAD_STATUS_EMPTY`].
+pub const PAYLOAD_STATUS_FULL: u8 = 1;
+/// See [`PAYLOAD_STATUS_EMPTY`].
+pub const PAYLOAD_STATUS_PENDING: u8 = 2;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,6 +473,25 @@ mod tests {
         let total: u64 =
             PARTICIPATION_FLAG_WEIGHTS.iter().sum::<u64>() + SYNC_REWARD_WEIGHT + PROPOSER_WEIGHT;
         assert_eq!(total, WEIGHT_DENOMINATOR);
+    }
+
+    #[test]
+    fn eip8453_flag_weights_sum_to_the_denominator() {
+        // EIP-8453's note: the progress flag takes altair's source and target
+        // weights and the finality flag the head weight, so the sum still
+        // equals WEIGHT_DENOMINATOR.
+        let total: u64 = PARTICIPATION_FLAG_WEIGHTS_EIP8453.iter().sum::<u64>()
+            + SYNC_REWARD_WEIGHT
+            + PROPOSER_WEIGHT;
+        assert_eq!(total, WEIGHT_DENOMINATOR);
+        assert_eq!(
+            PARTICIPATION_FLAG_WEIGHTS_EIP8453[PROGRESS_FLAG_INDEX],
+            PROGRESS_WEIGHT
+        );
+        assert_eq!(
+            PARTICIPATION_FLAG_WEIGHTS_EIP8453[FINALITY_FLAG_INDEX],
+            FINALITY_WEIGHT
+        );
     }
 
     #[test]
@@ -453,6 +515,9 @@ mod tests {
             DOMAIN_PROPOSER_PREFERENCES,
             DOMAIN_BUILDER_DEPOSIT,
             DOMAIN_INCLUSION_LIST_COMMITTEE,
+            DOMAIN_HEAD_VOTE,
+            DOMAIN_HEAD_VOTE_COMMITTEE,
+            DOMAIN_FINALITY_ATTESTER,
         ] {
             let masked = [
                 domain[0] & DOMAIN_APPLICATION_MASK[0],

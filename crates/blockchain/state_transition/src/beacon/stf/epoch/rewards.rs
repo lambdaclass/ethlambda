@@ -339,7 +339,7 @@ mod tests {
         // Current epoch 1, previous epoch 0: finalizing epoch 1 would make the
         // delay `0 - 1`, an underflow the specification treats as invalid.
         let mut state = crate::beacon::helpers::test_state::with_validators(4);
-        state.finalized_checkpoint_mut().epoch = 1;
+        state.finalized_checkpoint_mut().unwrap().epoch = 1;
         assert!(matches!(
             get_finality_delay(&state),
             Err(Error::ArithmeticOverflow(_))

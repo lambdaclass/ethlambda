@@ -131,6 +131,7 @@ pub fn new_payload_request(block: &SignedBeaconBlock) -> Option<NewPayloadReques
         | SignedBeaconBlock::Deneb(_)
         | SignedBeaconBlock::Gloas(_)
         | SignedBeaconBlock::Heze(_)
+        | SignedBeaconBlock::Eip8453(_)
         | SignedBeaconBlock::Lean(_) => return None,
     };
 

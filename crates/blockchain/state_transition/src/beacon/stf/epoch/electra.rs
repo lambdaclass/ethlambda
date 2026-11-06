@@ -123,7 +123,8 @@ pub(super) fn process_unfused_steps(
         | ForkName::Capella
         | ForkName::Deneb
         | ForkName::Gloas
-        | ForkName::Heze) => {
+        | ForkName::Heze
+        | ForkName::Eip8453) => {
             return Err(Error::UnsupportedForFork {
                 function: "process_unfused_steps",
                 fork,
@@ -201,7 +202,14 @@ pub(super) fn registry_action(
 pub fn process_registry_updates(state: &mut BeaconState, config: &Config) -> Result<()> {
     let current_epoch = get_current_epoch(state);
     let activation_epoch = compute_activation_exit_epoch(current_epoch);
-    let finalized_epoch = state.finalized_checkpoint().epoch;
+    // [Modified in EIP8453] `is_eligible_for_activation` compares with the
+    // epoch of the finality gadget's `finalized_slot`.
+    let finalized_epoch = match &*state {
+        BeaconState::Eip8453(inner) => {
+            crate::beacon::helpers::misc::compute_epoch_at_slot(inner.finalized_slot)
+        }
+        other => other.finalized_checkpoint()?.epoch,
+    };
 
     let actions: Vec<Option<RegistryAction>> = state
         .iter_validators()
@@ -425,7 +433,12 @@ pub(crate) fn drain_pending_deposits(
     churn_limit: Gwei,
 ) -> Result<()> {
     let next_epoch = get_current_epoch(state) + 1;
-    let finalized_slot = compute_start_slot_at_epoch(state.finalized_checkpoint().epoch);
+    // [Modified in EIP8453] The finality gate reads the finality gadget's
+    // `finalized_slot` directly.
+    let finalized_slot = match &*state {
+        BeaconState::Eip8453(inner) => inner.finalized_slot,
+        other => compute_start_slot_at_epoch(other.finalized_checkpoint()?.epoch),
+    };
 
     // `pending_queue_fields` borrows the whole state, so everything read
     // through it below has to finish before the loop's own, ordinary
@@ -445,7 +458,8 @@ pub(crate) fn drain_pending_deposits(
             )),
             PendingQueueFields::Fulu(_)
             | PendingQueueFields::Gloas(_)
-            | PendingQueueFields::Heze(_) => None,
+            | PendingQueueFields::Heze(_)
+            | PendingQueueFields::Eip8453(_) => None,
         };
         let available_for_processing = fields
             .deposit_balance_to_consume()
@@ -613,7 +627,8 @@ pub(crate) fn apply_pending_deposit(
 /// puts lean after every beacon fork.
 fn forbids_new_bls_validators(fork: ForkName) -> bool {
     match fork {
-        ForkName::Heze => true,
+        // EIP-8453 is built on heze and keeps its `apply_pending_deposit`.
+        ForkName::Heze | ForkName::Eip8453 => true,
         ForkName::Phase0
         | ForkName::Altair
         | ForkName::Bellatrix
@@ -865,7 +880,7 @@ mod tests {
         let mut state = electra_state_with_validators(2);
         // Past the deposit's own slot, so only the eth1-bridge gate, not the
         // unrelated finality gate, is under test.
-        state.finalized_checkpoint_mut().epoch = 1;
+        state.finalized_checkpoint_mut().unwrap().epoch = 1;
         let validator = state.validator(0).unwrap();
         let deposit = electra::PendingDeposit {
             pubkey: validator.pubkey,

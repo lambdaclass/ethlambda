@@ -95,7 +95,8 @@ pub fn process_operations(
         | ForkName::Electra
         | ForkName::Fulu
         | ForkName::Gloas
-        | ForkName::Heze) => {
+        | ForkName::Heze
+        | ForkName::Eip8453) => {
             return Err(Error::UnsupportedForFork {
                 function: "process_operations",
                 fork,
@@ -406,7 +407,7 @@ pub fn process_attestation(
 
     if data.target.epoch == current_epoch {
         verify(
-            data.source == state.current_justified_checkpoint(),
+            data.source == state.current_justified_checkpoint()?,
             "data.source == state.current_justified_checkpoint",
         )?;
         super::phase0_state(state, "process_attestation")?
@@ -414,7 +415,7 @@ pub fn process_attestation(
             .push(pending_attestation)?;
     } else {
         verify(
-            data.source == state.previous_justified_checkpoint(),
+            data.source == state.previous_justified_checkpoint()?,
             "data.source == state.previous_justified_checkpoint",
         )?;
         super::phase0_state(state, "process_attestation")?
@@ -503,7 +504,11 @@ pub fn add_validator_to_registry(
         // are progressive rather than `SszList` (see `BeaconState::altair_validator_lists`'s
         // own documentation), so it is refused for both reasons rather than
         // folded into either branch above.
-        fork @ (ForkName::Electra | ForkName::Fulu | ForkName::Gloas | ForkName::Heze) => {
+        fork @ (ForkName::Electra
+        | ForkName::Fulu
+        | ForkName::Gloas
+        | ForkName::Heze
+        | ForkName::Eip8453) => {
             return Err(Error::UnsupportedForFork {
                 function: "add_validator_to_registry",
                 fork,

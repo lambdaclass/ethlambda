@@ -1244,7 +1244,7 @@ mod gloas_block_production_tests {
             slot: state.slot() - 1,
             index,
             beacon_block_root,
-            source: state.current_justified_checkpoint(),
+            source: state.current_justified_checkpoint().unwrap(),
             target: ethlambda_types::beacon::containers::shared::Checkpoint {
                 epoch,
                 root: get_block_root(state, epoch).unwrap(),

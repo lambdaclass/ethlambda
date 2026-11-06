@@ -127,7 +127,7 @@ use crate::beacon::bls;
 use crate::beacon::config::Config;
 use crate::beacon::constants::{self, FAR_FUTURE_EPOCH};
 use crate::beacon::containers::shared::Validator;
-use crate::beacon::containers::{BeaconState, electra, fulu, gloas, heze};
+use crate::beacon::containers::{BeaconState, eip8453, electra, fulu, gloas, heze};
 use crate::beacon::error::{Error, Result};
 use crate::beacon::fork::ForkName;
 use crate::beacon::hash::hash;
@@ -664,7 +664,7 @@ pub fn compute_exit_epoch_and_update_churn(
     let current_epoch = get_current_epoch(state);
     let per_epoch_churn = match state.fork_name() {
         ForkName::Electra | ForkName::Fulu => get_activation_exit_churn_limit(state, config)?,
-        ForkName::Gloas | ForkName::Heze => {
+        ForkName::Gloas | ForkName::Heze | ForkName::Eip8453 => {
             crate::beacon::helpers::gloas::get_exit_churn_limit(state, config)?
         }
         fork @ (ForkName::Phase0
@@ -802,7 +802,7 @@ pub fn get_consolidation_churn_limit_for_fork(
 ) -> Result<Gwei> {
     match state.fork_name() {
         ForkName::Electra | ForkName::Fulu => get_consolidation_churn_limit(state, config),
-        ForkName::Gloas | ForkName::Heze => {
+        ForkName::Gloas | ForkName::Heze | ForkName::Eip8453 => {
             crate::beacon::helpers::gloas::get_consolidation_churn_limit(state, config)
         }
         fork @ (ForkName::Phase0
@@ -1033,6 +1033,7 @@ pub(crate) enum PendingQueueFields<'a> {
     Fulu(&'a mut fulu::BeaconState),
     Gloas(&'a mut gloas::BeaconState),
     Heze(&'a mut heze::BeaconState),
+    Eip8453(&'a mut eip8453::BeaconState),
 }
 
 impl<'a> PendingQueueFields<'a> {
@@ -1054,6 +1055,7 @@ impl<'a> PendingQueueFields<'a> {
             // Heze removes the field (EIP-8015): the eth1 bridge is fully
             // retired, which is what "unset" means to every reader.
             PendingQueueFields::Heze(_) => constants::UNSET_DEPOSIT_REQUESTS_START_INDEX,
+            PendingQueueFields::Eip8453(_) => constants::UNSET_DEPOSIT_REQUESTS_START_INDEX,
         }
     }
 
@@ -1064,6 +1066,7 @@ impl<'a> PendingQueueFields<'a> {
             PendingQueueFields::Fulu(state) => state.deposit_balance_to_consume,
             PendingQueueFields::Gloas(state) => state.deposit_balance_to_consume,
             PendingQueueFields::Heze(state) => state.deposit_balance_to_consume,
+            PendingQueueFields::Eip8453(state) => state.deposit_balance_to_consume,
         }
     }
 
@@ -1073,6 +1076,7 @@ impl<'a> PendingQueueFields<'a> {
             PendingQueueFields::Fulu(state) => &mut state.deposit_balance_to_consume,
             PendingQueueFields::Gloas(state) => &mut state.deposit_balance_to_consume,
             PendingQueueFields::Heze(state) => &mut state.deposit_balance_to_consume,
+            PendingQueueFields::Eip8453(state) => &mut state.deposit_balance_to_consume,
         }
     }
 
@@ -1087,6 +1091,7 @@ impl<'a> PendingQueueFields<'a> {
             PendingQueueFields::Fulu(state) => state.pending_deposits.push(deposit)?,
             PendingQueueFields::Gloas(state) => state.pending_deposits.push(deposit),
             PendingQueueFields::Heze(state) => state.pending_deposits.push(deposit),
+            PendingQueueFields::Eip8453(state) => state.pending_deposits.push(deposit),
         }
         Ok(())
     }
@@ -1099,6 +1104,7 @@ impl<'a> PendingQueueFields<'a> {
             PendingQueueFields::Fulu(state) => &state.pending_deposits,
             PendingQueueFields::Gloas(state) => &state.pending_deposits,
             PendingQueueFields::Heze(state) => &state.pending_deposits,
+            PendingQueueFields::Eip8453(state) => &state.pending_deposits,
         }
     }
 
@@ -1124,6 +1130,9 @@ impl<'a> PendingQueueFields<'a> {
             PendingQueueFields::Heze(state) => {
                 core::mem::take(&mut state.pending_deposits).into_inner()
             }
+            PendingQueueFields::Eip8453(state) => {
+                core::mem::take(&mut state.pending_deposits).into_inner()
+            }
         }
     }
 
@@ -1147,6 +1156,9 @@ impl<'a> PendingQueueFields<'a> {
             PendingQueueFields::Heze(state) => {
                 state.pending_deposits = gloas::PendingDeposits::from(deposits);
             }
+            PendingQueueFields::Eip8453(state) => {
+                state.pending_deposits = gloas::PendingDeposits::from(deposits);
+            }
         }
         Ok(())
     }
@@ -1161,6 +1173,7 @@ impl<'a> PendingQueueFields<'a> {
             PendingQueueFields::Fulu(state) => &state.pending_partial_withdrawals,
             PendingQueueFields::Gloas(state) => &state.pending_partial_withdrawals,
             PendingQueueFields::Heze(state) => &state.pending_partial_withdrawals,
+            PendingQueueFields::Eip8453(state) => &state.pending_partial_withdrawals,
         }
     }
 
@@ -1179,6 +1192,9 @@ impl<'a> PendingQueueFields<'a> {
             }
             PendingQueueFields::Gloas(state) => state.pending_partial_withdrawals.push(withdrawal),
             PendingQueueFields::Heze(state) => state.pending_partial_withdrawals.push(withdrawal),
+            PendingQueueFields::Eip8453(state) => {
+                state.pending_partial_withdrawals.push(withdrawal)
+            }
         }
         Ok(())
     }
@@ -1192,6 +1208,7 @@ impl<'a> PendingQueueFields<'a> {
             PendingQueueFields::Fulu(state) => &state.pending_consolidations,
             PendingQueueFields::Gloas(state) => &state.pending_consolidations,
             PendingQueueFields::Heze(state) => &state.pending_consolidations,
+            PendingQueueFields::Eip8453(state) => &state.pending_consolidations,
         }
     }
 
@@ -1208,6 +1225,7 @@ impl<'a> PendingQueueFields<'a> {
             PendingQueueFields::Fulu(state) => state.pending_consolidations.push(consolidation)?,
             PendingQueueFields::Gloas(state) => state.pending_consolidations.push(consolidation),
             PendingQueueFields::Heze(state) => state.pending_consolidations.push(consolidation),
+            PendingQueueFields::Eip8453(state) => state.pending_consolidations.push(consolidation),
         }
         Ok(())
     }
@@ -1233,6 +1251,9 @@ impl<'a> PendingQueueFields<'a> {
             PendingQueueFields::Heze(state) => {
                 core::mem::take(&mut state.pending_consolidations).into_inner()
             }
+            PendingQueueFields::Eip8453(state) => {
+                core::mem::take(&mut state.pending_consolidations).into_inner()
+            }
         }
     }
 
@@ -1256,6 +1277,9 @@ impl<'a> PendingQueueFields<'a> {
                 state.pending_consolidations = gloas::PendingConsolidations::from(consolidations);
             }
             PendingQueueFields::Heze(state) => {
+                state.pending_consolidations = gloas::PendingConsolidations::from(consolidations);
+            }
+            PendingQueueFields::Eip8453(state) => {
                 state.pending_consolidations = gloas::PendingConsolidations::from(consolidations);
             }
         }
@@ -1291,6 +1315,19 @@ impl<'a> PendingQueueFields<'a> {
                 state.current_epoch_participation.push(0);
                 state.inactivity_scores.push(0);
             }
+            // [Modified in EIP8453] `add_validator_to_registry`: no epoch
+            // participation lists, but the round and height participation
+            // lists, and every pending justification's participation, grow
+            // with the registry instead.
+            PendingQueueFields::Eip8453(state) => {
+                state.inactivity_scores.push(0);
+                state.round_participation.push(0);
+                state.target_participation.push(false);
+                state.progress_participation.push(false);
+                for pending in state.pending_finality.iter_mut() {
+                    pending.participation.push(false);
+                }
+            }
         }
         Ok(())
     }
@@ -1307,6 +1344,7 @@ pub(crate) fn pending_queue_fields<'a>(
         BeaconState::Fulu(state) => Ok(PendingQueueFields::Fulu(state)),
         BeaconState::Gloas(state) => Ok(PendingQueueFields::Gloas(state)),
         BeaconState::Heze(state) => Ok(PendingQueueFields::Heze(state)),
+        BeaconState::Eip8453(state) => Ok(PendingQueueFields::Eip8453(state)),
         other => Err(Error::UnsupportedForFork {
             function,
             fork: other.fork_name(),
@@ -1322,6 +1360,7 @@ pub(crate) enum PendingQueueFieldsRef<'a> {
     Fulu(&'a fulu::BeaconState),
     Gloas(&'a gloas::BeaconState),
     Heze(&'a heze::BeaconState),
+    Eip8453(&'a eip8453::BeaconState),
 }
 
 impl<'a> PendingQueueFieldsRef<'a> {
@@ -1331,6 +1370,7 @@ impl<'a> PendingQueueFieldsRef<'a> {
             PendingQueueFieldsRef::Fulu(state) => &state.pending_partial_withdrawals,
             PendingQueueFieldsRef::Gloas(state) => &state.pending_partial_withdrawals,
             PendingQueueFieldsRef::Heze(state) => &state.pending_partial_withdrawals,
+            PendingQueueFieldsRef::Eip8453(state) => &state.pending_partial_withdrawals,
         }
     }
 }
@@ -1345,6 +1385,7 @@ pub(crate) fn pending_queue_fields_ref<'a>(
         BeaconState::Fulu(state) => Ok(PendingQueueFieldsRef::Fulu(state)),
         BeaconState::Gloas(state) => Ok(PendingQueueFieldsRef::Gloas(state)),
         BeaconState::Heze(state) => Ok(PendingQueueFieldsRef::Heze(state)),
+        BeaconState::Eip8453(state) => Ok(PendingQueueFieldsRef::Eip8453(state)),
         other => Err(Error::UnsupportedForFork {
             function,
             fork: other.fork_name(),
@@ -1370,6 +1411,7 @@ pub(crate) enum ChurnCursorsMut<'a> {
     Fulu(&'a mut fulu::BeaconState),
     Gloas(&'a mut gloas::BeaconState),
     Heze(&'a mut heze::BeaconState),
+    Eip8453(&'a mut eip8453::BeaconState),
 }
 
 impl<'a> ChurnCursorsMut<'a> {
@@ -1379,6 +1421,7 @@ impl<'a> ChurnCursorsMut<'a> {
             ChurnCursorsMut::Fulu(state) => state.earliest_exit_epoch,
             ChurnCursorsMut::Gloas(state) => state.earliest_exit_epoch,
             ChurnCursorsMut::Heze(state) => state.earliest_exit_epoch,
+            ChurnCursorsMut::Eip8453(state) => state.earliest_exit_epoch,
         }
     }
 
@@ -1388,6 +1431,7 @@ impl<'a> ChurnCursorsMut<'a> {
             ChurnCursorsMut::Fulu(state) => &mut state.earliest_exit_epoch,
             ChurnCursorsMut::Gloas(state) => &mut state.earliest_exit_epoch,
             ChurnCursorsMut::Heze(state) => &mut state.earliest_exit_epoch,
+            ChurnCursorsMut::Eip8453(state) => &mut state.earliest_exit_epoch,
         }
     }
 
@@ -1397,6 +1441,7 @@ impl<'a> ChurnCursorsMut<'a> {
             ChurnCursorsMut::Fulu(state) => state.exit_balance_to_consume,
             ChurnCursorsMut::Gloas(state) => state.exit_balance_to_consume,
             ChurnCursorsMut::Heze(state) => state.exit_balance_to_consume,
+            ChurnCursorsMut::Eip8453(state) => state.exit_balance_to_consume,
         }
     }
 
@@ -1406,6 +1451,7 @@ impl<'a> ChurnCursorsMut<'a> {
             ChurnCursorsMut::Fulu(state) => &mut state.exit_balance_to_consume,
             ChurnCursorsMut::Gloas(state) => &mut state.exit_balance_to_consume,
             ChurnCursorsMut::Heze(state) => &mut state.exit_balance_to_consume,
+            ChurnCursorsMut::Eip8453(state) => &mut state.exit_balance_to_consume,
         }
     }
 
@@ -1415,6 +1461,7 @@ impl<'a> ChurnCursorsMut<'a> {
             ChurnCursorsMut::Fulu(state) => state.earliest_consolidation_epoch,
             ChurnCursorsMut::Gloas(state) => state.earliest_consolidation_epoch,
             ChurnCursorsMut::Heze(state) => state.earliest_consolidation_epoch,
+            ChurnCursorsMut::Eip8453(state) => state.earliest_consolidation_epoch,
         }
     }
 
@@ -1424,6 +1471,7 @@ impl<'a> ChurnCursorsMut<'a> {
             ChurnCursorsMut::Fulu(state) => &mut state.earliest_consolidation_epoch,
             ChurnCursorsMut::Gloas(state) => &mut state.earliest_consolidation_epoch,
             ChurnCursorsMut::Heze(state) => &mut state.earliest_consolidation_epoch,
+            ChurnCursorsMut::Eip8453(state) => &mut state.earliest_consolidation_epoch,
         }
     }
 
@@ -1433,6 +1481,7 @@ impl<'a> ChurnCursorsMut<'a> {
             ChurnCursorsMut::Fulu(state) => state.consolidation_balance_to_consume,
             ChurnCursorsMut::Gloas(state) => state.consolidation_balance_to_consume,
             ChurnCursorsMut::Heze(state) => state.consolidation_balance_to_consume,
+            ChurnCursorsMut::Eip8453(state) => state.consolidation_balance_to_consume,
         }
     }
 
@@ -1442,6 +1491,7 @@ impl<'a> ChurnCursorsMut<'a> {
             ChurnCursorsMut::Fulu(state) => &mut state.consolidation_balance_to_consume,
             ChurnCursorsMut::Gloas(state) => &mut state.consolidation_balance_to_consume,
             ChurnCursorsMut::Heze(state) => &mut state.consolidation_balance_to_consume,
+            ChurnCursorsMut::Eip8453(state) => &mut state.consolidation_balance_to_consume,
         }
     }
 }
@@ -1457,6 +1507,7 @@ pub(crate) fn churn_cursors_mut<'a>(
         BeaconState::Fulu(state) => Ok(ChurnCursorsMut::Fulu(state)),
         BeaconState::Gloas(state) => Ok(ChurnCursorsMut::Gloas(state)),
         BeaconState::Heze(state) => Ok(ChurnCursorsMut::Heze(state)),
+        BeaconState::Eip8453(state) => Ok(ChurnCursorsMut::Eip8453(state)),
         other => Err(Error::UnsupportedForFork {
             function,
             fork: other.fork_name(),

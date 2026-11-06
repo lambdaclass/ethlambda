@@ -359,23 +359,23 @@ fn assert_participation_outcome_matches(state: &BeaconState, expected: &BeaconSt
     let (_, _, expected_scores) = expected.altair_validator_lists().expect("altair lists");
     assert_eq!(scores, expected_scores, "inactivity scores");
     assert_eq!(
-        state.justification_bits(),
-        expected.justification_bits(),
+        state.justification_bits().ok(),
+        expected.justification_bits().ok(),
         "justification bits"
     );
     assert_eq!(
-        state.previous_justified_checkpoint(),
-        expected.previous_justified_checkpoint(),
+        state.previous_justified_checkpoint().ok(),
+        expected.previous_justified_checkpoint().ok(),
         "previous justified checkpoint"
     );
     assert_eq!(
-        state.current_justified_checkpoint(),
-        expected.current_justified_checkpoint(),
+        state.current_justified_checkpoint().ok(),
+        expected.current_justified_checkpoint().ok(),
         "current justified checkpoint"
     );
     assert_eq!(
-        state.finalized_checkpoint(),
-        expected.finalized_checkpoint(),
+        state.finalized_checkpoint().ok(),
+        expected.finalized_checkpoint().ok(),
         "finalized checkpoint"
     );
 }
@@ -482,10 +482,13 @@ mod tests {
 
         process_justification_and_finalization(&mut state).unwrap();
 
-        assert_eq!(state.justification_bits(), before.justification_bits());
         assert_eq!(
-            state.current_justified_checkpoint(),
-            before.current_justified_checkpoint()
+            state.justification_bits().unwrap(),
+            before.justification_bits().unwrap()
+        );
+        assert_eq!(
+            state.current_justified_checkpoint().unwrap(),
+            before.current_justified_checkpoint().unwrap()
         );
     }
 
@@ -505,10 +508,10 @@ mod tests {
 
         process_justification_and_finalization(&mut state).unwrap();
 
-        let bits = state.justification_bits();
+        let bits = state.justification_bits().unwrap();
         assert_eq!(bits.get(0), Some(false), "current epoch did not justify");
         assert_eq!(bits.get(1), Some(true), "previous epoch justified");
-        assert_eq!(state.current_justified_checkpoint().epoch, 1);
+        assert_eq!(state.current_justified_checkpoint().unwrap().epoch, 1);
     }
 
     // -----------------------------------------------------------------------

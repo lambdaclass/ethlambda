@@ -15,6 +15,7 @@ pub mod accessors;
 pub mod altair;
 pub mod attestation;
 pub mod capella;
+pub mod eip8453;
 pub mod electra;
 pub mod finality;
 pub mod fulu;

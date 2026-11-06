@@ -53,7 +53,7 @@ use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libssz_types::SszList;
 use libtest_mimic::Trial;
 
-use super::{PRESET, collect_all_handlers, lean_is_not_a_fixture_fork};
+use super::{PRESET, collect_all_handlers, eip8453_has_no_fixtures, lean_is_not_a_fixture_fork};
 
 /// One component's reward and penalty per validator, as the fixtures encode it.
 ///
@@ -161,6 +161,7 @@ fn components(
                 altair_helpers::get_inactivity_penalty_deltas(state, config),
             ),
         ],
+        ForkName::Eip8453 => eip8453_has_no_fixtures("rewards"),
         ForkName::Lean => lean_is_not_a_fixture_fork("rewards"),
     };
 

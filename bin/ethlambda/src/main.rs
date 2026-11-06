@@ -61,8 +61,8 @@ use ethlambda_types::{
     aggregator::AggregatorController,
     beacon::config::Config,
     beacon::containers::{
-        BeaconState, SignedBeaconBlock, altair, bellatrix, capella, deneb, electra, gloas, heze,
-        phase0,
+        BeaconState, SignedBeaconBlock, altair, bellatrix, capella, deneb, eip8453, electra, gloas,
+        heze, phase0,
     },
     beacon::fork::ForkName,
     beacon::primitives::Epoch,
@@ -1823,6 +1823,8 @@ fn first_config_difference(
         gloas_fork_epoch: _,
         heze_fork_version: _,
         heze_fork_epoch: _,
+        eip8453_fork_version: _,
+        eip8453_fork_epoch: _,
 
         // Time parameters: `seconds_per_slot`/`slot_duration_ms` (compared
         // below) move every slot boundary. The rest are operator-visible
@@ -1857,6 +1859,11 @@ fn first_config_difference(
         // A timeliness deadline like the `*_due_bps` above: it changes which
         // inclusion lists count as timely, not which block is valid.
         inclusion_list_due_bps: _,
+        // EIP-8453's available-chain deadlines, the same kind of value: they
+        // shape a node's view of the head, not which block is valid.
+        head_vote_due_bps: _,
+        support_cutoff_bps: _,
+        view_freeze_bps: _,
 
         // Validator cycle: compared below. Churn and inactivity-leak
         // parameters change which exits, activations and inactivity scores a
@@ -2042,14 +2049,15 @@ fn first_config_difference(
 
 /// Refuses an anchor state in `fork` if this node cannot follow that fork.
 ///
-/// Every fork is followed today, gloas included, so this lets every anchor
-/// through. A gloas anchor starts with no payload known (`payloads` is empty
-/// in `fork_choice::get_forkchoice_store`), so its head is EMPTY and the
-/// first FULL child is held until the actor fetches the parent's envelope.
-/// The guard stays for the next fork the node cannot follow: checked ahead of
-/// any store construction, on both anchor sources (a loaded network's genesis
-/// state and a checkpoint provider's finalized state), so a rejected anchor
-/// writes nothing to the data directory.
+/// Every fork through heze is followed, gloas included, so this lets those
+/// anchors through. A gloas anchor starts with no payload known (`payloads`
+/// is empty in `fork_choice::get_forkchoice_store`), so its head is EMPTY and
+/// the first FULL child is held until the actor fetches the parent's
+/// envelope. EIP-8453 is refused (`ForkName::is_followed`): its state
+/// transition exists but its fork choice does not. Checked ahead of any store
+/// construction, on both anchor sources (a loaded network's genesis state and
+/// a checkpoint provider's finalized state), so a rejected anchor writes
+/// nothing to the data directory.
 ///
 /// Keeps the refusal distinguishable from a peer serving a mismatched anchor
 /// pair: reporting both as `AnchorPairingMismatch` would tell an operator to
@@ -2282,7 +2290,7 @@ async fn fetch_initial_beacon_state(
         slot = state.slot(),
         fork = %state.fork_name(),
         validators = state.validator_count(),
-        finalized_epoch = state.finalized_checkpoint().epoch,
+        finalized_epoch = ?state.finalized_checkpoint().ok().map(|checkpoint| checkpoint.epoch),
         anchor_block_slot = block.slot(),
         "Beacon checkpoint sync complete"
     );
@@ -2457,6 +2465,24 @@ fn genesis_anchor_block(state: &BeaconState) -> SignedBeaconBlock {
                 parent_root,
                 state_root,
                 body: heze_genesis_body(state),
+            },
+            signature: Default::default(),
+        }),
+        // An EIP-8453 genesis commits to the empty body, or to the generator's
+        // mirrored bid as heze's does.
+        // TODO(eip8453): unreachable while `refuse_unfollowable_fork` refuses
+        // an EIP-8453 anchor.
+        ForkName::Eip8453 => SignedBeaconBlock::Eip8453(eip8453::SignedBeaconBlock {
+            message: eip8453::BeaconBlock {
+                slot,
+                proposer_index,
+                parent_root,
+                state_root,
+                body: mirrored_genesis_body(
+                    state,
+                    eip8453::BeaconBlockBody::empty(),
+                    |body, bid| body.signed_execution_payload_bid.message = bid,
+                ),
             },
             signature: Default::default(),
         }),
@@ -2680,10 +2706,20 @@ mod tests {
     }
 
     /// Gloas is followed: the envelopes and payload attestations a gloas chain
-    /// needs are delivered, so no fork is refused as an anchor.
+    /// needs are delivered, so no fork through heze is refused as an anchor.
+    /// EIP-8453 is: its fork choice does not exist yet.
     #[test]
-    fn startup_accepts_an_anchor_at_every_beacon_fork() {
+    fn startup_accepts_an_anchor_at_every_followed_beacon_fork() {
         for fork in ForkName::ALL {
+            if fork == ForkName::Eip8453 {
+                assert!(matches!(
+                    refuse_unfollowable_fork(fork),
+                    Err(checkpoint_sync::CheckpointSyncError::UnsupportedFork {
+                        fork: ForkName::Eip8453
+                    })
+                ));
+                continue;
+            }
             assert!(
                 refuse_unfollowable_fork(fork).is_ok(),
                 "{fork} must be followable"
@@ -3605,6 +3641,7 @@ validators:
                 }
                 ForkName::Gloas => gloas::BeaconBlockBody::empty_at(fork).hash_tree_root(),
                 ForkName::Heze => heze::BeaconBlockBody::empty().hash_tree_root(),
+                ForkName::Eip8453 => eip8453::BeaconBlockBody::empty().hash_tree_root(),
                 ForkName::Lean => unreachable!("ForkName::ALL excludes Lean"),
             };
             state.latest_block_header_mut().body_root = empty_body_root;

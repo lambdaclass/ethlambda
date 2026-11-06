@@ -44,6 +44,13 @@ pub fn get_inclusion_list_committee(
     slot: Slot,
     committees: &impl CommitteeCacheExt,
 ) -> Result<Vec<ValidatorIndex>> {
+    // [Modified in EIP8453] A uniform draw from the epoch's active set.
+    if matches!(state, BeaconState::Eip8453(_)) {
+        return Ok(
+            crate::beacon::helpers::eip8453::get_inclusion_list_committee(state, slot)?
+                .into_inner(),
+        );
+    }
     let epoch = compute_epoch_at_slot(slot);
     let epoch_committees = committees.committees(state, epoch);
     let mut indices: Vec<ValidatorIndex> = Vec::new();

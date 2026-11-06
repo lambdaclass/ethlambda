@@ -275,6 +275,23 @@ mod tests {
     }
 
     #[test]
+    fn the_eip8453_keys_are_claimed_rather_than_ignored() {
+        // The pinned consensus-specs configs' EIP-8453 section.
+        let text = "EIP8453_FORK_VERSION: 0xe8453000\nEIP8453_FORK_EPOCH: 18446744073709551615\n\
+                    HEAD_VOTE_DUE_BPS: 2500\nSUPPORT_CUTOFF_BPS: 5000\nVIEW_FREEZE_BPS: 7500\n";
+        let parsed = ConfigFile::parse(text).unwrap();
+        assert!(parsed.ignored.is_empty(), "ignored: {:?}", parsed.ignored);
+        assert_eq!(parsed.config.eip8453_fork_version, [0xe8, 0x45, 0x30, 0x00]);
+        assert_eq!(
+            parsed.config.eip8453_fork_epoch,
+            ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH
+        );
+        assert_eq!(parsed.config.head_vote_due_bps, 2_500);
+        assert_eq!(parsed.config.support_cutoff_bps, 5_000);
+        assert_eq!(parsed.config.view_freeze_bps, 7_500);
+    }
+
+    #[test]
     fn the_gloas_keys_are_claimed_rather_than_ignored() {
         // GLOAS_* and PAYLOAD_DUE_BPS used to be reported as ignored
         // alongside heze's; now that `Config` has fields for them, they must

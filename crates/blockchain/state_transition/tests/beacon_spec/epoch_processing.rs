@@ -52,7 +52,9 @@ use ethlambda_state_transition::beacon::containers::BeaconState;
 use ethlambda_state_transition::beacon::stf::epoch;
 use libtest_mimic::{Failed, Trial};
 
-use super::{Case, PRESET, collect_all_handlers, lean_is_not_a_fixture_fork};
+use super::{
+    Case, PRESET, collect_all_handlers, eip8453_has_no_fixtures, lean_is_not_a_fixture_fork,
+};
 
 /// Runs the single epoch-processing step the handler names.
 fn apply(
@@ -94,6 +96,7 @@ fn apply(
             | ForkName::Fulu
             | ForkName::Gloas
             | ForkName::Heze => epoch::altair::process_rewards_and_penalties(state, config),
+            ForkName::Eip8453 => eip8453_has_no_fixtures("rewards_and_penalties"),
             ForkName::Lean => lean_is_not_a_fixture_fork("rewards_and_penalties"),
         },
         // Deneb's own change (EIP-7514's activation-churn cap) is selected
@@ -120,6 +123,7 @@ fn apply(
             | ForkName::Bellatrix
             | ForkName::Capella
             | ForkName::Deneb => epoch::registry::process_registry_updates(state, config),
+            ForkName::Eip8453 => eip8453_has_no_fixtures("registry_updates"),
             ForkName::Lean => lean_is_not_a_fixture_fork("registry_updates"),
         },
         // Altair's and bellatrix's own changes here are scoped to the
@@ -143,6 +147,7 @@ fn apply(
             | ForkName::Bellatrix
             | ForkName::Capella
             | ForkName::Deneb => epoch::registry::process_slashings(state, config),
+            ForkName::Eip8453 => eip8453_has_no_fixtures("slashings"),
             ForkName::Lean => lean_is_not_a_fixture_fork("slashings"),
         },
         "eth1_data_reset" => epoch::process_eth1_data_reset(state),
@@ -162,6 +167,7 @@ fn apply(
             | ForkName::Bellatrix
             | ForkName::Capella
             | ForkName::Deneb => epoch::process_effective_balance_updates(state),
+            ForkName::Eip8453 => eip8453_has_no_fixtures("effective_balance_updates"),
             ForkName::Lean => lean_is_not_a_fixture_fork("effective_balance_updates"),
         },
         "slashings_reset" => epoch::process_slashings_reset(state),
@@ -212,6 +218,7 @@ fn apply(
                     fork: ForkName::Phase0,
                 },
             ),
+            ForkName::Eip8453 => eip8453_has_no_fixtures("inactivity_updates"),
             ForkName::Lean => lean_is_not_a_fixture_fork("inactivity_updates"),
         },
         "participation_flag_updates" => match fork {
@@ -230,6 +237,7 @@ fn apply(
                     fork: ForkName::Phase0,
                 },
             ),
+            ForkName::Eip8453 => eip8453_has_no_fixtures("participation_flag_updates"),
             ForkName::Lean => lean_is_not_a_fixture_fork("participation_flag_updates"),
         },
         // Unmodified in gloas (both sync committees are fork-invariant
@@ -257,6 +265,7 @@ fn apply(
             | ForkName::Capella
             | ForkName::Deneb
             | ForkName::Electra => epoch::electra::process_pending_deposits(state, config),
+            ForkName::Eip8453 => eip8453_has_no_fixtures("pending_deposits"),
             ForkName::Lean => lean_is_not_a_fixture_fork("pending_deposits"),
         },
         // Gloas-only: a second handler over the very same `process_pending_deposits`
@@ -285,6 +294,7 @@ fn apply(
                     fork,
                 },
             ),
+            ForkName::Eip8453 => eip8453_has_no_fixtures("pending_consolidations"),
             ForkName::Lean => lean_is_not_a_fixture_fork("pending_consolidations"),
         },
         // New in fulu (EIP-7917). Gloas keeps `proposer_lookahead` itself
@@ -307,6 +317,7 @@ fn apply(
                     fork,
                 },
             ),
+            ForkName::Eip8453 => eip8453_has_no_fixtures("proposer_lookahead"),
             ForkName::Lean => lean_is_not_a_fixture_fork("proposer_lookahead"),
         },
         // New in gloas (EIP-7732); no earlier fork has either handler at all.

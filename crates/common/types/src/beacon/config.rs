@@ -12,8 +12,8 @@
 //! # What is left out
 //!
 //! - **Forks this build cannot process.** `EIP8321_FORK_VERSION`/`EIP8321_FORK_EPOCH`
-//!   (its own later fork schedule) stay out for the same reason `GLOAS_*` and
-//!   `HEZE_*` used to: a fork version stored here would give
+//!   (its own later fork schedule) stay out for the same reason `GLOAS_*`,
+//!   `HEZE_*` and `EIP8453_*` used to: a fork version stored here would give
 //!   [`Config::fork_at_epoch`] a fork [`crate::beacon::fork::ForkName`] has no
 //!   variant for, so each is reported as an unknown key instead.
 //!   `GAS_LIMIT_SCHEDULE` (gloas-era) stays out too, since it is a list rather
@@ -327,6 +327,14 @@ pub struct Config {
     /// is not scheduled.
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub heze_fork_epoch: Epoch,
+    /// The `Fork.current_version` an EIP-8453 (decoupled consensus) block or
+    /// attestation signs under.
+    #[serde(with = "crate::beacon::serde_helpers::hex_array")]
+    pub eip8453_fork_version: Version,
+    /// The epoch EIP-8453 activates at, or [`constants::FAR_FUTURE_EPOCH`] if
+    /// it is not scheduled.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub eip8453_fork_epoch: Epoch,
 
     // -- Time parameters ---------------------------------------------------
     /// Wall-clock seconds per slot. Deprecated in favor of
@@ -428,6 +436,21 @@ pub struct Config {
     /// committee member publishes its own.
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub inclusion_list_due_bps: u64,
+    /// EIP-8453: basis points of the slot duration by which a head vote is
+    /// due (`fork-choice.md`'s `get_head_vote_due_ms`). Nothing in this build
+    /// reads it yet: the available chain's fork choice and duties are a later
+    /// phase. Parsed so a `config.yaml` carrying it is not warned about and
+    /// `/eth/v1/config/spec` echoes it.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub head_vote_due_bps: u64,
+    /// EIP-8453: `fork-choice.md`'s `get_support_cutoff_ms`, in basis points
+    /// of the slot duration. Not read yet, see [`Self::head_vote_due_bps`].
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub support_cutoff_bps: u64,
+    /// EIP-8453: `fork-choice.md`'s `get_view_freeze_ms`, in basis points of
+    /// the slot duration. Not read yet, see [`Self::head_vote_due_bps`].
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub view_freeze_bps: u64,
 
     // -- Validator cycle -----------------------------------------------------
     /// Score points added to a validator's inactivity score for each epoch it
@@ -760,6 +783,8 @@ impl Config {
             gloas_fork_epoch: constants::FAR_FUTURE_EPOCH,
             heze_fork_version: [0x08, 0x00, 0x00, 0x00],
             heze_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            eip8453_fork_version: [0xe8, 0x45, 0x30, 0x00],
+            eip8453_fork_epoch: constants::FAR_FUTURE_EPOCH,
 
             seconds_per_slot: 12,
             slot_duration_ms: 12_000,
@@ -781,6 +806,9 @@ impl Config {
             payload_attestation_due_bps: 7_500,
             min_builder_withdrawability_delay: 64,
             inclusion_list_due_bps: 7_500,
+            head_vote_due_bps: 2_500,
+            support_cutoff_bps: 5_000,
+            view_freeze_bps: 7_500,
 
             inactivity_score_bias: 4,
             inactivity_score_recovery_rate: 16,
@@ -903,6 +931,8 @@ impl Config {
             gloas_fork_epoch: constants::FAR_FUTURE_EPOCH,
             heze_fork_version: [0x08, 0x00, 0x00, 0x01],
             heze_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            eip8453_fork_version: [0xe8, 0x45, 0x30, 0x01],
+            eip8453_fork_epoch: constants::FAR_FUTURE_EPOCH,
 
             seconds_per_slot: 6,
             slot_duration_ms: 6_000,
@@ -924,6 +954,9 @@ impl Config {
             payload_attestation_due_bps: 7_500,
             min_builder_withdrawability_delay: 2,
             inclusion_list_due_bps: 7_500,
+            head_vote_due_bps: 2_500,
+            support_cutoff_bps: 5_000,
+            view_freeze_bps: 7_500,
 
             inactivity_score_bias: 4,
             inactivity_score_recovery_rate: 16,
@@ -1036,6 +1069,7 @@ impl Config {
             fulu_fork_epoch: constants::FAR_FUTURE_EPOCH,
             gloas_fork_epoch: constants::FAR_FUTURE_EPOCH,
             heze_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            eip8453_fork_epoch: constants::FAR_FUTURE_EPOCH,
             ..Config::mainnet()
         }
     }
@@ -1224,6 +1258,7 @@ impl Config {
             ForkName::Fulu => self.fulu_fork_version,
             ForkName::Gloas => self.gloas_fork_version,
             ForkName::Heze => self.heze_fork_version,
+            ForkName::Eip8453 => self.eip8453_fork_version,
             ForkName::Lean => lean_fork_unreachable("Config::fork_version"),
         }
     }
@@ -1243,6 +1278,7 @@ impl Config {
             ForkName::Fulu => self.fulu_fork_epoch,
             ForkName::Gloas => self.gloas_fork_epoch,
             ForkName::Heze => self.heze_fork_epoch,
+            ForkName::Eip8453 => self.eip8453_fork_epoch,
             ForkName::Lean => lean_fork_unreachable("Config::fork_epoch"),
         }
     }
@@ -1269,6 +1305,7 @@ impl Config {
             ForkName::Fulu => self.fulu_fork_epoch = epoch,
             ForkName::Gloas => self.gloas_fork_epoch = epoch,
             ForkName::Heze => self.heze_fork_epoch = epoch,
+            ForkName::Eip8453 => self.eip8453_fork_epoch = epoch,
             ForkName::Lean => lean_fork_unreachable("Config::with_fork_epoch"),
         }
         self
@@ -1287,6 +1324,7 @@ impl Config {
             ForkName::Fulu => self.fulu_fork_version = version,
             ForkName::Gloas => self.gloas_fork_version = version,
             ForkName::Heze => self.heze_fork_version = version,
+            ForkName::Eip8453 => self.eip8453_fork_version = version,
             // Matches `fork_version`'s own arm: reaching this means a caller
             // dispatched on the wrong chain, which is a bug in the caller.
             ForkName::Lean => lean_fork_unreachable("Config::with_fork_version"),
@@ -1430,6 +1468,38 @@ mod tests {
         assert_eq!(config.max_request_inclusion_list, 16);
         assert_eq!(config.min_slots_for_inclusion_lists_requests, 1);
         assert_eq!(config.max_transactions_bytes_per_inclusion_list, 8_192);
+    }
+
+    #[test]
+    fn eip8453_keys_are_claimed_and_parse() {
+        let yaml = "HEZE_FORK_EPOCH: 0\nEIP8453_FORK_VERSION: 0xe8453000\nEIP8453_FORK_EPOCH: 3\n\
+                    HEAD_VOTE_DUE_BPS: 2000\nSUPPORT_CUTOFF_BPS: 4000\nVIEW_FREEZE_BPS: 7000\n";
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(config.eip8453_fork_version, [0xe8, 0x45, 0x30, 0x00]);
+        assert_eq!(config.eip8453_fork_epoch, 3);
+        assert_eq!(config.fork_at_epoch(2), ForkName::Heze);
+        assert_eq!(config.fork_at_epoch(3), ForkName::Eip8453);
+        assert_eq!(config.head_vote_due_bps, 2_000);
+        assert_eq!(config.support_cutoff_bps, 4_000);
+        assert_eq!(config.view_freeze_bps, 7_000);
+    }
+
+    #[test]
+    fn eip8453_defaults_match_the_pinned_configs() {
+        for config in [Config::mainnet(), Config::minimal()] {
+            assert_eq!(config.eip8453_fork_epoch, constants::FAR_FUTURE_EPOCH);
+            assert_eq!(config.head_vote_due_bps, 2_500);
+            assert_eq!(config.support_cutoff_bps, 5_000);
+            assert_eq!(config.view_freeze_bps, 7_500);
+        }
+        assert_eq!(
+            Config::mainnet().eip8453_fork_version,
+            [0xe8, 0x45, 0x30, 0x00]
+        );
+        assert_eq!(
+            Config::minimal().eip8453_fork_version,
+            [0xe8, 0x45, 0x30, 0x01]
+        );
     }
 
     #[test]

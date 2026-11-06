@@ -218,7 +218,12 @@ const KEY_STATES_PRUNED_BELOW: &[u8] = b"states_pruned_below";
 /// heze devnet branches shipped these two changes as their 7 and 8 without the
 /// slot||root keys above, so a directory one of them wrote must not pass as
 /// current.
-pub const DB_VERSION: u64 = 9;
+///
+/// 10 added the EIP-8453 fork's config keys to `Config`
+/// (`EIP8453_FORK_VERSION`, `EIP8453_FORK_EPOCH`, `HEAD_VOTE_DUE_BPS`,
+/// `SUPPORT_CUTOFF_BPS`, `VIEW_FREEZE_BPS`), which shifts every later field of
+/// its encoding, and fork selector 9 for EIP-8453 states and blocks.
+pub const DB_VERSION: u64 = 10;
 
 /// The consensus protocol a data directory holds.
 ///
@@ -1026,6 +1031,15 @@ fn builds_on_payload(block: &SignedBeaconBlock, payload_block_hash: &ExecutionBl
                 == *payload_block_hash
         }
         SignedBeaconBlock::Heze(block) => {
+            block
+                .message
+                .body
+                .signed_execution_payload_bid
+                .message
+                .parent_block_hash
+                == *payload_block_hash
+        }
+        SignedBeaconBlock::Eip8453(block) => {
             block
                 .message
                 .body
@@ -4195,7 +4209,7 @@ impl Store {
                 .and_then(|bytes| bytes.first().copied())
                 .and_then(ForkName::from_selector);
             let is_gloas = match fork {
-                Some(ForkName::Gloas | ForkName::Heze) => true,
+                Some(ForkName::Gloas | ForkName::Heze | ForkName::Eip8453) => true,
                 Some(
                     ForkName::Phase0
                     | ForkName::Altair
@@ -10285,10 +10299,23 @@ mod tests {
                     signature: Default::default(),
                 },
             ),
+            SignedBeaconBlock::Eip8453(
+                ethlambda_types::beacon::containers::eip8453::SignedBeaconBlock {
+                    message: ethlambda_types::beacon::containers::eip8453::BeaconBlock {
+                        slot: 0x1213_1415,
+                        proposer_index: 7,
+                        parent_root: root(10),
+                        state_root: root(11),
+                        body: ethlambda_types::beacon::containers::eip8453::BeaconBlockBody::empty(
+                        ),
+                    },
+                    signature: Default::default(),
+                },
+            ),
         ];
         // The fork tag is part of the value; the newest fork in `ALL` is among
         // the blocks above.
-        assert_eq!(blocks[6].fork_name(), *ForkName::ALL.last().unwrap());
+        assert_eq!(blocks[7].fork_name(), *ForkName::ALL.last().unwrap());
         for block in blocks {
             let value = encode_beacon_block_value(&block);
             assert_eq!(

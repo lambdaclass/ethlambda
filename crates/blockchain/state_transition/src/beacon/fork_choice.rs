@@ -274,6 +274,11 @@ impl ForkRules {
             | ForkName::Electra
             | ForkName::Fulu => ForkRules::PreGloas,
             ForkName::Gloas | ForkName::Heze => ForkRules::Gloas,
+            // TODO(eip8453): EIP-8453 replaces this fork choice with the
+            // finality gadget and the available chain; until that lands its
+            // blocks keep gloas's payload shape here, and `on_block` refuses
+            // them.
+            ForkName::Eip8453 => ForkRules::Gloas,
             ForkName::Lean => lean_fork_unreachable("ForkRules::of"),
         }
     }
@@ -581,6 +586,9 @@ pub fn block_operations(block: &SignedBeaconBlock) -> (Vec<Attestation>, Vec<Att
             Attestation::Gloas,
             AttesterSlashing::Gloas,
         ),
+        // TODO(eip8453): finality-gadget attestations are not LMD votes; the
+        // EIP-8453 fork choice reads them (and head votes) itself.
+        SignedBeaconBlock::Eip8453(_) => (Vec::new(), Vec::new()),
         SignedBeaconBlock::Lean(_) => lean_block_unreachable("fork_choice::block_operations"),
     }
 }
@@ -1880,7 +1888,7 @@ pub fn get_voting_source(
             .get_state(&block_root)
             .expect("get")
             .ok_or(Error::SpecAssert("block_root in store.block_states"))?;
-        Ok(head_state.current_justified_checkpoint())
+        Ok(head_state.current_justified_checkpoint()?)
     }
 }
 
@@ -4532,8 +4540,8 @@ pub fn compute_pulled_up_tip(
     // that crosses an epoch boundary fail.
     stf::epoch::process_justification_and_finalization(&mut state, config)?;
 
-    let current_justified = state.current_justified_checkpoint();
-    let finalized = state.finalized_checkpoint();
+    let current_justified = state.current_justified_checkpoint()?;
+    let finalized = state.finalized_checkpoint()?;
 
     store.set_unrealized_justification(block_root, block_slot, current_justified);
     update_unrealized_checkpoints(store, current_justified, finalized);
@@ -5161,6 +5169,13 @@ pub fn on_block(
         // building on it requires `is_payload_verified` above.
         SignedBeaconBlock::Gloas(block) => Some(&block.message.body.payload_attestations),
         SignedBeaconBlock::Heze(block) => Some(&block.message.body.payload_attestations),
+        // TODO(eip8453): import EIP-8453 blocks once its fork choice exists.
+        SignedBeaconBlock::Eip8453(_) => {
+            return Err(Error::UnsupportedForFork {
+                function: "fork_choice::on_block",
+                fork: ForkName::Eip8453,
+            });
+        }
         SignedBeaconBlock::Lean(_) => lean_block_unreachable("fork_choice::on_block"),
     };
 
@@ -5277,8 +5292,8 @@ pub fn on_block(
     // store: unlike a map entry, an owned value can't be re-borrowed once
     // moved, and copying two `Checkpoint`s out is cheaper than reading the
     // whole state back from storage afterward.
-    let current_justified = state.current_justified_checkpoint();
-    let finalized = state.finalized_checkpoint();
+    let current_justified = state.current_justified_checkpoint()?;
+    let finalized = state.finalized_checkpoint()?;
 
     // [New in v1.7.0] Whether this block can even be a candidate for the
     // proposer boost, decided *before* it joins the store and before the one
@@ -7034,7 +7049,7 @@ pub(crate) mod tests {
         store.set_unrealized_justification(block_root, 0, unrealized);
 
         let mut state = crate::beacon::helpers::test_state::with_validators(1);
-        *state.current_justified_checkpoint_mut() = realized;
+        *state.current_justified_checkpoint_mut().unwrap() = realized;
         store.insert_state(block_root, state).unwrap();
 
         let voting_source =
@@ -7132,7 +7147,7 @@ pub(crate) mod tests {
     /// reads, so a failure can only come from the lookup, not the filter.
     fn post_state_over(anchor_state: &BeaconState, anchor_root: Root) -> BeaconState {
         let mut state = anchor_state.clone();
-        *state.current_justified_checkpoint_mut() = Checkpoint {
+        *state.current_justified_checkpoint_mut().unwrap() = Checkpoint {
             epoch: compute_epoch_at_slot(anchor_state.slot()),
             root: anchor_root,
         };

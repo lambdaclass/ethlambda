@@ -66,11 +66,11 @@ pub fn weigh_justification_and_finalization(
 ) -> Result<()> {
     let previous_epoch = get_previous_epoch(state);
     let current_epoch = get_current_epoch(state);
-    let old_previous_justified_checkpoint = state.previous_justified_checkpoint();
-    let old_current_justified_checkpoint = state.current_justified_checkpoint();
+    let old_previous_justified_checkpoint = state.previous_justified_checkpoint()?;
+    let old_current_justified_checkpoint = state.current_justified_checkpoint()?;
 
     // Process justifications
-    *state.previous_justified_checkpoint_mut() = state.current_justified_checkpoint();
+    *state.previous_justified_checkpoint_mut()? = state.current_justified_checkpoint()?;
 
     // Age the bitfield by one epoch before folding in this epoch's result. Index
     // 0 always names the epoch just processed, so ageing moves every bit toward
@@ -80,36 +80,36 @@ pub fn weigh_justification_and_finalization(
     // copy.
     for i in (1..JUSTIFICATION_BITS).rev() {
         let older = state
-            .justification_bits()
+            .justification_bits()?
             .get(i - 1)
             .expect("index is within JUSTIFICATION_BITS_LENGTH");
         state
-            .justification_bits_mut()
+            .justification_bits_mut()?
             .set(i, older)
             .expect("index is within JUSTIFICATION_BITS_LENGTH");
     }
     state
-        .justification_bits_mut()
+        .justification_bits_mut()?
         .set(0, false)
         .expect("index is within JUSTIFICATION_BITS_LENGTH");
 
     if meets_justification_threshold(previous_epoch_target_balance, total_active_balance)? {
-        *state.current_justified_checkpoint_mut() = Checkpoint {
+        *state.current_justified_checkpoint_mut()? = Checkpoint {
             epoch: previous_epoch,
             root: get_block_root(state, previous_epoch)?,
         };
         state
-            .justification_bits_mut()
+            .justification_bits_mut()?
             .set(1, true)
             .expect("index is within JUSTIFICATION_BITS_LENGTH");
     }
     if meets_justification_threshold(current_epoch_target_balance, total_active_balance)? {
-        *state.current_justified_checkpoint_mut() = Checkpoint {
+        *state.current_justified_checkpoint_mut()? = Checkpoint {
             epoch: current_epoch,
             root: get_block_root(state, current_epoch)?,
         };
         state
-            .justification_bits_mut()
+            .justification_bits_mut()?
             .set(0, true)
             .expect("index is within JUSTIFICATION_BITS_LENGTH");
     }
@@ -120,7 +120,7 @@ pub fn weigh_justification_and_finalization(
     // since holding a `&JustificationBits` borrow across those writes would
     // conflict with the `&mut BeaconState` each rule needs.
     let (justifies_1_2_3, justifies_1_2, justifies_0_1_2, justifies_0_1) = {
-        let bits = state.justification_bits();
+        let bits = state.justification_bits()?;
         let bit = |i: usize| {
             bits.get(i)
                 .expect("index is within JUSTIFICATION_BITS_LENGTH")
@@ -135,19 +135,19 @@ pub fn weigh_justification_and_finalization(
 
     // The 2nd/3rd/4th most recent epochs are justified, the 2nd using the 4th as source
     if justifies_1_2_3 && old_previous_justified_checkpoint.epoch + 3 == current_epoch {
-        *state.finalized_checkpoint_mut() = old_previous_justified_checkpoint;
+        *state.finalized_checkpoint_mut()? = old_previous_justified_checkpoint;
     }
     // The 2nd/3rd most recent epochs are justified, the 2nd using the 3rd as source
     if justifies_1_2 && old_previous_justified_checkpoint.epoch + 2 == current_epoch {
-        *state.finalized_checkpoint_mut() = old_previous_justified_checkpoint;
+        *state.finalized_checkpoint_mut()? = old_previous_justified_checkpoint;
     }
     // The 1st/2nd/3rd most recent epochs are justified, the 1st using the 3rd as source
     if justifies_0_1_2 && old_current_justified_checkpoint.epoch + 2 == current_epoch {
-        *state.finalized_checkpoint_mut() = old_current_justified_checkpoint;
+        *state.finalized_checkpoint_mut()? = old_current_justified_checkpoint;
     }
     // The 1st/2nd most recent epochs are justified, the 1st using the 2nd as source
     if justifies_0_1 && old_current_justified_checkpoint.epoch + 1 == current_epoch {
-        *state.finalized_checkpoint_mut() = old_current_justified_checkpoint;
+        *state.finalized_checkpoint_mut()? = old_current_justified_checkpoint;
     }
 
     Ok(())
@@ -188,15 +188,18 @@ mod tests {
         process_justification_and_finalization(&mut state, &config).unwrap();
 
         assert_eq!(
-            state.justification_bits(),
-            before.justification_bits(),
+            state.justification_bits().unwrap(),
+            before.justification_bits().unwrap(),
             "the bitfield must be untouched this close to genesis"
         );
         assert_eq!(
-            state.current_justified_checkpoint(),
-            before.current_justified_checkpoint()
+            state.current_justified_checkpoint().unwrap(),
+            before.current_justified_checkpoint().unwrap()
         );
-        assert_eq!(state.finalized_checkpoint(), before.finalized_checkpoint());
+        assert_eq!(
+            state.finalized_checkpoint().unwrap(),
+            before.finalized_checkpoint().unwrap()
+        );
     }
 
     #[test]
@@ -218,16 +221,19 @@ mod tests {
         )
         .unwrap();
 
-        let bits = state.justification_bits();
+        let bits = state.justification_bits().unwrap();
         assert_eq!(bits.get(0), Some(false), "current epoch did not justify");
         assert_eq!(bits.get(1), Some(true), "previous epoch justified");
         assert_eq!(bits.get(2), Some(false));
         assert_eq!(bits.get(3), Some(false));
 
-        assert_eq!(state.current_justified_checkpoint().epoch, 0);
+        assert_eq!(state.current_justified_checkpoint().unwrap().epoch, 0);
         // Only one epoch justified this round, so none of the four finalization
         // rules (each needing two or three consecutive justified epochs) fire.
-        assert_eq!(state.finalized_checkpoint().epoch, constants::GENESIS_EPOCH);
+        assert_eq!(
+            state.finalized_checkpoint().unwrap().epoch,
+            constants::GENESIS_EPOCH
+        );
     }
 
     #[test]
@@ -237,7 +243,7 @@ mod tests {
 
         weigh_justification_and_finalization(&mut state, total_active_balance, 199, 199).unwrap();
 
-        let bits = state.justification_bits();
+        let bits = state.justification_bits().unwrap();
         assert_eq!(bits.get(0), Some(false));
         assert_eq!(bits.get(1), Some(false));
     }

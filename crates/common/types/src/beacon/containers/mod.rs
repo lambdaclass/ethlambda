@@ -43,6 +43,7 @@ pub mod altair;
 pub mod bellatrix;
 pub mod capella;
 pub mod deneb;
+pub mod eip8453;
 pub mod electra;
 pub mod fulu;
 pub mod gloas;
@@ -80,6 +81,7 @@ macro_rules! dispatch_state {
             BeaconState::Fulu($state) => $body,
             BeaconState::Gloas($state) => $body,
             BeaconState::Heze($state) => $body,
+            BeaconState::Eip8453($state) => $body,
             BeaconState::Lean(_) => lean_state_unreachable($function),
         }
     };
@@ -111,6 +113,7 @@ macro_rules! dispatch_state_including_lean {
             BeaconState::Fulu($state) => $body,
             BeaconState::Gloas($state) => $body,
             BeaconState::Heze($state) => $body,
+            BeaconState::Eip8453($state) => $body,
             BeaconState::Lean($state) => $body,
         }
     };
@@ -157,6 +160,7 @@ macro_rules! dispatch_block {
             SignedBeaconBlock::Fulu($block) => $body,
             SignedBeaconBlock::Gloas($block) => $body,
             SignedBeaconBlock::Heze($block) => $body,
+            SignedBeaconBlock::Eip8453($block) => $body,
             SignedBeaconBlock::Lean(_) => lean_block_unreachable($function),
         }
     };
@@ -183,6 +187,7 @@ macro_rules! dispatch_block_including_lean {
             SignedBeaconBlock::Fulu($block) => $body,
             SignedBeaconBlock::Gloas($block) => $body,
             SignedBeaconBlock::Heze($block) => $body,
+            SignedBeaconBlock::Eip8453($block) => $body,
             SignedBeaconBlock::Lean($block) => $body,
         }
     };
@@ -227,6 +232,9 @@ pub enum BeaconState {
     /// Heze's state: gloas's without the eth1 and deposit-index fields
     /// (EIP-8015), so its own container.
     Heze(heze::BeaconState),
+    /// EIP-8453's state: heze's without the epoch participation and Casper
+    /// FFG fields, plus the finality gadget's and the head votes' own.
+    Eip8453(eip8453::BeaconState),
     Lean(crate::state::State),
 }
 
@@ -272,6 +280,7 @@ impl serde::Serialize for BeaconState {
             BeaconState::Fulu(state) => state.serialize(serializer),
             BeaconState::Gloas(state) => state.serialize(serializer),
             BeaconState::Heze(state) => state.serialize(serializer),
+            BeaconState::Eip8453(state) => state.serialize(serializer),
             BeaconState::Lean(_) => Err(serde::ser::Error::custom(
                 "a lean state has no JSON encoding: /lean/v0/states/finalized serves SSZ only",
             )),
@@ -314,6 +323,7 @@ impl BeaconState {
             BeaconState::Fulu(_) => ForkName::Fulu,
             BeaconState::Gloas(_) => ForkName::Gloas,
             BeaconState::Heze(_) => ForkName::Heze,
+            BeaconState::Eip8453(_) => ForkName::Eip8453,
             BeaconState::Lean(_) => ForkName::Lean,
         }
     }
@@ -385,6 +395,15 @@ impl BeaconState {
                 let state = heze::BeaconState::from_ssz_bytes(bytes)?;
                 expect_shape(fork, state.latest_execution_payload_bid.fork_name())?;
                 Ok(BeaconState::Heze(state))
+            }
+            // EIP-8453 keeps heze's bid, `inclusion_list_bits` included.
+            ForkName::Eip8453 => {
+                let state = eip8453::BeaconState::from_ssz_bytes(bytes)?;
+                expect_shape(
+                    ForkName::Heze,
+                    state.latest_execution_payload_bid.fork_name(),
+                )?;
+                Ok(BeaconState::Eip8453(state))
             }
             ForkName::Lean => Ok(BeaconState::Lean(crate::state::State::from_ssz_bytes(
                 bytes,
@@ -500,6 +519,11 @@ tree_fields!(
     heze::BeaconState => validators, balances, block_roots, state_roots, historical_roots, randao_mixes, slashings,
     historical_summaries
 );
+// EIP-8453 keeps heze's tree-backed fields; every list it adds is flat.
+tree_fields!(
+    eip8453::BeaconState => validators, balances, block_roots, state_roots, historical_roots, randao_mixes, slashings,
+    historical_summaries
+);
 
 /// Generates read and write accessors for state fields that every fork shares.
 ///
@@ -551,10 +575,10 @@ macro_rules! shared_state_accessors {
     };
 }
 
-/// Generates accessors for the eth1 fields every fork carries except heze,
-/// which removes them (EIP-8015). Fallible, answering
-/// [`Error::UnsupportedForFork`] for heze, so a caller that reaches one on a
-/// heze state gets an error naming the field rather than a wrong answer.
+/// Generates accessors for the eth1 fields every fork carries except heze
+/// and EIP-8453, which remove them (EIP-8015). Fallible, answering
+/// [`Error::UnsupportedForFork`] for those, so a caller that reaches one on
+/// such a state gets an error naming the field rather than a wrong answer.
 macro_rules! eth1_state_accessors {
     ($(($field:ident, $field_mut:ident, $ty:ty)),* $(,)?) => {
         impl BeaconState {
@@ -565,7 +589,7 @@ macro_rules! eth1_state_accessors {
                         stringify!($field),
                         |state| &state.$field,
                         carried_by: [Phase0, Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas],
-                        absent_from: [Heze],
+                        absent_from: [Heze, Eip8453],
                     )
                 }
 
@@ -575,7 +599,7 @@ macro_rules! eth1_state_accessors {
                         stringify!($field_mut),
                         |state| &mut state.$field,
                         carried_by: [Phase0, Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas],
-                        absent_from: [Heze],
+                        absent_from: [Heze, Eip8453],
                     )
                 }
             )*
@@ -589,22 +613,30 @@ eth1_state_accessors!(
     (eth1_data_votes, eth1_data_votes_mut, Eth1DataVotes),
 );
 
-/// Runs `$body` against the gloas or heze state inside `$state`, and answers
-/// [`Error::UnsupportedForFork`] naming `$function` for any other fork.
+/// Runs `$body` against the gloas, heze or EIP-8453 state inside `$state`,
+/// and answers [`Error::UnsupportedForFork`] naming `$function` for any other
+/// fork.
 ///
 /// For code that touches several gloas-family fields at once, where one
-/// accessor per field would fight the borrow checker. The two arms hold
+/// accessor per field would fight the borrow checker. The three arms hold
 /// different container types with the same field names, so `$body` is
-/// expanded once per fork and has to typecheck for both. The macro evaluates
+/// expanded once per fork and has to typecheck for each. The macro evaluates
 /// to a `Result` holding the body's value, so callers write `gloas_family!(..)?`;
 /// a `?` inside the body returns from the enclosing function. A fork added
-/// after heze is not caught by a wildcard here, it breaks this macro's match.
+/// after EIP-8453 is not caught by a wildcard here, it breaks this macro's
+/// match.
+///
+/// EIP-8453 keeps every payload, builder and withdrawal field gloas added, so
+/// it is a member here; a body that reads the epoch participation lists
+/// EIP-8453 removes, or whose rule EIP-8453 rewrites, goes through
+/// [`gloas_heze!`] instead, which leaves EIP-8453 out.
 #[macro_export]
 macro_rules! gloas_family {
     ($state:expr, $function:expr, |$inner:ident| $body:expr) => {
         match $state {
             $crate::beacon::containers::BeaconState::Gloas($inner) => Ok($body),
             $crate::beacon::containers::BeaconState::Heze($inner) => Ok($body),
+            $crate::beacon::containers::BeaconState::Eip8453($inner) => Ok($body),
             $crate::beacon::containers::BeaconState::Phase0(_)
             | $crate::beacon::containers::BeaconState::Altair(_)
             | $crate::beacon::containers::BeaconState::Bellatrix(_)
@@ -624,8 +656,42 @@ macro_rules! gloas_family {
     };
 }
 
+/// [`gloas_family!`] for gloas and heze only: EIP-8453 answers
+/// [`Error::UnsupportedForFork`].
+///
+/// For a body that reads gloas's epoch participation fields
+/// (`current_epoch_participation`, ...), which EIP-8453's state does not
+/// have, or that implements a gloas rule EIP-8453 rewrites (its own
+/// `process_builder_pending_payments`), so an EIP-8453 state reaching it is
+/// refused rather than run under the wrong rule.
+#[macro_export]
+macro_rules! gloas_heze {
+    ($state:expr, $function:expr, |$inner:ident| $body:expr) => {
+        match $state {
+            $crate::beacon::containers::BeaconState::Gloas($inner) => Ok($body),
+            $crate::beacon::containers::BeaconState::Heze($inner) => Ok($body),
+            $crate::beacon::containers::BeaconState::Phase0(_)
+            | $crate::beacon::containers::BeaconState::Altair(_)
+            | $crate::beacon::containers::BeaconState::Bellatrix(_)
+            | $crate::beacon::containers::BeaconState::Capella(_)
+            | $crate::beacon::containers::BeaconState::Deneb(_)
+            | $crate::beacon::containers::BeaconState::Electra(_)
+            | $crate::beacon::containers::BeaconState::Fulu(_)
+            | $crate::beacon::containers::BeaconState::Eip8453(_) => {
+                Err($crate::beacon::error::Error::UnsupportedForFork {
+                    function: $function,
+                    fork: $state.fork_name(),
+                })
+            }
+            $crate::beacon::containers::BeaconState::Lean(_) => {
+                $crate::beacon::lean_state_unreachable($function)
+            }
+        }
+    };
+}
+
 /// Generates accessors for the fields that exist from gloas on (EIP-7732):
-/// gloas and heze carry each unchanged, every earlier fork answers
+/// gloas, heze and EIP-8453 carry each unchanged, every earlier fork answers
 /// [`Error::UnsupportedForFork`]. The two lists are spelled out rather than
 /// one derived from the other, so a new fork joins neither silently.
 macro_rules! gloas_family_state_accessors {
@@ -637,7 +703,7 @@ macro_rules! gloas_family_state_accessors {
                         self,
                         stringify!($field),
                         |state| &state.$field,
-                        carried_by: [Gloas, Heze],
+                        carried_by: [Gloas, Heze, Eip8453],
                         absent_from: [Phase0, Altair, Bellatrix, Capella, Deneb, Electra, Fulu],
                     )
                 }
@@ -647,7 +713,7 @@ macro_rules! gloas_family_state_accessors {
                         self,
                         stringify!($field_mut),
                         |state| &mut state.$field,
-                        carried_by: [Gloas, Heze],
+                        carried_by: [Gloas, Heze, Eip8453],
                         absent_from: [Phase0, Altair, Bellatrix, Capella, Deneb, Electra, Fulu],
                     )
                 }
@@ -699,9 +765,6 @@ gloas_family_state_accessors!(
 shared_state_accessors!(
     copy: [
         (slot, slot_mut, Slot),
-        (previous_justified_checkpoint, previous_justified_checkpoint_mut, Checkpoint),
-        (current_justified_checkpoint, current_justified_checkpoint_mut, Checkpoint),
-        (finalized_checkpoint, finalized_checkpoint_mut, Checkpoint),
     ],
     reference: [
         (fork, fork_mut, Fork),
@@ -711,6 +774,76 @@ shared_state_accessors!(
         (historical_roots, historical_roots_mut, HistoricalRoots),
         (randao_mixes, randao_mixes_mut, RandaoMixes),
         (slashings, slashings_mut, Slashings),
+    ],
+);
+
+/// Generates accessors for the Casper FFG fields every fork from phase0
+/// through heze carries and EIP-8453 removes (its finality gadget keeps
+/// [`eip8453::HeightCheckpoint`]s instead, and reuses the name
+/// `finalized_checkpoint` for one of a different type). Fallible, answering
+/// [`Error::UnsupportedForFork`] for EIP-8453, so a caller that reaches one
+/// on such a state gets an error naming the field rather than a value that
+/// does not exist.
+macro_rules! casper_ffg_state_accessors {
+    (
+        copy: [$(($field:ident, $field_mut:ident, $ty:ty)),* $(,)?],
+        reference: [$(($ref_field:ident, $ref_field_mut:ident, $ref_ty:ty)),* $(,)?],
+    ) => {
+        impl BeaconState {
+            $(
+                pub fn $field(&self) -> Result<$ty> {
+                    dispatch_state_from!(
+                        self,
+                        stringify!($field),
+                        |state| state.$field,
+                        carried_by: [Phase0, Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze],
+                        absent_from: [Eip8453],
+                    )
+                }
+
+                pub fn $field_mut(&mut self) -> Result<&mut $ty> {
+                    dispatch_state_from!(
+                        self,
+                        stringify!($field_mut),
+                        |state| &mut state.$field,
+                        carried_by: [Phase0, Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze],
+                        absent_from: [Eip8453],
+                    )
+                }
+            )*
+
+            $(
+                pub fn $ref_field(&self) -> Result<&$ref_ty> {
+                    dispatch_state_from!(
+                        self,
+                        stringify!($ref_field),
+                        |state| &state.$ref_field,
+                        carried_by: [Phase0, Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze],
+                        absent_from: [Eip8453],
+                    )
+                }
+
+                pub fn $ref_field_mut(&mut self) -> Result<&mut $ref_ty> {
+                    dispatch_state_from!(
+                        self,
+                        stringify!($ref_field_mut),
+                        |state| &mut state.$ref_field,
+                        carried_by: [Phase0, Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze],
+                        absent_from: [Eip8453],
+                    )
+                }
+            )*
+        }
+    };
+}
+
+casper_ffg_state_accessors!(
+    copy: [
+        (previous_justified_checkpoint, previous_justified_checkpoint_mut, Checkpoint),
+        (current_justified_checkpoint, current_justified_checkpoint_mut, Checkpoint),
+        (finalized_checkpoint, finalized_checkpoint_mut, Checkpoint),
+    ],
+    reference: [
         (justification_bits, justification_bits_mut, JustificationBits),
     ],
 );
@@ -1085,6 +1218,7 @@ impl BeaconState {
             BeaconState::Fulu(s) => Some(Registry::Bounded(&s.validators, &s.balances)),
             BeaconState::Gloas(s) => Some(Registry::Progressive(&s.validators, &s.balances)),
             BeaconState::Heze(s) => Some(Registry::Progressive(&s.validators, &s.balances)),
+            BeaconState::Eip8453(s) => Some(Registry::Progressive(&s.validators, &s.balances)),
             BeaconState::Lean(_) => None,
         }
     }
@@ -1115,6 +1249,9 @@ impl BeaconState {
                 Some(RegistryMut::Progressive(&mut s.validators, &mut s.balances))
             }
             BeaconState::Heze(s) => {
+                Some(RegistryMut::Progressive(&mut s.validators, &mut s.balances))
+            }
+            BeaconState::Eip8453(s) => {
                 Some(RegistryMut::Progressive(&mut s.validators, &mut s.balances))
             }
             BeaconState::Lean(_) => None,
@@ -1243,6 +1380,7 @@ impl BeaconState {
             BeaconState::Fulu(state) => &state.historical_summaries,
             BeaconState::Gloas(state) => &state.historical_summaries,
             BeaconState::Heze(state) => &state.historical_summaries,
+            BeaconState::Eip8453(state) => &state.historical_summaries,
             BeaconState::Phase0(_)
             | BeaconState::Altair(_)
             | BeaconState::Bellatrix(_)
@@ -1255,6 +1393,7 @@ impl BeaconState {
             BeaconState::Fulu(state) => &mut state.historical_summaries,
             BeaconState::Gloas(state) => &mut state.historical_summaries,
             BeaconState::Heze(state) => &mut state.historical_summaries,
+            BeaconState::Eip8453(state) => &mut state.historical_summaries,
             BeaconState::Phase0(_)
             | BeaconState::Altair(_)
             | BeaconState::Bellatrix(_)
@@ -1342,7 +1481,7 @@ impl BeaconState {
                 state.next_withdrawal_index,
                 state.next_withdrawal_validator_index,
             ),
-            carried_by: [Capella, Deneb, Electra, Fulu, Gloas, Heze],
+            carried_by: [Capella, Deneb, Electra, Fulu, Gloas, Heze, Eip8453],
             absent_from: [Phase0, Altair, Bellatrix],
         )
     }
@@ -1356,7 +1495,7 @@ impl BeaconState {
                 &mut state.next_withdrawal_index,
                 &mut state.next_withdrawal_validator_index,
             ),
-            carried_by: [Capella, Deneb, Electra, Fulu, Gloas, Heze],
+            carried_by: [Capella, Deneb, Electra, Fulu, Gloas, Heze, Eip8453],
             absent_from: [Phase0, Altair, Bellatrix],
         )
     }
@@ -1408,7 +1547,7 @@ impl BeaconState {
                 InactivityScoresRef::from(&state.inactivity_scores),
             ),
             carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze],
-            absent_from: [Phase0],
+            absent_from: [Phase0, Eip8453],
         )
     }
 
@@ -1459,7 +1598,7 @@ impl BeaconState {
                 &mut state.inactivity_scores,
             ),
             carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu],
-            absent_from: [Phase0, Gloas, Heze],
+            absent_from: [Phase0, Gloas, Heze, Eip8453],
         )
     }
 
@@ -1491,7 +1630,7 @@ impl BeaconState {
                     .get_mut(index)
                     .ok_or(Error::IndexOutOfBounds { index, len })?
             },
-            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze],
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze, Eip8453],
             absent_from: [Phase0],
         )
     }
@@ -1519,7 +1658,7 @@ impl BeaconState {
                 &mut state.previous_epoch_participation[..]
             },
             carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze],
-            absent_from: [Phase0],
+            absent_from: [Phase0, Eip8453],
         )
     }
 
@@ -1539,7 +1678,7 @@ impl BeaconState {
             self,
             "BeaconState::sync_committees",
             |state| (&state.current_sync_committee, &state.next_sync_committee),
-            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze],
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze, Eip8453],
             absent_from: [Phase0],
         )
     }
@@ -1562,7 +1701,7 @@ impl BeaconState {
                 &mut state.current_sync_committee,
                 &mut state.next_sync_committee,
             ),
-            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze],
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze, Eip8453],
             absent_from: [Phase0],
         )
     }
@@ -1786,6 +1925,10 @@ pub enum SignedBeaconBlock {
     /// (EIP-8015). Its bid is still [`gloas::ExecutionPayloadBid`], in its
     /// heze shape.
     Heze(heze::SignedBeaconBlock),
+    /// EIP-8453's block: heze's body with this fork's attestations and
+    /// attester slashings, plus head votes, their support bits and the
+    /// legacy (heze-shaped) attester slashings.
+    Eip8453(eip8453::SignedBeaconBlock),
 
     /// The Lean consensus protocol's block.
     ///
@@ -1841,9 +1984,12 @@ impl SignedBeaconBlock {
     /// (`is_payload_verified(store, root)`) rather than this accessor.
     pub fn execution_block_hash(&self) -> Option<ExecutionBlockHash> {
         match self {
-            Self::Phase0(_) | Self::Altair(_) | Self::Gloas(_) | Self::Heze(_) | Self::Lean(_) => {
-                None
-            }
+            Self::Phase0(_)
+            | Self::Altair(_)
+            | Self::Gloas(_)
+            | Self::Heze(_)
+            | Self::Eip8453(_)
+            | Self::Lean(_) => None,
             Self::Bellatrix(block) => Some(block.message.body.execution_payload.block_hash),
             Self::Capella(block) => Some(block.message.body.execution_payload.block_hash),
             Self::Deneb(block) => Some(block.message.body.execution_payload.block_hash),
@@ -1905,6 +2051,13 @@ impl SignedBeaconBlock {
                 .message
                 .blob_kzg_commitments
                 .len(),
+            Self::Eip8453(block) => block
+                .message
+                .body
+                .signed_execution_payload_bid
+                .message
+                .blob_kzg_commitments
+                .len(),
         }
     }
 
@@ -1918,9 +2071,12 @@ impl SignedBeaconBlock {
     /// would describe.
     pub fn execution_payload_timestamp(&self) -> Option<u64> {
         match self {
-            Self::Phase0(_) | Self::Altair(_) | Self::Gloas(_) | Self::Heze(_) | Self::Lean(_) => {
-                None
-            }
+            Self::Phase0(_)
+            | Self::Altair(_)
+            | Self::Gloas(_)
+            | Self::Heze(_)
+            | Self::Eip8453(_)
+            | Self::Lean(_) => None,
             Self::Bellatrix(block) => Some(block.message.body.execution_payload.timestamp),
             Self::Capella(block) => Some(block.message.body.execution_payload.timestamp),
             Self::Deneb(block) => Some(block.message.body.execution_payload.timestamp),
@@ -1947,6 +2103,7 @@ impl SignedBeaconBlock {
             SignedBeaconBlock::Fulu(_) => ForkName::Fulu,
             SignedBeaconBlock::Gloas(_) => ForkName::Gloas,
             SignedBeaconBlock::Heze(_) => ForkName::Heze,
+            SignedBeaconBlock::Eip8453(_) => ForkName::Eip8453,
             SignedBeaconBlock::Lean(_) => ForkName::Lean,
         }
     }
@@ -1991,6 +2148,13 @@ impl SignedBeaconBlock {
                 let bid = &block.message.body.signed_execution_payload_bid.message;
                 expect_shape(fork, bid.fork_name())?;
                 Ok(SignedBeaconBlock::Heze(block))
+            }
+            ForkName::Eip8453 => {
+                let block = eip8453::SignedBeaconBlock::from_ssz_bytes(bytes)?;
+                let bid = &block.message.body.signed_execution_payload_bid.message;
+                // EIP-8453 keeps heze's bid shape.
+                expect_shape(ForkName::Heze, bid.fork_name())?;
+                Ok(SignedBeaconBlock::Eip8453(block))
             }
             ForkName::Lean => Ok(SignedBeaconBlock::Lean(
                 crate::block::SignedBlock::from_ssz_bytes(bytes)?,
@@ -2215,10 +2379,18 @@ impl<'a> From<&'a heze::BeaconBlock> for GloasBlockRef<'a> {
 impl SignedBeaconBlock {
     /// The message of a gloas or heze block, or `None` for every other fork.
     /// Panics on a lean block, like every beacon accessor here.
+    ///
+    /// `None` for an EIP-8453 block too: its attestations and attester
+    /// slashings are different containers from the ones [`GloasBlockRef`]
+    /// hands out, so the gossip, fork-choice and Beacon API readers of a
+    /// gloas-family block treat it as a block they cannot read.
     pub fn gloas_message(&self) -> Option<GloasBlockRef<'_>> {
         match self {
             SignedBeaconBlock::Gloas(block) => Some(GloasBlockRef::Gloas(&block.message)),
             SignedBeaconBlock::Heze(block) => Some(GloasBlockRef::Heze(&block.message)),
+            // TODO(eip8453): give fork choice, gossip and the Beacon API a
+            // reader for the EIP-8453 block.
+            SignedBeaconBlock::Eip8453(_) => None,
             SignedBeaconBlock::Phase0(_)
             | SignedBeaconBlock::Altair(_)
             | SignedBeaconBlock::Bellatrix(_)
@@ -2439,8 +2611,8 @@ impl DataColumnSidecar {
     pub fn from_ssz(fork: ForkName, bytes: &[u8]) -> Result<Self> {
         match fork {
             ForkName::Fulu => Ok(Self::Fulu(fulu::DataColumnSidecar::from_ssz_bytes(bytes)?)),
-            // Heze leaves the gloas sidecar unchanged.
-            ForkName::Gloas | ForkName::Heze => Ok(Self::Gloas(
+            // Heze and EIP-8453 leave the gloas sidecar unchanged.
+            ForkName::Gloas | ForkName::Heze | ForkName::Eip8453 => Ok(Self::Gloas(
                 gloas::DataColumnSidecar::from_ssz_bytes(bytes)?,
             )),
             ForkName::Phase0

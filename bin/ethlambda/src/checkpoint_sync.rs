@@ -619,13 +619,31 @@ fn verify_beacon_checkpoint_state(state: &BeaconState) -> Result<(), CheckpointS
         return Err(CheckpointSyncError::NoValidators);
     }
 
-    let current_epoch = state.slot() / preset::SLOTS_PER_EPOCH;
-    if state.finalized_checkpoint().epoch > current_epoch {
-        return Err(CheckpointSyncError::FinalizedExceedsStateSlot);
-    }
-
-    if state.current_justified_checkpoint().epoch < state.finalized_checkpoint().epoch {
-        return Err(CheckpointSyncError::JustifiedPrecedesFinalized);
+    if let BeaconState::Eip8453(inner) = state {
+        // The finality gadget's own forms of the two checks below.
+        // TODO(eip8453): unreachable while `refuse_unfollowable_fork` refuses
+        // an EIP-8453 anchor; revisit with its checkpoint sync.
+        if inner.finalized_slot > state.slot() {
+            return Err(CheckpointSyncError::FinalizedExceedsStateSlot);
+        }
+        if inner.justified_checkpoint.height < inner.finalized_checkpoint.height {
+            return Err(CheckpointSyncError::JustifiedPrecedesFinalized);
+        }
+    } else {
+        // Every beacon fork before EIP-8453 carries Casper FFG's checkpoints.
+        let (Ok(finalized), Ok(justified)) = (
+            state.finalized_checkpoint(),
+            state.current_justified_checkpoint(),
+        ) else {
+            unreachable!("every beacon fork but EIP-8453 carries Casper FFG checkpoints");
+        };
+        let current_epoch = state.slot() / preset::SLOTS_PER_EPOCH;
+        if finalized.epoch > current_epoch {
+            return Err(CheckpointSyncError::FinalizedExceedsStateSlot);
+        }
+        if justified.epoch < finalized.epoch {
+            return Err(CheckpointSyncError::JustifiedPrecedesFinalized);
+        }
     }
 
     if state.latest_block_header().slot > state.slot() {
@@ -1160,7 +1178,7 @@ mod tests {
     fn a_beacon_anchor_with_finalized_epoch_beyond_state_is_rejected() {
         let mut state = beacon_anchor_state();
         let current_epoch = state.slot() / preset::SLOTS_PER_EPOCH;
-        state.finalized_checkpoint_mut().epoch = current_epoch + 1;
+        state.finalized_checkpoint_mut().unwrap().epoch = current_epoch + 1;
 
         assert!(matches!(
             verify_beacon_checkpoint_state(&state),
@@ -1175,7 +1193,7 @@ mod tests {
     #[test]
     fn a_beacon_anchor_with_justified_epoch_before_finalized_is_rejected() {
         let mut state = beacon_anchor_state();
-        state.finalized_checkpoint_mut().epoch = 1;
+        state.finalized_checkpoint_mut().unwrap().epoch = 1;
 
         assert!(matches!(
             verify_beacon_checkpoint_state(&state),

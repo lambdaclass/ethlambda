@@ -135,13 +135,24 @@ async fn get_finality_checkpoints(
     // This endpoint is defined as a read of the state `state_id` names, and
     // the state is the only place a *previous* justified checkpoint is kept
     // at all: the store keeps one justified row and one finalized row.
+    //
+    // An EIP-8453 state has no Casper FFG checkpoints; its finality gadget
+    // keeps height checkpoints instead.
+    // TODO(eip8453): serve the finality gadget's checkpoints.
+    let (Ok(previous_justified), Ok(current_justified), Ok(finalized)) = (
+        state.previous_justified_checkpoint(),
+        state.current_justified_checkpoint(),
+        state.finalized_checkpoint(),
+    ) else {
+        return ApiError::BadRequest("the state has no Casper FFG checkpoints").into_response();
+    };
     crate::json_response(serde_json::json!({
         "execution_optimistic": crate::shared::optimistic::block_is_optimistic(&store, root),
         "finalized": is_finalized(&store, state.slot()),
         "data": {
-            "previous_justified": state.previous_justified_checkpoint(),
-            "current_justified": state.current_justified_checkpoint(),
-            "finalized": state.finalized_checkpoint(),
+            "previous_justified": previous_justified,
+            "current_justified": current_justified,
+            "finalized": finalized,
         }
     }))
 }

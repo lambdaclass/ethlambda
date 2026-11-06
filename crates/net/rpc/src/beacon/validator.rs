@@ -807,7 +807,9 @@ fn attestation_data(store: &Store, slot: Slot) -> Result<AttestationData, ApiErr
         checkpoint_state(store, &boundary, &store.config())
             .map_err(|_| ApiError::Internal("advancing the head state failed"))?
             .current_justified_checkpoint()
-    };
+    }
+    // TODO(eip8453): EIP-8453 attestation data is the finality gadget's.
+    .map_err(|_| ApiError::BadRequest("the head state has no Casper FFG checkpoints"))?;
     let target = Checkpoint {
         epoch,
         root: block_root_at_or_before(&state, head_root, epoch_start)?,

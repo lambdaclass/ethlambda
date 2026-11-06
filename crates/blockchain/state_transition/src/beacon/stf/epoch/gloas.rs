@@ -133,7 +133,7 @@ fn process_epoch_steps(
 /// [`super::electra::process_pending_consolidations`] is.
 pub fn process_participation_flag_updates(state: &mut BeaconState) -> Result<()> {
     let validator_count = state.validator_count();
-    ethlambda_types::gloas_family!(state, "process_participation_flag_updates", |inner| {
+    ethlambda_types::gloas_heze!(state, "process_participation_flag_updates", |inner| {
         inner.previous_epoch_participation =
             core::mem::take(&mut inner.current_epoch_participation);
         inner.current_epoch_participation = vec![0; validator_count].into();
@@ -187,7 +187,7 @@ pub fn process_builder_pending_payments(state: &mut BeaconState) -> Result<()> {
     let quorum = get_builder_payment_quorum_threshold(state)?;
     let epoch_len = preset::SLOTS_PER_EPOCH as usize;
 
-    ethlambda_types::gloas_family!(state, "process_builder_pending_payments", |inner| {
+    ethlambda_types::gloas_heze!(state, "process_builder_pending_payments", |inner| {
         for payment in &inner.builder_pending_payments[..epoch_len] {
             if payment.weight >= quorum {
                 inner
@@ -235,7 +235,14 @@ pub fn process_ptc_window(state: &mut BeaconState) -> Result<()> {
             .ok_or(Error::ArithmeticOverflow(
                 "process_ptc_window: start_slot + offset",
             ))?;
-        new_slice.push(compute_ptc(state, slot, &committees)?);
+        // [Modified in EIP8453] `compute_ptc` draws from the whole active
+        // set, shuffled.
+        let ptc = if matches!(state, BeaconState::Eip8453(_)) {
+            crate::beacon::helpers::eip8453::compute_ptc(state, slot)?
+        } else {
+            compute_ptc(state, slot, &committees)?
+        };
+        new_slice.push(ptc);
     }
 
     let ptc_window = state.ptc_window_mut()?;

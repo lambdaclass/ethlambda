@@ -323,6 +323,13 @@ impl ProducedBlock {
                 "a gloas block cannot be decoded without Eth-Execution-Payload-Included"
                     .to_string(),
             )),
+            // TODO(eip8453): propose under EIP-8453 once the validator client
+            // implements its duties.
+            ForkName::Eip8453 => Err(Error::InconsistentResponse(
+                "beacon node produced an eip8453 block, which this client does not propose \
+                 under yet"
+                    .to_string(),
+            )),
             ForkName::Phase0
             | ForkName::Altair
             | ForkName::Bellatrix

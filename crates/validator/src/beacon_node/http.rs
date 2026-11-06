@@ -949,6 +949,14 @@ impl BeaconNodeApi for HttpBeaconNode {
                     .map_err(|err| Error::Decode(format!("gloas aggregate: {err}")))?;
                 AggregateKind::Gloas(attestation)
             }
+            // TODO(eip8453): aggregate finality-gadget attestations once the
+            // validator client implements EIP-8453's duties.
+            ForkName::Eip8453 => {
+                return Err(Error::InconsistentResponse(
+                    "node produced an eip8453 aggregate, which this client does not publish yet"
+                        .to_string(),
+                ));
+            }
         };
         // The same contract the other two fetches carry, enforced here so a
         // node answering about the wrong slot is failed over from rather than

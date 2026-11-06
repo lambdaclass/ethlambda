@@ -29,7 +29,7 @@ use super::predicates::is_active_validator;
 /// behind the current one.
 pub fn get_finality_delay(state: &BeaconState) -> Result<Epoch> {
     get_previous_epoch(state)
-        .checked_sub(state.finalized_checkpoint().epoch)
+        .checked_sub(state.finalized_checkpoint()?.epoch)
         .ok_or(Error::ArithmeticOverflow(
             "get_previous_epoch(state) - finalized_checkpoint.epoch",
         ))

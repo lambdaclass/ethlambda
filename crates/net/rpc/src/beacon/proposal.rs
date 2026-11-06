@@ -344,6 +344,7 @@ pub(crate) fn require_gloas_slot(
 ) -> Result<(), ApiError> {
     match config.fork_at_epoch(compute_epoch_at_slot(slot)) {
         ForkName::Gloas | ForkName::Heze => Ok(()),
+        // TODO(eip8453): EIP-8453's blocks and duties are a later phase.
         ForkName::Phase0
         | ForkName::Altair
         | ForkName::Bellatrix
@@ -351,6 +352,7 @@ pub(crate) fn require_gloas_slot(
         | ForkName::Deneb
         | ForkName::Electra
         | ForkName::Fulu
+        | ForkName::Eip8453
         | ForkName::Lean => Err(ApiError::BadRequest(message)),
     }
 }
@@ -410,6 +412,7 @@ fn require_fulu_slot(config: &Config, slot: Slot, message: &'static str) -> Resu
         | ForkName::Electra
         | ForkName::Gloas
         | ForkName::Heze
+        | ForkName::Eip8453
         | ForkName::Lean => Err(ApiError::BadRequest(message)),
     }
 }

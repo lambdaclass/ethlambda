@@ -216,6 +216,7 @@ fn latest_block_hash(state: &BeaconState) -> Option<ExecutionBlockHash> {
     match state {
         BeaconState::Gloas(state) => Some(state.latest_block_hash),
         BeaconState::Heze(state) => Some(state.latest_block_hash),
+        BeaconState::Eip8453(state) => Some(state.latest_block_hash),
         BeaconState::Phase0(_)
         | BeaconState::Altair(_)
         | BeaconState::Bellatrix(_)

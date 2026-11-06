@@ -150,7 +150,7 @@ pub fn process_proposer_lookahead(state: &mut BeaconState) -> Result<()> {
         // sampling; see `crate::beacon::helpers::gloas::get_beacon_proposer_indices`'s
         // own doc. This is the one part of the step gloas cannot share
         // unchanged; see this module's own module doc.
-        ForkName::Gloas | ForkName::Heze => {
+        ForkName::Gloas | ForkName::Heze | ForkName::Eip8453 => {
             crate::beacon::helpers::gloas::get_beacon_proposer_indices(state, new_epoch)?
         }
         fork @ (ForkName::Phase0
@@ -311,7 +311,7 @@ mod tests {
         // Past the deposit's own slot, so the unrelated finality gate
         // (`deposit.slot > finalized_slot`) cannot be what lets, or blocks,
         // this deposit through; only the eth1-bridge gate is under test.
-        state.finalized_checkpoint_mut().epoch = 1;
+        state.finalized_checkpoint_mut().unwrap().epoch = 1;
         let deposit = request_sourced_pending_deposit(&state, 0);
         pending_queue_fields(&mut state, "test setup")
             .unwrap()
@@ -339,7 +339,7 @@ mod tests {
         let mut state = fulu_state_with_validators(2);
         // See the previous test: past the deposit's own slot, so only the
         // eth1-bridge gate, not the unrelated finality gate, is under test.
-        state.finalized_checkpoint_mut().epoch = 1;
+        state.finalized_checkpoint_mut().unwrap().epoch = 1;
         let deposit = request_sourced_pending_deposit(&state, 0);
         pending_queue_fields(&mut state, "test setup")
             .unwrap()

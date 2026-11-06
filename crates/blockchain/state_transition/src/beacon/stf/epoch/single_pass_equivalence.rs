@@ -148,17 +148,23 @@ fn random_state(rng: &mut SplitMix64, base: &BeaconState, config: &Config) -> Be
         root: Root::ZERO,
     };
     let previous_epoch = get_previous_epoch(&state);
-    *state.previous_justified_checkpoint_mut() = checkpoint(epoch.saturating_sub(rng.below(4)));
-    *state.current_justified_checkpoint_mut() = checkpoint(epoch.saturating_sub(rng.below(3)));
+    *state.previous_justified_checkpoint_mut().unwrap() =
+        checkpoint(epoch.saturating_sub(rng.below(4)));
+    *state.current_justified_checkpoint_mut().unwrap() =
+        checkpoint(epoch.saturating_sub(rng.below(3)));
     let finalized_epoch = if rng.chance(30) {
         0
     } else {
         previous_epoch.saturating_sub(rng.below(3))
     };
-    *state.finalized_checkpoint_mut() = checkpoint(finalized_epoch);
+    *state.finalized_checkpoint_mut().unwrap() = checkpoint(finalized_epoch);
     for bit in 0..constants::JUSTIFICATION_BITS_LENGTH {
         let value = rng.chance(50);
-        state.justification_bits_mut().set(bit, value).unwrap();
+        state
+            .justification_bits_mut()
+            .unwrap()
+            .set(bit, value)
+            .unwrap();
     }
 
     let mut balances: Vec<Gwei> = Vec::with_capacity(count);

@@ -147,6 +147,15 @@ pub fn with_validators_at(fork: ForkName, count: usize) -> BeaconState {
                 Some(crate::beacon::containers::heze::InclusionListBits::new());
             BeaconState::Heze(state)
         }
+        // Through the fork's own upgrade from heze's state, so the finality
+        // gadget's fields and the head vote committee window hold what
+        // `upgrade_to_eip8453` puts there. Needs at least one validator: the
+        // window draws its committees from the active set.
+        ForkName::Eip8453 => crate::beacon::upgrade::upgrade_to_eip8453(
+            &with_validators_at(ForkName::Heze, count),
+            &crate::beacon::config::Config::active(),
+        )
+        .expect("upgrade_to_eip8453 accepts a heze test state with validators"),
         // A test asking for a lean state from a beacon builder, which no fixture
         // fork name can produce; the `fork:` form, since the argument is the
         // whole input.
@@ -177,6 +186,7 @@ pub fn replace_balances(state: &mut BeaconState, balances: Vec<Gwei>) {
         BeaconState::Fulu(state) => state.balances = bounded(balances),
         BeaconState::Gloas(state) => state.balances = balances.into(),
         BeaconState::Heze(state) => state.balances = balances.into(),
+        BeaconState::Eip8453(state) => state.balances = balances.into(),
         BeaconState::Lean(_) => lean_state_unreachable("replace_balances"),
     }
 }

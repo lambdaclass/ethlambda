@@ -297,6 +297,8 @@ pub fn decode_aggregate_and_proof(
         // root the aggregator signs differs; `data.index` is the payload flag.
         ForkName::Gloas | ForkName::Heze => gloas::SignedAggregateAndProof::from_ssz_bytes(bytes)
             .map(SignedAggregateAndProof::Gloas),
+        // TODO(eip8453): decode EIP-8453's finality-gadget aggregates.
+        ForkName::Eip8453 => return Err(DecodeError::UnsupportedFork),
         ForkName::Phase0
         | ForkName::Altair
         | ForkName::Bellatrix
@@ -351,6 +353,8 @@ pub fn decode_attestation(fork: ForkName, bytes: &[u8]) -> Result<Attestation, D
         ForkName::Electra | ForkName::Fulu | ForkName::Gloas | ForkName::Heze => {
             electra::SingleAttestation::from_ssz_bytes(bytes).map(Attestation::Electra)
         }
+        // TODO(eip8453): EIP-8453's `SingleAttestation` is its own container.
+        ForkName::Eip8453 => return Err(DecodeError::UnsupportedFork),
         ForkName::Phase0
         | ForkName::Altair
         | ForkName::Bellatrix
@@ -388,6 +392,9 @@ pub fn decode_gossip(
                 ForkName::Gloas | ForkName::Heze => {
                     gloas::AttesterSlashing::from_ssz_bytes(bytes).map(AttesterSlashing::Gloas)
                 }
+                // TODO(eip8453): EIP-8453's attester slashings (and its
+                // legacy ones) are their own containers.
+                ForkName::Eip8453 => return Err(DecodeError::UnsupportedFork),
                 ForkName::Phase0
                 | ForkName::Altair
                 | ForkName::Bellatrix

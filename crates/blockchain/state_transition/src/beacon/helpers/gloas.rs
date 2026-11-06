@@ -219,6 +219,10 @@ pub fn is_builder_index(validator_index: ValidatorIndex) -> bool {
 /// Whether the builder at `builder_index` is active: its placement in the
 /// registry is finalized, and it has not initiated an exit.
 pub fn is_active_builder(state: &BeaconState, builder_index: gloas::BuilderIndex) -> Result<bool> {
+    // [Modified in EIP8453] The placement is finalized by `finalized_slot`.
+    if let BeaconState::Eip8453(inner) = state {
+        return super::eip8453::is_active_builder(inner, builder_index);
+    }
     let builders = state.builders()?;
     let builder = builders
         .get(builder_index as usize)
@@ -228,7 +232,7 @@ pub fn is_active_builder(state: &BeaconState, builder_index: gloas::BuilderIndex
         })?;
     Ok(
         // Placement in builder list is finalized.
-        builder.deposit_epoch < state.finalized_checkpoint().epoch
+        builder.deposit_epoch < state.finalized_checkpoint()?.epoch
         // Has not initiated exit.
         && builder.withdrawable_epoch == constants::FAR_FUTURE_EPOCH,
     )
@@ -600,9 +604,9 @@ pub fn get_attestation_participation_flag_indices(
 ) -> Result<Vec<usize>> {
     // Matching source.
     let justified_checkpoint = if data.target.epoch == get_current_epoch(state) {
-        state.current_justified_checkpoint()
+        state.current_justified_checkpoint()?
     } else {
-        state.previous_justified_checkpoint()
+        state.previous_justified_checkpoint()?
     };
     let is_matching_source = data.source == justified_checkpoint;
 
@@ -804,7 +808,8 @@ pub fn get_activation_churn_limit(state: &BeaconState, config: &Config) -> Resul
     let churn = config
         .min_per_epoch_churn_limit_electra
         .max(total_active_balance / config.churn_limit_quotient_gloas);
-    if state.fork_name() == ForkName::Heze {
+    // EIP-8453 is built on heze and keeps its activation churn.
+    if matches!(state.fork_name(), ForkName::Heze | ForkName::Eip8453) {
         let churn = config.max_per_epoch_activation_churn_limit_gloas.min(churn);
         let churn = scale_churn_to_slot_duration(churn, state, config);
         return Ok(churn - churn % preset::EFFECTIVE_BALANCE_INCREMENT);

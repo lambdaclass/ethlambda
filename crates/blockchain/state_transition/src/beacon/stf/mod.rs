@@ -58,6 +58,7 @@ pub mod bellatrix;
 pub mod block;
 pub mod capella;
 pub mod deneb;
+pub mod eip8453;
 pub mod electra;
 pub mod epoch;
 pub mod fulu;
@@ -230,6 +231,15 @@ pub fn process_slots(state: &mut BeaconState, slot: Slot, config: &Config) -> Re
 
     while state.slot() < slot {
         process_slot(state)?;
+        // [New in EIP8453] Round processing runs on the last slot of a round,
+        // before epoch processing when the two boundaries coincide. Only an
+        // EIP-8453 state has rounds: the state crossing into the fork is
+        // still heze's until `upgrade_at_fork_boundary` below.
+        if matches!(state, BeaconState::Eip8453(_))
+            && (state.slot() + 1).is_multiple_of(preset::SLOTS_PER_ROUND)
+        {
+            epoch::eip8453::process_round(state, config)?;
+        }
         // Epoch processing runs on the last slot of an epoch, before the counter
         // moves into the next one.
         if (state.slot() + 1).is_multiple_of(preset::SLOTS_PER_EPOCH) {
@@ -344,6 +354,23 @@ pub fn process_slot(state: &mut BeaconState) -> Result<()> {
                 .expect("next_position is in [0, SLOTS_PER_HISTORICAL_ROOT)");
         }
         BeaconState::Heze(inner) => {
+            let next_slot = inner
+                .slot
+                .checked_add(1)
+                .ok_or(Error::ArithmeticOverflow("process_slot: slot + 1"))?;
+            let next_position = (next_slot % preset::SLOTS_PER_HISTORICAL_ROOT as u64) as usize;
+            inner
+                .execution_payload_availability
+                .set(next_position, false)
+                .expect("next_position is in [0, SLOTS_PER_HISTORICAL_ROOT)");
+        }
+        BeaconState::Eip8453(inner) => {
+            // [New in EIP8453] Cache the target checkpoint root: the block
+            // that moved the chain to the current height is its target, and
+            // `advance_height` could not name its own block's root.
+            if inner.target_checkpoint.root.is_zero() {
+                inner.target_checkpoint.root = previous_block_root;
+            }
             let next_slot = inner
                 .slot
                 .checked_add(1)

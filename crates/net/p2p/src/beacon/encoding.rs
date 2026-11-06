@@ -523,7 +523,7 @@ where
 /// lean sorts after every beacon fork but has none.
 fn carries_inclusion_lists(fork: ForkName) -> bool {
     match fork {
-        ForkName::Heze => true,
+        ForkName::Heze | ForkName::Eip8453 => true,
         ForkName::Phase0
         | ForkName::Altair
         | ForkName::Bellatrix

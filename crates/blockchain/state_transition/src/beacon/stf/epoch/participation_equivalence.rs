@@ -208,16 +208,22 @@ fn random_state(rng: &mut SplitMix64, fork: ForkName) -> BeaconState {
         root: Root::ZERO,
     };
     let previous_epoch = get_previous_epoch(&state);
-    *state.previous_justified_checkpoint_mut() = checkpoint(epoch.saturating_sub(rng.below(4)));
-    *state.current_justified_checkpoint_mut() = checkpoint(epoch.saturating_sub(rng.below(3)));
-    *state.finalized_checkpoint_mut() = if rng.chance(50) {
+    *state.previous_justified_checkpoint_mut().unwrap() =
+        checkpoint(epoch.saturating_sub(rng.below(4)));
+    *state.current_justified_checkpoint_mut().unwrap() =
+        checkpoint(epoch.saturating_sub(rng.below(3)));
+    *state.finalized_checkpoint_mut().unwrap() = if rng.chance(50) {
         checkpoint(0)
     } else {
         checkpoint(previous_epoch.saturating_sub(rng.below(3)))
     };
     for bit in 0..constants::JUSTIFICATION_BITS_LENGTH {
         let value = rng.chance(50);
-        state.justification_bits_mut().set(bit, value).unwrap();
+        state
+            .justification_bits_mut()
+            .unwrap()
+            .set(bit, value)
+            .unwrap();
     }
     state
 }
@@ -256,23 +262,23 @@ fn assert_same_state(seed: u64, what: &str, fast: &BeaconState, slow: &BeaconSta
     let (_, _, slow_scores) = slow.altair_validator_lists().unwrap();
     assert_eq!(fast_scores, slow_scores, "{what} scores, seed {seed}");
     assert_eq!(
-        fast.justification_bits(),
-        slow.justification_bits(),
+        fast.justification_bits().unwrap(),
+        slow.justification_bits().unwrap(),
         "{what} bits, seed {seed}"
     );
     assert_eq!(
-        fast.previous_justified_checkpoint(),
-        slow.previous_justified_checkpoint(),
+        fast.previous_justified_checkpoint().unwrap(),
+        slow.previous_justified_checkpoint().unwrap(),
         "{what} previous justified, seed {seed}"
     );
     assert_eq!(
-        fast.current_justified_checkpoint(),
-        slow.current_justified_checkpoint(),
+        fast.current_justified_checkpoint().unwrap(),
+        slow.current_justified_checkpoint().unwrap(),
         "{what} current justified, seed {seed}"
     );
     assert_eq!(
-        fast.finalized_checkpoint(),
-        slow.finalized_checkpoint(),
+        fast.finalized_checkpoint().unwrap(),
+        slow.finalized_checkpoint().unwrap(),
         "{what} finalized, seed {seed}"
     );
 }
@@ -308,9 +314,10 @@ fn drivers_match_the_reference_steps() {
             assert_same_state(seed, "driver", &fast, &slow);
             succeeded += 1;
             balances_moved += !fast.iter_balances().eq(state.iter_balances()) as u32;
-            justified += (fast.current_justified_checkpoint()
-                != state.current_justified_checkpoint()) as u32;
-            finalized += (fast.finalized_checkpoint() != state.finalized_checkpoint()) as u32;
+            justified += (fast.current_justified_checkpoint().unwrap()
+                != state.current_justified_checkpoint().unwrap()) as u32;
+            finalized += (fast.finalized_checkpoint().unwrap()
+                != state.finalized_checkpoint().unwrap()) as u32;
         }
     });
     // The generator has to reach the interesting outcomes, not only errors.

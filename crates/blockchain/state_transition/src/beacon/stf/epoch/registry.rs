@@ -53,12 +53,14 @@ fn activation_churn_limit(state: &BeaconState, config: &Config) -> Result<u64> {
             Ok(churn_limit)
         }
         ForkName::Deneb => Ok(config.max_per_epoch_activation_churn_limit.min(churn_limit)),
-        fork @ (ForkName::Electra | ForkName::Fulu | ForkName::Gloas | ForkName::Heze) => {
-            Err(Error::UnsupportedForFork {
-                function: "process_registry_updates",
-                fork,
-            })
-        }
+        fork @ (ForkName::Electra
+        | ForkName::Fulu
+        | ForkName::Gloas
+        | ForkName::Heze
+        | ForkName::Eip8453) => Err(Error::UnsupportedForFork {
+            function: "process_registry_updates",
+            fork,
+        }),
         ForkName::Lean => lean_state_unreachable("activation_churn_limit"),
     }
 }
@@ -114,7 +116,7 @@ pub fn process_registry_updates(state: &mut BeaconState, config: &Config) -> Res
     // validators becoming eligible in the same epoch still activate in the
     // same order on every client, rather than in whatever order the registry
     // happens to store them.
-    let finalized_epoch = state.finalized_checkpoint().epoch;
+    let finalized_epoch = state.finalized_checkpoint()?.epoch;
     let mut activation_queue: Vec<ValidatorIndex> = (0..validator_count)
         .filter(|&index| {
             is_eligible_for_activation(

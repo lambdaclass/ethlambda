@@ -22,7 +22,7 @@ use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::{
     BeaconState, EpochParticipation, Fork, InactivityScores, altair, bellatrix, capella, deneb,
-    electra, fulu, gloas, heze, phase0,
+    eip8453, electra, fulu, gloas, heze, phase0,
 };
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::fork::ForkName;
@@ -1288,6 +1288,114 @@ pub fn upgrade_to_heze(pre: &BeaconState, config: &Config) -> Result<BeaconState
     Ok(BeaconState::Heze(post))
 }
 
+/// `upgrade_to_eip8453` (`specs/_features/eip8453/fork.md`): heze's state
+/// without the epoch participation lists and the Casper FFG fields, with the
+/// finality gadget starting at height 0 from the last finalized Casper FFG
+/// checkpoint, the target of height 1 being the latest block before the
+/// upgrade, and the head vote committee window filled for the current epoch
+/// and the lookahead (`initialize_head_vote_committee_window`).
+///
+/// Participation in the last epoch before the upgrade is not carried over,
+/// so it is never rewarded.
+pub fn upgrade_to_eip8453(pre: &BeaconState, config: &Config) -> Result<BeaconState> {
+    let BeaconState::Heze(pre) = pre else {
+        return Err(Error::UnsupportedForFork {
+            function: "upgrade_to_eip8453",
+            fork: pre.fork_name(),
+        });
+    };
+    let epoch = compute_epoch_at_slot(pre.slot);
+    let validator_count = pre.validators.len();
+    let pre = pre.clone();
+
+    let post = eip8453::BeaconState {
+        genesis_time: pre.genesis_time,
+        genesis_validators_root: pre.genesis_validators_root,
+        slot: pre.slot,
+        fork: Fork {
+            previous_version: pre.fork.current_version,
+            // [Modified in EIP8453]
+            current_version: config.eip8453_fork_version,
+            epoch,
+        },
+        // [New in EIP8453] (the target's root and slot, read before
+        // `latest_block_header` moves into the new state)
+        target_checkpoint: eip8453::HeightCheckpoint {
+            height: 1,
+            root: pre.latest_block_header.hash_tree_root(),
+        },
+        target_slot: pre.latest_block_header.slot,
+        latest_block_header: pre.latest_block_header,
+        block_roots: pre.block_roots,
+        state_roots: pre.state_roots,
+        historical_roots: pre.historical_roots,
+        validators: pre.validators,
+        balances: pre.balances,
+        randao_mixes: pre.randao_mixes,
+        slashings: pre.slashings,
+        // [Modified in EIP8453] Removed `previous_epoch_participation`,
+        // `current_epoch_participation`, `justification_bits`,
+        // `previous_justified_checkpoint`, `current_justified_checkpoint` and
+        // `finalized_checkpoint`.
+        inactivity_scores: pre.inactivity_scores,
+        current_sync_committee: pre.current_sync_committee,
+        next_sync_committee: pre.next_sync_committee,
+        latest_block_hash: pre.latest_block_hash,
+        next_withdrawal_index: pre.next_withdrawal_index,
+        next_withdrawal_validator_index: pre.next_withdrawal_validator_index,
+        historical_summaries: pre.historical_summaries,
+        deposit_balance_to_consume: pre.deposit_balance_to_consume,
+        exit_balance_to_consume: pre.exit_balance_to_consume,
+        earliest_exit_epoch: pre.earliest_exit_epoch,
+        consolidation_balance_to_consume: pre.consolidation_balance_to_consume,
+        earliest_consolidation_epoch: pre.earliest_consolidation_epoch,
+        pending_deposits: pre.pending_deposits,
+        pending_partial_withdrawals: pre.pending_partial_withdrawals,
+        pending_consolidations: pre.pending_consolidations,
+        proposer_lookahead: pre.proposer_lookahead,
+        builders: pre.builders,
+        next_withdrawal_builder_index: pre.next_withdrawal_builder_index,
+        execution_payload_availability: pre.execution_payload_availability,
+        builder_pending_payments: pre.builder_pending_payments,
+        builder_pending_withdrawals: pre.builder_pending_withdrawals,
+        latest_execution_payload_bid: pre.latest_execution_payload_bid,
+        payload_expected_withdrawals: pre.payload_expected_withdrawals,
+        ptc_window: pre.ptc_window,
+        // [New in EIP8453]
+        justified_checkpoint: eip8453::HeightCheckpoint {
+            height: 0,
+            root: pre.finalized_checkpoint.root,
+        },
+        // [New in EIP8453]
+        finalized_checkpoint: eip8453::HeightCheckpoint {
+            height: 0,
+            root: pre.finalized_checkpoint.root,
+        },
+        // [New in EIP8453]
+        finalized_slot: compute_start_slot_at_epoch(pre.finalized_checkpoint.epoch),
+        // [New in EIP8453]
+        target_participation: vec![false; validator_count].into(),
+        // [New in EIP8453]
+        progress_participation: vec![false; validator_count].into(),
+        // [New in EIP8453]
+        round_participation: vec![0; validator_count].into(),
+        // [New in EIP8453]
+        pending_finality: Default::default(),
+        // [New in EIP8453]
+        head_vote_participation: eip8453::empty_head_vote_participation(),
+        // [New in EIP8453]
+        head_vote_committee_window: eip8453::empty_head_vote_committee_window(),
+    };
+
+    // [New in EIP8453]
+    let mut post = BeaconState::Eip8453(post);
+    let window = crate::beacon::helpers::eip8453::initialize_head_vote_committee_window(&post)?;
+    if let BeaconState::Eip8453(inner) = &mut post {
+        inner.head_vote_committee_window = window;
+    }
+    Ok(post)
+}
+
 /// Applies the fork upgrade that produces `to`'s state shape from `state`.
 ///
 /// Dispatches over the per-fork upgrade functions by [`ForkName`] so a caller
@@ -1320,6 +1428,7 @@ pub fn upgrade_state(state: &BeaconState, to: ForkName, config: &Config) -> Resu
         ForkName::Fulu => upgrade_to_fulu(state, config),
         ForkName::Gloas => upgrade_to_gloas(state, config),
         ForkName::Heze => upgrade_to_heze(state, config),
+        ForkName::Eip8453 => upgrade_to_eip8453(state, config),
         // The `fork:` form, not `state:`: this dispatches on the requested
         // target, so it is the argument that is wrong, not what `state` holds.
         ForkName::Lean => lean_fork_unreachable("upgrade_state"),
