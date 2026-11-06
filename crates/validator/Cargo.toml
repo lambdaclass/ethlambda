@@ -26,10 +26,11 @@ serde_yaml_ng.workspace = true
 hex.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-# `time` for the duty loop's sleep between slots. Declared here rather than
-# relied on through workspace feature unification, so this crate still builds
-# if it is ever compiled on its own.
-tokio = { workspace = true, features = ["time", "macros"] }
+# `time` for the duty loop's sleep between slots, `rt` for `spawn_blocking`,
+# which keeps the slashing-protection record's disk flush off the executor.
+# Declared here rather than relied on through workspace feature unification,
+# so this crate still builds if it is ever compiled on its own.
+tokio = { workspace = true, features = ["time", "macros", "rt"] }
 reqwest = { workspace = true, features = ["json"] }
 
 # BLS12-381. Same version and backend the state transition verifies with, so a
@@ -74,3 +75,15 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
+
+[features]
+# Exposes `SlashingProtection::in_memory` to other crates' tests.
+test-utils = []
+
+# Skipped by a plain `cargo test`: it reads the EIP-3076 interchange vectors,
+# which `make slashing-protection-interchange-tests` downloads, and fails
+# without them. `make test-node` runs it by name.
+[[test]]
+name = "interchange_vectors"
+path = "tests/interchange_vectors.rs"
+test = false

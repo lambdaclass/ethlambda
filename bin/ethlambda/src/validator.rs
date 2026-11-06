@@ -105,6 +105,19 @@ pub(crate) struct ValidatorOptions {
     /// `builder_boost_factor = u64::MAX`).
     #[arg(long, default_value = "false", requires = "builder_proposals")]
     pub(crate) prefer_builder_proposals: bool,
+
+    /// Register every loaded key that has no slashing-protection record,
+    /// instead of refusing to start.
+    ///
+    /// DANGEROUS. Use it only for keys that are brand new, or that have signed
+    /// nothing anywhere for at least two epochs. A key is registered as never
+    /// having signed, so nothing here stops it from signing again what it
+    /// signed elsewhere a moment ago; and two idle epochs rule out a double
+    /// vote, not a surround of an older vote, which only the key's own history
+    /// can. Keys that already have a record keep it, so the flag never lowers
+    /// one; remove it once the keys are registered.
+    #[arg(long, default_value = "false")]
+    pub(crate) init_slashing_protection: bool,
 }
 
 impl ValidatorOptions {
@@ -198,6 +211,7 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
             .enable_keymanager
             .then(|| std::net::SocketAddr::new(options.http_address, options.keymanager_port)),
         builder,
+        init_slashing_protection: options.init_slashing_protection,
     })
     .await
     .map_err(Into::into)
@@ -221,6 +235,7 @@ mod tests {
             builder_proposals: false,
             builder_boost_factor: 100,
             prefer_builder_proposals: false,
+            init_slashing_protection: false,
         }
     }
 

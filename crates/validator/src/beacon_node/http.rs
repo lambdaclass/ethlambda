@@ -732,8 +732,8 @@ impl BeaconNodeApi for HttpBeaconNode {
     ///
     /// A blinded answer is therefore never assumed away. With builder proposals
     /// off (`None`) it is rejected: this client would not publish it through
-    /// `blinded_blocks`, so signing one would burn the slot's proposal guard
-    /// entry for a block that can never be sent. With them on it is decoded as
+    /// `blinded_blocks`, so signing one would burn the slot's slashing-protection
+    /// record for a block that can never be sent. With them on it is decoded as
     /// a blinded block, which `publish_blinded_block` sends.
     async fn produce_block(&self, request: &BlockRequest) -> Result<ProducedBlock> {
         if request.fork >= ForkName::Gloas {

@@ -869,8 +869,11 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   the current and next epoch (`PreferencesService`, v2 duties, signed at the
   proposal epoch's fork version as consensus-specs v1.7.0-beta.4 and every other
   client do), unconditionally, and `produceBlockV4` carries the boost factor.
-  It still keeps no slashing-protection record; PTC votes have an in-memory
-  `(validator, slot)` dedup only, and envelopes are unguarded.
+  It keeps EIP-3076 minimal-watermark slashing protection in
+  `--validators-dir/slashing_protection.json` (`crate::slashing_protection`),
+  durable before every block (blinded ones included) and attestation signature;
+  PTC votes have an in-memory `(validator, slot)` dedup only, and envelopes are
+  unguarded.
   `get_head_node` is one bottom-up walk for every fork, with
   the current slot's fork selecting the payload rules and the boost gate, so a
   follower on any network that schedules gloas (Sepolia does) pays work
