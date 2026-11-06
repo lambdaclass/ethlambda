@@ -93,7 +93,9 @@ fn apply(
             | ForkName::Electra
             | ForkName::Fulu
             | ForkName::Gloas => epoch::altair::process_rewards_and_penalties(state, config),
-            ForkName::Lean => lean_is_not_a_fixture_fork("rewards_and_penalties"),
+            ForkName::Lean | ForkName::Decoupled => {
+                lean_is_not_a_fixture_fork("rewards_and_penalties")
+            }
         },
         // Deneb's own change (EIP-7514's activation-churn cap) is selected
         // internally, by fork, inside `process_registry_updates` itself, so
@@ -119,7 +121,7 @@ fn apply(
             | ForkName::Bellatrix
             | ForkName::Capella
             | ForkName::Deneb => epoch::registry::process_registry_updates(state, config),
-            ForkName::Lean => lean_is_not_a_fixture_fork("registry_updates"),
+            ForkName::Lean | ForkName::Decoupled => lean_is_not_a_fixture_fork("registry_updates"),
         },
         // Altair's and bellatrix's own changes here are scoped to the
         // proportional multiplier `registry::process_slashings` already selects
@@ -142,7 +144,7 @@ fn apply(
             | ForkName::Bellatrix
             | ForkName::Capella
             | ForkName::Deneb => epoch::registry::process_slashings(state, config),
-            ForkName::Lean => lean_is_not_a_fixture_fork("slashings"),
+            ForkName::Lean | ForkName::Decoupled => lean_is_not_a_fixture_fork("slashings"),
         },
         "eth1_data_reset" => epoch::process_eth1_data_reset(state),
         // Phase0 through deneb round each validator toward the single ceiling
@@ -161,7 +163,9 @@ fn apply(
             | ForkName::Bellatrix
             | ForkName::Capella
             | ForkName::Deneb => epoch::process_effective_balance_updates(state),
-            ForkName::Lean => lean_is_not_a_fixture_fork("effective_balance_updates"),
+            ForkName::Lean | ForkName::Decoupled => {
+                lean_is_not_a_fixture_fork("effective_balance_updates")
+            }
         },
         "slashings_reset" => epoch::process_slashings_reset(state),
         "randao_mixes_reset" => epoch::process_randao_mixes_reset(state),
@@ -210,7 +214,9 @@ fn apply(
                     fork: ForkName::Phase0,
                 },
             ),
-            ForkName::Lean => lean_is_not_a_fixture_fork("inactivity_updates"),
+            ForkName::Lean | ForkName::Decoupled => {
+                lean_is_not_a_fixture_fork("inactivity_updates")
+            }
         },
         "participation_flag_updates" => match fork {
             ForkName::Gloas => epoch::gloas::process_participation_flag_updates(state),
@@ -226,7 +232,9 @@ fn apply(
                     fork: ForkName::Phase0,
                 },
             ),
-            ForkName::Lean => lean_is_not_a_fixture_fork("participation_flag_updates"),
+            ForkName::Lean | ForkName::Decoupled => {
+                lean_is_not_a_fixture_fork("participation_flag_updates")
+            }
         },
         // Unmodified in gloas (both sync committees are fork-invariant
         // fields, `BeaconState::sync_committees`/`_mut` already list gloas
@@ -251,7 +259,7 @@ fn apply(
             | ForkName::Capella
             | ForkName::Deneb
             | ForkName::Electra => epoch::electra::process_pending_deposits(state, config),
-            ForkName::Lean => lean_is_not_a_fixture_fork("pending_deposits"),
+            ForkName::Lean | ForkName::Decoupled => lean_is_not_a_fixture_fork("pending_deposits"),
         },
         // Gloas-only: a second handler over the very same `process_pending_deposits`
         // (its cases are named `activation_churn__*`), split out from
@@ -279,7 +287,9 @@ fn apply(
                     fork,
                 },
             ),
-            ForkName::Lean => lean_is_not_a_fixture_fork("pending_consolidations"),
+            ForkName::Lean | ForkName::Decoupled => {
+                lean_is_not_a_fixture_fork("pending_consolidations")
+            }
         },
         // New in fulu (EIP-7917). Gloas keeps `proposer_lookahead` itself
         // unchanged from fulu too, and `epoch::fulu::process_proposer_lookahead`
@@ -299,7 +309,9 @@ fn apply(
                     fork,
                 },
             ),
-            ForkName::Lean => lean_is_not_a_fixture_fork("proposer_lookahead"),
+            ForkName::Lean | ForkName::Decoupled => {
+                lean_is_not_a_fixture_fork("proposer_lookahead")
+            }
         },
         // New in gloas (EIP-7732); no earlier fork has either handler at all.
         "builder_pending_payments" => epoch::gloas::process_builder_pending_payments(state),

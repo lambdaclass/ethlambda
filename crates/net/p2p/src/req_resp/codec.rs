@@ -231,6 +231,9 @@ impl libp2p::request_response::Codec for Codec {
             lean_protocols::BLOCKS_BY_ROOT_V1 | lean_protocols::BLOCKS_BY_RANGE_V1 => {
                 lean_encoding::decode_blocks_response(io, label).await
             }
+            lean_protocols::DECOUPLED_BLOCKS_BY_ROOT_V1 => {
+                lean_encoding::decode_decoupled_blocks_response(io, label).await
+            }
             protocols::STATUS_V1 | protocols::STATUS_V2 => {
                 decode_single_chunk(io, protocol.as_ref(), label, |protocol, payload| {
                     beacon_encoding::decode_status(protocol, payload).map(ResponsePayload::Status)
@@ -364,6 +367,9 @@ impl libp2p::request_response::Codec for Codec {
                     .map_err(|err| invalid(format!("{err:?}")))?
                     .to_ssz()
             }
+            Request::DecoupledBlocksByRoot(roots) => {
+                lean_encoding::encode_decoupled_blocks_by_root(roots)?
+            }
         };
 
         let compressed_size = write_payload(io, &encoded).await?;
@@ -439,6 +445,9 @@ impl libp2p::request_response::Codec for Codec {
                         envelopes,
                     )
                     .await
+                }
+                ResponsePayload::DecoupledBlocks(blocks) => {
+                    lean_encoding::write_decoupled_blocks_response(io, label, blocks).await
                 }
             },
             Response::Error { code, message } => {

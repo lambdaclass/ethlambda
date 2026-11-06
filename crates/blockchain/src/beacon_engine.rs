@@ -80,6 +80,7 @@ pub fn gloas_new_payload_request<'a>(
         | SignedBeaconBlock::Deneb(_)
         | SignedBeaconBlock::Electra(_)
         | SignedBeaconBlock::Fulu(_)
+        | SignedBeaconBlock::Decoupled(_)
         | SignedBeaconBlock::Lean(_) => return mismatch("the block is not a gloas block"),
     };
 
@@ -126,6 +127,25 @@ pub fn gloas_new_payload_request<'a>(
 pub fn new_payload_request(block: &SignedBeaconBlock) -> Option<NewPayloadRequest<'_>> {
     let inner = match block {
         SignedBeaconBlock::Electra(inner) | SignedBeaconBlock::Fulu(inner) => inner,
+        // The decoupled body's payload, commitments and requests are fulu's,
+        // so the engine is asked the same question.
+        SignedBeaconBlock::Decoupled(inner) => {
+            let versioned_hashes = inner
+                .message
+                .body
+                .blob_kzg_commitments
+                .iter()
+                .map(kzg_commitment_to_versioned_hash)
+                .collect();
+            return Some(NewPayloadRequest {
+                execution_payload: &inner.message.body.execution_payload,
+                versioned_hashes,
+                parent_beacon_block_root: inner.message.parent_root,
+                execution_requests: get_execution_requests_list(
+                    &inner.message.body.execution_requests,
+                ),
+            });
+        }
         SignedBeaconBlock::Phase0(_)
         | SignedBeaconBlock::Altair(_)
         | SignedBeaconBlock::Bellatrix(_)

@@ -115,7 +115,9 @@ async fn post_pool_attestations(
     for (index, attestation) in attestations.into_iter().enumerate() {
         let slot = attestation.data.slot;
         let validator = attestation.attester_index;
-        let checked = if header_matches_slot(&store, header_fork, slot) {
+        let checked = if in_decoupled_fork(&store, slot) {
+            Err(DECOUPLED_SLOT)
+        } else if header_matches_slot(&store, header_fork, slot) {
             validate(&store, &state, &attestation, now_ms)
         } else {
             Err("Eth-Consensus-Version does not match the attestation slot's fork")
@@ -295,6 +297,10 @@ fn submission_fork(headers: &HeaderMap) -> Result<ForkName, ApiError> {
         .and_then(ForkName::parse);
     match fork {
         Some(fork @ (ForkName::Electra | ForkName::Fulu | ForkName::Gloas)) => Ok(fork),
+        // The decoupled fork has no attestations or aggregates to submit.
+        Some(ForkName::Decoupled) => Err(ApiError::BadRequest(
+            "attestations and aggregates are not available in the decoupled fork",
+        )),
         // `ForkName::parse` never returns Lean: it is absent from `ALL`.
         Some(
             ForkName::Phase0
@@ -309,6 +315,14 @@ fn submission_fork(headers: &HeaderMap) -> Result<ForkName, ApiError> {
         )),
     }
 }
+
+/// Whether `slot` is in the decoupled fork, whose slots have no attestations
+/// or aggregates.
+fn in_decoupled_fork(store: &Store, slot: Slot) -> bool {
+    store.config().fork_at_epoch(compute_epoch_at_slot(slot)) == ForkName::Decoupled
+}
+
+const DECOUPLED_SLOT: &str = "not available in the decoupled fork";
 
 /// Whether `header` is a version the fork at `slot` accepts: gloas's slots need
 /// the gloas header, and electra's and fulu's, whose containers are the same,
@@ -386,7 +400,9 @@ async fn post_aggregate_and_proofs(
         // The stateful checks resolve the aggregate's bits to the validators
         // behind them, which the chain actor applies to fork choice once the
         // network actor hands it over.
-        let checked = if header_matches_slot(&store, header_fork, slot) {
+        let checked = if in_decoupled_fork(&store, slot) {
+            Err(DECOUPLED_SLOT)
+        } else if header_matches_slot(&store, header_fork, slot) {
             aggregate::cheap_checks(&seen, &store, &aggregate, now_ms)
                 .and_then(|()| aggregate::stateful_checks(&store, &aggregate))
                 .map_err(|outcome: Outcome| {
@@ -454,6 +470,14 @@ async fn get_aggregate_attestation(
     Extension(engine): Extension<Option<EngineClient>>,
     Query(query): Query<AggregateQuery>,
 ) -> Response {
+    // Ahead of the engine check, like block production's slot check: a slot
+    // with no attestations is a 400 on any node.
+    if in_decoupled_fork(&store, query.slot) {
+        return ApiError::BadRequest(
+            "aggregate attestations are not available in the decoupled fork",
+        )
+        .into_response();
+    }
     if let Err(err) = require_execution_client(&engine) {
         return err.into_response();
     }
@@ -545,7 +569,7 @@ mod tests {
         let wall_epoch = compute_epoch_at_slot(crate::beacon::node::wall_slot(&probe));
         let head_slot = compute_start_slot_at_epoch(wall_epoch) - slots_back;
         match &mut state {
-            BeaconState::Fulu(fulu) => fulu.slot = head_slot,
+            BeaconState::Fulu(fulu) | BeaconState::Decoupled(fulu) => fulu.slot = head_slot,
             BeaconState::Gloas(gloas) => gloas.slot = head_slot,
             _ => unreachable!("built as fulu or gloas"),
         }

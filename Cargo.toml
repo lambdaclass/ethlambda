@@ -4,6 +4,7 @@ default-members = ["bin/ethlambda"]
 members = [
     "bin/ethlambda",
     "crates/blockchain",
+    "crates/blockchain/decoupled",
     "crates/blockchain/fork_choice",
     "crates/blockchain/state_transition",
     "crates/common/crypto",
@@ -67,6 +68,7 @@ overflow-checks = false
 
 [workspace.dependencies]
 ethlambda-blockchain = { path = "crates/blockchain" }
+ethlambda-decoupled = { path = "crates/blockchain/decoupled" }
 ethlambda-fork-choice = { path = "crates/blockchain/fork_choice" }
 ethlambda-state-transition = { path = "crates/blockchain/state_transition" }
 ethlambda-crypto = { path = "crates/common/crypto" }

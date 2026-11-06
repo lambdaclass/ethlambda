@@ -47,8 +47,9 @@ use ethlambda_blockchain::key_manager::{KeyRole, ValidatorKeyPair};
 use ethlambda_crypto::signature::ValidatorSecretKey;
 use ethlambda_engine::{EngineClient, JwtSecret};
 use ethlambda_network_api::{
-    BlockArrival, InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef,
-    ToRpcToP2PRef,
+    BlockArrival, InitBlockChain, InitDecoupledChain, InitDecoupledP2P, InitP2P,
+    SharedDecoupledBlocks, ToBlockChainToP2PRef, ToDecoupledToP2PRef, ToP2PToBlockChainRef,
+    ToP2PToDecoupledRef, ToRpcToP2PRef,
 };
 use ethlambda_p2p::{
     LeanWireConfig, P2P, PeerId, SwarmConfig, WireConfig, attestation_subscription_subnets,
@@ -60,7 +61,8 @@ use ethlambda_types::{
     aggregator::AggregatorController,
     beacon::config::Config,
     beacon::containers::{
-        BeaconState, SignedBeaconBlock, altair, bellatrix, capella, deneb, electra, gloas, phase0,
+        BeaconState, SignedBeaconBlock, altair, bellatrix, capella, decoupled, deneb, electra,
+        gloas, phase0,
     },
     beacon::fork::ForkName,
     beacon::primitives::Epoch,
@@ -229,6 +231,9 @@ fn init_info_stderr_logging() -> eyre::Result<()> {
 /// assemble once the chain-specific half is done.
 struct RunningNode {
     p2p: P2P,
+    /// The decoupled-consensus chain actor of a lean node running that
+    /// protocol, beside the (then passive) 3SF-mini one.
+    decoupled: Option<ethlambda_blockchain::decoupled_lean::DecoupledLean>,
     /// The chain actor, on both lean and mainnet: the beacon follower runs one
     /// too, so there is always exactly one to stop and join. `run_node`
     /// spawns and wires it before building this struct, which is what keeps
@@ -280,6 +285,9 @@ enum ChainActor {
         /// The checkpoint-sync URLs to ask for a gloas anchor's execution
         /// payload envelope; empty when there is nothing to ask.
         anchor_envelope_urls: Vec<String>,
+        /// The decoupled fork's shared engine, when the network schedules the
+        /// fork.
+        decoupled: Option<ethlambda_state_transition::beacon::decoupled_node::SharedDecoupledNode>,
     },
 }
 
@@ -311,6 +319,16 @@ struct ChainSetup {
     /// What to spawn this chain's actor with: lean's validator keys and duty
     /// configuration, or beacon's custody columns and data-availability flag.
     chain: ChainActor,
+    /// A lean node running the decoupled protocol: its chain actor's
+    /// configuration. The validator keys go to it rather than to `chain`.
+    decoupled: Option<DecoupledSetup>,
+}
+
+/// What [`ethlambda_blockchain::decoupled_lean::DecoupledLean::spawn`] needs.
+struct DecoupledSetup {
+    config: ethlambda_blockchain::decoupled_lean::DecoupledLeanConfig,
+    validator_keys: HashMap<u64, ValidatorKeyPair>,
+    blocks: SharedDecoupledBlocks,
 }
 
 /// Boot the node, on whichever chain [`Options::network`] names.
@@ -424,7 +442,10 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         Network::Lean(_) => None,
         Network::Mainnet { mainnet, .. } => {
             let spec = network::NetworkSpec::parse(&mainnet.network)?;
-            Some(network::NetworkSource::resolve(&spec)?)
+            Some(network::NetworkSource::resolve_with(
+                &spec,
+                &network::ConfigOverrides::from(mainnet),
+            )?)
         }
     };
 
@@ -537,7 +558,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                 attestation_committee_count,
             );
 
-            let validator_keys =
+            let mut validator_keys =
                 read_validator_keys(&validators_path, &validator_keys_dir, &lean.node_id)
                     .wrap_err("failed to load validator keys")?;
 
@@ -595,12 +616,27 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                 },
             };
 
+            // A decoupled node hands its keys to the decoupled chain actor and
+            // keeps the 3SF-mini one keyless: it then only ticks, and owns the
+            // store the rest of the node is wired to.
+            let decoupled = if lean.decoupled || genesis_config.decoupled.enabled {
+                let setup = decoupled_setup(
+                    &genesis_config,
+                    lean.decoupled_slots_per_round,
+                    std::mem::take(&mut validator_keys),
+                )?;
+                Some(setup)
+            } else {
+                None
+            };
+
             ChainSetup {
                 wire: WireConfig::Lean(LeanWireConfig {
                     validator_ids,
                     attestation_committee_count,
                     subscription_subnets: subscribed_subnets.clone(),
                     milliseconds_per_slot: genesis_config.milliseconds_per_slot,
+                    decoupled: decoupled.as_ref().map(|setup| setup.blocks.clone()),
                 }),
                 discovery: DiscoveryWireEntries {
                     subscription_subnets: subscribed_subnets,
@@ -611,6 +647,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                 store,
                 node_names,
                 chain: ChainActor::Lean(validator_keys, blockchain_config),
+                decoupled,
             }
         }
         // The Ethereum Beacon Chain follower: the wire plus a duty-free chain
@@ -666,6 +703,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                 fetch_initial_beacon_state(&clean_checkpoint_urls, backend.clone(), &source)
                     .await
                     .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
+            let decoupled_node = beacon_decoupled_node(&store)?;
 
             let engine = match &execution {
                 None => {
@@ -721,7 +759,9 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     safe_slots_to_import_optimistically: mainnet
                         .safe_slots_to_import_optimistically,
                     anchor_envelope_urls: clean_checkpoint_urls.clone(),
+                    decoupled: decoupled_node,
                 },
+                decoupled: None,
             }
         }
     };
@@ -792,6 +832,9 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     let shutdown = CancellationToken::new();
     let rpc_shutdown = shutdown.clone();
     let rpc_store = setup.store.clone();
+    let decoupled_status = ethlambda_types::decoupled::SharedDecoupledStatus::default();
+    let rpc_decoupled_status = decoupled_status.clone();
+    let decoupled_setup_for_spawn = setup.decoupled;
     let rpc_aggregator = aggregator.clone();
     let rpc_sync_status = sync_status.clone();
     let rpc_events = events.clone();
@@ -818,6 +861,17 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         ChainActor::Beacon { engine, .. } => engine.clone(),
         ChainActor::Lean(..) => None,
     };
+    let beacon_decoupled = match &setup.chain {
+        ChainActor::Beacon { decoupled, .. } => decoupled.clone(),
+        ChainActor::Lean(..) => None,
+    };
+    if let Some(node) = &beacon_decoupled {
+        p2p.actor_ref()
+            .recipient::<ethlambda_p2p::SetDecoupledNode>()
+            .send(ethlambda_p2p::SetDecoupledNode(node.clone()))
+            .inspect_err(|err| error!(%err, "Failed to hand the decoupled node to p2p"))?;
+    }
+    let rpc_decoupled = beacon_decoupled.clone();
 
     // Which HTTP surface this node serves follows from the store's own chain
     // tag rather than from the sub-command, so the two can never disagree.
@@ -842,6 +896,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     events: rpc_events,
                     client_version: version::engine_client_version(),
                     identity: rpc_identity,
+                    decoupled: rpc_decoupled,
                 },
                 local_peer_id,
                 rpc_shutdown,
@@ -855,6 +910,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                 rpc_sync_status,
                 local_peer_id,
                 rpc_events,
+                rpc_decoupled_status,
                 rpc_shutdown,
             )
             .await
@@ -872,6 +928,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             engine,
             safe_slots_to_import_optimistically,
             anchor_envelope_urls,
+            decoupled,
         } => {
             check_custody_set(&custody_columns)?;
             anchor_envelope_fetch = missing_anchor_envelope_root(&setup.store)
@@ -884,12 +941,41 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                 custody_columns,
                 engine,
                 safe_slots_to_import_optimistically,
+                decoupled,
             )
         }
     };
 
     let p2p_ref = p2p.actor_ref();
     let p2p_to_block_chain = p2p_ref.to_block_chain_to_p2p_ref();
+
+    let decoupled = match decoupled_setup_for_spawn {
+        Some(setup) => {
+            let chain = ethlambda_blockchain::decoupled_lean::DecoupledLean::spawn(
+                setup.config,
+                setup.validator_keys,
+                backend.clone(),
+                setup.blocks,
+                decoupled_status.clone(),
+            );
+            chain
+                .actor_ref()
+                .recipient::<InitDecoupledP2P>()
+                .send(InitDecoupledP2P {
+                    p2p: p2p_ref.to_decoupled_to_p2p_ref(),
+                })
+                .inspect_err(|err| error!(%err, "Failed to wire the decoupled chain to p2p"))?;
+            p2p_ref
+                .recipient::<InitDecoupledChain>()
+                .send(InitDecoupledChain {
+                    chain: chain.actor_ref().to_p2p_to_decoupled_ref(),
+                })
+                .inspect_err(|err| error!(%err, "Failed to wire p2p to the decoupled chain"))?;
+            info!("Running the decoupled consensus protocol");
+            Some(chain)
+        }
+        None => None,
+    };
 
     // Wire actors together via protocol refs
     blockchain
@@ -926,12 +1012,148 @@ async fn run_node(options: Options) -> eyre::Result<()> {
 
     wait_for_shutdown(RunningNode {
         p2p,
+        decoupled,
         blockchain,
         http,
         shutdown,
     })
     .await;
     Ok(())
+}
+
+/// The decoupled fork's shared engine for a beacon network that schedules
+/// the fork, or `None`.
+///
+/// Only activation at genesis is supported: the engine is anchored at the
+/// genesis block, which every node agrees on. Activating it mid-chain would
+/// need an anchor agreed across nodes at the boundary (the legacy finalized
+/// block is the natural one) and a rule for the first decoupled proposals,
+/// which have no previous-slot Goldfish votes to walk by.
+///
+/// The electorate is the genesis registry weighted by effective balance in
+/// increments, fixed for the run as the protocol assumes. Blocks a previous
+/// run stored are replayed, so a restarted node rebuilds the engine.
+fn beacon_decoupled_node(
+    store: &Store,
+) -> eyre::Result<Option<ethlambda_state_transition::beacon::decoupled_node::SharedDecoupledNode>> {
+    use ethlambda_state_transition::beacon::decoupled_node::DecoupledNode;
+    use ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
+    use ethlambda_types::beacon::preset::EFFECTIVE_BALANCE_INCREMENT;
+
+    let config = store.config();
+    if config.decoupled_fork_epoch == FAR_FUTURE_EPOCH {
+        return Ok(None);
+    }
+    eyre::ensure!(
+        config.decoupled_fork_epoch == 0,
+        "the decoupled fork is only supported from genesis (DECOUPLED_FORK_EPOCH: 0), got {}",
+        config.decoupled_fork_epoch
+    );
+    // The legacy finalized checkpoint never moves in this fork, so it is the
+    // genesis anchor on a fresh directory and on a resumed one alike.
+    let anchor = store.beacon_finalized_checkpoint();
+    eyre::ensure!(
+        anchor.epoch == 0,
+        "a decoupled network must be anchored at genesis, not at epoch {}",
+        anchor.epoch
+    );
+    let state = store
+        .get_state(&anchor.root)
+        .map_err(|err| eyre::eyre!("{err}"))?
+        .ok_or_else(|| eyre::eyre!("no genesis state to weigh the decoupled electorate with"))?;
+    let weights = state
+        .iter_validators()
+        .map(|validator| {
+            let active = validator.activation_epoch == 0 && validator.exit_epoch > 0;
+            if active {
+                validator.effective_balance / EFFECTIVE_BALANCE_INCREMENT
+            } else {
+                0
+            }
+        })
+        .collect::<Vec<_>>();
+    let validators = weights.iter().filter(|w| **w > 0).count();
+    let node = DecoupledNode::new(&config, anchor.root, weights).shared();
+    let replayed = ethlambda_blockchain::decoupled_beacon::replay(store, &node);
+    info!(
+        genesis_root = %ethlambda_types::ShortRoot(&anchor.root.0),
+        validators,
+        slots_per_round = config.decoupled_slots_per_round,
+        replayed,
+        "Running the decoupled fork from genesis"
+    );
+    Ok(Some(node))
+}
+
+/// The decoupled chain actor's configuration for a lean network.
+///
+/// The genesis block is `DecoupledBlock::genesis` over the 3SF-mini genesis
+/// state's root, so it commits to the genesis time and the validator set.
+/// `Δ` is a quarter slot, so the slot duration must be a multiple of four
+/// milliseconds.
+fn decoupled_setup(
+    genesis: &GenesisConfig,
+    slots_per_round_override: Option<u64>,
+    validator_keys: HashMap<u64, ValidatorKeyPair>,
+) -> eyre::Result<DecoupledSetup> {
+    let keys = &genesis.decoupled;
+    let slots_per_round = slots_per_round_override
+        .or(keys.slots_per_round)
+        .unwrap_or(3);
+    let mut params = ethlambda_decoupled::Params::with_round_length(slots_per_round);
+    if let Some(window) = keys.sg_window {
+        params.eta_sg = window;
+    }
+    if let Some(period) = keys.nonjustifiable_period {
+        params.k = period;
+    }
+    if let Some(debt) = keys.finality_debt {
+        params.d = debt;
+    }
+    if let Some(delay) = keys.timeout_delay {
+        params.timeout_delay = delay;
+    }
+    params
+        .validate()
+        .map_err(|err| eyre::eyre!("invalid decoupled consensus parameters: {err}"))?;
+    eyre::ensure!(
+        genesis.milliseconds_per_slot.is_multiple_of(4),
+        "the decoupled protocol needs a slot duration divisible by 4 ms (Δ = slot / 4), got {}",
+        genesis.milliseconds_per_slot
+    );
+    let genesis_state = State::from_genesis(genesis.genesis_time, genesis.validators());
+    let genesis_root =
+        ethlambda_blockchain::decoupled_lean::genesis_root(genesis_state.hash_tree_root());
+    let validators = genesis
+        .genesis_validators
+        .iter()
+        .map(|entry| {
+            (
+                entry.attestation_pubkey.to_vec(),
+                entry.proposal_pubkey.to_vec(),
+            )
+        })
+        .collect();
+    info!(
+        slots_per_round = params.slots_per_round,
+        sg_window = params.eta_sg,
+        nonjustifiable_period = params.k,
+        finality_debt = params.d,
+        timeout_delay = params.timeout_delay,
+        genesis_root = %ethlambda_types::ShortRoot(&genesis_root.0),
+        "Decoupled consensus configured"
+    );
+    Ok(DecoupledSetup {
+        config: ethlambda_blockchain::decoupled_lean::DecoupledLeanConfig {
+            params,
+            genesis_time_ms: genesis.genesis_time * 1000,
+            slot_duration_ms: genesis.milliseconds_per_slot,
+            genesis_root,
+            validators,
+        },
+        validator_keys,
+        blocks: SharedDecoupledBlocks::default(),
+    })
 }
 
 /// The root of the anchor block when it is a gloas block whose execution
@@ -1000,12 +1222,22 @@ async fn wait_for_shutdown(node: RunningNode) {
 
     let blockchain_ref = node.blockchain.actor_ref().clone();
     let p2p_ref = node.p2p.actor_ref().clone();
+    let decoupled_ref = node
+        .decoupled
+        .as_ref()
+        .map(|chain| chain.actor_ref().clone());
 
     blockchain_ref.context().stop();
+    if let Some(decoupled) = &decoupled_ref {
+        decoupled.context().stop();
+    }
     p2p_ref.context().stop();
     node.shutdown.cancel();
 
     blockchain_ref.join().await;
+    if let Some(decoupled) = decoupled_ref {
+        decoupled.join().await;
+    }
     p2p_ref.join().await;
     let _ = node.http.await;
 
@@ -1679,6 +1911,16 @@ fn first_config_difference(
         electra_fork_epoch: _,
         fulu_fork_version: _,
         fulu_fork_epoch: _,
+        // The decoupled fork's version and epoch are compared per fork below
+        // like every other fork's; its protocol parameters are consensus
+        // rules, compared below with the other chain values.
+        decoupled_fork_version: _,
+        decoupled_fork_epoch: _,
+        decoupled_slots_per_round: _,
+        decoupled_sg_window: _,
+        decoupled_nonjustifiable_period: _,
+        decoupled_finality_debt: _,
+        decoupled_timeout_delay: _,
         gloas_fork_version: _,
         gloas_fork_epoch: _,
 
@@ -1857,6 +2099,11 @@ fn first_config_difference(
     }
 
     compare!(
+        decoupled_slots_per_round,
+        decoupled_sg_window,
+        decoupled_nonjustifiable_period,
+        decoupled_finality_debt,
+        decoupled_timeout_delay,
         seconds_per_slot,
         slot_duration_ms,
         min_validator_withdrawability_delay,
@@ -2231,6 +2478,16 @@ fn genesis_anchor_block(state: &BeaconState) -> SignedBeaconBlock {
                 parent_root,
                 state_root,
                 body: electra::BeaconBlockBody::empty(),
+            },
+            signature: Default::default(),
+        }),
+        ForkName::Decoupled => SignedBeaconBlock::Decoupled(decoupled::SignedBeaconBlock {
+            message: decoupled::BeaconBlock {
+                slot,
+                proposer_index,
+                parent_root,
+                state_root,
+                body: decoupled::BeaconBlockBody::empty(),
             },
             signature: Default::default(),
         }),
@@ -2617,6 +2874,7 @@ validators:
                 attestation_pubkey: [1u8; PUBLIC_KEY_SIZE],
                 proposal_pubkey: [2u8; PUBLIC_KEY_SIZE],
             }],
+            decoupled: Default::default(),
         }
     }
 
@@ -3339,7 +3597,12 @@ validators:
         let config = Config::mainnet();
         let mut state = beacon::mainnet_genesis_state().unwrap();
 
-        for fork in ForkName::ALL {
+        // Decoupled is a sibling of gloas, not a step before it: it has its own
+        // test below.
+        for fork in ForkName::ALL
+            .into_iter()
+            .filter(|fork| *fork != ForkName::Decoupled)
+        {
             if fork != ForkName::Phase0 {
                 state = ethlambda_state_transition::beacon::upgrade::upgrade_state(
                     &state, fork, &config,
@@ -3356,6 +3619,7 @@ validators:
                 ForkName::Electra | ForkName::Fulu => {
                     electra::BeaconBlockBody::empty().hash_tree_root()
                 }
+                ForkName::Decoupled => unreachable!("filtered out above"),
                 ForkName::Gloas => gloas::BeaconBlockBody::empty().hash_tree_root(),
                 ForkName::Lean => unreachable!("ForkName::ALL excludes Lean"),
             };
@@ -3371,6 +3635,34 @@ validators:
                 "invariant broke at fork {fork:?}"
             );
         }
+    }
+
+    /// A fulu genesis taken through the decoupled fork at epoch 0 anchors on a
+    /// decoupled block whose root is the genesis header's.
+    #[test]
+    fn a_decoupled_genesis_anchor_block_hashes_to_the_states_own_header() {
+        let config = Config::mainnet();
+        let mut state = beacon::mainnet_genesis_state().unwrap();
+        for fork in [
+            ForkName::Altair,
+            ForkName::Bellatrix,
+            ForkName::Capella,
+            ForkName::Deneb,
+            ForkName::Electra,
+            ForkName::Fulu,
+        ] {
+            state =
+                ethlambda_state_transition::beacon::upgrade::upgrade_state(&state, fork, &config)
+                    .unwrap();
+        }
+        let state = beacon::genesis_at_decoupled(state, &config);
+        assert_eq!(state.fork_name(), ForkName::Decoupled);
+
+        let block = genesis_anchor_block(&state);
+        assert_eq!(block.fork_name(), ForkName::Decoupled);
+        let mut header = state.latest_block_header().clone();
+        header.state_root = state.hash_tree_root();
+        assert_eq!(block.message_hash_tree_root(), header.hash_tree_root());
     }
 
     /// A unique path under the OS temp dir, so parallel test runs cannot

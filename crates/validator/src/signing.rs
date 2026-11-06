@@ -8,12 +8,14 @@
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::constants::{
     DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_BUILDER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
-    DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_COMBINED_ATTESTATION, DOMAIN_CONTRIBUTION_AND_PROOF,
+    DOMAIN_GOLDFISH_VOTE, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF,
+    DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
 };
 use ethlambda_types::beacon::containers::altair::{
     ContributionAndProof, SyncAggregatorSelectionData,
 };
+use ethlambda_types::beacon::containers::decoupled::GoldfishVoteData;
 use ethlambda_types::beacon::containers::gloas::{
     ExecutionPayloadEnvelope, PayloadAttestationData,
 };
@@ -22,6 +24,7 @@ use ethlambda_types::beacon::primitives::{
     BLS_SIGNATURE_SIZE, BlsPubkey, BlsSignature, Domain, DomainType, Epoch, HashTreeRoot as _,
     Root, Slot,
 };
+use ethlambda_types::decoupled::AttestationData as DecoupledAttestationData;
 // `AttestationData`, `Checkpoint`, `Fork` and `SigningData` all live in
 // `containers::shared`, verified against `containers/shared.rs:158,120,97,220`.
 use ethlambda_types::beacon::signing::{
@@ -150,6 +153,28 @@ impl SigningContext {
     /// message wrapper and is deliberately not signed over.
     pub fn payload_attestation_signing_root(&self, data: &PayloadAttestationData) -> Root {
         let domain = self.domain(DOMAIN_PTC_ATTESTER, compute_epoch_at_slot(data.slot));
+        compute_signing_root(data.hash_tree_root(), domain)
+    }
+
+    /// The root a Goldfish vote is computed over: the `(slot, head)` data under
+    /// the Goldfish domain at the epoch of the vote's slot. The voter is not
+    /// signed over, so votes with one view aggregate.
+    pub fn goldfish_vote_signing_root(&self, data: &GoldfishVoteData) -> Root {
+        let domain = self.domain(DOMAIN_GOLDFISH_VOTE, compute_epoch_at_slot(data.slot));
+        compute_signing_root(data.hash_tree_root(), domain)
+    }
+
+    /// The root a combined attestation is computed over: its data under the
+    /// combined attestation domain at the epoch of the round's opening slot
+    /// (`round * DECOUPLED_SLOTS_PER_ROUND`), not of the slot it is cast in.
+    pub fn combined_attestation_signing_root(&self, data: &DecoupledAttestationData) -> Root {
+        let opening_slot = data
+            .round
+            .saturating_mul(self.config.decoupled_slots_per_round);
+        let domain = self.domain(
+            DOMAIN_COMBINED_ATTESTATION,
+            compute_epoch_at_slot(opening_slot),
+        );
         compute_signing_root(data.hash_tree_root(), domain)
     }
 
@@ -297,6 +322,33 @@ impl SigningContext {
         self.sign_root(store, pubkey, self.envelope_signing_root(envelope, slot))
     }
 
+    /// Sign a Goldfish vote on behalf of `pubkey`.
+    ///
+    /// Guarded by [`crate::decoupled`], which refuses a second vote for a slot
+    /// and persists that refusal across restarts.
+    pub fn sign_goldfish_vote(
+        &self,
+        store: &ValidatorStore,
+        pubkey: &BlsPubkey,
+        data: &GoldfishVoteData,
+    ) -> Result<BlsSignature> {
+        self.sign_root(store, pubkey, self.goldfish_vote_signing_root(data))
+    }
+
+    /// Sign a combined attestation on behalf of `pubkey`.
+    ///
+    /// Slashable under the decoupled protocol's E1 and E2 rules, which is why
+    /// the data only ever comes out of [`crate::decoupled`]'s anti-slashing
+    /// record; this method signs whatever it is handed.
+    pub fn sign_combined_attestation(
+        &self,
+        store: &ValidatorStore,
+        pubkey: &BlsPubkey,
+        data: &DecoupledAttestationData,
+    ) -> Result<BlsSignature> {
+        self.sign_root(store, pubkey, self.combined_attestation_signing_root(data))
+    }
+
     /// Sign a payload timeliness committee vote on behalf of `pubkey`.
     ///
     /// Not slashable by the specification, and deduplicated per validator and
@@ -384,6 +436,7 @@ impl SigningContext {
 mod tests {
     use super::*;
     use ethlambda_types::beacon::containers::shared::Checkpoint;
+    use ethlambda_types::beacon::fork::ForkName;
     use ethlambda_types::beacon::preset;
 
     fn secret() -> [u8; 32] {
@@ -766,5 +819,115 @@ mod tests {
             .sign_randao(&store, &BlsPubkey::default(), 1)
             .expect_err("must fail");
         assert!(matches!(err, Error::UnknownValidator(_)), "got {err:?}");
+    }
+
+    const DECOUPLED_EPOCH: Epoch = 10;
+
+    fn decoupled_context() -> SigningContext {
+        let mut config = Config::mainnet().with_fork_epoch(ForkName::Decoupled, DECOUPLED_EPOCH);
+        config.decoupled_slots_per_round = 4;
+        SigningContext {
+            config,
+            genesis_validators_root: Root::repeat_byte(7),
+        }
+    }
+
+    fn verifies(pubkey: &BlsPubkey, signature: &BlsSignature, root: Root) -> bool {
+        use blst::min_pk::{PublicKey, Signature};
+        let pk = PublicKey::from_bytes(&pubkey.0).expect("valid pubkey");
+        let sig = Signature::from_bytes(&signature.0).expect("valid signature");
+        sig.verify(true, root.as_slice(), DST, &[], &pk, true) == blst::BLST_ERROR::BLST_SUCCESS
+    }
+
+    /// Rebuilds the root the way the specification states it, from the fork
+    /// version up, so the assertion does not run through `SigningContext`.
+    fn expected_root(
+        object_root: Root,
+        domain_type: DomainType,
+        fork_version: [u8; 4],
+        gvr: Root,
+    ) -> Root {
+        compute_signing_root(object_root, compute_domain(domain_type, fork_version, gvr))
+    }
+
+    #[test]
+    fn a_goldfish_vote_signs_under_the_goldfish_domain_at_the_votes_epoch() {
+        let context = decoupled_context();
+        let data = GoldfishVoteData {
+            slot: DECOUPLED_EPOCH * preset::SLOTS_PER_EPOCH + 3,
+            head: Root::repeat_byte(9),
+        };
+        let expected = expected_root(
+            data.hash_tree_root(),
+            DOMAIN_GOLDFISH_VOTE,
+            context.config.decoupled_fork_version,
+            Root::repeat_byte(7),
+        );
+        assert_eq!(context.goldfish_vote_signing_root(&data), expected);
+
+        let mut store = ValidatorStore::new();
+        let pubkey = store.insert_secret("test", &secret()).expect("inserts");
+        let signature = context
+            .sign_goldfish_vote(&store, &pubkey, &data)
+            .expect("signs");
+        assert!(verifies(&pubkey, &signature, expected));
+
+        // Not the combined attestation's domain.
+        let other = expected_root(
+            data.hash_tree_root(),
+            DOMAIN_COMBINED_ATTESTATION,
+            context.config.decoupled_fork_version,
+            Root::repeat_byte(7),
+        );
+        assert!(!verifies(&pubkey, &signature, other));
+    }
+
+    #[test]
+    fn a_combined_attestation_signs_at_the_epoch_of_the_rounds_opening_slot() {
+        let context = decoupled_context();
+        let first_round = DECOUPLED_EPOCH * preset::SLOTS_PER_EPOCH / 4;
+        let data =
+            |round| DecoupledAttestationData::new(round, Some(Root::repeat_byte(3)), None, None);
+
+        // A round opening in the decoupled fork.
+        let inside = data(first_round + 1);
+        assert_eq!(
+            context.combined_attestation_signing_root(&inside),
+            expected_root(
+                inside.hash_tree_root(),
+                DOMAIN_COMBINED_ATTESTATION,
+                context.config.decoupled_fork_version,
+                Root::repeat_byte(7),
+            )
+        );
+
+        // A round that opened one slot before the fork signs under the old
+        // fork's version (whatever precedes it) even though it is cast after the fork: the epoch is
+        // the opening slot's, as the state transition verifies it.
+        let straddling = data(first_round - 1);
+        let before = context
+            .config
+            .fork_version(context.config.fork_at_epoch(DECOUPLED_EPOCH - 1));
+        assert_ne!(before, context.config.decoupled_fork_version);
+        assert_eq!(
+            context.combined_attestation_signing_root(&straddling),
+            expected_root(
+                straddling.hash_tree_root(),
+                DOMAIN_COMBINED_ATTESTATION,
+                before,
+                Root::repeat_byte(7),
+            )
+        );
+
+        let mut store = ValidatorStore::new();
+        let pubkey = store.insert_secret("test", &secret()).expect("inserts");
+        let signature = context
+            .sign_combined_attestation(&store, &pubkey, &inside)
+            .expect("signs");
+        assert!(verifies(
+            &pubkey,
+            &signature,
+            context.combined_attestation_signing_root(&inside)
+        ));
     }
 }

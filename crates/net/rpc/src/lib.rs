@@ -19,6 +19,7 @@ mod admin;
 mod base;
 mod beacon;
 mod blocks;
+mod decoupled;
 mod events;
 mod fork_choice;
 mod genesis;
@@ -67,6 +68,9 @@ pub async fn start_test_driver_rpc_server(
     Ok(())
 }
 
+// One handle per shared surface the lean API serves; bundling them would only
+// move the list into a struct every caller builds field by field anyway.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_rpc_server(
     config: RpcConfig,
     store: Store,
@@ -74,12 +78,14 @@ pub async fn start_rpc_server(
     sync_status: SyncStatusController,
     peer_id: String,
     events: EventBus,
+    decoupled_status: ethlambda_types::decoupled::SharedDecoupledStatus,
     shutdown: CancellationToken,
 ) -> Result<(), std::io::Error> {
     let api_router = build_api_router(store, config.version, peer_id)
         .layer(Extension(aggregator))
         .layer(Extension(sync_status))
-        .layer(Extension(events));
+        .layer(Extension(events))
+        .layer(Extension(decoupled_status));
     start_http_servers(config, Some(api_router), shutdown).await
 }
 
@@ -169,6 +175,7 @@ fn build_api_router(store: Store, version: &'static str, peer_id: String) -> Rou
         .merge(node::routes(version, peer_id))
         .merge(genesis::routes())
         .merge(spec::routes())
+        .merge(decoupled::routes())
         .with_state(store)
 }
 
@@ -240,6 +247,10 @@ pub struct BeaconApiHandles {
     pub client_version: ethlambda_engine::types::ClientVersionV1,
     /// What `/eth/v1/node/identity` reports beyond the peer id.
     pub identity: BeaconIdentity,
+    /// The decoupled fork's shared engine, on a network that schedules the
+    /// fork: its duty, pool and status endpoints and block production read
+    /// it. `None` everywhere else.
+    pub decoupled: Option<ethlambda_state_transition::beacon::decoupled_node::SharedDecoupledNode>,
 }
 
 /// Start the HTTP servers for a beacon node.
@@ -267,6 +278,7 @@ pub async fn start_beacon_rpc_server(
         .layer(Extension(handles.engine))
         .layer(Extension(handles.events))
         .layer(Extension(handles.identity))
+        .layer(Extension(handles.decoupled))
         .layer(Extension(beacon::graffiti::OwnVersion(Arc::new(
             handles.client_version,
         ))));
@@ -512,6 +524,20 @@ pub(crate) mod test_utils {
     }
 
     impl ethlambda_network_api::RpcToP2P for RecordingNetwork {
+        fn publish_goldfish_vote(
+            &self,
+            _vote: ethlambda_types::beacon::containers::decoupled::SignedGoldfishVote,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            Ok(())
+        }
+
+        fn publish_combined_attestation(
+            &self,
+            _attestation: ethlambda_types::beacon::containers::decoupled::SignedCombinedAttestation,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            Ok(())
+        }
+
         fn publish_beacon_attestation(
             &self,
             subnet_id: u64,

@@ -8,8 +8,12 @@ use std::future::Future;
 use std::pin::Pin;
 
 use async_trait::async_trait;
+use ethlambda_decoupled::AttestationInput;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::altair;
+use ethlambda_types::beacon::containers::decoupled::{
+    GoldfishVoteData, SignedCombinedAttestation, SignedGoldfishVote,
+};
 use ethlambda_types::beacon::containers::gloas;
 use ethlambda_types::beacon::containers::shared::AttestationData;
 use ethlambda_types::beacon::fork::ForkName;
@@ -304,6 +308,37 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
     ) -> Result<usize> {
         self.try_each("submit_payload_attestations", |node| {
             node.submit_payload_attestations(messages)
+        })
+        .await
+    }
+
+    async fn goldfish_vote_data(&self, slot: Slot) -> Result<GoldfishVoteData> {
+        self.try_each("goldfish_vote_data", |node| node.goldfish_vote_data(slot))
+            .await
+    }
+
+    /// First node that accepts, like attestations: a broadcast would publish
+    /// every vote once per node.
+    async fn submit_goldfish_votes(&self, votes: &[SignedGoldfishVote]) -> Result<usize> {
+        self.try_each("submit_goldfish_votes", |node| {
+            node.submit_goldfish_votes(votes)
+        })
+        .await
+    }
+
+    async fn decoupled_attestation_input(&self, round: u64) -> Result<AttestationInput> {
+        self.try_each("decoupled_attestation_input", |node| {
+            node.decoupled_attestation_input(round)
+        })
+        .await
+    }
+
+    async fn submit_combined_attestations(
+        &self,
+        attestations: &[SignedCombinedAttestation],
+    ) -> Result<usize> {
+        self.try_each("submit_combined_attestations", |node| {
+            node.submit_combined_attestations(attestations)
         })
         .await
     }

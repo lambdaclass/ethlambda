@@ -1011,6 +1011,7 @@ mod gloas_block_production_tests {
         let state = state_to_build_on();
         let skip = BlockProcessingOptions {
             randao: RandaoVerification::Skip,
+            ..Default::default()
         };
         let produce_with = |options| {
             let requests = ExecutionRequests::default();

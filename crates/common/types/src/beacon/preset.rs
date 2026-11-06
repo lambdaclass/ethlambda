@@ -1195,6 +1195,7 @@ pub mod retuned {
             | ForkName::Deneb
             | ForkName::Electra
             | ForkName::Fulu
+            | ForkName::Decoupled
             | ForkName::Gloas => super::PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX,
             ForkName::Lean => lean_fork_unreachable("proportional_slashing_multiplier"),
         }
@@ -1217,7 +1218,7 @@ pub mod retuned {
             ForkName::Bellatrix | ForkName::Capella | ForkName::Deneb => {
                 super::MIN_SLASHING_PENALTY_QUOTIENT_BELLATRIX
             }
-            ForkName::Electra | ForkName::Fulu | ForkName::Gloas => {
+            ForkName::Electra | ForkName::Fulu | ForkName::Decoupled | ForkName::Gloas => {
                 super::MIN_SLASHING_PENALTY_QUOTIENT_ELECTRA
             }
             ForkName::Lean => lean_fork_unreachable("min_slashing_penalty_quotient"),
@@ -1233,7 +1234,7 @@ pub mod retuned {
     /// small one.
     pub fn whistleblower_reward_quotient(fork: ForkName) -> u64 {
         match fork {
-            ForkName::Electra | ForkName::Fulu | ForkName::Gloas => {
+            ForkName::Electra | ForkName::Fulu | ForkName::Decoupled | ForkName::Gloas => {
                 super::WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA
             }
             ForkName::Phase0
@@ -1261,6 +1262,7 @@ pub mod retuned {
             | ForkName::Deneb
             | ForkName::Electra
             | ForkName::Fulu
+            | ForkName::Decoupled
             | ForkName::Gloas => super::INACTIVITY_PENALTY_QUOTIENT_BELLATRIX,
             ForkName::Lean => lean_fork_unreachable("inactivity_penalty_quotient"),
         }
@@ -1297,6 +1299,7 @@ pub mod retuned {
                 ForkName::Deneb,
                 ForkName::Electra,
                 ForkName::Fulu,
+                ForkName::Decoupled,
                 ForkName::Gloas,
             ];
 
@@ -1347,7 +1350,12 @@ pub mod retuned {
                     "{fork} must use bellatrix's penalty divisor",
                 );
             }
-            for fork in [ForkName::Electra, ForkName::Fulu, ForkName::Gloas] {
+            for fork in [
+                ForkName::Electra,
+                ForkName::Fulu,
+                ForkName::Decoupled,
+                ForkName::Gloas,
+            ] {
                 assert_eq!(
                     min_slashing_penalty_quotient(fork),
                     MIN_SLASHING_PENALTY_QUOTIENT_ELECTRA,
@@ -1368,7 +1376,12 @@ pub mod retuned {
                     "{fork} predates electra's whistleblower reward change",
                 );
             }
-            for fork in [ForkName::Electra, ForkName::Fulu, ForkName::Gloas] {
+            for fork in [
+                ForkName::Electra,
+                ForkName::Fulu,
+                ForkName::Decoupled,
+                ForkName::Gloas,
+            ] {
                 assert_eq!(
                     whistleblower_reward_quotient(fork),
                     WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA,

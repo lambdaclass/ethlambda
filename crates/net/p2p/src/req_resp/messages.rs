@@ -4,6 +4,7 @@ use ethlambda_types::beacon::containers::SignedBeaconBlock;
 use ethlambda_types::beacon::containers::fulu::DataColumnsByRootIdentifier;
 use ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope;
 use ethlambda_types::beacon::primitives::Root;
+use ethlambda_types::lean_decoupled::SignedDecoupledBlock;
 use libssz_types::SszList;
 
 use crate::beacon::messages::{
@@ -100,6 +101,8 @@ pub enum Request {
     /// ([`crate::beacon::messages::ExecutionPayloadEnvelopeRoots`]) carries the
     /// bound on decode and the codec re-applies it on encode.
     ExecutionPayloadEnvelopesByRoot(Vec<Root>),
+    /// Lean decoupled mode: the decoupled blocks with these roots.
+    DecoupledBlocksByRoot(Vec<Root>),
 }
 
 #[derive(Debug, Clone)]
@@ -204,6 +207,9 @@ impl std::fmt::Display for Response {
                 "Success(ExecutionPayloadEnvelopes count={})",
                 envelopes.len()
             ),
+            Self::Success {
+                payload: ResponsePayload::DecoupledBlocks(blocks),
+            } => write!(f, "Success(DecoupledBlocks count={})", blocks.len()),
             Self::Error { code, message } => {
                 let message = String::from_utf8_lossy(message);
                 write!(f, "Error({code:?}: {message})")
@@ -292,6 +298,8 @@ pub enum ResponsePayload {
     DataColumnSidecars(Vec<DataColumnSidecar>),
     /// The envelopes answering either gloas envelope protocol.
     ExecutionPayloadEnvelopes(Vec<SignedExecutionPayloadEnvelope>),
+    /// The blocks answering a decoupled-mode by-root request.
+    DecoupledBlocks(Vec<SignedDecoupledBlock>),
 }
 
 /// Error message type for non-success responses.

@@ -18,6 +18,7 @@ use ethlambda_types::{
     beacon::operation::BeaconOperation,
     beacon::primitives::ValidatorIndex,
     block::SignedBlock,
+    lean_decoupled::{SignedDecoupledAttestation, SignedDecoupledBlock, SignedGoldfishVote},
     primitives::HashTreeRoot as _,
     time::unix_now_ms,
 };
@@ -31,12 +32,13 @@ use super::{
     encoding::{compress_message, decompress_message},
     messages::{
         AGGREGATION_TOPIC_KIND, ATTESTATION_SUBNET_TOPIC_PREFIX, BLOCK_TOPIC_KIND,
+        DECOUPLED_ATTESTATION_TOPIC_KIND, DECOUPLED_BLOCK_TOPIC_KIND, DECOUPLED_VOTE_TOPIC_KIND,
         attestation_subnet_topic, topic_kind,
     },
 };
 use crate::beacon::constants::ATTESTATION_SUBNET_COUNT;
 use crate::beacon::decode::BeaconGossip;
-use crate::beacon::verdict::{self, Dispatch, GossipId, Validated};
+use crate::beacon::verdict::{self, DecoupledMessage, Dispatch, GossipId, Validated};
 use crate::beacon::{BeaconWire, decode as beacon_decode, topics as beacon_topics};
 use crate::{P2PServer, metrics};
 
@@ -97,6 +99,9 @@ pub async fn handle_gossip_message(
     };
 
     match kind {
+        DECOUPLED_BLOCK_TOPIC_KIND => handle_decoupled_block(server, &payload),
+        DECOUPLED_VOTE_TOPIC_KIND => handle_decoupled_vote(server, &payload),
+        DECOUPLED_ATTESTATION_TOPIC_KIND => handle_decoupled_attestation(server, &payload),
         BLOCK_TOPIC_KIND => handle_lean_block(server, &payload, compressed_len, wire_at).await,
         AGGREGATION_TOPIC_KIND => handle_lean_aggregation(server, &payload, compressed_len).await,
         kind if kind.starts_with(ATTESTATION_SUBNET_TOPIC_PREFIX) => {
@@ -178,6 +183,109 @@ async fn handle_lean_block(
     }
 }
 
+/// The decoupled chain actor, when this node runs one.
+fn decoupled_chain(server: &P2PServer) -> Option<&ethlambda_network_api::P2PToDecoupledRef> {
+    server
+        .wire
+        .decoupled()
+        .and_then(|decoupled| decoupled.chain.as_ref())
+}
+
+/// Decoupled gossip is forwarded without validation, like the rest of lean's
+/// gossip: the chain actor checks signatures before any handler sees it.
+fn handle_decoupled_block(server: &P2PServer, payload: &[u8]) {
+    let Some(block) = decode_lean::<SignedDecoupledBlock>(payload, "decoupled block") else {
+        return;
+    };
+    let block_root = block.message.hash_tree_root();
+    info!(
+        slot = block.message.slot,
+        proposer = block.message.proposer_index,
+        block_root = %ShortRoot(&block_root.0),
+        parent_root = %ShortRoot(&block.message.parent_root.0),
+        votes = block.message.body.votes.len(),
+        attestations = block.message.body.attestations.len(),
+        "Received decoupled block from gossip"
+    );
+    if let Some(chain) = decoupled_chain(server) {
+        let _ = chain
+            .new_decoupled_block(block, false)
+            .inspect_err(|err| error!(%err, "Failed to forward decoupled block"));
+    }
+}
+
+fn handle_decoupled_vote(server: &P2PServer, payload: &[u8]) {
+    let Some(vote) = decode_lean::<SignedGoldfishVote>(payload, "decoupled vote") else {
+        return;
+    };
+    trace!(
+        slot = vote.vote.slot,
+        validator = vote.vote.validator,
+        head = %ShortRoot(&vote.vote.head.0),
+        "Received Goldfish vote from gossip"
+    );
+    if let Some(chain) = decoupled_chain(server) {
+        let _ = chain
+            .new_decoupled_vote(vote)
+            .inspect_err(|err| error!(%err, "Failed to forward Goldfish vote"));
+    }
+}
+
+fn handle_decoupled_attestation(server: &P2PServer, payload: &[u8]) {
+    let Some(attestation) =
+        decode_lean::<SignedDecoupledAttestation>(payload, "decoupled attestation")
+    else {
+        return;
+    };
+    trace!(
+        round = attestation.attestation.data.round,
+        validator = attestation.attestation.validator,
+        "Received combined attestation from gossip"
+    );
+    if let Some(chain) = decoupled_chain(server) {
+        let _ = chain
+            .new_decoupled_attestation(attestation)
+            .inspect_err(|err| error!(%err, "Failed to forward combined attestation"));
+    }
+}
+
+fn publish_decoupled(
+    server: &P2PServer,
+    topic: Option<libp2p::gossipsub::IdentTopic>,
+    bytes: Vec<u8>,
+) {
+    let Some(topic) = topic else {
+        warn!("Not on the decoupled wire; dropping a decoupled message");
+        return;
+    };
+    server.swarm_handle.publish(topic, compress_message(&bytes));
+}
+
+pub fn publish_decoupled_block(server: &P2PServer, block: SignedDecoupledBlock) {
+    let block_root = block.message.hash_tree_root();
+    info!(
+        slot = block.message.slot,
+        proposer = block.message.proposer_index,
+        block_root = %ShortRoot(&block_root.0),
+        parent_root = %ShortRoot(&block.message.parent_root.0),
+        votes = block.message.body.votes.len(),
+        attestations = block.message.body.attestations.len(),
+        "Published decoupled block to gossipsub"
+    );
+    let topic = server.wire.decoupled().map(|d| d.block_topic.clone());
+    publish_decoupled(server, topic, block.to_ssz());
+}
+
+pub fn publish_decoupled_vote(server: &P2PServer, vote: SignedGoldfishVote) {
+    let topic = server.wire.decoupled().map(|d| d.vote_topic.clone());
+    publish_decoupled(server, topic, vote.to_ssz());
+}
+
+pub fn publish_decoupled_attestation(server: &P2PServer, attestation: SignedDecoupledAttestation) {
+    let topic = server.wire.decoupled().map(|d| d.attestation_topic.clone());
+    publish_decoupled(server, topic, attestation.to_ssz());
+}
+
 async fn handle_lean_aggregation(server: &mut P2PServer, payload: &[u8], compressed_len: usize) {
     metrics::observe_gossip_aggregation_size(payload.len(), compressed_len);
     let Some(aggregation) = decode_lean::<SignedAggregatedAttestation>(payload, "aggregation")
@@ -254,6 +362,11 @@ fn handle_beacon_gossip(
         triage_aggregate(server, wire, payload, id.received_at)
     } else if let Some(subnet_id) = beacon_topics::attestation_subnet(kind) {
         triage_attestation(server, topic_fork, payload, subnet_id)
+    } else if matches!(
+        kind,
+        beacon_topics::GOLDFISH_VOTE | beacon_topics::COMBINED_ATTESTATION
+    ) {
+        triage_decoupled_vote(server, kind, payload)
     } else if kind == beacon_topics::EXECUTION_PAYLOAD {
         triage_envelope(server, payload)
     } else if kind == beacon_topics::PAYLOAD_ATTESTATION_MESSAGE {
@@ -287,6 +400,103 @@ fn handle_beacon_gossip(
         }
         Dispatch::Validate(object) => verdict::spawn_stateful_checks(server, ctx, id, object),
     }
+}
+
+/// The decoupled fork's `goldfish_vote` and `combined_attestation` topics.
+///
+/// Decoded here; checked against the head state (a vote's committee
+/// membership, and either message's signature) and offered to the shared
+/// decoupled engine on a blocking thread ([`Validated::Decoupled`]), since a
+/// round's attestations arrive together and each costs a state read and a BLS
+/// verification. Accepted when the engine admits it, so only what this node
+/// holds is relayed; ignored when the engine refuses it (outside its slot or
+/// round window, a repeat, a third distinct vote), and rejected when malformed
+/// or wrongly signed.
+fn triage_decoupled_vote(server: &P2PServer, kind: &str, payload: &[u8]) -> Dispatch {
+    use ethlambda_types::beacon::containers::decoupled::{
+        SignedCombinedAttestation, SignedGoldfishVote,
+    };
+    let Some(node) = server.decoupled_node.clone() else {
+        metrics::inc_beacon_gossip(kind, "no_consumer");
+        return Dispatch::Report(Outcome::Ignore(IgnoreReason::NoConsumer));
+    };
+    let message = if kind == beacon_topics::GOLDFISH_VOTE {
+        SignedGoldfishVote::from_ssz_bytes(payload).map(DecoupledMessage::Vote)
+    } else {
+        SignedCombinedAttestation::from_ssz_bytes(payload)
+            .map(|attestation| DecoupledMessage::Attestation(Box::new(attestation)))
+    };
+    let Ok(message) = message else {
+        metrics::inc_beacon_gossip(kind, "decode_failed");
+        return Dispatch::Report(Outcome::Reject(RejectReason::Decode));
+    };
+    Dispatch::Validate(Validated::Decoupled { message, node })
+}
+
+/// Publish under the digest of `slot`'s epoch, on `kind`.
+fn publish_decoupled_beacon(server: &P2PServer, slot: u64, kind: &str, bytes: Vec<u8>) {
+    let Some(beacon) = server.wire.beacon() else {
+        error!(
+            kind,
+            "A decoupled beacon message reached a lean node; dropping it"
+        );
+        return;
+    };
+    let Some(digest) = beacon.publish_digest(slot) else {
+        warn!(
+            slot,
+            kind, "No held fork digest covers this message's slot; not publishing"
+        );
+        return;
+    };
+    let topic = IdentTopic::new(beacon_topics::topic_name(digest, kind));
+    server.swarm_handle.publish(topic, compress_message(&bytes));
+}
+
+/// Gossip a Goldfish vote this node's validator client submitted.
+pub fn publish_goldfish_vote(
+    server: &P2PServer,
+    vote: ethlambda_types::beacon::containers::decoupled::SignedGoldfishVote,
+) {
+    trace!(
+        slot = vote.data.slot,
+        validator = vote.validator_index,
+        "Publishing Goldfish vote"
+    );
+    publish_decoupled_beacon(
+        server,
+        vote.data.slot,
+        beacon_topics::GOLDFISH_VOTE,
+        vote.to_ssz(),
+    );
+}
+
+/// Gossip a combined attestation this node's validator client submitted.
+pub fn publish_combined_attestation(
+    server: &P2PServer,
+    attestation: ethlambda_types::beacon::containers::decoupled::SignedCombinedAttestation,
+) {
+    // Published under the digest of the slot it is being sent at: the
+    // round's attestation time falls in its second slot.
+    let slot = server
+        .decoupled_node
+        .as_ref()
+        .map(|node| {
+            let node = node.lock().expect("decoupled node lock poisoned");
+            node.params().opening_slot(attestation.data.round) + 1
+        })
+        .unwrap_or(0);
+    trace!(
+        round = attestation.data.round,
+        validator = attestation.validator_index,
+        "Publishing combined attestation"
+    );
+    publish_decoupled_beacon(
+        server,
+        slot,
+        beacon_topics::COMBINED_ATTESTATION,
+        attestation.to_ssz(),
+    );
 }
 
 /// Decode a beacon block and run its cheap gossip checks: a verdict already,
@@ -364,13 +574,15 @@ fn triage_data_column(
     metrics::inc_beacon_gossip(KIND, "decoded");
     let now_ms = unix_now_ms();
     let cheap = match &sidecar {
-        DataColumnSidecar::Fulu(sidecar) => gossip::column::cheap_checks(
-            &server.seen_columns,
-            &server.store,
-            sidecar,
-            subnet_id,
-            now_ms,
-        ),
+        DataColumnSidecar::Fulu(sidecar) | DataColumnSidecar::Decoupled(sidecar) => {
+            gossip::column::cheap_checks(
+                &server.seen_columns,
+                &server.store,
+                sidecar,
+                subnet_id,
+                now_ms,
+            )
+        }
         DataColumnSidecar::Gloas(sidecar) => gossip::column::cheap_checks_gloas(
             &server.seen_block_columns,
             &server.store,
@@ -1157,6 +1369,10 @@ pub fn join_aggregator_subnets(server: &mut P2PServer, subnets: Vec<(u64, u64)>)
     let Some(wire) = server.wire.beacon() else {
         return;
     };
+    // The decoupled fork has no attestation subnets to aggregate on.
+    if wire.fork == ForkName::Decoupled {
+        return;
+    }
     let mut joined = Vec::new();
     for (subnet_id, slot) in subnets {
         if subnet_id >= ATTESTATION_SUBNET_COUNT

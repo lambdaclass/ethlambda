@@ -42,6 +42,7 @@
 pub mod altair;
 pub mod bellatrix;
 pub mod capella;
+pub mod decoupled;
 pub mod deneb;
 pub mod electra;
 pub mod fulu;
@@ -77,6 +78,7 @@ macro_rules! dispatch_state {
             BeaconState::Deneb($state) => $body,
             BeaconState::Electra($state) => $body,
             BeaconState::Fulu($state) => $body,
+            BeaconState::Decoupled($state) => $body,
             BeaconState::Gloas($state) => $body,
             BeaconState::Lean(_) => lean_state_unreachable($function),
         }
@@ -107,6 +109,7 @@ macro_rules! dispatch_state_including_lean {
             BeaconState::Deneb($state) => $body,
             BeaconState::Electra($state) => $body,
             BeaconState::Fulu($state) => $body,
+            BeaconState::Decoupled($state) => $body,
             BeaconState::Gloas($state) => $body,
             BeaconState::Lean($state) => $body,
         }
@@ -152,6 +155,7 @@ macro_rules! dispatch_block {
             SignedBeaconBlock::Deneb($block) => $body,
             SignedBeaconBlock::Electra($block) => $body,
             SignedBeaconBlock::Fulu($block) => $body,
+            SignedBeaconBlock::Decoupled($block) => $body,
             SignedBeaconBlock::Gloas($block) => $body,
             SignedBeaconBlock::Lean(_) => lean_block_unreachable($function),
         }
@@ -177,6 +181,7 @@ macro_rules! dispatch_block_including_lean {
             SignedBeaconBlock::Deneb($block) => $body,
             SignedBeaconBlock::Electra($block) => $body,
             SignedBeaconBlock::Fulu($block) => $body,
+            SignedBeaconBlock::Decoupled($block) => $body,
             SignedBeaconBlock::Gloas($block) => $body,
             SignedBeaconBlock::Lean($block) => $body,
         }
@@ -203,6 +208,9 @@ pub enum BeaconState {
     Deneb(deneb::BeaconState),
     Electra(electra::BeaconState),
     Fulu(fulu::BeaconState),
+    /// The decoupled fork's state: fulu's container, unchanged. See the
+    /// [`decoupled`] module doc.
+    Decoupled(fulu::BeaconState),
     Gloas(gloas::BeaconState),
     Lean(crate::state::State),
 }
@@ -246,7 +254,7 @@ impl serde::Serialize for BeaconState {
             BeaconState::Capella(state) => state.serialize(serializer),
             BeaconState::Deneb(state) => state.serialize(serializer),
             BeaconState::Electra(state) => state.serialize(serializer),
-            BeaconState::Fulu(state) => state.serialize(serializer),
+            BeaconState::Fulu(state) | BeaconState::Decoupled(state) => state.serialize(serializer),
             BeaconState::Gloas(state) => state.serialize(serializer),
             BeaconState::Lean(_) => Err(serde::ser::Error::custom(
                 "a lean state has no JSON encoding: /lean/v0/states/finalized serves SSZ only",
@@ -288,6 +296,7 @@ impl BeaconState {
             BeaconState::Deneb(_) => ForkName::Deneb,
             BeaconState::Electra(_) => ForkName::Electra,
             BeaconState::Fulu(_) => ForkName::Fulu,
+            BeaconState::Decoupled(_) => ForkName::Decoupled,
             BeaconState::Gloas(_) => ForkName::Gloas,
             BeaconState::Lean(_) => ForkName::Lean,
         }
@@ -351,6 +360,9 @@ impl BeaconState {
                 bytes,
             )?)),
             ForkName::Fulu => Ok(BeaconState::Fulu(fulu::BeaconState::from_ssz_bytes(bytes)?)),
+            ForkName::Decoupled => Ok(BeaconState::Decoupled(fulu::BeaconState::from_ssz_bytes(
+                bytes,
+            )?)),
             ForkName::Gloas => Ok(BeaconState::Gloas(gloas::BeaconState::from_ssz_bytes(
                 bytes,
             )?)),
@@ -903,7 +915,9 @@ impl BeaconState {
             BeaconState::Capella(s) => Some(Registry::Bounded(&s.validators, &s.balances)),
             BeaconState::Deneb(s) => Some(Registry::Bounded(&s.validators, &s.balances)),
             BeaconState::Electra(s) => Some(Registry::Bounded(&s.validators, &s.balances)),
-            BeaconState::Fulu(s) => Some(Registry::Bounded(&s.validators, &s.balances)),
+            BeaconState::Fulu(s) | BeaconState::Decoupled(s) => {
+                Some(Registry::Bounded(&s.validators, &s.balances))
+            }
             BeaconState::Gloas(s) => Some(Registry::Progressive(&s.validators, &s.balances)),
             BeaconState::Lean(_) => None,
         }
@@ -930,7 +944,9 @@ impl BeaconState {
             BeaconState::Electra(s) => {
                 Some(RegistryMut::Bounded(&mut s.validators, &mut s.balances))
             }
-            BeaconState::Fulu(s) => Some(RegistryMut::Bounded(&mut s.validators, &mut s.balances)),
+            BeaconState::Fulu(s) | BeaconState::Decoupled(s) => {
+                Some(RegistryMut::Bounded(&mut s.validators, &mut s.balances))
+            }
             BeaconState::Gloas(s) => {
                 Some(RegistryMut::Progressive(&mut s.validators, &mut s.balances))
             }
@@ -1055,7 +1071,7 @@ impl BeaconState {
             BeaconState::Capella(state) => &state.historical_summaries,
             BeaconState::Deneb(state) => &state.historical_summaries,
             BeaconState::Electra(state) => &state.historical_summaries,
-            BeaconState::Fulu(state) => &state.historical_summaries,
+            BeaconState::Fulu(state) | BeaconState::Decoupled(state) => &state.historical_summaries,
             BeaconState::Gloas(state) => &state.historical_summaries,
             BeaconState::Phase0(_)
             | BeaconState::Altair(_)
@@ -1066,7 +1082,9 @@ impl BeaconState {
             BeaconState::Capella(state) => &mut state.historical_summaries,
             BeaconState::Deneb(state) => &mut state.historical_summaries,
             BeaconState::Electra(state) => &mut state.historical_summaries,
-            BeaconState::Fulu(state) => &mut state.historical_summaries,
+            BeaconState::Fulu(state) | BeaconState::Decoupled(state) => {
+                &mut state.historical_summaries
+            }
             BeaconState::Gloas(state) => &mut state.historical_summaries,
             BeaconState::Phase0(_)
             | BeaconState::Altair(_)
@@ -1155,7 +1173,7 @@ impl BeaconState {
                 state.next_withdrawal_index,
                 state.next_withdrawal_validator_index,
             ),
-            carried_by: [Capella, Deneb, Electra, Fulu, Gloas],
+            carried_by: [Capella, Deneb, Electra, Fulu, Decoupled, Gloas],
             absent_from: [Phase0, Altair, Bellatrix],
         )
     }
@@ -1169,7 +1187,7 @@ impl BeaconState {
                 &mut state.next_withdrawal_index,
                 &mut state.next_withdrawal_validator_index,
             ),
-            carried_by: [Capella, Deneb, Electra, Fulu, Gloas],
+            carried_by: [Capella, Deneb, Electra, Fulu, Decoupled, Gloas],
             absent_from: [Phase0, Altair, Bellatrix],
         )
     }
@@ -1220,7 +1238,7 @@ impl BeaconState {
                 &state.current_epoch_participation[..],
                 InactivityScoresRef::from(&state.inactivity_scores),
             ),
-            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas],
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Decoupled, Gloas],
             absent_from: [Phase0],
         )
     }
@@ -1271,7 +1289,7 @@ impl BeaconState {
                 &mut state.current_epoch_participation,
                 &mut state.inactivity_scores,
             ),
-            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu],
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Decoupled],
             absent_from: [Phase0, Gloas],
         )
     }
@@ -1304,7 +1322,7 @@ impl BeaconState {
                     .get_mut(index)
                     .ok_or(Error::IndexOutOfBounds { index, len })?
             },
-            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas],
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Decoupled, Gloas],
             absent_from: [Phase0],
         )
     }
@@ -1331,7 +1349,7 @@ impl BeaconState {
             } else {
                 &mut state.previous_epoch_participation[..]
             },
-            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas],
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Decoupled, Gloas],
             absent_from: [Phase0],
         )
     }
@@ -1352,7 +1370,7 @@ impl BeaconState {
             self,
             "BeaconState::sync_committees",
             |state| (&state.current_sync_committee, &state.next_sync_committee),
-            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas],
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Decoupled, Gloas],
             absent_from: [Phase0],
         )
     }
@@ -1375,7 +1393,7 @@ impl BeaconState {
                 &mut state.current_sync_committee,
                 &mut state.next_sync_committee,
             ),
-            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas],
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Decoupled, Gloas],
             absent_from: [Phase0],
         )
     }
@@ -1594,6 +1612,8 @@ pub enum SignedBeaconBlock {
     /// Fulu's block. See the enum doc for why this wraps
     /// [`electra::SignedBeaconBlock`] instead of a `fulu` type.
     Fulu(electra::SignedBeaconBlock),
+    /// The decoupled fork's block: electra's body plus the protocol fields.
+    Decoupled(decoupled::SignedBeaconBlock),
     Gloas(gloas::SignedBeaconBlock),
 
     /// The Lean consensus protocol's block.
@@ -1657,6 +1677,7 @@ impl SignedBeaconBlock {
             Self::Electra(block) | Self::Fulu(block) => {
                 Some(block.message.body.execution_payload.block_hash)
             }
+            Self::Decoupled(block) => Some(block.message.body.execution_payload.block_hash),
         }
     }
 
@@ -1698,6 +1719,7 @@ impl SignedBeaconBlock {
             Self::Electra(block) | Self::Fulu(block) => {
                 block.message.body.blob_kzg_commitments.len()
             }
+            Self::Decoupled(block) => block.message.body.blob_kzg_commitments.len(),
             Self::Gloas(block) => block
                 .message
                 .body
@@ -1725,6 +1747,7 @@ impl SignedBeaconBlock {
             Self::Electra(block) | Self::Fulu(block) => {
                 Some(block.message.body.execution_payload.timestamp)
             }
+            Self::Decoupled(block) => Some(block.message.body.execution_payload.timestamp),
         }
     }
 
@@ -1743,6 +1766,7 @@ impl SignedBeaconBlock {
             SignedBeaconBlock::Deneb(_) => ForkName::Deneb,
             SignedBeaconBlock::Electra(_) => ForkName::Electra,
             SignedBeaconBlock::Fulu(_) => ForkName::Fulu,
+            SignedBeaconBlock::Decoupled(_) => ForkName::Decoupled,
             SignedBeaconBlock::Gloas(_) => ForkName::Gloas,
             SignedBeaconBlock::Lean(_) => ForkName::Lean,
         }
@@ -1776,6 +1800,9 @@ impl SignedBeaconBlock {
             )),
             ForkName::Fulu => Ok(SignedBeaconBlock::Fulu(
                 electra::SignedBeaconBlock::from_ssz_bytes(bytes)?,
+            )),
+            ForkName::Decoupled => Ok(SignedBeaconBlock::Decoupled(
+                decoupled::SignedBeaconBlock::from_ssz_bytes(bytes)?,
             )),
             ForkName::Gloas => Ok(SignedBeaconBlock::Gloas(
                 gloas::SignedBeaconBlock::from_ssz_bytes(bytes)?,
@@ -1893,6 +1920,10 @@ signed_beacon_block_accessors!(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataColumnSidecar {
     Fulu(fulu::DataColumnSidecar),
+    /// The decoupled fork's sidecar: fulu's shape (the body keeps its
+    /// commitments at the same index), a distinct variant so
+    /// [`DataColumnSidecar::fork`] answers the right fork.
+    Decoupled(fulu::DataColumnSidecar),
     Gloas(gloas::DataColumnSidecar),
 }
 
@@ -1900,7 +1931,7 @@ impl DataColumnSidecar {
     /// The column this sidecar carries.
     pub fn index(&self) -> u64 {
         match self {
-            Self::Fulu(sidecar) => sidecar.index,
+            Self::Fulu(sidecar) | Self::Decoupled(sidecar) => sidecar.index,
             Self::Gloas(sidecar) => sidecar.index,
         }
     }
@@ -1908,7 +1939,9 @@ impl DataColumnSidecar {
     /// The slot of the block this sidecar belongs to.
     pub fn slot(&self) -> Slot {
         match self {
-            Self::Fulu(sidecar) => sidecar.signed_block_header.message.slot,
+            Self::Fulu(sidecar) | Self::Decoupled(sidecar) => {
+                sidecar.signed_block_header.message.slot
+            }
             Self::Gloas(sidecar) => sidecar.slot,
         }
     }
@@ -1917,7 +1950,9 @@ impl DataColumnSidecar {
     /// hash tree root, gloas's is named outright.
     pub fn block_root(&self) -> Root {
         match self {
-            Self::Fulu(sidecar) => sidecar.signed_block_header.message.hash_tree_root(),
+            Self::Fulu(sidecar) | Self::Decoupled(sidecar) => {
+                sidecar.signed_block_header.message.hash_tree_root()
+            }
             Self::Gloas(sidecar) => sidecar.beacon_block_root,
         }
     }
@@ -1926,6 +1961,7 @@ impl DataColumnSidecar {
     pub fn fork(&self) -> ForkName {
         match self {
             Self::Fulu(_) => ForkName::Fulu,
+            Self::Decoupled(_) => ForkName::Decoupled,
             Self::Gloas(_) => ForkName::Gloas,
         }
     }
@@ -1939,6 +1975,9 @@ impl DataColumnSidecar {
     pub fn from_ssz(fork: ForkName, bytes: &[u8]) -> Result<Self> {
         match fork {
             ForkName::Fulu => Ok(Self::Fulu(fulu::DataColumnSidecar::from_ssz_bytes(bytes)?)),
+            ForkName::Decoupled => Ok(Self::Decoupled(fulu::DataColumnSidecar::from_ssz_bytes(
+                bytes,
+            )?)),
             ForkName::Gloas => Ok(Self::Gloas(gloas::DataColumnSidecar::from_ssz_bytes(
                 bytes,
             )?)),
@@ -1958,7 +1997,7 @@ impl DataColumnSidecar {
     /// Encodes the sidecar.
     pub fn to_ssz(&self) -> Vec<u8> {
         match self {
-            Self::Fulu(sidecar) => sidecar.to_ssz(),
+            Self::Fulu(sidecar) | Self::Decoupled(sidecar) => sidecar.to_ssz(),
             Self::Gloas(sidecar) => sidecar.to_ssz(),
         }
     }

@@ -156,7 +156,7 @@ pub fn get_next_sync_committee_indices(state: &BeaconState) -> Result<Vec<Valida
 /// correctly weighted committee too.
 pub fn get_next_sync_committee(state: &BeaconState) -> Result<altair::SyncCommittee> {
     let indices = match state.fork_name() {
-        ForkName::Electra | ForkName::Fulu => {
+        ForkName::Electra | ForkName::Fulu | ForkName::Decoupled => {
             crate::beacon::helpers::electra::get_next_sync_committee_indices(state)?
         }
         ForkName::Phase0

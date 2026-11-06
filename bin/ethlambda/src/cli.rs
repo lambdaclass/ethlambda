@@ -307,6 +307,22 @@ pub(crate) struct MainnetOptions {
     /// `eth-clients` publishes and kurtosis mounts at `/network-configs`.
     #[arg(long, default_value = crate::network::DEFAULT_NETWORK)]
     pub(crate) network: String,
+
+    /// Schedule the decoupled fork at this epoch, overriding the loaded
+    /// network's `DECOUPLED_FORK_EPOCH`.
+    ///
+    /// For devnets: tooling that generates `config.yaml` cannot add custom
+    /// keys, and the fork's genesis state is the fulu one it knows, upgraded at
+    /// load when the fork is scheduled at epoch 0. Applied before anything else
+    /// reads the configuration, and refused when the network also schedules
+    /// gloas (the decoupled fork has no upgrade to it).
+    #[arg(long)]
+    pub(crate) decoupled_fork_epoch: Option<u64>,
+
+    /// Slots per round of the decoupled protocol, overriding the loaded
+    /// network's `DECOUPLED_SLOTS_PER_ROUND`. At least 3.
+    #[arg(long)]
+    pub(crate) decoupled_slots_per_round: Option<u64>,
 }
 
 /// Flags only the lean chain takes.
@@ -441,6 +457,19 @@ pub(crate) struct LeanOptions {
     /// `on_block`.
     #[arg(long, default_value = "3")]
     pub(crate) max_attestations_per_block: usize,
+    /// Run the decoupled consensus protocol (Goldfish + graded stabilization
+    /// gadget + height-based finality gadget) instead of 3SF-mini.
+    ///
+    /// The same as `DECOUPLED_CONSENSUS: true` in the genesis config, for
+    /// tooling that generates that file. Every node of the network must agree:
+    /// a decoupled node speaks its own topics and cannot follow a 3SF-mini
+    /// chain.
+    #[arg(long = "decoupled", default_value = "false")]
+    pub(crate) decoupled: bool,
+    /// Slots per round `R` (at least 3) for the decoupled protocol. Overrides
+    /// `DECOUPLED_SLOTS_PER_ROUND`; the default is 3.
+    #[arg(long = "decoupled.slots-per-round")]
+    pub(crate) decoupled_slots_per_round: Option<u64>,
     /// Shadow-simulator sim-cost + fake-XMSS flags (only under the
     /// `shadow-integration` feature).
     #[cfg(feature = "shadow-integration")]

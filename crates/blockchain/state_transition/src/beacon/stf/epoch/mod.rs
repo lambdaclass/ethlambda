@@ -99,6 +99,9 @@ pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
         ForkName::Deneb => capella::process_epoch(state, config),
         ForkName::Electra => electra::process_epoch(state, config),
         ForkName::Fulu => fulu::process_epoch(state, config),
+        // Fulu's steps minus justification, inactivity and rewards; see
+        // `crate::beacon::decoupled::process_epoch`.
+        ForkName::Decoupled => crate::beacon::decoupled::process_epoch(state, config),
         // EIP-7732's builder registry, payment queues, and payload
         // availability each need their own epoch-boundary steps
         // (`process_builder_pending_payments`, `process_ptc_window`), and
@@ -141,6 +144,9 @@ pub fn process_justification_and_finalization(
         | ForkName::Electra
         | ForkName::Fulu
         | ForkName::Gloas => altair::process_justification_and_finalization(state),
+        // The decoupled STF never updates the FFG fields: they stay at their
+        // fork-boundary values, and the engine's finality gadget replaces them.
+        ForkName::Decoupled => Ok(()),
         ForkName::Lean => lean_state_unreachable("process_justification_and_finalization"),
     }
 }

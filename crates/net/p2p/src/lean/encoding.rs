@@ -16,6 +16,7 @@ use std::io;
 use ethlambda_types::beacon::containers::SignedBeaconBlock;
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::block::SignedBlock;
+use ethlambda_types::lean_decoupled::{DecoupledBlocksByRootRequest, SignedDecoupledBlock};
 use libp2p::futures::{AsyncRead, AsyncWrite};
 use libssz::{SszDecode, SszEncode};
 use tracing::{error, warn};
@@ -43,6 +44,10 @@ pub fn decode_request(protocol: &str, payload: &[u8]) -> Option<io::Result<Reque
         }
         protocols::BLOCKS_BY_RANGE_V1 => LeanBlocksByRangeRequest::from_ssz_bytes(payload)
             .map(|wire| Request::BlocksByRange(wire.into())),
+        protocols::DECOUPLED_BLOCKS_BY_ROOT_V1 => {
+            DecoupledBlocksByRootRequest::from_ssz_bytes(payload)
+                .map(|request| Request::DecoupledBlocksByRoot(request.roots.into_inner()))
+        }
         _ => return None,
     };
     Some(request.map_err(|err| invalid(format!("{err:?}"))))
@@ -82,6 +87,58 @@ impl From<LeanBlocksByRangeRequest> for BlocksByRangeRequest {
     fn from(wire: LeanBlocksByRangeRequest) -> Self {
         Self::new(wire.start_slot, wire.count)
     }
+}
+
+/// Encode a `decoupled_blocks_by_root/1` body.
+pub fn encode_decoupled_blocks_by_root(
+    roots: &[ethlambda_types::primitives::H256],
+) -> io::Result<Vec<u8>> {
+    let roots = libssz_types::SszList::try_from(roots.to_vec())
+        .map_err(|err| invalid(format!("{err:?}")))?;
+    Ok(DecoupledBlocksByRootRequest { roots }.to_ssz())
+}
+
+/// Read a decoupled block response: one chunk per block, no context bytes.
+pub async fn decode_decoupled_blocks_response<T>(
+    io: &mut T,
+    protocol_label: &str,
+) -> io::Result<Response>
+where
+    T: AsyncRead + Unpin + Send,
+{
+    let limits = ChunkLimits {
+        has_context: false,
+        max_chunks: protocols::MAX_REQUEST_BLOCKS as usize,
+    };
+    let blocks = read_chunked_response(io, protocol_label, limits, |_, payload| {
+        SignedDecoupledBlock::from_ssz_bytes(payload).map_err(|err| invalid(format!("{err:?}")))
+    })
+    .await?;
+    Ok(Response::success(ResponsePayload::DecoupledBlocks(blocks)))
+}
+
+/// Write a decoupled block response: one result code and one payload per
+/// block, oversized blocks skipped.
+pub async fn write_decoupled_blocks_response<T>(
+    io: &mut T,
+    label: &'static str,
+    blocks: &[SignedDecoupledBlock],
+) -> io::Result<()>
+where
+    T: AsyncWrite + Unpin + Send,
+{
+    for block in blocks {
+        let encoded = block.to_ssz();
+        if encoded.len() > MAX_PAYLOAD_SIZE - 1024 {
+            warn!(
+                size = encoded.len(),
+                "Skipping oversized decoupled block in block response"
+            );
+            continue;
+        }
+        write_success_chunk(io, label, NO_CONTEXT, encoded).await?;
+    }
+    Ok(())
 }
 
 /// Decode the body of a single-chunk `status/1` response.

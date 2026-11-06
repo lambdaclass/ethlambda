@@ -1049,3 +1049,84 @@ mod gloas_tests {
         assert!(node.published_envelopes().is_empty());
     }
 }
+
+/// A decoupled block is proposed through the same path as any other: the node
+/// names the fork, the client signs under that fork's domain, and the body goes
+/// back out as the fork's own SSZ container.
+#[cfg(test)]
+mod decoupled_tests {
+    use super::*;
+    use crate::beacon_node::block_contents::DecoupledSignedBlockContents;
+    use crate::beacon_node::mock::MockBeaconNode;
+    use ethlambda_types::beacon::config::Config;
+    use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+    use ethlambda_types::beacon::primitives::{BlsPubkey, Bytes32, HashTreeRoot as _, Root};
+    use libssz::SszDecode as _;
+
+    const DECOUPLED_EPOCH: u64 = 10;
+
+    fn secret() -> [u8; 32] {
+        hex::decode("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+            .expect("valid hex")
+            .try_into()
+            .expect("32 bytes")
+    }
+
+    fn context() -> Arc<SigningContext> {
+        Arc::new(SigningContext {
+            config: Config::mainnet().with_fork_epoch(ForkName::Decoupled, DECOUPLED_EPOCH),
+            genesis_validators_root: Root::repeat_byte(1),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_decoupled_block_round_trips_and_is_signed_under_the_forks_domain() {
+        use blst::min_pk::{PublicKey, Signature};
+
+        let slot: Slot = DECOUPLED_EPOCH * SLOTS_PER_EPOCH + 5;
+        let mut store = ValidatorStore::new();
+        let pubkey: BlsPubkey = store.insert_secret("test", &secret()).expect("inserts");
+        let store = RwLock::new(store);
+        let node = Arc::new(MockBeaconNode::new().with_block(slot, 7));
+        let settings = ProposerSettings::new(Bytes32::repeat_byte(0xab), None);
+        let service = ProposalService::new(node.clone(), context(), Arc::new(settings));
+        let duty = ProposerDutyDto {
+            pubkey: crate::beacon_node::dto::encode_hex(&pubkey.0),
+            validator_index: 7,
+            slot,
+        };
+
+        let published = service
+            .propose(slot, &duty, &store)
+            .await
+            .expect("proposes");
+        assert_eq!(published, Published::Imported);
+
+        assert_eq!(node.block_requests()[0].fork, ForkName::Decoupled);
+        let (fork, body) = node.published_blocks().remove(0);
+        assert_eq!(fork, ForkName::Decoupled);
+
+        let decoded = DecoupledSignedBlockContents::from_ssz_bytes(&body).expect("decodes");
+        assert_eq!(decoded.signed_block.message.slot, slot);
+        assert_eq!(decoded.signed_block.message.proposer_index, 7);
+        assert!(decoded.signed_block.message.body.goldfish_votes.is_empty());
+
+        let root =
+            context().block_signing_root(decoded.signed_block.message.hash_tree_root(), slot);
+        let pk = PublicKey::from_bytes(&pubkey.0).expect("valid pubkey");
+        let sig =
+            Signature::from_bytes(&decoded.signed_block.signature.0).expect("valid signature");
+        assert_eq!(
+            sig.verify(
+                true,
+                root.as_slice(),
+                b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_",
+                &[],
+                &pk,
+                true
+            ),
+            blst::BLST_ERROR::BLST_SUCCESS,
+            "the published signature must verify over the published block"
+        );
+    }
+}

@@ -37,6 +37,15 @@ pub fn cheap_checks(
     if is_future_slot(&config, slot, now_ms) {
         return Err(Outcome::Ignore(IgnoreReason::FutureSlot));
     }
+    // [REJECT] (decoupled) The body carries no LMD attestations or attester
+    // slashings: the fork has neither, and the state transition refuses such a
+    // block outright.
+    if let SignedBeaconBlock::Decoupled(decoupled) = block
+        && (!decoupled.message.body.attestations.is_empty()
+            || !decoupled.message.body.attester_slashings.is_empty())
+    {
+        return Err(Outcome::Reject(RejectReason::OperationLimit));
+    }
     // [REJECT] The number of blob commitments is within the epoch's limit.
     let max_blobs = config.max_blobs_per_block(compute_epoch_at_slot(slot));
     if block.blob_kzg_commitment_count() as u64 > max_blobs {
@@ -70,7 +79,8 @@ fn as_gloas<'a>(
         | SignedBeaconBlock::Capella(_)
         | SignedBeaconBlock::Deneb(_)
         | SignedBeaconBlock::Electra(_)
-        | SignedBeaconBlock::Fulu(_) => None,
+        | SignedBeaconBlock::Fulu(_)
+        | SignedBeaconBlock::Decoupled(_) => None,
         SignedBeaconBlock::Lean(_) => lean_block_unreachable(function),
     }
 }
@@ -236,7 +246,8 @@ fn latest_block_hash(state: &BeaconState) -> Option<ExecutionBlockHash> {
         | BeaconState::Capella(_)
         | BeaconState::Deneb(_)
         | BeaconState::Electra(_)
-        | BeaconState::Fulu(_) => None,
+        | BeaconState::Fulu(_)
+        | BeaconState::Decoupled(_) => None,
         BeaconState::Lean(_) => lean_state_unreachable("block::latest_block_hash"),
     }
 }

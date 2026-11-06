@@ -160,7 +160,7 @@ fn components(
                 altair_helpers::get_inactivity_penalty_deltas(state, config),
             ),
         ],
-        ForkName::Lean => lean_is_not_a_fixture_fork("rewards"),
+        ForkName::Lean | ForkName::Decoupled => lean_is_not_a_fixture_fork("rewards"),
     };
 
     raw.into_iter()

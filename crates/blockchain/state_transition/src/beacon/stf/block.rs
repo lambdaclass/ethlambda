@@ -33,6 +33,7 @@ use crate::beacon::preset;
 use crate::beacon::primitives::{BlsSignature, HashTreeRoot as _, Root, Slot, ValidatorIndex};
 
 use super::{ExecutionEngine, bellatrix, capella, deneb, electra, fulu, gloas};
+use crate::beacon::decoupled::process_block as decoupled_process_block;
 
 /// Dispatches on the block's fork and runs that fork's own block processing.
 ///
@@ -104,6 +105,15 @@ pub fn process_block(
             options,
         ),
         containers::SignedBeaconBlock::Fulu(signed) => fulu::process_block(
+            state,
+            &signed.message,
+            config,
+            engine,
+            committees,
+            active_balances,
+            options,
+        ),
+        containers::SignedBeaconBlock::Decoupled(signed) => decoupled_process_block(
             state,
             &signed.message,
             config,
@@ -263,6 +273,24 @@ pub fn process_block_header(
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BlockProcessingOptions {
     pub randao: RandaoVerification,
+    pub decoupled_votes: VoteVerification,
+}
+
+/// Whether the decoupled fork's vote aggregates (`goldfish_votes` and
+/// `combined_attestations`) have their BLS signatures checked.
+///
+/// It reaches only the checks a body's own contents carry that the
+/// specification's forks verify inside `process_block` unconditionally; every
+/// other fork ignores it (their operations always verify, as fixtures expect).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VoteVerification {
+    #[default]
+    Verify,
+    /// The votes were verified when they entered the pool (block production),
+    /// or the caller skips the proposer signature and state root as well
+    /// (`apply_block` with `validate_result` false). Every structural check
+    /// still runs.
+    Skip,
 }
 
 /// Whether `process_randao` verifies the proposer's reveal before mixing it in.

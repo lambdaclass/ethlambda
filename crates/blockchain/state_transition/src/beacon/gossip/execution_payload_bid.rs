@@ -134,7 +134,7 @@ fn pre_gloas_payload(state: &BeaconState) -> Option<(ExecutionBlockHash, u64)> {
             let header = &s.latest_execution_payload_header;
             Some((header.block_hash, header.gas_limit))
         }
-        BeaconState::Fulu(s) => {
+        BeaconState::Fulu(s) | BeaconState::Decoupled(s) => {
             let header = &s.latest_execution_payload_header;
             Some((header.block_hash, header.gas_limit))
         }

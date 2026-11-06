@@ -1987,6 +1987,7 @@ dependencies = [
  "clap",
  "ethlambda-blockchain",
  "ethlambda-crypto",
+ "ethlambda-decoupled",
  "ethlambda-engine",
  "ethlambda-metrics",
  "ethlambda-network-api",
@@ -2026,6 +2027,7 @@ version = "1.0.0"
 dependencies = [
  "datatest-stable",
  "ethlambda-crypto",
+ "ethlambda-decoupled",
  "ethlambda-engine",
  "ethlambda-fork-choice",
  "ethlambda-metrics",
@@ -2061,6 +2063,15 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "zk_alloc",
+]
+
+[[package]]
+name = "ethlambda-decoupled"
+version = "1.0.0"
+dependencies = [
+ "ethlambda-types",
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2186,6 +2197,7 @@ dependencies = [
  "c-kzg",
  "datatest-stable",
  "ethlambda-crypto",
+ "ethlambda-decoupled",
  "ethlambda-metrics",
  "ethlambda-storage",
  "ethlambda-test-fixtures",
@@ -2270,6 +2282,7 @@ dependencies = [
  "axum",
  "blst",
  "ctr",
+ "ethlambda-decoupled",
  "ethlambda-metrics",
  "ethlambda-types",
  "hex",

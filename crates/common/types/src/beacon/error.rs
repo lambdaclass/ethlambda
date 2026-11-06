@@ -34,6 +34,15 @@ pub enum Error {
     #[error("arithmetic overflow in {0}")]
     ArithmeticOverflow(&'static str),
 
+    /// A decoupled block carried an LMD operation (attestations or attester
+    /// slashings) that the fork does not have.
+    #[error("a decoupled block must not carry {0}")]
+    DecoupledLegacyOperations(&'static str),
+
+    /// A decoupled block's vote aggregate was malformed (bits, slot or round).
+    #[error("invalid decoupled vote: {0}")]
+    InvalidDecoupledVote(&'static str),
+
     #[error("signature verification failed for {0}")]
     InvalidSignature(&'static str),
 

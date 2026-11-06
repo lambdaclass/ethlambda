@@ -411,7 +411,7 @@ fn random_state(rng: &mut SplitMix64, base: &BeaconState, config: &Config) -> Be
             inner.pending_deposits = deposits.try_into().unwrap();
             inner.pending_consolidations = consolidations.try_into().unwrap();
         }
-        BeaconState::Fulu(inner) => {
+        BeaconState::Fulu(inner) | BeaconState::Decoupled(inner) => {
             if rng.chance(10) {
                 inner.eth1_deposit_index = 3;
                 inner.deposit_requests_start_index = 5;
@@ -429,7 +429,9 @@ fn random_state(rng: &mut SplitMix64, base: &BeaconState, config: &Config) -> Be
         // Overflows `deposit_balance_to_consume + churn`.
         match &mut state {
             BeaconState::Electra(inner) => inner.deposit_balance_to_consume = u64::MAX - 5,
-            BeaconState::Fulu(inner) => inner.deposit_balance_to_consume = u64::MAX - 5,
+            BeaconState::Fulu(inner) | BeaconState::Decoupled(inner) => {
+                inner.deposit_balance_to_consume = u64::MAX - 5
+            }
             _ => unreachable!(),
         }
     }

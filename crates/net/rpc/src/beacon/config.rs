@@ -62,6 +62,7 @@ fn fork_schedule(config: &Config) -> Vec<Value> {
         (config.deneb_fork_version, config.deneb_fork_epoch),
         (config.electra_fork_version, config.electra_fork_epoch),
         (config.fulu_fork_version, config.fulu_fork_epoch),
+        (config.decoupled_fork_version, config.decoupled_fork_epoch),
         (config.gloas_fork_version, config.gloas_fork_epoch),
     ];
     let fork = |previous: [u8; 4], current: [u8; 4], epoch: u64| {

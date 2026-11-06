@@ -8,7 +8,9 @@ use crate::{
     WireConfig, beacon,
     lean::protocols::{
         BLOCKS_BY_RANGE_V1 as BLOCKS_BY_RANGE_PROTOCOL_V1,
-        BLOCKS_BY_ROOT_V1 as BLOCKS_BY_ROOT_PROTOCOL_V1, STATUS_V1 as STATUS_PROTOCOL_V1,
+        BLOCKS_BY_ROOT_V1 as BLOCKS_BY_ROOT_PROTOCOL_V1,
+        DECOUPLED_BLOCKS_BY_ROOT_V1 as DECOUPLED_BLOCKS_BY_ROOT_PROTOCOL_V1,
+        STATUS_V1 as STATUS_PROTOCOL_V1,
     },
     req_resp::Codec,
 };
@@ -50,6 +52,7 @@ pub(crate) struct ReqResp {
     pub(crate) lean_status: request_response::Behaviour<Codec>,
     pub(crate) lean_blocks_by_root: request_response::Behaviour<Codec>,
     pub(crate) lean_blocks_by_range: request_response::Behaviour<Codec>,
+    pub(crate) lean_decoupled_blocks_by_root: request_response::Behaviour<Codec>,
     pub(crate) beacon_status_v1: request_response::Behaviour<Codec>,
     pub(crate) beacon_status_v2: request_response::Behaviour<Codec>,
     pub(crate) beacon_ping: request_response::Behaviour<Codec>,
@@ -101,6 +104,15 @@ impl ReqResp {
                 one_protocol(
                     is_lean,
                     BLOCKS_BY_RANGE_PROTOCOL_V1,
+                    request_response::ProtocolSupport::Full,
+                ),
+                fetch_protocol_config(),
+            ),
+            lean_decoupled_blocks_by_root: request_response::Behaviour::with_codec(
+                codec.clone(),
+                one_protocol(
+                    is_lean,
+                    DECOUPLED_BLOCKS_BY_ROOT_PROTOCOL_V1,
                     request_response::ProtocolSupport::Full,
                 ),
                 fetch_protocol_config(),

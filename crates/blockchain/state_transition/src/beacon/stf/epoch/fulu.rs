@@ -145,7 +145,7 @@ pub fn process_proposer_lookahead(state: &mut BeaconState) -> Result<()> {
     // this is the earliest moment its proposers could have been computed.
     let new_epoch = get_current_epoch(state) + preset::MIN_SEED_LOOKAHEAD + 1;
     let new_epoch_proposers = match state.fork_name() {
-        ForkName::Fulu => get_beacon_proposer_indices(state, new_epoch)?,
+        ForkName::Fulu | ForkName::Decoupled => get_beacon_proposer_indices(state, new_epoch)?,
         // EIP-8045: gloas's own draw excludes slashed validators before
         // sampling; see `crate::beacon::helpers::gloas::get_beacon_proposer_indices`'s
         // own doc. This is the one part of the step gloas cannot share
@@ -218,7 +218,9 @@ mod tests {
     /// fork-specific projection to every test.
     fn lookahead_of(state: &BeaconState) -> Vec<crate::beacon::primitives::ValidatorIndex> {
         match state {
-            BeaconState::Fulu(state) => state.proposer_lookahead.to_vec(),
+            BeaconState::Fulu(state) | BeaconState::Decoupled(state) => {
+                state.proposer_lookahead.to_vec()
+            }
             _ => unreachable!("test states here are always fulu"),
         }
     }

@@ -55,6 +55,30 @@ pub struct GenesisConfig {
     pub milliseconds_per_slot: u64,
     #[serde(rename = "GENESIS_VALIDATORS")]
     pub genesis_validators: Vec<GenesisValidatorEntry>,
+    /// The decoupled consensus keys, all optional.
+    #[serde(flatten)]
+    pub decoupled: DecoupledGenesisConfig,
+}
+
+/// The genesis config's decoupled consensus keys. With
+/// `DECOUPLED_CONSENSUS: true` the network runs the decoupled protocol
+/// (`crate::lean_decoupled`) instead of 3SF-mini; the other keys override the
+/// protocol's defaults. Other clients ignore them, so only an all-ethlambda
+/// network can set them.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DecoupledGenesisConfig {
+    #[serde(rename = "DECOUPLED_CONSENSUS", default)]
+    pub enabled: bool,
+    #[serde(rename = "DECOUPLED_SLOTS_PER_ROUND", default)]
+    pub slots_per_round: Option<u64>,
+    #[serde(rename = "DECOUPLED_SG_WINDOW", default)]
+    pub sg_window: Option<u64>,
+    #[serde(rename = "DECOUPLED_NONJUSTIFIABLE_PERIOD", default)]
+    pub nonjustifiable_period: Option<u64>,
+    #[serde(rename = "DECOUPLED_FINALITY_DEBT", default)]
+    pub finality_debt: Option<u64>,
+    #[serde(rename = "DECOUPLED_TIMEOUT_DELAY", default)]
+    pub timeout_delay: Option<u64>,
 }
 
 impl GenesisConfig {

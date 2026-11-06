@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use ethlambda_types::beacon::constants::GENESIS_SLOT;
 use ethlambda_types::beacon::preset::{EPOCHS_PER_SYNC_COMMITTEE_PERIOD, SLOTS_PER_EPOCH};
-use ethlambda_types::beacon::primitives::{Epoch, Root, Slot, ValidatorIndex};
+use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, Root, Slot, ValidatorIndex};
 use tracing::{info, warn};
 
 use crate::beacon_node::BeaconNodeApi;
@@ -55,6 +55,10 @@ pub struct DutiesService<B> {
     beacon_node: Arc<B>,
     /// Validator indices this client signs for, resolved from public keys.
     indices: Vec<ValidatorIndex>,
+    /// The validators among them that are active, with their keys: who owes a
+    /// decoupled combined attestation, which every active validator casts each
+    /// round whatever its committee duties.
+    active: Vec<(BlsPubkey, ValidatorIndex)>,
     by_epoch: HashMap<Epoch, EpochDuties<AttesterDutyDto>>,
     /// Proposer duties, already narrowed to `indices`. See the module doc for
     /// why this is a second map rather than another field on the first.
@@ -78,6 +82,7 @@ impl<B: BeaconNodeApi> DutiesService<B> {
         Self {
             beacon_node,
             indices,
+            active: Vec::new(),
             by_epoch: HashMap::new(),
             proposers: HashMap::new(),
             ptc: HashMap::new(),
@@ -97,6 +102,15 @@ impl<B: BeaconNodeApi> DutiesService<B> {
 
     pub fn indices(&self) -> &[ValidatorIndex] {
         &self.indices
+    }
+
+    pub fn set_active(&mut self, active: Vec<(BlsPubkey, ValidatorIndex)>) {
+        self.active = active;
+    }
+
+    /// The active validators this client runs, as `(pubkey, index)`.
+    pub fn active(&self) -> &[(BlsPubkey, ValidatorIndex)] {
+        &self.active
     }
 
     /// Fetch `epoch`'s duties, replacing anything held for it if the beacon

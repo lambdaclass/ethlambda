@@ -20,6 +20,18 @@ pub const ATTESTATION_SUBNET_TOPIC_PREFIX: &str = "attestation";
 /// Full topic format: `/leanconsensus/{FORK_DIGEST}/aggregation/ssz_snappy`
 pub const AGGREGATION_TOPIC_KIND: &str = "aggregation";
 
+/// Topic kinds of a lean node running the decoupled consensus protocol
+/// (`ethlambda_types::lean_decoupled`). Distinct from every 3SF-mini and beacon
+/// kind, so one dispatch tells them apart.
+pub const DECOUPLED_BLOCK_TOPIC_KIND: &str = "decoupled_block";
+pub const DECOUPLED_VOTE_TOPIC_KIND: &str = "decoupled_vote";
+pub const DECOUPLED_ATTESTATION_TOPIC_KIND: &str = "decoupled_attestation";
+
+/// Build a decoupled-mode gossipsub topic of the given kind.
+pub fn decoupled_topic(kind: &str) -> libp2p::gossipsub::IdentTopic {
+    libp2p::gossipsub::IdentTopic::new(format!("/leanconsensus/{FORK_DIGEST}/{kind}/ssz_snappy"))
+}
+
 /// Build the block gossipsub topic.
 pub fn block_topic() -> libp2p::gossipsub::IdentTopic {
     libp2p::gossipsub::IdentTopic::new(format!(

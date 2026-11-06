@@ -602,6 +602,32 @@ pub fn config_from_spec_response(value: &serde_json::Value) -> Result<Config> {
         }
     }
 
+    // The decoupled fork's protocol parameters. Absent keeps the defaults
+    // already in `Config`, which every network without the fork leaves unused.
+    for (key, field) in [
+        (
+            "DECOUPLED_SLOTS_PER_ROUND",
+            &mut config.decoupled_slots_per_round,
+        ),
+        ("DECOUPLED_SG_WINDOW", &mut config.decoupled_sg_window),
+        (
+            "DECOUPLED_NONJUSTIFIABLE_PERIOD",
+            &mut config.decoupled_nonjustifiable_period,
+        ),
+        (
+            "DECOUPLED_FINALITY_DEBT",
+            &mut config.decoupled_finality_debt,
+        ),
+        (
+            "DECOUPLED_TIMEOUT_DELAY",
+            &mut config.decoupled_timeout_delay,
+        ),
+    ] {
+        if let Some(value) = spec_u64(value, key)? {
+            *field = value;
+        }
+    }
+
     Ok(config)
 }
 

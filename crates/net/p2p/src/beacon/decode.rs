@@ -291,6 +291,9 @@ pub fn decode_aggregate_and_proof(
         | ForkName::Capella
         | ForkName::Deneb => phase0::SignedAggregateAndProof::from_ssz_bytes(bytes)
             .map(SignedAggregateAndProof::Phase0),
+        // The decoupled fork has no aggregates; a peer still sending them is
+        // not malformed, only stale, so this scores as `Ignore`.
+        ForkName::Decoupled => return Err(DecodeError::UnsupportedFork),
         ForkName::Lean => {
             unreachable!("fork_at_slot never returns Lean: it is absent from ForkName::ALL")
         }
@@ -344,6 +347,8 @@ pub fn decode_attestation(fork: ForkName, bytes: &[u8]) -> Result<Attestation, D
         | ForkName::Bellatrix
         | ForkName::Capella
         | ForkName::Deneb => phase0::Attestation::from_ssz_bytes(bytes).map(Attestation::Phase0),
+        // No attestation subnets exist in the decoupled fork.
+        ForkName::Decoupled => return Err(DecodeError::UnsupportedFork),
         ForkName::Lean => {
             unreachable!("a beacon topic's fork is never Lean: it is absent from ForkName::ALL")
         }
@@ -370,7 +375,7 @@ pub fn decode_gossip(
         topics::ATTESTER_SLASHING => {
             let fork = fork_at_slot(config, attester_slashing_slot(bytes)?);
             let decoded = match fork {
-                ForkName::Electra | ForkName::Fulu => {
+                ForkName::Electra | ForkName::Fulu | ForkName::Decoupled => {
                     electra::AttesterSlashing::from_ssz_bytes(bytes).map(AttesterSlashing::Electra)
                 }
                 ForkName::Gloas => {

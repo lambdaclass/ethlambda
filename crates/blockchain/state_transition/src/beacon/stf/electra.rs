@@ -176,7 +176,7 @@ fn block_ref<'a>(state: &'a BeaconState, function: &'static str) -> Result<Block
         BeaconState::Electra(inner) => Ok(BlockRef {
             inner: BlockRefInner::Electra(inner),
         }),
-        BeaconState::Fulu(inner) => Ok(BlockRef {
+        BeaconState::Fulu(inner) | BeaconState::Decoupled(inner) => Ok(BlockRef {
             inner: BlockRefInner::Fulu(inner),
         }),
         other => Err(Error::UnsupportedForFork {
@@ -250,7 +250,7 @@ impl<'a> BlockMut<'a> {
 fn block_mut<'a>(state: &'a mut BeaconState, function: &'static str) -> Result<BlockMut<'a>> {
     match state {
         BeaconState::Electra(inner) => Ok(BlockMut::Electra(inner)),
-        BeaconState::Fulu(inner) => Ok(BlockMut::Fulu(inner)),
+        BeaconState::Fulu(inner) | BeaconState::Decoupled(inner) => Ok(BlockMut::Fulu(inner)),
         other => Err(Error::UnsupportedForFork {
             function,
             fork: other.fork_name(),
@@ -271,8 +271,12 @@ fn epoch_participation<'a>(
     match state {
         BeaconState::Electra(inner) if current => Ok(&inner.current_epoch_participation),
         BeaconState::Electra(inner) => Ok(&inner.previous_epoch_participation),
-        BeaconState::Fulu(inner) if current => Ok(&inner.current_epoch_participation),
-        BeaconState::Fulu(inner) => Ok(&inner.previous_epoch_participation),
+        BeaconState::Fulu(inner) | BeaconState::Decoupled(inner) if current => {
+            Ok(&inner.current_epoch_participation)
+        }
+        BeaconState::Fulu(inner) | BeaconState::Decoupled(inner) => {
+            Ok(&inner.previous_epoch_participation)
+        }
         other => Err(Error::UnsupportedForFork {
             function,
             fork: other.fork_name(),

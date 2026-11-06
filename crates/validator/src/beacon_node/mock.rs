@@ -5,8 +5,12 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use ethlambda_decoupled::AttestationInput;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::altair;
+use ethlambda_types::beacon::containers::decoupled::{
+    GoldfishVoteData, SignedCombinedAttestation, SignedGoldfishVote,
+};
 use ethlambda_types::beacon::containers::electra::{Attestation, SignedAggregateAndProof};
 use ethlambda_types::beacon::containers::gloas;
 use ethlambda_types::beacon::containers::shared::AttestationData;
@@ -15,8 +19,8 @@ use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, Root, Slot, ValidatorIndex};
 
 use crate::beacon_node::block_contents::{
-    Contents, GloasPayload, ProducedBlock, empty_block_for, empty_gloas_block_for,
-    empty_gloas_envelope_for,
+    Contents, GloasPayload, ProducedBlock, empty_block_for, empty_decoupled_block_for,
+    empty_gloas_block_for, empty_gloas_envelope_for,
 };
 use crate::beacon_node::dto::{
     AttesterDutyDto, CommitteeSubscriptionDto, ProposerDutyDto, ProposerPreparationDto, PtcDutyDto,
@@ -108,6 +112,16 @@ pub struct MockBeaconNode {
     pub payload_attestation_data: Option<gloas::PayloadAttestationData>,
     pub payload_attestation_data_calls: Mutex<usize>,
     pub submitted_payload_attestations: Mutex<Vec<gloas::PayloadAttestationMessage>>,
+    /// What `goldfish_vote_data` answers with, at whatever slot is asked: the
+    /// mock builds `(slot, head)` from the slot requested and this head.
+    pub goldfish_head: Option<Root>,
+    pub goldfish_vote_data_calls: Mutex<usize>,
+    pub submitted_goldfish_votes: Mutex<Vec<SignedGoldfishVote>>,
+    /// What `decoupled_attestation_input` answers with. The round is the one
+    /// asked for, like the real node's.
+    pub decoupled_input: Mutex<Option<AttestationInput>>,
+    pub decoupled_attestation_input_calls: Mutex<usize>,
+    pub submitted_combined_attestations: Mutex<Vec<SignedCombinedAttestation>>,
     /// The fork each `attestation_data` call named, in call order.
     pub attestation_data_forks: Mutex<Vec<ForkName>>,
     pub duties_calls: Mutex<usize>,
@@ -364,6 +378,45 @@ impl MockBeaconNode {
     /// Every payload attestation message submitted so far.
     pub fn submitted_payload_attestations(&self) -> Vec<gloas::PayloadAttestationMessage> {
         self.submitted_payload_attestations
+            .lock()
+            .expect("lock")
+            .clone()
+    }
+
+    /// Answer `goldfish_vote_data` with `head` at any slot.
+    pub fn with_goldfish_head(mut self, head: Root) -> Self {
+        self.goldfish_head = Some(head);
+        self
+    }
+
+    pub fn goldfish_vote_data_call_count(&self) -> usize {
+        *self.goldfish_vote_data_calls.lock().expect("lock")
+    }
+
+    /// Every Goldfish vote submitted so far.
+    pub fn submitted_goldfish_votes(&self) -> Vec<SignedGoldfishVote> {
+        self.submitted_goldfish_votes.lock().expect("lock").clone()
+    }
+
+    /// Answer `decoupled_attestation_input` with `input`, whatever round is
+    /// asked (the round field is rewritten to the one asked, like a node's).
+    pub fn with_decoupled_input(self, input: AttestationInput) -> Self {
+        self.set_decoupled_input(input);
+        self
+    }
+
+    /// Replace the input served, for tests that move the chain between rounds.
+    pub fn set_decoupled_input(&self, input: AttestationInput) {
+        *self.decoupled_input.lock().expect("lock") = Some(input);
+    }
+
+    pub fn decoupled_attestation_input_call_count(&self) -> usize {
+        *self.decoupled_attestation_input_calls.lock().expect("lock")
+    }
+
+    /// Every combined attestation submitted so far.
+    pub fn submitted_combined_attestations(&self) -> Vec<SignedCombinedAttestation> {
+        self.submitted_combined_attestations
             .lock()
             .expect("lock")
             .clone()
@@ -640,6 +693,18 @@ impl BeaconNodeApi for MockBeaconNode {
             failure: BeaconNodeFailure::Request,
             detail: "no block set".into(),
         })?;
+        if request.fork == ForkName::Decoupled {
+            let block = ProducedBlock {
+                fork: ForkName::Decoupled,
+                contents: Contents::Decoupled {
+                    block: empty_decoupled_block_for(slot, proposer_index),
+                    kzg_proofs: Default::default(),
+                    blobs: Default::default(),
+                },
+            };
+            crate::beacon_node::validate_produced_block(request, &block)?;
+            return Ok(block);
+        }
         // Electra, matching the block shape `empty_block_for` builds. A test
         // that needs a fork mismatch constructs one itself rather than getting
         // it by accident here.
@@ -748,6 +813,50 @@ impl BeaconNodeApi for MockBeaconNode {
             .expect("lock")
             .extend_from_slice(messages);
         Ok(messages.len())
+    }
+
+    async fn goldfish_vote_data(&self, slot: Slot) -> Result<GoldfishVoteData> {
+        self.guard("goldfish_vote_data")?;
+        *self.goldfish_vote_data_calls.lock().expect("lock") += 1;
+        let head = self.goldfish_head.ok_or_else(|| Error::BeaconNode {
+            url: "mock".to_string(),
+            failure: BeaconNodeFailure::Request,
+            detail: "no goldfish head set".to_string(),
+        })?;
+        Ok(GoldfishVoteData { slot, head })
+    }
+
+    async fn submit_goldfish_votes(&self, votes: &[SignedGoldfishVote]) -> Result<usize> {
+        self.guard("submit_goldfish_votes")?;
+        self.submitted_goldfish_votes
+            .lock()
+            .expect("lock")
+            .extend_from_slice(votes);
+        Ok(votes.len())
+    }
+
+    async fn decoupled_attestation_input(&self, round: u64) -> Result<AttestationInput> {
+        self.guard("decoupled_attestation_input")?;
+        *self.decoupled_attestation_input_calls.lock().expect("lock") += 1;
+        let input =
+            (*self.decoupled_input.lock().expect("lock")).ok_or_else(|| Error::BeaconNode {
+                url: "mock".to_string(),
+                failure: BeaconNodeFailure::Request,
+                detail: "no attestation input set".to_string(),
+            })?;
+        Ok(AttestationInput { round, ..input })
+    }
+
+    async fn submit_combined_attestations(
+        &self,
+        attestations: &[SignedCombinedAttestation],
+    ) -> Result<usize> {
+        self.guard("submit_combined_attestations")?;
+        self.submitted_combined_attestations
+            .lock()
+            .expect("lock")
+            .extend_from_slice(attestations);
+        Ok(attestations.len())
     }
 
     async fn submit_attestations(

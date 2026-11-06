@@ -45,7 +45,8 @@ fn payload_link(store: &Store, root: H256) -> Option<BlockPayloadLink> {
         | SignedBeaconBlock::Capella(_)
         | SignedBeaconBlock::Deneb(_)
         | SignedBeaconBlock::Electra(_)
-        | SignedBeaconBlock::Fulu(_) => Some(BlockPayloadLink::PreGloas),
+        | SignedBeaconBlock::Fulu(_)
+        | SignedBeaconBlock::Decoupled(_) => Some(BlockPayloadLink::PreGloas),
         SignedBeaconBlock::Gloas(block) => {
             let parent_status = match store.get_signed_block(&block.message.parent_root).ok()? {
                 None => None,
