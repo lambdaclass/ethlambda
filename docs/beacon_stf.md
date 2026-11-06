@@ -549,6 +549,45 @@ balances in index order. The table grows to the highest voting index, which is
 why `set_latest_message` only takes indices from validated attestations (a
 debug assertion bounds it).
 
+## EIP-8453
+
+EIP-8453 ("Decoupled Consensus") is ported from
+`specs/_features/eip8453/{beacon-chain,fork}.md` at ethereum/consensus-specs
+`decoupled-consensus` `0f4fa3ffdd26ec083ff4dba65645d81433178413`, on top of
+heze: types, configuration and the complete state transition. Fork choice (the
+finality gadget's store and the available chain), gossip, the validator client
+and the Beacon API are later phases, so the node does not follow the fork yet
+(`ForkName::Eip8453.is_followed()` is `false`).
+
+It replaces Casper FFG with a finality gadget whose chain state lives in the
+beacon state, and adds the available chain's head votes to the block:
+
+- `containers/eip8453.rs` in `ethlambda-types`: the height checkpoints, the
+  pending justifications, the reshaped `AttestationData` (a height pair and a
+  finality pair), `Attestation`/`IndexedAttestation` with an `epoch`, head votes,
+  and the block body and state. The state drops the epoch participation and
+  Casper FFG fields, whose positions stay as gaps (width 57), so the Casper FFG
+  accessors on `BeaconState` answer `UnsupportedForFork` for it.
+- `helpers/eip8453.rs`: the predicates, round arithmetic, attestation
+  committees (the active set split in index order, rotated by epoch, not
+  shuffled), weights and quorums (`u128`, see
+  [spec_deviations.md](./spec_deviations.md#eip-8453-decoupled-consensus)), the
+  head vote committee window, and round rewards.
+- `stf/eip8453.rs`: `process_block`, the attestations, head votes and both kinds
+  of attester slashing, then `process_height_events` once per block.
+- `stf/epoch/eip8453.rs`: `process_round` (inactivity, rewards, the
+  participation reset), which `process_slots` runs at the end of every round
+  before `process_epoch`, and the modified epoch steps.
+- `upgrade::upgrade_to_eip8453`.
+
+Heze steps EIP-8453 keeps call straight through; the few whose rule it
+modifies (registry activation, `is_active_builder`, the pending-deposit
+finality gate, `compute_ptc`, `get_inclusion_list_committee`, growing the
+registry) read the state's fork inside them. No consensus-spec-tests release
+ships EIP-8453 fixtures: every specification function has unit tests of its
+own rules instead, on both presets, and two signed blocks with attestations and
+head votes go through `state_transition` with their state roots checked.
+
 ## Macros and traits
 
 Two `macro_rules!` in the whole crate, both local, both replacing boilerplate that

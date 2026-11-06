@@ -607,7 +607,7 @@ existing once per chain.
   silent wrong answer.
 - **`ForkName::Lean` is deliberately absent from `ForkName::ALL`.** `ALL` is
   what `parse`, `previous` and `next` search, so its absence keeps
-  `parse("lean")` at `None` and `Gloas.next()` at `None`, meaning a fork upgrade
+  `parse("lean")` at `None` and `Eip8453.next()` at `None`, meaning a fork upgrade
   cannot walk off the end into lean. Lean is not a point on the Beacon Chain's
   fork timeline. `Lean` is declared *last* so the derived `Ord` puts it after
   every beacon fork, which is what `fork >= ForkName::X` gating reads.
@@ -903,6 +903,21 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   `PayloadAttributesV5` and the self-build bid's bits, the Beacon API's IL
   duties/produce/publish endpoints, and the validator client's IL duty. See
   `docs/spec_deviations.md`.
+- **EIP-8453** ("Decoupled Consensus", `ForkName::Eip8453`, after heze in
+  `ALL`, selector 9) is ported from consensus-specs `decoupled-consensus`
+  `0f4fa3ff`: types (`containers::eip8453`, `BeaconState::Eip8453`,
+  `SignedBeaconBlock::Eip8453`), config keys, presets and the whole state
+  transition (`helpers/eip8453.rs`, `stf/eip8453.rs`, `stf/epoch/eip8453.rs`,
+  `upgrade_to_eip8453`; `process_slots` runs `process_round` before
+  `process_epoch`). The state drops Casper FFG, so the Casper FFG accessors
+  (`finalized_checkpoint()`, `current_justified_checkpoint()`, ...) are
+  fallible and answer `UnsupportedForFork` for it; `gloas_family!` covers it,
+  `gloas_heze!` is for bodies that read the epoch participation lists. It is
+  not followed yet (`is_followed()` is `false`): fork choice, gossip, the
+  validator client and the Beacon API refuse or ignore it (`TODO(eip8453)`).
+  No fixtures exist; unit tests cover every function. See
+  [`docs/beacon_stf.md`](docs/beacon_stf.md#eip-8453) and
+  [`docs/spec_deviations.md`](docs/spec_deviations.md#eip-8453-decoupled-consensus).
 - A fixture case with no `post` state asserts the input must be **rejected**. That
   rule lives in `check_transition`; do not add a runner that ignores it.
 
@@ -1026,12 +1041,14 @@ behavior.
   in-memory map stays as a write-through cache in front of the table. Pruned
   on finalization to the same horizon as `LiveChain` (the finalized block's
   own slot, keeping that block's own entry).
-- `DB_VERSION` is 9: heze's own state and block containers (EIP-8015), so a
-  heze row written earlier no longer decodes, and EIP-8198's
-  `SLOT_DURATION_MS_HEZE` and `MIN_BLOB_DATA_RETENTION_MS` appended to
-  `Config`. 8 is skipped: the heze devnet branches shipped these two changes as
-  their 7 and 8 without this line's 7, so their directories must not pass as
-  current. (7 was `States` and `StateDiffs` moving from root keys to slot||root
+- `DB_VERSION` is 10: the EIP-8453 fork's config keys in `Config`
+  (`EIP8453_FORK_VERSION`/`EPOCH`, `HEAD_VOTE_DUE_BPS`, `SUPPORT_CUTOFF_BPS`,
+  `VIEW_FREEZE_BPS`) and fork selector 9 for its states and blocks. (9 was
+  heze's own state and block containers (EIP-8015), so a heze row written
+  earlier no longer decodes, and EIP-8198's `SLOT_DURATION_MS_HEZE` and
+  `MIN_BLOB_DATA_RETENTION_MS` appended to `Config`; 8 is skipped: the heze
+  devnet branches shipped these two changes as their 7 and 8 without the 7
+  below, so their directories must not pass as current. 7 was `States` and `StateDiffs` moving from root keys to slot||root
   keys (the block's slot, looked up from `BlockHeaders` by readers) so
   `Store::prune_finalized_states` can range-delete finalized states; 6 was the
   gloas schedule, timing and churn keys in `Config`, which is SSZ-encoded under

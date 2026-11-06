@@ -737,3 +737,119 @@ reads, and refuses to when that root is optimistic
 - **Why:** every devnet ethpandaops runs, focil-devnet-1 included, is generated
   that way, and anchoring at its `genesis.ssz` otherwise fails the anchor
   check.
+
+## EIP-8453 (decoupled consensus)
+
+EIP-8453's types, configuration and state transition follow
+`specs/_features/eip8453/{beacon-chain,fork}.md` at
+ethereum/consensus-specs `decoupled-consensus`
+`0f4fa3ffdd26ec083ff4dba65645d81433178413`. No consensus-spec-tests release
+ships EIP-8453 fixtures, so the port is checked by unit tests only (see
+[beacon_stf.md](./beacon_stf.md#eip-8453)). The entries below are the places
+where the specification is silent, marked unfinished, or where this node
+computes the same value another way.
+
+### The fork is not followed yet
+
+- **The specification:** an EIP-8453 chain runs its own fork choice (the
+  finality gadget's store and the available chain), gossip and validator
+  duties.
+- **ethlambda:** only the types, configuration and state transition exist.
+  `ForkName::Eip8453.is_followed()` answers `false`, so an anchor at the fork
+  is refused and a scheduled fork is warned about. Fork choice refuses an
+  EIP-8453 block (`on_block` answers `UnsupportedForFork`), gossip ignores its
+  attestations, aggregates and attester slashings (`DecodeError::UnsupportedFork`)
+  and subscribes heze's topics under its digest, and the Beacon API refuses its
+  finality checkpoints, attestation data, submissions and block production.
+  Each such site is marked `TODO(eip8453)`.
+- **Why:** those layers are later phases of the port.
+
+### Built on this repository's heze, not the pinned commit's
+
+- **The specification:** `upgrade_to_eip8453(pre: heze.BeaconState)`, over
+  the pinned commit's heze.
+- **ethlambda:** EIP-8453 inherits the heze this crate implements (the
+  heze-devnet line, fixture-tested at consensus-spec-tests `v1.7.0-beta.4`),
+  which folds EIP-8198 (quick slots) into heze. So an EIP-8453 state keeps
+  heze's slot-duration scaling of the activation, exit and consolidation churn
+  (`get_activation_churn_limit` answers heze's rule for both forks) and of the
+  sync aggregate's base reward. The pinned commit specifies EIP-8198 as a
+  separate feature.
+- **Why:** the task is to build on the heze this node runs; where the
+  specification reuses a heze or gloas function unchanged, this node's own
+  version of it is reused.
+
+### Weights are `u128`, not `Uint256`
+
+- **The specification:** `get_validator_weight`, `get_total_weight`,
+  `get_participating_weight` and `has_quorum` compute in `Uint256`.
+- **ethlambda:** in `u128` (`helpers::eip8453::Weight`), with checked
+  arithmetic. A validator's weight is below
+  `(2**64 / EFFECTIVE_BALANCE_INCREMENT) * EJECTION_INACTIVITY_SCORE**2 <
+  2**67` and the registry holds at most `2**40` validators, so three times a
+  total is below `2**109`: every value and comparison is the one `Uint256`
+  gives.
+- **Why:** no 256-bit integer type is a dependency of the state transition.
+
+### Shuffled draws index one whole-list shuffle
+
+- **The specification:** `compute_balance_weighted_selection(...,
+  shuffle_indices=True)` (behind `compute_ptc` and
+  `compute_head_vote_committee`) and `compute_uniform_selection` (behind
+  `get_inclusion_list_committee`) call `compute_shuffled_index` once per
+  draw.
+- **ethlambda:** the candidate list is shuffled once with `shuffle_list`
+  (`shuffle_list(indices, seed)[i] == indices[compute_shuffled_index(i, n,
+  seed)]`) and each draw indexes it. The drawn indices are identical; unit
+  tests compare both against the per-draw definition.
+- **Why:** the head vote committee draws `HEAD_VOTE_COMMITTEE_SIZE` members per
+  slot from the whole active set, at most one in `MAX_EFFECTIVE_BALANCE_ELECTRA
+  / effective_balance` draws accepted, and each per-draw shuffle costs
+  `SHUFFLE_ROUND_COUNT` hash pairs.
+
+### `process_attester_slashing` is not restated
+
+- **The specification:** modifies `is_slashable_attestation_data` and
+  `is_valid_indexed_attestation` and keeps `attester_slashings` in the body,
+  but does not restate `process_attester_slashing` or `AttesterSlashing`.
+- **ethlambda:** `AttesterSlashing` is the same two-field container over the
+  new `IndexedAttestation`, and `process_attester_slashing` is phase0's rule
+  (both slashable and valid, then slash the sorted intersection, at least one)
+  with the finality gadget's predicates. `process_legacy_attester_slashing` is
+  transcribed as written; its `is_valid_legacy_indexed_attestation` is heze's
+  `is_valid_indexed_attestation` (same bound, `MAX_VALIDATORS_PER_SLOT =
+  MAX_VALIDATORS_PER_COMMITTEE * MAX_COMMITTEES_PER_SLOT`, and domain).
+- **Why:** the specification's own reading of an unmodified function.
+
+### Modified heze functions dispatch on the fork inside heze's code
+
+- **The specification:** redefines `is_eligible_for_activation`,
+  `is_active_builder`, `process_pending_deposits`' finality gate,
+  `compute_ptc`, `get_inclusion_list_committee` and `add_validator_to_registry`
+  for the new state, and calls the unmodified heze steps around them.
+- **ethlambda:** the heze step that reaches each reads the state's fork:
+  `process_registry_updates` compares eligibility with
+  `compute_epoch_at_slot(finalized_slot)`, gloas's `is_active_builder`
+  forwards to EIP-8453's, `drain_pending_deposits` gates on `finalized_slot`,
+  `process_ptc_window` draws with EIP-8453's `compute_ptc`, heze's
+  `get_inclusion_list_committee` forwards to EIP-8453's, and a validator
+  created from a pending deposit grows the round, target, progress and every
+  pending justification's participation list
+  (`PendingQueueFields::push_empty_participation_and_inactivity`).
+- **Why:** one copy of each unmodified step, as for every earlier fork.
+
+### Head votes earn nothing
+
+- **The specification:** "This upgrade does not yet specify rewards for head
+  votes."
+- **ethlambda:** none are paid; head votes only record
+  `head_vote_participation`, which weighs builder payments.
+
+### `HeadVoteData.payload_status` is the raw byte
+
+- **The specification:** types it `PayloadStatus` (gloas fork choice's
+  `Uint8`) and asserts it is one of the three statuses in
+  `process_head_vote`.
+- **ethlambda:** the field is a `u8` and `process_head_vote` refuses any other
+  value, rather than decoding into fork choice's three-variant enum, which
+  could not represent the value the assertion exists to reject.
