@@ -10,6 +10,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+spawned-concurrency.workspace = true
 axum = "0.8.1"
 tokio = { workspace = true, features = ["macros", "time"] }
 tokio-util.workspace = true
@@ -34,7 +35,6 @@ futures-util = "0.3"
 
 [dev-dependencies]
 ethlambda-validator.workspace = true
-spawned-concurrency.workspace = true
 ethlambda-state-transition = { workspace = true, features = ["test-utils"] }
 ethlambda-types.workspace = true
 libssz-types.workspace = true
