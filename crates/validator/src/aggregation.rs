@@ -39,7 +39,7 @@ use ethlambda_types::beacon::containers::electra;
 use ethlambda_types::beacon::containers::gloas;
 use ethlambda_types::beacon::containers::shared::AttestationData;
 use ethlambda_types::beacon::fork::ForkName;
-use ethlambda_types::beacon::primitives::{HashTreeRoot as _, Slot};
+use ethlambda_types::beacon::primitives::{BlsPubkey, BlsSignature, HashTreeRoot as _, Slot};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
@@ -48,7 +48,7 @@ use crate::beacon_node::dto::{AttesterDutyDto, parse_pubkey};
 use crate::beacon_node::{AggregateKind, BeaconNodeApi, SignedAggregates};
 use crate::error::{Error, Result};
 use crate::keys::ValidatorStore;
-use crate::signing::{AggregateAndProofRef, SigningContext};
+use crate::signing::{AggregateAndProofRef, SigningContext, sign_all};
 
 /// An `AggregateAndProof` of either fork, held between building it and
 /// signing it.
@@ -91,17 +91,40 @@ impl<B: BeaconNodeApi> AggregationService<B> {
         }
 
         // Which of this client's validators aggregates, and with what proof.
-        let mut selected: Vec<(AttesterDutyDto, _)> = Vec::new();
+        // Asked for all at once, each within the signing budget: with only
+        // the last third of the slot left, a round trip per duty in series
+        // could run the whole duty out. Usually no request is made at all,
+        // since the proof was already produced for this epoch's subscription
+        // and `sign_selection_proof` remembers it.
+        let mut keyed = Vec::with_capacity(duties.len());
         for duty in duties {
-            match selection_for(&self.context, store, duty).await {
-                Ok(Some(proof)) => selected.push((duty.clone(), proof)),
+            match parse_pubkey(&duty.pubkey) {
+                Ok(pubkey) => keyed.push((duty, pubkey)),
+                Err(err) => {
+                    warn!(%slot, validator = duty.validator_index, %err, "Duty carried an unreadable pubkey")
+                }
+            }
+        }
+        let selections = sign_all(
+            keyed
+                .iter()
+                .map(|(duty, pubkey)| (*pubkey, selection_for(&self.context, store, duty))),
+        )
+        .await;
+        let mut selected: Vec<(&AttesterDutyDto, BlsPubkey, BlsSignature)> = Vec::new();
+        for ((duty, pubkey), selection) in keyed.into_iter().zip(selections) {
+            match selection {
+                Ok(Some(proof)) => selected.push((duty, pubkey, proof)),
                 Ok(None) => {}
-                Err(err) => warn!(
-                    %slot,
-                    validator = duty.validator_index,
-                    %err,
-                    "Could not compute aggregator selection; skipping this duty"
-                ),
+                Err(err) => {
+                    warn!(
+                        %slot,
+                        validator = duty.validator_index,
+                        %err,
+                        "Could not compute aggregator selection; skipping this duty"
+                    );
+                    crate::metrics::inc_signing_failures();
+                }
             }
         }
 
@@ -115,7 +138,7 @@ impl<B: BeaconNodeApi> AggregationService<B> {
         // twice for it would be the same answer at twice the cost.
         let data_root = data.hash_tree_root();
         let mut aggregates = BTreeMap::new();
-        for (duty, _) in &selected {
+        for (duty, _, _) in &selected {
             if aggregates.contains_key(&duty.committee_index) {
                 continue;
             }
@@ -150,54 +173,59 @@ impl<B: BeaconNodeApi> AggregationService<B> {
         // fork boundary sits.
         let fork = self.batch_fork(&aggregates, slot)?;
 
+        // Every wrapper is built first and all of them are signed at once,
+        // each within the signing budget, for the reason the selections are.
+        let mut wrappers = Vec::with_capacity(selected.len());
+        for (duty, pubkey, selection_proof) in selected {
+            let Some(aggregate) = aggregates.get(&duty.committee_index) else {
+                continue;
+            };
+            // The wrapper is the fork's own container, and the signing path
+            // takes its root from it: gloas's `Attestation` hashes
+            // differently from electra's, so a root computed over the wrong
+            // one would sign a message no node can verify.
+            let wrapper = match &aggregate.attestation {
+                AggregateKind::Electra(attestation) => {
+                    Wrapper::Electra(electra::AggregateAndProof {
+                        aggregator_index: duty.validator_index,
+                        aggregate: attestation.clone(),
+                        selection_proof,
+                    })
+                }
+                AggregateKind::Gloas(attestation) => Wrapper::Gloas(gloas::AggregateAndProof {
+                    aggregator_index: duty.validator_index,
+                    aggregate: attestation.clone(),
+                    selection_proof,
+                }),
+            };
+            wrappers.push((duty, pubkey, wrapper));
+        }
+
+        // Signed over the whole wrapper, not over the aggregate: that is what
+        // binds this validator's index and its selection proof to the votes
+        // it is republishing.
+        let signatures = sign_all(wrappers.iter().map(|(_, pubkey, wrapper)| {
+            let message = match wrapper {
+                Wrapper::Electra(message) => AggregateAndProofRef::Electra(message),
+                Wrapper::Gloas(message) => AggregateAndProofRef::Gloas(message),
+            };
+            (
+                *pubkey,
+                self.context
+                    .sign_aggregate_and_proof(store, pubkey, message),
+            )
+        }))
+        .await;
+
         let signed = {
             let mut electra_signed = Vec::new();
             let mut gloas_signed = Vec::new();
-            for (duty, selection_proof) in &selected {
-                let Some(aggregate) = aggregates.get(&duty.committee_index) else {
-                    continue;
-                };
-                let pubkey = match parse_pubkey(&duty.pubkey) {
-                    Ok(pubkey) => pubkey,
-                    Err(err) => {
-                        warn!(%slot, validator = duty.validator_index, %err, "Duty carried an unreadable pubkey");
-                        continue;
-                    }
-                };
-
-                // The wrapper is the fork's own container, and the signing path
-                // takes its root from it: gloas's `Attestation` hashes
-                // differently from electra's, so a root computed over the
-                // wrong one would sign a message no node can verify.
-                let wrapper = match &aggregate.attestation {
-                    AggregateKind::Electra(attestation) => {
-                        Wrapper::Electra(electra::AggregateAndProof {
-                            aggregator_index: duty.validator_index,
-                            aggregate: attestation.clone(),
-                            selection_proof: *selection_proof,
-                        })
-                    }
-                    AggregateKind::Gloas(attestation) => Wrapper::Gloas(gloas::AggregateAndProof {
-                        aggregator_index: duty.validator_index,
-                        aggregate: attestation.clone(),
-                        selection_proof: *selection_proof,
-                    }),
-                };
-                // Signed over the whole wrapper, not over the aggregate: that
-                // is what binds this validator's index and its selection proof
-                // to the votes it is republishing.
-                let message = match &wrapper {
-                    Wrapper::Electra(message) => AggregateAndProofRef::Electra(message),
-                    Wrapper::Gloas(message) => AggregateAndProofRef::Gloas(message),
-                };
-                let signature = match self
-                    .context
-                    .sign_aggregate_and_proof(store, &pubkey, message)
-                    .await
-                {
+            for ((duty, _, wrapper), signature) in wrappers.into_iter().zip(signatures) {
+                let signature = match signature {
                     Ok(signature) => signature,
                     Err(err) => {
                         warn!(%slot, validator = duty.validator_index, %err, "Failed to sign aggregate");
+                        crate::metrics::inc_signing_failures();
                         continue;
                     }
                 };
@@ -274,10 +302,7 @@ mod tests {
     }
 
     fn context() -> Arc<SigningContext> {
-        Arc::new(SigningContext {
-            config: Config::mainnet(),
-            genesis_validators_root: Root::ZERO,
-        })
+        Arc::new(SigningContext::new(Config::mainnet(), Root::ZERO))
     }
 
     fn store() -> (RwLock<ValidatorStore>, BlsPubkey) {
@@ -518,10 +543,10 @@ mod tests {
     }
 
     fn gloas_context() -> Arc<SigningContext> {
-        Arc::new(SigningContext {
-            config: Config::mainnet().with_fork_epoch(ForkName::Gloas, 100),
-            genesis_validators_root: Root::ZERO,
-        })
+        Arc::new(SigningContext::new(
+            Config::mainnet().with_fork_epoch(ForkName::Gloas, 100),
+            Root::ZERO,
+        ))
     }
 
     /// A slot in the gloas era at which this key is selected under the gloas

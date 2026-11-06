@@ -852,8 +852,10 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   `keys/web3signer.rs`): every `SigningContext::sign_*` is async, resolves the
   signer under a read guard scoped to the lookup and signs after releasing it,
   and sends the remote signer the message in full so its own slashing
-  protection applies. Remote keys are `url` entries in
-  `validator_definitions.yml` or `POST /eth/v1/remotekeys` (default signer
+  protection applies. Each duty signs its batch at once through
+  `signing::sign_all`, every signature bounded by `SIGNING_BUDGET`, so one
+  hung signer costs only its own keys. Remote keys are `type: web3signer`
+  entries in `validator_definitions.yml` or `POST /eth/v1/remotekeys` (default signer
   `--web3signer-url`); `/keystores` and `/remotekeys` partition the store.
   `get_head_node` is one bottom-up walk for every fork, with
   the current slot's fork selecting the payload rules and the boost gate, so a

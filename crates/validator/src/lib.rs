@@ -202,10 +202,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     );
 
     let clock = SlotClock::from_config(genesis.genesis_time, &spec);
-    let context = Arc::new(SigningContext {
-        config: spec,
-        genesis_validators_root: genesis.genesis_validators_root,
-    });
+    let context = Arc::new(SigningContext::new(spec, genesis.genesis_validators_root));
 
     let mut duties = DutiesService::new(beacon_node.clone(), Vec::new());
     let attestation = AttestationService::new(beacon_node.clone(), context.clone());
@@ -876,10 +873,10 @@ mod tests {
     }
 
     fn context() -> SigningContext {
-        SigningContext {
-            config: ethlambda_types::beacon::config::Config::mainnet(),
-            genesis_validators_root: Root::ZERO,
-        }
+        SigningContext::new(
+            ethlambda_types::beacon::config::Config::mainnet(),
+            Root::ZERO,
+        )
     }
 
     fn empty_store() -> RwLock<ValidatorStore> {
@@ -1073,11 +1070,11 @@ mod tests {
     // ---- gloas ----------------------------------------------------------
 
     fn gloas_context(epoch: u64) -> SigningContext {
-        SigningContext {
-            config: ethlambda_types::beacon::config::Config::mainnet()
+        SigningContext::new(
+            ethlambda_types::beacon::config::Config::mainnet()
                 .with_fork_epoch(ethlambda_types::beacon::fork::ForkName::Gloas, epoch),
-            genesis_validators_root: Root::ZERO,
-        }
+            Root::ZERO,
+        )
     }
 
     fn ptc_duty(index: u64, slot: u64) -> crate::beacon_node::dto::PtcDutyDto {
@@ -1173,10 +1170,7 @@ mod tests {
         let mut config = ethlambda_types::beacon::config::Config::mainnet()
             .with_fork_epoch(ethlambda_types::beacon::fork::ForkName::Gloas, 0);
         config.slot_duration_ms = 1_000;
-        let context = Arc::new(SigningContext {
-            config: config.clone(),
-            genesis_validators_root: Root::ZERO,
-        });
+        let context = Arc::new(SigningContext::new(config.clone(), Root::ZERO));
         let now_secs = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("after the epoch")
@@ -1226,11 +1220,11 @@ mod tests {
     }
 
     fn altair_context() -> SigningContext {
-        SigningContext {
-            config: ethlambda_types::beacon::config::Config::mainnet()
+        SigningContext::new(
+            ethlambda_types::beacon::config::Config::mainnet()
                 .with_fork_epoch(ethlambda_types::beacon::fork::ForkName::Altair, 0),
-            genesis_validators_root: Root::ZERO,
-        }
+            Root::ZERO,
+        )
     }
 
     fn sync_duty(index: u64, seats: Vec<u64>) -> crate::beacon_node::dto::SyncDutyDto {
@@ -1318,10 +1312,7 @@ mod tests {
         let mut config = ethlambda_types::beacon::config::Config::mainnet()
             .with_fork_epoch(ethlambda_types::beacon::fork::ForkName::Altair, 0);
         config.slot_duration_ms = 1_000;
-        let context = Arc::new(SigningContext {
-            config: config.clone(),
-            genesis_validators_root: Root::ZERO,
-        });
+        let context = Arc::new(SigningContext::new(config.clone(), Root::ZERO));
         let now_secs = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("after the epoch")
@@ -1373,10 +1364,7 @@ mod tests {
         use crate::beacon_node::mock::MockBeaconNode;
 
         let config = ethlambda_types::beacon::config::Config::mainnet();
-        let context = Arc::new(SigningContext {
-            config: config.clone(),
-            genesis_validators_root: Root::ZERO,
-        });
+        let context = Arc::new(SigningContext::new(config.clone(), Root::ZERO));
         let clock = SlotClock::from_config(0, &config);
         let node = Arc::new(MockBeaconNode::new());
         let store = empty_store();

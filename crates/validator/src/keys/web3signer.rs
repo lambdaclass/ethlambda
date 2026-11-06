@@ -46,35 +46,44 @@ pub struct Web3Signer {
 impl Web3Signer {
     /// Build a client for the signer at `url`, which is the server's base
     /// (`https://signer:9000`), not the signing path.
+    ///
+    /// Building one sets up a TLS configuration and a connection pool, so it
+    /// is not free: callers that hold a lock build it before taking the lock
+    /// (see [`crate::keys::ValidatorStore::insert_remote_signer`]).
     pub fn new(url: &str) -> Result<Self> {
         let base_url = url.trim_end_matches('/').to_string();
-        let parsed = reqwest::Url::parse(&base_url).map_err(|err| Error::Keystore {
-            path: base_url.clone(),
-            reason: format!("not a valid remote signer URL: {err}"),
-        })?;
+        // Every error below names the URL as `redact` renders it, never as
+        // given: these errors are logged, at startup and on import, and a URL
+        // refused for its shape may still carry a `user:password@` that the
+        // credentials check further down never got to reject.
+        let invalid = |reason: &str| Error::Keystore {
+            path: redact(&base_url),
+            reason: reason.to_string(),
+        };
+        let parsed = reqwest::Url::parse(&base_url)
+            .map_err(|err| invalid(&format!("not a valid remote signer URL: {err}")))?;
         if parsed.scheme() != "http" && parsed.scheme() != "https" {
-            return Err(Error::Keystore {
-                path: base_url,
-                reason: "a remote signer URL must be http or https".to_string(),
-            });
+            return Err(invalid("a remote signer URL must be http or https"));
         }
         // The URL is named in every error this client raises about the
         // signer, and those are logged. Credentials embedded in it would be
         // logged with them, so they are refused rather than redacted: the
         // signer's own authentication is TLS, not basic auth.
         if !parsed.username().is_empty() || parsed.password().is_some() {
-            return Err(Error::Keystore {
-                path: parsed.host_str().unwrap_or("").to_string(),
-                reason: "a remote signer URL must not carry credentials".to_string(),
-            });
+            return Err(invalid("a remote signer URL must not carry credentials"));
+        }
+        // The signing path is appended to the base, so a query or fragment
+        // would swallow it (`https://signer?token=abc` would request `/`), and
+        // a token in the query would be logged with every signing error.
+        if parsed.query().is_some() || parsed.fragment().is_some() {
+            return Err(invalid(
+                "a remote signer URL must not carry a query string or fragment",
+            ));
         }
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
-            .map_err(|err| Error::Keystore {
-                path: base_url.clone(),
-                reason: format!("could not build an HTTP client: {err}"),
-            })?;
+            .map_err(|err| invalid(&format!("could not build an HTTP client: {err}")))?;
         Ok(Self { base_url, client })
     }
 
@@ -149,6 +158,30 @@ fn truncate(body: &str) -> String {
     match body.char_indices().nth(MAX_LOGGED_BODY) {
         Some((cut, _)) => format!("{}...", &body[..cut]),
         None => body.to_string(),
+    }
+}
+
+/// `url` with anything that could be a credential cut out, for an error
+/// message: the userinfo before an `@` in the authority, and any query string
+/// or fragment. Works on text rather than a parsed URL, since it is what
+/// reports a URL that does not parse.
+fn redact(url: &str) -> String {
+    let (scheme, rest) = match url.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme), rest),
+        None => (None, url),
+    };
+    let rest = rest.split(['?', '#']).next().unwrap_or_default();
+    let (authority, path) = match rest.find('/') {
+        Some(cut) => rest.split_at(cut),
+        None => (rest, ""),
+    };
+    let host = match authority.rsplit_once('@') {
+        Some((_, host)) => host,
+        None => authority,
+    };
+    match scheme {
+        Some(scheme) => format!("{scheme}://{host}{path}"),
+        None => format!("{host}{path}"),
     }
 }
 
@@ -574,5 +607,41 @@ mod tests {
         assert!(!err.to_string().contains("secret"), "{err}");
         assert!(Web3Signer::new("signer:9000").is_err());
         assert!(Web3Signer::new("not a url").is_err());
+    }
+
+    /// A URL refused for its shape must not put its credentials into the
+    /// error either: the scheme and parse checks run before the credentials
+    /// one, and every one of these errors is logged.
+    #[test]
+    fn no_refusal_echoes_the_urls_credentials() {
+        for url in [
+            "ftp://admin:s3cret@signer:9000",
+            "https://admin:s3cret@signer:notaport",
+            "https://admin:s3cret@signer:9000",
+            "https://signer:9000?token=s3cret",
+            "https://signer:9000/#s3cret",
+        ] {
+            let Err(err) = Web3Signer::new(url) else {
+                panic!("{url} must be refused");
+            };
+            assert!(!err.to_string().contains("s3cret"), "{url}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_url_with_a_query_or_fragment_is_refused() {
+        assert!(Web3Signer::new("https://signer:9000?token=abc").is_err());
+        assert!(Web3Signer::new("https://signer:9000/#frag").is_err());
+        assert!(Web3Signer::new("https://signer:9000/prefix").is_ok());
+    }
+
+    #[test]
+    fn redaction_keeps_the_host_and_path_only() {
+        assert_eq!(
+            redact("https://user:pw@signer:9000/base?x=1#y"),
+            "https://signer:9000/base"
+        );
+        assert_eq!(redact("signer:9000"), "signer:9000");
+        assert_eq!(redact("a@b"), "b");
     }
 }

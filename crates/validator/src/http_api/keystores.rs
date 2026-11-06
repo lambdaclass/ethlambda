@@ -18,6 +18,7 @@
 //! the theory that a loud, obvious failure at import time beats a tool
 //! silently believing a validator has never signed.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -213,17 +214,34 @@ pub async fn import(
     // due for as long as the whole batch takes, rather than just for the
     // instant the inserts below actually need. `definitions_lock` above has
     // no such reader/writer to starve: only import and delete ever take it.
+    //
+    // The keys a remote signer holds in memory are read once, under a guard
+    // released at once. `definitions_lock` is held until the inserts below,
+    // and every keymanager writer takes it first, so the store cannot change
+    // between this read and those inserts.
+    let held_remotely: HashSet<BlsPubkey> = context
+        .store
+        .read()
+        .await
+        .remote_entries()
+        .into_iter()
+        .map(|(pubkey, _)| pubkey)
+        .collect();
     let mut prepared = Vec::with_capacity(request.keystores.len());
     for (position, json) in request.keystores.iter().enumerate() {
         let password = request.passwords.get(position).map(String::as_str);
-        prepared.push(prepare_import(&context, &mut definitions, json, password));
+        prepared.push(prepare_import(
+            &context,
+            &held_remotely,
+            &mut definitions,
+            json,
+            password,
+        ));
     }
 
-    // The definitions file is fully written by this point; nothing below
-    // touches it, so the guard can be released before the store lock is
-    // taken rather than held across it too.
-    drop(_definitions_guard);
-
+    // Still under `definitions_lock`: releasing it before these inserts would
+    // let a delete land between the file write above and the insert, and
+    // leave memory holding a key the file no longer lists.
     let mut store = context.store.write().await;
     let data = prepared
         .into_iter()
@@ -233,6 +251,7 @@ pub async fn import(
         })
         .collect();
     drop(store);
+    drop(_definitions_guard);
 
     Json(StatusResponse { data })
 }
@@ -241,6 +260,7 @@ pub async fn import(
 /// before it needs the store's write lock.
 fn prepare_import(
     context: &KeymanagerContext,
+    held_remotely: &HashSet<BlsPubkey>,
     definitions: &mut ValidatorDefinitions,
     json: &str,
     password: Option<&str>,
@@ -253,17 +273,19 @@ fn prepare_import(
     let secret = keystore.decrypt(password).map_err(KeyStatus::error)?;
     let pubkey = ValidatorStore::derive_pubkey(&secret).map_err(KeyStatus::error)?;
 
-    // A key a remote signer holds is `duplicate` here, the mirror of what
-    // `/eth/v1/remotekeys` answers for a local one: neither route silently
-    // replaces the other's entry. Re-importing a key this route already
-    // holds is still `imported`, since that is how a password is rotated.
-    let held_remotely = definitions.0.iter().any(|definition| {
+    // A key a remote signer holds, by the file or by the store, is
+    // `duplicate` here, the mirror of what `/eth/v1/remotekeys` answers for a
+    // local one: neither route silently replaces the other's entry. Judged
+    // before anything is written, so a `duplicate` never leaves files behind.
+    // Re-importing a key this route already holds is still `imported`, since
+    // that is how a password is rotated.
+    let remote_on_disk = definitions.0.iter().any(|definition| {
         definition.signing.is_remote()
             && parse_pubkey(&definition.voting_public_key)
                 .map(|parsed| parsed == pubkey)
                 .unwrap_or(false)
     });
-    if held_remotely {
+    if remote_on_disk || held_remotely.contains(&pubkey) {
         return Err(KeyStatus::duplicate());
     }
 
@@ -279,15 +301,10 @@ fn prepare_import(
 
 /// Add an already-decrypted, already-persisted key to the live store. The
 /// only step of an import that needs the write lock: a cheap, synchronous
-/// scalar validation and hashmap insert, never an await.
+/// scalar validation and hashmap insert, never an await. Nothing is judged
+/// again here: `prepare_import` judged the file and the store under
+/// `definitions_lock`, which is still held.
 fn finish_import(store: &mut ValidatorStore, secret: &[u8; 32]) -> KeyStatus {
-    // Checked again under the write lock: `prepare_import` judged the file,
-    // and a remote import can land between that and this insert.
-    match ValidatorStore::derive_pubkey(secret) {
-        Ok(pubkey) if store.remote_url(&pubkey).is_some() => return KeyStatus::duplicate(),
-        Ok(_) => {}
-        Err(err) => return KeyStatus::error(err),
-    }
     match store.insert_secret("keymanager import", secret) {
         Ok(pubkey) => {
             info!(pubkey = %encode_hex(&pubkey.0), "Imported validator key");
@@ -506,7 +523,7 @@ fn delete_one(
     // a `not_found` that reads as "already gone": acting on that, by importing
     // the key elsewhere, is what turns a failed delete into two hosts signing
     // for one validator.
-    if let Err(err) = persist_delete(context, pubkey) {
+    if let Err(err) = persist_delete(context, pubkey, Origin::Local) {
         return KeyStatus::error(err);
     }
 
@@ -545,19 +562,47 @@ pub(super) fn definitions_entry(
         .map(|definition| definition.signing))
 }
 
-/// Drop a deleted key's entry from the definitions file.
+/// Which route a definitions entry belongs to: the keystores route's local
+/// keys, or the remotekeys route's remote ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Origin {
+    Local,
+    Remote,
+}
+
+impl Origin {
+    fn owns(self, signing: &SigningDefinition) -> bool {
+        signing.is_remote() == (self == Self::Remote)
+    }
+}
+
+/// Drop a deleted key's entry from the definitions file, if it is an entry of
+/// `origin`'s kind.
+///
+/// Only that kind: the routes partition the store, and a delete through one
+/// must not erase the other's entry for the same key when memory and the file
+/// disagree about which kind it is. Saves nothing when no entry matched.
 ///
 /// Deliberately leaves the keystore and password files on disk: `deleted`
 /// means this client has stopped using the key, not that it destroys operator
 /// key material on an HTTP call. A definitions file with no entry for them is
 /// enough to keep them from being loaded again.
-pub(super) fn persist_delete(context: &KeymanagerContext, pubkey: &BlsPubkey) -> crate::Result<()> {
+pub(super) fn persist_delete(
+    context: &KeymanagerContext,
+    pubkey: &BlsPubkey,
+    origin: Origin,
+) -> crate::Result<()> {
     let mut definitions = ValidatorDefinitions::open(&context.validators_dir)?;
+    let before = definitions.0.len();
     definitions.0.retain(|definition| {
-        parse_pubkey(&definition.voting_public_key)
-            .map(|parsed| parsed != *pubkey)
-            .unwrap_or(true)
+        let names_key = parse_pubkey(&definition.voting_public_key)
+            .map(|parsed| parsed == *pubkey)
+            .unwrap_or(false);
+        !(names_key && origin.owns(&definition.signing))
     });
+    if definitions.0.len() == before {
+        return Ok(());
+    }
     definitions.save(&context.validators_dir)
 }
 
@@ -1042,6 +1087,51 @@ mod tests {
             !on_disk.0[0].enabled && !on_disk.0[0].signing.is_remote(),
             "the disabled local entry must be untouched"
         );
+    }
+
+    /// Memory holding a local key while the file holds a remote entry for
+    /// it: a delete through `/keystores` stops the local key signing, and
+    /// must leave the other route's file entry alone.
+    #[tokio::test]
+    async fn a_delete_never_erases_the_other_routes_file_entry() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut store = ValidatorStore::new();
+        let secret: [u8; 32] =
+            hex::decode("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+                .expect("valid hex")
+                .try_into()
+                .expect("32 bytes");
+        let pubkey = store.insert_secret("test", &secret).expect("inserts");
+        let hex = encode_hex(&pubkey.0);
+        ValidatorDefinitions(vec![ValidatorDefinition {
+            enabled: true,
+            voting_public_key: hex.clone(),
+            signing: SigningDefinition::Web3Signer {
+                url: "https://signer.example:9000".to_string(),
+            },
+        }])
+        .save(dir.path())
+        .expect("saves");
+        let store = Arc::new(RwLock::new(store));
+        let app = router(
+            context_with_dirs(store.clone(), dir.path()),
+            TOKEN.to_string(),
+        );
+
+        let (_, body) = send(
+            app,
+            authed(
+                "DELETE",
+                "/eth/v1/keystores",
+                serde_json::json!({ "pubkeys": [hex] }),
+            ),
+        )
+        .await;
+        assert_eq!(body["data"][0]["status"], "deleted");
+        assert!(store.read().await.is_empty(), "the local key stops signing");
+        let on_disk = ValidatorDefinitions::open(dir.path()).expect("opens");
+        assert_eq!(on_disk.0.len(), 1, "the remote entry is not this route's");
+        assert!(on_disk.0[0].signing.is_remote());
     }
 
     #[tokio::test]

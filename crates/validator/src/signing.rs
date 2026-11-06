@@ -29,6 +29,11 @@ use ethlambda_types::beacon::signing::{
     compute_domain, compute_epoch_at_slot, compute_signing_root,
 };
 
+use std::collections::HashMap;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
+
+use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
 use tokio::sync::RwLock;
 
 use crate::error::{Error, Result};
@@ -58,9 +63,64 @@ pub struct SigningContext {
     /// signature from one chain never verifies on another running the same
     /// fork schedule.
     pub genesis_validators_root: Root,
+    /// Selection proofs already produced; see [`Self::sign_selection_proof`].
+    selection_proofs: Mutex<HashMap<(BlsPubkey, Slot), BlsSignature>>,
+}
+
+/// How long a selection proof is remembered past its slot: the duty
+/// schedule holds the current epoch and the next, so a proof computed for a
+/// subscription at the start of an epoch is still wanted by the aggregation
+/// up to two epochs later.
+const SELECTION_PROOF_RETENTION_SLOTS: Slot = 3 * SLOTS_PER_EPOCH;
+
+/// How long one duty's batch of signatures may take, from when it is asked
+/// for.
+///
+/// Well inside every duty's own budget (the rest of its slot, at least a
+/// third of one), so a signer that hangs costs the signatures it owes and
+/// nothing else: the batch is published with whatever arrived in time, local
+/// keys and other signers' keys included. A healthy Web3Signer answers in
+/// milliseconds; one slower than this is one whose signatures would land too
+/// late to be worth much anyway.
+pub const SIGNING_BUDGET: Duration = Duration::from_secs(2);
+
+/// Ask for every signature in `requests` at once, and give each until
+/// [`SIGNING_BUDGET`] from now.
+///
+/// One result per request, in order. A request still outstanding at the
+/// deadline is dropped and reported as an [`Error::Signing`] for its key, so
+/// one unresponsive signer delays the batch by the budget at most and never
+/// takes the signatures that did arrive down with it.
+pub async fn sign_all<T, F>(requests: impl IntoIterator<Item = (BlsPubkey, F)>) -> Vec<Result<T>>
+where
+    F: Future<Output = Result<T>>,
+{
+    let deadline = tokio::time::Instant::now() + SIGNING_BUDGET;
+    futures::future::join_all(requests.into_iter().map(|(pubkey, request)| async move {
+        tokio::time::timeout_at(deadline, request)
+            .await
+            .unwrap_or_else(|_| {
+                Err(Error::Signing {
+                    pubkey,
+                    reason: format!(
+                        "no signature within the {}s signing budget",
+                        SIGNING_BUDGET.as_secs()
+                    ),
+                })
+            })
+    }))
+    .await
 }
 
 impl SigningContext {
+    pub fn new(config: Config, genesis_validators_root: Root) -> Self {
+        Self {
+            config,
+            genesis_validators_root,
+            selection_proofs: Mutex::new(HashMap::new()),
+        }
+    }
+
     /// The domain for `domain_type` as of `epoch`.
     pub fn domain(&self, domain_type: DomainType, epoch: Epoch) -> Domain {
         let fork = self.config.fork_at_epoch(epoch);
@@ -264,6 +324,20 @@ impl SigningContext {
                 Ok(BlsSignature(bytes))
             }
             SigningMethod::Web3Signer { signer } => {
+                // Web3Signer's `BLOCK_V2` takes the full block before
+                // bellatrix and the header only from bellatrix on, and this
+                // client only ever sends the header. Refused here rather than
+                // sent in a shape the signer answers with a 400; the proposal
+                // path refuses those forks long before this anyway.
+                if matches!(body, SigningBody::Block { .. })
+                    && self.config.fork_at_epoch(epoch) < ForkName::Bellatrix
+                {
+                    return Err(Error::Signing {
+                        pubkey: *pubkey,
+                        reason: "a remote signer is only asked for blocks from bellatrix on"
+                            .to_string(),
+                    });
+                }
                 let request = SigningRequest::new(self.fork_info(epoch), root, body);
                 signer.sign(pubkey, &request).await
             }
@@ -317,22 +391,44 @@ impl SigningContext {
     /// to a chain position, so producing one twice is producing the same bytes
     /// twice: BLS signatures are deterministic, which is the property the
     /// selection rule rests on.
+    ///
+    /// That determinism is also why the answer is remembered. The same proof
+    /// is wanted once when the epoch's subscriptions are sent and again by the
+    /// aggregation tick, and for a remote key each ask is a round trip; a
+    /// remembered proof is the very signature the signer would return. Only
+    /// a proof that was produced is remembered, so a failure is asked again.
     pub async fn sign_selection_proof(
         &self,
         store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
         slot: Slot,
     ) -> Result<BlsSignature> {
-        self.sign(
-            store,
-            pubkey,
-            self.selection_proof_signing_root(slot),
-            compute_epoch_at_slot(slot),
-            SigningBody::AggregationSlot {
-                aggregation_slot: AggregationSlot { slot },
-            },
-        )
-        .await
+        if let Some(proof) = self.selection_proofs().get(&(*pubkey, slot)) {
+            return Ok(*proof);
+        }
+        let proof = self
+            .sign(
+                store,
+                pubkey,
+                self.selection_proof_signing_root(slot),
+                compute_epoch_at_slot(slot),
+                SigningBody::AggregationSlot {
+                    aggregation_slot: AggregationSlot { slot },
+                },
+            )
+            .await?;
+        let mut proofs = self.selection_proofs();
+        proofs.retain(|(_, held), _| held + SELECTION_PROOF_RETENTION_SLOTS >= slot);
+        proofs.insert((*pubkey, slot), proof);
+        Ok(proof)
+    }
+
+    /// The remembered selection proofs. A poisoned map is still a map of
+    /// valid proofs, since an entry is inserted whole or not at all.
+    fn selection_proofs(&self) -> MutexGuard<'_, HashMap<(BlsPubkey, Slot), BlsSignature>> {
+        self.selection_proofs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Sign `message`, an aggregator's `AggregateAndProof`, on behalf of
@@ -551,10 +647,7 @@ mod tests {
     }
 
     fn context() -> SigningContext {
-        SigningContext {
-            config: Config::mainnet(),
-            genesis_validators_root: Root::ZERO,
-        }
+        SigningContext::new(Config::mainnet(), Root::ZERO)
     }
 
     fn attestation_data(target_epoch: Epoch) -> AttestationData {
@@ -592,6 +685,54 @@ mod tests {
         assert_eq!(
             sig.verify(true, root.as_slice(), DST, &[], &pk, true),
             blst::BLST_ERROR::BLST_SUCCESS
+        );
+    }
+
+    /// One request that never answers costs its own signature, after the
+    /// budget, and nothing else: the others come back as they were.
+    #[tokio::test(start_paused = true)]
+    async fn a_signature_past_the_budget_does_not_hold_back_the_rest() {
+        use futures::FutureExt as _;
+
+        let started = tokio::time::Instant::now();
+        let answered = BlsPubkey([1; 48]);
+        let hung = BlsPubkey([2; 48]);
+        let results = sign_all([
+            (answered, async { Ok(7u8) }.boxed()),
+            (hung, std::future::pending().boxed()),
+        ])
+        .await;
+
+        assert_eq!(started.elapsed(), SIGNING_BUDGET);
+        assert!(matches!(results[0], Ok(7)));
+        assert!(
+            matches!(&results[1], Err(Error::Signing { pubkey, .. }) if *pubkey == hung),
+            "the late one is a signing failure for its own key"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_selection_proof_is_remembered_once_produced() {
+        let (store, pubkey) = store_with_key();
+        let context = context();
+        let first = context
+            .sign_selection_proof(&store, &pubkey, 3200)
+            .await
+            .expect("signs");
+
+        // With the key gone, only the remembered proof can answer.
+        assert!(store.write().await.remove(&pubkey));
+        let again = context
+            .sign_selection_proof(&store, &pubkey, 3200)
+            .await
+            .expect("remembered");
+        assert_eq!(first, again);
+        assert!(
+            context
+                .sign_selection_proof(&store, &pubkey, 3201)
+                .await
+                .is_err(),
+            "another slot is another proof"
         );
     }
 
@@ -1101,7 +1242,7 @@ mod tests {
             let (fake, url) = serve(Answer::Signature).await;
             let (store, pubkey) = remote_store(&url);
             let context = context();
-            let slot = context.config.altair_fork_epoch * preset::SLOTS_PER_EPOCH;
+            let slot = context.config.electra_fork_epoch * preset::SLOTS_PER_EPOCH;
             let header = header(slot);
 
             context
@@ -1112,7 +1253,7 @@ mod tests {
             let requests = fake.requests.lock().expect("lock");
             let body = &requests[0].1;
             assert_eq!(body["type"], "BLOCK_V2");
-            assert_eq!(body["beacon_block"]["version"], "ALTAIR");
+            assert_eq!(body["beacon_block"]["version"], "ELECTRA");
             assert_eq!(
                 body["beacon_block"]["block_header"]["slot"],
                 slot.to_string()
@@ -1122,6 +1263,23 @@ mod tests {
                 serde_json::to_value(context.block_signing_root(header.hash_tree_root(), slot))
                     .expect("root")
             );
+        }
+
+        /// Before bellatrix the signer wants the full block, which this
+        /// client never sends, so the request is refused rather than made.
+        #[tokio::test]
+        async fn a_pre_bellatrix_block_is_not_sent_to_the_signer() {
+            let (fake, url) = serve(Answer::Signature).await;
+            let (store, pubkey) = remote_store(&url);
+            let context = context();
+            let slot = context.config.altair_fork_epoch * preset::SLOTS_PER_EPOCH;
+
+            let err = context
+                .sign_block(&store, &pubkey, &header(slot))
+                .await
+                .expect_err("refused");
+            assert!(matches!(err, Error::Signing { .. }), "got {err:?}");
+            assert!(fake.requests.lock().expect("lock").is_empty());
         }
 
         #[tokio::test]
