@@ -101,3 +101,35 @@ pub(crate) fn inc_state_cache_lookups(method: StateCacheMethod, key: &CacheKey, 
         .with_label_values(&[method.label(), kind, result])
         .inc();
 }
+
+static LEAN_BEACON_PROTO_ARRAY_REBUILDS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "lean_beacon_proto_array_rebuilds_total",
+        "Full rebuilds of the cached beacon fork-choice weights, by what made the cache stale",
+        &["reason"]
+    )
+    .unwrap()
+});
+
+static LEAN_BEACON_PROTO_ARRAY_REBUILD_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
+    register_histogram!(
+        "lean_beacon_proto_array_rebuild_seconds",
+        "Time to rebuild the cached beacon fork-choice weights from every latest message",
+        vec![
+            0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5
+        ]
+    )
+    .unwrap()
+});
+
+/// Count one rebuild of the cached fork-choice weights, by `reason`.
+pub(crate) fn inc_proto_array_rebuilds(reason: &str) {
+    LEAN_BEACON_PROTO_ARRAY_REBUILDS_TOTAL
+        .with_label_values(&[reason])
+        .inc();
+}
+
+/// Time one rebuild of the cached fork-choice weights; the guard records on drop.
+pub(crate) fn time_proto_array_rebuild() -> TimingGuard {
+    TimingGuard::new(&LEAN_BEACON_PROTO_ARRAY_REBUILD_SECONDS)
+}
