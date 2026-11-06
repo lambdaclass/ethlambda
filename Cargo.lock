@@ -1994,6 +1994,7 @@ dependencies = [
  "ethlambda-rpc",
  "ethlambda-state-transition",
  "ethlambda-storage",
+ "ethlambda-telemetry",
  "ethlambda-types",
  "ethlambda-validator",
  "eyre",
@@ -2032,6 +2033,7 @@ dependencies = [
  "ethlambda-network-api",
  "ethlambda-state-transition",
  "ethlambda-storage",
+ "ethlambda-telemetry",
  "ethlambda-test-fixtures",
  "ethlambda-types",
  "hex",
@@ -2112,6 +2114,7 @@ dependencies = [
  "ethlambda-network-api",
  "ethlambda-state-transition",
  "ethlambda-storage",
+ "ethlambda-telemetry",
  "ethlambda-types",
  "ethrex-common",
  "ethrex-p2p",
@@ -2226,6 +2229,20 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "xdelta3",
+]
+
+[[package]]
+name = "ethlambda-telemetry"
+version = "1.0.0"
+dependencies = [
+ "axum",
+ "ethlambda-metrics",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

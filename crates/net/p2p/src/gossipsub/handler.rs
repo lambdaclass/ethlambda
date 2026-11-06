@@ -34,6 +34,7 @@ use super::{
         attestation_subnet_topic, topic_kind,
     },
 };
+use crate::beacon::column_checks::{ColumnArrival, check_and_forward, passed_rows};
 use crate::beacon::constants::ATTESTATION_SUBNET_COUNT;
 use crate::beacon::decode::BeaconGossip;
 use crate::beacon::verdict::{self, Dispatch, GossipId, Validated};
@@ -981,6 +982,15 @@ pub async fn publish_beacon_block(
             .filter(|sidecar| beacon.custody_columns.contains(&sidecar.index()))
             .collect();
         if !custody.is_empty() {
+            let now = Instant::now();
+            // This node built these columns, so they are trusted without a check.
+            ethlambda_telemetry::emit(|| {
+                let arrival = ColumnArrival::received("local", now);
+                custody
+                    .iter()
+                    .flat_map(|sidecar| passed_rows(sidecar, arrival, now))
+                    .collect()
+            });
             let _ = blockchain
                 .new_data_column_sidecars(custody)
                 .inspect_err(|err| error!(%err, "Failed to hand the custody columns to the chain"));
@@ -1086,7 +1096,11 @@ pub async fn publish_execution_payload_envelope(
             .new_execution_payload_envelope(Box::new(envelope), BlockArrival::now())
             .inspect_err(|err| error!(%err, "Failed to hand the published envelope to the chain"));
     }
-    crate::beacon::column_checks::check_and_forward(server, sidecars);
+    check_and_forward(
+        server,
+        sidecars,
+        ColumnArrival::received("local", Instant::now()),
+    );
 }
 
 /// Gossip a payload attestation message a validator client signed, handed
