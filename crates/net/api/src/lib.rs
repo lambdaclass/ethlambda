@@ -33,18 +33,41 @@ pub trait BlockChainToP2P: Send + Sync {
     ) -> Result<(), ActorError>;
     /// Ask peers for whatever of one block this node is missing.
     fn fetch_block(&self, request: FetchRequest) -> Result<(), ActorError>;
-    /// Run the chain checks on sidecars the chain actor had parked, now that
-    /// the block they are checked against has a post-state: their parent for a
-    /// fulu sidecar, their own block for a gloas one.
+    /// Hand sidecars the chain actor holds to the p2p layer, which decides
+    /// what they need before they are stored by where they came from; see
+    /// [`SidecarOrigin`].
     ///
-    /// The chain actor keeps a sidecar without checking it, so it hands these
-    /// back rather than judging them itself: the p2p layer runs every column
-    /// check, off both actors, and sends the ones that pass back through
-    /// [`P2PToBlockChain::new_data_column_sidecars`].
+    /// For [`SidecarOrigin::Parked`] that is the chain checks: sidecars the
+    /// chain actor had parked, now that the block they are checked against has
+    /// a post-state (their parent for a fulu sidecar, their own block for a
+    /// gloas one). The chain actor keeps a sidecar without checking it, so it
+    /// hands these back rather than judging them itself: the p2p layer runs
+    /// every column check, off both actors, and sends the ones that pass back
+    /// through [`P2PToBlockChain::new_data_column_sidecars`].
     fn check_data_column_sidecars(
         &self,
         sidecars: Vec<DataColumnSidecar>,
+        origin: SidecarOrigin,
     ) -> Result<(), ActorError>;
+}
+
+/// Where the sidecars handed to [`BlockChainToP2P::check_data_column_sidecars`]
+/// came from, which decides what the p2p layer does with them before they
+/// reach [`P2PToBlockChain::new_data_column_sidecars`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SidecarOrigin {
+    /// From the network, parked by the chain actor unchecked until the block
+    /// they are judged against had a post-state: run the chain checks.
+    Parked,
+    /// Built by this node from the blobs its own execution client returned
+    /// for a held block (`engine_getBlobsV2`).
+    ///
+    /// Not checked: the fulu `p2p-interface.md` says a client "SHOULD skip
+    /// verification" of blobs from its local execution layer. But it "MUST
+    /// behave as if the `data_column_sidecar` had been received via gossip":
+    /// publish each on its subnet if and only if this node is subscribed to
+    /// it, and record it in the anti-equivocation (seen) cache.
+    ExecutionLayer,
 }
 
 /// What one block is missing, from the chain actor's point of view.

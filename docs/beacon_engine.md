@@ -14,7 +14,7 @@ The wire is
 
 ## Which methods, and why so few
 
-Six:
+Seven:
 
 | Method | Introduced | Why |
 |---|---|---|
@@ -24,14 +24,16 @@ Six:
 | `engine_forkchoiceUpdatedV4` | amsterdam | The same, from a gloas head on; also carries the node's custody columns |
 | `engine_exchangeCapabilities` | common | Startup handshake |
 | `engine_getClientVersionV1` | identification | Log what the execution client is |
+| `engine_getBlobsV2` | osaka | Rebuild a held fulu block's custody columns from the execution client's blob pool |
 
 Osaka introduces **no new `newPayload`**. Its own document adds only
-`engine_getPayloadV5` and `engine_getBlobsV2`/`V3`; `engine_newPayloadV5` belongs
+`engine_getPayloadV5` and `engine_getBlobsV2`/`V3`, of which this node calls
+`engine_getBlobsV2` (see [Blobs from the execution client](#blobs-from-the-execution-client)); `engine_newPayloadV5` belongs
 to Amsterdam, where gloas's envelope import uses it. So the Osaka-current call for a payload is prague's V4, and the
 Osaka-current fork choice notification is cancun's V3. Amsterdam's pair (newPayload V5, forkchoiceUpdated V4) is
 used from gloas on; the startup handshake warns when the execution client does not advertise either, but only on a network whose schedule includes gloas.
 
-Three method families a full client would have are deliberately absent:
+Two method families a full client would have are deliberately absent:
 
 - **`engine_getPayload*` outside the gloas path.** The follower itself never
   asks an execution client to start building a block, so its own
@@ -43,8 +45,6 @@ Three method families a full client would have are deliberately absent:
   `engine_getPayloadV6` (`ExecutionPayloadV4`, with `blockAccessList` and
   `slotNumber`) from gloas on. The handshake warns when a gloas network's
   execution client does not advertise `engine_getPayloadV6`.
-- **`engine_getBlobs*`.** There is no blob-pool fetch path here; data columns come
-  from peers over the network.
 - **`engine_getPayloadBodies*`.** Nothing consumes them.
 
 Blocks before electra are not asked about at all. This node checkpoint-syncs onto
@@ -239,6 +239,88 @@ costs one retry ladder per slot however many envelopes wait. This is the gloas
 counterpart of the limitation below, and unlike a block the envelope is not
 dropped.
 
+## Blobs from the execution client
+
+A fulu block is held until its custody data columns are stored. Gossip usually
+delivers them within a fraction of a second, but the execution client may
+already have every blob the block commits to, since the blob transactions went
+through its pool first. The fulu p2p spec ("Distributed blob publishing using
+blobs retrieved from local execution-layer client") says honest nodes SHOULD
+ask `engine_getBlobsV2` on receiving a valid `beacon_block` or
+`data_column_sidecar` from gossip, and turn a complete answer into data columns.
+The code is `crates/blockchain/src/beacon_blobs.rs`.
+
+**When it fires.** On the first data-availability hold of a block
+(`hold_block_for_columns`), when all of these hold: the block is fulu, it
+commits to at least one blob, and `--execution-endpoint` is set. Any slot and
+any source (gossip or sync) qualifies. A redelivery of a held root does not ask
+again.
+
+**The call.** One attempt with a 1 s timeout (`ENGINE_GET_BLOBS_TIMEOUT`, the
+value `osaka.md` gives the method), outside the retry ladder. The call races
+gossip delivery of the same columns, and a retry after the ladder's first
+backoff would land after that race is decided. A miss leaves the block to
+gossip and the per-slot peer asks, which is where it was anyway. The answer is
+all-or-nothing: `null` means the execution client lacks at least one blob (or is
+syncing), and counts as a miss.
+
+**V2, not V3.** V3 answers partially, but a column holds one cell from every
+blob, so a partial blob set builds no complete column, and this node has no
+partial-column assembly.
+
+**The build.** On a full answer, a blocking task first re-checks that the block
+was not imported meanwhile and which custody columns are still missing from the
+store, then builds only those (cells and sidecars) off the async runtime and off
+the chain actor. It does **not** verify the KZG proofs: the spec says a node
+SHOULD skip verifying blobs from its own execution client.
+
+**The hand-over.** The sidecars go to p2p through the existing
+`check_data_column_sidecars`, with `SidecarOrigin::ExecutionLayer`. That origin
+runs no checks. p2p records each column in the gossip seen cache first (so a
+copy gossip delivers later is ignored, and a column gossip already accepted is
+not published twice), publishes the newly recorded ones on their subnet topics
+if and only if this node is subscribed to them, which here means its custody
+columns, and forwards one batch to the chain actor. The chain actor stores the
+columns and releases the held block through the usual completeness check.
+
+```
+hold (first time) -> engine_getBlobsV2        1 s, one attempt
+                       |-- null / error  -> count; gossip and peer asks carry on
+                       '-- every blob    -> build missing custody columns
+                                            (block imported meanwhile? stop)
+                                                  |
+                         check_data_column_sidecars(ExecutionLayer)
+                                                  |
+   p2p: seen cache -> publish on subscribed subnets -> forward one batch
+                                                  |
+   chain actor: store columns -> release the held block
+```
+
+**Trust.** The proofs are taken as the execution client gives them. One that
+returns wrong proofs makes this node store and publish columns its peers'
+gossip validation rejects, which costs this node peer score. Debug builds
+re-run the chain checks on everything `new_data_column_sidecars` delivers and
+would catch it.
+
+**Not done.**
+
+- No ask when a sidecar arrives, only on a block's first hold.
+- Gloas: data availability moves to the payload envelope, so a held gloas block
+  has no columns to fill this way.
+- Partial columns (see V3 above).
+
+**Metrics.**
+
+| Metric | Reads |
+|---|---|
+| `lean_engine_get_blobs_total{outcome}` | Attempts: `hit`, `miss`, `error` |
+| `lean_engine_get_blobs_duration_seconds` | One round trip, whatever the outcome |
+| `lean_engine_blobs_to_columns_seconds` | Cell computation plus sidecar build |
+| `lean_data_columns_from_execution_layer_total{result}` | What p2p did with each column: `published`, `no_digest`, `already_seen`, `not_custody` |
+
+A high `miss` rate means the execution client's pool does not have the blobs.
+That is normal for old blocks and while the execution client is syncing.
+
 ## `forkchoiceUpdated`
 
 Sent once after every head recompute, which is once per import cascade and once
@@ -297,6 +379,8 @@ The first two must be given **together**: an Engine API endpoint always requires
 authentication, so an endpoint without a secret is refused at startup, before
 anything binds or connects. Clap cannot express "both or neither" across two
 optional flags, so the pairing is checked once, in `From<BeaconOptions>`.
+
+Blob fetching has no flag of its own: it is on whenever `--execution-endpoint` is set.
 
 With **neither** flag, the follower contacts no execution client and every block
 gets `PayloadValidity::NotRequired`, which is exactly what it did before any of

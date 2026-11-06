@@ -55,6 +55,7 @@ pub use events::{ChainEvent, EventBus, Topic, UnknownTopic};
 
 pub mod aggregation;
 mod beacon_aggregates;
+mod beacon_blobs;
 mod beacon_columns;
 pub mod beacon_engine;
 mod beacon_envelope;
@@ -3142,6 +3143,13 @@ impl BlockChainServer {
     /// arrives in; leaving it to the redrive cadence instead made a follower
     /// recovering from a checkpoint sync import roughly one such block per
     /// slot.
+    ///
+    /// The execution client is asked for the block's blobs once, on the first
+    /// hold of a fulu block that commits to any (see [`beacon_blobs`]). That
+    /// does not depend on the peer-ask timing above: it is a local call that
+    /// races nobody, and a hit hands the custody columns back through the same
+    /// path gossip uses, so it is as useful for a block at the tip as for an
+    /// old one.
     fn hold_block_for_columns(
         &mut self,
         block: SignedBeaconBlock,
@@ -3168,6 +3176,23 @@ impl BlockChainServer {
             missing = ?missing,
             "Holding block: its custody columns have not all arrived yet"
         );
+
+        // Before the block is moved into the store. Only the first hold asks:
+        // a redelivery of a held root must not re-query the execution client.
+        if let (Some(engine), Some(p2p), SignedBeaconBlock::Fulu(inner)) =
+            (&self.engine, &self.p2p, &block)
+            && !inner.message.body.blob_kzg_commitments.is_empty()
+            && !self.blocks_awaiting_columns.contains_key(&block_root)
+        {
+            beacon_blobs::spawn_fetch(
+                engine.clone(),
+                p2p.clone(),
+                self.store.clone(),
+                inner.clone(),
+                block_root,
+                self.custody_columns.clone(),
+            );
+        }
 
         // Written the same way a parent-missing block is (see
         // `process_or_pend_block`): no `LiveChain` entry, so it stays
@@ -4665,6 +4690,8 @@ mod tests {
     #[derive(Default)]
     pub(crate) struct RecordingP2P {
         pub(crate) checks: std::sync::Mutex<Vec<Vec<DataColumnSidecar>>>,
+        /// The origin each entry of `checks` was handed over with, in order.
+        pub(crate) check_origins: std::sync::Mutex<Vec<ethlambda_network_api::SidecarOrigin>>,
         pub(crate) fetches: std::sync::Mutex<Vec<FetchRequest>>,
     }
 
@@ -4697,8 +4724,10 @@ mod tests {
         fn check_data_column_sidecars(
             &self,
             sidecars: Vec<DataColumnSidecar>,
+            origin: ethlambda_network_api::SidecarOrigin,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
             self.checks.lock().unwrap().push(sidecars);
+            self.check_origins.lock().unwrap().push(origin);
             Ok(())
         }
     }

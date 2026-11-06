@@ -511,6 +511,28 @@ pub fn inc_data_column_fetch_failure(reason: &str) {
         .inc();
 }
 
+/// Count data column sidecars this node built from its own execution client's
+/// blobs, by what `beacon::engine_columns` did with them. `result` is
+/// `"published"` (newly recorded and sent to its subnet topic), `"no_digest"`
+/// (newly recorded and handed to the chain, but no held digest covers its slot
+/// so nothing was published),`"already_seen"` (gossip delivered that column
+/// first) or `"not_custody"` (not one of this node's columns, so not
+/// subscribed and dropped).
+pub fn inc_data_columns_from_execution_layer(result: &str, count: u64) {
+    static LEAN_DATA_COLUMNS_FROM_EXECUTION_LAYER_TOTAL: LazyLock<IntCounterVec> =
+        LazyLock::new(|| {
+            register_int_counter_vec!(
+                "lean_data_columns_from_execution_layer_total",
+                "Data column sidecars built from the local execution client's blobs, by outcome",
+                &["result"]
+            )
+            .unwrap()
+        });
+    LEAN_DATA_COLUMNS_FROM_EXECUTION_LAYER_TOTAL
+        .with_label_values(&[result])
+        .inc_by(count);
+}
+
 /// Test-only readback of [`inc_data_column_fetch_failure`]'s counter. The
 /// metric otherwise has no consumer inside the crate itself (Prometheus
 /// scrapes it), so this is the only way a test can observe that a failure was
