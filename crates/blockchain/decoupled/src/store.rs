@@ -165,6 +165,12 @@ impl Store {
     /// justified and finalized at its post-state's target height, with the
     /// clock at the anchor's slot.
     pub fn new(params: Params, committees: HeadVoteCommittees, anchor: Anchor) -> Self {
+        // `get_forkchoice_store` asserts the anchor is its own state's target
+        // once `process_slot` has filled the root in.
+        debug_assert!(
+            anchor.fg.target.root == anchor.root || anchor.fg.target.root == H256::ZERO,
+            "the anchor must be its post-state's target"
+        );
         let anchor_height = anchor.fg.target.height;
         let checkpoint = HeightCheckpoint::new(anchor_height, anchor.root);
         let time = slot_start(anchor.slot);
