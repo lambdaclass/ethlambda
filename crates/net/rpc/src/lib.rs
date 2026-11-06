@@ -247,10 +247,6 @@ pub struct BeaconApiHandles {
     pub client_version: ethlambda_engine::types::ClientVersionV1,
     /// What `/eth/v1/node/identity` reports beyond the peer id.
     pub identity: BeaconIdentity,
-    /// The decoupled fork's shared engine, on a network that schedules the
-    /// fork: its duty, pool and status endpoints and block production read
-    /// it. `None` everywhere else.
-    pub decoupled: Option<ethlambda_state_transition::beacon::decoupled_node::SharedDecoupledNode>,
 }
 
 /// Start the HTTP servers for a beacon node.
@@ -278,7 +274,6 @@ pub async fn start_beacon_rpc_server(
         .layer(Extension(handles.engine))
         .layer(Extension(handles.events))
         .layer(Extension(handles.identity))
-        .layer(Extension(handles.decoupled))
         .layer(Extension(beacon::graffiti::OwnVersion(Arc::new(
             handles.client_version,
         ))));
@@ -524,20 +519,6 @@ pub(crate) mod test_utils {
     }
 
     impl ethlambda_network_api::RpcToP2P for RecordingNetwork {
-        fn publish_goldfish_vote(
-            &self,
-            _vote: ethlambda_types::beacon::containers::decoupled::SignedGoldfishVote,
-        ) -> Result<(), spawned_concurrency::error::ActorError> {
-            Ok(())
-        }
-
-        fn publish_combined_attestation(
-            &self,
-            _attestation: ethlambda_types::beacon::containers::decoupled::SignedCombinedAttestation,
-        ) -> Result<(), spawned_concurrency::error::ActorError> {
-            Ok(())
-        }
-
         fn publish_beacon_attestation(
             &self,
             subnet_id: u64,

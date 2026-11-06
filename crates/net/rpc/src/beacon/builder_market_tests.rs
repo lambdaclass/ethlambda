@@ -269,9 +269,6 @@ impl World {
             .layer(Extension(engine.map(|engine| engine.client.clone())))
             .layer(Extension(SharedPayloadAttestationPool::default()))
             .layer(Extension(SharedSyncCommitteePool::default()))
-            .layer(Extension(
-                None::<ethlambda_state_transition::beacon::decoupled_node::SharedDecoupledNode>,
-            ))
             .layer(Extension(crate::beacon::graffiti::OwnVersion(Arc::new(
                 ethlambda_engine::types::ClientVersionV1 {
                     code: "LA".to_string(),

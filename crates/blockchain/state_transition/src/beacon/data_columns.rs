@@ -14,14 +14,14 @@ use rayon::prelude::*;
 
 use crate::beacon::containers::deneb::{Blob, KzgCommitments};
 use crate::beacon::containers::fulu::{self, DataColumnSidecar, KzgCommitmentsInclusionProof};
-use crate::beacon::containers::{BeaconBlockHeader, SignedBeaconBlockHeader, decoupled, electra};
+use crate::beacon::containers::{BeaconBlockHeader, SignedBeaconBlockHeader, electra};
 use crate::beacon::fork_choice::BLOB_KZG_COMMITMENTS_SUBTREE_INDEX;
 use crate::beacon::hash::hash_concat;
 use crate::beacon::kzg::{self, CellsPerExtBlob};
 use crate::beacon::preset::{
     CELLS_PER_EXT_BLOB, KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH, NUMBER_OF_COLUMNS,
 };
-use crate::beacon::primitives::{BlsSignature, Bytes32, HashTreeRoot as _, KzgProof, Root};
+use crate::beacon::primitives::{Bytes32, HashTreeRoot as _, KzgProof, Root};
 
 /// One blob's cell proofs, one per cell.
 pub type ProofsPerBlob = [KzgProof; CELLS_PER_EXT_BLOB];
@@ -50,121 +50,6 @@ pub enum SidecarError {
     InvalidProofs,
 }
 
-/// A signed block whose commitments sidecars are built from: electra's (which
-/// fulu wraps) and the decoupled fork's.
-///
-/// The decoupled body keeps its `blob_kzg_commitments` at the same index among
-/// the same number of leaves (sixteen fields, the last three of which fill what
-/// fulu's body leaves as zero padding), so a fulu sidecar and its inclusion
-/// proof fit unchanged. What differs is the tree the proof is folded in: its
-/// last three leaves are the protocol fields' roots, so the branch has to come
-/// from the decoupled body.
-pub trait SidecarBlock {
-    /// The block's `blob_kzg_commitments`.
-    fn commitments(&self) -> &KzgCommitments;
-
-    /// The sixteen leaves of the body's merkle tree.
-    fn body_leaves(&self) -> [Root; BODY_LEAVES];
-
-    /// The block's signature, which the sidecar header carries.
-    fn block_signature(&self) -> BlsSignature;
-
-    /// The block header, with a zero `body_root` for the caller to fill.
-    fn header_fields(&self) -> BeaconBlockHeader;
-}
-
-impl SidecarBlock for electra::SignedBeaconBlock {
-    fn commitments(&self) -> &KzgCommitments {
-        &self.message.body.blob_kzg_commitments
-    }
-
-    fn body_leaves(&self) -> [Root; BODY_LEAVES] {
-        electra_body_leaves(&self.message.body)
-    }
-
-    fn block_signature(&self) -> BlsSignature {
-        self.signature
-    }
-
-    fn header_fields(&self) -> BeaconBlockHeader {
-        let message = &self.message;
-        BeaconBlockHeader {
-            slot: message.slot,
-            proposer_index: message.proposer_index,
-            parent_root: message.parent_root,
-            state_root: message.state_root,
-            body_root: Root::ZERO,
-        }
-    }
-}
-
-impl SidecarBlock for decoupled::SignedBeaconBlock {
-    fn commitments(&self) -> &KzgCommitments {
-        &self.message.body.blob_kzg_commitments
-    }
-
-    fn body_leaves(&self) -> [Root; BODY_LEAVES] {
-        decoupled_body_leaves(&self.message.body)
-    }
-
-    fn block_signature(&self) -> BlsSignature {
-        self.signature
-    }
-
-    fn header_fields(&self) -> BeaconBlockHeader {
-        let message = &self.message;
-        BeaconBlockHeader {
-            slot: message.slot,
-            proposer_index: message.proposer_index,
-            parent_root: message.parent_root,
-            state_root: message.state_root,
-            body_root: Root::ZERO,
-        }
-    }
-}
-
-fn electra_body_leaves(body: &electra::BeaconBlockBody) -> [Root; BODY_LEAVES] {
-    [
-        body.randao_reveal.hash_tree_root(),
-        body.eth1_data.hash_tree_root(),
-        body.graffiti.hash_tree_root(),
-        body.proposer_slashings.hash_tree_root(),
-        body.attester_slashings.hash_tree_root(),
-        body.attestations.hash_tree_root(),
-        body.deposits.hash_tree_root(),
-        body.voluntary_exits.hash_tree_root(),
-        body.sync_aggregate.hash_tree_root(),
-        body.execution_payload.hash_tree_root(),
-        body.bls_to_execution_changes.hash_tree_root(),
-        body.blob_kzg_commitments.hash_tree_root(),
-        body.execution_requests.hash_tree_root(),
-        Root::ZERO,
-        Root::ZERO,
-        Root::ZERO,
-    ]
-}
-
-fn decoupled_body_leaves(body: &decoupled::BeaconBlockBody) -> [Root; BODY_LEAVES] {
-    [
-        body.randao_reveal.hash_tree_root(),
-        body.eth1_data.hash_tree_root(),
-        body.graffiti.hash_tree_root(),
-        body.proposer_slashings.hash_tree_root(),
-        body.attester_slashings.hash_tree_root(),
-        body.attestations.hash_tree_root(),
-        body.deposits.hash_tree_root(),
-        body.voluntary_exits.hash_tree_root(),
-        body.sync_aggregate.hash_tree_root(),
-        body.execution_payload.hash_tree_root(),
-        body.bls_to_execution_changes.hash_tree_root(),
-        body.blob_kzg_commitments.hash_tree_root(),
-        body.execution_requests.hash_tree_root(),
-        body.goldfish_votes.hash_tree_root(),
-        body.goldfish_support.hash_tree_root(),
-        body.combined_attestations.hash_tree_root(),
-    ]
-}
-
 /// The `blob_kzg_commitments` branch of `body`: `compute_merkle_proof(body,
 /// get_generalized_index(BeaconBlockBody, "blob_kzg_commitments"))`.
 ///
@@ -175,17 +60,7 @@ fn decoupled_body_leaves(body: &decoupled::BeaconBlockBody) -> [Root; BODY_LEAVE
 pub fn blob_kzg_commitments_inclusion_proof(
     body: &electra::BeaconBlockBody,
 ) -> KzgCommitmentsInclusionProof {
-    let (branch, root) = inclusion_proof_and_body_root(electra_body_leaves(body));
-    debug_assert_eq!(root, body.hash_tree_root());
-    branch
-}
-
-/// [`blob_kzg_commitments_inclusion_proof`] for a decoupled body, folded in
-/// that body's own tree.
-pub fn decoupled_blob_kzg_commitments_inclusion_proof(
-    body: &decoupled::BeaconBlockBody,
-) -> KzgCommitmentsInclusionProof {
-    let (branch, root) = inclusion_proof_and_body_root(decoupled_body_leaves(body));
+    let (branch, root) = inclusion_proof_and_body_root(body);
     debug_assert_eq!(root, body.hash_tree_root());
     branch
 }
@@ -193,8 +68,26 @@ pub fn decoupled_blob_kzg_commitments_inclusion_proof(
 /// The branch together with the body root it was folded up to, so a caller
 /// that needs both does not merkleize the body twice.
 fn inclusion_proof_and_body_root(
-    leaves: [Root; BODY_LEAVES],
+    body: &electra::BeaconBlockBody,
 ) -> (KzgCommitmentsInclusionProof, Root) {
+    let leaves: [Root; BODY_LEAVES] = [
+        body.randao_reveal.hash_tree_root(),
+        body.eth1_data.hash_tree_root(),
+        body.graffiti.hash_tree_root(),
+        body.proposer_slashings.hash_tree_root(),
+        body.attester_slashings.hash_tree_root(),
+        body.attestations.hash_tree_root(),
+        body.deposits.hash_tree_root(),
+        body.voluntary_exits.hash_tree_root(),
+        body.sync_aggregate.hash_tree_root(),
+        body.execution_payload.hash_tree_root(),
+        body.bls_to_execution_changes.hash_tree_root(),
+        body.blob_kzg_commitments.hash_tree_root(),
+        body.execution_requests.hash_tree_root(),
+        Root::ZERO,
+        Root::ZERO,
+        Root::ZERO,
+    ];
     let mut layer = leaves.to_vec();
     let mut index = BLOB_KZG_COMMITMENTS_SUBTREE_INDEX as usize;
     let mut branch: Vec<Bytes32> = Vec::with_capacity(KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH);
@@ -214,18 +107,24 @@ fn inclusion_proof_and_body_root(
 
 /// `compute_signed_block_header`: the block's header with its body replaced by
 /// the body's root, under the block's own signature.
-pub fn signed_block_header<B: SidecarBlock>(block: &B) -> SignedBeaconBlockHeader {
-    let (_, body_root) = inclusion_proof_and_body_root(block.body_leaves());
-    header_with_body_root(block, body_root)
+pub fn signed_block_header(block: &electra::SignedBeaconBlock) -> SignedBeaconBlockHeader {
+    header_with_body_root(block, block.message.body.hash_tree_root())
 }
 
-fn header_with_body_root<B: SidecarBlock>(block: &B, body_root: Root) -> SignedBeaconBlockHeader {
+fn header_with_body_root(
+    block: &electra::SignedBeaconBlock,
+    body_root: Root,
+) -> SignedBeaconBlockHeader {
+    let message = &block.message;
     SignedBeaconBlockHeader {
         message: BeaconBlockHeader {
+            slot: message.slot,
+            proposer_index: message.proposer_index,
+            parent_root: message.parent_root,
+            state_root: message.state_root,
             body_root,
-            ..block.header_fields()
         },
-        signature: block.block_signature(),
+        signature: block.signature,
     }
 }
 
@@ -280,14 +179,14 @@ pub fn get_data_column_sidecars(
 ///
 /// If `cells_and_proofs` and the block's commitments differ in length; see
 /// [`get_data_column_sidecars`].
-pub fn get_data_column_sidecars_from_block<B: SidecarBlock>(
-    block: &B,
+pub fn get_data_column_sidecars_from_block(
+    block: &electra::SignedBeaconBlock,
     cells_and_proofs: &[(Box<CellsPerExtBlob>, &ProofsPerBlob)],
 ) -> Vec<DataColumnSidecar> {
-    let (inclusion_proof, body_root) = inclusion_proof_and_body_root(block.body_leaves());
+    let (inclusion_proof, body_root) = inclusion_proof_and_body_root(&block.message.body);
     get_data_column_sidecars(
         &header_with_body_root(block, body_root),
-        block.commitments(),
+        &block.message.body.blob_kzg_commitments,
         &inclusion_proof,
         cells_and_proofs,
     )
@@ -301,12 +200,12 @@ pub fn get_data_column_sidecars_from_block<B: SidecarBlock>(
 /// `verify_data_column_sidecar` rejects a sidecar with zero commitments, so
 /// there is nothing to publish. `cell_proofs` is flattened blob by blob, as
 /// `BlobsBundleV2` and fulu's `BlockContents` carry it.
-pub fn verified_sidecars<B: SidecarBlock>(
-    block: &B,
+pub fn verified_sidecars(
+    block: &electra::SignedBeaconBlock,
     blobs: &[Blob],
     cell_proofs: &[KzgProof],
 ) -> Result<Vec<DataColumnSidecar>, SidecarError> {
-    let commitments = block.commitments();
+    let commitments = &block.message.body.blob_kzg_commitments;
     if blobs.len() != commitments.len() {
         return Err(SidecarError::Shape(
             "the number of blobs differs from the block's commitments",
@@ -366,7 +265,7 @@ mod tests {
         verify_data_column_sidecar_kzg_proofs,
     };
     use crate::beacon::preset::BYTES_PER_BLOB;
-    use crate::beacon::primitives::BLS_SIGNATURE_SIZE;
+    use crate::beacon::primitives::{BLS_SIGNATURE_SIZE, BlsSignature};
 
     /// A blob whose every field element is below the BLS modulus: the first
     /// byte of each 32-byte element is zero, the rest are `seed`-derived.
@@ -429,49 +328,6 @@ mod tests {
             assert!(verify_data_column_sidecar_inclusion_proof(sidecar));
             assert!(verify_data_column_sidecar_kzg_proofs(sidecar).unwrap());
         }
-    }
-
-    #[test]
-    fn a_decoupled_block_proves_inclusion_in_its_own_body_tree() {
-        let blobs = [blob(1)];
-        let (block, proofs) = block_with(&blobs);
-        let mut body = decoupled::BeaconBlockBody::from_electra(block.message.body.clone());
-        // Non-empty protocol fields, so the three extra leaves differ from the
-        // zero padding fulu's tree has there.
-        body.combined_attestations =
-            SszList::try_from(vec![decoupled::CombinedAttestationAggregate {
-                aggregation_bits: libssz_types::SszBitlist::with_length(3).unwrap(),
-                data: Default::default(),
-                signature: Default::default(),
-            }])
-            .unwrap();
-        let decoupled_block = decoupled::SignedBeaconBlock {
-            message: decoupled::BeaconBlock {
-                slot: 1,
-                proposer_index: 0,
-                parent_root: Root::repeat_byte(0x11),
-                state_root: Root::repeat_byte(0x22),
-                body,
-            },
-            signature: block.signature,
-        };
-        let sidecars = verified_sidecars(&decoupled_block, &blobs, &proofs).unwrap();
-        assert_eq!(sidecars.len(), NUMBER_OF_COLUMNS);
-        for sidecar in &sidecars {
-            assert_eq!(
-                sidecar.signed_block_header.message.body_root,
-                decoupled_block.message.body.hash_tree_root()
-            );
-            assert_eq!(
-                sidecar.signed_block_header.message.hash_tree_root(),
-                decoupled_block.message.hash_tree_root()
-            );
-            assert!(verify_data_column_sidecar_inclusion_proof(sidecar));
-            assert!(verify_data_column_sidecar_kzg_proofs(sidecar).unwrap());
-        }
-        // A fulu-shaped proof does not open the decoupled body.
-        let fulu_proof = blob_kzg_commitments_inclusion_proof(&block.message.body);
-        assert_ne!(sidecars[0].kzg_commitments_inclusion_proof, fulu_proof);
     }
 
     #[test]

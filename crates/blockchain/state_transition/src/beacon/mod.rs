@@ -78,8 +78,6 @@ pub use ethlambda_crypto::bls;
 mod bls_fixtures;
 pub mod das;
 pub mod data_columns;
-pub mod decoupled;
-pub mod decoupled_node;
 pub mod fork_choice;
 pub mod genesis;
 pub mod gloas_block_production;

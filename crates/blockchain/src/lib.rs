@@ -62,7 +62,6 @@ mod beacon_payloads;
 pub use beacon_payloads::checkpoint_hash;
 pub mod block_builder;
 pub(crate) mod coverage;
-pub mod decoupled_beacon;
 pub mod decoupled_lean;
 mod epoch_precompute;
 pub mod events;
@@ -313,7 +312,6 @@ impl BlockChain {
             Vec::new(),
             None,
             constants::SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY,
-            None,
         )
     }
 
@@ -348,7 +346,6 @@ impl BlockChain {
         custody_columns: Vec<u64>,
         engine: Option<EngineClient>,
         safe_slots_to_import_optimistically: u64,
-        decoupled: Option<decoupled_beacon::Shared>,
     ) -> BlockChain {
         assert_eq!(
             store.chain(),
@@ -367,7 +364,6 @@ impl BlockChain {
             custody_columns,
             engine,
             safe_slots_to_import_optimistically,
-            decoupled,
         )
     }
 
@@ -395,7 +391,6 @@ impl BlockChain {
         custody_columns: Vec<u64>,
         engine: Option<EngineClient>,
         safe_slots_to_import_optimistically: u64,
-        decoupled: Option<decoupled_beacon::Shared>,
     ) -> BlockChain {
         let genesis_time = store.config().genesis_time;
 
@@ -435,7 +430,6 @@ impl BlockChain {
             sync_status_controller,
             events,
             duties,
-            decoupled,
         }
         // Own thread: these handlers are long synchronous CPU that starves a shared runtime.
         .start_with_backend(Backend::Thread);
@@ -593,9 +587,6 @@ pub struct BlockChainServer {
     /// The lean-only or beacon-only half of this actor's state. See
     /// [`ChainDuties`].
     duties: ChainDuties,
-    /// The decoupled fork's shared engine, on a beacon node whose network
-    /// schedules the fork.
-    pub(crate) decoupled: Option<decoupled_beacon::Shared>,
 }
 
 /// The lean-only or beacon-only half of [`BlockChainServer`]'s state.
@@ -837,10 +828,8 @@ fn data_availability_for(
             }
             Some(fork_choice::DataAvailability::NotRequired)
         }
-        // The decoupled body keeps fulu's commitments field and its column
-        // inclusion proof, so the two share the whole column pipeline.
-        SignedBeaconBlock::Fulu(_) | SignedBeaconBlock::Decoupled(_) => {
-            if block.blob_kzg_commitment_count() == 0 {
+        SignedBeaconBlock::Fulu(inner) => {
+            if inner.message.body.blob_kzg_commitments.is_empty() {
                 return Some(fork_choice::DataAvailability::NotRequired);
             }
 
@@ -873,8 +862,7 @@ fn data_availability_for(
                         .expect("a sidecar this node verified before storing decodes")
                         .expect("presence just confirmed above");
                     match sidecar {
-                        DataColumnSidecar::Fulu(sidecar)
-                        | DataColumnSidecar::Decoupled(sidecar) => sidecar,
+                        DataColumnSidecar::Fulu(sidecar) => sidecar,
                         // The row decodes by its slot's fork, and this arm is
                         // the fulu block at that slot.
                         DataColumnSidecar::Gloas(_) => {
@@ -1078,9 +1066,6 @@ impl BlockChainServer {
                 // votes have to be in fork choice before the head this tick
                 // reports is chosen.
                 self.drain_deferred_aggregates();
-                // The decoupled engine's grades and confirmation run on its
-                // own Δ grid, before the head it picks is read.
-                self.decoupled_tick();
                 self.recompute_beacon_head().await;
             }
         }
@@ -1867,9 +1852,6 @@ impl BlockChainServer {
                 // Drop any hand-off span left by an insert outside this call,
                 // so the one taken below is this block's alone.
                 let _ = self.store.take_state_handoff();
-                // The engine reads the block after fork choice has taken it.
-                let decoupled_block = matches!(beacon_block, SignedBeaconBlock::Decoupled(_))
-                    .then(|| beacon_block.clone());
                 timings.stf_start = Some(Instant::now());
                 let imported = fork_choice::on_block(
                     &mut self.store,
@@ -1909,9 +1891,6 @@ impl BlockChainServer {
                     .store
                     .get_state(&block_root)
                     .expect("DB read should succeed");
-                if let (Some(block), Some(block_state)) = (&decoupled_block, &block_state) {
-                    self.decoupled_import(block, block_state, &committees);
-                }
                 match block_state {
                     Some(block_state) => {
                         // One `Table::LiveChain` scan for the whole body, not
@@ -2046,7 +2025,6 @@ impl BlockChainServer {
             duties: ChainDuties::Beacon,
             beacon_aggregates: Default::default(),
             glamsterdam_banner: Default::default(),
-            decoupled: None,
             store,
         }
     }
@@ -2517,12 +2495,6 @@ impl BlockChainServer {
             head_start: Some(Instant::now()),
             ..HeadTimings::default()
         };
-        if self.decoupled_active() {
-            self.decoupled_update_head();
-            timings.head_end = Some(Instant::now());
-            self.pin_head_shufflings();
-            return timings;
-        }
         let config = self.store.config();
         if let Err(err) = fork_choice::get_head(&mut self.store, &config) {
             // An invalidated justified checkpoint reaches here:
@@ -2586,16 +2558,7 @@ impl BlockChainServer {
         // not been computed yet is skipped. The plan also carries the hashes
         // for a pre-gloas head, which keeps its own cached payload hash;
         // `None` there means a follower still on its checkpoint anchor.
-        let mut plan = beacon_payloads::forkchoice_plan(&self.store, head_root)?;
-        // The decoupled fork's safe and finalized blocks are its stable and
-        // finalized tips: the legacy checkpoints stay at the fork boundary.
-        if self.decoupled_active()
-            && let Some((stable, finalized)) = self.decoupled_safe_and_finalized()
-        {
-            plan.state.safe_block_hash = beacon_payloads::checkpoint_hash(&self.store, stable);
-            plan.state.finalized_block_hash =
-                beacon_payloads::checkpoint_hash(&self.store, finalized);
-        }
+        let plan = beacon_payloads::forkchoice_plan(&self.store, head_root)?;
         let state = plan.state;
         let gloas = plan.gloas;
 
@@ -3754,12 +3717,6 @@ impl BlockChainServer {
         let config = self.store.config();
         match &self.duties {
             ChainDuties::Lean(_) => ms_until_next_interval(now_ms, &config.time_grid()),
-            // The decoupled fork's duties and grades fall on a quarter-slot grid.
-            ChainDuties::Beacon if self.decoupled.is_some() => ms_until_next_boundary(
-                now_ms,
-                config.genesis_time_ms(),
-                config.slot_duration_ms / 4,
-            ),
             ChainDuties::Beacon => {
                 ms_until_next_beacon_slot(now_ms, config.genesis_time_ms(), config.slot_duration_ms)
             }
@@ -4503,7 +4460,6 @@ mod tests {
             Vec::new(),
             None,
             constants::SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY,
-            None,
         );
     }
 
@@ -4538,7 +4494,6 @@ mod tests {
             sync_status: SyncStatusTracker::new(false),
             sync_status_controller: SyncStatusController::default(),
             duties: ChainDuties::Beacon,
-            decoupled: None,
         }
     }
 

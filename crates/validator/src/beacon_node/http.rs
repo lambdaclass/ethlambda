@@ -23,12 +23,8 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use ethlambda_decoupled::AttestationInput;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::altair;
-use ethlambda_types::beacon::containers::decoupled::{
-    GoldfishVoteData, SignedCombinedAttestation, SignedGoldfishVote,
-};
 use ethlambda_types::beacon::containers::electra::Attestation;
 use ethlambda_types::beacon::containers::gloas;
 use ethlambda_types::beacon::containers::shared::AttestationData;
@@ -414,30 +410,6 @@ impl HttpBeaconNode {
              &subcommittee_index={subcommittee_index}&beacon_block_root={}",
             encode_hex(&beacon_block_root.0),
         )
-    }
-
-    /// POST a JSON batch to a pool endpoint that answers 200 on success and the
-    /// per-index `failures` body otherwise, with the partial-success reading of
-    /// [`Self::handle_pool_submission`].
-    async fn submit_pool_batch<T: Serialize>(&self, path: &str, batch: &[T]) -> Result<usize> {
-        let url = format!("{}{path}", self.base_url);
-        let response = self
-            .client
-            .post(&url)
-            .json(batch)
-            .send()
-            .await
-            .map_err(|err| Error::BeaconNode {
-                url: url.clone(),
-                failure: BeaconNodeFailure::classify(&err),
-                detail: err.to_string(),
-            })?;
-        let status = response.status();
-        if status.is_success() {
-            return Ok(batch.len());
-        }
-        let body = response.text().await.unwrap_or_default();
-        Self::handle_pool_submission(status, body, batch.len())
     }
 
     /// Turn a non-2xx response from the pool-attestations endpoint into
@@ -845,51 +817,6 @@ impl BeaconNodeApi for HttpBeaconNode {
         Self::handle_pool_submission(status, body, messages.len())
     }
 
-    async fn goldfish_vote_data(&self, slot: Slot) -> Result<GoldfishVoteData> {
-        let response: DataResponse<GoldfishVoteData> = self
-            .get(&format!(
-                "/eth/v1/validator/decoupled/goldfish_vote_data?slot={slot}"
-            ))
-            .await?;
-        // Enforced here for the reason the other fetches' checks are: this is
-        // signable material.
-        if response.data.slot != slot {
-            return Err(Error::InconsistentResponse(format!(
-                "requested goldfish vote data for slot {slot}, node answered for slot {}",
-                response.data.slot
-            )));
-        }
-        Ok(response.data)
-    }
-
-    async fn submit_goldfish_votes(&self, votes: &[SignedGoldfishVote]) -> Result<usize> {
-        self.submit_pool_batch("/eth/v1/beacon/pool/goldfish_votes", votes)
-            .await
-    }
-
-    async fn decoupled_attestation_input(&self, round: u64) -> Result<AttestationInput> {
-        let response: DataResponse<AttestationInput> = self
-            .get(&format!(
-                "/eth/v1/validator/decoupled/attestation_input?round={round}"
-            ))
-            .await?;
-        if response.data.round != round {
-            return Err(Error::InconsistentResponse(format!(
-                "requested attestation input for round {round}, node answered for round {}",
-                response.data.round
-            )));
-        }
-        Ok(response.data)
-    }
-
-    async fn submit_combined_attestations(
-        &self,
-        attestations: &[SignedCombinedAttestation],
-    ) -> Result<usize> {
-        self.submit_pool_batch("/eth/v1/beacon/pool/combined_attestations", attestations)
-            .await
-    }
-
     /// Distinct from `post_no_content`: this endpoint's 400s are not always
     /// total failures. See [`Self::handle_pool_submission`].
     async fn submit_attestations(
@@ -962,13 +889,6 @@ impl BeaconNodeApi for HttpBeaconNode {
                      is the earliest supported",
                     fork.as_str()
                 )));
-            }
-            // The decoupled fork has no attestations, so no aggregate either.
-            ForkName::Decoupled => {
-                return Err(Error::InconsistentResponse(
-                    "node produced a decoupled aggregate, but that fork has no attestations"
-                        .to_string(),
-                ));
             }
             ForkName::Electra | ForkName::Fulu => {
                 let dto: AttestationDto = serde_json::from_value(response.data)

@@ -38,7 +38,7 @@ use super::{
 };
 use crate::beacon::constants::ATTESTATION_SUBNET_COUNT;
 use crate::beacon::decode::BeaconGossip;
-use crate::beacon::verdict::{self, DecoupledMessage, Dispatch, GossipId, Validated};
+use crate::beacon::verdict::{self, Dispatch, GossipId, Validated};
 use crate::beacon::{BeaconWire, decode as beacon_decode, topics as beacon_topics};
 use crate::{P2PServer, metrics};
 
@@ -362,11 +362,6 @@ fn handle_beacon_gossip(
         triage_aggregate(server, wire, payload, id.received_at)
     } else if let Some(subnet_id) = beacon_topics::attestation_subnet(kind) {
         triage_attestation(server, topic_fork, payload, subnet_id)
-    } else if matches!(
-        kind,
-        beacon_topics::GOLDFISH_VOTE | beacon_topics::COMBINED_ATTESTATION
-    ) {
-        triage_decoupled_vote(server, kind, payload)
     } else if kind == beacon_topics::EXECUTION_PAYLOAD {
         triage_envelope(server, payload)
     } else if kind == beacon_topics::PAYLOAD_ATTESTATION_MESSAGE {
@@ -400,103 +395,6 @@ fn handle_beacon_gossip(
         }
         Dispatch::Validate(object) => verdict::spawn_stateful_checks(server, ctx, id, object),
     }
-}
-
-/// The decoupled fork's `goldfish_vote` and `combined_attestation` topics.
-///
-/// Decoded here; checked against the head state (a vote's committee
-/// membership, and either message's signature) and offered to the shared
-/// decoupled engine on a blocking thread ([`Validated::Decoupled`]), since a
-/// round's attestations arrive together and each costs a state read and a BLS
-/// verification. Accepted when the engine admits it, so only what this node
-/// holds is relayed; ignored when the engine refuses it (outside its slot or
-/// round window, a repeat, a third distinct vote), and rejected when malformed
-/// or wrongly signed.
-fn triage_decoupled_vote(server: &P2PServer, kind: &str, payload: &[u8]) -> Dispatch {
-    use ethlambda_types::beacon::containers::decoupled::{
-        SignedCombinedAttestation, SignedGoldfishVote,
-    };
-    let Some(node) = server.decoupled_node.clone() else {
-        metrics::inc_beacon_gossip(kind, "no_consumer");
-        return Dispatch::Report(Outcome::Ignore(IgnoreReason::NoConsumer));
-    };
-    let message = if kind == beacon_topics::GOLDFISH_VOTE {
-        SignedGoldfishVote::from_ssz_bytes(payload).map(DecoupledMessage::Vote)
-    } else {
-        SignedCombinedAttestation::from_ssz_bytes(payload)
-            .map(|attestation| DecoupledMessage::Attestation(Box::new(attestation)))
-    };
-    let Ok(message) = message else {
-        metrics::inc_beacon_gossip(kind, "decode_failed");
-        return Dispatch::Report(Outcome::Reject(RejectReason::Decode));
-    };
-    Dispatch::Validate(Validated::Decoupled { message, node })
-}
-
-/// Publish under the digest of `slot`'s epoch, on `kind`.
-fn publish_decoupled_beacon(server: &P2PServer, slot: u64, kind: &str, bytes: Vec<u8>) {
-    let Some(beacon) = server.wire.beacon() else {
-        error!(
-            kind,
-            "A decoupled beacon message reached a lean node; dropping it"
-        );
-        return;
-    };
-    let Some(digest) = beacon.publish_digest(slot) else {
-        warn!(
-            slot,
-            kind, "No held fork digest covers this message's slot; not publishing"
-        );
-        return;
-    };
-    let topic = IdentTopic::new(beacon_topics::topic_name(digest, kind));
-    server.swarm_handle.publish(topic, compress_message(&bytes));
-}
-
-/// Gossip a Goldfish vote this node's validator client submitted.
-pub fn publish_goldfish_vote(
-    server: &P2PServer,
-    vote: ethlambda_types::beacon::containers::decoupled::SignedGoldfishVote,
-) {
-    trace!(
-        slot = vote.data.slot,
-        validator = vote.validator_index,
-        "Publishing Goldfish vote"
-    );
-    publish_decoupled_beacon(
-        server,
-        vote.data.slot,
-        beacon_topics::GOLDFISH_VOTE,
-        vote.to_ssz(),
-    );
-}
-
-/// Gossip a combined attestation this node's validator client submitted.
-pub fn publish_combined_attestation(
-    server: &P2PServer,
-    attestation: ethlambda_types::beacon::containers::decoupled::SignedCombinedAttestation,
-) {
-    // Published under the digest of the slot it is being sent at: the
-    // round's attestation time falls in its second slot.
-    let slot = server
-        .decoupled_node
-        .as_ref()
-        .map(|node| {
-            let node = node.lock().expect("decoupled node lock poisoned");
-            node.params().opening_slot(attestation.data.round) + 1
-        })
-        .unwrap_or(0);
-    trace!(
-        round = attestation.data.round,
-        validator = attestation.validator_index,
-        "Publishing combined attestation"
-    );
-    publish_decoupled_beacon(
-        server,
-        slot,
-        beacon_topics::COMBINED_ATTESTATION,
-        attestation.to_ssz(),
-    );
 }
 
 /// Decode a beacon block and run its cheap gossip checks: a verdict already,
@@ -574,15 +472,13 @@ fn triage_data_column(
     metrics::inc_beacon_gossip(KIND, "decoded");
     let now_ms = unix_now_ms();
     let cheap = match &sidecar {
-        DataColumnSidecar::Fulu(sidecar) | DataColumnSidecar::Decoupled(sidecar) => {
-            gossip::column::cheap_checks(
-                &server.seen_columns,
-                &server.store,
-                sidecar,
-                subnet_id,
-                now_ms,
-            )
-        }
+        DataColumnSidecar::Fulu(sidecar) => gossip::column::cheap_checks(
+            &server.seen_columns,
+            &server.store,
+            sidecar,
+            subnet_id,
+            now_ms,
+        ),
         DataColumnSidecar::Gloas(sidecar) => gossip::column::cheap_checks_gloas(
             &server.seen_block_columns,
             &server.store,
@@ -1369,10 +1265,6 @@ pub fn join_aggregator_subnets(server: &mut P2PServer, subnets: Vec<(u64, u64)>)
     let Some(wire) = server.wire.beacon() else {
         return;
     };
-    // The decoupled fork has no attestation subnets to aggregate on.
-    if wire.fork == ForkName::Decoupled {
-        return;
-    }
     let mut joined = Vec::new();
     for (subnet_id, slot) in subnets {
         if subnet_id >= ATTESTATION_SUBNET_COUNT

@@ -8,8 +8,7 @@
 //! a subnet attestation from [`P2PServer::attestation_validation_permits`] (see
 //! that field's own documentation for why they must not share one), a sync
 //! committee message or contribution from
-//! [`P2PServer::sync_validation_permits`], a decoupled fork's Goldfish vote or
-//! combined attestation from the attestation pool. Either way
+//! [`P2PServer::sync_validation_permits`]. Either way
 //! the blocking task sends a [`GossipVerdict`] back to the actor. Every beacon
 //! gossip message ends in exactly one [`report`]: gossipsub holds each one
 //! until then.
@@ -19,18 +18,11 @@ use std::time::Instant;
 
 use ethlambda_network_api::{AggregateArrival, BlockAnnouncement, BlockArrival, BlockSource};
 use ethlambda_state_transition::beacon::builder_market::SharedBuilderMarket;
-use ethlambda_state_transition::beacon::decoupled_node::{
-    DecoupledMessageError, SharedDecoupledNode, validate_combined_attestation,
-    validate_goldfish_vote,
-};
-use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome, RejectReason};
+use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome};
 use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCacheExt as _;
 use ethlambda_storage::{CacheKey, Store};
 use ethlambda_types::beacon::containers::altair::{
     SignedContributionAndProof, SyncCommitteeMessage,
-};
-use ethlambda_types::beacon::containers::decoupled::{
-    SignedCombinedAttestation, SignedGoldfishVote,
 };
 use ethlambda_types::beacon::containers::electra::{self, SingleAttestation};
 use ethlambda_types::beacon::containers::gloas::{
@@ -118,20 +110,6 @@ pub(crate) enum Validated {
     },
     /// A `sync_committee_contribution_and_proof`.
     SyncContribution(Box<SignedContributionAndProof>),
-    /// A decoupled fork's `goldfish_vote` or `combined_attestation`. Carries
-    /// the engine because admission is part of its checks: it is accepted
-    /// only when the engine takes it, so only what this node holds is relayed.
-    Decoupled {
-        message: DecoupledMessage,
-        node: SharedDecoupledNode,
-    },
-}
-
-/// The two messages of the decoupled fork's vote topics.
-pub(crate) enum DecoupledMessage {
-    Vote(SignedGoldfishVote),
-    // Boxed: three lists and a signature, wider than the vote.
-    Attestation(Box<SignedCombinedAttestation>),
 }
 
 impl Validated {
@@ -147,9 +125,7 @@ impl Validated {
                 gossip::block::stateful_checks(store, block, *block_root)
             }
             Self::Column(sidecar) => match &**sidecar {
-                DataColumnSidecar::Fulu(sidecar) | DataColumnSidecar::Decoupled(sidecar) => {
-                    gossip::column::stateful_checks(store, sidecar)
-                }
+                DataColumnSidecar::Fulu(sidecar) => gossip::column::stateful_checks(store, sidecar),
                 DataColumnSidecar::Gloas(sidecar) => {
                     gossip::column::stateful_checks_gloas(store, sidecar)
                 }
@@ -195,7 +171,6 @@ impl Validated {
             Self::SyncContribution(signed) => {
                 gossip::sync_committee::contribution_stateful_checks(store, signed)
             }
-            Self::Decoupled { message, node } => decoupled_stateful_checks(store, node, message),
         }
     }
 
@@ -209,7 +184,7 @@ impl Validated {
                     .record(block.slot(), block.proposer_index(), *block_root)
             }
             Self::Column(sidecar) => match &**sidecar {
-                DataColumnSidecar::Fulu(sidecar) | DataColumnSidecar::Decoupled(sidecar) => {
+                DataColumnSidecar::Fulu(sidecar) => {
                     let header = &sidecar.signed_block_header.message;
                     server
                         .seen_columns
@@ -253,9 +228,6 @@ impl Validated {
                     .record(message.slot, message.validator_index, *subnet_id)
             }
             Self::SyncContribution(signed) => server.seen_sync_contributions.record(signed),
-            // Admitted by the engine in `stateful_checks`, which refuses a
-            // repeat: that is this topic's seen cache.
-            Self::Decoupled { .. } => true,
         }
     }
 
@@ -426,9 +398,7 @@ impl Validated {
             | Self::PayloadAttestation(_)
             | Self::Operation(_)
             | Self::SyncCommitteeMessage { .. }
-            | Self::SyncContribution(_)
-            // Already in the engine, which the chain actor reads.
-            | Self::Decoupled { .. } => {}
+            | Self::SyncContribution(_) => {}
         }
     }
 }
@@ -464,8 +434,7 @@ fn record_liveness(server: &P2PServer, object: &Validated) {
         | Validated::ProposerPreferences(_)
         | Validated::Operation(_)
         | Validated::SyncCommitteeMessage { .. }
-        | Validated::SyncContribution(_)
-        | Validated::Decoupled { .. } => {}
+        | Validated::SyncContribution(_) => {}
     }
 }
 
@@ -639,66 +608,13 @@ fn permits_for<'a>(
         Validated::Aggregate { .. }
         | Validated::Attestation { .. }
         | Validated::PayloadAttestation(_)
-        | Validated::Operation(_)
-        | Validated::Decoupled { .. } => &server.attestation_validation_permits,
+        | Validated::Operation(_) => &server.attestation_validation_permits,
         Validated::ExecutionPayloadBid { .. } | Validated::ProposerPreferences(_) => {
             &server.builder_validation_permits
         }
         Validated::SyncCommitteeMessage { .. } | Validated::SyncContribution(_) => {
             &server.sync_validation_permits
         }
-    }
-}
-
-/// A decoupled vote's or attestation's checks against the head state, then
-/// the engine's admission.
-///
-/// A committee the head state cannot compute is this node's gap, not the
-/// sender's fault, so it is ignored; a wrong committee, an unknown validator or
-/// a bad signature is rejected.
-fn decoupled_stateful_checks(
-    store: &Store,
-    node: &SharedDecoupledNode,
-    message: &DecoupledMessage,
-) -> Outcome {
-    let Some((_, head_root)) = store.beacon_head() else {
-        return Outcome::Ignore(IgnoreReason::StateUnavailable);
-    };
-    let Ok(Some(state)) = store.get_state(&head_root) else {
-        return Outcome::Ignore(IgnoreReason::StateUnavailable);
-    };
-    let config = store.config();
-    let checked = match message {
-        DecoupledMessage::Vote(vote) => {
-            validate_goldfish_vote(&state, &config, &store.committee_cache(), vote)
-        }
-        DecoupledMessage::Attestation(attestation) => {
-            validate_combined_attestation(&state, &config, attestation)
-        }
-    };
-    if let Err(err) = checked {
-        debug!(%err, "Invalid decoupled vote");
-        return match err {
-            DecoupledMessageError::Committee(_) => Outcome::Ignore(IgnoreReason::StateUnavailable),
-            DecoupledMessageError::NotAdmitted => Outcome::Ignore(IgnoreReason::AlreadySeen),
-            DecoupledMessageError::NotInCommittee { .. } => {
-                Outcome::Reject(RejectReason::NotInCommittee)
-            }
-            DecoupledMessageError::UnknownValidator(_) => {
-                Outcome::Reject(RejectReason::UnknownValidator)
-            }
-            DecoupledMessageError::BadSignature => Outcome::Reject(RejectReason::BadSignature),
-        };
-    }
-    let mut node = node.lock().expect("decoupled node lock poisoned");
-    let admitted = match message {
-        DecoupledMessage::Vote(vote) => node.add_vote(vote),
-        DecoupledMessage::Attestation(attestation) => node.add_attestation(attestation),
-    };
-    if admitted {
-        Outcome::Accept
-    } else {
-        Outcome::Ignore(IgnoreReason::AlreadySeen)
     }
 }
 

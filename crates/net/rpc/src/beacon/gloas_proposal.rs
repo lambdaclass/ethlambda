@@ -706,10 +706,7 @@ fn prepare(
         head_slot,
         parent_requests,
         preferences,
-        options: BlockProcessingOptions {
-            randao,
-            ..Default::default()
-        },
+        options: BlockProcessingOptions { randao },
     })
 }
 
@@ -1209,9 +1206,6 @@ mod tests {
             .layer(Extension(SharedBuilderMarket::default()))
             .layer(Extension(FeeRecipients::default()))
             .layer(Extension(NodeCustodyColumns::default()))
-            .layer(Extension(
-                None::<ethlambda_state_transition::beacon::decoupled_node::SharedDecoupledNode>,
-            ))
             .layer(Extension(OwnVersion(Arc::new(ClientVersionV1 {
                 code: "LA".to_string(),
                 name: "ethlambda".to_string(),

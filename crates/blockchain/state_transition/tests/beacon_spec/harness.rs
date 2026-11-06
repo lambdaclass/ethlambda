@@ -69,11 +69,7 @@ pub fn trials() -> Vec<Trial> {
         }),
         Trial::test("harness/discovery_covers_every_supported_fork", || {
             let cases = collect(PRESET, "ssz_static", "Checkpoint");
-            // Decoupled is this client's own fork: no fixture directory exists.
-            for fork in ForkName::ALL
-                .into_iter()
-                .filter(|fork| *fork != ForkName::Decoupled)
-            {
+            for fork in ForkName::ALL {
                 assert!(
                     cases.iter().any(|case| case.fork == fork),
                     "discovery found no {fork} cases; the fixture release is expected to \

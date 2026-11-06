@@ -21,7 +21,6 @@ pub(crate) mod blocks;
 pub(crate) mod builder_config;
 pub(crate) mod builders;
 pub(crate) mod config;
-pub(crate) mod decoupled;
 pub(crate) mod envelopes;
 pub(crate) mod events;
 pub(crate) mod genesis;
@@ -200,7 +199,6 @@ pub(crate) fn routes(version: &'static str, peer_id: String) -> Router<Store> {
         .merge(proposer_preferences::routes())
         .merge(builders::routes())
         .merge(sync_committee::routes())
-        .merge(decoupled::routes())
 }
 
 #[cfg(test)]

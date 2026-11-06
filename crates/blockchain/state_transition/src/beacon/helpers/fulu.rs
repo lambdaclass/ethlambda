@@ -140,7 +140,7 @@ fn proposer_lookahead<'a>(
     function: &'static str,
 ) -> Result<&'a fulu::ProposerLookahead> {
     match state {
-        BeaconState::Fulu(inner) | BeaconState::Decoupled(inner) => Ok(&inner.proposer_lookahead),
+        BeaconState::Fulu(inner) => Ok(&inner.proposer_lookahead),
         BeaconState::Gloas(inner) => Ok(&inner.proposer_lookahead),
         other => Err(Error::UnsupportedForFork {
             function,
@@ -160,9 +160,7 @@ pub(crate) fn proposer_lookahead_mut<'a>(
     function: &'static str,
 ) -> Result<&'a mut fulu::ProposerLookahead> {
     match state {
-        BeaconState::Fulu(inner) | BeaconState::Decoupled(inner) => {
-            Ok(&mut inner.proposer_lookahead)
-        }
+        BeaconState::Fulu(inner) => Ok(&mut inner.proposer_lookahead),
         BeaconState::Gloas(inner) => Ok(&mut inner.proposer_lookahead),
         other => Err(Error::UnsupportedForFork {
             function,
@@ -236,7 +234,7 @@ pub(crate) fn fulu_state<'a>(
     function: &'static str,
 ) -> Result<&'a mut fulu::BeaconState> {
     match state {
-        BeaconState::Fulu(state) | BeaconState::Decoupled(state) => Ok(state),
+        BeaconState::Fulu(state) => Ok(state),
         other => Err(Error::UnsupportedForFork {
             function,
             fork: other.fork_name(),
@@ -250,7 +248,7 @@ pub(crate) fn fulu_state_ref<'a>(
     function: &'static str,
 ) -> Result<&'a fulu::BeaconState> {
     match state {
-        BeaconState::Fulu(state) | BeaconState::Decoupled(state) => Ok(state),
+        BeaconState::Fulu(state) => Ok(state),
         other => Err(Error::UnsupportedForFork {
             function,
             fork: other.fork_name(),

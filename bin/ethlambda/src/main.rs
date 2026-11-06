@@ -61,8 +61,7 @@ use ethlambda_types::{
     aggregator::AggregatorController,
     beacon::config::Config,
     beacon::containers::{
-        BeaconState, SignedBeaconBlock, altair, bellatrix, capella, decoupled, deneb, electra,
-        gloas, phase0,
+        BeaconState, SignedBeaconBlock, altair, bellatrix, capella, deneb, electra, gloas, phase0,
     },
     beacon::fork::ForkName,
     beacon::primitives::Epoch,
@@ -285,9 +284,6 @@ enum ChainActor {
         /// The checkpoint-sync URLs to ask for a gloas anchor's execution
         /// payload envelope; empty when there is nothing to ask.
         anchor_envelope_urls: Vec<String>,
-        /// The decoupled fork's shared engine, when the network schedules the
-        /// fork.
-        decoupled: Option<ethlambda_state_transition::beacon::decoupled_node::SharedDecoupledNode>,
     },
 }
 
@@ -442,10 +438,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         Network::Lean(_) => None,
         Network::Mainnet { mainnet, .. } => {
             let spec = network::NetworkSpec::parse(&mainnet.network)?;
-            Some(network::NetworkSource::resolve_with(
-                &spec,
-                &network::ConfigOverrides::from(mainnet),
-            )?)
+            Some(network::NetworkSource::resolve(&spec)?)
         }
     };
 
@@ -703,7 +696,6 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                 fetch_initial_beacon_state(&clean_checkpoint_urls, backend.clone(), &source)
                     .await
                     .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
-            let decoupled_node = beacon_decoupled_node(&store)?;
 
             let engine = match &execution {
                 None => {
@@ -759,7 +751,6 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     safe_slots_to_import_optimistically: mainnet
                         .safe_slots_to_import_optimistically,
                     anchor_envelope_urls: clean_checkpoint_urls.clone(),
-                    decoupled: decoupled_node,
                 },
                 decoupled: None,
             }
@@ -861,17 +852,6 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         ChainActor::Beacon { engine, .. } => engine.clone(),
         ChainActor::Lean(..) => None,
     };
-    let beacon_decoupled = match &setup.chain {
-        ChainActor::Beacon { decoupled, .. } => decoupled.clone(),
-        ChainActor::Lean(..) => None,
-    };
-    if let Some(node) = &beacon_decoupled {
-        p2p.actor_ref()
-            .recipient::<ethlambda_p2p::SetDecoupledNode>()
-            .send(ethlambda_p2p::SetDecoupledNode(node.clone()))
-            .inspect_err(|err| error!(%err, "Failed to hand the decoupled node to p2p"))?;
-    }
-    let rpc_decoupled = beacon_decoupled.clone();
 
     // Which HTTP surface this node serves follows from the store's own chain
     // tag rather than from the sub-command, so the two can never disagree.
@@ -896,7 +876,6 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     events: rpc_events,
                     client_version: version::engine_client_version(),
                     identity: rpc_identity,
-                    decoupled: rpc_decoupled,
                 },
                 local_peer_id,
                 rpc_shutdown,
@@ -928,7 +907,6 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             engine,
             safe_slots_to_import_optimistically,
             anchor_envelope_urls,
-            decoupled,
         } => {
             check_custody_set(&custody_columns)?;
             anchor_envelope_fetch = missing_anchor_envelope_root(&setup.store)
@@ -941,7 +919,6 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                 custody_columns,
                 engine,
                 safe_slots_to_import_optimistically,
-                decoupled,
             )
         }
     };
@@ -1019,70 +996,6 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     })
     .await;
     Ok(())
-}
-
-/// The decoupled fork's shared engine for a beacon network that schedules
-/// the fork, or `None`.
-///
-/// Only activation at genesis is supported: the engine is anchored at the
-/// genesis block, which every node agrees on. Activating it mid-chain would
-/// need an anchor agreed across nodes at the boundary (the legacy finalized
-/// block is the natural one) and a rule for the first decoupled proposals,
-/// which have no previous-slot Goldfish votes to walk by.
-///
-/// The electorate is the genesis registry weighted by effective balance in
-/// increments, fixed for the run as the protocol assumes. Blocks a previous
-/// run stored are replayed, so a restarted node rebuilds the engine.
-fn beacon_decoupled_node(
-    store: &Store,
-) -> eyre::Result<Option<ethlambda_state_transition::beacon::decoupled_node::SharedDecoupledNode>> {
-    use ethlambda_state_transition::beacon::decoupled_node::DecoupledNode;
-    use ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
-    use ethlambda_types::beacon::preset::EFFECTIVE_BALANCE_INCREMENT;
-
-    let config = store.config();
-    if config.decoupled_fork_epoch == FAR_FUTURE_EPOCH {
-        return Ok(None);
-    }
-    eyre::ensure!(
-        config.decoupled_fork_epoch == 0,
-        "the decoupled fork is only supported from genesis (DECOUPLED_FORK_EPOCH: 0), got {}",
-        config.decoupled_fork_epoch
-    );
-    // The legacy finalized checkpoint never moves in this fork, so it is the
-    // genesis anchor on a fresh directory and on a resumed one alike.
-    let anchor = store.beacon_finalized_checkpoint();
-    eyre::ensure!(
-        anchor.epoch == 0,
-        "a decoupled network must be anchored at genesis, not at epoch {}",
-        anchor.epoch
-    );
-    let state = store
-        .get_state(&anchor.root)
-        .map_err(|err| eyre::eyre!("{err}"))?
-        .ok_or_else(|| eyre::eyre!("no genesis state to weigh the decoupled electorate with"))?;
-    let weights = state
-        .iter_validators()
-        .map(|validator| {
-            let active = validator.activation_epoch == 0 && validator.exit_epoch > 0;
-            if active {
-                validator.effective_balance / EFFECTIVE_BALANCE_INCREMENT
-            } else {
-                0
-            }
-        })
-        .collect::<Vec<_>>();
-    let validators = weights.iter().filter(|w| **w > 0).count();
-    let node = DecoupledNode::new(&config, anchor.root, weights).shared();
-    let replayed = ethlambda_blockchain::decoupled_beacon::replay(store, &node);
-    info!(
-        genesis_root = %ethlambda_types::ShortRoot(&anchor.root.0),
-        validators,
-        slots_per_round = config.decoupled_slots_per_round,
-        replayed,
-        "Running the decoupled fork from genesis"
-    );
-    Ok(Some(node))
 }
 
 /// The decoupled chain actor's configuration for a lean network.
@@ -1911,16 +1824,6 @@ fn first_config_difference(
         electra_fork_epoch: _,
         fulu_fork_version: _,
         fulu_fork_epoch: _,
-        // The decoupled fork's version and epoch are compared per fork below
-        // like every other fork's; its protocol parameters are consensus
-        // rules, compared below with the other chain values.
-        decoupled_fork_version: _,
-        decoupled_fork_epoch: _,
-        decoupled_slots_per_round: _,
-        decoupled_sg_window: _,
-        decoupled_nonjustifiable_period: _,
-        decoupled_finality_debt: _,
-        decoupled_timeout_delay: _,
         gloas_fork_version: _,
         gloas_fork_epoch: _,
 
@@ -2099,11 +2002,6 @@ fn first_config_difference(
     }
 
     compare!(
-        decoupled_slots_per_round,
-        decoupled_sg_window,
-        decoupled_nonjustifiable_period,
-        decoupled_finality_debt,
-        decoupled_timeout_delay,
         seconds_per_slot,
         slot_duration_ms,
         min_validator_withdrawability_delay,
@@ -2478,16 +2376,6 @@ fn genesis_anchor_block(state: &BeaconState) -> SignedBeaconBlock {
                 parent_root,
                 state_root,
                 body: electra::BeaconBlockBody::empty(),
-            },
-            signature: Default::default(),
-        }),
-        ForkName::Decoupled => SignedBeaconBlock::Decoupled(decoupled::SignedBeaconBlock {
-            message: decoupled::BeaconBlock {
-                slot,
-                proposer_index,
-                parent_root,
-                state_root,
-                body: decoupled::BeaconBlockBody::empty(),
             },
             signature: Default::default(),
         }),
@@ -3597,12 +3485,7 @@ validators:
         let config = Config::mainnet();
         let mut state = beacon::mainnet_genesis_state().unwrap();
 
-        // Decoupled is a sibling of gloas, not a step before it: it has its own
-        // test below.
-        for fork in ForkName::ALL
-            .into_iter()
-            .filter(|fork| *fork != ForkName::Decoupled)
-        {
+        for fork in ForkName::ALL {
             if fork != ForkName::Phase0 {
                 state = ethlambda_state_transition::beacon::upgrade::upgrade_state(
                     &state, fork, &config,
@@ -3619,7 +3502,6 @@ validators:
                 ForkName::Electra | ForkName::Fulu => {
                     electra::BeaconBlockBody::empty().hash_tree_root()
                 }
-                ForkName::Decoupled => unreachable!("filtered out above"),
                 ForkName::Gloas => gloas::BeaconBlockBody::empty().hash_tree_root(),
                 ForkName::Lean => unreachable!("ForkName::ALL excludes Lean"),
             };
@@ -3635,34 +3517,6 @@ validators:
                 "invariant broke at fork {fork:?}"
             );
         }
-    }
-
-    /// A fulu genesis taken through the decoupled fork at epoch 0 anchors on a
-    /// decoupled block whose root is the genesis header's.
-    #[test]
-    fn a_decoupled_genesis_anchor_block_hashes_to_the_states_own_header() {
-        let config = Config::mainnet();
-        let mut state = beacon::mainnet_genesis_state().unwrap();
-        for fork in [
-            ForkName::Altair,
-            ForkName::Bellatrix,
-            ForkName::Capella,
-            ForkName::Deneb,
-            ForkName::Electra,
-            ForkName::Fulu,
-        ] {
-            state =
-                ethlambda_state_transition::beacon::upgrade::upgrade_state(&state, fork, &config)
-                    .unwrap();
-        }
-        let state = beacon::genesis_at_decoupled(state, &config);
-        assert_eq!(state.fork_name(), ForkName::Decoupled);
-
-        let block = genesis_anchor_block(&state);
-        assert_eq!(block.fork_name(), ForkName::Decoupled);
-        let mut header = state.latest_block_header().clone();
-        header.state_root = state.hash_tree_root();
-        assert_eq!(block.message_hash_tree_root(), header.hash_tree_root());
     }
 
     /// A unique path under the OS temp dir, so parallel test runs cannot
