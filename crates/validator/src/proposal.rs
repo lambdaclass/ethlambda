@@ -9,13 +9,15 @@
 //! back from the beacon node in between:
 //!
 //! 1. The **RANDAO reveal** for the slot's epoch, signed first because the node
-//!    cannot build a body without it. It is not slashable and is not guarded.
+//!    cannot build a body without it. It is not slashable and is not checked
+//!    against slashing protection.
 //! 2. The **block**, built by the beacon node around that reveal. This client
 //!    never chooses a block's contents; it asks for one and checks that what
 //!    came back is the one it asked for.
-//! 3. The **block signature**, which is slashable and is guarded.
+//! 3. The **block signature**, which is slashable, and which
+//!    [`crate::slashing_protection`] must allow and record first.
 //!
-//! # Why the guard is consulted twice
+//! # Why slashing protection is consulted twice
 //!
 //! Once before asking for a block, once before signing it.
 //!
@@ -24,10 +26,11 @@
 //! most expensive thing this client can ask of it. Discovering only afterwards
 //! that the slot was already proposed wastes that for nothing.
 //!
-//! The check before signing is the one that matters, and it records. Recording
-//! at signing time rather than after publication is what makes the duty loop's
-//! deadline safe: a proposal abandoned between signing and publishing cannot be
-//! re-signed, because the guard already counts that slot as proposed.
+//! The check before signing is the one that matters, and it records, durably,
+//! before the signature exists. Recording then rather than after publication is
+//! what makes the duty loop's deadline and a crash both safe: a proposal
+//! abandoned between signing and publishing cannot be re-signed, because the
+//! record already counts that slot as proposed.
 //!
 //! # Gloas: the block, then its envelope
 //!
@@ -37,14 +40,14 @@
 //! builder domain, and it is published right after the block, in the same
 //! budget. A bid naming anyone else is a builder's to reveal, and is left alone.
 //!
-//! The envelope is not slashable, so the guard is untouched by it.
+//! The envelope is not slashable, so slashing protection is untouched by it.
 //!
 //! # Blinded blocks
 //!
 //! With builder proposals on, the node may answer with a blinded block: the
 //! payload's header in place of the payload. Its root is the full block's, so
-//! the guard, the signing root and the signature are exactly what a full block
-//! gets, and the same slot-level protections apply.
+//! slashing protection, the signing root and the signature are exactly what a
+//! full block gets, and the same slot-level protections apply.
 //!
 //! The fee recipient is not compared for a blinded block. The header names the
 //! builder's address, and the relay pays the validator inside the payload, so
@@ -67,8 +70,8 @@
 //! not be: a second call asks the node for a second block, which will differ
 //! from the first because the node has packed whatever arrived in between, and
 //! two distinct blocks for one slot from one validator is a slashable proposer
-//! offence. The guard refuses it, so a retry is merely useless rather than
-//! dangerous, but the caller should not be relying on the guard for that.
+//! offence. Slashing protection refuses it, so a retry is merely useless rather
+//! than dangerous, but the caller should not be relying on that.
 
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -78,16 +81,16 @@ use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{BlsPubkey, ExecutionAddress, Root, Slot};
 use ethlambda_types::beacon::signing::compute_epoch_at_slot;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::beacon_node::block_contents::{GloasPayload, signed_envelope_ssz};
 use crate::beacon_node::dto::{ProposerDutyDto, encode_hex, parse_pubkey};
 use crate::beacon_node::{BeaconNodeApi, BlockRequest, Published, validate_produced_block};
 use crate::error::{Error, Result};
 use crate::keys::ValidatorStore;
-use crate::proposal_guard::ProposalGuard;
 use crate::proposer_settings::ProposerSettings;
 use crate::signing::SigningContext;
+use crate::slashing_protection::{Refusal, SharedProtection};
 use crate::slot_clock::SlotClock;
 
 pub struct ProposalService<B> {
@@ -100,19 +103,15 @@ pub struct ProposalService<B> {
     /// is the one that builds the payload, and the specification is explicit
     /// that it need not honour the preparation it was sent.
     settings: Arc<ProposerSettings>,
-    /// What this process has already proposed, per validator.
-    ///
-    /// A `std::sync::Mutex` for the reason [`crate::attestation`]'s is: the
-    /// critical section is a lookup and an insert with no await inside it, so
-    /// an async mutex would buy nothing and cost a scheduling point.
-    ///
-    /// Not slashing protection. See [`ProposalGuard`].
-    guard: std::sync::Mutex<ProposalGuard>,
+    /// What every validator has signed, shared with the attestation service
+    /// and the keymanager. See [`crate::slashing_protection`].
+    protection: SharedProtection,
     /// The `builder_boost_factor` sent with each block request, or `None` when
     /// builder proposals are off, in which case a blinded answer is refused.
     builder_boost_factor: Option<u64>,
     /// The slot of the latest blinded block this service signed, set before
-    /// its publish starts. A `std::sync::Mutex` for the reason `guard` is one.
+    /// its publish starts. A `std::sync::Mutex` because the critical section
+    /// is a single store with no await inside it.
     last_blinded_slot: std::sync::Mutex<Option<Slot>>,
     /// Where a slot starts, so a blinded publish that outlives the proposal
     /// can observe its own publication delay. `None` observes nothing.
@@ -124,16 +123,17 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         beacon_node: Arc<B>,
         context: Arc<SigningContext>,
         settings: Arc<ProposerSettings>,
+        protection: SharedProtection,
         builder_boost_factor: Option<u64>,
     ) -> Self {
         Self {
             beacon_node,
             context,
             settings,
+            protection,
             builder_boost_factor,
             last_blinded_slot: std::sync::Mutex::new(None),
             clock: None,
-            guard: std::sync::Mutex::new(ProposalGuard::new()),
         }
     }
 
@@ -229,37 +229,15 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         let pubkey = parse_pubkey(&duty.pubkey)?;
         let epoch = compute_epoch_at_slot(slot);
 
-        // Before paying for a block, not after. See the module doc.
-        //
-        // A poisoned lock is treated as a refusal rather than unwrapped: the
-        // lock is poisoned only by a panic while it is held, nothing inside it
-        // can panic, and a crash in the duty path would be a worse outcome than
-        // a skipped proposal.
-        match self.guard.lock() {
-            Ok(guard) => {
-                if let Err(refusal) = guard.check(&pubkey, slot) {
-                    warn!(
-                        %slot,
-                        validator = duty.validator_index,
-                        %refusal,
-                        "Refusing to propose: this process already proposed this slot"
-                    );
-                    crate::metrics::inc_blocks_refused();
-                    return Err(Error::ProposalRefused {
-                        slot,
-                        reason: refusal.to_string(),
-                    });
-                }
-            }
-            Err(err) => {
-                warn!(%slot, %err, "Proposal guard is poisoned; refusing to propose");
-                crate::metrics::inc_blocks_refused();
-                return Err(Error::ProposalRefused {
-                    slot,
-                    reason: "the proposal guard is poisoned".to_string(),
-                });
-            }
-        }
+        // Before paying for a block, not after. See the module doc. Off the
+        // executor even though it only reads: the record may be mid-write for
+        // another caller. A record that cannot be consulted is a refusal, not
+        // a crash in the duty path.
+        let checked = crate::slashing_protection::blocking(&self.protection, move |protection| {
+            Ok(protection.check_block(&pubkey, slot))
+        })
+        .await;
+        refuse_unless_safe(slot, duty.validator_index, "consult", checked)?;
 
         // Scoped away from every await, the way the attestation path's read
         // guard is, and for the reason spelled out there: a write-preferring
@@ -292,17 +270,17 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         // implementation that failed to honour its contract can be stopped
         // before it becomes a signature.
         //
-        // It matters more here than it reads. The guard records the *requested*
-        // slot while the signature covers the *produced* header's slot. If
-        // those ever diverged and both fell in one epoch, the domain would be
-        // identical and the result would be a valid, unguarded second block for
-        // a slot already proposed.
+        // It matters more here than it reads. Slashing protection records the
+        // *requested* slot while the signature covers the *produced* header's
+        // slot. If those ever diverged and both fell in one epoch, the domain
+        // would be identical and the result would be a valid, unrecorded
+        // second block for a slot already proposed.
         validate_produced_block(&request, &produced)?;
 
         // Also the implementation's contract, and checked again for the same
         // reason. With builder proposals off this client never publishes a
-        // blinded block, so signing one would record the slot in the guard for
-        // a block that can never be sent.
+        // blinded block, so signing one would record the slot in slashing
+        // protection for a block that can never be sent.
         if produced.is_blinded() && self.builder_boost_factor.is_none() {
             return Err(Error::InconsistentResponse(format!(
                 "node produced a blinded block for slot {slot}; builder proposals are off, so \
@@ -353,33 +331,22 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
 
         // The root is taken from the decoded container, never from anything
         // reassembled here, and it is taken once: the same value is what the
-        // guard's slot is recorded against and what the signature covers.
+        // recorded slot belongs to and what the signature covers.
         let block_root = produced.block_root();
+
+        // The check that matters, and the one that records, durably, before
+        // the signature exists. Everything after this point may be abandoned
+        // without risk, because the record already counts this slot as
+        // proposed. Off the executor, and before the store's read lock below,
+        // so the disk flush never holds up a keymanager writer.
+        let recorded = crate::slashing_protection::blocking(&self.protection, move |protection| {
+            protection.check_and_record_block(&pubkey, slot)
+        })
+        .await;
+        refuse_unless_safe(slot, duty.validator_index, "record", recorded)?;
 
         let signature = {
             let store = store.read().await;
-
-            // The check that matters, and the one that records. Everything
-            // after this point may be abandoned without risk, because the
-            // guard already counts this slot as proposed.
-            match self.guard.lock() {
-                Ok(mut guard) => guard.check_and_record(&pubkey, slot).map_err(|refusal| {
-                    crate::metrics::inc_blocks_refused();
-                    Error::ProposalRefused {
-                        slot,
-                        reason: refusal.to_string(),
-                    }
-                })?,
-                Err(err) => {
-                    warn!(%slot, %err, "Proposal guard is poisoned; refusing to sign");
-                    crate::metrics::inc_blocks_refused();
-                    return Err(Error::ProposalRefused {
-                        slot,
-                        reason: "the proposal guard is poisoned".to_string(),
-                    });
-                }
-            }
-
             let signature = self.context.sign_block(&store, &pubkey, block_root, slot)?;
             // Before the first await after signing, so an overrun of the
             // proposal's budget from here on is known to be a signed block.
@@ -648,11 +615,46 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
     }
 }
 
+/// Slashing protection's answer about a block, as the duty's outcome: a judged
+/// refusal, or a record that could not be consulted or written (`what` names
+/// which), is a counted [`Error::ProposalRefused`].
+fn refuse_unless_safe(
+    slot: Slot,
+    validator: u64,
+    what: &'static str,
+    outcome: Result<std::result::Result<(), Refusal>>,
+) -> Result<()> {
+    let reason = match outcome {
+        Ok(Ok(())) => return Ok(()),
+        Ok(Err(refusal)) => {
+            warn!(
+                %slot,
+                validator,
+                %refusal,
+                "Refusing to propose: slashing protection judged this block unsafe"
+            );
+            refusal.to_string()
+        }
+        Err(err) => {
+            error!(
+                %slot,
+                validator,
+                %err,
+                "Slashing protection could not {what} this block; refusing to sign"
+            );
+            err.to_string()
+        }
+    };
+    crate::metrics::inc_blocks_refused();
+    Err(Error::ProposalRefused { slot, reason })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::beacon_node::block_contents::SignedBlockContents;
     use crate::beacon_node::mock::MockBeaconNode;
+    use crate::slashing_protection::SlashingProtection;
     use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::primitives::HashTreeRoot as _;
     use ethlambda_types::beacon::primitives::{BlsPubkey, Bytes32, H160, Root};
@@ -689,7 +691,13 @@ mod tests {
 
     fn service(node: Arc<MockBeaconNode>) -> ProposalService<MockBeaconNode> {
         let settings = ProposerSettings::new(Bytes32::repeat_byte(0xab), None);
-        ProposalService::new(node, context(), Arc::new(settings), None)
+        ProposalService::new(
+            node,
+            context(),
+            Arc::new(settings),
+            SlashingProtection::in_memory(),
+            None,
+        )
     }
 
     fn service_expecting(
@@ -697,7 +705,13 @@ mod tests {
         fee_recipient: ExecutionAddress,
     ) -> ProposalService<MockBeaconNode> {
         let settings = ProposerSettings::new(Bytes32::repeat_byte(0xab), Some(fee_recipient));
-        ProposalService::new(node, context(), Arc::new(settings), None)
+        ProposalService::new(
+            node,
+            context(),
+            Arc::new(settings),
+            SlashingProtection::in_memory(),
+            None,
+        )
     }
 
     /// A slot inside mainnet's electra era.
@@ -794,7 +808,13 @@ mod tests {
         let (store, pubkey) = store();
         let node = Arc::new(MockBeaconNode::new().with_block(slot(), 7));
         let settings = Arc::new(ProposerSettings::new(Bytes32::repeat_byte(0xab), None));
-        let service = ProposalService::new(node.clone(), context(), settings.clone(), None);
+        let service = ProposalService::new(
+            node.clone(),
+            context(),
+            settings.clone(),
+            SlashingProtection::in_memory(),
+            None,
+        );
 
         settings.set_graffiti(&pubkey, Bytes32::repeat_byte(0xcd));
         service
@@ -840,7 +860,7 @@ mod tests {
         );
     }
 
-    /// The guard is consulted before the block is asked for, not after, so a
+    /// Slashing protection is consulted before the block is asked for, not after, so a
     /// slot already proposed costs the beacon node nothing.
     #[tokio::test]
     async fn a_repeated_slot_is_refused_without_asking_for_a_block() {
@@ -866,6 +886,72 @@ mod tests {
         assert_eq!(node.published_blocks().len(), 1);
     }
 
+    /// The restart shape: a fresh service over the same slashing-protection
+    /// directory refuses the slot already proposed, before asking for a block.
+    #[tokio::test]
+    async fn a_restart_does_not_forget_what_was_proposed() {
+        let (store, pubkey) = store();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let settings = Arc::new(ProposerSettings::new(Bytes32::repeat_byte(0xab), None));
+        let protection = || {
+            let opened =
+                SlashingProtection::open(dir.path(), Root::ZERO, &[pubkey], true).expect("opens");
+            Arc::new(std::sync::Mutex::new(opened))
+        };
+
+        let node = Arc::new(MockBeaconNode::new().with_block(slot(), 7));
+        ProposalService::new(
+            node.clone(),
+            context(),
+            settings.clone(),
+            protection(),
+            None,
+        )
+        .propose(slot(), &duty(&pubkey, 7, slot()), &store)
+        .await
+        .expect("first");
+        assert_eq!(node.published_blocks().len(), 1);
+
+        let node_again = Arc::new(MockBeaconNode::new().with_block(slot(), 7));
+        let err = ProposalService::new(node_again.clone(), context(), settings, protection(), None)
+            .propose(slot(), &duty(&pubkey, 7, slot()), &store)
+            .await
+            .expect_err("the slot was proposed before the restart");
+        assert!(matches!(err, Error::ProposalRefused { .. }), "got {err:?}");
+        assert!(node_again.block_requests().is_empty());
+        assert!(node_again.published_blocks().is_empty());
+    }
+
+    /// A persisted record holding nothing for the key refuses it before a
+    /// block is asked for. The in-memory record of the other tests registers
+    /// a key on first use; a real one does not.
+    #[tokio::test]
+    async fn an_unregistered_key_is_refused_before_a_block_is_requested() {
+        let (store, pubkey) = store();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let settings = Arc::new(ProposerSettings::new(Bytes32::repeat_byte(0xab), None));
+        let opened = SlashingProtection::open(dir.path(), Root::ZERO, &[], false)
+            .expect("opens with no keys");
+        let node = Arc::new(MockBeaconNode::new().with_block(slot(), 7));
+
+        let err = ProposalService::new(
+            node.clone(),
+            context(),
+            settings,
+            Arc::new(std::sync::Mutex::new(opened)),
+            None,
+        )
+        .propose(slot(), &duty(&pubkey, 7, slot()), &store)
+        .await
+        .expect_err("the key has no record");
+        assert!(
+            matches!(&err, Error::ProposalRefused { reason, .. } if reason.contains("no slashing-protection record")),
+            "got {err:?}"
+        );
+        assert!(node.block_requests().is_empty());
+        assert!(node.published_blocks().is_empty());
+    }
+
     #[tokio::test]
     async fn a_node_that_cannot_import_the_block_is_reported_rather_than_hidden() {
         let (store, pubkey) = store();
@@ -887,7 +973,13 @@ mod tests {
         fee_recipient: Option<ExecutionAddress>,
     ) -> ProposalService<MockBeaconNode> {
         let settings = ProposerSettings::new(Bytes32::repeat_byte(0xab), fee_recipient);
-        ProposalService::new(node, context(), Arc::new(settings), Some(100))
+        ProposalService::new(
+            node,
+            context(),
+            Arc::new(settings),
+            SlashingProtection::in_memory(),
+            Some(100),
+        )
     }
 
     /// A blinded block takes the `blinded_blocks` route and nothing else. Its
@@ -979,7 +1071,7 @@ mod tests {
         let err = service
             .propose(slot(), &duty(&pubkey, 7, slot()), &store)
             .await
-            .expect_err("the guard must refuse a second block for the slot");
+            .expect_err("slashing protection must refuse a second block for the slot");
         assert!(matches!(err, Error::ProposalRefused { .. }), "got {err:?}");
     }
 
@@ -1016,7 +1108,7 @@ mod tests {
             "the publish must complete although the proposal future is gone"
         );
 
-        // The guard recorded the slot before the publish started, so a retry
+        // Slashing protection recorded the slot before the publish started, so a retry
         // after the dropped future is refused without asking for a block.
         let err = service
             .propose(slot(), &duty(&pubkey, 7, slot()), &store)
@@ -1067,7 +1159,7 @@ mod tests {
     /// factor is refused before signing. With builder proposals off this client
     /// never publishes a blinded block, so signing would burn the slot for
     /// nothing. The second attempt is refused for the same reason rather than
-    /// by the guard, which shows nothing was recorded.
+    /// by slashing protection, which shows nothing was recorded.
     #[tokio::test]
     async fn a_blinded_block_is_refused_before_signing_with_builder_proposals_off() {
         let (store, pubkey) = store();
@@ -1245,12 +1337,12 @@ mod tests {
         );
     }
 
-    /// A failed production must leave the guard untouched, so the slot can
-    /// still be proposed if a later attempt succeeds. Recording on the early
-    /// check rather than at signing time would have burned it.
+    /// A failed production must leave slashing protection untouched, so the
+    /// slot can still be proposed if a later attempt succeeds. Recording on
+    /// the early check rather than at signing time would have burned it.
     ///
     /// The same service and the same node throughout, deliberately: a second
-    /// service would carry a second, empty guard and the test would pass
+    /// service would carry a second, empty record and the test would pass
     /// whether or not the first one recorded.
     #[tokio::test]
     async fn a_failed_production_does_not_burn_the_slot() {
@@ -1281,6 +1373,7 @@ mod gloas_tests {
     use super::*;
     use crate::beacon_node::block_contents::SignedExecutionPayloadEnvelopeContents;
     use crate::beacon_node::mock::MockBeaconNode;
+    use crate::slashing_protection::SlashingProtection;
     use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::containers::gloas;
     use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
@@ -1327,7 +1420,13 @@ mod gloas_tests {
             ethlambda_types::beacon::primitives::Bytes32::repeat_byte(0xab),
             None,
         );
-        ProposalService::new(node, context(), Arc::new(settings), None)
+        ProposalService::new(
+            node,
+            context(),
+            Arc::new(settings),
+            SlashingProtection::in_memory(),
+            None,
+        )
     }
 
     fn verifies(pubkey: &BlsPubkey, signature: &[u8; 96], root: Root) -> bool {
@@ -1404,10 +1503,16 @@ mod gloas_tests {
         ));
         let settings = Arc::new(ProposerSettings::new(Bytes32::repeat_byte(0xab), None));
         settings.set_graffiti(&pubkey, Bytes32::repeat_byte(0xcd));
-        ProposalService::new(node.clone(), context(), settings, None)
-            .propose(slot(), &duty(&pubkey), &store)
-            .await
-            .expect("proposes");
+        ProposalService::new(
+            node.clone(),
+            context(),
+            settings,
+            SlashingProtection::in_memory(),
+            None,
+        )
+        .propose(slot(), &duty(&pubkey), &store)
+        .await
+        .expect("proposes");
 
         let request = node.block_requests().remove(0);
         assert_eq!(request.fork, ForkName::Gloas);
@@ -1506,8 +1611,9 @@ mod gloas_tests {
         assert!(node.published_envelopes().is_empty());
     }
 
-    /// The guard's semantics are unchanged: a second proposal for the slot is
-    /// refused before asking for anything, and reveals no second envelope.
+    /// Slashing protection's semantics are unchanged at gloas: a second
+    /// proposal for the slot is refused before asking for anything, and
+    /// reveals no second envelope.
     #[tokio::test]
     async fn a_repeated_gloas_slot_is_refused_and_reveals_nothing_more() {
         let (store, pubkey) = store();

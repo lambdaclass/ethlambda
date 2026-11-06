@@ -865,8 +865,11 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   offsets by each slot's own fork, and `/eth/v1/config/spec` supplies them. With
   `--builder-proposals`, pre-gloas slots register validators with the node's builder
   and may sign a blinded block, published to the producing node only. It
-  still keeps no slashing-protection record; PTC votes have an in-memory
-  `(validator, slot)` dedup only, and envelopes are unguarded.
+  keeps EIP-3076 minimal-watermark slashing protection in
+  `--validators-dir/slashing_protection.json` (`crate::slashing_protection`),
+  durable before every block (blinded ones included) and attestation signature;
+  PTC votes have an in-memory `(validator, slot)` dedup only, and envelopes are
+  unguarded.
   `get_head_node` is one bottom-up walk for every fork, with
   the current slot's fork selecting the payload rules and the boost gate, so a
   follower on any network that schedules gloas (Sepolia does) pays work

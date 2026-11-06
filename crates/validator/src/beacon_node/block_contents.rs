@@ -51,7 +51,7 @@
 //! a [`BlindedBeaconBlock`] (`Eth-Execution-Payload-Blinded: true`): the block
 //! carries the payload's header, and the builder reveals the payload once this
 //! client has signed. No blobs travel with it, since the builder publishes
-//! them. Its root is the full block's, so signing and the proposal guard work
+//! them. Its root is the full block's, so signing and slashing protection work
 //! as for any other block. Electra and fulu share one blinded container.
 //! Electra blinded blocks are for third-party beacon nodes: an ethlambda node
 //! serves blinded blocks for fulu only.

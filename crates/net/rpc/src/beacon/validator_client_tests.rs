@@ -1584,6 +1584,7 @@ mod gloas {
                     None,
                 ),
             ),
+            ethlambda_validator::slashing_protection::SlashingProtection::in_memory(),
             None,
         );
         let duty = ProposerDutyDto {
@@ -1713,6 +1714,7 @@ mod gloas {
                     None,
                 ),
             ),
+            ethlambda_validator::slashing_protection::SlashingProtection::in_memory(),
             None,
         );
         let duty = ProposerDutyDto {
