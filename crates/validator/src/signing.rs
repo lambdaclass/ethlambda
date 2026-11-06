@@ -9,14 +9,15 @@ use ethlambda_types::beacon::builder::ValidatorRegistrationV1;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::constants::{
     DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_BUILDER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
-    DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PROPOSER_PREFERENCES,
+    DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE,
+    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
 };
 use ethlambda_types::beacon::containers::altair::{
     ContributionAndProof, SyncAggregatorSelectionData,
 };
 use ethlambda_types::beacon::containers::gloas::{
-    ExecutionPayloadEnvelope, PayloadAttestationData,
+    ExecutionPayloadEnvelope, PayloadAttestationData, ProposerPreferences,
 };
 use ethlambda_types::beacon::containers::shared::AttestationData;
 use ethlambda_types::beacon::primitives::{
@@ -316,6 +317,35 @@ impl SigningContext {
         self.sign_root(store, &registration.pubkey, root)
     }
 
+    /// A proposer preferences message's signature, under
+    /// `DOMAIN_PROPOSER_PREFERENCES` at the fork version of the proposal
+    /// epoch itself.
+    ///
+    /// That is `get_signed_proposer_preferences` as of consensus-specs
+    /// v1.7.0-beta.4, `compute_fork_version(proposal_epoch)` read off the
+    /// schedule, and the `proposer_preferences` gossip rule verifies under the
+    /// same domain. Every other client signs and verifies this way
+    /// (Lighthouse, Prysm, Teku, Lodestar and Nimbus all take the fork of the
+    /// proposal's epoch).
+    ///
+    /// The rule before it, beta.2's, verified with `get_domain` on the
+    /// dependent block's state advanced to the lookahead start, which gives
+    /// the fork of the epoch before the proposal's. That differs only for a
+    /// proposal in the first epoch of a fork, and there Lighthouse refuses it
+    /// as a bad signature: it did so for every first-gloas-epoch preference
+    /// this client signed that way on a devnet. Not slashable.
+    pub fn sign_proposer_preferences(
+        &self,
+        store: &ValidatorStore,
+        pubkey: &BlsPubkey,
+        preferences: &ProposerPreferences,
+    ) -> Result<BlsSignature> {
+        let proposal_epoch = compute_epoch_at_slot(preferences.proposal_slot);
+        let domain = self.domain(DOMAIN_PROPOSER_PREFERENCES, proposal_epoch);
+        let root = compute_signing_root(preferences.hash_tree_root(), domain);
+        self.sign_root(store, pubkey, root)
+    }
+
     /// Sign a payload timeliness committee vote on behalf of `pubkey`.
     ///
     /// Not slashable by the specification, and deduplicated per validator and
@@ -589,6 +619,88 @@ mod tests {
             context.domain(DOMAIN_BEACON_BUILDER, 0),
         );
         assert!(!verify(&pubkey, &signature, envelope_root));
+    }
+
+    /// A config whose gloas fork starts at epoch 500000, fulu being active
+    /// well before it, with a non-zero validators root.
+    fn gloas_scheduled_context() -> (SigningContext, Epoch) {
+        const GLOAS_EPOCH: Epoch = 500_000;
+        let mut config = Config::mainnet();
+        config.gloas_fork_epoch = GLOAS_EPOCH;
+        (
+            SigningContext {
+                config,
+                genesis_validators_root: Root::repeat_byte(0x42),
+            },
+            GLOAS_EPOCH,
+        )
+    }
+
+    fn preferences_for(slot: Slot) -> ProposerPreferences {
+        ProposerPreferences {
+            dependent_root: Root::repeat_byte(0x11),
+            proposal_slot: slot,
+            validator_index: 3,
+            fee_recipient: ethlambda_types::beacon::primitives::H160([0xab; 20]),
+            target_gas_limit: 36_000_000,
+        }
+    }
+
+    /// Whether a preference for `slot`, signed by the client, verifies under
+    /// fulu's and under gloas's version of `DOMAIN_PROPOSER_PREFERENCES`, in
+    /// that order. The domains are spelled out rather than asked of
+    /// [`SigningContext::domain`], so the test does not share the signer's
+    /// choice of epoch.
+    fn preference_verifies_under_fulu_and_gloas(slot: Slot) -> (bool, bool) {
+        let (store, pubkey) = store_with_key();
+        let (context, _) = gloas_scheduled_context();
+        let preferences = preferences_for(slot);
+
+        let signature = context
+            .sign_proposer_preferences(&store, &pubkey, &preferences)
+            .expect("signs");
+
+        let verifies_under = |version| {
+            let domain = compute_domain(
+                DOMAIN_PROPOSER_PREFERENCES,
+                version,
+                context.genesis_validators_root,
+            );
+            let root = compute_signing_root(preferences.hash_tree_root(), domain);
+            verify(&pubkey, &signature, root)
+        };
+        (
+            verifies_under(context.config.fulu_fork_version),
+            verifies_under(context.config.gloas_fork_version),
+        )
+    }
+
+    /// The first gloas epoch's preference is signed at gloas's version, the
+    /// proposal epoch's own, which is what beta.4's gossip rule and every
+    /// other client verify. Fulu's, the version beta.2's rule gave (the epoch
+    /// before the proposal's), is what Lighthouse refused as a bad signature.
+    #[test]
+    fn a_preference_for_the_first_gloas_epoch_is_signed_under_the_gloas_version() {
+        let (_, gloas_epoch) = gloas_scheduled_context();
+        let slot = gloas_epoch * preset::SLOTS_PER_EPOCH + 2;
+
+        let (under_fulu, under_gloas) = preference_verifies_under_fulu_and_gloas(slot);
+
+        assert!(under_gloas, "the proposal epoch's version");
+        assert!(!under_fulu, "not the version of the epoch before it");
+    }
+
+    /// One epoch later beta.2's rule gives gloas's version too, so the two
+    /// rules agree from here on.
+    #[test]
+    fn a_preference_for_the_second_gloas_epoch_is_signed_under_the_gloas_version() {
+        let (_, gloas_epoch) = gloas_scheduled_context();
+        let slot = (gloas_epoch + 1) * preset::SLOTS_PER_EPOCH;
+
+        let (under_fulu, under_gloas) = preference_verifies_under_fulu_and_gloas(slot);
+
+        assert!(under_gloas);
+        assert!(!under_fulu);
     }
 
     #[test]

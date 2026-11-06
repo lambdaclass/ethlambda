@@ -145,8 +145,9 @@ pub struct BlockRequest {
     pub graffiti: Bytes32,
     /// The `builder_boost_factor` to send, or `None` when builder proposals are
     /// off. `None` sends `0` and refuses a blinded answer; `Some` sends the
-    /// factor and accepts one. Ignored from gloas, where `produceBlockV4` takes
-    /// the builder configuration in its body.
+    /// factor and accepts one. From gloas the factor travels in
+    /// `produceBlockV4`'s body instead of the query, so a pooled p2p bid can
+    /// win on value; a gloas answer is never blinded.
     pub builder_boost_factor: Option<u64>,
 }
 
@@ -171,6 +172,21 @@ pub enum Published {
     /// relay may still have published it; see `Error::BlindedUnconfirmed`.
     /// Produced only by `ProposalService`, never by an implementation.
     BuilderUnconfirmed,
+}
+
+/// How many of the configured nodes took something sent to every node.
+///
+/// The caller needs it when what it sends lives on each node separately and
+/// a node that missed it never hears it any other way. Proposer preferences
+/// are such a send: each node gossips only what it accepted, and the service
+/// stops sending a preference once it counts as delivered, so "some node
+/// accepted" must not be mistaken for "every node did".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// Every configured node accepted. The only answer a single node gives.
+    Everywhere,
+    /// At least one node accepted and at least one refused or did not answer.
+    Partly,
 }
 
 /// Check that `block` is the block that was asked for.
@@ -334,6 +350,13 @@ pub trait BeaconNodeApi: Send + Sync {
     /// treats the two the same way will act on a stale proposer schedule.
     async fn proposer_duties(&self, epoch: Epoch) -> Result<ProposerDuties>;
 
+    /// Every proposer duty in `epoch` with v2's `dependent_root`: the block at
+    /// `compute_start_slot_at_epoch(epoch - 1) - 1`, the shuffling dependent
+    /// root fulu's proposer lookahead fixes the epoch's proposers from. Signed
+    /// proposer preferences must carry exactly this root, which v1's
+    /// definition (one epoch later) is not.
+    async fn proposer_duties_v2(&self, epoch: Epoch) -> Result<ProposerDuties>;
+
     /// Produce the attestation data for `slot`, which is in `fork`.
     ///
     /// No committee index is ever a parameter here. Before gloas the query
@@ -430,6 +453,25 @@ pub trait BeaconNodeApi: Send + Sync {
         &self,
         registrations: &[SignedValidatorRegistrationV1],
     ) -> Result<()>;
+
+    /// Submit signed proposer preferences, which the node validates with the
+    /// `proposer_preferences` gossip rules and publishes. `fork` is the
+    /// `Eth-Consensus-Version`: the fork the preferences belong to, that of
+    /// their proposal epoch.
+    ///
+    /// A 400 naming per-index failures is an `Err`: the whole call failed for
+    /// the caller's purposes, although the node may have published the entries
+    /// that passed. A node only short-circuits an identical entry, so one it
+    /// holds for the same `(slot, dependent_root)` with other content fails
+    /// every call that carries it. The caller therefore sends one preference
+    /// per call. State on the node's gossip, so failover sends it to every
+    /// node, and answers [`Delivery::Partly`] when only some of them accepted
+    /// it, so the caller knows to send it again.
+    async fn submit_proposer_preferences(
+        &self,
+        fork: ForkName,
+        preferences: &[gloas::SignedProposerPreferences],
+    ) -> Result<Delivery>;
 
     /// The envelope the node cached for the self-built payload of the block
     /// whose root is `block_root`, proposed at `slot`.

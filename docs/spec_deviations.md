@@ -297,12 +297,14 @@ from the Beacon API, and no other way.
   and a bid is compatible with it when it builds on that head and its payload.
   The builder-exit check is skipped for a pre-gloas parent, which carries no
   envelope.
-- **Preference signatures** are accepted under the lookahead state's own
-  `DOMAIN_PROPOSER_PREFERENCES` domain (the specification's), the fork version of
-  the epoch before the proposal's, or the proposal epoch's. They coincide outside
-  the first epoch of a fork. Lighthouse signs with the proposal epoch's version
-  and the specification gives the earlier one, so accepting both avoids
-  rejecting an honest client's messages around the gloas upgrade.
+- **Preference signatures** are accepted under `DOMAIN_PROPOSER_PREFERENCES` at
+  the proposal epoch's fork version, which consensus-specs v1.7.0-beta.4 signs
+  and verifies with and every client signs with, and also under the two that
+  v1.7.0-beta.2's rule (`get_domain` on the lookahead state) could give: that
+  state's own fork, and the fork version of the epoch before the proposal's.
+  They coincide outside the first epoch of a fork. The older two are kept for a
+  client still signing by beta.2, until the fixtures (pinned to beta.2) move
+  past it.
 - **Consequence:** builders onboarded at the fork are inactive until their
   deposit epoch is finalized, so gossip bids are rejected for the first epochs of
   gloas and `produceBlockV4` self-builds.
@@ -794,6 +796,25 @@ signature, whichever way the node answered. Three departures:
   validator, since one slot has one proposer.
 - **Registrations stop at gloas.** The client sends no `register_validator` from
   the gloas fork epoch on: the builder market works through proposer
-  preferences there, and `produceBlockV4` keeps its self-build configuration.
+  preferences there (see the next section), and `produceBlockV4` sends the
+  configured boost factor with no minimum bid and no builders.
   Validators with no fee recipient are not registered either (the field is
   required), and only validators the beacon node resolved are signed for.
+
+## The validator client's proposer preferences
+
+- **Signing domain: no departure, but ahead of the fixtures.** The validator
+  client signs under `DOMAIN_PROPOSER_PREFERENCES` at the proposal epoch's fork
+  version (`SigningContext::sign_proposer_preferences`), as consensus-specs
+  v1.7.0-beta.4's `get_signed_proposer_preferences` does with
+  `compute_fork_version(proposal_epoch)`, and as Lighthouse, Prysm, Teku,
+  Lodestar and Nimbus all sign and verify. The fixtures are still pinned to
+  v1.7.0-beta.2, whose gossip rule verified with `get_domain` on the dependent
+  block's state advanced to the lookahead start, the fork of the epoch before
+  the proposal's. The two differ only for a proposal in the first epoch of a
+  fork, where Lighthouse refuses beta.2's signature as a bad one. This node
+  still accepts beta.2's domain too (see the fulu-to-gloas boundary entry).
+- **Published unconditionally,** not gated on `--builder-proposals`, since from
+  gloas the preferences carry every proposal's fee recipient. Validators with no
+  fee recipient are skipped (the field is required), and a preference cannot be
+  replaced for the same slot and dependent root.

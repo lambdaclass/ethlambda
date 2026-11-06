@@ -18,6 +18,7 @@ use ethlambda_engine::{EngineClient, JwtSecret};
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
     block_production::advance_to_slot,
+    bls,
     builder_market::SharedBuilderMarket,
     gloas_block_production::test_support::{
         config as chain_config, parent_state, post_state, randao_reveal,
@@ -25,7 +26,7 @@ use ethlambda_state_transition::beacon::{
     gossip::proposer_preferences::dependent_root_at,
     helpers::{
         accessors::get_domain,
-        misc::compute_signing_root,
+        misc::{compute_domain, compute_signing_root},
         test_state::{secret_key_for, sign_for},
     },
     payload_attestation_pool::SharedPayloadAttestationPool,
@@ -35,18 +36,20 @@ use ethlambda_state_transition::beacon::{
 use ethlambda_storage::Store;
 use ethlambda_types::{
     beacon::{
+        config::Config,
         constants::{
             BUILDER_INDEX_SELF_BUILD, DOMAIN_BEACON_BUILDER, DOMAIN_PROPOSER_PREFERENCES,
             FAR_FUTURE_EPOCH, PAYLOAD_BUILDER_VERSION,
         },
         containers::{
-            BeaconState, SignedBeaconBlock,
+            BeaconState, Fork, SignedBeaconBlock,
             gloas::{
                 BeaconBlock, Builder, ExecutionPayloadBid, ExecutionRequests, ProposerPreferences,
                 SignedExecutionPayloadBid, SignedExecutionPayloadEnvelope,
                 SignedProposerPreferences,
             },
         },
+        fork::ForkName,
         primitives::{BlsPubkey, BlsSignature, ExecutionAddress, HashTreeRoot as _},
         signing::compute_epoch_at_slot,
     },
@@ -217,6 +220,8 @@ fn chain_state() -> BeaconState {
 }
 
 struct World {
+    /// The fork schedule the store runs on.
+    config: Config,
     store: Store,
     state: BeaconState,
     head_root: H256,
@@ -240,7 +245,33 @@ impl World {
     }
 
     fn at_clock(clock_slot: u64) -> Self {
-        let state = chain_state();
+        Self::build(chain_config(), chain_state(), clock_slot)
+    }
+
+    /// [`World::new`] with fulu before gloas: gloas starts at epoch 1, the one
+    /// [`SLOT`] and the head are in, so a preference for [`SLOT`] is for the
+    /// first gloas epoch. The head state carries the fork record
+    /// `upgrade_to_gloas` leaves at that boundary.
+    fn at_the_gloas_fork() -> Self {
+        let config = ForkName::ALL
+            .into_iter()
+            .filter(|&fork| fork < ForkName::Gloas)
+            .fold(chain_config(), |config, fork| {
+                config.with_fork_epoch(fork, 0)
+            })
+            .with_fork_epoch(ForkName::Gloas, compute_epoch_at_slot(SLOT));
+        let mut state = chain_state();
+        *state.fork_mut() = Fork {
+            previous_version: config.fork_version(ForkName::Fulu),
+            current_version: config.fork_version(ForkName::Gloas),
+            epoch: compute_epoch_at_slot(SLOT),
+        };
+        Self::build(config, state, HEAD_SLOT)
+    }
+
+    /// The head block on `state` and `config`, on a clock where `clock_slot`
+    /// is running.
+    fn build(config: Config, state: BeaconState, clock_slot: u64) -> Self {
         let genesis = genesis_block();
         let genesis_root = genesis.message_hash_tree_root();
         let block = gloas_beacon_block(
@@ -255,7 +286,7 @@ impl World {
         let head_root = header.hash_tree_root();
         let mut store = beacon_store_with_head_block(
             state.clone(),
-            chain_config(),
+            config.clone(),
             block,
             head_root,
             clock_slot,
@@ -263,6 +294,7 @@ impl World {
         store.insert_signed_block(genesis_root, genesis).unwrap();
         store.insert_state(genesis_root, state.clone()).unwrap();
         Self {
+            config,
             store,
             state,
             head_root,
@@ -296,7 +328,7 @@ impl World {
     }
 
     fn advanced(&self) -> BeaconState {
-        advance_to_slot(&self.state, SLOT, &chain_config()).unwrap()
+        advance_to_slot(&self.state, SLOT, &self.config).unwrap()
     }
 
     /// What `produceBlockV4` reads off the chain for [`SLOT`].
@@ -1082,6 +1114,132 @@ async fn valid_preferences_are_cached_and_published_once() {
     let reply = send(&app, preferences_request(&[signed], Some("gloas"))).await;
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(world.network.proposer_preferences.lock().unwrap().len(), 1);
+}
+
+/// The validator client's own path for a proposal at [`SLOT`], end to end
+/// against `world`'s node: it reads the proposer duty and its v2
+/// `dependent_root` from the served duties route, signs with
+/// `SigningContext::sign_proposer_preferences`, and posts through
+/// `HttpBeaconNode` under the fork of the preference's slot, as
+/// `PreferencesService` does. The post succeeding means the route's run of the
+/// gossip rules (`validate`) accepted it; this also checks that the market
+/// holds it and that it went out. Returns it with the proposer's key.
+async fn submit_as_the_validator_client(world: &World) -> (SignedProposerPreferences, BlsPubkey) {
+    use ethlambda_blockchain::{SyncStatusController, metrics::SyncStatus};
+    use ethlambda_validator::{
+        beacon_node::{BeaconNodeApi as _, dto::parse_pubkey, http::HttpBeaconNode},
+        keys::ValidatorStore,
+        signing::SigningContext,
+    };
+
+    let duties_routes = crate::beacon::validator::routes()
+        .with_state(world.store.clone())
+        .layer(Extension(SyncStatusController::new(SyncStatus::Synced)));
+    let router = world.app(None).merge(duties_routes);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bound = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await });
+    let client = HttpBeaconNode::new(format!("http://{bound}")).unwrap();
+
+    // The duty and the dependent root the way the validator client reads them.
+    let proposal_epoch = compute_epoch_at_slot(SLOT);
+    let duties = client
+        .proposer_duties_v2(proposal_epoch)
+        .await
+        .expect("the node serves v2 proposer duties");
+    let duty = duties
+        .duties
+        .iter()
+        .find(|duty| duty.slot == SLOT)
+        .expect("the slot has a proposer");
+    let proposer = duty.validator_index;
+    let message = ProposerPreferences {
+        dependent_root: duties.dependent_root,
+        proposal_slot: SLOT,
+        validator_index: proposer,
+        fee_recipient: address(0xaa),
+        target_gas_limit: 30_000_000,
+    };
+
+    let mut keys = ValidatorStore::new();
+    let pubkey = keys
+        .insert_secret("test", &secret_key_for(proposer as usize).to_bytes())
+        .expect("the test secret is a valid key");
+    assert_eq!(
+        pubkey,
+        parse_pubkey(&duty.pubkey).expect("the duty names a key"),
+        "the test registry's key for the proposer"
+    );
+    let context = SigningContext {
+        config: world.config.clone(),
+        genesis_validators_root: world.state.genesis_validators_root(),
+    };
+    let signature = context
+        .sign_proposer_preferences(&keys, &pubkey, &message)
+        .expect("signs");
+    let signed = SignedProposerPreferences { message, signature };
+
+    let fork = world.config.fork_at_epoch(proposal_epoch);
+    client
+        .submit_proposer_preferences(fork, std::slice::from_ref(&signed))
+        .await
+        .expect("the node accepts what the validator client signed");
+
+    assert_eq!(
+        *world.network.proposer_preferences.lock().unwrap(),
+        vec![signed.clone()]
+    );
+    assert_eq!(
+        world
+            .market
+            .preferences(SLOT, signed.message.dependent_root),
+        Some(signed.clone())
+    );
+    (signed, pubkey)
+}
+
+/// The validator client's preference passes this node's gossip rules. That
+/// pins the duties route's dependent root as the one the preference must
+/// carry, and the JSON the client posts as the one the route decodes. This
+/// world has gloas at epoch 0, so no fork boundary is involved; the next test
+/// has one.
+#[tokio::test]
+async fn preferences_signed_by_the_validator_client_pass_this_nodes_gossip_rules() {
+    submit_as_the_validator_client(&World::new()).await;
+}
+
+/// The same across a fulu-to-gloas boundary, for a slot in the first gloas
+/// epoch: the one case where the fork of the proposal's epoch (gloas, what
+/// consensus-specs v1.7.0-beta.4 and every client sign and verify with) and
+/// the fork of the epoch before it (fulu, beta.2's gossip rule) differ.
+///
+/// This node accepts both, so its verdict alone would also pass a client still
+/// signing by beta.2. The signature is therefore also checked against the two
+/// domains directly: it must verify under gloas's version, which Lighthouse
+/// and the others demand, and not under fulu's, which Lighthouse refused.
+#[tokio::test]
+async fn a_first_gloas_epoch_preference_from_the_validator_client_passes_this_nodes_gossip_rules() {
+    let world = World::at_the_gloas_fork();
+    let proposal_epoch = compute_epoch_at_slot(SLOT);
+    assert_eq!(
+        world.config.fork_at_epoch(proposal_epoch - 1),
+        ForkName::Fulu
+    );
+    assert_eq!(world.config.fork_at_epoch(proposal_epoch), ForkName::Gloas);
+
+    let (signed, pubkey) = submit_as_the_validator_client(&world).await;
+
+    let verifies_under = |fork| {
+        let domain = compute_domain(
+            DOMAIN_PROPOSER_PREFERENCES,
+            world.config.fork_version(fork),
+            world.state.genesis_validators_root(),
+        );
+        let root = compute_signing_root(signed.message.hash_tree_root(), domain);
+        bls::verify(&pubkey, root, &signed.signature)
+    };
+    assert!(verifies_under(ForkName::Gloas), "the proposal epoch's fork");
+    assert!(!verifies_under(ForkName::Fulu), "not the epoch before it");
 }
 
 #[tokio::test]

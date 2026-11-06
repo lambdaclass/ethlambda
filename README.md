@@ -338,7 +338,7 @@ endpoints.
 
 A separate process that holds the keys and performs the duties: attestations,
 block proposals, aggregation, sync committee messages and, from Gloas on, the
-payload envelope and the payload timeliness vote. It talks to a beacon node over
+payload envelope, proposer preferences and the payload timeliness vote. It talks to a beacon node over
 the standard Beacon API, so it works against `ethlambda beacon` (run with the
 `--execution-*` flags) or any other conformant beacon node.
 

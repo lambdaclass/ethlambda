@@ -24,8 +24,8 @@ use crate::beacon_node::dto::{
     SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto,
 };
 use crate::beacon_node::{
-    AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Genesis,
-    ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorEntry,
+    AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery,
+    Genesis, ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorEntry,
     validate_sync_contribution,
 };
 use crate::error::{BeaconNodeFailure, Error, Result};
@@ -64,6 +64,20 @@ pub struct MockBeaconNode {
     pub validators: Vec<ValidatorEntry>,
     pub duties: Mutex<Vec<(Epoch, AttesterDuties)>>,
     pub proposers: Mutex<Vec<(Epoch, ProposerDuties)>>,
+    /// What `proposer_duties_v2` answers with, by epoch, like `proposers`.
+    pub proposers_v2: Mutex<Vec<(Epoch, ProposerDuties)>>,
+    /// Run inside every `proposer_duties_v2` call that gets past the
+    /// configured failures, before it answers: the point where a caller has
+    /// taken its own snapshot and waits on the node, so a test can change the
+    /// world under it there.
+    pub on_proposer_duties_v2: Option<Box<dyn Fn() + Send + Sync>>,
+    /// Every proposer preferences batch `submit_proposer_preferences`
+    /// received, with the fork it was sent under, in call order.
+    pub submitted_preferences: Mutex<Vec<(ForkName, Vec<gloas::SignedProposerPreferences>)>>,
+    /// Proposal slots whose preference the mock refuses, as a node does one it
+    /// holds with other content: a call carrying any of them is an `Err` and
+    /// records nothing, like the node's 400 for the whole call.
+    pub refused_preference_slots: Mutex<Vec<Slot>>,
     pub attestation_data: Option<AttestationData>,
     /// The slot and proposer the mock will produce a block for. `None` makes
     /// `produce_block` fail, the way an unset `attestation_data` does.
@@ -143,6 +157,7 @@ pub struct MockBeaconNode {
     pub duties_calls: Mutex<usize>,
     pub validator_indices_calls: Mutex<usize>,
     pub proposer_duties_calls: Mutex<usize>,
+    pub proposer_duties_v2_calls: Mutex<usize>,
     pub attestation_data_calls: Mutex<usize>,
     /// Sync duties by the epoch they are asked at. An epoch never set answers
     /// no duties, so tests that do not care about sync committees are
@@ -258,6 +273,45 @@ impl MockBeaconNode {
             Some((_, existing)) => *existing = entry,
             None => stored.push((epoch, entry)),
         }
+    }
+
+    /// Set the v2 proposer duties for `epoch`, replacing any earlier ones: a
+    /// reorg is the same epoch answering with another dependent root.
+    pub fn set_proposers_v2(
+        &self,
+        epoch: Epoch,
+        dependent_root: Root,
+        duties: Vec<ProposerDutyDto>,
+    ) {
+        let mut stored = self.proposers_v2.lock().expect("lock");
+        let entry = ProposerDuties {
+            dependent_root,
+            duties,
+        };
+        match stored
+            .iter_mut()
+            .find(|(stored_epoch, _)| *stored_epoch == epoch)
+        {
+            Some((_, existing)) => *existing = entry,
+            None => stored.push((epoch, entry)),
+        }
+    }
+
+    pub fn with_proposers_v2(
+        self,
+        epoch: Epoch,
+        dependent_root: Root,
+        duties: Vec<ProposerDutyDto>,
+    ) -> Self {
+        self.set_proposers_v2(epoch, dependent_root, duties);
+        self
+    }
+
+    /// How many times `proposer_duties_v2` has been called and got past the
+    /// configured failures, answers and misses alike. A call `failures` or
+    /// `fail_everything` rejects is not counted.
+    pub fn proposer_duties_v2_call_count(&self) -> usize {
+        *self.proposer_duties_v2_calls.lock().expect("lock")
     }
 
     pub fn with_attestation_data(mut self, slot: Slot) -> Self {
@@ -556,8 +610,9 @@ impl MockBeaconNode {
         *self.validator_indices_calls.lock().expect("lock")
     }
 
-    /// How many times `proposer_duties` has been called, successes and
-    /// failures alike.
+    /// How many times `proposer_duties` has been called and got past the
+    /// configured failures, answers and misses alike. A call `failures` or
+    /// `fail_everything` rejects is not counted.
     pub fn proposer_duties_call_count(&self) -> usize {
         *self.proposer_duties_calls.lock().expect("lock")
     }
@@ -652,6 +707,25 @@ impl BeaconNodeApi for MockBeaconNode {
                 url: "mock".to_string(),
                 failure: BeaconNodeFailure::Request,
                 detail: format!("no proposer duties for epoch {epoch}"),
+            })
+    }
+
+    async fn proposer_duties_v2(&self, epoch: Epoch) -> Result<ProposerDuties> {
+        self.guard("proposer_duties_v2")?;
+        *self.proposer_duties_v2_calls.lock().expect("lock") += 1;
+        if let Some(hook) = &self.on_proposer_duties_v2 {
+            hook();
+        }
+        self.proposers_v2
+            .lock()
+            .expect("lock")
+            .iter()
+            .find(|(stored, _)| *stored == epoch)
+            .map(|(_, duties)| duties.clone())
+            .ok_or_else(|| Error::BeaconNode {
+                url: "mock".to_string(),
+                failure: BeaconNodeFailure::Request,
+                detail: format!("no v2 proposer duties for epoch {epoch}"),
             })
     }
 
@@ -802,6 +876,32 @@ impl BeaconNodeApi for MockBeaconNode {
             .expect("lock")
             .extend(registrations.iter().cloned());
         Ok(())
+    }
+
+    async fn submit_proposer_preferences(
+        &self,
+        fork: ForkName,
+        preferences: &[gloas::SignedProposerPreferences],
+    ) -> Result<Delivery> {
+        self.guard("submit_proposer_preferences")?;
+        let refused = self.refused_preference_slots.lock().expect("lock").clone();
+        if let Some(entry) = preferences
+            .iter()
+            .find(|entry| refused.contains(&entry.message.proposal_slot))
+        {
+            return Err(Error::BeaconNodeStatus {
+                status: 400,
+                body: format!(
+                    "preference for slot {} refused",
+                    entry.message.proposal_slot
+                ),
+            });
+        }
+        self.submitted_preferences
+            .lock()
+            .expect("lock")
+            .push((fork, preferences.to_vec()));
+        Ok(Delivery::Everywhere)
     }
 
     async fn execution_payload_envelope(
