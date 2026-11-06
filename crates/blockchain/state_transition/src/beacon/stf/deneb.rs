@@ -53,7 +53,7 @@ use crate::beacon::primitives::{
     Bytes32, Gwei, H256, HashTreeRoot as _, KzgCommitment, ParticipationFlags, ValidatorIndex,
 };
 
-use super::ExecutionEngine;
+use super::{BlockCaches, ExecutionEngine};
 
 // ---------------------------------------------------------------------------
 // Block processing
@@ -77,8 +77,7 @@ pub fn process_block(
     block: &deneb::BeaconBlock,
     config: &Config,
     engine: &ExecutionEngine,
-    committees: &CommitteeCache,
-    active_balances: &ActiveBalanceCache,
+    caches: BlockCaches<'_>,
     options: super::block::BlockProcessingOptions,
 ) -> Result<()> {
     super::block::process_block_header(
@@ -107,10 +106,15 @@ pub fn process_block(
         &block.body.voluntary_exits,
         &block.body.bls_to_execution_changes,
         config,
-        committees,
-        active_balances,
+        caches.committees,
+        caches.active_balances,
     )?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
+    super::altair::process_sync_aggregate(
+        state,
+        &block.body.sync_aggregate,
+        caches.active_balances,
+        caches.pubkey_indices,
+    )?;
     Ok(())
 }
 
@@ -166,10 +170,20 @@ fn process_operations(
     )?;
 
     for proposer_slashing in proposer_slashings {
-        super::operations::process_proposer_slashing(state, proposer_slashing, config)?;
+        super::operations::process_proposer_slashing(
+            state,
+            proposer_slashing,
+            config,
+            active_balances,
+        )?;
     }
     for attester_slashing in attester_slashings {
-        super::operations::process_attester_slashing(state, attester_slashing, config)?;
+        super::operations::process_attester_slashing(
+            state,
+            attester_slashing,
+            config,
+            active_balances,
+        )?;
     }
     for attestation in attestations {
         process_attestation(state, attestation, committees, active_balances)?;

@@ -38,8 +38,9 @@ use super::bls;
 use super::config::Config;
 use super::error::{Error, Result, verify};
 use super::helpers::accessors::{
-    ActiveBalanceCache, CommitteeCache, get_beacon_proposer_index, get_block_root,
-    get_block_root_at_slot, get_current_epoch, get_domain, get_previous_epoch, get_randao_mix,
+    ActiveBalanceCache, CommitteeCache, PubkeyIndexCache, get_beacon_proposer_index,
+    get_block_root, get_block_root_at_slot, get_current_epoch, get_domain, get_previous_epoch,
+    get_randao_mix,
 };
 use super::helpers::electra::{
     get_attesting_indices, get_indexed_attestation, is_valid_indexed_attestation,
@@ -47,7 +48,7 @@ use super::helpers::electra::{
 use super::helpers::misc::compute_signing_root;
 use super::helpers::predicates::is_slashable_validator;
 use super::lean_boundary::lean_state_unreachable;
-use super::stf::{self, ExecutionEngine};
+use super::stf::{self, BlockCaches, ExecutionEngine, OwnedBlockCaches};
 use ethlambda_storage::pools::single_committee;
 
 /// `state` advanced through empty slots to `slot`, as a block for `slot` is
@@ -377,12 +378,18 @@ impl Operations {
 /// maximum.
 pub fn pack_operations(state: &BeaconState, candidates: Operations, config: &Config) -> Operations {
     let mut scratch = state.clone();
+    // One table for the whole scratch pass, slashings included (a slashing
+    // starts an exit too): the scratch state is at the block's own slot, so
+    // its total active balance cannot change between candidates.
+    let active_balances = ActiveBalanceCache::default();
     let proposer_slashings = pack_each(
         &mut scratch,
         candidates.proposer_slashings,
         preset::MAX_PROPOSER_SLASHINGS,
         config,
-        stf::operations::process_proposer_slashing,
+        |state, slashing, config| {
+            stf::operations::process_proposer_slashing(state, slashing, config, &active_balances)
+        },
     );
 
     let epoch = get_current_epoch(&scratch);
@@ -399,7 +406,9 @@ pub fn pack_operations(state: &BeaconState, candidates: Operations, config: &Con
         ranked.into_iter().map(|(_, slashing)| slashing).collect(),
         preset::MAX_ATTESTER_SLASHINGS_ELECTRA,
         config,
-        stf::electra::process_attester_slashing,
+        |state, slashing, config| {
+            stf::electra::process_attester_slashing(state, slashing, config, &active_balances)
+        },
     );
 
     let voluntary_exits = pack_each(
@@ -407,7 +416,9 @@ pub fn pack_operations(state: &BeaconState, candidates: Operations, config: &Con
         candidates.voluntary_exits,
         preset::MAX_VOLUNTARY_EXITS,
         config,
-        stf::electra::process_voluntary_exit,
+        |state, exit, config| {
+            stf::electra::process_voluntary_exit(state, exit, config, &active_balances)
+        },
     );
     let bls_to_execution_changes = pack_each(
         &mut scratch,
@@ -508,10 +519,17 @@ pub struct BlockInputs {
 /// the network would, before anything is signed. `options` is what that run may
 /// leave unchecked: only a caller that set `skip_randao_verification` passes
 /// anything but the default.
+///
+/// `pubkey_indices` is the pubkey table that run resolves execution requests
+/// and the sync committee through. A node passes its `Store`'s shared one: a
+/// fresh table would first ingest the whole registry, which at mainnet's size
+/// costs more than the registry scans the table replaces. The run's committee
+/// and total-active-balance tables are fresh, as they always were here.
 pub fn assemble_block(
     state: &BeaconState,
     inputs: BlockInputs,
     config: &Config,
+    pubkey_indices: &PubkeyIndexCache,
     options: stf::block::BlockProcessingOptions,
 ) -> Result<BeaconBlock> {
     let body = BeaconBlockBody {
@@ -585,13 +603,17 @@ pub fn assemble_block(
         BeaconState::Lean(_) => lean_state_unreachable("assemble_block"),
     };
     let mut post = state.clone();
+    let scratch = OwnedBlockCaches::default();
+    let caches = BlockCaches {
+        pubkey_indices,
+        ..scratch.caches()
+    };
     stf::block::process_block(
         &mut post,
         &wrapped,
         config,
         &ExecutionEngine::valid(),
-        &CommitteeCache::default(),
-        &ActiveBalanceCache::default(),
+        caches,
         options,
     )?;
     // Fold the block's writes into their trees first, so the root is computed
@@ -679,6 +701,7 @@ mod tests {
             &state,
             inputs,
             &Config::mainnet(),
+            &PubkeyIndexCache::default(),
             BlockProcessingOptions::default(),
         )
         .unwrap();
@@ -700,8 +723,7 @@ mod tests {
             &signed,
             &Config::mainnet(),
             &ExecutionEngine::valid(),
-            &CommitteeCache::default(),
-            &ActiveBalanceCache::default(),
+            OwnedBlockCaches::default().caches(),
             BlockProcessingOptions::default(),
         )
         .unwrap();
@@ -736,6 +758,7 @@ mod tests {
                 &state,
                 inputs_with_infinity_reveal(&state),
                 &config,
+                &PubkeyIndexCache::default(),
                 BlockProcessingOptions::default(),
             )
             .is_err()
@@ -745,6 +768,7 @@ mod tests {
             &state,
             inputs_with_infinity_reveal(&state),
             &config,
+            &PubkeyIndexCache::default(),
             skip_randao(),
         )
         .unwrap();
@@ -764,8 +788,7 @@ mod tests {
             &signed,
             &config,
             &ExecutionEngine::valid(),
-            &CommitteeCache::default(),
-            &ActiveBalanceCache::default(),
+            OwnedBlockCaches::default().caches(),
             skip_randao(),
         )
         .unwrap();
@@ -792,6 +815,7 @@ mod tests {
                 &state,
                 inputs,
                 &Config::mainnet(),
+                &PubkeyIndexCache::default(),
                 BlockProcessingOptions::default(),
             )
             .is_err()
@@ -1161,8 +1185,14 @@ mod tests {
             execution_requests: ExecutionRequests::default(),
             sync_aggregate: empty_sync_aggregate(),
         };
-        let block =
-            assemble_block(&state, inputs, &config, BlockProcessingOptions::default()).unwrap();
+        let block = assemble_block(
+            &state,
+            inputs,
+            &config,
+            &PubkeyIndexCache::default(),
+            BlockProcessingOptions::default(),
+        )
+        .unwrap();
         assert_eq!(block.body.voluntary_exits.len(), 1);
         assert_eq!(block.body.voluntary_exits[0].message.validator_index, 4);
     }
@@ -1236,6 +1266,7 @@ mod tests {
             &state,
             inputs,
             &Config::mainnet(),
+            &PubkeyIndexCache::default(),
             BlockProcessingOptions::default(),
         )
         .unwrap();

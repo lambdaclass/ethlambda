@@ -77,7 +77,7 @@ use ethlambda_state_transition::beacon::{
     },
     sync_committee_pool::SharedSyncCommitteePool,
 };
-use ethlambda_storage::Store;
+use ethlambda_storage::{PubkeyIndexCache, Store};
 use ethlambda_types::{
     beacon::{
         config::Config,
@@ -434,6 +434,10 @@ struct Prepared {
     /// What the block's state transition may leave unchecked: the reveal, when
     /// the caller set `skip_randao_verification`.
     options: BlockProcessingOptions,
+    /// The store's shared pubkey table, which every state transition of the
+    /// proposal resolves execution requests and the sync committee through
+    /// (a fresh one would ingest the whole registry each time).
+    pubkey_indices: Arc<PubkeyIndexCache>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -686,8 +690,15 @@ fn prepare(
     if randao == RandaoVerification::Verify {
         verify_randao_reveal(&state, proposer, randao_reveal)?;
     }
-    let mut inputs = gloas_payload_inputs(&state, build_on_full, &parent_requests, &config)
-        .map_err(|_| ApiError::Internal("computing the payload attributes failed"))?;
+    let pubkey_indices = store.pubkey_index_cache();
+    let mut inputs = gloas_payload_inputs(
+        &state,
+        build_on_full,
+        &parent_requests,
+        &config,
+        &pubkey_indices,
+    )
+    .map_err(|_| ApiError::Internal("computing the payload attributes failed"))?;
 
     // The proposer's signed preferences for this slot, under the dependent root
     // the head's chain gives it. They name the fee recipient and gas target the
@@ -707,6 +718,7 @@ fn prepare(
         parent_requests,
         preferences,
         options: BlockProcessingOptions { randao },
+        pubkey_indices,
     })
 }
 
@@ -865,6 +877,7 @@ fn assemble(
         head_slot,
         parent_requests,
         options,
+        pubkey_indices,
         ..
     } = prepared;
     let attestations = pack_gloas_attestations(state, candidates);
@@ -891,7 +904,7 @@ fn assemble(
     };
     let operations = attestations.len() + payload_attestations.len();
     let attempt = inputs(attestations, payload_attestations, sync_aggregate);
-    match assemble_gloas_block(state, attempt, config, *options) {
+    match assemble_gloas_block(state, attempt, config, pubkey_indices, *options) {
         Ok(produced) => Ok(produced),
         // The packers check every operation's signature against this state, and
         // the sync aggregate was verified above, so this should not happen; but
@@ -899,7 +912,7 @@ fn assemble(
         Err(err) if operations > 0 || has_sync_aggregate => {
             warn!(slot = state.slot(), %err, "Block with operations failed to build; retrying without");
             let bare = inputs(Vec::new(), Vec::new(), empty_sync_aggregate());
-            assemble_gloas_block(state, bare, config, *options)
+            assemble_gloas_block(state, bare, config, pubkey_indices, *options)
                 .map_err(|_| ApiError::Internal("the block failed to build"))
         }
         Err(_) => Err(ApiError::Internal("the block failed to build")),
@@ -923,6 +936,7 @@ fn assemble_on_bid(
         head_slot,
         parent_requests,
         options,
+        pubkey_indices,
         ..
     } = prepared;
     let attestations = pack_gloas_attestations(state, candidates);
@@ -941,13 +955,20 @@ fn assemble_on_bid(
         state,
         inputs(attestations, payload_attestations),
         config,
+        pubkey_indices,
         *options,
     ) {
         Ok(block) => Ok(block),
         Err(err) if operations > 0 => {
             warn!(slot = state.slot(), %err, "Bid block with operations failed to build; retrying without");
-            assemble_gloas_block_on_bid(state, inputs(Vec::new(), Vec::new()), config, *options)
-                .map_err(|_| ApiError::Internal("the block failed to build"))
+            assemble_gloas_block_on_bid(
+                state,
+                inputs(Vec::new(), Vec::new()),
+                config,
+                pubkey_indices,
+                *options,
+            )
+            .map_err(|_| ApiError::Internal("the block failed to build"))
         }
         Err(_) => Err(ApiError::Internal("the block failed to build")),
     }
@@ -1517,7 +1538,14 @@ mod tests {
             test_support::{payload_for, randao_reveal},
         };
         let requests = ExecutionRequests::default();
-        let inputs = gloas_payload_inputs(state, true, &requests, &config()).unwrap();
+        let inputs = gloas_payload_inputs(
+            state,
+            true,
+            &requests,
+            &config(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
         assemble_gloas_block(
             state,
             GloasBlockInputs {
@@ -1533,6 +1561,7 @@ mod tests {
                 execution_requests: ExecutionRequests::default(),
             },
             &config(),
+            &PubkeyIndexCache::default(),
             ethlambda_state_transition::beacon::stf::block::BlockProcessingOptions::default(),
         )
         .unwrap()
@@ -1571,7 +1600,14 @@ mod tests {
             payload_for, randao_reveal,
         };
         let requests = ExecutionRequests::default();
-        let inputs = gloas_payload_inputs(state, true, &requests, &config()).unwrap();
+        let inputs = gloas_payload_inputs(
+            state,
+            true,
+            &requests,
+            &config(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
         let built = BuiltGloasPayload {
             execution_payload: payload_for(&inputs),
             block_value: Default::default(),
@@ -1588,6 +1624,7 @@ mod tests {
             parent_requests: requests.clone(),
             preferences: None,
             options: BlockProcessingOptions::default(),
+            pubkey_indices: Default::default(),
         };
         assemble(
             &config(),
@@ -1854,7 +1891,14 @@ mod tests {
         let commitment = blob_to_kzg_commitment(&blob).unwrap();
         let (_, proofs) = compute_cells_and_kzg_proofs(&blob).unwrap();
         let requests = ExecutionRequests::default();
-        let inputs = gloas_payload_inputs(&state, true, &requests, &config()).unwrap();
+        let inputs = gloas_payload_inputs(
+            &state,
+            true,
+            &requests,
+            &config(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
         let produced = assemble_gloas_block(
             &state,
             GloasBlockInputs {
@@ -1870,6 +1914,7 @@ mod tests {
                 execution_requests: ExecutionRequests::default(),
             },
             &config(),
+            &PubkeyIndexCache::default(),
             ethlambda_state_transition::beacon::stf::block::BlockProcessingOptions::default(),
         )
         .unwrap();

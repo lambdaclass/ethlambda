@@ -514,7 +514,8 @@ not part of the leanMetrics spec.
 
 | Name | Type | Usage | Sample collection event | Labels |
 |------|------|-------|-------------------------|--------|
-| `lean_beacon_total_active_balance_lookups_total` | Counter | Total active balance lookups, by whether the cache served them | On every `ActiveBalanceCacheExt::total_active_balance` call: block processing's attestations and sync aggregate | result=hit,miss,unkeyable |
+| `lean_beacon_total_active_balance_lookups_total` | Counter | Total active balance lookups, by whether the cache served them | On every `ActiveBalanceCacheExt::total_active_balance` call: block processing's attestations, sync aggregate and exit/consolidation churn | result=hit,miss,unkeyable |
+| `lean_beacon_pubkey_index_lookups_total` | Counter | Pubkey to validator-index lookups in block processing, by whether the pubkey index cache served them | Per sync committee seat, and per pubkey of a withdrawal or consolidation request; `fallback` is a registry search (also counted when the pubkey is not registered) | result=hit,fallback |
 
 Expect one miss per epoch per chain, and hits otherwise. `unkeyable` is the
 genesis state asking about its own epoch, and should be zero on a
