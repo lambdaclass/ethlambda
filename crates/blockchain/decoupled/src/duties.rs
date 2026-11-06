@@ -1,316 +1,197 @@
-//! Validator duties and available confirmation (PROTOCOL.md figures
-//! `alg:store` and `alg:duties`).
+//! The fork choice's internal API for validator duties and its external API
+//! (fork-choice.md: `get_ac_proposal`, `get_ac_vote_head`, `get_ac_frame`,
+//! `get_confirmed_node`, `get_head`), plus the reads validator.md makes of the
+//! source and head states to build FG attestation data.
 //!
 //! Duties are store reads: the engine computes what an honest validator would
 //! emit, and the host signs it, broadcasts it, and feeds it back through the
-//! ordinary handlers (`on_block`, `on_goldfish_vote`, `on_sg_vote`). Only the
-//! confirmation update writes the store, and it runs inside `on_tick`.
+//! ordinary handlers.
 
-use std::collections::{HashMap, HashSet};
-
-use ethlambda_types::primitives::H256;
-
-use crate::fork_choice::VoteView;
-use crate::params::{slot_start, view_freeze};
+use crate::fork_choice::View;
+use crate::params::{GENESIS_SLOT, HEAD_VOTE_DUE, SUPPORT_CUTOFF, time_into_slot, view_freeze};
 use crate::store::Store;
-use crate::types::{Attestation, GoldfishVote, Round, Slot, ValidatorIndex};
-use crate::validator_client::{AttestationInput, SourceFields};
+use crate::types::{
+    ForkChoiceNode, HeadVoteData, HeadVoteMessage, Height, HeightCheckpoint, INFINITE_TIME,
+    PayloadStatus, Slot,
+};
+use crate::views::compute_merged_view;
 
-/// The protocol content of an honest proposal (`propose_block`).
+/// `get_ac_proposal`'s result: the head to build on (never `Pending`), and the
+/// previous slot's p2p head votes with the indices of those the proposer
+/// counts as support (the block's `head_votes` and `head_vote_support`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Proposal {
-    pub slot: Slot,
-    /// `H`: the head to build on.
-    pub parent_root: H256,
-    /// `B.votes`: every previous-slot vote held.
-    pub votes: Vec<GoldfishVote>,
-    /// `B.support_votes`: the members resolved at proposal time.
-    pub support_votes: Vec<GoldfishVote>,
-    /// `B.attestations` (`proposal_attestations`).
-    pub attestations: Vec<Attestation>,
+pub struct AcProposal {
+    pub head: ForkChoiceNode,
+    pub vote_messages: Vec<HeadVoteMessage>,
+    pub support_indices: Vec<usize>,
+}
+
+/// `get_ac_frame`'s result: the FG source (the deepest viable node of the
+/// fast-confirmed path, if any) and the head of the current slot's votes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcFrame {
+    pub fg_confirmed: Option<ForkChoiceNode>,
+    pub head: ForkChoiceNode,
+}
+
+/// What validator.md reads from the source and head states to build FG
+/// attestation data: `target` from the source's state (its root filled when
+/// the source entered the height), `justified` and `finalized_height` from the
+/// head's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FinalityAttestationInput {
+    pub target: HeightCheckpoint,
+    pub justified: HeightCheckpoint,
+    pub finalized_height: Height,
+}
+
+/// The head vote data of a committee member of `slot` voting for `head`
+/// (validator.md, "Head vote data"): `Pending` when the head is the slot's own
+/// block, the head's payload status otherwise.
+pub fn head_vote_data(store: &Store, slot: Slot, head: ForkChoiceNode) -> HeadVoteData {
+    let status = if store.block_slot(&head.root) == Some(slot) {
+        PayloadStatus::Pending
+    } else {
+        head.payload_status
+    };
+    HeadVoteData::new(
+        slot,
+        ForkChoiceNode {
+            root: head.root,
+            payload_status: status,
+        },
+    )
 }
 
 impl Store {
-    /// `propose_block(Σ)`, store side: what the slot-`Σ.s` proposer builds.
-    /// Runs at `t_s`.
-    pub fn proposal(&self) -> Proposal {
-        let slot = self.slot;
-        let previous = slot.saturating_sub(1);
-        let view = self.pool_view(previous);
-        let parent_root = self.head_with(&view, previous);
-        let attestations = self.proposal_attestations(&parent_root);
-        Proposal {
-            slot,
-            parent_root,
-            votes: self.goldfish_votes(previous),
-            support_votes: view.support_votes,
-            attestations,
+    /// `get_ac_proposal(store)`, at a slot's start: the head over the previous
+    /// slot's p2p votes, every received one counted and the resolved ones
+    /// supporting.
+    pub fn get_ac_proposal(&self) -> AcProposal {
+        debug_assert_eq!(time_into_slot(self.time), 0);
+        let current = self.current_slot();
+        debug_assert!(current > GENESIS_SLOT);
+        let previous = current.saturating_sub(1);
+        let frame = self.get_fg_frame();
+        let (vote_messages, support_indices) =
+            self.get_local_view_from_p2p_messages(previous, INFINITE_TIME, INFINITE_TIME);
+        let view = compute_merged_view(
+            &(vote_messages.clone(), support_indices.clone()),
+            &(Vec::new(), Vec::new()),
+        );
+        let mut head = self.get_head_in_tree(&frame, &frame.tree, &view, previous);
+        if head.payload_status == PayloadStatus::Pending {
+            head.payload_status = PayloadStatus::Empty;
+        }
+        AcProposal {
+            head,
+            vote_messages,
+            support_indices,
         }
     }
 
-    /// `proposal_attestations(Σ, H)`: the pool's attestations in the inclusive
-    /// window `[max(0, r − η_SG), r]`, plus those carried by held blocks of a
-    /// slot in that window, minus every attestation already on `H`'s chain,
-    /// with at most two attestations per validator and round (the first two
-    /// in this order, as the formalization fixes).
-    pub fn proposal_attestations(&self, head: &H256) -> Vec<Attestation> {
-        let round = self.current_round();
-        let in_window = |r: Round| self.params.admits_round(round, r);
-
-        let mut candidates: Vec<Attestation> = Vec::new();
-        for (pool_round, pool) in &self.attestations {
-            if in_window(*pool_round) {
-                candidates.extend(pool.iter().map(|p| p.attestation.clone()));
-            }
-        }
-        let mut held: Vec<(&H256, &crate::store::Node)> = self
-            .blocks
-            .iter()
-            .filter(|(_, node)| in_window(self.params.round_of(node.slot)))
-            .collect();
-        held.sort_by_key(|(root, _)| **root);
-        for (_, node) in held {
-            candidates.extend(
-                node.attestations
-                    .iter()
-                    .filter(|a| in_window(a.round()))
-                    .cloned(),
-            );
-        }
-
-        let on_chain = self.attestations_on_chain(head, round.saturating_sub(self.params.eta_sg));
-        let mut seen: HashSet<Attestation> = HashSet::new();
-        let mut per_signer: HashMap<(ValidatorIndex, Round), usize> = HashMap::new();
-        let mut selected = Vec::new();
-        for attestation in candidates {
-            if on_chain.contains(&attestation) || seen.contains(&attestation) {
-                continue;
-            }
-            let count = per_signer
-                .entry((attestation.validator, attestation.round()))
-                .or_default();
-            if *count >= 2 {
-                continue;
-            }
-            *count += 1;
-            seen.insert(attestation.clone());
-            selected.push(attestation);
-        }
-        selected
-    }
-
-    /// The attestations carried by `head` and its ancestors of a round at or
-    /// after `from_round`. An attestation of round `k` can only sit in a
-    /// block of round at least `k`, so older blocks cannot hold a window row.
-    fn attestations_on_chain(&self, head: &H256, from_round: Round) -> HashSet<Attestation> {
-        let mut found = HashSet::new();
-        let mut cursor = Some(*head);
-        while let Some(root) = cursor {
-            let Some(node) = self.node(&root) else {
-                break;
-            };
-            if self.params.round_of(node.slot) < from_round {
-                break;
-            }
-            found.extend(node.attestations.iter().cloned());
-            cursor = node.parent;
-        }
-        found
-    }
-
-    /// `goldfish_vote(Σ)`: the head a slot-`Σ.s` committee member votes for.
-    /// Runs at `t_s + Δ`.
+    /// `get_ac_vote_head(store)`, at the head vote deadline: the previous
+    /// slot's p2p view frozen at its view freeze, merged with the current
+    /// slot's proposals' views, walked over the voter's subtree.
     ///
-    /// The vote view merges the previous-slot pool frozen at
-    /// `t_{s−1} + 3Δ` with the votes carried by every held slot-`s` proposal;
-    /// the walk runs over the voter's processed-block view, which keeps only
-    /// blocks processed before the freeze plus the ancestors of current
-    /// proposals, with viability recomputed inside it.
-    pub fn goldfish_vote_head(&self) -> H256 {
-        let slot = self.slot;
-        let previous = slot.saturating_sub(1);
-        let freeze = view_freeze(previous);
-
-        let mut votes = Vec::new();
-        let mut support = Vec::new();
-        if let Some(pool) = self.gf_votes.get(&previous) {
-            for pooled in pool {
-                if pooled.stamp < freeze {
-                    votes.push(pooled.vote);
-                }
-                if self
-                    .vote_resolution(&pooled.vote, pooled.stamp)
-                    .is_some_and(|resolution| resolution < freeze)
-                {
-                    support.push(pooled.vote);
-                }
-            }
+    /// Sign [`head_vote_data`] of the result, not the node itself: for the
+    /// current slot's block the walk may end on its `Empty` node, and the vote
+    /// names it `Pending`.
+    pub fn get_ac_vote_head(&self) -> ForkChoiceNode {
+        debug_assert_eq!(time_into_slot(self.time), HEAD_VOTE_DUE);
+        let current = self.current_slot();
+        if current == GENESIS_SLOT {
+            return ForkChoiceNode::empty(self.finalized_checkpoint.root);
         }
-        let proposals: Vec<H256> = self
-            .blocks
-            .iter()
-            .filter(|(_, node)| node.slot == slot)
-            .map(|(root, _)| *root)
-            .collect();
-        for proposal in &proposals {
-            let node = &self.blocks[proposal];
-            votes.extend(node.votes.iter().filter(|v| v.slot == previous).copied());
-            support.extend(
-                node.support_votes
-                    .iter()
-                    .filter(|v| v.slot == previous && self.vote_resolves(v))
-                    .copied(),
-            );
+        let frame = self.get_fg_frame();
+        let freeze = view_freeze(current - 1);
+        let local = self.get_local_view_from_p2p_messages(current - 1, freeze, freeze);
+        let proposer = self.get_proposer_view(current, current - 1);
+        let view = compute_merged_view(&local, &proposer);
+        let voter_subtree = self.get_voter_subtree(&frame.tree, current);
+        let head = self.get_head_in_tree(&frame, &voter_subtree, &view, current - 1);
+        if self
+            .block_slot(&head.root)
+            .is_some_and(|slot| slot < current)
+            && head.payload_status == PayloadStatus::Pending
+        {
+            ForkChoiceNode::empty(head.root)
+        } else {
+            head
         }
-        let view = VoteView::new(votes, support);
-        let tree = self.voter_filtered_tree(slot, freeze, &proposals);
-        self.head_in_tree(&tree, &view, previous)
     }
 
-    /// `voter_filtered_block_tree(Σ, s)`.
-    fn voter_filtered_tree(&self, _slot: Slot, freeze: i64, proposals: &[H256]) -> HashSet<H256> {
-        let mut blocks: HashSet<H256> = self
-            .blocks
+    /// `get_ac_frame(store)`, at or after the support cutoff.
+    pub fn get_ac_frame(&self) -> AcFrame {
+        debug_assert!(time_into_slot(self.time) >= SUPPORT_CUTOFF);
+        let current = self.current_slot();
+        let frame = self.get_fg_frame();
+        let view = self.get_combined_local_view(current, INFINITE_TIME, INFINITE_TIME);
+        let head = self.get_head_in_tree(&frame, &frame.tree, &view, current);
+        let viable_subtree = self.get_viable_subtree(&frame, &frame.tree);
+        let fast_confirmed_viable: Vec<ForkChoiceNode> = self
+            .fast_confirmed_path
             .iter()
-            .filter(|(_, node)| node.stamp < freeze)
-            .map(|(root, _)| *root)
-            .collect();
-        for proposal in proposals {
-            let mut cursor = Some(*proposal);
-            while let Some(root) = cursor {
-                if !blocks.insert(root) {
-                    break;
-                }
-                cursor = self.node(&root).and_then(|node| node.parent);
-            }
-        }
-        self.filtered_tree(Some(&blocks))
-    }
-
-    /// `update_confirmation(Σ, s)` at `t_s + 6Δ` (= `t_{s+1} + 2Δ`): run the
-    /// composed walk over the confirmation window's votes, write
-    /// `Σ.live_confirmed`, and update the two user-facing records.
-    pub(crate) fn update_confirmation(&mut self, slot: Slot) {
-        let (support_cutoff, confirmation_time) = self.confirmation_window(slot);
-        let pool: Vec<(GoldfishVote, i64)> = self
-            .gf_votes
-            .get(&slot)
-            .map(|pool| pool.iter().map(|p| (p.vote, p.stamp)).collect())
-            .unwrap_or_default();
-        let early: Vec<GoldfishVote> = pool
-            .iter()
-            .filter(|(vote, stamp)| {
-                self.vote_resolution(vote, *stamp)
-                    .is_some_and(|resolution| resolution < support_cutoff)
-            })
-            .map(|(vote, _)| *vote)
-            .collect();
-        let late: Vec<GoldfishVote> = pool
-            .iter()
-            .filter(|(_, stamp)| *stamp < confirmation_time)
-            .map(|(vote, _)| *vote)
-            .collect();
-        let support: Vec<GoldfishVote> = early
-            .iter()
-            .filter(|vote| {
-                !late
-                    .iter()
-                    .any(|other| other.validator == vote.validator && other != *vote)
-            })
+            .filter(|node| viable_subtree.contains(node))
             .copied()
             .collect();
-        let voters: HashSet<ValidatorIndex> = late.iter().map(|vote| vote.validator).collect();
+        AcFrame {
+            fg_confirmed: self.get_deepest_node(&fast_confirmed_viable),
+            head,
+        }
+    }
 
-        let tree = self.filtered_tree(None);
-        let root = self.fg_root();
-        let anchor = self.sg_root();
-        let view = VoteView::new(support.clone(), support);
-        let mut scores = self.scores(&view, slot, &anchor);
-        // `voters_count` is the late participants, not the support set's.
-        scores.voters = voters.len() as u64;
-        let head = self.ghost(anchor, &tree, &scores, |block| scores.majority(block));
+    /// The source and head state reads of validator.md's "Attestation data",
+    /// from one `get_ac_frame` observation. `None` when there is no FG source,
+    /// in which case the validator does not attest.
+    pub fn finality_attestation_input(&self, frame: &AcFrame) -> Option<FinalityAttestationInput> {
+        let source = frame.fg_confirmed?;
+        let source_state = self.block_checkpoints(&source.root)?;
+        let head_state = self.block_checkpoints(&frame.head.root)?;
+        Some(FinalityAttestationInput {
+            target: source_state.target,
+            justified: head_state.justified,
+            finalized_height: head_state.finalized.height,
+        })
+    }
 
-        let candidate = if scores.majority(&head) {
-            self.live_confirmed = head;
-            Some(head)
+    /// `get_confirmed_node(store)`: `latest_confirmed`, falling back to the
+    /// finalized node when it left the frame, is the finalized node, or
+    /// conflicts with the head. This is what an execution layer's safe block
+    /// follows (`get_confirmed_execution_block_hash` maps it to the bid's
+    /// block hash when `Full`, its parent block hash otherwise).
+    pub fn get_confirmed_node(&self) -> ForkChoiceNode {
+        let frame = self.get_fg_frame();
+        if !frame.tree.contains(&self.latest_confirmed)
+            || self.latest_confirmed == frame.finalized_node
+        {
+            return frame.finalized_node;
+        }
+        let head = self.get_head();
+        if !self.is_compatible(&head, &self.latest_confirmed) {
+            return frame.finalized_node;
+        }
+        self.latest_confirmed
+    }
+
+    /// `get_head(store)`: the walk over the current slot's votes at or after
+    /// its support cutoff, the previous slot's before; never `Pending`.
+    pub fn get_head(&self) -> ForkChoiceNode {
+        let current = self.current_slot();
+        if current == GENESIS_SLOT {
+            return ForkChoiceNode::empty(self.finalized_checkpoint.root);
+        }
+        let slot = if time_into_slot(self.time) >= SUPPORT_CUTOFF {
+            current
         } else {
-            self.live_confirmed = root;
-            // The saved grade-2 block stands in for the walk.
-            let frame = self.read_frame(self.current_round());
-            self.active_prefix(frame.g2.flatten())
+            current - 1
         };
-        self.update_user_confirmation_records(candidate);
-    }
-
-    /// `update_user_confirmation_records(Σ, C)`.
-    fn update_user_confirmation_records(&mut self, candidate: Option<H256>) {
-        let confirmed = self.advance(self.latest_confirmed, candidate);
-        let stable_root = self.stable_root();
-        self.latest_stable = self.advance(self.latest_stable, Some(stable_root));
-        if self.is_ancestor(&self.latest_stable, &confirmed) {
-            // The candidate extends the new stable record.
-            self.latest_confirmed = confirmed;
-        } else if !self.is_ancestor(&self.latest_stable, &self.latest_confirmed) {
-            // The old record has left the stable chain.
-            self.latest_confirmed = self.latest_stable;
+        let frame = self.get_fg_frame();
+        let view: View = self.get_combined_local_view(slot, INFINITE_TIME, INFINITE_TIME);
+        let mut head = self.get_head_in_tree(&frame, &frame.tree, &view, slot);
+        if head.payload_status == PayloadStatus::Pending {
+            head.payload_status = PayloadStatus::Empty;
         }
-    }
-
-    /// `advance(old, C)`: no candidate, or an ancestor, leaves the record.
-    fn advance(&self, old: H256, candidate: Option<H256>) -> H256 {
-        match candidate {
-            Some(c) if !self.is_ancestor(&c, &old) => c,
-            _ => old,
-        }
-    }
-
-    /// `attest(Σ, Λ)`, store side: the vote information the validator client
-    /// turns into a combined attestation at `a_r`. Run after the tick at
-    /// `a_r`, which has already run that instant's confirmation.
-    pub fn attestation_input(&self) -> AttestationInput {
-        let round = self.current_round();
-        let frame = self.read_frame(round);
-        let grade2 = self.grade2_block(&frame);
-        let anchor = self.sg_root();
-        let live = self.live_confirmed;
-
-        // `get_sg_vote(Σ, A_G2)`.
-        let safe = self
-            .deepest_clear(&anchor, &live, &frame)
-            .or(grade2)
-            .unwrap_or_else(|| match frame.g2 {
-                // Grade 2 exists, but the root has passed it.
-                Some(Some(_)) => self.fg_root(),
-                // The anchor fallback keeps voting total.
-                _ => anchor,
-            });
-
-        // `get_fg_vote(Σ, A_G2)`.
-        let view = self.pool_view(self.slot);
-        let head = self.head_with(&view, self.slot);
-        let head_state = &self.blocks[&head].state;
-        let source = grade2.map(|g2| {
-            let source = self.deepest_clear(&g2, &live, &frame).unwrap_or(g2);
-            let state = &self.blocks[&source].state;
-            SourceFields {
-                height: state.height,
-                entry: state.entry.root,
-                nonjustifiable: state.nonjustifiable,
-            }
-        });
-        AttestationInput {
-            round,
-            safe,
-            source,
-            justified_height: head_state.justified_height,
-            justified: head_state.justified.root,
-            finalized_height: head_state.finalized_height,
-        }
-    }
-
-    /// Whether `t` is a slot's proposal instant, for hosts that schedule
-    /// their own timers.
-    pub fn is_proposal_time(t: i64) -> bool {
-        t >= 0 && t == slot_start(crate::params::slot_of(t)) && t > 0
+        head
     }
 }

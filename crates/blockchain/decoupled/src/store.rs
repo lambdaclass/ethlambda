@@ -1,65 +1,66 @@
-//! The cumulative node store Σ and its handlers (PROTOCOL.md §1.1, §1.4,
-//! figure `alg:store`).
-//!
-//! The store keeps messages and their receipt stamps, the processed block tree
-//! with every block's chain state, the finality caches and the three
-//! confirmation records. Everything else (views, viable and filtered trees,
-//! scores, grades, the SG root) is derived when used, from stamps compared
-//! against past instants; the only cached derived values are the saved grades.
+//! The fork choice store and its handlers (fork-choice.md: `Store`,
+//! `get_forkchoice_store`, `on_tick`, `on_block`,
+//! `on_execution_payload_envelope`, `on_head_vote_message`, `update_finality`
+//! and the receipt-time and committee recorders).
 //!
 //! # Trust boundary
 //!
-//! The engine checks what the protocol's handlers check. It does not verify
-//! signatures, committee membership or the proposer schedule: those depend on
-//! each chain's keys and shuffling, so the host checks them before it calls a
-//! handler (MODELING_CHOICES §1.3 puts the committee test at the gate too).
+//! The engine checks what the fork choice handlers check. It does not run the
+//! state transition, verify signatures or compute committees: those depend on
+//! each chain's state and keys, so the host does them before it calls a
+//! handler and hands the results in ([`BlockInput::fg`], recorded committees).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use ethlambda_types::primitives::H256;
 
-use crate::chain_state::{ChainState, state_transition};
-use crate::grades::GradeCache;
-use crate::params::{Params, confirmation_time, slot_of, support_cutoff};
+use crate::params::{
+    GENESIS_SLOT, HEAD_VOTE_DUE, Params, SUPPORT_CUTOFF, slot_of, slot_start, time_into_slot,
+};
 use crate::types::{
-    Attestation, BlockInput, BlockRef, Electorate, GoldfishVote, Height, Round, Slot, Tick,
+    Anchor, BlockInput, FgCheckpoints, ForkChoiceNode, HeadVote, HeadVoteCommittee,
+    HeadVoteCommittees, HeadVoteMessage, Height, HeightCheckpoint, PayloadStatus, Slot, Tick,
+    ValidatorIndex,
 };
 
-/// The stamp of the anchor block: `Σ.timestamp(B_gen) = −∞`.
-pub const ANCHOR_STAMP: Tick = Tick::MIN;
-
-/// One processed block.
+/// One processed block: `store.blocks[root]`, `store.block_states[root]`'s
+/// finality gadget checkpoints, and `store.block_receipt_times[root]`.
 #[derive(Debug, Clone)]
-pub(crate) struct Node {
+pub(crate) struct Block {
     pub(crate) parent: Option<H256>,
     pub(crate) slot: Slot,
     /// Parent edges from the anchor.
     pub(crate) depth: u64,
-    /// `Σ.timestamp(B)`.
-    pub(crate) stamp: Tick,
-    /// `Σ.σ[B]`.
-    pub(crate) state: ChainState,
-    pub(crate) votes: Vec<GoldfishVote>,
-    pub(crate) support_votes: Vec<GoldfishVote>,
-    pub(crate) attestations: Vec<Attestation>,
+    /// `get_parent_payload_status(store, block)`.
+    pub(crate) parent_payload_status: PayloadStatus,
+    pub(crate) fg: FgCheckpoints,
+    pub(crate) receipt_time: Tick,
+    pub(crate) head_votes: Vec<HeadVote>,
+    pub(crate) head_vote_support: Vec<Vec<bool>>,
     pub(crate) children: Vec<H256>,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct PooledVote {
-    pub(crate) vote: GoldfishVote,
-    pub(crate) stamp: Tick,
+/// A verified execution payload: `store.payloads[root]` is present,
+/// `store.payload_receipt_times[root]` and
+/// `store.payload_inclusion_list_satisfaction[root]`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Payload {
+    pub(crate) receipt_time: Tick,
+    pub(crate) inclusion_list_satisfied: bool,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct PooledAttestation {
-    pub(crate) attestation: Attestation,
-    pub(crate) stamp: Tick,
+/// A head vote message in the pool with its receipt time
+/// (`store.head_vote_message_receipt_times`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PooledHeadVote {
+    pub(crate) message: HeadVoteMessage,
+    pub(crate) receipt_time: Tick,
 }
 
-/// Why `on_block` refused a block. Only [`BlockError::FutureSlot`] and
-/// [`BlockError::UnknownParent`] are transient: the same block can be offered
-/// again once the clock or the tree has moved.
+/// Why `on_block` refused a block. Only [`BlockError::FutureSlot`],
+/// [`BlockError::UnknownParent`] and [`BlockError::ParentPayloadNotVerified`]
+/// are transient: the same block can be offered again once the clock, the
+/// tree or the payloads have moved.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BlockError {
     #[error("block slot {slot} is after the current slot {current}")]
@@ -68,386 +69,365 @@ pub enum BlockError {
     Duplicate,
     #[error("parent {0:?} not processed")]
     UnknownParent(H256),
+    #[error("block builds on its parent's full payload, which is not verified")]
+    ParentPayloadNotVerified,
+    #[error("a block builds on its parent's empty or full branch, not on a pending one")]
+    PendingParentStatus,
     #[error("block does not descend from the finalized block")]
     NotDescendantOfFinalized,
     #[error("block slot {slot} is not after its parent's slot {parent_slot}")]
     SlotNotAfterParent { slot: Slot, parent_slot: Slot },
-    #[error("carried vote of slot {vote_slot} in a block of slot {slot}")]
-    VoteOfWrongSlot { vote_slot: Slot, slot: Slot },
-    #[error("support vote not among the carried votes")]
-    SupportNotSubset,
-    #[error("carried attestation of round {round} after the block's round {block_round}")]
-    AttestationFromFuture { round: Round, block_round: Round },
+    #[error("head vote support does not have one bit per voter")]
+    MalformedSupport,
 }
 
-/// What a tick asks the host to do (`on_tick`, §2.1). The store side of the
-/// tick (grades, clock, confirmation) has already run when this is returned.
+/// Why `on_head_vote_message` refused a message.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum HeadVoteError {
+    #[error("head vote already seen")]
+    Duplicate,
+    #[error("head vote of slot {slot} outside the previous and current slots")]
+    WrongSlot { slot: Slot },
+    #[error("head vote payload status {0} is not a payload status")]
+    InvalidPayloadStatus(u8),
+    #[error("the head vote committee of slot {0} is not recorded")]
+    UnknownCommittee(Slot),
+    #[error("validator {validator} is not in the head vote committee of slot {slot}")]
+    NotInCommittee {
+        slot: Slot,
+        validator: ValidatorIndex,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CommitteeError {
+    #[error("slot {0}'s head vote committee differs from the one recorded")]
+    Mismatch(Slot),
+    #[error("this store gives every validator a seat; it records no committees")]
+    NotRecorded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PayloadError {
+    #[error("payload for an unknown block {0:?}")]
+    UnknownBlock(H256),
+}
+
+/// What a tick asks the host to do. The store side of the tick (`unlock`,
+/// `update_confirmation`) has already run when this is returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TickEvents {
     pub tick: Tick,
     pub slot: Slot,
-    /// `t = t_s`, `s > 0`: the slot's proposer builds its block now.
+    /// The slot's start, `slot > 0`: its proposer builds on
+    /// `get_ac_proposal`.
     pub propose: bool,
-    /// `t = t_s + Δ`, `s > 0`: committee members cast their Goldfish vote.
-    pub vote: bool,
-    /// `t = a_r`: every awake validator attests for this round.
-    pub attest: Option<Round>,
+    /// The head vote deadline, `slot > 0`: committee members vote for
+    /// `get_ac_vote_head`, after this tick's `unlock`.
+    pub head_vote: bool,
+    /// The support cutoff: this tick's `update_confirmation` has run, and
+    /// `get_ac_frame` may be read for FG attestations.
+    pub support_cutoff: bool,
 }
 
-/// The decoupled-consensus store Σ.
+/// The EIP-8453 fork choice store.
 #[derive(Debug, Clone)]
 pub struct Store {
     pub(crate) params: Params,
-    pub(crate) electorate: Electorate,
-    /// `Σ.t`: the last tick run, `None` before the first.
-    pub(crate) time: Option<Tick>,
-    /// `Σ.s`.
-    pub(crate) slot: Slot,
-    pub(crate) anchor: H256,
-    /// `Σ.𝒯` with `Σ.σ[·]` and `Σ.timestamp[·]` of blocks.
-    pub(crate) blocks: HashMap<H256, Node>,
-    /// The finalized block's ancestors, indexed by depth, for O(1) ancestry
-    /// below `Σ.F`.
-    pub(crate) finalized_chain: Vec<H256>,
-    /// `Σ.gf_votes[·]`.
-    pub(crate) gf_votes: BTreeMap<Slot, Vec<PooledVote>>,
-    /// `Σ.attestations[·]`.
-    pub(crate) attestations: BTreeMap<Round, Vec<PooledAttestation>>,
-    /// `Σ.G2`, `Σ.G1`, `Σ.G0` for the current and the next round.
-    pub(crate) grades: GradeCache,
-    /// `Σ.F`, and the height at which it was justified (`σ.h_F` of the
-    /// chain state that finalized it).
-    pub(crate) finalized: H256,
-    pub(crate) finalized_height: Height,
-    /// `Σ.J`, `Σ.h_j`.
-    pub(crate) justified: H256,
-    pub(crate) justified_height: Height,
-    /// `Σ.h_max`.
+    pub(crate) committees: HeadVoteCommittees,
+    /// `store.time_ms`, in ticks.
+    pub(crate) time: Tick,
+    /// Whether `on_tick` has run: a store that has never ticked jumps to the
+    /// first time it is given instead of replaying the past.
+    pub(crate) ticked: bool,
+    /// The finalized block's subtree, plus blocks that conflict with it until
+    /// the next slot starts (their carried votes still count for the current
+    /// slot's views, as in the spec, where nothing is ever pruned).
+    pub(crate) blocks: HashMap<H256, Block>,
+    pub(crate) blocks_by_slot: BTreeMap<Slot, Vec<H256>>,
+    /// Strict ancestors of the finalized block that were pruned, so a child of
+    /// one is refused as not descending from it rather than fetched.
+    pub(crate) finalized_ancestors: HashSet<H256>,
+    pub(crate) payloads: HashMap<H256, Payload>,
+    pub(crate) justified_checkpoint: HeightCheckpoint,
+    pub(crate) finalized_checkpoint: HeightCheckpoint,
     pub(crate) max_height: Height,
-    pub(crate) live_confirmed: H256,
-    pub(crate) latest_confirmed: H256,
-    pub(crate) latest_stable: H256,
+    pub(crate) fast_confirmed_path: HashSet<ForkChoiceNode>,
+    pub(crate) latest_confirmed: ForkChoiceNode,
+    pub(crate) saved_confirmations: BTreeMap<Slot, ForkChoiceNode>,
+    /// `store.locks`, keyed by deadline.
+    pub(crate) locks: BTreeMap<Tick, ForkChoiceNode>,
+    pub(crate) head_vote_messages: BTreeMap<Slot, Vec<PooledHeadVote>>,
 }
 
 impl Store {
-    /// A store anchored at `anchor` (genesis, or the block the protocol starts
-    /// from), whose post-state is `anchor_state`.
-    ///
-    /// Everything below the anchor is out of the store's view: the anchor is
-    /// `B_gen` of the formal model, with stamp `−∞`.
-    pub fn new(
-        params: Params,
-        electorate: Electorate,
-        anchor: BlockRef,
-        anchor_state: ChainState,
-    ) -> Self {
-        let root = anchor.root;
-        let node = Node {
+    /// `get_forkchoice_store`: a store anchored at `anchor`, trusted as
+    /// justified and finalized at its post-state's target height, with the
+    /// clock at the anchor's slot.
+    pub fn new(params: Params, committees: HeadVoteCommittees, anchor: Anchor) -> Self {
+        let anchor_height = anchor.fg.target.height;
+        let checkpoint = HeightCheckpoint::new(anchor_height, anchor.root);
+        let time = slot_start(anchor.slot);
+        let block = Block {
             parent: None,
             slot: anchor.slot,
             depth: 0,
-            stamp: ANCHOR_STAMP,
-            state: anchor_state,
-            votes: Vec::new(),
-            support_votes: Vec::new(),
-            attestations: Vec::new(),
+            parent_payload_status: PayloadStatus::Empty,
+            fg: FgCheckpoints {
+                target: HeightCheckpoint::new(anchor_height, anchor.root),
+                ..anchor.fg
+            },
+            receipt_time: time,
+            head_votes: Vec::new(),
+            head_vote_support: Vec::new(),
             children: Vec::new(),
         };
         Self {
             params,
-            electorate,
-            time: None,
-            slot: anchor.slot,
-            anchor: root,
-            blocks: HashMap::from([(root, node)]),
-            finalized_chain: vec![root],
-            gf_votes: BTreeMap::new(),
-            attestations: BTreeMap::new(),
-            grades: GradeCache::initial(params.round_of(anchor.slot)),
-            finalized: root,
-            finalized_height: 0,
-            justified: root,
-            justified_height: 0,
-            max_height: 1,
-            live_confirmed: root,
-            latest_confirmed: root,
-            latest_stable: root,
+            committees,
+            time,
+            ticked: false,
+            blocks: HashMap::from([(anchor.root, block)]),
+            blocks_by_slot: BTreeMap::from([(anchor.slot, vec![anchor.root])]),
+            finalized_ancestors: HashSet::new(),
+            payloads: HashMap::new(),
+            justified_checkpoint: checkpoint,
+            finalized_checkpoint: checkpoint,
+            max_height: anchor_height,
+            fast_confirmed_path: HashSet::new(),
+            latest_confirmed: ForkChoiceNode::pending(anchor.root),
+            saved_confirmations: BTreeMap::new(),
+            locks: BTreeMap::new(),
+            head_vote_messages: BTreeMap::new(),
         }
-    }
-
-    /// A store anchored at genesis with the initial chain state.
-    pub fn from_genesis(params: Params, electorate: Electorate, genesis_root: H256) -> Self {
-        let anchor = BlockRef {
-            root: genesis_root,
-            slot: 0,
-        };
-        let state = ChainState::initial(anchor, electorate.len());
-        Self::new(params, electorate, anchor, state)
     }
 
     pub fn params(&self) -> &Params {
         &self.params
     }
 
-    pub fn electorate(&self) -> &Electorate {
-        &self.electorate
+    pub fn committees(&self) -> &HeadVoteCommittees {
+        &self.committees
     }
 
-    /// `Σ.t`, the last tick run.
-    pub fn time(&self) -> Option<Tick> {
+    /// `store.time_ms`, in ticks.
+    pub fn time(&self) -> Tick {
         self.time
     }
 
-    /// `Σ.s`.
+    /// `get_current_slot(store)`.
     pub fn current_slot(&self) -> Slot {
-        self.slot
+        slot_of(self.time)
     }
 
-    pub fn current_round(&self) -> Round {
-        self.params.round_of(self.slot)
-    }
-
-    /// The stamp an object processed now receives.
-    pub(crate) fn now(&self) -> Tick {
-        self.time.unwrap_or(ANCHOR_STAMP)
+    pub fn current_round(&self) -> u64 {
+        self.params.round_of(self.current_slot())
     }
 
     // ── Clock ──────────────────────────────────────────────────────────────
 
-    /// Run every public tick up to and including `now`, in order, and return
-    /// the duties each one asks for. A store that has never ticked runs only
-    /// `now`: a node that joins does not replay the past (§6.2, "a node that
-    /// joins starts with empty fields").
+    /// Run `on_tick` for every tick after the last one up to and including
+    /// `now`, in order, and return what each asks of the host. A store that
+    /// has never ticked runs `now` only: a node that joins does not replay the
+    /// duties of the past.
     ///
-    /// Call this before every handler, with the current wall-clock tick, so an
-    /// object is stamped after the tick of its own instant (§2: "the tick at a
-    /// public time runs once, before the objects processed at that time").
+    /// Call this before every handler with the current wall-clock tick, so an
+    /// object is stamped after the tick of its own instant ("callers must
+    /// process this tick before other events at the same timestamp").
     pub fn advance_to(&mut self, now: Tick) -> Vec<TickEvents> {
-        let first = match self.time {
-            Some(last) if now <= last => return Vec::new(),
-            Some(last) => last + 1,
-            None => now,
+        let first = if !self.ticked {
+            now
+        } else if now <= self.time {
+            return Vec::new();
+        } else {
+            self.time + 1
         };
         (first..=now).map(|t| self.on_tick(t)).collect()
     }
 
-    /// `on_tick(Σ, Λ, t)` (§2.1), store side.
-    ///
-    /// Completes the grades whose completion time this is (from the store as
-    /// it stands, before the clock moves), advances the clock, and runs the
-    /// slot-`(s−1)` confirmation at `t_s + 2Δ`. Proposals, votes and
-    /// attestations need the host's keys, so they come back as
-    /// [`TickEvents`]; the host runs them, in that order, against the store as
-    /// this call leaves it.
+    /// `on_tick(store, time)`: `unlock` at the head vote deadline and
+    /// `update_confirmation` at the support cutoff, both of the previous slot
+    /// and both before the clock moves; then the clock moves.
     pub fn on_tick(&mut self, t: Tick) -> TickEvents {
-        self.update_grades(t);
         let slot = slot_of(t);
-        self.time = Some(t);
-        self.slot = slot;
-        self.prune_pools();
-
-        let start = crate::params::slot_start(slot);
-        let propose = slot > 0 && t == start;
-        let vote = slot > 0 && t == start + 1;
-        if slot > 0 && t == support_cutoff(slot) {
+        let into_slot = time_into_slot(t);
+        if slot > GENESIS_SLOT && into_slot == HEAD_VOTE_DUE {
+            self.unlock(slot - 1, t);
+        }
+        if slot > GENESIS_SLOT && into_slot == SUPPORT_CUTOFF {
             self.update_confirmation(slot - 1);
         }
-        let round = self.params.round_of(slot);
-        let attest = (t == self.params.attestation_time(round)).then_some(round);
+        self.time = t;
+        self.ticked = true;
+        if into_slot == 0 {
+            self.prune();
+        }
         TickEvents {
             tick: t,
             slot,
-            propose,
-            vote,
-            attest,
+            propose: slot > GENESIS_SLOT && into_slot == 0,
+            head_vote: slot > GENESIS_SLOT && into_slot == HEAD_VOTE_DUE,
+            support_cutoff: into_slot == SUPPORT_CUTOFF,
         }
     }
 
-    /// Discard pool entries no rule can read any more (appendix A.3 and A.7:
-    /// "expired pool entries may be discarded"). Goldfish votes older than the
-    /// previous slot are refused on arrival and read by no duty; attestations
-    /// older than the SG window are read by no grade.
-    fn prune_pools(&mut self) {
-        let oldest_vote_slot = self.slot.saturating_sub(1);
-        self.gf_votes = self.gf_votes.split_off(&oldest_vote_slot);
-        let oldest_round = self.current_round().saturating_sub(self.params.eta_sg);
-        self.attestations = self.attestations.split_off(&oldest_round);
+    /// Discard what no rule reads any more, at a slot's start.
+    ///
+    /// * Blocks outside the finalized block's subtree: from this slot on, the
+    ///   views read votes only from blocks of the current slot, and every walk
+    ///   stays inside the finalized subtree. Strict ancestors of the finalized
+    ///   block are remembered by root only.
+    /// * Head vote messages and committees of slots before the previous one.
+    /// * Saved confirmations older than the slow lock window reads.
+    /// * Expired locks (a live lock's deadline is later than the store time).
+    fn prune(&mut self) {
+        let current = self.current_slot();
+        let finalized = self.finalized_checkpoint.root;
+        let mut keep = HashSet::new();
+        let mut stack = vec![finalized];
+        while let Some(root) = stack.pop() {
+            if let Some(block) = self.blocks.get(&root) {
+                keep.insert(root);
+                stack.extend(block.children.iter().copied());
+            }
+        }
+        let mut cursor = self.blocks.get(&finalized).and_then(|block| block.parent);
+        while let Some(root) = cursor {
+            self.finalized_ancestors.insert(root);
+            cursor = self.blocks.get(&root).and_then(|block| block.parent);
+        }
+        if keep.len() < self.blocks.len() {
+            self.blocks.retain(|root, _| keep.contains(root));
+            for roots in self.blocks_by_slot.values_mut() {
+                roots.retain(|root| keep.contains(root));
+            }
+            self.blocks_by_slot.retain(|_, roots| !roots.is_empty());
+            for block in self.blocks.values_mut() {
+                block.children.retain(|child| keep.contains(child));
+            }
+            self.payloads.retain(|root, _| keep.contains(root));
+        }
+
+        let previous = current.saturating_sub(1);
+        self.head_vote_messages = self.head_vote_messages.split_off(&previous);
+        if let HeadVoteCommittees::Recorded { by_slot, .. } = &mut self.committees {
+            *by_slot = by_slot.split_off(&previous);
+        }
+        let oldest_saved = current.saturating_sub(self.params.slow_lock_window + 1);
+        self.saved_confirmations = self.saved_confirmations.split_off(&oldest_saved);
+        self.locks = self.locks.split_off(&(self.time + 1));
     }
 
-    // ── Ancestry ───────────────────────────────────────────────────────────
+    // ── Ancestry over blocks ───────────────────────────────────────────────
 
     pub fn contains(&self, root: &H256) -> bool {
         self.blocks.contains_key(root)
     }
 
-    pub(crate) fn node(&self, root: &H256) -> Option<&Node> {
+    pub(crate) fn block(&self, root: &H256) -> Option<&Block> {
         self.blocks.get(root)
     }
 
-    pub(crate) fn depth(&self, root: &H256) -> Option<u64> {
-        self.blocks.get(root).map(|node| node.depth)
-    }
-
     pub fn block_slot(&self, root: &H256) -> Option<Slot> {
-        self.blocks.get(root).map(|node| node.slot)
+        self.blocks.get(root).map(|block| block.slot)
     }
 
-    pub fn block_ref(&self, root: &H256) -> Option<BlockRef> {
-        self.block_slot(root)
-            .map(|slot| BlockRef { root: *root, slot })
+    /// The post-state checkpoints of a held block.
+    pub fn block_checkpoints(&self, root: &H256) -> Option<FgCheckpoints> {
+        self.blocks.get(root).map(|block| block.fg)
     }
 
-    /// `Σ.σ[B]`.
-    pub fn chain_state(&self, root: &H256) -> Option<&ChainState> {
-        self.blocks.get(root).map(|node| &node.state)
-    }
-
-    /// The ancestor of `root` at `depth`, or `None` when `root` is unknown or
-    /// shallower than `depth`.
+    /// The ancestor of `root` at `depth`, or `None` when `root` is unknown,
+    /// shallower than `depth`, or its chain leaves the held blocks first.
     pub(crate) fn ancestor_at_depth(&self, root: &H256, depth: u64) -> Option<H256> {
         let mut current = *root;
-        let mut node = self.blocks.get(&current)?;
-        if node.depth < depth {
-            return None;
+        let mut block = self.blocks.get(&current)?;
+        while block.depth > depth {
+            current = block.parent?;
+            block = self.blocks.get(&current)?;
         }
-        loop {
-            if node.depth == depth {
-                return Some(current);
-            }
-            // Below the finalized block the chain is indexed: jump.
-            if let Some(&on_chain) = self.finalized_chain.get(node.depth as usize)
-                && on_chain == current
-            {
-                return self.finalized_chain.get(depth as usize).copied();
-            }
-            current = node.parent?;
-            node = self.blocks.get(&current)?;
-        }
+        (block.depth == depth).then_some(current)
     }
 
-    /// `B ⪯ C`: `B = C` or `B` is an ancestor of `C`. Unknown blocks are
-    /// ancestors of nothing.
-    pub fn is_ancestor(&self, ancestor: &H256, descendant: &H256) -> bool {
-        let Some(depth) = self.depth(ancestor) else {
+    /// `is_ancestor_root(store, root, ancestor)`: `ancestor` is `root` or one
+    /// of its ancestors, ignoring payload status.
+    pub fn is_ancestor_root(&self, root: &H256, ancestor: &H256) -> bool {
+        let Some(depth) = self.blocks.get(ancestor).map(|block| block.depth) else {
             return false;
         };
-        self.ancestor_at_depth(descendant, depth) == Some(*ancestor)
+        self.ancestor_at_depth(root, depth) == Some(*ancestor)
     }
 
-    /// Two blocks are compatible when one is an ancestor of the other.
-    pub fn compatible(&self, a: &H256, b: &H256) -> bool {
-        self.is_ancestor(a, b) || self.is_ancestor(b, a)
-    }
-
-    /// The deepest common ancestor of two processed blocks.
-    pub(crate) fn meet(&self, a: &H256, b: &H256) -> Option<H256> {
-        let depth_a = self.depth(a)?;
-        let depth_b = self.depth(b)?;
-        let mut depth = depth_a.min(depth_b);
-        let mut x = self.ancestor_at_depth(a, depth)?;
-        let mut y = self.ancestor_at_depth(b, depth)?;
-        while x != y {
-            depth = depth.checked_sub(1)?;
-            x = self.blocks.get(&x)?.parent?;
-            y = self.blocks.get(&y)?.parent?;
-        }
-        Some(x)
-    }
-
-    /// "Deepest" with the fixed tie-break: greater depth, then greater root.
-    pub(crate) fn deeper(&self, a: &H256, b: &H256) -> bool {
-        let (da, db) = (self.depth(a).unwrap_or(0), self.depth(b).unwrap_or(0));
-        da > db || (da == db && a > b)
-    }
-
-    /// The deepest ancestor of `g` compatible with `Σ.F`.
-    ///
-    /// A block that conflicts with `Σ.F` was pruned when `Σ.F` moved past it,
-    /// and its clip is then a strict ancestor of `Σ.F`. Every reader treats all
-    /// strict ancestors of `Σ.F` alike (none is in the filtered tree, all are
-    /// compatible with every block that is), so the anchor stands in for it.
-    pub(crate) fn clip_to_finalized(&self, g: &H256) -> H256 {
-        if !self.contains(g) {
-            return self.anchor;
-        }
-        if self.compatible(g, &self.finalized) {
-            return *g;
-        }
-        self.meet(g, &self.finalized).unwrap_or(self.anchor)
+    /// `is_strict_ancestor_root(store, root, ancestor)`.
+    pub fn is_strict_ancestor_root(&self, root: &H256, ancestor: &H256) -> bool {
+        root != ancestor && self.is_ancestor_root(root, ancestor)
     }
 
     // ── Handlers ───────────────────────────────────────────────────────────
 
-    /// `on_block(Σ, B)` (§2.1): admit a block whose parent is held, compute
-    /// its chain state, stamp it, unpack its Goldfish votes, fold its
-    /// finality, and offer its attestations to the SG pool.
+    /// `on_block(store, signed_block)`, fork-choice part: admit a block whose
+    /// parent is held and descends from the finalized block, run
+    /// `update_finality` on its post-state, and record its receipt time.
     ///
-    /// The host must have checked the proposer schedule, every signature, and
-    /// the committee membership of every carried vote.
+    /// The host must have run the block's state transition and recorded the
+    /// head vote committees of its carried votes (`record_head_vote_committee`).
     pub fn on_block(&mut self, block: &BlockInput) -> Result<(), BlockError> {
-        if block.slot > self.slot {
-            return Err(BlockError::FutureSlot {
-                slot: block.slot,
-                current: self.slot,
-            });
-        }
         if self.contains(&block.root) {
             return Err(BlockError::Duplicate);
         }
         let Some(parent) = self.blocks.get(&block.parent_root) else {
+            if self.finalized_ancestors.contains(&block.parent_root) {
+                return Err(BlockError::NotDescendantOfFinalized);
+            }
             return Err(BlockError::UnknownParent(block.parent_root));
         };
+        match block.parent_payload_status {
+            PayloadStatus::Pending => return Err(BlockError::PendingParentStatus),
+            PayloadStatus::Full if !self.is_payload_verified(&block.parent_root) => {
+                return Err(BlockError::ParentPayloadNotVerified);
+            }
+            _ => {}
+        }
+        let current = self.current_slot();
+        if block.slot > current {
+            return Err(BlockError::FutureSlot {
+                slot: block.slot,
+                current,
+            });
+        }
         if parent.slot >= block.slot {
             return Err(BlockError::SlotNotAfterParent {
                 slot: block.slot,
                 parent_slot: parent.slot,
             });
         }
-        if let Some(vote) = block.votes.iter().find(|v| v.slot + 1 != block.slot) {
-            return Err(BlockError::VoteOfWrongSlot {
-                vote_slot: vote.slot,
-                slot: block.slot,
-            });
-        }
-        if block
-            .support_votes
-            .iter()
-            .any(|support| !block.votes.contains(support))
-        {
-            return Err(BlockError::SupportNotSubset);
-        }
-        if !self.is_ancestor(&self.finalized, &block.parent_root) {
+        if !self.is_ancestor_root(&block.parent_root, &self.finalized_checkpoint.root) {
             return Err(BlockError::NotDescendantOfFinalized);
         }
-        let block_round = self.params.round_of(block.slot);
-        if let Some(att) = block.attestations.iter().find(|a| a.round() > block_round) {
-            return Err(BlockError::AttestationFromFuture {
-                round: att.round(),
-                block_round,
-            });
+        let well_formed = block.head_vote_support.len() == block.head_votes.len()
+            && block
+                .head_votes
+                .iter()
+                .zip(&block.head_vote_support)
+                .all(|(vote, bits)| bits.len() == vote.voter_indices.len());
+        if !well_formed {
+            return Err(BlockError::MalformedSupport);
         }
 
-        let parent_depth = parent.depth;
-        let block_ref = BlockRef {
-            root: block.root,
-            slot: block.slot,
-        };
-        let state = state_transition(
-            &parent.state,
-            block_ref,
-            &block.attestations,
-            &self.params,
-            &self.electorate,
-        );
-        let node = Node {
+        let mut fg = block.fg;
+        if fg.target.root == H256::ZERO {
+            // `process_slot` fills the root of a target the block entered.
+            fg.target.root = block.root;
+        }
+        let node = Block {
             parent: Some(block.parent_root),
             slot: block.slot,
-            depth: parent_depth + 1,
-            stamp: self.now(),
-            state,
-            votes: block.votes.clone(),
-            support_votes: block.support_votes.clone(),
-            attestations: block.attestations.clone(),
+            depth: parent.depth + 1,
+            parent_payload_status: block.parent_payload_status,
+            fg,
+            receipt_time: self.time,
+            head_votes: block.head_votes.clone(),
+            head_vote_support: block.head_vote_support.clone(),
             children: Vec::new(),
         };
         self.blocks.insert(block.root, node);
@@ -456,207 +436,192 @@ impl Store {
             .expect("parent checked above")
             .children
             .push(block.root);
-
-        for vote in &block.votes {
-            self.on_goldfish_vote(*vote);
-        }
-        let state = self.blocks[&block.root].state.clone();
-        self.update_finality(&state);
-        for attestation in &block.attestations {
-            self.on_sg_vote(attestation.clone());
-        }
+        self.blocks_by_slot
+            .entry(block.slot)
+            .or_default()
+            .push(block.root);
+        self.update_finality(&fg);
         Ok(())
     }
 
-    /// `on_goldfish_vote(Σ, vote)` (§2.1). Returns whether the vote entered
-    /// the pool. The host must have checked the committee and the signature.
-    pub fn on_goldfish_vote(&mut self, vote: GoldfishVote) -> bool {
-        if vote.slot < self.slot.saturating_sub(1) || vote.slot > self.slot {
-            return false;
+    /// `on_execution_payload_envelope`, fork-choice part: record that the
+    /// payload of `root` is verified, when it arrived, and whether it satisfies
+    /// the inclusion list constraints (`record_payload_inclusion_list_
+    /// satisfaction`). The host has checked data availability and verified the
+    /// envelope. A payload already verified is left as it is.
+    pub fn on_execution_payload_envelope(
+        &mut self,
+        root: &H256,
+        inclusion_list_satisfied: bool,
+    ) -> Result<(), PayloadError> {
+        if self.is_payload_verified(root) {
+            return Ok(());
         }
-        let stamp = self.now();
-        let pool = self.gf_votes.entry(vote.slot).or_default();
-        if pool.iter().any(|pooled| pooled.vote == vote) {
-            return false;
+        if !self.contains(root) {
+            return Err(PayloadError::UnknownBlock(*root));
         }
-        let by_validator = pool
-            .iter()
-            .filter(|pooled| pooled.vote.validator == vote.validator)
-            .count();
-        if by_validator >= 2 {
-            return false;
-        }
-        pool.push(PooledVote { vote, stamp });
-        true
+        self.payloads.insert(
+            *root,
+            Payload {
+                receipt_time: self.time,
+                inclusion_list_satisfied,
+            },
+        );
+        Ok(())
     }
 
-    /// `on_sg_vote(Σ, a)` (§2.1): admit a combined attestation whose round is
-    /// in the SG window, unless its SG projection is already held or its
-    /// validator already has two distinct safe blocks in the round. Returns
-    /// whether it entered the pool.
-    pub fn on_sg_vote(&mut self, attestation: Attestation) -> bool {
-        let round = attestation.round();
-        if !self.params.admits_round(self.current_round(), round) {
-            return false;
-        }
-        let stamp = self.now();
-        let pool = self.attestations.entry(round).or_default();
-        let safe = attestation.data.safe();
-        let mut round_votes: Vec<Option<H256>> = pool
-            .iter()
-            .filter(|pooled| pooled.attestation.validator == attestation.validator)
-            .map(|pooled| pooled.attestation.data.safe())
-            .collect();
-        round_votes.sort();
-        round_votes.dedup();
-        if round_votes.contains(&safe) || round_votes.len() >= 2 {
-            return false;
-        }
-        pool.push(PooledAttestation { attestation, stamp });
-        true
-    }
-
-    /// `update_finality(Σ, σ)` (§2.1): raise `h_max`, adopt a lex-greater
-    /// justification compatible with `Σ.F`, and advance `Σ.F` to a viable
-    /// proper descendant below `Σ.J`. The three statements run in order, each
-    /// reading the store the previous one left.
-    fn update_finality(&mut self, state: &ChainState) {
-        self.max_height = self.max_height.max(state.height);
-        if self.is_ancestor(&self.finalized, &state.justified.root)
-            && (state.justified_height, state.justified.root)
-                > (self.justified_height, self.justified)
-        {
-            self.justified = state.justified.root;
-            self.justified_height = state.justified_height;
-        }
-        let candidate = state.finalized.root;
-        if candidate != self.finalized
-            && self.is_ancestor(&self.finalized, &candidate)
-            && self.is_ancestor(&candidate, &self.justified)
-            && self.is_viable(&candidate)
-        {
-            self.advance_finalized(candidate);
-            self.finalized_height = state.finalized_height;
+    /// Update a verified payload's inclusion list satisfaction, as optimistic
+    /// sync does when a `NOT_VALIDATED` payload becomes `VALID`.
+    pub fn set_payload_inclusion_list_satisfaction(&mut self, root: &H256, satisfied: bool) {
+        if let Some(payload) = self.payloads.get_mut(root) {
+            payload.inclusion_list_satisfied = satisfied;
         }
     }
 
-    /// Move `Σ.F` to `new` and drop every branch that now conflicts with it:
-    /// the admission guard refuses their children, so nothing can extend them
-    /// (appendix A.10, "its branch freezes"). The saved grades need no
-    /// rewrite; every reader clips them (`clip_to_finalized`).
-    fn advance_finalized(&mut self, new: H256) {
-        let old = self.finalized;
-        let mut path = Vec::new();
-        let mut cursor = new;
-        while cursor != old {
-            path.push(cursor);
-            cursor = self.blocks[&cursor]
-                .parent
-                .expect("new F descends from old F");
-        }
-        path.push(old);
-        path.reverse();
+    /// `is_payload_verified(store, root)`.
+    pub fn is_payload_verified(&self, root: &H256) -> bool {
+        self.payloads.contains_key(root)
+    }
 
-        for pair in path.windows(2) {
-            let (from, keep) = (pair[0], pair[1]);
-            let siblings: Vec<H256> = self.blocks[&from]
-                .children
-                .iter()
-                .copied()
-                .filter(|child| *child != keep)
-                .collect();
-            for sibling in siblings {
-                self.remove_subtree(sibling);
+    /// `record_head_vote_committee`: keep the committee of a vote of the
+    /// previous or current slot; a committee recorded before must agree.
+    pub fn record_head_vote_committee(
+        &mut self,
+        slot: Slot,
+        committee: Vec<ValidatorIndex>,
+    ) -> Result<(), CommitteeError> {
+        let current = self.current_slot();
+        let HeadVoteCommittees::Recorded { by_slot, .. } = &mut self.committees else {
+            return Err(CommitteeError::NotRecorded);
+        };
+        if slot + 1 < current {
+            return Ok(());
+        }
+        match by_slot.get(&slot) {
+            Some(recorded) if recorded.members() == committee.as_slice() => Ok(()),
+            Some(_) => Err(CommitteeError::Mismatch(slot)),
+            None => {
+                by_slot.insert(slot, HeadVoteCommittee::new(committee));
+                Ok(())
             }
-            self.blocks
-                .get_mut(&from)
-                .expect("on the path")
-                .children
-                .retain(|child| *child == keep);
         }
-        for root in path.into_iter().skip(1) {
-            let depth = self.blocks[&root].depth as usize;
-            debug_assert_eq!(depth, self.finalized_chain.len());
-            self.finalized_chain.push(root);
-        }
-        self.finalized = new;
     }
 
-    fn remove_subtree(&mut self, root: H256) {
-        let mut stack = vec![root];
-        while let Some(current) = stack.pop() {
-            if let Some(node) = self.blocks.remove(&current) {
-                stack.extend(node.children);
-            }
+    /// `on_head_vote_message(store, message)`, after the host checked the
+    /// signature and recorded the committee: a message not yet seen, of the
+    /// previous or current slot, with a payload status and a validator in the
+    /// slot's committee (`is_valid_head_vote_message`), enters the pool with
+    /// its receipt time.
+    pub fn on_head_vote_message(&mut self, message: HeadVoteMessage) -> Result<(), HeadVoteError> {
+        let current = self.current_slot();
+        let previous = current.saturating_sub(1);
+        let slot = message.data.slot;
+        if self
+            .head_vote_messages
+            .get(&slot)
+            .is_some_and(|pool| pool.iter().any(|pooled| pooled.message == message))
+        {
+            return Err(HeadVoteError::Duplicate);
+        }
+        if slot != previous && slot != current {
+            return Err(HeadVoteError::WrongSlot { slot });
+        }
+        if message.data.payload_status().is_none() {
+            return Err(HeadVoteError::InvalidPayloadStatus(
+                message.data.payload_status,
+            ));
+        }
+        if !self.committees.is_recorded(slot) {
+            return Err(HeadVoteError::UnknownCommittee(slot));
+        }
+        if self.committees.seats(slot, message.validator_index) == 0 {
+            return Err(HeadVoteError::NotInCommittee {
+                slot,
+                validator: message.validator_index,
+            });
+        }
+        let receipt_time = self.time;
+        self.head_vote_messages
+            .entry(slot)
+            .or_default()
+            .push(PooledHeadVote {
+                message,
+                receipt_time,
+            });
+        Ok(())
+    }
+
+    /// `update_finality(store, state)`: raise `max_height`, adopt a
+    /// lexicographically greater justification that descends from the
+    /// finalized block, then adopt a higher finalization that strictly
+    /// descends from the finalized block, is an ancestor of the (updated)
+    /// justified block, and has a viable descendant.
+    pub(crate) fn update_finality(&mut self, fg: &FgCheckpoints) {
+        self.max_height = self.max_height.max(fg.target.height);
+
+        let store_justification = (
+            self.justified_checkpoint.height,
+            self.justified_checkpoint.root,
+        );
+        let state_justification = (fg.justified.height, fg.justified.root);
+        if state_justification > store_justification
+            && self.is_ancestor_root(&fg.justified.root, &self.finalized_checkpoint.root)
+        {
+            self.justified_checkpoint = fg.justified;
+        }
+
+        if fg.finalized.height > self.finalized_checkpoint.height
+            && self.is_strict_ancestor_root(&fg.finalized.root, &self.finalized_checkpoint.root)
+            && self.is_ancestor_root(&self.justified_checkpoint.root, &fg.finalized.root)
+            && self.has_viable_descendant(&fg.finalized.root)
+        {
+            self.finalized_checkpoint = fg.finalized;
         }
     }
 
     // ── Accessors ──────────────────────────────────────────────────────────
 
-    /// `Σ.F`.
-    pub fn finalized(&self) -> BlockRef {
-        self.block_ref(&self.finalized)
-            .expect("the finalized block is never pruned")
+    /// `store.finalized_checkpoint`.
+    pub fn finalized_checkpoint(&self) -> HeightCheckpoint {
+        self.finalized_checkpoint
     }
 
-    /// The height at which `Σ.F` was justified.
-    pub fn finalized_height(&self) -> Height {
-        self.finalized_height
+    /// `store.justified_checkpoint`.
+    pub fn justified_checkpoint(&self) -> HeightCheckpoint {
+        self.justified_checkpoint
     }
 
-    /// `Σ.J`, `Σ.h_j`.
-    pub fn justified(&self) -> (BlockRef, Height) {
-        let block = self
-            .block_ref(&self.justified)
-            .expect("the justified block descends from the finalized block");
-        (block, self.justified_height)
-    }
-
-    /// `Σ.h_max`.
+    /// `store.max_height`.
     pub fn max_height(&self) -> Height {
         self.max_height
     }
 
-    /// `Σ.live_confirmed`: the protocol-facing confirmation.
-    pub fn live_confirmed(&self) -> H256 {
-        self.live_confirmed
+    /// `store.latest_confirmed`.
+    pub fn latest_confirmed(&self) -> ForkChoiceNode {
+        self.latest_confirmed
     }
 
-    /// `get_stable(Σ)`: `Σ.latest_stable` when it extends `Σ.F`, else `Σ.F`.
-    pub fn stable(&self) -> BlockRef {
-        let root = if self.is_ancestor(&self.finalized, &self.latest_stable) {
-            self.latest_stable
-        } else {
-            self.finalized
-        };
-        self.block_ref(&root).expect("stable tip is processed")
+    /// `store.fast_confirmed_path`.
+    pub fn fast_confirmed_path(&self) -> &HashSet<ForkChoiceNode> {
+        &self.fast_confirmed_path
     }
 
-    /// `get_confirmed(Σ)`: `Σ.latest_confirmed` when it extends the stable
-    /// tip, else the stable tip. `Σ.F ⪯ stable ⪯ confirmed` always holds.
-    pub fn confirmed(&self) -> BlockRef {
-        let stable = self.stable();
-        if self.is_ancestor(&stable.root, &self.latest_confirmed) {
-            self.block_ref(&self.latest_confirmed)
-                .expect("checked by is_ancestor")
-        } else {
-            stable
-        }
+    /// `store.saved_confirmations`.
+    pub fn saved_confirmations(&self) -> &BTreeMap<Slot, ForkChoiceNode> {
+        &self.saved_confirmations
     }
 
-    /// The Goldfish votes held for `slot`, in arrival order.
-    pub fn goldfish_votes(&self, slot: Slot) -> Vec<GoldfishVote> {
-        self.gf_votes
+    /// `store.locks`, by deadline (expired ones may linger until the next
+    /// slot's start).
+    pub fn locks(&self) -> &BTreeMap<Tick, ForkChoiceNode> {
+        &self.locks
+    }
+
+    /// The head vote messages held for `slot`, in arrival order.
+    pub fn head_vote_messages(&self, slot: Slot) -> Vec<HeadVoteMessage> {
+        self.head_vote_messages
             .get(&slot)
-            .map(|pool| pool.iter().map(|pooled| pooled.vote).collect())
-            .unwrap_or_default()
-    }
-
-    /// The attestations held for `round`, in arrival order.
-    pub fn round_attestations(&self, round: Round) -> Vec<Attestation> {
-        self.attestations
-            .get(&round)
-            .map(|pool| pool.iter().map(|p| p.attestation.clone()).collect())
+            .map(|pool| pool.iter().map(|pooled| pooled.message).collect())
             .unwrap_or_default()
     }
 
@@ -664,24 +629,14 @@ impl Store {
     pub fn blocks(&self) -> impl Iterator<Item = (H256, Option<H256>, Slot)> + '_ {
         self.blocks
             .iter()
-            .map(|(root, node)| (*root, node.parent, node.slot))
+            .map(|(root, block)| (*root, block.parent, block.slot))
     }
 
-    /// `Σ.resolution_time(vote)` for a Goldfish vote: `+∞` (`None`) while the
-    /// head is unknown or of a later slot, else the later of the two stamps.
-    pub(crate) fn vote_resolution(&self, vote: &GoldfishVote, stamp: Tick) -> Option<Tick> {
-        let head = self.blocks.get(&vote.head)?;
-        (head.slot <= vote.slot).then(|| stamp.max(head.stamp))
-    }
-
-    /// Whether a vote's head resolves in the tree at all (finite resolution).
-    pub(crate) fn vote_resolves(&self, vote: &GoldfishVote) -> bool {
-        self.blocks
-            .get(&vote.head)
-            .is_some_and(|head| head.slot <= vote.slot)
-    }
-
-    pub(crate) fn confirmation_window(&self, slot: Slot) -> (Tick, Tick) {
-        (support_cutoff(slot), confirmation_time(slot))
+    /// The roots of held blocks of `slot`.
+    pub(crate) fn blocks_at_slot(&self, slot: Slot) -> &[H256] {
+        self.blocks_by_slot
+            .get(&slot)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 }

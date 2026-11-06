@@ -1,66 +1,100 @@
-//! An in-process network of nodes on the public time grid.
+//! An in-process lean-style network of nodes on the public time grid.
 //!
-//! Every object sent at tick `t` reaches every node at `t` (after that tick's
+//! Every validator runs one node, sits in every slot's head vote committee
+//! with one seat, weighs one in the finality gadget, proposes slot `s` when it
+//! is `s mod n`, and attests once per round in its own slot of the round. An
+//! object sent at tick `t` reaches every node at `t` (after that tick's
 //! duties), or later when a node is cut off or a Byzantine sender splits its
-//! audience; that is synchrony with delay below `Δ`. The checks are the
-//! bundle's observable claims, read at the honest nodes: the three tips nest,
-//! finalized reads agree and only extend, the chains grow, and no honest pair
-//! of attestations is slashable.
+//! audience: synchrony with delay below `Δ`.
+//!
+//! The checks are the protocol's observable claims, read at the honest nodes:
+//! finalized checkpoints never conflict and only extend, the confirmed node is
+//! at or below the finalized one and on the head's chain, the chain grows, and
+//! no honest validator signs a slashable pair.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
+use ethlambda_types::lean_decoupled::attestation_slot;
 use ethlambda_types::primitives::H256;
 
+use crate::chain_state::{ChainState, ChainStates, select_attestations};
+use crate::duties::head_vote_data;
 use crate::params::{Params, slot_of};
 use crate::store::{BlockError, Store};
-use crate::types::{Attestation, BlockInput, BlockRef, Electorate, GoldfishVote, Tick};
-use crate::validator_client::{Record, slashable};
+use crate::types::{
+    Anchor, AttestationData, BlockInput, BlockRef, Electorate, ForkChoiceNode, HeadVote,
+    HeadVoteCommittees, HeadVoteData, HeadVoteMessage, HeightCheckpoint, PayloadStatus, Slot, Tick,
+    ValidatorIndex,
+};
+use crate::validator_client::{FinalitySigningRecord, is_slashable_attestation_data};
+
+/// A block as it travels: one voter per head vote, as on lean.
+#[derive(Debug, Clone)]
+struct SimBlock {
+    root: H256,
+    parent_root: H256,
+    slot: Slot,
+    head_votes: Vec<HeadVoteMessage>,
+    support: Vec<bool>,
+    attestations: Vec<(ValidatorIndex, AttestationData)>,
+}
 
 #[derive(Debug, Clone)]
 enum Message {
     /// A block, and whether an honest proposer made it.
-    Block(BlockInput, bool),
-    Vote(GoldfishVote),
-    Attestation(Attestation),
+    Block(SimBlock, bool),
+    Vote(HeadVoteMessage),
+    Attestation(ValidatorIndex, AttestationData),
 }
 
 /// How a Byzantine validator departs from the protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Byzantine {
-    /// Two Goldfish votes every slot: the head and its parent.
+    /// Two head votes every slot: the head, and its parent's `Empty` node.
     EquivocateVotes,
     /// Two blocks in each of its slots, one to each half of the network,
     /// each relayed to the other half a tick later.
     EquivocateProposals,
-    /// Besides its honest attestation, two more each round: an empty safe
-    /// value with a timeout and a finality pair naming a block that does not
-    /// exist, and a target vote for that block one height up.
+    /// Besides its honest attestation, two more each time it attests: a
+    /// timeout naming a block that does not exist with a finality pair for
+    /// another, and a target vote for a nonexistent block one height up.
     JunkAttestations,
 }
 
 struct Node {
-    index: u64,
+    index: ValidatorIndex,
     store: Store,
-    record: Record,
-    pending_blocks: Vec<BlockInput>,
+    states: ChainStates,
+    record: FinalitySigningRecord,
+    /// Attestations received, with the round they arrived in.
+    pool: Vec<(u64, ValidatorIndex, AttestationData)>,
+    pending_blocks: Vec<(SimBlock, bool)>,
     online: bool,
     byzantine: Option<Byzantine>,
-    finalized_history: Vec<BlockRef>,
+    finalized_history: Vec<HeightCheckpoint>,
 }
 
 /// (sender, recipients or everyone, message)
-type Outbox = Vec<(u64, Option<Vec<u64>>, Message)>;
+type Outbox = Vec<(ValidatorIndex, Option<Vec<ValidatorIndex>>, Message)>;
 
 struct Network {
+    params: Params,
+    electorate: Electorate,
     nodes: Vec<Node>,
-    emitted: Vec<Attestation>,
+    /// Every block ever made, by root, with its parent: the ground truth the
+    /// agreement checks walk.
+    parents: HashMap<H256, H256>,
+    /// What each honest validator signed.
+    emitted: HashMap<ValidatorIndex, Vec<AttestationData>>,
     /// Messages a cut-off node missed, delivered when it comes back.
-    backlog: HashMap<u64, Vec<Message>>,
+    backlog: HashMap<ValidatorIndex, Vec<Message>>,
     /// Messages to deliver at the next step, by recipient.
-    delayed: Vec<(u64, Message)>,
+    delayed: Vec<(ValidatorIndex, Message)>,
 }
 
-fn block_root(slot: u64, proposer: u64) -> H256 {
+const GENESIS: H256 = H256([0x99; 32]);
+
+fn block_root(slot: Slot, proposer: ValidatorIndex) -> H256 {
     let mut bytes = [0xabu8; 32];
     bytes[..8].copy_from_slice(&slot.to_be_bytes());
     bytes[8..16].copy_from_slice(&proposer.to_be_bytes());
@@ -69,16 +103,29 @@ fn block_root(slot: u64, proposer: u64) -> H256 {
 
 impl Network {
     fn new(validators: u64, params: Params) -> Self {
-        let genesis = H256::ZERO;
+        let genesis = BlockRef {
+            root: GENESIS,
+            slot: 0,
+        };
+        let state = ChainState::initial(genesis, validators as usize);
+        let anchor = Anchor {
+            root: GENESIS,
+            slot: 0,
+            fg: state.checkpoints(),
+        };
         let nodes = (0..validators)
             .map(|index| Node {
                 index,
-                store: Store::from_genesis(
+                store: Store::new(
                     params,
-                    Electorate::uniform(validators as usize),
-                    genesis,
+                    HeadVoteCommittees::EveryValidator {
+                        validator_count: validators,
+                    },
+                    anchor,
                 ),
-                record: Record::default(),
+                states: ChainStates::new(genesis, state.clone()),
+                record: FinalitySigningRecord::default(),
+                pool: Vec::new(),
                 pending_blocks: Vec::new(),
                 online: true,
                 byzantine: None,
@@ -86,8 +133,11 @@ impl Network {
             })
             .collect();
         Self {
+            params,
+            electorate: Electorate::uniform(validators as usize),
             nodes,
-            emitted: Vec::new(),
+            parents: HashMap::new(),
+            emitted: HashMap::new(),
             backlog: HashMap::new(),
             delayed: Vec::new(),
         }
@@ -97,34 +147,90 @@ impl Network {
         self.nodes.iter().filter(|node| node.byzantine.is_none())
     }
 
-    fn proposer(&self, slot: u64) -> u64 {
+    fn proposer(&self, slot: Slot) -> ValidatorIndex {
         slot % self.nodes.len() as u64
     }
 
-    fn deliver(node: &mut Node, message: Message) {
-        match message {
-            Message::Block(block, honest) => {
-                node.pending_blocks.push(block);
-                Self::drain_pending(node, honest);
+    /// Whether `ancestor` is `root` or one of its ancestors, over every block
+    /// ever made.
+    fn descends(&self, root: H256, ancestor: H256) -> bool {
+        let mut cursor = root;
+        loop {
+            if cursor == ancestor {
+                return true;
             }
-            Message::Vote(vote) => {
-                node.store.on_goldfish_vote(vote);
-            }
-            Message::Attestation(attestation) => {
-                node.store.on_sg_vote(attestation);
+            match self.parents.get(&cursor) {
+                Some(parent) => cursor = *parent,
+                None => return false,
             }
         }
     }
 
-    fn drain_pending(node: &mut Node, honest: bool) {
+    fn deliver(params: &Params, electorate: &Electorate, node: &mut Node, message: Message) {
+        match message {
+            Message::Block(block, honest) => {
+                node.pending_blocks.push((block, honest));
+                Self::drain_pending(params, electorate, node);
+            }
+            Message::Vote(vote) => {
+                let _ = node.store.on_head_vote_message(vote);
+            }
+            Message::Attestation(validator, data) => {
+                let round = node.store.current_round();
+                node.pool.push((round, validator, data));
+            }
+        }
+    }
+
+    /// Import a block: derive its chain state, then hand it to the store.
+    fn import(
+        params: &Params,
+        electorate: &Electorate,
+        node: &mut Node,
+        block: &SimBlock,
+    ) -> Result<(), BlockError> {
+        if node.store.contains(&block.root) {
+            return Err(BlockError::Duplicate);
+        }
+        if node.states.get(&block.parent_root).is_none() {
+            return Err(BlockError::UnknownParent(block.parent_root));
+        }
+        let at = BlockRef {
+            root: block.root,
+            slot: block.slot,
+        };
+        let attestations = block.attestations.iter().map(|(v, data)| (*v, data));
+        let fg = node
+            .states
+            .import(&block.parent_root, at, attestations, params, electorate)
+            .expect("blocks carry only valid attestations");
+        let input = BlockInput {
+            root: block.root,
+            parent_root: block.parent_root,
+            slot: block.slot,
+            parent_payload_status: PayloadStatus::Empty,
+            head_votes: block
+                .head_votes
+                .iter()
+                .map(|message| HeadVote {
+                    voter_indices: vec![message.validator_index],
+                    data: message.data,
+                })
+                .collect(),
+            head_vote_support: block.support.iter().map(|bit| vec![*bit]).collect(),
+            fg,
+        };
+        node.store.on_block(&input)
+    }
+
+    fn drain_pending(params: &Params, electorate: &Electorate, node: &mut Node) {
         loop {
             let mut progressed = false;
-            let pending = std::mem::take(&mut node.pending_blocks);
-            for block in pending {
-                match node.store.on_block(&block) {
+            for (block, honest) in std::mem::take(&mut node.pending_blocks) {
+                match Self::import(params, electorate, node, &block) {
                     Ok(()) | Err(BlockError::Duplicate) => progressed = true,
                     Err(BlockError::UnknownParent(_)) | Err(BlockError::FutureSlot { .. }) => {
-                        node.pending_blocks.push(block)
+                        node.pending_blocks.push((block, honest))
                     }
                     Err(other) if honest => panic!("honest block refused: {other}"),
                     Err(_) => {}
@@ -136,98 +242,155 @@ impl Network {
         }
     }
 
+    fn propose(&mut self, i: usize, slot: Slot, outbox: &mut Outbox) {
+        let (params, electorate) = (self.params, self.electorate.clone());
+        let n = self.nodes.len() as u64;
+        let node = &mut self.nodes[i];
+        let proposal = node.store.get_ac_proposal();
+        assert_ne!(proposal.head.payload_status, PayloadStatus::Pending);
+        let parent_state = node
+            .states
+            .get(&proposal.head.root)
+            .expect("the head's state is held");
+        let candidates: Vec<(ValidatorIndex, AttestationData)> =
+            node.pool.iter().map(|(_, v, data)| (*v, *data)).collect();
+        let attestations = select_attestations(parent_state, &candidates)
+            .into_iter()
+            .map(|index| candidates[index])
+            .collect();
+        let support = (0..proposal.vote_messages.len())
+            .map(|index| proposal.support_indices.contains(&index))
+            .collect();
+        let block = SimBlock {
+            root: block_root(slot, node.index),
+            parent_root: proposal.head.root,
+            slot,
+            head_votes: proposal.vote_messages,
+            support,
+            attestations,
+        };
+        self.parents.insert(block.root, block.parent_root);
+        Self::import(&params, &electorate, node, &block).expect("own proposal admitted");
+        if node.byzantine == Some(Byzantine::EquivocateProposals) {
+            // A twin with the same parent and no content.
+            let twin = SimBlock {
+                root: block_root(slot, node.index + 1000),
+                head_votes: Vec::new(),
+                support: Vec::new(),
+                attestations: Vec::new(),
+                ..block.clone()
+            };
+            self.parents.insert(twin.root, twin.parent_root);
+            let index = node.index;
+            let (first, second): (Vec<u64>, Vec<u64>) =
+                (0..n).filter(|v| *v != index).partition(|v| v % 2 == 0);
+            for v in &first {
+                self.delayed.push((*v, Message::Block(twin.clone(), false)));
+            }
+            for v in &second {
+                self.delayed
+                    .push((*v, Message::Block(block.clone(), false)));
+            }
+            outbox.push((index, Some(first), Message::Block(block, false)));
+            outbox.push((index, Some(second), Message::Block(twin, false)));
+        } else {
+            let honest = node.byzantine.is_none();
+            outbox.push((node.index, None, Message::Block(block, honest)));
+        }
+    }
+
+    fn vote(&mut self, i: usize, slot: Slot, outbox: &mut Outbox) {
+        let node = &mut self.nodes[i];
+        let head = node.store.get_ac_vote_head();
+        let message = HeadVoteMessage {
+            validator_index: node.index,
+            data: head_vote_data(&node.store, slot, head),
+        };
+        node.store
+            .on_head_vote_message(message)
+            .expect("own vote admitted");
+        outbox.push((node.index, None, Message::Vote(message)));
+        if node.byzantine == Some(Byzantine::EquivocateVotes)
+            && let Some(parent) = node
+                .store
+                .blocks()
+                .find_map(|(root, parent, _)| (root == head.root).then_some(parent).flatten())
+        {
+            let second = HeadVoteMessage {
+                validator_index: node.index,
+                data: HeadVoteData::new(slot, ForkChoiceNode::empty(parent)),
+            };
+            outbox.push((node.index, None, Message::Vote(second)));
+        }
+    }
+
+    fn attest(&mut self, i: usize, outbox: &mut Outbox) {
+        let node = &mut self.nodes[i];
+        let frame = node.store.get_ac_frame();
+        let Some(input) = node.store.finality_attestation_input(&frame) else {
+            return;
+        };
+        let round = node.store.current_round();
+        if let Some(data) = node.record.attest(&input) {
+            node.pool.push((round, node.index, data));
+            if node.byzantine.is_none() {
+                self.emitted.entry(node.index).or_default().push(data);
+            }
+            outbox.push((node.index, None, Message::Attestation(node.index, data)));
+        }
+        if node.byzantine == Some(Byzantine::JunkAttestations) {
+            let bogus = H256([0xee; 32]);
+            let junk = [
+                AttestationData {
+                    target: HeightCheckpoint::new(input.target.height, bogus),
+                    timeout: true,
+                    finality: HeightCheckpoint::new(input.target.height.saturating_sub(1), bogus),
+                },
+                AttestationData {
+                    target: HeightCheckpoint::new(input.target.height + 1, bogus),
+                    timeout: false,
+                    finality: HeightCheckpoint::empty(),
+                },
+            ];
+            for data in junk {
+                outbox.push((node.index, None, Message::Attestation(node.index, data)));
+            }
+        }
+    }
+
     fn step(&mut self, t: Tick) {
         let mut outbox: Outbox = Vec::new();
-        let n = self.nodes.len() as u64;
+        let (params, electorate) = (self.params, self.electorate.clone());
+        let proposer = self.proposer(slot_of(t));
         for i in 0..self.nodes.len() {
-            let proposer = self.proposer(slot_of(t));
             let node = &mut self.nodes[i];
             let events = node.store.advance_to(t);
-            Self::drain_pending(node, true);
+            Self::drain_pending(&params, &electorate, node);
+            let round = node.store.current_round();
+            node.pool.retain(|(arrived, _, _)| arrived + 2 >= round);
+            let online = node.online;
+            let index = node.index;
             for event in events {
-                if !node.online || event.tick != t {
+                if !online || event.tick != t {
                     continue;
                 }
-                if event.propose && proposer == node.index {
-                    let proposal = node.store.proposal();
-                    let block = BlockInput {
-                        root: block_root(proposal.slot, node.index),
-                        parent_root: proposal.parent_root,
-                        slot: proposal.slot,
-                        proposer: node.index,
-                        votes: proposal.votes,
-                        support_votes: proposal.support_votes,
-                        attestations: proposal.attestations,
-                    };
-                    node.store.on_block(&block).expect("own proposal admitted");
-                    if node.byzantine == Some(Byzantine::EquivocateProposals) {
-                        // A twin with the same parent and no content.
-                        let twin = BlockInput {
-                            root: block_root(proposal.slot, node.index + 1000),
-                            votes: Vec::new(),
-                            support_votes: Vec::new(),
-                            attestations: Vec::new(),
-                            ..block.clone()
-                        };
-                        let (first, second): (Vec<u64>, Vec<u64>) = (0..n)
-                            .filter(|v| *v != node.index)
-                            .partition(|v| v % 2 == 0);
-                        for v in &first {
-                            self.delayed.push((*v, Message::Block(twin.clone(), false)));
-                        }
-                        for v in &second {
-                            self.delayed
-                                .push((*v, Message::Block(block.clone(), false)));
-                        }
-                        outbox.push((node.index, Some(first), Message::Block(block, false)));
-                        outbox.push((node.index, Some(second), Message::Block(twin, false)));
-                    } else {
-                        let honest = node.byzantine.is_none();
-                        outbox.push((node.index, None, Message::Block(block, honest)));
-                    }
+                if event.propose && proposer == index {
+                    self.propose(i, event.slot, &mut outbox);
                 }
-                if event.vote {
-                    let head = node.store.goldfish_vote_head();
-                    let vote = GoldfishVote {
-                        validator: node.index,
-                        slot: event.slot,
-                        head,
-                    };
-                    node.store.on_goldfish_vote(vote);
-                    outbox.push((node.index, None, Message::Vote(vote)));
-                    if node.byzantine == Some(Byzantine::EquivocateVotes)
-                        && let Some(parent) = node.store.node(&head).and_then(|b| b.parent)
-                    {
-                        let second = GoldfishVote {
-                            head: parent,
-                            ..vote
-                        };
-                        outbox.push((node.index, None, Message::Vote(second)));
-                    }
+                if event.head_vote {
+                    self.vote(i, event.slot, &mut outbox);
                 }
-                if event.attest.is_some() {
-                    let input = node.store.attestation_input();
-                    let attestation = node.record.create_attestation(node.index, &input);
-                    node.store.on_sg_vote(attestation.clone());
-                    if node.byzantine.is_none() {
-                        self.emitted.push(attestation.clone());
-                    }
-                    outbox.push((node.index, None, Message::Attestation(attestation)));
-                    if node.byzantine == Some(Byzantine::JunkAttestations) {
-                        for data in junk_attestations(&input) {
-                            let message = Attestation {
-                                validator: node.index,
-                                data,
-                            };
-                            outbox.push((node.index, None, Message::Attestation(message)));
-                        }
-                    }
+                let round = params.round_of(event.slot);
+                if event.support_cutoff
+                    && attestation_slot(round, index, params.slots_per_round) == event.slot
+                {
+                    self.attest(i, &mut outbox);
                 }
             }
         }
         for (to, message) in std::mem::take(&mut self.delayed) {
             if let Some(node) = self.nodes.iter_mut().find(|node| node.index == to) {
-                Self::deliver(node, message);
+                Self::deliver(&params, &electorate, node, message);
             }
         }
         for (from, recipients, message) in outbox {
@@ -242,7 +405,7 @@ impl Network {
                     continue;
                 }
                 if node.online {
-                    Self::deliver(node, message.clone());
+                    Self::deliver(&params, &electorate, node, message.clone());
                 } else {
                     self.backlog
                         .entry(node.index)
@@ -252,17 +415,20 @@ impl Network {
             }
         }
         for node in &mut self.nodes {
-            node.finalized_history.push(node.store.finalized());
-            check_nesting(&node.store);
+            node.finalized_history
+                .push(node.store.finalized_checkpoint());
+            node.states.retain(|root| node.store.contains(root));
+            check_confirmed(&node.store);
         }
     }
 
-    fn set_online(&mut self, index: u64, online: bool) {
+    fn set_online(&mut self, index: ValidatorIndex, online: bool) {
+        let (params, electorate) = (self.params, self.electorate.clone());
         let node = &mut self.nodes[index as usize];
         node.online = online;
         if online {
             for message in self.backlog.remove(&index).unwrap_or_default() {
-                Self::deliver(node, message);
+                Self::deliver(&params, &electorate, node, message);
             }
         }
     }
@@ -272,123 +438,147 @@ impl Network {
             self.step(t);
         }
     }
+
+    fn finalized_slot(&self, index: usize) -> Slot {
+        let node = &self.nodes[index];
+        node.store
+            .block_slot(&node.store.finalized_checkpoint().root)
+            .expect("the finalized block is held")
+    }
 }
 
-fn check_nesting(store: &Store) {
-    let finalized = store.finalized().root;
-    let stable = store.stable().root;
-    let confirmed = store.confirmed().root;
-    assert!(store.is_ancestor(&finalized, &stable), "F ⪯ stable");
-    assert!(store.is_ancestor(&stable, &confirmed), "stable ⪯ confirmed");
+/// `get_confirmed_node` is at or below the finalized node and on the head's
+/// chain.
+fn check_confirmed(store: &Store) {
+    let finalized = ForkChoiceNode::pending(store.finalized_checkpoint().root);
+    let confirmed = store.get_confirmed_node();
+    assert!(store.is_ancestor(&confirmed, &finalized), "F ⪯ confirmed");
+    assert!(
+        store.is_compatible(&store.get_head(), &confirmed),
+        "confirmed on the head's chain"
+    );
 }
 
 fn check_agreement(network: &Network) {
-    // Honest finalized reads agree: every node's finalized block is on the
-    // chain of the deepest one.
-    let deepest = network
+    // Honest finalized checkpoints never conflict: every one is on the chain
+    // of the deepest.
+    let all: Vec<HeightCheckpoint> = network
         .honest()
-        .max_by_key(|node| node.store.finalized().slot)
+        .flat_map(|node| node.finalized_history.iter().copied())
+        .collect();
+    let deepest = all
+        .iter()
+        .max_by_key(|checkpoint| checkpoint.height)
         .expect("nodes");
-    for node in network.honest() {
-        let f = node.store.finalized().root;
+    for checkpoint in &all {
         assert!(
-            deepest
-                .store
-                .is_ancestor(&f, &deepest.store.finalized().root),
-            "finalized blocks conflict"
+            network.descends(deepest.root, checkpoint.root),
+            "finalized blocks conflict: {checkpoint:?} / {deepest:?}"
         );
     }
     // Each node's finalized reads only extend.
     for node in network.honest() {
         for pair in node.finalized_history.windows(2) {
-            assert!(pair[0].slot <= pair[1].slot, "finality reverted");
-            assert!(node.store.is_ancestor(&pair[0].root, &pair[1].root) || pair[0] == pair[1]);
+            assert!(pair[0].height <= pair[1].height, "finality reverted");
+            assert!(network.descends(pair[1].root, pair[0].root));
         }
     }
-    // No honest attestation pair is slashable.
-    for a in &network.emitted {
-        for b in &network.emitted {
-            assert!(!slashable(a, b), "honest evidence: {a:?} / {b:?}");
+    // No honest validator signed a slashable pair.
+    for emitted in network.emitted.values() {
+        for a in emitted {
+            for b in emitted {
+                assert!(!is_slashable_attestation_data(a, b), "{a:?} / {b:?}");
+            }
         }
     }
 }
 
-const SLOTS: u64 = 60;
+const SLOTS: u64 = 64;
 
 #[test]
-fn an_honest_synchronous_network_finalizes_and_nests() {
-    let params = Params::with_round_length(3);
+fn an_honest_synchronous_network_finalizes_and_confirms() {
+    let params = Params::minimal();
     let mut network = Network::new(4, params);
     network.run(0..(4 * SLOTS as Tick));
     check_agreement(&network);
 
-    for node in &network.nodes {
-        let finalized = node.store.finalized();
-        let confirmed = node.store.confirmed();
-        let stable = node.store.stable();
+    for (i, node) in network.nodes.iter().enumerate() {
+        let finalized = network.finalized_slot(i);
+        let confirmed = node.store.get_confirmed_node();
+        let confirmed_slot = node.store.block_slot(&confirmed.root).unwrap();
         assert!(
-            finalized.slot + 3 * params.slots_per_round >= SLOTS,
-            "node {} finalized slot {} lags the head by more than three rounds",
-            node.index,
-            finalized.slot
+            finalized + 3 * params.slots_per_round >= SLOTS,
+            "node {i} finalized slot {finalized} lags the head by more than three rounds"
         );
-        assert!(confirmed.slot + 2 >= SLOTS, "confirmed {confirmed:?}");
-        assert!(
-            stable.slot + 2 * params.slots_per_round >= SLOTS,
-            "stable {stable:?}"
-        );
-        assert!(node.store.finalized_height() >= 5);
+        assert!(confirmed_slot + 2 >= SLOTS, "confirmed {confirmed:?}");
+        assert!(node.store.finalized_checkpoint().height >= 10);
+        assert!(!node.store.live_locks().is_empty(), "confirmations lock");
     }
-    // Every node ends on the same finalized block.
-    let first = network.nodes[0].store.finalized();
-    assert!(network.nodes.iter().all(|n| n.store.finalized() == first));
+    // Every node ends on the same finalized checkpoint.
+    let first = network.nodes[0].store.finalized_checkpoint();
+    assert!(
+        network
+            .nodes
+            .iter()
+            .all(|n| n.store.finalized_checkpoint() == first)
+    );
 }
 
 #[test]
 fn a_minority_going_offline_keeps_the_chain_live() {
-    let params = Params::with_round_length(3);
+    let params = Params::minimal();
     let mut network = Network::new(4, params);
     network.run(0..80);
     network.set_online(3, false);
     network.run(80..160);
-    let before = network.nodes[0].store.finalized();
+    let before = network.finalized_slot(0);
     network.run(160..240);
-    let after = network.nodes[0].store.finalized();
-    assert!(after.slot > before.slot, "3 of 4 keep finalizing");
+    let after = network.finalized_slot(0);
+    assert!(after > before, "3 of 4 keep finalizing");
     network.set_online(3, true);
     network.run(240..(4 * SLOTS as Tick));
     check_agreement(&network);
-    let tips: HashSet<_> = network.nodes.iter().map(|n| n.store.finalized()).collect();
-    assert_eq!(tips.len(), 1, "the returning node catches up: {tips:?}");
+    let tips: Vec<_> = network
+        .nodes
+        .iter()
+        .map(|n| n.store.finalized_checkpoint())
+        .collect();
+    assert!(
+        tips.iter().all(|tip| *tip == tips[0]),
+        "the returning node catches up: {tips:?}"
+    );
 }
 
 #[test]
 fn half_offline_stalls_finality_but_not_availability_and_heals() {
-    let params = Params::with_round_length(3);
+    let params = Params::minimal();
     let mut network = Network::new(4, params);
     network.run(0..60);
     network.set_online(2, false);
     network.set_online(3, false);
     network.run(60..140);
-    let stalled = network.nodes[0].store.finalized();
+    let stalled = network.nodes[0].store.finalized_checkpoint();
+    let head_before = network.nodes[0].store.get_head();
     network.run(140..200);
     assert_eq!(
-        network.nodes[0].store.finalized(),
+        network.nodes[0].store.finalized_checkpoint(),
         stalled,
         "2 of 4 cannot finalize"
+    );
+    let head_after = network.nodes[0].store.get_head();
+    assert!(
+        network.nodes[0].store.block_slot(&head_after.root)
+            > network.nodes[0].store.block_slot(&head_before.root),
+        "the head keeps growing"
     );
     network.set_online(2, true);
     network.set_online(3, true);
     network.run(200..(8 * SLOTS as Tick));
     check_agreement(&network);
     assert!(
-        network.nodes[0].store.finalized().slot > stalled.slot,
+        network.nodes[0].store.finalized_checkpoint().height > stalled.height,
         "finality resumes after healing"
     );
-}
-
-fn slot_of_grade(store: &Store, grade: Option<Option<H256>>) -> Option<Option<u64>> {
-    grade.map(|g| g.and_then(|root| store.block_slot(&root)))
 }
 
 /// Prints node 0's view once per slot: `cargo test -p ethlambda-decoupled
@@ -396,7 +586,7 @@ fn slot_of_grade(store: &Store, grade: Option<Option<H256>>) -> Option<Option<u6
 #[test]
 #[ignore = "diagnostic trace"]
 fn trace() {
-    let params = Params::with_round_length(3);
+    let params = Params::minimal();
     let mut network = Network::new(4, params);
     for t in 0..(4 * 40) {
         network.step(t);
@@ -404,64 +594,30 @@ fn trace() {
             continue;
         }
         let s = &network.nodes[0].store;
-        let (j, hj) = s.justified();
-        let g = s.saved_grades();
+        let slot_of_root = |root: &H256| s.block_slot(root);
+        let head = s.get_head();
+        let confirmed = s.get_confirmed_node();
+        let finalized = s.finalized_checkpoint();
+        let justified = s.justified_checkpoint();
         println!(
-            "slot {:>3} head {:>3} conf {:>3} stable {:>3} fin {:>3} (h_F {}) J {:>3} (h_j {}) h_max {} G2 {:?} G1 {:?} G0 {:?}",
+            "slot {:>3} head {:?} conf {:?} fin {:?} (h {}) J {:?} (h {}) h_max {} contest {} locks {}",
             t / 4,
-            s.block_slot(&s.head()).unwrap(),
-            s.confirmed().slot,
-            s.stable().slot,
-            s.finalized().slot,
-            s.finalized_height(),
-            j.slot,
-            hj,
+            slot_of_root(&head.root),
+            slot_of_root(&confirmed.root),
+            slot_of_root(&finalized.root),
+            finalized.height,
+            slot_of_root(&justified.root),
+            justified.height,
             s.max_height(),
-            slot_of_grade(s, g.g2),
-            slot_of_grade(s, g.g1),
-            slot_of_grade(s, g.g0),
+            s.is_fg_contest(),
+            s.live_locks().len(),
         );
     }
-    for a in network.emitted.iter().rev().take(4) {
-        println!("{a:?}");
-    }
-}
-
-/// Two attestations nobody honest would send, for this round.
-fn junk_attestations(input: &crate::AttestationInput) -> [crate::types::AttestationData; 2] {
-    use crate::types::{AttestationData, FinalityVote, HeightVote};
-    let bogus = H256([0xee; 32]);
-    let height = input.source.map_or(1, |source| source.height);
-    [
-        AttestationData::new(
-            input.round,
-            None,
-            Some(HeightVote {
-                height,
-                entry: bogus,
-                timeout: true,
-            }),
-            Some(FinalityVote {
-                height: input.justified_height + 1,
-                target: bogus,
-            }),
-        ),
-        AttestationData::new(
-            input.round,
-            Some(bogus),
-            Some(HeightVote {
-                height: height + 1,
-                entry: bogus,
-                timeout: false,
-            }),
-            None,
-        ),
-    ]
 }
 
 /// One Byzantine validator of four, with `behavior`, over 50 slots.
 fn byzantine_run(behavior: Byzantine) -> Network {
-    let params = Params::with_round_length(3);
+    let params = Params::minimal();
     let mut network = Network::new(4, params);
     network.nodes[3].byzantine = Some(behavior);
     network.run(0..200);
@@ -470,14 +626,17 @@ fn byzantine_run(behavior: Byzantine) -> Network {
 }
 
 fn assert_honest_progress(network: &Network) {
-    for node in network.honest() {
+    for (i, node) in network.nodes.iter().enumerate() {
+        if node.byzantine.is_some() {
+            continue;
+        }
+        let finalized = network.finalized_slot(i);
         assert!(
-            node.store.finalized().slot >= 30,
-            "node {} finalized only up to {:?}",
-            node.index,
-            node.store.finalized()
+            finalized >= 30,
+            "node {i} finalized only up to slot {finalized}"
         );
-        assert!(node.store.confirmed().slot >= 45);
+        let confirmed = node.store.get_confirmed_node();
+        assert!(node.store.block_slot(&confirmed.root).unwrap() >= 40);
     }
 }
 

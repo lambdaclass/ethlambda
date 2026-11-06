@@ -1,176 +1,175 @@
-//! Protocol constants and the public time grid (appendix A.2, A.6, A.9, A.11).
+//! EIP-8453's parameters and the public time grid.
+//!
+//! The engine keeps time in ticks of `Δ = SLOT_DURATION_MS / 4`. The spec's
+//! three due times within a slot (`HEAD_VOTE_DUE_BPS`, `SUPPORT_CUTOFF_BPS`,
+//! `VIEW_FREEZE_BPS`, at 25%, 50% and 75% of the slot) all land on that grid,
+//! and every comparison the spec makes against them is a strict `<` on a
+//! receipt time or a strict `>` on a lock deadline, both of which give the same
+//! answer on a time floored to the grid. So the engine stamps an object
+//! received between two grid instants with the earlier one, and the host
+//! converts wall-clock time with `floor((now_ms - genesis_ms) / Δ_ms)`.
 
 use crate::types::{Round, Slot, Tick};
 
-/// The protocol's fixed parameters.
-///
-/// `Δ` itself is not here: the engine counts time in units of `Δ` (see
-/// [`Tick`]), and the host converts wall-clock milliseconds with its own slot
-/// duration (`4Δ` per slot).
+/// `GENESIS_SLOT`.
+pub const GENESIS_SLOT: Slot = 0;
+
+/// The basis-point denominator of the slot-component durations.
+pub const BASIS_POINTS: u64 = 10_000;
+
+/// `HEAD_VOTE_DUE_BPS` (fork-choice.md, time parameters).
+pub const HEAD_VOTE_DUE_BPS: u64 = 2500;
+/// `SUPPORT_CUTOFF_BPS`.
+pub const SUPPORT_CUTOFF_BPS: u64 = 5000;
+/// `VIEW_FREEZE_BPS`.
+pub const VIEW_FREEZE_BPS: u64 = 7500;
+
+/// Ticks per slot: a slot is `4Δ`.
+pub const TICKS_PER_SLOT: Tick = 4;
+
+/// `get_head_vote_due_ms()`, in ticks into the slot.
+pub const HEAD_VOTE_DUE: Tick = bps_to_ticks(HEAD_VOTE_DUE_BPS);
+/// `get_support_cutoff_ms()`, in ticks into the slot.
+pub const SUPPORT_CUTOFF: Tick = bps_to_ticks(SUPPORT_CUTOFF_BPS);
+/// `get_view_freeze_ms()`, in ticks into the slot.
+pub const VIEW_FREEZE: Tick = bps_to_ticks(VIEW_FREEZE_BPS);
+
+/// A basis-point offset that lands exactly on the `Δ` grid, in ticks. Fails to
+/// compile for one that does not.
+const fn bps_to_ticks(bps: u64) -> Tick {
+    assert!(
+        (bps * TICKS_PER_SLOT as u64).is_multiple_of(BASIS_POINTS),
+        "a due time must land on the Δ grid"
+    );
+    (bps * TICKS_PER_SLOT as u64 / BASIS_POINTS) as Tick
+}
+
+/// `SLOTS_PER_ROUND` in the minimal preset.
+pub const MINIMAL_SLOTS_PER_ROUND: u64 = 4;
+/// `SLOTS_PER_ROUND` in the mainnet preset.
+pub const MAINNET_SLOTS_PER_ROUND: u64 = 8;
+/// `PENDING_FINALITY_WINDOW` (both presets).
+pub const PENDING_FINALITY_WINDOW: u64 = 4;
+/// `SLOW_LOCK_WINDOW` (fork-choice.md, misc config).
+pub const SLOW_LOCK_WINDOW: u64 = 4;
+
+/// The protocol's parameters that the spec does not fix as constants above.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Params {
-    /// `R ≥ 3`: slots per round (§6.1).
+    /// `SLOTS_PER_ROUND`. `TIMEOUT_DELAY_SLOTS` equals it.
     pub slots_per_round: u64,
-    /// `η_SG ≥ 1`: the SG expiry window, in rounds (§3.3).
-    pub eta_sg: u64,
-    /// `K ≥ 4`: every `K`-th height is nonjustifiable under finality debt (§4).
-    pub k: u64,
-    /// `D ≥ 2`: the finality-debt bound (§4).
-    pub d: u64,
-    /// `δ_t`: slots a timeout waits before it can move a height (§4). The
-    /// protocol's value is `2R`.
-    pub timeout_delay: u64,
+    /// `PENDING_FINALITY_WINDOW`: pending justifications a chain state keeps.
+    pub pending_finality_window: u64,
+    /// `SLOW_LOCK_WINDOW`: slots of saved confirmations a slow lock needs.
+    pub slow_lock_window: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ParamsError {
-    #[error("slots per round R = {0} must be at least 3")]
-    RoundTooShort(u64),
-    #[error("SG expiry window eta_SG = {0} must be at least 1")]
-    WindowTooShort(u64),
-    #[error("nonjustifiable period K = {0} must be at least 4")]
-    PeriodTooShort(u64),
-    #[error("finality-debt bound D = {0} must be at least 2")]
-    DebtTooSmall(u64),
+    #[error("slots per round must be at least 1")]
+    EmptyRound,
+    #[error("the pending finality window {0} must be at least 2")]
+    PendingWindowTooSmall(u64),
+    #[error("the slow lock window must be at least 1")]
+    EmptySlowLockWindow,
+}
+
+impl Default for Params {
+    fn default() -> Self {
+        Self::minimal()
+    }
 }
 
 impl Params {
-    /// The protocol's defaults for a given round length: `η_SG = 2`, `K = 5`
-    /// (the smallest value at which the formal finality claims are non-vacuous,
-    /// MODELING_CHOICES §7), `D = 2` (the structural floor) and `δ_t = 2R`.
-    pub fn with_round_length(slots_per_round: u64) -> Self {
+    /// The minimal preset: `SLOTS_PER_ROUND = 4`.
+    pub fn minimal() -> Self {
+        Self::with_slots_per_round(MINIMAL_SLOTS_PER_ROUND)
+    }
+
+    /// The mainnet preset: `SLOTS_PER_ROUND = 8`.
+    pub fn mainnet() -> Self {
+        Self::with_slots_per_round(MAINNET_SLOTS_PER_ROUND)
+    }
+
+    /// The spec's values with a chosen round length.
+    pub fn with_slots_per_round(slots_per_round: u64) -> Self {
         Self {
             slots_per_round,
-            eta_sg: 2,
-            k: 5,
-            d: 2,
-            timeout_delay: 2 * slots_per_round,
+            pending_finality_window: PENDING_FINALITY_WINDOW,
+            slow_lock_window: SLOW_LOCK_WINDOW,
         }
     }
 
-    /// Check the structural conditions of MODELING_CHOICES §8.
     pub fn validate(&self) -> Result<(), ParamsError> {
-        if self.slots_per_round < 3 {
-            return Err(ParamsError::RoundTooShort(self.slots_per_round));
+        if self.slots_per_round == 0 {
+            return Err(ParamsError::EmptyRound);
         }
-        if self.eta_sg < 1 {
-            return Err(ParamsError::WindowTooShort(self.eta_sg));
+        if self.pending_finality_window < 2 {
+            return Err(ParamsError::PendingWindowTooSmall(
+                self.pending_finality_window,
+            ));
         }
-        if self.k < 4 {
-            return Err(ParamsError::PeriodTooShort(self.k));
-        }
-        if self.d < 2 {
-            return Err(ParamsError::DebtTooSmall(self.d));
+        if self.slow_lock_window == 0 {
+            return Err(ParamsError::EmptySlowLockWindow);
         }
         Ok(())
     }
 
-    /// `round(s) = ⌊s / R⌋`.
+    /// `TIMEOUT_DELAY_SLOTS = SLOTS_PER_ROUND`.
+    pub fn timeout_delay_slots(&self) -> u64 {
+        self.slots_per_round
+    }
+
+    /// `compute_round_at_slot`.
     pub fn round_of(&self, slot: Slot) -> Round {
         slot / self.slots_per_round
     }
 
-    /// The opening slot `rR` of round `r`.
-    pub fn opening_slot(&self, round: Round) -> Slot {
+    /// `compute_start_slot_at_round`.
+    pub fn round_start_slot(&self, round: Round) -> Slot {
         round * self.slots_per_round
     }
 
-    /// `T_r = t_{rR}`: the opening slot's proposal time.
-    pub fn round_start(&self, round: Round) -> Tick {
-        slot_start(self.opening_slot(round))
-    }
-
-    /// `a_r = T_r + 6Δ`: the round's attestation time, which is the opening
-    /// slot's confirmation evaluation (§6.1). With `R ≥ 3` it falls in slot
-    /// `rR + 1`, inside round `r`.
-    pub fn attestation_time(&self, round: Round) -> Tick {
-        self.round_start(round) + 6
-    }
-
-    /// The inclusive SG admission window `[max(0, r − η_SG), r]` (§1.4).
-    pub fn admits_round(&self, current: Round, round: Round) -> bool {
-        current.saturating_sub(self.eta_sg) <= round && round <= current
-    }
-
-    /// The rounds `I_r = [max(0, r − η_SG), r)` the grades of round `r` read
-    /// (§3.3). Round 0 reads nothing.
-    pub fn grade_window(&self, round: Round) -> std::ops::Range<Round> {
-        round.saturating_sub(self.eta_sg)..round
+    /// The deadline of a lock created by the confirmation of `slot`:
+    /// `compute_time_at_slot_ms(slot + SLOW_LOCK_WINDOW + 1) +
+    /// get_head_vote_due_ms()` (`update_locks_and_confirmation`).
+    pub fn lock_deadline(&self, slot: Slot) -> Tick {
+        head_vote_due(slot + self.slow_lock_window + 1)
     }
 }
 
-/// `t_s = 4Δs`.
+/// `compute_time_at_slot`, in ticks.
 pub fn slot_start(slot: Slot) -> Tick {
-    4 * slot as Tick
+    TICKS_PER_SLOT * slot as Tick
 }
 
-/// `s = ⌊t / 4Δ⌋`; times before genesis clamp to slot 0.
+/// `compute_slot_at_time`; times before genesis clamp to slot 0.
 pub fn slot_of(t: Tick) -> Slot {
-    if t < 0 { 0 } else { (t / 4) as Slot }
+    if t < 0 {
+        0
+    } else {
+        (t / TICKS_PER_SLOT) as Slot
+    }
 }
 
-/// `t_s + Δ`: the Goldfish vote of slot `s`.
-pub fn vote_time(slot: Slot) -> Tick {
-    slot_start(slot) + 1
+/// `get_time_into_slot`, in ticks.
+pub fn time_into_slot(t: Tick) -> Tick {
+    t.rem_euclid(TICKS_PER_SLOT)
 }
 
-/// `t_s + 2Δ`: the support cutoff of slot `s`, which is also the slot-`(s−1)`
-/// confirmation evaluation.
+/// The head vote deadline of `slot`: `t_s + Δ`.
+pub fn head_vote_due(slot: Slot) -> Tick {
+    slot_start(slot) + HEAD_VOTE_DUE
+}
+
+/// The support cutoff of `slot`: `t_s + 2Δ`.
 pub fn support_cutoff(slot: Slot) -> Tick {
-    slot_start(slot) + 2
+    slot_start(slot) + SUPPORT_CUTOFF
 }
 
-/// `t_s + 3Δ`: the view freeze of slot `s`.
+/// The view freeze of `slot`: `t_s + 3Δ`.
 pub fn view_freeze(slot: Slot) -> Tick {
-    slot_start(slot) + 3
-}
-
-/// `t_s + 6Δ`: the confirmation evaluation of slot `s`.
-pub fn confirmation_time(slot: Slot) -> Tick {
-    slot_start(slot) + 6
-}
-
-/// The three grades and their cutoffs relative to `T_r` (§6.1):
-///
-/// ```text
-/// grade   early   late    completes
-/// G2      T−5Δ    T−Δ     T−Δ   (in the previous round)
-/// G1      T−4Δ    T−2Δ    T
-/// G0      T−3Δ    T−3Δ    T+Δ
-/// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Grade {
-    G0,
-    G1,
-    G2,
-}
-
-impl Grade {
-    pub const ALL: [Grade; 3] = [Grade::G2, Grade::G1, Grade::G0];
-
-    pub fn early_offset(self) -> Tick {
-        match self {
-            Grade::G0 => -3,
-            Grade::G1 => -4,
-            Grade::G2 => -5,
-        }
-    }
-
-    pub fn late_offset(self) -> Tick {
-        match self {
-            Grade::G0 => -3,
-            Grade::G1 => -2,
-            Grade::G2 => -1,
-        }
-    }
-
-    pub fn completion_offset(self) -> Tick {
-        match self {
-            Grade::G0 => 1,
-            Grade::G1 => 0,
-            Grade::G2 => -1,
-        }
-    }
+    slot_start(slot) + VIEW_FREEZE
 }
 
 #[cfg(test)]
@@ -178,35 +177,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_attestation_time_falls_in_the_rounds_second_slot() {
-        for r in 3..8 {
-            let params = Params::with_round_length(r);
-            for round in 0..5 {
-                let a = params.attestation_time(round);
-                assert_eq!(slot_of(a), params.opening_slot(round) + 1);
-                assert_eq!(params.round_of(slot_of(a)), round);
-                assert_eq!(a, support_cutoff(params.opening_slot(round) + 1));
-            }
-        }
+    fn the_due_times_are_the_quarter_points_of_a_slot() {
+        assert_eq!((HEAD_VOTE_DUE, SUPPORT_CUTOFF, VIEW_FREEZE), (1, 2, 3));
+        assert_eq!(head_vote_due(3), 13);
+        assert_eq!(support_cutoff(3), 14);
+        assert_eq!(view_freeze(3), 15);
+        assert_eq!(slot_of(15), 3);
+        assert_eq!(time_into_slot(15), 3);
     }
 
     #[test]
-    fn the_previous_rounds_attestation_lands_before_the_grade_2_early_cutoff() {
-        // R ≥ 3 is what makes a_{r−1} + Δ ≤ T_r − 5Δ (A.11).
-        let params = Params::with_round_length(3);
-        for round in 1..5 {
-            let delivered = params.attestation_time(round - 1) + 1;
-            let early = params.round_start(round) + Grade::G2.early_offset();
-            assert!(delivered <= early);
-        }
+    fn a_lock_lives_until_the_head_vote_of_the_slot_after_the_window() {
+        let params = Params::minimal();
+        // Confirmed at slot 10: expires at slot 15's head vote deadline.
+        assert_eq!(params.lock_deadline(10), head_vote_due(15));
     }
 
     #[test]
-    fn validation_enforces_the_structural_floors() {
-        assert!(Params::with_round_length(3).validate().is_ok());
-        assert!(Params::with_round_length(2).validate().is_err());
-        let mut params = Params::with_round_length(4);
-        params.k = 3;
+    fn validation_enforces_the_spec_floors() {
+        assert!(Params::minimal().validate().is_ok());
+        assert!(Params::mainnet().validate().is_ok());
+        assert!(Params::with_slots_per_round(0).validate().is_err());
+        let mut params = Params::minimal();
+        params.pending_finality_window = 1;
         assert!(params.validate().is_err());
     }
 }

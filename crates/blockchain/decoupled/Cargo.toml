@@ -1,6 +1,6 @@
 [package]
 name = "ethlambda-decoupled"
-description = "Chain-agnostic decoupled consensus protocol: Goldfish, graded stabilization gadget, height-based finality gadget"
+description = "Chain-agnostic EIP-8453 (decoupled consensus) fork choice: available chain with Goldilocks locks, height-based finality gadget, validator signing rules"
 authors.workspace = true
 edition.workspace = true
 keywords.workspace = true
