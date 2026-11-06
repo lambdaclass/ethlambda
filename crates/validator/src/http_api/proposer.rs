@@ -367,9 +367,9 @@ mod tests {
             validators_dir: dir.path().to_path_buf(),
             secrets_dir: dir.path().to_path_buf(),
             definitions_lock: Arc::new(tokio::sync::Mutex::new(())),
+            default_remote_signer: None,
             definitions_unflushed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             protection: crate::slashing_protection::SlashingProtection::in_memory(),
-            default_remote_signer: None,
         };
         Harness {
             app: router(context, TOKEN.to_string()),

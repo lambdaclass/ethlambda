@@ -53,12 +53,22 @@ pub struct KeymanagerContext {
     /// each handler across its entire read-modify-write cycle (not just
     /// `store`), is what actually orders those cycles.
     ///
-    /// Guards the file only, never `store`: holding it across the slow
-    /// EIP-2335 key derivation an import performs must not stall the duty
-    /// loop, which only ever waits on `store`. Where a handler needs both,
-    /// it takes this one first and `store` second, consistently, so the two
-    /// never deadlock against each other.
+    /// Every keymanager handler that changes the store or the file holds it
+    /// until both changes are done, so the two are always judged and changed
+    /// together: a handler that released it between writing the file and
+    /// inserting into the store would let a concurrent delete land in the
+    /// gap and leave memory and disk disagreeing.
+    ///
+    /// The duty loop never takes it, so holding it across the slow EIP-2335
+    /// key derivation an import performs stalls only other keymanager
+    /// requests. Where a handler needs both, it takes this one first and
+    /// `store` second, consistently, so the two never deadlock against each
+    /// other, and it holds `store` only for in-memory work, never across file
+    /// I/O or the derivation.
     pub definitions_lock: Arc<Mutex<()>>,
+    /// `--web3signer-url`: the signer a remote key imported without a `url`
+    /// of its own is assigned to. `None` makes such an import an error.
+    pub default_remote_signer: Option<String>,
     /// Whether the last save of the definitions file replaced it without
     /// flushing the directory, so its last change may not survive a power
     /// loss. Set and cleared by `keystores::save_definitions`; read where a
@@ -67,9 +77,6 @@ pub struct KeymanagerContext {
     /// The record every key must be registered in before it is loaded, so the
     /// duty path never meets a key it has no record for.
     pub protection: crate::slashing_protection::SharedProtection,
-    /// `--web3signer-url`: the signer a remote key imported without a `url`
-    /// of its own is assigned to. `None` makes such an import an error.
-    pub default_remote_signer: Option<String>,
 }
 
 /// The file the generated token is written to, inside the validators directory.

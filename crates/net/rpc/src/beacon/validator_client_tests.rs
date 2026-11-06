@@ -865,10 +865,7 @@ async fn serve_fulu_pinned(
         .spec()
         .await
         .expect("the client reads this node's spec");
-    let context = Arc::new(SigningContext {
-        config: spec,
-        genesis_validators_root: genesis.genesis_validators_root,
-    });
+    let context = Arc::new(SigningContext::new(spec, genesis.genesis_validators_root));
     (Arc::new(client), state, network, context)
 }
 
@@ -1165,10 +1162,7 @@ mod gloas {
             .spec()
             .await
             .expect("the client reads this node's spec");
-        let context = Arc::new(SigningContext {
-            config: spec,
-            genesis_validators_root: genesis.genesis_validators_root,
-        });
+        let context = Arc::new(SigningContext::new(spec, genesis.genesis_validators_root));
         Served {
             client,
             state,

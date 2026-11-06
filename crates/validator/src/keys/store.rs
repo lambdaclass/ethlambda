@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use blst::min_pk::SecretKey;
 use ethlambda_types::beacon::primitives::{BLS_PUBKEY_SIZE, BlsPubkey};
@@ -46,7 +46,12 @@ pub struct ValidatorStore {
     /// One client per remote signer URL, shared by every validator on it, so
     /// a hundred keys behind one signer are one connection pool rather than a
     /// hundred.
-    signers: HashMap<String, Arc<Web3Signer>>,
+    ///
+    /// Weak: the validators using a client hold it, and so does any signature
+    /// in flight through it. A client stops being reachable here once the
+    /// last of those lets go, with no pruning pass having to guess whether an
+    /// in-flight request still counts as a user.
+    signers: HashMap<String, Weak<Web3Signer>>,
 }
 
 impl ValidatorStore {
@@ -187,41 +192,60 @@ impl ValidatorStore {
                 secret_key: Arc::new(secret_key),
             },
         );
-        self.drop_unused_signers();
         Ok(pubkey)
     }
 
     /// Add a validator whose key a Web3Signer at `url` holds, replacing any
-    /// method the store had for it.
+    /// method the store had for it, building the signer's client if no other
+    /// validator already shares one.
     ///
     /// Nothing is asked of the signer here; see [`Self::load`] for why. The
     /// URL is checked for shape, which is the one failure worth refusing up
     /// front: an entry nobody could ever reach.
+    ///
+    /// For startup only. Building a client is not cheap, so a caller holding
+    /// the store behind a lock uses [`Self::signer_for_url`] and
+    /// [`Self::insert_remote_signer`] instead, and builds any missing client
+    /// before taking the write lock.
     pub fn insert_remote(&mut self, pubkey: BlsPubkey, url: &str) -> Result<()> {
-        // Keyed by the URL as the client normalizes it, so `.../` and `...`
-        // name one signer rather than two.
-        let key = url.trim_end_matches('/');
-        let signer = match self.signers.get(key) {
-            Some(signer) => signer.clone(),
-            None => {
-                let signer = Arc::new(Web3Signer::new(url)?);
-                self.signers.insert(key.to_string(), signer.clone());
-                signer
-            }
+        let signer = match self.signer_for_url(url) {
+            Some(signer) => signer,
+            None => Arc::new(Web3Signer::new(url)?),
         };
-        self.validators
-            .insert(pubkey, SigningMethod::Web3Signer { signer });
-        self.drop_unused_signers();
+        self.insert_remote_signer(pubkey, signer);
         Ok(())
     }
 
-    /// Forget any signer client no validator uses any more. Called after
-    /// every mutation, since each can orphan one: an insert that replaces a
-    /// remote entry with a local one, a remove, a remote insert on a new URL
-    /// for a key that was the last on its old one.
-    fn drop_unused_signers(&mut self) {
+    /// The client already serving `url`, if any validator still uses one.
+    /// Keyed by the URL as the client normalizes it, so `.../` and `...` name
+    /// one signer rather than two.
+    pub fn signer_for_url(&self, url: &str) -> Option<Arc<Web3Signer>> {
         self.signers
-            .retain(|_, signer| Arc::strong_count(signer) > 1);
+            .get(url.trim_end_matches('/'))
+            .and_then(Weak::upgrade)
+    }
+
+    /// Every client some validator still uses, by URL. Lets a caller that
+    /// builds clients outside the store's lock reuse these instead.
+    pub fn remote_signers(&self) -> HashMap<String, Arc<Web3Signer>> {
+        self.signers
+            .iter()
+            .filter_map(|(url, signer)| Some((url.clone(), signer.upgrade()?)))
+            .collect()
+    }
+
+    /// Add a validator signing through an already-built `signer`, replacing
+    /// any method the store had for it. A map insert and nothing more, so it
+    /// is cheap enough to run under the store's write lock.
+    pub fn insert_remote_signer(&mut self, pubkey: BlsPubkey, signer: Arc<Web3Signer>) {
+        // Entries whose client nobody holds any more are dropped here rather
+        // than on every mutation: they are a URL and a dead pointer, and a
+        // lookup already treats one as absent.
+        self.signers.retain(|_, signer| signer.strong_count() > 0);
+        self.signers
+            .insert(signer.url().to_string(), Arc::downgrade(&signer));
+        self.validators
+            .insert(pubkey, SigningMethod::Web3Signer { signer });
     }
 
     /// Derive a validator's public key from its raw secret, without adding it
@@ -238,9 +262,7 @@ impl ValidatorStore {
     }
 
     pub fn remove(&mut self, pubkey: &BlsPubkey) -> bool {
-        let removed = self.validators.remove(pubkey).is_some();
-        self.drop_unused_signers();
-        removed
+        self.validators.remove(pubkey).is_some()
     }
 
     pub fn contains(&self, pubkey: &BlsPubkey) -> bool {
@@ -465,6 +487,15 @@ mod tests {
         assert!(ValidatorStore::load(dir.path()).is_err());
     }
 
+    /// How many validators' worth of clients the store can still hand out.
+    fn live_signers(store: &ValidatorStore) -> usize {
+        store
+            .signers
+            .values()
+            .filter(|signer| signer.strong_count() > 0)
+            .count()
+    }
+
     #[test]
     fn remote_validators_on_one_url_share_a_client_and_release_it_together() {
         let mut store = ValidatorStore::new();
@@ -476,12 +507,31 @@ mod tests {
         store
             .insert_remote(second, "http://signer:9000/")
             .expect("inserts");
-        assert_eq!(store.signers.len(), 1, "one URL, one client");
+        assert_eq!(live_signers(&store), 1, "one URL, one client");
 
         assert!(store.remove(&first));
-        assert_eq!(store.signers.len(), 1, "still in use by the second key");
+        assert_eq!(live_signers(&store), 1, "still in use by the second key");
         assert!(store.remove(&second));
-        assert!(store.signers.is_empty(), "nobody uses it any more");
+        assert_eq!(live_signers(&store), 0, "nobody uses it any more");
+        assert!(store.signer_for_url("http://signer:9000").is_none());
+    }
+
+    /// A signature in flight holds the client, and must not keep it alive in
+    /// the store after it finishes: removal and the request's end can come in
+    /// either order.
+    #[test]
+    fn a_client_held_by_an_in_flight_signature_is_released_when_it_ends() {
+        let mut store = ValidatorStore::new();
+        let pubkey = BlsPubkey([1; BLS_PUBKEY_SIZE]);
+        store
+            .insert_remote(pubkey, "http://signer:9000")
+            .expect("inserts");
+        let in_flight = store.signer(&pubkey).expect("held");
+
+        assert!(store.remove(&pubkey));
+        assert_eq!(live_signers(&store), 1, "the request still holds it");
+        drop(in_flight);
+        assert_eq!(live_signers(&store), 0, "released with the request");
     }
 
     #[test]
@@ -497,7 +547,7 @@ mod tests {
         assert_eq!(derived, pubkey);
         assert_eq!(store.len(), 1);
         assert!(store.remote_url(&pubkey).is_none());
-        assert!(store.signers.is_empty());
+        assert_eq!(live_signers(&store), 0);
     }
 
     /// A definitions entry declaring a key its keystore does not hold must not

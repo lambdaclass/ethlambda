@@ -237,13 +237,13 @@ impl<B: BeaconNodeApi> ProposalService<B> {
         // The header is taken from the decoded container, never from anything
         // reassembled here, and it is taken once: its root is what the
         // recorded slot belongs to and what the signature covers.
+        //
+        // The block's root is the header's, so it is taken from the header:
+        // that rehashes five fields, where `produced.block_root()` would hash
+        // the whole body, transactions included, a second time inside the
+        // proposal's budget.
         let header = produced.header();
-        let block_root = produced.block_root();
-        debug_assert_eq!(
-            header.hash_tree_root(),
-            block_root,
-            "a header merkleizes to its block's root"
-        );
+        let block_root = header.hash_tree_root();
 
         // The check that matters, and the one that records, durably, before
         // the signature exists. Everything after this point may be abandoned
@@ -450,10 +450,7 @@ mod tests {
     }
 
     fn context() -> Arc<SigningContext> {
-        Arc::new(SigningContext {
-            config: Config::mainnet(),
-            genesis_validators_root: Root::ZERO,
-        })
+        Arc::new(SigningContext::new(Config::mainnet(), Root::ZERO))
     }
 
     /// A store holding one key, and the pubkey it resolves to.
@@ -869,10 +866,10 @@ mod gloas_tests {
     }
 
     fn context() -> Arc<SigningContext> {
-        Arc::new(SigningContext {
-            config: Config::mainnet().with_fork_epoch(ForkName::Gloas, GLOAS_EPOCH),
-            genesis_validators_root: Root::ZERO,
-        })
+        Arc::new(SigningContext::new(
+            Config::mainnet().with_fork_epoch(ForkName::Gloas, GLOAS_EPOCH),
+            Root::ZERO,
+        ))
     }
 
     fn store() -> (RwLock<ValidatorStore>, BlsPubkey) {

@@ -46,7 +46,7 @@ use crate::beacon_node::dto::{SyncDutyDto, parse_pubkey};
 use crate::beacon_node::{BeaconNodeApi, validate_sync_contribution};
 use crate::error::{Error, Result};
 use crate::keys::ValidatorStore;
-use crate::signing::SigningContext;
+use crate::signing::{SigningContext, sign_all};
 
 /// How many slots of dedup history are kept.
 const HISTORY_SLOTS: u64 = 64;
@@ -129,35 +129,45 @@ impl<B: BeaconNodeApi> SyncCommitteeService<B> {
             Err(err) => return Err(err),
         };
 
-        let mut messages = Vec::with_capacity(pending.len());
-        {
-            let _timing = crate::metrics::time_signing();
-            for duty in pending {
-                let pubkey = match parse_pubkey(&duty.pubkey) {
-                    Ok(pubkey) => pubkey,
-                    Err(err) => {
-                        error!(%slot, validator = duty.validator_index, %err, "Duty carried an unreadable pubkey");
-                        continue;
-                    }
-                };
-                if !self.record(duty.validator_index, slot) {
+        // Recorded one by one, then signed all at once, each within the
+        // signing budget: a hung remote signer costs only its own keys'
+        // messages, not the whole batch's.
+        let mut to_sign = Vec::with_capacity(pending.len());
+        for duty in pending {
+            let pubkey = match parse_pubkey(&duty.pubkey) {
+                Ok(pubkey) => pubkey,
+                Err(err) => {
+                    error!(%slot, validator = duty.validator_index, %err, "Duty carried an unreadable pubkey");
                     continue;
                 }
-                match self
-                    .context
-                    .sign_sync_committee_message(store, &pubkey, slot, root)
-                    .await
-                {
-                    Ok(signature) => messages.push(SyncCommitteeMessage {
-                        slot,
-                        beacon_block_root: root,
-                        validator_index: duty.validator_index,
-                        signature,
-                    }),
-                    Err(err) => {
-                        error!(%slot, validator = duty.validator_index, %err, "Failed to sign sync committee message");
-                        crate::metrics::inc_signing_failures();
-                    }
+            };
+            if self.record(duty.validator_index, slot) {
+                to_sign.push((duty.validator_index, pubkey));
+            }
+        }
+        let signatures = {
+            let _timing = crate::metrics::time_signing();
+            sign_all(to_sign.iter().map(|(_, pubkey)| {
+                (
+                    *pubkey,
+                    self.context
+                        .sign_sync_committee_message(store, pubkey, slot, root),
+                )
+            }))
+            .await
+        };
+        let mut messages = Vec::with_capacity(to_sign.len());
+        for ((validator_index, _), signature) in to_sign.into_iter().zip(signatures) {
+            match signature {
+                Ok(signature) => messages.push(SyncCommitteeMessage {
+                    slot,
+                    beacon_block_root: root,
+                    validator_index,
+                    signature,
+                }),
+                Err(err) => {
+                    error!(%slot, validator = validator_index, %err, "Failed to sign sync committee message");
+                    crate::metrics::inc_signing_failures();
                 }
             }
         }
@@ -191,32 +201,40 @@ impl<B: BeaconNodeApi> SyncCommitteeService<B> {
         duties: &[SyncDutyDto],
         store: &RwLock<ValidatorStore>,
     ) -> Result<usize> {
+        // Every (validator, subnet) pair's selection proof, asked for at once
+        // and each within the signing budget.
+        let mut seats = Vec::new();
+        for duty in duties {
+            let pubkey = match parse_pubkey(&duty.pubkey) {
+                Ok(pubkey) => pubkey,
+                Err(err) => {
+                    error!(%slot, validator = duty.validator_index, %err, "Duty carried an unreadable pubkey");
+                    continue;
+                }
+            };
+            for subnet in subnets_of(duty) {
+                seats.push((duty.validator_index, pubkey, subnet));
+            }
+        }
+        let proofs = sign_all(seats.iter().map(|(_, pubkey, subnet)| {
+            (
+                *pubkey,
+                self.context
+                    .sign_sync_selection_proof(store, pubkey, slot, *subnet),
+            )
+        }))
+        .await;
         // (validator, pubkey, subnet, selection proof) for each selected pair.
         let mut selected: Vec<(ValidatorIndex, BlsPubkey, u64, BlsSignature)> = Vec::new();
-        {
-            for duty in duties {
-                let pubkey = match parse_pubkey(&duty.pubkey) {
-                    Ok(pubkey) => pubkey,
-                    Err(err) => {
-                        error!(%slot, validator = duty.validator_index, %err, "Duty carried an unreadable pubkey");
-                        continue;
-                    }
-                };
-                for subnet in subnets_of(duty) {
-                    match self
-                        .context
-                        .sign_sync_selection_proof(store, &pubkey, slot, subnet)
-                        .await
-                    {
-                        Ok(proof) if is_sync_committee_aggregator(&proof) => {
-                            selected.push((duty.validator_index, pubkey, subnet, proof));
-                        }
-                        Ok(_) => {}
-                        Err(err) => {
-                            error!(%slot, validator = duty.validator_index, %err, "Failed to sign sync selection proof");
-                            crate::metrics::inc_signing_failures();
-                        }
-                    }
+        for ((validator, pubkey, subnet), proof) in seats.into_iter().zip(proofs) {
+            match proof {
+                Ok(proof) if is_sync_committee_aggregator(&proof) => {
+                    selected.push((validator, pubkey, subnet, proof));
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    error!(%slot, validator, %err, "Failed to sign sync selection proof");
+                    crate::metrics::inc_signing_failures();
                 }
             }
         }
@@ -258,27 +276,33 @@ impl<B: BeaconNodeApi> SyncCommitteeService<B> {
             fetched.insert(*subnet, answer);
         }
 
-        let mut signed = Vec::new();
-        {
-            for (validator, pubkey, subnet, proof) in selected {
-                let Some(Some(contribution)) = fetched.get(&subnet) else {
-                    continue;
-                };
-                let message = ContributionAndProof {
-                    aggregator_index: validator,
-                    contribution: contribution.clone(),
-                    selection_proof: proof,
-                };
-                match self
-                    .context
-                    .sign_contribution_and_proof(store, &pubkey, &message)
-                    .await
-                {
-                    Ok(signature) => signed.push(SignedContributionAndProof { message, signature }),
-                    Err(err) => {
-                        error!(%slot, validator, %err, "Failed to sign contribution and proof");
-                        crate::metrics::inc_signing_failures();
-                    }
+        let mut to_sign = Vec::new();
+        for (validator, pubkey, subnet, proof) in selected {
+            let Some(Some(contribution)) = fetched.get(&subnet) else {
+                continue;
+            };
+            let message = ContributionAndProof {
+                aggregator_index: validator,
+                contribution: contribution.clone(),
+                selection_proof: proof,
+            };
+            to_sign.push((pubkey, message));
+        }
+        let signatures = sign_all(to_sign.iter().map(|(pubkey, message)| {
+            (
+                *pubkey,
+                self.context
+                    .sign_contribution_and_proof(store, pubkey, message),
+            )
+        }))
+        .await;
+        let mut signed = Vec::with_capacity(to_sign.len());
+        for ((_, message), signature) in to_sign.into_iter().zip(signatures) {
+            match signature {
+                Ok(signature) => signed.push(SignedContributionAndProof { message, signature }),
+                Err(err) => {
+                    error!(%slot, validator = message.aggregator_index, %err, "Failed to sign contribution and proof");
+                    crate::metrics::inc_signing_failures();
                 }
             }
         }
@@ -327,10 +351,7 @@ mod tests {
     }
 
     fn context() -> Arc<SigningContext> {
-        Arc::new(SigningContext {
-            config: Config::mainnet(),
-            genesis_validators_root: Root::ZERO,
-        })
+        Arc::new(SigningContext::new(Config::mainnet(), Root::ZERO))
     }
 
     fn store() -> (RwLock<ValidatorStore>, BlsPubkey) {

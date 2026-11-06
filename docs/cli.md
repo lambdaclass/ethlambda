@@ -432,22 +432,40 @@ are separate (see
 a key moved to or from a signer carries its history through the signer's own
 tools. A signer refusal (`412`) is logged, counted as a
 signing failure and never retried; so is a key the signer does not hold, and a
-signer that cannot be reached. Nothing is asked of the signer at startup or at
+signer that cannot be reached. Each duty asks for its signatures all at once
+and gives each one 2 seconds: a signer that has not answered by then costs the
+signatures it owes and nothing else, so the duty publishes whatever arrived,
+local keys and other signers' keys included. Aggregator selection proofs are
+remembered once produced, so the one the epoch's subnet subscription asked for
+is not asked for again by the aggregation. Nothing is asked of the signer at startup or at
 import: a signer may start after this client does.
 
-A remote key is declared in `validator_definitions.yml` with a `url` where a
-local entry has its two keystore paths:
+A remote key is declared in `validator_definitions.yml` with `type:
+web3signer` and a `url` where a local entry has `type: local_keystore` and its
+two keystore paths:
 
 ```yaml
 - enabled: true
   voting_public_key: "0x9612…0d07"
+  type: web3signer
   url: https://signer:9000
 ```
 
 or imported at runtime through `POST /eth/v1/remotekeys` (below). A `url`
-left out of that request means `--web3signer-url`. The signer is reached over
-plain HTTPS with the system's trust roots; client certificates are not
-supported.
+left out of that request means `--web3signer-url`. An entry written without a
+`type` (every entry from before remote signing) is read by its fields; one
+naming both keystore paths and a `url` is refused at startup rather than read
+as either, and so is any field this client does not implement, such as
+Lighthouse's `root_certificate_path`. The `url` must not carry credentials, a
+query string or a fragment.
+
+The signer is reached over HTTP or HTTPS. HTTPS is verified against the Mozilla
+root store bundled into the binary (`webpki-roots`), **not** the operating
+system's trust store, and no other CA can be added: a signer behind an internal
+or self-signed CA fails every TLS handshake, and every signature for its keys
+is then counted as a signing failure. Client certificates are not supported
+either. Put such a signer behind a certificate from a public CA, or reach it
+over plain HTTP on a private network.
 
 ### The keymanager API
 
@@ -461,9 +479,14 @@ It serves `GET`, `POST` and `DELETE /eth/v1/remotekeys` for the keys a
 Web3Signer holds. The two routes partition the store: `/keystores` lists and
 deletes local keys only, `/remotekeys` remote keys only, and a key asked of the
 wrong route is `not_found`. An import of a key either route already holds is
-`duplicate`. `POST /remotekeys` persists each key to the definitions file
-before it starts signing, the same order the keystores import uses, and
-`readonly` is always `false`: this client has no key it cannot delete.
+`duplicate`. `POST /remotekeys` persists each key to the definitions file and
+registers it in the slashing-protection record before it starts signing, the
+same order the keystores import uses, and `readonly` is always `false`: this
+client has no key it cannot delete. These routes carry no slashing-protection
+history, since the specification gives them no field for it: a remote key
+imported with no record starts as never having signed, and `DELETE
+/remotekeys` leaves the record in place. `DELETE /keystores` exports nothing
+for a key a remote signer holds.
 
 It also serves `GET`, `POST` and `DELETE` on
 `/eth/v1/validator/{pubkey}/feerecipient`, `/graffiti` and `/gas_limit`, which

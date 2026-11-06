@@ -15,7 +15,7 @@ use crate::beacon_node::dto::{
 use crate::beacon_node::{BeaconNodeApi, validate_attestation_data};
 use crate::error::Result;
 use crate::keys::ValidatorStore;
-use crate::signing::SigningContext;
+use crate::signing::{SigningContext, sign_all};
 use crate::slashing_protection::SharedProtection;
 
 /// What one slot's attestation duty produced.
@@ -246,15 +246,19 @@ impl<B: BeaconNodeApi> AttestationService<B> {
         // await: `tokio::sync::RwLock` is write-preferring, and a keymanager
         // import queuing for the write lock would otherwise stall every read
         // behind it for as long as the guard was held.
-        let signatures = {
-            let _timing = crate::metrics::time_signing();
-            futures::future::join_all(
-                to_sign
-                    .iter()
-                    .map(|(_, pubkey)| self.context.sign_attestation(store, pubkey, &data)),
-            )
-            .await
-        };
+        //
+        // Each signature gets `SIGNING_BUDGET` and no more, so a hung signer
+        // costs only its own keys: the batch below goes out with every
+        // signature that arrived, rather than the slot's deadline dropping
+        // the whole batch, local keys included, while it waits.
+        let signatures =
+            {
+                let _timing = crate::metrics::time_signing();
+                sign_all(to_sign.iter().map(|(_, pubkey)| {
+                    (*pubkey, self.context.sign_attestation(store, pubkey, &data))
+                }))
+                .await
+            };
 
         let mut attestations = Vec::with_capacity(to_sign.len());
         for ((duty, _), signature) in to_sign.iter().zip(signatures) {
@@ -343,10 +347,7 @@ mod tests {
     }
 
     fn context() -> Arc<SigningContext> {
-        Arc::new(SigningContext {
-            config: Config::mainnet(),
-            genesis_validators_root: Root::ZERO,
-        })
+        Arc::new(SigningContext::new(Config::mainnet(), Root::ZERO))
     }
 
     fn duty(
@@ -832,11 +833,10 @@ mod tests {
     }
 
     fn gloas_context() -> Arc<SigningContext> {
-        Arc::new(SigningContext {
-            config: Config::mainnet()
-                .with_fork_epoch(ethlambda_types::beacon::fork::ForkName::Gloas, 10),
-            genesis_validators_root: Root::ZERO,
-        })
+        Arc::new(SigningContext::new(
+            Config::mainnet().with_fork_epoch(ethlambda_types::beacon::fork::ForkName::Gloas, 10),
+            Root::ZERO,
+        ))
     }
 
     /// From gloas `data.index` is the payload signal, so a node answering 1

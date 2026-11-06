@@ -89,14 +89,14 @@ pub struct ValidatorConfig {
     /// Bind address for the keymanager API. `None` when `--enable-keymanager`
     /// was not passed, in which case it is never spawned.
     pub keymanager: Option<std::net::SocketAddr>,
-    /// Register keys that have no slashing-protection record as never having
-    /// signed, instead of refusing to start. See
-    /// [`slashing_protection::SlashingProtection::open`].
-    pub init_slashing_protection: bool,
     /// `--web3signer-url`: the remote signer a key imported through
     /// `POST /eth/v1/remotekeys` without a `url` of its own is assigned to.
     /// Keys the definitions file already names a signer for need no default.
     pub web3signer_url: Option<String>,
+    /// Register keys that have no slashing-protection record as never having
+    /// signed, instead of refusing to start. See
+    /// [`slashing_protection::SlashingProtection::open`].
+    pub init_slashing_protection: bool,
 }
 
 /// Run the validator client until the process is stopped.
@@ -192,7 +192,9 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
 
     // After the beacon node names the chain, which the record must belong to,
     // and before any service that signs exists. Every loaded key must already
-    // have a record, unless the operator said otherwise.
+    // have a record, unless the operator said otherwise. That includes a key
+    // a remote signer holds: the signer keeps its own record, and this one is
+    // kept as well, so a key is covered whichever of the two it meets first.
     let keys = store.read().await.pubkeys();
     let protection = slashing_protection::SlashingProtection::open_locked(
         record_lock,
@@ -208,10 +210,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     );
     let protection = Arc::new(std::sync::Mutex::new(protection));
 
-    let context = Arc::new(SigningContext {
-        config: spec,
-        genesis_validators_root: genesis.genesis_validators_root,
-    });
+    let context = Arc::new(SigningContext::new(spec, genesis.genesis_validators_root));
 
     let mut duties = DutiesService::new(beacon_node.clone(), Vec::new());
     let attestation =
@@ -234,9 +233,9 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             validators_dir: config.validators_dir.clone(),
             secrets_dir: config.secrets_dir.clone(),
             definitions_lock: Arc::new(Mutex::new(())),
+            default_remote_signer: config.web3signer_url.clone(),
             definitions_unflushed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             protection: protection.clone(),
-            default_remote_signer: config.web3signer_url.clone(),
         };
         let router = http_api::router(context, token);
         let listener = tokio::net::TcpListener::bind(address)
@@ -890,10 +889,10 @@ mod tests {
     }
 
     fn context() -> SigningContext {
-        SigningContext {
-            config: ethlambda_types::beacon::config::Config::mainnet(),
-            genesis_validators_root: Root::ZERO,
-        }
+        SigningContext::new(
+            ethlambda_types::beacon::config::Config::mainnet(),
+            Root::ZERO,
+        )
     }
 
     fn empty_store() -> RwLock<ValidatorStore> {
@@ -1087,11 +1086,11 @@ mod tests {
     // ---- gloas ----------------------------------------------------------
 
     fn gloas_context(epoch: u64) -> SigningContext {
-        SigningContext {
-            config: ethlambda_types::beacon::config::Config::mainnet()
+        SigningContext::new(
+            ethlambda_types::beacon::config::Config::mainnet()
                 .with_fork_epoch(ethlambda_types::beacon::fork::ForkName::Gloas, epoch),
-            genesis_validators_root: Root::ZERO,
-        }
+            Root::ZERO,
+        )
     }
 
     fn ptc_duty(index: u64, slot: u64) -> crate::beacon_node::dto::PtcDutyDto {
@@ -1187,10 +1186,7 @@ mod tests {
         let mut config = ethlambda_types::beacon::config::Config::mainnet()
             .with_fork_epoch(ethlambda_types::beacon::fork::ForkName::Gloas, 0);
         config.slot_duration_ms = 1_000;
-        let context = Arc::new(SigningContext {
-            config: config.clone(),
-            genesis_validators_root: Root::ZERO,
-        });
+        let context = Arc::new(SigningContext::new(config.clone(), Root::ZERO));
         let now_secs = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("after the epoch")
@@ -1244,11 +1240,11 @@ mod tests {
     }
 
     fn altair_context() -> SigningContext {
-        SigningContext {
-            config: ethlambda_types::beacon::config::Config::mainnet()
+        SigningContext::new(
+            ethlambda_types::beacon::config::Config::mainnet()
                 .with_fork_epoch(ethlambda_types::beacon::fork::ForkName::Altair, 0),
-            genesis_validators_root: Root::ZERO,
-        }
+            Root::ZERO,
+        )
     }
 
     fn sync_duty(index: u64, seats: Vec<u64>) -> crate::beacon_node::dto::SyncDutyDto {
@@ -1336,10 +1332,7 @@ mod tests {
         let mut config = ethlambda_types::beacon::config::Config::mainnet()
             .with_fork_epoch(ethlambda_types::beacon::fork::ForkName::Altair, 0);
         config.slot_duration_ms = 1_000;
-        let context = Arc::new(SigningContext {
-            config: config.clone(),
-            genesis_validators_root: Root::ZERO,
-        });
+        let context = Arc::new(SigningContext::new(config.clone(), Root::ZERO));
         let now_secs = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("after the epoch")
@@ -1395,10 +1388,7 @@ mod tests {
         use crate::beacon_node::mock::MockBeaconNode;
 
         let config = ethlambda_types::beacon::config::Config::mainnet();
-        let context = Arc::new(SigningContext {
-            config: config.clone(),
-            genesis_validators_root: Root::ZERO,
-        });
+        let context = Arc::new(SigningContext::new(config.clone(), Root::ZERO));
         let clock = SlotClock::from_config(0, &config);
         let node = Arc::new(MockBeaconNode::new());
         let store = empty_store();

@@ -17,10 +17,11 @@ use ethlambda_types::beacon::primitives::Epoch;
 
 use crate::beacon_node::dto::{
     AttesterDutyDto, CommitteeSubscriptionDto, SyncCommitteeSubscriptionDto, SyncDutyDto,
+    parse_pubkey,
 };
 use crate::error::Result;
 use crate::keys::ValidatorStore;
-use crate::signing::SigningContext;
+use crate::signing::{SigningContext, sign_all};
 
 /// Send one subscription per held duty, claiming the aggregator role for the
 /// duties this client was selected for.
@@ -47,10 +48,36 @@ pub async fn subscribe<B: BeaconNodeApi>(
         return Ok(());
     }
 
-    let mut subscriptions = Vec::with_capacity(duties.len());
-    for duty in duties {
-        let is_aggregator = match selection_for(context, store, duty).await {
-            Ok(selection) => selection.is_some(),
+    // Every selection proof is asked for at once, each within the signing
+    // budget. This runs on the duty loop at an epoch boundary, ahead of that
+    // slot's proposal, so one request per duty in series would let a slow or
+    // unreachable signer hold up every validator's duties, local keys
+    // included, for as many round trips as there are duties. Bounded this
+    // way it costs `SIGNING_BUDGET` at most, and the proofs that did arrive
+    // are remembered for the aggregation tick (see
+    // `SigningContext::sign_selection_proof`).
+    let mut is_aggregator = vec![false; duties.len()];
+    let mut keyed = Vec::with_capacity(duties.len());
+    for (position, duty) in duties.iter().enumerate() {
+        match parse_pubkey(&duty.pubkey) {
+            Ok(pubkey) => keyed.push((position, duty, pubkey)),
+            Err(err) => warn!(
+                slot = duty.slot,
+                validator = duty.validator_index,
+                %err,
+                "Duty carried an unreadable pubkey; subscribing without the role"
+            ),
+        }
+    }
+    let selections = sign_all(
+        keyed
+            .iter()
+            .map(|(_, duty, pubkey)| (*pubkey, selection_for(context, store, duty))),
+    )
+    .await;
+    for ((position, duty, _), selection) in keyed.into_iter().zip(selections) {
+        match selection {
+            Ok(selection) => is_aggregator[position] = selection.is_some(),
             Err(err) => {
                 warn!(
                     slot = duty.slot,
@@ -58,17 +85,22 @@ pub async fn subscribe<B: BeaconNodeApi>(
                     %err,
                     "Could not compute aggregator selection; subscribing without the role"
                 );
-                false
+                crate::metrics::inc_signing_failures();
             }
-        };
-        subscriptions.push(CommitteeSubscriptionDto {
+        }
+    }
+
+    let subscriptions: Vec<CommitteeSubscriptionDto> = duties
+        .iter()
+        .zip(is_aggregator)
+        .map(|(duty, is_aggregator)| CommitteeSubscriptionDto {
             validator_index: duty.validator_index,
             committee_index: duty.committee_index,
             committees_at_slot: duty.committees_at_slot,
             slot: duty.slot,
             is_aggregator,
-        });
-    }
+        })
+        .collect();
 
     let aggregating = subscriptions
         .iter()
@@ -125,10 +157,7 @@ mod tests {
     }
 
     fn context() -> SigningContext {
-        SigningContext {
-            config: Config::mainnet(),
-            genesis_validators_root: Root::ZERO,
-        }
+        SigningContext::new(Config::mainnet(), Root::ZERO)
     }
 
     fn store() -> (RwLock<ValidatorStore>, BlsPubkey) {
