@@ -1016,22 +1016,12 @@ fn decoupled_setup(
     validator_keys: HashMap<u64, ValidatorKeyPair>,
 ) -> eyre::Result<DecoupledSetup> {
     let keys = &genesis.decoupled;
+    // Lean has no preset of its own: the round length defaults to EIP-8453's
+    // minimal preset, and every other parameter is the spec's.
     let slots_per_round = slots_per_round_override
         .or(keys.slots_per_round)
-        .unwrap_or(3);
-    let mut params = ethlambda_decoupled::Params::with_round_length(slots_per_round);
-    if let Some(window) = keys.sg_window {
-        params.eta_sg = window;
-    }
-    if let Some(period) = keys.nonjustifiable_period {
-        params.k = period;
-    }
-    if let Some(debt) = keys.finality_debt {
-        params.d = debt;
-    }
-    if let Some(delay) = keys.timeout_delay {
-        params.timeout_delay = delay;
-    }
+        .unwrap_or(ethlambda_decoupled::params::MINIMAL_SLOTS_PER_ROUND);
+    let params = ethlambda_decoupled::Params::with_slots_per_round(slots_per_round);
     params
         .validate()
         .map_err(|err| eyre::eyre!("invalid decoupled consensus parameters: {err}"))?;
@@ -1055,12 +1045,11 @@ fn decoupled_setup(
         .collect();
     info!(
         slots_per_round = params.slots_per_round,
-        sg_window = params.eta_sg,
-        nonjustifiable_period = params.k,
-        finality_debt = params.d,
-        timeout_delay = params.timeout_delay,
+        timeout_delay_slots = params.timeout_delay_slots(),
+        pending_finality_window = params.pending_finality_window,
+        slow_lock_window = params.slow_lock_window,
         genesis_root = %ethlambda_types::ShortRoot(&genesis_root.0),
-        "Decoupled consensus configured"
+        "Decoupled consensus (EIP-8453) configured"
     );
     Ok(DecoupledSetup {
         config: ethlambda_blockchain::decoupled_lean::DecoupledLeanConfig {

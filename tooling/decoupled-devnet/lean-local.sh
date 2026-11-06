@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# A local lean devnet running the decoupled consensus protocol: N ethlambda
+# A local lean devnet running the decoupled consensus (EIP-8453) protocol: N ethlambda
 # processes on 127.0.0.1, one validator each, peering over discv5 from node 0.
 #
 #   tooling/decoupled-devnet/lean-local.sh start   # keys, genesis, start nodes
@@ -9,14 +9,15 @@
 # Environment: N (nodes, default 4), DIR (work dir, default
 # /tmp/ethlambda-decoupled-lean), BIN (ethlambda binary, default
 # target/release-fast/ethlambda), SLOT_MS (default 4000), ROUND (slots per
-# round, default 3), GENESIS_DELAY (seconds, default 30).
+# round and timeout delay, default 4: EIP-8453 minimal), GENESIS_DELAY
+# (seconds, default 30).
 set -euo pipefail
 
 N=${N:-4}
 DIR=${DIR:-/tmp/ethlambda-decoupled-lean}
 BIN=${BIN:-target/release-fast/ethlambda}
 SLOT_MS=${SLOT_MS:-4000}
-ROUND=${ROUND:-3}
+ROUND=${ROUND:-4}
 GENESIS_DELAY=${GENESIS_DELAY:-30}
 
 gossip_port() { echo $((9300 + $1)); }

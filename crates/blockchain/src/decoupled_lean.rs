@@ -1,27 +1,41 @@
-//! The chain actor of a lean node running the decoupled consensus protocol.
+//! The chain actor of a lean node running the decoupled consensus (EIP-8453)
+//! protocol.
 //!
-//! It owns the protocol engine (`ethlambda_decoupled::Store`), this node's
-//! validator keys and anti-slashing records, and the signatures that back
-//! every object the engine holds. It ticks on the protocol's public grid
-//! (`Δ = slot / 4`), runs the duties each tick asks for, and imports blocks,
-//! Goldfish votes and combined attestations from the decoupled topics.
+//! It owns the fork choice engine (`ethlambda_decoupled::Store`), the finality
+//! gadget chain state of every held block, this node's validator keys and
+//! finality signing records, and the signatures that back every object it may
+//! put in a block. It ticks on the protocol's public grid (`Δ = slot / 4`),
+//! runs the duties each tick asks for, and imports blocks, head votes and FG
+//! attestations from the decoupled topics.
 //!
 //! Lean specifics, on top of the engine:
 //!
-//! * every validator weighs one, the slot-`s` committee is every validator,
-//!   and the proposer of slot `s` is `s mod n`, as on 3SF-mini lean;
+//! * every validator weighs one in finality gadget quorums, holds one seat in
+//!   every slot's head vote committee, and attests once per round in slot
+//!   `v mod SLOTS_PER_ROUND` of the round; the proposer of slot `s` is
+//!   `s mod n`, as on 3SF-mini lean;
+//! * there are no execution payloads: every block builds on its parent's
+//!   `Empty` branch;
 //! * signatures are individual XMSS signatures (see
 //!   `ethlambda_types::lean_decoupled` for the epoch grid);
-//! * imported blocks and the anti-slashing records are persisted under
-//!   prefixed `Metadata` keys and replayed on restart. A replayed node is a
-//!   node that joins (`§6.2`): its saved grades start empty.
+//! * gossip keeps the first head vote of a validator per slot and the first
+//!   FG attestation per round (p2p-interface.md), so equivocations reach the
+//!   fork choice only through blocks;
+//! * imported blocks and the signing records are persisted under prefixed
+//!   `Metadata` keys and replayed on restart. A replayed node is a node that
+//!   joins: its locks and saved confirmations start empty.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ethlambda_crypto::signature::{ValidatorPublicKey, ValidatorSignature};
-use ethlambda_decoupled::{BlockError, BlockInput, Electorate, Params, Record, Store as Engine};
+use ethlambda_decoupled::{
+    Anchor, BlockError, BlockInput, ChainState, ChainStates, Electorate, FinalitySigningRecord,
+    HeadVote, HeadVoteCommittees, HeadVoteMessage, Params, PayloadStatus, Store as Engine,
+    chain_state::{ChainStateError, select_attestations},
+    head_vote_data,
+};
 use ethlambda_network_api::{
     DecoupledToP2PRef, InitDecoupledP2P, SharedDecoupledBlocks,
     p2p_to_decoupled::{NewDecoupledAttestation, NewDecoupledBlock, NewDecoupledVote},
@@ -29,12 +43,11 @@ use ethlambda_network_api::{
 use ethlambda_storage::{StorageBackend, Table};
 use ethlambda_types::ShortRoot;
 use ethlambda_types::attestation::XmssSignature;
-use ethlambda_types::decoupled::{
-    Attestation, BlockRef, DecoupledStatus, GoldfishVote, SharedDecoupledStatus,
-};
+use ethlambda_types::decoupled::{BlockRef, DecoupledStatus, SharedDecoupledStatus};
 use ethlambda_types::lean_decoupled::{
-    DecoupledBlock, DecoupledBlockBody, SignedDecoupledAttestation, SignedDecoupledBlock,
-    SignedGoldfishVote, attestation_epoch, goldfish_vote_epoch,
+    DecoupledBlock, DecoupledBlockBody, FinalityAttestation, SignedDecoupledBlock,
+    SignedFinalityAttestation, SignedHeadVote, attestation_epoch, attestation_slot,
+    head_vote_epoch,
 };
 use ethlambda_types::primitives::{H256, HashTreeRoot as _};
 use ethlambda_types::time::unix_now_ms;
@@ -52,14 +65,17 @@ use tracing::{debug, error, info, warn};
 use crate::key_manager::{KeyManager, ValidatorKeyPair};
 
 /// `Metadata` key prefix of a persisted block, followed by its root.
-const BLOCK_KEY_PREFIX: &[u8] = b"decoupled/block/";
-/// `Metadata` key prefix of a validator's persisted record, followed by its
-/// index (little-endian).
-const RECORD_KEY_PREFIX: &[u8] = b"decoupled/record/";
+const BLOCK_KEY_PREFIX: &[u8] = b"decoupled/eip8453/block/";
+/// `Metadata` key prefix of a validator's persisted signing state, followed by
+/// its index (little-endian).
+const RECORD_KEY_PREFIX: &[u8] = b"decoupled/eip8453/record/";
 
 /// Blocks held while their parent is missing, at most. Past it the oldest
 /// parent's children are dropped: they can be fetched again.
 const MAX_PARKED_BLOCKS: usize = 1024;
+
+/// FG attestations held for proposals, at most.
+const MAX_POOLED_ATTESTATIONS: usize = 16384;
 
 /// How long a by-root lookup is left alone before it is asked again.
 const REFETCH_AFTER: Duration = Duration::from_secs(4);
@@ -82,14 +98,14 @@ impl DecoupledLeanConfig {
     }
 }
 
-/// One validator's persisted signing state: its anti-slashing record, and
+/// One validator's persisted signing state: its finality signing record, and
 /// the last slot it voted in and round it attested in, so a restart inside a
 /// slot never signs a second message at one XMSS epoch.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct SigningState {
-    record: Record,
+    record: FinalitySigningRecord,
     last_vote_slot: Option<u64>,
-    last_round: Option<u64>,
+    last_attest_round: Option<u64>,
 }
 
 /// Handle to the running actor.
@@ -117,10 +133,21 @@ impl DecoupledLean {
                 )
             })
             .collect();
-        let engine = Engine::from_genesis(
+        let genesis = BlockRef {
+            root: config.genesis_root,
+            slot: 0,
+        };
+        let genesis_state = ChainState::initial(genesis, validator_count);
+        let engine = Engine::new(
             config.params,
-            Electorate::uniform(validator_count),
-            config.genesis_root,
+            HeadVoteCommittees::EveryValidator {
+                validator_count: validator_count as u64,
+            },
+            Anchor {
+                root: genesis.root,
+                slot: genesis.slot,
+                fg: genesis_state.checkpoints(),
+            },
         );
         let ours: Vec<u64> = {
             let mut ids: Vec<u64> = validator_keys.keys().copied().collect();
@@ -130,12 +157,16 @@ impl DecoupledLean {
         let mut server = DecoupledLeanServer {
             config,
             engine,
+            states: ChainStates::new(genesis, genesis_state),
+            electorate: Electorate::uniform(validator_count),
             keys: KeyManager::new(validator_keys),
             ours,
             pubkeys,
             signing: HashMap::new(),
             vote_signatures: HashMap::new(),
-            attestation_signatures: HashMap::new(),
+            seen_votes: HashSet::new(),
+            attestations: BTreeMap::new(),
+            seen_attestations: HashSet::new(),
             verified: HashMap::new(),
             parked: BTreeMap::new(),
             future: Vec::new(),
@@ -165,16 +196,24 @@ impl DecoupledLean {
 pub struct DecoupledLeanServer {
     config: DecoupledLeanConfig,
     engine: Engine,
+    /// The finality gadget chain state of every held block.
+    states: ChainStates,
+    electorate: Electorate,
     keys: KeyManager,
     /// This node's validators, ascending.
     ours: Vec<u64>,
     /// `(attestation, proposal)` public keys by validator index.
     pubkeys: Vec<(ValidatorPublicKey, ValidatorPublicKey)>,
     signing: HashMap<u64, SigningState>,
-    /// The signature behind every vote and attestation the engine may put in
-    /// a proposal.
-    vote_signatures: HashMap<GoldfishVote, XmssSignature>,
-    attestation_signatures: HashMap<Attestation, XmssSignature>,
+    /// The signature behind every pooled head vote, which a proposal carries.
+    vote_signatures: HashMap<HeadVoteMessage, XmssSignature>,
+    /// `(slot, validator)` of every head vote taken from gossip or cast.
+    seen_votes: HashSet<(u64, u64)>,
+    /// FG attestations a proposal may carry, with their signatures, by round.
+    attestations: BTreeMap<u64, HashMap<FinalityAttestation, XmssSignature>>,
+    /// `(round, validator)` of every FG attestation taken from gossip or
+    /// cast.
+    seen_attestations: HashSet<(u64, u64)>,
     /// Message roots whose signature checked out, with the slot they belong
     /// to, so a vote already verified on gossip is not verified again when a
     /// block carries it.
@@ -271,12 +310,12 @@ impl DecoupledLeanServer {
             if event.propose {
                 self.propose(event.slot);
             }
-            if event.vote {
+            if event.head_vote {
                 self.vote(event.slot);
                 self.warm_keys(event.slot + 1);
             }
-            if let Some(round) = event.attest {
-                self.attest(round);
+            if event.support_cutoff {
+                self.attest(event.slot);
             }
         }
         self.retry_future_blocks();
@@ -296,53 +335,47 @@ impl DecoupledLeanServer {
             .contains(&proposer)
             .then_some((proposer, slot as u32));
         self.keys
-            .prepare_epochs_in_background(goldfish_vote_epoch(slot) as u32, proposal);
+            .prepare_epochs_in_background(head_vote_epoch(slot) as u32, proposal);
     }
 
-    /// `propose_block` at `t_s`, if one of this node's validators proposes.
+    /// The block of slot `slot`, at its start, if one of this node's
+    /// validators proposes: on `get_ac_proposal`'s head, carrying its view of
+    /// the previous slot's head votes and the pooled FG attestations that add
+    /// participation on that head.
     fn propose(&mut self, slot: u64) {
         let proposer = self.proposer_of(slot);
         if !self.ours.contains(&proposer) {
             return;
         }
-        let proposal = self.engine.proposal();
-        let mut votes = Vec::new();
+        let proposal = self.engine.get_ac_proposal();
+        let parent_root = proposal.head.root;
+        let mut head_votes = Vec::new();
         let mut support = Vec::new();
-        for vote in &proposal.votes {
-            let Some(signature) = self.vote_signatures.get(vote) else {
+        for (index, message) in proposal.vote_messages.iter().enumerate() {
+            let Some(signature) = self.vote_signatures.get(message) else {
                 warn!(
                     slot,
-                    validator = vote.validator,
-                    "No signature for a pooled vote"
+                    validator = message.validator_index,
+                    "No signature for a pooled head vote"
                 );
                 continue;
             };
-            votes.push(SignedGoldfishVote {
-                vote: *vote,
+            head_votes.push(SignedHeadVote {
+                message: *message,
                 signature: signature.clone(),
             });
-            support.push(proposal.support_votes.contains(vote));
+            support.push(proposal.support_indices.contains(&index));
         }
-        let attestations: Vec<SignedDecoupledAttestation> = proposal
-            .attestations
-            .iter()
-            .filter_map(|attestation| {
-                let signature = self.attestation_signatures.get(attestation)?;
-                Some(SignedDecoupledAttestation {
-                    attestation: attestation.clone(),
-                    signature: signature.clone(),
-                })
-            })
-            .collect();
+        let attestations = self.proposal_attestations(&parent_root);
         let body = DecoupledBlockBody {
-            votes: SszList::try_from(votes).expect("at most two votes per validator"),
-            support: SszBitlist::try_from(support).expect("one bit per vote"),
-            attestations: SszList::try_from(attestations).expect("bounded by the SG window"),
+            head_votes: SszList::try_from(head_votes).expect("one vote per validator"),
+            head_vote_support: SszBitlist::try_from(support).expect("one bit per vote"),
+            attestations: SszList::try_from(attestations).expect("bounded by the pool"),
         };
         let message = DecoupledBlock {
             slot,
             proposer_index: proposer,
-            parent_root: proposal.parent_root,
+            parent_root,
             body,
         };
         let root = message.hash_tree_root();
@@ -358,8 +391,8 @@ impl DecoupledLeanServer {
             slot,
             proposer,
             block_root = %ShortRoot(&root.0),
-            parent_root = %ShortRoot(&proposal.parent_root.0),
-            votes = block.message.body.votes.len(),
+            parent_root = %ShortRoot(&parent_root.0),
+            head_votes = block.message.body.head_votes.len(),
             attestations = block.message.body.attestations.len(),
             "Proposed decoupled block"
         );
@@ -371,10 +404,45 @@ impl DecoupledLeanServer {
         }
     }
 
-    /// `goldfish_vote` at `t_s + Δ`: every one of this node's validators is
-    /// in the committee.
+    /// The pooled FG attestations `process_attestation` accepts on `head`'s
+    /// chain state and that add participation there.
+    fn proposal_attestations(&self, head: &H256) -> Vec<SignedFinalityAttestation> {
+        let Some(state) = self.states.get(head) else {
+            return Vec::new();
+        };
+        let mut pooled: Vec<(&FinalityAttestation, &XmssSignature)> = self
+            .attestations
+            .values()
+            .flat_map(|round| round.iter())
+            .collect();
+        pooled.sort_by_key(|(attestation, _)| {
+            (
+                attestation.round,
+                attestation.validator_index,
+                attestation.data,
+            )
+        });
+        let candidates: Vec<_> = pooled
+            .iter()
+            .map(|(attestation, _)| (attestation.validator_index, attestation.data))
+            .collect();
+        select_attestations(state, &candidates)
+            .into_iter()
+            .map(|index| {
+                let (attestation, signature) = pooled[index];
+                SignedFinalityAttestation {
+                    message: *attestation,
+                    signature: signature.clone(),
+                }
+            })
+            .collect()
+    }
+
+    /// The head vote of slot `slot`, at its head vote deadline: every one of
+    /// this node's validators sits in the committee.
     fn vote(&mut self, slot: u64) {
-        let head = self.engine.goldfish_vote_head();
+        let head = self.engine.get_ac_vote_head();
+        let data = head_vote_data(&self.engine, slot, head);
         for validator in self.ours.clone() {
             let state = self.signing.entry(validator).or_default();
             if state.last_vote_slot.is_some_and(|last| last >= slot) {
@@ -382,108 +450,185 @@ impl DecoupledLeanServer {
             }
             state.last_vote_slot = Some(slot);
             self.persist_signing(validator);
-            let vote = GoldfishVote {
-                validator,
-                slot,
-                head,
+            let message = HeadVoteMessage {
+                validator_index: validator,
+                data,
             };
-            let epoch = goldfish_vote_epoch(slot) as u32;
-            let signature =
-                match self
-                    .keys
-                    .sign_attestation_message(validator, epoch, &vote.hash_tree_root())
-                {
-                    Ok(signature) => signature,
-                    Err(err) => {
-                        error!(slot, validator, %err, "Failed to sign Goldfish vote");
-                        continue;
-                    }
-                };
-            self.engine.on_goldfish_vote(vote);
-            self.vote_signatures.insert(vote, signature.clone());
-            if let Some(p2p) = &self.p2p {
-                let _ = p2p
-                    .publish_decoupled_vote(SignedGoldfishVote { vote, signature })
-                    .inspect_err(|err| error!(%err, "Failed to publish Goldfish vote"));
-            }
-        }
-        debug!(slot, head = %ShortRoot(&head.0), "Cast Goldfish votes");
-    }
-
-    /// `attest` at `a_r`: every validator, through its own record.
-    fn attest(&mut self, round: u64) {
-        let input = self.engine.attestation_input();
-        let opening = self.config.params.opening_slot(round);
-        for validator in self.ours.clone() {
-            let state = self.signing.entry(validator).or_default();
-            if state.last_round.is_some_and(|last| last >= round) {
-                continue;
-            }
-            let attestation = state.record.create_attestation(validator, &input);
-            state.last_round = Some(round);
-            self.persist_signing(validator);
-            let epoch = attestation_epoch(opening) as u32;
-            let root = attestation.hash_tree_root();
-            let signature = match self.keys.sign_attestation_message(validator, epoch, &root) {
+            let epoch = head_vote_epoch(slot) as u32;
+            let signature = match self.keys.sign_attestation_message(
+                validator,
+                epoch,
+                &message.hash_tree_root(),
+            ) {
                 Ok(signature) => signature,
                 Err(err) => {
-                    error!(round, validator, %err, "Failed to sign combined attestation");
+                    error!(slot, validator, %err, "Failed to sign head vote");
                     continue;
                 }
             };
-            self.engine.on_sg_vote(attestation.clone());
-            self.attestation_signatures
-                .insert(attestation.clone(), signature.clone());
+            self.seen_votes.insert((slot, validator));
+            if let Err(err) = self.engine.on_head_vote_message(message) {
+                warn!(slot, validator, %err, "Own head vote refused");
+                continue;
+            }
+            self.vote_signatures.insert(message, signature.clone());
             if let Some(p2p) = &self.p2p {
                 let _ = p2p
-                    .publish_decoupled_attestation(SignedDecoupledAttestation {
-                        attestation,
-                        signature,
-                    })
-                    .inspect_err(|err| error!(%err, "Failed to publish combined attestation"));
+                    .publish_decoupled_vote(SignedHeadVote { message, signature })
+                    .inspect_err(|err| error!(%err, "Failed to publish head vote"));
             }
         }
-        info!(
-            round,
-            safe = %ShortRoot(&input.safe.0),
-            source_height = input.source.map(|s| s.height),
-            justified_height = input.justified_height,
-            finalized_height = input.finalized_height,
-            "Attested"
+        debug!(
+            slot,
+            head = %ShortRoot(&head.root.0),
+            payload_status = data.payload_status,
+            "Cast head votes"
         );
+    }
+
+    /// The FG attestations of the validators whose attestation slot is
+    /// `slot`, at its support cutoff, after this tick's confirmation: from one
+    /// `get_ac_frame` observation, through each validator's signing record.
+    fn attest(&mut self, slot: u64) {
+        let params = self.config.params;
+        let round = params.round_of(slot);
+        let due: Vec<u64> = self
+            .ours
+            .iter()
+            .copied()
+            .filter(|&v| attestation_slot(round, v, params.slots_per_round) == slot)
+            .filter(|v| {
+                self.signing
+                    .get(v)
+                    .and_then(|state| state.last_attest_round)
+                    .is_none_or(|last| last < round)
+            })
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        let frame = self.engine.get_ac_frame();
+        let Some(input) = self.engine.finality_attestation_input(&frame) else {
+            info!(slot, round, "No FG source: not attesting");
+            return;
+        };
+        for validator in due {
+            let state = self.signing.entry(validator).or_default();
+            state.last_attest_round = Some(round);
+            let data = state.record.attest(&input);
+            // The record and the duty are persisted before signing.
+            self.persist_signing(validator);
+            let Some(data) = data else {
+                debug!(
+                    slot,
+                    validator, "Signing record suppresses the FG attestation"
+                );
+                continue;
+            };
+            let message = FinalityAttestation {
+                validator_index: validator,
+                round,
+                data,
+            };
+            let epoch = attestation_epoch(slot) as u32;
+            let root = message.hash_tree_root();
+            let signature = match self.keys.sign_attestation_message(validator, epoch, &root) {
+                Ok(signature) => signature,
+                Err(err) => {
+                    error!(round, validator, %err, "Failed to sign FG attestation");
+                    continue;
+                }
+            };
+            self.seen_attestations.insert((round, validator));
+            self.pool_attestation(message, signature.clone());
+            if let Some(p2p) = &self.p2p {
+                let _ = p2p
+                    .publish_decoupled_attestation(SignedFinalityAttestation { message, signature })
+                    .inspect_err(|err| error!(%err, "Failed to publish FG attestation"));
+            }
+            info!(
+                slot,
+                round,
+                validator,
+                target_height = data.target.height,
+                target_root = %ShortRoot(&data.target.root.0),
+                timeout = data.timeout,
+                finality_height = data.finality.height,
+                "Attested"
+            );
+        }
     }
 
     // ── Imports ────────────────────────────────────────────────────────────
 
-    fn on_vote(&mut self, signed: SignedGoldfishVote) {
-        let vote = signed.vote;
+    /// A gossip head vote: the first of its validator for its slot, with a
+    /// valid signature.
+    fn on_vote(&mut self, signed: SignedHeadVote) {
+        let message = signed.message;
+        let key = (message.data.slot, message.validator_index);
+        if self.seen_votes.contains(&key) {
+            return;
+        }
         if !self.verify_vote(&signed) {
             debug!(
-                slot = vote.slot,
-                validator = vote.validator,
-                "Invalid Goldfish vote"
+                slot = message.data.slot,
+                validator = message.validator_index,
+                "Invalid head vote"
             );
             return;
         }
-        if self.engine.on_goldfish_vote(vote) {
-            self.vote_signatures.insert(vote, signed.signature);
+        match self.engine.on_head_vote_message(message) {
+            Ok(()) => {
+                self.seen_votes.insert(key);
+                self.vote_signatures.insert(message, signed.signature);
+            }
+            Err(err) => debug!(
+                slot = message.data.slot,
+                validator = message.validator_index,
+                %err,
+                "Head vote refused"
+            ),
         }
     }
 
-    fn on_attestation(&mut self, signed: SignedDecoupledAttestation) {
+    /// A gossip FG attestation: the first of its validator for its round, of
+    /// a round whose attestation slot has started, with a valid signature.
+    fn on_attestation(&mut self, signed: SignedFinalityAttestation) {
+        let message = signed.message;
+        let key = (message.round, message.validator_index);
+        let current = self.engine.current_slot();
+        let slot = attestation_slot(
+            message.round,
+            message.validator_index,
+            self.config.params.slots_per_round,
+        );
+        if self.seen_attestations.contains(&key)
+            || slot > current
+            || message.round + 1 < self.engine.current_round()
+        {
+            return;
+        }
         if !self.verify_attestation(&signed) {
             debug!(
-                round = signed.attestation.data.round,
-                validator = signed.attestation.validator,
-                "Invalid combined attestation"
+                round = message.round,
+                validator = message.validator_index,
+                "Invalid FG attestation"
             );
             return;
         }
-        let attestation = signed.attestation;
-        if self.engine.on_sg_vote(attestation.clone()) {
-            self.attestation_signatures
-                .insert(attestation, signed.signature);
+        self.seen_attestations.insert(key);
+        self.pool_attestation(message, signed.signature);
+    }
+
+    fn pool_attestation(&mut self, attestation: FinalityAttestation, signature: XmssSignature) {
+        let pooled: usize = self.attestations.values().map(HashMap::len).sum();
+        if pooled >= MAX_POOLED_ATTESTATIONS {
+            return;
         }
+        self.attestations
+            .entry(attestation.round)
+            .or_default()
+            .insert(attestation, signature);
     }
 
     fn on_block(&mut self, block: SignedDecoupledBlock) {
@@ -498,7 +643,7 @@ impl DecoupledLeanServer {
             return;
         }
         let parent = block.message.parent_root;
-        if !self.engine.contains(&parent) {
+        if self.states.get(&parent).is_none() {
             self.park(block);
             self.request(parent);
             return;
@@ -507,17 +652,51 @@ impl DecoupledLeanServer {
             warn!(
                 slot = block.message.slot,
                 block_root = %ShortRoot(&root.0),
-                "Dropping decoupled block with an invalid signature"
+                "Dropping decoupled block that fails validation"
             );
             return;
         }
         self.import(block, root);
     }
 
-    /// Hand a checked block to the engine, then everything that was waiting
-    /// on it.
+    /// Derive a checked block's chain state, hand it to the engine, then
+    /// everything that was waiting on it.
     fn import(&mut self, block: SignedDecoupledBlock, root: H256) {
-        let input = block_input(&block, root);
+        let message = &block.message;
+        let at = BlockRef {
+            root,
+            slot: message.slot,
+        };
+        let attestations = message
+            .body
+            .attestations
+            .iter()
+            .map(|signed| (signed.message.validator_index, &signed.message.data));
+        let fg = match self.states.import(
+            &message.parent_root,
+            at,
+            attestations,
+            &self.config.params,
+            &self.electorate,
+        ) {
+            Ok(fg) => fg,
+            Err(ChainStateError::UnknownParent) => {
+                let parent = message.parent_root;
+                self.park(block);
+                self.request(parent);
+                return;
+            }
+            Err(ChainStateError::Attestation(err)) => {
+                warn!(
+                    slot = message.slot,
+                    block_root = %ShortRoot(&root.0),
+                    %err,
+                    "Decoupled block carries an invalid FG attestation"
+                );
+                return;
+            }
+        };
+        let input = block_input(&block, root, fg);
         match self.engine.on_block(&input) {
             Ok(()) => {}
             Err(BlockError::Duplicate) => return,
@@ -540,23 +719,20 @@ impl DecoupledLeanServer {
                 return;
             }
         }
-        for signed in block.message.body.votes.iter() {
-            self.vote_signatures
-                .insert(signed.vote, signed.signature.clone());
-        }
         for signed in block.message.body.attestations.iter() {
-            self.attestation_signatures
-                .insert(signed.attestation.clone(), signed.signature.clone());
+            self.pool_attestation(signed.message, signed.signature.clone());
         }
-        let finalized = self.engine.finalized();
+        let finalized = self.engine.finalized_checkpoint();
         info!(
             slot = block.message.slot,
             proposer = block.message.proposer_index,
             block_root = %ShortRoot(&root.0),
             parent_root = %ShortRoot(&block.message.parent_root.0),
-            votes = block.message.body.votes.len(),
+            head_votes = block.message.body.head_votes.len(),
             attestations = block.message.body.attestations.len(),
-            finalized_slot = finalized.slot,
+            target_height = fg.target.height,
+            justified_height = fg.justified.height,
+            finalized_height = finalized.height,
             "Imported decoupled block"
         );
         self.persist_block(&block, root);
@@ -624,16 +800,22 @@ impl DecoupledLeanServer {
         }
     }
 
-    /// Drop signatures no proposal can use any more, and stale bookkeeping.
+    /// Drop what no duty or check reads any more.
     fn prune(&mut self) {
-        let slot = self.engine.current_slot();
+        let engine = &self.engine;
+        self.states.retain(|root| engine.contains(root));
+        let slot = engine.current_slot();
         let oldest_vote_slot = slot.saturating_sub(1);
         self.vote_signatures
-            .retain(|vote, _| vote.slot >= oldest_vote_slot);
-        let round = self.engine.current_round();
-        let oldest_round = round.saturating_sub(self.config.params.eta_sg);
-        self.attestation_signatures
-            .retain(|attestation, _| attestation.round() >= oldest_round);
+            .retain(|message, _| message.data.slot >= oldest_vote_slot);
+        self.seen_votes
+            .retain(|(vote_slot, _)| *vote_slot >= oldest_vote_slot);
+        // An attestation stays includable while its target is the current
+        // one or its finality pair is pending; two rounds back is plenty.
+        let oldest_round = engine.current_round().saturating_sub(2);
+        self.attestations = self.attestations.split_off(&oldest_round);
+        self.seen_attestations
+            .retain(|(round, _)| *round >= oldest_round);
         let oldest_slot = slot.saturating_sub(4 * self.config.params.slots_per_round);
         self.verified
             .retain(|_, verified_slot| *verified_slot >= oldest_slot);
@@ -668,45 +850,68 @@ impl DecoupledLeanServer {
         valid
     }
 
-    fn verify_vote(&mut self, signed: &SignedGoldfishVote) -> bool {
-        let vote = signed.vote;
+    fn verify_vote(&mut self, signed: &SignedHeadVote) -> bool {
+        let message = signed.message;
         let pubkey = self
             .pubkeys
-            .get(vote.validator as usize)
+            .get(message.validator_index as usize)
             .map(|keys| keys.0.clone());
         self.check(
             pubkey.as_ref(),
-            goldfish_vote_epoch(vote.slot),
-            vote.hash_tree_root(),
-            vote.slot,
+            head_vote_epoch(message.data.slot),
+            message.hash_tree_root(),
+            message.data.slot,
             &signed.signature,
         )
     }
 
-    fn verify_attestation(&mut self, signed: &SignedDecoupledAttestation) -> bool {
-        let attestation = &signed.attestation;
-        let opening = self.config.params.opening_slot(attestation.round());
+    fn verify_attestation(&mut self, signed: &SignedFinalityAttestation) -> bool {
+        let message = signed.message;
+        let slot = attestation_slot(
+            message.round,
+            message.validator_index,
+            self.config.params.slots_per_round,
+        );
         let pubkey = self
             .pubkeys
-            .get(attestation.validator as usize)
+            .get(message.validator_index as usize)
             .map(|keys| keys.0.clone());
         self.check(
             pubkey.as_ref(),
-            attestation_epoch(opening),
-            attestation.hash_tree_root(),
-            opening,
+            attestation_epoch(slot),
+            message.hash_tree_root(),
+            slot,
             &signed.signature,
         )
     }
 
-    /// The proposer schedule, the proposer's signature, and every carried
-    /// vote's and attestation's signature.
+    /// The lean block rules the engine does not check: the proposer schedule
+    /// and signature, head votes of the previous slot with a payload status
+    /// and a valid signature, one support bit each, and FG attestations cast
+    /// before the block's slot with a valid signature.
     fn verify_block(&mut self, block: &SignedDecoupledBlock, root: H256) -> bool {
         let message = &block.message;
         if message.proposer_index != self.proposer_of(message.slot) {
             return false;
         }
-        if message.body.support.len() != message.body.votes.len() {
+        let body = &message.body;
+        if body.head_vote_support.len() != body.head_votes.len() {
+            return false;
+        }
+        let votes_ok = body.head_votes.iter().all(|vote| {
+            vote.message.data.slot + 1 == message.slot
+                && vote.message.data.payload_status().is_some()
+        });
+        let slots_per_round = self.config.params.slots_per_round;
+        let attestations_ok = body.attestations.iter().all(|attestation| {
+            let message_slot = attestation_slot(
+                attestation.message.round,
+                attestation.message.validator_index,
+                slots_per_round,
+            );
+            message_slot < message.slot
+        });
+        if !votes_ok || !attestations_ok {
             return false;
         }
         let pubkey = self
@@ -722,9 +927,8 @@ impl DecoupledLeanServer {
         ) {
             return false;
         }
-        message.body.votes.iter().all(|vote| self.verify_vote(vote))
-            && message
-                .body
+        body.head_votes.iter().all(|vote| self.verify_vote(vote))
+            && body
                 .attestations
                 .iter()
                 .all(|attestation| self.verify_attestation(attestation))
@@ -756,7 +960,7 @@ impl DecoupledLeanServer {
         }
     }
 
-    /// Load the signing records and replay the persisted blocks, oldest slot
+    /// Load the signing states and replay the persisted blocks, oldest slot
     /// first, into a store whose clock is now.
     fn restore(&mut self) {
         let Ok(view) = self.backend.begin_read() else {
@@ -793,7 +997,7 @@ impl DecoupledLeanServer {
         }
         info!(
             replayed = count,
-            finalized_slot = self.engine.finalized().slot,
+            finalized_height = self.engine.finalized_checkpoint().height,
             "Replayed persisted decoupled blocks"
         );
     }
@@ -802,23 +1006,27 @@ impl DecoupledLeanServer {
 
     fn publish_status(&self) {
         let engine = &self.engine;
-        let head_root = engine.head();
-        let (justified, justified_height) = engine.justified();
+        let block_ref = |root: H256| BlockRef {
+            root,
+            slot: engine.block_slot(&root).unwrap_or_default(),
+        };
+        let head = engine.get_head();
+        let finalized = engine.finalized_checkpoint();
+        let justified = engine.justified_checkpoint();
         let status = DecoupledStatus {
             slot: engine.current_slot(),
             round: engine.current_round(),
-            head: engine.block_ref(&head_root).unwrap_or(BlockRef {
-                root: head_root,
-                slot: 0,
-            }),
-            confirmed: engine.confirmed(),
-            stable: engine.stable(),
-            finalized: engine.finalized(),
-            finalized_height: engine.finalized_height(),
+            head: block_ref(head.root),
+            head_payload_status: head.payload_status,
+            confirmed: block_ref(engine.get_confirmed_node().root),
+            latest_confirmed: block_ref(engine.latest_confirmed().root),
+            finalized,
+            finalized_slot: engine.block_slot(&finalized.root).unwrap_or_default(),
             justified,
-            justified_height,
+            justified_slot: engine.block_slot(&justified.root).unwrap_or_default(),
             max_height: engine.max_height(),
-            live_confirmed: engine.live_confirmed(),
+            fg_contest: engine.is_fg_contest(),
+            live_locks: engine.live_locks().len() as u64,
             blocks: engine.blocks().count() as u64,
         };
         *self
@@ -828,29 +1036,34 @@ impl DecoupledLeanServer {
     }
 }
 
-/// The engine's view of a block: votes and support from the body, the
-/// attestations unsigned.
-fn block_input(block: &SignedDecoupledBlock, root: H256) -> BlockInput {
+/// The engine's view of a block: its head votes (one voter each) with their
+/// support bits, on the parent's empty branch, with its chain state's
+/// checkpoints.
+fn block_input(
+    block: &SignedDecoupledBlock,
+    root: H256,
+    fg: ethlambda_decoupled::FgCheckpoints,
+) -> BlockInput {
     let body = &block.message.body;
-    let votes: Vec<GoldfishVote> = body.votes.iter().map(|signed| signed.vote).collect();
-    let support_votes = votes
+    let head_votes = body
+        .head_votes
         .iter()
-        .enumerate()
-        .filter(|(i, _)| body.support.get(*i) == Some(true))
-        .map(|(_, vote)| *vote)
+        .map(|signed| HeadVote {
+            voter_indices: vec![signed.message.validator_index],
+            data: signed.message.data,
+        })
+        .collect();
+    let head_vote_support = (0..body.head_votes.len())
+        .map(|i| vec![body.head_vote_support.get(i) == Some(true)])
         .collect();
     BlockInput {
         root,
         parent_root: block.message.parent_root,
         slot: block.message.slot,
-        proposer: block.message.proposer_index,
-        votes,
-        support_votes,
-        attestations: body
-            .attestations
-            .iter()
-            .map(|signed| signed.attestation.clone())
-            .collect(),
+        parent_payload_status: PayloadStatus::Empty,
+        head_votes,
+        head_vote_support,
+        fg,
     }
 }
 
@@ -875,19 +1088,26 @@ pub fn persisted_block_count(backend: &dyn StorageBackend) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
     use super::*;
 
     #[test]
-    fn the_signing_epochs_never_collide() {
-        let mut epochs = HashSet::new();
-        let params = Params::with_round_length(3);
-        for slot in 0..200 {
-            assert!(epochs.insert(goldfish_vote_epoch(slot)));
-        }
-        for round in 0..60 {
-            assert!(epochs.insert(attestation_epoch(params.opening_slot(round))));
-        }
+    fn a_signing_state_survives_its_json_round_trip() {
+        let mut state = SigningState::default();
+        state.record.targets.insert(3, H256([1; 32]));
+        state.record.timeouts.insert(4);
+        state.record.finality_locks.insert(2, H256([2; 32]));
+        state
+            .record
+            .entries
+            .entry(3)
+            .or_default()
+            .insert(H256([1; 32]));
+        state.last_vote_slot = Some(9);
+        state.last_attest_round = Some(2);
+        let bytes = serde_json::to_vec(&state).unwrap();
+        let back: SigningState = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.record, state.record);
+        assert_eq!(back.last_vote_slot, Some(9));
+        assert_eq!(back.last_attest_round, Some(2));
     }
 }

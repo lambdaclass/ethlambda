@@ -17,7 +17,7 @@ use ethlambda_types::{
     beacon::operation::BeaconOperation,
     beacon::primitives::ValidatorIndex,
     block::SignedBlock,
-    lean_decoupled::{SignedDecoupledAttestation, SignedDecoupledBlock, SignedGoldfishVote},
+    lean_decoupled::{SignedDecoupledBlock, SignedFinalityAttestation, SignedHeadVote},
     primitives::H256,
 };
 use spawned_concurrency::error::ActorError;
@@ -555,10 +555,10 @@ pub type SharedDecoupledBlocks = Arc<RwLock<HashMap<H256, SignedDecoupledBlock>>
 #[protocol]
 pub trait DecoupledToP2P: Send + Sync {
     fn publish_decoupled_block(&self, block: SignedDecoupledBlock) -> Result<(), ActorError>;
-    fn publish_decoupled_vote(&self, vote: SignedGoldfishVote) -> Result<(), ActorError>;
+    fn publish_decoupled_vote(&self, vote: SignedHeadVote) -> Result<(), ActorError>;
     fn publish_decoupled_attestation(
         &self,
-        attestation: SignedDecoupledAttestation,
+        attestation: SignedFinalityAttestation,
     ) -> Result<(), ActorError>;
     /// Ask peers for these blocks by root.
     fn fetch_decoupled_blocks(&self, roots: Vec<H256>) -> Result<(), ActorError>;
@@ -572,10 +572,10 @@ pub trait P2PToDecoupled: Send + Sync {
         block: SignedDecoupledBlock,
         from_sync: bool,
     ) -> Result<(), ActorError>;
-    fn new_decoupled_vote(&self, vote: SignedGoldfishVote) -> Result<(), ActorError>;
+    fn new_decoupled_vote(&self, vote: SignedHeadVote) -> Result<(), ActorError>;
     fn new_decoupled_attestation(
         &self,
-        attestation: SignedDecoupledAttestation,
+        attestation: SignedFinalityAttestation,
     ) -> Result<(), ActorError>;
 }
 

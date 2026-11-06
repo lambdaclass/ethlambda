@@ -18,7 +18,7 @@ use ethlambda_types::{
     beacon::operation::BeaconOperation,
     beacon::primitives::ValidatorIndex,
     block::SignedBlock,
-    lean_decoupled::{SignedDecoupledAttestation, SignedDecoupledBlock, SignedGoldfishVote},
+    lean_decoupled::{SignedDecoupledBlock, SignedFinalityAttestation, SignedHeadVote},
     primitives::HashTreeRoot as _,
     time::unix_now_ms,
 };
@@ -32,8 +32,8 @@ use super::{
     encoding::{compress_message, decompress_message},
     messages::{
         AGGREGATION_TOPIC_KIND, ATTESTATION_SUBNET_TOPIC_PREFIX, BLOCK_TOPIC_KIND,
-        DECOUPLED_ATTESTATION_TOPIC_KIND, DECOUPLED_BLOCK_TOPIC_KIND, DECOUPLED_VOTE_TOPIC_KIND,
-        attestation_subnet_topic, topic_kind,
+        DECOUPLED_BLOCK_TOPIC_KIND, DECOUPLED_FG_ATTESTATION_TOPIC_KIND,
+        DECOUPLED_HEAD_VOTE_TOPIC_KIND, attestation_subnet_topic, topic_kind,
     },
 };
 use crate::beacon::constants::ATTESTATION_SUBNET_COUNT;
@@ -100,8 +100,8 @@ pub async fn handle_gossip_message(
 
     match kind {
         DECOUPLED_BLOCK_TOPIC_KIND => handle_decoupled_block(server, &payload),
-        DECOUPLED_VOTE_TOPIC_KIND => handle_decoupled_vote(server, &payload),
-        DECOUPLED_ATTESTATION_TOPIC_KIND => handle_decoupled_attestation(server, &payload),
+        DECOUPLED_HEAD_VOTE_TOPIC_KIND => handle_decoupled_vote(server, &payload),
+        DECOUPLED_FG_ATTESTATION_TOPIC_KIND => handle_decoupled_attestation(server, &payload),
         BLOCK_TOPIC_KIND => handle_lean_block(server, &payload, compressed_len, wire_at).await,
         AGGREGATION_TOPIC_KIND => handle_lean_aggregation(server, &payload, compressed_len).await,
         kind if kind.starts_with(ATTESTATION_SUBNET_TOPIC_PREFIX) => {
@@ -203,7 +203,7 @@ fn handle_decoupled_block(server: &P2PServer, payload: &[u8]) {
         proposer = block.message.proposer_index,
         block_root = %ShortRoot(&block_root.0),
         parent_root = %ShortRoot(&block.message.parent_root.0),
-        votes = block.message.body.votes.len(),
+        head_votes = block.message.body.head_votes.len(),
         attestations = block.message.body.attestations.len(),
         "Received decoupled block from gossip"
     );
@@ -215,37 +215,39 @@ fn handle_decoupled_block(server: &P2PServer, payload: &[u8]) {
 }
 
 fn handle_decoupled_vote(server: &P2PServer, payload: &[u8]) {
-    let Some(vote) = decode_lean::<SignedGoldfishVote>(payload, "decoupled vote") else {
+    let Some(vote) = decode_lean::<SignedHeadVote>(payload, "head vote") else {
         return;
     };
     trace!(
-        slot = vote.vote.slot,
-        validator = vote.vote.validator,
-        head = %ShortRoot(&vote.vote.head.0),
-        "Received Goldfish vote from gossip"
+        slot = vote.message.data.slot,
+        validator = vote.message.validator_index,
+        head = %ShortRoot(&vote.message.data.block_root.0),
+        payload_status = vote.message.data.payload_status,
+        "Received head vote from gossip"
     );
     if let Some(chain) = decoupled_chain(server) {
         let _ = chain
             .new_decoupled_vote(vote)
-            .inspect_err(|err| error!(%err, "Failed to forward Goldfish vote"));
+            .inspect_err(|err| error!(%err, "Failed to forward head vote"));
     }
 }
 
 fn handle_decoupled_attestation(server: &P2PServer, payload: &[u8]) {
-    let Some(attestation) =
-        decode_lean::<SignedDecoupledAttestation>(payload, "decoupled attestation")
+    let Some(attestation) = decode_lean::<SignedFinalityAttestation>(payload, "FG attestation")
     else {
         return;
     };
     trace!(
-        round = attestation.attestation.data.round,
-        validator = attestation.attestation.validator,
-        "Received combined attestation from gossip"
+        round = attestation.message.round,
+        validator = attestation.message.validator_index,
+        target_height = attestation.message.data.target.height,
+        timeout = attestation.message.data.timeout,
+        "Received FG attestation from gossip"
     );
     if let Some(chain) = decoupled_chain(server) {
         let _ = chain
             .new_decoupled_attestation(attestation)
-            .inspect_err(|err| error!(%err, "Failed to forward combined attestation"));
+            .inspect_err(|err| error!(%err, "Failed to forward FG attestation"));
     }
 }
 
@@ -268,7 +270,7 @@ pub fn publish_decoupled_block(server: &P2PServer, block: SignedDecoupledBlock) 
         proposer = block.message.proposer_index,
         block_root = %ShortRoot(&block_root.0),
         parent_root = %ShortRoot(&block.message.parent_root.0),
-        votes = block.message.body.votes.len(),
+        head_votes = block.message.body.head_votes.len(),
         attestations = block.message.body.attestations.len(),
         "Published decoupled block to gossipsub"
     );
@@ -276,12 +278,12 @@ pub fn publish_decoupled_block(server: &P2PServer, block: SignedDecoupledBlock) 
     publish_decoupled(server, topic, block.to_ssz());
 }
 
-pub fn publish_decoupled_vote(server: &P2PServer, vote: SignedGoldfishVote) {
+pub fn publish_decoupled_vote(server: &P2PServer, vote: SignedHeadVote) {
     let topic = server.wire.decoupled().map(|d| d.vote_topic.clone());
     publish_decoupled(server, topic, vote.to_ssz());
 }
 
-pub fn publish_decoupled_attestation(server: &P2PServer, attestation: SignedDecoupledAttestation) {
+pub fn publish_decoupled_attestation(server: &P2PServer, attestation: SignedFinalityAttestation) {
     let topic = server.wire.decoupled().map(|d| d.attestation_topic.clone());
     publish_decoupled(server, topic, attestation.to_ssz());
 }

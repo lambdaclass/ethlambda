@@ -15,6 +15,7 @@ pub use handler::{
 };
 pub use handler::{publish_decoupled_attestation, publish_decoupled_block, publish_decoupled_vote};
 pub use messages::{
-    DECOUPLED_ATTESTATION_TOPIC_KIND, DECOUPLED_BLOCK_TOPIC_KIND, DECOUPLED_VOTE_TOPIC_KIND,
-    aggregation_topic, attestation_subnet_topic, block_topic, decoupled_topic, topic_kind,
+    DECOUPLED_BLOCK_TOPIC_KIND, DECOUPLED_FG_ATTESTATION_TOPIC_KIND,
+    DECOUPLED_HEAD_VOTE_TOPIC_KIND, aggregation_topic, attestation_subnet_topic, block_topic,
+    decoupled_topic, topic_kind,
 };

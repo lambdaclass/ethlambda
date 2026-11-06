@@ -1084,9 +1084,9 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
             // A decoupled node speaks only the decoupled topics: its blocks and
             // votes are different containers from 3SF-mini's.
             let block_topic = gossipsub::decoupled_topic(gossipsub::DECOUPLED_BLOCK_TOPIC_KIND);
-            let vote_topic = gossipsub::decoupled_topic(gossipsub::DECOUPLED_VOTE_TOPIC_KIND);
+            let vote_topic = gossipsub::decoupled_topic(gossipsub::DECOUPLED_HEAD_VOTE_TOPIC_KIND);
             let attestation_topic =
-                gossipsub::decoupled_topic(gossipsub::DECOUPLED_ATTESTATION_TOPIC_KIND);
+                gossipsub::decoupled_topic(gossipsub::DECOUPLED_FG_ATTESTATION_TOPIC_KIND);
             for topic in [&block_topic, &vote_topic, &attestation_topic] {
                 swarm.behaviour_mut().gossipsub.subscribe(topic)?;
                 info!(topic = %topic, "Subscribed to decoupled topic");

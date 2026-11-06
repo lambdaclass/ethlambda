@@ -441,8 +441,9 @@ pub(crate) struct LeanOptions {
     /// `on_block`.
     #[arg(long, default_value = "3")]
     pub(crate) max_attestations_per_block: usize,
-    /// Run the decoupled consensus protocol (Goldfish + graded stabilization
-    /// gadget + height-based finality gadget) instead of 3SF-mini.
+    /// Run the decoupled consensus protocol (EIP-8453: an available chain
+    /// with Goldilocks locks, and a height-based finality gadget) instead of
+    /// 3SF-mini.
     ///
     /// The same as `DECOUPLED_CONSENSUS: true` in the genesis config, for
     /// tooling that generates that file. Every node of the network must agree:
@@ -450,8 +451,9 @@ pub(crate) struct LeanOptions {
     /// chain.
     #[arg(long = "decoupled", default_value = "false")]
     pub(crate) decoupled: bool,
-    /// Slots per round `R` (at least 3) for the decoupled protocol. Overrides
-    /// `DECOUPLED_SLOTS_PER_ROUND`; the default is 3.
+    /// `SLOTS_PER_ROUND` (at least 1) for the decoupled protocol, which is
+    /// also its timeout delay. Overrides `DECOUPLED_SLOTS_PER_ROUND`; the
+    /// default is EIP-8453's minimal preset, 4.
     #[arg(long = "decoupled.slots-per-round")]
     pub(crate) decoupled_slots_per_round: Option<u64>,
     /// Shadow-simulator sim-cost + fake-XMSS flags (only under the

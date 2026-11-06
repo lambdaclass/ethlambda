@@ -1,8 +1,11 @@
-//! `GET /lean/v0/decoupled/status`: a lean node's decoupled consensus view.
+//! `GET /lean/v0/decoupled/status`: a lean node's decoupled consensus
+//! (EIP-8453) view.
 //!
-//! The head, the three nested tips (finalized ⪯ stable ⪯ confirmed), the
-//! justification and the heights, as the decoupled chain actor last published
-//! them. 404 on a node that does not run the decoupled protocol.
+//! The head, the confirmed node (`get_confirmed_node`) and `latest_confirmed`,
+//! the finalized and justified checkpoints, the maximum height, whether the
+//! finality gadget is in a contest, and the live lock count, as the decoupled
+//! chain actor last published them. 404 on a node that does not run the
+//! decoupled protocol.
 
 use axum::{Extension, Router, http::StatusCode, response::IntoResponse, routing::get};
 use ethlambda_storage::Store;
