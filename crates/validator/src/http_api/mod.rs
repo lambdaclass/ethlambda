@@ -58,6 +58,14 @@ pub struct KeymanagerContext {
     /// it takes this one first and `store` second, consistently, so the two
     /// never deadlock against each other.
     pub definitions_lock: Arc<Mutex<()>>,
+    /// Whether the last save of the definitions file replaced it without
+    /// flushing the directory, so its last change may not survive a power
+    /// loss. Set and cleared by `keystores::save_definitions`; read where a
+    /// retry would otherwise report that change as final.
+    pub definitions_unflushed: Arc<std::sync::atomic::AtomicBool>,
+    /// The record every key must be registered in before it is loaded, so the
+    /// duty path never meets a key it has no record for.
+    pub protection: crate::slashing_protection::SharedProtection,
 }
 
 /// The file the generated token is written to, inside the validators directory.
@@ -155,7 +163,15 @@ pub fn router(context: KeymanagerContext, token: String) -> Router {
         .with_state(context)
         .layer(middleware::from_fn(require_bearer))
         .layer(Extension(ApiToken(token)))
+        // `POST /eth/v1/keystores` carries a whole EIP-3076 interchange, which
+        // in the complete format for a batch of validators runs past axum's
+        // 2 MB default. Nimbus allows 16 MiB and Lodestar 20 MB; Lighthouse
+        // and Prysm set no limit.
+        .layer(axum::extract::DefaultBodyLimit::max(KEYMANAGER_BODY_LIMIT))
 }
+
+/// The largest request body the keymanager API reads.
+const KEYMANAGER_BODY_LIMIT: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 struct ApiToken(String);
