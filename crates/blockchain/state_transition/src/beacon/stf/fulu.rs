@@ -48,6 +48,7 @@ use crate::beacon::helpers::accessors::{
 };
 use crate::beacon::helpers::electra::pending_queue_fields;
 use crate::beacon::helpers::fulu::{fulu_state, fulu_state_ref};
+use crate::beacon::helpers::target_balances::TargetBalanceDelta;
 use crate::beacon::primitives::{Bytes32, HashTreeRoot as _};
 
 use super::ExecutionEngine;
@@ -81,7 +82,14 @@ pub fn process_block(
     process_execution_payload(state, &block.body, config, engine)?;
     super::block::process_randao(state, &block.body.randao_reveal, options.randao)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
-    process_operations(state, &block.body, config, committees, active_balances)?;
+    process_operations(
+        state,
+        &block.body,
+        config,
+        committees,
+        active_balances,
+        options.target_delta,
+    )?;
     super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
     Ok(())
 }
@@ -224,6 +232,7 @@ pub fn process_operations(
     config: &Config,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    target_delta: Option<&TargetBalanceDelta>,
 ) -> Result<()> {
     // [Modified in Fulu]
     verify(body.deposits.is_empty(), "len(body.deposits) == 0")?;
@@ -235,7 +244,13 @@ pub fn process_operations(
         super::electra::process_attester_slashing(state, attester_slashing, config)?;
     }
     for attestation in body.attestations.iter() {
-        super::electra::process_attestation(state, attestation, committees, active_balances)?;
+        super::electra::process_attestation(
+            state,
+            attestation,
+            committees,
+            active_balances,
+            target_delta,
+        )?;
     }
     // [Modified in Fulu]
     // Removed `process_deposit`
