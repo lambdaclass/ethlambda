@@ -52,9 +52,11 @@ use std::collections::{HashMap, VecDeque};
 use ethlambda_engine::EngineError;
 use ethlambda_engine::types::PayloadStatusValue;
 use ethlambda_network_api::FetchRequest;
+use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::fork_choice::{
     self, PayloadStatus, PayloadStatusEnum, PayloadValidity,
 };
+use ethlambda_state_transition::beacon::inclusion_list;
 use ethlambda_state_transition::beacon::stf::ExecutionEngine;
 use ethlambda_state_transition::beacon::stf::gloas as stf_gloas;
 use ethlambda_types::ShortRoot;
@@ -464,15 +466,37 @@ impl BlockChainServer {
             return false;
         }
 
+        // Heze: the payload is also judged against the previous slot's timely
+        // inclusion lists (`record_payload_inclusion_list_satisfaction`).
+        let is_heze = block.fork_name() == ForkName::Heze;
+        let inclusion_list_transactions: Vec<Vec<u8>> = if is_heze {
+            inclusion_list::payload_inclusion_list_transactions(&self.store, root)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|transaction| transaction.to_vec())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // Then the execution client, whose answer has three outcomes where the
         // specification's engine has two (see `docs/spec_deviations.md`).
         // Without a client the follower trusts the payload, as it already does
-        // for every pre-gloas block it imports (`NotRequired`).
-        let status = match self.engine.clone() {
-            None => PayloadStatusEnum::Valid,
+        // for every pre-gloas block it imports (`NotRequired`), and so trusts
+        // it to satisfy the inclusion lists too: only an execution client can
+        // tell. A `NOT_VALIDATED` payload is recorded as satisfying
+        // (`optimistic-sync.md`), until its `VALID` verdict says otherwise.
+        let (status, inclusion_list_satisfied) = match self.engine.clone() {
+            None => (PayloadStatusEnum::Valid, true),
             Some(client) => {
-                let asked =
-                    beacon_engine::ask_envelope_status(&client, &block, &held.envelope).await;
+                let asked = beacon_engine::ask_envelope_status(
+                    &client,
+                    &block,
+                    &held.envelope,
+                    &inclusion_list_transactions,
+                )
+                .await
+                .map(|raw| (raw.status, raw.inclusion_list_satisfied));
                 // The client answered, so the envelopes waiting on it can be
                 // asked about in this same pass.
                 if asked.is_ok() {
@@ -488,7 +512,7 @@ impl BlockChainServer {
                     // `latestValidHash` (ethrex does), whereas a payload that
                     // executed and failed names its last valid ancestor. So a
                     // null one is read the same way.
-                    Ok(raw)
+                    Ok((raw, _))
                         if raw.status == PayloadStatusValue::InvalidBlockHash
                             || (raw.status == PayloadStatusValue::Invalid
                                 && raw.latest_valid_hash.is_none()) =>
@@ -503,11 +527,11 @@ impl BlockChainServer {
                         self.refetch_envelope_if_children_wait(root);
                         return false;
                     }
-                    Ok(raw) => match beacon_engine::verdict(&raw) {
+                    Ok((raw, satisfied)) => match beacon_engine::verdict(&raw) {
                         PayloadValidity::Validated | PayloadValidity::NotRequired => {
-                            PayloadStatusEnum::Valid
+                            (PayloadStatusEnum::Valid, satisfied.unwrap_or(true))
                         }
-                        PayloadValidity::Optimistic => PayloadStatusEnum::Syncing,
+                        PayloadValidity::Optimistic => (PayloadStatusEnum::Syncing, true),
                         PayloadValidity::Invalidated { latest_valid_hash } => {
                             warn!(
                                 %slot,
@@ -553,11 +577,30 @@ impl BlockChainServer {
 
         // `VALID` and `SYNCING` both let the payload in: the consensus layer
         // has verified it, the execution layer may not have finished.
+        if is_heze {
+            if !inclusion_list_satisfied {
+                warn!(
+                    %slot,
+                    block_root = %ShortRoot(&root.0),
+                    inclusion_list_transactions = inclusion_list_transactions.len(),
+                    "Execution payload does not satisfy the inclusion lists; fork choice \
+                     will not extend it"
+                );
+                metrics::inc_payload_inclusion_list_unsatisfied();
+            }
+            fork_choice::record_payload_inclusion_list_satisfaction(
+                &mut self.store,
+                root,
+                inclusion_list_satisfied,
+            );
+        }
         fork_choice::accept_execution_payload_envelope(&mut self.store, &held.envelope);
         info!(
             %slot,
             block_root = %ShortRoot(&root.0),
             ?status,
+            inclusion_list_transactions = inclusion_list_transactions.len(),
+            inclusion_list_satisfied,
             "Execution payload envelope verified"
         );
         self.store
@@ -1204,11 +1247,13 @@ mod tests {
     use ethlambda_network_api::BlockSource;
     use ethlambda_state_transition::beacon::fork::ForkName;
 
-    /// The mainnet preset with every fork active from genesis, as the fork
-    /// choice fixtures that carry no `config.yaml` of their own are run.
+    /// The mainnet preset with every fork through gloas active from genesis,
+    /// as the gloas fork choice fixtures that carry no `config.yaml` of their
+    /// own are run.
     fn fixture_config() -> Config {
         ForkName::ALL
             .into_iter()
+            .take_while(|fork| *fork <= ForkName::Gloas)
             .fold(Config::mainnet(), |config, fork| {
                 config.with_fork_epoch(fork, 0)
             })

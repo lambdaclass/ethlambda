@@ -373,8 +373,8 @@ fn helpers_match_the_reference() {
                 }
             }
 
-            let fast = helpers::get_flag_index_deltas(state, flag);
-            let slow = reference::get_flag_index_deltas(state, flag);
+            let fast = helpers::get_flag_index_deltas(state, flag, &config);
+            let slow = reference::get_flag_index_deltas(state, flag, &config);
             assert_same_outcome(seed, "flag deltas", &fast, &slow);
             if let (Ok(fast), Ok(slow)) = (fast, slow) {
                 assert_eq!(fast, slow, "flag deltas {flag}, seed {seed}");
@@ -487,10 +487,10 @@ fn summary_matches_the_reference() {
 
         // Each component of `RewardContext::deltas` against the reference's
         // vectors, and the balance it applies to against the spec's order.
-        let context = RewardContext::new(state, summary.totals()).unwrap();
+        let context = RewardContext::new(state, summary.totals(), &config).unwrap();
         let (_, _, scores) = state.altair_validator_lists().unwrap();
         let flag_deltas: Vec<_> = (0..flag_count)
-            .map(|flag| reference::get_flag_index_deltas(state, flag).unwrap())
+            .map(|flag| reference::get_flag_index_deltas(state, flag, &config).unwrap())
             .collect();
         let inactivity = reference::get_inactivity_penalty_deltas(state, &config);
         let mut first_expected_error = None;

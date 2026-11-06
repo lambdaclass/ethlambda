@@ -381,6 +381,30 @@ pub mod ssz_hex {
 /// `SszList<Transaction, N>` where `Transaction` is itself a
 /// `SszList<u8, M>`, so the Beacon API's JSON array of `0x`-prefixed
 /// transaction hex strings needs exactly this shape.
+/// [`ssz_hex`] for an optional field that is absent rather than `null` when
+/// unset: pair it with `#[serde(default, skip_serializing_if =
+/// "Option::is_none")]`, which keeps `serialize` from ever seeing `None`.
+pub mod optional_ssz_hex {
+    pub fn serialize<S, T>(value: &Option<T>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+        T: libssz::SszEncode,
+    {
+        match value {
+            Some(value) => super::ssz_hex::serialize(value, serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+        T: libssz::SszDecode,
+    {
+        super::ssz_hex::deserialize(deserializer).map(Some)
+    }
+}
+
 pub mod ssz_hex_seq {
     use libssz::SszEncode as _;
 

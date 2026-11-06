@@ -9,6 +9,7 @@
 //! chooses, so there is no one wire length for a test to assert.
 
 use ethlambda_types::beacon::containers::fulu::{ColumnIndices, DataColumnsByRootIdentifier};
+use ethlambda_types::beacon::containers::heze::InclusionListBits;
 use ethlambda_types::beacon::primitives::{Epoch, ForkDigest, Root, Slot};
 use libssz_derive::{SszDecode, SszEncode};
 use libssz_types::{SszBitvector, SszList};
@@ -220,6 +221,18 @@ pub struct ExecutionPayloadEnvelopesByRangeRequest {
     pub count: u64,
 }
 
+/// `InclusionListsByIndices` v1's request body: the committee positions whose
+/// lists are asked for, under the slot and the dependent root that fix the
+/// committee.
+///
+/// Fixed-size: 8 + 32 + 2 bytes.
+#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode)]
+pub struct InclusionListsByIndicesRequest {
+    pub slot: Slot,
+    pub dependent_root: Root,
+    pub indices: InclusionListBits,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,6 +261,24 @@ mod tests {
         };
         assert_eq!(v1.to_ssz().len(), 84);
         assert_eq!(status_v2().to_ssz().len(), 92);
+    }
+
+    #[test]
+    fn an_inclusion_lists_by_indices_request_has_the_spec_wire_length() {
+        // 8 + 32 + the two bytes of a sixteen-bit bitvector.
+        let mut indices = InclusionListBits::new();
+        indices.set(3, true).unwrap();
+        let request = InclusionListsByIndicesRequest {
+            slot: 161,
+            dependent_root: Root::repeat_byte(7),
+            indices,
+        };
+        let encoded = request.to_ssz();
+        assert_eq!(encoded.len(), 42);
+        assert_eq!(
+            InclusionListsByIndicesRequest::from_ssz_bytes(&encoded).unwrap(),
+            request
+        );
     }
 
     #[test]

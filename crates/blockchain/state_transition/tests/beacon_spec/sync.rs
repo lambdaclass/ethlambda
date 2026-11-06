@@ -256,7 +256,7 @@ fn run_case(case: &Case, config: &Config) -> Result<(), String> {
 /// in this suite runs through [`run_case`] the same way regardless of which
 /// handler it came from.
 pub fn trials() -> Vec<Trial> {
-    let config = Arc::new(Config::active());
+    let config = Arc::new(super::fixture_active_config());
     let cases = collect_all_handlers(PRESET, "sync");
     let mut trials = vec![super::discovery_trial("sync", cases.len())];
 

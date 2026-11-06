@@ -20,10 +20,10 @@
 //! request ([`gloas_new_payload_request`]) needs the block and the envelope.
 
 use ethlambda_engine::types::PayloadStatusValue;
-use ethlambda_engine::{EngineClient, EngineError, PayloadStatusV1};
+use ethlambda_engine::{EngineClient, EngineError, PayloadStatusV1, PayloadStatusV2};
+use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::containers::{self, SignedBeaconBlock};
 use ethlambda_state_transition::beacon::fork_choice::PayloadValidity;
-use ethlambda_state_transition::beacon::primitives::HashTreeRoot as _;
 use ethlambda_state_transition::beacon::primitives::{Bytes32, Root};
 use ethlambda_state_transition::beacon::stf::deneb::kzg_commitment_to_versioned_hash;
 use ethlambda_state_transition::beacon::stf::electra::get_execution_requests_list;
@@ -65,28 +65,26 @@ pub struct GloasNewPayloadRequest<'a> {
 ///
 /// The fork is chosen by an explicit match: a fork before gloas carries its
 /// payload in the block and is asked about with [`new_payload_request`] and
-/// `engine_newPayloadV4`, and no fork after gloas exists yet to need a V6.
+/// `engine_newPayloadV4`. Heze's block is gloas's container, so it is asked
+/// about from the same request, with `engine_newPayloadV6` and the inclusion
+/// list transactions (see [`ask_envelope_status`]).
 pub fn gloas_new_payload_request<'a>(
     block: &SignedBeaconBlock,
     envelope: &'a containers::gloas::SignedExecutionPayloadEnvelope,
 ) -> Result<GloasNewPayloadRequest<'a>, EngineError> {
     let mismatch = |reason: &str| Err(EngineError::EnvelopeMismatch(reason.to_string()));
-    let inner = match block {
-        SignedBeaconBlock::Gloas(inner) => inner,
-        SignedBeaconBlock::Phase0(_)
-        | SignedBeaconBlock::Altair(_)
-        | SignedBeaconBlock::Bellatrix(_)
-        | SignedBeaconBlock::Capella(_)
-        | SignedBeaconBlock::Deneb(_)
-        | SignedBeaconBlock::Electra(_)
-        | SignedBeaconBlock::Fulu(_)
-        | SignedBeaconBlock::Lean(_) => return mismatch("the block is not a gloas block"),
+    let message = match block {
+        SignedBeaconBlock::Lean(_) => return mismatch("the block is not a gloas block"),
+        other => other.gloas_message(),
+    };
+    let Some(message) = message else {
+        return mismatch("the block is not a gloas block");
     };
 
-    if envelope.message.beacon_block_root != inner.message.hash_tree_root() {
+    if envelope.message.beacon_block_root != message.hash_tree_root() {
         return mismatch("the envelope's beacon_block_root is not the block's root");
     }
-    let bid = &inner.message.body.signed_execution_payload_bid.message;
+    let bid = &message.signed_execution_payload_bid().message;
     if bid.block_hash != envelope.message.payload.block_hash {
         return mismatch("the bid's block_hash is not the payload's block_hash");
     }
@@ -132,6 +130,7 @@ pub fn new_payload_request(block: &SignedBeaconBlock) -> Option<NewPayloadReques
         | SignedBeaconBlock::Capella(_)
         | SignedBeaconBlock::Deneb(_)
         | SignedBeaconBlock::Gloas(_)
+        | SignedBeaconBlock::Heze(_)
         | SignedBeaconBlock::Lean(_) => return None,
     };
 
@@ -203,46 +202,54 @@ pub async fn ask(
     Ok(Some(verdict(&status)))
 }
 
-/// Asks the execution client about the payload `envelope` reveals for `block`,
-/// with `engine_newPayloadV5`.
+/// Asks the execution client about the payload `envelope` reveals for `block`:
+/// `engine_newPayloadV5` for a gloas block, `engine_newPayloadV6` with
+/// `inclusion_list_transactions` for a heze one. Answers with the engine's raw
+/// status, for a caller that must tell `INVALID_BLOCK_HASH` (the envelope's
+/// contents do not hash to its claimed block hash, so only that envelope is
+/// bad) from `INVALID` (the payload the hash names is bad), and, for heze,
+/// whether a `VALID` payload satisfied the lists. A gloas answer carries no
+/// such verdict.
 ///
-/// Never `Ok(None)`: unlike [`ask`] there is no "nothing to ask" reading, and a
-/// block/envelope pair that does not match is an
-/// [`EngineError::EnvelopeMismatch`], which the caller must treat as a refusal
-/// to import.
-pub async fn ask_envelope(
-    client: &EngineClient,
-    block: &SignedBeaconBlock,
-    envelope: &containers::gloas::SignedExecutionPayloadEnvelope,
-) -> Result<PayloadValidity, EngineError> {
-    ask_envelope_status(client, block, envelope)
-        .await
-        .map(|status| verdict(&status))
-}
-
-/// [`ask_envelope`] with the engine's raw answer, for a caller that must tell
-/// `INVALID_BLOCK_HASH` (the envelope's contents do not hash to its claimed
-/// block hash, so only that envelope is bad) from `INVALID` (the payload the
-/// hash names is bad).
+/// Never "nothing to ask": a block/envelope pair that does not match is an
+/// [`EngineError::EnvelopeMismatch`], which the caller must treat as a
+/// refusal to import.
 pub async fn ask_envelope_status(
     client: &EngineClient,
     block: &SignedBeaconBlock,
     envelope: &containers::gloas::SignedExecutionPayloadEnvelope,
-) -> Result<PayloadStatusV1, EngineError> {
+    inclusion_list_transactions: &[Vec<u8>],
+) -> Result<PayloadStatusV2, EngineError> {
     let request = gloas_new_payload_request(block, envelope)?;
-    client
+    if block.fork_name() == ForkName::Heze {
+        return client
+            .new_payload_v6(
+                request.execution_payload,
+                &request.versioned_hashes,
+                request.parent_beacon_block_root,
+                &request.execution_requests,
+                inclusion_list_transactions,
+            )
+            .await;
+    }
+    let status = client
         .new_payload_v5(
             request.execution_payload,
             &request.versioned_hashes,
             request.parent_beacon_block_root,
             &request.execution_requests,
         )
-        .await
+        .await?;
+    Ok(PayloadStatusV2 {
+        status,
+        inclusion_list_satisfied: None,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use ethlambda_state_transition::beacon::preset;
+    use ethlambda_state_transition::beacon::primitives::HashTreeRoot as _;
     use ethlambda_state_transition::beacon::primitives::{
         BlsSignature, ExecutionAddress, ExecutionBlockHash, KzgCommitment, Uint256,
     };

@@ -22,7 +22,7 @@ use ethlambda_state_transition::beacon::{
     gloas_block_production::test_support::{
         config as chain_config, parent_state, post_state, randao_reveal,
     },
-    gossip::proposer_preferences::dependent_root_at,
+    gossip::proposer_preferences::{dependent_root_at, proposer_preferences_domain},
     helpers::{
         accessors::get_domain,
         misc::compute_signing_root,
@@ -36,8 +36,8 @@ use ethlambda_storage::Store;
 use ethlambda_types::{
     beacon::{
         constants::{
-            BUILDER_INDEX_SELF_BUILD, DOMAIN_BEACON_BUILDER, DOMAIN_PROPOSER_PREFERENCES,
-            FAR_FUTURE_EPOCH, PAYLOAD_BUILDER_VERSION,
+            BUILDER_INDEX_SELF_BUILD, DOMAIN_BEACON_BUILDER, FAR_FUTURE_EPOCH,
+            PAYLOAD_BUILDER_VERSION,
         },
         containers::{
             BeaconState, SignedBeaconBlock,
@@ -315,6 +315,7 @@ impl World {
             execution_payment: 0,
             blob_kzg_commitments: Default::default(),
             execution_requests_root: ExecutionRequests::default().hash_tree_root(),
+            inclusion_list_bits: None,
         };
         let domain = get_domain(&prepared.state, DOMAIN_BEACON_BUILDER, None);
         let signing_root = compute_signing_root(message.hash_tree_root(), domain);
@@ -345,10 +346,10 @@ impl World {
             fee_recipient,
             target_gas_limit: gas,
         };
-        let domain = get_domain(
-            &self.state,
-            DOMAIN_PROPOSER_PREFERENCES,
-            Some(compute_epoch_at_slot(SLOT)),
+        let domain = proposer_preferences_domain(
+            &chain_config(),
+            self.state.genesis_validators_root(),
+            compute_epoch_at_slot(SLOT),
         );
         let signing_root = compute_signing_root(message.hash_tree_root(), domain);
         SignedProposerPreferences {
@@ -563,7 +564,10 @@ async fn nothing_is_cached_for_a_bid_block_and_a_self_build_envelope_for_it_is_r
     // The block is imported; the proposer's self-build envelope for it names
     // a different builder than the bid, so it is refused.
     let mut store = world.store.clone();
-    let post = post_state(&world.advanced(), &block);
+    let post = post_state(
+        &world.advanced(),
+        &ethlambda_types::beacon::containers::GloasBlock::Gloas(block.clone()),
+    );
     store
         .insert_signed_block(
             root,

@@ -4,6 +4,7 @@ pub(crate) mod encoding;
 mod envelope_client;
 mod envelopes;
 pub mod handlers;
+mod inclusion_lists;
 pub(crate) mod messages;
 
 pub(crate) use behaviour::{ReqResp, ReqRespEvent};

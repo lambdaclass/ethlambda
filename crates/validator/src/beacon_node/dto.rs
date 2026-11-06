@@ -240,6 +240,18 @@ pub struct PtcDutyDto {
     pub slot: Slot,
 }
 
+/// One entry of `POST /eth/v1/validator/duties/inclusion_list/{epoch}`
+/// (heze): the same three fields a PTC duty has, naming the one slot whose
+/// inclusion list committee the validator sits on that epoch.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InclusionListDutyDto {
+    pub pubkey: String,
+    #[serde(with = "quoted_u64")]
+    pub validator_index: ValidatorIndex,
+    #[serde(with = "quoted_u64")]
+    pub slot: Slot,
+}
+
 /// `GET /eth/v1/beacon/blocks/head/root`: the root, and whether the head is
 /// one the execution client has not validated.
 #[derive(Debug, Clone, Deserialize)]
@@ -544,6 +556,22 @@ pub fn config_from_spec_response(value: &serde_json::Value) -> Result<Config> {
         // and the millisecond field is what the clock actually uses.
         config.seconds_per_slot = slot_duration_ms / 1_000;
     }
+    // Heze (EIP-8198) changes the slot duration. A node that predates it does
+    // not send the key, and its chain keeps one duration across the fork, so
+    // absent means "the same as before" rather than this crate's compiled-in
+    // Heze default.
+    config.slot_duration_ms_heze = match spec_u64(value, "SLOT_DURATION_MS_HEZE")? {
+        Some(0) => {
+            return Err(Error::Decode(
+                "config/spec: the Heze slot duration is 0".to_string(),
+            ));
+        }
+        Some(duration_ms) => duration_ms,
+        None => config.slot_duration_ms,
+    };
+    if let Some(window_ms) = spec_u64(value, "MIN_BLOB_DATA_RETENTION_MS")? {
+        config.min_blob_data_retention_ms = window_ms;
+    }
 
     // The duty offsets. Absent means the node has not moved to the
     // basis-point form yet, in which case the mainnet defaults already in
@@ -580,6 +608,7 @@ pub fn config_from_spec_response(value: &serde_json::Value) -> Result<Config> {
             "PAYLOAD_ATTESTATION_DUE_BPS",
             &mut config.payload_attestation_due_bps,
         ),
+        ("INCLUSION_LIST_DUE_BPS", &mut config.inclusion_list_due_bps),
     ] {
         if let Some(bps) = spec_u64(value, key)? {
             *field = bps;
@@ -1038,6 +1067,24 @@ mod tests {
         assert_eq!(config.aggregate_due_bps_gloas, 5_000);
         assert_eq!(config.payload_due_bps, 5_000);
         assert_eq!(config.payload_attestation_due_bps, 7_500);
+    }
+
+    #[test]
+    fn the_heze_schedule_and_inclusion_list_deadline_are_read() {
+        let response = serde_json::json!({
+            "GLOAS_FORK_EPOCH": "0",
+            "HEZE_FORK_EPOCH": "5",
+            "HEZE_FORK_VERSION": "0x90684879",
+            "INCLUSION_LIST_DUE_BPS": "7000",
+        });
+        let config = config_from_spec_response(&response).expect("builds");
+        assert_eq!(config.fork_at_epoch(4), ForkName::Gloas);
+        assert_eq!(config.fork_at_epoch(5), ForkName::Heze);
+        assert_eq!(config.heze_fork_version, [0x90, 0x68, 0x48, 0x79]);
+        assert_eq!(config.inclusion_list_due_bps, 7_000);
+
+        let config = config_from_spec_response(&serde_json::json!({})).expect("builds");
+        assert_eq!(config.inclusion_list_due_bps, 7_500);
     }
 
     /// A node that has not moved to the basis-point form keeps the defaults,

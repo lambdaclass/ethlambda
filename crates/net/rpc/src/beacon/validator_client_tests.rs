@@ -1010,6 +1010,7 @@ fn assert_full_sync_aggregate(
         &mut state,
         aggregate,
         &ethlambda_state_transition::beacon::helpers::accessors::ActiveBalanceCache::default(),
+        &ethlambda_types::beacon::config::Config::mainnet(),
     )
     .expect("the packed aggregate verifies as the state transition checks it");
 }
@@ -1445,7 +1446,12 @@ mod gloas {
                 let published = network.blocks.lock().unwrap().first().cloned();
                 if let Some(SignedBeaconBlock::Gloas(signed)) = published {
                     let root = signed.message.hash_tree_root();
-                    let post = post_state(&parent, &signed.message);
+                    let post = post_state(
+                        &parent,
+                        &ethlambda_types::beacon::containers::GloasBlock::Gloas(
+                            signed.message.clone(),
+                        ),
+                    );
                     store
                         .insert_signed_block(root, SignedBeaconBlock::Gloas(signed))
                         .unwrap();

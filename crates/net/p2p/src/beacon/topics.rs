@@ -70,6 +70,19 @@ pub const GLOAS_TOPIC_KINDS: [&str; 4] = [
     PROPOSER_PREFERENCES,
 ];
 
+/// Topic kind for heze inclusion lists (EIP-7805).
+pub const INCLUSION_LIST: &str = "inclusion_list";
+
+/// The topic kinds heze subscribes to: gloas's, plus the inclusion list
+/// topic, which no earlier digest carries.
+pub const HEZE_TOPIC_KINDS: [&str; 5] = [
+    EXECUTION_PAYLOAD,
+    PAYLOAD_ATTESTATION_MESSAGE,
+    EXECUTION_PAYLOAD_BID,
+    PROPOSER_PREFERENCES,
+    INCLUSION_LIST,
+];
+
 /// Every topic kind this node subscribes to at every fork, in the order they
 /// are subscribed. [`GLOAS_TOPIC_KINDS`] follow from gloas.
 pub const SUBSCRIBED_TOPIC_KINDS: [&str; 7] = [
@@ -104,7 +117,7 @@ pub const SYNC_COMMITTEE_KIND: &str = "sync_committee";
 pub fn metric_kind(kind: &str) -> Option<&'static str> {
     if let Some(&global) = SUBSCRIBED_TOPIC_KINDS
         .iter()
-        .chain(GLOAS_TOPIC_KINDS.iter())
+        .chain(HEZE_TOPIC_KINDS.iter())
         .find(|&&known| known == kind)
     {
         return Some(global);
@@ -297,6 +310,13 @@ impl BeaconTopics {
                 column_subnets,
                 attestation_subnets,
             ),
+            // Heze adds the inclusion list topic to gloas's.
+            ForkName::Heze => Self::with_extra_kinds(
+                fork_digest,
+                &HEZE_TOPIC_KINDS,
+                column_subnets,
+                attestation_subnets,
+            ),
             ForkName::Lean => {
                 unreachable!("a beacon topic's fork is never Lean: it is absent from ForkName::ALL")
             }
@@ -418,6 +438,20 @@ mod tests {
             assert!(!fulu.contains(&name), "fulu holds {name}");
             assert_eq!(metric_kind(kind), Some(kind));
         }
+        let heze = fork_topics(ForkName::Heze);
+        assert_eq!(heze.len(), SUBSCRIBED_TOPIC_KINDS.len() + 5);
+        for kind in HEZE_TOPIC_KINDS {
+            assert!(
+                heze.contains(&topic_name(MAINNET, kind)),
+                "heze lacks {kind}"
+            );
+        }
+        let inclusion_list = topic_name(MAINNET, INCLUSION_LIST);
+        assert!(
+            !gloas.contains(&inclusion_list),
+            "gloas holds {inclusion_list}"
+        );
+        assert_eq!(metric_kind(INCLUSION_LIST), Some(INCLUSION_LIST));
         assert_eq!(
             topic_name(MAINNET, EXECUTION_PAYLOAD),
             "/eth2/8c9f62fe/execution_payload/ssz_snappy"

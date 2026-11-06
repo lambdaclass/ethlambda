@@ -47,7 +47,7 @@ use axum::{
 use ethlambda_blockchain::checkpoint_hash;
 use ethlambda_engine::{
     CustodyColumns, EngineClient, ForkchoiceStateV1,
-    building::{BuiltGloasPayload, PayloadAttributesV3, PayloadAttributesV4},
+    building::{BuiltGloasPayload, PayloadAttributesV3, PayloadAttributesV4, PayloadAttributesV5},
     types::ClientVersionV1,
 };
 use ethlambda_network_api::RpcToP2PRef;
@@ -70,6 +70,7 @@ use ethlambda_state_transition::beacon::{
         accessors::{get_beacon_proposer_index, get_domain},
         misc::compute_signing_root,
     },
+    inclusion_list::{get_inclusion_list_committee, inclusion_list_dependent_root},
     payload_attestation_pool::SharedPayloadAttestationPool,
     stf::{
         block::{BlockProcessingOptions, RandaoVerification},
@@ -83,14 +84,14 @@ use ethlambda_types::{
         config::Config,
         constants,
         containers::{
-            self, BeaconState, DataColumnSidecar,
+            self, BeaconState, DataColumnSidecar, GloasBlock,
             altair::SyncAggregate,
             deneb::Blob,
             gloas::{
-                BeaconBlock, ExecutionPayloadEnvelope, ExecutionRequests,
-                SignedExecutionPayloadBid, SignedExecutionPayloadEnvelope,
-                SignedProposerPreferences,
+                self, ExecutionPayloadEnvelope, ExecutionRequests, SignedExecutionPayloadBid,
+                SignedExecutionPayloadEnvelope, SignedProposerPreferences,
             },
+            heze::{self, InclusionListBits},
         },
         fork::ForkName,
         fork_choice::{ForkChoiceNode, PayloadStatus},
@@ -156,17 +157,27 @@ impl PayloadCache {
     }
 }
 
-/// Gloas's `BlockContents`, the Beacon API's envelope for a self-built block
-/// with its payload: not a consensus container, so it lives with the API.
-#[derive(Debug, Clone, PartialEq, SszEncode, SszDecode, serde::Serialize, serde::Deserialize)]
-pub(crate) struct GloasBlockContents {
-    pub(crate) block: BeaconBlock,
-    pub(crate) execution_payload_envelope: ExecutionPayloadEnvelope,
-    #[serde(with = "ethlambda_types::beacon::serde_helpers::seq")]
-    pub(crate) kzg_proofs: CellKzgProofs,
-    #[serde(with = "ethlambda_types::beacon::serde_helpers::ssz_hex_seq")]
-    pub(crate) blobs: Blobs,
+/// `BlockContents`, the Beacon API's envelope for a self-built block with its
+/// payload: not a consensus container, so it lives with the API. One struct per
+/// fork whose block differs (heze's body drops two fields, EIP-8015).
+macro_rules! block_contents {
+    ($name:ident, $block:ty) => {
+        #[derive(
+            Debug, Clone, PartialEq, SszEncode, SszDecode, serde::Serialize, serde::Deserialize,
+        )]
+        pub(crate) struct $name {
+            pub(crate) block: $block,
+            pub(crate) execution_payload_envelope: ExecutionPayloadEnvelope,
+            #[serde(with = "ethlambda_types::beacon::serde_helpers::seq")]
+            pub(crate) kzg_proofs: CellKzgProofs,
+            #[serde(with = "ethlambda_types::beacon::serde_helpers::ssz_hex_seq")]
+            pub(crate) blobs: Blobs,
+        }
+    };
 }
+
+block_contents!(GloasBlockContents, gloas::BeaconBlock);
+block_contents!(HezeBlockContents, heze::BeaconBlock);
 
 /// Gloas's `SignedExecutionPayloadEnvelopeContents`, what the stateless form of
 /// `publishExecutionPayloadEnvelope` receives.
@@ -239,8 +250,8 @@ async fn post_produce_block(
         )
         .into_response();
     };
-    if consensus_version(&headers).is_some_and(|fork| fork != ForkName::Gloas) {
-        return ApiError::BadRequest("Eth-Consensus-Version must be gloas").into_response();
+    if consensus_version(&headers).is_some_and(|fork| !fork.is_gloas_or_later()) {
+        return ApiError::BadRequest("Eth-Consensus-Version must be gloas or heze").into_response();
     }
     // Ahead of the engine check, like the slot check below: a bad flag is the
     // caller's mistake, a 400 on any node.
@@ -300,14 +311,15 @@ async fn post_produce_block(
     };
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let encoding = Encoding::from_accept(accept);
-    let (mut response, included, payload_value) = match produced {
+    let (mut response, included, payload_value, fork) = match produced {
         Production::Bid { block, bid } => {
             let payload_value = bid_payload_value(&bid);
+            let fork = block.fork_name();
             let response = match encoding {
                 Encoding::Ssz => ssz_response(block.to_ssz()),
-                Encoding::Json => block_json(&payload_value, false, &block),
+                Encoding::Json => block_json(fork, &payload_value, false, &block),
             };
-            (response, false, payload_value)
+            (response, false, payload_value, fork)
         }
         Production::Local(Produced {
             built,
@@ -326,6 +338,7 @@ async fn post_produce_block(
                 },
             );
             let included = query.include_payload;
+            let fork = block.fork_name();
             let response = if included {
                 let (Ok(kzg_proofs), Ok(blobs)) = (
                     CellKzgProofs::try_from(built.blobs_bundle.proofs),
@@ -334,23 +347,37 @@ async fn post_produce_block(
                     return ApiError::Internal("the blobs bundle exceeds the block's bounds")
                         .into_response();
                 };
-                let contents = GloasBlockContents {
-                    block,
-                    execution_payload_envelope: envelope,
-                    kzg_proofs,
-                    blobs,
-                };
-                match encoding {
-                    Encoding::Ssz => ssz_response(contents.to_ssz()),
-                    Encoding::Json => block_json(&payload_value, true, &contents),
+                match block {
+                    GloasBlock::Gloas(block) => contents_response(
+                        encoding,
+                        fork,
+                        &payload_value,
+                        &GloasBlockContents {
+                            block,
+                            execution_payload_envelope: envelope,
+                            kzg_proofs,
+                            blobs,
+                        },
+                    ),
+                    GloasBlock::Heze(block) => contents_response(
+                        encoding,
+                        fork,
+                        &payload_value,
+                        &HezeBlockContents {
+                            block,
+                            execution_payload_envelope: envelope,
+                            kzg_proofs,
+                            blobs,
+                        },
+                    ),
                 }
             } else {
                 match encoding {
                     Encoding::Ssz => ssz_response(block.to_ssz()),
-                    Encoding::Json => block_json(&payload_value, false, &block),
+                    Encoding::Json => block_json(fork, &payload_value, false, &block),
                 }
             };
-            (response, included, payload_value)
+            (response, included, payload_value, fork)
         }
     };
     let response_headers = response.headers_mut();
@@ -364,7 +391,20 @@ async fn post_produce_block(
     // Not computed: nothing here reads it, and the bid comparison compares
     // execution payload values only.
     response_headers.insert("eth-consensus-block-value", HeaderValue::from_static("0"));
-    with_consensus_version(response, ForkName::Gloas)
+    with_consensus_version(response, fork)
+}
+
+/// The response for a block with its payload: the contents container, SSZ or JSON.
+fn contents_response<T: libssz::SszEncode + serde::Serialize>(
+    encoding: Encoding,
+    fork: ForkName,
+    payload_value: &str,
+    contents: &T,
+) -> Response {
+    match encoding {
+        Encoding::Ssz => ssz_response(contents.to_ssz()),
+        Encoding::Json => block_json(fork, payload_value, true, contents),
+    }
 }
 
 /// A bid's total payment in Wei, the unit `Eth-Execution-Payload-Value` is in.
@@ -372,9 +412,14 @@ fn bid_payload_value(bid: &SignedExecutionPayloadBid) -> String {
     (u128::from(bid_total_gwei(&bid.message)) * 1_000_000_000).to_string()
 }
 
-fn block_json<T: serde::Serialize>(payload_value: &str, included: bool, data: &T) -> Response {
+fn block_json<T: serde::Serialize>(
+    fork: ForkName,
+    payload_value: &str,
+    included: bool,
+    data: &T,
+) -> Response {
     crate::json_response(serde_json::json!({
-        "version": ForkName::Gloas.as_str(),
+        "version": fork.as_str(),
         "consensus_block_value": "0",
         "execution_payload_value": payload_value,
         "execution_payload_included": included,
@@ -399,7 +444,7 @@ enum Production {
     /// A block committing to a builder's bid. The builder reveals the payload,
     /// so there is no envelope and nothing to cache.
     Bid {
-        block: BeaconBlock,
+        block: GloasBlock,
         bid: SignedExecutionPayloadBid,
     },
 }
@@ -407,7 +452,7 @@ enum Production {
 /// A self-built block.
 struct Produced {
     built: BuiltGloasPayload,
-    block: BeaconBlock,
+    block: GloasBlock,
     envelope: ExecutionPayloadEnvelope,
     payload_value: String,
 }
@@ -434,6 +479,12 @@ struct Prepared {
     /// What the block's state transition may leave unchecked: the reveal, when
     /// the caller set `skip_randao_verification`.
     options: BlockProcessingOptions,
+    /// Heze: the self-build bid's `inclusion_list_bits`. `None` at a gloas
+    /// slot.
+    inclusion_list_bits: Option<InclusionListBits>,
+    /// Heze: the previous slot's inclusion list transactions, which the built
+    /// payload must satisfy (`PayloadAttributesV5`). `None` at a gloas slot.
+    inclusion_list_transactions: Option<Vec<Vec<u8>>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -584,10 +635,10 @@ async fn produce(
     let GloasProduced { block, envelope } = assembled;
     info!(
         %slot,
-        proposer = block.proposer_index,
-        attestations = block.body.attestations.len(),
-        payload_attestations = block.body.payload_attestations.len(),
-        graffiti = %graffiti::display(&block.body.graffiti),
+        proposer = block.proposer_index(),
+        attestations = block.attestations().len(),
+        payload_attestations = block.payload_attestations().len(),
+        graffiti = %graffiti::display(block.graffiti()),
         blobs = built.blobs_bundle.blobs.len(),
         "Produced gloas block"
     );
@@ -623,9 +674,24 @@ fn candidate_bids(
                     .preferences
                     .as_ref()
                     .is_none_or(|prefs| prefs.message.fee_recipient == bid.fee_recipient)
+                && bid_is_inclusive(prepared, bid)
                 && bid_is_includable(&prepared.state, signed, &prepared.parent_requests)
         })
         .collect()
+}
+
+/// Heze: whether `bid`'s `inclusion_list_bits` cover every list in this node's
+/// own view of the previous slot (`is_inclusion_list_bits_inclusive` with
+/// `only_timely=False`, per heze `validator.md`), the bits the self-build would
+/// claim. A gloas slot has no such rule.
+fn bid_is_inclusive(prepared: &Prepared, bid: &containers::gloas::ExecutionPayloadBid) -> bool {
+    let Some(local) = &prepared.inclusion_list_bits else {
+        return true;
+    };
+    let Some(claimed) = &bid.inclusion_list_bits else {
+        return false;
+    };
+    (0..local.len()).all(|i| !local.get(i).unwrap_or(false) || claimed.get(i).unwrap_or(false))
 }
 
 /// The chain-side half of production: pick the parent payload branch, advance
@@ -664,7 +730,9 @@ fn prepare(
 
     let head_is_gloas = matches!(
         store.get_signed_block(&head_root),
-        Ok(Some(containers::SignedBeaconBlock::Gloas(_)))
+        Ok(Some(
+            containers::SignedBeaconBlock::Gloas(_) | containers::SignedBeaconBlock::Heze(_)
+        ))
     );
     let parent_requests = if build_on_full && head_is_gloas {
         store
@@ -698,6 +766,11 @@ fn prepare(
     if let Some(preferences) = &preferences {
         inputs.target_gas_limit = preferences.message.target_gas_limit;
     }
+    let (inclusion_list_bits, inclusion_list_transactions) =
+        match heze_inclusion_lists(store, &state, head_root, slot) {
+            Some((bits, transactions)) => (Some(bits), Some(transactions)),
+            None => (None, None),
+        };
     Ok(Prepared {
         state,
         inputs,
@@ -707,7 +780,54 @@ fn prepare(
         parent_requests,
         preferences,
         options: BlockProcessingOptions { randao },
+        inclusion_list_bits,
+        inclusion_list_transactions,
     })
+}
+
+/// Heze's two inputs from the inclusion list store for a block at `slot`: the
+/// self-build bid's `inclusion_list_bits` and the transactions the payload is
+/// built to satisfy, both over every valid, non-equivocating list of the
+/// previous slot this node holds (`only_timely=False`, the proposer's whole
+/// view, per heze `validator.md`). `None` at a gloas slot.
+///
+/// Read once, here, so the bid claims exactly the lists whose transactions
+/// the execution client was asked to include.
+fn heze_inclusion_lists(
+    store: &Store,
+    state: &BeaconState,
+    head_root: H256,
+    slot: Slot,
+) -> Option<(InclusionListBits, Vec<Vec<u8>>)> {
+    if state.fork_name() != ForkName::Heze {
+        return None;
+    }
+    let Some(inclusion_list_slot) = slot.checked_sub(1) else {
+        return Some((InclusionListBits::new(), Vec::new()));
+    };
+    let dependent_root = inclusion_list_dependent_root(store, head_root, inclusion_list_slot);
+    let committee =
+        match get_inclusion_list_committee(state, inclusion_list_slot, &*store.committee_cache()) {
+            Ok(committee) => committee,
+            Err(err) => {
+                warn!(%slot, %err, "No inclusion list committee for the previous slot");
+                return Some((InclusionListBits::new(), Vec::new()));
+            }
+        };
+    let lists = store.inclusion_list_store();
+    let bits = lists.bits(&committee, inclusion_list_slot, dependent_root, false);
+    let transactions: Vec<Vec<u8>> = lists
+        .transactions(inclusion_list_slot, dependent_root, false)
+        .into_iter()
+        .map(|transaction| transaction.to_vec())
+        .collect();
+    info!(
+        %slot,
+        inclusion_lists = lists.count(inclusion_list_slot, dependent_root),
+        inclusion_list_transactions = transactions.len(),
+        "Building on the previous slot's inclusion lists"
+    );
+    Some((bits, transactions))
 }
 
 /// A reveal that does not verify would fail the block's own state transition
@@ -826,13 +946,29 @@ async fn build_payload(
         target_gas_limit: inputs.target_gas_limit,
     };
     let custody_columns = CustodyColumns::from_indices(custody.0.iter().copied());
-    let (status, payload_id) = engine
-        .forkchoice_updated_v4_with_attributes(&forkchoice, &attributes, custody_columns)
-        .await
-        .map_err(|err| {
-            warn!(%err, "forkchoiceUpdatedV4 with payload attributes failed");
-            ApiError::ServiceUnavailable("the execution client did not start building")
-        })?;
+    // Heze (Bogota): V5, whose attributes carry the inclusion list
+    // transactions the payload must satisfy.
+    let started = match &prepared.inclusion_list_transactions {
+        Some(inclusion_list_transactions) => {
+            let attributes = PayloadAttributesV5 {
+                v4: attributes,
+                inclusion_list_transactions: inclusion_list_transactions.clone(),
+            };
+            engine
+                .forkchoice_updated_v5_with_attributes(&forkchoice, &attributes, custody_columns)
+                .await
+                .map(|(status, payload_id)| (status.status, payload_id))
+        }
+        None => {
+            engine
+                .forkchoice_updated_v4_with_attributes(&forkchoice, &attributes, custody_columns)
+                .await
+        }
+    };
+    let (status, payload_id) = started.map_err(|err| {
+        warn!(%err, "forkchoiceUpdated with payload attributes failed");
+        ApiError::ServiceUnavailable("the execution client did not start building")
+    })?;
     let Some(payload_id) = payload_id else {
         warn!(status = ?status.status, "The execution client declined to build a payload");
         return Err(ApiError::ServiceUnavailable(
@@ -888,6 +1024,7 @@ fn assemble(
         execution_payload: built.execution_payload.clone(),
         blob_kzg_commitments: commitments.clone(),
         execution_requests: execution_requests.clone(),
+        inclusion_list_bits: prepared.inclusion_list_bits.clone(),
     };
     let operations = attestations.len() + payload_attestations.len();
     let attempt = inputs(attestations, payload_attestations, sync_aggregate);
@@ -916,7 +1053,7 @@ fn assemble_on_bid(
     messages: Vec<containers::gloas::PayloadAttestationMessage>,
     randao_reveal: BlsSignature,
     graffiti: Bytes32,
-) -> Result<BeaconBlock, ApiError> {
+) -> Result<GloasBlock, ApiError> {
     let Prepared {
         state,
         head_root,
@@ -956,6 +1093,7 @@ fn assemble_on_bid(
 /// `GET /eth/v1/validator/execution_payload_envelopes/{slot}/{beacon_block_root}`.
 async fn get_envelope(
     Path((slot, block_root)): Path<(String, String)>,
+    State(store): State<Store>,
     Extension(cache): Extension<PayloadCache>,
     headers: HeaderMap,
 ) -> Response {
@@ -970,14 +1108,16 @@ async fn get_envelope(
             .into_response();
     };
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    // The envelope is the slot's own fork's, gloas or heze.
+    let fork = store.config().fork_at_epoch(compute_epoch_at_slot(slot));
     let response = match Encoding::from_accept(accept) {
         Encoding::Ssz => ssz_response(cached.envelope.to_ssz()),
         Encoding::Json => crate::json_response(serde_json::json!({
-            "version": ForkName::Gloas.as_str(),
+            "version": fork.as_str(),
             "data": cached.envelope,
         })),
     };
-    with_consensus_version(response, ForkName::Gloas)
+    with_consensus_version(response, fork)
 }
 
 fn parse_root(text: &str) -> Option<H256> {
@@ -1036,8 +1176,8 @@ async fn post_envelope_waiting(
     body: &[u8],
     block_wait: Duration,
 ) -> Response {
-    if consensus_version(headers) != Some(ForkName::Gloas) {
-        return ApiError::BadRequest("Eth-Consensus-Version must be gloas").into_response();
+    if !consensus_version(headers).is_some_and(ForkName::is_gloas_or_later) {
+        return ApiError::BadRequest("Eth-Consensus-Version must be gloas or heze").into_response();
     }
     let encoding = match BodyEncoding::from_headers(headers) {
         Ok(encoding) => encoding,
@@ -1091,11 +1231,11 @@ async fn post_envelope_waiting(
         return ApiError::BadRequest("unknown block: the envelope's block is not held")
             .into_response();
     };
-    let containers::SignedBeaconBlock::Gloas(block) = block else {
+    let Some(message) = block.gloas_message() else {
         return ApiError::BadRequest("the envelope's block is not a gloas block").into_response();
     };
-    let block_slot = block.message.slot;
-    let bid = block.message.body.signed_execution_payload_bid.message;
+    let block_slot = message.slot();
+    let bid = message.signed_execution_payload_bid().message.clone();
     if signed.message.builder_index != bid.builder_index
         || signed.message.payload.block_hash != bid.block_hash
     {
@@ -1406,13 +1546,7 @@ mod tests {
         let root = produced.block.hash_tree_root();
         let post = post_state(state, &produced.block);
         store
-            .insert_signed_block(
-                root,
-                containers::SignedBeaconBlock::Gloas(containers::gloas::SignedBeaconBlock {
-                    message: produced.block.clone(),
-                    signature,
-                }),
-            )
+            .insert_signed_block(root, produced.block.clone().into_signed(signature))
             .unwrap();
         store.insert_state(root, post.clone()).unwrap();
         (store, root, post)
@@ -1482,8 +1616,11 @@ mod tests {
         let network = Arc::new(RecordingNetwork::default());
         let p2p: RpcToP2PRef = network.clone();
         let mut forged = signed.clone();
-        forged.signature =
-            sign_envelope(&post, produced.block.proposer_index + 1, &produced.envelope);
+        forged.signature = sign_envelope(
+            &post,
+            produced.block.proposer_index() + 1,
+            &produced.envelope,
+        );
         let (headers, body) =
             json_envelope_request(Some("false"), serde_json::to_vec(&forged).unwrap());
         let response = post_envelope_waiting(
@@ -1531,6 +1668,7 @@ mod tests {
                 execution_payload: payload_for(&inputs),
                 blob_kzg_commitments: Vec::new(),
                 execution_requests: ExecutionRequests::default(),
+                inclusion_list_bits: None,
             },
             &config(),
             ethlambda_state_transition::beacon::stf::block::BlockProcessingOptions::default(),
@@ -1588,6 +1726,8 @@ mod tests {
             parent_requests: requests.clone(),
             preferences: None,
             options: BlockProcessingOptions::default(),
+            inclusion_list_bits: None,
+            inclusion_list_transactions: None,
         };
         assemble(
             &config(),
@@ -1614,14 +1754,14 @@ mod tests {
 
         let good = sync_aggregate_over(&state, parent_root, &[0, 1, 2]);
         let produced = assembled_with(&state, Some(good.clone()));
-        assert_eq!(produced.block.body.sync_aggregate, good);
+        assert_eq!(*produced.block.sync_aggregate(), good);
 
         let wrong = sync_aggregate_over(&state, H256::repeat_byte(1), &[0, 1, 2]);
         let produced = assembled_with(&state, Some(wrong));
-        assert_eq!(produced.block.body.sync_aggregate, empty_sync_aggregate());
+        assert_eq!(*produced.block.sync_aggregate(), empty_sync_aggregate());
 
         let produced = assembled_with(&state, None);
-        assert_eq!(produced.block.body.sync_aggregate, empty_sync_aggregate());
+        assert_eq!(*produced.block.sync_aggregate(), empty_sync_aggregate());
     }
 
     fn signed_envelope(
@@ -1630,7 +1770,7 @@ mod tests {
     ) -> SignedExecutionPayloadEnvelope {
         SignedExecutionPayloadEnvelope {
             message: produced.envelope.clone(),
-            signature: sign_envelope(post, produced.block.proposer_index, &produced.envelope),
+            signature: sign_envelope(post, produced.block.proposer_index(), &produced.envelope),
         }
     }
 
@@ -1735,8 +1875,11 @@ mod tests {
 
         // Signed by someone else.
         let mut forged = signed_envelope(&post, &produced);
-        forged.signature =
-            sign_envelope(&post, produced.block.proposer_index + 1, &produced.envelope);
+        forged.signature = sign_envelope(
+            &post,
+            produced.block.proposer_index() + 1,
+            &produced.envelope,
+        );
         let (headers, body) = envelope_request(Some("false"), forged.to_ssz());
         let response = post_envelope_waiting(&store, &p2p, &cache, &headers, &body, wait).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -1776,9 +1919,9 @@ mod tests {
         let state = state_to_build_on();
         let produced = produced_without_blobs(&state);
         let root = produced.block.hash_tree_root();
-        let slot = produced.block.slot;
+        let slot = produced.block.slot();
         let (store, _anchor) = beacon_store_with_config(state, config());
-        let app = routes().with_state(store);
+        let app = routes().with_state(store.clone());
         // The route layer's own cache cannot be reached from here, so the
         // handler is exercised directly through a router with a seeded one.
         let cache = PayloadCache::default();
@@ -1796,7 +1939,8 @@ mod tests {
                 "/eth/v1/validator/execution_payload_envelopes/{slot}/{beacon_block_root}",
                 get(get_envelope),
             )
-            .layer(Extension(cache));
+            .layer(Extension(cache))
+            .with_state(store);
         let uri = format!(
             "/eth/v1/validator/execution_payload_envelopes/{slot}/0x{}",
             hex::encode(root.0)
@@ -1868,6 +2012,7 @@ mod tests {
                 execution_payload: payload_for(&inputs),
                 blob_kzg_commitments: vec![commitment],
                 execution_requests: ExecutionRequests::default(),
+                inclusion_list_bits: None,
             },
             &config(),
             ethlambda_state_transition::beacon::stf::block::BlockProcessingOptions::default(),
@@ -1952,8 +2097,11 @@ mod tests {
             serde_json::from_slice(&serde_json::to_vec(&contents).unwrap()).unwrap();
         assert_eq!(back, contents);
 
+        let containers::GloasBlock::Gloas(gloas_block) = produced.block.clone() else {
+            unreachable!("built on a gloas state")
+        };
         let block_contents = GloasBlockContents {
-            block: produced.block.clone(),
+            block: gloas_block,
             execution_payload_envelope: produced.envelope.clone(),
             kzg_proofs: CellKzgProofs::try_from(proofs).unwrap(),
             blobs: blobs_list(vec![blob]).unwrap(),
@@ -2035,7 +2183,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let cache = PayloadCache::default();
         cache.insert(
-            produced.block.slot,
+            produced.block.slot(),
             root,
             CachedPayload {
                 envelope: produced.envelope.clone(),

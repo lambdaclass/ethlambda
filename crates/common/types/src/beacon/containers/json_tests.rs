@@ -351,6 +351,7 @@ fn gloas_block() -> gloas::SignedBeaconBlock {
             execution_payment: 9,
             execution_requests_root: [7; 32].into(),
             blob_kzg_commitments: vec![KzgCommitment([6; 48])].try_into().unwrap(),
+            inclusion_list_bits: None,
         },
         signature: signature(3),
     };
@@ -419,6 +420,7 @@ fn bid() -> gloas::SignedExecutionPayloadBid {
             execution_payment: 9,
             execution_requests_root: [7; 32].into(),
             blob_kzg_commitments: vec![KzgCommitment([6; 48])].try_into().unwrap(),
+            inclusion_list_bits: None,
         },
         signature: signature(3),
     }

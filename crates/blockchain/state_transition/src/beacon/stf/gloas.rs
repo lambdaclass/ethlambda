@@ -50,21 +50,22 @@ use libssz::SszEncode as _;
 use crate::beacon::bls;
 use crate::beacon::config::Config;
 use crate::beacon::constants;
-use crate::beacon::containers::shared::{DepositMessage, ProposerSlashing};
-use crate::beacon::containers::{BeaconState, capella, gloas};
+use crate::beacon::containers::altair::SyncAggregate;
+use crate::beacon::containers::shared::{DepositMessage, Eth1Data, ProposerSlashing};
+use crate::beacon::containers::{BeaconState, GloasBlock, capella, gloas, heze};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::helpers::accessors::{
     ActiveBalanceCache, ActiveBalanceCacheExt, CommitteeCache, CommitteeCacheExt,
     get_beacon_proposer_index, get_block_root_at_slot, get_current_epoch, get_domain,
     get_previous_epoch, get_randao_mix,
 };
-use crate::beacon::helpers::altair::{add_flag, base_reward_per_increment, has_flag};
+use crate::beacon::helpers::altair::{add_flag, base_reward_per_increment_at, has_flag};
 use crate::beacon::helpers::electra::{g2_point_at_infinity, get_committee_indices};
 use crate::beacon::helpers::gloas::{
     add_builder_to_registry, can_builder_cover_bid, convert_builder_index_to_validator_index,
     convert_validator_index_to_builder_index, get_attestation_participation_flag_indices,
-    get_indexed_attestation, get_indexed_payload_attestation, gloas_state, gloas_state_ref,
-    initiate_builder_exit, is_active_builder, is_attestation_same_slot, is_builder_index,
+    get_indexed_attestation, get_indexed_payload_attestation, initiate_builder_exit,
+    is_active_builder, is_attestation_same_slot, is_builder_index,
     is_builder_withdrawal_credential, is_valid_indexed_attestation,
     is_valid_indexed_payload_attestation, settle_builder_payment,
 };
@@ -73,15 +74,115 @@ use crate::beacon::helpers::mutators::{decrease_balance, increase_balance, slash
 use crate::beacon::helpers::predicates::is_slashable_attestation_data;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
-    Bytes32, ExecutionAddress, Gwei, HashTreeRoot as _, ParticipationFlags, Root, Slot,
-    ValidatorIndex, WithdrawalIndex,
+    BlsSignature, Bytes32, ExecutionAddress, Gwei, HashTreeRoot as _, ParticipationFlags, Root,
+    Slot, ValidatorIndex, WithdrawalIndex,
 };
 
 use super::ExecutionEngine;
 
+#[cfg(test)]
+use crate::beacon::helpers::gloas::{gloas_state, gloas_state_ref};
+
 // ---------------------------------------------------------------------------
 // Block processing
 // ---------------------------------------------------------------------------
+
+/// The operation lists of a gloas-family block body, borrowed.
+///
+/// Gloas and heze bodies hold the same lists under the same names; heze lacks
+/// `deposits` (EIP-8015), which is `None` here. [`process_operations`] reads
+/// this rather than either body, so one function serves both forks.
+pub struct Operations<'a> {
+    pub proposer_slashings: &'a gloas::ProposerSlashings,
+    pub attester_slashings: &'a gloas::AttesterSlashings,
+    pub attestations: &'a gloas::Attestations,
+    /// `None` at heze, whose body has no deposits.
+    pub deposits: Option<&'a gloas::Deposits>,
+    pub voluntary_exits: &'a gloas::VoluntaryExits,
+    pub bls_to_execution_changes: &'a gloas::BlsToExecutionChanges,
+    pub payload_attestations: &'a gloas::PayloadAttestations,
+}
+
+/// What `process_block` reads of a gloas-family block, borrowed, so gloas's and
+/// heze's blocks go through one implementation.
+///
+/// `eth1_data` is `None` at heze, whose body has none (EIP-8015): that is also
+/// what skips `process_eth1_data`, so the fork's rule lives in the container
+/// rather than in a fork check here.
+pub struct BlockParts<'a> {
+    pub slot: Slot,
+    pub proposer_index: ValidatorIndex,
+    pub parent_root: Root,
+    pub body_root: Root,
+    pub randao_reveal: &'a BlsSignature,
+    pub eth1_data: Option<&'a Eth1Data>,
+    pub signed_execution_payload_bid: &'a gloas::SignedExecutionPayloadBid,
+    pub parent_execution_requests: &'a gloas::ExecutionRequests,
+    pub sync_aggregate: &'a SyncAggregate,
+    pub operations: Operations<'a>,
+}
+
+macro_rules! block_parts_from {
+    ($block:ty, eth1: |$body:ident| $eth1:expr) => {
+        impl<'a> From<&'a $block> for BlockParts<'a> {
+            fn from(block: &'a $block) -> Self {
+                let $body = &block.body;
+                BlockParts {
+                    slot: block.slot,
+                    proposer_index: block.proposer_index,
+                    parent_root: block.parent_root,
+                    body_root: block.body.hash_tree_root(),
+                    randao_reveal: &block.body.randao_reveal,
+                    eth1_data: $eth1,
+                    signed_execution_payload_bid: &block.body.signed_execution_payload_bid,
+                    parent_execution_requests: &block.body.parent_execution_requests,
+                    sync_aggregate: &block.body.sync_aggregate,
+                    operations: (&block.body).into(),
+                }
+            }
+        }
+    };
+}
+
+block_parts_from!(gloas::BeaconBlock, eth1: |body| Some(&body.eth1_data));
+block_parts_from!(heze::BeaconBlock, eth1: |_body| None);
+
+impl<'a> From<&'a GloasBlock> for BlockParts<'a> {
+    fn from(block: &'a GloasBlock) -> Self {
+        match block {
+            GloasBlock::Gloas(block) => block.into(),
+            GloasBlock::Heze(block) => block.into(),
+        }
+    }
+}
+
+impl<'a> From<&'a gloas::BeaconBlockBody> for Operations<'a> {
+    fn from(body: &'a gloas::BeaconBlockBody) -> Self {
+        Operations {
+            proposer_slashings: &body.proposer_slashings,
+            attester_slashings: &body.attester_slashings,
+            attestations: &body.attestations,
+            deposits: Some(&body.deposits),
+            voluntary_exits: &body.voluntary_exits,
+            bls_to_execution_changes: &body.bls_to_execution_changes,
+            payload_attestations: &body.payload_attestations,
+        }
+    }
+}
+
+impl<'a> From<&'a heze::BeaconBlockBody> for Operations<'a> {
+    fn from(body: &'a heze::BeaconBlockBody) -> Self {
+        Operations {
+            proposer_slashings: &body.proposer_slashings,
+            attester_slashings: &body.attester_slashings,
+            attestations: &body.attestations,
+            deposits: None,
+            voluntary_exits: &body.voluntary_exits,
+            bls_to_execution_changes: &body.bls_to_execution_changes,
+            payload_attestations: &body.payload_attestations,
+        }
+    }
+}
 
 /// `process_block` (gloas `beacon-chain.md`).
 ///
@@ -98,43 +199,55 @@ use super::ExecutionEngine;
 /// [`super::block::process_block_header`], two steps after that, overwrites
 /// the header with this block's own. Reading it any later would read this
 /// block's slot instead of its parent's.
-pub fn process_block(
+pub fn process_block<'a, B>(
     state: &mut BeaconState,
-    block: &gloas::BeaconBlock,
+    block: &'a B,
     config: &Config,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
     options: super::block::BlockProcessingOptions,
-) -> Result<()> {
+) -> Result<()>
+where
+    BlockParts<'a>: From<&'a B>,
+{
+    let block = BlockParts::from(block);
     // [New in Gloas:EIP7732]
     let parent_slot = state.latest_block_header().slot;
 
     // [New in Gloas:EIP7732]
-    process_parent_execution_payload(state, block, config)?;
+    process_parent_execution_payload(
+        state,
+        &block.signed_execution_payload_bid.message,
+        block.parent_execution_requests,
+        config,
+    )?;
     super::block::process_block_header(
         state,
         block.slot,
         block.proposer_index,
         block.parent_root,
-        block.body.hash_tree_root(),
+        block.body_root,
     )?;
     // [Modified in Gloas:EIP7732]
     process_withdrawals(state)?;
     // [Modified in Gloas:EIP7732] Removed `process_execution_payload`.
     // [New in Gloas:EIP7732]
-    process_execution_payload_bid(state, &block.body.signed_execution_payload_bid, config)?;
-    super::block::process_randao(state, &block.body.randao_reveal, options.randao)?;
-    super::block::process_eth1_data(state, &block.body.eth1_data)?;
+    process_execution_payload_bid(state, block.signed_execution_payload_bid, config)?;
+    super::block::process_randao(state, block.randao_reveal, options.randao)?;
+    // [Modified in Heze:EIP8015] Removed `process_eth1_data`.
+    if let Some(eth1_data) = block.eth1_data {
+        super::block::process_eth1_data(state, eth1_data)?;
+    }
     // [Modified in Gloas:EIP7732]
     process_operations(
         state,
-        &block.body,
+        block.operations,
         parent_slot,
         config,
         committees,
         active_balances,
     )?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
+    super::altair::process_sync_aggregate(state, block.sync_aggregate, active_balances, config)?;
     Ok(())
 }
 
@@ -172,27 +285,46 @@ pub fn get_builder_withdrawals(
 
     let mut processed_count: u64 = 0;
     let mut withdrawals = Vec::new();
-    let inner = gloas_state_ref(state, "get_builder_withdrawals")?;
-    for withdrawal in inner.builder_pending_withdrawals.iter() {
-        if prior_withdrawals.len() + withdrawals.len() >= withdrawals_limit {
-            break;
+    ethlambda_types::gloas_family!(state, "get_builder_withdrawals", |inner| {
+        for withdrawal in inner.builder_pending_withdrawals.iter() {
+            if prior_withdrawals.len() + withdrawals.len() >= withdrawals_limit {
+                break;
+            }
+
+            withdrawals.push(capella::Withdrawal {
+                index: withdrawal_index,
+                validator_index: convert_builder_index_to_validator_index(withdrawal.builder_index),
+                address: withdrawal.fee_recipient,
+                amount: withdrawal.amount,
+            });
+            withdrawal_index = withdrawal_index
+                .checked_add(1)
+                .ok_or(Error::ArithmeticOverflow(
+                    "get_builder_withdrawals: withdrawal_index + 1",
+                ))?;
+            processed_count += 1;
         }
 
-        withdrawals.push(capella::Withdrawal {
-            index: withdrawal_index,
-            validator_index: convert_builder_index_to_validator_index(withdrawal.builder_index),
-            address: withdrawal.fee_recipient,
-            amount: withdrawal.amount,
-        });
-        withdrawal_index = withdrawal_index
-            .checked_add(1)
-            .ok_or(Error::ArithmeticOverflow(
-                "get_builder_withdrawals: withdrawal_index + 1",
-            ))?;
-        processed_count += 1;
-    }
+        Ok((withdrawals, withdrawal_index, processed_count))
+    })?
+}
 
-    Ok((withdrawals, withdrawal_index, processed_count))
+/// `get_builder_balance_after_withdrawals` (gloas `beacon-chain.md`): the
+/// builder's balance minus what `withdrawals` already take from it. Takes the
+/// builder's balance rather than the state, since the caller already holds
+/// the builder.
+pub fn get_builder_balance_after_withdrawals(
+    builder_balance: Gwei,
+    builder_index: gloas::BuilderIndex,
+    withdrawals: &[capella::Withdrawal],
+) -> Gwei {
+    let validator_index = convert_builder_index_to_validator_index(builder_index);
+    let withdrawn: Gwei = withdrawals
+        .iter()
+        .filter(|withdrawal| withdrawal.validator_index == validator_index)
+        .map(|withdrawal| withdrawal.amount)
+        .fold(0, Gwei::saturating_add);
+    builder_balance.saturating_sub(withdrawn)
 }
 
 /// `get_builders_sweep_withdrawals` (gloas `beacon-chain.md`): the builder
@@ -207,57 +339,71 @@ pub fn get_builders_sweep_withdrawals(
     prior_withdrawals: &[capella::Withdrawal],
 ) -> Result<(Vec<capella::Withdrawal>, WithdrawalIndex, u64)> {
     let epoch = get_current_epoch(state);
-    let inner = gloas_state_ref(state, "get_builders_sweep_withdrawals")?;
-    let builders_len = inner.builders.len() as u64;
-    let builders_limit = builders_len.min(preset::MAX_BUILDERS_PER_WITHDRAWALS_SWEEP);
-    let withdrawals_limit = preset::MAX_WITHDRAWALS_PER_PAYLOAD - 1;
-    verify(
-        prior_withdrawals.len() <= withdrawals_limit,
-        "get_builders_sweep_withdrawals: len(prior_withdrawals) <= withdrawals_limit",
-    )?;
+    ethlambda_types::gloas_family!(state, "get_builders_sweep_withdrawals", |inner| {
+        let builders_len = inner.builders.len() as u64;
+        let builders_limit = builders_len.min(preset::MAX_BUILDERS_PER_WITHDRAWALS_SWEEP);
+        let withdrawals_limit = preset::MAX_WITHDRAWALS_PER_PAYLOAD - 1;
+        verify(
+            prior_withdrawals.len() <= withdrawals_limit,
+            "get_builders_sweep_withdrawals: len(prior_withdrawals) <= withdrawals_limit",
+        )?;
 
-    let mut processed_count: u64 = 0;
-    let mut withdrawals = Vec::new();
-    let mut builder_index = inner.next_withdrawal_builder_index;
-    for _ in 0..builders_limit {
-        if prior_withdrawals.len() + withdrawals.len() >= withdrawals_limit {
-            break;
-        }
+        let mut processed_count: u64 = 0;
+        let mut withdrawals = Vec::new();
+        let mut builder_index = inner.next_withdrawal_builder_index;
+        for _ in 0..builders_limit {
+            // [Modified in Gloas] consensus-specs #5695: the balance test below sees
+            // every withdrawal already selected for the payload, not just this sweep's.
+            let all_withdrawals: Vec<capella::Withdrawal> = prior_withdrawals
+                .iter()
+                .chain(withdrawals.iter())
+                .cloned()
+                .collect();
+            if all_withdrawals.len() >= withdrawals_limit {
+                break;
+            }
 
-        let builder =
-            inner
-                .builders
-                .get(builder_index as usize)
-                .ok_or(Error::IndexOutOfBounds {
-                    index: builder_index as usize,
-                    len: inner.builders.len(),
-                })?;
-        if builder.withdrawable_epoch <= epoch && builder.balance > 0 {
-            withdrawals.push(capella::Withdrawal {
-                index: withdrawal_index,
-                validator_index: convert_builder_index_to_validator_index(builder_index),
-                address: builder.execution_address,
-                amount: builder.balance,
-            });
-            withdrawal_index = withdrawal_index
+            let builder =
+                inner
+                    .builders
+                    .get(builder_index as usize)
+                    .ok_or(Error::IndexOutOfBounds {
+                        index: builder_index as usize,
+                        len: inner.builders.len(),
+                    })?;
+            let balance = get_builder_balance_after_withdrawals(
+                builder.balance,
+                builder_index,
+                &all_withdrawals,
+            );
+            if builder.withdrawable_epoch <= epoch && balance > 0 {
+                withdrawals.push(capella::Withdrawal {
+                    index: withdrawal_index,
+                    validator_index: convert_builder_index_to_validator_index(builder_index),
+                    address: builder.execution_address,
+                    amount: balance,
+                });
+                withdrawal_index =
+                    withdrawal_index
+                        .checked_add(1)
+                        .ok_or(Error::ArithmeticOverflow(
+                            "get_builders_sweep_withdrawals: withdrawal_index + 1",
+                        ))?;
+            }
+
+            // `builders_limit <= builders_len`, and this loop only ever runs when
+            // `builders_limit > 0`, so `builders_len` is never zero here.
+            builder_index = builder_index
                 .checked_add(1)
                 .ok_or(Error::ArithmeticOverflow(
-                    "get_builders_sweep_withdrawals: withdrawal_index + 1",
-                ))?;
+                    "get_builders_sweep_withdrawals: builder_index + 1",
+                ))?
+                % builders_len;
+            processed_count += 1;
         }
 
-        // `builders_limit <= builders_len`, and this loop only ever runs when
-        // `builders_limit > 0`, so `builders_len` is never zero here.
-        builder_index = builder_index
-            .checked_add(1)
-            .ok_or(Error::ArithmeticOverflow(
-                "get_builders_sweep_withdrawals: builder_index + 1",
-            ))?
-            % builders_len;
-        processed_count += 1;
-    }
-
-    Ok((withdrawals, withdrawal_index, processed_count))
+        Ok((withdrawals, withdrawal_index, processed_count))
+    })?
 }
 
 /// `get_expected_withdrawals` (modified, EIP-7732): builder withdrawals, then
@@ -327,17 +473,16 @@ pub fn apply_withdrawals(
         if is_builder_index(withdrawal.validator_index) {
             let builder_index =
                 convert_validator_index_to_builder_index(withdrawal.validator_index);
-            let inner = gloas_state(state, "apply_withdrawals")?;
-            let len = inner.builders.len();
-            let builder =
-                inner
-                    .builders
-                    .get_mut(builder_index as usize)
-                    .ok_or(Error::IndexOutOfBounds {
+            ethlambda_types::gloas_family!(state, "apply_withdrawals", |inner| {
+                let len = inner.builders.len();
+                let builder = inner.builders.get_mut(builder_index as usize).ok_or(
+                    Error::IndexOutOfBounds {
                         index: builder_index as usize,
                         len,
-                    })?;
-            builder.balance = builder.balance.saturating_sub(withdrawal.amount);
+                    },
+                )?;
+                builder.balance = builder.balance.saturating_sub(withdrawal.amount);
+            })?
         } else {
             decrease_balance(state, withdrawal.validator_index, withdrawal.amount)?;
         }
@@ -352,8 +497,7 @@ pub fn update_payload_expected_withdrawals(
     state: &mut BeaconState,
     withdrawals: &[capella::Withdrawal],
 ) -> Result<()> {
-    gloas_state(state, "update_payload_expected_withdrawals")?.payload_expected_withdrawals =
-        gloas::Withdrawals::from(withdrawals.to_vec());
+    *state.payload_expected_withdrawals_mut()? = gloas::Withdrawals::from(withdrawals.to_vec());
     Ok(())
 }
 
@@ -374,11 +518,12 @@ pub fn update_builder_pending_withdrawals(
     if processed_builder_withdrawals_count == 0 {
         return Ok(());
     }
-    let inner = gloas_state(state, "update_builder_pending_withdrawals")?;
-    let mut owned = core::mem::take(&mut inner.builder_pending_withdrawals).into_inner();
-    let remaining = owned.split_off(processed_builder_withdrawals_count as usize);
-    inner.builder_pending_withdrawals = gloas::BuilderPendingWithdrawals::from(remaining);
-    Ok(())
+    ethlambda_types::gloas_family!(state, "update_builder_pending_withdrawals", |inner| {
+        let mut owned = core::mem::take(&mut inner.builder_pending_withdrawals).into_inner();
+        let remaining = owned.split_off(processed_builder_withdrawals_count as usize);
+        inner.builder_pending_withdrawals = gloas::BuilderPendingWithdrawals::from(remaining);
+        Ok(())
+    })?
 }
 
 /// `update_pending_partial_withdrawals` (unmodified since electra, whose
@@ -393,11 +538,12 @@ pub fn update_pending_partial_withdrawals(
     if processed_partial_withdrawals_count == 0 {
         return Ok(());
     }
-    let inner = gloas_state(state, "update_pending_partial_withdrawals")?;
-    let mut owned = core::mem::take(&mut inner.pending_partial_withdrawals).into_inner();
-    let remaining = owned.split_off(processed_partial_withdrawals_count as usize);
-    inner.pending_partial_withdrawals = gloas::PendingPartialWithdrawals::from(remaining);
-    Ok(())
+    ethlambda_types::gloas_family!(state, "update_pending_partial_withdrawals", |inner| {
+        let mut owned = core::mem::take(&mut inner.pending_partial_withdrawals).into_inner();
+        let remaining = owned.split_off(processed_partial_withdrawals_count as usize);
+        inner.pending_partial_withdrawals = gloas::PendingPartialWithdrawals::from(remaining);
+        Ok(())
+    })?
 }
 
 /// `update_next_withdrawal_builder_index` (gloas `beacon-chain.md`): the
@@ -411,18 +557,19 @@ pub fn update_next_withdrawal_builder_index(
     state: &mut BeaconState,
     processed_builders_sweep_count: u64,
 ) -> Result<()> {
-    let inner = gloas_state(state, "update_next_withdrawal_builder_index")?;
-    let builders_len = inner.builders.len() as u64;
-    if builders_len > 0 {
-        let next_index = inner
+    ethlambda_types::gloas_family!(state, "update_next_withdrawal_builder_index", |inner| {
+        let builders_len = inner.builders.len() as u64;
+        if builders_len > 0 {
+            let next_index = inner
             .next_withdrawal_builder_index
             .checked_add(processed_builders_sweep_count)
             .ok_or(Error::ArithmeticOverflow(
                 "update_next_withdrawal_builder_index: next_withdrawal_builder_index + processed_builders_sweep_count",
             ))?;
-        inner.next_withdrawal_builder_index = next_index % builders_len;
-    }
-    Ok(())
+            inner.next_withdrawal_builder_index = next_index % builders_len;
+        }
+        Ok(())
+    })?
 }
 
 /// `update_next_withdrawal_index` (unchanged since capella; ported here
@@ -489,22 +636,23 @@ fn update_next_withdrawal_validator_index(
 /// out yet either (there was none to reveal it), so the field still
 /// correctly names what the *next* revealed payload owes.
 pub fn process_withdrawals(state: &mut BeaconState) -> Result<()> {
-    let inner = gloas_state_ref(state, "process_withdrawals")?;
-    if inner.latest_block_hash != inner.latest_execution_payload_bid.block_hash {
-        return Ok(());
-    }
+    ethlambda_types::gloas_family!(state, "process_withdrawals", |inner| {
+        if inner.latest_block_hash != inner.latest_execution_payload_bid.block_hash {
+            return Ok(());
+        }
 
-    let expected = get_expected_withdrawals(state)?;
-    apply_withdrawals(state, &expected.withdrawals)?;
+        let expected = get_expected_withdrawals(state)?;
+        apply_withdrawals(state, &expected.withdrawals)?;
 
-    update_next_withdrawal_index(state, &expected.withdrawals)?;
-    update_payload_expected_withdrawals(state, &expected.withdrawals)?;
-    update_builder_pending_withdrawals(state, expected.processed_builder_withdrawals_count)?;
-    update_pending_partial_withdrawals(state, expected.processed_partial_withdrawals_count)?;
-    update_next_withdrawal_builder_index(state, expected.processed_builders_sweep_count)?;
-    update_next_withdrawal_validator_index(state, &expected.withdrawals)?;
+        update_next_withdrawal_index(state, &expected.withdrawals)?;
+        update_payload_expected_withdrawals(state, &expected.withdrawals)?;
+        update_builder_pending_withdrawals(state, expected.processed_builder_withdrawals_count)?;
+        update_pending_partial_withdrawals(state, expected.processed_partial_withdrawals_count)?;
+        update_next_withdrawal_builder_index(state, expected.processed_builders_sweep_count)?;
+        update_next_withdrawal_validator_index(state, &expected.withdrawals)?;
 
-    Ok(())
+        Ok(())
+    })?
 }
 
 // ---------------------------------------------------------------------------
@@ -590,15 +738,20 @@ pub fn verify_execution_payload_envelope_signature(
         let validator_index = state.latest_block_header().proposer_index;
         state.validator(validator_index)?.pubkey
     } else {
-        let inner = gloas_state_ref(state, "verify_execution_payload_envelope_signature")?;
-        inner
-            .builders
-            .get(builder_index as usize)
-            .ok_or(Error::IndexOutOfBounds {
-                index: builder_index as usize,
-                len: inner.builders.len(),
-            })?
-            .pubkey
+        ethlambda_types::gloas_family!(
+            state,
+            "verify_execution_payload_envelope_signature",
+            |inner| {
+                inner
+                    .builders
+                    .get(builder_index as usize)
+                    .ok_or(Error::IndexOutOfBounds {
+                        index: builder_index as usize,
+                        len: inner.builders.len(),
+                    })?
+                    .pubkey
+            }
+        )?
     };
 
     let domain = get_domain(state, constants::DOMAIN_BEACON_BUILDER, None);
@@ -669,64 +822,66 @@ pub fn verify_execution_payload_envelope(
     )?;
 
     // Verify consistency with the committed bid.
-    let inner = gloas_state_ref(state, "verify_execution_payload_envelope")?;
-    let bid = &inner.latest_execution_payload_bid;
-    verify(
-        envelope.builder_index == bid.builder_index,
-        "verify_execution_payload_envelope: envelope.builder_index == bid.builder_index",
-    )?;
-    verify(
-        payload.prev_randao == bid.prev_randao,
-        "verify_execution_payload_envelope: payload.prev_randao == bid.prev_randao",
-    )?;
-    verify(
-        payload.gas_limit == bid.gas_limit,
-        "verify_execution_payload_envelope: payload.gas_limit == bid.gas_limit",
-    )?;
-    verify(
-        payload.block_hash == bid.block_hash,
-        "verify_execution_payload_envelope: payload.block_hash == bid.block_hash",
-    )?;
-    verify(
-        envelope.execution_requests.hash_tree_root() == bid.execution_requests_root,
-        "verify_execution_payload_envelope: hash_tree_root(envelope.execution_requests) == bid.execution_requests_root",
-    )?;
+    ethlambda_types::gloas_family!(state, "verify_execution_payload_envelope", |inner| {
+        let bid = &inner.latest_execution_payload_bid;
+        verify(
+            envelope.builder_index == bid.builder_index,
+            "verify_execution_payload_envelope: envelope.builder_index == bid.builder_index",
+        )?;
+        verify(
+            payload.prev_randao == bid.prev_randao,
+            "verify_execution_payload_envelope: payload.prev_randao == bid.prev_randao",
+        )?;
+        verify(
+            payload.gas_limit == bid.gas_limit,
+            "verify_execution_payload_envelope: payload.gas_limit == bid.gas_limit",
+        )?;
+        verify(
+            payload.block_hash == bid.block_hash,
+            "verify_execution_payload_envelope: payload.block_hash == bid.block_hash",
+        )?;
+        verify(
+            envelope.execution_requests.hash_tree_root() == bid.execution_requests_root,
+            "verify_execution_payload_envelope: hash_tree_root(envelope.execution_requests) == bid.execution_requests_root",
+        )?;
 
-    // Verify the execution payload is valid.
-    verify(
-        payload.slot_number == state.slot(),
-        "verify_execution_payload_envelope: payload.slot_number == state.slot",
-    )?;
-    verify(
-        payload.parent_hash == inner.latest_block_hash,
-        "verify_execution_payload_envelope: payload.parent_hash == state.latest_block_hash",
-    )?;
-    verify(
-        payload.timestamp
-            == super::bellatrix::compute_timestamp_at_slot(state, state.slot(), config),
-        "verify_execution_payload_envelope: payload.timestamp == compute_time_at_slot(state, state.slot)",
-    )?;
-    verify(
-        payload.withdrawals.hash_tree_root() == inner.payload_expected_withdrawals.hash_tree_root(),
-        "verify_execution_payload_envelope: hash_tree_root(payload.withdrawals) == hash_tree_root(state.payload_expected_withdrawals)",
-    )?;
+        // Verify the execution payload is valid.
+        verify(
+            payload.slot_number == state.slot(),
+            "verify_execution_payload_envelope: payload.slot_number == state.slot",
+        )?;
+        verify(
+            payload.parent_hash == inner.latest_block_hash,
+            "verify_execution_payload_envelope: payload.parent_hash == state.latest_block_hash",
+        )?;
+        verify(
+            payload.timestamp
+                == super::bellatrix::compute_timestamp_at_slot(state, state.slot(), config),
+            "verify_execution_payload_envelope: payload.timestamp == compute_time_at_slot(state, state.slot)",
+        )?;
+        verify(
+            payload.withdrawals.hash_tree_root()
+                == inner.payload_expected_withdrawals.hash_tree_root(),
+            "verify_execution_payload_envelope: hash_tree_root(payload.withdrawals) == hash_tree_root(state.payload_expected_withdrawals)",
+        )?;
 
-    // Compute versioned hashes.
-    let _versioned_hashes: Vec<Bytes32> = bid
-        .blob_kzg_commitments
-        .iter()
-        .map(super::deneb::kzg_commitment_to_versioned_hash)
-        .collect();
+        // Compute versioned hashes.
+        let _versioned_hashes: Vec<Bytes32> = bid
+            .blob_kzg_commitments
+            .iter()
+            .map(super::deneb::kzg_commitment_to_versioned_hash)
+            .collect();
 
-    verify(
-        engine.execution_valid,
-        "verify_execution_payload_envelope: execution_engine.verify_and_notify_new_payload(\
+        verify(
+            engine.execution_valid,
+            "verify_execution_payload_envelope: execution_engine.verify_and_notify_new_payload(\
          NewPayloadRequest(execution_payload=payload, versioned_hashes=versioned_hashes, \
          parent_beacon_block_root=envelope.parent_beacon_block_root, \
          execution_requests=envelope.execution_requests))",
-    )?;
+        )?;
 
-    Ok(())
+        Ok(())
+    })?
 }
 
 // ---------------------------------------------------------------------------
@@ -746,21 +901,23 @@ pub fn verify_execution_payload_bid_signature(
     signed_bid: &gloas::SignedExecutionPayloadBid,
 ) -> Result<bool> {
     let builder_index = signed_bid.message.builder_index;
-    let inner = gloas_state_ref(state, "verify_execution_payload_bid_signature")?;
-    let builder = inner
-        .builders
-        .get(builder_index as usize)
-        .ok_or(Error::IndexOutOfBounds {
-            index: builder_index as usize,
-            len: inner.builders.len(),
-        })?;
-    let domain = get_domain(state, constants::DOMAIN_BEACON_BUILDER, None);
-    let signing_root = compute_signing_root(signed_bid.message.hash_tree_root(), domain);
-    Ok(bls::verify(
-        &builder.pubkey,
-        signing_root,
-        &signed_bid.signature,
-    ))
+    ethlambda_types::gloas_family!(state, "verify_execution_payload_bid_signature", |inner| {
+        let builder =
+            inner
+                .builders
+                .get(builder_index as usize)
+                .ok_or(Error::IndexOutOfBounds {
+                    index: builder_index as usize,
+                    len: inner.builders.len(),
+                })?;
+        let domain = get_domain(state, constants::DOMAIN_BEACON_BUILDER, None);
+        let signing_root = compute_signing_root(signed_bid.message.hash_tree_root(), domain);
+        Ok(bls::verify(
+            &builder.pubkey,
+            signing_root,
+            &signed_bid.signature,
+        ))
+    })?
 }
 
 /// `process_execution_payload_bid` (gloas `beacon-chain.md`).
@@ -784,23 +941,21 @@ pub fn process_execution_payload_bid(
     } else {
         // Verify that the builder is active.
         verify(
-            is_active_builder(
-                gloas_state_ref(state, "process_execution_payload_bid")?,
-                builder_index,
-            )?,
+            is_active_builder(state, builder_index)?,
             "process_execution_payload_bid: is_active_builder(state, builder_index)",
         )?;
         // Verify that the builder is a payload builder.
         let version = {
-            let inner = gloas_state_ref(state, "process_execution_payload_bid")?;
-            inner
-                .builders
-                .get(builder_index as usize)
-                .ok_or(Error::IndexOutOfBounds {
-                    index: builder_index as usize,
-                    len: inner.builders.len(),
-                })?
-                .version
+            ethlambda_types::gloas_family!(state, "process_execution_payload_bid", |inner| {
+                inner
+                    .builders
+                    .get(builder_index as usize)
+                    .ok_or(Error::IndexOutOfBounds {
+                        index: builder_index as usize,
+                        len: inner.builders.len(),
+                    })?
+                    .version
+            })?
         };
         verify(
             version == constants::PAYLOAD_BUILDER_VERSION,
@@ -808,11 +963,7 @@ pub fn process_execution_payload_bid(
         )?;
         // Verify that the builder has funds to cover the bid.
         verify(
-            can_builder_cover_bid(
-                gloas_state_ref(state, "process_execution_payload_bid")?,
-                builder_index,
-                amount,
-            )?,
+            can_builder_cover_bid(state, builder_index, amount)?,
             "process_execution_payload_bid: can_builder_cover_bid(state, builder_index, amount)",
         )?;
         // Verify that the bid signature is valid.
@@ -840,8 +991,7 @@ pub fn process_execution_payload_bid(
     )?;
     // Verify that the bid is for the right parent block.
     verify(
-        bid.parent_block_hash
-            == gloas_state_ref(state, "process_execution_payload_bid")?.latest_block_hash,
+        bid.parent_block_hash == *state.latest_block_hash()?,
         "process_execution_payload_bid: bid.parent_block_hash == state.latest_block_hash",
     )?;
     // Verify that the bid's block hash differs from its parent block hash.
@@ -875,16 +1025,17 @@ pub fn process_execution_payload_bid(
             .ok_or(Error::ArithmeticOverflow(
                 "process_execution_payload_bid: SLOTS_PER_EPOCH + bid.slot % SLOTS_PER_EPOCH",
             ))? as usize;
-        let inner = gloas_state(state, "process_execution_payload_bid")?;
-        let len = inner.builder_pending_payments.len();
-        if index >= len {
-            return Err(Error::IndexOutOfBounds { index, len });
-        }
-        inner.builder_pending_payments[index] = pending_payment;
+        ethlambda_types::gloas_family!(state, "process_execution_payload_bid", |inner| {
+            let len = inner.builder_pending_payments.len();
+            if index >= len {
+                return Err(Error::IndexOutOfBounds { index, len });
+            }
+            inner.builder_pending_payments[index] = pending_payment;
+        })?
     }
 
     // Cache the signed execution payload bid.
-    gloas_state(state, "process_execution_payload_bid")?.latest_execution_payload_bid = bid;
+    *state.latest_execution_payload_bid_mut()? = bid;
 
     Ok(())
 }
@@ -895,8 +1046,9 @@ pub fn process_execution_payload_bid(
 
 /// `apply_parent_execution_payload` (gloas `beacon-chain.md`).
 ///
-/// Processes the parent's execution-layer-triggered requests, settles (or
-/// directly queues) its builder payment, and marks its payload available.
+/// Settles (or directly queues) the parent's builder payment, processes its
+/// execution-layer-triggered requests, and marks its payload available. The
+/// payment goes first so a builder exit request sees it as pending.
 /// Called by [`process_parent_execution_payload`] during block processing,
 /// and (per the specification's own note) by the validator during block
 /// production before computing withdrawals.
@@ -906,13 +1058,14 @@ pub fn apply_parent_execution_payload(
     config: &Config,
 ) -> Result<()> {
     let (parent_bid, parent_slot, parent_epoch) = {
-        let inner = gloas_state_ref(state, "apply_parent_execution_payload")?;
-        let parent_slot = inner.latest_block_header.slot;
-        (
-            inner.latest_execution_payload_bid.clone(),
-            parent_slot,
-            compute_epoch_at_slot(parent_slot),
-        )
+        ethlambda_types::gloas_family!(state, "apply_parent_execution_payload", |inner| {
+            let parent_slot = inner.latest_block_header.slot;
+            (
+                inner.latest_execution_payload_bid.clone(),
+                parent_slot,
+                compute_epoch_at_slot(parent_slot),
+            )
+        })?
     };
 
     verify(
@@ -931,6 +1084,32 @@ pub fn apply_parent_execution_payload(
         requests.builder_exits.len() as u64 <= preset::MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD,
         "apply_parent_execution_payload: len(requests.builder_exits) <= MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD",
     )?;
+
+    // Settle the builder payment before the requests so that a builder exit
+    // request is rejected while the payment is pending (consensus-specs #5695).
+    let current_epoch = get_current_epoch(state);
+    if parent_epoch == current_epoch {
+        let payment_index = preset::SLOTS_PER_EPOCH
+            .checked_add(parent_slot % preset::SLOTS_PER_EPOCH)
+            .ok_or(Error::ArithmeticOverflow(
+                "apply_parent_execution_payload: SLOTS_PER_EPOCH + parent_slot % SLOTS_PER_EPOCH",
+            ))?;
+        settle_builder_payment(state, payment_index)?;
+    } else if parent_epoch == get_previous_epoch(state) {
+        let payment_index = parent_slot % preset::SLOTS_PER_EPOCH;
+        settle_builder_payment(state, payment_index)?;
+    } else if parent_bid.value > 0 {
+        // Parent is older than the previous epoch, its payment entry has
+        // been evicted from builder_pending_payments. Append the withdrawal
+        // directly.
+        state
+            .builder_pending_withdrawals_mut()?
+            .push(gloas::BuilderPendingWithdrawal {
+                fee_recipient: parent_bid.fee_recipient,
+                amount: parent_bid.value,
+                builder_index: parent_bid.builder_index,
+            });
+    }
 
     // Process execution requests from the parent's payload. The execution
     // requests are processed at state.slot (child's slot), not the parent's
@@ -955,50 +1134,20 @@ pub fn apply_parent_execution_payload(
         process_builder_exit_request(state, builder_exit, config)?;
     }
 
-    // Settle the builder payment.
-    let current_epoch = get_current_epoch(state);
-    if parent_epoch == current_epoch {
-        let payment_index = preset::SLOTS_PER_EPOCH
-            .checked_add(parent_slot % preset::SLOTS_PER_EPOCH)
-            .ok_or(Error::ArithmeticOverflow(
-                "apply_parent_execution_payload: SLOTS_PER_EPOCH + parent_slot % SLOTS_PER_EPOCH",
-            ))?;
-        settle_builder_payment(
-            gloas_state(state, "apply_parent_execution_payload")?,
-            payment_index,
-        )?;
-    } else if parent_epoch == get_previous_epoch(state) {
-        let payment_index = parent_slot % preset::SLOTS_PER_EPOCH;
-        settle_builder_payment(
-            gloas_state(state, "apply_parent_execution_payload")?,
-            payment_index,
-        )?;
-    } else if parent_bid.value > 0 {
-        // Parent is older than the previous epoch, its payment entry has
-        // been evicted from builder_pending_payments. Append the withdrawal
-        // directly.
-        gloas_state(state, "apply_parent_execution_payload")?
-            .builder_pending_withdrawals
-            .push(gloas::BuilderPendingWithdrawal {
-                fee_recipient: parent_bid.fee_recipient,
-                amount: parent_bid.value,
-                builder_index: parent_bid.builder_index,
-            });
-    }
-
     // Update parent payload availability and latest block hash.
     let slot_index = (parent_slot as usize) % preset::SLOTS_PER_HISTORICAL_ROOT;
-    let inner = gloas_state(state, "apply_parent_execution_payload")?;
-    inner
-        .execution_payload_availability
-        .set(slot_index, true)
-        .map_err(|err| Error::IndexOutOfBounds {
-            index: err.index,
-            len: err.len,
-        })?;
-    inner.latest_block_hash = parent_bid.block_hash;
+    ethlambda_types::gloas_family!(state, "apply_parent_execution_payload", |inner| {
+        inner
+            .execution_payload_availability
+            .set(slot_index, true)
+            .map_err(|err| Error::IndexOutOfBounds {
+                index: err.index,
+                len: err.len,
+            })?;
+        inner.latest_block_hash = parent_bid.block_hash;
 
-    Ok(())
+        Ok(())
+    })?
 }
 
 /// `process_parent_execution_payload` (gloas `beacon-chain.md`).
@@ -1008,14 +1157,11 @@ pub fn apply_parent_execution_payload(
 /// `state.latest_execution_payload_bid`).
 pub fn process_parent_execution_payload(
     state: &mut BeaconState,
-    block: &gloas::BeaconBlock,
+    bid: &gloas::ExecutionPayloadBid,
+    requests: &gloas::ExecutionRequests,
     config: &Config,
 ) -> Result<()> {
-    let bid = &block.body.signed_execution_payload_bid.message;
-    let parent_bid = gloas_state_ref(state, "process_parent_execution_payload")?
-        .latest_execution_payload_bid
-        .clone();
-    let requests = &block.body.parent_execution_requests;
+    let parent_bid = state.latest_execution_payload_bid()?.clone();
 
     if bid.parent_block_hash != parent_bid.block_hash {
         // Parent was EMPTY: no execution requests expected.
@@ -1088,38 +1234,36 @@ pub fn process_builder_deposit_request(
         return Ok(());
     }
 
-    let inner = gloas_state(state, "process_builder_deposit_request")?;
-    let existing = inner
-        .builders
+    let existing = state
+        .builders()?
         .iter()
         .position(|builder| builder.pubkey == request.pubkey);
 
     match existing {
         None => {
             if is_valid_builder_deposit_signature(request, config) {
-                let slot = inner.slot;
+                let slot = state.slot();
                 add_builder_to_registry(
-                    inner,
+                    state,
                     request.pubkey,
                     constants::PAYLOAD_BUILDER_VERSION,
                     ExecutionAddress::from_slice(&request.withdrawal_credentials.0[12..]),
                     request.amount,
                     slot,
-                );
+                )?;
             }
         }
         Some(builder_index) => {
-            let epoch = compute_epoch_at_slot(inner.slot);
-            let builder = &mut inner.builders[builder_index];
+            let epoch = compute_epoch_at_slot(state.slot());
+            let builder = &mut state.builders_mut()?[builder_index];
 
             // If exited and swept, reset the withdrawable epoch.
             if builder.withdrawable_epoch != constants::FAR_FUTURE_EPOCH && builder.balance == 0 {
-                builder.withdrawable_epoch =
-                    epoch
-                        .checked_add(config.min_builder_withdrawability_delay)
-                        .ok_or(Error::ArithmeticOverflow(
-                            "process_builder_deposit_request: epoch + MIN_BUILDER_WITHDRAWABILITY_DELAY",
-                        ))?;
+                builder.withdrawable_epoch = epoch
+                    .checked_add(config.min_builder_withdrawability_delay)
+                    .ok_or(Error::ArithmeticOverflow(
+                        "process_builder_deposit_request: epoch + MIN_BUILDER_WITHDRAWABILITY_DELAY",
+                    ))?;
             }
 
             // Increase balance by deposit amount.
@@ -1141,9 +1285,8 @@ pub fn process_builder_exit_request(
     request: &gloas::BuilderExitRequest,
     config: &Config,
 ) -> Result<()> {
-    let inner = gloas_state(state, "process_builder_exit_request")?;
-    let Some(builder_index) = inner
-        .builders
+    let builders = state.builders()?;
+    let Some(builder_index) = builders
         .iter()
         .position(|builder| builder.pubkey == request.pubkey)
     else {
@@ -1151,85 +1294,41 @@ pub fn process_builder_exit_request(
     };
     let builder_index = builder_index as gloas::BuilderIndex;
 
-    if !is_active_builder(inner, builder_index)? {
+    if !is_active_builder(state, builder_index)? {
         return Ok(());
     }
-    if inner.builders[builder_index as usize].execution_address != request.source_address {
+    if state.builders()?[builder_index as usize].execution_address != request.source_address {
         return Ok(());
     }
     if crate::beacon::helpers::gloas::get_pending_balance_to_withdraw_for_builder(
-        inner,
+        state,
         builder_index,
     )? != 0
     {
         return Ok(());
     }
 
-    initiate_builder_exit(inner, builder_index, config)
+    initiate_builder_exit(state, builder_index, config)
 }
 
 // ---------------------------------------------------------------------------
 // Operations
 // ---------------------------------------------------------------------------
 
-/// `process_proposer_slashing` (modified, EIP-7732): the shared
-/// `crate::beacon::stf::operations::verify_proposer_slashing` prologue, plus
-/// clearing the [`gloas::BeaconState::builder_pending_payments`] entry tied
-/// to the slashed proposal, if the slashing lands the slashed validator
-/// itself as the payment's own proposer and the payment is still inside the
-/// live two-epoch window. An unrelated same-slot equivocation (a different
-/// validator's evidence about the same proposal) must not grief an honest
-/// proposer's payment, which is exactly what comparing `payment.proposer_index`
-/// against the slashed proposer's own index, rather than clearing
-/// unconditionally, prevents.
+/// `process_proposer_slashing`: unmodified since consensus-specs #5719, which
+/// moved gloas's builder-payment clearing out of the operation and into
+/// [`slash_validator`], so every slashing path (proposer, attester, and the
+/// epoch's) drops the slashed proposer's pending payments, not only the one
+/// tied to the evidenced proposal. Still its own function, as the state is
+/// matched on gloas's own variant by the dispatcher.
 pub fn process_proposer_slashing(
     state: &mut BeaconState,
     proposer_slashing: &ProposerSlashing,
     config: &Config,
 ) -> Result<()> {
-    let (proposer_index, current_epoch) =
+    let (proposer_index, _current_epoch) =
         crate::beacon::stf::operations::verify_proposer_slashing(state, proposer_slashing)?;
-
-    // [New in Gloas:EIP7732] Remove the `BuilderPendingPayment` corresponding
-    // to this proposal if it is still in the 2-epoch window.
-    let slot = proposer_slashing.signed_header_1.message.slot;
-    let proposal_epoch = compute_epoch_at_slot(slot);
-    if proposal_epoch == current_epoch {
-        let payment_index = preset::SLOTS_PER_EPOCH
-            .checked_add(slot % preset::SLOTS_PER_EPOCH)
-            .ok_or(Error::ArithmeticOverflow(
-                "process_proposer_slashing: SLOTS_PER_EPOCH + slot % SLOTS_PER_EPOCH",
-            ))? as usize;
-        clear_builder_pending_payment_if_owned_by(state, payment_index, proposer_index)?;
-    } else if proposal_epoch == get_previous_epoch(state) {
-        let payment_index = (slot % preset::SLOTS_PER_EPOCH) as usize;
-        clear_builder_pending_payment_if_owned_by(state, payment_index, proposer_index)?;
-    }
-
     slash_validator(state, proposer_index, None, config)?;
-    Ok(())
-}
-
-/// Clears `state.builder_pending_payments[payment_index]` if it is recorded
-/// against `proposer_index`, [`process_proposer_slashing`]'s own helper for
-/// its two (current-epoch, previous-epoch) payment-window branches.
-fn clear_builder_pending_payment_if_owned_by(
-    state: &mut BeaconState,
-    payment_index: usize,
-    proposer_index: ValidatorIndex,
-) -> Result<()> {
-    let inner = gloas_state(state, "process_proposer_slashing")?;
-    let len = inner.builder_pending_payments.len();
-    let payment = inner
-        .builder_pending_payments
-        .get_mut(payment_index)
-        .ok_or(Error::IndexOutOfBounds {
-            index: payment_index,
-            len,
-        })?;
-    if payment.proposer_index == proposer_index {
-        *payment = gloas::BuilderPendingPayment::default();
-    }
     Ok(())
 }
 
@@ -1301,6 +1400,7 @@ pub fn process_attestation(
     state: &mut BeaconState,
     attestation: &gloas::Attestation,
     parent_slot: Slot,
+    config: &Config,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
@@ -1379,16 +1479,17 @@ pub fn process_attestation(
         (data.slot % preset::SLOTS_PER_EPOCH) as usize
     };
     let mut payment = {
-        let inner = gloas_state_ref(state, "process_attestation")?;
-        let len = inner.builder_pending_payments.len();
-        inner
-            .builder_pending_payments
-            .get(payment_index)
-            .cloned()
-            .ok_or(Error::IndexOutOfBounds {
-                index: payment_index,
-                len,
-            })?
+        ethlambda_types::gloas_family!(state, "process_attestation", |inner| {
+            let len = inner.builder_pending_payments.len();
+            inner
+                .builder_pending_payments
+                .get(payment_index)
+                .cloned()
+                .ok_or(Error::IndexOutOfBounds {
+                    index: payment_index,
+                    len,
+                })?
+        })?
     };
 
     let attesting_indices: Vec<ValidatorIndex> = indexed_attestation.attesting_indices.to_vec();
@@ -1412,8 +1513,15 @@ pub fn process_attestation(
     // execution-request paths touch balances, exit epochs and queues only), so
     // the total is fixed for the epoch. The debug cross-check on every cache
     // hit enforces that.
-    let base_reward_per_increment =
-        base_reward_per_increment(active_balances.total_active_balance(state)?);
+    //
+    // [Modified in Heze:EIP8198] priced at the slot duration in effect at the
+    // attestation's target epoch, so the proposer's share matches the
+    // attesters' own rewards for that epoch around a slot duration change.
+    let base_reward_per_increment = base_reward_per_increment_at(
+        active_balances.total_active_balance(state)?,
+        data.target.epoch,
+        config,
+    );
 
     // Read phase: for every attester, decide which flags this attestation
     // newly satisfies, add up the proposer's reward for granting them, and
@@ -1518,16 +1626,17 @@ pub fn process_attestation(
 
     // Update builder payment weight.
     {
-        let inner = gloas_state(state, "process_attestation")?;
-        let len = inner.builder_pending_payments.len();
-        let entry = inner
-            .builder_pending_payments
-            .get_mut(payment_index)
-            .ok_or(Error::IndexOutOfBounds {
-                index: payment_index,
-                len,
-            })?;
-        *entry = payment;
+        ethlambda_types::gloas_family!(state, "process_attestation", |inner| {
+            let len = inner.builder_pending_payments.len();
+            let entry = inner
+                .builder_pending_payments
+                .get_mut(payment_index)
+                .ok_or(Error::IndexOutOfBounds {
+                    index: payment_index,
+                    len,
+                })?;
+            *entry = payment;
+        })?
     }
 
     Ok(())
@@ -1581,16 +1690,18 @@ pub fn process_payload_attestation(
 /// `assert len(body.deposits) == 0` unconditionally, with no `process_deposit`
 /// call at all: like fulu, gloas has no eth1-bridge deposit path left to
 /// drain (`crate::beacon::stf::fulu::process_operations`'s own doc explains why).
-pub fn process_operations(
+pub fn process_operations<'a>(
     state: &mut BeaconState,
-    body: &gloas::BeaconBlockBody,
+    body: impl Into<Operations<'a>>,
     parent_slot: Slot,
     config: &Config,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
+    let body: Operations<'a> = body.into();
+    // [Modified in Heze:EIP8015] Heze's body has no `deposits` to check.
     verify(
-        body.deposits.is_empty(),
+        body.deposits.is_none_or(|deposits| deposits.is_empty()),
         "process_operations: len(body.deposits) == 0",
     )?;
 
@@ -1629,7 +1740,14 @@ pub fn process_operations(
     }
     // [Modified in Gloas:EIP7732]
     for attestation in body.attestations.iter() {
-        process_attestation(state, attestation, parent_slot, committees, active_balances)?;
+        process_attestation(
+            state,
+            attestation,
+            parent_slot,
+            config,
+            committees,
+            active_balances,
+        )?;
     }
     for voluntary_exit in body.voluntary_exits.iter() {
         crate::beacon::stf::electra::process_voluntary_exit(state, voluntary_exit, config)?;
@@ -2025,6 +2143,7 @@ mod tests {
             execution_payment: 0,
             blob_kzg_commitments: Default::default(),
             execution_requests_root: execution_requests.hash_tree_root(),
+            inclusion_list_bits: None,
         };
         tweak_bid(&mut bid);
 

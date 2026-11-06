@@ -122,7 +122,8 @@ pub(super) fn process_unfused_steps(
         | ForkName::Bellatrix
         | ForkName::Capella
         | ForkName::Deneb
-        | ForkName::Gloas) => {
+        | ForkName::Gloas
+        | ForkName::Heze) => {
             return Err(Error::UnsupportedForFork {
                 function: "process_unfused_steps",
                 fork,
@@ -442,7 +443,9 @@ pub(crate) fn drain_pending_deposits(
                 electra_state.eth1_deposit_index,
                 fields.deposit_requests_start_index(),
             )),
-            PendingQueueFields::Fulu(_) | PendingQueueFields::Gloas(_) => None,
+            PendingQueueFields::Fulu(_)
+            | PendingQueueFields::Gloas(_)
+            | PendingQueueFields::Heze(_) => None,
         };
         let available_for_processing = fields
             .deposit_balance_to_consume()
@@ -571,6 +574,15 @@ pub(crate) fn apply_pending_deposit(
 
     match existing_index {
         Some(index) => increase_balance(state, index as ValidatorIndex, deposit.amount),
+        // [Modified in Heze:EIP8365] A new validator with BLS withdrawal
+        // credentials is never created, and the deposit is consumed without a
+        // refund. Checked before the signature, as the specification orders
+        // it, and applied to deposits queued before the fork too.
+        None if forbids_new_bls_validators(state.fork_name())
+            && deposit.withdrawal_credentials.0[0] == constants::BLS_WITHDRAWAL_PREFIX =>
+        {
+            Ok(())
+        }
         None if is_valid_deposit_signature(
             deposit.pubkey,
             deposit.withdrawal_credentials,
@@ -591,6 +603,26 @@ pub(crate) fn apply_pending_deposit(
         // `crate::beacon::stf::operations::apply_deposit` documents for its own,
         // block-processing deposit path.
         None => Ok(()),
+    }
+}
+
+/// Whether `fork` stops creating validators from BLS-credentialed deposits
+/// (EIP-8365, from Heze on).
+///
+/// An explicit match, not an ordering comparison, since the derived order
+/// puts lean after every beacon fork.
+fn forbids_new_bls_validators(fork: ForkName) -> bool {
+    match fork {
+        ForkName::Heze => true,
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb
+        | ForkName::Electra
+        | ForkName::Fulu
+        | ForkName::Gloas
+        | ForkName::Lean => false,
     }
 }
 

@@ -40,6 +40,13 @@ pub enum Error {
     #[error("SSZ decoding failed: {0:?}")]
     SszDecode(libssz::DecodeError),
 
+    /// A value decoded for one fork has another fork's shape: gloas and heze
+    /// share their containers and differ only in the bid's
+    /// `inclusion_list_bits`, so the decoder accepts either and the caller's
+    /// fork is checked after.
+    #[error("expected a {expected} encoding, found a {found} one")]
+    ForkShapeMismatch { expected: ForkName, found: ForkName },
+
     /// A bounded SSZ collection was given more elements than its type permits.
     #[error("SSZ type error: {0:?}")]
     SszType(libssz_types::TypeError),

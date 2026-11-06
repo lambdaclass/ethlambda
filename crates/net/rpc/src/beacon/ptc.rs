@@ -191,7 +191,7 @@ fn ptc_duties(
         ));
     }
 
-    let readable_from_head = matches!(*head_state, BeaconState::Gloas(_))
+    let readable_from_head = matches!(*head_state, BeaconState::Gloas(_) | BeaconState::Heze(_))
         && epoch <= state_epoch + preset::MIN_SEED_LOOKAHEAD;
     let state: Arc<BeaconState> = if readable_from_head {
         head_state
@@ -227,6 +227,15 @@ fn ptc_duties(
 #[derive(Debug, Deserialize)]
 struct PayloadAttestationDataQuery {
     slot: Slot,
+}
+
+/// When an envelope for `slot` must have been seen, as milliseconds since
+/// genesis: the slot's start plus `get_payload_due_ms()` of the slot's own
+/// epoch (EIP-8198), whose duration is not the genesis one past Heze.
+fn payload_due_ms(config: &ethlambda_types::beacon::config::Config, slot: u64) -> u64 {
+    let slot_start_ms = config.time_at_slot_ms(0, slot);
+    let due_in_slot_ms = get_payload_due_ms(compute_epoch_at_slot(slot), config);
+    slot_start_ms.saturating_add(due_in_slot_ms)
 }
 
 /// `GET /eth/v1/validator/payload_attestation_data?slot`.
@@ -285,15 +294,15 @@ async fn get_payload_attestation_data(
 /// The number of blob commitments in a gloas block's bid.
 fn bid_commitment_count(block: &SignedBeaconBlock) -> Option<usize> {
     match block {
-        SignedBeaconBlock::Gloas(inner) => Some(
-            inner
-                .message
-                .body
-                .signed_execution_payload_bid
-                .message
-                .blob_kzg_commitments
-                .len(),
-        ),
+        SignedBeaconBlock::Gloas(_) | SignedBeaconBlock::Heze(_) => {
+            block.gloas_message().map(|message| {
+                message
+                    .signed_execution_payload_bid()
+                    .message
+                    .blob_kzg_commitments
+                    .len()
+            })
+        }
         _ => None,
     }
 }
@@ -340,9 +349,7 @@ fn payload_attestation_data(
         return Ok(None);
     };
 
-    let due_ms = slot
-        .saturating_mul(config.slot_duration_ms)
-        .saturating_add(get_payload_due_ms(&config));
+    let due_ms = payload_due_ms(&config, slot);
     let payload_present = store
         .beacon_envelope_seen_ms(&root)
         .is_some_and(|seen_ms| seen_ms < due_ms);
@@ -462,9 +469,9 @@ fn require_gloas_or_absent(headers: &HeaderMap) -> Result<(), ApiError> {
         return Ok(());
     };
     match value.to_str().ok().and_then(ForkName::parse) {
-        Some(ForkName::Gloas) => Ok(()),
+        Some(ForkName::Gloas | ForkName::Heze) => Ok(()),
         _ => Err(ApiError::BadRequest(
-            "Eth-Consensus-Version must name gloas",
+            "Eth-Consensus-Version must name gloas or heze",
         )),
     }
 }
@@ -873,8 +880,7 @@ mod tests {
     }
 
     fn due_ms(store: &Store, slot: u64) -> u64 {
-        let config = store.config();
-        slot * config.slot_duration_ms + get_payload_due_ms(&config)
+        payload_due_ms(&store.config(), slot)
     }
 
     #[tokio::test]

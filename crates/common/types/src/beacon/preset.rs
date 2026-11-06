@@ -561,6 +561,17 @@ pub mod mainnet {
     /// (`Vector<BuilderPendingPayment, BUILDER_PENDING_PAYMENTS_LENGTH>`):
     /// builder payments owed for the previous and current epoch.
     pub const BUILDER_PENDING_PAYMENTS_LENGTH: usize = 2 * SLOTS_PER_EPOCH as usize;
+
+    // ================================================================
+    // Heze
+    // ================================================================
+
+    // --- Inclusion list committee ---
+
+    /// Members of a slot's inclusion list committee (EIP-7805). Bounds
+    /// `InclusionListCommittee` (`Vector<ValidatorIndex, INCLUSION_LIST_COMMITTEE_SIZE>`)
+    /// and `InclusionListBits` (`Bitvector[INCLUSION_LIST_COMMITTEE_SIZE]`).
+    pub const INCLUSION_LIST_COMMITTEE_SIZE: usize = 16;
 }
 
 /// The minimal preset: the same shape as [`mainnet`], scaled down so spec test
@@ -1069,6 +1080,16 @@ pub mod minimal {
     /// (`Vector<BuilderPendingPayment, BUILDER_PENDING_PAYMENTS_LENGTH>`):
     /// builder payments owed for the previous and current epoch.
     pub const BUILDER_PENDING_PAYMENTS_LENGTH: usize = 2 * SLOTS_PER_EPOCH as usize;
+
+    // ================================================================
+    // Heze
+    // ================================================================
+
+    // --- Inclusion list committee ---
+
+    /// Members of a slot's inclusion list committee. Not customized: equal to
+    /// mainnet's.
+    pub const INCLUSION_LIST_COMMITTEE_SIZE: usize = 16;
 }
 
 #[cfg(not(feature = "preset-minimal"))]
@@ -1195,7 +1216,8 @@ pub mod retuned {
             | ForkName::Deneb
             | ForkName::Electra
             | ForkName::Fulu
-            | ForkName::Gloas => super::PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX,
+            | ForkName::Gloas
+            | ForkName::Heze => super::PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX,
             ForkName::Lean => lean_fork_unreachable("proportional_slashing_multiplier"),
         }
     }
@@ -1217,7 +1239,7 @@ pub mod retuned {
             ForkName::Bellatrix | ForkName::Capella | ForkName::Deneb => {
                 super::MIN_SLASHING_PENALTY_QUOTIENT_BELLATRIX
             }
-            ForkName::Electra | ForkName::Fulu | ForkName::Gloas => {
+            ForkName::Electra | ForkName::Fulu | ForkName::Gloas | ForkName::Heze => {
                 super::MIN_SLASHING_PENALTY_QUOTIENT_ELECTRA
             }
             ForkName::Lean => lean_fork_unreachable("min_slashing_penalty_quotient"),
@@ -1233,7 +1255,7 @@ pub mod retuned {
     /// small one.
     pub fn whistleblower_reward_quotient(fork: ForkName) -> u64 {
         match fork {
-            ForkName::Electra | ForkName::Fulu | ForkName::Gloas => {
+            ForkName::Electra | ForkName::Fulu | ForkName::Gloas | ForkName::Heze => {
                 super::WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA
             }
             ForkName::Phase0
@@ -1261,7 +1283,8 @@ pub mod retuned {
             | ForkName::Deneb
             | ForkName::Electra
             | ForkName::Fulu
-            | ForkName::Gloas => super::INACTIVITY_PENALTY_QUOTIENT_BELLATRIX,
+            | ForkName::Gloas
+            | ForkName::Heze => super::INACTIVITY_PENALTY_QUOTIENT_BELLATRIX,
             ForkName::Lean => lean_fork_unreachable("inactivity_penalty_quotient"),
         }
     }
@@ -1298,6 +1321,7 @@ pub mod retuned {
                 ForkName::Electra,
                 ForkName::Fulu,
                 ForkName::Gloas,
+                ForkName::Heze,
             ];
 
             assert_eq!(
@@ -1347,7 +1371,12 @@ pub mod retuned {
                     "{fork} must use bellatrix's penalty divisor",
                 );
             }
-            for fork in [ForkName::Electra, ForkName::Fulu, ForkName::Gloas] {
+            for fork in [
+                ForkName::Electra,
+                ForkName::Fulu,
+                ForkName::Gloas,
+                ForkName::Heze,
+            ] {
                 assert_eq!(
                     min_slashing_penalty_quotient(fork),
                     MIN_SLASHING_PENALTY_QUOTIENT_ELECTRA,
@@ -1368,7 +1397,12 @@ pub mod retuned {
                     "{fork} predates electra's whistleblower reward change",
                 );
             }
-            for fork in [ForkName::Electra, ForkName::Fulu, ForkName::Gloas] {
+            for fork in [
+                ForkName::Electra,
+                ForkName::Fulu,
+                ForkName::Gloas,
+                ForkName::Heze,
+            ] {
                 assert_eq!(
                     whistleblower_reward_quotient(fork),
                     WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA,
@@ -1636,6 +1670,7 @@ mod tests {
         );
 
         in_both!(usize: PTC_SIZE, PTC_WINDOW_LENGTH, BUILDER_PENDING_PAYMENTS_LENGTH);
+        in_both!(usize: INCLUSION_LIST_COMMITTEE_SIZE);
         in_both!(u64:
             MAX_PAYLOAD_ATTESTATIONS, MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD,
             MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD, MAX_BUILDERS_PER_WITHDRAWALS_SWEEP,

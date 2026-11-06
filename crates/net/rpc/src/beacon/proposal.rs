@@ -133,15 +133,19 @@ async fn post_block(
         .get("eth-consensus-version")
         .and_then(|value| value.to_str().ok())
         .and_then(ForkName::parse);
-    if !matches!(fork, Some(ForkName::Fulu | ForkName::Gloas)) {
-        return ApiError::BadRequest("Eth-Consensus-Version must be fulu or gloas").into_response();
+    if !matches!(
+        fork,
+        Some(ForkName::Fulu | ForkName::Gloas | ForkName::Heze)
+    ) {
+        return ApiError::BadRequest("Eth-Consensus-Version must be fulu, gloas or heze")
+            .into_response();
     }
     let encoding = match BodyEncoding::from_headers(&headers) {
         Ok(encoding) => encoding,
         Err(err) => return err.into_response(),
     };
-    if fork == Some(ForkName::Gloas) {
-        return post_gloas_block(&store, &p2p, encoding, &body).await;
+    if let Some(fork @ (ForkName::Gloas | ForkName::Heze)) = fork {
+        return post_gloas_block(&store, &p2p, fork, encoding, &body).await;
     }
     let Some(contents) = encoding.decode::<FuluSignedBlockContents>(&body) else {
         return ApiError::BadRequest("the body is not fulu SignedBlockContents").into_response();
@@ -250,13 +254,24 @@ async fn post_block(
 async fn post_gloas_block(
     store: &Store,
     p2p: &RpcToP2PRef,
+    fork: ForkName,
     encoding: BodyEncoding,
     body: &[u8],
 ) -> Response {
-    let Some(signed) = encoding.decode::<containers::gloas::SignedBeaconBlock>(body) else {
+    // Heze's body drops `eth1_data` and `deposits` (EIP-8015), so the header's
+    // fork picks the container to decode.
+    let block = if fork == ForkName::Heze {
+        encoding
+            .decode::<containers::heze::SignedBeaconBlock>(body)
+            .map(containers::SignedBeaconBlock::Heze)
+    } else {
+        encoding
+            .decode::<containers::gloas::SignedBeaconBlock>(body)
+            .map(containers::SignedBeaconBlock::Gloas)
+    };
+    let Some(block) = block else {
         return ApiError::BadRequest("the body is not a gloas SignedBeaconBlock").into_response();
     };
-    let block = containers::SignedBeaconBlock::Gloas(signed);
     let config = store.config();
     if let Err(err) = require_gloas_slot(
         &config,
@@ -264,6 +279,18 @@ async fn post_gloas_block(
         "blocks are accepted for gloas slots only",
     ) {
         return err.into_response();
+    }
+    // The bid's shape (heze's carries `inclusion_list_bits`) and the slot's fork
+    // must both be the one the header names.
+    let slot_fork = config.fork_at_epoch(compute_epoch_at_slot(block.slot()));
+    let bid_fork = block
+        .gloas_message()
+        .map(|message| message.signed_execution_payload_bid().message.fork_name());
+    if block.fork_name() != fork || bid_fork != Some(fork) || slot_fork != fork {
+        return ApiError::BadRequest(
+            "Eth-Consensus-Version, the block's shape and its slot's fork disagree",
+        )
+        .into_response();
     }
     let parent_state = match store.get_state(&block.parent_root()) {
         Ok(Some(state)) => state,
@@ -316,7 +343,7 @@ pub(crate) fn require_gloas_slot(
     message: &'static str,
 ) -> Result<(), ApiError> {
     match config.fork_at_epoch(compute_epoch_at_slot(slot)) {
-        ForkName::Gloas => Ok(()),
+        ForkName::Gloas | ForkName::Heze => Ok(()),
         ForkName::Phase0
         | ForkName::Altair
         | ForkName::Bellatrix
@@ -382,6 +409,7 @@ fn require_fulu_slot(config: &Config, slot: Slot, message: &'static str) -> Resu
         | ForkName::Deneb
         | ForkName::Electra
         | ForkName::Gloas
+        | ForkName::Heze
         | ForkName::Lean => Err(ApiError::BadRequest(message)),
     }
 }
@@ -963,12 +991,15 @@ mod tests {
         let produced = produce(&state, true, Vec::new()).unwrap();
         let (mut store, _anchor) = beacon_store_with_config(parent.clone(), config());
         store
-            .insert_state(produced.block.parent_root, parent)
+            .insert_state(produced.block.parent_root(), parent)
             .unwrap();
 
-        let signed = containers::gloas::SignedBeaconBlock {
-            signature: sign_block(&state, &produced.block),
-            message: produced.block.clone(),
+        let containers::SignedBeaconBlock::Gloas(signed) = produced
+            .block
+            .clone()
+            .into_signed(sign_block(&state, &produced.block))
+        else {
+            unreachable!("built on a gloas state")
         };
         let post = |store: Store,
                     network: Arc<RecordingNetwork>,
@@ -1013,9 +1044,11 @@ mod tests {
         let rejected = Arc::new(RecordingNetwork::default());
         let mut forged = signed.clone();
         forged.signature = sign_block(&state, &{
-            let mut other = produced.block.clone();
+            let containers::GloasBlock::Gloas(mut other) = produced.block.clone() else {
+                unreachable!("built on a gloas state")
+            };
             other.proposer_index += 1;
-            other
+            containers::GloasBlock::Gloas(other)
         });
         let (status, _) = post(store.clone(), rejected.clone(), &forged).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);

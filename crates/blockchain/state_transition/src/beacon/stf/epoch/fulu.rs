@@ -150,7 +150,7 @@ pub fn process_proposer_lookahead(state: &mut BeaconState) -> Result<()> {
         // sampling; see `crate::beacon::helpers::gloas::get_beacon_proposer_indices`'s
         // own doc. This is the one part of the step gloas cannot share
         // unchanged; see this module's own module doc.
-        ForkName::Gloas => {
+        ForkName::Gloas | ForkName::Heze => {
             crate::beacon::helpers::gloas::get_beacon_proposer_indices(state, new_epoch)?
         }
         fork @ (ForkName::Phase0

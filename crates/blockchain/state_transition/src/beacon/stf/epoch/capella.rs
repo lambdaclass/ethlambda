@@ -96,6 +96,7 @@ fn historical_summaries_mut<'a>(
         BeaconState::Electra(state) => Ok(&mut state.historical_summaries),
         BeaconState::Fulu(state) => Ok(&mut state.historical_summaries),
         BeaconState::Gloas(state) => Ok(&mut state.historical_summaries),
+        BeaconState::Heze(state) => Ok(&mut state.historical_summaries),
         other => Err(Error::UnsupportedForFork {
             function,
             fork: other.fork_name(),

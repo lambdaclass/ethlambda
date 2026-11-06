@@ -59,6 +59,7 @@ pub fn get_unslashed_participating_indices(
 pub fn get_flag_index_deltas(
     state: &BeaconState,
     flag_index: usize,
+    config: &Config,
 ) -> Result<(Vec<Gwei>, Vec<Gwei>)> {
     let validator_count = state.validator_count();
     let mut rewards = vec![0; validator_count];
@@ -101,7 +102,8 @@ pub fn get_flag_index_deltas(
     // further at mainnet's ~2^20 validators, since the unhoisted form is
     // O(n^2) (`1024x` slower again at that size) while this is O(n) (`32x`
     // slower again, same as every other size-dependent cost in this crate).
-    let base_reward_per_increment = get_base_reward_per_increment(state)?;
+    // [Modified in Heze:EIP8198] priced at the previous epoch's slot duration.
+    let base_reward_per_increment = get_base_reward_per_increment(state, previous_epoch, config)?;
 
     for index in get_eligible_validator_indices(state) {
         // `get_base_reward(state, index)` inlined against the hoisted
@@ -161,7 +163,18 @@ pub fn get_inactivity_penalty_deltas(
             )?;
             let inactivity_penalty_quotient =
                 preset::retuned::inactivity_penalty_quotient(state.fork_name());
-            let penalty_denominator = config.inactivity_score_bias * inactivity_penalty_quotient;
+            // [Modified in Heze:EIP8198] `INACTIVITY_SCORE_BIAS * quotient *
+            // duration(GENESIS_EPOCH) ** 2 // duration(previous_epoch) ** 2`.
+            let genesis_duration =
+                u128::from(config.slot_duration_ms_at_epoch(constants::GENESIS_EPOCH));
+            let previous_duration = u128::from(config.slot_duration_ms_at_epoch(previous_epoch));
+            let penalty_denominator = u64::try_from(
+                u128::from(config.inactivity_score_bias)
+                    * u128::from(inactivity_penalty_quotient)
+                    * genesis_duration.pow(2)
+                    / previous_duration.pow(2),
+            )
+            .unwrap_or(u64::MAX);
             penalties[index as usize] += penalty_numerator / penalty_denominator;
         }
     }

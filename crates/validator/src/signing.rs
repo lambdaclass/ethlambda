@@ -8,8 +8,9 @@
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::constants::{
     DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_BUILDER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
-    DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_INCLUSION_LIST_COMMITTEE,
+    DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE,
+    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
 };
 use ethlambda_types::beacon::containers::altair::{
     ContributionAndProof, SyncAggregatorSelectionData,
@@ -17,6 +18,7 @@ use ethlambda_types::beacon::containers::altair::{
 use ethlambda_types::beacon::containers::gloas::{
     ExecutionPayloadEnvelope, PayloadAttestationData,
 };
+use ethlambda_types::beacon::containers::heze::InclusionList;
 use ethlambda_types::beacon::containers::shared::AttestationData;
 use ethlambda_types::beacon::primitives::{
     BLS_SIGNATURE_SIZE, BlsPubkey, BlsSignature, Domain, DomainType, Epoch, HashTreeRoot as _,
@@ -151,6 +153,19 @@ impl SigningContext {
     pub fn payload_attestation_signing_root(&self, data: &PayloadAttestationData) -> Root {
         let domain = self.domain(DOMAIN_PTC_ATTESTER, compute_epoch_at_slot(data.slot));
         compute_signing_root(data.hash_tree_root(), domain)
+    }
+
+    /// The root an inclusion list committee member's list is computed over
+    /// (heze): the whole `InclusionList`, under
+    /// `DOMAIN_INCLUSION_LIST_COMMITTEE` at the epoch of the list's slot, as
+    /// `get_inclusion_list_signature` takes it. The validator index is part of
+    /// the signed message here, unlike a PTC vote's.
+    pub fn inclusion_list_signing_root(&self, inclusion_list: &InclusionList) -> Root {
+        let domain = self.domain(
+            DOMAIN_INCLUSION_LIST_COMMITTEE,
+            compute_epoch_at_slot(inclusion_list.slot),
+        );
+        compute_signing_root(inclusion_list.hash_tree_root(), domain)
     }
 
     /// The root a sync committee message is computed over: the block root
@@ -309,6 +324,24 @@ impl SigningContext {
         data: &PayloadAttestationData,
     ) -> Result<BlsSignature> {
         self.sign_root(store, pubkey, self.payload_attestation_signing_root(data))
+    }
+
+    /// Sign an inclusion list on behalf of `pubkey`.
+    ///
+    /// Not slashable. A second, different list from one member for one slot
+    /// marks it an equivocator and drops its lists from the slot's count, so
+    /// [`crate::inclusion_list`] signs at most one per validator and slot.
+    pub fn sign_inclusion_list(
+        &self,
+        store: &ValidatorStore,
+        pubkey: &BlsPubkey,
+        inclusion_list: &InclusionList,
+    ) -> Result<BlsSignature> {
+        self.sign_root(
+            store,
+            pubkey,
+            self.inclusion_list_signing_root(inclusion_list),
+        )
     }
 
     /// Sign a sync committee message for `slot` over `beacon_block_root`.
@@ -692,6 +725,44 @@ mod tests {
             context.sync_committee_message_signing_root(3200, root),
             compute_signing_root(root, context.domain(DOMAIN_SYNC_COMMITTEE, 100)),
             "the root is signed bare, under the sync committee domain"
+        );
+    }
+
+    #[test]
+    fn an_inclusion_list_verifies_under_its_own_root() {
+        use ethlambda_types::beacon::fork::ForkName;
+
+        let (store, pubkey) = store_with_key();
+        let context = SigningContext {
+            config: Config::mainnet()
+                .with_fork_epoch(ForkName::Gloas, 0)
+                .with_fork_epoch(ForkName::Heze, 5),
+            genesis_validators_root: Root::ZERO,
+        };
+        let inclusion_list = InclusionList {
+            slot: 5 * preset::SLOTS_PER_EPOCH + 3,
+            validator_index: 9,
+            dependent_root: Root::repeat_byte(7),
+            transactions: vec![vec![0x02, 0xf8].into()].into(),
+        };
+
+        let signature = context
+            .sign_inclusion_list(&store, &pubkey, &inclusion_list)
+            .expect("signs");
+        let root = context.inclusion_list_signing_root(&inclusion_list);
+        assert!(verify(&pubkey, &signature, root));
+        assert_eq!(
+            root,
+            compute_signing_root(
+                inclusion_list.hash_tree_root(),
+                context.domain(DOMAIN_INCLUSION_LIST_COMMITTEE, 5)
+            ),
+            "the whole list is signed, under the inclusion list committee domain at its epoch"
+        );
+        assert_ne!(
+            context.domain(DOMAIN_INCLUSION_LIST_COMMITTEE, 5),
+            context.domain(DOMAIN_INCLUSION_LIST_COMMITTEE, 4),
+            "the heze fork version is the one signed under from its first epoch"
         );
     }
 

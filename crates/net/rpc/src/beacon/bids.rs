@@ -22,7 +22,7 @@ use ethlambda_state_transition::beacon::{
     gossip::{
         IgnoreReason, Outcome,
         execution_payload_bid::{
-            MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE, cheap_checks, stateful_checks,
+            MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE_HEZE, cheap_checks, stateful_checks,
         },
     },
 };
@@ -85,14 +85,14 @@ async fn post_bid(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(err) = require_version(&headers, &[ForkName::Gloas]) {
+    if let Err(err) = require_version(&headers, &[ForkName::Gloas, ForkName::Heze]) {
         return err.into_response();
     }
     let encoding = match BodyEncoding::from_headers(&headers) {
         Ok(encoding) => encoding,
         Err(err) => return err.into_response(),
     };
-    if encoding == BodyEncoding::Ssz && body.len() > MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE {
+    if encoding == BodyEncoding::Ssz && body.len() > MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE_HEZE {
         return ApiError::BadRequest("the SignedExecutionPayloadBid exceeds its size bound")
             .into_response();
     }

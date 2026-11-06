@@ -1507,6 +1507,20 @@ pub fn inc_engine_no_verdict() {
     LEAN_ENGINE_NO_VERDICT_TOTAL.inc();
 }
 
+/// Heze payloads the execution client found valid but not satisfying the
+/// previous slot's inclusion lists, which fork choice then does not extend.
+pub fn inc_payload_inclusion_list_unsatisfied() {
+    static LEAN_PAYLOAD_INCLUSION_LIST_UNSATISFIED_TOTAL: std::sync::LazyLock<IntCounter> =
+        std::sync::LazyLock::new(|| {
+            register_int_counter!(
+                "lean_payload_inclusion_list_unsatisfied_total",
+                "Heze payloads that did not satisfy the inclusion lists"
+            )
+            .unwrap()
+        });
+    LEAN_PAYLOAD_INCLUSION_LIST_UNSATISFIED_TOTAL.inc();
+}
+
 /// Blocks not imported because the execution client has not validated them and
 /// they do not qualify for an optimistic import.
 ///

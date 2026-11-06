@@ -142,18 +142,19 @@ fn components(
         | ForkName::Deneb
         | ForkName::Electra
         | ForkName::Fulu
-        | ForkName::Gloas => vec![
+        | ForkName::Gloas
+        | ForkName::Heze => vec![
             (
                 "source_deltas",
-                altair_helpers::get_flag_index_deltas(state, TIMELY_SOURCE_FLAG_INDEX),
+                altair_helpers::get_flag_index_deltas(state, TIMELY_SOURCE_FLAG_INDEX, config),
             ),
             (
                 "target_deltas",
-                altair_helpers::get_flag_index_deltas(state, TIMELY_TARGET_FLAG_INDEX),
+                altair_helpers::get_flag_index_deltas(state, TIMELY_TARGET_FLAG_INDEX, config),
             ),
             (
                 "head_deltas",
-                altair_helpers::get_flag_index_deltas(state, TIMELY_HEAD_FLAG_INDEX),
+                altair_helpers::get_flag_index_deltas(state, TIMELY_HEAD_FLAG_INDEX, config),
             ),
             (
                 "inactivity_penalty_deltas",
@@ -173,7 +174,7 @@ fn components(
 }
 
 pub fn trials() -> Vec<Trial> {
-    let config = Arc::new(Config::active());
+    let config = Arc::new(super::fixture_active_config());
     let cases = collect_all_handlers(PRESET, "rewards");
     let mut trials = vec![super::discovery_trial("rewards", cases.len())];
 

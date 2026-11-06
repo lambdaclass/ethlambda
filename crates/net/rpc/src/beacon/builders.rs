@@ -15,7 +15,7 @@ use ethlambda_state_transition::beacon::helpers::gloas::is_active_builder;
 use ethlambda_storage::Store;
 use ethlambda_types::beacon::{
     constants::FAR_FUTURE_EPOCH,
-    containers::{BeaconState, gloas::Builder},
+    containers::gloas::Builder,
     primitives::{BlsPubkey, ValidatorIndex},
 };
 use serde::{Deserialize, Serialize};
@@ -139,19 +139,19 @@ async fn post_builders(
         Ok(found) => found,
         Err(err) => return err.into_response(),
     };
-    let BeaconState::Gloas(inner) = state.as_ref() else {
+    let Ok(builders) = state.builders() else {
         return ApiError::BadRequest("the requested state is prior to Gloas").into_response();
     };
 
     let mut entries = Vec::new();
-    for (index, builder) in inner.builders.iter().enumerate() {
+    for (index, builder) in builders.iter().enumerate() {
         let index = index as u64;
         if !(ids.is_empty() || ids.iter().any(|id| id.selects(index, builder))) {
             continue;
         }
         let status = if builder.withdrawable_epoch != FAR_FUTURE_EPOCH {
             BuilderStatus::Exited
-        } else if is_active_builder(inner, index).unwrap_or(false) {
+        } else if is_active_builder(&state, index).unwrap_or(false) {
             BuilderStatus::Active
         } else {
             BuilderStatus::Pending
@@ -182,6 +182,7 @@ mod tests {
         http::{Request, StatusCode},
     };
     use ethlambda_state_transition::beacon::helpers::test_state::with_signing_validators_at;
+    use ethlambda_types::beacon::containers::BeaconState;
     use ethlambda_types::beacon::{config::Config, fork::ForkName};
     use http_body_util::BodyExt as _;
     use tower::ServiceExt as _;

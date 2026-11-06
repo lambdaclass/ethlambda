@@ -149,6 +149,8 @@ pub const DOMAIN_PTC_ATTESTER: DomainType = [0x0c, 0x00, 0x00, 0x00];
 pub const DOMAIN_PROPOSER_PREFERENCES: DomainType = [0x0d, 0x00, 0x00, 0x00];
 /// Domain for a `BuilderDepositRequest`'s `signature` (gloas).
 pub const DOMAIN_BUILDER_DEPOSIT: DomainType = [0x0e, 0x00, 0x00, 0x00];
+/// Domain for a `SignedInclusionList` (heze, EIP-7805).
+pub const DOMAIN_INCLUSION_LIST_COMMITTEE: DomainType = [0x10, 0x00, 0x00, 0x00];
 
 // ---------------------------------------------------------------------------
 // Participation flags and incentivization weights (altair)
@@ -450,6 +452,7 @@ mod tests {
             DOMAIN_PTC_ATTESTER,
             DOMAIN_PROPOSER_PREFERENCES,
             DOMAIN_BUILDER_DEPOSIT,
+            DOMAIN_INCLUSION_LIST_COMMITTEE,
         ] {
             let masked = [
                 domain[0] & DOMAIN_APPLICATION_MASK[0],

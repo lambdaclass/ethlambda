@@ -46,6 +46,28 @@ pub struct PayloadStatusV1 {
     pub validation_error: Option<String>,
 }
 
+/// `PayloadStatusV2` (Bogota): [`PayloadStatusV1`] plus whether a `VALID`
+/// payload satisfied the inclusion list constraints (EIP-7805). Answered by
+/// `engine_newPayloadV6` and `engine_forkchoiceUpdatedV5`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PayloadStatusV2 {
+    #[serde(flatten)]
+    pub status: PayloadStatusV1,
+    /// `Some` only on a `VALID` status; `null` (or absent) otherwise.
+    #[serde(default)]
+    pub inclusion_list_satisfied: Option<bool>,
+}
+
+/// `engine_forkchoiceUpdatedV5`'s result: V3's, with a [`PayloadStatusV2`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkchoiceUpdatedV5Response {
+    pub payload_status: PayloadStatusV2,
+    #[serde(default)]
+    pub payload_id: Option<crate::building::PayloadId>,
+}
+
 /// `engine_forkchoiceUpdatedV3`'s first parameter.
 ///
 /// The three hashes serialize through [`ExecutionBlockHash`]'s own `Serialize`,

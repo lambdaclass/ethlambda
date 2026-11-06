@@ -175,6 +175,22 @@ static PAYLOAD_ATTESTATION_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(
     .unwrap()
 });
 
+static INCLUSION_LISTS_PUBLISHED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_inclusion_lists_published_total",
+        "Inclusion lists the beacon node accepted"
+    )
+    .unwrap()
+});
+
+static INCLUSION_LIST_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_inclusion_list_failures_total",
+        "Slots whose inclusion list committee duty did not result in a published list"
+    )
+    .unwrap()
+});
+
 /// End to end, from the slot's start to the node accepting the block.
 ///
 /// The buckets are tighter at the low end than the attestation histogram's,
@@ -322,6 +338,8 @@ pub fn init() {
     LazyLock::force(&ENVELOPE_FAILURES_TOTAL);
     LazyLock::force(&PAYLOAD_ATTESTATIONS_PUBLISHED_TOTAL);
     LazyLock::force(&PAYLOAD_ATTESTATION_FAILURES_TOTAL);
+    LazyLock::force(&INCLUSION_LISTS_PUBLISHED_TOTAL);
+    LazyLock::force(&INCLUSION_LIST_FAILURES_TOTAL);
     LazyLock::force(&SYNC_COMMITTEE_MESSAGES_PUBLISHED_TOTAL);
     LazyLock::force(&SYNC_COMMITTEE_FAILURES_TOTAL);
     LazyLock::force(&SYNC_CONTRIBUTIONS_PUBLISHED_TOTAL);
@@ -398,6 +416,14 @@ pub fn inc_payload_attestations_published(count: u64) {
 
 pub fn inc_payload_attestation_failures() {
     PAYLOAD_ATTESTATION_FAILURES_TOTAL.inc();
+}
+
+pub fn inc_inclusion_lists_published(count: u64) {
+    INCLUSION_LISTS_PUBLISHED_TOTAL.inc_by(count);
+}
+
+pub fn inc_inclusion_list_failures() {
+    INCLUSION_LIST_FAILURES_TOTAL.inc();
 }
 
 pub fn inc_sync_committee_messages_published(count: u64) {

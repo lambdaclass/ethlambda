@@ -11,19 +11,14 @@
 //!
 //! # What is left out
 //!
-//! - **Forks this build cannot process.** `HEZE_FORK_VERSION`/`HEZE_FORK_EPOCH`
-//!   and `EIP8321_FORK_VERSION`/`EIP8321_FORK_EPOCH` (its own later fork
-//!   schedule) stay out for the same reason `GLOAS_*` used to: a fork version
-//!   stored here would give [`Config::fork_at_epoch`] a fork
-//!   [`crate::beacon::fork::ForkName`] has no variant for, so each is
-//!   reported as an unknown key instead. `GAS_LIMIT_SCHEDULE` (gloas-era)
-//!   stays out too, since it is a list rather than a scalar. The rest are
-//!   heze-era data keys, not gloas's, with no reader in this build at all:
-//!   `INCLUSION_LIST_DUE_BPS`, `MAX_REQUEST_INCLUSION_LIST`,
-//!   `MIN_SLOTS_FOR_INCLUSION_LISTS_REQUESTS`, and
-//!   `MAX_TRANSACTIONS_BYTES_PER_INCLUSION_LIST` (EIP-7805's fork-choice-enforced
-//!   inclusion lists), and `CONFIRMATION_BYZANTINE_THRESHOLD` (the Fast
-//!   Confirmation Rule).
+//! - **Forks this build cannot process.** `EIP8321_FORK_VERSION`/`EIP8321_FORK_EPOCH`
+//!   (its own later fork schedule) stay out for the same reason `GLOAS_*` and
+//!   `HEZE_*` used to: a fork version stored here would give
+//!   [`Config::fork_at_epoch`] a fork [`crate::beacon::fork::ForkName`] has no
+//!   variant for, so each is reported as an unknown key instead.
+//!   `GAS_LIMIT_SCHEDULE` (gloas-era) stays out too, since it is a list rather
+//!   than a scalar, and so does `CONFIRMATION_BYZANTINE_THRESHOLD` (the Fast
+//!   Confirmation Rule), which nothing in this build reads.
 //!
 //! `PRESET_BASE` and `CONFIG_NAME` used to be left out as well, because they
 //! are strings and this struct is SSZ-encoded into the database. They are here
@@ -52,6 +47,7 @@ use libssz_types::SszList;
 use crate::beacon::constants;
 use crate::beacon::fork::ForkName;
 use crate::beacon::lean_fork_unreachable;
+use crate::beacon::preset;
 use crate::beacon::primitives::{Epoch, ExecutionBlockHash, Gwei, U256, Uint256, Version};
 use crate::chain_config::ChainConfig;
 use crate::constants::INTERVALS_PER_SLOT;
@@ -324,6 +320,13 @@ pub struct Config {
     /// is not scheduled.
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub gloas_fork_epoch: Epoch,
+    /// The `Fork.current_version` a heze block or attestation signs under.
+    #[serde(with = "crate::beacon::serde_helpers::hex_array")]
+    pub heze_fork_version: Version,
+    /// The epoch heze activates at, or [`constants::FAR_FUTURE_EPOCH`] if it
+    /// is not scheduled.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub heze_fork_epoch: Epoch,
 
     // -- Time parameters ---------------------------------------------------
     /// Wall-clock seconds per slot. Deprecated in favor of
@@ -340,6 +343,15 @@ pub struct Config {
     /// separately because the specification does.
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub slot_duration_ms: u64,
+    /// Heze (EIP-8198): the slot duration from [`Self::heze_fork_epoch`] on, in
+    /// milliseconds. A positive multiple of 1000, since the execution layer's
+    /// block timestamps are whole seconds.
+    ///
+    /// Read through [`Self::slot_duration_ms_at_epoch`] and the time helpers
+    /// below, never directly: only the schedule they implement knows which of
+    /// this and [`Self::slot_duration_ms`] an epoch runs on.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub slot_duration_ms_heze: u64,
     /// The assumed seconds per execution-layer block, used to convert
     /// [`Self::eth1_follow_distance`] (a block count) into a voting-period
     /// safety margin.
@@ -411,6 +423,11 @@ pub struct Config {
     /// to [`Self::min_validator_withdrawability_delay`].
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub min_builder_withdrawability_delay: Epoch,
+    /// Heze (EIP-7805): basis points of [`Self::slot_duration_ms`] by which
+    /// an inclusion list must arrive to count as timely, and by which a
+    /// committee member publishes its own.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub inclusion_list_due_bps: u64,
 
     // -- Validator cycle -----------------------------------------------------
     /// Score points added to a validator's inactivity score for each epoch it
@@ -575,6 +592,12 @@ pub struct Config {
     pub min_epochs_for_blob_sidecars_requests: u64,
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub min_epochs_for_data_column_sidecars_requests: u64,
+    /// Heze (EIP-8198): how long, in milliseconds, a node must keep serving
+    /// blob data. Replaces [`Self::min_epochs_for_data_column_sidecars_requests`]
+    /// from heze on, so the wall-clock window survives a slot duration change;
+    /// see [`Config::blob_data_retention_start_epoch`].
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub min_blob_data_retention_ms: u64,
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub subnets_per_node: u64,
 
@@ -621,6 +644,20 @@ pub struct Config {
     pub max_request_data_column_sidecars: u64,
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub min_epochs_for_block_requests: u64,
+
+    // -- Inclusion lists (heze, EIP-7805) ------------------------------------
+    /// The most inclusion lists one `InclusionListsByIndices` request may ask
+    /// for.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub max_request_inclusion_list: u64,
+    /// How many slots past its own an inclusion list is still accepted by
+    /// `on_inclusion_list` and must still be served over req/resp.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub min_slots_for_inclusion_lists_requests: u64,
+    /// The cap on the summed byte length of one inclusion list's
+    /// transactions.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub max_transactions_bytes_per_inclusion_list: u64,
 }
 
 /// Mainnet's values, which is what an absent key in a `config.yaml` falls back
@@ -721,9 +758,12 @@ impl Config {
             fulu_fork_epoch: 411_392,
             gloas_fork_version: [0x07, 0x00, 0x00, 0x00],
             gloas_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            heze_fork_version: [0x08, 0x00, 0x00, 0x00],
+            heze_fork_epoch: constants::FAR_FUTURE_EPOCH,
 
             seconds_per_slot: 12,
             slot_duration_ms: 12_000,
+            slot_duration_ms_heze: 10_000,
             seconds_per_eth1_block: 14,
             min_validator_withdrawability_delay: 256,
             shard_committee_period: 256,
@@ -740,6 +780,7 @@ impl Config {
             payload_due_bps: 5_000,
             payload_attestation_due_bps: 7_500,
             min_builder_withdrawability_delay: 64,
+            inclusion_list_due_bps: 7_500,
 
             inactivity_score_bias: 4,
             inactivity_score_recovery_rate: 16,
@@ -796,6 +837,7 @@ impl Config {
             message_domain_valid_snappy: [0x01, 0x00, 0x00, 0x00],
             min_epochs_for_blob_sidecars_requests: 4_096,
             min_epochs_for_data_column_sidecars_requests: 4_096,
+            min_blob_data_retention_ms: 1_572_864_000,
             subnets_per_node: 2,
 
             deposit_chain_id: 1,
@@ -818,6 +860,10 @@ impl Config {
             max_request_blob_sidecars_electra: 1_152,
             max_request_data_column_sidecars: 16_384,
             min_epochs_for_block_requests: 33_024,
+
+            max_request_inclusion_list: 16,
+            min_slots_for_inclusion_lists_requests: 1,
+            max_transactions_bytes_per_inclusion_list: 8_192,
         }
     }
 
@@ -855,9 +901,12 @@ impl Config {
             fulu_fork_epoch: constants::FAR_FUTURE_EPOCH,
             gloas_fork_version: [0x07, 0x00, 0x00, 0x01],
             gloas_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            heze_fork_version: [0x08, 0x00, 0x00, 0x01],
+            heze_fork_epoch: constants::FAR_FUTURE_EPOCH,
 
             seconds_per_slot: 6,
             slot_duration_ms: 6_000,
+            slot_duration_ms_heze: 5_000,
             seconds_per_eth1_block: 14,
             min_validator_withdrawability_delay: 256,
             shard_committee_period: 64,
@@ -874,6 +923,7 @@ impl Config {
             payload_due_bps: 5_000,
             payload_attestation_due_bps: 7_500,
             min_builder_withdrawability_delay: 2,
+            inclusion_list_due_bps: 7_500,
 
             inactivity_score_bias: 4,
             inactivity_score_recovery_rate: 16,
@@ -917,6 +967,7 @@ impl Config {
             message_domain_valid_snappy: [0x01, 0x00, 0x00, 0x00],
             min_epochs_for_blob_sidecars_requests: 4_096,
             min_epochs_for_data_column_sidecars_requests: 4_096,
+            min_blob_data_retention_ms: 196_608_000,
             subnets_per_node: 2,
 
             // configs/minimal.yaml: Ethereum Goerli testnet's chain and
@@ -942,6 +993,10 @@ impl Config {
             max_request_blob_sidecars_electra: 1_152,
             max_request_data_column_sidecars: 16_384,
             min_epochs_for_block_requests: 33_024,
+
+            max_request_inclusion_list: 16,
+            min_slots_for_inclusion_lists_requests: 1,
+            max_transactions_bytes_per_inclusion_list: 8_192,
         }
     }
 
@@ -965,6 +1020,9 @@ impl Config {
             config_name: ConfigName::default(),
             genesis_time,
             slot_duration_ms,
+            // Lean has no heze, but keep the two durations equal so the
+            // schedule reads as one duration even if a heze epoch were set.
+            slot_duration_ms_heze: slot_duration_ms,
             // Truncated on a cadence that is not a whole number of seconds.
             // Nothing on the lean path reads it: lean schedules every duty off
             // `slot_duration_ms`, and the second-resolution field exists for
@@ -977,6 +1035,7 @@ impl Config {
             electra_fork_epoch: constants::FAR_FUTURE_EPOCH,
             fulu_fork_epoch: constants::FAR_FUTURE_EPOCH,
             gloas_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            heze_fork_epoch: constants::FAR_FUTURE_EPOCH,
             ..Config::mainnet()
         }
     }
@@ -984,7 +1043,7 @@ impl Config {
     /// Genesis as a millisecond timestamp, the zero point every tick
     /// computation measures from.
     pub fn genesis_time_ms(&self) -> u64 {
-        self.genesis_time * 1_000
+        self.genesis_time.saturating_mul(1_000)
     }
 
     /// Interval duration in milliseconds.
@@ -1003,6 +1062,110 @@ impl Config {
     /// pipeline takes, and the metrics helpers can keep taking it by value.
     pub fn time_grid(&self) -> ChainConfig {
         ChainConfig::new(self.genesis_time, self.slot_duration_ms)
+    }
+
+    /// Heze (EIP-8198) `get_slot_durations`: the slot duration in effect from
+    /// each activation epoch on, oldest first. A fork that is not scheduled
+    /// ([`constants::FAR_FUTURE_EPOCH`]) has no entry.
+    pub fn slot_durations(&self) -> Vec<(Epoch, u64)> {
+        [
+            (constants::GENESIS_EPOCH, self.slot_duration_ms),
+            (self.heze_fork_epoch, self.slot_duration_ms_heze),
+        ]
+        .into_iter()
+        .filter(|(fork_epoch, _)| *fork_epoch != constants::FAR_FUTURE_EPOCH)
+        .collect()
+    }
+
+    /// Heze (EIP-8198) `get_slot_duration_ms`: the slot duration in effect at
+    /// `epoch`.
+    pub fn slot_duration_ms_at_epoch(&self, epoch: Epoch) -> u64 {
+        self.slot_durations()
+            .into_iter()
+            .rev()
+            .find(|(fork_epoch, _)| epoch >= *fork_epoch)
+            .map_or(self.slot_duration_ms, |(_, duration_ms)| duration_ms)
+    }
+
+    /// The slot duration in effect at `slot`: [`Self::slot_duration_ms_at_epoch`]
+    /// of the slot's epoch.
+    pub fn slot_duration_ms_at_slot(&self, slot: u64) -> u64 {
+        self.slot_duration_ms_at_epoch(slot / preset::SLOTS_PER_EPOCH)
+    }
+
+    /// Heze (EIP-8198) `compute_time_at_slot_ms`: the Unix time in
+    /// milliseconds at the start of `slot`, summing each schedule segment's
+    /// slots at that segment's duration. Saturates instead of wrapping.
+    pub fn time_at_slot_ms(&self, genesis_time_ms: u64, slot: u64) -> u64 {
+        let mut end_slot = slot;
+        let mut time_ms = genesis_time_ms;
+        for (fork_epoch, slot_duration_ms) in self.slot_durations().into_iter().rev() {
+            let fork_slot = fork_epoch.saturating_mul(preset::SLOTS_PER_EPOCH);
+            if fork_slot < end_slot {
+                time_ms =
+                    time_ms.saturating_add((end_slot - fork_slot).saturating_mul(slot_duration_ms));
+                end_slot = fork_slot;
+            }
+        }
+        time_ms
+    }
+
+    /// Heze (EIP-8198) `compute_slot_at_time_ms`: the slot running at Unix
+    /// time `time_ms`. A time before genesis is slot 0, where the
+    /// specification would underflow; callers that must tell the two apart
+    /// compare against `genesis_time_ms` first.
+    pub fn slot_at_time_ms(&self, genesis_time_ms: u64, time_ms: u64) -> u64 {
+        let (start_slot, start_time_ms, slot_duration_ms) = self
+            .slot_durations()
+            .into_iter()
+            .map(|(fork_epoch, slot_duration_ms)| {
+                let fork_slot = fork_epoch.saturating_mul(preset::SLOTS_PER_EPOCH);
+                (
+                    fork_slot,
+                    self.time_at_slot_ms(genesis_time_ms, fork_slot),
+                    slot_duration_ms,
+                )
+            })
+            .rfind(|(_, fork_time_ms, _)| time_ms >= *fork_time_ms)
+            .unwrap_or((0, genesis_time_ms, self.slot_duration_ms));
+        start_slot.saturating_add(time_ms.saturating_sub(start_time_ms) / slot_duration_ms)
+    }
+
+    /// `compute_time_at_slot`: [`Self::time_at_slot_ms`] in whole seconds, for
+    /// execution payload timestamps. Exact whenever every slot duration is a
+    /// multiple of 1000, which [`Self::check_slot_durations`] enforces.
+    pub fn time_at_slot(&self, genesis_time: u64, slot: u64) -> u64 {
+        self.time_at_slot_ms(genesis_time.saturating_mul(1_000), slot) / 1_000
+    }
+
+    /// Heze (EIP-8198) `compute_blob_data_retention_start_epoch`: the first
+    /// epoch of the blob data retention window ending at `epoch`, keeping the
+    /// window's wall-clock length ([`Self::min_blob_data_retention_ms`])
+    /// across a slot duration change.
+    pub fn blob_data_retention_start_epoch(&self, epoch: Epoch) -> Epoch {
+        let window_ms = self.min_blob_data_retention_ms;
+        let current_start_slot = epoch.saturating_mul(preset::SLOTS_PER_EPOCH);
+        let current_start_ms = self.time_at_slot_ms(0, current_start_slot);
+        if current_start_ms < window_ms {
+            return constants::GENESIS_EPOCH;
+        }
+        let window_start_ms = current_start_ms - window_ms;
+        self.slot_at_time_ms(0, window_start_ms) / preset::SLOTS_PER_EPOCH
+    }
+
+    /// Heze (EIP-8198): `Err` when `SLOT_DURATION_MS_HEZE` is not a positive
+    /// multiple of 1000, the rule the specification states for it. The
+    /// execution layer timestamps blocks in whole seconds, so a sub-second
+    /// duration would make [`Self::time_at_slot`] inexact. `SLOT_DURATION_MS`
+    /// keeps whatever validation its own parsing applies.
+    pub fn check_slot_durations(&self) -> Result<(), String> {
+        let duration_ms = self.slot_duration_ms_heze;
+        if duration_ms == 0 || !duration_ms.is_multiple_of(1_000) {
+            return Err(format!(
+                "SLOT_DURATION_MS_HEZE is {duration_ms}, but must be a positive multiple of 1000"
+            ));
+        }
+        Ok(())
     }
 
     /// The configuration matching the compiled-in preset: [`Config::minimal`]
@@ -1060,6 +1223,7 @@ impl Config {
             ForkName::Electra => self.electra_fork_version,
             ForkName::Fulu => self.fulu_fork_version,
             ForkName::Gloas => self.gloas_fork_version,
+            ForkName::Heze => self.heze_fork_version,
             ForkName::Lean => lean_fork_unreachable("Config::fork_version"),
         }
     }
@@ -1078,6 +1242,7 @@ impl Config {
             ForkName::Electra => self.electra_fork_epoch,
             ForkName::Fulu => self.fulu_fork_epoch,
             ForkName::Gloas => self.gloas_fork_epoch,
+            ForkName::Heze => self.heze_fork_epoch,
             ForkName::Lean => lean_fork_unreachable("Config::fork_epoch"),
         }
     }
@@ -1103,6 +1268,7 @@ impl Config {
             ForkName::Electra => self.electra_fork_epoch = epoch,
             ForkName::Fulu => self.fulu_fork_epoch = epoch,
             ForkName::Gloas => self.gloas_fork_epoch = epoch,
+            ForkName::Heze => self.heze_fork_epoch = epoch,
             ForkName::Lean => lean_fork_unreachable("Config::with_fork_epoch"),
         }
         self
@@ -1120,6 +1286,7 @@ impl Config {
             ForkName::Electra => self.electra_fork_version = version,
             ForkName::Fulu => self.fulu_fork_version = version,
             ForkName::Gloas => self.gloas_fork_version = version,
+            ForkName::Heze => self.heze_fork_version = version,
             // Matches `fork_version`'s own arm: reaching this means a caller
             // dispatched on the wrong chain, which is a bug in the caller.
             ForkName::Lean => lean_fork_unreachable("Config::with_fork_version"),
@@ -1247,6 +1414,22 @@ mod tests {
         assert_eq!(config.fork_epoch(ForkName::Gloas), 12);
         assert_eq!(config.fork_at_epoch(12), ForkName::Gloas);
         assert_eq!(config.max_request_payloads, 128);
+    }
+
+    #[test]
+    fn heze_keys_are_claimed_and_parse() {
+        let yaml = "GLOAS_FORK_EPOCH: 0\nHEZE_FORK_VERSION: 0x90684879\nHEZE_FORK_EPOCH: 5\n\
+                    INCLUSION_LIST_DUE_BPS: 6667\nMAX_REQUEST_INCLUSION_LIST: 16\n\
+                    MIN_SLOTS_FOR_INCLUSION_LISTS_REQUESTS: 1\n\
+                    MAX_TRANSACTIONS_BYTES_PER_INCLUSION_LIST: 8192\n";
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(config.heze_fork_version, [0x90, 0x68, 0x48, 0x79]);
+        assert_eq!(config.fork_at_epoch(4), ForkName::Gloas);
+        assert_eq!(config.fork_at_epoch(5), ForkName::Heze);
+        assert_eq!(config.inclusion_list_due_bps, 6_667);
+        assert_eq!(config.max_request_inclusion_list, 16);
+        assert_eq!(config.min_slots_for_inclusion_lists_requests, 1);
+        assert_eq!(config.max_transactions_bytes_per_inclusion_list, 8_192);
     }
 
     #[test]
@@ -1636,5 +1819,233 @@ mod tests {
         let entry = &json["BLOB_SCHEDULE"][0];
         assert_eq!(entry["EPOCH"], "100");
         assert_eq!(entry["MAX_BLOBS_PER_BLOCK"], "9");
+    }
+
+    // -- EIP-8198 slot schedule ----------------------------------------------
+
+    const SPE: u64 = preset::SLOTS_PER_EPOCH;
+    const GENESIS_MS: u64 = 1_700_000_000_000;
+
+    /// 12 s slots, switching to 9 s at epoch 2.
+    fn quick_slots() -> Config {
+        Config {
+            slot_duration_ms: 12_000,
+            slot_duration_ms_heze: 9_000,
+            heze_fork_epoch: 2,
+            ..Config::mainnet()
+        }
+    }
+
+    #[test]
+    fn slot_durations_list_scheduled_forks_only() {
+        assert_eq!(quick_slots().slot_durations(), [(0, 12_000), (2, 9_000)]);
+        let unscheduled = Config {
+            heze_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            ..quick_slots()
+        };
+        assert_eq!(unscheduled.slot_durations(), [(0, 12_000)]);
+        let at_genesis = Config {
+            heze_fork_epoch: 0,
+            ..quick_slots()
+        };
+        assert_eq!(at_genesis.slot_durations(), [(0, 12_000), (0, 9_000)]);
+        assert_eq!(at_genesis.slot_duration_ms_at_epoch(0), 9_000);
+    }
+
+    #[test]
+    fn slot_duration_switches_at_the_fork_epoch() {
+        let config = quick_slots();
+        assert_eq!(config.slot_duration_ms_at_epoch(0), 12_000);
+        assert_eq!(config.slot_duration_ms_at_epoch(1), 12_000);
+        assert_eq!(config.slot_duration_ms_at_epoch(2), 9_000);
+        assert_eq!(config.slot_duration_ms_at_epoch(1_000), 9_000);
+        assert_eq!(config.slot_duration_ms_at_slot(2 * SPE - 1), 12_000);
+        assert_eq!(config.slot_duration_ms_at_slot(2 * SPE), 9_000);
+    }
+
+    #[test]
+    fn time_at_slot_is_piecewise() {
+        let config = quick_slots();
+        assert_eq!(config.time_at_slot_ms(GENESIS_MS, 0), GENESIS_MS);
+        assert_eq!(
+            config.time_at_slot_ms(GENESIS_MS, 2 * SPE),
+            GENESIS_MS + 2 * SPE * 12_000
+        );
+        assert_eq!(
+            config.time_at_slot_ms(GENESIS_MS, 2 * SPE + 3),
+            GENESIS_MS + 2 * SPE * 12_000 + 3 * 9_000
+        );
+        // The last slot before the fork still takes 12 s to run.
+        let last_old = config.time_at_slot_ms(GENESIS_MS, 2 * SPE - 1);
+        let first_new = config.time_at_slot_ms(GENESIS_MS, 2 * SPE);
+        assert_eq!(first_new - last_old, 12_000);
+        let second_new = config.time_at_slot_ms(GENESIS_MS, 2 * SPE + 1);
+        assert_eq!(second_new - first_new, 9_000);
+    }
+
+    #[test]
+    fn time_at_slot_without_a_fork_is_linear() {
+        let config = Config {
+            heze_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            ..quick_slots()
+        };
+        assert_eq!(
+            config.time_at_slot_ms(GENESIS_MS, 1_000),
+            GENESIS_MS + 12_000_000
+        );
+        // Heze at genesis: every slot is 9 s.
+        let at_genesis = Config {
+            heze_fork_epoch: 0,
+            ..quick_slots()
+        };
+        assert_eq!(
+            at_genesis.time_at_slot_ms(GENESIS_MS, 10),
+            GENESIS_MS + 90_000
+        );
+    }
+
+    #[test]
+    fn slot_and_time_round_trip_across_the_fork() {
+        for config in [
+            quick_slots(),
+            Config {
+                heze_fork_epoch: 0,
+                ..quick_slots()
+            },
+            Config {
+                heze_fork_epoch: constants::FAR_FUTURE_EPOCH,
+                ..quick_slots()
+            },
+        ] {
+            for slot in 0..(4 * SPE) {
+                let start = config.time_at_slot_ms(GENESIS_MS, slot);
+                let duration = config.slot_duration_ms_at_slot(slot);
+                for offset in [0, 1, duration / 2, duration - 1] {
+                    assert_eq!(
+                        config.slot_at_time_ms(GENESIS_MS, start + offset),
+                        slot,
+                        "slot {slot} offset {offset} heze epoch {}",
+                        config.heze_fork_epoch
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn slot_at_time_around_genesis_and_the_fork_boundary() {
+        let config = quick_slots();
+        assert_eq!(config.slot_at_time_ms(GENESIS_MS, GENESIS_MS - 1), 0);
+        assert_eq!(config.slot_at_time_ms(GENESIS_MS, GENESIS_MS), 0);
+        let fork_ms = config.time_at_slot_ms(GENESIS_MS, 2 * SPE);
+        assert_eq!(config.slot_at_time_ms(GENESIS_MS, fork_ms - 1), 2 * SPE - 1);
+        assert_eq!(config.slot_at_time_ms(GENESIS_MS, fork_ms), 2 * SPE);
+        assert_eq!(config.slot_at_time_ms(GENESIS_MS, fork_ms + 8_999), 2 * SPE);
+        assert_eq!(
+            config.slot_at_time_ms(GENESIS_MS, fork_ms + 9_000),
+            2 * SPE + 1
+        );
+    }
+
+    #[test]
+    fn payload_timestamp_steps_by_the_new_duration_after_the_fork() {
+        let config = quick_slots();
+        let genesis = GENESIS_MS / 1_000;
+        let before = config.time_at_slot(genesis, 2 * SPE - 1);
+        let first = config.time_at_slot(genesis, 2 * SPE);
+        let second = config.time_at_slot(genesis, 2 * SPE + 1);
+        assert_eq!(first - before, 12);
+        assert_eq!(second - first, 9);
+    }
+
+    #[test]
+    fn blob_data_retention_window_keeps_its_wall_clock_length() {
+        // Before the window fills, it starts at genesis.
+        let config = quick_slots();
+        assert_eq!(config.blob_data_retention_start_epoch(0), 0);
+        assert_eq!(config.blob_data_retention_start_epoch(10), 0);
+        // One slot duration throughout: a window of 4096 epochs.
+        let flat = Config {
+            heze_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            min_blob_data_retention_ms: 4_096 * SPE * 12_000,
+            ..quick_slots()
+        };
+        assert_eq!(flat.blob_data_retention_start_epoch(5_000), 5_000 - 4_096);
+        assert_eq!(flat.blob_data_retention_start_epoch(4_096), 0);
+        assert_eq!(flat.blob_data_retention_start_epoch(4_095), 0);
+        // Fork at epoch 1000, 6 s slots after it: the window is 1000 epochs of
+        // 12 s. Epoch 1300 reaches back 300 epochs of 6 s (150 epochs of 12 s)
+        // past the fork, and the remaining 850 epochs of 12 s before it.
+        let fork = Config {
+            heze_fork_epoch: 1_000,
+            slot_duration_ms: 12_000,
+            slot_duration_ms_heze: 6_000,
+            min_blob_data_retention_ms: 1_000 * SPE * 12_000,
+            ..Config::mainnet()
+        };
+        assert_eq!(
+            fork.blob_data_retention_start_epoch(1_300),
+            1_000 - (1_000 - 150)
+        );
+        // Entirely after the fork the same window spans twice the epochs.
+        assert_eq!(fork.blob_data_retention_start_epoch(3_500), 1_500);
+    }
+
+    #[test]
+    fn far_future_inputs_saturate_instead_of_overflowing() {
+        let config = quick_slots();
+        assert_eq!(config.time_at_slot_ms(GENESIS_MS, u64::MAX), u64::MAX);
+        assert_eq!(config.time_at_slot(u64::MAX, u64::MAX), u64::MAX / 1_000);
+        let at_far_epoch = Config {
+            heze_fork_epoch: u64::MAX - 1,
+            ..quick_slots()
+        };
+        assert_eq!(
+            at_far_epoch.time_at_slot_ms(GENESIS_MS, 10),
+            GENESIS_MS + 120_000
+        );
+        let _ = config.slot_at_time_ms(GENESIS_MS, u64::MAX);
+        let _ = config.blob_data_retention_start_epoch(u64::MAX);
+        assert_eq!(
+            Config {
+                genesis_time: u64::MAX,
+                ..quick_slots()
+            }
+            .genesis_time_ms(),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn default_slot_schedule_values_match_the_spec_configs() {
+        assert_eq!(Config::mainnet().slot_duration_ms_heze, 10_000);
+        assert_eq!(Config::mainnet().min_blob_data_retention_ms, 1_572_864_000);
+        assert_eq!(Config::minimal().slot_duration_ms_heze, 5_000);
+        assert_eq!(Config::minimal().min_blob_data_retention_ms, 196_608_000);
+    }
+
+    #[test]
+    fn a_config_file_without_the_heze_slot_duration_gets_the_preset_default() {
+        let parsed: Config = serde_yaml_ng::from_str("SLOT_DURATION_MS_HEZE: 9000").unwrap();
+        assert_eq!(parsed.slot_duration_ms_heze, 9_000);
+        let absent: Config = serde_yaml_ng::from_str("MIN_BLOB_DATA_RETENTION_MS: 7").unwrap();
+        assert_eq!(absent.slot_duration_ms_heze, 10_000);
+        assert_eq!(absent.min_blob_data_retention_ms, 7);
+    }
+
+    #[test]
+    fn slot_durations_must_be_positive_whole_seconds() {
+        assert!(Config::mainnet().check_slot_durations().is_ok());
+        let sub_second = Config {
+            slot_duration_ms_heze: 9_500,
+            ..Config::mainnet()
+        };
+        let err = sub_second.check_slot_durations().unwrap_err();
+        assert!(err.contains("SLOT_DURATION_MS_HEZE"), "got {err}");
+        let zero = Config {
+            slot_duration_ms_heze: 0,
+            ..Config::mainnet()
+        };
+        assert!(zero.check_slot_durations().is_err());
     }
 }

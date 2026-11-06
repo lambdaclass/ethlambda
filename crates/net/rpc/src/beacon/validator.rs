@@ -23,7 +23,6 @@ use ethlambda_types::{
             BeaconState,
             shared::{AttestationData, Checkpoint},
         },
-        fork::ForkName,
         fork_choice::PayloadStatus,
         preset,
         primitives::{BlsPubkey, CommitteeIndex, Epoch, ExecutionAddress, Slot, ValidatorIndex},
@@ -582,6 +581,7 @@ fn proposer_duties(
     let proposer_lookahead = match state.as_ref() {
         BeaconState::Fulu(fulu) => &fulu.proposer_lookahead,
         BeaconState::Gloas(gloas) => &gloas.proposer_lookahead,
+        BeaconState::Heze(heze) => &heze.proposer_lookahead,
         _ => {
             return Err(ApiError::BadRequest(
                 "proposer duties are served from the proposer lookahead of fulu and gloas only",
@@ -813,7 +813,7 @@ fn attestation_data(store: &Store, slot: Slot) -> Result<AttestationData, ApiErr
         root: block_root_at_or_before(&state, head_root, epoch_start)?,
     };
 
-    let index = if store.config().fork_at_epoch(epoch) == ForkName::Gloas {
+    let index = if store.config().fork_at_epoch(epoch).is_gloas_or_later() {
         payload_present_index(store, &state, slot)?
     } else {
         0
@@ -849,7 +849,7 @@ fn payload_present_index(
     if head_state.slot() == slot {
         return Ok(0);
     }
-    if !matches!(head_state, BeaconState::Gloas(_)) {
+    if !matches!(head_state, BeaconState::Gloas(_) | BeaconState::Heze(_)) {
         return Ok(1);
     }
     let status = match store.head_payload_status() {

@@ -37,6 +37,7 @@ use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::DataColumnSidecar;
 use ethlambda_types::beacon::containers::SignedBeaconBlock;
 use ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope;
+use ethlambda_types::beacon::containers::heze::SignedInclusionList;
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::fork_digest::compute_fork_digest;
 use ethlambda_types::beacon::preset;
@@ -439,6 +440,100 @@ where
         Ok(envelope)
     })
     .await
+}
+
+/// Write an inclusion list response: one result code, one `ForkDigest` and
+/// one payload per list.
+///
+/// The context epoch is the list's own slot's, the rule the spec gives for
+/// `InclusionListsByIndices`.
+pub async fn write_inclusion_lists_response<T>(
+    io: &mut T,
+    label: &'static str,
+    config: &Config,
+    genesis_validators_root: Root,
+    lists: &[SignedInclusionList],
+) -> io::Result<()>
+where
+    T: AsyncWrite + Unpin + Send,
+{
+    for list in lists
+        .iter()
+        .take(protocols::MAX_REQUEST_INCLUSION_LIST as usize)
+    {
+        let digest = compute_fork_digest(
+            config,
+            genesis_validators_root,
+            list.message.slot / preset::SLOTS_PER_EPOCH,
+        );
+        write_success_chunk(io, label, &digest, list.to_ssz()).await?;
+    }
+    Ok(())
+}
+
+/// Read an inclusion list response: one `SignedInclusionList` per chunk,
+/// until the peer closes.
+///
+/// The counterpart of [`decode_execution_payload_envelopes_response`]: the
+/// context must be the digest of a heze-or-later fork, and the digest the
+/// list's own slot gives.
+pub async fn decode_inclusion_lists_response<T>(
+    io: &mut T,
+    protocol_label: &str,
+    config: &Config,
+    genesis_validators_root: Root,
+) -> io::Result<Vec<SignedInclusionList>>
+where
+    T: AsyncRead + Unpin + Send,
+{
+    let limits = ChunkLimits {
+        has_context: true,
+        max_chunks: protocols::MAX_REQUEST_INCLUSION_LIST as usize,
+    };
+    let schedule = ForkSchedule::new(config, genesis_validators_root);
+    read_chunked_response(io, protocol_label, limits, |context, payload| {
+        let fork = <[u8; 4]>::try_from(context)
+            .ok()
+            .and_then(|digest| schedule.fork_for_digest(digest));
+        if !fork.is_some_and(carries_inclusion_lists) {
+            return Err(invalid(format!(
+                "inclusion list chunk context {} is not a heze-or-later fork digest",
+                hex::encode(context),
+            )));
+        }
+        let list = SignedInclusionList::from_ssz_bytes(payload)
+            .map_err(|err| invalid(format!("inclusion list chunk: {err:?}")))?;
+        let slot = list.message.slot;
+        let expected = schedule.digest_at(slot / preset::SLOTS_PER_EPOCH);
+        if context != expected {
+            return Err(invalid(format!(
+                "inclusion list chunk context {} does not match {} for slot {}",
+                hex::encode(context),
+                hex::encode(expected),
+                slot,
+            )));
+        }
+        Ok(list)
+    })
+    .await
+}
+
+/// Whether `fork` has inclusion lists: heze and every beacon fork after it.
+/// An explicit match for the reason `ForkName::has_payload_envelopes` gives:
+/// lean sorts after every beacon fork but has none.
+fn carries_inclusion_lists(fork: ForkName) -> bool {
+    match fork {
+        ForkName::Heze => true,
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb
+        | ForkName::Electra
+        | ForkName::Fulu
+        | ForkName::Gloas
+        | ForkName::Lean => false,
+    }
 }
 
 /// Test fixtures shared by the codec and handler tests.

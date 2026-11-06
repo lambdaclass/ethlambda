@@ -500,8 +500,9 @@ rollover, see Networking). `refuse_unfollowable_fork` in `main.rs` and
 the next fork the node cannot follow: the first refuses such an anchor with
 `UnsupportedFork`, the second warns once per scheduled fork for which
 `ForkName::is_followed` answers no (the one place that says which forks the
-node follows). The ignored-keys warning only ever names heze's keys and
-`GAS_LIMIT_SCHEDULE`/`INCLUSION_LIST_DUE_BPS`.
+node follows). The ignored-keys warning only ever names later forks' keys
+(`EIP8321_*`, `EIP8198_*`), `GAS_LIMIT_SCHEDULE` and the other list-valued
+schedules.
 Platåberget (the Glamsterdam testnet) is already past its `GLOAS_FORK_EPOCH`,
 so its checkpoint anchor is a gloas state: it is accepted, starts with no
 payload known (head EMPTY), and its first FULL child is held until the anchor's
@@ -865,11 +866,43 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   (every fork's cases for topics it has no validator for, cases from forks a
   validated topic's rules do not cover per `validated_forks`, gloas's
   operation vectors among them, and the vectors in `SKIPPED`, which assume a
-  bad-block cache), and the `heze` fixture tree. `heze` does
-  not parse as a `ForkName`, so `collect` would skip it silently;
-  `UNMODELED_FORKS` names it and
+  bad-block cache). `UNMODELED_FORKS` is empty: every fork directory at the
+  pinned release parses, `heze` included, and
   `fixture_forks/every_directory_is_accounted_for` fails on any fork directory
   that is neither parseable nor listed, so a new fork forces a decision.
+- **Heze** (EIP-7805 FOCIL, EIP-8015) is gloas plus inclusion lists, without the
+  eth1 and deposit-index fields. It has its own containers in
+  `containers::heze` (`BeaconState`, `BeaconBlockBody`, `BeaconBlock`,
+  `SignedBeaconBlock`), progressive containers whose `active_fields` leave gaps
+  where EIP-8015 removed `eth1_data`, `deposits` and four state fields, so the
+  rest keep their generalized indices; `BeaconState::Heze` and
+  `SignedBeaconBlock::Heze` are the enum variants. The one thing it still
+  shares is the bid: `containers::gloas::ExecutionPayloadBid` carries
+  `inclusion_list_bits` as an `Option` (`None` gloas, `Some` heze) with
+  hand-written SSZ (the two shapes differ in the fixed part's length, which the
+  first offset gives away); `from_ssz(fork, ..)` checks the shape against the
+  fork it was asked for. Code that serves both forks reads gloas-family fields
+  through the `BeaconState` accessors (`builders()`, `ptc_window_mut()`, ...,
+  `UnsupportedForFork` before gloas), through the `gloas_family!` macro when it
+  needs several at once, and a block through `SignedBeaconBlock::gloas_message`
+  (`GloasBlockRef`) or, while a proposer builds one, `GloasBlock`. The eth1
+  accessors (`eth1_data()`, ...) answer `UnsupportedForFork` for heze. A rule stated "from gloas on" asks
+  `ForkName::is_gloas_or_later`, never `== ForkName::Gloas`. `upgrade_to_heze`
+  asserts the eth1 bridge is retired, drops the four state fields, sets the fork
+  version and an empty `inclusion_list_bits`; heze's `process_epoch` and
+  `process_block` skip the eth1 steps. The rest of heze:
+  the `InclusionListStore` pool on `Store` (`inclusion_list_store()`, in
+  memory, 64 slots), `beacon::inclusion_list` (committee, signature,
+  `on_inclusion_list`, committee state read from caches only),
+  `gossip::inclusion_list` and the bid topic's inclusive-bits IGNORE, fork
+  choice's `payload_inclusion_list_satisfaction` (recorded by the chain actor
+  from `engine_newPayloadV6`'s `inclusionListSatisfied` and fcU V5's on a
+  `VALID` verdict; a missing record reads as satisfied) gating
+  `should_extend_payload`, the `inclusion_list` topic, `InclusionListsByIndices`
+  served (never requested), production feeding the previous slot's lists into
+  `PayloadAttributesV5` and the self-build bid's bits, the Beacon API's IL
+  duties/produce/publish endpoints, and the validator client's IL duty. See
+  `docs/spec_deviations.md`.
 - A fixture case with no `post` state asserts the input must be **rejected**. That
   rule lives in `check_transition`; do not add a runner that ignores it.
 
@@ -993,16 +1026,20 @@ behavior.
   in-memory map stays as a write-through cache in front of the table. Pruned
   on finalization to the same horizon as `LiveChain` (the finalized block's
   own slot, keeping that block's own entry).
-- `DB_VERSION` is 7: `States` and `StateDiffs` moved from root keys to
-  slot||root keys (the block's slot, looked up from `BlockHeaders` by readers)
-  so `Store::prune_finalized_states` can range-delete finalized states; a
-  directory written by an earlier version holds rows no lookup finds. (6 was
-  the gloas schedule, timing and churn keys in `Config`, which is SSZ-encoded
-  under `KEY_CONFIG`; 5 was the unrealized-justifications table, since a
-  directory written before it has no row there for any block it already
-  imported; 4 was `PRESET_BASE`/`CONFIG_NAME` at the front of `Config`; 3 was
-  the runtime keys a `config.yaml` supplies.) `Store::from_db_state` refuses
-  any other version outright; there is no migration.
+- `DB_VERSION` is 9: heze's own state and block containers (EIP-8015), so a
+  heze row written earlier no longer decodes, and EIP-8198's
+  `SLOT_DURATION_MS_HEZE` and `MIN_BLOB_DATA_RETENTION_MS` appended to
+  `Config`. 8 is skipped: the heze devnet branches shipped these two changes as
+  their 7 and 8 without this line's 7, so their directories must not pass as
+  current. (7 was `States` and `StateDiffs` moving from root keys to slot||root
+  keys (the block's slot, looked up from `BlockHeaders` by readers) so
+  `Store::prune_finalized_states` can range-delete finalized states; 6 was the
+  gloas schedule, timing and churn keys in `Config`, which is SSZ-encoded under
+  `KEY_CONFIG`; 5 was the unrealized-justifications table, since a directory
+  written before it has no row there for any block it already imported; 4 was
+  `PRESET_BASE`/`CONFIG_NAME` at the front of `Config`; 3 was the runtime keys
+  a `config.yaml` supplies.) `Store::from_db_state` refuses any other version
+  outright; there is no migration.
 
 ### State Root Computation
 - Always computed via `hash_tree_root()` after full state transition

@@ -61,7 +61,8 @@ use ethlambda_types::{
     aggregator::AggregatorController,
     beacon::config::Config,
     beacon::containers::{
-        BeaconState, SignedBeaconBlock, altair, bellatrix, capella, deneb, electra, gloas, phase0,
+        BeaconState, SignedBeaconBlock, altair, bellatrix, capella, deneb, electra, gloas, heze,
+        phase0,
     },
     beacon::fork::ForkName,
     beacon::primitives::Epoch,
@@ -715,10 +716,15 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     // A handshake failure is not a reason to refuse to run: the
                     // execution client may simply be starting up, and every
                     // call that matters has its own retry ladder.
-                    let gloas_scheduled = store.config().gloas_fork_epoch
-                        != ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
+                    let far_future = ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
+                    let gloas_scheduled = store.config().gloas_fork_epoch != far_future;
+                    let heze_scheduled = store.config().heze_fork_epoch != far_future;
                     let _ = client
-                        .handshake(&version::engine_client_version(), gloas_scheduled)
+                        .handshake(
+                            &version::engine_client_version(),
+                            gloas_scheduled,
+                            heze_scheduled,
+                        )
                         .await
                         .inspect_err(|err| warn!(%err, "Engine API handshake failed"));
 
@@ -1826,6 +1832,8 @@ fn first_config_difference(
         fulu_fork_epoch: _,
         gloas_fork_version: _,
         gloas_fork_epoch: _,
+        heze_fork_version: _,
+        heze_fork_epoch: _,
 
         // Time parameters: `seconds_per_slot`/`slot_duration_ms` (compared
         // below) move every slot boundary. The rest are operator-visible
@@ -1833,6 +1841,9 @@ fn first_config_difference(
         // not change which block is valid.
         seconds_per_slot: _,
         slot_duration_ms: _,
+        // Compared below with `slot_duration_ms`: from the heze epoch on it
+        // moves every slot boundary (EIP-8198).
+        slot_duration_ms_heze: _,
         seconds_per_eth1_block: _,
         // Compared below: bounds how many validators may enter the
         // exit/activation queue and when a proposer/exiting validator is
@@ -1854,6 +1865,9 @@ fn first_config_difference(
         // Compared below, alongside `min_validator_withdrawability_delay`:
         // the builder-registry counterpart, also a state-transition rule.
         min_builder_withdrawability_delay: _,
+        // A timeliness deadline like the `*_due_bps` above: it changes which
+        // inclusion lists count as timely, not which block is valid.
+        inclusion_list_due_bps: _,
 
         // Validator cycle: compared below. Churn and inactivity-leak
         // parameters change which exits, activations and inactivity scores a
@@ -1914,6 +1928,9 @@ fn first_config_difference(
         message_domain_valid_snappy: _,
         min_epochs_for_blob_sidecars_requests: _,
         min_epochs_for_data_column_sidecars_requests: _,
+        // The heze-era form of the retention window above: how long this node
+        // serves blob data, not which block is valid.
+        min_blob_data_retention_ms: _,
         subnets_per_node: _,
 
         // Deposit contract: compared below. Never read by the state
@@ -1944,6 +1961,12 @@ fn first_config_difference(
         max_request_blob_sidecars_electra: _,
         max_request_data_column_sidecars: _,
         min_epochs_for_block_requests: _,
+
+        // Inclusion lists (heze): request bounds and the gossip size cap, the
+        // same wire-description reasoning as the networking groups above.
+        max_request_inclusion_list: _,
+        min_slots_for_inclusion_lists_requests: _,
+        max_transactions_bytes_per_inclusion_list: _,
     } = persisted;
 
     compare!(preset_base);
@@ -2004,6 +2027,7 @@ fn first_config_difference(
     compare!(
         seconds_per_slot,
         slot_duration_ms,
+        slot_duration_ms_heze,
         min_validator_withdrawability_delay,
         min_builder_withdrawability_delay,
         shard_committee_period,
@@ -2298,6 +2322,54 @@ async fn fetch_initial_beacon_state(
 /// rebuilding it here and letting `get_forkchoice_store` check the header
 /// hash is what proves this reconstruction matches what the state actually
 /// describes, rather than assuming it.
+/// The body a gloas or heze genesis header commits to.
+///
+/// The specification's genesis commits to the empty body. ethpandaops'
+/// genesis generator (`eth-beacon-genesis`), which builds the devnets, commits
+/// to one whose bid is the state's own `latest_execution_payload_bid` (the
+/// execution genesis hash as parent, the empty requests' root) instead. The
+/// header names whichever of the two the network was built with, so that one
+/// is the anchor's; when it names neither, the empty body is returned and
+/// `get_forkchoice_store`'s header check reports the mismatch.
+fn gloas_genesis_body(state: &BeaconState) -> gloas::BeaconBlockBody {
+    let empty = gloas::BeaconBlockBody::empty_at(ForkName::Gloas);
+    mirrored_genesis_body(state, empty, |body, bid| {
+        body.signed_execution_payload_bid.message = bid;
+    })
+}
+
+/// [`gloas_genesis_body`] for heze, whose body has no `eth1_data` and `deposits`
+/// (EIP-8015).
+fn heze_genesis_body(state: &BeaconState) -> heze::BeaconBlockBody {
+    let empty = heze::BeaconBlockBody::empty();
+    mirrored_genesis_body(state, empty, |body, bid| {
+        body.signed_execution_payload_bid.message = bid;
+    })
+}
+
+/// `empty`, or `empty` with the state's own bid when that is the body the
+/// state's header commits to; `empty` again when it names neither.
+fn mirrored_genesis_body<B: Clone + ethlambda_types::beacon::primitives::HashTreeRoot>(
+    state: &BeaconState,
+    empty: B,
+    set_bid: impl FnOnce(&mut B, gloas::ExecutionPayloadBid),
+) -> B {
+    let body_root = state.latest_block_header().body_root;
+    if ethlambda_types::beacon::primitives::HashTreeRoot::hash_tree_root(&empty) == body_root {
+        return empty;
+    }
+    let Ok(bid) = state.latest_execution_payload_bid() else {
+        return empty;
+    };
+    let mut mirrored = empty.clone();
+    set_bid(&mut mirrored, bid.clone());
+    if ethlambda_types::beacon::primitives::HashTreeRoot::hash_tree_root(&mirrored) == body_root {
+        mirrored
+    } else {
+        empty
+    }
+}
+
 fn genesis_anchor_block(state: &BeaconState) -> SignedBeaconBlock {
     let header = state.latest_block_header();
     let slot = header.slot;
@@ -2385,7 +2457,17 @@ fn genesis_anchor_block(state: &BeaconState) -> SignedBeaconBlock {
                 proposer_index,
                 parent_root,
                 state_root,
-                body: gloas::BeaconBlockBody::empty(),
+                body: gloas_genesis_body(state),
+            },
+            signature: Default::default(),
+        }),
+        ForkName::Heze => SignedBeaconBlock::Heze(heze::SignedBeaconBlock {
+            message: heze::BeaconBlock {
+                slot,
+                proposer_index,
+                parent_root,
+                state_root,
+                body: heze_genesis_body(state),
             },
             signature: Default::default(),
         }),
@@ -3306,6 +3388,27 @@ validators:
         );
     }
 
+    /// EIP-8198: the Heze slot duration moves every slot boundary past the
+    /// fork, so a resume with a different one is refused; the blob retention
+    /// window only changes what this node serves, so it is not.
+    #[test]
+    fn a_changed_heze_slot_duration_is_caught_but_a_changed_blob_retention_is_not() {
+        let persisted = Config::mainnet();
+
+        let mut supplied = Config::mainnet();
+        supplied.slot_duration_ms_heze += 1_000;
+        let difference = first_config_difference(&persisted, &supplied, 0)
+            .expect("a changed SLOT_DURATION_MS_HEZE must be caught");
+        assert!(
+            difference.starts_with("slot_duration_ms_heze:"),
+            "got {difference}"
+        );
+
+        let mut supplied = Config::mainnet();
+        supplied.min_blob_data_retention_ms += 1;
+        assert_eq!(first_config_difference(&persisted, &supplied, 0), None);
+    }
+
     /// A changed `PRESET_BASE` is refused, and the error shows both names as
     /// text. A changed `CONFIG_NAME` is a label with no consensus effect, so it
     /// resumes (the caller only warns), unless a chain value changed with it.
@@ -3486,6 +3589,15 @@ validators:
         let mut state = beacon::mainnet_genesis_state().unwrap();
 
         for fork in ForkName::ALL {
+            if fork == ForkName::Heze {
+                // Heze's upgrade asserts the eth1 bridge is retired (EIP-8015),
+                // which a genesis state that never processed a deposit request
+                // does not satisfy on its own.
+                let BeaconState::Gloas(inner) = &mut state else {
+                    panic!("the chain is at gloas before the heze upgrade");
+                };
+                inner.deposit_requests_start_index = inner.eth1_deposit_index;
+            }
             if fork != ForkName::Phase0 {
                 state = ethlambda_state_transition::beacon::upgrade::upgrade_state(
                     &state, fork, &config,
@@ -3502,7 +3614,8 @@ validators:
                 ForkName::Electra | ForkName::Fulu => {
                     electra::BeaconBlockBody::empty().hash_tree_root()
                 }
-                ForkName::Gloas => gloas::BeaconBlockBody::empty().hash_tree_root(),
+                ForkName::Gloas => gloas::BeaconBlockBody::empty_at(fork).hash_tree_root(),
+                ForkName::Heze => heze::BeaconBlockBody::empty().hash_tree_root(),
                 ForkName::Lean => unreachable!("ForkName::ALL excludes Lean"),
             };
             state.latest_block_header_mut().body_root = empty_body_root;
@@ -3517,6 +3630,38 @@ validators:
                 "invariant broke at fork {fork:?}"
             );
         }
+    }
+
+    /// A gloas genesis built by ethpandaops' `eth-beacon-genesis` commits to a
+    /// body whose bid is the state's own `latest_execution_payload_bid`, not
+    /// the empty body; the anchor block must hash to that header too.
+    #[test]
+    fn a_gloas_genesis_anchor_matches_the_generators_mirrored_bid_body() {
+        let mut config = Config::mainnet();
+        let mut state = beacon::mainnet_genesis_state().unwrap();
+        for fork in ForkName::ALL
+            .into_iter()
+            .skip(1)
+            .take_while(|fork| *fork <= ForkName::Gloas)
+        {
+            config = config.with_fork_epoch(fork, 0);
+            state =
+                ethlambda_state_transition::beacon::upgrade::upgrade_state(&state, fork, &config)
+                    .unwrap();
+        }
+        let BeaconState::Gloas(inner) = &mut state else {
+            panic!("the upgrade chain ends at gloas");
+        };
+        inner.latest_execution_payload_bid.parent_block_hash =
+            ethlambda_types::beacon::primitives::ExecutionBlockHash::repeat_byte(0xfd);
+        let mut mirrored = gloas::BeaconBlockBody::empty_at(ForkName::Gloas);
+        mirrored.signed_execution_payload_bid.message = inner.latest_execution_payload_bid.clone();
+        state.latest_block_header_mut().body_root = mirrored.hash_tree_root();
+
+        let block = genesis_anchor_block(&state);
+        let mut header = state.latest_block_header().clone();
+        header.state_root = state.hash_tree_root();
+        assert_eq!(block.message_hash_tree_root(), header.hash_tree_root());
     }
 
     /// A unique path under the OS temp dir, so parallel test runs cannot

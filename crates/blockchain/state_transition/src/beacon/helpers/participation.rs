@@ -40,7 +40,6 @@ use crate::beacon::primitives::Gwei;
 
 use super::accessors::{get_current_epoch, get_previous_epoch};
 use super::altair::has_flag;
-use super::math::integer_squareroot;
 use super::predicates::is_active_validator;
 
 /// Number of timeliness flags a validator can earn.
@@ -301,6 +300,11 @@ pub struct RewardContext {
     leaking: bool,
     fork: ForkName,
     base_reward_per_increment: Gwei,
+    /// The slot duration in effect at the previous epoch, which the rewards
+    /// and penalties being computed pay for (EIP-8198), and the genesis one
+    /// the inactivity penalty is scaled against.
+    previous_slot_duration_ms: u64,
+    genesis_slot_duration_ms: u64,
     active_increments: Gwei,
     participating_increments: [Gwei; FLAG_COUNT],
 }
@@ -312,13 +316,23 @@ impl RewardContext {
     ///
     /// Fails when that finality is past the previous epoch (see
     /// [`get_finality_delay`](super::finality::get_finality_delay)).
-    pub fn new(state: &BeaconState, totals: &ParticipationTotals) -> Result<Self> {
+    ///
+    /// [Modified in Heze:EIP8198]: rewards and penalties pay for the previous
+    /// epoch, so they are priced at the slot duration in effect at that
+    /// epoch (the one that differs from the current epoch's in the first
+    /// epoch after a slot duration change).
+    pub fn new(state: &BeaconState, totals: &ParticipationTotals, config: &Config) -> Result<Self> {
+        let previous_epoch = get_previous_epoch(state);
         Ok(Self {
             leaking: super::finality::is_in_inactivity_leak(state)?,
             fork: state.fork_name(),
-            base_reward_per_increment: preset::EFFECTIVE_BALANCE_INCREMENT
-                * preset::BASE_REWARD_FACTOR
-                / integer_squareroot(totals.total_active_balance),
+            base_reward_per_increment: super::altair::base_reward_per_increment_at(
+                totals.total_active_balance,
+                previous_epoch,
+                config,
+            ),
+            previous_slot_duration_ms: config.slot_duration_ms_at_epoch(previous_epoch),
+            genesis_slot_duration_ms: config.slot_duration_ms_at_epoch(constants::GENESIS_EPOCH),
             active_increments: totals.total_active_balance / preset::EFFECTIVE_BALANCE_INCREMENT,
             participating_increments: totals
                 .previous_epoch_flags
@@ -386,7 +400,18 @@ impl RewardContext {
                     "effective_balance * inactivity_scores[index]",
                 ))?;
         let inactivity_penalty_quotient = preset::retuned::inactivity_penalty_quotient(self.fork);
-        let penalty_denominator = config.inactivity_score_bias * inactivity_penalty_quotient;
+        // [Modified in Heze:EIP8198] the penalty grows with the square of the
+        // epoch duration, so the cumulative penalty over a fixed wall-clock
+        // leak is unchanged; multiply before dividing, as the specification
+        // does.
+        let genesis_duration = u128::from(self.genesis_slot_duration_ms);
+        let previous_duration = u128::from(self.previous_slot_duration_ms);
+        let penalty_denominator = u128::from(config.inactivity_score_bias)
+            * u128::from(inactivity_penalty_quotient)
+            * genesis_duration
+            * genesis_duration
+            / (previous_duration * previous_duration);
+        let penalty_denominator = u64::try_from(penalty_denominator).unwrap_or(u64::MAX);
         Ok(penalty_numerator / penalty_denominator)
     }
 

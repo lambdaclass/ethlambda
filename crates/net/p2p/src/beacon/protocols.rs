@@ -13,6 +13,10 @@
 //! same reason the column ones are: the server side answers out of
 //! `Table::ExecutionPayloadEnvelopes`. Nothing requests them yet.
 //!
+//! Heze's `inclusion_lists_by_indices/1` is registered inbound only: the
+//! server side answers out of the inclusion list store, and this node sends no
+//! such request yet, so it does not offer the outbound half.
+//!
 //! Only version 2 of the two block protocols is registered. Version 1 is
 //! deprecated by the spec, which lets a client answer it with an empty list,
 //! and its chunks carry no `<context-bytes>`, so serving it would mean a second
@@ -39,6 +43,13 @@ pub const EXECUTION_PAYLOAD_ENVELOPES_BY_RANGE_V1: &str =
     "/eth2/beacon_chain/req/execution_payload_envelopes_by_range/1/ssz_snappy";
 pub const EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT_V1: &str =
     "/eth2/beacon_chain/req/execution_payload_envelopes_by_root/1/ssz_snappy";
+pub const INCLUSION_LISTS_BY_INDICES_V1: &str =
+    "/eth2/beacon_chain/req/inclusion_lists_by_indices/1/ssz_snappy";
+
+/// `MAX_REQUEST_INCLUSION_LIST`: the ceiling on one `InclusionListsByIndices`
+/// answer. The request's `indices` is a bitvector over the sixteen-member
+/// committee, so it can never ask for more.
+pub const MAX_REQUEST_INCLUSION_LIST: u64 = 16;
 
 /// `MAX_REQUEST_PAYLOADS`: the ceiling on either gloas envelope request, and
 /// on the list a response carries.
@@ -119,6 +130,10 @@ pub fn registrations() -> Vec<(StreamProtocol, ProtocolSupport)> {
             StreamProtocol::new(EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT_V1),
             ProtocolSupport::Full,
         ),
+        (
+            StreamProtocol::new(INCLUSION_LISTS_BY_INDICES_V1),
+            ProtocolSupport::Inbound,
+        ),
     ]
 }
 
@@ -142,6 +157,7 @@ pub fn label(protocol: &str) -> Option<&'static str> {
         EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT_V1 => {
             Some("beacon_execution_payload_envelopes_by_root")
         }
+        INCLUSION_LISTS_BY_INDICES_V1 => Some("beacon_inclusion_lists_by_indices"),
         _ => None,
     }
 }
@@ -194,6 +210,23 @@ mod tests {
             EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT_V1,
             "/eth2/beacon_chain/req/execution_payload_envelopes_by_root/1/ssz_snappy"
         );
+    }
+
+    #[test]
+    fn the_inclusion_list_protocol_id_is_the_spec_string() {
+        assert_eq!(
+            INCLUSION_LISTS_BY_INDICES_V1,
+            "/eth2/beacon_chain/req/inclusion_lists_by_indices/1/ssz_snappy"
+        );
+    }
+
+    #[test]
+    fn inclusion_lists_by_indices_is_inbound_only() {
+        let registration = registrations()
+            .into_iter()
+            .find(|(protocol, _)| protocol.as_ref() == INCLUSION_LISTS_BY_INDICES_V1)
+            .expect("inclusion_lists_by_indices is registered");
+        assert!(matches!(registration.1, ProtocolSupport::Inbound));
     }
 
     #[test]

@@ -34,10 +34,9 @@ use super::{
     IgnoreReason, Outcome, QueueReason, RejectReason, execution_requests_within_limits,
     finalized_start_slot,
 };
+use crate::beacon::containers::gloas;
 use crate::beacon::containers::gloas::BuilderIndex;
-use crate::beacon::containers::{SignedBeaconBlock, gloas};
 use crate::beacon::fork_choice::Store;
-use crate::beacon::lean_boundary::lean_block_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{HashTreeRoot as _, Root};
 use crate::beacon::stf::gloas::verify_execution_payload_envelope_signature;
@@ -124,23 +123,14 @@ pub fn stateful_checks(store: &Store, envelope: &gloas::SignedExecutionPayloadEn
         Ok(block) => block,
         Err(outcome) => return outcome,
     };
-    let block = match &block {
-        SignedBeaconBlock::Gloas(block) => &block.message,
-        // A block of any other fork carries no bid, so no envelope is valid
-        // for it.
-        SignedBeaconBlock::Phase0(_)
-        | SignedBeaconBlock::Altair(_)
-        | SignedBeaconBlock::Bellatrix(_)
-        | SignedBeaconBlock::Capella(_)
-        | SignedBeaconBlock::Deneb(_)
-        | SignedBeaconBlock::Electra(_)
-        | SignedBeaconBlock::Fulu(_) => return Outcome::Reject(RejectReason::BlockNotGloas),
-        SignedBeaconBlock::Lean(_) => lean_block_unreachable("envelope::stateful_checks"),
+    // A block of any other fork carries no bid, so no envelope is valid for it.
+    let Some(block) = block.gloas_message() else {
+        return Outcome::Reject(RejectReason::BlockNotGloas);
     };
-    let bid = &block.body.signed_execution_payload_bid.message;
+    let bid = &block.signed_execution_payload_bid().message;
 
     // [REJECT] The block's slot matches the payload's slot number.
-    if block.slot != payload.slot_number {
+    if block.slot() != payload.slot_number {
         return Outcome::Reject(RejectReason::SlotMismatch);
     }
     // [REJECT] The envelope is from the builder committed to by the bid.
@@ -194,6 +184,7 @@ mod tests {
 
     use super::*;
     use crate::beacon::containers::electra;
+    use crate::beacon::containers::{SignedBeaconBlock, gloas};
     use crate::beacon::gossip::test_support::{fulu_parent, seen_envelopes, store};
     use crate::beacon::primitives::Slot;
 

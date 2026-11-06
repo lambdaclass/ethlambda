@@ -53,7 +53,7 @@
 //!   passes it to `super::electra::drain_pending_deposits`, the loop electra
 //!   and fulu run.
 //! - **[`process_participation_flag_updates`] is gloas's own copy**, over
-//!   [`gloas::BeaconState`] directly (through `helpers::gloas::gloas_state`).
+//!   the gloas-family state (through `ethlambda_types::gloas_family!`).
 //!   It is unmodified in the specification,
 //!   but replaces the whole list (a new length, not an element write), which
 //!   only the fork's own concrete container type can do: electra's and
@@ -66,7 +66,7 @@ use crate::beacon::containers::{BeaconState, gloas};
 use crate::beacon::error::{Error, Result};
 use crate::beacon::helpers::accessors::{CommitteeCache, get_current_epoch};
 use crate::beacon::helpers::gloas::{
-    compute_ptc, get_activation_churn_limit, get_builder_payment_quorum_threshold, gloas_state,
+    compute_ptc, get_activation_churn_limit, get_builder_payment_quorum_threshold,
 };
 use crate::beacon::helpers::misc::compute_start_slot_at_epoch;
 use crate::beacon::preset;
@@ -79,12 +79,28 @@ use crate::beacon::preset;
 /// this module's own doc for which steps below are shared and which are
 /// gloas's own copy.
 pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
+    process_epoch_steps(state, config, true)
+}
+
+/// `process_epoch` (modified, Heze:EIP8015): gloas's, without
+/// `process_eth1_data_reset`, since heze's state has no `eth1_data_votes`.
+pub fn process_epoch_heze(state: &mut BeaconState, config: &Config) -> Result<()> {
+    process_epoch_steps(state, config, false)
+}
+
+fn process_epoch_steps(
+    state: &mut BeaconState,
+    config: &Config,
+    eth1_data_reset: bool,
+) -> Result<()> {
     super::altair::process_justification_and_finalization(state)?;
     super::altair::process_inactivity_updates(state, config)?;
     super::altair::process_rewards_and_penalties(state, config)?;
     super::electra::process_registry_updates(state, config)?;
     super::electra::process_slashings(state, config)?;
-    super::process_eth1_data_reset(state)?;
+    if eth1_data_reset {
+        super::process_eth1_data_reset(state)?;
+    }
     // [Modified in Gloas:EIP8061]
     process_pending_deposits(state, config)?;
     super::electra::process_pending_consolidations(state, config)?;
@@ -110,19 +126,19 @@ pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
 /// installs a fresh, all-zero current list, gloas's own copy of
 /// [`crate::beacon::stf::epoch::altair::process_participation_flag_updates`]:
 /// identical logic, writing gloas's own progressive lists through
-/// [`gloas_state`] (an infallible `From<Vec<_>>` conversion, unlike the
+/// `gloas_family!` (an infallible `From<Vec<_>>` conversion, unlike the
 /// bounded `EpochParticipation`'s fallible `TryFrom` altair's version needs).
 /// See this module's own doc for why that difference is what keeps this a
 /// separate copy rather than a shared, `Vec`-level function the way
 /// [`super::electra::process_pending_consolidations`] is.
 pub fn process_participation_flag_updates(state: &mut BeaconState) -> Result<()> {
     let validator_count = state.validator_count();
-    let inner = gloas_state(state, "process_participation_flag_updates")?;
-
-    inner.previous_epoch_participation = core::mem::take(&mut inner.current_epoch_participation);
-    inner.current_epoch_participation = vec![0; validator_count].into();
-
-    Ok(())
+    ethlambda_types::gloas_family!(state, "process_participation_flag_updates", |inner| {
+        inner.previous_epoch_participation =
+            core::mem::take(&mut inner.current_epoch_participation);
+        inner.current_epoch_participation = vec![0; validator_count].into();
+        Ok(())
+    })?
 }
 
 // ---------------------------------------------------------------------------
@@ -169,24 +185,26 @@ pub fn process_pending_deposits(state: &mut BeaconState, config: &Config) -> Res
 /// whole.
 pub fn process_builder_pending_payments(state: &mut BeaconState) -> Result<()> {
     let quorum = get_builder_payment_quorum_threshold(state)?;
-    let inner = gloas_state(state, "process_builder_pending_payments")?;
     let epoch_len = preset::SLOTS_PER_EPOCH as usize;
 
-    for payment in &inner.builder_pending_payments[..epoch_len] {
-        if payment.weight >= quorum {
-            inner
-                .builder_pending_withdrawals
-                .push(payment.withdrawal.clone());
+    ethlambda_types::gloas_family!(state, "process_builder_pending_payments", |inner| {
+        for payment in &inner.builder_pending_payments[..epoch_len] {
+            if payment.weight >= quorum {
+                inner
+                    .builder_pending_withdrawals
+                    .push(payment.withdrawal.clone());
+            }
         }
-    }
 
-    for index in 0..epoch_len {
-        inner.builder_pending_payments[index] =
-            inner.builder_pending_payments[epoch_len + index].clone();
-        inner.builder_pending_payments[epoch_len + index] = gloas::BuilderPendingPayment::default();
-    }
+        for index in 0..epoch_len {
+            inner.builder_pending_payments[index] =
+                inner.builder_pending_payments[epoch_len + index].clone();
+            inner.builder_pending_payments[epoch_len + index] =
+                gloas::BuilderPendingPayment::default();
+        }
 
-    Ok(())
+        Ok(())
+    })?
 }
 
 // ---------------------------------------------------------------------------
@@ -220,11 +238,11 @@ pub fn process_ptc_window(state: &mut BeaconState) -> Result<()> {
         new_slice.push(compute_ptc(state, slot, &committees)?);
     }
 
-    let inner = gloas_state(state, "process_ptc_window")?;
+    let ptc_window = state.ptc_window_mut()?;
     let mut window = Vec::with_capacity(preset::PTC_WINDOW_LENGTH);
-    window.extend_from_slice(&inner.ptc_window[slots_per_epoch..]);
+    window.extend_from_slice(&ptc_window[slots_per_epoch..]);
     window.extend(new_slice);
-    inner.ptc_window = window.try_into().expect(
+    *ptc_window = window.try_into().expect(
         "dropping SLOTS_PER_EPOCH entries and appending SLOTS_PER_EPOCH more preserves \
          PTC_WINDOW_LENGTH",
     );
@@ -238,7 +256,7 @@ mod tests {
     use crate::beacon::containers::electra;
     use crate::beacon::fork::ForkName;
     use crate::beacon::helpers::accessors::get_total_active_balance;
-    use crate::beacon::helpers::gloas::{get_ptc, gloas_state_ref};
+    use crate::beacon::helpers::gloas::get_ptc;
     use crate::beacon::primitives::ValidatorIndex;
 
     /// A gloas state with `count` fully active, full-balance validators,
@@ -250,11 +268,17 @@ mod tests {
     }
 
     fn gloas_inner(state: &BeaconState) -> &gloas::BeaconState {
-        gloas_state_ref(state, "test").unwrap()
+        match state {
+            BeaconState::Gloas(inner) => inner,
+            _ => panic!("a gloas test state"),
+        }
     }
 
     fn gloas_inner_mut(state: &mut BeaconState) -> &mut gloas::BeaconState {
-        gloas_state(state, "test").unwrap()
+        match state {
+            BeaconState::Gloas(inner) => inner,
+            _ => panic!("a gloas test state"),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -369,6 +393,174 @@ mod tests {
         let inner = gloas_inner(&state);
         assert_eq!(inner.pending_deposits.len(), 1);
         assert_eq!(inner.pending_deposits[0], deposit);
+    }
+
+    // -----------------------------------------------------------------------
+    // EIP-8365: no new validators with BLS withdrawal credentials (heze)
+    // -----------------------------------------------------------------------
+
+    /// A pending deposit for `seed`'s key with `prefix` credentials, validly
+    /// signed so that only the credential rule, not the signature check, can
+    /// stop it.
+    fn signed_pending_deposit(seed: u8, prefix: u8) -> electra::PendingDeposit {
+        use crate::beacon::containers::shared::DepositMessage;
+        use crate::beacon::helpers::misc::{compute_deposit_domain, compute_signing_root};
+        use crate::beacon::primitives::{BlsPubkey, BlsSignature, Bytes32, HashTreeRoot as _};
+
+        let config = Config::mainnet();
+        let secret_key =
+            blst::min_pk::SecretKey::key_gen(&[seed; 32], &[]).expect("32 bytes of key material");
+        let pubkey = BlsPubkey(secret_key.sk_to_pk().to_bytes());
+        let mut withdrawal_credentials = Bytes32::ZERO;
+        withdrawal_credentials.0[0] = prefix;
+        let amount = preset::MIN_ACTIVATION_BALANCE;
+        let message = DepositMessage {
+            pubkey,
+            withdrawal_credentials,
+            amount,
+        };
+        let domain = compute_deposit_domain(config.genesis_fork_version);
+        let signing_root = compute_signing_root(message.hash_tree_root(), domain);
+        const DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+        let signature = BlsSignature(
+            secret_key
+                .sign(signing_root.as_slice(), DST, &[])
+                .to_bytes(),
+        );
+        electra::PendingDeposit {
+            pubkey,
+            withdrawal_credentials,
+            amount,
+            signature,
+            slot: constants::GENESIS_SLOT,
+        }
+    }
+
+    fn queue(state: &mut BeaconState, deposits: Vec<electra::PendingDeposit>) {
+        let mut fields = crate::beacon::helpers::electra::pending_queue_fields(state, "test")
+            .expect("a post-electra state has the queues");
+        for deposit in deposits {
+            fields.push_pending_deposit(deposit).unwrap();
+        }
+    }
+
+    fn queue_len(state: &mut BeaconState) -> usize {
+        crate::beacon::helpers::electra::pending_queue_fields(state, "test")
+            .unwrap()
+            .take_pending_deposits()
+            .len()
+    }
+
+    #[test]
+    fn heze_skips_a_new_bls_credentialed_deposit_without_refund() {
+        let config = Config::mainnet();
+        let mut state = crate::beacon::helpers::test_state::with_validators_at(ForkName::Heze, 2);
+        queue(
+            &mut state,
+            vec![signed_pending_deposit(1, constants::BLS_WITHDRAWAL_PREFIX)],
+        );
+
+        process_pending_deposits(&mut state, &config).unwrap();
+
+        assert_eq!(state.validator_count(), 2, "no validator created");
+        assert_eq!(state.balance(0).unwrap(), state.balance(1).unwrap());
+        assert_eq!(queue_len(&mut state), 0, "the deposit is consumed");
+    }
+
+    #[test]
+    fn heze_skips_a_bls_credentialed_deposit_with_an_invalid_signature_too() {
+        let config = Config::mainnet();
+        let mut state = crate::beacon::helpers::test_state::with_validators_at(ForkName::Heze, 2);
+        let mut deposit = signed_pending_deposit(1, constants::BLS_WITHDRAWAL_PREFIX);
+        deposit.signature = Default::default();
+        queue(&mut state, vec![deposit]);
+
+        process_pending_deposits(&mut state, &config).unwrap();
+
+        assert_eq!(state.validator_count(), 2);
+        assert_eq!(queue_len(&mut state), 0);
+    }
+
+    #[test]
+    fn heze_still_creates_validators_for_eth1_and_compounding_credentials() {
+        let config = Config::mainnet();
+        let mut state = crate::beacon::helpers::test_state::with_validators_at(ForkName::Heze, 2);
+        queue(
+            &mut state,
+            vec![
+                signed_pending_deposit(1, constants::ETH1_ADDRESS_WITHDRAWAL_PREFIX),
+                signed_pending_deposit(2, constants::COMPOUNDING_WITHDRAWAL_PREFIX),
+            ],
+        );
+
+        process_pending_deposits(&mut state, &config).unwrap();
+
+        assert_eq!(state.validator_count(), 4);
+        assert_eq!(queue_len(&mut state), 0);
+    }
+
+    #[test]
+    fn heze_still_credits_a_top_up_to_an_existing_bls_credentialed_validator() {
+        let config = Config::mainnet();
+        let mut state = crate::beacon::helpers::test_state::with_validators_at(ForkName::Heze, 2);
+        let mut deposit = signed_pending_deposit(1, constants::BLS_WITHDRAWAL_PREFIX);
+        {
+            let validator = state.validator_mut(0).unwrap();
+            validator.pubkey = deposit.pubkey;
+            validator.withdrawal_credentials = deposit.withdrawal_credentials;
+        }
+        // A top-up needs no valid signature.
+        deposit.signature = Default::default();
+        let amount = deposit.amount;
+        queue(&mut state, vec![deposit]);
+
+        let before = state.balance(0).unwrap();
+        process_pending_deposits(&mut state, &config).unwrap();
+
+        assert_eq!(state.validator_count(), 2);
+        assert_eq!(state.balance(0).unwrap(), before + amount);
+    }
+
+    #[test]
+    fn heze_bls_deposit_followed_by_an_eth1_deposit_creates_the_validator_with_the_latter() {
+        let config = Config::mainnet();
+        let mut state = crate::beacon::helpers::test_state::with_validators_at(ForkName::Heze, 2);
+        let bls = signed_pending_deposit(1, constants::BLS_WITHDRAWAL_PREFIX);
+        let eth1 = signed_pending_deposit(1, constants::ETH1_ADDRESS_WITHDRAWAL_PREFIX);
+        assert_eq!(bls.pubkey, eth1.pubkey);
+        let amount = eth1.amount;
+        let credentials = eth1.withdrawal_credentials;
+        queue(&mut state, vec![bls, eth1]);
+
+        process_pending_deposits(&mut state, &config).unwrap();
+
+        assert_eq!(state.validator_count(), 3);
+        let created = state.validator(2).unwrap();
+        assert_eq!(created.withdrawal_credentials, credentials);
+        assert_eq!(state.balance(2).unwrap(), amount);
+        assert_eq!(queue_len(&mut state), 0);
+    }
+
+    #[test]
+    fn a_bls_deposit_queued_at_gloas_is_skipped_once_upgraded_to_heze() {
+        let config = Config::mainnet();
+        let deposit = signed_pending_deposit(1, constants::BLS_WITHDRAWAL_PREFIX);
+
+        // Same deposit at gloas: still creates a validator.
+        let mut gloas = gloas_state_with_validators(2);
+        queue(&mut gloas, vec![deposit]);
+        // `upgrade_to_heze` (EIP-8015) needs the eth1 bridge retired.
+        let inner = gloas_inner_mut(&mut gloas);
+        inner.deposit_requests_start_index = inner.eth1_deposit_index;
+        let mut upgraded = crate::beacon::upgrade::upgrade_to_heze(&gloas, &config).unwrap();
+        process_pending_deposits(&mut gloas, &config).unwrap();
+        assert_eq!(gloas.validator_count(), 3);
+
+        // Carried over the fork, it is dropped.
+        assert_eq!(upgraded.fork_name(), ForkName::Heze);
+        process_pending_deposits(&mut upgraded, &config).unwrap();
+        assert_eq!(upgraded.validator_count(), 2);
+        assert_eq!(queue_len(&mut upgraded), 0);
     }
 
     #[test]
@@ -592,7 +784,7 @@ mod tests {
         // `> 0` regardless of weight.
         let mut settle_state = gloas_state_with_validators(64);
         gloas_inner_mut(&mut settle_state).builder_pending_payments[0] = payment;
-        settle_builder_payment(gloas_inner_mut(&mut settle_state), 0).unwrap();
+        settle_builder_payment(&mut settle_state, 0).unwrap();
         assert!(
             gloas_inner(&settle_state)
                 .builder_pending_withdrawals

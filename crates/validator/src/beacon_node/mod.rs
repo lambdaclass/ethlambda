@@ -16,13 +16,15 @@ use ethlambda_types::beacon::signing::compute_epoch_at_slot;
 
 use crate::beacon_node::block_contents::ProducedBlock;
 use crate::beacon_node::dto::{
-    AttesterDutyDto, CommitteeSubscriptionDto, ProposerDutyDto, ProposerPreparationDto, PtcDutyDto,
-    SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto,
+    AttesterDutyDto, CommitteeSubscriptionDto, InclusionListDutyDto, ProposerDutyDto,
+    ProposerPreparationDto, PtcDutyDto, SingleAttestationDto, SyncCommitteeSubscriptionDto,
+    SyncDutyDto,
 };
 use crate::error::Result;
 use ethlambda_types::beacon::containers::altair;
 use ethlambda_types::beacon::containers::electra;
 use ethlambda_types::beacon::containers::gloas;
+use ethlambda_types::beacon::containers::heze;
 
 pub mod block_contents;
 pub mod dto;
@@ -101,6 +103,11 @@ pub type AttesterDuties = Duties<AttesterDutyDto>;
 /// same kind of root the attester schedule uses, since committee membership is
 /// derived from the same shuffling.
 pub type PtcDuties = Duties<PtcDutyDto>;
+
+/// One epoch's inclusion list committee duties for the indices asked about
+/// (heze). `dependent_root` is the attester shuffling's, which the committees
+/// are drawn from, and is also the `dependent_root` a member's list names.
+pub type InclusionListDuties = Duties<InclusionListDutyDto>;
 
 /// Every proposer for one epoch, not only this client's. The endpoint takes no
 /// validator list, so the caller filters. See [`Duties`] for what
@@ -421,6 +428,24 @@ pub trait BeaconNodeApi: Send + Sync {
         &self,
         messages: &[gloas::PayloadAttestationMessage],
     ) -> Result<usize>;
+
+    /// The inclusion list committee duties for `indices` in `epoch` (heze).
+    ///
+    /// An epoch before heze answers with no duties rather than an error.
+    async fn inclusion_list_duties(
+        &self,
+        epoch: Epoch,
+        indices: &[ValidatorIndex],
+    ) -> Result<InclusionListDuties>;
+
+    /// The transactions the node's execution client would put in an inclusion
+    /// list for `slot` now, each an EIP-2718 transaction's bytes
+    /// (`engine_getInclusionListV1`).
+    async fn inclusion_list_transactions(&self, slot: Slot) -> Result<Vec<Vec<u8>>>;
+
+    /// Publish a committee member's signed inclusion list. The node validates
+    /// it as gossip would, stores it and gossips it.
+    async fn publish_inclusion_list(&self, signed: &heze::SignedInclusionList) -> Result<()>;
 
     /// Submits signed attestations to the node's pool, so they reach gossip.
     /// `fork_name` names the fork the attestations were produced under, since

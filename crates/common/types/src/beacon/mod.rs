@@ -35,7 +35,8 @@ pub mod signing;
 /// way an `unreachable!` written inline there would have.
 #[cold]
 #[track_caller]
-pub(crate) fn lean_state_unreachable(function: &str) -> ! {
+#[doc(hidden)]
+pub fn lean_state_unreachable(function: &str) -> ! {
     unreachable!(
         "lean state reached a beacon accessor ({function}); \
          BlockChainServer must dispatch on fork_name() before this point"

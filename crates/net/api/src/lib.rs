@@ -12,6 +12,7 @@ use ethlambda_types::{
             PayloadAttestationMessage, SignedExecutionPayloadBid, SignedExecutionPayloadEnvelope,
             SignedProposerPreferences,
         },
+        heze::SignedInclusionList,
     },
     beacon::operation::BeaconOperation,
     beacon::primitives::ValidatorIndex,
@@ -471,6 +472,10 @@ pub trait RpcToP2P: Send + Sync {
         &self,
         message: PayloadAttestationMessage,
     ) -> Result<(), ActorError>;
+    /// Gossip an inclusion list committee member's list on `inclusion_list`
+    /// (heze). Validated and stored by the caller, so the p2p actor only
+    /// counts it as seen and publishes.
+    fn publish_inclusion_list(&self, signed: SignedInclusionList) -> Result<(), ActorError>;
 }
 
 // --- Shared state: P2P -> RPC ---

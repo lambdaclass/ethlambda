@@ -129,7 +129,7 @@
 use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::config::Config;
 use ethlambda_state_transition::beacon::containers::{
-    BeaconState, altair, bellatrix, capella, deneb, electra, gloas, phase0, shared,
+    BeaconState, altair, bellatrix, capella, deneb, electra, gloas, heze, phase0, shared,
 };
 use ethlambda_state_transition::beacon::helpers::accessors::{ActiveBalanceCache, CommitteeCache};
 use ethlambda_state_transition::beacon::primitives::{HashTreeRoot as _, Slot};
@@ -264,6 +264,18 @@ fn apply(
                     block.body.hash_tree_root(),
                 )
             }
+            // Heze's block differs only in a body without `eth1_data` and
+            // `deposits` (EIP-8015), which the header's `body_root` commits to.
+            ForkName::Heze => {
+                let block: heze::BeaconBlock = case.ssz("block");
+                block::process_block_header(
+                    state,
+                    block.slot,
+                    block.proposer_index,
+                    block.parent_root,
+                    block.body.hash_tree_root(),
+                )
+            }
             // No `other` arm: the patterns above already cover every `ForkName`
             // there is, so a catch-all here would be dead code rather than a
             // safety net. `Lean` is covered by name for the same reason, rather
@@ -302,13 +314,14 @@ fn apply(
             // accounting, EIP-7732), so this reads the case's own `meta.yaml`
             // for `parent_slot` rather than only the operation file every
             // other fork's arm reads.
-            ForkName::Gloas => {
+            ForkName::Gloas | ForkName::Heze => {
                 let attestation: gloas::Attestation = case.ssz("attestation");
                 let meta: AttestationMeta = case.yaml("meta");
                 gloas_stf::process_attestation(
                     state,
                     &attestation,
                     meta.parent_slot,
+                    config,
                     &committees,
                     &active_balances,
                 )
@@ -336,7 +349,7 @@ fn apply(
             // Gloas's container widens again (EIP-7688's unbounded
             // `AttestingIndices`); the function is still not behaviorally
             // modified, only transcribed against gloas's own type.
-            ForkName::Gloas => {
+            ForkName::Gloas | ForkName::Heze => {
                 let slashing: gloas::AttesterSlashing = case.ssz("attester_slashing");
                 gloas_stf::process_attester_slashing(state, &slashing, config)
             }
@@ -358,7 +371,9 @@ fn apply(
                 | ForkName::Deneb
                 | ForkName::Electra
                 | ForkName::Fulu => operations::process_proposer_slashing(state, &slashing, config),
-                ForkName::Gloas => gloas_stf::process_proposer_slashing(state, &slashing, config),
+                ForkName::Gloas | ForkName::Heze => {
+                    gloas_stf::process_proposer_slashing(state, &slashing, config)
+                }
                 ForkName::Lean => lean_is_not_a_fixture_fork("proposer_slashing"),
             }
         }
@@ -388,7 +403,7 @@ fn apply(
                 let deposit: shared::Deposit = case.ssz("deposit");
                 electra_stf::process_deposit(state, &deposit, config)
             }
-            ForkName::Gloas => Err(
+            ForkName::Gloas | ForkName::Heze => Err(
                 ethlambda_state_transition::beacon::Error::UnsupportedForFork {
                     function: "deposit",
                     fork: ForkName::Gloas,
@@ -420,7 +435,7 @@ fn apply(
             // limits are read by `crate::beacon::helpers::electra::compute_exit_epoch_and_update_churn`
             // dispatching on the state's own fork, not by a gloas copy of
             // `process_voluntary_exit`; see that function's own doc).
-            ForkName::Electra | ForkName::Fulu | ForkName::Gloas => {
+            ForkName::Electra | ForkName::Fulu | ForkName::Gloas | ForkName::Heze => {
                 let exit: shared::SignedVoluntaryExit = case.ssz("voluntary_exit");
                 electra_stf::process_voluntary_exit(state, &exit, config)
             }
@@ -430,7 +445,7 @@ fn apply(
         // further fork match.
         "sync_aggregate" => {
             let sync_aggregate: altair::SyncAggregate = case.ssz("sync_aggregate");
-            altair_stf::process_sync_aggregate(state, &sync_aggregate, &active_balances)
+            altair_stf::process_sync_aggregate(state, &sync_aggregate, &active_balances, config)
         }
         // The fixture's operation file is a whole `BeaconBlockBody`, not a
         // bare payload: checking one needs fields that live on the body
@@ -499,7 +514,7 @@ fn apply(
                         "execution_payload has no handler for fork `{fork}`"
                     ));
                 }
-                ForkName::Gloas => Err(
+                ForkName::Gloas | ForkName::Heze => Err(
                     ethlambda_state_transition::beacon::Error::UnsupportedForFork {
                         function: "execution_payload",
                         fork: ForkName::Gloas,
@@ -549,7 +564,7 @@ fn apply(
             // its `payload` parameter entirely, since withdrawals are now
             // deterministic from the state alone. This is the one fork whose
             // arm reads no operation file at all.
-            ForkName::Gloas => gloas_stf::process_withdrawals(state),
+            ForkName::Gloas | ForkName::Heze => gloas_stf::process_withdrawals(state),
             ForkName::Lean => lean_is_not_a_fixture_fork("withdrawals"),
         },
         // New in gloas (EIP-7732): the block's binding commitment to a
@@ -561,10 +576,28 @@ fn apply(
         // New in gloas (EIP-7732): the *next* block's processing of the
         // previous slot's payload, so the fixture's operation file is a whole
         // `BeaconBlock`, named `block` like `block_header`'s.
-        "parent_execution_payload" => {
-            let block: gloas::BeaconBlock = case.ssz("block");
-            gloas_stf::process_parent_execution_payload(state, &block, config)
-        }
+        "parent_execution_payload" => match case.fork {
+            ForkName::Heze => {
+                let block: heze::BeaconBlock = case.ssz("block");
+                let body = &block.body;
+                gloas_stf::process_parent_execution_payload(
+                    state,
+                    &body.signed_execution_payload_bid.message,
+                    &body.parent_execution_requests,
+                    config,
+                )
+            }
+            _ => {
+                let block: gloas::BeaconBlock = case.ssz("block");
+                let body = &block.body;
+                gloas_stf::process_parent_execution_payload(
+                    state,
+                    &body.signed_execution_payload_bid.message,
+                    &body.parent_execution_requests,
+                    config,
+                )
+            }
+        },
         // `consolidation_request` and `withdrawal_request` are new in
         // electra, alongside `withdrawals`; neither fulu's nor gloas's own
         // specification lists either as modified (gloas's own
@@ -592,7 +625,7 @@ fn apply(
         // so far, since pyspec's own genesis for both already sets that
         // field, but it is not the function either fork's specification names.
         "deposit_request" => match case.fork {
-            ForkName::Fulu | ForkName::Gloas => {
+            ForkName::Fulu | ForkName::Gloas | ForkName::Heze => {
                 let request: electra::DepositRequest = case.ssz("deposit_request");
                 fulu_stf::process_deposit_request(state, &request)
             }

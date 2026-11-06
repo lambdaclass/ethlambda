@@ -11,7 +11,7 @@ use crate::api::{StorageBackend, StorageReadView, StorageReadViewExt, StorageWri
 use crate::committee_cache::CommitteeCache;
 use crate::error::Error;
 use crate::liveness::ObservedLiveness;
-use crate::pools::{AttestationPool, OperationPool};
+use crate::pools::{AttestationPool, InclusionListStore, OperationPool};
 
 use ethlambda_crypto::signature::ValidatorSignature;
 use ethlambda_types::{
@@ -210,7 +210,15 @@ const KEY_STATES_PRUNED_BELOW: &[u8] = b"states_pruned_below";
 /// [`Store::prune_finalized_states`]). A directory written by the previous
 /// version holds rows no lookup can find, and there is no migration, by the
 /// same policy every previous change followed.
-pub const DB_VERSION: u64 = 7;
+///
+/// 9 gave heze its own state and block containers (EIP-8015 removes the eth1
+/// and deposit-index fields), so a heze row written earlier is gloas-shaped
+/// bytes under a heze fork tag, and appended `SLOT_DURATION_MS_HEZE` and
+/// `MIN_BLOB_DATA_RETENTION_MS` to `Config` (EIP-8198). 8 is skipped: the
+/// heze devnet branches shipped these two changes as their 7 and 8 without the
+/// slot||root keys above, so a directory one of them wrote must not pass as
+/// current.
+pub const DB_VERSION: u64 = 9;
 
 /// The consensus protocol a data directory holds.
 ///
@@ -898,6 +906,12 @@ pub(crate) struct BeaconScratch {
     /// specification's `block_payload_statuses`; an absent root reads as
     /// `NOT_VALIDATED`.
     pub(crate) block_payload_statuses: HashMap<H256, (u64, PayloadStatusEnum)>,
+    /// Heze (EIP-7805): whether each beacon block's payload satisfied the
+    /// inclusion list constraints, against the block's slot for pruning: the
+    /// specification's `payload_inclusion_list_satisfaction`. Recorded when
+    /// the envelope is verified, and again when an optimistic payload's
+    /// execution verdict arrives. Pruned with `block_payload_statuses`.
+    pub(crate) payload_inclusion_list_satisfaction: HashMap<H256, (u64, bool)>,
     /// Gloas: beacon root to `(slot, milliseconds past genesis the block's
     /// envelope reached this node)`. What the payload timeliness committee's
     /// `payload_present` is decided from: the specification's vote is "an
@@ -1003,6 +1017,15 @@ fn decode_beacon_block_value(bytes: &[u8]) -> SignedBeaconBlock {
 fn builds_on_payload(block: &SignedBeaconBlock, payload_block_hash: &ExecutionBlockHash) -> bool {
     match block {
         SignedBeaconBlock::Gloas(block) => {
+            block
+                .message
+                .body
+                .signed_execution_payload_bid
+                .message
+                .parent_block_hash
+                == *payload_block_hash
+        }
+        SignedBeaconBlock::Heze(block) => {
             block
                 .message
                 .body
@@ -1148,6 +1171,8 @@ pub struct Store {
     attestation_pool: Arc<Mutex<AttestationPool>>,
     /// Beacon operation pool. See [`Store::operation_pool`].
     operation_pool: Arc<Mutex<OperationPool>>,
+    /// Heze's inclusion list store. See [`Store::inclusion_list_store`].
+    inclusion_list_store: Arc<Mutex<InclusionListStore>>,
     /// LRU memoization of states by block root, shared across `Store` clones.
     ///
     /// Holds the same fork-ladder enum the `States` table stores, so a lean
@@ -1842,6 +1867,7 @@ impl Store {
             ))),
             attestation_pool: Default::default(),
             operation_pool: Default::default(),
+            inclusion_list_store: Default::default(),
             state_cache,
             pending_states,
             committee_cache: Arc::new(CommitteeCache::default()),
@@ -1871,6 +1897,19 @@ impl Store {
         self.operation_pool
             .lock()
             .expect("operation pool lock poisoned")
+    }
+
+    /// Heze's inclusion list store (EIP-7805): the valid lists this node has
+    /// seen, from gossip, req/resp and its own Beacon API. Written by P2P and
+    /// the RPC, read by fork choice's payload satisfaction check, the bid
+    /// rules, block production and the req/resp server, which is why it lives
+    /// on the `Store` all of them share. Same sharing and locking rules as
+    /// [`Store::attestation_pool`]; in memory only, like the specification's
+    /// own, so a restart starts it empty.
+    pub fn inclusion_list_store(&self) -> MutexGuard<'_, InclusionListStore> {
+        self.inclusion_list_store
+            .lock()
+            .expect("inclusion list store lock poisoned")
     }
 
     // ============ Metadata Helpers ============
@@ -1950,8 +1989,8 @@ impl Store {
     /// externally supplied anchor time can.
     ///
     /// Public because it is also what a caller placing a moment *within* the
-    /// current slot wants: `ms_since_genesis() % slot_duration_ms` is how far
-    /// into its slot the clock reads, which the beacon reorg and
+    /// current slot wants: `ms_since_genesis()` less the current slot's start
+    /// offset is how far into its slot the clock reads, which the beacon reorg and
     /// block-timeliness rules compare against their basis-point deadlines.
     pub fn ms_since_genesis(&self) -> u64 {
         self.time_ms()
@@ -1981,15 +2020,18 @@ impl Store {
 
     /// The slot the store clock falls in, on either chain.
     ///
-    /// Divides by [`Config::slot_duration_ms`] rather than
+    /// Goes through [`Config::slot_at_time_ms`], which walks the EIP-8198
+    /// schedule, so a beacon clock past Heze divides by the Heze slot
+    /// duration. It works in milliseconds rather than
     /// [`Config::seconds_per_slot`] so a cadence that is not a whole number of
     /// seconds still lands on the right slot: `Config::lean` derives
     /// `seconds_per_slot` by truncating the millisecond value, so for lean the
-    /// millisecond field is the authoritative one. The two agree wherever
-    /// `slot_duration_ms == seconds_per_slot * 1000`, which every beacon
-    /// configuration holds to.
+    /// millisecond field is the authoritative one. Lean has a single duration,
+    /// so its answer is the plain division it always was.
     pub fn current_slot(&self) -> u64 {
-        self.ms_since_genesis() / self.config.slot_duration_ms
+        let time_ms = self.time_ms().expect("store time exists");
+        self.config
+            .slot_at_time_ms(self.config.genesis_time_ms(), time_ms)
     }
 
     // ============ Config ============
@@ -4153,7 +4195,7 @@ impl Store {
                 .and_then(|bytes| bytes.first().copied())
                 .and_then(ForkName::from_selector);
             let is_gloas = match fork {
-                Some(ForkName::Gloas) => true,
+                Some(ForkName::Gloas | ForkName::Heze) => true,
                 Some(
                     ForkName::Phase0
                     | ForkName::Altair
@@ -4458,13 +4500,44 @@ impl Store {
     }
 
     /// Drops payload verdicts strictly below `finalized_slot`, which no
-    /// attestation rule can ask about any more.
+    /// attestation rule can ask about any more, and the inclusion list
+    /// satisfaction recorded alongside them.
     pub fn prune_beacon_block_payload_statuses(&mut self, finalized_slot: u64) {
+        let mut beacon = self.beacon.lock().unwrap();
+        beacon
+            .block_payload_statuses
+            .retain(|_root, (slot, _status)| *slot >= finalized_slot);
+        beacon
+            .payload_inclusion_list_satisfaction
+            .retain(|_root, (slot, _satisfied)| *slot >= finalized_slot);
+    }
+
+    /// Heze: whether `root`'s payload was recorded as satisfying the
+    /// inclusion list constraints. `None` when nothing was recorded: a block
+    /// whose envelope has not been verified, one verified before a restart,
+    /// or one from before heze.
+    pub fn payload_inclusion_list_satisfaction(&self, root: &H256) -> Option<bool> {
         self.beacon
             .lock()
             .unwrap()
-            .block_payload_statuses
-            .retain(|_root, (slot, _status)| *slot >= finalized_slot);
+            .payload_inclusion_list_satisfaction
+            .get(root)
+            .map(|(_slot, satisfied)| *satisfied)
+    }
+
+    /// Records whether `root`'s payload satisfied the inclusion list
+    /// constraints, replacing any earlier answer.
+    pub fn set_payload_inclusion_list_satisfaction(
+        &mut self,
+        root: H256,
+        slot: u64,
+        satisfied: bool,
+    ) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .payload_inclusion_list_satisfaction
+            .insert(root, (slot, satisfied));
     }
 
     /// Records an execution client's answer for a payload. The fixture format
@@ -5797,6 +5870,72 @@ mod tests {
         assert_eq!(store.ms_since_genesis(), 0);
         assert_eq!(store.intervals_since_genesis(), 0);
         assert_eq!(store.current_slot(), 0);
+    }
+
+    /// 12 s slots for the first two epochs, then 9 s ones (EIP-8198).
+    fn quick_slots_config() -> Config {
+        Config {
+            slot_duration_ms: 12_000,
+            slot_duration_ms_heze: 9_000,
+            heze_fork_epoch: 2,
+            ..Config::mainnet()
+        }
+    }
+
+    #[test]
+    fn a_beacon_store_clock_counts_slots_across_the_heze_slot_duration_change() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let genesis_time = 1_606_824_023;
+        let mut store = Store::init_beacon(
+            backend,
+            genesis_time,
+            quick_slots_config(),
+            H256::ZERO,
+            Checkpoint::default(),
+            0,
+        );
+        let genesis_ms = genesis_time * 1_000;
+        let fork_ms = genesis_ms + 64 * 12_000;
+
+        for (time_ms, expected_slot) in [
+            (genesis_ms, 0),
+            (fork_ms - 1, 63),
+            (fork_ms, 64),
+            (fork_ms + 8_999, 64),
+            (fork_ms + 9_000, 65),
+            // A single 12 s division would still read slot 64 here.
+            (fork_ms + 12_000, 65),
+            (fork_ms + 100 * 9_000, 164),
+        ] {
+            store.set_time_ms(time_ms).expect("set time");
+            assert_eq!(store.current_slot(), expected_slot, "at {time_ms}");
+        }
+    }
+
+    #[test]
+    fn the_heze_slot_schedule_survives_a_restart() {
+        // `Config` is SSZ-encoded into `Metadata["config"]`, so the two
+        // EIP-8198 fields must come back out of the directory unchanged.
+        let backend = Arc::new(InMemoryBackend::new());
+        let config = Config {
+            min_blob_data_retention_ms: 123_456_000,
+            ..quick_slots_config()
+        };
+        Store::init_beacon(
+            backend.clone(),
+            1_606_824_023,
+            config,
+            H256::ZERO,
+            Checkpoint::default(),
+            0,
+        );
+
+        let store = Store::from_db_state(backend).unwrap().unwrap();
+        let resumed = store.config();
+        assert_eq!(resumed.slot_duration_ms, 12_000);
+        assert_eq!(resumed.slot_duration_ms_heze, 9_000);
+        assert_eq!(resumed.min_blob_data_retention_ms, 123_456_000);
+        assert_eq!(resumed.slot_durations(), [(0, 12_000), (2, 9_000)]);
     }
 
     #[test]
@@ -7420,7 +7559,12 @@ mod tests {
                 .historical_roots()
                 .ptr_eq(resident.historical_roots())
         );
-        assert!(decoded.eth1_data_votes().ptr_eq(resident.eth1_data_votes()));
+        assert!(
+            decoded
+                .eth1_data_votes()
+                .unwrap()
+                .ptr_eq(resident.eth1_data_votes().unwrap())
+        );
         let (BeaconState::Electra(decoded_electra), BeaconState::Electra(resident_electra)) =
             (decoded.as_ref(), resident.as_ref())
         else {
@@ -10129,10 +10273,22 @@ mod tests {
                 },
                 signature: Default::default(),
             }),
+            SignedBeaconBlock::Heze(
+                ethlambda_types::beacon::containers::heze::SignedBeaconBlock {
+                    message: ethlambda_types::beacon::containers::heze::BeaconBlock {
+                        slot: 0x0e0f_1011,
+                        proposer_index: 6,
+                        parent_root: root(8),
+                        state_root: root(9),
+                        body: ethlambda_types::beacon::containers::heze::BeaconBlockBody::empty(),
+                    },
+                    signature: Default::default(),
+                },
+            ),
         ];
         // The fork tag is part of the value; the newest fork in `ALL` is among
         // the blocks above.
-        assert_eq!(blocks[5].fork_name(), *ForkName::ALL.last().unwrap());
+        assert_eq!(blocks[6].fork_name(), *ForkName::ALL.last().unwrap());
         for block in blocks {
             let value = encode_beacon_block_value(&block);
             assert_eq!(

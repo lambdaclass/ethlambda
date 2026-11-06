@@ -82,7 +82,12 @@ pub fn process_block(
     super::block::process_randao(state, &block.body.randao_reveal, options.randao)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
     process_operations(state, &block.body, config, committees, active_balances)?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
+    super::altair::process_sync_aggregate(
+        state,
+        &block.body.sync_aggregate,
+        active_balances,
+        config,
+    )?;
     Ok(())
 }
 

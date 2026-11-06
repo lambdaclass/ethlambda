@@ -91,7 +91,11 @@ pub fn process_operations(
     let altair_attestations = match state.fork_name() {
         ForkName::Phase0 => false,
         ForkName::Altair | ForkName::Bellatrix | ForkName::Capella => true,
-        fork @ (ForkName::Deneb | ForkName::Electra | ForkName::Fulu | ForkName::Gloas) => {
+        fork @ (ForkName::Deneb
+        | ForkName::Electra
+        | ForkName::Fulu
+        | ForkName::Gloas
+        | ForkName::Heze) => {
             return Err(Error::UnsupportedForFork {
                 function: "process_operations",
                 fork,
@@ -106,9 +110,9 @@ pub fn process_operations(
     // so a malformed pre-state (or a future bug) must not be allowed to wrap
     // this into a huge outstanding count that no block could ever satisfy.
     let outstanding = state
-        .eth1_data()
+        .eth1_data()?
         .deposit_count
-        .checked_sub(state.eth1_deposit_index())
+        .checked_sub(*state.eth1_deposit_index()?)
         .ok_or(Error::ArithmeticOverflow(
             "eth1_data.deposit_count - eth1_deposit_index",
         ))?;
@@ -499,7 +503,7 @@ pub fn add_validator_to_registry(
         // are progressive rather than `SszList` (see `BeaconState::altair_validator_lists`'s
         // own documentation), so it is refused for both reasons rather than
         // folded into either branch above.
-        fork @ (ForkName::Electra | ForkName::Fulu | ForkName::Gloas) => {
+        fork @ (ForkName::Electra | ForkName::Fulu | ForkName::Gloas | ForkName::Heze) => {
             return Err(Error::UnsupportedForFork {
                 function: "add_validator_to_registry",
                 fork,
@@ -585,13 +589,13 @@ pub fn process_deposit(state: &mut BeaconState, deposit: &Deposit, config: &Conf
             deposit.data.hash_tree_root(),
             &deposit.proof,
             (constants::DEPOSIT_CONTRACT_TREE_DEPTH + 1) as u64,
-            state.eth1_deposit_index(),
-            state.eth1_data().deposit_root,
+            *state.eth1_deposit_index()?,
+            state.eth1_data()?.deposit_root,
         ),
         "is_valid_merkle_branch(hash_tree_root(deposit.data), deposit.proof, DEPOSIT_CONTRACT_TREE_DEPTH + 1, state.eth1_deposit_index, state.eth1_data.deposit_root)",
     )?;
 
-    *state.eth1_deposit_index_mut() += 1;
+    *state.eth1_deposit_index_mut()? += 1;
 
     apply_deposit(
         state,

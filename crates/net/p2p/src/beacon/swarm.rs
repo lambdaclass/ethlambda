@@ -21,8 +21,21 @@ use ethlambda_types::beacon::primitives::{ForkDigest, Root};
 /// `SLOTS_PER_EPOCH * SECONDS_PER_SLOT * 2`, which is what is written here
 /// rather than the number it evaluates to, so it stays correct if either factor
 /// moves.
+///
+/// Heze (EIP-8198) changes the slot duration and says durations stated in
+/// slots or epochs "MUST account for slot duration changes when converted to
+/// milliseconds". The gossipsub config is fixed when the swarm is built, so the
+/// duration used is the longest one on the schedule: a duplicate cache that
+/// outlives two epochs of a shorter slot is harmless, one that expires early is
+/// not.
 pub fn seen_ttl(config: &Config) -> Duration {
-    Duration::from_secs(preset::SLOTS_PER_EPOCH * config.seconds_per_slot * 2)
+    let slot_duration_ms = config
+        .slot_durations()
+        .into_iter()
+        .map(|(_, duration_ms)| duration_ms)
+        .max()
+        .unwrap_or(config.slot_duration_ms);
+    Duration::from_millis(preset::SLOTS_PER_EPOCH * slot_duration_ms * 2)
 }
 
 /// Lighthouse's identify protocol version. go-libp2p peers gate gossipsub GRAFT
@@ -245,6 +258,28 @@ mod tests {
         // interface states, so it wins, and writing it out keeps it honest if
         // either factor ever moves.
         assert_eq!(seen_ttl(&Config::mainnet()), Duration::from_secs(768));
+    }
+
+    #[test]
+    fn the_seen_ttl_covers_two_epochs_of_the_longest_slot_on_the_schedule() {
+        let quicker = Config {
+            slot_duration_ms: 12_000,
+            slot_duration_ms_heze: 9_000,
+            heze_fork_epoch: 5,
+            ..Config::mainnet()
+        };
+        assert_eq!(seen_ttl(&quicker), Duration::from_secs(768));
+        let slower = Config {
+            slot_duration_ms_heze: 14_000,
+            ..quicker.clone()
+        };
+        assert_eq!(seen_ttl(&slower), Duration::from_secs(896));
+        // An unscheduled Heze has no entry, so its duration is not counted.
+        let unscheduled = Config {
+            heze_fork_epoch: ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH,
+            ..slower
+        };
+        assert_eq!(seen_ttl(&unscheduled), Duration::from_secs(768));
     }
 
     #[tokio::test]

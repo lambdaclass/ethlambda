@@ -63,6 +63,7 @@ fn fork_schedule(config: &Config) -> Vec<Value> {
         (config.electra_fork_version, config.electra_fork_epoch),
         (config.fulu_fork_version, config.fulu_fork_epoch),
         (config.gloas_fork_version, config.gloas_fork_epoch),
+        (config.heze_fork_version, config.heze_fork_epoch),
     ];
     let fork = |previous: [u8; 4], current: [u8; 4], epoch: u64| {
         serde_json::json!({
@@ -339,6 +340,25 @@ mod tests {
         }
     }
 
+    /// EIP-8198: a validator client reading the spec must see both the genesis
+    /// and the Heze slot duration, and the wall-clock blob retention window,
+    /// or it would run its whole clock on one duration.
+    #[test]
+    fn the_spec_reports_the_heze_slot_duration_and_blob_retention_window() {
+        let config = Config {
+            slot_duration_ms: 12_000,
+            slot_duration_ms_heze: 9_000,
+            heze_fork_epoch: 2,
+            min_blob_data_retention_ms: 1_572_864_000,
+            ..Config::mainnet()
+        };
+        let data = spec(&config);
+        assert_eq!(data["SLOT_DURATION_MS"], "12000");
+        assert_eq!(data["SLOT_DURATION_MS_HEZE"], "9000");
+        assert_eq!(data["MIN_BLOB_DATA_RETENTION_MS"], "1572864000");
+        assert_eq!(data["HEZE_FORK_EPOCH"], "2");
+    }
+
     #[tokio::test]
     async fn the_spec_carries_the_preset_and_constants() {
         let json = get_spec_json().await;
@@ -540,6 +560,31 @@ mod tests {
         assert_eq!(
             last["previous_version"],
             hex_string(config.electra_fork_version)
+        );
+    }
+
+    #[test]
+    fn heze_is_listed_after_gloas_once_scheduled() {
+        let mut config = Config::mainnet();
+        config.gloas_fork_epoch = 0;
+        config.heze_fork_epoch = 1;
+        let schedule = fork_schedule(&config);
+        let last = schedule.last().unwrap();
+        assert_eq!(
+            last["current_version"],
+            hex_string(config.heze_fork_version)
+        );
+        assert_eq!(
+            last["previous_version"],
+            hex_string(config.gloas_fork_version)
+        );
+        assert_eq!(last["epoch"], "1");
+
+        config.heze_fork_epoch = constants::FAR_FUTURE_EPOCH;
+        let schedule = fork_schedule(&config);
+        assert_eq!(
+            schedule.last().unwrap()["current_version"],
+            hex_string(config.gloas_fork_version)
         );
     }
 
