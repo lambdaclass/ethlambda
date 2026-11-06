@@ -646,6 +646,7 @@ existing once per chain.
   `[patch.crates-io]` override because nothing outside this workspace depends on
   libssz, so there is no second copy to unify; that also keeps the manifest free
   of a `[patch]` table, which `shadow/cargo-patch.toml` would collide with.
+- **The participation lists and `pending_deposits` are tree-backed too** (`EpochParticipation`, `PendingDeposits`; progressive from gloas), reached through `altair_validator_lists` (`ParticipationRef`, no slice) and `epoch_participation_mut`; scan with `ParticipationRef::iter`, not `get(i)`.
 - **`Validators` and `Balances` are `ethlambda_ssz_tree::List`s** (gloas:
   `ethlambda_ssz_tree::ProgressiveList`, same method set), persistent
   Merkle trees that cache node hashes and share unchanged subtrees between

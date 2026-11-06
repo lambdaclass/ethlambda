@@ -69,6 +69,43 @@ impl<T: Value, U: UpdateMap<T>> Interface<T, U> {
         self.updates.get_mut(index)
     }
 
+    /// Buffers `value` as the new value of the element at `index`, without
+    /// reading the old one. Whether `index` is in range is returned; nothing is
+    /// written past the end.
+    pub(crate) fn set(&mut self, index: usize, value: T) -> bool {
+        if index >= self.len {
+            return false;
+        }
+        self.updates.insert(index, value);
+        true
+    }
+
+    /// `len` copies of `value` in a new tree of height `depth`, sharing every
+    /// identical subtree. The caller checks the type's limit.
+    pub(crate) fn repeat(value: &T, len: usize, depth: usize) -> Self {
+        Self {
+            tree: Tree::repeat(value, len, depth),
+            depth,
+            committed_len: len,
+            len,
+            updates: U::default(),
+        }
+    }
+
+    /// A reader for ascending indices: see [`SortedReader`].
+    pub(crate) fn sorted_reader(&self) -> SortedReader<'_, T, U> {
+        SortedReader {
+            tree: &self.tree,
+            depth: self.depth,
+            updates: &self.updates,
+            no_updates: self.updates.is_empty(),
+            len: self.len,
+            first: 0,
+            run: &[],
+            last: 0,
+        }
+    }
+
     /// Buffers `value` as the new last element. The caller checks the limit.
     pub(crate) fn push(&mut self, value: T) {
         self.updates.insert(self.len, value);
@@ -223,5 +260,69 @@ impl<T: Value, U: UpdateMap<T>> Interface<T, U> {
             Some(err) => Err(err),
             None => Ok(interface),
         }
+    }
+}
+
+/// Reads elements at non-decreasing indices, descending the tree only when an
+/// index leaves the leaf it last read.
+///
+/// What [`Interface::get`] does per index is a full descent; a pass that
+/// visits many indices in order, such as the attesters of one attestation,
+/// pays that for every one although consecutive indices mostly share a leaf.
+/// Pending writes are consulted first, exactly as `get` does, so the answers
+/// are identical to `get`'s.
+pub struct SortedReader<'a, T, U> {
+    tree: &'a Tree<T>,
+    depth: usize,
+    updates: &'a U,
+    no_updates: bool,
+    len: usize,
+    /// Index of the first element of `run`.
+    first: usize,
+    /// The elements of the leaf last read from.
+    run: &'a [T],
+    /// The previous index, to check the order in debug builds.
+    last: usize,
+}
+
+impl<'a, T: Value, U: UpdateMap<T>> SortedReader<'a, T, U> {
+    /// The element at `index`, or `None` past the end. `index` must not be
+    /// below the previous call's (checked in debug builds); the answer would
+    /// still be right, but each step back would cost a descent.
+    pub fn get(&mut self, index: usize) -> Option<&'a T> {
+        debug_assert!(
+            index >= self.last,
+            "sorted reader read {index} after {}",
+            self.last
+        );
+        self.last = index;
+        if index >= self.len {
+            return None;
+        }
+        if !self.no_updates
+            && let Some(value) = self.updates.get(index)
+        {
+            return Some(value);
+        }
+        if let Some(value) = index
+            .checked_sub(self.first)
+            .and_then(|offset| self.run.get(offset))
+        {
+            return Some(value);
+        }
+        let (first, run) = self.tree.leaf_run(index, self.depth)?;
+        self.first = first;
+        self.run = run;
+        run.get(index - first)
+    }
+
+    /// The number of elements, pending pushes included.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the list holds no elements.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 }

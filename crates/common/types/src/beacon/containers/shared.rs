@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 use ethlambda_ssz_tree::{List, ProgressiveList as TreeProgressiveList, Vector};
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
-use libssz_types::{SszBitvector, SszList, SszVector};
+use libssz_types::{SszBitvector, SszVector};
 
 use crate::beacon::constants;
 use crate::beacon::preset;
@@ -102,7 +102,22 @@ pub type DepositProof = SszVector<Bytes32, { constants::DEPOSIT_CONTRACT_TREE_DE
 /// Per-validator participation flags for one epoch, positionally parallel to
 /// [`Validators`]. Altair uses this in place of phase0's accumulated
 /// attestations.
-pub type EpochParticipation = SszList<ParticipationFlags, { preset::VALIDATOR_REGISTRY_LIMIT }>;
+///
+/// Tree-backed: the state root otherwise re-merkleized both multi-megabyte
+/// lists from scratch on every block, while a block flips flags for a few
+/// thousand validators at most. With the tree, only the leaves holding those
+/// validators are rehashed; a flag is one byte, so 32 share a chunk and a
+/// block's writes dirty far fewer leaves than it has attesters.
+///
+/// Writes are buffered densely (the default `VecMap`), not in a `BTreeMap`
+/// like the registry's. A block credits a thirty-second of the registry at
+/// scattered positions, and measured at mainnet size the `BTreeMap`'s inserts
+/// cost several times what the hashing it saves does (a few dozen
+/// milliseconds against a few); the dense buffer is an indexed write, and its
+/// slot-per-validator allocation is small next to that. The pass that writes
+/// nearly every entry, the epoch rotation, does not buffer either: it replaces
+/// the list with a freshly built one (see `process_participation_flag_updates`).
+pub type EpochParticipation = List<ParticipationFlags, { preset::VALIDATOR_REGISTRY_LIMIT }>;
 
 /// Per-validator inactivity scores, positionally parallel to [`Validators`]
 /// (altair and later).
@@ -131,6 +146,10 @@ pub type ProgressiveValidators = TreeProgressiveList<Validator, BTreeMap<usize, 
 /// Tree-backed like [`Balances`], with writes buffered densely (the default
 /// `VecMap`), since epoch processing writes every balance.
 pub type ProgressiveBalances = TreeProgressiveList<Gwei>;
+
+/// The gloas participation flags, positionally parallel to
+/// [`ProgressiveValidators`]. Tree-backed and buffered like [`EpochParticipation`].
+pub type ProgressiveEpochParticipation = TreeProgressiveList<ParticipationFlags>;
 
 // ---------------------------------------------------------------------------
 // Misc
@@ -567,5 +586,268 @@ mod tests {
         assert!(<ProposerSlashing as libssz::SszEncode>::is_fixed_size());
         assert!(<VoluntaryExit as libssz::SszEncode>::is_fixed_size());
         assert!(<SignedVoluntaryExit as libssz::SszEncode>::is_fixed_size());
+    }
+
+    /// Flags of mixed values, so a packing or ordering mistake changes the root.
+    fn flags(len: usize) -> Vec<ParticipationFlags> {
+        (0..len)
+            .map(|i| (i * 7 % 8) as ParticipationFlags)
+            .collect()
+    }
+
+    /// Lengths that hit an empty list, part of one chunk, exactly one chunk, a
+    /// partial last chunk and several leaf pages.
+    const LENGTHS: [usize; 8] = [0, 1, 31, 32, 33, 1000, 65_536 + 5, 300_001];
+
+    #[test]
+    fn tree_backed_participation_hashes_like_the_flat_list() {
+        use crate::primitives::HashTreeRoot as _;
+        type Flat = libssz_types::SszList<ParticipationFlags, { preset::VALIDATOR_REGISTRY_LIMIT }>;
+
+        for len in LENGTHS {
+            let values = flags(len);
+            let flat = Flat::try_from(values.clone()).unwrap();
+            let tree = EpochParticipation::try_from(values).unwrap();
+            assert_eq!(tree.hash_tree_root(), flat.hash_tree_root(), "len {len}");
+            assert_eq!(tree.to_ssz(), flat.to_ssz(), "len {len}");
+        }
+    }
+
+    #[test]
+    fn repeated_participation_hashes_like_the_flat_list() {
+        use crate::primitives::HashTreeRoot as _;
+        type Flat = libssz_types::SszList<ParticipationFlags, { preset::VALIDATOR_REGISTRY_LIMIT }>;
+
+        for len in LENGTHS {
+            let flat = Flat::try_from(vec![0; len]).unwrap();
+            let bounded = EpochParticipation::repeat(0, len).unwrap();
+            assert_eq!(bounded.hash_tree_root(), flat.hash_tree_root(), "len {len}");
+            assert_eq!(bounded.to_ssz(), flat.to_ssz(), "len {len}");
+
+            let flat = libssz_types::ProgressiveList::<ParticipationFlags>::from(vec![0; len]);
+            let progressive = ProgressiveEpochParticipation::repeat(0, len);
+            assert_eq!(
+                progressive.hash_tree_root(),
+                flat.hash_tree_root(),
+                "len {len}"
+            );
+            assert_eq!(progressive.to_ssz(), flat.to_ssz(), "len {len}");
+        }
+    }
+
+    #[test]
+    fn participation_writes_rehash_like_a_rebuilt_list() {
+        use crate::primitives::HashTreeRoot as _;
+        type Flat = libssz_types::SszList<ParticipationFlags, { preset::VALIDATOR_REGISTRY_LIMIT }>;
+
+        let mut values = flags(70_000);
+        let mut tree = EpochParticipation::try_from(values.clone()).unwrap();
+        // Warm every cached hash, so the writes below must invalidate the paths
+        // they touch rather than recompute the whole list.
+        tree.apply_updates();
+        let _ = tree.hash_tree_root();
+
+        for index in [0usize, 31, 32, 4_095, 4_096, 69_999] {
+            values[index] |= 0b100;
+            *tree.get_mut(index).unwrap() |= 0b100;
+        }
+        tree.push(0b11).unwrap();
+        values.push(0b11);
+        tree.apply_updates();
+
+        let flat = Flat::try_from(values).unwrap();
+        assert_eq!(tree.hash_tree_root(), flat.hash_tree_root());
+        assert_eq!(tree.to_ssz(), flat.to_ssz());
+    }
+
+    #[test]
+    fn progressive_participation_hashes_like_the_flat_list() {
+        use crate::primitives::HashTreeRoot as _;
+
+        for len in LENGTHS {
+            let values = flags(len);
+            let flat = libssz_types::ProgressiveList::<ParticipationFlags>::from(values.clone());
+            let tree = ProgressiveEpochParticipation::from(values);
+            assert_eq!(tree.hash_tree_root(), flat.hash_tree_root(), "len {len}");
+            assert_eq!(tree.to_ssz(), flat.to_ssz(), "len {len}");
+        }
+    }
+
+    /// Run with `--ignored --nocapture`. Compares what a state root pays for
+    /// the two participation lists after one block, before (flat lists,
+    /// rehashed whole) and after (trees) at mainnet registry size. The block
+    /// credits one slot's worth of validators (a thirty-second of the
+    /// registry, at pseudo-random positions as committee shuffling places
+    /// them) in the current epoch's list; the previous one is untouched.
+    #[test]
+    #[ignore = "benchmark"]
+    fn participation_root_after_a_block_of_writes_bench() {
+        use crate::primitives::HashTreeRoot as _;
+        use std::time::Instant;
+        type Flat = libssz_types::SszList<ParticipationFlags, { preset::VALIDATOR_REGISTRY_LIMIT }>;
+
+        const COUNT: usize = 2_400_000;
+        const TOUCHED: usize = COUNT / 32;
+        let values = flags(COUNT);
+        let mut state = 12345u64;
+        let touched: Vec<usize> = (0..TOUCHED)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) as usize % COUNT
+            })
+            .collect();
+
+        let flat_previous = Flat::try_from(values.clone()).unwrap();
+        let mut flat_current = Flat::try_from(values.clone()).unwrap();
+        let mut tree_previous = EpochParticipation::try_from(values.clone()).unwrap();
+        let mut tree_current = EpochParticipation::try_from(values).unwrap();
+        for tree in [&mut tree_previous, &mut tree_current] {
+            tree.apply_updates();
+            let _ = tree.hash_tree_root();
+        }
+
+        let start = Instant::now();
+        for &index in &touched {
+            flat_current[index] |= 0b100;
+        }
+        let flat_roots = (
+            flat_previous.hash_tree_root(),
+            flat_current.hash_tree_root(),
+        );
+        let flat_time = start.elapsed();
+
+        let start = Instant::now();
+        for &index in &touched {
+            *tree_current.get_mut(index).unwrap() |= 0b100;
+        }
+        let write_time = start.elapsed();
+        tree_previous.apply_updates();
+        tree_current.apply_updates();
+        let apply_time = start.elapsed();
+        let tree_roots = (
+            tree_previous.hash_tree_root(),
+            tree_current.hash_tree_root(),
+        );
+        let tree_time = start.elapsed();
+        println!("tree phases: writes {write_time:?}, apply {apply_time:?}, hash {tree_time:?}");
+
+        assert_eq!(flat_roots, tree_roots);
+        println!("flat: {flat_time:?}, tree: {tree_time:?} ({TOUCHED} of {COUNT} entries written)");
+    }
+
+    /// Run with `--ignored --nocapture`. Times the participation part of one
+    /// `process_attestation` at mainnet registry size: read the current flags
+    /// of ~75k ascending attesters, then write the new ones. "per-index" is
+    /// the first tree-backed version (a descent per `get`, then a `get_mut`
+    /// that copies the old value into the write buffer); the others swap in
+    /// the sorted reader and the blind `set`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn attestation_pass_bench() {
+        use crate::primitives::HashTreeRoot as _;
+        use std::time::Instant;
+
+        const COUNT: usize = 2_400_000;
+        const ATTESTERS: usize = COUNT / 32;
+        let mut state = 99u64;
+        let mut attesters: Vec<usize> = (0..ATTESTERS)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) as usize % COUNT
+            })
+            .collect();
+        attesters.sort_unstable();
+        attesters.dedup();
+
+        let fresh = || {
+            let mut list = EpochParticipation::try_from(flags(COUNT)).unwrap();
+            list.apply_updates();
+            let _ = list.hash_tree_root();
+            list
+        };
+
+        for (name, sorted_reads, blind_writes) in [
+            ("per-index get + get_mut", false, false),
+            ("per-index get + set", false, true),
+            ("sorted reader + get_mut", true, false),
+            ("sorted reader + set", true, true),
+        ] {
+            // Best of several runs: the first is cold.
+            let mut best = (std::time::Duration::MAX, std::time::Duration::MAX);
+            for _ in 0..5 {
+                let mut list = fresh();
+                let start = Instant::now();
+                let mut updates: Vec<(usize, ParticipationFlags)> = Vec::new();
+                if sorted_reads {
+                    let mut reader = list.sorted_reader();
+                    for &index in &attesters {
+                        let current = *reader.get(index).unwrap();
+                        updates.push((index, current));
+                    }
+                } else {
+                    for &index in &attesters {
+                        let current = *list.get(index).unwrap();
+                        updates.push((index, current));
+                    }
+                }
+                let read = start.elapsed();
+                let start = Instant::now();
+                for &(index, current) in &updates {
+                    if blind_writes {
+                        assert!(list.set(index, current | 0b100));
+                    } else {
+                        *list.get_mut(index).unwrap() |= 0b100;
+                    }
+                }
+                let write = start.elapsed();
+                best = (best.0.min(read), best.1.min(write));
+            }
+            println!(
+                "{name}: read {:?}, write {:?}, total {:?} ({} attesters)",
+                best.0,
+                best.1,
+                best.0 + best.1,
+                attesters.len()
+            );
+        }
+    }
+
+    /// Run with `--ignored --nocapture`. Times the epoch rotation's new
+    /// current-epoch participation list at mainnet registry size, then the
+    /// state root that follows: built from a zeroed `Vec` (what the rotation
+    /// did) against `List::repeat`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn participation_rotation_bench() {
+        use crate::primitives::HashTreeRoot as _;
+        use std::time::Instant;
+
+        const COUNT: usize = 2_400_000;
+        for _ in 0..3 {
+            let start = Instant::now();
+            let from_vec = EpochParticipation::try_from(vec![0u8; COUNT]).unwrap();
+            let build_vec = start.elapsed();
+            let start = Instant::now();
+            let root_vec = from_vec.hash_tree_root();
+            let hash_vec = start.elapsed();
+
+            let start = Instant::now();
+            let repeated = EpochParticipation::repeat(0, COUNT).unwrap();
+            let build_repeat = start.elapsed();
+            let start = Instant::now();
+            let root_repeat = repeated.hash_tree_root();
+            let hash_repeat = start.elapsed();
+
+            assert_eq!(root_vec, root_repeat);
+            println!(
+                "vec: build {build_vec:?} + hash {hash_vec:?} = {:?}; repeat: build {build_repeat:?} + hash {hash_repeat:?} = {:?}",
+                build_vec + hash_vec,
+                build_repeat + hash_repeat
+            );
+        }
     }
 }

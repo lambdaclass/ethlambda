@@ -57,8 +57,8 @@
 //!   It is unmodified in the specification,
 //!   but replaces the whole list (a new length, not an element write), which
 //!   only the fork's own concrete container type can do: electra's and
-//!   fulu's `EpochParticipation::try_from` is fallible where gloas's
-//!   `ProgressiveList::from` is not, so there is no shared return type a
+//!   fulu's `EpochParticipation::repeat` is fallible where gloas's
+//!   `ProgressiveList::repeat` is not, so there is no shared return type a
 //!   `dispatch_state_from!` body could give both.
 
 use crate::beacon::config::Config;
@@ -110,8 +110,8 @@ pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
 /// installs a fresh, all-zero current list, gloas's own copy of
 /// [`crate::beacon::stf::epoch::altair::process_participation_flag_updates`]:
 /// identical logic, writing gloas's own progressive lists through
-/// [`gloas_state`] (an infallible `From<Vec<_>>` conversion, unlike the
-/// bounded `EpochParticipation`'s fallible `TryFrom` altair's version needs).
+/// [`gloas_state`] (an infallible `repeat`, unlike the bounded
+/// `EpochParticipation`'s fallible one altair's version needs).
 /// See this module's own doc for why that difference is what keeps this a
 /// separate copy rather than a shared, `Vec`-level function the way
 /// [`super::electra::process_pending_consolidations`] is.
@@ -120,7 +120,8 @@ pub fn process_participation_flag_updates(state: &mut BeaconState) -> Result<()>
     let inner = gloas_state(state, "process_participation_flag_updates")?;
 
     inner.previous_epoch_participation = core::mem::take(&mut inner.current_epoch_participation);
-    inner.current_epoch_participation = vec![0; validator_count].into();
+    // `repeat` rather than a zeroed `Vec`, for the reason given in altair's.
+    inner.current_epoch_participation = gloas::EpochParticipation::repeat(0, validator_count);
 
     Ok(())
 }
@@ -326,7 +327,10 @@ mod tests {
             signature: Default::default(),
             slot: constants::GENESIS_SLOT,
         };
-        gloas_inner_mut(&mut state).pending_deposits.push(deposit);
+        gloas_inner_mut(&mut state)
+            .pending_deposits
+            .push(deposit)
+            .unwrap();
 
         let balance_before = state.balance(0).unwrap();
         process_pending_deposits(&mut state, &config).unwrap();
@@ -360,7 +364,8 @@ mod tests {
         };
         gloas_inner_mut(&mut state)
             .pending_deposits
-            .push(deposit.clone());
+            .push(deposit.clone())
+            .unwrap();
 
         let balance_before = state.balance(0).unwrap();
         process_pending_deposits(&mut state, &config).unwrap();
@@ -439,8 +444,8 @@ mod tests {
         };
         {
             let inner = gloas_inner_mut(&mut state);
-            inner.pending_deposits.push(first);
-            inner.pending_deposits.push(second.clone());
+            inner.pending_deposits.push(first).unwrap();
+            inner.pending_deposits.push(second.clone()).unwrap();
         }
 
         let balance_0_before = state.balance(0).unwrap();

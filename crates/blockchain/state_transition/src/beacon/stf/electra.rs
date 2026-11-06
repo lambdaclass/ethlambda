@@ -750,15 +750,17 @@ pub fn process_attestation(
 
     let mut proposer_reward_numerator: Gwei = 0;
     let mut updates: Vec<(ValidatorIndex, ParticipationFlags)> = Vec::new();
+    // `attesting_indices` is sorted ascending, so the reader walks each leaf
+    // once rather than descending the tree for every attester.
+    let mut reader = participation.sorted_reader();
     for index in attesting_indices {
-        let current_flags =
-            participation
-                .get(index as usize)
-                .copied()
-                .ok_or(Error::IndexOutOfBounds {
-                    index: index as usize,
-                    len: participation.len(),
-                })?;
+        let current_flags = reader
+            .get(index as usize)
+            .copied()
+            .ok_or(Error::IndexOutOfBounds {
+                index: index as usize,
+                len: participation.len(),
+            })?;
 
         let mut new_flags: ParticipationFlags = 0;
         // The attester's validator is read at most once, on the first flag
@@ -793,7 +795,7 @@ pub fn process_attestation(
                 .ok_or(Error::ArithmeticOverflow("proposer_reward_numerator"))?;
         }
         if new_flags != 0 {
-            updates.push((index, new_flags));
+            updates.push((index, current_flags | new_flags));
         }
     }
 
@@ -804,15 +806,20 @@ pub fn process_attestation(
         let mut fields = block_mut(state, "process_attestation")?;
         let participation_mut = fields.epoch_participation_mut(current_epoch_target);
         let participation_len = participation_mut.len();
-        for (index, new_flags) in updates {
-            let flags =
-                participation_mut
-                    .get_mut(index as usize)
-                    .ok_or(Error::IndexOutOfBounds {
-                        index: index as usize,
-                        len: participation_len,
-                    })?;
-            *flags |= new_flags;
+        // A blind write of `current_flags | new_flags`, which the read phase
+        // stored, rather than `|=` on the stored value. That is exact: the
+        // attesting indices are distinct (members of disjoint committees, and the
+        // signature set built above refuses a repeated index), so each index is
+        // written once, and nothing writes this list between the read phase and
+        // here, so the stored value is still `current_flags`. It saves the tree
+        // descent `get_mut` makes to copy the old value into the write buffer.
+        for (index, flags) in updates {
+            if !participation_mut.set(index as usize, flags) {
+                return Err(Error::IndexOutOfBounds {
+                    index: index as usize,
+                    len: participation_len,
+                });
+            }
         }
     }
 
