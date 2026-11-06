@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-5c34d081.js";
+            window.path_to_searchindex_js = "searchindex-872bc70a.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -987,11 +987,11 @@ and absent is not the same as zero.</p>
 <tr><td><code>ethlambda_validator_attestations_published_total</code></td><td>Counter</td><td>Attestations a beacon node accepted</td></tr>
 <tr><td><code>ethlambda_validator_attestation_failures_total</code></td><td>Counter</td><td>Slots whose attestation duty failed and returned</td></tr>
 <tr><td><code>ethlambda_validator_attestation_deadline_missed_total</code></td><td>Counter</td><td>Slots whose duty never returned in time and was abandoned. Points at a slow or hung beacon node rather than a rejected attestation</td></tr>
-<tr><td><code>ethlambda_validator_attestations_refused_total</code></td><td>Counter</td><td>Signatures deliberately not attempted, because this process had already signed a conflicting attestation for that validator. Should normally read zero</td></tr>
+<tr><td><code>ethlambda_validator_attestations_refused_total</code></td><td>Counter</td><td>Signatures deliberately not attempted, because slashing protection judged the attestation unsafe or could not record it. Should normally read zero</td></tr>
 <tr><td><code>ethlambda_validator_signing_failures_total</code></td><td>Counter</td><td>Signatures attempted and failed</td></tr>
 <tr><td><code>ethlambda_validator_blocks_proposed_total</code></td><td>Counter</td><td>Blocks signed and accepted by a beacon node</td></tr>
 <tr><td><code>ethlambda_validator_blocks_broadcast_not_imported_total</code></td><td>Counter</td><td>Blocks a node broadcast but could not import into its own database, which is what a 202 means. A subset of <code>blocks_proposed_total</code>, not a failure: the block reached the network. Points at that node’s execution layer</td></tr>
-<tr><td><code>ethlambda_validator_blocks_refused_total</code></td><td>Counter</td><td>Blocks deliberately not signed, because this process had already proposed that slot for that validator. Should normally read zero</td></tr>
+<tr><td><code>ethlambda_validator_blocks_refused_total</code></td><td>Counter</td><td>Blocks deliberately not signed, because slashing protection judged the block unsafe or could not record it. Should normally read zero</td></tr>
 <tr><td><code>ethlambda_validator_block_proposal_failures_total</code></td><td>Counter</td><td>Proposal duties that did not end in a published block, including ones abandoned for overrunning</td></tr>
 <tr><td><code>ethlambda_validator_envelopes_published_total</code></td><td>Counter</td><td>Execution payload envelopes a beacon node accepted for blocks this client proposed (gloas)</td></tr>
 <tr><td><code>ethlambda_validator_envelope_failures_total</code></td><td>Counter</td><td>Proposed gloas blocks whose self-built envelope was not published. The block is out and the proposal counts as made, but the slot’s payload is withheld, so this is the failure that costs the payload. Should read zero</td></tr>
@@ -1008,6 +1008,8 @@ and absent is not the same as zero.</p>
 <tr><td><code>ethlambda_validator_block_publication_delay_seconds</code></td><td>Histogram</td><td>Slot start to block accepted. Its buckets are tighter than the attestation histogram’s, because a block is due at the slot boundary rather than a third of the way in</td></tr>
 <tr><td><code>ethlambda_validator_beacon_node_available</code></td><td>Gauge</td><td>1 when a beacon node answered the last duty refresh or attestation</td></tr>
 <tr><td><code>ethlambda_validator_signing_duration_seconds</code></td><td>Histogram</td><td>Time to sign one slot’s batch, store read lock included</td></tr>
+<tr><td><code>ethlambda_validator_slashing_protection_write_seconds</code></td><td>Histogram</td><td>Time to durably write the slashing-protection record, once per slot’s attestation batch and once per block, before signing. Milliseconds on a local disk; worth an alert above about a second, since the duty waits for it and a write held past 3 s is refused</td></tr>
+<tr><td><code>ethlambda_validator_slashing_protection_write_failures_total</code></td><td>Counter</td><td>Slashing-protection writes that failed, each leaving its messages unsigned. Should read zero; anything else points at the disk under <code>--validators-dir</code></td></tr>
 <tr><td><code>ethlambda_validator_publication_delay_seconds</code></td><td>Histogram</td><td>Slot start to attestations accepted. The headline health number: it should sit near the one-third-slot duty offset</td></tr>
 </tbody>
 </table>

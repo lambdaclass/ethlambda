@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-5c34d081.js";
+            window.path_to_searchindex_js = "searchindex-872bc70a.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -193,7 +193,7 @@
 </tbody>
 </table>
 </div>
-<p>Three subcommands follow no chain. <code>ethlambda replay-era</code> replays real chain
+<p>Four subcommands follow no chain. <code>ethlambda replay-era</code> replays real chain
 history from <code>.era</code> files and checks it against the states stored in them; see
 <a href="./era_replay.html"><code>era_replay.md</code></a> for its flags and checks. <code>ethlambda benchmark</code> is the offline
 benchmarking harness, covering block building (<code>benchmark synthetic</code>, run
@@ -203,7 +203,9 @@ what each workload measures; <code>benchmark import</code>’s flags are in
 <a href="#benchmark-import-flags">their own section</a> below. <code>ethlambda validator</code> is
 the validator client: a separate process that holds keys and performs duties
 against a beacon node over the standard REST API, documented in
-<a href="#validator-flags">its own section</a> below.</p>
+<a href="#validator-flags">its own section</a> below. <code>ethlambda slashing-protection</code>
+moves that client’s EIP-3076 history in and out of its directory, offline; see
+<a href="#slashing-protection">its section</a> below.</p>
 <h2 id="node-is-the-default"><a class="header" href="#node-is-the-default"><code>node</code> is the default</a></h2>
 <p>clap has no native default subcommand, so the binary rewrites its own argv
 before parsing. If the first argument is not <code>node</code>, <code>beacon</code>, <code>benchmark</code>,
@@ -455,17 +457,24 @@ the <code>WireConfig</code> variant for the topics, the req/resp protocol set, t
 gossipsub <code>seen_ttl</code>, the identify version and the connection limits.</p>
 <p>Both chains run a chain actor, so <code>RunningNode</code> carries a plain <code>BlockChain</code>.</p>
 <h2 id="validator-flags"><a class="header" href="#validator-flags"><code>validator</code> flags</a></h2>
-<p><code>ethlambda validator</code> is not a node. It binds no libp2p port, opens no
+<p><code>ethlambda validator</code> is not a node. It binds no libp2p port, opens no chain
 database, runs no discovery and follows no chain: it holds validator keys and
 performs duties against a beacon node’s standard REST API. It works against any
 conformant beacon node, this repository’s <code>beacon</code> subcommand or another
 implementation’s, so none of the <a href="#common-flags">common flags</a> apply to it.</p>
 <blockquote>
-<p><strong>It keeps no slashing-protection record.</strong> Read
-<a href="./spec_deviations.html#the-validator-client-keeps-no-slashing-protection-record">Spec Deviations</a>
-before running it with keys that hold real stake. In short: do not run these
-keys in any other client while this one runs, and treat a restart with the
-same care as a manual key move. The client repeats this warning at startup.</p>
+<p><strong>Slashing protection</strong> lives in <code>--validators-dir/slashing_protection.json</code>,
+locked to one process, so <code>--validators-dir</code> must be writable: a read-only
+mount of the keys (a Kubernetes Secret, a <code>:ro</code> volume) fails at startup, as
+does a record that is a symlink (say, onto another volume) rather than a
+regular file, since a dangling one would read as “no record”; and
+the directory should be a local disk, since every signature waits for the
+record to be flushed to it, and the lock that keeps a second process off it
+is an <code>flock</code>, which a network filesystem may not honour. Unix only. A key with no record is refused at startup unless
+<code>--init-slashing-protection</code> is passed. A key moving here from another client
+brings its history with <a href="#slashing-protection"><code>slashing-protection import</code></a>,
+or in the same keymanager API request that imports the key. See
+<a href="./spec_deviations.html#the-validator-client-keeps-eip-3076s-minimal-watermarks-not-full-history">Spec Deviations</a>.</p>
 </blockquote>
 <div class="table-wrapper">
 <table>
@@ -482,6 +491,7 @@ same care as a manual key move. The client repeats this warning at startup.</p>
 <tr><td><code>--suggested-fee-recipient</code></td><td>none</td><td>Execution address to receive block rewards, <code>0x</code>-prefixed, for every validator the keymanager API gives no address of its own. Optional, and startup warns when it is absent: without it the beacon node picks an address, and it will not be yours</td></tr>
 <tr><td><code>--graffiti</code></td><td>empty</td><td>Text for the graffiti field of proposed blocks, for every validator the keymanager API gives no graffiti of its own. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer. An ethlambda beacon node appends both clients’ versions to it (see <a href="rpc.html#validator-endpoints"><code>rpc.md</code></a>)</td></tr>
 <tr><td><code>--enable-keymanager</code></td><td>off</td><td>Serve the keymanager API: keystores, plus each validator’s own fee recipient, graffiti and gas limit. Off by default because it mutates key material</td></tr>
+<tr><td><code>--init-slashing-protection</code></td><td>off</td><td>Register every loaded key with no slashing-protection record as never having signed, instead of refusing to start. Dangerous: only for keys that have signed nothing anywhere for at least two epochs, and even then it rules out a double vote only, not a surround of an older vote; a key with a history should bring it instead. Never lowers an existing record; remove it once the keys are registered, and startup warns while it is set for nothing</td></tr>
 </tbody>
 </table>
 </div>
@@ -609,6 +619,13 @@ Lighthouse answers it; <code>POST feerecipient</code> refuses the zero address, 
 specification requires; <code>POST graffiti</code> refuses text over 32 bytes rather than
 truncating it; and every route answers <code>404</code> for a key this client does not
 hold.</p>
+<p>The keystore routes carry slashing-protection history. <code>POST</code> refuses every
+key in the request if its <code>slashing_protection</code> does not parse or is for
+another chain, and otherwise writes that history before any key is saved, so a
+key never loads ahead of it; a validator the history names without a keystore
+in the request gets a record too. <code>DELETE</code>
+returns the deleted keys’ records as a minimal EIP-3076 interchange, answering
+<code>not_active</code> for a key that is gone but still has a record.</p>
 <p>The specification requires TLS. This binds to <code>--http-address</code>, loopback by
 default; exposing it further means putting a TLS terminator in front.</p>
 <h3 id="metrics"><a class="header" href="#metrics">Metrics</a></h3>
@@ -617,6 +634,29 @@ default; exposing it further means putting a TLS terminator in front.</p>
 beacon chain. Every series is registered at startup so it reads zero rather
 than being absent before its first event, which is what lets an alert fire on
 “attestations stopped”. See <a href="./metrics.html#validator-client">Metrics</a>.</p>
+<h2 id="slashing-protection"><a class="header" href="#slashing-protection"><code>slashing-protection</code></a></h2>
+<p>Moves the validator client’s EIP-3076 history in and out of its
+<code>--validators-dir</code>, offline. It takes the lock the client holds while running,
+so it refuses while a client runs on that directory, and it needs no beacon
+node: the record names its own chain.</p>
+<pre><code class="language-sh"># Bring a key's history from another client before its first start here.
+ethlambda slashing-protection import --validators-dir ./validators interchange.json
+
+# Hand the history over before running the keys elsewhere.
+ethlambda slashing-protection export --validators-dir ./validators out.json
+ethlambda slashing-protection export --validators-dir ./validators --pubkeys 0xab..,0xcd.. out.json
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Sub-command</th><th>Does</th></tr>
+</thead>
+<tbody>
+<tr><td><code>import &lt;file&gt;</code></td><td>Merges a version 5 interchange, complete or minimal, into the record. Each validator is reduced to its highest slot, source and target and merged by maximum, so nothing already recorded is lowered and slashable data in the file is absorbed rather than refused, except an attestation whose source is at or past its target outside genesis, which is refused. All or nothing. With no record yet, the import creates one for the interchange’s chain, and a failed import creates nothing; the client refuses the record at its next start if that is not its beacon node’s chain</td></tr>
+<tr><td><code>export [--pubkeys ...] &lt;file&gt;</code></td><td>Writes the record, or the named validators’ part of it, as a minimal version 5 interchange, readable by its owner only. A named validator with no record fails the export, so a typo or the wrong directory cannot produce a file that reads as complete. Takes the record’s lock, so the directory must be writable. Refuses to overwrite an existing file</td></tr>
+</tbody>
+</table>
+</div>
 <h2 id="benchmark-import-flags"><a class="header" href="#benchmark-import-flags"><code>benchmark import</code> flags</a></h2>
 <p>Neither sub-command follows a chain; see <a href="./benchmarking.html#import-workload"><code>benchmarking.md</code></a>
 for what the workload measures and why it exists.</p>

@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-5c34d081.js";
+            window.path_to_searchindex_js = "searchindex-872bc70a.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -3832,7 +3832,7 @@ from one place, and were removed outright by capella. Nothing here changes them.
 </tbody>
 </table>
 </div>
-<p>Three subcommands follow no chain. <code>ethlambda replay-era</code> replays real chain
+<p>Four subcommands follow no chain. <code>ethlambda replay-era</code> replays real chain
 history from <code>.era</code> files and checks it against the states stored in them; see
 <a href="#era-replay"><code>era_replay.md</code></a> for its flags and checks. <code>ethlambda benchmark</code> is the offline
 benchmarking harness, covering block building (<code>benchmark synthetic</code>, run
@@ -3842,7 +3842,9 @@ what each workload measures; <code>benchmark import</code>’s flags are in
 <a href="#benchmark-import-flags">their own section</a> below. <code>ethlambda validator</code> is
 the validator client: a separate process that holds keys and performs duties
 against a beacon node over the standard REST API, documented in
-<a href="#validator-flags">its own section</a> below.</p>
+<a href="#validator-flags">its own section</a> below. <code>ethlambda slashing-protection</code>
+moves that client’s EIP-3076 history in and out of its directory, offline; see
+<a href="#slashing-protection">its section</a> below.</p>
 <h2 id="node-is-the-default"><a class="header" href="#node-is-the-default"><code>node</code> is the default</a></h2>
 <p>clap has no native default subcommand, so the binary rewrites its own argv
 before parsing. If the first argument is not <code>node</code>, <code>beacon</code>, <code>benchmark</code>,
@@ -4094,17 +4096,24 @@ the <code>WireConfig</code> variant for the topics, the req/resp protocol set, t
 gossipsub <code>seen_ttl</code>, the identify version and the connection limits.</p>
 <p>Both chains run a chain actor, so <code>RunningNode</code> carries a plain <code>BlockChain</code>.</p>
 <h2 id="validator-flags"><a class="header" href="#validator-flags"><code>validator</code> flags</a></h2>
-<p><code>ethlambda validator</code> is not a node. It binds no libp2p port, opens no
+<p><code>ethlambda validator</code> is not a node. It binds no libp2p port, opens no chain
 database, runs no discovery and follows no chain: it holds validator keys and
 performs duties against a beacon node’s standard REST API. It works against any
 conformant beacon node, this repository’s <code>beacon</code> subcommand or another
 implementation’s, so none of the <a href="#common-flags">common flags</a> apply to it.</p>
 <blockquote>
-<p><strong>It keeps no slashing-protection record.</strong> Read
-<a href="#the-validator-client-keeps-no-slashing-protection-record">Spec Deviations</a>
-before running it with keys that hold real stake. In short: do not run these
-keys in any other client while this one runs, and treat a restart with the
-same care as a manual key move. The client repeats this warning at startup.</p>
+<p><strong>Slashing protection</strong> lives in <code>--validators-dir/slashing_protection.json</code>,
+locked to one process, so <code>--validators-dir</code> must be writable: a read-only
+mount of the keys (a Kubernetes Secret, a <code>:ro</code> volume) fails at startup, as
+does a record that is a symlink (say, onto another volume) rather than a
+regular file, since a dangling one would read as “no record”; and
+the directory should be a local disk, since every signature waits for the
+record to be flushed to it, and the lock that keeps a second process off it
+is an <code>flock</code>, which a network filesystem may not honour. Unix only. A key with no record is refused at startup unless
+<code>--init-slashing-protection</code> is passed. A key moving here from another client
+brings its history with <a href="#slashing-protection"><code>slashing-protection import</code></a>,
+or in the same keymanager API request that imports the key. See
+<a href="#the-validator-client-keeps-eip-3076s-minimal-watermarks-not-full-history">Spec Deviations</a>.</p>
 </blockquote>
 <div class="table-wrapper">
 <table>
@@ -4121,6 +4130,7 @@ same care as a manual key move. The client repeats this warning at startup.</p>
 <tr><td><code>--suggested-fee-recipient</code></td><td>none</td><td>Execution address to receive block rewards, <code>0x</code>-prefixed, for every validator the keymanager API gives no address of its own. Optional, and startup warns when it is absent: without it the beacon node picks an address, and it will not be yours</td></tr>
 <tr><td><code>--graffiti</code></td><td>empty</td><td>Text for the graffiti field of proposed blocks, for every validator the keymanager API gives no graffiti of its own. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer. An ethlambda beacon node appends both clients’ versions to it (see <a href="#validator-endpoints"><code>rpc.md</code></a>)</td></tr>
 <tr><td><code>--enable-keymanager</code></td><td>off</td><td>Serve the keymanager API: keystores, plus each validator’s own fee recipient, graffiti and gas limit. Off by default because it mutates key material</td></tr>
+<tr><td><code>--init-slashing-protection</code></td><td>off</td><td>Register every loaded key with no slashing-protection record as never having signed, instead of refusing to start. Dangerous: only for keys that have signed nothing anywhere for at least two epochs, and even then it rules out a double vote only, not a surround of an older vote; a key with a history should bring it instead. Never lowers an existing record; remove it once the keys are registered, and startup warns while it is set for nothing</td></tr>
 </tbody>
 </table>
 </div>
@@ -4248,6 +4258,13 @@ Lighthouse answers it; <code>POST feerecipient</code> refuses the zero address, 
 specification requires; <code>POST graffiti</code> refuses text over 32 bytes rather than
 truncating it; and every route answers <code>404</code> for a key this client does not
 hold.</p>
+<p>The keystore routes carry slashing-protection history. <code>POST</code> refuses every
+key in the request if its <code>slashing_protection</code> does not parse or is for
+another chain, and otherwise writes that history before any key is saved, so a
+key never loads ahead of it; a validator the history names without a keystore
+in the request gets a record too. <code>DELETE</code>
+returns the deleted keys’ records as a minimal EIP-3076 interchange, answering
+<code>not_active</code> for a key that is gone but still has a record.</p>
 <p>The specification requires TLS. This binds to <code>--http-address</code>, loopback by
 default; exposing it further means putting a TLS terminator in front.</p>
 <h3 id="metrics-1"><a class="header" href="#metrics-1">Metrics</a></h3>
@@ -4256,6 +4273,29 @@ default; exposing it further means putting a TLS terminator in front.</p>
 beacon chain. Every series is registered at startup so it reads zero rather
 than being absent before its first event, which is what lets an alert fire on
 “attestations stopped”. See <a href="#validator-client">Metrics</a>.</p>
+<h2 id="slashing-protection"><a class="header" href="#slashing-protection"><code>slashing-protection</code></a></h2>
+<p>Moves the validator client’s EIP-3076 history in and out of its
+<code>--validators-dir</code>, offline. It takes the lock the client holds while running,
+so it refuses while a client runs on that directory, and it needs no beacon
+node: the record names its own chain.</p>
+<pre><code class="language-sh"># Bring a key's history from another client before its first start here.
+ethlambda slashing-protection import --validators-dir ./validators interchange.json
+
+# Hand the history over before running the keys elsewhere.
+ethlambda slashing-protection export --validators-dir ./validators out.json
+ethlambda slashing-protection export --validators-dir ./validators --pubkeys 0xab..,0xcd.. out.json
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Sub-command</th><th>Does</th></tr>
+</thead>
+<tbody>
+<tr><td><code>import &lt;file&gt;</code></td><td>Merges a version 5 interchange, complete or minimal, into the record. Each validator is reduced to its highest slot, source and target and merged by maximum, so nothing already recorded is lowered and slashable data in the file is absorbed rather than refused, except an attestation whose source is at or past its target outside genesis, which is refused. All or nothing. With no record yet, the import creates one for the interchange’s chain, and a failed import creates nothing; the client refuses the record at its next start if that is not its beacon node’s chain</td></tr>
+<tr><td><code>export [--pubkeys ...] &lt;file&gt;</code></td><td>Writes the record, or the named validators’ part of it, as a minimal version 5 interchange, readable by its owner only. A named validator with no record fails the export, so a typo or the wrong directory cannot produce a file that reads as complete. Takes the record’s lock, so the directory must be writable. Refuses to overwrite an existing file</td></tr>
+</tbody>
+</table>
+</div>
 <h2 id="benchmark-import-flags"><a class="header" href="#benchmark-import-flags"><code>benchmark import</code> flags</a></h2>
 <p>Neither sub-command follows a chain; see <a href="#import-workload"><code>benchmarking.md</code></a>
 for what the workload measures and why it exists.</p>
@@ -6018,11 +6058,11 @@ and absent is not the same as zero.</p>
 <tr><td><code>ethlambda_validator_attestations_published_total</code></td><td>Counter</td><td>Attestations a beacon node accepted</td></tr>
 <tr><td><code>ethlambda_validator_attestation_failures_total</code></td><td>Counter</td><td>Slots whose attestation duty failed and returned</td></tr>
 <tr><td><code>ethlambda_validator_attestation_deadline_missed_total</code></td><td>Counter</td><td>Slots whose duty never returned in time and was abandoned. Points at a slow or hung beacon node rather than a rejected attestation</td></tr>
-<tr><td><code>ethlambda_validator_attestations_refused_total</code></td><td>Counter</td><td>Signatures deliberately not attempted, because this process had already signed a conflicting attestation for that validator. Should normally read zero</td></tr>
+<tr><td><code>ethlambda_validator_attestations_refused_total</code></td><td>Counter</td><td>Signatures deliberately not attempted, because slashing protection judged the attestation unsafe or could not record it. Should normally read zero</td></tr>
 <tr><td><code>ethlambda_validator_signing_failures_total</code></td><td>Counter</td><td>Signatures attempted and failed</td></tr>
 <tr><td><code>ethlambda_validator_blocks_proposed_total</code></td><td>Counter</td><td>Blocks signed and accepted by a beacon node</td></tr>
 <tr><td><code>ethlambda_validator_blocks_broadcast_not_imported_total</code></td><td>Counter</td><td>Blocks a node broadcast but could not import into its own database, which is what a 202 means. A subset of <code>blocks_proposed_total</code>, not a failure: the block reached the network. Points at that node’s execution layer</td></tr>
-<tr><td><code>ethlambda_validator_blocks_refused_total</code></td><td>Counter</td><td>Blocks deliberately not signed, because this process had already proposed that slot for that validator. Should normally read zero</td></tr>
+<tr><td><code>ethlambda_validator_blocks_refused_total</code></td><td>Counter</td><td>Blocks deliberately not signed, because slashing protection judged the block unsafe or could not record it. Should normally read zero</td></tr>
 <tr><td><code>ethlambda_validator_block_proposal_failures_total</code></td><td>Counter</td><td>Proposal duties that did not end in a published block, including ones abandoned for overrunning</td></tr>
 <tr><td><code>ethlambda_validator_envelopes_published_total</code></td><td>Counter</td><td>Execution payload envelopes a beacon node accepted for blocks this client proposed (gloas)</td></tr>
 <tr><td><code>ethlambda_validator_envelope_failures_total</code></td><td>Counter</td><td>Proposed gloas blocks whose self-built envelope was not published. The block is out and the proposal counts as made, but the slot’s payload is withheld, so this is the failure that costs the payload. Should read zero</td></tr>
@@ -6039,6 +6079,8 @@ and absent is not the same as zero.</p>
 <tr><td><code>ethlambda_validator_block_publication_delay_seconds</code></td><td>Histogram</td><td>Slot start to block accepted. Its buckets are tighter than the attestation histogram’s, because a block is due at the slot boundary rather than a third of the way in</td></tr>
 <tr><td><code>ethlambda_validator_beacon_node_available</code></td><td>Gauge</td><td>1 when a beacon node answered the last duty refresh or attestation</td></tr>
 <tr><td><code>ethlambda_validator_signing_duration_seconds</code></td><td>Histogram</td><td>Time to sign one slot’s batch, store read lock included</td></tr>
+<tr><td><code>ethlambda_validator_slashing_protection_write_seconds</code></td><td>Histogram</td><td>Time to durably write the slashing-protection record, once per slot’s attestation batch and once per block, before signing. Milliseconds on a local disk; worth an alert above about a second, since the duty waits for it and a write held past 3 s is refused</td></tr>
+<tr><td><code>ethlambda_validator_slashing_protection_write_failures_total</code></td><td>Counter</td><td>Slashing-protection writes that failed, each leaving its messages unsigned. Should read zero; anything else points at the disk under <code>--validators-dir</code></td></tr>
 <tr><td><code>ethlambda_validator_publication_delay_seconds</code></td><td>Histogram</td><td>Slot start to attestations accepted. The headline health number: it should sit near the one-third-slot duty offset</td></tr>
 </tbody>
 </table>
@@ -8146,57 +8188,89 @@ target-slot order as they are scanned.</p>
 <li><strong>Equivalence:</strong> both produce a valid block. ethlambda front-loads the attestations that advance justification and finality, and within those tiers prefers the <em>newest</em> target where leanSpec takes the <em>oldest</em>; combined with the smaller default budget, an older entry can be outranked by newer ones round after round, so which votes reach peers through blocks differs even though every block stays valid. The smaller budget yields smaller blocks and lower build times.</li>
 <li><strong>Upstream status:</strong> the tiered strategy is proposed upstream as leanSpec <a href="https://github.com/leanEthereum/leanSpec/pull/1149">PR #1149</a> (open at the time of writing), so this deviation may converge; the recursive-merge collapse follows leanSpec #510.</li>
 </ul>
-<h2 id="the-validator-client-keeps-no-slashing-protection-record"><a class="header" href="#the-validator-client-keeps-no-slashing-protection-record">The validator client keeps no slashing-protection record</a></h2>
-<p><code>ethlambda validator</code> signs attestations and blocks without recording what it
-has signed. It cannot detect that a previous run, or another client holding the
-same keys, already signed.</p>
+<h2 id="the-validator-client-keeps-eip-3076s-minimal-watermarks-not-full-history"><a class="header" href="#the-validator-client-keeps-eip-3076s-minimal-watermarks-not-full-history">The validator client keeps EIP-3076’s minimal watermarks, not full history</a></h2>
+<p><code>ethlambda validator</code> records, per validator, only the highest block slot and
+the highest attestation source and target epochs it has signed, and refuses
+anything that does not advance past them.</p>
 <ul>
 <li><strong>The specification:</strong> <a href="https://eips.ethereum.org/EIPS/eip-3076">EIP-3076</a>
-defines an interchange format and the conditions a validator client must never
-violate. For attestations: signing two <em>distinct</em> attestations with the same
-target epoch (a double vote), and signing one whose source and target surround
-or are surrounded by another’s. For blocks: signing two distinct ones for the
-same slot. Enforcing any of them requires a durable record, written before the
-signature leaves the process.</li>
-<li><strong>ethlambda:</strong> there is no such record and no store to hold one. This is a
-deliberate scope decision for the client’s first phase, not an oversight.</li>
-<li><strong>What partially covers it:</strong> two in-memory guards, one per message kind.
-<code>crate::attestation_guard::AttestationGuard</code> refuses to sign a second
-conflicting attestation for a validator <em>within one run</em>, using EIP-3076’s
-minimal rule (the target must advance, the source must not regress).
-<code>crate::proposal_guard::ProposalGuard</code> does the same for blocks, with the
-minimal rule for those (the slot must strictly advance). Between them they
-close the shapes reachable through ordinary operation: a backward wall-clock
-step, or a duty schedule replaced mid-epoch. Both are held in memory only, so
-a restart empties them and neither knows anything about any other process.</li>
-<li><strong>Gloas messages:</strong> a gloas proposer also signs an execution payload
-envelope, and a payload timeliness committee member signs a payload
-attestation. Neither is slashable, so neither has a guard. An envelope is
+forbids signing two <em>distinct</em> attestations with the same target epoch (a
+double vote), one whose source and target surround or are surrounded by
+another’s, and two distinct blocks for one slot. It allows enforcing those
+either against the full signing history or with the stricter minimal rule
+over watermarks.</li>
+<li><strong>ethlambda:</strong> the minimal rule. An attestation is signed only if its target
+is above the recorded target and its source is not below the recorded source;
+a block only if its slot is above the recorded slot. The record is
+<code>&lt;validators-dir&gt;/slashing_protection.json</code>, an EIP-3076 version 5 minimal
+interchange naming the chain’s <code>genesis_validators_root</code>. It is written to a
+temporary file, flushed, renamed into place and the directory flushed, all
+before the signature exists, and a write that fails leaves the message
+unsigned. A file that is empty, malformed, of another version or for another
+chain stops the client at startup rather than being read as “nothing
+signed”. An exclusive <code>flock</code> on the validators directory itself, the one
+inode nothing replaces or deletes, keeps a second process away from it. See
+<code>crate::slashing_protection</code>.</li>
+<li><strong>What the strictness costs:</strong> a byte-identical re-sign is refused. A client
+that recorded an attestation, crashed before publishing it, and restarted
+into the same slot loses that attestation rather than publishing it; the same
+holds for a block. An honest validator’s messages otherwise advance this way,
+so nothing else is refused. Lighthouse and Prysm keep signing roots to allow
+the identical re-sign; Teku keeps the same watermarks as this client.</li>
+<li><strong>A wedged record:</strong> the client refuses attestation data whose source is at
+or past its target, which is never valid outside genesis, so an impossible
+answer from a beacon node is refused rather than recorded. What it cannot
+tell is a possible one: a source below the target but ahead of what the
+chain has justified passes, the record keeps it, and every honest
+attestation after it is refused as <code>SourceRegressed</code> until justification
+reaches it, which during non-finality may be never. That is trust in the
+beacon node, the same trust every attestation already places in it; the
+symptom is the <code>SourceRegressed</code> refusal in the log and a non-zero
+<code>attestations_refused_total</code>. There is no tool that lowers a watermark, by
+design: stop the client, edit <code>slashing_protection.json</code> by hand, and start
+it again. Lowering a watermark is only safe for a key that has not signed
+past the value written. The same holds for a clock that jumps forward: the
+target is pinned to the slot the local clock asked for, so a beacon node
+that answers for a slot far ahead lets the record run ahead of the chain.
+A bound against the clock would be circular; the guard is the beacon
+node’s own view of the head, which doppelganger protection will bring.</li>
+<li><strong>No checksum, and rewritten minimal at every start:</strong> the record is an
+EIP-3076 minimal interchange and nothing more, by design: readable by other
+tools and editable by the operator, which the hand edit above relies on. A
+checksum or a generation counter would make it this client’s private format
+and refuse that edit, to guard against a flipped digit that still parses,
+which the disk’s and the filesystem’s own integrity checks are there for.
+Every start rewrites the file in the minimal shape, so signing roots and
+extra entries dropped in by hand collapse to their maxima.</li>
+<li><strong>Keys with no record:</strong> refused at startup. <code>--init-slashing-protection</code>
+registers them as never having signed, and a key imported through the
+keymanager API with no history is registered the same way before it is
+loaded. Nothing here stops such a key from signing again what it signed
+elsewhere a moment ago, so the flag is only for keys that have signed nothing
+anywhere for at least two epochs; the migration window is doppelganger
+protection’s to close, which this client does not have yet.</li>
+<li><strong>Messages outside the rule:</strong> sync committee messages and contributions
+are not slashable, and are not recorded. A gloas proposer also signs an
+execution payload envelope, and a payload timeliness committee member signs
+a payload attestation; neither is slashable, so neither is recorded. An envelope is
 published once per proposal, right after its block, and a failure to publish it
 is logged at error and counted without failing the proposal. A PTC vote has an
 in-memory dedup of <code>(validator, slot)</code> pairs recorded at signing time
 (<code>PayloadAttestationService</code>), so a duty abandoned between signing and
-submission is lost rather than re-signed. It is emptied by a restart and says
-nothing about another process, so it is not slashing protection either: a
-second, different vote for one slot is equivocation that peers penalize in
-gossip, not a slashing.</li>
-<li><strong>Why a proposer slashing is the worse of the two:</strong> a double vote needs a
-second validator’s attestation to be caught. Two signed block headers for one
-slot are the whole of the evidence on their own.</li>
-<li><strong>What is therefore not covered:</strong> restarting into a state where the chain has
-moved, and running these keys in two places at once. Both can produce a
-slashable double vote or a double proposal, and nothing in this client will
-stop them.</li>
-<li><strong>Keymanager consequences:</strong> <code>DELETE /eth/v1/keystores</code> must return an
-EIP-3076 interchange. This client returns a well-formed but empty one whose
-<code>genesis_validators_root</code> is deliberately all-zero, so a conformant importer
-rejects it outright rather than trusting an empty history that was never
-recorded. <code>POST</code> accepts the <code>slashing_protection</code> field and ignores it, with
-a server-side warning. A key migrated in or out through this API does not
-carry its history.</li>
-<li><strong>Operationally:</strong> do not run these keys in any other client while this one
-runs, and treat a restart as an event that needs the same care a manual key
-move would. The client warns about this at startup on every run.</li>
+submission is lost rather than re-signed. A second, different vote for one
+slot is equivocation that peers penalize in gossip, not a slashing.</li>
+<li><strong>What is not covered:</strong> the same keys running in another client on another
+machine. No local record can see that.</li>
+<li><strong>Interchange:</strong> an import (<code>ethlambda slashing-protection import</code>, or the
+keymanager API’s <code>POST /eth/v1/keystores</code>) reduces each validator to its
+highest slot, source and target and merges them with the record by maximum,
+so slashable data in the file is absorbed rather than refused, as Lighthouse
+and Nimbus do. The one exception is an attestation whose source is at or
+past its target outside genesis, which fails the whole import: it is never
+valid, and read into the record it would refuse every honest attestation
+until the chain justified past that source. An export (<code>ethlambda slashing-protection export</code>, or <code>DELETE /eth/v1/keystores</code>) is the record itself, in the minimal format. Both pass
+the shared <code>eth-clients/slashing-protection-interchange-tests</code> v5.3.0 vectors
+under their <code>should_succeed</code> (minimal) expectations.</li>
 </ul>
 <h2 id="builder-bids-gossip-and-api-only-no-builder-api"><a class="header" href="#builder-bids-gossip-and-api-only-no-builder-api">Builder bids: gossip and API only (no builder API)</a></h2>
 <p>A gloas proposer served by this node can take a builder’s bid from gossip or
