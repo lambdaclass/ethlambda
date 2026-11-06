@@ -911,3 +911,5 @@ pub fn add_participation_flag(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests;

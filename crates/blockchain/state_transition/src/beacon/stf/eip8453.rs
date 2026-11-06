@@ -558,3 +558,5 @@ pub fn advance_height(state: &mut BeaconState) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests;

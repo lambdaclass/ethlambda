@@ -220,3 +220,5 @@ pub fn process_head_vote_committee_window(state: &mut BeaconState) -> Result<()>
     Ok(())
 }
 
+#[cfg(test)]
+mod tests;
