@@ -461,6 +461,37 @@ that the tests compare like with like.
 - **Equivalence:** each is the specification's answer wherever the specification
   has one; they differ only where it would have raised.
 
+## A payload's block hash must be its header's
+
+`beacon_block` (bellatrix to fulu) and `execution_payload` gossip, and every
+envelope fetched by root or range, are REJECTed when the payload's `block_hash`
+is not `keccak256(rlp(header))` for the execution block header rebuilt from the
+payload's own fields.
+
+- **The specification:** has no such rule. A hash that does not match is the
+  execution client's to find, when the chain actor hands it the payload.
+- **ethlambda:** rebuilds the header in `ethlambda-p2p`
+  (`beacon/payload_hash.rs`) and refuses the message before the stateful rules
+  run. The header takes the payload's fields, the transactions and withdrawals
+  tries, the parent beacon block root (the block's `parent_root`; the
+  envelope's own field in gloas), the EIP-7685 requests hash (the Engine API's
+  request list, `get_execution_requests_list`), and in gloas the keccak of the
+  block access list bytes (EIP-7928) and the slot number (EIP-7843). It is run
+  per fork against real chain data: see the vector table in the module's tests.
+  A bellatrix payload that is the empty default (before the merge) is skipped.
+- **Why:** since `engine_newPayloadV2` the Engine API answers a block-hash
+  mismatch with `INVALID` and a null `latestValidHash`, the same answer as for
+  a payload that executed badly and whose last valid ancestor is unknown.
+  Applying payloads to fork choice before the execution client answers is only
+  safe if the structural case cannot get that far.
+- **Cost and counter:** one trie over the transactions per accepted-looking
+  message, after the cheap rules that drop most of them.
+  `lean_beacon_payload_block_hash_mismatch_total{kind}` counts refusals and a
+  `warn!` names the slot and root.
+- **Equivalence:** a stricter filter, never a looser one: every payload it
+  refuses is one the execution client would call `INVALID`. Blocks fetched by
+  `beacon_blocks_by_range/root` are not checked here.
+
 ## The envelope check reads the cached state root
 
 `verify_execution_payload_envelope` compares `envelope.beacon_block_root` with
