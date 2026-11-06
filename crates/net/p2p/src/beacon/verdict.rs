@@ -601,20 +601,26 @@ fn permits_for<'a>(
     server: &'a P2PServer,
     object: &Validated,
 ) -> &'a std::sync::Arc<tokio::sync::Semaphore> {
+    match pool_of(object) {
+        "gossip" => &server.gossip_validation_permits,
+        "attestation" => &server.attestation_validation_permits,
+        "builder" => &server.builder_validation_permits,
+        _ => &server.sync_validation_permits,
+    }
+}
+
+/// The label (see [`metrics::VALIDATION_POOLS`]) of the permit pool
+/// [`permits_for`] draws `object`'s permit from. The one `match` on the
+/// object kind, so the pool metrics and the pool actually used cannot differ.
+fn pool_of(object: &Validated) -> &'static str {
     match object {
-        Validated::Block { .. } | Validated::Column(_) | Validated::Envelope(_) => {
-            &server.gossip_validation_permits
-        }
+        Validated::Block { .. } | Validated::Column(_) | Validated::Envelope(_) => "gossip",
         Validated::Aggregate { .. }
         | Validated::Attestation { .. }
         | Validated::PayloadAttestation(_)
-        | Validated::Operation(_) => &server.attestation_validation_permits,
-        Validated::ExecutionPayloadBid { .. } | Validated::ProposerPreferences(_) => {
-            &server.builder_validation_permits
-        }
-        Validated::SyncCommitteeMessage { .. } | Validated::SyncContribution(_) => {
-            &server.sync_validation_permits
-        }
+        | Validated::Operation(_) => "attestation",
+        Validated::ExecutionPayloadBid { .. } | Validated::ProposerPreferences(_) => "builder",
+        Validated::SyncCommitteeMessage { .. } | Validated::SyncContribution(_) => "sync",
     }
 }
 
@@ -643,7 +649,9 @@ pub(crate) fn spawn_stateful_checks(
     id: GossipId,
     object: Validated,
 ) {
+    let pool = pool_of(&object);
     let Ok(permit) = permits_for(server, &object).clone().try_acquire_owned() else {
+        metrics::inc_validation_permit_exhausted(pool);
         let received_at = id.received_at;
         let outcome = Outcome::Ignore(IgnoreReason::Overloaded);
         report(server, id, outcome);
@@ -652,8 +660,12 @@ pub(crate) fn spawn_stateful_checks(
     };
     let store = server.store.clone();
     let actor = ctx.actor_ref();
+    let in_use = metrics::PoolInUse::new(pool);
+    let task = metrics::BlockingTask::new(id.kind);
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        let _in_use = in_use;
+        let _run = task.start();
         let mut object = object;
         let outcome = guarded(|| object.stateful_checks(&store));
         let _ = actor
