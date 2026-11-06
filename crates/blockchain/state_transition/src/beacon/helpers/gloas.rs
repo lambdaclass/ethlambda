@@ -821,10 +821,8 @@ pub fn get_activation_churn_limit(state: &BeaconState, config: &Config) -> Resul
 /// draws from this on a gloas state
 /// rather than electra's combined budget.
 pub fn get_exit_churn_limit(state: &BeaconState, config: &Config) -> Result<Gwei> {
-    Ok(exit_churn_limit_for(
-        get_total_active_balance(state)?,
-        config,
-    ))
+    let total_active_balance = get_total_active_balance(state)?;
+    Ok(exit_churn_limit_for(total_active_balance, config))
 }
 
 /// [`get_exit_churn_limit`] for a caller that already holds the total active
@@ -847,10 +845,8 @@ pub(crate) fn exit_churn_limit_for(total_active_balance: Gwei, config: &Config) 
 /// [`Config::min_per_epoch_churn_limit_electra`] the way the activation and
 /// exit limits are.
 pub fn get_consolidation_churn_limit(state: &BeaconState, config: &Config) -> Result<Gwei> {
-    Ok(consolidation_churn_limit_for(
-        get_total_active_balance(state)?,
-        config,
-    ))
+    let total_active_balance = get_total_active_balance(state)?;
+    Ok(consolidation_churn_limit_for(total_active_balance, config))
 }
 
 /// [`get_consolidation_churn_limit`] for a caller that already holds the total

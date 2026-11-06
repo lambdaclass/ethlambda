@@ -12,7 +12,9 @@ use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{Epoch, Gwei, ValidatorIndex};
 
-use super::accessors::{get_beacon_proposer_index, get_current_epoch, get_validator_churn_limit};
+use super::accessors::{
+    ActiveBalanceCache, get_beacon_proposer_index, get_current_epoch, get_validator_churn_limit,
+};
 use super::misc::compute_activation_exit_epoch;
 
 /// Adds `delta` to a validator's balance.
@@ -127,6 +129,57 @@ pub fn initiate_validator_exit(
     Ok(())
 }
 
+/// Starts `index`'s exit under the rules of the state's own fork.
+///
+/// Electra replaces [`initiate_validator_exit`] outright
+/// ([`crate::beacon::helpers::electra::initiate_validator_exit`], EIP-7251): the exit
+/// epoch comes from a balance-denominated churn budget rather than from
+/// counting how many validators are already queued. Every other caller of
+/// either version sits in a module that belongs to one fork and so names the
+/// version it wants directly. [`slash_validator`] is the exception, being one
+/// function that serves all seven forks, so it is the one place that has to
+/// ask the state which rule applies.
+///
+/// Reaching for phase0's version here instead is not a quiet inaccuracy: a
+/// slashing at electra would set a different `exit_epoch`, and leave the
+/// state's churn cursor unadvanced, so every subsequent exit in the same epoch
+/// would queue wrongly too.
+///
+/// `active_balances` reaches electra's churn limit, which reads the total
+/// active balance (see
+/// [`crate::beacon::helpers::electra::compute_exit_epoch_and_update_churn`]);
+/// phase0's count-based limit has no use for it.
+fn initiate_validator_exit_for_fork(
+    state: &mut BeaconState,
+    index: ValidatorIndex,
+    config: &Config,
+    active_balances: Option<&ActiveBalanceCache>,
+) -> Result<()> {
+    match state.fork_name() {
+        // Gloas is not a redefinition of `initiate_validator_exit` (EIP-8061
+        // touches only `compute_exit_epoch_and_update_churn`'s own churn
+        // limit, by fork dispatch there), so it reaches electra's copy
+        // unchanged, the same way pyspec's own unmodified
+        // `initiate_validator_exit` does on a gloas state: the churn it
+        // draws through `compute_exit_epoch_and_update_churn` is already
+        // gloas's own by the time it gets here.
+        ForkName::Electra | ForkName::Fulu | ForkName::Gloas => {
+            crate::beacon::helpers::electra::initiate_validator_exit(
+                state,
+                index,
+                config,
+                active_balances,
+            )
+        }
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb => initiate_validator_exit(state, index, config),
+        ForkName::Lean => lean_state_unreachable("initiate_validator_exit_for_fork"),
+    }
+}
+
 /// Slashes a validator: exits it, penalizes it, and pays the reporter.
 ///
 /// The immediate penalty is only a fraction of the effective balance. The rest of
@@ -152,54 +205,20 @@ pub fn initiate_validator_exit(
 ///
 /// The exit it starts, however, is genuinely fork-dependent, which is what
 /// [`initiate_validator_exit_for_fork`] exists to resolve.
-/// Starts `index`'s exit under the rules of the state's own fork.
 ///
-/// Electra replaces [`initiate_validator_exit`] outright
-/// ([`crate::beacon::helpers::electra::initiate_validator_exit`], EIP-7251): the exit
-/// epoch comes from a balance-denominated churn budget rather than from
-/// counting how many validators are already queued. Every other caller of
-/// either version sits in a module that belongs to one fork and so names the
-/// version it wants directly. [`slash_validator`] is the exception, being one
-/// function that serves all seven forks, so it is the one place that has to
-/// ask the state which rule applies.
-///
-/// Reaching for phase0's version here instead is not a quiet inaccuracy: a
-/// slashing at electra would set a different `exit_epoch`, and leave the
-/// state's churn cursor unadvanced, so every subsequent exit in the same epoch
-/// would queue wrongly too.
-fn initiate_validator_exit_for_fork(
-    state: &mut BeaconState,
-    index: ValidatorIndex,
-    config: &Config,
-) -> Result<()> {
-    match state.fork_name() {
-        // Gloas is not a redefinition of `initiate_validator_exit` (EIP-8061
-        // touches only `compute_exit_epoch_and_update_churn`'s own churn
-        // limit, by fork dispatch there), so it reaches electra's copy
-        // unchanged, the same way pyspec's own unmodified
-        // `initiate_validator_exit` does on a gloas state: the churn it
-        // draws through `compute_exit_epoch_and_update_churn` is already
-        // gloas's own by the time it gets here.
-        ForkName::Electra | ForkName::Fulu | ForkName::Gloas => {
-            crate::beacon::helpers::electra::initiate_validator_exit(state, index, config, None)
-        }
-        ForkName::Phase0
-        | ForkName::Altair
-        | ForkName::Bellatrix
-        | ForkName::Capella
-        | ForkName::Deneb => initiate_validator_exit(state, index, config),
-        ForkName::Lean => lean_state_unreachable("initiate_validator_exit_for_fork"),
-    }
-}
-
+/// `active_balances` is block processing's cache, handed to that exit's churn
+/// limit: every caller is a slashing operation in a block, so a block slashing
+/// many validators reads the total active balance once rather than once per
+/// validator. `None` computes it uncached.
 pub fn slash_validator(
     state: &mut BeaconState,
     slashed_index: ValidatorIndex,
     whistleblower_index: Option<ValidatorIndex>,
     config: &Config,
+    active_balances: Option<&ActiveBalanceCache>,
 ) -> Result<()> {
     let epoch = get_current_epoch(state);
-    initiate_validator_exit_for_fork(state, slashed_index, config)?;
+    initiate_validator_exit_for_fork(state, slashed_index, config, active_balances)?;
 
     let effective_balance = state.validator(slashed_index)?.effective_balance;
 
@@ -294,7 +313,7 @@ mod tests {
         let effective_balance = state.validator(3).unwrap().effective_balance;
         let balance_before = state.balance(3).unwrap();
 
-        slash_validator(&mut state, 3, None, &config).unwrap();
+        slash_validator(&mut state, 3, None, &config, None).unwrap();
 
         let validator = state.validator(3).unwrap();
         assert!(validator.slashed);
@@ -340,7 +359,7 @@ mod tests {
         );
 
         let effective_balance = state.validator(0).unwrap().effective_balance;
-        initiate_validator_exit_for_fork(&mut state, 0, &config).unwrap();
+        initiate_validator_exit_for_fork(&mut state, 0, &config, None).unwrap();
 
         let BeaconState::Gloas(inner) = &state else {
             unreachable!("built as Gloas");

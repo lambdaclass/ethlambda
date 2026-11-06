@@ -326,7 +326,7 @@ fn apply(
             | ForkName::Capella
             | ForkName::Deneb => {
                 let slashing: phase0::AttesterSlashing = case.ssz("attester_slashing");
-                operations::process_attester_slashing(state, &slashing, config)
+                operations::process_attester_slashing(state, &slashing, config, &active_balances)
             }
             // Electra's container widens the same way `Attestation`'s does
             // (see the `attestation` arm above); the function itself is not
@@ -334,14 +334,14 @@ fn apply(
             // Fulu's specification changes neither.
             ForkName::Electra | ForkName::Fulu => {
                 let slashing: electra::AttesterSlashing = case.ssz("attester_slashing");
-                electra_stf::process_attester_slashing(state, &slashing, config)
+                electra_stf::process_attester_slashing(state, &slashing, config, &active_balances)
             }
             // Gloas's container widens again (EIP-7688's unbounded
             // `AttestingIndices`); the function is still not behaviorally
             // modified, only transcribed against gloas's own type.
             ForkName::Gloas => {
                 let slashing: gloas::AttesterSlashing = case.ssz("attester_slashing");
-                gloas_stf::process_attester_slashing(state, &slashing, config)
+                gloas_stf::process_attester_slashing(state, &slashing, config, &active_balances)
             }
             ForkName::Lean => lean_is_not_a_fixture_fork("attester_slashing"),
         },
@@ -360,8 +360,15 @@ fn apply(
                 | ForkName::Capella
                 | ForkName::Deneb
                 | ForkName::Electra
-                | ForkName::Fulu => operations::process_proposer_slashing(state, &slashing, config),
-                ForkName::Gloas => gloas_stf::process_proposer_slashing(state, &slashing, config),
+                | ForkName::Fulu => operations::process_proposer_slashing(
+                    state,
+                    &slashing,
+                    config,
+                    &active_balances,
+                ),
+                ForkName::Gloas => {
+                    gloas_stf::process_proposer_slashing(state, &slashing, config, &active_balances)
+                }
                 ForkName::Lean => lean_is_not_a_fixture_fork("proposer_slashing"),
             }
         }

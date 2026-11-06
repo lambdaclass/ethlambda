@@ -22,7 +22,7 @@ pub use committee_cache::{CommitteeCache, Lookup, ShufflingKey};
 /// callers can match on it (e.g. to distinguish [`Error::DbVersionMismatch`]).
 pub use error::Error;
 pub use liveness::ObservedLiveness;
-pub use pubkey_index_cache::{PubkeyIndexCache, TAIL_MERGE_THRESHOLD};
+pub use pubkey_index_cache::PubkeyIndexCache;
 // `CacheKey` lives in `state_writer` (beside the `StateCache` it keys), not
 // `store`; re-exported here so the public path (`ethlambda_storage::CacheKey`)
 // is unaffected by which module owns it.

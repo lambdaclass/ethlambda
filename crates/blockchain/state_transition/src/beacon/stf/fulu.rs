@@ -50,7 +50,7 @@ use crate::beacon::helpers::electra::pending_queue_fields;
 use crate::beacon::helpers::fulu::{fulu_state, fulu_state_ref};
 use crate::beacon::primitives::{Bytes32, HashTreeRoot as _};
 
-use super::ExecutionEngine;
+use super::{BlockCaches, ExecutionEngine};
 
 // ---------------------------------------------------------------------------
 // Block processing
@@ -61,15 +61,12 @@ use super::ExecutionEngine;
 /// for [`super::electra::process_execution_payload`] and
 /// [`super::electra::process_operations`]. See the module docs for why these
 /// are the only steps this fork's specification asks to change.
-#[allow(clippy::too_many_arguments)]
 pub fn process_block(
     state: &mut BeaconState,
     block: &electra::BeaconBlock,
     config: &Config,
     engine: &ExecutionEngine,
-    committees: &CommitteeCache,
-    active_balances: &ActiveBalanceCache,
-    pubkey_indices: &PubkeyIndexCache,
+    caches: BlockCaches<'_>,
     options: super::block::BlockProcessingOptions,
 ) -> Result<()> {
     super::block::process_block_header(
@@ -87,15 +84,15 @@ pub fn process_block(
         state,
         &block.body,
         config,
-        committees,
-        active_balances,
-        pubkey_indices,
+        caches.committees,
+        caches.active_balances,
+        caches.pubkey_indices,
     )?;
     super::altair::process_sync_aggregate(
         state,
         &block.body.sync_aggregate,
-        active_balances,
-        pubkey_indices,
+        caches.active_balances,
+        caches.pubkey_indices,
     )?;
     Ok(())
 }
@@ -244,10 +241,20 @@ pub fn process_operations(
     verify(body.deposits.is_empty(), "len(body.deposits) == 0")?;
 
     for proposer_slashing in body.proposer_slashings.iter() {
-        super::operations::process_proposer_slashing(state, proposer_slashing, config)?;
+        super::operations::process_proposer_slashing(
+            state,
+            proposer_slashing,
+            config,
+            active_balances,
+        )?;
     }
     for attester_slashing in body.attester_slashings.iter() {
-        super::electra::process_attester_slashing(state, attester_slashing, config)?;
+        super::electra::process_attester_slashing(
+            state,
+            attester_slashing,
+            config,
+            active_balances,
+        )?;
     }
     for attestation in body.attestations.iter() {
         super::electra::process_attestation(state, attestation, committees, active_balances)?;

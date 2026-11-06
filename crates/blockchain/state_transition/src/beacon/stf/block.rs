@@ -24,15 +24,14 @@ use crate::beacon::containers::{self, BeaconBlockHeader, BeaconState, Eth1Data, 
 use crate::beacon::error::{Result, verify};
 use crate::beacon::hash::hash;
 use crate::beacon::helpers::accessors::{
-    ActiveBalanceCache, CommitteeCache, PubkeyIndexCache, get_beacon_proposer_index,
-    get_current_epoch, get_domain, get_randao_mix,
+    get_beacon_proposer_index, get_current_epoch, get_domain, get_randao_mix,
 };
 use crate::beacon::helpers::math::xor;
 use crate::beacon::helpers::misc::compute_signing_root;
 use crate::beacon::preset;
 use crate::beacon::primitives::{BlsSignature, HashTreeRoot as _, Root, Slot, ValidatorIndex};
 
-use super::{ExecutionEngine, bellatrix, capella, deneb, electra, fulu, gloas};
+use super::{BlockCaches, ExecutionEngine, bellatrix, capella, deneb, electra, fulu, gloas};
 
 /// Dispatches on the block's fork and runs that fork's own block processing.
 ///
@@ -41,97 +40,42 @@ use super::{ExecutionEngine, bellatrix, capella, deneb, electra, fulu, gloas};
 /// after [`super::process_slots`] has already advanced the state to the block's
 /// slot, so every arm validates and mutates a state already positioned at
 /// `signed_block`'s slot.
-#[allow(clippy::too_many_arguments)]
 pub fn process_block(
     state: &mut BeaconState,
     signed_block: &containers::SignedBeaconBlock,
     config: &Config,
     engine: &ExecutionEngine,
-    committees: &CommitteeCache,
-    active_balances: &ActiveBalanceCache,
-    pubkey_indices: &PubkeyIndexCache,
+    caches: BlockCaches<'_>,
     options: BlockProcessingOptions,
 ) -> Result<()> {
     match signed_block {
-        containers::SignedBeaconBlock::Phase0(signed) => process_block_phase0(
-            state,
-            &signed.message,
-            config,
-            committees,
-            active_balances,
-            options,
-        ),
-        containers::SignedBeaconBlock::Altair(signed) => process_block_altair(
-            state,
-            &signed.message,
-            config,
-            committees,
-            active_balances,
-            pubkey_indices,
-            options,
-        ),
-        containers::SignedBeaconBlock::Bellatrix(signed) => bellatrix::process_block(
-            state,
-            &signed.message,
-            config,
-            engine,
-            committees,
-            active_balances,
-            pubkey_indices,
-            options,
-        ),
-        containers::SignedBeaconBlock::Capella(signed) => capella::process_block(
-            state,
-            &signed.message,
-            config,
-            engine,
-            committees,
-            active_balances,
-            pubkey_indices,
-            options,
-        ),
-        containers::SignedBeaconBlock::Deneb(signed) => deneb::process_block(
-            state,
-            &signed.message,
-            config,
-            engine,
-            committees,
-            active_balances,
-            pubkey_indices,
-            options,
-        ),
-        containers::SignedBeaconBlock::Electra(signed) => electra::process_block(
-            state,
-            &signed.message,
-            config,
-            engine,
-            committees,
-            active_balances,
-            pubkey_indices,
-            options,
-        ),
-        containers::SignedBeaconBlock::Fulu(signed) => fulu::process_block(
-            state,
-            &signed.message,
-            config,
-            engine,
-            committees,
-            active_balances,
-            pubkey_indices,
-            options,
-        ),
+        containers::SignedBeaconBlock::Phase0(signed) => {
+            process_block_phase0(state, &signed.message, config, caches, options)
+        }
+        containers::SignedBeaconBlock::Altair(signed) => {
+            process_block_altair(state, &signed.message, config, caches, options)
+        }
+        containers::SignedBeaconBlock::Bellatrix(signed) => {
+            bellatrix::process_block(state, &signed.message, config, engine, caches, options)
+        }
+        containers::SignedBeaconBlock::Capella(signed) => {
+            capella::process_block(state, &signed.message, config, engine, caches, options)
+        }
+        containers::SignedBeaconBlock::Deneb(signed) => {
+            deneb::process_block(state, &signed.message, config, engine, caches, options)
+        }
+        containers::SignedBeaconBlock::Electra(signed) => {
+            electra::process_block(state, &signed.message, config, engine, caches, options)
+        }
+        containers::SignedBeaconBlock::Fulu(signed) => {
+            fulu::process_block(state, &signed.message, config, engine, caches, options)
+        }
         // ePBS (EIP-7732) restructures block processing around a builder's
         // bid rather than an embedded payload: a gloas block carries no
         // payload for `engine` to answer for, so this arm never reaches it.
-        containers::SignedBeaconBlock::Gloas(signed) => gloas::process_block(
-            state,
-            &signed.message,
-            config,
-            committees,
-            active_balances,
-            pubkey_indices,
-            options,
-        ),
+        containers::SignedBeaconBlock::Gloas(signed) => {
+            gloas::process_block(state, &signed.message, config, caches, options)
+        }
         containers::SignedBeaconBlock::Lean(_) => {
             crate::beacon::lean_block_unreachable("process_block")
         }
@@ -144,8 +88,7 @@ pub fn process_block_phase0(
     state: &mut BeaconState,
     block: &phase0::BeaconBlock,
     config: &Config,
-    committees: &CommitteeCache,
-    active_balances: &ActiveBalanceCache,
+    caches: BlockCaches<'_>,
     options: BlockProcessingOptions,
 ) -> Result<()> {
     process_block_header(
@@ -165,8 +108,8 @@ pub fn process_block_phase0(
         &block.body.deposits,
         &block.body.voluntary_exits,
         config,
-        committees,
-        active_balances,
+        caches.committees,
+        caches.active_balances,
     )?;
     Ok(())
 }
@@ -181,9 +124,7 @@ pub fn process_block_altair(
     state: &mut BeaconState,
     block: &altair::BeaconBlock,
     config: &Config,
-    committees: &CommitteeCache,
-    active_balances: &ActiveBalanceCache,
-    pubkey_indices: &PubkeyIndexCache,
+    caches: BlockCaches<'_>,
     options: BlockProcessingOptions,
 ) -> Result<()> {
     process_block_header(
@@ -203,14 +144,14 @@ pub fn process_block_altair(
         &block.body.deposits,
         &block.body.voluntary_exits,
         config,
-        committees,
-        active_balances,
+        caches.committees,
+        caches.active_balances,
     )?;
     super::altair::process_sync_aggregate(
         state,
         &block.body.sync_aggregate,
-        active_balances,
-        pubkey_indices,
+        caches.active_balances,
+        caches.pubkey_indices,
     )?;
     Ok(())
 }

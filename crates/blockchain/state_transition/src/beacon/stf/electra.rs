@@ -82,7 +82,7 @@ use crate::beacon::primitives::{
     WithdrawalIndex,
 };
 
-use super::ExecutionEngine;
+use super::{BlockCaches, ExecutionEngine};
 
 // ---------------------------------------------------------------------------
 // Local state projection
@@ -592,6 +592,7 @@ pub fn process_attester_slashing(
     state: &mut BeaconState,
     attester_slashing: &electra::AttesterSlashing,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     let attestation_1 = &attester_slashing.attestation_1;
     let attestation_2 = &attester_slashing.attestation_2;
@@ -614,6 +615,7 @@ pub fn process_attester_slashing(
         &attestation_1.attesting_indices,
         &attestation_2.attesting_indices,
         config,
+        active_balances,
     )
 }
 
@@ -1423,9 +1425,12 @@ pub fn process_withdrawal_request(
 // Execution-layer consolidation requests
 // ---------------------------------------------------------------------------
 
-/// Whether `request` is really a request to switch its source (and only
-/// source) validator from an eth1 to a compounding withdrawal credential,
-/// disguised as a self-consolidation.
+/// The specification's `is_valid_switch_to_compounding_request`: whether
+/// `request` is really a request to switch its source (and only source)
+/// validator from an eth1 to a compounding withdrawal credential, disguised as
+/// a self-consolidation. Answers with the source's index when it is (`None`
+/// where the specification returns `False`), so the caller acting on it does
+/// not resolve the same pubkey a second time.
 ///
 /// A validator that already holds an eth1 credential has no other way to
 /// become compounding: [`crate::beacon::helpers::electra::switch_to_compounding_validator`]
@@ -1435,39 +1440,39 @@ pub fn process_withdrawal_request(
 /// functions; nothing inside can actually fail, since every condition here
 /// is itself one of the specification's own `return False` guards rather
 /// than an assertion.
-pub fn is_valid_switch_to_compounding_request(
+pub fn switch_to_compounding_source(
     state: &BeaconState,
     request: &electra::ConsolidationRequest,
     pubkey_indices: &PubkeyIndexCache,
-) -> Result<bool> {
+) -> Result<Option<ValidatorIndex>> {
     if request.source_pubkey != request.target_pubkey {
-        return Ok(false);
+        return Ok(None);
     }
 
     let Some(source_index) = pubkey_indices.validator_index(state, &request.source_pubkey) else {
-        return Ok(false);
+        return Ok(None);
     };
     let source_validator = state.validator(source_index)?;
 
     if withdrawal_address(source_validator) != request.source_address {
-        return Ok(false);
+        return Ok(None);
     }
     if !has_eth1_withdrawal_credential(source_validator) {
-        return Ok(false);
+        return Ok(None);
     }
     if !is_active_validator(source_validator, get_current_epoch(state)) {
-        return Ok(false);
+        return Ok(None);
     }
     if source_validator.exit_epoch != FAR_FUTURE_EPOCH {
-        return Ok(false);
+        return Ok(None);
     }
 
-    Ok(true)
+    Ok(Some(source_index))
 }
 
 /// Honors (or quietly drops) an execution-layer-triggered consolidation
 /// (EIP-7251): either a switch-to-compounding request in disguise (see
-/// [`is_valid_switch_to_compounding_request`]), or a real merge of one
+/// [`switch_to_compounding_source`]), or a real merge of one
 /// validator's balance into another's.
 ///
 /// Every early return here, in both branches, is the specification's own
@@ -1491,14 +1496,7 @@ pub fn process_consolidation_request(
     active_balances: &ActiveBalanceCache,
     pubkey_indices: &PubkeyIndexCache,
 ) -> Result<()> {
-    if is_valid_switch_to_compounding_request(state, request, pubkey_indices)? {
-        // Already known to resolve, by the check just above; state has not
-        // been mutated since.
-        let source_index = pubkey_indices
-            .validator_index(state, &request.source_pubkey)
-            .ok_or(Error::SpecAssert(
-                "is_valid_switch_to_compounding_request already resolved consolidation_request.source_pubkey",
-            ))?;
+    if let Some(source_index) = switch_to_compounding_source(state, request, pubkey_indices)? {
         crate::beacon::helpers::electra::switch_to_compounding_validator(state, source_index)?;
         return Ok(());
     }
@@ -1811,10 +1809,15 @@ pub fn process_operations(
     }
 
     for proposer_slashing in body.proposer_slashings.iter() {
-        super::operations::process_proposer_slashing(state, proposer_slashing, config)?;
+        super::operations::process_proposer_slashing(
+            state,
+            proposer_slashing,
+            config,
+            active_balances,
+        )?;
     }
     for attester_slashing in body.attester_slashings.iter() {
-        process_attester_slashing(state, attester_slashing, config)?;
+        process_attester_slashing(state, attester_slashing, config, active_balances)?;
     }
     // [Modified in Electra:EIP7549]
     for attestation in body.attestations.iter() {
@@ -1859,15 +1862,12 @@ pub fn process_operations(
 /// them taking those fields directly rather than a whole body (see
 /// `crate::beacon::stf`'s module documentation). [`super::altair::process_sync_aggregate`]
 /// is reused the same way, for the same reason.
-#[allow(clippy::too_many_arguments)]
 pub fn process_block(
     state: &mut BeaconState,
     block: &electra::BeaconBlock,
     config: &Config,
     engine: &ExecutionEngine,
-    committees: &CommitteeCache,
-    active_balances: &ActiveBalanceCache,
-    pubkey_indices: &PubkeyIndexCache,
+    caches: BlockCaches<'_>,
     options: super::block::BlockProcessingOptions,
 ) -> Result<()> {
     super::block::process_block_header(
@@ -1885,15 +1885,15 @@ pub fn process_block(
         state,
         &block.body,
         config,
-        committees,
-        active_balances,
-        pubkey_indices,
+        caches.committees,
+        caches.active_balances,
+        caches.pubkey_indices,
     )?;
     super::altair::process_sync_aggregate(
         state,
         &block.body.sync_aggregate,
-        active_balances,
-        pubkey_indices,
+        caches.active_balances,
+        caches.pubkey_indices,
     )?;
     Ok(())
 }

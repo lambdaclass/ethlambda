@@ -3,10 +3,10 @@
 //!
 //! A sibling of [`crate::active_balance_cache::ActiveBalanceCache`], held by
 //! the `Store` for the same reasons (one table shared by the chain actor's
-//! state transition and anything else holding a `Store` clone). A caller with
-//! no `Store` of its own (a spec runner, a unit test, block production's
-//! scratch state) holds a fresh [`PubkeyIndexCache::default`] for as long as
-//! that work lasts.
+//! state transition, block production, and anything else holding a `Store`
+//! clone). A caller with no `Store` of its own (a spec runner, a unit test, the
+//! era replay) holds a fresh [`PubkeyIndexCache::default`] for as long as that
+//! work lasts.
 //!
 //! This module knows nothing about a `BeaconState`. It stores positions it is
 //! told about and answers *candidates*; the consensus logic that feeds it a
@@ -23,7 +23,8 @@
 //! make a candidate wrong, never make a right one disappear, so the caller
 //! checks every candidate against its own state and falls back to a scan when
 //! none passes. A missing or wrong entry is a slower lookup, never a wrong
-//! validator.
+//! validator, and the index a fallback scan finds is recorded
+//! ([`PubkeyIndexCache::insert`]), so it costs one scan, not one per lookup.
 //!
 //! # Layout
 //!
@@ -34,30 +35,34 @@
 //! two real keys negligible.
 //!
 //! Entries live in a sorted base (two parallel arrays, binary searched) plus
-//! a small hash map holding positions appended since the base was last built.
+//! a small ordered set holding entries added since the base was last built.
 //! The registry grows by a handful of validators a block at most, so the tail
 //! absorbs that growth cheaply; when it reaches [`TAIL_MERGE_THRESHOLD`] it is
-//! merged into the base in one linear pass.
+//! merged into the base in one linear pass. Both halves keep every index
+//! recorded under a key, so equal keys (a prefix collision, or one pubkey at
+//! two indices on two forks) are all returned as candidates.
 
-use std::collections::HashMap;
+use std::collections::BTreeSet;
 use std::sync::RwLock;
 
 use ethlambda_types::beacon::primitives::BlsPubkey;
 
-/// How many appended entries the hash map tail holds before it is merged into
-/// the sorted base.
+/// How many entries the tail holds before it is merged into the sorted base.
 ///
 /// A merge is linear in the whole table, so it must be rare: this many appends
 /// is on the order of the validators a mainnet day adds. It is also small
-/// enough that the tail's per-entry cost (a hash map slot, several times a
-/// base entry) stays a rounding error next to the base.
-pub const TAIL_MERGE_THRESHOLD: usize = 8192;
+/// enough that the tail's per-entry cost (a B-tree slot, a few times a base
+/// entry) stays a rounding error next to the base.
+const TAIL_MERGE_THRESHOLD: usize = 8192;
 
 /// Pubkey-prefix to validator-index table. See the module documentation.
 ///
-/// Internally synchronized, so every method takes `&self`. The write lock is
-/// held only to splice entries in, never while a state is scanned: callers
-/// collect a state's tail into a buffer first and hand it over.
+/// Internally synchronized, so every method takes `&self`. Nothing slow runs
+/// under the write lock except a merge: callers collect a state's keys into a
+/// buffer first, and [`Self::extend`] builds and sorts its batch before taking
+/// the lock. What it holds the lock for is the splice: a tail insert per
+/// appended position, or one linear merge into the base, which happens on the
+/// first (bulk) ingest and once every [`TAIL_MERGE_THRESHOLD`] entries after.
 #[derive(Debug, Default)]
 pub struct PubkeyIndexCache {
     inner: RwLock<Inner>,
@@ -66,13 +71,12 @@ pub struct PubkeyIndexCache {
 #[derive(Debug, Default)]
 struct Inner {
     /// Sorted ascending by `(key, index)`; `indices[i]` belongs to `keys[i]`.
-    /// Equal keys (a prefix collision, or one pubkey seen at two indices on
-    /// two forks) sit next to each other and are all returned as candidates.
     keys: Vec<u64>,
     indices: Vec<u32>,
-    /// Positions appended since the base was built. First writer wins for a
-    /// key; a second candidate for the same key just costs the caller a scan.
-    tail: HashMap<u64, u32>,
+    /// `(key, index)` entries added since the base was built: appended
+    /// registry positions, and indices a fallback scan found. Ordered, so a
+    /// key's entries are one range and a merge needs no sort.
+    tail: BTreeSet<(u64, u32)>,
     /// How many registry positions have been ingested: positions
     /// `0..covered_len` of some chain's registry, in order.
     covered_len: usize,
@@ -101,16 +105,16 @@ impl PubkeyIndexCache {
     pub fn candidates(&self, pubkey: &BlsPubkey) -> Vec<u64> {
         let key = Self::key_of(pubkey);
         let inner = self.inner.read().unwrap();
-        let start = inner.keys.partition_point(|candidate| *candidate < key);
-        let mut found: Vec<u64> = inner.keys[start..]
-            .iter()
-            .zip(&inner.indices[start..])
-            .take_while(|(candidate, _)| **candidate == key)
-            .map(|(_, index)| u64::from(*index))
+        let mut found: Vec<u64> = inner
+            .base_range(key)
+            .map(|position| u64::from(inner.indices[position]))
             .collect();
-        if let Some(index) = inner.tail.get(&key) {
-            found.push(u64::from(*index));
-        }
+        found.extend(
+            inner
+                .tail
+                .range((key, 0)..=(key, u32::MAX))
+                .map(|(_, index)| u64::from(*index)),
+        );
         found
     }
 
@@ -127,53 +131,95 @@ impl PubkeyIndexCache {
     /// covered but not stored: such a lookup finds no candidate and takes the
     /// caller's scan, which is correct and unreachable in practice.
     pub fn extend(&self, start: usize, keys: &[u64]) -> bool {
+        // Every position follows from `start`, so the batch is built, and a
+        // bulk one sorted, before the lock is taken: the first ingest of a
+        // whole registry sorts millions of entries, which no reader should
+        // wait on.
+        let mut batch: Vec<(u64, u32)> = keys
+            .iter()
+            .enumerate()
+            .filter_map(|(offset, key)| {
+                u32::try_from(start + offset)
+                    .ok()
+                    .map(|index| (*key, index))
+            })
+            .collect();
+        let bulk = batch.len() >= TAIL_MERGE_THRESHOLD;
+        if bulk {
+            // Sorting directly beats funnelling millions of entries through
+            // the tail.
+            batch.sort_unstable();
+        }
+
         let mut inner = self.inner.write().unwrap();
-        if start > inner.covered_len {
+        let covered = inner.covered_len;
+        if start > covered {
             return false;
         }
-        let skip = (inner.covered_len - start).min(keys.len());
-        let fresh = &keys[skip..];
-        let first_position = inner.covered_len;
-        let entries = fresh.iter().enumerate().filter_map(|(offset, key)| {
-            u32::try_from(first_position + offset)
-                .ok()
-                .map(|index| (*key, index))
-        });
-
-        if fresh.len() >= TAIL_MERGE_THRESHOLD {
-            // A bulk load (the first ingest of a whole registry): sorting it
-            // directly beats funnelling millions of entries through the map.
-            let mut batch: Vec<(u64, u32)> = entries.collect();
-            batch.extend(inner.tail.drain());
+        let end = start + keys.len();
+        if end <= covered {
+            return true;
+        }
+        if covered > start {
+            // A racing caller ingested part of this range first.
+            batch.retain(|(_, index)| *index as usize >= covered);
+        }
+        if bulk {
             inner.merge(batch);
         } else {
-            for (key, index) in entries {
-                inner.tail.entry(key).or_insert(index);
-            }
-            if inner.tail.len() >= TAIL_MERGE_THRESHOLD {
-                let batch: Vec<(u64, u32)> = inner.tail.drain().collect();
-                inner.merge(batch);
-            }
+            inner.tail.extend(batch);
+            inner.merge_tail_if_full();
         }
-        inner.covered_len += fresh.len();
+        inner.covered_len = end;
         true
     }
 
-    /// Heap bytes held by the table: capacity of the base arrays plus the
-    /// tail's slots.
-    pub fn heap_bytes(&self) -> usize {
-        let inner = self.inner.read().unwrap();
-        inner.keys.capacity() * size_of::<u64>()
-            + inner.indices.capacity() * size_of::<u32>()
-            + inner.tail.capacity() * (size_of::<u64>() + size_of::<u32>())
+    /// Records that `pubkey` sits at `index`, as a scan of some registry
+    /// found: a candidate like any other, verified by whoever asks next.
+    ///
+    /// For the lookups the table could not answer from what it ingested: a
+    /// second key under a shared prefix, or a position the table took in from
+    /// another fork's registry. Without this such a pubkey would cost a scan on
+    /// every lookup for as long as the process runs, since ingestion only ever
+    /// appends positions past `covered_len`. Recording an entry already held is
+    /// a no-op; an index past `u32` is not stored, as in [`Self::extend`].
+    pub fn insert(&self, pubkey: &BlsPubkey, index: u64) {
+        let Ok(index) = u32::try_from(index) else {
+            return;
+        };
+        let key = Self::key_of(pubkey);
+        let mut inner = self.inner.write().unwrap();
+        let in_base = inner
+            .base_range(key)
+            .any(|position| inner.indices[position] == index);
+        if !in_base && inner.tail.insert((key, index)) {
+            inner.merge_tail_if_full();
+        }
     }
 }
 
 impl Inner {
-    /// Merges `batch` into the sorted base, ordering ties by index so the
-    /// earlier registry position is returned first.
-    fn merge(&mut self, mut batch: Vec<(u64, u32)>) {
-        batch.sort_unstable();
+    /// Positions in the base whose key is `key`.
+    fn base_range(&self, key: u64) -> std::ops::Range<usize> {
+        let start = self.keys.partition_point(|candidate| *candidate < key);
+        let end = start + self.keys[start..].partition_point(|candidate| *candidate == key);
+        start..end
+    }
+
+    /// Merges the tail into the base once it holds [`TAIL_MERGE_THRESHOLD`]
+    /// entries.
+    fn merge_tail_if_full(&mut self) {
+        if self.tail.len() >= TAIL_MERGE_THRESHOLD {
+            let batch: Vec<(u64, u32)> = std::mem::take(&mut self.tail).into_iter().collect();
+            self.merge(batch);
+        }
+    }
+
+    /// Merges `batch`, sorted ascending, into the sorted base in one linear
+    /// pass, ordering ties by index so the earlier registry position is
+    /// returned first.
+    fn merge(&mut self, batch: Vec<(u64, u32)>) {
+        debug_assert!(batch.is_sorted());
         let total = self.keys.len() + batch.len();
         let mut keys = Vec::with_capacity(total);
         let mut indices = Vec::with_capacity(total);
@@ -212,6 +258,12 @@ mod tests {
         seeds
             .map(|seed| PubkeyIndexCache::key_of(&pubkey(seed)))
             .collect()
+    }
+
+    /// Heap bytes held by the sorted base: the capacity of its two arrays.
+    fn base_bytes(cache: &PubkeyIndexCache) -> usize {
+        let inner = cache.inner.read().unwrap();
+        inner.keys.capacity() * size_of::<u64>() + inner.indices.capacity() * size_of::<u32>()
     }
 
     #[test]
@@ -264,6 +316,18 @@ mod tests {
     }
 
     #[test]
+    fn a_racing_bulk_extend_skips_what_was_ingested_first() {
+        let cache = PubkeyIndexCache::default();
+        let bulk = TAIL_MERGE_THRESHOLD as u64 * 2;
+        assert!(cache.extend(0, &keys(0..10)));
+        // A caller that read `covered_len == 0` and scanned the whole registry.
+        assert!(cache.extend(0, &keys(0..bulk)));
+        assert_eq!(cache.covered_len(), bulk as usize);
+        assert_eq!(cache.candidates(&pubkey(4)), vec![4]);
+        assert_eq!(cache.candidates(&pubkey(bulk - 1)), vec![bulk - 1]);
+    }
+
+    #[test]
     fn equal_keys_return_every_candidate_in_index_order() {
         let cache = PubkeyIndexCache::default();
         let bulk = TAIL_MERGE_THRESHOLD as u64;
@@ -274,11 +338,44 @@ mod tests {
     }
 
     #[test]
+    fn equal_keys_in_the_tail_are_all_kept() {
+        let cache = PubkeyIndexCache::default();
+        let mut few = keys(100..110);
+        few[7] = few[2];
+        assert!(cache.extend(0, &few));
+        assert_eq!(cache.candidates(&pubkey(102)), vec![2, 7]);
+    }
+
+    #[test]
+    fn an_inserted_index_becomes_a_candidate_without_covering_a_position() {
+        let cache = PubkeyIndexCache::default();
+        assert!(cache.extend(0, &keys(0..5)));
+        // A scan elsewhere found pubkey 3 at index 9 (another fork's layout).
+        cache.insert(&pubkey(3), 9);
+        assert_eq!(cache.covered_len(), 5);
+        assert_eq!(cache.candidates(&pubkey(3)), vec![3, 9]);
+        // Recording it again, or recording what the base holds, adds nothing.
+        cache.insert(&pubkey(3), 9);
+        cache.insert(&pubkey(3), 3);
+        assert_eq!(cache.candidates(&pubkey(3)), vec![3, 9]);
+    }
+
+    #[test]
+    fn an_insert_matching_the_base_is_not_duplicated() {
+        let cache = PubkeyIndexCache::default();
+        let bulk = TAIL_MERGE_THRESHOLD as u64;
+        assert!(cache.extend(0, &keys(0..bulk)));
+        cache.insert(&pubkey(5), 5);
+        assert!(cache.inner.read().unwrap().tail.is_empty());
+        assert_eq!(cache.candidates(&pubkey(5)), vec![5]);
+    }
+
+    #[test]
     fn the_base_costs_twelve_bytes_an_entry() {
         let cache = PubkeyIndexCache::default();
         let count = TAIL_MERGE_THRESHOLD as u64 * 4;
         assert!(cache.extend(0, &keys(0..count)));
-        assert_eq!(cache.heap_bytes(), count as usize * 12);
+        assert_eq!(base_bytes(&cache), count as usize * 12);
     }
 
     /// Sizing check for a mainnet-scale registry; prints, asserts nothing
@@ -310,9 +407,9 @@ mod tests {
             })
             .count();
         println!(
-            "ingest {COUNT} keys: {ingest:?}; {hits} lookups: {:?}; heap {} bytes",
+            "ingest {COUNT} keys: {ingest:?}; {hits} lookups: {:?}; base {} bytes",
             started.elapsed(),
-            cache.heap_bytes()
+            base_bytes(&cache)
         );
     }
 }

@@ -344,11 +344,20 @@ impl CommitteeCacheExt for CommitteeCache {
 /// Between `process_effective_balance_updates` and the slot increment that
 /// follows it, a state is still in epoch `E - 1` but already carries epoch
 /// `E`'s effective balances, so its total would not match a key rooted at
-/// `E - 2`'s end. The only callers routed through the cache are block
-/// processing's (attestations, sync aggregate), which never run in that
-/// window: a block is processed on a state that `process_slots` has already
-/// advanced to the block's slot. Epoch processing keeps calling the
-/// uncached [`get_total_active_balance`].
+/// `E - 2`'s end. Every caller routed through the cache is block processing,
+/// which never runs in that window: a block is processed on a state that
+/// `process_slots` has already advanced to the block's slot. Those callers
+/// are attestations and the sync aggregate (base rewards), and the churn
+/// limits of everything a block can make exit or consolidate (voluntary
+/// exits, proposer and attester slashings, withdrawal and consolidation
+/// requests, gloas's `apply_parent_execution_payload` included), which reach
+/// it through [`total_active_balance_or_compute`] with `Some`. Block
+/// production's scratch runs of those same functions count too: their state
+/// is advanced to the block's slot first.
+///
+/// Epoch processing keeps calling the uncached [`get_total_active_balance`],
+/// and its ejections pass `None` to the same churn helpers. So does any other
+/// caller of those helpers that is not processing a block at its slot.
 fn active_balance_key(state: &BeaconState) -> Option<ActiveBalanceKey> {
     let epoch = get_current_epoch(state);
     let decision_slot = compute_start_slot_at_epoch(epoch).saturating_sub(1);
@@ -402,8 +411,8 @@ impl ActiveBalanceCacheExt for ActiveBalanceCache {
 /// [`ActiveBalanceCache`], shares one registry pass across a block's exits,
 /// consolidations and slashings, while epoch processing and the spec-shaped
 /// unit tests keep the uncached function. Passing `Some` is sound only for the
-/// callers [`active_balance_key`] documents: states advanced to their block's
-/// slot, never mid epoch processing.
+/// callers [`active_balance_key`] lists: states advanced to their block's
+/// slot, never mid epoch processing. A new `Some` caller belongs on that list.
 pub fn total_active_balance_or_compute(
     state: &BeaconState,
     cache: Option<&ActiveBalanceCache>,
@@ -437,8 +446,10 @@ pub trait PubkeyIndexCacheExt {
 
     /// The index holding `pubkey` in `state`, exactly as a position search of
     /// the registry would answer: the cache when it verifies, otherwise that
-    /// search. A pubkey that is not registered costs one search, never a
-    /// rebuild of the table. Counted in `lean_beacon_pubkey_index_lookups_total`.
+    /// search, whose answer is then recorded in the table
+    /// ([`PubkeyIndexCache::insert`]) so it is searched for once. A pubkey
+    /// that is not registered costs one search, never a rebuild of the table.
+    /// Counted in `lean_beacon_pubkey_index_lookups_total`.
     fn validator_index(&self, state: &BeaconState, pubkey: &BlsPubkey) -> Option<ValidatorIndex>;
 }
 
@@ -470,10 +481,15 @@ impl PubkeyIndexCacheExt for PubkeyIndexCache {
             return Some(index);
         }
         crate::metrics::inc_pubkey_index_lookups("fallback", 1);
-        state
+        let found = state
             .iter_validators()
             .position(|validator| validator.pubkey == *pubkey)
-            .map(|index| index as ValidatorIndex)
+            .map(|index| index as ValidatorIndex);
+        // Recorded so the next lookup of this pubkey on this chain is a hit.
+        if let Some(index) = found {
+            self.insert(pubkey, index);
+        }
+        found
     }
 }
 
@@ -1143,7 +1159,28 @@ mod tests {
         // Our own key at that index, absent from the table's fork, is found by
         // the scan.
         let own = pubkey_at(&ours, 4);
+        assert_eq!(cache.verified_index(&ours, &own), None);
         assert_eq!(cache.validator_index(&ours, &own), Some(4));
+    }
+
+    #[test]
+    fn a_fallback_scan_records_what_it_found() {
+        let ours = with_validators(10);
+        let cache = PubkeyIndexCache::default();
+        // The table is fed by a fork where index 4 holds a different key, so
+        // our own key at index 4 is nowhere in it.
+        let mut other_fork = ours.clone();
+        other_fork.validator_mut(4).unwrap().pubkey = BlsPubkey([0xCD; 48]);
+        cache.verified_index(&other_fork, &pubkey_at(&other_fork, 0));
+        let own = pubkey_at(&ours, 4);
+        assert_eq!(cache.verified_index(&ours, &own), None);
+
+        // One scan, and from then on the cache answers by itself, without
+        // having covered another position.
+        let covered = cache.covered_len();
+        assert_eq!(cache.validator_index(&ours, &own), Some(4));
+        assert_eq!(cache.verified_index(&ours, &own), Some(4));
+        assert_eq!(cache.covered_len(), covered);
     }
 
     #[test]
@@ -1160,7 +1197,7 @@ mod tests {
     }
 
     #[test]
-    fn a_key_prefix_collision_falls_back_to_the_right_validator() {
+    fn a_key_prefix_collision_resolves_both_validators() {
         let mut state = with_validators(10);
         let cache = PubkeyIndexCache::default();
         // Two distinct pubkeys sharing the eight bytes the table keys on.
@@ -1173,6 +1210,9 @@ mod tests {
         );
         append_validator(&mut state, twin);
 
+        // Both are kept under the shared key, so neither needs a scan.
+        assert_eq!(cache.verified_index(&state, &first), Some(2));
+        assert_eq!(cache.verified_index(&state, &twin), Some(10));
         assert_eq!(cache.validator_index(&state, &first), Some(2));
         assert_eq!(cache.validator_index(&state, &twin), Some(10));
     }

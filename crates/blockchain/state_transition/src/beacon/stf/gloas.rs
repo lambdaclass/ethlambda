@@ -77,7 +77,7 @@ use crate::beacon::primitives::{
     ValidatorIndex, WithdrawalIndex,
 };
 
-use super::ExecutionEngine;
+use super::{BlockCaches, ExecutionEngine};
 
 // ---------------------------------------------------------------------------
 // Block processing
@@ -102,16 +102,20 @@ pub fn process_block(
     state: &mut BeaconState,
     block: &gloas::BeaconBlock,
     config: &Config,
-    committees: &CommitteeCache,
-    active_balances: &ActiveBalanceCache,
-    pubkey_indices: &PubkeyIndexCache,
+    caches: BlockCaches<'_>,
     options: super::block::BlockProcessingOptions,
 ) -> Result<()> {
     // [New in Gloas:EIP7732]
     let parent_slot = state.latest_block_header().slot;
 
     // [New in Gloas:EIP7732]
-    process_parent_execution_payload(state, block, config, active_balances, pubkey_indices)?;
+    process_parent_execution_payload(
+        state,
+        block,
+        config,
+        caches.active_balances,
+        caches.pubkey_indices,
+    )?;
     super::block::process_block_header(
         state,
         block.slot,
@@ -132,14 +136,14 @@ pub fn process_block(
         &block.body,
         parent_slot,
         config,
-        committees,
-        active_balances,
+        caches.committees,
+        caches.active_balances,
     )?;
     super::altair::process_sync_aggregate(
         state,
         &block.body.sync_aggregate,
-        active_balances,
-        pubkey_indices,
+        caches.active_balances,
+        caches.pubkey_indices,
     )?;
     Ok(())
 }
@@ -1208,6 +1212,7 @@ pub fn process_proposer_slashing(
     state: &mut BeaconState,
     proposer_slashing: &ProposerSlashing,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     let (proposer_index, current_epoch) =
         crate::beacon::stf::operations::verify_proposer_slashing(state, proposer_slashing)?;
@@ -1228,7 +1233,7 @@ pub fn process_proposer_slashing(
         clear_builder_pending_payment_if_owned_by(state, payment_index, proposer_index)?;
     }
 
-    slash_validator(state, proposer_index, None, config)?;
+    slash_validator(state, proposer_index, None, config, Some(active_balances))?;
     Ok(())
 }
 
@@ -1271,6 +1276,7 @@ pub fn process_attester_slashing(
     state: &mut BeaconState,
     attester_slashing: &gloas::AttesterSlashing,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     let attestation_1 = &attester_slashing.attestation_1;
     let attestation_2 = &attester_slashing.attestation_2;
@@ -1293,6 +1299,7 @@ pub fn process_attester_slashing(
         &attestation_1.attesting_indices,
         &attestation_2.attesting_indices,
         config,
+        active_balances,
     )
 }
 
@@ -1644,10 +1651,10 @@ pub fn process_operations(
 
     // [Modified in Gloas:EIP7732]
     for proposer_slashing in body.proposer_slashings.iter() {
-        process_proposer_slashing(state, proposer_slashing, config)?;
+        process_proposer_slashing(state, proposer_slashing, config, active_balances)?;
     }
     for attester_slashing in body.attester_slashings.iter() {
-        process_attester_slashing(state, attester_slashing, config)?;
+        process_attester_slashing(state, attester_slashing, config, active_balances)?;
     }
     // [Modified in Gloas:EIP7732]
     for attestation in body.attestations.iter() {

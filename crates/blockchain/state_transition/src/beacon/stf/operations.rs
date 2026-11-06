@@ -118,10 +118,10 @@ pub fn process_operations(
     )?;
 
     for proposer_slashing in proposer_slashings {
-        process_proposer_slashing(state, proposer_slashing, config)?;
+        process_proposer_slashing(state, proposer_slashing, config, active_balances)?;
     }
     for attester_slashing in attester_slashings {
-        process_attester_slashing(state, attester_slashing, config)?;
+        process_attester_slashing(state, attester_slashing, config, active_balances)?;
     }
     for attestation in attestations {
         // Phase0 defers an attestation's reward to the epoch boundary, so it
@@ -226,9 +226,10 @@ pub fn process_proposer_slashing(
     state: &mut BeaconState,
     proposer_slashing: &ProposerSlashing,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     let (proposer_index, _current_epoch) = verify_proposer_slashing(state, proposer_slashing)?;
-    slash_validator(state, proposer_index, None, config)?;
+    slash_validator(state, proposer_index, None, config, Some(active_balances))?;
     Ok(())
 }
 
@@ -266,6 +267,7 @@ pub(crate) fn slash_attesting_index_intersection(
     attesting_indices_1: &[ValidatorIndex],
     attesting_indices_2: &[ValidatorIndex],
     config: &Config,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     let current_epoch = get_current_epoch(state);
     let indices_2: HashSet<ValidatorIndex> = attesting_indices_2.iter().copied().collect();
@@ -276,7 +278,7 @@ pub(crate) fn slash_attesting_index_intersection(
             continue;
         }
         if is_slashable_validator(state.validator(index)?, current_epoch) {
-            slash_validator(state, index, None, config)?;
+            slash_validator(state, index, None, config, Some(active_balances))?;
             slashed_any = true;
         }
     }
@@ -295,6 +297,7 @@ pub fn process_attester_slashing(
     state: &mut BeaconState,
     attester_slashing: &phase0::AttesterSlashing,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     let attestation_1 = &attester_slashing.attestation_1;
     let attestation_2 = &attester_slashing.attestation_2;
@@ -317,6 +320,7 @@ pub fn process_attester_slashing(
         &attestation_1.attesting_indices,
         &attestation_2.attesting_indices,
         config,
+        active_balances,
     )
 }
 
@@ -705,7 +709,15 @@ mod tests {
             signed_header_2: signed_header,
         };
 
-        assert!(process_proposer_slashing(&mut state, &slashing, &config).is_err());
+        assert!(
+            process_proposer_slashing(
+                &mut state,
+                &slashing,
+                &config,
+                &ActiveBalanceCache::default()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -790,6 +802,14 @@ mod tests {
             attestation_2,
         };
 
-        assert!(process_attester_slashing(&mut state, &slashing, &config).is_err());
+        assert!(
+            process_attester_slashing(
+                &mut state,
+                &slashing,
+                &config,
+                &ActiveBalanceCache::default()
+            )
+            .is_err()
+        );
     }
 }

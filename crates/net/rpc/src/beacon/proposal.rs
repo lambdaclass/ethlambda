@@ -572,10 +572,14 @@ async fn produce(
     };
     let attestation_count = attestations.len();
     let has_operations = !operations.is_empty();
+    // The store's shared pubkey table: a fresh one would ingest the whole
+    // registry on the block's first lookup, every proposal.
+    let pubkey_indices = store.pubkey_index_cache();
     let block = match assemble_block(
         &state,
         inputs(attestations, operations, sync_aggregate),
         &config,
+        &pubkey_indices,
         options,
     ) {
         Ok(block) => block,
@@ -589,6 +593,7 @@ async fn produce(
                 &state,
                 inputs(Vec::new(), Operations::default(), empty_sync_aggregate()),
                 &config,
+                &pubkey_indices,
                 options,
             )
             .map_err(|_| ApiError::Internal("the block failed to build"))?

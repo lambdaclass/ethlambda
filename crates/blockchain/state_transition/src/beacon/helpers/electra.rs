@@ -369,10 +369,8 @@ pub fn get_max_effective_balance(validator: &Validator) -> Gwei {
 /// `EFFECTIVE_BALANCE_INCREMENT` so the budget always divides evenly into the
 /// unit every balance change is already rounded to.
 pub fn get_balance_churn_limit(state: &BeaconState, config: &Config) -> Result<Gwei> {
-    Ok(balance_churn_limit_for(
-        get_total_active_balance(state)?,
-        config,
-    ))
+    let total_active_balance = get_total_active_balance(state)?;
+    Ok(balance_churn_limit_for(total_active_balance, config))
 }
 
 /// [`get_balance_churn_limit`] for a caller that already holds the total
@@ -393,8 +391,9 @@ pub(crate) fn balance_churn_limit_for(total_active_balance: Gwei, config: &Confi
 /// large validator set, activations and exits cannot alone consume the whole
 /// churn budget and starve consolidations of any share at all.
 pub fn get_activation_exit_churn_limit(state: &BeaconState, config: &Config) -> Result<Gwei> {
+    let total_active_balance = get_total_active_balance(state)?;
     Ok(activation_exit_churn_limit_for(
-        get_total_active_balance(state)?,
+        total_active_balance,
         config,
     ))
 }
@@ -410,10 +409,8 @@ pub(crate) fn activation_exit_churn_limit_for(total_active_balance: Gwei, config
 /// The portion of [`get_balance_churn_limit`] left over for consolidations
 /// once [`get_activation_exit_churn_limit`] has taken its share.
 pub fn get_consolidation_churn_limit(state: &BeaconState, config: &Config) -> Result<Gwei> {
-    Ok(consolidation_churn_limit_for(
-        get_total_active_balance(state)?,
-        config,
-    ))
+    let total_active_balance = get_total_active_balance(state)?;
+    Ok(consolidation_churn_limit_for(total_active_balance, config))
 }
 
 /// [`get_consolidation_churn_limit`] for a caller that already holds the total
@@ -691,15 +688,9 @@ pub fn compute_exit_epoch_and_update_churn(
     active_balances: Option<&ActiveBalanceCache>,
 ) -> Result<Epoch> {
     let current_epoch = get_current_epoch(state);
-    let per_epoch_churn = match state.fork_name() {
-        ForkName::Electra | ForkName::Fulu => activation_exit_churn_limit_for(
-            total_active_balance_or_compute(state, active_balances)?,
-            config,
-        ),
-        ForkName::Gloas => crate::beacon::helpers::gloas::exit_churn_limit_for(
-            total_active_balance_or_compute(state, active_balances)?,
-            config,
-        ),
+    let churn_limit_for: fn(Gwei, &Config) -> Gwei = match state.fork_name() {
+        ForkName::Electra | ForkName::Fulu => activation_exit_churn_limit_for,
+        ForkName::Gloas => crate::beacon::helpers::gloas::exit_churn_limit_for,
         fork @ (ForkName::Phase0
         | ForkName::Altair
         | ForkName::Bellatrix
@@ -712,6 +703,8 @@ pub fn compute_exit_epoch_and_update_churn(
         }
         ForkName::Lean => lean_state_unreachable("compute_exit_epoch_and_update_churn"),
     };
+    let total_active_balance = total_active_balance_or_compute(state, active_balances)?;
+    let per_epoch_churn = churn_limit_for(total_active_balance, config);
 
     let mut fields = churn_cursors_mut(state, "compute_exit_epoch_and_update_churn")?;
 
@@ -838,27 +831,23 @@ pub fn get_consolidation_churn_limit_for_fork(
     config: &Config,
     active_balances: Option<&ActiveBalanceCache>,
 ) -> Result<Gwei> {
-    match state.fork_name() {
-        ForkName::Electra | ForkName::Fulu => Ok(consolidation_churn_limit_for(
-            total_active_balance_or_compute(state, active_balances)?,
-            config,
-        )),
-        ForkName::Gloas => Ok(
-            crate::beacon::helpers::gloas::consolidation_churn_limit_for(
-                total_active_balance_or_compute(state, active_balances)?,
-                config,
-            ),
-        ),
+    let churn_limit_for: fn(Gwei, &Config) -> Gwei = match state.fork_name() {
+        ForkName::Electra | ForkName::Fulu => consolidation_churn_limit_for,
+        ForkName::Gloas => crate::beacon::helpers::gloas::consolidation_churn_limit_for,
         fork @ (ForkName::Phase0
         | ForkName::Altair
         | ForkName::Bellatrix
         | ForkName::Capella
-        | ForkName::Deneb) => Err(Error::UnsupportedForFork {
-            function: "get_consolidation_churn_limit_for_fork",
-            fork,
-        }),
+        | ForkName::Deneb) => {
+            return Err(Error::UnsupportedForFork {
+                function: "get_consolidation_churn_limit_for_fork",
+                fork,
+            });
+        }
         ForkName::Lean => lean_state_unreachable("get_consolidation_churn_limit_for_fork"),
-    }
+    };
+    let total_active_balance = total_active_balance_or_compute(state, active_balances)?;
+    Ok(churn_limit_for(total_active_balance, config))
 }
 
 /// Advances the consolidation-queue cursor for a consolidation moving

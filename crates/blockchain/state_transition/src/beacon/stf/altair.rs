@@ -348,20 +348,24 @@ pub fn process_sync_aggregate(
     // largest single cost of a live import (a hash probe per validator, every
     // block), where the cache answers each seat with a lookup and one
     // verifying tree descent.
-    let cached: Option<Vec<ValidatorIndex>> = committee_pubkeys
+    let mut resolved: Vec<Option<ValidatorIndex>> = committee_pubkeys
         .iter()
         .map(|pubkey| pubkey_indices.verified_index(state, pubkey))
         .collect();
-    let committee_indices = match cached {
-        Some(indices) => {
-            crate::metrics::inc_pubkey_index_lookups("hit", indices.len() as u64);
-            indices
-        }
-        None => {
-            crate::metrics::inc_pubkey_index_lookups("fallback", committee_pubkeys.len() as u64);
-            resolve_sync_committee_by_scan(state, committee_pubkeys)?
-        }
-    };
+    let missing = resolved.iter().filter(|index| index.is_none()).count();
+    crate::metrics::inc_pubkey_index_lookups("hit", (resolved.len() - missing) as u64);
+    if missing > 0 {
+        crate::metrics::inc_pubkey_index_lookups("fallback", missing as u64);
+        resolve_missing_seats_by_scan(state, committee_pubkeys, &mut resolved, pubkey_indices);
+    }
+    let committee_indices = resolved
+        .into_iter()
+        .map(|index| {
+            index.ok_or(Error::SpecAssert(
+                "state.current_sync_committee.pubkeys[i] in [v.pubkey for v in state.validators]",
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     let total_active_balance = active_balances.total_active_balance(state)?;
     let total_active_increments = total_active_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
@@ -405,42 +409,49 @@ pub fn process_sync_aggregate(
     Ok(())
 }
 
-/// Every committee seat's validator index, by one pass over the registry:
-/// the fallback for a seat the pubkey index cache could not verify.
+/// Fills every seat of `resolved` the pubkey index cache could not verify, by
+/// one pass over the registry, and records each index it finds in the cache
+/// so the next block's lookup of that seat is a hit.
+///
+/// Only the missing seats are searched for: the cache vouched for the rest,
+/// so one unconfirmable member costs one scan, not a scan for the whole
+/// committee.
 ///
 /// One pass, not one per seat. The specification writes this as a search per
 /// committee member, which is `SYNC_COMMITTEE_SIZE` scans of the whole
 /// validator set: at mainnet's ~1M validators that is hundreds of millions of
 /// 48-byte pubkey comparisons per block. Inverting the loop makes it one scan
-/// against a committee-sized map.
+/// against a map of the missing seats, which stops once every one is found.
 ///
 /// A pubkey may hold more than one seat, since sync-committee selection
 /// samples with replacement, so each key maps to every seat it occupies
-/// rather than to one.
-fn resolve_sync_committee_by_scan(
+/// rather than to one. A key's first position is taken, as the
+/// specification's `.index()` does; a seat whose pubkey is not registered is
+/// left `None` for the caller to reject.
+fn resolve_missing_seats_by_scan(
     state: &BeaconState,
     committee_pubkeys: &[BlsPubkey],
-) -> Result<Vec<ValidatorIndex>> {
+    resolved: &mut [Option<ValidatorIndex>],
+    pubkey_indices: &PubkeyIndexCache,
+) {
     let mut seats_by_pubkey: HashMap<&BlsPubkey, Vec<usize>> = HashMap::new();
     for (seat, pubkey) in committee_pubkeys.iter().enumerate() {
-        seats_by_pubkey.entry(pubkey).or_default().push(seat);
-    }
-    let mut resolved: Vec<Option<ValidatorIndex>> = vec![None; committee_pubkeys.len()];
-    for (index, validator) in state.iter_validators().enumerate() {
-        if let Some(seats) = seats_by_pubkey.get(&validator.pubkey) {
-            for &seat in seats {
-                resolved[seat] = Some(index as ValidatorIndex);
-            }
+        if resolved[seat].is_none() {
+            seats_by_pubkey.entry(pubkey).or_default().push(seat);
         }
     }
-    resolved
-        .into_iter()
-        .map(|index| {
-            index.ok_or(Error::SpecAssert(
-                "state.current_sync_committee.pubkeys[i] in [v.pubkey for v in state.validators]",
-            ))
-        })
-        .collect()
+    for (index, validator) in state.iter_validators().enumerate() {
+        if seats_by_pubkey.is_empty() {
+            break;
+        }
+        if let Some(seats) = seats_by_pubkey.remove(&validator.pubkey) {
+            let index = index as ValidatorIndex;
+            for seat in seats {
+                resolved[seat] = Some(index);
+            }
+            pubkey_indices.insert(&validator.pubkey, index);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -779,6 +790,56 @@ mod tests {
                 "validator {index}'s balance did not match its expected reward or penalty"
             );
         }
+    }
+
+    /// A seat the shared pubkey cache cannot verify (here, because the table
+    /// was fed by a fork whose registry holds another key at that index) is
+    /// scanned for, gives the same post-state as a fresh cache, and is
+    /// recorded so the next block's lookup is a hit.
+    #[test]
+    fn process_sync_aggregate_scans_for_an_unverifiable_seat_and_records_it() {
+        let (mut state, secret_keys) = altair_state_with_keypairs(3);
+        let pubkeys_vec: Vec<BlsPubkey> = (0..preset::SYNC_COMMITTEE_SIZE)
+            .map(|seat| BlsPubkey(secret_keys[seat % 3].sk_to_pk().to_bytes()))
+            .collect();
+        let aggregate_pubkey = bls::eth_aggregate_pubkeys(&pubkeys_vec).unwrap();
+        {
+            let (current_sync_committee, _) = state.sync_committees_mut().unwrap();
+            *current_sync_committee = SyncCommittee {
+                pubkeys: pubkeys_vec.try_into().unwrap(),
+                aggregate_pubkey,
+            };
+        }
+        let sync_aggregate = altair::SyncAggregate {
+            sync_committee_bits: altair::SyncCommitteeBits::default(),
+            sync_committee_signature: g2_point_at_infinity(),
+        };
+
+        let cache = PubkeyIndexCache::default();
+        let mut other_fork = state.clone();
+        other_fork.validator_mut(1).unwrap().pubkey = BlsPubkey([0xCD; 48]);
+        cache.verified_index(&other_fork, &BlsPubkey([0xCD; 48]));
+        let member = state.validator(1).unwrap().pubkey;
+        assert_eq!(cache.verified_index(&state, &member), None);
+
+        let mut with_fresh = state.clone();
+        process_sync_aggregate(
+            &mut with_fresh,
+            &sync_aggregate,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
+        process_sync_aggregate(
+            &mut state,
+            &sync_aggregate,
+            &ActiveBalanceCache::default(),
+            &cache,
+        )
+        .unwrap();
+
+        assert_eq!(state, with_fresh);
+        assert_eq!(cache.verified_index(&state, &member), Some(1));
     }
 
     #[test]

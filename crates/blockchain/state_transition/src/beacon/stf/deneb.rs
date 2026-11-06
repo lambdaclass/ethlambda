@@ -36,7 +36,7 @@ use crate::beacon::containers::{BeaconState, deneb, phase0};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::hash::hash;
 use crate::beacon::helpers::accessors::{
-    ActiveBalanceCache, ActiveBalanceCacheExt, CommitteeCache, CommitteeCacheExt, PubkeyIndexCache,
+    ActiveBalanceCache, ActiveBalanceCacheExt, CommitteeCache, CommitteeCacheExt,
     get_beacon_proposer_index, get_block_root, get_block_root_at_slot, get_current_epoch,
     get_previous_epoch, get_randao_mix,
 };
@@ -53,7 +53,7 @@ use crate::beacon::primitives::{
     Bytes32, Gwei, H256, HashTreeRoot as _, KzgCommitment, ParticipationFlags, ValidatorIndex,
 };
 
-use super::ExecutionEngine;
+use super::{BlockCaches, ExecutionEngine};
 
 // ---------------------------------------------------------------------------
 // Block processing
@@ -72,15 +72,12 @@ use super::ExecutionEngine;
 /// [`super::operations::process_operations`] has no fork check of its own to
 /// hang them on. See [`process_operations`]'s own documentation for why that
 /// is a full copy of the loop rather than a smaller patch.
-#[allow(clippy::too_many_arguments)]
 pub fn process_block(
     state: &mut BeaconState,
     block: &deneb::BeaconBlock,
     config: &Config,
     engine: &ExecutionEngine,
-    committees: &CommitteeCache,
-    active_balances: &ActiveBalanceCache,
-    pubkey_indices: &PubkeyIndexCache,
+    caches: BlockCaches<'_>,
     options: super::block::BlockProcessingOptions,
 ) -> Result<()> {
     super::block::process_block_header(
@@ -109,14 +106,14 @@ pub fn process_block(
         &block.body.voluntary_exits,
         &block.body.bls_to_execution_changes,
         config,
-        committees,
-        active_balances,
+        caches.committees,
+        caches.active_balances,
     )?;
     super::altair::process_sync_aggregate(
         state,
         &block.body.sync_aggregate,
-        active_balances,
-        pubkey_indices,
+        caches.active_balances,
+        caches.pubkey_indices,
     )?;
     Ok(())
 }
@@ -173,10 +170,20 @@ fn process_operations(
     )?;
 
     for proposer_slashing in proposer_slashings {
-        super::operations::process_proposer_slashing(state, proposer_slashing, config)?;
+        super::operations::process_proposer_slashing(
+            state,
+            proposer_slashing,
+            config,
+            active_balances,
+        )?;
     }
     for attester_slashing in attester_slashings {
-        super::operations::process_attester_slashing(state, attester_slashing, config)?;
+        super::operations::process_attester_slashing(
+            state,
+            attester_slashing,
+            config,
+            active_balances,
+        )?;
     }
     for attestation in attestations {
         process_attestation(state, attestation, committees, active_balances)?;

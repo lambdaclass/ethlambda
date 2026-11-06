@@ -105,6 +105,45 @@ impl ExecutionEngine {
     }
 }
 
+/// The tables block processing reads through instead of recomputing per
+/// block: committees, the total active balance, and pubkey to index. Borrowed
+/// together, so a block-processing entry point takes one argument for all of
+/// them, and a new table is a field here rather than a parameter on every
+/// fork's `process_block`.
+///
+/// Which tables a caller passes is its own decision: the chain actor's fork
+/// choice passes the `Store`'s shared ones, so every import reuses what earlier
+/// ones built; a caller with no `Store` holds an [`OwnedBlockCaches`]. Every
+/// table is sound to share across forks (each is keyed or verified per state;
+/// see each type), so mixing shared and fresh ones is a cost decision only.
+#[derive(Debug, Clone, Copy)]
+pub struct BlockCaches<'a> {
+    pub committees: &'a CommitteeCache,
+    pub active_balances: &'a ActiveBalanceCache,
+    pub pubkey_indices: &'a PubkeyIndexCache,
+}
+
+/// A fresh set of the tables [`BlockCaches`] borrows, for a caller with no
+/// `Store` (a spec runner, a unit test, the era replay) to hold for as long
+/// as its work lasts.
+#[derive(Debug, Default)]
+pub struct OwnedBlockCaches {
+    pub committees: CommitteeCache,
+    pub active_balances: ActiveBalanceCache,
+    pub pubkey_indices: PubkeyIndexCache,
+}
+
+impl OwnedBlockCaches {
+    /// Borrows every table.
+    pub fn caches(&self) -> BlockCaches<'_> {
+        BlockCaches {
+            committees: &self.committees,
+            active_balances: &self.active_balances,
+            pubkey_indices: &self.pubkey_indices,
+        }
+    }
+}
+
 /// Applies a signed block to the state.
 ///
 /// With `validate_result` set, the proposer's signature and the block's committed
@@ -129,28 +168,16 @@ impl ExecutionEngine {
 /// specification requires instead of failing on it. Rejecting the mismatch
 /// before any of that runs is what keeps the failure legible: "wrong fork," not
 /// some unrelated-looking assertion three steps later.
-#[allow(clippy::too_many_arguments)]
 pub fn state_transition(
     state: &mut BeaconState,
     signed_block: &containers::SignedBeaconBlock,
     validate_result: bool,
     config: &Config,
     engine: &ExecutionEngine,
-    committees: &CommitteeCache,
-    active_balances: &ActiveBalanceCache,
-    pubkey_indices: &PubkeyIndexCache,
+    caches: BlockCaches<'_>,
 ) -> Result<()> {
     process_slots(state, signed_block.slot(), config)?;
-    apply_block(
-        state,
-        signed_block,
-        validate_result,
-        config,
-        engine,
-        committees,
-        active_balances,
-        pubkey_indices,
-    )
+    apply_block(state, signed_block, validate_result, config, engine, caches)
 }
 
 /// [`state_transition`] from the point where `state` is already at the block's
@@ -162,16 +189,13 @@ pub fn state_transition(
 /// when the block sits exactly on the boundary. A state at the wrong slot is
 /// still refused: the block header check in `process_block` compares the
 /// block's slot with the state's.
-#[allow(clippy::too_many_arguments)]
 pub fn apply_block(
     state: &mut BeaconState,
     signed_block: &containers::SignedBeaconBlock,
     validate_result: bool,
     config: &Config,
     engine: &ExecutionEngine,
-    committees: &CommitteeCache,
-    active_balances: &ActiveBalanceCache,
-    pubkey_indices: &PubkeyIndexCache,
+    caches: BlockCaches<'_>,
 ) -> Result<()> {
     // After `process_slots`, never before it. A block proposed at the first slot
     // of a fork's activation epoch is the *post*-fork shape while the state
@@ -196,9 +220,7 @@ pub fn apply_block(
         signed_block,
         config,
         engine,
-        committees,
-        active_balances,
-        pubkey_indices,
+        caches,
         block::BlockProcessingOptions::default(),
     )?;
     // As in `process_slot`: the post-state's root, checked below and needed
