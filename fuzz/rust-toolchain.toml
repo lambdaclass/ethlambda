@@ -1,0 +1,5 @@
+# `cargo fuzz` needs nightly for `-Zsanitizer`. The same date the dependency
+# cooldown check already installs (`RESOLVER_TOOLCHAIN` in the Makefile), so
+# the repo asks for one nightly, not two.
+[toolchain]
+channel = "nightly-2026-06-21"

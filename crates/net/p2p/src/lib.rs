@@ -135,6 +135,30 @@ pub use req_resp::{request_beacon_block_by_root, request_beacon_blocks_by_range}
 /// refuses a network whose value differs from this one.
 pub use req_resp::MAX_PAYLOAD_SIZE;
 
+/// The gossip payload codec and the lean topic parser, for the fuzz targets
+/// in `fuzz/`: they are the first thing a peer's bytes reach, and nothing in
+/// the production API needs them by name.
+#[cfg(feature = "fuzzing")]
+pub use gossipsub::{compress_message, decompress_message, topic_kind as lean_topic_kind};
+
+/// The req/resp framing (varint length prefix, snappy frame, chunked
+/// responses), for the same targets. These are what `Codec` runs on every
+/// stream a peer opens.
+#[cfg(feature = "fuzzing")]
+pub use req_resp::Codec as ReqRespCodec;
+#[cfg(feature = "fuzzing")]
+pub use req_resp::encoding::{
+    ChunkLimits, DecodedPayload, decode_payload, decode_varint, encode_varint,
+    read_chunked_response, write_payload,
+};
+
+/// [`compute_message_id`] for the fuzz targets: a wrapper rather than a
+/// re-export because the function itself stays private to the swarm builder.
+#[cfg(feature = "fuzzing")]
+pub fn gossip_message_id(message: &libp2p::gossipsub::Message) -> libp2p::gossipsub::MessageId {
+    compute_message_id(message)
+}
+
 // 5ms, 10ms, 20ms, 40ms, 80ms, 160ms, 320ms, 640ms, 1280ms, 2560ms
 //
 // This ladder, not a separate wall-clock budget, is what actually bounds how
