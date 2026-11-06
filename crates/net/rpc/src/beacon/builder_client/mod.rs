@@ -467,16 +467,37 @@ pub(super) async fn read_body(
     Ok(body)
 }
 
-/// `text` cut to at most [`MAX_ERROR_TEXT`] bytes, at a char boundary.
-pub(super) fn truncate_error_text(mut text: String) -> String {
-    if text.len() > MAX_ERROR_TEXT {
-        let mut end = MAX_ERROR_TEXT;
-        while !text.is_char_boundary(end) {
-            end -= 1;
+/// `text` with every character that could break or restyle a line written
+/// out, cut to at most [`MAX_ERROR_TEXT`] bytes.
+///
+/// A builder's text reaches this node's logs and a validator client's error
+/// message. There a raw line break would start what reads as a log line of
+/// its own, and an ESC would start an ANSI sequence that recolors, moves the
+/// cursor in or clears a terminal. So every control character
+/// (`char::is_control`: C0, DEL and C1) and the Unicode line and paragraph
+/// separators U+2028/U+2029, which some viewers break lines at, are written
+/// as Rust escapes: `\n`, `\r` and `\t`, and `\u{1b}` for the rest. Everything
+/// else passes through unchanged, quotes and backslashes included.
+///
+/// The cap is applied to the escaped text, and never cuts a character or an
+/// escape in two.
+pub(super) fn error_text(text: String) -> String {
+    let mut written = String::with_capacity(text.len().min(MAX_ERROR_TEXT));
+    for c in text.chars() {
+        if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+            let escaped = c.escape_default();
+            if written.len() + escaped.len() > MAX_ERROR_TEXT {
+                break;
+            }
+            written.extend(escaped);
+        } else {
+            if written.len() + c.len_utf8() > MAX_ERROR_TEXT {
+                break;
+            }
+            written.push(c);
         }
-        text.truncate(end);
     }
-    text
+    written
 }
 
 /// The fork `version` names, if its bids have the shape [`SignedBuilderBid`]
@@ -512,10 +533,14 @@ fn outcome<T>(result: &Result<T, BuilderError>) -> &'static str {
     result.as_ref().map_or_else(BuilderError::label, |_| "ok")
 }
 
-/// A submission's answer: only 202 is success.
+/// A submission's answer: only 202 is success. Any other 2xx is an error of
+/// its own, since the builder may have taken the block all the same.
 async fn submission_result(response: reqwest::Response) -> Result<(), BuilderError> {
     match response.status() {
         StatusCode::ACCEPTED => Ok(()),
+        status if status.is_success() => Err(BuilderError::UnexpectedSuccess {
+            status: status.as_u16(),
+        }),
         _ => Err(BuilderError::from_status(response, SUBMIT_TIMEOUT).await),
     }
 }
