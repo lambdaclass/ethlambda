@@ -14,6 +14,9 @@ libssz.workspace = true
 libssz-merkle.workspace = true
 libssz-types.workspace = true
 rayon.workspace = true
+# `compress` exposes `compress256`, the block-level function `batch.rs` hashes
+# whole merkle layers with. A feature of the `sha2` already in the lockfile.
+sha2 = { workspace = true, features = ["compress"] }
 
 [dev-dependencies]
 libssz-derive.workspace = true
