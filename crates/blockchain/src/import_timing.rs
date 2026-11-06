@@ -176,8 +176,18 @@ pub struct ImportTimings {
     pub columns_wait_start: Option<Instant>,
     pub columns_wait_end: Option<Instant>,
 
-    /// Beacon: the `engine_newPayload` round trip, including its retry ladder.
-    /// I/O wait, not work.
+    /// Beacon: how long the import sat waiting for the execution client's
+    /// verdict with no consensus work of its own left to do. I/O wait, not
+    /// work.
+    ///
+    /// The request is sent from a task of its own while the state transition
+    /// runs (see [`Self::stf_spec_start`]), so this pair starts where that
+    /// transition ended and ends when the answer arrived. Both are the same
+    /// instant, a recorded zero, when there was no request to send (no
+    /// execution client, or a block with no payload in it: pre-merge or
+    /// gloas) or when the answer was already in once the transition finished.
+    /// How long the execution client itself took is
+    /// `lean_engine_new_payload_seconds`, not this.
     pub engine_start: Option<Instant>,
     pub engine_end: Option<Instant>,
 
@@ -196,6 +206,22 @@ pub struct ImportTimings {
     /// reports it minus [`Self::writer_wait_start`]..[`Self::writer_wait_end`].
     pub stf_start: Option<Instant>,
     pub stf_end: Option<Instant>,
+
+    /// Beacon: a state transition computed while the execution client's
+    /// verdict was still in flight, whether the import then used it or not.
+    ///
+    /// It runs before the `stf` pair above and overlaps the `engine_newPayload`
+    /// round trip, so it is neither inside `stf_start`..`stf_end` nor a
+    /// section of its own: the `stf` row adds it, since it is state-transition
+    /// work. A discarded one is added too, so the transition an `INVALIDATED`
+    /// verdict makes `on_block` run again shows as the second transition it
+    /// is, and a held block still shows the one it paid for. The `engine` pair
+    /// starts at this pair's end, so the rows still sum to the end-to-end time
+    /// instead of counting the overlap twice. `None` whenever no request was
+    /// sent, which is every import without an execution client and every
+    /// block with no payload to ask about.
+    pub stf_spec_start: Option<Instant>,
+    pub stf_spec_end: Option<Instant>,
 
     /// Beacon: the blocking hand-off of the post-state to the storage crate's
     /// background writer, which waits while the writer's queue is full. It
@@ -375,6 +401,12 @@ impl ImportTimings {
         let writer_wait = Row::new("writer_wait", self.writer_wait_start, self.writer_wait_end);
         if let (Some(total), Some(wait)) = (stf.elapsed, writer_wait.elapsed) {
             stf.elapsed = Some(total.saturating_sub(wait));
+        }
+        // Also when the import stopped before running its own transition (a
+        // held block), so the speculation it paid for is not lost.
+        if let Some(spec) = span(self.stf_spec_start, self.stf_spec_end) {
+            stf.elapsed = Some(stf.elapsed.unwrap_or_default() + spec);
+            stf.end = stf.end.or(self.stf_spec_end);
         }
         vec![
             Row::new("decode", self.decode_start, self.decode_end),
@@ -895,6 +927,67 @@ mod tests {
             Some(Duration::from_millis(90))
         );
         assert_eq!(row_elapsed(&timings, "writer_wait"), None);
+    }
+
+    #[test]
+    fn an_overlapped_transition_is_charged_to_stf_and_not_to_engine() {
+        // A 100 ms round trip with a 70 ms transition running inside it, then
+        // 20 ms of import. Un-overlapped, that is 100 + 20 ms; overlapped, the
+        // engine row keeps the 30 ms that was left and stf gains the 70 ms.
+        let base = Instant::now();
+        let mut timings = ImportTimings::default();
+        (timings.stf_spec_start, timings.stf_spec_end) = pair(base, 0, 70);
+        (timings.engine_start, timings.engine_end) = pair(base, 70, 30);
+        (timings.stf_start, timings.stf_end) = pair(base, 100, 20);
+
+        assert_eq!(
+            row_elapsed(&timings, "engine"),
+            Some(Duration::from_millis(30))
+        );
+        assert_eq!(
+            row_elapsed(&timings, "stf"),
+            Some(Duration::from_millis(90))
+        );
+        let rows: Duration = timings
+            .rows()
+            .into_iter()
+            .filter_map(|row| row.elapsed)
+            .sum();
+        assert_eq!(
+            rows,
+            Duration::from_millis(120),
+            "the rows still tile the span"
+        );
+    }
+
+    #[test]
+    fn a_held_block_still_charges_its_speculation_to_stf() {
+        // No verdict: the 70 ms transition ran, then 300 ms of waiting, then
+        // the block was held without a transition of its own.
+        let base = Instant::now();
+        let mut timings = ImportTimings::default();
+        (timings.stf_spec_start, timings.stf_spec_end) = pair(base, 0, 70);
+        (timings.engine_start, timings.engine_end) = pair(base, 70, 300);
+
+        assert_eq!(
+            row_elapsed(&timings, "stf"),
+            Some(Duration::from_millis(70))
+        );
+        assert_eq!(
+            row_elapsed(&timings, "engine"),
+            Some(Duration::from_millis(300))
+        );
+    }
+
+    #[test]
+    fn an_engine_with_nothing_to_wait_for_is_a_recorded_zero() {
+        // No request sent, or the answer was in before the transition ended:
+        // the row is present and zero, so every beacon block observes it.
+        let base = Instant::now();
+        let mut timings = ImportTimings::default();
+        (timings.engine_start, timings.engine_end) = (Some(base), Some(base));
+
+        assert_eq!(row_elapsed(&timings, "engine"), Some(Duration::ZERO));
     }
 
     #[test]
