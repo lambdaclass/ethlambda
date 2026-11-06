@@ -720,10 +720,13 @@ fn verify_randao_reveal(
     let epoch = compute_epoch_at_slot(state.slot());
     let domain = get_domain(state, constants::DOMAIN_RANDAO, Some(epoch));
     let signing_root = compute_signing_root(epoch.hash_tree_root(), domain);
-    let pubkey = state
-        .validator(proposer)
-        .map_err(|_| ApiError::Internal("the proposer is not in the registry"))?
-        .pubkey;
+    let pubkey = bls::IndexedPubkey {
+        index: proposer,
+        pubkey: state
+            .validator(proposer)
+            .map_err(|_| ApiError::Internal("the proposer is not in the registry"))?
+            .pubkey,
+    };
     if bls::verify(&pubkey, signing_root, &randao_reveal) {
         Ok(())
     } else {

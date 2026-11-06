@@ -119,10 +119,13 @@ fn stateful_rules(store: &Store, signed: &gloas::SignedProposerPreferences) -> R
         return Err(Outcome::Reject(RejectReason::WrongProposer));
     }
     // [REJECT] The signature is valid, under any candidate domain.
-    let pubkey = state
-        .validator(preferences.validator_index)
-        .map_err(|_| Outcome::Reject(RejectReason::WrongProposer))?
-        .pubkey;
+    let pubkey = bls::IndexedPubkey {
+        index: preferences.validator_index,
+        pubkey: state
+            .validator(preferences.validator_index)
+            .map_err(|_| Outcome::Reject(RejectReason::WrongProposer))?
+            .pubkey,
+    };
     let message_root = preferences.hash_tree_root();
     let valid = proposer_preferences_domains(&state, &config, proposal_epoch)
         .into_iter()

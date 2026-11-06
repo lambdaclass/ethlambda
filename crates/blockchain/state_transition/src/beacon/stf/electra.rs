@@ -44,7 +44,7 @@
 
 use libssz::SszEncode as _;
 
-use crate::beacon::bls::{self, SignatureSet};
+use crate::beacon::bls::{self, IndexedPubkey, SignatureSet};
 use crate::beacon::config::Config;
 use crate::beacon::constants::{self, FAR_FUTURE_EPOCH};
 use crate::beacon::containers::shared::{
@@ -532,7 +532,10 @@ pub fn process_voluntary_exit(
     let signing_root = compute_signing_root(voluntary_exit.hash_tree_root(), domain);
     signatures.push(
         SignatureSet::single(
-            &validator.pubkey,
+            &IndexedPubkey {
+                index: voluntary_exit.validator_index,
+                pubkey: validator.pubkey,
+            },
             signing_root,
             &signed_voluntary_exit.signature,
         ),

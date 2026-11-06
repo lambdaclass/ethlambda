@@ -123,7 +123,7 @@
 //! single easiest mistake to make copying that shape without also copying
 //! the reasoning behind it.
 
-use crate::beacon::bls::{AggregatePubkey, SignatureSet};
+use crate::beacon::bls::{AggregatePubkey, IndexedPubkey, SignatureSet};
 use crate::beacon::config::Config;
 use crate::beacon::constants::{self, FAR_FUTURE_EPOCH};
 use crate::beacon::containers::shared::{AttestationData, Validator};
@@ -331,7 +331,10 @@ pub fn indexed_attestation_signature_set_with_domain(
     let mut pubkeys = Vec::with_capacity(indices.len());
     for index in indices {
         match state.validator(*index) {
-            Ok(validator) => pubkeys.push(validator.pubkey),
+            Ok(validator) => pubkeys.push(IndexedPubkey {
+                index: *index,
+                pubkey: validator.pubkey,
+            }),
             Err(_) => return None,
         }
     }
@@ -577,7 +580,12 @@ pub(crate) fn attesters_aggregate_pubkey(
     let key_sums = committees.key_sums(state, epoch);
     let committees_per_slot = epoch_committees.committees_per_slot();
 
-    let pubkey_of = |index: ValidatorIndex| state.validator(index).ok().map(|v| v.pubkey);
+    let pubkey_of = |index: ValidatorIndex| {
+        state.validator(index).ok().map(|v| IndexedPubkey {
+            index,
+            pubkey: v.pubkey,
+        })
+    };
 
     // Committees derived from their sums, added as they come, and the keys of
     // every committee summed directly, summed once at the end.

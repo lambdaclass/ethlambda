@@ -248,7 +248,11 @@ fn voluntary_exit(state: &BeaconState, signed: &SignedVoluntaryExit, config: &Co
         state.genesis_validators_root(),
     );
     let signing_root = compute_signing_root(exit.hash_tree_root(), domain);
-    if !bls::verify(&validator.pubkey, signing_root, &signed.signature) {
+    let validator = bls::IndexedPubkey {
+        index: exit.validator_index,
+        pubkey: validator.pubkey,
+    };
+    if !bls::verify(&validator, signing_root, &signed.signature) {
         return Err(Outcome::Reject(RejectReason::BadSignature));
     }
     Ok(())
@@ -264,6 +268,10 @@ fn proposer_slashing(state: &BeaconState, slashing: &ProposerSlashing) -> Verdic
     if !is_slashable_validator(proposer, get_current_epoch(state)) {
         return Err(Outcome::Reject(RejectReason::InvalidOperation));
     }
+    let proposer = bls::IndexedPubkey {
+        index: proposer_index,
+        pubkey: proposer.pubkey,
+    };
     // [REJECT] Both signatures are valid.
     for signed_header in [&slashing.signed_header_1, &slashing.signed_header_2] {
         let header = &signed_header.message;
@@ -273,7 +281,7 @@ fn proposer_slashing(state: &BeaconState, slashing: &ProposerSlashing) -> Verdic
             Some(compute_epoch_at_slot(header.slot)),
         );
         let signing_root = compute_signing_root(header.hash_tree_root(), domain);
-        if !bls::verify(&proposer.pubkey, signing_root, &signed_header.signature) {
+        if !bls::verify(&proposer, signing_root, &signed_header.signature) {
             return Err(Outcome::Reject(RejectReason::BadSignature));
         }
     }
