@@ -238,6 +238,8 @@ mod tests {
             slot: 1,
             block: H256::ZERO,
             execution_optimistic: false,
+            builder_index: None,
+            block_hash: None,
         }));
         events.emit(head_event(1));
         events.emit(ChainEvent::BeaconFinalizedCheckpoint(

@@ -533,3 +533,47 @@ pub struct InitBlockChain {
 impl Message for InitBlockChain {
     type Result = ();
 }
+
+// --- Sink: P2P -> event stream ---
+
+/// A gloas gossip object that passed its topic's validation inside
+/// `ethlambda-p2p`, for the Beacon API's event stream.
+///
+/// These are the topics whose objects never reach the chain actor, which is
+/// the event bus's usual publisher: bids and proposer preferences are
+/// validated and kept in the p2p layer's `BuilderMarket`, and a payload
+/// attestation message is pooled there. Carrying only what each event shows
+/// keeps the sink free of a dependency on the blockchain crate, which owns
+/// the bus.
+#[derive(Clone, Debug)]
+pub enum GossipEvent {
+    /// An `execution_payload` envelope passed gossip validation. Only the
+    /// fields the event shows are carried, since the envelope itself holds a
+    /// whole execution payload.
+    ExecutionPayloadGossip {
+        slot: u64,
+        builder_index: u64,
+        block_hash: H256,
+        block_root: H256,
+    },
+    /// An `execution_payload_bid` passed gossip validation.
+    ExecutionPayloadBid(Box<SignedExecutionPayloadBid>),
+    /// A `payload_attestation_message` passed gossip validation.
+    PayloadAttestationMessage(PayloadAttestationMessage),
+    /// A `proposer_preferences` message passed gossip validation.
+    ProposerPreferences(Box<SignedProposerPreferences>),
+}
+
+/// Where `ethlambda-p2p` reports [`GossipEvent`]s.
+///
+/// Implemented by the event bus in `ethlambda-blockchain`, so the p2p layer
+/// can feed `/eth/v1/events` without depending on the crate that owns it.
+/// Best-effort like the bus itself: `emit` never blocks and never fails.
+pub trait GossipEventSink: Send + Sync {
+    /// Whether anything listens. Asked before building a payload that costs
+    /// a clone, so a node nobody subscribes to pays nothing.
+    fn has_subscribers(&self) -> bool;
+
+    /// Publish `event` to every current subscriber.
+    fn emit(&self, event: GossipEvent);
+}
