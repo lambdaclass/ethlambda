@@ -140,6 +140,7 @@ use ethlambda_state_transition::beacon::stf::deneb as deneb_stf;
 use ethlambda_state_transition::beacon::stf::electra as electra_stf;
 use ethlambda_state_transition::beacon::stf::fulu as fulu_stf;
 use ethlambda_state_transition::beacon::stf::gloas as gloas_stf;
+use ethlambda_state_transition::beacon::stf::signatures::SignatureBatch;
 use ethlambda_state_transition::beacon::stf::{ExecutionEngine, block, operations};
 use libtest_mimic::{Failed, Trial};
 
@@ -173,6 +174,32 @@ fn apply(
     state: &mut BeaconState,
     config: &Config,
 ) -> Result<(), String> {
+    // Every signature an operation defers is checked once the operation has
+    // run, which is how a block's own driver treats them: a case whose only
+    // defect is a bad signature is still rejected, only later.
+    let mut unhandled = None;
+    let outcome = SignatureBatch::deferred(|signatures| {
+        run(handler, case, state, config, signatures).unwrap_or_else(|err| {
+            unhandled = Some(err);
+            Ok(())
+        })
+    });
+    if let Some(err) = unhandled {
+        return Err(err);
+    }
+    outcome.map_err(|err| format!("{err:?}"))
+}
+
+/// [`apply`]'s dispatch, pushing every deferred signature into `signatures`.
+/// The outer `Err` is a case no handler here covers; the inner result is the
+/// crate's own verdict.
+fn run(
+    handler: &str,
+    case: &Case,
+    state: &mut BeaconState,
+    config: &Config,
+    signatures: &mut SignatureBatch,
+) -> Result<Result<(), ethlambda_state_transition::beacon::Error>, String> {
     // Only the `attestation` handler reads this. Bound up here so each of its
     // calls fits on one line; a case processes a single attestation, so there
     // is nothing for the cache to share between calls.
@@ -274,27 +301,51 @@ fn apply(
             // Phase0 defers every attestation's reward to the epoch boundary.
             ForkName::Phase0 => {
                 let attestation: phase0::Attestation = case.ssz("attestation");
-                operations::process_attestation(state, &attestation, config, &committees)
+                operations::process_attestation(
+                    state,
+                    &attestation,
+                    config,
+                    &committees,
+                    signatures,
+                )
             }
             // Altair scores an attestation immediately instead, and neither
             // bellatrix's nor capella's specification lists a further change,
             // so altair's own function serves both.
             ForkName::Altair | ForkName::Bellatrix | ForkName::Capella => {
                 let attestation: phase0::Attestation = case.ssz("attestation");
-                altair_stf::process_attestation(state, &attestation, &committees, &active_balances)
+                altair_stf::process_attestation(
+                    state,
+                    &attestation,
+                    &committees,
+                    &active_balances,
+                    signatures,
+                )
             }
             // Deneb widens the inclusion window and the timely-target
             // condition (EIP-7045); the container is still phase0's.
             ForkName::Deneb => {
                 let attestation: phase0::Attestation = case.ssz("attestation");
-                deneb_stf::process_attestation(state, &attestation, &committees, &active_balances)
+                deneb_stf::process_attestation(
+                    state,
+                    &attestation,
+                    &committees,
+                    &active_balances,
+                    signatures,
+                )
             }
             // Electra reshapes the container itself (EIP-7549's
             // `committee_bits`), and fulu's specification makes no further
             // change to either the container or the function.
             ForkName::Electra | ForkName::Fulu => {
                 let attestation: electra::Attestation = case.ssz("attestation");
-                electra_stf::process_attestation(state, &attestation, &committees, &active_balances)
+                electra_stf::process_attestation(
+                    state,
+                    &attestation,
+                    &committees,
+                    &active_balances,
+                    signatures,
+                )
             }
             // Gloas reshapes the container a third time (EIP-7688's unbounded
             // `AttestingIndices`) and modifies the function again (the new
@@ -311,6 +362,7 @@ fn apply(
                     meta.parent_slot,
                     &committees,
                     &active_balances,
+                    signatures,
                 )
             }
             ForkName::Lean => lean_is_not_a_fixture_fork("attestation"),
@@ -323,7 +375,7 @@ fn apply(
             | ForkName::Capella
             | ForkName::Deneb => {
                 let slashing: phase0::AttesterSlashing = case.ssz("attester_slashing");
-                operations::process_attester_slashing(state, &slashing, config)
+                operations::process_attester_slashing(state, &slashing, config, signatures)
             }
             // Electra's container widens the same way `Attestation`'s does
             // (see the `attestation` arm above); the function itself is not
@@ -331,14 +383,14 @@ fn apply(
             // Fulu's specification changes neither.
             ForkName::Electra | ForkName::Fulu => {
                 let slashing: electra::AttesterSlashing = case.ssz("attester_slashing");
-                electra_stf::process_attester_slashing(state, &slashing, config)
+                electra_stf::process_attester_slashing(state, &slashing, config, signatures)
             }
             // Gloas's container widens again (EIP-7688's unbounded
             // `AttestingIndices`); the function is still not behaviorally
             // modified, only transcribed against gloas's own type.
             ForkName::Gloas => {
                 let slashing: gloas::AttesterSlashing = case.ssz("attester_slashing");
-                gloas_stf::process_attester_slashing(state, &slashing, config)
+                gloas_stf::process_attester_slashing(state, &slashing, config, signatures)
             }
             ForkName::Lean => lean_is_not_a_fixture_fork("attester_slashing"),
         },
@@ -357,8 +409,12 @@ fn apply(
                 | ForkName::Capella
                 | ForkName::Deneb
                 | ForkName::Electra
-                | ForkName::Fulu => operations::process_proposer_slashing(state, &slashing, config),
-                ForkName::Gloas => gloas_stf::process_proposer_slashing(state, &slashing, config),
+                | ForkName::Fulu => {
+                    operations::process_proposer_slashing(state, &slashing, config, signatures)
+                }
+                ForkName::Gloas => {
+                    gloas_stf::process_proposer_slashing(state, &slashing, config, signatures)
+                }
                 ForkName::Lean => lean_is_not_a_fixture_fork("proposer_slashing"),
             }
         }
@@ -405,14 +461,14 @@ fn apply(
             // Unchanged through capella.
             ForkName::Phase0 | ForkName::Altair | ForkName::Bellatrix | ForkName::Capella => {
                 let exit: shared::SignedVoluntaryExit = case.ssz("voluntary_exit");
-                operations::process_voluntary_exit(state, &exit, config)
+                operations::process_voluntary_exit(state, &exit, config, signatures)
             }
             // Deneb pins the signature to `CAPELLA_FORK_VERSION` (EIP-7044),
             // so an exit signed long before it takes effect never expires
             // out from under its own signer at a later fork boundary.
             ForkName::Deneb => {
                 let exit: shared::SignedVoluntaryExit = case.ssz("voluntary_exit");
-                deneb_stf::process_voluntary_exit(state, &exit, config)
+                deneb_stf::process_voluntary_exit(state, &exit, config, signatures)
             }
             // Electra adds a pending-partial-withdrawal check and its own
             // balance-churn exit-queue accounting (EIP-7251); neither fulu's
@@ -422,7 +478,7 @@ fn apply(
             // `process_voluntary_exit`; see that function's own doc).
             ForkName::Electra | ForkName::Fulu | ForkName::Gloas => {
                 let exit: shared::SignedVoluntaryExit = case.ssz("voluntary_exit");
-                electra_stf::process_voluntary_exit(state, &exit, config)
+                electra_stf::process_voluntary_exit(state, &exit, config, signatures)
             }
             ForkName::Lean => lean_is_not_a_fixture_fork("voluntary_exit"),
         },
@@ -430,7 +486,7 @@ fn apply(
         // further fork match.
         "sync_aggregate" => {
             let sync_aggregate: altair::SyncAggregate = case.ssz("sync_aggregate");
-            altair_stf::process_sync_aggregate(state, &sync_aggregate, &active_balances)
+            altair_stf::process_sync_aggregate(state, &sync_aggregate, &active_balances, signatures)
         }
         // The fixture's operation file is a whole `BeaconBlockBody`, not a
         // bare payload: checking one needs fields that live on the body
@@ -516,7 +572,7 @@ fn apply(
         // from here on.
         "bls_to_execution_change" => {
             let signed_change: capella::SignedBLSToExecutionChange = case.ssz("address_change");
-            capella_stf::process_bls_to_execution_change(state, &signed_change, config)
+            capella_stf::process_bls_to_execution_change(state, &signed_change, config, signatures)
         }
         "withdrawals" => match case.fork {
             ForkName::Capella => {
@@ -556,7 +612,7 @@ fn apply(
         // builder's payload.
         "execution_payload_bid" => {
             let signed_bid: gloas::SignedExecutionPayloadBid = case.ssz("execution_payload_bid");
-            gloas_stf::process_execution_payload_bid(state, &signed_bid, config)
+            gloas_stf::process_execution_payload_bid(state, &signed_bid, config, signatures)
         }
         // New in gloas (EIP-7732): the *next* block's processing of the
         // previous slot's payload, so the fixture's operation file is a whole
@@ -627,12 +683,12 @@ fn apply(
         // whether the *previous* slot's payload showed up on time.
         "payload_attestation" => {
             let payload_attestation: gloas::PayloadAttestation = case.ssz("payload_attestation");
-            gloas_stf::process_payload_attestation(state, &payload_attestation, config)
+            gloas_stf::process_payload_attestation(state, &payload_attestation, config, signatures)
         }
         other => return Err(format!("unhandled operation `{other}`")),
     };
 
-    outcome.map_err(|err| format!("{err:?}"))
+    Ok(outcome)
 }
 
 pub fn trials() -> Vec<Trial> {

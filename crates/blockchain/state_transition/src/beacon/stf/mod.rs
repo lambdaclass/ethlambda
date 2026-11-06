@@ -63,6 +63,7 @@ pub mod epoch;
 pub mod fulu;
 pub mod gloas;
 pub mod operations;
+pub mod signatures;
 
 use crate::beacon::containers;
 use crate::beacon::containers::{BeaconState, phase0};
@@ -177,6 +178,12 @@ pub fn apply_block(
         "the block's fork matches the state's",
     )?;
 
+    // The proposer's signature on its own, before the body runs, rather than in
+    // the body's batch: a block nobody but its sender signed then costs one
+    // pairing to reject instead of a whole body's processing. Gossip checked it
+    // already (`precheck_block`), but a block fetched by request arrives here
+    // unchecked. `process_block` batches the body's own signatures and checks
+    // them before returning, so before the state root below is computed.
     if validate_result {
         verify(
             verify_block_signature(state, signed_block),
@@ -212,12 +219,20 @@ pub fn verify_block_signature(
     state: &BeaconState,
     signed_block: &containers::SignedBeaconBlock,
 ) -> bool {
-    let Ok(proposer) = state.validator(signed_block.proposer_index()) else {
-        return false;
-    };
+    block_signature_set(state, signed_block).is_some_and(|set| set.verify())
+}
+
+/// The proposer's signature check [`verify_block_signature`] makes, resolved
+/// but not yet run. `None` is a proposer index outside the registry, or a key
+/// or signature that does not validate.
+pub fn block_signature_set(
+    state: &BeaconState,
+    signed_block: &containers::SignedBeaconBlock,
+) -> Option<bls::SignatureSet> {
+    let proposer = state.validator(signed_block.proposer_index()).ok()?;
     let domain = get_domain(state, constants::DOMAIN_BEACON_PROPOSER, None);
     let signing_root = compute_signing_root(signed_block.message_hash_tree_root(), domain);
-    bls::verify(&proposer.pubkey, signing_root, &signed_block.signature())
+    bls::SignatureSet::single(&proposer.pubkey, signing_root, &signed_block.signature())
 }
 
 /// Advances the state to `slot`, running epoch processing at each boundary and

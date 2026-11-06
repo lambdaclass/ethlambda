@@ -40,6 +40,7 @@ use crate::beacon::preset;
 use crate::beacon::primitives::{
     Bytes32, ExecutionAddress, ExecutionBlockHash, HashTreeRoot as _, Root, Slot, Uint256,
 };
+use crate::beacon::stf::signatures::SignatureBatch;
 
 use super::ExecutionEngine;
 
@@ -63,6 +64,7 @@ use super::ExecutionEngine;
 /// the one fork where a block might still legitimately carry no real payload,
 /// if this chain's merge transition has not happened yet. Every later fork
 /// drops the condition outright, since by then it is always true.
+#[allow(clippy::too_many_arguments)]
 pub fn process_block(
     state: &mut BeaconState,
     block: &bellatrix::BeaconBlock,
@@ -71,6 +73,7 @@ pub fn process_block(
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
     options: super::block::BlockProcessingOptions,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     super::block::process_block_header(
         state,
@@ -82,7 +85,7 @@ pub fn process_block(
     if is_execution_enabled(state, &block.body.execution_payload)? {
         process_execution_payload(state, &block.body.execution_payload, config, engine)?;
     }
-    super::block::process_randao(state, &block.body.randao_reveal, options.randao)?;
+    super::block::process_randao(state, &block.body.randao_reveal, options.randao, signatures)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
     super::operations::process_operations(
         state,
@@ -94,8 +97,14 @@ pub fn process_block(
         config,
         committees,
         active_balances,
+        signatures,
     )?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
+    super::altair::process_sync_aggregate(
+        state,
+        &block.body.sync_aggregate,
+        active_balances,
+        signatures,
+    )?;
     Ok(())
 }
 
