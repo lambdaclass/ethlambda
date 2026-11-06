@@ -24,6 +24,7 @@ use ethlambda_blockchain::metrics::{BLOCK_ARRIVAL_PHASES, BLOCK_IMPORT_PHASES};
 use ethlambda_blockchain::{BlockChainServer, ImportOutcome};
 use ethlambda_p2p::beacon::decode;
 use ethlambda_state_transition::beacon::fork_choice;
+use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCacheExt as _;
 use ethlambda_storage::Store;
 use ethlambda_storage::backend::RocksDBBackend;
 use ethlambda_types::ShortRoot;
@@ -123,10 +124,17 @@ pub(crate) async fn replay_corpus(dir: &Path, options: &ReplayOptions) -> eyre::
         BlockChainServer::for_replay(store, None, options.safe_slots_to_import_optimistically);
 
     let mut samples = Vec::with_capacity(manifest.slots.len());
+    // The epoch of the block imported before the one in hand, for
+    // `--warm-committee-sums`.
+    let mut previous_epoch: Option<u64> = None;
 
     let warmup_total = manifest.warmup_slots.len();
     for (position, &slot) in manifest.warmup_slots.iter().enumerate() {
         let (block, block_root) = load_block(dir, &config, &mut clock, slot)?;
+        if options.warm_committee_sums {
+            warm_committee_sums(&clock, &block, previous_epoch)?;
+        }
+        previous_epoch = Some(slot / preset::SLOTS_PER_EPOCH);
         let wall_seconds = import(&mut server, block, slot, block_root).await?;
         eprintln!(
             "warm-up {}/{warmup_total}: slot {slot} imported in {}",
@@ -139,6 +147,12 @@ pub(crate) async fn replay_corpus(dir: &Path, options: &ReplayOptions) -> eyre::
     let total = manifest.slots.len();
     for (iteration, &slot) in manifest.slots.iter().enumerate() {
         let (block, block_root) = load_block(dir, &config, &mut clock, slot)?;
+        // Before the timer starts, so the warm-up is in no phase and no
+        // `wall_seconds`.
+        if options.warm_committee_sums {
+            warm_committee_sums(&clock, &block, previous_epoch)?;
+        }
+        previous_epoch = Some(slot / preset::SLOTS_PER_EPOCH);
 
         let timer = PhaseTimer::start(IMPORT_PHASE_HISTOGRAM);
         let wall_seconds = import(&mut server, block, slot, block_root).await?;
@@ -164,7 +178,12 @@ pub(crate) async fn replay_corpus(dir: &Path, options: &ReplayOptions) -> eyre::
 
     Ok(Report::new(
         Environment::collect(),
-        params_from(&manifest, dir, options.block_delay),
+        params_from(
+            &manifest,
+            dir,
+            options.block_delay,
+            options.warm_committee_sums,
+        ),
         samples,
     ))
 }
@@ -196,6 +215,48 @@ fn load_block(
     clock.set_time_ms(slot_start_ms)?;
 
     Ok((block, block_root))
+}
+
+/// Warms the committee key sums a live node's epoch precompute worker would
+/// have warmed before `block` arrives: its epoch's, when that epoch is later
+/// than `previous_epoch`'s, and, before the first block of the replay
+/// (`previous_epoch` is `None`), the epoch before as well.
+///
+/// The worker advances the head's post-state to the epoch start and warms
+/// from that state; this does the same from the block's parent post-state, so
+/// the shuffling key it files the sums under is the one the import looks up.
+/// Nothing else the worker does is reproduced: in a replay the import
+/// already produces the epoch's state itself, inside the measured span.
+fn warm_committee_sums(
+    store: &Store,
+    block: &SignedBeaconBlock,
+    previous_epoch: Option<u64>,
+) -> eyre::Result<()> {
+    let epoch = block.slot() / preset::SLOTS_PER_EPOCH;
+    let epochs: Vec<u64> = match previous_epoch {
+        None => epoch.checked_sub(1).into_iter().chain([epoch]).collect(),
+        Some(previous) if epoch > previous => vec![epoch],
+        Some(_) => return Ok(()),
+    };
+    let parent_root = block.parent_root();
+    let parent_state = store.get_state(&parent_root)?.ok_or_else(|| {
+        eyre::eyre!(
+            "no post-state for parent {} of the block at slot {}",
+            ShortRoot(&parent_root.0),
+            block.slot()
+        )
+    })?;
+    let config = store.config();
+    let committee_cache = store.committee_cache();
+    for epoch in epochs {
+        if parent_state.slot() < epoch * preset::SLOTS_PER_EPOCH {
+            let advanced = fork_choice::advance_to_epoch_start(&parent_state, epoch, &config)?;
+            committee_cache.warm_key_sums(&advanced, epoch);
+        } else {
+            committee_cache.warm_key_sums(&parent_state, epoch);
+        }
+    }
+    Ok(())
 }
 
 /// Import one block, returning the wall time of the `import_block` call
@@ -240,7 +301,12 @@ fn read_anchor(dir: &Path, config: &Config) -> eyre::Result<(BeaconState, Signed
 
 /// The report parameters a manifest already carries, so the loop above never
 /// has to reconstruct them from samples.
-fn params_from(manifest: &Manifest, dir: &Path, block_delay_ms: u64) -> Params {
+fn params_from(
+    manifest: &Manifest,
+    dir: &Path,
+    block_delay_ms: u64,
+    warm_committee_sums: bool,
+) -> Params {
     Params {
         mode: "import",
         corpus: dir.display().to_string(),
@@ -252,6 +318,7 @@ fn params_from(manifest: &Manifest, dir: &Path, block_delay_ms: u64) -> Params {
         range_end: manifest.range_end,
         blocks: manifest.slots.len(),
         block_delay_ms,
+        warm_committee_sums,
     }
 }
 

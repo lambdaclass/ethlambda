@@ -63,10 +63,11 @@ use crate::beacon::helpers::electra::{g2_point_at_infinity, get_committee_indice
 use crate::beacon::helpers::gloas::{
     add_builder_to_registry, can_builder_cover_bid, convert_builder_index_to_validator_index,
     convert_validator_index_to_builder_index, get_attestation_participation_flag_indices,
-    get_indexed_attestation, get_indexed_payload_attestation, gloas_state, gloas_state_ref,
-    indexed_attestation_signature_set, indexed_payload_attestation_signature_set,
-    initiate_builder_exit, is_active_builder, is_attestation_same_slot, is_builder_index,
-    is_builder_withdrawal_credential, settle_builder_payment,
+    get_indexed_attestation, get_indexed_payload_attestation, gloas_attestation_signature_set,
+    gloas_state, gloas_state_ref, indexed_attestation_signature_set,
+    indexed_payload_attestation_signature_set, initiate_builder_exit, is_active_builder,
+    is_attestation_same_slot, is_builder_index, is_builder_withdrawal_credential,
+    settle_builder_payment,
 };
 use crate::beacon::helpers::misc::{compute_domain, compute_epoch_at_slot, compute_signing_root};
 use crate::beacon::helpers::mutators::{decrease_balance, increase_balance, slash_validator};
@@ -1423,7 +1424,7 @@ pub fn process_attestation(
 
     let indexed_attestation = get_indexed_attestation(state, attestation, committees)?;
     signatures.push(
-        indexed_attestation_signature_set(state, &indexed_attestation),
+        gloas_attestation_signature_set(state, attestation, &indexed_attestation, committees),
         "process_attestation: is_valid_indexed_attestation(state, get_indexed_attestation(state, attestation))",
     )?;
 

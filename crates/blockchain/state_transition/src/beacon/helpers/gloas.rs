@@ -187,6 +187,30 @@ pub fn indexed_attestation_signature_set_with_domain(
     SignatureSet::fast_aggregate(&pubkeys, signing_root, &indexed_attestation.signature)
 }
 
+/// [`super::electra::electra_attestation_signature_set`] for a gloas
+/// attestation: the same checks, plus the length bound the container no longer
+/// enforces (`MAX_VALIDATORS_PER_SLOT`), checked first as
+/// [`indexed_attestation_signature_set_with_domain`] does.
+pub fn gloas_attestation_signature_set(
+    state: &BeaconState,
+    attestation: &gloas::Attestation,
+    indexed_attestation: &gloas::IndexedAttestation,
+    committees: &CommitteeCache,
+) -> Option<SignatureSet> {
+    if indexed_attestation.attesting_indices.len() > preset::MAX_VALIDATORS_PER_SLOT {
+        return None;
+    }
+    super::electra::attestation_signature_set(
+        state,
+        &indexed_attestation.data,
+        &indexed_attestation.signature,
+        &indexed_attestation.attesting_indices,
+        &attestation.committee_bits,
+        |bit| attestation.aggregation_bits.get(bit).unwrap_or(false),
+        committees,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Attestations
 // ---------------------------------------------------------------------------
