@@ -28,6 +28,12 @@ pub fn cheap_checks(
     block: &SignedBeaconBlock,
     now_ms: u64,
 ) -> Result<(), Outcome> {
+    // TODO(eip8453): EIP-8453 blocks have their own gossip rules
+    // (`p2p-interface.md`); until this node follows the fork they are
+    // ignored rather than judged by an earlier fork's.
+    if matches!(block, SignedBeaconBlock::Eip8453(_)) {
+        return Err(Outcome::Ignore(IgnoreReason::UnsupportedFork));
+    }
     if let Some(gloas_block) = as_gloas(block, "block::cheap_checks") {
         return cheap_checks_gloas(seen, store, gloas_block, now_ms);
     }
@@ -129,6 +135,10 @@ fn body_operations_within_limits(block: GloasBlockRef<'_>) -> bool {
 /// rebuild the state from diffs, which is far too slow for a verdict that
 /// gossipsub waits on. A miss queues the block instead.
 pub fn stateful_checks(store: &Store, block: &SignedBeaconBlock, block_root: Root) -> Outcome {
+    // TODO(eip8453): see `cheap_checks`.
+    if matches!(block, SignedBeaconBlock::Eip8453(_)) {
+        return Outcome::Ignore(IgnoreReason::UnsupportedFork);
+    }
     let gloas_block = as_gloas(block, "block::stateful_checks");
     let config = store.config();
     let parent_root = block.parent_root();

@@ -758,8 +758,9 @@ computes the same value another way.
   `ForkName::Eip8453.is_followed()` answers `false`, so an anchor at the fork
   is refused and a scheduled fork is warned about. Fork choice refuses an
   EIP-8453 block (`on_block` answers `UnsupportedForFork`), gossip ignores its
-  attestations, aggregates and attester slashings (`DecodeError::UnsupportedFork`)
-  and subscribes heze's topics under its digest, and the Beacon API refuses its
+  blocks (`IgnoreReason::UnsupportedFork`) and its attestations, aggregates and
+  attester slashings (`DecodeError::UnsupportedFork`) and subscribes heze's
+  topics under its digest, and the Beacon API refuses its
   finality checkpoints, attestation data, submissions and block production.
   Each such site is marked `TODO(eip8453)`.
 - **Why:** those layers are later phases of the port.
