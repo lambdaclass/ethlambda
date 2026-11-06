@@ -1,16 +1,15 @@
-//! Decoupled consensus protocol payloads, shared by both chains.
+//! Decoupled consensus (EIP-8453) payloads shared by the engine and the lean
+//! chain.
 //!
-//! The unsigned objects of the decoupled consensus protocol (Goldfish votes,
-//! combined attestations, the finality gadget's chain state), as formalized in
-//! `fradamt/verified-consensus` (`docs/PROTOCOL.md`). The protocol logic lives
-//! in `ethlambda-decoupled`; these live here so that the lean and the beacon
-//! wire containers, which this crate defines, can embed them.
-//!
-//! SSZ has no `Option`, so an optional field is a list of at most one
-//! element, which keeps the encoding canonical.
+//! The objects of EIP-8453's finality gadget (FG) and available chain (AC), as
+//! specified on consensus-specs branch `decoupled-consensus` at
+//! `0f4fa3ffdd26ec083ff4dba65645d81433178413` (`specs/_features/eip8453/`).
+//! The protocol logic lives in `ethlambda-decoupled`; the unsigned objects live
+//! here so the lean wire containers (`crate::lean_decoupled`), which this crate
+//! defines, can embed them. A beacon host builds the same values from its own
+//! containers (`HeightCheckpoint` and `HeadVoteData` have the same fields).
 
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
-use libssz_types::{SszBitlist, SszList};
 use serde::{Deserialize, Serialize};
 
 use crate::primitives::H256;
@@ -20,207 +19,219 @@ pub type Round = u64;
 pub type Height = u64;
 pub type ValidatorIndex = u64;
 
-/// The upper bound used for every per-validator bit list.
+/// A fork-choice node's payload dimension (gloas `PayloadStatus`): whether a
+/// [`ForkChoiceNode`] stands for a block whose payload is known empty, known
+/// full, or not yet decided.
 ///
-/// Matches the beacon chain's `VALIDATOR_REGISTRY_LIMIT`, so one chain-state
-/// type serves both chains.
-pub const VALIDATOR_LIMIT: usize = 1 << 40;
+/// The discriminants are the specification's (`PAYLOAD_STATUS_EMPTY = 0`,
+/// `PAYLOAD_STATUS_FULL = 1`, `PAYLOAD_STATUS_PENDING = 2`), and
+/// `get_payload_status_tiebreaker` compares them as integers.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum PayloadStatus {
+    Empty = 0,
+    Full = 1,
+    #[default]
+    Pending = 2,
+}
 
-/// A Goldfish vote `(val_index, s, B)` (appendix A.2): validator `validator`,
-/// a member of slot `slot`'s committee, votes for head `head`.
+impl From<PayloadStatus> for u8 {
+    fn from(status: PayloadStatus) -> Self {
+        status as u8
+    }
+}
+
+impl TryFrom<u8> for PayloadStatus {
+    type Error = u8;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Empty),
+            1 => Ok(Self::Full),
+            2 => Ok(Self::Pending),
+            other => Err(other),
+        }
+    }
+}
+
+/// A block and one of its payload branches (gloas `ForkChoiceNode`).
+///
+/// A host without execution payloads (lean) has a `Pending` and an `Empty`
+/// node per block and never a `Full` one.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default,
+)]
+pub struct ForkChoiceNode {
+    pub root: H256,
+    pub payload_status: PayloadStatus,
+}
+
+impl ForkChoiceNode {
+    pub fn pending(root: H256) -> Self {
+        Self {
+            root,
+            payload_status: PayloadStatus::Pending,
+        }
+    }
+
+    pub fn empty(root: H256) -> Self {
+        Self {
+            root,
+            payload_status: PayloadStatus::Empty,
+        }
+    }
+
+    pub fn full(root: H256) -> Self {
+        Self {
+            root,
+            payload_status: PayloadStatus::Full,
+        }
+    }
+}
+
+/// `HeightCheckpoint` (beacon-chain.md): a height of the finality gadget and
+/// its target block.
+///
+/// [`HeightCheckpoint::empty`] stands for an absent finality pair.
 #[derive(
     Debug,
     Clone,
     Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    Serialize,
-    Deserialize,
-    SszEncode,
-    SszDecode,
-    HashTreeRoot,
-)]
-pub struct GoldfishVote {
-    pub validator: ValidatorIndex,
-    pub slot: Slot,
-    pub head: H256,
-}
-
-/// A height pair `(h, T, τ)` (appendix A.9).
-///
-/// `timeout = false` is a target vote naming the block `entry` that brought
-/// the chain into height `height`. `timeout = true` is a timeout; it still
-/// names the entry it times out at, and a chain counts it only when the entry
-/// is the chain's own (the formalization's `matchesEntry`).
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    Serialize,
-    Deserialize,
-    SszEncode,
-    SszDecode,
-    HashTreeRoot,
-)]
-pub struct HeightVote {
-    pub height: Height,
-    pub entry: H256,
-    pub timeout: bool,
-}
-
-/// A finality pair `(h_f, T_f)` with `T_f ≠ ⊥` (appendix A.9).
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    Serialize,
-    Deserialize,
-    SszEncode,
-    SszDecode,
-    HashTreeRoot,
-)]
-pub struct FinalityVote {
-    pub height: Height,
-    pub target: H256,
-}
-
-/// Everything a combined attestation says, minus the signer (appendix A.9):
-/// `(round, safe, height pair, finality pair)`.
-///
-/// This is what validators sign, and what the beacon host aggregates over:
-/// honest validators with the same view emit identical data.
-#[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    Hash,
     Default,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
     Serialize,
     Deserialize,
     SszEncode,
     SszDecode,
     HashTreeRoot,
 )]
-#[serde(into = "AttestationDataJson", from = "AttestationDataJson")]
-pub struct AttestationData {
-    pub round: Round,
-    /// The safe block, or empty for `⊥`. Honest validators always vote a
-    /// block; `⊥` only appears in adversarial votes.
-    pub safe: SszList<H256, 1>,
-    pub height_pair: SszList<HeightVote, 1>,
-    pub finality_pair: SszList<FinalityVote, 1>,
+pub struct HeightCheckpoint {
+    pub height: Height,
+    pub root: H256,
 }
 
-impl AttestationData {
-    pub fn new(
-        round: Round,
-        safe: Option<H256>,
-        height_pair: Option<HeightVote>,
-        finality_pair: Option<FinalityVote>,
-    ) -> Self {
-        Self {
-            round,
-            safe: option_list(safe),
-            height_pair: option_list(height_pair),
-            finality_pair: option_list(finality_pair),
-        }
+impl HeightCheckpoint {
+    pub fn new(height: Height, root: H256) -> Self {
+        Self { height, root }
     }
 
-    pub fn safe(&self) -> Option<H256> {
-        self.safe.first().copied()
+    /// `HeightCheckpoint.empty()`.
+    pub fn empty() -> Self {
+        Self::default()
     }
 
-    pub fn height_pair(&self) -> Option<HeightVote> {
-        self.height_pair.first().copied()
-    }
-
-    pub fn finality_pair(&self) -> Option<FinalityVote> {
-        self.finality_pair.first().copied()
+    pub fn is_empty(&self) -> bool {
+        *self == Self::empty()
     }
 }
 
-/// The JSON shape of [`AttestationData`]: absent fields are `null`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct AttestationDataJson {
-    round: Round,
-    safe: Option<H256>,
-    height_pair: Option<HeightVote>,
-    finality_pair: Option<FinalityVote>,
-}
-
-impl From<AttestationData> for AttestationDataJson {
-    fn from(data: AttestationData) -> Self {
-        Self {
-            round: data.round,
-            safe: data.safe(),
-            height_pair: data.height_pair(),
-            finality_pair: data.finality_pair(),
-        }
-    }
-}
-
-impl From<AttestationDataJson> for AttestationData {
-    fn from(json: AttestationDataJson) -> Self {
-        Self::new(json.round, json.safe, json.height_pair, json.finality_pair)
-    }
-}
-
-fn option_list<T>(value: Option<T>) -> SszList<T, 1> {
-    let items: Vec<T> = value.into_iter().collect();
-    SszList::try_from(items).expect("at most one element fits a list of one")
-}
-
-/// A combined attestation `(val_index, round, safe, h, T, τ, h_f, T_f)`
-/// (appendix A.9). Its SG projection is `(validator, round, safe)`.
+/// `AttestationData` (beacon-chain.md, modified): the height pair is
+/// `(target, timeout)`, a target vote when `timeout` is false and a timeout
+/// when it is true; the finality pair is `finality`, the empty checkpoint when
+/// absent.
 #[derive(
-    Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
-pub struct Attestation {
-    pub validator: ValidatorIndex,
-    pub data: AttestationData,
+pub struct AttestationData {
+    pub target: HeightCheckpoint,
+    pub timeout: bool,
+    pub finality: HeightCheckpoint,
 }
 
-impl Attestation {
-    pub fn round(&self) -> Round {
-        self.data.round
-    }
+/// `HeadVoteData` (beacon-chain.md): a head vote of `slot` for a block and one
+/// of its payload branches.
+///
+/// `payload_status` is the wire byte; [`HeadVoteData::payload_status`] reads it,
+/// `None` for a value outside the three statuses (which
+/// `is_valid_head_vote_message` refuses). The spec names the block field
+/// `beacon_block_root`; on lean it is the decoupled block's root.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
+pub struct HeadVoteData {
+    pub slot: Slot,
+    pub block_root: H256,
+    pub payload_status: u8,
+}
 
-    /// The SG projection `(val_index, round, safe)` every SG rule and grade
-    /// reads (PROTOCOL.md §1.4).
-    pub fn sg_key(&self) -> SgKey {
-        SgKey {
-            validator: self.validator,
-            round: self.data.round,
-            safe: self.data.safe(),
+impl HeadVoteData {
+    pub fn new(slot: Slot, node: ForkChoiceNode) -> Self {
+        Self {
+            slot,
+            block_root: node.root,
+            payload_status: node.payload_status.into(),
         }
     }
+
+    pub fn payload_status(&self) -> Option<PayloadStatus> {
+        PayloadStatus::try_from(self.payload_status).ok()
+    }
+
+    /// The node the vote supports, when its status byte is valid.
+    pub fn supported_node(&self) -> Option<ForkChoiceNode> {
+        Some(ForkChoiceNode {
+            root: self.block_root,
+            payload_status: self.payload_status()?,
+        })
+    }
 }
 
-/// The SG projection of a combined attestation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SgKey {
-    pub validator: ValidatorIndex,
-    pub round: Round,
-    pub safe: Option<H256>,
+/// `HeadVoteMessage` without its signature: what one committee member says.
+/// Each chain wraps it in its own signed envelope.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
+pub struct HeadVoteMessage {
+    pub validator_index: ValidatorIndex,
+    pub data: HeadVoteData,
 }
 
-/// A block identified by root and slot. The chain state keeps these instead
-/// of whole blocks: the slot of the height entry gates timeouts, and the slot
-/// of a justified or finalized block maps it to a host checkpoint.
+/// A block identified by root and slot, for status reports.
 #[derive(
     Debug,
     Clone,
@@ -240,95 +251,33 @@ pub struct BlockRef {
     pub slot: Slot,
 }
 
-/// One bit per validator, sized to the electorate.
-pub type ValidatorBits = SszBitlist<VALIDATOR_LIMIT>;
-
-/// The chain state σ (§1.3).
-#[derive(
-    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SszEncode, SszDecode, HashTreeRoot,
-)]
-pub struct ChainState {
-    /// `L`: the latest block.
-    pub latest: BlockRef,
-    /// `s = L.slot`.
-    pub slot: Slot,
-    /// `h`: the current height.
-    pub height: Height,
-    /// `T_h`: the block that brought the chain into height `h`.
-    pub entry: BlockRef,
-    /// `nj`: computed on entry into `h`, fixed until the height changes.
-    pub nonjustifiable: bool,
-    /// `target_participation`, `Q_target`.
-    #[serde(skip)]
-    pub target_participation: ValidatorBits,
-    /// `progress`, `Q_prog`.
-    #[serde(skip)]
-    pub progress: ValidatorBits,
-    /// `finalize`, `Q_finality`.
-    #[serde(skip)]
-    pub finalize: ValidatorBits,
-    /// `J`: the latest justification on the chain.
-    pub justified: BlockRef,
-    /// `h_j`: its height.
-    pub justified_height: Height,
-    /// `F`: the latest finalization on the chain.
-    pub finalized: BlockRef,
-    /// `h_F`: its height.
-    pub finalized_height: Height,
-}
-
-impl ChainState {
-    /// The initial state: `L = T_h = J = F = B_gen`, `s = 0`, `h = 1`,
-    /// `h_j = h_F = 0`, `nj = false`, every bit clear (§1.3).
-    ///
-    /// `anchor` is genesis on a chain that runs the protocol from slot 0.
-    pub fn initial(anchor: BlockRef, validator_count: usize) -> Self {
-        let empty = empty_bits(validator_count);
-        Self {
-            latest: anchor,
-            slot: anchor.slot,
-            height: 1,
-            entry: anchor,
-            nonjustifiable: false,
-            target_participation: empty.clone(),
-            progress: empty.clone(),
-            finalize: empty,
-            justified: anchor,
-            justified_height: 0,
-            finalized: anchor,
-            finalized_height: 0,
-        }
-    }
-}
-
-fn empty_bits(validator_count: usize) -> ValidatorBits {
-    ValidatorBits::with_length(validator_count).expect("validator count within the registry limit")
-}
-
-/// A node's view of the three chains and the finality gadget, for operators
-/// and tests: what `GET /lean/v0/decoupled/status` and the beacon node's
-/// decoupled status endpoint serve.
+/// A node's view of the available chain and the finality gadget, for
+/// operators and tests: what `GET /lean/v0/decoupled/status` serves.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecoupledStatus {
     /// The node's protocol clock.
     pub slot: Slot,
     pub round: Round,
-    /// The fork-choice head.
+    /// `get_head(store)`.
     pub head: BlockRef,
-    /// `get_confirmed(Σ)`: the available chain's tip.
+    pub head_payload_status: PayloadStatus,
+    /// `get_confirmed_node(store)`: the confirmed tip an execution layer
+    /// would read as its safe block.
     pub confirmed: BlockRef,
-    /// `get_stable(Σ)`: the stable chain's tip.
-    pub stable: BlockRef,
-    /// `Σ.F` and the height it was justified at.
-    pub finalized: BlockRef,
-    pub finalized_height: Height,
-    /// `Σ.J`, `Σ.h_j`.
-    pub justified: BlockRef,
-    pub justified_height: Height,
-    /// `Σ.h_max`.
+    /// `store.latest_confirmed`.
+    pub latest_confirmed: BlockRef,
+    /// `store.finalized_checkpoint` and its block's slot.
+    pub finalized: HeightCheckpoint,
+    pub finalized_slot: Slot,
+    /// `store.justified_checkpoint` and its block's slot.
+    pub justified: HeightCheckpoint,
+    pub justified_slot: Slot,
+    /// `store.max_height`.
     pub max_height: Height,
-    /// `Σ.live_confirmed`, the protocol-facing confirmation.
-    pub live_confirmed: H256,
+    /// `is_fg_contest(store)`.
+    pub fg_contest: bool,
+    /// Live AC locks.
+    pub live_locks: u64,
     /// Blocks in the processed tree.
     pub blocks: u64,
 }
@@ -336,3 +285,39 @@ pub struct DecoupledStatus {
 /// The latest [`DecoupledStatus`], written by a chain actor and read by the
 /// HTTP server. `None` until the actor's first tick.
 pub type SharedDecoupledStatus = std::sync::Arc<std::sync::RwLock<Option<DecoupledStatus>>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::primitives::HashTreeRoot as _;
+    use libssz::{SszDecode as _, SszEncode as _};
+
+    #[test]
+    fn payload_status_round_trips_through_its_byte() {
+        for status in [
+            PayloadStatus::Empty,
+            PayloadStatus::Full,
+            PayloadStatus::Pending,
+        ] {
+            assert_eq!(PayloadStatus::try_from(u8::from(status)), Ok(status));
+        }
+        assert_eq!(PayloadStatus::try_from(3), Err(3));
+    }
+
+    #[test]
+    fn attestation_data_encodes_as_three_fields() {
+        let data = AttestationData {
+            target: HeightCheckpoint::new(3, H256([1; 32])),
+            timeout: true,
+            finality: HeightCheckpoint::empty(),
+        };
+        let bytes = data.to_ssz();
+        // Two checkpoints of 8 + 32 bytes and one boolean byte.
+        assert_eq!(bytes.len(), 2 * 40 + 1);
+        assert_eq!(AttestationData::from_ssz_bytes(&bytes).unwrap(), data);
+        assert_ne!(
+            data.hash_tree_root(),
+            AttestationData::default().hash_tree_root()
+        );
+    }
+}
