@@ -1063,6 +1063,12 @@ fn transition_block(
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
 ) -> (BeaconState, Result<()>) {
+    // Every STF phase observed below is the import's, and none of it belongs
+    // to the epoch precompute worker, which runs `process_epoch` on its own
+    // thread at the same time and so never sees this guard. See
+    // `metrics::StfContext` for why the series is split by caller.
+    let _import_context = metrics::import_context();
+
     let block_slot = signed_block.slot();
     let epoch = compute_epoch_at_slot(block_slot);
     let epoch_start = compute_start_slot_at_epoch(epoch);

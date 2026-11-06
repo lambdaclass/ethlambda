@@ -73,6 +73,8 @@ use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{HashTreeRoot as _, Slot};
 use crate::beacon::{bls, config::Config, constants};
+use crate::metrics::{StfPhase, observe_stf_phase, timed};
+use std::time::{Duration, Instant};
 
 /// What the execution layer would answer for a block's payload.
 ///
@@ -178,10 +180,10 @@ pub fn apply_block(
     )?;
 
     if validate_result {
-        verify(
-            verify_block_signature(state, signed_block),
-            "block signature",
-        )?;
+        let signature_valid = timed(StfPhase::BlockSignature, || {
+            verify_block_signature(state, signed_block)
+        });
+        verify(signature_valid, "block signature")?;
     }
 
     block::process_block(
@@ -193,15 +195,24 @@ pub fn apply_block(
         active_balances,
         block::BlockProcessingOptions::default(),
     )?;
-    // As in `process_slot`: the post-state's root, checked below and needed
-    // again in the next slot, is then computed on the state's own nodes.
-    state.apply_pending_mutations();
 
+    // As in `process_slot`: the post-state's root, checked below and needed
+    // again in the next slot, is then computed on the state's own nodes. The
+    // flush and the hash are one phase: the flush is what makes the hash run
+    // on, and cache into, those nodes, and a caller that does not validate
+    // pays the flush alone without ever naming it, so it is not worth a series
+    // of its own.
     if validate_result {
+        let state_root_matches = timed(StfPhase::StateRoot, || {
+            state.apply_pending_mutations();
+            signed_block.state_root() == state.hash_tree_root()
+        });
         verify(
-            signed_block.state_root() == state.hash_tree_root(),
+            state_root_matches,
             "block state root matches the post-state",
         )?;
+    } else {
+        state.apply_pending_mutations();
     }
 
     Ok(())
@@ -228,12 +239,22 @@ pub fn verify_block_signature(
 pub fn process_slots(state: &mut BeaconState, slot: Slot, config: &Config) -> Result<()> {
     verify(state.slot() < slot, "target slot is after the current slot")?;
 
+    // The epoch work is timed on its own and taken out of this call's total,
+    // so the two phases add up to the call instead of the second containing
+    // the first.
+    let started = Instant::now();
+    let mut epoch_work = Duration::ZERO;
+
     while state.slot() < slot {
         process_slot(state)?;
         // Epoch processing runs on the last slot of an epoch, before the counter
         // moves into the next one.
         if (state.slot() + 1).is_multiple_of(preset::SLOTS_PER_EPOCH) {
+            let epoch_started = Instant::now();
             epoch::process_epoch(state, config)?;
+            let elapsed = epoch_started.elapsed();
+            observe_stf_phase(StfPhase::ProcessEpoch, elapsed);
+            epoch_work += elapsed;
         }
         *state.slot_mut() += 1;
         upgrade_at_fork_boundary(state, config)?;
@@ -246,6 +267,13 @@ pub fn process_slots(state: &mut BeaconState, slot: Slot, config: &Config) -> Re
     // otherwise be cloned and cached with the whole epoch's writes still
     // pending.
     state.apply_pending_mutations();
+
+    // Only a call that got this far is observed: a rejected target slot or a
+    // failed epoch leaves no state worth attributing time to.
+    observe_stf_phase(
+        StfPhase::ProcessSlots,
+        started.elapsed().saturating_sub(epoch_work),
+    );
 
     Ok(())
 }
@@ -484,6 +512,39 @@ mod tests {
         process_slots(&mut state, target_slot, &config).unwrap();
 
         assert!(!state.has_pending_mutations());
+    }
+
+    /// The epoch work is observed once per boundary and under its own label,
+    /// and the plain slot work once per call, so the two never double count.
+    /// Which context they land in follows the thread's guard, which is what
+    /// keeps the precompute worker's `process_epoch` out of an import's.
+    #[test]
+    fn process_slots_observes_epoch_work_apart_from_slot_work() {
+        use crate::metrics::{import_context, take_observation_log};
+
+        let config = Config::mainnet();
+        let mut state = test_state::with_validators(4);
+        let two_epochs = state.slot() + 2 * preset::SLOTS_PER_EPOCH;
+
+        take_observation_log();
+        process_slots(&mut state, two_epochs, &config).unwrap();
+        assert_eq!(
+            take_observation_log(),
+            [
+                ("other", StfPhase::ProcessEpoch),
+                ("other", StfPhase::ProcessEpoch),
+                ("other", StfPhase::ProcessSlots),
+            ]
+        );
+
+        let _import = import_context();
+        let one_slot = state.slot() + 1;
+        process_slots(&mut state, one_slot, &config).unwrap();
+        assert_eq!(
+            take_observation_log(),
+            [("import", StfPhase::ProcessSlots)],
+            "a call that crosses no boundary runs no epoch work"
+        );
     }
 
     #[test]
