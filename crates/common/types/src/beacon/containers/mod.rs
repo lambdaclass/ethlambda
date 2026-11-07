@@ -2401,6 +2401,54 @@ impl SignedBeaconBlock {
             SignedBeaconBlock::Lean(_) => lean_block_unreachable("gloas_message"),
         }
     }
+
+    /// The signed execution payload bid of a block whose payload arrives in a
+    /// separate envelope: gloas, heze and EIP-8453, which keep gloas's bid.
+    /// `None` for every fork before gloas.
+    ///
+    /// Separate from [`Self::gloas_message`]: an EIP-8453 block has gloas's
+    /// payload shape (bid, envelope, PTC) but not its attestations, so the
+    /// readers that only want the payload half (envelope checks, the
+    /// execution layer, payload links) read the bid here.
+    pub fn payload_bid(&self) -> Option<&gloas::SignedExecutionPayloadBid> {
+        match self {
+            SignedBeaconBlock::Gloas(block) => {
+                Some(&block.message.body.signed_execution_payload_bid)
+            }
+            SignedBeaconBlock::Heze(block) => {
+                Some(&block.message.body.signed_execution_payload_bid)
+            }
+            SignedBeaconBlock::Eip8453(block) => {
+                Some(&block.message.body.signed_execution_payload_bid)
+            }
+            SignedBeaconBlock::Phase0(_)
+            | SignedBeaconBlock::Altair(_)
+            | SignedBeaconBlock::Bellatrix(_)
+            | SignedBeaconBlock::Capella(_)
+            | SignedBeaconBlock::Deneb(_)
+            | SignedBeaconBlock::Electra(_)
+            | SignedBeaconBlock::Fulu(_) => None,
+            SignedBeaconBlock::Lean(_) => lean_block_unreachable("payload_bid"),
+        }
+    }
+
+    /// The payload attestations of a gloas-family block (gloas, heze,
+    /// EIP-8453), `None` before gloas.
+    pub fn payload_attestations(&self) -> Option<&gloas::PayloadAttestations> {
+        match self {
+            SignedBeaconBlock::Gloas(block) => Some(&block.message.body.payload_attestations),
+            SignedBeaconBlock::Heze(block) => Some(&block.message.body.payload_attestations),
+            SignedBeaconBlock::Eip8453(block) => Some(&block.message.body.payload_attestations),
+            SignedBeaconBlock::Phase0(_)
+            | SignedBeaconBlock::Altair(_)
+            | SignedBeaconBlock::Bellatrix(_)
+            | SignedBeaconBlock::Capella(_)
+            | SignedBeaconBlock::Deneb(_)
+            | SignedBeaconBlock::Electra(_)
+            | SignedBeaconBlock::Fulu(_) => None,
+            SignedBeaconBlock::Lean(_) => lean_block_unreachable("payload_attestations"),
+        }
+    }
 }
 
 /// An unsigned gloas-family block, as a proposer builds one: gloas's or heze's.

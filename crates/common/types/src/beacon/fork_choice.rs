@@ -295,11 +295,70 @@ impl JustifiedBalances {
     }
 }
 
+// EIP-8453's fork choice engine (`ethlambda-decoupled`) keeps its own copies of
+// gloas's node types in `crate::decoupled`, with the same discriminants and
+// fields, so a beacon host converts at the boundary.
+
+impl From<PayloadStatus> for crate::decoupled::PayloadStatus {
+    fn from(status: PayloadStatus) -> Self {
+        match status {
+            PayloadStatus::Empty => Self::Empty,
+            PayloadStatus::Full => Self::Full,
+            PayloadStatus::Pending => Self::Pending,
+        }
+    }
+}
+
+impl From<crate::decoupled::PayloadStatus> for PayloadStatus {
+    fn from(status: crate::decoupled::PayloadStatus) -> Self {
+        match status {
+            crate::decoupled::PayloadStatus::Empty => Self::Empty,
+            crate::decoupled::PayloadStatus::Full => Self::Full,
+            crate::decoupled::PayloadStatus::Pending => Self::Pending,
+        }
+    }
+}
+
+impl From<ForkChoiceNode> for crate::decoupled::ForkChoiceNode {
+    fn from(node: ForkChoiceNode) -> Self {
+        Self {
+            root: node.root,
+            payload_status: node.payload_status.into(),
+        }
+    }
+}
+
+impl From<crate::decoupled::ForkChoiceNode> for ForkChoiceNode {
+    fn from(node: crate::decoupled::ForkChoiceNode) -> Self {
+        Self {
+            root: node.root,
+            payload_status: node.payload_status.into(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use libssz::{SszDecode as _, SszEncode as _};
 
     use super::*;
+
+    #[test]
+    fn nodes_convert_to_the_engines_and_back() {
+        for status in [
+            PayloadStatus::Empty,
+            PayloadStatus::Full,
+            PayloadStatus::Pending,
+        ] {
+            let node = ForkChoiceNode {
+                root: Root::repeat_byte(7),
+                payload_status: status,
+            };
+            let engine: crate::decoupled::ForkChoiceNode = node.into();
+            assert_eq!(u8::from(engine.payload_status), status as u8);
+            assert_eq!(ForkChoiceNode::from(engine), node);
+        }
+    }
 
     #[test]
     fn justified_balances_read_zero_past_the_registry() {

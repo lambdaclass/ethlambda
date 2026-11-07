@@ -642,11 +642,111 @@ pub fn empty_head_vote_committee_window() -> HeadVoteCommitteeWindow {
         .expect("the vector is built at its exact length")
 }
 
+// The fork choice engine (`ethlambda-decoupled`) works on the chain-agnostic
+// copies in `crate::decoupled`, which have the same fields (the engine names
+// `beacon_block_root` `block_root`, since lean votes for its own blocks).
+
+impl From<HeightCheckpoint> for crate::decoupled::HeightCheckpoint {
+    fn from(checkpoint: HeightCheckpoint) -> Self {
+        Self::new(checkpoint.height, checkpoint.root)
+    }
+}
+
+impl From<crate::decoupled::HeightCheckpoint> for HeightCheckpoint {
+    fn from(checkpoint: crate::decoupled::HeightCheckpoint) -> Self {
+        Self {
+            height: checkpoint.height,
+            root: checkpoint.root,
+        }
+    }
+}
+
+impl From<HeadVoteData> for crate::decoupled::HeadVoteData {
+    fn from(data: HeadVoteData) -> Self {
+        Self {
+            slot: data.slot,
+            block_root: data.beacon_block_root,
+            payload_status: data.payload_status,
+        }
+    }
+}
+
+impl From<crate::decoupled::HeadVoteData> for HeadVoteData {
+    fn from(data: crate::decoupled::HeadVoteData) -> Self {
+        Self {
+            slot: data.slot,
+            beacon_block_root: data.block_root,
+            payload_status: data.payload_status,
+        }
+    }
+}
+
+impl From<&HeadVoteMessage> for crate::decoupled::HeadVoteMessage {
+    /// The engine's message is the unsigned part: the signature is checked
+    /// before a message reaches the engine.
+    fn from(message: &HeadVoteMessage) -> Self {
+        Self {
+            validator_index: message.validator_index,
+            data: message.data.into(),
+        }
+    }
+}
+
+impl From<AttestationData> for crate::decoupled::AttestationData {
+    fn from(data: AttestationData) -> Self {
+        Self {
+            target: data.target.into(),
+            timeout: data.timeout,
+            finality: data.finality.into(),
+        }
+    }
+}
+
+impl From<crate::decoupled::AttestationData> for AttestationData {
+    fn from(data: crate::decoupled::AttestationData) -> Self {
+        Self {
+            target: data.target.into(),
+            timeout: data.timeout,
+            finality: data.finality.into(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use libssz::{SszDecode as _, SszEncode as _};
 
     use super::*;
+
+    #[test]
+    fn the_engines_copies_hash_and_encode_like_the_beacon_containers() {
+        let data = HeadVoteData {
+            slot: 9,
+            beacon_block_root: Root::repeat_byte(3),
+            payload_status: 1,
+        };
+        let engine: crate::decoupled::HeadVoteData = data.into();
+        assert_eq!(engine.to_ssz(), data.to_ssz());
+        assert_eq!(engine.hash_tree_root(), data.hash_tree_root());
+        assert_eq!(HeadVoteData::from(engine), data);
+
+        let checkpoint = HeightCheckpoint {
+            height: 4,
+            root: Root::repeat_byte(5),
+        };
+        let engine: crate::decoupled::HeightCheckpoint = checkpoint.into();
+        assert_eq!(engine.hash_tree_root(), checkpoint.hash_tree_root());
+        assert_eq!(HeightCheckpoint::from(engine), checkpoint);
+
+        let attestation = AttestationData {
+            target: checkpoint,
+            timeout: true,
+            finality: HeightCheckpoint::empty(),
+        };
+        let engine: crate::decoupled::AttestationData = attestation.into();
+        assert_eq!(engine.hash_tree_root(), attestation.hash_tree_root());
+        assert_eq!(AttestationData::from(engine), attestation);
+    }
     use crate::beacon::primitives::HashTreeRoot as _;
 
     #[test]
