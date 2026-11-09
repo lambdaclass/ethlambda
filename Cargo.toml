@@ -90,13 +90,13 @@ hex = "0.4"
 hmac = "0.12"
 base64 = "0.22"
 
-# spawned main 342b707b (v0.7.0 plus canary fixes) plus the unreleased spawned-test crate (lambdaclass/spawned#198). Every
+# spawned main b1a17e6c (v0.7.0 plus canary and drop-panic fixes) plus the unreleased spawned-test crate (lambdaclass/spawned#198). Every
 # spawned crate must name the same revision so they share one set of types.
 # `metrics`: the actor runtime's own counters (mailbox depth, queue wait,
 # handler time, actor exits), appended to `/metrics` by ethlambda-rpc.
-spawned-concurrency = { git = "https://github.com/lambdaclass/spawned", rev = "646cc0a4887b323e7e5231fa42d45509aa205ca5", features = ["metrics"] }
-spawned-rt = { git = "https://github.com/lambdaclass/spawned", rev = "646cc0a4887b323e7e5231fa42d45509aa205ca5" }
-spawned-test = { git = "https://github.com/lambdaclass/spawned", rev = "646cc0a4887b323e7e5231fa42d45509aa205ca5" }
+spawned-concurrency = { git = "https://github.com/lambdaclass/spawned", rev = "fc35abafe7a850aa27f4b511b60e28dc49b4a393", features = ["metrics"] }
+spawned-rt = { git = "https://github.com/lambdaclass/spawned", rev = "fc35abafe7a850aa27f4b511b60e28dc49b4a393" }
+spawned-test = { git = "https://github.com/lambdaclass/spawned", rev = "fc35abafe7a850aa27f4b511b60e28dc49b4a393" }
 tokio = "1.0"
 tokio-util = "0.7"
 
