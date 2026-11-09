@@ -107,89 +107,22 @@ fn count_drop(outcome: Outcome) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::time::Duration;
 
-    use ethlambda_network_api::{
-        AggregateArrival, BlockAnnouncement, BlockArrival, BlockSource, P2PToBlockChain,
+    use ethlambda_network_api::ToP2PToBlockChainRef as _;
+    use ethlambda_network_api::p2p_to_block_chain::{
+        DataColumnSidecarsAwaitingParent, NewDataColumnSidecars,
     };
-    use ethlambda_types::attestation::{SignedAggregatedAttestation, SignedAttestation};
     use ethlambda_types::beacon::config::Config;
-    use ethlambda_types::beacon::containers::{SignedAggregateAndProof, SignedBeaconBlock, gloas};
-    use ethlambda_types::beacon::primitives::{Root, ValidatorIndex};
-    use spawned_concurrency::error::ActorError;
-    use tokio::sync::mpsc;
+    use ethlambda_types::beacon::containers::gloas;
+    use ethlambda_types::beacon::primitives::Root;
+    use spawned_test::tasks::Mock;
 
     use super::*;
     use crate::test_support::{unconnected_beacon_server, valid_shaped_sidecar};
 
-    /// What [`check_and_forward`] sent the chain actor.
-    #[derive(Debug, PartialEq)]
-    enum Forwarded {
-        Checked(Vec<DataColumnSidecar>),
-        AwaitingParent(Vec<DataColumnSidecar>),
-    }
-
-    /// A chain actor stand-in that reports every sidecar batch it receives.
-    struct RecordingChain(mpsc::UnboundedSender<Forwarded>);
-
-    impl P2PToBlockChain for RecordingChain {
-        fn new_block(
-            &self,
-            _block: SignedBeaconBlock,
-            _source: BlockSource,
-            _arrival: BlockArrival,
-            _announcement: BlockAnnouncement,
-        ) -> Result<(), ActorError> {
-            Ok(())
-        }
-        fn new_attestation(&self, _attestation: SignedAttestation) -> Result<(), ActorError> {
-            Ok(())
-        }
-        fn new_aggregated_attestation(
-            &self,
-            _attestation: SignedAggregatedAttestation,
-        ) -> Result<(), ActorError> {
-            Ok(())
-        }
-        fn new_data_column_sidecars(
-            &self,
-            sidecars: Vec<DataColumnSidecar>,
-        ) -> Result<(), ActorError> {
-            let _ = self.0.send(Forwarded::Checked(sidecars));
-            Ok(())
-        }
-        fn data_column_sidecars_awaiting_parent(
-            &self,
-            sidecars: Vec<DataColumnSidecar>,
-        ) -> Result<(), ActorError> {
-            let _ = self.0.send(Forwarded::AwaitingParent(sidecars));
-            Ok(())
-        }
-        fn new_beacon_aggregate(
-            &self,
-            _aggregate: Box<SignedAggregateAndProof>,
-            _attesting_indices: Vec<ValidatorIndex>,
-            _arrival: AggregateArrival,
-        ) -> Result<(), ActorError> {
-            Ok(())
-        }
-        fn new_execution_payload_envelope(
-            &self,
-            _envelope: Box<
-                ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope,
-            >,
-            _arrival: BlockArrival,
-        ) -> Result<(), ActorError> {
-            Ok(())
-        }
-        fn new_payload_attestation_message(
-            &self,
-            _message: ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage,
-            _arrival: BlockArrival,
-        ) -> Result<(), ActorError> {
-            Ok(())
-        }
-    }
+    /// Long enough for the checks' blocking tasks on a loaded test machine.
+    const FORWARDED: Duration = Duration::from_secs(10);
 
     /// A sidecar the checks cannot judge yet goes back to the chain actor to
     /// be parked, and one they refuse goes nowhere: neither reaches the batch
@@ -197,8 +130,8 @@ mod tests {
     #[tokio::test]
     async fn only_what_passes_is_forwarded_as_checked() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
-        let (sender, mut received) = mpsc::unbounded_channel();
-        server.blockchain = Some(Arc::new(RecordingChain(sender)));
+        let chain = Mock::new().allow_sends().start();
+        server.blockchain = Some(chain.to_p2p_to_block_chain_ref());
 
         // Nothing in the store is its parent.
         let orphan = valid_shaped_sidecar(5, 0);
@@ -213,16 +146,12 @@ mod tests {
             ],
         );
 
-        assert_eq!(
-            received.recv().await,
-            Some(Forwarded::AwaitingParent(vec![DataColumnSidecar::Fulu(
-                orphan
-            )]))
-        );
-        // The task sends at most one message per kind and has now finished,
-        // so the channel closes with nothing else in it.
-        drop(server);
-        assert_eq!(received.recv().await, None);
+        let parked: DataColumnSidecarsAwaitingParent = chain.expect(FORWARDED).await;
+        assert_eq!(parked.sidecars, vec![DataColumnSidecar::Fulu(orphan)]);
+        // The task sends its checked batch, if it has one, before the parked
+        // one and nothing after it, so the log is already complete.
+        assert_eq!(chain.count::<NewDataColumnSidecars>(), 0);
+        chain.assert_no_unexpected();
     }
 
     /// A gloas sidecar is judged against its own block, not a parent: one
@@ -232,8 +161,8 @@ mod tests {
     #[tokio::test]
     async fn a_gloas_sidecar_for_an_unknown_block_is_parked_and_a_future_one_dropped() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
-        let (sender, mut received) = mpsc::unbounded_channel();
-        server.blockchain = Some(Arc::new(RecordingChain(sender)));
+        let chain = Mock::new().allow_sends().start();
+        server.blockchain = Some(chain.to_p2p_to_block_chain_ref());
 
         let unknown_block = DataColumnSidecar::Gloas(gloas::DataColumnSidecar {
             index: 0,
@@ -250,11 +179,9 @@ mod tests {
 
         check_and_forward(&server, vec![unknown_block.clone(), future]);
 
-        assert_eq!(
-            received.recv().await,
-            Some(Forwarded::AwaitingParent(vec![unknown_block]))
-        );
-        drop(server);
-        assert_eq!(received.recv().await, None);
+        let parked: DataColumnSidecarsAwaitingParent = chain.expect(FORWARDED).await;
+        assert_eq!(parked.sidecars, vec![unknown_block]);
+        assert_eq!(chain.count::<NewDataColumnSidecars>(), 0);
+        chain.assert_no_unexpected();
     }
 }

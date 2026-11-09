@@ -147,95 +147,31 @@ pub(crate) fn check_and_forward_then(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::sync::Arc;
+    use std::time::Duration;
 
-    use ethlambda_network_api::{
-        AggregateArrival, BlockAnnouncement, BlockSource, P2PToBlockChain,
-    };
+    use ethlambda_network_api::ToP2PToBlockChainRef as _;
+    use ethlambda_network_api::p2p_to_block_chain::NewExecutionPayloadEnvelope;
     use ethlambda_state_transition::beacon::gossip::{IgnoreReason, QueueReason, RejectReason};
-    use ethlambda_types::attestation::{SignedAggregatedAttestation, SignedAttestation};
     use ethlambda_types::beacon::config::Config;
-    use ethlambda_types::beacon::containers::{
-        DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock,
-    };
-    use ethlambda_types::beacon::primitives::ValidatorIndex;
     use ethlambda_types::primitives::H256;
-    use spawned_concurrency::error::ActorError;
-    use tokio::sync::mpsc;
+    use spawned_test::tasks::Mock;
 
     use super::*;
     use crate::test_support::unconnected_beacon_server;
 
-    /// What a [`Recorder`] saw the chain actor be sent, in order.
-    #[derive(Debug, PartialEq)]
-    pub(crate) enum Seen {
-        Block(u64),
-        Envelope(H256, u64),
-    }
-
-    /// A chain actor stand-in that reports every block and envelope it gets,
-    /// in one stream so their relative order is observable.
-    pub(crate) struct Recorder(pub mpsc::UnboundedSender<Seen>);
-
-    impl P2PToBlockChain for Recorder {
-        fn new_block(
-            &self,
-            block: SignedBeaconBlock,
-            _: BlockSource,
-            _: BlockArrival,
-            _: BlockAnnouncement,
-        ) -> Result<(), ActorError> {
-            let _ = self.0.send(Seen::Block(block.slot()));
-            Ok(())
-        }
-        fn new_attestation(&self, _: SignedAttestation) -> Result<(), ActorError> {
-            Ok(())
-        }
-        fn new_aggregated_attestation(
-            &self,
-            _: SignedAggregatedAttestation,
-        ) -> Result<(), ActorError> {
-            Ok(())
-        }
-        fn new_data_column_sidecars(&self, _: Vec<DataColumnSidecar>) -> Result<(), ActorError> {
-            Ok(())
-        }
-        fn data_column_sidecars_awaiting_parent(
-            &self,
-            _: Vec<DataColumnSidecar>,
-        ) -> Result<(), ActorError> {
-            Ok(())
-        }
-        fn new_beacon_aggregate(
-            &self,
-            _: Box<SignedAggregateAndProof>,
-            _: Vec<ValidatorIndex>,
-            _: AggregateArrival,
-        ) -> Result<(), ActorError> {
-            Ok(())
-        }
-        fn new_execution_payload_envelope(
-            &self,
-            envelope: Box<SignedExecutionPayloadEnvelope>,
-            _: BlockArrival,
-        ) -> Result<(), ActorError> {
-            let _ = self.0.send(Seen::Envelope(
-                envelope.message.beacon_block_root,
-                envelope.message.payload.slot_number,
-            ));
-            Ok(())
-        }
-        fn new_payload_attestation_message(
-            &self,
-            _: ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage,
-            _: BlockArrival,
-        ) -> Result<(), ActorError> {
-            Ok(())
-        }
-    }
+    /// Long enough for the checks' blocking tasks on a loaded test machine.
+    pub(crate) const FORWARDED: Duration = Duration::from_secs(10);
 
     pub(crate) fn envelope(slot: u64, byte: u8) -> SignedExecutionPayloadEnvelope {
         crate::beacon::encoding::test_support::envelope(H256::repeat_byte(byte), slot, H256::ZERO)
+    }
+
+    /// The `(block root, slot)` an envelope the chain actor was sent names.
+    pub(crate) fn sent(message: &NewExecutionPayloadEnvelope) -> (H256, u64) {
+        (
+            message.envelope.message.beacon_block_root,
+            message.envelope.message.payload.slot_number,
+        )
     }
 
     #[test]
@@ -252,8 +188,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn envelopes_for_unknown_blocks_are_forwarded_in_order() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
-        let (sender, mut received) = mpsc::unbounded_channel();
-        server.blockchain = Some(Arc::new(Recorder(sender)));
+        let chain = Mock::new().allow_sends().start();
+        server.blockchain = Some(chain.to_p2p_to_block_chain_ref());
 
         check_and_forward(
             &server,
@@ -261,12 +197,11 @@ pub(crate) mod tests {
         );
 
         for (slot, byte) in [(7, 1), (8, 2), (9, 3)] {
-            assert_eq!(
-                received.recv().await,
-                Some(Seen::Envelope(H256::repeat_byte(byte), slot))
-            );
+            let forwarded: NewExecutionPayloadEnvelope = chain.expect(FORWARDED).await;
+            assert_eq!(sent(&forwarded), (H256::repeat_byte(byte), slot));
         }
-        drop(server);
-        assert_eq!(received.recv().await, None);
+        // The last of the batch is the task's last send.
+        assert_eq!(chain.received().len(), 3);
+        chain.assert_no_unexpected();
     }
 }
