@@ -2010,6 +2010,7 @@ dependencies = [
  "serde_yaml_ng",
  "sha2",
  "snap",
+ "spawned-concurrency 0.6.0",
  "tempfile",
  "thiserror 2.0.18",
  "tikv-jemallocator",

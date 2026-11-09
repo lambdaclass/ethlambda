@@ -84,6 +84,7 @@ use spawned_concurrency::actor;
 use spawned_concurrency::error::ActorError;
 use spawned_concurrency::message::Message;
 use spawned_concurrency::protocol;
+use spawned_concurrency::system::{ExecutionGroup, SystemError};
 use spawned_concurrency::tasks::{
     Actor, ActorRef, ActorStart, Context, Handler, send_after, spawn_listener,
 };
@@ -91,10 +92,9 @@ use tracing::{debug, info, trace, warn};
 
 use crate::{
     discovery::{
-        DIAL_INTERVAL_AT_TARGET, DIAL_INTERVAL_AT_ZERO_PEERS, DiscoveryError, DiscoverySpawnConfig,
+        DIAL_INTERVAL_AT_TARGET, DIAL_INTERVAL_AT_ZERO_PEERS, DiscoveryHandle,
         dial::{DiscoveryState, dial_interval, dial_progress, dial_tick, forget_discovered_peer},
         enr::{dialable_port, read_ip, read_public_key, read_quic_port, read_tcp_port},
-        spawn_discovery,
     },
     gossipsub::{
         aggregation_topic, attestation_subnet_topic, block_topic, publish_aggregated_attestation,
@@ -1157,39 +1157,36 @@ pub struct P2P {
 }
 
 impl P2P {
-    /// Start discovery, start the I/O adapter, spawn the actor, and wire the
-    /// swarm event stream.
+    /// Start the I/O adapter, spawn the actor on `group`, and wire the swarm
+    /// event stream.
     ///
-    /// `discovery` is `Some` when discv5 runs: the server is started here, and
-    /// its handle seeds the dial loop's state and schedules its first tick. It
-    /// is started before the swarm adapter so a fatal discovery failure (a busy
-    /// UDP port, say) surfaces before any actor is running. `None` leaves the
-    /// dial loop unscheduled, so peering relies solely on the static bootnode
-    /// list `build_swarm` dialed.
+    /// `discovery` is `Some` when discv5 runs: the caller starts the server
+    /// with [`discovery::spawn_discovery`] before any actor, so a fatal
+    /// discovery failure (a busy UDP port, say) surfaces before anything is
+    /// running, and its handle seeds the dial loop's state and schedules its
+    /// first tick here. `None` leaves the dial loop unscheduled, so peering
+    /// relies solely on the static bootnode list `build_swarm` dialed.
     ///
     /// Always `Some` on beacon, which has no other way to find a peer:
     /// published mainnet bootnode ENRs carry no `quic` entry, so none of them
     /// is statically dialable. Opt-in on lean, where nothing else speaks discv5
     /// and co-located devnet nodes would otherwise all claim one UDP port.
     #[allow(clippy::too_many_arguments)]
-    pub async fn spawn(
+    pub fn spawn(
         built: BuiltSwarm,
         store: Store,
         node_names: HashMap<PeerId, String>,
-        discovery: Option<DiscoverySpawnConfig>,
+        discovery: Option<DiscoveryHandle>,
         payload_attestation_pool: SharedPayloadAttestationPool,
         builder_market: SharedBuilderMarket,
         sync_committee_pool: SharedSyncCommitteePool,
-    ) -> Result<P2P, DiscoveryError> {
-        let (discovery, local_enr) = match discovery {
-            Some(config) => {
-                let discovery = spawn_discovery(config).await?;
-                let local_enr = discovery.local_enr.clone();
-                (Some(discovery), Some(local_enr))
-            }
+        group: &ExecutionGroup,
+    ) -> Result<P2P, SystemError> {
+        let local_enr = match &discovery {
+            Some(discovery) => Some(discovery.local_enr.clone()),
             None => {
                 info!("discv5 discovery disabled; peering from the static bootnode list only");
-                (None, None)
+                None
             }
         };
         let (swarm_stream, swarm_handle) =
@@ -1268,7 +1265,7 @@ impl P2P {
         };
         let scores_peers = server.peer_scoring.is_some();
         let discovery_enabled = server.discovery.is_some();
-        let handle = server.start();
+        let handle = server.start_on(group)?;
         // At once rather than a slot in: the swarm starts on placeholder
         // topic scores, and the head's are already known.
         if scores_peers {

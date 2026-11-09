@@ -31,12 +31,14 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[unsafe(export_name = "malloc_conf")]
 static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
 
+use spawned_concurrency::ActorId;
+use spawned_concurrency::system::{ActorSystem, ShutdownReport};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
-    time::SystemTime,
+    time::{Duration, Instant, SystemTime},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -53,7 +55,9 @@ use ethlambda_network_api::{
 };
 use ethlambda_p2p::{
     LeanWireConfig, P2P, PeerId, SwarmConfig, WireConfig, attestation_subscription_subnets,
-    build_swarm, discovery::DiscoverySpawnConfig, parse_enrs,
+    build_swarm,
+    discovery::{DiscoverySpawnConfig, spawn_discovery},
+    parse_enrs,
 };
 use ethlambda_state_transition::beacon::fork_choice;
 use ethlambda_types::primitives::{H256, HashTreeRoot as _};
@@ -229,11 +233,29 @@ fn init_info_stderr_logging() -> eyre::Result<()> {
         .wrap_err("failed to set global tracing subscriber")
 }
 
+/// How long a graceful shutdown may take, from the signal to the last actor
+/// joined.
+///
+/// Comfortably under Docker's default 10 s `docker stop` grace period, so the
+/// node reports what it could not stop instead of being SIGKILLed with no
+/// record of why. Before this deadline existed a clean shutdown during
+/// catch-up took 14.3 s and was cut off by that SIGKILL (1d7902da).
+const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(8);
+
+/// The part of [`SHUTDOWN_DEADLINE`] the HTTP server gets to close before the
+/// actors are stopped. An open `/events` stream would otherwise hold axum's
+/// graceful shutdown, and the actors' share of the deadline with it.
+const HTTP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// A node that has started, whichever chain it follows.
 ///
 /// What [`wait_for_shutdown`] needs to stop, and all [`run_node`] has left to
 /// assemble once the chain-specific half is done.
 struct RunningNode {
+    /// Owns every actor below and the threads they run on. Shutting it down
+    /// stops them in reverse admission order: P2P, the ingress, before the
+    /// chain actor it feeds. See [`run_node`] for why that is the order.
+    system: ActorSystem,
     p2p: P2P,
     /// The chain actor, on both lean and mainnet: the beacon follower runs one
     /// too, so there is always exactly one to stop and join. `run_node`
@@ -769,8 +791,37 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     // `/lean/v0/node/identity` endpoint reports it.
     let local_peer_id = built.local_peer_id.to_string();
 
-    // `P2P::spawn` starts the discv5 server from this and owns the resulting
-    // handle.
+    // discv5 binds its UDP socket here, before any actor runs, so a busy port
+    // aborts startup with nothing to stop. `P2P::spawn` owns the handle.
+    let discovery = match discovery {
+        Some(config) => Some(
+            spawn_discovery(config)
+                .await
+                .wrap_err("failed to start discv5 discovery")?,
+        ),
+        None => None,
+    };
+
+    // The owner of every actor this node runs, and of the threads they run
+    // on. Two groups:
+    //
+    // - `chain`: one native thread for the chain actor, whose handlers are
+    //   long synchronous CPU (block import, state transition, signing) that
+    //   would starve a shared runtime. One worker with a one-worker helper
+    //   runtime is what `Backend::Thread` gave it before.
+    // - `network`: the P2P actor, on a multi-thread pool sized like the
+    //   default Tokio runtime it used to share with everything else.
+    //
+    // Admission order is shutdown order reversed, so the chain actor is
+    // admitted first and P2P, which feeds it, is stopped first.
+    let system = ActorSystem::new().wrap_err("failed to create the actor system")?;
+    let chain_group = system
+        .thread_group("chain", 1)
+        .wrap_err("failed to create the chain execution group")?;
+    let network_group = system
+        .async_group("network", network_workers())
+        .wrap_err("failed to create the network execution group")?;
+
     // Filled by gossip and the Beacon API's payload attestation endpoint, read
     // by block production and `GET .../pool/payload_attestations`.
     let payload_attestation_pool =
@@ -783,40 +834,17 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     // block production and the contribution endpoint.
     let sync_committee_pool =
         ethlambda_state_transition::beacon::sync_committee_pool::SharedSyncCommitteePool::default();
-    let p2p = P2P::spawn(
-        built,
-        setup.store.clone(),
-        setup.node_names,
-        discovery,
-        payload_attestation_pool.clone(),
-        builder_market.clone(),
-        sync_committee_pool.clone(),
-    )
-    .await
-    .wrap_err("failed to start discv5 discovery")?;
-
-    let shutdown = CancellationToken::new();
-    let rpc_shutdown = shutdown.clone();
+    // What the HTTP server and P2P take from values the chain actor's spawn
+    // below moves.
     let rpc_store = setup.store.clone();
-    let rpc_aggregator = aggregator.clone();
-    let rpc_sync_status = sync_status.clone();
     let rpc_events = events.clone();
-    let rpc_p2p = p2p.actor_ref().to_rpc_to_p2p_ref();
+    let rpc_sync_status = sync_status.clone();
+    let p2p_store = setup.store.clone();
     let rpc_custody_columns = match &setup.chain {
         ChainActor::Beacon {
             custody_columns, ..
         } => ethlambda_rpc::CustodyColumns(custody_columns.clone()),
         ChainActor::Lean(..) => ethlambda_rpc::CustodyColumns::default(),
-    };
-    let rpc_identity = ethlambda_rpc::BeaconIdentity {
-        metadata: p2p.local_metadata(),
-        ..beacon_identity(
-            p2p.local_enr().unwrap_or_default(),
-            common.discovery.advertise_ip,
-            common.gossipsub_port,
-            common.discovery.port,
-            &local_peer_id,
-        )
     };
     // Block production builds its payloads with the same execution client the
     // chain actor validates them with.
@@ -832,6 +860,61 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     // beacon directory never carries, so calling one panicked that request.
     let serves_beacon_api = setup.store.chain() == ethlambda_storage::Chain::Beacon;
 
+    // The chain actor before P2P: see the `system` comment above.
+    let mut anchor_envelope_fetch: Option<(Vec<String>, H256)> = None;
+    let blockchain = match setup.chain {
+        ChainActor::Lean(validator_keys, config) => {
+            BlockChain::spawn(setup.store, validator_keys, config, events, &chain_group)
+        }
+        ChainActor::Beacon {
+            custody_columns,
+            engine,
+            safe_slots_to_import_optimistically,
+            anchor_envelope_urls,
+        } => {
+            check_custody_set(&custody_columns)?;
+            anchor_envelope_fetch = missing_anchor_envelope_root(&setup.store)
+                .filter(|_| !anchor_envelope_urls.is_empty())
+                .map(|root| (anchor_envelope_urls, root));
+            BlockChain::spawn_beacon(
+                setup.store,
+                sync_status,
+                events,
+                custody_columns,
+                engine,
+                safe_slots_to_import_optimistically,
+                &chain_group,
+            )
+        }
+    }
+    .wrap_err("failed to start the chain actor")?;
+
+    let p2p = P2P::spawn(
+        built,
+        p2p_store,
+        setup.node_names,
+        discovery,
+        payload_attestation_pool.clone(),
+        builder_market.clone(),
+        sync_committee_pool.clone(),
+        &network_group,
+    )
+    .wrap_err("failed to start the P2P actor")?;
+
+    let shutdown = CancellationToken::new();
+    let rpc_shutdown = shutdown.clone();
+    let rpc_aggregator = aggregator.clone();
+    let rpc_p2p = p2p.actor_ref().to_rpc_to_p2p_ref();
+    let rpc_identity = ethlambda_rpc::BeaconIdentity {
+        metadata: p2p.local_metadata(),
+        ..beacon_identity(
+            p2p.local_enr().unwrap_or_default(),
+            common.discovery.advertise_ip,
+            common.gossipsub_port,
+            common.discovery.port,
+            &local_peer_id,
+        )
+    };
     let http = tokio::spawn(async move {
         let served = if serves_beacon_api {
             ethlambda_rpc::start_beacon_rpc_server(
@@ -867,32 +950,6 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         };
         let _ = served.inspect_err(|err| error!(%err, "RPC server failed"));
     });
-
-    let mut anchor_envelope_fetch: Option<(Vec<String>, H256)> = None;
-    let blockchain = match setup.chain {
-        ChainActor::Lean(validator_keys, config) => {
-            BlockChain::spawn(setup.store, validator_keys, config, events)
-        }
-        ChainActor::Beacon {
-            custody_columns,
-            engine,
-            safe_slots_to_import_optimistically,
-            anchor_envelope_urls,
-        } => {
-            check_custody_set(&custody_columns)?;
-            anchor_envelope_fetch = missing_anchor_envelope_root(&setup.store)
-                .filter(|_| !anchor_envelope_urls.is_empty())
-                .map(|root| (anchor_envelope_urls, root));
-            BlockChain::spawn_beacon(
-                setup.store,
-                sync_status,
-                events,
-                custody_columns,
-                engine,
-                safe_slots_to_import_optimistically,
-            )
-        }
-    };
 
     let p2p_ref = p2p.actor_ref();
     let p2p_to_block_chain = p2p_ref.to_block_chain_to_p2p_ref();
@@ -931,13 +988,24 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     }
 
     wait_for_shutdown(RunningNode {
+        system,
         p2p,
         blockchain,
         http,
         shutdown,
     })
-    .await;
-    Ok(())
+    .await
+}
+
+/// Async workers for the `network` group: what a default `#[tokio::main]`
+/// runtime would get, so P2P keeps the parallelism it had when it shared that
+/// runtime. One under Shadow, for the reason `run_node` runs single-threaded
+/// there.
+fn network_workers() -> usize {
+    if cfg!(feature = "shadow-integration") {
+        return 1;
+    }
+    std::thread::available_parallelism().map_or(4, std::num::NonZero::get)
 }
 
 /// The root of the anchor block when it is a gloas block whose execution
@@ -973,21 +1041,32 @@ fn check_custody_set(custody_columns: &[u64]) -> eyre::Result<()> {
     Ok(())
 }
 
-/// Wait for ctrl-c, then stop and join whatever is running.
+/// Wait for SIGINT or SIGTERM, then stop everything within
+/// [`SHUTDOWN_DEADLINE`].
 ///
-/// A 2nd, 3rd and 4th ctrl-c escalate to `std::process::exit(1)` rather than
-/// leaving shutdown stuck on an actor that hangs in `stop()`/`join()`.
+/// Ingress first: the HTTP server is cancelled and given
+/// [`HTTP_SHUTDOWN_TIMEOUT`] to close, then the actor system stops the actors
+/// in reverse admission order (P2P, then the chain actor) with whatever is left
+/// of the deadline. A shutdown that misses it names what is still running and
+/// exits non-zero rather than wait on it: Docker would SIGKILL the process two
+/// seconds later anyway, and then nothing would say which actor held it.
+///
+/// A 2nd, 3rd and 4th ctrl-c still escalate to `std::process::exit(1)`.
 ///
 /// Shared by both chains. Mainnet used to park on `pending()` here, so a
 /// follower killed mid-write left recovery to do; it now tears down the same
 /// way the lean node does.
-async fn wait_for_shutdown(node: RunningNode) {
+async fn wait_for_shutdown(node: RunningNode) -> eyre::Result<()> {
     info!("Node initialized");
 
-    // 1st ctrl+c: start graceful shutdown
-    tokio::signal::ctrl_c().await.ok();
+    let signal = shutdown_signal().await;
+    let started = Instant::now();
 
-    info!("Shutdown signal received, stopping actors and servers...");
+    info!(
+        signal,
+        deadline_secs = SHUTDOWN_DEADLINE.as_secs(),
+        "Shutdown signal received, stopping actors and servers..."
+    );
 
     tokio::spawn(async move {
         // This can be turned into a loop
@@ -1004,18 +1083,91 @@ async fn wait_for_shutdown(node: RunningNode) {
         std::process::exit(1);
     });
 
-    let blockchain_ref = node.blockchain.actor_ref().clone();
-    let p2p_ref = node.p2p.actor_ref().clone();
+    let RunningNode {
+        system,
+        p2p,
+        blockchain,
+        mut http,
+        shutdown,
+    } = node;
+    // Read now: the report names unfinished actors by id only.
+    let actors = [
+        (p2p.actor_ref().id(), "p2p"),
+        (blockchain.actor_ref().id(), "blockchain"),
+    ];
 
-    blockchain_ref.context().stop();
-    p2p_ref.context().stop();
-    node.shutdown.cancel();
+    shutdown.cancel();
+    if tokio::time::timeout(HTTP_SHUTDOWN_TIMEOUT, &mut http)
+        .await
+        .is_err()
+    {
+        warn!(
+            timeout_secs = HTTP_SHUTDOWN_TIMEOUT.as_secs(),
+            "HTTP server did not close in time; aborting it"
+        );
+        http.abort();
+    }
 
-    blockchain_ref.join().await;
-    p2p_ref.join().await;
-    let _ = node.http.await;
+    let report = system
+        .shutdown(SHUTDOWN_DEADLINE.saturating_sub(started.elapsed()))
+        .await;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    if report.complete {
+        info!(elapsed_ms, "Shutdown complete");
+        return Ok(());
+    }
+    log_incomplete_shutdown(&report, &actors, elapsed_ms);
+    // The unfinished work keeps its threads; returning would have the runtime
+    // wait on them with no deadline at all.
+    std::process::exit(1);
+}
 
-    info!("Shutdown complete");
+/// Name what a shutdown that missed [`SHUTDOWN_DEADLINE`] left running.
+fn log_incomplete_shutdown(report: &ShutdownReport, actors: &[(ActorId, &str)], elapsed_ms: u64) {
+    let name = |id: &ActorId| {
+        actors
+            .iter()
+            .find(|(known, _)| known == id)
+            .map_or_else(|| id.to_string(), |(_, name)| (*name).to_string())
+    };
+    let unfinished_actors: Vec<String> = report.unfinished_actors.iter().map(name).collect();
+    let exits: Vec<String> = report
+        .exits
+        .iter()
+        .map(|exit| format!("{}: {:?}", name(&exit.id), exit.reason))
+        .collect();
+    error!(
+        elapsed_ms,
+        deadline_secs = SHUTDOWN_DEADLINE.as_secs(),
+        unfinished_groups = ?report.unfinished_groups,
+        ?unfinished_actors,
+        ?exits,
+        supervisor_failures = ?report.supervisor_failures,
+        group_failures = ?report.group_failures,
+        "Shutdown deadline exceeded; exiting with work still running"
+    );
+}
+
+/// Resolve on the first SIGINT (ctrl-c) or SIGTERM, naming which one.
+///
+/// SIGTERM is what `docker stop`, systemd and Kubernetes send, so a container
+/// no longer needs `--stop-signal SIGINT` to shut down gracefully.
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                return tokio::select! {
+                    _ = tokio::signal::ctrl_c() => "SIGINT",
+                    _ = terminate.recv() => "SIGTERM",
+                };
+            }
+            Err(err) => warn!(%err, "Cannot listen for SIGTERM; only ctrl-c shuts down gracefully"),
+        }
+    }
+    tokio::signal::ctrl_c().await.ok();
+    "SIGINT"
 }
 
 /// The ENRs to start from when `--bootnodes` was not given.

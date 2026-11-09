@@ -38,9 +38,8 @@ use crate::sync_status::SyncStatusTracker;
 use spawned_concurrency::actor;
 use spawned_concurrency::error::ActorError;
 use spawned_concurrency::protocol;
-use spawned_concurrency::tasks::{
-    Actor, ActorRef, ActorStart, Backend, Context, Handler, send_after,
-};
+use spawned_concurrency::system::{ExecutionGroup, SystemError};
+use spawned_concurrency::tasks::{Actor, ActorRef, ActorStart, Context, Handler, send_after};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
@@ -234,12 +233,16 @@ impl BlockChain {
     /// touched it, so this is a programming error to catch here rather than
     /// a runtime condition to branch on. Use [`Self::spawn_beacon`] for a
     /// beacon store.
+    ///
+    /// The actor is admitted to `group`, which owns its thread and stops it on
+    /// shutdown; see [`Self::start_actor`] for what kind of group it needs.
     pub fn spawn(
         store: Store,
         validator_keys: HashMap<u64, ValidatorKeyPair>,
         config: BlockChainConfig,
         events: EventBus,
-    ) -> BlockChain {
+        group: &ExecutionGroup,
+    ) -> Result<BlockChain, SystemError> {
         assert_eq!(
             store.chain(),
             Chain::Lean,
@@ -311,6 +314,7 @@ impl BlockChain {
             Vec::new(),
             None,
             constants::SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY,
+            group,
         )
     }
 
@@ -345,7 +349,8 @@ impl BlockChain {
         custody_columns: Vec<u64>,
         engine: Option<EngineClient>,
         safe_slots_to_import_optimistically: u64,
-    ) -> BlockChain {
+        group: &ExecutionGroup,
+    ) -> Result<BlockChain, SystemError> {
         assert_eq!(
             store.chain(),
             Chain::Beacon,
@@ -363,6 +368,7 @@ impl BlockChain {
             custody_columns,
             engine,
             safe_slots_to_import_optimistically,
+            group,
         )
     }
 
@@ -380,6 +386,13 @@ impl BlockChain {
     /// layer, so [`BlockChain::spawn`] passes an empty vector and `None`. It
     /// passes the specification's own default for
     /// `safe_slots_to_import_optimistically`, which nothing on that arm reads.
+    ///
+    /// `group` must give the actor a thread of its own: its handlers are long
+    /// synchronous CPU (block import, state transition, signing) that would
+    /// starve a shared async runtime. `run_node` passes a one-worker
+    /// `thread_group`, which is what `Backend::Thread` gave it before: a
+    /// dedicated native thread driving the handlers, plus a one-worker Tokio
+    /// runtime for its timers and the aggregation worker's `spawn_blocking`.
     #[allow(clippy::too_many_arguments)]
     fn start_actor(
         mut store: Store,
@@ -390,7 +403,8 @@ impl BlockChain {
         custody_columns: Vec<u64>,
         engine: Option<EngineClient>,
         safe_slots_to_import_optimistically: u64,
-    ) -> BlockChain {
+        group: &ExecutionGroup,
+    ) -> Result<BlockChain, SystemError> {
         let genesis_time = store.config().genesis_time;
 
         // Payloads verified before a restart have no recorded verdict, since
@@ -430,8 +444,9 @@ impl BlockChain {
             events,
             duties,
         }
-        // Own thread: these handlers are long synchronous CPU that starves a shared runtime.
-        .start_with_backend(Backend::Thread);
+        // Own thread: these handlers are long synchronous CPU that starves a
+        // shared runtime. See this function's doc for what `group` must be.
+        .start_on(group)?;
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
             .duration_since(SystemTime::now())
             .unwrap_or_default();
@@ -440,7 +455,7 @@ impl BlockChain {
             handle.context(),
             block_chain_protocol::Tick,
         );
-        BlockChain { handle }
+        Ok(BlockChain { handle })
     }
 
     pub fn actor_ref(&self) -> &ActorRef<BlockChainServer> {
@@ -4437,7 +4452,9 @@ mod tests {
             },
         };
 
-        let _ = BlockChain::spawn(store, HashMap::new(), config, EventBus::default());
+        let system = spawned_concurrency::system::ActorSystem::new().unwrap();
+        let group = system.thread_group("chain", 1).unwrap();
+        let _ = BlockChain::spawn(store, HashMap::new(), config, EventBus::default(), &group);
     }
 
     #[test]
@@ -4452,6 +4469,8 @@ mod tests {
             DEFAULT_MILLISECONDS_PER_SLOT,
         );
 
+        let system = spawned_concurrency::system::ActorSystem::new().unwrap();
+        let group = system.thread_group("chain", 1).unwrap();
         let _ = BlockChain::spawn_beacon(
             store,
             SyncStatusController::default(),
@@ -4459,6 +4478,7 @@ mod tests {
             Vec::new(),
             None,
             constants::SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY,
+            &group,
         );
     }
 
