@@ -90,8 +90,11 @@ hex = "0.4"
 hmac = "0.12"
 base64 = "0.22"
 
-spawned-concurrency = "0.5.0"
-spawned-rt = "0.5.0"
+# Unreleased spawned v0.7 (main 32796a88 plus the spawned-test crate). Every
+# spawned crate must name the same revision so they share one set of types.
+spawned-concurrency = { git = "https://github.com/lambdaclass/spawned", rev = "fd28d2e93ceae3657073b030b0c64d81ec2c11d9" }
+spawned-rt = { git = "https://github.com/lambdaclass/spawned", rev = "fd28d2e93ceae3657073b030b0c64d81ec2c11d9" }
+spawned-test = { git = "https://github.com/lambdaclass/spawned", rev = "fd28d2e93ceae3657073b030b0c64d81ec2c11d9" }
 tokio = "1.0"
 tokio-util = "0.7"
 
