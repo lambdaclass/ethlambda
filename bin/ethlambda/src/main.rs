@@ -6,6 +6,7 @@ mod cli;
 mod command;
 mod era;
 mod fd_limit;
+mod http_server;
 mod keygen;
 mod network;
 mod slashing_protection;
@@ -32,6 +33,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
 
 use spawned_concurrency::ActorId;
+use spawned_concurrency::supervision::{ChildSpec, SupervisedChild};
 use spawned_concurrency::system::{ActorSystem, ShutdownReport};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -253,8 +255,9 @@ const HTTP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 /// assemble once the chain-specific half is done.
 struct RunningNode {
     /// Owns every actor below and the threads they run on. Shutting it down
-    /// stops them in reverse admission order: P2P, the ingress, before the
-    /// chain actor it feeds. See [`run_node`] for why that is the order.
+    /// stops them in reverse admission order: the HTTP server, then P2P, the
+    /// ingresses, before the chain actor they feed. See [`run_node`] for why
+    /// that is the order.
     system: ActorSystem,
     p2p: P2P,
     /// The chain actor, on both lean and mainnet: the beacon follower runs one
@@ -263,10 +266,8 @@ struct RunningNode {
     /// this a plain `BlockChain` rather than an `Option` describing a state
     /// the node never reaches.
     blockchain: BlockChain,
-    /// The HTTP server task. Returns once `shutdown` is cancelled.
-    http: tokio::task::JoinHandle<()>,
-    /// Cancelled by [`wait_for_shutdown`] to stop `http`.
-    shutdown: CancellationToken,
+    /// The supervised HTTP server; whichever generation is current.
+    http: SupervisedChild<http_server::HttpServer>,
 }
 
 /// What one chain claims to serve, in the entries its ENR publishes and its
@@ -809,11 +810,29 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     //   long synchronous CPU (block import, state transition, signing) that
     //   would starve a shared runtime. One worker with a one-worker helper
     //   runtime is what `Backend::Thread` gave it before.
-    // - `network`: the P2P actor, on a multi-thread pool sized like the
-    //   default Tokio runtime it used to share with everything else.
+    // - `network`: the P2P actor and the HTTP server, on a multi-thread pool
+    //   sized like the default Tokio runtime they used to share.
     //
     // Admission order is shutdown order reversed, so the chain actor is
-    // admitted first and P2P, which feeds it, is stopped first.
+    // admitted first and the ingresses that feed it, P2P and then HTTP, are
+    // stopped before it.
+    //
+    // Only the HTTP server is supervised (see `http_server`). The other two
+    // are not, on purpose:
+    //
+    // - The chain actor is the consensus-critical singleton. Its in-memory
+    //   state (pending blocks and columns, the sync gate, the aggregation
+    //   session, the validator keys' prepared XMSS signing state) is not
+    //   rebuilt from the store, and a fresh instance would sign again from a
+    //   key manager that does not know what the old one signed. P2P also holds
+    //   its `ActorRef` from `InitBlockChain`, which a replacement would not
+    //   rebind.
+    // - P2P owns the libp2p swarm and the discv5 server, built once here with
+    //   their sockets bound; a fresh instance would need both rebuilt, and the
+    //   chain actor and the HTTP server hold refs to the old one.
+    //
+    // A crash in either still just stops that actor, as before; supervising
+    // them needs that state recovery and ref rebinding first.
     let system = ActorSystem::new().wrap_err("failed to create the actor system")?;
     let chain_group = system
         .thread_group("chain", 1)
@@ -901,8 +920,6 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     )
     .wrap_err("failed to start the P2P actor")?;
 
-    let shutdown = CancellationToken::new();
-    let rpc_shutdown = shutdown.clone();
     let rpc_aggregator = aggregator.clone();
     let rpc_p2p = p2p.actor_ref().to_rpc_to_p2p_ref();
     let rpc_identity = ethlambda_rpc::BeaconIdentity {
@@ -915,41 +932,65 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             &local_peer_id,
         )
     };
-    let http = tokio::spawn(async move {
-        let served = if serves_beacon_api {
-            ethlambda_rpc::start_beacon_rpc_server(
+    // One run of the server per actor generation, from clones of everything
+    // it serves: see `http_server` for why that makes a restart safe.
+    let serve: http_server::Serve = Arc::new(move |shutdown| {
+        let rpc_config = rpc_config.clone();
+        let rpc_store = rpc_store.clone();
+        let rpc_sync_status = rpc_sync_status.clone();
+        let rpc_events = rpc_events.clone();
+        let local_peer_id = local_peer_id.clone();
+        if serves_beacon_api {
+            let handles = ethlambda_rpc::BeaconApiHandles {
+                p2p: rpc_p2p.clone(),
+                payload_attestation_pool: payload_attestation_pool.clone(),
+                builder_market: builder_market.clone(),
+                sync_committee_pool: sync_committee_pool.clone(),
+                custody_columns: rpc_custody_columns.clone(),
+                engine: rpc_engine.clone(),
+                events: rpc_events,
+                client_version: version::engine_client_version(),
+                identity: rpc_identity.clone(),
+            };
+            Box::pin(ethlambda_rpc::start_beacon_rpc_server(
                 rpc_config,
                 rpc_store,
                 rpc_sync_status,
-                ethlambda_rpc::BeaconApiHandles {
-                    p2p: rpc_p2p,
-                    payload_attestation_pool: payload_attestation_pool.clone(),
-                    builder_market: builder_market.clone(),
-                    sync_committee_pool: sync_committee_pool.clone(),
-                    custody_columns: rpc_custody_columns,
-                    engine: rpc_engine,
-                    events: rpc_events,
-                    client_version: version::engine_client_version(),
-                    identity: rpc_identity,
-                },
+                handles,
                 local_peer_id,
-                rpc_shutdown,
-            )
-            .await
+                shutdown,
+            ))
         } else {
-            ethlambda_rpc::start_rpc_server(
+            Box::pin(ethlambda_rpc::start_rpc_server(
                 rpc_config,
                 rpc_store,
-                rpc_aggregator,
+                rpc_aggregator.clone(),
                 rpc_sync_status,
                 local_peer_id,
                 rpc_events,
-                rpc_shutdown,
-            )
-            .await
-        };
-        let _ = served.inspect_err(|err| error!(%err, "RPC server failed"));
+                shutdown,
+            ))
+        }
     });
+    // Admitted last, so stopped first. See `http_server` for the budget.
+    let mut http_tree = system
+        .supervisor(http_server::supervisor_config())
+        .wrap_err("failed to create the HTTP server supervisor")?;
+    let http = http_tree
+        .add(
+            ChildSpec::new("http", &network_group, move |_| {
+                let serve = serve.clone();
+                async move { Ok::<_, std::convert::Infallible>(http_server::HttpServer::new(serve)) }
+            })
+            .shutdown_timeout(HTTP_SHUTDOWN_TIMEOUT),
+        )
+        .wrap_err("failed to declare the HTTP server")?;
+    let http_supervisor = http_tree
+        .start()
+        .await
+        .wrap_err("failed to start the HTTP server")?;
+    http_server::watch(http.clone(), http_supervisor);
+    http_server::install_fault_injection(http.clone());
 
     let p2p_ref = p2p.actor_ref();
     let p2p_to_block_chain = p2p_ref.to_block_chain_to_p2p_ref();
@@ -992,7 +1033,6 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         p2p,
         blockchain,
         http,
-        shutdown,
     })
     .await
 }
@@ -1044,10 +1084,9 @@ fn check_custody_set(custody_columns: &[u64]) -> eyre::Result<()> {
 /// Wait for SIGINT or SIGTERM, then stop everything within
 /// [`SHUTDOWN_DEADLINE`].
 ///
-/// Ingress first: the HTTP server is cancelled and given
-/// [`HTTP_SHUTDOWN_TIMEOUT`] to close, then the actor system stops the actors
-/// in reverse admission order (P2P, then the chain actor) with whatever is left
-/// of the deadline. A shutdown that misses it names what is still running and
+/// The actor system stops everything in reverse admission order: the HTTP
+/// server (given [`HTTP_SHUTDOWN_TIMEOUT`] of it), then P2P, then the chain
+/// actor. A shutdown that misses it names what is still running and
 /// exits non-zero rather than wait on it: Docker would SIGKILL the process two
 /// seconds later anyway, and then nothing would say which actor held it.
 ///
@@ -1087,30 +1126,18 @@ async fn wait_for_shutdown(node: RunningNode) -> eyre::Result<()> {
         system,
         p2p,
         blockchain,
-        mut http,
-        shutdown,
+        http,
     } = node;
     // Read now: the report names unfinished actors by id only.
-    let actors = [
+    let mut actors = vec![
         (p2p.actor_ref().id(), "p2p"),
         (blockchain.actor_ref().id(), "blockchain"),
     ];
-
-    shutdown.cancel();
-    if tokio::time::timeout(HTTP_SHUTDOWN_TIMEOUT, &mut http)
-        .await
-        .is_err()
-    {
-        warn!(
-            timeout_secs = HTTP_SHUTDOWN_TIMEOUT.as_secs(),
-            "HTTP server did not close in time; aborting it"
-        );
-        http.abort();
+    if let Ok(server) = http.current() {
+        actors.push((server.id(), "http"));
     }
 
-    let report = system
-        .shutdown(SHUTDOWN_DEADLINE.saturating_sub(started.elapsed()))
-        .await;
+    let report = system.shutdown(SHUTDOWN_DEADLINE).await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
     if report.complete {
         info!(elapsed_ms, "Shutdown complete");
