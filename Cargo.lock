@@ -2010,7 +2010,7 @@ dependencies = [
  "serde_yaml_ng",
  "sha2",
  "snap",
- "spawned-concurrency 0.6.0",
+ "spawned-concurrency 0.7.0",
  "tempfile",
  "thiserror 2.0.18",
  "tikv-jemallocator",
@@ -2041,7 +2041,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snap",
- "spawned-concurrency 0.6.0",
+ "spawned-concurrency 0.7.0",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -2101,7 +2101,7 @@ name = "ethlambda-network-api"
 version = "1.0.0"
 dependencies = [
  "ethlambda-types",
- "spawned-concurrency 0.6.0",
+ "spawned-concurrency 0.7.0",
 ]
 
 [[package]]
@@ -2129,7 +2129,7 @@ dependencies = [
  "secp256k1 0.30.0",
  "sha2",
  "snap",
- "spawned-concurrency 0.6.0",
+ "spawned-concurrency 0.7.0",
  "spawned-test",
  "thiserror 2.0.18",
  "tokio",
@@ -2161,7 +2161,7 @@ dependencies = [
  "libssz-types 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=5cb14378ffdadcb51b387c003567e2630d0c7073)",
  "serde",
  "serde_json",
- "spawned-concurrency 0.6.0",
+ "spawned-concurrency 0.7.0",
  "tokio",
  "tokio-util",
  "tower",
@@ -6598,13 +6598,13 @@ dependencies = [
 
 [[package]]
 name = "spawned-concurrency"
-version = "0.6.0"
-source = "git+https://github.com/lambdaclass/spawned?rev=fd28d2e93ceae3657073b030b0c64d81ec2c11d9#fd28d2e93ceae3657073b030b0c64d81ec2c11d9"
+version = "0.7.0"
+source = "git+https://github.com/lambdaclass/spawned?rev=39be3f3b62fa87ade2b62dbf45f0437f95024480#39be3f3b62fa87ade2b62dbf45f0437f95024480"
 dependencies = [
  "futures",
  "pin-project-lite",
- "spawned-macros 0.6.0",
- "spawned-rt 0.6.0",
+ "spawned-macros 0.7.0",
+ "spawned-rt 0.7.0",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -6622,8 +6622,8 @@ dependencies = [
 
 [[package]]
 name = "spawned-macros"
-version = "0.6.0"
-source = "git+https://github.com/lambdaclass/spawned?rev=fd28d2e93ceae3657073b030b0c64d81ec2c11d9#fd28d2e93ceae3657073b030b0c64d81ec2c11d9"
+version = "0.7.0"
+source = "git+https://github.com/lambdaclass/spawned?rev=39be3f3b62fa87ade2b62dbf45f0437f95024480#39be3f3b62fa87ade2b62dbf45f0437f95024480"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6646,8 +6646,8 @@ dependencies = [
 
 [[package]]
 name = "spawned-rt"
-version = "0.6.0"
-source = "git+https://github.com/lambdaclass/spawned?rev=fd28d2e93ceae3657073b030b0c64d81ec2c11d9#fd28d2e93ceae3657073b030b0c64d81ec2c11d9"
+version = "0.7.0"
+source = "git+https://github.com/lambdaclass/spawned?rev=39be3f3b62fa87ade2b62dbf45f0437f95024480#39be3f3b62fa87ade2b62dbf45f0437f95024480"
 dependencies = [
  "ctrlc",
  "loom",
@@ -6661,11 +6661,11 @@ dependencies = [
 
 [[package]]
 name = "spawned-test"
-version = "0.6.0"
-source = "git+https://github.com/lambdaclass/spawned?rev=fd28d2e93ceae3657073b030b0c64d81ec2c11d9#fd28d2e93ceae3657073b030b0c64d81ec2c11d9"
+version = "0.7.0"
+source = "git+https://github.com/lambdaclass/spawned?rev=39be3f3b62fa87ade2b62dbf45f0437f95024480#39be3f3b62fa87ade2b62dbf45f0437f95024480"
 dependencies = [
- "spawned-concurrency 0.6.0",
- "spawned-rt 0.6.0",
+ "spawned-concurrency 0.7.0",
+ "spawned-rt 0.7.0",
  "tracing",
 ]
 
