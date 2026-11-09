@@ -92,7 +92,9 @@ base64 = "0.22"
 
 # Unreleased spawned v0.7 (main 32796a88 plus the spawned-test crate). Every
 # spawned crate must name the same revision so they share one set of types.
-spawned-concurrency = { git = "https://github.com/lambdaclass/spawned", rev = "fd28d2e93ceae3657073b030b0c64d81ec2c11d9" }
+# `metrics`: the actor runtime's own counters (mailbox depth, queue wait,
+# handler time, actor exits), appended to `/metrics` by ethlambda-rpc.
+spawned-concurrency = { git = "https://github.com/lambdaclass/spawned", rev = "fd28d2e93ceae3657073b030b0c64d81ec2c11d9", features = ["metrics"] }
 spawned-rt = { git = "https://github.com/lambdaclass/spawned", rev = "fd28d2e93ceae3657073b030b0c64d81ec2c11d9" }
 spawned-test = { git = "https://github.com/lambdaclass/spawned", rev = "fd28d2e93ceae3657073b030b0c64d81ec2c11d9" }
 tokio = "1.0"
