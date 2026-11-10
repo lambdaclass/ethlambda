@@ -94,9 +94,9 @@ base64 = "0.22"
 # so they share one set of types.
 # `metrics`: the actor runtime's own counters (mailbox depth, queue wait,
 # handler time, actor exits), appended to `/metrics` by ethlambda-rpc.
-spawned-concurrency = { version = "0.7.1", features = ["metrics"] }
-spawned-rt = "0.7.1"
-spawned-test = "0.7.1"
+spawned-concurrency = { version = "0.7.2", features = ["metrics"] }
+spawned-rt = "0.7.2"
+spawned-test = "0.7.2"
 tokio = "1.0"
 tokio-util = "0.7"
 
