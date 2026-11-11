@@ -73,10 +73,20 @@ impl Eip8453Host {
     }
 }
 
-/// The parent payload status a stored block was imported with: its recorded
-/// payload link, or `Full` for a block whose link is unknown (the anchor, or a
-/// block before gloas, whose payload ran inside it).
+/// The parent payload status a stored block was imported with: its payload
+/// link, or `Full` for a block whose link has no parent status (the anchor, or
+/// a block before gloas, whose payload ran inside it).
+///
+/// The links are scratch, so a block imported before a restart has none until
+/// it is derived again from the block and its parent's bid
+/// (`ensure_payload_link`, which records it); reading the missing link as
+/// `Full` would refuse every replayed block built on an EMPTY branch.
 fn parent_status_of(store: &Store, root: &H256) -> PayloadStatus {
+    if store.payload_link(root).is_none() {
+        let _ = fork_choice::ensure_payload_link(store, *root).inspect_err(
+            |err| warn!(block_root = %ShortRoot(&root.0), %err, "Cannot derive a payload link"),
+        );
+    }
     store
         .payload_link(root)
         .and_then(|link| link.parent_status())
