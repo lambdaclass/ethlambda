@@ -12,9 +12,10 @@
 //! [`subnets`] hunt's predicate queries. The casts are what let discovery pace
 //! its own lookups, since a libp2p connection is otherwise invisible to it.
 //!
-//! Discovery owns this node's ENR once it starts: it re-signs the record when
-//! discv5's IP voting moves the address. [`LocalEnr`] reads the record it
-//! currently serves, which is what the Beacon API reports.
+//! This node's ENR lives in one lock-free slot that discovery serves from.
+//! discv5's IP voting re-signs it when the address moves, [`LocalEnrWriter`]
+//! re-signs it when a fork boundary moves the `eth2` entry, and [`LocalEnr`]
+//! reads it for the Beacon API.
 //!
 //! See `docs/discovery.md` for the operator-facing description.
 
@@ -26,18 +27,20 @@ pub(crate) mod subnets;
 
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use ethrex_p2p::discovery::{DiscoveryConfig, DiscoveryHandle, DiscoveryServer};
 use ethrex_p2p::types::{LocalNode, Node, SharedLocalNode};
+use libssz::SszEncode;
+use secp256k1::SecretKey;
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::Bootnode;
 use admission::LeanFilter;
-use enr::{EnrForkId, LocalEnrParams, build_local_enr};
+use enr::{ETH2_ENR_KEY, EnrForkId, LocalEnrParams, build_local_enr};
 
 /// Dials per second the loop opens when this node has no peers at all.
 ///
@@ -145,6 +148,9 @@ pub struct SpawnedDiscovery {
     pub(crate) filter: LeanFilter,
     /// The ENR discovery serves, read live; see [`LocalEnr`].
     pub local_enr: LocalEnr,
+    /// The same record's write side, which a fork boundary republishes `eth2`
+    /// through; see [`LocalEnrWriter`].
+    pub(crate) local_enr_writer: LocalEnrWriter,
     /// The attestation subnets this node subscribes to, which its ENR's
     /// `attnets` advertises. What the subnet hunt keeps supplied with peers.
     pub(crate) subscription_subnets: HashSet<u64>,
@@ -168,8 +174,7 @@ pub struct SpawnedDiscovery {
 pub async fn spawn_discovery(
     config: DiscoverySpawnConfig,
 ) -> Result<SpawnedDiscovery, DiscoveryError> {
-    let signer =
-        secp256k1::SecretKey::from_slice(&config.node_key).map_err(DiscoveryError::NodeKey)?;
+    let signer = SecretKey::from_slice(&config.node_key).map_err(DiscoveryError::NodeKey)?;
 
     let bind_addr = SocketAddr::new(config.bind_ip, config.discovery_port);
     let socket = UdpSocket::bind(bind_addr)
@@ -228,9 +233,10 @@ pub async fn spawn_discovery(
     // re-signs it under `params.signer` whenever IP voting bumps the sequence
     // number, keeping the extra entries.
     //
-    // `shared_local_node` is ethrex's live mirror of that identity: every
-    // re-signed record is written back into it. [`LocalEnr`] keeps a clone, so
-    // the identity endpoint reports the record discv5 actually serves.
+    // `local_node` is the only copy of that identity: discovery serves from it
+    // and swaps every re-signed record into it. [`LocalEnr`] and
+    // [`LocalEnrWriter`] keep clones, so the identity endpoint reports the
+    // record discv5 actually serves and a fork boundary edits that same record.
     //
     // `fork_id` publishes an EIP-2124 fork id for discovery to stamp on the ENR
     // when the chain crosses a fork. Neither chain here keys its peers on an
@@ -239,15 +245,18 @@ pub async fn spawn_discovery(
     // "the publisher is gone" and stops checking.
     let (fork_id_tx, fork_id_rx) = watch::channel(None);
     drop(fork_id_tx);
-    let shared_local_node = Arc::new(RwLock::new(LocalNode {
-        node: local_node.clone(),
-        record: local_record.clone(),
-    }));
-    let local_enr = LocalEnr(shared_local_node.clone());
+    let local_node = SharedLocalNode::new(LocalNode {
+        node: local_node,
+        record: local_record,
+    });
+    let local_enr = LocalEnr(local_node.clone());
+    let local_enr_writer = LocalEnrWriter {
+        local_node: local_node.clone(),
+        signer: params.signer,
+    };
 
     let server = DiscoveryServer::spawn(
         local_node,
-        local_record,
         params.signer,
         Arc::new(socket),
         Box::new(filter.clone()),
@@ -266,7 +275,6 @@ pub async fn spawn_discovery(
             // the whole point of having said it.
             nat_extip_set: config.advertise_ip.is_some(),
         },
-        shared_local_node,
         fork_id_rx,
     )
     .await
@@ -293,6 +301,7 @@ pub async fn spawn_discovery(
         handle: discovery,
         filter,
         local_enr,
+        local_enr_writer,
         subscription_subnets,
         target_peers: config.target_peers,
     })
@@ -301,64 +310,99 @@ pub async fn spawn_discovery(
 /// This node's ENR as discovery serves it right now.
 ///
 /// discv5's IP voting re-signs the record at runtime with a new address and a
-/// higher `seq`, and ethrex writes every record it re-signs into the
-/// [`SharedLocalNode`] it was started with. Reading through that, instead of
-/// keeping the string built at startup, is what keeps the Beacon API's
-/// `/eth/v1/node/identity` reporting the record peers get over discv5.
+/// higher `seq`, and so does [`LocalEnrWriter`] at a fork boundary. Both swap
+/// the result into the [`SharedLocalNode`] discovery serves from. Reading
+/// through that, instead of keeping the string built at startup, is what keeps
+/// the Beacon API's `/eth/v1/node/identity` reporting the record peers get over
+/// discv5.
 ///
-/// One direction only: nothing written here would reach discv5, which serves
-/// its own copy and overwrites this one on its next edit. See
-/// [`update_served_enr`] for the other direction.
+/// Read-only, and so safe to hand to the RPC server: editing takes the node
+/// key, which only [`LocalEnrWriter`] holds.
 #[derive(Clone)]
 pub struct LocalEnr(SharedLocalNode);
 
 impl LocalEnr {
-    /// The served record as an `enr:` string, or `None` if it cannot be read.
+    /// The served record as an `enr:` string, or `None` if it cannot be
+    /// encoded.
     ///
     /// Encoding cannot fail for a record `spawn_discovery` already encoded,
-    /// since IP voting edits only the address. A poisoned lock means ethrex
-    /// panicked mid-edit; this answers `None` rather than spread the panic
-    /// into whichever caller asked.
+    /// since the edits after it only replace entries it already carried.
+    /// Takes no lock: [`SharedLocalNode::load`] is a snapshot.
     pub fn current(&self) -> Option<String> {
-        // Cloned out so the guard, which is `!Send`, is dropped right here.
-        let record = self.0.read().ok()?.record.clone();
-        record
+        self.0
+            .load()
+            .record
             .enr_url()
             .inspect_err(|err| warn!(%err, "Could not encode the local ENR"))
             .ok()
     }
 }
 
-/// Publish a new `eth2` entry in the ENR this node serves over discv5.
+/// The write side of [`LocalEnr`]: edits the record discovery serves.
 ///
-/// Not possible with the discovery stack this node is built on, so this only
-/// says so. [`DiscoveryServer::spawn`] now returns the actor's handle, but
-/// `DiscoveryServerProtocol` still has no message that edits the local record:
-/// its consumer-facing messages report peer events, prune, ask for dial
-/// candidates, run predicate queries and refresh a *remote* ENR. ethrex edits
-/// its own record in two places only, both internal: discv5 IP voting
-/// (`update_local_ip`, the address) and `refresh_fork_id`, fed by the `fork_id`
-/// watch channel `spawn` takes. That one is consumer-driven, but it writes the
-/// EIP-2124 `eth` entry, an execution-chain fork id, not the consensus `eth2`
-/// entry this node needs moved. Writing into the [`SharedLocalNode`] mirror
-/// does not help either: discovery serves its own copy and overwrites the
-/// mirror on its next edit. What would close the gap is a protocol message
-/// that applies an edit through `NodeRecord::edit` (one `seq` bump, re-signed)
-/// and mirrors the result, as `refresh_fork_id` already does for `eth`.
-///
-/// Until then the record served to discv5 queries keeps the `eth2` entry it
-/// started with, and so does [`LocalEnr`], which reads what discovery serves. Peers already connected are unaffected (they handshake on
-/// `Status`, which does follow the switch) and the admission filter does move,
-/// but a peer that discovers this node after a boundary reads the stale digest
-/// and rejects the record, so a long-running node becomes harder to find until
-/// it is restarted.
-pub(crate) fn update_served_enr(fork_id: &EnrForkId) {
-    warn!(
-        fork_digest = %hex::encode(fork_id.fork_digest),
-        next_fork_epoch = fork_id.next_fork_epoch,
-        "The served ENR keeps its startup eth2 entry: the discovery server offers no way to \
-         replace its record at runtime"
-    );
+/// Holds the node key every edit is re-signed with, which is why it is a
+/// separate type that stays inside this crate rather than a method on
+/// [`LocalEnr`] riding along into the RPC server.
+pub(crate) struct LocalEnrWriter {
+    local_node: SharedLocalNode,
+    signer: SecretKey,
+}
+
+impl LocalEnrWriter {
+    /// Serve `fork_id` as this node's `eth2` entry.
+    ///
+    /// Does nothing when the served record already carries it. Every edit bumps
+    /// `seq`, and a bumped `seq` sends each peer that next sees our PING or PONG
+    /// back for the whole record, so a call that changes nothing must not edit.
+    ///
+    /// Otherwise the record is re-signed once with `seq` one higher, and peers
+    /// that discover this node after a fork boundary read the digest it is on
+    /// now. Without this they would read the startup digest and reject the
+    /// record, so a long-running node would grow harder to find with every
+    /// boundary until it restarted.
+    pub(crate) fn publish_fork_id(&self, fork_id: &EnrForkId) {
+        let eth2 = fork_id.to_ssz();
+        let served = self.local_node.load();
+        let unchanged = served
+            .record
+            .pairs()
+            .extra(ETH2_ENR_KEY)
+            .is_some_and(|served| served.as_ref() == eth2.as_slice());
+        if unchanged {
+            return;
+        }
+
+        // The edit runs again on a newer record whenever IP voting swaps one in
+        // first, so it must come out the same every time: it only replaces the
+        // one entry, from bytes computed once above.
+        let edited = self.local_node.edit_record(&self.signer, |pairs| {
+            let stored = pairs.set_extra(ETH2_ENR_KEY, eth2.clone());
+            debug_assert!(stored, "eth2 is outside the ENR dictionary");
+        });
+        let fork_digest = hex::encode(fork_id.fork_digest);
+        let next_fork_epoch = fork_id.next_fork_epoch;
+        match edited {
+            Ok(local_node) => info!(
+                %fork_digest,
+                next_fork_epoch,
+                enr_seq = local_node.record.seq,
+                "Serving a new eth2 entry in the local ENR"
+            ),
+            Err(err) => warn!(
+                %err,
+                %fork_digest,
+                next_fork_epoch,
+                "Could not republish the local ENR's eth2 entry; peers keep reading the old one"
+            ),
+        }
+    }
+
+    /// The record discovery serves right now, for tests outside this module
+    /// that hold a `DiscoveryState` rather than a [`LocalEnr`].
+    #[cfg(test)]
+    pub(crate) fn served_record(&self) -> ethrex_p2p::types::NodeRecord {
+        self.local_node.load().record.clone()
+    }
 }
 
 #[cfg(test)]
@@ -367,6 +411,7 @@ mod tests {
     use ethrex_p2p::peer_filter::PeerFilter;
     use ethrex_p2p::types::NodeRecord;
     use ethrex_rlp::decode::RLPDecode;
+    use libssz::SszDecode;
     use std::net::Ipv4Addr;
 
     fn config(discovery_port: u16, advertise_ip: Option<IpAddr>) -> DiscoverySpawnConfig {
@@ -438,6 +483,56 @@ mod tests {
 
         let local_enr = handle.local_enr.current().expect("the served ENR encodes");
         assert_eq!(decode_enr(&local_enr).pairs().ip, Some(advertised));
+    }
+
+    #[tokio::test]
+    async fn a_new_fork_id_is_what_discovery_serves_next() {
+        let handle = spawn_discovery(config(0, None))
+            .await
+            .expect("discovery spawns");
+        let before = decode_enr(&handle.local_enr.current().expect("the served ENR encodes"));
+        let next = EnrForkId {
+            fork_digest: [0x8c, 0x9f, 0x62, 0xfe],
+            next_fork_version: [0x06, 0x00, 0x00, 0x00],
+            next_fork_epoch: enr::FAR_FUTURE_EPOCH,
+        };
+
+        handle.local_enr_writer.publish_fork_id(&next);
+
+        let after = decode_enr(&handle.local_enr.current().expect("the served ENR encodes"));
+        let eth2 = after.pairs().extra(ETH2_ENR_KEY).expect("eth2 entry");
+        assert_eq!(EnrForkId::from_ssz_bytes(&eth2).unwrap(), next);
+        // One edit, one bump: peers learn of the edit from the higher `seq` in
+        // our next PING or PONG.
+        assert_eq!(after.seq, before.seq + 1);
+        assert!(after.verify_signature(), "re-signed with the node key");
+        // Nothing else a peer judges us by moved.
+        for key in [enr::ATTNETS_ENR_KEY, enr::QUIC_ENR_KEY] {
+            assert_eq!(after.pairs().extra(key), before.pairs().extra(key));
+        }
+        assert_eq!(after.pairs().ip, before.pairs().ip);
+        assert_eq!(after.pairs().udp_port, before.pairs().udp_port);
+        // A peer already on the new digest admits the record.
+        handle.filter.set_fork_id(next, Vec::new());
+        assert!(handle.filter.accepts(&after));
+    }
+
+    #[tokio::test]
+    async fn republishing_the_served_fork_id_leaves_the_record_alone() {
+        let handle = spawn_discovery(config(0, None))
+            .await
+            .expect("discovery spawns");
+        let before = handle.local_enr.current().expect("the served ENR encodes");
+
+        // `config` publishes `EnrForkId::local()`, and `transition::apply`
+        // offers the entry on every call, boundary or not.
+        handle.local_enr_writer.publish_fork_id(&EnrForkId::local());
+
+        let after = handle.local_enr.current().expect("the served ENR encodes");
+        assert_eq!(
+            after, before,
+            "no edit, so no `seq` bump for peers to chase"
+        );
     }
 
     #[tokio::test]

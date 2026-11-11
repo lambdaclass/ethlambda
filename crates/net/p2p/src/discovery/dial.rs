@@ -26,7 +26,7 @@ use super::node_id::node_id_from_peer_id;
 use super::subnets::SubnetHunt;
 use super::{
     DIAL_INTERVAL_AT_TARGET, DIAL_INTERVAL_AT_ZERO_PEERS, DISCOVERY_CANDIDATE_BATCH,
-    SpawnedDiscovery,
+    LocalEnrWriter, SpawnedDiscovery,
 };
 use crate::swarm_adapter::DialOutcome;
 use crate::{ConnectionDirection, P2PServer, metrics};
@@ -58,6 +58,9 @@ pub(crate) struct DiscoveryState {
     /// A handle on the admission policy discovery also runs, so a fork
     /// boundary can move both with one call. See [`LeanFilter::set_fork_id`].
     filter: LeanFilter,
+    /// The write side of the ENR discovery serves, so a fork boundary can move
+    /// its `eth2` entry along with the filter.
+    local_enr_writer: LocalEnrWriter,
 }
 
 impl DiscoveryState {
@@ -78,12 +81,18 @@ impl DiscoveryState {
             local_peer_id,
             target_peers: spawned.target_peers,
             filter: spawned.filter,
+            local_enr_writer: spawned.local_enr_writer,
         }
     }
 
     /// The admission policy shared with discovery.
     pub(crate) fn filter(&self) -> &LeanFilter {
         &self.filter
+    }
+
+    /// The write side of the ENR discovery serves.
+    pub(crate) fn local_enr_writer(&self) -> &LocalEnrWriter {
+        &self.local_enr_writer
     }
 
     /// Connected-peer count above which the loop stops dialing.
