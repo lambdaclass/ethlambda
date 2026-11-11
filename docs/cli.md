@@ -410,7 +410,9 @@ The slot length and the duty offsets are read from the beacon node's
 `/eth/v1/config/spec`, not divided out of a compiled-in constant. The
 specification states them as `SLOT_DURATION_MS` plus basis points of it,
 `ATTESTATION_DUE_BPS` and `AGGREGATE_DUE_BPS`, which on mainnet's 12-second slot
-work out at 3999 ms and 8000 ms. Gloas moves both earlier
+work out at 4000 ms and 8000 ms (`get_slot_component_duration_ms` rounds to the
+nearest millisecond; the beacon node judges the same deadlines with the same
+function, `Config::slot_component_duration_ms`). Gloas moves both earlier
 (`ATTESTATION_DUE_BPS_GLOAS`, `AGGREGATE_DUE_BPS_GLOAS`) and adds
 `PAYLOAD_ATTESTATION_DUE_BPS` (and `PAYLOAD_DUE_BPS`, which the node uses), so
 the clock picks the pair by the fork of each slot's own epoch. The sync

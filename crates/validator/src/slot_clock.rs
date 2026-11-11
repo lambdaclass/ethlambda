@@ -13,9 +13,6 @@ use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
 use ethlambda_types::beacon::primitives::{Epoch, Slot};
 
-/// Basis points in a whole, which is what the duty offsets are expressed in.
-const BASIS_POINTS: u64 = 10_000;
-
 /// Converts wall-clock time to slots and back, for a chain whose genesis, slot
 /// length and duty offsets are fixed for the life of the clock.
 ///
@@ -25,11 +22,12 @@ const BASIS_POINTS: u64 = 10_000;
 /// `SECONDS_PER_SLOT`. Both halves of that are gone. The slot length is
 /// `SLOT_DURATION_MS`, and the offsets are basis points of it:
 /// `ATTESTATION_DUE_BPS` and `AGGREGATE_DUE_BPS`, evaluated with
-/// `bps * SLOT_DURATION_MS // BASIS_POINTS`.
+/// `(bps * SLOT_DURATION_MS + BASIS_POINTS // 2) // BASIS_POINTS`, rounded to
+/// the nearest millisecond.
 ///
-/// It is not a cosmetic change. On mainnet the attester offset is 3999 ms, not
-/// the 4000 that a third of a 12-second slot gives, and the gloas fork moves
-/// both offsets to 2500 and 5000 basis points, which no fixed fraction
+/// It is not a cosmetic change. A third of a slot is not 3333 basis points of
+/// it (on a 9-second slot those are 3000 and 2999.7 ms), and the gloas fork
+/// moves both offsets to 2500 and 5000 basis points, which no fixed fraction
 /// expresses. Holding the basis points means this clock follows the network it
 /// was told about rather than the one it was compiled for.
 ///
@@ -244,18 +242,20 @@ impl SlotClock {
     /// `bps` basis points of the way into `slot`.
     ///
     /// The specification's own `get_slot_component_duration_ms`, which is
-    /// `bps * SLOT_DURATION_MS // BASIS_POINTS`: integer arithmetic on
-    /// milliseconds, multiplying before dividing. Doing it in `Duration`
-    /// instead would keep nanoseconds and land 0.4 ms past the spec's answer on
-    /// mainnet, which is wrong in the direction that matters for a deadline.
+    /// `(bps * SLOT_DURATION_MS + BASIS_POINTS // 2) // BASIS_POINTS`: integer
+    /// arithmetic on milliseconds, rounded to the nearest one. It is the same
+    /// function the beacon node judges these deadlines with
+    /// ([`Config::slot_component_duration_ms`]), so the two agree to the
+    /// millisecond; doing it in `Duration` instead would keep the fraction.
     ///
     /// The duration is the one of `slot` itself (EIP-8198's
     /// `get_slot_component_duration_ms` takes the slot's own), never the
     /// genesis one: the same basis points are a different length either side
     /// of the Heze fork.
     fn offset_into(&self, slot: Slot, bps: u64) -> SystemTime {
-        let slot_duration_ms = self.config.slot_duration_ms_at_slot(slot);
-        let offset_ms = bps.saturating_mul(slot_duration_ms) / BASIS_POINTS;
+        let offset_ms = self
+            .config
+            .slot_component_duration_ms(bps, self.epoch_of(slot));
         self.start_of(slot) + Duration::from_millis(offset_ms)
     }
 
@@ -534,10 +534,10 @@ mod tests {
         assert_eq!(clock.epoch_of(SLOTS_PER_EPOCH), 1);
     }
 
-    /// 3333 basis points of a 12-second slot is 3999 ms, not the 4000 a third
-    /// would give. The one-millisecond difference is what the integer floor in
-    /// the specification's own formula produces, and getting it by dividing
-    /// into thirds instead is how this was wrong before.
+    /// 3333 basis points of a 12-second slot is 3999.6 ms, which the
+    /// specification's formula rounds to 4000 (consensus-specs `0f4fa3ff`;
+    /// `v1.7.0-beta.4` floored it to 3999). The beacon node judges the same
+    /// deadline with the same rounding, so the clock must not floor it.
     #[test]
     fn the_attester_duty_runs_at_the_specifications_basis_points() {
         let clock = clock();
@@ -545,8 +545,35 @@ mod tests {
         let start = clock.start_of(10);
         assert_eq!(
             duty.duration_since(start).expect("after the start"),
-            Duration::from_millis(3_999)
+            Duration::from_millis(4_000)
         );
+    }
+
+    /// Every duty offset is the beacon node's own
+    /// `Config::slot_component_duration_ms`, the rounded value, on both sides
+    /// of the gloas boundary.
+    #[test]
+    fn duty_offsets_are_the_beacon_nodes_rounded_deadlines() {
+        let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 2);
+        let clock = SlotClock::from_config(GENESIS, &config);
+        for slot in [2 * SLOTS_PER_EPOCH - 1, 2 * SLOTS_PER_EPOCH] {
+            let epoch = clock.epoch_of(slot);
+            let gloas = clock.is_gloas(slot);
+            let due = |bps: u64| {
+                clock.start_of(slot)
+                    + Duration::from_millis(config.slot_component_duration_ms(bps, epoch))
+            };
+            let (attest, aggregate) = if gloas {
+                (
+                    config.attestation_due_bps_gloas,
+                    config.aggregate_due_bps_gloas,
+                )
+            } else {
+                (config.attestation_due_bps, config.aggregate_due_bps)
+            };
+            assert_eq!(clock.attestation_time(slot), due(attest));
+            assert_eq!(clock.aggregation_time(slot), due(aggregate));
+        }
     }
 
     /// 6667 basis points of a 12-second slot is exactly 8000 ms, which happens
@@ -768,7 +795,9 @@ mod tests {
     fn a_duty_offset_is_a_share_of_the_slots_own_duration() {
         let clock = quick_slots_clock();
         let config = Config::mainnet();
-        let offset = |bps: u64, duration_ms: u64| Duration::from_millis(bps * duration_ms / 10_000);
+        let offset = |bps: u64, duration_ms: u64| {
+            Duration::from_millis((bps * duration_ms + 5_000) / 10_000)
+        };
 
         // Last 12 s slot: the gloas attester offset (2500 bps) is 3 s in.
         assert_eq!(
@@ -868,7 +897,7 @@ mod tests {
         assert!(clock.is_gloas(first_gloas));
         assert_eq!(
             ms(clock.attestation_time(last_fulu), last_fulu),
-            Duration::from_millis(3_999)
+            Duration::from_millis(4_000)
         );
         assert_eq!(
             ms(clock.aggregation_time(last_fulu), last_fulu),
@@ -895,7 +924,7 @@ mod tests {
 
         assert_eq!(
             ms(clock.sync_message_time(last_fulu), last_fulu),
-            Duration::from_millis(3_999)
+            Duration::from_millis(4_000)
         );
         assert_eq!(
             ms(clock.contribution_time(last_fulu), last_fulu),
@@ -917,7 +946,7 @@ mod tests {
         let now = at(5 * SECONDS_PER_SLOT + 1);
         assert_eq!(
             clock.until_sync_message(5, now),
-            Duration::from_millis(2_999)
+            Duration::from_millis(3_000)
         );
         assert_eq!(
             clock.until_contribution(5, now),
@@ -1026,11 +1055,11 @@ mod tests {
     #[test]
     fn the_wait_until_the_attester_duty_is_the_rest_of_the_offset() {
         let clock = clock();
-        // One second into slot 5, whose duty runs 3999 ms in.
+        // One second into slot 5, whose duty runs 4000 ms in.
         let now = at(5 * SECONDS_PER_SLOT + 1);
         assert_eq!(
             clock.until_attestation(5, now),
-            Duration::from_millis(2_999)
+            Duration::from_millis(3_000)
         );
     }
 
@@ -1039,7 +1068,7 @@ mod tests {
         let clock = clock();
         assert_eq!(
             clock.until_attestation(5, clock.start_of(5)),
-            Duration::from_millis(3_999)
+            Duration::from_millis(4_000)
         );
     }
 

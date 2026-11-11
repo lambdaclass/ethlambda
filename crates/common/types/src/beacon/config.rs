@@ -1127,6 +1127,27 @@ impl Config {
         self.slot_duration_ms_at_epoch(slot / preset::SLOTS_PER_EPOCH)
     }
 
+    /// The specification's `get_slot_component_duration_ms`: how many
+    /// milliseconds `basis_points` out of [`constants::BASIS_POINTS`] of a slot
+    /// at `epoch` span, rounded to the nearest millisecond (half up).
+    ///
+    /// `(basis_points * duration + BASIS_POINTS // 2) // BASIS_POINTS`, as
+    /// phase0's `fork-choice.md` has it since consensus-specs `0f4fa3ff`
+    /// (v1.7.0-beta.4 floored instead). On a 12-second slot that moves
+    /// `ATTESTATION_DUE_BPS` (3333) from 3999 to 4000 ms and leaves every other
+    /// configured deadline where it was. The duration is the one in effect at
+    /// `epoch` (EIP-8198), since the same basis points are a different length
+    /// either side of a slot duration change.
+    ///
+    /// One definition for the fork choice and the validator client's
+    /// clock, so the two cannot disagree on a deadline by the rounding.
+    pub fn slot_component_duration_ms(&self, basis_points: u64, epoch: Epoch) -> u64 {
+        basis_points
+            .saturating_mul(self.slot_duration_ms_at_epoch(epoch))
+            .saturating_add(constants::BASIS_POINTS / 2)
+            / constants::BASIS_POINTS
+    }
+
     /// Heze (EIP-8198) `compute_time_at_slot_ms`: the Unix time in
     /// milliseconds at the start of `slot`, summing each schedule segment's
     /// slots at that segment's duration. Saturates instead of wrapping.
@@ -1931,6 +1952,32 @@ mod tests {
         assert_eq!(config.slot_duration_ms_at_epoch(1_000), 9_000);
         assert_eq!(config.slot_duration_ms_at_slot(2 * SPE - 1), 12_000);
         assert_eq!(config.slot_duration_ms_at_slot(2 * SPE), 9_000);
+    }
+
+    /// `get_slot_component_duration_ms` rounds to the nearest millisecond
+    /// (consensus-specs `0f4fa3ff`), where `v1.7.0-beta.4` floored: 3333
+    /// basis points are 3999.6 ms of a 12 s slot, 1999.8 of a 6 s one and
+    /// 2999.7 of a 9 s one.
+    #[test]
+    fn slot_components_round_to_the_nearest_millisecond() {
+        let config = quick_slots();
+        assert_eq!(config.slot_component_duration_ms(3_333, 0), 4_000);
+        assert_eq!(config.slot_component_duration_ms(3_333, 2), 3_000);
+        // 2000.4 and 8000.4 ms still round down.
+        assert_eq!(config.slot_component_duration_ms(1_667, 0), 2_000);
+        assert_eq!(config.slot_component_duration_ms(6_667, 0), 8_000);
+        // Half a millisecond rounds up.
+        let one_second = Config {
+            slot_duration_ms: 1_000,
+            ..Config::mainnet()
+        };
+        assert_eq!(one_second.slot_component_duration_ms(5, 0), 1);
+        assert_eq!(one_second.slot_component_duration_ms(4, 0), 0);
+        let minimal = Config {
+            slot_duration_ms: 6_000,
+            ..Config::mainnet()
+        };
+        assert_eq!(minimal.slot_component_duration_ms(3_333, 0), 2_000);
     }
 
     #[test]

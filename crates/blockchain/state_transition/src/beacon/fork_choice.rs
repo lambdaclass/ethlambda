@@ -2834,14 +2834,16 @@ pub fn seconds_to_milliseconds(seconds: u64) -> u64 {
 }
 
 /// The duration, in milliseconds, that `basis_points` out of
-/// [`constants::BASIS_POINTS`] of a slot spans.
+/// [`constants::BASIS_POINTS`] of a slot spans, rounded to the nearest
+/// millisecond ([`Config::slot_component_duration_ms`], which the validator
+/// client's clock reads too).
 ///
 /// [Modified in Heze:EIP8198]: `epoch` is the epoch of the slot the component
 /// is about, since the slot duration changes at Heze. The specification's
 /// Heze function reads `SLOT_DURATION_MS_HEZE` directly because it only ever
 /// runs there; this crate's functions serve both sides of the boundary.
 pub fn get_slot_component_duration_ms(basis_points: u64, epoch: Epoch, config: &Config) -> u64 {
-    basis_points.saturating_mul(config.slot_duration_ms_at_epoch(epoch)) / constants::BASIS_POINTS
+    config.slot_component_duration_ms(basis_points, epoch)
 }
 
 /// How far into a slot, in milliseconds, an attestation is due.

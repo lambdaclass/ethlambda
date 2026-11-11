@@ -29,13 +29,17 @@ fn a_slot_component_is_a_fraction_of_its_own_epochs_slot() {
     let config = quick_slots();
     assert_eq!(get_slot_component_duration_ms(5_000, 1, &config), 6_000);
     assert_eq!(get_slot_component_duration_ms(5_000, 2, &config), 4_500);
+    // Rounded to the nearest millisecond, either side of the fork: 3999.6 and
+    // 2999.7 ms.
+    assert_eq!(get_slot_component_duration_ms(3_333, 1, &config), 4_000);
+    assert_eq!(get_slot_component_duration_ms(3_333, 2, &config), 3_000);
     assert_eq!(
         get_proposer_reorg_cutoff_ms(1, &config),
-        config.proposer_reorg_cutoff_bps * 12_000 / 10_000
+        (config.proposer_reorg_cutoff_bps * 12_000 + 5_000) / 10_000
     );
     assert_eq!(
         get_proposer_reorg_cutoff_ms(2, &config),
-        config.proposer_reorg_cutoff_bps * 9_000 / 10_000
+        (config.proposer_reorg_cutoff_bps * 9_000 + 5_000) / 10_000
     );
 }
 
