@@ -138,7 +138,7 @@ pub fn submit(
         Ok(Ok(())) => {}
     }
     let is_verified = |root: &crate::beacon::primitives::Root| {
-        node.with(|n| n.engine().is_payload_verified(root))
+        node.with(|n| n.payload_envelope_seen(root))
             .unwrap_or(false)
     };
     let committee = match stateful_checks(is_verified, store, message) {
@@ -156,7 +156,9 @@ pub fn submit(
 /// it `Pending`, a vote for an earlier block names a payload decision, and a
 /// `Full` vote needs a verified, validated payload. `is_verified` answers
 /// `is_payload_verified` (the fork choice engine's record of verified
-/// payloads).
+/// payloads, `Eip8453Node::payload_envelope_seen`, which keeps a payload
+/// invalidated since it was verified, so a vote for it is rejected as invalid
+/// rather than ignored as unseen).
 pub fn verify_head_vote_payload_status(
     is_verified: impl Fn(&crate::beacon::primitives::Root) -> bool,
     store: &Store,
@@ -218,7 +220,7 @@ mod tests {
         let guard = scene.node.lock();
         let node = guard.as_ref().expect("installed");
         cheap_checks(node, &scene.store, message, now_ms)?;
-        let is_verified = |root: &Root| node.engine().is_payload_verified(root);
+        let is_verified = |root: &Root| node.payload_envelope_seen(root);
         stateful_checks(is_verified, &scene.store, message)
     }
 
@@ -406,6 +408,47 @@ mod tests {
         );
         assert_eq!(
             stateful_checks(verified, &store, &full).map(|_| ()),
+            Err(Outcome::Reject(RejectReason::PayloadInvalid))
+        );
+    }
+
+    #[test]
+    fn a_full_vote_for_a_payload_invalidated_since_is_rejected_not_ignored() {
+        let mut scene = scene(16);
+        let slot = scene.anchor_slot + 1;
+        let now = scene.at(slot, 0);
+        let validator = voter(&scene, slot);
+        let full = scene.head_vote(
+            validator,
+            data(slot, scene.anchor_root, PAYLOAD_STATUS_FULL),
+        );
+        let root = scene.anchor_root;
+        scene
+            .node
+            .with(|n| n.on_payload(&root, true, now))
+            .unwrap()
+            .unwrap();
+        scene.store.insert_beacon_block_payload_status(
+            root,
+            scene.anchor_slot,
+            crate::beacon::fork_choice::PayloadStatusEnum::Invalid,
+        );
+        let outcome = scene
+            .node
+            .with(|n| n.invalidate_payload(&root, now))
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ethlambda_decoupled::PayloadInvalidation::Invalidated { .. }
+        ));
+        assert!(
+            !scene
+                .node
+                .with(|n| n.engine().is_payload_verified(&root))
+                .unwrap()
+        );
+        assert_eq!(
+            validate(&scene, &full, now).map(|_| ()),
             Err(Outcome::Reject(RejectReason::PayloadInvalid))
         );
     }

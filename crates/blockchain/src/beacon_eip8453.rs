@@ -10,7 +10,9 @@
 //!   and `update_confirmation` and records the duty inputs of each instant;
 //! * feeds it every imported block (after the state transition, with the head
 //!   vote committees of the votes it carries recorded first) and every verified
-//!   payload;
+//!   payload, and tells it of every payload the execution client later finds
+//!   `INVALID` ([`BlockChainServer::eip8453_invalidate_payload`], from
+//!   `beacon_payloads`' `condemn_gloas_payload`);
 //! * takes the head and the finality gadget's checkpoints back from it, writes
 //!   them to the store (the head, the payload status of the head node, and the
 //!   justified and finalized rows that drive pruning), and tells the execution
@@ -39,8 +41,10 @@
 //! gadget's, or Casper FFG's while the gadget has not finalized) and replays
 //! every stored block above it, with each verified payload, as a joining node:
 //! its receipt times are the restart's, its locks and saved confirmations start
-//! empty, as the lean decoupled mode's do.
+//! empty, as the lean decoupled mode's do. The payload invalidations the store
+//! recorded (`Store::invalid_payloads`) are replayed after the blocks.
 
+use ethlambda_decoupled::PayloadInvalidation;
 use ethlambda_state_transition::beacon::eip8453_fork_choice::{
     self as host, block_input, head_vote_committee, pre_fork_block_input,
 };
@@ -52,7 +56,7 @@ use ethlambda_types::beacon::containers::{BeaconState, SignedBeaconBlock};
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::decoupled::ForkChoiceNode;
 use ethlambda_types::primitives::H256;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{BlockChainServer, metrics};
 
@@ -132,6 +136,23 @@ pub(crate) fn rebuild_node(
         }
         if feed_stored_block(store, &mut node, root, slot, parent, gadget_root, now_ms) {
             replayed += 1;
+        }
+    }
+    // Payloads the execution client found invalid before: their envelopes are
+    // gone, so they replayed unverified, and the blocks built on them left the
+    // store's index; the engine must also know them as invalid, to refuse
+    // their envelopes and the blocks built on them when they come again.
+    for (_slot, root) in store.invalid_payloads() {
+        if let PayloadInvalidation::Committed { checkpoint } =
+            node.engine_mut().invalidate_payload(&root)
+        {
+            error!(
+                block_root = %ShortRoot(&root.0),
+                checkpoint_height = checkpoint.height,
+                checkpoint_root = %ShortRoot(&checkpoint.root.0),
+                "A payload recorded invalid is one the finality gadget's justified or \
+                 finalized block builds on; this node needs operator attention"
+            );
         }
     }
     if let Some((lock, deadline)) = lock(&node) {
@@ -384,6 +405,29 @@ impl BlockChainServer {
                 .on_payload(&root, satisfied, now_ms)
                 .inspect_err(|err| debug!(%err, "The EIP-8453 fork choice did not take a payload"));
         });
+    }
+
+    /// The execution client found `root`'s payload invalid (a later verdict on
+    /// a payload first accepted, or a descendant's `latestValidHash`): the
+    /// engine drops its FULL node and every block built on it, unless the
+    /// finality gadget's justified or finalized block builds on it
+    /// ([`PayloadInvalidation::Committed`], which the caller reports). `None`
+    /// when the engine does not run.
+    pub(crate) fn eip8453_invalidate_payload(&mut self, root: H256) -> Option<PayloadInvalidation> {
+        let now_ms = self.eip8453_now_ms();
+        let outcome = self
+            .eip8453
+            .node
+            .with(|node| node.invalidate_payload(&root, now_ms))
+            .ok()?;
+        if let PayloadInvalidation::Invalidated { removed_blocks } = &outcome {
+            warn!(
+                block_root = %ShortRoot(&root.0),
+                removed_blocks = removed_blocks.len(),
+                "The EIP-8453 fork choice dropped an invalid payload and the blocks built on it"
+            );
+        }
+        Some(outcome)
     }
 
     /// Record an execution client's later verdict on a payload's inclusion

@@ -172,6 +172,11 @@ const KEY_FG_JUSTIFIED: &[u8] = b"fg_justified";
 /// EIP-8453: the finality gadget's finalized checkpoint. See
 /// [`KEY_FG_JUSTIFIED`].
 const KEY_FG_FINALIZED: &[u8] = b"fg_finalized";
+/// Gloas-family payloads the execution client found `INVALID`, above the
+/// finalized slot: an SSZ byte list of 40-byte records, each a block's slot
+/// (little-endian `u64`) and root. Absent means none. See
+/// [`Store::insert_invalid_payload`].
+const KEY_INVALID_PAYLOADS: &[u8] = b"invalid_payloads";
 /// The slot this directory's chain begins at: the anchor block's own slot,
 /// whether that anchor is genesis or a checkpoint. Its value has type [`u64`]
 /// and it's SSZ-encoded.
@@ -4091,6 +4096,53 @@ impl Store {
             .verified_payloads
             .iter()
             .copied()
+            .collect()
+    }
+
+    /// Gloas-family: records, durably, that the execution client found the
+    /// payload of `root` (a block at `slot`) invalid.
+    ///
+    /// The verdict itself lives in the scratch payload-status map
+    /// ([`Self::insert_beacon_block_payload_status`]), and
+    /// [`Self::remove_verified_payload`] deletes the envelope, so after a
+    /// restart an invalidated payload would read as one never verified, whose
+    /// envelope the node would fetch and apply again. This record is what a
+    /// restart replays instead.
+    ///
+    /// Each write drops the records below the finalized slot (the finalized
+    /// block's own stays: its children may still name its payload).
+    pub fn insert_invalid_payload(&mut self, root: H256, slot: u64) {
+        let finalized_slot = self
+            .latest_finalized()
+            .map_or(0, |checkpoint| checkpoint.slot);
+        let mut records = self.invalid_payloads();
+        records.retain(|(record_slot, record_root)| {
+            *record_slot >= finalized_slot && *record_root != root
+        });
+        records.push((slot, root));
+        let bytes: Vec<u8> = records
+            .iter()
+            .flat_map(|(record_slot, record_root)| {
+                record_slot.to_le_bytes().into_iter().chain(record_root.0)
+            })
+            .collect();
+        self.set_metadata(KEY_INVALID_PAYLOADS, &bytes);
+    }
+
+    /// The payloads [`Self::insert_invalid_payload`] recorded, as `(slot,
+    /// root)`, oldest record first. May hold records below the finalized slot
+    /// until the next write.
+    pub fn invalid_payloads(&self) -> Vec<(u64, H256)> {
+        let Some(bytes) = self.try_get_metadata::<Vec<u8>>(KEY_INVALID_PAYLOADS) else {
+            return Vec::new();
+        };
+        bytes
+            .chunks_exact(40)
+            .map(|record| {
+                let slot = u64::from_le_bytes(record[..8].try_into().expect("eight bytes"));
+                let root = H256(record[8..].try_into().expect("thirty-two bytes"));
+                (slot, root)
+            })
             .collect()
     }
 
@@ -9439,6 +9491,34 @@ mod tests {
 
         assert!(store.is_beacon_optimistic(finalized));
         assert!(!store.is_beacon_optimistic(stale));
+    }
+
+    #[test]
+    fn invalid_payload_records_persist_and_drop_below_finality_on_write() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = beacon_test_store(backend.clone());
+        assert!(store.invalid_payloads().is_empty());
+        let (r1, r2, r3) = (
+            H256::repeat_byte(1),
+            H256::repeat_byte(2),
+            H256::repeat_byte(3),
+        );
+        store.insert_invalid_payload(r1, 3);
+        store.insert_invalid_payload(r2, 5);
+        store.insert_invalid_payload(r1, 3);
+        assert_eq!(store.invalid_payloads(), vec![(5, r2), (3, r1)]);
+
+        store.set_metadata(
+            KEY_LATEST_FINALIZED,
+            &Checkpoint {
+                root: H256::repeat_byte(9),
+                slot: 4,
+            },
+        );
+        store.insert_invalid_payload(r3, 6);
+        // Read off the backend, as a restarted store would.
+        let reopened = store.clone();
+        assert_eq!(reopened.invalid_payloads(), vec![(5, r2), (6, r3)]);
     }
 
     #[test]

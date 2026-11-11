@@ -209,7 +209,7 @@ impl Validated {
                 ..
             } => {
                 let is_verified = |root: &Root| {
-                    node.with(|n| n.engine().is_payload_verified(root))
+                    node.with(|n| n.payload_envelope_seen(root))
                         .unwrap_or(false)
                 };
                 match gossip::head_vote::stateful_checks(is_verified, store, message) {

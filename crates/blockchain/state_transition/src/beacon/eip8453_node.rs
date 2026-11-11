@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use ethlambda_decoupled::{
     AcFrame, AcProposal, BlockError, BlockInput, CommitteeError, FinalityAttestationInput,
-    HeadVoteError, PayloadError, Store as Engine, TickEvents, head_vote_data,
+    HeadVoteError, PayloadError, PayloadInvalidation, Store as Engine, TickEvents, head_vote_data,
 };
 use ethlambda_types::decoupled::{
     BlockRef, DecoupledStatus, ForkChoiceNode, HeadVoteData, HeightCheckpoint,
@@ -266,6 +266,53 @@ impl Eip8453Node {
         self.advance_to_ms(now_ms);
         self.engine
             .on_execution_payload_envelope(root, inclusion_list_satisfied)
+    }
+
+    /// The execution client found `root`'s payload invalid: the engine's
+    /// `invalidate_payload`, after advancing to `now_ms`, and the duty inputs
+    /// recorded before it moved off what it removed.
+    ///
+    /// A proposal or head vote recorded at its instant that names the
+    /// payload's `Full` node or a block built on it is moved to the block's
+    /// `Empty` node, the deepest node left on that path, and a recorded
+    /// proposal stops counting votes for removed nodes as support. The
+    /// recorded instant is past and cannot be recomputed; what a validator
+    /// reads from now on names a viable node.
+    pub fn invalidate_payload(&mut self, root: &Root, now_ms: u64) -> PayloadInvalidation {
+        self.advance_to_ms(now_ms);
+        let outcome = self.engine.invalidate_payload(root);
+        if let PayloadInvalidation::Invalidated { removed_blocks } = &outcome {
+            let removed: HashSet<Root> = removed_blocks.iter().copied().collect();
+            let full = ForkChoiceNode::full(*root);
+            let is_gone = |node: &ForkChoiceNode| *node == full || removed.contains(&node.root);
+            let fallback = ForkChoiceNode::empty(*root);
+            for head in self.vote_heads.values_mut() {
+                if is_gone(head) {
+                    *head = fallback;
+                }
+            }
+            for proposal in self.proposals.values_mut() {
+                if is_gone(&proposal.head) {
+                    proposal.head = fallback;
+                }
+                let messages = &proposal.vote_messages;
+                proposal.support_indices.retain(|&index| {
+                    messages
+                        .get(index)
+                        .and_then(|message| message.data.supported_node())
+                        .is_some_and(|node| !is_gone(&node))
+                });
+            }
+        }
+        outcome
+    }
+
+    /// Whether `root`'s payload envelope has been "seen and verified", as the
+    /// head vote gossip rule asks: verified, or verified and since invalidated,
+    /// so a vote for an invalidated payload reaches the rule that rejects it
+    /// rather than being ignored as unseen.
+    pub fn payload_envelope_seen(&self, root: &Root) -> bool {
+        self.engine.is_payload_verified(root) || self.engine.is_payload_invalidated(root)
     }
 
     // ── Head votes and attestations ───────────────────────────────────────

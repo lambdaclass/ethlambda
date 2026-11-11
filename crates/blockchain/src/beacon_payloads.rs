@@ -29,6 +29,7 @@
 
 use std::collections::HashMap;
 
+use ethlambda_decoupled::PayloadInvalidation;
 use ethlambda_engine::ForkchoiceStateV1;
 use ethlambda_state_transition::beacon::fork_choice::{
     self, PayloadStatus, PayloadStatusEnum, PayloadValidity,
@@ -286,6 +287,11 @@ pub(crate) fn seed_resumed_payload_statuses(store: &mut Store, engine_configured
             store.insert_beacon_block_payload_status(root, slot, status);
         }
     }
+    // EIP-8453: a payload invalidated before the restart keeps its verdict, so
+    // its envelope is refused and a head vote for it rejected, as before.
+    for (slot, root) in store.invalid_payloads() {
+        store.insert_beacon_block_payload_status(root, slot, PayloadStatusEnum::Invalid);
+    }
 }
 
 impl BlockChainServer {
@@ -386,6 +392,13 @@ impl BlockChainServer {
     /// A pre-gloas `root` takes the block-level path instead: its payload is
     /// the block's, so the whole subtree goes. Refuses a block at or below
     /// finality, like [`fork_choice::invalidate_subtree`].
+    ///
+    /// Under the EIP-8453 fork choice the engine is told first, and the
+    /// finality gadget decides what is final: the engine refuses a payload its
+    /// justified or finalized block builds on (logged here, and nothing
+    /// changes), and otherwise drops the FULL node and the blocks built on it
+    /// before the store does the same. Such an invalidation is also recorded
+    /// durably, for a restart to replay ([`crate::beacon_eip8453::rebuild_node`]).
     fn condemn_gloas_payload(&mut self, root: H256, index: &HashMap<H256, (u64, H256)>) -> bool {
         let Some(block) = self.store.get_signed_block(&root).ok().flatten() else {
             return false;
@@ -395,15 +408,36 @@ impl BlockChainServer {
         };
         let hash = bid.block_hash;
         let slot = block.slot();
-        let finalized = self.store.beacon_finalized_checkpoint();
-        if root == finalized.root || slot <= compute_start_slot_at_epoch(finalized.epoch) {
-            error!(
-                condemned = %ShortRoot(&root.0),
-                "The execution client condemned a finalized payload; refusing to invalidate. \
-                 The execution and consensus layers disagree about finalized history and \
-                 this node needs operator attention"
-            );
-            return false;
+        let gadget = self.eip8453_invalidate_payload(root);
+        match &gadget {
+            Some(PayloadInvalidation::Committed { checkpoint }) => {
+                error!(
+                    %slot,
+                    condemned = %ShortRoot(&root.0),
+                    checkpoint_height = checkpoint.height,
+                    checkpoint_root = %ShortRoot(&checkpoint.root.0),
+                    "The execution client condemned a payload the finality gadget's justified \
+                     or finalized block builds on; refusing to invalidate. The execution and \
+                     consensus layers disagree about history the gadget committed to and this \
+                     node needs operator attention"
+                );
+                return false;
+            }
+            Some(
+                PayloadInvalidation::Invalidated { .. } | PayloadInvalidation::AlreadyInvalidated,
+            ) => {}
+            Some(PayloadInvalidation::NotHeld) | None => {
+                let finalized = self.store.beacon_finalized_checkpoint();
+                if root == finalized.root || slot <= compute_start_slot_at_epoch(finalized.epoch) {
+                    error!(
+                        condemned = %ShortRoot(&root.0),
+                        "The execution client condemned a finalized payload; refusing to \
+                         invalidate. The execution and consensus layers disagree about \
+                         finalized history and this node needs operator attention"
+                    );
+                    return false;
+                }
+            }
         }
 
         warn!(
@@ -440,6 +474,17 @@ impl BlockChainServer {
             .collect();
         for child in full_children {
             removed |= fork_choice::invalidate_subtree(&mut self.store, child) > 0;
+        }
+        match gadget {
+            Some(PayloadInvalidation::Invalidated { .. }) => {
+                self.store.insert_invalid_payload(root, slot);
+                // The engine's tree changed, whatever the store's did.
+                removed = true;
+            }
+            Some(PayloadInvalidation::AlreadyInvalidated) => {
+                self.store.insert_invalid_payload(root, slot);
+            }
+            _ => {}
         }
         removed
     }
