@@ -232,13 +232,23 @@ impl BlockChainServer {
 }
 
 impl Handler<EpochPrecomputeCheck> for BlockChainServer {
-    async fn handle(&mut self, msg: EpochPrecomputeCheck, _reply: PendingReply<'_, ()>, ctx: &Context<Self>) {
+    async fn handle(
+        &mut self,
+        msg: EpochPrecomputeCheck,
+        _reply: PendingReply<'_, ()>,
+        ctx: &Context<Self>,
+    ) {
         self.maybe_start_epoch_precompute(Trigger::Timer { slot: msg.slot }, ctx);
     }
 }
 
 impl Handler<EpochPrecomputed> for BlockChainServer {
-    async fn handle(&mut self, msg: EpochPrecomputed, _reply: PendingReply<'_, ()>, _ctx: &Context<Self>) {
+    async fn handle(
+        &mut self,
+        msg: EpochPrecomputed,
+        _reply: PendingReply<'_, ()>,
+        _ctx: &Context<Self>,
+    ) {
         self.epoch_precompute_in_flight = None;
         match msg.result {
             Ok(state) => {

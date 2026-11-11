@@ -107,7 +107,12 @@ impl Message for InjectCrash {
 }
 
 impl Handler<InjectCrash> for HttpServer {
-    async fn handle(&mut self, _msg: InjectCrash, _reply: PendingReply<'_, ()>, _ctx: &Context<Self>) {
+    async fn handle(
+        &mut self,
+        _msg: InjectCrash,
+        _reply: PendingReply<'_, ()>,
+        _ctx: &Context<Self>,
+    ) {
         panic!("fault injection: crashing the HTTP server");
     }
 }

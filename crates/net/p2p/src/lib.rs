@@ -1746,110 +1746,200 @@ impl P2PServer {
 // --- Manual Handler impls for network-api messages ---
 
 impl Handler<InitBlockChain> for P2PServer {
-    async fn handle(&mut self, msg: InitBlockChain, _reply: PendingReply<'_, ()>, _ctx: &Context<Self>) {
+    async fn handle(
+        &mut self,
+        msg: InitBlockChain,
+        _reply: PendingReply<'_, ()>,
+        _ctx: &Context<Self>,
+    ) {
         self.blockchain = Some(msg.blockchain);
         info!("BlockChain protocol ref initialized");
     }
 }
 
 impl Handler<PublishBlock> for P2PServer {
-    async fn handle(&mut self, msg: PublishBlock, _reply: PendingReply<'_, ()>, _ctx: &Context<Self>) {
+    async fn handle(
+        &mut self,
+        msg: PublishBlock,
+        _reply: PendingReply<'_, ()>,
+        _ctx: &Context<Self>,
+    ) {
         publish_block(self, msg.block).await;
     }
 }
 
 impl Handler<PublishAttestation> for P2PServer {
-    async fn handle(&mut self, msg: PublishAttestation, _reply: PendingReply<'_, ()>, _ctx: &Context<Self>) {
+    async fn handle(
+        &mut self,
+        msg: PublishAttestation,
+        _reply: PendingReply<'_, ()>,
+        _ctx: &Context<Self>,
+    ) {
         publish_attestation(self, msg.attestation).await;
     }
 }
 
 impl Handler<PublishAggregatedAttestation> for P2PServer {
-    async fn handle(&mut self, msg: PublishAggregatedAttestation, _reply: PendingReply<'_, ()>, _ctx: &Context<Self>) {
+    async fn handle(
+        &mut self,
+        msg: PublishAggregatedAttestation,
+        _reply: PendingReply<'_, ()>,
+        _ctx: &Context<Self>,
+    ) {
         publish_aggregated_attestation(self, msg.attestation).await;
     }
 }
 
 impl Handler<PublishBeaconAggregate> for P2PServer {
-    async fn handle(&mut self, msg: PublishBeaconAggregate, _reply: PendingReply<'_, ()>, _ctx: &Context<Self>) {
+    async fn handle(
+        &mut self,
+        msg: PublishBeaconAggregate,
+        _reply: PendingReply<'_, ()>,
+        _ctx: &Context<Self>,
+    ) {
         publish_beacon_aggregate(self, msg.aggregate, msg.attesting_indices).await;
     }
 }
 
 impl Handler<PublishBeaconOperation> for P2PServer {
-    async fn handle(&mut self, msg: PublishBeaconOperation, _reply: PendingReply<'_, ()>, _ctx: &Context<Self>) {
+    async fn handle(
+        &mut self,
+        msg: PublishBeaconOperation,
+        _reply: PendingReply<'_, ()>,
+        _ctx: &Context<Self>,
+    ) {
         publish_beacon_operation(self, msg.operation).await;
     }
 }
 
 impl Handler<PublishBeaconBlock> for P2PServer {
-    async fn handle(&mut self, msg: PublishBeaconBlock, _reply: PendingReply<'_, ()>, _ctx: &Context<Self>) {
+    async fn handle(
+        &mut self,
+        msg: PublishBeaconBlock,
+        _reply: PendingReply<'_, ()>,
+        _ctx: &Context<Self>,
+    ) {
         publish_beacon_block(self, msg.block, msg.sidecars).await;
     }
 }
 
 impl Handler<PublishExecutionPayloadEnvelope> for P2PServer {
-    async fn handle(&mut self, msg: PublishExecutionPayloadEnvelope, _reply: PendingReply<'_, ()>, _ctx: &Context<Self>) {
+    async fn handle(
+        &mut self,
+        msg: PublishExecutionPayloadEnvelope,
+        _reply: PendingReply<'_, ()>,
+        _ctx: &Context<Self>,
+    ) {
         gossipsub::publish_execution_payload_envelope(self, *msg.envelope, msg.sidecars).await;
     }
 }
 
 impl Handler<PublishExecutionPayloadBid> for P2PServer {
-    async fn handle(&mut self, msg: PublishExecutionPayloadBid, _reply: PendingReply<'_, ()>, _ctx: &Context<Self>) {
+    async fn handle(
+        &mut self,
+        msg: PublishExecutionPayloadBid,
+        _reply: PendingReply<'_, ()>,
+        _ctx: &Context<Self>,
+    ) {
         beacon::builder_market::publish_execution_payload_bid(self, msg.bid);
     }
 }
 
 impl Handler<PublishProposerPreferences> for P2PServer {
-    async fn handle(&mut self, msg: PublishProposerPreferences, _reply: PendingReply<'_, ()>, _ctx: &Context<Self>) {
+    async fn handle(
+        &mut self,
+        msg: PublishProposerPreferences,
+        _reply: PendingReply<'_, ()>,
+        _ctx: &Context<Self>,
+    ) {
         beacon::builder_market::publish_proposer_preferences(self, msg.preferences);
     }
 }
 
 impl Handler<PublishPayloadAttestationMessage> for P2PServer {
-    async fn handle(&mut self, msg: PublishPayloadAttestationMessage, _reply: PendingReply<'_, ()>, _ctx: &Context<Self>) {
+    async fn handle(
+        &mut self,
+        msg: PublishPayloadAttestationMessage,
+        _reply: PendingReply<'_, ()>,
+        _ctx: &Context<Self>,
+    ) {
         gossipsub::publish_payload_attestation_message(self, msg.message).await;
     }
 }
 
 impl Handler<SubscribeAttestationSubnets> for P2PServer {
-    async fn handle(&mut self, msg: SubscribeAttestationSubnets, _reply: PendingReply<'_, ()>, _ctx: &Context<Self>) {
+    async fn handle(
+        &mut self,
+        msg: SubscribeAttestationSubnets,
+        _reply: PendingReply<'_, ()>,
+        _ctx: &Context<Self>,
+    ) {
         gossipsub::join_aggregator_subnets(self, msg.subnets);
     }
 }
 
 impl Handler<PublishSyncCommitteeMessage> for P2PServer {
-    async fn handle(&mut self, msg: PublishSyncCommitteeMessage, _reply: PendingReply<'_, ()>, _ctx: &Context<Self>) {
+    async fn handle(
+        &mut self,
+        msg: PublishSyncCommitteeMessage,
+        _reply: PendingReply<'_, ()>,
+        _ctx: &Context<Self>,
+    ) {
         beacon::sync_committee::publish_sync_committee_message(self, msg.subnet_ids, msg.message);
     }
 }
 
 impl Handler<PublishSyncCommitteeContribution> for P2PServer {
-    async fn handle(&mut self, msg: PublishSyncCommitteeContribution, _reply: PendingReply<'_, ()>, _ctx: &Context<Self>) {
+    async fn handle(
+        &mut self,
+        msg: PublishSyncCommitteeContribution,
+        _reply: PendingReply<'_, ()>,
+        _ctx: &Context<Self>,
+    ) {
         beacon::sync_committee::publish_sync_committee_contribution(self, msg.contribution);
     }
 }
 
 impl Handler<SubscribeSyncCommitteeSubnets> for P2PServer {
-    async fn handle(&mut self, msg: SubscribeSyncCommitteeSubnets, _reply: PendingReply<'_, ()>, _ctx: &Context<Self>) {
+    async fn handle(
+        &mut self,
+        msg: SubscribeSyncCommitteeSubnets,
+        _reply: PendingReply<'_, ()>,
+        _ctx: &Context<Self>,
+    ) {
         beacon::sync_committee::join_sync_committee_subnets(self, msg.subnets);
     }
 }
 
 impl Handler<PublishBeaconAttestation> for P2PServer {
-    async fn handle(&mut self, msg: PublishBeaconAttestation, _reply: PendingReply<'_, ()>, _ctx: &Context<Self>) {
+    async fn handle(
+        &mut self,
+        msg: PublishBeaconAttestation,
+        _reply: PendingReply<'_, ()>,
+        _ctx: &Context<Self>,
+    ) {
         publish_beacon_attestation(self, msg.subnet_id, msg.attestation).await;
     }
 }
 
 impl Handler<FetchBlock> for P2PServer {
-    async fn handle(&mut self, msg: FetchBlock, _reply: PendingReply<'_, ()>, _ctx: &Context<Self>) {
+    async fn handle(
+        &mut self,
+        msg: FetchBlock,
+        _reply: PendingReply<'_, ()>,
+        _ctx: &Context<Self>,
+    ) {
         fetch_missing(self, msg.request).await;
     }
 }
 
 impl Handler<CheckDataColumnSidecars> for P2PServer {
-    async fn handle(&mut self, msg: CheckDataColumnSidecars, _reply: PendingReply<'_, ()>, _ctx: &Context<Self>) {
+    async fn handle(
+        &mut self,
+        msg: CheckDataColumnSidecars,
+        _reply: PendingReply<'_, ()>,
+        _ctx: &Context<Self>,
+    ) {
         beacon::column_checks::check_and_forward(self, msg.sidecars);
     }
 }
@@ -1938,7 +2028,12 @@ async fn fetch_missing_columns(server: &mut P2PServer, block_root: H256, columns
 // --- Manual Handler for swarm events ---
 
 impl Handler<WrappedSwarmEvent> for P2PServer {
-    async fn handle(&mut self, msg: WrappedSwarmEvent, _reply: PendingReply<'_, ()>, ctx: &Context<Self>) {
+    async fn handle(
+        &mut self,
+        msg: WrappedSwarmEvent,
+        _reply: PendingReply<'_, ()>,
+        ctx: &Context<Self>,
+    ) {
         handle_swarm_event(self, msg.0, ctx).await;
     }
 }

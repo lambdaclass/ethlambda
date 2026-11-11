@@ -547,7 +547,12 @@ fn settle(server: &mut P2PServer, outcome: Outcome, object: &Validated) -> Outco
 }
 
 impl Handler<GossipVerdict> for P2PServer {
-    async fn handle(&mut self, msg: GossipVerdict, _reply: PendingReply<'_, ()>, _ctx: &Context<Self>) {
+    async fn handle(
+        &mut self,
+        msg: GossipVerdict,
+        _reply: PendingReply<'_, ()>,
+        _ctx: &Context<Self>,
+    ) {
         let GossipVerdict {
             id,
             outcome,
