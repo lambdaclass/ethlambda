@@ -4,8 +4,10 @@
 //! keystores themselves. It is what the keymanager API mutates, so a key
 //! imported at runtime is still there after a restart.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -58,11 +60,14 @@ enum SigningKind {
 /// would silently ignore half of what the operator wrote, and loading it as
 /// local would bypass the remote signer and its slashing protection.
 ///
-/// Unknown fields are refused rather than skipped, so a Lighthouse field this
-/// client does not implement (`root_certificate_path`, say) is reported at
-/// startup instead of quietly having no effect.
+/// A field this client does not read is refused on a web3signer entry and
+/// skipped on a local one. On a remote entry it is most likely one of
+/// Lighthouse's signer settings (`root_certificate_path`, say), and an
+/// operator who set it expects it to take effect: skipped, the key would sign
+/// through a connection configured differently from the one they wrote down.
+/// A local entry has no such field, so a file Lighthouse wrote, with its own
+/// per-validator settings on each entry, still loads.
 #[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawDefinition {
     enabled: bool,
     voting_public_key: String,
@@ -74,7 +79,18 @@ struct RawDefinition {
     voting_keystore_password_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     url: Option<String>,
+    /// Every other field the entry carries, by name: what a web3signer entry
+    /// is refused for. Read only, so a rewritten entry holds the fields above
+    /// and nothing else.
+    #[serde(flatten, skip_serializing)]
+    unread: BTreeMap<String, IgnoredAny>,
 }
+
+/// The one unread field a web3signer entry may carry. Lighthouse writes
+/// `description` on every entry, an empty one included, so refusing it would
+/// refuse every remote entry Lighthouse wrote; it is a label, and changes
+/// nothing about how the key signs.
+const DESCRIPTION_FIELD: &str = "description";
 
 impl TryFrom<RawDefinition> for ValidatorDefinition {
     type Error = String;
@@ -113,6 +129,21 @@ impl TryFrom<RawDefinition> for ValidatorDefinition {
                 ));
             }
         };
+        if kind == SigningKind::Web3signer {
+            let unread: Vec<&str> = raw
+                .unread
+                .keys()
+                .map(String::as_str)
+                .filter(|field| *field != DESCRIPTION_FIELD)
+                .collect();
+            if !unread.is_empty() {
+                return Err(format!(
+                    "{}: a web3signer entry carries fields this client does not implement: {}",
+                    raw.voting_public_key,
+                    unread.join(", ")
+                ));
+            }
+        }
         let missing = |field: &str| format!("{}: missing field `{field}`", raw.voting_public_key);
         let signing = match kind {
             SigningKind::LocalKeystore => SigningDefinition::LocalKeystore {
@@ -161,6 +192,7 @@ impl From<ValidatorDefinition> for RawDefinition {
             voting_keystore_path,
             voting_keystore_password_path,
             url,
+            unread: BTreeMap::new(),
         }
     }
 }
@@ -488,16 +520,88 @@ mod tests {
         assert!(err.contains("voting_keystore_password_path"), "{err}");
     }
 
-    /// A field this client does not implement is reported, not ignored: an
-    /// operator who set `root_certificate_path` expects it to take effect.
+    /// A field this client does not implement is reported on a remote entry,
+    /// not ignored: an operator who set `root_certificate_path` expects it to
+    /// take effect. Every such field is named, whether the entry says its
+    /// `type` or is read as remote by its `url`.
     #[test]
-    fn an_unknown_field_is_refused() {
-        let err = open_text(
+    fn an_unimplemented_field_on_a_remote_entry_is_refused() {
+        let typed = open_text(
             "- enabled: true\n  voting_public_key: '0xaa'\n  type: web3signer\n  \
-             url: https://signer:9000\n  root_certificate_path: ca.pem\n",
+             url: https://signer:9000\n  root_certificate_path: ca.pem\n  \
+             request_timeout_ms: 500\n",
         )
-        .expect_err("unknown field");
-        assert!(err.contains("root_certificate_path"), "{err}");
+        .expect_err("unimplemented fields");
+        assert!(
+            typed.contains("request_timeout_ms, root_certificate_path"),
+            "{typed}"
+        );
+
+        let untyped = open_text(
+            "- enabled: true\n  voting_public_key: '0xaa'\n  \
+             url: https://signer:9000\n  suggested_fee_recipient: '0x00'\n",
+        )
+        .expect_err("unimplemented field");
+        assert!(untyped.contains("suggested_fee_recipient"), "{untyped}");
+    }
+
+    /// Lighthouse writes `description` on every entry, so a remote entry it
+    /// wrote, with no signer settings of its own, has to load.
+    #[test]
+    fn a_remote_entry_may_carry_a_description() {
+        let read = open_text(
+            "- enabled: true\n  voting_public_key: '0xaa'\n  description: ''\n  \
+             type: web3signer\n  url: https://signer:9000\n",
+        )
+        .expect("a remote entry as Lighthouse writes it");
+        assert_eq!(
+            read.0,
+            vec![remote_definition("0xaa", "https://signer:9000")]
+        );
+    }
+
+    /// A local entry is read past the fields this client does not have, typed
+    /// or not, so a file Lighthouse wrote loads as it did before entries had
+    /// a `type`.
+    #[test]
+    fn a_field_this_client_does_not_read_is_skipped_on_a_local_entry() {
+        let read = open_text(
+            "- enabled: true\n  voting_public_key: '0xaa'\n  \
+             graffiti: mine\n  builder_proposals: true\n  description: ''\n  \
+             type: local_keystore\n  voting_keystore_path: keystore.json\n  \
+             voting_keystore_password_path: password.txt\n\
+             - enabled: false\n  voting_public_key: '0xbb'\n  gas_limit: 30000000\n  \
+             voting_keystore_path: keystore.json\n  \
+             voting_keystore_password_path: password.txt\n",
+        )
+        .expect("local entries with Lighthouse's own fields");
+        assert_eq!(
+            read.0,
+            vec![definition("0xaa", true), definition("0xbb", false)]
+        );
+    }
+
+    /// The fields read past on the way in are not written back: an entry is
+    /// saved as the fields this client has, as it always was.
+    #[test]
+    fn a_skipped_field_is_not_written_back() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join(DEFINITIONS_FILE),
+            "- enabled: true\n  voting_public_key: '0xaa'\n  graffiti: mine\n  \
+             voting_keystore_path: keystore.json\n  \
+             voting_keystore_password_path: password.txt\n",
+        )
+        .expect("writes");
+
+        let read = ValidatorDefinitions::open(dir.path()).expect("opens");
+        read.save(dir.path()).expect("saves");
+        let text = std::fs::read_to_string(dir.path().join(DEFINITIONS_FILE)).expect("reads");
+        assert!(!text.contains("graffiti"), "{text}");
+        assert_eq!(
+            ValidatorDefinitions::open(dir.path()).expect("opens").0,
+            read.0
+        );
     }
 
     #[test]

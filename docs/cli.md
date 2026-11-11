@@ -455,9 +455,13 @@ or imported at runtime through `POST /eth/v1/remotekeys` (below). A `url`
 left out of that request means `--web3signer-url`. An entry written without a
 `type` (every entry from before remote signing) is read by its fields; one
 naming both keystore paths and a `url` is refused at startup rather than read
-as either, and so is any field this client does not implement, such as
-Lighthouse's `root_certificate_path`. The `url` must not carry credentials, a
-query string or a fragment.
+as either. So is a `web3signer` entry carrying a field this client does not
+implement, such as Lighthouse's `root_certificate_path`: skipping it would sign
+through a connection the operator did not describe. `description` is the one
+exception, since Lighthouse writes it on every entry. A local entry is read
+past such fields, so a file Lighthouse wrote for local keystores loads as it
+is; the fields are not kept when the file is next rewritten. The `url` must not
+carry credentials, a query string or a fragment.
 
 The signer is reached over HTTP or HTTPS. HTTPS is verified against the Mozilla
 root store bundled into the binary (`webpki-roots`), **not** the operating
