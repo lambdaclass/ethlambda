@@ -7317,9 +7317,16 @@ mod tests {
             // `beacon_test_store` names `H256::ZERO` as the head. Dropping the
             // store drains its state writer, so the state is on the backend,
             // not only in this instance's cache, before the resume below.
+            // The block row comes first: a state is keyed by its block's slot,
+            // which a read finds through that row. Its parent is one the store
+            // never saw, so the state is written as a snapshot.
+            let parent = H256::repeat_byte(0xcc);
             let mut store = beacon_test_store(backend.clone());
             store
-                .insert_state(H256::ZERO, beacon_test_state(7))
+                .insert_signed_block(H256::ZERO, beacon_test_block(7, parent))
+                .expect("insert block");
+            store
+                .insert_state(H256::ZERO, beacon_test_state_with_parent(7, parent))
                 .expect("insert");
         }
 
