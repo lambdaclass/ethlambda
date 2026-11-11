@@ -356,6 +356,12 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     let Options { common, network } = options;
     // Read before the chain match below moves `network`.
     let discovery_enabled = network.discovery_enabled();
+    let lean_node_id = match &network {
+        Network::Lean(lean) => Some(lean.node_id.clone()),
+        Network::Mainnet { .. } => None,
+    };
+    let telemetry_url = common.telemetry_clickhouse_url;
+    let telemetry_client_name = common.telemetry_client_name;
 
     #[cfg(feature = "shadow-integration")]
     if let Network::Lean(lean) = &network {
@@ -784,6 +790,42 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     // block production and the contribution endpoint.
     let sync_committee_pool =
         ethlambda_state_transition::beacon::sync_committee_pool::SharedSyncCommitteePool::default();
+    // Before the P2P actor starts, so its first column rows are not lost.
+    if let Some(url) = telemetry_url {
+        let url = url.into_inner();
+        let config = setup.store.config();
+        let grid = config.time_grid();
+        let (client_name, network_name) = telemetry_names(
+            lean_node_id.as_deref(),
+            telemetry_client_name,
+            setup.store.chain(),
+            config.config_name.as_str(),
+        );
+        if sends_credentials_in_clear(&url) {
+            warn!(
+                host = url.host_str(),
+                "The ClickHouse URL carries credentials over plain http to a host that is not \
+                 loopback; they cross the network unencrypted. Use https, or a loopback address"
+            );
+        }
+        // Only the host and port: the URL may carry credentials.
+        info!(
+            %client_name,
+            %network_name,
+            host = url.host_str(),
+            port = url.port_or_known_default(),
+            "Writing block telemetry to ClickHouse"
+        );
+        ethlambda_telemetry::install(ethlambda_telemetry::TelemetryConfig {
+            url,
+            client_name,
+            network_name,
+            clock: ethlambda_telemetry::SlotClock::new(
+                grid.genesis_time_ms(),
+                grid.milliseconds_per_slot,
+            ),
+        });
+    }
     let p2p = P2P::spawn(
         built,
         setup.store.clone(),
@@ -941,6 +983,60 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     })
     .await;
     Ok(())
+}
+
+/// `(meta_client_name, meta_network_name)` for the telemetry rows.
+///
+/// An explicit `--telemetry.client-name` wins. Otherwise a lean node uses its
+/// `--node-id` (devnets run several nodes per host) and a beacon node
+/// `ethlambda@<hostname>`. The hostname is read only on that last path, so a
+/// node with telemetry off never asks. A loaded `--network` directory may have
+/// no `CONFIG_NAME`, hence the beacon fallback.
+fn telemetry_names(
+    lean_node_id: Option<&str>,
+    explicit: Option<String>,
+    chain: ethlambda_storage::Chain,
+    config_name: &str,
+) -> (String, String) {
+    let client_name = explicit.unwrap_or_else(|| match lean_node_id {
+        Some(node_id) => node_id.to_owned(),
+        None => format!("ethlambda@{}", hostname()),
+    });
+    let network_name = match chain {
+        ethlambda_storage::Chain::Lean => "lean".to_owned(),
+        ethlambda_storage::Chain::Beacon if config_name.is_empty() => "unknown".to_owned(),
+        ethlambda_storage::Chain::Beacon => config_name.to_owned(),
+    };
+    (client_name, network_name)
+}
+
+/// `url` sends a username or password as basic auth, unencrypted, to a host
+/// that is not this machine.
+fn sends_credentials_in_clear(url: &reqwest::Url) -> bool {
+    let has_credentials = !url.username().is_empty() || url.password().is_some();
+    // An IPv6 host comes back bracketed.
+    let host = url.host_str().unwrap_or_default();
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    has_credentials && url.scheme() == "http" && !loopback
+}
+
+/// This machine's hostname, for the default telemetry client name.
+fn hostname() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is valid for writes of `buf.len()` bytes, and
+    // `gethostname` writes at most that many. It may leave no NUL when the
+    // name fills the buffer; the `position` fallback below handles that.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        warn!("gethostname failed; telemetry client name falls back to \"unknown\"");
+        return "unknown".to_owned();
+    }
+    let len = buf.iter().position(|&byte| byte == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..len]).into_owned()
 }
 
 /// The root of the anchor block when it is a gloas block whose execution
@@ -2320,6 +2416,50 @@ mod tests {
     use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use ethlambda_types::genesis::GenesisValidatorEntry;
     use ethlambda_types::state::PUBLIC_KEY_SIZE;
+
+    #[test]
+    fn an_explicit_telemetry_name_wins() {
+        let (client, network) = telemetry_names(
+            Some("node-1"),
+            Some("mine".to_owned()),
+            ethlambda_storage::Chain::Lean,
+            "",
+        );
+        assert_eq!((client.as_str(), network.as_str()), ("mine", "lean"));
+    }
+
+    #[test]
+    fn a_lean_node_is_named_by_its_node_id() {
+        let (client, network) =
+            telemetry_names(Some("node-1"), None, ethlambda_storage::Chain::Lean, "");
+        assert_eq!((client.as_str(), network.as_str()), ("node-1", "lean"));
+    }
+
+    #[test]
+    fn a_beacon_node_is_named_by_host_and_config() {
+        let (client, network) =
+            telemetry_names(None, None, ethlambda_storage::Chain::Beacon, "mainnet");
+        assert!(client.starts_with("ethlambda@"), "{client}");
+        assert_eq!(network, "mainnet");
+    }
+
+    #[test]
+    fn credentials_in_clear_are_flagged_only_off_loopback_over_http() {
+        let flagged = |raw: &str| sends_credentials_in_clear(&raw.parse().unwrap());
+        assert!(flagged("http://u:p@10.0.0.5:8123/"));
+        assert!(flagged("http://u@clickhouse.example:8123/"));
+        assert!(!flagged("https://u:p@clickhouse.example:8443/"));
+        assert!(!flagged("http://u:p@127.0.0.1:8123/"));
+        assert!(!flagged("http://u:p@[::1]:8123/"));
+        assert!(!flagged("http://u:p@localhost:8123/"));
+        assert!(!flagged("http://10.0.0.5:8123/"));
+    }
+
+    #[test]
+    fn a_beacon_network_without_a_config_name_is_unknown() {
+        let (_, network) = telemetry_names(None, None, ethlambda_storage::Chain::Beacon, "");
+        assert_eq!(network, "unknown");
+    }
 
     /// Emits one event per (target, level) of interest under a subscriber
     /// built from `node_log_filter(rust_log)` and returns what got written.

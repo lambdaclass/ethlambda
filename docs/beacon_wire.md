@@ -215,6 +215,14 @@ an unbounded progressive bitlist, so one longer than electra's type bound is
 REJECTed first, reading its length without expanding it, since expanding is
 what the seen-set check does before any other.
 
+One rule on `beacon_block` (bellatrix to fulu) and `execution_payload` is
+stricter than the specification: the payload's `block_hash` must equal the hash
+of the execution header rebuilt from the payload's own fields, or the message is
+REJECTed (`beacon/payload_hash.rs`; the reason is `payload_block_hash_mismatch`,
+and `lean_beacon_payload_block_hash_mismatch_total{kind}` counts it). It runs
+after the cheap rules and before the stateful half. See
+[spec_deviations.md](./spec_deviations.md#a-payloads-block-hash-must-be-its-headers).
+
 Three deliberate departures from the gloas gossip rules, each for want of state
 this node does not keep. Where the specification rejects a message whose block
 failed validation, this node (having no bad-block cache) cannot tell that from
@@ -336,6 +344,25 @@ such queues held about 490 MB. Gossipsub's own penalty for these failures
 (`slow_peer_weight`) left the peer in the `negative` band, never near the
 graylist. Lighthouse penalizes `SlowPeer` reports through its peer manager
 instead.
+
+Two limits keep a slow node of our own from costing it its peers. Gossipsub
+counts a forward that waited too long in a peer's queue as the same failure as
+a full queue, so a saturated uplink or a stalled runtime on our side makes
+every peer look slow at once:
+
+- A report counts only when its priority or its non-priority failures exceed
+  `SLOW_PEER_REPORT_THRESHOLD`. Lighthouse applies the same cut. A dead stream
+  fails every message queued for the peer; a few failures in a heartbeat are
+  more likely late forwards.
+- One check disconnects at most `MAX_SLOW_PEER_DISCONNECTS_PER_CHECK` peers,
+  the ones with the most failed messages first. The others keep their streak,
+  so a peer still failing at the next check is disconnected then. Peers held
+  back this way are logged as a warning, since many peers failing together
+  points at our side.
+
+A dead stream on a peer that gets little traffic, such as one gossipsub has
+already pruned from the mesh, may stay under the threshold. Its queue then
+stays pinned until the connection closes, as it did before this check existed.
 
 Around a fork-digest boundary the node holds two digests' topics, and every
 held digest gets the whole parameter set (exits and slashings included),
@@ -620,7 +647,8 @@ not imported only briefly and in small numbers, so a batch's envelopes must
 arrive before the next batch's blocks do. Everything fetched goes through the
 same rules as an `execution_payload` gossip message
 (`beacon/envelope_checks.rs`) before the actor sees it; a `Queue` verdict is
-forwarded too.
+forwarded too. That includes the payload block hash rule above, which the
+specification does not have.
 
 ### Data column sidecars
 
@@ -838,6 +866,7 @@ as a query filter, so a `quic`-only record is invisible to it.
 | `lean_beacon_gossip_messages_total{topic,result}` | Gossip received, by topic and by `decoded` / `decode_failed` / `decompress_failed` / `unsupported_fork` |
 | `lean_beacon_gossip_validation_total{kind,outcome,reason}` | Gossip verdicts, now including `beacon_aggregate_and_proof` and `beacon_attestation`; see [metrics.md](./metrics.md#beacon-gossip-validation) |
 | `lean_beacon_gossip_verdict_expired_total{kind}` | Verdicts that came too late to propagate anything; should stay at zero |
+| `lean_beacon_payload_block_hash_mismatch_total{kind}` | Payloads refused because `block_hash` is not the hash of the header rebuilt from their fields, by `block` / `envelope` |
 | `lean_beacon_status_digest_mismatch_total` | Handshakes seen from another fork digest |
 | `lean_beacon_fork_digest{digest}` | The digest computed at startup, as a label |
 | `lean_beacon_aggregate_decode_seconds` | Time spent decoding one aggregate off the wire |

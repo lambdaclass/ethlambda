@@ -1542,12 +1542,62 @@ pub fn set_sidecars_awaiting_parent(count: u64) {
     LEAN_SIDECARS_AWAITING_PARENT.set(count as i64);
 }
 
+/// `engine_newPayload` requests in flight right now, and payloads (blocks
+/// before gloas, envelopes from it) imported and still waiting for an
+/// answer, in flight or not.
+///
+/// The second is bounded by `MAX_PAYLOADS_AWAITING_VERDICT`; sitting at that
+/// bound means imports are being held for room, which is expected during
+/// catch-up and nowhere else.
+pub fn set_new_payloads(in_flight: usize, awaiting_verdict: usize) {
+    static LEAN_ENGINE_NEW_PAYLOAD_IN_FLIGHT: std::sync::LazyLock<IntGauge> =
+        std::sync::LazyLock::new(|| {
+            register_int_gauge!(
+                "lean_engine_new_payload_in_flight",
+                "engine_newPayload requests sent and not yet answered"
+            )
+            .unwrap()
+        });
+    static LEAN_ENGINE_PAYLOADS_AWAITING_VERDICT: std::sync::LazyLock<IntGauge> =
+        std::sync::LazyLock::new(|| {
+            register_int_gauge!(
+                "lean_engine_payloads_awaiting_verdict",
+                "Imported payloads the execution client has not answered for yet"
+            )
+            .unwrap()
+        });
+    LEAN_ENGINE_NEW_PAYLOAD_IN_FLIGHT.set(in_flight as i64);
+    LEAN_ENGINE_PAYLOADS_AWAITING_VERDICT.set(awaiting_verdict as i64);
+}
+
+/// One answer to an asynchronous `engine_newPayload`, by what was asked about
+/// (`block` before gloas, `envelope` from it) and how it was answered
+/// (`valid`, `optimistic`, `invalid`, `reverted`, `no_answer`, `stale`).
+pub fn inc_new_payload_answer(kind: &str, outcome: &str) {
+    static LEAN_ENGINE_NEW_PAYLOAD_ANSWERS_TOTAL: std::sync::LazyLock<IntCounterVec> =
+        std::sync::LazyLock::new(|| {
+            register_int_counter_vec!(
+                "lean_engine_new_payload_answers_total",
+                "Answers to engine_newPayload requests sent without waiting, by kind and outcome",
+                &["kind", "outcome"]
+            )
+            .unwrap()
+        });
+    LEAN_ENGINE_NEW_PAYLOAD_ANSWERS_TOTAL
+        .with_label_values(&[kind, outcome])
+        .inc();
+}
+
 /// Blocks not imported because no execution client verdict was obtained.
 ///
 /// A non-zero rate here means the follower is dropping blocks it cannot ask
 /// about, and its head will park behind the first one. Nothing re-drives a
 /// given-up call, so this is the metric that says the follower has stopped
 /// following rather than merely slowed down.
+///
+/// With answers taken asynchronously (the running actor's path) a payload
+/// already imported is kept and asked about again each slot instead, and this
+/// counts those failed asks.
 pub fn inc_engine_no_verdict() {
     static LEAN_ENGINE_NO_VERDICT_TOTAL: std::sync::LazyLock<IntCounter> =
         std::sync::LazyLock::new(|| {
@@ -1763,4 +1813,56 @@ pub fn observe_beacon_aggregate_end_to_end(duration: Duration) {
             .unwrap()
         });
     LEAN_BEACON_AGGREGATE_END_TO_END_SECONDS.observe(duration.as_secs_f64());
+}
+
+/// Count one `engine_getBlobsV2` attempt for a held fulu block, by what came
+/// back: `hit` (every blob), `miss` (the execution client answered `null`, so
+/// at least one blob is not in its pool) or `error` (transport, timeout or a
+/// malformed answer).
+pub fn inc_engine_get_blobs(outcome: &str) {
+    static LEAN_ENGINE_GET_BLOBS_TOTAL: std::sync::LazyLock<IntCounterVec> =
+        std::sync::LazyLock::new(|| {
+            register_int_counter_vec!(
+                "lean_engine_get_blobs_total",
+                "engine_getBlobsV2 attempts for held blocks by outcome (hit, miss, error)",
+                &["outcome"]
+            )
+            .unwrap()
+        });
+    LEAN_ENGINE_GET_BLOBS_TOTAL
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+/// How long one `engine_getBlobsV2` round trip took, whatever its outcome.
+///
+/// The buckets stop at the call's own timeout, so a mass in the last bucket
+/// means the execution client is not answering inside the window the
+/// specification gives it.
+pub fn observe_engine_get_blobs_duration(duration: Duration) {
+    static LEAN_ENGINE_GET_BLOBS_DURATION_SECONDS: std::sync::LazyLock<Histogram> =
+        std::sync::LazyLock::new(|| {
+            register_histogram!(
+                "lean_engine_get_blobs_duration_seconds",
+                "Time for one engine_getBlobsV2 round trip",
+                vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]
+            )
+            .unwrap()
+        });
+    LEAN_ENGINE_GET_BLOBS_DURATION_SECONDS.observe(duration.as_secs_f64());
+}
+
+/// How long turning an execution client's blobs into custody column sidecars
+/// took: the cell computation plus the sidecar build, off the actor thread.
+pub fn observe_engine_blobs_to_columns(duration: Duration) {
+    static LEAN_ENGINE_BLOBS_TO_COLUMNS_SECONDS: std::sync::LazyLock<Histogram> =
+        std::sync::LazyLock::new(|| {
+            register_histogram!(
+                "lean_engine_blobs_to_columns_seconds",
+                "Time to build custody data column sidecars from execution-client blobs",
+                vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0]
+            )
+            .unwrap()
+        });
+    LEAN_ENGINE_BLOBS_TO_COLUMNS_SECONDS.observe(duration.as_secs_f64());
 }

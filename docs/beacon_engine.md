@@ -14,7 +14,7 @@ The wire is
 
 ## Which methods, and why so few
 
-Six:
+Seven:
 
 | Method | Introduced | Why |
 |---|---|---|
@@ -24,14 +24,16 @@ Six:
 | `engine_forkchoiceUpdatedV4` | amsterdam | The same, from a gloas head on; also carries the node's custody columns |
 | `engine_exchangeCapabilities` | common | Startup handshake |
 | `engine_getClientVersionV1` | identification | Log what the execution client is |
+| `engine_getBlobsV2` | osaka | Rebuild a held fulu block's custody columns from the execution client's blob pool |
 
 Osaka introduces **no new `newPayload`**. Its own document adds only
-`engine_getPayloadV5` and `engine_getBlobsV2`/`V3`; `engine_newPayloadV5` belongs
+`engine_getPayloadV5` and `engine_getBlobsV2`/`V3`, of which this node calls
+`engine_getBlobsV2` (see [Blobs from the execution client](#blobs-from-the-execution-client)); `engine_newPayloadV5` belongs
 to Amsterdam, where gloas's envelope import uses it. So the Osaka-current call for a payload is prague's V4, and the
 Osaka-current fork choice notification is cancun's V3. Amsterdam's pair (newPayload V5, forkchoiceUpdated V4) is
 used from gloas on; the startup handshake warns when the execution client does not advertise either, but only on a network whose schedule includes gloas.
 
-Three method families a full client would have are deliberately absent:
+Two method families a full client would have are deliberately absent:
 
 - **`engine_getPayload*` outside the gloas path.** The follower itself never
   asks an execution client to start building a block, so its own
@@ -43,8 +45,6 @@ Three method families a full client would have are deliberately absent:
   `engine_getPayloadV6` (`ExecutionPayloadV4`, with `blockAccessList` and
   `slotNumber`) from gloas on. The handshake warns when a gloas network's
   execution client does not advertise `engine_getPayloadV6`.
-- **`engine_getBlobs*`.** There is no blob-pool fetch path here; data columns come
-  from peers over the network.
 - **`engine_getPayloadBodies*`.** Nothing consumes them.
 
 Blocks before electra are not asked about at all. This node checkpoint-syncs onto
@@ -72,6 +72,37 @@ This diagram is the pre-gloas path. A gloas block carries no payload, only a
 builder's bid, so nothing is asked about it at import; the question moves to the
 envelope that reveals the payload (see [Gloas](#gloas) below).
 
+## Asking without waiting
+
+On the running actor the `engine_newPayloadV4` arrow above does not wait. The
+question goes out first, from a tokio task of its own, and the block is imported
+right after as optimistic (it joins `optimistic_roots`, so every Beacon API
+response about it says `execution_optimistic` and attestation data for it is a
+`503`). The task reports back with a `NewPayloadAnswered` message, and the
+answer is applied then, the way the table below says, to a block already in fork
+choice. A gloas envelope goes the same way: it is applied at once with its
+payload `NOT_VALIDATED`. `crates/blockchain/src/beacon_new_payload.rs` holds
+the queue, the task and the answer handler.
+
+```
+block ─► DA gate ─► newPayload queued ─► on_block (optimistic) ─► head may move
+                        │
+                        └─► task ─► engine_newPayloadV4 ─► NewPayloadAnswered ─► verdict applied
+```
+
+| Rule | Why |
+|---|---|
+| A payload is sent only once no request for the payload it builds on is outstanding, and at most `MAX_NEW_PAYLOADS_IN_FLIGHT` at once | The Engine API orders only `forkchoiceUpdated`, and the client's connection pool can deliver two requests in either order; a payload whose parent the execution client has not seen is answered `SYNCING` and may start a sync from its peers |
+| `forkchoiceUpdated` names the newest payload on the head's chain whose request is not queued or in flight, and is sent again when the head's own answer arrives | Same reason: the execution client may not have the head's payload yet. Naming an ancestor instead of skipping the call keeps the client fed a head during catch-up, when the newest block's request always waits behind its parent's |
+| At most `MAX_PAYLOADS_AWAITING_VERDICT` imported payloads wait for an answer; past that a block is held (written as a pending block) and an envelope waits in `awaiting_engine`, until answers free room | Bounds how far the consensus side can run ahead of what has been validated; only reached during catch-up |
+| A block built on a gloas FULL parent waits for the parent payload's answer, not only for its envelope | An envelope refused for its contents is taken back out, and nothing may be built on it by then. Lighthouse and Prysm hold the same blocks by applying an envelope only after its answer |
+| No answer after the retry ladder: the block or payload stays, optimistic, and is asked again once a slot | It is already in fork choice; see [spec_deviations.md](./spec_deviations.md#payloads-are-applied-before-the-execution-client-answers) |
+| A `VALID` answer for the current head sends `head` again with `execution_optimistic: false` | A validator client that reacts to `head` was refused attestation data for the optimistic one |
+
+Two paths still wait for the answer inline: a block that is not an optimistic
+candidate (around the merge transition; see below), and a server with no mailbox
+to hear back on (offline replay).
+
 The order is the specification's own: `is_data_available` runs before
 `state_transition`, so a block about to be held for its custody columns is never
 one this node asks an execution client about.
@@ -93,7 +124,14 @@ specification.
 
 ### The transition runs while the answer is in flight
 
-With an execution client, `process_block` does not wait idle for the answer. It
+This applies only to an import that waits for its answer: a block that is not
+an optimistic candidate, or a server with no mailbox to hear an answer back on
+(offline replay and the import benchmark). On the running actor an optimistic
+candidate does not wait at all (see
+[Asking without waiting](#asking-without-waiting)), so nothing overlaps and
+`engine` stays a recorded zero.
+
+When an import does wait, `process_block` does not wait idle for the answer. It
 builds the request on the actor (copying only the payload, never the block),
 sends it from a spawned task so the HTTP exchange keeps progressing, and runs
 `fork_choice::speculate_transition` on the actor meanwhile: the block's state
@@ -135,9 +173,13 @@ request this module sends (`timed_new_payload`), a gloas envelope's included.
 
 | Wire status | Alias | What happens |
 |---|---|---|
-| `VALID` | | Imported. The block and every optimistic ancestor leave `optimistic_roots` |
-| `SYNCING`, `ACCEPTED` | `NOT_VALIDATED` | Imported *if* `is_optimistic_candidate_block` allows it, and joins `optimistic_roots` |
-| `INVALID`, `INVALID_BLOCK_HASH` | `INVALIDATED` | Not imported. `latestValidHash` decides how much of the branch dies with it |
+| `VALID` | | The block and every optimistic ancestor leave `optimistic_roots` |
+| `SYNCING`, `ACCEPTED` | `NOT_VALIDATED` | The block stays in `optimistic_roots` (it was imported optimistic, which only an `is_optimistic_candidate_block` may be) |
+| `INVALID`, `INVALID_BLOCK_HASH` | `INVALIDATED` | The block leaves fork choice. `latestValidHash` decides how much of the branch dies with it |
+
+On the inline path the same answers decide whether the block is imported at
+all: `NOT_VALIDATED` imports it only if it is an optimistic candidate, and
+`INVALIDATED` does not import it.
 
 A block in `optimistic_roots` carries normal fork-choice weight and can be the
 head. That is the point of optimistic sync, and the `sync/optimistic` fixture
@@ -146,9 +188,11 @@ take the head from a `VALID` one on attestation weight, and then requires the
 head to fall back when the `SYNCING` branch turns out to be invalid.
 
 An invalidated block leaves fork choice by having its `LiveChain` index row
-deleted. That is sufficient because `Store::block_index()` is the only source
-`filter_block_tree`, `compute_node_weights` and `walk_head` read: a root with no
-row contributes no weight to any ancestor and can never be walked to. The block
+deleted. That is sufficient because `Store::block_index()` is the only block
+source `filter_block_tree`, `compute_node_weights` and `walk_head` read: a root
+with no row contributes no weight to any ancestor and can never be walked to.
+The deletion also marks the store's cached fork-choice weights stale, so the next
+head computation rebuilds them without the removed blocks. The block
 and its state stay in their own tables, so an operator can still inspect what
 was rejected.
 
@@ -255,27 +299,114 @@ honest block hash and a different body cannot earn an `INVALID` that lands on th
 honest payload, and the engine never spends time on an envelope this node would
 refuse anyway.
 
+The envelope is applied as soon as those checks pass, its payload recorded
+`NOT_VALIDATED`, and the answer is applied when it arrives (see
+[Asking without waiting](#asking-without-waiting)):
+
 | Answer | What happens to the envelope |
 |---|---|
-| `VALID` | Applied; the payload is recorded `VALID` |
-| `SYNCING`, `ACCEPTED` | Applied and recorded `SYNCING` (not yet validated); a later `forkchoiceUpdated` `VALID` promotes it |
-| `INVALID` with a `latestValidHash` | The payload is invalid: not applied, so the block's FULL node never exists; the block and its EMPTY branch stay |
-| `INVALID` with a null `latestValidHash`, or `INVALID_BLOCK_HASH` | The envelope's contents do not hash to the block hash it claims: only that envelope is refused, since the builder's real one may still arrive |
-| no answer after the retry ladder | Kept (it is consensus-valid) and asked again once a slot |
+| `VALID` | The payload is recorded `VALID`; blocks waiting on it are released |
+| `SYNCING`, `ACCEPTED` | Stays `NOT_VALIDATED`; blocks waiting on it are released; a later `forkchoiceUpdated` `VALID` promotes it |
+| `INVALID` with a `latestValidHash` | The payload is invalid: its FULL node is removed and the blocks waiting on it are dropped; the block and its EMPTY branch stay |
+| `INVALID` with a null `latestValidHash`, or `INVALID_BLOCK_HASH` | The envelope's contents do not hash to the block hash it claims: the envelope is taken back out (no payload, not an invalid one), only that envelope is refused, and the blocks waiting on it keep waiting, since the builder's real one may still arrive |
+| no answer after the retry ladder | Stays applied and `NOT_VALIDATED`, blocks waiting on it keep waiting, and it is asked again once a slot |
 
-The null-`latestValidHash` row exists because ethrex has no `INVALID_BLOCK_HASH`
-status: it answers a mismatch with a null hash and an executed-and-failed payload
-with its last valid ancestor. `latestValidHash` and `VALID` follow the execution
+The null-`latestValidHash` row exists because since `engine_newPayloadV2` a
+block hash mismatch is answered `INVALID` with a null hash (`INVALID_BLOCK_HASH`
+is "supplanted by `INVALID`", execution-apis `shanghai.md`), while an
+executed-and-failed payload normally names its last valid ancestor. `latestValidHash` and `VALID` follow the execution
 chain (each block's `bid.parent_block_hash`), not every verified ancestor, since
 a block built past an ancestor's EMPTY node skips that ancestor's payload. The
 details, and why each departs from the specification, are in
-[spec_deviations.md](./spec_deviations.md#the-execution-client-judges-a-gloas-payload-before-the-envelope-is-applied).
+[spec_deviations.md](./spec_deviations.md#payloads-are-applied-before-the-execution-client-answers).
 
 With the engine down, the per-slot retry asks about the oldest held envelope
 only and releases the rest once that ask is answered, so an unreachable client
 costs one retry ladder per slot however many envelopes wait. This is the gloas
 counterpart of the limitation below, and unlike a block the envelope is not
 dropped.
+
+## Blobs from the execution client
+
+A fulu block is held until its custody data columns are stored. Gossip usually
+delivers them within a fraction of a second, but the execution client may
+already have every blob the block commits to, since the blob transactions went
+through its pool first. The fulu p2p spec ("Distributed blob publishing using
+blobs retrieved from local execution-layer client") says honest nodes SHOULD
+ask `engine_getBlobsV2` on receiving a valid `beacon_block` or
+`data_column_sidecar` from gossip, and turn a complete answer into data columns.
+The code is `crates/blockchain/src/beacon_blobs.rs`.
+
+**When it fires.** On the first data-availability hold of a block
+(`hold_block_for_columns`), when all of these hold: the block is fulu, it
+commits to at least one blob, and `--execution-endpoint` is set. Any slot and
+any source (gossip or sync) qualifies. A redelivery of a held root does not ask
+again.
+
+**The call.** One attempt with a 1 s timeout (`ENGINE_GET_BLOBS_TIMEOUT`, the
+value `osaka.md` gives the method), outside the retry ladder. The call races
+gossip delivery of the same columns, and a retry after the ladder's first
+backoff would land after that race is decided. A miss leaves the block to
+gossip and the per-slot peer asks, which is where it was anyway. The answer is
+all-or-nothing: `null` means the execution client lacks at least one blob (or is
+syncing), and counts as a miss.
+
+**V2, not V3.** V3 answers partially, but a column holds one cell from every
+blob, so a partial blob set builds no complete column, and this node has no
+partial-column assembly.
+
+**The build.** On a full answer, a blocking task first re-checks that the block
+was not imported meanwhile and which custody columns are still missing from the
+store, then builds only those (cells and sidecars) off the async runtime and off
+the chain actor. It does **not** verify the KZG proofs: the spec says a node
+SHOULD skip verifying blobs from its own execution client.
+
+**The hand-over.** The sidecars go to p2p through the existing
+`check_data_column_sidecars`, with `SidecarOrigin::ExecutionLayer`. That origin
+runs no checks. p2p records each column in the gossip seen cache first (so a
+copy gossip delivers later is ignored, and a column gossip already accepted is
+not published twice), publishes the newly recorded ones on their subnet topics
+if and only if this node is subscribed to them, which here means its custody
+columns, and forwards one batch to the chain actor. The chain actor stores the
+columns and releases the held block through the usual completeness check.
+
+```
+hold (first time) -> engine_getBlobsV2        1 s, one attempt
+                       |-- null / error  -> count; gossip and peer asks carry on
+                       '-- every blob    -> build missing custody columns
+                                            (block imported meanwhile? stop)
+                                                  |
+                         check_data_column_sidecars(ExecutionLayer)
+                                                  |
+   p2p: seen cache -> publish on subscribed subnets -> forward one batch
+                                                  |
+   chain actor: store columns -> release the held block
+```
+
+**Trust.** The proofs are taken as the execution client gives them. One that
+returns wrong proofs makes this node store and publish columns its peers'
+gossip validation rejects, which costs this node peer score. Debug builds
+re-run the chain checks on everything `new_data_column_sidecars` delivers and
+would catch it.
+
+**Not done.**
+
+- No ask when a sidecar arrives, only on a block's first hold.
+- Gloas: data availability moves to the payload envelope, so a held gloas block
+  has no columns to fill this way.
+- Partial columns (see V3 above).
+
+**Metrics.**
+
+| Metric | Reads |
+|---|---|
+| `lean_engine_get_blobs_total{outcome}` | Attempts: `hit`, `miss`, `error` |
+| `lean_engine_get_blobs_duration_seconds` | One round trip, whatever the outcome |
+| `lean_engine_blobs_to_columns_seconds` | Cell computation plus sidecar build |
+| `lean_data_columns_from_execution_layer_total{result}` | What p2p did with each column: `published`, `no_digest`, `already_seen`, `not_custody` |
+
+A high `miss` rate means the execution client's pool does not have the blobs.
+That is normal for old blocks and while the execution client is syncing.
 
 ## `forkchoiceUpdated`
 
@@ -338,6 +469,8 @@ authentication, so an endpoint without a secret is refused at startup, before
 anything binds or connects. Clap cannot express "both or neither" across two
 optional flags, so the pairing is checked once, in `From<BeaconOptions>`.
 
+Blob fetching has no flag of its own: it is on whenever `--execution-endpoint` is set.
+
 With **neither** flag, the follower contacts no execution client and every block
 gets `PayloadValidity::NotRequired`, which is exactly what it did before any of
 this existed.
@@ -354,7 +487,7 @@ cosmetic mismatch into an outage.
 
 ## Limitations
 
-### The retry ladder gives up, and nothing re-drives it
+### The retry ladder gives up
 
 Each call is attempted `ENGINE_MAX_ATTEMPTS` times, with a per-attempt timeout of
 `ENGINE_TIMEOUT` and a backoff starting at `ENGINE_INITIAL_BACKOFF` and doubling.
@@ -362,17 +495,16 @@ An RPC *error* is not retried: that is the execution client answering, with a
 refusal but an answer, so asking again would get the same refusal and burn the
 ladder for nothing.
 
-After the last attempt the block is **dropped**. `optimistic-sync.md` requires
-exactly that much ("a consensus engine MUST NOT import the block and MUST NOT
-apply it to the fork choice store"), but nothing here re-drives the call
-afterwards, so a persistently unreachable execution client parks the follower's
-head behind the first block it could not ask about, permanently, until a
-restart.
+On the running actor a block or payload that got no answer is already in fork
+choice; it stays, optimistic, and is asked again once a slot (see
+[Asking without waiting](#asking-without-waiting)).
 
-This was accepted knowingly for this change. The intended fix is a tick-driven
-re-drive of the set of blocks that got no verdict. `lean_engine_no_verdict_total` is the
-metric that says it is happening: a non-zero rate means the follower has stopped
-following rather than merely slowed down.
+On the inline path (a block that is not an optimistic candidate, or offline
+replay) the block is **dropped** after the last attempt. `optimistic-sync.md`
+requires exactly that much ("a consensus engine MUST NOT import the block and
+MUST NOT apply it to the fork choice store"), and nothing re-drives the call
+afterwards. `lean_engine_no_verdict_total` counts both: a non-zero rate means
+the execution client is not answering.
 
 ### `optimistic_roots` does not survive a restart
 

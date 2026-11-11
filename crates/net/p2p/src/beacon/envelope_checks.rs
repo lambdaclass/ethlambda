@@ -32,6 +32,7 @@ use ethlambda_storage::Store;
 use ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope;
 use tracing::{debug, error, warn};
 
+use crate::beacon::payload_hash;
 use crate::{P2PServer, metrics};
 
 /// Whether a fetched envelope goes to the chain actor.
@@ -48,10 +49,14 @@ fn judge(store: &Store, envelope: &SignedExecutionPayloadEnvelope) -> Outcome {
     // A fresh, empty cache: a fetched envelope is not a gossip duplicate of
     // anything, so the cache's one rule never fires.
     let seen = SeenEnvelopes::new(NonZeroUsize::MIN);
-    match cheap_checks(&seen, store, envelope) {
-        Ok(()) => stateful_checks(store, envelope),
-        Err(outcome) => outcome,
+    if let Err(outcome) = cheap_checks(&seen, store, envelope) {
+        return outcome;
     }
+    // The same stricter-than-the-specification rule the gossip topic runs.
+    if let Err(outcome) = payload_hash::reject_envelope_on_mismatch(envelope) {
+        return outcome;
+    }
+    stateful_checks(store, envelope)
 }
 
 /// Run the gossip rules on `envelopes` and send the chain actor the ones that
@@ -241,7 +246,13 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn envelope(slot: u64, byte: u8) -> SignedExecutionPayloadEnvelope {
-        crate::beacon::encoding::test_support::envelope(H256::repeat_byte(byte), slot, H256::ZERO)
+        // Sealed: the fetched-envelope rules refuse a block hash that is not
+        // the payload's header's.
+        payload_hash::seal_envelope(crate::beacon::encoding::test_support::envelope(
+            H256::repeat_byte(byte),
+            slot,
+            H256::ZERO,
+        ))
     }
 
     #[test]

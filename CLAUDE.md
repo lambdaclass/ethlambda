@@ -43,6 +43,7 @@ crates/
     ├─ crypto/              # XMSS sign/verify + aggregation (leanVM wrapper)
     ├─ ssz-tree/            # Persistent Merkle tree (List/Vector) behind the beacon registry and balances
     ├─ metrics/             # Prometheus re-exports, TimingGuard, gather utilities
+    ├─ telemetry/           # ClickHouse block_events rows (opt-in)
     └─ test-fixtures/       # Spec-fixture loading (prod dep of rpc's Hive test driver)
   net/
     ├─ api/                 # Actor protocol traits wiring BlockChain ↔ P2P
@@ -82,6 +83,22 @@ Fork choice head update
 ```
 (Store buffer fields are `new_payloads`/`known_payloads`; the accessors are named
 `extract_latest_new_attestations`/`extract_latest_known_attestations`.)
+
+### Asynchronous `engine_newPayload` (beacon)
+`crates/blockchain/src/beacon_new_payload.rs`. On the running actor a pre-gloas
+block (optimistic candidate) imports as optimistic and a gloas envelope applies
+as `NOT_VALIDATED` before the EL answers; `engine_newPayload` goes out first from
+a tokio task that reports back with a `NewPayloadAnswered` message, applied as
+`optimistic-sync.md` applies a verdict. Sent parent-before-child, at most
+`MAX_NEW_PAYLOADS_IN_FLIGHT` in flight; `forkchoiceUpdated` names the newest
+payload on the head's chain whose request is not queued or in flight (so catch-up
+still feeds the EL a head); at most `MAX_PAYLOADS_AWAITING_VERDICT` wait (past
+that the import is held). No answer:
+kept optimistic, re-asked once a slot (a documented deviation). Without a
+mailbox (offline replay) and for non-candidates the import still waits inline,
+running the block's state transition while the request is out
+(`speculate_transition`, `docs/beacon_engine.md`).
+The actor records its own `ActorRef` in a `#[started]` hook for this.
 
 ### State Transition Phases
 1. **process_slots()**: Advance through empty slots, update historical roots
@@ -336,8 +353,8 @@ actual_slot = finalized_slot + 1 + relative_index
   - `fork_digest` is a 4-byte hex string (no `0x` prefix); currently the dummy `12345678` agreed across clients
   - Mesh size: 8 (6-12 bounds), heartbeat: 700ms
   - Beacon wire: `validate_messages()` is on, so every beacon message waits for a verdict (~4.2s before gossipsub's cache evicts it). Rules in `state_transition::beacon::gossip` (cheap half inline, stateful half on a bounded `spawn_blocking` task); plumbing in `p2p/src/beacon/verdict.rs`. Lean gossip still auto-forwards
-  - Beacon peer scoring: lighthouse's parameters ported in `p2p/src/beacon/scoring.rs` (block, aggregate, 64 attestation subnets, exits, slashings; columns and sync contributions unscored), refreshed every slot from the head's active validator count. Mesh-delivery scoring (P3) is gated off while the head lags more than 4 slots and for an epoch after, because a catching-up node `Ignore`s every aggregate and would otherwise graylist its own mesh. Every held fork digest is parametrized before `transition::apply` joins it (gossipsub never scores a mesh grafted before its topic had parameters); the previous digest's weights are zeroed at the switch, and the switch restarts the P3 warmup. The swarm disconnects peers below the graylist (-16000) every 10 s, and peers gossipsub reported as `SlowPeer` in every check for a minute (a disabled gossipsub handler never drains its send queue, so the queue's message copies stay in memory until the connection closes). Lean runs unscored. See [`docs/beacon_wire.md`](docs/beacon_wire.md#peer-scoring)
-  - Data columns: every check runs in p2p. A column gossip did not accept (`Queue`/`Overloaded`), every fetched column, and parked columns replayed after their parent imports go through `column::chain_checks` in `p2p/src/beacon/column_checks.rs`. The chain actor stores what it gets unchecked; only debug builds re-run `chain_checks` there
+  - Beacon peer scoring: lighthouse's parameters ported in `p2p/src/beacon/scoring.rs` (block, aggregate, 64 attestation subnets, exits, slashings; columns and sync contributions unscored), refreshed every slot from the head's active validator count. Mesh-delivery scoring (P3) is gated off while the head lags more than 4 slots and for an epoch after, because a catching-up node `Ignore`s every aggregate and would otherwise graylist its own mesh. Every held fork digest is parametrized before `transition::apply` joins it (gossipsub never scores a mesh grafted before its topic had parameters); the previous digest's weights are zeroed at the switch, and the switch restarts the P3 warmup. The swarm disconnects peers below the graylist (-16000) every 10 s, and peers gossipsub reported as `SlowPeer` in every check for a minute (a disabled gossipsub handler never drains its send queue, so the queue's message copies stay in memory until the connection closes). Gossipsub reports an expired forward like a full queue, so our own saturated uplink makes every peer look slow: a report counts only above `SLOW_PEER_REPORT_THRESHOLD` failures (Lighthouse's cut), and one check disconnects at most `MAX_SLOW_PEER_DISCONNECTS_PER_CHECK` peers. Lean runs unscored. See [`docs/beacon_wire.md`](docs/beacon_wire.md#peer-scoring)
+  - Data columns: every check runs in p2p. A column gossip did not accept (`Queue`/`Overloaded`), every fetched column, and parked columns replayed after their parent imports go through `column::chain_checks` in `p2p/src/beacon/column_checks.rs`. The chain actor stores what it gets unchecked; only debug builds re-run `chain_checks` there. A held fulu block's custody columns can also come from the execution client (`engine_getBlobsV2`, `crates/blockchain/src/beacon_blobs.rs`), built without KZG verification and handed to p2p as `SidecarOrigin::ExecutionLayer` through `check_data_column_sidecars`, which records them seen, publishes them on their subnets and forwards them; see `docs/beacon_engine.md`
   - Beacon subscribes seven global topics plus two node-id-derived subnet families: custody
     columns and backbone attestation subnets. One of the seven is
     `sync_committee_contribution_and_proof`; the four `sync_committee_{0..3}` subnets are
@@ -590,6 +607,17 @@ default** on its two SSZ endpoints and bare integers in JSON, because
 
 See [`docs/rpc.md`](docs/rpc.md) for the full reference: CLI flags and defaults, the lean API endpoints (health, finalized state/block, justified checkpoint, blocks by root/slot, fork-choice tree + D3.js UI, runtime aggregator toggle), the Beacon API endpoints and the three ids they refuse, the metrics/debug endpoints (Prometheus `/metrics`, jemalloc heap profiling), the Hive test-driver endpoints, plus request/response shapes, status codes, and content types.
 
+## Block telemetry (`crates/common/telemetry`)
+
+`--telemetry.clickhouse-url` writes Silver's `block_events` rows (one per point in a block's
+life, per data column arrival) to ClickHouse over HTTP. A global sink, installed in `run_node`
+before `P2P::spawn`; `ethlambda_telemetry::emit(|| ...)` builds nothing when it is off. Rows
+come from `BlockImportReport::telemetry_events` (final pass only, `imported_here`),
+`CascadeTelemetry` (arrival rows, and beacon `attestable` at the per-arrival head
+recomputation), and p2p's column rows: `column_checks::column_rows` (after the check), and
+`passed_rows` called directly by the gossip-accept path and by this node's own fulu columns. See
+[`docs/telemetry.md`](docs/telemetry.md).
+
 ## Beacon Chain types (`crates/common/types/src/beacon/`)
 
 `ethlambda-types` carries the **Ethereum Beacon Chain** containers (phase0
@@ -820,10 +848,13 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   the duties. `attestation_data.index` at a gloas slot comes from
   `Store::head_payload_status`.
   With `--execution-endpoint`, an envelope that passes the consensus checks is
-  judged by `engine_newPayloadV5` (INVALID with a null `latestValidHash` is a
-  hash mismatch that refuses only that envelope; INVALID with one condemns the
-  payload via the execution-chain walk; an engine error keeps the envelope and
-  retries once a slot, probing with the oldest), and a gloas head sends
+  applied at once (payload `NOT_VALIDATED`) and judged by `engine_newPayloadV5`
+  without waiting, like a pre-gloas block (see `beacon_new_payload` below):
+  INVALID with a null `latestValidHash` is a hash mismatch (the only answer
+  Engine API V2+ gives one) that takes the envelope back out and refuses only
+  that copy; INVALID with one condemns the payload via the execution-chain
+  walk; no answer keeps it applied and re-asks once a slot. Blocks built on a
+  FULL payload wait for its answer, not just its envelope. A gloas head sends
   `engine_forkchoiceUpdatedV4` with the custody columns (head hash by the head
   node's FULL or EMPTY status, finalized from the finalized block's and safe
   from the Fast Confirmation Rule's confirmed block's `bid.parent_block_hash`).
@@ -868,7 +899,13 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   actor's tick after the head recompute and before `forkchoiceUpdated`; its
   confirmed root is the engine's safe hash and feeds the `fast_confirmation`
   event. State lives in `Store` (`fast_confirmation`), per-run sums are shared
-  in a `RunContext`. See [`docs/beacon_stf.md`](docs/beacon_stf.md#fast-confirmation-rule).
+  in a `RunContext`. It runs on the actor, so it must stay about as cheap as
+  `get_head`: it reads the fork choice's caches rather than the registry or
+  every vote (balance sources from the per-checkpoint `JustifiedBalances`,
+  attestation scores from the proto-array when the source is the justified
+  checkpoint's), and `get_current_target_score` walks only current-epoch votes
+  (an older vote's root may be below the live index, where each parent hop
+  decodes a block). See [`docs/beacon_stf.md`](docs/beacon_stf.md#fast-confirmation-rule).
 - Nothing is ignored for being unimplemented in the state transition or fork
   choice. Ignored cases are the `LightClient*` containers (a different layer,
   out of scope), `networking/gossip_*` cases outside what the node validates

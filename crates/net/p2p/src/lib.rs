@@ -39,7 +39,7 @@ use std::{
 use either::Either;
 use ethlambda_network_api::{
     ConnectedPeer, FetchRequest, GossipEventSink, InitBlockChain, MetaDataController,
-    P2PToBlockChainRef, PeerDirection, PeerTableController,
+    P2PToBlockChainRef, PeerDirection, PeerTableController, SidecarOrigin,
     block_chain_to_p2p::{
         CheckDataColumnSidecars, FetchBlock, PublishAggregatedAttestation, PublishAttestation,
         PublishBlock,
@@ -1914,7 +1914,16 @@ impl Handler<FetchBlock> for P2PServer {
 
 impl Handler<CheckDataColumnSidecars> for P2PServer {
     async fn handle(&mut self, msg: CheckDataColumnSidecars, _ctx: &Context<Self>) {
-        beacon::column_checks::check_and_forward(self, msg.sidecars);
+        match msg.origin {
+            SidecarOrigin::Parked => beacon::column_checks::check_and_forward(
+                self,
+                msg.sidecars,
+                beacon::column_checks::ColumnArrival::Recheck,
+            ),
+            SidecarOrigin::ExecutionLayer => {
+                beacon::engine_columns::publish_and_forward(self, msg.sidecars)
+            }
+        }
     }
 }
 
@@ -2903,6 +2912,9 @@ pub(crate) mod test_support {
                 Vec<ethlambda_types::beacon::primitives::ValidatorIndex>,
             )>,
         >,
+        /// Each `new_data_column_sidecars` batch, in arrival order.
+        pub(crate) sidecar_batches:
+            std::sync::Mutex<Vec<Vec<ethlambda_types::beacon::containers::DataColumnSidecar>>>,
     }
 
     impl ethlambda_network_api::P2PToBlockChain for RecordingChain {
@@ -2930,8 +2942,9 @@ pub(crate) mod test_support {
         }
         fn new_data_column_sidecars(
             &self,
-            _sidecars: Vec<ethlambda_types::beacon::containers::DataColumnSidecar>,
+            sidecars: Vec<ethlambda_types::beacon::containers::DataColumnSidecar>,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.sidecar_batches.lock().unwrap().push(sidecars);
             Ok(())
         }
         fn data_column_sidecars_awaiting_parent(

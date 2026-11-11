@@ -269,7 +269,7 @@ Series appear as blocks arrive rather than being seeded, since a third of the ph
 | Name | Type | Usage | Sample collection event | Labels | Buckets |
 |------|------|-------|-------------------------|--------|---------|
 | `lean_block_import_phase_seconds` | Histogram | Time one section of a block's import, or of the arrival carrying it, took | Per section that ran, on each import, hold or failure | phase (see below); source=gossip,sync | 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8, 12, 16, 32 |
-| `lean_engine_speculation_total` | Counter | State transitions the chain actor ran while the `engine_newPayload` round trip was in flight, by what became of them | Per beacon block asked of an execution client | outcome=used,discarded_invalidated,discarded_held,discarded_mismatch | |
+| `lean_engine_speculation_total` | Counter | State transitions the chain actor ran while the `engine_newPayload` round trip was in flight, by what became of them | Per beacon block whose import waits for its answer (not an optimistic candidate, or no mailbox: replay and the import benchmark), asked of an execution client | outcome=used,discarded_invalidated,discarded_held,discarded_mismatch | |
 | `lean_engine_new_payload_seconds` | Histogram | Time the execution client took to answer `engine_newPayload*`, from the request to the answer, retry ladder included: a pre-gloas block's payload, or from gloas on the payload an envelope reveals. For a block the import runs the state transition meanwhile, so this is the execution client's processing time, not what the import waited (the `engine` phase) | Per request sent: each pre-gloas beacon block, and each gloas envelope that passed its consensus checks | outcome=valid,optimistic,invalidated,no_verdict | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8, 12, 16, 32 |
 | `lean_block_import_cascade_blocks` | Histogram | Blocks one arrival put through the import path (attempts, so a block that ends held or pended counts) | Once per arriving block message | | 1, 2, 3, 5, 8, 16, 32, 64, 128 |
 
@@ -306,6 +306,15 @@ Per-arrival phases, charged once per arriving message however many blocks its ca
 | `get_head` | `fork_choice::get_head` (beacon) |
 | `fcu` | The `engine_forkchoiceUpdated` round trip (beacon) |
 
+### Block Telemetry
+
+Present only with `--telemetry.clickhouse-url`; see [Block telemetry](./telemetry.md). Both series are published at zero at startup, so a node whose inserts never succeed shows a rising failure count next to zero inserted rows instead of no series.
+
+| Name | Type | Usage | Sample collection event | Labels |
+|------|------|-------|-------------------------|--------|
+| `lean_telemetry_rows_total` | Counter | `block_events` rows, by what became of them | On every successful insert, and on every row dropped (channel full, backlog past its cap, a batch ClickHouse refused, or rows still pending when the writer's channel closes) | outcome=inserted,dropped |
+| `lean_telemetry_insert_failures_total` | Counter | Failed ClickHouse insert attempts, refusals included | On every failed insert; a failed best-effort schema statement alone is not counted | |
+
 ### Gossip Arrival Timing
 
 These histograms record the absolute distance between a gossip message's arrival and the start of the interval it was due in, so an arrival that is early by some amount and one that is late by the same amount land in the same bucket; the counters' `position` label is what tells them apart. `inside` means the message arrived within the interval it was due in, not merely somewhere in the right slot: an attestation for slot 10 that lands during slot 10's interval 2 is `after`, not `inside`, since it missed the AttestationProduction interval it was actually due in.
@@ -337,6 +346,20 @@ In practice the distribution is bimodal and dominated by production rather than 
 | `lean_state_write_queue_depth` | Gauge | States handed to the background writer but not yet committed | On every hand-off and on every commit | |
 | `lean_state_write_seconds` | Histogram | Time the background writer spends encoding, diffing and committing one state | Per state written | |
 | `lean_state_cache_lookups_total` | Counter | State cache lookups, by the `Store` method that made them, the kind of state asked for, and whether the cache held it | On every `get_state` (and the writer's own parent read), `has_state` and `cached_state` call | method=get_state,has_state,cached_state<br>kind=block,checkpoint<br>result=hit,miss |
+| `lean_beacon_proto_array_rebuilds_total` | Counter | Full rebuilds of the cached beacon fork-choice weights, by what made the cache stale | On a head computation that found the cache stale or not following its inputs | reason=unbuilt,prune,removal,balances,rules,coverage,link,underflow |
+| `lean_beacon_proto_array_rebuild_seconds` | Histogram | Time to rebuild the cached beacon fork-choice weights from every latest message | Per rebuild | |
+
+**`lean_beacon_proto_array_rebuilds_total` should move about once per epoch.**
+The beacon head computation reads vote weights the store keeps current as votes
+arrive, and rebuilds them from every latest message only when its inputs move
+under it: `balances` when the justified checkpoint moves, `prune` when finality
+prunes the block index (the two usually land together, and one rebuild covers
+both), `unbuilt` once per process. `removal` follows a payload invalidation or the
+restart head repair, `rules` the gloas fork boundary. `coverage` means a block
+reached the index without `Store::insert_fork_choice_node`: `on_block` always
+inserts one, so outside tests and bootstrap a steady rate of it is worth a look
+(an API read racing a block import can cost one now and then). `underflow` is a
+bug: the cache repaired itself, and a warning in the log names the validator.
 
 **On a beacon follower, watch `lean_table_bytes{table="data_columns"}`.** Every
 other table's series either stays flat or is bounded by pruning; `data_columns`
@@ -515,7 +538,7 @@ spec.
 |------|------|-------|-------------------------|--------|---------|
 | `lean_gossipsub_peers_by_score` | Gauge | Gossipsub peers by score band | Every 10 s, in the swarm task | band=non_negative,negative,below_gossip,below_publish,below_graylist | |
 | `lean_gossipsub_score_disconnects_total` | Counter | Peers disconnected for a gossipsub score below the graylist (-16000) | When the 10 s check disconnects one | | |
-| `lean_gossipsub_slow_peer_disconnects_total` | Counter | Peers disconnected for failing to take gossipsub messages in every 10 s check for a minute (a dead gossipsub stream pins its send queue in memory) | When the 10 s check disconnects one | | |
+| `lean_gossipsub_slow_peer_disconnects_total` | Counter | Peers disconnected for failing to take gossipsub messages in every 10 s check for a minute (a dead gossipsub stream pins its send queue in memory). A report counts only above `SLOW_PEER_REPORT_THRESHOLD` failures, and one check disconnects at most `MAX_SLOW_PEER_DISCONNECTS_PER_CHECK` peers | When the 10 s check disconnects one | | |
 | `lean_gossipsub_mesh_delivery_scoring` | Gauge | 1 while mesh message deliveries (P3) are scored, 0 while the head lags the wall clock or is warming up after catching up | Every slot, on the scoring refresh | | |
 
 The bands are mutually exclusive and split at the gossip (-4000), publish
@@ -660,6 +683,26 @@ worker, checkpoint-state advances, block production, gossip validation) writes
 also holds the other callers, so `lean_beacon_epoch_precompute_seconds` is the
 cleaner series for the worker alone.
 
+### Beacon Execution Payload Verdicts
+
+A beacon block (before gloas) or envelope (from it) is imported before the
+execution client answers `engine_newPayload`, and the answer is applied when it
+arrives. See "Asking without waiting" in [`beacon_engine.md`](beacon_engine.md).
+This is ethlambda-specific, not part of the leanMetrics spec.
+
+| Name | Type | Usage | Sample collection event | Labels | Buckets |
+|------|------|-------|-------------------------|--------|---------|
+| `lean_engine_new_payload_in_flight` | Gauge | `engine_newPayload` requests sent and not yet answered | On every send, answer and per-slot redrive | | |
+| `lean_engine_payloads_awaiting_verdict` | Gauge | Imported payloads with no answer yet, in flight or queued | On every send, answer and per-slot redrive | | |
+| `lean_engine_new_payload_answers_total` | Counter | Answers by what was asked about and how it was answered | When an answer is applied | kind=block,envelope; outcome=valid,optimistic,invalid,reverted,no_answer,stale | |
+| `lean_engine_no_verdict_total` | Counter | Requests that got no answer after the whole retry ladder (the payload stays, and is asked again next slot) | When the ladder is exhausted | | |
+
+**Read the waiting gauge against `MAX_PAYLOADS_AWAITING_VERDICT`.** At the cap,
+imports are held for room: expected during catch-up, a sign of a slow or stuck
+execution client otherwise. `outcome=stale` is an answer for a payload that left
+fork choice (or was finalized) while its request was out, and `reverted` an
+envelope taken back out because its contents do not hash to its block hash.
+
 ### Beacon Pubkey Cache
 
 Every BLS signature check `ethlambda beacon` runs (block import, fork choice,
@@ -705,6 +748,17 @@ spec.
 | `lean_envelopes_awaiting_block` | Gauge | Gloas execution payload envelopes held until their block is imported | On every hold, release, and finality eviction of the held envelopes | | |
 | `lean_envelopes_awaiting_columns` | Gauge | Gloas execution payload envelopes held until every sampled column is stored | On every hold, release, and finality eviction of the held envelopes | | |
 | `lean_blocks_awaiting_parent_payload` | Gauge | Gloas blocks held until their FULL parent's payload envelope is verified | On every hold, release, and finality eviction of the held blocks | | |
+| `lean_engine_get_blobs_total` | Counter | `engine_getBlobsV2` attempts for held fulu blocks, by outcome | On each answer of the one attempt made at a block's first hold | outcome=hit,miss,error | |
+| `lean_engine_get_blobs_duration_seconds` | Histogram | Time for one `engine_getBlobsV2` round trip | On each attempt, whatever its outcome | | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0 |
+| `lean_engine_blobs_to_columns_seconds` | Histogram | Time to build custody data column sidecars from execution-client blobs | On each build that reaches the cell computation, off the actor thread | | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0 |
+| `lean_data_columns_from_execution_layer_total` | Counter | Data column sidecars built from the execution client's blobs, by what p2p did with them | On each hand-over, once per result, incremented by the column count | result=published,no_digest,already_seen,not_custody | |
+
+`lean_engine_get_blobs_total` and its siblings cover the execution-client path
+(`docs/beacon_engine.md`, "Blobs from the execution client"). A high `miss`
+share means the execution client's blob pool lacks the blobs, which is normal
+for old blocks and for a syncing execution client; `already_seen` in
+`lean_data_columns_from_execution_layer_total` counts columns gossip delivered
+first.
 
 `lean_data_columns_rejected_total` counts the chain checks, which run in the
 p2p layer on every sidecar gossip did not accept: every fetched sidecar, a
