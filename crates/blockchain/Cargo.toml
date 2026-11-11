@@ -38,6 +38,9 @@ tracing.workspace = true
 hex.workspace = true
 
 [dev-dependencies]
+# `beacon::helpers::test_state`'s signing keys, for the in-process EIP-8453
+# network test.
+ethlambda-state-transition = { workspace = true, features = ["test-utils"] }
 hex = { workspace = true }
 libssz.workspace = true
 libssz-types.workspace = true

@@ -78,6 +78,7 @@ pub use ethlambda_crypto::bls;
 mod bls_fixtures;
 pub mod das;
 pub mod data_columns;
+pub mod eip8453_block_production;
 pub mod eip8453_fork_choice;
 pub mod eip8453_node;
 #[cfg(test)]

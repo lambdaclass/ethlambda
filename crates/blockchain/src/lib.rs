@@ -58,6 +58,8 @@ pub mod aggregation;
 mod beacon_aggregates;
 mod beacon_columns;
 mod beacon_eip8453;
+#[cfg(test)]
+mod beacon_eip8453_network_tests;
 pub mod beacon_engine;
 mod beacon_envelope;
 mod beacon_payloads;
