@@ -30,6 +30,7 @@ pub mod chain_state;
 mod confirmation;
 mod duties;
 pub mod fork_choice;
+mod invalidation;
 pub mod params;
 pub mod store;
 pub mod types;
@@ -39,6 +40,7 @@ mod views;
 pub use chain_state::{ChainState, ChainStates};
 pub use duties::{AcFrame, AcProposal, FinalityAttestationInput, head_vote_data};
 pub use fork_choice::{FgFrame, View, get_equivocating_indices};
+pub use invalidation::PayloadInvalidation;
 pub use params::{Params, ParamsError};
 pub use store::{BlockError, CommitteeError, HeadVoteError, PayloadError, Store, TickEvents};
 pub use types::{

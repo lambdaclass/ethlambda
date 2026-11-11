@@ -5,10 +5,13 @@
 //! `on_head_vote_message`. Times are ticks: slot `s` starts at `4s`, its head
 //! vote deadline is `4s + 1`, its support cutoff `4s + 2`.
 
+use std::collections::HashSet;
+
 use ethlambda_types::primitives::H256;
 
+use crate::invalidation::PayloadInvalidation;
 use crate::params::{Params, head_vote_due, slot_start, support_cutoff};
-use crate::store::{BlockError, CommitteeError, HeadVoteError, Store};
+use crate::store::{BlockError, CommitteeError, HeadVoteError, PayloadError, Store};
 use crate::types::{
     Anchor, BlockInput, FgCheckpoints, ForkChoiceNode, HeadVoteCommittees, HeadVoteData,
     HeadVoteMessage, HeightCheckpoint, PayloadStatus, Slot, Tick, ValidatorIndex,
@@ -697,4 +700,256 @@ fn a_full_vote_resolves_only_once_the_payload_is_verified() {
         slot_start(2) + 1
     );
     assert_eq!(store.get_vote_resolution_time(&full, 2, 11), 11);
+}
+
+// ── Payload invalidation ───────────────────────────────────────────────────
+
+fn full(byte: u8) -> ForkChoiceNode {
+    ForkChoiceNode::full(root(byte))
+}
+
+/// A block building on its parent's `Full` branch with its parent's
+/// checkpoints.
+fn add_on_full(store: &mut Store, byte: u8, parent: H256, slot: Slot) -> H256 {
+    let fg = store.block_checkpoints(&parent).expect("parent held");
+    add_on_full_with(store, byte, parent, slot, fg)
+}
+
+fn add_on_full_with(
+    store: &mut Store,
+    byte: u8,
+    parent: H256,
+    slot: Slot,
+    fg: FgCheckpoints,
+) -> H256 {
+    let mut block = input(byte, parent, slot, fg);
+    block.parent_payload_status = PayloadStatus::Full;
+    store.on_block(&block).expect("block admitted");
+    root(byte)
+}
+
+#[test]
+fn an_invalidated_payload_leaves_the_tree_with_everything_built_on_it() {
+    let mut store = store();
+    at(&mut store, slot_start(1));
+    let a = add(&mut store, 1, G, 1);
+    store.on_execution_payload_envelope(&a, true).unwrap();
+    at(&mut store, slot_start(2));
+    // B builds on A's payload, E on A's empty branch, D on B.
+    let b = add_on_full(&mut store, 2, a, 2);
+    let e = add(&mut store, 3, a, 2);
+    at(&mut store, slot_start(3));
+    let d = add(&mut store, 4, b, 3);
+    assert!(store.get_fg_frame().tree.contains(&full(1)));
+
+    let PayloadInvalidation::Invalidated { removed_blocks } = store.invalidate_payload(&a) else {
+        panic!("A's payload is invalidated");
+    };
+    let removed: HashSet<H256> = removed_blocks.into_iter().collect();
+    assert_eq!(removed, HashSet::from([b, d]));
+    assert!(!store.is_payload_verified(&a));
+    assert!(store.is_payload_invalidated(&a));
+    assert!(
+        store.contains(&a) && store.contains(&e),
+        "A and its empty branch stay"
+    );
+    assert!(!store.contains(&b) && !store.contains(&d));
+    assert!(store.is_block_invalidated(&b) && store.is_block_invalidated(&d));
+    let tree = store.get_fg_frame().tree;
+    assert!(!tree.contains(&full(1)));
+    assert!(tree.contains(&empty(1)) && tree.contains(&pending(3)));
+    // A vote for the payload or for what was built on it resolves no more.
+    assert_eq!(store.get_vote_resolution_time(&full(1), 3, 13), Tick::MAX);
+    assert_eq!(
+        store.get_vote_resolution_time(&pending(4), 3, 13),
+        Tick::MAX
+    );
+
+    // The payload, and every block on it, is refused from now on.
+    assert_eq!(
+        store.on_execution_payload_envelope(&a, true),
+        Err(PayloadError::Invalidated(a))
+    );
+    let mut on_full = input(5, a, 3, genesis_fg());
+    on_full.parent_payload_status = PayloadStatus::Full;
+    assert_eq!(
+        store.on_block(&on_full),
+        Err(BlockError::BuildsOnInvalidPayload)
+    );
+    let mut b_again = input(2, a, 2, genesis_fg());
+    b_again.parent_payload_status = PayloadStatus::Full;
+    assert_eq!(
+        store.on_block(&b_again),
+        Err(BlockError::BuildsOnInvalidPayload)
+    );
+    assert_eq!(
+        store.on_block(&input(6, d, 3, genesis_fg())),
+        Err(BlockError::BuildsOnInvalidPayload)
+    );
+    // The empty branch still extends.
+    add(&mut store, 7, a, 3);
+
+    assert_eq!(
+        store.invalidate_payload(&a),
+        PayloadInvalidation::AlreadyInvalidated
+    );
+    assert_eq!(
+        store.invalidate_payload(&d),
+        PayloadInvalidation::AlreadyInvalidated
+    );
+    assert_eq!(
+        store.invalidate_payload(&root(9)),
+        PayloadInvalidation::NotHeld
+    );
+}
+
+#[test]
+fn after_an_invalidation_the_head_the_vote_and_the_proposal_leave_the_payload() {
+    let mut store = store();
+    at(&mut store, slot_start(1));
+    let a = add(&mut store, 1, G, 1);
+    at(&mut store, head_vote_due(1));
+    for v in 0..4 {
+        vote(&mut store, v, 1, pending(1)).unwrap();
+    }
+    store.on_execution_payload_envelope(&a, true).unwrap();
+    at(&mut store, slot_start(2));
+    assert_eq!(store.get_ac_proposal().head, full(1));
+    let b = add_on_full(&mut store, 2, a, 2);
+    at(&mut store, head_vote_due(2));
+    for v in 0..4 {
+        vote(&mut store, v, 2, pending(2)).unwrap();
+    }
+    // Slot 2's confirmation takes a fast lock on B, through A's payload.
+    at(&mut store, support_cutoff(3));
+    assert_eq!(store.get_head(), empty(2));
+    assert_eq!(store.latest_confirmed(), pending(2));
+    let deadline = store.params().lock_deadline(2);
+    assert_eq!(store.locks().get(&deadline), Some(&pending(2)));
+    assert!(store.fast_confirmed_path().contains(&full(1)));
+
+    assert!(matches!(
+        store.invalidate_payload(&a),
+        PayloadInvalidation::Invalidated { .. }
+    ));
+    assert!(!store.contains(&b));
+    // What the store held by node moved up to A's pending node: the lock keeps
+    // its deadline there and still anchors the walk.
+    assert_eq!(store.locks().get(&deadline), Some(&pending(1)));
+    assert_eq!(store.latest_confirmed(), pending(1));
+    assert_eq!(store.get_confirmed_node(), pending(1));
+    assert!(
+        store
+            .fast_confirmed_path()
+            .iter()
+            .all(|node| node.root != b && *node != full(1))
+    );
+    assert_eq!(store.get_head(), empty(1));
+    let frame = store.get_ac_frame();
+    assert_eq!(frame.fg_confirmed, Some(pending(1)), "the FG source");
+    assert_eq!(frame.head.root, a);
+
+    at(&mut store, slot_start(4));
+    assert_eq!(store.get_ac_proposal().head, empty(1));
+    at(&mut store, head_vote_due(4));
+    assert_eq!(store.get_ac_vote_head(), empty(1));
+}
+
+#[test]
+fn a_payload_the_gadget_committed_to_is_not_invalidated() {
+    let mut store = store();
+    at(&mut store, slot_start(1));
+    let a = add(&mut store, 1, G, 1);
+    store.on_execution_payload_envelope(&a, true).unwrap();
+    // X builds on A's payload and enters height 2; Y justifies X.
+    at(&mut store, slot_start(2));
+    let x = add_on_full_with(
+        &mut store,
+        2,
+        a,
+        2,
+        FgCheckpoints {
+            target: cp(2, root(2)),
+            justified: cp(1, G),
+            finalized: cp(0, G),
+        },
+    );
+    store.on_execution_payload_envelope(&x, true).unwrap();
+    at(&mut store, slot_start(3));
+    let y = add_with(
+        &mut store,
+        3,
+        x,
+        3,
+        FgCheckpoints {
+            target: cp(3, root(3)),
+            justified: cp(2, x),
+            finalized: cp(0, G),
+        },
+    );
+    assert_eq!(store.justified_checkpoint(), cp(2, x));
+
+    // The justified block builds on A's payload: nothing changes.
+    assert_eq!(
+        store.invalidate_payload(&a),
+        PayloadInvalidation::Committed {
+            checkpoint: cp(2, x)
+        }
+    );
+    assert!(store.is_payload_verified(&a) && store.contains(&x));
+    assert!(!store.is_payload_invalidated(&a));
+
+    // The justified block's own payload is not part of what it commits to
+    // (the frame roots at its pending node): it goes, Y on its empty branch
+    // stays.
+    assert_eq!(
+        store.invalidate_payload(&x),
+        PayloadInvalidation::Invalidated {
+            removed_blocks: Vec::new()
+        }
+    );
+    assert!(store.contains(&y));
+
+    // Once X is finalized and A pruned, A is remembered as an ancestor the
+    // finalized chain passes through FULL; G through EMPTY.
+    at(&mut store, slot_start(4));
+    add_with(
+        &mut store,
+        4,
+        y,
+        4,
+        FgCheckpoints {
+            target: cp(3, root(3)),
+            justified: cp(2, x),
+            finalized: cp(2, x),
+        },
+    );
+    assert_eq!(store.finalized_checkpoint(), cp(2, x));
+    at(&mut store, slot_start(5));
+    assert!(!store.contains(&a));
+    assert_eq!(
+        store.invalidate_payload(&a),
+        PayloadInvalidation::Committed {
+            checkpoint: cp(2, x)
+        }
+    );
+    assert_eq!(store.invalidate_payload(&G), PayloadInvalidation::NotHeld);
+    // The finalized block's own invalidated payload stays refused.
+    assert!(store.is_payload_invalidated(&x));
+    assert_eq!(
+        store.on_block(&{
+            let mut on_full = input(5, x, 5, cp_fg(x));
+            on_full.parent_payload_status = PayloadStatus::Full;
+            on_full
+        }),
+        Err(BlockError::BuildsOnInvalidPayload)
+    );
+}
+
+fn cp_fg(justified: H256) -> FgCheckpoints {
+    FgCheckpoints {
+        target: cp(3, root(3)),
+        justified: cp(2, justified),
+        finalized: cp(2, justified),
+    }
 }

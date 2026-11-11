@@ -60,7 +60,9 @@ pub(crate) struct PooledHeadVote {
 /// Why `on_block` refused a block. Only [`BlockError::FutureSlot`],
 /// [`BlockError::UnknownParent`] and [`BlockError::ParentPayloadNotVerified`]
 /// are transient: the same block can be offered again once the clock, the
-/// tree or the payloads have moved.
+/// tree or the payloads have moved. [`BlockError::BuildsOnInvalidPayload`] is
+/// final: the block's chain builds on an execution payload the host
+/// invalidated ([`Store::invalidate_payload`]).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BlockError {
     #[error("block slot {slot} is after the current slot {current}")]
@@ -71,6 +73,8 @@ pub enum BlockError {
     UnknownParent(H256),
     #[error("block builds on its parent's full payload, which is not verified")]
     ParentPayloadNotVerified,
+    #[error("block builds on an execution payload that was invalidated")]
+    BuildsOnInvalidPayload,
     #[error("a block builds on its parent's empty or full branch, not on a pending one")]
     PendingParentStatus,
     #[error("block does not descend from the finalized block")]
@@ -111,6 +115,8 @@ pub enum CommitteeError {
 pub enum PayloadError {
     #[error("payload for an unknown block {0:?}")]
     UnknownBlock(H256),
+    #[error("the payload of {0:?} was invalidated")]
+    Invalidated(H256),
 }
 
 /// What a tick asks the host to do. The store side of the tick (`unlock`,
@@ -146,9 +152,17 @@ pub struct Store {
     pub(crate) blocks: HashMap<H256, Block>,
     pub(crate) blocks_by_slot: BTreeMap<Slot, Vec<H256>>,
     /// Strict ancestors of the finalized block that were pruned, so a child of
-    /// one is refused as not descending from it rather than fetched.
-    pub(crate) finalized_ancestors: HashSet<H256>,
+    /// one is refused as not descending from it rather than fetched, each with
+    /// the payload branch the finalized chain takes through it.
+    pub(crate) finalized_ancestors: HashMap<H256, PayloadStatus>,
     pub(crate) payloads: HashMap<H256, Payload>,
+    /// Blocks whose payload the host invalidated
+    /// ([`Store::invalidate_payload`]), with their slots: their `Full` node is
+    /// gone for good.
+    pub(crate) invalid_payloads: HashMap<H256, Slot>,
+    /// Blocks removed because their chain builds on an invalidated payload,
+    /// with their slots, so the same block offered again is refused.
+    pub(crate) invalid_blocks: HashMap<H256, Slot>,
     pub(crate) justified_checkpoint: HeightCheckpoint,
     pub(crate) finalized_checkpoint: HeightCheckpoint,
     pub(crate) max_height: Height,
@@ -195,8 +209,10 @@ impl Store {
             ticked: false,
             blocks: HashMap::from([(anchor.root, block)]),
             blocks_by_slot: BTreeMap::from([(anchor.slot, vec![anchor.root])]),
-            finalized_ancestors: HashSet::new(),
+            finalized_ancestors: HashMap::new(),
             payloads: HashMap::new(),
+            invalid_payloads: HashMap::new(),
+            invalid_blocks: HashMap::new(),
             justified_checkpoint: checkpoint,
             finalized_checkpoint: checkpoint,
             max_height: anchor_height,
@@ -303,10 +319,14 @@ impl Store {
                 stack.extend(block.children.iter().copied());
             }
         }
-        let mut cursor = self.blocks.get(&finalized).and_then(|block| block.parent);
-        while let Some(root) = cursor {
-            self.finalized_ancestors.insert(root);
-            cursor = self.blocks.get(&root).and_then(|block| block.parent);
+        let mut child = self.blocks.get(&finalized);
+        while let Some(block) = child {
+            let Some(parent) = block.parent else {
+                break;
+            };
+            self.finalized_ancestors
+                .insert(parent, block.parent_payload_status);
+            child = self.blocks.get(&parent);
         }
         if keep.len() < self.blocks.len() {
             self.blocks.retain(|root, _| keep.contains(root));
@@ -319,6 +339,14 @@ impl Store {
             }
             self.payloads.retain(|root, _| keep.contains(root));
         }
+        // An invalidated payload or block below the finalized slot could only
+        // be offered again on a chain that does not descend from the finalized
+        // block, which `on_block` refuses on its own. The finalized block's
+        // own payload stays recorded: its children may still name it.
+        let finalized_slot = self.blocks.get(&finalized).map_or(0, |block| block.slot);
+        self.invalid_payloads
+            .retain(|_, slot| *slot >= finalized_slot);
+        self.invalid_blocks.retain(|_, slot| *slot > finalized_slot);
 
         let previous = current.saturating_sub(1);
         self.head_vote_messages = self.head_vote_messages.split_off(&previous);
@@ -387,8 +415,15 @@ impl Store {
         if self.contains(&block.root) {
             return Err(BlockError::Duplicate);
         }
+        let builds_on_invalid = self.invalid_blocks.contains_key(&block.root)
+            || self.invalid_blocks.contains_key(&block.parent_root)
+            || (block.parent_payload_status == PayloadStatus::Full
+                && self.is_payload_invalidated(&block.parent_root));
+        if builds_on_invalid {
+            return Err(BlockError::BuildsOnInvalidPayload);
+        }
         let Some(parent) = self.blocks.get(&block.parent_root) else {
-            if self.finalized_ancestors.contains(&block.parent_root) {
+            if self.finalized_ancestors.contains_key(&block.parent_root) {
                 return Err(BlockError::NotDescendantOfFinalized);
             }
             return Err(BlockError::UnknownParent(block.parent_root));
@@ -460,7 +495,8 @@ impl Store {
     /// payload of `root` is verified, when it arrived, and whether it satisfies
     /// the inclusion list constraints (`record_payload_inclusion_list_
     /// satisfaction`). The host has checked data availability and verified the
-    /// envelope. A payload already verified is left as it is.
+    /// envelope. A payload already verified is left as it is; an invalidated
+    /// one is refused.
     pub fn on_execution_payload_envelope(
         &mut self,
         root: &H256,
@@ -468,6 +504,9 @@ impl Store {
     ) -> Result<(), PayloadError> {
         if self.is_payload_verified(root) {
             return Ok(());
+        }
+        if self.is_payload_invalidated(root) {
+            return Err(PayloadError::Invalidated(*root));
         }
         if !self.contains(root) {
             return Err(PayloadError::UnknownBlock(*root));
