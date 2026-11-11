@@ -2181,7 +2181,10 @@ mod tests {
     use crate::beacon::primitives::Root;
 
     /// Enough validators for two committees per slot, so one attestation can
-    /// name two committees; mainnet's preset is the only one these run under.
+    /// name two committees. These tests run under both presets (`make
+    /// test-beacon-minimal` runs `--lib` with `preset-minimal`), so slots and
+    /// member positions are derived from the preset rather than hardcoded:
+    /// minimal's epoch is 8 slots and its committees here hold 4 members.
     fn two_committees_per_slot_state() -> BeaconState {
         let count = (preset::SLOTS_PER_EPOCH * preset::TARGET_COMMITTEE_SIZE * 2) as usize;
         with_signing_validators_at(ForkName::Electra, count)
@@ -2232,7 +2235,7 @@ mod tests {
         assert!(warm.key_sums(&state, epoch).is_some());
         assert!(cold.key_sums(&state, epoch).is_none());
 
-        for slot_offset in [0u64, 7, 31] {
+        for slot_offset in [0u64, 7, preset::SLOTS_PER_EPOCH - 1] {
             let slot = compute_start_slot_at_epoch(epoch) + slot_offset;
             let committee_sets: [&[usize]; 3] = [&[0], &[1], &[0, 1]];
             for named in committee_sets {
@@ -2315,7 +2318,7 @@ mod tests {
             .committee(slot, 0)
             .unwrap()
             .to_vec();
-        let bad = members[5];
+        let bad = members[members.len() / 2];
         state.validator_mut(bad).unwrap().pubkey = Default::default();
 
         let committees = CommitteeCache::default();
