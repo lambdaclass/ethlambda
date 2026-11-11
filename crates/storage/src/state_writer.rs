@@ -49,7 +49,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -134,117 +134,63 @@ impl PendingStates {
 /// parent state that had left the cache was rebuilt once per column, eight at
 /// a time, and the node's resident memory jumped by gigabytes for it.
 ///
-/// The first miss on a root leads: it registers the root, rebuilds, caches
-/// the result, and only then deregisters the root and wakes the others. Every
-/// other miss on that root in the meantime waits and takes the leader's
-/// result, the same `Arc`. A miss that arrives after the leader deregistered
-/// leads a rebuild of its own, but finds the state in the cache on
-/// [`read_state`]'s re-check instead of reading it again.
-///
-/// A leader that fails, with an `Err` or a panic out of one of the backend
-/// reads' `.expect()`s, hands its waiters no result. Each of them retries,
-/// one as the new leader, so a failure is never shared and never strands a
-/// waiter.
+/// Each root under way has a [`OnceLock`]. The first miss runs the rebuild
+/// inside `get_or_init`; every other miss on that root blocks in
+/// `get_or_init` until it is done and takes the same `Arc`. A rebuild that
+/// panics leaves its cell empty, and `OnceLock` lets one of the blocked
+/// callers run its own rebuild instead, so a panic never strands a waiter.
+/// The entry is removed once the rebuild settles, so the map holds rebuilds
+/// under way and never pins a state.
 #[derive(Default)]
-pub(crate) struct StateRebuilds(Mutex<HashMap<H256, Arc<Rebuild>>>);
+pub(crate) struct StateRebuilds(Mutex<HashMap<H256, Arc<RebuildCell>>>);
 
-/// One rebuild under way: its outcome once there is one, and the condition
-/// its waiters sleep on until then.
-#[derive(Default)]
-struct Rebuild {
-    outcome: Mutex<RebuildOutcome>,
-    settled: Condvar,
-}
-
-#[derive(Default)]
-enum RebuildOutcome {
-    /// The leader is still rebuilding.
-    #[default]
-    Running,
-    /// The leader's result: the state, or `None` for a root with no state.
-    Built(Option<Arc<BeaconState>>),
-    /// The leader returned an error or unwound; a waiter retries.
-    Abandoned,
-}
+/// One rebuild's shared result. `Err(())` when the rebuild returned an error,
+/// which is not shared (`Error` is not `Clone`): a caller that finds it reads
+/// the state itself.
+type RebuildCell = OnceLock<Result<Option<Arc<BeaconState>>, ()>>;
 
 impl StateRebuilds {
-    /// Runs `rebuild` for `root` as the leader, or waits for the rebuild
-    /// already under way for `root` and returns its result.
+    /// Runs `rebuild` for `root`, or waits for the rebuild of `root` already
+    /// under way and returns its result.
     ///
-    /// `Fn`, not `FnOnce`: a caller whose leader failed retries, and may be
-    /// the one to lead the retry.
+    /// `Fn`, not `FnOnce`: a caller that finds a failed rebuild runs its own.
     fn share(
         &self,
         root: H256,
         rebuild: impl Fn() -> Result<Option<Arc<BeaconState>>, Error>,
     ) -> Result<Option<Arc<BeaconState>>, Error> {
-        loop {
-            let (flight, leads) = {
-                let mut flights = self.0.lock().unwrap();
-                match flights.get(&root) {
-                    Some(flight) => (flight.clone(), false),
-                    None => {
-                        let flight = Arc::new(Rebuild::default());
-                        flights.insert(root, flight.clone());
-                        (flight, true)
-                    }
-                }
-            };
-            if leads {
-                // Settles on drop, so an unwinding `rebuild` still wakes the
-                // waiters, as `Abandoned`.
-                let mut lead = Lead {
-                    rebuilds: self,
-                    root,
-                    flight,
-                    outcome: RebuildOutcome::Abandoned,
-                };
+        let cell = self.0.lock().unwrap().entry(root).or_default().clone();
+        let mut own = None;
+        let shared = cell
+            .get_or_init(|| {
                 let result = rebuild();
-                if let Ok(state) = &result {
-                    lead.outcome = RebuildOutcome::Built(state.clone());
-                }
-                return result;
-            }
-            let outcome = flight
-                .settled
-                .wait_while(flight.outcome.lock().unwrap(), |outcome| {
-                    matches!(outcome, RebuildOutcome::Running)
-                })
-                .unwrap();
-            if let RebuildOutcome::Built(state) = &*outcome {
-                crate::metrics::inc_state_rebuilds(RebuildRole::Joined);
-                return Ok(state.clone());
+                let shared = result.as_ref().map(Option::clone).map_err(|_| ());
+                own = Some(result);
+                shared
+            })
+            .clone();
+        // The first caller out removes the cell. A later miss can then
+        // register a fresh one for `root`, which a caller still leaving this
+        // cell must not remove. A rebuild that panicked with no one waiting
+        // skips this and leaves an empty cell, which the next miss on `root`
+        // fills and removes.
+        {
+            let mut cells = self.0.lock().unwrap();
+            if cells
+                .get(&root)
+                .is_some_and(|current| Arc::ptr_eq(current, &cell))
+            {
+                cells.remove(&root);
             }
         }
-    }
-}
-
-/// The leader's hold on a [`Rebuild`]. Dropping it deregisters the root and
-/// wakes the waiters, whether the rebuild returned or unwound.
-struct Lead<'a> {
-    rebuilds: &'a StateRebuilds,
-    root: H256,
-    flight: Arc<Rebuild>,
-    outcome: RebuildOutcome,
-}
-
-impl Drop for Lead<'_> {
-    fn drop(&mut self) {
-        // Tolerates poisoning rather than unwrapping: this runs during the
-        // unwind of a panicking rebuild, where a second panic would abort.
-        // Neither lock is ever held across a rebuild, so poisoning is not
-        // expected here; this only keeps it from turning into an abort.
-        self.rebuilds
-            .0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&self.root);
-        *self
-            .flight
-            .outcome
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = std::mem::take(&mut self.outcome);
-        self.flight.settled.notify_all();
+        match (own, shared) {
+            (Some(result), _) => result,
+            (None, Ok(state)) => {
+                crate::metrics::inc_state_rebuilds(RebuildRole::Joined);
+                Ok(state)
+            }
+            (None, Err(())) => rebuild(),
+        }
     }
 }
 
