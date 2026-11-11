@@ -453,10 +453,23 @@ verifications per slot, so nothing is joined without a request.
 
 Under an EIP-8453 digest the node holds `EIP8453_TOPIC_KINDS`: the global
 topics without the deprecated `beacon_aggregate_and_proof`, heze's additions,
-and `head_vote`; its backbone subnets become `attestation_{subnet_id}` (the
-`attestation_aggregate` and `head_vote_aggregate` topics are still TODOs in
-the specification and are not joined). The rollover joins them like any other
-fork's topics.
+and `head_vote`; and **every** `attestation_{subnet_id}` subnet, all
+`ATTESTATION_SUBNET_COUNT` of them, not the backbone's two. The rollover joins
+them like any other fork's topics, `SUBSCRIBE_LEAD_EPOCHS` ahead of the
+boundary (`every_fg_attestation_subnet_is_joined_ahead_of_the_eip8453_boundary`).
+
+Joining the whole family stands in for the specification's
+`attestation_aggregate` and `head_vote_aggregate` topics, which are still
+TODOs there and are not joined. FG attestations are spread over every subnet
+(`ATTESTATION_COMMITTEES_PER_ROUND` = 2,048 committees a round, subnet =
+committee index modulo `ATTESTATION_SUBNET_COUNT`), and with no aggregate
+topic a proposer can pack only the attestations its own node hears: a node on
+the backbone's subnets alone would see about 1/32 of them and a multi-node
+network would never reach the gadget's quorum. The ENR's and MetaData's
+`attnets` still advertise the backbone (`BeaconWire::attestation_subnets`):
+they describe the long-lived duty, not this stopgap. Aggregator subnets
+(`beacon_committee_subscriptions`) are not carried onto an EIP-8453 digest,
+which has no `beacon_attestation_{subnet_id}` topics.
 
 | Piece | Behaviour |
 | --- | --- |

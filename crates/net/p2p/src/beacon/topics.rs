@@ -30,12 +30,19 @@
 //! Publishing is wider than subscribing: the Beacon API gossips a validator
 //! client's attestations on whichever subnet each belongs to, through gossipsub
 //! fanout, which needs only peers subscribed to that subnet, not this node.
+//!
+//! EIP-8453 is the exception to "narrowly": under its digests this node joins
+//! every `attestation_{subnet_id}` subnet, standing in for the aggregate topics
+//! that fork's specification leaves as TODOs. See [`BeaconTopics::for_fork`]'s
+//! EIP-8453 arm.
 
 use std::collections::BTreeMap;
 
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::ForkDigest;
 use libp2p::gossipsub::IdentTopic;
+
+use super::constants::ATTESTATION_SUBNET_COUNT;
 
 /// Topic kind for beacon block gossip.
 pub const BEACON_BLOCK: &str = "beacon_block";
@@ -327,6 +334,9 @@ pub struct BeaconTopics {
     /// lighthouse node with no validators does too.
     ///
     /// A `BTreeMap` for the reason `column_topics` is one.
+    ///
+    /// Under an EIP-8453 digest this is every `attestation_{subnet_id}`
+    /// subnet, not the backbone's slice (see [`BeaconTopics::for_fork`]).
     pub attestation_topics: BTreeMap<u64, IdentTopic>,
 }
 
@@ -367,9 +377,9 @@ impl BeaconTopics {
                 attestation_subnets,
             ),
             // EIP-8453 deprecates the aggregate topic and the beacon
-            // attestation subnets, and adds `head_vote` and the
-            // `attestation_{subnet_id}` subnets the backbone moves to.
-            ForkName::Eip8453 => Self::eip8453(fork_digest, column_subnets, attestation_subnets),
+            // attestation subnets, and adds `head_vote` and every
+            // `attestation_{subnet_id}` subnet (see [`Self::eip8453`]).
+            ForkName::Eip8453 => Self::eip8453(fork_digest, column_subnets),
             ForkName::Lean => {
                 unreachable!("a beacon topic's fork is never Lean: it is absent from ForkName::ALL")
             }
@@ -385,26 +395,36 @@ impl BeaconTopics {
     }
 
     /// The topics under an EIP-8453 digest: [`EIP8453_TOPIC_KINDS`], the
-    /// custody column subnets, and the backbone's attestation subnets as
-    /// `attestation_{subnet_id}` (kept in `attestation_topics`, which the
-    /// rest of the wire reads the backbone from).
-    fn eip8453(
-        fork_digest: ForkDigest,
-        column_subnets: &[u64],
-        attestation_subnets: &[u64],
-    ) -> Self {
+    /// custody column subnets, and **every** `attestation_{subnet_id}`
+    /// subnet, not the backbone's slice.
+    ///
+    /// A deliberate departure, standing in for the specification's
+    /// `attestation_aggregate` and `head_vote_aggregate` topics, which are
+    /// still TODOs there. FG attestations are spread over all
+    /// `ATTESTATION_SUBNET_COUNT` subnets (2,048 committees a round, subnet =
+    /// committee index modulo the count) and nothing aggregates them onto a
+    /// global topic yet, so a proposer can pack only the attestations its own
+    /// node hears: a node holding the backbone's two subnets would see about
+    /// 1/32 of them and the gadget would never reach a quorum. Joining the
+    /// whole family makes every node a proposer worth having, at the cost of
+    /// receiving every attestation.
+    ///
+    /// The backbone still decides what the ENR's and MetaData's `attnets`
+    /// advertise (`BeaconWire::attestation_subnets`, untouched here): they
+    /// describe the long-lived duty a peer can rely on, not this stopgap.
+    fn eip8453(fork_digest: ForkDigest, column_subnets: &[u64]) -> Self {
         let mut column_topics = BTreeMap::new();
         for &subnet_id in column_subnets {
             column_topics
                 .entry(subnet_id)
                 .or_insert_with(|| IdentTopic::new(data_column_topic_name(fork_digest, subnet_id)));
         }
-        let mut attestation_topics = BTreeMap::new();
-        for &subnet_id in attestation_subnets {
-            attestation_topics.entry(subnet_id).or_insert_with(|| {
-                IdentTopic::new(fg_attestation_topic_name(fork_digest, subnet_id))
-            });
-        }
+        let attestation_topics: BTreeMap<u64, IdentTopic> = (0..ATTESTATION_SUBNET_COUNT)
+            .map(|subnet_id| {
+                let topic = IdentTopic::new(fg_attestation_topic_name(fork_digest, subnet_id));
+                (subnet_id, topic)
+            })
+            .collect();
         let mut topics: Vec<IdentTopic> = EIP8453_TOPIC_KINDS
             .iter()
             .map(|kind| IdentTopic::new(topic_name(fork_digest, kind)))
@@ -516,7 +536,10 @@ mod tests {
             topics.attestation_topics[&5].hash().into_string(),
             "/eth2/8c9f62fe/attestation_5/ssz_snappy"
         );
-        assert_eq!(names.len(), EIP8453_TOPIC_KINDS.len() + 1 + 2);
+        assert_eq!(
+            names.len(),
+            EIP8453_TOPIC_KINDS.len() + 1 + ATTESTATION_SUBNET_COUNT as usize
+        );
         // The topic kinds parse back, and `attestation_aggregate` is no subnet.
         assert_eq!(fg_attestation_subnet("attestation_17"), Some(17));
         assert_eq!(fg_attestation_subnet("attestation_aggregate"), None);
@@ -734,6 +757,32 @@ mod tests {
         // block topic is the one a careless `starts_with` would catch.
         assert_eq!(attestation_subnet("beacon_block"), None);
         assert_eq!(attestation_subnet(BEACON_AGGREGATE_AND_PROOF), None);
+    }
+
+    /// Under an EIP-8453 digest every attestation subnet is joined, whatever
+    /// the backbone: nothing aggregates FG attestations onto a global topic yet,
+    /// so a proposer packs only what its own node hears.
+    #[test]
+    fn every_attestation_subnet_is_joined_under_an_eip8453_digest() {
+        for backbone in [&[][..], &[12, 40][..]] {
+            let topics = BeaconTopics::for_fork(ForkName::Eip8453, MAINNET, &[], backbone);
+            assert_eq!(
+                topics
+                    .attestation_topics
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                (0..ATTESTATION_SUBNET_COUNT).collect::<Vec<_>>()
+            );
+            let names: Vec<String> = topics.topics.iter().map(|t| t.to_string()).collect();
+            for subnet_id in 0..ATTESTATION_SUBNET_COUNT {
+                assert!(names.contains(&fg_attestation_topic_name(MAINNET, subnet_id)));
+                assert!(!names.contains(&attestation_topic_name(MAINNET, subnet_id)));
+            }
+        }
+        // Heze, the fork before it, still joins the backbone only.
+        let heze = BeaconTopics::for_fork(ForkName::Heze, MAINNET, &[], &[12, 40]);
+        assert_eq!(heze.attestation_topics.len(), 2);
     }
 
     /// The backbone is a narrow slice, not the whole family: subscribing to all

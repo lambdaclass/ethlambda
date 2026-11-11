@@ -908,6 +908,26 @@ node computes the same value another way.
   `on_head_vote_message` reads), so the fork's first epoch can be judged
   while the head is a heze block.
 
+### Every `attestation_{subnet_id}` subnet is joined
+
+- **The specification:** a node holds its `SUBNETS_PER_NODE` backbone subnets
+  of `attestation_{subnet_id}`; proposers collect FG attestations and head
+  votes through the `attestation_aggregate` and `head_vote_aggregate` topics,
+  whose messages, selection proofs and deadlines are TODOs.
+- **ethlambda:** under an EIP-8453 digest the node joins all
+  `ATTESTATION_SUBNET_COUNT` `attestation_{subnet_id}` subnets
+  (`BeaconTopics::eip8453`), joined ahead of the fork boundary like the
+  fork's other topics. The ENR's and MetaData's `attnets` still advertise the
+  backbone. Aggregator subnets are not carried onto an EIP-8453 digest.
+- **Why:** with no aggregate topic, a proposer can pack only the FG
+  attestations its own node hears, and they are spread over every subnet
+  (2,048 committees a round, subnet = committee index modulo the count): on
+  the backbone alone a node sees about 1/32 of them and a multi-node network
+  never reaches the gadget's quorum. The in-process network test does not
+  show this, since it delivers by direct call. Head votes already travel on
+  one global topic, so they need nothing. Joining everything stands in for
+  the aggregate topics until the specification defines them.
+
 ### The execution layer's view
 
 - **The specification:** `forkchoiceUpdated`'s safe block is

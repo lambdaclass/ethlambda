@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::constants::MAXIMUM_GOSSIP_CLOCK_DISPARITY;
+use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::preset;
 use ethlambda_types::beacon::primitives::{Epoch, ForkDigest};
 use ethlambda_types::time::unix_now_ms;
@@ -167,7 +168,13 @@ pub(crate) fn apply(server: &mut P2PServer, epoch: Epoch) -> Changes {
             server.swarm_handle.subscribe(topic.clone());
             changes.subscribed.push(topic.to_string());
         }
-        for &subnet_id in server.aggregator_subnets.keys() {
+        // EIP-8453 has no `beacon_attestation_{subnet_id}` topics, and its
+        // digest already holds every `attestation_{subnet_id}` subnet.
+        let aggregator_subnets = server
+            .aggregator_subnets
+            .keys()
+            .filter(|_| has_beacon_attestation_subnets(Some(entry.fork)));
+        for &subnet_id in aggregator_subnets {
             let topic = attestation_topic(entry.digest, subnet_id);
             changes.subscribed.push(topic.to_string());
             server.swarm_handle.subscribe(topic);
@@ -193,7 +200,12 @@ pub(crate) fn apply(server: &mut P2PServer, epoch: Epoch) -> Changes {
             server.swarm_handle.unsubscribe(topic.clone());
             changes.unsubscribed.push(topic.to_string());
         }
-        for &subnet_id in server.aggregator_subnets.keys() {
+        let left_fork = wire.schedule.fork_for_digest(left.fork_digest);
+        let aggregator_subnets = server
+            .aggregator_subnets
+            .keys()
+            .filter(|_| has_beacon_attestation_subnets(left_fork));
+        for &subnet_id in aggregator_subnets {
             let topic = attestation_topic(left.fork_digest, subnet_id);
             changes.unsubscribed.push(topic.to_string());
             server.swarm_handle.unsubscribe(topic);
@@ -251,6 +263,13 @@ pub(crate) fn apply(server: &mut P2PServer, epoch: Epoch) -> Changes {
     changes
 }
 
+/// Whether a digest of `fork` carries phase0's `beacon_attestation_{subnet_id}`
+/// topics, which aggregators join on demand: every fork before EIP-8453, which
+/// deprecates them. An unknown fork is given the benefit of the doubt.
+pub(crate) fn has_beacon_attestation_subnets(fork: Option<ForkName>) -> bool {
+    fork.is_none_or(|fork| fork < ForkName::Eip8453)
+}
+
 fn attestation_topic(digest: ForkDigest, subnet_id: u64) -> IdentTopic {
     IdentTopic::new(topics::attestation_topic_name(digest, subnet_id))
 }
@@ -263,7 +282,6 @@ fn sync_committee_topic(digest: ForkDigest, subnet_id: u64) -> IdentTopic {
 mod tests {
     use super::*;
     use crate::test_support::unconnected_beacon_server;
-    use ethlambda_types::beacon::fork::ForkName;
     use libssz_types::SszList;
 
     use ethlambda_types::beacon::config::BlobScheduleEntry;
@@ -532,6 +550,41 @@ mod tests {
 
         // Nothing to do the second time.
         assert_eq!(apply(&mut server, GLOAS + 2), Changes::default());
+    }
+
+    /// The EIP-8453 digest's topics, every `attestation_{subnet_id}` subnet
+    /// among them, are joined `SUBSCRIBE_LEAD_EPOCHS` ahead of the boundary
+    /// like any other fork's; an aggregator subnet is not carried onto it,
+    /// since it has no `beacon_attestation_{subnet_id}` topics.
+    #[tokio::test]
+    async fn every_fg_attestation_subnet_is_joined_ahead_of_the_eip8453_boundary() {
+        const HEZE: Epoch = GLOAS + 10;
+        const EIP8453: Epoch = GLOAS + 20;
+        let config = config()
+            .with_fork_epoch(ForkName::Heze, HEZE)
+            .with_fork_epoch(ForkName::Eip8453, EIP8453);
+        let mut server = unconnected_beacon_server(config, 0).await;
+        let schedule = server.wire.beacon().expect("beacon").schedule.clone();
+        let eip8453 = schedule.digest_at(EIP8453);
+        server.aggregator_subnets.insert(9, u64::MAX);
+
+        apply(&mut server, EIP8453 - 2);
+        let joined = apply(&mut server, EIP8453 - 1);
+        for subnet_id in 0..crate::beacon::constants::ATTESTATION_SUBNET_COUNT {
+            let name = topics::fg_attestation_topic_name(eip8453, subnet_id);
+            assert!(joined.subscribed.contains(&name), "subnet {subnet_id}");
+        }
+        assert!(
+            !joined
+                .subscribed
+                .contains(&topics::attestation_topic_name(eip8453, 9))
+        );
+        let wire = server.wire.beacon().unwrap();
+        assert_eq!(wire.fork, ForkName::Heze);
+        assert_eq!(
+            wire.window_topics[0].attestation_topics.len() as u64,
+            crate::beacon::constants::ATTESTATION_SUBNET_COUNT
+        );
     }
 
     #[tokio::test]

@@ -1530,9 +1530,20 @@ pub fn join_aggregator_subnets(server: &mut P2PServer, subnets: Vec<(u64, u64)>)
     }
     // Under every digest the node holds: while a boundary's window is open,
     // attestations are published on either side of it.
+    // Not under an EIP-8453 digest: it deprecates these topics, and already
+    // holds every one of its own `attestation_{subnet_id}` subnets.
+    let held_digests: Vec<_> = wire
+        .held_topics()
+        .map(|held| held.fork_digest)
+        .filter(|&digest| {
+            crate::beacon::transition::has_beacon_attestation_subnets(
+                wire.schedule.fork_for_digest(digest),
+            )
+        })
+        .collect();
     for &subnet_id in &joined {
-        for held in wire.held_topics() {
-            let topic = beacon_topics::attestation_topic_name(held.fork_digest, subnet_id);
+        for &digest in &held_digests {
+            let topic = beacon_topics::attestation_topic_name(digest, subnet_id);
             server.swarm_handle.subscribe(IdentTopic::new(topic));
         }
     }
