@@ -544,7 +544,7 @@ pub(crate) mod test_utils {
                 .fail_operations
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
-                return Err(spawned_concurrency::error::ActorError::ActorStopped);
+                return Err(spawned_concurrency::error::ActorError::NoProc);
             }
             self.operations.lock().unwrap().push(operation);
             Ok(())
