@@ -281,15 +281,20 @@ async fn get_payload_attestation_data(
     if let Err(err) = require_validated(&store, data.beacon_block_root) {
         return err.into_response();
     }
+    // The slot's own fork: the container is gloas's, unchanged by heze and
+    // EIP-8453, but the version names the fork the slot is in.
+    let fork = store
+        .config()
+        .fork_at_epoch(compute_epoch_at_slot(data.slot));
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let response = match Encoding::from_accept(accept) {
         Encoding::Ssz => ssz_response(data.to_ssz()),
         Encoding::Json => crate::json_response(serde_json::json!({
-            "version": ForkName::Gloas.as_str(),
+            "version": fork.as_str(),
             "data": data,
         })),
     };
-    with_consensus_version(response, ForkName::Gloas)
+    with_consensus_version(response, fork)
 }
 
 /// The number of blob commitments in a gloas block's bid.
@@ -892,6 +897,22 @@ mod tests {
         assert_eq!(json["data"]["payload_present"], false);
         // No commitments, so there is no blob data to wait for.
         assert_eq!(json["data"]["blob_data_available"], true);
+    }
+
+    #[tokio::test]
+    async fn the_version_names_the_slots_fork() {
+        let state = gloas_state();
+        let slot = state.slot();
+        let config = gloas_config()
+            .with_fork_epoch(ForkName::Heze, 0)
+            .with_fork_epoch(ForkName::Eip8453, 0);
+        let (store, _root) = store_with_head(state, config, 0);
+
+        let reply = request(store, data_request(slot, None)).await;
+
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(reply.headers["eth-consensus-version"], "eip8453");
+        assert_eq!(reply.json()["version"], "eip8453");
     }
 
     #[tokio::test]
