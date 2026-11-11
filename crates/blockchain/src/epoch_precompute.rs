@@ -33,7 +33,7 @@ use ethlambda_types::beacon::containers::BeaconState;
 use ethlambda_types::beacon::preset;
 use ethlambda_types::primitives::H256;
 use spawned_concurrency::message::Message;
-use spawned_concurrency::tasks::{Context, Handler, send_after};
+use spawned_concurrency::tasks::{Context, Handler, PendingReply, send_after};
 use tracing::{debug, info, warn};
 
 use crate::BlockChainServer;
@@ -232,13 +232,13 @@ impl BlockChainServer {
 }
 
 impl Handler<EpochPrecomputeCheck> for BlockChainServer {
-    async fn handle(&mut self, msg: EpochPrecomputeCheck, ctx: &Context<Self>) {
+    async fn handle(&mut self, msg: EpochPrecomputeCheck, _reply: PendingReply<'_, ()>, ctx: &Context<Self>) {
         self.maybe_start_epoch_precompute(Trigger::Timer { slot: msg.slot }, ctx);
     }
 }
 
 impl Handler<EpochPrecomputed> for BlockChainServer {
-    async fn handle(&mut self, msg: EpochPrecomputed, _ctx: &Context<Self>) {
+    async fn handle(&mut self, msg: EpochPrecomputed, _reply: PendingReply<'_, ()>, _ctx: &Context<Self>) {
         self.epoch_precompute_in_flight = None;
         match msg.result {
             Ok(state) => {

@@ -37,7 +37,7 @@ use ethlambda_types::beacon::primitives::{Root, ValidatorIndex};
 use libp2p::PeerId;
 use libp2p::gossipsub::{MessageAcceptance, MessageId};
 use spawned_concurrency::message::Message;
-use spawned_concurrency::tasks::{Context, Handler};
+use spawned_concurrency::tasks::{Context, Handler, PendingReply};
 use tracing::{debug, error, warn};
 
 use crate::beacon::{builder_market, column_checks};
@@ -547,7 +547,7 @@ fn settle(server: &mut P2PServer, outcome: Outcome, object: &Validated) -> Outco
 }
 
 impl Handler<GossipVerdict> for P2PServer {
-    async fn handle(&mut self, msg: GossipVerdict, _ctx: &Context<Self>) {
+    async fn handle(&mut self, msg: GossipVerdict, _reply: PendingReply<'_, ()>, _ctx: &Context<Self>) {
         let GossipVerdict {
             id,
             outcome,

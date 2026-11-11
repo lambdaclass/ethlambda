@@ -21,7 +21,7 @@ use spawned_concurrency::message::Message;
 use spawned_concurrency::supervision::{
     Backoff, SupervisedChild, Supervisor, SupervisorConfig, SupervisorStrategy,
 };
-use spawned_concurrency::tasks::{Actor, Context, Handler};
+use spawned_concurrency::tasks::{Actor, Context, Handler, PendingReply};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -107,7 +107,7 @@ impl Message for InjectCrash {
 }
 
 impl Handler<InjectCrash> for HttpServer {
-    async fn handle(&mut self, _msg: InjectCrash, _ctx: &Context<Self>) {
+    async fn handle(&mut self, _msg: InjectCrash, _reply: PendingReply<'_, ()>, _ctx: &Context<Self>) {
         panic!("fault injection: crashing the HTTP server");
     }
 }
