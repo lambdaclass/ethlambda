@@ -702,7 +702,28 @@ Reads go through `get_state`, which tries three levels:
 ```
 
 If the diff chain is broken or the target's header is missing, `get_state`
-returns `None` rather than a partial state.
+returns `None` rather than a partial state. If a read fails, or a state on
+the way does not decode (a snapshot, a delta that does not apply to its base,
+a lean snapshot or diff), it returns an error rather than panicking:
+`Error::StateRebuild` wrapping `Error::Storage` or `Error::CorruptState`. A
+`BlockHeaders` row that does not decode still panics, in the slot lookup that
+reads it before any state row. Each caller decides what an error costs: p2p's
+column checks drop the one sidecar and log it, while fork choice and the state
+writer still panic on it.
+
+Concurrent misses on one root rebuild it once (`StateRebuilds` in
+`crates/storage/src/state_writer.rs`, a `OnceLock` per root under way). The
+first caller rebuilds. Every other caller that misses on that root while the
+rebuild is under way waits for it and gets the same result, so p2p's
+per-sidecar column checks, the chain actor and the RPC asking for one evicted
+parent state cost one snapshot read and one decode, not one each. A failed
+rebuild's error is shared the same way, so a failing root is read once rather
+than once per caller, and every caller waiting on it fails: a late block's
+eight custody columns are all dropped when their parent's state does not read
+back. The first caller out removes the rebuild's entry; a miss arriving
+before that takes the settled result, and any later miss reads storage
+again. A rebuild that panics hands the waiting callers nothing, and one of
+them rebuilds for the rest.
 
 ## Write Paths: What a Block Import Persists
 

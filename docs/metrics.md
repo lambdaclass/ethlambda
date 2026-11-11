@@ -348,6 +348,7 @@ In practice the distribution is bimodal and dominated by production rather than 
 | `lean_state_cache_lookups_total` | Counter | State cache lookups, by the `Store` method that made them, the kind of state asked for, and whether the cache held it | On every `get_state` (and the writer's own parent read), `has_state` and `cached_state` call | method=get_state,has_state,cached_state<br>kind=block,checkpoint<br>result=hit,miss |
 | `lean_beacon_proto_array_rebuilds_total` | Counter | Full rebuilds of the cached beacon fork-choice weights, by what made the cache stale | On a head computation that found the cache stale or not following its inputs | reason=unbuilt,prune,removal,balances,rules,coverage,link,underflow |
 | `lean_beacon_proto_array_rebuild_seconds` | Histogram | Time to rebuild the cached beacon fork-choice weights from every latest message | Per rebuild | |
+| `lean_state_rebuilds_total` | Counter | Block states read back from storage after missing the cache and the write buffer, by whether the read did the rebuild or waited on one already under way for that root | On every `get_state` miss that reads a state back from storage, or takes one from a rebuild under way; a miss that finds no state or fails counts as neither | role=led,joined |
 
 **`lean_beacon_proto_array_rebuilds_total` should move about once per epoch.**
 The beacon head computation reads vote weights the store keeps current as votes
@@ -387,6 +388,15 @@ or `has_state` miss means the state was not resident and came from the writer's
 buffer or RocksDB. A `cached_state` miss with `kind="checkpoint"` means fork
 choice's `checkpoint_state` rebuilt the state, running `process_slots` up to the
 epoch boundary when the checkpoint's block precedes it.
+
+**`lean_state_rebuilds_total{role="led"}` is the number of states actually
+read and decoded from storage.** A beacon rebuild costs about a second of CPU
+and several hundred megabytes at its peak, so this is the series to watch for
+resident-memory spikes. `role="joined"` counts misses that found a rebuild of
+the same root already under way and took its state instead. A lookup that
+finds no state for its root, or fails, counts under neither. A burst of joins
+next to a single lead is the pattern a late block's custody columns produce,
+each checked on its own task against a parent state that has left the cache.
 
 ### Beacon Gossip Validation
 

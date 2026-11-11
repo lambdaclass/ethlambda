@@ -13,6 +13,8 @@
 use std::collections::HashMap;
 
 use ethlambda_storage::CacheKey;
+use ethlambda_types::ShortRoot;
+use tracing::error;
 
 use super::{
     IgnoreReason, Outcome, QueueReason, RejectReason, SeenBlockColumns, SeenColumns,
@@ -204,17 +206,37 @@ pub fn chain_precheck_with(
             IgnoreReason::AlreadyStored,
         )));
     }
-    let Ok(Some(parent_state)) = store.get_state(&header.parent_root) else {
+    let parent_state = match store.get_state(&header.parent_root) {
+        Ok(Some(parent_state)) => parent_state,
         // Parked rather than dropped: the specification's "MAY be queued"
         // for a sidecar whose parent has not been seen. The head-state
         // signature check keeps a forged header from taking a
         // `PendingDataColumns` row while it waits.
-        return ChainPrecheck::Settled(
-            match queue_unless_forged(store, sidecar, QueueReason::ParentUnknown, memo) {
-                Outcome::Queue(_) => ChainVerdict::AwaitParent,
-                outcome => ChainVerdict::Drop(outcome),
-            },
-        );
+        Ok(None) => {
+            return ChainPrecheck::Settled(
+                match queue_unless_forged(store, sidecar, QueueReason::ParentUnknown, memo) {
+                    Outcome::Queue(_) => ChainVerdict::AwaitParent,
+                    outcome => ChainVerdict::Drop(outcome),
+                },
+            );
+        }
+        // A failed read or a corrupt row is not a parent still to come, so
+        // parking would wait for an import that need never happen. Dropped
+        // instead, as a panic in this read used to drop it.
+        Err(err) => {
+            let slot = header.slot;
+            let column = sidecar.index;
+            error!(
+                slot,
+                column,
+                parent_root = %ShortRoot(&header.parent_root.0),
+                %err,
+                "Could not read a data column's parent state; dropping the column"
+            );
+            return ChainPrecheck::Settled(ChainVerdict::Drop(Outcome::Ignore(
+                IgnoreReason::Internal,
+            )));
+        }
     };
     match judge_before_kzg(store, sidecar, &parent_state, PastLookahead::Advance, memo) {
         Ok(()) => ChainPrecheck::Pending(PendingKzg {
@@ -898,13 +920,19 @@ fn verify_header_signature(
 mod tests {
     use std::sync::Arc;
 
+    use ethlambda_storage::backend::InMemoryBackend;
+    use ethlambda_storage::{StorageBackend, Table};
+    use ethlambda_types::checkpoint::Checkpoint;
+
     use super::*;
     use crate::beacon::constants::{
         DATA_COLUMN_SIDECAR_SUBNET_COUNT, MAXIMUM_GOSSIP_CLOCK_DISPARITY as DISPARITY,
     };
     use crate::beacon::containers::{SignedBeaconBlock, electra, fulu, shared};
     use crate::beacon::fork::ForkName;
-    use crate::beacon::gossip::test_support::{fulu_parent, seen_columns, slot_start_ms, store};
+    use crate::beacon::gossip::test_support::{
+        GENESIS_TIME, fulu_parent, seen_columns, slot_start_ms, store,
+    };
     use crate::beacon::gossip::{IgnoreReason, Outcome, QueueReason, RejectReason};
     use crate::beacon::helpers::misc::compute_start_slot_at_epoch;
     use crate::beacon::helpers::test_state::secret_key_for;
@@ -1369,6 +1397,43 @@ mod tests {
         assert_eq!(
             chain_checks(&store, &sidecar(5, 1, 0), slot_start_ms(&store, 5)),
             ChainVerdict::AwaitParent
+        );
+    }
+
+    /// A parent whose state is stored but does not read back is not waiting
+    /// on an import, so the sidecar is dropped rather than parked, and the
+    /// failed read is an error rather than a panic.
+    #[test]
+    fn chain_checks_drop_a_sidecar_whose_parent_state_does_not_read_back() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::init_beacon(
+            backend.clone(),
+            GENESIS_TIME,
+            Config::mainnet().with_fork_epoch(ForkName::Fulu, 0),
+            Root::ZERO,
+            Checkpoint {
+                root: Root::ZERO,
+                slot: 0,
+            },
+            0,
+        );
+        let parent_slot = 4;
+        let card = sidecar(parent_slot + 1, 1, 0);
+        let parent_root = card.signed_block_header.message.parent_root;
+        store
+            .insert_pending_block(parent_root, parent_block(parent_slot))
+            .expect("insert pending parent");
+        // `States` is keyed by the block's slot (big-endian), then its root.
+        // A fork selector with no state after it decodes as no fork's state.
+        let key = [parent_slot.to_be_bytes().as_slice(), parent_root.as_slice()].concat();
+        let corrupt = vec![(key, vec![ForkName::Fulu.selector()])];
+        let mut batch = backend.begin_write().expect("write batch");
+        batch.put_batch(Table::States, corrupt).expect("put state");
+        batch.commit().expect("commit");
+
+        assert_eq!(
+            chain_checks(&store, &card, slot_start_ms(&store, parent_slot + 1)),
+            ChainVerdict::Drop(Outcome::Ignore(IgnoreReason::Internal))
         );
     }
 

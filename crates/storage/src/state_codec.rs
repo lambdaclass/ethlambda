@@ -34,26 +34,29 @@ pub(crate) fn encode_state_value(state: &BeaconState) -> Vec<u8> {
 
 /// The inverse of [`encode_state_value`].
 ///
-/// Panics on a value this build cannot tag-decode, matching every other state
-/// and block read in the crate:
+/// `Err` names what is wrong with a value this build cannot tag-decode.
 /// [`Store::from_db_state`](crate::store::Store::from_db_state) has already
-/// rejected a directory of the wrong format version, so anything reaching
-/// here is corruption rather than an old database.
-pub(crate) fn decode_state_value(bytes: &[u8]) -> BeaconState {
-    let (tag, ssz) = bytes.split_first().expect("value is never empty");
-    let fork = ForkName::from_selector(*tag).expect("value carries a known fork selector");
-    BeaconState::from_ssz(fork, ssz).expect("valid state value")
+/// rejected a directory of the wrong format version, so anything failing
+/// here is corruption rather than an old database. The caller knows which
+/// root it was reading and turns this into
+/// [`Error::CorruptState`](crate::error::Error::CorruptState).
+pub(crate) fn decode_state_value(bytes: &[u8]) -> Result<BeaconState, String> {
+    let (tag, ssz) = bytes.split_first().ok_or("the value is empty")?;
+    let fork =
+        ForkName::from_selector(*tag).ok_or_else(|| format!("unknown fork selector {tag}"))?;
+    BeaconState::from_ssz(fork, ssz).map_err(|err| format!("not a valid {fork} state: {err}"))
 }
 
 /// [`decode_state_value`] for the lean reader, which has no beacon shape to do
-/// anything with.
-pub(crate) fn decode_lean_state_value(bytes: &[u8]) -> State {
-    match decode_state_value(bytes) {
-        BeaconState::Lean(state) => state,
-        beacon => panic!(
-            "lean read a {} state out of the States table; a data directory holds one chain",
+/// anything with: a beacon value in a lean directory is as corrupt as one
+/// that does not decode, since a data directory holds one chain.
+pub(crate) fn decode_lean_state_value(bytes: &[u8]) -> Result<State, String> {
+    match decode_state_value(bytes)? {
+        BeaconState::Lean(state) => Ok(state),
+        beacon => Err(format!(
+            "a {} state in a lean directory",
             beacon.fork_name()
-        ),
+        )),
     }
 }
 
@@ -65,7 +68,7 @@ mod tests {
     fn a_tagged_state_value_round_trips() {
         let state = BeaconState::Lean(State::from_genesis(7, vec![]));
         let bytes = encode_state_value(&state);
-        assert_eq!(decode_state_value(&bytes), state);
+        assert_eq!(decode_state_value(&bytes), Ok(state));
     }
 
     #[test]
@@ -81,7 +84,7 @@ mod tests {
             1 + state.ssz_append_capacity(),
             "the buffer was regrown"
         );
-        assert_eq!(decode_state_value(&bytes), state);
+        assert_eq!(decode_state_value(&bytes), Ok(state));
     }
 
     #[test]
