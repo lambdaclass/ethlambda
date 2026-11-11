@@ -558,8 +558,9 @@ async fn finality_checkpoints_of_an_eip8453_state_are_the_gadgets_heights() {
 
 /// A stand-in execution client: `forkchoiceUpdated` (V4 or heze's V5) with
 /// attributes answers a payload id, and `getPayloadV6` a payload extending the
-/// requested head with exactly the requested attributes.
-async fn fake_engine() -> ethlambda_engine::EngineClient {
+/// requested head with exactly the requested attributes, under a block hash
+/// of its own for each slot, as a real execution client's are.
+pub(super) async fn fake_engine() -> ethlambda_engine::EngineClient {
     use std::sync::Mutex;
     let recorded: Arc<Mutex<Option<Value>>> = Arc::default();
     let handler = move |Json(request): Json<Value>| {
@@ -577,6 +578,9 @@ async fn fake_engine() -> ethlambda_engine::EngineClient {
                 }
                 Some("engine_getPayloadV6") => {
                     let attributes = recorded.lock().unwrap().clone().unwrap();
+                    let slot = attributes["slotNumber"].as_str().unwrap_or("0x0");
+                    let slot = u64::from_str_radix(slot.trim_start_matches("0x"), 16).unwrap_or(0);
+                    let block_hash = format!("0x{}{:016x}", "ee".repeat(24), slot);
                     serde_json::json!({
                         "executionPayload": {
                             "parentHash": attributes["parentHash"],
@@ -591,7 +595,7 @@ async fn fake_engine() -> ethlambda_engine::EngineClient {
                             "timestamp": attributes["timestamp"],
                             "extraData": "0x",
                             "baseFeePerGas": "0x7",
-                            "blockHash": format!("0x{}", "ee".repeat(32)),
+                            "blockHash": block_hash,
                             "transactions": [],
                             "withdrawals": attributes["withdrawals"],
                             "blobGasUsed": "0x0",

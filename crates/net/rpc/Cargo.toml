@@ -34,6 +34,9 @@ futures-util = "0.3"
 
 [dev-dependencies]
 ethlambda-validator.workspace = true
+# The validator client's EIP-8453 signing records live in a directory; the
+# end-to-end test gives it a throwaway one.
+tempfile = "3"
 spawned-concurrency.workspace = true
 ethlambda-state-transition = { workspace = true, features = ["test-utils"] }
 ethlambda-types.workspace = true

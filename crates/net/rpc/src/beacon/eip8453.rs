@@ -632,4 +632,6 @@ pub(crate) async fn post_fg_attestations(
 }
 
 #[cfg(test)]
+mod e2e_tests;
+#[cfg(test)]
 mod tests;
