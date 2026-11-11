@@ -63,7 +63,7 @@ jobs:
       # lag leanVM, and `--all-targets` leaves such targets out. Name them so
       # they keep compiling until they run again.
       - name: Clippy (skipped spectests)
-        run: cargo clippy --locked --workspace --test forkchoice_spectests --test signature_spectests --test stf_spectests --test ssz_spectests -- -D warnings
+        run: cargo clippy --locked --workspace --test forkchoice_spectests --test signature_spectests --test stf_spectests --test ssz_spectests --test interchange_vectors -- -D warnings
 
       # The binary's `include-ethrex` code (the `--ethrex.*` flags, the
       # embedded client's startup and shutdown) is cfg'd out of every pass
