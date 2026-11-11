@@ -1207,7 +1207,8 @@ pub fn get_forkchoice_store(
     )?;
 
     let anchor_root = anchor_block.message_hash_tree_root();
-    let anchor_rules = ForkRules::of(anchor_state.fork_name());
+    let anchor_fork = anchor_state.fork_name();
+    let anchor_rules = ForkRules::of(anchor_fork);
     let anchor_slot = anchor_block.slot();
 
     // The specification asserts `anchor_block.state_root ==
@@ -1342,6 +1343,14 @@ pub fn get_forkchoice_store(
             store.set_gloas_block_timeliness(anchor_root, [true, true]);
             store.set_payload_timeliness_vote(anchor_root, vec![None; preset::PTC_SIZE]);
             store.set_payload_data_availability_vote(anchor_root, vec![None; preset::PTC_SIZE]);
+            // [New in Heze:EIP7805] `payload_inclusion_list_satisfaction=
+            // {anchor_root: True}` (consensus-specs `0f4fa3ff`; beta.4 seeded
+            // it empty). A missing record already reads as satisfied
+            // (`is_payload_inclusion_list_satisfied`), so this states the rule
+            // rather than changing the answer.
+            if anchor_fork == ForkName::Heze {
+                store.set_payload_inclusion_list_satisfaction(anchor_root, anchor_slot, true);
+            }
         }
         ForkRules::PreGloas => {}
     }
@@ -3357,9 +3366,10 @@ fn is_pre_gloas(block: &SignedBeaconBlock) -> bool {
 /// where the specification asserts one is recorded: a payload verified
 /// before heze (whose lists were empty, so any payload satisfies them), one
 /// verified before a restart (nothing persists the map, as the
-/// specification's own store keeps it in memory), and an anchor's. Refusing
-/// to extend any of those would stall the chain over a record this node
-/// lost, not over a list the payload ignored.
+/// specification's own store keeps it in memory), and a gloas anchor's (a
+/// heze anchor is seeded `True`, see [`get_forkchoice_store`]). Refusing to
+/// extend any of those would stall the chain over a record this node lost,
+/// not over a list the payload ignored.
 pub fn is_payload_inclusion_list_satisfied(store: &Store, root: Root) -> bool {
     // If the payload is not locally available, the payload is not considered
     // to satisfy the inclusion list constraints.
@@ -9856,6 +9866,44 @@ pub(crate) mod tests {
         assert_eq!(store.block_timeliness(&anchor_root), None);
         assert_eq!(store.payload_timeliness_vote(&anchor_root), None);
         assert_eq!(store.payload_data_availability_vote(&anchor_root), None);
+    }
+
+    /// Heze's `get_forkchoice_store` seeds `payload_inclusion_list_satisfaction`
+    /// with `{anchor_root: True}` (consensus-specs `0f4fa3ff`); a gloas anchor
+    /// has no such map.
+    #[test]
+    fn get_forkchoice_store_seeds_a_heze_anchor_as_satisfying_its_inclusion_lists() {
+        use crate::beacon::containers::heze;
+
+        let mut state = test_state::with_validators_at(ForkName::Heze, 1);
+        let body = heze::BeaconBlockBody::empty();
+        *state.latest_block_header_mut() = BeaconBlockHeader {
+            slot: state.slot(),
+            proposer_index: 0,
+            parent_root: Root::ZERO,
+            state_root: Root::ZERO,
+            body_root: body.hash_tree_root(),
+        };
+        let signed = SignedBeaconBlock::Heze(heze::SignedBeaconBlock {
+            message: heze::BeaconBlock {
+                slot: state.slot(),
+                proposer_index: 0,
+                parent_root: Root::ZERO,
+                state_root: state.hash_tree_root(),
+                body,
+            },
+            signature: Default::default(),
+        });
+        let anchor_root = signed.message_hash_tree_root();
+        let config = Config::active()
+            .with_fork_epoch(ForkName::Gloas, 0)
+            .with_fork_epoch(ForkName::Heze, 0);
+        let store = get_forkchoice_store(Arc::new(InMemoryBackend::new()), state, signed, &config)
+            .expect("a heze anchor is accepted");
+        assert_eq!(
+            store.payload_inclusion_list_satisfaction(&anchor_root),
+            Some(true)
+        );
     }
 
     #[test]

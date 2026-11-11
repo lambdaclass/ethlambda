@@ -710,8 +710,10 @@ reads, and refuses to when that root is optimistic
   `root in store.payload_inclusion_list_satisfaction`.
 - **ethlambda:** a verified payload with no record reads as satisfying the
   inclusion lists. That covers a payload verified before heze (whose lists were
-  empty), one verified before a restart (the map is in memory only, as the
-  specification's store is), and an anchor's.
+  empty) and one verified before a restart (the map is in memory only, as the
+  specification's store is). A heze anchor is seeded `True` by
+  `get_forkchoice_store`, as the specification has done since consensus-specs
+  `0f4fa3ff`, so it no longer depends on the fallback.
 - **Why:** refusing to extend those would stall the chain over a record this
   node lost, not over a list the payload ignored. A payload this node judged
   itself is recorded from the execution client's `inclusionListSatisfied`

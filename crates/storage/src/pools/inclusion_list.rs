@@ -264,6 +264,27 @@ mod tests {
         assert!(store.lists_for(&committee, 5, ROOT, &all_bits()).is_empty());
     }
 
+    /// `get_inclusion_list_transactions` and `get_inclusion_list_bits` read a
+    /// `(slot, dependent_root)` nobody sent a list for as empty
+    /// (consensus-specs `0f4fa3ff`), rather than failing on the missing key,
+    /// and so does a key whose equivocators were never recorded.
+    #[test]
+    fn a_key_with_no_lists_reads_as_empty() {
+        let mut store = InclusionListStore::default();
+        assert!(store.transactions(5, ROOT, true).is_empty());
+        assert!(store.transactions(5, ROOT, false).is_empty());
+        let committee = [7; 16];
+        assert_eq!(
+            store.bits(&committee, 5, ROOT, false),
+            InclusionListBits::new()
+        );
+        // Lists for another slot or another dependent root do not leak in.
+        store.process_inclusion_list(list(6, 7, &[b"a"]), true);
+        assert!(store.transactions(5, ROOT, true).is_empty());
+        assert!(store.transactions(6, Root::repeat_byte(2), true).is_empty());
+        assert_eq!(store.transactions(6, ROOT, true).len(), 1);
+    }
+
     #[test]
     fn untimely_lists_count_only_when_asked() {
         let mut store = InclusionListStore::default();
