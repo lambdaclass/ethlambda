@@ -700,6 +700,14 @@ Reads go through `get_state`, which tries three levels:
 If the diff chain is broken or the target's header is missing, `get_state`
 returns `None` rather than a partial state.
 
+Concurrent misses on one root rebuild it once (`StateRebuilds` in
+`crates/storage/src/state_writer.rs`). The first caller leads. Every other
+caller that misses on that root while the rebuild is under way waits for it
+and gets the same `Arc`, so p2p's per-sidecar column checks, the chain actor
+and the RPC asking for one evicted parent state cost one snapshot read and one
+decode, not one each. A leader that errors or panics hands its waiters no
+result; they retry, one of them as the new leader.
+
 ## Write Paths: What a Block Import Persists
 
 Block import (`on_block` in `crates/blockchain/src/store.rs`) commits a

@@ -47,8 +47,8 @@ use libssz::{SszDecode, SszEncode};
 use crate::metrics::StateCacheMethod;
 use crate::state_codec::encode_state_value;
 use crate::state_writer::{
-    CacheKey, PendingStates, STATE_WRITE_QUEUE_CAPACITY, StateCache, StateWriteRequest,
-    StateWriterHandle, cache_get, read_state,
+    CacheKey, PendingStates, STATE_WRITE_QUEUE_CAPACITY, StateCache, StateRebuilds,
+    StateWriteRequest, StateWriterHandle, cache_get, read_state,
 };
 use thiserror::Error;
 use tracing::{info, warn};
@@ -1170,6 +1170,10 @@ pub struct Store {
     /// States handed to the writer but not yet committed; see
     /// [`PendingStates`].
     pending_states: Arc<PendingStates>,
+    /// Block-state rebuilds under way, shared with the writer thread, so
+    /// concurrent misses on one root read it from storage once; see
+    /// [`StateRebuilds`].
+    state_rebuilds: Arc<StateRebuilds>,
     /// Committee shufflings shared across everything that asks a beacon state
     /// which validators attest at a slot: the state transition as it
     /// processes a block's attestations, fork choice as it replays those same
@@ -1823,11 +1827,13 @@ impl Store {
     ) -> Self {
         let state_cache = new_state_cache();
         let pending_states = Arc::new(PendingStates::default());
+        let state_rebuilds = Arc::new(StateRebuilds::default());
         let state_writer = Arc::new(StateWriterHandle::spawn(
             backend.clone(),
             chain,
             state_cache.clone(),
             pending_states.clone(),
+            state_rebuilds.clone(),
         ));
         Self {
             backend,
@@ -1844,6 +1850,7 @@ impl Store {
             operation_pool: Default::default(),
             state_cache,
             pending_states,
+            state_rebuilds,
             committee_cache: Arc::new(CommitteeCache::default()),
             observed_liveness: Arc::new(ObservedLiveness::default()),
             active_balance_cache: Arc::new(ActiveBalanceCache::default()),
@@ -3246,12 +3253,18 @@ impl Store {
     /// [`read_state`](crate::state_writer::read_state), which this calls
     /// directly rather than restating: one copy of the algorithm is one copy
     /// that can go stale.
+    ///
+    /// Safe to call from many threads for the same root at once: a miss
+    /// that finds a rebuild of `root` already under way waits for it and
+    /// returns its result rather than reading the state again. See
+    /// [`StateRebuilds`].
     pub fn get_state(&self, root: &H256) -> Result<Option<Arc<BeaconState>>, Error> {
         read_state(
             self.backend.as_ref(),
             self.chain,
             &self.state_cache,
             &self.pending_states,
+            &self.state_rebuilds,
             root,
         )
     }
