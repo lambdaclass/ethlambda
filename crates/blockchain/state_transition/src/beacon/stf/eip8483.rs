@@ -141,7 +141,7 @@ pub fn process_builder_pq_registration_request(
 /// request does touches the registry (keys and withdrawal credentials read
 /// before the first request are the ones every later request would read), and
 /// the registration list changes only through this loop.
-pub(crate) fn process_validator_pq_registration_requests(
+pub fn process_validator_pq_registration_requests(
     state: &mut BeaconState,
     requests: &[ValidatorPQRegistrationRequest],
 ) -> Result<()> {

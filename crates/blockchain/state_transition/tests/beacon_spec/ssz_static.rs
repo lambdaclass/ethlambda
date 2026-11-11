@@ -18,7 +18,7 @@
 
 use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::containers::{
-    altair, bellatrix, capella, deneb, electra, fulu, gloas, heze, phase0, shared,
+    altair, bellatrix, capella, deneb, eip8483, electra, fulu, gloas, heze, phase0, shared,
 };
 use ethlambda_state_transition::beacon::primitives::{HashTreeRoot, Root};
 use libssz::{SszDecode, SszEncode};
@@ -202,6 +202,10 @@ pub fn trials() -> Vec<Trial> {
                 // Heze (EIP-8015) drops four eth1 and deposit-index fields from
                 // the state, leaving gaps in its progressive layout.
                 "BeaconState" if fork == ForkName::Heze => check::<heze::BeaconState>(case),
+                // EIP-8483 appends its two PQ registries to heze's state.
+                "BeaconState" if fork == ForkName::Eip8483 => {
+                    check::<eip8483::BeaconState>(case)
+                }
 
                 "BeaconBlock" if fork == ForkName::Phase0 => check::<phase0::BeaconBlock>(case),
                 "BeaconBlockBody" if fork == ForkName::Phase0 => {
@@ -258,9 +262,13 @@ pub fn trials() -> Vec<Trial> {
                     check::<gloas::SignedBeaconBlock>(case)
                 }
                 // Heze (EIP-8015) drops `eth1_data` and `deposits` from the body.
-                "BeaconBlock" if fork == ForkName::Heze => check::<heze::BeaconBlock>(case),
-                "BeaconBlockBody" if fork == ForkName::Heze => check::<heze::BeaconBlockBody>(case),
-                "SignedBeaconBlock" if fork == ForkName::Heze => {
+                // EIP-8483 keeps heze's block containers; only the requests
+                // inside `parent_execution_requests` change shape.
+                "BeaconBlock" if fork.is_heze_or_later() => check::<heze::BeaconBlock>(case),
+                "BeaconBlockBody" if fork.is_heze_or_later() => {
+                    check::<heze::BeaconBlockBody>(case)
+                }
+                "SignedBeaconBlock" if fork.is_heze_or_later() => {
                     check::<heze::SignedBeaconBlock>(case)
                 }
 
@@ -509,6 +517,17 @@ pub fn trials() -> Vec<Trial> {
                 // containers are heze's own, in the arms above).
                 "InclusionList" => check::<heze::InclusionList>(case),
                 "SignedInclusionList" => check::<heze::SignedInclusionList>(case),
+
+                // EIP-8483 (consensus-specs #5809). `ExecutionRequests` is
+                // covered by the gloas arm above, in its seven-field shape.
+                "ValidatorPQRegistrationRequest" => {
+                    check::<eip8483::ValidatorPQRegistrationRequest>(case)
+                }
+                "ValidatorPQRegistration" => check::<eip8483::ValidatorPQRegistration>(case),
+                "BuilderPQRegistrationRequest" => {
+                    check::<eip8483::BuilderPQRegistrationRequest>(case)
+                }
+                "BuilderPQRegistration" => check::<eip8483::BuilderPQRegistration>(case),
 
                 // No arm matched, so this crate has no container for this
                 // handler/fork pair, and this is not `LightClient*` (that

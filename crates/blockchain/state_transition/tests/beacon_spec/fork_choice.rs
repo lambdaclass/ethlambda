@@ -349,6 +349,10 @@ pub(super) fn decode_anchor_block(case: &Case) -> Result<SignedBeaconBlock, Stri
             message: decode(case, "anchor_block")?,
             signature: Default::default(),
         })),
+        ForkName::Eip8483 => Ok(SignedBeaconBlock::Eip8483(heze::SignedBeaconBlock {
+            message: decode(case, "anchor_block")?,
+            signature: Default::default(),
+        })),
         ForkName::Lean => lean_is_not_a_fixture_fork("fork_choice"),
     }
 }

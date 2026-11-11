@@ -16,7 +16,7 @@ use libssz::{SszDecode as _, SszEncode as _};
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libtest_mimic::Trial;
 
-use super::{Case, PRESET, collect, crypto_root, fixture_root};
+use super::{Case, PRESET, UNRELEASED_FORKS, collect, crypto_root, fixture_root};
 
 #[derive(serde::Deserialize)]
 struct RootFile {
@@ -69,7 +69,10 @@ pub fn trials() -> Vec<Trial> {
         }),
         Trial::test("harness/discovery_covers_every_supported_fork", || {
             let cases = collect(PRESET, "ssz_static", "Checkpoint");
-            for fork in ForkName::ALL {
+            let released = ForkName::ALL
+                .into_iter()
+                .filter(|fork| !UNRELEASED_FORKS.contains(fork));
+            for fork in released {
                 assert!(
                     cases.iter().any(|case| case.fork == fork),
                     "discovery found no {fork} cases; the fixture release is expected to \

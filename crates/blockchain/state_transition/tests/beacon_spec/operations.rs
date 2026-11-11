@@ -129,7 +129,7 @@
 use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::config::Config;
 use ethlambda_state_transition::beacon::containers::{
-    BeaconState, altair, bellatrix, capella, deneb, electra, gloas, heze, phase0, shared,
+    BeaconState, altair, bellatrix, capella, deneb, eip8483, electra, gloas, heze, phase0, shared,
 };
 use ethlambda_state_transition::beacon::helpers::accessors::{ActiveBalanceCache, CommitteeCache};
 use ethlambda_state_transition::beacon::primitives::{HashTreeRoot as _, Slot};
@@ -137,6 +137,7 @@ use ethlambda_state_transition::beacon::stf::altair as altair_stf;
 use ethlambda_state_transition::beacon::stf::bellatrix as bellatrix_stf;
 use ethlambda_state_transition::beacon::stf::capella as capella_stf;
 use ethlambda_state_transition::beacon::stf::deneb as deneb_stf;
+use ethlambda_state_transition::beacon::stf::eip8483 as eip8483_stf;
 use ethlambda_state_transition::beacon::stf::electra as electra_stf;
 use ethlambda_state_transition::beacon::stf::fulu as fulu_stf;
 use ethlambda_state_transition::beacon::stf::gloas as gloas_stf;
@@ -266,7 +267,8 @@ fn apply(
             }
             // Heze's block differs only in a body without `eth1_data` and
             // `deposits` (EIP-8015), which the header's `body_root` commits to.
-            ForkName::Heze => {
+            // EIP-8483's is heze's container.
+            ForkName::Heze | ForkName::Eip8483 => {
                 let block: heze::BeaconBlock = case.ssz("block");
                 block::process_block_header(
                     state,
@@ -583,7 +585,7 @@ fn apply(
         // previous slot's payload, so the fixture's operation file is a whole
         // `BeaconBlock`, named `block` like `block_header`'s.
         "parent_execution_payload" => match case.fork {
-            ForkName::Heze => {
+            ForkName::Heze | ForkName::Eip8483 => {
                 let block: heze::BeaconBlock = case.ssz("block");
                 let body = &block.body;
                 gloas_stf::process_parent_execution_payload(
@@ -662,6 +664,30 @@ fn apply(
             let request: gloas::BuilderExitRequest = case.ssz("builder_exit_request");
             gloas_stf::process_builder_exit_request(state, &request, config)
         }
+        // New in EIP-8483 (consensus-specs #5809). The validator handler also
+        // runs the batched path `apply_parent_execution_payload` uses, from
+        // the same pre-state, and fails the case if the two disagree.
+        "validator_pq_registration_request" => {
+            let request: eip8483::ValidatorPQRegistrationRequest =
+                case.ssz("validator_pq_registration_request");
+            let mut batched = state.clone();
+            let outcome = eip8483_stf::process_validator_pq_registration_request(state, &request);
+            eip8483_stf::process_validator_pq_registration_requests(&mut batched, &[request])
+                .map_err(|err| format!("the batched path failed: {err:?}"))?;
+            state.apply_pending_mutations();
+            batched.apply_pending_mutations();
+            if *state != batched {
+                return Err(
+                    "the batched path disagrees with the specification's function".to_string(),
+                );
+            }
+            outcome
+        }
+        "builder_pq_registration_request" => {
+            let request: eip8483::BuilderPQRegistrationRequest =
+                case.ssz("builder_pq_registration_request");
+            eip8483_stf::process_builder_pq_registration_request(state, &request)
+        }
         // New in gloas (EIP-7732): the payload timeliness committee's vote on
         // whether the *previous* slot's payload showed up on time.
         "payload_attestation" => {
@@ -715,6 +741,7 @@ fn every_shipped_handler_is_dispatched() -> Result<(), Failed> {
         "bls_to_execution_change",
         "builder_deposit_request",
         "builder_exit_request",
+        "builder_pq_registration_request",
         "consolidation_request",
         "deposit",
         "deposit_request",
@@ -724,6 +751,7 @@ fn every_shipped_handler_is_dispatched() -> Result<(), Failed> {
         "payload_attestation",
         "proposer_slashing",
         "sync_aggregate",
+        "validator_pq_registration_request",
         "voluntary_exit",
         "voluntary_exit_churn",
         "withdrawal_request",
