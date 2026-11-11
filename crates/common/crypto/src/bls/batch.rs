@@ -9,7 +9,8 @@
 //! in full. Checking `n` equations `e(pk_i, H(m_i)) = e(g1, sig_i)` together
 //! needs one Miller loop per set but only one final exponentiation for all of
 //! them, so a block with a dozen signature sets spends a fraction of what a
-//! dozen separate checks do.
+//! dozen separate checks do. `silver_crypto_simd` runs those Miller loops eight
+//! at a time on an IFMA CPU, which a batch gives it enough of to fill.
 //!
 //! # Why sets are grouped by message
 //!
@@ -39,10 +40,22 @@
 //! is redrawn, since it would drop its set from the equation altogether.
 //!
 //! Grouping adds two refusals. A weighted signature sum that is the point at
-//! infinity fails the batch: the right-hand side would be trivial, and a pair
+//! infinity fails the chunk: the right-hand side would be trivial, and a pair
 //! of keys `P` and `-P` whose weighted sum also vanished would let the
 //! left-hand side drop out too. And a group whose weighted key sum is the
 //! identity fails, as the pairing check refuses an identity key.
+//!
+//! # Why a batch is split into chunks
+//!
+//! Weighting keys and hashing messages cost more than the pairing itself, and
+//! `blst`'s batch, which this replaced, spread them over its thread pool. A
+//! batch here is cut into chunks of at most [`RUNS_PER_CHUNK`] message runs,
+//! each its own random linear combination with its own weights and its own
+//! final exponentiation, checked in parallel on rayon's pool. A chunk plus the
+//! pair for its signature sum fills one pass of the Miller-loop lanes.
+//! Splitting keeps the soundness argument per chunk: a forged set sits in one
+//! chunk, and that chunk passes with probability about 2^-64 whatever the other
+//! chunks hold.
 //!
 //! # What a batch answers
 //!
@@ -54,16 +67,18 @@
 
 use std::ops::Range;
 
-use blst::min_pk::{PublicKey, Signature};
-use blst::{blst_p1_affine, blst_p2_affine};
+use blst::min_pk::PublicKey;
 use rand::RngExt;
 use rayon::prelude::*;
+use silver_crypto_simd::bls::limbs::LANES;
+use silver_crypto_simd::bls::{G1Point, G2Point};
 
 use ethlambda_types::beacon::primitives::{BlsSignature, Root};
 
 use super::hashed_messages::hashed_message;
 use super::{
-    AggregatePubkey, PubkeySource, pairing_verify, primitives, validated_pubkey, validated_pubkeys,
+    AggregatePubkey, PubkeySource, core_verify, decode_signature, primitives, validated_pubkey,
+    validated_pubkeys,
 };
 
 /// One signature check, resolved and ready, that may be verified alone or in a
@@ -74,11 +89,15 @@ use super::{
 /// everything a check does short of the pairing. That split is what lets a
 /// caller decide *when* to pay for the pairing: at once ([`Self::verify`]) or
 /// together with the other sets of a block ([`verify_signature_sets`]).
+///
+/// A single key and a sum of keys are checked by the same equation, so a set
+/// does not record which one it holds; only a sum can be the identity, which
+/// both checks refuse.
 #[derive(Clone, Copy)]
 pub struct SignatureSet {
     pubkey: PublicKey,
     message: Root,
-    signature: Signature,
+    signature: G2Point,
 }
 
 impl SignatureSet {
@@ -92,7 +111,7 @@ impl SignatureSet {
         signature: &BlsSignature,
     ) -> Option<Self> {
         let pubkey = validated_pubkey(pubkey)?;
-        let signature = Signature::sig_validate(signature.as_ref(), false).ok()?;
+        let signature = decode_signature(signature)?;
         Some(Self {
             pubkey,
             message,
@@ -102,8 +121,8 @@ impl SignatureSet {
 
     /// `bls.FastAggregateVerify`'s inputs.
     ///
-    /// `None` for an empty `pubkeys`, any key that fails `key_validate`, or a
-    /// signature that fails `sig_validate`: the cases
+    /// `None` for an empty `pubkeys`, any key that fails `KeyValidate`, or a
+    /// signature that does not decode to a subgroup point: the cases
     /// [`super::fast_aggregate_verify`] answers false for before the pairing.
     pub fn fast_aggregate<K: PubkeySource>(
         pubkeys: &[K],
@@ -113,9 +132,9 @@ impl SignatureSet {
         if pubkeys.is_empty() {
             return None;
         }
-        let signature = Signature::sig_validate(signature.as_ref(), false).ok()?;
+        let signature = decode_signature(signature)?;
         let points = validated_pubkeys(pubkeys)?;
-        // Every point above already passed `key_validate`, so the sum does
+        // Every point above already passed `KeyValidate`, so the sum does
         // not re-check them.
         let pubkey = super::sum_validated_points(&points)?;
         Some(Self {
@@ -128,16 +147,17 @@ impl SignatureSet {
     /// `bls.FastAggregateVerify`'s inputs with the key already summed, as
     /// committee key sums produce it.
     ///
-    /// `None` when `signature` fails `sig_validate`. The key needs no check: a
-    /// sum of validated points is in the subgroup, and the identity, the one
-    /// sum that is not a valid key, is refused by [`Self::verify`] and by the
-    /// batch at pairing time, as it is for a key summed here from scratch.
+    /// `None` when `signature` does not decode to a subgroup point. The key
+    /// needs no check: a sum of validated points is in the subgroup, and the
+    /// identity, the one sum that is not a valid key, is refused by
+    /// [`Self::verify`] and by the batch before any pairing, as it is for a
+    /// key summed here from scratch.
     pub fn from_aggregate(
         key: AggregatePubkey,
         message: Root,
         signature: &BlsSignature,
     ) -> Option<Self> {
-        let signature = Signature::sig_validate(signature.as_ref(), false).ok()?;
+        let signature = decode_signature(signature)?;
         Some(Self {
             pubkey: key.to_public_key(),
             message,
@@ -148,18 +168,18 @@ impl SignatureSet {
     /// The pairing check on its own: the same answer [`super::verify`] or
     /// [`super::fast_aggregate_verify`] gives for these inputs.
     pub fn verify(&self) -> bool {
-        pairing_verify(&self.pubkey, &self.message, &self.signature)
+        core_verify(&self.pubkey, self.message, &self.signature)
     }
 
     /// Whether the key is the identity, which no signature can validly be
     /// made under. Only a sum of keys can be: a single registry key is
-    /// rejected by `key_validate` if it is.
+    /// rejected by `KeyValidate` if it is.
     ///
     /// The pairing check refuses the same input itself, so this makes the
     /// rule explicit where a reader of the batch looks for it, and lets the
     /// batch return before doing any group arithmetic.
     fn key_is_identity(&self) -> bool {
-        primitives::key_is_identity(&self.pubkey)
+        primitives::g1_point(&self.pubkey).is_infinity()
     }
 }
 
@@ -172,6 +192,11 @@ fn random_weight(rng: &mut impl RngExt) -> u64 {
         }
     }
 }
+
+/// How many message runs one chunk of a batch holds: with the pair for the
+/// chunk's signature sum, exactly one pass of the pairing product's Miller-loop
+/// lanes.
+const RUNS_PER_CHUNK: usize = LANES - 1;
 
 /// The runs of equal messages in `sets` taken in `order`, as index ranges into
 /// `order`. `order` must already be sorted by message.
@@ -187,15 +212,15 @@ fn message_runs(sets: &[SignatureSet], order: &[usize]) -> Vec<Range<usize>> {
     runs
 }
 
-/// Whether every set verifies, in one random-linear-combination check grouped
-/// by message: one pairing per distinct message and one final exponentiation.
-/// An empty slice verifies.
+/// Whether every set verifies, in random-linear-combination checks grouped by
+/// message: one pairing per distinct message, and one final exponentiation per
+/// chunk of [`RUNS_PER_CHUNK`] distinct messages. An empty slice verifies.
 ///
-/// See the module documentation for the equation and why the weights are
-/// random (64-bit, nonzero, from the OS-seeded RNG). A single set skips them
-/// and is verified directly, since one equation needs no combining. A set
-/// whose key is the identity fails the batch, as it fails
-/// [`SignatureSet::verify`], and so does a batch whose weighted signature sum
+/// See the module documentation for the equation, why the weights are random
+/// (64-bit, nonzero, from the OS-seeded RNG) and why the batch is chunked. A
+/// single set skips them and is verified directly, since one equation needs no
+/// combining. A set whose key is the identity fails the batch, as it fails
+/// [`SignatureSet::verify`], and so does a chunk whose weighted signature sum
 /// is the point at infinity.
 pub fn verify_signature_sets(sets: &[SignatureSet]) -> bool {
     match sets {
@@ -208,11 +233,26 @@ pub fn verify_signature_sets(sets: &[SignatureSet]) -> bool {
     }
     let mut order: Vec<usize> = (0..sets.len()).collect();
     order.sort_unstable_by(|&a, &b| sets[a].message.as_slice().cmp(sets[b].message.as_slice()));
+    let runs = message_runs(sets, &order);
+    runs.par_chunks(RUNS_PER_CHUNK)
+        .all(|chunk| chunk_holds(sets, &order, chunk))
+}
 
+/// One chunk's random linear combination, with its own weights; see the module
+/// documentation. `runs` index into `order`, which indexes `sets`. Every key is
+/// already known not to be the identity.
+fn chunk_holds(sets: &[SignatureSet], order: &[usize], runs: &[Range<usize>]) -> bool {
+    let (Some(first), Some(last)) = (runs.first(), runs.last()) else {
+        return true;
+    };
+    let members = &order[first.start..last.end];
     let mut rng = rand::rng();
-    let weights: Vec<u64> = order.iter().map(|_| random_weight(&mut rng)).collect();
-    let keys: Vec<PublicKey> = order.iter().map(|&i| sets[i].pubkey).collect();
-    let signatures: Vec<Signature> = order.iter().map(|&i| sets[i].signature).collect();
+    let weights: Vec<u64> = members.iter().map(|_| random_weight(&mut rng)).collect();
+    let keys: Vec<G1Point> = members
+        .iter()
+        .map(|&i| primitives::g1_point(&sets[i].pubkey))
+        .collect();
+    let signatures: Vec<G2Point> = members.iter().map(|&i| sets[i].signature).collect();
 
     // If the weighted signatures summed to the identity the right-hand side of
     // the equation would be trivial.
@@ -221,21 +261,19 @@ pub fn verify_signature_sets(sets: &[SignatureSet]) -> bool {
         return false;
     }
 
-    let runs = message_runs(sets, &order);
-    let groups: Vec<(PublicKey, blst_p2_affine)> = runs
+    // Each run's key sum and (on a cache miss) message hash are independent,
+    // and a hash costs about as much as a Miller loop, so they fan out rather
+    // than run one after another inside the chunk.
+    let offset = first.start;
+    let pairs: Vec<(G1Point, G2Point)> = runs
         .par_iter()
         .map(|run| {
-            let key = primitives::weighted_key_sum(&keys[run.clone()], &weights[run.clone()]);
+            let span = run.start - offset..run.end - offset;
+            let key = primitives::weighted_key_sum(&keys[span.clone()], &weights[span]);
             (key, hashed_message(&sets[order[run.start]].message))
         })
         .collect();
-    let group_keys: Vec<blst_p1_affine> = groups.iter().map(|(key, _)| (*key).into()).collect();
-    let pairs: Vec<(&blst_p1_affine, &blst_p2_affine)> = group_keys
-        .iter()
-        .zip(&groups)
-        .map(|(key, (_, hashed))| (key, hashed))
-        .collect();
-    primitives::pairing_check(&pairs, &signature_sum.into())
+    primitives::pairing_product_holds(&pairs, &signature_sum)
 }
 
 #[cfg(test)]
@@ -244,6 +282,7 @@ mod tests {
 
     use super::*;
     use crate::bls::{self, DST};
+    use blst::min_pk::Signature;
     use ethlambda_types::beacon::primitives::BlsPubkey;
 
     fn secret_key(seed: u8) -> SecretKey {
@@ -444,6 +483,69 @@ mod tests {
         assert!(verify_signature_sets(&sets));
     }
 
+    /// The batch answers what checking every set alone through `blst` answers,
+    /// at batch sizes on both sides of the pairing kernel's eight lanes (the
+    /// batch adds one pair for the signature sum), with no bad set and with a
+    /// bad set in each position class.
+    #[test]
+    fn a_batch_agrees_with_blst_checking_each_set_alone() {
+        use blst::BLST_ERROR::BLST_SUCCESS;
+        for n in [2u8, 7, 8, 9, 15, 16, 17] {
+            for bad in [None, Some(0), Some(n / 2), Some(n - 1)] {
+                let mut inputs: Vec<(BlsPubkey, Root, BlsSignature)> = (0..n)
+                    .map(|i| {
+                        let key = secret_key(100 + i);
+                        let msg = message(i);
+                        (pubkey_of(&key), msg, sign(&key, msg))
+                    })
+                    .collect();
+                if let Some(bad) = bad {
+                    let key = secret_key(100 + bad);
+                    inputs[usize::from(bad)].2 = sign(&key, message(255));
+                }
+                let theirs = inputs.iter().all(|(pubkey, msg, signature)| {
+                    let key = PublicKey::key_validate(pubkey.as_ref()).unwrap();
+                    let sig =
+                        blst::min_pk::Signature::sig_validate(signature.as_ref(), false).unwrap();
+                    sig.verify(false, msg.as_slice(), DST, &[], &key, false) == BLST_SUCCESS
+                });
+                assert_eq!(theirs, bad.is_none());
+                let sets: Vec<SignatureSet> = inputs
+                    .iter()
+                    .map(|(pubkey, msg, signature)| {
+                        SignatureSet::single(pubkey, *msg, signature).unwrap()
+                    })
+                    .collect();
+                assert_eq!(
+                    verify_signature_sets(&sets),
+                    theirs,
+                    "{n} sets, bad {bad:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn runs_split_across_chunks_each_hold_and_one_bad_set_fails_all() {
+        // Three sets per message over more messages than one chunk holds, so
+        // runs of shared messages land in several chunks.
+        let messages = RUNS_PER_CHUNK * 2 + 3;
+        let build = |bad: Option<usize>| -> Vec<SignatureSet> {
+            (0..messages * 3)
+                .map(|i| {
+                    let key = secret_key(i as u8);
+                    let msg = message((i % messages) as u8);
+                    let signed = if Some(i) == bad { message(250) } else { msg };
+                    SignatureSet::single(&pubkey_of(&key), msg, &sign(&key, signed)).unwrap()
+                })
+                .collect()
+        };
+        assert!(verify_signature_sets(&build(None)));
+        for bad in [0, messages, messages * 3 - 1] {
+            assert!(!verify_signature_sets(&build(Some(bad))), "bad {bad}");
+        }
+    }
+
     #[test]
     fn random_weights_are_never_zero() {
         let mut rng = rand::rng();
@@ -510,7 +612,7 @@ mod tests {
         for _ in 0..10 {
             assert!(!verify_signature_sets(&sets));
         }
-        let signatures: Vec<Signature> = sets.iter().map(|set| set.signature).collect();
+        let signatures: Vec<G2Point> = sets.iter().map(|set| set.signature).collect();
         let sum = primitives::weighted_signature_sum(&signatures, &[3, 5, 7, 9]);
         assert!(primitives::signature_is_identity(&sum));
     }
@@ -518,9 +620,14 @@ mod tests {
     /// The verdict plain blst gives for every set alone, ANDed.
     fn blst_checks_each(sets: &[SignatureSet]) -> bool {
         sets.iter().all(|set| {
-            set.signature
-                .verify(false, set.message.as_slice(), DST, &[], &set.pubkey, false)
-                == blst::BLST_ERROR::BLST_SUCCESS
+            Signature::from(set.signature.into_blst()).verify(
+                false,
+                set.message.as_slice(),
+                DST,
+                &[],
+                &set.pubkey,
+                false,
+            ) == blst::BLST_ERROR::BLST_SUCCESS
         })
     }
 

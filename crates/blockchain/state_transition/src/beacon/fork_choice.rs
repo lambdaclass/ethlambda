@@ -4401,12 +4401,16 @@ fn verify_column_cells(
     let cell_indices = vec![index; column.len()];
     let mut cells = Vec::with_capacity(column.len());
     for cell in column {
-        cells.push(
-            c_kzg::Cell::from_bytes(&cell[..])
-                .map_err(|_| Error::SpecAssert("len(cell) == BYTES_PER_CELL"))?,
-        );
+        cells.push(kzg_cell(cell)?);
     }
     kzg::verify_cell_kzg_proof_batch(commitments, &cell_indices, &cells, proofs)
+}
+
+/// A column's cell as the KZG module's [`kzg::Cell`].
+fn kzg_cell(cell: &fulu::Cell) -> Result<kzg::Cell> {
+    cell[..]
+        .try_into()
+        .map_err(|_| Error::SpecAssert("len(cell) == BYTES_PER_CELL"))
 }
 
 /// One column's worth of input to [`verify_column_cells_batch`]: the cell
@@ -4437,10 +4441,7 @@ pub fn verify_column_cells_batch(columns: &[ColumnCells<'_>]) -> Result<bool> {
     for column in columns {
         cell_indices.extend(std::iter::repeat_n(column.index, column.column.len()));
         for cell in column.column {
-            cells.push(
-                c_kzg::Cell::from_bytes(&cell[..])
-                    .map_err(|_| Error::SpecAssert("len(cell) == BYTES_PER_CELL"))?,
-            );
+            cells.push(kzg_cell(cell)?);
         }
         commitments.extend_from_slice(column.commitments);
         proofs.extend_from_slice(column.proofs);
