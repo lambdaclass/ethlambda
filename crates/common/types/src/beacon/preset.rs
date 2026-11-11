@@ -572,6 +572,20 @@ pub mod mainnet {
     /// `InclusionListCommittee` (`Vector<ValidatorIndex, INCLUSION_LIST_COMMITTEE_SIZE>`)
     /// and `InclusionListBits` (`Bitvector[INCLUSION_LIST_COMMITTEE_SIZE]`).
     pub const INCLUSION_LIST_COMMITTEE_SIZE: usize = 16;
+
+    // ================================================================
+    // EIP-8483
+    // ================================================================
+
+    // --- Execution ---
+
+    /// Bounds `ExecutionRequests.validator_pq_registrations`, checked in
+    /// `apply_parent_execution_payload` and on gossip (the list itself is
+    /// progressive, so nothing in its type bounds it).
+    pub const MAX_VALIDATOR_PQ_REGISTRATION_REQUESTS_PER_PAYLOAD: u64 = 1024;
+
+    /// Bounds `ExecutionRequests.builder_pq_registrations`, the same way.
+    pub const MAX_BUILDER_PQ_REGISTRATION_REQUESTS_PER_PAYLOAD: u64 = 16;
 }
 
 /// The minimal preset: the same shape as [`mainnet`], scaled down so spec test
@@ -1090,6 +1104,18 @@ pub mod minimal {
     /// Members of a slot's inclusion list committee. Not customized: equal to
     /// mainnet's.
     pub const INCLUSION_LIST_COMMITTEE_SIZE: usize = 16;
+
+    // ================================================================
+    // EIP-8483
+    // ================================================================
+
+    // --- Execution ---
+
+    /// Not customized: equal to mainnet's.
+    pub const MAX_VALIDATOR_PQ_REGISTRATION_REQUESTS_PER_PAYLOAD: u64 = 1024;
+
+    /// Not customized: equal to mainnet's.
+    pub const MAX_BUILDER_PQ_REGISTRATION_REQUESTS_PER_PAYLOAD: u64 = 16;
 }
 
 #[cfg(not(feature = "preset-minimal"))]
@@ -1671,6 +1697,10 @@ mod tests {
 
         in_both!(usize: PTC_SIZE, PTC_WINDOW_LENGTH, BUILDER_PENDING_PAYMENTS_LENGTH);
         in_both!(usize: INCLUSION_LIST_COMMITTEE_SIZE);
+        in_both!(u64:
+            MAX_VALIDATOR_PQ_REGISTRATION_REQUESTS_PER_PAYLOAD,
+            MAX_BUILDER_PQ_REGISTRATION_REQUESTS_PER_PAYLOAD,
+        );
         in_both!(u64:
             MAX_PAYLOAD_ATTESTATIONS, MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD,
             MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD, MAX_BUILDERS_PER_WITHDRAWALS_SWEEP,

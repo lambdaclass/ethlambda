@@ -187,6 +187,25 @@ impl ForkName {
         }
     }
 
+    /// Whether this fork's `ExecutionRequests` carries EIP-8483's two
+    /// post-quantum registration request lists, and its state the two
+    /// registries they write. An explicit match for the reason
+    /// [`Self::has_payload_envelopes`] gives.
+    pub const fn has_pq_registrations(self) -> bool {
+        match self {
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb
+            | ForkName::Electra
+            | ForkName::Fulu
+            | ForkName::Gloas
+            | ForkName::Heze
+            | ForkName::Lean => false,
+        }
+    }
+
     /// The one-byte tag this fork is stored under in a `States` value.
     ///
     /// Spelled out rather than `self as u8`. The variant order is already

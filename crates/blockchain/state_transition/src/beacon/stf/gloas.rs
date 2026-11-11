@@ -1889,6 +1889,7 @@ mod tests {
             builder_exits: gloas::BuilderExitRequests::from(vec![
                 gloas::BuilderExitRequest::default(),
             ]),
+            pq_registrations: None,
         };
 
         let list = get_execution_requests_list(&requests);

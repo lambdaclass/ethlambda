@@ -291,6 +291,7 @@ fn gloas_requests() -> gloas::ExecutionRequests {
             pubkey: pubkey(10),
         }]
         .into(),
+        pq_registrations: None,
     }
 }
 
