@@ -231,7 +231,7 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `GET` | `/eth/v1/beacon/execution_payload_envelopes/{block_id}` | JSON or SSZ | Gloas `SignedExecutionPayloadEnvelope` of that block (see below) |
 | `GET` | `/eth/v1/beacon/headers/{block_id}` | JSON | `SignedBeaconBlockHeader`, plus `canonical` |
 | `GET` | `/eth/v2/debug/beacon/states/{state_id}` | JSON or SSZ | `BeaconState` at `state_id` |
-| `GET` | `/eth/v1/beacon/states/{state_id}/finality_checkpoints` | JSON | That state's three checkpoints |
+| `GET` | `/eth/v1/beacon/states/{state_id}/finality_checkpoints` | JSON | That state's three checkpoints; an EIP-8453 state's finality gadget checkpoints, in heights (see [EIP-8453](#eip-8453-decoupled-consensus)) |
 | `GET` | `/eth/v1/beacon/states/{state_id}/fork` | JSON | That state's `Fork`: previous and current version, and the epoch it changed |
 | `GET` | `/eth/v1/beacon/genesis` | JSON | Genesis time, validators root, fork version |
 | `GET` | `/eth/v1/config/spec` | JSON | The store's `Config`, plus `PRESET_BASE`, `CONFIG_NAME`, the preset and the constants (see below) |
@@ -245,13 +245,18 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `GET` | `/eth/v1/beacon/states/{state_id}/validators/{validator_id}` | JSON | One registry entry, by index or pubkey; `404` if there is none |
 | `GET` | `/eth/v1/validator/duties/proposer/{epoch}` | JSON | Proposers for any epoch from the head's up to one past the wall clock's |
 | `GET` | `/eth/v2/validator/duties/proposer/{epoch}` | JSON | The same, with v2's `dependent_root` (what Lighthouse asks for) |
-| `POST` | `/eth/v1/validator/duties/attester/{epoch}` | JSON | Committee assignments for the given indices |
+| `POST` | `/eth/v1/validator/duties/attester/{epoch}` | JSON | Committee assignments for the given indices; `400` at an EIP-8453 epoch |
+| `POST` | `/eth/v1/validator/duties/attestation_committee/{epoch}` | JSON | EIP-8453: each given validator's attestation committee and the slots it attests in (ethlambda's own) |
+| `POST` | `/eth/v1/validator/duties/head_vote/{epoch}` | JSON | EIP-8453: the slots each given validator casts head votes in (ethlambda's own) |
 | `POST` | `/eth/v1/validator/duties/sync/{epoch}` | JSON | Sync committee seats for the given indices, up to the wall clock's current period plus one |
 | `POST` | `/eth/v1/validator/liveness/{epoch}` | JSON | Whether this node saw each validator act in the epoch (doppelganger protection) |
 | `POST` | `/eth/v1/validator/duties/ptc/{epoch}` | JSON | Payload timeliness committee seats for the given indices (gloas) |
-| `GET` | `/eth/v1/validator/attestation_data` | JSON | What to attest to at `slot` |
+| `GET` | `/eth/v1/validator/attestation_data` | JSON | What to attest to at `slot`; `400` at an EIP-8453 slot |
+| `GET` | `/eth/v1/validator/head_vote_data` | JSON | EIP-8453: the `HeadVoteData` a committee member of `slot` signs (ethlambda's own) |
+| `GET` | `/eth/v1/validator/finality_attestation_input` | JSON | EIP-8453: what an attester of `slot` selects its FG `AttestationData` from, or `204` (ethlambda's own) |
 | `GET` | `/eth/v1/validator/payload_attestation_data` | JSON or SSZ | What a committee member signs for `slot` (gloas) |
-| `POST` | `/eth/v2/beacon/pool/attestations` | *(status only)* | Validate and gossip `SingleAttestation`s (JSON or SSZ body) |
+| `POST` | `/eth/v2/beacon/pool/attestations` | *(status only)* | Validate and gossip `SingleAttestation`s (JSON or SSZ body); EIP-8453's under `Eth-Consensus-Version: eip8453` |
+| `POST` | `/eth/v1/beacon/pool/head_votes` | *(status only)* | EIP-8453: validate, apply and gossip `HeadVoteMessage`s (JSON or SSZ body; ethlambda's own) |
 | `GET`, `POST` | `/eth/v1/beacon/pool/proposer_slashings` | JSON | The operation pool's `ProposerSlashing`s; validate, pool and gossip one |
 | `GET`, `POST` | `/eth/v2/beacon/pool/attester_slashings` | JSON | The pool's `AttesterSlashing`s (GET carries `Eth-Consensus-Version`, the fork of the wall clock's current epoch); validate, pool and gossip one |
 | `GET`, `POST` | `/eth/v1/beacon/pool/voluntary_exits` | JSON | The pool's `SignedVoluntaryExit`s; validate, pool and gossip one |
@@ -266,9 +271,9 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `POST` | `/eth/v1/validator/contribution_and_proofs` | *(status only)* | Validate, pool and gossip `SignedContributionAndProof`s |
 | `POST` | `/eth/v1/validator/sync_committee_subscriptions` | *(status only)* | Join sync committee subnets until an epoch |
 | `GET` | `/eth/v3/validator/blocks/{slot}` | SSZ or JSON | An unsigned fulu block built on the head (`produceBlockV3`) |
-| `POST` | `/eth/v4/validator/blocks/{slot}` | SSZ or JSON | An unsigned gloas block: self-built, with its envelope and blobs when asked, or on a pooled builder bid (`produceBlockV4`) |
+| `POST` | `/eth/v4/validator/blocks/{slot}` | SSZ or JSON | An unsigned gloas block: self-built, with its envelope and blobs when asked, or on a pooled builder bid (`produceBlockV4`); at an EIP-8453 slot an EIP-8453 block on the fork choice's proposal |
 | `GET` | `/eth/v1/validator/execution_payload_envelopes/{slot}/{beacon_block_root}` | SSZ or JSON | The unsigned envelope `produceBlockV4` built (gloas) |
-| `POST` | `/eth/v2/beacon/blocks` | *(status only)* | Gossip and import a signed fulu or gloas block (`publishBlockV2`; JSON or SSZ body) |
+| `POST` | `/eth/v2/beacon/blocks` | *(status only)* | Gossip and import a signed fulu, gloas, heze or EIP-8453 block (`publishBlockV2`; JSON or SSZ body) |
 | `POST` | `/eth/v1/beacon/execution_payload_envelopes` | *(status only)* | Gossip a signed envelope and its data columns (gloas; JSON or SSZ body) |
 | `POST` | `/eth/v1/beacon/execution_payload_bids` | *(status only)* | Validate, pool and gossip a builder's `SignedExecutionPayloadBid` (gloas; JSON or SSZ body) |
 | `POST` | `/eth/v1/validator/proposer_preferences` | *(status only)* | Validate, cache and gossip `SignedProposerPreferences` (gloas; JSON or SSZ body) |
@@ -716,6 +721,121 @@ A `cl_type: ethlambda` participant in our ethereum-package fork
 branch `add-ethlambda`) runs an ethlambda validator client that, by default,
 talks to this node alone, so every block its validators propose is one this
 node built.
+
+### EIP-8453 (decoupled consensus)
+
+No beacon-APIs specification exists for EIP-8453, so the duty endpoints below
+are **ethlambda's own**, kept close to the standard ones' shapes: JSON with
+quoted integers, the duties envelope (`dependent_root`, `execution_optimistic`,
+`data`), `{version, data}` plus `Eth-Consensus-Version: eip8453` on
+fork-versioned bodies, and the pool endpoints' `IndexedErrorMessage` for
+refused submissions. Prysm's `decoupled-consensus-passing-spec-tests` branch
+was checked: it serves its duties only as deprecated gRPC-gateway paths under
+`/eth/v1alpha1/validator/` (`available_attestation_data/{slot}`,
+`finality_attestation_data/{slot}`, ...), for an earlier design whose head vote
+has no payload status and whose finality input names the target `entry`, so a
+client of EIP-8453 as specified cannot use them; nothing here follows them.
+
+The data endpoints read the shared fork choice node (`SharedEip8453Node`),
+which records each duty input at the protocol instant it belongs to as its
+clock passes it.
+
+- **`POST /eth/v1/validator/duties/attestation_committee/{epoch}`** takes a
+  JSON array of quoted validator indices and answers
+  `{dependent_root, execution_optimistic, data: [{pubkey, validator_index,
+  committee_index, committee_length, validator_committee_index, slots}]}`: each
+  active validator's one attestation committee for the epoch
+  (`get_attestation_committee_assignment`, computed in one pass over the
+  active set) and `slots`, quoted, the slot of each round of the epoch its
+  committee attests in (`compute_attestation_committee_slot`). The epoch bounds
+  and state are the attester duties' (one before the head's up to one past the
+  wall clock's; the head advanced to the epoch before when further); an epoch
+  before `EIP8453_FORK_EPOCH` is a `400`.
+- **`POST /eth/v1/validator/duties/head_vote/{epoch}`** takes the same body and
+  answers `{dependent_root, execution_optimistic, data: [{pubkey,
+  validator_index, slots}]}`: the slots of the epoch whose head vote committee
+  seats the validator (`get_head_vote_committee_assignments`), each once
+  however many seats it holds; a validator with none is left out. Read off an
+  EIP-8453 state's cached committee window, so the epoch is at most one past
+  the current one; a heze head (before the fork) or a lagging one is advanced
+  to `max(epoch - 1, EIP8453_FORK_EPOCH)`. A pre-fork epoch is a `400`.
+- **`dependent_root`** (the specification leaves lookahead a TODO): the block at
+  `compute_start_slot_at_epoch(epoch - 1) - 1`, the attester duties' definition,
+  for both, except the head vote committees of the fork epoch itself, which
+  `upgrade_to_eip8453` draws at the fork's first slot from the chain through the
+  last pre-fork block: the block at `compute_start_slot_at_epoch(epoch) - 1`.
+  Head vote committees are drawn at the transition into `epoch - 1` (seed and
+  effective balances through the last block of `epoch - 2`); attestation
+  committees depend only on the active set, which the registry fixes
+  `MAX_SEED_LOOKAHEAD` epochs ahead, so the root is conservative for them.
+- **`GET /eth/v1/validator/head_vote_data?slot=`** answers `{version:
+  "eip8453", data: {slot, beacon_block_root, payload_status}}`, the
+  `HeadVoteData` of validator.md's "Head vote data": `get_ac_vote_head` as of
+  the slot's head vote deadline (`HEAD_VOTE_DUE_BPS`), `payload_status` `2`
+  (pending) when it names the slot's own block, else `0`/`1` (empty/full).
+- **`GET /eth/v1/validator/finality_attestation_input?slot=`** answers
+  `{version: "eip8453", data: {target: {height, root}, justified: {height,
+  root}, finalized_height}}`: the source state's target and the head state's
+  justified checkpoint and finalized height from one `get_ac_frame`
+  observation at or after the slot's support cutoff (`SUPPORT_CUTOFF_BPS`),
+  or **`204`** when there is no FG source (or the source predates the gadget):
+  the validator must not attest. The signing record that turns these into
+  `AttestationData` is the validator client's, so the node serves inputs.
+- Both data endpoints: a slot before the fork, or other than the node's
+  current one, is a `400`; before the slot's instant, after it passed unrecorded
+  (a node that started its fork choice mid-slot), or with the fork choice not
+  running yet, `503`. A voted block whose payload is unvalidated is a `503`, as
+  for `attestation_data`. JSON only.
+- **`POST /eth/v1/beacon/pool/head_votes`** takes an array of signed
+  `HeadVoteMessage`s (`{validator_index, data, signature}`), JSON or SSZ. Each
+  runs through the `head_vote` gossip rules and into the fork choice
+  (`gossip::head_vote::submit`), then is gossiped on `head_vote`. One already
+  accepted counts as accepted and is not gossiped again. `200`, or `400` with
+  `{code, message, failures: [{index, message}]}`, a failure reading
+  `{outcome}: {reason}`; the rest still apply.
+- **`POST /eth/v2/beacon/pool/attestations`** with `Eth-Consensus-Version:
+  eip8453` takes EIP-8453 `SingleAttestation`s (`{committee_index,
+  attester_index, data: {target, timeout, finality}, signature, epoch}`). Each
+  runs through the `attestation_{subnet_id}` rules on its committee's subnet
+  and into the node's pool for proposals (`gossip::fg_attestation::submit`),
+  then is gossiped on that subnet; failures as above. Another fork's header at
+  an EIP-8453 slot is refused per item.
+- **`produceBlockV4`** at an EIP-8453 slot builds on the fork choice's proposal
+  as of the slot's start (`Eip8453Node::proposal`: the parent, its payload
+  branch, and the previous slot's head votes aggregated with their support
+  bits) rather than on the LMD-GHOST head, packs the FG attestations pooled in
+  the node (`pack_attestations`), and assembles with `assemble_eip8453_block`:
+  heze's self-built bid (inclusion list bits included), envelope and blobs
+  around an EIP-8453 body. With `include_payload=true` the body is
+  `Eip8453BlockContents` (`block`, `execution_payload_envelope`, `kzg_proofs`,
+  `blobs`, the gloas contents over EIP-8453's block), with
+  `Eth-Consensus-Version: eip8453`. Builder bids are not considered at an
+  EIP-8453 slot. Asked for another slot than the current one, `400`; with the
+  fork choice not running, `503`. `publishBlockV2` takes the signed block under
+  `eip8453` (its bid in heze's shape), and the envelope endpoints take its
+  envelope as they take gloas's.
+- **`finality_checkpoints`** of an EIP-8453 state answers `{version: "eip8453",
+  execution_optimistic, finalized, data: {target, target_slot,
+  current_justified, finalized, finalized_slot}}`, each checkpoint a
+  `{height, root}`: the finality gadget's target, justified and finalized
+  checkpoints, in heights rather than epochs, with the slots of the target and
+  the finalized block. There is no previous justified checkpoint.
+- **`/eth/v1/config/spec`** reports EIP-8453's configuration (`EIP8453_FORK_*`,
+  `HEAD_VOTE_DUE_BPS`, `SUPPORT_CUTOFF_BPS`, `VIEW_FREEZE_BPS`), its preset
+  (`PENDING_FINALITY_WINDOW`, `SLOTS_PER_ROUND`,
+  `ATTESTATION_COMMITTEES_PER_ROUND`, `MAX_VALIDATORS_PER_AGGREGATE`,
+  `HEAD_VOTE_COMMITTEE_SIZE`, `ROUND_REWARD_FACTOR`,
+  `MIN_ROUNDS_TO_INACTIVITY_LEAK`, `EJECTION_INACTIVITY_SCORE`,
+  `MAX_HEAD_VOTES`) and constants (`DOMAIN_HEAD_VOTE`,
+  `DOMAIN_HEAD_VOTE_COMMITTEE`, `DOMAIN_FINALITY_ATTESTER`, the two flag
+  indices and weights, `TIMEOUT_DELAY_SLOTS`).
+- **Unchanged duties.** Proposer duties read EIP-8453's `proposer_lookahead`;
+  the PTC, sync committee and inclusion list endpoints serve EIP-8453 epochs as
+  they serve heze's (the inclusion list committee is EIP-8453's own draw, and a
+  heze head answering for an EIP-8453 epoch is advanced across the fork). The
+  legacy attester duties and `attestation_data` refuse an EIP-8453 epoch or
+  slot with a `400` naming the endpoints above; there is no aggregation endpoint
+  for EIP-8453 (the specification's aggregate topics are TODOs).
 
 ### Encoding
 

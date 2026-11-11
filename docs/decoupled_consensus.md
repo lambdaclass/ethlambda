@@ -289,4 +289,12 @@ crates/blockchain/src/beacon_eip8453_network_tests.rs  in-process networks
   block's.
 - **Gossip.** `head_vote` and `attestation_{subnet_id}` are validated off the
   actor and applied to the shared node; validator clients' own messages go
-  through the same rules (`submit`) and are then published.
+  through the same rules (`submit`) and are then published. Under an EIP-8453
+  digest a node joins every `attestation_{subnet_id}` subnet, standing in for
+  the unspecified aggregate topics.
+- **Validator duties.** The Beacon API serves the duty inputs off the shared
+  node (`rpc/src/beacon/eip8453.rs`), and `ethlambda validator` votes at the
+  head vote deadline and attests at the support cutoff through a
+  `FinalitySigningRecord` per key it persists before signing
+  (`validator/src/finality_record.rs`). See
+  [rpc.md](./rpc.md#eip-8453-decoupled-consensus).

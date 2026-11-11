@@ -735,6 +735,11 @@ and absent is not the same as zero.
 | `ethlambda_validator_envelope_failures_total` | Counter | Proposed gloas blocks whose self-built envelope was not published. The block is out and the proposal counts as made, but the slot's payload is withheld, so this is the failure that costs the payload. Should read zero |
 | `ethlambda_validator_payload_attestations_published_total` | Counter | Payload timeliness committee votes a beacon node accepted (gloas) |
 | `ethlambda_validator_payload_attestation_failures_total` | Counter | Slots whose payload timeliness committee duty did not result in published votes |
+| `ethlambda_validator_head_votes_published_total` | Counter | EIP-8453 head votes a beacon node accepted |
+| `ethlambda_validator_head_vote_failures_total` | Counter | Slots whose EIP-8453 head vote duty did not result in published votes |
+| `ethlambda_validator_fg_attestations_published_total` | Counter | EIP-8453 finality gadget attestations a beacon node accepted |
+| `ethlambda_validator_fg_attestation_failures_total` | Counter | Slots whose EIP-8453 FG attestation duty did not result in published attestations |
+| `ethlambda_validator_fg_attestations_suppressed_total` | Counter | EIP-8453 FG attestation duties the key's finality signing record suppressed (no new vote at the height) |
 | `ethlambda_validator_sync_committee_messages_published_total` | Counter | Sync committee messages a beacon node accepted |
 | `ethlambda_validator_sync_committee_failures_total` | Counter | Slots whose sync committee message duty ended in an error or ran past its slot. A head the node reports optimistic is not a failure: nothing is signed |
 | `ethlambda_validator_sync_contributions_published_total` | Counter | Sync committee contributions this client published as an aggregator. Bursty, like `aggregates_published_total` |

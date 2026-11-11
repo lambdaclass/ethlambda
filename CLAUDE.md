@@ -376,7 +376,9 @@ actual_slot = finalized_slot + 1 + relative_index
     block production packs the operation pool through `pack_operations`
   - EIP-8453 digests (`BeaconTopics::for_fork`, `EIP8453_TOPIC_KINDS`) drop the deprecated
     `beacon_aggregate_and_proof` and `beacon_attestation_{subnet_id}` and hold `head_vote`
-    and the backbone as `attestation_{subnet_id}` (both unscored). Their rules
+    and **every** `attestation_{subnet_id}` subnet (both unscored), standing in for the
+    spec's TODO aggregate topics so a proposer hears every FG attestation; `attnets` still
+    advertises the backbone, and aggregator subnets are not carried onto these digests. Their rules
     (`gossip::head_vote`, `gossip::fg_attestation`) run like the other topics' (cheap
     inline, stateful on the attestation permit pool, head state advanced to the message's
     epoch when older) and an accepted message is applied to the shared `SharedEip8453Node`
@@ -950,11 +952,25 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   the first proposal does not rewind to the anchor. A genesis at the fork
   leaves the first target root for `process_slot`, and a heze `genesis.ssz`
   is upgraded at load. `SharedEip8453Node` (`beacon/eip8453_node.rs`) is shared
-  by the actor, p2p and the Beacon API (an `Extension`, no endpoint yet): the
-  engine, the gossip seen sets, the signed votes and attestations behind it,
-  the duty inputs (`vote_head`, `finality_attestation_input`, `proposal`), and
-  `eip8453_block_production` assembles a block from them. The validator client
-  and the Beacon API's EIP-8453 endpoints are the next phase (`TODO(eip8453)`).
+  by the actor, p2p and the Beacon API (an `Extension`): the engine, the gossip
+  seen sets, the signed votes and attestations behind it, the duty inputs
+  (`vote_head`, `finality_attestation_input`, `proposal`). The Beacon API's
+  EIP-8453 endpoints are ethlambda's own (no beacon-APIs spec exists;
+  `crates/net/rpc/src/beacon/eip8453.rs`): attestation committee and head vote
+  duties, head vote data, the finality attestation input (`204`: do not
+  attest), head vote submission, FG `SingleAttestation`s on the v2 attestation
+  pool under `Eth-Consensus-Version: eip8453`, `produceBlockV4` on the fork
+  choice's proposal (`gloas_block_production::assemble_eip8453_block`; no
+  builder bids) and `finality_checkpoints` in heights. They read time through
+  `NodeClock`, which tests fix. The validator client
+  (`crates/validator/src/eip8453.rs`) votes at `HEAD_VOTE_DUE_BPS` (in-memory
+  one-head-per-slot record) and attests at `SUPPORT_CUTOFF_BPS` through each
+  key's `FinalitySigningRecord` (`ethlambda-decoupled`'s), persisted in
+  `<validators-dir>/finality_signing/` before signing (`finality_record.rs`);
+  the legacy attestation and aggregation stop at EIP-8453 slots, and there is
+  no EIP-8453 aggregation (spec TODO). `eip8453/e2e_tests.rs` in the rpc crate
+  drives the validator client over HTTP against an unspawned actor to
+  finalization.
   `beacon_eip8453_network_tests.rs` runs three unspawned actors on a simulated
   clock across the fork (and from an EIP-8453 genesis) to finalization. See
   [`docs/decoupled_consensus.md`](docs/decoupled_consensus.md#beacon),

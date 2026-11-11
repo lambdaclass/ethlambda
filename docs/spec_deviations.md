@@ -78,6 +78,11 @@ same keys, already signed.
 - **Why a proposer slashing is the worse of the two:** a double vote needs a
   second validator's attestation to be caught. Two signed block headers for one
   slot are the whole of the evidence on their own.
+- **EIP-8453 messages:** the one record this client does keep on disk is
+  EIP-8453's `FinalitySigningRecord`, one per key, written before every FG
+  attestation is signed (see the EIP-8453 entry below): validator.md makes it
+  protocol state that must survive restarts. Head votes have an in-memory
+  per-slot record only: a second head for a slot is not slashable.
 - **What is therefore not covered:** restarting into a state where the chain has
   moved, and running these keys in two places at once. Both can produce a
   slashable double vote or a double proposal, and nothing in this client will
@@ -751,22 +756,117 @@ only (see [beacon_stf.md](./beacon_stf.md#eip-8453)). The entries below are
 the places where the specification is silent, marked unfinished, or where this
 node computes the same value another way.
 
-### The node follows the fork; validator duties and the Beacon API do not yet
+### The Beacon API's EIP-8453 endpoints are ethlambda's own
 
-- **The specification:** an EIP-8453 chain runs its own fork choice (the
-  finality gadget's store and the available chain), gossip and validator
-  duties.
-- **ethlambda:** the beacon node follows it: the chain actor runs the
-  `ethlambda-decoupled` engine at EIP-8453 time (`beacon_eip8453.rs`), the p2p
-  layer serves the fork's topics and protocols, and
-  `ForkName::Eip8453.is_followed()` answers `true`. The validator client and
-  the Beacon API's EIP-8453 endpoints (attestation data, submissions, block
-  production, the finality checkpoints) are the next phase; each such site is
-  still marked `TODO(eip8453)`. The node-side handle they build on is
-  `SharedEip8453Node` (duty inputs, proposal assembly inputs) with
-  `gossip::head_vote::submit` / `gossip::fg_attestation::submit` and
-  `RpcToP2P::publish_head_vote` / `publish_fg_attestation`.
-- **Why:** the port is phased.
+- **The specification:** no beacon-APIs specification exists for EIP-8453.
+- **ethlambda:** the node follows the fork (the chain actor runs the
+  `ethlambda-decoupled` engine, p2p serves the fork's topics and protocols), and
+  the validator client performs every EIP-8453 duty through endpoints this node
+  defines: `POST /eth/v1/validator/duties/attestation_committee/{epoch}`,
+  `POST /eth/v1/validator/duties/head_vote/{epoch}`,
+  `GET /eth/v1/validator/head_vote_data`,
+  `GET /eth/v1/validator/finality_attestation_input`,
+  `POST /eth/v1/beacon/pool/head_votes`, plus EIP-8453 forms of
+  `POST /eth/v2/beacon/pool/attestations` (`Eth-Consensus-Version: eip8453`),
+  `produceBlockV4`, `publishBlockV2` and `finality_checkpoints` (heights, not
+  epochs). Shapes and status codes are in
+  [rpc.md](./rpc.md#eip-8453-decoupled-consensus). Prysm's
+  `decoupled-consensus-passing-spec-tests` branch was checked first: its
+  duties are deprecated gRPC-gateway paths under `/eth/v1alpha1/validator/` for
+  an earlier design (no payload status on its head vote data, the target named
+  `entry`), which a client of EIP-8453 as specified cannot use, so these follow
+  the standard endpoints' shapes instead. The legacy attester duties and
+  `attestation_data` answer `400` at an EIP-8453 epoch.
+- **Why:** a validator client needs some API, and one shaped like the standard
+  endpoints keeps the client's transport code uniform.
+
+### Duty deadlines: the head vote deadline and the support cutoff
+
+- **The specification:** validator.md leaves "the EIP-8453 head-vote deadline
+  and voting helper" and "the FG attestation deadline and source observation"
+  as TODOs; fork-choice.md fixes `HEAD_VOTE_DUE_BPS` (25%) and
+  `SUPPORT_CUTOFF_BPS` (50%) as the instants `get_ac_vote_head` and
+  `get_ac_frame` are computed at.
+- **ethlambda:** a head vote committee member votes at `HEAD_VOTE_DUE_BPS` of
+  its slot, and the node answers the head vote data recorded at that instant.
+  An FG attester attests at `SUPPORT_CUTOFF_BPS` of its committee's slot, the
+  first instant `get_ac_frame` answers (right after the confirmation update the
+  source depends on), and the node answers the input of that observation; the
+  attestation stays acceptable to gossip until the committee's slot of the next
+  round. Both are bounded by the end of the slot. A proposal at an EIP-8453
+  slot is bounded by the head vote deadline rather than the attester offset,
+  the instant the slot's voters stop waiting for its block. The offsets come
+  from `/eth/v1/config/spec`.
+- **Why:** these are the protocol instants the duty inputs belong to; the node
+  computes each input there and a validator asking later reads the value of
+  that instant rather than of a store that has moved on.
+
+### Duty dependent roots
+
+- **The specification:** validator.md: "Specify assignment lookahead and the
+  dependent root" (TODO).
+- **ethlambda:** both duty endpoints answer the attester duties' dependent root,
+  the block at `compute_start_slot_at_epoch(epoch - 1) - 1`, except the head
+  vote duties of `EIP8453_FORK_EPOCH` itself, which answer the block at
+  `compute_start_slot_at_epoch(epoch) - 1`. The validator client refetches an
+  epoch's schedule when the root changes, as it does for every duty.
+- **Why:** head vote committees are drawn into the state's window at the
+  epoch transition into `epoch - 1` (seed and effective balances of the chain
+  through the last slot of `epoch - 2`), except the fork epoch's, which
+  `upgrade_to_eip8453` draws at the fork's first slot from the chain through
+  the last pre-fork block. Attestation committees depend only on the epoch's
+  active set, which activations and exits fix `MAX_SEED_LOOKAHEAD` epochs
+  ahead, so the attester root is conservative for them.
+
+### The finality signing record is persisted; the head vote record is not
+
+- **The specification:** "the record persists across restarts"; "the record and
+  selected data must be persisted before signing"; "selecting and recording the
+  data must be serialized per validator key". For head votes, "the validator
+  must record the selected root before signing and must not sign another head
+  for the same slot".
+- **ethlambda:** the validator client keeps each key's
+  `FinalitySigningRecord` (`ethlambda-decoupled`'s, with its selection rules) in
+  `<validators-dir>/finality_signing/0x<pubkey>.json`, JSON, mode `0600` in a
+  `0700` directory, written to a temporary file, flushed, renamed and the
+  directory flushed before the attestation is signed; a failed write signs
+  nothing, an unreadable file refuses the key rather than starting it empty,
+  and one lock over every key serializes selection and recording. The record
+  is never pruned. Head votes are recorded per key and slot in memory before
+  signing: a different head for a recorded slot is refused, the identical data
+  is signed again (a retry is the same message).
+- **Why:** the finality record decides whether the next vote at a height is a
+  target vote or a timeout, so it is protocol state, kept even though this
+  client otherwise keeps no slashing-protection database. A head vote is not
+  slashable; a second head for a slot only makes the validator an equivocator
+  the fork choice discounts, and a restart mid-slot is the only way to reach
+  one.
+
+### No aggregation duty
+
+- **The specification:** aggregator selection, the `head_vote_aggregate` and
+  `attestation_aggregate` messages and their deadlines are TODOs; the
+  aggregation helpers (`get_aggregate_head_vote`, `get_aggregate_attestation`)
+  are specified.
+- **ethlambda:** the validator client performs no aggregation at EIP-8453
+  slots, and the legacy aggregation stops there. A proposer's node aggregates
+  what it holds when it builds the block (`aggregate_head_votes`,
+  `pack_attestations`), and every node joins every attestation subnet (below)
+  so it holds every FG attestation.
+- **Why:** there is no selection rule or topic to aggregate for.
+
+### Block production at EIP-8453 slots: no builder bids
+
+- **The specification:** "Specify the EIP-8453 proposal helper, including full
+  or empty execution payload selection and inclusion-list checks" (TODO).
+- **ethlambda:** `produceBlockV4` builds on `get_ac_proposal`'s head and payload
+  branch as of the slot's start, carries that view's head votes (at most
+  `MAX_HEAD_VOTES`, the most supported first) and the node's pooled FG
+  attestations that `process_attestation` accepts, and self-builds the payload
+  with heze's bid, inclusion list bits and envelope. Builder bids pooled from
+  p2p are not considered at an EIP-8453 slot.
+- **Why:** the bid-won path assembles a gloas-shaped block; an EIP-8453 one is
+  a later step.
 
 ### The fork-choice handover at `EIP8453_FORK_EPOCH`
 
@@ -901,7 +1001,7 @@ node computes the same value another way.
 - **ethlambda:** a block without a post-state is `IGNORE` (no bad-block
   cache, as for every other topic); an EIP-8453 attester slashing decodes and
   is `IGNORE`d, as every operation is under a gloas or later head; the two
-  aggregate topics are not subscribed; `head_vote` and the
+  aggregate topics are not subscribed (every attestation subnet is, below); `head_vote` and the
   `attestation_{subnet_id}` subnets are unscored. A head vote's committee and
   domain, and an attestation's, are read from the head state advanced to the
   message's epoch when it is older (`get_pulled_up_state`, which

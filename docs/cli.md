@@ -367,6 +367,39 @@ for wall slot `S` are those of the period containing `S + 1`, since members
 assigned to slot `S` sign for `S - 1`. Both halves are bounded by the end of the
 slot.
 
+At EIP-8453 ("Decoupled Consensus") slots the attestation and its aggregation
+stop, and two votes take their place, through endpoints an ethlambda beacon node
+defines (no beacon-APIs specification exists; see
+[rpc.md](rpc.md#eip-8453-decoupled-consensus)). Each epoch the client fetches,
+for this epoch and the next when they are EIP-8453 ones, its validators'
+attestation committees (one an epoch, attesting once a round, in the slots the
+answer lists) and their head vote committee slots, instead of attester duties.
+In a slot:
+
+- **Head vote**, at `HEAD_VOTE_DUE_BPS`: each validator seated in the slot's
+  head vote committee (once, however many seats) gets the slot's
+  `HeadVoteData` from the node, records the slot and data, signs it under
+  `DOMAIN_HEAD_VOTE` and submits it. It never signs a different head for a
+  slot it already voted in (the record is in memory: a head vote is not
+  slashable).
+- **FG attestation**, at `SUPPORT_CUTOFF_BPS` of its committee's slot: the
+  node serves the inputs (target, justified, finalized height) or a `204` when
+  there is no FG source; the client selects the `AttestationData` through the
+  key's `FinalitySigningRecord`, writes the record to
+  `<validators-dir>/finality_signing/0x<pubkey>.json` (atomically, flushed,
+  mode `0600`) **before** signing, then signs under `DOMAIN_FINALITY_ATTESTER`
+  at the slot's epoch and submits it with its committee index and epoch. A
+  record that cannot be written or read signs nothing. These records are the
+  one thing this client keeps on disk across restarts: the specification makes
+  them protocol state (they decide whether the next vote at a height is a
+  target vote or a timeout).
+- **Proposal**: an EIP-8453 block and its envelope go through the gloas flow,
+  bounded by the head vote deadline. The payload timeliness committee, sync
+  committee and inclusion list duties continue as at heze.
+
+There is no EIP-8453 aggregation duty: the specification's aggregate topics
+and aggregator selection are TODOs.
+
 Not implemented: the builder flow and blinded blocks (the client asks for an
 unblinded block and refuses a blinded one), voluntary exits, doppelganger
 protection and remote signing.
@@ -382,7 +415,8 @@ work out at 3999 ms and 8000 ms. Gloas moves both earlier
 `PAYLOAD_ATTESTATION_DUE_BPS` (and `PAYLOAD_DUE_BPS`, which the node uses), so
 the clock picks the pair by the fork of each slot's own epoch. The sync
 committee offsets (`SYNC_MESSAGE_DUE_BPS`, `CONTRIBUTION_DUE_BPS` and their
-`_GLOAS` variants) are read and picked the same way.
+`_GLOAS` variants) are read and picked the same way, and so are EIP-8453's
+`HEAD_VOTE_DUE_BPS` and `SUPPORT_CUTOFF_BPS`.
 
 `SECONDS_PER_SLOT` no longer exists in the specification and is accepted only as
 a fallback, since deployed nodes still send it. A node sending both is required

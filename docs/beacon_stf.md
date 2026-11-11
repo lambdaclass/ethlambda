@@ -559,7 +559,11 @@ the fork (`ForkName::Eip8453.is_followed()` is `true`): its fork choice is the
 `ethlambda-decoupled` engine driven by the chain actor, and its gossip topics
 and req/resp protocols are served (see
 [decoupled_consensus.md](./decoupled_consensus.md#beacon)). The validator client
-and the Beacon API's EIP-8453 endpoints are the next phase.
+performs every EIP-8453 duty (head votes, FG attestations through a persisted
+`FinalitySigningRecord`, proposals) through the Beacon API's EIP-8453
+endpoints (see [rpc.md](./rpc.md#eip-8453-decoupled-consensus)), and an
+EIP-8453 block is assembled for `produceBlockV4` by
+`gloas_block_production::assemble_eip8453_block`.
 
 It replaces Casper FFG with a finality gadget whose chain state lives in the
 beacon state, and adds the available chain's head votes to the block:
