@@ -176,8 +176,8 @@ pub fn chain_checks(store: &Store, sidecar: &DataColumnSidecar, now_ms: u64) -> 
                 outcome => ChainVerdict::Drop(outcome),
             };
         }
-        // The parent's state is stored but could not be read back, so
-        // parking would wait on an import that has already happened. Dropped
+        // A failed read or a corrupt row is not a parent still to come, so
+        // parking would wait for an import that need never happen. Dropped
         // instead, as a panic in this read used to drop it.
         Err(err) => {
             let slot = header.slot;

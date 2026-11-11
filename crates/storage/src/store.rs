@@ -3267,6 +3267,11 @@ impl Store {
     /// that finds a rebuild of `root` already under way waits for it and
     /// returns its result rather than reading the state again. See
     /// [`StateRebuilds`].
+    ///
+    /// `Ok(None)` when no state is stored for `root`. `Err` when a read from
+    /// the backend fails or a stored row does not decode
+    /// ([`Error::CorruptState`]), wrapped in [`Error::StateRebuild`] since
+    /// every caller of that rebuild shares it.
     pub fn get_state(&self, root: &H256) -> Result<Option<Arc<BeaconState>>, Error> {
         read_state(
             self.backend.as_ref(),
