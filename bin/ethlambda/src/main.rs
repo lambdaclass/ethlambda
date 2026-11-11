@@ -8,6 +8,7 @@ mod era;
 mod fd_limit;
 mod keygen;
 mod network;
+mod slashing_protection;
 mod validator;
 mod version;
 
@@ -108,6 +109,11 @@ fn main() -> eyre::Result<()> {
         Command::Validator(options) => {
             init_node_logging()?;
             validator::run(options)
+        }
+        // Offline file work: no runtime, and stdout left alone.
+        Command::SlashingProtection(options) => {
+            init_info_stderr_logging()?;
+            slashing_protection::run(options)
         }
         // Key generation is synchronous, CPU-bound work whose product is files,
         // so it runs on this thread too and leaves stdout alone.
