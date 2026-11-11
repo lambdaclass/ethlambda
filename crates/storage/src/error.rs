@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use ethlambda_types::checkpoint::Checkpoint;
 use ethlambda_types::primitives::H256;
 
@@ -9,6 +11,18 @@ pub enum Error {
     UnexpectedMissingBlockHeader(H256),
     #[error("unexpected missing state for root {0}")]
     UnexpectedMissingState(H256),
+    /// A stored state did not decode, or a delta on the way to it did not
+    /// apply to its base. [`Store::from_db_state`](crate::store::Store::from_db_state)
+    /// has already refused a directory of another format version, so this is
+    /// corruption at rest rather than an old database.
+    #[error("the stored state for root {root} is corrupt: {reason}")]
+    CorruptState { root: H256, reason: String },
+    /// A state rebuild's error, handed to every concurrent read of the same
+    /// root that waited on that rebuild rather than reading the state itself
+    /// (`StateRebuilds` in `state_writer.rs`). Reference-counted because
+    /// `Error` is not `Clone`; it displays as the error it wraps.
+    #[error(transparent)]
+    StateRebuild(Arc<Error>),
     /// The data directory was written by a build with a different on-disk
     /// format. There is no migration: the `States` value layout changed, so
     /// every state already written would decode as the wrong shape.

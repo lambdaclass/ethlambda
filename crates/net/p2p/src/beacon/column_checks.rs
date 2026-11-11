@@ -60,9 +60,11 @@ pub(crate) fn check_and_forward(server: &P2PServer, sidecars: Vec<DataColumnSide
         let mut keep = Vec::new();
         let mut awaiting_parent = Vec::new();
         for check in checks {
-            // A panic inside the checks (a `Store` read's `.expect()` on a DB
-            // error, say) costs that one sidecar, which is what dropping it
-            // would have done anyway. Tokio has already caught it.
+            // A panic inside the checks (one of the `Store` reads that still
+            // `.expect()` on a DB error, say) costs that one sidecar, which is
+            // what dropping it would have done anyway. Tokio has already
+            // caught it. The parent-state read returns its error instead, and
+            // `chain_checks` drops the sidecar for it without unwinding.
             let (sidecar, verdict) = match check.await {
                 Ok(checked) => checked,
                 Err(err) => {

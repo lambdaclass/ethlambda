@@ -69,7 +69,9 @@ use crate::error::Error;
 use crate::metrics::{RebuildRole, StateCacheMethod};
 use crate::state_codec::{decode_lean_state_value, decode_state_value, encode_state_value};
 use crate::state_diff::StateDiff;
-use crate::store::{Chain, beacon_block_slot, block_slot, block_slot_in, encode_slot_root_key};
+use crate::store::{
+    Chain, beacon_block_slot, block_slot_in, encode_slot_root_key, try_block_slot_in,
+};
 
 /// What a state insert will write, decided but not yet committed.
 ///
@@ -136,37 +138,33 @@ impl PendingStates {
 ///
 /// Each root under way has a [`OnceLock`]. The first miss runs the rebuild
 /// inside `get_or_init`; every other miss on that root blocks in
-/// `get_or_init` until it is done and takes the same `Arc`. A rebuild that
-/// panics leaves its cell empty, and `OnceLock` lets one of the blocked
-/// callers run its own rebuild instead, so a panic never strands a waiter.
-/// The entry is removed once the rebuild settles, so the map holds rebuilds
-/// under way and never pins a state.
+/// `get_or_init` until it is done and takes the same result: the same `Arc`,
+/// or the same error. A rebuild that panics leaves its cell empty, and
+/// `OnceLock` lets one of the blocked callers run its own rebuild instead, so
+/// a panic never strands a waiter. The entry is removed once the rebuild
+/// settles, so the map holds rebuilds under way, never pins a state, and
+/// never keeps an error for a later miss: that one reads storage again.
 #[derive(Default)]
 pub(crate) struct StateRebuilds(Mutex<HashMap<H256, Arc<RebuildCell>>>);
 
-/// One rebuild's shared result. `Err(())` when the rebuild returned an error,
-/// which is not shared (`Error` is not `Clone`): a caller that finds it reads
-/// the state itself.
-type RebuildCell = OnceLock<Result<Option<Arc<BeaconState>>, ()>>;
+/// One rebuild's shared result. The error is behind an `Arc` because `Error`
+/// is not `Clone`; every caller gets it as [`Error::StateRebuild`].
+type RebuildCell = OnceLock<Result<Option<Arc<BeaconState>>, Arc<Error>>>;
 
 impl StateRebuilds {
     /// Runs `rebuild` for `root`, or waits for the rebuild of `root` already
     /// under way and returns its result.
-    ///
-    /// `Fn`, not `FnOnce`: a caller that finds a failed rebuild runs its own.
     fn share(
         &self,
         root: H256,
-        rebuild: impl Fn() -> Result<Option<Arc<BeaconState>>, Error>,
+        rebuild: impl FnOnce() -> Result<Option<Arc<BeaconState>>, Error>,
     ) -> Result<Option<Arc<BeaconState>>, Error> {
         let cell = self.0.lock().unwrap().entry(root).or_default().clone();
-        let mut own = None;
-        let shared = cell
+        let mut led = false;
+        let result = cell
             .get_or_init(|| {
-                let result = rebuild();
-                let shared = result.as_ref().map(Option::clone).map_err(|_| ());
-                own = Some(result);
-                shared
+                led = true;
+                rebuild().map_err(Arc::new)
             })
             .clone();
         // The first caller out removes the cell. A later miss can then
@@ -183,14 +181,10 @@ impl StateRebuilds {
                 cells.remove(&root);
             }
         }
-        match (own, shared) {
-            (Some(result), _) => result,
-            (None, Ok(state)) => {
-                crate::metrics::inc_state_rebuilds(RebuildRole::Joined);
-                Ok(state)
-            }
-            (None, Err(())) => rebuild(),
+        if !led {
+            crate::metrics::inc_state_rebuilds(RebuildRole::Joined);
         }
+        result.map_err(Error::StateRebuild)
     }
 }
 
@@ -280,6 +274,10 @@ pub(crate) fn read_state(
 /// Reads `root`'s state from the backend and caches it: [`read_state`]'s
 /// path past the cache and the write buffer, which [`StateRebuilds`] runs for
 /// one caller per root at a time.
+///
+/// `Err` when a read fails ([`Error::Storage`]) or what it read does not
+/// decode ([`Error::CorruptState`]), rather than a panic, so that a caller
+/// such as a gossip check can give up on one message instead of unwinding.
 fn rebuild_state(
     backend: &dyn StorageBackend,
     chain: Chain,
@@ -291,14 +289,15 @@ fn rebuild_state(
             // Anchor snapshot in `States`, otherwise reconstruct from the diff chain.
             // `States` is keyed by block slot then root, so a root with no
             // block row has no state to find.
-            let Some(slot) = block_slot(backend, chain, root) else {
-                return Ok(None);
-            };
             let snapshot = {
-                let view = backend.begin_read().expect("read view");
+                let view = backend.begin_read()?;
+                let Some(slot) = try_block_slot_in(view.as_ref(), chain, root)? else {
+                    return Ok(None);
+                };
                 let key = encode_slot_root_key(slot, root);
-                view.read_with(Table::States, &key, decode_lean_state_value)
-                    .expect("read")
+                view.read_with(Table::States, &key, decode_lean_state_value)?
+                    .transpose()
+                    .map_err(|reason| corrupt_state(root, reason))?
             };
             let state = match snapshot {
                 Some(state) => state,
@@ -316,9 +315,10 @@ fn rebuild_state(
             // decode per hop instead would be the whole cost that delta layer
             // exists to avoid. A snapshot root decodes straight from the
             // backend's buffer.
-            let Some(mut state) =
-                reconstruct_beacon_state_bytes(backend, root, |bytes| decode_state_value(&bytes))?
-            else {
+            let decode = |bytes: Cow<'_, [u8]>| {
+                decode_state_value(&bytes).map_err(|reason| corrupt_state(root, reason))
+            };
+            let Some(mut state) = reconstruct_beacon_state_bytes(backend, root, decode)? else {
                 return Ok(None);
             };
             rebase_onto_resident(cache, &mut state);
@@ -336,6 +336,14 @@ fn rebuild_state(
     let key = CacheKey::BlockState(*root);
     cache.lock().unwrap().put(key, state.clone());
     Ok(Some(state))
+}
+
+/// [`Error::CorruptState`] for the state of `root`, from a decoder's reason.
+fn corrupt_state(root: &H256, reason: String) -> Error {
+    Error::CorruptState {
+        root: *root,
+        reason,
+    }
 }
 
 /// Makes a state just decoded from storage share memory with a resident one.
@@ -403,36 +411,39 @@ fn rebase_onto_resident(cache: &StateCache, state: &mut BeaconState) {
 /// [`Store::prune_finalized_states`](crate::store::Store::prune_finalized_states)),
 /// matching how the lean walk in [`reconstruct_state`] handles both cases. A
 /// hop whose block row is absent ends the walk the same way.
+///
+/// `Err` when a read fails, when a delta does not apply to its base
+/// ([`Error::CorruptState`]), or when `consume` fails. A frame too short to
+/// hold its own header still panics in [`beacon_state_delta::unframe`]: no
+/// store writes one.
 pub(crate) fn reconstruct_beacon_state_bytes<T>(
     backend: &dyn StorageBackend,
     root: &H256,
-    consume: impl FnOnce(Cow<'_, [u8]>) -> T,
+    consume: impl FnOnce(Cow<'_, [u8]>) -> Result<T, Error>,
 ) -> Result<Option<T>, Error> {
-    let view = backend.begin_read().expect("read view");
+    let view = backend.begin_read()?;
     let mut records: Vec<Vec<u8>> = Vec::new();
     let mut consume = Some(consume);
     let mut cursor = *root;
     loop {
-        let Some(slot) = block_slot_in(view.as_ref(), Chain::Beacon, &cursor) else {
+        let Some(slot) = try_block_slot_in(view.as_ref(), Chain::Beacon, &cursor)? else {
             return Ok(None);
         };
         let key = encode_slot_root_key(slot, &cursor);
         // The walk ends at the first snapshot, so the deltas collected so
         // far are folded onto it while it is still borrowed.
-        let folded = view
-            .read_with(Table::States, &key, |snapshot| {
-                let consume = consume.take().expect("the walk ends at its first snapshot");
-                // `records` runs target -> snapshot child; reverse to snapshot
-                // child -> target, the order the chain was written in, so
-                // folding forward replays it correctly.
-                records.reverse();
-                fold_beacon_state_deltas(snapshot, &records, consume)
-            })
-            .expect("read");
-        if folded.is_some() {
-            return Ok(folded);
+        let folded = view.read_with(Table::States, &key, |snapshot| {
+            let consume = consume.take().expect("the walk ends at its first snapshot");
+            // `records` runs target -> snapshot child; reverse to snapshot
+            // child -> target, the order the chain was written in, so
+            // folding forward replays it correctly.
+            records.reverse();
+            fold_beacon_state_deltas(root, snapshot, &records, consume)
+        })?;
+        if let Some(folded) = folded {
+            return folded.map(Some);
         }
-        let Some(diff_bytes) = view.get(Table::StateDiffs, &key).expect("get") else {
+        let Some(diff_bytes) = view.get(Table::StateDiffs, &key)? else {
             return Ok(None);
         };
         let (base_root, _, _, _) = beacon_state_delta::unframe(&diff_bytes);
@@ -479,21 +490,26 @@ pub(crate) fn nearest_snapshot_root(view: &dyn StorageReadView, root: &H256) -> 
 
 /// Applies `records` (snapshot child first) to a borrowed `snapshot` and
 /// hands the result to `consume`: the snapshot itself when there is nothing
-/// to apply, otherwise the owned output of the last delta.
+/// to apply, otherwise the owned output of the last delta. A delta that does
+/// not apply is [`Error::CorruptState`] for `root`, the state being read.
 fn fold_beacon_state_deltas<T>(
+    root: &H256,
     snapshot: &[u8],
     records: &[Vec<u8>],
-    consume: impl FnOnce(Cow<'_, [u8]>) -> T,
-) -> T {
+    consume: impl FnOnce(Cow<'_, [u8]>) -> Result<T, Error>,
+) -> Result<T, Error> {
+    let apply = |record: &[u8], base: &[u8]| {
+        let (_, _, target_len, delta) = beacon_state_delta::unframe(record);
+        beacon_state_delta::try_decode(delta, base, target_len as usize)
+            .map_err(|reason| corrupt_state(root, reason))
+    };
     let mut records = records.iter();
     let Some(first) = records.next() else {
         return consume(Cow::Borrowed(snapshot));
     };
-    let (_, _, target_len, delta) = beacon_state_delta::unframe(first);
-    let mut bytes = beacon_state_delta::decode(delta, snapshot, target_len as usize);
+    let mut bytes = apply(first, snapshot)?;
     for record in records {
-        let (_, _, target_len, delta) = beacon_state_delta::unframe(record);
-        bytes = beacon_state_delta::decode(delta, &bytes, target_len as usize);
+        bytes = apply(record, &bytes)?;
     }
     consume(Cow::Owned(bytes))
 }
@@ -507,39 +523,41 @@ fn fold_beacon_state_deltas<T>(
 /// Lean directories only: the inlined `BlockHeaders` read below assumes a
 /// bare [`BlockHeader`], which is what a lean directory stores there. A
 /// beacon directory tags that table with a fork selector ahead of a
-/// `SignedBeaconBlock`, so calling this on one would decode the wrong shape
-/// and hit the `expect("valid header")` below instead of an explicit panic.
+/// `SignedBeaconBlock`, so calling this on one would fail decoding the wrong
+/// shape (the slot lookup's own header decode panics first) rather than
+/// refuse explicitly.
 /// Nothing does today: [`read_state`]'s `Chain::Lean` arm is this function's
 /// only caller, so that invariant is enforced by having exactly one caller
 /// rather than by a runtime check, unlike
 /// [`Store::get_block_header`](crate::store::Store::get_block_header)'s
 /// `lean_only` guard.
 ///
-/// Returns `Ok(None)` when the root is unknown or the diff chain is broken.
+/// Returns `Ok(None)` when the root is unknown or the diff chain is broken,
+/// and `Err` when a read fails or a row on the way does not decode.
 pub(crate) fn reconstruct_state(
     backend: &dyn StorageBackend,
     root: &H256,
 ) -> Result<Option<State>, Error> {
     // Walk back collecting diffs until we reach a snapshot.
-    let view = backend.begin_read().expect("read view");
+    let view = backend.begin_read()?;
     let mut diffs: Vec<StateDiff> = Vec::new();
     let mut cursor = *root;
     let snapshot = loop {
-        let Some(slot) = block_slot_in(view.as_ref(), Chain::Lean, &cursor) else {
+        let Some(slot) = try_block_slot_in(view.as_ref(), Chain::Lean, &cursor)? else {
             return Ok(None);
         };
         let key = encode_slot_root_key(slot, &cursor);
         if let Some(snapshot) = view
-            .read_with(Table::States, &key, decode_lean_state_value)
-            .expect("read")
+            .read_with(Table::States, &key, decode_lean_state_value)?
+            .transpose()
+            .map_err(|reason| corrupt_state(root, reason))?
         {
             break snapshot;
         }
         let Some(diff) = view
-            .read_with(Table::StateDiffs, &key, |bytes| {
-                StateDiff::from_ssz_bytes(bytes).expect("valid state diff")
-            })
-            .expect("read")
+            .read_with(Table::StateDiffs, &key, StateDiff::from_ssz_bytes)?
+            .transpose()
+            .map_err(|err| corrupt_state(root, format!("a state diff does not decode: {err:?}")))?
         else {
             return Ok(None);
         };
@@ -553,12 +571,15 @@ pub(crate) fn reconstruct_state(
 
     // The latest block header lives in BlockHeaders; the stored state caches
     // the real state_root there, so it equals the header byte-for-byte.
-    let view = backend.begin_read().expect("read view");
+    let view = backend.begin_read()?;
     let header = view
-        .read_with(Table::BlockHeaders, &root.to_ssz(), |bytes| {
-            BlockHeader::from_ssz_bytes(bytes).expect("valid header")
-        })
-        .expect("read");
+        .read_with(
+            Table::BlockHeaders,
+            &root.to_ssz(),
+            BlockHeader::from_ssz_bytes,
+        )?
+        .transpose()
+        .map_err(|err| corrupt_state(root, format!("its block header does not decode: {err:?}")))?;
     drop(view);
     let Some(latest_block_header) = header else {
         return Ok(None);
@@ -1162,8 +1183,8 @@ mod tests {
     }
 
     /// Blocks until `waiters` callers other than the leader are waiting on
-    /// `root`'s rebuild: each holds a clone of its `Arc<Rebuild>`, next to the
-    /// map's and the leader's own.
+    /// `root`'s rebuild: each holds a clone of its `Arc<RebuildCell>`, next to
+    /// the map's and the leader's own.
     fn wait_for_waiters(rebuilds: &StateRebuilds, root: &H256, waiters: usize) {
         let deadline = Instant::now() + std::time::Duration::from_secs(10);
         loop {
@@ -1261,30 +1282,50 @@ mod tests {
     }
 
     #[test]
-    fn a_leader_error_is_not_handed_to_its_waiters() {
+    fn a_leader_error_is_handed_to_its_waiters_and_not_kept() {
+        const WAITERS: usize = 3;
         let rebuilds = StateRebuilds::default();
         let root = H256([7u8; 32]);
         let built = Arc::new(BeaconState::Lean(base_state()));
         let calls = AtomicUsize::new(0);
+        // Only the first call fails, so a waiter that read the state itself
+        // instead of taking the leader's error would come back with a state.
         let rebuild = || {
             if calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                wait_for_waiters(&rebuilds, &root, 1);
+                wait_for_waiters(&rebuilds, &root, WAITERS);
                 return Err(Error::UnexpectedMissingState(root));
             }
             Ok(Some(built.clone()))
         };
 
         let results: Vec<_> = std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..2)
+            let handles: Vec<_> = (0..=WAITERS)
                 .map(|_| scope.spawn(|| rebuilds.share(root, rebuild)))
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
 
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "the waiter retried");
-        let (errors, states): (Vec<_>, Vec<_>) = results.into_iter().partition(Result::is_err);
-        assert_eq!(errors.len(), 1, "only the leader saw its error");
-        let state = states[0].as_ref().unwrap().as_ref().expect("a state");
-        assert!(Arc::ptr_eq(state, &built));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no waiter read it again");
+        for result in results {
+            let err = result.expect_err("every caller got the leader's error");
+            assert!(
+                matches!(
+                    &err,
+                    Error::StateRebuild(shared)
+                        if matches!(**shared, Error::UnexpectedMissingState(r) if r == root)
+                ),
+                "got {err:?}"
+            );
+        }
+        assert!(
+            rebuilds.0.lock().unwrap().is_empty(),
+            "a failed rebuild deregisters its root"
+        );
+
+        let state = rebuilds
+            .share(root, rebuild)
+            .expect("a later miss reads storage again rather than the old error")
+            .expect("a state");
+        assert!(Arc::ptr_eq(&state, &built));
     }
 }
