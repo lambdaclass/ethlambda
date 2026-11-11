@@ -128,9 +128,17 @@ fn run(case: &Case) -> Result<(), String> {
             // The README lets an importer refuse an interchange holding
             // slashable data, in which case the rest of the case is skipped.
             // This one absorbs all of it but an attestation whose source is at
-            // or past its target, so a refusal on such a step ends the case,
-            // as it does in Lighthouse; on any other step it is a failure.
-            (false, true) if step.contains_slashable_data => return Ok(()),
+            // or past its target, so only a step whose interchange holds one
+            // may be refused, which ends the case, as it does in Lighthouse.
+            // Every other slashable step must import: skipping on the flag
+            // alone would pass a suite whose importer had started refusing,
+            // say, a duplicated pubkey or a surround, with that case's blocks
+            // and attestations never attempted.
+            (false, true)
+                if step.contains_slashable_data && holds_impossible_source(&step.interchange) =>
+            {
+                return Ok(());
+            }
             (false, true) => {
                 return Err(format!(
                     "step {index}: import failed but should succeed (slashable data: {}): {}",
@@ -180,6 +188,26 @@ fn run(case: &Case) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Whether `interchange` holds an attestation whose source is at or past its
+/// target outside genesis: the one shape this importer refuses rather than
+/// absorbs. The rule is restated here rather than borrowed from the crate, so
+/// that the importer widening what it refuses cannot widen what this runner
+/// forgives along with it.
+fn holds_impossible_source(interchange: &serde_json::Value) -> bool {
+    let epoch =
+        |value: &serde_json::Value| value.as_str().and_then(|text| text.parse::<u64>().ok());
+    interchange["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|entry| entry["signed_attestations"].as_array().into_iter().flatten())
+        .any(|attestation| {
+            let source = epoch(&attestation["source_epoch"]);
+            let target = epoch(&attestation["target_epoch"]);
+            matches!((source, target), (Some(source), Some(target)) if source >= target && source != 0)
+        })
 }
 
 /// Only the epochs are judged; the rest of the data is filler.

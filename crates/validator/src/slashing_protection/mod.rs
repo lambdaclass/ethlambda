@@ -1459,6 +1459,31 @@ mod tests {
         assert!(propose(&mut fresh, 1, 97).is_err());
     }
 
+    /// An export writes nothing to the validators directory, and the lock is
+    /// an `flock` on the directory itself, which a read-only descriptor can
+    /// take: keys mounted read-only can still hand their history over.
+    #[cfg(unix)]
+    #[test]
+    fn an_export_needs_no_writable_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut protection = open(dir.path(), &[1], true).expect("init");
+        propose(&mut protection, 1, 97).expect("propose");
+        drop(protection);
+
+        let read_only = std::fs::Permissions::from_mode(0o500);
+        std::fs::set_permissions(dir.path(), read_only).expect("chmod");
+        let exported = SlashingProtection::open_offline(dir.path(), None)
+            .and_then(|protection| protection.export(&[pubkey(1)]));
+        let writable = std::fs::Permissions::from_mode(0o700);
+        std::fs::set_permissions(dir.path(), writable).expect("chmod back");
+
+        let exported = exported.expect("locks, reads and exports with no write access");
+        let json: serde_json::Value = serde_json::from_str(&exported).expect("json");
+        assert_eq!(json["data"][0]["signed_blocks"][0]["slot"], "97");
+    }
+
     #[test]
     fn opening_offline_needs_a_record_or_a_chain_to_create_one_for() {
         let dir = tempfile::tempdir().expect("temp dir");

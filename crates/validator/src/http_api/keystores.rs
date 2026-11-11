@@ -407,31 +407,31 @@ pub async fn import(
         .map(|result| match (result, &registration) {
             (Ok((_, secret, _)), Ok(_)) => finish_import(&mut store, &secret),
             (Ok((pubkey, _, _)), Err(err)) => {
-                if before.contains_key(&pubkey) {
-                    // Its keystore was rewritten; its entry is back as it was
-                    // and nothing about it changed in memory, so it stays
-                    // whatever it was, loaded since startup in the ordinary
-                    // case.
-                    let entry = if rolled_back.is_ok() {
-                        "its definitions entry is back as it was"
-                    } else {
-                        "its definitions entry could not be put back"
-                    };
-                    KeyStatus::error(format!(
+                match (before.contains_key(&pubkey), rolled_back.is_ok()) {
+                    // A key the file already listed, undone: its keystore,
+                    // its password and its entry are what they were before
+                    // the request, and nothing about it changed in memory, so
+                    // it stays whatever it was, loaded since startup in the
+                    // ordinary case.
+                    (true, true) => KeyStatus::error(format!(
+                        "not imported: its slashing-protection record could not be written: \
+                         {err}; its keystore and definitions entry are back as they were"
+                    )),
+                    // The undo failed as well, so what this request wrote
+                    // over the key's files and entry may still be there.
+                    (true, false) => KeyStatus::error(format!(
                         "keystore rewritten, but the slashing-protection record could not be \
-                         written: {err}; {entry}"
-                    ))
-                } else if rolled_back.is_err() {
+                         written: {err}; its definitions entry could not be put back"
+                    )),
+                    (false, true) => KeyStatus::error(format!(
+                        "not imported: its slashing-protection record could not be written: {err}"
+                    )),
                     // Still on disk, not loaded now, and refused at the next
                     // start until it has a record.
-                    KeyStatus::error(format!(
+                    (false, false) => KeyStatus::error(format!(
                         "saved, but not loaded: its slashing-protection record could not be \
                          written: {err}"
-                    ))
-                } else {
-                    KeyStatus::error(format!(
-                        "not imported: its slashing-protection record could not be written: {err}"
-                    ))
+                    )),
                 }
             }
             (Err(status), _) => status,
@@ -1508,11 +1508,12 @@ mod tests {
         )
         .await;
         assert_eq!(body["data"][0]["status"], "error", "got {body}");
+        // Not "keystore rewritten": the undo put the files back too, so the
+        // message must not send the operator looking for a new keystore.
+        let message = body["data"][0]["message"].as_str().unwrap_or_default();
+        assert!(message.starts_with("not imported"), "got {body}");
         assert!(
-            body["data"][0]["message"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("back as it was"),
+            message.ends_with("its keystore and definitions entry are back as they were"),
             "got {body}"
         );
         let definitions = ValidatorDefinitions::open(dir.path()).expect("opens");
@@ -1637,9 +1638,12 @@ mod tests {
         assert_eq!(definitions.0, vec![previous]);
     }
 
-    /// A request that carries history is refused whole, importing nothing.
+    /// A request whose history does not parse as an interchange is refused
+    /// whole, importing nothing: `{}` has neither metadata nor data. History
+    /// that does parse is imported with its keys (see
+    /// `an_import_brings_its_slashing_protection_history`).
     #[tokio::test]
-    async fn an_import_carrying_history_is_refused_whole() {
+    async fn an_import_whose_history_does_not_parse_is_refused_whole() {
         let dir = tempfile::tempdir().expect("temp dir");
         let context = context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
         let store = context.store.clone();
@@ -1658,6 +1662,14 @@ mod tests {
         )
         .await;
         assert_eq!(body["data"][0]["status"], "error", "got {body}");
+        // Refused for the history, and for its shape: not for the keystore,
+        // and not for some later step.
+        let message = body["data"][0]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with("slashing_protection was not imported")
+                && message.contains("malformed"),
+            "got {body}"
+        );
         assert!(store.read().await.pubkeys().is_empty());
         assert!(
             ValidatorDefinitions::open(dir.path())
