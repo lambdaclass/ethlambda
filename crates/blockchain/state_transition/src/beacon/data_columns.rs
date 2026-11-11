@@ -131,6 +131,11 @@ fn header_with_body_root(
 /// The specification's `get_data_column_sidecars`. `cells_and_proofs[i]` is
 /// blob `i`'s cells and its `CELLS_PER_EXT_BLOB` proofs.
 ///
+/// A block without commitments has no sidecars (consensus-specs `0f4fa3ff`):
+/// a sidecar with no cells is one `verify_data_column_sidecar` rejects, so
+/// there is nothing to build. `v1.7.0-beta.4` built `NUMBER_OF_COLUMNS`
+/// empty ones.
+///
 /// # Panics
 ///
 /// If `cells_and_proofs` and `kzg_commitments` differ in length, the
@@ -146,6 +151,9 @@ pub fn get_data_column_sidecars(
         kzg_commitments.len(),
         "one cells-and-proofs entry per commitment"
     );
+    if kzg_commitments.is_empty() {
+        return Vec::new();
+    }
     (0..NUMBER_OF_COLUMNS)
         .map(|column_index| {
             let column: Vec<fulu::Cell> = cells_and_proofs
@@ -380,6 +388,9 @@ mod tests {
     fn a_block_without_blobs_has_no_sidecars() {
         let (block, proofs) = block_with(&[]);
         assert!(verified_sidecars(&block, &[], &proofs).unwrap().is_empty());
+        // The specification's function itself, not only the guard above it
+        // (consensus-specs `0f4fa3ff`; beta.4 built 128 empty sidecars).
+        assert!(get_data_column_sidecars_from_block(&block, &[]).is_empty());
     }
 
     #[test]
