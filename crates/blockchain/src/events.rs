@@ -79,8 +79,10 @@ pub enum Topic {
     /// The new head does not descend from the previous one. On both surfaces.
     ChainReorg,
     DataColumnSidecar,
-    // Accepted on the beacon surface; `docs/rpc.md` lists which are emitted.
+    /// Beacon: a subnet attestation that passed the
+    /// `beacon_attestation_{subnet_id}` rules.
     SingleAttestation,
+    // The rest are accepted on the beacon surface; `docs/rpc.md` lists which are emitted.
     VoluntaryExit,
     BlsToExecutionChange,
     ProposerSlashing,
@@ -340,6 +342,11 @@ pub enum ChainEvent {
     PayloadAttestationMessage(Versioned<gloas::PayloadAttestationMessage>),
     /// Beacon `proposer_preferences`.
     ProposerPreferences(Box<Versioned<gloas::SignedProposerPreferences>>),
+    /// Beacon `single_attestation`: a subnet attestation passed the
+    /// `beacon_attestation_{subnet_id}` rules. Boxed for the reason
+    /// [`ChainEvent::BeaconAttestation`] is; it is also the highest-rate
+    /// topic, so the clone is only made when someone listens.
+    SingleAttestation(Box<electra::SingleAttestation>),
 }
 
 impl ChainEvent {
@@ -363,6 +370,7 @@ impl ChainEvent {
             ChainEvent::ExecutionPayloadBid(_) => Topic::ExecutionPayloadBid,
             ChainEvent::PayloadAttestationMessage(_) => Topic::PayloadAttestationMessage,
             ChainEvent::ProposerPreferences(_) => Topic::ProposerPreferences,
+            ChainEvent::SingleAttestation(_) => Topic::SingleAttestation,
         }
     }
 }
@@ -662,6 +670,9 @@ impl GossipEventSink for EventBus {
             }
             GossipEvent::ProposerPreferences(preferences) => {
                 ChainEvent::ProposerPreferences(Box::new(Versioned::gloas(*preferences)))
+            }
+            GossipEvent::SingleAttestation(attestation) => {
+                ChainEvent::SingleAttestation(attestation)
             }
         };
         EventBus::emit(self, event);
@@ -2098,5 +2109,37 @@ mod tests {
         });
         let event = ChainEvent::BeaconAttestation(Box::new(BeaconAttestationEvent::from(&signed)));
         assert_matches_example(event, Topic::Attestation, example);
+    }
+
+    /// The specification's `single_attestation` example, carried through the
+    /// event unchanged: quoted integers, `0x` hex, electra's field names.
+    #[test]
+    fn single_attestation_matches_the_specification_example() {
+        let example = r#"{"committee_index":"1", "attester_index":"1", "data":{"slot":"1", "index":"1", "beacon_block_root":"0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "source":{"epoch":"1", "root":"0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2"}, "target":{"epoch":"1", "root":"0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2"}}, "signature":"0x1b66ac1fb663c9bc59509846d6ec05345bd908eda73e670af888da41af171505cc411d61252fb6cb3fa0017b679f8bb2305b26a285fa2737f175668d0dff91cc1b66ac1fb663c9bc59509846d6ec05345bd908eda73e670af888da41af171505"}"#;
+        let attestation: electra::SingleAttestation = serde_json::from_str(example).unwrap();
+        let event = ChainEvent::SingleAttestation(Box::new(attestation));
+        assert_matches_example(event, Topic::SingleAttestation, example);
+    }
+
+    #[tokio::test]
+    async fn the_bus_turns_a_gossip_single_attestation_into_its_topic() {
+        let bus = EventBus::new(8);
+        let mut rx = bus.subscribe();
+        let sink: &dyn GossipEventSink = &bus;
+
+        let attestation = electra::SingleAttestation {
+            committee_index: 1,
+            attester_index: 2,
+            data: Default::default(),
+            signature: Default::default(),
+        };
+        sink.emit(GossipEvent::SingleAttestation(Box::new(
+            attestation.clone(),
+        )));
+
+        let ChainEvent::SingleAttestation(received) = rx.try_recv().unwrap() else {
+            panic!("expected a single_attestation event");
+        };
+        assert_eq!(*received, attestation);
     }
 }
