@@ -31,10 +31,11 @@
 //!   `beacon_block` or `data_column_sidecar` from gossip, convert a complete
 //!   answer to data columns and import them as if received on gossip. This
 //!   node asks on the first data-availability hold of a block, whether the
-//!   block came from gossip or from sync; it does not yet ask when a sidecar
-//!   arrives. Hence the hand-over to p2p rather than a direct store write:
-//!   publishing on subscribed subnets and updating the anti-equivocation cache
-//!   are MUSTs, and p2p owns both.
+//!   block came from gossip or from sync, once its proposer signature verifies
+//!   against its parent's state (see [`signed_by_its_proposer`]); it does not
+//!   yet ask when a sidecar arrives. Hence the hand-over to p2p rather than a
+//!   direct store write: publishing on subscribed subnets and updating the
+//!   anti-equivocation cache are MUSTs, and p2p owns both.
 //! - **One attempt.** The call races gossip delivery of the same columns, the
 //!   specification's own timeout for the method is 1 s, and a retry after the
 //!   engine ladder's backoff would land after that race is decided. A miss
@@ -62,15 +63,64 @@ use std::time::Instant;
 use ethlambda_engine::EngineClient;
 use ethlambda_network_api::{BlockChainToP2PRef, SidecarOrigin};
 use ethlambda_state_transition::beacon::data_columns;
+use ethlambda_state_transition::beacon::precheck::{Reference, precheck_block};
 use ethlambda_state_transition::beacon::stf::deneb::kzg_commitment_to_versioned_hash;
 use ethlambda_storage::Store;
 use ethlambda_types::ShortRoot;
-use ethlambda_types::beacon::containers::{DataColumnSidecar, deneb, electra};
+use ethlambda_types::beacon::containers::{DataColumnSidecar, SignedBeaconBlock, deneb, electra};
 use ethlambda_types::beacon::primitives::KzgProof;
 use ethlambda_types::primitives::H256;
 use tracing::{debug, error, info, warn};
 
 use crate::metrics;
+
+/// Whether a held block may have its columns built from the execution
+/// client's blobs: its proposer signature, and the rest of
+/// [`precheck_block`]'s rules, hold against its parent's post-state.
+///
+/// The columns built here carry the block's own signed header and skip every
+/// check on their way out (see `SidecarOrigin::ExecutionLayer`): p2p records
+/// them in the seen cache under `(slot, proposer, index)` and publishes them.
+/// A block can reach its hold unverified, since range sync and by-root
+/// answers never pass gossip validation and the import checks the signature
+/// only after data availability. Without this, a peer serving a forged copy
+/// whose commitments name blobs in the local pool would have this node publish
+/// columns its peers reject, and take the seen-cache key of the real block's
+/// columns from the same proposer and slot.
+///
+/// The parent has a post-state whenever the import reaches a hold; a hold
+/// without one is not asked about.
+pub(crate) fn signed_by_its_proposer(
+    store: &Store,
+    block: &SignedBeaconBlock,
+    block_root: H256,
+) -> bool {
+    let slot = block.slot();
+    let Some(parent_state) = store
+        .get_state(&block.parent_root())
+        .expect("DB read should succeed")
+    else {
+        debug!(
+            %slot,
+            block_root = %ShortRoot(&block_root.0),
+            "Not asking the execution client for blobs: the block's parent has no post-state"
+        );
+        return false;
+    };
+    let config = store.config();
+    precheck_block(block, block_root, Reference::Parent(&parent_state), &config)
+        .inspect_err(|err| {
+            let proposer = block.proposer_index();
+            warn!(
+                %slot,
+                proposer,
+                block_root = %ShortRoot(&block_root.0),
+                %err,
+                "Not asking the execution client for blobs: the block fails its precheck"
+            )
+        })
+        .is_ok()
+}
 
 /// Ask the execution client for a held fulu block's blobs on a task of its
 /// own, and hand the custody columns built from them to the p2p layer.
@@ -226,8 +276,52 @@ mod tests {
 
     use super::*;
     use crate::import_timing::ImportTimings;
-    use crate::tests::{beacon_server_recording, beacon_store, fulu_block};
-    use ethlambda_types::beacon::preset::BYTES_PER_BLOB;
+    use crate::tests::{bare_block, bare_state, beacon_server_recording, beacon_store, fulu_block};
+    use ethlambda_state_transition::beacon::helpers::test_state;
+    use ethlambda_types::beacon::config::Config;
+    use ethlambda_types::beacon::constants::DOMAIN_BEACON_PROPOSER;
+    use ethlambda_types::beacon::fork::ForkName;
+    use ethlambda_types::beacon::preset::{self, BYTES_PER_BLOB};
+    use ethlambda_types::beacon::signing::{
+        compute_domain, compute_epoch_at_slot, compute_signing_root,
+    };
+
+    /// `beacon_store(0, 0)` whose anchor, the parent of every block here, has
+    /// a post-state registering validator 0 under the key [`sign`] uses, so a
+    /// signed block passes the precheck a hold runs before it asks the
+    /// execution client.
+    fn store_with_keyed_parent() -> Store {
+        let keyed = test_state::with_signing_validators_at(ForkName::Phase0, 1);
+        let validator = keyed.validator(0).expect("one validator").clone();
+        let mut state = bare_state();
+        state
+            .push_validator(validator, preset::MAX_EFFECTIVE_BALANCE)
+            .expect("one validator fits the registry");
+        state.apply_pending_mutations();
+
+        let mut store = beacon_store(0, 0);
+        store
+            .insert_signed_block(H256::ZERO, bare_block(0, H256::repeat_byte(0xcc)))
+            .expect("insert");
+        store.insert_state(H256::ZERO, state).expect("insert");
+        store
+    }
+
+    /// `block` signed by validator 0, its proposer, under the mainnet fork
+    /// schedule `beacon_store` runs on.
+    fn sign(mut block: SignedBeaconBlock) -> SignedBeaconBlock {
+        let config = Config::mainnet();
+        let fork_version =
+            config.fork_version(config.fork_at_epoch(compute_epoch_at_slot(block.slot())));
+        // `bare_state`'s genesis validators root.
+        let domain = compute_domain(DOMAIN_BEACON_PROPOSER, fork_version, H256::ZERO);
+        let signing_root = compute_signing_root(block.message_hash_tree_root(), domain);
+        let SignedBeaconBlock::Fulu(inner) = &mut block else {
+            unreachable!("these tests build fulu blocks");
+        };
+        inner.signature = test_state::sign_for(inner.message.proposer_index as usize, signing_root);
+        block
+    }
 
     /// A blob whose every field element is below the BLS modulus.
     fn blob_bytes(seed: u8) -> Vec<u8> {
@@ -325,7 +419,8 @@ mod tests {
         (client, requests)
     }
 
-    /// A fulu block at slot 1 committing to each of `blobs`.
+    /// A fulu block at slot 1 committing to each of `blobs`, signed by its
+    /// proposer.
     fn block_committing_to(blobs: &[Vec<u8>]) -> SignedBeaconBlock {
         let mut block = fulu_block(H256::ZERO, 1, 0);
         let commitments: Vec<KzgCommitment> = blobs
@@ -336,7 +431,7 @@ mod tests {
             unreachable!("fulu_block builds a fulu block");
         };
         inner.message.body.blob_kzg_commitments = SszList::try_from(commitments).unwrap();
-        block
+        sign(block)
     }
 
     const CUSTODY: [u64; 3] = [0, 5, 77];
@@ -357,7 +452,7 @@ mod tests {
         let block = block_committing_to(&blobs);
         let root = block.message_hash_tree_root();
         let (engine, requests) = mock_engine(answer_for(&blobs)).await;
-        let (mut server, p2p) = beacon_server_recording(beacon_store(0, 0));
+        let (mut server, p2p) = beacon_server_recording(store_with_keyed_parent());
         server.engine = Some(engine);
         server.custody_columns = CUSTODY.to_vec();
 
@@ -397,7 +492,7 @@ mod tests {
         let block = block_committing_to(&blobs);
         let root = block.message_hash_tree_root();
         let (engine, _requests) = mock_engine(answer_for(&blobs)).await;
-        let (mut server, p2p) = beacon_server_recording(beacon_store(0, 0));
+        let (mut server, p2p) = beacon_server_recording(store_with_keyed_parent());
         server.engine = Some(engine);
         server.custody_columns = CUSTODY.to_vec();
         server
@@ -425,7 +520,7 @@ mod tests {
         let blobs = vec![blob_bytes(4)];
         let block = block_committing_to(&blobs);
         let (engine, requests) = mock_engine("null".to_string()).await;
-        let (mut server, p2p) = beacon_server_recording(beacon_store(0, 0));
+        let (mut server, p2p) = beacon_server_recording(store_with_keyed_parent());
         server.engine = Some(engine);
         server.custody_columns = CUSTODY.to_vec();
 
@@ -446,7 +541,7 @@ mod tests {
     async fn without_an_engine_nothing_is_asked_or_handed_over() {
         let blobs = vec![blob_bytes(5)];
         let block = block_committing_to(&blobs);
-        let (mut server, p2p) = beacon_server_recording(beacon_store(0, 0));
+        let (mut server, p2p) = beacon_server_recording(store_with_keyed_parent());
         server.custody_columns = CUSTODY.to_vec();
 
         server.hold_block_for_columns(block, 1, ImportTimings::default());
@@ -460,7 +555,7 @@ mod tests {
         let blobs = vec![blob_bytes(6)];
         let block = block_committing_to(&blobs);
         let (engine, requests) = mock_engine("null".to_string()).await;
-        let (mut server, _p2p) = beacon_server_recording(beacon_store(0, 0));
+        let (mut server, _p2p) = beacon_server_recording(store_with_keyed_parent());
         server.engine = Some(engine);
         server.custody_columns = CUSTODY.to_vec();
 
@@ -475,5 +570,33 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    /// An altered copy of a block (its body changed after signing, the
+    /// signature kept) whose commitments name blobs the execution client
+    /// holds: the columns would carry a header nobody signed, so the client is
+    /// not asked and nothing reaches p2p's seen cache or the wire.
+    #[tokio::test]
+    async fn a_block_whose_signature_does_not_verify_is_not_asked_about() {
+        let blobs = vec![blob_bytes(7)];
+        let mut block = block_committing_to(&blobs);
+        let SignedBeaconBlock::Fulu(inner) = &mut block else {
+            unreachable!("fulu_block builds a fulu block");
+        };
+        inner.message.body.graffiti = H256::repeat_byte(0x01);
+        let (engine, requests) = mock_engine(answer_for(&blobs)).await;
+        let (mut server, p2p) = beacon_server_recording(store_with_keyed_parent());
+        server.engine = Some(engine);
+        server.custody_columns = CUSTODY.to_vec();
+
+        server.hold_block_for_columns(block, 1, ImportTimings::default());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            0,
+            "the engine was not asked"
+        );
+        assert!(p2p.checks.lock().unwrap().is_empty());
     }
 }

@@ -3145,7 +3145,8 @@ impl BlockChainServer {
     /// slot.
     ///
     /// The execution client is asked for the block's blobs once, on the first
-    /// hold of a fulu block that commits to any (see [`beacon_blobs`]). That
+    /// hold of a fulu block that commits to any and whose proposer signature
+    /// verifies against its parent's state (see [`beacon_blobs`]). That
     /// does not depend on the peer-ask timing above: it is a local call that
     /// races nobody, and a hit hands the custody columns back through the same
     /// path gossip uses, so it is as useful for a block at the tip as for an
@@ -3179,10 +3180,13 @@ impl BlockChainServer {
 
         // Before the block is moved into the store. Only the first hold asks:
         // a redelivery of a held root must not re-query the execution client.
+        // Only a block whose proposer signature verifies does, since the
+        // columns built from its blobs carry its header unchecked.
         if let (Some(engine), Some(p2p), SignedBeaconBlock::Fulu(inner)) =
             (&self.engine, &self.p2p, &block)
             && !inner.message.body.blob_kzg_commitments.is_empty()
             && !self.blocks_awaiting_columns.contains_key(&block_root)
+            && beacon_blobs::signed_by_its_proposer(&self.store, &block, block_root)
         {
             beacon_blobs::spawn_fetch(
                 engine.clone(),

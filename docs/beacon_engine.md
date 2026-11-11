@@ -252,9 +252,19 @@ The code is `crates/blockchain/src/beacon_blobs.rs`.
 
 **When it fires.** On the first data-availability hold of a block
 (`hold_block_for_columns`), when all of these hold: the block is fulu, it
-commits to at least one blob, and `--execution-endpoint` is set. Any slot and
-any source (gossip or sync) qualifies. A redelivery of a held root does not ask
-again.
+commits to at least one blob, `--execution-endpoint` is set, and the block
+passes `precheck_block` against its parent's post-state (expected proposer and
+proposer signature). Any slot and any source (gossip or sync) qualifies. A
+redelivery of a held root does not ask again.
+
+The precheck is there because the built columns carry the block's own signed
+header and skip every check on their way out (see the hand-over below). Range
+sync and by-root answers never pass gossip validation, and the import checks
+the signature only after data availability, so without it a peer serving a
+forged copy of a block, whose commitments name blobs in this node's pool, would
+have this node publish columns its peers reject, and take the seen-cache key of
+the real block's columns from the same proposer and slot. It costs one BLS
+verification per first hold of a block that would be asked about.
 
 **The call.** One attempt with a 1 s timeout (`ENGINE_GET_BLOBS_TIMEOUT`, the
 value `osaka.md` gives the method), outside the retry ladder. The call races
