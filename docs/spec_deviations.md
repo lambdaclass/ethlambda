@@ -938,8 +938,10 @@ node computes the same value another way.
 - **ethlambda:** the validator client performs no aggregation at EIP-8453
   slots, and the legacy aggregation stops there. A proposer's node aggregates
   what it holds when it builds the block (`aggregate_head_votes`,
-  `pack_attestations`), and every node joins every attestation subnet (below)
-  so it holds every FG attestation.
+  `pack_attestations`, which splits one data's attesters over consecutive
+  committees so that no aggregate names more than
+  `MAX_VALIDATORS_PER_AGGREGATE` committee members), and every node joins every
+  attestation subnet (below) so it holds every FG attestation.
 - **Why:** there is no selection rule or topic to aggregate for.
 
 ### Block production at EIP-8453 slots: no builder bids
