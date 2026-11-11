@@ -195,10 +195,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.1.0
 
       - name: Free up disk space
-        uses: ./.github/actions/free-disk
+        uses: $/.github/actions/free-disk
 
       - name: Install kurtosis
         run: |
@@ -252,7 +252,7 @@ jobs:
 
       - name: Upload the dump and results
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: commit-boost-enclave-dump-${{ github.run_id }}
           path: ${{ runner.temp }}/dump
