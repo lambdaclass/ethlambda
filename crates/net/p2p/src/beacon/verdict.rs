@@ -578,6 +578,15 @@ impl Handler<GossipVerdict> for P2PServer {
                 );
                 (Outcome::Ignore(IgnoreReason::ValidationTimeout), None)
             }
+            // `JobOutcome` and `JobError` are `#[non_exhaustive]`: a way of
+            // ending spawned adds later still yields the one verdict.
+            _ => {
+                error!(
+                    kind = id.kind,
+                    "Beacon gossip validation ended without a result; reporting Ignore(Internal)"
+                );
+                (Outcome::Ignore(IgnoreReason::Internal), None)
+            }
         };
         let received_at = id.received_at;
         // Only an Accept or a Queue forwards, and both come with the object.

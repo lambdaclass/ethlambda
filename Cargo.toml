@@ -91,13 +91,13 @@ hmac = "0.12"
 base64 = "0.22"
 
 # spawned 0.8 pre-release: git rev of lambdaclass/spawned `feat/otp-exit-signals`
-# (PR #240, stacked on #239 deferred replies). Rev 43aba082 (43aba082c70f12ed69c6e246b0cd137d507752bb).
+# (PR #240, stacked on #239 deferred replies). Rev 850fd785 (850fd785bc5dd241e833cb5bc98eda5ac7ef4282).
 # Every spawned crate must come from the same rev so they share one set of types.
 # `metrics`: the actor runtime's own counters (mailbox depth, queue wait,
 # handler time, actor exits), appended to `/metrics` by ethlambda-rpc.
-spawned-concurrency = { git = "https://github.com/lambdaclass/spawned", rev = "43aba082c70f12ed69c6e246b0cd137d507752bb", features = ["metrics"] }
-spawned-rt = { git = "https://github.com/lambdaclass/spawned", rev = "43aba082c70f12ed69c6e246b0cd137d507752bb" }
-spawned-test = { git = "https://github.com/lambdaclass/spawned", rev = "43aba082c70f12ed69c6e246b0cd137d507752bb" }
+spawned-concurrency = { git = "https://github.com/lambdaclass/spawned", rev = "850fd785bc5dd241e833cb5bc98eda5ac7ef4282", features = ["metrics"] }
+spawned-rt = { git = "https://github.com/lambdaclass/spawned", rev = "850fd785bc5dd241e833cb5bc98eda5ac7ef4282" }
+spawned-test = { git = "https://github.com/lambdaclass/spawned", rev = "850fd785bc5dd241e833cb5bc98eda5ac7ef4282" }
 tokio = "1.0"
 tokio-util = "0.7"
 

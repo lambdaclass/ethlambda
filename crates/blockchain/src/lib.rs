@@ -6479,10 +6479,10 @@ mod tests {
                     assert!(!panic, "{name}: proof panicked");
                 },
                 move |outcome| {
-                    let what = match outcome {
-                        JobOutcome::Ok(()) => "done".to_string(),
-                        JobOutcome::Err(JobError::Panicked(m)) => format!("panicked ({m})"),
-                        JobOutcome::Err(err) => err.to_string(),
+                    let what = match outcome.into_result() {
+                        Ok(()) => "done".to_string(),
+                        Err(JobError::Panicked(m)) => format!("panicked ({m})"),
+                        Err(err) => err.to_string(),
                     };
                     Logged(done_log, format!("{name}: {what}"))
                 },
