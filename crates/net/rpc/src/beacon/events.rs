@@ -14,8 +14,8 @@
 //! - The payloads are the chain actor's beacon variants, which quote every
 //!   integer, so nothing here reshapes an event.
 //!
-//! Every event comes from the chain actor, the bus's only publisher; this
-//! handler only subscribes.
+//! The chain actor, p2p and the submission endpoints publish to the bus (see
+//! `ethlambda_blockchain::events`); this handler only subscribes.
 //!
 //! [`ChainEvent`]: ethlambda_blockchain::ChainEvent
 

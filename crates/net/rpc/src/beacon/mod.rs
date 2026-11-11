@@ -155,8 +155,6 @@ impl BodyEncoding {
     }
 }
 
-/// Decode the array a batch-submission endpoint takes, as JSON or as the SSZ
-/// `List[T, ...]` of the same elements, by the request's `Content-Type`.
 /// Report an object the API accepted on the event stream, when the node has an
 /// [`EventBus`](ethlambda_blockchain::EventBus) and anyone listens.
 ///
@@ -174,6 +172,8 @@ pub(crate) fn emit_accepted(
     }
 }
 
+/// Decode the array a batch-submission endpoint takes, as JSON or as the SSZ
+/// `List[T, ...]` of the same elements, by the request's `Content-Type`.
 pub(crate) fn decode_list<T>(
     headers: &axum::http::HeaderMap,
     body: &[u8],
