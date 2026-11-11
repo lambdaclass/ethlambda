@@ -16,12 +16,14 @@ use ethlambda_types::beacon::signing::compute_epoch_at_slot;
 
 use crate::beacon_node::block_contents::ProducedBlock;
 use crate::beacon_node::dto::{
-    AttesterDutyDto, CommitteeSubscriptionDto, InclusionListDutyDto, ProposerDutyDto,
+    AttestationCommitteeDutyDto, AttesterDutyDto, CommitteeSubscriptionDto,
+    FinalityAttestationInputDto, HeadVoteDutyDto, InclusionListDutyDto, ProposerDutyDto,
     ProposerPreparationDto, PtcDutyDto, SingleAttestationDto, SyncCommitteeSubscriptionDto,
     SyncDutyDto,
 };
 use crate::error::Result;
 use ethlambda_types::beacon::containers::altair;
+use ethlambda_types::beacon::containers::eip8453;
 use ethlambda_types::beacon::containers::electra;
 use ethlambda_types::beacon::containers::gloas;
 use ethlambda_types::beacon::containers::heze;
@@ -108,6 +110,17 @@ pub type PtcDuties = Duties<PtcDutyDto>;
 /// (heze). `dependent_root` is the attester shuffling's, which the committees
 /// are drawn from, and is also the `dependent_root` a member's list names.
 pub type InclusionListDuties = Duties<InclusionListDutyDto>;
+
+/// One epoch's EIP-8453 attestation committee duties for the indices asked
+/// about. `dependent_root` is the attester duties' kind: the committees follow
+/// the active set, which the registry fixes earlier still.
+pub type AttestationCommitteeDuties = Duties<AttestationCommitteeDutyDto>;
+
+/// One epoch's EIP-8453 head vote committee duties for the indices asked
+/// about. `dependent_root` is the attester duties' kind, except at the fork
+/// epoch, whose committees `upgrade_to_eip8453` draws from the chain through
+/// the last pre-fork block.
+pub type HeadVoteDuties = Duties<HeadVoteDutyDto>;
 
 /// Every proposer for one epoch, not only this client's. The endpoint takes no
 /// validator list, so the caller filters. See [`Duties`] for what
@@ -446,6 +459,51 @@ pub trait BeaconNodeApi: Send + Sync {
     /// Publish a committee member's signed inclusion list. The node validates
     /// it as gossip would, stores it and gossips it.
     async fn publish_inclusion_list(&self, signed: &heze::SignedInclusionList) -> Result<()>;
+
+    /// The EIP-8453 attestation committee duties for `indices` in `epoch`:
+    /// each validator's one committee for the epoch and the slots it attests
+    /// in. An ethlambda endpoint; no beacon-APIs specification exists for it.
+    async fn attestation_committee_duties(
+        &self,
+        epoch: Epoch,
+        indices: &[ValidatorIndex],
+    ) -> Result<AttestationCommitteeDuties>;
+
+    /// The EIP-8453 head vote committee duties for `indices` in `epoch`: the
+    /// slots each validator votes in. An ethlambda endpoint.
+    async fn head_vote_duties(
+        &self,
+        epoch: Epoch,
+        indices: &[ValidatorIndex],
+    ) -> Result<HeadVoteDuties>;
+
+    /// The `HeadVoteData` a head vote committee member of `slot` signs, as of
+    /// the slot's head vote deadline.
+    ///
+    /// # Contract: the answer is for `slot`, or this is an `Err`
+    ///
+    /// For the reason [`Self::attestation_data`] states.
+    async fn head_vote_data(&self, slot: Slot) -> Result<eip8453::HeadVoteData>;
+
+    /// What an FG attester of `slot` selects its `AttestationData` from, as
+    /// of the slot's support cutoff, or `None` (204) when the node has no FG
+    /// source and the validator must not attest. The selection itself is this
+    /// client's, through its `FinalitySigningRecord`.
+    async fn finality_attestation_input(
+        &self,
+        slot: Slot,
+    ) -> Result<Option<FinalityAttestationInputDto>>;
+
+    /// Submit signed head votes. Returns how many the node accepted, with the
+    /// partial-success reading of [`Self::submit_attestations`].
+    async fn submit_head_votes(&self, messages: &[eip8453::HeadVoteMessage]) -> Result<usize>;
+
+    /// Submit signed EIP-8453 `SingleAttestation`s on the attestation pool
+    /// (`Eth-Consensus-Version: eip8453`). Returns how many the node accepted.
+    async fn submit_fg_attestations(
+        &self,
+        attestations: &[eip8453::SingleAttestation],
+    ) -> Result<usize>;
 
     /// Submits signed attestations to the node's pool, so they reach gossip.
     /// `fork_name` names the fork the attestations were produced under, since

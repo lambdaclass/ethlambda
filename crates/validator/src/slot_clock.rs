@@ -91,10 +91,44 @@ impl SlotClock {
         self.config.fork_at_epoch(self.epoch_of(slot)) >= ForkName::Gloas
     }
 
-    /// Whether `slot` is a heze slot, the fork inclusion list committees exist
-    /// from.
+    /// Whether `slot` is a heze slot or later, the forks inclusion list
+    /// committees exist in (EIP-8453 keeps heze's).
     pub fn is_heze(&self, slot: Slot) -> bool {
-        self.config.fork_at_epoch(self.epoch_of(slot)) == ForkName::Heze
+        self.config.fork_at_epoch(self.epoch_of(slot)) >= ForkName::Heze
+    }
+
+    /// Whether `slot` is an EIP-8453 slot: head votes and FG attestations
+    /// instead of attestations and aggregates.
+    pub fn is_eip8453(&self, slot: Slot) -> bool {
+        self.config.fork_at_epoch(self.epoch_of(slot)) >= ForkName::Eip8453
+    }
+
+    /// When a head vote committee member of `slot` votes (EIP-8453):
+    /// `HEAD_VOTE_DUE_BPS` into the slot, the head vote deadline
+    /// (`get_head_vote_due_ms`), which is the instant the beacon node computes
+    /// the head vote data for.
+    pub fn head_vote_time(&self, slot: Slot) -> SystemTime {
+        self.offset_into(slot, self.config.head_vote_due_bps)
+    }
+
+    /// When an FG attester of `slot` attests (EIP-8453): `SUPPORT_CUTOFF_BPS`
+    /// into the slot. The specification leaves the FG attestation deadline a
+    /// TODO; the support cutoff is the first instant the beacon node's fork
+    /// choice answers `get_ac_frame`, the observation the attestation's source
+    /// and head come from.
+    pub fn fg_attestation_time(&self, slot: Slot) -> SystemTime {
+        self.offset_into(slot, self.config.support_cutoff_bps)
+    }
+
+    /// The instant a proposal for `slot` must be done by: the head vote
+    /// deadline at an EIP-8453 slot, the attester offset before it. Either is
+    /// the point the slot's voters stop waiting for its block.
+    pub fn proposal_deadline(&self, slot: Slot) -> SystemTime {
+        if self.is_eip8453(slot) {
+            self.head_vote_time(slot)
+        } else {
+            self.attestation_time(slot)
+        }
     }
 
     /// The slot containing `now`, or `None` before genesis.
@@ -304,6 +338,30 @@ impl SlotClock {
             .unwrap_or(Duration::ZERO)
     }
 
+    /// How long from `now` until the head vote for `slot`, or zero once that
+    /// instant has passed.
+    pub fn until_head_vote(&self, slot: Slot, now: SystemTime) -> Duration {
+        self.head_vote_time(slot)
+            .duration_since(now)
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// How long from `now` until the FG attestation for `slot`, or zero once
+    /// that instant has passed.
+    pub fn until_fg_attestation(&self, slot: Slot, now: SystemTime) -> Duration {
+        self.fg_attestation_time(slot)
+            .duration_since(now)
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// How long from `now` until the proposal for `slot` must be done, or zero
+    /// once that instant has passed. The budget a proposal gets.
+    pub fn until_proposal_deadline(&self, slot: Slot, now: SystemTime) -> Duration {
+        self.proposal_deadline(slot)
+            .duration_since(now)
+            .unwrap_or(Duration::ZERO)
+    }
+
     /// How long from `now` until the sync committee message for `slot`, or zero
     /// once that instant has passed.
     pub fn until_sync_message(&self, slot: Slot, now: SystemTime) -> Duration {
@@ -327,8 +385,13 @@ impl SlotClock {
     /// duties. Sleeping on the attestation alone would hold a sync message
     /// back when the network moves it earlier (gloas does).
     pub fn until_first_slot_duty(&self, slot: Slot, now: SystemTime) -> Duration {
-        self.until_attestation(slot, now)
-            .min(self.until_sync_message(slot, now))
+        // At an EIP-8453 slot the head vote is the first vote in it.
+        let vote = if self.is_eip8453(slot) {
+            self.until_head_vote(slot, now)
+        } else {
+            self.until_attestation(slot, now)
+        };
+        vote.min(self.until_sync_message(slot, now))
     }
 
     /// The next slot to serve, given the last one served, and how long until
@@ -880,6 +943,39 @@ mod tests {
         assert_eq!(
             clock.until_first_slot_duty(5, start + Duration::from_secs(10)),
             Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn eip8453_votes_at_the_head_vote_deadline_and_the_support_cutoff() {
+        let mut config = Config::mainnet()
+            .with_fork_epoch(ForkName::Gloas, 0)
+            .with_fork_epoch(ForkName::Heze, 0)
+            .with_fork_epoch(ForkName::Eip8453, 2);
+        config.slot_duration_ms_heze = 12_000;
+        let clock = SlotClock::from_config(GENESIS, &config);
+        let last_heze = 2 * SLOTS_PER_EPOCH - 1;
+        let first = 2 * SLOTS_PER_EPOCH;
+        assert!(!clock.is_eip8453(last_heze));
+        assert!(clock.is_eip8453(first));
+        assert!(clock.is_heze(first), "inclusion lists continue");
+        let into = |t: SystemTime| t.duration_since(clock.start_of(first)).expect("after");
+        assert_eq!(into(clock.head_vote_time(first)), Duration::from_secs(3));
+        assert_eq!(
+            into(clock.fg_attestation_time(first)),
+            Duration::from_secs(6)
+        );
+        // A proposal is due by the head vote deadline, and the first vote of
+        // the slot is the head vote.
+        assert_eq!(into(clock.proposal_deadline(first)), Duration::from_secs(3));
+        assert_eq!(
+            clock.until_first_slot_duty(first, clock.start_of(first)),
+            Duration::from_secs(3).min(clock.until_sync_message(first, clock.start_of(first)))
+        );
+        // Before the fork the attester offset still bounds a proposal.
+        assert_eq!(
+            clock.proposal_deadline(last_heze),
+            clock.attestation_time(last_heze)
         );
     }
 

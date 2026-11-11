@@ -75,6 +75,46 @@ pub(crate) fn write_private_no_symlink(
     std::fs::write(path, contents)
 }
 
+/// Replace the file at `path` with `contents` atomically and durably, at mode
+/// `0600` on unix: written to a `.tmp` sibling, flushed to disk, renamed over
+/// `path`, and the directory flushed so the rename itself survives a crash.
+///
+/// For a record that must be on disk before the action it guards, as an
+/// EIP-8453 finality signing record must be before its signature: a reader
+/// after a crash sees either the old record or the new one, never a torn or
+/// lost write.
+pub(crate) fn write_private_durable(
+    path: &Path,
+    contents: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(contents.as_ref())?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    {
+        let dir = path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

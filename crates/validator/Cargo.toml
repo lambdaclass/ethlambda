@@ -12,6 +12,10 @@ version.workspace = true
 [dependencies]
 ethlambda-types.workspace = true
 ethlambda-metrics.workspace = true
+# EIP-8453: the validator's `FinalitySigningRecord` and the selection rules
+# that read it (`get_finality_attestation_data`), reused rather than copied.
+# Depends only on `ethlambda-types`, `serde` and `thiserror`.
+ethlambda-decoupled.workspace = true
 
 # A produced block is decoded and re-published as SSZ, not JSON: signing it
 # needs its `hash_tree_root`, which only the typed container can give. See

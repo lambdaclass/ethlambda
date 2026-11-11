@@ -175,6 +175,46 @@ static PAYLOAD_ATTESTATION_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(
     .unwrap()
 });
 
+static HEAD_VOTES_PUBLISHED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_head_votes_published_total",
+        "EIP-8453 head votes the beacon node accepted"
+    )
+    .unwrap()
+});
+
+static HEAD_VOTE_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_head_vote_failures_total",
+        "Slots whose EIP-8453 head vote duty did not result in published votes"
+    )
+    .unwrap()
+});
+
+static FG_ATTESTATIONS_PUBLISHED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_fg_attestations_published_total",
+        "EIP-8453 finality gadget attestations the beacon node accepted"
+    )
+    .unwrap()
+});
+
+static FG_ATTESTATION_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_fg_attestation_failures_total",
+        "Slots whose EIP-8453 FG attestation duty did not result in published attestations"
+    )
+    .unwrap()
+});
+
+static FG_ATTESTATIONS_SUPPRESSED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_fg_attestations_suppressed_total",
+        "EIP-8453 FG attestation duties the finality signing record suppressed"
+    )
+    .unwrap()
+});
+
 static INCLUSION_LISTS_PUBLISHED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "ethlambda_validator_inclusion_lists_published_total",
@@ -338,6 +378,11 @@ pub fn init() {
     LazyLock::force(&ENVELOPE_FAILURES_TOTAL);
     LazyLock::force(&PAYLOAD_ATTESTATIONS_PUBLISHED_TOTAL);
     LazyLock::force(&PAYLOAD_ATTESTATION_FAILURES_TOTAL);
+    LazyLock::force(&HEAD_VOTES_PUBLISHED_TOTAL);
+    LazyLock::force(&HEAD_VOTE_FAILURES_TOTAL);
+    LazyLock::force(&FG_ATTESTATIONS_PUBLISHED_TOTAL);
+    LazyLock::force(&FG_ATTESTATION_FAILURES_TOTAL);
+    LazyLock::force(&FG_ATTESTATIONS_SUPPRESSED_TOTAL);
     LazyLock::force(&INCLUSION_LISTS_PUBLISHED_TOTAL);
     LazyLock::force(&INCLUSION_LIST_FAILURES_TOTAL);
     LazyLock::force(&SYNC_COMMITTEE_MESSAGES_PUBLISHED_TOTAL);
@@ -416,6 +461,26 @@ pub fn inc_payload_attestations_published(count: u64) {
 
 pub fn inc_payload_attestation_failures() {
     PAYLOAD_ATTESTATION_FAILURES_TOTAL.inc();
+}
+
+pub fn inc_head_votes_published(count: u64) {
+    HEAD_VOTES_PUBLISHED_TOTAL.inc_by(count);
+}
+
+pub fn inc_head_vote_failures() {
+    HEAD_VOTE_FAILURES_TOTAL.inc();
+}
+
+pub fn inc_fg_attestations_published(count: u64) {
+    FG_ATTESTATIONS_PUBLISHED_TOTAL.inc_by(count);
+}
+
+pub fn inc_fg_attestation_failures() {
+    FG_ATTESTATION_FAILURES_TOTAL.inc();
+}
+
+pub fn inc_fg_attestations_suppressed() {
+    FG_ATTESTATIONS_SUPPRESSED_TOTAL.inc();
 }
 
 pub fn inc_inclusion_lists_published(count: u64) {

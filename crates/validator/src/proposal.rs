@@ -890,6 +890,61 @@ mod gloas_tests {
         );
     }
 
+    /// An EIP-8453 block goes through the same flow: produced under its own
+    /// fork, published bare under the `eip8453` header as EIP-8453's signed
+    /// block, then its envelope.
+    #[tokio::test]
+    async fn an_eip8453_block_is_published_and_then_its_envelope() {
+        use ethlambda_types::beacon::containers::eip8453;
+        let (store, pubkey) = store();
+        let node = Arc::new(MockBeaconNode::new().with_gloas_block(
+            slot(),
+            7,
+            BUILDER_INDEX_SELF_BUILD,
+            true,
+        ));
+        let context = Arc::new(SigningContext {
+            config: Config::mainnet()
+                .with_fork_epoch(ForkName::Gloas, 0)
+                .with_fork_epoch(ForkName::Heze, 0)
+                .with_fork_epoch(ForkName::Eip8453, GLOAS_EPOCH),
+            genesis_validators_root: Root::ZERO,
+        });
+        let settings = ProposerSettings::new(Default::default(), None);
+        let service = ProposalService::new(node.clone(), context.clone(), Arc::new(settings));
+
+        let published = service
+            .propose(slot(), &duty(&pubkey), &store)
+            .await
+            .expect("proposes");
+        assert_eq!(published, Published::Imported);
+        assert_eq!(node.block_requests().remove(0).fork, ForkName::Eip8453);
+
+        let blocks = node.published_blocks();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].0, ForkName::Eip8453);
+        let signed = eip8453::SignedBeaconBlock::from_ssz_bytes(&blocks[0].1)
+            .expect("the body is a bare EIP-8453 signed block");
+        let block_root = signed.message.hash_tree_root();
+        assert!(verifies(
+            &pubkey,
+            &signed.signature.0,
+            context.block_signing_root(block_root, slot())
+        ));
+
+        let envelopes = node.published_envelopes();
+        assert_eq!(envelopes.len(), 1);
+        let contents = SignedExecutionPayloadEnvelopeContents::from_ssz_bytes(&envelopes[0].0)
+            .expect("the body is the signed envelope contents");
+        let envelope = &contents.signed_execution_payload_envelope;
+        assert_eq!(envelope.message.beacon_block_root, block_root);
+        assert!(verifies(
+            &pubkey,
+            &envelope.signature.0,
+            context.envelope_signing_root(&envelope.message, slot())
+        ));
+    }
+
     /// A validator's own graffiti reaches a gloas block request too, as it does
     /// a fulu one: the settings are read before the fork is looked at.
     #[tokio::test]

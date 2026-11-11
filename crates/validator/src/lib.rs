@@ -23,6 +23,12 @@
 //!
 //! [`docs/spec_deviations.md`]: https://github.com/lambdaclass/ethlambda/blob/main/docs/spec_deviations.md
 //!
+//! The one exception is EIP-8453's `FinalitySigningRecord`, which the
+//! specification makes protocol state rather than protection: it decides
+//! whether the next FG vote at a height is a target vote or a timeout, and
+//! must survive restarts. [`crate::finality_record`] keeps one per key on disk
+//! and writes it before every FG attestation is signed.
+//!
 //! The keymanager API is affected by the same decision. Its specification makes
 //! `slashing_protection` a required field of the `DELETE /eth/v1/keystores`
 //! response, so this implementation returns a well-formed but empty EIP-3076
@@ -35,7 +41,9 @@ pub mod attestation;
 pub mod attestation_guard;
 pub mod beacon_node;
 pub mod duties;
+pub mod eip8453;
 pub mod error;
+pub mod finality_record;
 pub mod http_api;
 pub mod inclusion_list;
 pub mod keys;
@@ -69,6 +77,8 @@ use crate::beacon_node::dto::ProposerPreparationDto;
 use crate::beacon_node::fallback::FallbackBeaconNode;
 use crate::beacon_node::http::HttpBeaconNode;
 use crate::duties::DutiesService;
+use crate::eip8453::{FgAttestationService, HeadVoteService};
+use crate::finality_record::FinalitySigningRecords;
 use crate::inclusion_list::InclusionListService;
 use crate::keys::ValidatorStore;
 use crate::payload_attestation::PayloadAttestationService;
@@ -118,7 +128,8 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
          previous run, or another client holding these keys, already signed. Running the same \
          keys here and anywhere else, or restarting into a state where the chain has moved, can \
          produce a slashable double vote or a double block proposal. Do not use these keys in \
-         any other client while this one runs. See docs/spec_deviations.md."
+         any other client while this one runs. (EIP-8453's finality signing records are the \
+         exception: they are kept on disk.) See docs/spec_deviations.md."
     );
 
     // Said at startup for the same reason the warning above is: an operator
@@ -201,8 +212,20 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         genesis_validators_root: genesis.genesis_validators_root,
     });
 
-    let mut duties = DutiesService::new(beacon_node.clone(), Vec::new());
+    let mut duties = DutiesService::new(beacon_node.clone(), Vec::new())
+        .with_eip8453_fork_epoch(context.config.eip8453_fork_epoch);
     let attestation = AttestationService::new(beacon_node.clone(), context.clone());
+    let finality_records = Arc::new(FinalitySigningRecords::in_validators_dir(
+        &config.validators_dir,
+    ));
+    let eip8453 = Eip8453Services {
+        head_vote: HeadVoteService::new(beacon_node.clone(), context.clone()),
+        fg_attestation: FgAttestationService::new(
+            beacon_node.clone(),
+            context.clone(),
+            finality_records,
+        ),
+    };
     let aggregation = AggregationService::new(beacon_node.clone(), context.clone());
     let payload_attestation = PayloadAttestationService::new(beacon_node.clone(), context.clone());
     let inclusion_list = InclusionListService::new(beacon_node.clone(), context.clone());
@@ -324,15 +347,21 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         let committee = duties.ptc_at_slot(slot, epoch);
         let sync_duties = duties.sync_at_slot(slot);
         let inclusion_lists = duties.inclusion_lists_at_slot(slot, epoch);
+        let eip8453_duties = Eip8453SlotDuties {
+            head_voters: duties.head_votes_at_slot(slot, epoch),
+            attesters: duties.attestation_committees_at_slot(slot, epoch),
+        };
         serve_slot_duties(
             &attestation,
             &aggregation,
             &payload_attestation,
             &sync_committee,
             &inclusion_list,
+            &eip8453,
             &clock,
             slot,
             &slot_duties,
+            &eip8453_duties,
             &committee,
             &sync_duties,
             inclusion_lists.as_ref(),
@@ -342,8 +371,22 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     }
 }
 
+/// EIP-8453's two duty services.
+struct Eip8453Services<B> {
+    head_vote: HeadVoteService<B>,
+    fg_attestation: FgAttestationService<B>,
+}
+
+/// This client's EIP-8453 duties in one slot.
+#[derive(Default)]
+struct Eip8453SlotDuties {
+    head_voters: Vec<crate::beacon_node::dto::HeadVoteDutyDto>,
+    attesters: Vec<crate::beacon_node::dto::AttestationCommitteeDutyDto>,
+}
+
 /// Everything a slot owes after its proposal: attest and aggregate, then the
-/// payload timeliness committee vote.
+/// payload timeliness committee vote. At an EIP-8453 slot, the head vote and
+/// the FG attestation take the attestation's and the aggregate's place.
 ///
 /// The two halves are independent on purpose. Committee membership is drawn
 /// separately from attester duties, so a client can sit on a slot's committee
@@ -365,9 +408,11 @@ async fn serve_slot_duties<B: BeaconNodeApi>(
     payload_attestation: &PayloadAttestationService<B>,
     sync_committee: &SyncCommitteeService<B>,
     inclusion_list: &InclusionListService<B>,
+    eip8453: &Eip8453Services<B>,
     clock: &SlotClock,
     slot: u64,
     slot_duties: &[crate::beacon_node::dto::AttesterDutyDto],
+    eip8453_duties: &Eip8453SlotDuties,
     committee: &[crate::beacon_node::dto::PtcDutyDto],
     sync_duties: &[crate::beacon_node::dto::SyncDutyDto],
     inclusion_lists: Option<&(Root, Vec<crate::beacon_node::dto::InclusionListDutyDto>)>,
@@ -377,7 +422,10 @@ async fn serve_slot_duties<B: BeaconNodeApi>(
     // than after it: its deadline is not ordered against theirs (gloas moves
     // it before the attestation) and each is bounded by the slot on its own.
     let attest_then_ptc = async {
-        if !slot_duties.is_empty() {
+        if clock.is_eip8453(slot) {
+            // The legacy attestation and its aggregation stop at EIP-8453.
+            eip8453_votes(eip8453, clock, slot, eip8453_duties, store).await;
+        } else if !slot_duties.is_empty() {
             tokio::time::sleep(clock.until_attestation(slot, SystemTime::now())).await;
             attest_and_aggregate(attestation, aggregation, clock, slot, slot_duties, store).await;
         }
@@ -392,6 +440,68 @@ async fn serve_slot_duties<B: BeaconNodeApi>(
         sync_committee_duty(sync_committee, clock, slot, sync_duties, store),
         inclusion_list_duty(inclusion_list, clock, slot, inclusion_lists, store),
     );
+}
+
+/// Run one EIP-8453 slot's two votes: the head vote at the head vote
+/// deadline, then the FG attestation at the support cutoff.
+///
+/// Each is bounded by the end of the slot, as the attestation is: a head vote
+/// counts only for its own slot, and an FG attestation only until the next
+/// round's committee slot, so work past the slot competes with the next one's.
+/// Abandoning either is safe: the head vote is recorded before signing, and
+/// the FG attestation's record is on disk before signing, so a dropped call is
+/// lost rather than re-signed differently. Failures are logged and counted.
+async fn eip8453_votes<B: BeaconNodeApi>(
+    services: &Eip8453Services<B>,
+    clock: &SlotClock,
+    slot: u64,
+    duties: &Eip8453SlotDuties,
+    store: &RwLock<ValidatorStore>,
+) {
+    if !duties.head_voters.is_empty() {
+        tokio::time::sleep(clock.until_head_vote(slot, SystemTime::now())).await;
+        let budget = clock.remaining_in(slot, SystemTime::now());
+        let vote = services.head_vote.vote(slot, &duties.head_voters, store);
+        match tokio::time::timeout(budget, vote).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
+                error!(%slot, %err, "Failed to publish this slot's head votes");
+                metrics::inc_head_vote_failures();
+                metrics::set_beacon_node_available(false);
+            }
+            Err(_) => {
+                warn!(
+                    %slot,
+                    budget_ms = budget.as_millis() as u64,
+                    "Head vote duty ran past the end of its slot and was abandoned"
+                );
+                metrics::inc_head_vote_failures();
+            }
+        }
+    }
+    if !duties.attesters.is_empty() {
+        tokio::time::sleep(clock.until_fg_attestation(slot, SystemTime::now())).await;
+        let budget = clock.remaining_in(slot, SystemTime::now());
+        let attest = services
+            .fg_attestation
+            .attest(slot, &duties.attesters, store);
+        match tokio::time::timeout(budget, attest).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
+                error!(%slot, %err, "Failed to publish this slot's FG attestations");
+                metrics::inc_fg_attestation_failures();
+                metrics::set_beacon_node_available(false);
+            }
+            Err(_) => {
+                warn!(
+                    %slot,
+                    budget_ms = budget.as_millis() as u64,
+                    "FG attestation duty ran past the end of its slot and was abandoned"
+                );
+                metrics::inc_fg_attestation_failures();
+            }
+        }
+    }
 }
 
 /// Run one slot's inclusion list committee duty (heze), bounded by the
@@ -692,7 +802,7 @@ async fn propose<B: BeaconNodeApi>(
     duty: &crate::beacon_node::dto::ProposerDutyDto,
     store: &RwLock<ValidatorStore>,
 ) {
-    let budget = clock.until_attestation(slot, SystemTime::now());
+    let budget = clock.until_proposal_deadline(slot, SystemTime::now());
     let attempt = tokio::time::timeout(budget, proposal.propose(slot, duty, store));
     match attempt.await {
         Ok(Ok(_)) => {
@@ -798,6 +908,7 @@ async fn refresh_epoch<B: BeaconNodeApi>(
     let changed = duties.refresh_around(epoch).await?;
     refresh_ptc(duties, epoch, context).await;
     refresh_inclusion_lists(duties, epoch, context).await;
+    refresh_eip8453(duties, epoch, context).await;
     refresh_sync(beacon_node, duties, epoch, context).await;
     metrics::set_duties_held(duties.all().len() as u64);
     if changed {
@@ -846,7 +957,8 @@ async fn refresh_inclusion_lists<B: BeaconNodeApi>(
     context: &SigningContext,
 ) {
     for target in [epoch, epoch + 1] {
-        if context.config.fork_at_epoch(target) != ethlambda_types::beacon::fork::ForkName::Heze {
+        // EIP-8453 keeps heze's inclusion lists.
+        if context.config.fork_at_epoch(target) < ethlambda_types::beacon::fork::ForkName::Heze {
             continue;
         }
         if let Err(err) = duties.refresh_inclusion_lists(target).await {
@@ -858,6 +970,39 @@ async fn refresh_inclusion_lists<B: BeaconNodeApi>(
         }
     }
     duties.prune_inclusion_lists_before(epoch);
+}
+
+/// Fetch the EIP-8453 attestation committee and head vote schedules for this
+/// epoch and the next, each only if it is an EIP-8453 epoch.
+///
+/// Gated per epoch, and its failures shrugged off, for the reasons
+/// [`refresh_ptc`] gives. No subnet subscription follows: under an EIP-8453
+/// digest the node holds every attestation subnet already.
+async fn refresh_eip8453<B: BeaconNodeApi>(
+    duties: &mut DutiesService<B>,
+    epoch: u64,
+    context: &SigningContext,
+) {
+    for target in [epoch, epoch + 1] {
+        if context.config.fork_at_epoch(target) < ethlambda_types::beacon::fork::ForkName::Eip8453 {
+            continue;
+        }
+        if let Err(err) = duties.refresh_attestation_committees(target).await {
+            warn!(
+                epoch = target,
+                %err,
+                "Attestation committee duties fetch failed; this client may miss its FG attestations"
+            );
+        }
+        if let Err(err) = duties.refresh_head_votes(target).await {
+            warn!(
+                epoch = target,
+                %err,
+                "Head vote duties fetch failed; this client may miss its head votes"
+            );
+        }
+    }
+    duties.prune_eip8453_before(epoch);
 }
 
 /// How many epochs before a period boundary the next period's subnets are
@@ -958,6 +1103,23 @@ mod tests {
 
     fn empty_store() -> RwLock<ValidatorStore> {
         RwLock::new(ValidatorStore::new())
+    }
+
+    /// EIP-8453 services over `node`, for a slot test with no EIP-8453 duty:
+    /// their records directory is never written.
+    fn eip8453_services(
+        node: &Arc<MockBeaconNode>,
+        context: &Arc<SigningContext>,
+    ) -> Eip8453Services<MockBeaconNode> {
+        let records = FinalitySigningRecords::new(std::env::temp_dir().join("unused-records"));
+        Eip8453Services {
+            head_vote: HeadVoteService::new(node.clone(), context.clone()),
+            fg_attestation: FgAttestationService::new(
+                node.clone(),
+                context.clone(),
+                Arc::new(records),
+            ),
+        }
     }
 
     fn settings(fee_recipient: Option<ExecutionAddress>) -> ProposerSettings {
@@ -1288,9 +1450,11 @@ mod tests {
             &PayloadAttestationService::new(node.clone(), context.clone()),
             &SyncCommitteeService::new(node.clone(), context.clone()),
             &InclusionListService::new(node.clone(), context.clone()),
+            &eip8453_services(&node, &context),
             &clock,
             slot,
             &[],
+            &Eip8453SlotDuties::default(),
             &committee,
             &[],
             None,
@@ -1414,9 +1578,11 @@ mod tests {
             &PayloadAttestationService::new(node.clone(), context.clone()),
             &SyncCommitteeService::new(node.clone(), context.clone()),
             &InclusionListService::new(node.clone(), context.clone()),
+            &eip8453_services(&node, &context),
             &clock,
             slot,
             &[],
+            &Eip8453SlotDuties::default(),
             &[],
             &[],
             Some(&assignment),
@@ -1452,9 +1618,11 @@ mod tests {
             &PayloadAttestationService::new(node.clone(), context.clone()),
             &SyncCommitteeService::new(node.clone(), context.clone()),
             &InclusionListService::new(node.clone(), context.clone()),
+            &eip8453_services(&node, &context),
             &clock,
             5,
             &[],
+            &Eip8453SlotDuties::default(),
             &[],
             &[],
             Some(&assignment),
@@ -1591,9 +1759,11 @@ mod tests {
             &PayloadAttestationService::new(node.clone(), context.clone()),
             &SyncCommitteeService::new(node.clone(), context.clone()),
             &InclusionListService::new(node.clone(), context.clone()),
+            &eip8453_services(&node, &context),
             &clock,
             slot,
             &[],
+            &Eip8453SlotDuties::default(),
             &[],
             &duties,
             None,
@@ -1629,9 +1799,11 @@ mod tests {
             &PayloadAttestationService::new(node.clone(), context.clone()),
             &SyncCommitteeService::new(node.clone(), context.clone()),
             &InclusionListService::new(node.clone(), context.clone()),
+            &eip8453_services(&node, &context),
             &clock,
             5,
             &[],
+            &Eip8453SlotDuties::default(),
             &[ptc_duty(3, 5)],
             &[],
             None,
@@ -1639,5 +1811,204 @@ mod tests {
         )
         .await;
         assert_eq!(node.payload_attestation_data_call_count(), 0);
+    }
+    // ---- EIP-8453 -------------------------------------------------------
+
+    fn eip8453_context(epoch: u64) -> SigningContext {
+        use ethlambda_types::beacon::fork::ForkName;
+        SigningContext {
+            config: ethlambda_types::beacon::config::Config::mainnet()
+                .with_fork_epoch(ForkName::Gloas, 0)
+                .with_fork_epoch(ForkName::Heze, 0)
+                .with_fork_epoch(ForkName::Eip8453, epoch),
+            genesis_validators_root: Root::ZERO,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_eip8453_epoch_fetches_its_two_schedules_and_no_attester_duties() {
+        use crate::beacon_node::dto::{AttestationCommitteeDutyDto, HeadVoteDutyDto};
+        let first = 4 * ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+        let node = Arc::new(
+            node()
+                .with_attestation_committee_duties(
+                    4,
+                    Root::repeat_byte(1),
+                    vec![AttestationCommitteeDutyDto {
+                        pubkey: crate::beacon_node::dto::encode_hex(&pubkey(1).0),
+                        validator_index: 11,
+                        committee_index: 5,
+                        committee_length: 2,
+                        validator_committee_index: 0,
+                        slots: vec![first, first + 8],
+                    }],
+                )
+                .with_head_vote_duties(
+                    4,
+                    Root::repeat_byte(1),
+                    vec![HeadVoteDutyDto {
+                        pubkey: crate::beacon_node::dto::encode_hex(&pubkey(2).0),
+                        validator_index: 22,
+                        slots: vec![first + 3],
+                    }],
+                ),
+        );
+        let mut duties = DutiesService::new(node.clone(), Vec::new()).with_eip8453_fork_epoch(4);
+        let keys = [pubkey(1), pubkey(2)];
+        refresh_epoch(
+            &node,
+            &mut duties,
+            &keys,
+            3,
+            &settings(None),
+            &empty_store(),
+            &eip8453_context(4),
+        )
+        .await
+        .expect("refreshes");
+        assert_eq!(
+            node.duties_call_count(),
+            1,
+            "attester duties for epoch 3 only: epoch 4 has no beacon committees"
+        );
+        assert_eq!(*node.attestation_committee_calls.lock().unwrap(), vec![4]);
+        assert_eq!(*node.head_vote_duty_calls.lock().unwrap(), vec![4]);
+        assert_eq!(duties.attestation_committees_at_slot(first, 4).len(), 1);
+        assert_eq!(duties.attestation_committees_at_slot(first + 8, 4).len(), 1);
+        assert!(
+            duties
+                .attestation_committees_at_slot(first + 1, 4)
+                .is_empty()
+        );
+        assert_eq!(duties.head_votes_at_slot(first + 3, 4).len(), 1);
+        assert!(duties.at_slot(first, 4).is_empty());
+
+        // Before the fork is scheduled, neither is asked for.
+        let node = Arc::new(node_without_ptc());
+        let mut duties = DutiesService::new(node.clone(), Vec::new());
+        refresh_epoch(
+            &node,
+            &mut duties,
+            &keys,
+            3,
+            &settings(None),
+            &empty_store(),
+            &context(),
+        )
+        .await
+        .expect("refreshes");
+        assert!(node.attestation_committee_calls.lock().unwrap().is_empty());
+        assert!(node.head_vote_duty_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_eip8453_slot_votes_and_attests_through_the_gadget_and_not_the_legacy_way() {
+        use crate::beacon_node::dto::{
+            AttestationCommitteeDutyDto, FinalityAttestationInputDto, HeadVoteDutyDto,
+        };
+        use crate::beacon_node::mock::MockBeaconNode;
+        use ethlambda_types::beacon::containers::eip8453;
+
+        let mut config = eip8453_context(0).config;
+        config.slot_duration_ms = 1_000;
+        config.slot_duration_ms_heze = 1_000;
+        let context = Arc::new(SigningContext {
+            config: config.clone(),
+            genesis_validators_root: Root::ZERO,
+        });
+        let now_secs = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_secs();
+        let clock = SlotClock::from_config(now_secs - 100, &config);
+        let slot = clock.now().expect("after genesis") + 1;
+
+        let mut store = ValidatorStore::new();
+        let secret: [u8; 32] =
+            hex::decode("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+                .expect("hex")
+                .try_into()
+                .expect("32 bytes");
+        let key = store.insert_secret("test", &secret).expect("inserts");
+        let store = RwLock::new(store);
+        let pubkey = crate::beacon_node::dto::encode_hex(&key.0);
+
+        let node = Arc::new(MockBeaconNode::new());
+        node.set_head_vote_data(eip8453::HeadVoteData {
+            slot,
+            beacon_block_root: Root::repeat_byte(5),
+            payload_status: 0,
+        });
+        node.set_finality_attestation_input(Some(FinalityAttestationInputDto {
+            target: eip8453::HeightCheckpoint {
+                height: 3,
+                root: Root::repeat_byte(6),
+            },
+            justified: eip8453::HeightCheckpoint::empty(),
+            finalized_height: 1,
+        }));
+        let records = tempfile::tempdir().expect("temp dir");
+        let services = Eip8453Services {
+            head_vote: HeadVoteService::new(node.clone(), context.clone()),
+            fg_attestation: FgAttestationService::new(
+                node.clone(),
+                context.clone(),
+                Arc::new(FinalitySigningRecords::in_validators_dir(records.path())),
+            ),
+        };
+        let eip8453_duties = Eip8453SlotDuties {
+            head_voters: vec![HeadVoteDutyDto {
+                pubkey: pubkey.clone(),
+                validator_index: 3,
+                slots: vec![slot],
+            }],
+            attesters: vec![AttestationCommitteeDutyDto {
+                pubkey: pubkey.clone(),
+                validator_index: 3,
+                committee_index: 9,
+                committee_length: 1,
+                validator_committee_index: 0,
+                slots: vec![slot],
+            }],
+        };
+        // A legacy attester duty too, which an EIP-8453 slot must not serve.
+        let legacy = [crate::beacon_node::dto::AttesterDutyDto {
+            pubkey,
+            validator_index: 3,
+            committee_index: 0,
+            committee_length: 1,
+            committees_at_slot: 1,
+            validator_committee_index: 0,
+            slot,
+        }];
+
+        serve_slot_duties(
+            &AttestationService::new(node.clone(), context.clone()),
+            &AggregationService::new(node.clone(), context.clone()),
+            &PayloadAttestationService::new(node.clone(), context.clone()),
+            &SyncCommitteeService::new(node.clone(), context.clone()),
+            &InclusionListService::new(node.clone(), context.clone()),
+            &services,
+            &clock,
+            slot,
+            &legacy,
+            &eip8453_duties,
+            &[],
+            &[],
+            None,
+            &store,
+        )
+        .await;
+
+        assert_eq!(
+            node.attestation_data_call_count(),
+            0,
+            "no legacy attestation"
+        );
+        assert_eq!(node.submitted_head_votes.lock().unwrap().len(), 1);
+        let attestations = node.submitted_fg_attestations.lock().unwrap().clone();
+        assert_eq!(attestations.len(), 1);
+        assert_eq!(attestations[0].committee_index, 9);
+        assert_eq!(attestations[0].data.target.height, 3);
     }
 }

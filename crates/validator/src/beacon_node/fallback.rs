@@ -10,6 +10,7 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::altair;
+use ethlambda_types::beacon::containers::eip8453;
 use ethlambda_types::beacon::containers::gloas;
 use ethlambda_types::beacon::containers::heze;
 use ethlambda_types::beacon::containers::shared::AttestationData;
@@ -19,12 +20,13 @@ use tracing::{debug, warn};
 
 use crate::beacon_node::block_contents::ProducedBlock;
 use crate::beacon_node::dto::{
-    CommitteeSubscriptionDto, ProposerPreparationDto, SingleAttestationDto,
-    SyncCommitteeSubscriptionDto, SyncDutyDto,
+    CommitteeSubscriptionDto, FinalityAttestationInputDto, ProposerPreparationDto,
+    SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto,
 };
 use crate::beacon_node::{
-    AggregateAttestation, AttesterDuties, BeaconNodeApi, BlockRequest, Genesis,
-    InclusionListDuties, ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorEntry,
+    AggregateAttestation, AttestationCommitteeDuties, AttesterDuties, BeaconNodeApi, BlockRequest,
+    Genesis, HeadVoteDuties, InclusionListDuties, ProposerDuties, PtcDuties, Published,
+    SignedAggregates, ValidatorEntry,
 };
 use crate::error::{Error, Result};
 
@@ -305,6 +307,60 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
     ) -> Result<usize> {
         self.try_each("submit_payload_attestations", |node| {
             node.submit_payload_attestations(messages)
+        })
+        .await
+    }
+
+    async fn attestation_committee_duties(
+        &self,
+        epoch: Epoch,
+        indices: &[ValidatorIndex],
+    ) -> Result<AttestationCommitteeDuties> {
+        self.try_each("attestation_committee_duties", |node| {
+            node.attestation_committee_duties(epoch, indices)
+        })
+        .await
+    }
+
+    async fn head_vote_duties(
+        &self,
+        epoch: Epoch,
+        indices: &[ValidatorIndex],
+    ) -> Result<HeadVoteDuties> {
+        self.try_each("head_vote_duties", |node| {
+            node.head_vote_duties(epoch, indices)
+        })
+        .await
+    }
+
+    async fn head_vote_data(&self, slot: Slot) -> Result<eip8453::HeadVoteData> {
+        self.try_each("head_vote_data", |node| node.head_vote_data(slot))
+            .await
+    }
+
+    /// A 204 ends the walk, as `payload_attestation_data`'s does: a node with
+    /// no FG source at the support cutoff is one not to attest through.
+    async fn finality_attestation_input(
+        &self,
+        slot: Slot,
+    ) -> Result<Option<FinalityAttestationInputDto>> {
+        self.try_each("finality_attestation_input", |node| {
+            node.finality_attestation_input(slot)
+        })
+        .await
+    }
+
+    async fn submit_head_votes(&self, messages: &[eip8453::HeadVoteMessage]) -> Result<usize> {
+        self.try_each("submit_head_votes", |node| node.submit_head_votes(messages))
+            .await
+    }
+
+    async fn submit_fg_attestations(
+        &self,
+        attestations: &[eip8453::SingleAttestation],
+    ) -> Result<usize> {
+        self.try_each("submit_fg_attestations", |node| {
+            node.submit_fg_attestations(attestations)
         })
         .await
     }

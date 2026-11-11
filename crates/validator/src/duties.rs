@@ -30,6 +30,13 @@
 //! Inclusion list committee duties, which exist from heze, are held the same
 //! way in a fourth map, with their `dependent_root` kept beside them: a
 //! member's list names that root, so it is handed out with the duties.
+//!
+//! EIP-8453 replaces the attester schedule: an EIP-8453 epoch has no beacon
+//! committees, so [`DutiesService::refresh`] fetches nothing for one (the
+//! service is told where the fork is, [`DutiesService::with_eip8453_fork_epoch`])
+//! and the two duties that take its place, the attestation committee (one an
+//! epoch, attesting once a round) and the head vote committee, are held in
+//! two more maps on the PTC's terms.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,7 +48,8 @@ use tracing::{info, warn};
 
 use crate::beacon_node::BeaconNodeApi;
 use crate::beacon_node::dto::{
-    AttesterDutyDto, InclusionListDutyDto, ProposerDutyDto, PtcDutyDto, SyncDutyDto,
+    AttestationCommitteeDutyDto, AttesterDutyDto, HeadVoteDutyDto, InclusionListDutyDto,
+    ProposerDutyDto, PtcDutyDto, SyncDutyDto,
 };
 use crate::error::Result;
 
@@ -74,6 +82,13 @@ pub struct DutiesService<B> {
     /// with no `dependent_root` because the endpoint sends none: the committee
     /// is fixed a period ahead, so each refresh simply replaces what is held.
     sync: HashMap<u64, Vec<SyncDutyDto>>,
+    /// EIP-8453 attestation committee duties, already narrowed to `indices`.
+    attestation_committees: HashMap<Epoch, EpochDuties<AttestationCommitteeDutyDto>>,
+    /// EIP-8453 head vote committee duties, already narrowed to `indices`.
+    head_votes: HashMap<Epoch, EpochDuties<HeadVoteDutyDto>>,
+    /// `EIP8453_FORK_EPOCH`: attester duties are fetched for earlier epochs
+    /// only. `FAR_FUTURE_EPOCH` unless told otherwise.
+    eip8453_fork_epoch: Epoch,
     /// Whether the "no validator indices resolved" warning has already fired.
     /// Without this, an idle client would repeat it every epoch forever; with
     /// it, the operator still gets exactly one signal that duties are not
@@ -91,8 +106,18 @@ impl<B: BeaconNodeApi> DutiesService<B> {
             ptc: HashMap::new(),
             inclusion_lists: HashMap::new(),
             sync: HashMap::new(),
+            attestation_committees: HashMap::new(),
+            head_votes: HashMap::new(),
+            eip8453_fork_epoch: ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH,
             warned_no_indices: false,
         }
+    }
+
+    /// Tell the service where EIP-8453 starts: from that epoch there are no
+    /// attester duties to fetch.
+    pub fn with_eip8453_fork_epoch(mut self, epoch: Epoch) -> Self {
+        self.eip8453_fork_epoch = epoch;
+        self
     }
 
     pub fn set_indices(&mut self, indices: Vec<ValidatorIndex>) {
@@ -114,6 +139,11 @@ impl<B: BeaconNodeApi> DutiesService<B> {
     /// Returns whether the schedule changed, which is what tells the caller to
     /// re-send subnet subscriptions.
     pub async fn refresh(&mut self, epoch: Epoch) -> Result<bool> {
+        // No beacon committees from EIP-8453 on: the schedule is the
+        // attestation committees' (`refresh_attestation_committees`).
+        if epoch >= self.eip8453_fork_epoch {
+            return Ok(self.by_epoch.remove(&epoch).is_some());
+        }
         if self.indices.is_empty() {
             // Otherwise indistinguishable from a correctly idle node: without
             // this, a client that never resolved any validators attests
@@ -392,6 +422,113 @@ impl<B: BeaconNodeApi> DutiesService<B> {
     }
 
     /// Forget payload timeliness committee duties for epochs before `epoch`.
+    /// Fetch `epoch`'s EIP-8453 attestation committee duties for this
+    /// client's indices, replacing anything held for it if the
+    /// `dependent_root` changed. Only for an EIP-8453 epoch.
+    pub async fn refresh_attestation_committees(&mut self, epoch: Epoch) -> Result<()> {
+        if self.indices.is_empty() {
+            return Ok(());
+        }
+        let fetched = self
+            .beacon_node
+            .attestation_committee_duties(epoch, &self.indices)
+            .await?;
+        let held = self.attestation_committees.get(&epoch);
+        if held.is_some_and(|held| held.dependent_root == fetched.dependent_root) {
+            return Ok(());
+        }
+        if held.is_some() {
+            warn!(%epoch, "Attestation committee duties invalidated by a reorg; replacing the schedule");
+        }
+        let mine: Vec<AttestationCommitteeDutyDto> = fetched
+            .duties
+            .into_iter()
+            .filter(|duty| self.indices.contains(&duty.validator_index))
+            .collect();
+        info!(%epoch, count = mine.len(), "Attestation committee duties updated");
+        self.attestation_committees.insert(
+            epoch,
+            EpochDuties {
+                dependent_root: fetched.dependent_root,
+                duties: mine,
+            },
+        );
+        Ok(())
+    }
+
+    /// Fetch `epoch`'s EIP-8453 head vote committee duties for this client's
+    /// indices, on the same terms. Only for an EIP-8453 epoch.
+    pub async fn refresh_head_votes(&mut self, epoch: Epoch) -> Result<()> {
+        if self.indices.is_empty() {
+            return Ok(());
+        }
+        let fetched = self
+            .beacon_node
+            .head_vote_duties(epoch, &self.indices)
+            .await?;
+        let held = self.head_votes.get(&epoch);
+        if held.is_some_and(|held| held.dependent_root == fetched.dependent_root) {
+            return Ok(());
+        }
+        if held.is_some() {
+            warn!(%epoch, "Head vote duties invalidated by a reorg; replacing the schedule");
+        }
+        let mine: Vec<HeadVoteDutyDto> = fetched
+            .duties
+            .into_iter()
+            .filter(|duty| self.indices.contains(&duty.validator_index))
+            .collect();
+        let seats: usize = mine.iter().map(|duty| duty.slots.len()).sum();
+        info!(%epoch, validators = mine.len(), votes = seats, "Head vote duties updated");
+        self.head_votes.insert(
+            epoch,
+            EpochDuties {
+                dependent_root: fetched.dependent_root,
+                duties: mine,
+            },
+        );
+        Ok(())
+    }
+
+    /// Forget EIP-8453 duties of epochs before `epoch`.
+    pub fn prune_eip8453_before(&mut self, epoch: Epoch) {
+        self.attestation_committees.retain(|held, _| *held >= epoch);
+        self.head_votes.retain(|held, _| *held >= epoch);
+    }
+
+    /// This client's FG attesters at `slot`: the attestation committee duties
+    /// of `slot`'s epoch whose slots include it.
+    pub fn attestation_committees_at_slot(
+        &self,
+        slot: Slot,
+        epoch: Epoch,
+    ) -> Vec<AttestationCommitteeDutyDto> {
+        self.attestation_committees
+            .get(&epoch)
+            .map(|held| {
+                held.duties
+                    .iter()
+                    .filter(|duty| duty.slots.contains(&slot))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// This client's head voters at `slot`.
+    pub fn head_votes_at_slot(&self, slot: Slot, epoch: Epoch) -> Vec<HeadVoteDutyDto> {
+        self.head_votes
+            .get(&epoch)
+            .map(|held| {
+                held.duties
+                    .iter()
+                    .filter(|duty| duty.slots.contains(&slot))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn prune_ptc_before(&mut self, epoch: Epoch) {
         self.ptc.retain(|held, _| *held >= epoch);
     }

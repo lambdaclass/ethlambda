@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::altair;
+use ethlambda_types::beacon::containers::eip8453;
 use ethlambda_types::beacon::containers::electra::{Attestation, SignedAggregateAndProof};
 use ethlambda_types::beacon::containers::gloas;
 use ethlambda_types::beacon::containers::heze;
@@ -20,14 +21,15 @@ use crate::beacon_node::block_contents::{
     empty_gloas_envelope_for,
 };
 use crate::beacon_node::dto::{
-    AttesterDutyDto, CommitteeSubscriptionDto, InclusionListDutyDto, ProposerDutyDto,
+    AttestationCommitteeDutyDto, AttesterDutyDto, CommitteeSubscriptionDto,
+    FinalityAttestationInputDto, HeadVoteDutyDto, InclusionListDutyDto, ProposerDutyDto,
     ProposerPreparationDto, PtcDutyDto, SingleAttestationDto, SyncCommitteeSubscriptionDto,
     SyncDutyDto,
 };
 use crate::beacon_node::{
-    AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Genesis,
-    InclusionListDuties, ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorEntry,
-    validate_sync_contribution,
+    AggregateAttestation, AggregateKind, AttestationCommitteeDuties, AttesterDuties, BeaconNodeApi,
+    BlockRequest, Genesis, HeadVoteDuties, InclusionListDuties, ProposerDuties, PtcDuties,
+    Published, SignedAggregates, ValidatorEntry, validate_sync_contribution,
 };
 use crate::error::{BeaconNodeFailure, Error, Result};
 
@@ -141,6 +143,24 @@ pub struct MockBeaconNode {
     pub contribution_requests: Mutex<Vec<(Slot, u64, Root)>>,
     pub published_contributions: Mutex<Vec<altair::SignedContributionAndProof>>,
     pub sync_subscriptions: Mutex<Vec<SyncCommitteeSubscriptionDto>>,
+
+    // ── EIP-8453 ──
+    /// Attestation committee duties by epoch. An epoch never set fails the
+    /// call, as `ptc` does.
+    pub attestation_committees: Mutex<Vec<(Epoch, AttestationCommitteeDuties)>>,
+    pub attestation_committee_calls: Mutex<Vec<Epoch>>,
+    /// Head vote duties by epoch. An epoch never set fails the call.
+    pub head_vote_duties: Mutex<Vec<(Epoch, HeadVoteDuties)>>,
+    pub head_vote_duty_calls: Mutex<Vec<Epoch>>,
+    /// What `head_vote_data` answers with, by slot. A slot never set fails
+    /// the call, the way a node asked before the deadline does.
+    pub head_vote_data: Mutex<HashMap<Slot, eip8453::HeadVoteData>>,
+    pub head_vote_data_calls: Mutex<usize>,
+    /// What `finality_attestation_input` answers with. `None` is the 204.
+    pub finality_attestation_input: Mutex<Option<FinalityAttestationInputDto>>,
+    pub finality_attestation_input_calls: Mutex<usize>,
+    pub submitted_head_votes: Mutex<Vec<eip8453::HeadVoteMessage>>,
+    pub submitted_fg_attestations: Mutex<Vec<eip8453::SingleAttestation>>,
 }
 
 impl MockBeaconNode {
@@ -183,6 +203,53 @@ impl MockBeaconNode {
             },
         ));
         self
+    }
+
+    /// EIP-8453 attestation committee duties for `epoch`.
+    pub fn with_attestation_committee_duties(
+        self,
+        epoch: Epoch,
+        dependent_root: Root,
+        duties: Vec<AttestationCommitteeDutyDto>,
+    ) -> Self {
+        self.attestation_committees.lock().expect("lock").push((
+            epoch,
+            AttestationCommitteeDuties {
+                dependent_root,
+                duties,
+            },
+        ));
+        self
+    }
+
+    /// EIP-8453 head vote duties for `epoch`.
+    pub fn with_head_vote_duties(
+        self,
+        epoch: Epoch,
+        dependent_root: Root,
+        duties: Vec<HeadVoteDutyDto>,
+    ) -> Self {
+        self.head_vote_duties.lock().expect("lock").push((
+            epoch,
+            HeadVoteDuties {
+                dependent_root,
+                duties,
+            },
+        ));
+        self
+    }
+
+    /// The head vote data the mock serves for `data.slot`, replacing any.
+    pub fn set_head_vote_data(&self, data: eip8453::HeadVoteData) {
+        self.head_vote_data
+            .lock()
+            .expect("lock")
+            .insert(data.slot, data);
+    }
+
+    /// The finality attestation input the mock serves; `None` is the 204.
+    pub fn set_finality_attestation_input(&self, input: Option<FinalityAttestationInputDto>) {
+        *self.finality_attestation_input.lock().expect("lock") = input;
     }
 
     /// Replace the duties stored for `epoch`.
@@ -676,6 +743,37 @@ impl BeaconNodeApi for MockBeaconNode {
                 failure: BeaconNodeFailure::Request,
                 detail: "no gloas block set".into(),
             })?;
+            // EIP-8453: the same split over its own block, with heze's bid.
+            if request.fork >= ForkName::Eip8453 {
+                use ethlambda_types::beacon::primitives::HashTreeRoot as _;
+                let mut body = eip8453::BeaconBlockBody::empty();
+                body.signed_execution_payload_bid.message.builder_index = spec.builder_index;
+                let block = eip8453::BeaconBlock {
+                    slot: spec.slot,
+                    proposer_index: spec.proposer_index,
+                    body,
+                    ..Default::default()
+                };
+                let payload = spec.include_payload.then(|| {
+                    Box::new(GloasPayload {
+                        envelope: empty_gloas_envelope_for(
+                            block.hash_tree_root(),
+                            spec.builder_index,
+                        ),
+                        kzg_proofs: Default::default(),
+                        blobs: Default::default(),
+                    })
+                });
+                let block = ProducedBlock {
+                    fork: ForkName::Eip8453,
+                    contents: Contents::Eip8453 {
+                        block: Box::new(block),
+                        payload,
+                    },
+                };
+                crate::beacon_node::validate_produced_block(request, &block)?;
+                return Ok(block);
+            }
             let block = empty_gloas_block_for(spec.slot, spec.proposer_index, spec.builder_index);
             let payload = spec.include_payload.then(|| {
                 use ethlambda_types::beacon::primitives::HashTreeRoot as _;
@@ -808,6 +906,101 @@ impl BeaconNodeApi for MockBeaconNode {
             .expect("lock")
             .extend_from_slice(messages);
         Ok(messages.len())
+    }
+
+    async fn attestation_committee_duties(
+        &self,
+        epoch: Epoch,
+        _indices: &[ValidatorIndex],
+    ) -> Result<AttestationCommitteeDuties> {
+        self.guard("attestation_committee_duties")?;
+        self.attestation_committee_calls
+            .lock()
+            .expect("lock")
+            .push(epoch);
+        self.attestation_committees
+            .lock()
+            .expect("lock")
+            .iter()
+            .find(|(stored, _)| *stored == epoch)
+            .map(|(_, duties)| duties.clone())
+            .ok_or_else(|| Error::BeaconNode {
+                url: "mock".to_string(),
+                failure: BeaconNodeFailure::Request,
+                detail: format!("no attestation committee duties for epoch {epoch}"),
+            })
+    }
+
+    async fn head_vote_duties(
+        &self,
+        epoch: Epoch,
+        _indices: &[ValidatorIndex],
+    ) -> Result<HeadVoteDuties> {
+        self.guard("head_vote_duties")?;
+        self.head_vote_duty_calls.lock().expect("lock").push(epoch);
+        self.head_vote_duties
+            .lock()
+            .expect("lock")
+            .iter()
+            .find(|(stored, _)| *stored == epoch)
+            .map(|(_, duties)| duties.clone())
+            .ok_or_else(|| Error::BeaconNode {
+                url: "mock".to_string(),
+                failure: BeaconNodeFailure::Request,
+                detail: format!("no head vote duties for epoch {epoch}"),
+            })
+    }
+
+    async fn head_vote_data(&self, slot: Slot) -> Result<eip8453::HeadVoteData> {
+        self.guard("head_vote_data")?;
+        *self.head_vote_data_calls.lock().expect("lock") += 1;
+        let data = self
+            .head_vote_data
+            .lock()
+            .expect("lock")
+            .get(&slot)
+            .copied()
+            .ok_or_else(|| Error::BeaconNodeStatus {
+                status: 503,
+                body: format!("no head vote data for slot {slot}"),
+            })?;
+        if data.slot != slot {
+            return Err(Error::InconsistentResponse(format!(
+                "requested head vote data for slot {slot}, node answered for slot {}",
+                data.slot
+            )));
+        }
+        Ok(data)
+    }
+
+    async fn finality_attestation_input(
+        &self,
+        _slot: Slot,
+    ) -> Result<Option<FinalityAttestationInputDto>> {
+        self.guard("finality_attestation_input")?;
+        *self.finality_attestation_input_calls.lock().expect("lock") += 1;
+        Ok(*self.finality_attestation_input.lock().expect("lock"))
+    }
+
+    async fn submit_head_votes(&self, messages: &[eip8453::HeadVoteMessage]) -> Result<usize> {
+        self.guard("submit_head_votes")?;
+        self.submitted_head_votes
+            .lock()
+            .expect("lock")
+            .extend_from_slice(messages);
+        Ok(messages.len())
+    }
+
+    async fn submit_fg_attestations(
+        &self,
+        attestations: &[eip8453::SingleAttestation],
+    ) -> Result<usize> {
+        self.guard("submit_fg_attestations")?;
+        self.submitted_fg_attestations
+            .lock()
+            .expect("lock")
+            .extend_from_slice(attestations);
+        Ok(attestations.len())
     }
 
     async fn inclusion_list_duties(

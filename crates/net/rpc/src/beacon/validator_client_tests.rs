@@ -632,7 +632,7 @@ fn fulu_block(
     use ethlambda_validator::beacon_node::block_contents::Contents;
     match &produced.contents {
         Contents::WithCellProofs { block, .. } | Contents::WithBlobProofs { block, .. } => block,
-        Contents::Gloas { .. } => unreachable!("a fulu proposal"),
+        Contents::Gloas { .. } | Contents::Eip8453 { .. } => unreachable!("a fulu proposal"),
     }
 }
 

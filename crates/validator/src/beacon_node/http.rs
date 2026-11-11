@@ -25,6 +25,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::altair;
+use ethlambda_types::beacon::containers::eip8453;
 use ethlambda_types::beacon::containers::electra::Attestation;
 use ethlambda_types::beacon::containers::gloas;
 use ethlambda_types::beacon::containers::heze;
@@ -39,17 +40,19 @@ use libssz::SszDecode as _;
 
 use crate::beacon_node::block_contents::ProducedBlock;
 use crate::beacon_node::dto::{
-    AttestationDataDto, AttestationDto, AttesterDutyDto, BlockRootResponse,
-    CommitteeSubscriptionDto, DataResponse, DutiesResponse, GenesisDto, InclusionListDutyDto,
+    AttestationCommitteeDutyDto, AttestationDataDto, AttestationDto, AttesterDutyDto,
+    BlockRootResponse, CommitteeSubscriptionDto, DataResponse, DutiesResponse,
+    FinalityAttestationInputDto, GenesisDto, HeadVoteDutyDto, InclusionListDutyDto,
     IndexedErrorResponse, ProposerDutyDto, ProposerPreparationDto, PtcDutyDto,
     SignedAggregateAndProofOutDto, SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto,
     SyncingDto, ValidatorEntryDto, VersionedResponse, config_from_spec_response, encode_hex,
     parse_pubkey, parse_root,
 };
 use crate::beacon_node::{
-    AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Genesis,
-    InclusionListDuties, ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorEntry,
-    validate_attestation_data, validate_produced_block, validate_sync_contribution,
+    AggregateAttestation, AggregateKind, AttestationCommitteeDuties, AttesterDuties, BeaconNodeApi,
+    BlockRequest, Genesis, HeadVoteDuties, InclusionListDuties, ProposerDuties, PtcDuties,
+    Published, SignedAggregates, ValidatorEntry, validate_attestation_data,
+    validate_produced_block, validate_sync_contribution,
 };
 use crate::error::{BeaconNodeFailure, Error, Result};
 
@@ -308,6 +311,31 @@ impl HttpBeaconNode {
             ))),
             None => Ok(None),
         }
+    }
+
+    /// POST an EIP-8453 batch to a pool endpoint, under
+    /// `Eth-Consensus-Version: eip8453`, with the partial-success reading of
+    /// [`Self::handle_pool_submission`].
+    async fn submit_to_pool<T: Serialize>(&self, path: &str, items: &[T]) -> Result<usize> {
+        let url = format!("{}{path}", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .header("Eth-Consensus-Version", ForkName::Eip8453.as_str())
+            .json(items)
+            .send()
+            .await
+            .map_err(|err| Error::BeaconNode {
+                url: url.clone(),
+                failure: BeaconNodeFailure::classify(&err),
+                detail: err.to_string(),
+            })?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(items.len());
+        }
+        let body = response.text().await.unwrap_or_default();
+        Self::handle_pool_submission(status, body, items.len())
     }
 
     /// A GET whose success may be a 204, which is an answer ("nothing to
@@ -864,6 +892,84 @@ impl BeaconNodeApi for HttpBeaconNode {
         .await
     }
 
+    async fn attestation_committee_duties(
+        &self,
+        epoch: Epoch,
+        indices: &[ValidatorIndex],
+    ) -> Result<AttestationCommitteeDuties> {
+        let body: Vec<String> = indices.iter().map(|index| index.to_string()).collect();
+        let response: DutiesResponse<Vec<AttestationCommitteeDutyDto>> = self
+            .post(
+                &format!("/eth/v1/validator/duties/attestation_committee/{epoch}"),
+                &body,
+                None,
+            )
+            .await?;
+        Ok(AttestationCommitteeDuties {
+            dependent_root: parse_root(&response.dependent_root)?,
+            duties: response.data,
+        })
+    }
+
+    async fn head_vote_duties(
+        &self,
+        epoch: Epoch,
+        indices: &[ValidatorIndex],
+    ) -> Result<HeadVoteDuties> {
+        let body: Vec<String> = indices.iter().map(|index| index.to_string()).collect();
+        let response: DutiesResponse<Vec<HeadVoteDutyDto>> = self
+            .post(
+                &format!("/eth/v1/validator/duties/head_vote/{epoch}"),
+                &body,
+                None,
+            )
+            .await?;
+        Ok(HeadVoteDuties {
+            dependent_root: parse_root(&response.dependent_root)?,
+            duties: response.data,
+        })
+    }
+
+    async fn head_vote_data(&self, slot: Slot) -> Result<eip8453::HeadVoteData> {
+        let response: VersionedResponse<eip8453::HeadVoteData> = self
+            .get(&format!("/eth/v1/validator/head_vote_data?slot={slot}"))
+            .await?;
+        // Signable material: a node answering about another slot is failed
+        // over from rather than signed for.
+        if response.data.slot != slot {
+            return Err(Error::InconsistentResponse(format!(
+                "requested head vote data for slot {slot}, node answered for slot {}",
+                response.data.slot
+            )));
+        }
+        Ok(response.data)
+    }
+
+    async fn finality_attestation_input(
+        &self,
+        slot: Slot,
+    ) -> Result<Option<FinalityAttestationInputDto>> {
+        let response: Option<VersionedResponse<FinalityAttestationInputDto>> = self
+            .get_optional(&format!(
+                "/eth/v1/validator/finality_attestation_input?slot={slot}"
+            ))
+            .await?;
+        Ok(response.map(|response| response.data))
+    }
+
+    async fn submit_head_votes(&self, messages: &[eip8453::HeadVoteMessage]) -> Result<usize> {
+        self.submit_to_pool("/eth/v1/beacon/pool/head_votes", messages)
+            .await
+    }
+
+    async fn submit_fg_attestations(
+        &self,
+        attestations: &[eip8453::SingleAttestation],
+    ) -> Result<usize> {
+        self.submit_to_pool("/eth/v2/beacon/pool/attestations", attestations)
+            .await
+    }
+
     /// Distinct from `post_no_content`: this endpoint's 400s are not always
     /// total failures. See [`Self::handle_pool_submission`].
     async fn submit_attestations(
@@ -949,11 +1055,12 @@ impl BeaconNodeApi for HttpBeaconNode {
                     .map_err(|err| Error::Decode(format!("gloas aggregate: {err}")))?;
                 AggregateKind::Gloas(attestation)
             }
-            // TODO(eip8453): aggregate finality-gadget attestations once the
-            // validator client implements EIP-8453's duties.
+            // EIP-8453 has no aggregation duty yet (its aggregate topics are
+            // TODOs in the specification), so this client never asks for one
+            // at an EIP-8453 slot.
             ForkName::Eip8453 => {
                 return Err(Error::InconsistentResponse(
-                    "node produced an eip8453 aggregate, which this client does not publish yet"
+                    "node produced an eip8453 aggregate, which this client does not publish"
                         .to_string(),
                 ));
             }

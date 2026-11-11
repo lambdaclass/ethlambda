@@ -8,13 +8,14 @@
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::constants::{
     DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_BUILDER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_INCLUSION_LIST_COMMITTEE,
-    DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE,
-    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_FINALITY_ATTESTER,
+    DOMAIN_HEAD_VOTE, DOMAIN_INCLUSION_LIST_COMMITTEE, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
+    DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
 };
 use ethlambda_types::beacon::containers::altair::{
     ContributionAndProof, SyncAggregatorSelectionData,
 };
+use ethlambda_types::beacon::containers::eip8453;
 use ethlambda_types::beacon::containers::gloas::{
     ExecutionPayloadEnvelope, PayloadAttestationData,
 };
@@ -152,6 +153,27 @@ impl SigningContext {
     /// message wrapper and is deliberately not signed over.
     pub fn payload_attestation_signing_root(&self, data: &PayloadAttestationData) -> Root {
         let domain = self.domain(DOMAIN_PTC_ATTESTER, compute_epoch_at_slot(data.slot));
+        compute_signing_root(data.hash_tree_root(), domain)
+    }
+
+    /// The root an EIP-8453 head vote's signature is computed over
+    /// (`get_head_vote_signature`): the `HeadVoteData`, under
+    /// `DOMAIN_HEAD_VOTE` at the epoch of its slot.
+    pub fn head_vote_signing_root(&self, data: &eip8453::HeadVoteData) -> Root {
+        let domain = self.domain(DOMAIN_HEAD_VOTE, compute_epoch_at_slot(data.slot));
+        compute_signing_root(data.hash_tree_root(), domain)
+    }
+
+    /// The root an EIP-8453 FG attestation's signature is computed over
+    /// (`get_attestation_signature`, modified): the `AttestationData`, under
+    /// `DOMAIN_FINALITY_ATTESTER` at `epoch`, the epoch of the attester's
+    /// assigned slot. Neither the epoch nor the committee index is signed.
+    pub fn fg_attestation_signing_root(
+        &self,
+        data: &eip8453::AttestationData,
+        epoch: Epoch,
+    ) -> Root {
+        let domain = self.domain(DOMAIN_FINALITY_ATTESTER, epoch);
         compute_signing_root(data.hash_tree_root(), domain)
     }
 
@@ -324,6 +346,35 @@ impl SigningContext {
         data: &PayloadAttestationData,
     ) -> Result<BlsSignature> {
         self.sign_root(store, pubkey, self.payload_attestation_signing_root(data))
+    }
+
+    /// Sign an EIP-8453 head vote on behalf of `pubkey`.
+    ///
+    /// Not slashable, but a second head for one slot makes the validator an
+    /// equivocator the fork choice discounts, so [`crate::eip8453`] records the
+    /// slot before signing and never signs another head for it.
+    pub fn sign_head_vote(
+        &self,
+        store: &ValidatorStore,
+        pubkey: &BlsPubkey,
+        data: &eip8453::HeadVoteData,
+    ) -> Result<BlsSignature> {
+        self.sign_root(store, pubkey, self.head_vote_signing_root(data))
+    }
+
+    /// Sign an EIP-8453 FG attestation on behalf of `pubkey`.
+    ///
+    /// Slashable (`is_slashable_attestation_data`): call only with data the
+    /// validator's `FinalitySigningRecord` selected and that record already
+    /// persisted (see [`crate::finality_record`]).
+    pub fn sign_fg_attestation(
+        &self,
+        store: &ValidatorStore,
+        pubkey: &BlsPubkey,
+        data: &eip8453::AttestationData,
+        epoch: Epoch,
+    ) -> Result<BlsSignature> {
+        self.sign_root(store, pubkey, self.fg_attestation_signing_root(data, epoch))
     }
 
     /// Sign an inclusion list on behalf of `pubkey`.

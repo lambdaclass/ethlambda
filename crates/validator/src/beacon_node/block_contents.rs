@@ -43,6 +43,7 @@
 //! |---|---|---|
 //! | Deneb, Electra, Fulu | `BlockContents` | `SignedBlockContents` |
 //! | Gloas and later | `GloasBlockContents` (block and self-built envelope) or a bare block | bare signed block, then the envelope separately |
+//! | EIP-8453 | `Eip8453BlockContents`, the same shape over EIP-8453's block (head votes, FG attestations), or a bare block | as gloas |
 //!
 //! # Gloas
 //!
@@ -87,7 +88,7 @@
 
 use ethlambda_types::beacon::containers::deneb::Blob;
 use ethlambda_types::beacon::containers::electra::{BeaconBlock, SignedBeaconBlock};
-use ethlambda_types::beacon::containers::{GloasBlock, gloas, heze};
+use ethlambda_types::beacon::containers::{GloasBlock, eip8453, gloas, heze};
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::preset;
 use ethlambda_types::beacon::primitives::{BlsSignature, KzgProof};
@@ -175,6 +176,7 @@ macro_rules! block_contents {
 
 block_contents!(GloasBlockContents, gloas::BeaconBlock);
 block_contents!(HezeBlockContents, heze::BeaconBlock);
+block_contents!(Eip8453BlockContents, eip8453::BeaconBlock);
 
 /// `publishExecutionPayloadEnvelope`'s body for gloas when the client supplies
 /// the blobs (`Eth-Blob-Data-Included: true`).
@@ -266,6 +268,13 @@ pub enum Contents {
         block: GloasBlock,
         payload: Option<Box<GloasPayload>>,
     },
+    /// EIP-8453: the same split as gloas, over EIP-8453's block, whose body
+    /// carries head votes and FG attestations in place of gloas's
+    /// attestations.
+    Eip8453 {
+        block: Box<eip8453::BeaconBlock>,
+        payload: Option<Box<GloasPayload>>,
+    },
 }
 
 impl ProducedBlock {
@@ -319,17 +328,12 @@ impl ProducedBlock {
             // Gloas needs one more fact than the fork: whether the node
             // included the payload, which only the response header says. See
             // `Self::from_gloas_ssz`.
-            ForkName::Gloas | ForkName::Heze => Err(Error::InconsistentResponse(
-                "a gloas block cannot be decoded without Eth-Execution-Payload-Included"
-                    .to_string(),
-            )),
-            // TODO(eip8453): propose under EIP-8453 once the validator client
-            // implements its duties.
-            ForkName::Eip8453 => Err(Error::InconsistentResponse(
-                "beacon node produced an eip8453 block, which this client does not propose \
-                 under yet"
-                    .to_string(),
-            )),
+            ForkName::Gloas | ForkName::Heze | ForkName::Eip8453 => {
+                Err(Error::InconsistentResponse(
+                    "a gloas block cannot be decoded without Eth-Execution-Payload-Included"
+                        .to_string(),
+                ))
+            }
             ForkName::Phase0
             | ForkName::Altair
             | ForkName::Bellatrix
@@ -359,7 +363,7 @@ impl ProducedBlock {
                 "produced gloas block: {what} did not decode: {err:?}"
             ))
         };
-        if !matches!(fork, ForkName::Gloas | ForkName::Heze) {
+        if !matches!(fork, ForkName::Gloas | ForkName::Heze | ForkName::Eip8453) {
             return Err(Error::InconsistentResponse(format!(
                 "a gloas block was asked for under fork {}",
                 fork.as_str()
@@ -372,6 +376,38 @@ impl ProducedBlock {
                 blobs,
             }))
         };
+        if fork == ForkName::Eip8453 {
+            let (block, payload) = if payload_included {
+                let contents = Eip8453BlockContents::from_ssz_bytes(bytes)
+                    .map_err(|err| decode("block contents", err))?;
+                (
+                    contents.block,
+                    payload_of(
+                        contents.execution_payload_envelope,
+                        contents.kzg_proofs,
+                        contents.blobs,
+                    ),
+                )
+            } else {
+                let block = eip8453::BeaconBlock::from_ssz_bytes(bytes)
+                    .map_err(|err| decode("bare block", err))?;
+                (block, None)
+            };
+            // EIP-8453 keeps heze's bid, `inclusion_list_bits` and all.
+            let bid = &block.body.signed_execution_payload_bid.message;
+            if bid.fork_name() != ForkName::Heze {
+                return Err(Error::InconsistentResponse(
+                    "the eip8453 block's bid is not heze's shape".to_string(),
+                ));
+            }
+            return Ok(Self {
+                fork,
+                contents: Contents::Eip8453 {
+                    block: Box::new(block),
+                    payload,
+                },
+            });
+        }
         let (block, payload) = match (fork, payload_included) {
             (ForkName::Heze, true) => {
                 let contents = HezeBlockContents::from_ssz_bytes(bytes)
@@ -433,6 +469,7 @@ impl ProducedBlock {
                 block.slot
             }
             Contents::Gloas { block, .. } => block.slot(),
+            Contents::Eip8453 { block, .. } => block.slot,
         }
     }
 
@@ -443,6 +480,7 @@ impl ProducedBlock {
                 block.proposer_index
             }
             Contents::Gloas { block, .. } => block.proposer_index(),
+            Contents::Eip8453 { block, .. } => block.proposer_index,
         }
     }
 
@@ -455,6 +493,7 @@ impl ProducedBlock {
                 block.hash_tree_root()
             }
             Contents::Gloas { block, .. } => block.hash_tree_root(),
+            Contents::Eip8453 { block, .. } => block.hash_tree_root(),
         }
     }
 
@@ -468,6 +507,13 @@ impl ProducedBlock {
             Contents::Gloas { block, .. } => {
                 block.signed_execution_payload_bid().message.fee_recipient
             }
+            Contents::Eip8453 { block, .. } => {
+                block
+                    .body
+                    .signed_execution_payload_bid
+                    .message
+                    .fee_recipient
+            }
         }
     }
 
@@ -478,6 +524,13 @@ impl ProducedBlock {
             Contents::Gloas { block, .. } => {
                 Some(block.signed_execution_payload_bid().message.builder_index)
             }
+            Contents::Eip8453 { block, .. } => Some(
+                block
+                    .body
+                    .signed_execution_payload_bid
+                    .message
+                    .builder_index,
+            ),
             _ => None,
         }
     }
@@ -487,7 +540,9 @@ impl ProducedBlock {
     /// and for a gloas block the node returned without its payload.
     pub fn take_gloas_payload(&mut self) -> Option<GloasPayload> {
         match &mut self.contents {
-            Contents::Gloas { payload, .. } => payload.take().map(|payload| *payload),
+            Contents::Gloas { payload, .. } | Contents::Eip8453 { payload, .. } => {
+                payload.take().map(|payload| *payload)
+            }
             _ => None,
         }
     }
@@ -498,7 +553,7 @@ impl ProducedBlock {
             Contents::WithBlobProofs { blobs, .. } | Contents::WithCellProofs { blobs, .. } => {
                 blobs.len()
             }
-            Contents::Gloas { payload, .. } => {
+            Contents::Gloas { payload, .. } | Contents::Eip8453 { payload, .. } => {
                 payload.as_ref().map_or(0, |payload| payload.blobs.len())
             }
         }
@@ -541,6 +596,11 @@ impl ProducedBlock {
             // this body, and are expected to have been taken out already by
             // `take_gloas_payload`.
             Contents::Gloas { block, .. } => block.into_signed(signature).to_ssz(),
+            Contents::Eip8453 { block, .. } => eip8453::SignedBeaconBlock {
+                message: *block,
+                signature,
+            }
+            .to_ssz(),
         }
     }
 }

@@ -240,6 +240,47 @@ pub struct PtcDutyDto {
     pub slot: Slot,
 }
 
+/// One entry of `POST /eth/v1/validator/duties/attestation_committee/{epoch}`
+/// (EIP-8453, an ethlambda endpoint): the validator's one attestation
+/// committee for the epoch and the slots it attests in, one a round.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AttestationCommitteeDutyDto {
+    pub pubkey: String,
+    #[serde(with = "quoted_u64")]
+    pub validator_index: ValidatorIndex,
+    #[serde(with = "quoted_u64")]
+    pub committee_index: u64,
+    #[serde(with = "quoted_u64")]
+    pub committee_length: u64,
+    #[serde(with = "quoted_u64")]
+    pub validator_committee_index: u64,
+    #[serde(with = "quoted_u64_vec")]
+    pub slots: Vec<Slot>,
+}
+
+/// One entry of `POST /eth/v1/validator/duties/head_vote/{epoch}` (EIP-8453,
+/// an ethlambda endpoint): the slots of the epoch whose head vote committee
+/// seats the validator, each once.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct HeadVoteDutyDto {
+    pub pubkey: String,
+    #[serde(with = "quoted_u64")]
+    pub validator_index: ValidatorIndex,
+    #[serde(with = "quoted_u64_vec")]
+    pub slots: Vec<Slot>,
+}
+
+/// `GET /eth/v1/validator/finality_attestation_input` (EIP-8453, an ethlambda
+/// endpoint): what an attester selects its `AttestationData` from through its
+/// signing record. Heights and roots as `HeightCheckpoint`s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct FinalityAttestationInputDto {
+    pub target: ethlambda_types::beacon::containers::eip8453::HeightCheckpoint,
+    pub justified: ethlambda_types::beacon::containers::eip8453::HeightCheckpoint,
+    #[serde(with = "quoted_u64")]
+    pub finalized_height: u64,
+}
+
 /// One entry of `POST /eth/v1/validator/duties/inclusion_list/{epoch}`
 /// (heze): the same three fields a PTC duty has, naming the one slot whose
 /// inclusion list committee the validator sits on that epoch.
