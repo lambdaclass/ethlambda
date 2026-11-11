@@ -335,7 +335,7 @@ In practice the distribution is bimodal and dominated by production rather than 
 | `lean_state_write_queue_depth` | Gauge | States handed to the background writer but not yet committed | On every hand-off and on every commit | |
 | `lean_state_write_seconds` | Histogram | Time the background writer spends encoding, diffing and committing one state | Per state written | |
 | `lean_state_cache_lookups_total` | Counter | State cache lookups, by the `Store` method that made them, the kind of state asked for, and whether the cache held it | On every `get_state` (and the writer's own parent read), `has_state` and `cached_state` call | method=get_state,has_state,cached_state<br>kind=block,checkpoint<br>result=hit,miss |
-| `lean_state_rebuilds_total` | Counter | Block states read back from storage after missing the cache and the write buffer, by whether the read did the rebuild or waited on one already under way for that root | On every `get_state` miss that reads a state back from storage, or takes one from a rebuild under way; a miss that finds no state or fails counts as neither | role=led,joined |
+| `lean_state_rebuilds_total` | Counter | Block states read back from storage after missing the cache and the write buffer, by whether the read did the rebuild or waited on one already under way for that root | On every `get_state` miss (and the writer's own parent read) that reads a state back from storage, or takes one from a rebuild under way; a miss that finds no state or fails counts as neither | role=led,joined |
 
 **On a beacon follower, watch `lean_table_bytes{table="data_columns"}`.** Every
 other table's series either stays flat or is bounded by pruning; `data_columns`
