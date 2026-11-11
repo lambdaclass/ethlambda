@@ -87,6 +87,11 @@ c-kzg = { version = "2.1.8", features = ["ethereum_kzg_settings"] }
 # functions that c-kzg does not export.
 num-bigint = "0.4.6"
 
+# The Fast Confirmation Rule's per-vote maps, keyed by block root: one lookup
+# per validator's latest message, where SipHash was most of the pass. The
+# version `ethlambda-storage` already uses for its own block-root maps.
+foldhash = "0.2.0"
+
 [dev-dependencies]
 ethlambda-test-fixtures.workspace = true
 serde.workspace = true

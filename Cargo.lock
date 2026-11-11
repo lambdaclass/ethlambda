@@ -2190,6 +2190,7 @@ dependencies = [
  "ethlambda-storage",
  "ethlambda-test-fixtures",
  "ethlambda-types",
+ "foldhash 0.2.0",
  "hex",
  "libssz 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=5cb14378ffdadcb51b387c003567e2630d0c7073)",
  "libssz-derive 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=5cb14378ffdadcb51b387c003567e2630d0c7073)",

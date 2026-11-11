@@ -549,6 +549,67 @@ balances in index order. The table grows to the highest voting index, which is
 why `set_latest_message` only takes indices from validated attestations (a
 debug assertion bounds it).
 
+## Fast Confirmation Rule
+
+`beacon::fast_confirmation` implements the Fast Confirmation Rule (FCR) of
+consensus-specs' `phase0`, `bellatrix` and `gloas` `fast-confirmation.md`, at
+**consensus-specs `master`, commit `f993cf2`** rather than the pinned
+`v1.7.0-beta.2`. The release ships no FCR fixtures, and `master` has fixes it
+lacks (the gloas empty-slot support discount, precise committee weight, the
+restart-resilient confirmed root, the `support_discount <= maximum_support`
+assertion). A later bump should diff those three files against that commit.
+
+- **Shape.** One Rust function per specification function, named as the
+  specification names it. `FastConfirmationStore` is the specification's own
+  store: a borrowed fork-choice `Store` plus the six variables. The variables
+  live in the `Store` between runs (`Store::fast_confirmation`, beside the rest
+  of the beacon fork-choice scratch); only `confirmed_root` is persisted.
+- **When it runs.** Once per slot, in the beacon actor's tick, after the clock
+  advance, the deferred aggregates and the head recompute (so past slots'
+  attestations are applied) and before `forkchoiceUpdated`, whose safe block it
+  decides. Not on imports, which recompute the head many times a slot. It is
+  skipped, and its variables reset to the finalized checkpoint, while the head
+  is more than 32 slots behind the wall clock (the `head` event's gate): the
+  rule assumes synchrony from the start of the previous slot.
+- **Outputs.** The `fast_confirmation` Beacon API event, after every run, and
+  the engine's safe block hash (`get_safe_execution_block_hash`).
+- **Cost.** A run reuses what the fork choice already keeps, so most runs cost
+  about what the head computation does:
+  - Balance sources are the store's per-checkpoint balances
+    (`fork_choice::checkpoint_balances`, the cache the head's justified
+    balances come from), which also carry the active set's figures
+    (`JustifiedBalances::active_balance`, `total_active_balance`). A registry
+    pass is paid once per checkpoint, at the boundary import, not per run. The
+    pulled-up head state's balances are the current target's, exact while no
+    validator was slashed in the current epoch (the head state's
+    `slashings[current_epoch % EPOCHS_PER_SLASHINGS_VECTOR]` is still zero);
+    otherwise they are built from the state for that run.
+  - Attestation scores are the proto-array's `PENDING` subtree totals
+    (`Store::proto_array_weights`) when the source is the justified
+    checkpoint's, read with the head's own snapshot, rule set and window so the
+    array never rebuilds for it. Only the previous epoch's source, at an epoch's
+    first slot, folds the latest messages (foldhash-keyed).
+  - Committee weights are per-slot sums memoized for the run; a range across an
+    epoch boundary sums its earlier epoch's slots less the members its later
+    part counts, and equivocators are a bitmap collected once per slot.
+  - `get_current_target_score`, reached only in an epoch's first slots, walks
+    only the roots voted for in the current epoch, once per run. Walking every
+    vote's root decoded a whole block per parent hop for votes below the live
+    index, and took over a second on mainnet; a vote from another epoch never
+    names the target, so skipping it changes no result.
+
+  At a million validators (`fast_confirmation_timing`, an ignored benchmark in
+  the module) a run takes about 0.5 ms mid-epoch against the head
+  computation's 0.08 ms, 2 to 3 ms in an epoch's second and third slots, and
+  about 14 ms in its first, as the head computation's once-an-epoch
+  proto-array rebuild does. `lean_beacon_fast_confirmation_time_seconds` times
+  a run.
+- **Restart.** The confirmed root is persisted when it changes, and the first
+  synced run of a process offers it to `get_restart_resilient_confirmed_root`.
+- **Tests.** No fixtures exist; the pyspec scenarios are ported as unit tests in
+  the module, on a store built directly (see the comment above them for what
+  they emulate and which scenarios are not ported).
+
 ## Macros and traits
 
 Two `macro_rules!` in the whole crate, both local, both replacing boilerplate that
