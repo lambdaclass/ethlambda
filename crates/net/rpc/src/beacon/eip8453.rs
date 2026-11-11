@@ -379,7 +379,7 @@ struct SlotQuery {
 /// choice not running yet, or the slot's instant not reached or missed, is a
 /// `503` another node (or this one a moment later) may answer; a slot other
 /// than the current one is the caller's mistake.
-fn duty_error(err: DutyError) -> ApiError {
+pub(crate) fn duty_error(err: DutyError) -> ApiError {
     match err {
         DutyError::Inactive => {
             ApiError::ServiceUnavailable("the EIP-8453 fork choice is not running yet")

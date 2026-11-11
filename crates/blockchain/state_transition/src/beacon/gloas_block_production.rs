@@ -587,6 +587,119 @@ pub fn assemble_gloas_block(
     Ok(GloasProduced { block, envelope })
 }
 
+/// What an EIP-8453 block body carries: a heze body's payload half (the
+/// self-built payload and its bid, the payload attestations, the parent's
+/// execution requests, the inclusion list bits), the sync aggregate, and in
+/// place of gloas's attestations the fork choice's head votes with their
+/// support bits and the FG attestations.
+#[derive(Debug, Clone)]
+pub struct Eip8453BlockInputs {
+    pub randao_reveal: BlsSignature,
+    pub graffiti: Bytes32,
+    /// The proposal's head vote aggregates (`Eip8453Node::proposal`).
+    pub head_votes: Vec<ethlambda_types::beacon::containers::eip8453::HeadVote>,
+    /// One support bitlist per head vote aggregate, in the same order.
+    pub head_vote_support: Vec<ethlambda_types::beacon::containers::eip8453::HeadVoteSupportBits>,
+    /// FG attestations (`eip8453_block_production::pack_attestations`).
+    pub attestations: Vec<ethlambda_types::beacon::containers::eip8453::Attestation>,
+    pub payload_attestations: Vec<PayloadAttestation>,
+    pub parent_execution_requests: ExecutionRequests,
+    pub execution_payload: ExecutionPayload,
+    pub blob_kzg_commitments: Vec<KzgCommitment>,
+    pub execution_requests: ExecutionRequests,
+    pub sync_aggregate: SyncAggregate,
+    /// The self-build bid's `inclusion_list_bits`: EIP-8453 keeps heze's bid.
+    pub inclusion_list_bits: InclusionListBits,
+}
+
+/// A produced EIP-8453 block and the unsigned envelope revealing its payload.
+#[derive(Debug, Clone)]
+pub struct Eip8453Produced {
+    pub block: ethlambda_types::beacon::containers::eip8453::BeaconBlock,
+    pub envelope: ExecutionPayloadEnvelope,
+}
+
+/// [`assemble_gloas_block`] for an EIP-8453 slot: the same self-built bid and
+/// envelope, an EIP-8453 body, and the block run through the generic
+/// `process_block` (EIP-8453's) on a copy of `state`, the state advanced to the
+/// block's slot from the proposal's parent.
+pub fn assemble_eip8453_block(
+    state: &BeaconState,
+    inputs: Eip8453BlockInputs,
+    config: &Config,
+    options: stf::block::BlockProcessingOptions,
+) -> Result<Eip8453Produced> {
+    use ethlambda_types::beacon::containers::{SignedBeaconBlock, eip8453};
+    verify(
+        matches!(state, BeaconState::Eip8453(_)),
+        "EIP-8453 block production runs on an EIP-8453 state",
+    )?;
+    let payload = &inputs.execution_payload;
+    let parent_root = state.latest_block_header().hash_tree_root();
+    let bid = ExecutionPayloadBid {
+        parent_block_hash: payload.parent_hash,
+        parent_block_root: parent_root,
+        block_hash: payload.block_hash,
+        prev_randao: payload.prev_randao,
+        fee_recipient: payload.fee_recipient,
+        gas_limit: payload.gas_limit,
+        builder_index: constants::BUILDER_INDEX_SELF_BUILD,
+        slot: state.slot(),
+        value: 0,
+        execution_payment: 0,
+        blob_kzg_commitments: inputs.blob_kzg_commitments.into(),
+        execution_requests_root: inputs.execution_requests.hash_tree_root(),
+        inclusion_list_bits: Some(inputs.inclusion_list_bits),
+    };
+    let mut body = eip8453::BeaconBlockBody::empty();
+    body.randao_reveal = inputs.randao_reveal;
+    body.graffiti = inputs.graffiti;
+    body.attestations = inputs.attestations.into();
+    body.sync_aggregate = inputs.sync_aggregate;
+    body.signed_execution_payload_bid = SignedExecutionPayloadBid {
+        message: bid,
+        signature: BlsSignature(bls::G2_POINT_AT_INFINITY),
+    };
+    body.payload_attestations = inputs.payload_attestations.into();
+    body.parent_execution_requests = inputs.parent_execution_requests;
+    body.head_votes = inputs.head_votes.into();
+    body.head_vote_support = inputs.head_vote_support.into();
+    let mut block = eip8453::BeaconBlock {
+        slot: state.slot(),
+        proposer_index: get_beacon_proposer_index(state)?,
+        parent_root,
+        state_root: Root::ZERO,
+        body,
+    };
+
+    let mut post = state.clone();
+    let unsigned = SignedBeaconBlock::Eip8453(eip8453::SignedBeaconBlock {
+        message: block.clone(),
+        signature: BlsSignature::default(),
+    });
+    stf::block::process_block(
+        &mut post,
+        &unsigned,
+        config,
+        &stf::ExecutionEngine::valid(),
+        &CommitteeCache::default(),
+        &ActiveBalanceCache::default(),
+        options,
+    )?;
+    post.apply_pending_mutations();
+    block.state_root = post.hash_tree_root();
+
+    let envelope = ExecutionPayloadEnvelope {
+        payload: inputs.execution_payload,
+        execution_requests: inputs.execution_requests,
+        builder_index: constants::BUILDER_INDEX_SELF_BUILD,
+        beacon_block_root: block.hash_tree_root(),
+        parent_beacon_block_root: block.parent_root,
+    };
+    check_envelope(&post, &envelope, config)?;
+    Ok(Eip8453Produced { block, envelope })
+}
+
 /// `verify_execution_payload_envelope` (gloas `fork-choice.md`) without its
 /// signature check and its engine call, against `post`, the state after the
 /// block the envelope belongs to.

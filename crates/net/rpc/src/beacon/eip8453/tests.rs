@@ -553,3 +553,262 @@ async fn finality_checkpoints_of_an_eip8453_state_are_the_gadgets_heights() {
     // Heights, not epochs.
     assert!(data["finalized"].get("height").is_some());
 }
+
+// ── Block production ────────────────────────────────────────────────────────
+
+/// A stand-in execution client: `forkchoiceUpdated` (V4 or heze's V5) with
+/// attributes answers a payload id, and `getPayloadV6` a payload extending the
+/// requested head with exactly the requested attributes.
+async fn fake_engine() -> ethlambda_engine::EngineClient {
+    use std::sync::Mutex;
+    let recorded: Arc<Mutex<Option<Value>>> = Arc::default();
+    let handler = move |Json(request): Json<Value>| {
+        let recorded = recorded.clone();
+        async move {
+            let result = match request["method"].as_str() {
+                Some("engine_forkchoiceUpdatedV4" | "engine_forkchoiceUpdatedV5") => {
+                    let mut attributes = request["params"][1].clone();
+                    attributes["parentHash"] = request["params"][0]["headBlockHash"].clone();
+                    *recorded.lock().unwrap() = Some(attributes);
+                    serde_json::json!({
+                        "payloadStatus": { "status": "VALID", "latestValidHash": null },
+                        "payloadId": "0x0000000000000001",
+                    })
+                }
+                Some("engine_getPayloadV6") => {
+                    let attributes = recorded.lock().unwrap().clone().unwrap();
+                    serde_json::json!({
+                        "executionPayload": {
+                            "parentHash": attributes["parentHash"],
+                            "feeRecipient": attributes["suggestedFeeRecipient"],
+                            "stateRoot": format!("0x{}", "00".repeat(32)),
+                            "receiptsRoot": format!("0x{}", "00".repeat(32)),
+                            "logsBloom": format!("0x{}", "00".repeat(256)),
+                            "prevRandao": attributes["prevRandao"],
+                            "blockNumber": "0x1",
+                            "gasLimit": attributes["targetGasLimit"],
+                            "gasUsed": "0x0",
+                            "timestamp": attributes["timestamp"],
+                            "extraData": "0x",
+                            "baseFeePerGas": "0x7",
+                            "blockHash": format!("0x{}", "ee".repeat(32)),
+                            "transactions": [],
+                            "withdrawals": attributes["withdrawals"],
+                            "blobGasUsed": "0x0",
+                            "excessBlobGas": "0x0",
+                            "blockAccessList": "0xc0",
+                            "slotNumber": attributes["slotNumber"],
+                        },
+                        "blockValue": "0x1",
+                        "blobsBundle": { "commitments": [], "proofs": [], "blobs": [] },
+                        "shouldOverrideBuilder": false,
+                        "executionRequests": [],
+                    })
+                }
+                _ => Value::Null,
+            };
+            Json(serde_json::json!({ "jsonrpc": "2.0", "id": request["id"], "result": result }))
+        }
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = Router::new().route("/", post(handler));
+    tokio::spawn(async move { axum::serve(listener, router).await });
+    let secret = ethlambda_engine::JwtSecret::new([0x0f; 32]);
+    ethlambda_engine::EngineClient::new(format!("http://{address}"), secret).unwrap()
+}
+
+impl Harness {
+    /// `produceBlockV4` and the publish endpoints, with an execution client
+    /// and the fork choice node `node`.
+    fn production_router(
+        &self,
+        engine: ethlambda_engine::EngineClient,
+        node: SharedEip8453Node,
+    ) -> Router {
+        use ethlambda_state_transition::beacon::{
+            builder_market::SharedBuilderMarket,
+            payload_attestation_pool::SharedPayloadAttestationPool,
+            sync_committee_pool::SharedSyncCommitteePool,
+        };
+        let p2p: RpcToP2PRef = self.network.clone();
+        let own_version = ethlambda_engine::types::ClientVersionV1 {
+            code: "LA".to_string(),
+            name: "ethlambda".to_string(),
+            version: "ethlambda/test".to_string(),
+            commit: "0x3c4d7e8f".to_string(),
+        };
+        crate::beacon::gloas_proposal::routes()
+            .merge(crate::beacon::proposal::routes())
+            .with_state(self.scene.store.clone())
+            .layer(Extension(Some(engine)))
+            .layer(Extension(node))
+            .layer(Extension(p2p))
+            .layer(Extension(self.clock.clone()))
+            .layer(Extension(SharedSyncCommitteePool::default()))
+            .layer(Extension(SharedPayloadAttestationPool::default()))
+            .layer(Extension(SharedBuilderMarket::default()))
+            .layer(Extension(crate::beacon::validator::FeeRecipients::default()))
+            .layer(Extension(crate::CustodyColumns::default()))
+            .layer(Extension(crate::beacon::graffiti::OwnVersion(Arc::new(
+                own_version,
+            ))))
+    }
+}
+
+const BUILDER_CONFIG: &str = r#"{"min_bid":"0","builder_boost_factor":"100","builders":[]}"#;
+
+#[tokio::test]
+async fn an_eip8453_block_builds_on_the_proposal_with_its_head_votes_and_attestations() {
+    use ethlambda_state_transition::beacon::constants::{
+        DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO, PAYLOAD_STATUS_PENDING,
+    };
+    use ethlambda_state_transition::beacon::helpers::accessors::{
+        get_beacon_proposer_index, get_domain,
+    };
+    use ethlambda_state_transition::beacon::helpers::test_state::sign_for;
+    use ethlambda_types::beacon::signing::compute_signing_root;
+    use ethlambda_types::primitives::HashTreeRoot as _;
+    use libssz::{SszDecode as _, SszEncode as _};
+
+    let h = Harness::new();
+    let anchor = h.scene.anchor_slot;
+    // At the anchor's slot: its committee votes for it (its own slot's block,
+    // so `PENDING`), and one attester attests with it as the height-1 target.
+    h.set_time(h.scene.at(anchor, 1_000));
+    let mut voters = h.scene.committee(anchor);
+    voters.sort_unstable();
+    voters.dedup();
+    for &voter in &voters {
+        let data = eip8453::HeadVoteData {
+            slot: anchor,
+            beacon_block_root: h.scene.anchor_root,
+            payload_status: PAYLOAD_STATUS_PENDING,
+        };
+        let message = h.scene.head_vote(voter, data);
+        let outcome = head_vote::submit(&h.scene.store, &h.scene.node, &message, h.clock.now_ms());
+        assert_eq!(outcome, Outcome::Accept);
+    }
+    let (committee_index, members) = h.scene.attestation_committee_at(anchor);
+    let epoch = compute_epoch_at_slot(anchor);
+    let attestation = h.scene.attestation(
+        members[0],
+        committee_index,
+        epoch,
+        fg_data(h.scene.anchor_root),
+    );
+    let subnet = fg_attestation::compute_subnet_for_attestation(&h.scene.config, committee_index);
+    let outcome = fg_attestation::submit(
+        &h.scene.store,
+        &h.scene.node,
+        &attestation,
+        subnet,
+        h.clock.now_ms(),
+    );
+    assert_eq!(outcome, Outcome::Accept);
+
+    // The next slot's proposer asks at the slot's start.
+    let slot = anchor + 1;
+    h.set_time(h.quarter(slot, 0));
+    let mut advanced = (*h.scene.state).clone();
+    ethlambda_state_transition::beacon::stf::process_slots(&mut advanced, slot, &h.scene.config)
+        .unwrap();
+    let proposer = get_beacon_proposer_index(&advanced).unwrap();
+    let sign = |root, domain_type| {
+        let domain = get_domain(&advanced, domain_type, Some(epoch));
+        sign_for(proposer as usize, compute_signing_root(root, domain))
+    };
+    let reveal = sign(epoch.hash_tree_root(), DOMAIN_RANDAO);
+    let request = Request::post(format!(
+        "/eth/v4/validator/blocks/{slot}?randao_reveal=0x{}&include_payload=true",
+        hex::encode(reveal.0)
+    ))
+    .header("content-type", "application/json")
+    .header("accept", "application/octet-stream")
+    .body(Body::from(BUILDER_CONFIG))
+    .unwrap();
+    let engine = fake_engine().await;
+    let router = h.production_router(engine.clone(), h.scene.node.clone());
+    let response = router.oneshot(request).await.unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(headers["eth-consensus-version"], "eip8453");
+    assert_eq!(headers["eth-execution-payload-included"], "true");
+    let contents =
+        crate::beacon::gloas_proposal::Eip8453BlockContents::from_ssz_bytes(&body).unwrap();
+    let block = contents.block;
+    assert_eq!(block.slot, slot);
+    assert_eq!(block.parent_root, h.scene.anchor_root);
+    assert_eq!(block.proposer_index, proposer);
+    // The proposal's head votes, aggregated, with their support bits.
+    let proposal = h
+        .scene
+        .node
+        .with(|n| n.proposal(slot, h.clock.now_ms()))
+        .unwrap()
+        .unwrap();
+    assert!(!proposal.head_votes.is_empty());
+    assert_eq!(block.body.head_votes.to_vec(), proposal.head_votes);
+    assert_eq!(
+        block.body.head_vote_support.len(),
+        proposal.head_votes.len()
+    );
+    // The pooled FG attestation, aggregated.
+    assert_eq!(block.body.attestations.len(), 1);
+    assert_eq!(block.body.attestations[0].data, attestation.data);
+    // Heze's self-built bid, and the envelope revealing its payload.
+    let bid = &block.body.signed_execution_payload_bid.message;
+    assert!(bid.inclusion_list_bits.is_some());
+    assert_eq!(
+        contents.execution_payload_envelope.beacon_block_root,
+        block.hash_tree_root()
+    );
+
+    // Signed, it publishes through `publishBlockV2` under its own fork.
+    let signature = sign(block.hash_tree_root(), DOMAIN_BEACON_PROPOSER);
+    let signed = eip8453::SignedBeaconBlock {
+        message: block.clone(),
+        signature,
+    };
+    let request = Request::post("/eth/v2/beacon/blocks")
+        .header("content-type", "application/octet-stream")
+        .header("eth-consensus-version", "eip8453")
+        .body(Body::from(signed.to_ssz()))
+        .unwrap();
+    let router = h.production_router(engine, h.scene.node.clone());
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let published = h.network.blocks.lock().unwrap();
+    assert_eq!(published.len(), 1);
+    assert_eq!(
+        published[0].message_hash_tree_root(),
+        block.hash_tree_root()
+    );
+}
+
+#[tokio::test]
+async fn producing_an_eip8453_block_needs_the_slots_proposal() {
+    let h = Harness::new();
+    let slot = h.scene.anchor_slot + 1;
+    h.set_time(h.quarter(slot, 0));
+    let request = |slot: Slot| {
+        Request::post(format!(
+            "/eth/v4/validator/blocks/{slot}?randao_reveal=0x{}&include_payload=true",
+            "00".repeat(96)
+        ))
+        .header("content-type", "application/json")
+        .body(Body::from(BUILDER_CONFIG))
+        .unwrap()
+    };
+    let engine = fake_engine().await;
+    // Another slot than the current one has no recorded proposal.
+    let router = h.production_router(engine.clone(), h.scene.node.clone());
+    let (status, _, _) = h.send(router, request(slot + 1)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // With no fork choice running there is nothing to build on.
+    let router = h.production_router(engine, SharedEip8453Node::new());
+    let (status, _, _) = h.send(router, request(slot)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}

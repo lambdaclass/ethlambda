@@ -25,6 +25,14 @@
 //! A self-built payload's fee recipient and gas target come from the signed
 //! proposer preferences for the slot when this node holds them.
 //!
+//! At an EIP-8453 slot the block builds on the fork choice's proposal
+//! (`Eip8453Node::proposal`: the parent and its payload status, with the
+//! previous slot's head votes and their support bits) rather than on the
+//! LMD-GHOST head, carries the FG attestations pooled in the shared node, and
+//! is assembled with `assemble_eip8453_block`; the self-built bid, the envelope,
+//! the inclusion list bits and the blobs follow the heze path. Builder bids are
+//! not considered at an EIP-8453 slot.
+//!
 //! What `produceBlockV4` builds is kept in a small cache, keyed by slot and
 //! block root and holding the current and the previous slot only, so the
 //! envelope and the blobs can be served and published without the caller
@@ -55,15 +63,18 @@ use ethlambda_state_transition::beacon::{
     block_production::{advance_to_slot, empty_sync_aggregate, verified_sync_aggregate},
     bls,
     builder_market::SharedBuilderMarket,
+    eip8453_block_production,
+    eip8453_node::{Eip8453Proposal, SharedEip8453Node},
     fork_choice::{
         get_head_node, gloas_verify_data_column_sidecar,
         gloas_verify_data_column_sidecar_kzg_proofs, should_build_on_full,
     },
     gloas_block_production::{
-        GloasBidBlockInputs, GloasBlockInputs, GloasPayloadInputs, GloasProduced,
-        assemble_gloas_block, assemble_gloas_block_on_bid, bid_is_includable,
-        gloas_data_column_sidecars, gloas_payload_inputs, pack_gloas_attestations,
-        pack_payload_attestations, parse_gloas_execution_requests,
+        Eip8453BlockInputs, Eip8453Produced, GloasBidBlockInputs, GloasBlockInputs,
+        GloasPayloadInputs, GloasProduced, assemble_eip8453_block, assemble_gloas_block,
+        assemble_gloas_block_on_bid, bid_is_includable, gloas_data_column_sidecars,
+        gloas_payload_inputs, pack_gloas_attestations, pack_payload_attestations,
+        parse_gloas_execution_requests,
     },
     gossip::proposer_preferences::dependent_root_at,
     helpers::{
@@ -87,6 +98,7 @@ use ethlambda_types::{
             self, BeaconState, DataColumnSidecar, GloasBlock,
             altair::SyncAggregate,
             deneb::Blob,
+            eip8453,
             gloas::{
                 self, ExecutionPayloadEnvelope, ExecutionRequests, SignedExecutionPayloadBid,
                 SignedExecutionPayloadEnvelope, SignedProposerPreferences,
@@ -109,6 +121,7 @@ use crate::beacon::{
     ApiError, BodyEncoding,
     bid_selection::{LocalCandidate, PayloadChoice, bid_total_gwei, choose_payload, wei_u128},
     builder_config::{BuilderConfig, decode_builder_config},
+    eip8453::{NodeClock, duty_error},
     graffiti::{self, OwnVersion},
     proposal::{Blobs, CellKzgProofs, decimal, randao_verification, require_gloas_slot},
     validator::{FeeRecipients, head},
@@ -178,6 +191,7 @@ macro_rules! block_contents {
 
 block_contents!(GloasBlockContents, gloas::BeaconBlock);
 block_contents!(HezeBlockContents, heze::BeaconBlock);
+block_contents!(Eip8453BlockContents, eip8453::BeaconBlock);
 
 /// Gloas's `SignedExecutionPayloadEnvelopeContents`, what the stateless form of
 /// `publishExecutionPayloadEnvelope` receives.
@@ -238,6 +252,8 @@ async fn post_produce_block(
     Extension(custody): Extension<NodeCustodyColumns>,
     Extension(cache): Extension<PayloadCache>,
     Extension(OwnVersion(own_version)): Extension<OwnVersion>,
+    eip8453_node: Option<Extension<SharedEip8453Node>>,
+    clock: Option<Extension<NodeClock>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -288,6 +304,27 @@ async fn post_produce_block(
         .into_response();
     }
 
+    // At an EIP-8453 slot the parent and the head votes are the fork
+    // choice's proposal, as of the slot's start.
+    let proposal = if store.config().fork_at_epoch(compute_epoch_at_slot(slot)) >= ForkName::Eip8453
+    {
+        let now = crate::beacon::eip8453::now_ms(clock.as_ref());
+        let Some(Extension(node)) = eip8453_node else {
+            return ApiError::ServiceUnavailable("the EIP-8453 fork choice is not running yet")
+                .into_response();
+        };
+        let pooled = node.with(|n| {
+            n.proposal(slot, now)
+                .map(|proposal| (proposal, n.all_pooled_attestations().cloned().collect()))
+        });
+        match pooled {
+            Ok(Ok(found)) => Some(found),
+            Ok(Err(err)) | Err(err) => return duty_error(err).into_response(),
+        }
+    } else {
+        None
+    };
+
     let graffiti = query.graffiti.unwrap_or(Bytes32::ZERO);
     let produced = produce(
         &store,
@@ -303,6 +340,7 @@ async fn post_produce_block(
         query.randao_reveal,
         randao,
         graffiti,
+        proposal,
     )
     .await;
     let produced = match produced {
@@ -348,7 +386,18 @@ async fn post_produce_block(
                         .into_response();
                 };
                 match block {
-                    GloasBlock::Gloas(block) => contents_response(
+                    LocalBlock::Eip8453(block) => contents_response(
+                        encoding,
+                        fork,
+                        &payload_value,
+                        &Eip8453BlockContents {
+                            block,
+                            execution_payload_envelope: envelope,
+                            kzg_proofs,
+                            blobs,
+                        },
+                    ),
+                    LocalBlock::Gloas(GloasBlock::Gloas(block)) => contents_response(
                         encoding,
                         fork,
                         &payload_value,
@@ -359,7 +408,7 @@ async fn post_produce_block(
                             blobs,
                         },
                     ),
-                    GloasBlock::Heze(block) => contents_response(
+                    LocalBlock::Gloas(GloasBlock::Heze(block)) => contents_response(
                         encoding,
                         fork,
                         &payload_value,
@@ -452,9 +501,41 @@ enum Production {
 /// A self-built block.
 struct Produced {
     built: BuiltGloasPayload,
-    block: GloasBlock,
+    block: LocalBlock,
     envelope: ExecutionPayloadEnvelope,
     payload_value: String,
+}
+
+/// A self-built block's container: gloas's or heze's, or EIP-8453's, whose
+/// body is another shape (head votes, FG attestations).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(untagged)]
+enum LocalBlock {
+    Gloas(GloasBlock),
+    Eip8453(eip8453::BeaconBlock),
+}
+
+impl LocalBlock {
+    fn fork_name(&self) -> ForkName {
+        match self {
+            LocalBlock::Gloas(block) => block.fork_name(),
+            LocalBlock::Eip8453(_) => ForkName::Eip8453,
+        }
+    }
+
+    fn hash_tree_root(&self) -> H256 {
+        match self {
+            LocalBlock::Gloas(block) => block.hash_tree_root(),
+            LocalBlock::Eip8453(block) => block.hash_tree_root(),
+        }
+    }
+
+    fn to_ssz(&self) -> Vec<u8> {
+        match self {
+            LocalBlock::Gloas(block) => block.to_ssz(),
+            LocalBlock::Eip8453(block) => block.to_ssz(),
+        }
+    }
 }
 
 /// This node's own payload for the slot, checked and ready to assemble.
@@ -485,6 +566,9 @@ struct Prepared {
     /// Heze: the previous slot's inclusion list transactions, which the built
     /// payload must satisfy (`PayloadAttributesV5`). `None` at a gloas slot.
     inclusion_list_transactions: Option<Vec<Vec<u8>>>,
+    /// EIP-8453: the fork choice's proposal the block builds on, and the
+    /// single attestations pooled for packing. `None` before the fork.
+    eip8453: Option<(Eip8453Proposal, Vec<eip8453::SingleAttestation>)>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -502,11 +586,19 @@ async fn produce(
     randao_reveal: BlsSignature,
     randao: RandaoVerification,
     graffiti: Bytes32,
+    proposal: Option<(Eip8453Proposal, Vec<eip8453::SingleAttestation>)>,
 ) -> Result<Production, ApiError> {
     let prepare_store = store.clone();
     let prepare_market = market.clone();
     let prepared = tokio::task::spawn_blocking(move || {
-        prepare(&prepare_store, &prepare_market, slot, randao_reveal, randao)
+        prepare(
+            &prepare_store,
+            &prepare_market,
+            slot,
+            randao_reveal,
+            randao,
+            proposal,
+        )
     })
     .await
     .map_err(|_| ApiError::Internal("preparing the block failed"))??;
@@ -538,7 +630,13 @@ async fn produce(
         Some(Err(err)) => (None, Some(err)),
         None => (None, None),
     };
-    let bids = candidate_bids(market, &prepared);
+    // Builder bids are not considered at an EIP-8453 slot: its block is
+    // another container, and the bid path assembles gloas's.
+    let bids = if prepared.eip8453.is_some() {
+        Vec::new()
+    } else {
+        candidate_bids(market, &prepared)
+    };
     let candidate = local.as_ref().map(|local| LocalCandidate {
         value_wei: wei_u128(&local.built.block_value),
         should_override_builder: local.built.should_override_builder,
@@ -614,6 +712,42 @@ async fn produce(
         execution_requests,
     } = local;
     let payload_value = decimal(&built.block_value);
+    if prepared.eip8453.is_some() {
+        let assembled = {
+            let built = built.clone();
+            tokio::task::spawn_blocking(move || {
+                assemble_eip8453(
+                    &config,
+                    &prepared,
+                    built,
+                    execution_requests,
+                    messages,
+                    sync_candidate,
+                    randao_reveal,
+                    graffiti,
+                )
+            })
+            .await
+            .map_err(|_| ApiError::Internal("assembling the block failed"))??
+        };
+        let Eip8453Produced { block, envelope } = assembled;
+        info!(
+            %slot,
+            proposer = block.proposer_index,
+            head_votes = block.body.head_votes.len(),
+            attestations = block.body.attestations.len(),
+            payload_attestations = block.body.payload_attestations.len(),
+            graffiti = %graffiti::display(&block.body.graffiti),
+            blobs = built.blobs_bundle.blobs.len(),
+            "Produced EIP-8453 block"
+        );
+        return Ok(Production::Local(Produced {
+            built,
+            block: LocalBlock::Eip8453(block),
+            envelope,
+            payload_value,
+        }));
+    }
     let assembled = {
         let built = built.clone();
         tokio::task::spawn_blocking(move || {
@@ -644,7 +778,7 @@ async fn produce(
     );
     Ok(Production::Local(Produced {
         built,
-        block,
+        block: LocalBlock::Gloas(block),
         envelope,
         payload_value,
     }))
@@ -702,38 +836,60 @@ fn prepare(
     slot: Slot,
     randao_reveal: BlsSignature,
     randao: RandaoVerification,
+    eip8453: Option<(Eip8453Proposal, Vec<eip8453::SingleAttestation>)>,
 ) -> Result<Prepared, ApiError> {
     let config = store.config();
-    let (head_root, head_state) = head(store)?;
+    let (head_root, head_state, build_on_full) = match &eip8453 {
+        // EIP-8453: `get_ac_proposal`'s head, never pending, and the payload
+        // branch it chose.
+        Some((proposal, _)) => {
+            let root = proposal.head.root;
+            let state = store
+                .get_state(&root)
+                .map_err(|_| ApiError::Internal("store read failed"))?
+                .ok_or(ApiError::ServiceUnavailable(
+                    "the proposal's parent has no state on this node",
+                ))?;
+            let build_on_full =
+                proposal.head.payload_status == ethlambda_types::decoupled::PayloadStatus::Full;
+            (root, state, build_on_full)
+        }
+        None => {
+            let (head_root, head_state) = head(store)?;
+            // The payload branch of the head: the one fork choice recorded,
+            // or, when it has not been recorded for this head yet, a fresh
+            // walk.
+            let payload_status = match store.head_payload_status() {
+                Some(status) => status,
+                None => {
+                    get_head_node(store, &config)
+                        .map_err(|_| ApiError::Internal("fork choice could not name the head"))?
+                        .payload_status
+                }
+            };
+            let node = ForkChoiceNode {
+                root: head_root,
+                payload_status,
+            };
+            let build_on_full = should_build_on_full(store, node, slot).map_err(|_| {
+                ApiError::Internal("could not decide which parent payload to build on")
+            })?;
+            debug_assert_ne!(payload_status, PayloadStatus::Pending);
+            (head_root, head_state, build_on_full)
+        }
+    };
     let head_slot = head_state.slot();
     if slot <= head_slot {
         return Err(ApiError::BadRequest("slot is not after the head block"));
     }
 
-    // The payload branch of the head: the one fork choice recorded, or, when
-    // it has not been recorded for this head yet, a fresh walk.
-    let payload_status = match store.head_payload_status() {
-        Some(status) => status,
-        None => {
-            get_head_node(store, &config)
-                .map_err(|_| ApiError::Internal("fork choice could not name the head"))?
-                .payload_status
-        }
-    };
-    let node = ForkChoiceNode {
-        root: head_root,
-        payload_status,
-    };
-    let build_on_full = should_build_on_full(store, node, slot)
-        .map_err(|_| ApiError::Internal("could not decide which parent payload to build on"))?;
-    debug_assert_ne!(payload_status, PayloadStatus::Pending);
-
-    let head_is_gloas = matches!(
-        store.get_signed_block(&head_root),
-        Ok(Some(
-            containers::SignedBeaconBlock::Gloas(_) | containers::SignedBeaconBlock::Heze(_)
-        ))
-    );
+    // A parent with a payload of its own (gloas, heze or EIP-8453) hands its
+    // envelope's requests to a child building on its full branch.
+    let head_is_gloas = store
+        .get_signed_block(&head_root)
+        .ok()
+        .flatten()
+        .is_some_and(|block| block.payload_bid().is_some());
     let parent_requests = if build_on_full && head_is_gloas {
         store
             .get_execution_payload_envelope(&head_root)
@@ -782,6 +938,7 @@ fn prepare(
         options: BlockProcessingOptions { randao },
         inclusion_list_bits,
         inclusion_list_transactions,
+        eip8453,
     })
 }
 
@@ -799,7 +956,8 @@ fn heze_inclusion_lists(
     head_root: H256,
     slot: Slot,
 ) -> Option<(InclusionListBits, Vec<Vec<u8>>)> {
-    if state.fork_name() != ForkName::Heze {
+    // EIP-8453 keeps heze's inclusion lists.
+    if state.fork_name() < ForkName::Heze {
         return None;
     }
     let Some(inclusion_list_slot) = slot.checked_sub(1) else {
@@ -1043,6 +1201,81 @@ fn assemble(
     }
 }
 
+/// [`assemble`] at an EIP-8453 slot: the proposal's head votes and support
+/// bits, the pooled single attestations aggregated and kept where
+/// `process_attestation` accepts them, and the payload half as heze's.
+#[allow(clippy::too_many_arguments)]
+fn assemble_eip8453(
+    config: &Config,
+    prepared: &Prepared,
+    built: BuiltGloasPayload,
+    execution_requests: ExecutionRequests,
+    messages: Vec<containers::gloas::PayloadAttestationMessage>,
+    sync_candidate: Option<SyncAggregate>,
+    randao_reveal: BlsSignature,
+    graffiti: Bytes32,
+) -> Result<Eip8453Produced, ApiError> {
+    let Prepared {
+        state,
+        head_root,
+        head_slot,
+        parent_requests,
+        options,
+        eip8453: Some((proposal, pool)),
+        ..
+    } = prepared
+    else {
+        return Err(ApiError::Internal("an EIP-8453 block without a proposal"));
+    };
+    let attestations = eip8453_block_production::pack_attestations(state, pool.iter());
+    let payload_attestations =
+        pack_payload_attestations(state, *head_root, *head_slot, messages, config);
+    let sync_aggregate = sync_candidate.map_or_else(empty_sync_aggregate, |candidate| {
+        verified_sync_aggregate(state, candidate)
+    });
+    let inputs = |attestations, payload_attestations, sync_aggregate, head_votes, support| {
+        Eip8453BlockInputs {
+            randao_reveal,
+            graffiti,
+            head_votes,
+            head_vote_support: support,
+            attestations,
+            payload_attestations,
+            parent_execution_requests: parent_requests.clone(),
+            execution_payload: built.execution_payload.clone(),
+            blob_kzg_commitments: built.blobs_bundle.commitments.clone(),
+            execution_requests: execution_requests.clone(),
+            sync_aggregate,
+            inclusion_list_bits: prepared.inclusion_list_bits.clone().unwrap_or_default(),
+        }
+    };
+    let attempt = inputs(
+        attestations,
+        payload_attestations,
+        sync_aggregate,
+        proposal.head_votes.clone(),
+        proposal.head_vote_support.clone(),
+    );
+    match assemble_eip8453_block(state, attempt, config, *options) {
+        Ok(produced) => Ok(produced),
+        // As for gloas: a block without its operations still earns the
+        // proposal. The head votes go too: their support bits are what a
+        // malformed aggregate would fail on.
+        Err(err) => {
+            warn!(slot = state.slot(), %err, "EIP-8453 block with operations failed to build; retrying without");
+            let bare = inputs(
+                Vec::new(),
+                Vec::new(),
+                empty_sync_aggregate(),
+                Vec::new(),
+                Vec::new(),
+            );
+            assemble_eip8453_block(state, bare, config, *options)
+                .map_err(|_| ApiError::Internal("the block failed to build"))
+        }
+    }
+}
+
 /// [`assemble`] for a block that commits to a builder's bid: no payload, no
 /// envelope. `process_block` on the block enforces the bid's own rules.
 fn assemble_on_bid(
@@ -1231,11 +1464,12 @@ async fn post_envelope_waiting(
         return ApiError::BadRequest("unknown block: the envelope's block is not held")
             .into_response();
     };
-    let Some(message) = block.gloas_message() else {
+    // Gloas, heze or EIP-8453: every block with a payload bid.
+    let Some(signed_bid) = block.payload_bid() else {
         return ApiError::BadRequest("the envelope's block is not a gloas block").into_response();
     };
-    let block_slot = message.slot();
-    let bid = message.signed_execution_payload_bid().message.clone();
+    let block_slot = block.slot();
+    let bid = signed_bid.message.clone();
     if signed.message.builder_index != bid.builder_index
         || signed.message.payload.block_hash != bid.block_hash
     {
@@ -1728,6 +1962,7 @@ mod tests {
             options: BlockProcessingOptions::default(),
             inclusion_list_bits: None,
             inclusion_list_transactions: None,
+            eip8453: None,
         };
         assemble(
             &config(),

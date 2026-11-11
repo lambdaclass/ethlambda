@@ -294,6 +294,7 @@ impl World {
             SLOT,
             randao_reveal(&self.advanced()),
             RandaoVerification::Verify,
+            None,
         )
         .unwrap()
     }

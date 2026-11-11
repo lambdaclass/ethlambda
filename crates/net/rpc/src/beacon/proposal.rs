@@ -135,16 +135,16 @@ async fn post_block(
         .and_then(ForkName::parse);
     if !matches!(
         fork,
-        Some(ForkName::Fulu | ForkName::Gloas | ForkName::Heze)
+        Some(ForkName::Fulu | ForkName::Gloas | ForkName::Heze | ForkName::Eip8453)
     ) {
-        return ApiError::BadRequest("Eth-Consensus-Version must be fulu, gloas or heze")
+        return ApiError::BadRequest("Eth-Consensus-Version must be fulu, gloas, heze or eip8453")
             .into_response();
     }
     let encoding = match BodyEncoding::from_headers(&headers) {
         Ok(encoding) => encoding,
         Err(err) => return err.into_response(),
     };
-    if let Some(fork @ (ForkName::Gloas | ForkName::Heze)) = fork {
+    if let Some(fork @ (ForkName::Gloas | ForkName::Heze | ForkName::Eip8453)) = fork {
         return post_gloas_block(&store, &p2p, fork, encoding, &body).await;
     }
     let Some(contents) = encoding.decode::<FuluSignedBlockContents>(&body) else {
@@ -258,16 +258,19 @@ async fn post_gloas_block(
     encoding: BodyEncoding,
     body: &[u8],
 ) -> Response {
-    // Heze's body drops `eth1_data` and `deposits` (EIP-8015), so the header's
-    // fork picks the container to decode.
-    let block = if fork == ForkName::Heze {
-        encoding
+    // Heze's body drops `eth1_data` and `deposits` (EIP-8015) and EIP-8453's
+    // is another shape again, so the header's fork picks the container to
+    // decode.
+    let block = match fork {
+        ForkName::Heze => encoding
             .decode::<containers::heze::SignedBeaconBlock>(body)
-            .map(containers::SignedBeaconBlock::Heze)
-    } else {
-        encoding
+            .map(containers::SignedBeaconBlock::Heze),
+        ForkName::Eip8453 => encoding
+            .decode::<containers::eip8453::SignedBeaconBlock>(body)
+            .map(containers::SignedBeaconBlock::Eip8453),
+        _ => encoding
             .decode::<containers::gloas::SignedBeaconBlock>(body)
-            .map(containers::SignedBeaconBlock::Gloas)
+            .map(containers::SignedBeaconBlock::Gloas),
     };
     let Some(block) = block else {
         return ApiError::BadRequest("the body is not a gloas SignedBeaconBlock").into_response();
@@ -280,13 +283,16 @@ async fn post_gloas_block(
     ) {
         return err.into_response();
     }
-    // The bid's shape (heze's carries `inclusion_list_bits`) and the slot's fork
-    // must both be the one the header names.
+    // The bid's shape (heze's carries `inclusion_list_bits`, which EIP-8453
+    // keeps) and the slot's fork must both be the one the header names.
     let slot_fork = config.fork_at_epoch(compute_epoch_at_slot(block.slot()));
-    let bid_fork = block
-        .gloas_message()
-        .map(|message| message.signed_execution_payload_bid().message.fork_name());
-    if block.fork_name() != fork || bid_fork != Some(fork) || slot_fork != fork {
+    let bid_fork = block.payload_bid().map(|bid| bid.message.fork_name());
+    let expected_bid_fork = if fork == ForkName::Eip8453 {
+        ForkName::Heze
+    } else {
+        fork
+    };
+    if block.fork_name() != fork || bid_fork != Some(expected_bid_fork) || slot_fork != fork {
         return ApiError::BadRequest(
             "Eth-Consensus-Version, the block's shape and its slot's fork disagree",
         )
@@ -343,8 +349,9 @@ pub(crate) fn require_gloas_slot(
     message: &'static str,
 ) -> Result<(), ApiError> {
     match config.fork_at_epoch(compute_epoch_at_slot(slot)) {
-        ForkName::Gloas | ForkName::Heze => Ok(()),
-        // TODO(eip8453): EIP-8453's blocks and duties are a later phase.
+        // EIP-8453 keeps gloas's payload separation: its block commits to a
+        // bid, and the payload follows in an envelope.
+        ForkName::Gloas | ForkName::Heze | ForkName::Eip8453 => Ok(()),
         ForkName::Phase0
         | ForkName::Altair
         | ForkName::Bellatrix
@@ -352,7 +359,6 @@ pub(crate) fn require_gloas_slot(
         | ForkName::Deneb
         | ForkName::Electra
         | ForkName::Fulu
-        | ForkName::Eip8453
         | ForkName::Lean => Err(ApiError::BadRequest(message)),
     }
 }
