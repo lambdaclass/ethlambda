@@ -35,6 +35,11 @@ const SLOW_PEER_REPORT_THRESHOLD: usize = 10;
 /// peer's queue the same way it reports a full queue, so a saturated uplink or
 /// a stalled runtime on our side makes every peer look slow at once.
 /// Disconnecting them all in one check would leave the node without peers.
+///
+/// The cap bounds the rate, not the total: an uplink that stays too slow for
+/// gossip past the streak still drains peers, this many per check, while
+/// discovery refills them. That case is deliberately left alone, since
+/// bandwidth that slow is not something the node can solve from its side.
 const MAX_SLOW_PEER_DISCONNECTS_PER_CHECK: usize = 10;
 
 pub enum SwarmCommand {

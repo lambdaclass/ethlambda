@@ -349,6 +349,11 @@ every peer look slow at once:
   back this way are logged as a warning, since many peers failing together
   points at our side.
 
+The cap bounds the rate, not the total. A node whose own uplink stays too slow
+for gossip past the streak still loses up to `MAX_SLOW_PEER_DISCONNECTS_PER_CHECK`
+peers per check while discovery refills them. That case is deliberately left
+alone: bandwidth that slow is not something the node can solve from its side.
+
 A dead stream on a peer that gets little traffic, such as one gossipsub has
 already pruned from the mesh, may stay under the threshold. Its queue then
 stays pinned until the connection closes, as it did before this check existed.
