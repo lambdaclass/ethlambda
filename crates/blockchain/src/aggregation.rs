@@ -52,6 +52,7 @@
 //! [`AggregationWorker::pause`] and [`AggregationWorker::set_paused`]).
 
 use std::collections::{HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
@@ -72,7 +73,7 @@ use ethlambda_types::{
 use spawned_concurrency::message::Message;
 use spawned_concurrency::tasks::ActorRef;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, trace, warn};
+use tracing::{error, info, trace, warn};
 
 use crate::block_builder::{self, EntryScore};
 use crate::{SlotInterval, metrics};
@@ -1132,6 +1133,26 @@ pub fn aggregate_job(job: AggregationJob) -> Option<AggregatedGroupOutput> {
     })
 }
 
+/// [`aggregate_job`] for the worker loop, with a panic reported as a failed
+/// proof instead of unwinding out of it.
+///
+/// The worker is one thread for the process's whole life, and nothing looks at
+/// it before shutdown, so a panic escaping a job would end aggregation for
+/// good, silently. A prover panic does reach this thread: `prove` catches it on
+/// the prover thread and re-raises it on the caller. Under per-slot sessions
+/// the same panic cost one session; here it costs one job, which the worker's
+/// failure branch then handles like any other failed proof.
+///
+/// `AssertUnwindSafe` holds because the job is moved in and dropped with the
+/// unwind, and nothing the closure touches is left half-written for the next
+/// round: the store is only written afterwards, by [`store_aggregate`].
+fn aggregate_job_catching_panics(job: AggregationJob) -> Option<AggregatedGroupOutput> {
+    std::panic::catch_unwind(AssertUnwindSafe(|| aggregate_job(job)))
+        .inspect_err(|_| error!("Aggregation job panicked; the worker carries on"))
+        .ok()
+        .flatten()
+}
+
 /// Store one aggregate the worker just produced and build the announcement
 /// for the actor: the proof into the pending payload pool, and the gossip
 /// signatures it consumed out of the pool.
@@ -1554,7 +1575,7 @@ fn run_aggregation_worker(
         let children = job.children.len();
 
         let job_start = Instant::now();
-        let output = aggregate_job(job);
+        let output = aggregate_job_catching_panics(job);
         let elapsed = job_start.elapsed();
 
         let Some(output) = output else {
@@ -2335,6 +2356,30 @@ mod tests {
             resolved.keys_to_delete.is_empty(),
             "nothing to delete from gossip: this candidate has no gossip sigs"
         );
+    }
+
+    // ---- proving ----
+
+    /// A job that panics comes back to the worker loop as a failed proof
+    /// instead of unwinding through it. The loop is the worker thread's whole
+    /// life, so an escaped panic would stop aggregation until the process
+    /// restarts, with nothing logged. Driven through `aggregate_job`'s slot
+    /// width check, which panics before the prover is reached; a prover panic
+    /// arrives the same way, re-raised on this thread by `prove`.
+    #[test]
+    fn a_panicking_job_comes_back_as_a_failed_proof() {
+        let job = AggregationJob {
+            hashed: dummy_hashed(),
+            slot: u64::from(u32::MAX) + 1,
+            children: Vec::new(),
+            accepted_child_ids: Vec::new(),
+            raw_pubkeys: Vec::new(),
+            raw_sigs: Vec::new(),
+            raw_ids: vec![0, 1],
+            keys_to_delete: Vec::new(),
+        };
+
+        assert!(aggregate_job_catching_panics(job).is_none());
     }
 
     // ---- ordering ----
