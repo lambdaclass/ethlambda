@@ -36,8 +36,9 @@ use ethlambda_types::beacon::primitives::{Root, ValidatorIndex};
 use libp2p::PeerId;
 use libp2p::gossipsub::{MessageAcceptance, MessageId};
 use spawned_concurrency::message::Message;
+use spawned_concurrency::send_handler;
 use spawned_concurrency::tasks::{
-    BlockingJobPermit, Context, Handler, JobError, JobOptions, JobOutcome, PendingReply,
+    BlockingJobPermit, Context, Handler, JobError, JobOptions, JobOutcome,
 };
 use tracing::{debug, error, warn};
 
@@ -549,13 +550,9 @@ fn settle(server: &mut P2PServer, outcome: Outcome, object: &Validated) -> Outco
     }
 }
 
+#[send_handler]
 impl Handler<GossipVerdict> for P2PServer {
-    async fn handle(
-        &mut self,
-        msg: GossipVerdict,
-        _reply: PendingReply<'_, ()>,
-        _ctx: &Context<Self>,
-    ) {
+    async fn handle(&mut self, msg: GossipVerdict, _ctx: &Context<Self>) {
         let GossipVerdict { id, checked } = msg;
         let (outcome, object) = match checked {
             JobOutcome::Ok((outcome, object)) => (settle(self, outcome, &object), Some(object)),

@@ -39,10 +39,10 @@ use spawned_concurrency::actor;
 use spawned_concurrency::error::ActorError;
 use spawned_concurrency::message::Message;
 use spawned_concurrency::protocol;
+use spawned_concurrency::send_handler;
 use spawned_concurrency::system::{ExecutionGroup, SystemError};
 use spawned_concurrency::tasks::{
-    Actor, ActorRef, ActorStart, Context, Handler, JobKey, JobOptions, JobOutcome, PendingReply,
-    send_after,
+    Actor, ActorRef, ActorStart, Context, Handler, JobKey, JobOptions, JobOutcome, send_after,
 };
 use tracing::{debug, error, info, trace, warn};
 
@@ -3864,15 +3864,17 @@ use ethlambda_network_api::p2p_to_block_chain::{
     NewBlock, NewDataColumnSidecars, NewExecutionPayloadEnvelope, NewPayloadAttestationMessage,
 };
 
+#[send_handler]
 impl Handler<InitP2P> for BlockChainServer {
-    async fn handle(&mut self, msg: InitP2P, _reply: PendingReply<'_, ()>, _ctx: &Context<Self>) {
+    async fn handle(&mut self, msg: InitP2P, _ctx: &Context<Self>) {
         self.p2p = Some(msg.p2p);
         info!("P2P protocol ref initialized");
     }
 }
 
+#[send_handler]
 impl Handler<NewBlock> for BlockChainServer {
-    async fn handle(&mut self, msg: NewBlock, _reply: PendingReply<'_, ()>, ctx: &Context<Self>) {
+    async fn handle(&mut self, msg: NewBlock, ctx: &Context<Self>) {
         let arrival_ms = unix_now_ms();
         // The mailbox hop ends here. Everything before it happened in the p2p
         // actor and rode in on the message, because nothing on this side can
@@ -3982,13 +3984,9 @@ impl Handler<NewBlock> for BlockChainServer {
     }
 }
 
+#[send_handler]
 impl Handler<NewExecutionPayloadEnvelope> for BlockChainServer {
-    async fn handle(
-        &mut self,
-        msg: NewExecutionPayloadEnvelope,
-        _reply: PendingReply<'_, ()>,
-        _ctx: &Context<Self>,
-    ) {
+    async fn handle(&mut self, msg: NewExecutionPayloadEnvelope, _ctx: &Context<Self>) {
         // Beacon-only: lean has no execution payload envelopes.
         let ChainDuties::Beacon = &self.duties else {
             return;
@@ -4001,13 +3999,9 @@ impl Handler<NewExecutionPayloadEnvelope> for BlockChainServer {
     }
 }
 
+#[send_handler]
 impl Handler<NewPayloadAttestationMessage> for BlockChainServer {
-    async fn handle(
-        &mut self,
-        msg: NewPayloadAttestationMessage,
-        _reply: PendingReply<'_, ()>,
-        ctx: &Context<Self>,
-    ) {
+    async fn handle(&mut self, msg: NewPayloadAttestationMessage, ctx: &Context<Self>) {
         // Beacon-only: lean has no payload timeliness committee.
         let ChainDuties::Beacon = &self.duties else {
             return;
@@ -4026,13 +4020,9 @@ impl Handler<NewPayloadAttestationMessage> for BlockChainServer {
     }
 }
 
+#[send_handler]
 impl Handler<NewAttestation> for BlockChainServer {
-    async fn handle(
-        &mut self,
-        msg: NewAttestation,
-        _reply: PendingReply<'_, ()>,
-        ctx: &Context<Self>,
-    ) {
+    async fn handle(&mut self, msg: NewAttestation, ctx: &Context<Self>) {
         // Lean-only. A beacon node subscribes to no attestation subnet, so
         // nothing delivers this message there; fork choice learns its votes
         // from block bodies inside `on_block` instead. `current_slot` below is
@@ -4063,13 +4053,9 @@ impl Handler<NewAttestation> for BlockChainServer {
     }
 }
 
+#[send_handler]
 impl Handler<NewAggregatedAttestation> for BlockChainServer {
-    async fn handle(
-        &mut self,
-        msg: NewAggregatedAttestation,
-        _reply: PendingReply<'_, ()>,
-        _ctx: &Context<Self>,
-    ) {
+    async fn handle(&mut self, msg: NewAggregatedAttestation, _ctx: &Context<Self>) {
         // Lean-only: beacon gossip aggregates are out of scope for this actor.
         let ChainDuties::Lean(_) = &self.duties else {
             return;
@@ -4080,36 +4066,24 @@ impl Handler<NewAggregatedAttestation> for BlockChainServer {
     }
 }
 
+#[send_handler]
 impl Handler<NewDataColumnSidecars> for BlockChainServer {
-    async fn handle(
-        &mut self,
-        msg: NewDataColumnSidecars,
-        _reply: PendingReply<'_, ()>,
-        _ctx: &Context<Self>,
-    ) {
+    async fn handle(&mut self, msg: NewDataColumnSidecars, _ctx: &Context<Self>) {
         self.on_checked_data_columns(msg.sidecars).await;
         self.settle_envelopes().await;
     }
 }
 
+#[send_handler]
 impl Handler<DataColumnSidecarsAwaitingParent> for BlockChainServer {
-    async fn handle(
-        &mut self,
-        msg: DataColumnSidecarsAwaitingParent,
-        _reply: PendingReply<'_, ()>,
-        _ctx: &Context<Self>,
-    ) {
+    async fn handle(&mut self, msg: DataColumnSidecarsAwaitingParent, _ctx: &Context<Self>) {
         self.park_data_columns(msg.sidecars);
     }
 }
 
+#[send_handler]
 impl Handler<NewBeaconAggregate> for BlockChainServer {
-    async fn handle(
-        &mut self,
-        msg: NewBeaconAggregate,
-        _reply: PendingReply<'_, ()>,
-        _ctx: &Context<Self>,
-    ) {
+    async fn handle(&mut self, msg: NewBeaconAggregate, _ctx: &Context<Self>) {
         // Beacon-only: nothing subscribes a lean node to this topic, so a
         // message here would be a dispatch bug rather than a chain that has
         // nothing to do with it. Dropped rather than panicked on, the way
@@ -4135,13 +4109,9 @@ impl Handler<NewBeaconAggregate> for BlockChainServer {
 // message that does not apply to this chain is a real outcome there, while
 // below it the same situation is a dispatch bug. See `ChainDuties`.
 
+#[send_handler]
 impl Handler<AggregateProduced> for BlockChainServer {
-    async fn handle(
-        &mut self,
-        msg: AggregateProduced,
-        _reply: PendingReply<'_, ()>,
-        _ctx: &Context<Self>,
-    ) {
+    async fn handle(&mut self, msg: AggregateProduced, _ctx: &Context<Self>) {
         let ChainDuties::Lean(_) = &self.duties else {
             return;
         };
@@ -4189,13 +4159,9 @@ impl BlockChainServer {
     }
 }
 
+#[send_handler]
 impl Handler<EarlyAggregationCheck> for BlockChainServer {
-    async fn handle(
-        &mut self,
-        _msg: EarlyAggregationCheck,
-        _reply: PendingReply<'_, ()>,
-        ctx: &Context<Self>,
-    ) {
+    async fn handle(&mut self, _msg: EarlyAggregationCheck, ctx: &Context<Self>) {
         let ChainDuties::Lean(_) = &self.duties else {
             return;
         };
@@ -4203,13 +4169,9 @@ impl Handler<EarlyAggregationCheck> for BlockChainServer {
     }
 }
 
+#[send_handler]
 impl Handler<AggregationDone> for BlockChainServer {
-    async fn handle(
-        &mut self,
-        msg: AggregationDone,
-        _reply: PendingReply<'_, ()>,
-        _ctx: &Context<Self>,
-    ) {
+    async fn handle(&mut self, msg: AggregationDone, _ctx: &Context<Self>) {
         let ChainDuties::Lean(lean) = &self.duties else {
             return;
         };
@@ -4268,13 +4230,9 @@ impl Message for PublishBuiltBlock {
     type Result = ();
 }
 
+#[send_handler]
 impl Handler<BlockSealed> for BlockChainServer {
-    async fn handle(
-        &mut self,
-        msg: BlockSealed,
-        _reply: PendingReply<'_, ()>,
-        ctx: &Context<Self>,
-    ) {
+    async fn handle(&mut self, msg: BlockSealed, ctx: &Context<Self>) {
         let ChainDuties::Lean(_) = &self.duties else {
             return;
         };
@@ -4282,13 +4240,9 @@ impl Handler<BlockSealed> for BlockChainServer {
     }
 }
 
+#[send_handler]
 impl Handler<PublishBuiltBlock> for BlockChainServer {
-    async fn handle(
-        &mut self,
-        msg: PublishBuiltBlock,
-        _reply: PendingReply<'_, ()>,
-        _ctx: &Context<Self>,
-    ) {
+    async fn handle(&mut self, msg: PublishBuiltBlock, _ctx: &Context<Self>) {
         let ChainDuties::Lean(_) = &self.duties else {
             return;
         };
@@ -6386,13 +6340,9 @@ mod tests {
     impl Message for Logged {
         type Result = ();
     }
+    #[send_handler]
     impl Handler<Logged> for BlockChainServer {
-        async fn handle(
-            &mut self,
-            msg: Logged,
-            _reply: PendingReply<'_, ()>,
-            _ctx: &Context<Self>,
-        ) {
+        async fn handle(&mut self, msg: Logged, _ctx: &Context<Self>) {
             msg.0.lock().unwrap().push(msg.1);
         }
     }

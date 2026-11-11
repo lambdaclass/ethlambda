@@ -18,10 +18,11 @@ use std::{future::Future, io, pin::Pin, sync::Arc, time::Duration};
 
 use spawned_concurrency::actor;
 use spawned_concurrency::message::Message;
+use spawned_concurrency::send_handler;
 use spawned_concurrency::supervision::{
     Backoff, SupervisedChild, Supervisor, SupervisorConfig, SupervisorStrategy,
 };
-use spawned_concurrency::tasks::{Actor, Context, Handler, PendingReply};
+use spawned_concurrency::tasks::{Actor, Context, Handler};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -106,13 +107,9 @@ impl Message for InjectCrash {
     type Result = ();
 }
 
+#[send_handler]
 impl Handler<InjectCrash> for HttpServer {
-    async fn handle(
-        &mut self,
-        _msg: InjectCrash,
-        _reply: PendingReply<'_, ()>,
-        _ctx: &Context<Self>,
-    ) {
+    async fn handle(&mut self, _msg: InjectCrash, _ctx: &Context<Self>) {
         panic!("fault injection: crashing the HTTP server");
     }
 }
