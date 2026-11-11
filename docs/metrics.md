@@ -141,7 +141,7 @@ aggregators during the head-update interval for the next slot's proposer to adop
 | `lean_block_body_proof_building_time_seconds` | Histogram | Time taken to build a candidate block body proof (the attestation Type-1 → Type-2 merge) | On body proof production | | 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4 |
 | `lean_block_body_proof_candidates` | Histogram | Candidate body proofs a proposer had to choose from; `0` means the block could only be empty | On block production | | 0, 1, 2, 3, 4, 6, 8 |
 | `lean_block_body_source_total` | Counter | Where a proposed block's body came from | On block production | source=body_proof,empty | |
-| `lean_block_body_proof_rejected_total` | Counter | Candidate body proofs a proposer rejected | On block production | reason=off_chain_vote,state_transition,verification | |
+| `lean_block_body_proof_rejected_total` | Counter | Candidate body proofs a proposer rejected | On block production | reason=duplicate_data,off_chain_vote,state_transition,verification | |
 
 Since the proposer no longer packs a body, `lean_block_building_time_seconds` now measures
 assembly only — choosing a candidate, verifying it, signing — and the merge it used to

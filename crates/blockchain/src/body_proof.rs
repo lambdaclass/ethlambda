@@ -256,8 +256,10 @@ impl BodyVoters {
 /// Each candidate is screened against the chain the block would extend, sealed
 /// against `head_state` — the state transition both applies its attestations
 /// and computes the state root — and scored by [`BodyValue`]. The best
-/// candidate that beats the empty body is adopted, with three caveats:
+/// candidate that beats the empty body is adopted, with four caveats:
 ///
+/// - a candidate carrying one `AttestationData` twice is dropped. Block import
+///   rejects it and the state transition does not, so it would cost the slot;
 /// - a candidate carrying a vote that does not sit on that chain is dropped.
 ///   The state transition does not check those roots, so a body packed against
 ///   another node's view would otherwise be carried verbatim — valid, and
@@ -305,6 +307,15 @@ pub(crate) fn choose_body(
     for candidate in candidates.iter() {
         let body = candidate.body_proof.block_body.clone();
         let attestation_count = body.attestations.len();
+        if repeats_attestation_data(&body) {
+            trace!(
+                %slot,
+                attestation_count,
+                "Rejected a candidate body proof: it repeats attestation data"
+            );
+            metrics::inc_body_proof_rejected("duplicate_data");
+            continue;
+        }
         if !body_votes_on_chain(&body, &chain_view) {
             trace!(
                 %slot,
@@ -404,6 +415,21 @@ fn body_votes_on_chain(body: &BlockBody, chain_view: &[H256]) -> bool {
     body.attestations
         .iter()
         .all(|attestation| attestation_data_matches_chain(chain_view, &attestation.data))
+}
+
+/// Whether a body carries some `AttestationData` more than once.
+///
+/// Block import rejects such a body (`StoreError::DuplicateAttestationData`)
+/// while the state transition accepts it, so `seal_block` alone would let the
+/// proposer sign a block its own import then refuses. Nor does the aggregate
+/// check catch it: leanVM groups claims by message, so splitting one entry of
+/// a valid body into two still verifies against that body's proof.
+fn repeats_attestation_data(body: &BlockBody) -> bool {
+    let mut seen = HashSet::with_capacity(body.attestations.len());
+    !body
+        .attestations
+        .iter()
+        .all(|attestation| seen.insert(&attestation.data))
 }
 
 /// Count the validators a body's attestations add on top of `head_state`.
@@ -813,6 +839,23 @@ mod tests {
     fn choose_body_rejects_a_candidate_voting_off_chain() {
         let mut candidates = BodyProofBuffer::default();
         candidates.push_local(candidate(vec![off_chain_vote()]));
+
+        let chosen = choose(&candidates);
+
+        assert!(!chosen.adopted);
+    }
+
+    /// Block import rejects a body carrying one `AttestationData` twice
+    /// (`StoreError::DuplicateAttestationData`) though the state transition
+    /// accepts it, so without this screen the proposer would sign a block its
+    /// own import then refuses, and with a one-time key that slot is lost. The
+    /// aggregate check does not catch it either: leanVM groups claims by
+    /// message, so a body split from a valid one verifies against that body's
+    /// proof. Marked local here so the screen alone decides.
+    #[test]
+    fn choose_body_rejects_a_candidate_repeating_attestation_data() {
+        let mut candidates = BodyProofBuffer::default();
+        candidates.push_local(candidate(vec![head_vote(&[0, 1]), head_vote(&[2])]));
 
         let chosen = choose(&candidates);
 

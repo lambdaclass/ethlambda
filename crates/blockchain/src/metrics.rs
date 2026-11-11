@@ -942,10 +942,16 @@ const AGGREGATOR_SKIP_REASONS: &[&str] = &[
 const BLOCK_BODY_SOURCES: &[&str] = &["body_proof", "empty"];
 
 /// Label values for `lean_block_body_proof_rejected_total`: a candidate
+/// carrying one attestation data twice, which block import rejects, one
 /// carrying a vote this node cannot place on the chain the block would extend,
 /// one whose attestations its own state transition rejected, and one whose
 /// aggregate failed verification.
-const BODY_PROOF_REJECT_REASONS: &[&str] = &["off_chain_vote", "state_transition", "verification"];
+const BODY_PROOF_REJECT_REASONS: &[&str] = &[
+    "duplicate_data",
+    "off_chain_vote",
+    "state_transition",
+    "verification",
+];
 
 static LEAN_AGGREGATOR_SKIPPED_TOTAL: std::sync::LazyLock<IntCounterVec> =
     std::sync::LazyLock::new(|| {
