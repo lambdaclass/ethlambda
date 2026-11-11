@@ -123,11 +123,12 @@ pub fn stateful_checks(store: &Store, envelope: &gloas::SignedExecutionPayloadEn
         Ok(block) => block,
         Err(outcome) => return outcome,
     };
-    // A block of any other fork carries no bid, so no envelope is valid for it.
-    let Some(block) = block.gloas_message() else {
+    // A block of any fork before gloas carries no bid, so no envelope is valid
+    // for it. Gloas, heze and EIP-8453 all carry gloas's bid.
+    let Some(signed_bid) = block.payload_bid() else {
         return Outcome::Reject(RejectReason::BlockNotGloas);
     };
-    let bid = &block.signed_execution_payload_bid().message;
+    let bid = &signed_bid.message;
 
     // [REJECT] The block's slot matches the payload's slot number.
     if block.slot() != payload.slot_number {

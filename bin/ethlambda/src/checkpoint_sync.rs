@@ -178,6 +178,11 @@ pub enum CheckpointSyncError {
     FinalizedExceedsStateSlot,
     #[error("justified slot cannot precede finalized slot")]
     JustifiedPrecedesFinalized,
+    #[error(
+        "an EIP-8453 anchor must be its own state's finality gadget target (the state's \
+         target_checkpoint names another block)"
+    )]
+    AnchorNotItsTarget,
     #[error("justified and finalized at same slot must have matching roots")]
     JustifiedFinalizedRootMismatch,
     #[error("block header slot exceeds state slot")]
@@ -620,9 +625,22 @@ fn verify_beacon_checkpoint_state(state: &BeaconState) -> Result<(), CheckpointS
     }
 
     if let BeaconState::Eip8453(inner) = state {
+        // EIP-8453's `get_forkchoice_store` trusts the anchor as justified and
+        // finalized at its post-state's target height, and asserts the anchor
+        // is that target once `process_slot` has filled an empty root in: the
+        // finality gadget's finalized block, which a provider serves as the
+        // finalized state, is one. Any other block would anchor the gadget on
+        // a height it never reached.
+        if !inner.target_checkpoint.root.is_zero() {
+            let mut header = inner.latest_block_header.clone();
+            if header.state_root.is_zero() {
+                header.state_root = state.hash_tree_root();
+            }
+            if inner.target_checkpoint.root != header.hash_tree_root() {
+                return Err(CheckpointSyncError::AnchorNotItsTarget);
+            }
+        }
         // The finality gadget's own forms of the two checks below.
-        // TODO(eip8453): unreachable while `refuse_unfollowable_fork` refuses
-        // an EIP-8453 anchor; revisit with its checkpoint sync.
         if inner.finalized_slot > state.slot() {
             return Err(CheckpointSyncError::FinalizedExceedsStateSlot);
         }

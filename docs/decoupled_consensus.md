@@ -249,6 +249,44 @@ Local devnet: `tooling/decoupled-devnet/lean-local.sh start|status|stop`.
 ## Beacon
 
 The beacon chain's EIP-8453 fork (types and state transition, built on Heze)
-is being implemented separately. Its fork choice is this engine, fed as the
-"What a host supplies" table says; the FG rules then come from
-`BeaconState` rather than `chain_state.rs`.
+runs this engine as its fork choice, fed as the "What a host supplies" table
+says; the FG rules come from `BeaconState` rather than `chain_state.rs`.
+
+```text
+crates/blockchain/state_transition/src/beacon/
+  eip8453_fork_choice.rs     the host: Δ ticks on the schedule-aware slot clock,
+                             BlockInput from a block and its post-state, anchors,
+                             is_finalized_ancestor, get_latest_attestation_committee_slot,
+                             the execution hashes (get_confirmed_execution_block_hash)
+  eip8453_node.rs            SharedEip8453Node: the engine, the gossip Seen sets,
+                             the signed head votes and single attestations behind it,
+                             duty inputs recorded at their instants
+  eip8453_block_production.rs  pack_attestations, assemble_block
+  gossip/{head_vote,fg_attestation}.rs  the two new topics' rules, and `submit`
+  gossip/block.rs            EIP-8453's modified beacon_block rules
+crates/blockchain/src/beacon_eip8453.rs   the chain actor: install, replay, tick,
+                                          feed, head and checkpoints, forkchoiceUpdated
+crates/blockchain/src/beacon_eip8453_network_tests.rs  in-process networks
+```
+
+- **Time.** The engine's tick is `4 * slot + quarter` from the beacon slot
+  clock (heze's slot duration change included), so its `slot_of` agrees with
+  the beacon slot. The chain actor ticks every quarter slot from a slot
+  before the fork.
+- **Blocks.** `fork_choice::on_block` runs an EIP-8453 block's state
+  transition and gloas's payload bookkeeping only; the actor then records the
+  head vote committees of the votes it carries (from its post-state) and
+  hands the engine its `BlockInput`. Envelopes reach the engine once
+  verified, with their inclusion list verdict.
+- **The fork transition and restarts** both anchor the engine at the store's
+  finalized block and replay the stored blocks above it; at the transition a
+  lock is seeded on the last LMD-GHOST head. See `docs/spec_deviations.md`
+  (EIP-8453) for both.
+- **Head and finality.** The actor writes the engine's head (with its
+  payload status) and the gadget's justified and finalized blocks to the
+  store, which prunes on the finalized one, and sends `forkchoiceUpdated`
+  with the head node's payload, the confirmed node's (safe) and the finalized
+  block's.
+- **Gossip.** `head_vote` and `attestation_{subnet_id}` are validated off the
+  actor and applied to the shared node; validator clients' own messages go
+  through the same rules (`submit`) and are then published.

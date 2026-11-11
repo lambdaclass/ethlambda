@@ -743,27 +743,195 @@ reads, and refuses to when that root is optimistic
 EIP-8453's types, configuration and state transition follow
 `specs/_features/eip8453/{beacon-chain,fork}.md` at
 ethereum/consensus-specs `decoupled-consensus`
-`0f4fa3ffdd26ec083ff4dba65645d81433178413`. No consensus-spec-tests release
-ships EIP-8453 fixtures, so the port is checked by unit tests only (see
-[beacon_stf.md](./beacon_stf.md#eip-8453)). The entries below are the places
-where the specification is silent, marked unfinished, or where this node
-computes the same value another way.
+`0f4fa3ffdd26ec083ff4dba65645d81433178413`, and its fork choice and networking
+`fork-choice.md` and `p2p-interface.md` there. No consensus-spec-tests release
+ships EIP-8453 fixtures, so the port is checked by unit tests and the
+in-process network tests (`crates/blockchain/src/beacon_eip8453_network_tests.rs`)
+only (see [beacon_stf.md](./beacon_stf.md#eip-8453)). The entries below are
+the places where the specification is silent, marked unfinished, or where this
+node computes the same value another way.
 
-### The fork is not followed yet
+### The node follows the fork; validator duties and the Beacon API do not yet
 
 - **The specification:** an EIP-8453 chain runs its own fork choice (the
   finality gadget's store and the available chain), gossip and validator
   duties.
-- **ethlambda:** only the types, configuration and state transition exist.
-  `ForkName::Eip8453.is_followed()` answers `false`, so an anchor at the fork
-  is refused and a scheduled fork is warned about. Fork choice refuses an
-  EIP-8453 block (`on_block` answers `UnsupportedForFork`), gossip ignores its
-  blocks (`IgnoreReason::UnsupportedFork`) and its attestations, aggregates and
-  attester slashings (`DecodeError::UnsupportedFork`) and subscribes heze's
-  topics under its digest, and the Beacon API refuses its
-  finality checkpoints, attestation data, submissions and block production.
-  Each such site is marked `TODO(eip8453)`.
-- **Why:** those layers are later phases of the port.
+- **ethlambda:** the beacon node follows it: the chain actor runs the
+  `ethlambda-decoupled` engine at EIP-8453 time (`beacon_eip8453.rs`), the p2p
+  layer serves the fork's topics and protocols, and
+  `ForkName::Eip8453.is_followed()` answers `true`. The validator client and
+  the Beacon API's EIP-8453 endpoints (attestation data, submissions, block
+  production, the finality checkpoints) are the next phase; each such site is
+  still marked `TODO(eip8453)`. The node-side handle they build on is
+  `SharedEip8453Node` (duty inputs, proposal assembly inputs) with
+  `gossip::head_vote::submit` / `gossip::fg_attestation::submit` and
+  `RpcToP2P::publish_head_vote` / `publish_fg_attestation`.
+- **Why:** the port is phased.
+
+### The fork-choice handover at `EIP8453_FORK_EPOCH`
+
+- **The specification:** fork.md starts the finality gadget at height 0 from
+  the last finalized Casper FFG checkpoint, with the latest pre-fork block as
+  the target of height 1, and its `get_forkchoice_store` only describes a
+  store anchored at an EIP-8453 block. How a running node moves from
+  LMD-GHOST to the new fork choice is not specified; `add_lock`'s note names
+  "a lock seeded at a fork transition" as a lock producer without defining
+  one.
+- **ethlambda:** once the clock reaches the fork's first slot (after
+  LMD-GHOST's clock has run up to it, so its last epoch pull-up of Casper
+  FFG's checkpoints has happened), or the first EIP-8453 block is imported,
+  the engine is anchored at the store's finalized block (Casper FFG's), at
+  height 0, and every stored block above it is replayed into it: pre-fork
+  blocks with every checkpoint at height 0 on the anchor
+  (`pre_fork_checkpoints`), EIP-8453 blocks with their post-states'
+  checkpoints. Then a lock is seeded on the last LMD-GHOST head node (its
+  payload status as LMD-GHOST picked it, the EMPTY branch when that FULL node
+  is not in the engine's tree) with the deadline a confirmation of the last
+  pre-fork slot gets (`lock_deadline(fork_slot - 1)`, the head vote deadline
+  of `fork_slot + SLOW_LOCK_WINDOW`), and only then are the present instant's
+  duty inputs recorded.
+- **Why:** at the fork's first slot no head vote of the previous slot exists,
+  so the available chain's walk ends at its anchor, the finalized block, and
+  the first proposal would orphan every block since
+  (`the_handover_lock_keeps_the_pre_fork_chain` shows it). Anchoring at the
+  finalized block rather than the last pre-fork block keeps every branch that
+  descends from Casper FFG's finality, as fork.md's height 0 does; giving the
+  pre-fork blocks height 0 keeps them viable until height 1 is justified and
+  never makes one an FG source (a height-0 target is not well formed). The
+  lock lives as long as one the protocol itself would create, after which the
+  available chain's own confirmations hold the head.
+
+### A genesis upgrade leaves the first target root for `process_slot`
+
+- **The specification:** `upgrade_to_eip8453` sets the height-1 target to
+  `hash_tree_root(pre.latest_block_header)`.
+- **ethlambda:** when that header's `state_root` is still zero (only at
+  genesis: every later upgrade runs after a `process_slot` filled it), the
+  target root is left empty instead, as `advance_height` leaves it, and the
+  first `process_slot` fills it with the genesis block's root. A network
+  whose `EIP8453_FORK_EPOCH` is 0 may ship a heze `genesis.ssz`, which
+  `NetworkDir::load` upgrades through the fork.
+- **Why:** at genesis that header's root names no block, so no attestation
+  could name the gadget's first target, `get_forkchoice_store`'s assertion
+  that the anchor is its own target fails, and the chain could never justify.
+  The genesis block is the latest block before the upgrade, which is what
+  fork.md says the first target is.
+
+### A zero finalized root at height 0 is the genesis block
+
+- **The specification:** `is_finalized_ancestor` compares
+  `get_ancestor(store, root, state.finalized_slot).root` with
+  `state.finalized_checkpoint.root`.
+- **ethlambda:** a zero `finalized_checkpoint.root` (the gadget started from a
+  chain that never finalized under Casper FFG, whose checkpoint root is zero,
+  or at genesis) answers "descends" for every block.
+- **Why:** that is the genesis checkpoint, which every phase0 store reads as
+  the genesis block; comparing roots would ignore every block and vote until
+  the gadget's first finalization.
+
+### `is_finalized_ancestor` and the block's finalized slot read the store's finalized block when it is later
+
+- **The specification:** both read the head's post-state: `state.finalized_slot`
+  for the block rule, `state.finalized_checkpoint` for the ancestry.
+- **ethlambda:** when the store's finalized block (the gadget's best, which
+  the store also prunes below) is at or after the head state's, it is used
+  instead. Block gossip reads it for the finalized slot too, and the
+  ancestry checks of blocks, head votes and attestations walk to it.
+- **Why:** the store's finalized block is on the head's chain and descends
+  from the head state's, so descending from it implies the specification's
+  answer, and the live-chain rows below it are pruned, so walking to the head
+  state's older one could fall off them. A block at or below the store's
+  finalized slot cannot descend from it unless it is it.
+
+### Head votes reach the head at the next quarter-slot tick
+
+- **The specification:** `get_head` is a function of the store, evaluated
+  whenever it is needed.
+- **ethlambda:** an accepted head vote is applied to the shared engine when
+  its gossip verdict settles (p2p) or when it is submitted (Beacon API); the
+  chain actor writes the head the store and the execution client see at its
+  quarter-slot ticks and after each import. Validator duties read the engine
+  directly.
+- **Why:** a vote of the current slot moves `get_head` only from the support
+  cutoff, which is a tick; votes arriving later move it within `Δ`. Taking
+  the head on every vote would write the store and call
+  `forkchoiceUpdated` once per committee member.
+
+### A restarted node rejoins as a joining node
+
+- **The specification:** the store is in memory; nothing says what survives a
+  restart.
+- **ethlambda:** a restart anchors a fresh engine at the stored finalized
+  block (the gadget's, or Casper FFG's before the gadget has finalized),
+  replays every stored block above it in slot order (their post-states'
+  checkpoints, their head votes, their verified payloads), and starts the
+  clock at the present: receipt times are the restart's, and the p2p head
+  vote pool, the locks and the saved confirmations start empty. The lean
+  decoupled mode restarts the same way.
+- **Why:** the locks and confirmations are a function of what this node saw
+  and when, which a restart has lost; the engine catches up from the next
+  slot's votes (`an_in_process_network_crosses_the_fork_and_finalizes_with_the_gadget`
+  restarts a node mid-chain and checks it).
+
+### The stored finalized and justified rows name the gadget's blocks
+
+- **The specification:** the store's checkpoints are `HeightCheckpoint`s.
+- **ethlambda:** the slot-denominated `latest_finalized`/`latest_justified`
+  rows every slot reader and pruning use hold the gadget's checkpoint blocks
+  at their own slots once the gadget reaches height 1 (Casper FFG's rows,
+  epoch start slots, stay until then); the heights are in `fg_justified` and
+  `fg_finalized` metadata keys. An EIP-8453 checkpoint-sync anchor is recorded
+  at its own slot too. No table layout changed, so `DB_VERSION` did not.
+- **Why:** one row for both forks keeps every reader (pruning, the envelope
+  and column finality sweeps, gossip) unchanged; the readers that used to
+  convert the row to an epoch and back now read its slot, which is the same
+  value before EIP-8453.
+
+### Gossip rules this node cannot fully apply
+
+- **The specification:** a voted block or target that is stored but failed
+  validation is `REJECT`; `attester_slashing` keeps its validation rules over
+  the modified container; `head_vote_aggregate` and `attestation_aggregate`
+  are TODOs.
+- **ethlambda:** a block without a post-state is `IGNORE` (no bad-block
+  cache, as for every other topic); an EIP-8453 attester slashing decodes and
+  is `IGNORE`d, as every operation is under a gloas or later head; the two
+  aggregate topics are not subscribed; `head_vote` and the
+  `attestation_{subnet_id}` subnets are unscored. A head vote's committee and
+  domain, and an attestation's, are read from the head state advanced to the
+  message's epoch when it is older (`get_pulled_up_state`, which
+  `on_head_vote_message` reads), so the fork's first epoch can be judged
+  while the head is a heze block.
+
+### The execution layer's view
+
+- **The specification:** `forkchoiceUpdated`'s safe block is
+  `get_confirmed_execution_block_hash`; the head and finalized hashes follow
+  gloas's `notify_forkchoice_updated`.
+- **ethlambda:** head: the head node's payload (`bid.block_hash` FULL,
+  `bid.parent_block_hash` EMPTY); safe: `get_confirmed_execution_block_hash`;
+  finalized: the gadget's finalized block read as a pending node, i.e. the
+  payload it builds on (`bid.parent_block_hash`), as gloas reads a checkpoint
+  block. `engine_newPayloadV6` and `engine_forkchoiceUpdatedV5`, heze's, carry
+  the envelopes and the head. A payload the execution client later finds
+  `INVALID` is cut out of the store's payload structures as under gloas, but
+  the engine keeps it as verified: it has no removal handler, so the FULL
+  node stays selectable until finality prunes it (a known limitation).
+
+### Status v3 and `BeaconBlocksByHead`
+
+- **ethlambda:** `status/3` reads the head's post-state (falling back to the
+  store's finalized block when the head is not an EIP-8453 state or is not
+  cached); a node publishing under an EIP-8453 digest opens handshakes in v3
+  and retries in v2 when refused. `beacon_blocks_by_head/1` is served (the
+  ancestry from the requested root, down to the oldest block held) but this
+  node never requests it: range sync and by-root requests still fetch.
+
+### The EIP-8453 due times are compile-time
+
+- **ethlambda:** `HEAD_VOTE_DUE_BPS`, `SUPPORT_CUTOFF_BPS` and
+  `VIEW_FREEZE_BPS` must be the specification's 2500/5000/7500
+  (`check_constants`), since the engine's `Δ` grid is built on them.
 
 ### Built on this repository's heze, not the pinned commit's
 

@@ -140,10 +140,9 @@ impl ForkName {
     /// cannot follow has one place to say so; every site whose rule is "does
     /// this node follow the fork" calls it.
     ///
-    /// EIP-8453 is not followed yet: its types and state transition exist,
-    /// but fork choice (the finality gadget's store and the available
-    /// chain), its gossip and its Beacon API do not, so an anchor at it is
-    /// refused and a scheduled one is warned about.
+    /// EIP-8453 is followed: the chain actor runs its fork choice (the
+    /// finality gadget and the available chain) across the fork, and the
+    /// network side serves its gossip topics and req/resp protocols.
     ///
     /// # Panics
     ///
@@ -159,10 +158,12 @@ impl ForkName {
             | ForkName::Electra
             | ForkName::Fulu
             | ForkName::Gloas
-            | ForkName::Heze => true,
-            // TODO(eip8453): follow once fork choice, p2p and the Beacon API
-            // handle the fork.
-            ForkName::Eip8453 => false,
+            | ForkName::Heze
+            // The finality gadget and the available chain run the fork choice,
+            // its gossip topics and req/resp protocols are served; validator
+            // duties and the Beacon API's EIP-8453 endpoints are the next
+            // phase (`docs/spec_deviations.md`).
+            | ForkName::Eip8453 => true,
             ForkName::Lean => super::lean_fork_unreachable("ForkName::is_followed"),
         }
     }
@@ -392,9 +393,9 @@ mod tests {
     }
 
     #[test]
-    fn every_beacon_fork_through_heze_is_followed() {
+    fn every_beacon_fork_is_followed() {
         for fork in ForkName::ALL {
-            assert_eq!(fork.is_followed(), fork != ForkName::Eip8453, "{fork:?}");
+            assert!(fork.is_followed(), "{fork:?}");
         }
     }
 

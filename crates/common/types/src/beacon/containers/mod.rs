@@ -2388,8 +2388,9 @@ impl SignedBeaconBlock {
         match self {
             SignedBeaconBlock::Gloas(block) => Some(GloasBlockRef::Gloas(&block.message)),
             SignedBeaconBlock::Heze(block) => Some(GloasBlockRef::Heze(&block.message)),
-            // TODO(eip8453): give fork choice, gossip and the Beacon API a
-            // reader for the EIP-8453 block.
+            // Its attestations and slashings are other containers; readers
+            // of the payload half (the bid, the payload attestations) use
+            // `payload_bid` and `payload_attestations`, which cover EIP-8453.
             SignedBeaconBlock::Eip8453(_) => None,
             SignedBeaconBlock::Phase0(_)
             | SignedBeaconBlock::Altair(_)

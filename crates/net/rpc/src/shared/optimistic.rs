@@ -46,30 +46,24 @@ fn payload_link(store: &Store, root: H256) -> Option<BlockPayloadLink> {
         | SignedBeaconBlock::Deneb(_)
         | SignedBeaconBlock::Electra(_)
         | SignedBeaconBlock::Fulu(_) => Some(BlockPayloadLink::PreGloas),
-        block @ (SignedBeaconBlock::Gloas(_) | SignedBeaconBlock::Heze(_)) => {
-            let message = block.gloas_message()?;
-            let parent_status = match store.get_signed_block(&message.parent_root()).ok()? {
+        // Gloas, heze and EIP-8453 carry gloas's bid.
+        block @ (SignedBeaconBlock::Gloas(_)
+        | SignedBeaconBlock::Heze(_)
+        | SignedBeaconBlock::Eip8453(_)) => {
+            let wanted = block.payload_bid()?.message.parent_block_hash;
+            let parent_status = match store.get_signed_block(&block.parent_root()).ok()? {
                 None => None,
-                Some(parent) => match parent.gloas_message() {
-                    Some(parent) => {
-                        let wanted = message
-                            .signed_execution_payload_bid()
-                            .message
-                            .parent_block_hash;
-                        let held = parent.signed_execution_payload_bid().message.block_hash;
-                        Some(if wanted == held {
-                            PayloadStatus::Full
-                        } else {
-                            PayloadStatus::Empty
-                        })
-                    }
+                Some(parent) => match parent.payload_bid() {
+                    Some(parent_bid) => Some(if wanted == parent_bid.message.block_hash {
+                        PayloadStatus::Full
+                    } else {
+                        PayloadStatus::Empty
+                    }),
                     None => Some(PayloadStatus::Full),
                 },
             };
             Some(BlockPayloadLink::Gloas { parent_status })
         }
-        // TODO(eip8453): derive the payload link of an EIP-8453 block.
-        SignedBeaconBlock::Eip8453(_) => None,
         // A lean block is never in a beacon store.
         SignedBeaconBlock::Lean(_) => None,
     }

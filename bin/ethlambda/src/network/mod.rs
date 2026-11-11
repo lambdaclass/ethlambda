@@ -202,6 +202,11 @@ pub(crate) fn check_constants(config: &Config) -> Result<(), ConstantsMismatch> 
         max_payload_size == ethlambda_p2p::MAX_PAYLOAD_SIZE as u64,
         message_domain_invalid_snappy == ethlambda_p2p::MESSAGE_DOMAIN_INVALID_SNAPPY,
         message_domain_valid_snappy == ethlambda_p2p::MESSAGE_DOMAIN_VALID_SNAPPY,
+        // EIP-8453's fork choice runs on the engine's quarter-slot grid,
+        // whose due times are compile-time constants.
+        head_vote_due_bps == ethlambda_decoupled::params::HEAD_VOTE_DUE_BPS,
+        support_cutoff_bps == ethlambda_decoupled::params::SUPPORT_CUTOFF_BPS,
+        view_freeze_bps == ethlambda_decoupled::params::VIEW_FREEZE_BPS,
     );
 
     if mismatches.is_empty() {

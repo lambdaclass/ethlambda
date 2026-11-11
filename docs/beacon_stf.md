@@ -554,10 +554,12 @@ debug assertion bounds it).
 EIP-8453 ("Decoupled Consensus") is ported from
 `specs/_features/eip8453/{beacon-chain,fork}.md` at ethereum/consensus-specs
 `decoupled-consensus` `0f4fa3ffdd26ec083ff4dba65645d81433178413`, on top of
-heze: types, configuration and the complete state transition. Fork choice (the
-finality gadget's store and the available chain), gossip, the validator client
-and the Beacon API are later phases, so the node does not follow the fork yet
-(`ForkName::Eip8453.is_followed()` is `false`).
+heze: types, configuration and the complete state transition. The node follows
+the fork (`ForkName::Eip8453.is_followed()` is `true`): its fork choice is the
+`ethlambda-decoupled` engine driven by the chain actor, and its gossip topics
+and req/resp protocols are served (see
+[decoupled_consensus.md](./decoupled_consensus.md#beacon)). The validator client
+and the Beacon API's EIP-8453 endpoints are the next phase.
 
 It replaces Casper FFG with a finality gadget whose chain state lives in the
 beacon state, and adds the available chain's head votes to the block:

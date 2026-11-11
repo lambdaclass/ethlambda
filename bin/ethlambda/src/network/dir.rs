@@ -118,13 +118,35 @@ impl NetworkDir {
         // epoch 0 and ships a genesis state in the newest one, so decoding as
         // phase0 would fail on exactly the networks this flag exists for.
         let fork = parsed.config.fork_at_epoch(0);
-        let genesis_state = BeaconState::from_ssz(fork, &genesis_bytes).map_err(|err| {
-            NetworkDirError::Genesis {
-                path: genesis_path,
-                fork,
-                reason: format!("{err:?}"),
+        let genesis_state = match BeaconState::from_ssz(fork, &genesis_bytes) {
+            Ok(state) => state,
+            // EIP-8453 at epoch 0: no genesis generator writes an EIP-8453
+            // state, so a heze `genesis.ssz` is upgraded through the fork here
+            // (`upgrade_to_eip8453`, whose first target is the genesis block).
+            Err(_) if fork == ForkName::Eip8453 => {
+                BeaconState::from_ssz(ForkName::Heze, &genesis_bytes)
+                    .map_err(|err| format!("{err:?}"))
+                    .and_then(|heze| {
+                        ethlambda_state_transition::beacon::upgrade::upgrade_to_eip8453(
+                            &heze,
+                            &parsed.config,
+                        )
+                        .map_err(|err| format!("{err:?}"))
+                    })
+                    .map_err(|reason| NetworkDirError::Genesis {
+                        path: genesis_path.clone(),
+                        fork,
+                        reason,
+                    })?
             }
-        })?;
+            Err(err) => {
+                return Err(NetworkDirError::Genesis {
+                    path: genesis_path,
+                    fork,
+                    reason: format!("{err:?}"),
+                });
+            }
+        };
 
         let bootnodes = read_bootnodes(base)?;
 

@@ -60,15 +60,15 @@ const GENESIS_TIME: u64 = 1_000_000;
 const VALIDATORS: usize = 32;
 const NODES: usize = 3;
 
-/// Every fork through heze at genesis, EIP-8453 at epoch 1.
-fn config() -> Config {
+/// Every fork through heze at genesis, EIP-8453 at `fork_epoch`.
+fn config(fork_epoch: Epoch) -> Config {
     let mut config = Config::active();
     for fork in ForkName::ALL {
         if fork != ForkName::Phase0 && fork < ForkName::Eip8453 {
             config = config.with_fork_epoch(fork, 0);
         }
     }
-    config = config.with_fork_epoch(ForkName::Eip8453, 1);
+    config = config.with_fork_epoch(ForkName::Eip8453, fork_epoch);
     config.genesis_time = GENESIS_TIME;
     config
 }
@@ -88,7 +88,11 @@ fn sign(
 /// largest effective balance (so every head vote committee draw accepts), its
 /// sync committees held by those keys, and the genesis block, whose bid mirrors
 /// the state's (as `eth-beacon-genesis` builds it) so no payload is delivered.
-fn genesis() -> (BeaconState, SignedBeaconBlock) {
+///
+/// With the fork at epoch 0 the heze genesis is upgraded through
+/// `upgrade_to_eip8453`, as a loaded network's `genesis.ssz` is at startup,
+/// and the genesis block is an EIP-8453 block.
+fn genesis(config: &Config) -> (BeaconState, SignedBeaconBlock) {
     let mut state = test_state::with_signing_validators_at(ForkName::Heze, VALIDATORS);
     *state.slot_mut() = 0;
     *state.genesis_time_mut() = GENESIS_TIME;
@@ -106,6 +110,32 @@ fn genesis() -> (BeaconState, SignedBeaconBlock) {
     }
     inner.next_sync_committee = inner.current_sync_committee.clone();
     inner.latest_execution_payload_bid.block_hash = Bytes32::repeat_byte(0xaa);
+    if config.eip8453_fork_epoch == 0 {
+        let mut state =
+            ethlambda_state_transition::beacon::upgrade::upgrade_to_eip8453(&state, config)
+                .expect("a heze genesis upgrades");
+        let BeaconState::Eip8453(inner) = &mut state else {
+            unreachable!("an EIP-8453 state")
+        };
+        let mut body = eip8453::BeaconBlockBody::empty();
+        body.signed_execution_payload_bid.message = inner.latest_execution_payload_bid.clone();
+        inner.latest_block_header.body_root = body.hash_tree_root();
+        state.apply_pending_mutations();
+        let block = SignedBeaconBlock::Eip8453(eip8453::SignedBeaconBlock {
+            message: eip8453::BeaconBlock {
+                slot: 0,
+                proposer_index: 0,
+                parent_root: Root::ZERO,
+                state_root: state.hash_tree_root(),
+                body,
+            },
+            signature: Default::default(),
+        });
+        return (state, block);
+    }
+    let BeaconState::Heze(inner) = &mut state else {
+        unreachable!("a heze state")
+    };
     let mut body = heze::BeaconBlockBody::empty();
     body.signed_execution_payload_bid.message = inner.latest_execution_payload_bid.clone();
     inner.latest_block_header = BeaconBlockHeader {
@@ -331,9 +361,9 @@ struct Network {
 }
 
 impl Network {
-    fn new() -> Self {
-        let config = config();
-        let (state, block) = genesis();
+    fn new(fork_epoch: Epoch) -> Self {
+        let config = config(fork_epoch);
+        let (state, block) = genesis(&config);
         let nodes = (0..NODES)
             .map(|_| {
                 let store = fork_choice::get_forkchoice_store(
@@ -556,7 +586,7 @@ impl Network {
 /// and finalizes heights on every node alike, finalizing EIP-8453 blocks.
 #[tokio::test]
 async fn an_in_process_network_crosses_the_fork_and_finalizes_with_the_gadget() {
-    let mut network = Network::new();
+    let mut network = Network::new(1);
     let fork_slot = network.fork_slot;
     let end = fork_slot + 6 * preset::SLOTS_PER_ROUND;
     let mut total_votes = 0;
@@ -697,7 +727,7 @@ async fn an_in_process_network_crosses_the_fork_and_finalizes_with_the_gadget() 
 /// the last heze block.
 #[tokio::test]
 async fn the_handover_lock_keeps_the_pre_fork_chain() {
-    let mut network = Network::new();
+    let mut network = Network::new(1);
     let fork_slot = network.fork_slot;
     for slot in 1..fork_slot {
         network.run_slot(slot).await;
@@ -725,4 +755,38 @@ async fn the_handover_lock_keeps_the_pre_fork_chain() {
         proposal.head.root, last_heze,
         "the seeded lock keeps the chain"
     );
+}
+
+/// A network whose EIP-8453 epoch is 0: its genesis is the heze genesis
+/// upgraded through the fork, the engine anchors at the genesis block (the
+/// first target, whose root `process_slot` fills), and the gadget finalizes
+/// from the first round on.
+#[tokio::test]
+async fn a_network_upgraded_at_genesis_finalizes_with_the_gadget() {
+    let mut network = Network::new(0);
+    let end = 5 * preset::SLOTS_PER_ROUND;
+    for slot in 1..=end {
+        network.run_slot(slot).await;
+    }
+    assert_eq!(
+        network.imported, end as usize,
+        "every slot's block imported"
+    );
+    let finalized = network
+        .store(0)
+        .fg_finalized_checkpoint()
+        .expect("the gadget recorded");
+    assert!(finalized.height >= 2, "the gadget finalized: {finalized:?}");
+    let head = network.store(0).head().unwrap();
+    for node in 1..NODES {
+        assert_eq!(
+            network.store(node).head().unwrap(),
+            head,
+            "node {node}'s head"
+        );
+        assert_eq!(
+            network.store(node).fg_finalized_checkpoint(),
+            Some(finalized)
+        );
+    }
 }

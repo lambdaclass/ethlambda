@@ -622,8 +622,10 @@ pub(crate) fn is_current_or_previous_epoch(config: &Config, epoch: Epoch, now_ms
 /// (A gloas aggregate has its own container, which says so itself.)
 pub(crate) fn is_gloas_slot(config: &Config, slot: Slot) -> bool {
     match config.fork_at_epoch(compute_epoch_at_slot(slot)) {
-        // TODO(eip8453): EIP-8453 attestations are their own container; its
-        // gossip rules are a later phase.
+        // EIP-8453's attestations are their own container on their own
+        // subnets (`fg_attestation`); a `beacon_attestation_{subnet_id}` of
+        // an EIP-8453 slot can only arrive on an earlier digest's deprecated
+        // topic, and is judged by gloas's rules there.
         ForkName::Gloas | ForkName::Heze | ForkName::Eip8453 => true,
         ForkName::Phase0
         | ForkName::Altair

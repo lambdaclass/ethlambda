@@ -2480,8 +2480,6 @@ fn genesis_anchor_block(state: &BeaconState) -> SignedBeaconBlock {
         }),
         // An EIP-8453 genesis commits to the empty body, or to the generator's
         // mirrored bid as heze's does.
-        // TODO(eip8453): unreachable while `refuse_unfollowable_fork` refuses
-        // an EIP-8453 anchor.
         ForkName::Eip8453 => SignedBeaconBlock::Eip8453(eip8453::SignedBeaconBlock {
             message: eip8453::BeaconBlock {
                 slot,
@@ -2715,21 +2713,11 @@ mod tests {
         assert!(validate_aggregate_subnet_ids(Some(&[]), 4).is_ok());
     }
 
-    /// Gloas is followed: the envelopes and payload attestations a gloas chain
-    /// needs are delivered, so no fork through heze is refused as an anchor.
-    /// EIP-8453 is: its fork choice does not exist yet.
+    /// Every beacon fork is followed (EIP-8453 through its own fork choice),
+    /// so no anchor is refused for its fork.
     #[test]
     fn startup_accepts_an_anchor_at_every_followed_beacon_fork() {
         for fork in ForkName::ALL {
-            if fork == ForkName::Eip8453 {
-                assert!(matches!(
-                    refuse_unfollowable_fork(fork),
-                    Err(checkpoint_sync::CheckpointSyncError::UnsupportedFork {
-                        fork: ForkName::Eip8453
-                    })
-                ));
-                continue;
-            }
             assert!(
                 refuse_unfollowable_fork(fork).is_ok(),
                 "{fork} must be followable"

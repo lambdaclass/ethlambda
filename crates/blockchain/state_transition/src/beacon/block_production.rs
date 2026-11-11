@@ -91,7 +91,9 @@ pub fn payload_inputs(state: &BeaconState, config: &Config) -> Result<PayloadInp
         BeaconState::Gloas(_) | BeaconState::Heze(_) => {
             return Err(Error::SpecAssert("block production does not support gloas"));
         }
-        // TODO(eip8453): EIP-8453 block production is a later phase.
+        // An EIP-8453 block is assembled by `eip8453_block_production` from
+        // the fork choice's proposal.
+        // TODO(eip8453): the Beacon API's produceBlock for it (next phase).
         BeaconState::Eip8453(_) => {
             return Err(Error::SpecAssert(
                 "block production does not support eip8453",

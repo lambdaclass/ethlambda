@@ -374,6 +374,19 @@ actual_slot = finalized_slot + 1 + relative_index
     which must be electra or fulu: under a gloas head every operation is IGNOREd) and feed
     `Store::operation_pool`; the attestation pool is in `Store` too. Both are in memory, and
     block production packs the operation pool through `pack_operations`
+  - EIP-8453 digests (`BeaconTopics::for_fork`, `EIP8453_TOPIC_KINDS`) drop the deprecated
+    `beacon_aggregate_and_proof` and `beacon_attestation_{subnet_id}` and hold `head_vote`
+    and the backbone as `attestation_{subnet_id}` (both unscored). Their rules
+    (`gossip::head_vote`, `gossip::fg_attestation`) run like the other topics' (cheap
+    inline, stateful on the attestation permit pool, head state advanced to the message's
+    epoch when older) and an accepted message is applied to the shared `SharedEip8453Node`
+    when its verdict settles (engine + seen set for a vote, proposal pool + seen set for an
+    attestation); `submit` runs the same path for this node's validator client.
+    `beacon_block` judges an EIP-8453 block by its modified rules (head-vote operation limits,
+    finalized slot and ancestry from the store's finalized block). An EIP-8453
+    `attester_slashing` decodes by its topic's digest and is IGNOREd like every operation
+    under a gloas+ head. The finalized-slot readers of gossip use `Store::latest_finalized`
+    directly (an epoch start before EIP-8453, the gadget's block's slot after)
 - **Req/Resp**: Status, BlocksByRoot, BlocksByRange (snappy frame compression + varint length)
   - Beacon adds `beacon_blocks_by_{range,root}/2` alongside its Status/Ping/MetaData/Goodbye set.
     Both serve from the checkpoint-anchored store, and `build_status` advertises it
@@ -390,6 +403,9 @@ actual_slot = finalized_slot + 1 + relative_index
     until the envelope answer is forwarded (the actor keeps unmatched envelopes only briefly)
     Their chunks carry four `<context-bytes>` (the block's own epoch's fork digest), which is why
     `BeaconWire` and the codec carry `genesis_validators_root`. See [`docs/beacon_wire.md`](docs/beacon_wire.md)
+  - EIP-8453 adds `status/3` (`finalized_slot` from the head's post-state; opened at an
+    EIP-8453 digest, v2 on refusal) and `beacon_blocks_by_head/1` (fulu's, served from the
+    store's ancestry walk, never requested)
 
 ### Peer Discovery (discv5)
 - Always on for `beacon` (mainnet bootnode ENRs are not statically dialable, so a crawl is its only way to find a peer); opt-in for `node` behind the lean-only `--discovery.enable`, off by default, so a lean node peers from `--bootnodes` alone and binds no discovery socket. `Network::discovery_enabled` is the one answer; `P2P::spawn` takes `Option<DiscoverySpawnConfig>` and `P2PServer.discovery` is an `Option`, `None` leaving the dial loop unscheduled
@@ -912,10 +928,36 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   `process_epoch`). The state drops Casper FFG, so the Casper FFG accessors
   (`finalized_checkpoint()`, `current_justified_checkpoint()`, ...) are
   fallible and answer `UnsupportedForFork` for it; `gloas_family!` covers it,
-  `gloas_heze!` is for bodies that read the epoch participation lists. It is
-  not followed yet (`is_followed()` is `false`): fork choice, gossip, the
-  validator client and the Beacon API refuse or ignore it (`TODO(eip8453)`).
-  No fixtures exist; unit tests cover every function. See
+  `gloas_heze!` is for bodies that read the epoch participation lists. **The
+  node follows it** (`is_followed()` is `true`): at EIP-8453 time the chain
+  actor runs the `ethlambda-decoupled` engine as the fork choice
+  (`crates/blockchain/src/beacon_eip8453.rs`; the host in
+  `beacon/eip8453_fork_choice.rs`), ticking it every quarter slot (the tick is
+  `4 * slot + quarter` on the schedule-aware slot clock), recording each
+  carried vote's head vote committee from the block's post-state before
+  feeding the block (`fork_choice::on_block` runs only the STF and gloas's
+  payload bookkeeping for an EIP-8453 block), feeding verified envelopes, and
+  writing the engine's head (with its payload status) and the finality
+  gadget's checkpoints to the store (`Store::update_fg_checkpoints`: the
+  slot-denominated `latest_finalized`/`latest_justified` rows then name the
+  gadget's blocks at their own slots, which pruning and every slot reader use;
+  heights in the `fg_*` metadata keys). `forkchoiceUpdated`: head = the head
+  node's payload, safe = `get_confirmed_execution_block_hash`, finalized = the
+  gadget's finalized block's `parent_block_hash`; heze's V5/V6 engine methods.
+  The fork transition and a restart both anchor a fresh engine at the store's
+  finalized block and replay the stored blocks above it (pre-fork blocks at
+  height 0); the transition also seeds a lock on the last LMD-GHOST head so
+  the first proposal does not rewind to the anchor. A genesis at the fork
+  leaves the first target root for `process_slot`, and a heze `genesis.ssz`
+  is upgraded at load. `SharedEip8453Node` (`beacon/eip8453_node.rs`) is shared
+  by the actor, p2p and the Beacon API (an `Extension`, no endpoint yet): the
+  engine, the gossip seen sets, the signed votes and attestations behind it,
+  the duty inputs (`vote_head`, `finality_attestation_input`, `proposal`), and
+  `eip8453_block_production` assembles a block from them. The validator client
+  and the Beacon API's EIP-8453 endpoints are the next phase (`TODO(eip8453)`).
+  `beacon_eip8453_network_tests.rs` runs three unspawned actors on a simulated
+  clock across the fork (and from an EIP-8453 genesis) to finalization. See
+  [`docs/decoupled_consensus.md`](docs/decoupled_consensus.md#beacon),
   [`docs/beacon_stf.md`](docs/beacon_stf.md#eip-8453) and
   [`docs/spec_deviations.md`](docs/spec_deviations.md#eip-8453-decoupled-consensus).
 - A fixture case with no `post` state asserts the input must be **rejected**. That
