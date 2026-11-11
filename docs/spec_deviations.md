@@ -1000,6 +1000,12 @@ node computes the same value another way.
   first `process_slot` fills it with the genesis block's root. A network
   whose `EIP8453_FORK_EPOCH` is 0 may ship a heze `genesis.ssz`, which
   `NetworkDir::load` upgrades through the fork.
+- **Consequence:** this changes the state. On a network with
+  `EIP8453_FORK_EPOCH` 0, the upgraded genesis state, and so every state root
+  from slot 0 on, differs from what a literal `upgrade_to_eip8453` produces,
+  so another client must make the same choice to share that genesis. A fork
+  at any later epoch is unaffected: there the header's `state_root` is filled
+  and the target root is the specification's.
 - **Why:** at genesis that header's root names no block, so no attestation
   could name the gadget's first target, `get_forkchoice_store`'s assertion
   that the anchor is its own target fails, and the chain could never justify.
