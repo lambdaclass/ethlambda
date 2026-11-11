@@ -8,14 +8,15 @@
 //! protocol state as much as slashing protection: the record decides whether
 //! the next vote at a height is a target vote or a timeout, so a client that
 //! forgot it would not only risk a slashable double vote but vote differently
-//! from what the protocol prescribes. It is therefore kept even though this
-//! client otherwise keeps no slashing-protection database.
+//! from what the protocol prescribes. It is kept apart from the client's
+//! EIP-3076 slashing-protection record, which covers Casper FFG attestations
+//! and blocks, and is not part of its interchange.
 //!
 //! The selection and recording rules are `ethlambda-decoupled`'s
 //! ([`FinalitySigningRecord::attest`]); this module owns the storage:
 //!
 //! - one JSON file per key, `<dir>/0x<pubkey>.json`, written atomically and
-//!   flushed to disk at mode `0600` ([`crate::secure_fs::write_private_durable`])
+//!   flushed to disk at mode `0600` ([`crate::secure_fs::write_private_durably`])
 //!   before [`FinalitySigningRecords::attest`] returns the data to sign;
 //! - a record is read from its file the first time its key attests in a run
 //!   (a key imported at runtime starts from its file, or empty);
@@ -139,9 +140,22 @@ impl FinalitySigningRecords {
         let bytes = serde_json::to_vec_pretty(record)
             .map_err(|err| Error::Decode(format!("encoding a finality signing record: {err}")))?;
         let path = self.path(pubkey);
-        crate::secure_fs::write_private_durable(&path, bytes).map_err(|source| Error::Io {
-            path: path.display().to_string(),
-            source,
+        // Either error leaves the in-memory record as it was and signs
+        // nothing. After an `Unflushed` one the file may already hold the
+        // new record, which only forbids a vote that was never signed.
+        crate::secure_fs::write_private_durably(&path, bytes).map_err(|err| {
+            let path = path.display().to_string();
+            if err.after_rename {
+                Error::Unflushed {
+                    path,
+                    source: err.source,
+                }
+            } else {
+                Error::Io {
+                    path,
+                    source: err.source,
+                }
+            }
         })
     }
 }

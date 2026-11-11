@@ -66,6 +66,18 @@ pub fn validate_attestation_data(slot: Slot, data: &AttestationData) -> Result<(
             data.target.epoch
         )));
     }
+    // Signing a source at or past its target would record a source the
+    // chain's justified checkpoint cannot have reached, and the record keeps
+    // it: every honest attestation afterwards would be refused as a source
+    // regression until justification caught up, or forever during
+    // non-finality.
+    if crate::slashing_protection::is_impossible_source(data.source.epoch, data.target.epoch) {
+        return Err(crate::error::Error::InconsistentResponse(format!(
+            "attestation data for slot {slot} carries source epoch {} at or past its target \
+             epoch {}",
+            data.source.epoch, data.target.epoch
+        )));
+    }
     Ok(())
 }
 
@@ -176,11 +188,11 @@ pub enum Published {
 /// stuck on a stale head is never failed over from.
 ///
 /// Both fields are checked because both end up signed. The slot selects the
-/// signing domain and is the whole of what the proposal guard keys on. The
+/// signing domain and is the whole of what slashing protection keys a block on. The
 /// proposer index is not something this client chooses either: a node on a
 /// different fork computes a different proposer, and a block naming someone
 /// else is one this client's key can only sign uselessly, while still burning
-/// the guard's record for that slot.
+/// the slot in slashing protection's record.
 pub fn validate_produced_block(request: &BlockRequest, block: &ProducedBlock) -> Result<()> {
     if block.slot() != request.slot {
         return Err(crate::error::Error::InconsistentResponse(format!(
@@ -342,9 +354,10 @@ pub trait BeaconNodeApi: Send + Sync {
     ///
     /// An implementation must reject data whose `slot` is not the one asked
     /// for, and whose `target.epoch` is not that slot's epoch. Both are
-    /// signable material, and this client keeps no slashing-protection record,
+    /// signable material, and slashing protection records whatever it allows,
     /// so a node answering about the wrong slot must never reach the signing
-    /// path.
+    /// path: a target from the future would raise the validator's watermark
+    /// and cost it every attestation until the chain caught up.
     ///
     /// It matters that this is the *implementation's* job rather than the
     /// caller's, because of where failover sits.
@@ -653,4 +666,47 @@ pub fn validate_sync_contribution(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ethlambda_types::beacon::containers::shared::Checkpoint;
+
+    fn data(slot: Slot, source: Epoch, target: Epoch) -> AttestationData {
+        AttestationData {
+            slot,
+            index: 0,
+            beacon_block_root: Root::ZERO,
+            source: Checkpoint {
+                epoch: source,
+                root: Root::ZERO,
+            },
+            target: Checkpoint {
+                epoch: target,
+                root: Root::ZERO,
+            },
+        }
+    }
+
+    /// Slot 100 is in epoch 3 on the mainnet preset.
+    #[test]
+    fn attestation_data_with_a_source_at_or_past_its_target_is_refused() {
+        assert!(validate_attestation_data(100, &data(100, 2, 3)).is_ok());
+        assert!(validate_attestation_data(100, &data(100, 0, 3)).is_ok());
+        let err = validate_attestation_data(100, &data(100, 3, 3)).expect_err("source == target");
+        assert!(err.to_string().contains("source epoch 3"), "{err}");
+        assert!(validate_attestation_data(100, &data(100, 4, 3)).is_err());
+    }
+
+    /// At genesis both checkpoints are epoch 0, and that is the one valid
+    /// shape where the source does not precede the target.
+    #[test]
+    fn genesis_attestation_data_is_accepted() {
+        assert!(validate_attestation_data(0, &data(0, 0, 0)).is_ok());
+        assert!(
+            validate_attestation_data(0, &data(0, 1, 0)).is_err(),
+            "a source past a genesis target is not the genesis shape"
+        );
+    }
 }

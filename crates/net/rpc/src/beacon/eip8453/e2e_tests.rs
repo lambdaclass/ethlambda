@@ -441,6 +441,7 @@ async fn the_validator_client_proposes_an_eip8453_block_through_this_node() {
         world.client.clone(),
         world.context.clone(),
         Arc::new(settings),
+        ethlambda_validator::slashing_protection::SlashingProtection::in_memory(),
     );
 
     // The node imports what the client publishes, as its chain actor would,

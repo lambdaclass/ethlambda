@@ -8,7 +8,7 @@
 | `ethlambda beacon <flags>` | The Ethereum Beacon Chain, as a gossip follower |
 | `ethlambda <flags>` | `node`: the subcommand is injected |
 
-Three subcommands follow no chain. `ethlambda replay-era` replays real chain
+Four subcommands follow no chain. `ethlambda replay-era` replays real chain
 history from `.era` files and checks it against the states stored in them; see
 [`era_replay.md`](./era_replay.md) for its flags and checks. `ethlambda benchmark` is the offline
 benchmarking harness, covering block building (`benchmark synthetic`, run
@@ -18,7 +18,9 @@ what each workload measures; `benchmark import`'s flags are in
 [their own section](#benchmark-import-flags) below. `ethlambda validator` is
 the validator client: a separate process that holds keys and performs duties
 against a beacon node over the standard REST API, documented in
-[its own section](#validator-flags) below.
+[its own section](#validator-flags) below. `ethlambda slashing-protection`
+moves that client's EIP-3076 history in and out of its directory, offline; see
+[its section](#slashing-protection) below.
 
 ## `node` is the default
 
@@ -262,17 +264,24 @@ Both chains run a chain actor, so `RunningNode` carries a plain `BlockChain`.
 
 ## `validator` flags
 
-`ethlambda validator` is not a node. It binds no libp2p port, opens no
+`ethlambda validator` is not a node. It binds no libp2p port, opens no chain
 database, runs no discovery and follows no chain: it holds validator keys and
 performs duties against a beacon node's standard REST API. It works against any
 conformant beacon node, this repository's `beacon` subcommand or another
 implementation's, so none of the [common flags](#common-flags) apply to it.
 
-> **It keeps no slashing-protection record.** Read
-> [Spec Deviations](./spec_deviations.md#the-validator-client-keeps-no-slashing-protection-record)
-> before running it with keys that hold real stake. In short: do not run these
-> keys in any other client while this one runs, and treat a restart with the
-> same care as a manual key move. The client repeats this warning at startup.
+> **Slashing protection** lives in `--validators-dir/slashing_protection.json`,
+> locked to one process, so `--validators-dir` must be writable: a read-only
+> mount of the keys (a Kubernetes Secret, a `:ro` volume) fails at startup, as
+> does a record that is a symlink (say, onto another volume) rather than a
+> regular file, since a dangling one would read as "no record"; and
+> the directory should be a local disk, since every signature waits for the
+> record to be flushed to it, and the lock that keeps a second process off it
+> is an `flock`, which a network filesystem may not honour. Unix only. A key with no record is refused at startup unless
+> `--init-slashing-protection` is passed. A key moving here from another client
+> brings its history with [`slashing-protection import`](#slashing-protection),
+> or in the same keymanager API request that imports the key. See
+> [Spec Deviations](./spec_deviations.md#the-validator-client-keeps-eip-3076s-minimal-watermarks-not-full-history).
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -285,6 +294,7 @@ implementation's, so none of the [common flags](#common-flags) apply to it.
 | `--suggested-fee-recipient` | none | Execution address to receive block rewards, `0x`-prefixed, for every validator the keymanager API gives no address of its own. Optional, and startup warns when it is absent: without it the beacon node picks an address, and it will not be yours |
 | `--graffiti` | empty | Text for the graffiti field of proposed blocks, for every validator the keymanager API gives no graffiti of its own. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer. An ethlambda beacon node appends both clients' versions to it (see [`rpc.md`](rpc.md#validator-endpoints)) |
 | `--enable-keymanager` | off | Serve the keymanager API: keystores, plus each validator's own fee recipient, graffiti and gas limit. Off by default because it mutates key material |
+| `--init-slashing-protection` | off | Register every loaded key with no slashing-protection record as never having signed, instead of refusing to start. Dangerous: only for keys that have signed nothing anywhere for at least two epochs, and even then it rules out a double vote only, not a surround of an older vote; a key with a history should bring it instead. Never lowers an existing record; remove it once the keys are registered, and startup warns while it is set for nothing |
 
 ### What it does today
 
@@ -462,6 +472,14 @@ specification requires; `POST graffiti` refuses text over 32 bytes rather than
 truncating it; and every route answers `404` for a key this client does not
 hold.
 
+The keystore routes carry slashing-protection history. `POST` refuses every
+key in the request if its `slashing_protection` does not parse or is for
+another chain, and otherwise writes that history before any key is saved, so a
+key never loads ahead of it; a validator the history names without a keystore
+in the request gets a record too. `DELETE`
+returns the deleted keys' records as a minimal EIP-3076 interchange, answering
+`not_active` for a key that is gone but still has a record.
+
 The specification requires TLS. This binds to `--http-address`, loopback by
 default; exposing it further means putting a TLS terminator in front.
 
@@ -472,6 +490,27 @@ Served on `--metrics-port`, prefixed `ethlambda_validator_` rather than the
 beacon chain. Every series is registered at startup so it reads zero rather
 than being absent before its first event, which is what lets an alert fire on
 "attestations stopped". See [Metrics](./metrics.md#validator-client).
+
+## `slashing-protection`
+
+Moves the validator client's EIP-3076 history in and out of its
+`--validators-dir`, offline. It takes the lock the client holds while running,
+so it refuses while a client runs on that directory, and it needs no beacon
+node: the record names its own chain.
+
+```sh
+# Bring a key's history from another client before its first start here.
+ethlambda slashing-protection import --validators-dir ./validators interchange.json
+
+# Hand the history over before running the keys elsewhere.
+ethlambda slashing-protection export --validators-dir ./validators out.json
+ethlambda slashing-protection export --validators-dir ./validators --pubkeys 0xab..,0xcd.. out.json
+```
+
+| Sub-command | Does |
+|---|---|
+| `import <file>` | Merges a version 5 interchange, complete or minimal, into the record. Each validator is reduced to its highest slot, source and target and merged by maximum, so nothing already recorded is lowered and slashable data in the file is absorbed rather than refused, except an attestation whose source is at or past its target outside genesis, which is refused. All or nothing. With no record yet, the import creates one for the interchange's chain, and a failed import creates nothing; the client refuses the record at its next start if that is not its beacon node's chain |
+| `export [--pubkeys ...] <file>` | Writes the record, or the named validators' part of it, as a minimal version 5 interchange, readable by its owner only. A named validator with no record fails the export, so a typo or the wrong directory cannot produce a file that reads as complete. Takes the record's lock, so the directory must be writable. Refuses to overwrite an existing file |
 
 ## `benchmark import` flags
 
