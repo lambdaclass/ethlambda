@@ -164,14 +164,13 @@ pub fn get_inactivity_penalty_deltas(
             let inactivity_penalty_quotient =
                 preset::retuned::inactivity_penalty_quotient(state.fork_name());
             // [Modified in Heze:EIP8198] `INACTIVITY_SCORE_BIAS * quotient *
-            // duration(GENESIS_EPOCH) ** 2 // duration(previous_epoch) ** 2`.
-            let genesis_duration =
-                u128::from(config.slot_duration_ms_at_epoch(constants::GENESIS_EPOCH));
+            // SLOT_DURATION_MS ** 2 // duration(previous_epoch) ** 2`.
+            let reference_duration = u128::from(config.slot_duration_ms);
             let previous_duration = u128::from(config.slot_duration_ms_at_epoch(previous_epoch));
             let penalty_denominator = u64::try_from(
                 u128::from(config.inactivity_score_bias)
                     * u128::from(inactivity_penalty_quotient)
-                    * genesis_duration.pow(2)
+                    * reference_duration.pow(2)
                     / previous_duration.pow(2),
             )
             .unwrap_or(u64::MAX);

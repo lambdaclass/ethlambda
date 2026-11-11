@@ -199,3 +199,52 @@ fn churn_is_unchanged_when_the_slot_duration_does_not_change() {
         config.min_per_epoch_churn_limit_electra
     );
 }
+
+/// A network that activates EIP-8198 at genesis: `SLOT_DURATION_MS` is
+/// 12 s but every epoch runs 9 s slots. consensus-specs `0f4fa3ff` scales
+/// against `SLOT_DURATION_MS`, so such a network is scaled from its first
+/// epoch; `v1.7.0-beta.4` scaled against the genesis epoch's own duration and
+/// left it unscaled.
+fn quick_slots_from_genesis() -> Config {
+    Config {
+        heze_fork_epoch: 0,
+        ..quick_slots()
+    }
+}
+
+#[test]
+fn a_heze_genesis_is_scaled_against_slot_duration_ms() {
+    let config = quick_slots_from_genesis();
+    assert_eq!(config.slot_duration_ms_at_epoch(0), 9_000);
+    let total = 1_000_000_000_000_000;
+    // The 9 s price, as at epoch 2 of the scheduled fork above.
+    assert_eq!(base_reward_per_increment_at(total, 0, &config), 1_517);
+    assert_eq!(base_reward_per_increment_at(total, 5, &config), 1_517);
+
+    let state = state_at_epoch(ForkName::Heze, 3, 4);
+    let churn_config = Config {
+        min_per_epoch_churn_limit_electra: 133_000_000_001,
+        ..config.clone()
+    };
+    // 133_000_000_001 * 9000 / 12000, rounded down to an increment.
+    assert_eq!(
+        get_exit_churn_limit(&state, &churn_config).unwrap(),
+        99_000_000_000
+    );
+}
+
+#[test]
+fn a_heze_genesis_inactivity_penalty_uses_the_squared_ratio() {
+    let config = quick_slots_from_genesis();
+    let state = state_at_epoch(ForkName::Heze, 3, 4);
+    let summary = EpochSummary::build(&state, false).unwrap();
+    let context = RewardContext::new(&state, summary.totals(), &config).unwrap();
+    let (flags, effective_balance) = summary.iter().next().unwrap();
+    let penalty = context
+        .inactivity_penalty(flags, effective_balance, || Ok(1_000), &config)
+        .unwrap();
+    let quotient = u128::from(preset::retuned::inactivity_penalty_quotient(ForkName::Heze));
+    let bias = u128::from(config.inactivity_score_bias);
+    let denominator = bias * quotient * 12_000 * 12_000 / (9_000 * 9_000);
+    assert_eq!(penalty, (32_000_000_000u128 * 1_000 / denominator) as u64);
+}

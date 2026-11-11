@@ -301,10 +301,10 @@ pub struct RewardContext {
     fork: ForkName,
     base_reward_per_increment: Gwei,
     /// The slot duration in effect at the previous epoch, which the rewards
-    /// and penalties being computed pay for (EIP-8198), and the genesis one
-    /// the inactivity penalty is scaled against.
+    /// and penalties being computed pay for (EIP-8198), and
+    /// `SLOT_DURATION_MS`, the one the inactivity penalty is scaled against.
     previous_slot_duration_ms: u64,
-    genesis_slot_duration_ms: u64,
+    reference_slot_duration_ms: u64,
     active_increments: Gwei,
     participating_increments: [Gwei; FLAG_COUNT],
 }
@@ -332,7 +332,7 @@ impl RewardContext {
                 config,
             ),
             previous_slot_duration_ms: config.slot_duration_ms_at_epoch(previous_epoch),
-            genesis_slot_duration_ms: config.slot_duration_ms_at_epoch(constants::GENESIS_EPOCH),
+            reference_slot_duration_ms: config.slot_duration_ms,
             active_increments: totals.total_active_balance / preset::EFFECTIVE_BALANCE_INCREMENT,
             participating_increments: totals
                 .previous_epoch_flags
@@ -401,15 +401,15 @@ impl RewardContext {
                 ))?;
         let inactivity_penalty_quotient = preset::retuned::inactivity_penalty_quotient(self.fork);
         // [Modified in Heze:EIP8198] the penalty grows with the square of the
-        // epoch duration, so the cumulative penalty over a fixed wall-clock
-        // leak is unchanged; multiply before dividing, as the specification
-        // does.
-        let genesis_duration = u128::from(self.genesis_slot_duration_ms);
+        // ratio of the previous epoch's slot duration to `SLOT_DURATION_MS`,
+        // so the cumulative penalty over a fixed wall-clock leak stays about
+        // the same; multiply before dividing, as the specification does.
+        let reference_duration = u128::from(self.reference_slot_duration_ms);
         let previous_duration = u128::from(self.previous_slot_duration_ms);
         let penalty_denominator = u128::from(config.inactivity_score_bias)
             * u128::from(inactivity_penalty_quotient)
-            * genesis_duration
-            * genesis_duration
+            * reference_duration
+            * reference_duration
             / (previous_duration * previous_duration);
         let penalty_denominator = u64::try_from(penalty_denominator).unwrap_or(u64::MAX);
         Ok(penalty_numerator / penalty_denominator)

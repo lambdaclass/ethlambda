@@ -819,13 +819,17 @@ pub fn get_activation_churn_limit(state: &BeaconState, config: &Config) -> Resul
 }
 
 /// `churn * get_slot_duration_ms(get_current_epoch(state)) //
-/// get_slot_duration_ms(GENESIS_EPOCH)` (EIP-8198): an epoch of shorter slots
-/// is shorter in wall-clock time, so its churn budget shrinks to keep the
-/// per-second rate. The ratio is exactly one before Heze.
+/// SLOT_DURATION_MS` (EIP-8198): an epoch of shorter slots is shorter in
+/// wall-clock time, so its churn budget shrinks to keep the per-second rate.
+/// The ratio is exactly one before Heze.
+///
+/// Relative to `SLOT_DURATION_MS`, not the slot duration at `GENESIS_EPOCH`
+/// (consensus-specs `0f4fa3ff`), so a network that starts at Heze is scaled
+/// too; the two differ only there.
 fn scale_churn_to_slot_duration(churn: Gwei, state: &BeaconState, config: &Config) -> Gwei {
     let current_duration = u128::from(config.slot_duration_ms_at_epoch(get_current_epoch(state)));
-    let genesis_duration = u128::from(config.slot_duration_ms_at_epoch(constants::GENESIS_EPOCH));
-    Gwei::try_from(u128::from(churn) * current_duration / genesis_duration).unwrap_or(Gwei::MAX)
+    let reference_duration = u128::from(config.slot_duration_ms);
+    Gwei::try_from(u128::from(churn) * current_duration / reference_duration).unwrap_or(Gwei::MAX)
 }
 
 /// The per-epoch churn limit for exits, in Gwei.

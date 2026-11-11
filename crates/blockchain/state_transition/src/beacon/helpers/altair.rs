@@ -223,7 +223,7 @@ pub fn get_base_reward_per_increment(
 /// [`get_base_reward_per_increment`] for a total active balance the caller
 /// already holds, such as one served by an `ActiveBalanceCache`.
 ///
-/// Pre-Heze pricing, at the genesis slot duration. Heze-capable paths use
+/// Pre-Heze pricing, at `SLOT_DURATION_MS`. Heze-capable paths use
 /// [`base_reward_per_increment_at`].
 pub fn base_reward_per_increment(total_active_balance: Gwei) -> Gwei {
     preset::EFFECTIVE_BALANCE_INCREMENT * preset::BASE_REWARD_FACTOR
@@ -233,9 +233,13 @@ pub fn base_reward_per_increment(total_active_balance: Gwei) -> Gwei {
 /// [`base_reward_per_increment`] priced at the slot duration in effect at
 /// `epoch` (EIP-8198), in the specification's order of operations:
 /// `EFFECTIVE_BALANCE_INCREMENT * BASE_REWARD_FACTOR * duration(epoch) //
-/// duration(GENESIS_EPOCH) // integer_squareroot(total_active_balance)`.
-/// Equal to [`base_reward_per_increment`] wherever the duration is the
-/// genesis one.
+/// SLOT_DURATION_MS // integer_squareroot(total_active_balance)`.
+/// Equal to [`base_reward_per_increment`] wherever the duration is
+/// `SLOT_DURATION_MS`.
+///
+/// The reference duration is `SLOT_DURATION_MS`, not the slot duration at
+/// `GENESIS_EPOCH` (consensus-specs `0f4fa3ff`), so a network that activates
+/// EIP-8198 at genesis is scaled too. The two differ only there.
 pub fn base_reward_per_increment_at(
     total_active_balance: Gwei,
     epoch: Epoch,
@@ -244,7 +248,7 @@ pub fn base_reward_per_increment_at(
     let numerator = u128::from(preset::EFFECTIVE_BALANCE_INCREMENT)
         * u128::from(preset::BASE_REWARD_FACTOR)
         * u128::from(config.slot_duration_ms_at_epoch(epoch))
-        / u128::from(config.slot_duration_ms_at_epoch(constants::GENESIS_EPOCH));
+        / u128::from(config.slot_duration_ms);
     Gwei::try_from(numerator / u128::from(integer_squareroot(total_active_balance)))
         .unwrap_or(Gwei::MAX)
 }
