@@ -580,6 +580,96 @@ mod tests {
         assert_eq!(input.fg.justified.root, Root::repeat_byte(4));
     }
 
+    /// The execution hashes `forkchoiceUpdated` carries: a FULL node's payload
+    /// is its bid's `block_hash`, an EMPTY or PENDING node's the payload it
+    /// builds on; the confirmed node of a fresh engine is its finalized
+    /// anchor, read as pending.
+    #[test]
+    fn the_execution_hashes_follow_the_nodes_payload_status() {
+        let scene = crate::beacon::eip8453_test_support::scene(16);
+        let block = scene
+            .store
+            .get_signed_block(&scene.anchor_root)
+            .unwrap()
+            .unwrap();
+        let bid = block.payload_bid().unwrap().message.clone();
+        assert_ne!(bid.block_hash, bid.parent_block_hash);
+        let node = |status| protocol::ForkChoiceNode {
+            root: scene.anchor_root,
+            payload_status: status,
+        };
+        assert_eq!(
+            node_execution_block_hash(&scene.store, node(protocol::PayloadStatus::Full)),
+            Some(bid.block_hash)
+        );
+        for status in [
+            protocol::PayloadStatus::Empty,
+            protocol::PayloadStatus::Pending,
+        ] {
+            assert_eq!(
+                node_execution_block_hash(&scene.store, node(status)),
+                Some(bid.parent_block_hash)
+            );
+        }
+        let confirmed = scene
+            .node
+            .with(|n| get_confirmed_execution_block_hash(&scene.store, n.engine()))
+            .unwrap();
+        assert_eq!(confirmed, Some(bid.parent_block_hash));
+        assert_eq!(
+            finalized_execution_block_hash(&scene.store, scene.anchor_root),
+            Some(bid.parent_block_hash)
+        );
+        // An unknown block has no hash.
+        assert_eq!(
+            node_execution_block_hash(
+                &scene.store,
+                protocol::ForkChoiceNode::pending(Root::repeat_byte(9))
+            ),
+            None
+        );
+    }
+
+    /// A head vote reaches the engine only for a slot whose committee was
+    /// recorded first; `accept_head_vote` records it from the head state.
+    #[test]
+    fn a_vote_needs_its_slots_committee_recorded_first() {
+        let scene = crate::beacon::eip8453_test_support::scene(16);
+        let slot = scene.anchor_slot + 1;
+        let now = scene.at(slot, 1_000);
+        let validator = scene.committee(slot)[0];
+        let message = scene.head_vote(
+            validator,
+            crate::beacon::containers::eip8453::HeadVoteData {
+                slot,
+                beacon_block_root: scene.anchor_root,
+                payload_status: 0,
+            },
+        );
+        let refused = scene
+            .node
+            .with(|n| {
+                n.advance_to_ms(now);
+                n.engine_mut()
+                    .on_head_vote_message(protocol::HeadVoteMessage::from(&message))
+            })
+            .unwrap();
+        assert_eq!(
+            refused,
+            Err(ethlambda_decoupled::HeadVoteError::UnknownCommittee(slot))
+        );
+        let accepted = scene
+            .node
+            .with(|n| n.accept_head_vote(message.clone(), scene.committee(slot), now))
+            .unwrap();
+        assert_eq!(accepted, Ok(()));
+        let pooled = scene
+            .node
+            .with(|n| n.engine().head_vote_messages(slot).len())
+            .unwrap();
+        assert_eq!(pooled, 1);
+    }
+
     #[test]
     fn descent_names_the_ancestor_at_the_finalized_slot() {
         // 1 <- 2 <- 3 and 1 <- 4, at slots 1..=4.

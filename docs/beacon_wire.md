@@ -449,6 +449,28 @@ verifications per slot, so nothing is joined without a request.
 | Contributions | `sync_committee_contribution_and_proof` is always subscribed, validated, relayed and pooled for block production |
 | Publishing | the Beacon API pools its own submissions first, then publishes on each subnet its validator holds a seat in, under the digest the message's slot names, and marks them seen so a peer's echo is ignored |
 
+## EIP-8453 topics
+
+Under an EIP-8453 digest the node holds `EIP8453_TOPIC_KINDS`: the global
+topics without the deprecated `beacon_aggregate_and_proof`, heze's additions,
+and `head_vote`; its backbone subnets become `attestation_{subnet_id}` (the
+`attestation_aggregate` and `head_vote_aggregate` topics are still TODOs in
+the specification and are not joined). The rollover joins them like any other
+fork's topics.
+
+| Piece | Behaviour |
+| --- | --- |
+| `head_vote` | `validate_head_vote_gossip` with `verify_head_vote_payload_status` (`gossip::head_vote`): cheap half inline (fork epoch, seen, current slot), stateful half on the attestation permit pool (voted block, finalized ancestry, payload status, committee and signature against the head state advanced to the vote's epoch). An accepted vote is applied to the shared `SharedEip8453Node` (fork choice and seen set) when its verdict settles |
+| `attestation_{subnet_id}` | `validate_attestation_gossip` (`gossip::fg_attestation`): the round comes from `get_latest_attestation_committee_slot`; an accepted attestation is pooled in the shared node for proposals |
+| `beacon_block` | EIP-8453's modified rules: head vote limits and support bits, legacy slashings, and the finalized slot and ancestry from the store's finalized block (the gadget's) |
+| `attester_slashing` | decoded as EIP-8453's container by its topic's digest, then ignored, as every operation is under a gloas or later head |
+| Scoring | `head_vote` and the new subnets are unscored |
+| Publishing | `gossip::head_vote::submit` / `gossip::fg_attestation::submit` run a validator client's message through the same rules and apply step, then `RpcToP2P::publish_head_vote` / `publish_fg_attestation` gossip it under its slot's (epoch's) digest |
+
+Request/response adds `status/3` (`finalized_slot` from the head's
+post-state; a node publishing under an EIP-8453 digest opens its handshakes in
+it) and `beacon_blocks_by_head/1` (served, never requested).
+
 ## Request/response
 
 | Protocol | Direction |
