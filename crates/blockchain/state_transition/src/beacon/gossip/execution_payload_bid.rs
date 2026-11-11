@@ -35,12 +35,13 @@ use crate::beacon::builder_market::{BuilderMarket, KnownPayload};
 use crate::beacon::config::Config;
 use crate::beacon::constants::PAYLOAD_BUILDER_VERSION;
 use crate::beacon::containers::{BeaconState, SignedBeaconBlock, gloas};
+use crate::beacon::fork::ForkName;
 use crate::beacon::fork_choice::{self, ForkChoiceNode, PayloadStatus, Store};
 use crate::beacon::helpers::accessors::{get_current_epoch, get_randao_mix};
 use crate::beacon::helpers::gloas::{can_builder_cover_bid, is_active_builder};
 use crate::beacon::helpers::misc::{compute_epoch_at_slot, compute_start_slot_at_epoch};
 use crate::beacon::inclusion_list::get_inclusion_list_committee;
-use crate::beacon::lean_boundary::lean_state_unreachable;
+use crate::beacon::lean_boundary::{lean_fork_unreachable, lean_state_unreachable};
 use crate::beacon::preset;
 use crate::beacon::primitives::{Epoch, ExecutionBlockHash, Root, Slot};
 use crate::beacon::stf;
@@ -120,8 +121,22 @@ pub fn cheap_checks(
     }
     // Ours: gloas and heze bids share one container, so a decode accepts
     // either shape (see `gloas::ExecutionPayloadBid`); the specification's
-    // typed decoder rejects the shape the bid's slot does not take.
-    if bid.fork_name() != config.fork_at_epoch(proposal_epoch) {
+    // typed decoder rejects the shape the bid's slot does not take. EIP-8453
+    // keeps heze's bid, so its slots take heze's shape.
+    let shape = match config.fork_at_epoch(proposal_epoch) {
+        ForkName::Heze | ForkName::Eip8453 => ForkName::Heze,
+        // Gloas's own shape; an earlier fork's slot was ignored above.
+        fork @ (ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb
+        | ForkName::Electra
+        | ForkName::Fulu
+        | ForkName::Gloas) => fork,
+        ForkName::Lean => lean_fork_unreachable("execution_payload_bid::cheap_checks"),
+    };
+    if bid.fork_name() != shape {
         return Err(Outcome::Reject(RejectReason::WrongForkShape));
     }
     Ok(())
@@ -744,6 +759,35 @@ mod tests {
         assert_eq!(
             cheap_checks(&scene.market, &fulu, &scene.signed(|_| {}), now_ms),
             Err(ignore(IgnoreReason::PreGloasSlot))
+        );
+    }
+
+    /// EIP-8453 keeps heze's `ExecutionPayloadBid` (its `BeaconBlockBody`
+    /// carries heze's `SignedExecutionPayloadBid`, and `p2p-interface.md`
+    /// leaves the topic unmodified), so a bid of an EIP-8453 slot has heze's
+    /// shape, and gloas's is the wrong one.
+    #[test]
+    fn an_eip8453_slot_takes_the_heze_shaped_bid() {
+        let config = Config::mainnet()
+            .with_fork_epoch(ForkName::Fulu, 0)
+            .with_fork_epoch(ForkName::Gloas, 0)
+            .with_fork_epoch(ForkName::Heze, 0)
+            .with_fork_epoch(ForkName::Eip8453, BID_SLOT / SLOTS_PER_EPOCH);
+        let eip8453 = crate::beacon::gossip::test_support::store_with_config(0, config);
+        let scene = scene();
+        // Heze shortens the slot (EIP-8198): the schedule-aware clock.
+        let now_ms = crate::beacon::gossip::slot_start_ms(&eip8453.config(), BID_SLOT) + 100;
+        let heze_shaped = scene.signed(|bid| {
+            bid.inclusion_list_bits =
+                Some(crate::beacon::containers::heze::InclusionListBits::new());
+        });
+        assert_eq!(
+            cheap_checks(&scene.market, &eip8453, &heze_shaped, now_ms),
+            Ok(())
+        );
+        assert_eq!(
+            cheap_checks(&scene.market, &eip8453, &scene.signed(|_| {}), now_ms),
+            Err(reject(RejectReason::WrongForkShape))
         );
     }
 
