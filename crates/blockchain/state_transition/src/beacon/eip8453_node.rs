@@ -203,6 +203,24 @@ impl Eip8453Node {
         }
     }
 
+    /// Record the duty input of the engine's current instant again, if it is
+    /// one: for a host that changed the store within the tick that recorded
+    /// it (a node built by jumping to the present, then given its blocks and
+    /// any seeded lock).
+    pub fn record_current_duties(&mut self) {
+        let time = self.engine.time();
+        let slot = self.engine.current_slot();
+        let into_slot = ethlambda_decoupled::params::time_into_slot(time);
+        let event = TickEvents {
+            tick: time,
+            slot,
+            propose: slot > 0 && into_slot == 0,
+            head_vote: slot > 0 && into_slot == ethlambda_decoupled::params::HEAD_VOTE_DUE,
+            support_cutoff: into_slot == ethlambda_decoupled::params::SUPPORT_CUTOFF,
+        };
+        self.on_tick_event(&event);
+    }
+
     fn prune(&mut self) {
         let slot = self.engine.current_slot();
         let oldest_slot = slot.saturating_sub(HEAD_VOTE_SLOTS_KEPT);

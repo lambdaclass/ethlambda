@@ -573,6 +573,14 @@ async fn an_in_process_network_crosses_the_fork_and_finalizes_with_the_gadget() 
                     node.eip8453_node().is_active(),
                     "the engine runs at the fork"
                 );
+                let head = node.store.head().unwrap();
+                let (head_slot, parent) = node.store.block_entry(&head).unwrap();
+                let (parent_slot, _) = node.store.block_entry(&parent).unwrap();
+                assert_eq!(
+                    (head_slot, parent_slot),
+                    (fork_slot, fork_slot - 1),
+                    "the fork's first block is the head, on the last heze block"
+                );
             }
         }
     }
@@ -621,4 +629,100 @@ async fn an_in_process_network_crosses_the_fork_and_finalizes_with_the_gadget() 
     // The slot-denominated row pruning reads moved to the gadget's block.
     let stored = network.store(0).latest_finalized().unwrap();
     assert_eq!((stored.root, stored.slot), (finalized.root, finalized_slot));
+
+    // Restart the last node on its own directory: a fresh actor anchors its
+    // engine at the stored finalized block and replays the blocks above it,
+    // starting from the same finality gadget checkpoints.
+    let restarted_store = network.nodes[NODES - 1].store.clone();
+    let mut restarted = BlockChainServer::for_replay(
+        restarted_store,
+        None,
+        ethlambda_state_transition::beacon::constants::SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY,
+    );
+    assert!(!restarted.eip8453_node().is_active());
+    restarted.tick_at(network.time(end, 3)).await;
+    let (replayed_justified, replayed_finalized) = restarted
+        .eip8453_node()
+        .with(|n| n.checkpoints())
+        .expect("the restart installs the engine");
+    assert_eq!(replayed_finalized, finalized.into());
+    assert_eq!(replayed_justified, justified.into());
+    let replayed_blocks = restarted
+        .eip8453_node()
+        .with(|n| n.engine().blocks().count())
+        .unwrap();
+    let live_blocks = network.nodes[0]
+        .eip8453_node()
+        .with(|n| {
+            let engine = n.engine();
+            let finalized = engine.finalized_checkpoint().root;
+            engine
+                .blocks()
+                .filter(|(root, _, _)| engine.is_ancestor_root(root, &finalized))
+                .count()
+        })
+        .unwrap();
+    assert_eq!(
+        replayed_blocks, live_blocks,
+        "the replay holds the finalized subtree"
+    );
+    network.nodes[NODES - 1] = restarted;
+
+    // The network goes on with the restarted node, which catches up from the
+    // votes and blocks that follow, and finalizes further alike.
+    let more = end + 2 * preset::SLOTS_PER_ROUND;
+    for slot in end + 1..=more {
+        network.run_slot(slot).await;
+    }
+    let head = network.store(0).head().unwrap();
+    let later = network.store(0).fg_finalized_checkpoint().unwrap();
+    assert!(
+        later.height > finalized.height,
+        "finality moved on: {later:?}"
+    );
+    for node in 1..NODES {
+        assert_eq!(
+            network.store(node).head().unwrap(),
+            head,
+            "node {node}'s head"
+        );
+        assert_eq!(network.store(node).fg_finalized_checkpoint(), Some(later));
+    }
+}
+
+/// Why the handover seeds a lock: at the fork's first slot no head vote of the
+/// previous slot exists, so without one the available chain's walk stops at
+/// its anchor (Casper FFG's finalized block, here genesis) and the fork's
+/// first proposal would orphan every block since. With the lock it builds on
+/// the last heze block.
+#[tokio::test]
+async fn the_handover_lock_keeps_the_pre_fork_chain() {
+    let mut network = Network::new();
+    let fork_slot = network.fork_slot;
+    for slot in 1..fork_slot {
+        network.run_slot(slot).await;
+    }
+    let last_heze = network.store(0).head().unwrap();
+    let genesis = network.store(0).latest_finalized().unwrap().root;
+    let now = network.time(fork_slot, 0);
+
+    let unlocked = crate::beacon_eip8453::rebuild_node(network.store(0), now, |_| None)
+        .expect("the store anchors an engine");
+    let mut unlocked = unlocked;
+    let proposal = unlocked.proposal(fork_slot, now).unwrap();
+    assert_eq!(
+        proposal.head.root, genesis,
+        "without a lock the walk stops at its anchor"
+    );
+
+    network.tick(fork_slot, 0).await;
+    let proposal = network.nodes[0]
+        .eip8453_node()
+        .with(|n| n.proposal(fork_slot, now))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        proposal.head.root, last_heze,
+        "the seeded lock keeps the chain"
+    );
 }

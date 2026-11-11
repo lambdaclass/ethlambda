@@ -85,10 +85,19 @@ fn payload_verified(store: &Store, root: H256) -> bool {
     fork_choice::is_payload_verified(store, root)
 }
 
-/// Build an engine anchored at the store's finalized block and replay every
-/// stored block above it, with its verified payload. `None` when the
-/// finalized block or its state is missing.
-pub(crate) fn rebuild_node(store: &Store, now_ms: u64) -> Option<Eip8453Node> {
+/// A lock to seed at the handover: the node and its deadline (in ticks).
+pub(crate) type SeedLock = (ForkChoiceNode, ethlambda_decoupled::Tick);
+
+/// Build an engine anchored at the store's finalized block, replay every
+/// stored block above it with its verified payload, seed `lock` when given,
+/// and only then record the duty inputs of the present instant (so a node
+/// installed at a slot's start proposes on the replayed tree, under the
+/// lock). `None` when the finalized block or its state is missing.
+pub(crate) fn rebuild_node(
+    store: &Store,
+    now_ms: u64,
+    lock: impl FnOnce(&Eip8453Node) -> Option<SeedLock>,
+) -> Option<Eip8453Node> {
     let config = store.config();
     let finalized = store.latest_finalized().ok()?;
     let (anchor_slot, _) = store.block_entry(&finalized.root)?;
@@ -99,8 +108,11 @@ pub(crate) fn rebuild_node(store: &Store, now_ms: u64) -> Option<Eip8453Node> {
     let gadget_root = anchor.fg.finalized.root;
     let mut node = Eip8453Node::new(config.as_ref().clone(), host::new_engine(anchor));
     // A never-ticked engine jumps to the present: the replay below stamps
-    // every block with the restart's time, as a joining node's would be.
-    node.advance_to_ms(now_ms);
+    // every block with the restart's time, as a joining node's would be. The
+    // jump goes to the engine directly, so the instant's duty inputs are
+    // recorded below, once the tree is in place.
+    node.engine_mut()
+        .advance_to(host::tick_at_ms(&config, now_ms));
     if payload_verified(store, finalized.root) {
         let satisfied = fork_choice::is_payload_inclusion_list_satisfied(store, finalized.root);
         let _ = node.on_payload(&finalized.root, satisfied, now_ms);
@@ -122,6 +134,16 @@ pub(crate) fn rebuild_node(store: &Store, now_ms: u64) -> Option<Eip8453Node> {
             replayed += 1;
         }
     }
+    if let Some((lock, deadline)) = lock(&node) {
+        node.engine_mut().add_lock(deadline, lock);
+        info!(
+            lock_root = %ShortRoot(&lock.root.0),
+            ?lock.payload_status,
+            deadline,
+            "Seeded the available chain's lock on the last LMD-GHOST head"
+        );
+    }
+    node.record_current_duties();
     info!(
         anchor_slot,
         anchor_root = %ShortRoot(&finalized.root.0),
@@ -283,29 +305,38 @@ impl BlockChainServer {
             warn!(%err, "Not running the EIP-8453 fork choice");
             return;
         }
-        let Some(mut node) = rebuild_node(&self.store, now_ms) else {
+        // At the transition (a pre-fork head), the lock on the last LMD-GHOST
+        // head node, with the deadline a confirmation of the last pre-fork
+        // slot gets. Its payload status is the one LMD-GHOST picked, or the
+        // EMPTY branch when that node is not in the engine's tree (a FULL head
+        // whose payload this node never verified).
+        let seed = (!head_is_eip8453)
+            .then(|| head_root.zip(self.store.head_payload_status()))
+            .flatten();
+        let lock = |node: &Eip8453Node| -> Option<SeedLock> {
+            let (head_root, status) = seed?;
+            let engine = node.engine();
+            if !engine.contains(&head_root) {
+                return None;
+            }
+            let mut payload_status: ethlambda_types::decoupled::PayloadStatus = status.into();
+            if payload_status == ethlambda_types::decoupled::PayloadStatus::Full
+                && !engine.is_payload_verified(&head_root)
+            {
+                payload_status = ethlambda_types::decoupled::PayloadStatus::Empty;
+            }
+            let deadline = engine.params().lock_deadline(fork_slot.saturating_sub(1));
+            Some((
+                ForkChoiceNode {
+                    root: head_root,
+                    payload_status,
+                },
+                deadline,
+            ))
+        };
+        let Some(node) = rebuild_node(&self.store, now_ms, lock) else {
             return;
         };
-        if !head_is_eip8453
-            && let (Some(head_root), Some(status)) = (head_root, self.store.head_payload_status())
-        {
-            let lock = ForkChoiceNode {
-                root: head_root,
-                payload_status: status.into(),
-            };
-            let deadline = node
-                .engine()
-                .params()
-                .lock_deadline(fork_slot.saturating_sub(1));
-            if node.engine().contains(&head_root) {
-                node.engine_mut().add_lock(deadline, lock);
-                info!(
-                    fork_slot,
-                    head_root = %ShortRoot(&head_root.0),
-                    "Seeded the available chain's lock on the last LMD-GHOST head"
-                );
-            }
-        }
         self.eip8453.node.install(node);
         metrics::set_eip8453_active(true);
     }
