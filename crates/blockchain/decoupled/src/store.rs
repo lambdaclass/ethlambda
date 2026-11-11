@@ -166,6 +166,9 @@ pub struct Store {
     pub(crate) justified_checkpoint: HeightCheckpoint,
     pub(crate) finalized_checkpoint: HeightCheckpoint,
     pub(crate) max_height: Height,
+    /// The greatest target height of the blocks pruning dropped, which
+    /// `max_height` still counts, for when an invalidation recomputes it.
+    pub(crate) pruned_max_height: Height,
     pub(crate) fast_confirmed_path: HashSet<ForkChoiceNode>,
     pub(crate) latest_confirmed: ForkChoiceNode,
     pub(crate) saved_confirmations: BTreeMap<Slot, ForkChoiceNode>,
@@ -216,6 +219,7 @@ impl Store {
             justified_checkpoint: checkpoint,
             finalized_checkpoint: checkpoint,
             max_height: anchor_height,
+            pruned_max_height: anchor_height,
             fast_confirmed_path: HashSet::new(),
             latest_confirmed: ForkChoiceNode::pending(anchor.root),
             saved_confirmations: BTreeMap::new(),
@@ -304,7 +308,8 @@ impl Store {
     /// * Blocks outside the finalized block's subtree: from this slot on, the
     ///   views read votes only from blocks of the current slot, and every walk
     ///   stays inside the finalized subtree. Strict ancestors of the finalized
-    ///   block are remembered by root only.
+    ///   block are remembered by root only, and the dropped blocks' greatest
+    ///   target height is kept for `invalidate_payload`.
     /// * Head vote messages and committees of slots before the previous one.
     /// * Saved confirmations older than the slow lock window reads.
     /// * Expired locks (a live lock's deadline is later than the store time).
@@ -329,6 +334,14 @@ impl Store {
             child = self.blocks.get(&parent);
         }
         if keep.len() < self.blocks.len() {
+            let pruned_max_height = self
+                .blocks
+                .iter()
+                .filter(|(root, _)| !keep.contains(*root))
+                .map(|(_, block)| block.fg.target.height)
+                .max()
+                .unwrap_or(0);
+            self.pruned_max_height = self.pruned_max_height.max(pruned_max_height);
             self.blocks.retain(|root, _| keep.contains(root));
             for roots in self.blocks_by_slot.values_mut() {
                 roots.retain(|root| keep.contains(root));

@@ -856,6 +856,79 @@ fn after_an_invalidation_the_head_the_vote_and_the_proposal_leave_the_payload() 
 }
 
 #[test]
+fn an_invalidation_lowers_the_height_floor_the_removed_blocks_raised() {
+    let mut store = store();
+    at(&mut store, slot_start(1));
+    let x = add(&mut store, 1, G, 1);
+    store.on_execution_payload_envelope(&x, true).unwrap();
+    // A1 and A2 build on X's payload and time out heights 1 and 2 without
+    // justifying either; B builds on X's empty branch, still at height 1.
+    at(&mut store, slot_start(2));
+    let timed_out = |height: u64, byte: u8| FgCheckpoints {
+        target: cp(height, root(byte)),
+        justified: cp(0, G),
+        finalized: cp(0, G),
+    };
+    let a1 = add_on_full_with(&mut store, 2, x, 2, timed_out(2, 2));
+    let b = add(&mut store, 3, x, 2);
+    at(&mut store, head_vote_due(2));
+    for v in 0..4 {
+        vote(&mut store, v, 2, ForkChoiceNode::pending(b)).unwrap();
+    }
+    at(&mut store, slot_start(3));
+    add_with(&mut store, 4, a1, 3, timed_out(3, 4));
+    // Height 3 is two above the justified height 1: only A1 and A2 pass the
+    // floor.
+    assert_eq!(store.max_height(), 3);
+    assert!(!store.get_fg_frame().viable_heads.contains(&pending(3)));
+
+    assert!(matches!(
+        store.invalidate_payload(&x),
+        PayloadInvalidation::Invalidated { .. }
+    ));
+    // The blocks that raised the floor are gone, and so is their height: the
+    // reorganization onto B does not touch the justified checkpoint, so the
+    // fork choice must be able to make it (optimistic-sync.md, "Re-Orgs").
+    assert_eq!(store.max_height(), 1);
+    assert!(store.get_fg_frame().viable_heads.contains(&pending(3)));
+    assert_eq!(store.get_head(), empty(3));
+    // Slot 2's confirmation gives the FG an attestation source on B.
+    at(&mut store, support_cutoff(3));
+    assert_eq!(store.get_ac_frame().fg_confirmed, Some(pending(3)));
+}
+
+#[test]
+fn an_invalidation_still_counts_the_heights_of_pruned_blocks() {
+    let mut store = store();
+    let fg = |target: (u64, u8), justified: (u64, H256), finalized: (u64, H256)| FgCheckpoints {
+        target: cp(target.0, root(target.1)),
+        justified: cp(justified.0, justified.1),
+        finalized: cp(finalized.0, finalized.1),
+    };
+    at(&mut store, slot_start(1));
+    // P, on a branch the finalization below prunes, reaches height 3.
+    add_with(&mut store, 1, G, 1, fg((3, 1), (0, G), (0, G)));
+    let f = add_with(&mut store, 2, G, 1, fg((2, 2), (1, G), (0, G)));
+    at(&mut store, slot_start(2));
+    let x = add(&mut store, 3, f, 2);
+    store.on_execution_payload_envelope(&x, true).unwrap();
+    at(&mut store, slot_start(3));
+    // C, on X's payload, justifies and finalizes F at height 3.
+    add_on_full_with(&mut store, 4, x, 3, fg((3, 4), (2, f), (2, f)));
+    assert_eq!(store.finalized_checkpoint(), cp(2, f));
+    at(&mut store, slot_start(4));
+    assert!(!store.contains(&root(1)));
+
+    assert!(matches!(
+        store.invalidate_payload(&x),
+        PayloadInvalidation::Invalidated { .. }
+    ));
+    // The held blocks are at height 2, but P was taken in at height 3.
+    assert_eq!(store.max_height(), 3);
+    assert!(store.get_fg_frame().viable_heads.contains(&pending(3)));
+}
+
+#[test]
 fn a_payload_the_gadget_committed_to_is_not_invalidated() {
     let mut store = store();
     at(&mut store, slot_start(1));

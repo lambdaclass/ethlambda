@@ -187,8 +187,12 @@ crates/blockchain/src/decoupled_lean.rs     lean chain actor
   `get_ac_proposal`, the confirmation walk and the FG source never reach them;
   a vote for them no longer resolves, so it supports nothing (it still counts
   as participation, as a vote for an unknown block does); `is_fg_contest` and
-  `has_viable_descendant` no longer see them. A lock, `latest_confirmed` and
-  the saved confirmations on a removed node move to the block's `Pending`
+  `has_viable_descendant` no longer see them, and `max_height` is recomputed
+  without their target heights (from the held blocks and the greatest height
+  pruning dropped), since a height floor only removed blocks reached would
+  leave no viable head and the gadget without a source. A lock,
+  `latest_confirmed` and the saved confirmations on a removed node move to
+  the block's `Pending`
   node (a lock keeps its deadline, as `unlock` moves one), and the
   fast-confirmed path drops them. When the gadget's justified or finalized
   block builds on the payload (its `Full` node is an ancestor of that block's

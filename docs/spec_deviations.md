@@ -1153,8 +1153,12 @@ node computes the same value another way.
   on; the block and its EMPTY branch stay. So no `get_head`,
   `get_ac_vote_head`, `get_ac_proposal`, confirmation or FG source names
   them, a vote for them supports nothing (it still counts as participation,
-  as a vote for an unknown block does), and `is_fg_contest` and
-  `has_viable_descendant` no longer see them. A lock, `latest_confirmed` or
+  as a vote for an unknown block does), `is_fg_contest` and
+  `has_viable_descendant` no longer see them, and `max_height` is recomputed
+  without their target heights, so the viability floor follows the blocks
+  left (optimistic sync: the node "MUST support any chain reorganisation
+  which does *not* affect the justified checkpoint"; a floor only removed
+  blocks reached would leave no viable head). A lock, `latest_confirmed` or
   saved confirmation on a removed node moves to the block's PENDING node (a
   lock keeping its deadline, as `unlock` moves one); duty inputs the node
   recorded earlier in the slot move to its EMPTY node. When the gadget's

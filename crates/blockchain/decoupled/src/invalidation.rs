@@ -23,7 +23,11 @@
 //!   it supports nothing (it still counts as participation, as a vote for an
 //!   unknown block does);
 //! * `is_fg_contest` and `has_viable_descendant` no longer see the removed
-//!   blocks;
+//!   blocks, and `max_height` is recomputed without their target heights (the
+//!   held blocks', and those pruning dropped): a height floor only removed
+//!   blocks reached would leave the frame without a viable head, every walk
+//!   at its root and the gadget without a source, for good, though the
+//!   reorganization touches no justified checkpoint;
 //! * the block itself stays, with its `Empty` branch.
 //!
 //! What the store keeps by node is moved to the deepest node left above it,
@@ -155,6 +159,15 @@ impl Store {
         // Every removed block's parent is `root` or another removed block.
         if let Some(block) = self.blocks.get_mut(root) {
             block.children.retain(|child| !removed.contains(child));
+        }
+        // `max_height` is the greatest target height of the blocks the store
+        // took in; the removed ones no longer count.
+        if !removed_blocks.is_empty() {
+            self.max_height = self
+                .blocks
+                .values()
+                .map(|block| block.fg.target.height)
+                .fold(self.pruned_max_height, u64::max);
         }
         PayloadInvalidation::Invalidated { removed_blocks }
     }
