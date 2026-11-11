@@ -55,6 +55,7 @@ pub(crate) struct ReqResp {
     pub(crate) lean_decoupled_blocks_by_root: request_response::Behaviour<Codec>,
     pub(crate) beacon_status_v1: request_response::Behaviour<Codec>,
     pub(crate) beacon_status_v2: request_response::Behaviour<Codec>,
+    pub(crate) beacon_status_v3: request_response::Behaviour<Codec>,
     pub(crate) beacon_ping: request_response::Behaviour<Codec>,
     pub(crate) beacon_metadata_v1: request_response::Behaviour<Codec>,
     pub(crate) beacon_metadata_v2: request_response::Behaviour<Codec>,
@@ -62,6 +63,7 @@ pub(crate) struct ReqResp {
     pub(crate) beacon_goodbye: request_response::Behaviour<Codec>,
     pub(crate) beacon_blocks_by_range: request_response::Behaviour<Codec>,
     pub(crate) beacon_blocks_by_root: request_response::Behaviour<Codec>,
+    pub(crate) beacon_blocks_by_head: request_response::Behaviour<Codec>,
     pub(crate) data_column_sidecars_by_range: request_response::Behaviour<Codec>,
     pub(crate) data_column_sidecars_by_root: request_response::Behaviour<Codec>,
     pub(crate) execution_payload_envelopes_by_range: request_response::Behaviour<Codec>,
@@ -136,6 +138,15 @@ impl ReqResp {
                 ),
                 handshake_protocol_config(),
             ),
+            beacon_status_v3: request_response::Behaviour::with_codec(
+                codec.clone(),
+                one_protocol(
+                    is_beacon,
+                    beacon::protocols::STATUS_V3,
+                    request_response::ProtocolSupport::Full,
+                ),
+                handshake_protocol_config(),
+            ),
             beacon_ping: request_response::Behaviour::with_codec(
                 codec.clone(),
                 one_protocol(
@@ -198,6 +209,15 @@ impl ReqResp {
                 one_protocol(
                     is_beacon,
                     beacon::protocols::BLOCKS_BY_ROOT_V2,
+                    request_response::ProtocolSupport::Full,
+                ),
+                fetch_protocol_config(),
+            ),
+            beacon_blocks_by_head: request_response::Behaviour::with_codec(
+                codec.clone(),
+                one_protocol(
+                    is_beacon,
+                    beacon::protocols::BLOCKS_BY_HEAD_V1,
                     request_response::ProtocolSupport::Full,
                 ),
                 fetch_protocol_config(),

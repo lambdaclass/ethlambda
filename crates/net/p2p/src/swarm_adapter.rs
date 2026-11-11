@@ -422,6 +422,9 @@ pub(crate) fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCo
                 ReqRespProtocol::BeaconStatusV2 => {
                     behaviour.beacon_status_v2.send_request(&peer, request)
                 }
+                ReqRespProtocol::BeaconStatusV3 => {
+                    behaviour.beacon_status_v3.send_request(&peer, request)
+                }
                 ReqRespProtocol::BeaconPing => behaviour.beacon_ping.send_request(&peer, request),
                 ReqRespProtocol::BeaconMetadataV1 => {
                     behaviour.beacon_metadata_v1.send_request(&peer, request)
@@ -440,6 +443,9 @@ pub(crate) fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCo
                     .send_request(&peer, request),
                 ReqRespProtocol::BeaconBlocksByRoot => {
                     behaviour.beacon_blocks_by_root.send_request(&peer, request)
+                }
+                ReqRespProtocol::BeaconBlocksByHead => {
+                    behaviour.beacon_blocks_by_head.send_request(&peer, request)
                 }
                 ReqRespProtocol::DataColumnSidecarsByRange => behaviour
                     .data_column_sidecars_by_range

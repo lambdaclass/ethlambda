@@ -163,6 +163,13 @@ pub async fn handle_req_resp_message(
                         )
                         .await;
                     }
+                    Request::BlocksByHead(request) => {
+                        trace!(
+                            kind = "beacon_blocks_by_head_request",
+                            peer_count, "P2P message received"
+                        );
+                        handle_beacon_blocks_by_head_request(server, peer, request, channel).await;
+                    }
                     Request::DataColumnsByRange(request) => {
                         trace!(
                             kind = "data_column_sidecars_by_range_request",
@@ -2203,6 +2210,57 @@ async fn handle_beacon_blocks_by_root_request(
     respond(server, channel, ResponsePayload::Blocks(blocks));
 }
 
+/// Answer `beacon_blocks_by_head/1`: the blocks along `beacon_root`'s
+/// ancestry, inclusive, in descending slot order, until the answer holds
+/// `min(count, MAX_REQUEST_BLOCKS_DENEB)` blocks or the next ancestor is one
+/// this node does not hold (below its anchor, which is where the epochs it is
+/// obliged to serve end for a checkpoint-synced node).
+///
+/// A root this node does not hold is answered with no blocks, which the
+/// specification allows for a root outside the served range.
+async fn handle_beacon_blocks_by_head_request(
+    server: &mut P2PServer,
+    peer: PeerId,
+    request: crate::beacon::messages::BeaconBlocksByHeadRequest,
+    channel: ResponseChannel<Response>,
+) {
+    let Some(channel) = beacon_block_store_or_refuse(server, peer, channel) else {
+        return;
+    };
+    let blocks = blocks_by_head(&server.store, request.beacon_root, request.count);
+    trace!(
+        %peer,
+        beacon_root = %request.beacon_root,
+        count = request.count,
+        found = blocks.len(),
+        "Responding to BeaconBlocksByHead request"
+    );
+    respond(server, channel, ResponsePayload::Blocks(blocks));
+}
+
+/// The walk behind [`handle_beacon_blocks_by_head_request`].
+pub(crate) fn blocks_by_head(store: &Store, root: H256, count: u64) -> Vec<SignedBeaconBlock> {
+    let limit = count.min(MAX_REQUEST_BLOCKS_DENEB) as usize;
+    let mut blocks = Vec::with_capacity(limit);
+    let mut cursor = root;
+    while blocks.len() < limit {
+        match store.get_signed_block(&cursor) {
+            Ok(Some(SignedBeaconBlock::Lean(_))) | Ok(None) | Err(_) => break,
+            Ok(Some(block)) => {
+                let parent = block.parent_root();
+                // The anchor's parent is not held; neither is genesis's.
+                let at_anchor = block.slot() == 0 || parent.is_zero();
+                blocks.push(block);
+                if at_anchor {
+                    break;
+                }
+                cursor = parent;
+            }
+        }
+    }
+    blocks
+}
+
 /// Answer `data_column_sidecars_by_root/1` with whichever of the named
 /// sidecars this node custodies.
 ///
@@ -2853,6 +2911,53 @@ pub(crate) mod tests {
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
+
+    /// `beacon_blocks_by_head/1` answers the root's ancestry, inclusive, in
+    /// descending slot order, up to the count, and stops at the oldest block
+    /// held.
+    #[test]
+    fn blocks_by_head_walks_the_ancestry_descending() {
+        use ethlambda_types::beacon::containers::electra;
+        let mut store = Store::init_beacon(
+            Arc::new(InMemoryBackend::new()),
+            0,
+            ethlambda_types::beacon::config::Config::mainnet(),
+            H256::ZERO,
+            ethlambda_types::checkpoint::Checkpoint {
+                root: H256::ZERO,
+                slot: 0,
+            },
+            0,
+        );
+        let mut parent = H256::ZERO;
+        let mut roots = Vec::new();
+        for slot in 1..=5 {
+            let block = SignedBeaconBlock::Fulu(electra::SignedBeaconBlock {
+                message: electra::BeaconBlock {
+                    slot,
+                    proposer_index: 0,
+                    parent_root: parent,
+                    state_root: H256::ZERO,
+                    body: electra::BeaconBlockBody::empty(),
+                },
+                signature: Default::default(),
+            });
+            let root = block.message_hash_tree_root();
+            store.insert_signed_block(root, block).unwrap();
+            roots.push(root);
+            parent = root;
+        }
+        let slots = |blocks: Vec<SignedBeaconBlock>| -> Vec<u64> {
+            blocks.iter().map(SignedBeaconBlock::slot).collect()
+        };
+        assert_eq!(slots(blocks_by_head(&store, roots[4], 3)), vec![5, 4, 3]);
+        assert_eq!(
+            slots(blocks_by_head(&store, roots[3], 100)),
+            vec![4, 3, 2, 1]
+        );
+        assert!(blocks_by_head(&store, H256::repeat_byte(7), 3).is_empty());
+        assert!(blocks_by_head(&store, roots[4], 0).is_empty());
+    }
 
     /// A real, unconnected `P2PServer`: a loopback swarm bound to an
     /// OS-assigned port, discv5 the same way, and no bootnodes or peers. Ports

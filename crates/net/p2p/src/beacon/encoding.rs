@@ -50,7 +50,7 @@ use super::decode;
 use super::fork_schedule::ForkSchedule;
 use super::messages::{
     BeaconBlocksByRangeRequest, BeaconMetaData, BeaconStatus, MetaDataV1, MetaDataV2, MetaDataV3,
-    StatusV1, StatusV2,
+    StatusV1, StatusV2, StatusV3,
 };
 use super::protocols::{self, MAX_REQUEST_BLOCKS_DENEB};
 use crate::req_resp::codec::write_success_chunk;
@@ -95,6 +95,7 @@ pub fn encode_status(protocol: &str, status: &BeaconStatus) -> io::Result<Vec<u8
     match (protocol, status) {
         (protocols::STATUS_V1, BeaconStatus::V1(status)) => Ok(status.to_ssz()),
         (protocols::STATUS_V2, BeaconStatus::V2(status)) => Ok(status.to_ssz()),
+        (protocols::STATUS_V3, BeaconStatus::V3(status)) => Ok(status.to_ssz()),
         _ => Err(invalid(format!(
             "status version does not match protocol {protocol}"
         ))),
@@ -108,6 +109,9 @@ pub fn decode_status(protocol: &str, payload: &[u8]) -> io::Result<BeaconStatus>
             .map_err(|err| invalid(format!("{err:?}"))),
         protocols::STATUS_V2 => StatusV2::from_ssz_bytes(payload)
             .map(BeaconStatus::V2)
+            .map_err(|err| invalid(format!("{err:?}"))),
+        protocols::STATUS_V3 => StatusV3::from_ssz_bytes(payload)
+            .map(BeaconStatus::V3)
             .map_err(|err| invalid(format!("{err:?}"))),
         _ => Err(invalid(format!("not a status protocol: {protocol}"))),
     }

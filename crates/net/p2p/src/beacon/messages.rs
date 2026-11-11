@@ -44,16 +44,31 @@ pub struct StatusV2 {
     pub earliest_available_slot: Slot,
 }
 
+/// `Status` v3 (EIP-8453): v2 with `finalized_slot` in place of
+/// `finalized_epoch`, since the finality gadget finalizes blocks at heights
+/// rather than epoch checkpoints, so the finalized block need not open an
+/// epoch.
+#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode)]
+pub struct StatusV3 {
+    pub fork_digest: ForkDigest,
+    pub finalized_root: Root,
+    pub finalized_slot: Slot,
+    pub head_root: Root,
+    pub head_slot: Slot,
+    pub earliest_available_slot: Slot,
+}
+
 /// A `Status` in whichever version the negotiated protocol asked for.
 ///
 /// The version is a property of the stream, not of the value, so it is carried
 /// alongside the fields rather than being recovered from them: v1 and v2 differ
 /// only by a trailing `uint64`, which SSZ cannot tell apart from a truncated
-/// v2.
+/// v2, and v2 and v3 have the same shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BeaconStatus {
     V1(StatusV1),
     V2(StatusV2),
+    V3(StatusV3),
 }
 
 impl BeaconStatus {
@@ -61,6 +76,7 @@ impl BeaconStatus {
         match self {
             BeaconStatus::V1(status) => status.fork_digest,
             BeaconStatus::V2(status) => status.fork_digest,
+            BeaconStatus::V3(status) => status.fork_digest,
         }
     }
 
@@ -68,15 +84,42 @@ impl BeaconStatus {
         match self {
             BeaconStatus::V1(status) => status.head_slot,
             BeaconStatus::V2(status) => status.head_slot,
+            BeaconStatus::V3(status) => status.head_slot,
         }
     }
 
+    /// The finalized epoch: v3's finalized slot's epoch.
     pub fn finalized_epoch(&self) -> Epoch {
         match self {
             BeaconStatus::V1(status) => status.finalized_epoch,
             BeaconStatus::V2(status) => status.finalized_epoch,
+            BeaconStatus::V3(status) => {
+                status.finalized_slot / ethlambda_types::beacon::preset::SLOTS_PER_EPOCH
+            }
         }
     }
+
+    /// The finalized slot: v3's own, the finalized epoch's start slot before.
+    pub fn finalized_slot(&self) -> Slot {
+        match self {
+            BeaconStatus::V1(status) => {
+                status.finalized_epoch * ethlambda_types::beacon::preset::SLOTS_PER_EPOCH
+            }
+            BeaconStatus::V2(status) => {
+                status.finalized_epoch * ethlambda_types::beacon::preset::SLOTS_PER_EPOCH
+            }
+            BeaconStatus::V3(status) => status.finalized_slot,
+        }
+    }
+}
+
+/// `BeaconBlocksByHead` v1's request (fulu's `p2p-interface.md`, which
+/// EIP-8453 extends with its own block type): blocks along the ancestry of
+/// `beacon_root`, inclusive, in descending slot order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SszEncode, SszDecode)]
+pub struct BeaconBlocksByHeadRequest {
+    pub beacon_root: Root,
+    pub count: u64,
 }
 
 /// `Ping`, and its response: a metadata sequence number, so a peer can tell

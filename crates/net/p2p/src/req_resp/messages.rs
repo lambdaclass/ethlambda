@@ -9,7 +9,7 @@ use ethlambda_types::lean_decoupled::SignedDecoupledBlock;
 use libssz_types::SszList;
 
 use crate::beacon::messages::{
-    BeaconMetaData, BeaconStatus, DataColumnsByRangeRequest,
+    BeaconBlocksByHeadRequest, BeaconMetaData, BeaconStatus, DataColumnsByRangeRequest,
     ExecutionPayloadEnvelopesByRangeRequest, Goodbye, InclusionListsByIndicesRequest, Ping,
 };
 use crate::lean::messages::{BlocksByRootRequest, Status};
@@ -106,6 +106,8 @@ pub enum Request {
     DecoupledBlocksByRoot(Vec<Root>),
     /// Heze inclusion lists by committee position. Beacon-only.
     InclusionListsByIndices(InclusionListsByIndicesRequest),
+    /// `BeaconBlocksByHead` v1: blocks along a root's ancestry. Beacon-only.
+    BlocksByHead(BeaconBlocksByHeadRequest),
 }
 
 #[derive(Debug, Clone)]

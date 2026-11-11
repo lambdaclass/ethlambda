@@ -455,6 +455,7 @@ pub enum ReqRespProtocol {
     LeanDecoupledBlocksByRoot,
     BeaconStatusV1,
     BeaconStatusV2,
+    BeaconStatusV3,
     BeaconPing,
     BeaconMetadataV1,
     BeaconMetadataV2,
@@ -462,6 +463,7 @@ pub enum ReqRespProtocol {
     BeaconGoodbye,
     BeaconBlocksByRange,
     BeaconBlocksByRoot,
+    BeaconBlocksByHead,
     DataColumnSidecarsByRange,
     DataColumnSidecarsByRoot,
     ExecutionPayloadEnvelopesByRange,
@@ -2139,7 +2141,7 @@ async fn handle_swarm_event(
                         beacon::handler::build_status(
                             &server.store,
                             wire,
-                            beacon::handler::StatusVersion::V1,
+                            beacon::handler::StatusVersion::opening(wire),
                         ),
                         hex::encode(wire.fork_digest),
                     )
@@ -2392,6 +2394,7 @@ async fn handle_behaviour_event(
             }
             ReqRespEvent::BeaconStatusV1(e) => (ReqRespProtocol::BeaconStatusV1, e),
             ReqRespEvent::BeaconStatusV2(e) => (ReqRespProtocol::BeaconStatusV2, e),
+            ReqRespEvent::BeaconStatusV3(e) => (ReqRespProtocol::BeaconStatusV3, e),
             ReqRespEvent::BeaconPing(e) => (ReqRespProtocol::BeaconPing, e),
             ReqRespEvent::BeaconMetadataV1(e) => (ReqRespProtocol::BeaconMetadataV1, e),
             ReqRespEvent::BeaconMetadataV2(e) => (ReqRespProtocol::BeaconMetadataV2, e),
@@ -2399,6 +2402,7 @@ async fn handle_behaviour_event(
             ReqRespEvent::BeaconGoodbye(e) => (ReqRespProtocol::BeaconGoodbye, e),
             ReqRespEvent::BeaconBlocksByRange(e) => (ReqRespProtocol::BeaconBlocksByRange, e),
             ReqRespEvent::BeaconBlocksByRoot(e) => (ReqRespProtocol::BeaconBlocksByRoot, e),
+            ReqRespEvent::BeaconBlocksByHead(e) => (ReqRespProtocol::BeaconBlocksByHead, e),
             ReqRespEvent::DataColumnSidecarsByRange(e) => {
                 (ReqRespProtocol::DataColumnSidecarsByRange, e)
             }
@@ -3659,6 +3663,7 @@ mod tests {
                 }
                 ReqRespEvent::BeaconStatusV1(e) => (ReqRespProtocol::BeaconStatusV1, e),
                 ReqRespEvent::BeaconStatusV2(e) => (ReqRespProtocol::BeaconStatusV2, e),
+                ReqRespEvent::BeaconStatusV3(e) => (ReqRespProtocol::BeaconStatusV3, e),
                 ReqRespEvent::BeaconPing(e) => (ReqRespProtocol::BeaconPing, e),
                 ReqRespEvent::BeaconMetadataV1(e) => (ReqRespProtocol::BeaconMetadataV1, e),
                 ReqRespEvent::BeaconMetadataV2(e) => (ReqRespProtocol::BeaconMetadataV2, e),
@@ -3666,6 +3671,7 @@ mod tests {
                 ReqRespEvent::BeaconGoodbye(e) => (ReqRespProtocol::BeaconGoodbye, e),
                 ReqRespEvent::BeaconBlocksByRange(e) => (ReqRespProtocol::BeaconBlocksByRange, e),
                 ReqRespEvent::BeaconBlocksByRoot(e) => (ReqRespProtocol::BeaconBlocksByRoot, e),
+                ReqRespEvent::BeaconBlocksByHead(e) => (ReqRespProtocol::BeaconBlocksByHead, e),
                 ReqRespEvent::DataColumnSidecarsByRange(e) => {
                     (ReqRespProtocol::DataColumnSidecarsByRange, e)
                 }

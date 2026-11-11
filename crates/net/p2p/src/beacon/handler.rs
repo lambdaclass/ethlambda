@@ -16,7 +16,7 @@ use tracing::debug;
 
 use super::messages::{
     AttnetsBits, BeaconMetaData, BeaconStatus, MetaDataV1, MetaDataV2, MetaDataV3, StatusV1,
-    StatusV2, SyncnetsBits,
+    StatusV2, StatusV3, SyncnetsBits,
 };
 use super::{BeaconWire, constants, protocols};
 use crate::P2PServer;
@@ -89,7 +89,44 @@ pub fn build_status(store: &Store, wire: &BeaconWire, version: StatusVersion) ->
             head_slot: v1.head_slot,
             earliest_available_slot,
         }),
+        StatusVersion::V3 => {
+            let (finalized_root, finalized_slot) = status_v3_finality(store);
+            BeaconStatus::V3(StatusV3 {
+                fork_digest: v1.fork_digest,
+                finalized_root,
+                finalized_slot,
+                head_root: v1.head_root,
+                head_slot: v1.head_slot,
+                earliest_available_slot,
+            })
+        }
     }
+}
+
+/// `Status` v3's finality (EIP-8453 `p2p-interface.md`): `finalized_root` is
+/// `state.finalized_checkpoint.root` and `finalized_slot` is
+/// `state.finalized_slot`, where `state` is the head's post-state.
+///
+/// A head state from before EIP-8453 (a node that has not crossed the fork)
+/// has no `finalized_slot`, and one that is not cached is not rebuilt for a
+/// handshake: both answer the store's own finalized block, the gadget's once
+/// it has finalized and Casper FFG's checkpoint (its epoch's start slot)
+/// before.
+fn status_v3_finality(store: &Store) -> (Root, u64) {
+    let head_state = store
+        .head()
+        .ok()
+        .and_then(|head| store.cached_state(ethlambda_storage::CacheKey::BlockState(head)));
+    if let Some(head_state) = head_state
+        && let ethlambda_types::beacon::containers::BeaconState::Eip8453(inner) = &*head_state
+    {
+        return (inner.finalized_checkpoint.root, inner.finalized_slot);
+    }
+    store
+        .latest_finalized()
+        .map_or((Root::ZERO, 0), |finalized| {
+            (finalized.root, finalized.slot)
+        })
 }
 
 /// Which `Status` version a stream negotiated.
@@ -97,6 +134,8 @@ pub fn build_status(store: &Store, wire: &BeaconWire, version: StatusVersion) ->
 pub enum StatusVersion {
     V1,
     V2,
+    /// EIP-8453's: `finalized_slot` for `finalized_epoch`.
+    V3,
 }
 
 impl StatusVersion {
@@ -105,6 +144,18 @@ impl StatusVersion {
         match status {
             BeaconStatus::V1(_) => Self::V1,
             BeaconStatus::V2(_) => Self::V2,
+            BeaconStatus::V3(_) => Self::V3,
+        }
+    }
+
+    /// The version this node opens a handshake in: v3 once it publishes
+    /// under an EIP-8453 digest (an EIP-8453 network's peers speak it), v1
+    /// before, which every mainnet client still answers.
+    pub fn opening(wire: &BeaconWire) -> Self {
+        if wire.fork >= ethlambda_types::beacon::fork::ForkName::Eip8453 {
+            Self::V3
+        } else {
+            Self::V1
         }
     }
 }
@@ -197,6 +248,7 @@ pub async fn send_status(server: &P2PServer, peer_id: PeerId, wire_status: Beaco
     let protocol = match StatusVersion::of(&wire_status) {
         StatusVersion::V1 => ReqRespProtocol::BeaconStatusV1,
         StatusVersion::V2 => ReqRespProtocol::BeaconStatusV2,
+        StatusVersion::V3 => ReqRespProtocol::BeaconStatusV3,
     };
     server
         .swarm_handle

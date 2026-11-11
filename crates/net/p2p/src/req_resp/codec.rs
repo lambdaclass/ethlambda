@@ -11,9 +11,9 @@ use super::{
 };
 
 use crate::beacon::messages::{
-    BeaconBlocksByRangeRequest, DataColumnsByRangeRequest, DataColumnsByRootIdentifiers,
-    ExecutionPayloadEnvelopeRoots, ExecutionPayloadEnvelopesByRangeRequest, Goodbye,
-    InclusionListsByIndicesRequest, Ping,
+    BeaconBlocksByHeadRequest, BeaconBlocksByRangeRequest, DataColumnsByRangeRequest,
+    DataColumnsByRootIdentifiers, ExecutionPayloadEnvelopeRoots,
+    ExecutionPayloadEnvelopesByRangeRequest, Goodbye, InclusionListsByIndicesRequest, Ping,
 };
 use crate::beacon::{BeaconContext, encoding as beacon_encoding, protocols};
 use crate::lean::messages::{BlocksByRootRequest, RequestedBlockRoots};
@@ -162,9 +162,9 @@ impl libp2p::request_response::Codec for Codec {
             return request;
         }
         match protocol.as_ref() {
-            protocols::STATUS_V1 | protocols::STATUS_V2 => Ok(Request::Status(
-                beacon_encoding::decode_status(protocol.as_ref(), &payload)?,
-            )),
+            protocols::STATUS_V1 | protocols::STATUS_V2 | protocols::STATUS_V3 => Ok(
+                Request::Status(beacon_encoding::decode_status(protocol.as_ref(), &payload)?),
+            ),
             protocols::PING_V1 => Ok(Request::Ping(
                 Ping::from_ssz_bytes(&payload).map_err(|err| invalid(format!("{err:?}")))?,
             )),
@@ -187,6 +187,10 @@ impl libp2p::request_response::Codec for Codec {
                 roots: RequestedBlockRoots::from_ssz_bytes(&payload)
                     .map_err(|err| invalid(format!("{err:?}")))?,
             })),
+            protocols::BLOCKS_BY_HEAD_V1 => Ok(Request::BlocksByHead(
+                BeaconBlocksByHeadRequest::from_ssz_bytes(&payload)
+                    .map_err(|err| invalid(format!("{err:?}")))?,
+            )),
             // The bare list again, this time of identifiers rather than
             // roots; unwrapped into a plain `Vec` because nothing above the
             // codec needs the SSZ bound once decode has already enforced it.
@@ -240,7 +244,7 @@ impl libp2p::request_response::Codec for Codec {
             lean_protocols::DECOUPLED_BLOCKS_BY_ROOT_V1 => {
                 lean_encoding::decode_decoupled_blocks_response(io, label).await
             }
-            protocols::STATUS_V1 | protocols::STATUS_V2 => {
+            protocols::STATUS_V1 | protocols::STATUS_V2 | protocols::STATUS_V3 => {
                 decode_single_chunk(io, protocol.as_ref(), label, |protocol, payload| {
                     beacon_encoding::decode_status(protocol, payload).map(ResponsePayload::Status)
                 })
@@ -261,7 +265,9 @@ impl libp2p::request_response::Codec for Codec {
                 })
                 .await
             }
-            protocols::BLOCKS_BY_RANGE_V2 | protocols::BLOCKS_BY_ROOT_V2 => {
+            protocols::BLOCKS_BY_RANGE_V2
+            | protocols::BLOCKS_BY_ROOT_V2
+            | protocols::BLOCKS_BY_HEAD_V1 => {
                 let context = self.beacon_context(protocol.as_ref())?;
                 let blocks = beacon_encoding::decode_blocks_response(
                     io,
@@ -388,6 +394,7 @@ impl libp2p::request_response::Codec for Codec {
                 lean_encoding::encode_decoupled_blocks_by_root(roots)?
             }
             Request::InclusionListsByIndices(request) => request.to_ssz(),
+            Request::BlocksByHead(request) => request.to_ssz(),
         };
 
         let compressed_size = write_payload(io, &encoded).await?;
@@ -418,7 +425,9 @@ impl libp2p::request_response::Codec for Codec {
                     lean_protocols::BLOCKS_BY_ROOT_V1 | lean_protocols::BLOCKS_BY_RANGE_V1 => {
                         lean_encoding::write_blocks_response(io, label, blocks).await
                     }
-                    protocols::BLOCKS_BY_RANGE_V2 | protocols::BLOCKS_BY_ROOT_V2 => {
+                    protocols::BLOCKS_BY_RANGE_V2
+                    | protocols::BLOCKS_BY_ROOT_V2
+                    | protocols::BLOCKS_BY_HEAD_V1 => {
                         let context = self.beacon_context(protocol.as_ref())?;
                         beacon_encoding::write_blocks_response(
                             io,
@@ -634,6 +643,64 @@ mod tests {
             result.is_err(),
             "writing a v1 Status on a v2 stream must be refused, not truncated"
         );
+    }
+
+    #[tokio::test]
+    async fn a_status_v3_round_trips_with_its_finalized_slot() {
+        let v3 = BeaconStatus::V3(crate::beacon::messages::StatusV3 {
+            fork_digest: [1, 2, 3, 4],
+            finalized_root: Root::repeat_byte(5),
+            finalized_slot: 45,
+            head_root: Root::repeat_byte(6),
+            head_slot: 50,
+            earliest_available_slot: 7,
+        });
+        let decoded = request_round_trip(protocols::STATUS_V3, Request::Status(v3.clone())).await;
+        let Request::Status(decoded) = decoded else {
+            panic!("a status request");
+        };
+        assert_eq!(decoded, v3);
+        assert_eq!(decoded.finalized_slot(), 45);
+        assert_eq!(
+            decoded.finalized_epoch(),
+            45 / ethlambda_types::beacon::preset::SLOTS_PER_EPOCH
+        );
+        let response = response_round_trip(
+            protocols::STATUS_V3,
+            Response::success(ResponsePayload::Status(v3.clone())),
+        )
+        .await;
+        assert!(matches!(
+            response,
+            Response::Success {
+                payload: ResponsePayload::Status(BeaconStatus::V3(_))
+            }
+        ));
+        // A v1 body is not written on a v3 stream.
+        let stream_protocol = StreamProtocol::new(protocols::STATUS_V3);
+        let mut buffer = Cursor::new(Vec::new());
+        assert!(
+            codec()
+                .write_request(&stream_protocol, &mut buffer, Request::Status(status()))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blocks_by_head_request_round_trips() {
+        let request = crate::beacon::messages::BeaconBlocksByHeadRequest {
+            beacon_root: Root::repeat_byte(9),
+            count: 12,
+        };
+        let decoded =
+            request_round_trip(protocols::BLOCKS_BY_HEAD_V1, Request::BlocksByHead(request)).await;
+        let Request::BlocksByHead(decoded) = decoded else {
+            panic!("a blocks-by-head request");
+        };
+        assert_eq!(decoded, request);
+        // Forty bytes: a root and a count.
+        assert_eq!(libssz::SszEncode::to_ssz(&request).len(), 40);
     }
 
     #[tokio::test]
