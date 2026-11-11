@@ -40,6 +40,9 @@ ethlambda-types.workspace = true
 ethlambda-crypto.workspace = true
 ethlambda-metrics.workspace = true
 ethlambda-storage.workspace = true
+# EIP-8453's fork choice engine. The beacon host of it (`beacon::eip8453_fork_choice`)
+# lives here, beside the gossip rules that read it from the p2p layer.
+ethlambda-decoupled.workspace = true
 
 thiserror.workspace = true
 tracing.workspace = true

@@ -25,7 +25,7 @@ use ethlambda_types::{
         constants::NUM_BLOCK_TIMELINESS_DEADLINES,
         containers::{
             BeaconState, Checkpoint as BeaconCheckpoint, DataColumnSidecar, SignedBeaconBlock,
-            gloas,
+            eip8453::HeightCheckpoint, gloas,
         },
         fork::ForkName,
         fork_choice::{
@@ -160,6 +160,18 @@ const KEY_PRESET: &[u8] = b"preset";
 const KEY_BEACON_UNREALIZED_JUSTIFIED: &[u8] = b"beacon_unrealized_justified";
 /// Key for the beacon store's unrealized finalized checkpoint.
 const KEY_BEACON_UNREALIZED_FINALIZED: &[u8] = b"beacon_unrealized_finalized";
+/// EIP-8453: the finality gadget's justified checkpoint as the fork choice
+/// last adopted it, an SSZ `eip8453::HeightCheckpoint`. Absent on a directory
+/// that never followed EIP-8453.
+///
+/// [`KEY_LATEST_JUSTIFIED`] carries the same block as a slot-denominated
+/// [`Checkpoint`] with the block's own slot (not an epoch start), so every
+/// slot-based reader keeps working; this key keeps the height, which a
+/// [`Checkpoint`] has no field for.
+const KEY_FG_JUSTIFIED: &[u8] = b"fg_justified";
+/// EIP-8453: the finality gadget's finalized checkpoint. See
+/// [`KEY_FG_JUSTIFIED`].
+const KEY_FG_FINALIZED: &[u8] = b"fg_finalized";
 /// The slot this directory's chain begins at: the anchor block's own slot,
 /// whether that anchor is genesis or a checkpoint. Its value has type [`u64`]
 /// and it's SSZ-encoded.
@@ -1953,6 +1965,15 @@ impl Store {
         self.set_metadata_batch(&[(key, value)]);
     }
 
+    /// Reads an SSZ metadata value that may be absent.
+    fn try_get_metadata<T: SszDecode>(&self, key: &[u8]) -> Option<T> {
+        let view = self.backend.begin_read().expect("read view");
+        view.read_with(Table::Metadata, key, |bytes| {
+            T::from_ssz_bytes(bytes).expect("valid encoding")
+        })
+        .expect("read")
+    }
+
     /// Writes several SSZ metadata values under one commit.
     ///
     /// [`Store::set_metadata`] opens and commits a batch per call, so a caller
@@ -2880,6 +2901,60 @@ impl Store {
             root: checkpoint.root,
             slot: checkpoint.epoch * SLOTS_PER_EPOCH,
         }
+    }
+
+    // ============ EIP-8453 finality gadget checkpoints ============
+
+    /// The finality gadget's justified checkpoint the EIP-8453 fork choice
+    /// last adopted, or `None` before the fork choice has run on this
+    /// directory.
+    pub fn fg_justified_checkpoint(&self) -> Option<HeightCheckpoint> {
+        self.try_get_metadata(KEY_FG_JUSTIFIED)
+    }
+
+    /// The finality gadget's finalized checkpoint. See
+    /// [`Self::fg_justified_checkpoint`].
+    pub fn fg_finalized_checkpoint(&self) -> Option<HeightCheckpoint> {
+        self.try_get_metadata(KEY_FG_FINALIZED)
+    }
+
+    /// Records the EIP-8453 fork choice's head and its finality gadget
+    /// checkpoints, each with its block's own slot.
+    ///
+    /// The heights go under their own keys; the slot-denominated rows every
+    /// slot reader uses ([`Self::latest_justified`], [`Self::latest_finalized`],
+    /// pruning) move only when the checkpoint is a height the gadget reached
+    /// itself (above zero) and, for the finalized one, only forwards: at the
+    /// fork the gadget starts at height 0 from Casper FFG's finalized block,
+    /// whose stored row (its epoch's start slot) must not move back to the
+    /// block's own slot.
+    pub fn update_fg_checkpoints(
+        &mut self,
+        head: H256,
+        justified: (HeightCheckpoint, u64),
+        finalized: (HeightCheckpoint, u64),
+    ) -> Result<(), Error> {
+        let (justified, justified_slot) = justified;
+        let (finalized, finalized_slot) = finalized;
+        self.set_metadata_batch(&[
+            (KEY_FG_JUSTIFIED, &justified),
+            (KEY_FG_FINALIZED, &finalized),
+        ]);
+        let stored_justified = self.latest_justified()?;
+        let stored_finalized = self.latest_finalized()?;
+        let justified_row = (justified.height > 0
+            && (stored_justified.root != justified.root
+                || stored_justified.slot != justified_slot))
+            .then_some(Checkpoint {
+                root: justified.root,
+                slot: justified_slot,
+            });
+        let finalized_row = (finalized.height > 0 && finalized_slot > stored_finalized.slot)
+            .then_some(Checkpoint {
+                root: finalized.root,
+                slot: finalized_slot,
+            });
+        self.update_checkpoints(ForkCheckpoints::new(head, justified_row, finalized_row))
     }
 
     /// Returns the beacon store's unrealized justified checkpoint.

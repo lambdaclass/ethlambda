@@ -1297,6 +1297,15 @@ pub fn upgrade_to_heze(pre: &BeaconState, config: &Config) -> Result<BeaconState
 ///
 /// Participation in the last epoch before the upgrade is not carried over,
 /// so it is never rewarded.
+///
+/// One departure, at genesis only: a genesis state's `latest_block_header`
+/// still has the zero state root `process_slot` fills in, so
+/// `hash_tree_root(pre.latest_block_header)` names no block, and the gadget's
+/// first target would be a root nobody can attest to or build on. The target
+/// root is left empty there instead, as `advance_height` leaves it, and the
+/// first `process_slot` fills it with the genesis block's root, the latest
+/// block before the upgrade. Every later upgrade runs after a `process_slot`
+/// has filled the header, so it is unaffected (`docs/spec_deviations.md`).
 pub fn upgrade_to_eip8453(pre: &BeaconState, config: &Config) -> Result<BeaconState> {
     let BeaconState::Heze(pre) = pre else {
         return Err(Error::UnsupportedForFork {
@@ -1307,6 +1316,11 @@ pub fn upgrade_to_eip8453(pre: &BeaconState, config: &Config) -> Result<BeaconSt
     let epoch = compute_epoch_at_slot(pre.slot);
     let validator_count = pre.validators.len();
     let pre = pre.clone();
+    let target_root = if pre.latest_block_header.state_root.is_zero() {
+        Root::ZERO
+    } else {
+        pre.latest_block_header.hash_tree_root()
+    };
 
     let post = eip8453::BeaconState {
         genesis_time: pre.genesis_time,
@@ -1322,7 +1336,7 @@ pub fn upgrade_to_eip8453(pre: &BeaconState, config: &Config) -> Result<BeaconSt
         // `latest_block_header` moves into the new state)
         target_checkpoint: eip8453::HeightCheckpoint {
             height: 1,
-            root: pre.latest_block_header.hash_tree_root(),
+            root: target_root,
         },
         target_slot: pre.latest_block_header.slot,
         latest_block_header: pre.latest_block_header,

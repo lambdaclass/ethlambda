@@ -230,6 +230,33 @@ fn transition(state: &mut BeaconState, block: &SignedBeaconBlock, config: &Confi
 // Fork upgrade and slot processing
 // ---------------------------------------------------------------------------
 
+/// At genesis the header's state root is still zero, so its root names no
+/// block: the target root is left for the first `process_slot`, which fills
+/// it with the genesis block's root (the deviation `upgrade_to_eip8453`
+/// documents).
+#[test]
+fn a_genesis_upgrade_leaves_the_first_target_for_process_slot() {
+    let mut pre = test_state::with_validators_at(ForkName::Heze, 6);
+    *pre.slot_mut() = 0;
+    pre.latest_block_header_mut().slot = 0;
+    assert!(pre.latest_block_header().state_root.is_zero());
+    let config = Config::active().with_fork_epoch(ForkName::Eip8453, 0);
+
+    let mut state =
+        crate::beacon::upgrade::upgrade_state(&pre, ForkName::Eip8453, &config).unwrap();
+    assert_eq!(inner(&state).target_checkpoint.height, 1);
+    assert_eq!(inner(&state).target_checkpoint.root, Root::ZERO);
+
+    let state_root = state.hash_tree_root();
+    let mut genesis_header = state.latest_block_header().clone();
+    genesis_header.state_root = state_root;
+    stf::process_slot(&mut state).unwrap();
+    assert_eq!(
+        inner(&state).target_checkpoint.root,
+        genesis_header.hash_tree_root()
+    );
+}
+
 #[test]
 fn upgrade_to_eip8453_starts_the_finality_gadget_from_the_finalized_casper_checkpoint() {
     let mut pre = test_state::with_validators_at(ForkName::Heze, 6);
@@ -239,6 +266,8 @@ fn upgrade_to_eip8453_starts_the_finality_gadget_from_the_finalized_casper_check
     };
     *pre.finalized_checkpoint_mut().unwrap() = finalized;
     pre.latest_block_header_mut().slot = 5;
+    // Past genesis, the `process_slot` before the upgrade has filled it.
+    pre.latest_block_header_mut().state_root = Root::repeat_byte(9);
     pre.fork_mut().current_version = [8, 0, 0, 0];
     let header_root = pre.latest_block_header().hash_tree_root();
     let config = config();
