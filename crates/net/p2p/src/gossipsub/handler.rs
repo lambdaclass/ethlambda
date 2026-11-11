@@ -374,6 +374,12 @@ fn handle_beacon_gossip(
         crate::beacon::builder_market::triage_proposer_preferences(server, payload)
     } else if kind == beacon_topics::INCLUSION_LIST {
         triage_inclusion_list(server, payload)
+    } else if kind == beacon_topics::HEAD_VOTE {
+        triage_head_vote(server, payload)
+    } else if let Some(subnet_id) = beacon_topics::fg_attestation_subnet(kind) {
+        triage_fg_attestation(server, payload, subnet_id)
+    } else if kind == beacon_topics::ATTESTER_SLASHING && topic_fork >= ForkName::Eip8453 {
+        triage_eip8453_attester_slashing(payload)
     } else if matches!(
         kind,
         beacon_topics::VOLUNTARY_EXIT
@@ -709,6 +715,104 @@ fn triage_inclusion_list(server: &P2PServer, payload: &[u8]) -> Dispatch {
         signed: Box::new(signed),
         received_ms,
     })
+}
+
+/// Decode an EIP-8453 head vote and run its cheap gossip checks. Same shape
+/// as [`triage_payload_attestation`]; the arrival time travels with the vote,
+/// whose receipt the fork choice stamps when it is applied.
+fn triage_head_vote(server: &P2PServer, payload: &[u8]) -> Dispatch {
+    const KIND: &str = beacon_topics::HEAD_VOTE;
+    let message = match beacon_decode::decode_head_vote(payload) {
+        Ok(message) => message,
+        Err(err) => {
+            metrics::inc_beacon_gossip(KIND, "decode_failed");
+            debug!(kind = KIND, %err, bytes = payload.len(), "Beacon gossip decode failed");
+            return Dispatch::Report(Outcome::Reject(RejectReason::Decode));
+        }
+    };
+    metrics::inc_beacon_gossip(KIND, "decoded");
+    trace!(
+        slot = message.data.slot,
+        validator = message.validator_index,
+        block_root = %ShortRoot(&message.data.beacon_block_root.0),
+        payload_status = message.data.payload_status,
+        "Beacon head vote decoded"
+    );
+    let now_ms = unix_now_ms();
+    let node = server.eip8453.clone();
+    let cheap = node.with(|n| gossip::head_vote::cheap_checks(n, &server.store, &message, now_ms));
+    match cheap {
+        Err(_) => {
+            return Dispatch::Report(Outcome::Ignore(IgnoreReason::ForkChoiceInactive));
+        }
+        Ok(Err(outcome)) => return Dispatch::Report(outcome),
+        Ok(Ok(())) => {}
+    }
+    Dispatch::Validate(Validated::HeadVote {
+        message: Box::new(message),
+        node,
+        committee: Vec::new(),
+        now_ms,
+    })
+}
+
+/// Decode an EIP-8453 finality gadget attestation and run its cheap gossip
+/// checks, which place it in its round.
+fn triage_fg_attestation(server: &P2PServer, payload: &[u8], subnet_id: u64) -> Dispatch {
+    const KIND: &str = beacon_topics::FG_ATTESTATION_KIND;
+    let attestation = match beacon_decode::decode_fg_attestation(payload) {
+        Ok(attestation) => attestation,
+        Err(err) => {
+            metrics::inc_beacon_gossip(KIND, "decode_failed");
+            debug!(kind = KIND, %err, bytes = payload.len(), "Beacon gossip decode failed");
+            return Dispatch::Report(Outcome::Reject(RejectReason::Decode));
+        }
+    };
+    metrics::inc_beacon_gossip(KIND, "decoded");
+    trace!(
+        subnet_id,
+        committee_index = attestation.committee_index,
+        attester = attestation.attester_index,
+        target_height = attestation.data.target.height,
+        target_root = %ShortRoot(&attestation.data.target.root.0),
+        "Beacon finality gadget attestation decoded"
+    );
+    let now_ms = unix_now_ms();
+    let node = server.eip8453.clone();
+    let cheap = node.with(|n| {
+        gossip::fg_attestation::cheap_checks(n, &server.store, &attestation, subnet_id, now_ms)
+    });
+    let round = match cheap {
+        Err(_) => return Dispatch::Report(Outcome::Ignore(IgnoreReason::ForkChoiceInactive)),
+        Ok(Err(outcome)) => return Dispatch::Report(outcome),
+        Ok(Ok(round)) => round,
+    };
+    Dispatch::Validate(Validated::FgAttestation {
+        attestation: Box::new(attestation),
+        node,
+        round,
+    })
+}
+
+/// An `attester_slashing` under an EIP-8453 digest: the modified container.
+///
+/// "The validation logic is unchanged", and this node validates operations
+/// only against an electra or fulu head (every operation is ignored under a
+/// gloas or later head, `gossip::operations`), so a well-formed one is ignored
+/// here too and only bytes that do not decode are rejected.
+fn triage_eip8453_attester_slashing(payload: &[u8]) -> Dispatch {
+    const KIND: &str = beacon_topics::ATTESTER_SLASHING;
+    match beacon_decode::decode_eip8453_attester_slashing(payload) {
+        Ok(_) => {
+            metrics::inc_beacon_gossip(KIND, "decoded");
+            Dispatch::Report(Outcome::Ignore(IgnoreReason::NoConsumer))
+        }
+        Err(err) => {
+            metrics::inc_beacon_gossip(KIND, "decode_failed");
+            debug!(kind = KIND, %err, bytes = payload.len(), "Beacon gossip decode failed");
+            Dispatch::Report(Outcome::Reject(RejectReason::Decode))
+        }
+    }
 }
 
 /// Decode one of the four operation topics (`voluntary_exit`,

@@ -63,7 +63,8 @@ use ethlambda_state_transition::beacon::gossip::{
     sync_committee::{SeenSyncCommitteeMessages, SeenSyncContributions},
 };
 use ethlambda_state_transition::beacon::{
-    builder_market::SharedBuilderMarket, payload_attestation_pool::SharedPayloadAttestationPool,
+    builder_market::SharedBuilderMarket, eip8453_node::SharedEip8453Node,
+    payload_attestation_pool::SharedPayloadAttestationPool,
     sync_committee_pool::SharedSyncCommitteePool,
 };
 use ethlambda_storage::{Chain, Store};
@@ -1254,6 +1255,7 @@ impl P2P {
         payload_attestation_pool: SharedPayloadAttestationPool,
         builder_market: SharedBuilderMarket,
         sync_committee_pool: SharedSyncCommitteePool,
+        eip8453: SharedEip8453Node,
     ) -> Result<P2P, DiscoveryError> {
         let (discovery, local_enr) = match discovery {
             Some(config) => {
@@ -1338,6 +1340,7 @@ impl P2P {
                 BUILDER_VALIDATION_PERMITS,
             )),
             sync_committee_pool,
+            eip8453,
             aggregator_subnets: HashMap::new(),
             peer_scoring,
         };
@@ -1534,6 +1537,13 @@ pub struct P2PServer {
     /// Beacon API that serves and fills the same pool (block production reads
     /// it). Filled by `verdict::forward`; lean never touches it.
     pub(crate) sync_committee_pool: SharedSyncCommitteePool,
+
+    /// EIP-8453's fork choice node, shared with the chain actor (which
+    /// installs the engine at the fork) and the Beacon API. The `head_vote`
+    /// and `attestation_{subnet_id}` gossip rules read it (the engine's
+    /// verified payloads, the seen sets) and apply accepted messages to it.
+    /// Empty before the fork, and always on lean.
+    pub(crate) eip8453: SharedEip8453Node,
 
     /// The attestation subnets joined for a validator client's aggregators,
     /// each with the last slot it is needed for. Short-lived by design: never
@@ -3255,6 +3265,7 @@ pub(crate) mod test_support {
                 crate::BUILDER_VALIDATION_PERMITS,
             )),
             sync_committee_pool: Default::default(),
+            eip8453: Default::default(),
             aggregator_subnets: HashMap::new(),
             peer_scoring: None,
         }

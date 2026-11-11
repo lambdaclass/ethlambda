@@ -716,9 +716,14 @@ pub(crate) fn ancestor_at(state: &BeaconState, at_block_root: Root, slot: Slot) 
     }
 }
 
-/// The first slot of the store's finalized epoch.
+/// The store's finalized slot: the first slot of the finalized epoch under
+/// Casper FFG (an epoch is stored as its own start slot), the finalized
+/// block's own slot under EIP-8453's finality gadget, which finalizes blocks
+/// rather than epochs.
 pub(crate) fn finalized_start_slot(store: &Store) -> Slot {
-    compute_start_slot_at_epoch(store.beacon_finalized_checkpoint().epoch)
+    store
+        .latest_finalized()
+        .map_or(0, |checkpoint| checkpoint.slot)
 }
 
 /// Where a block's chain stands relative to the finalized checkpoint.
@@ -781,9 +786,14 @@ impl FinalizedAncestry {
 /// that is `Unknown` too, and so is a walk that falls off at the finalized
 /// block's own row, which pruning always keeps.
 pub(crate) fn finalized_ancestry(store: &Store, root: Root) -> FinalizedAncestry {
-    let finalized = store.beacon_finalized_checkpoint();
+    // The slot-denominated row: an epoch's start slot under Casper FFG, the
+    // finality gadget's block's own slot under EIP-8453 (see
+    // `finalized_start_slot`).
+    let Ok(finalized) = store.latest_finalized() else {
+        return FinalizedAncestry::Unknown;
+    };
     let index = store.block_index();
-    let checkpoint_slot = compute_start_slot_at_epoch(finalized.epoch);
+    let checkpoint_slot = finalized.slot;
     match fork_choice::get_ancestor_or_missing(&index, root, checkpoint_slot) {
         Ok(ancestor) if ancestor == finalized.root => FinalizedAncestry::Descends,
         Ok(_) => FinalizedAncestry::Conflicts,

@@ -2992,6 +2992,7 @@ pub(crate) mod tests {
                 crate::BUILDER_VALIDATION_PERMITS,
             )),
             sync_committee_pool: Default::default(),
+            eip8453: Default::default(),
             aggregator_subnets: HashMap::new(),
             peer_scoring: None,
         }

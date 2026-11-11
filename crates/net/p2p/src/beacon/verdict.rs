@@ -18,6 +18,7 @@ use std::time::Instant;
 
 use ethlambda_network_api::{AggregateArrival, BlockAnnouncement, BlockArrival, BlockSource};
 use ethlambda_state_transition::beacon::builder_market::SharedBuilderMarket;
+use ethlambda_state_transition::beacon::eip8453_node::SharedEip8453Node;
 use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome};
 use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCacheExt as _;
 use ethlambda_state_transition::beacon::inclusion_list;
@@ -25,6 +26,7 @@ use ethlambda_storage::{CacheKey, Store};
 use ethlambda_types::beacon::containers::altair::{
     SignedContributionAndProof, SyncCommitteeMessage,
 };
+use ethlambda_types::beacon::containers::eip8453;
 use ethlambda_types::beacon::containers::electra::{self, SingleAttestation};
 use ethlambda_types::beacon::containers::gloas::{
     PayloadAttestationMessage, SignedExecutionPayloadBid, SignedExecutionPayloadEnvelope,
@@ -118,6 +120,24 @@ pub(crate) enum Validated {
     },
     /// A `sync_committee_contribution_and_proof`.
     SyncContribution(Box<SignedContributionAndProof>),
+    /// An EIP-8453 `head_vote`. Carries the shared fork choice node, which
+    /// the stateful checks read (verified payloads) and the verdict applies
+    /// an accepted vote to, with the committee the checks read and the time
+    /// it arrived at.
+    HeadVote {
+        message: Box<eip8453::HeadVoteMessage>,
+        node: SharedEip8453Node,
+        /// Empty until [`Validated::stateful_checks`] fills it in on `Accept`.
+        committee: Vec<ValidatorIndex>,
+        now_ms: u64,
+    },
+    /// An EIP-8453 `attestation_{subnet_id}`, with the round
+    /// `get_latest_attestation_committee_slot` placed it in.
+    FgAttestation {
+        attestation: Box<eip8453::SingleAttestation>,
+        node: SharedEip8453Node,
+        round: u64,
+    },
 }
 
 impl Validated {
@@ -181,6 +201,27 @@ impl Validated {
             }
             Self::SyncContribution(signed) => {
                 gossip::sync_committee::contribution_stateful_checks(store, signed)
+            }
+            Self::HeadVote {
+                message,
+                node,
+                committee,
+                ..
+            } => {
+                let is_verified = |root: &Root| {
+                    node.with(|n| n.engine().is_payload_verified(root))
+                        .unwrap_or(false)
+                };
+                match gossip::head_vote::stateful_checks(is_verified, store, message) {
+                    Ok(read) => {
+                        *committee = read;
+                        Outcome::Accept
+                    }
+                    Err(outcome) => outcome,
+                }
+            }
+            Self::FgAttestation { attestation, .. } => {
+                gossip::fg_attestation::stateful_checks(store, attestation)
             }
         }
     }
@@ -254,6 +295,28 @@ impl Validated {
                     .record(message.slot, message.validator_index, *subnet_id)
             }
             Self::SyncContribution(signed) => server.seen_sync_contributions.record(signed),
+            // Applying an accepted head vote to the fork choice is what marks
+            // it seen: the node refuses a second vote of one validator for a
+            // slot, as `seen.head_vote_validator_slots` does.
+            Self::HeadVote {
+                message,
+                node,
+                committee,
+                now_ms,
+            } => node
+                .with(|n| {
+                    n.accept_head_vote((**message).clone(), committee.clone(), *now_ms)
+                        .inspect_err(|err| debug!(%err, "Head vote not applied"))
+                        .is_ok()
+                })
+                .unwrap_or(false),
+            Self::FgAttestation {
+                attestation,
+                node,
+                round,
+            } => node
+                .with(|n| n.accept_attestation((**attestation).clone(), *round))
+                .unwrap_or(false),
         }
     }
 
@@ -453,7 +516,12 @@ impl Validated {
             | Self::PayloadAttestation(_)
             | Self::Operation(_)
             | Self::SyncCommitteeMessage { .. }
-            | Self::SyncContribution(_) => {}
+            | Self::SyncContribution(_)
+            // Applied to the shared fork choice node when the verdict was
+            // settled (`record_seen`); the chain actor reads the head from it
+            // at its next quarter-slot tick.
+            | Self::HeadVote { .. }
+            | Self::FgAttestation { .. } => {}
         }
     }
 }
@@ -480,6 +548,17 @@ fn record_liveness(server: &P2PServer, object: &Validated) {
         }
         Validated::Attestation { attestation, .. } => {
             observed.record(attestation.data.target.epoch, attestation.attester_index);
+        }
+        // EIP-8453: a head vote and a finality gadget attestation each show
+        // their validator live in the epoch they were cast in.
+        Validated::HeadVote { message, .. } => {
+            observed.record(
+                message.data.slot / ethlambda_types::beacon::preset::SLOTS_PER_EPOCH,
+                message.validator_index,
+            );
+        }
+        Validated::FgAttestation { attestation, .. } => {
+            observed.record(attestation.epoch, attestation.attester_index);
         }
         Validated::Block { .. }
         | Validated::Column(_)
@@ -665,7 +744,9 @@ fn permits_for<'a>(
         | Validated::Attestation { .. }
         | Validated::PayloadAttestation(_)
         | Validated::InclusionList { .. }
-        | Validated::Operation(_) => &server.attestation_validation_permits,
+        | Validated::Operation(_)
+        | Validated::HeadVote { .. }
+        | Validated::FgAttestation { .. } => &server.attestation_validation_permits,
         Validated::ExecutionPayloadBid { .. } | Validated::ProposerPreferences(_) => {
             &server.builder_validation_permits
         }

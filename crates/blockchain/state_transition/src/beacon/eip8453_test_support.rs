@@ -61,7 +61,20 @@ pub(crate) fn scene(validators: usize) -> Scene {
     let mut state = test_state::with_signing_validators_at(ForkName::Eip8453, validators);
     *state.genesis_time_mut() = GENESIS_TIME;
     let slot = state.slot();
-    let body = eip8453::BeaconBlockBody::empty();
+    // Every sync committee seat held by a registered key, and the anchor's
+    // payload not delivered (its bid's block hash is not the state's latest),
+    // so a child builds on its EMPTY branch with a self-built bid.
+    let pubkeys: Vec<_> = state.iter_validators().map(|v| v.pubkey).collect();
+    let mut body = eip8453::BeaconBlockBody::empty();
+    if let BeaconState::Eip8453(inner) = &mut state {
+        for (seat, pubkey) in inner.current_sync_committee.pubkeys.iter_mut().enumerate() {
+            *pubkey = pubkeys[seat % pubkeys.len()];
+        }
+        inner.next_sync_committee = inner.current_sync_committee.clone();
+        inner.latest_execution_payload_bid.block_hash =
+            crate::beacon::primitives::Bytes32::repeat_byte(0xaa);
+        body.signed_execution_payload_bid.message = inner.latest_execution_payload_bid.clone();
+    }
     *state.latest_block_header_mut() = BeaconBlockHeader {
         slot,
         proposer_index: 0,
@@ -152,6 +165,74 @@ impl Scene {
             })
             .find(|(_, members)| !members.is_empty())
             .expect("some committee of the slot has a member")
+    }
+
+    /// A signed EIP-8453 block at `slot` on the anchor, on its EMPTY branch,
+    /// carrying `head_votes` and `head_vote_support` (applied as given, so a
+    /// test may pass a malformed body; the state root then stays zero).
+    pub(crate) fn child_block(
+        &self,
+        slot: Slot,
+        head_votes: Vec<eip8453::HeadVote>,
+        head_vote_support: Vec<eip8453::HeadVoteSupportBits>,
+    ) -> SignedBeaconBlock {
+        use crate::beacon::constants::{
+            BUILDER_INDEX_SELF_BUILD, DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO,
+        };
+        use crate::beacon::helpers::accessors::{get_beacon_proposer_index, get_randao_mix};
+        let mut state = (*self.state).clone();
+        crate::beacon::stf::process_slots(&mut state, slot, &self.config).unwrap();
+        let epoch = compute_epoch_at_slot(slot);
+        let proposer = get_beacon_proposer_index(&state).unwrap();
+        let sign = |root: Root, domain_type| {
+            let domain = get_domain(&state, domain_type, Some(epoch));
+            test_state::sign_for(proposer as usize, compute_signing_root(root, domain))
+        };
+        let randao = sign(epoch.hash_tree_root(), DOMAIN_RANDAO);
+        let mut bid = crate::beacon::containers::gloas::SignedExecutionPayloadBid::default();
+        bid.message.builder_index = BUILDER_INDEX_SELF_BUILD;
+        bid.message.slot = slot;
+        bid.message.parent_block_hash = *state.latest_block_hash().unwrap();
+        bid.message.block_hash = crate::beacon::primitives::Bytes32::repeat_byte(0x33);
+        bid.message.parent_block_root = self.anchor_root;
+        bid.message.prev_randao = get_randao_mix(&state, epoch);
+        bid.message.inclusion_list_bits =
+            Some(crate::beacon::containers::heze::InclusionListBits::new());
+        bid.signature =
+            crate::beacon::primitives::BlsSignature(crate::beacon::bls::G2_POINT_AT_INFINITY);
+        let assembled = crate::beacon::eip8453_block_production::assemble_block(
+            &state,
+            self.anchor_root,
+            slot,
+            randao,
+            bid.clone(),
+            head_votes.clone(),
+            head_vote_support.clone(),
+            Vec::new(),
+            &self.config,
+        );
+        let block = match assembled {
+            Ok((block, _)) => block,
+            Err(_) => {
+                let mut body = eip8453::BeaconBlockBody::empty();
+                body.randao_reveal = randao;
+                body.signed_execution_payload_bid = bid;
+                body.head_votes = head_votes.into();
+                body.head_vote_support = head_vote_support.into();
+                eip8453::BeaconBlock {
+                    slot,
+                    proposer_index: proposer,
+                    parent_root: self.anchor_root,
+                    state_root: Root::ZERO,
+                    body,
+                }
+            }
+        };
+        let signature = sign(block.hash_tree_root(), DOMAIN_BEACON_PROPOSER);
+        SignedBeaconBlock::Eip8453(eip8453::SignedBeaconBlock {
+            message: block,
+            signature,
+        })
     }
 
     /// `attester`'s signed single attestation of `data` for committee

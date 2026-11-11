@@ -83,6 +83,51 @@ pub const HEZE_TOPIC_KINDS: [&str; 5] = [
     INCLUSION_LIST,
 ];
 
+/// Topic kind for EIP-8453 head votes (`HeadVoteMessage`).
+pub const HEAD_VOTE: &str = "head_vote";
+
+/// The global topic kinds under an EIP-8453 digest (`p2p-interface.md`):
+/// [`SUBSCRIBED_TOPIC_KINDS`] without the deprecated
+/// `beacon_aggregate_and_proof`, heze's additions, and `head_vote`. The
+/// `head_vote_aggregate` and `attestation_aggregate` topics the specification
+/// names are still TODOs there, so nothing subscribes to them.
+pub const EIP8453_TOPIC_KINDS: [&str; 12] = [
+    BEACON_BLOCK,
+    VOLUNTARY_EXIT,
+    PROPOSER_SLASHING,
+    ATTESTER_SLASHING,
+    BLS_TO_EXECUTION_CHANGE,
+    SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF,
+    EXECUTION_PAYLOAD,
+    PAYLOAD_ATTESTATION_MESSAGE,
+    EXECUTION_PAYLOAD_BID,
+    PROPOSER_PREFERENCES,
+    INCLUSION_LIST,
+    HEAD_VOTE,
+];
+
+/// Topic family for EIP-8453's finality gadget attestations
+/// (`attestation_{subnet_id}`), which replaces `beacon_attestation_{subnet_id}`.
+pub const FG_ATTESTATION_PREFIX: &str = "attestation_";
+
+/// The metric label every EIP-8453 attestation subnet shares.
+pub const FG_ATTESTATION_KIND: &str = "attestation";
+
+/// The topic carrying one EIP-8453 attestation subnet.
+pub fn fg_attestation_topic_name(fork_digest: ForkDigest, subnet_id: u64) -> String {
+    topic_name(fork_digest, &format!("{FG_ATTESTATION_PREFIX}{subnet_id}"))
+}
+
+/// The subnet an EIP-8453 attestation topic kind names, or `None` if the kind
+/// is not one. The digit check keeps `attestation_aggregate` out.
+pub fn fg_attestation_subnet(kind: &str) -> Option<u64> {
+    let suffix = kind.strip_prefix(FG_ATTESTATION_PREFIX)?;
+    if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    suffix.parse().ok()
+}
+
 /// Every topic kind this node subscribes to at every fork, in the order they
 /// are subscribed. [`GLOAS_TOPIC_KINDS`] follow from gloas.
 pub const SUBSCRIBED_TOPIC_KINDS: [&str; 7] = [
@@ -118,9 +163,13 @@ pub fn metric_kind(kind: &str) -> Option<&'static str> {
     if let Some(&global) = SUBSCRIBED_TOPIC_KINDS
         .iter()
         .chain(HEZE_TOPIC_KINDS.iter())
+        .chain(EIP8453_TOPIC_KINDS.iter())
         .find(|&&known| known == kind)
     {
         return Some(global);
+    }
+    if fg_attestation_subnet(kind).is_some() {
+        return Some(FG_ATTESTATION_KIND);
     }
     if data_column_subnet(kind).is_some() {
         return Some(DATA_COLUMN_SIDECAR_KIND);
@@ -310,15 +359,17 @@ impl BeaconTopics {
                 column_subnets,
                 attestation_subnets,
             ),
-            // Heze adds the inclusion list topic to gloas's. EIP-8453 keeps
-            // heze's topics.
-            // TODO(eip8453): add the head vote topics (`p2p-interface.md`).
-            ForkName::Heze | ForkName::Eip8453 => Self::with_extra_kinds(
+            // Heze adds the inclusion list topic to gloas's.
+            ForkName::Heze => Self::with_extra_kinds(
                 fork_digest,
                 &HEZE_TOPIC_KINDS,
                 column_subnets,
                 attestation_subnets,
             ),
+            // EIP-8453 deprecates the aggregate topic and the beacon
+            // attestation subnets, and adds `head_vote` and the
+            // `attestation_{subnet_id}` subnets the backbone moves to.
+            ForkName::Eip8453 => Self::eip8453(fork_digest, column_subnets, attestation_subnets),
             ForkName::Lean => {
                 unreachable!("a beacon topic's fork is never Lean: it is absent from ForkName::ALL")
             }
@@ -331,6 +382,41 @@ impl BeaconTopics {
         attestation_subnets: &[u64],
     ) -> Self {
         Self::with_extra_kinds(fork_digest, &[], column_subnets, attestation_subnets)
+    }
+
+    /// The topics under an EIP-8453 digest: [`EIP8453_TOPIC_KINDS`], the
+    /// custody column subnets, and the backbone's attestation subnets as
+    /// `attestation_{subnet_id}` (kept in `attestation_topics`, which the
+    /// rest of the wire reads the backbone from).
+    fn eip8453(
+        fork_digest: ForkDigest,
+        column_subnets: &[u64],
+        attestation_subnets: &[u64],
+    ) -> Self {
+        let mut column_topics = BTreeMap::new();
+        for &subnet_id in column_subnets {
+            column_topics
+                .entry(subnet_id)
+                .or_insert_with(|| IdentTopic::new(data_column_topic_name(fork_digest, subnet_id)));
+        }
+        let mut attestation_topics = BTreeMap::new();
+        for &subnet_id in attestation_subnets {
+            attestation_topics.entry(subnet_id).or_insert_with(|| {
+                IdentTopic::new(fg_attestation_topic_name(fork_digest, subnet_id))
+            });
+        }
+        let mut topics: Vec<IdentTopic> = EIP8453_TOPIC_KINDS
+            .iter()
+            .map(|kind| IdentTopic::new(topic_name(fork_digest, kind)))
+            .collect();
+        topics.extend(column_topics.values().cloned());
+        topics.extend(attestation_topics.values().cloned());
+        Self {
+            fork_digest,
+            topics,
+            column_topics,
+            attestation_topics,
+        }
     }
 
     /// [`Self::new`] plus the global topic `extra_kinds` a fork adds, placed
@@ -410,6 +496,33 @@ mod tests {
     fn subscriptions_are_exactly_the_seven_global_topics() {
         let topics = BeaconTopics::new(MAINNET, &[], &[]);
         assert_eq!(topics.topics.len(), 7);
+    }
+
+    #[test]
+    fn eip8453_swaps_the_aggregate_and_attestation_topics_for_head_votes_and_fg_attestations() {
+        let topics = BeaconTopics::for_fork(ForkName::Eip8453, MAINNET, &[3], &[5, 9]);
+        let names: Vec<String> = topics
+            .topics
+            .iter()
+            .map(|topic| topic.hash().into_string())
+            .collect();
+        assert!(names.contains(&topic_name(MAINNET, HEAD_VOTE)));
+        assert!(names.contains(&topic_name(MAINNET, INCLUSION_LIST)));
+        assert!(names.contains(&fg_attestation_topic_name(MAINNET, 5)));
+        assert!(names.contains(&fg_attestation_topic_name(MAINNET, 9)));
+        assert!(!names.contains(&topic_name(MAINNET, BEACON_AGGREGATE_AND_PROOF)));
+        assert!(!names.contains(&attestation_topic_name(MAINNET, 5)));
+        assert_eq!(
+            topics.attestation_topics[&5].hash().into_string(),
+            "/eth2/8c9f62fe/attestation_5/ssz_snappy"
+        );
+        assert_eq!(names.len(), EIP8453_TOPIC_KINDS.len() + 1 + 2);
+        // The topic kinds parse back, and `attestation_aggregate` is no subnet.
+        assert_eq!(fg_attestation_subnet("attestation_17"), Some(17));
+        assert_eq!(fg_attestation_subnet("attestation_aggregate"), None);
+        assert_eq!(fg_attestation_subnet("beacon_attestation_3"), None);
+        assert_eq!(metric_kind("attestation_17"), Some(FG_ATTESTATION_KIND));
+        assert_eq!(metric_kind(HEAD_VOTE), Some(HEAD_VOTE));
     }
 
     #[test]

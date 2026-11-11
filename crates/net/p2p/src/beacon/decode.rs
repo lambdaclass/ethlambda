@@ -28,7 +28,8 @@
 
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::{
-    DataColumnSidecar, SignedBeaconBlock, altair, capella, electra, gloas, heze, phase0, shared,
+    DataColumnSidecar, SignedBeaconBlock, altair, capella, eip8453, electra, gloas, heze, phase0,
+    shared,
 };
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::preset;
@@ -266,6 +267,29 @@ pub fn decode_proposer_preferences(
     gloas::SignedProposerPreferences::from_ssz_bytes(bytes).map_err(|_| DecodeError::Ssz)
 }
 
+/// Decode an EIP-8453 `head_vote` payload.
+pub fn decode_head_vote(bytes: &[u8]) -> Result<eip8453::HeadVoteMessage, DecodeError> {
+    eip8453::HeadVoteMessage::from_ssz_bytes(bytes).map_err(|_| DecodeError::Ssz)
+}
+
+/// Decode an EIP-8453 `attestation_{subnet_id}` payload: the modified
+/// `SingleAttestation`.
+pub fn decode_fg_attestation(bytes: &[u8]) -> Result<eip8453::SingleAttestation, DecodeError> {
+    eip8453::SingleAttestation::from_ssz_bytes(bytes).map_err(|_| DecodeError::Ssz)
+}
+
+/// Decode an `attester_slashing` payload under an EIP-8453 digest: the
+/// modified `AttesterSlashing`, refused past `MAX_ATTESTER_SLASHING_SIZE_EIP8453`
+/// before decoding.
+pub fn decode_eip8453_attester_slashing(
+    bytes: &[u8],
+) -> Result<eip8453::AttesterSlashing, DecodeError> {
+    if bytes.len() > preset::MAX_ATTESTER_SLASHING_SIZE_EIP8453 {
+        return Err(DecodeError::Ssz);
+    }
+    eip8453::AttesterSlashing::from_ssz_bytes(bytes).map_err(|_| DecodeError::Ssz)
+}
+
 /// Decode a `sync_committee_{subnet_id}` payload. Altair on and the same
 /// container at every fork, so no fork lookup is needed.
 pub fn decode_sync_committee_message(
@@ -297,7 +321,10 @@ pub fn decode_aggregate_and_proof(
         // root the aggregator signs differs; `data.index` is the payload flag.
         ForkName::Gloas | ForkName::Heze => gloas::SignedAggregateAndProof::from_ssz_bytes(bytes)
             .map(SignedAggregateAndProof::Gloas),
-        // TODO(eip8453): decode EIP-8453's finality-gadget aggregates.
+        // EIP-8453 deprecates `beacon_aggregate_and_proof` (its aggregated FG
+        // attestations go on the still unspecified `attestation_aggregate`),
+        // so the EIP-8453 digest never subscribes the topic; an aggregate of
+        // an EIP-8453 slot on an earlier digest's topic is for no consumer.
         ForkName::Eip8453 => return Err(DecodeError::UnsupportedFork),
         ForkName::Phase0
         | ForkName::Altair
@@ -353,7 +380,10 @@ pub fn decode_attestation(fork: ForkName, bytes: &[u8]) -> Result<Attestation, D
         ForkName::Electra | ForkName::Fulu | ForkName::Gloas | ForkName::Heze => {
             electra::SingleAttestation::from_ssz_bytes(bytes).map(Attestation::Electra)
         }
-        // TODO(eip8453): EIP-8453's `SingleAttestation` is its own container.
+        // EIP-8453 deprecates `beacon_attestation_{subnet_id}`: its
+        // `SingleAttestation` goes on `attestation_{subnet_id}`
+        // ([`decode_fg_attestation`]), and the EIP-8453 digest never
+        // subscribes these topics.
         ForkName::Eip8453 => return Err(DecodeError::UnsupportedFork),
         ForkName::Phase0
         | ForkName::Altair
@@ -392,8 +422,11 @@ pub fn decode_gossip(
                 ForkName::Gloas | ForkName::Heze => {
                     gloas::AttesterSlashing::from_ssz_bytes(bytes).map(AttesterSlashing::Gloas)
                 }
-                // TODO(eip8453): EIP-8453's attester slashings (and its
-                // legacy ones) are their own containers.
+                // EIP-8453's `AttesterSlashing` carries no slot to read the
+                // fork from: the gossip handler decodes it by its topic's
+                // digest ([`decode_eip8453_attester_slashing`]). A slashing
+                // whose bytes read as an EIP-8453 slot here is not one this
+                // decode can type.
                 ForkName::Eip8453 => return Err(DecodeError::UnsupportedFork),
                 ForkName::Phase0
                 | ForkName::Altair

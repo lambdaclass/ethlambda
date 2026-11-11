@@ -9,7 +9,7 @@ use super::{
     IgnoreReason, Outcome, QueueReason, RejectReason, SeenBlocks, execution_requests_within_limits,
     finalized_ancestry, finalized_start_slot, is_future_slot,
 };
-use crate::beacon::containers::{BeaconState, GloasBlockRef, SignedBeaconBlock};
+use crate::beacon::containers::{BeaconState, GloasBlockRef, SignedBeaconBlock, eip8453};
 use crate::beacon::fork_choice::{self, Store};
 use crate::beacon::helpers::misc::compute_epoch_at_slot;
 use crate::beacon::lean_boundary::lean_state_unreachable;
@@ -28,11 +28,9 @@ pub fn cheap_checks(
     block: &SignedBeaconBlock,
     now_ms: u64,
 ) -> Result<(), Outcome> {
-    // TODO(eip8453): EIP-8453 blocks have their own gossip rules
-    // (`p2p-interface.md`); until this node follows the fork they are
-    // ignored rather than judged by an earlier fork's.
-    if matches!(block, SignedBeaconBlock::Eip8453(_)) {
-        return Err(Outcome::Ignore(IgnoreReason::UnsupportedFork));
+    // EIP-8453's modified rules (`p2p-interface.md`).
+    if let SignedBeaconBlock::Eip8453(signed) = block {
+        return cheap_checks_eip8453(seen, store, &signed.message, now_ms);
     }
     if let Some(gloas_block) = as_gloas(block, "block::cheap_checks") {
         return cheap_checks_gloas(seen, store, gloas_block, now_ms);
@@ -114,6 +112,78 @@ fn cheap_checks_gloas(
     Ok(())
 }
 
+/// EIP-8453's `validate_beacon_block_gossip` (`p2p-interface.md`), the rules
+/// that read only the block, the clock and the store's metadata: gloas's, with
+/// the finalized slot the finality gadget's block's own slot and EIP-8453's
+/// operation limits.
+///
+/// The specification reads the finalized slot from the head's post-state; this
+/// reads the store's finalized block, which the gadget's fork choice adopts
+/// from the best of every branch and is therefore that slot or a later one on
+/// the head's chain. A block at or below it cannot descend from it unless it
+/// is it, so the rule ignores no block the specification's would accept and
+/// later finalize.
+fn cheap_checks_eip8453(
+    seen: &SeenBlocks,
+    store: &Store,
+    block: &eip8453::BeaconBlock,
+    now_ms: u64,
+) -> Result<(), Outcome> {
+    let config = store.config();
+    // [IGNORE] The block is the first with a valid signature for its slot and
+    // proposer.
+    if seen.contains(block.slot, block.proposer_index) {
+        return Err(Outcome::Ignore(IgnoreReason::AlreadySeen));
+    }
+    // [IGNORE] The block is not from a future slot.
+    if is_future_slot(&config, block.slot, now_ms) {
+        return Err(Outcome::Ignore(IgnoreReason::FutureSlot));
+    }
+    // [Modified in EIP8453] [IGNORE] The block is from a slot greater than the
+    // latest finalized slot.
+    let finalized_slot = store
+        .latest_finalized()
+        .map_or(0, |checkpoint| checkpoint.slot);
+    if block.slot <= finalized_slot {
+        return Err(Outcome::Ignore(IgnoreReason::Finalized));
+    }
+    // [REJECT] The body's operation counts, and the parent execution
+    // requests' counts, are within their limits.
+    if !eip8453_operations_within_limits(&block.body)
+        || !execution_requests_within_limits(&block.body.parent_execution_requests)
+    {
+        return Err(Outcome::Reject(RejectReason::OperationLimit));
+    }
+    // [REJECT] The bid's blob KZG commitment count is within the per-epoch
+    // limit.
+    let bid = &block.body.signed_execution_payload_bid.message;
+    let max_blobs = config.max_blobs_per_block(compute_epoch_at_slot(block.slot));
+    if bid.blob_kzg_commitments.len() as u64 > max_blobs {
+        return Err(Outcome::Reject(RejectReason::TooManyBlobs));
+    }
+    Ok(())
+}
+
+/// EIP-8453's modified `verify_block_body_operation_limits`: gloas's limits
+/// (heze has no deposits), plus the head votes, one support bitlist per head
+/// vote with one bit per voter, and the legacy attester slashings.
+pub fn eip8453_operations_within_limits(body: &eip8453::BeaconBlockBody) -> bool {
+    body.proposer_slashings.len() <= preset::MAX_PROPOSER_SLASHINGS
+        && body.attester_slashings.len() <= preset::MAX_ATTESTER_SLASHINGS_ELECTRA
+        && body.attestations.len() <= preset::MAX_ATTESTATIONS_ELECTRA
+        && body.voluntary_exits.len() <= preset::MAX_VOLUNTARY_EXITS
+        && body.bls_to_execution_changes.len() <= preset::MAX_BLS_TO_EXECUTION_CHANGES
+        && body.payload_attestations.len() as u64 <= preset::MAX_PAYLOAD_ATTESTATIONS
+        && body.head_votes.len() as u64 <= preset::MAX_HEAD_VOTES
+        && body.head_vote_support.len() == body.head_votes.len()
+        && body
+            .head_votes
+            .iter()
+            .zip(body.head_vote_support.iter())
+            .all(|(vote, bits)| bits.len() == vote.voter_indices.len())
+        && body.legacy_attester_slashings.len() <= preset::MAX_ATTESTER_SLASHINGS_ELECTRA
+}
+
 /// `verify_block_body_operation_limits` (`specs/gloas/p2p-interface.md`).
 ///
 /// Gloas's operation lists are progressive, so unlike every earlier fork's
@@ -135,11 +205,11 @@ fn body_operations_within_limits(block: GloasBlockRef<'_>) -> bool {
 /// rebuild the state from diffs, which is far too slow for a verdict that
 /// gossipsub waits on. A miss queues the block instead.
 pub fn stateful_checks(store: &Store, block: &SignedBeaconBlock, block_root: Root) -> Outcome {
-    // TODO(eip8453): see `cheap_checks`.
-    if matches!(block, SignedBeaconBlock::Eip8453(_)) {
-        return Outcome::Ignore(IgnoreReason::UnsupportedFork);
-    }
-    let gloas_block = as_gloas(block, "block::stateful_checks");
+    // Gloas, heze and EIP-8453 share these rules: EIP-8453 modifies only the
+    // finalized slot (its cheap half) and `is_finalized_ancestor`, which
+    // `finalized_ancestry` answers against the store's finalized block, the
+    // gadget's once it has finalized.
+    let payload_bid = block.payload_bid().map(|signed| &signed.message);
     let config = store.config();
     let parent_root = block.parent_root();
     let parent_known = store.has_block(&parent_root);
@@ -172,7 +242,7 @@ pub fn stateful_checks(store: &Store, block: &SignedBeaconBlock, block_root: Roo
     // even with an unverified parent payload. The parent's fullness is read
     // once: it decodes the parent block, which the bounded validation pool
     // should not do twice.
-    let parent_full = if gloas_block.is_some() {
+    let parent_full = if payload_bid.is_some() {
         match fork_choice::is_parent_node_full(store, block) {
             Ok(full) => full,
             Err(err) => {
@@ -183,7 +253,7 @@ pub fn stateful_checks(store: &Store, block: &SignedBeaconBlock, block_root: Roo
     } else {
         true
     };
-    if gloas_block.is_some() && parent_full && !fork_choice::is_payload_verified(store, parent_root)
+    if payload_bid.is_some() && parent_full && !fork_choice::is_payload_verified(store, parent_root)
     {
         return Outcome::Ignore(IgnoreReason::ParentPayloadUnverified);
     }
@@ -193,10 +263,9 @@ pub fn stateful_checks(store: &Store, block: &SignedBeaconBlock, block_root: Roo
     }
     // A gloas block has no payload to time; earlier forks: [REJECT] the
     // execution payload's timestamp is the slot's.
-    if let Some(gloas_block) = gloas_block {
+    if let Some(bid) = payload_bid {
         // [REJECT] The bid's parent equals the block's parent.
-        let bid = &gloas_block.signed_execution_payload_bid().message;
-        if bid.parent_block_root != gloas_block.parent_root() {
+        if bid.parent_block_root != block.parent_root() {
             return Outcome::Reject(RejectReason::BidParentMismatch);
         }
         // [REJECT] If the parent is not full, the bid builds on the parent's
@@ -722,6 +791,118 @@ mod tests {
         assert_eq!(
             stateful_checks(&store, &block, block_root),
             Outcome::Queue(QueueReason::ParentNotReady)
+        );
+    }
+}
+
+#[cfg(test)]
+mod eip8453_tests {
+    use super::*;
+    use crate::beacon::eip8453_test_support::scene;
+    use crate::beacon::gossip::test_support::seen_blocks;
+
+    #[test]
+    fn an_eip8453_child_of_the_finalized_anchor_is_accepted() {
+        let scene = scene(32);
+        let slot = scene.anchor_slot + 1;
+        let block = scene.child_block(slot, Vec::new(), Vec::new());
+        let now = scene.at(slot, 100);
+        assert_eq!(
+            validate(&seen_blocks(), &scene.store, &block, now),
+            Outcome::Accept
+        );
+    }
+
+    #[test]
+    fn the_eip8453_cheap_rules_bound_head_votes_and_their_support() {
+        let scene = scene(32);
+        let slot = scene.anchor_slot + 1;
+        let now = scene.at(slot, 100);
+        let vote = eip8453::HeadVote {
+            voter_indices: vec![1, 2].try_into().unwrap(),
+            data: Default::default(),
+            signature: Default::default(),
+        };
+        // One support bitlist per head vote.
+        let unpaired = scene.child_block(slot, vec![vote.clone()], Vec::new());
+        assert_eq!(
+            cheap_checks(&seen_blocks(), &scene.store, &unpaired, now),
+            Err(Outcome::Reject(RejectReason::OperationLimit))
+        );
+        // One support bit per voter.
+        let mut one_bit = eip8453::HeadVoteSupportBits::default();
+        one_bit.push(true);
+        let short = scene.child_block(slot, vec![vote.clone()], vec![one_bit]);
+        assert_eq!(
+            cheap_checks(&seen_blocks(), &scene.store, &short, now),
+            Err(Outcome::Reject(RejectReason::OperationLimit))
+        );
+        // At most `MAX_HEAD_VOTES`.
+        let count = preset::MAX_HEAD_VOTES as usize + 1;
+        let mut two_bits = eip8453::HeadVoteSupportBits::default();
+        two_bits.push(false);
+        two_bits.push(false);
+        let many = scene.child_block(slot, vec![vote; count], vec![two_bits; count]);
+        assert_eq!(
+            cheap_checks(&seen_blocks(), &scene.store, &many, now),
+            Err(Outcome::Reject(RejectReason::OperationLimit))
+        );
+    }
+
+    #[test]
+    fn the_eip8453_rules_ignore_finalized_future_and_seen_blocks() {
+        let scene = scene(32);
+        let slot = scene.anchor_slot + 1;
+        let block = scene.child_block(slot, Vec::new(), Vec::new());
+        let root = block.message_hash_tree_root();
+        // From the future.
+        assert_eq!(
+            cheap_checks(
+                &seen_blocks(),
+                &scene.store,
+                &block,
+                scene.at(slot, 0) - 2_000
+            ),
+            Err(Outcome::Ignore(IgnoreReason::FutureSlot))
+        );
+        // Already seen for its slot and proposer.
+        let mut seen = seen_blocks();
+        seen.record(slot, block.proposer_index(), root);
+        assert_eq!(
+            cheap_checks(&seen, &scene.store, &block, scene.at(slot, 100)),
+            Err(Outcome::Ignore(IgnoreReason::AlreadySeen))
+        );
+        // At or below the finalized slot (the anchor's own).
+        let at_anchor = scene.child_block(slot, Vec::new(), Vec::new());
+        let SignedBeaconBlock::Eip8453(mut signed) = at_anchor else {
+            unreachable!()
+        };
+        signed.message.slot = scene.anchor_slot;
+        let at_anchor = SignedBeaconBlock::Eip8453(signed);
+        assert_eq!(
+            cheap_checks(
+                &seen_blocks(),
+                &scene.store,
+                &at_anchor,
+                scene.at(slot, 100)
+            ),
+            Err(Outcome::Ignore(IgnoreReason::Finalized))
+        );
+    }
+
+    #[test]
+    fn a_forged_eip8453_block_is_rejected() {
+        let scene = scene(32);
+        let slot = scene.anchor_slot + 1;
+        let block = scene.child_block(slot, Vec::new(), Vec::new());
+        let SignedBeaconBlock::Eip8453(mut signed) = block else {
+            unreachable!()
+        };
+        signed.message.body.graffiti = crate::beacon::primitives::Bytes32::repeat_byte(1);
+        let forged = SignedBeaconBlock::Eip8453(signed);
+        assert_eq!(
+            validate(&seen_blocks(), &scene.store, &forged, scene.at(slot, 100)),
+            Outcome::Reject(RejectReason::BadSignature)
         );
     }
 }
