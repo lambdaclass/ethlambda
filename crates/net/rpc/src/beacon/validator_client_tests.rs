@@ -276,6 +276,33 @@ async fn the_validator_client_can_exit_a_validator_through_this_node() {
         matches!(&err, Error::BeaconNodeStatus { status: 400, body } if body.contains("voluntary exit")),
         "got {err:?}"
     );
+
+    // An exit naming a past epoch is one the chain accepts too: it measures
+    // the shard committee period against its own epoch and verifies under
+    // the fork it is at, neither of which the exit's epoch moves.
+    let pubkey = state.validator(1).unwrap().pubkey;
+    let keys = {
+        let mut store = ValidatorStore::new();
+        store
+            .insert_secret("test", &secret_key_for(1).to_bytes())
+            .expect("valid key");
+        store
+    };
+    let options = ExitOptions {
+        epoch: Some(0),
+        no_confirmation: true,
+        no_wait: true,
+        ..ExitOptions::default()
+    };
+    run_exit(&client, &keys, pubkey, &options, &mut no_input)
+        .await
+        .expect("the node accepts an exit naming epoch 0");
+    let published = network.operations.lock().unwrap().clone();
+    let [_, BeaconOperation::VoluntaryExit(exit)] = published.as_slice() else {
+        panic!("expected a second published exit, got {published:?}");
+    };
+    assert_eq!(exit.message.validator_index, 1);
+    assert_eq!(exit.message.epoch, 0);
 }
 
 /// One slot of an attester's work, in the order `ethlambda validator` does it.

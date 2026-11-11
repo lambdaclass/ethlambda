@@ -131,9 +131,9 @@ pub(crate) struct ExitOptions {
     #[arg(long, default_value = "http://localhost:5052")]
     pub(crate) beacon_node: String,
 
-    /// The exit's epoch. Defaults to the current one. A later epoch only makes
-    /// sense with --presign, since a node refuses an exit whose epoch has not
-    /// come.
+    /// The exit's epoch, before which the chain refuses it. Defaults to the
+    /// current one. A later epoch needs --presign, since a node refuses an
+    /// exit whose epoch has not come.
     #[arg(long)]
     pub(crate) epoch: Option<u64>,
 
@@ -251,8 +251,13 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
 }
 
 /// Sign and publish one validator's voluntary exit, on its own runtime like
-/// [`run`]. A run the operator aborted at the confirmation prompt is a clean
-/// exit, not an error: nothing happened, and nothing needed to.
+/// [`run`].
+///
+/// A run that did not get the confirmation phrase ends with a failing status.
+/// Nothing went wrong, but nothing was published either, and that is what a
+/// script reading the status asked about: one run without `--no-confirmation`
+/// and with nobody at stdin reads an empty line, and must not look like an
+/// exit that went out.
 #[tokio::main]
 pub(crate) async fn exit(options: ExitOptions) -> eyre::Result<()> {
     let outcome = exit::run(ExitConfig {
@@ -269,9 +274,10 @@ pub(crate) async fn exit(options: ExitOptions) -> eyre::Result<()> {
     .await?;
     match outcome {
         Outcome::Presigned(signed) => exit::print_presigned(&signed)?,
-        Outcome::NotConfirmed => {
-            eprintln!("Nothing was published. The phrase is \"{CONFIRMATION_PHRASE}\".");
-        }
+        Outcome::NotConfirmed => eyre::bail!(
+            "the voluntary exit was not published: the confirmation phrase is \
+             \"{CONFIRMATION_PHRASE}\""
+        ),
         Outcome::Published { .. } => {}
     }
     Ok(())

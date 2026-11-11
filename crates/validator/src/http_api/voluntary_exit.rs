@@ -7,16 +7,21 @@
 //! an operator pre-sign an exit for a later epoch and hold on to it.
 //!
 //! The exit epoch is the `epoch` query parameter, or the current epoch by the
-//! client's own clock when none is given. The validator index is asked of the
-//! beacon node on every call rather than cached: a key whose deposit has not
-//! been processed has no index yet, and a 404 saying so is the honest answer
-//! until it does.
+//! client's own clock when none is given. Whatever epoch it names, the exit is
+//! signed for the fork that will process it (see
+//! [`crate::signing::SigningContext::voluntary_exit_signing_root`]), so
+//! `?epoch=0` on a chain past deneb is as valid as the current epoch.
+//!
+//! The validator index is asked of the beacon node on every call rather than
+//! cached: a key whose deposit has not been processed has no index yet, and a
+//! 404 saying so is the honest answer until it does.
 //!
 //! Every route answers 404 for a key this client does not hold, as the
 //! settings routes do.
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
+use ethlambda_types::beacon::constants::GENESIS_EPOCH;
 use ethlambda_types::beacon::containers::shared::{SignedVoluntaryExit, VoluntaryExit};
 use serde::Deserialize;
 use tracing::info;
@@ -39,15 +44,17 @@ pub async fn create_signed_voluntary_exit(
     Query(query): Query<VoluntaryExitQuery>,
 ) -> Result<Json<Data<SignedVoluntaryExit>>, ApiError> {
     let pubkey = parse_path_key(&pubkey)?;
+    let current_epoch = context.clock.now().map(|slot| context.clock.epoch_of(slot));
     let epoch = match &query.epoch {
         Some(text) => parse_uint64("epoch", text)?,
-        None => {
-            let slot = context.clock.now().ok_or_else(|| {
-                ApiError::Internal("the chain's genesis is in the future".to_string())
-            })?;
-            context.clock.epoch_of(slot)
-        }
+        None => current_epoch.ok_or_else(|| {
+            ApiError::Internal("the chain's genesis is in the future".to_string())
+        })?,
     };
+    // The domain follows the fork that will process the exit, which is the
+    // chain's present one for an exit naming a past epoch. Before genesis
+    // the chain's first state is the earliest that can.
+    let current_epoch = current_epoch.unwrap_or(GENESIS_EPOCH);
 
     // The key is checked before the beacon node is asked, so a key this
     // client does not hold costs no round trip and is answered the same way
@@ -73,13 +80,13 @@ pub async fn create_signed_voluntary_exit(
         epoch,
         validator_index: entry.index,
     };
-    // Signed under the store's read lock, like the settings routes change
-    // their setting under it: a keystore delete, which takes the write lock,
-    // cannot land between the check above and the signature.
+    // The read lock is not held across the round trip to the beacon node, so
+    // a keystore delete can land between the check above and here. Signing
+    // then finds no key, which is the same 404 the check gives.
     let store = context.store.read().await;
     let signature = context
         .signing
-        .sign_voluntary_exit(&store, &pubkey, &exit)
+        .sign_voluntary_exit(&store, &pubkey, &exit, current_epoch)
         .map_err(|err| match err {
             crate::Error::UnknownValidator(_) => ApiError::NotFound(format!(
                 "no validator with pubkey {} is held by this client",
@@ -146,6 +153,11 @@ mod tests {
     /// to `INDEX` when `resolves` is set, and a clock a few epochs past
     /// genesis.
     fn harness(resolves: bool) -> Harness {
+        harness_at(10, resolves)
+    }
+
+    /// [`harness`] with the clock `epochs` epochs past genesis.
+    fn harness_at(epochs: u64, resolves: bool) -> Harness {
         let mut store = ValidatorStore::new();
         let pubkey = store.insert_secret("test", &secret()).expect("inserts");
         let mut node = MockBeaconNode::new();
@@ -161,7 +173,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("after the epoch")
             .as_secs()
-            - 10 * 32 * 12;
+            - epochs * 32 * 12;
         let clock = SlotClock::from_config(genesis_time, &config);
         let signing = Arc::new(SigningContext {
             config,
@@ -234,13 +246,17 @@ mod tests {
 
         let signed: SignedVoluntaryExit =
             serde_json::from_value(body["data"].clone()).expect("a SignedVoluntaryExit");
-        let now = harness.clock.now().expect("after genesis");
-        assert_eq!(signed.message.epoch, harness.clock.epoch_of(now));
+        let now = harness
+            .clock
+            .epoch_of(harness.clock.now().expect("after genesis"));
+        assert_eq!(signed.message.epoch, now);
         assert_eq!(signed.message.validator_index, INDEX);
         assert!(verify(
             &harness.pubkey,
             &signed.signature,
-            harness.signing.voluntary_exit_signing_root(&signed.message)
+            harness
+                .signing
+                .voluntary_exit_signing_root(&signed.message, now)
         ));
         // The wire form quotes its integers, as every Beacon API container does.
         assert!(body["data"]["message"]["epoch"].is_string(), "got {body}");
@@ -257,6 +273,35 @@ mod tests {
         let (status, body) = send(&harness.app, request).await;
         assert_eq!(status, StatusCode::OK, "got {body}");
         assert_eq!(body["data"]["message"]["epoch"], "999999");
+    }
+
+    /// An exit naming a past epoch is signed for the chain as it is now, not
+    /// as it was then: here a chain past deneb, whose nodes verify every exit
+    /// under the capella version, one naming epoch 0 included.
+    #[tokio::test]
+    async fn an_exit_naming_a_past_epoch_is_signed_for_the_chains_present_fork() {
+        use ethlambda_types::beacon::constants::DOMAIN_VOLUNTARY_EXIT;
+        use ethlambda_types::beacon::primitives::HashTreeRoot as _;
+        use ethlambda_types::beacon::signing::{compute_domain, compute_signing_root};
+
+        let harness = harness_at(Config::mainnet().electra_fork_epoch + 10, true);
+        let request = post(&uri(&harness.pubkey, "?epoch=0"), Some(TOKEN));
+        let (status, body) = send(&harness.app, request).await;
+        assert_eq!(status, StatusCode::OK, "got {body}");
+
+        let signed: SignedVoluntaryExit =
+            serde_json::from_value(body["data"].clone()).expect("a SignedVoluntaryExit");
+        assert_eq!(signed.message.epoch, 0);
+        let capella = compute_domain(
+            DOMAIN_VOLUNTARY_EXIT,
+            harness.signing.config.capella_fork_version,
+            harness.signing.genesis_validators_root,
+        );
+        assert!(verify(
+            &harness.pubkey,
+            &signed.signature,
+            compute_signing_root(signed.message.hash_tree_root(), capella)
+        ));
     }
 
     #[tokio::test]

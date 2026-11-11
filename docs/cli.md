@@ -314,7 +314,7 @@ ethlambda validator exit \
 | `--keystore` | required | The validator's EIP-2335 voting keystore |
 | `--password-file` | required | The file holding that keystore's password. A trailing newline is ignored |
 | `--beacon-node` | `http://localhost:5052` | Base URL of the beacon node's HTTP API. One node, not a list: this is a one-shot command, and an operator whose node is down picks another |
-| `--epoch` | the current epoch | The exit's epoch. A later one only makes sense with `--presign`, since a node refuses an exit whose epoch has not come |
+| `--epoch` | the current epoch | The exit's epoch, before which the chain refuses it. An earlier one is as good as the current one. A later one needs `--presign`: a node refuses an exit whose epoch has not come, so the command refuses to publish one |
 | `--presign` | off | Sign the exit and print it as JSON on stdout without publishing it, for an operator who wants to hold a signed exit for later. Logs go to stderr, so the JSON pipes cleanly into a file |
 | `--no-confirmation` | off | Publish without asking for the confirmation phrase. For scripts; use with care |
 | `--no-wait` | off | Return as soon as the beacon node has accepted the exit, without waiting for the chain to process it |
@@ -325,20 +325,32 @@ can never validate again. So before publishing anything the command refuses a
 beacon node that is still syncing, refuses a validator the chain would refuse
 (one that is not `active_ongoing`, or not yet `SHARD_COMMITTEE_PERIOD` epochs
 past its activation, naming the epoch it becomes eligible at), and then prints
-a warning and asks for the phrase `Exit my validator` on stdin. Anything else
-aborts without publishing.
+a warning and asks for the phrase `Exit my validator` on stdin. Anything else,
+an empty stdin included, aborts without publishing and with a failing exit
+status, so a script cannot take an exit that never went out for one that did.
+
+The shard committee period is measured the way the chain measures it: against
+the epoch the exit is processed in, which is now for an exit being published
+and the exit's own epoch for a `--presign` one naming a later epoch. One rule
+of the chain's cannot be checked up front: from electra on it refuses a
+validator with a partial withdrawal still pending. That refusal comes back as
+the beacon node's `400`, with its reason.
 
 After publishing, unless `--no-wait` is given, it polls the validator's status
-once a slot. When the chain reports `active_exiting` it prints the current,
-exit and withdrawable epochs and how long until the exit epoch, and returns;
-**keep the validator running until that epoch**, since it still has duties
-until then. A validator already `exited_unslashed` or `exited_slashed` is
-reported as such.
+once a slot, for up to two epochs. When the chain reports `active_exiting` it
+prints the current, exit and withdrawable epochs and how long until the exit
+epoch, and returns; **keep the validator running until that epoch**, since it
+still has duties until then. Any later status (`exited_*`, `withdrawal_*`) and
+`active_slashed` end the wait too, reported as such. If the chain has not
+processed the exit when the wait runs out, the command says so and returns
+successfully, since the exit was published; a beacon node that cannot answer a
+poll is asked again at the next slot rather than failing the run.
 
-From deneb on, exits are signed under `CAPELLA_FORK_VERSION` whatever their
-epoch (EIP-7044), so a pre-signed exit stays valid across every fork to come.
-The command signs that way, and the keymanager API's `voluntary_exit` route
-below does too.
+Exits are signed for the fork that processes them, not the one their epoch
+falls in. From deneb on that is `CAPELLA_FORK_VERSION` whatever epoch the exit
+names (EIP-7044), an epoch from before deneb included, so a pre-signed exit
+stays valid across every fork to come. The command signs that way, and the
+keymanager API's `voluntary_exit` route below does too.
 
 ### What it does today
 

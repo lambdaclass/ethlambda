@@ -133,9 +133,11 @@ pub struct MockBeaconNode {
     pub contribution_requests: Mutex<Vec<(Slot, u64, Root)>>,
     pub published_contributions: Mutex<Vec<altair::SignedContributionAndProof>>,
     pub sync_subscriptions: Mutex<Vec<SyncCommitteeSubscriptionDto>>,
-    /// What `validator` answers for any key. `None` is the node's 404. Behind
-    /// a mutex so a test can flip the status while the exit command waits.
+    /// What `validator` answers for any key. `None` is the node's 404.
     pub validator_details: Mutex<Option<ValidatorDetails>>,
+    /// What `validator` answers once an exit has been submitted, standing in
+    /// for the chain processing it. `None` leaves the answer as it was.
+    pub details_after_exit: Mutex<Option<ValidatorDetails>>,
     pub submitted_exits: Mutex<Vec<SignedVoluntaryExit>>,
 }
 
@@ -420,6 +422,11 @@ impl MockBeaconNode {
 
     pub fn set_validator_details(&self, details: Option<ValidatorDetails>) {
         *self.validator_details.lock().expect("lock") = details;
+    }
+
+    pub fn with_details_after_exit(self, details: ValidatorDetails) -> Self {
+        *self.details_after_exit.lock().expect("lock") = Some(details);
+        self
     }
 
     pub fn submitted_exits(&self) -> Vec<SignedVoluntaryExit> {
@@ -974,6 +981,9 @@ impl BeaconNodeApi for MockBeaconNode {
             .lock()
             .expect("lock")
             .push(exit.clone());
+        if let Some(details) = self.details_after_exit.lock().expect("lock").take() {
+            self.set_validator_details(Some(details));
+        }
         Ok(())
     }
 }
