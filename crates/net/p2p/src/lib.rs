@@ -886,6 +886,15 @@ pub(crate) fn gossipsub_config(
         // and its inbound stream is closed; earlier releases processed
         // messages up to the limit and dropped the rest.
         .max_publish_messages(500)
+        // libp2p-gossipsub 0.50 refuses an RPC whose subscriptions and control
+        // messages add up to more than this, 16 KiB by default, as a decode
+        // error that closes the stream it came on. A beacon peer on every
+        // subnet passes that with the hello it sends on connecting once it
+        // holds two digests' topics, as every peer does around a fork or
+        // blob-parameter boundary, and an IHAVE naming more than about 700
+        // message ids passes it on its own. The frame bound above is the only
+        // one this node had before the cap existed, so the cap is set to it.
+        .max_control_message_size(MAX_COMPRESSED_PAYLOAD_SIZE)
         .allow_self_origin(true)
         .idontwant_message_size_threshold(1000);
     if validate_messages {
@@ -3417,6 +3426,139 @@ mod tests {
         let config = gossipsub_config(Duration::from_secs(1), true);
         assert!(config.unsubscribe_backoff() >= peers_backoff);
         assert!(config.unsubscribe_backoff() >= config.prune_backoff());
+    }
+
+    /// Every beacon topic under `fork_digest` for a node on every subnet: the
+    /// global topics, gloas's four, and every column, attestation and sync
+    /// committee subnet.
+    fn every_beacon_topic(fork_digest: [u8; 4]) -> Vec<libp2p::gossipsub::IdentTopic> {
+        use crate::beacon::topics::{
+            GLOAS_TOPIC_KINDS, SUBSCRIBED_TOPIC_KINDS, attestation_topic_name,
+            data_column_topic_name, sync_committee_topic_name, topic_name,
+        };
+        use ethlambda_types::beacon::constants::{
+            DATA_COLUMN_SIDECAR_SUBNET_COUNT, SYNC_COMMITTEE_SUBNET_COUNT,
+        };
+
+        let attestation_subnets =
+            ethlambda_types::beacon::config::Config::mainnet().attestation_subnet_count;
+        let globals = SUBSCRIBED_TOPIC_KINDS
+            .iter()
+            .chain(&GLOAS_TOPIC_KINDS)
+            .map(|kind| topic_name(fork_digest, kind));
+        let columns = (0..DATA_COLUMN_SIDECAR_SUBNET_COUNT)
+            .map(|subnet| data_column_topic_name(fork_digest, subnet));
+        let attestations =
+            (0..attestation_subnets).map(|subnet| attestation_topic_name(fork_digest, subnet));
+        let sync_committees = (0..SYNC_COMMITTEE_SUBNET_COUNT as u64)
+            .map(|subnet| sync_committee_topic_name(fork_digest, subnet));
+        globals
+            .chain(columns)
+            .chain(attestations)
+            .chain(sync_committees)
+            .map(libp2p::gossipsub::IdentTopic::new)
+            .collect()
+    }
+
+    /// Connects a fresh peer subscribed to `topics` to a fresh node, both
+    /// beacon swarms, and answers whether the node learns every one of them.
+    ///
+    /// The peer subscribes before it dials, so its subscriptions reach the
+    /// node the way a connecting peer's do: all at once, in the one hello RPC
+    /// gossipsub sends a new connection (rust-libp2p since gossipsub 0.50, the
+    /// go, js and jvm implementations always). That RPC is never resent.
+    async fn node_learns_every_subscription(topics: &[libp2p::gossipsub::IdentTopic]) -> bool {
+        use ethlambda_types::beacon::config::Config;
+        use ethlambda_types::beacon::primitives::Root;
+
+        fn build(node_key_byte: u8) -> BuiltSwarm {
+            let config = Config::mainnet();
+            build_swarm(SwarmConfig {
+                node_key: vec![node_key_byte; 32],
+                bootnodes: Vec::new(),
+                listening_socket: "127.0.0.1:0".parse().expect("valid socket"),
+                target_peers: crate::discovery::DEFAULT_DISCOVERY_TARGET_PEERS,
+                agent_version: "ethlambda/test",
+                wire: WireConfig::Beacon(Box::new(crate::beacon::swarm::BeaconWireConfig {
+                    fork_digest: [0u8; 4],
+                    fork: config.fork_at_epoch(0),
+                    config: config.clone(),
+                    genesis_time: config.genesis_time,
+                    genesis_validators_root: Root::ZERO,
+                    custody_columns: Vec::new(),
+                    attestation_subnets: Vec::new(),
+                })),
+            })
+            .expect("beacon swarm builds")
+        }
+
+        let mut node = build(1);
+        let mut peer = build(2);
+        let peer_id = peer.local_peer_id;
+        for topic in topics {
+            let gossipsub = &mut peer.swarm.behaviour_mut().gossipsub;
+            gossipsub.subscribe(topic).expect("peer subscribes");
+        }
+
+        let node_addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = node.swarm.select_next_some().await {
+                break address
+                    .with_p2p(node.local_peer_id)
+                    .expect("failed to add peer ID to multiaddr");
+            }
+        };
+        peer.swarm.dial(node_addr).expect("dial is accepted");
+
+        let hears_all = |gossipsub: &Gossipsub| {
+            gossipsub.all_peers().any(|(id, subscribed)| {
+                *id == peer_id
+                    && topics
+                        .iter()
+                        .all(|topic| subscribed.contains(&&topic.hash()))
+            })
+        };
+        let heard = async {
+            while !hears_all(&node.swarm.behaviour().gossipsub) {
+                tokio::select! {
+                    _ = node.swarm.select_next_some() => {}
+                    _ = peer.swarm.select_next_some() => {}
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), heard)
+            .await
+            .is_ok()
+    }
+
+    /// A peer on every subnet sends a hello of well over 16 KiB once it holds
+    /// two digests' topics, which every peer does for the epochs around a fork
+    /// or blob-parameter boundary. libp2p-gossipsub 0.50 caps the
+    /// subscriptions and control messages of one RPC at 16 KiB by default and
+    /// refuses a bigger one outright, closing the stream it came on, so such a
+    /// peer would be left out of every mesh. The lambdaclass fork had no such
+    /// cap; its only bound was the frame size.
+    ///
+    /// One digest's topics fit under that default, which is the control: a
+    /// failure on two digests is the size and nothing else.
+    #[tokio::test]
+    async fn a_peer_on_every_subnet_of_two_digests_is_heard_subscribing() {
+        let one_digest = every_beacon_topic([0xAA; 4]);
+        assert!(
+            node_learns_every_subscription(&one_digest).await,
+            "a peer on every subnet of one digest is heard"
+        );
+
+        let mut two_digests = one_digest;
+        two_digests.extend(every_beacon_topic([0xBB; 4]));
+        let topic_bytes: usize = two_digests
+            .iter()
+            .map(|topic| topic.hash().as_str().len())
+            .sum();
+        assert!(topic_bytes > 16 * 1024, "the names alone pass 16 KiB");
+        assert!(
+            node_learns_every_subscription(&two_digests).await,
+            "a peer on every subnet of two digests is heard"
+        );
     }
 
     /// How many times [`concurrent_beacon_requests_on_different_protocols_never_cross`]
