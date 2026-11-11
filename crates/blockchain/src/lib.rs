@@ -6423,7 +6423,8 @@ mod tests {
     type Log = Arc<Mutex<Vec<String>>>;
 
     /// Run `f` in one of the chain actor's turns, to reach its `Context`.
-    struct InActor(Box<dyn FnOnce(&mut BlockChainServer, &Context<BlockChainServer>) + Send>);
+    type InTurn = Box<dyn FnOnce(&mut BlockChainServer, &Context<BlockChainServer>) + Send>;
+    struct InActor(InTurn);
     impl Message for InActor {
         type Result = ();
     }

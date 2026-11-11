@@ -1813,7 +1813,8 @@ mod tests {
     // ---- The job that carries a stateful check (spawned 0.8 `pipe_with`) ----
 
     /// Run `f` in one of the p2p actor's turns, to reach its `Context`.
-    struct InActor(Box<dyn FnOnce(&mut P2PServer, &Context<P2PServer>) + Send>);
+    type InTurn = Box<dyn FnOnce(&mut P2PServer, &Context<P2PServer>) + Send>;
+    struct InActor(InTurn);
     impl Message for InActor {
         type Result = ();
     }
