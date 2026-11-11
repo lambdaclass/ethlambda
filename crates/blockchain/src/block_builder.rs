@@ -26,7 +26,7 @@ use ethlambda_state_transition::{
 use ethlambda_storage::HeadVoteWindow;
 use ethlambda_types::{
     ShortRoot,
-    attestation::{AggregatedAttestation, AggregationBits, AttestationData},
+    attestation::{AggregatedAttestation, AggregationBits, AttestationData, XmssSignature},
     block::{
         AggregatedAttestations, Block, BlockBody, MultiMessageAggregate,
         MultiMessageAggregateError, SignedBlock, SingleMessageAggregate,
@@ -1272,13 +1272,44 @@ pub fn seal_block(
     block: Block,
     single_message_aggregates: Vec<SingleMessageAggregate>,
 ) -> Result<SignedBlock, SealError> {
+    let proposer_signature = sign_proposal(key_manager, &block)?;
+    seal_signed_block(
+        head_state,
+        block,
+        proposer_signature,
+        single_message_aggregates,
+    )
+}
+
+/// The stateful half of [`seal_block`]: sign the block root with the
+/// proposer's proposal key. Needs `&mut KeyManager` (XMSS keys are
+/// stateful), so it runs on the actor; the expensive wrap and merge in
+/// [`seal_signed_block`] do not, and run off it.
+pub fn sign_proposal(
+    key_manager: &mut KeyManager,
+    block: &Block,
+) -> Result<XmssSignature, SealError> {
+    let slot: u32 = block.slot.try_into().expect("slot exceeds u32");
+    let block_root = block.hash_tree_root();
+    let sign_start = Instant::now();
+    let proposer_signature =
+        key_manager.sign_block_root(block.proposer_index, slot, &block_root)?;
+    metrics::observe_block_proposal_phase("sign_proposer", sign_start.elapsed());
+    Ok(proposer_signature)
+}
+
+/// The pure half of [`seal_block`]: wrap `proposer_signature` and merge it
+/// with the attestation aggregates. No store or key access, so it can run on
+/// a blocking job.
+pub fn seal_signed_block(
+    head_state: &State,
+    block: Block,
+    proposer_signature: XmssSignature,
+    single_message_aggregates: Vec<SingleMessageAggregate>,
+) -> Result<SignedBlock, SealError> {
     let slot: u32 = block.slot.try_into().expect("slot exceeds u32");
     let proposer_index = block.proposer_index;
     let block_root = block.hash_tree_root();
-
-    let sign_start = Instant::now();
-    let proposer_signature = key_manager.sign_block_root(proposer_index, slot, &block_root)?;
-    metrics::observe_block_proposal_phase("sign_proposer", sign_start.elapsed());
 
     let validators = &head_state.validators;
     let proposer_validator = validators

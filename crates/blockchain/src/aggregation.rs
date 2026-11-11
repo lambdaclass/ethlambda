@@ -5,8 +5,9 @@
 //! or up to [`EARLY_AGGREGATION_WINDOW`] early when the 2/3 signature
 //! threshold is met — via
 //! [`run_aggregation_worker`]. The actor stays on its message loop; the worker
-//! runs the expensive XMSS proofs on a `spawn_blocking` thread and streams
-//! results back as [`AggregateProduced`] / [`AggregationDone`] messages.
+//! runs the expensive XMSS proofs as a keyed blocking job owned by the actor
+//! and streams results back as [`AggregateProduced`] emits, ending with one
+//! [`AggregationDone`].
 //!
 //! [`snapshot_aggregation_inputs`] builds the session's job list with a tiered
 //! greedy selector modeled on `block_builder::select_attestations`: an
@@ -32,28 +33,22 @@ use ethlambda_types::{
     state::Validator,
 };
 use spawned_concurrency::message::Message;
-use spawned_concurrency::tasks::{ActorRef, Context, send_after};
-use tokio_util::sync::CancellationToken;
+use spawned_concurrency::tasks::{JobCtx, JobHandle, JobKey, JobOutcome};
 use tracing::{info, trace, warn};
 
 use crate::block_builder::{self, EntryScore};
 use crate::metrics;
 
 /// Soft deadline for committee-signature aggregation measured from session
-/// start: one full interval. After this much wall time elapses, the actor
-/// signals the worker to stop via its cancellation token. A session started
-/// exactly at interval 2 therefore runs until interval 3; a session started
-/// early (see `maybe_start_early_aggregation`) ends correspondingly earlier.
-/// The deadline only stops new jobs from starting — a job mid-proof finishes
-/// and publishes right after.
+/// start: one full interval. Past it the worker starts no new job. A session
+/// started exactly at interval 2 therefore runs until interval 3; a session
+/// started early (see `maybe_start_early_aggregation`) ends correspondingly
+/// earlier. The deadline only stops new jobs from starting — a job mid-proof
+/// finishes and publishes right after — so it is checked by the worker, not
+/// set as the job's (hard) `JobOptions::deadline`.
 pub(crate) fn aggregation_deadline(milliseconds_per_interval: u64) -> Duration {
     Duration::from_millis(milliseconds_per_interval)
 }
-
-/// Upper bound we wait for a prior worker to exit if it is still running when
-/// the next session is about to start. Reached only in pathological cases
-/// (mismatched timers, stuck proofs); we warn before blocking.
-pub(crate) const PRIOR_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Width of the early-aggregation window: a session may start at most this
 /// long before the interval-2 boundary, provided the signature threshold is
@@ -126,35 +121,50 @@ pub struct AggregatedGroupOutput {
     pub(crate) keys_to_delete: Vec<(u64, H256)>,
 }
 
-/// Tracks an in-flight off-thread aggregation worker so the actor can cancel,
-/// join, and correlate incoming result messages with the right session.
+/// The slot's aggregation session: the once-per-slot latch, plus the keyed
+/// job that runs its proofs. Starting the next session replaces the job
+/// (`AGGREGATION_JOB` key), which cancels it and fences every message it
+/// still has queued, so no session id travels with the results.
 pub(crate) struct AggregationSession {
-    /// Slot at which this session was started; used as a fencing id so we can
-    /// drop late-arriving messages from a prior session.
+    /// Slot at which this session was started.
     pub(crate) session_id: u64,
     /// Whether the session started before the slot's interval-2 boundary via
     /// the early-aggregation trigger.
     pub(crate) early: bool,
-    /// Child of the actor cancellation token; fires either at the deadline or
-    /// when the actor itself is stopping.
-    pub(crate) cancel: CancellationToken,
-    /// Handle to the `spawn_blocking` worker. Held so `stopped()` / new-session
-    /// start can await completion.
-    pub(crate) worker: tokio::task::JoinHandle<()>,
+    /// The worker job. Kept to tell whether a prior session still runs when
+    /// the next one starts.
+    pub(crate) job: JobHandle,
 }
 
-/// One successful aggregate streamed back from the worker.
+/// Key of the aggregation worker job: one session at a time.
+pub(crate) const AGGREGATION_JOB: JobKey = JobKey::new("aggregation");
+
+/// One successful aggregate, emitted by the worker job (fenced with it).
 pub(crate) struct AggregateProduced {
     pub(crate) session_id: u64,
     pub(crate) output: AggregatedGroupOutput,
+    /// The interval-2 boundary: an early session's aggregate is held until
+    /// then before it reaches the store and gossip.
+    pub(crate) publish_at: SystemTime,
 }
 impl Message for AggregateProduced {
     type Result = ();
 }
 
-/// Emitted by the worker after its loop exits (completion or cancellation).
-pub(crate) struct AggregationDone {
+/// An early session's aggregate, held by a timer until the interval-2
+/// boundary. A plain timer is not fenced with the job, so its handler checks
+/// the session.
+pub(crate) struct HeldAggregate {
     pub(crate) session_id: u64,
+    pub(crate) output: AggregatedGroupOutput,
+}
+impl Message for HeldAggregate {
+    type Result = ();
+}
+
+/// What the worker job did, when its loop exits (completion, the soft
+/// deadline, or cancellation).
+pub(crate) struct AggregationSummary {
     pub(crate) groups_considered: usize,
     pub(crate) groups_aggregated: usize,
     pub(crate) total_raw_sigs: usize,
@@ -162,16 +172,14 @@ pub(crate) struct AggregationDone {
     pub(crate) total_elapsed: Duration,
     pub(crate) cancelled: bool,
 }
-impl Message for AggregationDone {
-    type Result = ();
-}
 
-/// Self-message scheduled via `send_after` at session start. Cancels the
-/// session's token so the worker stops starting new aggregations.
-pub(crate) struct AggregationDeadline {
+/// The worker job's terminal message: its summary, or how it failed (a panic
+/// in a proof). Fenced like its emits.
+pub(crate) struct AggregationDone {
     pub(crate) session_id: u64,
+    pub(crate) outcome: JobOutcome<AggregationSummary>,
 }
-impl Message for AggregationDeadline {
+impl Message for AggregationDone {
     type Result = ();
 }
 
@@ -1157,25 +1165,25 @@ pub(crate) fn aggregation_bits_from_validator_indices(bits: &[u64]) -> Aggregati
     aggregation_bits
 }
 
-/// Worker loop — runs on a `spawn_blocking` thread, no store access.
+/// Worker loop — runs as the session's blocking job, no store access.
 ///
-/// Pulls jobs from the snapshot, runs [`aggregate_job`] for each, and streams
-/// successful aggregates back to the actor as [`AggregateProduced`] messages.
-/// Emits [`AggregationDone`] when the loop exits (completion or cancellation).
+/// Pulls jobs from the snapshot, runs [`aggregate_job`] for each, and emits
+/// successful aggregates to the actor as [`AggregateProduced`] messages. Stops
+/// starting new jobs once the job is cancelled (the next session replaced it,
+/// or the actor is stopping) or `stop_starting_at` passed. Returns the
+/// session's summary, which the job delivers as [`AggregationDone`].
 ///
-/// Publish alignment: aggregates must not reach the actor (and thus gossip)
-/// before the interval-2 boundary. `publish_at` is that boundary as a wall-clock
-/// instant; a produced aggregate still ahead of it is delivered via
-/// [`send_after`] timed to land at the boundary, otherwise it is sent
-/// immediately. A normal interval-2 session starts at the boundary, so its
-/// aggregates are always past it and sent without delay.
+/// Publish alignment: aggregates must not reach the store and gossip before
+/// the interval-2 boundary, `publish_at`. The worker emits each aggregate as
+/// soon as it is proven and the actor holds an early one until the boundary
+/// (see [`HeldAggregate`]), so a held aggregate never delays the next proof.
 pub(crate) fn run_aggregation_worker(
     snapshot: AggregationSnapshot,
-    actor: ActorRef<crate::BlockChainServer>,
-    cancel: CancellationToken,
+    job_ctx: &JobCtx<crate::BlockChainServer>,
     session_id: u64,
     publish_at: SystemTime,
-) {
+    stop_starting_at: Instant,
+) -> AggregationSummary {
     let start = Instant::now();
     let groups_considered = snapshot.groups_considered;
     let mut groups_aggregated = 0usize;
@@ -1183,9 +1191,11 @@ pub(crate) fn run_aggregation_worker(
     let mut total_children = 0usize;
     let jobs_total = snapshot.jobs.len();
     let mut jobs_attempted = 0usize;
+    let mut cancelled = false;
 
     for job in snapshot.jobs {
-        if cancel.is_cancelled() {
+        if job_ctx.is_cancelled() || Instant::now() >= stop_starting_at {
+            cancelled = true;
             break;
         }
         jobs_attempted += 1;
@@ -1222,48 +1232,33 @@ pub(crate) fn run_aggregation_worker(
         total_raw_sigs += raw_sigs;
         total_children += children;
 
-        // Hold the aggregate until the interval-2 boundary (early session), or
-        // send now if already at/past it. `send_after` is fire-and-forget: it
-        // spawns a timer that delivers the message and is cancelled only if the
-        // actor stops, so the produced aggregate is not lost when the worker's
-        // own loop ends. `duration_since` errs once the boundary has passed,
-        // which collapses to a zero delay here.
-        let delay = publish_at
-            .duration_since(SystemTime::now())
-            .unwrap_or(Duration::ZERO);
-        if delay.is_zero() {
-            if actor
-                .send(AggregateProduced { session_id, output })
-                .is_err()
-            {
-                // Actor is gone; no point producing more.
-                break;
-            }
-        } else {
-            send_after(
-                delay,
-                Context::from_ref(&actor),
-                AggregateProduced { session_id, output },
-            );
+        let produced = AggregateProduced {
+            session_id,
+            output,
+            publish_at,
+        };
+        if job_ctx.emit_blocking(produced).is_err() {
+            // Cancelled meanwhile: nothing more of this session is wanted.
+            cancelled = true;
+            break;
         }
     }
 
-    // Jobs the loop never reached (deadline cancellation or actor gone) are
+    // Jobs the loop never reached (deadline, replacement or actor stop) are
     // skipped aggregation submissions per leanMetrics.
     let jobs_dropped = jobs_total - jobs_attempted;
     if jobs_dropped > 0 {
         metrics::inc_aggregator_skipped_other(jobs_dropped as u64);
     }
 
-    let _ = actor.send(AggregationDone {
-        session_id,
+    AggregationSummary {
         groups_considered,
         groups_aggregated,
         total_raw_sigs,
         total_children,
         total_elapsed: start.elapsed(),
-        cancelled: cancel.is_cancelled(),
-    });
+        cancelled,
+    }
 }
 
 #[cfg(test)]
