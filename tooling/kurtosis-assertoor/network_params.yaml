@@ -25,11 +25,15 @@ participants:
     cl_type: lighthouse
     vc_type: ethlambda
     vc_image: ghcr.io/lambdaclass/ethlambda:unstable
+    # Genesis keys in a fresh directory: nothing has ever signed with them, so
+    # registering them without history is safe.
+    vc_extra_params: ["--init-slashing-protection"]
   - el_type: geth
     cl_type: ethlambda
     cl_image: ghcr.io/lambdaclass/ethlambda:unstable
     vc_type: ethlambda
     vc_image: ghcr.io/lambdaclass/ethlambda:unstable
+    vc_extra_params: ["--init-slashing-protection"]
 network_params:
   # ethlambda only supports the mainnet preset: 32-slot epochs of 12 s.
   preset: mainnet
