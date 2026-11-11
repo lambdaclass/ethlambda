@@ -603,3 +603,54 @@ pub fn aggregate_head_votes(
         .map(|(_, vote, bits)| (vote, bits))
         .unzip()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::beacon::eip8453_test_support::scene;
+    use ethlambda_types::decoupled::PayloadStatus;
+
+    /// Duty inputs recorded before an invalidation, at their instants, move to
+    /// the invalidated block's EMPTY node: a validator reading them later signs
+    /// nothing on the invalid payload.
+    #[test]
+    fn recorded_duty_inputs_move_off_an_invalidated_payload() {
+        let scene = scene(16);
+        let anchor = scene.anchor_root;
+        let slot = scene.anchor_slot + 1;
+        let quarter_ms = scene.config.slot_duration_ms_at_slot(slot) / 4;
+        let (proposal, vote) = scene
+            .node
+            .with(|n| {
+                // The anchor's payload arrives early in its own slot, so it is
+                // in the next slot's voter subtree.
+                n.on_payload(&anchor, true, scene.at(scene.anchor_slot, 0))
+                    .unwrap();
+                let proposal = n.proposal(slot, scene.at(slot, 0)).unwrap();
+                let vote = n.vote_head(slot, scene.at(slot, quarter_ms)).unwrap();
+                (proposal.head, vote)
+            })
+            .unwrap();
+        assert_eq!(proposal, ForkChoiceNode::full(anchor));
+        assert_eq!(vote.payload_status(), Some(PayloadStatus::Full));
+
+        let now = scene.at(slot, quarter_ms + 1);
+        let (outcome, proposal, vote) = scene
+            .node
+            .with(|n| {
+                let outcome = n.invalidate_payload(&anchor, now);
+                let proposal = n.proposal(slot, now).unwrap();
+                let vote = n.vote_head(slot, now).unwrap();
+                (outcome, proposal.head, vote)
+            })
+            .unwrap();
+        assert_eq!(
+            outcome,
+            PayloadInvalidation::Invalidated {
+                removed_blocks: Vec::new()
+            }
+        );
+        assert_eq!(proposal, ForkChoiceNode::empty(anchor));
+        assert_eq!(vote.supported_node(), Some(ForkChoiceNode::empty(anchor)));
+    }
+}

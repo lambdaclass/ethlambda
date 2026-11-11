@@ -1197,6 +1197,52 @@ async fn an_in_process_network_reveals_payloads_builds_on_them_and_finalizes() {
             ))
     });
     assert!(told_head, "forkchoiceUpdated named the head's payload");
+
+    // An INVALID verdict about a payload the gadget's justified block builds
+    // on (its parent's) is refused on every node: logged, and nothing changes.
+    let justified = network.store(0).fg_justified_checkpoint().unwrap();
+    let committed = network.store(0).block_entry(&justified.root).unwrap().1;
+    let committed_slot = network.store(0).block_entry(&committed).unwrap().0;
+    assert_eq!(
+        parent_payload_hash(network.store(0), justified.root),
+        payload_hash(committed_slot),
+        "the justified block builds on its parent's payload"
+    );
+    for server in &mut network.nodes {
+        assert!(!server.condemn_payload_chain(committed, None));
+        let (invalidated, holds_justified, head) = server
+            .eip8453_node()
+            .with(|n| {
+                let engine = n.engine();
+                (
+                    engine.is_payload_invalidated(&committed),
+                    engine.contains(&justified.root),
+                    engine.get_head(),
+                )
+            })
+            .unwrap();
+        assert!(!invalidated && holds_justified);
+        assert_eq!(head, ForkChoiceNode::full(last_root));
+        // What the engine answered (a refusal changes nothing, so asking
+        // again is safe).
+        let answer = server
+            .eip8453_node()
+            .with(|n| n.engine_mut().invalidate_payload(&committed))
+            .unwrap();
+        assert!(
+            matches!(
+                answer,
+                ethlambda_decoupled::PayloadInvalidation::Committed { .. }
+            ),
+            "{answer:?}"
+        );
+        assert_ne!(
+            server.store.beacon_block_payload_status(committed),
+            fork_choice::PayloadStatusEnum::Invalid
+        );
+        assert!(server.store.invalid_payloads().is_empty());
+        assert!(server.store.block_index().contains_key(&justified.root));
+    }
 }
 
 /// Two payloads the execution client first accepts optimistically are later
