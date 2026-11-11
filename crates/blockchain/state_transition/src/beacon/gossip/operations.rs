@@ -3,11 +3,14 @@
 //!
 //! The rules are the specification's `validate_voluntary_exit_gossip`
 //! (`phase0/p2p-interface.md`, modified in `deneb/p2p-interface.md` to pin the
-//! signature domain to the capella fork version), `validate_proposer_slashing_gossip`,
+//! signature domain to the capella fork version, and in
+//! `electra/p2p-interface.md` to ignore an exit while the validator has pending
+//! partial withdrawals), `validate_proposer_slashing_gossip`,
 //! `validate_attester_slashing_gossip` (phase0; electra changes only the
 //! `AttesterSlashing` type) and `validate_bls_to_execution_change_gossip`
-//! (`capella/p2p-interface.md`), as of consensus-specs v1.7.0-beta.1, which is
-//! what the conformance vectors are generated from.
+//! (`capella/p2p-interface.md`), as of consensus-specs `0f4fa3ff`. The
+//! conformance vectors are `v1.7.0-beta.4`'s, which predate electra's
+//! voluntary-exit rule and have no case with a pending partial withdrawal.
 //!
 //! Each function splits where the specification first reads `state`:
 //! `cheap_checks` is everything before it (the seen records, the clock, and
@@ -15,9 +18,8 @@
 //! state is the fork-choice head's post-state, read as it is and never
 //! advanced: an operation has no block of its own to name one, and the
 //! specification checks it against the head without a slot transition. The
-//! rules do not run `process_*`, so they also do not apply a block's own
-//! extra conditions (an exit's pending balance, say); block packing filters
-//! those.
+//! rules do not run `process_*`, so a block's other conditions beyond the
+//! gossip rules are left to block packing, which filters them.
 
 use std::collections::HashSet;
 
@@ -38,7 +40,9 @@ use crate::beacon::containers::BeaconState;
 use crate::beacon::fork_choice::Store;
 use crate::beacon::hash::hash;
 use crate::beacon::helpers::accessors::{get_current_epoch, get_domain};
-use crate::beacon::helpers::electra::is_valid_indexed_attestation;
+use crate::beacon::helpers::electra::{
+    get_pending_balance_to_withdraw, is_valid_indexed_attestation,
+};
 use crate::beacon::helpers::misc::{compute_domain, compute_epoch_at_slot, compute_signing_root};
 use crate::beacon::helpers::predicates::{
     is_active_validator, is_slashable_attestation_data, is_slashable_validator,
@@ -239,6 +243,15 @@ fn voluntary_exit(state: &BeaconState, signed: &SignedVoluntaryExit, config: &Co
                 .saturating_add(config.shard_committee_period)
     {
         return Err(Outcome::Reject(RejectReason::InvalidOperation));
+    }
+    // [New in Electra:EIP7251] [IGNORE] The validator has no pending partial
+    // withdrawals: `process_voluntary_exit` refuses the exit while it has any,
+    // so it is ignored rather than forwarded. `stateful_checks` only hands
+    // this electra and fulu states, so the queue is always there to read.
+    match get_pending_balance_to_withdraw(state, exit.validator_index) {
+        Ok(0) => {}
+        Ok(_) => return Err(Outcome::Ignore(IgnoreReason::PendingPartialWithdrawals)),
+        Err(_) => return Err(Outcome::Ignore(IgnoreReason::StateUnavailable)),
     }
     // [Modified in Deneb:EIP7044] [REJECT] The signature, under the capella
     // fork version so exits stay valid across forks.
@@ -506,8 +519,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_validly_signed_exit_is_accepted() {
+    /// A fulu head state old enough for validator 2 to exit, and validator
+    /// 2's validly signed exit.
+    fn exit_ready_state() -> (crate::beacon::containers::BeaconState, BeaconOperation) {
         let mut state = fulu_parent(0);
         // Past `SHARD_COMMITTEE_PERIOD` epochs since activation.
         let config = crate::beacon::config::Config::mainnet();
@@ -524,12 +538,55 @@ mod tests {
         );
         let signing_root =
             crate::beacon::helpers::misc::compute_signing_root(message.hash_tree_root(), domain);
-        state.apply_pending_mutations();
-        let store = store_with_head(state);
         let exit = BeaconOperation::VoluntaryExit(shared::SignedVoluntaryExit {
             message,
             signature: sign_for(2, signing_root),
         });
+        (state, exit)
+    }
+
+    #[test]
+    fn a_validly_signed_exit_is_accepted() {
+        let (mut state, exit) = exit_ready_state();
+        state.apply_pending_mutations();
+        let store = store_with_head(state);
         assert_eq!(stateful_checks(&store, &exit), Outcome::Accept);
+    }
+
+    /// `electra/p2p-interface.md` (consensus-specs `0f4fa3ff`): an exit the
+    /// state transition would refuse for a pending partial withdrawal is
+    /// ignored, whoever else's withdrawals are queued.
+    #[test]
+    fn an_exit_with_pending_partial_withdrawals_is_ignored() {
+        let (mut state, exit) = exit_ready_state();
+        let withdrawal = |validator_index| electra::PendingPartialWithdrawal {
+            validator_index,
+            amount: 1_000_000_000,
+            withdrawable_epoch: 0,
+        };
+        let mut queue =
+            crate::beacon::helpers::electra::pending_queue_fields(&mut state, "test").unwrap();
+        queue
+            .push_pending_partial_withdrawal(withdrawal(3))
+            .unwrap();
+        state.apply_pending_mutations();
+        let store = store_with_head(state.clone());
+        assert_eq!(
+            stateful_checks(&store, &exit),
+            Outcome::Accept,
+            "another validator's withdrawal does not hold the exit back"
+        );
+
+        let mut queue =
+            crate::beacon::helpers::electra::pending_queue_fields(&mut state, "test").unwrap();
+        queue
+            .push_pending_partial_withdrawal(withdrawal(2))
+            .unwrap();
+        state.apply_pending_mutations();
+        let store = store_with_head(state);
+        assert_eq!(
+            stateful_checks(&store, &exit),
+            Outcome::Ignore(IgnoreReason::PendingPartialWithdrawals)
+        );
     }
 }

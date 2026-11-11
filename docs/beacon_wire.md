@@ -227,8 +227,9 @@ block, current slot, committee seat).
 `voluntary_exit`, `proposer_slashing`, `attester_slashing` and
 `bls_to_execution_change` are validated in p2p like aggregates, by
 `gossip::operations`: the specification's `validate_*_gossip` functions
-(consensus-specs v1.7.0-beta.1), run against the fork-choice head's post-state
-as it is, with no state advance and no `process_*`. The seen records (the
+(consensus-specs `0f4fa3ff`, which adds electra's IGNORE of an exit whose
+validator has pending partial withdrawals), run against the fork-choice head's
+post-state as it is, with no state advance and no `process_*`. The seen records (the
 first valid exit or credential change per validator, proposer slashing per
 proposer, and the validators an attester slashing slashes) live in
 `SeenOperations`, are recorded only on `Accept` and never pruned, so an
