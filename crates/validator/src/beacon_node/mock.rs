@@ -599,7 +599,7 @@ impl BeaconNodeApi for MockBeaconNode {
         // head: it errors, and failover moves past it. Without this the mock
         // would be a more permissive node than any real one, and tests built
         // on it would not reflect what happens in production.
-        crate::beacon_node::validate_attestation_data(slot, &data)?;
+        crate::beacon_node::validate_attestation_data(slot, fork, &data)?;
         Ok(data)
     }
 

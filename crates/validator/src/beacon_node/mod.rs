@@ -32,8 +32,8 @@ pub mod http;
 #[cfg(test)]
 pub mod mock;
 
-/// Check that `data` is an answer about `slot`, as the contract on
-/// [`BeaconNodeApi::attestation_data`] requires.
+/// Check that `data` is an answer about `slot`, which is in `fork`, as the
+/// contract on [`BeaconNodeApi::attestation_data`] requires.
 ///
 /// One function rather than two copies, because it is enforced in two places
 /// for two different reasons and they must not drift apart. Each
@@ -42,12 +42,21 @@ pub mod mock;
 /// before signing, since the trait is public and nothing stops an
 /// implementation from being wrong.
 ///
-/// Both fields are checked because both are signable. `slot` is the obvious
-/// one. `target.epoch` matters independently: it selects the signing domain
-/// (see `SigningContext::attestation_signing_root`), so a node answering with
-/// the right slot and a wrong target epoch is a second, distinct way to make
-/// this client sign something it should not.
-pub fn validate_attestation_data(slot: Slot, data: &AttestationData) -> Result<()> {
+/// `slot` and `target.epoch` are checked because both are signable. `slot` is
+/// the obvious one. `target.epoch` matters independently: it selects the
+/// signing domain (see `SigningContext::attestation_signing_root`), so a node
+/// answering with the right slot and a wrong target epoch is a second,
+/// distinct way to make this client sign something it should not.
+///
+/// `index` is checked for liveness rather than safety. A vote whose index
+/// cannot be valid at `fork` is one every peer rejects (gossip's
+/// `attestation.data.index == 0` from electra, `< 2` from gloas), and by
+/// then slashing protection has recorded its target, so the validator has no
+/// second vote to cast in that epoch. Refused here, nothing is recorded for
+/// it, and the `Err` is one failover moves past to a node that may answer
+/// properly. Lodestar's validator client refuses the same before signing
+/// (`validateAttestationDuty`).
+pub fn validate_attestation_data(slot: Slot, fork: ForkName, data: &AttestationData) -> Result<()> {
     if data.slot != slot {
         return Err(crate::error::Error::InconsistentResponse(format!(
             "requested attestation data for slot {slot}, node answered for slot {}",
@@ -74,7 +83,49 @@ pub fn validate_attestation_data(slot: Slot, data: &AttestationData) -> Result<(
             data.source.epoch, data.target.epoch
         )));
     }
+    let highest_index = highest_attestation_index(fork)?;
+    if data.index > highest_index {
+        return Err(crate::error::Error::InconsistentResponse(format!(
+            "attestation data for slot {slot} carries index {}, and a {} attestation's is at \
+             most {highest_index}",
+            data.index,
+            fork.as_str()
+        )));
+    }
     Ok(())
+}
+
+/// The highest `AttestationData.index` a vote at `fork` can carry.
+///
+/// Every fork is named rather than compared against, so a fork added after
+/// gloas has to say what its index means instead of inheriting gloas's
+/// answer.
+fn highest_attestation_index(fork: ForkName) -> Result<u64> {
+    match fork {
+        // A committee, and the one the query names: this client only ever
+        // asks about committee 0 (see `BeaconNodeApi::attestation_data`), so
+        // any other index is not an answer to its question.
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb => Ok(0),
+        // EIP-7549 moved the committee out of the signed data and left the
+        // field fixed at zero.
+        ForkName::Electra | ForkName::Fulu => Ok(0),
+        // The payload signal: 0 for a same-slot block or an empty one, 1 for
+        // a block whose payload was seen. Which of the two is right depends
+        // on the node's view of the block, which this client does not have,
+        // so only the range is checked.
+        ForkName::Gloas => Ok(1),
+        // Not a Beacon Chain fork: `Config::fork_at_epoch` never names it, so
+        // a caller that does is wrong, and nothing is signed for it.
+        ForkName::Lean => Err(crate::error::Error::InconsistentResponse(
+            "attestation data was asked for under the lean fork, which is not a Beacon Chain \
+             fork and has no attestation of this shape"
+                .to_string(),
+        )),
+    }
 }
 
 /// The chain's genesis, as the beacon node reports it.
@@ -338,6 +389,12 @@ pub trait BeaconNodeApi: Send + Sync {
     /// so a node answering about the wrong slot must never reach the signing
     /// path: a target from the future would raise the validator's watermark
     /// and cost it every attestation until the chain caught up.
+    ///
+    /// It must also reject an `index` that cannot be valid at `fork`: anything
+    /// but 0 before gloas, anything above 1 from it. Such a vote is rejected
+    /// by every peer, after slashing protection has spent the validator's one
+    /// vote for the epoch on it. [`validate_attestation_data`] is every one of
+    /// these checks.
     ///
     /// It matters that this is the *implementation's* job rather than the
     /// caller's, because of where failover sits.
@@ -609,21 +666,74 @@ mod tests {
     /// Slot 100 is in epoch 3 on the mainnet preset.
     #[test]
     fn attestation_data_with_a_source_at_or_past_its_target_is_refused() {
-        assert!(validate_attestation_data(100, &data(100, 2, 3)).is_ok());
-        assert!(validate_attestation_data(100, &data(100, 0, 3)).is_ok());
-        let err = validate_attestation_data(100, &data(100, 3, 3)).expect_err("source == target");
+        let fork = ForkName::Fulu;
+        assert!(validate_attestation_data(100, fork, &data(100, 2, 3)).is_ok());
+        assert!(validate_attestation_data(100, fork, &data(100, 0, 3)).is_ok());
+        let err =
+            validate_attestation_data(100, fork, &data(100, 3, 3)).expect_err("source == target");
         assert!(err.to_string().contains("source epoch 3"), "{err}");
-        assert!(validate_attestation_data(100, &data(100, 4, 3)).is_err());
+        assert!(validate_attestation_data(100, fork, &data(100, 4, 3)).is_err());
     }
 
     /// At genesis both checkpoints are epoch 0, and that is the one valid
     /// shape where the source does not precede the target.
     #[test]
     fn genesis_attestation_data_is_accepted() {
-        assert!(validate_attestation_data(0, &data(0, 0, 0)).is_ok());
+        let fork = ForkName::Phase0;
+        assert!(validate_attestation_data(0, fork, &data(0, 0, 0)).is_ok());
         assert!(
-            validate_attestation_data(0, &data(0, 1, 0)).is_err(),
+            validate_attestation_data(0, fork, &data(0, 1, 0)).is_err(),
             "a source past a genesis target is not the genesis shape"
         );
+    }
+
+    fn with_index(index: u64) -> AttestationData {
+        AttestationData {
+            index,
+            ..data(100, 2, 3)
+        }
+    }
+
+    /// Before gloas the index is zero: the committee this client asks about
+    /// up to deneb, and EIP-7549's fixed zero from electra. Anything else is
+    /// a vote no peer accepts.
+    #[test]
+    fn a_nonzero_index_is_refused_before_gloas() {
+        let before_gloas = ForkName::ALL
+            .iter()
+            .copied()
+            .filter(|fork| *fork < ForkName::Gloas);
+        for fork in before_gloas {
+            assert!(
+                validate_attestation_data(100, fork, &with_index(0)).is_ok(),
+                "{fork:?} takes index 0"
+            );
+            let err = validate_attestation_data(100, fork, &with_index(1))
+                .expect_err("an index of 1 before gloas");
+            assert!(
+                matches!(err, crate::error::Error::InconsistentResponse(_)),
+                "{fork:?}: failover must be able to move past it, got {err}"
+            );
+            assert!(err.to_string().contains("carries index 1"), "{err}");
+        }
+    }
+
+    /// From gloas the index is the payload signal, 0 or 1, and passes through
+    /// as the node gave it. Only a value outside that range is refused.
+    #[test]
+    fn a_gloas_index_is_zero_or_one() {
+        let fork = ForkName::Gloas;
+        assert!(validate_attestation_data(100, fork, &with_index(0)).is_ok());
+        assert!(validate_attestation_data(100, fork, &with_index(1)).is_ok());
+        let err = validate_attestation_data(100, fork, &with_index(2)).expect_err("an index of 2");
+        assert!(err.to_string().contains("at most 1"), "{err}");
+        assert!(validate_attestation_data(100, fork, &with_index(u64::MAX)).is_err());
+    }
+
+    /// Lean is not on the Beacon Chain's fork timeline, so no index is valid
+    /// for it and nothing is signed.
+    #[test]
+    fn the_lean_fork_has_no_valid_index() {
+        assert!(validate_attestation_data(100, ForkName::Lean, &with_index(0)).is_err());
     }
 }

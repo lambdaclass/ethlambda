@@ -589,7 +589,7 @@ impl BeaconNodeApi for HttpBeaconNode {
         // is what lets `FallbackBeaconNode` move to the next node; the same
         // check one layer up runs only after this node's answer was already
         // accepted.
-        validate_attestation_data(slot, &data)?;
+        validate_attestation_data(slot, fork, &data)?;
         Ok(data)
     }
 

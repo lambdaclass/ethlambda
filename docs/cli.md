@@ -311,8 +311,12 @@ advance so it can collect the votes.
 Each slot it wakes at the boundary. If one of its validators proposes that
 slot, it signs the RANDAO reveal, asks the beacon node for a block, checks that
 the block is for the slot and proposer it asked about, signs it and publishes
-it. One third into the slot it fetches the attestation data, signs for every
-validator due that slot, and submits the batch. Two thirds in, for any duty it
+it. One third into the slot it fetches the attestation data, checks that it is
+for the slot it asked about and that its `index` is one the slot's fork allows
+(0 before gloas, 0 or 1 from it, where it is the payload signal), signs for
+every validator due that slot, and submits the batch. A node whose answer fails
+either check is passed over for the next one in `--beacon-nodes`, before
+anything is recorded or signed. Two thirds in, for any duty it
 was selected to aggregate, it asks the node for the aggregate covering that
 committee's votes on the data it just signed, wraps it with the selection proof
 and publishes it.
