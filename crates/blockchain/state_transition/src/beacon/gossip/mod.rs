@@ -126,6 +126,9 @@ pub enum IgnoreReason {
     Overloaded,
     /// Validation panicked.
     Internal,
+    /// Validation did not finish within its deadline. The check may still be
+    /// running; its late result is dropped.
+    ValidationTimeout,
     /// The message's own fork is one this build does not validate or decode
     /// (currently gloas): not the sender's fault, and not malformed, so this
     /// is `Ignore` rather than `Reject`. A `Reject` down-scores the peer in
@@ -209,6 +212,7 @@ impl IgnoreReason {
             Self::NoConsumer => "no_consumer",
             Self::Overloaded => "overloaded",
             Self::Internal => "internal",
+            Self::ValidationTimeout => "validation_timeout",
             Self::UnsupportedFork => "unsupported_fork",
             Self::OutsideEpochWindow => "outside_epoch_window",
             Self::CoveredBits => "covered_bits",

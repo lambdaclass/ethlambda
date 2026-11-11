@@ -467,6 +467,19 @@ pub fn observe_beacon_gossip_verdict(
         .observe(elapsed.as_secs_f64());
 }
 
+/// Verdicts reported for `kind`, and how many of them were `(outcome, reason)`.
+#[cfg(test)]
+pub(crate) fn beacon_gossip_verdicts(kind: &str, outcome: &str, reason: &str) -> (u64, u64) {
+    (
+        LEAN_BEACON_GOSSIP_VALIDATION_SECONDS
+            .with_label_values(&[kind])
+            .get_sample_count(),
+        LEAN_BEACON_GOSSIP_VALIDATION_TOTAL
+            .with_label_values(&[kind, outcome, reason])
+            .get(),
+    )
+}
+
 /// Count one verdict gossipsub could no longer act on.
 pub fn inc_beacon_gossip_verdict_expired(kind: &str) {
     LEAN_BEACON_GOSSIP_VERDICT_EXPIRED_TOTAL

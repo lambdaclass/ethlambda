@@ -6407,4 +6407,169 @@ mod tests {
         };
         assert_eq!((gossip.slot, gossip.block), (4, root));
     }
+
+    // ---- Jobs owned by the chain actor (spawned 0.8) ----
+    //
+    // The block seal and the aggregation worker rely on three properties of
+    // a keyed `pipe_blocking_with` job, checked here on a running chain actor:
+    // a newer job under the same key fences everything the older one still
+    // has queued (its emits and its terminal message); an actor stop
+    // delivers nothing more; and a panic ends the job with one terminal
+    // message.
+
+    use spawned_concurrency::tasks::JobError;
+    use std::sync::Mutex;
+
+    type Log = Arc<Mutex<Vec<String>>>;
+
+    /// Run `f` in one of the chain actor's turns, to reach its `Context`.
+    struct InActor(Box<dyn FnOnce(&mut BlockChainServer, &Context<BlockChainServer>) + Send>);
+    impl Message for InActor {
+        type Result = ();
+    }
+    impl Handler<InActor> for BlockChainServer {
+        async fn handle(
+            &mut self,
+            msg: InActor,
+            _reply: PendingReply<'_, ()>,
+            ctx: &Context<Self>,
+        ) {
+            (msg.0)(self, ctx);
+        }
+    }
+
+    /// A job's emit or terminal message, logged when dispatched.
+    struct Logged(Log, String);
+    impl Message for Logged {
+        type Result = ();
+    }
+    impl Handler<Logged> for BlockChainServer {
+        async fn handle(
+            &mut self,
+            msg: Logged,
+            _reply: PendingReply<'_, ()>,
+            _ctx: &Context<Self>,
+        ) {
+            msg.0.lock().unwrap().push(msg.1);
+        }
+    }
+
+    /// Start a keyed blocking job named `name` that waits `before`, emits
+    /// one `Logged`, waits `after`, then (with `panic`) panics.
+    fn keyed_job(
+        log: &Log,
+        name: &'static str,
+        before: Duration,
+        after: Duration,
+        panic: bool,
+    ) -> InActor {
+        let (emit_log, done_log) = (log.clone(), log.clone());
+        InActor(Box::new(move |_, ctx| {
+            let opts = JobOptions {
+                key: Some(AGGREGATION_JOB),
+                ..JobOptions::default()
+            };
+            ctx.pipe_blocking_with(
+                opts,
+                move |job| {
+                    std::thread::sleep(before);
+                    let _ = job.emit_blocking(Logged(emit_log, format!("{name}: emit")));
+                    std::thread::sleep(after);
+                    assert!(!panic, "{name}: proof panicked");
+                },
+                move |outcome| {
+                    let what = match outcome {
+                        JobOutcome::Ok(()) => "done".to_string(),
+                        JobOutcome::Err(JobError::Panicked(m)) => format!("panicked ({m})"),
+                        JobOutcome::Err(err) => err.to_string(),
+                    };
+                    Logged(done_log, format!("{name}: {what}"))
+                },
+            )
+            .expect("the job starts");
+        }))
+    }
+
+    async fn settle_for(ms: u64) {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_newer_keyed_job_fences_everything_the_older_one_has_queued() {
+        let actor = beacon_server(beacon_store_at_slot_10()).start();
+        let log = Log::default();
+        // The first job emits at once, then keeps running; the second replaces
+        // it while the first's emit sits in the mailbox behind it (both starts
+        // are queued before the first runs), the case the session-id checks
+        // used to cover by hand.
+        actor
+            .send(keyed_job(
+                &log,
+                "old",
+                Duration::ZERO,
+                Duration::from_millis(200),
+                false,
+            ))
+            .unwrap();
+        actor
+            .send(keyed_job(
+                &log,
+                "new",
+                Duration::from_millis(50),
+                Duration::ZERO,
+                false,
+            ))
+            .unwrap();
+        settle_for(500).await;
+        let log = log.lock().unwrap().clone();
+        assert!(!log.iter().any(|entry| entry.starts_with("old")), "{log:?}");
+        assert_eq!(
+            log.iter()
+                .filter(|e| e.starts_with("new"))
+                .collect::<Vec<_>>(),
+            ["new: emit", "new: done"]
+        );
+        actor.child_handle().stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_during_a_job_delivers_none_of_its_messages() {
+        let actor = beacon_server(beacon_store_at_slot_10()).start();
+        let log = Log::default();
+        actor
+            .send(keyed_job(
+                &log,
+                "seal",
+                Duration::from_millis(150),
+                Duration::ZERO,
+                false,
+            ))
+            .unwrap();
+        settle_for(30).await;
+        actor.child_handle().stop();
+        actor.join().await;
+        settle_for(300).await;
+        assert_eq!(*log.lock().unwrap(), Vec::<String>::new());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicking_job_ends_with_one_terminal_message() {
+        let actor = beacon_server(beacon_store_at_slot_10()).start();
+        let log = Log::default();
+        actor
+            .send(keyed_job(
+                &log,
+                "proof",
+                Duration::ZERO,
+                Duration::ZERO,
+                true,
+            ))
+            .unwrap();
+        settle_for(300).await;
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["proof: emit", "proof: panicked (proof: proof panicked)"]
+        );
+        actor.child_handle().stop();
+    }
 }

@@ -2,19 +2,18 @@
 //!
 //! The rules live in `ethlambda_state_transition::beacon::gossip`; this module
 //! decides where each half runs and what happens to the result. Cheap checks
-//! run inline in the p2p actor. Stateful checks run on a `spawn_blocking`
-//! thread, bounded by one of three pools depending on the kind: a block or a
+//! run inline in the p2p actor. Stateful checks run off it as a job owned by
+//! the actor, bounded by one of three pools depending on the kind: a block or a
 //! column draws from [`P2PServer::gossip_validation_permits`], an aggregate or
 //! a subnet attestation from [`P2PServer::attestation_validation_permits`] (see
 //! that field's own documentation for why they must not share one), a sync
 //! committee message or contribution from
 //! [`P2PServer::sync_validation_permits`]. Either way
-//! the blocking task sends a [`GossipVerdict`] back to the actor. Every beacon
+//! the job delivers one [`GossipVerdict`] back to the actor. Every beacon
 //! gossip message ends in exactly one [`report`]: gossipsub holds each one
 //! until then.
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ethlambda_network_api::{AggregateArrival, BlockAnnouncement, BlockArrival, BlockSource};
 use ethlambda_state_transition::beacon::builder_market::SharedBuilderMarket;
@@ -37,7 +36,9 @@ use ethlambda_types::beacon::primitives::{Root, ValidatorIndex};
 use libp2p::PeerId;
 use libp2p::gossipsub::{MessageAcceptance, MessageId};
 use spawned_concurrency::message::Message;
-use spawned_concurrency::tasks::{Context, Handler, PendingReply};
+use spawned_concurrency::tasks::{
+    Context, Handler, JobError, JobOptions, JobOutcome, PendingReply,
+};
 use tracing::{debug, error, warn};
 
 use crate::beacon::{builder_market, column_checks};
@@ -522,11 +523,13 @@ pub(crate) enum Dispatch {
     Validate(Validated),
 }
 
-/// A blocking task's verdict, sent back to the p2p actor.
+/// A stateful check's job ended: the terminal message of the job
+/// [`spawn_stateful_checks`] starts, so it arrives exactly once per object,
+/// whether the check returned, panicked or overran
+/// [`STATEFUL_CHECK_DEADLINE`].
 pub(crate) struct GossipVerdict {
     id: GossipId,
-    outcome: Outcome,
-    object: Validated,
+    checked: JobOutcome<(Outcome, Validated)>,
 }
 
 impl Message for GossipVerdict {
@@ -553,14 +556,34 @@ impl Handler<GossipVerdict> for P2PServer {
         _reply: PendingReply<'_, ()>,
         _ctx: &Context<Self>,
     ) {
-        let GossipVerdict {
-            id,
-            outcome,
-            object,
-        } = msg;
-        let outcome = settle(self, outcome, &object);
+        let GossipVerdict { id, checked } = msg;
+        let (outcome, object) = match checked {
+            JobOutcome::Ok((outcome, object)) => (settle(self, outcome, &object), Some(object)),
+            // A panic inside validation (a `Store` read's `.expect()` on a DB
+            // error, say) must still produce a verdict, or gossipsub would hold
+            // the message until its cache evicts it.
+            JobOutcome::Err(JobError::Panicked(panic_message)) => {
+                error!(
+                    panic_message,
+                    "Beacon gossip validation panicked; reporting Ignore(Internal)"
+                );
+                (Outcome::Ignore(IgnoreReason::Internal), None)
+            }
+            // The check still runs, holding its permit; its result is dropped.
+            JobOutcome::Err(JobError::DeadlineExceeded) => {
+                warn!(
+                    kind = id.kind,
+                    deadline_secs = STATEFUL_CHECK_DEADLINE.as_secs(),
+                    "Beacon gossip validation overran its deadline; reporting Ignore"
+                );
+                (Outcome::Ignore(IgnoreReason::ValidationTimeout), None)
+            }
+        };
         let received_at = id.received_at;
-        if report(self, id, outcome) {
+        // Only an Accept or a Queue forwards, and both come with the object.
+        if report(self, id, outcome)
+            && let Some(object) = object
+        {
             object.forward(self, received_at, outcome);
         }
     }
@@ -623,8 +646,16 @@ fn permits_for<'a>(
     }
 }
 
-/// Run `object`'s stateful checks on a blocking thread. The verdict comes back
-/// to the actor as a [`GossipVerdict`].
+/// How long an object's stateful checks may run before it is reported
+/// `Ignore(ValidationTimeout)` anyway. One mainnet slot: a check that has not
+/// finished by then is hung, and gossipsub would otherwise hold its message
+/// until the cache evicts it.
+pub(crate) const STATEFUL_CHECK_DEADLINE: Duration = Duration::from_secs(12);
+
+/// Run `object`'s stateful checks off the actor, as a job owned by the p2p
+/// actor. The verdict comes back as one [`GossipVerdict`], also when the check
+/// panics or overruns [`STATEFUL_CHECK_DEADLINE`], and never after the actor
+/// began to stop (the job is cancelled with it).
 ///
 /// A block or a column draws its permit from
 /// [`P2PServer::gossip_validation_permits`]; an aggregate or a subnet
@@ -642,6 +673,12 @@ fn permits_for<'a>(
 /// fetch or range sync, both far slower than gossip. An aggregate or a subnet
 /// attestation is not forwarded on this outcome at all: see
 /// [`Validated::forward`]'s own documentation for why.
+///
+/// The check itself runs on Tokio's blocking pool, awaited by an async job
+/// (`pipe_with`), not as a native job (`pipe_blocking_with`): spawned 0.8 runs
+/// each native job on a freshly spawned OS thread, under a per-actor budget
+/// (`MAX_NATIVE_JOBS`, at most 4 by default) that `#[actor]` cannot raise,
+/// while these pools admit up to 352 checks at once.
 pub(crate) fn spawn_stateful_checks(
     server: &P2PServer,
     ctx: &Context<P2PServer>,
@@ -656,40 +693,55 @@ pub(crate) fn spawn_stateful_checks(
         return;
     };
     let store = server.store.clone();
-    let actor = ctx.actor_ref();
-    tokio::task::spawn_blocking(move || {
+    pipe_checks(server, ctx, id, STATEFUL_CHECK_DEADLINE, move || {
         let _permit = permit;
         let mut object = object;
-        let outcome = guarded(|| object.stateful_checks(&store));
-        let _ = actor
-            .send(GossipVerdict {
-                id,
-                outcome,
-                object,
-            })
-            .inspect_err(|_| warn!("P2P actor stopped before a gossip verdict arrived"));
+        let outcome = object.stateful_checks(&store);
+        (outcome, object)
     });
 }
 
-/// `checks()`, with a panic turned into `Ignore(Internal)`.
-///
-/// A panic inside validation (a `Store` read's `.expect()` on a DB error, say)
-/// must still produce a verdict, or gossipsub would hold the message until its
-/// cache evicts it. The blocking thread's permit is unaffected either way: it
-/// drops on unwind exactly as it would on a normal return.
-pub(crate) fn guarded(checks: impl FnOnce() -> Outcome) -> Outcome {
-    catch_unwind(AssertUnwindSafe(checks)).unwrap_or_else(|payload| {
-        let panic_message = payload
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-            .unwrap_or("<non-string panic payload>");
-        error!(
-            panic_message,
-            "Beacon gossip validation panicked; reporting Ignore(Internal)"
-        );
-        Outcome::Ignore(IgnoreReason::Internal)
-    })
+/// Run `checks` on Tokio's blocking pool as a job owned by the p2p actor,
+/// with a `deadline`, and deliver its one [`GossipVerdict`].
+fn pipe_checks(
+    server: &P2PServer,
+    ctx: &Context<P2PServer>,
+    id: GossipId,
+    deadline: Duration,
+    checks: impl FnOnce() -> (Outcome, Validated) + Send + 'static,
+) {
+    // `pipe_with` drops `work` and `done` when it cannot start the job; keep
+    // what the verdict for that case needs.
+    let fallback = GossipId {
+        message_id: id.message_id.clone(),
+        propagation_source: id.propagation_source,
+        received_at: id.received_at,
+        kind: id.kind,
+    };
+    let opts = JobOptions {
+        // `spawned_rt::time::Instant` is `std::time::Instant` outside simulation.
+        deadline: Some(Instant::now() + deadline),
+        ..JobOptions::default()
+    };
+    let work = async move {
+        match tokio::task::spawn_blocking(checks).await {
+            Ok(checked) => checked,
+            // Re-raise the check's panic so the job reports it as
+            // `JobError::Panicked`.
+            Err(err) => match err.try_into_panic() {
+                Ok(panic) => std::panic::resume_unwind(panic),
+                Err(err) => panic!("stateful checks did not finish: {err}"),
+            },
+        }
+    };
+    let started = ctx.pipe_with(opts, work, move |checked| GossipVerdict { id, checked });
+    if let Err(err) = started {
+        // Only when the actor is stopping (`OwnerStopping`), or at its 1024
+        // deferred credits, far above the 352 permits. The object went with
+        // the refused job, so it is not forwarded.
+        warn!(%err, "Could not start a gossip check");
+        report(server, fallback, Outcome::Ignore(IgnoreReason::Overloaded));
+    }
 }
 
 #[cfg(test)]
@@ -1525,15 +1577,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn a_panicking_check_is_ignored_rather_than_propagated() {
-        assert_eq!(
-            guarded(|| panic!("a DB read failed")),
-            Outcome::Ignore(IgnoreReason::Internal)
-        );
-        assert_eq!(guarded(|| Outcome::Accept), Outcome::Accept);
-    }
-
     /// The compressed BLS12-381 G2 generator: a signature that decodes and
     /// combines, standing in for a verified one where the test is about
     /// pooling and not about verification.
@@ -1765,5 +1808,109 @@ mod tests {
             attestation_before
         );
         drop(held);
+    }
+
+    // ---- The job that carries a stateful check (spawned 0.8 `pipe_with`) ----
+
+    /// Run `f` in one of the p2p actor's turns, to reach its `Context`.
+    struct InActor(Box<dyn FnOnce(&mut P2PServer, &Context<P2PServer>) + Send>);
+    impl Message for InActor {
+        type Result = ();
+    }
+    impl Handler<InActor> for P2PServer {
+        async fn handle(
+            &mut self,
+            msg: InActor,
+            _reply: PendingReply<'_, ()>,
+            ctx: &Context<Self>,
+        ) {
+            (msg.0)(self, ctx);
+        }
+    }
+
+    /// A gossip id under a metric `kind` of the test's own, so the global
+    /// verdict counters tell its verdicts apart from every other test's.
+    fn test_id(kind: &'static str) -> GossipId {
+        GossipId {
+            message_id: MessageId::new(kind.as_bytes()),
+            propagation_source: PeerId::random(),
+            received_at: Instant::now(),
+            kind,
+        }
+    }
+
+    /// Start `checks` on a running p2p actor under `kind`, with `deadline`.
+    async fn run_checks(
+        kind: &'static str,
+        deadline: Duration,
+        checks: impl FnOnce() -> (Outcome, Validated) + Send + 'static,
+    ) -> spawned_concurrency::tasks::ActorRef<P2PServer> {
+        use spawned_concurrency::tasks::ActorStart as _;
+        let server = unconnected_beacon_server(Config::mainnet(), 0)
+            .await
+            .start();
+        server
+            .send(InActor(Box::new(move |server, ctx| {
+                pipe_checks(server, ctx, test_id(kind), deadline, checks)
+            })))
+            .expect("the p2p actor runs");
+        server
+    }
+
+    /// Wait (up to 5 s) until `kind` has at least `n` verdicts.
+    async fn verdicts_reach(kind: &'static str, n: u64) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while metrics::beacon_gossip_verdicts(kind, "", "").0 < n {
+            assert!(Instant::now() < deadline, "{kind}: fewer than {n} verdicts");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicking_check_still_yields_exactly_one_verdict() {
+        const KIND: &str = "test_panicking_check";
+        let server = run_checks(KIND, Duration::from_secs(5), || panic!("a DB read failed")).await;
+        verdicts_reach(KIND, 1).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            metrics::beacon_gossip_verdicts(KIND, "ignore", "internal"),
+            (1, 1)
+        );
+        server.child_handle().stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hung_check_is_reported_at_its_deadline_and_its_late_result_dropped() {
+        const KIND: &str = "test_hung_check";
+        let server = run_checks(KIND, Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_millis(500));
+            (Outcome::Accept, sync_message_object(5, 11, 1, vec![(1, 0)]))
+        })
+        .await;
+        verdicts_reach(KIND, 1).await;
+        assert_eq!(
+            metrics::beacon_gossip_verdicts(KIND, "ignore", "validation_timeout"),
+            (1, 1)
+        );
+        // The check returns Accept long after: no second verdict.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(metrics::beacon_gossip_verdicts(KIND, "", "").0, 1);
+        server.child_handle().stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_verdict_reaches_an_actor_that_stopped_during_the_check() {
+        const KIND: &str = "test_check_during_stop";
+        let server = run_checks(KIND, Duration::from_secs(5), || {
+            std::thread::sleep(Duration::from_millis(300));
+            (Outcome::Accept, sync_message_object(5, 11, 1, vec![(1, 0)]))
+        })
+        .await;
+        // Let the job start, then stop the actor while the check still runs.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        server.child_handle().stop();
+        server.join().await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(metrics::beacon_gossip_verdicts(KIND, "", "").0, 0);
     }
 }
