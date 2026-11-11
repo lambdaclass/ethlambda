@@ -147,7 +147,9 @@ fn inclusion_list_duties(
         })
     };
 
-    if config.fork_at_epoch(epoch) != ForkName::Heze {
+    // EIP-8453 keeps heze's inclusion lists, over its own committee draw
+    // (`get_inclusion_list_committee` dispatches on the state's fork).
+    if config.fork_at_epoch(epoch) < ForkName::Heze {
         return Ok(respond(Vec::new()));
     }
     if epoch + 1 < state_epoch {
@@ -158,7 +160,12 @@ fn inclusion_list_duties(
 
     // A state answers committees for its own epoch, the one before and the
     // next one; anything later is reached by advancing a copy of the head.
-    let state: Arc<BeaconState> = if epoch <= state_epoch + preset::MIN_SEED_LOOKAHEAD {
+    // A heze head answering for an EIP-8453 epoch is advanced across the
+    // fork too: the committee draw changes there and follows the state's fork.
+    let same_draw = matches!(*head_state, BeaconState::Eip8453(_))
+        == (config.fork_at_epoch(epoch) >= ForkName::Eip8453);
+    let state: Arc<BeaconState> = if epoch <= state_epoch + preset::MIN_SEED_LOOKAHEAD && same_draw
+    {
         head_state
     } else {
         let mut advanced = (*head_state).clone();
@@ -217,7 +224,7 @@ async fn get_inclusion_list(
     if store
         .config()
         .fork_at_epoch(compute_epoch_at_slot(query.slot))
-        != ForkName::Heze
+        < ForkName::Heze
     {
         return ApiError::BadRequest("the slot is not a heze slot").into_response();
     }
@@ -270,9 +277,13 @@ async fn post_inclusion_list(
     body: Bytes,
 ) -> Response {
     if let Some(value) = headers.get("eth-consensus-version")
-        && value.to_str().ok().and_then(ForkName::parse) != Some(ForkName::Heze)
+        && !matches!(
+            value.to_str().ok().and_then(ForkName::parse),
+            Some(ForkName::Heze | ForkName::Eip8453)
+        )
     {
-        return ApiError::BadRequest("Eth-Consensus-Version must name heze").into_response();
+        return ApiError::BadRequest("Eth-Consensus-Version must name heze or eip8453")
+            .into_response();
     }
     let signed = match serde_json::from_slice::<PublishBody>(&body) {
         Ok(PublishBody::Wrapped { data }) | Ok(PublishBody::Bare(data)) => data,

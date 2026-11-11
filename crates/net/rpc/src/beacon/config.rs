@@ -212,6 +212,16 @@ fn extra_entries() -> impl Iterator<Item = (&'static str, String)> {
         MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD,
         MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD,
         MAX_BUILDERS_PER_WITHDRAWALS_SWEEP,
+        // EIP-8453, in the order of the specification's `presets/*/eip8453.yaml`.
+        PENDING_FINALITY_WINDOW,
+        SLOTS_PER_ROUND,
+        ATTESTATION_COMMITTEES_PER_ROUND,
+        MAX_VALIDATORS_PER_AGGREGATE,
+        HEAD_VOTE_COMMITTEE_SIZE,
+        ROUND_REWARD_FACTOR,
+        MIN_ROUNDS_TO_INACTIVITY_LEAK,
+        EJECTION_INACTIVITY_SCORE,
+        MAX_HEAD_VOTES,
     );
 
     let domains = entries!(hex_string; constants:
@@ -231,6 +241,9 @@ fn extra_entries() -> impl Iterator<Item = (&'static str, String)> {
         DOMAIN_PTC_ATTESTER,
         DOMAIN_PROPOSER_PREFERENCES,
         DOMAIN_BUILDER_DEPOSIT,
+        DOMAIN_HEAD_VOTE,
+        DOMAIN_HEAD_VOTE_COMMITTEE,
+        DOMAIN_FINALITY_ATTESTER,
     );
 
     // One-byte constants (withdrawal prefixes and execution request types), so
@@ -261,13 +274,21 @@ fn extra_entries() -> impl Iterator<Item = (&'static str, String)> {
         BUILDER_PAYMENT_THRESHOLD_NUMERATOR,
         BUILDER_PAYMENT_THRESHOLD_DENOMINATOR,
         PAYLOAD_BUILDER_VERSION,
+        PROGRESS_FLAG_INDEX,
+        FINALITY_FLAG_INDEX,
+        PROGRESS_WEIGHT,
+        FINALITY_WEIGHT,
     );
+    // `TIMEOUT_DELAY_SLOTS` is a constant of EIP-8453's specification whose
+    // value is the preset's `SLOTS_PER_ROUND`, so it lives with the preset.
+    let preset_derived = entries!(decimal; preset: TIMEOUT_DELAY_SLOTS);
 
     preset
         .into_iter()
         .chain(domains)
         .chain(one_byte_constants)
         .chain(other_constants)
+        .chain(preset_derived)
 }
 
 /// A quoted decimal, the Beacon API's encoding for every integer.
@@ -602,6 +623,26 @@ mod tests {
         assert_eq!(data["HEAD_VOTE_DUE_BPS"], "2000");
         assert_eq!(data["SUPPORT_CUTOFF_BPS"], "5000");
         assert_eq!(data["VIEW_FREEZE_BPS"], "7500");
+        // The preset and the constants a validator client signs and
+        // schedules with.
+        assert_eq!(data["SLOTS_PER_ROUND"], preset::SLOTS_PER_ROUND.to_string());
+        assert_eq!(
+            data["ATTESTATION_COMMITTEES_PER_ROUND"],
+            preset::ATTESTATION_COMMITTEES_PER_ROUND.to_string()
+        );
+        assert_eq!(
+            data["HEAD_VOTE_COMMITTEE_SIZE"],
+            preset::HEAD_VOTE_COMMITTEE_SIZE.to_string()
+        );
+        assert_eq!(data["MAX_HEAD_VOTES"], preset::MAX_HEAD_VOTES.to_string());
+        assert_eq!(
+            data["TIMEOUT_DELAY_SLOTS"],
+            preset::SLOTS_PER_ROUND.to_string()
+        );
+        assert_eq!(data["DOMAIN_HEAD_VOTE"], "0x12000000");
+        assert_eq!(data["DOMAIN_HEAD_VOTE_COMMITTEE"], "0x13000000");
+        assert_eq!(data["DOMAIN_FINALITY_ATTESTER"], "0x14000000");
+        assert_eq!(data["PROGRESS_WEIGHT"], "40");
     }
 
     #[test]

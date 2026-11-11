@@ -752,6 +752,47 @@ fn attestation_committees_partition_the_active_set_in_rotated_index_order() {
 }
 
 #[test]
+fn committee_assignments_name_each_wanted_validators_one_committee() {
+    let count = 2 * preset::ATTESTATION_COMMITTEES_PER_ROUND + 3;
+    let mut state = state(count);
+    state.validator_mut(4).unwrap().activation_epoch = constants::FAR_FUTURE_EPOCH;
+    let wanted = [0u64, 4, 7, count as u64 + 5];
+    for epoch in [1, 2] {
+        let assignments =
+            get_attestation_committee_assignments(&state, epoch, |v| wanted.contains(&v)).unwrap();
+        // Inactive and absent validators have none.
+        assert_eq!(assignments.keys().copied().collect::<Vec<_>>(), vec![0, 7]);
+        for (&validator, assignment) in &assignments {
+            let committee =
+                get_attestation_committee(&state, epoch, assignment.committee_index).unwrap();
+            assert_eq!(assignment.committee_length, committee.len() as u64);
+            assert_eq!(committee[assignment.position as usize], validator);
+        }
+    }
+}
+
+#[test]
+fn a_committee_attests_once_per_round_of_the_epoch() {
+    let rounds_per_epoch = preset::SLOTS_PER_EPOCH / preset::SLOTS_PER_ROUND;
+    let per_slot = preset::ATTESTATION_COMMITTEES_PER_ROUND as u64 / preset::SLOTS_PER_ROUND;
+    for epoch in [0, 3] {
+        let last = preset::ATTESTATION_COMMITTEES_PER_ROUND as u64 - 1;
+        for committee_index in [0, per_slot - 1, per_slot, last] {
+            let slots = attestation_committee_slots(epoch, committee_index).unwrap();
+            assert_eq!(slots.len() as u64, rounds_per_epoch);
+            for &slot in &slots {
+                assert_eq!(compute_epoch_at_slot(slot), epoch);
+                let round = compute_round_at_slot(slot);
+                assert_eq!(
+                    compute_attestation_committee_slot(round, committee_index).unwrap(),
+                    slot
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn aggregate_participants_follow_the_concatenated_committees() {
     let state = state(40);
     let epoch = get_current_epoch(&state);

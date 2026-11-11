@@ -19,6 +19,7 @@ use ethlambda_types::{
     beacon::{
         constants::FAR_FUTURE_EPOCH,
         containers::{BeaconState, shared::Validator},
+        fork::ForkName,
         primitives::{BlsPubkey, Epoch, Gwei, ValidatorIndex},
         signing::compute_epoch_at_slot,
     },
@@ -137,8 +138,22 @@ async fn get_finality_checkpoints(
     // at all: the store keeps one justified row and one finalized row.
     //
     // An EIP-8453 state has no Casper FFG checkpoints; its finality gadget
-    // keeps height checkpoints instead.
-    // TODO(eip8453): serve the finality gadget's checkpoints.
+    // keeps height checkpoints instead, served in their own shape.
+    if let BeaconState::Eip8453(inner) = state.as_ref() {
+        let response = crate::json_response(serde_json::json!({
+            "version": ForkName::Eip8453.as_str(),
+            "execution_optimistic": crate::shared::optimistic::block_is_optimistic(&store, root),
+            "finalized": is_finalized(&store, state.slot()),
+            "data": {
+                "target": inner.target_checkpoint,
+                "target_slot": inner.target_slot.to_string(),
+                "current_justified": inner.justified_checkpoint,
+                "finalized": inner.finalized_checkpoint,
+                "finalized_slot": inner.finalized_slot.to_string(),
+            }
+        }));
+        return with_consensus_version(response, ForkName::Eip8453);
+    }
     let (Ok(previous_justified), Ok(current_justified), Ok(finalized)) = (
         state.previous_justified_checkpoint(),
         state.current_justified_checkpoint(),

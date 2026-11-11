@@ -53,8 +53,10 @@ use tracing::{debug, warn};
 
 use crate::beacon::{
     ApiError, decode_list,
+    eip8453::{self, NodeClock},
     validator::{head, require_execution_client, require_validated},
 };
+use ethlambda_state_transition::beacon::eip8453_node::SharedEip8453Node;
 
 pub(crate) fn routes() -> Router<Store> {
     Router::new()
@@ -91,6 +93,8 @@ pub(crate) struct Failure {
 async fn post_pool_attestations(
     State(store): State<Store>,
     Extension(p2p): Extension<RpcToP2PRef>,
+    node: Option<Extension<SharedEip8453Node>>,
+    clock: Option<Extension<NodeClock>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -98,6 +102,13 @@ async fn post_pool_attestations(
         Ok(fork) => fork,
         Err(err) => return err.into_response(),
     };
+    // EIP-8453's single attestation is another container, judged by its own
+    // gossip rules and pooled in the fork choice node.
+    if header_fork == ForkName::Eip8453 {
+        let node = node.map(|Extension(node)| node);
+        let now = eip8453::now_ms(clock.as_ref());
+        return eip8453::post_fg_attestations(store, node, p2p, now, &headers, &body).await;
+    }
     let attestations = match decode_list::<SingleAttestation>(&headers, &body) {
         Ok(attestations) => attestations,
         Err(err) => return err.into_response(),
@@ -290,9 +301,13 @@ fn submission_fork(headers: &HeaderMap) -> Result<ForkName, ApiError> {
         .and_then(|value| value.to_str().ok())
         .and_then(ForkName::parse);
     match fork {
-        Some(fork @ (ForkName::Electra | ForkName::Fulu | ForkName::Gloas | ForkName::Heze)) => {
-            Ok(fork)
-        }
+        Some(
+            fork @ (ForkName::Electra
+            | ForkName::Fulu
+            | ForkName::Gloas
+            | ForkName::Heze
+            | ForkName::Eip8453),
+        ) => Ok(fork),
         // `ForkName::parse` never returns Lean: it is absent from `ALL`.
         Some(
             ForkName::Phase0
@@ -300,12 +315,10 @@ fn submission_fork(headers: &HeaderMap) -> Result<ForkName, ApiError> {
             | ForkName::Bellatrix
             | ForkName::Capella
             | ForkName::Deneb
-            // TODO(eip8453): accept EIP-8453's attestations.
-            | ForkName::Eip8453
             | ForkName::Lean,
         )
         | None => Err(ApiError::BadRequest(
-            "Eth-Consensus-Version must name electra, fulu or gloas",
+            "Eth-Consensus-Version must name electra, fulu, gloas, heze or eip8453",
         )),
     }
 }
@@ -314,11 +327,13 @@ fn submission_fork(headers: &HeaderMap) -> Result<ForkName, ApiError> {
 /// the gloas header, and electra's and fulu's, whose containers are the same,
 /// accept either of theirs.
 fn header_matches_slot(store: &Store, header: ForkName, slot: Slot) -> bool {
-    let slot_is_gloas = store
-        .config()
-        .fork_at_epoch(compute_epoch_at_slot(slot))
-        .is_gloas_or_later();
-    slot_is_gloas == header.is_gloas_or_later()
+    let slot_fork = store.config().fork_at_epoch(compute_epoch_at_slot(slot));
+    // An EIP-8453 slot has no attestation of this shape at all: its own are
+    // routed to `eip8453::post_fg_attestations` by their header.
+    if slot_fork >= ForkName::Eip8453 {
+        return false;
+    }
+    slot_fork.is_gloas_or_later() == header.is_gloas_or_later()
 }
 
 /// `200` when nothing failed, else the Beacon API's `IndexedErrorMessage`

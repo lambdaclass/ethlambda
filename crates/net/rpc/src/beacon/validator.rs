@@ -23,6 +23,7 @@ use ethlambda_types::{
             BeaconState,
             shared::{AttestationData, Checkpoint},
         },
+        fork::ForkName,
         fork_choice::PayloadStatus,
         preset,
         primitives::{BlsPubkey, CommitteeIndex, Epoch, ExecutionAddress, Slot, ValidatorIndex},
@@ -354,7 +355,7 @@ async fn post_prepare_beacon_proposer(
     axum::http::StatusCode::OK.into_response()
 }
 
-fn parse_epoch(epoch: &str) -> Result<Epoch, ApiError> {
+pub(crate) fn parse_epoch(epoch: &str) -> Result<Epoch, ApiError> {
     epoch
         .parse()
         .map_err(|_| ApiError::BadRequest("invalid epoch"))
@@ -428,7 +429,7 @@ pub(crate) fn epoch_upper_bound(store: &Store, head_epoch: Epoch) -> Epoch {
 ///
 /// Runs `process_slots` on a miss, which is seconds on a mainnet registry, so
 /// callers run on a blocking thread.
-fn state_for_epoch(
+pub(crate) fn state_for_epoch(
     store: &Store,
     head_root: H256,
     epoch: Epoch,
@@ -442,7 +443,7 @@ fn state_for_epoch(
 }
 
 /// Turns a duties computation run on a blocking thread into a response.
-fn duties_response(
+pub(crate) fn duties_response(
     computed: Result<Result<serde_json::Value, ApiError>, tokio::task::JoinError>,
 ) -> Response {
     match computed {
@@ -464,7 +465,7 @@ fn duties_response(
 /// a guess: a wrong `dependent_root` would let a validator client keep duties
 /// a reorg has invalidated. A duty's dependent slot is at most two epochs back,
 /// far inside the window, so this should never fire.
-fn block_root_at_or_before(
+pub(crate) fn block_root_at_or_before(
     head_state: &BeaconState,
     head_root: H256,
     slot: Slot,
@@ -582,6 +583,9 @@ fn proposer_duties(
         BeaconState::Fulu(fulu) => &fulu.proposer_lookahead,
         BeaconState::Gloas(gloas) => &gloas.proposer_lookahead,
         BeaconState::Heze(heze) => &heze.proposer_lookahead,
+        // EIP-8453 keeps the lookahead and `get_beacon_proposer_index` as
+        // heze has them.
+        BeaconState::Eip8453(eip8453) => &eip8453.proposer_lookahead,
         _ => {
             return Err(ApiError::BadRequest(
                 "proposer duties are served from the proposer lookahead of fulu and gloas only",
@@ -680,6 +684,14 @@ fn attester_duties(
         .map(|index| index.parse::<ValidatorIndex>())
         .collect::<Result<std::collections::HashSet<_>, _>>()
         .map_err(|_| ApiError::BadRequest("invalid validator index"))?;
+    // EIP-8453 replaces the beacon committees with attestation committees
+    // that attest once a round, served by their own endpoint.
+    if store.config().fork_at_epoch(epoch) >= ForkName::Eip8453 {
+        return Err(ApiError::BadRequest(
+            "an EIP-8453 epoch has no beacon committees: ask \
+             /eth/v1/validator/duties/attestation_committee/{epoch}",
+        ));
+    }
     let (head_root, head_state) = head(store)?;
 
     let head_epoch = compute_epoch_at_slot(head_state.slot());
@@ -786,6 +798,14 @@ async fn get_attestation_data(
 }
 
 fn attestation_data(store: &Store, slot: Slot) -> Result<AttestationData, ApiError> {
+    // EIP-8453 splits the attestation into a head vote and an FG attestation,
+    // each with its own endpoint (`eip8453.rs`).
+    if store.config().fork_at_epoch(compute_epoch_at_slot(slot)) >= ForkName::Eip8453 {
+        return Err(ApiError::BadRequest(
+            "an EIP-8453 slot has no attestation data: ask /eth/v1/validator/head_vote_data \
+             and /eth/v1/validator/finality_attestation_input",
+        ));
+    }
     let (head_root, state) = head(store)?;
     if slot < state.slot() {
         return Err(ApiError::BadRequest("slot is before the head block"));
@@ -808,7 +828,6 @@ fn attestation_data(store: &Store, slot: Slot) -> Result<AttestationData, ApiErr
             .map_err(|_| ApiError::Internal("advancing the head state failed"))?
             .current_justified_checkpoint()
     }
-    // TODO(eip8453): EIP-8453 attestation data is the finality gadget's.
     .map_err(|_| ApiError::BadRequest("the head state has no Casper FFG checkpoints"))?;
     let target = Checkpoint {
         epoch,

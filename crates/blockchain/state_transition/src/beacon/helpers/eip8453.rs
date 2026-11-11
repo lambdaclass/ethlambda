@@ -579,6 +579,71 @@ pub fn get_attestation_committee(
     Ok(attestation_committee_from(&active, epoch, index)?.into())
 }
 
+/// One validator's attestation committee for an epoch (validator.md's
+/// `get_attestation_committee_assignment`), with what a duty needs beside the
+/// index: the committee's size and the validator's position in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttestationCommitteeAssignment {
+    pub committee_index: crate::beacon::primitives::CommitteeIndex,
+    pub committee_length: u64,
+    pub position: u64,
+}
+
+/// `get_attestation_committee_assignment(state, epoch, v)` for every `v` that
+/// `wanted` accepts, in one pass over the epoch's active set instead of one
+/// committee walk per validator and committee index (2,048 of them). A
+/// validator that is not active in `epoch` has no entry; every active one sits
+/// on exactly one committee.
+pub fn get_attestation_committee_assignments(
+    state: &BeaconState,
+    epoch: Epoch,
+    wanted: impl Fn(ValidatorIndex) -> bool,
+) -> Result<std::collections::BTreeMap<ValidatorIndex, AttestationCommitteeAssignment>> {
+    let active = get_active_validator_indices(state, epoch);
+    let mut assignments = std::collections::BTreeMap::new();
+    if active.is_empty() {
+        return Ok(assignments);
+    }
+    for committee_index in 0..preset::ATTESTATION_COMMITTEES_PER_ROUND as u64 {
+        let committee = attestation_committee_from(&active, epoch, committee_index)?;
+        for (position, &validator_index) in committee.iter().enumerate() {
+            if wanted(validator_index) {
+                assignments.insert(
+                    validator_index,
+                    AttestationCommitteeAssignment {
+                        committee_index,
+                        committee_length: committee.len() as u64,
+                        position: position as u64,
+                    },
+                );
+            }
+        }
+    }
+    Ok(assignments)
+}
+
+/// The slots of `epoch` in which the committee at `committee_index` attests:
+/// `compute_attestation_committee_slot(round, committee_index)` for every
+/// round with a slot in `epoch`, keeping the slots that fall in it
+/// (validator.md: "in each round, it attests in the slot
+/// `compute_attestation_committee_slot(round, committee_index)`, using the
+/// committee of that slot's epoch").
+pub fn attestation_committee_slots(
+    epoch: Epoch,
+    committee_index: crate::beacon::primitives::CommitteeIndex,
+) -> Result<Vec<Slot>> {
+    let start = compute_start_slot_at_epoch(epoch);
+    let end = start + preset::SLOTS_PER_EPOCH;
+    let mut slots = Vec::new();
+    for round in compute_round_at_slot(start)..=compute_round_at_slot(end - 1) {
+        let slot = compute_attestation_committee_slot(round, committee_index)?;
+        if (start..end).contains(&slot) {
+            slots.push(slot);
+        }
+    }
+    Ok(slots)
+}
+
 /// `get_aggregate_participants`: the validators marked in
 /// `aggregate.aggregation_bits`, which concatenates the attestation committees
 /// its `committee_bits` names for `epoch`. A bit past the end of

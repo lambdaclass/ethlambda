@@ -25,21 +25,21 @@ use crate::beacon::preset;
 use crate::beacon::primitives::{Epoch, HashTreeRoot as _, Root, Slot, ValidatorIndex};
 
 /// Genesis time of the scene's network, in seconds.
-pub(crate) const GENESIS_TIME: u64 = 1_000;
+pub const GENESIS_TIME: u64 = 1_000;
 
 /// An anchored EIP-8453 store and its fork choice node.
-pub(crate) struct Scene {
-    pub(crate) store: Store,
-    pub(crate) node: SharedEip8453Node,
-    pub(crate) config: Config,
-    pub(crate) anchor_root: Root,
-    pub(crate) anchor_slot: Slot,
-    pub(crate) state: Arc<BeaconState>,
+pub struct Scene {
+    pub store: Store,
+    pub node: SharedEip8453Node,
+    pub config: Config,
+    pub anchor_root: Root,
+    pub anchor_slot: Slot,
+    pub state: Arc<BeaconState>,
 }
 
 /// The fork schedule the scene runs: gloas and heze at genesis, EIP-8453 at
 /// epoch 1, the scene's anchor epoch.
-pub(crate) fn config() -> Config {
+pub fn config() -> Config {
     let mut config = Config::active()
         .with_fork_epoch(ForkName::Altair, 0)
         .with_fork_epoch(ForkName::Bellatrix, 0)
@@ -56,7 +56,7 @@ pub(crate) fn config() -> Config {
 
 /// A store anchored at an EIP-8453 block at the first slot of epoch 1, over
 /// `validators` validators with real keys, and the node anchored with it.
-pub(crate) fn scene(validators: usize) -> Scene {
+pub fn scene(validators: usize) -> Scene {
     let config = config();
     let mut state = test_state::with_signing_validators_at(ForkName::Eip8453, validators);
     *state.genesis_time_mut() = GENESIS_TIME;
@@ -116,20 +116,20 @@ pub(crate) fn scene(validators: usize) -> Scene {
 
 impl Scene {
     /// Unix milliseconds `offset_ms` into `slot`.
-    pub(crate) fn at(&self, slot: Slot, offset_ms: u64) -> u64 {
+    pub fn at(&self, slot: Slot, offset_ms: u64) -> u64 {
         self.config
             .time_at_slot_ms(self.config.genesis_time_ms(), slot)
             + offset_ms
     }
 
     /// The head vote committee of `slot` in the anchor state.
-    pub(crate) fn committee(&self, slot: Slot) -> Vec<ValidatorIndex> {
+    pub fn committee(&self, slot: Slot) -> Vec<ValidatorIndex> {
         crate::beacon::eip8453_fork_choice::head_vote_committee(&self.state, slot, &self.config)
             .expect("the anchor state answers its own epoch")
     }
 
     /// `validator`'s signed head vote for `data`.
-    pub(crate) fn head_vote(
+    pub fn head_vote(
         &self,
         validator: ValidatorIndex,
         data: eip8453::HeadVoteData,
@@ -149,7 +149,7 @@ impl Scene {
 
     /// A non-empty attestation committee whose slot is `slot`, and its
     /// members: `(committee_index, members)`.
-    pub(crate) fn attestation_committee_at(&self, slot: Slot) -> (u64, Vec<ValidatorIndex>) {
+    pub fn attestation_committee_at(&self, slot: Slot) -> (u64, Vec<ValidatorIndex>) {
         let round = compute_round_at_slot(slot);
         let epoch = compute_epoch_at_slot(slot);
         (0..preset::ATTESTATION_COMMITTEES_PER_ROUND as u64)
@@ -170,7 +170,7 @@ impl Scene {
     /// A signed EIP-8453 block at `slot` on the anchor, on its EMPTY branch,
     /// carrying `head_votes` and `head_vote_support` (applied as given, so a
     /// test may pass a malformed body; the state root then stays zero).
-    pub(crate) fn child_block(
+    pub fn child_block(
         &self,
         slot: Slot,
         head_votes: Vec<eip8453::HeadVote>,
@@ -237,7 +237,7 @@ impl Scene {
 
     /// `attester`'s signed single attestation of `data` for committee
     /// `committee_index` of `epoch`.
-    pub(crate) fn attestation(
+    pub fn attestation(
         &self,
         attester: ValidatorIndex,
         committee_index: u64,

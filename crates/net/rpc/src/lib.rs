@@ -256,6 +256,8 @@ pub struct BeaconApiHandles {
     pub eip8453: ethlambda_state_transition::beacon::eip8453_node::SharedEip8453Node,
 }
 
+pub use beacon::eip8453::NodeClock;
+
 /// Start the HTTP servers for a beacon node.
 ///
 /// The beacon counterpart to [`start_rpc_server`]. It takes no
@@ -526,6 +528,16 @@ pub(crate) mod test_utils {
         >,
         /// `(subnet id, until epoch)` pairs asked for.
         pub(crate) sync_subscriptions: std::sync::Mutex<Vec<(u64, u64)>>,
+        /// EIP-8453 head votes published.
+        pub(crate) head_votes:
+            std::sync::Mutex<Vec<ethlambda_types::beacon::containers::eip8453::HeadVoteMessage>>,
+        /// `(subnet id, attestation)` per EIP-8453 FG attestation published.
+        pub(crate) fg_attestations: std::sync::Mutex<
+            Vec<(
+                u64,
+                ethlambda_types::beacon::containers::eip8453::SingleAttestation,
+            )>,
+        >,
     }
 
     impl ethlambda_network_api::RpcToP2P for RecordingNetwork {
@@ -630,16 +642,21 @@ pub(crate) mod test_utils {
 
         fn publish_head_vote(
             &self,
-            _message: ethlambda_types::beacon::containers::eip8453::HeadVoteMessage,
+            message: ethlambda_types::beacon::containers::eip8453::HeadVoteMessage,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.head_votes.lock().unwrap().push(message);
             Ok(())
         }
 
         fn publish_fg_attestation(
             &self,
-            _subnet_id: u64,
-            _attestation: ethlambda_types::beacon::containers::eip8453::SingleAttestation,
+            subnet_id: u64,
+            attestation: ethlambda_types::beacon::containers::eip8453::SingleAttestation,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.fg_attestations
+                .lock()
+                .unwrap()
+                .push((subnet_id, attestation));
             Ok(())
         }
 

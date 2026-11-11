@@ -21,6 +21,7 @@ pub(crate) mod blocks;
 pub(crate) mod builder_config;
 pub(crate) mod builders;
 pub(crate) mod config;
+pub(crate) mod eip8453;
 pub(crate) mod envelopes;
 pub(crate) mod events;
 pub(crate) mod genesis;
@@ -191,6 +192,7 @@ pub(crate) fn routes(version: &'static str, peer_id: String) -> Router<Store> {
         .merge(config::routes())
         .merge(node::routes(version, peer_id))
         .merge(validator::routes())
+        .merge(eip8453::routes())
         .merge(pool::routes())
         .merge(operations::routes())
         .merge(proposal::routes())
