@@ -208,6 +208,25 @@ mod tests {
         }
     }
 
+    /// The edges the proptest above does not reach: a limit that is not a
+    /// power of two (both sides round it up), a limit equal to the chunk
+    /// count, a limit of zero, and the registry's `1 << 40`, whose virtual
+    /// padding is a 40-level tail of zero hashes.
+    #[test]
+    fn merkleize_matches_libssz_at_edge_limits() {
+        for len in [0usize, 1, 2, 3, 4, 5, 255, 256, 257, 511, 512, 513, 1025] {
+            let chunks = nodes(len as u64 + 17, len);
+            let pow2 = len.max(1).next_power_of_two();
+            for limit in [len, len + 1, pow2, pow2 + pow2 / 2 + 1, 1 << 40] {
+                assert_eq!(
+                    merkleize(&chunks, limit),
+                    libssz_merkleize(&Sha2Hasher, &chunks, Some(limit)),
+                    "len {len}, limit {limit}"
+                );
+            }
+        }
+    }
+
     /// Validator-sized composite: public key, credentials and four more words.
     #[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
     struct Validator {
