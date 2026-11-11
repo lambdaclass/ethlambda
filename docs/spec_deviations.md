@@ -851,7 +851,12 @@ node computes the same value another way.
   its gossip verdict settles (p2p) or when it is submitted (Beacon API); the
   chain actor writes the head the store and the execution client see at its
   quarter-slot ticks and after each import. Validator duties read the engine
-  directly.
+  directly. Every entry point advances the engine to its own time first, so
+  the engine's ticks (`unlock`, `update_confirmation`, pruning) run on
+  whichever thread reaches a tick first: the chain actor, the p2p actor
+  settling a verdict, or a Beacon API handler. The node's mutex serializes
+  them, and no caller holds a storage lock while taking it (the order is
+  always node, then storage).
 - **Why:** a vote of the current slot moves `get_head` only from the support
   cutoff, which is a tick; votes arriving later move it within `Δ`. Taking
   the head on every vote would write the store and call

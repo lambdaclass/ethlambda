@@ -2248,7 +2248,8 @@ pub(crate) fn blocks_by_head(store: &Store, root: H256, count: u64) -> Vec<Signe
             Ok(Some(SignedBeaconBlock::Lean(_))) | Ok(None) | Err(_) => break,
             Ok(Some(block)) => {
                 let parent = block.parent_root();
-                // The anchor's parent is not held; neither is genesis's.
+                // Genesis has no parent. A checkpoint anchor's parent is not
+                // held either, which the next lookup's `None` ends on.
                 let at_anchor = block.slot() == 0 || parent.is_zero();
                 blocks.push(block);
                 if at_anchor {
