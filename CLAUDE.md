@@ -855,8 +855,9 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   signer under a read guard scoped to the lookup and signs after releasing it,
   and sends the remote signer the message in full so its own slashing
   protection applies on top of this client's record, which a remote key is
-  registered in and checked against like a local one. Each duty signs its
-  batch at once through
+  registered in and checked against like a local one; the signature the
+  signer returns is verified against the pubkey and root before it is used.
+  Each duty signs its batch at once through
   `signing::sign_all`, every signature bounded by `SIGNING_BUDGET`, so one
   hung signer costs only its own keys. Remote keys are `type: web3signer`
   entries in `validator_definitions.yml` or `POST /eth/v1/remotekeys` (default signer

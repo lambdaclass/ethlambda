@@ -431,8 +431,12 @@ are separate (see
 [Spec Deviations](./spec_deviations.md#the-validator-client-keeps-eip-3076s-minimal-watermarks-not-full-history)):
 a key moved to or from a signer carries its history through the signer's own
 tools. A signer refusal (`412`) is logged, counted as a
-signing failure and never retried; so is a key the signer does not hold, and a
-signer that cannot be reached. Each duty asks for its signatures all at once
+signing failure and never retried; so is a key the signer does not hold, a
+signer that cannot be reached, and an answer that does not verify: every
+signature a signer returns is checked against the validator's public key and
+the signing root before it is used, so a signer holding another key under that
+pubkey, or computing another root, costs the signature rather than publishing
+one no peer accepts. Each duty asks for its signatures all at once
 and gives each one 2 seconds: a signer that has not answered by then costs the
 signatures it owes and nothing else, so the duty publishes whatever arrived,
 local keys and other signers' keys included. Aggregator selection proofs are

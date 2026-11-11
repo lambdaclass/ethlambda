@@ -50,6 +50,21 @@ pub use crate::keys::web3signer::AggregateAndProofRef;
 /// client signs will ever verify.
 const DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
+/// Whether `signature` is `pubkey`'s signature over `root`. A pubkey or a
+/// signature that is not a point on the curve verifies nothing.
+fn verifies(pubkey: &BlsPubkey, root: Root, signature: &BlsSignature) -> bool {
+    use blst::min_pk::{PublicKey, Signature};
+
+    let (Ok(public_key), Ok(signature)) = (
+        PublicKey::from_bytes(&pubkey.0),
+        Signature::from_bytes(&signature.0),
+    ) else {
+        return false;
+    };
+    signature.verify(true, root.as_slice(), DST, &[], &public_key, true)
+        == blst::BLST_ERROR::BLST_SUCCESS
+}
+
 /// The chain-wide half of a signing domain, fixed for the life of the process.
 ///
 /// The fork version deliberately does not live here. It is a function of the
@@ -339,7 +354,27 @@ impl SigningContext {
                     });
                 }
                 let request = SigningRequest::new(self.fork_info(epoch), root, body);
-                signer.sign(pubkey, &request).await
+                let signature = signer.sign(pubkey, &request).await?;
+                // Checked before it leaves this function. The signer is
+                // another process on the far side of a network: one holding a
+                // different key under this pubkey, computing another root
+                // for a fork it does not know, or answering through a proxy
+                // that rewrote the body would otherwise have this client
+                // publish a signature no peer accepts, and decide
+                // `is_aggregator` on bytes that are not the selection proof.
+                // A local key needs no such check: its signature is computed
+                // here, over this root.
+                if !verifies(pubkey, root, &signature) {
+                    return Err(Error::Signing {
+                        pubkey: *pubkey,
+                        reason: format!(
+                            "remote signer {} answered with a signature that does not verify \
+                             for this key and message",
+                            signer.url()
+                        ),
+                    });
+                }
+                Ok(signature)
             }
         }
     }
@@ -1147,7 +1182,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         /// What the fake signer does: records every request and answers with
-        /// a fixed signature, or with a fixed status.
+        /// a signature, or with a fixed status.
         #[derive(Clone)]
         struct Fake {
             requests: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
@@ -1156,8 +1191,30 @@ mod tests {
 
         #[derive(Clone, Copy)]
         enum Answer {
+            /// The test key's signature over the request's `signingRoot`, as
+            /// a signer holding that key would give.
             Signature,
+            /// A well-formed signature over the request's `signingRoot`, by a
+            /// key other than the one asked for.
+            AnotherKeysSignature,
+            /// The test key's signature, over a root other than the request's.
+            AnotherRootsSignature,
+            /// 96 bytes that are not a signature at all.
+            Garbage,
             Status(u16),
+        }
+
+        /// `secret`'s signature over `root`, as hex.
+        fn signature_hex(secret: &[u8; 32], root: &[u8]) -> String {
+            let secret_key = blst::min_pk::SecretKey::from_bytes(secret).expect("a valid scalar");
+            hex::encode(secret_key.sign(root, DST, &[]).to_bytes())
+        }
+
+        /// A second key, for a signer that answers with the wrong one.
+        fn other_secret() -> [u8; 32] {
+            let mut bytes = secret();
+            bytes[31] ^= 0x01;
+            bytes
         }
 
         async fn handle(
@@ -1166,12 +1223,25 @@ mod tests {
             body: String,
         ) -> (StatusCode, String) {
             let json: serde_json::Value = serde_json::from_str(&body).expect("json body");
+            let root = hex::decode(
+                json["signingRoot"]
+                    .as_str()
+                    .expect("a signing root")
+                    .trim_start_matches("0x"),
+            )
+            .expect("hex");
             fake.requests.lock().expect("lock").push((pubkey, json));
-            match *fake.answer.lock().expect("lock") {
-                Answer::Signature => (
+            let signed = |signature: String| {
+                (
                     StatusCode::OK,
-                    format!("{{\"signature\":\"0x{}\"}}", "ab".repeat(96)),
-                ),
+                    format!("{{\"signature\":\"0x{signature}\"}}"),
+                )
+            };
+            match *fake.answer.lock().expect("lock") {
+                Answer::Signature => signed(signature_hex(&secret(), &root)),
+                Answer::AnotherKeysSignature => signed(signature_hex(&other_secret(), &root)),
+                Answer::AnotherRootsSignature => signed(signature_hex(&secret(), &[0x11; 32])),
+                Answer::Garbage => signed("ab".repeat(96)),
                 Answer::Status(code) => (
                     StatusCode::from_u16(code).expect("status"),
                     "refused".to_string(),
@@ -1198,8 +1268,10 @@ mod tests {
             (fake, format!("http://{address}"))
         }
 
+        /// A store whose one key, the test key's, is held by the signer at
+        /// `url` and not by this process.
         fn remote_store(url: &str) -> (RwLock<ValidatorStore>, BlsPubkey) {
-            let pubkey = BlsPubkey([0x42; 48]);
+            let pubkey = ValidatorStore::derive_pubkey(&secret()).expect("a valid key");
             let mut store = ValidatorStore::new();
             store.insert_remote(pubkey, url).expect("inserts");
             (RwLock::new(store), pubkey)
@@ -1216,12 +1288,15 @@ mod tests {
                 .sign_attestation(&store, &pubkey, &data)
                 .await
                 .expect("signs");
-            assert_eq!(signature.0, [0xab; 96]);
+            assert!(
+                verify(&pubkey, &signature, context.attestation_signing_root(&data)),
+                "the signer's signature is the one returned"
+            );
 
             let requests = fake.requests.lock().expect("lock");
             assert_eq!(requests.len(), 1);
             let (path_pubkey, body) = &requests[0];
-            assert_eq!(path_pubkey, &format!("0x{}", "42".repeat(48)));
+            assert_eq!(path_pubkey, &format!("0x{}", hex::encode(pubkey.0)));
             assert_eq!(body["type"], "ATTESTATION");
             assert_eq!(
                 body["signingRoot"],
@@ -1281,6 +1356,56 @@ mod tests {
                 .expect_err("refused");
             assert!(matches!(err, Error::Signing { .. }), "got {err:?}");
             assert!(fake.requests.lock().expect("lock").is_empty());
+        }
+
+        /// What the signer answers is checked before it is used: a signature
+        /// by another key, over another root, or that is no signature at all
+        /// is a signing failure for that key, never something to publish.
+        #[tokio::test]
+        async fn a_signature_that_does_not_verify_is_a_signing_error() {
+            for answer in [
+                Answer::AnotherKeysSignature,
+                Answer::AnotherRootsSignature,
+                Answer::Garbage,
+            ] {
+                let (fake, url) = serve(answer).await;
+                let (store, pubkey) = remote_store(&url);
+
+                let err = context()
+                    .sign_attestation(&store, &pubkey, &attestation_data(100))
+                    .await
+                    .expect_err("must fail");
+                assert!(matches!(err, Error::Signing { .. }), "got {err:?}");
+                assert!(err.to_string().contains("does not verify"), "{err}");
+                assert!(!err.is_retryable());
+                assert_eq!(fake.requests.lock().expect("lock").len(), 1, "asked once");
+            }
+        }
+
+        /// A selection proof that does not verify is not remembered: the
+        /// next ask goes to the signer again rather than being answered from
+        /// bytes that were never the proof.
+        #[tokio::test]
+        async fn an_unverified_selection_proof_is_not_remembered() {
+            let (fake, url) = serve(Answer::AnotherKeysSignature).await;
+            let (store, pubkey) = remote_store(&url);
+            let context = context();
+
+            context
+                .sign_selection_proof(&store, &pubkey, 100)
+                .await
+                .expect_err("must fail");
+            *fake.answer.lock().expect("lock") = Answer::Signature;
+            let proof = context
+                .sign_selection_proof(&store, &pubkey, 100)
+                .await
+                .expect("signs");
+            assert!(verify(
+                &pubkey,
+                &proof,
+                context.selection_proof_signing_root(100)
+            ));
+            assert_eq!(fake.requests.lock().expect("lock").len(), 2);
         }
 
         #[tokio::test]
