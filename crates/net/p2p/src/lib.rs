@@ -265,6 +265,14 @@ const BUILDER_VALIDATION_PERMITS: usize = 32;
 /// message arriving with none free is ignored, like every other kind.
 const SYNC_VALIDATION_PERMITS: usize = 64;
 
+/// The p2p actor's native-job budget (`MAX_NATIVE_JOBS`): every stateful
+/// check runs as one blocking job holding a permit from one of the pools
+/// above, so the pools, not this budget, bound how many run at once.
+const STATEFUL_CHECK_PERMITS: usize = GOSSIP_VALIDATION_PERMITS
+    + ATTESTATION_VALIDATION_PERMITS
+    + BUILDER_VALIDATION_PERMITS
+    + SYNC_VALIDATION_PERMITS;
+
 /// Capacity of the first-valid-sync-message cache, keyed by `(slot, validator
 /// index, subnet)`. A subnet carries one message per member per slot, at most
 /// a subcommittee's worth, so this holds a few slots of every subnet.
@@ -1560,7 +1568,7 @@ pub(crate) trait P2PProtocol: Send + Sync {
     fn refresh_peer_scoring(&self) -> Result<(), ActorError>;
 }
 
-#[actor(protocol = P2PProtocol)]
+#[actor(protocol = P2PProtocol, max_native_jobs = STATEFUL_CHECK_PERMITS)]
 impl P2PServer {
     #[send_handler]
     async fn handle_retry_block_fetch(

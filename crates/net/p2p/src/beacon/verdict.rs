@@ -37,7 +37,7 @@ use libp2p::PeerId;
 use libp2p::gossipsub::{MessageAcceptance, MessageId};
 use spawned_concurrency::message::Message;
 use spawned_concurrency::tasks::{
-    Context, Handler, JobError, JobOptions, JobOutcome, PendingReply,
+    BlockingJobPermit, Context, Handler, JobError, JobOptions, JobOutcome, PendingReply,
 };
 use tracing::{debug, error, warn};
 
@@ -683,11 +683,10 @@ pub(crate) const STATEFUL_CHECK_DEADLINE: Duration = Duration::from_secs(12);
 /// attestation is not forwarded on this outcome at all: see
 /// [`Validated::forward`]'s own documentation for why.
 ///
-/// The check itself runs on Tokio's blocking pool, awaited by an async job
-/// (`pipe_with`), not as a native job (`pipe_blocking_with`): spawned 0.8 runs
-/// each native job on a freshly spawned OS thread, under a per-actor budget
-/// (`MAX_NATIVE_JOBS`, at most 4 by default) that `#[actor]` cannot raise,
-/// while these pools admit up to 352 checks at once.
+/// The check runs as a blocking job (`pipe_blocking_with`, on Tokio's blocking
+/// pool). The p2p actor's native-job budget is
+/// [`STATEFUL_CHECK_PERMITS`](crate::STATEFUL_CHECK_PERMITS), the
+/// sum of these pools, so the pools stay the only bound.
 pub(crate) fn spawn_stateful_checks(
     server: &P2PServer,
     ctx: &Context<P2PServer>,
@@ -695,14 +694,23 @@ pub(crate) fn spawn_stateful_checks(
     object: Validated,
 ) {
     let Ok(permit) = permits_for(server, &object).clone().try_acquire_owned() else {
-        let received_at = id.received_at;
-        let outcome = Outcome::Ignore(IgnoreReason::Overloaded);
-        report(server, id, outcome);
-        object.forward(server, received_at, outcome);
+        report_overloaded(server, id, object);
         return;
     };
+    // Reserve the job before `id` and `object` move into it, so a refusal
+    // still has them for its one verdict.
+    let job = match ctx.reserve_blocking_job() {
+        Ok(job) => job,
+        Err(err) => {
+            // Only when the actor is stopping (`OwnerStopping`), or at its
+            // 1024 deferred credits, far above the 352 permits.
+            warn!(%err, "Could not start a gossip check");
+            report_overloaded(server, id, object);
+            return;
+        }
+    };
     let store = server.store.clone();
-    pipe_checks(server, ctx, id, STATEFUL_CHECK_DEADLINE, move || {
+    pipe_checks(job, id, STATEFUL_CHECK_DEADLINE, move || {
         let _permit = permit;
         let mut object = object;
         let outcome = object.stateful_checks(&store);
@@ -710,47 +718,30 @@ pub(crate) fn spawn_stateful_checks(
     });
 }
 
-/// Run `checks` on Tokio's blocking pool as a job owned by the p2p actor,
-/// with a `deadline`, and deliver its one [`GossipVerdict`].
+/// Report `object` `Ignore(Overloaded)` without checking it, and send it on
+/// as that outcome allows (see [`spawn_stateful_checks`]).
+fn report_overloaded(server: &P2PServer, id: GossipId, object: Validated) {
+    let received_at = id.received_at;
+    let outcome = Outcome::Ignore(IgnoreReason::Overloaded);
+    report(server, id, outcome);
+    object.forward(server, received_at, outcome);
+}
+
+/// Run `checks` as the reserved blocking `job`, with a `deadline`, and
+/// deliver its one [`GossipVerdict`] (also on a panic, as
+/// `JobError::Panicked`).
 fn pipe_checks(
-    server: &P2PServer,
-    ctx: &Context<P2PServer>,
+    job: BlockingJobPermit<P2PServer>,
     id: GossipId,
     deadline: Duration,
     checks: impl FnOnce() -> (Outcome, Validated) + Send + 'static,
 ) {
-    // `pipe_with` drops `work` and `done` when it cannot start the job; keep
-    // what the verdict for that case needs.
-    let fallback = GossipId {
-        message_id: id.message_id.clone(),
-        propagation_source: id.propagation_source,
-        received_at: id.received_at,
-        kind: id.kind,
-    };
-    let opts = JobOptions {
-        // `spawned_rt::time::Instant` is `std::time::Instant` outside simulation.
-        deadline: Some(Instant::now() + deadline),
-        ..JobOptions::default()
-    };
-    let work = async move {
-        match tokio::task::spawn_blocking(checks).await {
-            Ok(checked) => checked,
-            // Re-raise the check's panic so the job reports it as
-            // `JobError::Panicked`.
-            Err(err) => match err.try_into_panic() {
-                Ok(panic) => std::panic::resume_unwind(panic),
-                Err(err) => panic!("stateful checks did not finish: {err}"),
-            },
-        }
-    };
-    let started = ctx.pipe_with(opts, work, move |checked| GossipVerdict { id, checked });
-    if let Err(err) = started {
-        // Only when the actor is stopping (`OwnerStopping`), or at its 1024
-        // deferred credits, far above the 352 permits. The object went with
-        // the refused job, so it is not forwarded.
-        warn!(%err, "Could not start a gossip check");
-        report(server, fallback, Outcome::Ignore(IgnoreReason::Overloaded));
-    }
+    let opts = JobOptions::default().deadline_after(deadline);
+    job.pipe_blocking_with(
+        opts,
+        move |_job| checks(),
+        move |checked| GossipVerdict { id, checked },
+    );
 }
 
 #[cfg(test)]
@@ -766,7 +757,7 @@ mod tests {
     use ethlambda_types::beacon::containers::{
         AttestationData, Checkpoint, electra, gloas, phase0,
     };
-    use spawned_test::tasks::{Mock, MockRef};
+    use spawned_test::tasks::{Mock, MockRef, in_actor};
 
     use super::*;
     use crate::test_support::{envelope, unconnected_beacon_server, valid_shaped_sidecar};
@@ -1819,24 +1810,7 @@ mod tests {
         drop(held);
     }
 
-    // ---- The job that carries a stateful check (spawned 0.8 `pipe_with`) ----
-
-    /// Run `f` in one of the p2p actor's turns, to reach its `Context`.
-    type InTurn = Box<dyn FnOnce(&mut P2PServer, &Context<P2PServer>) + Send>;
-    struct InActor(InTurn);
-    impl Message for InActor {
-        type Result = ();
-    }
-    impl Handler<InActor> for P2PServer {
-        async fn handle(
-            &mut self,
-            msg: InActor,
-            _reply: PendingReply<'_, ()>,
-            ctx: &Context<Self>,
-        ) {
-            (msg.0)(self, ctx);
-        }
-    }
+    // ---- The job that carries a stateful check (spawned 0.8 `pipe_blocking_with`) ----
 
     /// A gossip id under a metric `kind` of the test's own, so the global
     /// verdict counters tell its verdicts apart from every other test's.
@@ -1859,11 +1833,11 @@ mod tests {
         let server = unconnected_beacon_server(Config::mainnet(), 0)
             .await
             .start();
-        server
-            .send(InActor(Box::new(move |server, ctx| {
-                pipe_checks(server, ctx, test_id(kind), deadline, checks)
-            })))
-            .expect("the p2p actor runs");
+        in_actor(&server, move |_, ctx| {
+            let job = ctx.reserve_blocking_job().expect("the p2p actor runs");
+            pipe_checks(job, test_id(kind), deadline, checks)
+        })
+        .await;
         server
     }
 
