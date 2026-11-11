@@ -335,7 +335,7 @@ In practice the distribution is bimodal and dominated by production rather than 
 | `lean_state_write_queue_depth` | Gauge | States handed to the background writer but not yet committed | On every hand-off and on every commit | |
 | `lean_state_write_seconds` | Histogram | Time the background writer spends encoding, diffing and committing one state | Per state written | |
 | `lean_state_cache_lookups_total` | Counter | State cache lookups, by the `Store` method that made them, the kind of state asked for, and whether the cache held it | On every `get_state` (and the writer's own parent read), `has_state` and `cached_state` call | method=get_state,has_state,cached_state<br>kind=block,checkpoint<br>result=hit,miss |
-| `lean_state_rebuilds_total` | Counter | Block states read back from storage after missing the cache and the write buffer, by whether the read did the rebuild or waited on one already under way for that root | On every `get_state` miss that reaches storage | role=led,joined |
+| `lean_state_rebuilds_total` | Counter | Block states read back from storage after missing the cache and the write buffer, by whether the read did the rebuild or waited on one already under way for that root | On every `get_state` miss that reads a state back from storage, or takes one from a rebuild under way; a miss that finds no state or fails counts as neither | role=led,joined |
 
 **On a beacon follower, watch `lean_table_bytes{table="data_columns"}`.** Every
 other table's series either stays flat or is bounded by pruning; `data_columns`
@@ -368,7 +368,8 @@ epoch boundary when the checkpoint's block precedes it.
 read and decoded from storage.** A beacon rebuild costs about a second of CPU
 and several hundred megabytes at its peak, so this is the series to watch for
 resident-memory spikes. `role="joined"` counts misses that found a rebuild of
-the same root already under way and waited for it instead. A burst of joins
+the same root already under way and took its state instead. A lookup that
+finds no state for its root, or fails, counts under neither. A burst of joins
 next to a single lead is the pattern a late block's custody columns produce,
 each checked on its own task against a parent state that has left the cache.
 

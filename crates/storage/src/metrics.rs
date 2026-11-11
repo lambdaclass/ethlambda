@@ -105,8 +105,8 @@ static LEAN_STATE_REBUILDS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 pub(crate) enum RebuildRole {
     /// Read and decoded the state itself.
     Led,
-    /// Waited on a rebuild of the same root already under way and took its
-    /// result.
+    /// Waited on a rebuild of the same root already under way and took the
+    /// state it read.
     Joined,
 }
 

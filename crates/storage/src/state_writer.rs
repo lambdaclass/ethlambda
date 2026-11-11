@@ -141,14 +141,22 @@ impl PendingStates {
 /// `get_or_init` until it is done and takes the same result: the same `Arc`,
 /// or the same error. A rebuild that panics leaves its cell empty, and
 /// `OnceLock` lets one of the blocked callers run its own rebuild instead, so
-/// a panic never strands a waiter. The entry is removed once the rebuild
-/// settles, so the map holds rebuilds under way, never pins a state, and
-/// never keeps an error for a later miss: that one reads storage again.
+/// a panic never strands a waiter.
+///
+/// Sharing an error means one failed read fails every caller waiting on it:
+/// a late block's eight custody columns are all dropped, not one, when their
+/// parent's state does not read back.
+///
+/// The first caller out of a settled rebuild removes its entry, so the map
+/// holds rebuilds under way and never pins a state. A result outlives the
+/// rebuild only for the moment between the cell being set and that removal:
+/// a miss arriving then takes it, and any later miss reads storage again.
 #[derive(Default)]
 pub(crate) struct StateRebuilds(Mutex<HashMap<H256, Arc<RebuildCell>>>);
 
 /// One rebuild's shared result. The error is behind an `Arc` because `Error`
-/// is not `Clone`; every caller gets it as [`Error::StateRebuild`].
+/// is not `Clone`; every caller, the one that ran the rebuild included, gets
+/// it as [`Error::StateRebuild`].
 type RebuildCell = OnceLock<Result<Option<Arc<BeaconState>>, Arc<Error>>>;
 
 impl StateRebuilds {
@@ -167,24 +175,31 @@ impl StateRebuilds {
                 rebuild().map_err(Arc::new)
             })
             .clone();
-        // The first caller out removes the cell. A later miss can then
-        // register a fresh one for `root`, which a caller still leaving this
-        // cell must not remove. A rebuild that panicked with no one waiting
-        // skips this and leaves an empty cell, which the next miss on `root`
-        // fills and removes.
-        {
-            let mut cells = self.0.lock().unwrap();
-            if cells
-                .get(&root)
-                .is_some_and(|current| Arc::ptr_eq(current, &cell))
-            {
-                cells.remove(&root);
-            }
-        }
-        if !led {
+        self.release(root, &cell);
+        // Only a waiter that took a state counts: one that took a miss or
+        // an error saved nothing.
+        if !led && matches!(result, Ok(Some(_))) {
             crate::metrics::inc_state_rebuilds(RebuildRole::Joined);
         }
         result.map_err(Error::StateRebuild)
+    }
+
+    /// Removes `root`'s entry if it is still `cell`.
+    ///
+    /// The first caller out removes the cell. A later miss can then register
+    /// a fresh one for `root`, which a caller still leaving this cell must
+    /// not remove: that would let a third miss start a second rebuild of
+    /// `root` beside the fresh one. A rebuild that panicked with no one
+    /// waiting skips this and leaves an empty cell, which the next miss on
+    /// `root` fills and removes.
+    fn release(&self, root: H256, cell: &Arc<RebuildCell>) {
+        let mut cells = self.0.lock().unwrap();
+        if cells
+            .get(&root)
+            .is_some_and(|current| Arc::ptr_eq(current, cell))
+        {
+            cells.remove(&root);
+        }
     }
 }
 
@@ -255,19 +270,37 @@ pub(crate) fn read_state(
     if let Some(state) = pending.get(root) {
         return Ok(Some(state));
     }
-    rebuilds.share(*root, || {
-        // Checked again under the lead: a rebuild that finished between the
-        // miss above and taking the lead has already cached its state, and a
-        // second read would be the very cost the lead exists to avoid. Not
-        // counted as a lookup, since the miss above already was.
-        if let Some(state) = cache.lock().unwrap().get(&key).cloned() {
-            return Ok(Some(state));
+    rebuilds.share(*root, || lead_rebuild(backend, chain, cache, pending, root))
+}
+
+/// What the one caller leading a rebuild of `root` runs: the cache and the
+/// write buffer once more, then storage.
+///
+/// Checked again under the lead because a rebuild that finished between the
+/// caller's miss and its taking the lead has already cached its state, and a
+/// second read would be the very cost the lead exists to avoid. Not counted
+/// as a lookup, since the miss before it already was.
+///
+/// Counts a `led` rebuild only when storage gave back a state: a root with
+/// no state costs one block-header read, and is not what that series is for.
+fn lead_rebuild(
+    backend: &dyn StorageBackend,
+    chain: Chain,
+    cache: &StateCache,
+    pending: &PendingStates,
+    root: &H256,
+) -> Result<Option<Arc<BeaconState>>, Error> {
+    let key = CacheKey::BlockState(*root);
+    if let Some(state) = cache.lock().unwrap().get(&key).cloned() {
+        return Ok(Some(state));
+    }
+    if let Some(state) = pending.get(root) {
+        return Ok(Some(state));
+    }
+    rebuild_state(backend, chain, cache, root).inspect(|state| {
+        if state.is_some() {
+            crate::metrics::inc_state_rebuilds(RebuildRole::Led);
         }
-        if let Some(state) = pending.get(root) {
-            return Ok(Some(state));
-        }
-        crate::metrics::inc_state_rebuilds(RebuildRole::Led);
-        rebuild_state(backend, chain, cache, root)
     })
 }
 
@@ -275,9 +308,11 @@ pub(crate) fn read_state(
 /// path past the cache and the write buffer, which [`StateRebuilds`] runs for
 /// one caller per root at a time.
 ///
-/// `Err` when a read fails ([`Error::Storage`]) or what it read does not
-/// decode ([`Error::CorruptState`]), rather than a panic, so that a caller
-/// such as a gossip check can give up on one message instead of unwinding.
+/// `Err` when a read fails ([`Error::Storage`]) or a state, delta or diff it
+/// read does not decode ([`Error::CorruptState`]), rather than a panic, so
+/// that a caller such as a gossip check can give up on one message instead
+/// of unwinding. A `BlockHeaders` row whose slot does not decode still panics
+/// in the slot lookup, on both chains.
 fn rebuild_state(
     backend: &dyn StorageBackend,
     chain: Chain,
@@ -533,7 +568,9 @@ fn fold_beacon_state_deltas<T>(
 /// `lean_only` guard.
 ///
 /// Returns `Ok(None)` when the root is unknown or the diff chain is broken,
-/// and `Err` when a read fails or a row on the way does not decode.
+/// and `Err` when a read fails or a snapshot or diff on the way does not
+/// decode. A `BlockHeaders` row that does not decode still panics, in the
+/// slot lookup that reads it first.
 pub(crate) fn reconstruct_state(
     backend: &dyn StorageBackend,
     root: &H256,
@@ -570,16 +607,13 @@ pub(crate) fn reconstruct_state(
     diffs.reverse();
 
     // The latest block header lives in BlockHeaders; the stored state caches
-    // the real state_root there, so it equals the header byte-for-byte.
+    // the real state_root there, so it equals the header byte-for-byte. The
+    // walk's first slot lookup decoded this same row, so one that does not
+    // decode has already panicked there.
     let view = backend.begin_read()?;
-    let header = view
-        .read_with(
-            Table::BlockHeaders,
-            &root.to_ssz(),
-            BlockHeader::from_ssz_bytes,
-        )?
-        .transpose()
-        .map_err(|err| corrupt_state(root, format!("its block header does not decode: {err:?}")))?;
+    let header = view.read_with(Table::BlockHeaders, &root.to_ssz(), |bytes| {
+        BlockHeader::from_ssz_bytes(bytes).expect("valid header")
+    })?;
     drop(view);
     let Some(latest_block_header) = header else {
         return Ok(None);
@@ -1206,8 +1240,193 @@ mod tests {
         }
     }
 
+    /// An in-memory backend that counts read views and holds each one until
+    /// [`Self::open`], so a test can line callers up behind one rebuild's
+    /// read before letting it finish.
+    struct GatedBackend {
+        inner: crate::backend::InMemoryBackend,
+        open: Mutex<bool>,
+        opened: std::sync::Condvar,
+        reads: AtomicUsize,
+    }
+
+    impl GatedBackend {
+        fn new(open: bool) -> Self {
+            Self {
+                inner: crate::backend::InMemoryBackend::new(),
+                open: Mutex::new(open),
+                opened: std::sync::Condvar::new(),
+                reads: AtomicUsize::new(0),
+            }
+        }
+
+        fn open(&self) {
+            *self.open.lock().unwrap() = true;
+            self.opened.notify_all();
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+
+        /// A lean `state` stored as a snapshot under `root`, with the
+        /// `BlockHeaders` row a read finds its slot in.
+        fn store_lean_state(&self, root: H256, state: &State) {
+            let header = BlockHeader {
+                slot: state.slot,
+                proposer_index: 0,
+                parent_root: H256::ZERO,
+                state_root: H256::ZERO,
+                body_root: H256::ZERO,
+            };
+            let headers = vec![(root.to_ssz(), header.to_ssz())];
+            let key = encode_slot_root_key(state.slot, &root);
+            let states = vec![(key, encode_state_value(&BeaconState::Lean(state.clone())))];
+            let mut batch = self.inner.begin_write().expect("write batch");
+            batch
+                .put_batch(Table::BlockHeaders, headers)
+                .expect("put header");
+            batch.put_batch(Table::States, states).expect("put state");
+            batch.commit().expect("commit");
+        }
+    }
+
+    impl StorageBackend for GatedBackend {
+        fn begin_read(&self) -> Result<Box<dyn StorageReadView + '_>, crate::api::Error> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                open = self.opened.wait(open).unwrap();
+            }
+            drop(open);
+            self.inner.begin_read()
+        }
+
+        fn begin_write(
+            &self,
+        ) -> Result<Box<dyn crate::api::StorageWriteBatch + 'static>, crate::api::Error> {
+            self.inner.begin_write()
+        }
+    }
+
+    /// Opens the gate when dropped, so a failed assertion that unwinds past it
+    /// releases the callers held behind it rather than leaving the thread
+    /// scope waiting on them forever.
+    struct OpenOnDrop<'a>(&'a GatedBackend);
+
+    impl Drop for OpenOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.open();
+        }
+    }
+
+    fn state_cache() -> StateCache {
+        Mutex::new(LruCache::new(
+            std::num::NonZeroUsize::new(32).expect("non-zero"),
+        ))
+    }
+
     #[test]
-    fn concurrent_misses_on_one_root_share_one_rebuild() {
+    fn concurrent_get_state_misses_on_one_root_read_storage_once() {
+        const WAITERS: usize = 7;
+        let backend = GatedBackend::new(false);
+        let root = H256([8u8; 32]);
+        backend.store_lean_state(root, &base_state());
+        let cache = state_cache();
+        let pending = PendingStates::default();
+        let rebuilds = StateRebuilds::default();
+
+        let states: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..=WAITERS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        read_state(&backend, Chain::Lean, &cache, &pending, &rebuilds, &root)
+                    })
+                })
+                .collect();
+            // The leader is held in its read view until every other caller is
+            // waiting on its rebuild, so none of them can miss the cache after
+            // the rebuild settles and read storage a second time.
+            let gate = OpenOnDrop(&backend);
+            wait_for_waiters(&rebuilds, &root, WAITERS);
+            drop(gate);
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap().expect("no error").expect("a state"))
+                .collect()
+        });
+
+        assert_eq!(backend.reads(), 1, "eight misses, one read view");
+        for state in &states {
+            assert!(Arc::ptr_eq(state, &states[0]), "one state, not copies");
+        }
+        assert!(rebuilds.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_lead_takes_a_state_settled_since_its_miss_without_reading() {
+        let backend = GatedBackend::new(true);
+        let root = H256([9u8; 32]);
+        let state = Arc::new(BeaconState::Lean(base_state()));
+        let cache = state_cache();
+        let pending = PendingStates::default();
+
+        // Cached by a rebuild that settled after this caller missed the
+        // cache and before it took the lead.
+        cache
+            .lock()
+            .unwrap()
+            .put(CacheKey::BlockState(root), state.clone());
+        let found = lead_rebuild(&backend, Chain::Lean, &cache, &pending, &root)
+            .expect("no error")
+            .expect("the cached state");
+        assert!(Arc::ptr_eq(&found, &state));
+
+        // Handed to the write buffer in that window, and already evicted.
+        cache.lock().unwrap().clear();
+        pending.insert(root, state.clone());
+        let found = lead_rebuild(&backend, Chain::Lean, &cache, &pending, &root)
+            .expect("no error")
+            .expect("the pending state");
+        assert!(Arc::ptr_eq(&found, &state));
+
+        assert_eq!(backend.reads(), 0, "neither lead went to storage");
+    }
+
+    #[test]
+    fn a_caller_leaving_an_old_rebuild_keeps_a_newer_one_registered() {
+        let rebuilds = StateRebuilds::default();
+        let root = H256([10u8; 32]);
+        let built = Arc::new(BeaconState::Lean(base_state()));
+        let calls = AtomicUsize::new(0);
+        let rebuild = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            wait_for_waiters(&rebuilds, &root, 1);
+            Ok(Some(built.clone()))
+        };
+
+        std::thread::scope(|scope| {
+            let leader = scope.spawn(|| rebuilds.share(root, rebuild));
+            wait_for_waiters(&rebuilds, &root, 0);
+            // The last caller out of an earlier, settled rebuild of `root`
+            // leaves only now, after the leader above registered a new one.
+            rebuilds.release(root, &Arc::new(RebuildCell::new()));
+            let waiter = scope.spawn(|| rebuilds.share(root, rebuild));
+            for caller in [leader, waiter] {
+                let state = caller.join().unwrap().expect("no error").expect("a state");
+                assert!(Arc::ptr_eq(&state, &built));
+            }
+        });
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the waiter joined the leader's rebuild rather than starting a second"
+        );
+    }
+
+    #[test]
+    fn concurrent_shares_of_one_root_run_one_rebuild() {
         const WAITERS: usize = 7;
         let rebuilds = StateRebuilds::default();
         let root = H256([5u8; 32]);

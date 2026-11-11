@@ -15,12 +15,20 @@ pub enum Error {
     /// apply to its base. [`Store::from_db_state`](crate::store::Store::from_db_state)
     /// has already refused a directory of another format version, so this is
     /// corruption at rest rather than an old database.
+    ///
+    /// `root` is the state being read, which for a delta can be built on the
+    /// corrupt row rather than be it: a snapshot that does not decode is
+    /// reported against every state read through it.
     #[error("the stored state for root {root} is corrupt: {reason}")]
     CorruptState { root: H256, reason: String },
-    /// A state rebuild's error, handed to every concurrent read of the same
-    /// root that waited on that rebuild rather than reading the state itself
-    /// (`StateRebuilds` in `state_writer.rs`). Reference-counted because
-    /// `Error` is not `Clone`; it displays as the error it wraps.
+    /// Every error a state rebuild returns, as
+    /// [`Store::get_state`](crate::store::Store::get_state) gives it: the
+    /// caller that ran the rebuild and every concurrent read of the same root
+    /// that waited on it get the same one (`StateRebuilds` in
+    /// `state_writer.rs`). It wraps [`Error::Storage`] or
+    /// [`Error::CorruptState`], so match through it rather than on those
+    /// directly. Reference-counted because `Error` is not `Clone`; it displays
+    /// as the error it wraps.
     #[error(transparent)]
     StateRebuild(Arc<Error>),
     /// The data directory was written by a build with a different on-disk
