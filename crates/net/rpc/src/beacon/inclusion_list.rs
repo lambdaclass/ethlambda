@@ -148,7 +148,7 @@ fn inclusion_list_duties(
     };
 
     // EIP-8453 keeps heze's inclusion lists, over its own committee draw
-    // (`get_inclusion_list_committee` dispatches on the state's fork).
+    // (`get_inclusion_list_committee` dispatches on the slot's fork).
     if config.fork_at_epoch(epoch) < ForkName::Heze {
         return Ok(respond(Vec::new()));
     }
@@ -161,7 +161,7 @@ fn inclusion_list_duties(
     // A state answers committees for its own epoch, the one before and the
     // next one; anything later is reached by advancing a copy of the head.
     // A heze head answering for an EIP-8453 epoch is advanced across the
-    // fork too: the committee draw changes there and follows the state's fork.
+    // fork too, which the draw (chosen by the slot's fork) does not need.
     let same_draw = matches!(*head_state, BeaconState::Eip8453(_))
         == (config.fork_at_epoch(epoch) >= ForkName::Eip8453);
     let state: Arc<BeaconState> = if epoch <= state_epoch + preset::MIN_SEED_LOOKAHEAD && same_draw
@@ -179,7 +179,7 @@ fn inclusion_list_duties(
     let mut assigned: HashSet<ValidatorIndex> = HashSet::new();
     let mut duties = Vec::new();
     for slot in start_slot..start_slot + preset::SLOTS_PER_EPOCH {
-        let committee = get_inclusion_list_committee(&state, slot, &*committees)
+        let committee = get_inclusion_list_committee(&config, &state, slot, &*committees)
             .map_err(|_| ApiError::Internal("the inclusion list committee is unavailable"))?;
         for validator_index in committee {
             if !wanted.contains(&validator_index) || !assigned.insert(validator_index) {
@@ -452,10 +452,12 @@ mod tests {
 
         // Every committee member of the epoch gets exactly its first slot.
         let committees = store.committee_cache();
+        let config = store.config();
         let start = compute_start_slot_at_epoch(epoch);
         let mut expected = std::collections::BTreeMap::new();
         for slot in start..start + preset::SLOTS_PER_EPOCH {
-            for member in get_inclusion_list_committee(&head_state, slot, &*committees).unwrap() {
+            let committee = get_inclusion_list_committee(&config, &head_state, slot, &*committees);
+            for member in committee.unwrap() {
                 expected.entry(member).or_insert(slot);
             }
         }

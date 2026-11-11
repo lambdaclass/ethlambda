@@ -142,9 +142,13 @@ fn stateful_rules(store: &Store, signed: &SignedInclusionList) -> Result<(), Out
     let state = committee_state(store, inclusion_list.slot, dependent_root)
         .ok_or(Outcome::Ignore(IgnoreReason::StateUnavailable))?;
     // [REJECT] The includer is a member of the committee.
-    let committee =
-        get_inclusion_list_committee(&state, inclusion_list.slot, &*store.committee_cache())
-            .map_err(|_| Outcome::Ignore(IgnoreReason::StateUnavailable))?;
+    let committee = get_inclusion_list_committee(
+        &config,
+        &state,
+        inclusion_list.slot,
+        &*store.committee_cache(),
+    )
+    .map_err(|_| Outcome::Ignore(IgnoreReason::StateUnavailable))?;
     if !committee.contains(&inclusion_list.validator_index) {
         return Err(Outcome::Reject(RejectReason::NotInInclusionListCommittee));
     }
@@ -168,4 +172,130 @@ pub fn validate(
         return outcome;
     }
     stateful_checks(store, signed)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use ethlambda_storage::ForkCheckpoints;
+    use ethlambda_storage::backend::InMemoryBackend;
+    use ethlambda_types::checkpoint::Checkpoint;
+
+    use super::*;
+    use crate::beacon::config::Config;
+    use crate::beacon::constants::FAR_FUTURE_EPOCH;
+    use crate::beacon::containers::BeaconState;
+    use crate::beacon::containers::gloas::Transaction;
+    use crate::beacon::containers::heze::InclusionList;
+    use crate::beacon::fork::ForkName;
+    use crate::beacon::gossip::test_support::{GENESIS_TIME, empty_block};
+    use crate::beacon::helpers::misc::compute_start_slot_at_epoch;
+    use crate::beacon::helpers::test_state::{sign_for, with_signing_validators_at};
+    use crate::beacon::inclusion_list::inclusion_list_signing_root;
+    use crate::beacon::preset::SLOTS_PER_EPOCH;
+
+    const HEAD: Root = Root::repeat_byte(0x50);
+    /// The shuffling dependent block of the fork's first epoch: the head's
+    /// parent, at the slot below the head's epoch.
+    const DEPENDENT: Root = Root::repeat_byte(0x31);
+    const FORK_EPOCH: u64 = 2;
+
+    /// A heze chain one epoch before `EIP8453_FORK_EPOCH`: its head opens
+    /// epoch 1, and the head's parent is the dependent block of epoch 2's
+    /// committees. The head's post-state, with real keys, is what
+    /// `committee_state` hands a list of epoch 2 until a fork block imports.
+    fn heze_head_before_the_fork() -> (Store, BeaconState) {
+        let mut config = Config::active();
+        for fork in [
+            ForkName::Altair,
+            ForkName::Bellatrix,
+            ForkName::Capella,
+            ForkName::Deneb,
+            ForkName::Electra,
+            ForkName::Fulu,
+            ForkName::Gloas,
+            ForkName::Heze,
+        ] {
+            config = config.with_fork_epoch(fork, 0);
+        }
+        let config = config.with_fork_epoch(ForkName::Eip8453, FORK_EPOCH);
+        let head_slot = SLOTS_PER_EPOCH;
+        let mut state = with_signing_validators_at(ForkName::Heze, 256);
+        let BeaconState::Heze(inner) = &mut state else {
+            unreachable!("built as heze")
+        };
+        assert_eq!(inner.slot, head_slot);
+        inner.block_roots[(head_slot - 1) as usize] = DEPENDENT;
+        inner.latest_block_header.slot = head_slot;
+        state.apply_pending_mutations();
+
+        let mut store = Store::init_beacon(
+            Arc::new(InMemoryBackend::new()),
+            GENESIS_TIME,
+            config,
+            HEAD,
+            Checkpoint {
+                root: HEAD,
+                slot: head_slot,
+            },
+            head_slot,
+        );
+        store
+            .insert_pending_block(DEPENDENT, empty_block(0, Root::ZERO))
+            .expect("insert the dependent block");
+        store
+            .insert_signed_block(HEAD, empty_block(head_slot, DEPENDENT))
+            .expect("insert the head");
+        store
+            .insert_state(HEAD, state.clone())
+            .expect("insert the head state");
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(HEAD))
+            .expect("move the head");
+        let mut dependent_state = state.clone();
+        *dependent_state.slot_mut() = 0;
+        dependent_state.latest_block_header_mut().slot = 0;
+        store
+            .insert_state(DEPENDENT, dependent_state)
+            .expect("insert the dependent state");
+        (store, state)
+    }
+
+    /// A list of the fork's first slot, from a member of EIP-8453's committee
+    /// for it (a uniform draw) who is not on heze's, judged while the head is
+    /// still the heze block before the fork: accepted, as by a node whose
+    /// head is the fork's first block (an EIP-8453 state, which answers the
+    /// uniform draw).
+    #[test]
+    fn a_fork_epoch_list_is_judged_by_the_eip8453_committee_under_a_heze_head() {
+        let (store, state) = heze_head_before_the_fork();
+        let config = store.config();
+        let slot = compute_start_slot_at_epoch(FORK_EPOCH);
+        let committees = store.committee_cache();
+        let eip8453_committee =
+            crate::beacon::helpers::eip8453::get_inclusion_list_committee(&state, slot).unwrap();
+        let heze_config = (*config)
+            .clone()
+            .with_fork_epoch(ForkName::Eip8453, FAR_FUTURE_EPOCH);
+        let heze_committee =
+            get_inclusion_list_committee(&heze_config, &state, slot, &*committees).unwrap();
+        let member = *eip8453_committee
+            .iter()
+            .find(|member| !heze_committee.contains(member))
+            .expect("the uniform draw names someone heze's committee does not");
+
+        let message = InclusionList {
+            slot,
+            validator_index: member,
+            dependent_root: DEPENDENT,
+            transactions: vec![Transaction::from(vec![1u8])].into(),
+        };
+        let root = inclusion_list_signing_root(&config, &state, &message);
+        let signed = SignedInclusionList {
+            message,
+            signature: sign_for(member as usize, root),
+        };
+        assert_eq!(stateful_checks(&store, &signed), Outcome::Accept);
+    }
 }

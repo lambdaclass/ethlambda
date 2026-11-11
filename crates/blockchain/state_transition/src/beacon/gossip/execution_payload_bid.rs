@@ -495,9 +495,13 @@ fn stateful_rules(
         let dependent_root =
             dependent_root_at(&parent_state, bid.parent_block_root, inclusion_list_slot)
                 .ok_or(ignore(IgnoreReason::AncestryUnknown))?;
-        let committee =
-            get_inclusion_list_committee(state, inclusion_list_slot, &*store.committee_cache())
-                .map_err(|_| ignore(IgnoreReason::StateUnavailable))?;
+        let committee = get_inclusion_list_committee(
+            &store.config(),
+            state,
+            inclusion_list_slot,
+            &*store.committee_cache(),
+        )
+        .map_err(|_| ignore(IgnoreReason::StateUnavailable))?;
         if !store.inclusion_list_store().is_bits_inclusive(
             &committee,
             inclusion_list_slot,

@@ -17,6 +17,7 @@ use crate::beacon::config::Config;
 use crate::beacon::constants::DOMAIN_INCLUSION_LIST_COMMITTEE;
 use crate::beacon::containers::BeaconState;
 use crate::beacon::containers::heze::{InclusionList, SignedInclusionList};
+use crate::beacon::eip8453_fork_choice::is_eip8453_slot;
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::fork_choice::{
     Store, compute_shuffling_dependent_slot, compute_shuffling_lookahead_start_slot,
@@ -37,15 +38,23 @@ use crate::beacon::primitives::{
 /// of `slot`, concatenated in committee order, then cycled to
 /// `INCLUSION_LIST_COMMITTEE_SIZE` members.
 ///
+/// The rule is the one of `slot`'s own fork, not of `state`'s, as for
+/// [`inclusion_list_domain`]: a list is judged against the state at
+/// `compute_shuffling_lookahead_start_slot`, an epoch earlier, so for a list
+/// of `EIP8453_FORK_EPOCH` that is a heze state, and for heze's last slot it
+/// can be an EIP-8453 one. Either rule reads only the epoch's seed and
+/// active set, which both states answer.
+///
 /// The committees come through `committees`, the shared shuffling cache, so
 /// the per-message gossip check does not reshuffle the epoch.
 pub fn get_inclusion_list_committee(
+    config: &Config,
     state: &BeaconState,
     slot: Slot,
     committees: &impl CommitteeCacheExt,
 ) -> Result<Vec<ValidatorIndex>> {
     // [Modified in EIP8453] A uniform draw from the epoch's active set.
-    if matches!(state, BeaconState::Eip8453(_)) {
+    if is_eip8453_slot(config, slot) {
         return Ok(
             crate::beacon::helpers::eip8453::get_inclusion_list_committee(state, slot)?
                 .into_inner(),
@@ -278,8 +287,12 @@ pub fn on_inclusion_list(
     let state = committee_state(store, inclusion_list.slot, dependent_root).ok_or(
         Error::SpecAssert("inclusion_list.dependent_root in store.block_states"),
     )?;
-    let committee =
-        get_inclusion_list_committee(&state, inclusion_list.slot, &*store.committee_cache())?;
+    let committee = get_inclusion_list_committee(
+        &config,
+        &state,
+        inclusion_list.slot,
+        &*store.committee_cache(),
+    )?;
     verify(
         committee.contains(&inclusion_list.validator_index),
         "inclusion_list.validator_index in committee",
@@ -300,6 +313,7 @@ pub fn on_inclusion_list(
 /// slot of `epoch` whose inclusion list committee `validator_index` sits on,
 /// if any. `epoch` must be at most the state's next epoch.
 pub fn get_inclusion_list_committee_assignment(
+    config: &Config,
     state: &BeaconState,
     epoch: Epoch,
     validator_index: ValidatorIndex,
@@ -309,7 +323,8 @@ pub fn get_inclusion_list_committee_assignment(
     verify(epoch <= next_epoch, "epoch <= next_epoch")?;
     let start_slot = compute_start_slot_at_epoch(epoch);
     for slot in start_slot..start_slot + preset::SLOTS_PER_EPOCH {
-        if get_inclusion_list_committee(state, slot, committees)?.contains(&validator_index) {
+        if get_inclusion_list_committee(config, state, slot, committees)?.contains(&validator_index)
+        {
             return Ok(Some(slot));
         }
     }
@@ -380,6 +395,56 @@ mod tests {
             expect(ForkName::Heze)
         );
         assert_ne!(expect(ForkName::Gloas), expect(ForkName::Heze));
+    }
+
+    /// The committee draw is the rule of the list's own slot's fork, not of
+    /// the state it is read from: across `EIP8453_FORK_EPOCH` the state a
+    /// list of the fork's first epoch is judged against is still a heze one
+    /// (`compute_shuffling_lookahead_start_slot` is in the epoch before), and
+    /// a list of heze's last slot can be judged against an EIP-8453 state.
+    #[test]
+    fn the_committee_follows_the_fork_schedule_at_the_lists_slot() {
+        use crate::beacon::helpers::accessors::CommitteeCache;
+        use crate::beacon::helpers::test_state::with_validators_at;
+
+        let heze = with_validators_at(ForkName::Heze, 256);
+        let state_epoch = get_current_epoch(&heze);
+        let committees = CommitteeCache::default();
+        let heze_rule = |state: &BeaconState, slot: Slot| {
+            let epoch_committees = committees.committees(state, compute_epoch_at_slot(slot));
+            let indices: Vec<ValidatorIndex> = (0..epoch_committees.committees_per_slot())
+                .flat_map(|index| epoch_committees.committee(slot, index).unwrap().to_vec())
+                .collect();
+            (0..preset::INCLUSION_LIST_COMMITTEE_SIZE)
+                .map(|i| indices[i % indices.len()])
+                .collect::<Vec<_>>()
+        };
+        let uniform_draw = |state: &BeaconState, slot: Slot| {
+            crate::beacon::helpers::eip8453::get_inclusion_list_committee(state, slot)
+                .unwrap()
+                .into_inner()
+        };
+
+        // A list of the fork's first epoch, read off a heze state from the
+        // epoch before: EIP-8453's uniform draw.
+        let config = Config::active().with_fork_epoch(ForkName::Eip8453, state_epoch + 1);
+        let fork_slot = compute_start_slot_at_epoch(state_epoch + 1);
+        assert_ne!(uniform_draw(&heze, fork_slot), heze_rule(&heze, fork_slot));
+        assert_eq!(
+            get_inclusion_list_committee(&config, &heze, fork_slot, &committees).unwrap(),
+            uniform_draw(&heze, fork_slot),
+        );
+
+        // A list of heze's last slot, read off the EIP-8453 state the upgrade
+        // makes of the same heze state at the fork's first slot: heze's
+        // committees.
+        let config = Config::active().with_fork_epoch(ForkName::Eip8453, state_epoch);
+        let eip8453 = with_validators_at(ForkName::Eip8453, 256);
+        let heze_slot = compute_start_slot_at_epoch(state_epoch) - 1;
+        assert_eq!(
+            get_inclusion_list_committee(&config, &eip8453, heze_slot, &committees).unwrap(),
+            heze_rule(&heze, heze_slot),
+        );
     }
 
     /// The slot finality prunes the live chain to (epoch 4's first), and the

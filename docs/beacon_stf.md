@@ -596,8 +596,10 @@ beacon state, and adds the available chain's head votes to the block:
 
 Heze steps EIP-8453 keeps call straight through; the few whose rule it
 modifies (registry activation, `is_active_builder`, the pending-deposit
-finality gate, `compute_ptc`, `get_inclusion_list_committee`, growing the
-registry) read the state's fork inside them. No consensus-spec-tests release
+finality gate, `compute_ptc`, growing the registry) read the state's fork
+inside them; `get_inclusion_list_committee` reads its slot's fork instead,
+since the state a list is judged against is an epoch older than the list.
+No consensus-spec-tests release
 ships EIP-8453 fixtures: every specification function has unit tests of its
 own rules instead, on both presets, and two signed blocks with attestations and
 head votes go through `state_transition` with their state roots checked.

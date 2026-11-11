@@ -870,8 +870,10 @@ fn get_inclusion_list_committee_is_a_uniform_draw_from_the_active_set() {
         compute_uniform_selection(&active, seed, preset::INCLUSION_LIST_COMMITTEE_SIZE as u64)
             .unwrap()
     );
-    // Heze's entry point dispatches to this one for an EIP-8453 state.
+    // Heze's entry point dispatches to this one for an EIP-8453 slot.
+    let config = Config::active().with_fork_epoch(ForkName::Eip8453, get_current_epoch(&state));
     let via_heze = crate::beacon::inclusion_list::get_inclusion_list_committee(
+        &config,
         &state,
         slot,
         &crate::beacon::helpers::accessors::CommitteeCache::default(),

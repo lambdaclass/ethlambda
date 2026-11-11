@@ -59,9 +59,12 @@ fn lists_for_request(
     let Some(state) = committee_state(store, request.slot, request.dependent_root) else {
         return Vec::new();
     };
-    let Ok(committee) =
-        get_inclusion_list_committee(&state, request.slot, &*store.committee_cache())
-    else {
+    let Ok(committee) = get_inclusion_list_committee(
+        &store.config(),
+        &state,
+        request.slot,
+        &*store.committee_cache(),
+    ) else {
         return Vec::new();
     };
     store.inclusion_list_store().lists_for(

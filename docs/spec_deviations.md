@@ -1273,11 +1273,15 @@ node computes the same value another way.
   `process_registry_updates` compares eligibility with
   `compute_epoch_at_slot(finalized_slot)`, gloas's `is_active_builder`
   forwards to EIP-8453's, `drain_pending_deposits` gates on `finalized_slot`,
-  `process_ptc_window` draws with EIP-8453's `compute_ptc`, heze's
-  `get_inclusion_list_committee` forwards to EIP-8453's, and a validator
+  `process_ptc_window` draws with EIP-8453's `compute_ptc`, and a validator
   created from a pending deposit grows the round, target, progress and every
   pending justification's participation list
-  (`PendingQueueFields::push_empty_participation_and_inactivity`).
+  (`PendingQueueFields::push_empty_participation_and_inactivity`). Heze's
+  `get_inclusion_list_committee` forwards to EIP-8453's for a list of an
+  EIP-8453 slot, reading the list's slot's fork rather than the state's: the
+  state a list is judged against is `compute_shuffling_lookahead_start_slot`'s,
+  an epoch earlier, so a list of `EIP8453_FORK_EPOCH` is judged against a
+  heze state, the way its signature domain is already the list's epoch's.
 - **Why:** one copy of each unmodified step, as for every earlier fork.
 
 ### Head votes earn nothing

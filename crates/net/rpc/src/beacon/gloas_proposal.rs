@@ -968,14 +968,18 @@ fn heze_inclusion_lists(
         return Some((InclusionListBits::new(), Vec::new()));
     };
     let dependent_root = inclusion_list_dependent_root(store, head_root, inclusion_list_slot);
-    let committee =
-        match get_inclusion_list_committee(state, inclusion_list_slot, &*store.committee_cache()) {
-            Ok(committee) => committee,
-            Err(err) => {
-                warn!(%slot, %err, "No inclusion list committee for the previous slot");
-                return Some((InclusionListBits::new(), Vec::new()));
-            }
-        };
+    let committee = match get_inclusion_list_committee(
+        &store.config(),
+        state,
+        inclusion_list_slot,
+        &*store.committee_cache(),
+    ) {
+        Ok(committee) => committee,
+        Err(err) => {
+            warn!(%slot, %err, "No inclusion list committee for the previous slot");
+            return Some((InclusionListBits::new(), Vec::new()));
+        }
+    };
     let lists = store.inclusion_list_store();
     let bits = lists.bits(&committee, inclusion_list_slot, dependent_root, false);
     let transactions: Vec<Vec<u8>> = lists
