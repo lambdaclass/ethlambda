@@ -96,9 +96,11 @@ const RECORD_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 /// could not be reached at all (`Error::SlashingProtectionUnusable`): the
 /// lock is poisoned, because an operation panicked while holding it, and
 /// stays so until the process restarts, since nothing here recovers a record
-/// that a panic may have left half-updated in memory. The panic that poisons
-/// it is reported the same way on the call that raised it, which sees it as
-/// the blocking task's `JoinError`.
+/// that a panic may have left half-updated in memory. The call whose own
+/// operation panicked sees it as the blocking task's `JoinError` and is told
+/// so, with the panic's message; every later call is told an earlier access
+/// panicked. The duty loop asks [`ensure_usable`] once a slot and stops the
+/// client on a poisoned record, so the restart comes from its supervisor.
 ///
 /// The operation runs to completion even if the caller is dropped, as a duty
 /// abandoned at its deadline is: that is safe, since a record written for a
@@ -113,11 +115,6 @@ pub async fn blocking<T: Send + 'static>(
     protection: &SharedProtection,
     operation: impl FnOnce(&mut SlashingProtection) -> Result<T> + Send + 'static,
 ) -> Result<T> {
-    let poisoned = || Error::SlashingProtectionUnusable {
-        reason: "an earlier access panicked while holding the record, so nothing is signed \
-                 until the validator client is restarted"
-            .to_string(),
-    };
     let protection = protection.clone();
     tokio::task::spawn_blocking(move || {
         // A bounded wait rather than `lock()`: a write normally holds the
@@ -129,7 +126,7 @@ pub async fn blocking<T: Send + 'static>(
         let mut protection = loop {
             match protection.try_lock() {
                 Ok(guard) => break guard,
-                Err(std::sync::TryLockError::Poisoned(_)) => return Err(poisoned()),
+                Err(std::sync::TryLockError::Poisoned(_)) => return Err(poisoned_earlier()),
                 Err(std::sync::TryLockError::WouldBlock) => {
                     if std::time::Instant::now() >= deadline {
                         return Err(Error::SlashingProtectionUnusable {
@@ -148,14 +145,56 @@ pub async fn blocking<T: Send + 'static>(
     })
     .await
     .map_err(|err| {
-        if err.is_panic() {
-            poisoned()
-        } else {
-            Error::SlashingProtectionUnusable {
-                reason: format!("the record could not be consulted: {err}"),
-            }
-        }
+        let reason = match err.try_into_panic() {
+            // This call's own operation panicked, and it held the record when
+            // it did: nothing else in the task can panic. Said as this
+            // access's failure, with the panic's message, since "an earlier
+            // access" would send whoever reads it looking for another event.
+            Ok(panic) => format!(
+                "this access panicked while holding the record ({}), so nothing is signed until \
+                 the validator client is restarted",
+                panic_message(panic.as_ref())
+            ),
+            Err(err) => format!("the record could not be consulted: {err}"),
+        };
+        Error::SlashingProtectionUnusable { reason }
     })?
+}
+
+/// What a caller is told when it finds the record's lock already poisoned.
+fn poisoned_earlier() -> Error {
+    Error::SlashingProtectionUnusable {
+        reason: "an earlier access panicked while holding the record, so nothing is signed \
+                 until the validator client is restarted"
+            .to_string(),
+    }
+}
+
+/// A panic's message, when it carried one: `panic!` with a literal gives a
+/// `&str` and with arguments a `String`. Anything else was raised with
+/// `panic_any` and has no text to show.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&'static str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no message")
+}
+
+/// Refuse to go on with a record whose lock is poisoned.
+///
+/// A poisoned record refuses every duty and never recovers (see
+/// [`blocking`]), so a client left running on one looks alive to whatever
+/// supervises it while signing nothing. The duty loop asks this once a slot
+/// and stops on an `Err`, which ends the process with a failure status:
+/// systemd or Kubernetes then restarts it, and the restart reads the record
+/// back from disk, which every write either replaced whole or left alone.
+/// That is the remedy the refusals ask for.
+pub fn ensure_usable(protection: &SharedProtection) -> Result<()> {
+    if protection.is_poisoned() {
+        return Err(poisoned_earlier());
+    }
+    Ok(())
 }
 
 /// Whether an attestation's source epoch is at or past its target, which is
@@ -1541,5 +1580,68 @@ mod tests {
             attest(&mut protection, 2, &data(96, 2, 3, 0xaa)),
             Err(Refusal::Unregistered)
         );
+    }
+
+    // A poisoned record.
+
+    /// The duty loop's once-a-slot question: a healthy record lets it go on,
+    /// a poisoned one stops the client, and the error is not one to retry.
+    #[test]
+    fn a_poisoned_record_stops_the_client() {
+        let protection = SlashingProtection::in_memory();
+        ensure_usable(&protection).expect("a healthy record is usable");
+
+        // Poisoned the way a bug would: a panic while the lock is held.
+        let held = protection.clone();
+        std::thread::spawn(move || {
+            let _guard = held.lock().expect("not poisoned yet");
+            panic!("a bug while holding the record");
+        })
+        .join()
+        .expect_err("the thread panics");
+
+        let err = ensure_usable(&protection).expect_err("a poisoned record is not");
+        assert!(
+            matches!(err, Error::SlashingProtectionUnusable { .. }),
+            "got {err}"
+        );
+        assert!(!err.is_retryable(), "the loop must stop, not try again");
+    }
+
+    /// The access whose own operation panics is told it was its panic, with
+    /// the message, and only the ones after it that an earlier access
+    /// panicked: the same wording for both points the first at an event that
+    /// never happened.
+    #[tokio::test]
+    async fn the_access_that_panics_is_told_so_and_later_ones_that_an_earlier_one_did() {
+        let protection = SlashingProtection::in_memory();
+
+        let own = blocking(&protection, |_| -> Result<()> {
+            panic!("a bug in the record")
+        })
+        .await
+        .expect_err("the operation panicked")
+        .to_string();
+        assert!(own.contains("this access panicked"), "{own}");
+        assert!(own.contains("a bug in the record"), "{own}");
+
+        let later = blocking(&protection, |_| Ok(()))
+            .await
+            .expect_err("the record is poisoned")
+            .to_string();
+        assert!(later.contains("an earlier access panicked"), "{later}");
+        ensure_usable(&protection).expect_err("and the duty loop stops on it");
+    }
+
+    /// A panic raised with arguments carries a `String`, not a `&str`, and
+    /// one raised with `panic_any` carries neither.
+    #[test]
+    fn a_panics_message_is_read_whatever_it_was_raised_with() {
+        let literal: Box<dyn std::any::Any + Send> = Box::new("a literal");
+        assert_eq!(panic_message(literal.as_ref()), "a literal");
+        let formatted: Box<dyn std::any::Any + Send> = Box::new(format!("slot {}", 7));
+        assert_eq!(panic_message(formatted.as_ref()), "slot 7");
+        let neither: Box<dyn std::any::Any + Send> = Box::new(7_u64);
+        assert_eq!(panic_message(neither.as_ref()), "no message");
     }
 }

@@ -265,6 +265,18 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         tokio::time::sleep(delay).await;
         served = Some(slot);
 
+        // A poisoned record refuses every duty until the process restarts,
+        // and nothing in the process restarts it. Carrying on would leave a
+        // client that answers `/health` and signs nothing, which no
+        // supervisor has a reason to touch; stopping hands systemd or
+        // Kubernetes the restart the refusals ask for. Asked once a slot, at
+        // the boundary, which is soon enough: in between, the record refuses
+        // every duty on its own.
+        if let Err(err) = slashing_protection::ensure_usable(&protection) {
+            error!(%slot, %err, "Slashing protection is unusable; stopping so the client can be restarted");
+            return Err(err);
+        }
+
         let epoch = clock.epoch_of(slot);
 
         if last_epoch != Some(epoch) {
