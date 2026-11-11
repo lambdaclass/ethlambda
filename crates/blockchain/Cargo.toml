@@ -43,6 +43,8 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "rt"] }
 datatest-stable = "0.3.3"
 serde_json.workspace = true
 snap = "1.1.1"
+# `in_actor`: run a closure in the chain actor's turn (the job tests).
+spawned-test.workspace = true
 
 [features]
 # Run the fork choice fixture cases the actor tests read from

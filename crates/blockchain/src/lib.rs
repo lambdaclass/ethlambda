@@ -30,8 +30,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::aggregation::{
     AGGREGATION_JOB, AggregateProduced, AggregationDone, AggregationSession,
-    EARLY_AGGREGATION_WINDOW, EarlyAggregationCheck, HeldAggregate, MAX_AGGREGATION_JOBS,
-    aggregation_deadline, run_aggregation_worker,
+    EARLY_AGGREGATION_WINDOW, EarlyAggregationCheck, MAX_AGGREGATION_JOBS, aggregation_deadline,
+    run_aggregation_worker,
 };
 use crate::key_manager::ValidatorKeyPair;
 use crate::sync_status::SyncStatusTracker;
@@ -1386,7 +1386,7 @@ impl BlockChainServer {
         let t2_ms = time_config.genesis_time_ms()
             + SlotInterval::Aggregation.to_ms_since_genesis(slot, &time_config);
         // Interval-2 boundary as a wall-clock instant; an aggregate produced
-        // before it is held until then (`HeldAggregate`), so nothing reaches
+        // before it is emitted at it (`emit_at_blocking`), so nothing reaches
         // gossip early.
         let publish_at = SystemTime::UNIX_EPOCH + Duration::from_millis(t2_ms);
         let now_ms = unix_now_ms();
@@ -4128,7 +4128,7 @@ impl Handler<NewBeaconAggregate> for BlockChainServer {
 // Aggregation message handlers (worker → actor, actor → self for deadline)
 // -------------------------------------------------------------------------
 //
-// All four are lean-only: a beacon follower never starts an aggregation
+// All three are lean-only: a beacon follower never starts an aggregation
 // session, so none of these messages are ever sent to one in practice. Each
 // still opens with the `else { return }` guard rather than reaching for
 // `lean()`, because a handler is the actor's outer boundary: dropping a
@@ -4140,57 +4140,15 @@ impl Handler<AggregateProduced> for BlockChainServer {
         &mut self,
         msg: AggregateProduced,
         _reply: PendingReply<'_, ()>,
-        ctx: &Context<Self>,
+        _ctx: &Context<Self>,
     ) {
         let ChainDuties::Lean(_) = &self.duties else {
             return;
         };
         // No session check: this is an emit of the current session's job,
-        // fenced by the framework once a newer session (or a stop) cancelled it.
-        //
-        // An early session's aggregate waits for the interval-2 boundary.
-        // `duration_since` errs once the boundary has passed, which collapses
-        // to "publish now".
-        let delay = msg
-            .publish_at
-            .duration_since(SystemTime::now())
-            .unwrap_or(Duration::ZERO);
-        if !delay.is_zero() {
-            send_after(
-                delay,
-                ctx.clone(),
-                HeldAggregate {
-                    session_id: msg.session_id,
-                    output: msg.output,
-                },
-            );
-            return;
-        }
-        self.publish_own_aggregate(msg.output);
-    }
-}
-
-impl Handler<HeldAggregate> for BlockChainServer {
-    async fn handle(
-        &mut self,
-        msg: HeldAggregate,
-        _reply: PendingReply<'_, ()>,
-        _ctx: &Context<Self>,
-    ) {
-        let ChainDuties::Lean(lean) = &self.duties else {
-            return;
-        };
-        // A timer is not fenced with the job, so drop an aggregate whose
-        // session was replaced while it was held.
-        let current = lean.current_aggregation.as_ref().map(|s| s.session_id);
-        if current != Some(msg.session_id) {
-            trace!(
-                incoming_session_id = msg.session_id,
-                current_session_id = ?current,
-                "Dropping held aggregate of a replaced session"
-            );
-            return;
-        }
+        // fenced by the framework once a newer session (or a stop) cancelled
+        // it, and delivered no earlier than the interval-2 boundary (the
+        // worker schedules an early one with `emit_at_blocking`).
         self.publish_own_aggregate(msg.output);
     }
 }
@@ -6418,26 +6376,10 @@ mod tests {
     // message.
 
     use spawned_concurrency::tasks::JobError;
+    use spawned_test::tasks::in_actor;
     use std::sync::Mutex;
 
     type Log = Arc<Mutex<Vec<String>>>;
-
-    /// Run `f` in one of the chain actor's turns, to reach its `Context`.
-    type InTurn = Box<dyn FnOnce(&mut BlockChainServer, &Context<BlockChainServer>) + Send>;
-    struct InActor(InTurn);
-    impl Message for InActor {
-        type Result = ();
-    }
-    impl Handler<InActor> for BlockChainServer {
-        async fn handle(
-            &mut self,
-            msg: InActor,
-            _reply: PendingReply<'_, ()>,
-            ctx: &Context<Self>,
-        ) {
-            (msg.0)(self, ctx);
-        }
-    }
 
     /// A job's emit or terminal message, logged when dispatched.
     struct Logged(Log, String);
@@ -6456,16 +6398,17 @@ mod tests {
     }
 
     /// Start a keyed blocking job named `name` that waits `before`, emits
-    /// one `Logged`, waits `after`, then (with `panic`) panics.
+    /// one `Logged`, waits `after`, then (with `panic`) panics. Run it in the
+    /// chain actor's turn with `in_actor`.
     fn keyed_job(
         log: &Log,
         name: &'static str,
         before: Duration,
         after: Duration,
         panic: bool,
-    ) -> InActor {
+    ) -> impl FnOnce(&mut BlockChainServer, &Context<BlockChainServer>) + Send + 'static {
         let (emit_log, done_log) = (log.clone(), log.clone());
-        InActor(Box::new(move |_, ctx| {
+        move |_, ctx| {
             let opts = JobOptions {
                 key: Some(AGGREGATION_JOB),
                 ..JobOptions::default()
@@ -6488,7 +6431,7 @@ mod tests {
                 },
             )
             .expect("the job starts");
-        }))
+        }
     }
 
     async fn settle_for(ms: u64) {
@@ -6503,24 +6446,21 @@ mod tests {
         // it while the first's emit sits in the mailbox behind it (both starts
         // are queued before the first runs), the case the session-id checks
         // used to cover by hand.
-        actor
-            .send(keyed_job(
-                &log,
-                "old",
-                Duration::ZERO,
-                Duration::from_millis(200),
-                false,
-            ))
-            .unwrap();
-        actor
-            .send(keyed_job(
-                &log,
-                "new",
-                Duration::from_millis(50),
-                Duration::ZERO,
-                false,
-            ))
-            .unwrap();
+        let old = keyed_job(
+            &log,
+            "old",
+            Duration::ZERO,
+            Duration::from_millis(200),
+            false,
+        );
+        let new = keyed_job(
+            &log,
+            "new",
+            Duration::from_millis(50),
+            Duration::ZERO,
+            false,
+        );
+        tokio::join!(in_actor(&actor, old), in_actor(&actor, new));
         settle_for(500).await;
         let log = log.lock().unwrap().clone();
         assert!(!log.iter().any(|entry| entry.starts_with("old")), "{log:?}");
@@ -6537,15 +6477,17 @@ mod tests {
     async fn a_stop_during_a_job_delivers_none_of_its_messages() {
         let actor = beacon_server(beacon_store_at_slot_10()).start();
         let log = Log::default();
-        actor
-            .send(keyed_job(
+        in_actor(
+            &actor,
+            keyed_job(
                 &log,
                 "seal",
                 Duration::from_millis(150),
                 Duration::ZERO,
                 false,
-            ))
-            .unwrap();
+            ),
+        )
+        .await;
         settle_for(30).await;
         actor.child_handle().stop();
         actor.join().await;
@@ -6557,15 +6499,11 @@ mod tests {
     async fn a_panicking_job_ends_with_one_terminal_message() {
         let actor = beacon_server(beacon_store_at_slot_10()).start();
         let log = Log::default();
-        actor
-            .send(keyed_job(
-                &log,
-                "proof",
-                Duration::ZERO,
-                Duration::ZERO,
-                true,
-            ))
-            .unwrap();
+        in_actor(
+            &actor,
+            keyed_job(&log, "proof", Duration::ZERO, Duration::ZERO, true),
+        )
+        .await;
         settle_for(300).await;
         assert_eq!(
             *log.lock().unwrap(),

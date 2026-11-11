@@ -2042,6 +2042,7 @@ dependencies = [
  "serde_json",
  "snap",
  "spawned-concurrency 0.7.3",
+ "spawned-test",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",

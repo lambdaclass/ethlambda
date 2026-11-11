@@ -141,24 +141,9 @@ pub(crate) const AGGREGATION_JOB: JobKey = JobKey::new("aggregation");
 
 /// One successful aggregate, emitted by the worker job (fenced with it).
 pub(crate) struct AggregateProduced {
-    pub(crate) session_id: u64,
     pub(crate) output: AggregatedGroupOutput,
-    /// The interval-2 boundary: an early session's aggregate is held until
-    /// then before it reaches the store and gossip.
-    pub(crate) publish_at: SystemTime,
 }
 impl Message for AggregateProduced {
-    type Result = ();
-}
-
-/// An early session's aggregate, held by a timer until the interval-2
-/// boundary. A plain timer is not fenced with the job, so its handler checks
-/// the session.
-pub(crate) struct HeldAggregate {
-    pub(crate) session_id: u64,
-    pub(crate) output: AggregatedGroupOutput,
-}
-impl Message for HeldAggregate {
     type Result = ();
 }
 
@@ -1174,9 +1159,11 @@ pub(crate) fn aggregation_bits_from_validator_indices(bits: &[u64]) -> Aggregati
 /// session's summary, which the job delivers as [`AggregationDone`].
 ///
 /// Publish alignment: aggregates must not reach the store and gossip before
-/// the interval-2 boundary, `publish_at`. The worker emits each aggregate as
-/// soon as it is proven and the actor holds an early one until the boundary
-/// (see [`HeldAggregate`]), so a held aggregate never delays the next proof.
+/// the interval-2 boundary, `publish_at`. The worker schedules an aggregate
+/// proven before the boundary as an emit at the boundary (`emit_at_blocking`)
+/// and goes on to the next proof. The scheduled emit is fenced with the job,
+/// so a replaced session's held aggregate is never delivered, and the
+/// terminal [`AggregationDone`] waits for it.
 pub(crate) fn run_aggregation_worker(
     snapshot: AggregationSnapshot,
     job_ctx: &JobCtx<crate::BlockChainServer>,
@@ -1232,12 +1219,17 @@ pub(crate) fn run_aggregation_worker(
         total_raw_sigs += raw_sigs;
         total_children += children;
 
-        let produced = AggregateProduced {
-            session_id,
-            output,
-            publish_at,
+        let produced = AggregateProduced { output };
+        // `duration_since` errs once the boundary has passed: publish now.
+        let hold = publish_at
+            .duration_since(SystemTime::now())
+            .unwrap_or(Duration::ZERO);
+        let emitted = if hold.is_zero() {
+            job_ctx.emit_blocking(produced)
+        } else {
+            job_ctx.emit_at_blocking(spawned_concurrency::Instant::now() + hold, produced)
         };
-        if job_ctx.emit_blocking(produced).is_err() {
+        if emitted.is_err() {
             // Cancelled meanwhile: nothing more of this session is wanted.
             cancelled = true;
             break;
