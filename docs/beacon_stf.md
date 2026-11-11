@@ -730,18 +730,18 @@ Two things that arrangement has to be careful about:
 
 ## Status
 
-All eight forks, phase0 through gloas, have containers, fork upgrades, state
-transitions, and epoch processing. At the pinned fixture release every case
-that is not ignored passes on both presets:
+All ten forks, phase0 through heze plus EIP-8453, have containers, fork
+upgrades, state transitions, and epoch processing. At the pinned fixture release
+(`v1.7.0-beta.4`, which ships no EIP-8453 cases) every case that is not ignored
+passes on both presets:
 
 | Preset | Fixture cases passed | Ignored | Lib tests |
 |--------|----------------------|---------|-----------|
-| mainnet | 7175 | 1285 | 433 passed, 1 ignored |
-| minimal | 49261 | 5403 | 434 passed, 1 ignored |
+| mainnet | 8979 | 1053 | 768 passed |
+| minimal | 59442 | 5763 | 769 passed |
 
 The lib counts are with `beacon-spec-tests` on, and include lean's own unit
-tests, since the two chains share one lib target. The one ignored lib test is
-a timing measurement, not a fixture.
+tests, since the two chains share one lib target.
 
 Minimal runs more cases because the release ships more fixtures for it, and it
 runs two runners mainnet does not: `genesis`'s `initialization` and `validity`.
