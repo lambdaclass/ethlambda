@@ -871,6 +871,10 @@ fn prepare(
                 root: head_root,
                 payload_status,
             };
+            // `slot` is the proposal slot, the slot the head state is advanced
+            // to below: `should_build_on_full(store, head, state.slot)`, not
+            // the wall-clock slot (gloas `validator.md`, consensus-specs
+            // `0f4fa3ff`).
             let build_on_full = should_build_on_full(store, node, slot).map_err(|_| {
                 ApiError::Internal("could not decide which parent payload to build on")
             })?;

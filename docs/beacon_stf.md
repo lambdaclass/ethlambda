@@ -46,7 +46,15 @@ catch-all `_`, so a real fork added to the enum still breaks every match that ha
 to grow an arm for it.
 
 Correctness is defined by the released spec test fixtures, pinned in the
-`Makefile`.
+`Makefile` (`v1.7.0-beta.4`). The rules themselves are ahead of them: the base
+forks, phase0 through heze, follow consensus-specs `0f4fa3ff` (the
+`decoupled-consensus` commit the EIP-8453 port is pinned to): every change
+since `v1.7.0-beta.4` to a rule this node implements is in, but one.
+`onboard_builders_from_pending_deposits`
+keeps the `v1.7.0-beta.4` rule, because Platåberget forked to gloas under it
+(see [spec_deviations.md](./spec_deviations.md#the-gloas-upgrade-onboards-builders-by-the-rule-the-networks-forked-under)).
+No `v1.7.0-beta.4` case fails under the newer rules, and each change of
+behavior carries a unit test that the older rule fails.
 
 ## Running the tests
 

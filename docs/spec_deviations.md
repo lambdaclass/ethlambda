@@ -745,6 +745,54 @@ reads, and refuses to when that root is optimistic
   that way, and anchoring at its `genesis.ssz` otherwise fails the anchor
   check.
 
+## The gloas upgrade onboards builders by the rule the networks forked under
+
+- **The specification:** consensus-specs `0f4fa3ff` (#5736, merged 2026-10-26)
+  rewrites gloas `fork.md`'s `onboard_builders_from_pending_deposits`. Only a
+  deposit with builder (`0xb0`) withdrawal credentials can fund a builder at
+  the fork, so any other deposit stays queued even when a builder already has
+  its pubkey; a builder-credential deposit with a valid signature registers a
+  builder even when its pubkey is a validator's or a pending validator's; and
+  one with an invalid signature stays queued only to preserve a validator
+  top-up.
+- **ethlambda:** keeps the `v1.7.0-beta.4` rule, under which a deposit for an
+  existing validator's pubkey always stays queued, a builder-credential
+  deposit for a pubkey with a valid pending validator deposit stays queued,
+  and any deposit for a pubkey already onboarded as a builder in the same pass
+  tops that builder up, whatever its credentials.
+- **Why:** a fork upgrade that already happened on a live network is fixed by
+  the rule its clients ran then, and a node syncing through it from a pre-fork
+  anchor must reproduce that state. Both built-in networks that schedule
+  gloas forked before #5736 merged. Platåberget (fork slot 49152, 2026-08-20)
+  held 16 306 pending deposits at slot 49151, 11 825 of them with builder
+  credentials over 10 033 pubkeys, 12 of which were already validators' and 7
+  of which also had non-builder deposits queued. Running the
+  upgrade on its finalized slot-49151 state (from
+  `beacon.plataberget.ethpandaops.io`) reproduces the chain's slot-49152
+  `builders` and `pending_deposits` roots exactly under the `v1.7.0-beta.4`
+  rule (10 012 builders, 4 022 deposits left queued); the new rule gives
+  10 029 builders and 4 481 queued deposits, a different post-fork state.
+  Sepolia (era 1379, 2026-10-06) forked with an empty queue and no builders,
+  so neither rule changes its state. Mainnet and Hoodi do not schedule gloas.
+  A network that forks to gloas from now on, and the next
+  consensus-spec-tests release's `gloas/fork` vectors, would need the new
+  rule; the function should then take it per network or per fork epoch rather
+  than for every chain.
+
+## The proposer does not prepare its gloas payload ahead of the slot
+
+- **The specification:** `prepare_execution_payload` decides
+  `should_build_on_full(store, head, state.slot)` for the proposal slot
+  (consensus-specs `0f4fa3ff`; `v1.7.0-beta.4` asked for the wall-clock
+  slot), and a proposer that prepares during the previous slot SHOULD prepare
+  again once the parent's payload attestations are in.
+- **ethlambda:** `produceBlockV4` prepares the payload when the validator
+  client asks for the block, at the proposal slot, deciding with the
+  proposal slot (`gloas_proposal::prepare`). There is no earlier preparation,
+  so nothing to redo.
+- **Why:** this node does not yet start payload building in the previous
+  slot; the decision it does make is the specification's.
+
 ## EIP-8453 (decoupled consensus)
 
 EIP-8453's types, configuration and state transition follow
@@ -1112,8 +1160,10 @@ node computes the same value another way.
 - **The specification:** `upgrade_to_eip8453(pre: heze.BeaconState)`, over
   the pinned commit's heze.
 - **ethlambda:** EIP-8453 inherits the heze this crate implements (the
-  heze-devnet line, fixture-tested at consensus-spec-tests `v1.7.0-beta.4`),
-  which folds EIP-8198 (quick slots) into heze. So an EIP-8453 state keeps
+  heze-devnet line, its rules brought up to the pinned commit's base forks
+  except the gloas builder onboarding above, fixture-tested at
+  consensus-spec-tests `v1.7.0-beta.4`), which folds EIP-8198 (quick slots)
+  into heze. So an EIP-8453 state keeps
   heze's slot-duration scaling of the activation, exit and consolidation churn
   (`get_activation_churn_limit` answers heze's rule for both forks) and of the
   sync aggregate's base reward. The pinned commit specifies EIP-8198 as a

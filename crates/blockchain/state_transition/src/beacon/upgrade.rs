@@ -959,6 +959,12 @@ fn requeue(
 /// builder. From the fork onward, a builder is created or topped up only
 /// through a `BuilderDepositRequest` (EIP-8282).
 ///
+/// This is the `v1.7.0-beta.4` rule, deliberately: consensus-specs `0f4fa3ff`
+/// (#5736) changed it, but Platåberget forked to gloas under this one, and
+/// syncing through its fork from a pre-fork anchor must rebuild the same
+/// builders and pending deposits (the new rule does not; see
+/// `docs/spec_deviations.md`).
+///
 /// A deposit for an already-registered validator stays queued untouched. A
 /// deposit whose pubkey neither registry recognizes yet is onboarded as a
 /// builder only if its withdrawal credential is builder-prefixed, no deposit
