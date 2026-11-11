@@ -1491,6 +1491,7 @@ mod gloas {
                     None,
                 ),
             ),
+            ethlambda_validator::slashing_protection::SlashingProtection::in_memory(),
         );
         let duty = ProposerDutyDto {
             pubkey: encode_hex(&pubkey.0),
@@ -1609,6 +1610,7 @@ mod gloas {
                     None,
                 ),
             ),
+            ethlambda_validator::slashing_protection::SlashingProtection::in_memory(),
         );
         let duty = ProposerDutyDto {
             pubkey: encode_hex(&pubkey.0),
