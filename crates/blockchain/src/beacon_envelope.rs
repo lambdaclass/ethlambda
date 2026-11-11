@@ -468,7 +468,8 @@ impl BlockChainServer {
 
         // Heze: the payload is also judged against the previous slot's timely
         // inclusion lists (`record_payload_inclusion_list_satisfaction`).
-        let is_heze = block.fork_name() == ForkName::Heze;
+        // EIP-8453 keeps heze's inclusion lists.
+        let is_heze = block.fork_name() >= ForkName::Heze;
         let inclusion_list_transactions: Vec<Vec<u8>> = if is_heze {
             inclusion_list::payload_inclusion_list_transactions(&self.store, root)
                 .unwrap_or_default()
@@ -595,6 +596,10 @@ impl BlockChainServer {
             );
         }
         fork_choice::accept_execution_payload_envelope(&mut self.store, &held.envelope);
+        // EIP-8453: the engine's `on_execution_payload_envelope` (the payload
+        // is verified, when it arrived, and its inclusion list verdict).
+        let now_ms = self.eip8453_now_ms();
+        self.eip8453_on_payload(root, inclusion_list_satisfied || !is_heze, now_ms);
         info!(
             %slot,
             block_root = %ShortRoot(&root.0),

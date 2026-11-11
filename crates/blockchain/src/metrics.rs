@@ -1120,6 +1120,42 @@ pub fn update_head_slot(slot: u64) {
     LEAN_HEAD_SLOT.set(slot.try_into().unwrap());
 }
 
+/// Whether the EIP-8453 fork choice (finality gadget and available chain) runs.
+pub fn set_eip8453_active(active: bool) {
+    static LEAN_EIP8453_FORK_CHOICE_ACTIVE: std::sync::LazyLock<IntGauge> =
+        std::sync::LazyLock::new(|| {
+            register_int_gauge!(
+                "lean_eip8453_fork_choice_active",
+                "1 while the EIP-8453 fork choice replaces LMD-GHOST and Casper FFG"
+            )
+            .unwrap()
+        });
+    LEAN_EIP8453_FORK_CHOICE_ACTIVE.set(i64::from(active));
+}
+
+/// The finality gadget's justified and finalized heights, as the fork choice
+/// last adopted them.
+pub fn set_eip8453_heights(justified: u64, finalized: u64) {
+    static LEAN_EIP8453_JUSTIFIED_HEIGHT: std::sync::LazyLock<IntGauge> =
+        std::sync::LazyLock::new(|| {
+            register_int_gauge!(
+                "lean_eip8453_justified_height",
+                "The EIP-8453 finality gadget's justified height"
+            )
+            .unwrap()
+        });
+    static LEAN_EIP8453_FINALIZED_HEIGHT: std::sync::LazyLock<IntGauge> =
+        std::sync::LazyLock::new(|| {
+            register_int_gauge!(
+                "lean_eip8453_finalized_height",
+                "The EIP-8453 finality gadget's finalized height"
+            )
+            .unwrap()
+        });
+    LEAN_EIP8453_JUSTIFIED_HEIGHT.set(justified.try_into().unwrap_or(i64::MAX));
+    LEAN_EIP8453_FINALIZED_HEIGHT.set(finalized.try_into().unwrap_or(i64::MAX));
+}
+
 pub fn update_latest_justified_slot(slot: u64) {
     LEAN_LATEST_JUSTIFIED_SLOT.set(slot.try_into().unwrap());
 }

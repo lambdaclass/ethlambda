@@ -475,6 +475,12 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     // receiver-count guard in `emit` makes every emission a no-op.
     let events = EventBus::default();
 
+    // EIP-8453's fork choice node: empty until the beacon chain actor installs
+    // the engine at the fork, and shared with the p2p layer (gossip rules of
+    // the fork's topics) and the Beacon API (the next phase's duty endpoints).
+    // Always empty on lean.
+    let eip8453_node = ethlambda_state_transition::beacon::eip8453_node::SharedEip8453Node::new();
+
     // Both chains keep a RocksDB directory now, so this is resolved once
     // rather than in each arm. Opening it before the match also means a bad
     // `--data-dir` fails before any network configuration is derived.
@@ -925,6 +931,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                 custody_columns,
                 engine,
                 safe_slots_to_import_optimistically,
+                eip8453_node.clone(),
             )
         }
     };

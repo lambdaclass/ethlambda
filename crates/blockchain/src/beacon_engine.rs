@@ -73,18 +73,20 @@ pub fn gloas_new_payload_request<'a>(
     envelope: &'a containers::gloas::SignedExecutionPayloadEnvelope,
 ) -> Result<GloasNewPayloadRequest<'a>, EngineError> {
     let mismatch = |reason: &str| Err(EngineError::EnvelopeMismatch(reason.to_string()));
-    let message = match block {
+    // Gloas, heze and EIP-8453 carry gloas's bid; every other fork is not a
+    // payload-envelope fork.
+    let bid = match block {
         SignedBeaconBlock::Lean(_) => return mismatch("the block is not a gloas block"),
-        other => other.gloas_message(),
+        other => other.payload_bid(),
     };
-    let Some(message) = message else {
+    let Some(bid) = bid else {
         return mismatch("the block is not a gloas block");
     };
 
-    if envelope.message.beacon_block_root != message.hash_tree_root() {
+    if envelope.message.beacon_block_root != block.message_hash_tree_root() {
         return mismatch("the envelope's beacon_block_root is not the block's root");
     }
-    let bid = &message.signed_execution_payload_bid().message;
+    let bid = &bid.message;
     if bid.block_hash != envelope.message.payload.block_hash {
         return mismatch("the bid's block_hash is not the payload's block_hash");
     }
@@ -222,7 +224,9 @@ pub async fn ask_envelope_status(
     inclusion_list_transactions: &[Vec<u8>],
 ) -> Result<PayloadStatusV2, EngineError> {
     let request = gloas_new_payload_request(block, envelope)?;
-    if block.fork_name() == ForkName::Heze {
+    // Heze's `engine_newPayloadV6`, which EIP-8453 inherits with heze's
+    // inclusion lists.
+    if block.fork_name() >= ForkName::Heze {
         return client
             .new_payload_v6(
                 request.execution_payload,

@@ -3,6 +3,7 @@ use ethlambda_network_api::{
     AggregateArrival, BlockAnnouncement, BlockArrival, BlockChainToP2PRef, BlockSource,
     DeferredFrom, FetchRequest, InitP2P,
 };
+use ethlambda_state_transition::beacon::eip8453_node::SharedEip8453Node;
 use ethlambda_state_transition::beacon::error::Error as BeaconError;
 use ethlambda_state_transition::beacon::fork_choice;
 use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCacheExt;
@@ -56,6 +57,7 @@ pub use events::{ChainEvent, EventBus, Topic, UnknownTopic};
 pub mod aggregation;
 mod beacon_aggregates;
 mod beacon_columns;
+mod beacon_eip8453;
 pub mod beacon_engine;
 mod beacon_envelope;
 mod beacon_payloads;
@@ -326,6 +328,7 @@ impl BlockChain {
             Vec::new(),
             None,
             constants::SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY,
+            SharedEip8453Node::new(),
         )
     }
 
@@ -353,6 +356,11 @@ impl BlockChain {
     /// when `--execution-endpoint` was not given, and
     /// `safe_slots_to_import_optimistically` is
     /// `--safe-slots-to-import-optimistically`.
+    ///
+    /// `eip8453` is the EIP-8453 fork choice node the p2p layer and the Beacon
+    /// API share with this actor; the actor installs the engine in it once the
+    /// fork is reached.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_beacon(
         store: Store,
         sync_status_controller: SyncStatusController,
@@ -360,6 +368,7 @@ impl BlockChain {
         custody_columns: Vec<u64>,
         engine: Option<EngineClient>,
         safe_slots_to_import_optimistically: u64,
+        eip8453: SharedEip8453Node,
     ) -> BlockChain {
         assert_eq!(
             store.chain(),
@@ -378,6 +387,7 @@ impl BlockChain {
             custody_columns,
             engine,
             safe_slots_to_import_optimistically,
+            eip8453,
         )
     }
 
@@ -405,6 +415,7 @@ impl BlockChain {
         custody_columns: Vec<u64>,
         engine: Option<EngineClient>,
         safe_slots_to_import_optimistically: u64,
+        eip8453: SharedEip8453Node,
     ) -> BlockChain {
         let genesis_time = store.config().genesis_time;
 
@@ -423,7 +434,7 @@ impl BlockChain {
             .inspect_err(|err| error!(%err, "Failed to clear parked data column sidecars"));
 
         let events = ChainEvents::new(events, &store);
-        let handle = BlockChainServer {
+        let mut handle = BlockChainServer {
             store,
             p2p: None,
             pending_blocks: HashMap::new(),
@@ -444,9 +455,15 @@ impl BlockChain {
             sync_status_controller,
             events,
             duties,
+            eip8453: beacon_eip8453::Eip8453Host::new(eip8453),
+        };
+        // A directory already past the fork resumes its fork choice now, so
+        // the first head the actor reports is the gadget's.
+        if handle.store.chain() == Chain::Beacon {
+            handle.ensure_eip8453_engine(unix_now_ms());
         }
         // Own thread: these handlers are long synchronous CPU that starves a shared runtime.
-        .start_with_backend(Backend::Thread);
+        let handle = handle.start_with_backend(Backend::Thread);
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
             .duration_since(SystemTime::now())
             .unwrap_or_default();
@@ -601,6 +618,11 @@ pub struct BlockChainServer {
     /// The lean-only or beacon-only half of this actor's state. See
     /// [`ChainDuties`].
     duties: ChainDuties,
+
+    /// EIP-8453's fork choice, shared with the p2p layer and the Beacon API.
+    /// Empty until the clock reaches the fork (always on lean). See
+    /// [`crate::beacon_eip8453`].
+    eip8453: beacon_eip8453::Eip8453Host,
 }
 
 /// The lean-only or beacon-only half of [`BlockChainServer`]'s state.
@@ -917,8 +939,9 @@ fn data_availability_for(
         SignedBeaconBlock::Gloas(_) | SignedBeaconBlock::Heze(_) => {
             Some(fork_choice::DataAvailability::NotRequired)
         }
-        // EIP-8453 keeps gloas's payload envelopes, so the same holds; its
-        // blocks are refused by fork choice for now anyway.
+        // EIP-8453 keeps gloas's payload envelopes, so the same holds: its
+        // fork choice's `on_execution_payload_envelope` asserts
+        // `is_data_available`, as gloas's does.
         SignedBeaconBlock::Eip8453(_) => Some(fork_choice::DataAvailability::NotRequired),
         // `process_block` dispatches a lean block to `store::on_block` before
         // this function is ever reached, so this arm is never observed for
@@ -1004,7 +1027,11 @@ impl BlockChainServer {
             ),
         };
 
-        if store_time > 0 && tick_time <= store_time {
+        // EIP-8453 ticks every quarter slot, and an arrival may already have
+        // moved the store clock within the same second; the engine's own clock
+        // is idempotent, so its ticks are never skipped here.
+        let eip8453_tick = self.store.chain() == Chain::Beacon && self.eip8453_due(timestamp_ms);
+        if store_time > 0 && tick_time <= store_time && !eip8453_tick {
             debug!(
                 %slot,
                 ?interval,
@@ -1088,6 +1115,14 @@ impl BlockChainServer {
                 // wall clock at tick time), so it doubles as the wall-clock
                 // slot for the gate.
                 self.events.publish_lean_changes(&self.store, slot);
+            }
+            Chain::Beacon if eip8453_tick => {
+                // EIP-8453: the LMD-GHOST store's clock runs up to the fork's
+                // first slot (its last epoch pull-up included), then only moves;
+                // the engine ticks and chooses the head.
+                self.advance_store_clock_for_eip8453(timestamp_ms);
+                self.eip8453_tick(timestamp_ms);
+                self.recompute_beacon_head().await;
             }
             Chain::Beacon => {
                 let config = self.store.config();
@@ -1906,6 +1941,11 @@ impl BlockChainServer {
                     return (timings, Err(err.into()));
                 }
 
+                // EIP-8453: the engine's `on_block` (update_finality, receipt
+                // time, head vote committees), on the block just stored.
+                let now_ms = self.eip8453_now_ms();
+                self.eip8453_on_imported_block(block_root, now_ms);
+
                 // The block is already in the store whatever the rest of this
                 // arm does with its body, so nothing below may turn into an
                 // `Err` that fails the import: that would make this function's
@@ -2060,8 +2100,34 @@ impl BlockChainServer {
             duties: ChainDuties::Beacon,
             beacon_aggregates: Default::default(),
             glamsterdam_banner: Default::default(),
+            eip8453: Default::default(),
             store,
         }
+    }
+
+    /// The EIP-8453 fork choice node this server ticks and feeds. Shared with
+    /// whoever clones it; empty until the fork is reached.
+    pub fn eip8453_node(&self) -> SharedEip8453Node {
+        self.eip8453.node.clone()
+    }
+
+    /// Run this server's tick at `timestamp_ms` without a running actor: the
+    /// clock, the fork choice (the EIP-8453 engine's quarter-slot tick at its
+    /// slots), the head, and the sweeps a tick owes. For a caller driving an
+    /// unspawned server ([`Self::for_replay`]) on its own clock, as the
+    /// in-process EIP-8453 network test does.
+    pub async fn tick_at(&mut self, timestamp_ms: u64) {
+        if self.store.chain() == Chain::Beacon && self.eip8453_due(timestamp_ms) {
+            self.advance_store_clock_for_eip8453(timestamp_ms);
+            self.eip8453_tick(timestamp_ms);
+        } else {
+            let config = self.store.config();
+            fork_choice::on_tick_ms(&mut self.store, timestamp_ms, &config);
+        }
+        self.recompute_beacon_head().await;
+        self.evict_held_blocks_at_or_below_finality();
+        self.evict_envelope_queues_at_or_below_finality();
+        self.settle_envelopes().await;
     }
 
     /// Import one block on the caller's task.
@@ -2554,6 +2620,13 @@ impl BlockChainServer {
             head_start: Some(Instant::now()),
             ..HeadTimings::default()
         };
+        // EIP-8453: the available chain's head, and the finality gadget's
+        // checkpoints, from the engine.
+        if self.eip8453_update_head() {
+            timings.head_end = Some(Instant::now());
+            self.pin_head_shufflings();
+            return timings;
+        }
         let config = self.store.config();
         if let Err(err) = fork_choice::get_head(&mut self.store, &config) {
             // An invalidated justified checkpoint reaches here:
@@ -2617,7 +2690,13 @@ impl BlockChainServer {
         // not been computed yet is skipped. The plan also carries the hashes
         // for a pre-gloas head, which keeps its own cached payload hash;
         // `None` there means a follower still on its checkpoint anchor.
-        let plan = beacon_payloads::forkchoice_plan(&self.store, head_root)?;
+        // EIP-8453: head, safe and finalized from the engine (the head node's
+        // payload, `get_confirmed_execution_block_hash`, the gadget's
+        // finalized block).
+        let plan = match self.eip8453_forkchoice_plan() {
+            Some(plan) => plan?,
+            None => beacon_payloads::forkchoice_plan(&self.store, head_root)?,
+        };
         let state = plan.state;
         let gloas = plan.gloas;
 
@@ -2635,8 +2714,9 @@ impl BlockChainServer {
         // VALID head satisfied its inclusion lists. The follower sends `null`
         // attributes either way.
         let config = self.store.config();
+        // EIP-8453 keeps heze's engine methods and inclusion lists.
         let heze = config.fork_at_epoch(compute_epoch_at_slot(head_slot))
-            == ethlambda_state_transition::beacon::ForkName::Heze;
+            >= ethlambda_state_transition::beacon::ForkName::Heze;
         let response = if heze {
             let custody = CustodyColumns::from_indices(self.custody_columns.iter().copied());
             client
@@ -3799,9 +3879,10 @@ impl BlockChainServer {
         let config = self.store.config();
         match &self.duties {
             ChainDuties::Lean(_) => ms_until_next_interval(now_ms, &config.time_grid()),
-            ChainDuties::Beacon => {
+            // EIP-8453 runs on quarter slots (`Δ`), from a slot before its fork.
+            ChainDuties::Beacon => self.ms_until_next_eip8453_tick(now_ms).unwrap_or_else(|| {
                 ms_until_next_beacon_slot(now_ms, config.genesis_time_ms(), &config)
-            }
+            }),
         }
     }
 
@@ -4663,6 +4744,7 @@ mod tests {
             Vec::new(),
             None,
             constants::SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY,
+            SharedEip8453Node::new(),
         );
     }
 
@@ -4697,6 +4779,7 @@ mod tests {
             sync_status: SyncStatusTracker::new(false),
             sync_status_controller: SyncStatusController::default(),
             duties: ChainDuties::Beacon,
+            eip8453: Default::default(),
         }
     }
 

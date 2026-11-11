@@ -43,13 +43,12 @@ use tracing::{debug, error, warn};
 
 use crate::BlockChainServer;
 
-/// The bid a gloas block carries, or `None` for any other fork.
+/// The bid a gloas-family block (gloas, heze, EIP-8453) carries, or `None`
+/// for any other fork.
 pub(crate) fn bid_of(block: &SignedBeaconBlock) -> Option<&gloas::ExecutionPayloadBid> {
     match block {
         SignedBeaconBlock::Lean(_) => None,
-        other => other
-            .gloas_message()
-            .map(|message| &message.signed_execution_payload_bid().message),
+        other => other.payload_bid().map(|signed| &signed.message),
     }
 }
 
@@ -341,6 +340,7 @@ impl BlockChainServer {
                         holder,
                         satisfied,
                     );
+                    self.eip8453_set_inclusion_list_satisfaction(holder, satisfied);
                 }
                 mark_payloads_validated(&mut self.store, holder)
             }
