@@ -295,10 +295,12 @@ Three differences from lighthouse:
   `MESH_DELIVERY_MAX_HEAD_LAG` slots, and back on only after an epoch within
   that lag, so the counters have refilled. While P3 is off its threshold and
   weight are zero but its cap is not, so the counters keep counting to their
-  real ceiling. `SyncStatus` cannot serve as this gate: on the mainnet
-  follower it reported `synced` through a 10-minute catch-up up to 98 slots
-  behind, since its network-stall rule reads a lagging freshest-known block
-  as a stalled network.
+  real ceiling. `SyncStatus` is not this gate: it reports syncing only past
+  two epochs of lag, and only once peers report a head ahead, where P3 must
+  be off from `MESH_DELIVERY_MAX_HEAD_LAG` slots. (It also used to read a
+  lagging freshest-known block as a stalled network, and reported `synced`
+  through a 10-minute catch-up up to 98 slots behind on the mainnet
+  follower.)
 - **Leaving a topic waits out the peers' backoff.** Gossipsub's default
   backoff after unsubscribing (10 s) is shorter than its prune backoff
   (60 s), and a rust-libp2p peer that sees a mesh peer unsubscribe backs off

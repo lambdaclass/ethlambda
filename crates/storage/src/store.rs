@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -252,6 +253,9 @@ impl Chain {
 /// (e.g. a block's `parent_state` right after import). A miss falls back to a
 /// snapshot read or a diff-chain reconstruction.
 const STATE_CACHE_CAPACITY: usize = 32;
+
+/// [`Store::network_head`]'s "no peer has reported" marker. No slot reaches it.
+const NO_NETWORK_HEAD: u64 = u64::MAX;
 
 /// Keep block proofs for at least this many slots below the tip, even once
 /// finalized. Proofs older than this window are pruned only when the window
@@ -1196,6 +1200,11 @@ pub struct Store {
     /// node's own API), which is why it lives on the `Store` all three share.
     /// See [`ObservedLiveness`]. Always empty on lean.
     observed_liveness: Arc<ObservedLiveness>,
+    /// The head slot this node's peers report, as P2P last aggregated it from
+    /// their `Status` messages, or [`NO_NETWORK_HEAD`] while no connected peer
+    /// has reported one. Written by P2P, read by the chain actor's sync
+    /// tracker; see [`Store::network_head`].
+    network_head: Arc<AtomicU64>,
     /// The total active balance per epoch, shared the way
     /// [`Self::committee_cache`] is: by the chain actor's state transition
     /// and anything else holding a `Store` clone. See
@@ -1846,6 +1855,7 @@ impl Store {
             pending_states,
             committee_cache: Arc::new(CommitteeCache::default()),
             observed_liveness: Arc::new(ObservedLiveness::default()),
+            network_head: Arc::new(AtomicU64::new(NO_NETWORK_HEAD)),
             active_balance_cache: Arc::new(ActiveBalanceCache::default()),
             beacon: Default::default(),
             state_writer,
@@ -3292,6 +3302,27 @@ impl Store {
     /// `Store`. See [`ObservedLiveness`].
     pub fn observed_liveness(&self) -> &ObservedLiveness {
         &self.observed_liveness
+    }
+
+    /// The head slot this node's peers report, or `None` while no connected
+    /// peer has reported one.
+    ///
+    /// The sync tracker's evidence that the network is ahead of this node. It
+    /// is a peer *claim*, not a verified block: P2P drops a head past the wall
+    /// clock and asks several peers to agree before the value moves, and the
+    /// tracker additionally requires the node's own head to trail the clock,
+    /// so no claim alone can stop a node that is current. Runtime-only and
+    /// shared by every clone of this `Store`.
+    pub fn network_head(&self) -> Option<u64> {
+        let slot = self.network_head.load(Ordering::Relaxed);
+        (slot != NO_NETWORK_HEAD).then_some(slot)
+    }
+
+    /// Publish the peers' head; see [`Self::network_head`]. P2P is the only
+    /// writer.
+    pub fn set_network_head(&self, slot: Option<u64>) {
+        let slot = slot.unwrap_or(NO_NETWORK_HEAD);
+        self.network_head.store(slot, Ordering::Relaxed);
     }
 
     /// The total-active-balance cache shared by every clone of this store.
@@ -7190,6 +7221,17 @@ mod tests {
 
         clone.cache_state(key, Arc::new(beacon_test_state(7)));
         assert!(store.cached_state(key).is_some());
+    }
+
+    #[test]
+    fn the_network_head_is_shared_across_store_clones() {
+        let store = Store::test_store();
+        let clone = store.clone();
+        assert_eq!(store.network_head(), None);
+        clone.set_network_head(Some(42));
+        assert_eq!(store.network_head(), Some(42));
+        clone.set_network_head(None);
+        assert_eq!(store.network_head(), None);
     }
 
     #[test]

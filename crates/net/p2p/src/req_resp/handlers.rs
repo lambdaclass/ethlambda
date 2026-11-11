@@ -53,6 +53,7 @@ use crate::beacon::transition;
 use crate::discovery::enr::node_id_from_peer_id;
 use crate::lean::messages::{BlocksByRootRequest, RequestedBlockRoots, Status};
 use crate::lean::protocols::MAX_REQUEST_BLOCKS;
+use crate::peer_heads;
 use crate::req_resp::messages::BlocksByRangeRequest;
 use crate::{
     BACKOFF_MULTIPLIER, CustodyWait, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, MAX_SYNC_RANGE,
@@ -598,15 +599,23 @@ async fn handle_lean_status_request(
     peer: PeerId,
 ) {
     trace!(finalized_slot=%request.finalized.slot, head_slot=%request.head.slot, "Received status request from peer {peer}");
+    peer_heads::observe(server, peer, request.head.slot);
     let our_status = build_status(&server.store);
     respond(server, channel, ResponsePayload::LeanStatus(our_status));
 }
 
 async fn handle_lean_status_response(server: &mut P2PServer, status: Status, peer: PeerId) {
     trace!(finalized_slot=%status.finalized.slot, head_slot=%status.head.slot, "Received status response from peer {peer}");
+    let refresh = server.peer_heads.take_refresh(&peer);
+    peer_heads::observe(server, peer, status.head.slot);
 
     let our_head_slot = server.store.head_slot();
     if status.head.slot <= our_head_slot {
+        return;
+    }
+    // A refresh answer only updates the peer's head unless it shows this node
+    // well behind; see `REFRESH_RANGE_SYNC_LEAD_LEAN`.
+    if refresh && status.head.slot - our_head_slot <= peer_heads::REFRESH_RANGE_SYNC_LEAD_LEAN {
         return;
     }
     let gap = status.head.slot - our_head_slot;
@@ -1730,7 +1739,14 @@ async fn handle_status_request(
             peer_finalized_epoch = peer_status.finalized_epoch(),
             "Beacon status received"
         );
+        // Recorded only from a digest this node syncs from, as an answer is
+        // below: a peer still on a superseded digest is not on the chain being
+        // followed.
+        if transition::is_syncable_digest(wire, peer_status.fork_digest(), unix_now_ms()) {
+            peer_heads::observe(server, peer, peer_status.head_slot());
+        }
     }
+    let wire = server.wire.beacon().expect("checked above");
     let our_status =
         beacon_handler::build_status(&server.store, wire, StatusVersion::of(&peer_status));
     respond(server, channel, ResponsePayload::Status(our_status));
@@ -1836,6 +1852,7 @@ async fn handle_status_response(
     status: BeaconStatus,
     ctx: &Context<P2PServer>,
 ) {
+    let refresh = server.peer_heads.take_refresh(&peer);
     let Some(wire) = server.wire.beacon() else {
         return;
     };
@@ -1866,8 +1883,10 @@ async fn handle_status_response(
         %peer,
         peer_head_slot,
         peer_finalized_epoch = status.finalized_epoch(),
+        refresh,
         "Beacon handshake complete"
     );
+    peer_heads::observe(server, peer, peer_head_slot);
 
     // A whole-block decode per handshake, the same one `build_status` already
     // pays to send ours.
@@ -1877,6 +1896,13 @@ async fn handle_status_response(
     else {
         return;
     };
+    // A refresh answer only updates the peer's head unless it shows this node
+    // an epoch behind; see `REFRESH_RANGE_SYNC_LEAD_BEACON`.
+    if refresh
+        && target_range.end - target_range.start <= peer_heads::REFRESH_RANGE_SYNC_LEAD_BEACON
+    {
+        return;
+    }
 
     debug!(
         %peer,
@@ -2780,6 +2806,7 @@ pub(crate) mod tests {
             outbound_requests: HashMap::new(),
             range_sync_state: None,
             beacon_fetched_through: 0,
+            peer_heads: Default::default(),
             bootnode_addrs: HashMap::new(),
             node_names: HashMap::new(),
             discovery: Some(crate::discovery::dial::DiscoveryState::new(

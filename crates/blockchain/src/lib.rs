@@ -34,7 +34,7 @@ use crate::aggregation::{
     PRIOR_WORKER_JOIN_TIMEOUT, aggregation_deadline, run_aggregation_worker,
 };
 use crate::key_manager::ValidatorKeyPair;
-use crate::sync_status::SyncStatusTracker;
+use crate::sync_status::{SyncStatusTracker, SyncThresholds};
 use spawned_concurrency::actor;
 use spawned_concurrency::error::ActorError;
 use spawned_concurrency::protocol;
@@ -304,7 +304,7 @@ impl BlockChain {
 
         Self::start_actor(
             store,
-            SyncStatusTracker::new(gate_duties),
+            SyncStatusTracker::new(gate_duties, SyncThresholds::LEAN),
             sync_status_controller,
             events,
             ChainDuties::Lean(Box::new(lean)),
@@ -322,7 +322,7 @@ impl BlockChain {
     /// [`ChainDuties::Beacon`]). Feeding it gossip and calling this from
     /// `run_node` are later slices; this constructor only builds the actor.
     ///
-    /// Uses [`SyncStatusTracker::new`]`(false)`: the tracker still drives the
+    /// Uses [`SyncStatusTracker::new`]`(false, ..)`: the tracker still drives the
     /// `lean_node_sync_status` metric (the name predates beacon support), but
     /// there are no duties on this arm for it to gate.
     ///
@@ -356,7 +356,7 @@ impl BlockChain {
 
         Self::start_actor(
             store,
-            SyncStatusTracker::new(false),
+            SyncStatusTracker::new(false, SyncThresholds::BEACON),
             sync_status_controller,
             events,
             ChainDuties::Beacon,
@@ -2018,7 +2018,7 @@ impl BlockChainServer {
             safe_slots_to_import_optimistically,
             last_tick_instant: None,
             epoch_precompute_in_flight: None,
-            sync_status: SyncStatusTracker::new(false),
+            sync_status: SyncStatusTracker::new(false, SyncThresholds::BEACON),
             sync_status_controller: SyncStatusController::default(),
             events: ChainEvents::new(EventBus::default(), &store),
             duties: ChainDuties::Beacon,
@@ -3584,18 +3584,16 @@ impl BlockChainServer {
     ///
     /// Reads the head through [`Self::head_slot`], which is where the
     /// per-chain part of that lives (lean's `Store::head_slot` and beacon's
-    /// `Store::beacon_head` decode different tables). The tracker itself is
-    /// chain-agnostic, but the freshest block seen is not: on a beacon
-    /// follower, once the clock is past a fork the node does not follow (see
-    /// [`Self::clock_is_past_followed_forks`]) the network is treated as fresh.
+    /// `Store::beacon_head` decode different tables), and the network's head
+    /// from [`Store::network_head`], the head the node's peers report in
+    /// `Status`. The tracker itself is chain-agnostic, with per-chain
+    /// thresholds; see [`SyncThresholds`]. On a beacon follower, once the clock
+    /// is past a fork the node does not follow (see
+    /// [`Self::clock_is_past_followed_forks`]) the network is treated as being
+    /// at the clock, since no peer on that fork can tell it so.
     fn update_sync_status(&mut self, current_slot: u64) {
         let head_slot = self.head_slot();
-        let live_max_slot = self
-            .store
-            .max_live_chain_slot()
-            .expect("max live chain slot exists")
-            .unwrap_or(head_slot);
-        let max_seen_slot = match self.store.chain() {
+        let network_head = match self.store.chain() {
             Chain::Beacon
                 if Self::clock_is_past_followed_forks(
                     &self.store.config(),
@@ -3603,13 +3601,13 @@ impl BlockChainServer {
                     head_slot,
                 ) =>
             {
-                current_slot
+                Some(current_slot)
             }
-            Chain::Beacon | Chain::Lean => live_max_slot,
+            Chain::Beacon | Chain::Lean => self.store.network_head(),
         };
         let status = self
             .sync_status
-            .update(current_slot, head_slot, max_seen_slot);
+            .update(current_slot, head_slot, network_head);
         metrics::set_node_sync_status(status);
         self.sync_status_controller.set(status);
     }
@@ -3620,16 +3618,17 @@ impl BlockChainServer {
     /// Every fork is followed today, so this is false; it stays as the guard
     /// for the next fork the node cannot follow.
     ///
-    /// Blocks past the fork do not reach the live chain from the network, so the freshest block
-    /// the store knows stays at the head and the sync tracker would read the
-    /// network as stalled `NETWORK_STALL_THRESHOLD` slots after the fork and
-    /// report `Synced` for good on a node that follows nothing. Nothing else
-    /// tells the node the network is ahead: gossip blocks past the fork are
-    /// ignored in p2p. The fork digest rolls over at runtime, so a node that
-    /// runs across a fork it can follow switches topics and Status digests on
-    /// its own; for a fork it cannot follow that switch brings nothing in. The
-    /// clock is the one signal that is always there, and treating the network
-    /// as fresh lets head lag decide.
+    /// Past such a fork the peers that moved on answer `Status` from a digest
+    /// this node cannot sync from, so none of their heads is recorded (see the
+    /// Status handlers in p2p), and the peers left behind report heads as
+    /// stale as ours. The sync tracker would read that silence as a stalled
+    /// network and report `Synced` for good on a node that follows nothing.
+    /// Nothing else tells the node the network is ahead: gossip blocks past the
+    /// fork are ignored in p2p. The fork digest rolls over at runtime, so a node
+    /// that runs across a fork it can follow switches topics and Status
+    /// digests on its own; for a fork it cannot follow that switch brings
+    /// nothing in. The clock is the one signal that is always there, and
+    /// treating the network as being at the clock lets head lag decide.
     fn clock_is_past_followed_forks(config: &Config, current_slot: u64, head_slot: u64) -> bool {
         let fork_at = |slot: u64| config.fork_at_epoch(compute_epoch_at_slot(slot));
         !fork_at(current_slot).is_followed() && fork_at(head_slot).is_followed()
@@ -4490,7 +4489,7 @@ mod tests {
             safe_slots_to_import_optimistically: constants::SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY,
             last_tick_instant: None,
             epoch_precompute_in_flight: None,
-            sync_status: SyncStatusTracker::new(false),
+            sync_status: SyncStatusTracker::new(false, SyncThresholds::BEACON),
             sync_status_controller: SyncStatusController::default(),
             duties: ChainDuties::Beacon,
         }
@@ -5277,15 +5276,18 @@ mod tests {
         beacon_server(beacon_store_with_config(GENESIS_TIME, 0, config))
     }
 
+    /// Three epochs in: past the beacon tracker's two-epoch clock tolerance
+    /// with the head still at the anchor (slot 0).
+    const THREE_EPOCHS: u64 = 3 * preset::SLOTS_PER_EPOCH;
+
     #[test]
     fn the_clock_reaching_a_followed_fork_does_not_force_syncing() {
-        // Gloas is followed, so blocks past the fork do reach the live chain
-        // and the tracker's own stall detection applies as before: with no
-        // block at all it reads a stalled network as synced, the same as when
-        // no fork is scheduled.
+        // Gloas is followed, so the fork rule stays out of it and the peers
+        // decide: every peer as stale as we are is a stalled network, read as
+        // synced, the same as when no fork is scheduled.
         let mut server = syncing_server(Some(1));
-        let past_the_fork = preset::SLOTS_PER_EPOCH + 8;
-        server.update_sync_status(past_the_fork);
+        server.store.set_network_head(Some(0));
+        server.update_sync_status(THREE_EPOCHS);
         assert_eq!(
             server.sync_status_controller.get(),
             crate::metrics::SyncStatus::Synced
@@ -5297,10 +5299,26 @@ mod tests {
         // The same silence with no gloas scheduled is a stalled network, which
         // the tracker deliberately reports as synced.
         let mut server = syncing_server(None);
-        server.update_sync_status(preset::SLOTS_PER_EPOCH + 8);
+        server.store.set_network_head(Some(0));
+        server.update_sync_status(THREE_EPOCHS);
         assert_eq!(
             server.sync_status_controller.get(),
             crate::metrics::SyncStatus::Synced
+        );
+    }
+
+    #[test]
+    fn a_follower_behind_its_peers_reads_as_syncing() {
+        // The mainnet follower `docs/beacon_wire.md` describes: catching up,
+        // two epochs and more behind the clock, with peers at the clock. It
+        // used to read synced, since the freshest block it knew of was its own
+        // head.
+        let mut server = syncing_server(None);
+        server.store.set_network_head(Some(THREE_EPOCHS));
+        server.update_sync_status(THREE_EPOCHS);
+        assert_eq!(
+            server.sync_status_controller.get(),
+            crate::metrics::SyncStatus::Syncing
         );
     }
 

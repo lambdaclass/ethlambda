@@ -115,6 +115,7 @@ pub mod discovery;
 mod gossipsub;
 pub mod lean;
 pub mod metrics;
+mod peer_heads;
 mod req_resp;
 pub(crate) mod swarm_adapter;
 
@@ -1212,6 +1213,7 @@ impl P2P {
             .beacon()
             .map(|beacon| beacon::scoring::PeerScoring::new(&beacon.config, beacon.fork_digest));
         let local_metadata = built.wire.beacon().map(|beacon| beacon.metadata.clone());
+        let first_status_refresh = status_refresh_interval(&store);
 
         let server = P2PServer {
             swarm_handle,
@@ -1226,6 +1228,7 @@ impl P2P {
             outbound_requests: HashMap::new(),
             range_sync_state: None,
             beacon_fetched_through,
+            peer_heads: Default::default(),
             bootnode_addrs: built.bootnode_addrs,
             node_names,
             discovery: discovery.map(|handle| DiscoveryState::new(handle, built.local_peer_id)),
@@ -1282,6 +1285,13 @@ impl P2P {
             AGGREGATOR_SUBNET_SWEEP_INTERVAL,
             handle.context(),
             p2p_protocol::LeaveExpiredAggregatorSubnets,
+        );
+        // The handshake covers a new peer, so the first refresh waits a full
+        // interval.
+        send_after(
+            first_status_refresh,
+            handle.context(),
+            p2p_protocol::RefreshPeerStatus,
         );
         // The dial loop's first tick. Nothing else schedules one, so without
         // discovery the loop never runs.
@@ -1384,6 +1394,9 @@ pub struct P2PServer {
     /// whether or not it has been imported yet. Gossip never advances it, so
     /// range sync reads it beside the store's head; see `beacon_sync_target`.
     pub(crate) beacon_fetched_through: u64,
+    /// Every connected peer's latest `Status` head, aggregated onto
+    /// `Store::network_head` for the sync tracker. See [`peer_heads`].
+    pub(crate) peer_heads: peer_heads::PeerHeads,
     bootnode_addrs: HashMap<PeerId, Vec<Multiaddr>>,
     node_names: HashMap<PeerId, String>,
 
@@ -1561,6 +1574,9 @@ pub(crate) trait P2PProtocol: Send + Sync {
     fn advance_fork_schedule(&self) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn refresh_peer_scoring(&self) -> Result<(), ActorError>;
+    /// Re-ask every connected peer for its `Status`; see [`peer_heads`].
+    #[allow(dead_code)] // invoked via send_after, not called directly
+    fn refresh_peer_status(&self) -> Result<(), ActorError>;
 }
 
 #[actor(protocol = P2PProtocol)]
@@ -1732,6 +1748,27 @@ impl P2PServer {
             send_after(slot, ctx.clone(), p2p_protocol::RefreshPeerScoring);
         }
         beacon::scoring::refresh(self);
+    }
+
+    /// Re-ask every connected peer for its `Status`, so the head each one
+    /// reported at the handshake does not go stale while it stays connected.
+    /// Both chains; see [`peer_heads`] for the pace.
+    #[send_handler]
+    async fn handle_refresh_peer_status(
+        &mut self,
+        _msg: p2p_protocol::RefreshPeerStatus,
+        ctx: &Context<Self>,
+    ) {
+        send_after(
+            status_refresh_interval(&self.store),
+            ctx.clone(),
+            p2p_protocol::RefreshPeerStatus,
+        );
+        let peers: Vec<PeerId> = self.connected_peers.keys().copied().collect();
+        for peer in peers {
+            self.peer_heads.begin_refresh(peer);
+            request_status(self, peer).await;
+        }
     }
 
     /// The deadline of a range batch held back for custody. Scheduled once,
@@ -1940,6 +1977,40 @@ async fn fetch_missing_columns(server: &mut P2PServer, block_root: H256, columns
 
 // --- Manual Handler for swarm events ---
 
+/// How often to re-ask every connected peer for its `Status`; see
+/// [`peer_heads`] for the pace on each chain.
+fn status_refresh_interval(store: &Store) -> Duration {
+    let slots = match store.chain() {
+        Chain::Lean => peer_heads::STATUS_REFRESH_SLOTS_LEAN,
+        Chain::Beacon => peer_heads::STATUS_REFRESH_SLOTS_BEACON,
+    };
+    Duration::from_millis(store.config().slot_duration_ms.saturating_mul(slots))
+}
+
+/// Send `peer` our `Status`, asking for its own: the periodic refresh. The
+/// handshake in `ConnectionEstablished` sends the same request, with its own
+/// logging around it.
+async fn request_status(server: &P2PServer, peer: PeerId) {
+    // Built before the send, so no borrow of `server.wire` is alive across it.
+    let beacon_status = server.wire.beacon().map(|wire| {
+        beacon::handler::build_status(&server.store, wire, beacon::handler::StatusVersion::V1)
+    });
+    match beacon_status {
+        Some(status) => beacon::handler::send_status(server, peer, status).await,
+        None => {
+            let our_status = build_status(&server.store);
+            server
+                .swarm_handle
+                .send_request(
+                    peer,
+                    Request::LeanStatus(our_status),
+                    ReqRespProtocol::LeanStatus,
+                )
+                .await;
+        }
+    }
+}
+
 impl Handler<WrappedSwarmEvent> for P2PServer {
     async fn handle(&mut self, msg: WrappedSwarmEvent, ctx: &Context<Self>) {
         handle_swarm_event(self, msg.0, ctx).await;
@@ -2072,6 +2143,7 @@ async fn handle_swarm_event(
                     .remove(&peer_id)
                     .unwrap_or(closed_direction);
                 forget_discovered_peer(server, &peer_id);
+                peer_heads::forget(server, &peer_id);
                 server.refresh_peer_metrics();
                 let peer_count = server.connected_peers.len();
                 metrics::notify_peer_disconnected(
@@ -3042,6 +3114,7 @@ pub(crate) mod test_support {
             outbound_requests: HashMap::new(),
             range_sync_state: None,
             beacon_fetched_through: 0,
+            peer_heads: Default::default(),
             bootnode_addrs: HashMap::new(),
             node_names: HashMap::new(),
             discovery: Some(crate::discovery::dial::DiscoveryState::new(

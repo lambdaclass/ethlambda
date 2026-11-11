@@ -166,12 +166,16 @@ flag unset on a placement that does not cover every subnet.
 
 ### Sync gate
 
-`sync_status.rs` tracks how far the local head lags the slot clock. Past the threshold the
-node reports itself syncing and stops attesting and proposing, since a head derived from a
-partial view is not worth voting for. A hysteresis band stops the state from flapping at the
-boundary, and a network-wide stall (nobody else is ahead either) leaves the node synced so
-its validators can help the chain recover. The same status feeds the `lean_node_sync_status`
-metric and, through a shared controller, the `/lean/v0/node/syncing` endpoint.
+`sync_status.rs` decides whether the node is behind. It is syncing, and stops attesting
+and proposing, when its head trails the slot clock **and** the head its peers report is
+ahead of its own, since a head derived from a partial view is not worth voting for. The
+peers' head is each connected peer's latest `Status`, re-requested every few slots, which
+p2p aggregates onto `Store::network_head` (`crates/net/p2p/src/peer_heads.rs`). A
+hysteresis band stops the state from flapping at the boundary, and a network-wide stall
+(nobody else is ahead either) leaves the node synced so its validators can help the chain
+recover. This departs from leanSpec's rule; see `docs/spec_deviations.md`. The same status
+feeds the `lean_node_sync_status` metric and, through a shared controller, the
+`/lean/v0/node/syncing` endpoint.
 `--disable-duty-sync-gate` reduces the gate to observe-only.
 
 ### Missing parents
