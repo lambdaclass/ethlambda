@@ -18,6 +18,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use ethlambda_network_api::SidecarOrigin;
 use ethlambda_state_transition::beacon::gossip::column::{
     is_parkable_gloas, judgeable_block_gloas,
 };
@@ -141,7 +142,7 @@ impl BlockChainServer {
         let Some(ref p2p) = self.p2p else {
             return;
         };
-        let _ = p2p.check_data_column_sidecars(sidecars).inspect_err(
+        let _ = p2p.check_data_column_sidecars(sidecars, SidecarOrigin::Parked).inspect_err(
             |err| error!(%err, "Failed to send data column sidecars to the p2p layer for checks"),
         );
     }

@@ -419,6 +419,10 @@ pub enum RejectReason {
     BuilderIndexMismatch,
     /// A gloas envelope's payload block hash is not its bid's.
     BlockHashMismatch,
+    /// An execution payload's `block_hash` is not the hash of the execution
+    /// block header rebuilt from the payload's own fields. A check stricter
+    /// than the specification's, run in p2p: see `docs/spec_deviations.md`.
+    PayloadBlockHashMismatch,
     /// The root of a gloas envelope's execution requests is not its bid's.
     ExecutionRequestsRootMismatch,
     /// A gloas envelope's payload carries more withdrawals than its limit.
@@ -482,6 +486,7 @@ impl RejectReason {
             Self::PayloadInvalid => "payload_invalid",
             Self::BuilderIndexMismatch => "builder_index_mismatch",
             Self::BlockHashMismatch => "block_hash_mismatch",
+            Self::PayloadBlockHashMismatch => "payload_block_hash_mismatch",
             Self::ExecutionRequestsRootMismatch => "execution_requests_root_mismatch",
             Self::TooManyWithdrawals => "too_many_withdrawals",
             Self::PreGloasSlot => "pre_gloas_slot",

@@ -670,6 +670,24 @@ pub fn inc_beacon_gossip_verdict_expired(kind: &str) {
         .inc();
 }
 
+static LEAN_BEACON_PAYLOAD_BLOCK_HASH_MISMATCH_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(
+    || {
+        register_int_counter_vec!(
+            "lean_beacon_payload_block_hash_mismatch_total",
+            "Execution payloads refused because their block hash is not the hash of the header rebuilt from their fields, by kind (block, envelope)",
+            &["kind"]
+        )
+        .unwrap()
+    },
+);
+
+/// Count one payload refused for a block hash that is not its header's.
+pub fn inc_beacon_payload_block_hash_mismatch(kind: &str) {
+    LEAN_BEACON_PAYLOAD_BLOCK_HASH_MISMATCH_TOTAL
+        .with_label_values(&[kind])
+        .inc();
+}
+
 pub fn inc_beacon_status_digest_mismatch() {
     LEAN_BEACON_STATUS_DIGEST_MISMATCH_TOTAL.inc();
 }
@@ -705,6 +723,28 @@ pub fn inc_data_column_fetch_failure(reason: &str) {
     LEAN_DATA_COLUMN_FETCH_FAILURES_TOTAL
         .with_label_values(&[reason])
         .inc();
+}
+
+/// Count data column sidecars this node built from its own execution client's
+/// blobs, by what `beacon::engine_columns` did with them. `result` is
+/// `"published"` (newly recorded and sent to its subnet topic), `"no_digest"`
+/// (newly recorded and handed to the chain, but no held digest covers its slot
+/// so nothing was published),`"already_seen"` (gossip delivered that column
+/// first) or `"not_custody"` (not one of this node's columns, so not
+/// subscribed and dropped).
+pub fn inc_data_columns_from_execution_layer(result: &str, count: u64) {
+    static LEAN_DATA_COLUMNS_FROM_EXECUTION_LAYER_TOTAL: LazyLock<IntCounterVec> =
+        LazyLock::new(|| {
+            register_int_counter_vec!(
+                "lean_data_columns_from_execution_layer_total",
+                "Data column sidecars built from the local execution client's blobs, by outcome",
+                &["result"]
+            )
+            .unwrap()
+        });
+    LEAN_DATA_COLUMNS_FROM_EXECUTION_LAYER_TOTAL
+        .with_label_values(&[result])
+        .inc_by(count);
 }
 
 /// Test-only readback of [`inc_data_column_fetch_failure`]'s counter. The

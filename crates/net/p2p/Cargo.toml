@@ -13,6 +13,7 @@ version.workspace = true
 ethlambda-network-api.workspace = true
 ethlambda-storage.workspace = true
 ethlambda-metrics.workspace = true
+ethlambda-telemetry.workspace = true
 ethlambda-types.workspace = true
 # For `verify_data_column_sidecar`, the one sidecar check cheap enough to run
 # in the gossip loop: pure structural validation, no KZG. `blst` and `c-kzg`
@@ -73,6 +74,9 @@ rand = "0.8"
 # against with nothing in the manifest saying so.
 ethrex-p2p = { git = "https://github.com/lambdaclass/ethrex", tag = "v25.0.0" }
 ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex", tag = "v25.0.0" }
+# The ordered trie behind a payload's transactions root, which `ethrex-common`
+# only builds from decoded transactions, not the raw bytes a payload carries.
+ethrex-trie = { git = "https://github.com/lambdaclass/ethrex", tag = "v25.0.0" }
 ethrex-common = { git = "https://github.com/lambdaclass/ethrex", tag = "v25.0.0" }
 
 # `rand` seeds the throwaway signing keys the ENR tests build records with.

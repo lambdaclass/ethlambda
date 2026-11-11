@@ -65,6 +65,8 @@ one `CommonOptions` struct flattened into each.
 | `--discovery.port` | `9000` | discv5 UDP port; must differ from `--gossipsub-port`. See [Peer discovery](./discovery.md) |
 | `--discovery.advertise-ip` | bind address | IP published in the ENR |
 | `--discovery.target-peers` | `200` | Connected-peer count above which discovery stops dialing |
+| `--telemetry.clickhouse-url` | off | ClickHouse HTTP endpoint for per-block `block_events` rows; also read from `ETHLAMBDA_TELEMETRY_CLICKHOUSE_URL`, the place for a URL with a password. See [Block telemetry](./telemetry.md) |
+| `--telemetry.client-name` | `--node-id` / `ethlambda@<hostname>` | `meta_client_name` on those rows; requires the URL |
 
 Three of those have no clap default, because the two chains answer them
 differently. A single `default_value` can only say one thing, so the flag

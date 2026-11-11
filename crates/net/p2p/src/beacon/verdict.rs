@@ -358,11 +358,26 @@ impl Validated {
                     .inspect_err(|err| warn!(%err, "Failed to forward a gossip block"));
             }
             Self::Column(sidecar) if outcome == Outcome::Accept => {
+                // Accept means gossip already ran every rule. This instant is
+                // taken in `forward`, after the verdict's trip back through
+                // the p2p actor, where `check_and_forward` takes the instant
+                // its check finished.
+                ethlambda_telemetry::emit(|| {
+                    column_checks::passed_rows(
+                        &sidecar,
+                        column_checks::ColumnArrival::received("gossip", received_at),
+                        Instant::now(),
+                    )
+                });
                 let _ = blockchain
                     .new_data_column_sidecars(vec![*sidecar])
                     .inspect_err(|err| warn!(%err, "Failed to forward a data column sidecar"));
             }
-            Self::Column(sidecar) => column_checks::check_and_forward(server, vec![*sidecar]),
+            Self::Column(sidecar) => column_checks::check_and_forward(
+                server,
+                vec![*sidecar],
+                column_checks::ColumnArrival::received("gossip", received_at),
+            ),
             Self::Aggregate {
                 aggregate,
                 attesting_indices,

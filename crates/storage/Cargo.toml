@@ -25,6 +25,12 @@ libssz-types.workspace = true
 lru.workspace = true
 xdelta3.workspace = true
 
+# The cached fork-choice weights look a block root up once per vote batch, and
+# once per latest message on a rebuild; std's SipHash was one of the largest
+# costs of the head computation's tally. Already in the lockfile through other
+# crates, so this adds no new version.
+foldhash = "0.2.0"
+
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"

@@ -148,29 +148,48 @@ pub fn get_data_column_sidecars(
     );
     (0..NUMBER_OF_COLUMNS)
         .map(|column_index| {
-            let column: Vec<fulu::Cell> = cells_and_proofs
-                .iter()
-                .map(|(cells, _)| {
-                    SszVector::try_from(cells[column_index].to_bytes().to_vec())
-                        .expect("a c-kzg cell is BYTES_PER_CELL bytes")
-                })
-                .collect();
-            let kzg_proofs: Vec<KzgProof> = cells_and_proofs
-                .iter()
-                .map(|(_, proofs)| proofs[column_index])
-                .collect();
-            DataColumnSidecar {
-                index: column_index as u64,
-                column: SszList::try_from(column)
-                    .expect("a block holds at most MAX_BLOB_COMMITMENTS_PER_BLOCK blobs"),
-                kzg_commitments: kzg_commitments.clone(),
-                kzg_proofs: SszList::try_from(kzg_proofs)
-                    .expect("a block holds at most MAX_BLOB_COMMITMENTS_PER_BLOCK blobs"),
-                signed_block_header: signed_block_header.clone(),
-                kzg_commitments_inclusion_proof: inclusion_proof.clone(),
-            }
+            column_sidecar(
+                column_index,
+                signed_block_header,
+                kzg_commitments,
+                inclusion_proof,
+                cells_and_proofs,
+            )
         })
         .collect()
+}
+
+/// The sidecar for one column: that column's cell and proof from every blob,
+/// under the block's header, commitments and inclusion proof. The one place a
+/// sidecar is assembled, so the full set and a requested subset cannot differ.
+fn column_sidecar(
+    column_index: usize,
+    signed_block_header: &SignedBeaconBlockHeader,
+    kzg_commitments: &KzgCommitments,
+    inclusion_proof: &KzgCommitmentsInclusionProof,
+    cells_and_proofs: &[(Box<CellsPerExtBlob>, &ProofsPerBlob)],
+) -> DataColumnSidecar {
+    let column: Vec<fulu::Cell> = cells_and_proofs
+        .iter()
+        .map(|(cells, _)| {
+            SszVector::try_from(cells[column_index].to_bytes().to_vec())
+                .expect("a c-kzg cell is BYTES_PER_CELL bytes")
+        })
+        .collect();
+    let kzg_proofs: Vec<KzgProof> = cells_and_proofs
+        .iter()
+        .map(|(_, proofs)| proofs[column_index])
+        .collect();
+    DataColumnSidecar {
+        index: column_index as u64,
+        column: SszList::try_from(column)
+            .expect("a block holds at most MAX_BLOB_COMMITMENTS_PER_BLOCK blobs"),
+        kzg_commitments: kzg_commitments.clone(),
+        kzg_proofs: SszList::try_from(kzg_proofs)
+            .expect("a block holds at most MAX_BLOB_COMMITMENTS_PER_BLOCK blobs"),
+        signed_block_header: signed_block_header.clone(),
+        kzg_commitments_inclusion_proof: inclusion_proof.clone(),
+    }
 }
 
 /// The specification's `get_data_column_sidecars_from_block`.
@@ -205,25 +224,12 @@ pub fn verified_sidecars(
     blobs: &[Blob],
     cell_proofs: &[KzgProof],
 ) -> Result<Vec<DataColumnSidecar>, SidecarError> {
-    let commitments = &block.message.body.blob_kzg_commitments;
-    if blobs.len() != commitments.len() {
-        return Err(SidecarError::Shape(
-            "the number of blobs differs from the block's commitments",
-        ));
-    }
-    if cell_proofs.len() != blobs.len() * CELLS_PER_EXT_BLOB {
-        return Err(SidecarError::Shape(
-            "the number of cell proofs is not blobs * CELLS_PER_EXT_BLOB",
-        ));
-    }
+    check_shape(block, blobs, cell_proofs)?;
     if blobs.is_empty() {
         return Ok(Vec::new());
     }
-
-    let all_cells: Vec<Box<CellsPerExtBlob>> = blobs
-        .par_iter()
-        .map(|blob| kzg::compute_cells(&blob[..]).map_err(|_| SidecarError::InvalidBlob))
-        .collect::<Result<_, _>>()?;
+    let commitments = &block.message.body.blob_kzg_commitments;
+    let all_cells = compute_all_cells(blobs)?;
 
     let mut batch_commitments = Vec::with_capacity(cell_proofs.len());
     let mut batch_indices = Vec::with_capacity(cell_proofs.len());
@@ -246,14 +252,104 @@ pub fn verified_sidecars(
         return Err(SidecarError::InvalidProofs);
     }
 
-    // The shape check above made the length an exact multiple, so no remainder.
-    let (proof_chunks, _) = cell_proofs.as_chunks::<CELLS_PER_EXT_BLOB>();
-    let cells_and_proofs: Vec<(Box<CellsPerExtBlob>, &ProofsPerBlob)> =
-        all_cells.into_iter().zip(proof_chunks).collect();
+    let cells_and_proofs = pair_cells_with_proofs(all_cells, cell_proofs);
     Ok(get_data_column_sidecars_from_block(
         block,
         &cells_and_proofs,
     ))
+}
+
+/// The sidecars for `columns` of `block`, built from blobs and cell proofs
+/// this node's own execution client returned (`engine_getBlobsV2`), without
+/// verifying the proofs.
+///
+/// Fulu `p2p-interface.md` ("Distributed blob publishing using blobs
+/// retrieved from local execution-layer client") says a client SHOULD skip
+/// verification of blobs it got from its own execution layer, which is why
+/// this is not [`verified_sidecars`]. The caller is the chain actor's
+/// `beacon_blobs` module; blobs from any other source must go through
+/// [`verified_sidecars`].
+///
+/// The shape checks are the same as [`verified_sidecars`]. Only the requested
+/// columns are built, one per distinct index in ascending order, whatever the
+/// order or repetition in `columns`; an index at or past `NUMBER_OF_COLUMNS`
+/// is a [`SidecarError::Shape`]. A block with zero blobs, or an empty
+/// `columns`, yields no sidecars and computes no cells.
+pub fn unverified_sidecars(
+    block: &electra::SignedBeaconBlock,
+    blobs: &[Blob],
+    cell_proofs: &[KzgProof],
+    columns: &[u64],
+) -> Result<Vec<DataColumnSidecar>, SidecarError> {
+    check_shape(block, blobs, cell_proofs)?;
+    let mut columns = columns.to_vec();
+    columns.sort_unstable();
+    columns.dedup();
+    if columns
+        .last()
+        .is_some_and(|&last| last >= NUMBER_OF_COLUMNS as u64)
+    {
+        return Err(SidecarError::Shape(
+            "a requested column index is not below NUMBER_OF_COLUMNS",
+        ));
+    }
+    if blobs.is_empty() || columns.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let cells_and_proofs = pair_cells_with_proofs(compute_all_cells(blobs)?, cell_proofs);
+    let commitments = &block.message.body.blob_kzg_commitments;
+    let (inclusion_proof, body_root) = inclusion_proof_and_body_root(&block.message.body);
+    let header = header_with_body_root(block, body_root);
+    Ok(columns
+        .into_iter()
+        .map(|column_index| {
+            column_sidecar(
+                column_index as usize,
+                &header,
+                commitments,
+                &inclusion_proof,
+                &cells_and_proofs,
+            )
+        })
+        .collect())
+}
+
+/// The count checks both sidecar builders start with, before any KZG work.
+fn check_shape(
+    block: &electra::SignedBeaconBlock,
+    blobs: &[Blob],
+    cell_proofs: &[KzgProof],
+) -> Result<(), SidecarError> {
+    if blobs.len() != block.message.body.blob_kzg_commitments.len() {
+        return Err(SidecarError::Shape(
+            "the number of blobs differs from the block's commitments",
+        ));
+    }
+    if cell_proofs.len() != blobs.len() * CELLS_PER_EXT_BLOB {
+        return Err(SidecarError::Shape(
+            "the number of cell proofs is not blobs * CELLS_PER_EXT_BLOB",
+        ));
+    }
+    Ok(())
+}
+
+/// Every blob's cells, computed in parallel (one blob per task).
+fn compute_all_cells(blobs: &[Blob]) -> Result<Vec<Box<CellsPerExtBlob>>, SidecarError> {
+    blobs
+        .par_iter()
+        .map(|blob| kzg::compute_cells(&blob[..]).map_err(|_| SidecarError::InvalidBlob))
+        .collect()
+}
+
+/// Blob `i`'s cells next to its `CELLS_PER_EXT_BLOB` proofs. `check_shape`
+/// made the proof count an exact multiple, so there is no remainder.
+fn pair_cells_with_proofs(
+    all_cells: Vec<Box<CellsPerExtBlob>>,
+    cell_proofs: &[KzgProof],
+) -> Vec<(Box<CellsPerExtBlob>, &ProofsPerBlob)> {
+    let (proof_chunks, _) = cell_proofs.as_chunks::<CELLS_PER_EXT_BLOB>();
+    all_cells.into_iter().zip(proof_chunks).collect()
 }
 
 #[cfg(test)]
@@ -381,5 +477,66 @@ mod tests {
             verified_sidecars(&block, &[bad], &proofs),
             Err(SidecarError::InvalidBlob)
         ));
+    }
+
+    #[test]
+    fn requested_columns_match_the_verified_set_in_ascending_order() {
+        let blobs = [blob(1), blob(2)];
+        let (block, proofs) = block_with(&blobs);
+        let all = verified_sidecars(&block, &blobs, &proofs).unwrap();
+        let last = NUMBER_OF_COLUMNS as u64 - 1;
+        let got = unverified_sidecars(&block, &blobs, &proofs, &[last, 5, 0, 5]).unwrap();
+        let expected: Vec<_> = [0, 5, last as usize]
+            .into_iter()
+            .map(|i| all[i].clone())
+            .collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn no_requested_columns_or_no_blobs_yield_nothing() {
+        let blobs = [blob(1)];
+        let (block, proofs) = block_with(&blobs);
+        assert!(
+            unverified_sidecars(&block, &blobs, &proofs, &[])
+                .unwrap()
+                .is_empty()
+        );
+        let (empty_block, empty_proofs) = block_with(&[]);
+        assert!(
+            unverified_sidecars(&empty_block, &[], &empty_proofs, &[0, 1])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unverified_sidecars_refuse_bad_shapes() {
+        let blobs = [blob(1)];
+        let (block, proofs) = block_with(&blobs);
+        assert!(matches!(
+            unverified_sidecars(&block, &[], &proofs, &[0]),
+            Err(SidecarError::Shape(_))
+        ));
+        assert!(matches!(
+            unverified_sidecars(&block, &blobs, &proofs[..proofs.len() - 1], &[0]),
+            Err(SidecarError::Shape(_))
+        ));
+        assert!(matches!(
+            unverified_sidecars(&block, &blobs, &proofs, &[0, NUMBER_OF_COLUMNS as u64]),
+            Err(SidecarError::Shape(_))
+        ));
+    }
+
+    #[test]
+    fn a_tampered_proof_still_builds_because_nothing_is_verified() {
+        let blobs = [blob(1), blob(2)];
+        let (block, mut proofs) = block_with(&blobs);
+        proofs.swap(0, 1);
+        let swapped = proofs[0];
+        let got = unverified_sidecars(&block, &blobs, &proofs, &[0]).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].kzg_proofs[0], swapped);
+        assert!(!verify_data_column_sidecar_kzg_proofs(&got[0]).unwrap());
     }
 }

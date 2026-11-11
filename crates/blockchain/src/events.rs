@@ -805,6 +805,27 @@ impl ChainEvents {
         }
     }
 
+    /// `head` again for the head already announced, now that the execution
+    /// client validated its payload.
+    ///
+    /// A block is imported before its payload is judged, so the `head` event
+    /// for a new head goes out with `execution_optimistic: true` and a
+    /// validator client that reacts to it is refused attestation data until the
+    /// verdict arrives. This second event, same head and `false`, is its cue
+    /// to ask again. Only when the view's head is still `head`: a head that
+    /// has moved on was announced on its own.
+    pub(crate) fn publish_beacon_head_validated(
+        &self,
+        store: &Store,
+        head: H256,
+        wall_clock_slot: u64,
+    ) {
+        if self.view.head != head || !self.bus.has_subscribers() {
+            return;
+        }
+        publish_beacon_head_change(store, &self.bus, &self.view, head, wall_clock_slot);
+    }
+
     /// Move the view to `store`'s current values, whether or not anything is
     /// emitted, and hand back the previous one when there is a subscriber to
     /// report the difference to.
@@ -852,9 +873,11 @@ impl ChainEvents {
     /// envelope the actor just imported.
     ///
     /// Both here, in that order: the actor imports an envelope only once its
-    /// payload verified and every sampled column of its blobs is stored (see
-    /// `apply_or_hold_envelope`), which is what `execution_payload_available`
-    /// reports, so the two moments are one.
+    /// consensus checks passed and every sampled column of its blobs is
+    /// stored (see `apply_or_hold_envelope`), which is what
+    /// `execution_payload_available` reports, so the two moments are one. The
+    /// execution client's answer may still be out (`beacon_new_payload`); an
+    /// envelope it refuses is taken back out afterwards.
     pub(crate) fn publish_envelope_imported(
         &self,
         store: &Store,

@@ -362,7 +362,7 @@ fn decode(message: &str) -> EngineError {
 }
 
 /// A `DATA` of any length.
-fn parse_data(text: &str) -> Result<Vec<u8>, EngineError> {
+pub(crate) fn parse_data(text: &str) -> Result<Vec<u8>, EngineError> {
     let digits = text
         .strip_prefix("0x")
         .ok_or_else(|| decode("DATA must be 0x-prefixed"))?;
@@ -370,7 +370,7 @@ fn parse_data(text: &str) -> Result<Vec<u8>, EngineError> {
 }
 
 /// A `DATA` of exactly `N` bytes.
-fn parse_fixed<const N: usize>(text: &str) -> Result<[u8; N], EngineError> {
+pub(crate) fn parse_fixed<const N: usize>(text: &str) -> Result<[u8; N], EngineError> {
     parse_data(text)?.try_into().map_err(|bytes: Vec<u8>| {
         EngineError::Decode(format!("expected {N} bytes, got {}", bytes.len()))
     })

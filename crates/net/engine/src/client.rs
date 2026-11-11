@@ -1,4 +1,4 @@
-//! The JSON-RPC client, its retry ladder, and the four methods.
+//! The JSON-RPC client, its retry ladder, and the methods a follower calls.
 
 use std::time::Duration;
 
@@ -10,8 +10,9 @@ use tracing::{debug, warn};
 use crate::auth::JwtSecret;
 use crate::error::EngineError;
 use crate::types::{
-    ClientVersionV1, CustodyColumns, ExecutionPayloadV3, ExecutionPayloadV4, ForkchoiceStateV1,
-    ForkchoiceUpdatedResponse, PayloadStatusV1, data,
+    BlobAndProofV2, BlobAndProofV2Json, ClientVersionV1, CustodyColumns, ExecutionPayloadV3,
+    ExecutionPayloadV4, ForkchoiceStateV1, ForkchoiceUpdatedResponse, PayloadStatusV1, data,
+    decode_blobs_v2,
 };
 
 /// Per-attempt timeout.
@@ -25,6 +26,10 @@ pub const ENGINE_TIMEOUT: Duration = Duration::from_secs(8);
 /// gives that method. Tighter than [`ENGINE_TIMEOUT`], which stays the default
 /// for the older methods.
 pub const ENGINE_NEW_PAYLOAD_V5_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// Per-attempt timeout for `engine_getBlobsV2`, the value `osaka.md` gives that
+/// method.
+pub const ENGINE_GET_BLOBS_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// How many times one call is attempted before it is given up on.
 ///
@@ -339,6 +344,37 @@ impl EngineClient {
             .call("engine_getPayloadV6", json!([payload_id]))
             .await?;
         response.try_into()
+    }
+
+    /// `engine_getBlobsV2`: every blob named by `versioned_hashes`, in order,
+    /// with its cell proofs, or `None` when the execution client is missing
+    /// any of them.
+    ///
+    /// One attempt, bounded by [`ENGINE_GET_BLOBS_TIMEOUT`], and deliberately
+    /// not through the retry ladder: this call races the gossip delivery of the
+    /// same data columns, and a retry after the ladder's first backoff would
+    /// land after that race is lost. A failure leaves the block to gossip and
+    /// peers, which is where it was anyway.
+    ///
+    /// An answer that is not shaped as the specification requires (wrong
+    /// length, blob size or proof count, or a `null` element) is a
+    /// [`EngineError::Decode`].
+    pub async fn get_blobs_v2(
+        &self,
+        versioned_hashes: &[Bytes32],
+    ) -> Result<Option<Vec<BlobAndProofV2>>, EngineError> {
+        let hashes: Vec<String> = versioned_hashes
+            .iter()
+            .map(|hash| data(hash.as_slice()))
+            .collect();
+        let result: Option<Vec<Option<BlobAndProofV2Json>>> = self
+            .call_once(
+                "engine_getBlobsV2",
+                &json!([hashes]),
+                ENGINE_GET_BLOBS_TIMEOUT,
+            )
+            .await?;
+        decode_blobs_v2(result, versioned_hashes.len())
     }
 
     /// `engine_exchangeCapabilities`. Returns what the execution client says it

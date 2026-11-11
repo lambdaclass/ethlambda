@@ -34,8 +34,10 @@ use super::{
         attestation_subnet_topic, topic_kind,
     },
 };
+use crate::beacon::column_checks::{ColumnArrival, check_and_forward, passed_rows};
 use crate::beacon::constants::ATTESTATION_SUBNET_COUNT;
 use crate::beacon::decode::BeaconGossip;
+use crate::beacon::payload_hash;
 use crate::beacon::verdict::{self, Dispatch, GossipId, Validated};
 use crate::beacon::{BeaconWire, decode as beacon_decode, topics as beacon_topics};
 use crate::{P2PServer, metrics};
@@ -323,6 +325,11 @@ fn triage_block(server: &P2PServer, wire: &BeaconWire, payload: &[u8]) -> Dispat
     {
         return Dispatch::Report(outcome);
     }
+    // Stricter than the specification: see `beacon::payload_hash`. After the
+    // rules that drop most messages, since it hashes every transaction.
+    if let Err(outcome) = payload_hash::reject_block_on_mismatch(&block, block_root) {
+        return Dispatch::Report(outcome);
+    }
     Dispatch::Validate(Validated::Block {
         block: Box::new(block),
         block_root,
@@ -527,6 +534,9 @@ fn triage_envelope(server: &P2PServer, payload: &[u8]) -> Dispatch {
     if let Err(outcome) =
         gossip::envelope::cheap_checks(&server.seen_envelopes, &server.store, &envelope)
     {
+        return Dispatch::Report(outcome);
+    }
+    if let Err(outcome) = payload_hash::reject_envelope_on_mismatch(&envelope) {
         return Dispatch::Report(outcome);
     }
     Dispatch::Validate(Validated::Envelope(Box::new(envelope)))
@@ -981,6 +991,15 @@ pub async fn publish_beacon_block(
             .filter(|sidecar| beacon.custody_columns.contains(&sidecar.index()))
             .collect();
         if !custody.is_empty() {
+            let now = Instant::now();
+            // This node built these columns, so they are trusted without a check.
+            ethlambda_telemetry::emit(|| {
+                let arrival = ColumnArrival::received("local", now);
+                custody
+                    .iter()
+                    .flat_map(|sidecar| passed_rows(sidecar, arrival, now))
+                    .collect()
+            });
             let _ = blockchain
                 .new_data_column_sidecars(custody)
                 .inspect_err(|err| error!(%err, "Failed to hand the custody columns to the chain"));
@@ -1086,7 +1105,11 @@ pub async fn publish_execution_payload_envelope(
             .new_execution_payload_envelope(Box::new(envelope), BlockArrival::now())
             .inspect_err(|err| error!(%err, "Failed to hand the published envelope to the chain"));
     }
-    crate::beacon::column_checks::check_and_forward(server, sidecars);
+    check_and_forward(
+        server,
+        sidecars,
+        ColumnArrival::received("local", Instant::now()),
+    );
 }
 
 /// Gossip a payload attestation message a validator client signed, handed
@@ -1762,7 +1785,7 @@ mod tests {
     #[tokio::test]
     async fn an_envelope_passes_triage_unless_its_key_was_seen() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
-        let envelope = crate::test_support::envelope(1, 3);
+        let envelope = payload_hash::seal_envelope(crate::test_support::envelope(1, 3));
         let payload = envelope.to_ssz();
 
         assert!(matches!(
@@ -1777,6 +1800,20 @@ mod tests {
         assert!(matches!(
             triage_envelope(&server, &payload),
             Dispatch::Report(Outcome::Ignore(IgnoreReason::AlreadySeen))
+        ));
+    }
+
+    /// An envelope whose block hash is not its payload header's is rejected
+    /// in triage, before any state is read, and counted.
+    #[tokio::test]
+    async fn an_envelope_with_a_wrong_block_hash_is_rejected_in_triage() {
+        let server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let mut envelope = payload_hash::seal_envelope(crate::test_support::envelope(1, 3));
+        envelope.message.payload.gas_used += 1;
+
+        assert!(matches!(
+            triage_envelope(&server, &envelope.to_ssz()),
+            Dispatch::Report(Outcome::Reject(RejectReason::PayloadBlockHashMismatch))
         ));
     }
 

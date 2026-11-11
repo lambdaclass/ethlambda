@@ -7,6 +7,7 @@ mod error;
 mod liveness;
 mod metrics;
 pub mod pools;
+mod proto_array;
 mod pubkey_index_cache;
 mod state_codec;
 mod state_diff;
@@ -23,6 +24,7 @@ pub use committee_cache::{CommitteeCache, Lookup, ShufflingKey};
 /// callers can match on it (e.g. to distinguish [`Error::DbVersionMismatch`]).
 pub use error::Error;
 pub use liveness::ObservedLiveness;
+pub use proto_array::{ProtoArrayError, WeightRules};
 pub use pubkey_index_cache::{PubkeyIndexCache, TAIL_MERGE_THRESHOLD};
 pub use target_balance_cache::{TargetBalanceCache, TargetBalances};
 // `CacheKey` lives in `state_writer` (beside the `StateCache` it keys), not

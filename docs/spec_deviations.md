@@ -435,8 +435,9 @@ Three places in the gloas head read something the specification would abort on,
 because a live node holds gaps a fixture tree never has. Each is marked
 "Implementation choice, not spec text" at its definition. The head the node
 runs is `walk_head` (through `get_head_node`) over the weights of
-`compute_node_weights`; the spec-literal references carry the same tolerances so
-that the tests compare like with like.
+`cached_node_weights`, the store's cached vote weights, which the tests hold
+equal to `compute_node_weights`; the spec-literal references carry the same
+tolerances so that the tests compare like with like.
 
 - **Pruned votes** (`compute_node_weights`; in the references,
   `get_attestation_score`, and through it `is_head_weak` and
@@ -460,6 +461,37 @@ that the tests compare like with like.
   early equivocation, never withhold one wrongly.
 - **Equivalence:** each is the specification's answer wherever the specification
   has one; they differ only where it would have raised.
+
+## A payload's block hash must be its header's
+
+`beacon_block` (bellatrix to fulu) and `execution_payload` gossip, and every
+envelope fetched by root or range, are REJECTed when the payload's `block_hash`
+is not `keccak256(rlp(header))` for the execution block header rebuilt from the
+payload's own fields.
+
+- **The specification:** has no such rule. A hash that does not match is the
+  execution client's to find, when the chain actor hands it the payload.
+- **ethlambda:** rebuilds the header in `ethlambda-p2p`
+  (`beacon/payload_hash.rs`) and refuses the message before the stateful rules
+  run. The header takes the payload's fields, the transactions and withdrawals
+  tries, the parent beacon block root (the block's `parent_root`; the
+  envelope's own field in gloas), the EIP-7685 requests hash (the Engine API's
+  request list, `get_execution_requests_list`), and in gloas the keccak of the
+  block access list bytes (EIP-7928) and the slot number (EIP-7843). It is run
+  per fork against real chain data: see the vector table in the module's tests.
+  A bellatrix payload that is the empty default (before the merge) is skipped.
+- **Why:** since `engine_newPayloadV2` the Engine API answers a block-hash
+  mismatch with `INVALID` and a null `latestValidHash`, the same answer as for
+  a payload that executed badly and whose last valid ancestor is unknown.
+  Applying payloads to fork choice before the execution client answers is only
+  safe if the structural case cannot get that far.
+- **Cost and counter:** one trie over the transactions per accepted-looking
+  message, after the cheap rules that drop most of them.
+  `lean_beacon_payload_block_hash_mismatch_total{kind}` counts refusals and a
+  `warn!` names the slot and root.
+- **Equivalence:** a stricter filter, never a looser one: every payload it
+  refuses is one the execution client would call `INVALID`. Blocks fetched by
+  `beacon_blocks_by_range/root` are not checked here.
 
 ## The envelope check reads the cached state root
 
@@ -571,50 +603,92 @@ newer than the release the fixtures are pinned to.
   before it checks the head. Remove this entry when the pin reaches
   `v1.7.0-beta.4`.
 
-## The execution client judges a gloas payload before the envelope is applied
+## Payloads are applied before the execution client answers
 
-`verify_execution_payload_envelope` asks the execution engine last, as part of
-one boolean function. The follower runs the pure consensus checks first
-(`check_execution_payload_envelope`: signature, bid, state, data availability),
-then asks the engine with `engine_newPayloadV5` only about an envelope that
-passed them, and records it with `accept_execution_payload_envelope`. The
-engine's part is answered "valid" inside the checks because its answer has
-three outcomes and the specification's `ExecutionEngine` has two.
+The specification asks the execution engine inside the state transition
+(`process_execution_payload` before gloas, `verify_execution_payload_envelope`
+from it), so a block or envelope enters the store only with an answer in hand,
+and `optimistic-sync.md` relaxes that only for an answer of `NOT_VALIDATED`. The
+running follower does not wait for the answer at all
+(`crates/blockchain/src/beacon_new_payload.rs`):
 
-- **`VALID`:** applied; the payload is recorded `VALID`.
-- **`SYNCING` / `ACCEPTED`:** applied, since the consensus checks passed and the
-  payload is `NOT_VALIDATED` (`optimistic-sync.md`); recorded `SYNCING`, which
-  the attestation gossip rules already read as not yet validated. A later
-  `forkchoiceUpdated` `VALID` for the head, or for a descendant payload, moves
-  it and every optimistic payload on that chain to `VALID`. Unlike a pre-gloas
-  block there is no `is_optimistic_candidate_block` gate: a payload is applied
-  to a block the consensus layer already imported, so there is no
-  merge-transition poisoning to guard against.
-- **`INVALID`:** not applied, so the FULL node of the block never exists; the
-  payload is recorded `INVALID`, children held for it are dropped and later
-  blocks that name it as their FULL parent are dropped instead of held. The
-  block itself and its EMPTY branch stay. `latestValidHash` can reach further
-  back, in which case the first payload after it is condemned the same way
+- A pre-gloas block that is an optimistic candidate is imported as optimistic
+  (`optimistic_roots`) as soon as its consensus checks pass, with its
+  `engine_newPayloadV4` sent first from a task of its own. A gloas envelope is
+  applied as soon as the consensus checks below pass, its payload recorded
+  `NOT_VALIDATED`. Everything that reads optimism reads both as optimistic, so
+  the Beacon API refuses attestation and payload attestation data for them with
+  a `503` until the answer arrives.
+- The answer is applied when it arrives, to what is already in fork choice:
+  `VALID` validates (and sends `head` again for a head that was optimistic),
+  `SYNCING`/`ACCEPTED` changes nothing, `INVALID` removes the block's branch or
+  condemns the gloas payload, exactly as a `forkchoiceUpdated` verdict about an
+  imported block already did.
+- **No answer after the retry ladder** is where this departs from the letter of
+  `optimistic-sync.md`, which says such a block MUST NOT be applied to fork
+  choice. It already is, so it stays, optimistic, and is asked again once a
+  slot. Taking it back out would need an un-import that re-holds its
+  descendants, for a state the next answer resolves anyway.
+- A payload is sent only once the one it builds on has been answered, at most
+  `MAX_NEW_PAYLOADS_IN_FLIGHT` at once, and `forkchoiceUpdated` names the newest
+  payload on the head's chain whose request is not queued or in flight: the
+  Engine API orders only `forkchoiceUpdated`, and a payload the execution client
+  receives before its parent is answered `SYNCING` and may start a sync from
+  peers.
+- At most `MAX_PAYLOADS_AWAITING_VERDICT` payloads wait for an answer; past that
+  the import waits (a pre-gloas block is held, an envelope waits in
+  `awaiting_engine`). Only catch-up reaches it.
+- A block that is not an optimistic candidate (around the merge transition)
+  still waits for its answer inline, as does a server with no mailbox
+  (offline replay): those are the specification's order.
+
+For a gloas payload the follower also orders the checks differently:
+`verify_execution_payload_envelope` asks the engine last, as part of one boolean
+function, while the follower runs the pure consensus checks first
+(`check_execution_payload_envelope`: signature, bid, state, data availability)
+and asks with `engine_newPayloadV5` only about an envelope that passed them,
+recording it with `accept_execution_payload_envelope`. The engine's part is
+answered "valid" inside the checks because its answer has three outcomes and
+the specification's `ExecutionEngine` has two.
+
+- **`VALID`:** the payload is recorded `VALID`.
+- **`SYNCING` / `ACCEPTED`:** recorded `SYNCING`, which the attestation gossip
+  rules already read as not yet validated. A later `forkchoiceUpdated` `VALID`
+  for the head, or for a descendant payload, moves it and every optimistic
+  payload on that chain to `VALID`. Unlike a pre-gloas block there is no
+  `is_optimistic_candidate_block` gate: a payload is applied to a block the
+  consensus layer already imported, so there is no merge-transition poisoning
+  to guard against.
+- **`INVALID`:** the FULL node of the block is removed and the payload is
+  recorded `INVALID`; blocks waiting on it are dropped and later blocks that
+  name it as their FULL parent are dropped instead of held. The block itself and
+  its EMPTY branch stay. `latestValidHash` can reach further back, in which case
+  the first payload after it is condemned the same way
   (`beacon_payloads::resolve_invalid_payload`, which skips blocks that carry no
   payload, unlike the pre-gloas `resolve_invalid_block`). A `forkchoiceUpdated`
-  `INVALID` for a payload already applied removes it again (its FULL node, its
-  stored envelope, and every child built on it).
+  `INVALID` for a payload already applied removes it the same way.
 - **A hash mismatch (`INVALID_BLOCK_HASH`, or `INVALID` with a null
   `latestValidHash`):** the envelope's contents do not hash to the block hash it
-  claims, so only that envelope (by its own root) is refused; the root's
-  payload is not condemned, since the builder's real envelope may still arrive.
-  ethrex has no `INVALID_BLOCK_HASH` status: it answers a block hash mismatch
-  with `INVALID` and a null `latestValidHash`, and an executed-and-failed
-  payload with `INVALID` and its last valid ancestor. So a null one is read as
-  a mismatch and a non-null one as the payload being invalid. A payload that
-  failed with no valid ancestor to name is read as a mismatch too, which only
-  costs a refused envelope.
-- **No answer after the retry ladder:** the payload is not applied, as for a
-  block, but unlike a block the envelope is consensus-valid and already held,
-  so it is kept and the per-slot redrive asks again, about the oldest held
-  envelope only and the rest once that ask is answered, so a down client costs
-  one retry ladder per slot however many wait. It is not fetched again:
-  that would repeat the ladder for every copy that arrives.
+  claims, so the envelope is taken back out (`revert_envelope`: no FULL node,
+  no recorded verdict, no arrival time) and only that envelope (by its own root)
+  is refused; the root's payload is not condemned, since the builder's real
+  envelope may still arrive. Since `engine_newPayloadV2` a block hash mismatch
+  is answered `INVALID` with a null `latestValidHash` (`INVALID_BLOCK_HASH` is
+  "supplanted by `INVALID`", execution-apis `shanghai.md`), and an
+  executed-and-failed payload `INVALID` with its last valid ancestor. So a null
+  one is read as a mismatch and a non-null one as the payload being invalid. A
+  payload that failed with no valid ancestor to name is read as a mismatch too,
+  which only costs a refused envelope. Lighthouse and Prysm reject only the
+  envelope too; they never apply it before the answer, so they have nothing to
+  take back out.
+- **Blocks built on a FULL payload wait for its answer**, not only for its
+  envelope, which is what lets a refused envelope be taken back out with nothing
+  on top of it. `on_block` would accept them as soon as the envelope is applied;
+  Lighthouse (`get_parent_import_status`) and Prysm (`ParentPayloadReady`) hold
+  the same blocks, since their FULL node exists only after the answer.
+- **No answer after the retry ladder:** the envelope stays applied and
+  `NOT_VALIDATED`, the blocks waiting on it keep waiting, and it is asked again
+  once a slot, as for a pre-gloas block.
 
 `latestValidHash` and `VALID` follow the execution-layer chain, not every
 verified ancestor: a gloas block's EL parent is the ancestor whose payload hash
