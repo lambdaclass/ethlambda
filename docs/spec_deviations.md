@@ -969,14 +969,15 @@ node computes the same value another way.
 - **ethlambda:** a restart anchors a fresh engine at the stored finalized
   block (the gadget's, or Casper FFG's before the gadget has finalized),
   replays every stored block above it in slot order (their post-states'
-  checkpoints, their head votes, their verified payloads), and starts the
-  clock at the present: receipt times are the restart's, and the p2p head
-  vote pool, the locks and the saved confirmations start empty. The lean
-  decoupled mode restarts the same way.
+  checkpoints, their head votes, their verified payloads, and the payload
+  invalidations it recorded, below), and starts the clock at the present:
+  receipt times are the restart's, and the p2p head vote pool, the locks and
+  the saved confirmations start empty. The lean decoupled mode restarts the
+  same way.
 - **Why:** the locks and confirmations are a function of what this node saw
   and when, which a restart has lost; the engine catches up from the next
   slot's votes (`an_in_process_network_crosses_the_fork_and_finalizes_with_the_gadget`
-  restarts a node mid-chain and checks it).
+  restarts a node mid-chain from its reopened database and checks it).
 
 ### The stored finalized and justified rows name the gadget's blocks
 
@@ -1039,9 +1040,55 @@ node computes the same value another way.
   payload it builds on (`bid.parent_block_hash`), as gloas reads a checkpoint
   block. `engine_newPayloadV6` and `engine_forkchoiceUpdatedV5`, heze's, carry
   the envelopes and the head. A payload the execution client later finds
-  `INVALID` is cut out of the store's payload structures as under gloas, but
-  the engine keeps it as verified: it has no removal handler, so the FULL
-  node stays selectable until finality prunes it (a known limitation).
+  `INVALID` leaves the engine and the store's payload structures together
+  (below).
+
+### A payload found `INVALID` after it was accepted
+
+- **The specification:** EIP-8453's fork choice has no handler for it:
+  `on_execution_payload_envelope` records a payload once the execution engine
+  has not refused it, and an optimistic answer (`SYNCING`, `ACCEPTED`) lets it
+  in before the engine has executed it. `sync/optimistic.md` says an
+  invalidated block and its descendants are no longer viable, that their
+  weight must not count for their ancestors, and that an invalidated
+  justified or finalized block calls for an operator. p2p-interface.md's
+  `verify_head_vote_payload_status` rejects a vote for a payload whose
+  verdict is `INVALIDATED`, after ignoring one whose envelope was not "seen
+  and verified".
+- **ethlambda:** a later `INVALID` verdict (a `newPayload` or
+  `forkchoiceUpdated` answer about the payload, or a descendant's whose
+  `latestValidHash` reaches it, resolved as under gloas) goes to the engine's
+  `invalidate_payload` before the store's own condemnation. The engine drops
+  the block's FULL node and every block built on it, directly or through a
+  descendant, and refuses the payload's envelope and those blocks from then
+  on; the block and its EMPTY branch stay. So no `get_head`,
+  `get_ac_vote_head`, `get_ac_proposal`, confirmation or FG source names
+  them, a vote for them supports nothing (it still counts as participation,
+  as a vote for an unknown block does), and `is_fg_contest` and
+  `has_viable_descendant` no longer see them. A lock, `latest_confirmed` or
+  saved confirmation on a removed node moves to the block's PENDING node (a
+  lock keeping its deadline, as `unlock` moves one); duty inputs the node
+  recorded earlier in the slot move to its EMPTY node. When the gadget's
+  justified or finalized block builds on the payload (the payload's FULL node
+  is an ancestor of it), nothing changes in the engine or the store and the
+  verdict is logged at `error`. The checkpoint blocks' own payloads are not
+  part of that: the frame roots at their PENDING nodes, and gloas's
+  `notify_forkchoice_updated` already reads a checkpoint as the payload it
+  builds on. An invalidated payload counts as "seen and verified" for the
+  head vote rule, so a vote for it is rejected rather than ignored. Each
+  invalidation is recorded durably (the `invalid_payloads` metadata key,
+  trimmed to the unfinalized window when written), and a restart replays it
+  into the rebuilt engine and the payload verdicts.
+- **Why:** optimistic sync's rule in the engine's terms. Removing what is
+  built on the payload, rather than marking it, makes every reader of the
+  tree honor it the way each already honors a pruned branch. Moving the
+  locks keeps the available chain anchored on the block that is still valid
+  instead of letting the walk restart from the frame's root, and a payload
+  the gadget committed to is the case optimistic sync hands to an operator,
+  so no recovery is invented. The store deletes an invalidated payload's
+  envelope, so without the record a restarted node would read the payload as
+  one never verified, fetch its envelope again for any block built on it, and
+  depend on the execution client to refuse it a second time.
 
 ### Status v3 and `BeaconBlocksByHead`
 

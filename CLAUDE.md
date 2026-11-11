@@ -946,9 +946,21 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   heights in the `fg_*` metadata keys). `forkchoiceUpdated`: head = the head
   node's payload, safe = `get_confirmed_execution_block_hash`, finalized = the
   gadget's finalized block's `parent_block_hash`; heze's V5/V6 engine methods.
-  The fork transition and a restart both anchor a fresh engine at the store's
-  finalized block and replay the stored blocks above it (pre-fork blocks at
-  height 0); the transition also seeds a lock on the last LMD-GHOST head so
+  An `INVALID` verdict on a payload first accepted (a later `newPayload` or
+  `forkchoiceUpdated` answer, or a descendant's `latestValidHash` walk) reaches
+  the engine through `condemn_gloas_payload` before the store's own
+  condemnation: `Store::invalidate_payload` (`ethlambda-decoupled`'s
+  `invalidation.rs`) drops the FULL node and every block built on it from the
+  engine's tree, so no head, head vote, proposal, confirmation or FG source
+  names them, refuses their envelope and blocks from then on, and moves locks
+  and confirmations on them to the block's PENDING node; a payload the
+  gadget's justified or finalized block builds on is logged at `error` and
+  left alone. Each invalidation is recorded in the `invalid_payloads` metadata
+  key, which a restart replays into the rebuilt engine and the payload
+  verdicts. The fork transition and a restart both anchor a fresh engine at
+  the store's finalized block and replay the stored blocks above it (pre-fork
+  blocks at height 0; payload links a restart lost are derived again); the
+  transition also seeds a lock on the last LMD-GHOST head so
   the first proposal does not rewind to the anchor. A genesis at the fork
   leaves the first target root for `process_slot`, and a heze `genesis.ssz`
   is upgraded at load. `SharedEip8453Node` (`beacon/eip8453_node.rs`) is shared
@@ -972,7 +984,11 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   drives the validator client over HTTP against an unspawned actor to
   finalization.
   `beacon_eip8453_network_tests.rs` runs three unspawned actors on a simulated
-  clock across the fork (and from an EIP-8453 genesis) to finalization. See
+  clock across the fork (and from an EIP-8453 genesis) to finalization; with
+  payloads, proposers reveal envelopes through the actor's envelope path to a
+  stand-in execution client (`mock_engine.rs`), blocks build on FULL parents,
+  and two payloads are invalidated (one per verdict path) with every node
+  moving off them, a node restarted from its database included. See
   [`docs/decoupled_consensus.md`](docs/decoupled_consensus.md#beacon),
   [`docs/beacon_stf.md`](docs/beacon_stf.md#eip-8453) and
   [`docs/spec_deviations.md`](docs/spec_deviations.md#eip-8453-decoupled-consensus).

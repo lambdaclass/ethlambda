@@ -67,6 +67,8 @@ crates/blockchain/decoupled/             ethlambda-decoupled: the protocol, chai
   src/views.rs                           vote resolution, p2p/block/proposer views, merge
   src/confirmation.rs                    live locks, fast/slow locks, update_confirmation,
                                          update_locks_and_confirmation, unlock
+  src/invalidation.rs                    invalidate_payload: a payload the execution
+                                         layer found INVALID after accepting it
   src/duties.rs                          get_ac_proposal, get_ac_vote_head, get_ac_frame,
                                          get_head, get_confirmed_node, head_vote_data
   src/validator_client.rs                FinalitySigningRecord, get_finality_vote,
@@ -113,7 +115,7 @@ crates/blockchain/src/decoupled_lean.rs     lean chain actor
 | FG checkpoints per block (`FgCheckpoints`) | `chain_state::ChainStates::import` | `state.target_checkpoint`, `justified_checkpoint`, `finalized_checkpoint` (an empty target root is filled with the block's root, as `process_slot` would) |
 | Committee seats (`HeadVoteCommittees`) | `EveryValidator { n }`: one seat each, every slot | `recorded(HEAD_VOTE_COMMITTEE_SIZE)` and `record_head_vote_committee(slot, get_head_vote_committee(state, slot))` before each message or block vote of that slot |
 | FG weights (`Electorate`) | one per validator | read from `BeaconState` (`get_validator_weight`); the engine never sees them |
-| Payload status | none: every block builds on `Empty`, no payload is ever verified | `BlockInput::parent_payload_status` (`get_parent_payload_status`), `on_execution_payload_envelope(root, inclusion_list_satisfied)`, `set_payload_inclusion_list_satisfaction` |
+| Payload status | none: every block builds on `Empty`, no payload is ever verified | `BlockInput::parent_payload_status` (`get_parent_payload_status`), `on_execution_payload_envelope(root, inclusion_list_satisfied)`, `set_payload_inclusion_list_satisfaction`, `invalidate_payload(root)` on a later `INVALID` |
 | Signatures, gossip rules | XMSS, first message per key | BLS, `validate_head_vote_gossip` |
 
 `get_confirmed_execution_block_hash` is left to the beacon host: it maps
@@ -171,6 +173,31 @@ crates/blockchain/src/decoupled_lean.rs     lean chain actor
   so `TickEvents::head_vote` is false at slot 0.
 - **The signing record never prunes.** `FinalitySigningRecord` has no API that
   drops entries; finality signing locks do not expire.
+- **Invalidating a payload** (`invalidate_payload`). The spec records a payload
+  once the execution engine has not refused it, and an optimistic answer lets
+  it in before the engine has executed it; nothing in the spec takes it back.
+  Following optimistic sync (an invalidated payload and everything built on it
+  is no longer viable, and its weight counts for nothing), the engine drops
+  the block's `Full` node and removes every block built on it, directly or
+  through a descendant, remembering both so the payload's envelope and those
+  blocks are refused if offered again (`BlockError::BuildsOnInvalidPayload`,
+  `PayloadError::Invalidated`). The block and its `Empty` branch stay. Every
+  walk, view and confirmation then reads a tree without them, the way it reads
+  one without pruned branches: `get_head`, `get_ac_vote_head`,
+  `get_ac_proposal`, the confirmation walk and the FG source never reach them;
+  a vote for them no longer resolves, so it supports nothing (it still counts
+  as participation, as a vote for an unknown block does); `is_fg_contest` and
+  `has_viable_descendant` no longer see them. A lock, `latest_confirmed` and
+  the saved confirmations on a removed node move to the block's `Pending`
+  node (a lock keeps its deadline, as `unlock` moves one), and the
+  fast-confirmed path drops them. When the gadget's justified or finalized
+  block builds on the payload (its `Full` node is an ancestor of that block's
+  node, or, for a pruned ancestor, the finalized chain took its `Full`
+  branch), nothing changes and the result says so (`Committed`): the frame
+  would go with it, and optimistic sync leaves that to an operator. The
+  justified or finalized block's own payload is not part of what it commits
+  to (the frame roots at its `Pending` node) and is invalidated like any
+  other.
 
 ### What the spec leaves open, and what the engine does
 
@@ -265,8 +292,11 @@ crates/blockchain/state_transition/src/beacon/
   gossip/{head_vote,fg_attestation}.rs  the two new topics' rules, and `submit`
   gossip/block.rs            EIP-8453's modified beacon_block rules
 crates/blockchain/src/beacon_eip8453.rs   the chain actor: install, replay, tick,
-                                          feed, head and checkpoints, forkchoiceUpdated
-crates/blockchain/src/beacon_eip8453_network_tests.rs  in-process networks
+                                          feed, invalidate, head and checkpoints,
+                                          forkchoiceUpdated
+crates/blockchain/src/beacon_eip8453_network_tests.rs  in-process networks, with and
+                                          without payloads (mock_engine.rs answers
+                                          for the execution client)
 ```
 
 - **Time.** The engine's tick is `4 * slot + quarter` from the beacon slot
@@ -279,9 +309,25 @@ crates/blockchain/src/beacon_eip8453_network_tests.rs  in-process networks
   hands the engine its `BlockInput`. Envelopes reach the engine once
   verified, with their inclusion list verdict.
 - **The fork transition and restarts** both anchor the engine at the store's
-  finalized block and replay the stored blocks above it; at the transition a
-  lock is seeded on the last LMD-GHOST head. See `docs/spec_deviations.md`
-  (EIP-8453) for both.
+  finalized block and replay the stored blocks above it (each with the
+  parent payload status its bid gives, derived again when a restart lost the
+  recorded link); at the transition a lock is seeded on the last LMD-GHOST
+  head. See `docs/spec_deviations.md` (EIP-8453) for both.
+- **Invalid payloads.** Every `INVALID` verdict the actor applies (a later
+  `newPayload` or `forkchoiceUpdated` answer about a payload, or a
+  descendant's `latestValidHash`, resolved to the first invalid payload on its
+  execution chain as under gloas) goes to the engine first
+  (`condemn_gloas_payload` → `eip8453_invalidate_payload` →
+  `Eip8453Node::invalidate_payload`), then to the store's own payload
+  structures. A payload the gadget committed to is logged at `error` and left
+  alone in both. The node also moves its recorded duty inputs off what was
+  removed (to the block's `Empty` node). Each invalidation is recorded in the
+  store's `invalid_payloads` metadata key; a restart replays it into the
+  rebuilt engine (after the stored blocks, which no longer include those
+  built on it) and seeds the payload's `INVALID` verdict again, so its
+  envelope stays refused and a head vote for it stays rejected
+  (`payload_envelope_seen` counts an invalidated payload as seen, so the
+  gossip rule reaches its `REJECT`).
 - **Head and finality.** The actor writes the engine's head (with its
   payload status) and the gadget's justified and finalized blocks to the
   store, which prunes on the finalized one, and sends `forkchoiceUpdated`

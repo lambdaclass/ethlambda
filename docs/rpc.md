@@ -681,9 +681,10 @@ Fulu (`blocks/{slot}`) and gloas (`produceBlockV4`) do the same, and the
   thread. A gloas epoch more than one before the head state's is a `400`.
   `dependent_root` is defined as for attester duties. There is no `503`.
 - **`GET /eth/v1/validator/payload_attestation_data?slot=`** answers
-  `{version: "gloas", data: {beacon_block_root, slot, payload_present,
+  `{version, data: {beacon_block_root, slot, payload_present,
   blob_data_available}}` as JSON, or the SSZ `PayloadAttestationData` on
-  `Accept: application/octet-stream`, with `Eth-Consensus-Version: gloas`. The
+  `Accept: application/octet-stream`, with `Eth-Consensus-Version`; the version
+  is the slot's fork (`gloas`, `heze` or `eip8453`), the container gloas's. The
   data is for the block of that very slot on the head's chain; a slot with no
   such block (or whose block is not a gloas block) answers `204` with no body,
   which a client reads as "cast no vote". A slot before the gloas fork is a
