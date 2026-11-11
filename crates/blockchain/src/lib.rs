@@ -74,6 +74,8 @@ mod glamsterdam;
 pub mod import_timing;
 pub mod key_manager;
 pub mod metrics;
+#[cfg(test)]
+mod mock_engine;
 pub mod reaggregate;
 pub mod spec_test_runner;
 pub mod store;
