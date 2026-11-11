@@ -12,6 +12,8 @@ pub mod block;
 pub mod column;
 pub mod envelope;
 pub mod execution_payload_bid;
+pub mod fg_attestation;
+pub mod head_vote;
 pub mod inclusion_list;
 pub mod operations;
 pub mod payload_attestation;
@@ -203,6 +205,12 @@ pub enum IgnoreReason {
     /// A heze bid's `inclusion_list_bits` leaves out a committee member whose
     /// timely list this node holds.
     InclusionListBitsNotInclusive,
+    /// An EIP-8453 attestation's `epoch` is not the epoch of its committee's
+    /// latest started slot.
+    AttestationEpoch,
+    /// An EIP-8453 message arrived before this node's fork choice for the
+    /// fork runs.
+    ForkChoiceInactive,
 }
 
 impl IgnoreReason {
@@ -247,6 +255,8 @@ impl IgnoreReason {
             Self::SyncCommitteeUnavailable => "sync_committee_unavailable",
             Self::EmptyInclusionList => "empty_inclusion_list",
             Self::InclusionListBitsNotInclusive => "inclusion_list_bits_not_inclusive",
+            Self::AttestationEpoch => "attestation_epoch",
+            Self::ForkChoiceInactive => "fork_choice_inactive",
         }
     }
 }
@@ -356,6 +366,15 @@ pub enum RejectReason {
     /// A message's shape belongs to a different fork than the one its slot
     /// is in: a gloas-shaped bid at a heze slot, or the reverse.
     WrongForkShape,
+    /// An EIP-8453 head vote's slot lies before the fork.
+    PreForkSlot,
+    /// An EIP-8453 head vote names a block from a later slot than its own.
+    VoteBeforeBlock,
+    /// An EIP-8453 head vote for an earlier block names neither its empty nor
+    /// its full payload.
+    PayloadStatusMismatch,
+    /// An EIP-8453 attestation's data is not well formed.
+    MalformedAttestationData,
 }
 
 impl RejectReason {
@@ -414,6 +433,10 @@ impl RejectReason {
             Self::EmptyTransaction => "empty_transaction",
             Self::NotInInclusionListCommittee => "not_in_inclusion_list_committee",
             Self::WrongForkShape => "wrong_fork_shape",
+            Self::PreForkSlot => "pre_fork_slot",
+            Self::VoteBeforeBlock => "vote_before_block",
+            Self::PayloadStatusMismatch => "payload_status_mismatch",
+            Self::MalformedAttestationData => "malformed_attestation_data",
         }
     }
 }

@@ -284,6 +284,29 @@ pub fn anchor(root: Root, slot: Slot, state: &BeaconState) -> Result<Anchor> {
     Ok(Anchor { root, slot, fg })
 }
 
+/// The head's post-state, advanced to the start of `epoch` when it is older:
+/// fork-choice.md's `get_pulled_up_state`, which `on_head_vote_message` reads
+/// committees and domains from. Across the fork the head is a heze block whose
+/// state has neither head vote committees nor EIP-8453's fork version, so a
+/// gossip rule of the fork's first epoch needs the advanced state too.
+///
+/// Through [`fork_choice::checkpoint_state`], so the advance is computed once
+/// per `(epoch, head)` and cached. `None` when the store has no head state.
+pub fn head_state_at_epoch(
+    store: &Store,
+    epoch: crate::beacon::primitives::Epoch,
+    config: &Config,
+) -> Option<std::sync::Arc<BeaconState>> {
+    let head = store.head().ok()?;
+    if let Some(state) = store.cached_state(ethlambda_storage::CacheKey::BlockState(head))
+        && state.slot() / preset::SLOTS_PER_EPOCH >= epoch
+    {
+        return Some(state);
+    }
+    let checkpoint = crate::beacon::containers::Checkpoint { epoch, root: head };
+    fork_choice::checkpoint_state(store, &checkpoint, config).ok()
+}
+
 /// `get_head_vote_committee(state, slot)` as the engine records it.
 pub fn head_vote_committee(
     state: &BeaconState,

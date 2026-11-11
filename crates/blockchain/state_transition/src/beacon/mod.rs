@@ -79,6 +79,9 @@ mod bls_fixtures;
 pub mod das;
 pub mod data_columns;
 pub mod eip8453_fork_choice;
+pub mod eip8453_node;
+#[cfg(test)]
+pub(crate) mod eip8453_test_support;
 pub mod fork_choice;
 pub mod genesis;
 pub mod gloas_block_production;

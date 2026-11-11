@@ -274,10 +274,10 @@ impl ForkRules {
             | ForkName::Electra
             | ForkName::Fulu => ForkRules::PreGloas,
             ForkName::Gloas | ForkName::Heze => ForkRules::Gloas,
-            // TODO(eip8453): EIP-8453 replaces this fork choice with the
-            // finality gadget and the available chain; until that lands its
-            // blocks keep gloas's payload shape here, and `on_block` refuses
-            // them.
+            // EIP-8453 replaces this fork choice with the finality gadget and
+            // the available chain (`eip8453_fork_choice`), but its blocks keep
+            // gloas's payload shape, which is what the rules decide here: the
+            // payload link, the PTC votes and the envelope checks.
             ForkName::Eip8453 => ForkRules::Gloas,
             ForkName::Lean => lean_fork_unreachable("ForkRules::of"),
         }
@@ -586,8 +586,9 @@ pub fn block_operations(block: &SignedBeaconBlock) -> (Vec<Attestation>, Vec<Att
             Attestation::Gloas,
             AttesterSlashing::Gloas,
         ),
-        // TODO(eip8453): finality-gadget attestations are not LMD votes; the
-        // EIP-8453 fork choice reads them (and head votes) itself.
+        // Finality gadget attestations are not LMD votes and EIP-8453's store
+        // keeps no equivocating indices: the state transition counts the
+        // attestations, and the engine reads the block's head votes itself.
         SignedBeaconBlock::Eip8453(_) => (Vec::new(), Vec::new()),
         SignedBeaconBlock::Lean(_) => lean_block_unreachable("fork_choice::block_operations"),
     }
@@ -1272,12 +1273,25 @@ pub fn get_forkchoice_store(
     // `anchor_state.slot()`, not the checkpoint's: the stored checkpoint is
     // epoch-denominated, so an anchor taken mid-epoch would record its epoch's
     // start slot and advertise a floor below anything this directory holds.
+    //
+    // [EIP-8453] The finality gadget finalizes blocks, not epochs: an EIP-8453
+    // anchor (the gadget's finalized block) is recorded at its own slot, so
+    // the ancestry walks against it (`on_block`'s finalized check over the
+    // parent) stop on it rather than below it.
+    let stored_checkpoint = if anchor_state.fork_name() >= ForkName::Eip8453 {
+        ethlambda_types::checkpoint::Checkpoint {
+            root: anchor_root,
+            slot: anchor_slot,
+        }
+    } else {
+        Store::beacon_checkpoint_as_stored(justified_checkpoint)
+    };
     let mut store = Store::init_beacon(
         backend,
         anchor_state.genesis_time(),
         config.clone(),
         anchor_root,
-        Store::beacon_checkpoint_as_stored(justified_checkpoint),
+        stored_checkpoint,
         anchor_state.slot(),
     );
     store.set_time_ms(time_ms).expect("set time");
@@ -3230,18 +3244,14 @@ pub fn get_proposer_head(
 /// is therefore a caller bug, reported by name rather than assumed away, the
 /// same projection `SignedBeaconBlock::gloas_message` gives a block.
 fn gloas_bid(block: &SignedBeaconBlock) -> Result<&gloas::ExecutionPayloadBid> {
-    match block {
-        SignedBeaconBlock::Gloas(inner) => {
-            Ok(&inner.message.body.signed_execution_payload_bid.message)
-        }
-        SignedBeaconBlock::Heze(inner) => {
-            Ok(&inner.message.body.signed_execution_payload_bid.message)
-        }
-        other => Err(Error::UnsupportedForFork {
+    // Gloas, heze and EIP-8453 all carry gloas's bid.
+    block
+        .payload_bid()
+        .map(|signed| &signed.message)
+        .ok_or_else(|| Error::UnsupportedForFork {
             function: "gloas_bid",
-            fork: other.fork_name(),
-        }),
-    }
+            fork: block.fork_name(),
+        })
 }
 
 /// Whether `root` names a block this store holds and that block is
@@ -5055,6 +5065,14 @@ pub fn on_block(
         return Ok(());
     }
 
+    // [Modified in EIP8453] The finality gadget and the available chain
+    // replace this module's LMD-GHOST and Casper FFG: an EIP-8453 block keeps
+    // the payload-aware import (state transition, payload link, PTC votes) and
+    // drops everything this function does for the latter.
+    if matches!(signed_block, SignedBeaconBlock::Eip8453(_)) {
+        return on_block_eip8453(store, signed_block, config, payload_validity, committees);
+    }
+
     // Parent block must be known. `get_state` hands back a shared `Arc`, which
     // both checks the parent is known and gives the value to clone the copy
     // `state_transition` below mutates from: `state_transition` must not be
@@ -5169,12 +5187,9 @@ pub fn on_block(
         // building on it requires `is_payload_verified` above.
         SignedBeaconBlock::Gloas(block) => Some(&block.message.body.payload_attestations),
         SignedBeaconBlock::Heze(block) => Some(&block.message.body.payload_attestations),
-        // TODO(eip8453): import EIP-8453 blocks once its fork choice exists.
+        // Dispatched to `on_block_eip8453` at the top of this function.
         SignedBeaconBlock::Eip8453(_) => {
-            return Err(Error::UnsupportedForFork {
-                function: "fork_choice::on_block",
-                fork: ForkName::Eip8453,
-            });
+            unreachable!("on_block hands EIP-8453 blocks to on_block_eip8453")
         }
         SignedBeaconBlock::Lean(_) => lean_block_unreachable("fork_choice::on_block"),
     };
@@ -5402,6 +5417,132 @@ pub fn on_block(
     // Eagerly compute unrealized justification and finality.
     compute_pulled_up_tip(store, block_root, block_slot, config)?;
 
+    Ok(())
+}
+
+/// EIP-8453's `on_block` (`specs/_features/eip8453/fork-choice.md`), the
+/// part this store holds: the block's state transition and the payload-aware
+/// bookkeeping gloas's `on_block` keeps (payload link, PTC vote vectors,
+/// `notify_ptc_messages`, the execution hash and optimistic records).
+///
+/// What EIP-8453 adds to the fork choice (`update_finality`, the block's
+/// receipt time, its head vote committees) is the engine's: the caller hands
+/// the imported block to it (`eip8453_fork_choice::block_input`), reading the
+/// parent payload status back from the recorded [`BlockPayloadLink`]. Nothing
+/// here touches the Casper FFG checkpoints, proposer boost, block timeliness or
+/// unrealized justifications: EIP-8453's store removes them.
+///
+/// The finalized check is the specification's, over the parent: the finalized
+/// block (the store's [`Store::latest_finalized`], the gadget's once it has
+/// finalized, Casper FFG's at the fork) must be an ancestor of the parent.
+fn on_block_eip8453(
+    store: &mut Store,
+    signed_block: SignedBeaconBlock,
+    config: &Config,
+    payload_validity: &PayloadValidity,
+    committees: &CommitteeCache,
+) -> Result<()> {
+    let block_root = signed_block.message_hash_tree_root();
+    let parent_root = signed_block.parent_root();
+
+    // Parent block must be known.
+    let parent_state = store
+        .get_state(&parent_root)
+        .expect("get")
+        .ok_or(Error::SpecAssert("block.parent_root in store.block_states"))?;
+
+    // If this block builds on the parent's full payload, that payload must
+    // have been verified by `on_execution_payload_envelope`.
+    let parent_status = get_parent_payload_status(store, &signed_block)?;
+    if parent_status == PayloadStatus::Full {
+        verify(
+            is_payload_verified(store, parent_root),
+            "is_payload_verified(store, block.parent_root)",
+        )?;
+    }
+
+    // Blocks cannot be in the future.
+    verify(
+        get_current_slot(store, config) >= signed_block.slot(),
+        "get_current_slot(store) >= block.slot",
+    )?;
+
+    // [Modified in EIP8453] Run the finalized check over the parent.
+    let finalized = store
+        .latest_finalized()
+        .expect("finalized checkpoint exists");
+    let index = store.block_index();
+    let descends = parent_root == finalized.root
+        || get_ancestor(&index, parent_root, finalized.slot)? == finalized.root;
+    verify(
+        descends,
+        "is_ancestor_root(store, block.parent_root, store.finalized_checkpoint.root)",
+    )?;
+
+    // Check the block is valid and compute the post-state.
+    let engine = match payload_validity {
+        PayloadValidity::Invalidated { .. } => stf::ExecutionEngine::invalid(),
+        PayloadValidity::NotRequired | PayloadValidity::Validated | PayloadValidity::Optimistic => {
+            stf::ExecutionEngine::valid()
+        }
+    };
+    let active_balances = store.active_balance_cache();
+    let (mut state, transition) = transition_block(
+        store,
+        &parent_state,
+        parent_root,
+        &signed_block,
+        true,
+        config,
+        &engine,
+        committees,
+        &active_balances,
+    );
+    if let PayloadValidity::Invalidated { latest_valid_hash } = payload_validity {
+        let condemned =
+            resolve_invalid_block(store, &index, block_root, parent_root, *latest_valid_hash);
+        let removed = invalidate_subtree(store, condemned);
+        warn!(
+            block_root = %ShortRoot(&block_root.0),
+            condemned = %ShortRoot(&condemned.0),
+            removed,
+            "Execution layer rejected a payload; invalidated its branch"
+        );
+        return Err(transition.err().unwrap_or(Error::SpecAssert(
+            "the execution layer rejected this block's payload",
+        )));
+    }
+    transition?;
+    state.latest_block_header_mut().state_root = signed_block.state_root();
+
+    // Notify the store about the payload attestations in the block. Before
+    // the block joins the store, as `on_block` orders it, so a failure leaves
+    // nothing behind.
+    if let Some(payload_attestations) = signed_block.payload_attestations() {
+        notify_ptc_messages(store, &state, payload_attestations, config)?;
+    }
+
+    let block_slot = signed_block.slot();
+    let signed_block_el_hash = signed_block.execution_block_hash_if_execution_block();
+    store
+        .insert_signed_block(block_root, signed_block)
+        .expect("insert");
+    store.insert_state(block_root, state).expect("insert");
+    store.set_payload_link(
+        block_root,
+        block_slot,
+        ForkRules::Gloas.payload_link(Some(parent_status)),
+    );
+    store.set_payload_timeliness_vote(block_root, vec![None; preset::PTC_SIZE]);
+    store.set_payload_data_availability_vote(block_root, vec![None; preset::PTC_SIZE]);
+    if let Some(el_block_hash) = signed_block_el_hash {
+        store.insert_beacon_el_block_hash(block_root, block_slot, el_block_hash);
+    }
+    match payload_validity {
+        PayloadValidity::Optimistic => store.insert_beacon_optimistic_root(block_root, block_slot),
+        PayloadValidity::Validated => mark_validated(store, block_root),
+        PayloadValidity::NotRequired | PayloadValidity::Invalidated { .. } => {}
+    }
     Ok(())
 }
 

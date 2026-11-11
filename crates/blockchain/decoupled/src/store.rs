@@ -221,6 +221,12 @@ impl Store {
         self.time
     }
 
+    /// Whether `on_tick` has run. A host stepping the clock one tick at a time
+    /// lets a store that has not jump straight to the present instead.
+    pub fn has_ticked(&self) -> bool {
+        self.ticked
+    }
+
     /// `get_current_slot(store)`.
     pub fn current_slot(&self) -> Slot {
         slot_of(self.time)
