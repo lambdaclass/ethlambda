@@ -174,6 +174,8 @@ mod tests {
             validators_dir: dir.path().to_path_buf(),
             secrets_dir: dir.path().to_path_buf(),
             definitions_lock: Arc::new(tokio::sync::Mutex::new(())),
+            definitions_unflushed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            protection: crate::slashing_protection::SlashingProtection::in_memory(),
             beacon_node: Arc::new(node),
             signing: signing.clone(),
             clock: clock.clone(),
