@@ -51,12 +51,11 @@ impl ValidatorDefinitions {
 
     /// Write the definitions back, replacing the file.
     ///
-    /// Writes to a sibling temporary file and renames it over the target
-    /// rather than truncating in place. The keymanager API calls this while
-    /// validators are signing, and a crash partway through an in-place write
-    /// would leave a truncated file that stops the client booting, losing every
-    /// validator rather than the one being changed. `rename` within one
-    /// directory is atomic, so a reader sees the old file or the new one.
+    /// Through [`secure_fs::write_private_durably`] rather than truncating in
+    /// place. The keymanager API calls this while validators are signing, and
+    /// a crash partway through an in-place write would leave a truncated file
+    /// that stops the client booting, losing every validator rather than the
+    /// one being changed.
     pub fn save(&self, validators_dir: &Path) -> Result<()> {
         let path = validators_dir.join(DEFINITIONS_FILE);
         let contents = serde_yaml_ng::to_string(self).map_err(|err| Error::Keystore {
@@ -64,17 +63,24 @@ impl ValidatorDefinitions {
             reason: err.to_string(),
         })?;
 
-        // Mode set on the temporary file, not the final path: `rename`
-        // preserves it, and setting it here means the file is never
-        // world-readable even for the instant between creation and rename.
-        let temporary = validators_dir.join(format!("{DEFINITIONS_FILE}.tmp"));
-        secure_fs::write_private(&temporary, contents).map_err(|source| Error::Io {
-            path: temporary.display().to_string(),
-            source,
-        })?;
-        std::fs::rename(&temporary, &path).map_err(|source| Error::Io {
-            path: path.display().to_string(),
-            source,
+        // An after-rename failure is `Error::Unflushed`: the file is replaced
+        // and every reader sees the new one, only its survival of a power loss
+        // is in doubt. What that means is the caller's to decide. An import
+        // can count it as written (a lost entry only removes a key), a delete
+        // cannot (a lost removal brings a key back).
+        secure_fs::write_private_durably(&path, contents).map_err(|err| {
+            let path = path.display().to_string();
+            if err.after_rename {
+                Error::Unflushed {
+                    path,
+                    source: err.source,
+                }
+            } else {
+                Error::Io {
+                    path,
+                    source: err.source,
+                }
+            }
         })
     }
 
