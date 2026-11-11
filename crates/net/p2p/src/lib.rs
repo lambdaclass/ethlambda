@@ -46,7 +46,8 @@ use ethlambda_network_api::{
     rpc_to_p2p::{
         PublishBeaconAggregate, PublishBeaconAttestation, PublishBeaconBlock,
         PublishBeaconOperation, PublishExecutionPayloadBid, PublishExecutionPayloadEnvelope,
-        PublishInclusionList, PublishPayloadAttestationMessage, PublishProposerPreferences,
+        PublishFgAttestation, PublishHeadVote, PublishInclusionList,
+        PublishPayloadAttestationMessage, PublishProposerPreferences,
         PublishSyncCommitteeContribution, PublishSyncCommitteeMessage, SubscribeAttestationSubnets,
         SubscribeSyncCommitteeSubnets,
     },
@@ -1962,6 +1963,18 @@ impl Handler<PublishProposerPreferences> for P2PServer {
 impl Handler<PublishInclusionList> for P2PServer {
     async fn handle(&mut self, msg: PublishInclusionList, _ctx: &Context<Self>) {
         gossipsub::publish_inclusion_list(self, msg.signed);
+    }
+}
+
+impl Handler<PublishHeadVote> for P2PServer {
+    async fn handle(&mut self, msg: PublishHeadVote, _ctx: &Context<Self>) {
+        gossipsub::publish_head_vote(self, msg.message);
+    }
+}
+
+impl Handler<PublishFgAttestation> for P2PServer {
+    async fn handle(&mut self, msg: PublishFgAttestation, _ctx: &Context<Self>) {
+        gossipsub::publish_fg_attestation(self, msg.subnet_id, msg.attestation);
     }
 }
 

@@ -1386,6 +1386,73 @@ pub fn publish_inclusion_list(
     );
 }
 
+/// Gossip an EIP-8453 head vote on `head_vote` under its slot's digest. The
+/// caller validated it and applied it to the shared fork choice node, which is
+/// also what marks it seen, so a copy relayed back is ignored on arrival.
+pub fn publish_head_vote(
+    server: &mut P2PServer,
+    message: ethlambda_types::beacon::containers::eip8453::HeadVoteMessage,
+) {
+    let slot = message.data.slot;
+    let Some(beacon) = server.wire.beacon() else {
+        error!(slot, "A head vote reached a lean node; dropping it");
+        return;
+    };
+    let Some(digest) = beacon.publish_digest(slot) else {
+        warn!(
+            slot,
+            "No held fork digest covers this head vote's slot; not publishing"
+        );
+        return;
+    };
+    let topic = IdentTopic::new(beacon_topics::topic_name(digest, beacon_topics::HEAD_VOTE));
+    server
+        .swarm_handle
+        .publish(topic, compress_message(&message.to_ssz()));
+    debug!(
+        slot,
+        validator = message.validator_index,
+        block_root = %ShortRoot(&message.data.beacon_block_root.0),
+        "Published head vote to gossipsub"
+    );
+}
+
+/// Gossip an EIP-8453 finality gadget attestation on
+/// `attestation_{subnet_id}` under the digest of its epoch. The caller
+/// validated and pooled it, marking it seen.
+pub fn publish_fg_attestation(
+    server: &mut P2PServer,
+    subnet_id: u64,
+    attestation: ethlambda_types::beacon::containers::eip8453::SingleAttestation,
+) {
+    let epoch = attestation.epoch;
+    let Some(beacon) = server.wire.beacon() else {
+        error!(
+            epoch,
+            "A finality gadget attestation reached a lean node; dropping it"
+        );
+        return;
+    };
+    let slot = epoch.saturating_mul(ethlambda_types::beacon::preset::SLOTS_PER_EPOCH);
+    let Some(digest) = beacon.publish_digest(slot) else {
+        warn!(
+            epoch,
+            "No held fork digest covers this attestation's epoch; not publishing"
+        );
+        return;
+    };
+    let topic = IdentTopic::new(beacon_topics::fg_attestation_topic_name(digest, subnet_id));
+    server
+        .swarm_handle
+        .publish(topic, compress_message(&attestation.to_ssz()));
+    debug!(
+        epoch,
+        subnet_id,
+        attester = attestation.attester_index,
+        "Published finality gadget attestation to gossipsub"
+    );
+}
+
 pub async fn publish_payload_attestation_message(
     server: &mut P2PServer,
     message: ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage,

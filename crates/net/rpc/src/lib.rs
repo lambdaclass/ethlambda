@@ -247,6 +247,13 @@ pub struct BeaconApiHandles {
     pub client_version: ethlambda_engine::types::ClientVersionV1,
     /// What `/eth/v1/node/identity` reports beyond the peer id.
     pub identity: BeaconIdentity,
+    /// EIP-8453's fork choice node, shared with the chain actor and the p2p
+    /// layer: the duty inputs (`vote_head`, `finality_attestation_input`,
+    /// `proposal`) and the submission paths (`gossip::head_vote::submit`,
+    /// `gossip::fg_attestation::submit`, then `RpcToP2P::publish_*`) the
+    /// EIP-8453 validator endpoints build on. Layered as an `Extension`; no
+    /// endpoint reads it yet.
+    pub eip8453: ethlambda_state_transition::beacon::eip8453_node::SharedEip8453Node,
 }
 
 /// Start the HTTP servers for a beacon node.
@@ -274,6 +281,7 @@ pub async fn start_beacon_rpc_server(
         .layer(Extension(handles.engine))
         .layer(Extension(handles.events))
         .layer(Extension(handles.identity))
+        .layer(Extension(handles.eip8453))
         .layer(Extension(beacon::graffiti::OwnVersion(Arc::new(
             handles.client_version,
         ))));
@@ -617,6 +625,21 @@ pub(crate) mod test_utils {
             signed: ethlambda_types::beacon::containers::heze::SignedInclusionList,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
             self.inclusion_lists.lock().unwrap().push(signed);
+            Ok(())
+        }
+
+        fn publish_head_vote(
+            &self,
+            _message: ethlambda_types::beacon::containers::eip8453::HeadVoteMessage,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            Ok(())
+        }
+
+        fn publish_fg_attestation(
+            &self,
+            _subnet_id: u64,
+            _attestation: ethlambda_types::beacon::containers::eip8453::SingleAttestation,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
             Ok(())
         }
 

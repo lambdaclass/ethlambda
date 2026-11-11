@@ -7,6 +7,7 @@ use ethlambda_types::{
     beacon::containers::{
         DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock,
         altair::{SignedContributionAndProof, SyncCommitteeMessage},
+        eip8453,
         electra::SingleAttestation,
         gloas::{
             PayloadAttestationMessage, SignedExecutionPayloadBid, SignedExecutionPayloadEnvelope,
@@ -476,6 +477,19 @@ pub trait RpcToP2P: Send + Sync {
     /// (heze). Validated and stored by the caller, so the p2p actor only
     /// counts it as seen and publishes.
     fn publish_inclusion_list(&self, signed: SignedInclusionList) -> Result<(), ActorError>;
+    /// Gossip an EIP-8453 head vote on `head_vote`. The caller ran the gossip
+    /// rules and applied it to the shared fork choice node
+    /// (`gossip::head_vote::submit`), which also marks it seen, so the p2p
+    /// actor only publishes.
+    fn publish_head_vote(&self, message: eip8453::HeadVoteMessage) -> Result<(), ActorError>;
+    /// Gossip an EIP-8453 finality gadget attestation on
+    /// `attestation_{subnet_id}`. Validated and pooled by the caller
+    /// (`gossip::fg_attestation::submit`), which also computed the subnet.
+    fn publish_fg_attestation(
+        &self,
+        subnet_id: u64,
+        attestation: eip8453::SingleAttestation,
+    ) -> Result<(), ActorError>;
 }
 
 // --- Shared state: P2P -> RPC ---

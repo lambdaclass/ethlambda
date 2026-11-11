@@ -843,6 +843,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     let rpc_sync_status = sync_status.clone();
     let rpc_events = events.clone();
     let rpc_p2p = p2p.actor_ref().to_rpc_to_p2p_ref();
+    let rpc_eip8453_node = eip8453_node.clone();
     let rpc_custody_columns = match &setup.chain {
         ChainActor::Beacon {
             custody_columns, ..
@@ -889,6 +890,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     events: rpc_events,
                     client_version: version::engine_client_version(),
                     identity: rpc_identity,
+                    eip8453: rpc_eip8453_node,
                 },
                 local_peer_id,
                 rpc_shutdown,

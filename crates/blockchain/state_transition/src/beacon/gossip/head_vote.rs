@@ -28,7 +28,7 @@ use crate::beacon::containers::eip8453;
 use crate::beacon::eip8453_fork_choice::{
     FinalizedDescent, head_state_at_epoch, head_vote_committee, is_finalized_ancestor,
 };
-use crate::beacon::eip8453_node::Eip8453Node;
+use crate::beacon::eip8453_node::{Eip8453Node, SharedEip8453Node};
 use crate::beacon::fork_choice::{self, Store};
 use crate::beacon::helpers::accessors::get_domain;
 use crate::beacon::helpers::misc::{compute_epoch_at_slot, compute_signing_root};
@@ -119,6 +119,37 @@ pub fn stateful_checks(
         return Err(Outcome::Reject(RejectReason::BadSignature));
     }
     Ok(committee)
+}
+
+/// A head vote this node's own validator client submits: the gossip rules,
+/// then, on `Accept`, the vote applied to the fork choice and marked seen,
+/// exactly as a gossip one is. The caller publishes it on `Accept` (gossip
+/// never delivers a node its own message).
+pub fn submit(
+    store: &Store,
+    node: &SharedEip8453Node,
+    message: &eip8453::HeadVoteMessage,
+    now_ms: u64,
+) -> Outcome {
+    let cheap = node.with(|n| cheap_checks(n, store, message, now_ms));
+    match cheap {
+        Err(_) => return Outcome::Ignore(IgnoreReason::ForkChoiceInactive),
+        Ok(Err(outcome)) => return outcome,
+        Ok(Ok(())) => {}
+    }
+    let is_verified = |root: &crate::beacon::primitives::Root| {
+        node.with(|n| n.engine().is_payload_verified(root))
+            .unwrap_or(false)
+    };
+    let committee = match stateful_checks(is_verified, store, message) {
+        Ok(committee) => committee,
+        Err(outcome) => return outcome,
+    };
+    match node.with(|n| n.accept_head_vote(message.clone(), committee, now_ms)) {
+        Ok(Ok(())) => Outcome::Accept,
+        Ok(Err(_)) => Outcome::Ignore(IgnoreReason::AlreadySeen),
+        Err(_) => Outcome::Ignore(IgnoreReason::ForkChoiceInactive),
+    }
 }
 
 /// `verify_head_vote_payload_status`: a vote for its own slot's block names
@@ -219,6 +250,35 @@ mod tests {
         assert_eq!(
             validate(&scene, &message, now),
             Err(Outcome::Ignore(IgnoreReason::AlreadySeen))
+        );
+    }
+
+    #[test]
+    fn a_submitted_vote_is_judged_and_applied_like_a_gossip_one() {
+        let scene = scene(16);
+        let slot = scene.anchor_slot + 1;
+        let now = scene.at(slot, 1_000);
+        let message = scene.head_vote(
+            voter(&scene, slot),
+            data(slot, scene.anchor_root, PAYLOAD_STATUS_EMPTY),
+        );
+        assert_eq!(
+            submit(&scene.store, &scene.node, &message, now),
+            Outcome::Accept
+        );
+        assert_eq!(
+            submit(&scene.store, &scene.node, &message, now),
+            Outcome::Ignore(IgnoreReason::AlreadySeen)
+        );
+        scene
+            .node
+            .with(|n| assert_eq!(n.pooled_head_votes(slot), std::slice::from_ref(&message)))
+            .unwrap();
+        // Before the fork choice runs nothing is accepted.
+        let inactive = crate::beacon::eip8453_node::SharedEip8453Node::new();
+        assert_eq!(
+            submit(&scene.store, &inactive, &message, now),
+            Outcome::Ignore(IgnoreReason::ForkChoiceInactive)
         );
     }
 

@@ -28,7 +28,7 @@ use crate::beacon::eip8453_fork_choice::{
     FinalizedDescent, get_latest_attestation_committee_slot, head_state_at_epoch,
     is_finalized_ancestor,
 };
-use crate::beacon::eip8453_node::Eip8453Node;
+use crate::beacon::eip8453_node::{Eip8453Node, SharedEip8453Node};
 use crate::beacon::fork_choice::Store;
 use crate::beacon::helpers::accessors::get_domain;
 use crate::beacon::helpers::eip8453::{
@@ -80,6 +80,32 @@ pub fn cheap_checks(
         return Err(Outcome::Reject(RejectReason::MalformedAttestationData));
     }
     Ok(round)
+}
+
+/// A single attestation this node's own validator client submits: the gossip
+/// rules for `subnet_id`, then, on `Accept`, pooled and marked seen exactly as
+/// a gossip one is. The caller publishes it on `Accept`.
+pub fn submit(
+    store: &Store,
+    node: &SharedEip8453Node,
+    attestation: &eip8453::SingleAttestation,
+    subnet_id: u64,
+    now_ms: u64,
+) -> Outcome {
+    let round = match node.with(|n| cheap_checks(n, store, attestation, subnet_id, now_ms)) {
+        Err(_) => return Outcome::Ignore(IgnoreReason::ForkChoiceInactive),
+        Ok(Err(outcome)) => return outcome,
+        Ok(Ok(round)) => round,
+    };
+    let outcome = stateful_checks(store, attestation);
+    if outcome != Outcome::Accept {
+        return outcome;
+    }
+    match node.with(|n| n.accept_attestation(attestation.clone(), round)) {
+        Ok(true) => Outcome::Accept,
+        Ok(false) => Outcome::Ignore(IgnoreReason::AlreadySeen),
+        Err(_) => Outcome::Ignore(IgnoreReason::ForkChoiceInactive),
+    }
 }
 
 /// The rules that need the target block and the head state. Runs on a
@@ -194,6 +220,26 @@ mod tests {
             .node
             .with(|node| assert_eq!(node.pooled_attestations(round).len(), 1))
             .unwrap();
+    }
+
+    #[test]
+    fn a_submitted_attestation_is_judged_and_pooled_like_a_gossip_one() {
+        let scene = scene(16);
+        let slot = scene.anchor_slot;
+        let now = scene.at(slot, 1_000);
+        let (committee_index, members) = scene.attestation_committee_at(slot);
+        let epoch = compute_epoch_at_slot(slot);
+        let attestation =
+            scene.attestation(members[0], committee_index, epoch, data(scene.anchor_root));
+        let subnet = compute_subnet_for_attestation(&scene.config, committee_index);
+        assert_eq!(
+            submit(&scene.store, &scene.node, &attestation, subnet, now),
+            Outcome::Accept
+        );
+        assert_eq!(
+            submit(&scene.store, &scene.node, &attestation, subnet, now),
+            Outcome::Ignore(IgnoreReason::AlreadySeen)
+        );
     }
 
     #[test]
