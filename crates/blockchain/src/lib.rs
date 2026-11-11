@@ -910,9 +910,9 @@ fn data_availability_for(
         // block's own import (see `beacon_envelope`). So a gloas block has
         // nothing to wait for here, and `on_block` reads no availability
         // evidence for it.
-        SignedBeaconBlock::Gloas(_) | SignedBeaconBlock::Heze(_) => {
-            Some(fork_choice::DataAvailability::NotRequired)
-        }
+        SignedBeaconBlock::Gloas(_)
+        | SignedBeaconBlock::Heze(_)
+        | SignedBeaconBlock::Eip8483(_) => Some(fork_choice::DataAvailability::NotRequired),
         // `process_block` dispatches a lean block to `store::on_block` before
         // this function is ever reached, so this arm is never observed for
         // one; named on its own rather than folded into the group above so
@@ -2628,8 +2628,9 @@ impl BlockChainServer {
         // VALID head satisfied its inclusion lists. The follower sends `null`
         // attributes either way.
         let config = self.store.config();
-        let heze = config.fork_at_epoch(compute_epoch_at_slot(head_slot))
-            == ethlambda_state_transition::beacon::ForkName::Heze;
+        let heze = config
+            .fork_at_epoch(compute_epoch_at_slot(head_slot))
+            .is_heze_or_later();
         let response = if heze {
             let custody = CustodyColumns::from_indices(self.custody_columns.iter().copied());
             client

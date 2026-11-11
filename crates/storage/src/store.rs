@@ -202,7 +202,11 @@ const KEY_ANCHOR_SLOT: &[u8] = b"anchor_slot";
 /// 8 appended `SLOT_DURATION_MS_HEZE` and `MIN_BLOB_DATA_RETENTION_MS` to
 /// `Config` (EIP-8198), so a directory written by version 7 decodes its stored
 /// config into the wrong fields.
-pub const DB_VERSION: u64 = 8;
+///
+/// 9 added `EIP8483_FORK_VERSION` and `EIP8483_FORK_EPOCH` to `Config`, after
+/// heze's schedule, so a directory written by version 8 decodes its stored
+/// config into the wrong fields.
+pub const DB_VERSION: u64 = 9;
 
 /// The consensus protocol a data directory holds.
 ///
@@ -1004,7 +1008,7 @@ fn builds_on_payload(block: &SignedBeaconBlock, payload_block_hash: &ExecutionBl
                 .parent_block_hash
                 == *payload_block_hash
         }
-        SignedBeaconBlock::Heze(block) => {
+        SignedBeaconBlock::Heze(block) | SignedBeaconBlock::Eip8483(block) => {
             block
                 .message
                 .body
@@ -3928,7 +3932,7 @@ impl Store {
                 .and_then(|bytes| bytes.first().copied())
                 .and_then(ForkName::from_selector);
             let is_gloas = match fork {
-                Some(ForkName::Gloas | ForkName::Heze) => true,
+                Some(ForkName::Gloas | ForkName::Heze | ForkName::Eip8483) => true,
                 Some(
                     ForkName::Phase0
                     | ForkName::Altair

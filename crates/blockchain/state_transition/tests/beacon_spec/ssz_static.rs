@@ -429,12 +429,18 @@ pub fn trials() -> Vec<Trial> {
                     check::<gloas::DataColumnSidecar>(case)
                 }
                 "MatrixEntry"
-                    if matches!(fork, ForkName::Fulu | ForkName::Gloas | ForkName::Heze) =>
+                    if matches!(
+                        fork,
+                        ForkName::Fulu | ForkName::Gloas | ForkName::Heze | ForkName::Eip8483
+                    ) =>
                 {
                     check::<fulu::MatrixEntry>(case)
                 }
                 "DataColumnsByRootIdentifier"
-                    if matches!(fork, ForkName::Fulu | ForkName::Gloas | ForkName::Heze) =>
+                    if matches!(
+                        fork,
+                        ForkName::Fulu | ForkName::Gloas | ForkName::Heze | ForkName::Eip8483
+                    ) =>
                 {
                     check::<fulu::DataColumnsByRootIdentifier>(case)
                 }

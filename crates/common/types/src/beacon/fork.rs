@@ -40,7 +40,8 @@ const BEACON_SNAPSHOT_INTERVAL: u64 = preset::SLOTS_PER_EPOCH;
 /// a target of the beacon STF's `upgrade`-style traversal. See
 /// [`ForkName::ALL`].
 ///
-/// Forks after heze exist upstream but are out of scope for this crate.
+/// Forks after heze exist upstream but are out of scope for this crate, except
+/// EIP-8483, a feature fork built on heze.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ForkName {
     Phase0,
@@ -55,6 +56,12 @@ pub enum ForkName {
     /// are gloas's, except that the execution payload bid gains
     /// `inclusion_list_bits`; see `containers::gloas::ExecutionPayloadBid`.
     Heze,
+    /// EIP-8483, post-quantum material registration (consensus-specs #5809):
+    /// a feature fork on heze, scheduled by its own `EIP8483_FORK_EPOCH`.
+    /// Heze's containers, except that `ExecutionRequests` gains two request
+    /// lists (see `containers::gloas::ExecutionRequests`) and the state two
+    /// registries (`containers::eip8483::BeaconState`).
+    Eip8483,
     /// The Lean consensus protocol, which this repository implements alongside
     /// the Beacon Chain. Not a Beacon Chain fork, and not in [`ForkName::ALL`].
     Lean,
@@ -66,9 +73,9 @@ impl ForkName {
     /// [`ForkName::Lean`] is not here: it is not a Beacon Chain fork. Because
     /// `parse`, `previous`, `next`, and the spec-fixture harness all search this
     /// array, its absence is what makes `parse("lean")` return `None`, keeps
-    /// `Heze.next()` at `None`, and stops any fixture directory from resolving
+    /// `Eip8483.next()` at `None`, and stops any fixture directory from resolving
     /// to a lean case.
-    pub const ALL: [ForkName; 9] = [
+    pub const ALL: [ForkName; 10] = [
         ForkName::Phase0,
         ForkName::Altair,
         ForkName::Bellatrix,
@@ -78,6 +85,7 @@ impl ForkName {
         ForkName::Fulu,
         ForkName::Gloas,
         ForkName::Heze,
+        ForkName::Eip8483,
     ];
 
     /// The lowercase name the specification and its fixture paths use.
@@ -92,6 +100,7 @@ impl ForkName {
             ForkName::Fulu => "fulu",
             ForkName::Gloas => "gloas",
             ForkName::Heze => "heze",
+            ForkName::Eip8483 => "eip8483",
             ForkName::Lean => "lean",
         }
     }
@@ -140,7 +149,8 @@ impl ForkName {
             | ForkName::Electra
             | ForkName::Fulu
             | ForkName::Gloas
-            | ForkName::Heze => true,
+            | ForkName::Heze
+            | ForkName::Eip8483 => true,
             ForkName::Lean => super::lean_fork_unreachable("ForkName::is_followed"),
         }
     }
@@ -154,7 +164,7 @@ impl ForkName {
     /// gloas must be listed here, so the compiler forces the decision.
     pub const fn has_payload_envelopes(self) -> bool {
         match self {
-            ForkName::Gloas | ForkName::Heze => true,
+            ForkName::Gloas | ForkName::Heze | ForkName::Eip8483 => true,
             ForkName::Phase0
             | ForkName::Altair
             | ForkName::Bellatrix
@@ -175,7 +185,7 @@ impl ForkName {
     /// [`Self::has_payload_envelopes`] gives.
     pub const fn is_gloas_or_later(self) -> bool {
         match self {
-            ForkName::Gloas | ForkName::Heze => true,
+            ForkName::Gloas | ForkName::Heze | ForkName::Eip8483 => true,
             ForkName::Phase0
             | ForkName::Altair
             | ForkName::Bellatrix
@@ -187,12 +197,35 @@ impl ForkName {
         }
     }
 
+    /// Whether this is heze or a later beacon fork.
+    ///
+    /// EIP-8483 keeps every heze rule (inclusion lists, EIP-8015's removed
+    /// eth1 fields, EIP-8198's slot schedule, heze's bid shape), so a rule
+    /// the specification states "from heze on" asks this rather than
+    /// comparing with [`ForkName::Heze`]. An explicit match for the reason
+    /// [`Self::has_payload_envelopes`] gives.
+    pub const fn is_heze_or_later(self) -> bool {
+        match self {
+            ForkName::Heze | ForkName::Eip8483 => true,
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb
+            | ForkName::Electra
+            | ForkName::Fulu
+            | ForkName::Gloas
+            | ForkName::Lean => false,
+        }
+    }
+
     /// Whether this fork's `ExecutionRequests` carries EIP-8483's two
     /// post-quantum registration request lists, and its state the two
     /// registries they write. An explicit match for the reason
     /// [`Self::has_payload_envelopes`] gives.
     pub const fn has_pq_registrations(self) -> bool {
         match self {
+            ForkName::Eip8483 => true,
             ForkName::Phase0
             | ForkName::Altair
             | ForkName::Bellatrix
@@ -226,6 +259,7 @@ impl ForkName {
             ForkName::Fulu => 6,
             ForkName::Gloas => 7,
             ForkName::Heze => 8,
+            ForkName::Eip8483 => 9,
             ForkName::Lean => 255,
         }
     }
@@ -251,7 +285,8 @@ impl ForkName {
             | ForkName::Electra
             | ForkName::Fulu
             | ForkName::Gloas
-            | ForkName::Heze => BEACON_SNAPSHOT_INTERVAL,
+            | ForkName::Heze
+            | ForkName::Eip8483 => BEACON_SNAPSHOT_INTERVAL,
         }
     }
 
@@ -270,6 +305,7 @@ impl ForkName {
             6 => Some(ForkName::Fulu),
             7 => Some(ForkName::Gloas),
             8 => Some(ForkName::Heze),
+            9 => Some(ForkName::Eip8483),
             255 => Some(ForkName::Lean),
             _ => None,
         }
@@ -308,22 +344,38 @@ mod tests {
         }
         assert_eq!(ForkName::parse("gloas"), Some(ForkName::Gloas));
         assert_eq!(ForkName::parse("heze"), Some(ForkName::Heze));
+        assert_eq!(ForkName::parse("eip8483"), Some(ForkName::Eip8483));
         assert_eq!(ForkName::parse("eip8321"), None);
     }
 
     #[test]
-    fn heze_is_the_last_beacon_fork() {
+    fn eip8483_is_the_last_beacon_fork() {
         assert_eq!(ForkName::Gloas.next(), Some(ForkName::Heze));
+        assert_eq!(ForkName::Heze.next(), Some(ForkName::Eip8483));
         // Also guards the reason Lean is kept out of ALL: adding it there
         // would make this None into Some(Lean) and let `upgrade` walk off
         // the end.
-        assert_eq!(ForkName::Heze.next(), None);
+        assert_eq!(ForkName::Eip8483.next(), None);
+    }
+
+    #[test]
+    fn heze_rules_and_pq_registrations_hold_from_their_forks_on() {
+        for fork in ForkName::ALL {
+            assert_eq!(fork.is_heze_or_later(), fork >= ForkName::Heze, "{fork}");
+            assert_eq!(
+                fork.has_pq_registrations(),
+                fork >= ForkName::Eip8483,
+                "{fork}"
+            );
+        }
+        assert!(!ForkName::Lean.is_heze_or_later());
+        assert!(!ForkName::Lean.has_pq_registrations());
     }
 
     #[test]
     fn neighbours_terminate_at_the_ends() {
         assert_eq!(ForkName::Phase0.previous(), None);
-        assert_eq!(ForkName::Heze.next(), None);
+        assert_eq!(ForkName::Eip8483.next(), None);
         assert_eq!(ForkName::Altair.previous(), Some(ForkName::Phase0));
         assert_eq!(ForkName::Altair.next(), Some(ForkName::Bellatrix));
     }
@@ -381,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn every_beacon_fork_through_heze_is_followed() {
+    fn every_beacon_fork_through_eip8483_is_followed() {
         for fork in ForkName::ALL {
             assert!(fork.is_followed(), "{fork:?}");
         }
@@ -402,9 +454,10 @@ mod tests {
         assert_eq!(ForkName::Fulu.selector(), 6);
         assert_eq!(ForkName::Gloas.selector(), 7);
         assert_eq!(ForkName::Heze.selector(), 8);
+        assert_eq!(ForkName::Eip8483.selector(), 9);
         // Lean sits at the top of the byte range so the forks after heze can
         // keep taking the next free value.
         assert_eq!(ForkName::Lean.selector(), 255);
-        assert_eq!(ForkName::from_selector(9), None);
+        assert_eq!(ForkName::from_selector(10), None);
     }
 }

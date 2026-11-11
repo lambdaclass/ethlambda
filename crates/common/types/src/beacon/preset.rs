@@ -1243,7 +1243,8 @@ pub mod retuned {
             | ForkName::Electra
             | ForkName::Fulu
             | ForkName::Gloas
-            | ForkName::Heze => super::PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX,
+            | ForkName::Heze
+            | ForkName::Eip8483 => super::PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX,
             ForkName::Lean => lean_fork_unreachable("proportional_slashing_multiplier"),
         }
     }
@@ -1265,9 +1266,11 @@ pub mod retuned {
             ForkName::Bellatrix | ForkName::Capella | ForkName::Deneb => {
                 super::MIN_SLASHING_PENALTY_QUOTIENT_BELLATRIX
             }
-            ForkName::Electra | ForkName::Fulu | ForkName::Gloas | ForkName::Heze => {
-                super::MIN_SLASHING_PENALTY_QUOTIENT_ELECTRA
-            }
+            ForkName::Electra
+            | ForkName::Fulu
+            | ForkName::Gloas
+            | ForkName::Heze
+            | ForkName::Eip8483 => super::MIN_SLASHING_PENALTY_QUOTIENT_ELECTRA,
             ForkName::Lean => lean_fork_unreachable("min_slashing_penalty_quotient"),
         }
     }
@@ -1281,9 +1284,11 @@ pub mod retuned {
     /// small one.
     pub fn whistleblower_reward_quotient(fork: ForkName) -> u64 {
         match fork {
-            ForkName::Electra | ForkName::Fulu | ForkName::Gloas | ForkName::Heze => {
-                super::WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA
-            }
+            ForkName::Electra
+            | ForkName::Fulu
+            | ForkName::Gloas
+            | ForkName::Heze
+            | ForkName::Eip8483 => super::WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA,
             ForkName::Phase0
             | ForkName::Altair
             | ForkName::Bellatrix
@@ -1310,7 +1315,8 @@ pub mod retuned {
             | ForkName::Electra
             | ForkName::Fulu
             | ForkName::Gloas
-            | ForkName::Heze => super::INACTIVITY_PENALTY_QUOTIENT_BELLATRIX,
+            | ForkName::Heze
+            | ForkName::Eip8483 => super::INACTIVITY_PENALTY_QUOTIENT_BELLATRIX,
             ForkName::Lean => lean_fork_unreachable("inactivity_penalty_quotient"),
         }
     }

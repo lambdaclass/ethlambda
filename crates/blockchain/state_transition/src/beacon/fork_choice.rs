@@ -269,7 +269,7 @@ impl ForkRules {
             | ForkName::Deneb
             | ForkName::Electra
             | ForkName::Fulu => ForkRules::PreGloas,
-            ForkName::Gloas | ForkName::Heze => ForkRules::Gloas,
+            ForkName::Gloas | ForkName::Heze | ForkName::Eip8483 => ForkRules::Gloas,
             ForkName::Lean => lean_fork_unreachable("ForkRules::of"),
         }
     }
@@ -571,7 +571,7 @@ pub fn block_operations(block: &SignedBeaconBlock) -> (Vec<Attestation>, Vec<Att
             Attestation::Gloas,
             AttesterSlashing::Gloas,
         ),
-        SignedBeaconBlock::Heze(block) => wrap_operations(
+        SignedBeaconBlock::Heze(block) | SignedBeaconBlock::Eip8483(block) => wrap_operations(
             block.message.body.attestations.iter(),
             block.message.body.attester_slashings.iter(),
             Attestation::Gloas,
@@ -3190,7 +3190,7 @@ fn gloas_bid(block: &SignedBeaconBlock) -> Result<&gloas::ExecutionPayloadBid> {
         SignedBeaconBlock::Gloas(inner) => {
             Ok(&inner.message.body.signed_execution_payload_bid.message)
         }
-        SignedBeaconBlock::Heze(inner) => {
+        SignedBeaconBlock::Heze(inner) | SignedBeaconBlock::Eip8483(inner) => {
             Ok(&inner.message.body.signed_execution_payload_bid.message)
         }
         other => Err(Error::UnsupportedForFork {
@@ -5124,7 +5124,9 @@ pub fn on_block(
         // imported, and its full payload branch stays unreachable, since
         // building on it requires `is_payload_verified` above.
         SignedBeaconBlock::Gloas(block) => Some(&block.message.body.payload_attestations),
-        SignedBeaconBlock::Heze(block) => Some(&block.message.body.payload_attestations),
+        SignedBeaconBlock::Heze(block) | SignedBeaconBlock::Eip8483(block) => {
+            Some(&block.message.body.payload_attestations)
+        }
         SignedBeaconBlock::Lean(_) => lean_block_unreachable("fork_choice::on_block"),
     };
 

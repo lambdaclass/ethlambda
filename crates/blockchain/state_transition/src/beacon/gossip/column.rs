@@ -442,7 +442,7 @@ pub fn stateful_checks_gloas(store: &Store, sidecar: &gloas::DataColumnSidecar) 
                 .message
                 .blob_kzg_commitments
         }
-        SignedBeaconBlock::Heze(block) => {
+        SignedBeaconBlock::Heze(block) | SignedBeaconBlock::Eip8483(block) => {
             &block
                 .message
                 .body

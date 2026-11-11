@@ -18,8 +18,22 @@
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libssz_types::ProgressiveList;
 
+use super::altair::SyncCommittee;
+use super::fulu::ProposerLookahead;
+use super::gloas::{
+    BuilderIndex, BuilderPendingPayments, BuilderPendingWithdrawals, Builders, EpochParticipation,
+    ExecutionPayloadAvailability, ExecutionPayloadBid, InactivityScores,
+    PayloadTimelinessCommitteeWindow, PendingConsolidations, PendingDeposits,
+    PendingPartialWithdrawals, Withdrawals,
+};
+use super::shared::{
+    BeaconBlockHeader, BlockRoots, Checkpoint, Fork, HistoricalRoots, HistoricalSummaries,
+    JustificationBits, ProgressiveBalances, ProgressiveValidators, RandaoMixes, Slashings,
+    StateRoots,
+};
 use crate::beacon::primitives::{
-    BlsPubkey, Bytes32, Bytes64, ExecutionAddress, ValidatorIndex,
+    BlsPubkey, Bytes32, Bytes64, Epoch, ExecutionAddress, ExecutionBlockHash, Gwei, Root, Slot,
+    ValidatorIndex, WithdrawalIndex,
 };
 
 /// The validator PQ registration requests pertaining to a single execution
@@ -143,6 +157,212 @@ impl PQRegistrationRequests {
     }
 }
 
+/// The EIP-8483 beacon state: heze's, plus `validator_pq_registrations` and
+/// `builder_pq_registrations` appended (`active_fields(width=48, gaps=(8, 9,
+/// 10, 28))`).
+///
+/// The four gaps are heze's (EIP-8015's removed eth1 and deposit-index
+/// fields), so every field heze carries keeps its generalized index. Not
+/// `#[derive(Default)]`, for the reason gloas's state gives.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[ssz(progressive_container, active_fields = [1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])]
+pub struct BeaconState {
+    // -- Versioning --
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub genesis_time: u64,
+    /// The root of the genesis validator registry, which separates this
+    /// chain from any other running the same fork schedule.
+    pub genesis_validators_root: Root,
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub slot: Slot,
+    pub fork: Fork,
+
+    // -- History --
+    /// The most recent block's header, with `state_root` left zero until the
+    /// slot advances, since a block cannot commit to the root of the state
+    /// containing it.
+    pub latest_block_header: BeaconBlockHeader,
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
+    pub block_roots: BlockRoots,
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
+    pub state_roots: StateRoots,
+    /// Frozen since capella: further history is committed to by
+    /// `historical_summaries` instead.
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
+    pub historical_roots: HistoricalRoots,
+
+    // -- Registry (EIP-7688) --
+    /// The validator registry, tree-backed and progressively merkleized. See
+    /// [`ProgressiveValidators`].
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
+    pub validators: ProgressiveValidators,
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
+    pub balances: ProgressiveBalances,
+
+    // -- Randomness --
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
+    pub randao_mixes: RandaoMixes,
+
+    // -- Slashings --
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
+    pub slashings: Slashings,
+
+    // -- Participation (EIP-7688) --
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
+    pub previous_epoch_participation: EpochParticipation,
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
+    pub current_epoch_participation: EpochParticipation,
+
+    // -- Finality --
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
+    pub justification_bits: JustificationBits,
+    pub previous_justified_checkpoint: Checkpoint,
+    pub current_justified_checkpoint: Checkpoint,
+    pub finalized_checkpoint: Checkpoint,
+
+    // -- Inactivity (EIP-7688) --
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
+    pub inactivity_scores: InactivityScores,
+
+    // -- Sync committees --
+    pub current_sync_committee: SyncCommittee,
+    pub next_sync_committee: SyncCommittee,
+
+    // -- Execution (EIP-7732) --
+    /// The most recently revealed payload's own hash. Replaces
+    /// `latest_execution_payload_header`: a gloas state no longer holds a
+    /// payload header, only this hash and `latest_execution_payload_bid`.
+    pub latest_block_hash: ExecutionBlockHash,
+
+    // -- Withdrawals --
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub next_withdrawal_index: WithdrawalIndex,
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub next_withdrawal_validator_index: ValidatorIndex,
+
+    // -- History (capella) --
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
+    pub historical_summaries: HistoricalSummaries,
+
+    // -- Deposits, exits, and consolidations (electra) --
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub deposit_balance_to_consume: Gwei,
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub exit_balance_to_consume: Gwei,
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub earliest_exit_epoch: Epoch,
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub consolidation_balance_to_consume: Gwei,
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub earliest_consolidation_epoch: Epoch,
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
+    pub pending_deposits: PendingDeposits,
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
+    pub pending_partial_withdrawals: PendingPartialWithdrawals,
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
+    pub pending_consolidations: PendingConsolidations,
+
+    // -- Proposer lookahead (fulu) --
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
+    pub proposer_lookahead: ProposerLookahead,
+
+    // -- Builders (EIP-7732) --
+    /// The builder registry.
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
+    pub builders: Builders,
+    /// Where the builder withdrawal sweep last stopped, the builder-side
+    /// counterpart of `next_withdrawal_validator_index`.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub next_withdrawal_builder_index: BuilderIndex,
+    /// Bits tracking, for each of the last `SLOTS_PER_HISTORICAL_ROOT` slots,
+    /// whether that slot's payload was made available.
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
+    pub execution_payload_availability: ExecutionPayloadAvailability,
+    /// Builder payments owed for the previous and current epoch, settled by
+    /// `process_builder_pending_payments`.
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
+    pub builder_pending_payments: BuilderPendingPayments,
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
+    pub builder_pending_withdrawals: BuilderPendingWithdrawals,
+    /// The bid the payload currently expected for this slot, if any, was
+    /// bought under.
+    pub latest_execution_payload_bid: ExecutionPayloadBid,
+    /// The withdrawals `get_expected_withdrawals` computed for the payload
+    /// this slot expects, cached here so a late-revealed payload's
+    /// `process_execution_payload` does not have to recompute the sweep.
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
+    pub payload_expected_withdrawals: Withdrawals,
+    /// The cached window of payload timeliness committees for the previous,
+    /// current, and lookahead epochs, refreshed each epoch by
+    /// `process_ptc_window`.
+    #[serde(serialize_with = "crate::beacon::serde_helpers::nested_quoted_u64_seq::serialize")]
+    pub ptc_window: PayloadTimelinessCommitteeWindow,
+
+    // -- Post-quantum registrations (EIP-8483) --
+    /// The registered validator PQ material, at most one entry per
+    /// validator.
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
+    pub validator_pq_registrations: ValidatorPQRegistrations,
+    /// The registered builder PQ material, at most one entry per builder
+    /// public key.
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
+    pub builder_pq_registrations: BuilderPQRegistrations,
+}
+
+impl From<super::heze::BeaconState> for BeaconState {
+    /// Heze's state with both registries empty. Every other field carries
+    /// over untouched, `fork` included: `upgrade_to_eip8483` sets that one
+    /// itself.
+    fn from(pre: super::heze::BeaconState) -> Self {
+        Self {
+            genesis_time: pre.genesis_time,
+            genesis_validators_root: pre.genesis_validators_root,
+            slot: pre.slot,
+            fork: pre.fork,
+            latest_block_header: pre.latest_block_header,
+            block_roots: pre.block_roots,
+            state_roots: pre.state_roots,
+            historical_roots: pre.historical_roots,
+            validators: pre.validators,
+            balances: pre.balances,
+            randao_mixes: pre.randao_mixes,
+            slashings: pre.slashings,
+            previous_epoch_participation: pre.previous_epoch_participation,
+            current_epoch_participation: pre.current_epoch_participation,
+            justification_bits: pre.justification_bits,
+            previous_justified_checkpoint: pre.previous_justified_checkpoint,
+            current_justified_checkpoint: pre.current_justified_checkpoint,
+            finalized_checkpoint: pre.finalized_checkpoint,
+            inactivity_scores: pre.inactivity_scores,
+            current_sync_committee: pre.current_sync_committee,
+            next_sync_committee: pre.next_sync_committee,
+            latest_block_hash: pre.latest_block_hash,
+            next_withdrawal_index: pre.next_withdrawal_index,
+            next_withdrawal_validator_index: pre.next_withdrawal_validator_index,
+            historical_summaries: pre.historical_summaries,
+            deposit_balance_to_consume: pre.deposit_balance_to_consume,
+            exit_balance_to_consume: pre.exit_balance_to_consume,
+            earliest_exit_epoch: pre.earliest_exit_epoch,
+            consolidation_balance_to_consume: pre.consolidation_balance_to_consume,
+            earliest_consolidation_epoch: pre.earliest_consolidation_epoch,
+            pending_deposits: pre.pending_deposits,
+            pending_partial_withdrawals: pre.pending_partial_withdrawals,
+            pending_consolidations: pre.pending_consolidations,
+            proposer_lookahead: pre.proposer_lookahead,
+            builders: pre.builders,
+            next_withdrawal_builder_index: pre.next_withdrawal_builder_index,
+            execution_payload_availability: pre.execution_payload_availability,
+            builder_pending_payments: pre.builder_pending_payments,
+            builder_pending_withdrawals: pre.builder_pending_withdrawals,
+            latest_execution_payload_bid: pre.latest_execution_payload_bid,
+            payload_expected_withdrawals: pre.payload_expected_withdrawals,
+            ptc_window: pre.ptc_window,
+            validator_pq_registrations: Default::default(),
+            builder_pq_registrations: Default::default(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use libssz::{SszDecode as _, SszEncode as _};
@@ -163,8 +383,14 @@ mod tests {
             <BuilderPQRegistrationRequest as libssz::SszEncode>::fixed_size(),
             100
         );
-        assert_eq!(<ValidatorPQRegistration as libssz::SszEncode>::fixed_size(), 72);
-        assert_eq!(<BuilderPQRegistration as libssz::SszEncode>::fixed_size(), 80);
+        assert_eq!(
+            <ValidatorPQRegistration as libssz::SszEncode>::fixed_size(),
+            72
+        );
+        assert_eq!(
+            <BuilderPQRegistration as libssz::SszEncode>::fixed_size(),
+            80
+        );
     }
 
     #[test]

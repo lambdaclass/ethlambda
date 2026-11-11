@@ -46,7 +46,9 @@ fn payload_link(store: &Store, root: H256) -> Option<BlockPayloadLink> {
         | SignedBeaconBlock::Deneb(_)
         | SignedBeaconBlock::Electra(_)
         | SignedBeaconBlock::Fulu(_) => Some(BlockPayloadLink::PreGloas),
-        block @ (SignedBeaconBlock::Gloas(_) | SignedBeaconBlock::Heze(_)) => {
+        block @ (SignedBeaconBlock::Gloas(_)
+        | SignedBeaconBlock::Heze(_)
+        | SignedBeaconBlock::Eip8483(_)) => {
             let message = block.gloas_message()?;
             let parent_status = match store.get_signed_block(&message.parent_root()).ok()? {
                 None => None,

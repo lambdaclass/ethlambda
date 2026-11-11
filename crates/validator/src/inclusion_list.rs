@@ -145,9 +145,13 @@ impl<B: BeaconNodeApi> InclusionListService<B> {
         }
 
         // One request per list: the endpoint takes a single list.
+        let fork = self
+            .context
+            .config
+            .fork_at_epoch(slot / ethlambda_types::beacon::preset::SLOTS_PER_EPOCH);
         let mut published = 0;
         for signed in &lists {
-            match self.beacon_node.publish_inclusion_list(signed).await {
+            match self.beacon_node.publish_inclusion_list(fork, signed).await {
                 Ok(()) => published += 1,
                 Err(err) => warn!(
                     %slot,

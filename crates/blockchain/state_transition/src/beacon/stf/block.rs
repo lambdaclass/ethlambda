@@ -104,7 +104,8 @@ pub fn process_block(
         }
         // Heze's block body drops `eth1_data` and `deposits` (EIP-8015); the
         // rest of block processing is gloas's own.
-        containers::SignedBeaconBlock::Heze(signed) => {
+        containers::SignedBeaconBlock::Heze(signed)
+        | containers::SignedBeaconBlock::Eip8483(signed) => {
             gloas::process_block(state, &signed.message, config, committees, active_balances)
         }
         containers::SignedBeaconBlock::Lean(_) => {

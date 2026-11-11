@@ -120,8 +120,9 @@ pub fn cheap_checks(
     }
     // Ours: gloas and heze bids share one container, so a decode accepts
     // either shape (see `gloas::ExecutionPayloadBid`); the specification's
-    // typed decoder rejects the shape the bid's slot does not take.
-    if bid.fork_name() != config.fork_at_epoch(proposal_epoch) {
+    // typed decoder rejects the shape the bid's slot does not take. EIP-8483
+    // takes heze's.
+    if !bid.has_shape_of(config.fork_at_epoch(proposal_epoch)) {
         return Err(Outcome::Reject(RejectReason::WrongForkShape));
     }
     Ok(())
@@ -154,7 +155,8 @@ fn pre_gloas_payload(state: &BeaconState) -> Option<(ExecutionBlockHash, u64)> {
         BeaconState::Phase0(_)
         | BeaconState::Altair(_)
         | BeaconState::Gloas(_)
-        | BeaconState::Heze(_) => None,
+        | BeaconState::Heze(_)
+        | BeaconState::Eip8483(_) => None,
         BeaconState::Lean(_) => lean_state_unreachable("execution_payload_bid::pre_gloas_payload"),
     }
 }
@@ -188,7 +190,7 @@ fn head_view(store: &Store) -> Result<HeadView, Outcome> {
     };
     if let Some(state) = store.cached_state(CacheKey::BlockState(node.root)) {
         return match &*state {
-            BeaconState::Gloas(_) | BeaconState::Heze(_) => {
+            BeaconState::Gloas(_) | BeaconState::Heze(_) | BeaconState::Eip8483(_) => {
                 let bid = state
                     .latest_execution_payload_bid()
                     .map_err(|_| internal())?;
@@ -222,7 +224,7 @@ fn head_view(store: &Store) -> Result<HeadView, Outcome> {
                 bid_block_hash: bid.block_hash,
             })
         }
-        SignedBeaconBlock::Heze(block) => {
+        SignedBeaconBlock::Heze(block) | SignedBeaconBlock::Eip8483(block) => {
             let bid = &block.message.body.signed_execution_payload_bid.message;
             Ok(HeadView::Gloas {
                 node,
@@ -458,7 +460,10 @@ fn stateful_rules(
     }
     // [IGNORE] The parent's payload does not try to exit the builder. Only a
     // gloas parent has an envelope to carry the request.
-    let parent_is_gloas = matches!(&*parent_state, BeaconState::Gloas(_) | BeaconState::Heze(_));
+    let parent_is_gloas = matches!(
+        &*parent_state,
+        BeaconState::Gloas(_) | BeaconState::Heze(_) | BeaconState::Eip8483(_)
+    );
     if parent_is_gloas && bid.parent_block_hash == latest_bid.block_hash {
         let exits = parent_payload_exits(store, market, bid)
             .ok_or(ignore(IgnoreReason::ParentPayloadUnverified))?;

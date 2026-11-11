@@ -22,7 +22,7 @@ use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::{
     BeaconState, EpochParticipation, Fork, InactivityScores, altair, bellatrix, capella, deneb,
-    electra, fulu, gloas, heze, phase0,
+    eip8483, electra, fulu, gloas, heze, phase0,
 };
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::fork::ForkName;
@@ -1288,6 +1288,34 @@ pub fn upgrade_to_heze(pre: &BeaconState, config: &Config) -> Result<BeaconState
     Ok(BeaconState::Heze(post))
 }
 
+/// `upgrade_to_eip8483` (EIP-8483 `fork.md`, consensus-specs #5809): the heze
+/// state with the EIP-8483 fork version and both PQ registries empty.
+///
+/// `latest_execution_payload_bid` is copied unchanged, so its
+/// `execution_requests_root` may commit to heze's five-field
+/// `ExecutionRequests`. The specification leaves to "the coordinated upgrade"
+/// how the first EIP-8483 block validates such a parent; this crate's rule is
+/// in `process_parent_execution_payload` (see `docs/spec_deviations.md`).
+pub fn upgrade_to_eip8483(pre: &BeaconState, config: &Config) -> Result<BeaconState> {
+    let BeaconState::Heze(pre) = pre else {
+        return Err(Error::UnsupportedForFork {
+            function: "upgrade_to_eip8483",
+            fork: pre.fork_name(),
+        });
+    };
+    let epoch = compute_epoch_at_slot(pre.slot);
+    let fork = Fork {
+        previous_version: pre.fork.current_version,
+        // [Modified in EIP8483]
+        current_version: config.eip8483_fork_version,
+        epoch,
+    };
+    // [New in EIP8483] Both registries start empty.
+    let mut post = eip8483::BeaconState::from(pre.clone());
+    post.fork = fork;
+    Ok(BeaconState::Eip8483(post))
+}
+
 /// Applies the fork upgrade that produces `to`'s state shape from `state`.
 ///
 /// Dispatches over the per-fork upgrade functions by [`ForkName`] so a caller
@@ -1320,6 +1348,7 @@ pub fn upgrade_state(state: &BeaconState, to: ForkName, config: &Config) -> Resu
         ForkName::Fulu => upgrade_to_fulu(state, config),
         ForkName::Gloas => upgrade_to_gloas(state, config),
         ForkName::Heze => upgrade_to_heze(state, config),
+        ForkName::Eip8483 => upgrade_to_eip8483(state, config),
         // The `fork:` form, not `state:`: this dispatches on the requested
         // target, so it is the argument that is wrong, not what `state` holds.
         ForkName::Lean => lean_fork_unreachable("upgrade_state"),

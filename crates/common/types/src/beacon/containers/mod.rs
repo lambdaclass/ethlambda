@@ -81,6 +81,7 @@ macro_rules! dispatch_state {
             BeaconState::Fulu($state) => $body,
             BeaconState::Gloas($state) => $body,
             BeaconState::Heze($state) => $body,
+            BeaconState::Eip8483($state) => $body,
             BeaconState::Lean(_) => lean_state_unreachable($function),
         }
     };
@@ -112,6 +113,7 @@ macro_rules! dispatch_state_including_lean {
             BeaconState::Fulu($state) => $body,
             BeaconState::Gloas($state) => $body,
             BeaconState::Heze($state) => $body,
+            BeaconState::Eip8483($state) => $body,
             BeaconState::Lean($state) => $body,
         }
     };
@@ -158,6 +160,7 @@ macro_rules! dispatch_block {
             SignedBeaconBlock::Fulu($block) => $body,
             SignedBeaconBlock::Gloas($block) => $body,
             SignedBeaconBlock::Heze($block) => $body,
+            SignedBeaconBlock::Eip8483($block) => $body,
             SignedBeaconBlock::Lean(_) => lean_block_unreachable($function),
         }
     };
@@ -184,24 +187,48 @@ macro_rules! dispatch_block_including_lean {
             SignedBeaconBlock::Fulu($block) => $body,
             SignedBeaconBlock::Gloas($block) => $body,
             SignedBeaconBlock::Heze($block) => $body,
+            SignedBeaconBlock::Eip8483($block) => $body,
             SignedBeaconBlock::Lean($block) => $body,
         }
     };
 }
 
-/// Refuses a gloas-family value decoded for `fork` whose bid has the other
-/// fork's shape. Gloas and heze share the bid container (see
+/// Refuses a gloas-family value decoded for `fork` whose bid has another
+/// fork's shape. Gloas, heze and EIP-8483 share the bid container (see
 /// [`gloas::ExecutionPayloadBid`]), so decoding a bid accepts either shape and
-/// the fork the caller expected is checked here.
-fn expect_shape(fork: ForkName, shape: ForkName) -> Result<()> {
-    if fork == shape {
+/// the fork the caller expected is checked here. EIP-8483 changes nothing in
+/// the bid, so its values carry heze's.
+fn expect_bid_shape(fork: ForkName, bid: &gloas::ExecutionPayloadBid) -> Result<()> {
+    let expected = if fork.is_heze_or_later() {
+        ForkName::Heze
+    } else {
+        ForkName::Gloas
+    };
+    let found = bid.fork_name();
+    if expected == found {
         Ok(())
     } else {
-        Err(Error::ForkShapeMismatch {
-            expected: fork,
-            found: shape,
-        })
+        Err(Error::ForkShapeMismatch { expected, found })
     }
+}
+
+/// Refuses a value decoded for `fork` whose [`gloas::ExecutionRequests`] has
+/// another fork's shape: EIP-8483's seven lists, or the five every fork from
+/// gloas to heze uses (see that type's doc). `found` names heze for a
+/// five-field value, the last fork that shape belongs to.
+pub fn expect_requests_shape(fork: ForkName, requests: &gloas::ExecutionRequests) -> Result<()> {
+    if requests.has_shape_of(fork) {
+        return Ok(());
+    }
+    let found = if requests.has_pq_registrations() {
+        ForkName::Eip8483
+    } else {
+        ForkName::Heze
+    };
+    Err(Error::ForkShapeMismatch {
+        expected: fork,
+        found,
+    })
 }
 
 /// The beacon state, in whichever fork's shape it currently has, plus the lean
@@ -228,6 +255,8 @@ pub enum BeaconState {
     /// Heze's state: gloas's without the eth1 and deposit-index fields
     /// (EIP-8015), so its own container.
     Heze(heze::BeaconState),
+    /// EIP-8483's state: heze's plus the two PQ registries.
+    Eip8483(eip8483::BeaconState),
     Lean(crate::state::State),
 }
 
@@ -273,6 +302,7 @@ impl serde::Serialize for BeaconState {
             BeaconState::Fulu(state) => state.serialize(serializer),
             BeaconState::Gloas(state) => state.serialize(serializer),
             BeaconState::Heze(state) => state.serialize(serializer),
+            BeaconState::Eip8483(state) => state.serialize(serializer),
             BeaconState::Lean(_) => Err(serde::ser::Error::custom(
                 "a lean state has no JSON encoding: /lean/v0/states/finalized serves SSZ only",
             )),
@@ -315,6 +345,7 @@ impl BeaconState {
             BeaconState::Fulu(_) => ForkName::Fulu,
             BeaconState::Gloas(_) => ForkName::Gloas,
             BeaconState::Heze(_) => ForkName::Heze,
+            BeaconState::Eip8483(_) => ForkName::Eip8483,
             BeaconState::Lean(_) => ForkName::Lean,
         }
     }
@@ -379,13 +410,18 @@ impl BeaconState {
             ForkName::Fulu => Ok(BeaconState::Fulu(fulu::BeaconState::from_ssz_bytes(bytes)?)),
             ForkName::Gloas => {
                 let state = gloas::BeaconState::from_ssz_bytes(bytes)?;
-                expect_shape(fork, state.latest_execution_payload_bid.fork_name())?;
+                expect_bid_shape(fork, &state.latest_execution_payload_bid)?;
                 Ok(BeaconState::Gloas(state))
             }
             ForkName::Heze => {
                 let state = heze::BeaconState::from_ssz_bytes(bytes)?;
-                expect_shape(fork, state.latest_execution_payload_bid.fork_name())?;
+                expect_bid_shape(fork, &state.latest_execution_payload_bid)?;
                 Ok(BeaconState::Heze(state))
+            }
+            ForkName::Eip8483 => {
+                let state = eip8483::BeaconState::from_ssz_bytes(bytes)?;
+                expect_bid_shape(fork, &state.latest_execution_payload_bid)?;
+                Ok(BeaconState::Eip8483(state))
             }
             ForkName::Lean => Ok(BeaconState::Lean(crate::state::State::from_ssz_bytes(
                 bytes,
@@ -501,6 +537,12 @@ tree_fields!(
     heze::BeaconState => validators, balances, block_roots, state_roots, historical_roots, randao_mixes, slashings,
     historical_summaries
 );
+// EIP-8483's two registries are plain progressive lists, which buffer
+// nothing, so the list is heze's.
+tree_fields!(
+    eip8483::BeaconState => validators, balances, block_roots, state_roots, historical_roots, randao_mixes, slashings,
+    historical_summaries
+);
 
 /// Generates read and write accessors for state fields that every fork shares.
 ///
@@ -566,7 +608,7 @@ macro_rules! eth1_state_accessors {
                         stringify!($field),
                         |state| &state.$field,
                         carried_by: [Phase0, Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas],
-                        absent_from: [Heze],
+                        absent_from: [Heze, Eip8483],
                     )
                 }
 
@@ -576,7 +618,7 @@ macro_rules! eth1_state_accessors {
                         stringify!($field_mut),
                         |state| &mut state.$field,
                         carried_by: [Phase0, Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas],
-                        absent_from: [Heze],
+                        absent_from: [Heze, Eip8483],
                     )
                 }
             )*
@@ -606,6 +648,7 @@ macro_rules! gloas_family {
         match $state {
             $crate::beacon::containers::BeaconState::Gloas($inner) => Ok($body),
             $crate::beacon::containers::BeaconState::Heze($inner) => Ok($body),
+            $crate::beacon::containers::BeaconState::Eip8483($inner) => Ok($body),
             $crate::beacon::containers::BeaconState::Phase0(_)
             | $crate::beacon::containers::BeaconState::Altair(_)
             | $crate::beacon::containers::BeaconState::Bellatrix(_)
@@ -638,7 +681,7 @@ macro_rules! gloas_family_state_accessors {
                         self,
                         stringify!($field),
                         |state| &state.$field,
-                        carried_by: [Gloas, Heze],
+                        carried_by: [Gloas, Heze, Eip8483],
                         absent_from: [Phase0, Altair, Bellatrix, Capella, Deneb, Electra, Fulu],
                     )
                 }
@@ -648,7 +691,7 @@ macro_rules! gloas_family_state_accessors {
                         self,
                         stringify!($field_mut),
                         |state| &mut state.$field,
-                        carried_by: [Gloas, Heze],
+                        carried_by: [Gloas, Heze, Eip8483],
                         absent_from: [Phase0, Altair, Bellatrix, Capella, Deneb, Electra, Fulu],
                     )
                 }
@@ -694,6 +737,49 @@ gloas_family_state_accessors!(
         ptc_window,
         ptc_window_mut,
         gloas::PayloadTimelinessCommitteeWindow
+    ),
+);
+
+/// Generates accessors for EIP-8483's two registries, which only its state
+/// carries; every other fork answers [`Error::UnsupportedForFork`].
+macro_rules! pq_registration_accessors {
+    ($(($field:ident, $field_mut:ident, $ty:ty)),* $(,)?) => {
+        impl BeaconState {
+            $(
+                pub fn $field(&self) -> Result<&$ty> {
+                    dispatch_state_from!(
+                        self,
+                        stringify!($field),
+                        |state| &state.$field,
+                        carried_by: [Eip8483],
+                        absent_from: [Phase0, Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze],
+                    )
+                }
+
+                pub fn $field_mut(&mut self) -> Result<&mut $ty> {
+                    dispatch_state_from!(
+                        self,
+                        stringify!($field_mut),
+                        |state| &mut state.$field,
+                        carried_by: [Eip8483],
+                        absent_from: [Phase0, Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze],
+                    )
+                }
+            )*
+        }
+    };
+}
+
+pq_registration_accessors!(
+    (
+        validator_pq_registrations,
+        validator_pq_registrations_mut,
+        eip8483::ValidatorPQRegistrations
+    ),
+    (
+        builder_pq_registrations,
+        builder_pq_registrations_mut,
+        eip8483::BuilderPQRegistrations
     ),
 );
 
@@ -1086,6 +1172,7 @@ impl BeaconState {
             BeaconState::Fulu(s) => Some(Registry::Bounded(&s.validators, &s.balances)),
             BeaconState::Gloas(s) => Some(Registry::Progressive(&s.validators, &s.balances)),
             BeaconState::Heze(s) => Some(Registry::Progressive(&s.validators, &s.balances)),
+            BeaconState::Eip8483(s) => Some(Registry::Progressive(&s.validators, &s.balances)),
             BeaconState::Lean(_) => None,
         }
     }
@@ -1116,6 +1203,9 @@ impl BeaconState {
                 Some(RegistryMut::Progressive(&mut s.validators, &mut s.balances))
             }
             BeaconState::Heze(s) => {
+                Some(RegistryMut::Progressive(&mut s.validators, &mut s.balances))
+            }
+            BeaconState::Eip8483(s) => {
                 Some(RegistryMut::Progressive(&mut s.validators, &mut s.balances))
             }
             BeaconState::Lean(_) => None,
@@ -1311,7 +1401,7 @@ impl BeaconState {
                 state.next_withdrawal_index,
                 state.next_withdrawal_validator_index,
             ),
-            carried_by: [Capella, Deneb, Electra, Fulu, Gloas, Heze],
+            carried_by: [Capella, Deneb, Electra, Fulu, Gloas, Heze, Eip8483],
             absent_from: [Phase0, Altair, Bellatrix],
         )
     }
@@ -1325,7 +1415,7 @@ impl BeaconState {
                 &mut state.next_withdrawal_index,
                 &mut state.next_withdrawal_validator_index,
             ),
-            carried_by: [Capella, Deneb, Electra, Fulu, Gloas, Heze],
+            carried_by: [Capella, Deneb, Electra, Fulu, Gloas, Heze, Eip8483],
             absent_from: [Phase0, Altair, Bellatrix],
         )
     }
@@ -1376,7 +1466,7 @@ impl BeaconState {
                 &state.current_epoch_participation[..],
                 InactivityScoresRef::from(&state.inactivity_scores),
             ),
-            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze],
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze, Eip8483],
             absent_from: [Phase0],
         )
     }
@@ -1428,7 +1518,7 @@ impl BeaconState {
                 &mut state.inactivity_scores,
             ),
             carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu],
-            absent_from: [Phase0, Gloas, Heze],
+            absent_from: [Phase0, Gloas, Heze, Eip8483],
         )
     }
 
@@ -1460,7 +1550,7 @@ impl BeaconState {
                     .get_mut(index)
                     .ok_or(Error::IndexOutOfBounds { index, len })?
             },
-            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze],
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze, Eip8483],
             absent_from: [Phase0],
         )
     }
@@ -1487,7 +1577,7 @@ impl BeaconState {
             } else {
                 &mut state.previous_epoch_participation[..]
             },
-            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze],
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze, Eip8483],
             absent_from: [Phase0],
         )
     }
@@ -1508,7 +1598,7 @@ impl BeaconState {
             self,
             "BeaconState::sync_committees",
             |state| (&state.current_sync_committee, &state.next_sync_committee),
-            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze],
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze, Eip8483],
             absent_from: [Phase0],
         )
     }
@@ -1531,7 +1621,7 @@ impl BeaconState {
                 &mut state.current_sync_committee,
                 &mut state.next_sync_committee,
             ),
-            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze],
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze, Eip8483],
             absent_from: [Phase0],
         )
     }
@@ -1755,6 +1845,12 @@ pub enum SignedBeaconBlock {
     /// (EIP-8015). Its bid is still [`gloas::ExecutionPayloadBid`], in its
     /// heze shape.
     Heze(heze::SignedBeaconBlock),
+    /// EIP-8483's block. Wraps [`heze::SignedBeaconBlock`], the way `Fulu`
+    /// wraps electra's: EIP-8483 adds no block field of its own, only two
+    /// lists inside `parent_execution_requests`, which
+    /// [`gloas::ExecutionRequests`] carries in either shape.
+    /// [`SignedBeaconBlock::from_ssz`] checks the shape against the fork.
+    Eip8483(heze::SignedBeaconBlock),
 
     /// The Lean consensus protocol's block.
     ///
@@ -1810,9 +1906,12 @@ impl SignedBeaconBlock {
     /// (`is_payload_verified(store, root)`) rather than this accessor.
     pub fn execution_block_hash(&self) -> Option<ExecutionBlockHash> {
         match self {
-            Self::Phase0(_) | Self::Altair(_) | Self::Gloas(_) | Self::Heze(_) | Self::Lean(_) => {
-                None
-            }
+            Self::Phase0(_)
+            | Self::Altair(_)
+            | Self::Gloas(_)
+            | Self::Heze(_)
+            | Self::Eip8483(_)
+            | Self::Lean(_) => None,
             Self::Bellatrix(block) => Some(block.message.body.execution_payload.block_hash),
             Self::Capella(block) => Some(block.message.body.execution_payload.block_hash),
             Self::Deneb(block) => Some(block.message.body.execution_payload.block_hash),
@@ -1853,7 +1952,7 @@ impl SignedBeaconBlock {
                 .message
                 .blob_kzg_commitments
                 .len(),
-            Self::Heze(block) => block
+            Self::Heze(block) | Self::Eip8483(block) => block
                 .message
                 .body
                 .signed_execution_payload_bid
@@ -1873,9 +1972,12 @@ impl SignedBeaconBlock {
     /// would describe.
     pub fn execution_payload_timestamp(&self) -> Option<u64> {
         match self {
-            Self::Phase0(_) | Self::Altair(_) | Self::Gloas(_) | Self::Heze(_) | Self::Lean(_) => {
-                None
-            }
+            Self::Phase0(_)
+            | Self::Altair(_)
+            | Self::Gloas(_)
+            | Self::Heze(_)
+            | Self::Eip8483(_)
+            | Self::Lean(_) => None,
             Self::Bellatrix(block) => Some(block.message.body.execution_payload.timestamp),
             Self::Capella(block) => Some(block.message.body.execution_payload.timestamp),
             Self::Deneb(block) => Some(block.message.body.execution_payload.timestamp),
@@ -1902,6 +2004,7 @@ impl SignedBeaconBlock {
             SignedBeaconBlock::Fulu(_) => ForkName::Fulu,
             SignedBeaconBlock::Gloas(_) => ForkName::Gloas,
             SignedBeaconBlock::Heze(_) => ForkName::Heze,
+            SignedBeaconBlock::Eip8483(_) => ForkName::Eip8483,
             SignedBeaconBlock::Lean(_) => ForkName::Lean,
         }
     }
@@ -1937,15 +2040,24 @@ impl SignedBeaconBlock {
             )),
             ForkName::Gloas => {
                 let block = gloas::SignedBeaconBlock::from_ssz_bytes(bytes)?;
-                let bid = &block.message.body.signed_execution_payload_bid.message;
-                expect_shape(fork, bid.fork_name())?;
+                let body = &block.message.body;
+                expect_bid_shape(fork, &body.signed_execution_payload_bid.message)?;
+                expect_requests_shape(fork, &body.parent_execution_requests)?;
                 Ok(SignedBeaconBlock::Gloas(block))
             }
             ForkName::Heze => {
                 let block = heze::SignedBeaconBlock::from_ssz_bytes(bytes)?;
-                let bid = &block.message.body.signed_execution_payload_bid.message;
-                expect_shape(fork, bid.fork_name())?;
+                let body = &block.message.body;
+                expect_bid_shape(fork, &body.signed_execution_payload_bid.message)?;
+                expect_requests_shape(fork, &body.parent_execution_requests)?;
                 Ok(SignedBeaconBlock::Heze(block))
+            }
+            ForkName::Eip8483 => {
+                let block = heze::SignedBeaconBlock::from_ssz_bytes(bytes)?;
+                let body = &block.message.body;
+                expect_bid_shape(fork, &body.signed_execution_payload_bid.message)?;
+                expect_requests_shape(fork, &body.parent_execution_requests)?;
+                Ok(SignedBeaconBlock::Eip8483(block))
             }
             ForkName::Lean => Ok(SignedBeaconBlock::Lean(
                 crate::block::SignedBlock::from_ssz_bytes(bytes)?,
@@ -2058,6 +2170,8 @@ signed_beacon_block_accessors!(
 pub enum GloasBlockRef<'a> {
     Gloas(&'a gloas::BeaconBlock),
     Heze(&'a heze::BeaconBlock),
+    /// An EIP-8483 block, in heze's container (see [`SignedBeaconBlock::Eip8483`]).
+    Eip8483(&'a heze::BeaconBlock),
 }
 
 macro_rules! gloas_ref_dispatch {
@@ -2065,6 +2179,7 @@ macro_rules! gloas_ref_dispatch {
         match $self {
             GloasBlockRef::Gloas($block) => $body,
             GloasBlockRef::Heze($block) => $body,
+            GloasBlockRef::Eip8483($block) => $body,
         }
     };
 }
@@ -2074,6 +2189,7 @@ impl<'a> GloasBlockRef<'a> {
         match self {
             GloasBlockRef::Gloas(_) => ForkName::Gloas,
             GloasBlockRef::Heze(_) => ForkName::Heze,
+            GloasBlockRef::Eip8483(_) => ForkName::Eip8483,
         }
     }
 
@@ -2145,12 +2261,22 @@ impl<'a> GloasBlockRef<'a> {
         gloas_ref_dispatch!(self, |block| &block.body.parent_execution_requests)
     }
 
+    /// Whether this block's bid and parent execution requests have the shapes
+    /// `fork` uses, the two shapes its containers do not pin down on their
+    /// own (see [`gloas::ExecutionPayloadBid`] and [`gloas::ExecutionRequests`]).
+    pub fn has_shapes_of(&self, fork: ForkName) -> bool {
+        self.signed_execution_payload_bid()
+            .message
+            .has_shape_of(fork)
+            && self.parent_execution_requests().has_shape_of(fork)
+    }
+
     /// How many deposits the body carries: always zero at heze, whose body has
     /// none (EIP-8015), and what the gossip rule bounds at gloas.
     pub fn deposits_len(&self) -> usize {
         match self {
             GloasBlockRef::Gloas(block) => block.body.deposits.len(),
-            GloasBlockRef::Heze(_) => 0,
+            GloasBlockRef::Heze(_) | GloasBlockRef::Eip8483(_) => 0,
         }
     }
 }
@@ -2174,6 +2300,7 @@ impl SignedBeaconBlock {
         match self {
             SignedBeaconBlock::Gloas(block) => Some(GloasBlockRef::Gloas(&block.message)),
             SignedBeaconBlock::Heze(block) => Some(GloasBlockRef::Heze(&block.message)),
+            SignedBeaconBlock::Eip8483(block) => Some(GloasBlockRef::Eip8483(&block.message)),
             SignedBeaconBlock::Phase0(_)
             | SignedBeaconBlock::Altair(_)
             | SignedBeaconBlock::Bellatrix(_)
@@ -2198,6 +2325,9 @@ impl SignedBeaconBlock {
 pub enum GloasBlock {
     Gloas(gloas::BeaconBlock),
     Heze(heze::BeaconBlock),
+    /// An EIP-8483 block, in heze's container. Built explicitly: the
+    /// `From<heze::BeaconBlock>` conversion below yields [`Self::Heze`].
+    Eip8483(heze::BeaconBlock),
 }
 
 impl From<gloas::BeaconBlock> for GloasBlock {
@@ -2217,6 +2347,7 @@ macro_rules! gloas_block_dispatch {
         match $self {
             GloasBlock::Gloas($block) => $body,
             GloasBlock::Heze($block) => $body,
+            GloasBlock::Eip8483($block) => $body,
         }
     };
 }
@@ -2226,6 +2357,7 @@ impl GloasBlock {
         match self {
             GloasBlock::Gloas(_) => ForkName::Gloas,
             GloasBlock::Heze(_) => ForkName::Heze,
+            GloasBlock::Eip8483(_) => ForkName::Eip8483,
         }
     }
 
@@ -2261,24 +2393,24 @@ impl GloasBlock {
         gloas_block_dispatch!(self, |block| block.to_ssz())
     }
 
-    /// Decodes a block of `fork`, which must be gloas or heze.
+    /// Decodes a block of `fork`, which must be gloas, heze or EIP-8483.
     pub fn from_ssz(fork: ForkName, bytes: &[u8]) -> Result<Self> {
         match fork {
             ForkName::Gloas => {
                 let block = gloas::BeaconBlock::from_ssz_bytes(bytes)?;
-                expect_shape(
-                    fork,
-                    block.body.signed_execution_payload_bid.message.fork_name(),
-                )?;
+                expect_bid_shape(fork, &block.body.signed_execution_payload_bid.message)?;
+                expect_requests_shape(fork, &block.body.parent_execution_requests)?;
                 Ok(GloasBlock::Gloas(block))
             }
-            ForkName::Heze => {
+            ForkName::Heze | ForkName::Eip8483 => {
                 let block = heze::BeaconBlock::from_ssz_bytes(bytes)?;
-                expect_shape(
-                    fork,
-                    block.body.signed_execution_payload_bid.message.fork_name(),
-                )?;
-                Ok(GloasBlock::Heze(block))
+                expect_bid_shape(fork, &block.body.signed_execution_payload_bid.message)?;
+                expect_requests_shape(fork, &block.body.parent_execution_requests)?;
+                Ok(if fork == ForkName::Heze {
+                    GloasBlock::Heze(block)
+                } else {
+                    GloasBlock::Eip8483(block)
+                })
             }
             other => Err(Error::UnsupportedForFork {
                 function: "GloasBlock::from_ssz",
@@ -2291,6 +2423,7 @@ impl GloasBlock {
         match self {
             GloasBlock::Gloas(block) => GloasBlockRef::Gloas(block),
             GloasBlock::Heze(block) => GloasBlockRef::Heze(block),
+            GloasBlock::Eip8483(block) => GloasBlockRef::Eip8483(block),
         }
     }
 
@@ -2330,6 +2463,9 @@ impl GloasBlock {
             }
             GloasBlock::Heze(message) => {
                 SignedBeaconBlock::Heze(heze::SignedBeaconBlock { message, signature })
+            }
+            GloasBlock::Eip8483(message) => {
+                SignedBeaconBlock::Eip8483(heze::SignedBeaconBlock { message, signature })
             }
         }
     }
@@ -2394,8 +2530,8 @@ impl DataColumnSidecar {
     pub fn from_ssz(fork: ForkName, bytes: &[u8]) -> Result<Self> {
         match fork {
             ForkName::Fulu => Ok(Self::Fulu(fulu::DataColumnSidecar::from_ssz_bytes(bytes)?)),
-            // Heze leaves the gloas sidecar unchanged.
-            ForkName::Gloas | ForkName::Heze => Ok(Self::Gloas(
+            // Heze and EIP-8483 leave the gloas sidecar unchanged.
+            ForkName::Gloas | ForkName::Heze | ForkName::Eip8483 => Ok(Self::Gloas(
                 gloas::DataColumnSidecar::from_ssz_bytes(bytes)?,
             )),
             ForkName::Phase0

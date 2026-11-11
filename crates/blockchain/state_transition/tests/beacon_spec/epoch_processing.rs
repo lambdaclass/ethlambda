@@ -93,7 +93,8 @@ fn apply(
             | ForkName::Electra
             | ForkName::Fulu
             | ForkName::Gloas
-            | ForkName::Heze => epoch::altair::process_rewards_and_penalties(state, config),
+            | ForkName::Heze
+            | ForkName::Eip8483 => epoch::altair::process_rewards_and_penalties(state, config),
             ForkName::Lean => lean_is_not_a_fixture_fork("rewards_and_penalties"),
         },
         // Deneb's own change (EIP-7514's activation-churn cap) is selected
@@ -112,9 +113,11 @@ fn apply(
             // `BeaconState` already reaches through element accessors generic
             // over the bounded/progressive split, so a gloas state runs the
             // identical function unchanged.
-            ForkName::Electra | ForkName::Fulu | ForkName::Gloas | ForkName::Heze => {
-                epoch::electra::process_registry_updates(state, config)
-            }
+            ForkName::Electra
+            | ForkName::Fulu
+            | ForkName::Gloas
+            | ForkName::Heze
+            | ForkName::Eip8483 => epoch::electra::process_registry_updates(state, config),
             ForkName::Phase0
             | ForkName::Altair
             | ForkName::Bellatrix
@@ -135,9 +138,11 @@ fn apply(
             // Unmodified in gloas too, and, like `registry_updates` above,
             // only touches `validators`/`balances` and `state.slashings()`
             // (a fork-invariant field), so it runs unchanged on a gloas state.
-            ForkName::Electra | ForkName::Fulu | ForkName::Gloas | ForkName::Heze => {
-                epoch::electra::process_slashings(state, config)
-            }
+            ForkName::Electra
+            | ForkName::Fulu
+            | ForkName::Gloas
+            | ForkName::Heze
+            | ForkName::Eip8483 => epoch::electra::process_slashings(state, config),
             ForkName::Phase0
             | ForkName::Altair
             | ForkName::Bellatrix
@@ -154,9 +159,11 @@ fn apply(
         "effective_balance_updates" => match fork {
             // Same reasoning as `registry_updates`/`slashings` above: unmodified
             // in gloas, and reaches only `validators`/`balances`.
-            ForkName::Electra | ForkName::Fulu | ForkName::Gloas | ForkName::Heze => {
-                epoch::electra::process_effective_balance_updates(state)
-            }
+            ForkName::Electra
+            | ForkName::Fulu
+            | ForkName::Gloas
+            | ForkName::Heze
+            | ForkName::Eip8483 => epoch::electra::process_effective_balance_updates(state),
             ForkName::Phase0
             | ForkName::Altair
             | ForkName::Bellatrix
@@ -205,7 +212,8 @@ fn apply(
             | ForkName::Electra
             | ForkName::Fulu
             | ForkName::Gloas
-            | ForkName::Heze => epoch::altair::process_inactivity_updates(state, config),
+            | ForkName::Heze
+            | ForkName::Eip8483 => epoch::altair::process_inactivity_updates(state, config),
             ForkName::Phase0 => Err(
                 ethlambda_state_transition::beacon::Error::UnsupportedForFork {
                     function: "inactivity_updates",
@@ -215,7 +223,7 @@ fn apply(
             ForkName::Lean => lean_is_not_a_fixture_fork("inactivity_updates"),
         },
         "participation_flag_updates" => match fork {
-            ForkName::Gloas | ForkName::Heze => {
+            ForkName::Gloas | ForkName::Heze | ForkName::Eip8483 => {
                 epoch::gloas::process_participation_flag_updates(state)
             }
             ForkName::Altair
@@ -248,7 +256,7 @@ fn apply(
         // gloas state for; see `epoch::gloas`'s own module doc.
         "pending_deposits" => match fork {
             ForkName::Fulu => epoch::fulu::process_pending_deposits(state, config),
-            ForkName::Gloas | ForkName::Heze => {
+            ForkName::Gloas | ForkName::Heze | ForkName::Eip8483 => {
                 epoch::gloas::process_pending_deposits(state, config)
             }
             ForkName::Phase0
@@ -272,9 +280,11 @@ fn apply(
         // `Vec` level, so this one copy serves it as well; see
         // `epoch::electra::process_pending_consolidations`'s own doc.
         "pending_consolidations" => match fork {
-            ForkName::Electra | ForkName::Fulu | ForkName::Gloas | ForkName::Heze => {
-                epoch::electra::process_pending_consolidations(state, config)
-            }
+            ForkName::Electra
+            | ForkName::Fulu
+            | ForkName::Gloas
+            | ForkName::Heze
+            | ForkName::Eip8483 => epoch::electra::process_pending_consolidations(state, config),
             ForkName::Phase0
             | ForkName::Altair
             | ForkName::Bellatrix
@@ -293,7 +303,7 @@ fn apply(
         // excludes slashed validators for gloas), so this one copy serves
         // both; see that function's own doc.
         "proposer_lookahead" => match fork {
-            ForkName::Fulu | ForkName::Gloas | ForkName::Heze => {
+            ForkName::Fulu | ForkName::Gloas | ForkName::Heze | ForkName::Eip8483 => {
                 epoch::fulu::process_proposer_lookahead(state)
             }
             ForkName::Phase0

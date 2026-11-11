@@ -329,9 +329,13 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
         .await
     }
 
-    async fn publish_inclusion_list(&self, signed: &heze::SignedInclusionList) -> Result<()> {
+    async fn publish_inclusion_list(
+        &self,
+        fork: ForkName,
+        signed: &heze::SignedInclusionList,
+    ) -> Result<()> {
         self.try_each("publish_inclusion_list", |node| {
-            node.publish_inclusion_list(signed)
+            node.publish_inclusion_list(fork, signed)
         })
         .await
     }

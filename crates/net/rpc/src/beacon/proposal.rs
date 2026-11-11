@@ -131,7 +131,7 @@ async fn post_block(
         .and_then(ForkName::parse);
     if !matches!(
         fork,
-        Some(ForkName::Fulu | ForkName::Gloas | ForkName::Heze)
+        Some(ForkName::Fulu | ForkName::Gloas | ForkName::Heze | ForkName::Eip8483)
     ) {
         return ApiError::BadRequest("Eth-Consensus-Version must be fulu, gloas or heze")
             .into_response();
@@ -140,7 +140,7 @@ async fn post_block(
         Ok(encoding) => encoding,
         Err(err) => return err.into_response(),
     };
-    if let Some(fork @ (ForkName::Gloas | ForkName::Heze)) = fork {
+    if let Some(fork @ (ForkName::Gloas | ForkName::Heze | ForkName::Eip8483)) = fork {
         return post_gloas_block(&store, &p2p, fork, encoding, &body).await;
     }
     let Some(contents) = encoding.decode::<FuluSignedBlockContents>(&body) else {
@@ -255,11 +255,18 @@ async fn post_gloas_block(
     body: &[u8],
 ) -> Response {
     // Heze's body drops `eth1_data` and `deposits` (EIP-8015), so the header's
-    // fork picks the container to decode.
-    let block = if fork == ForkName::Heze {
+    // fork picks the container to decode. EIP-8483 keeps heze's container,
+    // with its own requests shape, checked below with the bid's.
+    let block = if fork.is_heze_or_later() {
         encoding
             .decode::<containers::heze::SignedBeaconBlock>(body)
-            .map(containers::SignedBeaconBlock::Heze)
+            .map(|block| {
+                if fork == ForkName::Eip8483 {
+                    containers::SignedBeaconBlock::Eip8483(block)
+                } else {
+                    containers::SignedBeaconBlock::Heze(block)
+                }
+            })
     } else {
         encoding
             .decode::<containers::gloas::SignedBeaconBlock>(body)
@@ -276,13 +283,14 @@ async fn post_gloas_block(
     ) {
         return err.into_response();
     }
-    // The bid's shape (heze's carries `inclusion_list_bits`) and the slot's fork
-    // must both be the one the header names.
+    // The bid's shape (heze's carries `inclusion_list_bits`), the requests'
+    // shape (EIP-8483's carry two more lists) and the slot's fork must all be
+    // the one the header names.
     let slot_fork = config.fork_at_epoch(compute_epoch_at_slot(block.slot()));
-    let bid_fork = block
+    let shapes_match = block
         .gloas_message()
-        .map(|message| message.signed_execution_payload_bid().message.fork_name());
-    if block.fork_name() != fork || bid_fork != Some(fork) || slot_fork != fork {
+        .is_some_and(|message| message.has_shapes_of(fork));
+    if block.fork_name() != fork || !shapes_match || slot_fork != fork {
         return ApiError::BadRequest(
             "Eth-Consensus-Version, the block's shape and its slot's fork disagree",
         )
@@ -339,7 +347,7 @@ pub(crate) fn require_gloas_slot(
     message: &'static str,
 ) -> Result<(), ApiError> {
     match config.fork_at_epoch(compute_epoch_at_slot(slot)) {
-        ForkName::Gloas | ForkName::Heze => Ok(()),
+        ForkName::Gloas | ForkName::Heze | ForkName::Eip8483 => Ok(()),
         ForkName::Phase0
         | ForkName::Altair
         | ForkName::Bellatrix
@@ -373,6 +381,7 @@ fn require_fulu_slot(config: &Config, slot: Slot, message: &'static str) -> Resu
         | ForkName::Electra
         | ForkName::Gloas
         | ForkName::Heze
+        | ForkName::Eip8483
         | ForkName::Lean => Err(ApiError::BadRequest(message)),
     }
 }

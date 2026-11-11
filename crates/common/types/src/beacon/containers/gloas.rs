@@ -461,6 +461,13 @@ impl ExecutionPayloadBid {
         }
     }
 
+    /// Whether this bid has the shape `fork` uses: heze's from heze on
+    /// (EIP-8483 changes nothing in the bid), gloas's before. Not
+    /// `self.fork_name() == fork`, which no EIP-8483 bid satisfies.
+    pub fn has_shape_of(&self, fork: ForkName) -> bool {
+        self.inclusion_list_bits.is_some() == fork.is_heze_or_later()
+    }
+
     fn fixed_len(&self) -> usize {
         if self.inclusion_list_bits.is_some() {
             HEZE_BID_FIXED_LEN
@@ -687,6 +694,19 @@ impl ExecutionRequests {
         }
     }
 
+    /// This value in `fork`'s shape, for a block body carrying its parent's
+    /// requests: from EIP-8483 on, a pre-EIP-8483 value gains EIP-8483's two
+    /// lists, empty (a pre-fork payload produced none), which is what the
+    /// first EIP-8483 block carries for a FULL heze parent. A value already
+    /// carrying them is returned as is, even for an earlier `fork`: dropping
+    /// requests is never right, and the state transition refuses the shape.
+    pub fn into_shape_of(mut self, fork: ForkName) -> Self {
+        if fork.has_pq_registrations() && self.pq_registrations.is_none() {
+            self.pq_registrations = Some(super::eip8483::PQRegistrationRequests::default());
+        }
+        self
+    }
+
     /// Whether this value has EIP-8483's seven-field shape.
     pub fn has_pq_registrations(&self) -> bool {
         self.pq_registrations.is_some()
@@ -711,9 +731,7 @@ impl ExecutionRequests {
     }
 
     /// The validator PQ registration requests, empty on a pre-EIP-8483 value.
-    pub fn validator_pq_registrations(
-        &self,
-    ) -> &[super::eip8483::ValidatorPQRegistrationRequest] {
+    pub fn validator_pq_registrations(&self) -> &[super::eip8483::ValidatorPQRegistrationRequest] {
         self.pq_registrations
             .as_ref()
             .map_or(&[], |pq| &pq.validator_pq_registrations)
@@ -785,12 +803,13 @@ impl libssz::SszDecode for ExecutionRequests {
     }
 
     fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, libssz::DecodeError> {
-        let first_offset_bytes = bytes.get(..BYTES_PER_LENGTH_OFFSET).ok_or(
-            libssz::DecodeError::InvalidByteLength {
-                expected: FIVE_FIELD_REQUESTS_FIXED_LEN,
-                got: bytes.len(),
-            },
-        )?;
+        let first_offset_bytes =
+            bytes
+                .get(..BYTES_PER_LENGTH_OFFSET)
+                .ok_or(libssz::DecodeError::InvalidByteLength {
+                    expected: FIVE_FIELD_REQUESTS_FIXED_LEN,
+                    got: bytes.len(),
+                })?;
         let first_offset = u32::from_le_bytes(
             first_offset_bytes
                 .try_into()
@@ -1217,14 +1236,16 @@ impl BeaconBlockBody {
 
     /// [`Self::empty`] in `fork`'s shape: heze's default bid carries an
     /// all-zero `inclusion_list_bits`, gloas's none (see
-    /// [`ExecutionPayloadBid`]).
+    /// [`ExecutionPayloadBid`]), and EIP-8483's parent requests carry its two
+    /// empty lists (see [`ExecutionRequests::empty`]).
     pub fn empty_at(fork: ForkName) -> Self {
         let mut body = Self::empty();
-        if fork == ForkName::Heze {
+        if fork.is_heze_or_later() {
             body.signed_execution_payload_bid
                 .message
                 .inclusion_list_bits = Some(InclusionListBits::new());
         }
+        body.parent_execution_requests = ExecutionRequests::empty(fork);
         body
     }
 }
@@ -1981,8 +2002,14 @@ mod tests {
             ..sample_requests()
         };
         let json = serde_json::to_value(&seven).unwrap();
-        assert_eq!(json["validator_pq_registrations"].as_array().unwrap().len(), 2);
-        assert_eq!(json["builder_pq_registrations"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            json["validator_pq_registrations"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(
+            json["builder_pq_registrations"].as_array().unwrap().len(),
+            1
+        );
         assert_eq!(
             json["validator_pq_registrations"][0]["pq_data"],
             format!("0x{}", "0e".repeat(64))

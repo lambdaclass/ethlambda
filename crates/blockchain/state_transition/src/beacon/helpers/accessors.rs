@@ -456,7 +456,7 @@ pub fn get_beacon_proposer_index(state: &BeaconState) -> Result<ValidatorIndex> 
         // Gloas's own `proposer_lookahead` is unchanged from fulu (see
         // `containers::gloas`'s module doc) and gloas does not redefine
         // this function, so both forks share fulu's exact same lookup.
-        ForkName::Fulu | ForkName::Gloas | ForkName::Heze => {
+        ForkName::Fulu | ForkName::Gloas | ForkName::Heze | ForkName::Eip8483 => {
             return super::fulu::get_beacon_proposer_index(state);
         }
         ForkName::Phase0
@@ -492,7 +492,7 @@ pub fn get_beacon_proposer_index(state: &BeaconState) -> Result<ValidatorIndex> 
             |index| Ok(state.validator(index)?.effective_balance),
         ),
         ForkName::Fulu => unreachable!("Fulu returns via the dispatch match above"),
-        ForkName::Gloas | ForkName::Heze => {
+        ForkName::Gloas | ForkName::Heze | ForkName::Eip8483 => {
             unreachable!("Gloas returns via the dispatch match above")
         }
         ForkName::Lean => lean_state_unreachable("get_beacon_proposer_index"),

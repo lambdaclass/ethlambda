@@ -545,7 +545,14 @@ macro_rules! impl_hex_serialize {
     };
 }
 
-impl_hex_serialize!(H160, BlsPubkey, BlsSignature, Bytes64, KzgCommitment, KzgProof);
+impl_hex_serialize!(
+    H160,
+    BlsPubkey,
+    BlsSignature,
+    Bytes64,
+    KzgCommitment,
+    KzgProof
+);
 
 /// The `Deserialize` counterpart of [`impl_hex_serialize`], for the types the
 /// Beacon API accepts in a request body: a validator's public key (as a
@@ -568,7 +575,14 @@ macro_rules! impl_hex_deserialize {
     };
 }
 
-impl_hex_deserialize!(BlsPubkey, BlsSignature, Bytes64, H160, KzgCommitment, KzgProof);
+impl_hex_deserialize!(
+    BlsPubkey,
+    BlsSignature,
+    Bytes64,
+    H160,
+    KzgCommitment,
+    KzgProof
+);
 
 #[cfg(test)]
 mod tests {

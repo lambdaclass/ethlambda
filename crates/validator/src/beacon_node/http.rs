@@ -854,12 +854,16 @@ impl BeaconNodeApi for HttpBeaconNode {
 
     /// The list goes under `data`, the body `publishInclusionList` takes,
     /// with the fork named in the header the endpoint requires.
-    async fn publish_inclusion_list(&self, signed: &heze::SignedInclusionList) -> Result<()> {
+    async fn publish_inclusion_list(
+        &self,
+        fork: ForkName,
+        signed: &heze::SignedInclusionList,
+    ) -> Result<()> {
         let body = serde_json::json!({ "data": signed });
         self.post_no_content(
             "/eth/v1/validator/inclusion_list",
             &body,
-            Some(ForkName::Heze.as_str()),
+            Some(fork.as_str()),
         )
         .await
     }
@@ -944,7 +948,7 @@ impl BeaconNodeApi for HttpBeaconNode {
             }
             // Gloas's attestation is its own container, with its own hash tree
             // root, so it is decoded as one and signed over as one.
-            ForkName::Gloas | ForkName::Heze => {
+            ForkName::Gloas | ForkName::Heze | ForkName::Eip8483 => {
                 let attestation: gloas::Attestation = serde_json::from_value(response.data)
                     .map_err(|err| Error::Decode(format!("gloas aggregate: {err}")))?;
                 AggregateKind::Gloas(attestation)
