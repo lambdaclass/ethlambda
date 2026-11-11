@@ -330,6 +330,41 @@ mod tests {
         }
     }
 
+    /// Fulu's `is_data_available` (consensus-specs `0f4fa3ff`) ties every
+    /// sidecar to the block being imported: its header must be that block's
+    /// and its commitments must be proven against that header's body.
+    #[test]
+    fn sidecars_are_available_only_for_their_own_block() {
+        use crate::beacon::fork_choice::{DataAvailability, is_data_available_columns};
+
+        let config = Config::mainnet();
+        let blobs = [blob(1)];
+        let (block, proofs) = block_with(&blobs);
+        let root = block.message.hash_tree_root();
+        let sidecars: Vec<_> = verified_sidecars(&block, &blobs, &proofs)
+            .unwrap()
+            .into_iter()
+            .take(2)
+            .collect();
+        let available = |root, sidecars: &[DataColumnSidecar]| {
+            is_data_available_columns(root, &DataAvailability::Columns(sidecars.to_vec()), &config)
+                .unwrap()
+        };
+        assert!(available(root, &sidecars));
+
+        // Valid sidecars of this block, asked about another one.
+        assert!(!available(Root::repeat_byte(0x44), &sidecars));
+
+        // A broken inclusion proof: the header is the block's and the cells
+        // still match the commitments the sidecar carries, so only the proof
+        // tells that the block never committed to them.
+        let mut forged = sidecars.clone();
+        forged[1].kzg_commitments_inclusion_proof[0] = Root::repeat_byte(0x55);
+        assert!(verify_data_column_sidecar(&forged[1], &config));
+        assert!(verify_data_column_sidecar_kzg_proofs(&forged[1]).unwrap());
+        assert!(!available(root, &forged));
+    }
+
     #[test]
     fn a_wrong_cell_proof_fails_verification() {
         let blobs = [blob(1), blob(2)];

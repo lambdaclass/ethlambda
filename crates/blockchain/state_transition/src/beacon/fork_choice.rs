@@ -4457,20 +4457,32 @@ pub fn verify_data_column_sidecar_inclusion_proof(sidecar: &fulu::DataColumnSide
 }
 
 /// The specification's `is_data_available` for fulu
-/// (`specs/fulu/fork-choice.md`): every column sidecar sampled for this
-/// block must be individually valid.
+/// (`specs/fulu/fork-choice.md`): every column sidecar sampled for the block
+/// `beacon_block_root` must belong to it and be individually valid.
+///
+/// Per sidecar, in the specification's order (consensus-specs `0f4fa3ff`):
+/// its header is the block's own (`hash_tree_root` of the header message is
+/// `beacon_block_root`), [`verify_data_column_sidecar`], the commitments'
+/// [`verify_data_column_sidecar_inclusion_proof`] against that header's body
+/// root, and the cells' KZG proofs. Without the first two of those a sidecar
+/// naming another block, or carrying commitments that block never made, would
+/// pass: the KZG check only compares the cells with the commitments in the
+/// same sidecar. `v1.7.0-beta.4` checked only the structure and the KZG proofs.
 ///
 /// Unlike deneb's version, this takes no commitments of its own: fulu's
 /// `is_data_available` does not either, since sampling checks each sidecar
-/// against the commitment list it itself carries
-/// ([`verify_data_column_sidecar`]) rather than the caller cross-checking a
-/// separate list. An evidence value with no sidecars is vacuously
-/// available, matching the specification's `all(... for ... in
+/// against the commitment list it itself carries rather than the caller
+/// cross-checking a separate list. An evidence value with no sidecars is
+/// vacuously available, matching the specification's `all(... for ... in
 /// column_sidecars)` over an empty sequence; a caller simulating "not all
 /// required columns have been sampled" must reject the block itself rather
 /// than relying on this to do it, since nothing about an empty list is
 /// distinguishable here from "this block needed no sampling at all".
-pub fn is_data_available_columns(evidence: &DataAvailability, config: &Config) -> Result<bool> {
+pub fn is_data_available_columns(
+    beacon_block_root: Root,
+    evidence: &DataAvailability,
+    config: &Config,
+) -> Result<bool> {
     let sidecars = match evidence {
         DataAvailability::Columns(sidecars) => sidecars,
         DataAvailability::NotRequired => return Ok(true),
@@ -4481,7 +4493,9 @@ pub fn is_data_available_columns(evidence: &DataAvailability, config: &Config) -
         }
     };
     for sidecar in sidecars {
-        if !(verify_data_column_sidecar(sidecar, config)
+        if !(sidecar.signed_block_header.message.hash_tree_root() == beacon_block_root
+            && verify_data_column_sidecar(sidecar, config)
+            && verify_data_column_sidecar_inclusion_proof(sidecar)
             && verify_data_column_sidecar_kzg_proofs(sidecar)?)
         {
             return Ok(false);
@@ -5172,7 +5186,7 @@ pub fn on_block(
         }
         SignedBeaconBlock::Fulu(_) => {
             verify(
-                is_data_available_columns(blob_evidence, config)?,
+                is_data_available_columns(block_root, blob_evidence, config)?,
                 "is_data_available(hash_tree_root(block))",
             )?;
             None
@@ -9874,6 +9888,7 @@ pub(crate) mod tests {
         let config = Config::active();
         assert!(
             is_data_available_columns(
+                Root::ZERO,
                 &DataAvailability::Blobs {
                     blobs: Vec::new(),
                     proofs: Vec::new(),
