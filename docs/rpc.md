@@ -38,7 +38,9 @@ envelope's signature and data columns, attestations, aggregates, sync committee
 messages and contributions, slashings, exits, BLS changes, payload attestations,
 builder bids and proposer preferences are all checked against the chain,
 signatures included, before they reach the network; a failure is a `400`. A
-caller cannot make this node publish what its peers would refuse.
+caller can only make this node publish what passes these checks. They are not
+every gossip rule, so peers may still ignore a message that passed them, such
+as a duplicate or one outside gossip's timing windows.
 
 **What it takes on the caller's word.** These carry no signature to check, or
 one the node does not check:
