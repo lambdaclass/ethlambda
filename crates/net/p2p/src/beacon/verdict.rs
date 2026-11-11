@@ -555,11 +555,11 @@ impl Handler<GossipVerdict> for P2PServer {
     async fn handle(&mut self, msg: GossipVerdict, _ctx: &Context<Self>) {
         let GossipVerdict { id, checked } = msg;
         let (outcome, object) = match checked {
-            JobOutcome::Ok((outcome, object)) => (settle(self, outcome, &object), Some(object)),
+            Ok((outcome, object)) => (settle(self, outcome, &object), Some(object)),
             // A panic inside validation (a `Store` read's `.expect()` on a DB
             // error, say) must still produce a verdict, or gossipsub would hold
             // the message until its cache evicts it.
-            JobOutcome::Err(JobError::Panicked(panic_message)) => {
+            Err(JobError::Panicked(panic_message)) => {
                 error!(
                     panic_message,
                     "Beacon gossip validation panicked; reporting Ignore(Internal)"
@@ -567,7 +567,7 @@ impl Handler<GossipVerdict> for P2PServer {
                 (Outcome::Ignore(IgnoreReason::Internal), None)
             }
             // The check still runs, holding its permit; its result is dropped.
-            JobOutcome::Err(JobError::DeadlineExceeded) => {
+            Err(JobError::DeadlineExceeded) => {
                 warn!(
                     kind = id.kind,
                     deadline_secs = STATEFUL_CHECK_DEADLINE.as_secs(),
@@ -575,7 +575,7 @@ impl Handler<GossipVerdict> for P2PServer {
                 );
                 (Outcome::Ignore(IgnoreReason::ValidationTimeout), None)
             }
-            // `JobOutcome` and `JobError` are `#[non_exhaustive]`: a way of
+            // `JobError` is `#[non_exhaustive]`: a way of
             // ending spawned adds later still yields the one verdict.
             _ => {
                 error!(
@@ -680,7 +680,7 @@ pub(crate) const STATEFUL_CHECK_DEADLINE: Duration = Duration::from_secs(12);
 /// attestation is not forwarded on this outcome at all: see
 /// [`Validated::forward`]'s own documentation for why.
 ///
-/// The check runs as a blocking job (`pipe_blocking_with`, on Tokio's blocking
+/// The check runs as a blocking job (`pipe_blocking`, on Tokio's blocking
 /// pool). The p2p actor's native-job budget is
 /// [`STATEFUL_CHECK_PERMITS`](crate::STATEFUL_CHECK_PERMITS), the
 /// sum of these pools, so the pools stay the only bound.
@@ -696,7 +696,7 @@ pub(crate) fn spawn_stateful_checks(
     };
     // Reserve the job before `id` and `object` move into it, so a refusal
     // still has them for its one verdict.
-    let job = match ctx.reserve_blocking_job() {
+    let job = match ctx.reserve_blocking_job(checks_options(STATEFUL_CHECK_DEADLINE)) {
         Ok(job) => job,
         Err(err) => {
             // Only when the actor is stopping (`OwnerStopping`), or at its
@@ -707,7 +707,7 @@ pub(crate) fn spawn_stateful_checks(
         }
     };
     let store = server.store.clone();
-    pipe_checks(job, id, STATEFUL_CHECK_DEADLINE, move || {
+    pipe_checks(job, id, move || {
         let _permit = permit;
         let mut object = object;
         let outcome = object.stateful_checks(&store);
@@ -724,18 +724,21 @@ fn report_overloaded(server: &P2PServer, id: GossipId, object: Validated) {
     object.forward(server, received_at, outcome);
 }
 
-/// Run `checks` as the reserved blocking `job`, with a `deadline`, and
-/// deliver its one [`GossipVerdict`] (also on a panic, as
-/// `JobError::Panicked`).
+/// The options a stateful check is reserved with: its `deadline`, counted
+/// from the reservation, which the check starts right after.
+fn checks_options(deadline: Duration) -> JobOptions {
+    JobOptions::new().deadline(deadline)
+}
+
+/// Run `checks` as the reserved blocking `job` (reserved with
+/// [`checks_options`]) and deliver its one [`GossipVerdict`] (also on a
+/// panic, as `JobError::Panicked`).
 fn pipe_checks(
     job: BlockingJobPermit<P2PServer>,
     id: GossipId,
-    deadline: Duration,
     checks: impl FnOnce() -> (Outcome, Validated) + Send + 'static,
 ) {
-    let opts = JobOptions::default().deadline_after(deadline);
-    job.pipe_blocking_with(
-        opts,
+    job.pipe_blocking(
         move |_job| checks(),
         move |checked| GossipVerdict { id, checked },
     );
@@ -1807,7 +1810,7 @@ mod tests {
         drop(held);
     }
 
-    // ---- The job that carries a stateful check (spawned 0.8 `pipe_blocking_with`) ----
+    // ---- The job that carries a stateful check (spawned 0.8 `pipe_blocking`) ----
 
     /// A gossip id under a metric `kind` of the test's own, so the global
     /// verdict counters tell its verdicts apart from every other test's.
@@ -1831,8 +1834,10 @@ mod tests {
             .await
             .start();
         in_actor(&server, move |_, ctx| {
-            let job = ctx.reserve_blocking_job().expect("the p2p actor runs");
-            pipe_checks(job, test_id(kind), deadline, checks)
+            let job = ctx
+                .reserve_blocking_job(checks_options(deadline))
+                .expect("the p2p actor runs");
+            pipe_checks(job, test_id(kind), checks)
         })
         .await;
         server

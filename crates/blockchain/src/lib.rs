@@ -1406,14 +1406,11 @@ impl BlockChainServer {
         // `aggregation_deadline`).
         let stop_starting_at =
             Instant::now() + aggregation_deadline(time_config.milliseconds_per_interval());
-        let opts = JobOptions {
-            key: Some(AGGREGATION_JOB),
-            ..JobOptions::default()
-        };
-        let started = ctx.pipe_blocking_with(
+        let opts = JobOptions::new().key(AGGREGATION_JOB);
+        let started = ctx.pipe_blocking(
             opts,
             move |job_ctx| {
-                run_aggregation_worker(snapshot, job_ctx, session_id, publish_at, stop_starting_at)
+                run_aggregation_worker(snapshot, &job_ctx, session_id, publish_at, stop_starting_at)
             },
             move |outcome| AggregationDone {
                 session_id,
@@ -1657,11 +1654,8 @@ impl BlockChainServer {
         };
         let head_state = self.store.head_state();
         // Keyed: a newer proposal cancels this one and fences its result.
-        let opts = JobOptions {
-            key: Some(JobKey::new("block-proposal")),
-            ..JobOptions::default()
-        };
-        let started = ctx.pipe_blocking_with(
+        let opts = JobOptions::new().key(JobKey::new("block-proposal"));
+        let started = ctx.pipe_blocking(
             opts,
             move |_job| {
                 let sealed = block_builder::seal_signed_block(
@@ -1697,7 +1691,7 @@ impl BlockChainServer {
             slot_start_ms,
             outcome,
         } = msg;
-        let signed_block = match outcome.into_result() {
+        let signed_block = match outcome {
             Ok(Ok(signed_block)) => signed_block,
             Ok(Err(err)) => {
                 error!(%slot, %validator_id, %err, "Failed to seal block");
@@ -4180,7 +4174,7 @@ impl Handler<AggregationDone> for BlockChainServer {
             .current_aggregation
             .as_ref()
             .is_some_and(|s| s.session_id == msg.session_id && s.early);
-        let summary = match msg.outcome.into_result() {
+        let summary = match msg.outcome {
             Ok(summary) => summary,
             Err(err) => {
                 // A proof panicked: the session ends here, as a failed one.
@@ -6323,7 +6317,7 @@ mod tests {
     // ---- Jobs owned by the chain actor (spawned 0.8) ----
     //
     // The block seal and the aggregation worker rely on three properties of
-    // a keyed `pipe_blocking_with` job, checked here on a running chain actor:
+    // a keyed `pipe_blocking` job, checked here on a running chain actor:
     // a newer job under the same key fences everything the older one still
     // has queued (its emits and its terminal message); an actor stop
     // delivers nothing more; and a panic ends the job with one terminal
@@ -6359,11 +6353,8 @@ mod tests {
     ) -> impl FnOnce(&mut BlockChainServer, &Context<BlockChainServer>) + Send + 'static {
         let (emit_log, done_log) = (log.clone(), log.clone());
         move |_, ctx| {
-            let opts = JobOptions {
-                key: Some(AGGREGATION_JOB),
-                ..JobOptions::default()
-            };
-            ctx.pipe_blocking_with(
+            let opts = JobOptions::new().key(AGGREGATION_JOB);
+            ctx.pipe_blocking(
                 opts,
                 move |job| {
                     std::thread::sleep(before);
@@ -6372,7 +6363,7 @@ mod tests {
                     assert!(!panic, "{name}: proof panicked");
                 },
                 move |outcome| {
-                    let what = match outcome.into_result() {
+                    let what = match outcome {
                         Ok(()) => "done".to_string(),
                         Err(JobError::Panicked(m)) => format!("panicked ({m})"),
                         Err(err) => err.to_string(),

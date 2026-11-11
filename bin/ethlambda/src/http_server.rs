@@ -38,18 +38,16 @@ pub(crate) type Serve = Arc<
 /// supervisor gives up, and the node runs on without HTTP as it did before
 /// supervision, with an error saying so.
 pub(crate) fn supervisor_config() -> SupervisorConfig {
-    SupervisorConfig {
-        strategy: SupervisorStrategy::OneForOne,
-        max_restarts: 3,
-        restart_window: Duration::from_secs(60),
-        backoff: Backoff {
-            initial: Duration::from_secs(1),
-            maximum: Duration::from_secs(10),
-            stable_after: Duration::from_secs(60),
-            ..Backoff::default()
-        },
-        ..SupervisorConfig::default()
-    }
+    SupervisorConfig::new()
+        .strategy(SupervisorStrategy::OneForOne)
+        .max_restarts(3)
+        .restart_window(Duration::from_secs(60))
+        .backoff(
+            Backoff::new()
+                .initial(Duration::from_secs(1))
+                .maximum(Duration::from_secs(10))
+                .stable_after(Duration::from_secs(60)),
+        )
 }
 
 pub(crate) struct HttpServer {
