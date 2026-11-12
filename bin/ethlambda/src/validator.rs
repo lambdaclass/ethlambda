@@ -6,7 +6,9 @@
 use std::path::PathBuf;
 
 use ethlambda_types::beacon::primitives::{Bytes32, ExecutionAddress, H160};
-use ethlambda_validator::proposer_settings::{GRAFFITI_BYTES, graffiti_from_text};
+use ethlambda_validator::proposer_settings::{
+    DEFAULT_GAS_LIMIT, GRAFFITI_BYTES, graffiti_from_text,
+};
 use ethlambda_validator::{BuilderProposals, ValidatorConfig};
 
 /// An execution address is exactly this wide.
@@ -69,6 +71,22 @@ pub(crate) struct ValidatorOptions {
     /// startup warns loudly when it is absent.
     #[arg(long)]
     pub(crate) suggested_fee_recipient: Option<String>,
+
+    /// The gas limit every validator targets, unless the keymanager API gives
+    /// it its own.
+    ///
+    /// Before gloas it goes into builder registrations (with
+    /// `--builder-proposals`). From gloas it goes into the proposer
+    /// preferences, published for every proposal, and the beacon node builds
+    /// this client's own payloads toward it too, so on a network whose gas
+    /// limit is not the default, set it or every proposal pulls the limit
+    /// toward 60M.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_GAS_LIMIT,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub(crate) gas_limit: u64,
 
     /// Serve the keymanager API: keystores, plus each validator's own fee
     /// recipient, graffiti and gas limit, which are held in memory only.
@@ -210,6 +228,7 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
         keymanager: options
             .enable_keymanager
             .then(|| std::net::SocketAddr::new(options.http_address, options.keymanager_port)),
+        gas_limit: options.gas_limit,
         builder,
         init_slashing_protection: options.init_slashing_protection,
     })
@@ -231,6 +250,7 @@ mod tests {
             metrics_port: 5064,
             graffiti: graffiti.to_string(),
             suggested_fee_recipient: None,
+            gas_limit: DEFAULT_GAS_LIMIT,
             enable_keymanager: false,
             builder_proposals: false,
             builder_boost_factor: 100,
@@ -259,6 +279,21 @@ mod tests {
             "/tmp/s",
         ];
         Cli::try_parse_from(base.iter().chain(extra)).map(|cli| cli.options)
+    }
+
+    #[test]
+    fn the_gas_limit_defaults_to_60m_and_takes_any_positive_value() {
+        assert_eq!(parse(&[]).expect("parses").gas_limit, DEFAULT_GAS_LIMIT);
+        let options = parse(&["--gas-limit", "200000000"]).expect("parses");
+        assert_eq!(options.gas_limit, 200_000_000);
+        parse(&["--gas-limit", "0"]).expect_err("a zero gas limit is a mistake");
+    }
+
+    /// From gloas the gas limit is published whether or not builder proposals
+    /// are on, so it does not require them.
+    #[test]
+    fn the_gas_limit_does_not_need_builder_proposals() {
+        parse(&["--gas-limit", "30000000"]).expect("parses alone");
     }
 
     #[test]

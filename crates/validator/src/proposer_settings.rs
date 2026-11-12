@@ -64,11 +64,16 @@ pub fn graffiti_to_text(graffiti: &Bytes32) -> String {
     String::from_utf8_lossy(&graffiti.0[..GRAFFITI_BYTES - padding]).into_owned()
 }
 
-/// The gas limit a validator with no override reports.
+/// The gas limit a validator with no override reports, unless `--gas-limit`
+/// names another.
 ///
-/// Lighthouse's and Nimbus's default. Builder registrations carry it as the
-/// gas limit the builder should target, and the keymanager API serves it as the
-/// specification requires.
+/// Lighthouse's and Nimbus's default (Lighthouse's when the network config
+/// names no gas limit schedule, which this client does not read). Builder
+/// registrations carry it as the gas limit the builder should target, from
+/// gloas the proposer preferences carry it as the target the node's own
+/// payload is built toward too, and the keymanager API serves it as the
+/// specification requires. A network whose gas limit is elsewhere needs
+/// `--gas-limit`, or every proposal pulls its limit toward this one.
 pub const DEFAULT_GAS_LIMIT: u64 = 60_000_000;
 
 /// One validator's overrides; `None` means the default applies.
@@ -123,6 +128,20 @@ impl ProposerSettings {
                 overrides: HashMap::new(),
             }),
             generation: AtomicU64::new(0),
+        }
+    }
+
+    /// These settings with `gas_limit` as the gas limit of every validator
+    /// with no override of its own, in place of [`DEFAULT_GAS_LIMIT`].
+    pub fn with_default_gas_limit(self, gas_limit: u64) -> Self {
+        let mut inner = self
+            .inner
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner);
+        inner.default_gas_limit = gas_limit;
+        Self {
+            inner: RwLock::new(inner),
+            generation: self.generation,
         }
     }
 
@@ -266,6 +285,25 @@ mod tests {
         assert_eq!(settings.fee_recipient(&key(2)), Some(H160([0xaa; 20])));
         assert_eq!(settings.graffiti(&key(2)), Bytes32::repeat_byte(0x11));
         assert_eq!(settings.gas_limit(&key(2)), DEFAULT_GAS_LIMIT);
+    }
+
+    /// `--gas-limit` replaces the default every key without an override gets,
+    /// in the pair a preference signs too; an override still wins, and
+    /// clearing it falls back to the configured default, not the built-in one.
+    #[test]
+    fn a_configured_default_gas_limit_replaces_the_built_in_one() {
+        let settings = settings().with_default_gas_limit(200_000_000);
+        assert_eq!(settings.gas_limit(&key(1)), 200_000_000);
+        assert_eq!(
+            settings.fee_recipient_and_gas_limit(&key(1)),
+            Some((H160([0xaa; 20]), 200_000_000))
+        );
+
+        settings.set_gas_limit(&key(1), 30_000_000);
+        assert_eq!(settings.gas_limit(&key(1)), 30_000_000);
+        assert_eq!(settings.gas_limit(&key(2)), 200_000_000);
+        settings.clear_gas_limit(&key(1));
+        assert_eq!(settings.gas_limit(&key(1)), 200_000_000);
     }
 
     /// The pair a signed registration or preference carries agrees with the

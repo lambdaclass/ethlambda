@@ -96,6 +96,11 @@ pub struct ValidatorConfig {
     /// Bind address for the keymanager API. `None` when `--enable-keymanager`
     /// was not passed, in which case it is never spawned.
     pub keymanager: Option<std::net::SocketAddr>,
+    /// The gas limit every validator targets unless the keymanager API gives
+    /// it its own: its builder registrations' before gloas, and its proposer
+    /// preferences' from gloas, which is what the node's own payload is built
+    /// toward.
+    pub gas_limit: u64,
     /// Builder proposals, or `None` when `--builder-proposals` is off.
     pub builder: Option<BuilderProposals>,
     /// Register keys that have no slashing-protection record as never having
@@ -144,10 +149,10 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
              preferences sign that address for the builder to pay."
         );
     }
-    let settings = Arc::new(ProposerSettings::new(
-        config.graffiti,
-        config.suggested_fee_recipient,
-    ));
+    let settings = Arc::new(
+        ProposerSettings::new(config.graffiti, config.suggested_fee_recipient)
+            .with_default_gas_limit(config.gas_limit),
+    );
 
     // The directory's lock first, before any key is read: held from here,
     // nothing another process does to the directory can get between what
@@ -207,6 +212,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         attestation_due_bps = spec.attestation_due_bps,
         aggregate_due_bps = spec.aggregate_due_bps,
         validators = store.read().await.len(),
+        gas_limit = config.gas_limit,
         "Validator client starting"
     );
 
