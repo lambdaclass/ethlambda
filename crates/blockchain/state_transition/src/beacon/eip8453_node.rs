@@ -130,6 +130,10 @@ pub struct Eip8453Node {
     proposals: BTreeMap<Slot, ethlambda_decoupled::AcProposal>,
     /// `get_ac_vote_head` at each slot's head vote deadline.
     vote_heads: BTreeMap<Slot, ForkChoiceNode>,
+    /// Head votes accepted ahead of their slot (gossip's "current slot" rule
+    /// allows `MAXIMUM_GOSSIP_CLOCK_DISPARITY`), with their committees, by
+    /// slot: `on_head_vote_message` delays them until the clock reaches it.
+    early_head_votes: BTreeMap<Slot, Vec<(eip8453::HeadVoteMessage, Vec<ValidatorIndex>)>>,
 }
 
 impl Eip8453Node {
@@ -143,6 +147,7 @@ impl Eip8453Node {
             attestations: BTreeMap::new(),
             proposals: BTreeMap::new(),
             vote_heads: BTreeMap::new(),
+            early_head_votes: BTreeMap::new(),
         }
     }
 
@@ -178,6 +183,7 @@ impl Eip8453Node {
             for event in &step {
                 self.on_tick_event(event);
             }
+            self.apply_early_head_votes();
             events.extend(step);
             if self.engine.time() >= now {
                 break;
@@ -332,10 +338,13 @@ impl Eip8453Node {
     /// validation), then `on_head_vote_message`, then mark it seen and keep the
     /// signed message for proposals.
     ///
-    /// A vote of a slot other than the previous or the current one is refused
-    /// by the engine ("delay consideration until their slot is in the past"
-    /// applies only to the gossip rule's current-slot vote, which is never
-    /// early here) and is not marked seen.
+    /// A vote of the next slot (gossip's current-slot rule allows
+    /// `MAXIMUM_GOSSIP_CLOCK_DISPARITY`, so one can arrive just before its
+    /// slot starts) is accepted and marked seen, and reaches the engine once
+    /// the clock reaches its slot: `on_head_vote_message` says to "delay
+    /// consideration in the fork-choice until their slot is in the past". A
+    /// vote of any other slot than the previous or the current one is
+    /// refused by the engine and is not marked seen.
     pub fn accept_head_vote(
         &mut self,
         message: eip8453::HeadVoteMessage,
@@ -344,19 +353,54 @@ impl Eip8453Node {
     ) -> Result<(), HeadVoteError> {
         self.advance_to_ms(now_ms);
         let slot = message.data.slot;
+        let validator = message.validator_index;
         // Two messages of one validator can pass validation concurrently; the
         // first applied is the one gossip forwards.
-        if self.head_vote_seen(slot, message.validator_index) {
+        if self.head_vote_seen(slot, validator) {
             return Err(HeadVoteError::Duplicate);
         }
+        if slot == self.engine.current_slot() + 1 {
+            self.seen_head_votes.insert((slot, validator));
+            self.early_head_votes
+                .entry(slot)
+                .or_default()
+                .push((message, committee));
+            return Ok(());
+        }
+        self.apply_head_vote(message, committee)?;
+        self.seen_head_votes.insert((slot, validator));
+        Ok(())
+    }
+
+    /// Record a head vote's committee, then `on_head_vote_message`, and keep
+    /// the signed message for proposals.
+    fn apply_head_vote(
+        &mut self,
+        message: eip8453::HeadVoteMessage,
+        committee: Vec<ValidatorIndex>,
+    ) -> Result<(), HeadVoteError> {
+        let slot = message.data.slot;
         if let Err(err) = self.engine.record_head_vote_committee(slot, committee) {
             tracing::warn!(slot, %err, "Head vote committee disagrees with the recorded one");
         }
         self.engine
             .on_head_vote_message(ethlambda_types::decoupled::HeadVoteMessage::from(&message))?;
-        self.seen_head_votes.insert((slot, message.validator_index));
         self.head_votes.entry(slot).or_default().push(message);
         Ok(())
+    }
+
+    /// Hand the engine the early head votes of every slot its clock has
+    /// reached, right after that slot's first tick.
+    fn apply_early_head_votes(&mut self) {
+        let later = self
+            .early_head_votes
+            .split_off(&(self.engine.current_slot() + 1));
+        let due = std::mem::replace(&mut self.early_head_votes, later);
+        for (message, committee) in due.into_values().flatten() {
+            let _ = self
+                .apply_head_vote(message, committee)
+                .inspect_err(|err| tracing::debug!(%err, "Delayed head vote not applied"));
+        }
     }
 
     /// Keep a single attestation that passed `validate_attestation_gossip`,
@@ -652,5 +696,74 @@ mod tests {
         );
         assert_eq!(proposal, ForkChoiceNode::empty(anchor));
         assert_eq!(vote.supported_node(), Some(ForkChoiceNode::empty(anchor)));
+    }
+
+    /// A head vote that arrives within `MAXIMUM_GOSSIP_CLOCK_DISPARITY` before
+    /// its slot passes gossip validation ("is for the current slot" allows
+    /// the disparity), and `on_head_vote_message` delays it in the fork
+    /// choice "until their slot is in the past" rather than dropping it: it
+    /// is accepted (so gossip forwards it and marks it seen) and reaches the
+    /// engine once the clock reaches its slot.
+    #[test]
+    fn an_early_head_vote_is_delayed_to_its_slot_not_dropped() {
+        let scene = scene(16);
+        let slot = scene.anchor_slot + 1;
+        let early = scene.at(slot, 0) - 100;
+        let validator = scene.committee(slot)[0];
+        let message = scene.head_vote(
+            validator,
+            eip8453::HeadVoteData {
+                slot,
+                beacon_block_root: scene.anchor_root,
+                payload_status: 0,
+            },
+        );
+        let (gossip, accepted) = scene
+            .node
+            .with(|n| {
+                n.advance_to_ms(early);
+                let gossip = crate::beacon::gossip::head_vote::cheap_checks(
+                    n,
+                    &scene.store,
+                    &message,
+                    early,
+                );
+                let accepted = n.accept_head_vote(message.clone(), scene.committee(slot), early);
+                (gossip, accepted)
+            })
+            .unwrap();
+        assert_eq!(gossip, Ok(()), "the vote passes gossip validation");
+        assert_eq!(
+            accepted,
+            Ok(()),
+            "the vote is accepted, to be considered at its slot"
+        );
+        let (seen, pooled_early) = scene
+            .node
+            .with(|n| {
+                (
+                    n.head_vote_seen(slot, validator),
+                    n.engine().head_vote_messages(slot).len(),
+                )
+            })
+            .unwrap();
+        assert!(seen, "an accepted vote is marked seen");
+        assert_eq!(
+            pooled_early, 0,
+            "the fork choice does not consider it early"
+        );
+
+        let (pooled, signed) = scene
+            .node
+            .with(|n| {
+                n.advance_to_ms(scene.at(slot, 0));
+                (
+                    n.engine().head_vote_messages(slot).len(),
+                    n.pooled_head_votes(slot).len(),
+                )
+            })
+            .unwrap();
+        assert_eq!(pooled, 1, "the vote reaches the fork choice at its slot");
+        assert_eq!(signed, 1, "and the pool proposals aggregate from");
     }
 }
