@@ -64,7 +64,8 @@ head trails the wall clock **and** its peers report a head ahead of it.
   node does not.
 
 The beacon node runs the same rule with Lighthouse's numbers (two epochs of
-clock lag, one epoch of peer lead, a refresh every half epoch). consensus-specs
+clock lag, one epoch of peer lead) and Prysm's `Status` refresh, every half
+epoch (Lighthouse refreshes every 300 s). consensus-specs
 has no sync gate, and the Beacon API leaves `is_syncing` to the client.
 
 ## Attestation scoring on block building
