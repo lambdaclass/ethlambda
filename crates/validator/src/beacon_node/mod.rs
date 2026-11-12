@@ -15,7 +15,7 @@ use ethlambda_types::beacon::primitives::{
 };
 use ethlambda_types::beacon::signing::compute_epoch_at_slot;
 
-use crate::beacon_node::block_contents::ProducedBlock;
+use crate::beacon_node::block_contents::{ProducedBlock, Producer};
 use crate::beacon_node::dto::{
     AttesterDutyDto, CommitteeSubscriptionDto, ProposerDutyDto, ProposerPreparationDto, PtcDutyDto,
     SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto,
@@ -172,11 +172,6 @@ pub enum Published {
     /// its builder, which publishes the block and reveals the payload. Nothing
     /// says the node imported it.
     HandedToBuilder,
-    /// The node failed to confirm the blinded block (a 5xx other than 503, or
-    /// no answer once connected). The relay may still have published it; see
-    /// `Error::BlindedUnconfirmed`. Produced only by `ProposalService`, never
-    /// by an implementation.
-    BuilderUnconfirmed,
 }
 
 /// Check that `block` is the block that was asked for.
@@ -406,14 +401,15 @@ pub trait BeaconNodeApi: Send + Sync {
     /// proposal, whether or not the first one succeeded.
     async fn publish_block(&self, fork: ForkName, body: &[u8]) -> Result<Published>;
 
-    /// Publish a signed blinded block, the one with root `block_root` produced
-    /// at `slot` under `fork`, to `POST /eth/v2/beacon/blinded_blocks`. The
-    /// node hands it to its builder.
+    /// Publish a signed blinded block, produced under `fork` by `producer`
+    /// (the [`ProducedBlock::producer`] of the block it was signed from), to
+    /// `POST /eth/v2/beacon/blinded_blocks`. The node hands it to its builder.
     ///
     /// # Contract: the node that produced it, and no other
     ///
     /// Only the producing node's builder holds the payload, and only that node
-    /// claimed the slot. Failover must not offer it elsewhere.
+    /// claimed the slot. Failover must not offer it elsewhere: the fallback
+    /// sends it to `producer` alone.
     ///
     /// # Contract: which error means what
     ///
@@ -431,8 +427,7 @@ pub trait BeaconNodeApi: Send + Sync {
     /// two edges it knowingly reads the wrong way.
     async fn publish_blinded_block(
         &self,
-        slot: Slot,
-        block_root: Root,
+        producer: Producer,
         fork: ForkName,
         body: &[u8],
     ) -> Result<Published>;

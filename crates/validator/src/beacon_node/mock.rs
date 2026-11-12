@@ -17,7 +17,7 @@ use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, Root, Slot, Validato
 use tokio::sync::{Notify, Semaphore};
 
 use crate::beacon_node::block_contents::{
-    Contents, GloasPayload, ProducedBlock, empty_block_for, empty_gloas_block_for,
+    Contents, GloasPayload, ProducedBlock, Producer, empty_block_for, empty_gloas_block_for,
     empty_gloas_envelope_for,
 };
 use crate::beacon_node::dto::{
@@ -103,8 +103,8 @@ pub struct MockBeaconNode {
     /// records its batch, so a test releases calls one at a time instead of
     /// guessing how long a delay must be.
     pub registration_gate: Option<Arc<Semaphore>>,
-    /// Every blinded block published, as (slot, fork, body).
-    pub published_blinded: Mutex<Vec<(Slot, ForkName, Vec<u8>)>>,
+    /// Every blinded block published, as (fork, body).
+    pub published_blinded: Mutex<Vec<(ForkName, Vec<u8>)>>,
     /// What `publish_blinded_block` reports. `None` is `Ok(HandedToBuilder)`;
     /// `Err(detail)` is a `BlindedUnconfirmed` carrying `detail`.
     pub blinded_publish_outcome: Option<std::result::Result<Published, String>>,
@@ -119,6 +119,11 @@ pub struct MockBeaconNode {
     /// test that publishes once can await it whether or not the call came
     /// first, since `notify_one` keeps the permit for a later waiter.
     pub blinded_publish_entered: Arc<Notify>,
+    /// When set, `produce_block` takes a permit before it answers, as a node
+    /// slow to build a block does, for as long as the test holds it back.
+    pub produce_gate: Option<Arc<Semaphore>>,
+    /// Notified when `produce_block` is called, before the gate.
+    pub produce_entered: Arc<Notify>,
 
     /// What the test asserts against.
     pub submitted: Mutex<Vec<SingleAttestationDto>>,
@@ -341,6 +346,12 @@ impl MockBeaconNode {
     /// before it records its batch.
     pub fn with_registration_gate(mut self, gate: Arc<Semaphore>) -> Self {
         self.registration_gate = Some(gate);
+        self
+    }
+
+    /// Make `produce_block` wait for a permit from `gate` before it answers.
+    pub fn with_produce_gate(mut self, gate: Arc<Semaphore>) -> Self {
+        self.produce_gate = Some(gate);
         self
     }
 
@@ -709,6 +720,13 @@ impl BeaconNodeApi for MockBeaconNode {
     /// failover moves past it.
     async fn produce_block(&self, request: &BlockRequest) -> Result<ProducedBlock> {
         self.guard("produce_block")?;
+        self.produce_entered.notify_one();
+        if let Some(gate) = &self.produce_gate {
+            gate.acquire()
+                .await
+                .expect("the gate is never closed")
+                .forget();
+        }
         self.block_requests
             .lock()
             .expect("lock")
@@ -731,6 +749,7 @@ impl BeaconNodeApi for MockBeaconNode {
             let block = ProducedBlock {
                 fork: ForkName::Gloas,
                 contents: Contents::Gloas { block, payload },
+                producer: Default::default(),
             };
             crate::beacon_node::validate_produced_block(request, &block)?;
             return Ok(block);
@@ -748,6 +767,7 @@ impl BeaconNodeApi for MockBeaconNode {
                 contents: Contents::Blinded {
                     block: BlindedBeaconBlock::from(empty_block_for(slot, proposer_index)),
                 },
+                producer: Default::default(),
             };
             crate::beacon_node::validate_produced_block(request, &block)?;
             return Ok(block);
@@ -762,6 +782,7 @@ impl BeaconNodeApi for MockBeaconNode {
                 kzg_proofs: Default::default(),
                 blobs: Default::default(),
             },
+            producer: Default::default(),
         };
         crate::beacon_node::validate_produced_block(request, &block)?;
         Ok(block)
@@ -778,8 +799,7 @@ impl BeaconNodeApi for MockBeaconNode {
 
     async fn publish_blinded_block(
         &self,
-        slot: Slot,
-        _block_root: Root,
+        _producer: Producer,
         fork: ForkName,
         body: &[u8],
     ) -> Result<Published> {
@@ -803,7 +823,7 @@ impl BeaconNodeApi for MockBeaconNode {
         self.published_blinded
             .lock()
             .expect("lock")
-            .push((slot, fork, body.to_vec()));
+            .push((fork, body.to_vec()));
         match &self.blinded_publish_outcome {
             None => Ok(Published::HandedToBuilder),
             Some(Ok(published)) => Ok(*published),

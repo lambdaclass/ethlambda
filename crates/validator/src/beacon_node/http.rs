@@ -37,7 +37,7 @@ use tracing::{debug, warn};
 
 use libssz::SszDecode as _;
 
-use crate::beacon_node::block_contents::ProducedBlock;
+use crate::beacon_node::block_contents::{ProducedBlock, Producer};
 use crate::beacon_node::dto::{
     AttestationDataDto, AttestationDto, AttesterDutyDto, BlockRootResponse,
     CommitteeSubscriptionDto, DataResponse, DutiesResponse, GenesisDto, IndexedErrorResponse,
@@ -820,8 +820,7 @@ impl BeaconNodeApi for HttpBeaconNode {
         &self,
         // For the fallback, which picks the node that produced this block;
         // one node has nothing to choose.
-        _slot: Slot,
-        _block_root: Root,
+        _producer: Producer,
         fork: ForkName,
         body: &[u8],
     ) -> Result<Published> {
@@ -1591,7 +1590,7 @@ mod tests {
             let served = serve(status, vec![], vec![]).await;
             let published = served
                 .node
-                .publish_blinded_block(5, Root::ZERO, ForkName::Fulu, &[1, 2, 3])
+                .publish_blinded_block(Producer::default(), ForkName::Fulu, &[1, 2, 3])
                 .await
                 .expect("accepted");
             assert_eq!(published, expected, "status {status}");
@@ -1605,7 +1604,7 @@ mod tests {
         let served = serve(400, vec![], b"bad".to_vec()).await;
         let err = served
             .node
-            .publish_blinded_block(5, Root::ZERO, ForkName::Fulu, &[1])
+            .publish_blinded_block(Producer::default(), ForkName::Fulu, &[1])
             .await
             .expect_err("a refusal");
         assert!(
@@ -1616,7 +1615,7 @@ mod tests {
         let served = serve(500, vec![], b"boom".to_vec()).await;
         let err = served
             .node
-            .publish_blinded_block(5, Root::ZERO, ForkName::Fulu, &[1])
+            .publish_blinded_block(Producer::default(), ForkName::Fulu, &[1])
             .await
             .expect_err("unconfirmed");
         assert!(
@@ -1638,7 +1637,7 @@ mod tests {
         // Nothing listens on port 1.
         let node = HttpBeaconNode::new("http://127.0.0.1:1").expect("builds");
         let err = node
-            .publish_blinded_block(5, Root::ZERO, ForkName::Fulu, &[1])
+            .publish_blinded_block(Producer::default(), ForkName::Fulu, &[1])
             .await
             .expect_err("no answer");
         assert!(matches!(err, Error::BeaconNode { .. }), "got {err:?}");
@@ -1668,7 +1667,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let err = node
-            .publish_blinded_block(5, Root::ZERO, ForkName::Fulu, &[1])
+            .publish_blinded_block(Producer::default(), ForkName::Fulu, &[1])
             .await
             .expect_err("never connects");
         held.abort();
@@ -1695,7 +1694,7 @@ mod tests {
         let served = serve(503, vec![], b"syncing".to_vec()).await;
         let err = served
             .node
-            .publish_blinded_block(5, Root::ZERO, ForkName::Fulu, &[1])
+            .publish_blinded_block(Producer::default(), ForkName::Fulu, &[1])
             .await
             .expect_err("refused");
         assert!(

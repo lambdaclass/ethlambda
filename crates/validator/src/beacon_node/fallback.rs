@@ -17,7 +17,7 @@ use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, Root, Slot, ValidatorIndex};
 use tracing::{debug, warn};
 
-use crate::beacon_node::block_contents::ProducedBlock;
+use crate::beacon_node::block_contents::{ProducedBlock, Producer};
 use crate::beacon_node::dto::{
     CommitteeSubscriptionDto, ProposerPreparationDto, SingleAttestationDto,
     SyncCommitteeSubscriptionDto, SyncDutyDto,
@@ -40,29 +40,12 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// first one that succeeds.
 pub struct FallbackBeaconNode<B> {
     nodes: Vec<B>,
-    /// The latest blinded block produced, and the node that produced it. A
-    /// blinded block can only be published where it was produced: that node's
-    /// builder holds the payload, and that node claimed the slot.
-    blinded_producer: std::sync::Mutex<Option<BlindedProducer>>,
-}
-
-/// Which node produced which blinded block.
-#[derive(Debug, Clone, Copy)]
-struct BlindedProducer {
-    slot: Slot,
-    /// Checked at publish, so the record answers for the block being
-    /// published rather than for whatever was last produced at its slot.
-    block_root: Root,
-    position: usize,
 }
 
 impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
     pub fn new(nodes: Vec<B>) -> Self {
         assert!(!nodes.is_empty(), "at least one beacon node is required");
-        Self {
-            nodes,
-            blinded_producer: std::sync::Mutex::new(None),
-        }
+        Self { nodes }
     }
 
     /// Try each node in order, returning the first success.
@@ -277,27 +260,14 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
             .await
     }
 
-    /// Remembers which node answered when the block is blinded, and forgets
-    /// it otherwise, a production that failed on every node included: the
-    /// record is for the latest block only, so nothing leaves a stale claim
-    /// that a blinded publish could match.
+    /// Marks the block with the node that produced it, which is where a
+    /// blinded block's publish has to go back to (see [`Producer`]).
     async fn produce_block(&self, request: &BlockRequest) -> Result<ProducedBlock> {
-        let produced = self
+        let (position, mut block) = self
             .try_each_at("produce_block", |node| node.produce_block(request))
-            .await;
-        let record = match &produced {
-            Ok((position, block)) if block.is_blinded() => Some(BlindedProducer {
-                slot: block.slot(),
-                block_root: block.block_root(),
-                position: *position,
-            }),
-            _ => None,
-        };
-        *self
-            .blinded_producer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = record;
-        produced.map(|(_, block)| block)
+            .await?;
+        block.producer = Producer::at(position);
+        Ok(block)
     }
 
     /// First node that accepts it wins, rather than a broadcast to every node.
@@ -330,26 +300,22 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
     /// protection has already recorded the slot, so nothing retries it.
     async fn publish_blinded_block(
         &self,
-        slot: Slot,
-        block_root: Root,
+        producer: Producer,
         fork: ForkName,
         body: &[u8],
     ) -> Result<Published> {
-        let record = *self
-            .blinded_producer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match record {
-            Some(producer) if producer.slot == slot && producer.block_root == block_root => {
-                self.nodes[producer.position]
-                    .publish_blinded_block(slot, block_root, fork, body)
-                    .await
-            }
-            _ => Err(Error::InconsistentResponse(format!(
-                "no beacon node produced blinded block {} for slot {slot}",
-                crate::beacon_node::dto::encode_hex(&block_root.0)
-            ))),
-        }
+        // A position this fallback never handed out: there is no node the
+        // block could go back to.
+        let node = self.nodes.get(producer.position()).ok_or_else(|| {
+            Error::InconsistentResponse(format!(
+                "a blinded block names beacon node {} as its producer, but {} are configured",
+                producer.position(),
+                self.nodes.len()
+            ))
+        })?;
+        // The node behind this one is a single node, with nothing to choose.
+        node.publish_blinded_block(Producer::default(), fork, body)
+            .await
     }
 
     /// To every node, like the other calls that install state on a node: a
@@ -1051,8 +1017,8 @@ mod tests {
         MockBeaconNode::new().with_block(5, 7).with_blinded_block()
     }
 
-    /// Node 0 cannot produce, node 1 can and answers blinded: the block must go
-    /// back to node 1, and node 0 must never see it.
+    /// Node 0 cannot produce, node 1 can and answers blinded: the block names
+    /// node 1 as its producer, goes back to node 1, and node 0 never sees it.
     #[tokio::test]
     async fn a_blinded_block_is_published_where_it_was_produced() {
         let first = MockBeaconNode::new().failing_call("produce_block", "down");
@@ -1063,9 +1029,10 @@ mod tests {
             .await
             .expect("node 1 produces");
         assert!(produced.is_blinded());
+        assert_eq!(produced.producer, Producer::at(1));
 
         let published = fallback
-            .publish_blinded_block(5, produced.block_root(), ForkName::Electra, &[1, 2, 3])
+            .publish_blinded_block(produced.producer, ForkName::Electra, &[1, 2, 3])
             .await
             .expect("published");
         assert_eq!(published, Published::HandedToBuilder);
@@ -1073,10 +1040,7 @@ mod tests {
         let first_published = fallback.nodes[0].published_blinded.lock().expect("lock");
         let second_published = fallback.nodes[1].published_blinded.lock().expect("lock");
         assert!(first_published.is_empty(), "node 0 never produced it");
-        assert_eq!(
-            *second_published,
-            vec![(5, ForkName::Electra, vec![1, 2, 3])]
-        );
+        assert_eq!(*second_published, vec![(ForkName::Electra, vec![1, 2, 3])]);
     }
 
     /// The producing node failing the publish is the end of it: another node's
@@ -1092,7 +1056,7 @@ mod tests {
             .await
             .expect("node 1 produces");
         let err = fallback
-            .publish_blinded_block(5, produced.block_root(), ForkName::Electra, &[9])
+            .publish_blinded_block(produced.producer, ForkName::Electra, &[9])
             .await
             .expect_err("node 1 failed to confirm");
         assert!(
@@ -1109,27 +1073,16 @@ mod tests {
         );
     }
 
-    /// The record answers for one block: another slot, or another root at the
-    /// same slot, is refused without reaching any node.
+    /// A producer this fallback never handed out has no node to go back to,
+    /// and is refused without reaching any node.
     #[tokio::test]
-    async fn a_blinded_publish_for_another_slot_or_block_is_refused() {
+    async fn a_blinded_publish_naming_an_unknown_producer_is_refused() {
         let fallback = FallbackBeaconNode::new(vec![blinded_node()]);
-        let produced = fallback
-            .produce_block(&blinded_request(5, 7))
+        let err = fallback
+            .publish_blinded_block(Producer::at(3), ForkName::Electra, &[1])
             .await
-            .expect("produces");
-        let root = produced.block_root();
-
-        for (slot, block_root, what) in [
-            (6, root, "nothing was produced for slot 6"),
-            (5, Root::repeat_byte(0xee), "that block was not produced"),
-        ] {
-            let err = fallback
-                .publish_blinded_block(slot, block_root, ForkName::Electra, &[1])
-                .await
-                .expect_err(what);
-            assert!(matches!(err, Error::InconsistentResponse(_)), "got {err:?}");
-        }
+            .expect_err("there is no node 3");
+        assert!(matches!(err, Error::InconsistentResponse(_)), "got {err:?}");
         assert!(
             fallback.nodes[0]
                 .published_blinded
@@ -1137,46 +1090,6 @@ mod tests {
                 .expect("lock")
                 .is_empty()
         );
-    }
-
-    /// A production that fails on every node clears the record too, so the
-    /// earlier block's claim does not outlive the attempt that replaced it.
-    #[tokio::test]
-    async fn a_failed_production_clears_the_blinded_record() {
-        let fallback = FallbackBeaconNode::new(vec![blinded_node()]);
-        let produced = fallback
-            .produce_block(&blinded_request(5, 7))
-            .await
-            .expect("blinded");
-        fallback
-            .produce_block(&blinded_request(6, 7))
-            .await
-            .expect_err("the node holds no block for slot 6");
-
-        fallback
-            .publish_blinded_block(5, produced.block_root(), ForkName::Electra, &[1])
-            .await
-            .expect_err("the record is gone");
-    }
-
-    /// A full block produced afterwards clears the claim, so an old blinded
-    /// block's slot cannot be published against a node that no longer holds it.
-    #[tokio::test]
-    async fn a_full_block_clears_the_blinded_record() {
-        let fallback = FallbackBeaconNode::new(vec![blinded_node()]);
-        let blinded = fallback
-            .produce_block(&blinded_request(5, 7))
-            .await
-            .expect("blinded");
-        fallback
-            .produce_block(&request(5, 7))
-            .await
-            .expect("full, since no factor was sent");
-
-        fallback
-            .publish_blinded_block(5, blinded.block_root(), ForkName::Electra, &[1])
-            .await
-            .expect_err("the record is gone");
     }
 
     #[tokio::test]

@@ -246,6 +246,33 @@ pub struct ProducedBlock {
     /// told which.
     pub fork: ForkName,
     pub contents: Contents,
+    /// Which configured node produced it, for a blinded block's publish to go
+    /// back to. See [`Producer`].
+    pub producer: Producer,
+}
+
+/// Which of the configured beacon nodes produced a block.
+///
+/// A blinded block can only be published where it was produced: that node's
+/// builder holds the payload, and that node claimed the slot. The fallback
+/// fills this in when it returns a block and reads it when the signed block
+/// is published, so the block carries its own way back: the proposal path
+/// takes the producer from the very block it signed. A single node has
+/// nothing to choose and leaves it at the default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Producer(usize);
+
+impl Producer {
+    /// The node at `position` in the fallback's list.
+    pub(crate) fn at(position: usize) -> Self {
+        Self(position)
+    }
+
+    /// The position in the fallback's list of the node that produced the
+    /// block.
+    pub(crate) fn position(self) -> usize {
+        self.0
+    }
 }
 
 /// The block and the blob material that came with it.
@@ -309,6 +336,7 @@ impl ProducedBlock {
                         kzg_proofs: contents.kzg_proofs,
                         blobs: contents.blobs,
                     },
+                    producer: Producer::default(),
                 })
             }
             ForkName::Fulu => {
@@ -321,6 +349,7 @@ impl ProducedBlock {
                         kzg_proofs: contents.kzg_proofs,
                         blobs: contents.blobs,
                     },
+                    producer: Producer::default(),
                 })
             }
             // Gloas needs one more fact than the fork: whether the node
@@ -358,6 +387,7 @@ impl ProducedBlock {
                 Ok(Self {
                     fork,
                     contents: Contents::Blinded { block },
+                    producer: Producer::default(),
                 })
             }
             // Named, as `from_ssz` names its arms, so a new fork forces a
@@ -411,6 +441,7 @@ impl ProducedBlock {
         Ok(Self {
             fork: ForkName::Gloas,
             contents: Contents::Gloas { block, payload },
+            producer: Producer::default(),
         })
     }
 

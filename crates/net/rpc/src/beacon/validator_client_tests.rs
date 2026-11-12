@@ -1750,6 +1750,7 @@ mod builder_flow {
     };
     use ethlambda_types::beacon::primitives::ExecutionAddress;
     use ethlambda_validator::beacon_node::Published;
+    use ethlambda_validator::beacon_node::block_contents::Producer;
     use libssz::SszDecode as _;
 
     /// What a test drives: this node served over a socket, the proposer's key
@@ -1873,23 +1874,23 @@ mod builder_flow {
         }
 
         /// Registered, a bid taken at the maximum factor, and the blinded
-        /// block signed: its root and the body to publish.
-        async fn signed_blinded(&self) -> (ethlambda_types::primitives::H256, Vec<u8>) {
+        /// block signed: the node that produced it and the body to publish.
+        async fn signed_blinded(&self) -> (Producer, Vec<u8>) {
             self.register().await;
             self.world.offer(1, |_| {});
             let produced = self.produce(Some(u64::MAX)).await;
             assert!(produced.is_blinded());
-            let block_root = produced.block_root();
-            (block_root, self.sign(produced).await)
+            let producer = produced.producer;
+            (producer, self.sign(produced).await)
         }
 
         async fn publish_blinded(
             &self,
-            block_root: ethlambda_types::primitives::H256,
+            producer: Producer,
             body: &[u8],
         ) -> ethlambda_validator::Result<Published> {
             self.client
-                .publish_blinded_block(self.world.slot, block_root, ForkName::Fulu, body)
+                .publish_blinded_block(producer, ForkName::Fulu, body)
                 .await
         }
     }
@@ -1905,9 +1906,9 @@ mod builder_flow {
         let engine = fake_execution_client_paying("0x2a", false).await;
         let h = harness(world, engine).await;
 
-        let (block_root, body) = h.signed_blinded().await;
+        let (producer, body) = h.signed_blinded().await;
         let err = h
-            .publish_blinded(block_root, &body)
+            .publish_blinded(producer, &body)
             .await
             .expect_err("the relay refused it");
         assert!(
@@ -1927,9 +1928,9 @@ mod builder_flow {
         let engine = fake_execution_client_paying("0x2a", false).await;
         let h = harness(world, engine).await;
 
-        let (block_root, body) = h.signed_blinded().await;
+        let (producer, body) = h.signed_blinded().await;
         let err = h
-            .publish_blinded(block_root, &body)
+            .publish_blinded(producer, &body)
             .await
             .expect_err("the relay did not confirm it");
         assert!(
@@ -1953,8 +1954,8 @@ mod builder_flow {
         let engine = fake_execution_client_paying("0x2a", false).await;
         let h = harness(world, engine).await;
 
-        let (block_root, body) = h.signed_blinded().await;
-        let published = h.publish_blinded(block_root, &body).await.expect("handed");
+        let (producer, body) = h.signed_blinded().await;
+        let published = h.publish_blinded(producer, &body).await.expect("handed");
         assert_eq!(published, Published::HandedToBuilder);
 
         let full = h.produce(None).await;
@@ -1991,11 +1992,11 @@ mod builder_flow {
             "the factor must reach the node and take the bid"
         );
 
-        let block_root = produced.block_root();
+        let producer = produced.producer;
         let body = h.sign(produced).await;
         let published = h
             .client
-            .publish_blinded_block(h.world.slot, block_root, ForkName::Fulu, &body)
+            .publish_blinded_block(producer, ForkName::Fulu, &body)
             .await
             .expect("the node hands the block to its builder");
         assert_eq!(published, Published::HandedToBuilder);
