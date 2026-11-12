@@ -784,10 +784,12 @@ clock passes it.
   the validator must not attest. The signing record that turns these into
   `AttestationData` is the validator client's, so the node serves inputs.
 - Both data endpoints: a slot before the fork, or other than the node's
-  current one, is a `400`; before the slot's instant, after it passed unrecorded
-  (a node that started its fork choice mid-slot), or with the fork choice not
-  running yet, `503`. A voted block whose payload is unvalidated is a `503`, as
-  for `attestation_data`. JSON only.
+  current one, is a `400`; before the slot's instant, or with the fork choice
+  not running yet, `503`. Head vote data is also a `503` after its instant
+  passed unrecorded (a node that started its fork choice mid-slot), and for a
+  voted block whose payload is unvalidated, as for `attestation_data`; the
+  finality attestation input is observed when asked, so it has neither case.
+  JSON only.
 - **`POST /eth/v1/beacon/pool/head_votes`** takes an array of signed
   `HeadVoteMessage`s (`{validator_index, data, signature}`), JSON or SSZ. Each
   runs through the `head_vote` gossip rules and into the fork choice

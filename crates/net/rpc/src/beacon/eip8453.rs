@@ -30,13 +30,14 @@
 //! with `Eth-Consensus-Version: eip8453` (see `pool.rs`, which hands them to
 //! [`post_fg_attestations`]).
 //!
-//! The data endpoints answer for the protocol instant each input belongs to,
-//! recorded by the shared [`SharedEip8453Node`] as its clock passes it: the
-//! head vote deadline (`HEAD_VOTE_DUE_BPS`) for head vote data, and the
-//! support cutoff (`SUPPORT_CUTOFF_BPS`) for the finality attestation input,
-//! the first instant `get_ac_frame` answers in a slot. Asked before that
-//! instant they answer `503`; asked about another slot than the node's
-//! current one, `400`.
+//! The data endpoints answer for the protocol instant each input belongs to.
+//! Head vote data is `get_ac_vote_head` as the shared [`SharedEip8453Node`]
+//! recorded it when its clock passed the head vote deadline
+//! (`HEAD_VOTE_DUE_BPS`). The finality attestation input is one
+//! `get_ac_frame` observation, taken when asked at or after the support
+//! cutoff (`SUPPORT_CUTOFF_BPS`), the first instant it answers in a slot.
+//! Asked before that instant they answer `503`; asked about another slot than
+//! the node's current one, `400`.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
