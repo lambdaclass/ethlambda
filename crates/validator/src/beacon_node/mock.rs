@@ -64,6 +64,9 @@ pub struct MockBeaconNode {
     pub duties: Mutex<Vec<(Epoch, AttesterDuties)>>,
     pub proposers: Mutex<Vec<(Epoch, ProposerDuties)>>,
     pub attestation_data: Option<AttestationData>,
+    /// Hand `attestation_data` back without checking it, as an implementation
+    /// that failed to honour the trait's contract would.
+    pub attestation_data_unchecked: bool,
     /// The slot and proposer the mock will produce a block for. `None` makes
     /// `produce_block` fail, the way an unset `attestation_data` does.
     pub produces_block: Option<(Slot, ValidatorIndex)>,
@@ -308,6 +311,15 @@ impl MockBeaconNode {
             .lock()
             .expect("lock")
             .clone()
+    }
+
+    /// Break the contract on `BeaconNodeApi::attestation_data`: answer with
+    /// whatever data is set, unchecked. For tests of the caller's own check,
+    /// which a mock that honours the contract never lets a wrong answer
+    /// reach.
+    pub fn without_attestation_data_check(mut self) -> Self {
+        self.attestation_data_unchecked = true;
+        self
     }
 
     /// Give `attestation_data` answers a nonzero `index`, the way a gloas node
@@ -598,8 +610,11 @@ impl BeaconNodeApi for MockBeaconNode {
         // with data for another slot behaves like a node stuck on a stale
         // head: it errors, and failover moves past it. Without this the mock
         // would be a more permissive node than any real one, and tests built
-        // on it would not reflect what happens in production.
-        crate::beacon_node::validate_attestation_data(slot, fork, &data)?;
+        // on it would not reflect what happens in production. Unless a test
+        // asks for exactly that, to reach the caller's own check.
+        if !self.attestation_data_unchecked {
+            crate::beacon_node::validate_attestation_data(slot, fork, &data)?;
+        }
         Ok(data)
     }
 

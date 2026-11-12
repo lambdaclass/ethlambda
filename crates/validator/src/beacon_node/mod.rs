@@ -56,6 +56,13 @@ pub mod mock;
 /// it, and the `Err` is one failover moves past to a node that may answer
 /// properly. Lodestar's validator client refuses the same before signing
 /// (`validateAttestationDuty`).
+///
+/// `fork` must be the fork `slot` falls in on the caller's schedule, and is
+/// taken on trust: an implementation is handed it with the request and holds
+/// no schedule to check it against, so the bound on `index` is only as right
+/// as the fork it is given. [`crate::attestation::AttestationService`], the
+/// caller that signs, derives it from its own `Config` for the slot it asks
+/// about, and runs this check again under it.
 pub fn validate_attestation_data(slot: Slot, fork: ForkName, data: &AttestationData) -> Result<()> {
     if data.slot != slot {
         return Err(crate::error::Error::InconsistentResponse(format!(
@@ -83,7 +90,7 @@ pub fn validate_attestation_data(slot: Slot, fork: ForkName, data: &AttestationD
             data.source.epoch, data.target.epoch
         )));
     }
-    let highest_index = highest_attestation_index(fork)?;
+    let highest_index = highest_attestation_index(fork);
     if data.index > highest_index {
         return Err(crate::error::Error::InconsistentResponse(format!(
             "attestation data for slot {slot} carries index {}, and a {} attestation's is at \
@@ -100,7 +107,7 @@ pub fn validate_attestation_data(slot: Slot, fork: ForkName, data: &AttestationD
 /// Every fork is named rather than compared against, so a fork added after
 /// gloas has to say what its index means instead of inheriting gloas's
 /// answer.
-fn highest_attestation_index(fork: ForkName) -> Result<u64> {
+fn highest_attestation_index(fork: ForkName) -> u64 {
     match fork {
         // A committee, and the one the query names: this client only ever
         // asks about committee 0 (see `BeaconNodeApi::attestation_data`), so
@@ -109,22 +116,25 @@ fn highest_attestation_index(fork: ForkName) -> Result<u64> {
         | ForkName::Altair
         | ForkName::Bellatrix
         | ForkName::Capella
-        | ForkName::Deneb => Ok(0),
+        | ForkName::Deneb => 0,
         // EIP-7549 moved the committee out of the signed data and left the
         // field fixed at zero.
-        ForkName::Electra | ForkName::Fulu => Ok(0),
+        ForkName::Electra | ForkName::Fulu => 0,
         // The payload signal: 0 for a same-slot block or an empty one, 1 for
         // a block whose payload was seen. Which of the two is right depends
         // on the node's view of the block, which this client does not have,
         // so only the range is checked.
-        ForkName::Gloas => Ok(1),
+        ForkName::Gloas => 1,
         // Not a Beacon Chain fork: `Config::fork_at_epoch` never names it, so
-        // a caller that does is wrong, and nothing is signed for it.
-        ForkName::Lean => Err(crate::error::Error::InconsistentResponse(
-            "attestation data was asked for under the lean fork, which is not a Beacon Chain \
-             fork and has no attestation of this shape"
-                .to_string(),
-        )),
+        // a caller that does has a bug of its own. A panic rather than an
+        // `Err`, because this runs after the node has answered: an `Err`
+        // here is `InconsistentResponse`, which failover blames on the node
+        // and retries on every other one, so a local bug would read as every
+        // beacon node failing, every slot.
+        ForkName::Lean => unreachable!(
+            "validate_attestation_data: lean is not a Beacon Chain fork and has no attestation \
+             data of this shape"
+        ),
     }
 }
 
@@ -730,10 +740,12 @@ mod tests {
         assert!(validate_attestation_data(100, fork, &with_index(u64::MAX)).is_err());
     }
 
-    /// Lean is not on the Beacon Chain's fork timeline, so no index is valid
-    /// for it and nothing is signed.
+    /// Lean is not on the Beacon Chain's fork timeline and no schedule names
+    /// it, so a caller that does has a bug, reported as one rather than as a
+    /// node answering badly.
     #[test]
-    fn the_lean_fork_has_no_valid_index() {
-        assert!(validate_attestation_data(100, ForkName::Lean, &with_index(0)).is_err());
+    #[should_panic(expected = "lean is not a Beacon Chain fork")]
+    fn the_lean_fork_is_a_bug_in_the_caller() {
+        let _ = validate_attestation_data(100, ForkName::Lean, &with_index(0));
     }
 }

@@ -1533,6 +1533,10 @@ mod tests {
     fn an_export_needs_no_writable_directory() {
         use std::os::unix::fs::PermissionsExt as _;
 
+        if running_as_root() {
+            eprintln!("skipped: root bypasses directory permissions");
+            return;
+        }
         let dir = tempfile::tempdir().expect("temp dir");
         let mut protection = open(dir.path(), &[1], true).expect("init");
         propose(&mut protection, 1, 97).expect("propose");

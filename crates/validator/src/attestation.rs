@@ -705,7 +705,14 @@ mod tests {
         let store = RwLock::new(store);
         let pubkey_hex = encode_hex(&pubkey.0);
 
-        let node = Arc::new(MockBeaconNode::new().with_attestation_data(96));
+        // A node that breaks the trait's contract and hands the stale data
+        // back unchecked, so the refusal below is `attest`'s own, the last
+        // one before a signature, and not the implementation's.
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_attestation_data(96)
+                .without_attestation_data_check(),
+        );
         let service =
             AttestationService::new(node.clone(), context(), SlashingProtection::in_memory());
 
@@ -734,7 +741,8 @@ mod tests {
         let store = RwLock::new(store);
         let pubkey_hex = encode_hex(&pubkey.0);
 
-        let mut node = MockBeaconNode::new();
+        // Unchecked by the node, so `attest`'s own check is what refuses.
+        let mut node = MockBeaconNode::new().without_attestation_data_check();
         node.attestation_data = Some(AttestationData {
             slot: 96,
             index: 0,
@@ -769,6 +777,10 @@ mod tests {
     /// every peer would reject, and a correct answer for the same slot is
     /// still signed. `context()` is mainnet's schedule, where slot 96 is long
     /// before gloas, so 1 is not an index a vote there can carry.
+    ///
+    /// The node hands its answer back unchecked, so what refuses it is
+    /// `attest`'s own check, under the fork `attest` derives for the slot:
+    /// with that check gone, or run under gloas, the first call would sign.
     #[tokio::test]
     async fn an_index_invalid_at_the_slots_fork_is_refused_and_records_nothing() {
         let mut store = ValidatorStore::new();
@@ -780,7 +792,8 @@ mod tests {
         let wrong = Arc::new(
             MockBeaconNode::new()
                 .with_attestation_data(96)
-                .with_attestation_index(1),
+                .with_attestation_index(1)
+                .without_attestation_data_check(),
         );
         let err = AttestationService::new(wrong.clone(), context(), protection.clone())
             .attest(96, &duties, &store)
