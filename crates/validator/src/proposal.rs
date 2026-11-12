@@ -114,6 +114,9 @@ pub struct ProposalService<B> {
     /// The `builder_boost_factor` sent with each block request, or `None` when
     /// builder proposals are off, in which case a blinded answer is refused.
     builder_boost_factor: Option<u64>,
+    /// The `min_bid` sent with each gloas block request, in gwei: the floor
+    /// below which the node takes no p2p bid. `0` unless set.
+    builder_min_bid: u64,
     /// The slot of the latest blinded block this service signed, set before
     /// its publish starts. A `std::sync::Mutex` because the critical section
     /// is a single store with no await inside it.
@@ -141,10 +144,18 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
             settings,
             protection,
             builder_boost_factor,
+            builder_min_bid: 0,
             last_blinded_slot: std::sync::Mutex::new(None),
             clock: None,
             preferences: None,
         }
+    }
+
+    /// Send `min_bid` (gwei) with every gloas block request, so the node
+    /// takes no p2p bid below it.
+    pub fn with_builder_min_bid(mut self, min_bid: u64) -> Self {
+        self.builder_min_bid = min_bid;
+        self
     }
 
     /// Give the service the proposer preferences this client published, so
@@ -300,6 +311,7 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
             randao_reveal,
             graffiti,
             builder_boost_factor: self.builder_boost_factor,
+            builder_min_bid: self.builder_min_bid,
         };
         let mut produced = self.beacon_node.produce_block(&request).await?;
 
@@ -1086,6 +1098,7 @@ mod tests {
             randao_reveal: Default::default(),
             graffiti: Default::default(),
             builder_boost_factor: None,
+            builder_min_bid: 0,
         };
         let full = full.produce_block(&request).await.expect("produces");
         assert!(ProposalService::<MockBeaconNode>::compares_fee_recipient(
@@ -1110,6 +1123,23 @@ mod tests {
         assert_eq!(pays(stranger, Some(current), &[]), Some(false));
         assert_eq!(pays(stranger, None, &[preferred]), Some(false));
         assert_eq!(pays(stranger, None, &[]), None);
+    }
+
+    /// The configured floor goes with the block request, beside the factor.
+    #[tokio::test]
+    async fn the_min_bid_goes_with_every_block_request() {
+        let (store, pubkey) = store();
+        let node = Arc::new(MockBeaconNode::new().with_block(slot(), 7));
+        let service = builder_service(node.clone(), None).with_builder_min_bid(1_000_000);
+
+        service
+            .propose(slot(), &duty(&pubkey, 7, slot()), &store)
+            .await
+            .expect("proposes");
+
+        let requests = node.block_requests();
+        assert_eq!(requests[0].builder_boost_factor, Some(100));
+        assert_eq!(requests[0].builder_min_bid, 1_000_000);
     }
 
     /// A node that does not confirm the publish may still have handed the block

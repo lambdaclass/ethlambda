@@ -868,7 +868,10 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   epoch before gloas it signs proposer preferences every slot for its proposals in
   the current and next epoch (`PreferencesService`, v2 duties, signed at the
   proposal epoch's fork version as consensus-specs v1.7.0-beta.4 and every other
-  client do), unconditionally, and `produceBlockV4` carries the boost factor.
+  client do), unconditionally, re-sending each kept one once an epoch (a node
+  holds them in memory only), and `produceBlockV4` carries the boost factor and
+  `--builder-min-bid`. `--gas-limit` sets the target gas limit the preferences
+  carry, which the node's own gloas payload is built toward.
   It keeps EIP-3076 minimal-watermark slashing protection in
   `--validators-dir/slashing_protection.json` (`crate::slashing_protection`),
   durable before every block (blinded ones included) and attestation signature;

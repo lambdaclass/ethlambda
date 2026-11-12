@@ -149,6 +149,10 @@ pub struct BlockRequest {
     /// `produceBlockV4`'s body instead of the query, so a pooled p2p bid can
     /// win on value; a gloas answer is never blinded.
     pub builder_boost_factor: Option<u64>,
+    /// The smallest p2p bid, in gwei, the node may take for a gloas block
+    /// (`produceBlockV4`'s `min_bid`): `--builder-min-bid`, `0` when builder
+    /// proposals are off. Not sent before gloas, where no endpoint takes it.
+    pub builder_min_bid: u64,
 }
 
 /// What became of a published block.

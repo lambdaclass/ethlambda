@@ -836,6 +836,7 @@ mod tests {
             randao_reveal: BlsSignature([0; 96]),
             graffiti: Bytes32::default(),
             builder_boost_factor: None,
+            builder_min_bid: 0,
         }
     }
 

@@ -124,6 +124,16 @@ pub(crate) struct ValidatorOptions {
     #[arg(long, default_value = "false", requires = "builder_proposals")]
     pub(crate) prefer_builder_proposals: bool,
 
+    /// The smallest builder bid, in gwei, a gloas block may be built on: the
+    /// beacon node takes no p2p bid whose value plus execution payment is
+    /// below it, however the boost factor weighs it.
+    ///
+    /// Sent as `produceBlockV4`'s `min_bid`, so gloas only. A bid floor
+    /// matters most with `--prefer-builder-proposals`, which otherwise takes
+    /// a 1-gwei bid over the local payload. `0` sets no floor.
+    #[arg(long, default_value_t = 0, requires = "builder_proposals")]
+    pub(crate) builder_min_bid: u64,
+
     /// Register every loaded key that has no slashing-protection record,
     /// instead of refusing to start.
     ///
@@ -191,6 +201,7 @@ impl ValidatorOptions {
             } else {
                 self.builder_boost_factor
             },
+            min_bid: self.builder_min_bid,
         })
     }
 
@@ -255,6 +266,7 @@ mod tests {
             builder_proposals: false,
             builder_boost_factor: 100,
             prefer_builder_proposals: false,
+            builder_min_bid: 0,
             init_slashing_protection: false,
         }
     }
@@ -306,7 +318,10 @@ mod tests {
         let options = parse(&["--builder-proposals"]).expect("parses");
         assert_eq!(
             options.builder(),
-            Some(BuilderProposals { boost_factor: 100 })
+            Some(BuilderProposals {
+                boost_factor: 100,
+                min_bid: 0
+            })
         );
     }
 
@@ -316,7 +331,10 @@ mod tests {
             parse(&["--builder-proposals", "--builder-boost-factor", "250"]).expect("parses");
         assert_eq!(
             options.builder(),
-            Some(BuilderProposals { boost_factor: 250 })
+            Some(BuilderProposals {
+                boost_factor: 250,
+                min_bid: 0
+            })
         );
     }
 
@@ -327,7 +345,8 @@ mod tests {
         assert_eq!(
             options.builder(),
             Some(BuilderProposals {
-                boost_factor: u64::MAX
+                boost_factor: u64::MAX,
+                min_bid: 0
             })
         );
     }
@@ -338,6 +357,36 @@ mod tests {
             .expect_err("a factor with builder proposals off is a mistake");
         parse(&["--prefer-builder-proposals"])
             .expect_err("a preference with builder proposals off is a mistake");
+        parse(&["--builder-min-bid", "1000000"])
+            .expect_err("a bid floor with builder proposals off is a mistake");
+    }
+
+    /// The floor travels with either way of weighing bids, in gwei as given.
+    #[test]
+    fn a_min_bid_is_used_beside_the_factor_or_the_preference() {
+        let options =
+            parse(&["--builder-proposals", "--builder-min-bid", "1000000"]).expect("parses");
+        assert_eq!(
+            options.builder(),
+            Some(BuilderProposals {
+                boost_factor: 100,
+                min_bid: 1_000_000
+            })
+        );
+        let options = parse(&[
+            "--builder-proposals",
+            "--prefer-builder-proposals",
+            "--builder-min-bid",
+            "5",
+        ])
+        .expect("parses");
+        assert_eq!(
+            options.builder(),
+            Some(BuilderProposals {
+                boost_factor: u64::MAX,
+                min_bid: 5
+            })
+        );
     }
 
     #[test]

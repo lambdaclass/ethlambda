@@ -118,6 +118,9 @@ pub struct BuilderProposals {
     /// bid and the local payload as they are; `u64::MAX` takes the builder
     /// whenever there is a bid.
     pub boost_factor: u64,
+    /// The smallest p2p bid, in gwei, a gloas block may be built on
+    /// (`produceBlockV4`'s `min_bid`). `0` takes any bid that wins on value.
+    pub min_bid: u64,
 }
 
 /// Run the validator client until the process is stopped.
@@ -263,10 +266,12 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         config.builder.map(|builder| builder.boost_factor),
     )
     .with_clock(clock.clone())
+    .with_builder_min_bid(config.builder.map_or(0, |builder| builder.min_bid))
     .with_preferences(preferences.clone());
     let registration = config.builder.map(|builder| {
         info!(
             boost_factor = builder.boost_factor,
+            min_bid_gwei = builder.min_bid,
             "Builder proposals on: registering validators and accepting blinded blocks"
         );
         Arc::new(RegistrationService::new(

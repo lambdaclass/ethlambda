@@ -134,13 +134,15 @@ struct SszResponse {
 /// The body `produceBlockV4` requires: the node decodes it, as the
 /// specification demands, even when it builds locally.
 ///
-/// `min_bid` stays `0` and `builders` stays empty, since the builder API
-/// (relay or `builder_pubkeys` bids) is a later phase. The factor is the
-/// configured `builder_boost_factor` with `--builder-proposals`, so a pooled
-/// p2p bid can win on value, and `0` without it: self-build only, as before.
-fn builder_config(boost_factor: Option<u64>) -> String {
+/// `builders` stays empty, since the builder API (relay or `builder_pubkeys`
+/// bids) is a later phase. The top-level `min_bid` and factor govern the pooled
+/// p2p bids. The factor is the configured `builder_boost_factor` with
+/// `--builder-proposals`, so such a bid can win on value, and `0` without it:
+/// self-build only, as before. `min_bid` is `--builder-min-bid`, in gwei, the
+/// floor below which no p2p bid is taken, `0` without builder proposals.
+fn builder_config(boost_factor: Option<u64>, min_bid: u64) -> String {
     let factor = boost_factor.unwrap_or(0);
-    format!(r#"{{"min_bid":"0","builder_boost_factor":"{factor}","builders":[]}}"#)
+    format!(r#"{{"min_bid":"{min_bid}","builder_boost_factor":"{factor}","builders":[]}}"#)
 }
 
 /// A [`BeaconNodeApi`] backed by one beacon node's standard REST Beacon API.
@@ -454,7 +456,7 @@ impl HttpBeaconNode {
         let response = self
             .post_json_for_ssz(
                 &path,
-                builder_config(request.builder_boost_factor),
+                builder_config(request.builder_boost_factor, request.builder_min_bid),
                 request.fork.as_str(),
             )
             .await?;
@@ -1409,23 +1411,31 @@ mod tests {
     /// The body `produceBlockV4` requires: no minimum bid and no builders,
     /// the boost factor being the configured one or `0`.
     #[test]
-    fn the_builder_config_carries_the_factor_or_zero() {
+    fn the_builder_config_carries_the_factor_or_zero_and_the_min_bid() {
         for (factor, expected) in [(None, "0"), (Some(250), "250"), (Some(0), "0")] {
             let value: serde_json::Value =
-                serde_json::from_str(&builder_config(factor)).expect("valid json");
+                serde_json::from_str(&builder_config(factor, 0)).expect("valid json");
             assert_eq!(value["min_bid"], "0");
             assert_eq!(value["builder_boost_factor"], expected, "{factor:?}");
             assert_eq!(value["builders"], serde_json::json!([]));
         }
+        let value: serde_json::Value =
+            serde_json::from_str(&builder_config(Some(100), u64::MAX)).expect("valid json");
+        assert_eq!(value["min_bid"], u64::MAX.to_string(), "quoted, as a Gwei");
     }
 
     /// The body reaches the wire: a gloas production request posts it.
     #[tokio::test]
-    async fn a_gloas_production_request_posts_the_factor_in_its_body() {
-        for (factor, expected) in [(None, "0"), (Some(250), "250")] {
+    async fn a_gloas_production_request_posts_the_factor_and_min_bid_in_its_body() {
+        let cases = [
+            (None, 0, "0", "0"),
+            (Some(250), 1_000_000, "250", "1000000"),
+        ];
+        for (factor, min_bid, expected_factor, expected_min_bid) in cases {
             let served = serve(500, vec![], vec![]).await;
             let request = BlockRequest {
                 fork: ForkName::Gloas,
+                builder_min_bid: min_bid,
                 ..block_request(factor)
             };
             let _ = served.node.produce_block(&request).await;
@@ -1433,7 +1443,8 @@ mod tests {
             assert_eq!(seen.len(), 1);
             assert!(seen[0].0.contains("/eth/v4/validator/blocks/5"));
             let body: serde_json::Value = serde_json::from_slice(&seen[0].1).expect("json body");
-            assert_eq!(body["builder_boost_factor"], expected);
+            assert_eq!(body["builder_boost_factor"], expected_factor);
+            assert_eq!(body["min_bid"], expected_min_bid);
         }
     }
 
@@ -1500,6 +1511,7 @@ mod tests {
             randao_reveal: Default::default(),
             graffiti: Default::default(),
             builder_boost_factor: factor,
+            builder_min_bid: 0,
         }
     }
 
