@@ -38,11 +38,12 @@
 //! # Restart
 //!
 //! A restarted node anchors a fresh engine at the store's finalized block (the
-//! gadget's, or Casper FFG's while the gadget has not finalized) and replays
-//! every stored block above it, with each verified payload, as a joining node:
-//! its receipt times are the restart's, its locks and saved confirmations start
-//! empty, as the lean decoupled mode's do. The payload invalidations the store
-//! recorded (`Store::invalid_payloads`) are replayed after the blocks.
+//! gadget's, at the height it finalized it, or Casper FFG's while the gadget
+//! has not finalized) and replays every stored block above it, with each
+//! verified payload, as a joining node: its receipt times are the restart's,
+//! its locks and saved confirmations start empty, as the lean decoupled mode's
+//! do. The payload invalidations the store recorded (`Store::invalid_payloads`)
+//! are replayed after the blocks.
 
 use ethlambda_decoupled::PayloadInvalidation;
 use ethlambda_state_transition::beacon::eip8453_fork_choice::{
@@ -116,9 +117,25 @@ pub(crate) fn rebuild_node(
     let finalized = store.latest_finalized().ok()?;
     let (anchor_slot, _) = store.block_entry(&finalized.root)?;
     let anchor_state = store.get_state(&finalized.root).ok().flatten()?;
-    let anchor = host::anchor(finalized.root, anchor_slot, &anchor_state)
+    let mut anchor = host::anchor(finalized.root, anchor_slot, &anchor_state)
         .inspect_err(|err| warn!(%err, "Cannot anchor the EIP-8453 fork choice"))
         .ok()?;
+    // The gadget's first finalized block is the last pre-fork block, the
+    // target of height 1 (fork.md), whose heze post-state carries no height.
+    // A restart anchored on it resumes at the height the gadget finalized it
+    // at, as `update_finality` never moves the finalized checkpoint back.
+    if anchor_state.fork_name() < ForkName::Eip8453
+        && let Some(recorded) = store.fg_finalized_checkpoint()
+        && recorded.root == finalized.root
+        && recorded.height > anchor.fg.finalized.height
+    {
+        let at_height: ethlambda_types::decoupled::HeightCheckpoint = recorded.into();
+        anchor.fg = ethlambda_decoupled::FgCheckpoints {
+            target: at_height,
+            justified: at_height,
+            finalized: at_height,
+        };
+    }
     let gadget_root = anchor.fg.finalized.root;
     let mut node = Eip8453Node::new(config.as_ref().clone(), host::new_engine(anchor));
     // A never-ticked engine jumps to the present: the replay below stamps

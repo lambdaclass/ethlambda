@@ -1062,8 +1062,9 @@ node computes the same value another way.
 - **The specification:** the store is in memory; nothing says what survives a
   restart.
 - **ethlambda:** a restart anchors a fresh engine at the stored finalized
-  block (the gadget's, or Casper FFG's before the gadget has finalized),
-  replays every stored block above it in slot order (their post-states'
+  block (the gadget's, or Casper FFG's before the gadget has finalized) and
+  its height (`fg_finalized`: the gadget's first finalized block is the last
+  pre-fork block, height 1, whose heze state names no height), replays every stored block above it in slot order (their post-states'
   checkpoints, their head votes, their verified payloads, and the payload
   invalidations it recorded, below), and starts the clock at the present:
   receipt times are the restart's, and the p2p head vote pool, the locks and

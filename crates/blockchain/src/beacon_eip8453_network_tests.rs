@@ -1037,6 +1037,69 @@ async fn an_in_process_network_crosses_the_fork_and_finalizes_with_the_gadget() 
     }
 }
 
+/// The gadget's first finalized checkpoint is height 1 on the last heze block
+/// (fork.md: "the target of height 1 is the latest block before the
+/// upgrade"), and the store's finalized row moves to it. A node restarted
+/// then anchors its engine at that heze block, and must resume at the height
+/// it had finalized: `update_finality` never moves the finalized checkpoint
+/// back, and the recorded heights must not either.
+#[tokio::test]
+async fn a_restart_at_the_first_finalized_height_resumes_at_it() {
+    let mut network = Network::new(1);
+    let fork_slot = network.fork_slot;
+    let mut slot = 0;
+    let finalized = loop {
+        slot += 1;
+        network.run_slot(slot).await;
+        if let Some(finalized) = network.store(0).fg_finalized_checkpoint()
+            && finalized.height > 0
+        {
+            break finalized;
+        }
+        assert!(
+            slot < fork_slot + 8 * preset::SLOTS_PER_ROUND,
+            "the gadget finalizes"
+        );
+    };
+    assert_eq!(
+        finalized.height, 1,
+        "the first finalized height: {finalized:?}"
+    );
+    let (finalized_slot, _) = network.store(0).block_entry(&finalized.root).unwrap();
+    assert_eq!(
+        finalized_slot,
+        fork_slot - 1,
+        "height 1 is the last heze block"
+    );
+    let justified = network.store(NODES - 1).fg_justified_checkpoint().unwrap();
+
+    network.restart(NODES - 1);
+    let now = network.time(slot, 3);
+    network.nodes[NODES - 1].tick_at(now).await;
+    let restarted = &network.nodes[NODES - 1];
+    let (replayed_justified, replayed_finalized) = restarted
+        .eip8453_node()
+        .with(|n| n.checkpoints())
+        .expect("the restart installs the engine");
+    assert_eq!(replayed_finalized, finalized.into());
+    assert_eq!(replayed_justified, justified.into());
+    assert_eq!(restarted.store.fg_finalized_checkpoint(), Some(finalized));
+
+    // The network goes on and finalizes further, the restarted node alike.
+    let more = slot + 3 * preset::SLOTS_PER_ROUND;
+    for slot in slot + 1..=more {
+        network.run_slot(slot).await;
+    }
+    let later = network.store(0).fg_finalized_checkpoint().unwrap();
+    assert!(
+        later.height > finalized.height,
+        "finality moved on: {later:?}"
+    );
+    for node in 1..NODES {
+        assert_eq!(network.store(node).fg_finalized_checkpoint(), Some(later));
+    }
+}
+
 /// Why the handover seeds a lock: at the fork's first slot no head vote of the
 /// previous slot exists, so without one the available chain's walk stops at
 /// its anchor (Casper FFG's finalized block, here genesis) and the fork's
