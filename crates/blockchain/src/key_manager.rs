@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::Instant;
 
 use ethlambda_crypto::signature::{ValidatorSecretKey, ValidatorSignature};
@@ -40,8 +40,8 @@ pub struct ValidatorKeyPair {
 pub struct KeyManager {
     /// Shared so a background warm can hold the keys while the actor signs.
     keys: HashMap<u64, Arc<ValidatorKeyPair>>,
-    /// The in-flight [`Self::prepare_keys_in_background`] thread, if any.
-    warm_worker: Option<JoinHandle<()>>,
+    /// The in-flight [`Self::prepare_keys_in_background`] warm, if any.
+    warm_worker: Option<spawned_rt::tasks::JoinHandle<()>>,
 }
 
 /// Which of a validator's two XMSS keys: each signs one kind of message.
@@ -112,8 +112,12 @@ impl KeyManager {
         warm_keys(slot, &self.keys_to_warm(proposer));
     }
 
-    /// Same warm as [`Self::prepare_keys_for`], on a background thread, so the
-    /// caller does not wait out the subtree rebuilds at a boundary.
+    /// Same warm as [`Self::prepare_keys_for`], on Tokio's blocking pool
+    /// (`spawned_rt::tasks::spawn_blocking`), so the caller does not wait out
+    /// the subtree rebuilds at a boundary. Under Spawned's deterministic
+    /// simulator the warm runs inline as one scheduling step instead, so it
+    /// is part of the seeded schedule. Needs a Tokio runtime: the chain
+    /// actor's group provides one.
     ///
     /// Safe to overlap with signing: a key's cache sits behind a lock that
     /// `sign` also takes, so a signature racing the warm of the same key waits
@@ -121,9 +125,8 @@ impl KeyManager {
     /// eviction rule of [`Self::prepare_keys_for`] still applies to when this
     /// is called.
     ///
-    /// Skips the warm while the previous one is still running, and warns
-    /// instead of failing when the thread cannot be spawned: either way the
-    /// only cost is latency, since `sign` rebuilds a missing subtree itself.
+    /// Skips the warm while the previous one is still running: the only cost
+    /// is latency, since `sign` rebuilds a missing subtree itself.
     pub fn prepare_keys_in_background(&mut self, slot: u32, proposer: Option<u64>) {
         if let Some(worker) = self.warm_worker.take() {
             if !worker.is_finished() {
@@ -131,17 +134,12 @@ impl KeyManager {
                 self.warm_worker = Some(worker);
                 return;
             }
-            let _ = worker
-                .join()
-                .inspect_err(|_| warn!("XMSS warm thread panicked"));
         }
 
         let keys = self.keys_to_warm(proposer);
-        self.warm_worker = thread::Builder::new()
-            .name("xmss-warm".to_string())
-            .spawn(move || warm_keys(slot, &keys))
-            .inspect_err(|err| warn!(slot, %err, "Failed to spawn XMSS warm thread"))
-            .ok();
+        self.warm_worker = Some(spawned_rt::tasks::spawn_blocking(move || {
+            warm_keys(slot, &keys)
+        }));
     }
 
     /// The keys [`Self::prepare_keys_for`] warms: every attestation key, then
@@ -579,8 +577,8 @@ mod tests {
         key_manager.sign_block_root(0, 1, &message).unwrap();
     }
 
-    #[test]
-    fn prepare_keys_in_background_warms_without_blocking_signing() {
+    #[tokio::test]
+    async fn prepare_keys_in_background_warms_without_blocking_signing() {
         let count = 2 * MIN_KEYS_PER_WARM_THREAD as u64 + 1;
         let mut key_manager = tiny_key_manager(count);
 
@@ -595,9 +593,9 @@ mod tests {
         key_manager
             .warm_worker
             .take()
-            .expect("warm thread spawned")
-            .join()
-            .expect("warm thread finished cleanly");
+            .expect("warm spawned")
+            .await
+            .expect("warm finished cleanly");
 
         // A later call spawns a fresh warm once the previous one is done.
         key_manager.prepare_keys_in_background(1, Some(0));

@@ -75,6 +75,8 @@ pub mod reaggregate;
 pub mod spec_test_runner;
 pub mod store;
 mod sync_status;
+#[cfg(test)]
+mod sim_tests;
 
 pub struct BlockChain {
     handle: ActorRef<BlockChainServer>,

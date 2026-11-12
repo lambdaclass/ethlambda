@@ -2042,6 +2042,7 @@ dependencies = [
  "serde_json",
  "snap",
  "spawned-concurrency 0.7.3",
+ "spawned-rt 0.7.3",
  "spawned-test",
  "thiserror 2.0.18",
  "tokio",
@@ -6600,7 +6601,7 @@ dependencies = [
 [[package]]
 name = "spawned-concurrency"
 version = "0.7.3"
-source = "git+https://github.com/lambdaclass/spawned?rev=4667d633c8a51a69db88a7896971115ed20aa5fe#4667d633c8a51a69db88a7896971115ed20aa5fe"
+source = "git+https://github.com/lambdaclass/spawned?rev=4f84ba1ae8f7c19240bcf8c77d23999d7b43a199#4f84ba1ae8f7c19240bcf8c77d23999d7b43a199"
 dependencies = [
  "futures",
  "pin-project-lite",
@@ -6624,7 +6625,7 @@ dependencies = [
 [[package]]
 name = "spawned-macros"
 version = "0.7.3"
-source = "git+https://github.com/lambdaclass/spawned?rev=4667d633c8a51a69db88a7896971115ed20aa5fe#4667d633c8a51a69db88a7896971115ed20aa5fe"
+source = "git+https://github.com/lambdaclass/spawned?rev=4f84ba1ae8f7c19240bcf8c77d23999d7b43a199#4f84ba1ae8f7c19240bcf8c77d23999d7b43a199"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6648,11 +6649,12 @@ dependencies = [
 [[package]]
 name = "spawned-rt"
 version = "0.7.3"
-source = "git+https://github.com/lambdaclass/spawned?rev=4667d633c8a51a69db88a7896971115ed20aa5fe#4667d633c8a51a69db88a7896971115ed20aa5fe"
+source = "git+https://github.com/lambdaclass/spawned?rev=4f84ba1ae8f7c19240bcf8c77d23999d7b43a199#4f84ba1ae8f7c19240bcf8c77d23999d7b43a199"
 dependencies = [
  "ctrlc",
  "loom",
  "nix 0.30.1",
+ "spawned-sim-libc",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -6661,9 +6663,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "spawned-sim-libc"
+version = "0.7.3"
+source = "git+https://github.com/lambdaclass/spawned?rev=4f84ba1ae8f7c19240bcf8c77d23999d7b43a199#4f84ba1ae8f7c19240bcf8c77d23999d7b43a199"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "spawned-test"
 version = "0.7.3"
-source = "git+https://github.com/lambdaclass/spawned?rev=4667d633c8a51a69db88a7896971115ed20aa5fe#4667d633c8a51a69db88a7896971115ed20aa5fe"
+source = "git+https://github.com/lambdaclass/spawned?rev=4f84ba1ae8f7c19240bcf8c77d23999d7b43a199#4f84ba1ae8f7c19240bcf8c77d23999d7b43a199"
 dependencies = [
  "spawned-concurrency 0.7.3",
  "spawned-rt 0.7.3",

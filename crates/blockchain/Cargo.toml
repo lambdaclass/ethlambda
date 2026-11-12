@@ -24,6 +24,9 @@ ethlambda-test-fixtures.workspace = true
 libssz.workspace = true
 
 spawned-concurrency.workspace = true
+# Blocking helpers (`spawn_blocking`): Tokio in production, one inline
+# step under the deterministic simulator.
+spawned-rt.workspace = true
 
 tokio.workspace = true
 tokio-util = { version = "0.7", default-features = false }
@@ -35,6 +38,8 @@ tracing.workspace = true
 hex.workspace = true
 
 [dev-dependencies]
+# sim_tests: the stub aggregation prover (Shadow integration), see src/sim_tests.rs.
+ethlambda-crypto = { workspace = true, features = ["shadow-integration"] }
 hex = { workspace = true }
 libssz.workspace = true
 libssz-types.workspace = true
@@ -69,3 +74,7 @@ harness = false
 # leanVM key format and fail to decode. Run on demand with
 # `cargo test --profile release-fast --test <name>`.
 test = false
+
+# `sim_tests`: built with RUSTFLAGS="--cfg spawned_sim --cfg tokio_unstable".
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(spawned_sim)"] }
