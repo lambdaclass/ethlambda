@@ -280,9 +280,10 @@ implementation's, so none of the [common flags](#common-flags) apply to it.
 > is an `flock`, which a network filesystem may not honour. Unix only. Run the
 > client under a supervisor that restarts it (systemd's `Restart=on-failure`,
 > a Kubernetes pod): if a bug ever panics while the record is held, the record
-> is unusable for the rest of that process, every duty is refused, and the
-> client exits with a failure at the next slot instead of idling, so that the
-> restart rereads the record from disk. A key with no record is refused at startup unless
+> is unusable for the rest of that process and no attestation or block can be
+> signed, so the client stops at once and exits with a failure, after letting
+> a keymanager request in flight finish, and the restart rereads the record
+> from disk. A key with no record is refused at startup unless
 > `--init-slashing-protection` is passed. A key moving here from another client
 > brings its history with [`slashing-protection import`](#slashing-protection),
 > or in the same keymanager API request that imports the key. See

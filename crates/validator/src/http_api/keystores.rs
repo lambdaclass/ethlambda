@@ -1376,7 +1376,7 @@ mod tests {
                 .expect("opens with no keys");
         let mut context =
             context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
-        context.protection = Arc::new(std::sync::Mutex::new(protection));
+        context.protection = crate::slashing_protection::SharedProtection::new(protection);
         let protection = context.protection.clone();
 
         let (_, body) = send(
@@ -1420,7 +1420,7 @@ mod tests {
         std::fs::create_dir(&record).expect("a directory in its place");
         let mut context =
             context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
-        context.protection = Arc::new(std::sync::Mutex::new(protection));
+        context.protection = crate::slashing_protection::SharedProtection::new(protection);
         let store = context.store.clone();
 
         let (_, body) = send(
@@ -1493,7 +1493,7 @@ mod tests {
             .expect("saves");
         let mut context =
             context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
-        context.protection = Arc::new(std::sync::Mutex::new(protection));
+        context.protection = crate::slashing_protection::SharedProtection::new(protection);
 
         let (_, body) = send(
             router(context, TOKEN.to_string()),
@@ -1563,7 +1563,7 @@ mod tests {
             .expect("saves");
         let mut context =
             context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
-        context.protection = Arc::new(std::sync::Mutex::new(protection));
+        context.protection = crate::slashing_protection::SharedProtection::new(protection);
 
         let (_, body) = send(
             router(context, TOKEN.to_string()),
@@ -1694,7 +1694,7 @@ mod tests {
         std::fs::create_dir(&record).expect("a directory in its place");
         let mut context =
             context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
-        context.protection = Arc::new(std::sync::Mutex::new(protection));
+        context.protection = crate::slashing_protection::SharedProtection::new(protection);
 
         let (_, body) = send(
             router(context, TOKEN.to_string()),
@@ -1732,6 +1732,118 @@ mod tests {
         );
     }
 
+    /// The reason the client stops gracefully. An import has saved its key
+    /// and is waiting to register it when a bug poisons the record: the
+    /// client stops, which used to drop the runtime with the request parked
+    /// there, leaving a key saved and enabled with no record, refused at
+    /// every start after. Told to stop instead, the server lets the import
+    /// meet the poisoned record, take its key off disk again and answer.
+    #[tokio::test]
+    async fn an_import_in_flight_when_the_record_is_poisoned_is_undone_before_the_client_stops() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (context, protection) = context_with_record(dir.path());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds");
+        let address = listener.local_addr().expect("bound");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let server = tokio::spawn({
+            let router = router(context, TOKEN.to_string());
+            let shutdown = shutdown.clone();
+            async move {
+                crate::http_api::serve(listener, router, shutdown)
+                    .await
+                    .expect("serves");
+            }
+        });
+
+        // Another access holds the record, so the import's registration
+        // waits for it, and will panic with it held: the bug.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (locked, is_locked) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn({
+            let protection = protection.clone();
+            move || {
+                let _guard = protection.lock().expect("not poisoned yet");
+                locked.send(()).expect("the test is waiting");
+                held.recv().expect("released");
+                panic!("a bug while holding the record");
+            }
+        });
+        is_locked.recv().expect("the record is held");
+
+        let request = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("http://{address}/eth/v1/keystores"))
+                .bearer_auth(TOKEN)
+                .json(&serde_json::json!({
+                    "keystores": [keystore_json()],
+                    "passwords": [PASSWORD],
+                }))
+                .send()
+                .await
+                .expect("the request in flight is answered")
+                .json::<serde_json::Value>()
+                .await
+                .expect("with a body")
+        });
+
+        // The import has saved its key once the definitions file lists it.
+        let saved = async {
+            loop {
+                let listed = ValidatorDefinitions::open(dir.path())
+                    .map(|definitions| !definitions.0.is_empty())
+                    .unwrap_or(false);
+                if listed {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(60), saved)
+            .await
+            .expect("the import saves its key");
+        release.send(()).expect("the holder is waiting");
+        holder.join().expect_err("the holder panics");
+
+        // What `run` does from here: stop on the record, the keymanager last.
+        let stopped = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            crate::run_until_stopped(std::future::pending(), &protection, shutdown, Some(server)),
+        )
+        .await
+        .expect("the client stops");
+        assert!(
+            matches!(stopped, Error::SlashingProtectionUnusable { .. }),
+            "got {stopped}"
+        );
+
+        // Checked before the answer is read: by the time the client is
+        // reported stopped, which is when the runtime goes, the import has
+        // already been undone.
+        assert!(
+            ValidatorStore::load(dir.path())
+                .expect("loads")
+                .pubkeys()
+                .is_empty(),
+            "the next start finds no key to refuse"
+        );
+        assert!(
+            !dir.path().join(format!("{KEYSTORE_PUBKEY}.json")).exists(),
+            "the keystore is off disk again"
+        );
+
+        let body = request.await.expect("the request task ends");
+        assert_eq!(body["data"][0]["status"], "error", "got {body}");
+        assert!(
+            body["data"][0]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("not imported"),
+            "got {body}"
+        );
+    }
+
     /// A key that fails to persist must leave no slashing-protection record
     /// behind: a record would later let the same keystore, copied in by hand,
     /// past the startup check as if it had been registered on purpose.
@@ -1752,7 +1864,7 @@ mod tests {
                 .expect("opens with no keys");
         let mut context =
             context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
-        context.protection = Arc::new(std::sync::Mutex::new(protection));
+        context.protection = crate::slashing_protection::SharedProtection::new(protection);
         let protection = context.protection.clone();
 
         let (_, body) = send(
@@ -1789,7 +1901,7 @@ mod tests {
         )
         .expect("opens with no keys");
         let mut context = context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir);
-        context.protection = Arc::new(std::sync::Mutex::new(protection));
+        context.protection = crate::slashing_protection::SharedProtection::new(protection);
         let protection = context.protection.clone();
         (context, protection)
     }

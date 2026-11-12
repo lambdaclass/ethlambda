@@ -427,7 +427,7 @@ mod tests {
         keys: &[ethlambda_types::beacon::primitives::BlsPubkey],
     ) -> SharedProtection {
         let protection = SlashingProtection::open(dir, Root::ZERO, keys, true).expect("opens");
-        Arc::new(std::sync::Mutex::new(protection))
+        crate::slashing_protection::SharedProtection::new(protection)
     }
 
     /// The restart shape the old in-memory guard could not cover: a fresh

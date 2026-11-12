@@ -122,10 +122,11 @@ pub enum Error {
     /// Kept apart from `SlashingProtection` and `Io` because the remedy
     /// differs: those name a file to look at, this one names a process to
     /// restart. A poisoned lock is a bug, never a disk, and it stays poisoned
-    /// for the life of the process, so every duty is refused from then on
-    /// and the duty loop stops the client at the next slot, for its
-    /// supervisor to restart (see `slashing_protection::ensure_usable`).
-    /// Never retryable.
+    /// for the life of the process. Only attestations and proposals consult
+    /// the record, so those are what it refuses from then on; the other
+    /// duties would go on signing, which is why the client stops as soon as
+    /// the poisoning is seen, for its supervisor to restart (see
+    /// `slashing_protection::SharedProtection`). Never retryable.
     #[error("slashing protection is unusable: {reason}")]
     SlashingProtectionUnusable { reason: String },
 

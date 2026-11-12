@@ -65,6 +65,7 @@ use std::sync::{Arc, Mutex};
 
 use ethlambda_types::beacon::containers::shared::AttestationData;
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, Root, Slot};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::beacon_node::dto::encode_hex;
@@ -76,7 +77,40 @@ use crate::error::{Error, Result};
 /// a change, a file write, with no `.await` inside. Async callers go through
 /// [`blocking`], so neither the write nor waiting for another holder's write
 /// holds up the executor.
-pub type SharedProtection = Arc<Mutex<SlashingProtection>>;
+///
+/// It also carries the signal that the record has become unusable. A panic
+/// while the lock is held poisons it for the life of the process, since
+/// nothing here recovers a record a panic may have left half-updated in
+/// memory: from then on no attestation and no block can be signed. The
+/// remedy is a restart, which reads the record back from disk, where every
+/// write either replaced it whole or left it alone. [`blocking`] raises the
+/// signal from the access that poisons the lock, or first finds it poisoned,
+/// and [`crate::run`] stops the client on it, for its supervisor to restart.
+#[derive(Clone)]
+pub struct SharedProtection {
+    record: Arc<Mutex<SlashingProtection>>,
+    unusable: CancellationToken,
+}
+
+impl SharedProtection {
+    pub fn new(protection: SlashingProtection) -> Self {
+        Self {
+            record: Arc::new(Mutex::new(protection)),
+            unusable: CancellationToken::new(),
+        }
+    }
+
+    /// Lock the record on the calling thread, waiting out any other holder.
+    /// For synchronous callers; an async one goes through [`blocking`].
+    pub fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, SlashingProtection>> {
+        self.record.lock()
+    }
+
+    /// Resolves once the record is unusable, and never on a healthy one.
+    pub async fn unusable(&self) {
+        self.unusable.cancelled().await;
+    }
+}
 
 /// How long [`blocking`] waits for the record before refusing, and how often
 /// it looks. A flush takes milliseconds on a healthy disk; a quarter of a
@@ -94,13 +128,12 @@ const RECORD_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 /// The operation's own error comes back as it is, so a caller can still tell
 /// a write that failed (`Error::Io`, a disk to look at) from a record that
 /// could not be reached at all (`Error::SlashingProtectionUnusable`): the
-/// lock is poisoned, because an operation panicked while holding it, and
-/// stays so until the process restarts, since nothing here recovers a record
-/// that a panic may have left half-updated in memory. The call whose own
-/// operation panicked sees it as the blocking task's `JoinError` and is told
-/// so, with the panic's message; every later call is told an earlier access
-/// panicked. The duty loop asks [`ensure_usable`] once a slot and stops the
-/// client on a poisoned record, so the restart comes from its supervisor.
+/// lock is poisoned, because an operation panicked while holding it. The call
+/// whose own operation panicked sees that as the blocking task's `JoinError`
+/// and is told the panic was its own; every later call is told an earlier
+/// access panicked. Either way the access raises the handle's signal (see
+/// [`SharedProtection`]), from the blocking task rather than from the caller,
+/// who may be gone by then.
 ///
 /// The operation runs to completion even if the caller is dropped, as a duty
 /// abandoned at its deadline is: that is safe, since a record written for a
@@ -115,8 +148,12 @@ pub async fn blocking<T: Send + 'static>(
     protection: &SharedProtection,
     operation: impl FnOnce(&mut SlashingProtection) -> Result<T> + Send + 'static,
 ) -> Result<T> {
-    let protection = protection.clone();
+    let SharedProtection { record, unusable } = protection.clone();
     tokio::task::spawn_blocking(move || {
+        // Declared before the guard, so on a panic in `operation` it drops
+        // after the guard has poisoned the lock: nobody is told the record is
+        // unusable before it is.
+        let _signal = SignalIfPanicking(&unusable);
         // A bounded wait rather than `lock()`: a write normally holds the
         // record for milliseconds, so a wait this long means a flush is
         // stuck, and refusing then keeps a stuck disk from piling up one
@@ -124,9 +161,12 @@ pub async fn blocking<T: Send + 'static>(
         // on a refusal.
         let deadline = std::time::Instant::now() + RECORD_WAIT;
         let mut protection = loop {
-            match protection.try_lock() {
+            match record.try_lock() {
                 Ok(guard) => break guard,
-                Err(std::sync::TryLockError::Poisoned(_)) => return Err(poisoned_earlier()),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    unusable.cancel();
+                    return Err(poisoned_earlier());
+                }
                 Err(std::sync::TryLockError::WouldBlock) => {
                     if std::time::Instant::now() >= deadline {
                         return Err(Error::SlashingProtectionUnusable {
@@ -145,56 +185,41 @@ pub async fn blocking<T: Send + 'static>(
     })
     .await
     .map_err(|err| {
-        let reason = match err.try_into_panic() {
+        let reason = if err.is_panic() {
             // This call's own operation panicked, and it held the record when
             // it did: nothing else in the task can panic. Said as this
-            // access's failure, with the panic's message, since "an earlier
-            // access" would send whoever reads it looking for another event.
-            Ok(panic) => format!(
-                "this access panicked while holding the record ({}), so nothing is signed until \
-                 the validator client is restarted",
-                panic_message(panic.as_ref())
-            ),
-            Err(err) => format!("the record could not be consulted: {err}"),
+            // access's failure, since "an earlier access" would send whoever
+            // reads it looking for another event. The panic's message and
+            // location are what the panic hook printed, so they are not
+            // repeated here.
+            "this access panicked while holding the record, so no attestation or block is signed \
+             until the validator client is restarted; the panic is reported just before this"
+                .to_string()
+        } else {
+            format!("the record could not be consulted: {err}")
         };
         Error::SlashingProtectionUnusable { reason }
     })?
 }
 
+/// Raises the record's signal when dropped by a panic unwinding past it.
+struct SignalIfPanicking<'a>(&'a CancellationToken);
+
+impl Drop for SignalIfPanicking<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.cancel();
+        }
+    }
+}
+
 /// What a caller is told when it finds the record's lock already poisoned.
 fn poisoned_earlier() -> Error {
     Error::SlashingProtectionUnusable {
-        reason: "an earlier access panicked while holding the record, so nothing is signed \
-                 until the validator client is restarted"
+        reason: "an earlier access panicked while holding the record, so no attestation or block \
+                 is signed until the validator client is restarted"
             .to_string(),
     }
-}
-
-/// A panic's message, when it carried one: `panic!` with a literal gives a
-/// `&str` and with arguments a `String`. Anything else was raised with
-/// `panic_any` and has no text to show.
-fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
-    panic
-        .downcast_ref::<&'static str>()
-        .copied()
-        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("no message")
-}
-
-/// Refuse to go on with a record whose lock is poisoned.
-///
-/// A poisoned record refuses every duty and never recovers (see
-/// [`blocking`]), so a client left running on one looks alive to whatever
-/// supervises it while signing nothing. The duty loop asks this once a slot
-/// and stops on an `Err`, which ends the process with a failure status:
-/// systemd or Kubernetes then restarts it, and the restart reads the record
-/// back from disk, which every write either replaced whole or left alone.
-/// That is the remedy the refusals ask for.
-pub fn ensure_usable(protection: &SharedProtection) -> Result<()> {
-    if protection.is_poisoned() {
-        return Err(poisoned_earlier());
-    }
-    Ok(())
 }
 
 /// Whether an attestation's source epoch is at or past its target, which is
@@ -568,11 +593,11 @@ impl SlashingProtection {
     /// production caller can reach it.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn in_memory() -> SharedProtection {
-        Arc::new(Mutex::new(Self {
+        SharedProtection::new(Self {
             genesis_validators_root: Root::ZERO,
             records: HashMap::new(),
             storage: None,
-        }))
+        })
     }
 
     /// The record's path, or `None` for the in-memory record of the tests.
@@ -913,11 +938,13 @@ mod tests {
             .expect("the record is written")
     }
 
+    /// What [`SlashingProtection::in_memory`] shares, held directly.
     fn memory() -> SlashingProtection {
-        Arc::into_inner(SlashingProtection::in_memory())
-            .expect("sole owner")
-            .into_inner()
-            .expect("not poisoned")
+        SlashingProtection {
+            genesis_validators_root: Root::ZERO,
+            records: HashMap::new(),
+            storage: None,
+        }
     }
 
     fn open(dir: &Path, keys: &[u8], init: bool) -> Result<SlashingProtection> {
@@ -1584,14 +1611,14 @@ mod tests {
 
     // A poisoned record.
 
-    /// The duty loop's once-a-slot question: a healthy record lets it go on,
-    /// a poisoned one stops the client, and the error is not one to retry.
-    #[test]
-    fn a_poisoned_record_stops_the_client() {
-        let protection = SlashingProtection::in_memory();
-        ensure_usable(&protection).expect("a healthy record is usable");
+    /// How long a test waits for a signal that should have been raised.
+    const RAISED: std::time::Duration = std::time::Duration::from_secs(5);
+    /// How long a test watches for a signal that should not be.
+    const QUIET: std::time::Duration = std::time::Duration::from_millis(20);
 
-        // Poisoned the way a bug would: a panic while the lock is held.
+    /// Poisoned the way a bug would poison it: a panic while the lock is
+    /// held. Around [`blocking`], so nothing has observed it yet.
+    fn poison(protection: &SharedProtection) {
         let held = protection.clone();
         std::thread::spawn(move || {
             let _guard = held.lock().expect("not poisoned yet");
@@ -1599,49 +1626,82 @@ mod tests {
         })
         .join()
         .expect_err("the thread panics");
-
-        let err = ensure_usable(&protection).expect_err("a poisoned record is not");
-        assert!(
-            matches!(err, Error::SlashingProtectionUnusable { .. }),
-            "got {err}"
-        );
-        assert!(!err.is_retryable(), "the loop must stop, not try again");
     }
 
-    /// The access whose own operation panics is told it was its panic, with
-    /// the message, and only the ones after it that an earlier access
-    /// panicked: the same wording for both points the first at an event that
-    /// never happened.
+    /// The access whose own operation panics is told the panic was its own,
+    /// and only the ones after it that an earlier access panicked: the same
+    /// wording for both points the first at an event that never happened. It
+    /// also raises the signal the client stops on, with nothing else having
+    /// to touch the record first.
     #[tokio::test]
-    async fn the_access_that_panics_is_told_so_and_later_ones_that_an_earlier_one_did() {
+    async fn the_access_that_panics_is_told_so_and_raises_the_signal() {
         let protection = SlashingProtection::in_memory();
+        blocking(&protection, |_| Ok(()))
+            .await
+            .expect("a healthy record answers");
+        tokio::time::timeout(QUIET, protection.unusable())
+            .await
+            .expect_err("a healthy record raises nothing");
 
         let own = blocking(&protection, |_| -> Result<()> {
             panic!("a bug in the record")
         })
         .await
-        .expect_err("the operation panicked")
-        .to_string();
-        assert!(own.contains("this access panicked"), "{own}");
-        assert!(own.contains("a bug in the record"), "{own}");
+        .expect_err("the operation panicked");
+        assert!(
+            matches!(own, Error::SlashingProtectionUnusable { .. }),
+            "got {own}"
+        );
+        assert!(!own.is_retryable(), "nothing to try again");
+        assert!(own.to_string().contains("this access panicked"), "{own}");
+        tokio::time::timeout(RAISED, protection.unusable())
+            .await
+            .expect("the panicking access raises the signal");
 
         let later = blocking(&protection, |_| Ok(()))
             .await
             .expect_err("the record is poisoned")
             .to_string();
         assert!(later.contains("an earlier access panicked"), "{later}");
-        ensure_usable(&protection).expect_err("and the duty loop stops on it");
     }
 
-    /// A panic raised with arguments carries a `String`, not a `&str`, and
-    /// one raised with `panic_any` carries neither.
-    #[test]
-    fn a_panics_message_is_read_whatever_it_was_raised_with() {
-        let literal: Box<dyn std::any::Any + Send> = Box::new("a literal");
-        assert_eq!(panic_message(literal.as_ref()), "a literal");
-        let formatted: Box<dyn std::any::Any + Send> = Box::new(format!("slot {}", 7));
-        assert_eq!(panic_message(formatted.as_ref()), "slot 7");
-        let neither: Box<dyn std::any::Any + Send> = Box::new(7_u64);
-        assert_eq!(panic_message(neither.as_ref()), "no message");
+    /// A lock poisoned without anyone seeing it raises nothing until an
+    /// access finds it so, and that access raises the signal.
+    #[tokio::test]
+    async fn the_access_that_finds_the_record_poisoned_raises_the_signal() {
+        let protection = SlashingProtection::in_memory();
+        poison(&protection);
+        tokio::time::timeout(QUIET, protection.unusable())
+            .await
+            .expect_err("nothing has looked at the record yet");
+
+        blocking(&protection, |_| Ok(()))
+            .await
+            .expect_err("the record is poisoned");
+        tokio::time::timeout(RAISED, protection.unusable())
+            .await
+            .expect("the access that found it raises the signal");
+    }
+
+    /// The signal comes from the blocking task, not from the caller awaiting
+    /// it: a duty abandoned at its deadline drops the caller and leaves the
+    /// task running, and a panic after that must still stop the client.
+    #[tokio::test]
+    async fn the_signal_is_raised_even_when_the_caller_is_gone() {
+        let protection = SlashingProtection::in_memory();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let call = blocking(&protection, move |_| -> Result<()> {
+            held.recv().expect("released");
+            panic!("a bug after the caller left")
+        });
+        // Polled, so the task is running, then dropped at the timeout.
+        tokio::time::timeout(QUIET, call)
+            .await
+            .expect_err("the operation is still held");
+
+        release.send(()).expect("the task is still running");
+        tokio::time::timeout(RAISED, protection.unusable())
+            .await
+            .expect("the task itself raises the signal");
     }
 }
