@@ -63,10 +63,12 @@ pub enum Error {
     #[error("beacon node is syncing")]
     BeaconNodeSyncing,
     /// A signed blinded block was sent and the node's answer does not say
-    /// whether it went out: a 5xx, or no answer at all.
+    /// whether it went out: a 5xx other than 503, or no answer once connected.
     ///
-    /// Distinct from [`Self::BeaconNodeStatus`], which for this call means a
-    /// definite refusal (a 4xx: the block was not published). Here the node
+    /// Distinct from [`Self::BeaconNodeStatus`] and [`Self::BeaconNode`],
+    /// which for this call mean a definite failure (a 4xx or a 503, or a
+    /// connection never established: the block was not published; see
+    /// `BeaconNodeApi::publish_blinded_block`). Here the node
     /// may have handed the block to its builder before failing, and the relay
     /// publishes on receipt, so the block may well be on the network. Nothing
     /// can safely be retried: the slot is signed, and a second block for it

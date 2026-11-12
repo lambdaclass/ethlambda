@@ -61,6 +61,22 @@ use crate::error::{BeaconNodeFailure, Error, Result};
 /// a stalled request could then outlive the slot it was serving.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// How long establishing a connection (TCP, and TLS for `https`) may take,
+/// within [`REQUEST_TIMEOUT`].
+///
+/// Its own bound so that a node that cannot be reached fails as a connect
+/// error, which says the request never left, rather than as the total
+/// timeout, which cannot say whether it did. That difference decides how a
+/// blinded publish is reported: a block that never reached the node is a
+/// missed proposal, while one the node may have handed to its relay is
+/// unconfirmed (see [`BeaconNodeApi::publish_blinded_block`]). Without it, an
+/// unreachable producing node counted a slot that was certainly missed as one
+/// the relay might still publish.
+///
+/// Three seconds is far beyond a healthy handshake, local or across a
+/// continent, and leaves most of the request budget to the answer.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// How long `register_validator` may take. Longer than [`REQUEST_TIMEOUT`]
 /// because an ethlambda node forwards the registrations to its relay and waits
 /// up to 10 s for the answer before replying; a client that gave up at 8 s
@@ -88,35 +104,20 @@ async fn read_error_body(mut response: reqwest::Response) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-/// A body as an error shows it: control characters written out (`\n`, `\r`,
-/// `\u{1b}`, ...), so the log line it lands in stays one line and carries no
-/// terminal escapes, and cut to [`ERROR_TEXT_LIMIT`] bytes.
-fn error_text(body: String) -> String {
-    let mut text = String::with_capacity(body.len());
-    for c in body.chars() {
-        // Every control character, and the two Unicode line separators, is
-        // written out, so neither a line break nor a terminal escape sequence
-        // reaches the log as itself.
-        if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
-            text.extend(c.escape_default());
-        } else {
-            text.push(c);
-        }
-    }
-    if text.len() > ERROR_TEXT_LIMIT {
-        let mut end = ERROR_TEXT_LIMIT;
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        text.truncate(end);
-        text.push_str("...");
-    }
-    text
+/// Text a node sent, as an error or a log line shows it: control characters
+/// and line separators written out (`\n`, `\u{1b}`, ...), so the line it lands
+/// in stays one line and carries no terminal escapes, and cut to
+/// [`ERROR_TEXT_LIMIT`] bytes without splitting a character or an escape.
+///
+/// The same function the beacon node's builder client writes a relay's text
+/// through, [`ethlambda_types::text::one_line`].
+fn error_text(text: &str) -> String {
+    ethlambda_types::text::one_line(text, ERROR_TEXT_LIMIT)
 }
 
 /// [`read_error_body`] as [`error_text`] shows it.
 async fn error_body(response: reqwest::Response) -> String {
-    error_text(read_error_body(response).await)
+    error_text(&read_error_body(response).await)
 }
 
 /// What an SSZ answer carries besides its bytes: the fork, which only a header
@@ -146,9 +147,19 @@ impl HttpBeaconNode {
     /// Builds a client for the node at `base_url`, stripping any trailing
     /// slash so callers may pass either form.
     pub fn new(base_url: impl Into<String>) -> Result<Self> {
+        Self::with_connect_timeout(base_url, CONNECT_TIMEOUT)
+    }
+
+    /// [`Self::new`] with `connect_timeout` in place of [`CONNECT_TIMEOUT`],
+    /// so a test can see a connect timeout without waiting three seconds.
+    fn with_connect_timeout(
+        base_url: impl Into<String>,
+        connect_timeout: Duration,
+    ) -> Result<Self> {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         let client = Client::builder()
             .timeout(REQUEST_TIMEOUT)
+            .connect_timeout(connect_timeout)
             .build()
             .map_err(|err| Error::BeaconNode {
                 url: base_url.clone(),
@@ -533,9 +544,11 @@ impl HttpBeaconNode {
             let failed = error.failures.len();
             if failed > 0 && failed < submitted {
                 for failure in &error.failures {
+                    // The node's text, so written out and capped like a whole
+                    // error body: one line per failure, whatever it sent.
                     warn!(
                         submission_index = failure.index,
-                        reason = %failure.message,
+                        reason = %error_text(&failure.message),
                         "One attestation in this slot's batch was rejected"
                     );
                 }
@@ -545,7 +558,7 @@ impl HttpBeaconNode {
 
         Err(Error::BeaconNodeStatus {
             status: status.as_u16(),
-            body: error_text(body),
+            body: error_text(&body),
         })
     }
 
@@ -788,14 +801,13 @@ impl BeaconNodeApi for HttpBeaconNode {
 
     /// Maps the answer as the trait's contract says: 2xx is handed to the
     /// builder (202 is the node's broadcast-without-import, as for a full
-    /// block), and a 4xx is a definite refusal.
+    /// block); a 4xx, a 503 and a connection that was never established are
+    /// definite; every other 5xx, and any failure once connected, is
+    /// [`Error::BlindedUnconfirmed`].
     ///
-    /// Two cases that look like failures are also definite, because the node
-    /// cannot have acted on the block: a connection error (the request never
-    /// left) and a 503 (the node is syncing, and refuses before it hands
-    /// anything to a builder). Every other 5xx, and any failure after the
-    /// request was sent (a timeout, a reset), is [`Error::BlindedUnconfirmed`],
-    /// since the relay may still publish.
+    /// A connect error covers a connection refused and one that timed out
+    /// ([`CONNECT_TIMEOUT`]); reqwest reports the latter as both a connect
+    /// error and a timeout, and the connect check comes first.
     ///
     /// The status alone cannot always tell, and two edges are knowingly read
     /// the wrong way. Some of ethlambda's own 500s are definite (no builder
@@ -1546,20 +1558,27 @@ mod tests {
         assert_eq!(status, 400);
         assert!(body.starts_with("first line\\nsecond line\\r\\nfirst line"));
         assert!(!body.contains('\n') && !body.contains('\r'));
-        assert_eq!(body.len(), ERROR_TEXT_LIMIT + "...".len());
+        assert!(body.len() <= ERROR_TEXT_LIMIT, "{} bytes", body.len());
+        assert!(
+            body.len() > ERROR_TEXT_LIMIT - "\\r".len(),
+            "filled to the cap"
+        );
     }
 
+    /// The cap applies to the written-out text and never splits a character
+    /// or an escape: a body of escapes ends on a whole one.
     #[test]
-    fn error_text_cuts_on_a_character_boundary() {
-        let text = error_text("é".repeat(ERROR_TEXT_LIMIT));
-        assert!(text.ends_with("..."));
-        assert!(text.len() <= ERROR_TEXT_LIMIT + "...".len());
-        assert_eq!(error_text("short".to_string()), "short");
+    fn error_text_cuts_on_a_character_or_escape_boundary() {
+        let text = error_text(&"é".repeat(ERROR_TEXT_LIMIT));
+        assert_eq!(text, "é".repeat(ERROR_TEXT_LIMIT / 2));
+        let text = error_text(&"\u{1b}".repeat(ERROR_TEXT_LIMIT));
+        assert_eq!(text, "\\u{1b}".repeat(ERROR_TEXT_LIMIT / "\\u{1b}".len()));
+        assert_eq!(error_text("short"), "short");
     }
 
     #[test]
     fn error_text_writes_out_every_control_character() {
-        let text = error_text("a\u{1b}[31mb\tc\u{2028}d".to_string());
+        let text = error_text("a\u{1b}[31mb\tc\u{2028}d");
         assert_eq!(text, "a\\u{1b}[31mb\\tc\\u{2028}d");
     }
 
@@ -1623,6 +1642,51 @@ mod tests {
             .await
             .expect_err("no answer");
         assert!(matches!(err, Error::BeaconNode { .. }), "got {err:?}");
+    }
+
+    /// A connection that never completes is a connect error too, not the
+    /// total timeout, so it is definite: nothing was sent. The listener
+    /// accepts TCP but never answers the TLS handshake, which is part of
+    /// connecting, so the connect timeout fires on every platform and with no
+    /// unroutable address involved.
+    #[tokio::test]
+    async fn a_blinded_publish_whose_connection_times_out_is_a_definite_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds");
+        let address = listener.local_addr().expect("address");
+        let held = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let connect_timeout = Duration::from_millis(200);
+        let node =
+            HttpBeaconNode::with_connect_timeout(format!("https://{address}"), connect_timeout)
+                .expect("builds");
+
+        let started = std::time::Instant::now();
+        let err = node
+            .publish_blinded_block(5, Root::ZERO, ForkName::Fulu, &[1])
+            .await
+            .expect_err("never connects");
+        held.abort();
+
+        assert!(
+            matches!(
+                err,
+                Error::BeaconNode {
+                    failure: BeaconNodeFailure::Timeout,
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+        assert!(
+            started.elapsed() < REQUEST_TIMEOUT,
+            "the connect timeout, not the request's, ended it"
+        );
     }
 
     /// A syncing node refuses before it hands anything to a builder.

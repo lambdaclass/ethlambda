@@ -483,12 +483,14 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
     ///
     /// # Why an unconfirmed publish is not an error
     ///
-    /// A 5xx or a missing answer does not say the block was not published: the
-    /// node may have handed it to the relay, which publishes regardless of what
-    /// the node then replied. So that outcome is logged loudly and counted on
-    /// its own series, and returned as [`Published::BuilderUnconfirmed`]. It is
-    /// not retried: the slot is signed, and a second block for it would be an
-    /// equivocation. A 4xx is a definite refusal and propagates as a failed
+    /// A 5xx or a missing answer once connected does not say the block was not
+    /// published: the node may have handed it to the relay, which publishes
+    /// regardless of what the node then replied. So that outcome is logged
+    /// loudly and counted on its own series, and returned as
+    /// [`Published::BuilderUnconfirmed`]. It is not retried: the slot is
+    /// signed, and a second block for it would be an equivocation. A definite
+    /// failure (a 4xx, a 503, a connection never made; see
+    /// [`BeaconNodeApi::publish_blinded_block`]) propagates as a failed
     /// proposal.
     async fn publish_blinded(
         &self,
@@ -1078,35 +1080,45 @@ mod tests {
     /// The duty loop drops the proposal at its budget while the node is still
     /// waiting on the relay. The publish runs on its own task, so the block is
     /// still sent, and the slot is known to be signed.
+    ///
+    /// The proposal is dropped once the publish has reached the node, which
+    /// holds it until the test lets it answer, rather than after a fixed
+    /// delay: the slashing-protection write and the signatures come first, and
+    /// on a loaded machine they can take longer than any delay picked here.
     #[tokio::test]
     async fn a_blinded_publish_survives_a_dropped_proposal() {
         let (store, pubkey) = store();
+        let relay_answers = Arc::new(tokio::sync::Semaphore::new(0));
         let node = Arc::new(
             MockBeaconNode::new()
                 .with_block(slot(), 7)
                 .with_blinded_block()
-                .with_blinded_publish_delay(std::time::Duration::from_millis(300)),
+                .with_blinded_publish_gate(relay_answers.clone()),
         );
         let service = builder_service(node.clone(), None);
 
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            service.propose(slot(), &duty(&pubkey, 7, slot()), &store),
-        )
-        .await;
-        assert!(
-            outcome.is_err(),
-            "the proposal must be dropped at the budget"
-        );
+        let at_the_node = node.blinded_publish_entered.clone();
+        let this_duty = duty(&pubkey, 7, slot());
+        tokio::select! {
+            outcome = service.propose(slot(), &this_duty, &store) => {
+                panic!("the node is still waiting on the relay, yet the proposal ended: {outcome:?}")
+            }
+            () = at_the_node.notified() => {}
+        }
+        // The proposal future is dropped here, as the budget drops it.
         assert!(service.signed_blinded_at(slot()));
         assert!(node.published_blinded.lock().expect("lock").is_empty());
 
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-        assert_eq!(
-            node.published_blinded.lock().expect("lock").len(),
-            1,
-            "the publish must complete although the proposal future is gone"
-        );
+        relay_answers.add_permits(1);
+        let published = async {
+            while node.published_blinded.lock().expect("lock").is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), published)
+            .await
+            .expect("the publish must complete although the proposal future is gone");
+        assert_eq!(node.published_blinded.lock().expect("lock").len(), 1);
 
         // Slashing protection recorded the slot before the publish started, so a retry
         // after the dropped future is refused without asking for a block.

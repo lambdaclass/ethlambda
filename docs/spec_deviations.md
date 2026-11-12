@@ -775,10 +775,13 @@ signature, whichever way the node answered. Three departures:
   that node's builder holds the payload and only that node claimed the slot, so
   offering the signed block to another node would hand it to a builder that
   never saw the bid. If the producing node fails, the publish fails, and
-  slashing protection has already recorded the slot, so nothing retries. A 5xx or no
-  answer is reported as unconfirmed (logged at error, counted on
-  `blinded_blocks_unconfirmed_total`) and not as a missed proposal, since the
-  relay may still publish the block. The producing node is recorded with the
+  slashing protection has already recorded the slot, so nothing retries. A 5xx
+  other than 503, or no answer once connected, is reported as unconfirmed
+  (logged at error, counted on `blinded_blocks_unconfirmed_total`) and not as a
+  missed proposal, since the relay may still publish the block. A 4xx, a 503 or
+  a connection never made (refused, or past the client's 3 s connect timeout)
+  is a missed proposal: the node cannot have handed the block on. The
+  producing node is recorded with the
   block's slot and root, and a publish for any other block is refused, as
   Teku does; Lighthouse, Lodestar and Nimbus fail over or broadcast instead.
   Two status codes are read the wrong way: some of ethlambda's own 500s are

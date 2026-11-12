@@ -20,7 +20,7 @@ use crate::beacon_node::dto::{
     AttesterDutyDto, CommitteeSubscriptionDto, ProposerDutyDto, ProposerPreparationDto, PtcDutyDto,
     SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto,
 };
-use crate::error::Result;
+use crate::error::{BeaconNodeFailure, Error, Result};
 use ethlambda_types::beacon::containers::altair;
 use ethlambda_types::beacon::containers::electra;
 use ethlambda_types::beacon::containers::gloas;
@@ -32,6 +32,11 @@ pub mod http;
 
 #[cfg(test)]
 pub mod mock;
+
+/// Builder registrations per request. Lighthouse's batch size: large enough
+/// that a few thousand validators take a handful of requests, small enough
+/// that one request stays well under a node's body limit.
+pub const REGISTRATION_BATCH: usize = 500;
 
 /// Check that `data` is an answer about `slot`, as the contract on
 /// [`BeaconNodeApi::attestation_data`] requires.
@@ -167,9 +172,10 @@ pub enum Published {
     /// its builder, which publishes the block and reveals the payload. Nothing
     /// says the node imported it.
     HandedToBuilder,
-    /// The node failed to confirm the blinded block (5xx or no answer). The
-    /// relay may still have published it; see `Error::BlindedUnconfirmed`.
-    /// Produced only by `ProposalService`, never by an implementation.
+    /// The node failed to confirm the blinded block (a 5xx other than 503, or
+    /// no answer once connected). The relay may still have published it; see
+    /// `Error::BlindedUnconfirmed`. Produced only by `ProposalService`, never
+    /// by an implementation.
     BuilderUnconfirmed,
 }
 
@@ -411,10 +417,18 @@ pub trait BeaconNodeApi: Send + Sync {
     ///
     /// # Contract: which error means what
     ///
-    /// A definite refusal (4xx) is an `Err` other than
-    /// `Error::BlindedUnconfirmed`: the block was not published. A 5xx or a
-    /// transport failure is `Error::BlindedUnconfirmed`, because the relay may
-    /// still publish the block.
+    /// The line is whether the node can have handed the block to its builder.
+    ///
+    /// - **Definite**, an `Err` other than `Error::BlindedUnconfirmed`: the
+    ///   block was not published. A 4xx; a 503, which a syncing node answers
+    ///   before it hands anything to a builder; and a connection that was never
+    ///   established, refused or timed out, since the request never left.
+    /// - **Unconfirmed**, `Error::BlindedUnconfirmed`: every other 5xx, and any
+    ///   failure once the connection was up (no answer in time, a reset). The
+    ///   relay may still publish the block.
+    ///
+    /// The status cannot always tell, and the HTTP implementation documents the
+    /// two edges it knowingly reads the wrong way.
     async fn publish_blinded_block(
         &self,
         slot: Slot,
@@ -423,13 +437,61 @@ pub trait BeaconNodeApi: Send + Sync {
         body: &[u8],
     ) -> Result<Published>;
 
-    /// Send signed builder registrations to the node, which forwards them to its
-    /// builder. JSON, since a node may forward the body unchanged to MEV-Boost.
-    /// State installed on the node's builder, so failover sends it to every node.
+    /// Send signed builder registrations to the node in one request, which it
+    /// forwards to its builder. JSON, since a node may forward the body
+    /// unchanged to MEV-Boost. State installed on the node's builder, so
+    /// failover sends it to every node.
     async fn register_validators(
         &self,
         registrations: &[SignedValidatorRegistrationV1],
     ) -> Result<()>;
+
+    /// Send `registrations` in requests of at most [`REGISTRATION_BATCH`], one
+    /// after another, and say what became of each batch: one outcome per
+    /// batch, in order, `Ok` when the node accepted it.
+    ///
+    /// Batched here, below the fallback's fan-out, so that each node works
+    /// through its own sequence of batches beside the others: a hung node
+    /// holds back only its own. Batched above it, every batch would wait for
+    /// every node before the next one started.
+    ///
+    /// Once the node cannot be reached ([`Error::BeaconNode`]) the batches left
+    /// are not sent, and fail with that error: each would cost another
+    /// timeout, and the send waiting on them holds back the next keymanager
+    /// change (see `crate::registration`). A node that answered with an error
+    /// status is up, so it is still given the rest.
+    ///
+    /// [`Error::BeaconNode`]: crate::error::Error::BeaconNode
+    async fn register_validators_in_batches(
+        &self,
+        registrations: &[SignedValidatorRegistrationV1],
+    ) -> Vec<Result<()>> {
+        let mut outcomes = Vec::new();
+        let mut unreachable: Option<(String, BeaconNodeFailure, String)> = None;
+        for batch in registrations.chunks(REGISTRATION_BATCH) {
+            if let Some((url, failure, detail)) = &unreachable {
+                outcomes.push(Err(Error::BeaconNode {
+                    url: url.clone(),
+                    failure: *failure,
+                    detail: format!(
+                        "not sent, an earlier batch could not reach the node: {detail}"
+                    ),
+                }));
+                continue;
+            }
+            let outcome = self.register_validators(batch).await;
+            if let Err(Error::BeaconNode {
+                url,
+                failure,
+                detail,
+            }) = &outcome
+            {
+                unreachable = Some((url.clone(), *failure, detail.clone()));
+            }
+            outcomes.push(outcome);
+        }
+        outcomes
+    }
 
     /// The envelope the node cached for the self-built payload of the block
     /// whose root is `block_root`, proposed at `slot`.

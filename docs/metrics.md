@@ -751,7 +751,7 @@ and absent is not the same as zero.
 | `ethlambda_validator_builder_registrations_sent_total` | Counter | Builder registrations a beacon node accepted (`--builder-proposals`) |
 | `ethlambda_validator_builder_registration_failures_total` | Counter | Registration batches no beacon node accepted. A missed registration costs at most a builder block, never a duty |
 | `ethlambda_validator_blinded_blocks_proposed_total` | Counter | Blinded blocks a beacon node handed to its builder. A subset of `blocks_proposed_total` |
-| `ethlambda_validator_blinded_blocks_unconfirmed_total` | Counter | Blinded blocks the beacon node did not confirm (a 5xx or no answer), which the relay may still have published. Not retried, since a second block for the slot would be an equivocation |
+| `ethlambda_validator_blinded_blocks_unconfirmed_total` | Counter | Blinded blocks the beacon node did not confirm (a 5xx other than 503, or no answer once connected), which the relay may still have published. Not retried, since a second block for the slot would be an equivocation |
 | `ethlambda_validator_block_publication_delay_seconds` | Histogram | Slot start to block accepted. Its buckets are tighter than the attestation histogram's, because a block is due at the slot boundary rather than a third of the way in |
 | `ethlambda_validator_beacon_node_available` | Gauge | 1 when a beacon node answered the last duty refresh or attestation |
 | `ethlambda_validator_signing_duration_seconds` | Histogram | Time to sign one slot's batch, store read lock included |

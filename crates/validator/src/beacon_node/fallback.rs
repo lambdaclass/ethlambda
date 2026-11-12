@@ -368,6 +368,68 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
         .await
     }
 
+    /// Every node works through its own batches at once, so a node that hangs
+    /// holds back only its own sequence: the healthy ones have every batch
+    /// while it is still timing out on its first. A batch counts as sent when
+    /// any node accepted it, as [`Self::register_validators`] does for one.
+    ///
+    /// Each node that refused anything is logged once, with how many batches,
+    /// rather than once per batch.
+    async fn register_validators_in_batches(
+        &self,
+        registrations: &[SignedValidatorRegistrationV1],
+    ) -> Vec<Result<()>> {
+        let per_node = futures_util::future::join_all(
+            self.nodes
+                .iter()
+                .map(|node| node.register_validators_in_batches(registrations)),
+        )
+        .await;
+
+        let batches = registrations.len().div_ceil(super::REGISTRATION_BATCH);
+        let mut accepted = vec![false; batches];
+        let mut last = vec![None; batches];
+        for (position, outcomes) in per_node.into_iter().enumerate() {
+            let mut refused = 0;
+            let mut first_refusal = None;
+            for (batch, outcome) in outcomes.into_iter().enumerate() {
+                match outcome {
+                    Ok(()) => accepted[batch] = true,
+                    Err(err) => {
+                        refused += 1;
+                        let detail = err.to_string();
+                        first_refusal.get_or_insert_with(|| detail.clone());
+                        last[batch] = Some(detail);
+                    }
+                }
+            }
+            if let Some(err) = first_refusal {
+                warn!(
+                    what = "register_validators",
+                    position,
+                    refused,
+                    batches,
+                    %err,
+                    node_effect = "it will not hold these registrations",
+                    "Beacon node did not accept"
+                );
+            }
+        }
+        accepted
+            .into_iter()
+            .zip(last)
+            .map(|(accepted, last)| {
+                if accepted {
+                    Ok(())
+                } else {
+                    Err(Error::AllBeaconNodesFailed(
+                        last.unwrap_or_else(|| "no nodes configured".to_string()),
+                    ))
+                }
+            })
+            .collect()
+    }
+
     /// Fails over like any query: the envelope the node cached is only on the
     /// node that produced the block, and one that did not answers 404.
     async fn execution_payload_envelope(
@@ -557,8 +619,10 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::beacon_node::REGISTRATION_BATCH;
     use crate::beacon_node::mock::MockBeaconNode;
     use ethlambda_types::beacon::primitives::Root;
+    use std::sync::Arc;
 
     fn healthy() -> MockBeaconNode {
         let mut node = MockBeaconNode::new();
@@ -1158,24 +1222,134 @@ mod tests {
         );
     }
 
-    /// Every node is called at once: two slow nodes cost one delay, not the
-    /// sum, so a hung node does not hold back the ones behind it.
+    /// Every node is called at once: the second is called while the first
+    /// has not answered yet, so a hung node does not hold back the ones behind
+    /// it. Called in turn, the second would wait for a permit that is only
+    /// given once both have been called.
     #[tokio::test]
     async fn every_node_is_called_at_once() {
-        let delay = std::time::Duration::from_millis(300);
-        let slow = || MockBeaconNode::new().with_registration_delay(delay);
-        let fallback = FallbackBeaconNode::new(vec![slow(), slow()]);
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let held = || MockBeaconNode::new().with_registration_gate(gate.clone());
+        let fallback = Arc::new(FallbackBeaconNode::new(vec![held(), held()]));
 
-        let started = std::time::Instant::now();
-        fallback
-            .register_validators(&[])
-            .await
-            .expect("both accept");
-        let elapsed = started.elapsed();
+        let call = tokio::spawn({
+            let fallback = fallback.clone();
+            async move { fallback.register_validators(&[]).await }
+        });
+        for node in &fallback.nodes {
+            node.wait_for_registration_calls(1).await;
+        }
+        gate.add_permits(2);
+        call.await.expect("the call ends").expect("both accept");
 
-        assert!(elapsed < delay * 2, "took {elapsed:?}");
         for node in &fallback.nodes {
             assert_eq!(*node.registration_batches.lock().expect("lock"), vec![0]);
         }
+    }
+
+    /// `count` registrations with distinct keys. Unsigned: no mock checks.
+    fn registrations(
+        count: usize,
+    ) -> Vec<ethlambda_types::beacon::builder::SignedValidatorRegistrationV1> {
+        use ethlambda_types::beacon::builder::{
+            SignedValidatorRegistrationV1, ValidatorRegistrationV1,
+        };
+        use ethlambda_types::beacon::primitives::{BlsPubkey, BlsSignature, H160};
+
+        (0..count)
+            .map(|index| {
+                let mut pubkey = [0u8; 48];
+                pubkey[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                SignedValidatorRegistrationV1 {
+                    message: ValidatorRegistrationV1 {
+                        fee_recipient: H160([1; 20]),
+                        gas_limit: 30_000_000,
+                        timestamp: 5,
+                        pubkey: BlsPubkey(pubkey),
+                    },
+                    signature: BlsSignature([3; 96]),
+                }
+            })
+            .collect()
+    }
+
+    /// Each node works through the batches on its own: while one node holds
+    /// its first batch, the other has been sent all of them. In step, the
+    /// healthy node would have its second batch only once the hung one
+    /// answered its first.
+    #[tokio::test]
+    async fn a_hung_node_holds_back_only_its_own_batches() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let hung = MockBeaconNode::new().with_registration_gate(gate.clone());
+        let fallback = Arc::new(FallbackBeaconNode::new(vec![hung, MockBeaconNode::new()]));
+        let sent = registrations(2 * REGISTRATION_BATCH + 1);
+
+        let send = tokio::spawn({
+            let (fallback, sent) = (fallback.clone(), sent.clone());
+            async move { fallback.register_validators_in_batches(&sent).await }
+        });
+        let healthy_has_every_batch = async {
+            while fallback.nodes[1]
+                .registration_batches
+                .lock()
+                .expect("lock")
+                .len()
+                < 3
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), healthy_has_every_batch)
+            .await
+            .expect("the healthy node is not held back by the hung one");
+        assert_eq!(
+            fallback.nodes[0]
+                .registration_attempts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the hung node is still on its first batch"
+        );
+
+        gate.add_permits(3);
+        let outcomes = send.await.expect("the send ends");
+        assert_eq!(outcomes.len(), 3);
+        assert!(outcomes.iter().all(Result::is_ok));
+        assert_eq!(
+            *fallback.nodes[0].registration_batches.lock().expect("lock"),
+            vec![REGISTRATION_BATCH, REGISTRATION_BATCH, 1]
+        );
+    }
+
+    /// A node that cannot be reached is sent no more batches: each would cost
+    /// another timeout. A batch counts as sent when any node took it, and as
+    /// failed when none did.
+    #[tokio::test]
+    async fn an_unreachable_node_is_sent_no_more_batches() {
+        let sent = registrations(REGISTRATION_BATCH + 1);
+
+        let fallback =
+            FallbackBeaconNode::new(vec![MockBeaconNode::failing("down"), MockBeaconNode::new()]);
+        let outcomes = fallback.register_validators_in_batches(&sent).await;
+        assert!(outcomes.iter().all(Result::is_ok), "node 1 took both");
+        let attempts = |position: usize| {
+            fallback.nodes[position]
+                .registration_attempts
+                .load(std::sync::atomic::Ordering::SeqCst)
+        };
+        assert_eq!(attempts(0), 1, "stopped after its first batch");
+        assert_eq!(attempts(1), 2);
+
+        let fallback = FallbackBeaconNode::new(vec![
+            MockBeaconNode::failing("down"),
+            MockBeaconNode::failing("also down"),
+        ]);
+        let outcomes = fallback.register_validators_in_batches(&sent).await;
+        assert_eq!(outcomes.len(), 2);
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| matches!(outcome, Err(Error::AllBeaconNodesFailed(_)))),
+            "got {outcomes:?}"
+        );
     }
 }

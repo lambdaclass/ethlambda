@@ -42,22 +42,44 @@
 //! refusal says more about the node or the relay than about one entry, and no
 //! other client splits either.
 //!
-//! # One send of each kind at a time
+//! # Each node works through the batches on its own
 //!
-//! Both sends are spawned off the slot loop, so nothing else would stop a new
-//! one starting while the last still waits on a slow node: a full send every
-//! epoch, each holding the whole registration set and sending it again to the
-//! healthy nodes. A send that finds the previous one of its kind still going
-//! is skipped (see [`crate::in_flight`]). A skipped full send waits for the
-//! next epoch, and a skipped per-slot one for the next slot, since it has not
-//! marked its change as sent.
+//! The full set goes out in batches of [`REGISTRATION_BATCH`], and each node
+//! is sent its batches in turn beside the other nodes rather than in step with
+//! them (see [`BeaconNodeApi::register_validators_in_batches`]). A node that
+//! hangs costs only its own batches, and only one timeout: what it has not
+//! been sent by then is dropped until the next epoch.
+//!
+//! # One send at a time, and the newest registration last
+//!
+//! An ethlambda beacon node keeps the fee recipient of every registration it
+//! is sent, newest timestamp or not, so the order sends reach a node in is the
+//! order its fee recipients end up in. Every send therefore takes one lock,
+//! [`RegistrationService::sending`], before it reads the cache and holds it
+//! until the last batch is answered. A per-slot send can then never be
+//! overtaken by an older registration from a full send that read the cache
+//! before the change, and no batch of either is still in flight when the next
+//! begins. The one window left is a request this client gave up on at its
+//! timeout that the node still processes afterwards; the next epoch's full
+//! send, which carries the newest registration, closes it.
+//!
+//! A per-slot send that finds the lock taken skips: it has not marked its
+//! change as sent, so a later slot picks it up. While a full send runs, that
+//! is the first slot after it ends, which against a node that is slow to
+//! answer each batch can be several slots on. A full send waits for it
+//! instead, since a per-slot send is short and skipping would cost an epoch.
+//! A full send that finds the previous full send still running, or waiting,
+//! skips to the next epoch (see [`crate::in_flight`]), so a hung node cannot
+//! queue up one waiting send per epoch.
 //!
 //! # Signing stays off the async runtime
 //!
 //! The first epoch signs one BLS signature per validator. That runs on the
 //! blocking pool in chunks of [`SIGN_CHUNK`], taking the store's read lock
 //! afresh for each chunk, so neither the runtime's threads nor a queued
-//! keymanager writer wait on thousands of signatures.
+//! keymanager writer wait on thousands of signatures. The cache's own lock is
+//! only ever taken under [`RegistrationService::sending`], so nothing on the
+//! runtime waits on a chunk that holds it.
 //!
 //! # The per-slot check is one atomic read
 //!
@@ -74,20 +96,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ethlambda_types::beacon::builder::{SignedValidatorRegistrationV1, ValidatorRegistrationV1};
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, warn};
 
-use crate::beacon_node::BeaconNodeApi;
 use crate::beacon_node::dto::encode_hex;
+use crate::beacon_node::{BeaconNodeApi, REGISTRATION_BATCH};
 use crate::in_flight::InFlight;
 use crate::keys::ValidatorStore;
 use crate::proposer_settings::ProposerSettings;
 use crate::signing::SigningContext;
-
-/// Registrations per request. Lighthouse's batch size: large enough that a few
-/// thousand validators take a handful of requests, small enough that one
-/// request stays well under a node's body limit.
-pub const REGISTRATION_BATCH: usize = 500;
 
 /// Keys signed per blocking task, and so per hold of the store's read lock.
 const SIGN_CHUNK: usize = 64;
@@ -138,16 +155,21 @@ pub struct RegistrationService<B> {
     context: Arc<SigningContext>,
     settings: Arc<ProposerSettings>,
     /// The validators the beacon node resolved at the last epoch refresh.
+    /// Taken under [`Self::sending`] only.
     known: std::sync::Mutex<Vec<BlsPubkey>>,
-    /// The latest signed registration per validator.
+    /// The latest signed registration per validator. Taken under
+    /// [`Self::sending`] only, so it is never contended: a `std` mutex is
+    /// enough, and a signing chunk holding it keeps no one else waiting.
     signed: std::sync::Mutex<HashMap<BlsPubkey, SignedValidatorRegistrationV1>>,
     /// The [`ProposerSettings::generation`] the cache was last brought up to
     /// date against.
     signed_generation: AtomicU64,
-    /// The epoch's full send, while it runs.
+    /// Held by a send from before it reads the cache until its last batch is
+    /// answered, so sends reach every node in the order they read the cache.
+    /// See the module doc.
+    sending: Mutex<()>,
+    /// The epoch's full send, while it runs or waits for [`Self::sending`].
     full_send: InFlight,
-    /// The per-slot send of changed keys, while it runs.
-    changed_send: InFlight,
 }
 
 impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
@@ -163,8 +185,8 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
             known: std::sync::Mutex::new(Vec::new()),
             signed: std::sync::Mutex::new(HashMap::new()),
             signed_generation: AtomicU64::new(0),
+            sending: Mutex::new(()),
             full_send: InFlight::default(),
-            changed_send: InFlight::default(),
         }
     }
 
@@ -284,6 +306,9 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
             );
             return;
         };
+        // Waits out a per-slot send rather than skipping: that one is short,
+        // and the full set is sent once an epoch.
+        let _sending = self.sending.lock().await;
         // Read before signing, so a change that lands while this runs is seen
         // by the next `register_changed` rather than lost.
         let generation = self.settings.generation();
@@ -305,7 +330,7 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
                 "Validators without a fee recipient are not registered with the builder"
             );
         }
-        self.send(current.all, REGISTRATION_BATCH).await;
+        self.send(&current.all).await;
     }
 
     /// Send only the registrations whose fee recipient or gas limit changed
@@ -326,10 +351,16 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
         if self.is_gloas(epoch) {
             return;
         }
-        // Silently: the change stays unsent, so the next slot picks it up.
-        let Some(_running) = self.changed_send.enter() else {
+        if self.settings.generation() == self.signed_generation.load(Ordering::Acquire) {
+            return;
+        }
+        // Silently: another send is running, and the change stays unsent, so
+        // the next slot picks it up.
+        let Ok(_sending) = self.sending.try_lock() else {
             return;
         };
+        // Again, under the lock: a full send that just ended may have signed
+        // this change already.
         let generation = self.settings.generation();
         if generation == self.signed_generation.load(Ordering::Acquire) {
             return;
@@ -347,25 +378,28 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
         if current.changed.is_empty() {
             return;
         }
-        self.send(current.changed, REGISTRATION_BATCH).await;
+        self.send(&current.changed).await;
     }
 
-    /// Send `registrations` to the beacon node in chunks of `batch_size`.
-    ///
-    /// The size is a parameter so a test can see the chunking without signing
-    /// hundreds of keys.
-    async fn send(&self, registrations: Vec<SignedValidatorRegistrationV1>, batch_size: usize) {
-        for chunk in registrations.chunks(batch_size) {
-            match self.beacon_node.register_validators(chunk).await {
-                Ok(()) => {
-                    debug!(count = chunk.len(), "Builder registrations sent");
-                    crate::metrics::inc_builder_registrations_sent(chunk.len());
-                }
-                Err(err) => {
-                    warn!(count = chunk.len(), %err, "No beacon node accepted the builder registrations");
+    /// Send `registrations` to the beacon node in batches, counting each batch
+    /// as sent when a node accepted it and as a failure when none did.
+    async fn send(&self, registrations: &[SignedValidatorRegistrationV1]) {
+        let outcomes = self
+            .beacon_node
+            .register_validators_in_batches(registrations)
+            .await;
+        for (batch, outcome) in registrations.chunks(REGISTRATION_BATCH).zip(outcomes) {
+            let count = batch.len();
+            // Only logged and counted: see "Failures are never propagated".
+            let _ = outcome
+                .inspect(|()| {
+                    debug!(count, "Builder registrations sent");
+                    crate::metrics::inc_builder_registrations_sent(count);
+                })
+                .inspect_err(|err| {
+                    warn!(count, %err, "No beacon node accepted the builder registrations");
                     crate::metrics::inc_builder_registration_failures();
-                }
-            }
+                });
         }
     }
 }
@@ -376,6 +410,7 @@ mod tests {
     use crate::beacon_node::mock::MockBeaconNode;
     use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::primitives::{Bytes32, H160, Root};
+    use tokio::sync::Semaphore;
 
     fn context(config: Config) -> Arc<SigningContext> {
         Arc::new(SigningContext {
@@ -523,20 +558,41 @@ mod tests {
         );
     }
 
+    /// A service over a node whose `register_validators` calls each wait for
+    /// a permit from the returned gate, which starts with `permits`.
+    fn gated_service(
+        settings: Arc<ProposerSettings>,
+        permits: usize,
+    ) -> (
+        Arc<RegistrationService<MockBeaconNode>>,
+        Arc<MockBeaconNode>,
+        Arc<Semaphore>,
+    ) {
+        let gate = Arc::new(Semaphore::new(permits));
+        let node = Arc::new(MockBeaconNode::new().with_registration_gate(gate.clone()));
+        let service = Arc::new(RegistrationService::new(
+            node.clone(),
+            context(Config::mainnet()),
+            settings,
+        ));
+        (service, node, gate)
+    }
+
+    /// Bounds a call that must return on its own, so a regression fails the
+    /// test rather than hanging it.
+    async fn promptly<F: std::future::Future>(what: &str, call: F) -> F::Output {
+        tokio::time::timeout(std::time::Duration::from_secs(5), call)
+            .await
+            .unwrap_or_else(|_| panic!("{what}"))
+    }
+
     /// A full send that is still waiting on a slow node makes the next one
     /// skip, rather than both holding the set and sending it again; once it
     /// ends, the next one runs.
     #[tokio::test]
     async fn an_epoch_send_still_running_makes_the_next_one_skip() {
         let (store, pubkeys) = store_with_keys(2);
-        let node = Arc::new(
-            MockBeaconNode::new().with_registration_delay(std::time::Duration::from_millis(300)),
-        );
-        let service = Arc::new(RegistrationService::new(
-            node.clone(),
-            context(Config::mainnet()),
-            settings(Some(H160([0xab; 20]))),
-        ));
+        let (service, node, gate) = gated_service(settings(Some(H160([0xab; 20]))), 0);
         let store = Arc::new(RwLock::new(store));
 
         let slow = tokio::spawn(
@@ -544,15 +600,15 @@ mod tests {
                 .clone()
                 .register_all(0, pubkeys.clone(), store.clone()),
         );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        tokio::time::timeout(
-            std::time::Duration::from_millis(100),
+        node.wait_for_registration_calls(1).await;
+        promptly(
+            "skips rather than waiting on the node",
             service
                 .clone()
                 .register_all(1, pubkeys.clone(), store.clone()),
         )
-        .await
-        .expect("skips at once rather than waiting on the node");
+        .await;
+        gate.add_permits(1);
         slow.await.expect("the first send ends");
         assert_eq!(
             *node.registration_batches.lock().expect("lock"),
@@ -560,21 +616,104 @@ mod tests {
             "only the first send reached the node"
         );
 
+        gate.add_permits(1);
         service.register_all(2, pubkeys, store).await;
         assert_eq!(*node.registration_batches.lock().expect("lock"), vec![2, 2]);
     }
 
+    /// The reviewer's race: a full send holds the registrations it read
+    /// before a change, and a per-slot send must not deliver the change while
+    /// that older copy is still to reach the node, or the older one lands last
+    /// and the node keeps its fee recipient. The per-slot send skips instead,
+    /// and the next slot's delivers the change after the full send.
     #[tokio::test]
-    async fn send_chunks_by_the_size_it_is_given() {
-        let (store, pubkeys) = store_with_keys(5);
-        let (service, node) = service(Config::mainnet(), settings(Some(H160([0xab; 20]))));
-        let current = service.current(&store, &pubkeys, 1_000);
+    async fn a_change_is_never_overtaken_by_a_full_send_that_read_before_it() {
+        let (store, pubkeys) = store_with_keys(2);
+        let settings = settings(Some(H160([0xab; 20])));
+        let (service, node, gate) = gated_service(settings.clone(), 0);
+        let store = Arc::new(RwLock::new(store));
 
-        service.send(current.all, 2).await;
+        // The full send has read the cache and is at the node.
+        let full = tokio::spawn(
+            service
+                .clone()
+                .register_all(0, pubkeys.clone(), store.clone()),
+        );
+        node.wait_for_registration_calls(1).await;
+
+        settings.set_fee_recipient(&pubkeys[0], H160([0xcd; 20]));
+        promptly(
+            "the per-slot send skips rather than waiting on the node",
+            service.clone().register_changed(0, store.clone()),
+        )
+        .await;
+        assert_eq!(
+            node.registration_attempts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "nothing reached the node beside the full send"
+        );
+
+        gate.add_permits(1);
+        full.await.expect("the full send ends");
+        gate.add_permits(1);
+        service.register_changed(0, store).await;
+
+        let registrations = node.registrations.lock().expect("lock");
+        let latest_for_first = registrations
+            .iter()
+            .rfind(|registration| registration.message.pubkey == pubkeys[0])
+            .expect("registered");
+        assert_eq!(
+            latest_for_first.message.fee_recipient,
+            H160([0xcd; 20]),
+            "the change reaches the node last"
+        );
+        assert_eq!(*node.registration_batches.lock().expect("lock"), vec![2, 1]);
+    }
+
+    /// The other way round, the full send waits for a running per-slot send
+    /// rather than skipping its epoch, and then sends the change too, since it
+    /// reads the cache only once the per-slot send is done.
+    #[tokio::test]
+    async fn a_full_send_waits_for_a_running_per_slot_send() {
+        let (store, pubkeys) = store_with_keys(2);
+        let settings = settings(Some(H160([0xab; 20])));
+        let (service, node, gate) = gated_service(settings.clone(), 1);
+        let store = Arc::new(RwLock::new(store));
+        service
+            .clone()
+            .register_all(0, pubkeys.clone(), store.clone())
+            .await;
+
+        settings.set_gas_limit(&pubkeys[1], 30_000_000);
+        let changed = tokio::spawn(service.clone().register_changed(0, store.clone()));
+        node.wait_for_registration_calls(2).await;
+        let full = tokio::spawn(
+            service
+                .clone()
+                .register_all(1, pubkeys.clone(), store.clone()),
+        );
+        // Long enough for a full send that skipped to have returned.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !full.is_finished(),
+            "the full send waits rather than skipping"
+        );
+
+        gate.add_permits(2);
+        changed.await.expect("the per-slot send ends");
+        full.await.expect("the full send ends");
 
         assert_eq!(
             *node.registration_batches.lock().expect("lock"),
-            vec![2, 2, 1]
+            vec![2, 1, 2]
+        );
+        let registrations = node.registrations.lock().expect("lock");
+        assert_eq!(registrations[2].message.gas_limit, 30_000_000);
+        assert_eq!(
+            registrations[4], registrations[2],
+            "the full send carries the change it waited for"
         );
     }
 
