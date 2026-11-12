@@ -67,8 +67,15 @@ async fn post_proposer_preferences(
 ) -> Response {
     // A validator client submits during the epoch before gloas, when the
     // consensus version it names is still fulu.
-    if let Err(err) = require_version(&headers, &[ForkName::Fulu, ForkName::Gloas, ForkName::Heze])
-    {
+    if let Err(err) = require_version(
+        &headers,
+        &[
+            ForkName::Fulu,
+            ForkName::Gloas,
+            ForkName::Heze,
+            ForkName::Eip8483,
+        ],
+    ) {
         return err.into_response();
     }
     let preferences = match decode_list::<SignedProposerPreferences>(&headers, &body) {

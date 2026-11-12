@@ -168,7 +168,7 @@ pub fn get_next_sync_committee(state: &BeaconState) -> Result<altair::SyncCommit
         // `compute_balance_weighted_selection` rather than electra's inline
         // rejection-sampling loop, though it keeps electra's effective-balance
         // ceiling. See `crate::beacon::helpers::gloas`'s own module doc.
-        ForkName::Gloas | ForkName::Heze => {
+        ForkName::Gloas | ForkName::Heze | ForkName::Eip8483 => {
             crate::beacon::helpers::gloas::get_next_sync_committee_indices(state)?
         }
         ForkName::Lean => lean_state_unreachable("get_next_sync_committee"),

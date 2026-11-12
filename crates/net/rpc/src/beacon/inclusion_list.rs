@@ -147,7 +147,7 @@ fn inclusion_list_duties(
         })
     };
 
-    if config.fork_at_epoch(epoch) != ForkName::Heze {
+    if !config.fork_at_epoch(epoch).is_heze_or_later() {
         return Ok(respond(Vec::new()));
     }
     if epoch + 1 < state_epoch {
@@ -214,10 +214,10 @@ async fn get_inclusion_list(
     let Ok(Query(query)) = query else {
         return ApiError::BadRequest("slot is required").into_response();
     };
-    if store
+    if !store
         .config()
         .fork_at_epoch(compute_epoch_at_slot(query.slot))
-        != ForkName::Heze
+        .is_heze_or_later()
     {
         return ApiError::BadRequest("the slot is not a heze slot").into_response();
     }
@@ -270,9 +270,14 @@ async fn post_inclusion_list(
     body: Bytes,
 ) -> Response {
     if let Some(value) = headers.get("eth-consensus-version")
-        && value.to_str().ok().and_then(ForkName::parse) != Some(ForkName::Heze)
+        && !value
+            .to_str()
+            .ok()
+            .and_then(ForkName::parse)
+            .is_some_and(ForkName::is_heze_or_later)
     {
-        return ApiError::BadRequest("Eth-Consensus-Version must name heze").into_response();
+        return ApiError::BadRequest("Eth-Consensus-Version must name heze or a later fork")
+            .into_response();
     }
     let signed = match serde_json::from_slice::<PublishBody>(&body) {
         Ok(PublishBody::Wrapped { data }) | Ok(PublishBody::Bare(data)) => data,

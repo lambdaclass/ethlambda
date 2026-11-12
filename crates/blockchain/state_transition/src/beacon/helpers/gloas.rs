@@ -85,7 +85,6 @@ use crate::beacon::constants;
 use crate::beacon::containers::shared::AttestationData;
 use crate::beacon::containers::{BeaconState, gloas};
 use crate::beacon::error::{Error, Result};
-use crate::beacon::fork::ForkName;
 use crate::beacon::hash::hash;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
@@ -804,7 +803,7 @@ pub fn get_activation_churn_limit(state: &BeaconState, config: &Config) -> Resul
     let churn = config
         .min_per_epoch_churn_limit_electra
         .max(total_active_balance / config.churn_limit_quotient_gloas);
-    if state.fork_name() == ForkName::Heze {
+    if state.fork_name().is_heze_or_later() {
         let churn = config.max_per_epoch_activation_churn_limit_gloas.min(churn);
         let churn = scale_churn_to_slot_duration(churn, state, config);
         return Ok(churn - churn % preset::EFFECTIVE_BALANCE_INCREMENT);

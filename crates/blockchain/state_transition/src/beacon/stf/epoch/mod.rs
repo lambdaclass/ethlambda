@@ -106,7 +106,8 @@ pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
         // lists need their own copies of several more (see `gloas`'s own
         // module doc for which), so gloas gets its own driver too.
         ForkName::Gloas => gloas::process_epoch(state, config),
-        ForkName::Heze => gloas::process_epoch_heze(state, config),
+        // EIP-8483 changes no epoch step.
+        ForkName::Heze | ForkName::Eip8483 => gloas::process_epoch_heze(state, config),
         ForkName::Lean => lean_state_unreachable("process_epoch"),
     }
 }
@@ -142,7 +143,8 @@ pub fn process_justification_and_finalization(
         | ForkName::Electra
         | ForkName::Fulu
         | ForkName::Gloas
-        | ForkName::Heze => altair::process_justification_and_finalization(state),
+        | ForkName::Heze
+        | ForkName::Eip8483 => altair::process_justification_and_finalization(state),
         ForkName::Lean => lean_state_unreachable("process_justification_and_finalization"),
     }
 }

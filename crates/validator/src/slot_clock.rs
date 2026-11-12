@@ -94,7 +94,9 @@ impl SlotClock {
     /// Whether `slot` is a heze slot, the fork inclusion list committees exist
     /// from.
     pub fn is_heze(&self, slot: Slot) -> bool {
-        self.config.fork_at_epoch(self.epoch_of(slot)) == ForkName::Heze
+        self.config
+            .fork_at_epoch(self.epoch_of(slot))
+            .is_heze_or_later()
     }
 
     /// The slot containing `now`, or `None` before genesis.

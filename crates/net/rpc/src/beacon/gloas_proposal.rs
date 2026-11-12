@@ -346,7 +346,7 @@ async fn post_produce_block(
                             blobs,
                         },
                     ),
-                    GloasBlock::Heze(block) => contents_response(
+                    GloasBlock::Heze(block) | GloasBlock::Eip8483(block) => contents_response(
                         encoding,
                         fork,
                         &payload_value,
@@ -715,7 +715,9 @@ fn prepare(
     let head_is_gloas = matches!(
         store.get_signed_block(&head_root),
         Ok(Some(
-            containers::SignedBeaconBlock::Gloas(_) | containers::SignedBeaconBlock::Heze(_)
+            containers::SignedBeaconBlock::Gloas(_)
+                | containers::SignedBeaconBlock::Heze(_)
+                | containers::SignedBeaconBlock::Eip8483(_)
         ))
     );
     let parent_requests = if build_on_full && head_is_gloas {
@@ -733,6 +735,9 @@ fn prepare(
 
     let state = advance_to_slot(&head_state, slot, &config)
         .map_err(|_| ApiError::Internal("advancing the head state failed"))?;
+    // The body carries the parent's requests in the block's own fork's shape:
+    // across the EIP-8483 boundary a heze parent's gain its two empty lists.
+    let parent_requests = parent_requests.into_shape_of(state.fork_name());
     let proposer = get_beacon_proposer_index(&state)
         .map_err(|_| ApiError::Internal("no proposer for the slot"))?;
     verify_randao_reveal(&state, proposer, randao_reveal)?;
@@ -780,7 +785,7 @@ fn heze_inclusion_lists(
     head_root: H256,
     slot: Slot,
 ) -> Option<(InclusionListBits, Vec<Vec<u8>>)> {
-    if state.fork_name() != ForkName::Heze {
+    if !state.fork_name().is_heze_or_later() {
         return None;
     }
     let Some(inclusion_list_slot) = slot.checked_sub(1) else {
@@ -853,8 +858,9 @@ async fn build_local(
             "the execution client returned an inconsistent blobs bundle",
         ));
     }
-    let execution_requests = parse_gloas_execution_requests(&built.execution_requests)
-        .map_err(|_| ApiError::Internal("the execution client's request list is malformed"))?;
+    let execution_requests =
+        parse_gloas_execution_requests(&built.execution_requests, prepared.state.fork_name())
+            .map_err(|_| ApiError::Internal("the execution client's request list is malformed"))?;
     Ok(LocalBuild {
         built,
         execution_requests,
@@ -1225,6 +1231,16 @@ async fn post_envelope_waiting(
         || signed.message.payload.block_hash != bid.block_hash
     {
         return ApiError::BadRequest("the envelope does not fulfill the block's bid")
+            .into_response();
+    }
+    // The payload's requests take its block's fork's shape (EIP-8483's carry
+    // two more lists), which the container cannot pin down on its own.
+    if !signed
+        .message
+        .execution_requests
+        .has_shape_of(block.fork_name())
+    {
+        return ApiError::BadRequest("the envelope's requests have another fork's shape")
             .into_response();
     }
 

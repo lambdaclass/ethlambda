@@ -191,8 +191,10 @@ fn ptc_duties(
         ));
     }
 
-    let readable_from_head = matches!(*head_state, BeaconState::Gloas(_) | BeaconState::Heze(_))
-        && epoch <= state_epoch + preset::MIN_SEED_LOOKAHEAD;
+    let readable_from_head = matches!(
+        *head_state,
+        BeaconState::Gloas(_) | BeaconState::Heze(_) | BeaconState::Eip8483(_)
+    ) && epoch <= state_epoch + preset::MIN_SEED_LOOKAHEAD;
     let state: Arc<BeaconState> = if readable_from_head {
         head_state
     } else {
@@ -294,15 +296,15 @@ async fn get_payload_attestation_data(
 /// The number of blob commitments in a gloas block's bid.
 fn bid_commitment_count(block: &SignedBeaconBlock) -> Option<usize> {
     match block {
-        SignedBeaconBlock::Gloas(_) | SignedBeaconBlock::Heze(_) => {
-            block.gloas_message().map(|message| {
-                message
-                    .signed_execution_payload_bid()
-                    .message
-                    .blob_kzg_commitments
-                    .len()
-            })
-        }
+        SignedBeaconBlock::Gloas(_)
+        | SignedBeaconBlock::Heze(_)
+        | SignedBeaconBlock::Eip8483(_) => block.gloas_message().map(|message| {
+            message
+                .signed_execution_payload_bid()
+                .message
+                .blob_kzg_commitments
+                .len()
+        }),
         _ => None,
     }
 }
@@ -469,7 +471,7 @@ fn require_gloas_or_absent(headers: &HeaderMap) -> Result<(), ApiError> {
         return Ok(());
     };
     match value.to_str().ok().and_then(ForkName::parse) {
-        Some(ForkName::Gloas | ForkName::Heze) => Ok(()),
+        Some(ForkName::Gloas | ForkName::Heze | ForkName::Eip8483) => Ok(()),
         _ => Err(ApiError::BadRequest(
             "Eth-Consensus-Version must name gloas or heze",
         )),

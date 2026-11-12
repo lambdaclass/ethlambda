@@ -123,7 +123,8 @@ pub(super) fn process_unfused_steps(
         | ForkName::Capella
         | ForkName::Deneb
         | ForkName::Gloas
-        | ForkName::Heze) => {
+        | ForkName::Heze
+        | ForkName::Eip8483) => {
             return Err(Error::UnsupportedForFork {
                 function: "process_unfused_steps",
                 fork,
@@ -445,7 +446,8 @@ pub(crate) fn drain_pending_deposits(
             )),
             PendingQueueFields::Fulu(_)
             | PendingQueueFields::Gloas(_)
-            | PendingQueueFields::Heze(_) => None,
+            | PendingQueueFields::Heze(_)
+            | PendingQueueFields::Eip8483(_) => None,
         };
         let available_for_processing = fields
             .deposit_balance_to_consume()
@@ -613,7 +615,7 @@ pub(crate) fn apply_pending_deposit(
 /// puts lean after every beacon fork.
 fn forbids_new_bls_validators(fork: ForkName) -> bool {
     match fork {
-        ForkName::Heze => true,
+        ForkName::Heze | ForkName::Eip8483 => true,
         ForkName::Phase0
         | ForkName::Altair
         | ForkName::Bellatrix

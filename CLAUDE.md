@@ -867,6 +867,9 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   pinned release parses, `heze` included, and
   `fixture_forks/every_directory_is_accounted_for` fails on any fork directory
   that is neither parseable nor listed, so a new fork forces a decision.
+  `UNRELEASED_FORKS` (`eip8483`) names implemented forks no release ships yet,
+  which the harness's every-fork-has-cases check skips; their cases still run
+  when vectors are placed in the tree.
 - **Heze** (EIP-7805 FOCIL, EIP-8015) is gloas plus inclusion lists, without the
   eth1 and deposit-index fields. It has its own containers in
   `containers::heze` (`BeaconState`, `BeaconBlockBody`, `BeaconBlock`,
@@ -900,6 +903,33 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   `PayloadAttributesV5` and the self-build bid's bits, the Beacon API's IL
   duties/produce/publish endpoints, and the validator client's IL duty. See
   `docs/spec_deviations.md`.
+- **EIP-8483** (post-quantum material registration, consensus-specs #5809, an
+  open PR) is a feature fork on heze, `ForkName::Eip8483`, with its own
+  `EIP8483_FORK_VERSION`/`EIP8483_FORK_EPOCH`: a `config.yaml` without them
+  (every heze-devnet-3 config) leaves it unscheduled, so nothing about heze
+  changes. A rule stated "from heze on" asks `ForkName::is_heze_or_later`, never
+  `== ForkName::Heze`; FOCIL, EIP-8198's slot schedule, EIP-8365, the bid shape
+  and Engine API V5/V6 all stay on at EIP-8483. Its state is
+  `containers::eip8483::BeaconState` (heze's plus `validator_pq_registrations`
+  and `builder_pq_registrations`, `BeaconState::Eip8483`); its blocks reuse
+  heze's containers (`SignedBeaconBlock::Eip8483`, `GloasBlock::Eip8483`,
+  `GloasBlockRef::Eip8483`, which `From<heze::BeaconBlock>` does not build).
+  The one shape it changes is `ExecutionRequests`, which carries EIP-8483's two
+  lists as one `Option` (`pq_registrations`) with hand-written SSZ told apart
+  by the first offset (20 or 28), the bid's pattern. **"No requests" is
+  `ExecutionRequests::empty(fork)`, never `Default`**: the seven-field empty
+  value has a different encoding and root. Every decode for a known fork (block,
+  envelope gossip and req/resp, the Beacon API) checks the requests' shape; so
+  do `process_parent_execution_payload` and `verify_execution_payload_envelope`.
+  `stf::eip8483` holds the two handlers, the spec-literal ones plus a batched
+  validator path `apply_parent_execution_payload` uses (one registry pass and a
+  uniqueness index per payload, tested against the literal one on every pyspec
+  case). Request types follow the CS PR (`0x05`/`0x06`; the EIP says
+  `0x06`/`0x07`) and are accepted from the engine only at EIP-8483
+  (`parse_gloas_execution_requests(list, fork)`). The first EIP-8483 block over
+  a FULL pre-fork parent is checked against the five-field root, our provisional
+  rule for what the spec leaves open; see `docs/spec_deviations.md`. No
+  execution client implements the predeploys yet.
 - A fixture case with no `post` state asserts the input must be **rejected**. That
   rule lives in `check_transition`; do not add a runner that ignores it.
 
@@ -1012,9 +1042,10 @@ behavior.
   in-memory map stays as a write-through cache in front of the table. Pruned
   on finalization to the same horizon as `LiveChain` (the finalized block's
   own slot, keeping that block's own entry).
-- `DB_VERSION` is 8: EIP-8198 appended `SLOT_DURATION_MS_HEZE` and
-  `MIN_BLOB_DATA_RETENTION_MS` to `Config`, so version 7's stored config decodes
-  into the wrong fields. (7 was heze's own state and block containers
+- `DB_VERSION` is 9: EIP-8483 added `EIP8483_FORK_VERSION`/`EIP8483_FORK_EPOCH`
+  to `Config`, so version 8's stored config decodes into the wrong fields. (8
+  was EIP-8198 appending `SLOT_DURATION_MS_HEZE` and
+  `MIN_BLOB_DATA_RETENTION_MS` to `Config`; 7 was heze's own state and block containers
   (EIP-8015): a heze row written by version 6 no longer decodes; 6 was the unrealized-justifications table: a directory
   written by an earlier version has no row there for any block it already
   imported, which would otherwise look identical to "no unrealized

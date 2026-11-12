@@ -255,7 +255,7 @@ fn handle_beacon_gossip(
     } else if let Some(subnet_id) = beacon_topics::attestation_subnet(kind) {
         triage_attestation(server, topic_fork, payload, subnet_id)
     } else if kind == beacon_topics::EXECUTION_PAYLOAD {
-        triage_envelope(server, payload)
+        triage_envelope(server, topic_fork, payload)
     } else if kind == beacon_topics::PAYLOAD_ATTESTATION_MESSAGE {
         triage_payload_attestation(server, payload)
     } else if kind == beacon_topics::INCLUSION_LIST {
@@ -508,9 +508,9 @@ fn triage_attestation(
 
 /// Decode a gloas execution payload envelope and run its cheap gossip checks.
 /// Same shape as [`triage_block`].
-fn triage_envelope(server: &P2PServer, payload: &[u8]) -> Dispatch {
+fn triage_envelope(server: &P2PServer, fork: ForkName, payload: &[u8]) -> Dispatch {
     const KIND: &str = beacon_topics::EXECUTION_PAYLOAD;
-    let envelope = match beacon_decode::decode_execution_payload_envelope(payload) {
+    let envelope = match beacon_decode::decode_execution_payload_envelope(fork, payload) {
         Ok(envelope) => envelope,
         Err(err) => {
             metrics::inc_beacon_gossip(KIND, "decode_failed");
@@ -1819,7 +1819,7 @@ mod tests {
         let server = unconnected_beacon_server(Config::mainnet(), 0).await;
 
         assert!(matches!(
-            triage_envelope(&server, &[0xff; 3]),
+            triage_envelope(&server, ForkName::Gloas, &[0xff; 3]),
             Dispatch::Report(Outcome::Reject(RejectReason::Decode))
         ));
         assert!(matches!(
@@ -1837,7 +1837,7 @@ mod tests {
         let payload = envelope.to_ssz();
 
         assert!(matches!(
-            triage_envelope(&server, &payload),
+            triage_envelope(&server, ForkName::Gloas, &payload),
             Dispatch::Validate(Validated::Envelope(decoded)) if *decoded == envelope
         ));
 
@@ -1846,7 +1846,7 @@ mod tests {
             envelope.message.builder_index,
         );
         assert!(matches!(
-            triage_envelope(&server, &payload),
+            triage_envelope(&server, ForkName::Gloas, &payload),
             Dispatch::Report(Outcome::Ignore(IgnoreReason::AlreadySeen))
         ));
     }

@@ -58,6 +58,7 @@ pub mod bellatrix;
 pub mod block;
 pub mod capella;
 pub mod deneb;
+pub mod eip8483;
 pub mod electra;
 pub mod epoch;
 pub mod fulu;
@@ -343,6 +344,17 @@ pub fn process_slot(state: &mut BeaconState) -> Result<()> {
                 .expect("next_position is in [0, SLOTS_PER_HISTORICAL_ROOT)");
         }
         BeaconState::Heze(inner) => {
+            let next_slot = inner
+                .slot
+                .checked_add(1)
+                .ok_or(Error::ArithmeticOverflow("process_slot: slot + 1"))?;
+            let next_position = (next_slot % preset::SLOTS_PER_HISTORICAL_ROOT as u64) as usize;
+            inner
+                .execution_payload_availability
+                .set(next_position, false)
+                .expect("next_position is in [0, SLOTS_PER_HISTORICAL_ROOT)");
+        }
+        BeaconState::Eip8483(inner) => {
             let next_slot = inner
                 .slot
                 .checked_add(1)

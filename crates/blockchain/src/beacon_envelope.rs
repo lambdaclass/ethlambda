@@ -52,7 +52,6 @@ use std::collections::{HashMap, VecDeque};
 use ethlambda_engine::EngineError;
 use ethlambda_engine::types::PayloadStatusValue;
 use ethlambda_network_api::FetchRequest;
-use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::fork_choice::{
     self, PayloadStatus, PayloadStatusEnum, PayloadValidity,
 };
@@ -468,7 +467,7 @@ impl BlockChainServer {
 
         // Heze: the payload is also judged against the previous slot's timely
         // inclusion lists (`record_payload_inclusion_list_satisfaction`).
-        let is_heze = block.fork_name() == ForkName::Heze;
+        let is_heze = block.fork_name().is_heze_or_later();
         let inclusion_list_transactions: Vec<Vec<u8>> = if is_heze {
             inclusion_list::payload_inclusion_list_transactions(&self.store, root)
                 .unwrap_or_default()

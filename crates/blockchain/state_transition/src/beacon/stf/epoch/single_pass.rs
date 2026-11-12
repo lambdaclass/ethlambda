@@ -410,7 +410,8 @@ impl DepositPlan {
                 )),
                 PendingQueueFields::Fulu(_)
                 | PendingQueueFields::Gloas(_)
-                | PendingQueueFields::Heze(_) => None,
+                | PendingQueueFields::Heze(_)
+                | PendingQueueFields::Eip8483(_) => None,
             };
             let available_for_processing = fields
                 .deposit_balance_to_consume()

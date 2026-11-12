@@ -147,6 +147,7 @@ pub(crate) fn fixed_proposer(parent_state: &BeaconState, slot: Slot) -> Option<V
         BeaconState::Fulu(state) => (state.slot, &state.proposer_lookahead),
         BeaconState::Gloas(state) => (state.slot, &state.proposer_lookahead),
         BeaconState::Heze(state) => (state.slot, &state.proposer_lookahead),
+        BeaconState::Eip8483(state) => (state.slot, &state.proposer_lookahead),
         BeaconState::Phase0(_)
         | BeaconState::Altair(_)
         | BeaconState::Bellatrix(_)

@@ -64,6 +64,7 @@ fn fork_schedule(config: &Config) -> Vec<Value> {
         (config.fulu_fork_version, config.fulu_fork_epoch),
         (config.gloas_fork_version, config.gloas_fork_epoch),
         (config.heze_fork_version, config.heze_fork_epoch),
+        (config.eip8483_fork_version, config.eip8483_fork_epoch),
     ];
     let fork = |previous: [u8; 4], current: [u8; 4], epoch: u64| {
         serde_json::json!({
@@ -211,6 +212,9 @@ fn extra_entries() -> impl Iterator<Item = (&'static str, String)> {
         MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD,
         MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD,
         MAX_BUILDERS_PER_WITHDRAWALS_SWEEP,
+        // EIP-8483, `presets/*/eip8483.yaml`.
+        MAX_VALIDATOR_PQ_REGISTRATION_REQUESTS_PER_PAYLOAD,
+        MAX_BUILDER_PQ_REGISTRATION_REQUESTS_PER_PAYLOAD,
     );
 
     let domains = entries!(hex_string; constants:
@@ -244,6 +248,8 @@ fn extra_entries() -> impl Iterator<Item = (&'static str, String)> {
         BUILDER_WITHDRAWAL_PREFIX,
         BUILDER_DEPOSIT_REQUEST_TYPE,
         BUILDER_EXIT_REQUEST_TYPE,
+        VALIDATOR_PQ_REGISTRATION_REQUEST_TYPE,
+        BUILDER_PQ_REGISTRATION_REQUEST_TYPE,
     );
 
     // `VERSIONED_HASH_VERSION_KZG` is a `Bytes1` like the withdrawal prefixes,
@@ -586,6 +592,32 @@ mod tests {
             schedule.last().unwrap()["current_version"],
             hex_string(config.gloas_fork_version)
         );
+    }
+
+    #[test]
+    fn eip8483_is_listed_after_heze_once_scheduled_and_absent_otherwise() {
+        let mut config = Config::mainnet();
+        config.gloas_fork_epoch = 0;
+        config.heze_fork_epoch = 1;
+        let unscheduled = fork_schedule(&config);
+        assert_eq!(
+            unscheduled.last().unwrap()["current_version"],
+            hex_string(config.heze_fork_version)
+        );
+
+        config.eip8483_fork_epoch = 3;
+        let schedule = fork_schedule(&config);
+        assert_eq!(schedule.len(), unscheduled.len() + 1);
+        let last = schedule.last().unwrap();
+        assert_eq!(
+            last["current_version"],
+            hex_string(config.eip8483_fork_version)
+        );
+        assert_eq!(
+            last["previous_version"],
+            hex_string(config.heze_fork_version)
+        );
+        assert_eq!(last["epoch"], "3");
     }
 
     #[test]

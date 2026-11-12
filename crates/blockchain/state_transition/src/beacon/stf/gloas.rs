@@ -54,6 +54,7 @@ use crate::beacon::containers::altair::SyncAggregate;
 use crate::beacon::containers::shared::{DepositMessage, Eth1Data, ProposerSlashing};
 use crate::beacon::containers::{BeaconState, GloasBlock, capella, gloas, heze};
 use crate::beacon::error::{Error, Result, verify};
+use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::{
     ActiveBalanceCache, ActiveBalanceCacheExt, CommitteeCache, CommitteeCacheExt,
     get_beacon_proposer_index, get_block_root_at_slot, get_current_epoch, get_domain,
@@ -151,7 +152,7 @@ impl<'a> From<&'a GloasBlock> for BlockParts<'a> {
     fn from(block: &'a GloasBlock) -> Self {
         match block {
             GloasBlock::Gloas(block) => block.into(),
-            GloasBlock::Heze(block) => block.into(),
+            GloasBlock::Heze(block) | GloasBlock::Eip8483(block) => block.into(),
         }
     }
 }
@@ -715,6 +716,19 @@ pub fn get_execution_requests_list(requests: &gloas::ExecutionRequests) -> Vec<V
         requests.builder_exits.is_empty(),
         requests.builder_exits.to_ssz(),
     );
+    // [New in EIP8483]
+    if let Some(pq) = &requests.pq_registrations {
+        push(
+            constants::VALIDATOR_PQ_REGISTRATION_REQUEST_TYPE,
+            pq.validator_pq_registrations.is_empty(),
+            pq.validator_pq_registrations.to_ssz(),
+        );
+        push(
+            constants::BUILDER_PQ_REGISTRATION_REQUEST_TYPE,
+            pq.builder_pq_registrations.is_empty(),
+            pq.builder_pq_registrations.to_ssz(),
+        );
+    }
 
     list
 }
@@ -818,6 +832,17 @@ pub fn verify_execution_payload_envelope(
     verify(
         envelope.parent_beacon_block_root == state.latest_block_header().parent_root,
         "verify_execution_payload_envelope: envelope.parent_beacon_block_root == state.latest_block_header.parent_root",
+    )?;
+
+    // Ours: one struct carries every fork's requests (see
+    // `gloas::ExecutionRequests`), so the shape the specification's typed
+    // envelope guarantees is checked here: the payload's requests take its
+    // block's fork's, the state's. Without it a builder could commit an
+    // EIP-8483 bid to a five-field root, which no child block's seven-field
+    // `parent_execution_requests` could then match.
+    verify(
+        envelope.execution_requests.has_shape_of(state.fork_name()),
+        "verify_execution_payload_envelope: envelope.execution_requests has the state's fork's shape",
     )?;
 
     // Verify consistency with the committed bid.
@@ -1083,6 +1108,18 @@ pub fn apply_parent_execution_payload(
         requests.builder_exits.len() as u64 <= preset::MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD,
         "apply_parent_execution_payload: len(requests.builder_exits) <= MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD",
     )?;
+    // [New in EIP8483]
+    verify(
+        requests.validator_pq_registrations().len() as u64
+            <= preset::MAX_VALIDATOR_PQ_REGISTRATION_REQUESTS_PER_PAYLOAD,
+        "apply_parent_execution_payload: len(requests.validator_pq_registrations) <= MAX_VALIDATOR_PQ_REGISTRATION_REQUESTS_PER_PAYLOAD",
+    )?;
+    // [New in EIP8483]
+    verify(
+        requests.builder_pq_registrations().len() as u64
+            <= preset::MAX_BUILDER_PQ_REGISTRATION_REQUESTS_PER_PAYLOAD,
+        "apply_parent_execution_payload: len(requests.builder_pq_registrations) <= MAX_BUILDER_PQ_REGISTRATION_REQUESTS_PER_PAYLOAD",
+    )?;
 
     // Settle the builder payment before the requests so that a builder exit
     // request is rejected while the payment is pending (consensus-specs #5695).
@@ -1132,6 +1169,15 @@ pub fn apply_parent_execution_payload(
     for builder_exit in requests.builder_exits.iter() {
         process_builder_exit_request(state, builder_exit, config)?;
     }
+    // [New in EIP8483] Empty on a pre-EIP-8483 value, which includes a heze
+    // parent's requests applied by the first EIP-8483 block.
+    crate::beacon::stf::eip8483::process_validator_pq_registration_requests(
+        state,
+        requests.validator_pq_registrations(),
+    )?;
+    for request in requests.builder_pq_registrations() {
+        crate::beacon::stf::eip8483::process_builder_pq_registration_request(state, request)?;
+    }
 
     // Update parent payload availability and latest block hash.
     let slot_index = (parent_slot as usize) % preset::SLOTS_PER_HISTORICAL_ROOT;
@@ -1161,11 +1207,21 @@ pub fn process_parent_execution_payload(
     config: &Config,
 ) -> Result<()> {
     let parent_bid = state.latest_execution_payload_bid()?.clone();
+    let fork = state.fork_name();
+
+    // Ours: one struct carries every fork's requests (see
+    // `gloas::ExecutionRequests`), so what the specification's typed body
+    // guarantees is checked here, for a block built in process as much as
+    // for a decoded one.
+    verify(
+        requests.has_shape_of(fork),
+        "process_parent_execution_payload: requests have the state's fork's shape",
+    )?;
 
     if bid.parent_block_hash != parent_bid.block_hash {
         // Parent was EMPTY: no execution requests expected.
         verify(
-            *requests == gloas::ExecutionRequests::default(),
+            *requests == gloas::ExecutionRequests::empty(fork),
             "process_parent_execution_payload: requests == ExecutionRequests.empty()",
         )?;
         return Ok(());
@@ -1173,10 +1229,50 @@ pub fn process_parent_execution_payload(
 
     // Parent was FULL: verify the bid commitment and apply the payload.
     verify(
-        requests.hash_tree_root() == parent_bid.execution_requests_root,
+        committed_requests_root(requests, &parent_bid, fork, config)?
+            == parent_bid.execution_requests_root,
         "process_parent_execution_payload: hash_tree_root(requests) == parent_bid.execution_requests_root",
     )?;
     apply_parent_execution_payload(state, requests, config)
+}
+
+/// The root `parent_bid` committed `requests` under, which is
+/// `hash_tree_root(requests)` except across the EIP-8483 boundary.
+///
+/// EIP-8483's `upgrade_to_eip8483` copies `latest_execution_payload_bid`
+/// unchanged, and the specification leaves to the coordinated upgrade how the
+/// first EIP-8483 block validates a FULL pre-fork parent (consensus-specs
+/// #5809's `fork.md` note): that parent's bid committed to the five-field
+/// `ExecutionRequests`, whose root differs from the seven-field one even with
+/// both new lists empty. Ours, provisional until the specification decides
+/// (`docs/spec_deviations.md`): the block's own `parent_execution_requests`
+/// stays seven-field, as its fork's body type requires, its two PQ lists must
+/// be empty (a pre-fork payload produced none), and the root compared is the
+/// five-field one. The parent's fork is read from its bid's slot, so a parent
+/// two forks back (heze and EIP-8483 scheduled at one epoch over a gloas
+/// chain) takes the same path.
+fn committed_requests_root(
+    requests: &gloas::ExecutionRequests,
+    parent_bid: &gloas::ExecutionPayloadBid,
+    fork: ForkName,
+    config: &Config,
+) -> Result<Root> {
+    let parent_fork = config.fork_at_epoch(compute_epoch_at_slot(parent_bid.slot));
+    if fork.has_pq_registrations() && !parent_fork.has_pq_registrations() {
+        verify(
+            requests
+                .pq_registrations
+                .as_ref()
+                .is_none_or(|pq| pq.is_empty()),
+            "process_parent_execution_payload: a pre-EIP-8483 parent payload carries no PQ registration requests",
+        )?;
+        let committed = gloas::ExecutionRequests {
+            pq_registrations: None,
+            ..requests.clone()
+        };
+        return Ok(committed.hash_tree_root());
+    }
+    Ok(requests.hash_tree_root())
 }
 
 // ---------------------------------------------------------------------------
@@ -1889,6 +1985,7 @@ mod tests {
             builder_exits: gloas::BuilderExitRequests::from(vec![
                 gloas::BuilderExitRequest::default(),
             ]),
+            pq_registrations: None,
         };
 
         let list = get_execution_requests_list(&requests);

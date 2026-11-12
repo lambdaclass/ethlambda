@@ -148,6 +148,28 @@ mod tests {
         );
     }
 
+    /// EIP-8483's schedule is read from a file that names it and left
+    /// unscheduled by one that does not, which is every published network's.
+    #[test]
+    fn the_eip8483_keys_are_claimed_and_default_to_unscheduled() {
+        let unscheduled = ConfigFile::parse(DEVNET).unwrap();
+        assert_eq!(
+            unscheduled.config.eip8483_fork_epoch,
+            ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH
+        );
+
+        let text = format!("{DEVNET}\nEIP8483_FORK_VERSION: 0xe8483000\nEIP8483_FORK_EPOCH: 7\n");
+        let parsed = ConfigFile::parse(&text).unwrap();
+        for key in ["EIP8483_FORK_VERSION", "EIP8483_FORK_EPOCH"] {
+            assert!(
+                !parsed.ignored.contains(&key.to_string()),
+                "{key} reported as ignored"
+            );
+        }
+        assert_eq!(parsed.config.eip8483_fork_version, [0xe8, 0x48, 0x30, 0x00]);
+        assert_eq!(parsed.config.eip8483_fork_epoch, 7);
+    }
+
     #[test]
     fn the_heze_keys_are_claimed_rather_than_ignored() {
         // HEZE_* and the inclusion list keys used to be reported as ignored;

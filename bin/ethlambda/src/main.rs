@@ -1626,6 +1626,8 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         gloas_fork_epoch: _,
         heze_fork_version: _,
         heze_fork_epoch: _,
+        eip8483_fork_version: _,
+        eip8483_fork_epoch: _,
 
         // Time parameters: `seconds_per_slot`/`slot_duration_ms` (compared
         // below) move every slot boundary. The rest are operator-visible
@@ -1776,6 +1778,8 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         gloas_fork_epoch,
         heze_fork_version,
         heze_fork_epoch,
+        eip8483_fork_version,
+        eip8483_fork_epoch,
         seconds_per_slot,
         slot_duration_ms,
         slot_duration_ms_heze,
@@ -2058,7 +2062,9 @@ fn gloas_genesis_body(state: &BeaconState) -> gloas::BeaconBlockBody {
 /// [`gloas_genesis_body`] for heze, whose body has no `eth1_data` and `deposits`
 /// (EIP-8015).
 fn heze_genesis_body(state: &BeaconState) -> heze::BeaconBlockBody {
-    let empty = heze::BeaconBlockBody::empty();
+    // Heze's and EIP-8483's share this container; the state's fork picks the
+    // parent requests' shape.
+    let empty = heze::BeaconBlockBody::empty_at(state.fork_name());
     mirrored_genesis_body(state, empty, |body, bid| {
         body.signed_execution_payload_bid.message = bid;
     })
@@ -2179,6 +2185,16 @@ fn genesis_anchor_block(state: &BeaconState) -> SignedBeaconBlock {
             signature: Default::default(),
         }),
         ForkName::Heze => SignedBeaconBlock::Heze(heze::SignedBeaconBlock {
+            message: heze::BeaconBlock {
+                slot,
+                proposer_index,
+                parent_root,
+                state_root,
+                body: heze_genesis_body(state),
+            },
+            signature: Default::default(),
+        }),
+        ForkName::Eip8483 => SignedBeaconBlock::Eip8483(heze::SignedBeaconBlock {
             message: heze::BeaconBlock {
                 slot,
                 proposer_index,
@@ -3119,7 +3135,9 @@ validators:
                     electra::BeaconBlockBody::empty().hash_tree_root()
                 }
                 ForkName::Gloas => gloas::BeaconBlockBody::empty_at(fork).hash_tree_root(),
-                ForkName::Heze => heze::BeaconBlockBody::empty().hash_tree_root(),
+                ForkName::Heze | ForkName::Eip8483 => {
+                    heze::BeaconBlockBody::empty_at(fork).hash_tree_root()
+                }
                 ForkName::Lean => unreachable!("ForkName::ALL excludes Lean"),
             };
             state.latest_block_header_mut().body_root = empty_body_root;

@@ -836,7 +836,11 @@ impl BeaconNodeApi for MockBeaconNode {
         Ok(self.inclusion_list_transactions.clone().unwrap_or_default())
     }
 
-    async fn publish_inclusion_list(&self, signed: &heze::SignedInclusionList) -> Result<()> {
+    async fn publish_inclusion_list(
+        &self,
+        _fork: ForkName,
+        signed: &heze::SignedInclusionList,
+    ) -> Result<()> {
         self.guard("publish_inclusion_list")?;
         self.published_inclusion_lists
             .lock()

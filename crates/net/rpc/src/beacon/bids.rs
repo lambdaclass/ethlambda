@@ -85,7 +85,10 @@ async fn post_bid(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(err) = require_version(&headers, &[ForkName::Gloas, ForkName::Heze]) {
+    if let Err(err) = require_version(
+        &headers,
+        &[ForkName::Gloas, ForkName::Heze, ForkName::Eip8483],
+    ) {
         return err.into_response();
     }
     let encoding = match BodyEncoding::from_headers(&headers) {

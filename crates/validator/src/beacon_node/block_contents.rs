@@ -319,10 +319,12 @@ impl ProducedBlock {
             // Gloas needs one more fact than the fork: whether the node
             // included the payload, which only the response header says. See
             // `Self::from_gloas_ssz`.
-            ForkName::Gloas | ForkName::Heze => Err(Error::InconsistentResponse(
-                "a gloas block cannot be decoded without Eth-Execution-Payload-Included"
-                    .to_string(),
-            )),
+            ForkName::Gloas | ForkName::Heze | ForkName::Eip8483 => {
+                Err(Error::InconsistentResponse(
+                    "a gloas block cannot be decoded without Eth-Execution-Payload-Included"
+                        .to_string(),
+                ))
+            }
             ForkName::Phase0
             | ForkName::Altair
             | ForkName::Bellatrix
@@ -352,7 +354,7 @@ impl ProducedBlock {
                 "produced gloas block: {what} did not decode: {err:?}"
             ))
         };
-        if !matches!(fork, ForkName::Gloas | ForkName::Heze) {
+        if !matches!(fork, ForkName::Gloas | ForkName::Heze | ForkName::Eip8483) {
             return Err(Error::InconsistentResponse(format!(
                 "a gloas block was asked for under fork {}",
                 fork.as_str()
@@ -365,12 +367,21 @@ impl ProducedBlock {
                 blobs,
             }))
         };
-        let (block, payload) = match (fork, payload_included) {
-            (ForkName::Heze, true) => {
+        // Heze's container also carries EIP-8483's block, tagged with its own
+        // fork; `GloasBlock`'s `From<heze::BeaconBlock>` would tag it heze.
+        let heze_family = |block: heze::BeaconBlock| {
+            if fork == ForkName::Eip8483 {
+                GloasBlock::Eip8483(block)
+            } else {
+                GloasBlock::Heze(block)
+            }
+        };
+        let (block, payload) = match (fork.is_heze_or_later(), payload_included) {
+            (true, true) => {
                 let contents = HezeBlockContents::from_ssz_bytes(bytes)
                     .map_err(|err| decode("block contents", err))?;
                 (
-                    GloasBlock::Heze(contents.block),
+                    heze_family(contents.block),
                     payload_of(
                         contents.execution_payload_envelope,
                         contents.kzg_proofs,
@@ -378,7 +389,7 @@ impl ProducedBlock {
                     ),
                 )
             }
-            (_, true) => {
+            (false, true) => {
                 let contents = GloasBlockContents::from_ssz_bytes(bytes)
                     .map_err(|err| decode("block contents", err))?;
                 (
@@ -390,14 +401,14 @@ impl ProducedBlock {
                     ),
                 )
             }
-            (ForkName::Heze, false) => (
-                GloasBlock::Heze(
+            (true, false) => (
+                heze_family(
                     heze::BeaconBlock::from_ssz_bytes(bytes)
                         .map_err(|err| decode("bare block", err))?,
                 ),
                 None,
             ),
-            (_, false) => (
+            (false, false) => (
                 GloasBlock::Gloas(
                     gloas::BeaconBlock::from_ssz_bytes(bytes)
                         .map_err(|err| decode("bare block", err))?,
@@ -405,11 +416,16 @@ impl ProducedBlock {
                 None,
             ),
         };
-        // The bid's shape must be the fork's own: heze's carries
-        // `inclusion_list_bits`, gloas's does not.
-        if block.signed_execution_payload_bid().message.fork_name() != fork {
+        // The bid's and the parent requests' shapes must be the fork's own:
+        // heze's bid carries `inclusion_list_bits`, gloas's does not, and
+        // EIP-8483's requests carry two more lists. The envelope's requests
+        // are the payload's own, so they take the block's fork's shape too.
+        let envelope_shape_matches = payload
+            .as_ref()
+            .is_none_or(|payload| payload.envelope.execution_requests.has_shape_of(fork));
+        if !block.as_ref().has_shapes_of(fork) || !envelope_shape_matches {
             return Err(Error::InconsistentResponse(format!(
-                "the {} block's bid has the other fork's shape",
+                "the {} block or its envelope has another fork's shape",
                 fork.as_str()
             )));
         }

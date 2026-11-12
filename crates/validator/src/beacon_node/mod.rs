@@ -444,8 +444,14 @@ pub trait BeaconNodeApi: Send + Sync {
     async fn inclusion_list_transactions(&self, slot: Slot) -> Result<Vec<Vec<u8>>>;
 
     /// Publish a committee member's signed inclusion list. The node validates
-    /// it as gossip would, stores it and gossips it.
-    async fn publish_inclusion_list(&self, signed: &heze::SignedInclusionList) -> Result<()>;
+    /// it as gossip would, stores it and gossips it. `fork` is the fork of the
+    /// list's slot, which the request names in `Eth-Consensus-Version`: heze,
+    /// or a fork after it that keeps inclusion lists.
+    async fn publish_inclusion_list(
+        &self,
+        fork: ForkName,
+        signed: &heze::SignedInclusionList,
+    ) -> Result<()>;
 
     /// Submits signed attestations to the node's pool, so they reach gossip.
     /// `fork_name` names the fork the attestations were produced under, since

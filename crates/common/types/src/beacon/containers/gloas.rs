@@ -461,6 +461,13 @@ impl ExecutionPayloadBid {
         }
     }
 
+    /// Whether this bid has the shape `fork` uses: heze's from heze on
+    /// (EIP-8483 changes nothing in the bid), gloas's before. Not
+    /// `self.fork_name() == fork`, which no EIP-8483 bid satisfies.
+    pub fn has_shape_of(&self, fork: ForkName) -> bool {
+        self.inclusion_list_bits.is_some() == fork.is_heze_or_later()
+    }
+
     fn fixed_len(&self) -> usize {
         if self.inclusion_list_bits.is_some() {
             HEZE_BID_FIXED_LEN
@@ -629,19 +636,26 @@ pub struct SignedExecutionPayloadBid {
 /// Electra's three request kinds (EIP-6110/7002/7251), plus `builder_deposits`
 /// and `builder_exits` (EIP-8282), the execution-layer path [`Builder`]s are
 /// onboarded and retired through from the fork onward.
-#[derive(
-    Debug,
-    Clone,
-    Default,
-    PartialEq,
-    Eq,
-    serde::Serialize,
-    serde::Deserialize,
-    SszEncode,
-    SszDecode,
-    HashTreeRoot,
-)]
-#[ssz(progressive_container)]
+///
+/// One struct serves gloas, heze and EIP-8483. EIP-8483 appends two request
+/// lists, `validator_pq_registrations` and `builder_pq_registrations`, and
+/// changes nothing else; carrying them as one `Option`
+/// ([`Self::pq_registrations`], `None` before EIP-8483, `Some` from it on)
+/// keeps the envelope, the block body's `parent_execution_requests` and
+/// `NewPayloadRequest` serving every fork, the way the bid's
+/// `inclusion_list_bits` does for heze. [`Self::empty`] builds the empty
+/// value a given fork expects, which is what every caller that means "no
+/// requests" must use: [`Default`] is the five-field shape, and an EIP-8483
+/// empty value has a different encoding and root.
+///
+/// SSZ is therefore written out below. Every field is a list, so the fixed
+/// part is one offset per field and the first offset (the fixed part's
+/// length) says which shape an encoding is: [`FIVE_FIELD_REQUESTS_FIXED_LEN`]
+/// or [`SEVEN_FIELD_REQUESTS_FIXED_LEN`]. Merkleization follows the
+/// progressive container each fork declares: five active fields, or seven. A
+/// decoder handed bytes for a known fork checks the shape against that fork,
+/// since nothing at this level knows which fork the bytes were meant for.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExecutionRequests {
     #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub deposits: DepositRequests,
@@ -653,6 +667,216 @@ pub struct ExecutionRequests {
     pub builder_deposits: BuilderDepositRequests,
     #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub builder_exits: BuilderExitRequests,
+    /// EIP-8483's two request lists, or `None` on a pre-EIP-8483 value.
+    /// Flattened, so the JSON object carries the specification's field
+    /// names directly; an object without them deserializes to `None`.
+    #[serde(flatten)]
+    pub pq_registrations: Option<super::eip8483::PQRegistrationRequests>,
+}
+
+/// The fixed part of a gloas or heze [`ExecutionRequests`]: one offset for
+/// each of its five lists.
+pub const FIVE_FIELD_REQUESTS_FIXED_LEN: usize = 5 * BYTES_PER_LENGTH_OFFSET;
+
+/// The fixed part of an EIP-8483 [`ExecutionRequests`]: one offset for each
+/// of its seven lists.
+pub const SEVEN_FIELD_REQUESTS_FIXED_LEN: usize = 7 * BYTES_PER_LENGTH_OFFSET;
+
+impl ExecutionRequests {
+    /// The empty requests in the shape `fork` uses: seven empty lists from
+    /// EIP-8483 on, five before it.
+    pub fn empty(fork: ForkName) -> Self {
+        Self {
+            pq_registrations: fork
+                .has_pq_registrations()
+                .then(super::eip8483::PQRegistrationRequests::default),
+            ..Self::default()
+        }
+    }
+
+    /// This value in `fork`'s shape, for a block body carrying its parent's
+    /// requests: from EIP-8483 on, a pre-EIP-8483 value gains EIP-8483's two
+    /// lists, empty (a pre-fork payload produced none), which is what the
+    /// first EIP-8483 block carries for a FULL heze parent. A value already
+    /// carrying them is returned as is, even for an earlier `fork`: dropping
+    /// requests is never right, and the state transition refuses the shape.
+    pub fn into_shape_of(mut self, fork: ForkName) -> Self {
+        if fork.has_pq_registrations() && self.pq_registrations.is_none() {
+            self.pq_registrations = Some(super::eip8483::PQRegistrationRequests::default());
+        }
+        self
+    }
+
+    /// Whether this value has EIP-8483's seven-field shape.
+    pub fn has_pq_registrations(&self) -> bool {
+        self.pq_registrations.is_some()
+    }
+
+    /// Whether this value has the shape `fork` uses.
+    pub fn has_shape_of(&self, fork: ForkName) -> bool {
+        self.has_pq_registrations() == fork.has_pq_registrations()
+    }
+
+    /// Whether every request list, EIP-8483's included, is empty.
+    pub fn is_empty(&self) -> bool {
+        self.deposits.is_empty()
+            && self.withdrawals.is_empty()
+            && self.consolidations.is_empty()
+            && self.builder_deposits.is_empty()
+            && self.builder_exits.is_empty()
+            && self
+                .pq_registrations
+                .as_ref()
+                .is_none_or(super::eip8483::PQRegistrationRequests::is_empty)
+    }
+
+    /// The validator PQ registration requests, empty on a pre-EIP-8483 value.
+    pub fn validator_pq_registrations(&self) -> &[super::eip8483::ValidatorPQRegistrationRequest] {
+        self.pq_registrations
+            .as_ref()
+            .map_or(&[], |pq| &pq.validator_pq_registrations)
+    }
+
+    /// The builder PQ registration requests, empty on a pre-EIP-8483 value.
+    pub fn builder_pq_registrations(&self) -> &[super::eip8483::BuilderPQRegistrationRequest] {
+        self.pq_registrations
+            .as_ref()
+            .map_or(&[], |pq| &pq.builder_pq_registrations)
+    }
+
+    fn fixed_len(&self) -> usize {
+        if self.has_pq_registrations() {
+            SEVEN_FIELD_REQUESTS_FIXED_LEN
+        } else {
+            FIVE_FIELD_REQUESTS_FIXED_LEN
+        }
+    }
+}
+
+impl libssz::SszEncode for ExecutionRequests {
+    fn is_fixed_size() -> bool {
+        false
+    }
+
+    /// Unused for a variable-size container, whose parent writes an offset in
+    /// its place; answered the way the derive would, with the five-field
+    /// fixed part.
+    fn fixed_size() -> usize {
+        FIVE_FIELD_REQUESTS_FIXED_LEN
+    }
+
+    fn encoded_len(&self) -> usize {
+        let pq_len = self.pq_registrations.as_ref().map_or(0, |pq| {
+            pq.validator_pq_registrations.encoded_len() + pq.builder_pq_registrations.encoded_len()
+        });
+        self.fixed_len()
+            + self.deposits.encoded_len()
+            + self.withdrawals.encoded_len()
+            + self.consolidations.encoded_len()
+            + self.builder_deposits.encoded_len()
+            + self.builder_exits.encoded_len()
+            + pq_len
+    }
+
+    fn ssz_append(&self, buf: &mut Vec<u8>) {
+        let mut encoder = libssz::ContainerEncoder::new(buf, self.fixed_len());
+        encoder.append_variable(&self.deposits);
+        encoder.append_variable(&self.withdrawals);
+        encoder.append_variable(&self.consolidations);
+        encoder.append_variable(&self.builder_deposits);
+        encoder.append_variable(&self.builder_exits);
+        if let Some(pq) = &self.pq_registrations {
+            encoder.append_variable(&pq.validator_pq_registrations);
+            encoder.append_variable(&pq.builder_pq_registrations);
+        }
+        encoder.finalize();
+    }
+}
+
+impl libssz::SszDecode for ExecutionRequests {
+    fn is_fixed_size() -> bool {
+        false
+    }
+
+    fn fixed_size() -> usize {
+        FIVE_FIELD_REQUESTS_FIXED_LEN
+    }
+
+    fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, libssz::DecodeError> {
+        let first_offset_bytes =
+            bytes
+                .get(..BYTES_PER_LENGTH_OFFSET)
+                .ok_or(libssz::DecodeError::InvalidByteLength {
+                    expected: FIVE_FIELD_REQUESTS_FIXED_LEN,
+                    got: bytes.len(),
+                })?;
+        let first_offset = u32::from_le_bytes(
+            first_offset_bytes
+                .try_into()
+                .expect("slice of BYTES_PER_LENGTH_OFFSET bytes"),
+        ) as usize;
+        // The first offset is the fixed part's length, which is what tells
+        // the two shapes apart. Anything else is a malformed encoding of
+        // either; report it against the five-field shape, the one a value
+        // had first.
+        let carries_pq_registrations = match first_offset {
+            FIVE_FIELD_REQUESTS_FIXED_LEN => false,
+            SEVEN_FIELD_REQUESTS_FIXED_LEN => true,
+            got => {
+                return Err(libssz::DecodeError::InvalidFirstOffset {
+                    expected: FIVE_FIELD_REQUESTS_FIXED_LEN,
+                    got,
+                });
+            }
+        };
+        let field_count = if carries_pq_registrations { 7 } else { 5 };
+
+        let mut decoder = libssz::ContainerDecoder::new(bytes, first_offset)?;
+        for _ in 0..field_count {
+            decoder.read_variable_offset()?;
+        }
+        let deposits = decoder.decode_variable()?;
+        let withdrawals = decoder.decode_variable()?;
+        let consolidations = decoder.decode_variable()?;
+        let builder_deposits = decoder.decode_variable()?;
+        let builder_exits = decoder.decode_variable()?;
+        let pq_registrations = if carries_pq_registrations {
+            Some(super::eip8483::PQRegistrationRequests {
+                validator_pq_registrations: decoder.decode_variable()?,
+                builder_pq_registrations: decoder.decode_variable()?,
+            })
+        } else {
+            None
+        };
+        Ok(Self {
+            deposits,
+            withdrawals,
+            consolidations,
+            builder_deposits,
+            builder_exits,
+            pq_registrations,
+        })
+    }
+}
+
+impl libssz_merkle::HashTreeRoot for ExecutionRequests {
+    fn hash_tree_root(&self, hasher: &impl libssz_merkle::Sha256Hasher) -> libssz_merkle::Node {
+        let mut chunks = Vec::with_capacity(7);
+        chunks.push(self.deposits.hash_tree_root(hasher));
+        chunks.push(self.withdrawals.hash_tree_root(hasher));
+        chunks.push(self.consolidations.hash_tree_root(hasher));
+        chunks.push(self.builder_deposits.hash_tree_root(hasher));
+        chunks.push(self.builder_exits.hash_tree_root(hasher));
+        if let Some(pq) = &self.pq_registrations {
+            chunks.push(pq.validator_pq_registrations.hash_tree_root(hasher));
+            chunks.push(pq.builder_pq_registrations.hash_tree_root(hasher));
+        }
+        // Every field is active in both shapes, so `active_fields` is as many
+        // ones as there are chunks.
+        let active_fields = vec![true; chunks.len()];
+        let root = libssz_merkle::merkleize_progressive(hasher, &chunks);
+        libssz_merkle::mix_in_active_fields(hasher, &root, &active_fields)
+    }
 }
 
 /// The execution layer's block contents, no longer carried inside
@@ -1012,14 +1236,16 @@ impl BeaconBlockBody {
 
     /// [`Self::empty`] in `fork`'s shape: heze's default bid carries an
     /// all-zero `inclusion_list_bits`, gloas's none (see
-    /// [`ExecutionPayloadBid`]).
+    /// [`ExecutionPayloadBid`]), and EIP-8483's parent requests carry its two
+    /// empty lists (see [`ExecutionRequests::empty`]).
     pub fn empty_at(fork: ForkName) -> Self {
         let mut body = Self::empty();
-        if fork == ForkName::Heze {
+        if fork.is_heze_or_later() {
             body.signed_execution_payload_bid
                 .message
                 .inclusion_list_bits = Some(InclusionListBits::new());
         }
+        body.parent_execution_requests = ExecutionRequests::empty(fork);
         body
     }
 }
@@ -1582,5 +1808,213 @@ mod tests {
         assert!(<PayloadAttestationData as libssz::SszEncode>::is_fixed_size());
         assert!(<PayloadAttestationMessage as libssz::SszEncode>::is_fixed_size());
         assert!(<ProposerPreferences as libssz::SszEncode>::is_fixed_size());
+    }
+
+    // -- ExecutionRequests: the hand-written SSZ against the derive --------
+
+    use super::super::eip8483::{
+        BuilderPQRegistrationRequest, BuilderPQRegistrationRequests, PQRegistrationRequests,
+        ValidatorPQRegistrationRequest, ValidatorPQRegistrationRequests,
+    };
+    use crate::beacon::primitives::Bytes64;
+
+    /// What `#[ssz(progressive_container)]` derives for the five-field
+    /// shape, the derive `ExecutionRequests` itself used before EIP-8483.
+    #[derive(SszEncode, SszDecode, HashTreeRoot)]
+    #[ssz(progressive_container)]
+    struct DerivedFiveFieldRequests {
+        deposits: DepositRequests,
+        withdrawals: WithdrawalRequests,
+        consolidations: ConsolidationRequests,
+        builder_deposits: BuilderDepositRequests,
+        builder_exits: BuilderExitRequests,
+    }
+
+    /// What the derive produces for EIP-8483's seven-field shape
+    /// (`active_fields(width=7)`).
+    #[derive(SszEncode, SszDecode, HashTreeRoot)]
+    #[ssz(progressive_container)]
+    struct DerivedSevenFieldRequests {
+        deposits: DepositRequests,
+        withdrawals: WithdrawalRequests,
+        consolidations: ConsolidationRequests,
+        builder_deposits: BuilderDepositRequests,
+        builder_exits: BuilderExitRequests,
+        validator_pq_registrations: ValidatorPQRegistrationRequests,
+        builder_pq_registrations: BuilderPQRegistrationRequests,
+    }
+
+    /// Requests with at least one entry in every five-field list, so a
+    /// field encoded in the wrong slot changes the bytes.
+    fn sample_requests() -> ExecutionRequests {
+        ExecutionRequests {
+            deposits: vec![DepositRequest {
+                pubkey: BlsPubkey([1; 48]),
+                withdrawal_credentials: Bytes32::repeat_byte(2),
+                amount: 3,
+                signature: BlsSignature([4; 96]),
+                index: 5,
+            }]
+            .into(),
+            withdrawals: vec![
+                WithdrawalRequest {
+                    source_address: ExecutionAddress::from_slice(&[6; 20]),
+                    validator_pubkey: BlsPubkey([7; 48]),
+                    amount: 8,
+                };
+                2
+            ]
+            .into(),
+            consolidations: vec![ConsolidationRequest {
+                source_address: ExecutionAddress::from_slice(&[9; 20]),
+                source_pubkey: BlsPubkey([10; 48]),
+                target_pubkey: BlsPubkey([11; 48]),
+            }]
+            .into(),
+            builder_deposits: vec![BuilderDepositRequest::default(); 3].into(),
+            builder_exits: vec![BuilderExitRequest::default()].into(),
+            pq_registrations: None,
+        }
+    }
+
+    fn sample_pq_registrations() -> PQRegistrationRequests {
+        PQRegistrationRequests {
+            validator_pq_registrations: vec![
+                ValidatorPQRegistrationRequest {
+                    source_address: ExecutionAddress::from_slice(&[12; 20]),
+                    validator_pubkey: BlsPubkey([13; 48]),
+                    pq_data: Bytes64([14; 64]),
+                };
+                2
+            ]
+            .into(),
+            builder_pq_registrations: vec![BuilderPQRegistrationRequest {
+                source_address: ExecutionAddress::from_slice(&[15; 20]),
+                builder_pubkey: BlsPubkey([16; 48]),
+                pq_data: Bytes32::repeat_byte(17),
+            }]
+            .into(),
+        }
+    }
+
+    fn derived_five(requests: &ExecutionRequests) -> DerivedFiveFieldRequests {
+        assert!(!requests.has_pq_registrations());
+        DerivedFiveFieldRequests {
+            deposits: requests.deposits.clone(),
+            withdrawals: requests.withdrawals.clone(),
+            consolidations: requests.consolidations.clone(),
+            builder_deposits: requests.builder_deposits.clone(),
+            builder_exits: requests.builder_exits.clone(),
+        }
+    }
+
+    fn derived_seven(requests: &ExecutionRequests) -> DerivedSevenFieldRequests {
+        let pq = requests
+            .pq_registrations
+            .clone()
+            .expect("a seven-field value");
+        DerivedSevenFieldRequests {
+            deposits: requests.deposits.clone(),
+            withdrawals: requests.withdrawals.clone(),
+            consolidations: requests.consolidations.clone(),
+            builder_deposits: requests.builder_deposits.clone(),
+            builder_exits: requests.builder_exits.clone(),
+            validator_pq_registrations: pq.validator_pq_registrations,
+            builder_pq_registrations: pq.builder_pq_registrations,
+        }
+    }
+
+    #[test]
+    fn five_field_requests_encode_and_merkleize_as_the_derive_did() {
+        for requests in [ExecutionRequests::default(), sample_requests()] {
+            let derived = derived_five(&requests);
+            assert_eq!(requests.to_ssz(), derived.to_ssz());
+            assert_eq!(requests.encoded_len(), derived.to_ssz().len());
+            assert_eq!(requests.hash_tree_root(), derived.hash_tree_root());
+
+            let decoded = ExecutionRequests::from_ssz_bytes(&derived.to_ssz()).unwrap();
+            assert_eq!(decoded, requests);
+            assert!(!decoded.has_pq_registrations());
+        }
+    }
+
+    #[test]
+    fn seven_field_requests_encode_and_merkleize_as_the_derive_would() {
+        let empty_pq = ExecutionRequests {
+            pq_registrations: Some(PQRegistrationRequests::default()),
+            ..ExecutionRequests::default()
+        };
+        let full = ExecutionRequests {
+            pq_registrations: Some(sample_pq_registrations()),
+            ..sample_requests()
+        };
+        for requests in [empty_pq, full] {
+            let derived = derived_seven(&requests);
+            assert_eq!(requests.to_ssz(), derived.to_ssz());
+            assert_eq!(requests.encoded_len(), derived.to_ssz().len());
+            assert_eq!(requests.hash_tree_root(), derived.hash_tree_root());
+
+            let decoded = ExecutionRequests::from_ssz_bytes(&derived.to_ssz()).unwrap();
+            assert_eq!(decoded, requests);
+            assert!(decoded.has_pq_registrations());
+        }
+    }
+
+    /// The shapes differ in encoding and root even with every list empty,
+    /// which is why "no requests" has to be built for a fork
+    /// ([`ExecutionRequests::empty`]) rather than through `Default`.
+    #[test]
+    fn empty_requests_of_the_two_shapes_differ() {
+        let five = ExecutionRequests::default();
+        let seven = ExecutionRequests {
+            pq_registrations: Some(PQRegistrationRequests::default()),
+            ..ExecutionRequests::default()
+        };
+        assert!(five.is_empty() && seven.is_empty());
+        assert_ne!(five, seven);
+        assert_eq!(five.to_ssz().len(), FIVE_FIELD_REQUESTS_FIXED_LEN);
+        assert_eq!(seven.to_ssz().len(), SEVEN_FIELD_REQUESTS_FIXED_LEN);
+        assert_ne!(five.hash_tree_root(), seven.hash_tree_root());
+    }
+
+    #[test]
+    fn a_first_offset_of_neither_shape_is_refused() {
+        let mut bytes = ExecutionRequests::default().to_ssz();
+        bytes[..4].copy_from_slice(&24u32.to_le_bytes());
+        bytes.extend([0; 4]);
+        assert!(ExecutionRequests::from_ssz_bytes(&bytes).is_err());
+        assert!(ExecutionRequests::from_ssz_bytes(&[]).is_err());
+    }
+
+    /// The Beacon API's JSON names EIP-8483's lists only on a seven-field
+    /// value, and reads an object without them back as the five-field shape.
+    #[test]
+    fn requests_json_carries_the_pq_lists_only_in_the_seven_field_shape() {
+        let five = sample_requests();
+        let json = serde_json::to_value(&five).unwrap();
+        assert!(json.get("validator_pq_registrations").is_none());
+        assert!(json.get("builder_pq_registrations").is_none());
+        let back: ExecutionRequests = serde_json::from_value(json).unwrap();
+        assert_eq!(back, five);
+
+        let seven = ExecutionRequests {
+            pq_registrations: Some(sample_pq_registrations()),
+            ..sample_requests()
+        };
+        let json = serde_json::to_value(&seven).unwrap();
+        assert_eq!(
+            json["validator_pq_registrations"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(
+            json["builder_pq_registrations"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            json["validator_pq_registrations"][0]["pq_data"],
+            format!("0x{}", "0e".repeat(64))
+        );
+        let back: ExecutionRequests = serde_json::from_value(json).unwrap();
+        assert_eq!(back, seven);
     }
 }

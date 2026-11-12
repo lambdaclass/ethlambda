@@ -80,6 +80,8 @@ pub const BLS_PUBKEY_SIZE: usize = 48;
 pub const BLS_SIGNATURE_SIZE: usize = 96;
 /// The number of bytes in a KZG commitment or proof, both compressed G1 points.
 pub const KZG_POINT_SIZE: usize = 48;
+/// The number of bytes in a [`Bytes64`].
+pub const BYTES64_SIZE: usize = 64;
 
 /// Formats a fixed-length byte string as `Name(0xabcd…)`.
 ///
@@ -416,6 +418,51 @@ impl fmt::Debug for BlsSignature {
     }
 }
 
+/// 64 bytes with no further meaning attached, the specification's `Bytes64`.
+///
+/// Introduced for EIP-8483's validator post-quantum material, which the
+/// consensus layer treats as two independent 32-byte halves (each must be
+/// unique across every registration), so [`Self::first_half`] and
+/// [`Self::second_half`] name them. Merkleizes as two chunks, like any
+/// `Vector[uint8, 64]`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, SszEncode, SszDecode, HashTreeRoot)]
+#[ssz(transparent)]
+pub struct Bytes64(pub [u8; BYTES64_SIZE]);
+
+impl Bytes64 {
+    /// Bytes `0..32`, the specification's `pq_data[:32]`.
+    pub fn first_half(&self) -> &[u8; 32] {
+        self.0[..32]
+            .try_into()
+            .expect("a 64-byte array splits into two 32-byte halves")
+    }
+
+    /// Bytes `32..64`, the specification's `pq_data[32:]`.
+    pub fn second_half(&self) -> &[u8; 32] {
+        self.0[32..]
+            .try_into()
+            .expect("a 64-byte array splits into two 32-byte halves")
+    }
+}
+
+impl Default for Bytes64 {
+    fn default() -> Self {
+        Self([0; BYTES64_SIZE])
+    }
+}
+
+impl AsRef<[u8]> for Bytes64 {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Bytes64 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        debug_byte_vector(f, "Bytes64", &self.0)
+    }
+}
+
 /// A KZG commitment to a blob.
 ///
 /// The same width as [`KzgProof`] and as [`BlsPubkey`], and a separate type from
@@ -498,7 +545,14 @@ macro_rules! impl_hex_serialize {
     };
 }
 
-impl_hex_serialize!(H160, BlsPubkey, BlsSignature, KzgCommitment, KzgProof);
+impl_hex_serialize!(
+    H160,
+    BlsPubkey,
+    BlsSignature,
+    Bytes64,
+    KzgCommitment,
+    KzgProof
+);
 
 /// The `Deserialize` counterpart of [`impl_hex_serialize`], for the types the
 /// Beacon API accepts in a request body: a validator's public key (as a
@@ -521,7 +575,14 @@ macro_rules! impl_hex_deserialize {
     };
 }
 
-impl_hex_deserialize!(BlsPubkey, BlsSignature, H160, KzgCommitment, KzgProof);
+impl_hex_deserialize!(
+    BlsPubkey,
+    BlsSignature,
+    Bytes64,
+    H160,
+    KzgCommitment,
+    KzgProof
+);
 
 #[cfg(test)]
 mod tests {

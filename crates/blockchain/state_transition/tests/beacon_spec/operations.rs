@@ -129,7 +129,7 @@
 use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::config::Config;
 use ethlambda_state_transition::beacon::containers::{
-    BeaconState, altair, bellatrix, capella, deneb, electra, gloas, heze, phase0, shared,
+    BeaconState, altair, bellatrix, capella, deneb, eip8483, electra, gloas, heze, phase0, shared,
 };
 use ethlambda_state_transition::beacon::helpers::accessors::{ActiveBalanceCache, CommitteeCache};
 use ethlambda_state_transition::beacon::primitives::{HashTreeRoot as _, Slot};
@@ -137,6 +137,7 @@ use ethlambda_state_transition::beacon::stf::altair as altair_stf;
 use ethlambda_state_transition::beacon::stf::bellatrix as bellatrix_stf;
 use ethlambda_state_transition::beacon::stf::capella as capella_stf;
 use ethlambda_state_transition::beacon::stf::deneb as deneb_stf;
+use ethlambda_state_transition::beacon::stf::eip8483 as eip8483_stf;
 use ethlambda_state_transition::beacon::stf::electra as electra_stf;
 use ethlambda_state_transition::beacon::stf::fulu as fulu_stf;
 use ethlambda_state_transition::beacon::stf::gloas as gloas_stf;
@@ -266,7 +267,8 @@ fn apply(
             }
             // Heze's block differs only in a body without `eth1_data` and
             // `deposits` (EIP-8015), which the header's `body_root` commits to.
-            ForkName::Heze => {
+            // EIP-8483's is heze's container.
+            ForkName::Heze | ForkName::Eip8483 => {
                 let block: heze::BeaconBlock = case.ssz("block");
                 block::process_block_header(
                     state,
@@ -314,7 +316,7 @@ fn apply(
             // accounting, EIP-7732), so this reads the case's own `meta.yaml`
             // for `parent_slot` rather than only the operation file every
             // other fork's arm reads.
-            ForkName::Gloas | ForkName::Heze => {
+            ForkName::Gloas | ForkName::Heze | ForkName::Eip8483 => {
                 let attestation: gloas::Attestation = case.ssz("attestation");
                 let meta: AttestationMeta = case.yaml("meta");
                 gloas_stf::process_attestation(
@@ -349,7 +351,7 @@ fn apply(
             // Gloas's container widens again (EIP-7688's unbounded
             // `AttestingIndices`); the function is still not behaviorally
             // modified, only transcribed against gloas's own type.
-            ForkName::Gloas | ForkName::Heze => {
+            ForkName::Gloas | ForkName::Heze | ForkName::Eip8483 => {
                 let slashing: gloas::AttesterSlashing = case.ssz("attester_slashing");
                 gloas_stf::process_attester_slashing(state, &slashing, config)
             }
@@ -371,7 +373,7 @@ fn apply(
                 | ForkName::Deneb
                 | ForkName::Electra
                 | ForkName::Fulu => operations::process_proposer_slashing(state, &slashing, config),
-                ForkName::Gloas | ForkName::Heze => {
+                ForkName::Gloas | ForkName::Heze | ForkName::Eip8483 => {
                     gloas_stf::process_proposer_slashing(state, &slashing, config)
                 }
                 ForkName::Lean => lean_is_not_a_fixture_fork("proposer_slashing"),
@@ -403,7 +405,7 @@ fn apply(
                 let deposit: shared::Deposit = case.ssz("deposit");
                 electra_stf::process_deposit(state, &deposit, config)
             }
-            ForkName::Gloas | ForkName::Heze => Err(
+            ForkName::Gloas | ForkName::Heze | ForkName::Eip8483 => Err(
                 ethlambda_state_transition::beacon::Error::UnsupportedForFork {
                     function: "deposit",
                     fork: ForkName::Gloas,
@@ -435,7 +437,11 @@ fn apply(
             // limits are read by `crate::beacon::helpers::electra::compute_exit_epoch_and_update_churn`
             // dispatching on the state's own fork, not by a gloas copy of
             // `process_voluntary_exit`; see that function's own doc).
-            ForkName::Electra | ForkName::Fulu | ForkName::Gloas | ForkName::Heze => {
+            ForkName::Electra
+            | ForkName::Fulu
+            | ForkName::Gloas
+            | ForkName::Heze
+            | ForkName::Eip8483 => {
                 let exit: shared::SignedVoluntaryExit = case.ssz("voluntary_exit");
                 electra_stf::process_voluntary_exit(state, &exit, config)
             }
@@ -514,7 +520,7 @@ fn apply(
                         "execution_payload has no handler for fork `{fork}`"
                     ));
                 }
-                ForkName::Gloas | ForkName::Heze => Err(
+                ForkName::Gloas | ForkName::Heze | ForkName::Eip8483 => Err(
                     ethlambda_state_transition::beacon::Error::UnsupportedForFork {
                         function: "execution_payload",
                         fork: ForkName::Gloas,
@@ -564,7 +570,9 @@ fn apply(
             // its `payload` parameter entirely, since withdrawals are now
             // deterministic from the state alone. This is the one fork whose
             // arm reads no operation file at all.
-            ForkName::Gloas | ForkName::Heze => gloas_stf::process_withdrawals(state),
+            ForkName::Gloas | ForkName::Heze | ForkName::Eip8483 => {
+                gloas_stf::process_withdrawals(state)
+            }
             ForkName::Lean => lean_is_not_a_fixture_fork("withdrawals"),
         },
         // New in gloas (EIP-7732): the block's binding commitment to a
@@ -577,7 +585,7 @@ fn apply(
         // previous slot's payload, so the fixture's operation file is a whole
         // `BeaconBlock`, named `block` like `block_header`'s.
         "parent_execution_payload" => match case.fork {
-            ForkName::Heze => {
+            ForkName::Heze | ForkName::Eip8483 => {
                 let block: heze::BeaconBlock = case.ssz("block");
                 let body = &block.body;
                 gloas_stf::process_parent_execution_payload(
@@ -625,7 +633,7 @@ fn apply(
         // so far, since pyspec's own genesis for both already sets that
         // field, but it is not the function either fork's specification names.
         "deposit_request" => match case.fork {
-            ForkName::Fulu | ForkName::Gloas | ForkName::Heze => {
+            ForkName::Fulu | ForkName::Gloas | ForkName::Heze | ForkName::Eip8483 => {
                 let request: electra::DepositRequest = case.ssz("deposit_request");
                 fulu_stf::process_deposit_request(state, &request)
             }
@@ -655,6 +663,30 @@ fn apply(
         "builder_exit_request" => {
             let request: gloas::BuilderExitRequest = case.ssz("builder_exit_request");
             gloas_stf::process_builder_exit_request(state, &request, config)
+        }
+        // New in EIP-8483 (consensus-specs #5809). The validator handler also
+        // runs the batched path `apply_parent_execution_payload` uses, from
+        // the same pre-state, and fails the case if the two disagree.
+        "validator_pq_registration_request" => {
+            let request: eip8483::ValidatorPQRegistrationRequest =
+                case.ssz("validator_pq_registration_request");
+            let mut batched = state.clone();
+            let outcome = eip8483_stf::process_validator_pq_registration_request(state, &request);
+            eip8483_stf::process_validator_pq_registration_requests(&mut batched, &[request])
+                .map_err(|err| format!("the batched path failed: {err:?}"))?;
+            state.apply_pending_mutations();
+            batched.apply_pending_mutations();
+            if *state != batched {
+                return Err(
+                    "the batched path disagrees with the specification's function".to_string(),
+                );
+            }
+            outcome
+        }
+        "builder_pq_registration_request" => {
+            let request: eip8483::BuilderPQRegistrationRequest =
+                case.ssz("builder_pq_registration_request");
+            eip8483_stf::process_builder_pq_registration_request(state, &request)
         }
         // New in gloas (EIP-7732): the payload timeliness committee's vote on
         // whether the *previous* slot's payload showed up on time.
@@ -709,6 +741,7 @@ fn every_shipped_handler_is_dispatched() -> Result<(), Failed> {
         "bls_to_execution_change",
         "builder_deposit_request",
         "builder_exit_request",
+        "builder_pq_registration_request",
         "consolidation_request",
         "deposit",
         "deposit_request",
@@ -718,6 +751,7 @@ fn every_shipped_handler_is_dispatched() -> Result<(), Failed> {
         "payload_attestation",
         "proposer_slashing",
         "sync_aggregate",
+        "validator_pq_registration_request",
         "voluntary_exit",
         "voluntary_exit_churn",
         "withdrawal_request",

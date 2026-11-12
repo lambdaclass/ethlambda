@@ -289,7 +289,7 @@ fn decode_signed_aggregate(case: &Case, name: &str) -> Result<SignedAggregateAnd
             electra::SignedAggregateAndProof::from_ssz_bytes(&bytes)
                 .map_err(|err| format!("decoding {name}: {err:?}"))?,
         )),
-        ForkName::Gloas | ForkName::Heze => Ok(SignedAggregateAndProof::Gloas(
+        ForkName::Gloas | ForkName::Heze | ForkName::Eip8483 => Ok(SignedAggregateAndProof::Gloas(
             gloas::SignedAggregateAndProof::from_ssz_bytes(&bytes)
                 .map_err(|err| format!("decoding {name}: {err:?}"))?,
         )),

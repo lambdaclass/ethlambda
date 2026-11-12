@@ -95,7 +95,8 @@ pub fn process_operations(
         | ForkName::Electra
         | ForkName::Fulu
         | ForkName::Gloas
-        | ForkName::Heze) => {
+        | ForkName::Heze
+        | ForkName::Eip8483) => {
             return Err(Error::UnsupportedForFork {
                 function: "process_operations",
                 fork,
@@ -503,7 +504,11 @@ pub fn add_validator_to_registry(
         // are progressive rather than `SszList` (see `BeaconState::altair_validator_lists`'s
         // own documentation), so it is refused for both reasons rather than
         // folded into either branch above.
-        fork @ (ForkName::Electra | ForkName::Fulu | ForkName::Gloas | ForkName::Heze) => {
+        fork @ (ForkName::Electra
+        | ForkName::Fulu
+        | ForkName::Gloas
+        | ForkName::Heze
+        | ForkName::Eip8483) => {
             return Err(Error::UnsupportedForFork {
                 function: "add_validator_to_registry",
                 fork,

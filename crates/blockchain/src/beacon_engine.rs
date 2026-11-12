@@ -21,7 +21,6 @@
 
 use ethlambda_engine::types::PayloadStatusValue;
 use ethlambda_engine::{EngineClient, EngineError, PayloadStatusV1, PayloadStatusV2};
-use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::containers::{self, SignedBeaconBlock};
 use ethlambda_state_transition::beacon::fork_choice::PayloadValidity;
 use ethlambda_state_transition::beacon::primitives::{Bytes32, Root};
@@ -131,6 +130,7 @@ pub fn new_payload_request(block: &SignedBeaconBlock) -> Option<NewPayloadReques
         | SignedBeaconBlock::Deneb(_)
         | SignedBeaconBlock::Gloas(_)
         | SignedBeaconBlock::Heze(_)
+        | SignedBeaconBlock::Eip8483(_)
         | SignedBeaconBlock::Lean(_) => return None,
     };
 
@@ -221,7 +221,7 @@ pub async fn ask_envelope_status(
     inclusion_list_transactions: &[Vec<u8>],
 ) -> Result<PayloadStatusV2, EngineError> {
     let request = gloas_new_payload_request(block, envelope)?;
-    if block.fork_name() == ForkName::Heze {
+    if block.fork_name().is_heze_or_later() {
         return client
             .new_payload_v6(
                 request.execution_payload,

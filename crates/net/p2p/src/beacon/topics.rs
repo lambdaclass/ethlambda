@@ -310,8 +310,9 @@ impl BeaconTopics {
                 column_subnets,
                 attestation_subnets,
             ),
-            // Heze adds the inclusion list topic to gloas's.
-            ForkName::Heze => Self::with_extra_kinds(
+            // Heze adds the inclusion list topic to gloas's. EIP-8483 adds
+            // none of its own.
+            ForkName::Heze | ForkName::Eip8483 => Self::with_extra_kinds(
                 fork_digest,
                 &HEZE_TOPIC_KINDS,
                 column_subnets,

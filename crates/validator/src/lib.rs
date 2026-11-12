@@ -846,7 +846,7 @@ async fn refresh_inclusion_lists<B: BeaconNodeApi>(
     context: &SigningContext,
 ) {
     for target in [epoch, epoch + 1] {
-        if context.config.fork_at_epoch(target) != ethlambda_types::beacon::fork::ForkName::Heze {
+        if !context.config.fork_at_epoch(target).is_heze_or_later() {
             continue;
         }
         if let Err(err) = duties.refresh_inclusion_lists(target).await {

@@ -222,12 +222,22 @@ pub fn decode_data_column_sidecar(
     DataColumnSidecar::from_ssz(fork, bytes).map_err(|_| DecodeError::Ssz)
 }
 
-/// Decode an `execution_payload` payload. The topic exists from gloas on, so
-/// the container needs no fork lookup.
+/// Decode an `execution_payload` payload under `fork`, the topic digest's.
+/// The topic exists from gloas on and every fork since shares the container,
+/// but its `execution_requests` takes `fork`'s shape (EIP-8483's carry two
+/// more lists, see `gloas::ExecutionRequests`), which the specification's
+/// typed decoder would enforce, so an envelope of the other shape fails like
+/// any malformed payload.
 pub fn decode_execution_payload_envelope(
+    fork: ForkName,
     bytes: &[u8],
 ) -> Result<gloas::SignedExecutionPayloadEnvelope, DecodeError> {
-    gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(bytes).map_err(|_| DecodeError::Ssz)
+    let envelope = gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(bytes)
+        .map_err(|_| DecodeError::Ssz)?;
+    if !envelope.message.execution_requests.has_shape_of(fork) {
+        return Err(DecodeError::Ssz);
+    }
+    Ok(envelope)
 }
 
 /// Decode a `payload_attestation_message` payload. Gloas on, like
@@ -295,8 +305,10 @@ pub fn decode_aggregate_and_proof(
         }
         // Electra's bytes, but a progressive `Attestation` (EIP-7688), so the
         // root the aggregator signs differs; `data.index` is the payload flag.
-        ForkName::Gloas | ForkName::Heze => gloas::SignedAggregateAndProof::from_ssz_bytes(bytes)
-            .map(SignedAggregateAndProof::Gloas),
+        ForkName::Gloas | ForkName::Heze | ForkName::Eip8483 => {
+            gloas::SignedAggregateAndProof::from_ssz_bytes(bytes)
+                .map(SignedAggregateAndProof::Gloas)
+        }
         ForkName::Phase0
         | ForkName::Altair
         | ForkName::Bellatrix
@@ -348,7 +360,11 @@ pub fn decode_attestation(fork: ForkName, bytes: &[u8]) -> Result<Attestation, D
     match fork {
         // Gloas's `SingleAttestation` has electra's bytes; its `data.index`
         // carries the payload flag, which the gossip rules read.
-        ForkName::Electra | ForkName::Fulu | ForkName::Gloas | ForkName::Heze => {
+        ForkName::Electra
+        | ForkName::Fulu
+        | ForkName::Gloas
+        | ForkName::Heze
+        | ForkName::Eip8483 => {
             electra::SingleAttestation::from_ssz_bytes(bytes).map(Attestation::Electra)
         }
         ForkName::Phase0
@@ -385,7 +401,7 @@ pub fn decode_gossip(
                 ForkName::Electra | ForkName::Fulu => {
                     electra::AttesterSlashing::from_ssz_bytes(bytes).map(AttesterSlashing::Electra)
                 }
-                ForkName::Gloas | ForkName::Heze => {
+                ForkName::Gloas | ForkName::Heze | ForkName::Eip8483 => {
                     gloas::AttesterSlashing::from_ssz_bytes(bytes).map(AttesterSlashing::Gloas)
                 }
                 ForkName::Phase0
@@ -738,9 +754,15 @@ mod tests {
     fn an_execution_payload_envelope_round_trips() {
         let envelope = crate::test_support::envelope(5, 9);
         let bytes = envelope.to_ssz();
-        assert_eq!(decode_execution_payload_envelope(&bytes), Ok(envelope));
-        assert!(decode_execution_payload_envelope(&bytes[..bytes.len() - 1]).is_err());
-        assert!(decode_execution_payload_envelope(&[0xff; 3]).is_err());
+        let gloas = ForkName::Gloas;
+        assert_eq!(
+            decode_execution_payload_envelope(gloas, &bytes),
+            Ok(envelope)
+        );
+        assert!(decode_execution_payload_envelope(gloas, &bytes[..bytes.len() - 1]).is_err());
+        assert!(decode_execution_payload_envelope(gloas, &[0xff; 3]).is_err());
+        // A five-field envelope on an EIP-8483 topic has another fork's shape.
+        assert!(decode_execution_payload_envelope(ForkName::Eip8483, &bytes).is_err());
     }
 
     #[test]

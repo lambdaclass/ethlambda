@@ -290,9 +290,13 @@ fn submission_fork(headers: &HeaderMap) -> Result<ForkName, ApiError> {
         .and_then(|value| value.to_str().ok())
         .and_then(ForkName::parse);
     match fork {
-        Some(fork @ (ForkName::Electra | ForkName::Fulu | ForkName::Gloas | ForkName::Heze)) => {
-            Ok(fork)
-        }
+        Some(
+            fork @ (ForkName::Electra
+            | ForkName::Fulu
+            | ForkName::Gloas
+            | ForkName::Heze
+            | ForkName::Eip8483),
+        ) => Ok(fork),
         // `ForkName::parse` never returns Lean: it is absent from `ALL`.
         Some(
             ForkName::Phase0

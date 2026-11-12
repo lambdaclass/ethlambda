@@ -518,12 +518,19 @@ impl SeenBlockColumns {
 /// reject a block that import accepts.
 ///
 /// Shared by [`block`] (a block's parent execution requests) and [`envelope`].
+///
+/// EIP-8483 (`specs/_features/eip8483/p2p-interface.md`) adds its two PQ
+/// registration lists, empty on a pre-EIP-8483 value and so always within.
 pub(crate) fn execution_requests_within_limits(requests: &gloas::ExecutionRequests) -> bool {
     requests.withdrawals.len() <= preset::MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD
         && requests.consolidations.len() <= preset::MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD
         && requests.builder_deposits.len() as u64
             <= preset::MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD
         && requests.builder_exits.len() as u64 <= preset::MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD
+        && requests.validator_pq_registrations().len() as u64
+            <= preset::MAX_VALIDATOR_PQ_REGISTRATION_REQUESTS_PER_PAYLOAD
+        && requests.builder_pq_registrations().len() as u64
+            <= preset::MAX_BUILDER_PQ_REGISTRATION_REQUESTS_PER_PAYLOAD
 }
 
 /// The specification's `compute_time_at_slot_ms`: the clock reading at the
@@ -599,7 +606,7 @@ pub(crate) fn is_current_or_previous_epoch(config: &Config, epoch: Epoch, now_ms
 /// (A gloas aggregate has its own container, which says so itself.)
 pub(crate) fn is_gloas_slot(config: &Config, slot: Slot) -> bool {
     match config.fork_at_epoch(compute_epoch_at_slot(slot)) {
-        ForkName::Gloas | ForkName::Heze => true,
+        ForkName::Gloas | ForkName::Heze | ForkName::Eip8483 => true,
         ForkName::Phase0
         | ForkName::Altair
         | ForkName::Bellatrix

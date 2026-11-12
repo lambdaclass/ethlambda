@@ -421,6 +421,13 @@ where
         }
         let envelope = SignedExecutionPayloadEnvelope::from_ssz_bytes(payload)
             .map_err(|err| invalid(format!("execution payload envelope chunk: {err:?}")))?;
+        // The requests take the context fork's shape (EIP-8483's carry two
+        // more lists); the slot check below then ties that fork to the payload.
+        if !fork.is_some_and(|fork| envelope.message.execution_requests.has_shape_of(fork)) {
+            return Err(invalid(
+                "execution payload envelope chunk's requests have another fork's shape".to_string(),
+            ));
+        }
         let slot = envelope.message.payload.slot_number;
         let expected = schedule.digest_at(slot / preset::SLOTS_PER_EPOCH);
         if context != expected {
@@ -523,7 +530,7 @@ where
 /// lean sorts after every beacon fork but has none.
 fn carries_inclusion_lists(fork: ForkName) -> bool {
     match fork {
-        ForkName::Heze => true,
+        ForkName::Heze | ForkName::Eip8483 => true,
         ForkName::Phase0
         | ForkName::Altair
         | ForkName::Bellatrix

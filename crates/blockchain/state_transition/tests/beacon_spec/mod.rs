@@ -164,7 +164,7 @@ pub fn fixture_active_config() -> Config {
 /// still need its own edit to *map* a fork's new or changed handlers to the
 /// right function, since that mapping is specific to each runner; only the gate
 /// is one line.
-pub const HIGHEST_IMPLEMENTED_FORK: ForkName = ForkName::Heze;
+pub const HIGHEST_IMPLEMENTED_FORK: ForkName = ForkName::Eip8483;
 
 /// The root of the extracted fixture tree.
 ///
@@ -439,6 +439,17 @@ fn read_dir_sorted(path: &Path) -> Vec<fs::DirEntry> {
 /// [`HIGHEST_IMPLEMENTED_FORK`] entirely because the gate never sees the case.
 /// So [`fixture_fork_trials`] checks this list against the tree instead.
 pub const UNMODELED_FORKS: &[&str] = &[];
+
+/// Forks this crate implements that no fixture release ships yet.
+///
+/// EIP-8483 comes from consensus-specs #5809, an open pull request, so the
+/// pinned release has no `eip8483` tree. The harness's "every implemented
+/// fork has cases" check skips these rather than failing on an absence that
+/// says nothing about this crate; every runner still runs an `eip8483` case
+/// it finds (vectors generated from that PR and placed in the tree), since
+/// [`HIGHEST_IMPLEMENTED_FORK`] covers the fork. Remove an entry once the
+/// pinned release ships its tree.
+pub const UNRELEASED_FORKS: &[ForkName] = &[ForkName::Eip8483];
 
 /// Panics: a fixture case cannot be a lean case.
 ///

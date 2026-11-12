@@ -149,6 +149,14 @@ impl BeaconBlockBody {
             .inclusion_list_bits = Some(InclusionListBits::new());
         body
     }
+
+    /// [`Self::empty`] for `fork`, heze or EIP-8483, which share this
+    /// container: EIP-8483's parent requests carry its two empty lists.
+    pub fn empty_at(fork: crate::beacon::fork::ForkName) -> Self {
+        let mut body = Self::empty();
+        body.parent_execution_requests = super::gloas::ExecutionRequests::empty(fork);
+        body
+    }
 }
 
 /// Heze's block: gloas's, over [`BeaconBlockBody`].

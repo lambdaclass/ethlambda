@@ -401,6 +401,20 @@ pub const BUILDER_DEPOSIT_REQUEST_TYPE: u8 = 0x03;
 /// request.
 pub const BUILDER_EXIT_REQUEST_TYPE: u8 = 0x04;
 
+/// The first byte identifying an execution layer request as a validator
+/// post-quantum registration request (EIP-8483).
+///
+/// The value follows consensus-specs #5809 (`0x05`), not the EIP text, which
+/// still says `0x06`: the two drafts disagree, and the consensus layer's own
+/// specification is the one this crate implements. The execution client must
+/// use the same byte.
+pub const VALIDATOR_PQ_REGISTRATION_REQUEST_TYPE: u8 = 0x05;
+/// The first byte identifying an execution layer request as a builder
+/// post-quantum registration request (EIP-8483). `0x06` per consensus-specs
+/// #5809; the EIP text says `0x07`. See
+/// [`VALIDATOR_PQ_REGISTRATION_REQUEST_TYPE`].
+pub const BUILDER_PQ_REGISTRATION_REQUEST_TYPE: u8 = 0x06;
+
 /// Index into `store.block_timeliness[root]` for whether the block itself
 /// arrived before the (ordinary) attestation deadline: the one deadline every
 /// fork before gloas checked, and still what `is_head_late` reads. See

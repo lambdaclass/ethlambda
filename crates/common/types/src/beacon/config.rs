@@ -327,6 +327,16 @@ pub struct Config {
     /// is not scheduled.
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub heze_fork_epoch: Epoch,
+    /// The `Fork.current_version` an EIP-8483 block or attestation signs
+    /// under. EIP-8483 is a feature fork on heze with its own schedule
+    /// (consensus-specs #5809); a `config.yaml` without the key leaves it
+    /// unscheduled.
+    #[serde(with = "crate::beacon::serde_helpers::hex_array")]
+    pub eip8483_fork_version: Version,
+    /// The epoch EIP-8483 activates at, or [`constants::FAR_FUTURE_EPOCH`]
+    /// if it is not scheduled.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub eip8483_fork_epoch: Epoch,
 
     // -- Time parameters ---------------------------------------------------
     /// Wall-clock seconds per slot. Deprecated in favor of
@@ -760,6 +770,8 @@ impl Config {
             gloas_fork_epoch: constants::FAR_FUTURE_EPOCH,
             heze_fork_version: [0x08, 0x00, 0x00, 0x00],
             heze_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            eip8483_fork_version: [0xe8, 0x48, 0x30, 0x00],
+            eip8483_fork_epoch: constants::FAR_FUTURE_EPOCH,
 
             seconds_per_slot: 12,
             slot_duration_ms: 12_000,
@@ -903,6 +915,8 @@ impl Config {
             gloas_fork_epoch: constants::FAR_FUTURE_EPOCH,
             heze_fork_version: [0x08, 0x00, 0x00, 0x01],
             heze_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            eip8483_fork_version: [0xe8, 0x48, 0x30, 0x01],
+            eip8483_fork_epoch: constants::FAR_FUTURE_EPOCH,
 
             seconds_per_slot: 6,
             slot_duration_ms: 6_000,
@@ -1036,6 +1050,7 @@ impl Config {
             fulu_fork_epoch: constants::FAR_FUTURE_EPOCH,
             gloas_fork_epoch: constants::FAR_FUTURE_EPOCH,
             heze_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            eip8483_fork_epoch: constants::FAR_FUTURE_EPOCH,
             ..Config::mainnet()
         }
     }
@@ -1224,6 +1239,7 @@ impl Config {
             ForkName::Fulu => self.fulu_fork_version,
             ForkName::Gloas => self.gloas_fork_version,
             ForkName::Heze => self.heze_fork_version,
+            ForkName::Eip8483 => self.eip8483_fork_version,
             ForkName::Lean => lean_fork_unreachable("Config::fork_version"),
         }
     }
@@ -1243,6 +1259,7 @@ impl Config {
             ForkName::Fulu => self.fulu_fork_epoch,
             ForkName::Gloas => self.gloas_fork_epoch,
             ForkName::Heze => self.heze_fork_epoch,
+            ForkName::Eip8483 => self.eip8483_fork_epoch,
             ForkName::Lean => lean_fork_unreachable("Config::fork_epoch"),
         }
     }
@@ -1269,6 +1286,7 @@ impl Config {
             ForkName::Fulu => self.fulu_fork_epoch = epoch,
             ForkName::Gloas => self.gloas_fork_epoch = epoch,
             ForkName::Heze => self.heze_fork_epoch = epoch,
+            ForkName::Eip8483 => self.eip8483_fork_epoch = epoch,
             ForkName::Lean => lean_fork_unreachable("Config::with_fork_epoch"),
         }
         self
@@ -1287,6 +1305,7 @@ impl Config {
             ForkName::Fulu => self.fulu_fork_version = version,
             ForkName::Gloas => self.gloas_fork_version = version,
             ForkName::Heze => self.heze_fork_version = version,
+            ForkName::Eip8483 => self.eip8483_fork_version = version,
             // Matches `fork_version`'s own arm: reaching this means a caller
             // dispatched on the wrong chain, which is a bug in the caller.
             ForkName::Lean => lean_fork_unreachable("Config::with_fork_version"),

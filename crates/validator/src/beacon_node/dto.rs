@@ -1087,6 +1087,33 @@ mod tests {
         assert_eq!(config.inclusion_list_due_bps, 7_500);
     }
 
+    /// A node that does not report EIP-8483's keys (every heze-devnet-3
+    /// client) leaves it unscheduled; one that does schedules it.
+    #[test]
+    fn the_eip8483_schedule_is_read_and_absent_means_unscheduled() {
+        let heze_only = serde_json::json!({
+            "GLOAS_FORK_EPOCH": "0",
+            "HEZE_FORK_EPOCH": "1",
+        });
+        let config = config_from_spec_response(&heze_only).expect("builds");
+        assert_eq!(
+            config.eip8483_fork_epoch,
+            ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH
+        );
+        assert_eq!(config.fork_at_epoch(1_000), ForkName::Heze);
+
+        let response = serde_json::json!({
+            "GLOAS_FORK_EPOCH": "0",
+            "HEZE_FORK_EPOCH": "1",
+            "EIP8483_FORK_EPOCH": "3",
+            "EIP8483_FORK_VERSION": "0xe8483000",
+        });
+        let config = config_from_spec_response(&response).expect("builds");
+        assert_eq!(config.fork_at_epoch(2), ForkName::Heze);
+        assert_eq!(config.fork_at_epoch(3), ForkName::Eip8483);
+        assert_eq!(config.eip8483_fork_version, [0xe8, 0x48, 0x30, 0x00]);
+    }
+
     /// A node that has not moved to the basis-point form keeps the defaults,
     /// which are the right answer for every network that predates it.
     #[test]

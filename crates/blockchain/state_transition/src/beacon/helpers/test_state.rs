@@ -141,12 +141,10 @@ pub fn with_validators_at(fork: ForkName, count: usize) -> BeaconState {
         ForkName::Electra => BeaconState::Electra(electra_state(count)),
         ForkName::Fulu => BeaconState::Fulu(fulu_state(count)),
         ForkName::Gloas => BeaconState::Gloas(gloas_state(count)),
-        ForkName::Heze => {
-            let mut state = crate::beacon::containers::heze::BeaconState::from(gloas_state(count));
-            state.latest_execution_payload_bid.inclusion_list_bits =
-                Some(crate::beacon::containers::heze::InclusionListBits::new());
-            BeaconState::Heze(state)
-        }
+        ForkName::Heze => BeaconState::Heze(heze_state(count)),
+        ForkName::Eip8483 => BeaconState::Eip8483(
+            crate::beacon::containers::eip8483::BeaconState::from(heze_state(count)),
+        ),
         // A test asking for a lean state from a beacon builder, which no fixture
         // fork name can produce; the `fork:` form, since the argument is the
         // whole input.
@@ -177,6 +175,7 @@ pub fn replace_balances(state: &mut BeaconState, balances: Vec<Gwei>) {
         BeaconState::Fulu(state) => state.balances = bounded(balances),
         BeaconState::Gloas(state) => state.balances = balances.into(),
         BeaconState::Heze(state) => state.balances = balances.into(),
+        BeaconState::Eip8483(state) => state.balances = balances.into(),
         BeaconState::Lean(_) => lean_state_unreachable("replace_balances"),
     }
 }
@@ -572,6 +571,15 @@ fn fulu_state(count: usize) -> fulu::BeaconState {
             .try_into()
             .expect("the vector is built at its exact length"),
     }
+}
+
+/// [`gloas_state`] in heze's shape: the eth1 fields dropped and the bid given
+/// its all-zero `inclusion_list_bits`.
+fn heze_state(count: usize) -> crate::beacon::containers::heze::BeaconState {
+    let mut state = crate::beacon::containers::heze::BeaconState::from(gloas_state(count));
+    state.latest_execution_payload_bid.inclusion_list_bits =
+        Some(crate::beacon::containers::heze::InclusionListBits::new());
+    state
 }
 
 /// The [`with_validators_at`] counterpart for gloas.

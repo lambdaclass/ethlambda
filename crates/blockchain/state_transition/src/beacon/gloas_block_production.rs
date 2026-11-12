@@ -21,6 +21,7 @@
 
 use std::collections::BTreeMap;
 
+use super::ForkName;
 use super::block_production::pack_attestations;
 use super::bls;
 use super::config::Config;
@@ -117,14 +118,20 @@ pub fn gloas_payload_inputs(
     })
 }
 
-/// `get_execution_requests` (gloas `validator.md`): the execution client's
-/// EIP-7685 request list into gloas's five-kind `ExecutionRequests`.
+/// `get_execution_requests` (gloas `validator.md`, modified by EIP-8483's):
+/// the execution client's EIP-7685 request list into `fork`'s
+/// `ExecutionRequests`, five kinds before EIP-8483 and seven from it on.
 ///
 /// The types must be strictly ascending and no element empty, which is
 /// checked rather than trusted, since a list this node accepted would go into
-/// a bid its peers then reject.
-pub fn parse_gloas_execution_requests(list: &[Vec<u8>]) -> Result<ExecutionRequests> {
-    let mut requests = ExecutionRequests::default();
+/// a bid its peers then reject. EIP-8483's two types are unknown before its
+/// fork, and the result has `fork`'s shape even when the list names neither,
+/// since the bid commits to its root.
+pub fn parse_gloas_execution_requests(
+    list: &[Vec<u8>],
+    fork: ForkName,
+) -> Result<ExecutionRequests> {
+    let mut requests = ExecutionRequests::empty(fork);
     let mut previous_type: Option<u8> = None;
     for element in list {
         let (&request_type, data) = element
@@ -155,6 +162,22 @@ pub fn parse_gloas_execution_requests(list: &[Vec<u8>]) -> Result<ExecutionReque
             }
             constants::BUILDER_EXIT_REQUEST_TYPE => {
                 requests.builder_exits =
+                    libssz::SszDecode::from_ssz_bytes(data).map_err(malformed)?;
+            }
+            // [New in EIP8483] `pq_registrations` is `Some` exactly when
+            // `fork` has them, so these arms are unknown types before it.
+            constants::VALIDATOR_PQ_REGISTRATION_REQUEST_TYPE
+                if requests.pq_registrations.is_some() =>
+            {
+                let pq = requests.pq_registrations.as_mut().expect("guarded above");
+                pq.validator_pq_registrations =
+                    libssz::SszDecode::from_ssz_bytes(data).map_err(malformed)?;
+            }
+            constants::BUILDER_PQ_REGISTRATION_REQUEST_TYPE
+                if requests.pq_registrations.is_some() =>
+            {
+                let pq = requests.pq_registrations.as_mut().expect("guarded above");
+                pq.builder_pq_registrations =
                     libssz::SszDecode::from_ssz_bytes(data).map_err(malformed)?;
             }
             _ => return Err(Error::SpecAssert("a known execution request type")),
@@ -393,9 +416,17 @@ fn unsigned_block(state: &BeaconState, body: BeaconBlockBody) -> Result<GloasBlo
             state_root: Root::ZERO,
             body: body.into(),
         }),
+        // EIP-8483 builds heze's container, tagged with its own fork.
+        BeaconState::Eip8483(_) => GloasBlock::Eip8483(heze::BeaconBlock {
+            slot,
+            proposer_index,
+            parent_root,
+            state_root: Root::ZERO,
+            body: body.into(),
+        }),
         _ => {
             return Err(Error::SpecAssert(
-                "gloas block production runs on a gloas or heze state",
+                "gloas block production runs on a gloas, heze or EIP-8483 state",
             ));
         }
     })
@@ -431,7 +462,10 @@ pub fn assemble_gloas_block_on_bid(
     config: &Config,
 ) -> Result<GloasBlock> {
     verify(
-        matches!(state, BeaconState::Gloas(_) | BeaconState::Heze(_)),
+        matches!(
+            state,
+            BeaconState::Gloas(_) | BeaconState::Heze(_) | BeaconState::Eip8483(_)
+        ),
         "gloas block production runs on a gloas or heze state",
     )?;
     let body = BeaconBlockBody {
@@ -527,7 +561,10 @@ pub fn assemble_gloas_block(
     config: &Config,
 ) -> Result<GloasProduced> {
     verify(
-        matches!(state, BeaconState::Gloas(_) | BeaconState::Heze(_)),
+        matches!(
+            state,
+            BeaconState::Gloas(_) | BeaconState::Heze(_) | BeaconState::Eip8483(_)
+        ),
         "gloas block production runs on a gloas or heze state",
     )?;
     let payload = &inputs.execution_payload;
@@ -1289,19 +1326,71 @@ mod gloas_block_production_tests {
             ..Default::default()
         };
         let list = stf::gloas::get_execution_requests_list(&requests);
-        assert_eq!(parse_gloas_execution_requests(&list).unwrap(), requests);
+        let gloas = ForkName::Gloas;
         assert_eq!(
-            parse_gloas_execution_requests(&[]).unwrap(),
+            parse_gloas_execution_requests(&list, gloas).unwrap(),
+            requests
+        );
+        assert_eq!(
+            parse_gloas_execution_requests(&[], gloas).unwrap(),
             ExecutionRequests::default()
         );
         let exit = vec![constants::BUILDER_EXIT_REQUEST_TYPE, 1];
         let deposit = vec![constants::DEPOSIT_REQUEST_TYPE, 1];
-        assert!(parse_gloas_execution_requests(&[exit, deposit]).is_err());
+        assert!(parse_gloas_execution_requests(&[exit, deposit], gloas).is_err());
         assert!(
-            parse_gloas_execution_requests(&[vec![constants::BUILDER_DEPOSIT_REQUEST_TYPE]])
+            parse_gloas_execution_requests(&[vec![constants::BUILDER_DEPOSIT_REQUEST_TYPE]], gloas)
                 .is_err()
         );
-        assert!(parse_gloas_execution_requests(&[vec![0x7f, 0]]).is_err());
+        assert!(parse_gloas_execution_requests(&[vec![0x7f, 0]], gloas).is_err());
+    }
+
+    /// EIP-8483's two request types parse only at its fork, and an EIP-8483
+    /// list naming neither still yields the seven-field shape its bid commits
+    /// to.
+    #[test]
+    fn an_eip8483_request_list_carries_pq_registrations_only_at_its_fork() {
+        use ethlambda_types::beacon::containers::eip8483::{
+            BuilderPQRegistrationRequest, PQRegistrationRequests, ValidatorPQRegistrationRequest,
+        };
+
+        let requests = ExecutionRequests {
+            builder_exits: vec![gloas::BuilderExitRequest::default()].into(),
+            pq_registrations: Some(PQRegistrationRequests {
+                validator_pq_registrations: vec![ValidatorPQRegistrationRequest::default(); 2]
+                    .into(),
+                builder_pq_registrations: vec![BuilderPQRegistrationRequest::default()].into(),
+            }),
+            ..Default::default()
+        };
+        let list = stf::gloas::get_execution_requests_list(&requests);
+        let types: Vec<u8> = list.iter().map(|element| element[0]).collect();
+        assert_eq!(
+            types,
+            vec![
+                constants::BUILDER_EXIT_REQUEST_TYPE,
+                constants::VALIDATOR_PQ_REGISTRATION_REQUEST_TYPE,
+                constants::BUILDER_PQ_REGISTRATION_REQUEST_TYPE,
+            ]
+        );
+        // 132- and 100-byte records, the predeploy contracts' own.
+        assert_eq!(list[1].len(), 1 + 2 * 132);
+        assert_eq!(list[2].len(), 1 + 100);
+
+        assert_eq!(
+            parse_gloas_execution_requests(&list, ForkName::Eip8483).unwrap(),
+            requests
+        );
+        assert!(parse_gloas_execution_requests(&list, ForkName::Heze).is_err());
+        assert_eq!(
+            parse_gloas_execution_requests(&[], ForkName::Eip8483).unwrap(),
+            ExecutionRequests::empty(ForkName::Eip8483)
+        );
+        assert!(
+            parse_gloas_execution_requests(&[], ForkName::Eip8483)
+                .unwrap()
+                .has_pq_registrations()
+        );
     }
 }
 

@@ -712,3 +712,43 @@ reads, and refuses to when that root is optimistic
 - **Why:** every devnet ethpandaops runs, focil-devnet-1 included, is generated
   that way, and anchoring at its `genesis.ssz` otherwise fails the anchor
   check.
+
+## The first EIP-8483 block over a FULL pre-fork parent
+
+EIP-8483 is implemented from consensus-specs #5809, an open pull request (head
+`5dcce0ab` when this was written), as a feature fork on heze with its own
+`EIP8483_FORK_EPOCH`.
+
+- **The specification:** `upgrade_to_eip8483` copies
+  `latest_execution_payload_bid` unchanged, so its `execution_requests_root`
+  commits to heze's five-field `ExecutionRequests`, whose root differs from the
+  seven-field type's even when both new lists are empty. The `fork.md` note
+  leaves "how the first post-fork block validates a full pre-fork parent" to
+  the coordinated upgrade that activates the feature, and says nothing more.
+- **ethlambda:** the first EIP-8483 block's `parent_execution_requests` is
+  seven-field like every EIP-8483 body (a typed client could decode nothing
+  else). When the parent bid's slot is before `EIP8483_FORK_EPOCH`,
+  `process_parent_execution_payload` requires both PQ lists to be empty (a
+  pre-fork payload produced none) and compares the five-field root with the
+  bid's commitment; otherwise it compares the seven-field root, as the
+  specification states. An EMPTY parent's requests must equal the seven-field
+  empty value either way. Block production builds the same thing: the parent
+  envelope's five-field requests gain two empty lists
+  (`ExecutionRequests::into_shape_of`).
+- **Provisional:** this is our rule, not the specification's, and it changes
+  when the specification picks one. It applies only on a network that
+  schedules EIP-8483 after a fork with payloads; a network starting at
+  EIP-8483 never meets it.
+
+## EIP-8483's request types are `0x05` and `0x06`
+
+- **The specifications disagree:** consensus-specs #5809 assigns
+  `VALIDATOR_PQ_REGISTRATION_REQUEST_TYPE = 0x05` and
+  `BUILDER_PQ_REGISTRATION_REQUEST_TYPE = 0x06`; the EIP text (EIPs #12609)
+  says `0x06` and `0x07`, since `0x05` is claimed by draft EIPs 8148 and 8205,
+  and expects the final values to be coordinated in consensus-specs.
+- **ethlambda:** follows consensus-specs, as for every other consensus-layer
+  rule of the feature (names, the per-half uniqueness rule, the absence of a
+  `has_execution_withdrawal_credential` check). The execution client paired
+  with the node must use the same two bytes, or every PQ request list fails
+  to parse and every payload carrying one is refused.
