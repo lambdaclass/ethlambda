@@ -173,7 +173,10 @@ peers' head is each connected peer's latest `Status`, re-requested every few slo
 p2p aggregates onto `Store::network_head` (`crates/net/p2p/src/peer_heads.rs`). A
 hysteresis band stops the state from flapping at the boundary, and a network-wide stall
 (nobody else is ahead either) leaves the node synced so its validators can help the chain
-recover. This departs from leanSpec's rule; see `docs/spec_deviations.md`. The same status
+recover. This departs from leanSpec's rule; see `docs/spec_deviations.md`. The gate is
+judged on every tick and again after every block arrival: on a catch-up, range sync puts
+the whole span into the actor's mailbox at once and the tick waits behind all of it, so a
+gate judged only on the tick kept reading synced until the catch-up was over. The same status
 feeds the `lean_node_sync_status` metric and, through a shared controller, the
 `/lean/v0/node/syncing` endpoint.
 `--disable-duty-sync-gate` reduces the gate to observe-only.

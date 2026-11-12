@@ -2088,8 +2088,15 @@ impl BlockChainServer {
             // the store clock, which only `on_tick` and an early arrival
             // advance.
             metrics::update_current_slot(self.wall_clock_slot());
+            // Judges the sync gate too.
             let head = self.recompute_beacon_head().await;
             cascade.absorb_head(head);
+        } else {
+            // Lean duties read the gate in the tick that judges it, but the
+            // tick waits behind a catch-up's blocks the same way beacon's
+            // does, and the Lean API, the status gauge and the next arrival's
+            // reaggregation check read it in between.
+            self.update_sync_status(self.wall_clock_slot());
         }
 
         cascade.observe(blocks);
@@ -2306,8 +2313,16 @@ impl BlockChainServer {
     /// `forkchoiceUpdated` verdict's) happens inside it. After the
     /// `forkchoiceUpdated` round trip, so `execution_optimistic` reflects the
     /// verdict it carried.
+    ///
+    /// And where the sync gate is judged between ticks, for the same reason
+    /// the head is: on a catch-up the tick waits behind every block range sync
+    /// forwarded, so a gate judged only there kept answering `Synced` to the
+    /// validator client for the whole catch-up, however far behind. Judged
+    /// before the `forkchoiceUpdated` round trip, so a slow execution client
+    /// does not delay it by one more engine call.
     async fn recompute_beacon_head(&mut self) -> HeadTimings {
         let mut timings = self.update_head_from_fork_choice();
+        self.update_sync_status(self.wall_clock_slot());
         if let Some((start, end)) = self.notify_forkchoice_updated().await {
             timings.fcu_start = Some(start);
             timings.fcu_end = Some(end);
@@ -5316,6 +5331,35 @@ mod tests {
         let mut server = syncing_server(None);
         server.store.set_network_head(Some(THREE_EPOCHS));
         server.update_sync_status(THREE_EPOCHS);
+        assert_eq!(
+            server.sync_status_controller.get(),
+            crate::metrics::SyncStatus::Syncing
+        );
+    }
+
+    #[tokio::test]
+    async fn a_block_arrival_judges_the_gate_without_waiting_for_the_tick() {
+        // A node reconnecting to peers far ahead of it: range sync forwards
+        // the whole catch-up at once, and the tick waits in the mailbox behind
+        // every block of it. The gate has to move on the arrivals themselves,
+        // or it answers `Synced` for the whole catch-up. A block whose parent
+        // is unknown is enough: whatever becomes of a block, its arrival ends
+        // in the head recompute.
+        let mut server = syncing_server(None);
+        let orphan = || bare_block(1, H256::repeat_byte(0xee));
+
+        // Peers as stale as the node: a stall, synced.
+        server.store.set_network_head(Some(0));
+        server.on_block(orphan(), ImportTimings::default()).await;
+        assert_eq!(
+            server.sync_status_controller.get(),
+            crate::metrics::SyncStatus::Synced
+        );
+
+        // A peer reports a head at the clock; the next arrival closes the gate.
+        let wall_clock_slot = server.wall_clock_slot();
+        server.store.set_network_head(Some(wall_clock_slot));
+        server.on_block(orphan(), ImportTimings::default()).await;
         assert_eq!(
             server.sync_status_controller.get(),
             crate::metrics::SyncStatus::Syncing
