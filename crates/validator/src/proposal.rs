@@ -42,6 +42,10 @@
 //!
 //! The envelope is not slashable, so slashing protection is untouched by it.
 //!
+//! The node pays the fee recipient of the proposer preference it holds for
+//! the slot, which names the address in force when it was signed. The check
+//! before signing therefore accepts that address as well as the current one.
+//!
 //! # Blinded blocks
 //!
 //! With builder proposals on, the node may answer with a blinded block: the
@@ -88,6 +92,7 @@ use crate::beacon_node::dto::{ProposerDutyDto, encode_hex, parse_pubkey};
 use crate::beacon_node::{BeaconNodeApi, BlockRequest, Published, validate_produced_block};
 use crate::error::{Error, Result};
 use crate::keys::ValidatorStore;
+use crate::preferences::PreferencesService;
 use crate::proposer_settings::ProposerSettings;
 use crate::signing::SigningContext;
 use crate::slashing_protection::{Refusal, SharedProtection};
@@ -116,6 +121,10 @@ pub struct ProposalService<B> {
     /// Where a slot starts, so a blinded publish that outlives the proposal
     /// can observe its own publication delay. `None` observes nothing.
     clock: Option<SlotClock>,
+    /// The proposer preferences a node accepted, whose fee recipient a gloas
+    /// block may rightly pay instead of the current one. `None` compares
+    /// against the current one alone.
+    preferences: Option<Arc<PreferencesService<B>>>,
 }
 
 impl<B: BeaconNodeApi + 'static> ProposalService<B> {
@@ -134,7 +143,16 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
             builder_boost_factor,
             last_blinded_slot: std::sync::Mutex::new(None),
             clock: None,
+            preferences: None,
         }
+    }
+
+    /// Give the service the proposer preferences this client published, so
+    /// the fee recipient check accepts the address a gloas block's node was
+    /// given in them.
+    pub fn with_preferences(mut self, preferences: Arc<PreferencesService<B>>) -> Self {
+        self.preferences = Some(preferences);
+        self
     }
 
     /// Give the service the slot clock, so a blinded block's publication delay
@@ -187,33 +205,55 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
     /// never happen, and when it does it is a misconfigured or untrustworthy
     /// beacon node paying someone else, every time this validator proposes.
     ///
-    /// With no configured address there is nothing to compare against and this
-    /// says nothing, which is the same silence as a matching one; the startup
-    /// warning is where that case is reported.
+    /// With no configured address and no published preference there is
+    /// nothing to compare against and this says nothing, which is the same
+    /// silence as a matching one; the startup warning is where that case is
+    /// reported.
     fn check_fee_recipient(
         produced: &crate::beacon_node::block_contents::ProducedBlock,
-        expected: Option<ExecutionAddress>,
+        current: Option<ExecutionAddress>,
+        preferred: &[ExecutionAddress],
         slot: Slot,
     ) {
-        let Some(expected) = expected else {
-            return;
-        };
         // The payload's before gloas, the bid's from it on: the same address
         // the execution layer is told to pay, read where the block keeps it.
         let actual = produced.fee_recipient();
-        if actual != expected {
-            tracing::error!(
-                %slot,
-                expected = %crate::beacon_node::dto::encode_hex(&expected.0),
-                actual = %crate::beacon_node::dto::encode_hex(&actual.0),
-                "Block pays its execution-layer rewards to an address this client did not ask \
-                 for; signing it anyway, since refusing would also forfeit the consensus reward \
-                 and cost the network a slot. Check this beacon node's proposer preparation. A \
-                 fee recipient changed through the keymanager API this epoch reaches the node \
-                 only at the next one."
-            );
-            crate::metrics::inc_fee_recipient_mismatches();
+        if Self::pays_this_validator(actual, current, preferred) != Some(false) {
+            return;
         }
+        let expected: Vec<String> = current
+            .iter()
+            .chain(preferred)
+            .map(|address| crate::beacon_node::dto::encode_hex(&address.0))
+            .collect();
+        tracing::error!(
+            %slot,
+            expected = %expected.join(","),
+            actual = %crate::beacon_node::dto::encode_hex(&actual.0),
+            "Block pays its execution-layer rewards to an address this client did not ask for; \
+             signing it anyway, since refusing would also forfeit the consensus reward and cost \
+             the network a slot. Check this beacon node's proposer preparation. A fee recipient \
+             changed through the keymanager API reaches the node at the next epoch boundary; \
+             from gloas, a proposer preference published before the change (by this process \
+             before a restart, say) keeps the old address until the next dependent root."
+        );
+        crate::metrics::inc_fee_recipient_mismatches();
+    }
+
+    /// Whether `actual` is an address this validator asked to be paid at: its
+    /// `current` one, or one of the proposer preferences a node accepted for
+    /// the slot (`preferred`), which from gloas a node builds with in
+    /// preference to the current address, and which name the address in force
+    /// when they were signed. `None` when there is nothing to compare against.
+    fn pays_this_validator(
+        actual: ExecutionAddress,
+        current: Option<ExecutionAddress>,
+        preferred: &[ExecutionAddress],
+    ) -> Option<bool> {
+        if current.is_none() && preferred.is_empty() {
+            return None;
+        }
+        Some(current == Some(actual) || preferred.contains(&actual))
     }
 
     /// Produce, sign and publish the block for `slot`.
@@ -309,7 +349,12 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         }
 
         if Self::compares_fee_recipient(&produced) {
-            Self::check_fee_recipient(&produced, fee_recipient, slot);
+            let preferred = self
+                .preferences
+                .as_ref()
+                .map(|preferences| preferences.accepted_fee_recipients(slot))
+                .unwrap_or_default();
+            Self::check_fee_recipient(&produced, fee_recipient, &preferred, slot);
         } else {
             tracing::debug!(
                 %slot,
@@ -1046,6 +1091,25 @@ mod tests {
         assert!(ProposalService::<MockBeaconNode>::compares_fee_recipient(
             &full
         ));
+    }
+
+    /// The current address and every accepted preference's are this
+    /// validator's; anything else is a mismatch, and with neither configured
+    /// there is nothing to compare.
+    #[test]
+    fn a_block_may_pay_the_current_address_or_a_published_preferences() {
+        let pays = ProposalService::<MockBeaconNode>::pays_this_validator;
+        let current = H160([0x01; 20]);
+        let preferred = H160([0x02; 20]);
+        let stranger = H160([0x03; 20]);
+
+        assert_eq!(pays(current, Some(current), &[]), Some(true));
+        assert_eq!(pays(preferred, Some(current), &[preferred]), Some(true));
+        assert_eq!(pays(current, Some(current), &[preferred]), Some(true));
+        assert_eq!(pays(stranger, Some(current), &[preferred]), Some(false));
+        assert_eq!(pays(stranger, Some(current), &[]), Some(false));
+        assert_eq!(pays(stranger, None, &[preferred]), Some(false));
+        assert_eq!(pays(stranger, None, &[]), None);
     }
 
     /// A node that does not confirm the publish may still have handed the block

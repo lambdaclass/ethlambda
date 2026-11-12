@@ -145,14 +145,15 @@ static PROPOSER_PREFERENCES_PUBLISHED_TOTAL: LazyLock<IntCounter> = LazyLock::ne
     .unwrap()
 });
 
-/// Proposer preferences no beacon node accepted, one count per preference per
-/// attempt. The next slot retries, so this is a warning sign: until one is
-/// accepted, builders' bids for the slot are ignored. A re-send of one some
-/// node already accepted is not counted, since that cost does not apply.
+/// Proposer preference sends some beacon node refused or did not answer, one
+/// count per preference per attempt, re-sends included. The next slot retries,
+/// so this is a warning sign: a node that misses one never gossips it, and
+/// until some node accepts it, builders' bids for the slot are ignored. A send
+/// whose slot started before the nodes answered is not counted.
 static PROPOSER_PREFERENCES_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "ethlambda_validator_proposer_preferences_failures_total",
-        "Proposer preferences no beacon node accepted"
+        "Proposer preference sends some beacon node refused or did not answer"
     )
     .unwrap()
 });

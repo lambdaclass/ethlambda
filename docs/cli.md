@@ -337,8 +337,14 @@ for a slot with none. It reads those duties from the v2 proposer duties
 endpoint, whose dependent root the preferences must carry, and publishes each
 `(slot, dependent root)` until every node has accepted it, sending the message
 as first signed to all of them again each slot until then, and again after a
-reorg changes the root. Duties outside their epoch, and all but the first for
-a slot, are dropped before anything is signed. A
+reorg changes the root. After that it sends each one, as first signed, once
+more every epoch while its slot is ahead, at the epoch's last slot, since a
+node that restarts loses what it accepted; a node restarted mid-epoch thus
+lacks the rest of that epoch's, and has the next epoch's from its first slot.
+Each preference is its own request, and a poll sends all
+of them, for both epochs, at once, so a node that does not answer delays the
+others by one request timeout. Duties outside their epoch, and all but the
+first for a slot, are dropped before anything is signed. A
 validator with no fee recipient is skipped, with one warning per epoch naming
 the count. A preference cannot be replaced for the same slot and root, so a
 fee recipient changed through the keymanager API applies from the next

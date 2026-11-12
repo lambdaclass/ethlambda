@@ -818,3 +818,9 @@ signature, whichever way the node answered. Three departures:
   gloas the preferences carry every proposal's fee recipient. Validators with no
   fee recipient are skipped (the field is required), and a preference cannot be
   replaced for the same slot and dependent root.
+- **Re-sent once an epoch,** as signed, to every node, while its slot is ahead.
+  The specification says nothing about re-sending; it is here because a beacon
+  node holds them in memory only
+  and gossip does not replay them, so a node that restarts would otherwise
+  self-build without them, and ignore builders' bids, until the next dependent
+  root. Same cadence as `prepare_beacon_proposer`, which a restart loses too.

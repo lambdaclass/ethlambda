@@ -241,6 +241,14 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     let aggregation = AggregationService::new(beacon_node.clone(), context.clone());
     let payload_attestation = PayloadAttestationService::new(beacon_node.clone(), context.clone());
     let sync_committee = SyncCommitteeService::new(beacon_node.clone(), context.clone());
+
+    // Unconditional, as Lighthouse does: from gloas the preferences carry the
+    // fee recipient of every proposal, builders or not. See the module doc.
+    let preferences = Arc::new(
+        PreferencesService::new(beacon_node.clone(), context.clone(), settings.clone())
+            .with_clock(clock.clone()),
+    );
+
     let proposal = ProposalService::new(
         beacon_node.clone(),
         context.clone(),
@@ -248,7 +256,8 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         protection.clone(),
         config.builder.map(|builder| builder.boost_factor),
     )
-    .with_clock(clock.clone());
+    .with_clock(clock.clone())
+    .with_preferences(preferences.clone());
     let registration = config.builder.map(|builder| {
         info!(
             boost_factor = builder.boost_factor,
@@ -260,14 +269,6 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             settings.clone(),
         ))
     });
-
-    // Unconditional, as Lighthouse does: from gloas the preferences carry the
-    // fee recipient of every proposal, builders or not. See the module doc.
-    let preferences = Arc::new(PreferencesService::new(
-        beacon_node.clone(),
-        context.clone(),
-        settings.clone(),
-    ));
 
     if let Some(address) = config.keymanager {
         let token = http_api::load_or_create_token(&config.validators_dir)?;

@@ -20,6 +20,12 @@
 //! change is registered at the next epoch boundary. A block proposed before
 //! then pays the address the node was last told, which the check before
 //! signing reports as a mismatch.
+//!
+//! From gloas a node pays the address in the proposer preferences it holds for
+//! the slot instead, and gas limit likewise, and a preference cannot be
+//! replaced for its dependent root: a change reaches gloas blocks from the next
+//! dependent root on. The check before signing accepts the address of a
+//! preference a node accepted.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

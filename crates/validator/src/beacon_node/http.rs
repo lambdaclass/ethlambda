@@ -560,6 +560,18 @@ impl HttpBeaconNode {
         })
     }
 
+    /// The proposer duties for `epoch` at the endpoint's `version` (`v1` or
+    /// `v2`), which differ only in which `dependent_root` they report.
+    async fn proposer_duties_at(&self, version: &str, epoch: Epoch) -> Result<ProposerDuties> {
+        let response: DutiesResponse<Vec<ProposerDutyDto>> = self
+            .get(&format!("/eth/{version}/validator/duties/proposer/{epoch}"))
+            .await?;
+        Ok(ProposerDuties {
+            dependent_root: parse_root(&response.dependent_root)?,
+            duties: response.data,
+        })
+    }
+
     async fn decode<T: serde::de::DeserializeOwned>(response: reqwest::Response) -> Result<T> {
         let status = response.status();
         if status == StatusCode::SERVICE_UNAVAILABLE {
@@ -681,25 +693,13 @@ impl BeaconNodeApi for HttpBeaconNode {
     /// answers for every proposer in the epoch rather than for a submitted
     /// list, so there is nothing to send.
     async fn proposer_duties(&self, epoch: Epoch) -> Result<ProposerDuties> {
-        let response: DutiesResponse<Vec<ProposerDutyDto>> = self
-            .get(&format!("/eth/v1/validator/duties/proposer/{epoch}"))
-            .await?;
-        Ok(ProposerDuties {
-            dependent_root: parse_root(&response.dependent_root)?,
-            duties: response.data,
-        })
+        self.proposer_duties_at("v1", epoch).await
     }
 
     /// [`Self::proposer_duties`] against the v2 path, whose `dependent_root`
     /// is the shuffling dependent root proposer preferences must carry.
     async fn proposer_duties_v2(&self, epoch: Epoch) -> Result<ProposerDuties> {
-        let response: DutiesResponse<Vec<ProposerDutyDto>> = self
-            .get(&format!("/eth/v2/validator/duties/proposer/{epoch}"))
-            .await?;
-        Ok(ProposerDuties {
-            dependent_root: parse_root(&response.dependent_root)?,
-            duties: response.data,
-        })
+        self.proposer_duties_at("v2", epoch).await
     }
 
     async fn attestation_data(&self, slot: Slot, fork: ForkName) -> Result<AttestationData> {

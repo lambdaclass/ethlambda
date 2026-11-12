@@ -78,6 +78,9 @@ pub struct MockBeaconNode {
     /// holds with other content: a call carrying any of them is an `Err` and
     /// records nothing, like the node's 400 for the whole call.
     pub refused_preference_slots: Mutex<Vec<Slot>>,
+    /// How long `submit_proposer_preferences` takes before it answers, as a
+    /// slow node would.
+    pub preference_delay: Option<std::time::Duration>,
     pub attestation_data: Option<AttestationData>,
     /// The slot and proposer the mock will produce a block for. `None` makes
     /// `produce_block` fail, the way an unset `attestation_data` does.
@@ -368,6 +371,32 @@ impl MockBeaconNode {
     pub fn with_registration_delay(mut self, delay: std::time::Duration) -> Self {
         self.registration_delay = Some(delay);
         self
+    }
+
+    /// Make `submit_proposer_preferences` take `delay` before it answers.
+    pub fn with_preference_delay(mut self, delay: std::time::Duration) -> Self {
+        self.preference_delay = Some(delay);
+        self
+    }
+
+    /// The duties `stored` holds for `epoch`, or the error a node without them
+    /// answers, naming `what` was asked for.
+    fn proposers_at(
+        stored: &Mutex<Vec<(Epoch, ProposerDuties)>>,
+        epoch: Epoch,
+        what: &str,
+    ) -> Result<ProposerDuties> {
+        stored
+            .lock()
+            .expect("lock")
+            .iter()
+            .find(|(held, _)| *held == epoch)
+            .map(|(_, duties)| duties.clone())
+            .ok_or_else(|| Error::BeaconNode {
+                url: "mock".to_string(),
+                failure: BeaconNodeFailure::Request,
+                detail: format!("no {what} for epoch {epoch}"),
+            })
     }
 
     /// Make `publish_blinded_block` take `delay` before it records the block.
@@ -697,17 +726,7 @@ impl BeaconNodeApi for MockBeaconNode {
     async fn proposer_duties(&self, epoch: Epoch) -> Result<ProposerDuties> {
         self.guard("proposer_duties")?;
         *self.proposer_duties_calls.lock().expect("lock") += 1;
-        self.proposers
-            .lock()
-            .expect("lock")
-            .iter()
-            .find(|(stored, _)| *stored == epoch)
-            .map(|(_, duties)| duties.clone())
-            .ok_or_else(|| Error::BeaconNode {
-                url: "mock".to_string(),
-                failure: BeaconNodeFailure::Request,
-                detail: format!("no proposer duties for epoch {epoch}"),
-            })
+        Self::proposers_at(&self.proposers, epoch, "proposer duties")
     }
 
     async fn proposer_duties_v2(&self, epoch: Epoch) -> Result<ProposerDuties> {
@@ -716,17 +735,7 @@ impl BeaconNodeApi for MockBeaconNode {
         if let Some(hook) = &self.on_proposer_duties_v2 {
             hook();
         }
-        self.proposers_v2
-            .lock()
-            .expect("lock")
-            .iter()
-            .find(|(stored, _)| *stored == epoch)
-            .map(|(_, duties)| duties.clone())
-            .ok_or_else(|| Error::BeaconNode {
-                url: "mock".to_string(),
-                failure: BeaconNodeFailure::Request,
-                detail: format!("no v2 proposer duties for epoch {epoch}"),
-            })
+        Self::proposers_at(&self.proposers_v2, epoch, "v2 proposer duties")
     }
 
     async fn attestation_data(&self, slot: Slot, fork: ForkName) -> Result<AttestationData> {
@@ -884,6 +893,9 @@ impl BeaconNodeApi for MockBeaconNode {
         preferences: &[gloas::SignedProposerPreferences],
     ) -> Result<Delivery> {
         self.guard("submit_proposer_preferences")?;
+        if let Some(delay) = self.preference_delay {
+            tokio::time::sleep(delay).await;
+        }
         let refused = self.refused_preference_slots.lock().expect("lock").clone();
         if let Some(entry) = preferences
             .iter()

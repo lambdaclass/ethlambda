@@ -179,8 +179,8 @@ pub enum Published {
 /// The caller needs it when what it sends lives on each node separately and
 /// a node that missed it never hears it any other way. Proposer preferences
 /// are such a send: each node gossips only what it accepted, and the service
-/// stops sending a preference once it counts as delivered, so "some node
-/// accepted" must not be mistaken for "every node did".
+/// sends a preference every node holds only once an epoch more, so "some
+/// node accepted" must not be mistaken for "every node did".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Delivery {
     /// Every configured node accepted. The only answer a single node gives.
