@@ -85,7 +85,7 @@ pub enum Error {
     ProposalRefused { slot: u64, reason: String },
     #[error("beacon node returned an inconsistent response: {0}")]
     InconsistentResponse(String),
-    /// `ethlambda validator exit` refused to sign: the chain would refuse the
+    /// `ethlambda voluntary-exit` refused to sign: the chain would refuse the
     /// exit too, for the reason given. Deterministic, like a proposal refusal.
     #[error("voluntary exit refused: {0}")]
     ExitRefused(String),

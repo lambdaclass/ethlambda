@@ -309,9 +309,14 @@ impl HttpBeaconNode {
         }
     }
 
-    /// A GET whose success may be a 204, which is an answer ("nothing to
-    /// report") and not a failure.
-    async fn get_optional<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<Option<T>> {
+    /// A GET for which the `absent` status is an answer ("nothing to report")
+    /// and not a failure: a 204 from an endpoint that has nothing yet, a 404
+    /// from one asked about something the node does not know.
+    async fn get_optional<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        absent: StatusCode,
+    ) -> Result<Option<T>> {
         let url = format!("{}{path}", self.base_url);
         debug!(%url, "Beacon API GET");
         let response = self
@@ -324,7 +329,7 @@ impl HttpBeaconNode {
                 failure: BeaconNodeFailure::classify(&err),
                 detail: err.to_string(),
             })?;
-        if response.status() == StatusCode::NO_CONTENT {
+        if response.status() == absent {
             return Ok(None);
         }
         Self::decode(response).await.map(Some)
@@ -771,11 +776,9 @@ impl BeaconNodeApi for HttpBeaconNode {
         &self,
         slot: Slot,
     ) -> Result<Option<gloas::PayloadAttestationData>> {
-        let response: Option<VersionedResponse<gloas::PayloadAttestationData>> = self
-            .get_optional(&format!(
-                "/eth/v1/validator/payload_attestation_data?slot={slot}"
-            ))
-            .await?;
+        let path = format!("/eth/v1/validator/payload_attestation_data?slot={slot}");
+        let response: Option<VersionedResponse<gloas::PayloadAttestationData>> =
+            self.get_optional(&path, StatusCode::NO_CONTENT).await?;
         let Some(response) = response else {
             return Ok(None);
         };
@@ -1050,28 +1053,17 @@ impl BeaconNodeApi for HttpBeaconNode {
     }
 
     async fn validator(&self, pubkey: &BlsPubkey) -> Result<Option<ValidatorDetails>> {
-        let url = format!(
-            "{}/eth/v1/beacon/states/head/validators/{}",
-            self.base_url,
+        let path = format!(
+            "/eth/v1/beacon/states/head/validators/{}",
             encode_hex(&pubkey.0)
         );
-        debug!(%url, "Beacon API GET");
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|err| Error::BeaconNode {
-                url: url.clone(),
-                failure: BeaconNodeFailure::classify(&err),
-                detail: err.to_string(),
-            })?;
-        // `get_optional` reads a 204 as "nothing"; this endpoint says it with
-        // a 404, which the specification lists as "validator not found".
-        if response.status() == StatusCode::NOT_FOUND {
+        // A 404 is this endpoint's "validator not found", per the
+        // specification.
+        let response: Option<DataResponse<ValidatorDetailsDto>> =
+            self.get_optional(&path, StatusCode::NOT_FOUND).await?;
+        let Some(response) = response else {
             return Ok(None);
-        }
-        let response: DataResponse<ValidatorDetailsDto> = Self::decode(response).await?;
+        };
         let entry = response.data;
         // The answer names the key it describes; a node answering about
         // another validator must not have its index signed into an exit.

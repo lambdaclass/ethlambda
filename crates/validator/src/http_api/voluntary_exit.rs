@@ -61,14 +61,16 @@ pub async fn create_signed_voluntary_exit(
     // whether or not a node is reachable.
     require_held(&*context.store.read().await, &pubkey)?;
 
-    let resolved = context
+    // The same lookup the `voluntary-exit` command makes, so the two ways to
+    // sign an exit cannot disagree about a validator's index.
+    let entry = context
         .beacon_node
-        .validator_indices(&[pubkey])
+        .validator(&pubkey)
         .await
         .map_err(|err| {
             ApiError::Internal(format!("could not resolve the validator index: {err}"))
         })?;
-    let Some(entry) = resolved.into_iter().find(|entry| entry.pubkey == pubkey) else {
+    let Some(entry) = entry else {
         return Err(ApiError::NotFound(format!(
             "the validator index for {} is not known yet; the beacon node has no \
              validator with that key, so its deposit may not have been processed",
@@ -117,13 +119,14 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use ethlambda_types::beacon::config::Config;
+    use ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
     use ethlambda_types::beacon::primitives::{BlsPubkey, BlsSignature, Bytes32, Root};
     use http_body_util::BodyExt as _;
     use tokio::sync::RwLock;
     use tower::ServiceExt as _;
 
     use super::*;
-    use crate::beacon_node::ValidatorEntry;
+    use crate::beacon_node::ValidatorDetails;
     use crate::beacon_node::mock::MockBeaconNode;
     use crate::http_api::router;
     use crate::keys::ValidatorStore;
@@ -160,13 +163,15 @@ mod tests {
     fn harness_at(epochs: u64, resolves: bool) -> Harness {
         let mut store = ValidatorStore::new();
         let pubkey = store.insert_secret("test", &secret()).expect("inserts");
-        let mut node = MockBeaconNode::new();
+        let node = MockBeaconNode::new();
         if resolves {
-            node.validators = vec![ValidatorEntry {
+            node.set_validator_details(Some(ValidatorDetails {
                 index: INDEX,
-                pubkey,
                 status: "active_ongoing".to_string(),
-            }];
+                activation_epoch: 0,
+                exit_epoch: FAR_FUTURE_EPOCH,
+                withdrawable_epoch: FAR_FUTURE_EPOCH,
+            }));
         }
         let config = Config::mainnet();
         let genesis_time = std::time::SystemTime::now()

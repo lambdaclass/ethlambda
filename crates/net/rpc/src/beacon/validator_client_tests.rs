@@ -197,7 +197,7 @@ fn keys_for(state: &BeaconState, indices: &[u64]) -> RwLock<ValidatorStore> {
     RwLock::new(keys)
 }
 
-/// `ethlambda validator exit`, end to end: the client's own lookup of the
+/// `ethlambda voluntary-exit`, end to end: the client's own lookup of the
 /// validator, its signature, and this node's pool endpoint. The fixture's
 /// validators are all active since epoch 0 and the wall epoch is far past
 /// `SHARD_COMMITTEE_PERIOD`, so the node's gossip rules accept the exit.

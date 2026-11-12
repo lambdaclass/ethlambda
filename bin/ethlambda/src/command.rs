@@ -30,6 +30,7 @@ const EXPLICIT: &[&str] = &[
     BENCHMARK,
     REPLAY_ERA,
     VALIDATOR,
+    VOLUNTARY_EXIT,
     SLASHING_PROTECTION,
     KEYGEN,
     "help",
@@ -44,6 +45,7 @@ const BEACON: &str = "beacon";
 const BENCHMARK: &str = "benchmark";
 const REPLAY_ERA: &str = "replay-era";
 const VALIDATOR: &str = "validator";
+const VOLUNTARY_EXIT: &str = "voluntary-exit";
 const SLASHING_PROTECTION: &str = "slashing-protection";
 const KEYGEN: &str = "keygen";
 
@@ -85,14 +87,12 @@ pub(crate) enum Command {
     /// Replay real chain history from `.era` files and check it against the stored states.
     ReplayEra(ReplayEraOptions),
     /// Run the beacon-chain validator client against a beacon node's HTTP API.
-    //
-    // `subcommand_negates_reqs`: `ethlambda validator exit` carries only its
-    // own flags, so the client's required ones must not be demanded of it;
-    // `args_conflicts_with_subcommands`: and none of the client's flags may be
-    // given alongside it, since none applies. On the variant rather than on
-    // `ValidatorOptions`, where clap's derive does not pick them up.
-    #[command(subcommand_negates_reqs = true, args_conflicts_with_subcommands = true)]
     Validator(crate::validator::ValidatorOptions),
+    /// Sign a voluntary exit for one validator and publish it to a beacon node.
+    ///
+    /// Irreversible once the chain processes it. Asks for a confirmation phrase
+    /// before publishing unless --no-confirmation is given.
+    VoluntaryExit(crate::voluntary_exit::VoluntaryExitOptions),
     /// Import or export the validator client's EIP-3076 slashing-protection
     /// history, offline.
     SlashingProtection(crate::slashing_protection::SlashingProtectionOptions),
@@ -210,33 +210,17 @@ mod tests {
             Command::Validator(options) => options,
             other => panic!("expected a validator invocation, got {other:?}"),
         };
-        assert_eq!(
-            options.beacon_nodes.as_deref(),
-            Some(&["http://localhost:5052".to_string()][..])
-        );
-        assert_eq!(
-            options.validators_dir,
-            Some(PathBuf::from("/tmp/validators"))
-        );
-        assert!(options.command.is_none());
+        assert_eq!(options.beacon_nodes, vec!["http://localhost:5052"]);
+        assert_eq!(options.validators_dir, PathBuf::from("/tmp/validators"));
     }
 
-    /// Without the sub-command the client's flags stay required: a bare
-    /// `ethlambda validator` must not start a client with nothing configured.
+    /// `voluntary-exit` is a command of its own, so it takes only its own
+    /// flags and the validator client's required ones are not asked of it.
     #[test]
-    fn a_client_run_still_requires_its_flags() {
-        let args = ["ethlambda", "validator", "--graffiti", "hello"];
-        assert!(try_parse_from(args.iter().map(OsString::from)).is_err());
-    }
-
-    /// `validator exit` carries only its own flags: the client's required
-    /// ones are not demanded of it.
-    #[test]
-    fn the_validator_exit_subcommand_parses_without_the_client_flags() {
+    fn voluntary_exit_parses_as_its_own_sub_command() {
         let args = [
             "ethlambda",
-            "validator",
-            "exit",
+            VOLUNTARY_EXIT,
             "--keystore",
             "/tmp/keystore.json",
             "--password-file",
@@ -248,11 +232,8 @@ mod tests {
             "123",
         ];
         let command = try_parse_from(args.iter().map(OsString::from)).expect("invocation parses");
-        let Command::Validator(options) = command else {
-            panic!("expected a validator invocation, got {command:?}");
-        };
-        let Some(crate::validator::ValidatorCommand::Exit(exit)) = options.command else {
-            panic!("expected the exit sub-command, got {:?}", options.command);
+        let Command::VoluntaryExit(exit) = command else {
+            panic!("expected a voluntary-exit invocation, got {command:?}");
         };
         assert_eq!(exit.keystore, PathBuf::from("/tmp/keystore.json"));
         assert_eq!(exit.password_file, PathBuf::from("/tmp/password"));
@@ -261,23 +242,6 @@ mod tests {
         assert!(exit.presign);
         assert!(!exit.no_confirmation);
         assert!(!exit.no_wait);
-    }
-
-    /// And the client's own flags are refused beside it, since none applies.
-    #[test]
-    fn the_client_flags_are_refused_beside_validator_exit() {
-        let args = [
-            "ethlambda",
-            "validator",
-            "--graffiti",
-            "hello",
-            "exit",
-            "--keystore",
-            "/tmp/keystore.json",
-            "--password-file",
-            "/tmp/password",
-        ];
-        assert!(try_parse_from(args.iter().map(OsString::from)).is_err());
     }
 
     /// The historical flat form must keep working, unchanged.
@@ -498,6 +462,7 @@ mod tests {
             BEACON,
             BENCHMARK,
             VALIDATOR,
+            VOLUNTARY_EXIT,
             SLASHING_PROTECTION,
             KEYGEN,
         ] {

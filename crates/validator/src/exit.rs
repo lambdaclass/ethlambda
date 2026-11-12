@@ -1,4 +1,4 @@
-//! `ethlambda validator exit`: sign a voluntary exit for one keystore and hand
+//! `ethlambda voluntary-exit`: sign a voluntary exit for one keystore and hand
 //! it to a beacon node.
 //!
 //! A voluntary exit is the one thing a validator signs that cannot be taken
@@ -30,14 +30,12 @@ use ethlambda_types::beacon::containers::shared::{SignedVoluntaryExit, Voluntary
 use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch};
 use tracing::info;
-use zeroize::Zeroizing;
 
 use crate::beacon_node::dto::encode_hex;
 use crate::beacon_node::http::HttpBeaconNode;
 use crate::beacon_node::{BeaconNodeApi, ValidatorDetails};
 use crate::error::{Error, Result};
 use crate::keys::ValidatorStore;
-use crate::keys::keystore::Keystore;
 use crate::signing::SigningContext;
 use crate::slot_clock::SlotClock;
 
@@ -102,37 +100,15 @@ pub async fn run(config: ExitConfig) -> Result<Outcome> {
     run_with(&node, &store, pubkey, &config.options, &mut input).await
 }
 
-/// Decrypt one keystore into a store holding only its key.
-///
-/// The password file is read the way `ValidatorStore::load` reads one: whole,
-/// with a trailing newline trimmed, since an editor leaves one and a password
-/// ending in a newline is not something anyone chose.
+/// Decrypt one keystore into a store holding only its key, read from disk
+/// exactly as the validator client reads its own
+/// ([`ValidatorStore::insert_keystore_file`]).
 pub fn load_keystore(
     keystore_path: &Path,
     password_path: &Path,
 ) -> Result<(ValidatorStore, BlsPubkey)> {
-    let json = std::fs::read_to_string(keystore_path).map_err(|source| Error::Io {
-        path: keystore_path.display().to_string(),
-        source,
-    })?;
-    let keystore = Keystore::from_json(&json).map_err(|err| Error::Keystore {
-        path: keystore_path.display().to_string(),
-        reason: err.to_string(),
-    })?;
-    let password = std::fs::read_to_string(password_path).map_err(|source| Error::Io {
-        path: password_path.display().to_string(),
-        source,
-    })?;
-    // Scrubbed on drop, like the secret `decrypt` yields from it.
-    let password = Zeroizing::new(password);
-    let secret = keystore
-        .decrypt(password.trim_end_matches(['\n', '\r']))
-        .map_err(|err| Error::Keystore {
-            path: keystore_path.display().to_string(),
-            reason: err.to_string(),
-        })?;
     let mut store = ValidatorStore::new();
-    let pubkey = store.insert_secret(&keystore_path.display().to_string(), &secret)?;
+    let pubkey = store.insert_keystore_file(keystore_path, password_path)?;
     Ok((store, pubkey))
 }
 
