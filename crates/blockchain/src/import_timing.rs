@@ -888,21 +888,6 @@ impl CascadeTelemetry {
     /// arriving block was imported here, and an `attestable` row at the head
     /// recomputation's end for every block imported here.
     pub fn events(&self, cascade: &CascadeTimings) -> Vec<BlockEvent> {
-        self.events_except_awaiting(cascade, |_| false)
-    }
-
-    /// [`Self::events`], leaving out the `attestable` row of every block
-    /// `awaits_verdict` names: one imported before the execution client
-    /// answered (`beacon_new_payload`). Such a block is optimistic at this
-    /// head recomputation, so validators cannot attest to it yet; its
-    /// `attestable` is written when a `VALID` answer is applied, which the
-    /// actor always does after this recomputation, since the import that
-    /// asked runs it within the same message.
-    pub fn events_except_awaiting(
-        &self,
-        cascade: &CascadeTimings,
-        awaits_verdict: impl Fn(&H256) -> bool,
-    ) -> Vec<BlockEvent> {
         let mut events = Vec::new();
         if let (Some((slot, root)), Some(source)) = (self.arrival, cascade.source_label())
             && self
@@ -934,7 +919,6 @@ impl CascadeTelemetry {
             events.extend(
                 self.imported
                     .iter()
-                    .filter(|&&(_, root, _)| !awaits_verdict(&root))
                     .map(|&(slot, root, source)| row("attestable", head_end, slot, root, source)),
             );
         }
@@ -953,7 +937,7 @@ fn source_label(source: Option<BlockSource>) -> Option<&'static str> {
     }
 }
 
-pub(crate) fn row(
+fn row(
     stage: &'static str,
     at: Instant,
     slot: u64,
@@ -1684,31 +1668,6 @@ mod tests {
                 .filter(|event| event.stage == "attestable")
                 .all(|event| event.at == head_end)
         );
-    }
-
-    /// A block imported before its execution client answered is optimistic
-    /// at the head recomputation: its `attestable` waits for the answer
-    /// (`beacon_new_payload::answer_events`), while the arrival's other rows
-    /// and the other imports are written as before.
-    #[test]
-    fn a_block_awaiting_its_engine_answer_is_not_attestable_at_the_head() {
-        let base = Instant::now();
-        let arriving = H256::repeat_byte(3);
-        let child = H256::repeat_byte(4);
-        let telemetry = CascadeTelemetry {
-            arrival: Some((7, arriving)),
-            imported: vec![(7, arriving, "gossip"), (8, child, "sync")],
-        };
-
-        let events =
-            telemetry.events_except_awaiting(&arrival_cascade(base), |root| *root == arriving);
-        let attestable: Vec<_> = events
-            .iter()
-            .filter(|event| event.stage == "attestable")
-            .map(|event| event.slot)
-            .collect();
-        assert_eq!(attestable, [8]);
-        assert!(events.iter().any(|event| event.stage == "fcu_end"));
     }
 
     /// A re-delivered block the store already holds reports imported without

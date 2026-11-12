@@ -72,37 +72,6 @@ This diagram is the pre-gloas path. A gloas block carries no payload, only a
 builder's bid, so nothing is asked about it at import; the question moves to the
 envelope that reveals the payload (see [Gloas](#gloas) below).
 
-## Asking without waiting
-
-On the running actor the `engine_newPayloadV4` arrow above does not wait. The
-question goes out first, from a tokio task of its own, and the block is imported
-right after as optimistic (it joins `optimistic_roots`, so every Beacon API
-response about it says `execution_optimistic` and attestation data for it is a
-`503`). The task reports back with a `NewPayloadAnswered` message, and the
-answer is applied then, the way the table below says, to a block already in fork
-choice. A gloas envelope goes the same way: it is applied at once with its
-payload `NOT_VALIDATED`. `crates/blockchain/src/beacon_new_payload.rs` holds
-the queue, the task and the answer handler.
-
-```
-block ─► DA gate ─► newPayload queued ─► on_block (optimistic) ─► head may move
-                        │
-                        └─► task ─► engine_newPayloadV4 ─► NewPayloadAnswered ─► verdict applied
-```
-
-| Rule | Why |
-|---|---|
-| A payload is sent only once no request for the payload it builds on is outstanding, and at most `MAX_NEW_PAYLOADS_IN_FLIGHT` at once | The Engine API orders only `forkchoiceUpdated`, and the client's connection pool can deliver two requests in either order; a payload whose parent the execution client has not seen is answered `SYNCING` and may start a sync from its peers |
-| `forkchoiceUpdated` names the newest payload on the head's chain whose request is not queued or in flight, and is sent again when the head's own answer arrives | Same reason: the execution client may not have the head's payload yet. Naming an ancestor instead of skipping the call keeps the client fed a head during catch-up, when the newest block's request always waits behind its parent's |
-| At most `MAX_PAYLOADS_AWAITING_VERDICT` imported payloads wait for an answer; past that a block is held (written as a pending block) and an envelope waits in `awaiting_engine`, until answers free room | Bounds how far the consensus side can run ahead of what has been validated; only reached during catch-up |
-| A block built on a gloas FULL parent waits for the parent payload's answer, not only for its envelope | An envelope refused for its contents is taken back out, and nothing may be built on it by then. Lighthouse and Prysm hold the same blocks by applying an envelope only after its answer |
-| No answer after the retry ladder: the block or payload stays, optimistic, and is asked again once a slot | It is already in fork choice; see [spec_deviations.md](./spec_deviations.md#payloads-are-applied-before-the-execution-client-answers) |
-| A `VALID` answer for the current head sends `head` again with `execution_optimistic: false` | A validator client that reacts to `head` was refused attestation data for the optimistic one |
-
-Two paths still wait for the answer inline: a block that is not an optimistic
-candidate (around the merge transition; see below), and a server with no mailbox
-to hear back on (offline replay).
-
 The order is the specification's own: `is_data_available` runs before
 `state_transition`, so a block about to be held for its custody columns is never
 one this node asks an execution client about.
@@ -124,14 +93,7 @@ specification.
 
 ### The transition runs while the answer is in flight
 
-This applies only to an import that waits for its answer: a block that is not
-an optimistic candidate, or a server with no mailbox to hear an answer back on
-(offline replay and the import benchmark). On the running actor an optimistic
-candidate does not wait at all (see
-[Asking without waiting](#asking-without-waiting)), so nothing overlaps and
-`engine` stays a recorded zero.
-
-When an import does wait, `process_block` does not wait idle for the answer. It
+With an execution client, `process_block` does not wait idle for the answer. It
 builds the request on the actor (copying only the payload, never the block),
 sends it from a spawned task so the HTTP exchange keeps progressing, and runs
 `fork_choice::speculate_transition` on the actor meanwhile: the block's state
@@ -173,13 +135,9 @@ request this module sends (`timed_new_payload`), a gloas envelope's included.
 
 | Wire status | Alias | What happens |
 |---|---|---|
-| `VALID` | | The block and every optimistic ancestor leave `optimistic_roots` |
-| `SYNCING`, `ACCEPTED` | `NOT_VALIDATED` | The block stays in `optimistic_roots` (it was imported optimistic, which only an `is_optimistic_candidate_block` may be) |
-| `INVALID`, `INVALID_BLOCK_HASH` | `INVALIDATED` | The block leaves fork choice. `latestValidHash` decides how much of the branch dies with it |
-
-On the inline path the same answers decide whether the block is imported at
-all: `NOT_VALIDATED` imports it only if it is an optimistic candidate, and
-`INVALIDATED` does not import it.
+| `VALID` | | Imported. The block and every optimistic ancestor leave `optimistic_roots` |
+| `SYNCING`, `ACCEPTED` | `NOT_VALIDATED` | Imported *if* `is_optimistic_candidate_block` allows it, and joins `optimistic_roots` |
+| `INVALID`, `INVALID_BLOCK_HASH` | `INVALIDATED` | Not imported. `latestValidHash` decides how much of the branch dies with it |
 
 A block in `optimistic_roots` carries normal fork-choice weight and can be the
 head. That is the point of optimistic sync, and the `sync/optimistic` fixture
@@ -299,26 +257,21 @@ honest block hash and a different body cannot earn an `INVALID` that lands on th
 honest payload, and the engine never spends time on an envelope this node would
 refuse anyway.
 
-The envelope is applied as soon as those checks pass, its payload recorded
-`NOT_VALIDATED`, and the answer is applied when it arrives (see
-[Asking without waiting](#asking-without-waiting)):
-
 | Answer | What happens to the envelope |
 |---|---|
-| `VALID` | The payload is recorded `VALID`; blocks waiting on it are released |
-| `SYNCING`, `ACCEPTED` | Stays `NOT_VALIDATED`; blocks waiting on it are released; a later `forkchoiceUpdated` `VALID` promotes it |
-| `INVALID` with a `latestValidHash` | The payload is invalid: its FULL node is removed and the blocks waiting on it are dropped; the block and its EMPTY branch stay |
-| `INVALID` with a null `latestValidHash`, or `INVALID_BLOCK_HASH` | The envelope's contents do not hash to the block hash it claims: the envelope is taken back out (no payload, not an invalid one), only that envelope is refused, and the blocks waiting on it keep waiting, since the builder's real one may still arrive |
-| no answer after the retry ladder | Stays applied and `NOT_VALIDATED`, blocks waiting on it keep waiting, and it is asked again once a slot |
+| `VALID` | Applied; the payload is recorded `VALID` |
+| `SYNCING`, `ACCEPTED` | Applied and recorded `SYNCING` (not yet validated); a later `forkchoiceUpdated` `VALID` promotes it |
+| `INVALID` with a `latestValidHash` | The payload is invalid: not applied, so the block's FULL node never exists; the block and its EMPTY branch stay |
+| `INVALID` with a null `latestValidHash`, or `INVALID_BLOCK_HASH` | The envelope's contents do not hash to the block hash it claims: only that envelope is refused, since the builder's real one may still arrive |
+| no answer after the retry ladder | Kept (it is consensus-valid) and asked again once a slot |
 
-The null-`latestValidHash` row exists because since `engine_newPayloadV2` a
-block hash mismatch is answered `INVALID` with a null hash (`INVALID_BLOCK_HASH`
-is "supplanted by `INVALID`", execution-apis `shanghai.md`), while an
-executed-and-failed payload normally names its last valid ancestor. `latestValidHash` and `VALID` follow the execution
+The null-`latestValidHash` row exists because ethrex has no `INVALID_BLOCK_HASH`
+status: it answers a mismatch with a null hash and an executed-and-failed payload
+with its last valid ancestor. `latestValidHash` and `VALID` follow the execution
 chain (each block's `bid.parent_block_hash`), not every verified ancestor, since
 a block built past an ancestor's EMPTY node skips that ancestor's payload. The
 details, and why each departs from the specification, are in
-[spec_deviations.md](./spec_deviations.md#payloads-are-applied-before-the-execution-client-answers).
+[spec_deviations.md](./spec_deviations.md#the-execution-client-judges-a-gloas-payload-before-the-envelope-is-applied).
 
 With the engine down, the per-slot retry asks about the oldest held envelope
 only and releases the rest once that ask is answered, so an unreachable client
@@ -487,7 +440,7 @@ cosmetic mismatch into an outage.
 
 ## Limitations
 
-### The retry ladder gives up
+### The retry ladder gives up, and nothing re-drives it
 
 Each call is attempted `ENGINE_MAX_ATTEMPTS` times, with a per-attempt timeout of
 `ENGINE_TIMEOUT` and a backoff starting at `ENGINE_INITIAL_BACKOFF` and doubling.
@@ -495,16 +448,17 @@ An RPC *error* is not retried: that is the execution client answering, with a
 refusal but an answer, so asking again would get the same refusal and burn the
 ladder for nothing.
 
-On the running actor a block or payload that got no answer is already in fork
-choice; it stays, optimistic, and is asked again once a slot (see
-[Asking without waiting](#asking-without-waiting)).
+After the last attempt the block is **dropped**. `optimistic-sync.md` requires
+exactly that much ("a consensus engine MUST NOT import the block and MUST NOT
+apply it to the fork choice store"), but nothing here re-drives the call
+afterwards, so a persistently unreachable execution client parks the follower's
+head behind the first block it could not ask about, permanently, until a
+restart.
 
-On the inline path (a block that is not an optimistic candidate, or offline
-replay) the block is **dropped** after the last attempt. `optimistic-sync.md`
-requires exactly that much ("a consensus engine MUST NOT import the block and
-MUST NOT apply it to the fork choice store"), and nothing re-drives the call
-afterwards. `lean_engine_no_verdict_total` counts both: a non-zero rate means
-the execution client is not answering.
+This was accepted knowingly for this change. The intended fix is a tick-driven
+re-drive of the set of blocks that got no verdict. `lean_engine_no_verdict_total` is the
+metric that says it is happening: a non-zero rate means the follower has stopped
+following rather than merely slowed down.
 
 ### `optimistic_roots` does not survive a restart
 

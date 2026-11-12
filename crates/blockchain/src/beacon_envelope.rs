@@ -452,29 +452,6 @@ impl BlockChainServer {
         // for every pre-gloas block it imports (`NotRequired`).
         let status = match self.engine.clone() {
             None => PayloadStatusEnum::Valid,
-            // The running actor applies the envelope now, its payload
-            // `NOT_VALIDATED`, and applies the answer when it arrives (see
-            // `beacon_new_payload`). Blocks built on this payload wait for
-            // that answer, not for this, so a refused envelope can be taken
-            // back out with nothing on top of it.
-            Some(_) if self.answers_payloads_later() => {
-                if let Err(err) = beacon_engine::gloas_new_payload_request(&block, &held.envelope) {
-                    warn!(
-                        %slot,
-                        block_root = %ShortRoot(&root.0),
-                        %err,
-                        "Dropping an envelope that does not match its block"
-                    );
-                    self.refetch_envelope_if_children_wait(root);
-                    return false;
-                }
-                if !self.new_payloads.has_room() {
-                    self.hold_envelope_awaiting_engine(root, slot, held);
-                    return false;
-                }
-                self.ask_about_envelope_payload(&block, &held.envelope, held.envelope_root);
-                PayloadStatusEnum::Syncing
-            }
             Some(client) => {
                 let asked =
                     beacon_engine::ask_envelope_status(&client, &block, &held.envelope).await;
@@ -488,12 +465,11 @@ impl BlockChainServer {
                     // this envelope is bad, the payload the bid names may not
                     // be. Only this envelope is refused, so the builder's real
                     // one can still arrive.
-                    // Since `engine_newPayloadV2` a hash mismatch is answered
-                    // `INVALID` with a null `latestValidHash`
-                    // (`INVALID_BLOCK_HASH` is "supplanted by `INVALID`",
-                    // execution-apis `shanghai.md`), whereas a payload that
-                    // executed and failed normally names its last valid
-                    // ancestor. So a null one is read the same way.
+                    // Some execution clients have no `INVALID_BLOCK_HASH` and
+                    // answer a hash mismatch with `INVALID` and a null
+                    // `latestValidHash` (ethrex does), whereas a payload that
+                    // executed and failed names its last valid ancestor. So a
+                    // null one is read the same way.
                     Ok(raw)
                         if raw.status == PayloadStatusValue::InvalidBlockHash
                             || (raw.status == PayloadStatusValue::Invalid
@@ -579,12 +555,7 @@ impl BlockChainServer {
             slot,
             held.envelope.message.payload.block_hash,
         );
-        // The children waiting on this payload go once it is answered, which
-        // is now unless the question is still out (then
-        // `beacon_new_payload` releases them).
-        if !self.new_payloads.awaits_envelope_answer(&root) {
-            self.envelopes.verified.push_back(root);
-        }
+        self.envelopes.verified.push_back(root);
         let message = &held.envelope.message;
         self.events.publish_envelope_imported(
             &self.store,
@@ -594,44 +565,6 @@ impl BlockChainServer {
             root,
         );
         true
-    }
-
-    /// Release the blocks waiting on `root`'s payload, now that the execution
-    /// client answered for it (`VALID`, or `SYNCING`/`ACCEPTED`).
-    pub(crate) fn release_children_of_answered_payload(&mut self, root: H256) {
-        self.envelopes.verified.push_back(root);
-    }
-
-    /// Take an applied envelope back out: the execution client refused its
-    /// contents (`INVALID` with no `latestValidHash`), which says this copy is
-    /// bad, not that the payload its bid commits to is.
-    ///
-    /// The block keeps its EMPTY branch and goes back to having no payload, so
-    /// a correct envelope can still be applied; this one is refused if it
-    /// comes again. Nothing was built on the FULL node, since blocks building
-    /// on it wait for the answer (`parent_payload_unverified`), and those
-    /// waiting keep waiting: the envelope is asked for again for them.
-    /// Lighthouse and Prysm reach the same state by never applying such an
-    /// envelope, since they wait for the answer first.
-    pub(crate) fn revert_envelope(&mut self, root: H256, envelope_root: H256) {
-        warn!(
-            block_root = %ShortRoot(&root.0),
-            envelope_root = %ShortRoot(&envelope_root.0),
-            "Execution client refused an envelope's contents; taking it back out"
-        );
-        self.store.remove_verified_payload(&root);
-        self.store.remove_beacon_block_payload_status(root);
-        self.store.remove_beacon_envelope_seen(&root);
-        self.envelopes.verified.retain(|verified| *verified != root);
-        self.envelopes.reject(envelope_root);
-        self.envelopes.head_dirty = true;
-        self.refetch_envelope_if_children_wait(root);
-    }
-
-    /// Queue every envelope held because too many payloads were waiting for
-    /// the execution client, now that there is room again.
-    pub(crate) fn release_envelopes_awaiting_engine_room(&mut self) {
-        self.release_envelopes_awaiting_engine();
     }
 
     /// Keep a consensus-valid envelope until the execution client answers.
@@ -977,23 +910,14 @@ impl BlockChainServer {
     /// Whether `block` is a gloas block whose parent is FULL while that
     /// parent's payload is not yet verified: `on_block` would reject it with
     /// `is_payload_verified(store, block.parent_root)`.
-    ///
-    /// Also while the parent's envelope is applied but the execution client
-    /// has not answered for its payload yet. `on_block` would accept the block
-    /// then, but an envelope refused for its contents is taken back out (see
-    /// `revert_envelope`), and nothing may be built on it by that time.
-    /// Lighthouse and Prysm hold the same blocks, by applying an envelope only
-    /// after its answer.
     pub(crate) fn parent_payload_unverified(&self, block: &SignedBeaconBlock) -> bool {
         if !block.fork_name().has_payload_envelopes() {
             return false;
         }
-        let parent_root = block.parent_root();
         matches!(
             fork_choice::get_parent_payload_status(&self.store, block),
             Ok(PayloadStatus::Full)
-        ) && (!fork_choice::is_payload_verified(&self.store, parent_root)
-            || self.new_payloads.awaits_envelope_answer(&parent_root))
+        ) && !fork_choice::is_payload_verified(&self.store, block.parent_root())
     }
 
     /// Keep `block` until its parent's envelope is verified.
@@ -3127,9 +3051,8 @@ mod tests {
         ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
     )]
     async fn an_invalid_verdict_with_a_null_latest_valid_hash_rejects_only_that_envelope() {
-        // How the Engine API reports a payload whose contents do not hash to
-        // its block hash since `engine_newPayloadV2`: INVALID,
-        // `latestValidHash` null.
+        // How ethrex reports a payload whose contents do not hash to its block
+        // hash: INVALID, `latestValidHash` null.
         let (client, mock) =
             mock_engine(status_json("INVALID", None), status_json("SYNCING", None)).await;
         let mut server = server_with_held_child(client).await;
@@ -3151,196 +3074,6 @@ mod tests {
             .receive_envelope(valid_envelope_for_full_parent(), 0)
             .await;
         assert_eq!(count(&mock, "engine_newPayloadV5"), 1);
-    }
-
-    /// The running actor's path: the envelope is applied at once and the
-    /// answer comes back as a message, which the test hands over itself.
-    fn answer_later(
-        server: &mut BlockChainServer,
-    ) -> tokio::sync::mpsc::UnboundedReceiver<crate::beacon_new_payload::NewPayloadAnswered> {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        server.verdict_sink = Some(crate::beacon_new_payload::VerdictSink::Channel(tx));
-        rx
-    }
-
-    #[tokio::test]
-    #[cfg_attr(
-        not(feature = "beacon-spec-tests"),
-        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
-    )]
-    async fn an_envelope_applies_before_its_answer_and_its_full_child_waits_for_it() {
-        let (client, mock) =
-            mock_engine(status_json("VALID", None), status_json("SYNCING", None)).await;
-        let mut server = server_with_held_child(client).await;
-        let mut answers = answer_later(&mut server);
-
-        server
-            .receive_envelope(valid_envelope_for_full_parent(), 0)
-            .await;
-        server.settle_envelopes().await;
-
-        // Applied, not yet judged: the FULL node exists, the child still waits.
-        assert!(server.store.has_verified_payload(&root(FULL_PARENT)));
-        assert!(
-            server
-                .store
-                .beacon_block_payload_status(root(FULL_PARENT))
-                .is_not_validated()
-        );
-        assert!(server.envelopes.is_block_held(&root(FULL_CHILD)));
-
-        let answered = answers.recv().await.expect("an answer");
-        server.on_new_payload_answered(answered).await;
-
-        assert_eq!(
-            server.store.beacon_block_payload_status(root(FULL_PARENT)),
-            PayloadStatusEnum::Valid
-        );
-        assert!(server.store.has_state(&root(FULL_CHILD)).unwrap());
-        assert_eq!(count(&mock, "engine_newPayloadV5"), 1);
-    }
-
-    /// The other order: the child arrives after the envelope is applied but
-    /// before its answer. `on_block` alone would take it then; it waits.
-    #[tokio::test]
-    #[cfg_attr(
-        not(feature = "beacon-spec-tests"),
-        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
-    )]
-    async fn a_child_arriving_while_its_parent_payload_awaits_an_answer_is_held() {
-        let (client, _mock) =
-            mock_engine(status_json("VALID", None), status_json("SYNCING", None)).await;
-        let case = Case::new("on_execution_payload_envelope", FULL_CHILD_CASE);
-        let mut server = case.server(12);
-        server.engine = Some(client);
-        let mut answers = answer_later(&mut server);
-        server
-            .on_block(case.block(FULL_PARENT), ImportTimings::default())
-            .await;
-        fork_choice::on_tick(&mut server.store, 24, &fixture_config());
-        server
-            .receive_envelope(valid_envelope_for_full_parent(), 0)
-            .await;
-        server.settle_envelopes().await;
-        assert!(server.store.has_verified_payload(&root(FULL_PARENT)));
-
-        server
-            .on_block(case.block(FULL_CHILD), ImportTimings::default())
-            .await;
-        assert!(server.envelopes.is_block_held(&root(FULL_CHILD)));
-        assert!(!server.store.has_state(&root(FULL_CHILD)).unwrap());
-
-        let answered = answers.recv().await.expect("an answer");
-        server.on_new_payload_answered(answered).await;
-        assert!(server.store.has_state(&root(FULL_CHILD)).unwrap());
-    }
-
-    #[tokio::test]
-    #[cfg_attr(
-        not(feature = "beacon-spec-tests"),
-        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
-    )]
-    async fn an_envelope_refused_for_its_contents_is_taken_back_out() {
-        let (client, mock) =
-            mock_engine(status_json("INVALID", None), status_json("SYNCING", None)).await;
-        let mut server = server_with_held_child(client).await;
-        let mut answers = answer_later(&mut server);
-        let envelope = valid_envelope_for_full_parent();
-
-        server.receive_envelope(envelope.clone(), 0).await;
-        server.settle_envelopes().await;
-        assert!(server.store.has_verified_payload(&root(FULL_PARENT)));
-
-        let answered = answers.recv().await.expect("an answer");
-        server.on_new_payload_answered(answered).await;
-
-        // Back to no payload, not to an invalid one: a correct envelope can
-        // still be applied, and the child keeps waiting for it.
-        assert!(!server.store.has_verified_payload(&root(FULL_PARENT)));
-        assert!(
-            !server
-                .store
-                .beacon_block_payload_status(root(FULL_PARENT))
-                .is_invalidated()
-        );
-        assert_eq!(
-            server.store.beacon_envelope_seen_ms(&root(FULL_PARENT)),
-            None
-        );
-        assert!(server.envelopes.is_block_held(&root(FULL_CHILD)));
-        assert_eq!(head(&server).1, PayloadStatus::Empty);
-
-        // The same copy is refused if it comes again, without asking.
-        server.receive_envelope(envelope, 0).await;
-        server.settle_envelopes().await;
-        assert!(!server.store.has_verified_payload(&root(FULL_PARENT)));
-        assert_eq!(count(&mock, "engine_newPayloadV5"), 1);
-    }
-
-    #[tokio::test]
-    #[cfg_attr(
-        not(feature = "beacon-spec-tests"),
-        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
-    )]
-    async fn an_answer_that_condemns_the_payload_drops_the_child_waiting_on_it() {
-        // A non-null `latestValidHash`: the payload executed and failed.
-        let (client, _mock) = mock_engine(
-            status_json("INVALID", Some(H256::repeat_byte(0x11))),
-            status_json("SYNCING", None),
-        )
-        .await;
-        let mut server = server_with_held_child(client).await;
-        let mut answers = answer_later(&mut server);
-
-        server
-            .receive_envelope(valid_envelope_for_full_parent(), 0)
-            .await;
-        server.settle_envelopes().await;
-        let answered = answers.recv().await.expect("an answer");
-        server.on_new_payload_answered(answered).await;
-
-        assert!(!server.store.has_verified_payload(&root(FULL_PARENT)));
-        assert_eq!(
-            server.store.beacon_block_payload_status(root(FULL_PARENT)),
-            PayloadStatusEnum::Invalid
-        );
-        assert!(!server.envelopes.is_block_held(&root(FULL_CHILD)));
-        assert!(!server.store.has_state(&root(FULL_CHILD)).unwrap());
-        assert_eq!(head(&server), (root(FULL_PARENT), PayloadStatus::Empty));
-    }
-
-    #[tokio::test]
-    #[cfg_attr(
-        not(feature = "beacon-spec-tests"),
-        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
-    )]
-    async fn no_answer_keeps_the_envelope_and_its_child_waiting() {
-        let (client, mock) = mock_engine("ERROR".to_string(), status_json("SYNCING", None)).await;
-        let mut server = server_with_held_child(client).await;
-        let mut answers = answer_later(&mut server);
-
-        server
-            .receive_envelope(valid_envelope_for_full_parent(), 0)
-            .await;
-        server.settle_envelopes().await;
-        let answered = answers.recv().await.expect("an answer");
-        server.on_new_payload_answered(answered).await;
-
-        assert!(server.store.has_verified_payload(&root(FULL_PARENT)));
-        assert!(server.envelopes.is_block_held(&root(FULL_CHILD)));
-        assert!(
-            server
-                .new_payloads
-                .awaits_envelope_answer(&root(FULL_PARENT))
-        );
-
-        // Asked again on the next slot; this time the client answers.
-        mock.lock().unwrap().new_payload = status_json("SYNCING", None);
-        server.redrive_new_payloads().await;
-        let answered = answers.recv().await.expect("a second answer");
-        server.on_new_payload_answered(answered).await;
-        assert!(server.store.has_state(&root(FULL_CHILD)).unwrap());
-        assert!(count(&mock, "engine_newPayloadV5") >= 2);
     }
 
     #[tokio::test]
