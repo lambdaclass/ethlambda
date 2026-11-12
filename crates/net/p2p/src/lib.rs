@@ -1213,7 +1213,7 @@ impl P2P {
             .beacon()
             .map(|beacon| beacon::scoring::PeerScoring::new(&beacon.config, beacon.fork_digest));
         let local_metadata = built.wire.beacon().map(|beacon| beacon.metadata.clone());
-        let first_status_refresh = status_refresh_interval(&store);
+        let first_status_refresh = status_refresh_tick(&store);
 
         let server = P2PServer {
             swarm_handle,
@@ -1286,8 +1286,8 @@ impl P2P {
             handle.context(),
             p2p_protocol::LeaveExpiredAggregatorSubnets,
         );
-        // The handshake covers a new peer, so the first refresh waits a full
-        // interval.
+        // The refresh timer's first tick. A peer is first due an interval
+        // after its handshake, which `peer_heads` tracks per peer.
         send_after(
             first_status_refresh,
             handle.context(),
@@ -1574,7 +1574,8 @@ pub(crate) trait P2PProtocol: Send + Sync {
     fn advance_fork_schedule(&self) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn refresh_peer_scoring(&self) -> Result<(), ActorError>;
-    /// Re-ask every connected peer for its `Status`; see [`peer_heads`].
+    /// Re-ask the connected peers that are due for their `Status`; see
+    /// [`peer_heads`].
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn refresh_peer_status(&self) -> Result<(), ActorError>;
 }
@@ -1750,9 +1751,12 @@ impl P2PServer {
         beacon::scoring::refresh(self);
     }
 
-    /// Re-ask every connected peer for its `Status`, so the head each one
-    /// reported at the handshake does not go stale while it stays connected.
-    /// Both chains; see [`peer_heads`] for the pace.
+    /// Re-ask the connected peers whose `Status` is an interval old, so the
+    /// head each one reported at the handshake does not go stale while it
+    /// stays connected. Ticks every slot and asks only that slot's share of
+    /// the peers, so the requests are spread over the interval rather than
+    /// sent to every peer at once. Both chains; see [`peer_heads`] for the
+    /// pace.
     #[send_handler]
     async fn handle_refresh_peer_status(
         &mut self,
@@ -1760,11 +1764,17 @@ impl P2PServer {
         ctx: &Context<Self>,
     ) {
         send_after(
-            status_refresh_interval(&self.store),
+            status_refresh_tick(&self.store),
             ctx.clone(),
             p2p_protocol::RefreshPeerStatus,
         );
-        let peers: Vec<PeerId> = self.connected_peers.keys().copied().collect();
+        let wall_slot = peer_heads::wall_clock_slot(self);
+        let interval = status_refresh_slots(&self.store);
+        let peers = self.peer_heads.due_for_refresh(
+            self.connected_peers.keys().copied(),
+            wall_slot,
+            interval,
+        );
         for peer in peers {
             self.peer_heads.begin_refresh(peer);
             request_status(self, peer).await;
@@ -1977,14 +1987,19 @@ async fn fetch_missing_columns(server: &mut P2PServer, block_root: H256, columns
 
 // --- Manual Handler for swarm events ---
 
-/// How often to re-ask every connected peer for its `Status`; see
-/// [`peer_heads`] for the pace on each chain.
-fn status_refresh_interval(store: &Store) -> Duration {
-    let slots = match store.chain() {
+/// Slots between two `Status` requests to the same peer; see [`peer_heads`]
+/// for the pace on each chain.
+fn status_refresh_slots(store: &Store) -> u64 {
+    match store.chain() {
         Chain::Lean => peer_heads::STATUS_REFRESH_SLOTS_LEAN,
         Chain::Beacon => peer_heads::STATUS_REFRESH_SLOTS_BEACON,
-    };
-    Duration::from_millis(store.config().slot_duration_ms.saturating_mul(slots))
+    }
+}
+
+/// The refresh timer's period: one slot, each tick asking that slot's share
+/// of the peers that are due.
+fn status_refresh_tick(store: &Store) -> Duration {
+    Duration::from_millis(store.config().slot_duration_ms)
 }
 
 /// Send `peer` our `Status`, asking for its own: the periodic refresh. The

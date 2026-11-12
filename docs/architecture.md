@@ -169,7 +169,8 @@ flag unset on a placement that does not cover every subnet.
 `sync_status.rs` decides whether the node is behind. It is syncing, and stops attesting
 and proposing, when its head trails the slot clock **and** the head its peers report is
 ahead of its own, since a head derived from a partial view is not worth voting for. The
-peers' head is each connected peer's latest `Status`, re-requested every few slots, which
+peers' head is each connected peer's latest `Status`, re-requested every few slots per peer
+(spread over the interval, so a node with hundreds of peers never asks them all at once), which
 p2p aggregates onto `Store::network_head` (`crates/net/p2p/src/peer_heads.rs`). A
 hysteresis band stops the state from flapping at the boundary, and a network-wide stall
 (nobody else is ahead either) leaves the node synced so its validators can help the chain

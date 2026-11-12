@@ -15,7 +15,11 @@
 //! Peers send `Status` once per connection, so a claim would go stale while
 //! the peer stays connected. [`STATUS_REFRESH_SLOTS_LEAN`] and
 //! [`STATUS_REFRESH_SLOTS_BEACON`] pace a re-request, the way Lighthouse
-//! re-statuses every 300 s and Prysm every half epoch.
+//! re-statuses every 300 s and Prysm every half epoch. The pace is per peer,
+//! counted from that peer's own last exchange, and no slot asks more than its
+//! share of the peers (see [`PeerHeads::due_for_refresh`]), so a node with
+//! hundreds of peers spreads the requests over the interval instead of sending
+//! them all at once.
 
 use std::collections::{HashMap, HashSet};
 
@@ -37,12 +41,12 @@ pub(crate) const PEER_HEAD_QUORUM: usize = 3;
 /// `FUTURE_SLOT_TOLERANCE` and Prysm's `maxFutureStatusHeadSlot`.
 pub(crate) const FUTURE_HEAD_TOLERANCE: u64 = 1;
 
-/// How often a lean node re-asks every connected peer for its `Status`: every
+/// How often a lean node re-asks each connected peer for its `Status`: every
 /// lead the lean sync tracker tolerates (`SyncThresholds::LEAN.peer_lead`), so
 /// a claim is never staler than the gap it is meant to detect.
 pub(crate) const STATUS_REFRESH_SLOTS_LEAN: u64 = 4;
 
-/// How often a beacon node re-asks every connected peer for its `Status`:
+/// How often a beacon node re-asks each connected peer for its `Status`:
 /// Prysm's half epoch (`maintainPeerStatuses`).
 pub(crate) const STATUS_REFRESH_SLOTS_BEACON: u64 = SLOTS_PER_EPOCH / 2;
 
@@ -64,6 +68,9 @@ pub(crate) struct PeerHeads {
     /// Peers whose outstanding `Status` request is a refresh rather than the
     /// handshake; see [`REFRESH_RANGE_SYNC_LEAD_LEAN`].
     refreshing: HashSet<PeerId>,
+    /// The wall-clock slot of each connected peer's last `Status` exchange, in
+    /// either direction: the last time it told us its head, or we asked.
+    last_exchange: HashMap<PeerId, u64>,
 }
 
 impl PeerHeads {
@@ -71,7 +78,9 @@ impl PeerHeads {
     /// [`FUTURE_HEAD_TOLERANCE`]; a peer whose head is dropped loses any
     /// earlier report too, since a peer that claims the future is not one to
     /// believe about the present. Returns whether the head was recorded.
+    /// Either way the exchange postpones `peer`'s next refresh.
     pub(crate) fn record(&mut self, peer: PeerId, head_slot: u64, wall_slot: u64) -> bool {
+        self.last_exchange.insert(peer, wall_slot);
         if head_slot > wall_slot.saturating_add(FUTURE_HEAD_TOLERANCE) {
             self.heads.remove(&peer);
             return false;
@@ -84,6 +93,7 @@ impl PeerHeads {
     pub(crate) fn forget(&mut self, peer: &PeerId) {
         self.heads.remove(peer);
         self.refreshing.remove(peer);
+        self.last_exchange.remove(peer);
     }
 
     /// The network's head as the peers report it: the second-highest report
@@ -100,6 +110,43 @@ impl PeerHeads {
         heads.get(rank).copied()
     }
 
+    /// The connected peers to re-ask for their `Status` at `wall_slot`, at
+    /// most one slot's share of them.
+    ///
+    /// A peer falls due `interval` slots after its last exchange. Each call
+    /// sends at most `connected / interval` (rounded up) of the due peers,
+    /// longest-waiting first, so 200 peers that connected together are
+    /// re-asked across a whole interval rather than in one burst, and from
+    /// then on stay spread out. A peer seen here for the first time is still
+    /// in its handshake, so it counts as having just exchanged. The peers
+    /// returned count as asked at `wall_slot`.
+    pub(crate) fn due_for_refresh(
+        &mut self,
+        connected: impl IntoIterator<Item = PeerId>,
+        wall_slot: u64,
+        interval: u64,
+    ) -> Vec<PeerId> {
+        let interval = interval.max(1);
+        let mut connected_count = 0usize;
+        let mut due = Vec::new();
+        for peer in connected {
+            connected_count += 1;
+            let last = *self.last_exchange.entry(peer).or_insert(wall_slot);
+            if last.saturating_add(interval) <= wall_slot {
+                due.push((last, peer));
+            }
+        }
+        let per_slot = connected_count.div_ceil(usize::try_from(interval).unwrap_or(usize::MAX));
+        due.sort_unstable_by_key(|(last, _)| *last);
+        due.truncate(per_slot);
+        due.into_iter()
+            .map(|(_, peer)| {
+                self.last_exchange.insert(peer, wall_slot);
+                peer
+            })
+            .collect()
+    }
+
     /// Note that the `Status` request about to go to `peer` is a refresh.
     pub(crate) fn begin_refresh(&mut self, peer: PeerId) {
         self.refreshing.insert(peer);
@@ -112,7 +159,7 @@ impl PeerHeads {
 }
 
 /// The slot the wall clock is in, on the store's time grid.
-fn wall_clock_slot(server: &P2PServer) -> u64 {
+pub(crate) fn wall_clock_slot(server: &P2PServer) -> u64 {
     let grid = server.store.config().time_grid();
     unix_now_ms().saturating_sub(grid.genesis_time_ms()) / grid.milliseconds_per_slot
 }
@@ -203,6 +250,51 @@ mod tests {
         heads.forget(&peer);
         assert_eq!(heads.network_head(), None);
         assert!(!heads.take_refresh(&peer));
+        // A reconnect is a fresh handshake, not a refresh that is overdue.
+        assert!(heads.due_for_refresh([peer], 1_000, 4).is_empty());
+    }
+
+    #[test]
+    fn a_peer_is_re_asked_one_interval_after_its_last_exchange() {
+        let mut heads = PeerHeads::default();
+        let peer = PeerId::random();
+        // First seen at slot 10, mid-handshake.
+        assert!(heads.due_for_refresh([peer], 10, 4).is_empty());
+        assert!(heads.due_for_refresh([peer], 13, 4).is_empty());
+        assert_eq!(heads.due_for_refresh([peer], 14, 4), vec![peer]);
+        // Asked at 14, so not again until 18.
+        assert!(heads.due_for_refresh([peer], 17, 4).is_empty());
+        assert_eq!(heads.due_for_refresh([peer], 18, 4), vec![peer]);
+    }
+
+    #[test]
+    fn a_status_from_the_peer_postpones_its_refresh() {
+        // A peer that sent us its `Status` at slot 12 is as fresh as one we
+        // asked then.
+        let mut heads = PeerHeads::default();
+        let peer = PeerId::random();
+        heads.due_for_refresh([peer], 10, 4);
+        heads.record(peer, 12, 12);
+        assert!(heads.due_for_refresh([peer], 14, 4).is_empty());
+        assert_eq!(heads.due_for_refresh([peer], 16, 4), vec![peer]);
+    }
+
+    #[test]
+    fn peers_that_connected_together_are_re_asked_across_an_interval() {
+        // A beacon node's default 200 peers, all connected at slot 0 and due
+        // together at slot 16: no slot asks more than 13 of them, and every
+        // one is asked within the interval after they fell due.
+        let peers: Vec<PeerId> = (0..200).map(|_| PeerId::random()).collect();
+        let mut heads = PeerHeads::default();
+        heads.due_for_refresh(peers.iter().copied(), 0, STATUS_REFRESH_SLOTS_BEACON);
+        let mut asked = HashSet::new();
+        for slot in 16..32 {
+            let batch =
+                heads.due_for_refresh(peers.iter().copied(), slot, STATUS_REFRESH_SLOTS_BEACON);
+            assert!(batch.len() <= 13, "slot {slot} asked {} peers", batch.len());
+            asked.extend(batch);
+        }
+        assert_eq!(asked.len(), peers.len());
     }
 
     #[test]
