@@ -623,8 +623,9 @@ pub fn config_from_spec_response(value: &serde_json::Value) -> Result<Config> {
     if let Some(bps) = spec_u64(value, "AGGREGATE_DUE_BPS")? {
         config.aggregate_due_bps = bps;
     }
-    // The gloas offsets and the payload deadlines. Absent keeps the
-    // specification's defaults already in `Config` (2500, 5000, 5000, 7500).
+    // The gloas offsets, the payload deadlines and EIP-8453's head vote
+    // deadline and support cutoff. Absent keeps the specification's defaults
+    // already in `Config` (2500, 5000, 5000, 7500; 2500, 5000).
     for (key, field) in [
         (
             "ATTESTATION_DUE_BPS_GLOAS",
@@ -650,6 +651,8 @@ pub fn config_from_spec_response(value: &serde_json::Value) -> Result<Config> {
             &mut config.payload_attestation_due_bps,
         ),
         ("INCLUSION_LIST_DUE_BPS", &mut config.inclusion_list_due_bps),
+        ("HEAD_VOTE_DUE_BPS", &mut config.head_vote_due_bps),
+        ("SUPPORT_CUTOFF_BPS", &mut config.support_cutoff_bps),
     ] {
         if let Some(bps) = spec_u64(value, key)? {
             *field = bps;
@@ -1126,6 +1129,28 @@ mod tests {
 
         let config = config_from_spec_response(&serde_json::json!({})).expect("builds");
         assert_eq!(config.inclusion_list_due_bps, 7_500);
+    }
+
+    /// EIP-8453's two duty instants are configuration (fork-choice.md,
+    /// "Configs / Time parameters"), and the head vote and FG attestation run
+    /// at the node's values, not this crate's defaults.
+    #[test]
+    fn the_eip8453_schedule_and_duty_offsets_are_read() {
+        let response = serde_json::json!({
+            "EIP8453_FORK_EPOCH": "7",
+            "EIP8453_FORK_VERSION": "0xa0684879",
+            "HEAD_VOTE_DUE_BPS": "2000",
+            "SUPPORT_CUTOFF_BPS": "4000",
+        });
+        let config = config_from_spec_response(&response).expect("builds");
+        assert_eq!(config.fork_at_epoch(7), ForkName::Eip8453);
+        assert_eq!(config.eip8453_fork_version, [0xa0, 0x68, 0x48, 0x79]);
+        assert_eq!(config.head_vote_due_bps, 2_000);
+        assert_eq!(config.support_cutoff_bps, 4_000);
+
+        let config = config_from_spec_response(&serde_json::json!({})).expect("builds");
+        assert_eq!(config.head_vote_due_bps, 2_500);
+        assert_eq!(config.support_cutoff_bps, 5_000);
     }
 
     /// A node that has not moved to the basis-point form keeps the defaults,

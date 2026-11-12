@@ -437,18 +437,19 @@ pub struct Config {
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub inclusion_list_due_bps: u64,
     /// EIP-8453: basis points of the slot duration by which a head vote is
-    /// due (`fork-choice.md`'s `get_head_vote_due_ms`). Nothing in this build
-    /// reads it yet: the available chain's fork choice and duties are a later
-    /// phase. Parsed so a `config.yaml` carrying it is not warned about and
-    /// `/eth/v1/config/spec` echoes it.
+    /// due (`fork-choice.md`'s `get_head_vote_due_ms`). The node's fork
+    /// choice runs these three due times on a compile-time quarter-slot grid
+    /// and refuses a configuration naming others; `/eth/v1/config/spec`
+    /// echoes them, and the validator client times its head vote by this one
+    /// and its FG attestation by [`Self::support_cutoff_bps`].
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub head_vote_due_bps: u64,
     /// EIP-8453: `fork-choice.md`'s `get_support_cutoff_ms`, in basis points
-    /// of the slot duration. Not read yet, see [`Self::head_vote_due_bps`].
+    /// of the slot duration. See [`Self::head_vote_due_bps`].
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub support_cutoff_bps: u64,
     /// EIP-8453: `fork-choice.md`'s `get_view_freeze_ms`, in basis points of
-    /// the slot duration. Not read yet, see [`Self::head_vote_due_bps`].
+    /// the slot duration. See [`Self::head_vote_due_bps`].
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub view_freeze_bps: u64,
 
