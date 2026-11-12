@@ -716,7 +716,7 @@ reads, and refuses to when that root is optimistic
 ## The first EIP-8483 block over a FULL pre-fork parent
 
 EIP-8483 is implemented from consensus-specs #5809, an open pull request (head
-`a043fda6` when this was written), as a feature fork on heze with its own
+`5dcce0ab` when this was written), as a feature fork on heze with its own
 `EIP8483_FORK_EPOCH`.
 
 - **The specification:** `upgrade_to_eip8483` copies

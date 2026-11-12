@@ -203,9 +203,7 @@ pub fn trials() -> Vec<Trial> {
                 // the state, leaving gaps in its progressive layout.
                 "BeaconState" if fork == ForkName::Heze => check::<heze::BeaconState>(case),
                 // EIP-8483 appends its two PQ registries to heze's state.
-                "BeaconState" if fork == ForkName::Eip8483 => {
-                    check::<eip8483::BeaconState>(case)
-                }
+                "BeaconState" if fork == ForkName::Eip8483 => check::<eip8483::BeaconState>(case),
 
                 "BeaconBlock" if fork == ForkName::Phase0 => check::<phase0::BeaconBlock>(case),
                 "BeaconBlockBody" if fork == ForkName::Phase0 => {

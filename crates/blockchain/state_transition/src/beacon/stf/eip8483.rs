@@ -1,11 +1,13 @@
 //! EIP-8483 (post-quantum material registration): the two request handlers
 //! `specs/_features/eip8483/beacon-chain.md` adds, transcribed from
-//! consensus-specs #5809 at `a043fda6`.
+//! consensus-specs #5809 at `5dcce0ab`.
 //!
 //! A validator's withdrawal address registers 64 bytes of opaque PQ material
 //! for that validator, and a builder's execution address 32 bytes for that
-//! builder. Invalid requests are ignored rather than failing the block, and no
-//! validator or builder status is checked. Each registered 32-byte part must
+//! builder. A validator must have execution (`0x01` or `0x02`) withdrawal
+//! credentials, since a BLS one names no address. Invalid requests are ignored
+//! rather than failing the block, and no validator or builder status is
+//! checked. Each registered 32-byte part must
 //! be unique (the material is public, so anyone could otherwise copy someone
 //! else's), checked against every registration, the requester's own included,
 //! before a later request overwrites an earlier one. Validator and builder
@@ -30,12 +32,12 @@ use crate::beacon::containers::eip8483::{
     ValidatorPQRegistrationRequest,
 };
 use crate::beacon::error::Result;
+use crate::beacon::helpers::electra::has_execution_withdrawal_credential;
 use crate::beacon::primitives::{BlsPubkey, Bytes32, ValidatorIndex};
 
-/// Whether `withdrawal_credentials[12:]` is `source_address`: the
-/// specification's only authorization check. No prefix is checked, so a BLS
-/// (`0x00`) credential's hash bytes are compared too, which no execution
-/// address can be made to match.
+/// Whether `withdrawal_credentials[12:]` is `source_address`. Only meaningful
+/// for an execution credential: a BLS (`0x00`) one holds hash bytes there,
+/// which is why the specification checks the prefix first.
 fn is_withdrawal_address(withdrawal_credentials: &Bytes32, source_address: &[u8; 20]) -> bool {
     withdrawal_credentials.0[12..] == source_address[..]
 }
@@ -53,6 +55,11 @@ pub fn process_validator_pq_registration_request(
     };
     let validator_index = validator_index as ValidatorIndex;
     let validator = state.validator(validator_index)?;
+
+    // Verify the validator has execution withdrawal credentials.
+    if !has_execution_withdrawal_credential(validator) {
+        return Ok(());
+    }
 
     // Verify the request comes from the validator's withdrawal address.
     if !is_withdrawal_address(&validator.withdrawal_credentials, &request.source_address.0) {
@@ -149,19 +156,22 @@ pub fn process_validator_pq_registration_requests(
         return Ok(());
     }
 
-    // The registry position and withdrawal credentials of every requested
-    // key, first occurrence first, as `validator_pubkeys.index(..)` finds it.
+    // The registry position of every requested key, first occurrence first,
+    // as `validator_pubkeys.index(..)` finds it, with its withdrawal
+    // credentials if they are execution ones and `None` if they are BLS.
     let wanted: HashSet<BlsPubkey> = requests
         .iter()
         .map(|request| request.validator_pubkey)
         .collect();
-    let mut resolved: HashMap<BlsPubkey, (ValidatorIndex, Bytes32)> =
+    let mut resolved: HashMap<BlsPubkey, (ValidatorIndex, Option<Bytes32>)> =
         HashMap::with_capacity(wanted.len());
     for (index, validator) in state.iter_validators().enumerate() {
         if wanted.contains(&validator.pubkey) {
+            let credentials = has_execution_withdrawal_credential(validator)
+                .then_some(validator.withdrawal_credentials);
             resolved
                 .entry(validator.pubkey)
-                .or_insert((index as ValidatorIndex, validator.withdrawal_credentials));
+                .or_insert((index as ValidatorIndex, credentials));
         }
     }
 
@@ -172,7 +182,7 @@ pub fn process_validator_pq_registration_requests(
     }
 
     for request in requests {
-        let Some(&(validator_index, withdrawal_credentials)) =
+        let Some(&(validator_index, Some(withdrawal_credentials))) =
             resolved.get(&request.validator_pubkey)
         else {
             continue;
@@ -550,6 +560,22 @@ mod tests {
         assert_validator_ignored(&state, request);
     }
 
+    /// The source address matches the credential's bytes, so only the
+    /// prefix check refuses it (`__bls_credentials_matching_source_address`).
+    #[test]
+    fn validator_bls_credentials_matching_source_address() {
+        let mut state = state();
+        set_withdrawal_credentials(
+            &mut state,
+            0,
+            constants::BLS_WITHDRAWAL_PREFIX,
+            address(0x11),
+        );
+        let request = validator_request(&state, 0, data(0x22, 0x22), None);
+        assert_eq!(request.source_address, address(0x11));
+        assert_validator_ignored(&state, request);
+    }
+
     #[test]
     fn validator_wrong_source_address() {
         let mut state = state();
@@ -797,6 +823,13 @@ mod tests {
         for index in 0..VALIDATORS as u64 {
             set_execution_withdrawal_address(&mut state, index, address(0x10 + index as u8));
         }
+        // Validator 5's address bytes stay, under a BLS prefix.
+        set_withdrawal_credentials(
+            &mut state,
+            5,
+            constants::BLS_WITHDRAWAL_PREFIX,
+            address(0x15),
+        );
         let seeded = [
             validator_request(&state, 6, data(0x60, 0x61), None),
             validator_request(&state, 7, data(0x70, 0x71), None),
@@ -822,8 +855,9 @@ mod tests {
             // Validator 6 moves off its material, and validator 2 takes it.
             validator_request(&state, 6, data(0xe0, 0xe1), None),
             validator_request(&state, 2, data(0x60, 0x61), None),
-            // Wrong address and unknown key.
+            // Wrong address, BLS credentials, and unknown key.
             validator_request(&state, 3, data(0xc0, 0xc1), Some(address(0xff))),
+            validator_request(&state, 5, data(0xc2, 0xc3), None),
             ValidatorPQRegistrationRequest {
                 source_address: address(0x10),
                 validator_pubkey: pubkey(99),

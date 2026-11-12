@@ -1,7 +1,7 @@
 //! Containers EIP-8483 (post-quantum material registration) introduces.
 //!
 //! Transcribed from consensus-specs #5809 (`specs/_features/eip8483/`, head
-//! `a043fda6`), which builds the feature on heze. Two execution layer
+//! `5dcce0ab`), which builds the feature on heze. Two execution layer
 //! triggered requests let a validator's withdrawal address register 64 bytes
 //! of opaque post-quantum material, and a builder's execution address 32
 //! bytes, ahead of a later fork that migrates to post-quantum signatures. The
