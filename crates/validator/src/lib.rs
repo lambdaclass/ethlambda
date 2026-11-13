@@ -52,6 +52,8 @@ use std::time::SystemTime;
 
 use ethlambda_types::beacon::primitives::{BlsPubkey, Bytes32, ExecutionAddress, ValidatorIndex};
 use tokio::sync::{Mutex, RwLock};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::aggregation::AggregationService;
@@ -197,7 +199,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         path = %protection.path().map(|path| path.display().to_string()).unwrap_or_default(),
         "Slashing protection loaded"
     );
-    let protection = Arc::new(std::sync::Mutex::new(protection));
+    let protection = slashing_protection::SharedProtection::new(protection);
 
     let context = Arc::new(SigningContext {
         config: spec,
@@ -217,6 +219,11 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         protection.clone(),
     );
 
+    // Cancelled when the duty loop below ends, whatever ended it: the
+    // keymanager server then stops accepting requests and finishes the ones
+    // in flight, and `run` waits for it before returning.
+    let shutdown = CancellationToken::new();
+    let mut keymanager = None;
     if let Some(address) = config.keymanager {
         let token = http_api::load_or_create_token(&config.validators_dir)?;
         let context = http_api::KeymanagerContext {
@@ -239,117 +246,193 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                 source,
             })?;
         info!(%address, "Keymanager API listening");
-        tokio::spawn(async move {
-            if let Err(err) = axum::serve(listener, router).await {
+        let shutdown = shutdown.clone();
+        keymanager = Some(tokio::spawn(async move {
+            if let Err(err) = http_api::serve(listener, router, shutdown).await {
                 error!(%err, "Keymanager API stopped");
             }
-        });
+        }));
     }
 
-    let mut last_epoch: Option<u64> = None;
-    // The slot whose duties were last attempted, so an overrunning slot does
-    // not cost the next one as well. See `SlotClock::next_slot_to_serve`.
-    let mut served: Option<u64> = None;
+    // The duty loop, as a future that ends only with the error that stopped
+    // it. Not awaited here: `run_until_stopped` races it against the
+    // slashing-protection record becoming unusable.
+    let duty_loop = async {
+        let mut last_epoch: Option<u64> = None;
+        // The slot whose duties were last attempted, so an overrunning slot does
+        // not cost the next one as well. See `SlotClock::next_slot_to_serve`.
+        let mut served: Option<u64> = None;
 
-    loop {
-        // One wake per slot, at the slot boundary, rather than one at the
-        // attester offset.
-        //
-        // A slot has more than one thing due in it and they are due at
-        // different points: a proposer publishes at the boundary, every
-        // attester votes one third in. A loop woken only at the attester
-        // offset can never propose, because by the time it runs the slot it
-        // would be proposing for is already a third gone.
-        //
-        // Waking at the boundary and sleeping further in reaches both, and
-        // gives the epoch refresh below a third of a slot of headroom it did
-        // not have when it ran at the attester offset itself, where every
-        // second it took came straight out of the attestation's lateness.
-        let (slot, delay) = clock.next_slot_to_serve(served, SystemTime::now());
-        tokio::time::sleep(delay).await;
-        served = Some(slot);
+        loop {
+            // One wake per slot, at the slot boundary, rather than one at the
+            // attester offset.
+            //
+            // A slot has more than one thing due in it and they are due at
+            // different points: a proposer publishes at the boundary, every
+            // attester votes one third in. A loop woken only at the attester
+            // offset can never propose, because by the time it runs the slot it
+            // would be proposing for is already a third gone.
+            //
+            // Waking at the boundary and sleeping further in reaches both, and
+            // gives the epoch refresh below a third of a slot of headroom it did
+            // not have when it ran at the attester offset itself, where every
+            // second it took came straight out of the attestation's lateness.
+            let (slot, delay) = clock.next_slot_to_serve(served, SystemTime::now());
+            tokio::time::sleep(delay).await;
+            served = Some(slot);
 
-        let epoch = clock.epoch_of(slot);
+            let epoch = clock.epoch_of(slot);
 
-        if last_epoch != Some(epoch) {
-            // Snapshot the pubkeys and let the guard drop right here, before
-            // `refresh_epoch`'s awaits (a sync check, two duties fetches, a
-            // validator lookup, a subscription POST). Passing the guard
-            // itself in used to extend it across that whole call, because
-            // `&*store.read().await` as a match scrutinee has its temporary
-            // lifetime extended to the entire match. Holding a read lock
-            // that long lets the keymanager's write lock
-            // (`http_api::keystores::import`, held across slow EIP-2335
-            // derivation) queue ahead of it, and since `tokio::sync::RwLock`
-            // is write-preferring, every read after that point, including
-            // this one next epoch, would starve until the import finished.
-            let pubkeys = store.read().await.pubkeys();
-            let refreshed = refresh_epoch(
-                &beacon_node,
-                &mut duties,
-                &pubkeys,
-                epoch,
-                &settings,
-                &store,
-                &context,
-            );
-            match refreshed.await {
-                Ok(()) => last_epoch = Some(epoch),
-                // A beacon node that is down, syncing or answering badly will
-                // likely answer next epoch, so keep the schedule already held
-                // and try again. Anything else will not fix itself, and looping
-                // on it would hide the cause behind a warning every slot.
-                Err(err) if err.is_retryable() => {
-                    warn!(%epoch, %err, "Failed to refresh duties; keeping the previous schedule");
-                    metrics::set_beacon_node_available(false);
-                }
-                // Unreachable today: every error `refresh_epoch` can produce
-                // comes from a `BeaconNodeApi` call, and every variant those
-                // raise is classified retryable (see `Error::is_retryable`).
-                // Kept rather than deleted, since it is the only thing that
-                // would stop the process if a future non-retryable failure
-                // (a local config or key problem, say) ever reached this
-                // point; do not remove it as unreachable dead code.
-                Err(err) => {
-                    error!(%epoch, %err, "Cannot refresh duties; stopping");
-                    return Err(err);
+            if last_epoch != Some(epoch) {
+                // Snapshot the pubkeys and let the guard drop right here, before
+                // `refresh_epoch`'s awaits (a sync check, two duties fetches, a
+                // validator lookup, a subscription POST). Passing the guard
+                // itself in used to extend it across that whole call, because
+                // `&*store.read().await` as a match scrutinee has its temporary
+                // lifetime extended to the entire match. Holding a read lock
+                // that long lets the keymanager's write lock
+                // (`http_api::keystores::import`, held across slow EIP-2335
+                // derivation) queue ahead of it, and since `tokio::sync::RwLock`
+                // is write-preferring, every read after that point, including
+                // this one next epoch, would starve until the import finished.
+                let pubkeys = store.read().await.pubkeys();
+                let refreshed = refresh_epoch(
+                    &beacon_node,
+                    &mut duties,
+                    &pubkeys,
+                    epoch,
+                    &settings,
+                    &store,
+                    &context,
+                );
+                match refreshed.await {
+                    Ok(()) => last_epoch = Some(epoch),
+                    // A beacon node that is down, syncing or answering badly will
+                    // likely answer next epoch, so keep the schedule already held
+                    // and try again. Anything else will not fix itself, and looping
+                    // on it would hide the cause behind a warning every slot.
+                    Err(err) if err.is_retryable() => {
+                        warn!(%epoch, %err, "Failed to refresh duties; keeping the previous schedule");
+                        metrics::set_beacon_node_available(false);
+                    }
+                    // Unreachable today: every error `refresh_epoch` can produce
+                    // comes from a `BeaconNodeApi` call, and every variant those
+                    // raise is classified retryable (see `Error::is_retryable`).
+                    // Kept rather than deleted, since it is the only thing that
+                    // would stop the process if a future non-retryable failure
+                    // (a local config or key problem, say) ever reached this
+                    // point; do not remove it as unreachable dead code.
+                    Err(err) => {
+                        error!(%epoch, %err, "Cannot refresh duties; stopping");
+                        return err;
+                    }
                 }
             }
+
+            // A block is due now, at the boundary this iteration woke on.
+            //
+            // Cloned out of `duties` so the borrow ends before the await: the duty
+            // is three small fields, and holding a borrow of the schedule across
+            // the proposal would stop the next epoch's refresh from replacing it.
+            if let Some(duty) = duties.proposer_at_slot(slot, epoch).cloned() {
+                propose(&proposal, &clock, slot, &duty, &store).await;
+            }
+
+            // The rest of the way to the first of the slot's remaining duties:
+            // the attester offset, or the sync committee offset when the network
+            // puts it earlier. Zero if the refresh or the proposal above already
+            // ran past it, in which case the duty is late rather than skipped.
+            // Each branch of `serve_slot_duties` waits for its own offset.
+            tokio::time::sleep(clock.until_first_slot_duty(slot, SystemTime::now())).await;
+
+            let slot_duties = duties.at_slot(slot, epoch);
+            let committee = duties.ptc_at_slot(slot, epoch);
+            let sync_duties = duties.sync_at_slot(slot);
+            serve_slot_duties(
+                &attestation,
+                &aggregation,
+                &payload_attestation,
+                &sync_committee,
+                &clock,
+                slot,
+                &slot_duties,
+                &committee,
+                &sync_duties,
+                &store,
+            )
+            .await;
         }
+    };
 
-        // A block is due now, at the boundary this iteration woke on.
-        //
-        // Cloned out of `duties` so the borrow ends before the await: the duty
-        // is three small fields, and holding a borrow of the schedule across
-        // the proposal would stop the next epoch's refresh from replacing it.
-        if let Some(duty) = duties.proposer_at_slot(slot, epoch).cloned() {
-            propose(&proposal, &clock, slot, &duty, &store).await;
+    Err(run_until_stopped(duty_loop, &protection, shutdown, keymanager).await)
+}
+
+/// How long the keymanager gets to finish its requests in flight once the
+/// client is stopping.
+///
+/// Generous on purpose. An import decrypts every keystore of its batch before
+/// it registers any, tens of seconds for a full one, and cut short between
+/// saving its keys and registering them it leaves keys the next start
+/// refuses. Nothing waits this long unless a request really is in flight, and
+/// one that never ends must not keep a stopped client from being restarted.
+const KEYMANAGER_DRAIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run `duties` until they stop on their own or the slashing-protection
+/// record becomes unusable, then let the keymanager finish, and say why the
+/// client stopped.
+///
+/// # Stopping on an unusable record
+///
+/// A poisoned record signs no attestation and no block for the rest of the
+/// process (see [`slashing_protection::SharedProtection`]). Carrying on would
+/// leave a client that answers `/health` and does not attest, which nothing
+/// that supervises it has a reason to touch; stopping hands systemd or
+/// Kubernetes the restart. The duties are dropped where they stand, at once,
+/// since the access that poisons the record is the one that raises the
+/// signal. Dropping them is safe for the reason abandoning one at its
+/// deadline is: whatever was signed was recorded first.
+///
+/// # The keymanager goes last
+///
+/// Returning from [`run`] drops the runtime, and a request dropped with it
+/// stops at whichever await it was parked on. For an import that can be
+/// between saving its keys and registering them, the one place it must not
+/// stop (see [`http_api::serve`]). So the server is told to stop and waited
+/// for: on a poisoned record the import's registration fails, and it takes
+/// its keys off disk again before it answers.
+async fn run_until_stopped(
+    duties: impl Future<Output = Error>,
+    protection: &slashing_protection::SharedProtection,
+    shutdown: CancellationToken,
+    keymanager: Option<JoinHandle<()>>,
+) -> Error {
+    let stopped = tokio::select! {
+        err = duties => err,
+        () = protection.unusable() => {
+            let err = Error::SlashingProtectionUnusable {
+                reason: "an access panicked while holding the record, so no attestation or \
+                         block is signed until the validator client is restarted"
+                    .to_string(),
+            };
+            error!(%err, "Stopping so the validator client can be restarted");
+            err
         }
+    };
 
-        // The rest of the way to the first of the slot's remaining duties:
-        // the attester offset, or the sync committee offset when the network
-        // puts it earlier. Zero if the refresh or the proposal above already
-        // ran past it, in which case the duty is late rather than skipped.
-        // Each branch of `serve_slot_duties` waits for its own offset.
-        tokio::time::sleep(clock.until_first_slot_duty(slot, SystemTime::now())).await;
-
-        let slot_duties = duties.at_slot(slot, epoch);
-        let committee = duties.ptc_at_slot(slot, epoch);
-        let sync_duties = duties.sync_at_slot(slot);
-        serve_slot_duties(
-            &attestation,
-            &aggregation,
-            &payload_attestation,
-            &sync_committee,
-            &clock,
-            slot,
-            &slot_duties,
-            &committee,
-            &sync_duties,
-            &store,
-        )
-        .await;
+    shutdown.cancel();
+    if let Some(keymanager) = keymanager {
+        match tokio::time::timeout(KEYMANAGER_DRAIN, keymanager).await {
+            Ok(joined) => {
+                let _ =
+                    joined.inspect_err(|err| error!(%err, "Keymanager API failed while stopping"));
+            }
+            Err(_) => warn!(
+                waited_s = KEYMANAGER_DRAIN.as_secs(),
+                "Keymanager API still has a request in flight; stopping without it"
+            ),
+        }
     }
+    stopped
 }
 
 /// Everything a slot owes after its proposal: attest and aggregate, then the
@@ -1414,5 +1497,115 @@ mod tests {
         )
         .await;
         assert_eq!(node.payload_attestation_data_call_count(), 0);
+    }
+
+    // Stopping.
+
+    /// Stands in for the keymanager server with a request in flight: told to
+    /// stop, it takes `work` to finish, and the flag says when it has.
+    fn keymanager_finishing_in(
+        shutdown: &CancellationToken,
+        work: std::time::Duration,
+    ) -> (JoinHandle<()>, Arc<std::sync::atomic::AtomicBool>) {
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = tokio::spawn({
+            let shutdown = shutdown.clone();
+            let finished = finished.clone();
+            async move {
+                shutdown.cancelled().await;
+                tokio::time::sleep(work).await;
+                finished.store(true, std::sync::atomic::Ordering::Release);
+            }
+        });
+        (handle, finished)
+    }
+
+    /// A record poisoned by one of its accesses stops duties that would
+    /// otherwise never end, and the client is not reported stopped until the
+    /// keymanager has finished what it had in flight.
+    #[tokio::test(start_paused = true)]
+    async fn an_unusable_record_stops_the_client_once_the_keymanager_has_finished() {
+        let protection = slashing_protection::SlashingProtection::in_memory();
+        let shutdown = CancellationToken::new();
+        let (keymanager, finished) =
+            keymanager_finishing_in(&shutdown, std::time::Duration::from_secs(5));
+
+        slashing_protection::blocking(&protection, |_| -> Result<()> {
+            panic!("a bug in the record")
+        })
+        .await
+        .expect_err("the access panicked");
+
+        let stopped = run_until_stopped(
+            std::future::pending(),
+            &protection,
+            shutdown.clone(),
+            Some(keymanager),
+        )
+        .await;
+        assert!(
+            matches!(stopped, Error::SlashingProtectionUnusable { .. }),
+            "got {stopped}"
+        );
+        assert!(shutdown.is_cancelled(), "the keymanager was told to stop");
+        assert!(
+            finished.load(std::sync::atomic::Ordering::Acquire),
+            "its request in flight finishes before the client stops"
+        );
+    }
+
+    /// Duties that end on their own leave the same way: with the error that
+    /// ended them, after the keymanager has finished.
+    #[tokio::test(start_paused = true)]
+    async fn duties_that_stop_on_their_own_also_wait_for_the_keymanager() {
+        let protection = slashing_protection::SlashingProtection::in_memory();
+        let shutdown = CancellationToken::new();
+        let (keymanager, finished) =
+            keymanager_finishing_in(&shutdown, std::time::Duration::from_secs(5));
+
+        let stopped = run_until_stopped(
+            async { Error::BeaconNodeSyncing },
+            &protection,
+            shutdown,
+            Some(keymanager),
+        )
+        .await;
+        assert!(matches!(stopped, Error::BeaconNodeSyncing), "got {stopped}");
+        assert!(finished.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    /// A request that never ends does not keep a stopped client from being
+    /// restarted: the wait for the keymanager is bounded.
+    #[tokio::test(start_paused = true)]
+    async fn a_keymanager_that_never_finishes_does_not_hold_the_client_up() {
+        let protection = slashing_protection::SlashingProtection::in_memory();
+        let keymanager = tokio::spawn(std::future::pending::<()>());
+
+        let before = tokio::time::Instant::now();
+        let stopped = run_until_stopped(
+            async { Error::BeaconNodeSyncing },
+            &protection,
+            CancellationToken::new(),
+            Some(keymanager),
+        )
+        .await;
+        assert!(matches!(stopped, Error::BeaconNodeSyncing), "got {stopped}");
+        assert_eq!(before.elapsed(), KEYMANAGER_DRAIN);
+    }
+
+    /// With no keymanager there is nothing to wait for.
+    #[tokio::test(start_paused = true)]
+    async fn stopping_without_a_keymanager_waits_for_nothing() {
+        let protection = slashing_protection::SlashingProtection::in_memory();
+        let before = tokio::time::Instant::now();
+        let stopped = run_until_stopped(
+            async { Error::BeaconNodeSyncing },
+            &protection,
+            CancellationToken::new(),
+            None,
+        )
+        .await;
+        assert!(matches!(stopped, Error::BeaconNodeSyncing), "got {stopped}");
+        assert_eq!(before.elapsed(), std::time::Duration::ZERO);
     }
 }
