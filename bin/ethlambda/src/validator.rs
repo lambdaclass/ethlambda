@@ -136,7 +136,11 @@ pub(crate) struct ValidatorOptions {
     /// Sent as `produceBlockV4`'s `min_bid`, so gloas only. A bid floor
     /// matters most with `--prefer-builder-proposals`, which otherwise takes
     /// a 1-gwei bid over the local payload. `0` sets no floor.
-    #[arg(long, default_value_t = 0, requires = "builder_proposals")]
+    ///
+    /// Taken with or without `--builder-proposals`: without it, a node whose
+    /// execution client fails at the slot may still build on a pooled bid,
+    /// and this is the floor that bid must clear.
+    #[arg(long, default_value_t = 0)]
     pub(crate) builder_min_bid: u64,
 
     /// Register every loaded key that has no slashing-protection record,
@@ -206,7 +210,6 @@ impl ValidatorOptions {
             } else {
                 self.builder_boost_factor
             },
-            min_bid: self.builder_min_bid,
         })
     }
 
@@ -246,6 +249,7 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
             .then(|| std::net::SocketAddr::new(options.http_address, options.keymanager_port)),
         gas_limit: options.gas_limit,
         builder,
+        builder_min_bid: options.builder_min_bid,
         init_slashing_protection: options.init_slashing_protection,
     })
     .await
@@ -323,10 +327,7 @@ mod tests {
         let options = parse(&["--builder-proposals"]).expect("parses");
         assert_eq!(
             options.builder(),
-            Some(BuilderProposals {
-                boost_factor: 100,
-                min_bid: 0
-            })
+            Some(BuilderProposals { boost_factor: 100 })
         );
     }
 
@@ -336,10 +337,7 @@ mod tests {
             parse(&["--builder-proposals", "--builder-boost-factor", "250"]).expect("parses");
         assert_eq!(
             options.builder(),
-            Some(BuilderProposals {
-                boost_factor: 250,
-                min_bid: 0
-            })
+            Some(BuilderProposals { boost_factor: 250 })
         );
     }
 
@@ -351,7 +349,6 @@ mod tests {
             options.builder(),
             Some(BuilderProposals {
                 boost_factor: u64::MAX,
-                min_bid: 0
             })
         );
     }
@@ -362,21 +359,19 @@ mod tests {
             .expect_err("a factor with builder proposals off is a mistake");
         parse(&["--prefer-builder-proposals"])
             .expect_err("a preference with builder proposals off is a mistake");
-        parse(&["--builder-min-bid", "1000000"])
-            .expect_err("a bid floor with builder proposals off is a mistake");
     }
 
-    /// The floor travels with either way of weighing bids, in gwei as given.
+    /// The floor travels with either way of weighing bids, in gwei as given,
+    /// and without builder proposals too: a node whose local build fails may
+    /// still build on a pooled bid, which the floor then applies to.
     #[test]
-    fn a_min_bid_is_used_beside_the_factor_or_the_preference() {
+    fn a_min_bid_is_taken_with_or_without_builder_proposals() {
         let options =
             parse(&["--builder-proposals", "--builder-min-bid", "1000000"]).expect("parses");
+        assert_eq!(options.builder_min_bid, 1_000_000);
         assert_eq!(
             options.builder(),
-            Some(BuilderProposals {
-                boost_factor: 100,
-                min_bid: 1_000_000
-            })
+            Some(BuilderProposals { boost_factor: 100 })
         );
         let options = parse(&[
             "--builder-proposals",
@@ -385,13 +380,16 @@ mod tests {
             "5",
         ])
         .expect("parses");
+        assert_eq!(options.builder_min_bid, 5);
         assert_eq!(
             options.builder(),
             Some(BuilderProposals {
-                boost_factor: u64::MAX,
-                min_bid: 5
+                boost_factor: u64::MAX
             })
         );
+        let options = parse(&["--builder-min-bid", "1000000"]).expect("parses");
+        assert_eq!(options.builder_min_bid, 1_000_000);
+        assert_eq!(options.builder(), None);
     }
 
     #[test]

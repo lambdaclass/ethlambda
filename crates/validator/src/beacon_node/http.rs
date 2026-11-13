@@ -143,7 +143,7 @@ struct SszResponse {
 /// A node whose local build fails may then still build on a pooled bid (see
 /// `proposal.rs`'s module doc for why that block is signed). `min_bid` is
 /// `--builder-min-bid`, in gwei, the floor below which no p2p bid is taken,
-/// `0` without builder proposals.
+/// with or without builder proposals, so it also bounds that fallback.
 fn builder_config(boost_factor: Option<u64>, min_bid: u64) -> String {
     let factor = boost_factor.unwrap_or(0);
     format!(r#"{{"min_bid":"{min_bid}","builder_boost_factor":"{factor}","builders":[]}}"#)
@@ -1443,6 +1443,7 @@ mod tests {
     async fn a_gloas_production_request_posts_the_factor_and_min_bid_in_its_body() {
         let cases = [
             (None, 0, "0", "0"),
+            (None, 1_000_000, "0", "1000000"),
             (Some(250), 1_000_000, "250", "1000000"),
         ];
         for (factor, min_bid, expected_factor, expected_min_bid) in cases {
