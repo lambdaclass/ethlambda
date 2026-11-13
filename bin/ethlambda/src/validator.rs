@@ -105,7 +105,10 @@ pub(crate) struct ValidatorOptions {
     /// registrations and blinded blocks are fulu and earlier only. From gloas
     /// the builder market works through proposer preferences, which are
     /// published with or without this flag; there it only sets the boost
-    /// factor that weighs p2p bids in `produceBlockV4`.
+    /// factor that weighs p2p bids in `produceBlockV4`. Without it the factor
+    /// is 0, the local payload unless it cannot be built: a node whose
+    /// execution client fails at the slot may still build on a p2p bid, and
+    /// that block is signed.
     #[arg(long, default_value = "false")]
     pub(crate) builder_proposals: bool,
 

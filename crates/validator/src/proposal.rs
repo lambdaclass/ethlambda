@@ -35,10 +35,24 @@
 //! # Gloas: the block, then its envelope
 //!
 //! From gloas the block commits to a bid and the payload is revealed in an
-//! envelope the builder signs. This client only self-builds: when the bid names
-//! the self-build sentinel, the proposer's own key signs the envelope under the
-//! builder domain, and it is published right after the block, in the same
-//! budget. A bid naming anyone else is a builder's to reveal, and is left alone.
+//! envelope the builder signs. This client reveals only its own payloads: when
+//! the bid names the self-build sentinel, the proposer's own key signs the
+//! envelope under the builder domain, and it is published right after the
+//! block, in the same budget. A bid naming anyone else is a builder's to
+//! reveal, and is left alone.
+//!
+//! # A builder's bid without `--builder-proposals`
+//!
+//! Without the flag a gloas block request carries a boost factor of `0`,
+//! which beacon-APIs defines as the local payload unless it cannot be built.
+//! A node whose execution client fails at the slot may therefore build on a
+//! pooled p2p bid, and this client signs that block rather than refusing it.
+//! A refusal would cost the slot as well as its payload, where the bid pays
+//! the fee recipient this validator's preference named. Lighthouse, Prysm and Teku sign it too, and their nodes
+//! fall back the same way; Lodestar refuses it only in its opt-in
+//! `executiononly` mode. Before gloas a blinded block is refused instead, but
+//! for another reason: without the flag this client has no way to publish
+//! one.
 //!
 //! The envelope is not slashable, so slashing protection is untouched by it.
 //!
@@ -461,7 +475,9 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         // Also the implementation's contract, and checked again for the same
         // reason. With builder proposals off this client never publishes a
         // blinded block, so signing one would record the slot in slashing
-        // protection for a block that can never be sent.
+        // protection for a block that can never be sent. A gloas block built
+        // on a builder's bid is not refused here: it is a full block, and the
+        // module doc says why it is signed.
         if produced.is_blinded() && self.builder_boost_factor.is_none() {
             return Err(Error::InconsistentResponse(format!(
                 "node produced a blinded block for slot {slot}; builder proposals are off, so \
@@ -2026,6 +2042,10 @@ mod gloas_tests {
 
     /// A bid naming a builder is that builder's to reveal; this client signs
     /// nothing for it.
+    ///
+    /// The block itself is signed and published, with builder proposals off
+    /// too (this module's service has none): that is the block a node whose
+    /// local build failed builds on a pooled bid. See the module doc.
     #[tokio::test]
     async fn a_builders_bid_gets_no_envelope_from_this_client() {
         let (store, pubkey) = store();

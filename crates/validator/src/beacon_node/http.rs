@@ -139,8 +139,11 @@ struct SszResponse {
 /// bids) is a later phase. The top-level `min_bid` and factor govern the pooled
 /// p2p bids. The factor is the configured `builder_boost_factor` with
 /// `--builder-proposals`, so such a bid can win on value, and `0` without it:
-/// self-build only, as before. `min_bid` is `--builder-min-bid`, in gwei, the
-/// floor below which no p2p bid is taken, `0` without builder proposals.
+/// the local payload unless it cannot be built, as beacon-APIs defines `0`.
+/// A node whose local build fails may then still build on a pooled bid (see
+/// `proposal.rs`'s module doc for why that block is signed). `min_bid` is
+/// `--builder-min-bid`, in gwei, the floor below which no p2p bid is taken,
+/// `0` without builder proposals.
 fn builder_config(boost_factor: Option<u64>, min_bid: u64) -> String {
     let factor = boost_factor.unwrap_or(0);
     format!(r#"{{"min_bid":"{min_bid}","builder_boost_factor":"{factor}","builders":[]}}"#)
