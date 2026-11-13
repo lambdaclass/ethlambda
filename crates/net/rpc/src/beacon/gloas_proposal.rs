@@ -44,7 +44,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use ethlambda_blockchain::checkpoint_hash;
+use ethlambda_blockchain::{SyncStatusController, checkpoint_hash, metrics::SyncStatus};
 use ethlambda_engine::{
     CustodyColumns, EngineClient, ForkchoiceStateV1,
     building::{BuiltGloasPayload, PayloadAttributesV3, PayloadAttributesV4},
@@ -229,6 +229,7 @@ async fn post_produce_block(
     Extension(custody): Extension<NodeCustodyColumns>,
     Extension(cache): Extension<PayloadCache>,
     Extension(OwnVersion(own_version)): Extension<OwnVersion>,
+    Extension(sync_status): Extension<SyncStatusController>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -271,6 +272,10 @@ async fn post_produce_block(
     let builders = builder_config.usable_entries(slot);
     if builders > 0 {
         debug!(%slot, builders, "Not consulting the builder entries of the block production request");
+    }
+    // Before the head is read, as `produceBlockV3` does.
+    if sync_status.get() == SyncStatus::Syncing {
+        return ApiError::ServiceUnavailable("the node is syncing").into_response();
     }
     // Without an execution client a block can only be built on a bid, so a node
     // holding none for the slot has nothing to offer.
@@ -1204,9 +1209,18 @@ mod tests {
     }
 
     fn produce_app(store: Store, engine: Option<EngineClient>) -> Router {
+        produce_app_with_sync(store, engine, SyncStatus::Synced)
+    }
+
+    fn produce_app_with_sync(
+        store: Store,
+        engine: Option<EngineClient>,
+        sync: SyncStatus,
+    ) -> Router {
         routes()
             .with_state(store)
             .layer(Extension(engine))
+            .layer(Extension(SyncStatusController::new(sync)))
             .layer(Extension(SharedSyncCommitteePool::default()))
             .layer(Extension(SharedPayloadAttestationPool::default()))
             .layer(Extension(SharedBuilderMarket::default()))
@@ -1274,6 +1288,21 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// The syncing refusal precedes the execution-client one, so the message
+    /// tells the two apart.
+    #[tokio::test]
+    async fn producing_on_a_syncing_node_is_a_503() {
+        let (store, head_slot) = gloas_scheduled_store();
+        let app = produce_app_with_sync(store, None, SyncStatus::Syncing);
+        let (status, json) = respond(
+            app,
+            produce_request(head_slot + 1, "&include_payload=true", EMPTY_CONFIG),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["message"], "the node is syncing");
     }
 
     #[tokio::test]

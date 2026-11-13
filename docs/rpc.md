@@ -453,8 +453,10 @@ the chain actor writes, so no request waits on the actor.
   root comes from running the block through `process_block`. The answer is
   fulu `BlockContents`: the block, the bundle's cell proofs and its blobs, with
   `Eth-Execution-Payload-Blinded: false`. It is a
-  **`503`** without a configured execution client, or when the bundle is
-  malformed (its commitments, proofs and blobs disagree in count). A slot the
+  **`503`** while the node is syncing (checked before the head is read, as
+  for the duties endpoints), without a configured execution client, or when
+  the bundle is malformed (its commitments, proofs and blobs disagree in
+  count). The head state is advanced to the slot on a blocking thread. A slot the
   schedule does not place at fulu (gloas included) is a `400`, checked before
   the execution client; `produceBlockV3` is the fulu endpoint, and a gloas slot
   goes to `produceBlockV4`. So is a slot that has not started yet: one starting
@@ -609,7 +611,7 @@ entries are decoded and not consulted.
 | `200` JSON | `{version: "gloas", consensus_block_value, execution_payload_value, execution_payload_included, data}`, where `data` is the same container as the SSZ body |
 | Response headers | `Eth-Consensus-Version: gloas`, `Eth-Execution-Payload-Included` (`true` or `false`; always `false` for a bid-won block), `Eth-Execution-Payload-Value` (wei, decimal; a bid's value times `10^9` when it won), `Eth-Consensus-Block-Value` (always `0`: the comparison is of execution payload values only). No `Eth-Builder-Url`: that is for builder-API bids |
 | `400` | A slot the schedule does not place at gloas or that has not started yet (more than 500 ms ahead of this node's clock, as for `produceBlockV3`), a missing or malformed query, a wrong `Eth-Consensus-Version`, a bad body, a slot not after the head block, or a `randao_reveal` that does not verify against the slot's proposer. The slot check precedes the execution-client check, so it is a `400` on any node |
-| `503` | No execution client and no viable pooled bid for the slot, the execution client did not start or return a build (and no bid took its place), the node is building on a FULL parent whose envelope it does not hold, or the winning bid failed to build and there is no local payload to fall back on |
+| `503` | The node is syncing (checked before the head is read), no execution client and no viable pooled bid for the slot, the execution client did not start or return a build (and no bid took its place), the node is building on a FULL parent whose envelope it does not hold, or the winning bid failed to build and there is no local payload to fall back on |
 
 The node advances the head state to the slot, and decides which parent payload
 to build on with `should_build_on_full` over the payload status fork choice

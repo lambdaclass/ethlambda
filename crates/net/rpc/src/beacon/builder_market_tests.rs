@@ -280,6 +280,9 @@ impl World {
             .with_state(self.store.clone())
             .layer(Extension(p2p))
             .layer(Extension(engine.map(|engine| engine.client.clone())))
+            .layer(Extension(ethlambda_blockchain::SyncStatusController::new(
+                ethlambda_blockchain::metrics::SyncStatus::Synced,
+            )))
             .layer(Extension(SharedPayloadAttestationPool::default()))
             .layer(Extension(SharedSyncCommitteePool::default()))
             .layer(Extension(crate::beacon::graffiti::OwnVersion(Arc::new(

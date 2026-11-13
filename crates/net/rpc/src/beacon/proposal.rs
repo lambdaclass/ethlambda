@@ -26,7 +26,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use ethlambda_blockchain::metrics::SyncStatus;
+use ethlambda_blockchain::{SyncStatusController, metrics::SyncStatus};
 use ethlambda_engine::{
     EngineClient, ForkchoiceStateV1,
     building::{BuiltPayload, PayloadAttributesV3},
@@ -526,6 +526,7 @@ async fn get_block(
     Extension(sync_pool): Extension<SharedSyncCommitteePool>,
     Extension(fee_recipients): Extension<FeeRecipients>,
     Extension(OwnVersion(own_version)): Extension<OwnVersion>,
+    Extension(sync_status): Extension<SyncStatusController>,
     builder: Option<Extension<Arc<Builder>>>,
     headers: HeaderMap,
 ) -> Response {
@@ -551,6 +552,12 @@ async fn get_block(
     .and_then(|()| refuse_future_slot(&store.config(), slot))
     {
         return err.into_response();
+    }
+    // Before the head is read: a syncing node's head is not the chain's. This
+    // does not bound the advance in `produce`: the tracker reads a node more
+    // than 8 slots behind as a stalled network, not as syncing (#559).
+    if sync_status.get() == SyncStatus::Syncing {
+        return ApiError::ServiceUnavailable("the node is syncing").into_response();
     }
     let Some(engine) = engine else {
         return ApiError::ServiceUnavailable(
@@ -671,6 +678,10 @@ struct BuilderRequest<'a> {
 /// if the first fails. A valid bid waits for the local payload only until
 /// [`LOCAL_BUILD_DEADLINE`] (see [`local_and_bid`]). Without a builder the
 /// block is built exactly as it is without one.
+///
+/// The head state is advanced to `slot` on a blocking thread, as
+/// `produceBlockV4` does: behind a stalled network, the head can be epochs
+/// short of the slot, and that advance is the work the proposal needs.
 #[allow(clippy::too_many_arguments)]
 async fn produce(
     store: &Store,
@@ -686,14 +697,21 @@ async fn produce(
     graffiti: Bytes32,
 ) -> Result<(Produced, String, ForkName), ApiError> {
     let config = store.config();
-    let (head_root, head_state) = head(store)?;
-    if slot <= head_state.slot() {
-        return Err(ApiError::BadRequest("slot is not after the head block"));
-    }
-    let state = advance_to_slot(&head_state, slot, &config).map_err(|err| {
-        warn!(%slot, %err, "Advancing the head state to the proposal slot failed");
-        ApiError::Internal("advancing the head state failed")
-    })?;
+    let advance_store = store.clone();
+    let advance_config = Arc::clone(&config);
+    let (head_root, state) = tokio::task::spawn_blocking(move || {
+        let (head_root, head_state) = head(&advance_store)?;
+        if slot <= head_state.slot() {
+            return Err(ApiError::BadRequest("slot is not after the head block"));
+        }
+        let state = advance_to_slot(&head_state, slot, &advance_config).map_err(|err| {
+            warn!(%slot, %err, "Advancing the head state to the proposal slot failed");
+            ApiError::Internal("advancing the head state failed")
+        })?;
+        Ok((head_root, state))
+    })
+    .await
+    .map_err(|_| ApiError::Internal("advancing the head state failed"))??;
     let fork = state.fork_name();
     let proposer =
         ethlambda_state_transition::beacon::helpers::accessors::get_beacon_proposer_index(&state)
@@ -1282,9 +1300,18 @@ mod tests {
     }
 
     fn produce_app(store: Store, engine: Option<EngineClient>) -> Router {
+        produce_app_with_sync(store, engine, SyncStatusController::new(SyncStatus::Synced))
+    }
+
+    fn produce_app_with_sync(
+        store: Store,
+        engine: Option<EngineClient>,
+        sync_status: SyncStatusController,
+    ) -> Router {
         routes()
             .with_state(store)
             .layer(Extension(engine))
+            .layer(Extension(sync_status))
             .layer(Extension(SharedSyncCommitteePool::default()))
             .layer(Extension(FeeRecipients::default()))
             .layer(Extension(OwnVersion(Arc::new(
@@ -1370,19 +1397,7 @@ mod tests {
     #[tokio::test]
     async fn producing_a_gloas_slot_is_a_400_even_with_no_execution_client() {
         let (store, head_slot) = gloas_scheduled_store();
-        let app = routes()
-            .with_state(store)
-            .layer(Extension(None::<EngineClient>))
-            .layer(Extension(SharedSyncCommitteePool::default()))
-            .layer(Extension(FeeRecipients::default()))
-            .layer(Extension(OwnVersion(Arc::new(
-                ethlambda_engine::types::ClientVersionV1 {
-                    code: "LA".to_string(),
-                    name: "ethlambda".to_string(),
-                    version: "ethlambda/test".to_string(),
-                    commit: "0x3c4d7e8f".to_string(),
-                },
-            ))));
+        let app = produce_app(store, None);
         let uri = format!(
             "/eth/v3/validator/blocks/{}?randao_reveal=0x{}",
             head_slot + 1,
@@ -1684,8 +1699,12 @@ mod tests {
     use std::time::Duration;
 
     impl BuilderWorld {
+        /// The production wiring: the router and the builder read one sync
+        /// status.
         fn app(&self, engine: Option<EngineClient>) -> Router {
-            produce_app(self.store.clone(), engine).layer(Extension(self.builder.clone()))
+            let sync_status = self.builder.sync_status.clone();
+            produce_app_with_sync(self.store.clone(), engine, sync_status)
+                .layer(Extension(self.builder.clone()))
         }
 
         fn uri(&self, query: &str) -> String {
@@ -1909,12 +1928,22 @@ mod tests {
         answer.assert(&world, false, "42", 0);
     }
 
+    /// Refused before the head is read, so neither the execution client nor
+    /// the builder is asked. The breaker's own syncing trip is covered in
+    /// `breaker`.
     #[tokio::test]
-    async fn a_syncing_node_keeps_the_builder_out() {
+    async fn a_syncing_node_answers_503_and_asks_no_builder() {
         let world = builder_world(true, SyncStatus::Syncing).await;
         world.offer(ETH, |_| {});
         let answer = produce(&world, "0x2a", false, "").await;
-        answer.assert(&world, false, "42", 0);
+        assert_eq!(
+            answer.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            answer.json
+        );
+        assert_eq!(answer.json["message"], "the node is syncing");
+        assert!(world.relay.header_requests().is_empty());
     }
 
     #[tokio::test]
