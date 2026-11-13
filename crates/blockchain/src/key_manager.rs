@@ -128,12 +128,12 @@ impl KeyManager {
     /// Skips the warm while the previous one is still running: the only cost
     /// is latency, since `sign` rebuilds a missing subtree itself.
     pub fn prepare_keys_in_background(&mut self, slot: u32, proposer: Option<u64>) {
-        if let Some(worker) = self.warm_worker.take() {
-            if !worker.is_finished() {
-                warn!(slot, "Previous XMSS warm still running, skipping this one");
-                self.warm_worker = Some(worker);
-                return;
-            }
+        if let Some(worker) = self.warm_worker.take()
+            && !worker.is_finished()
+        {
+            warn!(slot, "Previous XMSS warm still running, skipping this one");
+            self.warm_worker = Some(worker);
+            return;
         }
 
         let keys = self.keys_to_warm(proposer);
