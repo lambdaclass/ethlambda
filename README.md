@@ -36,8 +36,6 @@ mv ethlambda-linux-x86_64 ethlambda && mv ethrex-linux-x86_64 ethrex
 ./ethlambda --version && ./ethrex --version
 
 mkdir -p beacon-data ethrex-data
-# A persisted key keeps the node's identity, and so its custody set, stable across restarts
-openssl rand -hex 32 > beacon-data/node-key
 # The secret both clients authenticate the Engine API with
 openssl rand -hex 32 > jwt.hex
 
@@ -51,7 +49,6 @@ openssl rand -hex 32 > jwt.hex
 ./ethlambda beacon \
   --network                mainnet \
   --checkpoint-sync-url    https://beaconstate.ethstaker.cc \
-  --node-key               beacon-data/node-key \
   --data-dir               beacon-data/db \
   --discovery.advertise-ip "$(curl -s https://ifconfig.me)" \
   --execution-endpoint     http://127.0.0.1:8551 \
@@ -134,8 +131,6 @@ docker pull ghcr.io/lambdaclass/ethlambda:latest
 docker pull ghcr.io/lambdaclass/ethrex
 
 mkdir -p beacon-data ethrex-data
-# A persisted key keeps the node's identity, and so its custody set, stable across restarts
-openssl rand -hex 32 > beacon-data/node-key
 # The secret both clients authenticate the Engine API with
 openssl rand -hex 32 > jwt.hex
 # This host's public address, published in the node's ENR (see above)
@@ -166,7 +161,6 @@ docker run -d --name ethlambda-beacon --network ethereum --stop-signal SIGINT --
   ghcr.io/lambdaclass/ethlambda:latest beacon \
   --network                mainnet \
   --checkpoint-sync-url    https://beaconstate.ethstaker.cc \
-  --node-key               /data/node-key \
   --data-dir               /data/db \
   --http-address           0.0.0.0 \
   --discovery.advertise-ip "$PUBLIC_IP" \
@@ -184,8 +178,6 @@ and no `--execution-*` flags.
 docker pull ghcr.io/lambdaclass/ethlambda:latest
 
 mkdir -p beacon-data
-# A persisted key keeps the node's identity, and so its custody set, stable across restarts
-openssl rand -hex 32 > beacon-data/node-key
 # This host's public address, published in the node's ENR (see above)
 PUBLIC_IP=$(curl -s https://ifconfig.me)
 
@@ -199,7 +191,6 @@ docker run -d --name ethlambda-beacon --stop-signal SIGINT --stop-timeout 60 \
   ghcr.io/lambdaclass/ethlambda:latest beacon \
   --network                mainnet \
   --checkpoint-sync-url    https://beaconstate.ethstaker.cc \
-  --node-key               /data/node-key \
   --data-dir               /data/db \
   --http-address           0.0.0.0 \
   --discovery.advertise-ip "$PUBLIC_IP"
@@ -302,7 +293,6 @@ what they sign.
 ./target/release/ethlambda beacon \
   --network             mainnet \
   --checkpoint-sync-url <beacon-api-url> \
-  --node-key            ./node-key \
   --data-dir            ./data
 ```
 
@@ -310,7 +300,7 @@ what they sign.
 |---|---|
 | `--network` | `mainnet` (default), `sepolia`, `hoodi`, `plataberget`, or a path to a directory of network files (`config.yaml`, `genesis.ssz`, optionally `bootstrap_nodes.yaml`), the layout `eth-clients` publishes and kurtosis mounts |
 | `--checkpoint-sync-url` | Where the anchor comes from. Required on a fresh data directory for a built-in network, since those never start from genesis. A resumable data directory is used before it; a network loaded from a directory anchors at its own `genesis.ssz` when no URL is given |
-| `--node-key` | Optional, but worth persisting: the columns this node custodies are a function of its node id, so without a key file it changes identity, and custody set, on every restart |
+| `--node-key` | Optional. Without it, the node generates a key on the data directory's first start and keeps it there as `node.key`, so its identity, and with it the columns it custodies, stays the same across restarts |
 | `--execution-endpoint`, `--execution-jwt-secret` | Optional Engine API pairing, given together. Without them, blocks import without payload validation |
 
 A built-in network needs nothing else on disk. Its `eth-clients` `config.yaml`

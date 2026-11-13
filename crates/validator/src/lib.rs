@@ -37,7 +37,7 @@ pub mod metrics;
 pub mod payload_attestation;
 pub mod proposal;
 pub mod proposer_settings;
-pub(crate) mod secure_fs;
+pub mod secure_fs;
 pub mod signing;
 pub mod slashing_protection;
 pub mod slot_clock;

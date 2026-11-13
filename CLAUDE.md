@@ -421,10 +421,14 @@ where a bad value is reported.
 `run_node` owns everything that is not chain-specific, in order: the discv5
 port check, metrics registration, the banner and version log, the
 `RLIMIT_NOFILE` raise, the `HIVE_LEAN_TEST_DRIVER` early return (lean-only, and
-it must still precede key loading), `--node-key` resolution, resolving
-`--network` into a `NetworkSource` (mainnet only; must precede the next step,
-since a loaded network's own bootnode list is part of its fallback), reading
-`--bootnodes`, and building the aggregator, sync-status and event handles.
+it must still precede key loading), resolving `--network` into a
+`NetworkSource` (mainnet only; must precede the next step, since a loaded
+network's own bootnode list is part of its fallback), reading `--bootnodes`,
+building the aggregator, sync-status and event handles, opening `--data-dir`'s
+RocksDB backend, and `--node-key` resolution. That last one comes after the
+open because, without `--node-key`, the identity is `<data-dir>/node.key`,
+generated and stored on the directory's first start, and RocksDB's lock is
+what keeps two processes on one directory from racing to write it.
 
 It then branches **once**, on `network`, both arms inline, each evaluating to a
 `ChainSetup`: the wire configuration, the ENR entries that describe it, the
