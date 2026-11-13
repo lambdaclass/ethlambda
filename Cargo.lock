@@ -2275,6 +2275,7 @@ dependencies = [
  "ethlambda-metrics",
  "ethlambda-types",
  "futures",
+ "futures-util",
  "hex",
  "hmac",
  "http-body-util",

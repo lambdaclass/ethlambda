@@ -6,6 +6,7 @@
 //! beacon node sent: the wire representation is a transport detail, and the
 //! chain only ever agrees about the merkle root.
 
+use ethlambda_types::beacon::builder::ValidatorRegistrationV1;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::constants::{
     DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_BUILDER,
@@ -30,7 +31,7 @@ use ethlambda_types::beacon::primitives::{
 // `AttestationData`, `Checkpoint`, `Fork` and `SigningData` all live in
 // `containers::shared`, verified against `containers/shared.rs:158,120,97,220`.
 use ethlambda_types::beacon::signing::{
-    compute_domain, compute_epoch_at_slot, compute_signing_root,
+    compute_builder_domain, compute_domain, compute_epoch_at_slot, compute_signing_root,
 };
 
 use std::collections::HashMap;
@@ -671,6 +672,49 @@ impl SigningContext {
         .await
     }
 
+    /// A builder registration's signature.
+    ///
+    /// Signed under `compute_builder_domain(genesis_fork_version)`: the genesis
+    /// fork version and a zero validators root, per builder-specs, so a
+    /// registration verifies whatever fork the chain is in. Not
+    /// `DOMAIN_BEACON_BUILDER`, which is gloas's envelope domain. Not
+    /// slashable: a registration commits to nothing about the chain, and a
+    /// builder keeps only the newest one per validator.
+    ///
+    /// The one synchronous `sign_*`, and local keys only. Registrations are
+    /// signed in bulk on the blocking pool, under a store read guard taken per
+    /// chunk (see [`crate::registration`]), to keep thousands of signatures off
+    /// the runtime; a remote signer's round trip has no place there. A key a
+    /// Web3Signer holds is refused, and goes unregistered: it gets no builder
+    /// bid and its blocks are built locally, which costs no duty.
+    pub fn sign_validator_registration(
+        &self,
+        store: &ValidatorStore,
+        registration: &ValidatorRegistrationV1,
+    ) -> Result<BlsSignature> {
+        let pubkey = &registration.pubkey;
+        match store
+            .signer(pubkey)
+            .ok_or(Error::UnknownValidator(*pubkey))?
+        {
+            SigningMethod::LocalKeystore { secret_key } => {
+                let domain = compute_builder_domain(self.config.genesis_fork_version);
+                let root = compute_signing_root(registration.hash_tree_root(), domain);
+                let signature = secret_key.sign(root.as_slice(), DST, &[]);
+                let bytes: [u8; BLS_SIGNATURE_SIZE] = signature.to_bytes();
+                Ok(BlsSignature(bytes))
+            }
+            SigningMethod::Web3Signer { signer } => Err(Error::Signing {
+                pubkey: *pubkey,
+                reason: format!(
+                    "builder registrations are not signed through a remote signer yet; the key \
+                     held by {} is not registered with the builder",
+                    signer.url()
+                ),
+            }),
+        }
+    }
+
     /// Sign a payload timeliness committee vote on behalf of `pubkey`.
     ///
     /// Not slashable by the specification, and deduplicated per validator and
@@ -1013,6 +1057,68 @@ mod tests {
             state_root: Root::repeat_byte(2),
             body_root: Root::repeat_byte(3),
         }
+    }
+
+    fn registration(pubkey: BlsPubkey) -> ValidatorRegistrationV1 {
+        ValidatorRegistrationV1 {
+            fee_recipient: ethlambda_types::beacon::primitives::H160([0xab; 20]),
+            gas_limit: 36_000_000,
+            timestamp: 1_700_000_000,
+            pubkey,
+        }
+    }
+
+    /// A context whose genesis validators root is not zero, so the builder
+    /// domain (which zeroes it) and a context-derived one cannot coincide.
+    fn context_with_validators_root() -> SigningContext {
+        SigningContext::new(Config::mainnet(), Root::repeat_byte(0x42))
+    }
+
+    #[test]
+    fn a_registration_is_signed_under_the_builder_domain() {
+        use ethlambda_types::beacon::constants::DOMAIN_APPLICATION_BUILDER;
+
+        let (store, pubkey) = store_with_key();
+        let context = context_with_validators_root();
+        let registration = registration(pubkey);
+
+        let signature = context
+            .sign_validator_registration(&store.blocking_read(), &registration)
+            .expect("signs");
+
+        let root = compute_signing_root(
+            registration.hash_tree_root(),
+            compute_builder_domain(Config::mainnet().genesis_fork_version),
+        );
+        assert!(verify(&pubkey, &signature, root));
+
+        // The same domain type under this chain's validators root is a
+        // different domain: a context-derived one would not verify.
+        let with_root = compute_signing_root(
+            registration.hash_tree_root(),
+            context.domain(DOMAIN_APPLICATION_BUILDER, 0),
+        );
+        assert!(!verify(&pubkey, &signature, with_root));
+    }
+
+    /// The registration domain is not gloas's envelope domain, whose type
+    /// constant is similar in name only: a signature under one must not verify
+    /// under the other.
+    #[test]
+    fn a_registration_does_not_verify_under_the_envelope_domain() {
+        let (store, pubkey) = store_with_key();
+        let context = context_with_validators_root();
+        let registration = registration(pubkey);
+
+        let signature = context
+            .sign_validator_registration(&store.blocking_read(), &registration)
+            .expect("signs");
+
+        let envelope_root = compute_signing_root(
+            registration.hash_tree_root(),
+            context.domain(DOMAIN_BEACON_BUILDER, 0),
+        );
+        assert!(!verify(&pubkey, &signature, envelope_root));
     }
 
     #[tokio::test]

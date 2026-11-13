@@ -862,11 +862,14 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   and a block at slot N packs only `(N-1, parent_root)`, replaced by the empty
   aggregate when `verified_sync_aggregate` fails (see `docs/spec_deviations.md`).
   `SlotClock` picks the
-  offsets by each slot's own fork, and `/eth/v1/config/spec` supplies them. It
+  offsets by each slot's own fork, and `/eth/v1/config/spec` supplies them. With
+  `--builder-proposals`, pre-gloas slots register validators with the node's builder
+  and may sign a blinded block, published to the producing node only. It
   keeps EIP-3076 minimal-watermark slashing protection in
   `--validators-dir/slashing_protection.json` (`crate::slashing_protection`),
-  durable before every block and attestation signature; PTC votes have an
-  in-memory `(validator, slot)` dedup only, and envelopes are unguarded. A key can live
+  durable before every block (blinded ones included) and attestation signature;
+  PTC votes have an in-memory `(validator, slot)` dedup only, and envelopes are
+  unguarded. A key can live
   in a Web3Signer instead of the process (`SigningMethod::Web3Signer`,
   `keys/web3signer.rs`): every `SigningContext::sign_*` is async, resolves the
   signer under a read guard scoped to the lookup and signs after releasing it,
