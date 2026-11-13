@@ -47,8 +47,8 @@ use libssz::{SszDecode, SszEncode};
 use crate::metrics::StateCacheMethod;
 use crate::state_codec::encode_state_value;
 use crate::state_writer::{
-    CacheKey, PendingStates, STATE_WRITE_QUEUE_CAPACITY, StateCache, StateWriteRequest,
-    StateWriterHandle, cache_get, read_state,
+    CacheKey, PendingStates, STATE_WRITE_QUEUE_CAPACITY, StateCache, StateRebuilds,
+    StateWriteRequest, StateWriterHandle, cache_get, read_state,
 };
 use thiserror::Error;
 use tracing::{info, warn};
@@ -1076,6 +1076,16 @@ pub(crate) fn block_slot(backend: &dyn StorageBackend, chain: Chain, root: &H256
 /// second read view while holding the first can deadlock against a writer
 /// queued between the two on a backend whose read lock is not reentrant.
 pub(crate) fn block_slot_in(view: &dyn StorageReadView, chain: Chain, root: &H256) -> Option<u64> {
+    try_block_slot_in(view, chain, root).expect("read")
+}
+
+/// [`block_slot_in`], returning a failed read rather than panicking on it,
+/// for the state rebuild in `read_state`, whose callers handle a storage error.
+pub(crate) fn try_block_slot_in(
+    view: &dyn StorageReadView,
+    chain: Chain,
+    root: &H256,
+) -> Result<Option<u64>, crate::api::Error> {
     match chain {
         Chain::Beacon => {
             view.read_with(Table::BlockHeaders, &root.to_ssz(), peek_beacon_block_slot)
@@ -1086,7 +1096,6 @@ pub(crate) fn block_slot_in(view: &dyn StorageReadView, chain: Chain, root: &H25
                 .slot
         }),
     }
-    .expect("read")
 }
 
 /// Fork choice store backed by a pluggable storage backend.
@@ -1170,6 +1179,10 @@ pub struct Store {
     /// States handed to the writer but not yet committed; see
     /// [`PendingStates`].
     pending_states: Arc<PendingStates>,
+    /// Block-state rebuilds under way, shared with the writer thread, so
+    /// concurrent misses on one root read it from storage once; see
+    /// [`StateRebuilds`].
+    state_rebuilds: Arc<StateRebuilds>,
     /// Committee shufflings shared across everything that asks a beacon state
     /// which validators attest at a slot: the state transition as it
     /// processes a block's attestations, fork choice as it replays those same
@@ -1823,11 +1836,13 @@ impl Store {
     ) -> Self {
         let state_cache = new_state_cache();
         let pending_states = Arc::new(PendingStates::default());
+        let state_rebuilds = Arc::new(StateRebuilds::default());
         let state_writer = Arc::new(StateWriterHandle::spawn(
             backend.clone(),
             chain,
             state_cache.clone(),
             pending_states.clone(),
+            state_rebuilds.clone(),
         ));
         Self {
             backend,
@@ -1844,6 +1859,7 @@ impl Store {
             operation_pool: Default::default(),
             state_cache,
             pending_states,
+            state_rebuilds,
             committee_cache: Arc::new(CommitteeCache::default()),
             observed_liveness: Arc::new(ObservedLiveness::default()),
             active_balance_cache: Arc::new(ActiveBalanceCache::default()),
@@ -3246,12 +3262,25 @@ impl Store {
     /// [`read_state`](crate::state_writer::read_state), which this calls
     /// directly rather than restating: one copy of the algorithm is one copy
     /// that can go stale.
+    ///
+    /// Safe to call from many threads for the same root at once: a miss
+    /// that finds a rebuild of `root` already under way waits for it and
+    /// returns its state rather than reading the state again. See
+    /// [`StateRebuilds`].
+    ///
+    /// `Ok(None)` when no state is stored for `root`. `Err` when a read from
+    /// the backend fails or a stored row does not decode
+    /// ([`Error::CorruptState`]), wrapped in [`Error::StateRebuild`]. A
+    /// corrupt state is shared with every caller that waited on its rebuild;
+    /// a failed read is returned only by the caller that ran it, and a caller
+    /// that waited on it reads again.
     pub fn get_state(&self, root: &H256) -> Result<Option<Arc<BeaconState>>, Error> {
         read_state(
             self.backend.as_ref(),
             self.chain,
             &self.state_cache,
             &self.pending_states,
+            &self.state_rebuilds,
             root,
         )
     }
@@ -7466,6 +7495,44 @@ mod tests {
         for (root, encoded) in expected.into_iter().rev() {
             let state = cold.get_state(&root).expect("get").expect("present");
             assert_eq!(state.to_ssz(), encoded);
+        }
+    }
+
+    #[test]
+    fn a_corrupt_beacon_state_reads_back_as_an_error_and_is_not_cached() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        let mut store = beacon_test_store(backend.clone());
+        // Slot 0 is a snapshot and slot 1 a delta on it, so the two reads
+        // below cover a snapshot that does not decode and a delta that has
+        // the wrong base to apply to.
+        let tip = insert_beacon_chain(&mut store, 0..=1, H256::ZERO);
+        drop(store);
+
+        let snapshot_root = beacon_chain_root(0);
+        let truncated = vec![(
+            encode_slot_root_key(0, &snapshot_root),
+            vec![ForkName::Electra.selector(), 0, 1, 2],
+        )];
+        let mut batch = backend.begin_write().expect("write batch");
+        batch
+            .put_batch(Table::States, truncated)
+            .expect("put state");
+        batch.commit().expect("commit");
+
+        let cold = beacon_test_store(backend);
+        for root in [snapshot_root, tip] {
+            let err = cold
+                .get_state(&root)
+                .expect_err("a corrupt state is an error, not a panic");
+            assert!(
+                matches!(
+                    &err,
+                    Error::StateRebuild(shared)
+                        if matches!(**shared, Error::CorruptState { root: r, .. } if r == root)
+                ),
+                "got {err:?}"
+            );
+            assert!(cold.cached_state(CacheKey::BlockState(root)).is_none());
         }
     }
 

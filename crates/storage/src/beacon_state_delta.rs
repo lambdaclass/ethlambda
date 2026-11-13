@@ -21,7 +21,7 @@
 //! `insert_state`/`get_state` (in `store.rs`) call into this module for the
 //! beacon arm: `insert_state` writes a snapshot at anchors and a
 //! [`frame`]d [`encode`] otherwise, and `get_state` follows the frame's base
-//! and [`decode`]s it back, via [`unframe`].
+//! and decodes it back ([`try_decode`]), via [`unframe`].
 //!
 //! The base of a delta is the nearest snapshot on the state's branch, not its
 //! parent. A read is then one snapshot plus one delta, whatever the state's
@@ -63,25 +63,30 @@ pub(crate) fn encode(target: &[u8], base: &[u8]) -> Vec<u8> {
     })
 }
 
-/// The inverse of [`encode`].
+/// The inverse of [`encode`], for a delta known to be sound: the writer's own
+/// round trip and tests. Panics where [`try_decode`] returns `Err`.
+pub(crate) fn decode(delta: &[u8], base: &[u8], target_len: usize) -> Vec<u8> {
+    try_decode(delta, base, target_len).unwrap_or_else(|err| panic!("{err}"))
+}
+
+/// The inverse of [`encode`], for a delta read back from storage.
 ///
 /// `target_len` comes from the frame, so the output buffer is sized exactly
-/// rather than at `(delta + base) * 2`. Panics on a delta this build cannot
+/// rather than at `(delta + base) * 2`. `Err` on a delta this build cannot
 /// apply: `from_db_state` has already rejected a directory of the wrong
-/// format version, so anything reaching here is corruption rather than an old
-/// database, which matches how every other read in this crate treats a bad
-/// value.
+/// format version, so anything failing here is corruption rather than an old
+/// database, and the state read reports it rather than panicking.
 ///
 /// A `target_len` of zero is [`encode`]'s empty-target case; the empty
 /// output stands in directly for the same reason encode short-circuits it.
-pub(crate) fn decode(delta: &[u8], base: &[u8], target_len: usize) -> Vec<u8> {
+pub(crate) fn try_decode(delta: &[u8], base: &[u8], target_len: usize) -> Result<Vec<u8>, String> {
     if target_len == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let output_buffer_len =
-        u32::try_from(target_len).expect("target length fits a u32 at beacon scale");
-    xdelta3::decode_with_output_len(delta, base, output_buffer_len).unwrap_or_else(|err| {
-        panic!("xdelta3 decode failed against exact target length {target_len}: {err:?}")
+    let output_buffer_len = u32::try_from(target_len)
+        .map_err(|_| format!("target length {target_len} does not fit a u32"))?;
+    xdelta3::decode_with_output_len(delta, base, output_buffer_len).map_err(|err| {
+        format!("xdelta3 decode failed against exact target length {target_len}: {err:?}")
     })
 }
 

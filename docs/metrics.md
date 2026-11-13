@@ -335,6 +335,7 @@ In practice the distribution is bimodal and dominated by production rather than 
 | `lean_state_write_queue_depth` | Gauge | States handed to the background writer but not yet committed | On every hand-off and on every commit | |
 | `lean_state_write_seconds` | Histogram | Time the background writer spends encoding, diffing and committing one state | Per state written | |
 | `lean_state_cache_lookups_total` | Counter | State cache lookups, by the `Store` method that made them, the kind of state asked for, and whether the cache held it | On every `get_state` (and the writer's own parent read), `has_state` and `cached_state` call | method=get_state,has_state,cached_state<br>kind=block,checkpoint<br>result=hit,miss |
+| `lean_state_rebuilds_total` | Counter | Block states read back from storage after missing the cache and the write buffer, by whether the read did the rebuild or waited on one already under way for that root | On every `get_state` miss (and the writer's own parent read) that reads a state back from storage, or takes the state a rebuild under way read; a miss that finds no state, finds it cached by the time it leads, or fails counts as neither. Both roles are seeded at zero | role=led,joined |
 
 **On a beacon follower, watch `lean_table_bytes{table="data_columns"}`.** Every
 other table's series either stays flat or is bounded by pruning; `data_columns`
@@ -362,6 +363,18 @@ or `has_state` miss means the state was not resident and came from the writer's
 buffer or RocksDB. A `cached_state` miss with `kind="checkpoint"` means fork
 choice's `checkpoint_state` rebuilt the state, running `process_slots` up to the
 epoch boundary when the checkpoint's block precedes it.
+
+**`lean_state_rebuilds_total{role="led"}` is the number of states actually
+read and decoded from storage.** A beacon rebuild costs about a second of CPU
+and several hundred megabytes at its peak, so this is the series to watch for
+resident-memory spikes. `role="joined"` counts misses that found a rebuild of
+the same root already under way and took the state it read instead, so every
+join has the lead it waited on beside it. A lookup that finds no state for
+its root, or fails, counts under neither, and so does a lead that finds the
+state already cached by a rebuild that settled since its own miss, along with
+whoever waited on it. A burst of joins next to a single lead is the pattern a
+late block's custody columns produce, each checked on its own task against a
+parent state that has left the cache.
 
 ### Beacon Gossip Validation
 

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use ethlambda_types::checkpoint::Checkpoint;
 use ethlambda_types::primitives::H256;
 
@@ -9,6 +11,27 @@ pub enum Error {
     UnexpectedMissingBlockHeader(H256),
     #[error("unexpected missing state for root {0}")]
     UnexpectedMissingState(H256),
+    /// A stored state did not decode, or a delta on the way to it did not
+    /// apply to its base. [`Store::from_db_state`](crate::store::Store::from_db_state)
+    /// has already refused a directory of another format version, so this is
+    /// corruption at rest rather than an old database.
+    ///
+    /// `root` is the state being read, which for a delta can be built on the
+    /// corrupt row rather than be it: a snapshot that does not decode is
+    /// reported against every state read through it.
+    #[error("the stored state for root {root} is corrupt: {reason}")]
+    CorruptState { root: H256, reason: String },
+    /// Every error a state rebuild returns, as
+    /// [`Store::get_state`](crate::store::Store::get_state) gives it. It wraps
+    /// [`Error::Storage`] or [`Error::CorruptState`], so match through it
+    /// rather than on those directly. A corrupt state is shared: the caller
+    /// that ran the rebuild and every concurrent read of the same root that
+    /// waited on it get the same one (`StateRebuilds` in `state_writer.rs`).
+    /// A failed read is not: a caller only returns one from a read it ran
+    /// itself, and a waiter handed one reads again. Reference-counted because
+    /// `Error` is not `Clone`; it displays as the error it wraps.
+    #[error(transparent)]
+    StateRebuild(Arc<Error>),
     /// The data directory was written by a build with a different on-disk
     /// format. There is no migration: the `States` value layout changed, so
     /// every state already written would decode as the wrong shape.
