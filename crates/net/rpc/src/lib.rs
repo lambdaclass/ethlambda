@@ -1,5 +1,7 @@
+use std::future::IntoFuture as _;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{Extension, Router};
 use ethlambda_blockchain::{EventBus, SyncStatusController};
@@ -135,7 +137,25 @@ pub async fn start_http_servers(
     Ok(())
 }
 
+/// How long [`serve`] waits, once shutdown starts, for responses still in
+/// flight before it stops waiting on them.
+///
+/// axum's graceful shutdown waits with no limit, and a response can stall for
+/// as long as its client stops reading: a validator client paused mid-stream,
+/// or a slow download of a whole state.
+const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Bind one listener and serve `app` on it until `shutdown` is cancelled.
+///
+/// Graceful shutdown waits for every in-flight response, so `app` gets the
+/// token as a [`events::ShutdownSignal`] too: the event streams, which never
+/// finish on their own, end on it. The signal holds a child of the token, not
+/// a clone: a child is cancelled with its parent but cannot cancel it, so a
+/// handler can wait for shutdown and never trigger the node's.
+///
+/// The wait is bounded by [`HTTP_DRAIN_TIMEOUT`]. Past it, this returns
+/// without the stalled responses: the listener is already closed by then, and
+/// their connection tasks end with the runtime.
 async fn serve(
     address: IpAddr,
     port: u16,
@@ -145,11 +165,24 @@ async fn serve(
     let addr = SocketAddr::new(address, port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "HTTP server listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown.cancelled().await;
-        })
-        .await
+    let app = app.layer(Extension(events::ShutdownSignal::of(&shutdown)));
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown.clone().cancelled_owned())
+        .into_future();
+    let drain_deadline = async move {
+        shutdown.cancelled().await;
+        tokio::time::sleep(HTTP_DRAIN_TIMEOUT).await;
+    };
+    tokio::select! {
+        served = server => served,
+        () = drain_deadline => {
+            tracing::warn!(
+                %addr,
+                "HTTP responses still in flight after the shutdown drain timeout; no longer waiting on them"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Build the API router with the given store, client version, and peer ID.
