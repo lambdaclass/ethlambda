@@ -172,7 +172,9 @@ ahead of its own, since a head derived from a partial view is not worth voting f
 peers' head is the highest of each connected peer's latest `Status`, re-requested every few
 slots per peer (spread over the interval, so a node with hundreds of peers never asks them
 all at once), not counting a head the node has already imported, which p2p publishes on
-`Store::network_head` (`crates/net/p2p/src/peer_heads.rs`). The thresholds, and the refresh
+`Store::peer_view` with how many peers have reported (`crates/net/p2p/src/peer_heads.rs`).
+Until 5 peers have, for a bounded window after startup, the network is assumed to be at the
+clock, since the first peer to answer may be as stale as the node. The thresholds, and the refresh
 cadence they depend on, are `SyncThresholds` in `crates/net/api/src/sync.rs`, shared by both
 actors. A hysteresis band stops the state from flapping at the boundary, and a network-wide
 stall (nobody else is ahead either) leaves the node synced so its validators can help the

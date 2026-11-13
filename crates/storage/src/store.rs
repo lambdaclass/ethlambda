@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -256,6 +256,19 @@ const STATE_CACHE_CAPACITY: usize = 32;
 
 /// [`Store::network_head`]'s "no peer has reported" marker. No slot reaches it.
 const NO_NETWORK_HEAD: u64 = u64::MAX;
+
+/// What this node's connected peers report in `Status`, as P2P last published
+/// it; see [`Store::peer_view`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PeerView {
+    /// The highest head slot the peers report that this node has not already
+    /// imported, or `None` while no connected peer reports one.
+    pub network_head: Option<u64>,
+    /// Connected peers whose latest `Status` head was not past the wall
+    /// clock, counted whether or not this node already holds that head: how
+    /// many peers the view rests on, which `network_head` alone cannot say.
+    pub reporting_peers: usize,
+}
 
 /// Keep block proofs for at least this many slots below the tip, even once
 /// finalized. Proofs older than this window are pruned only when the window
@@ -1205,6 +1218,9 @@ pub struct Store {
     /// while no connected peer reports one. Written by P2P, read by the chain
     /// actor's sync tracker; see [`Store::network_head`].
     network_head: Arc<AtomicU64>,
+    /// [`PeerView::reporting_peers`], published with `network_head`; see
+    /// [`Store::set_peer_view`] for the order the two are written and read in.
+    reporting_peers: Arc<AtomicUsize>,
     /// The total active balance per epoch, shared the way
     /// [`Self::committee_cache`] is: by the chain actor's state transition
     /// and anything else holding a `Store` clone. See
@@ -1856,6 +1872,7 @@ impl Store {
             committee_cache: Arc::new(CommitteeCache::default()),
             observed_liveness: Arc::new(ObservedLiveness::default()),
             network_head: Arc::new(AtomicU64::new(NO_NETWORK_HEAD)),
+            reporting_peers: Arc::new(AtomicUsize::new(0)),
             active_balance_cache: Arc::new(ActiveBalanceCache::default()),
             beacon: Default::default(),
             state_writer,
@@ -3315,15 +3332,35 @@ impl Store {
     /// not advance towards, so no claim can hold a stalled node for long.
     /// Runtime-only and shared by every clone of this `Store`.
     pub fn network_head(&self) -> Option<u64> {
-        let slot = self.network_head.load(Ordering::Relaxed);
-        (slot != NO_NETWORK_HEAD).then_some(slot)
+        self.peer_view().network_head
     }
 
-    /// Publish the peers' head; see [`Self::network_head`]. P2P is the only
+    /// The peers' head together with how many peers report one; see
+    /// [`PeerView`]. The sync tracker reads both from one call, since it ends
+    /// its startup hold on the count and then judges by the head.
+    pub fn peer_view(&self) -> PeerView {
+        // Count first, head second: the reverse of `set_peer_view`, so a count
+        // read here comes with a head at least as new as the one published
+        // with it, never one from before it.
+        let reporting_peers = self.reporting_peers.load(Ordering::SeqCst);
+        let slot = self.network_head.load(Ordering::SeqCst);
+        PeerView {
+            network_head: (slot != NO_NETWORK_HEAD).then_some(slot),
+            reporting_peers,
+        }
+    }
+
+    /// Publish what the peers report; see [`Self::peer_view`]. P2P is the only
     /// writer.
-    pub fn set_network_head(&self, slot: Option<u64>) {
-        let slot = slot.unwrap_or(NO_NETWORK_HEAD);
-        self.network_head.store(slot, Ordering::Relaxed);
+    ///
+    /// The head goes first and the count after it. A tracker that read the
+    /// new count with the old head could end its startup hold on the fifth
+    /// report while missing that report's lead, the one it was waiting for.
+    pub fn set_peer_view(&self, view: PeerView) {
+        let slot = view.network_head.unwrap_or(NO_NETWORK_HEAD);
+        self.network_head.store(slot, Ordering::SeqCst);
+        self.reporting_peers
+            .store(view.reporting_peers, Ordering::SeqCst);
     }
 
     /// The total-active-balance cache shared by every clone of this store.
@@ -7225,13 +7262,24 @@ mod tests {
     }
 
     #[test]
-    fn the_network_head_is_shared_across_store_clones() {
+    fn the_peer_view_is_shared_across_store_clones() {
         let store = Store::test_store();
         let clone = store.clone();
-        assert_eq!(store.network_head(), None);
-        clone.set_network_head(Some(42));
+        assert_eq!(store.peer_view(), PeerView::default());
+        let view = PeerView {
+            network_head: Some(42),
+            reporting_peers: 3,
+        };
+        clone.set_peer_view(view);
+        assert_eq!(store.peer_view(), view);
         assert_eq!(store.network_head(), Some(42));
-        clone.set_network_head(None);
+        // Peers whose heads this node holds still count, with no head left.
+        let held = PeerView {
+            network_head: None,
+            reporting_peers: 3,
+        };
+        clone.set_peer_view(held);
+        assert_eq!(store.peer_view(), held);
         assert_eq!(store.network_head(), None);
     }
 

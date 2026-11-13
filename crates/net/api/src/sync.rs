@@ -45,7 +45,8 @@ pub struct SyncThresholds {
     /// does not flap at the boundary.
     pub hysteresis: u64,
     /// Slots after the first judgment during which the node assumes the
-    /// network is at least at the wall clock, whatever its peers report.
+    /// network is at least at the wall clock, unless [`Self::startup_peers`]
+    /// peers have reported before then.
     ///
     /// The first judgment runs before any peer has answered a `Status`, and
     /// the first peer to answer may itself be behind, so without this a node
@@ -55,6 +56,16 @@ pub struct SyncThresholds {
     /// node that never finds a peer, or restarts into a real stall, still
     /// falls back to treating the silence as a stall.
     pub startup_grace: u64,
+    /// Connected peers whose `Status` ends the startup hold early.
+    ///
+    /// Once this many have reported a head (one past the wall clock does
+    /// not count, one this node already holds does), the node judges by
+    /// their reports instead of the hold's assumption. One report is not
+    /// enough, since the first peer to answer may be as stale as this node,
+    /// but the highest of several is: a single current peer among them shows
+    /// the lead. A node with fewer peers than this keeps the whole
+    /// [`Self::startup_grace`] window. The same count on both chains.
+    pub startup_peers: usize,
     /// Slots the node may read as syncing on a peer-reported lead without its
     /// head advancing, before it treats the network as stalled after all.
     ///
@@ -92,6 +103,7 @@ impl SyncThresholds {
         peer_lead: 1,
         hysteresis: 2,
         startup_grace: 8,
+        startup_peers: 5,
         stall_window: 16,
         status_refresh_slots: 2,
     };
@@ -104,13 +116,15 @@ impl SyncThresholds {
     /// follower importing about one block a slot right at the boundary would
     /// otherwise flip twice a slot. The startup hold and the stall window are
     /// an epoch: finding beacon peers through discovery can take a while, and
-    /// Prysm holds until it has peers, however long. The `Status` refresh is
+    /// Prysm holds until it has peers, however long; five peers reporting end
+    /// the hold sooner. The `Status` refresh is
     /// Prysm's half epoch (`maintainPeerStatuses`).
     pub const BEACON: Self = Self {
         clock_lag: 2 * SLOTS_PER_EPOCH,
         peer_lead: SLOTS_PER_EPOCH,
         hysteresis: 4,
         startup_grace: SLOTS_PER_EPOCH,
+        startup_peers: 5,
         stall_window: SLOTS_PER_EPOCH,
         status_refresh_slots: SLOTS_PER_EPOCH / 2,
     };

@@ -3626,8 +3626,10 @@ impl BlockChainServer {
     /// Refresh the sync-status tracker and its two outputs (the
     /// `lean_node_sync_status` metric and [`SyncStatusController`]).
     ///
-    /// The network's head comes from [`Store::network_head`], the highest head
-    /// the node's peers report in `Status` that it does not already hold. The
+    /// The network's head comes from [`Store::peer_view`], the highest head
+    /// the node's peers report in `Status` that it does not already hold,
+    /// together with how many peers report one, which can end the tracker's
+    /// startup hold early. The
     /// tracker itself is chain-agnostic, with per-chain thresholds; see
     /// [`SyncThresholds`]. On a beacon follower, once the clock is past a fork
     /// the node does not follow (see [`Self::clock_is_past_followed_forks`])
@@ -3636,13 +3638,16 @@ impl BlockChainServer {
     fn judge_sync_status(&mut self, current_slot: u64, head_slot: u64) {
         let past_followed_forks = self.store.chain() == Chain::Beacon
             && Self::clock_is_past_followed_forks(&self.store.config(), current_slot, head_slot);
+        // One read for both halves, so the count that may end the startup
+        // hold comes with a head at least as new as the one published with it.
+        let peers = self.store.peer_view();
+        self.sync_status.note_reporting_peers(peers.reporting_peers);
         let status = if past_followed_forks {
             self.sync_status
                 .update_with_network_at_clock(current_slot, head_slot)
         } else {
-            let network_head = self.store.network_head();
             self.sync_status
-                .update(current_slot, head_slot, network_head)
+                .update(current_slot, head_slot, peers.network_head)
         };
         metrics::set_node_sync_status(status);
         self.sync_status_controller.set(status);
@@ -4213,6 +4218,7 @@ mod tests {
 
     use super::*;
     use ethlambda_state_transition::beacon::fork_choice::seconds_to_milliseconds;
+    use ethlambda_storage::PeerView;
     use ethlambda_storage::backend::InMemoryBackend;
     use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::containers::{
@@ -5323,13 +5329,39 @@ mod tests {
     }
 
     #[test]
+    fn five_reporting_peers_published_by_p2p_end_the_startup_hold() {
+        // The tracker's first judgment is three epochs past the head, so the
+        // hold reads it as syncing. Five peers reporting heads it holds (no
+        // network head) end the hold well inside its epoch, and the peers'
+        // word, a stalled network, stands.
+        let mut server = syncing_server(None);
+        server.update_sync_status(THREE_EPOCHS);
+        assert_eq!(
+            server.sync_status_controller.get(),
+            crate::metrics::SyncStatus::Syncing
+        );
+        server.store.set_peer_view(PeerView {
+            network_head: None,
+            reporting_peers: SyncThresholds::BEACON.startup_peers,
+        });
+        server.update_sync_status(THREE_EPOCHS + 1);
+        assert_eq!(
+            server.sync_status_controller.get(),
+            crate::metrics::SyncStatus::Synced
+        );
+    }
+
+    #[test]
     fn the_clock_reaching_a_followed_fork_does_not_force_syncing() {
         // Gloas is followed, so the fork rule stays out of it and the peers
         // decide: every peer as stale as we are is a stalled network, read as
         // synced, the same as when no fork is scheduled.
         let mut server = syncing_server(Some(1));
         past_startup(&mut server);
-        server.store.set_network_head(Some(0));
+        server.store.set_peer_view(PeerView {
+            network_head: Some(0),
+            reporting_peers: 0,
+        });
         server.update_sync_status(THREE_EPOCHS);
         assert_eq!(
             server.sync_status_controller.get(),
@@ -5343,7 +5375,10 @@ mod tests {
         // the tracker deliberately reports as synced.
         let mut server = syncing_server(None);
         past_startup(&mut server);
-        server.store.set_network_head(Some(0));
+        server.store.set_peer_view(PeerView {
+            network_head: Some(0),
+            reporting_peers: 0,
+        });
         server.update_sync_status(THREE_EPOCHS);
         assert_eq!(
             server.sync_status_controller.get(),
@@ -5359,7 +5394,10 @@ mod tests {
         // head.
         let mut server = syncing_server(None);
         past_startup(&mut server);
-        server.store.set_network_head(Some(THREE_EPOCHS));
+        server.store.set_peer_view(PeerView {
+            network_head: Some(THREE_EPOCHS),
+            reporting_peers: 0,
+        });
         server.update_sync_status(THREE_EPOCHS);
         assert_eq!(
             server.sync_status_controller.get(),
@@ -5375,9 +5413,10 @@ mod tests {
         // follow that head too, so the recompute itself is what judges it.
         let mut server = syncing_server(None);
         past_startup(&mut server);
-        server
-            .store
-            .set_network_head(Some(server.wall_clock_slot()));
+        server.store.set_peer_view(PeerView {
+            network_head: Some(server.wall_clock_slot()),
+            reporting_peers: 0,
+        });
         server.update_head_from_fork_choice();
         assert_eq!(
             server.sync_status_controller.get(),
@@ -5398,7 +5437,10 @@ mod tests {
         let orphan = || bare_block(1, H256::repeat_byte(0xee));
 
         // Peers as stale as the node: a stall, synced.
-        server.store.set_network_head(Some(0));
+        server.store.set_peer_view(PeerView {
+            network_head: Some(0),
+            reporting_peers: 0,
+        });
         server.on_block(orphan(), ImportTimings::default()).await;
         assert_eq!(
             server.sync_status_controller.get(),
@@ -5407,7 +5449,10 @@ mod tests {
 
         // A peer reports a head at the clock; the next arrival closes the gate.
         let wall_clock_slot = server.wall_clock_slot();
-        server.store.set_network_head(Some(wall_clock_slot));
+        server.store.set_peer_view(PeerView {
+            network_head: Some(wall_clock_slot),
+            reporting_peers: 0,
+        });
         server.on_block(orphan(), ImportTimings::default()).await;
         assert_eq!(
             server.sync_status_controller.get(),

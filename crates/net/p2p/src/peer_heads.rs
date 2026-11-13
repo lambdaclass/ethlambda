@@ -28,7 +28,7 @@
 use std::collections::{HashMap, HashSet};
 
 use ethlambda_network_api::sync::SyncThresholds;
-use ethlambda_storage::{Chain, Store};
+use ethlambda_storage::{Chain, PeerView, Store};
 use ethlambda_types::primitives::H256;
 use libp2p::PeerId;
 use tracing::debug;
@@ -71,6 +71,12 @@ pub(crate) struct PeerHeads {
     /// The head slot each peer last reported, while it stays connected and
     /// the head is not one this node holds.
     heads: HashMap<PeerId, u64>,
+    /// Connected peers whose latest report was not past the wall clock,
+    /// including those whose head this node holds and so left out of
+    /// `heads`: the sync tracker ends its startup hold on how many peers have
+    /// spoken, and a peer that is level with us has spoken as much as one
+    /// that is ahead.
+    reporting: HashSet<PeerId>,
     /// Peers whose outstanding `Status` request is a refresh rather than the
     /// handshake; a refresh answer needs a larger lead to start a range sync.
     refreshing: HashSet<PeerId>,
@@ -102,8 +108,10 @@ impl PeerHeads {
         self.last_exchange.insert(peer, wall_slot);
         if head_slot > wall_slot.saturating_add(FUTURE_HEAD_TOLERANCE) {
             self.heads.remove(&peer);
+            self.reporting.remove(&peer);
             return Report::Future;
         }
+        self.reporting.insert(peer);
         if held {
             self.heads.remove(&peer);
             return Report::Held;
@@ -115,6 +123,7 @@ impl PeerHeads {
     /// Forget a disconnected peer.
     pub(crate) fn forget(&mut self, peer: &PeerId) {
         self.heads.remove(peer);
+        self.reporting.remove(peer);
         self.refreshing.remove(peer);
         self.last_exchange.remove(peer);
         self.foreign_digest.remove(peer);
@@ -125,6 +134,12 @@ impl PeerHeads {
     /// `None` with none at all.
     pub(crate) fn network_head(&self) -> Option<u64> {
         self.heads.values().copied().max()
+    }
+
+    /// How many connected peers have reported a head not past the wall
+    /// clock, whether or not this node holds it.
+    pub(crate) fn reporting_peers(&self) -> usize {
+        self.reporting.len()
     }
 
     /// The connected peers to re-ask for their `Status` at `wall_slot`, at
@@ -241,9 +256,10 @@ pub(crate) fn forget(server: &mut P2PServer, peer: &PeerId) {
 }
 
 fn publish(server: &P2PServer) {
-    server
-        .store
-        .set_network_head(server.peer_heads.network_head());
+    server.store.set_peer_view(PeerView {
+        network_head: server.peer_heads.network_head(),
+        reporting_peers: server.peer_heads.reporting_peers(),
+    });
 }
 
 #[cfg(test)]
@@ -293,6 +309,35 @@ mod tests {
         heads.record(on_lighter_fork, 109, 110, false);
         heads.record(on_lighter_fork, 110, 110, true);
         assert_eq!(heads.network_head(), None);
+    }
+
+    #[test]
+    fn peers_level_with_us_count_as_reporting() {
+        // At genesis every peer reports a head this node already holds. None
+        // of them is a lead, but all of them have spoken, which is what ends
+        // the sync tracker's startup hold.
+        let mut heads = PeerHeads::default();
+        let peers: Vec<_> = (0..5).map(|_| PeerId::random()).collect();
+        for peer in &peers {
+            assert_eq!(heads.record(*peer, 3, 6, true), Report::Held);
+        }
+        assert_eq!(heads.network_head(), None);
+        assert_eq!(heads.reporting_peers(), 5);
+        // A later report from one of them is still one peer.
+        heads.record(peers[0], 4, 7, false);
+        assert_eq!(heads.reporting_peers(), 5);
+        heads.forget(&peers[1]);
+        assert_eq!(heads.reporting_peers(), 4);
+    }
+
+    #[test]
+    fn a_peer_reporting_the_future_is_not_reporting() {
+        let mut heads = PeerHeads::default();
+        let liar = PeerId::random();
+        heads.record(liar, 100, 100, false);
+        assert_eq!(heads.reporting_peers(), 1);
+        heads.record(liar, 100 + FUTURE_HEAD_TOLERANCE + 1, 100, false);
+        assert_eq!(heads.reporting_peers(), 0);
     }
 
     #[test]

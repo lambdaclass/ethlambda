@@ -68,6 +68,13 @@ pub(crate) struct SyncStatusTracker {
     thresholds: SyncThresholds,
     /// The slot at which the startup hold ends; set by the first update.
     startup_ends_at: Option<u64>,
+    /// How many connected peers last reported a head; see
+    /// [`Self::note_reporting_peers`].
+    reporting_peers: usize,
+    /// Whether [`SyncThresholds::startup_peers`] peers have reported, which
+    /// ends the startup hold for good: peers dropping off afterwards make the
+    /// view thinner, not the assumption true again.
+    heard_from_peers: bool,
     /// When the head last advanced; set by the first update.
     progress: Option<Progress>,
     /// The wall-clock slot from which the node has been behind both the clock
@@ -89,10 +96,20 @@ impl SyncStatusTracker {
             gate_duties,
             thresholds,
             startup_ends_at: None,
+            reporting_peers: 0,
+            heard_from_peers: false,
             progress: None,
             behind_since: None,
             stalled_at_head: None,
         }
+    }
+
+    /// Note how many connected peers have reported a `Status` head, counting
+    /// those this node already holds (`PeerView::reporting_peers`). Read by
+    /// the next judgment, which ends the startup hold once it reaches
+    /// [`SyncThresholds::startup_peers`].
+    pub(crate) fn note_reporting_peers(&mut self, reporting_peers: usize) {
+        self.reporting_peers = reporting_peers;
     }
 
     /// Re-judge the status at `current_slot` (the wall clock's slot).
@@ -102,7 +119,8 @@ impl SyncStatusTracker {
     /// With no report the node cannot be behind anyone, so it reads as synced
     /// (a stalled or empty network, where its validators should keep
     /// working), except during the startup hold, which assumes the network is
-    /// at least at the clock.
+    /// at least at the clock until [`SyncThresholds::startup_peers`] peers
+    /// have reported or [`SyncThresholds::startup_grace`] slots have passed.
     pub(crate) fn update(
         &mut self,
         current_slot: u64,
@@ -137,13 +155,26 @@ impl SyncStatusTracker {
             peer_lead: lead_threshold,
             hysteresis,
             startup_grace,
+            startup_peers,
             stall_window,
             ..
         } = self.thresholds;
         let startup_ends_at = *self
             .startup_ends_at
             .get_or_insert(current_slot.saturating_add(startup_grace));
-        let starting_up = current_slot < startup_ends_at;
+        if !self.heard_from_peers && self.reporting_peers >= startup_peers {
+            self.heard_from_peers = true;
+            if current_slot < startup_ends_at {
+                info!(
+                    current_slot,
+                    head_slot,
+                    network_head,
+                    reporting_peers = self.reporting_peers,
+                    "Enough peers have reported; ending the startup hold early"
+                );
+            }
+        }
+        let starting_up = !self.heard_from_peers && current_slot < startup_ends_at;
 
         let progress = self.progress.get_or_insert(Progress {
             head_slot,
@@ -172,7 +203,8 @@ impl SyncStatusTracker {
 
         // During the startup hold, assume the network is at least at the
         // clock: a report can add lead, never take it away, since the first
-        // peer to answer may be as stale as we are.
+        // peer to answer may be as stale as we are. Enough of them reporting
+        // ends the hold (see above); one does not.
         let assumed = starting_up || network_at_clock;
         let network_head = if assumed {
             Some(network_head.map_or(current_slot, |slot| slot.max(current_slot)))
@@ -503,6 +535,40 @@ mod tests {
         // Once the hold is over, the same report reads as a stall.
         let after_grace = 300 + LEAN.startup_grace;
         assert_eq!(tracker.update(after_grace, 0, Some(0)), SyncStatus::Synced);
+    }
+
+    #[test]
+    fn enough_reporting_peers_end_the_startup_hold() {
+        // A slow network start, not a stale node: ten slots behind the clock
+        // inside the hold, with every peer level with us (their heads are
+        // ones we hold, so there is no network head). One short of the count
+        // keeps the hold; reaching it lets the peers' word stand.
+        let mut tracker = SyncStatusTracker::new(true, LEAN);
+        assert_eq!(tracker.update(300, 290, None), SyncStatus::Syncing);
+        tracker.note_reporting_peers(LEAN.startup_peers - 1);
+        assert_eq!(tracker.update(301, 290, None), SyncStatus::Syncing);
+        tracker.note_reporting_peers(LEAN.startup_peers);
+        assert_eq!(tracker.update(302, 290, None), SyncStatus::Synced);
+    }
+
+    #[test]
+    fn the_startup_hold_stays_over_once_enough_peers_reported() {
+        let mut tracker = SyncStatusTracker::new(true, LEAN);
+        tracker.note_reporting_peers(LEAN.startup_peers);
+        assert_eq!(tracker.update(300, 290, None), SyncStatus::Synced);
+        // Peers dropping off thin the view; they do not bring the hold back.
+        tracker.note_reporting_peers(1);
+        assert_eq!(tracker.update(301, 290, None), SyncStatus::Synced);
+    }
+
+    #[test]
+    fn one_current_peer_among_the_reporters_still_shows_the_lead() {
+        // The hold is over, but a stale node is still caught: the highest
+        // report is the network head, so one current peer among the five is
+        // enough.
+        let mut tracker = SyncStatusTracker::new(true, BEACON);
+        tracker.note_reporting_peers(BEACON.startup_peers);
+        assert_eq!(tracker.update(1000, 100, Some(999)), SyncStatus::Syncing);
     }
 
     #[test]
