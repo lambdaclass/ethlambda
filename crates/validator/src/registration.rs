@@ -126,6 +126,9 @@ struct Current {
     changed: Vec<SignedValidatorRegistrationV1>,
     /// Validators skipped because no fee recipient is configured for them.
     no_fee_recipient: usize,
+    /// Chunks whose signing task failed, so whose validators are in neither
+    /// list.
+    failed_chunks: usize,
 }
 
 impl Current {
@@ -133,6 +136,7 @@ impl Current {
         self.all.extend(other.all);
         self.changed.extend(other.changed);
         self.no_fee_recipient += other.no_fee_recipient;
+        self.failed_chunks += other.failed_chunks;
     }
 }
 
@@ -213,6 +217,7 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
             all: Vec::with_capacity(pubkeys.len()),
             changed: Vec::new(),
             no_fee_recipient: 0,
+            failed_chunks: 0,
         };
         for pubkey in pubkeys {
             let Some((fee_recipient, gas_limit)) =
@@ -277,6 +282,7 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
             all: Vec::with_capacity(pubkeys.len()),
             changed: Vec::new(),
             no_fee_recipient: 0,
+            failed_chunks: 0,
         };
         for chunk in pubkeys.chunks(SIGN_CHUNK) {
             let (service, store, chunk) = (self.clone(), store.clone(), chunk.to_vec());
@@ -287,10 +293,23 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
             .await;
             match part {
                 Ok(part) => current.extend(part),
-                Err(err) => warn!(%err, "Signing builder registrations failed; skipping a chunk"),
+                Err(err) => {
+                    warn!(%err, "Signing builder registrations failed; skipping a chunk");
+                    current.failed_chunks += 1;
+                }
             }
         }
         current
+    }
+
+    /// Record that every setting up to `generation` is signed, unless a chunk
+    /// of `current` failed to sign. Then the generation stays behind, so the
+    /// next slot's [`Self::register_changed`] signs what that chunk held
+    /// rather than leaving a keymanager change in it unsent for an epoch.
+    fn mark_signed(&self, generation: u64, current: &Current) {
+        if current.failed_chunks == 0 {
+            self.signed_generation.store(generation, Ordering::Release);
+        }
     }
 
     /// Register every validator in `pubkeys`, the ones the beacon node resolved
@@ -331,7 +350,7 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = pubkeys.clone();
 
         let current = self.current_blocking(&store, &pubkeys).await;
-        self.signed_generation.store(generation, Ordering::Release);
+        self.mark_signed(generation, &current);
         if current.no_fee_recipient > 0 {
             warn!(
                 skipped = current.no_fee_recipient,
@@ -382,7 +401,7 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
             return;
         }
         let current = self.current_blocking(&store, &known).await;
-        self.signed_generation.store(generation, Ordering::Release);
+        self.mark_signed(generation, &current);
         if current.changed.is_empty() {
             return;
         }

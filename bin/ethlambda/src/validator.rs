@@ -98,9 +98,10 @@ pub(crate) struct ValidatorOptions {
     )]
     pub(crate) builder_boost_factor: u64,
 
-    /// Take the builder's block whenever there is a valid bid, unless the
-    /// execution client asks to override the builder (sends
-    /// `builder_boost_factor = u64::MAX`).
+    /// Take the builder's block whenever there is a valid bid: this client
+    /// sends `builder_boost_factor = u64::MAX`. The beacon node still keeps
+    /// its local payload when its execution client sets
+    /// `shouldOverrideBuilder`.
     #[arg(long, default_value = "false", requires = "builder_proposals")]
     pub(crate) prefer_builder_proposals: bool,
 

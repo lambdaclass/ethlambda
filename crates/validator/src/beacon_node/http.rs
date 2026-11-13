@@ -91,16 +91,17 @@ const ERROR_BODY_READ_LIMIT: usize = 1024 * 1024;
 const ERROR_TEXT_LIMIT: usize = 1024;
 
 /// A failed answer's body, read up to [`ERROR_BODY_READ_LIMIT`] bytes, so a
-/// node answering with an endless body cannot hold the client on it.
+/// node answering with an endless body cannot hold the client on it. Only
+/// what fits is copied out of each chunk.
 async fn read_error_body(mut response: reqwest::Response) -> String {
     let mut bytes = Vec::new();
-    while bytes.len() < ERROR_BODY_READ_LIMIT {
-        match response.chunk().await {
-            Ok(Some(chunk)) => bytes.extend_from_slice(&chunk),
-            _ => break,
+    while let Ok(Some(chunk)) = response.chunk().await {
+        let room = ERROR_BODY_READ_LIMIT - bytes.len();
+        bytes.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        if bytes.len() == ERROR_BODY_READ_LIMIT {
+            break;
         }
     }
-    bytes.truncate(ERROR_BODY_READ_LIMIT);
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
@@ -1568,8 +1569,8 @@ mod tests {
     /// or an escape: a body of escapes keeps whole ones, then the marker.
     #[test]
     fn error_text_cuts_on_a_character_or_escape_boundary() {
-        let text = error_text(&"é".repeat(ERROR_TEXT_LIMIT));
         let room = ERROR_TEXT_LIMIT - "...".len();
+        let text = error_text(&"é".repeat(ERROR_TEXT_LIMIT));
         assert_eq!(text, format!("{}...", "é".repeat(room / 2)));
         let text = error_text(&"\u{1b}".repeat(ERROR_TEXT_LIMIT));
         let escapes = "\\u{1b}".repeat(room / "\\u{1b}".len());
