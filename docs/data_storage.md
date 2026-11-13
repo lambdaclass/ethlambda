@@ -703,23 +703,29 @@ the way does not decode (a snapshot, a delta that does not apply to its base,
 a lean snapshot or diff), it returns an error rather than panicking:
 `Error::StateRebuild` wrapping `Error::Storage` or `Error::CorruptState`. A
 `BlockHeaders` row that does not decode still panics, in the slot lookup that
-reads it before any state row. Each caller decides what an error costs: p2p's
-column checks drop the one sidecar and log it, while fork choice and the state
-writer still panic on it.
+reads it before any state row. The store logs every failed rebuild at `error`
+(`State rebuild failed`, with the root), once per read rather than once per
+caller, since most callers report the error as something else or not at all.
+Each caller decides what an error costs: p2p's column checks drop the one
+sidecar, while fork choice and the state writer still panic on it.
 
 Concurrent misses on one root rebuild it once (`StateRebuilds` in
 `crates/storage/src/state_writer.rs`, a `OnceLock` per root under way). The
 first caller rebuilds. Every other caller that misses on that root while the
-rebuild is under way waits for it and gets the same result, so p2p's
+rebuild is under way waits for it and gets the same state, so p2p's
 per-sidecar column checks, the chain actor and the RPC asking for one evicted
-parent state cost one snapshot read and one decode, not one each. A failed
-rebuild's error is shared the same way, so a failing root is read once rather
-than once per caller, and every caller waiting on it fails: a late block's
-eight custody columns are all dropped when their parent's state does not read
-back. The first caller out removes the rebuild's entry; a miss arriving
-before that takes the settled result, and any later miss reads storage
-again. A rebuild that panics hands the waiting callers nothing, and one of
-them rebuilds for the rest.
+parent state cost one snapshot read and one decode, not one each. A corrupt
+state is shared the same way, so it is read once rather than once per caller,
+and every caller waiting on it fails: a late block's eight custody columns
+are all dropped when their parent's state does not decode. A failed read
+(`Error::Storage`) is not shared, since it can be transient: a caller only
+ever gets one from a read it ran itself, and the callers that waited on it go
+round again and share a read of their own. That keeps a p2p column check's
+failed read from reaching fork choice's or the state writer's panic on a read
+they never made. The first caller out removes the rebuild's entry; a miss
+arriving before that takes the settled result (or, for a failed read, goes
+round again), and any later miss reads storage again. A rebuild that panics
+hands the waiting callers nothing, and one of them rebuilds for the rest.
 
 ## Write Paths: What a Block Import Persists
 

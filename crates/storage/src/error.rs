@@ -22,13 +22,14 @@ pub enum Error {
     #[error("the stored state for root {root} is corrupt: {reason}")]
     CorruptState { root: H256, reason: String },
     /// Every error a state rebuild returns, as
-    /// [`Store::get_state`](crate::store::Store::get_state) gives it: the
-    /// caller that ran the rebuild and every concurrent read of the same root
-    /// that waited on it get the same one (`StateRebuilds` in
-    /// `state_writer.rs`). It wraps [`Error::Storage`] or
-    /// [`Error::CorruptState`], so match through it rather than on those
-    /// directly. Reference-counted because `Error` is not `Clone`; it displays
-    /// as the error it wraps.
+    /// [`Store::get_state`](crate::store::Store::get_state) gives it. It wraps
+    /// [`Error::Storage`] or [`Error::CorruptState`], so match through it
+    /// rather than on those directly. A corrupt state is shared: the caller
+    /// that ran the rebuild and every concurrent read of the same root that
+    /// waited on it get the same one (`StateRebuilds` in `state_writer.rs`).
+    /// A failed read is not: a caller only returns one from a read it ran
+    /// itself, and a waiter handed one reads again. Reference-counted because
+    /// `Error` is not `Clone`; it displays as the error it wraps.
     #[error(transparent)]
     StateRebuild(Arc<Error>),
     /// The data directory was written by a build with a different on-disk

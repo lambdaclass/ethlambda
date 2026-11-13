@@ -12,7 +12,7 @@
 
 use ethlambda_storage::CacheKey;
 use ethlambda_types::ShortRoot;
-use tracing::error;
+use tracing::debug;
 
 use super::{
     IgnoreReason, Outcome, QueueReason, RejectReason, SeenBlockColumns, SeenColumns,
@@ -178,11 +178,13 @@ pub fn chain_checks(store: &Store, sidecar: &DataColumnSidecar, now_ms: u64) -> 
         }
         // A failed read or a corrupt row is not a parent still to come, so
         // parking would wait for an import that need never happen. Dropped
-        // instead, as a panic in this read used to drop it.
+        // instead, as a panic in this read used to drop it. The store has
+        // already logged the failure at `error`, once for every column that
+        // shared it, so this only notes which column it cost.
         Err(err) => {
             let slot = header.slot;
             let column = sidecar.index;
-            error!(
+            debug!(
                 slot,
                 column,
                 parent_root = %ShortRoot(&header.parent_root.0),

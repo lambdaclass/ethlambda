@@ -126,6 +126,17 @@ pub(crate) fn inc_state_rebuilds(role: RebuildRole) {
         .inc();
 }
 
+/// Register the metrics that should be visible before their first
+/// observation.
+pub fn init() {
+    // Both roles at zero, so `increase()` sees the first burst after a
+    // restart: a burst of rebuilds is rare enough that it can be the only one
+    // in the range a dashboard looks at.
+    for role in [RebuildRole::Led, RebuildRole::Joined] {
+        LEAN_STATE_REBUILDS_TOTAL.with_label_values(&[role.label()]);
+    }
+}
+
 /// Count one state-cache lookup for `key`, made by `method`.
 pub(crate) fn inc_state_cache_lookups(method: StateCacheMethod, key: &CacheKey, hit: bool) {
     let kind = match key {

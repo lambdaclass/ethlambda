@@ -3265,13 +3265,15 @@ impl Store {
     ///
     /// Safe to call from many threads for the same root at once: a miss
     /// that finds a rebuild of `root` already under way waits for it and
-    /// returns its result rather than reading the state again. See
+    /// returns its state rather than reading the state again. See
     /// [`StateRebuilds`].
     ///
     /// `Ok(None)` when no state is stored for `root`. `Err` when a read from
     /// the backend fails or a stored row does not decode
-    /// ([`Error::CorruptState`]), wrapped in [`Error::StateRebuild`] since
-    /// every caller of that rebuild shares it.
+    /// ([`Error::CorruptState`]), wrapped in [`Error::StateRebuild`]. A
+    /// corrupt state is shared with every caller that waited on its rebuild;
+    /// a failed read is returned only by the caller that ran it, and a caller
+    /// that waited on it reads again.
     pub fn get_state(&self, root: &H256) -> Result<Option<Arc<BeaconState>>, Error> {
         read_state(
             self.backend.as_ref(),
