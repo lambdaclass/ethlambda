@@ -150,6 +150,18 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     if store.is_empty() {
         warn!("No validators loaded; the client will idle");
     }
+    // The per-validator fee recipients, graffiti and gas limits the keymanager
+    // persisted, or the operator wrote by hand. A malformed one is fatal, as a
+    // bad keystore is: a validator paying an address the operator did not
+    // mean is worse than a refused start.
+    let seeded =
+        keys::ValidatorDefinitions::open(&config.validators_dir)?.seed_overrides(&settings)?;
+    if seeded > 0 {
+        info!(
+            count = seeded,
+            "Loaded per-validator proposer settings from the definitions file"
+        );
+    }
     metrics::set_validators_loaded(store.len() as u64);
     // The keymanager mutates this at runtime while the duty loop reads it, so
     // it is shared rather than owned outright from here on.
