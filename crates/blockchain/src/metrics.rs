@@ -118,6 +118,35 @@ impl SlotPosition {
 
 // --- Gauges ---
 
+static LEAN_BEACON_EPOCH_PRECOMPUTE_RUNNING: std::sync::LazyLock<IntGauge> =
+    std::sync::LazyLock::new(|| {
+        register_int_gauge!(
+            "lean_beacon_epoch_precompute_running",
+            "1 while an epoch precompute worker is running its advance, 0 otherwise"
+        )
+        .unwrap()
+    });
+
+/// Marks an epoch precompute worker as running in
+/// `lean_beacon_epoch_precompute_running` until dropped. A guard rather than a
+/// set/unset pair so a panicking worker still clears the gauge. At most one
+/// worker runs at a time (`epoch_precompute_in_flight`), so a plain 0/1 gauge
+/// is exact.
+pub struct EpochPrecomputeRunning;
+
+impl EpochPrecomputeRunning {
+    pub fn start() -> Self {
+        LEAN_BEACON_EPOCH_PRECOMPUTE_RUNNING.set(1);
+        Self
+    }
+}
+
+impl Drop for EpochPrecomputeRunning {
+    fn drop(&mut self) {
+        LEAN_BEACON_EPOCH_PRECOMPUTE_RUNNING.set(0);
+    }
+}
+
 static LEAN_HEAD_SLOT: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(|| {
     register_int_gauge!("lean_head_slot", "Latest slot of the lean chain").unwrap()
 });

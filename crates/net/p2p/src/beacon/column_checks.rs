@@ -46,12 +46,18 @@ pub(crate) fn check_and_forward(server: &P2PServer, sidecars: Vec<DataColumnSide
         for sidecar in sidecars {
             // The semaphore is never closed, so this only returns once a
             // permit is free.
+            let waiting_since = std::time::Instant::now();
             let Ok(permit) = permits.clone().acquire_owned().await else {
                 return;
             };
+            metrics::observe_column_check_permit_wait("column_check", waiting_since.elapsed());
+            let in_use = metrics::PoolInUse::new("column_check");
+            let task = metrics::BlockingTask::new("column_check");
             let store = store.clone();
             checks.push(tokio::task::spawn_blocking(move || {
                 let _permit = permit;
+                let _in_use = in_use;
+                let _run = task.start();
                 let verdict = column::chain_checks_for(&store, &sidecar, unix_now_ms());
                 (sidecar, verdict)
             }));
