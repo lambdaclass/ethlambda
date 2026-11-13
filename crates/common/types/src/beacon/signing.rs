@@ -7,7 +7,7 @@
 //! a message, such as a validator client, can reach them without taking on that
 //! crate's `blst`, `c-kzg` and RocksDB dependencies.
 
-use crate::beacon::constants::DOMAIN_DEPOSIT;
+use crate::beacon::constants::{DOMAIN_APPLICATION_BUILDER, DOMAIN_DEPOSIT};
 use crate::beacon::containers::shared::{Fork, SigningData};
 use crate::beacon::fork_digest::compute_fork_data_root;
 use crate::beacon::preset;
@@ -72,9 +72,32 @@ pub fn compute_deposit_domain(genesis_fork_version: Version) -> Domain {
     compute_domain(DOMAIN_DEPOSIT, genesis_fork_version, Root::ZERO)
 }
 
+/// The domain for the builder API's own messages: validator registrations
+/// and builder bids.
+///
+/// Like a deposit's, it is computed against the genesis fork version and a
+/// zero validators root, so one signature stays valid across every fork of
+/// its chain. This is builder-specs' `compute_domain(DOMAIN_APPLICATION_BUILDER)`,
+/// whose defaults are exactly those. It is not gloas's in-protocol builder
+/// domain; see [`DOMAIN_APPLICATION_BUILDER`].
+pub fn compute_builder_domain(genesis_fork_version: Version) -> Domain {
+    compute_domain(DOMAIN_APPLICATION_BUILDER, genesis_fork_version, Root::ZERO)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_mainnet_builder_domain_is_the_published_one() {
+        // The domain type, then the first 28 bytes of the fork data root of
+        // mainnet's genesis fork version (all zero) and a zero validators
+        // root, which is sha256 of 64 zero bytes.
+        let expected =
+            hex::decode("00000001f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a9")
+                .unwrap();
+        assert_eq!(compute_builder_domain([0, 0, 0, 0]).to_vec(), expected);
+    }
 
     #[test]
     fn fork_version_switches_at_the_boundary() {

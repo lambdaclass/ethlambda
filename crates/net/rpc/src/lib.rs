@@ -29,6 +29,8 @@ mod shared;
 mod spec;
 pub mod test_driver;
 
+pub use beacon::builder_client::{BuilderClient, BuilderError, VersionedBid};
+
 pub(crate) use base::json_response;
 
 #[derive(Debug, Clone)]
