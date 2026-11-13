@@ -26,8 +26,9 @@ use ethlambda_state_transition::beacon::{
     gossip::proposer_preferences::dependent_root_at,
     helpers::{
         accessors::get_domain,
+        fulu::initialize_proposer_lookahead,
         misc::{compute_domain, compute_signing_root},
-        test_state::{secret_key_for, sign_for},
+        test_state::{secret_key_for, sign_for, with_signing_validators_at},
     },
     payload_attestation_pool::SharedPayloadAttestationPool,
     stf::block::RandaoVerification,
@@ -51,7 +52,7 @@ use ethlambda_types::{
         },
         fork::ForkName,
         primitives::{BlsPubkey, BlsSignature, ExecutionAddress, HashTreeRoot as _},
-        signing::compute_epoch_at_slot,
+        signing::{compute_epoch_at_slot, compute_start_slot_at_epoch},
     },
     primitives::H256,
 };
@@ -266,6 +267,35 @@ impl World {
             current_version: config.fork_version(ForkName::Gloas),
             epoch: compute_epoch_at_slot(SLOT),
         };
+        Self::build(config, state, HEAD_SLOT)
+    }
+
+    /// The epoch before gloas, as a node is through all of it: gloas starts at
+    /// epoch 2, and the head is a fulu state at slot 32, the first of epoch 1,
+    /// whose proposer lookahead already holds epoch 2's proposers. The head
+    /// block's parent is the genesis block, slots 1 to 31 having been skipped,
+    /// so that is also the block that fixed epoch 2's shuffling (slot 31).
+    fn before_the_gloas_fork() -> Self {
+        let gloas_epoch = compute_epoch_at_slot(HEAD_SLOT) + 1;
+        let config = ForkName::ALL
+            .into_iter()
+            .filter(|&fork| fork < ForkName::Gloas)
+            .fold(chain_config(), |config, fork| {
+                config.with_fork_epoch(fork, 0)
+            })
+            .with_fork_epoch(ForkName::Gloas, gloas_epoch);
+        let mut state = with_signing_validators_at(ForkName::Fulu, 64);
+        let lookahead = initialize_proposer_lookahead(&state).unwrap();
+        let genesis_root = genesis_block().message_hash_tree_root();
+        let BeaconState::Fulu(inner) = &mut state else {
+            unreachable!("built as fulu")
+        };
+        assert_eq!(inner.slot, HEAD_SLOT);
+        inner.proposer_lookahead = lookahead.try_into().unwrap();
+        inner.latest_block_header.slot = inner.slot;
+        for slot in 0..HEAD_SLOT as usize {
+            inner.block_roots[slot] = genesis_root;
+        }
         Self::build(config, state, HEAD_SLOT)
     }
 
@@ -1119,7 +1149,7 @@ async fn valid_preferences_are_cached_and_published_once() {
     assert_eq!(world.network.proposer_preferences.lock().unwrap().len(), 1);
 }
 
-/// The validator client's own path for a proposal at [`SLOT`], end to end
+/// The validator client's own path for a proposal at `slot`, end to end
 /// against `world`'s node: it reads the proposer duty and its v2
 /// `dependent_root` from the served duties route, signs with
 /// `SigningContext::sign_proposer_preferences`, and posts through
@@ -1127,7 +1157,10 @@ async fn valid_preferences_are_cached_and_published_once() {
 /// `PreferencesService` does. The post succeeding means the route's run of the
 /// gossip rules (`validate`) accepted it; this also checks that the market
 /// holds it and that it went out. Returns it with the proposer's key.
-async fn submit_as_the_validator_client(world: &World) -> (SignedProposerPreferences, BlsPubkey) {
+async fn submit_as_the_validator_client(
+    world: &World,
+    slot: u64,
+) -> (SignedProposerPreferences, BlsPubkey) {
     use ethlambda_blockchain::{SyncStatusController, metrics::SyncStatus};
     use ethlambda_validator::{
         beacon_node::{BeaconNodeApi as _, dto::parse_pubkey, http::HttpBeaconNode},
@@ -1145,7 +1178,7 @@ async fn submit_as_the_validator_client(world: &World) -> (SignedProposerPrefere
     let client = HttpBeaconNode::new(format!("http://{bound}")).unwrap();
 
     // The duty and the dependent root the way the validator client reads them.
-    let proposal_epoch = compute_epoch_at_slot(SLOT);
+    let proposal_epoch = compute_epoch_at_slot(slot);
     let duties = client
         .proposer_duties_v2(proposal_epoch)
         .await
@@ -1153,12 +1186,12 @@ async fn submit_as_the_validator_client(world: &World) -> (SignedProposerPrefere
     let duty = duties
         .duties
         .iter()
-        .find(|duty| duty.slot == SLOT)
+        .find(|duty| duty.slot == slot)
         .expect("the slot has a proposer");
     let proposer = duty.validator_index;
     let message = ProposerPreferences {
         dependent_root: duties.dependent_root,
-        proposal_slot: SLOT,
+        proposal_slot: slot,
         validator_index: proposer,
         fee_recipient: address(0xaa),
         target_gas_limit: 30_000_000,
@@ -1195,7 +1228,7 @@ async fn submit_as_the_validator_client(world: &World) -> (SignedProposerPrefere
     assert_eq!(
         world
             .market
-            .preferences(SLOT, signed.message.dependent_root),
+            .preferences(slot, signed.message.dependent_root),
         Some(signed.clone())
     );
     (signed, pubkey)
@@ -1208,7 +1241,7 @@ async fn submit_as_the_validator_client(world: &World) -> (SignedProposerPrefere
 /// has one.
 #[tokio::test]
 async fn preferences_signed_by_the_validator_client_pass_this_nodes_gossip_rules() {
-    submit_as_the_validator_client(&World::new()).await;
+    submit_as_the_validator_client(&World::new(), SLOT).await;
 }
 
 /// The same across a fulu-to-gloas boundary, for a slot in the first gloas
@@ -1230,7 +1263,7 @@ async fn a_first_gloas_epoch_preference_from_the_validator_client_passes_this_no
     );
     assert_eq!(world.config.fork_at_epoch(proposal_epoch), ForkName::Gloas);
 
-    let (signed, pubkey) = submit_as_the_validator_client(&world).await;
+    let (signed, pubkey) = submit_as_the_validator_client(&world, SLOT).await;
 
     let verifies_under = |fork| {
         let domain = compute_domain(
@@ -1243,6 +1276,28 @@ async fn a_first_gloas_epoch_preference_from_the_validator_client_passes_this_no
     };
     assert!(verifies_under(ForkName::Gloas), "the proposal epoch's fork");
     assert!(!verifies_under(ForkName::Fulu), "not the epoch before it");
+}
+
+/// The same a whole epoch earlier, while this node's head is still fulu: at a
+/// real fork every preference for the first gloas epoch is signed and sent in
+/// the epoch before it, so the gossip rules run on a fulu head. The duty, the
+/// dependent root and the proposer come out of fulu's proposer lookahead, and
+/// the preference goes out for the first slot of gloas.
+#[tokio::test]
+async fn a_first_gloas_epoch_preference_passes_this_nodes_gossip_rules_on_a_fulu_head() {
+    let world = World::before_the_gloas_fork();
+    assert!(matches!(world.state, BeaconState::Fulu(_)), "a fulu head");
+    let gloas_epoch = compute_epoch_at_slot(HEAD_SLOT) + 1;
+    assert_eq!(world.config.fork_at_epoch(gloas_epoch - 1), ForkName::Fulu);
+    assert_eq!(world.config.fork_at_epoch(gloas_epoch), ForkName::Gloas);
+
+    let first_gloas_slot = compute_start_slot_at_epoch(gloas_epoch);
+    let (signed, _) = submit_as_the_validator_client(&world, first_gloas_slot).await;
+    assert_eq!(
+        signed.message.dependent_root,
+        genesis_block().message_hash_tree_root(),
+        "the block at slot 31, the genesis one on this chain"
+    );
 }
 
 #[tokio::test]
