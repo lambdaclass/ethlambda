@@ -40,7 +40,7 @@ use spawned_concurrency::message::Message;
 use spawned_concurrency::tasks::{Context, Handler};
 use tracing::{debug, error, warn};
 
-use crate::beacon::{builder_market, column_checks};
+use crate::beacon::column_checks;
 use crate::gossipsub::operation_kind;
 use crate::{P2PServer, metrics};
 
@@ -213,9 +213,10 @@ impl Validated {
             Self::ExecutionPayloadBid { bid, .. } => {
                 server.builder_market.record_bid((**bid).clone())
             }
-            Self::ProposerPreferences(preferences) => server
-                .builder_market
-                .record_preferences((**preferences).clone(), builder_market::wall_slot(server)),
+            Self::ProposerPreferences(preferences) => server.builder_market.record_preferences(
+                (**preferences).clone(),
+                crate::wall_clock_slot(&server.store),
+            ),
             Self::PayloadAttestation(message) => server
                 .seen_payload_attestations
                 .record(message.data.slot, message.validator_index),

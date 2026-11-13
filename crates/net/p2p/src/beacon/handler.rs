@@ -51,6 +51,13 @@ use crate::req_resp::Request;
 /// stream is eight bytes short and the codec refuses it, which killed the
 /// connection outright. Answering a request means answering in its own version.
 pub fn build_status(store: &Store, wire: &BeaconWire, version: StatusVersion) -> BeaconStatus {
+    status_in_version(&build_status_v2(store, wire), version)
+}
+
+/// [`build_status`] in v2, the version that carries every field, for a caller
+/// that sends one `Status` in several versions (the periodic refresh) and so
+/// should read the head, a whole-block decode, once.
+pub fn build_status_v2(store: &Store, wire: &BeaconWire) -> StatusV2 {
     let (finalized_root, finalized_epoch, head_root, head_slot, earliest_available_slot) =
         match store.beacon_head() {
             Some((head_slot, head_root)) => {
@@ -72,23 +79,27 @@ pub fn build_status(store: &Store, wire: &BeaconWire, version: StatusVersion) ->
             None => (Root::ZERO, 0, Root::ZERO, 0, 0),
         };
 
-    let v1 = StatusV1 {
+    StatusV2 {
         fork_digest: wire.fork_digest,
         finalized_root,
         finalized_epoch,
         head_root,
         head_slot,
-    };
+        earliest_available_slot,
+    }
+}
+
+/// `status` in `version`: v1 is v2 without `earliest_available_slot`.
+pub fn status_in_version(status: &StatusV2, version: StatusVersion) -> BeaconStatus {
     match version {
-        StatusVersion::V1 => BeaconStatus::V1(v1),
-        StatusVersion::V2 => BeaconStatus::V2(StatusV2 {
-            fork_digest: v1.fork_digest,
-            finalized_root: v1.finalized_root,
-            finalized_epoch: v1.finalized_epoch,
-            head_root: v1.head_root,
-            head_slot: v1.head_slot,
-            earliest_available_slot,
+        StatusVersion::V1 => BeaconStatus::V1(StatusV1 {
+            fork_digest: status.fork_digest,
+            finalized_root: status.finalized_root,
+            finalized_epoch: status.finalized_epoch,
+            head_root: status.head_root,
+            head_slot: status.head_slot,
         }),
+        StatusVersion::V2 => BeaconStatus::V2(status.clone()),
     }
 }
 
@@ -225,11 +236,13 @@ pub async fn request_metadata(server: &P2PServer, peer_id: PeerId) {
         .await;
 }
 
-/// Re-open a refused handshake on the other `Status` version.
+/// Re-open a refused `status/1` request on `status/2`.
 ///
 /// A peer that supports neither version was never going to talk to us, and one
-/// retry cannot loop: the retry is sent in the version the first attempt was
-/// not.
+/// retry cannot loop: the caller retries only a refused `status/1`, and this
+/// sends `status/2`. A refresh asks in the version the peer last answered in,
+/// so a peer that has dropped v1 is asked in v2 from then on rather than
+/// refused and retried every time.
 pub async fn retry_status_on_other_version(server: &P2PServer, peer_id: PeerId) {
     let Some(wire) = server.wire.beacon() else {
         return;

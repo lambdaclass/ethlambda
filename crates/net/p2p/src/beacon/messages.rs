@@ -70,6 +70,13 @@ impl BeaconStatus {
         }
     }
 
+    pub fn head_root(&self) -> Root {
+        match self {
+            BeaconStatus::V1(status) => status.head_root,
+            BeaconStatus::V2(status) => status.head_root,
+        }
+    }
+
     pub fn finalized_epoch(&self) -> Epoch {
         match self {
             BeaconStatus::V1(status) => status.finalized_epoch,

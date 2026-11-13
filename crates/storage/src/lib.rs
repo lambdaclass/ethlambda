@@ -27,5 +27,5 @@ pub use liveness::ObservedLiveness;
 pub use state_writer::CacheKey;
 pub use store::{
     Chain, DB_VERSION, ForkCheckpoints, GetForkchoiceStoreError, HeadVoteWindow,
-    MAX_RESUMABLE_DB_STATE_AGE, NEW_PAYLOAD_CAP, Store,
+    MAX_RESUMABLE_DB_STATE_AGE, NEW_PAYLOAD_CAP, PeerView, Store,
 };

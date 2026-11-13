@@ -295,10 +295,12 @@ Three differences from lighthouse:
   `MESH_DELIVERY_MAX_HEAD_LAG` slots, and back on only after an epoch within
   that lag, so the counters have refilled. While P3 is off its threshold and
   weight are zero but its cap is not, so the counters keep counting to their
-  real ceiling. `SyncStatus` cannot serve as this gate: on the mainnet
-  follower it reported `synced` through a 10-minute catch-up up to 98 slots
-  behind, since its network-stall rule reads a lagging freshest-known block
-  as a stalled network.
+  real ceiling. `SyncStatus` is not this gate: it reports syncing only past
+  two epochs of lag, and only once peers report a head ahead, where P3 must
+  be off from `MESH_DELIVERY_MAX_HEAD_LAG` slots. (It also used to read a
+  lagging freshest-known block as a stalled network, and reported `synced`
+  through a 10-minute catch-up up to 98 slots behind on the mainnet
+  follower.)
 - **Leaving a topic waits out the peers' backoff.** Gossipsub's default
   backoff after unsubscribing (10 s) is shorter than its prune backoff
   (60 s), and a rust-libp2p peer that sees a mesh peer unsubscribe backs off
@@ -737,7 +739,7 @@ Both paths now import. A fetched block reaches the chain actor as
 `BlockSource::Sync`, keeping every per-block range and root check on the way in,
 and the by-root path is what resolves a gossiped block's missing parent.
 
-Range sync is paced by `P2PServer::beacon_fetched_through`, the highest slot
+Range sync is paced by `P2PServer::range_fetched_through`, the highest slot
 handed to the actor, not by the store's head. Delivery is a message and import
 is work, so the store trails a delivered batch by the whole actor mailbox.
 Driven off the head, every resync tick re-requested the part still draining,
@@ -750,8 +752,18 @@ follower that had caught up and then imported from gossip kept it at its last
 range batch, and every peer that connected later was asked again for every block
 since: 748 blocks in 66 bursts on one follower. A `Status` answer is
 therefore measured against the higher of the watermark and the store's head
-(`beacon_sync_target`). The head is a safe floor, since a head block's whole
-ancestry is already imported.
+(`range_sync_target`). The head is a safe floor, since a head block's whole
+ancestry is already imported. Lean range sync reads the same watermark, for
+the same reason.
+
+Each peer is also re-asked for its `Status` every half epoch, so the head it
+reported at the handshake does not go stale for the sync gate (see
+`crates/net/p2p/src/peer_heads.rs`). An answer to that refresh starts a range
+sync only when it leads the same floor by more than an epoch
+(`status_sync_target`): a node keeping up with gossip sees peers a slot ahead
+all the time, and a one-block range request would only race gossip. An answer
+naming a head this node has already imported starts nothing, and skips the head
+decode the comparison would cost.
 
 `Status` is store-derived: head from `Store::beacon_head`, the finalized
 checkpoint from `Store::beacon_finalized_checkpoint`, and
@@ -806,7 +818,7 @@ as a query filter, so a `quic`-only record is invisible to it.
 | `lean_beacon_gossip_messages_total{topic,result}` | Gossip received, by topic and by `decoded` / `decode_failed` / `decompress_failed` / `unsupported_fork` |
 | `lean_beacon_gossip_validation_total{kind,outcome,reason}` | Gossip verdicts, now including `beacon_aggregate_and_proof` and `beacon_attestation`; see [metrics.md](./metrics.md#beacon-gossip-validation) |
 | `lean_beacon_gossip_verdict_expired_total{kind}` | Verdicts that came too late to propagate anything; should stay at zero |
-| `lean_beacon_status_digest_mismatch_total` | Handshakes seen from another fork digest |
+| `lean_beacon_status_digest_mismatch_total` | Peers whose `Status` moved onto another fork digest, once per move (not per refresh) |
 | `lean_beacon_fork_digest{digest}` | The digest computed at startup, as a label |
 | `lean_beacon_aggregate_decode_seconds` | Time spent decoding one aggregate off the wire |
 | `lean_beacon_aggregate_mailbox_wait_seconds` | How long an aggregate sat in the chain actor's mailbox |

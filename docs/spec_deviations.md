@@ -28,6 +28,69 @@ interval, and stops early once it runs out of time.
 - **leanSpec:** `aggregate()` is called inline and synchronously from `tick_interval`, at interval 2 only. It walks every attestation data with fresh evidence, with no job cap, no time budget, no worker, and no cancellation.
 - **Equivalence:** on cancellation the worker emits only the groups that finished, so a slot may pack fewer aggregates than the synchronous path would; any such subset still yields a valid block, affecting how many votes are included rather than signature validity. The job cap has the same character: it bounds prover work per slot, not what a block may carry.
 
+## The duty sync gate compares the head with peers' heads, not with imported blocks
+
+A node reports itself syncing, and stops proposing and attesting, only when its
+head trails the wall clock **and** its peers report a head ahead of it.
+
+- **leanSpec:** `ValidatorService._is_synced_for_duties` (PR #708) takes the
+  freshest block it knows from imported blocks only. When that block is more
+  than 8 slots behind the wall clock it reads the network as stalled and allows
+  duties; otherwise the node is syncing once its head is more than 4 slots
+  behind the clock, with a hysteresis band of 2.
+  `test_no_extra_blocks_treats_isolation_as_network_stall` pins the case of a
+  node 100 slots behind with nothing newer imported, which does its duties.
+- **ethlambda:** the node is syncing when its head is more than 4 slots behind
+  the wall clock and the head its peers report is more than 1 slot ahead of its
+  own, with the same band of 2 on both (`SyncThresholds::LEAN`,
+  `crates/net/api/src/sync.rs`, judged in
+  `crates/blockchain/src/sync_status.rs`). The peers' head comes from `Status`
+  (`crates/net/p2p/src/peer_heads.rs`): the highest of each connected peer's
+  latest report, re-requested every 2 slots, with a head past the wall clock by
+  more than a slot dropped and a head the node has already imported not counted
+  (the peer is not ahead of it, whatever its slot). The peer lead is smaller
+  than the clock lag because a report is up to 2 slots old: a node 5 slots
+  behind a producing network sees its peers' 2-slot-old heads 2 slots ahead.
+  With no report at all the node cannot be behind anyone and reads as synced,
+  except during a hold at startup, during which the network is assumed to be
+  at least at the clock. The hold lasts 8 slots, or until 5 connected peers
+  have reported a head (one the node already holds counts; one past the clock
+  does not), whichever comes first: the first peer to answer may be as stale
+  as the node, but the highest of five shows the lead if any one of them is
+  current.
+- **Stall window:** a lead that does not turn into progress is given up on. A
+  node that reads as syncing on its peers' word with its head flat for 16 slots
+  (`SyncThresholds::stall_window`) treats the network as stalled and does its
+  duties, until its head next advances. A peer that claims a head it does not
+  serve (an empty answer, invalid blocks, no answer at all) therefore costs at
+  most that window, not the rest of a network stall. The window is sized above
+  what can legitimately hold a catching-up head still, and counts only from the
+  end of the startup hold.
+- **Why:** imported blocks cannot tell "the network is stalled" from "this node
+  is behind". A node catching up has imported nothing recent either, so the
+  specification's rule reports it synced for the whole catch-up and it proposes
+  and attests on a stale head (lambdaclass/ethlambda#559). Lighthouse and Prysm
+  decide against what their peers report, and require the head to trail the
+  clock too, so no peer's claim can idle a node that is current. Comparing with
+  peers also keeps a run of missed proposals (leanSpec #1194) from closing the
+  gate on every honest node, since none of them is more than propagation behind
+  another.
+- **Equivalence:** the two agree whenever no peer is further ahead of the node
+  than its newest imported block. They differ for a node behind its peers with
+  nothing newer imported, which the specification lets do its duties and this
+  node does not, until its head has been flat for the stall window. They also
+  differ for a node restarted into a network stall, which the specification
+  lets do its duties at once and this node holds until 5 peers have reported
+  or the 8-slot startup window has passed.
+
+The beacon node runs the same rule with Lighthouse's numbers (two epochs of
+clock lag, one epoch of peer lead), a band of 4 slots that neither Lighthouse
+nor Prysm has (this node re-judges on every block arrival, and would otherwise
+flip twice a slot at the boundary), an epoch of startup hold (ended sooner by
+the same 5 reporting peers) and of stall window, and Prysm's `Status` refresh, every half epoch (Lighthouse refreshes
+every 300 s). consensus-specs has no sync gate, and the Beacon API leaves
+`is_syncing` to the client.
+
 ## Attestation scoring on block building
 
 Attestations are scored and selected when packing a block, rather than taken in
