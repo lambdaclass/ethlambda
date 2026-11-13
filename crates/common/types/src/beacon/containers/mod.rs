@@ -366,8 +366,74 @@ impl BeaconState {
     /// unlike the accessors that read a beacon field: this is the inverse of
     /// [`BeaconState::from_ssz`], which builds that variant, so refusing here
     /// would make decoding a state and re-encoding it panic.
+    ///
+    /// Goes through [`BeaconState::ssz_append`] rather than libssz's own
+    /// `to_ssz`, which reserves only the encoding's length and so holds a fulu
+    /// or gloas state twice while encoding it (see
+    /// [`BeaconState::ssz_append_capacity`]).
     pub fn to_ssz(&self) -> Vec<u8> {
-        dispatch_state_including_lean!(self, |state| state.to_ssz())
+        let mut buf = Vec::new();
+        self.ssz_append(&mut buf);
+        buf
+    }
+
+    /// How much [`BeaconState::ssz_append`] reserves past the end of the
+    /// buffer it appends to, so the append never regrows it: the encoding's
+    /// own length plus the largest fixed-size field of this variant's state.
+    /// Public for tests that check that bound.
+    ///
+    /// The headroom is for libssz's container encoder, which writes each
+    /// fixed-size field past the end of the buffer and then moves it into
+    /// place. A fixed-size field written after every variable-size one
+    /// (fulu's `proposer_lookahead`, gloas's `ptc_window`) therefore needs
+    /// room beyond the encoding's length, and without it a buffer the size of
+    /// the whole state is regrown to twice that, copying it, for the last few
+    /// hundred bytes.
+    pub fn ssz_append_capacity(&self) -> usize {
+        dispatch_state_including_lean!(self, |state| state.encoded_len())
+            + self.largest_fixed_field()
+    }
+
+    /// The largest fixed-size field in this variant's state: how far past the
+    /// encoding's end libssz's encoder can write (see
+    /// [`BeaconState::ssz_append_capacity`]).
+    ///
+    /// The beacon forks share one list. Every one of them has `randao_mixes`,
+    /// the largest on mainnet, and the only field that beats it on any preset
+    /// is gloas's `ptc_window` on minimal, by about a kilobyte, so a list per
+    /// fork would save nothing worth keeping eight lists for. A lean state is
+    /// a different container with fields a few hundred bytes wide, and
+    /// reserving a beacon state's megabytes for it would often outweigh the
+    /// state itself.
+    fn largest_fixed_field(&self) -> usize {
+        use libssz::SszEncode;
+        let largest = |sizes: &[usize]| sizes.iter().copied().max().unwrap_or(0);
+        match self {
+            BeaconState::Lean(_) => largest(&[
+                <crate::state::StateConfig as SszEncode>::fixed_size(),
+                <crate::block::BlockHeader as SszEncode>::fixed_size(),
+                <crate::checkpoint::Checkpoint as SszEncode>::fixed_size(),
+            ]),
+            _ => largest(&[
+                <shared::RandaoMixes as SszEncode>::fixed_size(),
+                <shared::BlockRoots as SszEncode>::fixed_size(),
+                <altair::SyncCommittee as SszEncode>::fixed_size(),
+                <gloas::PayloadTimelinessCommitteeWindow as SszEncode>::fixed_size(),
+            ]),
+        }
+    }
+
+    /// Appends [`BeaconState::to_ssz`]'s output to `buf`, after whatever it
+    /// already holds.
+    ///
+    /// For a caller that frames the encoding (the storage layer's fork tag):
+    /// a mainnet state encodes to hundreds of megabytes, and the append holds
+    /// one copy of it, never two. It first reserves
+    /// [`BeaconState::ssz_append_capacity`] past `buf`'s length, so a caller
+    /// need not size `buf` itself.
+    pub fn ssz_append(&self, buf: &mut Vec<u8>) {
+        buf.reserve_exact(self.ssz_append_capacity());
+        dispatch_state_including_lean!(self, |state| state.ssz_append(buf))
     }
 
     /// The state's merkle root, which a block's `state_root` must equal.
