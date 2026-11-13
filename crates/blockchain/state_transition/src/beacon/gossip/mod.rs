@@ -512,7 +512,7 @@ pub(crate) fn slot_start_ms(config: &Config, slot: Slot) -> u64 {
 
 /// The specification's `is_future_slot`: `slot` starts later than `now_ms`
 /// plus the gossip clock disparity allowance.
-pub(crate) fn is_future_slot(config: &Config, slot: Slot, now_ms: u64) -> bool {
+pub fn is_future_slot(config: &Config, slot: Slot, now_ms: u64) -> bool {
     slot_start_ms(config, slot) > now_ms.saturating_add(MAXIMUM_GOSSIP_CLOCK_DISPARITY)
 }
 

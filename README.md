@@ -312,6 +312,7 @@ what they sign.
 | `--checkpoint-sync-url` | Where the anchor comes from. Required on a fresh data directory for a built-in network, since those never start from genesis. A resumable data directory is used before it; a network loaded from a directory anchors at its own `genesis.ssz` when no URL is given |
 | `--node-key` | Optional, but worth persisting: the columns this node custodies are a function of its node id, so without a key file it changes identity, and custody set, on every restart |
 | `--execution-endpoint`, `--execution-jwt-secret` | Optional Engine API pairing, given together. Without them, blocks import without payload validation |
+| `--builder` | Optional builder API endpoint, normally MEV-Boost. With it, a fulu proposal from a validator registered through this node gets a blinded block when the builder's bid wins; without it every block is built locally |
 
 A built-in network needs nothing else on disk. Its `eth-clients` `config.yaml`
 and bootnode list, and the two genesis values the fork digest is computed from,

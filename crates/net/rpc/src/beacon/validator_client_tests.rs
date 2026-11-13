@@ -119,28 +119,55 @@ async fn serve_at(
     fulu.current_sync_committee = sync_committee.clone();
     fulu.next_sync_committee = sync_committee;
 
-    let (mut store, _root) = beacon_store_at(state.clone());
+    // On a clock where the slot after the head is running, the slot these
+    // tests propose for: production refuses a slot that has not started, and
+    // the wall clock may still be in the epoch's first slot, the head's own.
+    let (mut store, _root) =
+        crate::test_utils::beacon_store_at_clock(state.clone(), state.slot() + 1);
     // A block built on this head names the head block's real root as its
     // parent, which the fixture's placeholder anchor block does not have:
     // keep the state under that root too, as a real anchor would be.
+    let parent_root = real_head_root(&state);
+    store.insert_state(parent_root, state.clone()).unwrap();
+    let (client, network, _pool, address) = spawn_server(store.clone(), engine).await;
+    (client, state, network, address, store)
+}
+
+/// The root a block built on `state` names as its parent: its latest block
+/// header's, which the fixtures' placeholder anchor block does not have.
+fn real_head_root(state: &BeaconState) -> ethlambda_types::primitives::H256 {
     let advanced = ethlambda_state_transition::beacon::block_production::advance_to_slot(
-        &state,
+        state,
         state.slot() + 1,
         &ethlambda_types::beacon::config::Config::mainnet(),
     )
     .unwrap();
-    let parent_root = advanced.latest_block_header().hash_tree_root();
-    store.insert_state(parent_root, state.clone()).unwrap();
-    let (client, network, _pool, address) = spawn_server(store.clone(), engine).await;
-    (client, state, network, address, store)
+    advanced.latest_block_header().hash_tree_root()
 }
 
 /// Serve `store` through the router the real server builds, over a socket on an
 /// ephemeral port, and connect this crate's client to it. Also hands back the
 /// payload attestation pool the router fills and the socket it listens on.
 async fn spawn_server(
+    store: Store,
+    engine: Option<ethlambda_engine::EngineClient>,
+) -> (
+    HttpBeaconNode,
+    Arc<RecordingNetwork>,
+    SharedPayloadAttestationPool,
+    std::net::SocketAddr,
+) {
+    spawn_server_sharing(store, engine, SharedSyncCommitteePool::default()).await
+}
+
+/// [`spawn_server`] pooling sync committee messages in `sync_pool`, so a second
+/// node over the same head, on a clock a slot later, packs into its block what
+/// the first one pooled: block production refuses a slot that has not started,
+/// and a sync committee message is accepted only during its own slot.
+async fn spawn_server_sharing(
     mut store: Store,
     engine: Option<ethlambda_engine::EngineClient>,
+    sync_pool: SharedSyncCommitteePool,
 ) -> (
     HttpBeaconNode,
     Arc<RecordingNetwork>,
@@ -160,7 +187,7 @@ async fn spawn_server(
     let router = crate::build_beacon_api_router(store, "ethlambda/test", "peer".into())
         .layer(Extension(SyncStatusController::new(SyncStatus::Synced)))
         .layer(Extension(p2p))
-        .layer(Extension(SharedSyncCommitteePool::default()))
+        .layer(Extension(sync_pool))
         .layer(Extension(payload_pool.clone()))
         .layer(Extension(
             ethlambda_state_transition::beacon::builder_market::SharedBuilderMarket::default(),
@@ -420,18 +447,41 @@ fn valid_blob(seed: u8) -> Vec<u8> {
 /// The fulu bundle carries `blob_count` valid blobs with their commitments and
 /// cell proofs (flattened blob by blob, as `BlobsBundleV2` does).
 pub(super) async fn fake_execution_client(blob_count: usize) -> ethlambda_engine::EngineClient {
-    fake_execution_client_with(blob_count, None).await
+    let delay = std::time::Duration::ZERO;
+    fake_execution_client_with(blob_count, None, "0x2a", false, delay).await
+}
+
+/// [`fake_execution_client`] with no blobs, whose fulu payload pays
+/// `block_value` (hex wei) and carries `should_override_builder`.
+pub(super) async fn fake_execution_client_paying(
+    block_value: &'static str,
+    should_override_builder: bool,
+) -> ethlambda_engine::EngineClient {
+    let delay = std::time::Duration::ZERO;
+    fake_execution_client_with(0, None, block_value, should_override_builder, delay).await
+}
+
+/// [`fake_execution_client`] with no blobs, holding every `forkchoiceUpdated`
+/// answer back for `delay`: an execution client slow to start a build.
+pub(super) async fn fake_execution_client_slow_to_build(
+    delay: std::time::Duration,
+) -> ethlambda_engine::EngineClient {
+    fake_execution_client_with(0, None, "0x2a", false, delay).await
 }
 
 /// [`fake_execution_client`] whose gloas payloads carry `blob`, with its real
 /// commitment and cell proofs, in the blobs bundle.
 async fn fake_execution_client_with_blob(blob: Option<Vec<u8>>) -> ethlambda_engine::EngineClient {
-    fake_execution_client_with(0, blob).await
+    let delay = std::time::Duration::ZERO;
+    fake_execution_client_with(0, blob, "0x2a", false, delay).await
 }
 
 async fn fake_execution_client_with(
     blob_count: usize,
     blob: Option<Vec<u8>>,
+    block_value: &'static str,
+    should_override_builder: bool,
+    forkchoice_delay: std::time::Duration,
 ) -> ethlambda_engine::EngineClient {
     use axum::{Json, routing::post};
     use ethlambda_state_transition::beacon::kzg;
@@ -497,7 +547,11 @@ async fn fake_execution_client_with(
                     "excessBlobGas": "0x0",
                 })
             };
-            let result = match request["method"].as_str() {
+            let method = request["method"].as_str();
+            if let Some("engine_forkchoiceUpdatedV3" | "engine_forkchoiceUpdatedV4") = method {
+                tokio::time::sleep(forkchoice_delay).await;
+            }
+            let result = match method {
                 Some("engine_forkchoiceUpdatedV3" | "engine_forkchoiceUpdatedV4") => {
                     let mut attributes = request["params"][1].clone();
                     attributes["parentHash"] = request["params"][0]["headBlockHash"].clone();
@@ -513,9 +567,9 @@ async fn fake_execution_client_with(
                     v5_payload["blobGasUsed"] = blob_gas_used.clone().into();
                     serde_json::json!({
                         "executionPayload": v5_payload,
-                        "blockValue": "0x2a",
+                        "blockValue": block_value,
                         "blobsBundle": { "commitments": commitments, "proofs": proofs, "blobs": blobs },
-                        "shouldOverrideBuilder": false,
+                        "shouldOverrideBuilder": should_override_builder,
                         "executionRequests": [],
                     })
                 }
@@ -573,8 +627,15 @@ async fn produce_with_pool(
     };
     use ethlambda_types::beacon::constants::{DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO};
 
-    let (client, state, network, address, store) =
+    let (client, state, network, address, mut store) =
         serve_at(Some(fake_execution_client(blob_count).await)).await;
+    // The publish endpoints refuse a parent at the finalized slot other than
+    // the finalized block, so finalize the root the block names, as a real
+    // anchor's checkpoint does. Here only: the vote paths walk the block
+    // index, which holds the placeholder anchor.
+    let (anchor_root, _) = crate::beacon::validator::head(&store).unwrap();
+    let parent_root = real_head_root(&state);
+    crate::test_utils::finalize_at(&mut store, anchor_root, parent_root, state.slot());
     fill_pool(&store, &state);
     let slot = state.slot() + 1;
     let advanced = advance_to_slot(
@@ -801,7 +862,9 @@ async fn the_json_block_carries_its_blobs_and_cell_proofs_as_hex() {
 // ---------------------------------------------------------------------------
 
 /// A fulu head state at the first slot of epoch 2, its header's root the one
-/// the store's head is under, served on a clock pinned to that slot.
+/// the store's head is under, served on a clock pinned to that slot, or
+/// `clock_ahead` slots after it, pooling sync committee messages in
+/// `sync_pool`.
 ///
 /// Unlike [`serve`] the head root is the root a block built on this state
 /// names as its parent, which is the root `process_sync_aggregate` reads back
@@ -811,6 +874,8 @@ async fn the_json_block_carries_its_blobs_and_cell_proofs_as_hex() {
 /// own `fork` and the client's schedule give one domain.
 async fn serve_fulu_pinned(
     engine: Option<ethlambda_engine::EngineClient>,
+    sync_pool: SharedSyncCommitteePool,
+    clock_ahead: u64,
 ) -> (
     Arc<HttpBeaconNode>,
     BeaconState,
@@ -857,9 +922,9 @@ async fn serve_fulu_pinned(
         config,
         block,
         head_root,
-        slot,
+        slot + clock_ahead,
     );
-    let (client, network, _, _) = spawn_server(store, engine).await;
+    let (client, network, _, _) = spawn_server_sharing(store, engine, sync_pool).await;
     let genesis = client.genesis().await.expect("genesis");
     let spec = client
         .spec()
@@ -1028,12 +1093,17 @@ async fn the_validator_client_can_serve_on_the_sync_committee() {
         containers::SignedBeaconBlock,
     };
 
+    let engine = fake_execution_client(0).await;
+    let sync_pool = SharedSyncCommitteePool::default();
     let (client, state, network, context) =
-        serve_fulu_pinned(Some(fake_execution_client(0).await)).await;
+        serve_fulu_pinned(Some(engine.clone()), sync_pool.clone(), 0).await;
     let slot = state.slot();
     let root = sync_committee_slot(&client, &state, &network, context, slot).await;
 
     // The next slot's block packs what was pooled over the head it builds on.
+    // It is asked for once that slot has started: the same head and pool on a
+    // clock one slot later.
+    let (client, _, network, _) = serve_fulu_pinned(Some(engine), sync_pool, 1).await;
     let next = slot + 1;
     let advanced = advance_to_slot(&state, next, &fulu_schedule()).unwrap();
     let proposer = get_beacon_proposer_index(&advanced).unwrap();
@@ -1144,6 +1214,16 @@ mod gloas {
         clock_slot: u64,
         engine: Option<ethlambda_engine::EngineClient>,
     ) -> Served {
+        serve_gloas_sharing(clock_slot, engine, SharedSyncCommitteePool::default()).await
+    }
+
+    /// [`serve_gloas`] pooling sync committee messages in `sync_pool`; see
+    /// [`spawn_server_sharing`].
+    async fn serve_gloas_sharing(
+        clock_slot: u64,
+        engine: Option<ethlambda_engine::EngineClient>,
+        sync_pool: SharedSyncCommitteePool,
+    ) -> Served {
         let state = head_state();
         let block = gloas_beacon_block(
             state.slot(),
@@ -1159,7 +1239,8 @@ mod gloas {
         let head_root = header.hash_tree_root();
         let store =
             beacon_store_with_head_block(state.clone(), config(), block, head_root, clock_slot);
-        let (client, network, payload_pool, _address) = spawn_server(store.clone(), engine).await;
+        let (client, network, payload_pool, _address) =
+            spawn_server_sharing(store.clone(), engine, sync_pool).await;
         let genesis = client.genesis().await.expect("genesis");
         let spec = client
             .spec()
@@ -1579,18 +1660,28 @@ mod gloas {
     #[tokio::test]
     async fn the_validator_client_can_serve_on_the_sync_committee_at_a_gloas_slot() {
         let engine = fake_execution_client(0).await;
+        let sync_pool = SharedSyncCommitteePool::default();
         let Served {
             client,
             state,
             network,
-            store,
             context,
             ..
-        } = serve_gloas(32, Some(engine)).await;
+        } = serve_gloas_sharing(32, Some(engine.clone()), sync_pool.clone()).await;
         let client = Arc::new(client);
         let slot = state.slot();
         let root = sync_committee_slot(&client, &state, &network, context.clone(), slot).await;
 
+        // The next slot's block, asked for once that slot has started: the
+        // same head and pool on a clock one slot later.
+        let Served {
+            client,
+            network,
+            store,
+            context,
+            ..
+        } = serve_gloas_sharing(33, Some(engine), sync_pool).await;
+        let client = Arc::new(client);
         let next = slot + 1;
         let advanced = advance_to_slot(&state, next, &config()).unwrap();
         let proposer = get_beacon_proposer_index(&advanced).unwrap();

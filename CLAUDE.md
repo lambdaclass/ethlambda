@@ -588,6 +588,17 @@ default** on its two SSZ endpoints and bare integers in JSON, because
 `checkpoint_sync.rs` and other clients' lean sync read those bytes and may send no
 `Accept` at all; `/lean/v0/blocks/finalized` now answers JSON when asked for it by name.
 
+With `--builder`, the beacon surface also runs the **fulu builder flow
+(MEV-Boost)**. `register_validator` forwards registrations to the builder
+(`beacon/registrations.rs`, client in `beacon/builder_client/`).
+`produceBlockV3` asks for the builder's bid alongside the local build and
+serves a blinded block when the bid passes its checks and wins on value
+(`beacon/builder_flow/`: bid checks, circuit breaker, boost-factor choice).
+`blinded_blocks` hands the signed block back for the builder to publish, with
+no local fallback, since a second block for the slot would be an equivocation. Gloas
+has no blinded blocks; its builder market is separate (the **Gloas** bullet
+under Beacon Chain STF).
+
 See [`docs/rpc.md`](docs/rpc.md) for the full reference: CLI flags and defaults, the lean API endpoints (health, finalized state/block, justified checkpoint, blocks by root/slot, fork-choice tree + D3.js UI, runtime aggregator toggle), the Beacon API endpoints and the three ids they refuse, the metrics/debug endpoints (Prometheus `/metrics`, jemalloc heap profiling), the Hive test-driver endpoints, plus request/response shapes, status codes, and content types.
 
 ## Beacon Chain types (`crates/common/types/src/beacon/`)
