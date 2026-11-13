@@ -19,6 +19,8 @@
 //! Gloas is the exception: its payload is revealed in an envelope, so its
 //! request ([`gloas_new_payload_request`]) needs the block and the envelope.
 
+use std::time::Instant;
+
 use ethlambda_engine::types::PayloadStatusValue;
 use ethlambda_engine::{EngineClient, EngineError, PayloadStatusV1};
 use ethlambda_state_transition::beacon::containers::{self, SignedBeaconBlock};
@@ -178,6 +180,87 @@ pub fn verdict(status: &PayloadStatusV1) -> PayloadValidity {
     })
 }
 
+/// [`NewPayloadRequest`] with its own copy of the payload, so it can move into
+/// a spawned task.
+///
+/// The chain actor sends the question from a task of its own and runs the
+/// block's state transition meanwhile (see `process_block`), and a task cannot
+/// borrow the block the actor goes on using. Only the payload is copied: the
+/// rest of the request is already owned, and the block itself, which also
+/// carries the attestations and the other operations, is never cloned.
+pub struct OwnedNewPayloadRequest {
+    execution_payload: containers::deneb::ExecutionPayload,
+    versioned_hashes: Vec<Bytes32>,
+    parent_beacon_block_root: Root,
+    execution_requests: Vec<Vec<u8>>,
+}
+
+impl NewPayloadRequest<'_> {
+    /// Copies the borrowed payload so the request outlives the block.
+    pub fn into_owned(self) -> OwnedNewPayloadRequest {
+        OwnedNewPayloadRequest {
+            execution_payload: self.execution_payload.clone(),
+            versioned_hashes: self.versioned_hashes,
+            parent_beacon_block_root: self.parent_beacon_block_root,
+            execution_requests: self.execution_requests,
+        }
+    }
+}
+
+/// [`ask`] for a request already built with [`new_payload_request`], which is
+/// how the actor sends it from a task while it computes the transition.
+///
+/// The answer is read exactly as [`ask`] reads it: `Err` means no answer after
+/// the client's whole retry ladder, and there is no `Ok(None)` because a
+/// request existing means there was something to ask.
+pub async fn ask_request(
+    client: &EngineClient,
+    request: OwnedNewPayloadRequest,
+) -> Result<PayloadValidity, EngineError> {
+    let call = client.new_payload(
+        &request.execution_payload,
+        &request.versioned_hashes,
+        request.parent_beacon_block_root,
+        &request.execution_requests,
+    );
+    let status = timed_new_payload(call).await?;
+    Ok(verdict(&status))
+}
+
+/// Awaits `call`, one `engine_newPayload*` request, and observes the time from
+/// sending it to its answer as `lean_engine_new_payload_seconds`, under the
+/// [`outcome_label`] of the verdict the answer reads as.
+///
+/// Every request this module sends goes through here, a block's payload and an
+/// envelope's alike, so the metric is the execution client's time for every
+/// payload it was asked about. A request refused before it is sent (an
+/// envelope that does not match its block) never reaches it.
+async fn timed_new_payload(
+    call: impl Future<Output = Result<PayloadStatusV1, EngineError>>,
+) -> Result<PayloadStatusV1, EngineError> {
+    let sent = Instant::now();
+    let status = call.await;
+    let validity = status.as_ref().ok().map(verdict);
+    let outcome = outcome_label(validity.as_ref());
+    crate::metrics::observe_engine_new_payload(outcome, sent.elapsed());
+    status
+}
+
+/// The `outcome` an answer is counted under: its verdict, or `no_verdict`
+/// when the retry ladder ran out without one.
+///
+/// `not_required` is listed for completeness: a status from the execution
+/// client always reads as one of the other three verdicts.
+pub fn outcome_label(verdict: Option<&PayloadValidity>) -> &'static str {
+    match verdict {
+        Some(PayloadValidity::Validated) => "valid",
+        Some(PayloadValidity::Optimistic) => "optimistic",
+        Some(PayloadValidity::Invalidated { .. }) => "invalidated",
+        Some(PayloadValidity::NotRequired) => "not_required",
+        None => "no_verdict",
+    }
+}
+
 /// Asks the execution client about `block`'s payload.
 ///
 /// `Ok(None)` means there was nothing to ask, which is not a failure:
@@ -192,14 +275,13 @@ pub async fn ask(
     let Some(request) = new_payload_request(block) else {
         return Ok(None);
     };
-    let status = client
-        .new_payload(
-            request.execution_payload,
-            &request.versioned_hashes,
-            request.parent_beacon_block_root,
-            &request.execution_requests,
-        )
-        .await?;
+    let call = client.new_payload(
+        request.execution_payload,
+        &request.versioned_hashes,
+        request.parent_beacon_block_root,
+        &request.execution_requests,
+    );
+    let status = timed_new_payload(call).await?;
     Ok(Some(verdict(&status)))
 }
 
@@ -230,14 +312,13 @@ pub async fn ask_envelope_status(
     envelope: &containers::gloas::SignedExecutionPayloadEnvelope,
 ) -> Result<PayloadStatusV1, EngineError> {
     let request = gloas_new_payload_request(block, envelope)?;
-    client
-        .new_payload_v5(
-            request.execution_payload,
-            &request.versioned_hashes,
-            request.parent_beacon_block_root,
-            &request.execution_requests,
-        )
-        .await
+    let call = client.new_payload_v5(
+        request.execution_payload,
+        &request.versioned_hashes,
+        request.parent_beacon_block_root,
+        &request.execution_requests,
+    );
+    timed_new_payload(call).await
 }
 
 #[cfg(test)]
