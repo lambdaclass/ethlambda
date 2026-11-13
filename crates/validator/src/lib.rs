@@ -30,6 +30,7 @@ pub mod attestation;
 pub mod beacon_node;
 pub mod duties;
 pub mod error;
+pub mod exit;
 pub mod http_api;
 pub mod keys;
 pub mod metrics;
@@ -234,6 +235,9 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             secrets_dir: config.secrets_dir.clone(),
             definitions_lock: Arc::new(Mutex::new(())),
             default_remote_signer: config.web3signer_url.clone(),
+            beacon_node: beacon_node.clone(),
+            signing: context.clone(),
+            clock: clock.clone(),
             definitions_unflushed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             protection: protection.clone(),
         };

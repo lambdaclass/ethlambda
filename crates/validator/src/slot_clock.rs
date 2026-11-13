@@ -110,6 +110,11 @@ impl SlotClock {
         slot / SLOTS_PER_EPOCH
     }
 
+    /// How long one slot lasts.
+    pub fn slot_duration(&self) -> Duration {
+        Duration::from_millis(self.slot_duration_ms)
+    }
+
     /// When `slot` begins.
     pub fn start_of(&self, slot: Slot) -> SystemTime {
         // Saturating rather than wrapping: a slot number large enough to

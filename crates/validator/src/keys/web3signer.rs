@@ -21,7 +21,9 @@ use ethlambda_types::beacon::containers::altair::{
 use ethlambda_types::beacon::containers::gloas::{
     ExecutionPayloadEnvelope, PayloadAttestationData,
 };
-use ethlambda_types::beacon::containers::shared::{AttestationData, BeaconBlockHeader, Fork};
+use ethlambda_types::beacon::containers::shared::{
+    AttestationData, BeaconBlockHeader, Fork, VoluntaryExit,
+};
 use ethlambda_types::beacon::containers::{electra, gloas};
 use ethlambda_types::beacon::primitives::{BLS_SIGNATURE_SIZE, BlsPubkey, BlsSignature, Root};
 use serde::Serialize;
@@ -314,6 +316,9 @@ pub enum SigningBody<'a> {
     PayloadAttestationMessage {
         payload_attestation_message: Versioned<&'a PayloadAttestationData>,
     },
+    VoluntaryExit {
+        voluntary_exit: &'a VoluntaryExit,
+    },
 }
 
 impl SigningBody<'_> {
@@ -332,6 +337,7 @@ impl SigningBody<'_> {
             }
             Self::ExecutionPayloadEnvelope { .. } => "EXECUTION_PAYLOAD_ENVELOPE",
             Self::PayloadAttestationMessage { .. } => "PAYLOAD_ATTESTATION_MESSAGE",
+            Self::VoluntaryExit { .. } => "VOLUNTARY_EXIT",
         }
     }
 }
@@ -480,11 +486,22 @@ mod tests {
             state_root: Root::repeat_byte(2),
             body_root: Root::repeat_byte(3),
         };
+        let exit = VoluntaryExit {
+            epoch: 100,
+            validator_index: 7,
+        };
         let cases: Vec<(SigningBody<'_>, &str, &str)> = vec![
             (
                 SigningBody::Attestation { attestation: &data },
                 "ATTESTATION",
                 "attestation",
+            ),
+            (
+                SigningBody::VoluntaryExit {
+                    voluntary_exit: &exit,
+                },
+                "VOLUNTARY_EXIT",
+                "voluntary_exit",
             ),
             (
                 SigningBody::RandaoReveal {
@@ -544,6 +561,32 @@ mod tests {
                 "{kind}: type, fork_info, signingRoot and the message, nothing else"
             );
         }
+    }
+
+    /// Web3Signer's `VoluntaryExit` schema: both fields quoted integers.
+    #[test]
+    fn a_voluntary_exit_request_has_web3signers_shape() {
+        let exit = VoluntaryExit {
+            epoch: 269_568,
+            validator_index: 1234,
+        };
+        let encoded = encode(&SigningRequest::new(
+            fork_info(),
+            Root::repeat_byte(0x11),
+            SigningBody::VoluntaryExit {
+                voluntary_exit: &exit,
+            },
+        ));
+        assert_eq!(encoded["type"], "VOLUNTARY_EXIT");
+        assert_eq!(
+            encoded["voluntary_exit"],
+            serde_json::json!({ "epoch": "269568", "validator_index": "1234" })
+        );
+        assert_eq!(
+            encoded["signingRoot"],
+            format!("0x{}", "11".repeat(32)),
+            "the root travels, so the signer can refuse one it does not derive itself"
+        );
     }
 
     #[test]

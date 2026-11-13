@@ -27,7 +27,7 @@ use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::altair;
 use ethlambda_types::beacon::containers::electra::Attestation;
 use ethlambda_types::beacon::containers::gloas;
-use ethlambda_types::beacon::containers::shared::AttestationData;
+use ethlambda_types::beacon::containers::shared::{AttestationData, SignedVoluntaryExit};
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, Root, Slot, ValidatorIndex};
 use reqwest::{Client, StatusCode};
@@ -41,12 +41,13 @@ use crate::beacon_node::dto::{
     AttestationDataDto, AttestationDto, AttesterDutyDto, BlockRootResponse,
     CommitteeSubscriptionDto, DataResponse, DutiesResponse, GenesisDto, IndexedErrorResponse,
     ProposerDutyDto, ProposerPreparationDto, PtcDutyDto, SignedAggregateAndProofOutDto,
-    SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto, SyncingDto, ValidatorEntryDto,
-    VersionedResponse, config_from_spec_response, encode_hex, parse_pubkey, parse_root,
+    SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto, SyncingDto,
+    ValidatorDetailsDto, ValidatorEntryDto, VersionedResponse, config_from_spec_response,
+    encode_hex, parse_pubkey, parse_root,
 };
 use crate::beacon_node::{
     AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Genesis,
-    ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorEntry,
+    ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails, ValidatorEntry,
     validate_attestation_data, validate_produced_block, validate_sync_contribution,
 };
 use crate::error::{BeaconNodeFailure, Error, Result};
@@ -308,9 +309,14 @@ impl HttpBeaconNode {
         }
     }
 
-    /// A GET whose success may be a 204, which is an answer ("nothing to
-    /// report") and not a failure.
-    async fn get_optional<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<Option<T>> {
+    /// A GET for which the `absent` status is an answer ("nothing to report")
+    /// and not a failure: a 204 from an endpoint that has nothing yet, a 404
+    /// from one asked about something the node does not know.
+    async fn get_optional<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        absent: StatusCode,
+    ) -> Result<Option<T>> {
         let url = format!("{}{path}", self.base_url);
         debug!(%url, "Beacon API GET");
         let response = self
@@ -323,7 +329,7 @@ impl HttpBeaconNode {
                 failure: BeaconNodeFailure::classify(&err),
                 detail: err.to_string(),
             })?;
-        if response.status() == StatusCode::NO_CONTENT {
+        if response.status() == absent {
             return Ok(None);
         }
         Self::decode(response).await.map(Some)
@@ -480,12 +486,13 @@ impl BeaconNodeApi for HttpBeaconNode {
         })
     }
 
-    /// Fetches the network's fork schedule and slot duration.
+    /// Fetches the network's configuration, as far as this client reads it.
     ///
     /// The spec endpoint returns every configuration value as a quoted
-    /// string. Only the fork schedule and the slot duration are read here;
-    /// the rest of `Config` keeps its mainnet defaults, which is correct for
-    /// every network whose presets this binary was compiled against.
+    /// string. Only the keys [`config_from_spec_response`] names are read
+    /// (the fork schedule, the slot duration, the duty offsets and
+    /// `SHARD_COMMITTEE_PERIOD`); the rest of `Config` keeps its mainnet
+    /// defaults, so nothing in this client may rely on those.
     async fn spec(&self) -> Result<Config> {
         let response: DataResponse<serde_json::Value> = self.get("/eth/v1/config/spec").await?;
         config_from_spec_response(&response.data)
@@ -770,11 +777,9 @@ impl BeaconNodeApi for HttpBeaconNode {
         &self,
         slot: Slot,
     ) -> Result<Option<gloas::PayloadAttestationData>> {
-        let response: Option<VersionedResponse<gloas::PayloadAttestationData>> = self
-            .get_optional(&format!(
-                "/eth/v1/validator/payload_attestation_data?slot={slot}"
-            ))
-            .await?;
+        let path = format!("/eth/v1/validator/payload_attestation_data?slot={slot}");
+        let response: Option<VersionedResponse<gloas::PayloadAttestationData>> =
+            self.get_optional(&path, StatusCode::NO_CONTENT).await?;
         let Some(response) = response else {
             return Ok(None);
         };
@@ -1046,6 +1051,43 @@ impl BeaconNodeApi for HttpBeaconNode {
             None,
         )
         .await
+    }
+
+    async fn validator(&self, pubkey: &BlsPubkey) -> Result<Option<ValidatorDetails>> {
+        let path = format!(
+            "/eth/v1/beacon/states/head/validators/{}",
+            encode_hex(&pubkey.0)
+        );
+        // A 404 is this endpoint's "validator not found", per the
+        // specification.
+        let response: Option<DataResponse<ValidatorDetailsDto>> =
+            self.get_optional(&path, StatusCode::NOT_FOUND).await?;
+        let Some(response) = response else {
+            return Ok(None);
+        };
+        let entry = response.data;
+        // The answer names the key it describes; a node answering about
+        // another validator must not have its index signed into an exit.
+        let answered = parse_pubkey(&entry.validator.pubkey)?;
+        if answered != *pubkey {
+            return Err(Error::InconsistentResponse(format!(
+                "asked about validator {}, node answered about {}",
+                encode_hex(&pubkey.0),
+                entry.validator.pubkey
+            )));
+        }
+        Ok(Some(ValidatorDetails {
+            index: entry.index,
+            status: entry.status,
+            activation_epoch: entry.validator.activation_epoch,
+            exit_epoch: entry.validator.exit_epoch,
+            withdrawable_epoch: entry.validator.withdrawable_epoch,
+        }))
+    }
+
+    async fn submit_voluntary_exit(&self, exit: &SignedVoluntaryExit) -> Result<()> {
+        self.post_no_content("/eth/v1/beacon/pool/voluntary_exits", exit, None)
+            .await
     }
 }
 

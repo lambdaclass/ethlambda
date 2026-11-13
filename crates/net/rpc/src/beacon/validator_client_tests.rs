@@ -41,6 +41,7 @@ use ethlambda_validator::{
         },
         http::HttpBeaconNode,
     },
+    exit::{ExitOptions, Outcome, run_with as run_exit},
     keys::ValidatorStore,
     signing::SigningContext,
     sync_committee::{SyncCommitteeService, subnets_of},
@@ -194,6 +195,160 @@ fn keys_for(state: &BeaconState, indices: &[u64]) -> RwLock<ValidatorStore> {
         );
     }
     RwLock::new(keys)
+}
+
+/// `ethlambda voluntary-exit`, end to end: the client's own lookup of the
+/// validator, its signature, and this node's pool endpoint. The fixture's
+/// validators are all active since epoch 0 and the wall epoch is far past
+/// `SHARD_COMMITTEE_PERIOD`, so the node's gossip rules accept the exit.
+#[tokio::test]
+async fn the_validator_client_can_exit_a_validator_through_this_node() {
+    use ethlambda_types::beacon::{
+        containers::shared::{SignedVoluntaryExit, VoluntaryExit},
+        operation::BeaconOperation,
+    };
+
+    let (client, state, network) = serve().await;
+    let pubkey = state.validator(0).unwrap().pubkey;
+
+    let details = client
+        .validator(&pubkey)
+        .await
+        .expect("the node answers")
+        .expect("validator 0 is in the state");
+    assert_eq!(details.index, 0);
+    assert_eq!(details.status, "active_ongoing");
+    assert_eq!(
+        details.activation_epoch,
+        state.validator(0).unwrap().activation_epoch
+    );
+    assert_eq!(details.exit_epoch, state.validator(0).unwrap().exit_epoch);
+    assert!(
+        client
+            .validator(&BlsPubkey([9; 48]))
+            .await
+            .expect("a 404 is an answer, not an error")
+            .is_none(),
+        "a key the chain does not know is None"
+    );
+
+    // The whole command, minus the prompt, against this node over the socket.
+    let keys = {
+        let mut store = ValidatorStore::new();
+        store
+            .insert_secret("test", &secret_key_for(0).to_bytes())
+            .expect("valid key");
+        RwLock::new(store)
+    };
+    let options = ExitOptions {
+        no_confirmation: true,
+        no_wait: true,
+        ..ExitOptions::default()
+    };
+    let mut no_input = std::io::empty();
+    let mut no_input = std::io::BufReader::new(&mut no_input);
+    let outcome = run_exit(&client, &keys, pubkey, &options, &mut no_input)
+        .await
+        .expect("the node accepts the exit");
+    assert_eq!(outcome, Outcome::Published { accepted: None });
+
+    let published = network.operations.lock().unwrap().clone();
+    let [BeaconOperation::VoluntaryExit(exit)] = published.as_slice() else {
+        panic!("expected one published exit, got {published:?}");
+    };
+    assert_eq!(exit.message.validator_index, 0);
+    assert_eq!(exit.message.epoch, compute_epoch_at_slot(state.slot()));
+
+    // A refusal comes back as the node's 400 with its reason, not as a
+    // transport failure.
+    let forged = SignedVoluntaryExit {
+        message: VoluntaryExit {
+            epoch: exit.message.epoch,
+            validator_index: 1,
+        },
+        signature: exit.signature,
+    };
+    let err = client
+        .submit_voluntary_exit(&forged)
+        .await
+        .expect_err("validator 0's signature does not cover validator 1's exit");
+    assert!(
+        matches!(&err, Error::BeaconNodeStatus { status: 400, body } if body.contains("voluntary exit")),
+        "got {err:?}"
+    );
+
+    // An exit naming a past epoch is one the chain accepts too: it measures
+    // the shard committee period against its own epoch and verifies under
+    // the fork it is at, neither of which the exit's epoch moves.
+    let pubkey = state.validator(1).unwrap().pubkey;
+    let keys = {
+        let mut store = ValidatorStore::new();
+        store
+            .insert_secret("test", &secret_key_for(1).to_bytes())
+            .expect("valid key");
+        RwLock::new(store)
+    };
+    let options = ExitOptions {
+        epoch: Some(0),
+        no_confirmation: true,
+        no_wait: true,
+        ..ExitOptions::default()
+    };
+    run_exit(&client, &keys, pubkey, &options, &mut no_input)
+        .await
+        .expect("the node accepts an exit naming epoch 0");
+    let published = network.operations.lock().unwrap().clone();
+    let [_, BeaconOperation::VoluntaryExit(exit)] = published.as_slice() else {
+        panic!("expected a second published exit, got {published:?}");
+    };
+    assert_eq!(exit.message.validator_index, 1);
+    assert_eq!(exit.message.epoch, 0);
+}
+
+/// A network that shortens `SHARD_COMMITTEE_PERIOD`, the way a devnet lets an
+/// exit be tried without waiting out mainnet's 256 epochs, is followed: the
+/// command measures the validator against the period this node reports. Here
+/// the chain is at epoch 2 and the validators activated at epoch 0, so the
+/// node's two epochs make them eligible and mainnet's 256 would not.
+#[tokio::test]
+async fn the_validator_client_follows_this_nodes_shard_committee_period() {
+    use ethlambda_types::beacon::operation::BeaconOperation;
+
+    let mut config = fulu_schedule();
+    config.shard_committee_period = 2;
+    let (client, state, network, _) = serve_fulu_pinned_under(config, None).await;
+    assert_eq!(compute_epoch_at_slot(state.slot()), 2);
+    assert_eq!(state.validator(0).unwrap().activation_epoch, 0);
+
+    let spec = client.spec().await.expect("the client reads the spec");
+    assert_eq!(spec.shard_committee_period, 2);
+
+    let pubkey = state.validator(0).unwrap().pubkey;
+    let keys = {
+        let mut store = ValidatorStore::new();
+        store
+            .insert_secret("test", &secret_key_for(0).to_bytes())
+            .expect("valid key");
+        RwLock::new(store)
+    };
+    let options = ExitOptions {
+        no_confirmation: true,
+        no_wait: true,
+        ..ExitOptions::default()
+    };
+    let mut no_input = std::io::empty();
+    let mut no_input = std::io::BufReader::new(&mut no_input);
+    let outcome = run_exit(&*client, &keys, pubkey, &options, &mut no_input)
+        .await
+        .expect("the validator is past this node's shard committee period");
+    assert_eq!(outcome, Outcome::Published { accepted: None });
+
+    let published = network.operations.lock().unwrap().clone();
+    let [BeaconOperation::VoluntaryExit(exit)] = published.as_slice() else {
+        panic!("expected one published exit, got {published:?}");
+    };
+    assert_eq!(exit.message.validator_index, 0);
+    assert_eq!(exit.message.epoch, 2);
 }
 
 /// One slot of an attester's work, in the order `ethlambda validator` does it.
@@ -817,9 +972,22 @@ async fn serve_fulu_pinned(
     Arc<RecordingNetwork>,
     Arc<SigningContext>,
 ) {
+    serve_fulu_pinned_under(fulu_schedule(), engine).await
+}
+
+/// [`serve_fulu_pinned`] under `config`, which must keep [`fulu_schedule`]'s
+/// forks, for a test of a network that sets some other key its own way.
+async fn serve_fulu_pinned_under(
+    config: ethlambda_types::beacon::config::Config,
+    engine: Option<ethlambda_engine::EngineClient>,
+) -> (
+    Arc<HttpBeaconNode>,
+    BeaconState,
+    Arc<RecordingNetwork>,
+    Arc<SigningContext>,
+) {
     use ethlambda_types::beacon::containers::shared::Fork;
 
-    let config = fulu_schedule();
     let mut state = with_signing_validators_at(ForkName::Fulu, COUNT);
     let slot = compute_start_slot_at_epoch(2);
     {
