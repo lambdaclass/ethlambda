@@ -31,6 +31,10 @@ tracing.workspace = true
 # Declared here rather than relied on through workspace feature unification,
 # so this crate still builds if it is ever compiled on its own.
 tokio = { workspace = true, features = ["time", "macros", "rt"] }
+# `CancellationToken`: the signal that stops the client when the
+# slashing-protection record becomes unusable, and the one that tells the
+# keymanager server to finish its requests in flight.
+tokio-util.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 
 # BLS12-381. Same version and backend the state transition verifies with, so a

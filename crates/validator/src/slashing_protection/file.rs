@@ -42,10 +42,13 @@ pub const FILE_NAME: &str = "slashing_protection.json";
 /// The only EIP-3076 interchange version this client reads or writes.
 pub const INTERCHANGE_VERSION: &str = "5";
 
-/// This client's own file, read strictly: a field it did not write is an
-/// error, since nothing else should have written here. Not for reading
-/// other clients' interchange files, which may carry fields this refuses;
-/// an importer needs its own, lenient, types.
+/// An EIP-3076 version 5 interchange: the shape of this client's own record
+/// and of every file it imports. The record reader ([`read`]) and the
+/// importer ([`parse`], which `SlashingProtection::stage` calls) share these
+/// types, and both read strictly: a field the format does not define is an
+/// error rather than ignored, as it is in Lighthouse's EIP-3076 types, so a
+/// file that is not the interchange it claims to be is refused whole instead
+/// of half read.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Interchange {

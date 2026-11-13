@@ -680,7 +680,7 @@ mod tests {
         let protection = || {
             let opened =
                 SlashingProtection::open(dir.path(), Root::ZERO, &[pubkey], true).expect("opens");
-            Arc::new(std::sync::Mutex::new(opened))
+            crate::slashing_protection::SharedProtection::new(opened)
         };
 
         let node = Arc::new(MockBeaconNode::new().with_block(slot(), 7));
@@ -716,7 +716,7 @@ mod tests {
             node.clone(),
             context(),
             settings,
-            Arc::new(std::sync::Mutex::new(opened)),
+            crate::slashing_protection::SharedProtection::new(opened),
         )
         .propose(slot(), &duty(&pubkey, 7, slot()), &store)
         .await
