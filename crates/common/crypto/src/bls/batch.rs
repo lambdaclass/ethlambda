@@ -41,7 +41,7 @@ use rand::RngExt;
 
 use ethlambda_types::beacon::primitives::{BlsPubkey, BlsSignature, Root};
 
-use super::{DST, validated_pubkey, validated_pubkeys};
+use super::{AggregatePubkey, DST, validated_pubkey, validated_pubkeys};
 
 /// How many bits of each random weight the batch check uses.
 const RAND_BITS: usize = 64;
@@ -104,6 +104,27 @@ impl SignatureSet {
         let pubkey = super::sum_validated_points(&points)?;
         Some(Self {
             pubkey,
+            message,
+            signature,
+            aggregated: true,
+        })
+    }
+
+    /// `bls.FastAggregateVerify`'s inputs with the key already summed, as
+    /// committee key sums produce it.
+    ///
+    /// `None` when `signature` fails `sig_validate`. The key needs no check: a
+    /// sum of validated points is in the subgroup, and the identity, the one
+    /// sum that is not a valid key, is refused by [`Self::verify`] and by the
+    /// batch at pairing time, as it is for a key summed here from scratch.
+    pub fn from_aggregate(
+        key: AggregatePubkey,
+        message: Root,
+        signature: &BlsSignature,
+    ) -> Option<Self> {
+        let signature = Signature::sig_validate(signature.as_ref(), false).ok()?;
+        Some(Self {
+            pubkey: key.to_public_key(),
             message,
             signature,
             aggregated: true,
