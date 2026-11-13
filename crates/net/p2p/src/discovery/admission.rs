@@ -54,6 +54,9 @@ pub(crate) struct DiscoveredPeer {
     /// `P2PServer::record_peer_custody`), and this only fills the gap until
     /// that answer arrives. Lighthouse splits the two the same way.
     pub(crate) custody_group_count: Option<u64>,
+    /// The record as an `enr:` string, kept for the Beacon API's peer list.
+    /// `None` only if the record cannot be re-encoded.
+    pub(crate) enr: Option<String>,
 }
 
 /// Why a discovered peer was turned away.
@@ -235,6 +238,7 @@ fn admit(
         addrs: dial_addrs(ip, quic_port, tcp_port, peer_id),
         subnets,
         custody_group_count,
+        enr: record.enr_url().ok(),
     })
 }
 
@@ -396,6 +400,7 @@ mod tests {
                 addrs: vec![Multiaddr::empty()],
                 subnets,
                 custody_group_count: None,
+                enr: None,
             }
         }
     }
@@ -730,6 +735,7 @@ mod tests {
             addrs: vec![Multiaddr::empty()],
             subnets: vec![],
             custody_group_count: Some(custody_group_count),
+            enr: None,
         }
     }
 

@@ -515,6 +515,138 @@ impl MetaDataController {
     }
 }
 
+/// Which side opened a peer's first connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerDirection {
+    /// The remote dialed us.
+    Inbound,
+    /// We dialed the remote.
+    Outbound,
+}
+
+impl PeerDirection {
+    /// The value the Beacon API's `Peer.direction` carries.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inbound => "inbound",
+            Self::Outbound => "outbound",
+        }
+    }
+}
+
+/// One connected peer, as the Beacon API's `/eth/v1/node/peers` reports it.
+///
+/// Strings rather than libp2p types, so this crate stays free of libp2p.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectedPeer {
+    /// The peer's libp2p id, base58.
+    pub peer_id: String,
+    pub direction: PeerDirection,
+    /// The remote address of the connection that made the peer connected, ending
+    /// in `/p2p/<peer id>`.
+    pub last_seen_p2p_address: String,
+    /// The peer's `enr:`-prefixed record, when discovery supplied one before we
+    /// dialed it. `None` for an inbound peer, whose record we never fetch.
+    pub enr: Option<String>,
+}
+
+/// Shared, runtime-readable table of the peers this node is connected to.
+///
+/// The p2p layer is the sole writer: it inserts a peer when its first
+/// connection is established and removes it when its last one closes, so only
+/// connected peers are ever in the table. The Beacon API's
+/// `/eth/v1/node/peers` clones the handle and reads it at request time.
+#[derive(Clone, Debug, Default)]
+pub struct PeerTableController {
+    peers: Arc<RwLock<std::collections::HashMap<String, ConnectedPeer>>>,
+}
+
+impl PeerTableController {
+    /// Record a peer as connected, replacing any earlier entry for it.
+    pub fn insert(&self, peer: ConnectedPeer) {
+        self.peers
+            .write()
+            .expect("peer table lock poisoned")
+            .insert(peer.peer_id.clone(), peer);
+    }
+
+    /// Drop a peer that no longer holds a connection.
+    pub fn remove(&self, peer_id: &str) {
+        self.peers
+            .write()
+            .expect("peer table lock poisoned")
+            .remove(peer_id);
+    }
+
+    /// One connected peer, if it is.
+    pub fn get(&self, peer_id: &str) -> Option<ConnectedPeer> {
+        self.peers
+            .read()
+            .expect("peer table lock poisoned")
+            .get(peer_id)
+            .cloned()
+    }
+
+    /// Every connected peer, ordered by peer id so a response is stable
+    /// between polls.
+    pub fn snapshot(&self) -> Vec<ConnectedPeer> {
+        let mut peers: Vec<_> = self
+            .peers
+            .read()
+            .expect("peer table lock poisoned")
+            .values()
+            .cloned()
+            .collect();
+        peers.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
+        peers
+    }
+}
+
+#[cfg(test)]
+mod peer_table_tests {
+    use super::*;
+
+    fn peer(id: &str, direction: PeerDirection) -> ConnectedPeer {
+        ConnectedPeer {
+            peer_id: id.to_string(),
+            direction,
+            last_seen_p2p_address: format!("/ip4/10.0.0.1/tcp/9000/p2p/{id}"),
+            enr: None,
+        }
+    }
+
+    #[test]
+    fn a_peer_is_present_from_insert_until_remove() {
+        let table = PeerTableController::default();
+        table.insert(peer("b", PeerDirection::Inbound));
+        assert_eq!(table.get("b").unwrap().direction, PeerDirection::Inbound);
+
+        table.remove("b");
+        assert!(table.get("b").is_none());
+        assert!(table.snapshot().is_empty());
+    }
+
+    #[test]
+    fn inserting_twice_keeps_one_entry_with_the_latest_value() {
+        let table = PeerTableController::default();
+        table.insert(peer("a", PeerDirection::Inbound));
+        table.insert(peer("a", PeerDirection::Outbound));
+        let peers = table.snapshot();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].direction, PeerDirection::Outbound);
+    }
+
+    #[test]
+    fn the_snapshot_is_ordered_by_peer_id_and_shared_between_clones() {
+        let table = PeerTableController::default();
+        let reader = table.clone();
+        table.insert(peer("c", PeerDirection::Outbound));
+        table.insert(peer("a", PeerDirection::Inbound));
+        let ids: Vec<_> = reader.snapshot().into_iter().map(|p| p.peer_id).collect();
+        assert_eq!(ids, ["a", "c"]);
+    }
+}
+
 // --- Init messages ---
 // Used to wire actors together after spawn.
 
