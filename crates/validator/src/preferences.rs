@@ -59,10 +59,11 @@
 //! restarts has lost them, and gossip does not give them back. Every kept
 //! preference whose slot is still ahead is therefore sent again, as signed,
 //! once an epoch, as the duty loop re-sends `prepare_beacon_proposer`, which a
-//! restart loses too. The round runs at the poll of an epoch's last slot,
-//! after which every slot of the next epoch is still ahead, so a node
-//! restarted mid-epoch lacks the rest of that epoch's preferences and holds
-//! every later one, the next epoch's first slot included. Each node answers
+//! restart loses too. The round runs at the poll of an epoch's second-to-last
+//! slot, or of its last when that poll was skipped behind a slow node, while
+//! every slot of the next epoch is still ahead. So a node restarted mid-epoch
+//! lacks the rest of that epoch's preferences and holds every later one, the
+//! next epoch's first slot included. Each node answers
 //! the re-send as it does any other: one still holding the preference with a
 //! 200 and no republish, one that lost it by taking it again, and one not
 //! ready yet by making it a preference only some nodes hold, sent each slot
@@ -143,10 +144,16 @@ enum Sent {
 }
 
 /// The re-send round a poll at `current_slot` belongs to: the epoch of the
-/// slot after it. An epoch's round thus starts at the poll of the last slot
-/// before it, while every one of its slots is still ahead.
+/// slot two after it. An epoch's round thus starts at the poll of the
+/// second-to-last slot before it, while every one of its slots is still
+/// ahead.
+///
+/// Not the last slot: polls are single-flight, so a poll held up behind a slow
+/// node skips the next one. Started one slot early, the round still runs at
+/// the last slot when the first poll is skipped, and the epoch's first slot is
+/// still ahead then.
 fn round_of(current_slot: Slot) -> Epoch {
-    compute_epoch_at_slot(current_slot + 1)
+    compute_epoch_at_slot(current_slot + 2)
 }
 
 impl Sent {
@@ -365,8 +372,17 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
             if self.started(duty.slot, current_slot) {
                 continue;
             }
-            let Ok(pubkey) = parse_pubkey(&duty.pubkey) else {
-                continue;
+            let pubkey = match parse_pubkey(&duty.pubkey) {
+                Ok(pubkey) => pubkey,
+                Err(err) => {
+                    debug!(
+                        slot = duty.slot,
+                        validator = duty.validator_index,
+                        %err,
+                        "Skipping a proposer duty whose pubkey does not parse"
+                    );
+                    continue;
+                }
             };
             if !pubkeys.contains(&pubkey) {
                 continue;
@@ -1318,8 +1334,8 @@ mod tests {
 
     /// A node that restarts loses what it accepted. Each preference every node
     /// took is sent again, as first signed, once a round: at the poll of an
-    /// epoch's last slot, so the next epoch's first slot is covered too. A
-    /// re-send is not counted as published again.
+    /// epoch's second-to-last slot, so the next epoch's first slot is covered
+    /// too. A re-send is not counted as published again.
     #[tokio::test]
     async fn every_kept_preference_is_sent_again_once_an_epoch() {
         let (store, pubkeys) = store_with_keys(1);
@@ -1358,9 +1374,10 @@ mod tests {
             slots
         };
 
-        // Published the epoch before their own, and not again before its end.
+        // Published the epoch before their own, and not again before its
+        // round.
         assert_eq!(publish(slot_in(GLOAS_EPOCH, 1)).await, 2);
-        publish(last_of_epoch - 1).await;
+        publish(last_of_epoch - 2).await;
         assert_eq!(submitted(&node).len(), 2);
         assert_eq!(
             service.accepted_fee_recipients(later_slot, 3),
@@ -1371,7 +1388,7 @@ mod tests {
         // signed, for both slots, the next epoch's first included.
         settings.set_fee_recipient(&pubkeys[0], H160([0xcd; 20]));
         assert_eq!(
-            publish(last_of_epoch).await,
+            publish(last_of_epoch - 1).await,
             0,
             "a re-send is not published again"
         );
@@ -1387,10 +1404,43 @@ mod tests {
             vec![FEE_RECIPIENT]
         );
 
-        // Once a round: the next epoch's polls send nothing more.
+        // Once a round: the epoch's last poll and the next epoch's send
+        // nothing more.
+        publish(last_of_epoch).await;
         publish(first_slot).await;
         publish(first_slot + 1).await;
         assert_eq!(submitted(&node).len(), 4);
+    }
+
+    /// The poll that starts a round is skipped when the one before it is
+    /// still running behind a slow node. The round then runs at the epoch's
+    /// last slot, while the next epoch's first slot is still ahead.
+    #[tokio::test]
+    async fn a_round_whose_first_poll_is_skipped_runs_at_the_last_slot() {
+        let (store, pubkeys) = store_with_keys(1);
+        let snapshot: HashSet<BlsPubkey> = pubkeys.iter().copied().collect();
+        let store = Arc::new(RwLock::new(store));
+        let first_slot = slot_in(GLOAS_EPOCH + 1, 0);
+        let node = MockBeaconNode::new().with_proposers_v2(
+            GLOAS_EPOCH + 1,
+            Root::repeat_byte(0x22),
+            vec![duty(&pubkeys[0], 3, first_slot)],
+        );
+        let (service, node) = service(node, settings(Some(FEE_RECIPIENT)));
+        let last_of_epoch = slot_in(GLOAS_EPOCH, preset::SLOTS_PER_EPOCH - 1);
+
+        let published = service
+            .publish_epoch(slot_in(GLOAS_EPOCH, 1), GLOAS_EPOCH + 1, &snapshot, &store)
+            .await;
+        assert_eq!(published, 1);
+        // No poll at `last_of_epoch - 1`.
+        service
+            .publish_epoch(last_of_epoch, GLOAS_EPOCH + 1, &snapshot, &store)
+            .await;
+
+        let sent = submitted(&node);
+        assert_eq!(sent.len(), 2, "the next epoch's first slot is re-sent");
+        assert_eq!(sent[1].1[0], sent[0].1[0]);
     }
 
     /// A round's re-send no node takes (every node restarted and is not ready
