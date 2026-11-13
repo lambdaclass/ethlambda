@@ -60,15 +60,15 @@ use tracing::{error, info, warn};
 
 use crate::aggregation::AggregationService;
 use crate::attestation::AttestationService;
+use crate::beacon_node::BeaconNodeApi;
 use crate::beacon_node::dto::ProposerPreparationDto;
 use crate::beacon_node::fallback::FallbackBeaconNode;
 use crate::beacon_node::http::HttpBeaconNode;
-use crate::beacon_node::{BeaconNodeApi, Published};
 use crate::duties::DutiesService;
 use crate::keys::ValidatorStore;
 use crate::payload_attestation::PayloadAttestationService;
 use crate::preferences::PreferencesService;
-use crate::proposal::ProposalService;
+use crate::proposal::{BlindedOutcome, ProposalService, Proposed};
 use crate::proposer_settings::ProposerSettings;
 use crate::registration::RegistrationService;
 use crate::signing::SigningContext;
@@ -741,32 +741,22 @@ async fn propose<B: BeaconNodeApi + 'static>(
     store: &RwLock<ValidatorStore>,
 ) {
     let budget = clock.until_attestation(slot, SystemTime::now());
-    let attempt = tokio::time::timeout(budget, proposal.propose(slot, duty, store));
-    match attempt.await {
-        // Already logged at error and counted on its own series; the block
-        // may well be out, so it is neither a published-in-time delay nor a
-        // failure.
-        Ok(Ok(Published::BuilderUnconfirmed)) => {}
-        // A blinded publish observes its own delay, on the task that ran it.
-        Ok(Ok(_)) if proposal.signed_blinded_at(slot) => {}
-        Ok(Ok(_)) => {
+    let deadline = tokio::time::Instant::now() + budget;
+    match proposal.propose_by(slot, duty, store, deadline).await {
+        Ok(Proposed::Full(_) | Proposed::Blinded(BlindedOutcome::Published(_))) => {
             let elapsed = SystemTime::now()
                 .duration_since(clock.start_of(slot))
                 .unwrap_or_default();
             metrics::observe_block_publication_delay(elapsed.as_secs_f64());
         }
-        // Once a blinded block is signed, only its publish task reports an
-        // error (and counts the failure), so it is not counted twice here.
-        Ok(Err(_)) if proposal.signed_blinded_at(slot) => {}
-        Ok(Err(err)) => {
-            error!(%slot, validator = duty.validator_index, %err, "Failed to propose this slot's block");
-            metrics::inc_block_proposal_failures();
-        }
-        // A blinded block is signed, and its publish runs on its own task: the
-        // beacon node waits up to 5 s for the relay, which can outlast this
-        // budget. That is not a missed proposal, and the task counts the real
-        // outcome.
-        Err(_) if proposal.signed_blinded_at(slot) => {
+        // Already logged at error and counted on its own series; the block
+        // may well be out, so it is neither a published-in-time delay nor a
+        // failure.
+        Ok(Proposed::Blinded(BlindedOutcome::Unconfirmed)) => {}
+        // The beacon node waits up to 5 s for the relay, which can outlast
+        // this budget. Not a missed proposal: the publish goes on, on its own
+        // task, which reports and counts the real outcome.
+        Ok(Proposed::Blinded(BlindedOutcome::StillPublishing)) => {
             info!(
                 %slot,
                 validator = duty.validator_index,
@@ -774,13 +764,17 @@ async fn propose<B: BeaconNodeApi + 'static>(
                 "Blinded block signed; its publish outlived the proposal budget and continues"
             );
         }
-        Err(_) => {
+        Err(Error::ProposalDeadline { .. }) => {
             warn!(
                 %slot,
                 validator = duty.validator_index,
                 budget_ms = budget.as_millis() as u64,
                 "Block proposal ran past the point attesters stop waiting and was abandoned"
             );
+            metrics::inc_block_proposal_failures();
+        }
+        Err(err) => {
+            error!(%slot, validator = duty.validator_index, %err, "Failed to propose this slot's block");
             metrics::inc_block_proposal_failures();
         }
     }

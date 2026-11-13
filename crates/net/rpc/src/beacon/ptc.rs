@@ -533,7 +533,7 @@ fn aggregate_pool(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{RecordingNetwork, gloas_beacon_block};
+    use crate::test_utils::{RecordingNetwork, gloas_beacon_block, slot_root};
     use axum::{body::Body, http::Request};
     use ethlambda_state_transition::beacon::{
         constants::DOMAIN_PTC_ATTESTER,
@@ -571,7 +571,7 @@ mod tests {
         // Distinct roots per slot, so a `dependent_root` read from the wrong
         // slot shows up.
         for slot in 0..inner.block_roots.len() {
-            inner.block_roots[slot] = H256::repeat_byte(slot as u8 + 1);
+            inner.block_roots[slot] = slot_root(slot as u64);
         }
         for index in 0..preset::PTC_WINDOW_LENGTH {
             inner.ptc_window[index] = vec![index as u64; preset::PTC_SIZE]
@@ -739,7 +739,7 @@ mod tests {
             let expected = if dependent_slot >= head_slot {
                 head_root
             } else {
-                H256::repeat_byte(dependent_slot as u8 + 1)
+                slot_root(dependent_slot)
             };
             assert_eq!(json["dependent_root"], format!("{expected:?}"));
         }

@@ -17,7 +17,7 @@ use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, Root, Slot, ValidatorIndex};
 use tracing::{debug, warn};
 
-use crate::beacon_node::block_contents::ProducedBlock;
+use crate::beacon_node::block_contents::{ProducedBlock, Producer};
 use crate::beacon_node::dto::{
     CommitteeSubscriptionDto, ProposerPreparationDto, SingleAttestationDto,
     SyncCommitteeSubscriptionDto, SyncDutyDto,
@@ -40,29 +40,12 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// first one that succeeds.
 pub struct FallbackBeaconNode<B> {
     nodes: Vec<B>,
-    /// The latest blinded block produced, and the node that produced it. A
-    /// blinded block can only be published where it was produced: that node's
-    /// builder holds the payload, and that node claimed the slot.
-    blinded_producer: std::sync::Mutex<Option<BlindedProducer>>,
-}
-
-/// Which node produced which blinded block.
-#[derive(Debug, Clone, Copy)]
-struct BlindedProducer {
-    slot: Slot,
-    /// Checked at publish, so the record answers for the block being
-    /// published rather than for whatever was last produced at its slot.
-    block_root: Root,
-    position: usize,
 }
 
 impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
     pub fn new(nodes: Vec<B>) -> Self {
         assert!(!nodes.is_empty(), "at least one beacon node is required");
-        Self {
-            nodes,
-            blinded_producer: std::sync::Mutex::new(None),
-        }
+        Self { nodes }
     }
 
     /// The nodes, in order, for a test outside this module that drives a
@@ -367,27 +350,14 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
             .await
     }
 
-    /// Remembers which node answered when the block is blinded, and forgets
-    /// it otherwise, a production that failed on every node included: the
-    /// record is for the latest block only, so nothing leaves a stale claim
-    /// that a blinded publish could match.
+    /// Marks the block with the node that produced it, which is where a
+    /// blinded block's publish has to go back to (see [`Producer`]).
     async fn produce_block(&self, request: &BlockRequest) -> Result<ProducedBlock> {
-        let produced = self
+        let (position, mut block) = self
             .try_each_at("produce_block", |node| node.produce_block(request))
-            .await;
-        let record = match &produced {
-            Ok((position, block)) if block.is_blinded() => Some(BlindedProducer {
-                slot: block.slot(),
-                block_root: block.block_root(),
-                position: *position,
-            }),
-            _ => None,
-        };
-        *self
-            .blinded_producer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = record;
-        produced.map(|(_, block)| block)
+            .await?;
+        block.producer = Producer::at(position);
+        Ok(block)
     }
 
     /// First node that accepts it wins, rather than a broadcast to every node.
@@ -420,26 +390,22 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
     /// protection has already recorded the slot, so nothing retries it.
     async fn publish_blinded_block(
         &self,
-        slot: Slot,
-        block_root: Root,
+        producer: Producer,
         fork: ForkName,
         body: &[u8],
     ) -> Result<Published> {
-        let record = *self
-            .blinded_producer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match record {
-            Some(producer) if producer.slot == slot && producer.block_root == block_root => {
-                self.nodes[producer.position]
-                    .publish_blinded_block(slot, block_root, fork, body)
-                    .await
-            }
-            _ => Err(Error::InconsistentResponse(format!(
-                "no beacon node produced blinded block {} for slot {slot}",
-                crate::beacon_node::dto::encode_hex(&block_root.0)
-            ))),
-        }
+        // A position this fallback never handed out: there is no node the
+        // block could go back to.
+        let node = self.nodes.get(producer.position()).ok_or_else(|| {
+            Error::InconsistentResponse(format!(
+                "a blinded block names beacon node {} as its producer, but {} are configured",
+                producer.position(),
+                self.nodes.len()
+            ))
+        })?;
+        // The node behind this one is a single node, with nothing to choose.
+        node.publish_blinded_block(Producer::default(), fork, body)
+            .await
     }
 
     /// To every node, like the other calls that install state on a node: a
@@ -456,6 +422,68 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
             |node| node.register_validators(registrations),
         )
         .await
+    }
+
+    /// Every node works through its own batches at once, so a node that hangs
+    /// holds back only its own sequence: the healthy ones have every batch
+    /// while it is still timing out on its first. A batch counts as sent when
+    /// any node accepted it, as [`Self::register_validators`] does for one.
+    ///
+    /// Each node that refused anything is logged once, with how many batches,
+    /// rather than once per batch.
+    async fn register_validators_in_batches(
+        &self,
+        registrations: &[SignedValidatorRegistrationV1],
+    ) -> Vec<Result<()>> {
+        let per_node = futures_util::future::join_all(
+            self.nodes
+                .iter()
+                .map(|node| node.register_validators_in_batches(registrations)),
+        )
+        .await;
+
+        let batches = registrations.len().div_ceil(super::REGISTRATION_BATCH);
+        let mut accepted = vec![false; batches];
+        let mut last = vec![None; batches];
+        for (position, outcomes) in per_node.into_iter().enumerate() {
+            let mut refused = 0;
+            let mut first_refusal = None;
+            for (batch, outcome) in outcomes.into_iter().enumerate() {
+                match outcome {
+                    Ok(()) => accepted[batch] = true,
+                    Err(err) => {
+                        refused += 1;
+                        let detail = err.to_string();
+                        first_refusal.get_or_insert_with(|| detail.clone());
+                        last[batch] = Some(detail);
+                    }
+                }
+            }
+            if let Some(err) = first_refusal {
+                warn!(
+                    what = "register_validators",
+                    position,
+                    refused,
+                    batches,
+                    %err,
+                    node_effect = "it will not hold these registrations",
+                    "Beacon node did not accept"
+                );
+            }
+        }
+        accepted
+            .into_iter()
+            .zip(last)
+            .map(|(accepted, last)| {
+                if accepted {
+                    Ok(())
+                } else {
+                    Err(Error::AllBeaconNodesFailed(
+                        last.unwrap_or_else(|| "no nodes configured".to_string()),
+                    ))
+                }
+            })
+            .collect()
     }
 
     /// To every node, since each one gossips what it accepts: a preference
@@ -667,8 +695,10 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::beacon_node::REGISTRATION_BATCH;
     use crate::beacon_node::mock::MockBeaconNode;
     use ethlambda_types::beacon::primitives::Root;
+    use std::sync::Arc;
 
     fn healthy() -> MockBeaconNode {
         let mut node = MockBeaconNode::new();
@@ -1098,8 +1128,8 @@ mod tests {
         MockBeaconNode::new().with_block(5, 7).with_blinded_block()
     }
 
-    /// Node 0 cannot produce, node 1 can and answers blinded: the block must go
-    /// back to node 1, and node 0 must never see it.
+    /// Node 0 cannot produce, node 1 can and answers blinded: the block names
+    /// node 1 as its producer, goes back to node 1, and node 0 never sees it.
     #[tokio::test]
     async fn a_blinded_block_is_published_where_it_was_produced() {
         let first = MockBeaconNode::new().failing_call("produce_block", "down");
@@ -1110,9 +1140,10 @@ mod tests {
             .await
             .expect("node 1 produces");
         assert!(produced.is_blinded());
+        assert_eq!(produced.producer, Producer::at(1));
 
         let published = fallback
-            .publish_blinded_block(5, produced.block_root(), ForkName::Electra, &[1, 2, 3])
+            .publish_blinded_block(produced.producer, ForkName::Electra, &[1, 2, 3])
             .await
             .expect("published");
         assert_eq!(published, Published::HandedToBuilder);
@@ -1120,10 +1151,7 @@ mod tests {
         let first_published = fallback.nodes[0].published_blinded.lock().expect("lock");
         let second_published = fallback.nodes[1].published_blinded.lock().expect("lock");
         assert!(first_published.is_empty(), "node 0 never produced it");
-        assert_eq!(
-            *second_published,
-            vec![(5, ForkName::Electra, vec![1, 2, 3])]
-        );
+        assert_eq!(*second_published, vec![(ForkName::Electra, vec![1, 2, 3])]);
     }
 
     /// The producing node failing the publish is the end of it: another node's
@@ -1139,7 +1167,7 @@ mod tests {
             .await
             .expect("node 1 produces");
         let err = fallback
-            .publish_blinded_block(5, produced.block_root(), ForkName::Electra, &[9])
+            .publish_blinded_block(produced.producer, ForkName::Electra, &[9])
             .await
             .expect_err("node 1 failed to confirm");
         assert!(
@@ -1156,27 +1184,16 @@ mod tests {
         );
     }
 
-    /// The record answers for one block: another slot, or another root at the
-    /// same slot, is refused without reaching any node.
+    /// A producer this fallback never handed out has no node to go back to,
+    /// and is refused without reaching any node.
     #[tokio::test]
-    async fn a_blinded_publish_for_another_slot_or_block_is_refused() {
+    async fn a_blinded_publish_naming_an_unknown_producer_is_refused() {
         let fallback = FallbackBeaconNode::new(vec![blinded_node()]);
-        let produced = fallback
-            .produce_block(&blinded_request(5, 7))
+        let err = fallback
+            .publish_blinded_block(Producer::at(3), ForkName::Electra, &[1])
             .await
-            .expect("produces");
-        let root = produced.block_root();
-
-        for (slot, block_root, what) in [
-            (6, root, "nothing was produced for slot 6"),
-            (5, Root::repeat_byte(0xee), "that block was not produced"),
-        ] {
-            let err = fallback
-                .publish_blinded_block(slot, block_root, ForkName::Electra, &[1])
-                .await
-                .expect_err(what);
-            assert!(matches!(err, Error::InconsistentResponse(_)), "got {err:?}");
-        }
+            .expect_err("there is no node 3");
+        assert!(matches!(err, Error::InconsistentResponse(_)), "got {err:?}");
         assert!(
             fallback.nodes[0]
                 .published_blinded
@@ -1184,46 +1201,6 @@ mod tests {
                 .expect("lock")
                 .is_empty()
         );
-    }
-
-    /// A production that fails on every node clears the record too, so the
-    /// earlier block's claim does not outlive the attempt that replaced it.
-    #[tokio::test]
-    async fn a_failed_production_clears_the_blinded_record() {
-        let fallback = FallbackBeaconNode::new(vec![blinded_node()]);
-        let produced = fallback
-            .produce_block(&blinded_request(5, 7))
-            .await
-            .expect("blinded");
-        fallback
-            .produce_block(&blinded_request(6, 7))
-            .await
-            .expect_err("the node holds no block for slot 6");
-
-        fallback
-            .publish_blinded_block(5, produced.block_root(), ForkName::Electra, &[1])
-            .await
-            .expect_err("the record is gone");
-    }
-
-    /// A full block produced afterwards clears the claim, so an old blinded
-    /// block's slot cannot be published against a node that no longer holds it.
-    #[tokio::test]
-    async fn a_full_block_clears_the_blinded_record() {
-        let fallback = FallbackBeaconNode::new(vec![blinded_node()]);
-        let blinded = fallback
-            .produce_block(&blinded_request(5, 7))
-            .await
-            .expect("blinded");
-        fallback
-            .produce_block(&request(5, 7))
-            .await
-            .expect("full, since no factor was sent");
-
-        fallback
-            .publish_blinded_block(5, blinded.block_root(), ForkName::Electra, &[1])
-            .await
-            .expect_err("the record is gone");
     }
 
     #[tokio::test]
@@ -1340,24 +1317,134 @@ mod tests {
         );
     }
 
-    /// Every node is called at once: two slow nodes cost one delay, not the
-    /// sum, so a hung node does not hold back the ones behind it.
+    /// Every node is called at once: the second is called while the first
+    /// has not answered yet, so a hung node does not hold back the ones behind
+    /// it. Called in turn, the second would wait for a permit that is only
+    /// given once both have been called.
     #[tokio::test]
     async fn every_node_is_called_at_once() {
-        let delay = std::time::Duration::from_millis(300);
-        let slow = || MockBeaconNode::new().with_registration_delay(delay);
-        let fallback = FallbackBeaconNode::new(vec![slow(), slow()]);
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let held = || MockBeaconNode::new().with_registration_gate(gate.clone());
+        let fallback = Arc::new(FallbackBeaconNode::new(vec![held(), held()]));
 
-        let started = std::time::Instant::now();
-        fallback
-            .register_validators(&[])
-            .await
-            .expect("both accept");
-        let elapsed = started.elapsed();
+        let call = tokio::spawn({
+            let fallback = fallback.clone();
+            async move { fallback.register_validators(&[]).await }
+        });
+        for node in &fallback.nodes {
+            node.wait_for_registration_calls(1).await;
+        }
+        gate.add_permits(2);
+        call.await.expect("the call ends").expect("both accept");
 
-        assert!(elapsed < delay * 2, "took {elapsed:?}");
         for node in &fallback.nodes {
             assert_eq!(*node.registration_batches.lock().expect("lock"), vec![0]);
         }
+    }
+
+    /// `count` registrations with distinct keys. Unsigned: no mock checks.
+    fn registrations(
+        count: usize,
+    ) -> Vec<ethlambda_types::beacon::builder::SignedValidatorRegistrationV1> {
+        use ethlambda_types::beacon::builder::{
+            SignedValidatorRegistrationV1, ValidatorRegistrationV1,
+        };
+        use ethlambda_types::beacon::primitives::{BlsPubkey, BlsSignature, H160};
+
+        (0..count)
+            .map(|index| {
+                let mut pubkey = [0u8; 48];
+                pubkey[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                SignedValidatorRegistrationV1 {
+                    message: ValidatorRegistrationV1 {
+                        fee_recipient: H160([1; 20]),
+                        gas_limit: 30_000_000,
+                        timestamp: 5,
+                        pubkey: BlsPubkey(pubkey),
+                    },
+                    signature: BlsSignature([3; 96]),
+                }
+            })
+            .collect()
+    }
+
+    /// Each node works through the batches on its own: while one node holds
+    /// its first batch, the other has been sent all of them. In step, the
+    /// healthy node would have its second batch only once the hung one
+    /// answered its first.
+    #[tokio::test]
+    async fn a_hung_node_holds_back_only_its_own_batches() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let hung = MockBeaconNode::new().with_registration_gate(gate.clone());
+        let fallback = Arc::new(FallbackBeaconNode::new(vec![hung, MockBeaconNode::new()]));
+        let sent = registrations(2 * REGISTRATION_BATCH + 1);
+
+        let send = tokio::spawn({
+            let (fallback, sent) = (fallback.clone(), sent.clone());
+            async move { fallback.register_validators_in_batches(&sent).await }
+        });
+        let healthy_has_every_batch = async {
+            while fallback.nodes[1]
+                .registration_batches
+                .lock()
+                .expect("lock")
+                .len()
+                < 3
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), healthy_has_every_batch)
+            .await
+            .expect("the healthy node is not held back by the hung one");
+        assert_eq!(
+            fallback.nodes[0]
+                .registration_attempts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the hung node is still on its first batch"
+        );
+
+        gate.add_permits(3);
+        let outcomes = send.await.expect("the send ends");
+        assert_eq!(outcomes.len(), 3);
+        assert!(outcomes.iter().all(Result::is_ok));
+        assert_eq!(
+            *fallback.nodes[0].registration_batches.lock().expect("lock"),
+            vec![REGISTRATION_BATCH, REGISTRATION_BATCH, 1]
+        );
+    }
+
+    /// A node that cannot be reached is sent no more batches: each would cost
+    /// another timeout. A batch counts as sent when any node took it, and as
+    /// failed when none did.
+    #[tokio::test]
+    async fn an_unreachable_node_is_sent_no_more_batches() {
+        let sent = registrations(REGISTRATION_BATCH + 1);
+
+        let fallback =
+            FallbackBeaconNode::new(vec![MockBeaconNode::failing("down"), MockBeaconNode::new()]);
+        let outcomes = fallback.register_validators_in_batches(&sent).await;
+        assert!(outcomes.iter().all(Result::is_ok), "node 1 took both");
+        let attempts = |position: usize| {
+            fallback.nodes[position]
+                .registration_attempts
+                .load(std::sync::atomic::Ordering::SeqCst)
+        };
+        assert_eq!(attempts(0), 1, "stopped after its first batch");
+        assert_eq!(attempts(1), 2);
+
+        let fallback = FallbackBeaconNode::new(vec![
+            MockBeaconNode::failing("down"),
+            MockBeaconNode::failing("also down"),
+        ]);
+        let outcomes = fallback.register_validators_in_batches(&sent).await;
+        assert_eq!(outcomes.len(), 2);
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| matches!(outcome, Err(Error::AllBeaconNodesFailed(_)))),
+            "got {outcomes:?}"
+        );
     }
 }

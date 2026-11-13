@@ -868,7 +868,7 @@ fn payload_present_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{beacon_store_at, idle_engine};
+    use crate::test_utils::{beacon_store_at, idle_engine, slot_root};
     use axum::{
         body::Body,
         http::{Request, StatusCode},
@@ -895,7 +895,7 @@ mod tests {
         };
         fulu.proposer_lookahead = lookahead.try_into().unwrap();
         for slot in 0..fulu.block_roots.len() {
-            fulu.block_roots[slot] = H256::repeat_byte(slot as u8 + 1);
+            fulu.block_roots[slot] = slot_root(slot as u64);
         }
         state
     }

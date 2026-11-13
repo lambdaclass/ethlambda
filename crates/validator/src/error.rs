@@ -63,10 +63,12 @@ pub enum Error {
     #[error("beacon node is syncing")]
     BeaconNodeSyncing,
     /// A signed blinded block was sent and the node's answer does not say
-    /// whether it went out: a 5xx, or no answer at all.
+    /// whether it went out: a 5xx other than 503, or no answer once connected.
     ///
-    /// Distinct from [`Self::BeaconNodeStatus`], which for this call means a
-    /// definite refusal (a 4xx: the block was not published). Here the node
+    /// Distinct from [`Self::BeaconNodeStatus`] and [`Self::BeaconNode`],
+    /// which for this call mean a definite failure (a 4xx or a 503, or a
+    /// connection never established: the block was not published; see
+    /// `BeaconNodeApi::publish_blinded_block`). Here the node
     /// may have handed the block to its builder before failing, and the relay
     /// publishes on receipt, so the block may well be on the network. Nothing
     /// can safely be retried: the slot is signed, and a second block for it
@@ -89,6 +91,16 @@ pub enum Error {
     /// abandoned attestation itself is never retried, by design.
     #[error("attestation duty for slot {slot} ran past the end of its slot")]
     AttestationDeadline { slot: u64 },
+    /// The slot's proposal ran past its deadline, the point attesters stop
+    /// waiting for a block, before its block was published, and was
+    /// abandoned.
+    ///
+    /// The proposal counterpart of [`Self::AttestationDeadline`], and
+    /// retryable in the same sense only. Never raised once a blinded block is
+    /// signed: its publish goes on past the deadline (see
+    /// `ProposalService::propose_by`).
+    #[error("proposal for slot {slot} ran past the point attesters stop waiting for its block")]
+    ProposalDeadline { slot: u64 },
     /// Slashing protection refused to sign a block for this slot, or could not
     /// record it.
     ///
@@ -181,6 +193,7 @@ impl Error {
             | Self::BlindedUnconfirmed { .. }
             | Self::InconsistentResponse(_)
             | Self::AttestationDeadline { .. }
+            | Self::ProposalDeadline { .. }
             | Self::Decode(_) => true,
             // A refusal repeats itself, and a record that could not be written
             // needs an operator: retrying within the slot helps neither.

@@ -777,12 +777,16 @@ signature, whichever way the node answered. Three departures:
   that node's builder holds the payload and only that node claimed the slot, so
   offering the signed block to another node would hand it to a builder that
   never saw the bid. If the producing node fails, the publish fails, and
-  slashing protection has already recorded the slot, so nothing retries. A 5xx or no
-  answer is reported as unconfirmed (logged at error, counted on
-  `blinded_blocks_unconfirmed_total`) and not as a missed proposal, since the
-  relay may still publish the block. The producing node is recorded with the
-  block's slot and root, and a publish for any other block is refused, as
-  Teku does; Lighthouse, Lodestar and Nimbus fail over or broadcast instead.
+  slashing protection has already recorded the slot, so nothing retries. A 5xx
+  other than 503, or no answer once connected, is reported as unconfirmed
+  (logged at error, counted on `blinded_blocks_unconfirmed_total`) and not as a
+  missed proposal, since the relay may still publish the block. A 4xx, a 503 or
+  a connection never made (refused, or past the client's 3 s connect timeout)
+  is a missed proposal: the node cannot have handed the block on. The block
+  carries the node that produced it (`Producer`, filled in by the fallback),
+  and the proposal path sends the signed block back to it; Teku pins a blinded
+  block to its producer too, in a cache keyed by slot and root, while
+  Lighthouse, Lodestar and Nimbus fail over or broadcast instead.
   Two status codes are read the wrong way: some of ethlambda's own 500s are
   definite (no builder configured, the block failing the node's checks) and
   count as unconfirmed, and a proxy's 503 sent after it forwarded the request
@@ -790,10 +794,10 @@ signature, whichever way the node answered. Three departures:
 - **A blinded block stays signed but undelivered for longer.** The node waits
   up to 5 s on the relay and the client up to 8 s on the node, against well
   under a second for a full block. The publish runs on its own task so the
-  proposal budget cannot cut it off, but the process handles no signals: a
-  SIGINT in that window ends the task with the request. The record of the
-  latest blinded block (`signed_blinded_at`) is one per process, not per
-  validator, since one slot has one proposer.
+  proposal budget cannot cut it off: past the budget the proposal returns
+  "still publishing" and the task reports the outcome itself. The process
+  handles no signals, though: a SIGINT in that window ends the task with the
+  request.
 - **Registrations stop at gloas.** The client sends no `register_validator` from
   the gloas fork epoch on: the builder market works through proposer
   preferences there (see the next section), and `produceBlockV4` sends the
