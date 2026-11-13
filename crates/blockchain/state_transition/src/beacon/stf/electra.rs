@@ -44,7 +44,7 @@
 
 use libssz::SszEncode as _;
 
-use crate::beacon::bls;
+use crate::beacon::bls::{self, SignatureSet};
 use crate::beacon::config::Config;
 use crate::beacon::constants::{self, FAR_FUTURE_EPOCH};
 use crate::beacon::containers::shared::{
@@ -65,8 +65,8 @@ use crate::beacon::helpers::electra::{
     get_consolidation_churn_limit_for_fork, get_indexed_attestation, get_max_effective_balance,
     get_pending_balance_to_withdraw, has_compounding_withdrawal_credential,
     has_eth1_withdrawal_credential, has_execution_withdrawal_credential,
-    initiate_validator_exit as electra_initiate_validator_exit, is_fully_withdrawable_validator,
-    is_partially_withdrawable_validator, is_valid_indexed_attestation, pending_queue_fields,
+    indexed_attestation_signature_set, initiate_validator_exit as electra_initiate_validator_exit,
+    is_fully_withdrawable_validator, is_partially_withdrawable_validator, pending_queue_fields,
     pending_queue_fields_ref,
 };
 use crate::beacon::helpers::math::integer_squareroot;
@@ -81,6 +81,7 @@ use crate::beacon::primitives::{
     BlsPubkey, BlsSignature, Bytes32, Gwei, HashTreeRoot as _, ParticipationFlags, ValidatorIndex,
     WithdrawalIndex,
 };
+use crate::beacon::stf::signatures::SignatureBatch;
 
 use super::ExecutionEngine;
 
@@ -489,6 +490,7 @@ pub fn process_voluntary_exit(
     state: &mut BeaconState,
     signed_voluntary_exit: &SignedVoluntaryExit,
     config: &Config,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let voluntary_exit = signed_voluntary_exit.message;
     let current_epoch = get_current_epoch(state);
@@ -528,8 +530,8 @@ pub fn process_voluntary_exit(
         state.genesis_validators_root(),
     );
     let signing_root = compute_signing_root(voluntary_exit.hash_tree_root(), domain);
-    verify(
-        bls::verify(
+    signatures.push(
+        SignatureSet::single(
             &validator.pubkey,
             signing_root,
             &signed_voluntary_exit.signature,
@@ -560,8 +562,9 @@ pub fn process_bls_to_execution_change(
     state: &mut BeaconState,
     signed_change: &capella::SignedBLSToExecutionChange,
     config: &Config,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
-    super::capella::process_bls_to_execution_change(state, signed_change, config)
+    super::capella::process_bls_to_execution_change(state, signed_change, config, signatures)
 }
 
 // ---------------------------------------------------------------------------
@@ -586,6 +589,7 @@ pub fn process_attester_slashing(
     state: &mut BeaconState,
     attester_slashing: &electra::AttesterSlashing,
     config: &Config,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let attestation_1 = &attester_slashing.attestation_1;
     let attestation_2 = &attester_slashing.attestation_2;
@@ -594,12 +598,12 @@ pub fn process_attester_slashing(
         is_slashable_attestation_data(&attestation_1.data, &attestation_2.data),
         "is_slashable_attestation_data(attestation_1.data, attestation_2.data)",
     )?;
-    verify(
-        is_valid_indexed_attestation(state, attestation_1),
+    signatures.push(
+        indexed_attestation_signature_set(state, attestation_1),
         "is_valid_indexed_attestation(state, attestation_1)",
     )?;
-    verify(
-        is_valid_indexed_attestation(state, attestation_2),
+    signatures.push(
+        indexed_attestation_signature_set(state, attestation_2),
         "is_valid_indexed_attestation(state, attestation_2)",
     )?;
 
@@ -641,6 +645,7 @@ pub fn process_attestation(
     attestation: &electra::Attestation,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let data = attestation.data;
     let current_epoch = get_current_epoch(state);
@@ -710,8 +715,8 @@ pub fn process_attestation(
         attestation_participation_flag_indices(state, &data, inclusion_delay)?;
 
     let indexed_attestation = get_indexed_attestation(state, attestation, committees)?;
-    verify(
-        is_valid_indexed_attestation(state, &indexed_attestation),
+    signatures.push(
+        indexed_attestation_signature_set(state, &indexed_attestation),
         "is_valid_indexed_attestation(state, get_indexed_attestation(state, attestation))",
     )?;
 
@@ -1785,6 +1790,7 @@ pub fn process_operations(
     config: &Config,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let deposit_requests_start_index =
         block_ref(state, "process_operations")?.deposit_requests_start_index();
@@ -1803,24 +1809,24 @@ pub fn process_operations(
     }
 
     for proposer_slashing in body.proposer_slashings.iter() {
-        super::operations::process_proposer_slashing(state, proposer_slashing, config)?;
+        super::operations::process_proposer_slashing(state, proposer_slashing, config, signatures)?;
     }
     for attester_slashing in body.attester_slashings.iter() {
-        process_attester_slashing(state, attester_slashing, config)?;
+        process_attester_slashing(state, attester_slashing, config, signatures)?;
     }
     // [Modified in Electra:EIP7549]
     for attestation in body.attestations.iter() {
-        process_attestation(state, attestation, committees, active_balances)?;
+        process_attestation(state, attestation, committees, active_balances, signatures)?;
     }
     for deposit in body.deposits.iter() {
         process_deposit(state, deposit, config)?;
     }
     // [Modified in Electra:EIP7251]
     for voluntary_exit in body.voluntary_exits.iter() {
-        process_voluntary_exit(state, voluntary_exit, config)?;
+        process_voluntary_exit(state, voluntary_exit, config, signatures)?;
     }
     for signed_change in body.bls_to_execution_changes.iter() {
-        process_bls_to_execution_change(state, signed_change, config)?;
+        process_bls_to_execution_change(state, signed_change, config, signatures)?;
     }
     // [New in Electra:EIP6110:EIP7002:EIP7251]
     process_execution_requests(state, &body.execution_requests, config)?;
@@ -1845,6 +1851,7 @@ pub fn process_operations(
 /// them taking those fields directly rather than a whole body (see
 /// `crate::beacon::stf`'s module documentation). [`super::altair::process_sync_aggregate`]
 /// is reused the same way, for the same reason.
+#[allow(clippy::too_many_arguments)]
 pub fn process_block(
     state: &mut BeaconState,
     block: &electra::BeaconBlock,
@@ -1853,6 +1860,7 @@ pub fn process_block(
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
     options: super::block::BlockProcessingOptions,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     super::block::process_block_header(
         state,
@@ -1863,10 +1871,22 @@ pub fn process_block(
     )?;
     process_withdrawals(state, &block.body.execution_payload)?;
     process_execution_payload(state, &block.body, config, engine)?;
-    super::block::process_randao(state, &block.body.randao_reveal, options.randao)?;
+    super::block::process_randao(state, &block.body.randao_reveal, options.randao, signatures)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
-    process_operations(state, &block.body, config, committees, active_balances)?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
+    process_operations(
+        state,
+        &block.body,
+        config,
+        committees,
+        active_balances,
+        signatures,
+    )?;
+    super::altair::process_sync_aggregate(
+        state,
+        &block.body.sync_aggregate,
+        active_balances,
+        signatures,
+    )?;
     Ok(())
 }
 

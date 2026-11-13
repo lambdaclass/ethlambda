@@ -105,6 +105,9 @@ use ethlambda_types::beacon::primitives::{
     BLS_PUBKEY_SIZE, BLS_SIGNATURE_SIZE, BlsPubkey, BlsSignature, Root,
 };
 
+mod batch;
+pub use batch::{SignatureSet, verify_signature_sets};
+
 /// The ciphersuite the specification pins BLS signatures to: the IETF BLS
 /// draft's proof-of-possession scheme over BLS12-381's G2, using SHA-256 in
 /// the XMD hash-to-curve construction.

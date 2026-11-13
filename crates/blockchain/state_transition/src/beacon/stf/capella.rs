@@ -41,7 +41,7 @@
 //! fresh here, since capella's own [`capella::ExecutionPayloadHeader`] adds
 //! `withdrawals_root` and is a distinct type from bellatrix's.
 
-use crate::beacon::bls;
+use crate::beacon::bls::SignatureSet;
 use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::shared::{Deposit, ProposerSlashing, SignedVoluntaryExit};
@@ -58,6 +58,7 @@ use crate::beacon::helpers::misc::{compute_domain, compute_signing_root};
 use crate::beacon::helpers::mutators::decrease_balance;
 use crate::beacon::preset;
 use crate::beacon::primitives::{H256, HashTreeRoot as _};
+use crate::beacon::stf::signatures::SignatureBatch;
 
 use super::ExecutionEngine;
 
@@ -72,6 +73,7 @@ use super::ExecutionEngine;
 /// See this module's own documentation for why [`process_withdrawals`] runs
 /// before [`process_operations`], and so before this same block's own
 /// `bls_to_execution_changes` are processed.
+#[allow(clippy::too_many_arguments)]
 pub fn process_block(
     state: &mut BeaconState,
     block: &capella::BeaconBlock,
@@ -80,6 +82,7 @@ pub fn process_block(
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
     options: super::block::BlockProcessingOptions,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     super::block::process_block_header(
         state,
@@ -90,7 +93,7 @@ pub fn process_block(
     )?;
     process_withdrawals(state, &block.body.execution_payload)?;
     process_execution_payload(state, &block.body.execution_payload, config, engine)?;
-    super::block::process_randao(state, &block.body.randao_reveal, options.randao)?;
+    super::block::process_randao(state, &block.body.randao_reveal, options.randao, signatures)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
     process_operations(
         state,
@@ -103,8 +106,14 @@ pub fn process_block(
         config,
         committees,
         active_balances,
+        signatures,
     )?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
+    super::altair::process_sync_aggregate(
+        state,
+        &block.body.sync_aggregate,
+        active_balances,
+        signatures,
+    )?;
     Ok(())
 }
 
@@ -369,6 +378,7 @@ pub fn process_operations(
     config: &Config,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     super::operations::process_operations(
         state,
@@ -380,9 +390,10 @@ pub fn process_operations(
         config,
         committees,
         active_balances,
+        signatures,
     )?;
     for signed_change in bls_to_execution_changes {
-        process_bls_to_execution_change(state, signed_change, config)?;
+        process_bls_to_execution_change(state, signed_change, config, signatures)?;
     }
     Ok(())
 }
@@ -414,6 +425,7 @@ pub fn process_bls_to_execution_change(
     state: &mut BeaconState,
     signed_change: &capella::SignedBLSToExecutionChange,
     config: &Config,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let change = &signed_change.message;
 
@@ -434,8 +446,8 @@ pub fn process_bls_to_execution_change(
         state.genesis_validators_root(),
     );
     let signing_root = compute_signing_root(change.hash_tree_root(), domain);
-    verify(
-        bls::verify(
+    signatures.push(
+        SignatureSet::single(
             &change.from_bls_pubkey,
             signing_root,
             &signed_change.signature,
@@ -748,7 +760,10 @@ mod tests {
         );
         let signed_change = capella::SignedBLSToExecutionChange { message, signature };
 
-        process_bls_to_execution_change(&mut state, &signed_change, &config).unwrap();
+        crate::beacon::stf::signatures::checked(|s| {
+            process_bls_to_execution_change(&mut state, &signed_change, &config, s)
+        })
+        .unwrap();
 
         let validator = state.validator(0).unwrap();
         assert_eq!(
@@ -797,7 +812,12 @@ mod tests {
         );
         let signed_change = capella::SignedBLSToExecutionChange { message, signature };
 
-        assert!(process_bls_to_execution_change(&mut state, &signed_change, &config).is_err());
+        assert!(
+            crate::beacon::stf::signatures::checked(|s| {
+                process_bls_to_execution_change(&mut state, &signed_change, &config, s)
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -818,6 +838,11 @@ mod tests {
             signature: BlsSignature::default(),
         };
 
-        assert!(process_bls_to_execution_change(&mut state, &signed_change, &config).is_err());
+        assert!(
+            crate::beacon::stf::signatures::checked(|s| {
+                process_bls_to_execution_change(&mut state, &signed_change, &config, s)
+            })
+            .is_err()
+        );
     }
 }
