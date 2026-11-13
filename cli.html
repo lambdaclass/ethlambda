@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-872bc70a.js";
+            window.path_to_searchindex_js = "searchindex-ec71fa14.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -203,7 +203,9 @@ what each workload measures; <code>benchmark import</code>’s flags are in
 <a href="#benchmark-import-flags">their own section</a> below. <code>ethlambda validator</code> is
 the validator client: a separate process that holds keys and performs duties
 against a beacon node over the standard REST API, documented in
-<a href="#validator-flags">its own section</a> below. <code>ethlambda slashing-protection</code>
+<a href="#validator-flags">its own section</a> below. <code>ethlambda voluntary-exit</code> signs one
+validator’s voluntary exit and hands it to a beacon node; see
+<a href="#voluntary-exit">its section</a> below. <code>ethlambda slashing-protection</code>
 moves that client’s EIP-3076 history in and out of its directory, offline; see
 <a href="#slashing-protection">its section</a> below.</p>
 <h2 id="node-is-the-default"><a class="header" href="#node-is-the-default"><code>node</code> is the default</a></h2>
@@ -566,8 +568,9 @@ for wall slot <code>S</code> are those of the period containing <code>S + 1</cod
 assigned to slot <code>S</code> sign for <code>S - 1</code>. Both halves are bounded by the end of the
 slot.</p>
 <p>Not implemented: the builder flow and blinded blocks (the client asks for an
-unblinded block and refuses a blinded one), voluntary exits, doppelganger
-protection and remote signing.</p>
+unblinded block and refuses a blinded one), doppelganger protection and remote
+signing. Voluntary exits are signed by the keymanager API’s <code>voluntary_exit</code>
+route and by <a href="#voluntary-exit"><code>ethlambda voluntary-exit</code></a>.</p>
 <h3 id="duty-offsets-come-from-the-network"><a class="header" href="#duty-offsets-come-from-the-network">Duty offsets come from the network</a></h3>
 <p>The slot length and the duty offsets are read from the beacon node’s
 <code>/eth/v1/config/spec</code>, not divided out of a compiled-in constant. The
@@ -595,7 +598,15 @@ epoch is not picked up until the next one.</p>
 <code>api-token.txt</code> in the validators directory and generated there on first start
 if absent. The token file is written <code>0600</code> and a file too short to be a real
 token is refused rather than accepted.</p>
-<p>It also serves <code>GET</code>, <code>POST</code> and <code>DELETE</code> on
+<p>It also serves <code>POST /eth/v1/validator/{pubkey}/voluntary_exit</code>, which signs a
+voluntary exit for a validator this client holds and answers with the
+<code>SignedVoluntaryExit</code>, for the exit’s <code>epoch</code> query parameter or the current
+epoch when none is given. <strong>It does not publish the exit.</strong> As the
+specification has it, the caller hands the message to a beacon node’s
+<code>POST /eth/v1/beacon/pool/voluntary_exits</code>, or holds on to it. The validator
+index comes from the beacon node on each call, so a key whose deposit the chain
+has not processed yet is a <code>404</code> saying so.</p>
+<p>And it serves <code>GET</code>, <code>POST</code> and <code>DELETE</code> on
 <code>/eth/v1/validator/{pubkey}/feerecipient</code>, <code>/graffiti</code> and <code>/gas_limit</code>, which
 give one validator its own value in place of the command line’s default:</p>
 <div class="table-wrapper">
@@ -634,6 +645,63 @@ default; exposing it further means putting a TLS terminator in front.</p>
 beacon chain. Every series is registered at startup so it reads zero rather
 than being absent before its first event, which is what lets an alert fire on
 “attestations stopped”. See <a href="./metrics.html#validator-client">Metrics</a>.</p>
+<h2 id="voluntary-exit"><a class="header" href="#voluntary-exit"><code>voluntary-exit</code></a></h2>
+<p><code>ethlambda voluntary-exit</code> signs a voluntary exit for one validator and hands
+it to a beacon node, which validates it against its head and gossips it. It is
+a command of its own rather than part of <code>ethlambda validator</code>: it takes one
+keystore and none of the client’s flags, runs once and ends.</p>
+<pre><code class="language-sh">ethlambda voluntary-exit \
+  --keystore ~/validators/0xabc.../voting-keystore.json \
+  --password-file ~/secrets/0xabc... \
+  --beacon-node http://localhost:5052
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--keystore</code></td><td>required</td><td>The validator’s EIP-2335 voting keystore</td></tr>
+<tr><td><code>--password-file</code></td><td>required</td><td>The file holding that keystore’s password. A trailing newline is ignored</td></tr>
+<tr><td><code>--beacon-node</code></td><td><code>http://localhost:5052</code></td><td>Base URL of the beacon node’s HTTP API. One node, not a list: this is a one-shot command, and an operator whose node is down picks another</td></tr>
+<tr><td><code>--epoch</code></td><td>the current epoch</td><td>The exit’s epoch, before which the chain refuses it. An earlier one is as good as the current one. A later one needs <code>--presign</code>: a node refuses an exit whose epoch has not come, so the command refuses to publish one</td></tr>
+<tr><td><code>--presign</code></td><td>off</td><td>Sign the exit and print it as JSON on stdout without publishing it, for an operator who wants to hold a signed exit for later. Logs go to stderr, so the JSON pipes cleanly into a file</td></tr>
+<tr><td><code>--no-confirmation</code></td><td>off</td><td>Publish without asking for the confirmation phrase. For scripts; use with care</td></tr>
+<tr><td><code>--no-wait</code></td><td>off</td><td>Return as soon as the beacon node has accepted the exit, without waiting for the chain to process it</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>A voluntary exit is irreversible.</strong> Once the chain processes it the
+validator is queued to leave, stops earning after its exit epoch, and the key
+can never validate again. So before publishing anything the command refuses a
+beacon node that is still syncing, refuses a validator the chain would refuse
+(one that is not <code>active_ongoing</code>, or not yet <code>SHARD_COMMITTEE_PERIOD</code> epochs
+past its activation, naming the epoch it becomes eligible at), and then prints
+a warning and asks for the phrase <code>Exit my validator</code> on stdin. Anything else,
+an empty stdin included, aborts without publishing and with a failing exit
+status, so a script cannot take an exit that never went out for one that did.</p>
+<p>The shard committee period is measured the way the chain measures it: against
+the epoch the exit is processed in, which is now for an exit being published
+and the exit’s own epoch for a <code>--presign</code> one naming a later epoch. Its
+length is the beacon node’s own <code>SHARD_COMMITTEE_PERIOD</code>, read from
+<code>/eth/v1/config/spec</code>, so a devnet that shortens it is followed. One rule
+of the chain’s cannot be checked up front: from electra on it refuses a
+validator with a partial withdrawal still pending. That refusal comes back as
+the beacon node’s <code>400</code>, with its reason.</p>
+<p>After publishing, unless <code>--no-wait</code> is given, it polls the validator’s status
+once a slot, for up to two epochs. When the chain reports <code>active_exiting</code> it
+prints the current, exit and withdrawable epochs and how long until the exit
+epoch, and returns; <strong>keep the validator running until that epoch</strong>, since it
+still has duties until then. Any later status (<code>exited_*</code>, <code>withdrawal_*</code>) and
+<code>active_slashed</code> end the wait too, reported as such. If the chain has not
+processed the exit when the wait runs out, the command says so and returns
+successfully, since the exit was published; a beacon node that cannot answer a
+poll is asked again at the next slot rather than failing the run.</p>
+<p>Exits are signed for the fork that processes them, not the one their epoch
+falls in. From deneb on that is <code>CAPELLA_FORK_VERSION</code> whatever epoch the exit
+names (EIP-7044), an epoch from before deneb included, so a pre-signed exit
+stays valid across every fork to come. The command signs that way, and the
+<a href="#the-keymanager-api">keymanager API</a>’s <code>voluntary_exit</code> route does too.</p>
 <h2 id="slashing-protection"><a class="header" href="#slashing-protection"><code>slashing-protection</code></a></h2>
 <p>Moves the validator client’s EIP-3076 history in and out of its
 <code>--validators-dir</code>, offline. It takes the lock the client holds while running,
