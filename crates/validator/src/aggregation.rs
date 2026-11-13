@@ -41,7 +41,7 @@ use ethlambda_types::beacon::containers::shared::AttestationData;
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{BlsPubkey, BlsSignature, HashTreeRoot as _, Slot};
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::aggregation_selection::selection_for;
 use crate::beacon_node::dto::{AttesterDutyDto, parse_pubkey};
@@ -116,6 +116,15 @@ impl<B: BeaconNodeApi> AggregationService<B> {
             match selection {
                 Ok(Some(proof)) => selected.push((duty, pubkey, proof)),
                 Ok(None) => {}
+                // A key the keymanager deleted since the schedule was
+                // fetched. Its duty is skipped, as its attestation was, and
+                // is not a signature that failed: counting it would raise a
+                // signing alert for a delete the operator asked for.
+                Err(Error::UnknownValidator(_)) => debug!(
+                    %slot,
+                    validator = duty.validator_index,
+                    "Duty names a key this client no longer holds; skipped"
+                ),
                 Err(err) => {
                     warn!(
                         %slot,
@@ -223,6 +232,16 @@ impl<B: BeaconNodeApi> AggregationService<B> {
             for ((duty, _, wrapper), signature) in wrappers.into_iter().zip(signatures) {
                 let signature = match signature {
                     Ok(signature) => signature,
+                    // Deleted between the selection above and here; not a
+                    // signing failure, for the reason given there.
+                    Err(Error::UnknownValidator(_)) => {
+                        debug!(
+                            %slot,
+                            validator = duty.validator_index,
+                            "Duty names a key this client no longer holds; skipped"
+                        );
+                        continue;
+                    }
                     Err(err) => {
                         warn!(%slot, validator = duty.validator_index, %err, "Failed to sign aggregate");
                         crate::metrics::inc_signing_failures();

@@ -7,9 +7,11 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use ethlambda_types::beacon::primitives::BlsPubkey;
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 
+use crate::beacon_node::dto::parse_pubkey;
 use crate::error::{Error, Result};
 use crate::secure_fs;
 
@@ -325,6 +327,32 @@ impl ValidatorDefinitions {
 
     pub fn enabled(&self) -> impl Iterator<Item = &ValidatorDefinition> {
         self.0.iter().filter(|definition| definition.enabled)
+    }
+
+    /// Every entry beside the key it names, each `voting_public_key` decoded
+    /// once.
+    ///
+    /// What a caller asking about several keys builds its lookup from, rather
+    /// than decoding every entry again for each key it asks about. An entry
+    /// whose `voting_public_key` does not parse names no key and is left
+    /// out: nothing can ask for it by key, and [`Self::remove_where`] keeps
+    /// it, so no caller may count it as found.
+    pub fn keyed(&self) -> impl Iterator<Item = (BlsPubkey, &ValidatorDefinition)> {
+        self.0.iter().filter_map(|definition| {
+            let pubkey = parse_pubkey(&definition.voting_public_key).ok()?;
+            Some((pubkey, definition))
+        })
+    }
+
+    /// Drop every entry `drop` names, judged by its key and by how it signs.
+    /// An entry whose key does not parse is kept; see [`Self::keyed`].
+    pub fn remove_where(&mut self, drop: impl Fn(&BlsPubkey, &SigningDefinition) -> bool) {
+        self.0.retain(
+            |definition| match parse_pubkey(&definition.voting_public_key) {
+                Ok(pubkey) => !drop(&pubkey, &definition.signing),
+                Err(_) => true,
+            },
+        );
     }
 }
 

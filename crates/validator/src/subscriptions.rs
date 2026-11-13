@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::aggregation_selection::selection_for;
 use crate::beacon_node::BeaconNodeApi;
@@ -19,7 +19,7 @@ use crate::beacon_node::dto::{
     AttesterDutyDto, CommitteeSubscriptionDto, SyncCommitteeSubscriptionDto, SyncDutyDto,
     parse_pubkey,
 };
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::keys::ValidatorStore;
 use crate::signing::{SigningContext, sign_all};
 
@@ -49,13 +49,13 @@ pub async fn subscribe<B: BeaconNodeApi>(
     }
 
     // Every selection proof is asked for at once, each within the signing
-    // budget. This runs on the duty loop at an epoch boundary, ahead of that
-    // slot's proposal, so one request per duty in series would let a slow or
-    // unreachable signer hold up every validator's duties, local keys
-    // included, for as many round trips as there are duties. Bounded this
-    // way it costs `SIGNING_BUDGET` at most, and the proofs that did arrive
-    // are remembered for the aggregation tick (see
-    // `SigningContext::sign_selection_proof`).
+    // budget: one request per duty in series would cost a slow or
+    // unreachable signer as many round trips as there are duties before any
+    // subscription went out. Bounded this way it costs `SIGNING_BUDGET` at
+    // most, and the proofs that did arrive are remembered for the
+    // aggregation tick (see `SigningContext::sign_selection_proof`). The
+    // duty loop runs this from a task of its own, after the slot's block, so
+    // even that budget is never spent ahead of a proposal.
     let mut is_aggregator = vec![false; duties.len()];
     let mut keyed = Vec::with_capacity(duties.len());
     for (position, duty) in duties.iter().enumerate() {
@@ -78,6 +78,15 @@ pub async fn subscribe<B: BeaconNodeApi>(
     for ((position, duty, _), selection) in keyed.into_iter().zip(selections) {
         match selection {
             Ok(selection) => is_aggregator[position] = selection.is_some(),
+            // A key the keymanager deleted since the schedule was fetched:
+            // nothing failed to sign, so nothing is counted. Its subscription
+            // still goes out, without the role, like any other it cannot
+            // claim one for.
+            Err(Error::UnknownValidator(_)) => debug!(
+                slot = duty.slot,
+                validator = duty.validator_index,
+                "Duty names a key this client no longer holds; subscribing without the role"
+            ),
             Err(err) => {
                 warn!(
                     slot = duty.slot,

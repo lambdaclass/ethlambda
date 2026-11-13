@@ -39,8 +39,7 @@ use crate::Error;
 use crate::beacon_node::dto::{encode_hex, parse_pubkey};
 use crate::http_api::KeymanagerContext;
 use crate::http_api::keystores::{
-    DeleteRequest, KeyStatus, Origin, StatusResponse, definitions_entry, flush_earlier_removal,
-    persist_delete, save_definitions,
+    DeleteRequest, Judged, KeyStatus, Origin, StatusResponse, delete_keys, save_definitions,
 };
 use crate::keys::{
     SigningDefinition, ValidatorDefinition, ValidatorDefinitions, ValidatorStore, Web3Signer,
@@ -139,16 +138,21 @@ pub async fn import(
     // What the store holds, read under a guard released at once: nothing
     // below holds the store across file I/O or client construction, so a
     // duty's per-signature read never waits on this request.
-    let (known, mut signers) = {
+    let (mut known, mut signers) = {
         let store = context.store.read().await;
         let known: HashSet<BlsPubkey> = store.pubkeys().into_iter().collect();
         (known, store.remote_signers())
     };
+    // And what the file names, each entry decoded once for the request
+    // rather than once for every key in it. A disabled local entry, or one
+    // left behind by a failed delete, is still "already known": overwriting
+    // it would turn a key the operator disabled into a signing one.
+    known.extend(definitions.keyed().map(|(pubkey, _)| pubkey));
 
     let mut prepared: Vec<Prepared> = request
         .remote_keys
         .iter()
-        .map(|key| prepare_import(&context, &known, &mut signers, &mut definitions, key))
+        .map(|key| prepare_import(&context, &mut known, &mut signers, &mut definitions, key))
         .collect();
 
     // One save for the whole batch rather than one per key. A failure fails
@@ -213,11 +217,7 @@ pub async fn import(
             // refuse the whole client for a key with no record.
             Err(err) => {
                 let added: HashSet<BlsPubkey> = staged.iter().copied().collect();
-                definitions.0.retain(|definition| {
-                    parse_pubkey(&definition.voting_public_key)
-                        .map(|parsed| !added.contains(&parsed))
-                        .unwrap_or(true)
-                });
+                definitions.remove_where(|pubkey, _| added.contains(pubkey));
                 failure = Some(match save_definitions(&context, &definitions) {
                     Ok(()) | Err(Error::Unflushed { .. }) => format!(
                         "not imported: its slashing-protection record could not be written: {err}"
@@ -273,12 +273,12 @@ pub async fn import(
 /// append the entry to `definitions`, which the caller saves once for the
 /// whole batch.
 ///
-/// `Ok(None)` is a duplicate. `known` is the store's keys; `definitions`
-/// already holds the entries staged for earlier keys in the batch, so a key
-/// named twice in one request is a duplicate the second time.
+/// `Ok(None)` is a duplicate. `known` is every key the store holds or the
+/// file names, and gains each key staged here, so a key named twice in one
+/// request is a duplicate the second time.
 fn prepare_import(
     context: &KeymanagerContext,
-    known: &HashSet<BlsPubkey>,
+    known: &mut HashSet<BlsPubkey>,
     signers: &mut HashMap<String, Arc<Web3Signer>>,
     definitions: &mut ValidatorDefinitions,
     key: &ImportRemoteKey,
@@ -297,16 +297,9 @@ fn prepare_import(
         }
     };
 
-    // Known to the store, or to the file: a disabled local entry, or one
-    // left behind by a failed delete, is still "already known", and
-    // overwriting it would turn a key the operator disabled into a signing
-    // one. Judged before anything is built or staged.
-    let on_disk = definitions.0.iter().any(|definition| {
-        parse_pubkey(&definition.voting_public_key)
-            .map(|parsed| parsed == pubkey)
-            .unwrap_or(false)
-    });
-    if on_disk || known.contains(&pubkey) {
+    // Known to the store, or to the file. Judged before anything is built or
+    // staged.
+    if known.contains(&pubkey) {
         return Ok(None);
     }
 
@@ -328,6 +321,7 @@ fn prepare_import(
         voting_public_key: encode_hex(&pubkey.0),
         signing: SigningDefinition::Web3Signer { url },
     });
+    known.insert(pubkey);
     Ok(Some((pubkey, signer)))
 }
 
@@ -337,73 +331,52 @@ pub async fn delete(
 ) -> Json<StatusResponse> {
     let _definitions_guard = context.definitions_lock.lock().await;
 
-    let mut store = context.store.write().await;
-    let data = request
-        .pubkeys
-        .iter()
-        .map(|text| match parse_pubkey(text) {
-            Ok(pubkey) => delete_one(&context, &mut store, &pubkey),
-            Err(err) => KeyStatus::error(err),
-        })
+    // Uncapped, and a migration off a signer deletes hundreds of keys in one
+    // request. `delete_keys` reads the file once, holds the store's write
+    // lock only to take the keys out of memory, and saves once, so a request
+    // that size does not stand between the duties and their signatures.
+    let data = delete_keys(&context, &request.pubkeys, Origin::Remote, judge_delete)
+        .await
+        .into_iter()
+        .map(|(_, status)| status)
         .collect();
-    drop(store);
 
     Json(StatusResponse { data })
 }
 
-/// The keystores route's delete, gated the other way: only a remote key is
+/// The keystores route's judgement, gated the other way: only a remote key is
 /// this route's to remove, and a local one is `not_found` here whatever its
-/// state. The on-disk check comes first and decides `not_found`, for the
-/// reason spelled out on `keystores::delete_one`.
-fn delete_one(
+/// state. The file decides `not_found`, for the reason spelled out on
+/// `keystores::delete_keys`.
+fn judge_delete(
     context: &KeymanagerContext,
     store: &mut ValidatorStore,
-    pubkey: &ethlambda_types::beacon::primitives::BlsPubkey,
-) -> KeyStatus {
-    let on_disk = match definitions_entry(context, pubkey) {
-        Ok(entry) => entry.is_some_and(|signing| signing.is_remote()),
-        Err(err) => return KeyStatus::error(err),
-    };
+    pubkey: &BlsPubkey,
+    entry: Option<Origin>,
+) -> Judged {
+    let on_disk = entry == Some(Origin::Remote);
     let in_memory = store.remote_url(pubkey).is_some();
     if !on_disk && !in_memory {
-        // An earlier removal whose directory flush failed must reach the disk
-        // for good before this says the key is gone; see
-        // `keystores::flush_earlier_removal`.
-        if let Err(status) = flush_earlier_removal(context) {
-            return status;
-        }
-        return KeyStatus {
-            status: "not_found".to_string(),
-            message: None,
-        };
+        return Judged::Absent;
     }
 
-    // The in-memory removal first, so this process stops signing with the
-    // key whatever becomes of the file; a failed persist is reported, not
-    // swallowed, so a retry gets the same error rather than a `not_found`
-    // that reads as "already gone".
     if in_memory {
         store.remove(pubkey);
     }
-    context.settings.forget(pubkey);
-    match persist_delete(context, pubkey, Origin::Remote) {
-        Ok(()) => {}
-        // On disk, but it may not survive a power loss, so the key could come
-        // back enabled. An error, so no caller takes the key for gone; this
-        // process does not sign with it.
-        Err(Error::Unflushed { path, source }) => {
-            return KeyStatus::error(format!(
-                "removed from {path}, but the directory could not be flushed: {source}; the key \
-                 may come back after a power loss"
-            ));
-        }
-        Err(err) => return KeyStatus::error(err),
+    // The key's overrides go with it, unless the store still holds it. That
+    // is the file listing a remote entry for a key this process runs as a
+    // local one, which only a hand edit under a running client produces: the
+    // entry comes off the file, but the local key is the keystores route's
+    // and keeps proposing, so its fee recipient, graffiti and gas limit stay
+    // or its next blocks would pay the default address.
+    if !store.contains(pubkey) {
+        context.settings.forget(pubkey);
     }
-
-    info!(pubkey = %encode_hex(&pubkey.0), "Deleted remote validator key");
-    KeyStatus {
-        status: "deleted".to_string(),
-        message: None,
+    // The mirror of the keystores route's case: the store held the key
+    // remotely while the file lists it as a local keystore, an entry this
+    // route leaves alone and the next start would load.
+    Judged::Removed {
+        stranded: in_memory && entry == Some(Origin::Local),
     }
 }
 
@@ -750,6 +723,156 @@ mod tests {
         .await;
         assert_eq!(statuses(&body), ["deleted"]);
         assert!(store.read().await.is_empty());
+    }
+
+    /// One request, many keys: each is judged against a single read of the
+    /// file and comes off it in a single save. A key named twice is `deleted`
+    /// the first time and gone the second, and a key this client never had
+    /// is `not_found`.
+    #[tokio::test]
+    async fn a_delete_of_several_keys_judges_each_and_saves_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Arc::new(RwLock::new(ValidatorStore::new()));
+        let app = router(
+            context_with_dirs(store.clone(), dir.path(), Some(SIGNER)),
+            TOKEN.to_string(),
+        );
+        let (_, body) = send(
+            app.clone(),
+            authed(
+                "POST",
+                "/eth/v1/remotekeys",
+                serde_json::json!({ "remote_keys": [
+                    { "pubkey": pubkey_hex(1) },
+                    { "pubkey": pubkey_hex(2) },
+                    { "pubkey": pubkey_hex(3) },
+                ] }),
+            ),
+        )
+        .await;
+        assert_eq!(statuses(&body), ["imported", "imported", "imported"]);
+
+        let (_, body) = send(
+            app,
+            authed(
+                "DELETE",
+                "/eth/v1/remotekeys",
+                serde_json::json!({ "pubkeys": [
+                    pubkey_hex(1), pubkey_hex(9), pubkey_hex(2), "0xnothex", pubkey_hex(1),
+                ] }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            statuses(&body),
+            ["deleted", "not_found", "deleted", "error", "not_found"],
+            "got {body}"
+        );
+
+        let kept = parse_pubkey(&pubkey_hex(3)).expect("pubkey");
+        assert_eq!(store.read().await.pubkeys(), vec![kept]);
+        let on_disk = ValidatorDefinitions::open(dir.path()).expect("opens");
+        assert_eq!(on_disk.0.len(), 1);
+        assert_eq!(on_disk.0[0].voting_public_key, pubkey_hex(3));
+    }
+
+    /// The file listing a remote entry for a key this process runs as a local
+    /// one, which only a hand edit under a running client produces. The
+    /// entry is this route's to remove, but the local key is not: it keeps
+    /// signing, and it keeps the settings it proposes with.
+    #[tokio::test]
+    async fn a_delete_leaves_a_local_key_under_the_same_pubkey_its_settings() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut store = ValidatorStore::new();
+        let mut secret = [0u8; 32];
+        secret[31] = 1;
+        let pubkey = store.insert_secret("test", &secret).expect("inserts");
+        let hex = encode_hex(&pubkey.0);
+        ValidatorDefinitions(vec![ValidatorDefinition {
+            enabled: true,
+            voting_public_key: hex.clone(),
+            signing: SigningDefinition::Web3Signer {
+                url: SIGNER.to_string(),
+            },
+        }])
+        .save(dir.path())
+        .expect("saves");
+        let store = Arc::new(RwLock::new(store));
+        let context = context_with_dirs(store.clone(), dir.path(), None);
+        let settings = context.settings.clone();
+        let fee_recipient = ethlambda_types::beacon::primitives::H160([0xcd; 20]);
+        settings.set_fee_recipient(&pubkey, fee_recipient);
+
+        let (_, body) = send(
+            router(context, TOKEN.to_string()),
+            authed(
+                "DELETE",
+                "/eth/v1/remotekeys",
+                serde_json::json!({ "pubkeys": [hex] }),
+            ),
+        )
+        .await;
+        assert_eq!(statuses(&body), ["deleted"], "got {body}");
+
+        let on_disk = ValidatorDefinitions::open(dir.path()).expect("opens");
+        assert!(on_disk.0.is_empty(), "the remote entry is off the file");
+        assert!(
+            store.read().await.contains(&pubkey),
+            "the local key is the other route's and still signs"
+        );
+        assert_eq!(
+            settings.fee_recipient(&pubkey),
+            Some(fee_recipient),
+            "a key that keeps proposing keeps its fee recipient"
+        );
+    }
+
+    /// The mirror of the keystores route's case: the store holds the key
+    /// through a signer while the file lists it as a local keystore. The
+    /// delete stops the key signing and leaves the other route's entry
+    /// alone, and since that entry would bring the key back at the next
+    /// start, the answer is an error rather than `deleted`.
+    #[tokio::test]
+    async fn a_delete_does_not_report_gone_a_key_the_file_lists_as_local() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pubkey = parse_pubkey(&pubkey_hex(1)).expect("pubkey");
+        let mut store = ValidatorStore::new();
+        store.insert_remote(pubkey, SIGNER).expect("inserts");
+        ValidatorDefinitions(vec![ValidatorDefinition {
+            enabled: true,
+            voting_public_key: pubkey_hex(1),
+            signing: SigningDefinition::LocalKeystore {
+                voting_keystore_path: "keystore.json".into(),
+                voting_keystore_password_path: "password.txt".into(),
+            },
+        }])
+        .save(dir.path())
+        .expect("saves");
+        let store = Arc::new(RwLock::new(store));
+        let app = router(
+            context_with_dirs(store.clone(), dir.path(), None),
+            TOKEN.to_string(),
+        );
+
+        let (_, body) = send(
+            app,
+            authed(
+                "DELETE",
+                "/eth/v1/remotekeys",
+                serde_json::json!({ "pubkeys": [pubkey_hex(1)] }),
+            ),
+        )
+        .await;
+        assert_eq!(statuses(&body), ["error"], "got {body}");
+        let message = body["data"][0]["message"].as_str().expect("a message");
+        assert!(message.contains("/eth/v1/keystores"), "{message}");
+        assert!(
+            store.read().await.is_empty(),
+            "the remote key stops signing"
+        );
+        let on_disk = ValidatorDefinitions::open(dir.path()).expect("opens");
+        assert_eq!(on_disk.0.len(), 1, "the local entry is not this route's");
+        assert!(!on_disk.0[0].signing.is_remote());
     }
 
     /// A context over `dir` whose slashing protection is a real record there,

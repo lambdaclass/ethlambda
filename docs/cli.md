@@ -436,12 +436,21 @@ signer that cannot be reached, and an answer that does not verify: every
 signature a signer returns is checked against the validator's public key and
 the signing root before it is used, so a signer holding another key under that
 pubkey, or computing another root, costs the signature rather than publishing
-one no peer accepts. Each duty asks for its signatures all at once
+one no peer accepts. That check runs off the duty loop, a core per signature,
+so a large batch of answers does not hold the loop up. Each duty asks for its
+signatures all at once
 and gives each one 2 seconds: a signer that has not answered by then costs the
 signatures it owes and nothing else, so the duty publishes whatever arrived,
-local keys and other signers' keys included. Aggregator selection proofs are
+local keys and other signers' keys included. One signer is sent at most 64
+requests at a time and the rest of a batch waits its turn inside the same 2
+seconds, so a signer costs this client 64 connections however many keys it
+holds; the sub-command also raises its open-file limit at startup, as `node`
+and `beacon` do. Aggregator selection proofs are
 remembered once produced, so the one the epoch's subnet subscription asked for
-is not asked for again by the aggregation. Nothing is asked of the signer at startup or at
+is not asked for again by the aggregation. Those subscriptions are sent from a
+task of their own, started once the epoch's first slot has had its block, so
+the round trips for their selection proofs never stand between a slot boundary
+and a proposal. Nothing is asked of the signer at startup or at
 import: a signer may start after this client does.
 
 A remote key is declared in `validator_definitions.yml` with `type:
@@ -495,6 +504,17 @@ history, since the specification gives them no field for it: a remote key
 imported with no record starts as never having signed, and `DELETE
 /remotekeys` leaves the record in place. `DELETE /keystores` exports nothing
 for a key a remote signer holds.
+
+A delete through either route reads the definitions file once and saves it
+once for the whole request, and takes the keys out of memory in between, so a
+request naming hundreds of keys does not hold up the duties' signatures. The
+two routes can only disagree with the file about a key's kind after the file
+was edited by hand under a running client. A delete that then finds the key in
+memory as its own kind, and in the file as the other route's, stops signing
+with it and answers `error` naming the other route, not `deleted`: the entry
+it leaves would load the key again at the next start. `DELETE /remotekeys` of
+a remote entry whose key this process runs from a local keystore removes the
+entry and leaves the local key, and its per-validator settings, as they are.
 
 It also serves `GET`, `POST` and `DELETE` on
 `/eth/v1/validator/{pubkey}/feerecipient`, `/graffiti` and `/gas_limit`, which

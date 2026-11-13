@@ -10,7 +10,7 @@ use tracing::info;
 
 use crate::beacon_node::dto::{encode_hex, parse_pubkey};
 use crate::error::{Error, Result};
-use crate::keys::definitions::{SigningDefinition, ValidatorDefinitions};
+use crate::keys::definitions::{DEFINITIONS_FILE, SigningDefinition, ValidatorDefinitions};
 use crate::keys::keystore::Keystore;
 use crate::keys::web3signer::Web3Signer;
 
@@ -75,14 +75,24 @@ impl ValidatorStore {
         let definitions = ValidatorDefinitions::open(validators_dir)?;
         let mut store = Self::new();
 
-        for definition in definitions.enabled() {
+        let entries = definitions.0.iter().enumerate();
+        for (position, definition) in entries.filter(|(_, definition)| definition.enabled) {
             let (voting_keystore_path, voting_keystore_password_path) = match &definition.signing {
                 SigningDefinition::Web3Signer { url } => {
+                    // Named by its place in the file, never by its `url`. The
+                    // URL here is as the operator wrote it: `Web3Signer::new`
+                    // has not seen it yet, so it may still carry the
+                    // credentials that would be refused there, and this
+                    // error is logged as startup aborts. The position also
+                    // tells entries apart, which a URL shared by every key
+                    // on one signer does not.
                     let pubkey = parse_pubkey(&definition.voting_public_key).map_err(|err| {
                         Error::Keystore {
-                            path: url.clone(),
+                            path: validators_dir.join(DEFINITIONS_FILE).display().to_string(),
                             reason: format!(
-                                "the definitions entry's voting_public_key is unreadable: {err}"
+                                "entry {} (a web3signer entry): its voting_public_key is \
+                                 unreadable: {err}",
+                                position + 1
                             ),
                         }
                     })?;
@@ -137,7 +147,7 @@ impl ValidatorStore {
             // The keymanager's delete is where that becomes dangerous. It
             // removes from the store by the derived key but removes from the
             // definitions file by the *declared* one
-            // (`http_api::keystores::persist_delete`), so a mismatch makes the
+            // (`http_api::keystores::delete_keys`), so a mismatch makes the
             // file retain the entry while the response reports `deleted`. The
             // next restart loads the keystore again and the validator signs
             // again, which is exactly the shape that produces a double vote
@@ -485,6 +495,38 @@ mod tests {
         .expect("saves definitions");
 
         assert!(ValidatorStore::load(dir.path()).is_err());
+    }
+
+    /// A remote entry's `url` is as the operator wrote it until
+    /// `Web3Signer::new` has judged it, so an error raised before that names
+    /// the entry by its place in the file and never echoes the URL, which
+    /// may carry credentials.
+    #[test]
+    fn an_unreadable_pubkey_on_a_remote_entry_does_not_echo_its_url() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let remote = |voting_public_key: &str, url: &str| ValidatorDefinition {
+            enabled: true,
+            voting_public_key: voting_public_key.to_string(),
+            signing: SigningDefinition::Web3Signer {
+                url: url.to_string(),
+            },
+        };
+        ValidatorDefinitions(vec![
+            remote(VECTOR_PUBKEY, "http://127.0.0.1:9"),
+            remote("0xnothex", "https://admin:s3cret@signer:9000"),
+        ])
+        .save(dir.path())
+        .expect("saves definitions");
+
+        let Err(err) = ValidatorStore::load(dir.path()) else {
+            panic!("an entry with an unreadable pubkey must refuse the load");
+        };
+        let message = err.to_string();
+        assert!(message.contains("entry 2"), "{message}");
+        assert!(
+            !message.contains("s3cret") && !message.contains("admin"),
+            "the error must not carry the URL's credentials: {message}"
+        );
     }
 
     /// How many validators' worth of clients the store can still hand out.

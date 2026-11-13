@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use ethlambda_types::beacon::primitives::{Bytes32, ExecutionAddress, H160};
 use ethlambda_validator::ValidatorConfig;
 use ethlambda_validator::proposer_settings::{GRAFFITI_BYTES, graffiti_from_text};
+use eyre::WrapErr as _;
 
 /// An execution address is exactly this wide.
 const ADDRESS_BYTES: usize = 20;
@@ -163,6 +164,13 @@ impl ValidatorOptions {
 #[tokio::main]
 pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
     options.validate_ports()?;
+    // The same raise `run_node` makes, and for a like reason: with remote
+    // keys every signing request in flight is a socket (capped per signer,
+    // see `Web3Signer`), next to the beacon nodes', the metrics server's and
+    // the keymanager's. On a default soft limit `connect` starts failing
+    // with `EMFILE` once several signers are busy at once, and every
+    // signature those requests were for fails with it.
+    crate::fd_limit::raise_fd_limit().wrap_err("failed to raise RLIMIT_NOFILE")?;
     let graffiti = options.graffiti()?;
     let suggested_fee_recipient = options.suggested_fee_recipient()?;
     ethlambda_validator::run(ValidatorConfig {

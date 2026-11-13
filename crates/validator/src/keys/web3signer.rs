@@ -25,6 +25,7 @@ use ethlambda_types::beacon::containers::shared::{AttestationData, BeaconBlockHe
 use ethlambda_types::beacon::containers::{electra, gloas};
 use ethlambda_types::beacon::primitives::{BLS_SIGNATURE_SIZE, BlsPubkey, BlsSignature, Root};
 use serde::Serialize;
+use tokio::sync::Semaphore;
 
 use crate::beacon_node::dto::{encode_hex, parse_signature};
 use crate::error::{Error, Result};
@@ -37,10 +38,26 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 /// Web3Signer's answer when its slashing protection refused the message.
 const SLASHING_PROTECTION_REFUSED: u16 = 412;
 
+/// The most requests one signer is sent at once; the rest of a batch waits
+/// its turn.
+///
+/// The client speaks HTTP/1.1, so every request in flight is a connection of
+/// its own. A duty asks for all its signatures together, and uncapped that is
+/// a socket per key: a thousand remote keys at an epoch boundary would open a
+/// thousand, past the usual 1024 descriptor limit, at which point `connect`
+/// fails and every remote signature with it. Capped, a signer costs this many
+/// descriptors however many keys it holds, and its connections are reused
+/// from one capful to the next. A healthy signer answers in milliseconds, so
+/// a thousand signatures still fit many times over in the signing budget.
+pub const MAX_CONCURRENT_REQUESTS: usize = 64;
+
 /// One remote signer, shared by every validator whose key it holds.
 pub struct Web3Signer {
     base_url: String,
     client: reqwest::Client,
+    /// One permit per request in flight; see [`MAX_CONCURRENT_REQUESTS`].
+    /// Per signer, so one that is slow holds up only its own keys.
+    in_flight: Semaphore,
 }
 
 impl Web3Signer {
@@ -51,6 +68,11 @@ impl Web3Signer {
     /// is not free: callers that hold a lock build it before taking the lock
     /// (see [`crate::keys::ValidatorStore::insert_remote_signer`]).
     pub fn new(url: &str) -> Result<Self> {
+        Self::with_cap(url, MAX_CONCURRENT_REQUESTS)
+    }
+
+    /// [`Self::new`], sent at most `cap` requests at once.
+    pub(crate) fn with_cap(url: &str, cap: usize) -> Result<Self> {
         let base_url = url.trim_end_matches('/').to_string();
         // Every error below names the URL as `redact` renders it, never as
         // given: these errors are logged, at startup and on import, and a URL
@@ -84,7 +106,11 @@ impl Web3Signer {
             .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(|err| invalid(&format!("could not build an HTTP client: {err}")))?;
-        Ok(Self { base_url, client })
+        Ok(Self {
+            base_url,
+            client,
+            in_flight: Semaphore::new(cap),
+        })
     }
 
     /// The signer's base URL, with any trailing slash already stripped.
@@ -109,6 +135,19 @@ impl Web3Signer {
             pubkey: *pubkey,
             reason,
         };
+
+        // Held until the answer is read. Waiting for one is part of what the
+        // caller's deadline bounds, and a request dropped at that deadline
+        // gives its permit back at once.
+        let _permit = self.in_flight.acquire().await.map_err(|_| {
+            failed(format!(
+                "remote signer {} is no longer in use",
+                self.base_url
+            ))
+        })?;
+        // The round trip alone, from here to the answer or the failure: the
+        // wait for a permit above is this client's own queue, not the signer.
+        let _timing = crate::metrics::time_remote_signer_request();
 
         let response = self
             .client

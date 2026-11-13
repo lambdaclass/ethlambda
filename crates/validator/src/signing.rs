@@ -30,11 +30,12 @@ use ethlambda_types::beacon::signing::{
 };
 
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 
 use crate::error::{Error, Result};
 use crate::keys::web3signer::{
@@ -80,6 +81,8 @@ pub struct SigningContext {
     pub genesis_validators_root: Root,
     /// Selection proofs already produced; see [`Self::sign_selection_proof`].
     selection_proofs: Mutex<HashMap<(BlsPubkey, Slot), BlsSignature>>,
+    /// One permit per remote signature being verified; see [`Self::verified`].
+    verifications: Arc<Semaphore>,
 }
 
 /// How long a selection proof is remembered past its slot: the duty
@@ -129,11 +132,41 @@ where
 
 impl SigningContext {
     pub fn new(config: Config, genesis_validators_root: Root) -> Self {
+        // One verification per core: each is a pairing, pure CPU, so more at
+        // once would only take turns on the same cores.
+        let cores = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
         Self {
             config,
             genesis_validators_root,
             selection_proofs: Mutex::new(HashMap::new()),
+            verifications: Arc::new(Semaphore::new(cores)),
         }
+    }
+
+    /// Whether `signature` is `pubkey`'s signature over `root`, checked on
+    /// the blocking pool rather than on the task that asked.
+    ///
+    /// A verification is a pairing, about a millisecond of CPU with no await
+    /// in it. Run inline, a batch's answers would be verified one after
+    /// another on the duty task, where [`sign_all`]'s deadline cannot cut in:
+    /// a thousand remote keys would hold the duty loop for a second or more
+    /// that the signing budget does not bound, ahead of whatever the slot
+    /// owes next. Here they run a core each, and waiting for a core is an
+    /// await the budget covers.
+    async fn verified(&self, pubkey: BlsPubkey, root: Root, signature: BlsSignature) -> bool {
+        let Ok(permit) = self.verifications.clone().acquire_owned().await else {
+            return false;
+        };
+        // The permit goes into the blocking task and is released when the
+        // pairing ends, not when this future is dropped: a batch cut off at
+        // its deadline leaves its verifications running, and they must still
+        // count against the bound.
+        let verification = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            verifies(&pubkey, root, &signature)
+        });
+        // A verification that did not run to its end vouches for nothing.
+        verification.await.unwrap_or(false)
     }
 
     /// The domain for `domain_type` as of `epoch`.
@@ -364,7 +397,7 @@ impl SigningContext {
                 // `is_aggregator` on bytes that are not the selection proof.
                 // A local key needs no such check: its signature is computed
                 // here, over this root.
-                if !verifies(pubkey, root, &signature) {
+                if !self.verified(*pubkey, root, signature).await {
                     return Err(Error::Signing {
                         pubkey: *pubkey,
                         reason: format!(
@@ -432,14 +465,24 @@ impl SigningContext {
     /// aggregation tick, and for a remote key each ask is a round trip; a
     /// remembered proof is the very signature the signer would return. Only
     /// a proof that was produced is remembered, so a failure is asked again.
+    ///
+    /// The store is asked before the memory is. A proof outlives its key
+    /// there, so answering from it first would hand a key the keymanager
+    /// deleted mid-epoch its selection: the aggregation would go on to fetch
+    /// an aggregate it then cannot sign. A key this client no longer holds
+    /// is [`Error::UnknownValidator`] here, as it is on every other path.
     pub async fn sign_selection_proof(
         &self,
         store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
         slot: Slot,
     ) -> Result<BlsSignature> {
-        if let Some(proof) = self.selection_proofs().get(&(*pubkey, slot)) {
-            return Ok(*proof);
+        if !store.read().await.contains(pubkey) {
+            return Err(Error::UnknownValidator(*pubkey));
+        }
+        let remembered = self.selection_proofs().get(&(*pubkey, slot)).copied();
+        if let Some(proof) = remembered {
+            return Ok(proof);
         }
         let proof = self
             .sign(
@@ -747,29 +790,25 @@ mod tests {
         );
     }
 
+    /// A remembered proof is for a validator this client serves. Once the
+    /// keymanager has deleted the key its proofs answer nothing, so the
+    /// aggregation stops at the selection rather than fetching an aggregate
+    /// it then cannot sign.
     #[tokio::test]
-    async fn a_selection_proof_is_remembered_once_produced() {
+    async fn a_remembered_selection_proof_is_not_handed_out_for_a_deleted_key() {
         let (store, pubkey) = store_with_key();
         let context = context();
-        let first = context
+        context
             .sign_selection_proof(&store, &pubkey, 3200)
             .await
             .expect("signs");
 
-        // With the key gone, only the remembered proof can answer.
         assert!(store.write().await.remove(&pubkey));
-        let again = context
+        let err = context
             .sign_selection_proof(&store, &pubkey, 3200)
             .await
-            .expect("remembered");
-        assert_eq!(first, again);
-        assert!(
-            context
-                .sign_selection_proof(&store, &pubkey, 3201)
-                .await
-                .is_err(),
-            "another slot is another proof"
-        );
+            .expect_err("the key is gone");
+        assert!(matches!(err, Error::UnknownValidator(_)), "got {err:?}");
     }
 
     #[test]
@@ -1179,6 +1218,7 @@ mod tests {
         use axum::extract::{Path, State};
         use axum::http::StatusCode;
         use axum::routing::post;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::{Arc, Mutex};
 
         /// What the fake signer does: records every request and answers with
@@ -1187,6 +1227,10 @@ mod tests {
         struct Fake {
             requests: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
             answer: Arc<Mutex<Answer>>,
+            /// How many requests are being answered right now, and the most
+            /// that ever were at once.
+            in_flight: Arc<AtomicUsize>,
+            peak: Arc<AtomicUsize>,
         }
 
         #[derive(Clone, Copy)]
@@ -1194,6 +1238,8 @@ mod tests {
             /// The test key's signature over the request's `signingRoot`, as
             /// a signer holding that key would give.
             Signature,
+            /// The same, after a pause long enough for requests to overlap.
+            SlowSignature,
             /// A well-formed signature over the request's `signingRoot`, by a
             /// key other than the one asked for.
             AnotherKeysSignature,
@@ -1237,8 +1283,17 @@ mod tests {
                     format!("{{\"signature\":\"0x{signature}\"}}"),
                 )
             };
-            match *fake.answer.lock().expect("lock") {
-                Answer::Signature => signed(signature_hex(&secret(), &root)),
+            let answer = *fake.answer.lock().expect("lock");
+            if matches!(answer, Answer::SlowSignature) {
+                let now = fake.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                fake.peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                fake.in_flight.fetch_sub(1, Ordering::SeqCst);
+            }
+            match answer {
+                Answer::Signature | Answer::SlowSignature => {
+                    signed(signature_hex(&secret(), &root))
+                }
                 Answer::AnotherKeysSignature => signed(signature_hex(&other_secret(), &root)),
                 Answer::AnotherRootsSignature => signed(signature_hex(&secret(), &[0x11; 32])),
                 Answer::Garbage => signed("ab".repeat(96)),
@@ -1254,6 +1309,8 @@ mod tests {
             let fake = Fake {
                 requests: Arc::new(Mutex::new(Vec::new())),
                 answer: Arc::new(Mutex::new(answer)),
+                in_flight: Arc::new(AtomicUsize::new(0)),
+                peak: Arc::new(AtomicUsize::new(0)),
             };
             let app = Router::new()
                 .route("/api/v1/eth2/sign/{pubkey}", post(handle))
@@ -1380,6 +1437,72 @@ mod tests {
                 assert!(!err.is_retryable());
                 assert_eq!(fake.requests.lock().expect("lock").len(), 1, "asked once");
             }
+        }
+
+        /// The signer is asked for a selection proof once: the same key and
+        /// slot again is answered from memory, another slot is another ask.
+        #[tokio::test]
+        async fn a_selection_proof_is_remembered_once_produced() {
+            let (fake, url) = serve(Answer::Signature).await;
+            let (store, pubkey) = remote_store(&url);
+            let context = context();
+
+            let first = context
+                .sign_selection_proof(&store, &pubkey, 3200)
+                .await
+                .expect("signs");
+            let again = context
+                .sign_selection_proof(&store, &pubkey, 3200)
+                .await
+                .expect("remembered");
+            assert_eq!(first, again);
+            assert_eq!(fake.requests.lock().expect("lock").len(), 1, "asked once");
+
+            context
+                .sign_selection_proof(&store, &pubkey, 3201)
+                .await
+                .expect("signs");
+            assert_eq!(
+                fake.requests.lock().expect("lock").len(),
+                2,
+                "another slot is another proof"
+            );
+        }
+
+        /// A batch larger than the signer's cap is sent a capful at a time,
+        /// and every signature in it still arrives. Without the cap each
+        /// request in flight is a socket of its own, and a thousand keys at
+        /// an epoch boundary are a thousand sockets.
+        #[tokio::test]
+        async fn a_signer_is_never_sent_more_than_its_cap_at_once() {
+            use crate::keys::Web3Signer;
+
+            const CAP: usize = 4;
+            const ASKED: usize = 4 * CAP;
+
+            let (fake, url) = serve(Answer::SlowSignature).await;
+            let pubkey = ValidatorStore::derive_pubkey(&secret()).expect("a valid key");
+            let signer = Arc::new(Web3Signer::with_cap(&url, CAP).expect("a usable url"));
+            let mut store = ValidatorStore::new();
+            store.insert_remote_signer(pubkey, signer);
+            let store = RwLock::new(store);
+            let context = context();
+
+            let proofs = sign_all((0..ASKED as Slot).map(|slot| {
+                (
+                    pubkey,
+                    context.sign_selection_proof(&store, &pubkey, 3200 + slot),
+                )
+            }))
+            .await;
+
+            assert!(proofs.iter().all(Result::is_ok), "every proof arrives");
+            assert_eq!(fake.requests.lock().expect("lock").len(), ASKED);
+            assert_eq!(
+                fake.peak.load(Ordering::SeqCst),
+                CAP,
+                "the batch fills the cap and never passes it"
+            );
         }
 
         /// A selection proof that does not verify is not remembered: the
