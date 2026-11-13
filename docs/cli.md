@@ -121,6 +121,9 @@ from a normal build.
 | `--builder` | none | Base URL of a builder API endpoint, normally MEV-Boost (e.g. `http://127.0.0.1:18550`). Without it every block is built locally |
 | `--builder-header-timeout` | `1000` | Milliseconds block production waits for the builder's bid; also sent to the builder as `X-Timeout-Ms`. Requires `--builder` |
 | `--builder-follow-redirects` | off | Follow the builder's 307 and 308 redirects, up to ten per call, never from https to http. A 301, 302 or 303 is not followed even then, since following one resends a POST as a GET without its body. Off, every redirect fails the call with an error naming its target, so registrations and signed blocks go only where `--builder` points; on, so does any redirect it does not follow. Requires `--builder` |
+| `--builder-fallback-skips` | `3` | Build locally when more than this many consecutive slots right before the proposal had no block (the circuit breaker). Requires `--builder` |
+| `--builder-fallback-skips-per-epoch` | `8` | Build locally when more than this many of the slots in the epoch's worth before the proposal had no block. Requires `--builder` |
+| `--builder-fallback-epochs-since-finalization` | `3` | Build locally when the proposal is more than this many epochs past the finalized checkpoint. Requires `--builder` |
 
 Accepted range is `CUSTODY_REQUIREMENT` to `NUMBER_OF_CUSTODY_GROUPS` (4 to
 128), enforced at parse time rather than clamped: serving a different set than
