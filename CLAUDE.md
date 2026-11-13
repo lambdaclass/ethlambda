@@ -45,7 +45,7 @@ crates/
     ├─ metrics/             # Prometheus re-exports, TimingGuard, gather utilities
     └─ test-fixtures/       # Spec-fixture loading (prod dep of rpc's Hive test driver)
   net/
-    ├─ api/                 # Actor protocol traits wiring BlockChain ↔ P2P
+    ├─ api/                 # Actor protocol traits wiring BlockChain ↔ P2P, plus the shared sync-gate thresholds (`sync.rs`)
     ├─ p2p/                 # libp2p: gossipsub + req-resp (Status, BlocksByRoot, BlocksByRange, gloas envelopes)
     │   ├─ src/gossipsub/   # Topic encoding, message handling
     │   ├─ src/req_resp/    # Request/response codec and handlers
@@ -379,7 +379,7 @@ actual_slot = finalized_slot + 1 + relative_index
     Both serve from the checkpoint-anchored store, and `build_status` advertises it
     (head, finalized checkpoint, and the anchor's slot as `earliest_available_slot`), so peers
     have a reason to ask. Asking runs too: a peer's Status starts a range session from the
-    higher of `P2PServer::beacon_fetched_through` (the highest slot a range answer handed to
+    higher of `P2PServer::range_fetched_through` (the highest slot a range answer handed to
     the chain actor, since the store's head trails a delivered batch by the whole actor
     mailbox) and the store's head (which gossip imports move and the watermark never sees).
     Fetched blocks reach the actor as `BlockSource::Sync`.

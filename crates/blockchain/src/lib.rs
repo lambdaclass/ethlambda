@@ -564,7 +564,7 @@ pub struct BlockChainServer {
 
     /// Shared, read-only mirror of `sync_status` for readers outside the actor
     /// (the RPC `/lean/v0/node/syncing` endpoint). Written from
-    /// `update_sync_status` with the same `SyncStatus` fed to the metric.
+    /// `judge_sync_status` with the same `SyncStatus` fed to the metric.
     sync_status_controller: SyncStatusController,
 
     /// Chain-event publication: the bus and what decides what goes out on
@@ -996,7 +996,13 @@ impl BlockChainServer {
 
         // Update current slot metric
         metrics::update_current_slot(slot);
-        self.update_sync_status(slot);
+        // Beacon judges the gate in the head recompute this tick ends in (see
+        // `update_head_from_fork_choice`), off the head it has just read;
+        // judging here too would only be overwritten moments later, at the
+        // cost of another whole-block decode.
+        if self.store.chain() == Chain::Lean {
+            self.update_sync_status(slot);
+        }
 
         // Snapshot the aggregator flag once per tick so all read sites within
         // the tick see a consistent value even if the admin API toggles it
@@ -2317,12 +2323,13 @@ impl BlockChainServer {
     /// And where the sync gate is judged between ticks, for the same reason
     /// the head is: on a catch-up the tick waits behind every block range sync
     /// forwarded, so a gate judged only there kept answering `Synced` to the
-    /// validator client for the whole catch-up, however far behind. Judged
-    /// before the `forkchoiceUpdated` round trip, so a slow execution client
-    /// does not delay it by one more engine call.
+    /// validator client for the whole catch-up, however far behind. The
+    /// judgment is in [`Self::update_head_from_fork_choice`], so it lands
+    /// before the `forkchoiceUpdated` round trip (a slow execution client does
+    /// not delay it by one more engine call) and again whenever an `INVALID`
+    /// verdict moves the head inside that call.
     async fn recompute_beacon_head(&mut self) -> HeadTimings {
         let mut timings = self.update_head_from_fork_choice();
-        self.update_sync_status(self.wall_clock_slot());
         if let Some((start, end)) = self.notify_forkchoice_updated().await {
             timings.fcu_start = Some(start);
             timings.fcu_end = Some(end);
@@ -2503,6 +2510,14 @@ impl BlockChainServer {
     /// A failure here means fork choice could not find a head (for instance
     /// every known block is unjustifiable), which is a condition to log and
     /// wait out, not a reason to crash a follower.
+    ///
+    /// Also the beacon sync gate's one judge, since the gate reads the head:
+    /// every tick, arrival and envelope release ends here through
+    /// [`Self::recompute_beacon_head`], and so does an `INVALID`
+    /// `forkchoiceUpdated` verdict that moves the head back, which would
+    /// otherwise leave the gate judging a head that no longer is. Judged off
+    /// the head read here rather than reading it again: on beacon that read is
+    /// a whole-block decode.
     pub(crate) fn update_head_from_fork_choice(&mut self) -> HeadTimings {
         let _timing = metrics::time_beacon_head_compute();
         let mut timings = HeadTimings {
@@ -2518,13 +2533,18 @@ impl BlockChainServer {
             // what this does: the head simply does not move.
             warn!(%err, "Failed to compute beacon head");
             timings.head_end = Some(Instant::now());
+            // The head did not move, but the clock did.
+            self.update_sync_status(self.wall_clock_slot());
             return timings;
         }
         timings.head_end = Some(Instant::now());
-        if let Some((head_slot, _)) = self.store.beacon_head() {
+        let head = self.store.beacon_head();
+        if let Some((head_slot, _)) = head {
             metrics::update_head_slot(head_slot);
         }
-        self.pin_head_shufflings();
+        self.pin_head_shufflings(head);
+        let head_slot = head.map_or(0, |(slot, _)| slot);
+        self.judge_sync_status(self.wall_clock_slot(), head_slot);
         timings
     }
 
@@ -2539,8 +2559,8 @@ impl BlockChainServer {
     /// longer cached (a reorg back to an old block) keeps the previous head's
     /// pinning until a later head is resident, which at worst lets one of its
     /// shufflings be evicted and rebuilt, never serves a wrong committee.
-    fn pin_head_shufflings(&mut self) {
-        let Some((_, head_root)) = self.store.beacon_head() else {
+    fn pin_head_shufflings(&mut self, head: Option<(u64, H256)>) {
+        let Some((_, head_root)) = head else {
             return;
         };
         let committees = self.store.committee_cache();
@@ -3594,35 +3614,36 @@ impl BlockChainServer {
         }
     }
 
+    /// [`Self::judge_sync_status`] off the head read through
+    /// [`Self::head_slot`], which is where the per-chain part of that lives
+    /// (lean's `Store::head_slot` and beacon's `Store::beacon_head` decode
+    /// different tables). For a caller that has not just read the head.
+    fn update_sync_status(&mut self, current_slot: u64) {
+        let head_slot = self.head_slot();
+        self.judge_sync_status(current_slot, head_slot);
+    }
+
     /// Refresh the sync-status tracker and its two outputs (the
     /// `lean_node_sync_status` metric and [`SyncStatusController`]).
     ///
-    /// Reads the head through [`Self::head_slot`], which is where the
-    /// per-chain part of that lives (lean's `Store::head_slot` and beacon's
-    /// `Store::beacon_head` decode different tables), and the network's head
-    /// from [`Store::network_head`], the head the node's peers report in
-    /// `Status`. The tracker itself is chain-agnostic, with per-chain
-    /// thresholds; see [`SyncThresholds`]. On a beacon follower, once the clock
-    /// is past a fork the node does not follow (see
-    /// [`Self::clock_is_past_followed_forks`]) the network is treated as being
-    /// at the clock, since no peer on that fork can tell it so.
-    fn update_sync_status(&mut self, current_slot: u64) {
-        let head_slot = self.head_slot();
-        let network_head = match self.store.chain() {
-            Chain::Beacon
-                if Self::clock_is_past_followed_forks(
-                    &self.store.config(),
-                    current_slot,
-                    head_slot,
-                ) =>
-            {
-                Some(current_slot)
-            }
-            Chain::Beacon | Chain::Lean => self.store.network_head(),
+    /// The network's head comes from [`Store::network_head`], the highest head
+    /// the node's peers report in `Status` that it does not already hold. The
+    /// tracker itself is chain-agnostic, with per-chain thresholds; see
+    /// [`SyncThresholds`]. On a beacon follower, once the clock is past a fork
+    /// the node does not follow (see [`Self::clock_is_past_followed_forks`])
+    /// the network is treated as being at the clock, since no peer on that
+    /// fork can tell it so.
+    fn judge_sync_status(&mut self, current_slot: u64, head_slot: u64) {
+        let past_followed_forks = self.store.chain() == Chain::Beacon
+            && Self::clock_is_past_followed_forks(&self.store.config(), current_slot, head_slot);
+        let status = if past_followed_forks {
+            self.sync_status
+                .update_with_network_at_clock(current_slot, head_slot)
+        } else {
+            let network_head = self.store.network_head();
+            self.sync_status
+                .update(current_slot, head_slot, network_head)
         };
-        let status = self
-            .sync_status
-            .update(current_slot, head_slot, network_head);
         metrics::set_node_sync_status(status);
         self.sync_status_controller.set(status);
     }
@@ -5295,12 +5316,19 @@ mod tests {
     /// with the head still at the anchor (slot 0).
     const THREE_EPOCHS: u64 = 3 * preset::SLOTS_PER_EPOCH;
 
+    /// Start the tracker's clock at slot 0, so its startup hold (an epoch) is
+    /// over by [`THREE_EPOCHS`] and the peers' reports decide.
+    fn past_startup(server: &mut BlockChainServer) {
+        server.update_sync_status(0);
+    }
+
     #[test]
     fn the_clock_reaching_a_followed_fork_does_not_force_syncing() {
         // Gloas is followed, so the fork rule stays out of it and the peers
         // decide: every peer as stale as we are is a stalled network, read as
         // synced, the same as when no fork is scheduled.
         let mut server = syncing_server(Some(1));
+        past_startup(&mut server);
         server.store.set_network_head(Some(0));
         server.update_sync_status(THREE_EPOCHS);
         assert_eq!(
@@ -5314,6 +5342,7 @@ mod tests {
         // The same silence with no gloas scheduled is a stalled network, which
         // the tracker deliberately reports as synced.
         let mut server = syncing_server(None);
+        past_startup(&mut server);
         server.store.set_network_head(Some(0));
         server.update_sync_status(THREE_EPOCHS);
         assert_eq!(
@@ -5329,8 +5358,27 @@ mod tests {
         // used to read synced, since the freshest block it knew of was its own
         // head.
         let mut server = syncing_server(None);
+        past_startup(&mut server);
         server.store.set_network_head(Some(THREE_EPOCHS));
         server.update_sync_status(THREE_EPOCHS);
+        assert_eq!(
+            server.sync_status_controller.get(),
+            crate::metrics::SyncStatus::Syncing
+        );
+    }
+
+    #[test]
+    fn a_head_recompute_judges_the_gate_on_its_own() {
+        // An `INVALID` `forkchoiceUpdated` verdict moves the head through
+        // `update_head_from_fork_choice` alone, inside the engine call and
+        // after `recompute_beacon_head` has judged the gate. The gate has to
+        // follow that head too, so the recompute itself is what judges it.
+        let mut server = syncing_server(None);
+        past_startup(&mut server);
+        server
+            .store
+            .set_network_head(Some(server.wall_clock_slot()));
+        server.update_head_from_fork_choice();
         assert_eq!(
             server.sync_status_controller.get(),
             crate::metrics::SyncStatus::Syncing
@@ -5346,6 +5394,7 @@ mod tests {
         // is unknown is enough: whatever becomes of a block, its arrival ends
         // in the head recompute.
         let mut server = syncing_server(None);
+        past_startup(&mut server);
         let orphan = || bare_block(1, H256::repeat_byte(0xee));
 
         // Peers as stale as the node: a stall, synced.

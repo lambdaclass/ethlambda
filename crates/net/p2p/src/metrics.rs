@@ -354,7 +354,7 @@ static LEAN_BEACON_GOSSIP_MESSAGES_TOTAL: LazyLock<IntCounterVec> = LazyLock::ne
 static LEAN_BEACON_STATUS_DIGEST_MISMATCH_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "lean_beacon_status_digest_mismatch_total",
-        "Beacon Status requests whose fork digest did not match ours"
+        "Peers whose beacon Status moved onto a fork digest we do not hold, counted once per move"
     )
     .unwrap()
 });
@@ -474,6 +474,9 @@ pub fn inc_beacon_gossip_verdict_expired(kind: &str) {
         .inc();
 }
 
+/// Count a peer whose `Status` has moved onto a fork digest this node does not
+/// hold: once when it moves there, not on every `Status` it sends from there,
+/// so the periodic refresh does not inflate it with connection age.
 pub fn inc_beacon_status_digest_mismatch() {
     LEAN_BEACON_STATUS_DIGEST_MISMATCH_TOTAL.inc();
 }

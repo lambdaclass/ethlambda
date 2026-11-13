@@ -21,6 +21,8 @@ use spawned_concurrency::error::ActorError;
 use spawned_concurrency::message::Message;
 use spawned_concurrency::protocol;
 
+pub mod sync;
+
 // --- Protocol: BlockChain -> P2P ---
 
 #[protocol]

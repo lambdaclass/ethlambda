@@ -68,6 +68,7 @@ use ethlambda_state_transition::beacon::{
 use ethlambda_storage::{Chain, Store};
 use ethlambda_types::beacon::preset::{MAX_VALIDATORS_PER_COMMITTEE, SLOTS_PER_EPOCH};
 use ethlambda_types::primitives::H256;
+use ethlambda_types::time::unix_now_ms;
 use ethrex_p2p::types::NodeRecord;
 use ethrex_rlp::decode::RLPDecode;
 use futures::StreamExt;
@@ -101,7 +102,7 @@ use crate::{
         publish_attestation, publish_beacon_aggregate, publish_beacon_attestation,
         publish_beacon_block, publish_beacon_operation, publish_block,
     },
-    lean::protocols::MAX_REQUEST_BLOCKS,
+    lean::{messages::Status, protocols::MAX_REQUEST_BLOCKS},
     req_resp::{
         Codec, MAX_COMPRESSED_PAYLOAD_SIZE, ReqResp, ReqRespEvent, Request, build_status,
         fetch_block_from_peer, fetch_data_columns_from_peer, fetch_envelope_from_peer,
@@ -1198,7 +1199,8 @@ impl P2P {
 
         // Seeded from the anchor the store was bootstrapped at, so the first
         // range request starts where the chain does rather than at slot 0.
-        let beacon_fetched_through = match store.chain() {
+        // Lean reads its head beside it, which is the same floor.
+        let range_fetched_through = match store.chain() {
             Chain::Beacon => store.beacon_head().map_or(0, |(slot, _)| slot),
             Chain::Lean => 0,
         };
@@ -1227,7 +1229,7 @@ impl P2P {
             pending_column_requests: HashMap::new(),
             outbound_requests: HashMap::new(),
             range_sync_state: None,
-            beacon_fetched_through,
+            range_fetched_through,
             peer_heads: Default::default(),
             bootnode_addrs: built.bootnode_addrs,
             node_names,
@@ -1390,11 +1392,12 @@ pub struct P2PServer {
     pub(crate) outbound_requests: HashMap<ReqRespRequestId, PendingRequestKind>,
     pub(crate) range_sync_state: Option<RangeSyncState>,
 
-    /// Highest beacon slot a range answer has handed to the chain actor,
-    /// whether or not it has been imported yet. Gossip never advances it, so
-    /// range sync reads it beside the store's head; see `beacon_sync_target`.
-    pub(crate) beacon_fetched_through: u64,
-    /// Every connected peer's latest `Status` head, aggregated onto
+    /// Highest slot a range answer has handed to the chain actor, whether or
+    /// not it has been imported yet, on either chain. Gossip never advances
+    /// it, so range sync reads it beside the store's head; see
+    /// `range_sync_target`.
+    pub(crate) range_fetched_through: u64,
+    /// Every connected peer's latest `Status` head, published on
     /// `Store::network_head` for the sync tracker. See [`peer_heads`].
     pub(crate) peer_heads: peer_heads::PeerHeads,
     bootnode_addrs: HashMap<PeerId, Vec<Multiaddr>>,
@@ -1768,17 +1771,7 @@ impl P2PServer {
             ctx.clone(),
             p2p_protocol::RefreshPeerStatus,
         );
-        let wall_slot = peer_heads::wall_clock_slot(self);
-        let interval = status_refresh_slots(&self.store);
-        let peers = self.peer_heads.due_for_refresh(
-            self.connected_peers.keys().copied(),
-            wall_slot,
-            interval,
-        );
-        for peer in peers {
-            self.peer_heads.begin_refresh(peer);
-            request_status(self, peer).await;
-        }
+        self.refresh_due_peer_statuses().await;
     }
 
     /// The deadline of a range batch held back for custody. Scheduled once,
@@ -1987,13 +1980,16 @@ async fn fetch_missing_columns(server: &mut P2PServer, block_root: H256, columns
 
 // --- Manual Handler for swarm events ---
 
-/// Slots between two `Status` requests to the same peer; see [`peer_heads`]
-/// for the pace on each chain.
-fn status_refresh_slots(store: &Store) -> u64 {
-    match store.chain() {
-        Chain::Lean => peer_heads::STATUS_REFRESH_SLOTS_LEAN,
-        Chain::Beacon => peer_heads::STATUS_REFRESH_SLOTS_BEACON,
-    }
+/// The slot the wall clock is in, on the store's time grid. Zero before
+/// genesis.
+///
+/// The one p2p-wide answer: the builder market's gossip verdicts and the
+/// peer-head tracker all read "now" through it. [`beacon::BeaconWire::wall_slot`]
+/// is the same formula off the wire's copy of the config, for code that holds
+/// a wire rather than a store.
+pub(crate) fn wall_clock_slot(store: &Store) -> u64 {
+    let grid = store.config().time_grid();
+    unix_now_ms().saturating_sub(grid.genesis_time_ms()) / grid.milliseconds_per_slot.max(1)
 }
 
 /// The refresh timer's period: one slot, each tick asking that slot's share
@@ -2002,26 +1998,63 @@ fn status_refresh_tick(store: &Store) -> Duration {
     Duration::from_millis(store.config().slot_duration_ms)
 }
 
-/// Send `peer` our `Status`, asking for its own: the periodic refresh. The
-/// handshake in `ConnectionEstablished` sends the same request, with its own
-/// logging around it.
-async fn request_status(server: &P2PServer, peer: PeerId) {
-    // Built before the send, so no borrow of `server.wire` is alive across it.
-    let beacon_status = server.wire.beacon().map(|wire| {
-        beacon::handler::build_status(&server.store, wire, beacon::handler::StatusVersion::V1)
-    });
-    match beacon_status {
-        Some(status) => beacon::handler::send_status(server, peer, status).await,
-        None => {
-            let our_status = build_status(&server.store);
-            server
-                .swarm_handle
-                .send_request(
-                    peer,
-                    Request::LeanStatus(our_status),
-                    ReqRespProtocol::LeanStatus,
-                )
-                .await;
+/// The `Status` the periodic refresh sends, built once per refresh tick
+/// however many peers it asks: on beacon, building one decodes the head
+/// block.
+enum RefreshStatus {
+    Lean(Status),
+    /// Built in v2, the superset; a peer that speaks only v1 gets it with
+    /// `earliest_available_slot` dropped.
+    Beacon(beacon::messages::StatusV2),
+}
+
+impl RefreshStatus {
+    fn build(server: &P2PServer) -> Self {
+        match server.wire.beacon() {
+            Some(wire) => Self::Beacon(beacon::handler::build_status_v2(&server.store, wire)),
+            None => Self::Lean(build_status(&server.store)),
+        }
+    }
+}
+
+impl P2PServer {
+    /// Re-ask this slot's share of the connected peers that are due for their
+    /// `Status`; see [`peer_heads`]. The half of
+    /// [`Self::handle_refresh_peer_status`] that needs no actor context.
+    ///
+    /// Asks each beacon peer in the version its last exchange ran on, so a
+    /// peer that has dropped `status/1` is not refused (and then retried) on
+    /// every refresh.
+    pub(crate) async fn refresh_due_peer_statuses(&mut self) {
+        let wall_slot = wall_clock_slot(&self.store);
+        let interval = peer_heads::thresholds(&self.store).status_refresh_slots;
+        let peers = self.peer_heads.due_for_refresh(
+            self.connected_peers.keys().copied(),
+            wall_slot,
+            interval,
+        );
+        if peers.is_empty() {
+            return;
+        }
+        let status = RefreshStatus::build(self);
+        for peer in peers {
+            self.peer_heads.begin_refresh(peer);
+            match &status {
+                RefreshStatus::Beacon(v2) => {
+                    let version = self.peer_heads.status_version(&peer);
+                    let status = beacon::handler::status_in_version(v2, version);
+                    beacon::handler::send_status(self, peer, status).await;
+                }
+                RefreshStatus::Lean(status) => {
+                    self.swarm_handle
+                        .send_request(
+                            peer,
+                            Request::LeanStatus(status.clone()),
+                            ReqRespProtocol::LeanStatus,
+                        )
+                        .await;
+                }
+            }
         }
     }
 }
@@ -3128,7 +3161,7 @@ pub(crate) mod test_support {
             pending_column_requests: HashMap::new(),
             outbound_requests: HashMap::new(),
             range_sync_state: None,
-            beacon_fetched_through: 0,
+            range_fetched_through: 0,
             peer_heads: Default::default(),
             bootnode_addrs: HashMap::new(),
             node_names: HashMap::new(),

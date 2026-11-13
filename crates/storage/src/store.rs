@@ -1200,10 +1200,10 @@ pub struct Store {
     /// node's own API), which is why it lives on the `Store` all three share.
     /// See [`ObservedLiveness`]. Always empty on lean.
     observed_liveness: Arc<ObservedLiveness>,
-    /// The head slot this node's peers report, as P2P last aggregated it from
-    /// their `Status` messages, or [`NO_NETWORK_HEAD`] while no connected peer
-    /// has reported one. Written by P2P, read by the chain actor's sync
-    /// tracker; see [`Store::network_head`].
+    /// The highest head slot this node's peers report in `Status` that it has
+    /// not already imported, as P2P last published it, or [`NO_NETWORK_HEAD`]
+    /// while no connected peer reports one. Written by P2P, read by the chain
+    /// actor's sync tracker; see [`Store::network_head`].
     network_head: Arc<AtomicU64>,
     /// The total active balance per epoch, shared the way
     /// [`Self::committee_cache`] is: by the chain actor's state transition
@@ -3304,15 +3304,16 @@ impl Store {
         &self.observed_liveness
     }
 
-    /// The head slot this node's peers report, or `None` while no connected
-    /// peer has reported one.
+    /// The highest head slot this node's peers report that it has not already
+    /// imported, or `None` while no connected peer reports one.
     ///
     /// The sync tracker's evidence that the network is ahead of this node. It
     /// is a peer *claim*, not a verified block: P2P drops a head past the wall
-    /// clock and asks several peers to agree before the value moves, and the
-    /// tracker additionally requires the node's own head to trail the clock,
-    /// so no claim alone can stop a node that is current. Runtime-only and
-    /// shared by every clone of this `Store`.
+    /// clock and does not count a head this node already holds, and the
+    /// tracker requires the node's own head to trail the clock, so no claim
+    /// can stop a node that is current, and gives up on a lead its head does
+    /// not advance towards, so no claim can hold a stalled node for long.
+    /// Runtime-only and shared by every clone of this `Store`.
     pub fn network_head(&self) -> Option<u64> {
         let slot = self.network_head.load(Ordering::Relaxed);
         (slot != NO_NETWORK_HEAD).then_some(slot)
