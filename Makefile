@@ -82,7 +82,7 @@ update: ## 📦 Update dependencies under the publish-age cooldown (UPDATE_ARGS=
 cooldown-check: ## 🔎 Fail if a lockfile pins crates younger than the publish-age cooldown
 	@rustup toolchain install $(RESOLVER_TOOLCHAIN) --profile minimal > /dev/null && \
 	status=0; \
-	for manifest in Cargo.toml tooling/event-monitor/Cargo.toml; do \
+	for manifest in Cargo.toml tooling/event-monitor/Cargo.toml fuzz/Cargo.toml; do \
 		if ! out=$$(cargo +$(RESOLVER_TOOLCHAIN) update --dry-run -Z min-publish-age --manifest-path $$manifest 2>&1); then \
 			echo "WARNING: publish-age cooldown probe failed for $$manifest:"; echo "$$out" | grep -v "^ *Updating " | head -20; continue; \
 		fi; \
@@ -289,3 +289,21 @@ docs: ## 📚 Generate the documentation site under ./book
 
 docs-serve: ## 📖 Serve the documentation locally with live reload
 	mdbook serve --open
+
+# Fuzzing. The `fuzz/` crate is its own workspace on the nightly its
+# rust-toolchain.toml pins; `cargo fuzz` is `cargo install cargo-fuzz`.
+# See docs/fuzzing.md.
+FUZZ_SECONDS ?= 60
+FUZZ_ARGS ?= -timeout=10 -rss_limit_mb=2048
+
+fuzz-list: ## 🎯 List the fuzz targets
+	cd fuzz && cargo fuzz list
+
+fuzz: ## 🎯 Run one fuzz target until stopped (FUZZ_TARGET=<name>; FUZZ_ARGS go to libFuzzer)
+	@test -n "$(FUZZ_TARGET)" || { echo "FUZZ_TARGET is required, see 'make fuzz-list'"; exit 1; }
+	cd fuzz && cargo fuzz run $(FUZZ_TARGET) -- $(FUZZ_ARGS)
+
+fuzz-smoke: ## 🎯 Run every fuzz target for FUZZ_SECONDS (default 60) each
+	cd fuzz && for target in $$(cargo fuzz list); do \
+		cargo fuzz run $$target -- -max_total_time=$(FUZZ_SECONDS) $(FUZZ_ARGS) || exit 1; \
+	done
