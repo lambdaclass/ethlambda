@@ -68,3 +68,108 @@ field by field and marks a node whose spec differs offline (`invalid node
 specs: spec mismatch: GloasForkEpoch`); lighthouse reports the far-future
 value and ethlambda omits the key. The chain itself is healthy (all nodes share
 a head and finalize), so this is a spec-endpoint gap, not a harness problem.
+
+## Commit-Boost check
+
+Starts the same three participants with `mev_type: commit-boost`
+(`commit_boost_params.yaml`): a flashbots mev-boost-relay, a reth-rbuilder
+builder with its own lighthouse beacon node, and one
+[Commit-Boost](https://github.com/Commit-Boost/commit-boost-client) PBS module
+per participant, which stands in for MEV-Boost. It also starts spamoor at a
+light load, since rbuilder submits no bid for a block without transactions and
+a heavy load slows the relay past Commit-Boost's getHeader timeout (see the
+comment in the params file). The package gives the ethlambda
+beacon node `--builder <pbs url>` and the ethlambda validator client
+`--builder-proposals`. There is no assertoor: the base battery's checks fail on
+the spec-endpoint gap above, so `scripts/check-builder-blocks.sh` polls the
+ethlambda services' Prometheus metrics instead, for up to the timeout it is given.
+
+| Service | Metric | Shows |
+|---|---|---|
+| `cl-3-ethlambda-geth` | `lean_beacon_builder_registrations_total{outcome="forwarded"}` >= 1 | Registrations reach the builder through the beacon node |
+| `cl-3-ethlambda-geth` | `lean_beacon_builder_payload_source_total{source="builder"}` >= 1 | The beacon node's own `produceBlockV3` took a builder bid |
+| `vc-3-geth-ethlambda` | `ethlambda_validator_builder_registrations_sent_total` >= 1 | The validator client registers its validators |
+| `vc-3-geth-ethlambda` | `ethlambda_validator_blinded_blocks_proposed_total` >= 1 | It signs and publishes blinded blocks through ethlambda's beacon node |
+| `vc-2-geth-lighthouse-ethlambda` | `ethlambda_validator_blinded_blocks_proposed_total` >= 1 | It does the same through a third-party beacon node (lighthouse) |
+
+Passing therefore covers the registration path, a builder block from ethlambda's
+own beacon node, and ethlambda's validator client proposing blinded blocks
+through lighthouse. The script writes every `lean_beacon_builder_*` and
+`ethlambda_validator_*` blinded or registration series of the three services to
+`<output-dir>/<service>.prom`, pass or fail, and the unmet conditions to
+`failed.txt`.
+
+The relay, builder, PBS and spamoor images are pinned by digest in
+`commit_boost_params.yaml` (the package's defaults are floating tags).
+
+### Run it locally
+
+The image needs the builder support, so build one from a checkout of the
+builder PR stack (#694 to #705). From that checkout's root, `make docker-build
+DOCKER_TAG=<tag>` tags it `ghcr.io/lambdaclass/ethlambda:<tag>`; set that as the
+`cl_image` and `vc_image` of the ethlambda entries in `commit_boost_params.yaml`.
+Kurtosis uses an image that exists in the local Docker daemon and only pulls a
+missing one (`kurtosis run --image-download`, default `missing`), so no setting
+is needed; do not pass `--image-download always`. From the repository root:
+
+```bash
+git clone https://github.com/lambdaclass/ethereum-package.git /tmp/ethereum-package
+git -C /tmp/ethereum-package checkout 7fa7d1225fe5d975300ecc5584bf28ca6d42d451
+
+kurtosis run /tmp/ethereum-package --enclave ethlambda-commit-boost \
+  --args-file tooling/kurtosis-assertoor/commit_boost_params.yaml
+
+tooling/kurtosis-assertoor/scripts/check-builder-blocks.sh \
+  ethlambda-commit-boost 40 /tmp/builder-results
+
+kurtosis enclave rm -f ethlambda-commit-boost
+```
+
+### In CI
+
+The `commit-boost` job of `.github/workflows/kurtosis_assertoor.yml` runs on
+manual dispatch only. Pick `battery: commit-boost` (or `both`) and give `image`
+the tag of an image built from the builder PR stack; the default `assertoor`
+runs only the base battery, as before. Its pin is `COMMIT_BOOST_PACKAGE_REF`,
+separate from `ETHEREUM_PACKAGE_REF`, and it uploads `commit-boost-enclave-dump-<run id>`.
+
+It is dispatch-only because the image that pushes and pull requests test
+(`sha-<7>` of `main`, or `unstable`) does not have `--builder` or
+`--builder-proposals` until the builder PR stack is on `main`, so the check
+would fail there. Once it lands, drop the event condition on the job to run it
+on push and on pull requests.
+
+### The fork pin
+
+lambdaclass/ethereum-package#22 added ethlambda to `apply_external_builder_flags`
+(`--builder=<url>` for the beacon node, `--builder-proposals` for the validator
+client) and is merged (`a15e7df`). `COMMIT_BOOST_PACKAGE_REF` is
+`7fa7d1225fe5d975300ecc5584bf28ca6d42d451`, from
+lambdaclass/ethereum-package#23, which adds the builder's enode bootnode fix on
+top of it. Re-pin to #23's merge commit once it lands: a squash-merge leaves the
+current commit unreachable from the fork's default branch, so it may be garbage
+collected.
+
+### Upstream workarounds
+
+A local run found two breakages in images and packages we do not control:
+
+| Breakage | Worked around in |
+|---|---|
+| `ethpandaops/reth-rbuilder:develop` (newest image, 2026-07-17) parses only enode URLs as bootnodes, and the package has passed ENRs since its 08-05 refactor, so the builder's execution client refused them | fork PR #23, through the `COMMIT_BOOST_PACKAGE_REF` pin |
+| Commit-Boost's PBS requires `SECONDS_PER_SLOT` in the chain config, and the genesis generator now writes only `SLOT_DURATION_MS` | `mev_params.commit_boost_config` in `commit_boost_params.yaml`, which gives the chain explicitly (`chain_id` has to be a hex string) |
+
+Drop each once the upstream is fixed. The explicit chain must change with the
+network parameters.
+
+### Startup noise
+
+The Commit-Boost PBS modules start after the consensus clients, so at startup
+ethlambda's beacon node logs "Builder is not answering" and its first
+registration batch fails. The validator client re-sends registrations every
+epoch, so this clears within an epoch and is not a failure.
+
+From epoch 4 until the chain first finalizes, the beacon node builds locally and
+counts `lean_beacon_builder_fallback_total{reason="no_finality"}`: like
+Lighthouse, it skips the builder when the proposal is more than 3 epochs past
+the finalized checkpoint, and the genesis checkpoint counts as one.
