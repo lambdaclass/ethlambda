@@ -1239,6 +1239,7 @@ mod tests {
     const PASSWORD: &str = "\u{1d531}\u{1d522}\u{1d530}\u{1d531}\u{1d52d}\u{1d51e}\u{1d530}\u{1d530}\u{1d534}\u{1d52c}\u{1d52f}\u{1d521}\u{1f511}";
 
     fn context_with_dirs(store: SharedStore, dir: &std::path::Path) -> KeymanagerContext {
+        let (beacon_node, signing, clock) = crate::http_api::tests::exit_route_context();
         KeymanagerContext {
             store,
             settings: Arc::new(crate::proposer_settings::ProposerSettings::new(
@@ -1248,6 +1249,9 @@ mod tests {
             validators_dir: dir.to_path_buf(),
             secrets_dir: dir.to_path_buf(),
             definitions_lock: Arc::new(tokio::sync::Mutex::new(())),
+            beacon_node,
+            signing,
+            clock,
             definitions_unflushed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             protection: crate::slashing_protection::SlashingProtection::in_memory(),
             default_remote_signer: None,

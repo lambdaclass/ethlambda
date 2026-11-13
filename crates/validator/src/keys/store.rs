@@ -7,6 +7,7 @@ use std::sync::{Arc, Weak};
 use blst::min_pk::SecretKey;
 use ethlambda_types::beacon::primitives::{BLS_PUBKEY_SIZE, BlsPubkey};
 use tracing::info;
+use zeroize::Zeroizing;
 
 use crate::beacon_node::dto::{encode_hex, parse_pubkey};
 use crate::error::{Error, Result};
@@ -107,36 +108,7 @@ impl ValidatorStore {
             let keystore_path = resolve(validators_dir, voting_keystore_path);
             let password_path = resolve(validators_dir, voting_keystore_password_path);
 
-            let json = std::fs::read_to_string(&keystore_path).map_err(|source| Error::Io {
-                path: keystore_path.display().to_string(),
-                source,
-            })?;
-            let keystore = Keystore::from_json(&json).map_err(|err| Error::Keystore {
-                path: keystore_path.display().to_string(),
-                reason: err.to_string(),
-            })?;
-            let password = std::fs::read_to_string(&password_path).map_err(|source| Error::Io {
-                path: password_path.display().to_string(),
-                source,
-            })?;
-            // `normalize_password` inside `decrypt` already strips every C0
-            // control code, newlines included, so this trim is redundant
-            // today. It stays anyway: trimming at the file-reading boundary
-            // is defensible on its own and does not depend on a deeper
-            // implementation detail continuing to hold. Do not delete it as
-            // dead code, and do not treat it as the only thing standing
-            // between a saved password file and a working decrypt.
-            //
-            // `decrypt` yields a `Zeroizing<[u8; 32]>`, scrubbed on drop.
-            // Deref it at the call below rather than copying it out.
-            let secret = keystore
-                .decrypt(password.trim_end_matches(['\n', '\r']))
-                .map_err(|err| Error::Keystore {
-                    path: keystore_path.display().to_string(),
-                    reason: err.to_string(),
-                })?;
-
-            let derived = store.insert_secret(&keystore_path.display().to_string(), &secret)?;
+            let derived = store.insert_keystore_file(&keystore_path, &password_path)?;
 
             // The definitions file's `voting_public_key` is a claim about what
             // is inside the keystore, and until here nothing checked it. Every
@@ -184,6 +156,52 @@ impl ValidatorStore {
             "Loaded validator keys"
         );
         Ok(store)
+    }
+
+    /// Decrypt the keystore at `keystore_path` with the password in
+    /// `password_path` and add its key, answering the public key it holds.
+    ///
+    /// The one place a keystore and its password file are read from disk, for
+    /// [`Self::load`] and the `voluntary-exit` command alike, so the two cannot
+    /// come to read a password differently. The password file is read whole,
+    /// with a trailing newline trimmed: an editor leaves one, and a password
+    /// ending in a newline is not something anyone chose.
+    pub fn insert_keystore_file(
+        &mut self,
+        keystore_path: &Path,
+        password_path: &Path,
+    ) -> Result<BlsPubkey> {
+        let json = std::fs::read_to_string(keystore_path).map_err(|source| Error::Io {
+            path: keystore_path.display().to_string(),
+            source,
+        })?;
+        let keystore = Keystore::from_json(&json).map_err(|err| Error::Keystore {
+            path: keystore_path.display().to_string(),
+            reason: err.to_string(),
+        })?;
+        let password = std::fs::read_to_string(password_path).map_err(|source| Error::Io {
+            path: password_path.display().to_string(),
+            source,
+        })?;
+        // Scrubbed on drop, like the secret `decrypt` yields from it.
+        let password = Zeroizing::new(password);
+        // `normalize_password` inside `decrypt` already strips every C0
+        // control code, newlines included, so this trim is redundant today.
+        // It stays anyway: trimming at the file-reading boundary is
+        // defensible on its own and does not depend on a deeper
+        // implementation detail continuing to hold. Do not delete it as dead
+        // code, and do not treat it as the only thing standing between a
+        // saved password file and a working decrypt.
+        //
+        // `decrypt` yields a `Zeroizing<[u8; 32]>`, scrubbed on drop. Deref
+        // it at the call below rather than copying it out.
+        let secret = keystore
+            .decrypt(password.trim_end_matches(['\n', '\r']))
+            .map_err(|err| Error::Keystore {
+                path: keystore_path.display().to_string(),
+                reason: err.to_string(),
+            })?;
+        self.insert_secret(&keystore_path.display().to_string(), &secret)
     }
 
     /// Add one secret key, deriving its public key.

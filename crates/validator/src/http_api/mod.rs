@@ -12,19 +12,23 @@ use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Extension, Router};
 use subtle::ConstantTimeEq as _;
 use tokio::sync::Mutex;
 use tracing::info;
 
 use crate::Error;
+use crate::beacon_node::BeaconNodeApi;
 use crate::proposer_settings::ProposerSettings;
 use crate::secure_fs;
+use crate::signing::SigningContext;
+use crate::slot_clock::SlotClock;
 
 pub mod keystores;
 pub mod proposer;
 pub mod remotekeys;
+pub mod voluntary_exit;
 
 pub use keystores::SharedStore;
 
@@ -69,6 +73,13 @@ pub struct KeymanagerContext {
     /// `--web3signer-url`: the signer a remote key imported without a `url`
     /// of its own is assigned to. `None` makes such an import an error.
     pub default_remote_signer: Option<String>,
+    /// Where the `voluntary_exit` route resolves a key's validator index.
+    pub beacon_node: Arc<dyn BeaconNodeApi>,
+    /// What the `voluntary_exit` route signs with.
+    pub signing: Arc<SigningContext>,
+    /// What the `voluntary_exit` route reads the current epoch from when the
+    /// caller names none.
+    pub clock: SlotClock,
     /// Whether the last save of the definitions file replaced it without
     /// flushing the directory, so its last change may not survive a power
     /// loss. Set and cleared by `keystores::save_definitions`; read where a
@@ -177,6 +188,10 @@ pub fn router(context: KeymanagerContext, token: String) -> Router {
                 .post(proposer::set_gas_limit)
                 .delete(proposer::delete_gas_limit),
         )
+        .route(
+            "/eth/v1/validator/{pubkey}/voluntary_exit",
+            post(voluntary_exit::create_signed_voluntary_exit),
+        )
         .with_state(context)
         .layer(middleware::from_fn(require_bearer))
         .layer(Extension(ApiToken(token)))
@@ -241,8 +256,27 @@ async fn require_bearer(request: Request, next: Next) -> Response {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    /// The three `voluntary_exit` fields for a test that is not about that
+    /// route: a mock node resolving no validator, mainnet's schedule and a
+    /// clock started at the Unix epoch.
+    pub(crate) fn exit_route_context() -> (Arc<dyn BeaconNodeApi>, Arc<SigningContext>, SlotClock) {
+        use ethlambda_types::beacon::config::Config;
+        use ethlambda_types::beacon::primitives::Root;
+
+        let config = Config::mainnet();
+        let clock = SlotClock::from_config(0, &config);
+        let signing = Arc::new(SigningContext::new(config, Root::ZERO));
+        let node = Arc::new(crate::beacon_node::mock::MockBeaconNode::new());
+        (node, signing, clock)
+    }
+}
+
 #[cfg(all(test, unix))]
-mod tests {
+mod token_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
 

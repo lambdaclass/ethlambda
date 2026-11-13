@@ -18,7 +18,9 @@ what each workload measures; `benchmark import`'s flags are in
 [their own section](#benchmark-import-flags) below. `ethlambda validator` is
 the validator client: a separate process that holds keys and performs duties
 against a beacon node over the standard REST API, documented in
-[its own section](#validator-flags) below. `ethlambda slashing-protection`
+[its own section](#validator-flags) below. `ethlambda voluntary-exit` signs one
+validator's voluntary exit and hands it to a beacon node; see
+[its section](#voluntary-exit) below. `ethlambda slashing-protection`
 moves that client's EIP-3076 history in and out of its directory, offline; see
 [its section](#slashing-protection) below.
 
@@ -379,8 +381,9 @@ assigned to slot `S` sign for `S - 1`. Both halves are bounded by the end of the
 slot.
 
 Not implemented: the builder flow and blinded blocks (the client asks for an
-unblinded block and refuses a blinded one), voluntary exits and doppelganger
-protection.
+unblinded block and refuses a blinded one) and doppelganger protection.
+Voluntary exits are signed by the keymanager API's `voluntary_exit` route and
+by [`ethlambda voluntary-exit`](#voluntary-exit).
 
 ### Duty offsets come from the network
 
@@ -453,6 +456,15 @@ the round trips for their selection proofs never stand between a slot boundary
 and a proposal. Nothing is asked of the signer at startup or at
 import: a signer may start after this client does.
 
+A voluntary exit for a remote key is signed the same way (`VOLUNTARY_EXIT`),
+through the keymanager API's `voluntary_exit` route. The signer derives an
+exit's root itself and refuses a request naming another, so it is told the one
+fork version the exit is signed under, as both `previous_version` and
+`current_version`: from deneb on that is the capella version (EIP-7044), not
+the fork the schedule has at the exit's epoch. [`ethlambda
+voluntary-exit`](#voluntary-exit) decrypts a keystore file, so it signs for
+local keys only.
+
 A remote key is declared in `validator_definitions.yml` with `type:
 web3signer` and a `url` where a local entry has `type: local_keystore` and its
 two keystore paths:
@@ -516,7 +528,16 @@ it leaves would load the key again at the next start. `DELETE /remotekeys` of
 a remote entry whose key this process runs from a local keystore removes the
 entry and leaves the local key, and its per-validator settings, as they are.
 
-It also serves `GET`, `POST` and `DELETE` on
+It also serves `POST /eth/v1/validator/{pubkey}/voluntary_exit`, which signs a
+voluntary exit for a validator this client holds, in a local keystore or in a
+remote signer, and answers with the `SignedVoluntaryExit`, for the exit's
+`epoch` query parameter or the current epoch when none is given. **It does not publish the exit.** As the
+specification has it, the caller hands the message to a beacon node's
+`POST /eth/v1/beacon/pool/voluntary_exits`, or holds on to it. The validator
+index comes from the beacon node on each call, so a key whose deposit the chain
+has not processed yet is a `404` saying so.
+
+And it serves `GET`, `POST` and `DELETE` on
 `/eth/v1/validator/{pubkey}/feerecipient`, `/graffiti` and `/gas_limit`, which
 give one validator its own value in place of the command line's default:
 
@@ -555,6 +576,65 @@ Served on `--metrics-port`, prefixed `ethlambda_validator_` rather than the
 beacon chain. Every series is registered at startup so it reads zero rather
 than being absent before its first event, which is what lets an alert fire on
 "attestations stopped". See [Metrics](./metrics.md#validator-client).
+
+## `voluntary-exit`
+
+`ethlambda voluntary-exit` signs a voluntary exit for one validator and hands
+it to a beacon node, which validates it against its head and gossips it. It is
+a command of its own rather than part of `ethlambda validator`: it takes one
+keystore and none of the client's flags, runs once and ends.
+
+```sh
+ethlambda voluntary-exit \
+  --keystore ~/validators/0xabc.../voting-keystore.json \
+  --password-file ~/secrets/0xabc... \
+  --beacon-node http://localhost:5052
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--keystore` | required | The validator's EIP-2335 voting keystore |
+| `--password-file` | required | The file holding that keystore's password. A trailing newline is ignored |
+| `--beacon-node` | `http://localhost:5052` | Base URL of the beacon node's HTTP API. One node, not a list: this is a one-shot command, and an operator whose node is down picks another |
+| `--epoch` | the current epoch | The exit's epoch, before which the chain refuses it. An earlier one is as good as the current one. A later one needs `--presign`: a node refuses an exit whose epoch has not come, so the command refuses to publish one |
+| `--presign` | off | Sign the exit and print it as JSON on stdout without publishing it, for an operator who wants to hold a signed exit for later. Logs go to stderr, so the JSON pipes cleanly into a file |
+| `--no-confirmation` | off | Publish without asking for the confirmation phrase. For scripts; use with care |
+| `--no-wait` | off | Return as soon as the beacon node has accepted the exit, without waiting for the chain to process it |
+
+**A voluntary exit is irreversible.** Once the chain processes it the
+validator is queued to leave, stops earning after its exit epoch, and the key
+can never validate again. So before publishing anything the command refuses a
+beacon node that is still syncing, refuses a validator the chain would refuse
+(one that is not `active_ongoing`, or not yet `SHARD_COMMITTEE_PERIOD` epochs
+past its activation, naming the epoch it becomes eligible at), and then prints
+a warning and asks for the phrase `Exit my validator` on stdin. Anything else,
+an empty stdin included, aborts without publishing and with a failing exit
+status, so a script cannot take an exit that never went out for one that did.
+
+The shard committee period is measured the way the chain measures it: against
+the epoch the exit is processed in, which is now for an exit being published
+and the exit's own epoch for a `--presign` one naming a later epoch. Its
+length is the beacon node's own `SHARD_COMMITTEE_PERIOD`, read from
+`/eth/v1/config/spec`, so a devnet that shortens it is followed. One rule
+of the chain's cannot be checked up front: from electra on it refuses a
+validator with a partial withdrawal still pending. That refusal comes back as
+the beacon node's `400`, with its reason.
+
+After publishing, unless `--no-wait` is given, it polls the validator's status
+once a slot, for up to two epochs. When the chain reports `active_exiting` it
+prints the current, exit and withdrawable epochs and how long until the exit
+epoch, and returns; **keep the validator running until that epoch**, since it
+still has duties until then. Any later status (`exited_*`, `withdrawal_*`) and
+`active_slashed` end the wait too, reported as such. If the chain has not
+processed the exit when the wait runs out, the command says so and returns
+successfully, since the exit was published; a beacon node that cannot answer a
+poll is asked again at the next slot rather than failing the run.
+
+Exits are signed for the fork that processes them, not the one their epoch
+falls in. From deneb on that is `CAPELLA_FORK_VERSION` whatever epoch the exit
+names (EIP-7044), an epoch from before deneb included, so a pre-signed exit
+stays valid across every fork to come. The command signs that way, and the
+[keymanager API](#the-keymanager-api)'s `voluntary_exit` route does too.
 
 ## `slashing-protection`
 

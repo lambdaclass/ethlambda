@@ -11,6 +11,7 @@ use ethlambda_types::beacon::containers::electra::{Attestation, SignedAggregateA
 use ethlambda_types::beacon::containers::gloas;
 use ethlambda_types::beacon::containers::shared::AttestationData;
 use ethlambda_types::beacon::containers::shared::Checkpoint;
+use ethlambda_types::beacon::containers::shared::SignedVoluntaryExit;
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, Root, Slot, ValidatorIndex};
 
@@ -24,7 +25,7 @@ use crate::beacon_node::dto::{
 };
 use crate::beacon_node::{
     AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Genesis,
-    ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorEntry,
+    ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails, ValidatorEntry,
     validate_sync_contribution,
 };
 use crate::error::{BeaconNodeFailure, Error, Result};
@@ -132,6 +133,16 @@ pub struct MockBeaconNode {
     pub contribution_requests: Mutex<Vec<(Slot, u64, Root)>>,
     pub published_contributions: Mutex<Vec<altair::SignedContributionAndProof>>,
     pub sync_subscriptions: Mutex<Vec<SyncCommitteeSubscriptionDto>>,
+    /// What `validator` answers for any key. `None` is the node's 404.
+    pub validator_details: Mutex<Option<ValidatorDetails>>,
+    /// What `validator` answers once an exit has been submitted, standing in
+    /// for the chain processing it. `None` leaves the answer as it was.
+    pub details_after_exit: Mutex<Option<ValidatorDetails>>,
+    pub submitted_exits: Mutex<Vec<SignedVoluntaryExit>>,
+    /// When set, `submit_voluntary_exit` answers a node's 400 with this
+    /// reason and records nothing: an exit the node judged invalid, as
+    /// opposed to a node that could not be reached (`failures`).
+    pub exit_refusal: Option<String>,
 }
 
 impl MockBeaconNode {
@@ -406,6 +417,30 @@ impl MockBeaconNode {
 
     pub fn sync_subscriptions(&self) -> Vec<SyncCommitteeSubscriptionDto> {
         self.sync_subscriptions.lock().expect("lock").clone()
+    }
+
+    pub fn with_validator_details(self, details: ValidatorDetails) -> Self {
+        self.set_validator_details(Some(details));
+        self
+    }
+
+    pub fn set_validator_details(&self, details: Option<ValidatorDetails>) {
+        *self.validator_details.lock().expect("lock") = details;
+    }
+
+    pub fn with_details_after_exit(self, details: ValidatorDetails) -> Self {
+        *self.details_after_exit.lock().expect("lock") = Some(details);
+        self
+    }
+
+    pub fn submitted_exits(&self) -> Vec<SignedVoluntaryExit> {
+        self.submitted_exits.lock().expect("lock").clone()
+    }
+
+    /// Refuses every submitted exit with a 400 carrying `reason`.
+    pub fn refusing_exits(mut self, reason: &str) -> Self {
+        self.exit_refusal = Some(reason.to_string());
+        self
     }
 
     pub fn with_publish_outcome(mut self, outcome: Published) -> Self {
@@ -942,6 +977,29 @@ impl BeaconNodeApi for MockBeaconNode {
             .lock()
             .expect("lock")
             .extend_from_slice(subscriptions);
+        Ok(())
+    }
+
+    async fn validator(&self, _pubkey: &BlsPubkey) -> Result<Option<ValidatorDetails>> {
+        self.guard("validator")?;
+        Ok(self.validator_details.lock().expect("lock").clone())
+    }
+
+    async fn submit_voluntary_exit(&self, exit: &SignedVoluntaryExit) -> Result<()> {
+        self.guard("submit_voluntary_exit")?;
+        if let Some(reason) = &self.exit_refusal {
+            return Err(Error::BeaconNodeStatus {
+                status: 400,
+                body: reason.clone(),
+            });
+        }
+        self.submitted_exits
+            .lock()
+            .expect("lock")
+            .push(exit.clone());
+        if let Some(details) = self.details_after_exit.lock().expect("lock").take() {
+            self.set_validator_details(Some(details));
+        }
         Ok(())
     }
 }

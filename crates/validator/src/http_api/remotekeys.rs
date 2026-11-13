@@ -403,6 +403,7 @@ mod tests {
         dir: &std::path::Path,
         default_remote_signer: Option<&str>,
     ) -> KeymanagerContext {
+        let (beacon_node, signing, clock) = crate::http_api::tests::exit_route_context();
         KeymanagerContext {
             store,
             settings: Arc::new(crate::proposer_settings::ProposerSettings::new(
@@ -415,6 +416,9 @@ mod tests {
             definitions_unflushed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             protection: crate::slashing_protection::SlashingProtection::in_memory(),
             default_remote_signer: default_remote_signer.map(str::to_string),
+            beacon_node,
+            signing,
+            clock,
         }
     }
 
