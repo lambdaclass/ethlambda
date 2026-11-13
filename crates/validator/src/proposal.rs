@@ -55,7 +55,9 @@ use std::sync::Arc;
 
 use ethlambda_types::beacon::constants::BUILDER_INDEX_SELF_BUILD;
 use ethlambda_types::beacon::fork::ForkName;
-use ethlambda_types::beacon::primitives::{BlsPubkey, ExecutionAddress, Root, Slot};
+use ethlambda_types::beacon::primitives::{
+    BlsPubkey, ExecutionAddress, HashTreeRoot as _, Root, Slot,
+};
 use ethlambda_types::beacon::signing::compute_epoch_at_slot;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -172,15 +174,7 @@ impl<B: BeaconNodeApi> ProposalService<B> {
         .await;
         refuse_unless_safe(slot, duty.validator_index, "consult", checked)?;
 
-        // Scoped away from every await, the way the attestation path's read
-        // guard is, and for the reason spelled out there: a write-preferring
-        // lock lets one queued keymanager writer block every reader behind it,
-        // so a guard held across the block production round trip below would
-        // put the whole duty path behind it.
-        let randao_reveal = {
-            let store = store.read().await;
-            self.context.sign_randao(&store, &pubkey, epoch)?
-        };
+        let randao_reveal = self.context.sign_randao(store, &pubkey, epoch).await?;
 
         // Both read once, before the block is asked for, so the check below
         // compares against the address in force when the request went out.
@@ -240,26 +234,29 @@ impl<B: BeaconNodeApi> ProposalService<B> {
             "Block produced; signing"
         );
 
-        // The root is taken from the decoded container, never from anything
-        // reassembled here, and it is taken once: the same value is what the
+        // The header is taken from the decoded container, never from anything
+        // reassembled here, and it is taken once: its root is what the
         // recorded slot belongs to and what the signature covers.
-        let block_root = produced.block_root();
+        //
+        // The block's root is the header's, so it is taken from the header:
+        // that rehashes five fields, where `produced.block_root()` would hash
+        // the whole body, transactions included, a second time inside the
+        // proposal's budget.
+        let header = produced.header();
+        let block_root = header.hash_tree_root();
 
         // The check that matters, and the one that records, durably, before
         // the signature exists. Everything after this point may be abandoned
         // without risk, because the record already counts this slot as
-        // proposed. Off the executor, and before the store's read lock below,
-        // so the disk flush never holds up a keymanager writer.
+        // proposed. Off the executor, and with no guard on the store held, so
+        // the disk flush never holds up a keymanager writer.
         let recorded = crate::slashing_protection::blocking(&self.protection, move |protection| {
             protection.check_and_record_block(&pubkey, slot)
         })
         .await;
         refuse_unless_safe(slot, duty.validator_index, "record", recorded)?;
 
-        let signature = {
-            let store = store.read().await;
-            self.context.sign_block(&store, &pubkey, block_root, slot)?
-        };
+        let signature = self.context.sign_block(store, &pubkey, &header).await?;
 
         // Taken out before the block is signed into its body: the envelope is
         // published on its own, after the block, and the bare gloas block body
@@ -350,11 +347,10 @@ impl<B: BeaconNodeApi> ProposalService<B> {
             )));
         }
 
-        let signature = {
-            let store = store.read().await;
-            self.context
-                .sign_execution_payload_envelope(&store, pubkey, &envelope, slot)?
-        };
+        let signature = self
+            .context
+            .sign_execution_payload_envelope(store, pubkey, &envelope, slot)
+            .await?;
         let body = match payload {
             Some(payload) => payload.into_signed_contents_ssz(signature),
             None => signed_envelope_ssz(envelope, signature),
@@ -443,7 +439,6 @@ mod tests {
     use crate::beacon_node::mock::MockBeaconNode;
     use crate::slashing_protection::SlashingProtection;
     use ethlambda_types::beacon::config::Config;
-    use ethlambda_types::beacon::primitives::HashTreeRoot as _;
     use ethlambda_types::beacon::primitives::{BlsPubkey, Bytes32, H160, Root};
     use libssz::SszDecode as _;
 
@@ -455,10 +450,7 @@ mod tests {
     }
 
     fn context() -> Arc<SigningContext> {
-        Arc::new(SigningContext {
-            config: Config::mainnet(),
-            genesis_validators_root: Root::ZERO,
-        })
+        Arc::new(SigningContext::new(Config::mainnet(), Root::ZERO))
     }
 
     /// A store holding one key, and the pubkey it resolves to.
@@ -860,7 +852,7 @@ mod gloas_tests {
     use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::containers::gloas;
     use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
-    use ethlambda_types::beacon::primitives::{BlsPubkey, HashTreeRoot as _};
+    use ethlambda_types::beacon::primitives::BlsPubkey;
     use libssz::SszDecode as _;
 
     const GLOAS_EPOCH: u64 = 10;
@@ -874,10 +866,10 @@ mod gloas_tests {
     }
 
     fn context() -> Arc<SigningContext> {
-        Arc::new(SigningContext {
-            config: Config::mainnet().with_fork_epoch(ForkName::Gloas, GLOAS_EPOCH),
-            genesis_validators_root: Root::ZERO,
-        })
+        Arc::new(SigningContext::new(
+            Config::mainnet().with_fork_epoch(ForkName::Gloas, GLOAS_EPOCH),
+            Root::ZERO,
+        ))
     }
 
     fn store() -> (RwLock<ValidatorStore>, BlsPubkey) {

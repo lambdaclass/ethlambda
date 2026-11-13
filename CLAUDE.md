@@ -849,7 +849,27 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   keeps EIP-3076 minimal-watermark slashing protection in
   `--validators-dir/slashing_protection.json` (`crate::slashing_protection`),
   durable before every block and attestation signature; PTC votes have an
-  in-memory `(validator, slot)` dedup only, and envelopes are unguarded.
+  in-memory `(validator, slot)` dedup only, and envelopes are unguarded. A key can live
+  in a Web3Signer instead of the process (`SigningMethod::Web3Signer`,
+  `keys/web3signer.rs`): every `SigningContext::sign_*` is async, resolves the
+  signer under a read guard scoped to the lookup and signs after releasing it,
+  and sends the remote signer the message in full so its own slashing
+  protection applies on top of this client's record, which a remote key is
+  registered in and checked against like a local one; the signature the
+  signer returns is verified against the pubkey and root before it is used,
+  on the blocking pool (`SigningContext::verified`), never inline on the duty
+  task. Each duty signs its batch at once through
+  `signing::sign_all`, every signature bounded by `SIGNING_BUDGET`, so one
+  hung signer costs only its own keys; one signer is sent at most
+  `MAX_CONCURRENT_REQUESTS` at a time. The epoch's subnet subscriptions, whose
+  selection proofs are round trips for remote keys, are sent from a spawned
+  task after the slot's proposal, not from `refresh_epoch`. Remote keys are
+  `type: web3signer`
+  entries in `validator_definitions.yml` or `POST /eth/v1/remotekeys` (default signer
+  `--web3signer-url`); `/keystores` and `/remotekeys` partition the store, and
+  both deletes go through `keystores::delete_keys` (one read and one save of
+  the definitions file per request, the store's write lock held only for the
+  in-memory removals).
   `get_head_node` is one bottom-up walk for every fork, with
   the current slot's fork selecting the payload rules and the boost gate, so a
   follower on any network that schedules gloas (Sepolia does) pays work

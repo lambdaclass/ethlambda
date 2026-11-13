@@ -237,12 +237,35 @@ static BEACON_NODE_AVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// How long a duty waited for its batch of signatures.
+///
+/// For local keys that is the signing itself, well under a millisecond a key.
+/// With remote keys it is the batch's slowest answer, round trip and
+/// verification included, and at most the signing budget
+/// (`signing::SIGNING_BUDGET`): a sample at the top bucket means a signer
+/// that did not answer in time, not slow arithmetic. What one signer request
+/// takes is `remote_signer_request_duration_seconds`.
 static SIGNING_DURATION_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
     register_histogram!(
         "ethlambda_validator_signing_duration_seconds",
-        "Time spent signing one slot's batch of attestations, read lock included",
+        "Time a duty waited for its batch of signatures, remote signer round trips included",
         vec![
-            0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5
+            0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5
+        ]
+    )
+    .unwrap()
+});
+
+/// One request to a remote signer, from sending it to its answer or failure.
+///
+/// The top bucket is the client's own request timeout; a request the signing
+/// budget cut off before that is recorded at the moment it was dropped.
+static REMOTE_SIGNER_REQUEST_DURATION_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
+    register_histogram!(
+        "ethlambda_validator_remote_signer_request_duration_seconds",
+        "Time one signing request to a remote signer took, whatever its outcome",
+        vec![
+            0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 8.0
         ]
     )
     .unwrap()
@@ -358,6 +381,7 @@ pub fn init() {
     LazyLock::force(&FEE_RECIPIENT_MISMATCHES_TOTAL);
     LazyLock::force(&BEACON_NODE_AVAILABLE);
     LazyLock::force(&SIGNING_DURATION_SECONDS);
+    LazyLock::force(&REMOTE_SIGNER_REQUEST_DURATION_SECONDS);
     LazyLock::force(&PUBLICATION_DELAY_SECONDS);
     LazyLock::force(&SLASHING_PROTECTION_WRITE_SECONDS);
     LazyLock::force(&SLASHING_PROTECTION_WRITE_FAILURES_TOTAL);
@@ -472,13 +496,19 @@ pub fn set_beacon_node_available(available: bool) {
     BEACON_NODE_AVAILABLE.set(i64::from(available));
 }
 
-/// Time one slot's signing loop. The returned guard records to
-/// `ethlambda_validator_signing_duration_seconds` when dropped; hold it only
-/// across the synchronous signing loop, never across an await, or the sample
-/// stops meaning "how long the signing took" and starts meaning "how long
-/// the signing took plus whatever else shared the guard's scope".
+/// Time one duty's batch of signatures. The returned guard records to
+/// `ethlambda_validator_signing_duration_seconds` when dropped; hold it
+/// across the `signing::sign_all` call and nothing else, or the sample stops
+/// meaning "how long the duty waited for its signatures" and starts meaning
+/// that plus whatever else shared the guard's scope.
 pub fn time_signing() -> TimingGuard {
     TimingGuard::new(&SIGNING_DURATION_SECONDS)
+}
+
+/// Time one request to a remote signer. The returned guard records to
+/// `ethlambda_validator_remote_signer_request_duration_seconds` when dropped.
+pub fn time_remote_signer_request() -> TimingGuard {
+    TimingGuard::new(&REMOTE_SIGNER_REQUEST_DURATION_SECONDS)
 }
 
 pub fn time_slashing_protection_write() -> TimingGuard {

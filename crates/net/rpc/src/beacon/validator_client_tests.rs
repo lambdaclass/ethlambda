@@ -238,7 +238,7 @@ async fn the_validator_client_can_exit_a_validator_through_this_node() {
         store
             .insert_secret("test", &secret_key_for(0).to_bytes())
             .expect("valid key");
-        store
+        RwLock::new(store)
     };
     let options = ExitOptions {
         no_confirmation: true,
@@ -286,7 +286,7 @@ async fn the_validator_client_can_exit_a_validator_through_this_node() {
         store
             .insert_secret("test", &secret_key_for(1).to_bytes())
             .expect("valid key");
-        store
+        RwLock::new(store)
     };
     let options = ExitOptions {
         epoch: Some(0),
@@ -329,7 +329,7 @@ async fn the_validator_client_follows_this_nodes_shard_committee_period() {
         store
             .insert_secret("test", &secret_key_for(0).to_bytes())
             .expect("valid key");
-        store
+        RwLock::new(store)
     };
     let options = ExitOptions {
         no_confirmation: true,
@@ -1033,10 +1033,7 @@ async fn serve_fulu_pinned_under(
         .spec()
         .await
         .expect("the client reads this node's spec");
-    let context = Arc::new(SigningContext {
-        config: spec,
-        genesis_validators_root: genesis.genesis_validators_root,
-    });
+    let context = Arc::new(SigningContext::new(spec, genesis.genesis_validators_root));
     (Arc::new(client), state, network, context)
 }
 
@@ -1333,10 +1330,7 @@ mod gloas {
             .spec()
             .await
             .expect("the client reads this node's spec");
-        let context = Arc::new(SigningContext {
-            config: spec,
-            genesis_validators_root: genesis.genesis_validators_root,
-        });
+        let context = Arc::new(SigningContext::new(spec, genesis.genesis_validators_root));
         Served {
             client,
             state,

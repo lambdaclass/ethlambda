@@ -114,6 +114,14 @@ anything that does not advance past them.
   slot is equivocation that peers penalize in gossip, not a slashing.
 - **What is not covered:** the same keys running in another client on another
   machine. No local record can see that.
+- **A key held by a remote signer:** a key in a Web3Signer (see
+  [Remote signing](./cli.md#remote-signing-web3signer)) is registered in this
+  record and checked against it like any other, and is then signed by the
+  signer, which receives every message in full and keeps a record of its own;
+  a message it refuses is dropped here and never retried. The two records are
+  separate: the signer's is neither imported into this one nor exported from
+  it, so a key moved to or from a signer carries its history through the
+  signer's own tools.
 - **Interchange:** an import (`ethlambda slashing-protection import`, or the
   keymanager API's `POST /eth/v1/keystores`) reduces each validator to its
   highest slot, source and target and merges them with the record by maximum,
