@@ -372,7 +372,6 @@ pub(super) async fn handle_envelopes_by_range_response(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Arc;
     use std::time::Duration;
 
     use ethlambda_network_api::{BlockArrival, BlockSource};
@@ -594,7 +593,7 @@ mod tests {
     /// or no chain to forward to, so range sync cannot wait forever.
     #[tokio::test]
     async fn the_range_release_fires_when_there_is_nothing_to_forward() {
-        use crate::beacon::envelope_checks::tests::Recorder;
+        use ethlambda_network_api::ToP2PToBlockChainRef as _;
 
         let mut server = crate::test_support::unconnected_beacon_server(Config::mainnet(), 0).await;
         let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -613,10 +612,12 @@ mod tests {
         assert_eq!(done_rx.recv().await, Some(()));
 
         // An empty answer.
-        let (sender, _received) = tokio::sync::mpsc::unbounded_channel();
-        server.blockchain = Some(Arc::new(Recorder(sender)));
+        let chain = spawned_test::tasks::Mock::new().start();
+        server.blockchain = Some(chain.to_p2p_to_block_chain_ref());
         envelope_checks::check_and_forward_then(&server, Vec::new(), Some(callback(done_tx)));
         assert_eq!(done_rx.recv().await, Some(()));
+        chain.settle().await;
+        assert!(chain.received().is_empty());
     }
 
     fn pending_lookup(server: &mut P2PServer, root: H256, attempts: u32) {
@@ -691,19 +692,21 @@ mod tests {
     /// handed it, and in slot order, whichever order the peer listed them.
     #[tokio::test]
     async fn range_envelopes_are_forwarded_after_the_batch_blocks_in_slot_order() {
-        use crate::beacon::envelope_checks::tests::{Recorder, Seen};
+        use ethlambda_network_api::P2PToBlockChain as _;
+        use ethlambda_network_api::ToP2PToBlockChainRef as _;
+        use ethlambda_network_api::p2p_to_block_chain::{NewBlock, NewExecutionPayloadEnvelope};
+
+        use crate::beacon::envelope_checks::tests::sent;
 
         let mut server = crate::test_support::unconnected_beacon_server(Config::mainnet(), 0).await;
-        let (sender, mut received) = tokio::sync::mpsc::unbounded_channel();
-        let chain = Arc::new(Recorder(sender));
-        server.blockchain = Some(chain.clone());
+        let chain = spawned_test::tasks::Mock::new().allow_sends().start();
+        server.blockchain = Some(chain.to_p2p_to_block_chain_ref());
         let root = H256::repeat_byte(3);
 
         // What `handle_beacon_blocks_by_range_response` does before it asks
         // for the span's envelopes.
         for slot in [20, 21] {
-            let _ = ethlambda_network_api::P2PToBlockChain::new_block(
-                chain.as_ref(),
+            let _ = chain.new_block(
                 fulu_block_at(slot),
                 BlockSource::Sync,
                 BlockArrival::now(),
@@ -724,11 +727,32 @@ mod tests {
             })),
         );
 
-        assert_eq!(received.recv().await, Some(Seen::Block(20)));
-        assert_eq!(received.recv().await, Some(Seen::Block(21)));
-        assert_eq!(received.recv().await, Some(Seen::Envelope(root, 20)));
-        assert_eq!(received.recv().await, Some(Seen::Envelope(root, 21)));
-        // The release comes only after the last envelope was sent.
+        // The release comes only after the last envelope was sent, so once it
+        // fires and the mock has handled what was sent before, the log is
+        // complete.
         assert_eq!(done_rx.recv().await, Some(()));
+        chain.settle().await;
+        let order: Vec<_> = chain.received().iter().map(|r| r.type_name).collect();
+        assert_eq!(
+            order,
+            [
+                std::any::type_name::<NewBlock>(),
+                std::any::type_name::<NewBlock>(),
+                std::any::type_name::<NewExecutionPayloadEnvelope>(),
+                std::any::type_name::<NewExecutionPayloadEnvelope>(),
+            ]
+        );
+        let blocks: Vec<u64> = chain
+            .take_all::<NewBlock>()
+            .iter()
+            .map(|sent| sent.block.slot())
+            .collect();
+        assert_eq!(blocks, [20, 21]);
+        let envelopes: Vec<_> = chain
+            .take_all::<NewExecutionPayloadEnvelope>()
+            .iter()
+            .map(sent)
+            .collect();
+        assert_eq!(envelopes, [(root, 20), (root, 21)]);
     }
 }

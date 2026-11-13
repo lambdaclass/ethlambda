@@ -82,9 +82,15 @@ async fn with_no_api_router_metrics_and_debug_are_served_on_the_metrics_port() {
     let served = tokio::spawn(start_http_servers(config.clone(), None, shutdown.clone()));
 
     // Metrics: the whole reason `beacon` serves anything at all.
+    let metrics = get(port, "/metrics").await;
     assert!(
-        status_line(&get(port, "/metrics").await).contains("200"),
+        status_line(&metrics).contains("200"),
         "/metrics must be served"
+    );
+    // The actor runtime's series ride along with the node's own.
+    assert!(
+        metrics.contains("spawned_mailbox_depth"),
+        "/metrics must carry the actor runtime's series"
     );
     // Debug: `beacon` gains these by going through the shared entry point.
     // Heap profiling was previously node-only.

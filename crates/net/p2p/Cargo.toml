@@ -83,3 +83,8 @@ libssz-types.workspace = true
 
 sha2 = "0.10"
 hex.workspace = true
+
+[dev-dependencies]
+# Mock chain actors for the forwarding tests: an `ActorRef<Mock>` stands in for
+# any protocol ref, so tests need no hand-written protocol stubs.
+spawned-test.workspace = true

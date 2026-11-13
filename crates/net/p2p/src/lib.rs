@@ -84,6 +84,7 @@ use spawned_concurrency::actor;
 use spawned_concurrency::error::ActorError;
 use spawned_concurrency::message::Message;
 use spawned_concurrency::protocol;
+use spawned_concurrency::system::{ExecutionGroup, SystemError};
 use spawned_concurrency::tasks::{
     Actor, ActorRef, ActorStart, Context, Handler, send_after, spawn_listener,
 };
@@ -91,10 +92,9 @@ use tracing::{debug, info, trace, warn};
 
 use crate::{
     discovery::{
-        DIAL_INTERVAL_AT_TARGET, DIAL_INTERVAL_AT_ZERO_PEERS, DiscoveryError, DiscoverySpawnConfig,
+        DIAL_INTERVAL_AT_TARGET, DIAL_INTERVAL_AT_ZERO_PEERS, DiscoveryHandle,
         dial::{DiscoveryState, dial_interval, dial_progress, dial_tick, forget_discovered_peer},
         enr::{dialable_port, read_ip, read_public_key, read_quic_port, read_tcp_port},
-        spawn_discovery,
     },
     gossipsub::{
         aggregation_topic, attestation_subnet_topic, block_topic, publish_aggregated_attestation,
@@ -1157,39 +1157,36 @@ pub struct P2P {
 }
 
 impl P2P {
-    /// Start discovery, start the I/O adapter, spawn the actor, and wire the
-    /// swarm event stream.
+    /// Start the I/O adapter, spawn the actor on `group`, and wire the swarm
+    /// event stream.
     ///
-    /// `discovery` is `Some` when discv5 runs: the server is started here, and
-    /// its handle seeds the dial loop's state and schedules its first tick. It
-    /// is started before the swarm adapter so a fatal discovery failure (a busy
-    /// UDP port, say) surfaces before any actor is running. `None` leaves the
-    /// dial loop unscheduled, so peering relies solely on the static bootnode
-    /// list `build_swarm` dialed.
+    /// `discovery` is `Some` when discv5 runs: the caller starts the server
+    /// with [`discovery::spawn_discovery`] before any actor, so a fatal
+    /// discovery failure (a busy UDP port, say) surfaces before anything is
+    /// running, and its handle seeds the dial loop's state and schedules its
+    /// first tick here. `None` leaves the dial loop unscheduled, so peering
+    /// relies solely on the static bootnode list `build_swarm` dialed.
     ///
     /// Always `Some` on beacon, which has no other way to find a peer:
     /// published mainnet bootnode ENRs carry no `quic` entry, so none of them
     /// is statically dialable. Opt-in on lean, where nothing else speaks discv5
     /// and co-located devnet nodes would otherwise all claim one UDP port.
     #[allow(clippy::too_many_arguments)]
-    pub async fn spawn(
+    pub fn spawn(
         built: BuiltSwarm,
         store: Store,
         node_names: HashMap<PeerId, String>,
-        discovery: Option<DiscoverySpawnConfig>,
+        discovery: Option<DiscoveryHandle>,
         payload_attestation_pool: SharedPayloadAttestationPool,
         builder_market: SharedBuilderMarket,
         sync_committee_pool: SharedSyncCommitteePool,
-    ) -> Result<P2P, DiscoveryError> {
-        let (discovery, local_enr) = match discovery {
-            Some(config) => {
-                let discovery = spawn_discovery(config).await?;
-                let local_enr = discovery.local_enr.clone();
-                (Some(discovery), Some(local_enr))
-            }
+        group: &ExecutionGroup,
+    ) -> Result<P2P, SystemError> {
+        let local_enr = match &discovery {
+            Some(discovery) => Some(discovery.local_enr.clone()),
             None => {
                 info!("discv5 discovery disabled; peering from the static bootnode list only");
-                (None, None)
+                None
             }
         };
         let (swarm_stream, swarm_handle) =
@@ -1268,7 +1265,7 @@ impl P2P {
         };
         let scores_peers = server.peer_scoring.is_some();
         let discovery_enabled = server.discovery.is_some();
-        let handle = server.start();
+        let handle = server.start_on(group)?;
         // At once rather than a slot in: the swarm starts on placeholder
         // topic scores, and the head's are already known.
         if scores_peers {
@@ -2827,85 +2824,6 @@ pub(crate) mod test_support {
 
     use crate::beacon::swarm::BeaconWireConfig;
     use crate::{P2PServer, SwarmConfig, WireConfig, build_swarm};
-
-    /// A chain actor stand-in recording what reaches it: each block's
-    /// announcement and each aggregate with its attesting indices. The rest
-    /// of the protocol is accepted and dropped.
-    #[derive(Default)]
-    pub(crate) struct RecordingChain {
-        pub(crate) announcements: std::sync::Mutex<Vec<ethlambda_network_api::BlockAnnouncement>>,
-        pub(crate) aggregates: std::sync::Mutex<
-            Vec<(
-                ethlambda_types::beacon::containers::SignedAggregateAndProof,
-                Vec<ethlambda_types::beacon::primitives::ValidatorIndex>,
-            )>,
-        >,
-    }
-
-    impl ethlambda_network_api::P2PToBlockChain for RecordingChain {
-        fn new_block(
-            &self,
-            _block: ethlambda_types::beacon::containers::SignedBeaconBlock,
-            _source: ethlambda_network_api::BlockSource,
-            _arrival: ethlambda_network_api::BlockArrival,
-            announcement: ethlambda_network_api::BlockAnnouncement,
-        ) -> Result<(), spawned_concurrency::error::ActorError> {
-            self.announcements.lock().unwrap().push(announcement);
-            Ok(())
-        }
-        fn new_attestation(
-            &self,
-            _attestation: ethlambda_types::attestation::SignedAttestation,
-        ) -> Result<(), spawned_concurrency::error::ActorError> {
-            Ok(())
-        }
-        fn new_aggregated_attestation(
-            &self,
-            _attestation: ethlambda_types::attestation::SignedAggregatedAttestation,
-        ) -> Result<(), spawned_concurrency::error::ActorError> {
-            Ok(())
-        }
-        fn new_data_column_sidecars(
-            &self,
-            _sidecars: Vec<ethlambda_types::beacon::containers::DataColumnSidecar>,
-        ) -> Result<(), spawned_concurrency::error::ActorError> {
-            Ok(())
-        }
-        fn data_column_sidecars_awaiting_parent(
-            &self,
-            _sidecars: Vec<ethlambda_types::beacon::containers::DataColumnSidecar>,
-        ) -> Result<(), spawned_concurrency::error::ActorError> {
-            Ok(())
-        }
-        fn new_beacon_aggregate(
-            &self,
-            aggregate: Box<ethlambda_types::beacon::containers::SignedAggregateAndProof>,
-            attesting_indices: Vec<ethlambda_types::beacon::primitives::ValidatorIndex>,
-            _arrival: ethlambda_network_api::AggregateArrival,
-        ) -> Result<(), spawned_concurrency::error::ActorError> {
-            self.aggregates
-                .lock()
-                .unwrap()
-                .push((*aggregate, attesting_indices));
-            Ok(())
-        }
-        fn new_execution_payload_envelope(
-            &self,
-            _envelope: Box<
-                ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope,
-            >,
-            _arrival: ethlambda_network_api::BlockArrival,
-        ) -> Result<(), spawned_concurrency::error::ActorError> {
-            Ok(())
-        }
-        fn new_payload_attestation_message(
-            &self,
-            _message: ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage,
-            _arrival: ethlambda_network_api::BlockArrival,
-        ) -> Result<(), spawned_concurrency::error::ActorError> {
-            Ok(())
-        }
-    }
 
     /// A gloas envelope for `(root_byte, builder)` at slot `slot_number`
     /// zero. Only what the cheap gossip checks and the seen cache read is

@@ -1283,7 +1283,7 @@ mod tests {
     use ethlambda_types::beacon::primitives::Slot;
 
     use super::*;
-    use crate::test_support::{RecordingChain, unconnected_beacon_server, valid_shaped_sidecar};
+    use crate::test_support::{unconnected_beacon_server, valid_shaped_sidecar};
 
     /// An electra-shaped aggregate at `slot` with `data.index` set to
     /// `data_index`. Only what [`gossip::aggregate::cheap_checks`]'s very
@@ -1730,15 +1730,25 @@ mod tests {
             unreachable!("unconnected_beacon_server builds a beacon wire");
         };
         beacon.topics.fork_digest = beacon.digest_for_slot(5);
-        let chain = std::sync::Arc::new(RecordingChain::default());
-        server.blockchain = Some(chain.clone());
+        use ethlambda_network_api::ToP2PToBlockChainRef as _;
+        use ethlambda_network_api::p2p_to_block_chain::NewBeaconAggregate;
+
+        let chain = spawned_test::tasks::Mock::new().allow_sends().start();
+        server.blockchain = Some(chain.to_p2p_to_block_chain_ref());
         let aggregate = ethlambda_types::beacon::containers::SignedAggregateAndProof::Electra(
             electra_aggregate(5, 0),
         );
 
         publish_beacon_aggregate(&mut server, aggregate.clone(), vec![3, 4]).await;
 
-        assert_eq!(*chain.aggregates.lock().unwrap(), [(aggregate, vec![3, 4])]);
+        chain.settle().await;
+        let handed: Vec<_> = chain
+            .take_all::<NewBeaconAggregate>()
+            .into_iter()
+            .map(|sent| (*sent.aggregate, sent.attesting_indices))
+            .collect();
+        assert_eq!(handed, [(aggregate, vec![3, 4])]);
+        assert_eq!(chain.received().len(), 1);
     }
 
     /// A payload that does not decode as a gloas envelope is the sender's

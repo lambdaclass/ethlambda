@@ -90,8 +90,13 @@ hex = "0.4"
 hmac = "0.12"
 base64 = "0.22"
 
-spawned-concurrency = "0.5.0"
-spawned-rt = "0.5.0"
+# spawned 0.7.1 from crates.io. Every spawned crate must name the same version
+# so they share one set of types.
+# `metrics`: the actor runtime's own counters (mailbox depth, queue wait,
+# handler time, actor exits), appended to `/metrics` by ethlambda-rpc.
+spawned-concurrency = { version = "0.7.3", features = ["metrics"] }
+spawned-rt = "0.7.3"
+spawned-test = "0.7.3"
 tokio = "1.0"
 tokio-util = "0.7"
 

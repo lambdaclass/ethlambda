@@ -494,6 +494,8 @@ Some features we are looking to implement in the near future, in order of priori
 - [Add a guest program and ZK proving of the STF](https://github.com/lambdaclass/ethlambda/issues/156)
 - Rewrite the STF in the concrete programming language to enable formal verification
 
+The [testing and verification roadmap](docs/testing_roadmap.md) proposes how we plan to test the client: a seeded chain-logic simulator first, then model checking, fault injection and long-running soak tests.
+
 ### Experimental features
 
 We have a proof-of-concept formalization of a part of the state transition function in Lean4 in PR [#269](https://github.com/lambdaclass/ethlambda/pull/269).

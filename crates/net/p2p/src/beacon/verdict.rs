@@ -691,19 +691,40 @@ pub(crate) fn guarded(checks: impl FnOnce() -> Outcome) -> Outcome {
 mod tests {
     use std::sync::Arc;
 
-    use ethlambda_network_api::P2PToBlockChain;
+    use ethlambda_network_api::ToP2PToBlockChainRef as _;
+    use ethlambda_network_api::p2p_to_block_chain::{
+        NewBlock, NewExecutionPayloadEnvelope, NewPayloadAttestationMessage,
+    };
     use ethlambda_state_transition::beacon::gossip::{QueueReason, RejectReason};
-    use ethlambda_types::attestation::{SignedAggregatedAttestation, SignedAttestation};
     use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::containers::{
         AttestationData, Checkpoint, electra, gloas, phase0,
     };
-    use spawned_concurrency::error::ActorError;
+    use spawned_test::tasks::{Mock, MockRef};
 
     use super::*;
-    use crate::test_support::{
-        RecordingChain, envelope, unconnected_beacon_server, valid_shaped_sidecar,
-    };
+    use crate::test_support::{envelope, unconnected_beacon_server, valid_shaped_sidecar};
+
+    /// A chain actor stand-in that takes every send and logs it.
+    fn recording_chain(server: &mut P2PServer) -> MockRef {
+        let chain = Mock::new().allow_sends().start();
+        server.blockchain = Some(chain.to_p2p_to_block_chain_ref());
+        chain
+    }
+
+    /// A chain actor stand-in that fails the test on any message at all.
+    fn silent_chain(server: &mut P2PServer) -> MockRef {
+        let chain = Mock::new().start();
+        server.blockchain = Some(chain.to_p2p_to_block_chain_ref());
+        chain
+    }
+
+    /// Assert the chain actor was sent nothing. `forward` sends synchronously,
+    /// so once the mock has handled what was sent before, the log is complete.
+    async fn assert_nothing_sent(chain: &MockRef) {
+        chain.settle().await;
+        assert_eq!(chain.received(), []);
+    }
 
     /// A minimal fulu block for a given `(slot, proposer)`: `settle` and
     /// `record_seen` only ever read those two fields plus the root passed
@@ -914,8 +935,7 @@ mod tests {
     #[tokio::test]
     async fn only_an_accepted_gossip_block_is_announced() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
-        let chain = Arc::new(RecordingChain::default());
-        server.blockchain = Some(chain.clone());
+        let chain = recording_chain(&mut server);
         let block = || Validated::Block {
             block: Box::new(fulu_block(5, 1)),
             block_root: Root::repeat_byte(1),
@@ -933,21 +953,27 @@ mod tests {
             Outcome::Ignore(IgnoreReason::Overloaded),
         );
 
+        chain.settle().await;
+        let announcements: Vec<_> = chain
+            .take_all::<NewBlock>()
+            .into_iter()
+            .map(|sent| sent.announcement)
+            .collect();
         assert_eq!(
-            *chain.announcements.lock().unwrap(),
+            announcements,
             [
                 BlockAnnouncement::Announce,
                 BlockAnnouncement::Silent,
                 BlockAnnouncement::Silent
             ]
         );
+        chain.assert_no_unexpected();
     }
 
     #[tokio::test]
     async fn an_overloaded_aggregate_is_not_forwarded() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
-        let chain = Arc::new(RecordingChain::default());
-        server.blockchain = Some(chain.clone());
+        let chain = silent_chain(&mut server);
         let object = Validated::Aggregate {
             aggregate: Box::new(phase0_aggregate(5, 1)),
             attesting_indices: Vec::new(),
@@ -959,7 +985,7 @@ mod tests {
             Outcome::Ignore(IgnoreReason::Overloaded),
         );
 
-        assert!(chain.aggregates.lock().unwrap().is_empty());
+        assert_nothing_sent(&chain).await;
     }
 
     /// An accepted electra aggregate is what block production packs other
@@ -1102,8 +1128,7 @@ mod tests {
     #[tokio::test]
     async fn a_subnet_attestation_is_never_forwarded_even_on_accept() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
-        let chain = Arc::new(RecordingChain::default());
-        server.blockchain = Some(chain.clone());
+        let chain = silent_chain(&mut server);
         let object = Validated::Attestation {
             attestation: Box::new(electra_attestation(5, 1)),
             subnet_id: 0,
@@ -1111,74 +1136,7 @@ mod tests {
 
         object.forward(&server, Instant::now(), Outcome::Accept);
 
-        assert!(chain.aggregates.lock().unwrap().is_empty());
-    }
-
-    /// What `forward` handed the chain actor, by method.
-    #[derive(Debug, PartialEq)]
-    enum Sent {
-        Envelope,
-        PayloadAttestation,
-    }
-
-    /// A chain actor stand-in that reports only the two gloas deliveries.
-    struct GloasRecorder(tokio::sync::mpsc::UnboundedSender<Sent>);
-
-    impl P2PToBlockChain for GloasRecorder {
-        fn new_block(
-            &self,
-            _block: SignedBeaconBlock,
-            _source: BlockSource,
-            _arrival: BlockArrival,
-            _announcement: BlockAnnouncement,
-        ) -> Result<(), ActorError> {
-            Ok(())
-        }
-        fn new_attestation(&self, _attestation: SignedAttestation) -> Result<(), ActorError> {
-            Ok(())
-        }
-        fn new_aggregated_attestation(
-            &self,
-            _attestation: SignedAggregatedAttestation,
-        ) -> Result<(), ActorError> {
-            Ok(())
-        }
-        fn new_data_column_sidecars(
-            &self,
-            _sidecars: Vec<DataColumnSidecar>,
-        ) -> Result<(), ActorError> {
-            Ok(())
-        }
-        fn data_column_sidecars_awaiting_parent(
-            &self,
-            _sidecars: Vec<DataColumnSidecar>,
-        ) -> Result<(), ActorError> {
-            Ok(())
-        }
-        fn new_beacon_aggregate(
-            &self,
-            _aggregate: Box<SignedAggregateAndProof>,
-            _attesting_indices: Vec<ValidatorIndex>,
-            _arrival: AggregateArrival,
-        ) -> Result<(), ActorError> {
-            Ok(())
-        }
-        fn new_execution_payload_envelope(
-            &self,
-            _envelope: Box<SignedExecutionPayloadEnvelope>,
-            _arrival: BlockArrival,
-        ) -> Result<(), ActorError> {
-            let _ = self.0.send(Sent::Envelope);
-            Ok(())
-        }
-        fn new_payload_attestation_message(
-            &self,
-            _message: PayloadAttestationMessage,
-            _arrival: BlockArrival,
-        ) -> Result<(), ActorError> {
-            let _ = self.0.send(Sent::PayloadAttestation);
-            Ok(())
-        }
+        assert_nothing_sent(&chain).await;
     }
 
     pub(crate) fn payload_attestation(slot: u64, validator: u64) -> PayloadAttestationMessage {
@@ -1240,27 +1198,25 @@ mod tests {
     #[tokio::test]
     async fn an_envelope_is_forwarded_on_accept_and_queue_only() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
-        let (sender, mut received) = tokio::sync::mpsc::unbounded_channel();
-        server.blockchain = Some(Arc::new(GloasRecorder(sender)));
+        let chain = recording_chain(&mut server);
 
         let forward = |outcome| {
             Validated::Envelope(Box::new(envelope(1, 3))).forward(&server, Instant::now(), outcome)
         };
         forward(Outcome::Accept);
-        assert_eq!(received.try_recv(), Ok(Sent::Envelope));
         forward(Outcome::Queue(QueueReason::BlockUnknown));
-        assert_eq!(received.try_recv(), Ok(Sent::Envelope));
         forward(Outcome::Ignore(IgnoreReason::Overloaded));
         forward(Outcome::Reject(RejectReason::BadSignature));
-        assert!(received.try_recv().is_err());
+        chain.settle().await;
+        assert_eq!(chain.count::<NewExecutionPayloadEnvelope>(), 2);
+        assert_eq!(chain.received().len(), 2);
     }
 
     /// A payload attestation reaches the chain actor on `Accept` alone.
     #[tokio::test]
     async fn a_payload_attestation_is_forwarded_on_accept_only() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
-        let (sender, mut received) = tokio::sync::mpsc::unbounded_channel();
-        server.blockchain = Some(Arc::new(GloasRecorder(sender)));
+        let chain = recording_chain(&mut server);
 
         let forward = |outcome| {
             Validated::PayloadAttestation(payload_attestation(5, 1)).forward(
@@ -1272,9 +1228,10 @@ mod tests {
         forward(Outcome::Ignore(IgnoreReason::UnknownBlock));
         forward(Outcome::Ignore(IgnoreReason::Overloaded));
         forward(Outcome::Reject(RejectReason::NotInPtc));
-        assert!(received.try_recv().is_err());
         forward(Outcome::Accept);
-        assert_eq!(received.try_recv(), Ok(Sent::PayloadAttestation));
+        chain.settle().await;
+        assert_eq!(chain.count::<NewPayloadAttestationMessage>(), 1);
+        assert_eq!(chain.received().len(), 1);
     }
 
     /// An accepted payload attestation is pooled for block production, with
@@ -1447,8 +1404,7 @@ mod tests {
     #[tokio::test]
     async fn bids_and_preferences_never_reach_the_chain_actor() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
-        let (sender, mut received) = tokio::sync::mpsc::unbounded_channel();
-        server.blockchain = Some(Arc::new(GloasRecorder(sender)));
+        let chain = silent_chain(&mut server);
 
         for outcome in [
             Outcome::Accept,
@@ -1463,7 +1419,7 @@ mod tests {
             );
         }
 
-        assert!(received.try_recv().is_err());
+        assert_nothing_sent(&chain).await;
     }
 
     /// Bids and preferences draw from a pool of their own, so a burst of them
@@ -1749,8 +1705,7 @@ mod tests {
     #[tokio::test]
     async fn sync_committee_gossip_never_reaches_the_chain_actor() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
-        let (sender, mut received) = tokio::sync::mpsc::unbounded_channel();
-        server.blockchain = Some(Arc::new(GloasRecorder(sender)));
+        let chain = silent_chain(&mut server);
         for outcome in [
             Outcome::Accept,
             Outcome::Queue(QueueReason::BlockUnknown),
@@ -1764,7 +1719,7 @@ mod tests {
                 outcome,
             );
         }
-        assert!(received.try_recv().is_err());
+        assert_nothing_sent(&chain).await;
     }
 
     /// The sync pool is its own: exhausting it must not starve the block and
