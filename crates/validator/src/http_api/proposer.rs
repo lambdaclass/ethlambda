@@ -12,13 +12,14 @@
 //! one to drop.
 //!
 //! Every route answers 404 for a key this client does not hold. The check and
-//! the change happen under one read of the validator store, so a keystore
-//! delete, which takes that store's write lock and then forgets the key's
-//! settings, cannot land between them and leave an override behind for a key
-//! that is gone. The file is written under the same `definitions_lock` the
-//! keystore routes take, and before memory changes: a failed write is a 500
-//! that changes nothing, so what the operator sees is what the next restart
-//! loads.
+//! the change happen under one hold of `definitions_lock`, which a keystore
+//! delete also holds from before it removes the key until after it has
+//! forgotten the key's settings, so a delete cannot land between them and
+//! leave an override behind for a key that is gone. The validator store's own
+//! lock is read for the check alone and released before the file is touched,
+//! since the duty loop signs under it. The file is written before memory
+//! changes: a failed write is a 500 that changes nothing, so what the operator
+//! sees is what the next restart loads.
 
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
@@ -123,8 +124,17 @@ fn require_held(store: &ValidatorStore, pubkey: &BlsPubkey) -> Result<(), ApiErr
 ///
 /// Locks in the order the keystore routes take them: `definitions_lock`
 /// first, which serialises this open-mutate-save cycle against a concurrent
-/// import or delete, then `store`'s read lock for the held check, kept until
-/// the change is applied so a delete cannot land in between.
+/// import or delete, then `store`'s read lock for the held check.
+///
+/// The read lock is released as soon as the check has answered, not kept
+/// across the file work below. It does not need to be: only a delete removes
+/// a key, and a delete holds `definitions_lock` for its whole duration, so
+/// none can land before the change is applied. And it must not be: an import
+/// takes `store`'s write lock after it has released `definitions_lock`, that
+/// write would queue behind a read still held here, and
+/// `tokio::sync::RwLock` is write-preferring, so every signature the duty
+/// loop owes would wait behind it for as long as this file took to read,
+/// write and flush.
 ///
 /// A held key with no entry in the file can only mean the file was edited
 /// under a running client. That is a 500 naming the file rather than a
@@ -135,8 +145,9 @@ async fn persist_and_apply(
     change: SettingChange,
 ) -> Result<(), ApiError> {
     let _definitions_guard = context.definitions_lock.lock().await;
-    let store = context.store.read().await;
-    require_held(&store, pubkey)?;
+    // The guard is a temporary of this statement, so it is gone before the
+    // file is opened.
+    require_held(&*context.store.read().await, pubkey)?;
 
     let path = context
         .validators_dir

@@ -8,8 +8,37 @@
 //! convention here is `0600`; everything in this crate that writes such a
 //! file must go through one of these two functions instead, to actually
 //! follow that convention rather than only claim to.
+//!
+//! Both also flush what they wrote to the device before returning. Each of
+//! these files is one a later step relies on having reached disk: the
+//! definitions file's `.tmp` sibling is renamed over the live file, and a
+//! rename can survive a power loss that the data behind it did not, leaving
+//! an empty definitions file, which parses as "no validators" rather than as
+//! an error; an imported keystore and its password are named by a definitions
+//! entry that is made durable right after them.
 
 use std::path::Path;
+
+/// Write `contents` to `file` and flush them to the device.
+fn write_durably(mut file: std::fs::File, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    use std::io::Write as _;
+    file.write_all(contents.as_ref())?;
+    file.sync_all()
+}
+
+/// Flush a directory, which is what makes a `rename` into it durable: until
+/// then a power loss can bring the old name's target back.
+#[cfg(unix)]
+pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// A directory cannot be opened as a file here; the rename is left to the
+/// platform.
+#[cfg(not(unix))]
+pub(crate) fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
 
 /// Write `contents`, creating the file if it does not exist and truncating it
 /// if it does, at mode `0600` on unix.
@@ -22,20 +51,19 @@ use std::path::Path;
 /// [`write_private_no_symlink`] for the ones that are.
 #[cfg(unix)]
 pub(crate) fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
-    use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
         .open(path)?;
-    file.write_all(contents.as_ref())
+    write_durably(file, contents)
 }
 
 #[cfg(not(unix))]
 pub(crate) fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
-    std::fs::write(path, contents)
+    write_durably(std::fs::File::create(path)?, contents)
 }
 
 /// Write `contents` at mode `0600`, refusing to follow an existing symlink at
@@ -55,16 +83,15 @@ pub(crate) fn write_private_no_symlink(
     path: &Path,
     contents: impl AsRef<[u8]>,
 ) -> std::io::Result<()> {
-    use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
-    file.write_all(contents.as_ref())
+    write_durably(file, contents)
 }
 
 #[cfg(not(unix))]
@@ -72,7 +99,7 @@ pub(crate) fn write_private_no_symlink(
     path: &Path,
     contents: impl AsRef<[u8]>,
 ) -> std::io::Result<()> {
-    std::fs::write(path, contents)
+    write_durably(std::fs::File::create(path)?, contents)
 }
 
 #[cfg(all(test, unix))]
@@ -92,6 +119,16 @@ mod tests {
             .mode();
         assert_eq!(mode & 0o777, 0o600, "got {mode:o}");
         assert_eq!(std::fs::read_to_string(&path).expect("reads"), "shh");
+    }
+
+    /// `ValidatorDefinitions::save` calls this after every rename. It only
+    /// logs a failure, so a platform that refused to flush a directory would
+    /// show up as a warning on every keymanager write and nowhere else.
+    #[test]
+    fn sync_dir_flushes_a_directory() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_private(&dir.path().join("secret"), "shh").expect("writes");
+        sync_dir(dir.path()).expect("a directory can be flushed");
     }
 
     #[test]

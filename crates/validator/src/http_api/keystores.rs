@@ -33,6 +33,7 @@ use crate::beacon_node::dto::{encode_hex, parse_pubkey};
 use crate::http_api::KeymanagerContext;
 use crate::keys::keystore::Keystore;
 use crate::keys::{ValidatorDefinition, ValidatorDefinitions, ValidatorStore};
+use crate::proposer_settings::Overrides;
 use crate::secure_fs;
 
 /// The EIP-3076 interchange version this client reports when it has no history.
@@ -294,6 +295,31 @@ fn persist_import(
     let keystore_path = absolute(context.validators_dir.join(format!("{base}.json")))?;
     let password_path = absolute(context.secrets_dir.join(&base))?;
 
+    // Re-importing an already-known key updates its entry in place instead
+    // of appending a duplicate: `voting_public_key` is this file's natural
+    // key, and a duplicate would make `ValidatorStore::load` process the
+    // same keystore twice on the next restart.
+    //
+    // Compared as keys, the way the delete and the settings routes find an
+    // entry, not as text: a hand-written entry may spell its key in upper
+    // case or without the `0x`, and one this lookup missed would be appended
+    // beside rather than replaced, leaving its overrides on an entry the
+    // settings below no longer describe.
+    let position = definitions.0.iter().position(|existing| {
+        parse_pubkey(&existing.voting_public_key).is_ok_and(|parsed| parsed == *pubkey)
+    });
+
+    // The overrides the rebuilt entry will carry (see `with_overrides_of`
+    // below), parsed before anything is written. Startup parses enabled
+    // entries only, so the entry being replaced may hold a value nothing has
+    // checked yet, and this import is what enables it: carried over unparsed,
+    // a malformed one would be reported `imported` and then refuse the next
+    // start, for every validator rather than this one.
+    let overrides = match position {
+        Some(index) => definitions.0[index].overrides()?,
+        None => Overrides::default(),
+    };
+
     // `write_private_no_symlink` still overwrites an existing *regular*
     // file, so re-importing the same key (rotating its password, or simply
     // retrying) behaves exactly as a plain `std::fs::write` would; it only
@@ -335,15 +361,7 @@ fn persist_import(
         },
     }
 
-    // Re-importing an already-known key updates its entry in place instead
-    // of appending a duplicate: `voting_public_key` is this file's natural
-    // key, and a duplicate would make `ValidatorStore::load` process the
-    // same keystore twice on the next restart.
-    let undo = match definitions
-        .0
-        .iter()
-        .position(|existing| existing.voting_public_key == base)
-    {
+    let undo = match position {
         Some(index) => {
             // A re-imported key keeps the fee recipient, graffiti and gas
             // limit its entry held: only the keystore and password move.
@@ -371,6 +389,16 @@ fn persist_import(
         }
         return Err(err);
     }
+
+    // The file now holds this key's entry, enabled, with these overrides, so
+    // the settings must hold them too. For a key already loaded this changes
+    // nothing. For an entry this import enables (one that was disabled, or
+    // one a failed delete left behind after forgetting the key's settings)
+    // nothing else would load them before the next restart: the file would
+    // name one fee recipient while the process paid the default, and the
+    // restart would switch it with no request having asked. A fresh import
+    // has none, which clears anything left over for the key.
+    context.settings.seed(pubkey, overrides);
     Ok(())
 }
 
@@ -909,6 +937,154 @@ mod tests {
         let definitions = ValidatorDefinitions::open(dir.path()).expect("opens");
         assert_eq!(definitions.0.len(), 1, "one entry, not a duplicate");
         assert_eq!(definitions.0[0].graffiti.as_deref(), Some("kept"));
+    }
+
+    /// The public key of [`keystore_json`]'s keystore.
+    fn keystore_pubkey() -> BlsPubkey {
+        parse_pubkey(
+            "9612d7a727c9d0a22e185a1c768478dfe919cada9266988cb32359c11f2b7b27f4ae4040902382ae2910c15e2b420d07",
+        )
+        .expect("valid pubkey")
+    }
+
+    /// A disabled entry for [`keystore_json`]'s key carrying overrides of its
+    /// own, as an operator would have left one in the file.
+    fn disabled_entry(suggested_fee_recipient: &str) -> ValidatorDefinition {
+        ValidatorDefinition {
+            enabled: false,
+            voting_public_key: encode_hex(&keystore_pubkey().0),
+            voting_keystore_path: PathBuf::from("old.json"),
+            voting_keystore_password_path: PathBuf::from("old.txt"),
+            suggested_fee_recipient: Some(suggested_fee_recipient.to_string()),
+            graffiti: Some("kept".to_string()),
+            gas_limit: Some(30_000_000),
+        }
+    }
+
+    fn import_request() -> Request<Body> {
+        let import = serde_json::json!({
+            "keystores": [keystore_json()],
+            "passwords": [PASSWORD],
+        });
+        authed("POST", "/eth/v1/keystores", import)
+    }
+
+    /// An import is what enables a disabled entry, so it is also what has to
+    /// load the overrides the entry carries: startup seeds enabled entries
+    /// only. Without that the file names one fee recipient while the process
+    /// pays the default and `GET feerecipient` reports the default, until a
+    /// restart switches the payout with no request having asked for it.
+    #[tokio::test]
+    async fn an_import_that_enables_an_entry_loads_the_overrides_it_carries() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Arc::new(RwLock::new(ValidatorStore::new()));
+        let context = context_with_dirs(store.clone(), dir.path());
+        let app = router(context.clone(), TOKEN.to_string());
+        let pubkey = keystore_pubkey();
+        let own = format!("0x{}", "bb".repeat(20));
+        ValidatorDefinitions(vec![disabled_entry(&own)])
+            .save(dir.path())
+            .expect("writes the definitions file");
+
+        let (status, body) = send(app.clone(), import_request()).await;
+        assert_eq!(status, StatusCode::OK, "got {body}");
+        assert_eq!(body["data"][0]["status"], "imported", "got {body}");
+
+        let definitions = ValidatorDefinitions::open(dir.path()).expect("opens");
+        assert_eq!(definitions.0.len(), 1, "one entry, not a duplicate");
+        assert!(definitions.0[0].enabled);
+        let persisted = definitions.0[0].overrides().expect("valid");
+        assert_eq!(
+            persisted.fee_recipient,
+            Some(ethlambda_types::beacon::primitives::H160([0xbb; 20])),
+            "the entry keeps what it carried"
+        );
+        assert_eq!(persisted.gas_limit, Some(30_000_000));
+        assert_eq!(
+            context.settings.overrides(&pubkey),
+            persisted,
+            "the process must run with what the file says, not the defaults"
+        );
+
+        // And it is what the API reports. This context has no default fee
+        // recipient, so an import that left the settings alone answers 500.
+        let path = format!("/eth/v1/validator/{}/feerecipient", encode_hex(&pubkey.0));
+        let request = Request::builder()
+            .uri(&path)
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(Body::empty())
+            .expect("request");
+        let (status, body) = send(app, request).await;
+        assert_eq!(status, StatusCode::OK, "got {body}");
+        assert_eq!(body["data"]["ethaddress"], own, "got {body}");
+    }
+
+    /// Startup parses enabled entries only, so a disabled entry can hold a
+    /// value nothing has checked. An import that enabled it unparsed would
+    /// report `imported` and then refuse the next start, for every validator.
+    /// It is refused here instead, before anything is written.
+    #[tokio::test]
+    async fn a_malformed_override_on_the_entry_fails_the_import_and_changes_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Arc::new(RwLock::new(ValidatorStore::new()));
+        let context = context_with_dirs(store.clone(), dir.path());
+        let app = router(context.clone(), TOKEN.to_string());
+        let pubkey = keystore_pubkey();
+        let existing = disabled_entry("0x1234");
+        ValidatorDefinitions(vec![existing.clone()])
+            .save(dir.path())
+            .expect("writes the definitions file");
+
+        let (status, body) = send(app, import_request()).await;
+        assert_eq!(status, StatusCode::OK, "got {body}");
+        assert_eq!(body["data"][0]["status"], "error", "got {body}");
+        assert!(
+            body["data"][0]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("suggested_fee_recipient")),
+            "the error should name the field: {body}"
+        );
+
+        assert_eq!(
+            ValidatorDefinitions::open(dir.path()).expect("opens").0,
+            vec![existing],
+            "the entry stays as it was, disabled"
+        );
+        assert!(store.read().await.is_empty(), "the key is not signing");
+        assert_eq!(context.settings.overrides(&pubkey), Overrides::default());
+        let keystore = dir.path().join(format!("{}.json", encode_hex(&pubkey.0)));
+        assert!(!keystore.exists(), "refused before the keystore is written");
+    }
+
+    /// The entry is found by its key, not by how the file spells it: a
+    /// hand-written `voting_public_key` in upper case with no `0x` loads like
+    /// any other, so a re-import must replace it, overrides carried, rather
+    /// than append a second entry beside it.
+    #[tokio::test]
+    async fn a_reimport_replaces_an_entry_that_spells_its_key_differently() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Arc::new(RwLock::new(ValidatorStore::new()));
+        let context = context_with_dirs(store.clone(), dir.path());
+        let app = router(context.clone(), TOKEN.to_string());
+        let pubkey = keystore_pubkey();
+        let mut existing = disabled_entry(&format!("0x{}", "bb".repeat(20)));
+        existing.voting_public_key = hex::encode_upper(pubkey.0);
+        ValidatorDefinitions(vec![existing])
+            .save(dir.path())
+            .expect("writes the definitions file");
+
+        let (status, body) = send(app, import_request()).await;
+        assert_eq!(status, StatusCode::OK, "got {body}");
+        assert_eq!(body["data"][0]["status"], "imported", "got {body}");
+
+        let definitions = ValidatorDefinitions::open(dir.path()).expect("opens");
+        assert_eq!(definitions.0.len(), 1, "replaced, not appended beside");
+        assert_eq!(definitions.0[0].voting_public_key, encode_hex(&pubkey.0));
+        assert_eq!(definitions.0[0].graffiti.as_deref(), Some("kept"));
+        assert_eq!(
+            context.settings.overrides(&pubkey),
+            definitions.0[0].overrides().expect("valid")
+        );
     }
 
     /// The regression test for the gap that let the keymanager mutate only

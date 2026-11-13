@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::beacon_node::dto::parse_pubkey;
 use crate::error::{Error, Result};
@@ -137,6 +138,15 @@ impl ValidatorDefinitions {
     /// would leave a truncated file that stops the client booting, losing every
     /// validator rather than the one being changed. `rename` within one
     /// directory is atomic, so a reader sees the old file or the new one.
+    ///
+    /// That holds across a power loss too, not only a crash of this process:
+    /// `write_private` flushes the temporary file before the rename, so the
+    /// name never points at data that has not reached the device. Without it
+    /// the rename can survive and the data not, and an empty definitions file
+    /// is not an error: it parses as no validators at all, so the client would
+    /// start, idle, and say so in one warning. The directory is flushed after
+    /// the rename so that a change the keymanager has answered for is not
+    /// undone by one either.
     pub fn save(&self, validators_dir: &Path) -> Result<()> {
         let path = validators_dir.join(DEFINITIONS_FILE);
         let contents = serde_yaml_ng::to_string(self).map_err(|err| Error::Keystore {
@@ -155,7 +165,22 @@ impl ValidatorDefinitions {
         std::fs::rename(&temporary, &path).map_err(|source| Error::Io {
             path: path.display().to_string(),
             source,
-        })
+        })?;
+
+        // Logged, not returned. The rename above is the commit: the new file
+        // is already what every reader sees, and every caller takes an error
+        // from here to mean the file is unchanged (an import undoes its entry,
+        // a settings route leaves memory alone). Failing now would make that
+        // false, to report a rename that is in place but not yet flushed.
+        let _ = secure_fs::sync_dir(validators_dir).inspect_err(|err| {
+            warn!(
+                path = %validators_dir.display(),
+                %err,
+                "Wrote the validator definitions file but could not flush its directory; the \
+                 change is in place and may not survive a power loss"
+            )
+        });
+        Ok(())
     }
 
     /// The entries that should be loaded and signed with.

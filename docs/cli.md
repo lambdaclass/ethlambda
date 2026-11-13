@@ -422,7 +422,10 @@ before the request is answered, and loaded again at startup, so a restart runs
 with what the operator set. A write that fails is a `500` that changes nothing.
 The fields may also be put in the file by hand before the client starts; a
 malformed one refuses startup. Deleting a keystore drops its entry and its
-values with it.
+values with it. Importing a key whose entry is already in the file, a
+re-import or one that enables a disabled entry, keeps the entry's values and
+runs with them at once; if one of them is malformed the import is refused and
+nothing is written.
 
 A few answers worth knowing: `GET feerecipient` is a `500` when the validator
 has no address and there is no `--suggested-fee-recipient` default, as
