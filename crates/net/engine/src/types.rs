@@ -12,9 +12,12 @@
 use ethlambda_types::beacon::containers::capella::Withdrawal;
 use ethlambda_types::beacon::containers::{deneb, gloas};
 use ethlambda_types::beacon::preset;
-use ethlambda_types::beacon::primitives::{ExecutionBlockHash, Uint256};
+use ethlambda_types::beacon::primitives::{ExecutionBlockHash, KzgProof, Uint256};
 use ethlambda_types::beacon::serde_helpers::HexPrefixed;
 use serde::{Deserialize, Serialize, Serializer};
+
+use crate::building::{parse_data, parse_fixed};
+use crate::error::EngineError;
 
 /// `PayloadStatusV1.status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -253,6 +256,76 @@ pub fn uint256(value: &Uint256) -> String {
         return "0x0".to_string();
     }
     format!("0x{trimmed}")
+}
+
+/// `BlobAndProofV2` (Osaka): one blob from the execution client's blob pool,
+/// with its `CELLS_PER_EXT_BLOB` cell proofs.
+///
+/// Produced only by `decode_blobs_v2`, which checks the wire shape, so a value
+/// of this type always has a `BYTES_PER_BLOB` blob and exactly
+/// `CELLS_PER_EXT_BLOB` proofs. The proofs are not verified: the specification
+/// lets a consensus client skip that for blobs from its own execution client.
+#[derive(Debug, Clone)]
+pub struct BlobAndProofV2 {
+    /// The blob, `BYTES_PER_BLOB` bytes.
+    pub blob: Vec<u8>,
+    /// The blob's cell proofs, exactly `CELLS_PER_EXT_BLOB` of them.
+    pub proofs: Vec<ethlambda_types::beacon::primitives::KzgProof>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct BlobAndProofV2Json {
+    blob: String,
+    proofs: Vec<String>,
+}
+
+/// Decodes an `engine_getBlobsV2` result for a request of `requested` hashes.
+///
+/// `null` is `Ok(None)`: the execution client is missing at least one blob, or
+/// cannot serve its pool. A `null` element is a decode error, since V2 never
+/// sends one (V3 does, for a partial answer).
+pub(crate) fn decode_blobs_v2(
+    result: Option<Vec<Option<BlobAndProofV2Json>>>,
+    requested: usize,
+) -> Result<Option<Vec<BlobAndProofV2>>, EngineError> {
+    let Some(entries) = result else {
+        return Ok(None);
+    };
+    if entries.len() != requested {
+        return Err(EngineError::Decode(format!(
+            "asked for {requested} blobs, got {}",
+            entries.len()
+        )));
+    }
+
+    let mut blobs = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.into_iter().enumerate() {
+        let json = entry
+            .ok_or_else(|| EngineError::Decode(format!("blob {index} is null in a V2 answer")))?;
+
+        let blob = parse_data(&json.blob)?;
+        if blob.len() != preset::BYTES_PER_BLOB {
+            return Err(EngineError::Decode(format!(
+                "blob {index} is {} bytes, expected BYTES_PER_BLOB ({})",
+                blob.len(),
+                preset::BYTES_PER_BLOB
+            )));
+        }
+        if json.proofs.len() != preset::CELLS_PER_EXT_BLOB {
+            return Err(EngineError::Decode(format!(
+                "blob {index} has {} proofs, expected CELLS_PER_EXT_BLOB ({})",
+                json.proofs.len(),
+                preset::CELLS_PER_EXT_BLOB
+            )));
+        }
+        let proofs = json
+            .proofs
+            .iter()
+            .map(|text| parse_fixed(text).map(KzgProof))
+            .collect::<Result<Vec<_>, _>>()?;
+        blobs.push(BlobAndProofV2 { blob, proofs });
+    }
+    Ok(Some(blobs))
 }
 
 #[cfg(test)]
@@ -496,5 +569,45 @@ mod tests {
             uint256(&U256(most_significant)),
             format!("0xa{}", "0".repeat(62))
         );
+    }
+
+    fn blob_json(blob_len: usize, proof_count: usize) -> BlobAndProofV2Json {
+        BlobAndProofV2Json {
+            blob: format!("0x{}", "00".repeat(blob_len)),
+            proofs: vec![format!("0x{}", "11".repeat(48)); proof_count],
+        }
+    }
+
+    #[test]
+    fn a_blob_of_the_wrong_size_is_a_decode_error() {
+        let answer = Some(vec![Some(blob_json(
+            preset::BYTES_PER_BLOB - 1,
+            preset::CELLS_PER_EXT_BLOB,
+        ))]);
+        assert!(matches!(
+            decode_blobs_v2(answer, 1),
+            Err(EngineError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn a_null_element_is_a_decode_error() {
+        let answer = Some(vec![None]);
+        assert!(matches!(
+            decode_blobs_v2(answer, 1),
+            Err(EngineError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn a_well_formed_blob_decodes() {
+        let answer = Some(vec![Some(blob_json(
+            preset::BYTES_PER_BLOB,
+            preset::CELLS_PER_EXT_BLOB,
+        ))]);
+        let blobs = decode_blobs_v2(answer, 1)
+            .expect("well formed")
+            .expect("some");
+        assert_eq!(blobs[0].proofs.len(), preset::CELLS_PER_EXT_BLOB);
     }
 }

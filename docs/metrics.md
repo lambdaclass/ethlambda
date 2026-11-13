@@ -600,6 +600,17 @@ spec.
 | `lean_envelopes_awaiting_block` | Gauge | Gloas execution payload envelopes held until their block is imported | On every hold, release, and finality eviction of the held envelopes | | |
 | `lean_envelopes_awaiting_columns` | Gauge | Gloas execution payload envelopes held until every sampled column is stored | On every hold, release, and finality eviction of the held envelopes | | |
 | `lean_blocks_awaiting_parent_payload` | Gauge | Gloas blocks held until their FULL parent's payload envelope is verified | On every hold, release, and finality eviction of the held blocks | | |
+| `lean_engine_get_blobs_total` | Counter | `engine_getBlobsV2` attempts for held fulu blocks, by outcome | On each answer of the one attempt made at a block's first hold | outcome=hit,miss,error | |
+| `lean_engine_get_blobs_duration_seconds` | Histogram | Time for one `engine_getBlobsV2` round trip | On each attempt, whatever its outcome | | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0 |
+| `lean_engine_blobs_to_columns_seconds` | Histogram | Time to build custody data column sidecars from execution-client blobs | On each build that reaches the cell computation, off the actor thread | | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0 |
+| `lean_data_columns_from_execution_layer_total` | Counter | Data column sidecars built from the execution client's blobs, by what p2p did with them | On each hand-over, once per result, incremented by the column count | result=published,no_digest,already_seen,not_custody | |
+
+`lean_engine_get_blobs_total` and its siblings cover the execution-client path
+(`docs/beacon_engine.md`, "Blobs from the execution client"). A high `miss`
+share means the execution client's blob pool lacks the blobs, which is normal
+for old blocks and for a syncing execution client; `already_seen` in
+`lean_data_columns_from_execution_layer_total` counts columns gossip delivered
+first.
 
 `lean_data_columns_rejected_total` counts the chain checks, which run in the
 p2p layer on every sidecar gossip did not accept: every fetched sidecar, a
