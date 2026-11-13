@@ -188,7 +188,7 @@ fn electra_requests() -> electra::ExecutionRequests {
     }
 }
 
-fn electra_block() -> electra::SignedBeaconBlock {
+pub(crate) fn electra_block() -> electra::SignedBeaconBlock {
     let mut body = electra::BeaconBlockBody::empty();
     body.randao_reveal = signature(1);
     body.graffiti = [9; 32].into();
@@ -371,6 +371,13 @@ fn gloas_block() -> gloas::SignedBeaconBlock {
 #[test]
 fn a_fulu_block_round_trips_through_json() {
     round_trip(&electra_block());
+}
+
+#[test]
+fn an_execution_payload_header_round_trips_through_json() {
+    round_trip(&super::deneb::ExecutionPayloadHeader::from(
+        &electra_payload(),
+    ));
 }
 
 #[test]
