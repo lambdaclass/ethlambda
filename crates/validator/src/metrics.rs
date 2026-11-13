@@ -134,6 +134,42 @@ static BUILDER_REGISTRATION_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new
     .unwrap()
 });
 
+/// Proposer preferences a beacon node accepted. Counted per preference, so a
+/// full epoch's worth reads as that many, and once, when the first node
+/// accepts it: the re-sends to nodes that missed it do not count again.
+static PROPOSER_PREFERENCES_PUBLISHED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_proposer_preferences_published_total",
+        "Proposer preferences a beacon node accepted"
+    )
+    .unwrap()
+});
+
+/// Proposer preference sends some beacon node refused or did not answer, one
+/// count per preference per attempt, re-sends included. The next slot retries,
+/// so this is a warning sign: a node that misses one never gossips it, and
+/// until some node accepts it, builders' bids for the slot are ignored. A send
+/// whose slot started before the nodes answered is not counted.
+static PROPOSER_PREFERENCES_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_proposer_preferences_failures_total",
+        "Proposer preference sends some beacon node refused or did not answer"
+    )
+    .unwrap()
+});
+
+/// v2 proposer-duty fetches no beacon node answered, one count per target epoch
+/// per attempt. Without the duties no preference is signed for that epoch, so a
+/// node that is syncing or lacks the endpoint shows up here and not as refused
+/// preferences.
+static PROPOSER_PREFERENCES_DUTY_FETCH_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_proposer_preferences_duty_fetch_failures_total",
+        "v2 proposer-duty fetches no beacon node answered"
+    )
+    .unwrap()
+});
+
 /// Blinded blocks a beacon node handed to its builder.
 static BLINDED_BLOCKS_PROPOSED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
@@ -406,6 +442,9 @@ pub fn init() {
     LazyLock::force(&BLOCKS_BROADCAST_NOT_IMPORTED_TOTAL);
     LazyLock::force(&BUILDER_REGISTRATIONS_SENT_TOTAL);
     LazyLock::force(&BUILDER_REGISTRATION_FAILURES_TOTAL);
+    LazyLock::force(&PROPOSER_PREFERENCES_PUBLISHED_TOTAL);
+    LazyLock::force(&PROPOSER_PREFERENCES_FAILURES_TOTAL);
+    LazyLock::force(&PROPOSER_PREFERENCES_DUTY_FETCH_FAILURES_TOTAL);
     LazyLock::force(&BLINDED_BLOCKS_PROPOSED_TOTAL);
     LazyLock::force(&BLINDED_BLOCKS_UNCONFIRMED_TOTAL);
     LazyLock::force(&BLOCKS_REFUSED_TOTAL);
@@ -481,6 +520,18 @@ pub fn inc_builder_registrations_sent(count: usize) {
 
 pub fn inc_builder_registration_failures() {
     BUILDER_REGISTRATION_FAILURES_TOTAL.inc();
+}
+
+pub fn inc_proposer_preferences_published(count: usize) {
+    PROPOSER_PREFERENCES_PUBLISHED_TOTAL.inc_by(count as u64);
+}
+
+pub fn inc_proposer_preferences_failures() {
+    PROPOSER_PREFERENCES_FAILURES_TOTAL.inc();
+}
+
+pub fn inc_proposer_preferences_duty_fetch_failures() {
+    PROPOSER_PREFERENCES_DUTY_FETCH_FAILURES_TOTAL.inc();
 }
 
 pub fn inc_blinded_blocks_proposed() {

@@ -10,15 +10,15 @@ use ethlambda_types::beacon::builder::ValidatorRegistrationV1;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::constants::{
     DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_BUILDER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
-    DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
-    DOMAIN_VOLUNTARY_EXIT,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PROPOSER_PREFERENCES,
+    DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE,
+    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
 use ethlambda_types::beacon::containers::altair::{
     ContributionAndProof, SyncAggregatorSelectionData,
 };
 use ethlambda_types::beacon::containers::gloas::{
-    ExecutionPayloadEnvelope, PayloadAttestationData,
+    ExecutionPayloadEnvelope, PayloadAttestationData, ProposerPreferences,
 };
 use ethlambda_types::beacon::containers::shared::{
     AttestationData, BeaconBlockHeader, Fork, VoluntaryExit,
@@ -681,25 +681,74 @@ impl SigningContext {
     /// slashable: a registration commits to nothing about the chain, and a
     /// builder keeps only the newest one per validator.
     ///
-    /// The one synchronous `sign_*`, and local keys only. Registrations are
-    /// signed in bulk on the blocking pool, under a store read guard taken per
-    /// chunk (see [`crate::registration`]), to keep thousands of signatures off
-    /// the runtime; a remote signer's round trip has no place there. A key a
-    /// Web3Signer holds is refused, and goes unregistered: it gets no builder
-    /// bid and its blocks are built locally, which costs no duty.
+    /// Synchronous and local keys only, through [`Self::sign_local`].
+    /// Registrations are signed in bulk on the blocking pool, under a store
+    /// read guard taken per chunk (see [`crate::registration`]), to keep
+    /// thousands of signatures off the runtime; a remote signer's round trip
+    /// has no place there. A key a Web3Signer holds goes unregistered: it gets
+    /// no builder bid and its blocks are built locally, which costs no duty.
     pub fn sign_validator_registration(
         &self,
         store: &ValidatorStore,
         registration: &ValidatorRegistrationV1,
     ) -> Result<BlsSignature> {
-        let pubkey = &registration.pubkey;
+        let domain = compute_builder_domain(self.config.genesis_fork_version);
+        let root = compute_signing_root(registration.hash_tree_root(), domain);
+        self.sign_local(store, &registration.pubkey, root, "builder registrations")
+    }
+
+    /// A proposer preferences message's signature, under
+    /// `DOMAIN_PROPOSER_PREFERENCES` at the fork version of the proposal
+    /// epoch itself.
+    ///
+    /// That is `get_signed_proposer_preferences` as of consensus-specs
+    /// v1.7.0-beta.4, `compute_fork_version(proposal_epoch)` read off the
+    /// schedule, and the `proposer_preferences` gossip rule verifies under the
+    /// same domain. Every other client signs and verifies this way
+    /// (Lighthouse, Prysm, Teku, Lodestar and Nimbus all take the fork of the
+    /// proposal's epoch).
+    ///
+    /// The rule before it, beta.2's, verified with `get_domain` on the
+    /// dependent block's state advanced to the lookahead start, which gives
+    /// the fork of the epoch before the proposal's. That differs only for a
+    /// proposal in the first epoch of a fork, and there Lighthouse refuses it
+    /// as a bad signature: it did so for every first-gloas-epoch preference
+    /// this client signed that way on a devnet. Not slashable.
+    ///
+    /// Synchronous and local keys only, through [`Self::sign_local`]: signed
+    /// under the read guard [`crate::preferences`] holds for the batch. A key
+    /// a Web3Signer holds publishes no preferences, so no builder bids for its
+    /// slot and the node builds its payload locally, which costs no duty.
+    pub fn sign_proposer_preferences(
+        &self,
+        store: &ValidatorStore,
+        pubkey: &BlsPubkey,
+        preferences: &ProposerPreferences,
+    ) -> Result<BlsSignature> {
+        let proposal_epoch = compute_epoch_at_slot(preferences.proposal_slot);
+        let domain = self.domain(DOMAIN_PROPOSER_PREFERENCES, proposal_epoch);
+        let root = compute_signing_root(preferences.hash_tree_root(), domain);
+        self.sign_local(store, pubkey, root, "proposer preferences")
+    }
+
+    /// Sign `root` with `pubkey`'s key, which this process must hold.
+    ///
+    /// For the messages signed synchronously, under a store guard the caller
+    /// already holds: builder registrations and proposer preferences. No
+    /// remote signer request is defined for either here, so a key a
+    /// Web3Signer holds is refused, `what` naming the message.
+    fn sign_local(
+        &self,
+        store: &ValidatorStore,
+        pubkey: &BlsPubkey,
+        root: Root,
+        what: &str,
+    ) -> Result<BlsSignature> {
         match store
             .signer(pubkey)
             .ok_or(Error::UnknownValidator(*pubkey))?
         {
             SigningMethod::LocalKeystore { secret_key } => {
-                let domain = compute_builder_domain(self.config.genesis_fork_version);
-                let root = compute_signing_root(registration.hash_tree_root(), domain);
                 let signature = secret_key.sign(root.as_slice(), DST, &[]);
                 let bytes: [u8; BLS_SIGNATURE_SIZE] = signature.to_bytes();
                 Ok(BlsSignature(bytes))
@@ -707,8 +756,8 @@ impl SigningContext {
             SigningMethod::Web3Signer { signer } => Err(Error::Signing {
                 pubkey: *pubkey,
                 reason: format!(
-                    "builder registrations are not signed through a remote signer yet; the key \
-                     held by {} is not registered with the builder",
+                    "{what} are not signed through a remote signer yet, so the key held by {} \
+                     goes without",
                     signer.url()
                 ),
             }),
@@ -1119,6 +1168,109 @@ mod tests {
             context.domain(DOMAIN_BEACON_BUILDER, 0),
         );
         assert!(!verify(&pubkey, &signature, envelope_root));
+    }
+
+    /// The two synchronous messages are signed by local keys only: a key a
+    /// Web3Signer holds is refused by name rather than sent a request no
+    /// signer schema here defines.
+    #[test]
+    fn registrations_and_preferences_refuse_a_remote_key() {
+        let pubkey = BlsPubkey([0xcd; 48]);
+        let mut store = ValidatorStore::new();
+        store
+            .insert_remote(pubkey, "https://signer.example:9000")
+            .expect("a well-formed signer url");
+        let context = context_with_validators_root();
+
+        let registration = context.sign_validator_registration(&store, &registration(pubkey));
+        assert!(
+            matches!(&registration, Err(Error::Signing { reason, .. }) if reason.contains("builder registrations")),
+            "got {registration:?}"
+        );
+        let preferences = context.sign_proposer_preferences(&store, &pubkey, &preferences_for(64));
+        assert!(
+            matches!(&preferences, Err(Error::Signing { reason, .. }) if reason.contains("proposer preferences")),
+            "got {preferences:?}"
+        );
+    }
+
+    /// A config whose gloas fork starts at epoch 500000, fulu being active
+    /// well before it, with a non-zero validators root.
+    fn gloas_scheduled_context() -> (SigningContext, Epoch) {
+        const GLOAS_EPOCH: Epoch = 500_000;
+        let mut config = Config::mainnet();
+        config.gloas_fork_epoch = GLOAS_EPOCH;
+        (
+            SigningContext::new(config, Root::repeat_byte(0x42)),
+            GLOAS_EPOCH,
+        )
+    }
+
+    fn preferences_for(slot: Slot) -> ProposerPreferences {
+        ProposerPreferences {
+            dependent_root: Root::repeat_byte(0x11),
+            proposal_slot: slot,
+            validator_index: 3,
+            fee_recipient: ethlambda_types::beacon::primitives::H160([0xab; 20]),
+            target_gas_limit: 36_000_000,
+        }
+    }
+
+    /// Whether a preference for `slot`, signed by the client, verifies under
+    /// fulu's and under gloas's version of `DOMAIN_PROPOSER_PREFERENCES`, in
+    /// that order. The domains are spelled out rather than asked of
+    /// [`SigningContext::domain`], so the test does not share the signer's
+    /// choice of epoch.
+    fn preference_verifies_under_fulu_and_gloas(slot: Slot) -> (bool, bool) {
+        let (store, pubkey) = store_with_key();
+        let (context, _) = gloas_scheduled_context();
+        let preferences = preferences_for(slot);
+
+        let signature = context
+            .sign_proposer_preferences(&store.blocking_read(), &pubkey, &preferences)
+            .expect("signs");
+
+        let verifies_under = |version| {
+            let domain = compute_domain(
+                DOMAIN_PROPOSER_PREFERENCES,
+                version,
+                context.genesis_validators_root,
+            );
+            let root = compute_signing_root(preferences.hash_tree_root(), domain);
+            verify(&pubkey, &signature, root)
+        };
+        (
+            verifies_under(context.config.fulu_fork_version),
+            verifies_under(context.config.gloas_fork_version),
+        )
+    }
+
+    /// The first gloas epoch's preference is signed at gloas's version, the
+    /// proposal epoch's own, which is what beta.4's gossip rule and every
+    /// other client verify. Fulu's, the version beta.2's rule gave (the epoch
+    /// before the proposal's), is what Lighthouse refused as a bad signature.
+    #[test]
+    fn a_preference_for_the_first_gloas_epoch_is_signed_under_the_gloas_version() {
+        let (_, gloas_epoch) = gloas_scheduled_context();
+        let slot = gloas_epoch * preset::SLOTS_PER_EPOCH + 2;
+
+        let (under_fulu, under_gloas) = preference_verifies_under_fulu_and_gloas(slot);
+
+        assert!(under_gloas, "the proposal epoch's version");
+        assert!(!under_fulu, "not the version of the epoch before it");
+    }
+
+    /// One epoch later beta.2's rule gives gloas's version too, so the two
+    /// rules agree from here on.
+    #[test]
+    fn a_preference_for_the_second_gloas_epoch_is_signed_under_the_gloas_version() {
+        let (_, gloas_epoch) = gloas_scheduled_context();
+        let slot = (gloas_epoch + 1) * preset::SLOTS_PER_EPOCH;
+
+        let (under_fulu, under_gloas) = preference_verifies_under_fulu_and_gloas(slot);
+
+        assert!(under_gloas);
+        assert!(!under_fulu);
     }
 
     #[tokio::test]

@@ -47,9 +47,9 @@ use crate::beacon_node::dto::{
     encode_hex, parse_pubkey, parse_root,
 };
 use crate::beacon_node::{
-    AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Genesis,
-    ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails, ValidatorEntry,
-    validate_attestation_data, validate_produced_block, validate_sync_contribution,
+    AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery,
+    Genesis, ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails,
+    ValidatorEntry, validate_attestation_data, validate_produced_block, validate_sync_contribution,
 };
 use crate::error::{BeaconNodeFailure, Error, Result};
 
@@ -135,10 +135,22 @@ struct SszResponse {
     body: Vec<u8>,
 }
 
-/// The body `produceBlockV4` requires. Self-build only, so no minimum bid, no
-/// boost and no builders: the node decodes it, as the specification demands,
-/// and builds locally.
-const BUILDER_CONFIG: &str = r#"{"min_bid":"0","builder_boost_factor":"0","builders":[]}"#;
+/// The body `produceBlockV4` requires: the node decodes it, as the
+/// specification demands, even when it builds locally.
+///
+/// `builders` stays empty, since the builder API (relay or `builder_pubkeys`
+/// bids) is a later phase. The top-level `min_bid` and factor govern the pooled
+/// p2p bids. The factor is the configured `builder_boost_factor` with
+/// `--builder-proposals`, so such a bid can win on value, and `0` without it:
+/// the local payload unless it cannot be built, as beacon-APIs defines `0`.
+/// A node whose local build fails may then still build on a pooled bid (see
+/// `proposal.rs`'s module doc for why that block is signed). `min_bid` is
+/// `--builder-min-bid`, in gwei, the floor below which no p2p bid is taken,
+/// with or without builder proposals, so it also bounds that fallback.
+fn builder_config(boost_factor: Option<u64>, min_bid: u64) -> String {
+    let factor = boost_factor.unwrap_or(0);
+    format!(r#"{{"min_bid":"{min_bid}","builder_boost_factor":"{factor}","builders":[]}}"#)
+}
 
 /// A [`BeaconNodeApi`] backed by one beacon node's standard REST Beacon API.
 pub struct HttpBeaconNode {
@@ -322,7 +334,7 @@ impl HttpBeaconNode {
     async fn post_json_for_ssz(
         &self,
         path: &str,
-        json_body: &'static str,
+        json_body: String,
         consensus_version: &str,
     ) -> Result<SszResponse> {
         let url = format!("{}{path}", self.base_url);
@@ -464,7 +476,11 @@ impl HttpBeaconNode {
             encode_hex(&request.graffiti.0),
         );
         let response = self
-            .post_json_for_ssz(&path, BUILDER_CONFIG, request.fork.as_str())
+            .post_json_for_ssz(
+                &path,
+                builder_config(request.builder_boost_factor, request.builder_min_bid),
+                request.fork.as_str(),
+            )
             .await?;
         if response.fork != ForkName::Gloas {
             return Err(Error::InconsistentResponse(format!(
@@ -567,6 +583,18 @@ impl HttpBeaconNode {
         Err(Error::BeaconNodeStatus {
             status: status.as_u16(),
             body: error_text(&body),
+        })
+    }
+
+    /// The proposer duties for `epoch` at the endpoint's `version` (`v1` or
+    /// `v2`), which differ only in which `dependent_root` they report.
+    async fn proposer_duties_at(&self, version: &str, epoch: Epoch) -> Result<ProposerDuties> {
+        let response: DutiesResponse<Vec<ProposerDutyDto>> = self
+            .get(&format!("/eth/{version}/validator/duties/proposer/{epoch}"))
+            .await?;
+        Ok(ProposerDuties {
+            dependent_root: parse_root(&response.dependent_root)?,
+            duties: response.data,
         })
     }
 
@@ -692,13 +720,13 @@ impl BeaconNodeApi for HttpBeaconNode {
     /// answers for every proposer in the epoch rather than for a submitted
     /// list, so there is nothing to send.
     async fn proposer_duties(&self, epoch: Epoch) -> Result<ProposerDuties> {
-        let response: DutiesResponse<Vec<ProposerDutyDto>> = self
-            .get(&format!("/eth/v1/validator/duties/proposer/{epoch}"))
-            .await?;
-        Ok(ProposerDuties {
-            dependent_root: parse_root(&response.dependent_root)?,
-            duties: response.data,
-        })
+        self.proposer_duties_at("v1", epoch).await
+    }
+
+    /// [`Self::proposer_duties`] against the v2 path, whose `dependent_root`
+    /// is the shuffling dependent root proposer preferences must carry.
+    async fn proposer_duties_v2(&self, epoch: Epoch) -> Result<ProposerDuties> {
+        self.proposer_duties_at("v2", epoch).await
     }
 
     async fn attestation_data(&self, slot: Slot, fork: ForkName) -> Result<AttestationData> {
@@ -888,6 +916,26 @@ impl BeaconNodeApi for HttpBeaconNode {
             Some(REGISTRATION_TIMEOUT),
         )
         .await
+    }
+
+    /// JSON, which every beacon node must accept, an empty list never reaching
+    /// the wire. The gloas container serialises as the endpoint's JSON itself.
+    /// One node, so an acceptance is always [`Delivery::Everywhere`].
+    async fn submit_proposer_preferences(
+        &self,
+        fork: ForkName,
+        preferences: &[gloas::SignedProposerPreferences],
+    ) -> Result<Delivery> {
+        if preferences.is_empty() {
+            return Ok(Delivery::Everywhere);
+        }
+        self.post_no_content(
+            "/eth/v1/validator/proposer_preferences",
+            &preferences,
+            Some(fork.as_str()),
+        )
+        .await
+        .map(|()| Delivery::Everywhere)
     }
 
     async fn execution_payload_envelope(
@@ -1418,13 +1466,45 @@ mod tests {
         );
     }
 
-    /// The body `produceBlockV4` requires: self-build only, so no builders.
+    /// The body `produceBlockV4` requires: no minimum bid and no builders,
+    /// the boost factor being the configured one or `0`.
     #[test]
-    fn the_builder_config_is_the_documented_self_build_body() {
-        let value: serde_json::Value = serde_json::from_str(BUILDER_CONFIG).expect("valid json");
-        assert_eq!(value["min_bid"], "0");
-        assert_eq!(value["builder_boost_factor"], "0");
-        assert_eq!(value["builders"], serde_json::json!([]));
+    fn the_builder_config_carries_the_factor_or_zero_and_the_min_bid() {
+        for (factor, expected) in [(None, "0"), (Some(250), "250"), (Some(0), "0")] {
+            let value: serde_json::Value =
+                serde_json::from_str(&builder_config(factor, 0)).expect("valid json");
+            assert_eq!(value["min_bid"], "0");
+            assert_eq!(value["builder_boost_factor"], expected, "{factor:?}");
+            assert_eq!(value["builders"], serde_json::json!([]));
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(&builder_config(Some(100), u64::MAX)).expect("valid json");
+        assert_eq!(value["min_bid"], u64::MAX.to_string(), "quoted, as a Gwei");
+    }
+
+    /// The body reaches the wire: a gloas production request posts it.
+    #[tokio::test]
+    async fn a_gloas_production_request_posts_the_factor_and_min_bid_in_its_body() {
+        let cases = [
+            (None, 0, "0", "0"),
+            (None, 1_000_000, "0", "1000000"),
+            (Some(250), 1_000_000, "250", "1000000"),
+        ];
+        for (factor, min_bid, expected_factor, expected_min_bid) in cases {
+            let served = serve(500, vec![], vec![]).await;
+            let request = BlockRequest {
+                fork: ForkName::Gloas,
+                builder_min_bid: min_bid,
+                ..block_request(factor)
+            };
+            let _ = served.node.produce_block(&request).await;
+            let seen = served.seen.lock().expect("lock");
+            assert_eq!(seen.len(), 1);
+            assert!(seen[0].0.contains("/eth/v4/validator/blocks/5"));
+            let body: serde_json::Value = serde_json::from_slice(&seen[0].1).expect("json body");
+            assert_eq!(body["builder_boost_factor"], expected_factor);
+            assert_eq!(body["min_bid"], expected_min_bid);
+        }
     }
 
     /// A Beacon API double that answers every route the same way: whatever
@@ -1490,6 +1570,7 @@ mod tests {
             randao_reveal: Default::default(),
             graffiti: Default::default(),
             builder_boost_factor: factor,
+            builder_min_bid: 0,
         }
     }
 
@@ -1624,6 +1705,62 @@ mod tests {
     fn error_text_writes_out_every_control_character() {
         let text = error_text("a\u{1b}[31mb\tc\u{2028}d");
         assert_eq!(text, "a\\u{1b}[31mb\\tc\\u{2028}d");
+    }
+
+    #[tokio::test]
+    async fn proposer_preferences_are_posted_as_json_with_the_fork_header() {
+        use ethlambda_types::beacon::primitives::{BlsSignature, H160};
+
+        let preferences = vec![gloas::SignedProposerPreferences {
+            message: gloas::ProposerPreferences {
+                dependent_root: Root::from([9u8; 32]),
+                proposal_slot: 70,
+                validator_index: 4,
+                fee_recipient: H160([0xcd; 20]),
+                target_gas_limit: 36_000_000,
+            },
+            signature: BlsSignature([5; 96]),
+        }];
+        let served = serve(200, vec![], vec![]).await;
+        let delivery = served
+            .node
+            .submit_proposer_preferences(ForkName::Fulu, &preferences)
+            .await
+            .expect("accepted");
+        assert_eq!(delivery, Delivery::Everywhere, "one node is every node");
+
+        let seen = served.seen.lock().expect("lock");
+        assert_eq!(seen.len(), 1);
+        assert!(
+            seen[0]
+                .0
+                .ends_with("/eth/v1/validator/proposer_preferences")
+        );
+        assert_eq!(seen[0].2["eth-consensus-version"], "fulu");
+        let decoded: Vec<gloas::SignedProposerPreferences> =
+            serde_json::from_slice(&seen[0].1).expect("the body is the endpoint's JSON");
+        assert_eq!(decoded, preferences);
+    }
+
+    #[tokio::test]
+    async fn an_empty_preference_list_never_reaches_the_wire() {
+        let served = serve(200, vec![], vec![]).await;
+        served
+            .node
+            .submit_proposer_preferences(ForkName::Fulu, &[])
+            .await
+            .expect("a no-op");
+        assert!(served.seen.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn v2_proposer_duties_use_the_v2_path() {
+        let reply = br#"{"dependent_root":"0x0909090909090909090909090909090909090909090909090909090909090909","execution_optimistic":false,"data":[]}"#.to_vec();
+        let served = serve(200, vec![("content-type", "application/json")], reply).await;
+        let duties = served.node.proposer_duties_v2(3).await.expect("decodes");
+        assert_eq!(duties.dependent_root, Root::from([9u8; 32]));
+        let seen = served.seen.lock().expect("lock");
+        assert!(seen[0].0.ends_with("/eth/v2/validator/duties/proposer/3"));
     }
 
     #[tokio::test]

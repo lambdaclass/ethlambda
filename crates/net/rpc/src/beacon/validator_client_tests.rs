@@ -587,6 +587,7 @@ async fn block_production_without_an_execution_client_is_retryable() {
         randao_reveal: Default::default(),
         graffiti: Default::default(),
         builder_boost_factor: None,
+        builder_min_bid: 0,
     };
     let err = client.produce_block(&request).await.unwrap_err();
     assert!(matches!(err, Error::BeaconNodeSyncing), "got {err:?}");
@@ -828,6 +829,7 @@ async fn produce_with_pool(
         randao_reveal,
         graffiti: ethlambda_types::primitives::H256(graffiti),
         builder_boost_factor: None,
+        builder_min_bid: 0,
     };
     let produced = client.produce_block(&request).await.unwrap();
     assert_eq!(produced.slot(), slot);
@@ -1302,6 +1304,7 @@ async fn the_validator_client_can_serve_on_the_sync_committee() {
         randao_reveal,
         graffiti: Default::default(),
         builder_boost_factor: None,
+        builder_min_bid: 0,
     };
     let produced = client.produce_block(&request).await.unwrap();
     let block_domain = get_domain(&advanced, DOMAIN_BEACON_PROPOSER, Some(epoch));
@@ -2018,6 +2021,7 @@ mod builder_flow {
                 randao_reveal,
                 graffiti: ethlambda_types::primitives::H256([0; 32]),
                 builder_boost_factor,
+                builder_min_bid: 0,
             };
             self.client.produce_block(&request).await.unwrap()
         }

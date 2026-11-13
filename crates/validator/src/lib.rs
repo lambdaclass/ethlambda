@@ -36,6 +36,7 @@ pub(crate) mod in_flight;
 pub mod keys;
 pub mod metrics;
 pub mod payload_attestation;
+pub mod preferences;
 pub mod proposal;
 pub mod proposer_settings;
 pub mod registration;
@@ -45,6 +46,8 @@ pub mod slashing_protection;
 pub mod slot_clock;
 pub mod subscriptions;
 pub mod sync_committee;
+#[cfg(test)]
+mod test_support;
 
 pub use error::{Error, Result};
 
@@ -67,6 +70,7 @@ use crate::beacon_node::http::HttpBeaconNode;
 use crate::duties::DutiesService;
 use crate::keys::ValidatorStore;
 use crate::payload_attestation::PayloadAttestationService;
+use crate::preferences::PreferencesService;
 use crate::proposal::{BlindedOutcome, ProposalService, Proposed};
 use crate::proposer_settings::ProposerSettings;
 use crate::registration::RegistrationService;
@@ -99,8 +103,20 @@ pub struct ValidatorConfig {
     /// `POST /eth/v1/remotekeys` without a `url` of its own is assigned to.
     /// Keys the definitions file already names a signer for need no default.
     pub web3signer_url: Option<String>,
+    /// The gas limit every validator targets unless the keymanager API gives
+    /// it its own: its builder registrations' before gloas, and its proposer
+    /// preferences' from gloas, which is what the node's own payload is built
+    /// toward.
+    pub gas_limit: u64,
     /// Builder proposals, or `None` when `--builder-proposals` is off.
     pub builder: Option<BuilderProposals>,
+    /// The smallest p2p bid, in gwei, a gloas block may be built on
+    /// (`produceBlockV4`'s `min_bid`). `0` takes any bid that wins on value.
+    ///
+    /// Not part of [`BuilderProposals`]: without them a node whose local build
+    /// fails may still build on a pooled bid, and this floor applies to that
+    /// bid too.
+    pub builder_min_bid: u64,
     /// Register keys that have no slashing-protection record as never having
     /// signed, instead of refusing to start. See
     /// [`slashing_protection::SlashingProtection::open`].
@@ -111,9 +127,10 @@ pub struct ValidatorConfig {
 /// and accept a blinded block when the builder's bid wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuilderProposals {
-    /// The `builder_boost_factor` sent with every pre-gloas block request:
-    /// 100 compares the bid and the local payload as they are; `u64::MAX`
-    /// takes the builder whenever there is a bid.
+    /// The `builder_boost_factor` sent with every block request (in the query
+    /// before gloas, in `produceBlockV4`'s body from gloas): 100 compares the
+    /// bid and the local payload as they are; `u64::MAX` takes the builder
+    /// whenever there is a bid.
     pub boost_factor: u64,
 }
 
@@ -146,10 +163,10 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
              preferences sign that address for the builder to pay."
         );
     }
-    let settings = Arc::new(ProposerSettings::new(
-        config.graffiti,
-        config.suggested_fee_recipient,
-    ));
+    let settings = Arc::new(
+        ProposerSettings::new(config.graffiti, config.suggested_fee_recipient)
+            .with_default_gas_limit(config.gas_limit),
+    );
 
     // The directory's lock first, before any key is read: held from here,
     // nothing another process does to the directory can get between what
@@ -227,6 +244,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         attestation_due_bps = spec.attestation_due_bps,
         aggregate_due_bps = spec.aggregate_due_bps,
         validators = store.read().await.len(),
+        gas_limit = config.gas_limit,
         "Validator client starting"
     );
 
@@ -260,6 +278,14 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     let aggregation = AggregationService::new(beacon_node.clone(), context.clone());
     let payload_attestation = PayloadAttestationService::new(beacon_node.clone(), context.clone());
     let sync_committee = SyncCommitteeService::new(beacon_node.clone(), context.clone());
+
+    // Unconditional, as Lighthouse does: from gloas the preferences carry the
+    // fee recipient of every proposal, builders or not. See the module doc.
+    let preferences = Arc::new(
+        PreferencesService::new(beacon_node.clone(), context.clone(), settings.clone())
+            .with_clock(clock.clone()),
+    );
+
     let proposal = ProposalService::new(
         beacon_node.clone(),
         context.clone(),
@@ -267,10 +293,13 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         protection.clone(),
         config.builder.map(|builder| builder.boost_factor),
     )
-    .with_clock(clock.clone());
+    .with_clock(clock.clone())
+    .with_builder_min_bid(config.builder_min_bid)
+    .with_preferences(preferences.clone());
     let registration = config.builder.map(|builder| {
         info!(
             boost_factor = builder.boost_factor,
+            min_bid_gwei = config.builder_min_bid,
             "Builder proposals on: registering validators and accepting blinded blocks"
         );
         Arc::new(RegistrationService::new(
@@ -415,6 +444,15 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             if let Some(duty) = duties.proposer_at_slot(slot, epoch).cloned() {
                 propose(&proposal, &clock, slot, &duty, &store).await;
             }
+
+            // Right after the proposal and ahead of the slot's other duties: the
+            // preferences for the slots after this one must be out before those
+            // slots start (gossip IGNOREs a started slot), and the poll's v2 duties
+            // fetch for the next epoch can make the node advance a state, which
+            // should not compete with it producing this slot's block. Off the slot
+            // loop, since it is single-flight and a slow node must not delay this
+            // slot's duties.
+            tokio::spawn(preferences.clone().poll(slot, store.clone()));
 
             // The subscriptions the refresh above left owing, sent from a task of
             // their own and only now, after the block.

@@ -16,8 +16,10 @@
 //!   dependent root (the whole canonical case, and a dependent block about an
 //!   epoch old is usually evicted from the state cache), else from the cached
 //!   checkpoint state of the epoch before the proposal's.
-//! - The signature verifies under any of three domains, since clients disagree
-//!   at the fork boundary: see [`proposer_preferences_domains`].
+//! - The signature verifies under the proposal epoch's domain (v1.7.0-beta.4's
+//!   rule, and every client's) or under either of the two that beta.2's rule
+//!   could give, which differ from it only in the first epoch of a fork: see
+//!   [`proposer_preferences_domains`].
 
 use ethlambda_storage::CacheKey;
 
@@ -208,15 +210,22 @@ pub fn dependent_root_at(
     ancestor_at(state, state_block_root, dependent_slot)
 }
 
-/// The distinct candidate signing domains, tried in order: `get_domain(
-/// lookahead_state, DOMAIN_PROPOSER_PREFERENCES, Some(P))` (the specification's);
-/// the schedule's fork version at `P - MIN_SEED_LOOKAHEAD` (saturating); and the
-/// schedule's at `P`.
+/// The distinct candidate signing domains for proposal epoch `P`, tried in
+/// order.
 ///
-/// Outside the first epoch of a fork the three coincide. Across a boundary
-/// the specification's gives the version of the epoch before the proposal's,
-/// while lighthouse signs with the proposal epoch's, so accepting both avoids
-/// rejecting an honest client's messages around the gloas upgrade.
+/// First the schedule's fork version at `P`: consensus-specs v1.7.0-beta.4's
+/// `compute_fork_version(proposal_epoch)`, which `get_signed_proposer_preferences`
+/// signs with and `validate_proposer_preferences_gossip` verifies with, and
+/// what every client (this one's validator client included) signs under.
+///
+/// Then the two that beta.2's rule, `get_domain(lookahead_state,
+/// DOMAIN_PROPOSER_PREFERENCES, P)`, could give: `get_domain` on the state
+/// this node read the lookahead from, and the schedule's version at
+/// `P - MIN_SEED_LOOKAHEAD` (saturating), the epoch beta.2 advances its state
+/// to (this node may have read the head's, a later one). They are kept for a
+/// client still signing by beta.2, until the fixtures move past it. Outside
+/// the first epoch of a fork all three coincide, so accepting the older ones
+/// costs nothing.
 pub fn proposer_preferences_domains(
     lookahead_state: &BeaconState,
     config: &Config,
@@ -231,13 +240,13 @@ pub fn proposer_preferences_domains(
         )
     };
     let domains = [
+        at(proposal_epoch),
         get_domain(
             lookahead_state,
             DOMAIN_PROPOSER_PREFERENCES,
             Some(proposal_epoch),
         ),
         at(proposal_epoch.saturating_sub(preset::MIN_SEED_LOOKAHEAD)),
-        at(proposal_epoch),
     ];
     let mut distinct: Vec<Domain> = Vec::with_capacity(domains.len());
     for domain in domains {
@@ -595,10 +604,11 @@ mod tests {
         let root = state.genesis_validators_root();
         let at =
             |fork| compute_domain(DOMAIN_PROPOSER_PREFERENCES, config.fork_version(fork), root);
-        // Proposal epoch 2 is gloas's first: the lookahead state's fork (fulu)
-        // and the epoch before the proposal's agree, the proposal epoch's is gloas.
+        // Proposal epoch 2 is gloas's first. The proposal epoch's version
+        // (gloas, beta.4's rule) comes first; the lookahead state's fork and
+        // the epoch before the proposal's (beta.2's) agree on fulu.
         let domains = proposer_preferences_domains(&state, &config, 2);
-        assert_eq!(domains, vec![at(ForkName::Fulu), at(ForkName::Gloas)]);
+        assert_eq!(domains, vec![at(ForkName::Gloas), at(ForkName::Fulu)]);
 
         // A signature under either verifies; one under neither does not.
         let preferences = gloas::ProposerPreferences {
