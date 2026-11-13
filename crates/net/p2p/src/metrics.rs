@@ -313,6 +313,20 @@ pub fn inc_discovered_peers_dialed() {
     LEAN_DISCOVERED_PEERS_DIALED.inc();
 }
 
+/// Counts peers the subnet hunt handed the dial loop: discovery records on a
+/// subscribed attestation subnet too few connected peers advertise. Whether
+/// each one connected is in the peer connect and disconnect metrics.
+pub fn inc_subnet_hunt_peers(count: u64) {
+    static LEAN_DISCOVERY_SUBNET_HUNT_PEERS: LazyLock<IntCounter> = LazyLock::new(|| {
+        register_int_counter!(
+            "lean_discovery_subnet_hunt_peers_total",
+            "Peers found by discv5 subnet hunts, for subscribed attestation subnets short of peers"
+        )
+        .unwrap()
+    });
+    LEAN_DISCOVERY_SUBNET_HUNT_PEERS.inc_by(count);
+}
+
 /// Refresh the gossipsub mesh peers gauge from the current mesh peer set.
 pub fn update_gossip_mesh_peers<'a>(
     peers: impl Iterator<Item = &'a PeerId>,

@@ -7,19 +7,22 @@
 //!
 //! Lighthouse applies these inside the discovery query itself, via
 //! `discv5.find_node_predicate`. ethlambda hands them to ethrex as a
-//! [`LeanFilter`], which the peer table consults the moment each ENR arrives. A
-//! peer that does not belong is judged where the record lands, not at dial time,
-//! and is not offered for dialing again until it publishes a higher-`seq`
-//! record, which the peer table runs through the filter afresh.
+//! [`LeanFilter`], which the discovery server consults the moment each ENR
+//! arrives. A peer that does not belong is judged where the record lands, not at
+//! dial time, and is not offered for dialing again until it publishes a
+//! higher-`seq` record, which discovery runs through the filter afresh.
 //!
-//! So the dial loop filters nothing: every contact it draws has already passed,
-//! and all it does is turn the record into something dialable
-//! ([`LeanFilter::dial_target`]) and rank what it got
+//! So the dial loop filters nothing: every node it draws has already passed. It
+//! does not even read ENRs, because discovery hands out an
+//! [`ethrex_p2p::types::Node`], which knows nothing of `quic` or `attnets`.
+//! Instead the filter files what it admits in [`DialTargets`] as it judges it,
+//! and the dial loop looks the node id back up there and ranks what it got
 //! ([`rank_candidates`]).
 
-use std::collections::HashSet;
-use std::sync::{Arc, RwLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, RwLock};
 
+use ethrex_common::H256;
 use ethrex_p2p::peer_filter::PeerFilter;
 use ethrex_p2p::types::NodeRecord;
 use libp2p::{Multiaddr, PeerId};
@@ -34,11 +37,24 @@ use super::enr::{
     ATTNETS_ENR_KEY, CGC_ENR_KEY, ETH2_ENR_KEY, EnrForkId, node_id_from_peer_id, read_ip,
     read_public_key, read_quic_port, read_tcp_port, subnets_from_attnets,
 };
+use super::node_id::node_id_from_public_key;
 use crate::dial_addrs;
+
+/// Dial targets held at once, past which a new one is dropped.
+///
+/// Only records that pass admission land here, so on any real network the map
+/// is the size of the lean population and never approaches this. The cap is for
+/// the case where that population is manufactured: minting ENRs costs a
+/// signature, and an unbounded map would grow with however many an adversary
+/// cares to gossip. Matching ethrex's own connection-pool bound keeps our
+/// memory in the same order as the table that feeds us.
+const MAX_DIAL_TARGETS: usize = 10_000;
 
 /// A peer that passed admission and is ready to dial.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DiscoveredPeer {
+    /// The discv5 node id, which is how ethrex names this same peer.
+    pub(crate) node_id: H256,
     pub(crate) peer_id: PeerId,
     /// Every dial target for this peer, built from whichever of the two ports
     /// the record actually advertises. Never empty: [`admit`] rejects a record
@@ -56,11 +72,65 @@ pub(crate) struct DiscoveredPeer {
     pub(crate) custody_group_count: Option<u64>,
 }
 
+/// What the filter admitted, keyed by the node id discovery will name it with.
+///
+/// Written inside the discovery actor as ENRs arrive, read by the dial loop in
+/// the P2P actor, hence the lock. Every critical section is one map operation on
+/// data already in hand, so nothing is held across an `.await` and the discovery
+/// message loop is never parked on it.
+///
+/// This exists because the two halves know different things about the same peer.
+/// Discovery decides *whether* to dial, from facts it tracks itself: whether the
+/// peer knows us, whether we already tried it, whether we are connected. It
+/// hands back a `Node`, which carries an address and a key and nothing else.
+/// *How* to dial a lean peer lives in ENR entries discovery has no opinion
+/// about, so we keep what we read out of the record the one time we saw it.
+#[derive(Clone, Default)]
+pub(crate) struct DialTargets(Arc<Mutex<HashMap<H256, DiscoveredPeer>>>);
+
+impl DialTargets {
+    /// File a peer the filter just admitted, replacing what an earlier record
+    /// said about it.
+    fn record(&self, peer: DiscoveredPeer) {
+        let mut targets = self.lock();
+        if targets.len() >= MAX_DIAL_TARGETS && !targets.contains_key(&peer.node_id) {
+            debug!(
+                node_id = %peer.node_id,
+                "Dropping dial target: already holding MAX_DIAL_TARGETS"
+            );
+            return;
+        }
+        targets.insert(peer.node_id, peer);
+    }
+
+    /// Forget a peer whose latest record no longer passes admission.
+    ///
+    /// Discovery stops offering it either way, so this is about not keeping a
+    /// stale multiaddr for a peer that moved off our network.
+    fn forget(&self, node_id: &H256) {
+        self.lock().remove(node_id);
+    }
+
+    /// How to dial `node_id`, or `None` for a node we never saw an admissible
+    /// record for. That covers every bootnode discovery knows only as a bare
+    /// endpoint, which is why it is an ordinary answer rather than a surprise.
+    pub(crate) fn get(&self, node_id: &H256) -> Option<DiscoveredPeer> {
+        self.lock().get(node_id).cloned()
+    }
+
+    /// The only way the map is reached, so the reason a poisoned lock is
+    /// impossible is stated once: every critical section is a `HashMap` call
+    /// with no user code inside it, so no panic can leave the map torn.
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<H256, DiscoveredPeer>> {
+        self.0.lock().expect("dial targets lock is never poisoned")
+    }
+}
+
 /// Why a discovered peer was turned away.
 ///
-/// No reason is final: the peer table re-runs the filter on every higher-`seq`
-/// record, so a peer that adds a `quic` entry or gains an address through
-/// discv5's IP voting is reconsidered without restarting the process.
+/// No reason is final: discovery re-runs the filter on every higher-`seq`
+/// record, so a peer that adds a `quic` or `tcp` entry or gains an address
+/// through discv5's IP voting is reconsidered without restarting the process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RejectReason {
     /// No `eth2` entry, or one that does not decode. Cannot be our network.
@@ -77,20 +147,23 @@ pub(crate) enum RejectReason {
     MissingAddress,
 }
 
-/// The spec's admission checks, in the shape ethrex's peer table wants them.
+/// The spec's admission checks, in the shape ethrex's discovery server wants
+/// them.
 ///
 /// Holds what [`admit`] needs to judge a record, so the dial loop no longer
-/// carries the local fork id and committee count around: the value handed to
-/// [`PeerTableServer::spawn_with_filter`](ethrex_p2p::peer_table::PeerTableServer::spawn_with_filter)
-/// judges by the same rules the dial loop later asks for dial targets.
+/// carries the local fork id and committee count around. Judging and publishing
+/// are the same act here: a record that passes is filed in [`DialTargets`] on
+/// the way out, which is the only moment the ENR behind a peer is in hand.
 ///
-/// [`Clone`] because the peer table takes ownership of the filter it runs, and
-/// every clone shares one [`Policy`], so [`Self::set_fork_id`] at a fork
-/// boundary changes what the table's copy admits as well as the dial loop's.
+/// [`Clone`] because discovery takes ownership of the filter it runs, and every
+/// clone shares one [`Policy`] and one [`DialTargets`], so [`Self::set_fork_id`]
+/// at a fork boundary changes what discovery's copy admits as well as the dial
+/// loop's, and what discovery's copy files is what the dial loop reads.
 #[derive(Clone)]
 pub struct LeanFilter {
     policy: Arc<RwLock<Policy>>,
     attestation_committee_count: u64,
+    dial_targets: DialTargets,
 }
 
 /// The part of admission that moves at a fork boundary.
@@ -111,13 +184,14 @@ impl LeanFilter {
                 also_admitted: Vec::new(),
             })),
             attestation_committee_count,
+            dial_targets: DialTargets::default(),
         }
     }
 
     /// Replace the local `eth2` entry and the further digests admitted beside
     /// it.
     ///
-    /// The peer table re-judges a record only when its `seq` rises, so a peer
+    /// Discovery re-judges a record only when its `seq` rises, so a peer
     /// rejected under the old policy stays rejected until it republishes;
     /// peers cross a boundary by doing exactly that.
     pub(crate) fn set_fork_id(&self, fork_id: EnrForkId, also_admitted: Vec<ForkDigest>) {
@@ -127,14 +201,16 @@ impl LeanFilter {
         };
     }
 
-    /// What to dial for a record that has already been admitted, or `None` if it
-    /// would not be.
+    /// A handle on what this filter has admitted so far, for the dial loop.
+    pub(crate) fn dial_targets(&self) -> DialTargets {
+        self.dial_targets.clone()
+    }
+
+    /// What to dial for `record`, or `None` if it would not be admitted.
     ///
-    /// The `None` arm is unreachable for a contact drawn from the peer table,
-    /// since the same policy already judged the same record. It is not an
-    /// `expect` because the two are only guaranteed to agree while the record is
-    /// unchanged, and the peer table hands out clones: a caller that reaches
-    /// this with an arbitrary record should get nothing to dial, not a panic.
+    /// Judges without filing: the subnet hunt reads records out of
+    /// discovery's answers, which hand back the record itself rather than a
+    /// node id to look up in [`DialTargets`].
     pub(crate) fn dial_target(&self, record: &NodeRecord) -> Option<DiscoveredPeer> {
         self.judge(record).ok()
     }
@@ -152,10 +228,14 @@ impl LeanFilter {
 
 impl PeerFilter for LeanFilter {
     fn accepts(&self, record: &NodeRecord) -> bool {
-        self.judge(record)
-            // The only place a rejection is visible: the peer table records
-            // that the record failed the filter but says nothing about why.
-            .inspect_err(|reason| {
+        match self.judge(record) {
+            Ok(peer) => {
+                self.dial_targets.record(peer);
+                true
+            }
+            // The only place a rejection is visible: discovery records that the
+            // record failed the filter but says nothing about why.
+            Err(reason) => {
                 debug!(
                     ip = ?record.pairs().ip,
                     udp_port = ?record.pairs().udp_port,
@@ -163,8 +243,16 @@ impl PeerFilter for LeanFilter {
                     ?reason,
                     "Rejecting discovered peer"
                 );
-            })
-            .is_ok()
+                // A peer that used to pass and no longer does must not leave a
+                // dialable address behind: this is the same record being judged
+                // afresh at a higher `seq`, which is how a node announces it
+                // moved. Nothing to remove for a peer that never passed.
+                if let Some(key) = read_public_key(record.pairs()) {
+                    self.dial_targets.forget(&node_id_from_public_key(&key));
+                }
+                false
+            }
+        }
     }
 }
 
@@ -211,6 +299,7 @@ fn admit(
     }
 
     let public_key = read_public_key(pairs).ok_or(RejectReason::BadPublicKey)?;
+    let node_id = node_id_from_public_key(&public_key);
     let peer_id = PeerId::from_public_key(&libp2p::identity::PublicKey::from(public_key));
 
     let ip = read_ip(pairs).ok_or(RejectReason::MissingAddress)?;
@@ -231,6 +320,7 @@ fn admit(
     });
 
     Ok(DiscoveredPeer {
+        node_id,
         peer_id,
         addrs: dial_addrs(ip, quic_port, tcp_port, peer_id),
         subnets,
@@ -264,8 +354,14 @@ impl DiscoveredPeer {
 
 /// Order candidates so the ones filling this node's gaps are dialed first:
 /// custody columns it samples that are undersupplied (fewer connected
-/// custodians than `dial::CUSTODY_REDUNDANCY_TARGET`), then attestation
-/// subnets no connected peer covers.
+/// custodians than `dial::CUSTODY_REDUNDANCY_TARGET`), then the subscribed
+/// attestation subnets the subnet hunt is looking for (`wanted_subnets`, see
+/// [`super::subnets`]), then attestation subnets no connected peer covers.
+///
+/// A wanted subnet outranks any other uncovered one because this node needs
+/// it: it subscribes to it, and publishes its own attestations there. The
+/// subnet hunt's finds land in the same queue and rank here like any other
+/// candidate, which is what puts them ahead of the crawl's random draws.
 ///
 /// Custody outranks subnets because the two shortfalls do not cost the same.
 /// At the extreme, a column no connected peer custodies cannot be fetched by
@@ -289,6 +385,7 @@ pub(crate) fn rank_candidates(
     candidates: &mut [DiscoveredPeer],
     covered_subnets: &HashSet<u64>,
     wanted_columns: &HashSet<u64>,
+    wanted_subnets: &HashSet<u64>,
 ) {
     candidates.sort_by_key(|candidate| {
         // Skipped rather than computed and discarded when nothing is wanted,
@@ -300,12 +397,21 @@ pub(crate) fn rank_candidates(
         } else {
             candidate.custody_coverage(wanted_columns)
         };
+        let wanted = candidate
+            .subnets
+            .iter()
+            .filter(|subnet| wanted_subnets.contains(subnet))
+            .count();
         let subnets = candidate
             .subnets
             .iter()
             .filter(|subnet| !covered_subnets.contains(subnet))
             .count();
-        (std::cmp::Reverse(columns), std::cmp::Reverse(subnets))
+        (
+            std::cmp::Reverse(columns),
+            std::cmp::Reverse(wanted),
+            std::cmp::Reverse(subnets),
+        )
     });
 }
 
@@ -389,9 +495,11 @@ mod tests {
     }
 
     impl DiscoveredPeer {
-        /// A candidate carrying only what ranking looks at.
+        /// A candidate carrying only what ranking looks at. Ranking never reads
+        /// the identity, so both ids are placeholders.
         fn for_test(subnets: Vec<u64>) -> Self {
             Self {
+                node_id: H256::zero(),
                 peer_id: PeerId::random(),
                 addrs: vec![Multiaddr::empty()],
                 subnets,
@@ -585,10 +693,34 @@ mod tests {
         assert_eq!(peer.subnets, vec![2]);
     }
 
-    // --- what the peer table sees, and what it hands back ---
+    // --- what discovery sees, and what the dial loop finds afterwards ---
 
     fn filter() -> LeanFilter {
         LeanFilter::new(EnrForkId::local(), TEST_COMMITTEE_COUNT)
+    }
+
+    /// What the dial loop would find for `record`, going the way it really
+    /// goes: discovery hands it a node id, and the target must have been filed
+    /// under that id when the filter judged the record.
+    fn filed_target(policy: &LeanFilter, record: &NodeRecord) -> Option<DiscoveredPeer> {
+        let key = read_public_key(record.pairs())?;
+        policy.dial_targets().get(&node_id_from_public_key(&key))
+    }
+
+    #[test]
+    fn a_target_is_keyed_by_the_node_id_discovery_will_name_it_with() {
+        // The dial loop looks a target up under the id carried by the `Node`
+        // discovery hands back, so our derivation has to be ethrex's. Were it
+        // not, every lookup would miss and nothing would surface it: the loop
+        // would keep drawing candidates and dial none of them.
+        let record = record_with(set_admissible_entries);
+
+        let peer = admit_record(&record).expect("accepted");
+
+        assert_eq!(
+            peer.node_id,
+            Node::from_enr(&record).expect("a node").node_id()
+        );
     }
 
     #[test]
@@ -598,8 +730,9 @@ mod tests {
             set_admissible_entries(pairs);
         });
 
-        assert!(filter().accepts(&record));
-        let peer = filter().dial_target(&record).expect("dialable");
+        let policy = filter();
+        assert!(policy.accepts(&record));
+        let peer = filed_target(&policy, &record).expect("dialable");
         assert_eq!(peer.subnets, vec![2, 5]);
     }
 
@@ -612,13 +745,14 @@ mod tests {
             set_quic(pairs, 9001);
         });
 
-        assert!(!filter().accepts(&record));
-        assert!(filter().dial_target(&record).is_none());
+        let policy = filter();
+        assert!(!policy.accepts(&record));
+        assert!(filed_target(&policy, &record).is_none());
     }
 
     #[test]
     fn a_fork_boundary_moves_what_every_clone_admits() {
-        // The peer table owns a clone of the filter, so a boundary has to reach
+        // Discovery owns a clone of the filter, so a boundary has to reach
         // it through the shared policy rather than through the dial loop's copy.
         let table_copy = filter();
         let dial_copy = table_copy.clone();
@@ -649,14 +783,40 @@ mod tests {
     #[test]
     fn a_missing_quic_port_is_rejected() {
         // Discoverable, but not over the only transport we speak. The peer can
-        // add a `quic` entry and republish: the peer table runs the filter
-        // again on a higher-`seq` record. This is what the dial-time
-        // `set_unwanted` this replaced could not express, since ethrex never
-        // clears that flag.
+        // add a `quic` entry and republish: discovery runs the filter again on a
+        // higher-`seq` record. This is what the dial-time `set_unwanted` this
+        // replaced could not express, since ethrex never clears that flag.
         let record = record_with(|pairs| set_eth2(pairs, EnrForkId::local()));
 
-        assert!(!filter().accepts(&record));
-        assert!(filter().dial_target(&record).is_none());
+        let policy = filter();
+        assert!(!policy.accepts(&record));
+        assert!(filed_target(&policy, &record).is_none());
+    }
+
+    #[test]
+    fn a_peer_that_leaves_our_network_stops_being_dialable() {
+        // The same node, republishing at a higher `seq` with a foreign fork
+        // digest. Discovery re-judges it and stops offering it, but a target
+        // left filed under its node id would still be dialed by the one draw
+        // already in flight, and would sit there for the life of the process.
+        let signer = secp256k1::SecretKey::new(&mut rand::rngs::OsRng);
+        let public_key = public_key_from_signing_key(&signer);
+        let node = Node::new(IpAddr::from(Ipv4Addr::LOCALHOST), 9010, 0, public_key);
+        let mut record = NodeRecord::from_node(&node, 1, &signer).unwrap();
+        record.edit(&signer, set_admissible_entries).unwrap();
+
+        let policy = filter();
+        assert!(policy.accepts(&record));
+        assert!(filed_target(&policy, &record).is_some());
+
+        let mut foreign = EnrForkId::local();
+        foreign.fork_digest = [0xde, 0xad, 0xbe, 0xef];
+        record
+            .edit(&signer, |pairs| set_eth2(pairs, foreign))
+            .unwrap();
+
+        assert!(!policy.accepts(&record));
+        assert_eq!(filed_target(&policy, &record), None);
     }
 
     #[test]
@@ -681,7 +841,10 @@ mod tests {
         let policy = filter();
         let mut admitted: Vec<_> = [honest, hostile]
             .iter()
-            .map(|record| policy.dial_target(record).expect("both are admitted"))
+            .map(|record| {
+                assert!(policy.accepts(record));
+                filed_target(&policy, record).expect("both are admitted")
+            })
             .collect();
         assert!(
             admitted
@@ -690,7 +853,12 @@ mod tests {
             "no admitted peer may advertise a subnet outside the local committee"
         );
 
-        rank_candidates(&mut admitted, &HashSet::new(), &HashSet::new());
+        rank_candidates(
+            &mut admitted,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
         assert_eq!(
             admitted[0].subnets,
             vec![3],
@@ -707,9 +875,44 @@ mod tests {
             DiscoveredPeer::for_test(vec![2]),
             DiscoveredPeer::for_test(vec![2, 3]),
         ];
-        rank_candidates(&mut candidates, &HashSet::from([0u64, 1]), &HashSet::new());
+        rank_candidates(
+            &mut candidates,
+            &HashSet::from([0u64, 1]),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
         let order: Vec<_> = candidates.iter().map(|c| c.subnets.clone()).collect();
         assert_eq!(order, vec![vec![2, 3], vec![2], vec![0]]);
+    }
+
+    #[test]
+    fn a_wanted_subnet_outranks_more_uncovered_ones() {
+        // Nothing is covered, so `[1, 2, 3]` fills three gaps and `[0]` one.
+        // But subnet 0 is one this node subscribes to and is hunting peers
+        // for, and the others are not, so the one peer on it goes first.
+        let mut candidates = vec![
+            DiscoveredPeer::for_test(vec![1, 2, 3]),
+            DiscoveredPeer::for_test(vec![0]),
+        ];
+        rank_candidates(
+            &mut candidates,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::from([0u64]),
+        );
+        let order: Vec<_> = candidates.iter().map(|c| c.subnets.clone()).collect();
+        assert_eq!(order, vec![vec![0], vec![1, 2, 3]]);
+
+        // A column gap still comes first: the hunt sits below custody.
+        let supernode = custodian(constants::NUMBER_OF_CUSTODY_GROUPS);
+        let mut candidates = vec![DiscoveredPeer::for_test(vec![0]), supernode.clone()];
+        rank_candidates(
+            &mut candidates,
+            &HashSet::new(),
+            &HashSet::from([97u64]),
+            &HashSet::from([0u64]),
+        );
+        assert_eq!(candidates[0].peer_id, supernode.peer_id);
     }
 
     /// A candidate whose peer id is a real secp256k1 key, so the node id
@@ -723,10 +926,12 @@ mod tests {
         )
         .map(libp2p::identity::secp256k1::Keypair::from)
         .expect("a valid key");
+        let node_id = node_id_from_public_key(keypair.public());
         DiscoveredPeer {
             peer_id: libp2p::identity::Keypair::from(keypair)
                 .public()
                 .to_peer_id(),
+            node_id,
             addrs: vec![Multiaddr::empty()],
             subnets: vec![],
             custody_group_count: Some(custody_group_count),
@@ -740,7 +945,12 @@ mod tests {
         let well_subnetted = DiscoveredPeer::for_test(vec![0, 1, 2, 3]);
 
         let mut candidates = vec![well_subnetted.clone(), supernode.clone()];
-        rank_candidates(&mut candidates, &HashSet::new(), &HashSet::from([97u64]));
+        rank_candidates(
+            &mut candidates,
+            &HashSet::new(),
+            &HashSet::from([97u64]),
+            &HashSet::new(),
+        );
         assert_eq!(
             candidates[0].peer_id, supernode.peer_id,
             "a column no peer holds stops the chain; an uncovered subnet only narrows the view"
@@ -748,7 +958,12 @@ mod tests {
 
         // With every column covered, subnet coverage decides again.
         let mut candidates = vec![supernode.clone(), well_subnetted.clone()];
-        rank_candidates(&mut candidates, &HashSet::new(), &HashSet::new());
+        rank_candidates(
+            &mut candidates,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
         assert_eq!(candidates[0].peer_id, well_subnetted.peer_id);
     }
 
@@ -768,7 +983,12 @@ mod tests {
             DiscoveredPeer::for_test(vec![]),
             DiscoveredPeer::for_test(vec![7]),
         ];
-        rank_candidates(&mut candidates, &HashSet::new(), &HashSet::new());
+        rank_candidates(
+            &mut candidates,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
         let order: Vec<_> = candidates.iter().map(|c| c.subnets.clone()).collect();
         assert_eq!(
             order,

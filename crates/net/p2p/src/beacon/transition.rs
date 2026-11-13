@@ -244,7 +244,7 @@ pub(crate) fn apply(server: &mut P2PServer, epoch: Epoch) -> Changes {
         .iter()
         .map(|topics| topics.fork_digest)
         .collect();
-    // Without discovery there is no peer table whose admission to update.
+    // Without discovery there is no admission policy to update.
     if let Some(state) = &server.discovery {
         state.filter().set_fork_id(fork_id, also_admitted);
     }
