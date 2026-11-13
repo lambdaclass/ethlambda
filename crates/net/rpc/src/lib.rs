@@ -758,6 +758,19 @@ pub(crate) mod test_utils {
         Some(client.expect("building a client opens no connection"))
     }
 
+    /// A block root of its own for every `slot`, never the zero hash: `slot + 1`
+    /// in the last eight bytes, big-endian.
+    ///
+    /// For filling a state's `block_roots` so a root read from the wrong slot
+    /// shows up. `H256::repeat_byte(slot as u8 + 1)` cannot do that: the window
+    /// is `SLOTS_PER_HISTORICAL_ROOT` long, more slots than a byte counts, so it
+    /// overflows at slot 255 (a panic in debug, repeating roots in release).
+    pub(crate) fn slot_root(slot: u64) -> H256 {
+        let mut root = [0; 32];
+        root[24..].copy_from_slice(&(slot + 1).to_be_bytes());
+        H256(root)
+    }
+
     /// A beacon store whose anchor, and so head, is `state`, under a block at
     /// the state's slot. Returns the store and that block's root.
     ///
