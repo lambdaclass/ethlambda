@@ -182,8 +182,7 @@ use crate::beacon::containers::{bellatrix, deneb, electra, fulu, gloas, phase0};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::{
-    ActiveBalanceCache, CommitteeCache, CommitteeCacheExt, get_active_validator_indices,
-    get_current_epoch,
+    CommitteeCache, CommitteeCacheExt, get_active_validator_indices, get_current_epoch,
 };
 use crate::beacon::helpers::attestation as phase0_attestation;
 use crate::beacon::helpers::electra as electra_helpers;
@@ -1060,8 +1059,7 @@ fn transition_block(
     validate_result: bool,
     config: &Config,
     engine: &stf::ExecutionEngine,
-    committees: &CommitteeCache,
-    active_balances: &ActiveBalanceCache,
+    caches: stf::BlockCaches<'_>,
 ) -> (BeaconState, Result<()>) {
     let block_slot = signed_block.slot();
     let epoch = compute_epoch_at_slot(block_slot);
@@ -1086,8 +1084,7 @@ fn transition_block(
                 validate_result,
                 config,
                 engine,
-                committees,
-                active_balances,
+                caches,
             );
             return (state, outcome);
         }
@@ -1103,8 +1100,7 @@ fn transition_block(
                     validate_result,
                     config,
                     engine,
-                    committees,
-                    active_balances,
+                    caches,
                 )
             });
         return (state, outcome);
@@ -1128,8 +1124,7 @@ fn transition_block(
             validate_result,
             config,
             engine,
-            committees,
-            active_balances,
+            caches,
         )
     });
     (state, outcome)
@@ -4958,9 +4953,17 @@ pub fn on_block(
     // applies, after `process_slots`, so no second parent state exists).
     // Either way `state` is an independent clone, so a failing block cannot
     // corrupt a cached entry.
-    // The store's own cache, so every block of this chain shares one entry per
-    // epoch; see `ActiveBalanceCacheExt`.
+    // The store's own tables: every block of this chain shares one total
+    // active balance per epoch (see `ActiveBalanceCacheExt`), and one pubkey
+    // table, shared across forks since every hit is verified against the state
+    // in hand (see `PubkeyIndexCacheExt`).
     let active_balances = store.active_balance_cache();
+    let pubkey_indices = store.pubkey_index_cache();
+    let caches = stf::BlockCaches {
+        committees,
+        active_balances: &active_balances,
+        pubkey_indices: &pubkey_indices,
+    };
     let (mut state, transition) = transition_block(
         store,
         &parent_state,
@@ -4969,8 +4972,7 @@ pub fn on_block(
         true,
         config,
         &engine,
-        committees,
-        &active_balances,
+        caches,
     );
 
     // `optimistic-sync.md`: a block deemed `INVALIDATED` MUST NOT be included
@@ -5646,7 +5648,7 @@ mod tests {
     use super::*;
     use crate::beacon::bls;
     use crate::beacon::containers::BeaconBlockHeader;
-    use crate::beacon::helpers::accessors::{self, ActiveBalanceCache};
+    use crate::beacon::helpers::accessors;
     use crate::beacon::helpers::misc::compute_signing_root;
     use crate::beacon::helpers::test_state;
     use crate::beacon::primitives::BlsSignature;
@@ -6316,8 +6318,7 @@ mod tests {
             false,
             &config,
             &stf::ExecutionEngine::valid(),
-            &CommitteeCache::default(),
-            &ActiveBalanceCache::default(),
+            stf::OwnedBlockCaches::default().caches(),
         );
         outcome.expect("applies");
         post.apply_pending_mutations();
@@ -7189,15 +7190,13 @@ mod tests {
         // the transition once, unvalidated, the way a proposer decides
         // everything but the signature and the state root before signing.
         let mut trial_state = anchor_state.clone();
-        let trial_committees = CommitteeCache::default();
         stf::state_transition(
             &mut trial_state,
             &draft,
             false,
             &config,
             &stf::ExecutionEngine::valid(),
-            &trial_committees,
-            &ActiveBalanceCache::default(),
+            stf::OwnedBlockCaches::default().caches(),
         )
         .expect("the drafted block must transition cleanly");
         let state_root = trial_state.hash_tree_root();
@@ -10391,7 +10390,9 @@ mod tests {
         BlockInputs, advance_to_slot, assemble_block, empty_sync_aggregate, payload_inputs,
     };
     use crate::beacon::containers::electra;
-    use crate::beacon::helpers::accessors::{get_beacon_proposer_index, get_domain};
+    use crate::beacon::helpers::accessors::{
+        PubkeyIndexCache, get_beacon_proposer_index, get_domain,
+    };
     use crate::beacon::helpers::test_state::{sign_for, with_signing_validators_at};
     use crate::beacon::primitives::Bytes32;
     use ethlambda_types::beacon::containers::deneb::ExecutionPayload;
@@ -10448,6 +10449,7 @@ mod tests {
             &advanced,
             inputs,
             &config,
+            &PubkeyIndexCache::default(),
             crate::beacon::stf::block::BlockProcessingOptions::default(),
         )
         .expect("assemble");
@@ -10473,8 +10475,7 @@ mod tests {
             false,
             &Config::mainnet(),
             &stf::ExecutionEngine::valid(),
-            &CommitteeCache::default(),
-            &ActiveBalanceCache::default(),
+            stf::OwnedBlockCaches::default().caches(),
         );
         outcome.expect("the block applies");
         state.apply_pending_mutations();

@@ -327,10 +327,27 @@ activation or exit lands at least `MAX_SEED_LOOKAHEAD` epochs ahead, so no block
 inside the epoch can move the total, and two states agreeing on that root agree
 on it. The cache lives outside the state, so it adds no field to `BeaconState`
 and no SSZ concern; callers with no store (spec runners, block production,
-tests) hold a fresh `ActiveBalanceCache::default()`. Epoch processing, churn
-helpers and fork choice keep calling the uncached one-pass
-`get_total_active_balance`. In debug builds every hit is cross-checked against a
-fresh computation.
+tests) hold a fresh `ActiveBalanceCache::default()`. Block processing reads it
+for base rewards (attestations, the sync aggregate) and for the churn limits
+of everything a block can make exit or consolidate: voluntary exits, proposer
+and attester slashings, withdrawal and consolidation requests (gloas's
+`apply_parent_execution_payload` included). The churn helpers take it as an
+`Option`, and epoch processing (its ejections included) passes `None` and keeps
+calling the uncached one-pass `get_total_active_balance`, because the key is
+unsound once that epoch's effective-balance update has run. In debug builds
+every hit is cross-checked against a fresh computation.
+
+A block-processing entry point (`state_transition`, `apply_block`, every
+fork's `process_block`) takes its tables as one `stf::BlockCaches`: the
+committee cache, the active-balance cache, and the pubkey-index cache, which
+answers `validator_index(pubkey)` (the sync committee's seats, withdrawal and
+consolidation requests) without walking the registry. Fork choice passes the
+`Store`'s shared tables; block production passes a fresh committee and
+active-balance table but the store's pubkey table, since a fresh one would
+ingest the whole registry; a caller with no store holds an
+`stf::OwnedBlockCaches`. Every pubkey-table answer is verified against the
+asking state, and an index found by a fallback scan is recorded, so a key the
+table cannot confirm costs one scan rather than one per block.
 
 Epoch steps 1-3 (justification, inactivity updates, rewards) follow that rule
 through `helpers::participation`. One walk of `iter_validators()`, zipped with
