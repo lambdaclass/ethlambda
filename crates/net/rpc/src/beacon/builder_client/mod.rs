@@ -467,37 +467,15 @@ pub(super) async fn read_body(
     Ok(body)
 }
 
-/// `text` with every character that could break or restyle a line written
-/// out, cut to at most [`MAX_ERROR_TEXT`] bytes.
+/// `text` as [`ethlambda_types::text::one_line`] writes it, cut to at most
+/// [`MAX_ERROR_TEXT`] bytes.
 ///
 /// A builder's text reaches this node's logs and a validator client's error
-/// message. There a raw line break would start what reads as a log line of
-/// its own, and an ESC would start an ANSI sequence that recolors, moves the
-/// cursor in or clears a terminal. So every control character
-/// (`char::is_control`: C0, DEL and C1) and the Unicode line and paragraph
-/// separators U+2028/U+2029, which some viewers break lines at, are written
-/// as Rust escapes: `\n`, `\r` and `\t`, and `\u{1b}` for the rest. Everything
-/// else passes through unchanged, quotes and backslashes included.
-///
-/// The cap is applied to the escaped text, and never cuts a character or an
-/// escape in two.
+/// message, so no line break or terminal escape in it may reach either as
+/// itself. The validator client writes a beacon node's error text through the
+/// same function.
 pub(super) fn error_text(text: String) -> String {
-    let mut written = String::with_capacity(text.len().min(MAX_ERROR_TEXT));
-    for c in text.chars() {
-        if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
-            let escaped = c.escape_default();
-            if written.len() + escaped.len() > MAX_ERROR_TEXT {
-                break;
-            }
-            written.extend(escaped);
-        } else {
-            if written.len() + c.len_utf8() > MAX_ERROR_TEXT {
-                break;
-            }
-            written.push(c);
-        }
-    }
-    written
+    ethlambda_types::text::one_line(&text, MAX_ERROR_TEXT)
 }
 
 /// The fork `version` names, if its bids have the shape [`SignedBuilderBid`]

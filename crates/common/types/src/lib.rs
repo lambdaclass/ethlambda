@@ -9,6 +9,7 @@ pub mod enr;
 pub mod genesis;
 pub mod primitives;
 pub mod state;
+pub mod text;
 pub mod time;
 
 /// Display helper for truncated root hashes (8 hex chars)

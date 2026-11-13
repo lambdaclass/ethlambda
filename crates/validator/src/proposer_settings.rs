@@ -22,6 +22,7 @@
 //! signing reports as a mismatch.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{PoisonError, RwLock};
 
 use ethlambda_types::beacon::primitives::{BlsPubkey, Bytes32, ExecutionAddress, H256};
@@ -59,9 +60,9 @@ pub fn graffiti_to_text(graffiti: &Bytes32) -> String {
 
 /// The gas limit a validator with no override reports.
 ///
-/// Lighthouse's and Nimbus's default. Nothing in this client uses it yet: it
-/// matters only to builder registrations, and there is no builder flow. It is
-/// held so the keymanager API can serve it as the specification requires.
+/// Lighthouse's and Nimbus's default. Builder registrations carry it as the
+/// gas limit the builder should target, and the keymanager API serves it as the
+/// specification requires.
 pub const DEFAULT_GAS_LIMIT: u64 = 60_000_000;
 
 /// One validator's overrides; `None` means the default applies.
@@ -98,6 +99,10 @@ struct Inner {
 #[derive(Debug)]
 pub struct ProposerSettings {
     inner: RwLock<Inner>,
+    /// Bumped on every override write or delete, so a reader that caches
+    /// something derived from the settings (the builder registrations) can
+    /// tell that nothing changed without reading every key.
+    generation: AtomicU64,
 }
 
 impl ProposerSettings {
@@ -111,7 +116,14 @@ impl ProposerSettings {
                 default_gas_limit: DEFAULT_GAS_LIMIT,
                 overrides: HashMap::new(),
             }),
+            generation: AtomicU64::new(0),
         }
+    }
+
+    /// A counter that moves whenever any override is written, cleared or
+    /// forgotten. Equal readings mean no per-key setting changed between them.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     fn read<T>(&self, f: impl FnOnce(&Inner) -> T) -> T {
@@ -127,6 +139,9 @@ impl ProposerSettings {
         if entry.is_empty() {
             inner.overrides.remove(pubkey);
         }
+        // Inside the write lock, so a reader that sees the new generation also
+        // sees the new value.
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
     /// Where `pubkey`'s execution-layer rewards should go, or `None` when
@@ -135,6 +150,29 @@ impl ProposerSettings {
         self.read(|inner| {
             let overridden = inner.overrides.get(pubkey).and_then(|o| o.fee_recipient);
             overridden.or(inner.default_fee_recipient)
+        })
+    }
+
+    /// `pubkey`'s fee recipient and gas limit read together, under one lock, or
+    /// `None` when it has no fee recipient.
+    ///
+    /// For a signed message that carries both (a builder registration, proposer
+    /// preferences): two separate reads could straddle a keymanager write and
+    /// pair an old address with a new gas limit, a combination the operator
+    /// never configured, which the builder then keeps.
+    pub fn fee_recipient_and_gas_limit(
+        &self,
+        pubkey: &BlsPubkey,
+    ) -> Option<(ExecutionAddress, u64)> {
+        self.read(|inner| {
+            let overrides = inner.overrides.get(pubkey);
+            let fee_recipient = overrides
+                .and_then(|o| o.fee_recipient)
+                .or(inner.default_fee_recipient)?;
+            let gas_limit = overrides
+                .and_then(|o| o.gas_limit)
+                .unwrap_or(inner.default_gas_limit);
+            Some((fee_recipient, gas_limit))
         })
     }
 
@@ -183,6 +221,7 @@ impl ProposerSettings {
     pub fn forget(&self, pubkey: &BlsPubkey) {
         let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         inner.overrides.remove(pubkey);
+        self.generation.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -221,6 +260,28 @@ mod tests {
         assert_eq!(settings.fee_recipient(&key(2)), Some(H160([0xaa; 20])));
         assert_eq!(settings.graffiti(&key(2)), Bytes32::repeat_byte(0x11));
         assert_eq!(settings.gas_limit(&key(2)), DEFAULT_GAS_LIMIT);
+    }
+
+    /// The pair a signed registration or preference carries agrees with the
+    /// two separate reads, and is `None` exactly when there is no address.
+    #[test]
+    fn the_fee_recipient_and_gas_limit_read_together_match_the_single_reads() {
+        let settings = ProposerSettings::new(Bytes32::ZERO, None);
+        assert_eq!(settings.fee_recipient_and_gas_limit(&key(1)), None);
+
+        settings.set_gas_limit(&key(1), 30_000_000);
+        assert_eq!(settings.fee_recipient_and_gas_limit(&key(1)), None);
+        settings.set_fee_recipient(&key(1), H160([0xbb; 20]));
+        assert_eq!(
+            settings.fee_recipient_and_gas_limit(&key(1)),
+            Some((H160([0xbb; 20]), 30_000_000))
+        );
+
+        let defaults = self::settings();
+        assert_eq!(
+            defaults.fee_recipient_and_gas_limit(&key(2)),
+            Some((H160([0xaa; 20]), DEFAULT_GAS_LIMIT))
+        );
     }
 
     /// Clearing one field leaves the others overridden.
