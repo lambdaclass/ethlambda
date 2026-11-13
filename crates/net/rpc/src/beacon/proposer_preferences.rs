@@ -14,7 +14,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
-use ethlambda_network_api::RpcToP2PRef;
+use ethlambda_blockchain::EventBus;
+use ethlambda_network_api::{GossipEvent, RpcToP2PRef};
 use ethlambda_state_transition::beacon::{
     builder_market::SharedBuilderMarket,
     gossip::{IgnoreReason, Outcome, proposer_preferences::validate},
@@ -28,7 +29,7 @@ use tracing::{debug, warn};
 use crate::beacon::{
     ApiError,
     bids::{describe, require_version, unix_ms},
-    decode_list,
+    decode_list, emit_accepted,
 };
 
 /// The most entries one request may carry: the SSZ list's bound,
@@ -62,6 +63,7 @@ async fn post_proposer_preferences(
     State(store): State<Store>,
     Extension(p2p): Extension<RpcToP2PRef>,
     Extension(market): Extension<SharedBuilderMarket>,
+    events: Option<Extension<EventBus>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -78,8 +80,11 @@ async fn post_proposer_preferences(
         return ApiError::BadRequest("too many signed proposer preferences").into_response();
     }
 
-    let validated =
-        tokio::task::spawn_blocking(move || submit(&store, &p2p, &market, preferences)).await;
+    let events = events.map(|Extension(events)| events);
+    let validated = tokio::task::spawn_blocking(move || {
+        submit(&store, &p2p, &market, events.as_ref(), preferences)
+    })
+    .await;
     let failures = match validated {
         Ok(failures) => failures,
         Err(_) => return ApiError::Internal("validating the preferences failed").into_response(),
@@ -102,6 +107,7 @@ fn submit(
     store: &Store,
     p2p: &RpcToP2PRef,
     market: &SharedBuilderMarket,
+    events: Option<&EventBus>,
     preferences: Vec<SignedProposerPreferences>,
 ) -> Vec<Failure> {
     let now_ms = unix_ms();
@@ -132,8 +138,14 @@ fn submit(
             });
             continue;
         }
+        let for_event = signed.clone();
         match p2p.publish_proposer_preferences(signed) {
-            Ok(()) => debug!(%slot, validator, "Accepted proposer preferences for gossip"),
+            Ok(()) => {
+                emit_accepted(events, || {
+                    GossipEvent::ProposerPreferences(Box::new(for_event))
+                });
+                debug!(%slot, validator, "Accepted proposer preferences for gossip")
+            }
             Err(_) => failures.push(Failure {
                 index,
                 message: "the network actor is not running".to_string(),

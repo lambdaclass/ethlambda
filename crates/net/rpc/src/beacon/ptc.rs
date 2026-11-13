@@ -12,6 +12,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
+use crate::beacon::emit_accepted;
 use axum::{
     Extension, Router,
     body::Bytes,
@@ -20,10 +21,10 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use ethlambda_blockchain::SyncStatusController;
 use ethlambda_blockchain::metrics::SyncStatus;
+use ethlambda_blockchain::{EventBus, SyncStatusController};
 use ethlambda_engine::EngineClient;
-use ethlambda_network_api::RpcToP2PRef;
+use ethlambda_network_api::{GossipEvent, RpcToP2PRef};
 use ethlambda_state_transition::beacon::{
     fork_choice::get_payload_due_ms,
     gloas_block_production::aggregate_payload_attestations,
@@ -389,6 +390,7 @@ async fn post_pool_payload_attestations(
     State(store): State<Store>,
     Extension(p2p): Extension<RpcToP2PRef>,
     Extension(pool): Extension<SharedPayloadAttestationPool>,
+    events: Option<Extension<EventBus>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -433,8 +435,14 @@ async fn post_pool_payload_attestations(
             debug!(%slot, validator, "Payload attestation already pooled; not republishing");
             continue;
         }
+        let for_event = message.clone();
         match p2p.publish_payload_attestation_message(message) {
-            Ok(()) => debug!(%slot, validator, "Accepted payload attestation for gossip"),
+            Ok(()) => {
+                emit_accepted(events.as_deref(), || {
+                    GossipEvent::PayloadAttestationMessage(for_event)
+                });
+                debug!(%slot, validator, "Accepted payload attestation for gossip")
+            }
             Err(_) => failures.push(Failure {
                 index,
                 message: "the network actor is not running".to_string(),

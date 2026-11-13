@@ -1722,6 +1722,10 @@ impl BlockChainServer {
         // post-state the store already holds before ever reaching here.
         let slot = signed_block.slot();
         let block_root = signed_block.message_hash_tree_root();
+        // Two words, taken before the match moves the block: the `block` event
+        // of a gloas block names its bid's builder and payload hash.
+        let bid = crate::beacon_payloads::bid_of(&signed_block)
+            .map(|bid| (bid.builder_index, bid.block_hash));
         let is_new = !self
             .store
             .has_state(&block_root)
@@ -1943,7 +1947,8 @@ impl BlockChainServer {
         // `block` goes out first so subscribers see it ahead of the
         // justified/head/finalized moves its import triggers.
         if is_new {
-            self.events.publish_block(&self.store, slot, block_root);
+            self.events
+                .publish_block(&self.store, slot, block_root, bid);
         }
         // Lean only: a beacon import moves no head of its own, and the
         // cascade's head recompute publishes beacon's events once it runs.
@@ -5828,9 +5833,11 @@ mod tests {
 
     use crate::events::{
         BeaconAttestationEvent, BeaconChainReorgEvent, BeaconFinalizedCheckpointEvent,
-        BeaconHeadEvent, DataColumnSidecarEvent, HEAD_EVENT_RECENCY_SLOTS,
+        BeaconHeadEvent, BeaconHeadV2Event, DataColumnSidecarEvent, ExecutionPayloadAvailableEvent,
+        ExecutionPayloadEvent, HEAD_EVENT_RECENCY_SLOTS, Versioned,
     };
     use ethlambda_storage::ForkCheckpoints;
+    use ethlambda_types::beacon::fork_choice::PayloadStatus;
     use tokio::sync::broadcast;
 
     const G: H256 = H256::repeat_byte(0x10);
@@ -5901,8 +5908,12 @@ mod tests {
             .expect("update head");
     }
 
+    /// What is on the channel but `head_v2`, which rides every `head` and is
+    /// tested apart (see [`drain_all`]).
     fn drain(rx: &mut broadcast::Receiver<ChainEvent>) -> Vec<ChainEvent> {
-        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|event| !matches!(event, ChainEvent::BeaconHeadV2(_)))
+            .collect()
     }
 
     fn as_head(event: &ChainEvent) -> &BeaconHeadEvent {
@@ -6234,5 +6245,186 @@ mod tests {
             panic!("expected block_gossip, got {:?}", emitted[0]);
         };
         assert_eq!((gossip.slot, gossip.block), (4, root));
+    }
+
+    // -----------------------------------------------------------------
+    // `head_v2`
+    // -----------------------------------------------------------------
+
+    /// Everything on the channel, `head_v2` included. [`drain`] leaves it
+    /// out, so the tests of `head` and `chain_reorg` keep reading the
+    /// events they name.
+    fn drain_all(rx: &mut broadcast::Receiver<ChainEvent>) -> Vec<ChainEvent> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    fn as_head_v2(event: &ChainEvent) -> &Versioned<BeaconHeadV2Event> {
+        match event {
+            ChainEvent::BeaconHeadV2(head) => head,
+            other => panic!("expected a head_v2 event, got {other:?}"),
+        }
+    }
+
+    /// Every head move announces `head`, then `head_v2` for the same block,
+    /// and a pre-gloas head is `full`.
+    #[test]
+    fn a_head_move_emits_head_v2_right_after_head_and_it_is_full_before_gloas() {
+        let (mut store, mut events, mut rx) = fork_fixture(A);
+        set_head(&mut store, B);
+        events.publish_beacon_changes(&store, 2);
+
+        let emitted = drain_all(&mut rx);
+        assert_eq!(emitted.len(), 2, "{emitted:?}");
+        assert_eq!(as_head(&emitted[0]).block, B);
+        let v2 = as_head_v2(&emitted[1]);
+        assert_eq!(v2.version, "phase0");
+        assert_eq!(
+            v2.data,
+            BeaconHeadV2Event {
+                slot: 2,
+                block: B,
+                state: post_state_root(B),
+                payload_status: "full",
+                epoch_transition: false,
+                // Epoch 0: both dependent roots underflow to genesis.
+                current_epoch_dependent_root: G,
+                next_epoch_dependent_root: G,
+                execution_optimistic: false,
+            }
+        );
+    }
+
+    /// `head_v2`'s roots are `head`'s shifted one epoch: current is the root
+    /// at `start_slot(epoch - 1) - 1`, next the root at `start_slot(epoch) - 1`,
+    /// both the genesis block's on underflow.
+    #[test]
+    fn head_v2_dependent_roots_follow_the_epoch_and_underflow_to_genesis() {
+        let x = H256::repeat_byte(0x21);
+        let y = H256::repeat_byte(0x22);
+        let z = H256::repeat_byte(0x23);
+        let mut store = event_store(GENESIS_TIME);
+        insert_event_block(&mut store, x, 31, G, &[(0, G)]);
+        insert_event_block(&mut store, y, 32, x, &[(0, G), (31, x)]);
+        insert_event_block(&mut store, z, 65, y, &[(0, G), (31, x), (32, y)]);
+        set_head(&mut store, x);
+        let mut events = ChainEvents::new(EventBus::new(16), &store);
+        let mut rx = events.subscribe();
+
+        set_head(&mut store, y);
+        events.publish_beacon_changes(&store, 32);
+        let emitted = drain_all(&mut rx);
+        let head = &as_head_v2(&emitted[1]).data;
+        assert!(head.epoch_transition);
+        // Epoch 1 (slot 32): `start_slot(0) - 1` underflows, `start_slot(1) - 1`
+        // is slot 31.
+        assert_eq!(head.current_epoch_dependent_root, G);
+        assert_eq!(head.next_epoch_dependent_root, x);
+
+        set_head(&mut store, z);
+        events.publish_beacon_changes(&store, 65);
+        let emitted = drain_all(&mut rx);
+        let head = &as_head_v2(&emitted[1]).data;
+        assert!(head.epoch_transition);
+        // Epoch 2 (slot 65): slots 31 and 63.
+        assert_eq!(head.current_epoch_dependent_root, x);
+        assert_eq!(head.next_epoch_dependent_root, y);
+    }
+
+    /// A head whose payload arrives gets `head_v2` a second time, for the same
+    /// block and with no epoch transition; nothing else moves.
+    #[test]
+    fn a_head_whose_payload_arrives_gets_head_v2_again() {
+        let (store, mut events, mut rx) = fork_fixture(B);
+        store.set_head_payload_status(B, PayloadStatus::Empty);
+        // The view starts from the empty head, as after the head's own move.
+        events.publish_beacon_changes(&store, 2);
+        assert!(drain_all(&mut rx).is_empty());
+
+        store.set_head_payload_status(B, PayloadStatus::Full);
+        events.publish_beacon_changes(&store, 2);
+
+        let emitted = drain_all(&mut rx);
+        assert_eq!(emitted.len(), 1, "{emitted:?}");
+        let v2 = &as_head_v2(&emitted[0]).data;
+        assert_eq!((v2.slot, v2.block), (2, B));
+        assert!(!v2.epoch_transition);
+
+        // Reported once: the view now holds FULL.
+        events.publish_beacon_changes(&store, 2);
+        assert!(drain_all(&mut rx).is_empty());
+    }
+
+    /// Other transitions are optional in the specification and left out here:
+    /// full to empty, and an empty head that stays empty.
+    #[test]
+    fn only_empty_to_full_repeats_head_v2() {
+        let (store, mut events, mut rx) = fork_fixture(B);
+        store.set_head_payload_status(B, PayloadStatus::Full);
+        events.publish_beacon_changes(&store, 2);
+        store.set_head_payload_status(B, PayloadStatus::Empty);
+        events.publish_beacon_changes(&store, 2);
+        assert!(drain_all(&mut rx).is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // Envelope import events
+    // -----------------------------------------------------------------
+
+    /// An envelope the chain actor imports publishes `execution_payload` and
+    /// `execution_payload_available`, in that order.
+    #[test]
+    fn an_imported_envelope_publishes_execution_payload_then_available() {
+        let (store, events, mut rx) = fork_fixture(B);
+
+        events.publish_envelope_imported(&store, 2, 42, H256::repeat_byte(0x77), B);
+
+        let emitted = drain_all(&mut rx);
+        assert_eq!(emitted.len(), 2, "{emitted:?}");
+        match &emitted[0] {
+            ChainEvent::ExecutionPayload(payload) => assert_eq!(
+                payload,
+                &ExecutionPayloadEvent {
+                    slot: 2,
+                    builder_index: 42,
+                    block_hash: H256::repeat_byte(0x77),
+                    block_root: B,
+                    execution_optimistic: false,
+                }
+            ),
+            other => panic!("expected execution_payload first, got {other:?}"),
+        }
+        match &emitted[1] {
+            ChainEvent::ExecutionPayloadAvailable(available) => assert_eq!(
+                available,
+                &ExecutionPayloadAvailableEvent {
+                    slot: 2,
+                    block_root: B
+                }
+            ),
+            other => panic!("expected execution_payload_available second, got {other:?}"),
+        }
+    }
+
+    /// A gloas block's `block` event names its bid's builder and payload
+    /// hash; an earlier block's carries neither.
+    #[test]
+    fn the_block_event_carries_the_bid_of_a_gloas_block_only() {
+        let (store, events, mut rx) = fork_fixture(B);
+
+        events.publish_block(&store, 2, B, Some((42, H256::repeat_byte(0x77))));
+        events.publish_block(&store, 2, B, None);
+
+        let emitted = drain_all(&mut rx);
+        let json: Vec<_> = emitted
+            .iter()
+            .map(|event| serde_json::to_value(event).unwrap())
+            .collect();
+        assert_eq!(json[0]["builder_index"], "42");
+        assert_eq!(
+            json[0]["block_hash"],
+            format!("0x{}", "77".repeat(32)).as_str()
+        );
+        assert!(json[1].get("builder_index").is_none());
+        assert!(json[1].get("block_hash").is_none());
     }
 }

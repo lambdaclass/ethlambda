@@ -231,8 +231,9 @@ pub struct BeaconApiHandles {
     /// makes block production, attestation data and aggregation answer 503:
     /// with nothing validating payloads, none has a block it may vouch for.
     pub engine: Option<ethlambda_engine::EngineClient>,
-    /// The chain-event bus `/eth/v1/events` streams from. Read only there:
-    /// the chain actor is its only publisher, so no endpoint here writes to it.
+    /// The chain-event bus `/eth/v1/events` streams from. Besides the chain
+    /// actor and p2p, the submission endpoints publish to it: what they accept
+    /// is an event of its own (see `beacon::emit_accepted`).
     pub events: EventBus,
     /// This build as the Engine API identifies it. Block production appends
     /// its code and commit, with the execution client's, to every block's
