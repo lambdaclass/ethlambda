@@ -33,9 +33,18 @@
 //! # Failures are never propagated
 //!
 //! A missed registration costs at most a builder block, never a duty, so a
-//! failed send is logged and counted and the caller moves on. A changed
-//! registration whose send fails is cached anyway, so it is not re-sent at the
-//! next slot: it waits for the next epoch's full send.
+//! failed send is logged and counted and the caller moves on.
+//!
+//! A per-slot send that no node accepts is sent again at every slot until one
+//! does: it carries a keymanager change, and until a node takes it the builder
+//! keeps paying the old fee recipient. The registrations are re-sent as they
+//! were signed, so nothing is re-signed and their timestamps stay put, and
+//! [`RegistrationService::signed_generation`] stays behind meanwhile, which
+//! keeps the per-slot check below one atomic read. A full send that fails
+//! waits for the next epoch's instead: re-sending every key each slot would
+//! load a node that is already failing, and the next full send carries them
+//! all anyway. A full send ends every per-slot retry, delivered or not, so a
+//! node that keeps refusing costs a warning a slot for an epoch at most.
 //!
 //! A batch a node refuses with a 400 is not split to find the entry it
 //! objects to: every entry is signed here by keys this client holds, so a
@@ -65,12 +74,20 @@
 //!
 //! A per-slot send that finds the lock taken skips: it has not marked its
 //! change as sent, so a later slot picks it up. While a full send runs, that
-//! is the first slot after it ends, which against a node that is slow to
-//! answer each batch can be several slots on. A full send waits for it
-//! instead, since a per-slot send is short and skipping would cost an epoch.
-//! A full send that finds the previous full send still running, or waiting,
-//! skips to the next epoch (see [`crate::in_flight`]), so a hung node cannot
-//! queue up one waiting send per epoch.
+//! is the first slot after it ends, and a full send lasts as long as its
+//! slowest node takes over every batch. A node has 12 s to answer each one
+//! (one that takes longer is treated as unreachable and sent no more), so the
+//! wait is at most 12 s per [`REGISTRATION_BATCH`] validators. An ethlambda
+//! node whose relay does not answer comes close: it replies to each batch
+//! with a 500 once its own 10 s wait on the relay runs out, and is still sent
+//! the rest. With 5,000 validators, ten batches, a keymanager change then
+//! waits about 100 s, eight slots, and two minutes at most.
+//!
+//! A full send waits for a running per-slot send instead, since that send is
+//! short and skipping would cost an epoch. A full send that finds the
+//! previous full send still running, or waiting, skips to the next epoch (see
+//! [`crate::in_flight`]), so a hung node cannot queue up one waiting send per
+//! epoch.
 //!
 //! # Signing stays off the async runtime
 //!
@@ -118,6 +135,9 @@ struct Current {
     changed: Vec<SignedValidatorRegistrationV1>,
     /// Validators skipped because no fee recipient is configured for them.
     no_fee_recipient: usize,
+    /// Chunks whose signing task failed, so whose validators are in neither
+    /// list.
+    failed_chunks: usize,
 }
 
 impl Current {
@@ -125,6 +145,7 @@ impl Current {
         self.all.extend(other.all);
         self.changed.extend(other.changed);
         self.no_fee_recipient += other.no_fee_recipient;
+        self.failed_chunks += other.failed_chunks;
     }
 }
 
@@ -162,8 +183,14 @@ pub struct RegistrationService<B> {
     /// enough, and a signing chunk holding it keeps no one else waiting.
     signed: std::sync::Mutex<HashMap<BlsPubkey, SignedValidatorRegistrationV1>>,
     /// The [`ProposerSettings::generation`] the cache was last brought up to
-    /// date against.
+    /// date against. Held behind while [`Self::unsent`] is not empty, so the
+    /// next per-slot call retries it.
     signed_generation: AtomicU64,
+    /// Validators whose newest registration a per-slot send could not get any
+    /// node to accept: sent again, as signed, at every slot until one does or
+    /// the next full send, which carries them anyway, ends the retry. Taken
+    /// under [`Self::sending`] only.
+    unsent: std::sync::Mutex<HashSet<BlsPubkey>>,
     /// Held by a send from before it reads the cache until its last batch is
     /// answered, so sends reach every node in the order they read the cache.
     /// See the module doc.
@@ -185,6 +212,7 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
             known: std::sync::Mutex::new(Vec::new()),
             signed: std::sync::Mutex::new(HashMap::new()),
             signed_generation: AtomicU64::new(0),
+            unsent: std::sync::Mutex::new(HashSet::new()),
             sending: Mutex::new(()),
             full_send: InFlight::default(),
         }
@@ -205,6 +233,7 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
             all: Vec::with_capacity(pubkeys.len()),
             changed: Vec::new(),
             no_fee_recipient: 0,
+            failed_chunks: 0,
         };
         for pubkey in pubkeys {
             let Some((fee_recipient, gas_limit)) =
@@ -269,6 +298,7 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
             all: Vec::with_capacity(pubkeys.len()),
             changed: Vec::new(),
             no_fee_recipient: 0,
+            failed_chunks: 0,
         };
         for chunk in pubkeys.chunks(SIGN_CHUNK) {
             let (service, store, chunk) = (self.clone(), store.clone(), chunk.to_vec());
@@ -279,10 +309,33 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
             .await;
             match part {
                 Ok(part) => current.extend(part),
-                Err(err) => warn!(%err, "Signing builder registrations failed; skipping a chunk"),
+                Err(err) => {
+                    warn!(%err, "Signing builder registrations failed; skipping a chunk");
+                    current.failed_chunks += 1;
+                }
             }
         }
         current
+    }
+
+    /// Record that every setting up to `generation` is signed and sent,
+    /// unless a chunk of the signing failed (`failed_chunks`) or a registration
+    /// is waiting to be sent again ([`Self::unsent`]). Then the generation
+    /// stays behind, so the next slot's [`Self::register_changed`] signs what
+    /// that chunk held, or re-sends what no node took, rather than leaving a
+    /// keymanager change unsent for an epoch.
+    fn mark_signed(&self, generation: u64, failed_chunks: usize) {
+        if failed_chunks == 0 && self.unsent().is_empty() {
+            self.signed_generation.store(generation, Ordering::Release);
+        }
+    }
+
+    /// [`Self::unsent`], locked. A poisoned lock is recovered: every write is
+    /// one set operation.
+    fn unsent(&self) -> std::sync::MutexGuard<'_, HashSet<BlsPubkey>> {
+        self.unsent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Register every validator in `pubkeys`, the ones the beacon node resolved
@@ -323,7 +376,6 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = pubkeys.clone();
 
         let current = self.current_blocking(&store, &pubkeys).await;
-        self.signed_generation.store(generation, Ordering::Release);
         if current.no_fee_recipient > 0 {
             warn!(
                 skipped = current.no_fee_recipient,
@@ -331,12 +383,19 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
             );
         }
         self.send(&current.all).await;
+        // This send carried every key, so it ends each per-slot retry: a key it
+        // delivered needs no more, and one it did not waits for the next
+        // epoch's full send with the rest of its batch.
+        self.unsent().clear();
+        self.mark_signed(generation, current.failed_chunks);
     }
 
     /// Send only the registrations whose fee recipient or gas limit changed
     /// since they were last signed, over the validators the last
-    /// [`Self::register_all`] was given. Called every slot, so a keymanager
-    /// change reaches the builder within a slot rather than an epoch.
+    /// [`Self::register_all`] was given, plus any an earlier slot could not
+    /// get a node to accept ([`Self::unsent`]). Called every slot, so a
+    /// keymanager change reaches the builder within a slot rather than an
+    /// epoch.
     ///
     /// Returns before touching the store when no setting was written since the
     /// last signing: see the module doc.
@@ -374,24 +433,44 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
             return;
         }
         let current = self.current_blocking(&store, &known).await;
-        self.signed_generation.store(generation, Ordering::Release);
-        if current.changed.is_empty() {
-            return;
+        // What changed, and what an earlier slot could not get any node to
+        // take. Both are read off `all`, the newest registration per key, so a
+        // key that changed again since its failed send goes out once, as now.
+        let retry = std::mem::take(&mut *self.unsent());
+        let changed: HashSet<BlsPubkey> = current
+            .changed
+            .iter()
+            .map(|registration| registration.message.pubkey)
+            .collect();
+        let outgoing: Vec<SignedValidatorRegistrationV1> = current
+            .all
+            .into_iter()
+            .filter(|registration| {
+                let pubkey = &registration.message.pubkey;
+                changed.contains(pubkey) || retry.contains(pubkey)
+            })
+            .collect();
+        if !outgoing.is_empty() {
+            let failed = self.send(&outgoing).await;
+            self.unsent().extend(failed);
         }
-        self.send(&current.changed).await;
+        self.mark_signed(generation, current.failed_chunks);
     }
 
     /// Send `registrations` to the beacon node in batches, counting each batch
     /// as sent when a node accepted it and as a failure when none did.
-    async fn send(&self, registrations: &[SignedValidatorRegistrationV1]) {
+    ///
+    /// Returns the validators in the batches no node accepted.
+    async fn send(&self, registrations: &[SignedValidatorRegistrationV1]) -> HashSet<BlsPubkey> {
         let outcomes = self
             .beacon_node
             .register_validators_in_batches(registrations)
             .await;
+        let mut failed = HashSet::new();
         for (batch, outcome) in registrations.chunks(REGISTRATION_BATCH).zip(outcomes) {
             let count = batch.len();
             // Only logged and counted: see "Failures are never propagated".
-            let _ = outcome
+            let refused = outcome
                 .inspect(|()| {
                     debug!(count, "Builder registrations sent");
                     crate::metrics::inc_builder_registrations_sent(count);
@@ -399,8 +478,13 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
                 .inspect_err(|err| {
                     warn!(count, %err, "No beacon node accepted the builder registrations");
                     crate::metrics::inc_builder_registration_failures();
-                });
+                })
+                .is_err();
+            if refused {
+                failed.extend(batch.iter().map(|registration| registration.message.pubkey));
+            }
         }
+        failed
     }
 }
 
@@ -763,6 +847,116 @@ mod tests {
         assert_eq!(registrations.len(), 4);
         assert_eq!(registrations[3].message.pubkey, pubkeys[2]);
         assert_eq!(registrations[3].message.gas_limit, 30_000_000);
+    }
+
+    fn refuse_registrations(node: &MockBeaconNode) {
+        node.failures
+            .lock()
+            .expect("lock")
+            .insert("register_validators", "relay down".to_string());
+    }
+
+    fn registration_calls(node: &MockBeaconNode) -> usize {
+        node.registration_attempts
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A change no node accepted goes out again at every slot, as it was
+    /// signed, until a node takes it; the slot after that sends nothing.
+    #[tokio::test]
+    async fn a_change_no_node_accepted_is_sent_again_until_one_does() {
+        let (store, pubkeys) = store_with_keys(2);
+        let settings = settings(Some(H160([0xab; 20])));
+        let (service, node) = service(Config::mainnet(), settings.clone());
+        let store = Arc::new(RwLock::new(store));
+        service
+            .clone()
+            .register_all(0, pubkeys.clone(), store.clone())
+            .await;
+
+        refuse_registrations(&node);
+        settings.set_gas_limit(&pubkeys[1], 30_000_000);
+        service.clone().register_changed(0, store.clone()).await;
+        service.clone().register_changed(0, store.clone()).await;
+        assert_eq!(registration_calls(&node), 3, "refused, then tried again");
+
+        node.stop_failing("register_validators");
+        service.clone().register_changed(0, store.clone()).await;
+        let signed = service.signed.lock().expect("lock")[&pubkeys[1]].clone();
+        {
+            let registrations = node.registrations.lock().expect("lock");
+            assert_eq!(
+                registrations.len(),
+                3,
+                "the full send's two, then the change"
+            );
+            assert_eq!(registrations[2].message.gas_limit, 30_000_000);
+            assert_eq!(
+                registrations[2], signed,
+                "re-sent as signed, not signed again"
+            );
+        }
+
+        service.clone().register_changed(0, store.clone()).await;
+        assert_eq!(registration_calls(&node), 4, "delivered, so nothing more");
+    }
+
+    /// A full send that delivers a key waiting for its retry ends the retry,
+    /// and the slots after it go back to sending nothing.
+    #[tokio::test]
+    async fn a_full_send_that_delivers_a_waiting_change_ends_its_retry() {
+        let (store, pubkeys) = store_with_keys(2);
+        let settings = settings(Some(H160([0xab; 20])));
+        let (service, node) = service(Config::mainnet(), settings.clone());
+        let store = Arc::new(RwLock::new(store));
+        service
+            .clone()
+            .register_all(0, pubkeys.clone(), store.clone())
+            .await;
+
+        refuse_registrations(&node);
+        settings.set_gas_limit(&pubkeys[1], 30_000_000);
+        service.clone().register_changed(0, store.clone()).await;
+
+        node.stop_failing("register_validators");
+        service
+            .clone()
+            .register_all(1, pubkeys.clone(), store.clone())
+            .await;
+        service.clone().register_changed(1, store.clone()).await;
+        assert_eq!(
+            *node.registration_batches.lock().expect("lock"),
+            vec![2, 2],
+            "the two full sends, and no retry after the second"
+        );
+    }
+
+    /// A full send ends the retry even when it is refused too: the change then
+    /// waits for the next epoch's full send with the rest of the set, rather
+    /// than costing a refused send at every slot for as long as the node
+    /// refuses.
+    #[tokio::test]
+    async fn a_refused_full_send_ends_the_retry_too() {
+        let (store, pubkeys) = store_with_keys(2);
+        let settings = settings(Some(H160([0xab; 20])));
+        let (service, node) = service(Config::mainnet(), settings.clone());
+        let store = Arc::new(RwLock::new(store));
+        service
+            .clone()
+            .register_all(0, pubkeys.clone(), store.clone())
+            .await;
+
+        refuse_registrations(&node);
+        settings.set_gas_limit(&pubkeys[1], 30_000_000);
+        service.clone().register_changed(0, store.clone()).await;
+        service
+            .clone()
+            .register_all(1, pubkeys.clone(), store.clone())
+            .await;
+        assert_eq!(registration_calls(&node), 3, "full, per-slot, full");
+
+        service.clone().register_changed(1, store.clone()).await;
+        assert_eq!(registration_calls(&node), 3, "no retry after the full send");
     }
 
     /// The per-slot call is one atomic read when no setting moved: with the

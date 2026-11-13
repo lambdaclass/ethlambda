@@ -513,8 +513,17 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
                 .unwrap_or_default();
             Self::check_fee_recipient(&produced, fee_recipient, &preferred, slot);
         } else {
+            // Both addresses, so a log can say afterwards who built the block
+            // and where this client had asked to be paid.
+            let header = crate::beacon_node::dto::encode_hex(&produced.fee_recipient().0);
+            let configured = fee_recipient.map_or_else(
+                || "none".to_string(),
+                |address| crate::beacon_node::dto::encode_hex(&address.0),
+            );
             tracing::debug!(
                 %slot,
+                header_fee_recipient = %header,
+                configured_fee_recipient = %configured,
                 "Blinded block: its header names the builder's address; the relay pays the \
                  validator in the payload"
             );
