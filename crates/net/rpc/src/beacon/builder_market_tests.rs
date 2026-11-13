@@ -1247,7 +1247,8 @@ async fn a_first_gloas_epoch_preference_from_the_validator_client_passes_this_no
 
 #[tokio::test]
 async fn cached_preferences_resubmitted_are_a_200_without_a_publish() {
-    // Needs only the market: an identical entry short-circuits the rules.
+    // Needs only the market: an identical entry stops at the rules' first,
+    // `AlreadySeen`, and is then a success.
     let world = World::new();
     let signed = world.preferences(address(0xaa), 30_000_000);
     assert!(world.market.record_preferences(signed.clone(), HEAD_SLOT));

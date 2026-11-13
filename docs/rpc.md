@@ -703,7 +703,8 @@ message accepted from either side is seen by both.
   clients name `gloas` even during the epoch before the fork (the fork of the
   preference's slot); `fulu` is accepted as leniency towards one that names its
   wall clock's fork. Each entry runs the gossip rules in order; an entry already
-  cached, identical, succeeds without a republish. Accepted entries are cached
+  cached, identical, succeeds without a republish, including one gossip cached
+  while this copy was being validated. Accepted entries are cached
   (the first per `(proposal slot, dependent root)` wins) and gossiped. If any
   entry fails the answer is `400`
   `{code, message, failures: [{index, message}]}` and the others were still

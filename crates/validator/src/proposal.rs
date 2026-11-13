@@ -509,7 +509,7 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
             let preferred = self
                 .preferences
                 .as_ref()
-                .map(|preferences| preferences.accepted_fee_recipients(slot))
+                .map(|preferences| preferences.accepted_fee_recipients(slot, duty.validator_index))
                 .unwrap_or_default();
             Self::check_fee_recipient(&produced, fee_recipient, &preferred, slot);
         } else {

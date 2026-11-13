@@ -74,6 +74,12 @@
 //! replaced for the same slot and root. A fee recipient changed after a
 //! preference went out applies from the next dependent root onward only.
 //!
+//! A restart with other settings (another `--suggested-fee-recipient` or
+//! `--gas-limit`, or the keymanager's overrides gone) is the same case seen
+//! from a client that no longer remembers what it signed: it signs a
+//! preference that differs from the one the nodes hold, and they refuse it
+//! each slot until its slot starts, while building with the one they hold.
+//!
 //! # One preference per request, all at once
 //!
 //! A call has one status for all its entries: a node answers 400 when any
@@ -210,18 +216,23 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl<B> PreferencesService<B> {
-    /// The fee recipients of the preferences some node accepted for `slot`,
-    /// one per dependent root signed for.
+    /// The fee recipients of the preferences some node accepted for `slot`
+    /// from `validator`, one per dependent root signed for.
     ///
     /// From gloas a node builds with the preference it holds for the slot, so
     /// a block at `slot` may rightly pay one of these rather than the
     /// validator's current address: the preference names the address in
     /// force when it was signed, and cannot be replaced for its root.
-    pub fn accepted_fee_recipients(&self, slot: Slot) -> Vec<ExecutionAddress> {
+    ///
+    /// Only `validator`'s own: a reorg can move the slot from one of this
+    /// client's validators to another, and the first one's address is not one
+    /// the second asked to be paid at.
+    pub fn accepted_fee_recipients(&self, slot: Slot, validator: u64) -> Vec<ExecutionAddress> {
         lock(&self.sent)
             .iter()
             .filter(|((held, _), _)| *held == slot)
             .filter_map(|(_, sent)| sent.accepted())
+            .filter(|signed| signed.message.validator_index == validator)
             .map(|signed| signed.message.fee_recipient)
             .collect()
     }
@@ -530,14 +541,23 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
                     Before::Unsent => {
                         // A refused entry is tried again every slot until its
                         // slot passes, so only its first refusal is a warning.
+                        //
+                        // A node that already holds a different preference
+                        // for the slot and root refuses this one too. That is
+                        // what a restart with another fee recipient or gas
+                        // limit (or without the keymanager's overrides) looks
+                        // like, and then the node does have a preference: the
+                        // one signed before the restart.
                         warn!(
                             epoch = target,
                             slot = key.0,
                             validator,
                             %err,
-                            "No beacon node accepted a proposer preference; builders' bids \
-                             for that slot are ignored, and from gloas a node may not know \
-                             the fee recipient"
+                            "No beacon node accepted a proposer preference. Unless the nodes \
+                             already hold one for this slot and dependent root (signed before a \
+                             restart with other settings, which they keep), builders' bids for \
+                             that slot are ignored, and from gloas a node may not know the fee \
+                             recipient"
                         );
                         lock(&self.sent).insert(key, Sent::Refused);
                         Tally::default()
@@ -794,6 +814,45 @@ mod tests {
         assert_eq!(sent.len(), 2);
         assert_eq!(sent[1].1[0].message.dependent_root, Root::repeat_byte(0x33));
         assert!(verifies(&pubkeys[0], &sent[1].1[0]));
+    }
+
+    /// A reorg that moves a slot from one of this client's validators to
+    /// another leaves both preferences kept, and each validator's block may
+    /// pay only the address it signed for itself.
+    #[tokio::test]
+    async fn accepted_fee_recipients_are_the_proposers_own() {
+        let (store, pubkeys) = store_with_keys(2);
+        let store = Arc::new(RwLock::new(store));
+        let slot = slot_in(GLOAS_EPOCH, 10);
+        let node = MockBeaconNode::new().with_proposers_v2(
+            GLOAS_EPOCH,
+            Root::repeat_byte(0x11),
+            vec![duty(&pubkeys[0], 3, slot)],
+        );
+        let settings = settings(Some(FEE_RECIPIENT));
+        let other_recipient = H160([0xcd; 20]);
+        settings.set_fee_recipient(&pubkeys[1], other_recipient);
+        let (service, node) = service(node, settings);
+        let current = slot_in(GLOAS_EPOCH, 1);
+
+        service.clone().poll(current, store.clone()).await;
+        node.set_proposers_v2(
+            GLOAS_EPOCH,
+            Root::repeat_byte(0x33),
+            vec![duty(&pubkeys[1], 5, slot)],
+        );
+        service.clone().poll(current + 1, store).await;
+
+        assert_eq!(submitted(&node).len(), 2);
+        assert_eq!(
+            service.accepted_fee_recipients(slot, 3),
+            vec![FEE_RECIPIENT]
+        );
+        assert_eq!(
+            service.accepted_fee_recipients(slot, 5),
+            vec![other_recipient]
+        );
+        assert!(service.accepted_fee_recipients(slot, 4).is_empty());
     }
 
     #[tokio::test]
@@ -1304,7 +1363,7 @@ mod tests {
         publish(last_of_epoch - 1).await;
         assert_eq!(submitted(&node).len(), 2);
         assert_eq!(
-            service.accepted_fee_recipients(later_slot),
+            service.accepted_fee_recipients(later_slot, 3),
             vec![FEE_RECIPIENT]
         );
 
@@ -1324,7 +1383,7 @@ mod tests {
         again.sort_by_key(|entry| entry.message.proposal_slot);
         assert_eq!(again, first, "the messages as first signed");
         assert_eq!(
-            service.accepted_fee_recipients(later_slot),
+            service.accepted_fee_recipients(later_slot, 3),
             vec![FEE_RECIPIENT]
         );
 
@@ -1368,7 +1427,10 @@ mod tests {
         publish(slot_in(GLOAS_EPOCH, preset::SLOTS_PER_EPOCH - 1)).await;
         let key = (slot, root);
         assert_eq!(stages(&service), HashMap::from([(key, "partly")]));
-        assert_eq!(service.accepted_fee_recipients(slot), vec![FEE_RECIPIENT]);
+        assert_eq!(
+            service.accepted_fee_recipients(slot, 3),
+            vec![FEE_RECIPIENT]
+        );
 
         node.failures.lock().expect("lock").clear();
         publish(slot_in(GLOAS_EPOCH + 1, 0)).await;

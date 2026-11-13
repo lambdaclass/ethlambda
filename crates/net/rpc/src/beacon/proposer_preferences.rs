@@ -99,6 +99,13 @@ async fn post_proposer_preferences(
     response
 }
 
+/// Whether `market` holds `signed` itself for its slot and dependent root,
+/// rather than another message: an identical entry is a success.
+fn holds(market: &SharedBuilderMarket, signed: &SignedProposerPreferences) -> bool {
+    let key = (signed.message.proposal_slot, signed.message.dependent_root);
+    market.preferences(key.0, key.1).as_ref() == Some(signed)
+}
+
 /// Validate, record and publish each entry, in order.
 fn submit(
     store: &Store,
@@ -112,12 +119,16 @@ fn submit(
     for (index, signed) in preferences.into_iter().enumerate() {
         let slot = signed.message.proposal_slot;
         let validator = signed.message.validator_index;
-        let held = market.preferences(slot, signed.message.dependent_root);
-        if held.as_ref() == Some(&signed) {
+        // `AlreadySeen` is `validate`'s first rule, so a resubmission costs no
+        // signature check. Asked again after `record_preferences` too: gossip
+        // can record the same message (relayed by another node this client
+        // posted it to) while this copy is being validated.
+        let verdict = validate(market, store, &signed, now_ms);
+        let seen = Outcome::Ignore(IgnoreReason::AlreadySeen);
+        if verdict == seen && holds(market, &signed) {
             debug!(%slot, validator, "Proposer preferences already cached; not republishing");
             continue;
         }
-        let verdict = validate(market, store, &signed, now_ms);
         if verdict != Outcome::Accept {
             let (outcome, reason) = verdict.labels();
             warn!(%slot, validator, outcome, reason, "Refused submitted proposer preferences");
@@ -128,9 +139,13 @@ fn submit(
             continue;
         }
         if !market.record_preferences(signed.clone(), wall_slot) {
+            if holds(market, &signed) {
+                debug!(%slot, validator, "Proposer preferences cached meanwhile; not republishing");
+                continue;
+            }
             failures.push(Failure {
                 index,
-                message: describe(&Outcome::Ignore(IgnoreReason::AlreadySeen)),
+                message: describe(&seen),
             });
             continue;
         }
