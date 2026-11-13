@@ -905,9 +905,8 @@ mod tests {
         let BeaconState::Fulu(inner) = &mut state else {
             unreachable!("built as fulu")
         };
-        for flags in inner.current_epoch_participation.iter_mut() {
-            *flags = 0b111;
-        }
+        let count = inner.current_epoch_participation.len();
+        inner.current_epoch_participation = vec![0b111; count].try_into().unwrap();
         assert!(pack_attestations(&state, vec![candidate]).is_empty());
     }
 
