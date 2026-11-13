@@ -34,12 +34,15 @@ pub(crate) async fn get_health() -> impl IntoResponse {
 }
 
 pub(crate) async fn get_metrics() -> impl IntoResponse {
-    let mut response = gather_default_metrics()
+    let mut body = gather_default_metrics()
         .inspect_err(|err| {
             warn!(%err, "Failed to gather Prometheus metrics");
         })
-        .unwrap_or_default()
-        .into_response();
+        .unwrap_or_default();
+    // spawned's actor metrics (mailbox depth, queue wait, handler duration) live
+    // in its own collector, not the prometheus registry, so append its text.
+    body.push_str(&spawned_concurrency::metrics::render_prometheus());
+    let mut response = body.into_response();
     let content_type = HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8");
     response
         .headers_mut()

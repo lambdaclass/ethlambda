@@ -86,6 +86,12 @@ async fn with_no_api_router_metrics_and_debug_are_served_on_the_metrics_port() {
         status_line(&get(port, "/metrics").await).contains("200"),
         "/metrics must be served"
     );
+    assert!(
+        get(port, "/metrics")
+            .await
+            .contains("spawned_mailbox_depth"),
+        "/metrics must carry spawned's actor metrics after the registry text"
+    );
     // Debug: `beacon` gains these by going through the shared entry point.
     // Heap profiling was previously node-only.
     assert!(
