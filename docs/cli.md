@@ -379,8 +379,8 @@ assigned to slot `S` sign for `S - 1`. Both halves are bounded by the end of the
 slot.
 
 Not implemented: the builder flow and blinded blocks (the client asks for an
-unblinded block and refuses a blinded one), voluntary exits, doppelganger
-protection and remote signing.
+unblinded block and refuses a blinded one), voluntary exits and doppelganger
+protection.
 
 ### Duty offsets come from the network
 
