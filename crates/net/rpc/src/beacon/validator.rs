@@ -35,7 +35,9 @@ use serde::{Deserialize, Serialize};
 
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
-    fork_choice::{checkpoint_state, get_current_store_epoch, get_head_node},
+    fork_choice::{
+        checkpoint_state, compute_shuffling_dependent_slot, get_current_store_epoch, get_head_node,
+    },
     gossip::attestation::compute_subnet_for_attestation,
     helpers::accessors::{CommitteeCacheExt as _, get_block_root_at_slot},
     helpers::altair::compute_sync_committee_period,
@@ -535,11 +537,11 @@ impl DependentRoot {
     /// definition names the genesis block where its subtraction would
     /// underflow, which is slot 0.
     fn slot(self, epoch: Epoch) -> Slot {
-        let epoch = match self {
-            Self::V1 => epoch,
-            Self::V2 => epoch.saturating_sub(1),
-        };
-        compute_start_slot_at_epoch(epoch).saturating_sub(1)
+        match self {
+            Self::V1 => compute_start_slot_at_epoch(epoch).saturating_sub(1),
+            // The state transition's own definition, so the two cannot drift.
+            Self::V2 => compute_shuffling_dependent_slot(epoch),
+        }
     }
 }
 

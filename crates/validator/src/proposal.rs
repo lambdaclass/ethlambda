@@ -35,12 +35,30 @@
 //! # Gloas: the block, then its envelope
 //!
 //! From gloas the block commits to a bid and the payload is revealed in an
-//! envelope the builder signs. This client only self-builds: when the bid names
-//! the self-build sentinel, the proposer's own key signs the envelope under the
-//! builder domain, and it is published right after the block, in the same
-//! budget. A bid naming anyone else is a builder's to reveal, and is left alone.
+//! envelope the builder signs. This client reveals only its own payloads: when
+//! the bid names the self-build sentinel, the proposer's own key signs the
+//! envelope under the builder domain, and it is published right after the
+//! block, in the same budget. A bid naming anyone else is a builder's to
+//! reveal, and is left alone.
+//!
+//! # A builder's bid without `--builder-proposals`
+//!
+//! Without the flag a gloas block request carries a boost factor of `0`,
+//! which beacon-APIs defines as the local payload unless it cannot be built.
+//! A node whose execution client fails at the slot may therefore build on a
+//! pooled p2p bid, and this client signs that block rather than refusing it.
+//! A refusal would cost the slot as well as its payload, where the bid pays
+//! the fee recipient this validator's preference named. Lighthouse, Prysm and Teku sign it too, and their nodes
+//! fall back the same way; Lodestar refuses it only in its opt-in
+//! `executiononly` mode. Before gloas a blinded block is refused instead, but
+//! for another reason: without the flag this client has no way to publish
+//! one.
 //!
 //! The envelope is not slashable, so slashing protection is untouched by it.
+//!
+//! The node pays the fee recipient of the proposer preference it holds for
+//! the slot, which names the address in force when it was signed. The check
+//! before signing therefore accepts that address as well as the current one.
 //!
 //! # Blinded blocks
 //!
@@ -95,6 +113,7 @@ use crate::beacon_node::dto::{ProposerDutyDto, encode_hex, parse_pubkey};
 use crate::beacon_node::{BeaconNodeApi, BlockRequest, Published, validate_produced_block};
 use crate::error::{Error, Result};
 use crate::keys::ValidatorStore;
+use crate::preferences::PreferencesService;
 use crate::proposer_settings::ProposerSettings;
 use crate::signing::SigningContext;
 use crate::slashing_protection::{Refusal, SharedProtection};
@@ -180,9 +199,16 @@ pub struct ProposalService<B> {
     /// The `builder_boost_factor` sent with each block request, or `None` when
     /// builder proposals are off, in which case a blinded answer is refused.
     builder_boost_factor: Option<u64>,
+    /// The `min_bid` sent with each gloas block request, in gwei: the floor
+    /// below which the node takes no p2p bid. `0` unless set.
+    builder_min_bid: u64,
     /// Where a slot starts, so a blinded publish that outlives the deadline
     /// can observe its own publication delay. `None` observes nothing.
     clock: Option<SlotClock>,
+    /// The proposer preferences a node accepted, whose fee recipient a gloas
+    /// block may rightly pay instead of the current one. `None` compares
+    /// against the current one alone.
+    preferences: Option<Arc<PreferencesService<B>>>,
 }
 
 impl<B: BeaconNodeApi + 'static> ProposalService<B> {
@@ -199,8 +225,25 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
             settings,
             protection,
             builder_boost_factor,
+            builder_min_bid: 0,
             clock: None,
+            preferences: None,
         }
+    }
+
+    /// Send `min_bid` (gwei) with every gloas block request, so the node
+    /// takes no p2p bid below it.
+    pub fn with_builder_min_bid(mut self, min_bid: u64) -> Self {
+        self.builder_min_bid = min_bid;
+        self
+    }
+
+    /// Give the service the proposer preferences this client published, so
+    /// the fee recipient check accepts the address a gloas block's node was
+    /// given in them.
+    pub fn with_preferences(mut self, preferences: Arc<PreferencesService<B>>) -> Self {
+        self.preferences = Some(preferences);
+        self
     }
 
     /// Give the service the slot clock, so a blinded block's publication delay
@@ -243,33 +286,55 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
     /// never happen, and when it does it is a misconfigured or untrustworthy
     /// beacon node paying someone else, every time this validator proposes.
     ///
-    /// With no configured address there is nothing to compare against and this
-    /// says nothing, which is the same silence as a matching one; the startup
-    /// warning is where that case is reported.
+    /// With no configured address and no published preference there is
+    /// nothing to compare against and this says nothing, which is the same
+    /// silence as a matching one; the startup warning is where that case is
+    /// reported.
     fn check_fee_recipient(
         produced: &crate::beacon_node::block_contents::ProducedBlock,
-        expected: Option<ExecutionAddress>,
+        current: Option<ExecutionAddress>,
+        preferred: &[ExecutionAddress],
         slot: Slot,
     ) {
-        let Some(expected) = expected else {
-            return;
-        };
         // The payload's before gloas, the bid's from it on: the same address
         // the execution layer is told to pay, read where the block keeps it.
         let actual = produced.fee_recipient();
-        if actual != expected {
-            tracing::error!(
-                %slot,
-                expected = %crate::beacon_node::dto::encode_hex(&expected.0),
-                actual = %crate::beacon_node::dto::encode_hex(&actual.0),
-                "Block pays its execution-layer rewards to an address this client did not ask \
-                 for; signing it anyway, since refusing would also forfeit the consensus reward \
-                 and cost the network a slot. Check this beacon node's proposer preparation. A \
-                 fee recipient changed through the keymanager API this epoch reaches the node \
-                 only at the next one."
-            );
-            crate::metrics::inc_fee_recipient_mismatches();
+        if Self::pays_this_validator(actual, current, preferred) != Some(false) {
+            return;
         }
+        let expected: Vec<String> = current
+            .iter()
+            .chain(preferred)
+            .map(|address| crate::beacon_node::dto::encode_hex(&address.0))
+            .collect();
+        tracing::error!(
+            %slot,
+            expected = %expected.join(","),
+            actual = %crate::beacon_node::dto::encode_hex(&actual.0),
+            "Block pays its execution-layer rewards to an address this client did not ask for; \
+             signing it anyway, since refusing would also forfeit the consensus reward and cost \
+             the network a slot. Check this beacon node's proposer preparation. A fee recipient \
+             changed through the keymanager API reaches the node at the next epoch boundary; \
+             from gloas, a proposer preference published before the change (by this process \
+             before a restart, say) keeps the old address until the next dependent root."
+        );
+        crate::metrics::inc_fee_recipient_mismatches();
+    }
+
+    /// Whether `actual` is an address this validator asked to be paid at: its
+    /// `current` one, or one of the proposer preferences a node accepted for
+    /// the slot (`preferred`), which from gloas a node builds with in
+    /// preference to the current address, and which name the address in force
+    /// when they were signed. `None` when there is nothing to compare against.
+    fn pays_this_validator(
+        actual: ExecutionAddress,
+        current: Option<ExecutionAddress>,
+        preferred: &[ExecutionAddress],
+    ) -> Option<bool> {
+        if current.is_none() && preferred.is_empty() {
+            return None;
+        }
+        Some(current == Some(actual) || preferred.contains(&actual))
     }
 
     /// Produce, sign and publish the block for `slot`, however long it takes.
@@ -389,6 +454,7 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
             randao_reveal,
             graffiti,
             builder_boost_factor: self.builder_boost_factor,
+            builder_min_bid: self.builder_min_bid,
         };
         let mut produced = self.beacon_node.produce_block(&request).await?;
 
@@ -409,7 +475,9 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         // Also the implementation's contract, and checked again for the same
         // reason. With builder proposals off this client never publishes a
         // blinded block, so signing one would record the slot in slashing
-        // protection for a block that can never be sent.
+        // protection for a block that can never be sent. A gloas block built
+        // on a builder's bid is not refused here: it is a full block, and the
+        // module doc says why it is signed.
         if produced.is_blinded() && self.builder_boost_factor.is_none() {
             return Err(Error::InconsistentResponse(format!(
                 "node produced a blinded block for slot {slot}; builder proposals are off, so \
@@ -438,7 +506,12 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         }
 
         if Self::compares_fee_recipient(&produced) {
-            Self::check_fee_recipient(&produced, fee_recipient, slot);
+            let preferred = self
+                .preferences
+                .as_ref()
+                .map(|preferences| preferences.accepted_fee_recipients(slot, duty.validator_index))
+                .unwrap_or_default();
+            Self::check_fee_recipient(&produced, fee_recipient, &preferred, slot);
         } else {
             // Both addresses, so a log can say afterwards who built the block
             // and where this client had asked to be paid.
@@ -1248,11 +1321,48 @@ mod tests {
             randao_reveal: Default::default(),
             graffiti: Default::default(),
             builder_boost_factor: None,
+            builder_min_bid: 0,
         };
         let full = full.produce_block(&request).await.expect("produces");
         assert!(ProposalService::<MockBeaconNode>::compares_fee_recipient(
             &full
         ));
+    }
+
+    /// The current address and every accepted preference's are this
+    /// validator's; anything else is a mismatch, and with neither configured
+    /// there is nothing to compare.
+    #[test]
+    fn a_block_may_pay_the_current_address_or_a_published_preferences() {
+        let pays = ProposalService::<MockBeaconNode>::pays_this_validator;
+        let current = H160([0x01; 20]);
+        let preferred = H160([0x02; 20]);
+        let stranger = H160([0x03; 20]);
+
+        assert_eq!(pays(current, Some(current), &[]), Some(true));
+        assert_eq!(pays(preferred, Some(current), &[preferred]), Some(true));
+        assert_eq!(pays(current, Some(current), &[preferred]), Some(true));
+        assert_eq!(pays(stranger, Some(current), &[preferred]), Some(false));
+        assert_eq!(pays(stranger, Some(current), &[]), Some(false));
+        assert_eq!(pays(stranger, None, &[preferred]), Some(false));
+        assert_eq!(pays(stranger, None, &[]), None);
+    }
+
+    /// The configured floor goes with the block request, beside the factor.
+    #[tokio::test]
+    async fn the_min_bid_goes_with_every_block_request() {
+        let (store, pubkey) = store();
+        let node = Arc::new(MockBeaconNode::new().with_block(slot(), 7));
+        let service = builder_service(node.clone(), None).with_builder_min_bid(1_000_000);
+
+        service
+            .propose(slot(), &duty(&pubkey, 7, slot()), &store)
+            .await
+            .expect("proposes");
+
+        let requests = node.block_requests();
+        assert_eq!(requests[0].builder_boost_factor, Some(100));
+        assert_eq!(requests[0].builder_min_bid, 1_000_000);
     }
 
     /// A node that does not confirm the publish may still have handed the block
@@ -1941,6 +2051,10 @@ mod gloas_tests {
 
     /// A bid naming a builder is that builder's to reveal; this client signs
     /// nothing for it.
+    ///
+    /// The block itself is signed and published, with builder proposals off
+    /// too (this module's service has none): that is the block a node whose
+    /// local build failed builds on a pooled bid. See the module doc.
     #[tokio::test]
     async fn a_builders_bid_gets_no_envelope_from_this_client() {
         let (store, pubkey) = store();
