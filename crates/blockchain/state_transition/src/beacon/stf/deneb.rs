@@ -25,7 +25,7 @@
 //! caches two new blob-gas fields for EIP-4844, and [`process_voluntary_exit`]
 //! signs under a fixed fork version for EIP-7044.
 
-use crate::beacon::bls::SignatureSet;
+use crate::beacon::bls::{IndexedPubkey, SignatureSet};
 use crate::beacon::config::Config;
 use crate::beacon::constants::{self, FAR_FUTURE_EPOCH};
 use crate::beacon::containers::capella::SignedBLSToExecutionChange;
@@ -712,7 +712,10 @@ pub fn process_voluntary_exit(
     let signing_root = compute_signing_root(voluntary_exit.hash_tree_root(), domain);
     signatures.push(
         SignatureSet::single(
-            &validator.pubkey,
+            &IndexedPubkey {
+                index: voluntary_exit.validator_index,
+                pubkey: validator.pubkey,
+            },
             signing_root,
             &signed_voluntary_exit.signature,
         ),

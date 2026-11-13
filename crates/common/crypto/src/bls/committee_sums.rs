@@ -22,9 +22,9 @@
 
 use blst::min_pk::{AggregatePublicKey, PublicKey};
 
-use ethlambda_types::beacon::primitives::{BlsPubkey, BlsSignature, Root};
+use ethlambda_types::beacon::primitives::{BlsSignature, Root};
 
-use super::{SignatureSet, sum_validated_projective, validated_pubkeys};
+use super::{PubkeySource, SignatureSet, sum_validated_projective, validated_pubkeys};
 
 /// A sum of validated public keys, kept as a curve point. Never serialized.
 ///
@@ -39,7 +39,7 @@ pub struct AggregatePubkey(AggregatePublicKey);
 impl AggregatePubkey {
     /// The sum of `pubkeys`, each validated through the pubkey cache. `None` if
     /// `pubkeys` is empty or any key fails validation.
-    pub fn sum(pubkeys: &[BlsPubkey]) -> Option<Self> {
+    pub fn sum<K: PubkeySource>(pubkeys: &[K]) -> Option<Self> {
         let points = validated_pubkeys(pubkeys)?;
         sum_validated_projective(&points).map(Self)
     }
@@ -50,7 +50,7 @@ impl AggregatePubkey {
     /// Negation goes through `blst`'s own `sub_aggregate`, so no `unsafe` is
     /// needed here. Subtracting every key `self` was built from yields the
     /// identity, not an error: see [`Self::verify`].
-    pub fn minus(&self, pubkeys: &[BlsPubkey]) -> Option<Self> {
+    pub fn minus<K: PubkeySource>(&self, pubkeys: &[K]) -> Option<Self> {
         if pubkeys.is_empty() {
             return Some(*self);
         }
@@ -134,6 +134,7 @@ mod tests {
     use super::super::DST;
     use super::*;
     use blst::min_pk::SecretKey;
+    use ethlambda_types::beacon::primitives::BlsPubkey;
 
     fn secret(seed: u64) -> SecretKey {
         let mut ikm = [0x3cu8; 32];
@@ -178,7 +179,7 @@ mod tests {
 
     #[test]
     fn sum_of_nothing_or_of_an_invalid_key_is_none() {
-        assert!(AggregatePubkey::sum(&[]).is_none());
+        assert!(AggregatePubkey::sum::<BlsPubkey>(&[]).is_none());
         let mut keys = pubkeys(3);
         keys.push(BlsPubkey::default());
         assert!(AggregatePubkey::sum(&keys).is_none());
@@ -198,7 +199,10 @@ mod tests {
         let left = AggregatePubkey::sum(&keys[..5]).unwrap();
         let right = AggregatePubkey::sum(&keys[5..]).unwrap();
         assert_eq!(left.plus(&right).to_bytes(), total.to_bytes());
-        assert_eq!(total.minus(&[]).unwrap().to_bytes(), total.to_bytes());
+        assert_eq!(
+            total.minus::<BlsPubkey>(&[]).unwrap().to_bytes(),
+            total.to_bytes()
+        );
     }
 
     /// The same over random masks of a committee-sized run, with the attesters
