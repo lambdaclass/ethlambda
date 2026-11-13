@@ -622,6 +622,19 @@ pub fn inc_gossipsub_score_disconnects() {
     LEAN_GOSSIPSUB_SCORE_DISCONNECTS_TOTAL.inc();
 }
 
+/// Count a peer disconnected for persistently failing to take gossipsub
+/// messages.
+pub fn inc_gossipsub_slow_peer_disconnects() {
+    static LEAN_GOSSIPSUB_SLOW_PEER_DISCONNECTS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+        register_int_counter!(
+            "lean_gossipsub_slow_peer_disconnects_total",
+            "Peers disconnected for persistently failing to take gossipsub messages"
+        )
+        .unwrap()
+    });
+    LEAN_GOSSIPSUB_SLOW_PEER_DISCONNECTS_TOTAL.inc();
+}
+
 /// Whether gossipsub's mesh-delivery term (P3) is being scored: 0 while the
 /// head lags or is still warming up after catching up. See
 /// `beacon::scoring::MeshDeliveryGate`.
