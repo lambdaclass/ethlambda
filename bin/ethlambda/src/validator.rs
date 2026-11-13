@@ -80,7 +80,9 @@ pub(crate) struct ValidatorOptions {
     /// preferences, published for every proposal, and the beacon node builds
     /// this client's own payloads toward it too, so on a network whose gas
     /// limit is not the default, set it or every proposal pulls the limit
-    /// toward 60M.
+    /// toward 60M. Sepolia and Platåberget schedule 200000000: pass
+    /// `--gas-limit 200000000` there. The network config's
+    /// `GAS_LIMIT_SCHEDULE` is not read yet (#795).
     #[arg(
         long,
         default_value_t = DEFAULT_GAS_LIMIT,

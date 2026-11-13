@@ -293,6 +293,14 @@ pub async fn set_gas_limit(
     let pubkey = parse_path_key(&pubkey)?;
     let Json(request) = body?;
     let gas_limit = parse_uint64(&request.gas_limit)?;
+    // Refused as `--gas-limit` refuses it. From gloas this value is signed
+    // into the proposer preferences, which cannot be replaced for their
+    // dependent root, and the node builds this client's payload toward it.
+    if gas_limit == 0 {
+        return Err(ApiError::BadRequest(
+            "a gas limit of zero cannot be set".to_string(),
+        ));
+    }
 
     let store = context.store.read().await;
     require_held(&store, &pubkey)?;
@@ -569,6 +577,22 @@ mod tests {
             harness.settings.gas_limit(&harness.pubkey),
             DEFAULT_GAS_LIMIT
         );
+    }
+
+    /// `"0"` is a well-formed `Uint64`, but refused as `--gas-limit` refuses
+    /// it, and an override already set is left as it was.
+    #[tokio::test]
+    async fn a_zero_gas_limit_is_refused() {
+        let harness = harness(None);
+        let path = uri(&harness.pubkey, "gas_limit");
+        let set = serde_json::json!({ "gas_limit": "30000000" });
+        let (status, _) = send(&harness.app, request("POST", &path, Some(set))).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let zero = serde_json::json!({ "gas_limit": "0" });
+        let (status, _) = send(&harness.app, request("POST", &path, Some(zero))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(harness.settings.gas_limit(&harness.pubkey), 30_000_000);
     }
 
     #[tokio::test]

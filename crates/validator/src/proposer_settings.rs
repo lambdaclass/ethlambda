@@ -133,16 +133,12 @@ impl ProposerSettings {
 
     /// These settings with `gas_limit` as the gas limit of every validator
     /// with no override of its own, in place of [`DEFAULT_GAS_LIMIT`].
-    pub fn with_default_gas_limit(self, gas_limit: u64) -> Self {
-        let mut inner = self
-            .inner
-            .into_inner()
-            .unwrap_or_else(PoisonError::into_inner);
-        inner.default_gas_limit = gas_limit;
-        Self {
-            inner: RwLock::new(inner),
-            generation: self.generation,
-        }
+    pub fn with_default_gas_limit(mut self, gas_limit: u64) -> Self {
+        self.inner
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .default_gas_limit = gas_limit;
+        self
     }
 
     /// A counter that moves whenever any override is written, cleared or
