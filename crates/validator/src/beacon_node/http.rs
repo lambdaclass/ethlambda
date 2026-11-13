@@ -107,7 +107,8 @@ async fn read_error_body(mut response: reqwest::Response) -> String {
 /// Text a node sent, as an error or a log line shows it: control characters
 /// and line separators written out (`\n`, `\u{1b}`, ...), so the line it lands
 /// in stays one line and carries no terminal escapes, and cut to
-/// [`ERROR_TEXT_LIMIT`] bytes without splitting a character or an escape.
+/// [`ERROR_TEXT_LIMIT`] bytes without splitting a character or an escape,
+/// ending in `...` when it is cut.
 ///
 /// The same function the beacon node's builder client writes a relay's text
 /// through, [`ethlambda_types::text::one_line`].
@@ -1543,9 +1544,9 @@ mod tests {
         assert!(served.seen.lock().expect("lock").is_empty());
     }
 
-    /// A node's error body reaches the logs on one line and cut short: a body
-    /// with line breaks cannot forge log lines, and a long one cannot flood
-    /// them.
+    /// A node's error body reaches the logs on one line and cut short, saying
+    /// so: a body with line breaks cannot forge log lines, a long one cannot
+    /// flood them, and a cut one does not read as all the node said.
     #[tokio::test]
     async fn an_error_body_is_one_line_and_capped() {
         let reply = "first line\nsecond line\r\n".repeat(200).into_bytes();
@@ -1555,23 +1556,24 @@ mod tests {
             panic!("got {err:?}");
         };
         assert_eq!(status, 400);
-        assert!(body.starts_with("first line\\nsecond line\\r\\nfirst line"));
         assert!(!body.contains('\n') && !body.contains('\r'));
-        assert!(body.len() <= ERROR_TEXT_LIMIT, "{} bytes", body.len());
-        assert!(
-            body.len() > ERROR_TEXT_LIMIT - "\\r".len(),
-            "filled to the cap"
-        );
+        // Written out, then cut to the cap less the marker's three bytes,
+        // which here falls inside a word.
+        let written = "first line\\nsecond line\\r\\n".repeat(200);
+        let kept = ERROR_TEXT_LIMIT - "...".len();
+        assert_eq!(body, format!("{}...", &written[..kept]));
     }
 
     /// The cap applies to the written-out text and never splits a character
-    /// or an escape: a body of escapes ends on a whole one.
+    /// or an escape: a body of escapes keeps whole ones, then the marker.
     #[test]
     fn error_text_cuts_on_a_character_or_escape_boundary() {
         let text = error_text(&"é".repeat(ERROR_TEXT_LIMIT));
-        assert_eq!(text, "é".repeat(ERROR_TEXT_LIMIT / 2));
+        let room = ERROR_TEXT_LIMIT - "...".len();
+        assert_eq!(text, format!("{}...", "é".repeat(room / 2)));
         let text = error_text(&"\u{1b}".repeat(ERROR_TEXT_LIMIT));
-        assert_eq!(text, "\\u{1b}".repeat(ERROR_TEXT_LIMIT / "\\u{1b}".len()));
+        let escapes = "\\u{1b}".repeat(room / "\\u{1b}".len());
+        assert_eq!(text, format!("{escapes}..."));
         assert_eq!(error_text("short"), "short");
     }
 

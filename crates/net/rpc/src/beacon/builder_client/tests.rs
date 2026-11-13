@@ -480,11 +480,12 @@ async fn a_long_error_is_cut_short() {
     let Err(BuilderError::BadRequest(message)) = get_header(&client_for(&relay)).await else {
         panic!("expected a bad request");
     };
-    assert_eq!(message.len(), 1024);
+    assert_eq!(message, format!("{}...", "x".repeat(1021)));
 }
 
 /// Line breaks are written out, so a builder's text cannot start a log line of
-/// its own, and the escaped text is what the length cap applies to.
+/// its own, and the escaped text is what the length cap applies to: 510 of
+/// the two-byte escapes, then the marker.
 #[tokio::test]
 async fn line_breaks_in_an_error_are_written_out() {
     let relay = MockRelay::start(GENESIS_FORK_VERSION).await;
@@ -500,7 +501,7 @@ async fn line_breaks_in_an_error_are_written_out() {
     let Err(BuilderError::BadRequest(message)) = get_header(&client_for(&relay)).await else {
         panic!("expected a bad request");
     };
-    assert_eq!(message.len(), 1024);
+    assert_eq!(message, format!("{}...", r"\n".repeat(510)));
 }
 
 /// Every other control character is written out too (an ESC would start an
@@ -534,9 +535,10 @@ async fn control_characters_in_an_error_are_written_out() {
 /// The cap never leaves half an escape behind.
 #[test]
 fn the_cap_never_cuts_an_escape_in_two() {
-    // 1020 bytes, then a six-byte escape that would end past the cap.
+    // 1020 bytes, then a six-byte escape that would end past the cap: it is
+    // left out whole, and the marker ends the text.
     let text = format!("{}\x1b", "x".repeat(1020));
-    assert_eq!(super::error_text(text), "x".repeat(1020));
+    assert_eq!(super::error_text(text), format!("{}...", "x".repeat(1020)));
     let text = format!("{}\x1b", "x".repeat(1018));
     assert_eq!(
         super::error_text(text),

@@ -65,12 +65,20 @@
 //!
 //! A per-slot send that finds the lock taken skips: it has not marked its
 //! change as sent, so a later slot picks it up. While a full send runs, that
-//! is the first slot after it ends, which against a node that is slow to
-//! answer each batch can be several slots on. A full send waits for it
-//! instead, since a per-slot send is short and skipping would cost an epoch.
-//! A full send that finds the previous full send still running, or waiting,
-//! skips to the next epoch (see [`crate::in_flight`]), so a hung node cannot
-//! queue up one waiting send per epoch.
+//! is the first slot after it ends, and a full send lasts as long as its
+//! slowest node takes over every batch. A node has 12 s to answer each one
+//! (one that takes longer is treated as unreachable and sent no more), so the
+//! wait is at most 12 s per [`REGISTRATION_BATCH`] validators. An ethlambda
+//! node whose relay does not answer comes close: it replies to each batch
+//! with a 500 once its own 10 s wait on the relay runs out, and is still sent
+//! the rest. With 5,000 validators, ten batches, a keymanager change then
+//! waits about 100 s, eight slots, and two minutes at most.
+//!
+//! A full send waits for a running per-slot send instead, since that send is
+//! short and skipping would cost an epoch. A full send that finds the
+//! previous full send still running, or waiting, skips to the next epoch (see
+//! [`crate::in_flight`]), so a hung node cannot queue up one waiting send per
+//! epoch.
 //!
 //! # Signing stays off the async runtime
 //!
