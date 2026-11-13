@@ -36,6 +36,9 @@ tokio = { workspace = true, features = ["time", "macros", "rt"] }
 # keymanager server to finish its requests in flight.
 tokio-util.workspace = true
 reqwest = { workspace = true, features = ["json"] }
+# `join_all`, so a slot's attestations are signed concurrently: each one is a
+# round trip when a remote signer holds the key.
+futures = "0.3"
 
 # BLS12-381. Same version and backend the state transition verifies with, so a
 # signature produced here and one checked there come from one implementation.

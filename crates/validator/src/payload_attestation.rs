@@ -43,7 +43,7 @@ use crate::beacon_node::BeaconNodeApi;
 use crate::beacon_node::dto::{PtcDutyDto, parse_pubkey};
 use crate::error::Result;
 use crate::keys::ValidatorStore;
-use crate::signing::SigningContext;
+use crate::signing::{SigningContext, sign_all};
 
 /// How many slots of dedup history are kept. Far more than the one slot a duty
 /// is ever owed for; the margin only absorbs a clock that steps back a little.
@@ -117,38 +117,43 @@ impl<B: BeaconNodeApi> PayloadAttestationService<B> {
             )));
         }
 
-        let mut messages = Vec::with_capacity(pending.len());
-        {
-            let _timing = crate::metrics::time_signing();
-            let store = store.read().await;
-            for duty in pending {
-                let pubkey = match parse_pubkey(&duty.pubkey) {
-                    Ok(pubkey) => pubkey,
-                    Err(err) => {
-                        error!(%slot, validator = duty.validator_index, %err, "Duty carried an unreadable pubkey");
-                        continue;
-                    }
-                };
-
-                // Recorded before signing, so a signature that exists is one
-                // the record already knows about.
-                if !self.record(duty.validator_index, slot) {
+        // Recorded one by one before anything is signed, so a signature that
+        // exists is one the record already knows about; then signed all at
+        // once, each within the signing budget.
+        let mut to_sign = Vec::with_capacity(pending.len());
+        for duty in pending {
+            let pubkey = match parse_pubkey(&duty.pubkey) {
+                Ok(pubkey) => pubkey,
+                Err(err) => {
+                    error!(%slot, validator = duty.validator_index, %err, "Duty carried an unreadable pubkey");
                     continue;
                 }
-
-                match self
-                    .context
-                    .sign_payload_attestation(&store, &pubkey, &data)
-                {
-                    Ok(signature) => messages.push(PayloadAttestationMessage {
-                        validator_index: duty.validator_index,
-                        data,
-                        signature,
-                    }),
-                    Err(err) => {
-                        error!(%slot, validator = duty.validator_index, %err, "Failed to sign payload attestation");
-                        crate::metrics::inc_signing_failures();
-                    }
+            };
+            if self.record(duty.validator_index, slot) {
+                to_sign.push((duty.validator_index, pubkey));
+            }
+        }
+        let signatures = {
+            let _timing = crate::metrics::time_signing();
+            sign_all(to_sign.iter().map(|(_, pubkey)| {
+                (
+                    *pubkey,
+                    self.context.sign_payload_attestation(store, pubkey, &data),
+                )
+            }))
+            .await
+        };
+        let mut messages = Vec::with_capacity(to_sign.len());
+        for ((validator_index, _), signature) in to_sign.into_iter().zip(signatures) {
+            match signature {
+                Ok(signature) => messages.push(PayloadAttestationMessage {
+                    validator_index,
+                    data,
+                    signature,
+                }),
+                Err(err) => {
+                    error!(%slot, validator = validator_index, %err, "Failed to sign payload attestation");
+                    crate::metrics::inc_signing_failures();
                 }
             }
         }
@@ -225,10 +230,10 @@ mod tests {
     }
 
     fn context() -> Arc<SigningContext> {
-        Arc::new(SigningContext {
-            config: Config::mainnet().with_fork_epoch(ForkName::Gloas, GLOAS_EPOCH),
-            genesis_validators_root: Root::ZERO,
-        })
+        Arc::new(SigningContext::new(
+            Config::mainnet().with_fork_epoch(ForkName::Gloas, GLOAS_EPOCH),
+            Root::ZERO,
+        ))
     }
 
     fn store() -> (RwLock<ValidatorStore>, BlsPubkey) {
