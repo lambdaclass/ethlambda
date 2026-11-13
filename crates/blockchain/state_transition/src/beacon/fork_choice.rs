@@ -629,7 +629,25 @@ pub enum DataAvailability {
         proofs: Vec<KzgProof>,
     },
     /// Fulu's shape: the column sidecars sampled for this block.
+    ///
+    /// [`is_data_available_columns`] runs the specification's full check on
+    /// every one of them, KZG batch included. This is what the fixture suites
+    /// supply, so they keep exercising the real check.
     Columns(Vec<fulu::DataColumnSidecar>),
+    /// Fulu's shape, when the caller has already verified every sampled column
+    /// for this block and holds no sidecars to show for it.
+    ///
+    /// Constructing this is a promise: each sidecar this node samples for the
+    /// block passed [`verify_data_column_sidecar`], the inclusion proof and
+    /// [`verify_data_column_sidecar_kzg_proofs`], and was stored under the
+    /// block's own root. Only a caller that gates every write of those
+    /// sidecars on those checks may make it (the chain actor does, by storing
+    /// only what the p2p layer's column checks accepted), since
+    /// [`is_data_available_columns`] takes it on trust and runs nothing. It
+    /// exists so import does not decode every stored sidecar and repeat the
+    /// KZG batch the sidecar already paid for on arrival; a caller with
+    /// unchecked sidecars must pass [`Self::Columns`] instead.
+    ColumnsVerified,
 }
 
 /// What an execution client said about the payload of the block being imported
@@ -4073,7 +4091,7 @@ pub fn is_data_available_blobs(
     let (blobs, proofs) = match evidence {
         DataAvailability::Blobs { blobs, proofs } => (blobs.as_slice(), proofs.as_slice()),
         DataAvailability::NotRequired => (&[][..], &[][..]),
-        DataAvailability::Columns(_) => {
+        DataAvailability::Columns(_) | DataAvailability::ColumnsVerified => {
             return Err(Error::SpecAssert(
                 "a deneb or electra block's data availability is judged on blobs",
             ));
@@ -4237,10 +4255,13 @@ pub fn verify_data_column_sidecar_inclusion_proof(sidecar: &fulu::DataColumnSide
 /// required columns have been sampled" must reject the block itself rather
 /// than relying on this to do it, since nothing about an empty list is
 /// distinguishable here from "this block needed no sampling at all".
+///
+/// [`DataAvailability::ColumnsVerified`] is accepted without running anything:
+/// its constructor promised the same checks already ran on each sidecar.
 pub fn is_data_available_columns(evidence: &DataAvailability, config: &Config) -> Result<bool> {
     let sidecars = match evidence {
         DataAvailability::Columns(sidecars) => sidecars,
-        DataAvailability::NotRequired => return Ok(true),
+        DataAvailability::NotRequired | DataAvailability::ColumnsVerified => return Ok(true),
         DataAvailability::Blobs { .. } => {
             return Err(Error::SpecAssert(
                 "a fulu block's data availability is judged on column sidecars",
@@ -5421,6 +5442,36 @@ pub fn check_execution_payload_envelope(
     sidecars: &[gloas::DataColumnSidecar],
     engine: &stf::ExecutionEngine,
 ) -> Result<()> {
+    check_envelope(store, signed_envelope, config, Some(sidecars), engine)
+}
+
+/// [`check_execution_payload_envelope`] for a caller that has already verified
+/// every sampled column of the block, and so holds no sidecars to pass.
+///
+/// The caller promises what [`DataAvailability::ColumnsVerified`] promises,
+/// against the commitments of this block's bid: each sampled sidecar passed
+/// the gloas structural check and the KZG batch, and is stored under the
+/// block's own root. Everything else is checked exactly as in
+/// [`check_execution_payload_envelope`]; only the data-availability step is
+/// taken on trust, so the KZG batch is not repeated on every envelope.
+pub fn check_execution_payload_envelope_columns_verified(
+    store: &Store,
+    signed_envelope: &gloas::SignedExecutionPayloadEnvelope,
+    config: &Config,
+    engine: &stf::ExecutionEngine,
+) -> Result<()> {
+    check_envelope(store, signed_envelope, config, None, engine)
+}
+
+/// The body of both public checks. `sidecars` is `None` when the caller has
+/// vouched for every sampled column, which skips only the availability step.
+fn check_envelope(
+    store: &Store,
+    signed_envelope: &gloas::SignedExecutionPayloadEnvelope,
+    config: &Config,
+    sidecars: Option<&[gloas::DataColumnSidecar]>,
+    engine: &stf::ExecutionEngine,
+) -> Result<()> {
     let envelope = &signed_envelope.message;
     let block_root = envelope.beacon_block_root;
 
@@ -5440,11 +5491,13 @@ pub fn check_execution_payload_envelope(
         .ok_or(Error::SpecAssert(
             "envelope.beacon_block_root in store.blocks",
         ))?;
-    let kzg_commitments = &gloas_bid(&block)?.blob_kzg_commitments;
-    verify(
-        is_data_available_gloas_columns(sidecars, kzg_commitments)?,
-        "is_data_available(envelope.beacon_block_root)",
-    )?;
+    if let Some(sidecars) = sidecars {
+        let kzg_commitments = &gloas_bid(&block)?.blob_kzg_commitments;
+        verify(
+            is_data_available_gloas_columns(sidecars, kzg_commitments)?,
+            "is_data_available(envelope.beacon_block_root)",
+        )?;
+    }
 
     // Verify the execution payload envelope.
     stf::gloas::verify_execution_payload_envelope(&state, signed_envelope, config, engine)?;

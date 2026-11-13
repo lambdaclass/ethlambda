@@ -58,7 +58,7 @@ use ethlambda_state_transition::beacon::fork_choice::{
 use ethlambda_state_transition::beacon::stf::ExecutionEngine;
 use ethlambda_state_transition::beacon::stf::gloas as stf_gloas;
 use ethlambda_types::ShortRoot;
-use ethlambda_types::beacon::containers::{DataColumnSidecar, SignedBeaconBlock, gloas};
+use ethlambda_types::beacon::containers::{SignedBeaconBlock, gloas};
 use ethlambda_types::primitives::{H256, HashTreeRoot as _};
 use tracing::{debug, error, info, trace, warn};
 
@@ -416,40 +416,22 @@ impl BlockChainServer {
             return false;
         }
 
-        let sidecars = if commitment_count == 0 {
-            Vec::new()
-        } else {
-            match self.stored_gloas_columns(slot, &root) {
-                Some(sidecars) => sidecars,
-                None => {
-                    // Every sampled column was listed as stored a moment ago,
-                    // so failing to read one back is a storage or decode
-                    // fault, not a wait. Holding would name nothing missing
-                    // and be redriven every slot for as long as the fault
-                    // lasts, so the envelope is dropped (and asked for again
-                    // if children wait on it).
-                    warn!(
-                        %slot,
-                        block_root = %ShortRoot(&root.0),
-                        "Dropping an envelope: a stored sampled column could not be read back"
-                    );
-                    self.refetch_envelope_if_children_wait(root);
-                    return false;
-                }
-            }
-        };
-
+        // Every sampled column is stored, and a stored column has passed the
+        // structural check, the inclusion proof's gloas counterpart and the KZG
+        // batch in the p2p layer (gossip validation, or `chain_checks_gloas`
+        // for a fetched or parked one) against this block's bid, so none is
+        // read back and verified a second time here. With no commitments there
+        // is nothing to sample and nothing to verify.
         // The consensus checks come first, as `verify_execution_payload_envelope`
         // orders them, so the execution client is only ever asked about an
         // envelope this node would accept: signed by the builder, matching
         // the bid and the state, and with its data available.
         self.advance_beacon_clock_to(held.event_ms);
         let config = self.store.config();
-        if let Err(err) = fork_choice::check_execution_payload_envelope(
+        if let Err(err) = fork_choice::check_execution_payload_envelope_columns_verified(
             &self.store,
             &held.envelope,
             &config,
-            &sidecars,
             &ExecutionEngine::valid(),
         ) {
             // p2p judged the envelope before it got here, so no peer is
@@ -605,28 +587,6 @@ impl BlockChainServer {
     fn release_envelopes_awaiting_engine(&mut self) {
         let roots: Vec<H256> = self.envelopes.awaiting_engine.keys().copied().collect();
         self.envelopes.work.extend(roots);
-    }
-
-    /// Every sampled column stored for `root`, decoded as gloas sidecars, or
-    /// `None` if any is missing or not one.
-    fn stored_gloas_columns(
-        &self,
-        slot: u64,
-        root: &H256,
-    ) -> Option<Vec<gloas::DataColumnSidecar>> {
-        self.custody_columns
-            .iter()
-            .map(
-                |&index| match self.store.get_data_column(slot, root, index) {
-                    Ok(Some(DataColumnSidecar::Gloas(sidecar))) => Some(sidecar),
-                    Ok(Some(DataColumnSidecar::Fulu(_))) | Ok(None) => None,
-                    Err(err) => {
-                        error!(%err, "Failed to read back a stored data column sidecar");
-                        None
-                    }
-                },
-            )
-            .collect()
     }
 
     /// Hold `held` for a block that is in the store but has no post-state yet,
