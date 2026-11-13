@@ -380,8 +380,9 @@ assigned to slot `S` sign for `S - 1`. Both halves are bounded by the end of the
 slot.
 
 Not implemented: the builder flow and blinded blocks (the client asks for an
-unblinded block and refuses a blinded one), voluntary exits, doppelganger
-protection and remote signing.
+unblinded block and refuses a blinded one), doppelganger protection and remote
+signing. Voluntary exits are signed by the keymanager API's `voluntary_exit`
+route and by [`ethlambda voluntary-exit`](#voluntary-exit).
 
 ### Duty offsets come from the network
 
@@ -502,7 +503,9 @@ status, so a script cannot take an exit that never went out for one that did.
 
 The shard committee period is measured the way the chain measures it: against
 the epoch the exit is processed in, which is now for an exit being published
-and the exit's own epoch for a `--presign` one naming a later epoch. One rule
+and the exit's own epoch for a `--presign` one naming a later epoch. Its
+length is the beacon node's own `SHARD_COMMITTEE_PERIOD`, read from
+`/eth/v1/config/spec`, so a devnet that shortens it is followed. One rule
 of the chain's cannot be checked up front: from electra on it refuses a
 validator with a partial withdrawal still pending. That refusal comes back as
 the beacon node's `400`, with its reason.

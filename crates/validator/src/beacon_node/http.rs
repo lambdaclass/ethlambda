@@ -486,12 +486,13 @@ impl BeaconNodeApi for HttpBeaconNode {
         })
     }
 
-    /// Fetches the network's fork schedule and slot duration.
+    /// Fetches the network's configuration, as far as this client reads it.
     ///
     /// The spec endpoint returns every configuration value as a quoted
-    /// string. Only the fork schedule and the slot duration are read here;
-    /// the rest of `Config` keeps its mainnet defaults, which is correct for
-    /// every network whose presets this binary was compiled against.
+    /// string. Only the keys [`config_from_spec_response`] names are read
+    /// (the fork schedule, the slot duration, the duty offsets and
+    /// `SHARD_COMMITTEE_PERIOD`); the rest of `Config` keeps its mainnet
+    /// defaults, so nothing in this client may rely on those.
     async fn spec(&self) -> Result<Config> {
         let response: DataResponse<serde_json::Value> = self.get("/eth/v1/config/spec").await?;
         config_from_spec_response(&response.data)

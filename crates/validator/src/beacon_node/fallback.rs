@@ -429,16 +429,40 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
         .await
     }
 
+    /// First answer wins, and `Ok(None)` is an answer: a node that knows no
+    /// validator with this key ends the walk, though one further down the
+    /// list might know it, the trade [`Self::payload_attestation_data`] makes
+    /// with its 204. Nodes at the same head hold the same registry, so the
+    /// two differ only while the first lags behind the block that processed
+    /// the deposit, and the caller reports `None` as "not known yet", which
+    /// asking again settles.
+    ///
+    /// The one caller is the keymanager's voluntary-exit route. When every
+    /// node is down, `try_each`'s warning therefore calls a missed duty what
+    /// is only a failed API request.
     async fn validator(&self, pubkey: &BlsPubkey) -> Result<Option<ValidatorDetails>> {
         self.try_each("validator", |node| node.validator(pubkey))
             .await
     }
 
+    /// Fails over from a node that is down, but not from one that refuses the
+    /// exit. A 400 is the node's verdict on the exit itself, one every node
+    /// on the same chain would repeat, so it ends the walk and comes back as
+    /// the [`Error::BeaconNodeStatus`] the trait promises, with that node's
+    /// reason. Walking on would resend a refused exit to every node and
+    /// report the refusal as all of them having failed.
     async fn submit_voluntary_exit(&self, exit: &SignedVoluntaryExit) -> Result<()> {
+        // `try_each` walks past every `Err`, so the refusal goes through it
+        // as an answer and is unwrapped on the way out.
         self.try_each("submit_voluntary_exit", |node| {
-            node.submit_voluntary_exit(exit)
+            Box::pin(async move {
+                match node.submit_voluntary_exit(exit).await {
+                    Err(refusal @ Error::BeaconNodeStatus { status: 400, .. }) => Ok(Err(refusal)),
+                    outcome => outcome.map(Ok),
+                }
+            })
         })
-        .await
+        .await?
     }
 }
 
@@ -830,6 +854,69 @@ mod tests {
             1,
             "try_all, not try_each"
         );
+    }
+
+    fn signed_exit() -> SignedVoluntaryExit {
+        use ethlambda_types::beacon::containers::shared::VoluntaryExit;
+        use ethlambda_types::beacon::primitives::BlsSignature;
+        SignedVoluntaryExit {
+            message: VoluntaryExit {
+                epoch: 10,
+                validator_index: 7,
+            },
+            signature: BlsSignature([0; 96]),
+        }
+    }
+
+    /// A refusal is the node's answer about the exit, not a node failing. It
+    /// must reach the caller as that node's 400 and reason, and the exit must
+    /// not be resent to the nodes behind it.
+    #[tokio::test]
+    async fn a_refused_exit_ends_the_walk_with_the_nodes_reason() {
+        let fallback = FallbackBeaconNode::new(vec![
+            MockBeaconNode::new().refusing_exits("the validator is not active"),
+            MockBeaconNode::new(),
+        ]);
+
+        let err = fallback
+            .submit_voluntary_exit(&signed_exit())
+            .await
+            .expect_err("the first node refused it");
+        assert!(
+            matches!(&err, Error::BeaconNodeStatus { status: 400, body } if body.contains("not active")),
+            "got {err:?}"
+        );
+        assert!(
+            fallback.nodes[1].submitted_exits().is_empty(),
+            "a refused exit must not be resent to the next node"
+        );
+    }
+
+    /// A node that is down is still failed over from, as for any other call.
+    #[tokio::test]
+    async fn an_exit_fails_over_from_a_node_that_is_down() {
+        let fallback =
+            FallbackBeaconNode::new(vec![MockBeaconNode::failing("down"), MockBeaconNode::new()]);
+
+        fallback
+            .submit_voluntary_exit(&signed_exit())
+            .await
+            .expect("the second node accepts it");
+        assert_eq!(fallback.nodes[1].submitted_exits(), vec![signed_exit()]);
+    }
+
+    #[tokio::test]
+    async fn an_exit_no_node_could_be_reached_for_is_every_node_failing() {
+        let fallback = FallbackBeaconNode::new(vec![
+            MockBeaconNode::failing("first down"),
+            MockBeaconNode::failing("second down"),
+        ]);
+
+        let err = fallback
+            .submit_voluntary_exit(&signed_exit())
+            .await
+            .expect_err("nothing answered");
+        assert!(matches!(err, Error::AllBeaconNodesFailed(_)), "got {err:?}");
     }
 
     /// The pair a beacon node can genuinely report and this client must still

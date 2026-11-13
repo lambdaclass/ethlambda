@@ -139,6 +139,10 @@ pub struct MockBeaconNode {
     /// for the chain processing it. `None` leaves the answer as it was.
     pub details_after_exit: Mutex<Option<ValidatorDetails>>,
     pub submitted_exits: Mutex<Vec<SignedVoluntaryExit>>,
+    /// When set, `submit_voluntary_exit` answers a node's 400 with this
+    /// reason and records nothing: an exit the node judged invalid, as
+    /// opposed to a node that could not be reached (`failures`).
+    pub exit_refusal: Option<String>,
 }
 
 impl MockBeaconNode {
@@ -431,6 +435,12 @@ impl MockBeaconNode {
 
     pub fn submitted_exits(&self) -> Vec<SignedVoluntaryExit> {
         self.submitted_exits.lock().expect("lock").clone()
+    }
+
+    /// Refuses every submitted exit with a 400 carrying `reason`.
+    pub fn refusing_exits(mut self, reason: &str) -> Self {
+        self.exit_refusal = Some(reason.to_string());
+        self
     }
 
     pub fn with_publish_outcome(mut self, outcome: Published) -> Self {
@@ -977,6 +987,12 @@ impl BeaconNodeApi for MockBeaconNode {
 
     async fn submit_voluntary_exit(&self, exit: &SignedVoluntaryExit) -> Result<()> {
         self.guard("submit_voluntary_exit")?;
+        if let Some(reason) = &self.exit_refusal {
+            return Err(Error::BeaconNodeStatus {
+                status: 400,
+                body: reason.clone(),
+            });
+        }
         self.submitted_exits
             .lock()
             .expect("lock")

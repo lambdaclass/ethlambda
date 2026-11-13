@@ -62,7 +62,9 @@ pub async fn create_signed_voluntary_exit(
     require_held(&*context.store.read().await, &pubkey)?;
 
     // The same lookup the `voluntary-exit` command makes, so the two ways to
-    // sign an exit cannot disagree about a validator's index.
+    // sign an exit cannot disagree about a validator's index. Here it goes
+    // through the client's failover list, where the first node to answer is
+    // final, a 404 included: see `FallbackBeaconNode::validator`.
     let entry = context
         .beacon_node
         .validator(&pubkey)

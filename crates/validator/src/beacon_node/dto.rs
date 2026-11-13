@@ -519,6 +519,11 @@ fn spec_u64(value: &serde_json::Value, key: &str) -> Result<Option<u64>> {
 /// schedule differs while the compile-time presets, which fix SSZ list bounds,
 /// necessarily do not.
 ///
+/// Only the keys read below are overridden: the slot length, the duty
+/// offsets, `SHARD_COMMITTEE_PERIOD` and the fork schedule. Every other
+/// `Config` field is mainnet's whatever the node reports, so code in this
+/// crate that starts reading one has to read its key here first.
+///
 /// An absent key keeps its default: a fork this network has not scheduled is
 /// normal. A key that is present but unparseable is an error, because silently
 /// falling back to a mainnet default would leave the client signing under the
@@ -605,6 +610,13 @@ pub fn config_from_spec_response(value: &serde_json::Value) -> Result<Config> {
         if let Some(bps) = spec_u64(value, key)? {
             *field = bps;
         }
+    }
+    // What `ethlambda voluntary-exit` measures a validator's eligibility
+    // against. A devnet shortens it so an exit can be tried without waiting
+    // out mainnet's 256 epochs, and the command would refuse every validator
+    // there if this stayed at the default.
+    if let Some(epochs) = spec_u64(value, "SHARD_COMMITTEE_PERIOD")? {
+        config.shard_committee_period = epochs;
     }
     if let Some(version) = spec_version(value, "GENESIS_FORK_VERSION")? {
         config = config.with_fork_version(ForkName::Phase0, version);
@@ -1136,6 +1148,22 @@ mod tests {
         assert_eq!(config.contribution_due_bps, 6_667);
         assert_eq!(config.sync_message_due_bps_gloas, 2_500);
         assert_eq!(config.contribution_due_bps_gloas, 5_000);
+    }
+
+    /// A network that shortens the period is followed, not held to mainnet's
+    /// 256 epochs: the exit command checks eligibility against this field.
+    #[test]
+    fn the_shard_committee_period_is_read_and_defaults_to_mainnets() {
+        let response = serde_json::json!({ "SHARD_COMMITTEE_PERIOD": "4" });
+        let config = config_from_spec_response(&response).expect("builds");
+        assert_eq!(config.shard_committee_period, 4);
+
+        let config = config_from_spec_response(&serde_json::json!({})).expect("builds");
+        assert_eq!(config.shard_committee_period, 256);
+
+        let response = serde_json::json!({ "SHARD_COMMITTEE_PERIOD": "soon" });
+        let err = config_from_spec_response(&response).expect_err("must reject");
+        assert!(matches!(err, Error::Decode(_)), "got {err:?}");
     }
 
     #[test]
