@@ -50,6 +50,8 @@ use crate::beacon::helpers::electra::pending_queue_fields;
 use crate::beacon::helpers::fulu::{fulu_state, fulu_state_ref};
 use crate::beacon::primitives::{Bytes32, HashTreeRoot as _};
 
+use crate::metrics::{StfPhase, timed, try_for_each_timed};
+
 use super::ExecutionEngine;
 
 // ---------------------------------------------------------------------------
@@ -70,15 +72,21 @@ pub fn process_block(
     active_balances: &ActiveBalanceCache,
     options: super::block::BlockProcessingOptions,
 ) -> Result<()> {
-    super::block::process_block_header(
-        state,
-        block.slot,
-        block.proposer_index,
-        block.parent_root,
-        block.body.hash_tree_root(),
-    )?;
-    super::electra::process_withdrawals(state, &block.body.execution_payload)?;
-    process_execution_payload(state, &block.body, config, engine)?;
+    // The body's root is an argument, so it is hashed inside the timed span:
+    // it is part of what a header costs.
+    timed(StfPhase::BlockHeader, || {
+        super::block::process_block_header(
+            state,
+            block.slot,
+            block.proposer_index,
+            block.parent_root,
+            block.body.hash_tree_root(),
+        )
+    })?;
+    timed(StfPhase::ExecutionPayload, || -> Result<()> {
+        super::electra::process_withdrawals(state, &block.body.execution_payload)?;
+        process_execution_payload(state, &block.body, config, engine)
+    })?;
     super::block::process_randao(state, &block.body.randao_reveal, options.randao)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
     process_operations(state, &block.body, config, committees, active_balances)?;
@@ -228,24 +236,40 @@ pub fn process_operations(
     // [Modified in Fulu]
     verify(body.deposits.is_empty(), "len(body.deposits) == 0")?;
 
-    for proposer_slashing in body.proposer_slashings.iter() {
-        super::operations::process_proposer_slashing(state, proposer_slashing, config)?;
-    }
-    for attester_slashing in body.attester_slashings.iter() {
-        super::electra::process_attester_slashing(state, attester_slashing, config)?;
-    }
-    for attestation in body.attestations.iter() {
-        super::electra::process_attestation(state, attestation, committees, active_balances)?;
-    }
+    try_for_each_timed(
+        StfPhase::ProposerSlashings,
+        body.proposer_slashings.iter(),
+        |slashing| super::operations::process_proposer_slashing(state, slashing, config),
+    )?;
+    try_for_each_timed(
+        StfPhase::AttesterSlashings,
+        body.attester_slashings.iter(),
+        |slashing| super::electra::process_attester_slashing(state, slashing, config),
+    )?;
+    try_for_each_timed(
+        StfPhase::Attestations,
+        body.attestations.iter(),
+        |attestation| {
+            super::electra::process_attestation(state, attestation, committees, active_balances)
+        },
+    )?;
     // [Modified in Fulu]
     // Removed `process_deposit`
-    for voluntary_exit in body.voluntary_exits.iter() {
-        super::electra::process_voluntary_exit(state, voluntary_exit, config)?;
-    }
-    for signed_change in body.bls_to_execution_changes.iter() {
-        super::electra::process_bls_to_execution_change(state, signed_change, config)?;
-    }
-    process_execution_requests(state, &body.execution_requests, config)?;
+    try_for_each_timed(
+        StfPhase::VoluntaryExits,
+        body.voluntary_exits.iter(),
+        |exit| super::electra::process_voluntary_exit(state, exit, config),
+    )?;
+    try_for_each_timed(
+        StfPhase::BlsToExecutionChanges,
+        body.bls_to_execution_changes.iter(),
+        |signed_change| {
+            super::electra::process_bls_to_execution_change(state, signed_change, config)
+        },
+    )?;
+    timed(StfPhase::ExecutionRequests, || {
+        process_execution_requests(state, &body.execution_requests, config)
+    })?;
 
     Ok(())
 }

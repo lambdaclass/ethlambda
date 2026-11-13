@@ -77,6 +77,8 @@ use crate::beacon::primitives::{
     ValidatorIndex, WithdrawalIndex,
 };
 
+use crate::metrics::{StfPhase, timed, try_for_each_timed};
+
 use super::ExecutionEngine;
 
 // ---------------------------------------------------------------------------
@@ -109,20 +111,32 @@ pub fn process_block(
     // [New in Gloas:EIP7732]
     let parent_slot = state.latest_block_header().slot;
 
+    // Gloas has no execution payload step of its own: the parent's payload, the
+    // withdrawals and the bid are its equivalents, so they are observed as
+    // `execution_payload`, which therefore reaches the histogram twice per block.
+    //
     // [New in Gloas:EIP7732]
-    process_parent_execution_payload(state, block, config)?;
-    super::block::process_block_header(
-        state,
-        block.slot,
-        block.proposer_index,
-        block.parent_root,
-        block.body.hash_tree_root(),
-    )?;
+    timed(StfPhase::ExecutionPayload, || {
+        process_parent_execution_payload(state, block, config)
+    })?;
+    // The body's root is an argument, so it is hashed inside the timed span:
+    // it is part of what a header costs.
+    timed(StfPhase::BlockHeader, || {
+        super::block::process_block_header(
+            state,
+            block.slot,
+            block.proposer_index,
+            block.parent_root,
+            block.body.hash_tree_root(),
+        )
+    })?;
     // [Modified in Gloas:EIP7732]
-    process_withdrawals(state)?;
     // [Modified in Gloas:EIP7732] Removed `process_execution_payload`.
     // [New in Gloas:EIP7732]
-    process_execution_payload_bid(state, &block.body.signed_execution_payload_bid, config)?;
+    timed(StfPhase::ExecutionPayload, || -> Result<()> {
+        process_withdrawals(state)?;
+        process_execution_payload_bid(state, &block.body.signed_execution_payload_bid, config)
+    })?;
     super::block::process_randao(state, &block.body.randao_reveal, options.randao)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
     // [Modified in Gloas:EIP7732]
@@ -1621,28 +1635,48 @@ pub fn process_operations(
     )?;
 
     // [Modified in Gloas:EIP7732]
-    for proposer_slashing in body.proposer_slashings.iter() {
-        process_proposer_slashing(state, proposer_slashing, config)?;
-    }
-    for attester_slashing in body.attester_slashings.iter() {
-        process_attester_slashing(state, attester_slashing, config)?;
-    }
+    try_for_each_timed(
+        StfPhase::ProposerSlashings,
+        body.proposer_slashings.iter(),
+        |slashing| process_proposer_slashing(state, slashing, config),
+    )?;
+    try_for_each_timed(
+        StfPhase::AttesterSlashings,
+        body.attester_slashings.iter(),
+        |slashing| process_attester_slashing(state, slashing, config),
+    )?;
     // [Modified in Gloas:EIP7732]
-    for attestation in body.attestations.iter() {
-        process_attestation(state, attestation, parent_slot, committees, active_balances)?;
-    }
-    for voluntary_exit in body.voluntary_exits.iter() {
-        crate::beacon::stf::electra::process_voluntary_exit(state, voluntary_exit, config)?;
-    }
-    for signed_change in body.bls_to_execution_changes.iter() {
-        crate::beacon::stf::capella::process_bls_to_execution_change(state, signed_change, config)?;
-    }
+    try_for_each_timed(
+        StfPhase::Attestations,
+        body.attestations.iter(),
+        |attestation| {
+            process_attestation(state, attestation, parent_slot, committees, active_balances)
+        },
+    )?;
+    try_for_each_timed(
+        StfPhase::VoluntaryExits,
+        body.voluntary_exits.iter(),
+        |exit| crate::beacon::stf::electra::process_voluntary_exit(state, exit, config),
+    )?;
+    try_for_each_timed(
+        StfPhase::BlsToExecutionChanges,
+        body.bls_to_execution_changes.iter(),
+        |signed_change| {
+            crate::beacon::stf::capella::process_bls_to_execution_change(
+                state,
+                signed_change,
+                config,
+            )
+        },
+    )?;
     // [Modified in Gloas:EIP7732] Removed `process_deposit_request`,
     // `process_withdrawal_request`, and `process_consolidation_request`.
     // [New in Gloas:EIP7732]
-    for payload_attestation in body.payload_attestations.iter() {
-        process_payload_attestation(state, payload_attestation, config)?;
-    }
+    try_for_each_timed(
+        StfPhase::PayloadAttestations,
+        body.payload_attestations.iter(),
+        |payload_attestation| process_payload_attestation(state, payload_attestation, config),
+    )?;
 
     Ok(())
 }

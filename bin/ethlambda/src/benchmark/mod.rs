@@ -327,6 +327,10 @@ struct PhaseTimer {
     /// The histogram this timer reads; the import workload uses a different
     /// one (`lean_block_import_phase_seconds`) than the synthetic build does.
     histogram: &'static str,
+    /// A `(label, value)` the series must carry to be read, for a histogram
+    /// with a label besides `phase` that splits one phase into several series.
+    /// `None` reads every series, as the original two workloads do.
+    only: Option<(&'static str, &'static str)>,
     /// Per-phase (sample_sum, sample_count) before the build.
     before: HashMap<String, (f64, u64)>,
 }
@@ -335,8 +339,45 @@ impl PhaseTimer {
     fn start(histogram: &'static str) -> Self {
         Self {
             histogram,
-            before: read(histogram),
+            only: None,
+            before: read(histogram, None),
         }
+    }
+
+    /// [`Self::start`] over only the series that carry `only`'s label value.
+    ///
+    /// For `lean_beacon_stf_phase_seconds`, whose `context` label separates the
+    /// import path's observations from every other caller's: without the filter
+    /// a background `process_epoch` that finished mid-import would be charged
+    /// to the block that happened to be importing.
+    fn start_filtered(histogram: &'static str, only: (&'static str, &'static str)) -> Self {
+        Self {
+            histogram,
+            only: Some(only),
+            before: read(histogram, Some(only)),
+        }
+    }
+
+    /// Per-phase seconds accumulated since [`PhaseTimer::start`], for phases a
+    /// single import may observe any number of times.
+    ///
+    /// The counterpart of [`Self::finish_at_most_once`] for a phase that
+    /// legitimately repeats within one import: `process_epoch` once per epoch
+    /// boundary a long skip crosses, the gloas payload steps twice. The value is
+    /// the sum of those observations, which is the time the import spent in the
+    /// phase. A phase never observed is omitted rather than reported as zero,
+    /// for the reason given there.
+    fn finish_summed(self, expected: impl Iterator<Item = &'static str>) -> BTreeMap<String, f64> {
+        let after = read(self.histogram, self.only);
+        let mut phases = BTreeMap::new();
+        for phase in expected {
+            let (sum_before, count_before) = self.before.get(phase).copied().unwrap_or((0.0, 0));
+            let (sum_after, count_after) = after.get(phase).copied().unwrap_or((0.0, 0));
+            if count_after > count_before {
+                phases.insert(phase.to_string(), sum_after - sum_before);
+            }
+        }
+        phases
     }
 
     /// Per-phase durations since [`PhaseTimer::start`] for `expected` phases.
@@ -349,7 +390,7 @@ impl PhaseTimer {
         self,
         expected: impl Iterator<Item = &'static str>,
     ) -> eyre::Result<BTreeMap<String, f64>> {
-        let after = read(self.histogram);
+        let after = read(self.histogram, self.only);
         let mut phases = BTreeMap::new();
         for phase in expected {
             let (sum_before, count_before) = self.before.get(phase).copied().unwrap_or((0.0, 0));
@@ -377,7 +418,7 @@ impl PhaseTimer {
         self,
         expected: impl Iterator<Item = &'static str>,
     ) -> eyre::Result<BTreeMap<String, f64>> {
-        let after = read(self.histogram);
+        let after = read(self.histogram, self.only);
         let mut phases = BTreeMap::new();
         for phase in expected {
             let (sum_before, count_before) = self.before.get(phase).copied().unwrap_or((0.0, 0));
@@ -397,11 +438,23 @@ impl PhaseTimer {
 }
 
 /// Current (sample_sum, sample_count) per phase label on `histogram`.
-fn read(histogram: &str) -> HashMap<String, (f64, u64)> {
+///
+/// With `only`, series that do not carry that label value are skipped: the
+/// per-phase map is keyed by `phase` alone, so two series of one phase would
+/// otherwise overwrite each other and the reading would be whichever came last.
+fn read(histogram: &str, only: Option<(&str, &str)>) -> HashMap<String, (f64, u64)> {
     ethlambda_metrics::gather()
         .iter()
         .filter(|family| family.name() == histogram)
         .flat_map(|family| family.get_metric())
+        .filter(|metric| {
+            only.is_none_or(|(name, value)| {
+                metric
+                    .get_label()
+                    .iter()
+                    .any(|label| label.name() == name && label.value() == value)
+            })
+        })
         .filter_map(|metric| {
             let phase = metric
                 .get_label()
@@ -418,9 +471,102 @@ fn read(histogram: &str) -> HashMap<String, (f64, u64)> {
         .collect()
 }
 
+/// Current value of every series of the counter family `counter`, by the
+/// value of its `result` label.
+///
+/// A family nothing has incremented yet is not in the registry at all, so an
+/// absent family and an absent series both read as an empty map; the caller
+/// treats a missing result as zero lookups, which is what it is.
+fn read_counter(counter: &str) -> BTreeMap<String, u64> {
+    ethlambda_metrics::gather()
+        .iter()
+        .filter(|family| family.name() == counter)
+        .flat_map(|family| family.get_metric())
+        .filter_map(|metric| {
+            let result = metric
+                .get_label()
+                .iter()
+                .find(|label| label.name() == "result")?
+                .value()
+                .to_string();
+            Some((result, metric.get_counter().value() as u64))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod phase_timer_tests {
     use super::*;
+
+    #[test]
+    fn a_filtered_timer_reads_only_the_series_it_names() {
+        // The shape of `lean_beacon_stf_phase_seconds`: one phase, two
+        // callers. A background caller's observation made during the span must
+        // not reach the import's reading.
+        let histogram = ethlambda_metrics::register_histogram_vec!(
+            "test_phase_timer_filtered_seconds",
+            "Phase histogram used only by the PhaseTimer tests",
+            &["context", "phase"]
+        )
+        .expect("registers once");
+
+        let timer =
+            PhaseTimer::start_filtered("test_phase_timer_filtered_seconds", ("context", "import"));
+        histogram
+            .with_label_values(&["import", "process_epoch"])
+            .observe(0.25);
+        histogram
+            .with_label_values(&["other", "process_epoch"])
+            .observe(9.0);
+
+        let phases = timer.finish_summed(["process_epoch", "randao"].into_iter());
+
+        assert!((phases["process_epoch"] - 0.25).abs() < 1e-9);
+        assert!(!phases.contains_key("randao"), "never observed, so absent");
+    }
+
+    #[test]
+    fn a_summed_phase_adds_every_observation_of_one_import() {
+        let histogram = ethlambda_metrics::register_histogram_vec!(
+            "test_phase_timer_summed_seconds",
+            "Phase histogram used only by the PhaseTimer tests",
+            &["context", "phase"]
+        )
+        .expect("registers once");
+        // Observed before the span: in neither the sum nor the count.
+        histogram
+            .with_label_values(&["import", "execution_payload"])
+            .observe(100.0);
+
+        let timer =
+            PhaseTimer::start_filtered("test_phase_timer_summed_seconds", ("context", "import"));
+        histogram
+            .with_label_values(&["import", "execution_payload"])
+            .observe(0.1);
+        histogram
+            .with_label_values(&["import", "execution_payload"])
+            .observe(0.2);
+
+        let phases = timer.finish_summed(["execution_payload"].into_iter());
+        assert!((phases["execution_payload"] - 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_counter_is_read_by_its_result_label() {
+        let counter = ethlambda_metrics::register_int_counter_vec!(
+            "test_read_counter_total",
+            "Counter used only by the read_counter test",
+            &["result"]
+        )
+        .expect("registers once");
+        counter.with_label_values(&["hit"]).inc_by(3);
+        counter.with_label_values(&["miss"]).inc();
+
+        let values = read_counter("test_read_counter_total");
+        assert_eq!(values["hit"], 3);
+        assert_eq!(values["miss"], 1);
+        assert!(read_counter("test_never_registered_total").is_empty());
+    }
 
     #[test]
     fn an_unobserved_phase_is_omitted_rather_than_reported_as_zero() {
