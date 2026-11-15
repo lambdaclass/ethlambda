@@ -2010,7 +2010,7 @@ dependencies = [
  "serde_yaml_ng",
  "sha2",
  "snap",
- "spawned-concurrency 0.7.3",
+ "spawned-concurrency 0.8.0",
  "tempfile",
  "thiserror 2.0.18",
  "tikv-jemallocator",
@@ -2041,8 +2041,8 @@ dependencies = [
  "serde",
  "serde_json",
  "snap",
- "spawned-concurrency 0.7.3",
- "spawned-rt 0.7.3",
+ "spawned-concurrency 0.8.0",
+ "spawned-rt 0.8.0",
  "spawned-test",
  "thiserror 2.0.18",
  "tokio",
@@ -2103,7 +2103,7 @@ name = "ethlambda-network-api"
 version = "1.0.0"
 dependencies = [
  "ethlambda-types",
- "spawned-concurrency 0.7.3",
+ "spawned-concurrency 0.8.0",
 ]
 
 [[package]]
@@ -2131,7 +2131,7 @@ dependencies = [
  "secp256k1 0.30.0",
  "sha2",
  "snap",
- "spawned-concurrency 0.7.3",
+ "spawned-concurrency 0.8.0",
  "spawned-test",
  "thiserror 2.0.18",
  "tokio",
@@ -2163,7 +2163,7 @@ dependencies = [
  "libssz-types 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=5cb14378ffdadcb51b387c003567e2630d0c7073)",
  "serde",
  "serde_json",
- "spawned-concurrency 0.7.3",
+ "spawned-concurrency 0.8.0",
  "tokio",
  "tokio-util",
  "tower",
@@ -6600,13 +6600,15 @@ dependencies = [
 
 [[package]]
 name = "spawned-concurrency"
-version = "0.7.3"
-source = "git+https://github.com/lambdaclass/spawned?rev=4f84ba1ae8f7c19240bcf8c77d23999d7b43a199#4f84ba1ae8f7c19240bcf8c77d23999d7b43a199"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da02834ca272603e01ffa99e4a62b66e39498ae066d8e21062d92e4622e28616"
 dependencies = [
  "futures",
+ "parking_lot",
  "pin-project-lite",
- "spawned-macros 0.7.3",
- "spawned-rt 0.7.3",
+ "spawned-macros 0.8.0",
+ "spawned-rt 0.8.0",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -6624,8 +6626,9 @@ dependencies = [
 
 [[package]]
 name = "spawned-macros"
-version = "0.7.3"
-source = "git+https://github.com/lambdaclass/spawned?rev=4f84ba1ae8f7c19240bcf8c77d23999d7b43a199#4f84ba1ae8f7c19240bcf8c77d23999d7b43a199"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e368e431187a02bb18bd41fa9b4e0dd890c74efd0caf2308d4fa33a1bb4c6216"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6648,8 +6651,9 @@ dependencies = [
 
 [[package]]
 name = "spawned-rt"
-version = "0.7.3"
-source = "git+https://github.com/lambdaclass/spawned?rev=4f84ba1ae8f7c19240bcf8c77d23999d7b43a199#4f84ba1ae8f7c19240bcf8c77d23999d7b43a199"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf5a762cf874c37bb6b357a4ea82880da982ab59a38a108ace3264637b493c97"
 dependencies = [
  "ctrlc",
  "loom",
@@ -6664,19 +6668,21 @@ dependencies = [
 
 [[package]]
 name = "spawned-sim-libc"
-version = "0.7.3"
-source = "git+https://github.com/lambdaclass/spawned?rev=4f84ba1ae8f7c19240bcf8c77d23999d7b43a199#4f84ba1ae8f7c19240bcf8c77d23999d7b43a199"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1797c45ec3d62c6e25e25c5c8b6f82d3e0ae1c28ecde4ee3a5da2fb9469d3186"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "spawned-test"
-version = "0.7.3"
-source = "git+https://github.com/lambdaclass/spawned?rev=4f84ba1ae8f7c19240bcf8c77d23999d7b43a199#4f84ba1ae8f7c19240bcf8c77d23999d7b43a199"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f32ce1a2c27f0b648220a893d9f573f250d36d1c08f6d2b0dc55585f3e49ab04"
 dependencies = [
- "spawned-concurrency 0.7.3",
- "spawned-rt 0.7.3",
+ "spawned-concurrency 0.8.0",
+ "spawned-rt 0.8.0",
  "tracing",
 ]
 
