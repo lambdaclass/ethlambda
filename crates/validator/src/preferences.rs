@@ -92,9 +92,11 @@
 //! accepted, with no body to trust, and each success is remembered on its own.
 //!
 //! The requests go out together, both target epochs' fetches and sends too, so
-//! a node that does not answer costs a poll one duties fetch and one request
-//! timeout rather than one timeout per preference. A poll sends at most one
-//! preference per slot of the two epochs.
+//! nodes that do not answer cost a poll one request timeout on the sends
+//! rather than one per preference. The duties are fetched from one node at a
+//! time, so each such node listed ahead of the one that answers adds a
+//! timeout there. A poll sends at most one preference per slot of the two
+//! epochs.
 //!
 //! # Failures are never propagated
 //!
@@ -152,7 +154,11 @@ enum Sent {
 /// Not the last slot: polls are single-flight, so a poll held up behind a slow
 /// node skips the next one. Started one slot early, the round still runs at
 /// the last slot when the first poll is skipped, and the epoch's first slot is
-/// still ahead then.
+/// still ahead then. A poll that outlasts two slots skips both, and the round
+/// runs at the epoch's first poll instead, too late for its first slot. That
+/// takes nodes that hang on every request listed ahead of the one that
+/// answers the duties, since each costs a request timeout: about two of them
+/// on 12 s slots, or one where slots are shorter.
 fn round_of(current_slot: Slot) -> Epoch {
     compute_epoch_at_slot(current_slot + 2)
 }
@@ -186,7 +192,8 @@ enum Before {
 struct Tally {
     /// A node accepted it for the first time.
     published: bool,
-    /// It went from every node or none to some: the poll warns once for all.
+    /// It is no longer known to be on every node, having been either there or
+    /// on none: the poll warns once for all.
     newly_partial: bool,
 }
 

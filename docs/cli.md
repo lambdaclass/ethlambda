@@ -343,7 +343,9 @@ reorg changes the root. After that it sends each one, as first signed, once
 more every epoch while its slot is ahead, at the epoch's second-to-last slot
 (or its last, if a slow node made the client skip that poll), since a
 node that restarts loses what it accepted; a node restarted mid-epoch thus
-lacks the rest of that epoch's, and has the next epoch's from its first slot.
+lacks the rest of that epoch's, and has the next epoch's from its first slot,
+unless it restarted after that re-send, in the epoch's last slot or two: then
+it lacks the next epoch's too, up to that epoch's own re-send.
 Each preference is its own request, and a poll sends all
 of them, for both epochs, at once, so a node that does not answer delays the
 others by one request timeout. Duties outside their epoch, and all but the
