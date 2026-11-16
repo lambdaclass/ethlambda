@@ -47,12 +47,17 @@ pub struct SyncThresholds {
     /// keeping up with gossip, where a peer a slot ahead is ordinary and a
     /// one-block range request would only race gossip.
     pub peer_lead: u64,
-    /// Recovery band: once syncing, both lags must drop this many slots below
-    /// their thresholds before the node reports synced again, so the status
-    /// does not flap at the boundary.
+    /// Recovery band: once syncing, the node reports synced again only when
+    /// the clock lag or the peer lead drops this many slots below its
+    /// threshold, so the status does not flap at the boundary. The lead's
+    /// threshold never drops below one slot, since a peer one slot ahead is
+    /// ordinary propagation.
     pub hysteresis: u64,
     /// Slots the node may read as syncing on a peer-reported lead without its
     /// head advancing, before it treats the network as stalled after all.
+    /// Added up over every stretch spent behind on the peers' word since the
+    /// head last advanced, so a lead that lapses for a moment does not start
+    /// the count over.
     ///
     /// A peer that claims a head it does not serve (an empty answer, invalid
     /// blocks, no answer) would otherwise keep a node that is behind the

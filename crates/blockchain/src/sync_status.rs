@@ -46,13 +46,6 @@ impl Default for SyncStatusController {
     }
 }
 
-/// The head slot the tracker last saw rise, and the wall-clock slot it rose at.
-#[derive(Clone, Copy, Debug)]
-struct Progress {
-    head_slot: u64,
-    at: u64,
-}
-
 /// The sync gate: judges, from the clock, the node's own head and the head its
 /// peers report, whether the node is too far behind to do validator duties.
 /// See [`SyncThresholds`] for the rule and the numbers.
@@ -66,11 +59,21 @@ pub(crate) struct SyncStatusTracker {
     /// `--disable-duty-sync-gate` flag (gating stays on by default).
     gate_duties: bool,
     thresholds: SyncThresholds,
-    /// When the head last advanced; set by the first update.
-    progress: Option<Progress>,
-    /// The wall-clock slot from which the node has been behind both the clock
-    /// and its peers, while it still is.
-    behind_since: Option<u64>,
+    /// The head slot progress is measured from: the highest the head has
+    /// reached, or where it last moved back to. Set by the first update.
+    progress_head: Option<u64>,
+    /// Slots the node has spent behind on its peers' word since its head last
+    /// advanced, measured against [`SyncThresholds::stall_window`].
+    ///
+    /// Added up rather than measured from when the node last fell behind: a
+    /// claim that lapses for a moment (a peer reporting a block this node
+    /// holds, a reconnect) would otherwise restart the window, and a peer
+    /// doing that every few slots could keep the node idle indefinitely.
+    behind_for: u64,
+    /// The wall-clock slot of the last judgment, while that judgment found the
+    /// node behind on its peers' word: the start of the stretch the next one
+    /// adds to [`Self::behind_for`].
+    behind_at: Option<u64>,
     /// The head slot at which a peer-reported lead was given up on for making
     /// no progress (see [`SyncThresholds::stall_window`]). Holds the node
     /// synced until the head moves past it: the peers that claimed the lead
@@ -86,8 +89,9 @@ impl SyncStatusTracker {
             syncing: false,
             gate_duties,
             thresholds,
-            progress: None,
-            behind_since: None,
+            progress_head: None,
+            behind_for: 0,
+            behind_at: None,
             stalled_at_head: None,
         }
     }
@@ -136,23 +140,18 @@ impl SyncStatusTracker {
             ..
         } = self.thresholds;
 
-        let progress = self.progress.get_or_insert(Progress {
-            head_slot,
-            at: current_slot,
-        });
-        if head_slot > progress.head_slot {
-            *progress = Progress {
-                head_slot,
-                at: current_slot,
-            };
-        } else if head_slot < progress.head_slot {
+        let progress_head = *self.progress_head.get_or_insert(head_slot);
+        if head_slot > progress_head {
+            self.progress_head = Some(head_slot);
+            self.behind_for = 0;
+            self.behind_at = None;
+        } else if head_slot < progress_head {
             // The head moved back (an `INVALID` execution verdict cutting a
             // branch out): progress is measured from where it now is, or the
             // re-imports below the old mark would not count. Moving back is
-            // not itself progress, so `at` stays.
-            progress.head_slot = head_slot;
+            // not itself progress, so the time spent behind stands.
+            self.progress_head = Some(head_slot);
         }
-        let progress = *progress;
         match self.stalled_at_head {
             Some(stalled) if head_slot > stalled => self.stalled_at_head = None,
             // Same for a head that moved back below where the lead was given
@@ -169,30 +168,38 @@ impl SyncStatusTracker {
         let clock_lag = current_slot.saturating_sub(head_slot);
         let peer_lead = network_head.map_or(0, |slot| slot.saturating_sub(head_slot));
         let band = if self.syncing { hysteresis } else { 0 };
-        let behind = clock_lag > clock_threshold.saturating_sub(band)
-            && peer_lead > lead_threshold.saturating_sub(band);
+        // The band never takes the lead below a slot: a peer one slot ahead is
+        // ordinary propagation, and on lean, whose lead threshold is one, the
+        // band would otherwise keep a node syncing on any peer a slot ahead of
+        // it, such as one holding an orphaned block.
+        let lead_floor = lead_threshold
+            .saturating_sub(band)
+            .max(lead_threshold.min(1));
+        let behind = clock_lag > clock_threshold.saturating_sub(band) && peer_lead > lead_floor;
+
         // Counted only while behind on the peers' word: behind on the clock's
         // word (past a fork the node does not follow) is no claim that a peer
         // can fail to deliver.
-        let behind_since = if behind && !network_at_clock {
-            *self.behind_since.get_or_insert(current_slot)
+        let on_peers_word = behind && !network_at_clock;
+        if on_peers_word {
+            if let Some(since) = self.behind_at {
+                self.behind_for += current_slot.saturating_sub(since);
+            }
+            self.behind_at = Some(current_slot);
         } else {
-            self.behind_since = None;
-            current_slot
-        };
+            self.behind_at = None;
+        }
 
-        // The backstop: behind on the peers' word, with the head flat for a
-        // whole window since the node fell behind on that word or last
-        // advanced. Whoever claims the lead is not delivering it, which is
-        // what a stalled network looks like too.
-        let flat_for = current_slot.saturating_sub(behind_since.max(progress.at));
-        if behind && !network_at_clock && self.stalled_at_head.is_none() && flat_for > stall_window
-        {
+        // The backstop: behind on the peers' word for a whole window, all of
+        // it with the head flat. Whoever claims the lead is not delivering it,
+        // which is what a stalled network looks like too.
+        let behind_for = self.behind_for;
+        if on_peers_word && self.stalled_at_head.is_none() && behind_for > stall_window {
             warn!(
                 current_slot,
                 head_slot,
                 network_head,
-                flat_for,
+                behind_for,
                 "Peers report a head this node is not reaching; treating the network as stalled"
             );
             self.stalled_at_head = Some(head_slot);
@@ -468,6 +475,53 @@ mod tests {
     fn a_current_node_is_synced_from_the_first_tick() {
         let mut tracker = SyncStatusTracker::new(true, LEAN);
         assert_eq!(tracker.update(300, 299, None), SyncStatus::Synced);
+    }
+
+    #[test]
+    fn a_lead_that_lapses_now_and_then_does_not_restart_the_stall_window() {
+        // Finding: a single judgment without the lead (the claiming peer
+        // reporting a block we hold, or reconnecting) restarted the window,
+        // so a peer doing that every few slots kept the node idle for good.
+        let mut tracker = steady_lean();
+        let start = 100;
+        assert_eq!(tracker.update(start, 50, Some(start)), SyncStatus::Syncing);
+        let lapse_every = LEAN.stall_window / 2;
+        let give_up_by = start + 2 * LEAN.stall_window;
+        let mut gave_up = false;
+        for current in start + 1..=give_up_by {
+            let claim = if current % lapse_every == 0 {
+                Some(50)
+            } else {
+                Some(current)
+            };
+            let status = tracker.update(current, 50, claim);
+            gave_up |= claim == Some(current) && status == SyncStatus::Synced;
+        }
+        assert!(gave_up, "the window never ran out");
+        // Given up on, the claim is not believed again while the head is flat.
+        let next = give_up_by + 1;
+        assert_eq!(tracker.update(next, 50, Some(next)), SyncStatus::Synced);
+    }
+
+    #[test]
+    fn the_band_never_takes_the_lead_below_a_slot() {
+        // Finding: on lean (lead threshold 1, band 2) a node already syncing
+        // stayed syncing on a peer one slot ahead. Here it has caught up to
+        // the network's head at 10 during a run of missed proposals, and one
+        // peer holds an orphan at 11 that nobody built on.
+        let mut tracker = steady_lean();
+        assert_eq!(tracker.update(16, 5, Some(16)), SyncStatus::Syncing);
+        assert_eq!(tracker.update(16, 10, Some(11)), SyncStatus::Synced);
+        // Two slots ahead is still a lead.
+        assert_eq!(tracker.update(16, 10, Some(12)), SyncStatus::Syncing);
+        // The beacon band is unaffected: 32 - 4 slots of lead keep it syncing.
+        let mut beacon = steady(BEACON);
+        assert_eq!(beacon.update(1_000, 900, Some(1_000)), SyncStatus::Syncing);
+        let lead = BEACON.peer_lead - BEACON.hysteresis + 1;
+        assert_eq!(
+            beacon.update(1_000, 900, Some(900 + lead)),
+            SyncStatus::Syncing
+        );
     }
 
     #[test]

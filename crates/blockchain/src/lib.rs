@@ -5461,6 +5461,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_lean_block_arrival_judges_the_gate_without_waiting_for_the_tick() {
+        // The lean half of the beacon test above: lean duties read the gate in
+        // the tick, but the tick waits behind a catch-up's blocks, so each
+        // arrival judges it too. An orphan is enough, since every arrival ends
+        // in the judgment whatever becomes of the block.
+        let backend = Arc::new(InMemoryBackend::default());
+        let store = Store::from_anchor_state(
+            backend,
+            State::from_genesis(0, Vec::new()),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
+        let mut server = beacon_server(store);
+        server.sync_status = SyncStatusTracker::new(false, SyncThresholds::LEAN);
+        let orphan = || {
+            SignedBeaconBlock::Lean(ethlambda_types::block::SignedBlock {
+                message: ethlambda_types::block::Block {
+                    slot: 5,
+                    proposer_index: 0,
+                    parent_root: H256::repeat_byte(9),
+                    state_root: H256::ZERO,
+                    body: ethlambda_types::block::BlockBody::default(),
+                },
+                proof: ethlambda_types::block::MultiMessageAggregate::default(),
+            })
+        };
+
+        // No peer has reported: judged, and synced.
+        server.on_block(orphan(), ImportTimings::default()).await;
+        assert_eq!(
+            server.sync_status_controller.get(),
+            crate::metrics::SyncStatus::Synced
+        );
+
+        // A peer at the clock: the next arrival closes the gate.
+        let wall_clock_slot = server.wall_clock_slot();
+        server.store.set_network_head(Some(wall_clock_slot));
+        server.on_block(orphan(), ImportTimings::default()).await;
+        assert_eq!(
+            server.sync_status_controller.get(),
+            crate::metrics::SyncStatus::Syncing
+        );
+    }
+
+    #[tokio::test]
     async fn the_descendants_of_a_held_block_wait_for_it_without_re_importing_it() {
         // A range batch hands the actor a whole chain at once. When its first
         // block is held for columns, every later block names a held ancestor,
