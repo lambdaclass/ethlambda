@@ -235,11 +235,14 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
                 }
             }
         }
-        if accepted == self.nodes.len() {
-            return Ok(Delivery::Everywhere);
-        }
+        // Nested, so no node at all is never "every node": the constructor
+        // refuses an empty list, but this does not lean on it.
         if accepted > 0 {
-            return Ok(Delivery::Partly);
+            return if accepted == self.nodes.len() {
+                Ok(Delivery::Everywhere)
+            } else {
+                Ok(Delivery::Partly)
+            };
         }
         let detail = last
             .map(|err| err.to_string())
@@ -502,12 +505,34 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
     ) -> Result<Delivery> {
         // Quiet: the service retries a refused preference every slot and warns
         // once per entry, with what it costs.
-        self.try_all_quiet(
-            "submit_proposer_preferences",
-            "it will not gossip these proposer preferences",
-            |node| node.submit_proposer_preferences(fork, preferences),
-        )
-        .await
+        let outcome_unknown = std::sync::atomic::AtomicBool::new(false);
+        let delivery = self
+            .try_all_quiet(
+                "submit_proposer_preferences",
+                "it will not gossip these proposer preferences",
+                |node| {
+                    let outcome_unknown = &outcome_unknown;
+                    Box::pin(async move {
+                        node.submit_proposer_preferences(fork, preferences)
+                            .await
+                            .inspect_err(|err| {
+                                if err.outcome_unknown() {
+                                    outcome_unknown
+                                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            })
+                    })
+                },
+            )
+            .await;
+        // Whether some node may hold the preference after all decides whether
+        // it can be signed again: see `PreferencesService`.
+        match delivery {
+            Err(Error::AllBeaconNodesFailed(detail)) if outcome_unknown.into_inner() => {
+                Err(Error::NoNodeConfirmed(detail))
+            }
+            other => other,
+        }
     }
 
     /// Fails over like any query: the envelope the node cached is only on the
@@ -1020,6 +1045,49 @@ mod tests {
 
         assert!(fallback.nodes[0].subscriptions().is_empty());
         assert_eq!(fallback.nodes[1].subscriptions().len(), 1);
+    }
+
+    /// A preference every node refused outright is a plain failure, so it is
+    /// signed afresh; one a node may have taken before failing is told apart,
+    /// so it is kept as signed (see `PreferencesService`).
+    #[tokio::test]
+    async fn a_preference_no_node_confirmed_says_whether_one_may_hold_it() {
+        let slot = 96;
+        let refusing = || {
+            let node = MockBeaconNode::new();
+            node.refused_preference_slots
+                .lock()
+                .expect("lock")
+                .push(slot);
+            node
+        };
+        let preference = gloas::SignedProposerPreferences {
+            message: gloas::ProposerPreferences {
+                proposal_slot: slot,
+                ..Default::default()
+            },
+            signature: Default::default(),
+        };
+        let preferences = std::slice::from_ref(&preference);
+
+        let refused = FallbackBeaconNode::new(vec![refusing(), refusing()]);
+        let err = refused
+            .submit_proposer_preferences(ForkName::Gloas, preferences)
+            .await
+            .expect_err("both refused");
+        assert!(matches!(err, Error::AllBeaconNodesFailed(_)), "got {err:?}");
+        assert!(!err.outcome_unknown());
+
+        let lost = FallbackBeaconNode::new(vec![
+            refusing(),
+            MockBeaconNode::new().failing_call("submit_proposer_preferences", "timed out"),
+        ]);
+        let err = lost
+            .submit_proposer_preferences(ForkName::Gloas, preferences)
+            .await
+            .expect_err("neither confirmed");
+        assert!(matches!(err, Error::NoNodeConfirmed(_)), "got {err:?}");
+        assert!(err.outcome_unknown());
     }
 
     #[tokio::test]

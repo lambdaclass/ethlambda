@@ -58,6 +58,12 @@ pub enum Error {
     },
     #[error("every configured beacon node failed; last error: {0}")]
     AllBeaconNodesFailed(String),
+    /// Every node failed a request, and at least one may have acted on it
+    /// first: it timed out or broke once sent, or answered a 5xx. Raised for
+    /// proposer preferences only, where whether a node may hold one decides
+    /// whether it can be signed again (see `PreferencesService`).
+    #[error("no beacon node confirmed the request, and one may have taken it; last error: {0}")]
+    NoNodeConfirmed(String),
     #[error("beacon node returned {status}: {body}")]
     BeaconNodeStatus { status: u16, body: String },
     #[error("beacon node is syncing")]
@@ -178,6 +184,20 @@ pub enum Error {
 }
 
 impl Error {
+    /// Whether a request that failed with this may still have been acted on
+    /// by the node: no answer came once it was sent (a timeout, a broken
+    /// connection, an unreadable body), or a 5xx other than 503 said it failed
+    /// partway. A 4xx, a 503, a syncing node and a connection never made are
+    /// definite: the node did not take it.
+    pub fn outcome_unknown(&self) -> bool {
+        match self {
+            Self::NoNodeConfirmed(_) | Self::BlindedUnconfirmed { .. } => true,
+            Self::BeaconNode { failure, .. } => *failure != BeaconNodeFailure::Connect,
+            Self::BeaconNodeStatus { status, .. } => *status >= 500 && *status != 503,
+            _ => false,
+        }
+    }
+
     /// Whether the duty loop should try again rather than give up.
     ///
     /// The distinction the loop needs every slot: a beacon node that is down,
@@ -188,6 +208,7 @@ impl Error {
         match self {
             Self::BeaconNode { .. }
             | Self::AllBeaconNodesFailed(_)
+            | Self::NoNodeConfirmed(_)
             | Self::BeaconNodeStatus { .. }
             | Self::BeaconNodeSyncing
             | Self::BlindedUnconfirmed { .. }
