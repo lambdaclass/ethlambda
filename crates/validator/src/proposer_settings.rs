@@ -147,9 +147,10 @@ impl ProposerSettings {
         self
     }
 
-    /// A counter that moves whenever a fee recipient or gas limit override is
-    /// written, cleared or forgotten. Equal readings mean no per-key fee
-    /// recipient or gas limit changed between them.
+    /// A counter that moves whenever a write or delete changes a fee
+    /// recipient or gas limit override; one that leaves them as they were
+    /// does not move it. Equal readings mean no per-key fee recipient or gas
+    /// limit changed between them.
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
@@ -420,6 +421,9 @@ mod tests {
         assert!(!moved(&settings, &|s| s.clear_graffiti(&key(1))));
         assert!(moved(&settings, &|s| s.clear_gas_limit(&key(1))));
         assert!(!moved(&settings, &|s| s.clear_gas_limit(&key(1))));
+        assert!(moved(&settings, &|s| s.clear_fee_recipient(&key(1))));
+        assert!(!moved(&settings, &|s| s.clear_fee_recipient(&key(1))));
+        assert!(moved(&settings, &|s| s.set_fee_recipient(&key(1), address)));
         assert!(moved(&settings, &|s| s.forget(&key(1))));
 
         settings.set_graffiti(&key(2), Bytes32::repeat_byte(0x22));
