@@ -48,11 +48,11 @@
 //! A node whose execution client fails at the slot may therefore build on a
 //! pooled p2p bid, and this client signs that block rather than refusing it.
 //! A refusal would cost the slot as well as its payload, where the bid pays
-//! the fee recipient this validator's preference named. Lighthouse, Prysm and Teku sign it too, and their nodes
-//! fall back the same way; Lodestar refuses it only in its opt-in
-//! `executiononly` mode. Before gloas a blinded block is refused instead, but
-//! for another reason: without the flag this client has no way to publish
-//! one.
+//! the fee recipient this validator's preference named. Lighthouse, Prysm and
+//! Teku sign it too, and their nodes fall back the same way; Lodestar refuses
+//! it only in its opt-in `executiononly` mode. Before gloas a blinded block is
+//! refused instead, but for another reason: without the flag this client has
+//! no way to publish one.
 //!
 //! The envelope is not slashable, so slashing protection is untouched by it.
 //!
@@ -302,11 +302,15 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         if Self::pays_this_validator(actual, current, preferred) != Some(false) {
             return;
         }
-        let expected: Vec<String> = current
+        let mut expected: Vec<String> = current
             .iter()
             .chain(preferred)
             .map(|address| crate::beacon_node::dto::encode_hex(&address.0))
             .collect();
+        // Each once: the current address is usually the preferred one too,
+        // and two dependent roots' preferences may name the same one.
+        expected.sort_unstable();
+        expected.dedup();
         tracing::error!(
             %slot,
             expected = %expected.join(","),

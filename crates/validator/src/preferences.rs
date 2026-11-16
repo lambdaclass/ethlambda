@@ -63,11 +63,12 @@
 //! slot, or of its last when that poll was skipped behind a slow node, while
 //! every slot of the next epoch is still ahead. So a node restarted mid-epoch
 //! lacks the rest of that epoch's preferences and holds every later one, the
-//! next epoch's first slot included. Each node answers
-//! the re-send as it does any other: one still holding the preference with a
-//! 200 and no republish, one that lost it by taking it again, and one not
-//! ready yet by making it a preference only some nodes hold, sent each slot
-//! from then on.
+//! next epoch's first slot included. One restarted after the round, in an
+//! epoch's last slot or two, lacks the next epoch's too, up to that epoch's
+//! own round. Each node answers the re-send as it does any other: one still
+//! holding the preference with a 200 and no republish, one that lost it by
+//! taking it again, and one not ready yet by making it a preference only some
+//! nodes hold, sent each slot from then on.
 //!
 //! # No replacement
 //!
