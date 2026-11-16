@@ -201,8 +201,11 @@ impl SyncStatusTracker {
                 // Behind since the last judgment: the whole stretch counts.
                 (Some(counted), None) => self.behind_for + current_slot.saturating_sub(counted),
                 // Back after a lapse longer than the window: a new claim,
-                // with a window of its own, once per head position.
-                (_, Some(lapsed))
+                // with a window of its own, once per head position. Only
+                // once something was counted at this head: the first claim
+                // after a quiet stretch starts from zero anyway, and must not
+                // use up the renewal an outage later would need.
+                (Some(_), Some(lapsed))
                     if !self.renewed && current_slot.saturating_sub(lapsed) > stall_window =>
                 {
                     self.renewed = true;
@@ -574,6 +577,9 @@ mod tests {
         // reconnected after hours gave up on its peers' lead a slot later,
         // before its first range batch could land.
         let mut tracker = steady_lean();
+        // A quiet stretch first, longer than a window, at the same head: the
+        // first claim after it must not use up the renewal.
+        assert_eq!(tracker.update(80, 50, None), SyncStatus::Synced);
         assert_eq!(tracker.update(100, 50, Some(100)), SyncStatus::Syncing);
         for current in 101..=110 {
             assert_eq!(
