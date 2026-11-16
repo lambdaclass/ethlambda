@@ -68,11 +68,11 @@
 //! after the round lacks the next epoch's too, all but its last slot's, which
 //! the round at that epoch's second-to-last slot re-sends. A round whose
 //! duties come late (slow nodes ahead of the one that answers, see below)
-//! leaves out the slots that started meanwhile, the next epoch's first among
-//! them. Each node answers the re-send as it does any other: one still
-//! holding the preference with a 200 and no republish, one that lost it by
-//! taking it again, and one not ready yet by making it a preference only some
-//! nodes hold, sent each slot from then on.
+//! leaves out the slots that started meanwhile, which can include the next
+//! epoch's first. Each node answers the re-send as it does any other: one
+//! still holding the preference with a 200 and no republish, one that lost it
+//! by taking it again, and one not ready yet by making it a preference only
+//! some nodes hold, sent each slot from then on.
 //!
 //! # No replacement
 //!
