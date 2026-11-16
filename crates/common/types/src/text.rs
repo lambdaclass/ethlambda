@@ -10,8 +10,10 @@ const CUT: &str = "...";
 /// node's logs and error messages. There a raw line break would start what
 /// reads as a log line of its own, and an ESC would start an ANSI sequence that
 /// recolors, moves the cursor in or clears a terminal. So every control
-/// character (`char::is_control`: C0, DEL and C1) and the Unicode line and
-/// paragraph separators U+2028/U+2029, which some viewers break lines at, are
+/// character (`char::is_control`: C0, DEL and C1), the Unicode line and
+/// paragraph separators U+2028/U+2029, which some viewers break lines at, and
+/// the bidirectional controls, which reorder how the rest of a line reads
+/// (U+061C, U+200E/U+200F, U+202A to U+202E and U+2066 to U+2069), are
 /// written as Rust escapes: `\n`, `\r` and `\t`, and `\u{1b}` for the rest.
 /// Everything else passes through unchanged, quotes and backslashes included.
 ///
@@ -26,8 +28,7 @@ pub fn one_line(text: &str, max_bytes: usize) -> String {
     // part of it that leaves room for the marker.
     let mut kept_if_cut = 0;
     for c in text.chars() {
-        let breaks_the_line = c.is_control() || matches!(c, '\u{2028}' | '\u{2029}');
-        let escaped = breaks_the_line.then(|| c.escape_default());
+        let escaped = rewrites_the_line(c).then(|| c.escape_default());
         let len = escaped
             .as_ref()
             .map_or(c.len_utf8(), ExactSizeIterator::len);
@@ -49,6 +50,22 @@ pub fn one_line(text: &str, max_bytes: usize) -> String {
     written
 }
 
+/// Whether writing `c` out as it is could break the line, restyle it, or
+/// reorder how it reads.
+fn rewrites_the_line(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{2028}'
+                | '\u{2029}'
+                | '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::one_line;
@@ -59,6 +76,23 @@ mod tests {
         assert_eq!(
             one_line(text, 1024),
             r#"\u{1b}[31mred\u{1b}[0m\ttab\u{7}bell\u{85}nel\u{2028}ls\u{2029}ps "q" \ ok\r\n"#
+        );
+    }
+
+    /// A right-to-left override would make the rest of the line read
+    /// backwards in a terminal, so it is written out like a control character.
+    #[test]
+    fn bidirectional_controls_are_written_out() {
+        let text = "a\u{202e}b\u{2066}c\u{2069}d\u{200f}e\u{061c}f";
+        assert_eq!(
+            one_line(text, 1024),
+            r"a\u{202e}b\u{2066}c\u{2069}d\u{200f}e\u{61c}f"
+        );
+        // Neighbours of those ranges pass through.
+        let neighbours = "\u{200d}\u{2029}\u{202f}\u{2070}";
+        assert_eq!(
+            one_line(neighbours, 1024),
+            "\u{200d}\\u{2029}\u{202f}\u{2070}"
         );
     }
 
