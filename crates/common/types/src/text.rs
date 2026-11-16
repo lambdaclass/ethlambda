@@ -83,17 +83,15 @@ mod tests {
     /// backwards in a terminal, so it is written out like a control character.
     #[test]
     fn bidirectional_controls_are_written_out() {
-        let text = "a\u{202e}b\u{2066}c\u{2069}d\u{200f}e\u{061c}f";
+        // Each range's ends, and the two marks.
+        let text = "\u{61c}\u{200e}\u{200f}\u{202a}\u{202e}\u{2066}\u{2069}";
         assert_eq!(
             one_line(text, 1024),
-            r"a\u{202e}b\u{2066}c\u{2069}d\u{200f}e\u{61c}f"
+            r"\u{61c}\u{200e}\u{200f}\u{202a}\u{202e}\u{2066}\u{2069}"
         );
-        // Neighbours of those ranges pass through.
-        let neighbours = "\u{200d}\u{2029}\u{202f}\u{2070}";
-        assert_eq!(
-            one_line(neighbours, 1024),
-            "\u{200d}\\u{2029}\u{202f}\u{2070}"
-        );
+        // Their neighbours pass through.
+        let neighbours = "\u{61b}\u{61d}\u{200d}\u{2010}\u{202f}\u{2065}\u{206a}";
+        assert_eq!(one_line(neighbours, 1024), neighbours);
     }
 
     /// A cut text ends in the marker, counted within the cap; a text that
