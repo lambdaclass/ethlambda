@@ -67,12 +67,13 @@ head trails the wall clock **and** its peers report a head ahead of it.
   slots are added up rather than counted from when the node last fell behind:
   each slot spent behind counts once, and a lead that lapses for less than the
   window pauses the count rather than restarting it. A lead absent for longer
-  than that (an outage) ends the count, and the next claim gets a whole
-  window. A peer that
-  claims a head it does not serve (an empty answer, invalid blocks, no answer
-  at all) therefore costs at most that window, not the rest of a network
-  stall. The window is sized above
-  what can legitimately hold a catching-up head still.
+  than that (an outage) ends the count once per head position, and the next
+  claim gets a whole window, unless the node already gave up on a lead at
+  that head. A peer that claims a head it does not serve (an empty answer,
+  invalid blocks, no answer at all) therefore costs at most that window at
+  each head the node reaches (two around an outage), not the rest of a
+  network stall. The window is sized above what can legitimately hold a
+  catching-up head still.
 - **Why:** imported blocks cannot tell "the network is stalled" from "this node
   is behind". A node catching up has imported nothing recent either, so the
   specification's rule reports it synced for the whole catch-up and it proposes

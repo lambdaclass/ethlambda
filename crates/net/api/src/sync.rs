@@ -59,8 +59,9 @@ pub struct SyncThresholds {
     /// head advancing, before it treats the network as stalled after all.
     /// Added up over every slot spent behind on the peers' word since the
     /// head last advanced, so a lead that lapses for a moment does not start
-    /// the count over; a lead absent for longer than the window (an outage)
-    /// does, and the next claim gets a window of its own.
+    /// the count over. A lead absent for longer than the window (an outage)
+    /// does, once per head position, and the next claim gets a window of its
+    /// own, unless the node has already given up on a lead at this head.
     ///
     /// A peer that claims a head it does not serve (an empty answer, invalid
     /// blocks, no answer) would otherwise keep a node that is behind the

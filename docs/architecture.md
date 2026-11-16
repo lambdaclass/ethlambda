@@ -181,7 +181,7 @@ chain recover. So does starting up before any peer has reported, as in Lighthous
 the network is at the clock would idle every node at once whenever all of them are behind it.
 A lead the head does not advance towards for a whole stall window reads as a
 stall too, so a peer claiming a head it never serves cannot idle the node for longer than
-that. This departs from leanSpec's rule; see `docs/spec_deviations.md`. The gate is judged
+that at one head (two windows around an outage). This departs from leanSpec's rule; see `docs/spec_deviations.md`. The gate is judged
 on every tick and again whenever the head can move between ticks (every lean block arrival,
 every beacon head recompute, `INVALID` `forkchoiceUpdated` verdicts included): on a
 catch-up, range sync puts the whole span into the actor's mailbox at once and the tick

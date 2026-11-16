@@ -78,8 +78,13 @@ pub(crate) struct SyncStatusTracker {
     /// The wall-clock slot from which no judgment has found the node behind
     /// on its peers' word, while that lasts. A lapse longer than the stall
     /// window (an outage, peers that stopped claiming) ends the count: the
-    /// next claim gets a window of its own.
+    /// next claim gets a window of its own, once per head position.
     lapsed_at: Option<u64>,
+    /// Whether a claim after a long lapse has already had a fresh window at
+    /// the current head. Once per head position, so that claiming for most
+    /// of a window, lapsing for a whole one and claiming again cannot keep
+    /// a node idle for half of all slots indefinitely.
+    renewed: bool,
     /// The head slot at which a peer-reported lead was given up on for making
     /// no progress (see [`SyncThresholds::stall_window`]). Holds the node
     /// synced until the head moves past it: the peers that claimed the lead
@@ -99,6 +104,7 @@ impl SyncStatusTracker {
             behind_for: 0,
             counted_at: None,
             lapsed_at: None,
+            renewed: false,
             stalled_at_head: None,
         }
     }
@@ -153,6 +159,7 @@ impl SyncStatusTracker {
             self.behind_for = 0;
             self.counted_at = None;
             self.lapsed_at = None;
+            self.renewed = false;
         } else if head_slot < progress_head {
             // The head moved back (an `INVALID` execution verdict cutting a
             // branch out): progress is measured from where it now is, or the
@@ -194,8 +201,13 @@ impl SyncStatusTracker {
                 // Behind since the last judgment: the whole stretch counts.
                 (Some(counted), None) => self.behind_for + current_slot.saturating_sub(counted),
                 // Back after a lapse longer than the window: a new claim,
-                // with a window of its own.
-                (_, Some(lapsed)) if current_slot.saturating_sub(lapsed) > stall_window => 0,
+                // with a window of its own, once per head position.
+                (_, Some(lapsed))
+                    if !self.renewed && current_slot.saturating_sub(lapsed) > stall_window =>
+                {
+                    self.renewed = true;
+                    0
+                }
                 // Back after a shorter lapse: this slot counts once, however
                 // many judgments it has.
                 (Some(counted), Some(_)) => self.behind_for + u64::from(current_slot != counted),
@@ -582,6 +594,37 @@ mod tests {
         }
         let past = back + LEAN.stall_window + 1;
         assert_eq!(tracker.update(past, 50, Some(past)), SyncStatus::Synced);
+    }
+
+    #[test]
+    fn a_fresh_window_after_a_long_lapse_comes_once_per_head() {
+        // Finding: claiming for most of a window, lapsing for a whole one
+        // and claiming again got a fresh window every time, so the node sat
+        // idle for about half of all slots, indefinitely.
+        let mut tracker = steady_lean();
+        let window = LEAN.stall_window;
+        let mut current = 100;
+        let mut idle = 0;
+        for _ in 0..10 {
+            for _ in 0..window {
+                if tracker.update(current, 50, Some(current)) == SyncStatus::Syncing {
+                    idle += 1;
+                }
+                current += 1;
+            }
+            for _ in 0..=window {
+                tracker.update(current, 50, None);
+                current += 1;
+            }
+        }
+        // The first window, one renewal, and a slot each for the claims that
+        // trip it: bounded, however many rounds.
+        assert!(idle <= 2 * window + 2, "idle for {idle} slots");
+        // A head advance gives the next claim its own window again.
+        assert_eq!(
+            tracker.update(current, 51, Some(current)),
+            SyncStatus::Syncing
+        );
     }
 
     #[test]
