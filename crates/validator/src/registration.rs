@@ -127,6 +127,11 @@ use crate::signing::SigningContext;
 /// Keys signed per blocking task, and so per hold of the store's read lock.
 const SIGN_CHUNK: usize = 64;
 
+/// What [`RegistrationService::signed_generation`] holds while something is
+/// still to send. No [`ProposerSettings::generation`] reaches it, so the next
+/// per-slot call runs whether or not a setting moved since.
+const BEHIND: u64 = u64::MAX;
+
 /// What [`RegistrationService::current`] found for a set of validators.
 struct Current {
     /// Every validator's registration, cached or newly signed.
@@ -186,14 +191,20 @@ pub struct RegistrationService<B> {
     /// when its registration reaches the send.
     signed: std::sync::Mutex<HashMap<BlsPubkey, SignedValidatorRegistrationV1>>,
     /// The [`ProposerSettings::generation`] the cache was last brought up to
-    /// date against. Held behind while [`Self::unsent`] is not empty, so the
-    /// next per-slot call retries it.
+    /// date against, or [`BEHIND`] while [`Self::unsent`] is not empty or a
+    /// chunk's signing failed, so the next per-slot call sends what is left.
     signed_generation: AtomicU64,
     /// Validators whose newest registration a per-slot send could not get any
     /// node to accept: sent again, as signed, at every slot until one does or
     /// a full send carries them, which ends the retry. Taken under
     /// [`Self::sending`] only.
     unsent: std::sync::Mutex<HashSet<BlsPubkey>>,
+    /// Validators found with no fee recipient while a registration of theirs
+    /// was cached. A retry ends when its key loses its fee recipient, so that
+    /// registration may never have reached a node: once a fee recipient is set
+    /// again it is signed afresh rather than found unchanged. Taken under
+    /// [`Self::sending`] only.
+    lapsed: std::sync::Mutex<HashSet<BlsPubkey>>,
     /// Held by a send from before it reads the cache until its last batch is
     /// answered, so sends reach every node in the order they read the cache.
     /// See the module doc.
@@ -220,6 +231,7 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
             signed: std::sync::Mutex::new(HashMap::new()),
             signed_generation: AtomicU64::new(0),
             unsent: std::sync::Mutex::new(HashSet::new()),
+            lapsed: std::sync::Mutex::new(HashSet::new()),
             sending: Mutex::new(()),
             full_send: InFlight::default(),
             #[cfg(test)]
@@ -238,6 +250,11 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
             .signed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut lapsed = self
+            .lapsed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut newly_lapsed = Vec::new();
         let mut current = Current {
             all: Vec::with_capacity(pubkeys.len()),
             changed: Vec::new(),
@@ -254,11 +271,15 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
                 self.settings.fee_recipient_and_gas_limit(pubkey)
             else {
                 current.no_fee_recipient += 1;
+                if signed.contains_key(pubkey) {
+                    newly_lapsed.push(*pubkey);
+                }
                 continue;
             };
 
             let held = signed.get(pubkey);
             if let Some(held) = held
+                && !lapsed.contains(pubkey)
                 && held.message.fee_recipient == fee_recipient
                 && held.message.gas_limit == gas_limit
             {
@@ -292,6 +313,10 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
         signed.extend(
             changed.map(|registration| (registration.message.pubkey, registration.clone())),
         );
+        for registration in &current.changed {
+            lapsed.remove(&registration.message.pubkey);
+        }
+        lapsed.extend(newly_lapsed);
         current
     }
 
@@ -341,14 +366,13 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
     /// Record that every setting up to `generation` is signed and sent,
     /// unless a chunk of the signing failed (`in_failed_chunks` is not empty)
     /// or a registration is waiting to be sent again ([`Self::unsent`]). Then
-    /// the generation stays behind, so the next slot's
-    /// [`Self::register_changed`] signs what that chunk held, or re-sends what
-    /// no node took, rather than leaving a keymanager change unsent for an
-    /// epoch.
+    /// it records [`BEHIND`], so the next slot's [`Self::register_changed`]
+    /// signs what that chunk held, or re-sends what no node took, even when no
+    /// setting moved, rather than leaving it for the next epoch.
     fn mark_signed(&self, generation: u64, in_failed_chunks: &HashSet<BlsPubkey>) {
-        if in_failed_chunks.is_empty() && self.unsent().is_empty() {
-            self.signed_generation.store(generation, Ordering::Release);
-        }
+        let done = in_failed_chunks.is_empty() && self.unsent().is_empty();
+        let marked = if done { generation } else { BEHIND };
+        self.signed_generation.store(marked, Ordering::Release);
     }
 
     /// [`Self::unsent`], locked. A poisoned lock is recovered: every write is
@@ -391,6 +415,10 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|pubkey, _| current_keys.contains(pubkey));
+        self.lapsed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|pubkey| current_keys.contains(pubkey));
         *self
             .known
             .lock()
@@ -407,9 +435,9 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
         // This send carried every key but those of a failed chunk, so it ends
         // their per-slot retries: a key it delivered needs no more, and one it
         // did not waits for the next epoch's full send with the rest of its
-        // batch. A key in a failed chunk was not carried, so it keeps its retry.
-        self.unsent()
-            .retain(|pubkey| current.in_failed_chunks.contains(pubkey));
+        // batch. A key in a failed chunk was not carried, so the next slot
+        // sends it, changed or not.
+        *self.unsent() = current.in_failed_chunks.clone();
         self.mark_signed(generation, &current.in_failed_chunks);
     }
 
@@ -1068,6 +1096,63 @@ mod tests {
         service.clone().register_changed(0, store.clone()).await;
         assert_eq!(registration_calls(&node), 3, "the retry goes out");
         assert_eq!(latest(&node, &pubkeys[1]).message.gas_limit, 30_000_000);
+    }
+
+    /// A full send whose chunk fails with no setting changed since the last
+    /// one still sends that chunk's keys at the next slot: the per-slot check
+    /// is held behind whether or not the generation moved.
+    #[tokio::test]
+    async fn a_failed_chunk_of_a_full_send_goes_out_at_the_next_slot() {
+        let (store, pubkeys) = store_with_keys(2);
+        let (service, node) = service(Config::mainnet(), settings(Some(H160([0xab; 20]))));
+        let store = Arc::new(RwLock::new(store));
+
+        panic_signing(&service, Some(pubkeys[1]));
+        service
+            .clone()
+            .register_all(0, pubkeys.clone(), store.clone())
+            .await;
+        assert_eq!(registration_calls(&node), 0, "the only chunk failed");
+
+        panic_signing(&service, None);
+        service.clone().register_changed(0, store.clone()).await;
+        assert_eq!(*node.registration_batches.lock().expect("lock"), vec![2]);
+        service.clone().register_changed(0, store.clone()).await;
+        assert_eq!(registration_calls(&node), 1, "delivered, so nothing more");
+    }
+
+    /// A retry ends when its key loses its fee recipient, so the registration
+    /// it was retrying may never have reached a node. Setting the same address
+    /// again signs and sends it, rather than finding it unchanged in the cache.
+    #[tokio::test]
+    async fn a_fee_recipient_set_again_after_a_lapse_is_sent() {
+        let (store, pubkeys) = store_with_keys(1);
+        let settings = settings(None);
+        settings.set_fee_recipient(&pubkeys[0], H160([0xab; 20]));
+        let (service, node) = service(Config::mainnet(), settings.clone());
+        let store = Arc::new(RwLock::new(store));
+        service
+            .clone()
+            .register_all(0, pubkeys.clone(), store.clone())
+            .await;
+
+        refuse_registrations(&node);
+        settings.set_fee_recipient(&pubkeys[0], H160([0xcd; 20]));
+        service.clone().register_changed(0, store.clone()).await;
+        node.stop_failing("register_validators");
+        settings.clear_fee_recipient(&pubkeys[0]);
+        service.clone().register_changed(0, store.clone()).await;
+        assert_eq!(
+            registration_calls(&node),
+            2,
+            "nothing to send without an address"
+        );
+
+        settings.set_fee_recipient(&pubkeys[0], H160([0xcd; 20]));
+        service.clone().register_changed(0, store.clone()).await;
+        let latest = latest(&node, &pubkeys[0]);
+        assert_eq!(latest.message.fee_recipient, H160([0xcd; 20]));
+        assert_eq!(registration_calls(&node), 3);
     }
 
     /// A full send does not carry the keys of a chunk that failed, so it does
