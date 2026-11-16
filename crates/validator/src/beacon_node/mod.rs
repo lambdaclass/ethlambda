@@ -457,7 +457,7 @@ pub trait BeaconNodeApi: Send + Sync {
     ///   relay may still publish the block.
     ///
     /// The status cannot always tell, and the HTTP implementation documents the
-    /// two edges it knowingly reads the wrong way.
+    /// edges it knowingly reads the wrong way.
     async fn publish_blinded_block(
         &self,
         producer: Producer,

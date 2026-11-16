@@ -448,7 +448,11 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
         for (position, outcomes) in per_node.into_iter().enumerate() {
             let mut refused = 0;
             let mut first_refusal = None;
-            for (batch, outcome) in outcomes.into_iter().enumerate() {
+            // One outcome per batch is the trait's contract. A node that
+            // breaks it can neither panic this nor pass a batch off as
+            // delivered: extra outcomes are dropped, and a missing one leaves
+            // its batch not accepted by that node.
+            for (batch, outcome) in outcomes.into_iter().take(batches).enumerate() {
                 match outcome {
                     Ok(()) => accepted[batch] = true,
                     Err(err) => {
@@ -478,9 +482,9 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
                 if accepted {
                     Ok(())
                 } else {
-                    Err(Error::AllBeaconNodesFailed(
-                        last.unwrap_or_else(|| "no nodes configured".to_string()),
-                    ))
+                    Err(Error::AllBeaconNodesFailed(last.unwrap_or_else(|| {
+                        "no beacon node gave an outcome for this batch".to_string()
+                    })))
                 }
             })
             .collect()
