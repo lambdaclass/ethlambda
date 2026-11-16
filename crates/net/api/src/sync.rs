@@ -25,6 +25,13 @@ use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
 /// ahead of me" and "the network is stalled"; the clock keeps a peer's claim
 /// from idling a node whose own head is current.
 ///
+/// Only peers show a lead, from the first judgment on: a node that starts
+/// behind the clock does its duties until a peer reports a head ahead of it,
+/// as Lighthouse does in its initial `Stalled` state. Assuming the network is
+/// at the clock instead would idle every node at once whenever all of them are
+/// behind it (a slow network start, a restart after an outage), and a network
+/// where nobody proposes stays stalled.
+///
 /// A peer's head is a claim, and a claim that never turns into progress is
 /// bounded by [`Self::stall_window`]: syncing means getting somewhere, and a
 /// lead nobody delivers reads the same as a stalled network.
@@ -44,28 +51,6 @@ pub struct SyncThresholds {
     /// their thresholds before the node reports synced again, so the status
     /// does not flap at the boundary.
     pub hysteresis: u64,
-    /// Slots after the first judgment during which the node assumes the
-    /// network is at least at the wall clock, unless [`Self::startup_peers`]
-    /// peers have reported before then.
-    ///
-    /// The first judgment runs before any peer has answered a `Status`, and
-    /// the first peer to answer may itself be behind, so without this a node
-    /// resuming a stale database would read "no peer is ahead" as a stalled
-    /// network and do its duties on that stale head. Prysm holds a starting
-    /// node in initial sync until it has peers; this bounds that hold, so a
-    /// node that never finds a peer, or restarts into a real stall, still
-    /// falls back to treating the silence as a stall.
-    pub startup_grace: u64,
-    /// Connected peers whose `Status` ends the startup hold early.
-    ///
-    /// Once this many have reported a head (one past the wall clock does
-    /// not count, one this node already holds does), the node judges by
-    /// their reports instead of the hold's assumption. One report is not
-    /// enough, since the first peer to answer may be as stale as this node,
-    /// but the highest of several is: a single current peer among them shows
-    /// the lead. A node with fewer peers than this keeps the whole
-    /// [`Self::startup_grace`] window. The same count on both chains.
-    pub startup_peers: usize,
     /// Slots the node may read as syncing on a peer-reported lead without its
     /// head advancing, before it treats the network as stalled after all.
     ///
@@ -102,8 +87,6 @@ impl SyncThresholds {
         clock_lag: 4,
         peer_lead: 1,
         hysteresis: 2,
-        startup_grace: 8,
-        startup_peers: 5,
         stall_window: 16,
         status_refresh_slots: 2,
     };
@@ -114,17 +97,12 @@ impl SyncThresholds {
     /// Lighthouse peer `Advanced`). Neither client has a hysteresis band, but
     /// neither re-judges on every block arrival either; this node does, and a
     /// follower importing about one block a slot right at the boundary would
-    /// otherwise flip twice a slot. The startup hold and the stall window are
-    /// an epoch: finding beacon peers through discovery can take a while, and
-    /// Prysm holds until it has peers, however long; five peers reporting end
-    /// the hold sooner. The `Status` refresh is
-    /// Prysm's half epoch (`maintainPeerStatuses`).
+    /// otherwise flip twice a slot. The stall window is an epoch, and the
+    /// `Status` refresh is Prysm's half epoch (`maintainPeerStatuses`).
     pub const BEACON: Self = Self {
         clock_lag: 2 * SLOTS_PER_EPOCH,
         peer_lead: SLOTS_PER_EPOCH,
         hysteresis: 4,
-        startup_grace: SLOTS_PER_EPOCH,
-        startup_peers: 5,
         stall_window: SLOTS_PER_EPOCH,
         status_refresh_slots: SLOTS_PER_EPOCH / 2,
     };

@@ -52,20 +52,19 @@ head trails the wall clock **and** its peers report a head ahead of it.
   than the clock lag because a report is up to 2 slots old: a node 5 slots
   behind a producing network sees its peers' 2-slot-old heads 2 slots ahead.
   With no report at all the node cannot be behind anyone and reads as synced,
-  except during a hold at startup, during which the network is assumed to be
-  at least at the clock. The hold lasts 8 slots, or until 5 connected peers
-  have reported a head (one the node already holds counts; one past the clock
-  does not), whichever comes first: the first peer to answer may be as stale
-  as the node, but the highest of five shows the lead if any one of them is
-  current.
+  from the first judgment on: a node resuming a stale database does its duties
+  on its stale head until a peer reports a lead, as a Lighthouse node does in
+  its initial `Stalled` state. Assuming the network is at the clock instead
+  would idle every node at once whenever all of them are behind it (a slow
+  start, a restart after an outage), and a network where nobody proposes stays
+  stalled.
 - **Stall window:** a lead that does not turn into progress is given up on. A
   node that reads as syncing on its peers' word with its head flat for 16 slots
   (`SyncThresholds::stall_window`) treats the network as stalled and does its
   duties, until its head next advances. A peer that claims a head it does not
   serve (an empty answer, invalid blocks, no answer at all) therefore costs at
   most that window, not the rest of a network stall. The window is sized above
-  what can legitimately hold a catching-up head still, and counts only from the
-  end of the startup hold.
+  what can legitimately hold a catching-up head still.
 - **Why:** imported blocks cannot tell "the network is stalled" from "this node
   is behind". A node catching up has imported nothing recent either, so the
   specification's rule reports it synced for the whole catch-up and it proposes
@@ -78,18 +77,15 @@ head trails the wall clock **and** its peers report a head ahead of it.
 - **Equivalence:** the two agree whenever no peer is further ahead of the node
   than its newest imported block. They differ for a node behind its peers with
   nothing newer imported, which the specification lets do its duties and this
-  node does not, until its head has been flat for the stall window. They also
-  differ for a node restarted into a network stall, which the specification
-  lets do its duties at once and this node holds until 5 peers have reported
-  or the 8-slot startup window has passed.
+  node does not, until its head has been flat for the stall window.
 
 The beacon node runs the same rule with Lighthouse's numbers (two epochs of
 clock lag, one epoch of peer lead), a band of 4 slots that neither Lighthouse
 nor Prysm has (this node re-judges on every block arrival, and would otherwise
-flip twice a slot at the boundary), an epoch of startup hold (ended sooner by
-the same 5 reporting peers) and of stall window, and Prysm's `Status` refresh, every half epoch (Lighthouse refreshes
-every 300 s). consensus-specs has no sync gate, and the Beacon API leaves
-`is_syncing` to the client.
+flip twice a slot at the boundary), an epoch of stall window, and Prysm's
+`Status` refresh, every half epoch (Lighthouse refreshes every 300 s).
+consensus-specs has no sync gate, and the Beacon API leaves `is_syncing` to the
+client.
 
 ## Attestation scoring on block building
 
