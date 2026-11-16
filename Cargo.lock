@@ -172,7 +172,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -183,7 +183,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -788,7 +788,7 @@ dependencies = [
  "bitflags 2.11.1",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -1916,7 +1916,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2010,7 +2010,7 @@ dependencies = [
  "serde_yaml_ng",
  "sha2",
  "snap",
- "spawned-concurrency 0.8.0",
+ "spawned-concurrency",
  "tempfile",
  "thiserror 2.0.18",
  "tikv-jemallocator",
@@ -2041,8 +2041,8 @@ dependencies = [
  "serde",
  "serde_json",
  "snap",
- "spawned-concurrency 0.8.0",
- "spawned-rt 0.8.0",
+ "spawned-concurrency",
+ "spawned-rt",
  "spawned-test",
  "thiserror 2.0.18",
  "tokio",
@@ -2103,7 +2103,7 @@ name = "ethlambda-network-api"
 version = "1.0.0"
 dependencies = [
  "ethlambda-types",
- "spawned-concurrency 0.8.0",
+ "spawned-concurrency",
 ]
 
 [[package]]
@@ -2131,7 +2131,7 @@ dependencies = [
  "secp256k1 0.30.0",
  "sha2",
  "snap",
- "spawned-concurrency 0.8.0",
+ "spawned-concurrency",
  "spawned-test",
  "thiserror 2.0.18",
  "tokio",
@@ -2163,7 +2163,7 @@ dependencies = [
  "libssz-types 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=5cb14378ffdadcb51b387c003567e2630d0c7073)",
  "serde",
  "serde_json",
- "spawned-concurrency 0.8.0",
+ "spawned-concurrency",
  "tokio",
  "tokio-util",
  "tower",
@@ -2303,8 +2303,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-blockchain"
-version = "25.0.0"
-source = "git+https://github.com/lambdaclass/ethrex?tag=v25.0.0#f3b90bc6dc57704940d1ff4f2bc74a8dd5788df2"
+version = "30.0.1"
+source = "git+https://github.com/lambdaclass/ethrex?rev=bc13c9d28e3904fd7186fa91650f81be270373b5#bc13c9d28e3904fd7186fa91650f81be270373b5"
 dependencies = [
  "bytes",
  "crossbeam",
@@ -2328,8 +2328,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-common"
-version = "25.0.0"
-source = "git+https://github.com/lambdaclass/ethrex?tag=v25.0.0#f3b90bc6dc57704940d1ff4f2bc74a8dd5788df2"
+version = "30.0.1"
+source = "git+https://github.com/lambdaclass/ethrex?rev=bc13c9d28e3904fd7186fa91650f81be270373b5#bc13c9d28e3904fd7186fa91650f81be270373b5"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -2337,6 +2337,7 @@ dependencies = [
  "ethrex-crypto",
  "ethrex-rlp",
  "ethrex-trie",
+ "foldhash 0.2.0",
  "hex",
  "hex-literal",
  "hex-simd",
@@ -2362,8 +2363,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-crypto"
-version = "25.0.0"
-source = "git+https://github.com/lambdaclass/ethrex?tag=v25.0.0#f3b90bc6dc57704940d1ff4f2bc74a8dd5788df2"
+version = "30.0.1"
+source = "git+https://github.com/lambdaclass/ethrex?rev=bc13c9d28e3904fd7186fa91650f81be270373b5#bc13c9d28e3904fd7186fa91650f81be270373b5"
 dependencies = [
  "ark-bn254",
  "ark-ec",
@@ -2384,8 +2385,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-guest-program"
-version = "25.0.0"
-source = "git+https://github.com/lambdaclass/ethrex?tag=v25.0.0#f3b90bc6dc57704940d1ff4f2bc74a8dd5788df2"
+version = "30.0.1"
+source = "git+https://github.com/lambdaclass/ethrex?rev=bc13c9d28e3904fd7186fa91650f81be270373b5#bc13c9d28e3904fd7186fa91650f81be270373b5"
 dependencies = [
  "bytes",
  "ethereum-types",
@@ -2407,8 +2408,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-l2-common"
-version = "25.0.0"
-source = "git+https://github.com/lambdaclass/ethrex?tag=v25.0.0#f3b90bc6dc57704940d1ff4f2bc74a8dd5788df2"
+version = "30.0.1"
+source = "git+https://github.com/lambdaclass/ethrex?rev=bc13c9d28e3904fd7186fa91650f81be270373b5#bc13c9d28e3904fd7186fa91650f81be270373b5"
 dependencies = [
  "bytes",
  "ethereum-types",
@@ -2425,8 +2426,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-levm"
-version = "25.0.0"
-source = "git+https://github.com/lambdaclass/ethrex?tag=v25.0.0#f3b90bc6dc57704940d1ff4f2bc74a8dd5788df2"
+version = "30.0.1"
+source = "git+https://github.com/lambdaclass/ethrex?rev=bc13c9d28e3904fd7186fa91650f81be270373b5#bc13c9d28e3904fd7186fa91650f81be270373b5"
 dependencies = [
  "bytes",
  "derive_more 1.0.0",
@@ -2443,8 +2444,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-metrics"
-version = "25.0.0"
-source = "git+https://github.com/lambdaclass/ethrex?tag=v25.0.0#f3b90bc6dc57704940d1ff4f2bc74a8dd5788df2"
+version = "30.0.1"
+source = "git+https://github.com/lambdaclass/ethrex?rev=bc13c9d28e3904fd7186fa91650f81be270373b5#bc13c9d28e3904fd7186fa91650f81be270373b5"
 dependencies = [
  "ethrex-common",
  "serde",
@@ -2455,8 +2456,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-p2p"
-version = "25.0.0"
-source = "git+https://github.com/lambdaclass/ethrex?tag=v25.0.0#f3b90bc6dc57704940d1ff4f2bc74a8dd5788df2"
+version = "30.0.1"
+source = "git+https://github.com/lambdaclass/ethrex?rev=bc13c9d28e3904fd7186fa91650f81be270373b5#bc13c9d28e3904fd7186fa91650f81be270373b5"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2486,8 +2487,8 @@ dependencies = [
  "serde",
  "sha2",
  "snap",
- "spawned-concurrency 0.5.0",
- "spawned-rt 0.5.0",
+ "spawned-concurrency",
+ "spawned-rt",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -2497,8 +2498,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-rlp"
-version = "25.0.0"
-source = "git+https://github.com/lambdaclass/ethrex?tag=v25.0.0#f3b90bc6dc57704940d1ff4f2bc74a8dd5788df2"
+version = "30.0.1"
+source = "git+https://github.com/lambdaclass/ethrex?rev=bc13c9d28e3904fd7186fa91650f81be270373b5#bc13c9d28e3904fd7186fa91650f81be270373b5"
 dependencies = [
  "bytes",
  "ethereum-types",
@@ -2507,8 +2508,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-storage"
-version = "25.0.0"
-source = "git+https://github.com/lambdaclass/ethrex?tag=v25.0.0#f3b90bc6dc57704940d1ff4f2bc74a8dd5788df2"
+version = "30.0.1"
+source = "git+https://github.com/lambdaclass/ethrex?rev=bc13c9d28e3904fd7186fa91650f81be270373b5#bc13c9d28e3904fd7186fa91650f81be270373b5"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2517,6 +2518,7 @@ dependencies = [
  "ethrex-rlp",
  "ethrex-trie",
  "fastbloom",
+ "indexmap 2.14.0",
  "lru",
  "rayon",
  "rustc-hash",
@@ -2529,8 +2531,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-trie"
-version = "25.0.0"
-source = "git+https://github.com/lambdaclass/ethrex?tag=v25.0.0#f3b90bc6dc57704940d1ff4f2bc74a8dd5788df2"
+version = "30.0.1"
+source = "git+https://github.com/lambdaclass/ethrex?rev=bc13c9d28e3904fd7186fa91650f81be270373b5#bc13c9d28e3904fd7186fa91650f81be270373b5"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2549,8 +2551,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-vm"
-version = "25.0.0"
-source = "git+https://github.com/lambdaclass/ethrex?tag=v25.0.0#f3b90bc6dc57704940d1ff4f2bc74a8dd5788df2"
+version = "30.0.1"
+source = "git+https://github.com/lambdaclass/ethrex?rev=bc13c9d28e3904fd7186fa91650f81be270373b5#bc13c9d28e3904fd7186fa91650f81be270373b5"
 dependencies = [
  "bytes",
  "derive_more 1.0.0",
@@ -4799,7 +4801,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5422,7 +5424,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -6089,7 +6091,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6581,21 +6583,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
-]
-
-[[package]]
-name = "spawned-concurrency"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc21166874e8cd7584ea795c223303160461f0bb1b571bc23e92ca2abb7c5149"
-dependencies = [
- "futures",
- "pin-project-lite",
- "spawned-macros 0.5.0",
- "spawned-rt 0.5.0",
- "thiserror 2.0.18",
- "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6607,21 +6595,10 @@ dependencies = [
  "futures",
  "parking_lot",
  "pin-project-lite",
- "spawned-macros 0.8.0",
- "spawned-rt 0.8.0",
+ "spawned-macros",
+ "spawned-rt",
  "thiserror 2.0.18",
  "tracing",
-]
-
-[[package]]
-name = "spawned-macros"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d64742b41741dfebd5b5ba4dbc4cbc5cc91f4a2cf8107191007d64295682973"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
 ]
 
 [[package]]
@@ -6633,20 +6610,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "spawned-rt"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9e270e6606a118708120671f2d171316762fa832cab73699c714c23aaafe6eb"
-dependencies = [
- "ctrlc",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -6681,8 +6644,8 @@ version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f32ce1a2c27f0b648220a893d9f573f250d36d1c08f6d2b0dc55585f3e49ab04"
 dependencies = [
- "spawned-concurrency 0.8.0",
- "spawned-rt 0.8.0",
+ "spawned-concurrency",
+ "spawned-rt",
  "tracing",
 ]
 
@@ -6863,7 +6826,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7650,7 +7613,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
