@@ -800,4 +800,7 @@ signature, whichever way the node answered. Three departures:
   the gloas fork epoch on: the builder market works through proposer
   preferences there, and `produceBlockV4` keeps its self-build configuration.
   Validators with no fee recipient are not registered either (the field is
-  required), and only validators the beacon node resolved are signed for.
+  required), and only validators the beacon node resolved, pending or active,
+  are signed for: the flashbots relay refuses a whole batch over an exited or
+  withdrawn key, as Teku's validator client and Lighthouse's beacon node
+  account for.

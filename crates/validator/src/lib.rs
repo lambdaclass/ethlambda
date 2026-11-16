@@ -749,8 +749,9 @@ async fn propose<B: BeaconNodeApi + 'static>(
 /// Resolve any newly activated validators, refresh the duty schedule, and
 /// re-send subnet subscriptions if it moved.
 ///
-/// Returns the pubkeys the beacon node resolved to an index, which is who a
-/// builder registration is signed for: the node drops the rest anyway.
+/// Returns the pubkeys a builder registration is signed for: those the beacon
+/// node resolved to an index whose validator is pending or active (see
+/// [`is_registrable`]).
 async fn refresh_epoch<B: BeaconNodeApi>(
     beacon_node: &Arc<B>,
     duties: &mut DutiesService<B>,
@@ -835,7 +836,22 @@ async fn refresh_epoch<B: BeaconNodeApi>(
         subscriptions::subscribe(beacon_node, &duties.all(), store, context).await?;
     }
     metrics::set_beacon_node_available(true);
-    Ok(entries.iter().map(|entry| entry.pubkey).collect())
+    let registrable = entries.iter().filter(|entry| is_registrable(&entry.status));
+    Ok(registrable.map(|entry| entry.pubkey).collect())
+}
+
+/// Whether a validator whose Beacon API `status` is this one is sent a builder
+/// registration: one that is pending or active, not one that exited or was
+/// withdrawn.
+///
+/// The flashbots relay refuses a whole registration request over one key it
+/// does not know, and it knows only pending and active validators, so one
+/// exited key would cost every other in its batch of up to
+/// [`beacon_node::REGISTRATION_BATCH`]. Teku's validator client leaves exited
+/// keys out the same way, and Lighthouse's beacon node drops them before
+/// forwarding; a node that forwards as it gets would otherwise pass them on.
+fn is_registrable(status: &str) -> bool {
+    status.starts_with("pending") || status.starts_with("active")
 }
 
 /// Fetch the payload timeliness committee schedule for this epoch and the next,
@@ -1135,6 +1151,45 @@ mod tests {
             resolved.is_empty(),
             "the answer to 'resolve nothing' is nothing, not everything"
         );
+    }
+
+    /// Only pending and active validators get a builder registration: the
+    /// flashbots relay refuses a whole batch over one key it does not know, and
+    /// it knows no exited or withdrawn one. Proposer preparations still go to
+    /// every resolved validator.
+    #[tokio::test]
+    async fn only_pending_and_active_validators_are_registered() {
+        let mut node = node();
+        node.validators[1].status = "exited_unslashed".to_string();
+        node.validators.push(ValidatorEntry {
+            index: 33,
+            pubkey: pubkey(3),
+            status: "pending_queued".to_string(),
+        });
+        node.validators.push(ValidatorEntry {
+            index: 44,
+            pubkey: pubkey(4),
+            status: "withdrawal_done".to_string(),
+        });
+        let node = Arc::new(node);
+        let mut duties = DutiesService::new(node.clone(), Vec::new());
+        let keys = [pubkey(1), pubkey(2), pubkey(3), pubkey(4)];
+        let settings = settings(Some(H160([0xab; 20])));
+
+        let registered = refresh_epoch(
+            &node,
+            &mut duties,
+            &keys,
+            3,
+            &settings,
+            &empty_store(),
+            &context(),
+        )
+        .await
+        .expect("refreshes");
+
+        assert_eq!(registered, vec![pubkey(1), pubkey(3)]);
+        assert_eq!(node.preparations().len(), 4);
     }
 
     /// With nothing resolved there is nobody to register, and an empty array
