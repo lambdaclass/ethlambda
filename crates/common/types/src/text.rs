@@ -83,7 +83,7 @@ mod tests {
     /// backwards in a terminal, so it is written out like a control character.
     #[test]
     fn bidirectional_controls_are_written_out() {
-        // Each range's ends, and the two marks.
+        // Each range's ends, and the single marks.
         let text = "\u{61c}\u{200e}\u{200f}\u{202a}\u{202e}\u{2066}\u{2069}";
         assert_eq!(
             one_line(text, 1024),
