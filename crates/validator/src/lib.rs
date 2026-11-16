@@ -284,6 +284,13 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             settings.clone(),
         ))
     });
+    // Logged above when builder proposals are on.
+    if config.builder.is_none() && config.builder_min_bid > 0 {
+        info!(
+            min_bid_gwei = config.builder_min_bid,
+            "Builder proposals off; a pooled bid a gloas block falls back to must still reach the minimum bid"
+        );
+    }
 
     if let Some(address) = config.keymanager {
         let token = http_api::load_or_create_token(&config.validators_dir)?;

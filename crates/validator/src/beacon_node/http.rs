@@ -1424,8 +1424,8 @@ mod tests {
         );
     }
 
-    /// The body `produceBlockV4` requires: no minimum bid and no builders,
-    /// the boost factor being the configured one or `0`.
+    /// The body `produceBlockV4` requires: no builders, the boost factor
+    /// being the configured one or `0`, and the minimum bid as given.
     #[test]
     fn the_builder_config_carries_the_factor_or_zero_and_the_min_bid() {
         for (factor, expected) in [(None, "0"), (Some(250), "250"), (Some(0), "0")] {
