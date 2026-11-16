@@ -47,9 +47,10 @@ head trails the wall clock **and** its peers report a head ahead of it.
   `crates/net/api/src/sync.rs`, judged in
   `crates/blockchain/src/sync_status.rs`). The peers' head comes from `Status`
   (`crates/net/p2p/src/peer_heads.rs`): the highest of each connected peer's
-  latest report, re-requested every 2 slots, with a head past the wall clock by
-  more than a slot dropped and a head the node has already imported not counted
-  (the peer is not ahead of it, whatever its slot). The peer lead is smaller
+  latest report, re-requested every 2 slots and counted for 8 slots after it
+  arrives, with a head past the wall clock by more than a slot dropped and a
+  head the node has already imported not counted (the peer is not ahead of
+  it, whatever its slot). The peer lead is smaller
   than the clock lag because a report is up to 2 slots old: a node 5 slots
   behind a producing network sees its peers' 2-slot-old heads 2 slots ahead.
   With no report at all the node cannot be behind anyone and reads as synced,

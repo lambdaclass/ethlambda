@@ -687,7 +687,7 @@ fn sync_towards_peer(
 /// would fetch them all again.
 async fn handle_lean_status_response(server: &mut P2PServer, status: Status, peer: PeerId) {
     trace!(finalized_slot=%status.finalized.slot, head_slot=%status.head.slot, "Received status response from peer {peer}");
-    let refresh = server.peer_heads.take_refresh(&peer);
+    let refresh = server.peer_heads.answer_is_refresh(peer);
     let refresh_lead = refresh.then(|| peer_heads::thresholds(&server.store).peer_lead);
     on_lean_status(server, peer, &status, refresh_lead).await;
 }
@@ -1965,7 +1965,7 @@ async fn handle_status_response(
     status: BeaconStatus,
     ctx: &Context<P2PServer>,
 ) {
-    let refresh = server.peer_heads.take_refresh(&peer);
+    let refresh = server.peer_heads.answer_is_refresh(peer);
     let Some(wire) = server.wire.beacon() else {
         return;
     };
@@ -3378,14 +3378,16 @@ pub(crate) mod tests {
         let peer = connected_peer(&mut server);
         let lead = SyncThresholds::LEAN.peer_lead;
         let unknown = H256::repeat_byte(0x11);
+        let our_head = server.store.head().expect("head exists");
+        // The handshake's answer, level with us: every later one is to a
+        // refresh.
+        handle_lean_status_response(&mut server, lean_status_at(our_head, 0), peer).await;
 
-        server.peer_heads.begin_refresh(peer);
         handle_lean_status_response(&mut server, lean_status_at(unknown, lead), peer).await;
         assert!(server.range_sync_state.is_none());
         // The answer still counts towards the network head the gate reads.
         assert_eq!(server.store.network_head(), Some(lead));
 
-        server.peer_heads.begin_refresh(peer);
         handle_lean_status_response(&mut server, lean_status_at(unknown, lead + 1), peer).await;
         let state = server.range_sync_state.as_ref().expect("past the lead");
         assert_eq!(state.current_range, 1..(lead + 2));
@@ -3480,7 +3482,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn the_refresh_asks_one_slots_share_of_the_due_peers_and_marks_them() {
+    async fn the_refresh_asks_one_slots_share_of_the_due_peers() {
         let mut server = unconnected_server().await;
         let interval = SyncThresholds::LEAN.status_refresh_slots;
         let wall = crate::wall_clock_slot(&server.store);
@@ -3495,13 +3497,32 @@ pub(crate) mod tests {
 
         server.refresh_due_peer_statuses().await;
 
-        // Marked as refreshes, so their answers need the lead to start a sync,
-        // and no more of them than this slot's share.
-        let asked = peers
-            .iter()
-            .filter(|peer| server.peer_heads.take_refresh(peer))
-            .count();
-        assert_eq!(asked, peers.len().div_ceil(interval as usize));
+        // This slot's share was asked and counts as just exchanged; the rest
+        // are still due.
+        let share = peers.len().div_ceil(interval as usize);
+        let still_due = server
+            .peer_heads
+            .due_for_refresh(peers.iter().copied(), wall, interval);
+        assert_eq!(still_due.len(), peers.len() - share);
+    }
+
+    #[tokio::test]
+    async fn the_refresh_timer_ages_out_a_claim_nobody_repeats() {
+        let mut server = unconnected_server().await;
+        let peer = connected_peer(&mut server);
+        let wall = crate::wall_clock_slot(&server.store);
+        let lifetime = SyncThresholds::LEAN.report_lifetime();
+        server
+            .peer_heads
+            .record(peer, 100, wall - lifetime - 1, false);
+        // As published when the report arrived.
+        server
+            .store
+            .set_network_head(server.peer_heads.network_head());
+        assert_eq!(server.store.network_head(), Some(100));
+
+        server.refresh_due_peer_statuses().await;
+        assert_eq!(server.store.network_head(), None);
     }
 
     #[test]

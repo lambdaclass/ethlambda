@@ -2027,6 +2027,9 @@ impl P2PServer {
     /// every refresh.
     pub(crate) async fn refresh_due_peer_statuses(&mut self) {
         let wall_slot = wall_clock_slot(&self.store);
+        // Once a slot, the same cadence as the refresh: a report past its
+        // lifetime is no longer evidence of where the network is.
+        peer_heads::expire(self, wall_slot);
         let interval = peer_heads::thresholds(&self.store).status_refresh_slots;
         let peers = self.peer_heads.due_for_refresh(
             self.connected_peers.keys().copied(),
@@ -2038,7 +2041,6 @@ impl P2PServer {
         }
         let status = RefreshStatus::build(self);
         for peer in peers {
-            self.peer_heads.begin_refresh(peer);
             match &status {
                 RefreshStatus::Beacon(v2) => {
                     let version = self.peer_heads.status_version(&peer);

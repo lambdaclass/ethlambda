@@ -113,6 +113,16 @@ impl SyncThresholds {
         status_refresh_slots: SLOTS_PER_EPOCH / 2,
     };
 
+    /// Slots a peer's `Status` report counts towards the network head after
+    /// it arrived: four refresh intervals. That outlasts a refresh that times
+    /// out (libp2p's 10 s) and the one after it, so a peer that misses an
+    /// answer keeps its claim and a node behind it stays syncing, while a
+    /// peer that has stopped answering altogether loses it. Expiry can only
+    /// take a lead away.
+    pub const fn report_lifetime(&self) -> u64 {
+        4 * self.status_refresh_slots
+    }
+
     /// Whether a report as stale as the refresh allows still shows the lead
     /// of a node the clock says is behind: a node just past
     /// [`Self::clock_lag`] behind peers that are a slot behind the clock and

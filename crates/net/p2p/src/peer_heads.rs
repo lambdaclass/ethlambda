@@ -23,7 +23,9 @@
 //! epoch. The pace is per peer, counted from that peer's own last exchange,
 //! and no slot asks more than its share of the peers (see
 //! [`PeerHeads::due_for_refresh`]), so a node with hundreds of peers spreads
-//! the requests over the interval instead of sending them all at once.
+//! the requests over the interval instead of sending them all at once. A
+//! report counts for `SyncThresholds::report_lifetime` after it arrived, so a
+//! peer that stays connected but stops answering does not keep its claim.
 
 use std::collections::{HashMap, HashSet};
 
@@ -67,16 +69,28 @@ pub(crate) enum Report {
     Disconnected,
 }
 
+/// A peer's reported head, and the wall-clock slot the report arrived at.
+#[derive(Debug, Clone, Copy)]
+struct Claim {
+    head_slot: u64,
+    reported_at: u64,
+}
+
 /// Every connected peer's latest `Status` head, and the per-peer state of the
 /// `Status` exchange that keeps it fresh.
 #[derive(Debug, Default)]
 pub(crate) struct PeerHeads {
-    /// The head slot each peer last reported, while it stays connected and
-    /// the head is not one this node holds.
-    heads: HashMap<PeerId, u64>,
-    /// Peers whose outstanding `Status` request is a refresh rather than the
-    /// handshake; a refresh answer needs a larger lead to start a range sync.
-    refreshing: HashSet<PeerId>,
+    /// The head each peer last reported, while it stays connected, the head
+    /// is not one this node holds, and the report is not older than
+    /// `SyncThresholds::report_lifetime`.
+    heads: HashMap<PeerId, Claim>,
+    /// Peers that have answered a `Status` of ours on this connection. The
+    /// first answer is the handshake's, and every later one is a refresh's,
+    /// which needs a larger lead to start a range sync. Counted by answer
+    /// rather than marked per request, since a slow handshake answer can
+    /// arrive after the first refresh has gone out, and a mark per peer would
+    /// then swap the two.
+    answered: HashSet<PeerId>,
     /// The wall-clock slot of each connected peer's last `Status` exchange, in
     /// either direction: the last time it told us its head, or we asked.
     last_exchange: HashMap<PeerId, u64>,
@@ -111,14 +125,27 @@ impl PeerHeads {
             self.heads.remove(&peer);
             return Report::Held;
         }
-        self.heads.insert(peer, head_slot);
+        let claim = Claim {
+            head_slot,
+            reported_at: wall_slot,
+        };
+        self.heads.insert(peer, claim);
         Report::Counted
+    }
+
+    /// Drop every report older than `lifetime` slots at `wall_slot`. Returns
+    /// whether any was dropped.
+    pub(crate) fn expire(&mut self, wall_slot: u64, lifetime: u64) -> bool {
+        let before = self.heads.len();
+        self.heads
+            .retain(|_, claim| claim.reported_at.saturating_add(lifetime) >= wall_slot);
+        self.heads.len() != before
     }
 
     /// Forget a disconnected peer.
     pub(crate) fn forget(&mut self, peer: &PeerId) {
         self.heads.remove(peer);
-        self.refreshing.remove(peer);
+        self.answered.remove(peer);
         self.last_exchange.remove(peer);
         self.foreign_digest.remove(peer);
         self.status_versions.remove(peer);
@@ -127,7 +154,7 @@ impl PeerHeads {
     /// The network's head as the peers report it: the highest counted report,
     /// `None` with none at all.
     pub(crate) fn network_head(&self) -> Option<u64> {
-        self.heads.values().copied().max()
+        self.heads.values().map(|claim| claim.head_slot).max()
     }
 
     /// The connected peers to re-ask for their `Status` at `wall_slot`, at
@@ -167,14 +194,11 @@ impl PeerHeads {
             .collect()
     }
 
-    /// Note that the `Status` request about to go to `peer` is a refresh.
-    pub(crate) fn begin_refresh(&mut self, peer: PeerId) {
-        self.refreshing.insert(peer);
-    }
-
-    /// Whether `peer`'s `Status` answer is to a refresh, clearing the mark.
-    pub(crate) fn take_refresh(&mut self, peer: &PeerId) -> bool {
-        self.refreshing.remove(peer)
+    /// Note an answer from `peer` to a `Status` of ours, returning whether it
+    /// is a refresh's: every answer on a connection after the first, which
+    /// is the handshake's.
+    pub(crate) fn answer_is_refresh(&mut self, peer: PeerId) -> bool {
+        !self.answered.insert(peer)
     }
 
     /// Note whether `peer`'s latest beacon `Status` came from a fork digest
@@ -238,6 +262,15 @@ pub(crate) fn observe(
     }
     publish(server);
     report
+}
+
+/// Drop the reports older than `SyncThresholds::report_lifetime` at
+/// `wall_slot`, republishing the network head if any was.
+pub(crate) fn expire(server: &mut P2PServer, wall_slot: u64) {
+    let lifetime = thresholds(&server.store).report_lifetime();
+    if server.peer_heads.expire(wall_slot, lifetime) {
+        publish(server);
+    }
 }
 
 /// Forget a disconnected peer's head and republish the network head.
@@ -332,12 +365,14 @@ mod tests {
         let mut heads = PeerHeads::default();
         let peer = PeerId::random();
         heads.record(peer, 100, 100, false);
-        heads.begin_refresh(peer);
+        assert!(!heads.answer_is_refresh(peer));
         heads.note_digest(peer, false);
         heads.note_status_version(peer, StatusVersion::V2);
         heads.forget(&peer);
         assert_eq!(heads.network_head(), None);
-        assert!(!heads.take_refresh(&peer));
+        // The next connection's first answer is its handshake's again.
+        assert!(!heads.answer_is_refresh(peer));
+        heads.forget(&peer);
         assert_eq!(heads.status_version(&peer), StatusVersion::V1);
         // A reconnect on a foreign digest is news again.
         assert!(heads.note_digest(peer, false));
@@ -416,11 +451,35 @@ mod tests {
     }
 
     #[test]
-    fn a_refresh_mark_is_taken_once() {
+    fn only_the_first_answer_on_a_connection_is_the_handshakes() {
+        // Finding: a mark per peer swapped the two when a slow handshake
+        // answer arrived after the first refresh had gone out, so the refresh
+        // answer started a one-block range sync that raced gossip.
         let mut heads = PeerHeads::default();
         let peer = PeerId::random();
-        heads.begin_refresh(peer);
-        assert!(heads.take_refresh(&peer));
-        assert!(!heads.take_refresh(&peer));
+        assert!(!heads.answer_is_refresh(peer));
+        assert!(heads.answer_is_refresh(peer));
+        assert!(heads.answer_is_refresh(peer));
+    }
+
+    #[test]
+    fn a_report_counts_for_its_lifetime_and_no_longer() {
+        // Finding: a connected peer that stopped answering kept its last
+        // head in the network head for as long as it stayed connected.
+        let lifetime = SyncThresholds::LEAN.report_lifetime();
+        let refresh = SyncThresholds::LEAN.status_refresh_slots;
+        let mut heads = PeerHeads::default();
+        let peer = PeerId::random();
+        heads.record(peer, 100, 100, false);
+        // A refresh that times out (10 s, under 3 lean slots) and the one
+        // after it come and go before the claim does.
+        assert!(!heads.expire(100 + 2 * refresh + 3, lifetime));
+        assert!(!heads.expire(100 + lifetime, lifetime));
+        assert_eq!(heads.network_head(), Some(100));
+        assert!(heads.expire(100 + lifetime + 1, lifetime));
+        assert_eq!(heads.network_head(), None);
+        // A fresh report counts again.
+        heads.record(peer, 120, 120, false);
+        assert_eq!(heads.network_head(), Some(120));
     }
 }
