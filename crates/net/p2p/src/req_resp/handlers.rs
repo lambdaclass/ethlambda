@@ -126,7 +126,7 @@ pub async fn handle_req_resp_message(
                             kind = "beacon_status_request",
                             peer_count, "P2P message received"
                         );
-                        handle_status_request(server, peer, peer_status, channel).await;
+                        handle_status_request(server, peer, peer_status, channel, ctx).await;
                     }
                     Request::Ping(ping) => {
                         trace!(kind = "beacon_ping", peer_count, "P2P message received");
@@ -604,9 +604,77 @@ async fn handle_lean_status_request(
     peer: PeerId,
 ) {
     trace!(finalized_slot=%request.finalized.slot, head_slot=%request.head.slot, "Received status request from peer {peer}");
-    peer_heads::observe(server, peer, request.head.slot, request.head.root);
     let our_status = build_status(&server.store);
     respond(server, channel, ResponsePayload::LeanStatus(our_status));
+
+    // A peer's `Status` request tells us its head as surely as its answer to
+    // ours does, and it postpones our own refresh to that peer (see
+    // `PeerHeads::due_for_refresh`). Between two nodes whose refresh timers
+    // fire at different points in the slot, one of them only ever receives
+    // requests, so a request that shows a lead has to be able to start the
+    // sync too. Lighthouse does the same: both go through `process_status`.
+    // Held to a refresh answer's lead, since it arrives as often as one.
+    let refresh_lead = Some(peer_heads::thresholds(&server.store).peer_lead);
+    on_lean_status(server, peer, &request, refresh_lead).await;
+}
+
+/// Record a lean peer's `Status`, whether its request or its answer to ours,
+/// and start or extend a range sync when it leaves this node behind (see
+/// [`status_sync_target`] for `refresh_lead`).
+async fn on_lean_status(
+    server: &mut P2PServer,
+    peer: PeerId,
+    status: &Status,
+    refresh_lead: Option<u64>,
+) {
+    // A head this node already imported leaves nothing to fetch from this
+    // peer, and one past the clock or from a peer already gone is not synced
+    // towards at all.
+    if peer_heads::observe(server, peer, status.head.slot, status.head.root) != Report::Counted {
+        return;
+    }
+    let our_head_slot = server.store.head_slot();
+    if sync_towards_peer(server, peer, status.head.slot, our_head_slot, refresh_lead) {
+        request_next_range_batch(server).await;
+        trace!(%peer, "Long-range sync: using BlocksByRange");
+    }
+}
+
+/// Start a range sync towards `peer`'s advertised head, or extend the running
+/// one, when [`status_sync_target`] says its `Status` leaves this node behind.
+/// Returns whether it did, for the caller to send the next batch over its own
+/// chain's protocol. A batch already in flight stays the only one: the next
+/// goes out when it completes.
+fn sync_towards_peer(
+    server: &mut P2PServer,
+    peer: PeerId,
+    peer_head_slot: u64,
+    head_slot: u64,
+    refresh_lead: Option<u64>,
+) -> bool {
+    let fetched_through = server.range_fetched_through;
+    let Some(target_range) =
+        status_sync_target(fetched_through, head_slot, peer_head_slot, refresh_lead)
+    else {
+        return false;
+    };
+    debug!(
+        %peer,
+        peer_head_slot,
+        head_slot,
+        fetched_through,
+        start_slot = target_range.start,
+        end_exclusive = target_range.end,
+        "Peer status head is ahead of what has been fetched"
+    );
+    let end_exclusive = target_range.end;
+    match &mut server.range_sync_state {
+        Some(state) => state.merge_peer(peer, peer_head_slot, end_exclusive),
+        None => {
+            server.range_sync_state = Some(RangeSyncState::new(target_range, peer, peer_head_slot));
+        }
+    }
+    true
 }
 
 /// Record the peer's answer to our `Status`, and start or extend range sync
@@ -620,43 +688,8 @@ async fn handle_lean_status_request(
 async fn handle_lean_status_response(server: &mut P2PServer, status: Status, peer: PeerId) {
     trace!(finalized_slot=%status.finalized.slot, head_slot=%status.head.slot, "Received status response from peer {peer}");
     let refresh = server.peer_heads.take_refresh(&peer);
-    // A head this node already imported leaves nothing to fetch from this peer.
-    if peer_heads::observe(server, peer, status.head.slot, status.head.root) == Report::Held {
-        return;
-    }
-
-    let our_head_slot = server.store.head_slot();
     let refresh_lead = refresh.then(|| peer_heads::thresholds(&server.store).peer_lead);
-    let Some(target_range) = status_sync_target(
-        server.range_fetched_through,
-        our_head_slot,
-        status.head.slot,
-        refresh_lead,
-    ) else {
-        return;
-    };
-    debug!(
-        %peer,
-        peer_head_slot = status.head.slot,
-        local_head_slot = our_head_slot,
-        fetched_through = server.range_fetched_through,
-        start_slot = target_range.start,
-        end_exclusive = target_range.end,
-        "Peer status head is ahead of what has been fetched"
-    );
-
-    let start_slot = target_range.start;
-    let end_exclusive = target_range.end;
-    match &mut server.range_sync_state {
-        Some(state) => state.merge_peer(peer, status.head.slot, end_exclusive),
-        None => {
-            server.range_sync_state =
-                Some(RangeSyncState::new(target_range, peer, status.head.slot));
-        }
-    }
-
-    request_next_range_batch(server).await;
-    trace!(%peer, start_slot, end_exclusive, "Long-range sync: using BlocksByRange");
+    on_lean_status(server, peer, &status, refresh_lead).await;
 }
 
 async fn handle_lean_blocks_by_root_request(
@@ -1723,6 +1756,7 @@ async fn handle_status_request(
     peer: PeerId,
     peer_status: BeaconStatus,
     channel: ResponseChannel<Response>,
+    ctx: &Context<P2PServer>,
 ) {
     if server.wire.beacon().is_none() {
         warn!(%peer, "Beacon request arrived on a lean node; refusing");
@@ -1748,6 +1782,7 @@ async fn handle_status_request(
     server
         .peer_heads
         .note_status_version(peer, StatusVersion::of(&peer_status));
+    let mut counted = false;
     if !held {
         // Not grounds for closing the stream: the peer told us who it is and we
         // answer honestly. Counting it is how a digest that has moved under us
@@ -1773,18 +1808,37 @@ async fn handle_status_request(
             "Beacon status received"
         );
         if syncable {
-            peer_heads::observe(
+            let report = peer_heads::observe(
                 server,
                 peer,
                 peer_status.head_slot(),
                 peer_status.head_root(),
             );
+            counted = report == Report::Counted;
         }
     }
     let wire = server.wire.beacon().expect("checked above");
     let our_status =
         beacon_handler::build_status(&server.store, wire, StatusVersion::of(&peer_status));
     respond(server, channel, ResponsePayload::Status(our_status));
+
+    // As on lean (see `handle_lean_status_request`), a request that shows a
+    // lead starts the sync the way a refresh answer does.
+    if !counted {
+        return;
+    }
+    let head_slot = server.store.beacon_head().map_or(0, |(slot, _)| slot);
+    let refresh_lead = Some(peer_heads::thresholds(&server.store).peer_lead);
+    if sync_towards_peer(
+        server,
+        peer,
+        peer_status.head_slot(),
+        head_slot,
+        refresh_lead,
+    ) {
+        request_next_beacon_range_batch(server, ctx).await;
+        trace!(%peer, "Beacon long-range sync: using BeaconBlocksByRange");
+    }
 }
 
 /// Answer `ping/1` with our metadata sequence number.
@@ -1871,16 +1925,18 @@ fn range_sync_target(
     Some(start_slot..end_exclusive)
 }
 
-/// The range a peer's `Status` answer should start or extend a range sync
-/// over, on either chain: [`range_sync_target`], unless the answer is to a
-/// *refresh* (`refresh_lead` is then `SyncThresholds::peer_lead`) and leads
-/// what this node has fetched by no more than that.
+/// The range a peer's `Status` should start or extend a range sync over, on
+/// either chain: [`range_sync_target`], unless the `Status` is an answer to a
+/// *refresh* or the peer's own request (`refresh_lead` is then
+/// `SyncThresholds::peer_lead`) and leads what this node has fetched by no
+/// more than that.
 ///
-/// A handshake answer starts a range sync at any lead, as it always has. A
-/// refresh lands every few slots on a node that is keeping up with gossip,
-/// where a peer a slot ahead is ordinary and a one-block range request would
-/// only race gossip; past the lead the sync gate reads as behind, the refresh
-/// is what notices, and nothing else would start the sync.
+/// A handshake answer starts a range sync at any lead, as it always has.
+/// Refreshes and requests land every few slots on a node that is keeping up
+/// with gossip, where a peer a slot ahead is ordinary and a one-block range
+/// request would only race gossip; past the lead the sync gate reads as
+/// behind, and one of the two is what notices, since nothing else would
+/// start the sync.
 fn status_sync_target(
     fetched_through: u64,
     head_slot: u64,
@@ -1959,44 +2015,18 @@ async fn handle_status_response(
         "Beacon handshake complete"
     );
     // A head this node already imported leaves nothing to fetch from this
-    // peer, and saves the head decode below: on a node keeping up, that is
-    // nearly every refresh answer.
-    if peer_heads::observe(server, peer, peer_head_slot, status.head_root()) == Report::Held {
+    // peer (on a node keeping up, that is nearly every refresh answer), and
+    // one past the clock or from a peer already gone is not synced towards.
+    if peer_heads::observe(server, peer, peer_head_slot, status.head_root()) != Report::Counted {
         return;
     }
 
-    // A whole-block decode, the same one `build_status` pays to send ours.
     let head_slot = server.store.beacon_head().map_or(0, |(slot, _)| slot);
     let refresh_lead = refresh.then(|| peer_heads::thresholds(&server.store).peer_lead);
-    let Some(target_range) = status_sync_target(
-        server.range_fetched_through,
-        head_slot,
-        peer_head_slot,
-        refresh_lead,
-    ) else {
-        return;
-    };
-
-    debug!(
-        %peer,
-        peer_head_slot,
-        fetched_through = server.range_fetched_through,
-        head_slot,
-        start_slot = target_range.start,
-        end_exclusive = target_range.end,
-        "Beacon peer status head is ahead of what has been fetched"
-    );
-
-    let end_exclusive = target_range.end;
-    match &mut server.range_sync_state {
-        Some(state) => state.merge_peer(peer, peer_head_slot, end_exclusive),
-        None => {
-            server.range_sync_state = Some(RangeSyncState::new(target_range, peer, peer_head_slot));
-        }
+    if sync_towards_peer(server, peer, peer_head_slot, head_slot, refresh_lead) {
+        request_next_beacon_range_batch(server, ctx).await;
+        trace!(%peer, "Beacon long-range sync: using BeaconBlocksByRange");
     }
-
-    request_next_beacon_range_batch(server, ctx).await;
-    trace!(%peer, "Beacon long-range sync: using BeaconBlocksByRange");
 }
 
 /// Record a pong. Nothing is driven off one yet.
@@ -3332,10 +3362,20 @@ pub(crate) mod tests {
         }
     }
 
+    /// A peer this server counts as connected, which is what lets its
+    /// `Status` count.
+    fn connected_peer(server: &mut P2PServer) -> PeerId {
+        let peer = PeerId::random();
+        server
+            .connected_peers
+            .insert(peer, ConnectionDirection::Inbound);
+        peer
+    }
+
     #[tokio::test]
     async fn a_lean_refresh_answer_starts_range_sync_only_past_the_lead() {
         let mut server = unconnected_server().await;
-        let peer = PeerId::random();
+        let peer = connected_peer(&mut server);
         let lead = SyncThresholds::LEAN.peer_lead;
         let unknown = H256::repeat_byte(0x11);
 
@@ -3356,7 +3396,7 @@ pub(crate) mod tests {
         // Finding: lean had no fetched-through watermark, so every answer
         // during a catch-up re-requested blocks still queued for import.
         let mut server = unconnected_server().await;
-        let peer = PeerId::random();
+        let peer = connected_peer(&mut server);
         let unknown = H256::repeat_byte(0x11);
         server.range_fetched_through = 2000;
 
@@ -3377,10 +3417,64 @@ pub(crate) mod tests {
         // under any slot it likes) is not ahead of us, so it neither moves the
         // network head nor starts a range sync.
         let mut server = unconnected_server().await;
-        let peer = PeerId::random();
+        let peer = connected_peer(&mut server);
         let our_head = server.store.head().expect("head exists");
 
         handle_lean_status_response(&mut server, lean_status_at(our_head, 50), peer).await;
+        assert!(server.range_sync_state.is_none());
+        assert_eq!(server.store.network_head(), None);
+    }
+
+    #[tokio::test]
+    async fn a_lean_status_request_past_the_lead_starts_range_sync() {
+        // Finding: a request postpones our own refresh to its sender, so
+        // between two nodes one may only ever receive requests. The request's
+        // head starts the sync, held to a refresh answer's lead (the lead the
+        // request handler passes).
+        let mut server = unconnected_server().await;
+        let peer = connected_peer(&mut server);
+        let lead = SyncThresholds::LEAN.peer_lead;
+        let unknown = H256::repeat_byte(0x11);
+
+        on_lean_status(
+            &mut server,
+            peer,
+            &lean_status_at(unknown, lead),
+            Some(lead),
+        )
+        .await;
+        assert!(server.range_sync_state.is_none());
+
+        on_lean_status(&mut server, peer, &lean_status_at(unknown, 500), Some(lead)).await;
+        let state = server.range_sync_state.as_ref().expect("past the lead");
+        assert_eq!(state.current_range, 1..501);
+        assert!(state.in_flight, "the first batch goes out at once");
+    }
+
+    #[tokio::test]
+    async fn a_head_past_the_clock_starts_no_range_sync() {
+        // Finding: a head past the clock was left out of the network head but
+        // still merged into the range sync, where `next_batch` prefers the
+        // highest head, so the liar got the next batch on every refresh.
+        let mut server = unconnected_server().await;
+        let peer = connected_peer(&mut server);
+        let future = crate::wall_clock_slot(&server.store) + 100;
+        let unknown = H256::repeat_byte(0x11);
+
+        handle_lean_status_response(&mut server, lean_status_at(unknown, future), peer).await;
+        assert!(server.range_sync_state.is_none());
+        assert_eq!(server.store.network_head(), None);
+    }
+
+    #[tokio::test]
+    async fn a_status_from_a_peer_no_longer_connected_is_ignored() {
+        // Finding: a `Status` handled after its sender's disconnect left a
+        // head that `forget` had already run for, so nothing removed it.
+        let mut server = unconnected_server().await;
+        let gone = PeerId::random();
+        let unknown = H256::repeat_byte(0x11);
+
+        handle_lean_status_response(&mut server, lean_status_at(unknown, 500), gone).await;
         assert!(server.range_sync_state.is_none());
         assert_eq!(server.store.network_head(), None);
     }

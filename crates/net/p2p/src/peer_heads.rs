@@ -62,6 +62,9 @@ pub(crate) enum Report {
     Held,
     /// Past the wall clock: dropped, along with the peer's earlier report.
     Future,
+    /// From a peer that is no longer connected: a `Status` handled after its
+    /// disconnect, whose head [`forget`] would never clear.
+    Disconnected,
 }
 
 /// Every connected peer's latest `Status` head, and the per-peer state of the
@@ -211,14 +214,17 @@ fn holds_block(store: &Store, root: &H256) -> bool {
 }
 
 /// Record the head `peer` reported in a `Status` (request or answer) and
-/// republish the network head. Returns what became of it, so an answer whose
-/// head this node already holds can skip looking for a range to sync.
+/// republish the network head. Returns what became of it: only a
+/// [`Report::Counted`] head is worth looking for a range to sync towards.
 pub(crate) fn observe(
     server: &mut P2PServer,
     peer: PeerId,
     head_slot: u64,
     head_root: H256,
 ) -> Report {
+    if !server.connected_peers.contains_key(&peer) {
+        return Report::Disconnected;
+    }
     let wall_slot = crate::wall_clock_slot(&server.store);
     let held = holds_block(&server.store, &head_root);
     let report = server.peer_heads.record(peer, head_slot, wall_slot, held);

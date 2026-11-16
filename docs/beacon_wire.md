@@ -761,9 +761,13 @@ reported at the handshake does not go stale for the sync gate (see
 `crates/net/p2p/src/peer_heads.rs`). An answer to that refresh starts a range
 sync only when it leads the same floor by more than an epoch
 (`status_sync_target`): a node keeping up with gossip sees peers a slot ahead
-all the time, and a one-block range request would only race gossip. An answer
-naming a head this node has already imported starts nothing, and skips the head
-decode the comparison would cost.
+all the time, and a one-block range request would only race gossip. A peer's
+own `Status` request is held to the same lead and can start one too, as in
+Lighthouse, where requests and answers both go through `process_status`: a
+request postpones this node's refresh to that peer, so a peer that always asks
+first would otherwise never be synced from. A `Status` naming a head this node
+has already imported, a head past the clock, or coming from a peer no longer
+connected starts nothing.
 
 `Status` is store-derived: head from `Store::beacon_head`, the finalized
 checkpoint from `Store::beacon_finalized_checkpoint`, and

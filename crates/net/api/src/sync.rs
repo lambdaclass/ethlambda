@@ -41,11 +41,12 @@ pub struct SyncThresholds {
     pub clock_lag: u64,
     /// Slots the peers' head must lead ours before the node can be syncing.
     ///
-    /// Also how far ahead a peer answering a `Status` *refresh* must be
-    /// before its answer starts a range sync. A handshake answer starts one
-    /// at any lead, but a refresh lands every few slots on a node that is
-    /// keeping up with gossip, where a peer a slot ahead is ordinary and a
-    /// one-block range request would only race gossip.
+    /// Also how far ahead a peer must be before its answer to a `Status`
+    /// *refresh*, or its own `Status` request, starts a range sync. A
+    /// handshake answer starts one at any lead, but refreshes and requests
+    /// land every few slots on a node that is keeping up with gossip, where a
+    /// peer a slot ahead is ordinary and a one-block range request would only
+    /// race gossip.
     pub peer_lead: u64,
     /// Recovery band: once syncing, the node reports synced again only when
     /// the clock lag or the peer lead drops this many slots below its
