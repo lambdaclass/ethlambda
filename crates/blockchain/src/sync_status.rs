@@ -68,12 +68,18 @@ pub(crate) struct SyncStatusTracker {
     /// Added up rather than measured from when the node last fell behind: a
     /// claim that lapses for a moment (a peer reporting a block this node
     /// holds, a reconnect) would otherwise restart the window, and a peer
-    /// doing that every few slots could keep the node idle indefinitely.
+    /// doing that every few slots could keep the node idle indefinitely. A
+    /// stretch behind counts in full; a slot reached after a lapse counts
+    /// once, so a lapse at every slot boundary pauses nothing.
     behind_for: u64,
-    /// The wall-clock slot of the last judgment, while that judgment found the
-    /// node behind on its peers' word: the start of the stretch the next one
-    /// adds to [`Self::behind_for`].
-    behind_at: Option<u64>,
+    /// The wall-clock slot of the last judgment that found the node behind on
+    /// its peers' word, already counted into [`Self::behind_for`].
+    counted_at: Option<u64>,
+    /// The wall-clock slot from which no judgment has found the node behind
+    /// on its peers' word, while that lasts. A lapse longer than the stall
+    /// window (an outage, peers that stopped claiming) ends the count: the
+    /// next claim gets a window of its own.
+    lapsed_at: Option<u64>,
     /// The head slot at which a peer-reported lead was given up on for making
     /// no progress (see [`SyncThresholds::stall_window`]). Holds the node
     /// synced until the head moves past it: the peers that claimed the lead
@@ -91,7 +97,8 @@ impl SyncStatusTracker {
             thresholds,
             progress_head: None,
             behind_for: 0,
-            behind_at: None,
+            counted_at: None,
+            lapsed_at: None,
             stalled_at_head: None,
         }
     }
@@ -144,7 +151,8 @@ impl SyncStatusTracker {
         if head_slot > progress_head {
             self.progress_head = Some(head_slot);
             self.behind_for = 0;
-            self.behind_at = None;
+            self.counted_at = None;
+            self.lapsed_at = None;
         } else if head_slot < progress_head {
             // The head moved back (an `INVALID` execution verdict cutting a
             // branch out): progress is measured from where it now is, or the
@@ -182,12 +190,21 @@ impl SyncStatusTracker {
         // can fail to deliver.
         let on_peers_word = behind && !network_at_clock;
         if on_peers_word {
-            if let Some(since) = self.behind_at {
-                self.behind_for += current_slot.saturating_sub(since);
-            }
-            self.behind_at = Some(current_slot);
+            self.behind_for = match (self.counted_at, self.lapsed_at.take()) {
+                // Behind since the last judgment: the whole stretch counts.
+                (Some(counted), None) => self.behind_for + current_slot.saturating_sub(counted),
+                // Back after a lapse longer than the window: a new claim,
+                // with a window of its own.
+                (_, Some(lapsed)) if current_slot.saturating_sub(lapsed) > stall_window => 0,
+                // Back after a shorter lapse: this slot counts once, however
+                // many judgments it has.
+                (Some(counted), Some(_)) => self.behind_for + u64::from(current_slot != counted),
+                // Behind for the first time since the head advanced.
+                (None, _) => self.behind_for,
+            };
+            self.counted_at = Some(current_slot);
         } else {
-            self.behind_at = None;
+            self.lapsed_at.get_or_insert(current_slot);
         }
 
         // The backstop: behind on the peers' word for a whole window, all of
@@ -501,6 +518,70 @@ mod tests {
         // Given up on, the claim is not believed again while the head is flat.
         let next = give_up_by + 1;
         assert_eq!(tracker.update(next, 50, Some(next)), SyncStatus::Synced);
+    }
+
+    #[test]
+    fn a_lead_that_lapses_at_every_slot_boundary_still_runs_out() {
+        // Finding: a lapse discarded the stretch on either side of it, so a
+        // claim dropped just before each slot's first judgment and made again
+        // before its second kept the count at zero. Lean is judged several
+        // times a slot, and only some of those judgments gate duties.
+        let mut tracker = steady_lean();
+        assert_eq!(tracker.update(100, 50, Some(100)), SyncStatus::Syncing);
+        let mut gave_up_at = None;
+        for current in 101..=100 + 2 * LEAN.stall_window {
+            tracker.update(current, 50, Some(50));
+            if tracker.update(current, 50, Some(current)) == SyncStatus::Synced {
+                gave_up_at.get_or_insert(current);
+            }
+        }
+        assert_eq!(gave_up_at, Some(101 + LEAN.stall_window));
+
+        // Beacon is judged about once a slot: a claim made every other slot
+        // stretches the window to twice its length, no more.
+        let mut tracker = steady(BEACON);
+        assert_eq!(tracker.update(1_000, 900, Some(1_000)), SyncStatus::Syncing);
+        let mut gave_up_at = None;
+        for current in 1_001..=1_000 + 3 * BEACON.stall_window {
+            let claim = (current % 2 == 1).then_some(current);
+            let status = tracker.update(current, 900, claim.or(Some(900)));
+            if claim.is_some() && status == SyncStatus::Synced {
+                gave_up_at.get_or_insert(current);
+            }
+        }
+        let gave_up_at = gave_up_at.expect("the window ran out");
+        assert!(
+            gave_up_at <= 1_002 + 2 * BEACON.stall_window,
+            "{gave_up_at}"
+        );
+    }
+
+    #[test]
+    fn a_claim_back_after_a_long_lapse_gets_a_whole_window() {
+        // Finding: time counted before an outage carried over, so a node that
+        // reconnected after hours gave up on its peers' lead a slot later,
+        // before its first range batch could land.
+        let mut tracker = steady_lean();
+        assert_eq!(tracker.update(100, 50, Some(100)), SyncStatus::Syncing);
+        for current in 101..=110 {
+            assert_eq!(
+                tracker.update(current, 50, Some(current)),
+                SyncStatus::Syncing
+            );
+        }
+        // Cut off, head flat, for far longer than a window.
+        assert_eq!(tracker.update(111, 50, None), SyncStatus::Synced);
+        assert_eq!(tracker.update(300, 50, None), SyncStatus::Synced);
+        let back = 301;
+        for current in back..=back + LEAN.stall_window {
+            assert_eq!(
+                tracker.update(current, 50, Some(current)),
+                SyncStatus::Syncing,
+                "slot {current}"
+            );
+        }
+        let past = back + LEAN.stall_window + 1;
+        assert_eq!(tracker.update(past, 50, Some(past)), SyncStatus::Synced);
     }
 
     #[test]

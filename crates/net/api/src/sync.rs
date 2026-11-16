@@ -52,13 +52,15 @@ pub struct SyncThresholds {
     /// the clock lag or the peer lead drops this many slots below its
     /// threshold, so the status does not flap at the boundary. The lead's
     /// threshold never drops below one slot, since a peer one slot ahead is
-    /// ordinary propagation.
+    /// ordinary propagation, so on lean (a lead threshold of one) the band
+    /// applies to the clock lag alone.
     pub hysteresis: u64,
     /// Slots the node may read as syncing on a peer-reported lead without its
     /// head advancing, before it treats the network as stalled after all.
-    /// Added up over every stretch spent behind on the peers' word since the
+    /// Added up over every slot spent behind on the peers' word since the
     /// head last advanced, so a lead that lapses for a moment does not start
-    /// the count over.
+    /// the count over; a lead absent for longer than the window (an outage)
+    /// does, and the next claim gets a window of its own.
     ///
     /// A peer that claims a head it does not serve (an empty answer, invalid
     /// blocks, no answer) would otherwise keep a node that is behind the

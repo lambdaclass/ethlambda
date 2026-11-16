@@ -42,8 +42,8 @@ head trails the wall clock **and** its peers report a head ahead of it.
   node 100 slots behind with nothing newer imported, which does its duties.
 - **ethlambda:** the node is syncing when its head is more than 4 slots behind
   the wall clock and the head its peers report is more than 1 slot ahead of its
-  own, with the same band of 2 on both, though the lead's threshold never
-  drops below 1 slot (`SyncThresholds::LEAN`,
+  own, with a band of 2 on the clock lag (the band never takes the lead's
+  threshold below 1 slot, so the lead gets none) (`SyncThresholds::LEAN`,
   `crates/net/api/src/sync.rs`, judged in
   `crates/blockchain/src/sync_status.rs`). The peers' head comes from `Status`
   (`crates/net/p2p/src/peer_heads.rs`): the highest of each connected peer's
@@ -64,8 +64,11 @@ head trails the wall clock **and** its peers report a head ahead of it.
   node that has read as syncing on its peers' word for 16 slots in all
   (`SyncThresholds::stall_window`) with its head flat throughout treats the
   network as stalled and does its duties, until its head next advances. The
-  slots are added up rather than counted from when the node last fell behind,
-  so a lead that lapses for a moment does not restart the window. A peer that
+  slots are added up rather than counted from when the node last fell behind:
+  each slot spent behind counts once, and a lead that lapses for less than the
+  window pauses the count rather than restarting it. A lead absent for longer
+  than that (an outage) ends the count, and the next claim gets a whole
+  window. A peer that
   claims a head it does not serve (an empty answer, invalid blocks, no answer
   at all) therefore costs at most that window, not the rest of a network
   stall. The window is sized above
