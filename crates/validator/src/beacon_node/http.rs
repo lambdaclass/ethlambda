@@ -811,13 +811,15 @@ impl BeaconNodeApi for HttpBeaconNode {
     /// ([`CONNECT_TIMEOUT`]); reqwest reports the latter as both a connect
     /// error and a timeout, and the connect check comes first.
     ///
-    /// The status alone cannot always tell, and two edges are knowingly read
-    /// the wrong way. Some of ethlambda's own 500s are definite (no builder
-    /// configured, the blinded block failing the node's checks) and are read as
-    /// unconfirmed. A 503 from a proxy that had already forwarded the request
-    /// is read as definite. Neither changes what happens next: nothing is
-    /// retried and nothing is signed again either way. Only the log line and
-    /// the counter it lands on are wrong.
+    /// The status alone cannot always tell, and three edges are knowingly
+    /// read the wrong way. Some of ethlambda's own 500s are definite (no
+    /// builder configured, the blinded block failing the node's checks) and
+    /// are read as unconfirmed. A pooled connection the node had already
+    /// closed fails without the request being written, but is not a connect
+    /// error, so it is read as unconfirmed too. A 503 from a proxy that had
+    /// already forwarded the request is read as definite. None changes what
+    /// happens next: nothing is retried and nothing is signed again either
+    /// way. Only the log line and the counter it lands on are wrong.
     async fn publish_blinded_block(
         &self,
         // For the fallback, which picks the node that produced this block;
@@ -1536,6 +1538,15 @@ mod tests {
         let decoded: Vec<SignedValidatorRegistrationV1> =
             serde_json::from_slice(&seen[0].1).expect("the body is the JSON a relay takes");
         assert_eq!(decoded, registrations);
+        // The integers as quoted decimal strings, which builder-specs requires
+        // and other clients' nodes insist on: a round trip through the same
+        // serde impl would pass with bare numbers too.
+        let raw: serde_json::Value = serde_json::from_slice(&seen[0].1).expect("json");
+        let message = &raw[0]["message"];
+        assert_eq!(message["gas_limit"], "36000000");
+        assert_eq!(message["timestamp"], "1700000000");
+        let fee_recipient = format!("0x{}", "ab".repeat(20));
+        assert_eq!(message["fee_recipient"], fee_recipient.as_str());
     }
 
     #[tokio::test]

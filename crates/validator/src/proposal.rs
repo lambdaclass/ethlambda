@@ -728,8 +728,15 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
                 crate::metrics::inc_blocks_broadcast_not_imported();
             }
             // `publish_block` never answers with this: a blinded block goes
-            // through `publish_blinded_block`.
-            Published::HandedToBuilder => {}
+            // through `publish_blinded_block`. Reported rather than assumed
+            // away, as `blinded_outcome` reports a full block's outcome.
+            Published::HandedToBuilder => warn!(
+                %slot,
+                validator,
+                ?published,
+                "Beacon node API answered a block publish with an outcome that belongs to \
+                 another call"
+            ),
         }
         Ok(published)
     }

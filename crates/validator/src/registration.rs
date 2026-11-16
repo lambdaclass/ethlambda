@@ -531,7 +531,15 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
             .register_validators_in_batches(registrations)
             .await;
         let mut failed = HashSet::new();
-        for (batch, outcome) in registrations.chunks(REGISTRATION_BATCH).zip(outcomes) {
+        // A batch with no outcome counts as refused rather than delivered.
+        let mut outcomes = outcomes.into_iter();
+        for batch in registrations.chunks(REGISTRATION_BATCH) {
+            let outcome = outcomes.next().unwrap_or_else(|| {
+                let detail = "the beacon node gave no outcome for this batch";
+                Err(crate::error::Error::InconsistentResponse(
+                    detail.to_string(),
+                ))
+            });
             let count = batch.len();
             // Only logged and counted: see "Failures are never propagated".
             let refused = outcome
