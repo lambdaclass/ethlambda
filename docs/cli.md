@@ -341,14 +341,19 @@ endpoint, whose dependent root the preferences must carry, and publishes each
 as first signed to all of them again each slot until then, and again after a
 reorg changes the root. After that it sends each one, as first signed, once
 more every epoch while its slot is ahead, at the epoch's second-to-last slot
-(or its last, if a slow node made the client skip that poll), since a
-node that restarts loses what it accepted; a node restarted mid-epoch thus
-lacks the rest of that epoch's, and has the next epoch's from its first slot,
-unless it restarted after that re-send, in the epoch's last slot or two: then
-it lacks the next epoch's too, up to that epoch's own re-send.
-Each preference is its own request, and a poll sends all
-of them, for both epochs, at once, so a node that does not answer delays the
-others by one request timeout. Duties outside their epoch, and all but the
+(or the next poll after it, if a slow node made the client skip that one),
+since a node that restarts loses what it accepted. A node restarted mid-epoch
+thus lacks the preferences of the slots before that re-send and holds the
+later ones; one restarted after it lacks the next epoch's too, all but its
+last slot's, which the next epoch's re-send covers. A re-send covers only the slots
+that have not started when its duties fetch returns, so slow nodes ahead of
+the one that answers can leave the next epoch's first slots out.
+Each preference is its own request, and a poll sends all of them, for both
+epochs, to every node at once, so a node that does not answer delays the end
+of the poll by one request timeout, not the other nodes' delivery. The duties
+are fetched from one node at a time, so each node that does not answer,
+listed ahead of the one that does, delays every send by a request timeout.
+Duties outside their epoch, and all but the
 first for a slot, are dropped before anything is signed. A
 validator with no fee recipient is skipped, with one warning per epoch naming
 the count. A preference cannot be replaced for the same slot and root, so a

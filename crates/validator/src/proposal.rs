@@ -302,19 +302,20 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         if Self::pays_this_validator(actual, current, preferred) != Some(false) {
             return;
         }
-        let mut expected: Vec<String> = current
-            .iter()
-            .chain(preferred)
-            .map(|address| crate::beacon_node::dto::encode_hex(&address.0))
-            .collect();
-        // Each once: the current address is usually the preferred one too,
-        // and two dependent roots' preferences may name the same one.
-        expected.sort_unstable();
-        expected.dedup();
-        tracing::error!(
+        // The configured address first, then the preferences', each once: the
+        // current address is usually the preferred one too, and two dependent
+        // roots' preferences may name the same one.
+        let mut expected: Vec<String> = Vec::new();
+        for address in current.iter().chain(preferred) {
+            let address = encode_hex(&address.0);
+            if !expected.contains(&address) {
+                expected.push(address);
+            }
+        }
+        error!(
             %slot,
             expected = %expected.join(","),
-            actual = %crate::beacon_node::dto::encode_hex(&actual.0),
+            actual = %encode_hex(&actual.0),
             "Block pays its execution-layer rewards to an address this client did not ask for; \
              signing it anyway, since refusing would also forfeit the consensus reward and cost \
              the network a slot. Check this beacon node's proposer preparation. A fee recipient \

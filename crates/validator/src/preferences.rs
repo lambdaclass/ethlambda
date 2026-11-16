@@ -60,12 +60,16 @@
 //! preference whose slot is still ahead is therefore sent again, as signed,
 //! once an epoch, as the duty loop re-sends `prepare_beacon_proposer`, which a
 //! restart loses too. The round runs at the poll of an epoch's second-to-last
-//! slot, or of its last when that poll was skipped behind a slow node, while
-//! every slot of the next epoch is still ahead. So a node restarted mid-epoch
-//! lacks the rest of that epoch's preferences and holds every later one, the
-//! next epoch's first slot included. One restarted after the round, in an
-//! epoch's last slot or two, lacks the next epoch's too, up to that epoch's
-//! own round. Each node answers the re-send as it does any other: one still
+//! slot, or at the next poll after it when that one was skipped behind a slow
+//! node, and re-sends each kept preference whose slot has not started once
+//! the poll's duties are in. Normally that is the epoch's last slot and every
+//! slot of the next one, so a node restarted mid-epoch lacks the preferences
+//! of the slots before the round and holds every later one. One restarted
+//! after the round lacks the next epoch's too, all but its last slot's, which
+//! the round at that epoch's second-to-last slot re-sends. A round whose
+//! duties come late (slow nodes ahead of the one that answers, see below)
+//! leaves out the slots that started meanwhile, the next epoch's first among
+//! them. Each node answers the re-send as it does any other: one still
 //! holding the preference with a 200 and no republish, one that lost it by
 //! taking it again, and one not ready yet by making it a preference only some
 //! nodes hold, sent each slot from then on.
@@ -152,13 +156,13 @@ enum Sent {
 /// ahead.
 ///
 /// Not the last slot: polls are single-flight, so a poll held up behind a slow
-/// node skips the next one. Started one slot early, the round still runs at
-/// the last slot when the first poll is skipped, and the epoch's first slot is
-/// still ahead then. A poll that outlasts two slots skips both, and the round
-/// runs at the epoch's first poll instead, too late for its first slot. That
-/// takes nodes that hang on every request listed ahead of the one that
-/// answers the duties, since each costs a request timeout: about two of them
-/// on 12 s slots, or one where slots are shorter.
+/// node skips the ones that fall while it runs, and starting a slot early
+/// leaves the last slot's poll to run the round when the first is skipped.
+/// Whichever poll runs it, the round re-sends only the slots that have not
+/// started when that poll's duties fetch returns. Each node that hangs,
+/// listed ahead of the one that answers the duties, adds a request timeout to
+/// that fetch, so enough of them push the round past the next epoch's first
+/// slots.
 fn round_of(current_slot: Slot) -> Epoch {
     compute_epoch_at_slot(current_slot + 2)
 }
