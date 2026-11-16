@@ -754,7 +754,11 @@ since: 748 blocks in 66 bursts on one follower. A `Status` answer is
 therefore measured against the higher of the watermark and the store's head
 (`range_sync_target`). The head is a safe floor, since a head block's whole
 ancestry is already imported. Lean range sync reads the same watermark, for
-the same reason.
+the same reason. A watermark the head stays below, unmoved and with no range
+session running, for longer than the stall window is dropped back to the head
+(`P2PServer::expire_range_watermark`): blocks handed over that never imported
+(an invalid answer, a fork the head did not follow) would otherwise never be
+asked for again.
 
 Each peer is also re-asked for its `Status` every half epoch, so the head it
 reported at the handshake does not go stale for the sync gate (see

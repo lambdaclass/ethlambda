@@ -472,6 +472,33 @@ pub struct ReqRespRequestId {
     pub id: OutboundRequestId,
 }
 
+/// How long the store's head has stayed where it is, as the once-a-slot
+/// refresh timer sees it; see [`P2PServer::expire_range_watermark`].
+#[derive(Debug, Default)]
+pub(crate) struct HeadWatch {
+    /// The head slot last seen, and the wall-clock slot it was first seen at.
+    seen: Option<(u64, u64)>,
+}
+
+impl HeadWatch {
+    /// Note the head at `wall_slot`, returning how many slots it has stayed
+    /// at `head_slot`: zero whenever it has just moved, in either direction.
+    pub(crate) fn flat_for(&mut self, head_slot: u64, wall_slot: u64) -> u64 {
+        match self.seen {
+            Some((slot, since)) if slot == head_slot => wall_slot.saturating_sub(since),
+            _ => {
+                self.seen = Some((head_slot, wall_slot));
+                0
+            }
+        }
+    }
+
+    /// Start the count over at `wall_slot`, as if the head had just moved.
+    pub(crate) fn restart(&mut self, head_slot: u64, wall_slot: u64) {
+        self.seen = Some((head_slot, wall_slot));
+    }
+}
+
 pub(crate) struct RangeSyncState {
     /// Remaining slots to request, with an exclusive end.
     pub(crate) current_range: Range<u64>,
@@ -1230,6 +1257,7 @@ impl P2P {
             outbound_requests: HashMap::new(),
             range_sync_state: None,
             range_fetched_through,
+            head_watch: HeadWatch::default(),
             peer_heads: Default::default(),
             bootnode_addrs: built.bootnode_addrs,
             node_names,
@@ -1395,8 +1423,12 @@ pub struct P2PServer {
     /// Highest slot a range answer has handed to the chain actor, whether or
     /// not it has been imported yet, on either chain. Gossip never advances
     /// it, so range sync reads it beside the store's head; see
-    /// `range_sync_target`.
+    /// `range_sync_target`. Dropped back to the head when the blocks above
+    /// the head never import; see [`Self::expire_range_watermark`].
     pub(crate) range_fetched_through: u64,
+    /// How long the store's head has stayed put, for
+    /// [`Self::expire_range_watermark`].
+    pub(crate) head_watch: HeadWatch,
     /// Every connected peer's latest `Status` head, published on
     /// `Store::network_head` for the sync tracker. See [`peer_heads`].
     pub(crate) peer_heads: peer_heads::PeerHeads,
@@ -2018,6 +2050,42 @@ impl RefreshStatus {
 }
 
 impl P2PServer {
+    /// Drop [`Self::range_fetched_through`] back to the store's head once the
+    /// head has stayed below it, without moving and with no range session
+    /// running, for longer than the stall window
+    /// (`SyncThresholds::stall_window`).
+    ///
+    /// The watermark measures every later `Status` from the highest slot a
+    /// range answer handed to the chain actor, which keeps a catch-up from
+    /// fetching blocks still queued for import again. Blocks that never
+    /// import (an invalid answer, a fork the head did not follow) would
+    /// otherwise never be asked for again, leaving the node to walk back to
+    /// them one parent at a time. A head that is still importing moves, so a
+    /// slow catch-up never trips this. Once dropped, the count starts over,
+    /// so a head that cannot move at all is fetched for at most once a window.
+    pub(crate) fn expire_range_watermark(&mut self, wall_slot: u64) {
+        let head_slot = match self.store.chain() {
+            Chain::Lean => self.store.head_slot(),
+            Chain::Beacon => self.store.beacon_head().map_or(0, |(slot, _)| slot),
+        };
+        let flat_for = self.head_watch.flat_for(head_slot, wall_slot);
+        let window = peer_heads::thresholds(&self.store).stall_window;
+        if self.range_sync_state.is_some()
+            || self.range_fetched_through <= head_slot
+            || flat_for <= window
+        {
+            return;
+        }
+        debug!(
+            head_slot,
+            fetched_through = self.range_fetched_through,
+            flat_for,
+            "Blocks handed over above the head never imported; fetching them again"
+        );
+        self.range_fetched_through = head_slot;
+        self.head_watch.restart(head_slot, wall_slot);
+    }
+
     /// Re-ask this slot's share of the connected peers that are due for their
     /// `Status`; see [`peer_heads`]. The half of
     /// [`Self::handle_refresh_peer_status`] that needs no actor context.
@@ -2028,8 +2096,10 @@ impl P2PServer {
     pub(crate) async fn refresh_due_peer_statuses(&mut self) {
         let wall_slot = wall_clock_slot(&self.store);
         // Once a slot, the same cadence as the refresh: a report past its
-        // lifetime is no longer evidence of where the network is.
+        // lifetime is no longer evidence of where the network is, and a
+        // watermark the head never reaches is no longer a floor.
         peer_heads::expire(self, wall_slot);
+        self.expire_range_watermark(wall_slot);
         let interval = peer_heads::thresholds(&self.store).status_refresh_slots;
         let peers = self.peer_heads.due_for_refresh(
             self.connected_peers.keys().copied(),
@@ -3164,6 +3234,7 @@ pub(crate) mod test_support {
             outbound_requests: HashMap::new(),
             range_sync_state: None,
             range_fetched_through: 0,
+            head_watch: crate::HeadWatch::default(),
             peer_heads: Default::default(),
             bootnode_addrs: HashMap::new(),
             node_names: HashMap::new(),

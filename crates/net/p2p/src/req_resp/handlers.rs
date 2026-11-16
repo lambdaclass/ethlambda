@@ -2910,6 +2910,7 @@ pub(crate) mod tests {
             outbound_requests: HashMap::new(),
             range_sync_state: None,
             range_fetched_through: 0,
+            head_watch: crate::HeadWatch::default(),
             peer_heads: Default::default(),
             bootnode_addrs: HashMap::new(),
             node_names: HashMap::new(),
@@ -3504,6 +3505,50 @@ pub(crate) mod tests {
             .peer_heads
             .due_for_refresh(peers.iter().copied(), wall, interval);
         assert_eq!(still_due.len(), peers.len() - share);
+    }
+
+    #[test]
+    fn a_head_watch_counts_from_the_last_move() {
+        let mut watch = crate::HeadWatch::default();
+        assert_eq!(watch.flat_for(5, 10), 0);
+        assert_eq!(watch.flat_for(5, 20), 10);
+        // A head that keeps moving, however slowly, is never flat for long.
+        for (head, wall) in [(6, 30), (7, 45), (8, 60)] {
+            assert_eq!(watch.flat_for(head, wall), 0);
+            assert_eq!(watch.flat_for(head, wall + 14), 14);
+        }
+        // Moving back counts as moving.
+        assert_eq!(watch.flat_for(4, 80), 0);
+    }
+
+    #[tokio::test]
+    async fn a_watermark_the_head_never_reaches_is_dropped_after_a_stall_window() {
+        // Finding: the watermark only ever rose, so blocks handed over above
+        // the head that never imported were never range-requested again.
+        let mut server = unconnected_server().await;
+        let head = server.store.head_slot();
+        let window = SyncThresholds::LEAN.stall_window;
+        server.range_fetched_through = 2000;
+        server.expire_range_watermark(100);
+        server.expire_range_watermark(100 + window);
+        assert_eq!(server.range_fetched_through, 2000);
+
+        // A range session still running keeps it.
+        let session = RangeSyncState::new(1..10, PeerId::random(), 10);
+        server.range_sync_state = Some(session);
+        server.expire_range_watermark(101 + window);
+        assert_eq!(server.range_fetched_through, 2000);
+        server.range_sync_state = None;
+        server.expire_range_watermark(101 + window);
+        assert_eq!(server.range_fetched_through, head);
+
+        // The count starts over, so a head that cannot move is fetched for at
+        // most once a window.
+        server.range_fetched_through = 2000;
+        server.expire_range_watermark(101 + 2 * window);
+        assert_eq!(server.range_fetched_through, 2000);
+        server.expire_range_watermark(102 + 2 * window);
+        assert_eq!(server.range_fetched_through, head);
     }
 
     #[tokio::test]
