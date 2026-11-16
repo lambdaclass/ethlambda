@@ -43,8 +43,9 @@
 //! keeps the per-slot check below one atomic read. A full send that fails
 //! waits for the next epoch's instead: re-sending every key each slot would
 //! load a node that is already failing, and the next full send carries them
-//! all anyway. A full send ends every per-slot retry, delivered or not, so a
-//! node that keeps refusing costs a warning a slot for an epoch at most.
+//! all anyway. A full send ends every per-slot retry it carries, delivered or
+//! not, so a node that keeps refusing costs a warning a slot for an epoch at
+//! most.
 //!
 //! A batch a node refuses with a 400 is not split to find the entry it
 //! objects to: every entry is signed here by keys this client holds, so a
@@ -135,9 +136,9 @@ struct Current {
     changed: Vec<SignedValidatorRegistrationV1>,
     /// Validators skipped because no fee recipient is configured for them.
     no_fee_recipient: usize,
-    /// Chunks whose signing task failed, so whose validators are in neither
-    /// list.
-    failed_chunks: usize,
+    /// Validators in a chunk whose signing task failed, so in neither list.
+    /// The chunk cached nothing, so a change among them is still to be signed.
+    in_failed_chunks: HashSet<BlsPubkey>,
 }
 
 impl Current {
@@ -145,7 +146,7 @@ impl Current {
         self.all.extend(other.all);
         self.changed.extend(other.changed);
         self.no_fee_recipient += other.no_fee_recipient;
-        self.failed_chunks += other.failed_chunks;
+        self.in_failed_chunks.extend(other.in_failed_chunks);
     }
 }
 
@@ -181,6 +182,8 @@ pub struct RegistrationService<B> {
     /// The latest signed registration per validator. Taken under
     /// [`Self::sending`] only, so it is never contended: a `std` mutex is
     /// enough, and a signing chunk holding it keeps no one else waiting.
+    /// Written only once a chunk is signed in full, so a key is cached only
+    /// when its registration reaches the send.
     signed: std::sync::Mutex<HashMap<BlsPubkey, SignedValidatorRegistrationV1>>,
     /// The [`ProposerSettings::generation`] the cache was last brought up to
     /// date against. Held behind while [`Self::unsent`] is not empty, so the
@@ -188,8 +191,8 @@ pub struct RegistrationService<B> {
     signed_generation: AtomicU64,
     /// Validators whose newest registration a per-slot send could not get any
     /// node to accept: sent again, as signed, at every slot until one does or
-    /// the next full send, which carries them anyway, ends the retry. Taken
-    /// under [`Self::sending`] only.
+    /// a full send carries them, which ends the retry. Taken under
+    /// [`Self::sending`] only.
     unsent: std::sync::Mutex<HashSet<BlsPubkey>>,
     /// Held by a send from before it reads the cache until its last batch is
     /// answered, so sends reach every node in the order they read the cache.
@@ -197,6 +200,10 @@ pub struct RegistrationService<B> {
     sending: Mutex<()>,
     /// The epoch's full send, while it runs or waits for [`Self::sending`].
     full_send: InFlight,
+    /// A key whose signing panics, so a test can fail a chunk: nothing else
+    /// can.
+    #[cfg(test)]
+    panic_signing: std::sync::Mutex<Option<BlsPubkey>>,
 }
 
 impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
@@ -215,6 +222,8 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
             unsent: std::sync::Mutex::new(HashSet::new()),
             sending: Mutex::new(()),
             full_send: InFlight::default(),
+            #[cfg(test)]
+            panic_signing: std::sync::Mutex::new(None),
         }
     }
 
@@ -233,9 +242,14 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
             all: Vec::with_capacity(pubkeys.len()),
             changed: Vec::new(),
             no_fee_recipient: 0,
-            failed_chunks: 0,
+            in_failed_chunks: HashSet::new(),
         };
         for pubkey in pubkeys {
+            #[cfg(test)]
+            if self.panic_signing.lock().expect("lock").as_ref() == Some(pubkey) {
+                panic!("signing panicked, as the test asked");
+            }
+
             let Some((fee_recipient, gas_limit)) =
                 self.settings.fee_recipient_and_gas_limit(pubkey)
             else {
@@ -268,10 +282,16 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
                 }
             };
             let registration = SignedValidatorRegistrationV1 { message, signature };
-            signed.insert(*pubkey, registration.clone());
             current.all.push(registration.clone());
             current.changed.push(registration);
         }
+        // Cached only now that the chunk is signed in full: a key cached by a
+        // chunk that then panicked would never reach the send, and the next
+        // call would find it unchanged and not send it either.
+        let changed = current.changed.iter();
+        signed.extend(
+            changed.map(|registration| (registration.message.pubkey, registration.clone())),
+        );
         current
     }
 
@@ -298,10 +318,10 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
             all: Vec::with_capacity(pubkeys.len()),
             changed: Vec::new(),
             no_fee_recipient: 0,
-            failed_chunks: 0,
+            in_failed_chunks: HashSet::new(),
         };
-        for chunk in pubkeys.chunks(SIGN_CHUNK) {
-            let (service, store, chunk) = (self.clone(), store.clone(), chunk.to_vec());
+        for keys in pubkeys.chunks(SIGN_CHUNK) {
+            let (service, store, chunk) = (self.clone(), store.clone(), keys.to_vec());
             let part = tokio::task::spawn_blocking(move || {
                 let store = store.blocking_read();
                 service.current(&store, &chunk, now_secs)
@@ -311,7 +331,7 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
                 Ok(part) => current.extend(part),
                 Err(err) => {
                     warn!(%err, "Signing builder registrations failed; skipping a chunk");
-                    current.failed_chunks += 1;
+                    current.in_failed_chunks.extend(keys);
                 }
             }
         }
@@ -319,13 +339,14 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
     }
 
     /// Record that every setting up to `generation` is signed and sent,
-    /// unless a chunk of the signing failed (`failed_chunks`) or a registration
-    /// is waiting to be sent again ([`Self::unsent`]). Then the generation
-    /// stays behind, so the next slot's [`Self::register_changed`] signs what
-    /// that chunk held, or re-sends what no node took, rather than leaving a
-    /// keymanager change unsent for an epoch.
-    fn mark_signed(&self, generation: u64, failed_chunks: usize) {
-        if failed_chunks == 0 && self.unsent().is_empty() {
+    /// unless a chunk of the signing failed (`in_failed_chunks` is not empty)
+    /// or a registration is waiting to be sent again ([`Self::unsent`]). Then
+    /// the generation stays behind, so the next slot's
+    /// [`Self::register_changed`] signs what that chunk held, or re-sends what
+    /// no node took, rather than leaving a keymanager change unsent for an
+    /// epoch.
+    fn mark_signed(&self, generation: u64, in_failed_chunks: &HashSet<BlsPubkey>) {
+        if in_failed_chunks.is_empty() && self.unsent().is_empty() {
             self.signed_generation.store(generation, Ordering::Release);
         }
     }
@@ -383,11 +404,13 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
             );
         }
         self.send(&current.all).await;
-        // This send carried every key, so it ends each per-slot retry: a key it
-        // delivered needs no more, and one it did not waits for the next
-        // epoch's full send with the rest of its batch.
-        self.unsent().clear();
-        self.mark_signed(generation, current.failed_chunks);
+        // This send carried every key but those of a failed chunk, so it ends
+        // their per-slot retries: a key it delivered needs no more, and one it
+        // did not waits for the next epoch's full send with the rest of its
+        // batch. A key in a failed chunk was not carried, so it keeps its retry.
+        self.unsent()
+            .retain(|pubkey| current.in_failed_chunks.contains(pubkey));
+        self.mark_signed(generation, &current.in_failed_chunks);
     }
 
     /// Send only the registrations whose fee recipient or gas limit changed
@@ -450,11 +473,15 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
                 changed.contains(pubkey) || retry.contains(pubkey)
             })
             .collect();
+        // A key waiting for its retry whose chunk failed is in neither list,
+        // so not in `outgoing` either: it waits for the next slot again.
+        let in_failed_chunk = retry.intersection(&current.in_failed_chunks);
+        self.unsent().extend(in_failed_chunk);
         if !outgoing.is_empty() {
             let failed = self.send(&outgoing).await;
             self.unsent().extend(failed);
         }
-        self.mark_signed(generation, current.failed_chunks);
+        self.mark_signed(generation, &current.in_failed_chunks);
     }
 
     /// Send `registrations` to the beacon node in batches, counting each batch
@@ -974,6 +1001,124 @@ mod tests {
 
         service.clone().register_changed(1, store.clone()).await;
         assert_eq!(registration_calls(&node), 3, "no retry after the full send");
+    }
+
+    /// Makes signing `pubkey` panic, failing its chunk, or stops doing so.
+    fn panic_signing(service: &RegistrationService<MockBeaconNode>, pubkey: Option<BlsPubkey>) {
+        *service.panic_signing.lock().expect("lock") = pubkey;
+    }
+
+    /// The last registration `node` accepted for `pubkey`.
+    fn latest(node: &MockBeaconNode, pubkey: &BlsPubkey) -> SignedValidatorRegistrationV1 {
+        let registrations = node.registrations.lock().expect("lock");
+        registrations
+            .iter()
+            .rfind(|registration| registration.message.pubkey == *pubkey)
+            .expect("registered")
+            .clone()
+    }
+
+    /// A chunk that panics part way through caches nothing, so a key it signed
+    /// before the panic is signed again and sent at the next slot, rather than
+    /// found unchanged there and left for the next epoch's full send.
+    #[tokio::test]
+    async fn a_failed_chunk_leaves_nothing_cached_unsent() {
+        let (store, pubkeys) = store_with_keys(2);
+        let settings = settings(Some(H160([0xab; 20])));
+        let (service, node) = service(Config::mainnet(), settings.clone());
+        let store = Arc::new(RwLock::new(store));
+        service
+            .clone()
+            .register_all(0, pubkeys.clone(), store.clone())
+            .await;
+
+        settings.set_fee_recipient(&pubkeys[0], H160([0xcd; 20]));
+        settings.set_fee_recipient(&pubkeys[1], H160([0xcd; 20]));
+        // The first key is signed, then the second panics.
+        panic_signing(&service, Some(pubkeys[1]));
+        service.clone().register_changed(0, store.clone()).await;
+        assert_eq!(
+            registration_calls(&node),
+            1,
+            "the failed chunk sent nothing"
+        );
+
+        panic_signing(&service, None);
+        service.clone().register_changed(0, store.clone()).await;
+        assert_eq!(*node.registration_batches.lock().expect("lock"), vec![2, 2]);
+        assert_eq!(
+            latest(&node, &pubkeys[0]).message.fee_recipient,
+            H160([0xcd; 20])
+        );
+        assert_eq!(
+            latest(&node, &pubkeys[1]).message.fee_recipient,
+            H160([0xcd; 20])
+        );
+    }
+
+    /// A key waiting for its retry keeps waiting when its chunk fails at the
+    /// next slot, rather than leaving the retry set with the failed chunk.
+    #[tokio::test]
+    async fn a_retry_survives_a_failed_chunk() {
+        let (store, pubkeys) = store_with_keys(2);
+        let settings = settings(Some(H160([0xab; 20])));
+        let (service, node) = service(Config::mainnet(), settings.clone());
+        let store = Arc::new(RwLock::new(store));
+        service
+            .clone()
+            .register_all(0, pubkeys.clone(), store.clone())
+            .await;
+        refuse_registrations(&node);
+        settings.set_gas_limit(&pubkeys[1], 30_000_000);
+        service.clone().register_changed(0, store.clone()).await;
+        node.stop_failing("register_validators");
+
+        panic_signing(&service, Some(pubkeys[0]));
+        service.clone().register_changed(0, store.clone()).await;
+        assert_eq!(
+            registration_calls(&node),
+            2,
+            "the failed chunk sent nothing"
+        );
+
+        panic_signing(&service, None);
+        service.clone().register_changed(0, store.clone()).await;
+        assert_eq!(registration_calls(&node), 3, "the retry goes out");
+        assert_eq!(latest(&node, &pubkeys[1]).message.gas_limit, 30_000_000);
+    }
+
+    /// A full send does not carry the keys of a chunk that failed, so it does
+    /// not end their retries.
+    #[tokio::test]
+    async fn a_full_send_keeps_the_retries_of_a_failed_chunk() {
+        let (store, pubkeys) = store_with_keys(2);
+        let settings = settings(Some(H160([0xab; 20])));
+        let (service, node) = service(Config::mainnet(), settings.clone());
+        let store = Arc::new(RwLock::new(store));
+        service
+            .clone()
+            .register_all(0, pubkeys.clone(), store.clone())
+            .await;
+        refuse_registrations(&node);
+        settings.set_gas_limit(&pubkeys[1], 30_000_000);
+        service.clone().register_changed(0, store.clone()).await;
+        node.stop_failing("register_validators");
+
+        panic_signing(&service, Some(pubkeys[0]));
+        service
+            .clone()
+            .register_all(1, pubkeys.clone(), store.clone())
+            .await;
+        assert_eq!(
+            registration_calls(&node),
+            2,
+            "the failed chunk sent nothing"
+        );
+
+        panic_signing(&service, None);
+        service.clone().register_changed(1, store.clone()).await;
+        assert_eq!(registration_calls(&node), 3, "the retry goes out");
+        assert_eq!(latest(&node, &pubkeys[1]).message.gas_limit, 30_000_000);
     }
 
     /// The per-slot call is one atomic read when no setting moved: with the
