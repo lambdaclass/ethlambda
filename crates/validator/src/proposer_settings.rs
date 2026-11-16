@@ -77,6 +77,11 @@ impl Overrides {
     fn is_empty(&self) -> bool {
         *self == Self::default()
     }
+
+    /// The overrides a builder registration carries.
+    fn registered(&self) -> (Option<ExecutionAddress>, Option<u64>) {
+        (self.fee_recipient, self.gas_limit)
+    }
 }
 
 #[derive(Debug)]
@@ -99,9 +104,10 @@ struct Inner {
 #[derive(Debug)]
 pub struct ProposerSettings {
     inner: RwLock<Inner>,
-    /// Bumped on every override write or delete, so a reader that caches
-    /// something derived from the settings (the builder registrations) can
-    /// tell that nothing changed without reading every key.
+    /// Bumped whenever a write or delete changes a fee recipient or gas limit
+    /// override, so a reader that caches something derived from those (the
+    /// builder registrations) can tell that nothing changed without reading
+    /// every key. A graffiti write leaves it alone: nothing cached reads it.
     generation: AtomicU64,
 }
 
@@ -120,8 +126,9 @@ impl ProposerSettings {
         }
     }
 
-    /// A counter that moves whenever any override is written, cleared or
-    /// forgotten. Equal readings mean no per-key setting changed between them.
+    /// A counter that moves whenever a fee recipient or gas limit override is
+    /// written, cleared or forgotten. Equal readings mean no per-key fee
+    /// recipient or gas limit changed between them.
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
@@ -135,13 +142,17 @@ impl ProposerSettings {
     fn update(&self, pubkey: &BlsPubkey, f: impl FnOnce(&mut Overrides)) {
         let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         let entry = inner.overrides.entry(*pubkey).or_default();
+        let before = entry.registered();
         f(entry);
+        let changed = entry.registered() != before;
         if entry.is_empty() {
             inner.overrides.remove(pubkey);
         }
         // Inside the write lock, so a reader that sees the new generation also
         // sees the new value.
-        self.generation.fetch_add(1, Ordering::Release);
+        if changed {
+            self.generation.fetch_add(1, Ordering::Release);
+        }
     }
 
     /// Where `pubkey`'s execution-layer rewards should go, or `None` when
@@ -220,8 +231,11 @@ impl ProposerSettings {
     /// signs with. A key imported again later starts on the defaults.
     pub fn forget(&self, pubkey: &BlsPubkey) {
         let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
-        inner.overrides.remove(pubkey);
-        self.generation.fetch_add(1, Ordering::Release);
+        let removed = inner.overrides.remove(pubkey);
+        let unset = (None, None);
+        if removed.is_some_and(|overrides| overrides.registered() != unset) {
+            self.generation.fetch_add(1, Ordering::Release);
+        }
     }
 }
 
@@ -343,5 +357,33 @@ mod tests {
         settings.set_graffiti(&key(1), Bytes32::repeat_byte(0x22));
         settings.clear_graffiti(&key(1));
         assert!(settings.read(|inner| inner.overrides.is_empty()));
+    }
+
+    /// The generation moves with what a registration carries, and only then:
+    /// a graffiti write, a write of the value already held, or forgetting a
+    /// key with no such override makes no reader re-check every key.
+    #[test]
+    fn the_generation_moves_only_with_a_fee_recipient_or_gas_limit() {
+        let settings = settings();
+        let moved = |settings: &ProposerSettings, write: &dyn Fn(&ProposerSettings)| {
+            let before = settings.generation();
+            write(settings);
+            settings.generation() != before
+        };
+        let address = H160([0x33; 20]);
+
+        assert!(moved(&settings, &|s| s.set_fee_recipient(&key(1), address)));
+        assert!(!moved(&settings, &|s| s.set_fee_recipient(&key(1), address)));
+        assert!(moved(&settings, &|s| s.set_gas_limit(&key(1), 30_000_000)));
+        assert!(!moved(&settings, &|s| s
+            .set_graffiti(&key(1), Bytes32::repeat_byte(0x22))));
+        assert!(!moved(&settings, &|s| s.clear_graffiti(&key(1))));
+        assert!(moved(&settings, &|s| s.clear_gas_limit(&key(1))));
+        assert!(!moved(&settings, &|s| s.clear_gas_limit(&key(1))));
+        assert!(moved(&settings, &|s| s.forget(&key(1))));
+
+        settings.set_graffiti(&key(2), Bytes32::repeat_byte(0x22));
+        assert!(!moved(&settings, &|s| s.forget(&key(2))));
+        assert!(!moved(&settings, &|s| s.forget(&key(3))));
     }
 }

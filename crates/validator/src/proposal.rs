@@ -88,7 +88,7 @@ use ethlambda_types::beacon::primitives::{BlsPubkey, ExecutionAddress, Root, Slo
 use ethlambda_types::beacon::signing::compute_epoch_at_slot;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::beacon_node::block_contents::{GloasPayload, Producer, signed_envelope_ssz};
 use crate::beacon_node::dto::{ProposerDutyDto, encode_hex, parse_pubkey};
@@ -442,12 +442,10 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         } else {
             // Both addresses, so a log can say afterwards who built the block
             // and where this client had asked to be paid.
-            let header = crate::beacon_node::dto::encode_hex(&produced.fee_recipient().0);
-            let configured = fee_recipient.map_or_else(
-                || "none".to_string(),
-                |address| crate::beacon_node::dto::encode_hex(&address.0),
-            );
-            tracing::debug!(
+            let header = encode_hex(&produced.fee_recipient().0);
+            let configured =
+                fee_recipient.map_or_else(|| "none".to_string(), |address| encode_hex(&address.0));
+            debug!(
                 %slot,
                 header_fee_recipient = %header,
                 configured_fee_recipient = %configured,
@@ -691,7 +689,7 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
             // The task ended without sending, so it panicked. The block may or
             // may not have gone out, which is what "unconfirmed" says.
             Err(_) => {
-                tracing::error!(%slot, validator, "The blinded publish task failed");
+                error!(%slot, validator, "The blinded publish task failed");
                 crate::metrics::inc_blinded_blocks_unconfirmed();
                 Ok(Proposed::Blinded(BlindedOutcome::Unconfirmed))
             }
@@ -776,7 +774,7 @@ fn blinded_outcome(
             Ok(BlindedOutcome::Published(published))
         }
         Err(err @ Error::BlindedUnconfirmed { .. }) => {
-            tracing::error!(
+            error!(
                 %slot,
                 validator,
                 %err,
@@ -809,7 +807,7 @@ fn report_unawaited(
         }
         Ok(BlindedOutcome::Unconfirmed | BlindedOutcome::StillPublishing) => {}
         Err(err) => {
-            tracing::error!(
+            error!(
                 %slot,
                 validator,
                 %err,
