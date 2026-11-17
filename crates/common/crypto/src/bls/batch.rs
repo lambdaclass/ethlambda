@@ -48,6 +48,13 @@ const RAND_BITS: usize = 64;
 
 /// The bit of a compressed G1 point's first byte that marks the point at
 /// infinity.
+///
+/// A compressed BLS12-381 point (the ZCash serialization the consensus specs'
+/// 48-byte keys use, and what blst's `to_bytes` writes) keeps three flags in
+/// the top bits of its first byte: bit 7 says the encoding is compressed, bit
+/// 6 that the point is the identity, and bit 5 which of the two `y` values
+/// goes with `x`. The identity is therefore `0xc0` followed by zeros, and
+/// bit 6 is set on no other point.
 const INFINITY_FLAG: u8 = 0b0100_0000;
 
 /// One signature check, resolved and ready, that may be verified alone or in a
