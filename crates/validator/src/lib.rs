@@ -288,7 +288,8 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     if config.builder.is_none() && config.builder_min_bid > 0 {
         info!(
             min_bid_gwei = config.builder_min_bid,
-            "Builder proposals off; a pooled bid a gloas block falls back to must still reach the minimum bid"
+            "Builder proposals off; --builder-min-bid still applies to a p2p bid taken when the local \
+             payload cannot be built"
         );
     }
 

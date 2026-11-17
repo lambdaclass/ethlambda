@@ -1254,6 +1254,9 @@ mod tests {
         assert_eq!(stages(&service)[&(slot, root)], "everywhere");
     }
 
+    /// A send no node answered is tried again at the next poll. (The mock's
+    /// failure is a request that may have left, so this one is kept as
+    /// signed; a refused one is `a_refused_preference_is_signed_afresh`.)
     #[tokio::test]
     async fn a_failed_submit_is_retried_next_poll() {
         let (store, pubkeys) = store_with_keys(1);
@@ -1266,7 +1269,7 @@ mod tests {
         node.failures
             .lock()
             .expect("lock")
-            .insert("submit_proposer_preferences", "node refused".to_string());
+            .insert("submit_proposer_preferences", "no answer".to_string());
         let (service, node) = service(node, settings(Some(FEE_RECIPIENT)));
         let current = slot_in(GLOAS_EPOCH, 1);
 

@@ -28,7 +28,10 @@ pub enum BeaconNodeFailure {
     /// The connection could not be established: refused, or not made within
     /// the connect timeout. Nothing was sent.
     Connect,
-    /// The request could not be built or sent.
+    /// The request could not be built (an invalid URL or header, say), so
+    /// nothing was sent.
+    Build,
+    /// The request failed on its way out or back, after it may have left.
     Request,
     /// The response body could not be read.
     Body,
@@ -41,7 +44,9 @@ impl BeaconNodeFailure {
     /// timeout. It is a connection never made, so the connect check comes
     /// first: [`Error::outcome_unknown`] counts it as definite.
     pub fn classify(error: &reqwest::Error) -> Self {
-        if error.is_connect() {
+        if error.is_builder() {
+            Self::Build
+        } else if error.is_connect() {
             Self::Connect
         } else if error.is_timeout() {
             Self::Timeout
@@ -194,12 +199,15 @@ impl Error {
     /// Whether a request that failed with this may still have been acted on
     /// by the node: no answer came once it was sent (a timeout, a broken
     /// connection, an unreadable body), or a 5xx other than 503 said it failed
-    /// partway. A 4xx, a 503, a syncing node and a connection never made are
-    /// definite: the node did not take it.
+    /// partway. A 4xx, a 503, a syncing node, a connection never made and a
+    /// request never built are definite: the node did not take it.
     pub fn outcome_unknown(&self) -> bool {
         match self {
             Self::NoNodeConfirmed(_) | Self::BlindedUnconfirmed { .. } => true,
-            Self::BeaconNode { failure, .. } => *failure != BeaconNodeFailure::Connect,
+            Self::BeaconNode { failure, .. } => !matches!(
+                failure,
+                BeaconNodeFailure::Connect | BeaconNodeFailure::Build
+            ),
             Self::BeaconNodeStatus { status, .. } => *status >= 500 && *status != 503,
             _ => false,
         }
@@ -240,3 +248,27 @@ impl Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A request reqwest could not build never left, so no node can have
+    /// taken it: a preference that failed so is signed afresh, not kept.
+    #[test]
+    fn a_request_never_built_is_a_definite_failure() {
+        let err = reqwest::Client::new()
+            .get("not a url")
+            .build()
+            .expect_err("a URL without a scheme does not build");
+        let failure = BeaconNodeFailure::classify(&err);
+        assert_eq!(failure, BeaconNodeFailure::Build);
+
+        let failed = Error::BeaconNode {
+            url: "not a url".to_string(),
+            failure,
+            detail: err.to_string(),
+        };
+        assert!(!failed.outcome_unknown());
+    }
+}
