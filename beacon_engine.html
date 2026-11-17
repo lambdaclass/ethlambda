@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-2c548559.js";
+            window.path_to_searchindex_js = "searchindex-3b22f915.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -475,6 +475,13 @@ cosmetic mismatch into an outage.</p>
 An RPC <em>error</em> is not retried: that is the execution client answering, with a
 refusal but an answer, so asking again would get the same refusal and burn the
 ladder for nothing.</p>
+<p><code>engine_getPayloadV5</code> and <code>engine_getPayloadV6</code> have no ladder: one attempt at
+<code>ENGINE_GET_PAYLOAD_TIMEOUT</code> (1 s). execution-apis #958 removed the method’s
+timeout (“MUST respond immediately”, and the consensus client “MAY abort such a
+call at its own discretion”); 1 s is the value it replaced and what Nimbus and
+Prysm (before gloas) use, where Lighthouse and Teku allow 2 s. A retry could not
+deliver the slot’s payload in time, and an execution client may stop the build
+once it has served the call.</p>
 <p>After the last attempt the block is <strong>dropped</strong>. <code>optimistic-sync.md</code> requires
 exactly that much (“a consensus engine MUST NOT import the block and MUST NOT
 apply it to the fork choice store”), but nothing here re-drives the call

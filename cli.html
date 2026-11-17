@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-2c548559.js";
+            window.path_to_searchindex_js = "searchindex-3b22f915.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -310,6 +310,12 @@ from a normal build.</p>
 <tr><td><code>--execution-endpoint</code></td><td>none</td><td>Base URL of the execution client’s Engine API endpoint, e.g. <code>http://127.0.0.1:8551</code>. Must be given together with <code>--execution-jwt-secret</code></td></tr>
 <tr><td><code>--execution-jwt-secret</code></td><td>none</td><td>File holding the 32-byte hex JWT secret shared with the execution client</td></tr>
 <tr><td><code>--safe-slots-to-import-optimistically</code></td><td>the specification’s own value</td><td>How far behind the wall clock a block must be before it may be imported optimistically on age alone</td></tr>
+<tr><td><code>--builder</code></td><td>none</td><td>Base URL of a builder API endpoint, normally MEV-Boost (e.g. <code>http://127.0.0.1:18550</code>). Without it every block is built locally</td></tr>
+<tr><td><code>--builder-header-timeout</code></td><td><code>1000</code></td><td>Milliseconds block production waits for the builder’s bid; also sent to the builder as <code>X-Timeout-Ms</code>. Requires <code>--builder</code></td></tr>
+<tr><td><code>--builder-follow-redirects</code></td><td>off</td><td>Follow the builder’s 307 and 308 redirects, up to ten per call, never from https to http. A 301, 302 or 303 is not followed even then, since following one resends a POST as a GET without its body. Off, every redirect fails the call with an error naming its target, so registrations and signed blocks go only where <code>--builder</code> points; on, so does any redirect it does not follow. Requires <code>--builder</code></td></tr>
+<tr><td><code>--builder-fallback-skips</code></td><td><code>3</code></td><td>Build locally when more than this many consecutive slots right before the proposal had no block (the circuit breaker). Requires <code>--builder</code></td></tr>
+<tr><td><code>--builder-fallback-skips-per-epoch</code></td><td><code>8</code></td><td>Build locally when more than this many of the slots in the epoch’s worth before the proposal had no block. Requires <code>--builder</code></td></tr>
+<tr><td><code>--builder-fallback-epochs-since-finalization</code></td><td><code>3</code></td><td>Build locally when the proposal is more than this many epochs past the finalized checkpoint. Requires <code>--builder</code></td></tr>
 </tbody>
 </table>
 </div>

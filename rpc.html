@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-2c548559.js";
+            window.path_to_searchindex_js = "searchindex-3b22f915.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -424,15 +424,17 @@ surface rather than sitting beside it; a <code>/lean/v0</code> path on a beacon 
 <tr><td><code>GET</code></td><td><code>/eth/v1/validator/sync_committee_contribution</code></td><td>JSON</td><td>The pooled messages for <code>(slot, subcommittee_index, beacon_block_root)</code>, aggregated</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/validator/contribution_and_proofs</code></td><td><em>(status only)</em></td><td>Validate, pool and gossip <code>SignedContributionAndProof</code>s</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/validator/sync_committee_subscriptions</code></td><td><em>(status only)</em></td><td>Join sync committee subnets until an epoch</td></tr>
-<tr><td><code>GET</code></td><td><code>/eth/v3/validator/blocks/{slot}</code></td><td>SSZ or JSON</td><td>An unsigned fulu block built on the head (<code>produceBlockV3</code>)</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v3/validator/blocks/{slot}</code></td><td>SSZ or JSON</td><td>An unsigned fulu block built on the head, or, with <code>--builder</code>, the blinded block around a winning bid (<code>produceBlockV3</code>)</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v4/validator/blocks/{slot}</code></td><td>SSZ or JSON</td><td>An unsigned gloas block: self-built, with its envelope and blobs when asked, or on a pooled builder bid (<code>produceBlockV4</code>)</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/validator/execution_payload_envelopes/{slot}/{beacon_block_root}</code></td><td>SSZ or JSON</td><td>The unsigned envelope <code>produceBlockV4</code> built (gloas)</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v2/beacon/blocks</code></td><td><em>(status only)</em></td><td>Gossip and import a signed fulu or gloas block (<code>publishBlockV2</code>; JSON or SSZ body)</td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v2/beacon/blinded_blocks</code></td><td><em>(status only)</em></td><td>Hand a signed fulu blinded block to the builder to reveal (<code>publishBlindedBlockV2</code>; JSON or SSZ body)</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/beacon/execution_payload_envelopes</code></td><td><em>(status only)</em></td><td>Gossip a signed envelope and its data columns (gloas; JSON or SSZ body)</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/beacon/execution_payload_bids</code></td><td><em>(status only)</em></td><td>Validate, pool and gossip a builder’s <code>SignedExecutionPayloadBid</code> (gloas; JSON or SSZ body)</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/validator/proposer_preferences</code></td><td><em>(status only)</em></td><td>Validate, cache and gossip <code>SignedProposerPreferences</code> (gloas; JSON or SSZ body)</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/beacon/states/{state_id}/builders</code></td><td>JSON</td><td>The gloas builder registry, filtered by id and status</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/validator/prepare_beacon_proposer</code></td><td><em>(status only)</em></td><td>Record each validator’s fee recipient for block production (see below)</td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v1/validator/register_validator</code></td><td><em>(status only)</em></td><td>Forwards builder registrations of active or pending validators to <code>--builder</code>, and sets their fee recipients</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/events</code></td><td>SSE</td><td>Live stream of chain events (see below)</td></tr>
 </tbody>
 </table>
@@ -442,7 +444,8 @@ surface rather than sitting beside it; a <code>/lean/v0</code> path on a beacon 
 answer is computed from the fork-choice head’s post-state, read off the store
 the chain actor writes, so no request waits on the actor.</p>
 <ul>
-<li><strong>Duties</strong> are bounded by the wall clock, as the Beacon API defines it: any
+<li>
+<p><strong>Duties</strong> are bounded by the wall clock, as the Beacon API defines it: any
 epoch up to one past the current one is served (or one past the head’s, if
 the head is ahead of a lagging clock), so a validator client’s next-epoch
 lookahead at an epoch boundary, while the head is still in the previous
@@ -463,8 +466,10 @@ every committee of the epoch, a full shuffle per request on mainnet. Gloas
 epochs are served like fulu ones: gloas keeps fulu’s <code>proposer_lookahead</code> and
 <code>upgrade_to_gloas</code> carries it over, so a fulu head already answers proposer
 duties (v1 and v2) for the first gloas epoch, and a gloas head answers from
-its own lookahead.</li>
-<li><strong>Sync duties</strong> read the head state’s <code>current_sync_committee</code> for an epoch in
+its own lookahead.</p>
+</li>
+<li>
+<p><strong>Sync duties</strong> read the head state’s <code>current_sync_committee</code> for an epoch in
 the head’s own sync committee period and <code>next_sync_committee</code> for the one
 after. The upper bound is the wall clock’s, as the Beacon API defines it: the
 period after the clock’s current one. When the head lags a period boundary
@@ -476,8 +481,10 @@ historical state; see <code>docs/spec_deviations.md</code>). A validator is matc
 gets every seat it holds, since the committee is drawn with replacement; one
 with no seat is left out. An unknown index is a <code>400</code>, and the endpoint is a
 <code>503</code> while the node is syncing. What a duty asks for is served by the four
-sync committee endpoints in <a href="#sync-committee">Sync committee</a> below.</li>
-<li><strong>Liveness</strong> is this node’s own view, which the Beacon API allows. A
+sync committee endpoints in <a href="#sync-committee">Sync committee</a> below.</p>
+</li>
+<li>
+<p><strong>Liveness</strong> is this node’s own view, which the Beacon API allows. A
 validator is live in an epoch if the head state credits it for that epoch (a
 non-zero participation byte, so anything a block already included), <strong>or</strong>
 the node observed it act: an accepted gossip aggregate (its aggregator and
@@ -487,8 +494,10 @@ block’s proposer, or a submission through <code>pool/attestations</code> or
 yet, most of the current epoch; it keeps the newest three epochs recorded,
 as one bitset each. The window is the store clock’s previous, current and
 next epoch (the next is always <code>false</code>); anything else, and an unknown
-index, is a <code>400</code>, and the endpoint is a <code>503</code> while the node is syncing.</li>
-<li><strong><code>attestation_data</code></strong> follows phase0’s <code>validator.md</code>: the head block, the
+index, is a <code>400</code>, and the endpoint is a <code>503</code> while the node is syncing.</p>
+</li>
+<li>
+<p><strong><code>attestation_data</code></strong> follows phase0’s <code>validator.md</code>: the head block, the
 epoch’s boundary block as target, and as source the current justified
 checkpoint of the head state advanced to the slot’s epoch (through fork
 choice’s cached <code>checkpoint_state</code>, and only when the head is in an earlier
@@ -505,14 +514,18 @@ requested slot itself (its payload cannot be revealed yet), otherwise <code>1</c
 exactly when fork choice holds the head block’s payload as FULL
 (<code>Store::head_payload_status</code>, or one fresh <code>get_head_node</code> walk when none is
 recorded for this head). A pre-gloas head counts as FULL (see
-<a href="./spec_deviations.html#a-pre-gloas-head-counts-as-full-in-attestation_dataindex">Spec Deviations</a>).</li>
-<li><strong><code>states/{state_id}/validators/{validator_id}</code></strong> is one entry of the list
+<a href="./spec_deviations.html#a-pre-gloas-head-counts-as-full-in-attestation_dataindex">Spec Deviations</a>).</p>
+</li>
+<li>
+<p><strong><code>states/{state_id}/validators/{validator_id}</code></strong> is one entry of the list
 endpoint, in the same shape and with the same <code>state_id</code> handling,
 <code>execution_optimistic</code> and <code>finalized</code>. The id is an index or a <code>0x</code> pubkey;
 one naming no validator is a <code>404</code> (the list form omits it), a malformed one
 a <code>400</code>. Lighthouse’s validator client resolves each key to its index this
-way, and stays inactive without it.</li>
-<li><strong><code>pool/attestations</code></strong> checks each attestation against the electra
+way, and stays inactive without it.</p>
+</li>
+<li>
+<p><strong><code>pool/attestations</code></strong> checks each attestation against the electra
 <code>beacon_attestation_{subnet_id}</code> gossip conditions it can evaluate (clock
 window, <code>data.index == 0</code>, target epoch, the voted block known and the target
 its checkpoint block, committee membership, BLS signature), then gossips it on
@@ -528,20 +541,26 @@ one on a gloas slot, fails that item (not the batch) with
 gloas slot <code>data.index</code> may be <code>0</code> or <code>1</code>, checked with gloas’s payload-status
 gossip rule (a vote in the voted block’s own slot must be <code>0</code>; <code>1</code> needs the
 node to have verified the payload, otherwise the item fails). A gloas
-<code>SingleAttestation</code> is electra’s own container.</li>
-<li><strong><code>beacon_committee_subscriptions</code></strong>: each aggregator’s entry makes the node
+<code>SingleAttestation</code> is electra’s own container.</p>
+</li>
+<li>
+<p><strong><code>beacon_committee_subscriptions</code></strong>: each aggregator’s entry makes the node
 join its committee’s attestation subnet until the end of that slot, so the
 committee’s votes from other validators reach the pool too: every
 attestation this node relays has passed the <code>beacon_attestation_{subnet_id}</code>
 checks first, and the ones accepted on a joined subnet are pooled. Joined
-subnets are left once their slot has passed, and never appear in <code>attnets</code>.</li>
-<li><strong><code>aggregate_attestation</code></strong> answers from the pool: every vote held for the
+subnets are left once their slot has passed, and never appear in <code>attnets</code>.</p>
+</li>
+<li>
+<p><strong><code>aggregate_attestation</code></strong> answers from the pool: every vote held for the
 data root and committee, as electra’s <code>Attestation</code> with the BLS aggregate of
 their signatures; at a gloas slot the answer is <code>{version: "gloas", data}</code>
 with gloas’s <code>Attestation</code> (the same JSON shape). JSON only. <code>404</code> when
 nothing is held, and <code>503</code> when the block the votes name is optimistic,
-whether or not it is the head, or when no execution client is configured.</li>
-<li><strong><code>aggregate_and_proofs</code></strong> checks each aggregate with the same
+whether or not it is the head, or when no execution client is configured.</p>
+</li>
+<li>
+<p><strong><code>aggregate_and_proofs</code></strong> checks each aggregate with the same
 <code>beacon_aggregate_and_proof</code> gossip conditions this node applies to its
 peers’ aggregates (<code>gossip::aggregate</code>), signatures included, against a
 fresh seen-cache (a node never receives its own messages, so P2P’s says
@@ -549,8 +568,10 @@ nothing about them). What passes is gossiped on the topic, goes into the
 pool, and is handed to the chain actor, which applies it to fork choice and
 announces it on <code>/eth/v1/events</code>’s <code>attestation</code>. The <code>Eth-Consensus-Version</code>
 header picks the decoder: <code>gloas</code> takes gloas’s <code>SignedAggregateAndProof</code>,
-the others electra’s.</li>
-<li><strong>Request body encodings.</strong> <code>pool/attestations</code>, <code>pool/payload_attestations</code>
+the others electra’s.</p>
+</li>
+<li>
+<p><strong>Request body encodings.</strong> <code>pool/attestations</code>, <code>pool/payload_attestations</code>
 and <code>aggregate_and_proofs</code> take either JSON (<code>application/json</code>, also the
 reading of a request with no <code>Content-Type</code>) or the SSZ <code>List[...]</code> of the
 same items (<code>application/octet-stream</code>): the offset-table encoding every
@@ -559,17 +580,50 @@ votes, with a JSON retry only on a <code>415</code>, and what nimbus can send fo
 attestations. Any other content type is a <code>415</code>, and a body that does not
 decode in the type’s encoding a <code>400</code>. <code>POST beacon/blocks</code> and
 <code>POST beacon/execution_payload_envelopes</code> choose the same way (below); the
-other validator-client submissions are JSON.</li>
-<li><strong>The attestation pool</strong> holds, the best-covered per data root and
+other validator-client submissions are JSON.</p>
+</li>
+<li>
+<p><strong>The attestation pool</strong> holds, the best-covered per data root and
 committee: votes from <code>pool/attestations</code> and the aggregator subnets,
 aggregates from <code>aggregate_and_proofs</code>, and every electra gossip aggregate
 P2P accepts (gloas aggregates included, in gloas’s container), once all three
 of its signatures have verified. Gossip aggregates are pooled on arrival, so a slot’s aggregates are there when the
 next slot’s block is asked for. Entries more than an epoch old are dropped
-once a slot.</li>
-<li><strong><code>prepare_beacon_proposer</code></strong> records each validator’s fee recipient, in
-memory (a validator client repeats the call every epoch).</li>
-<li><strong><code>blocks/{slot}</code></strong> advances the head state to the slot and asks the node’s
+once a slot.</p>
+</li>
+<li>
+<p><strong><code>prepare_beacon_proposer</code></strong> records each validator’s fee recipient, in
+memory (a validator client repeats the call every epoch).</p>
+</li>
+<li>
+<p><strong><code>register_validator</code></strong> takes a JSON array or an SSZ list of signed
+builder registrations. Registrations of validators the head state does not
+hold, or holds as exited, are dropped and counted
+(<code>lean_beacon_builder_registrations_total</code>), not refused. Exit is judged at
+the later of the head’s epoch and the wall clock’s, so a lagging head cannot
+let an exited validator through. The beacon-APIs say
+they must not reach the builder, not that the request fails. Each kept
+registration also sets its validator’s fee recipient, so a block built
+locally still pays the registered address. As in Lighthouse, that happens
+before the builder is asked: it holds whatever the builder answers, and with
+no <code>--builder</code> at all. Signatures are not checked here (Lighthouse does not
+check them either); the builder does. A validator registered more than once
+in one request keeps only its newest registration by <code>timestamp</code> (the later
+one on a tie, as builders order them), counted as <code>duplicate</code>. The kept ones
+go to <code>--builder</code> in one call, skipped when none are left. A builder’s 400
+is passed through and any other failure is a 500; with no <code>--builder</code> the
+answer is 500, an empty list included, which is answered without reading
+the head state. Only once the builder accepts them are they remembered for
+block production (the proposer asks the builder for a bid, against the
+registered gas limit): the builder verifies their signatures and this node
+does not, so a registration it refuses must not steer this node’s bids.
+Future improvement: every other call walks the whole
+registry once, with nothing bounding how many walks run at once; a
+pubkey-to-index map beside the head state would make it a lookup per
+registration.</p>
+</li>
+<li>
+<p><strong><code>blocks/{slot}</code></strong> advances the head state to the slot and asks the node’s
 own execution client to build on the head (<code>forkchoiceUpdatedV3</code> with
 payload attributes, then <code>getPayloadV5</code>), with the proposer’s fee recipient.
 The body packs the pool’s best aggregates (committees voting alike merged
@@ -585,13 +639,64 @@ aggregate described under <a href="#sync-committee">Sync committee</a> (empty wh
 nothing verifiable is pooled). The payload bundle’s KZG commitments go in the body. The state
 root comes from running the block through <code>process_block</code>. The answer is
 fulu <code>BlockContents</code>: the block, the bundle’s cell proofs and its blobs, with
-<code>Eth-Execution-Payload-Blinded: false</code>; there is no builder flow. It is a
-<strong><code>503</code></strong> without a configured execution client, or when the bundle is
-malformed (its commitments, proofs and blobs disagree in count). A slot the
+<code>Eth-Execution-Payload-Blinded: false</code>. It is a
+<strong><code>503</code></strong> while the node is syncing (checked before the head is read, as
+for the duties endpoints), without a configured execution client, or when
+the bundle is malformed (its commitments, proofs and blobs disagree in
+count). The head state is advanced to the slot on a blocking thread. A slot the
 schedule does not place at fulu (gloas included) is a <code>400</code>, checked before
 the execution client; <code>produceBlockV3</code> is the fulu endpoint, and a gloas slot
-goes to <code>produceBlockV4</code>.</li>
-<li><strong>Graffiti</strong> is the validator client’s, with both clients’ codes and
+goes to <code>produceBlockV4</code>. So is a slot that has not started yet: one starting
+more than <code>MAXIMUM_GOSSIP_CLOCK_DISPARITY</code> (500 ms) after this node’s clock,
+gossip’s <code>is_future_slot</code>, is refused before any state is advanced to it.
+Every block endpoint here applies the same bound, since advancing to a
+far-future slot would run every epoch transition up to it. A validator client
+asks once its slot has started, and a block further ahead would be ignored on
+gossip anyway.</p>
+<p><strong>The builder path</strong> is taken only when <code>--builder</code> is set, the proposer
+registered through this node (<code>register_validator</code>, remembered for two
+epochs after it was last sent), and the circuit breaker is quiet: it keeps
+the builder out while the node is syncing, the head is optimistic, finality
+is too far behind, or too many slots were skipped (the <code>--builder-fallback-*</code>
+flags set the thresholds). The builder’s <code>getHeader</code> is then asked
+concurrently with the local build, bounded by its own timeout, and an error
+or a timeout means no bid. Once a bid has passed its checks, the local build
+has until two seconds after the two were asked for (<code>LOCAL_BUILD_DEADLINE</code>;
+Lodestar’s race cutoff and Lighthouse’s <code>getPayload</code> timeout are both 2 s):
+an execution client still silent then is given up on with a warning, and
+the bid is served as for any failed local build. Without a valid bid the
+local build is waited for as it is without a builder. A bid is checked
+before it competes: the head’s execution block as its parent, the
+proposal’s <code>prev_randao</code>
+and timestamp, the parent’s block number plus one, the withdrawals root,
+the blob commitment and blob gas bounds, a gas limit within one step of the parent’s toward the registered target,
+and its signature, verified against the key the bid itself names. That
+catches a corrupted bid and an honest endpoint’s mistakes, not the endpoint
+or a man in the middle on a plain-HTTP <code>--builder</code> signing a changed bid
+again under a key of its own: the endpoint is trusted, as in every client
+(Lighthouse, Teku, Prysm and Nimbus verify against the bid’s own key too,
+and Lodestar does not verify it). Its fee recipient is not checked, since builders
+name themselves there and pay the proposer with a transaction this node never
+sees before signing; the relay checks that payment (see
+<code>spec_deviations.md</code>). A bid that passes goes through <code>assemble_blinded_block</code>
+with the packed attestations, operations and sync aggregate, so the blinded
+block’s state root comes from running the block through <code>process_block</code>.
+<code>builder_boost_factor</code> (percent, default 100) then weighs the two: the local
+payload wins iff its value is at least <code>factor * bid / 100</code>, multiplied
+first and rounded down once (the spec’s text rounds the bid first; see
+<code>spec_deviations.md</code>), so a tie and a
+factor of 0 keep it and <code>u64::MAX</code> takes the bid; the execution client’s
+<code>shouldOverrideBuilder</code> keeps the local payload whatever the bid pays. If one
+side fails the other is served, even under the override: a local block that
+fails to build then gives way to the builder’s, with a warning, since a
+block beats a missed slot. A bid that pays nothing is not refused, but
+it never beats a local payload, whatever the factor: it is served only when
+the local payload or its block fails. A blinded answer is the blinded block as SSZ
+or JSON, with <code>Eth-Execution-Payload-Blinded: true</code> and
+<code>Eth-Execution-Payload-Value</code> set to the bid’s value in wei.</p>
+</li>
+<li>
+<p><strong>Graffiti</strong> is the validator client’s, with both clients’ codes and
 commits appended as far as they fit: <code>hello RH1a2bLA3c4d</code> for reth at
 <code>1a2b…</code> under ethlambda at <code>3c4d…</code>. The execution client’s half comes from
 <code>engine_getClientVersionV1</code>, asked alongside the payload build and given up
@@ -601,14 +706,22 @@ suffix shrinks rather than cutting the validator’s text short, in
 Lighthouse’s tiers, and is appended to every block with no opt-out; the
 <code>graffiti_policy</code> parameter Lighthouse’s validator client sends is not read.
 <code>LA</code> is ethlambda’s own code: <code>identification.md</code> reserves none for it and
-lets an unlisted client pick any two letters no listed client uses.</li>
-<li><strong><code>POST beacon/blocks</code></strong> takes JSON or SSZ, by <code>Content-Type</code> as above, and
+lets an unlisted client pick any two letters no listed client uses.</p>
+</li>
+<li>
+<p><strong><code>POST beacon/blocks</code></strong> takes JSON or SSZ, by <code>Content-Type</code> as above, and
 the <code>Eth-Consensus-Version</code> header (<code>fulu</code> or <code>gloas</code>, else <code>400</code>; any other
 content type is a <code>415</code>). The JSON is the specification’s: lodestar’s and
 nimbus’s validator clients post it, teku’s falls back to it, and lighthouse
 and prysm post SSZ. Both reach the same checks after decoding. Fulu: a
-<code>SignedBlockContents</code>. A slot the schedule does not place at fulu is a <code>400</code>,
-checked before any state is advanced. The block is then checked against its
+<code>SignedBlockContents</code>. A slot the schedule does not place at fulu, one that
+has not started yet (see <code>produceBlockV3</code>), or one at or below the finalized
+checkpoint’s first slot is a <code>400</code>, and so is a parent at or below that slot
+that is not the finalized block itself, since the finalized checkpoint
+cannot be its ancestor (gossip’s IGNORE and REJECT rules for the two). All
+are checked before any state is advanced, and so before the signature: they
+bound how far an unauthenticated request can make this node advance an old
+parent’s state. The block is then checked against its
 <strong>parent’s</strong> state advanced to its slot: an unknown parent, a slot not after
 the parent’s, the wrong proposer or a bad proposer signature is a <code>400</code>. Then
 every blob’s cells are computed and all cell proofs batch-verified on a
@@ -619,18 +732,51 @@ on <code>data_column_sidecar_{compute_subnet_for_data_column_sidecar(index)}</co
 last the chain actor gets this node’s custody columns, then the block, to
 import. Gloas: a bare <code>gloas::SignedBeaconBlock</code> (a gloas block carries no
 payload or blobs, so no sidecars go with it; they follow in the envelope). The
-slot must be scheduled at gloas, the parent must be held, the slot must be
+slot must be scheduled at gloas, have started and be after the finalized
+slot, the parent must be held and pass the same finality check, the slot must be
 after the parent’s, and the proposer and signature are checked against the
 parent’s state advanced to the slot (all <code>400</code> otherwise), before the block is
-gossiped and handed to the chain actor.</li>
-<li><strong>The operation pool</strong> holds, beside the attestation pool and in memory in
+gossiped and handed to the chain actor. This node publishes one block per
+slot: a second block for a slot whose root differs from the first, through
+this endpoint or <code>blinded_blocks</code>, is a <code>400</code>, since a validator that signed
+two would be slashed. The same block again is a retry and passes. A slot
+below the finalized one is refused too, since claims there are forgotten.</p>
+</li>
+<li>
+<p><strong><code>POST beacon/blinded_blocks</code></strong> takes a fulu <code>SignedBlindedBeaconBlock</code> as
+JSON or SSZ, by <code>Content-Type</code> as above, with <code>Eth-Consensus-Version: fulu</code>.
+It is checked as a fulu <code>beacon/blocks</code> is, before anything leaves this node:
+the slot is scheduled at fulu, has started and is after the finalized slot,
+the parent is held, passes the finality check and is before the block, the
+proposer is the one the parent’s state names for the slot, and the proposer’s
+signature verifies (a blinded block has its full block’s root, so the check
+is the same). Then the slot is claimed, shared with <code>beacon/blocks</code>, and the
+block goes to the builder (<code>submitBlindedBlockV2</code>) on its own task, so a
+validator client that hangs up cannot cancel the reveal. The builder
+publishes the full block and its data columns; it returns over gossip and
+imports like any block, and nothing is gossiped here. The body limit is
+the one <code>beacon/blocks</code> has (<code>413</code> over it). The builder’s answer is logged
+from the submission task, an error when it did not take a signed block.
+The status is the builder’s: 202 becomes <code>200</code>, a builder <code>400</code> stays <code>400</code>, and anything else
+is a <code>500</code>. Only 202 is success, as builder-specs defines <code>submitBlindedBlockV2</code>;
+a builder answering another 2xx (200 is what V1 answered) gets a <code>500</code> too,
+with an error log of its own saying the builder may have published the block
+anyway, so an operator can tell it from a refusal. There is no local fallback, since a second block would be an
+equivocation. With no <code>--builder</code> the answer is <code>500</code>. <code>broadcast_validation</code>
+is not read: the checks above run whatever it names, and the builder, not
+this node, broadcasts the block.</p>
+</li>
+<li>
+<p><strong>The operation pool</strong> holds, beside the attestation pool and in memory in
 the same <code>Store</code> (<code>Store::operation_pool</code>): proposer slashings (one per
 proposer), attester slashings (one per <code>hash_tree_root</code>), voluntary exits and
 BLS changes (one per validator), first one wins. Entries come from the four
 <code>pool/*</code> POST routes and from gossip P2P accepts, so each has passed the
 topic’s gossip rules; the pool never checks a signature. Entries the head
-state has made pointless are pruned.</li>
-<li><strong><code>pool/proposer_slashings</code>, <code>pool/attester_slashings</code>, <code>pool/voluntary_exits</code>
+state has made pointless are pruned.</p>
+</li>
+<li>
+<p><strong><code>pool/proposer_slashings</code>, <code>pool/attester_slashings</code>, <code>pool/voluntary_exits</code>
 and <code>pool/bls_to_execution_changes</code></strong>: <code>GET</code> lists the pool. <code>POST</code> runs the
 specification’s <code>validate_*_gossip</code> rule for the topic against the head’s
 post-state as it is (consensus-specs v1.7.0-beta.1; no <code>process_*</code> and no
@@ -638,7 +784,8 @@ state advance, and an attester slashing’s range and slashability checks run
 before its BLS checks), pools the operation and gossips it on the topic. A
 rejected operation is a <code>400</code>. <code>bls_to_execution_changes</code> takes an array: on
 partial failure the response is a <code>400</code> listing the failures by index, and
-the valid entries are still pooled and published.</li>
+the valid entries are still pooled and published.</p>
+</li>
 </ul>
 <h3 id="gloas-block-production"><a class="header" href="#gloas-block-production">Gloas block production</a></h3>
 <p>A gloas proposer signs two things on their own, the block and the envelope that
@@ -661,8 +808,8 @@ entries are decoded and not consulted.</p>
 <tr><td><code>200</code> SSZ</td><td>Self-built with <code>include_payload=true</code>: <code>BlockContents</code> (<code>block</code>, <code>execution_payload_envelope</code>, <code>kzg_proofs</code>, <code>blobs</code>). Otherwise, and for every bid-won block, the bare <code>gloas::BeaconBlock</code></td></tr>
 <tr><td><code>200</code> JSON</td><td><code>{version: "gloas", consensus_block_value, execution_payload_value, execution_payload_included, data}</code>, where <code>data</code> is the same container as the SSZ body</td></tr>
 <tr><td>Response headers</td><td><code>Eth-Consensus-Version: gloas</code>, <code>Eth-Execution-Payload-Included</code> (<code>true</code> or <code>false</code>; always <code>false</code> for a bid-won block), <code>Eth-Execution-Payload-Value</code> (wei, decimal; a bid’s value times <code>10^9</code> when it won), <code>Eth-Consensus-Block-Value</code> (always <code>0</code>: the comparison is of execution payload values only). No <code>Eth-Builder-Url</code>: that is for builder-API bids</td></tr>
-<tr><td><code>400</code></td><td>A slot the schedule does not place at gloas, a missing or malformed query, a wrong <code>Eth-Consensus-Version</code>, a bad body, a slot not after the head block, or a <code>randao_reveal</code> that does not verify against the slot’s proposer. The slot check precedes the execution-client check, so it is a <code>400</code> on any node</td></tr>
-<tr><td><code>503</code></td><td>No execution client and no viable pooled bid for the slot, the execution client did not start or return a build (and no bid took its place), the node is building on a FULL parent whose envelope it does not hold, or the winning bid failed to build and there is no local payload to fall back on</td></tr>
+<tr><td><code>400</code></td><td>A slot the schedule does not place at gloas or that has not started yet (more than 500 ms ahead of this node’s clock, as for <code>produceBlockV3</code>), a missing or malformed query, a wrong <code>Eth-Consensus-Version</code>, a bad body, a slot not after the head block, or a <code>randao_reveal</code> that does not verify against the slot’s proposer. The slot check precedes the execution-client check, so it is a <code>400</code> on any node</td></tr>
+<tr><td><code>503</code></td><td>The node is syncing (checked before the head is read), no execution client and no viable pooled bid for the slot, the execution client did not start or return a build (and no bid took its place), the node is building on a FULL parent whose envelope it does not hold, or the winning bid failed to build and there is no local payload to fall back on</td></tr>
 </tbody>
 </table>
 </div>
