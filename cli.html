@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-ec71fa14.js";
+            window.path_to_searchindex_js = "searchindex-2c548559.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -472,7 +472,13 @@ does a record that is a symlink (say, onto another volume) rather than a
 regular file, since a dangling one would read as “no record”; and
 the directory should be a local disk, since every signature waits for the
 record to be flushed to it, and the lock that keeps a second process off it
-is an <code>flock</code>, which a network filesystem may not honour. Unix only. A key with no record is refused at startup unless
+is an <code>flock</code>, which a network filesystem may not honour. Unix only. Run the
+client under a supervisor that restarts it (systemd’s <code>Restart=on-failure</code>,
+a Kubernetes pod): if a bug ever panics while the record is held, the record
+is unusable for the rest of that process and no attestation or block can be
+signed, so the client stops at once and exits with a failure, after letting
+a keymanager request in flight finish, and the restart rereads the record
+from disk. A key with no record is refused at startup unless
 <code>--init-slashing-protection</code> is passed. A key moving here from another client
 brings its history with <a href="#slashing-protection"><code>slashing-protection import</code></a>,
 or in the same keymanager API request that imports the key. See
@@ -509,8 +515,12 @@ advance so it can collect the votes.</p>
 <p>Each slot it wakes at the boundary. If one of its validators proposes that
 slot, it signs the RANDAO reveal, asks the beacon node for a block, checks that
 the block is for the slot and proposer it asked about, signs it and publishes
-it. One third into the slot it fetches the attestation data, signs for every
-validator due that slot, and submits the batch. Two thirds in, for any duty it
+it. One third into the slot it fetches the attestation data, checks that it is
+for the slot it asked about and that its <code>index</code> is one the slot’s fork allows
+(0 before gloas, 0 or 1 from it, where it is the payload signal), signs for
+every validator due that slot, and submits the batch. A node whose answer fails
+either check is passed over for the next one in <code>--beacon-nodes</code>, before
+anything is recorded or signed. Two thirds in, for any duty it
 was selected to aggregate, it asks the node for the aggregate covering that
 committee’s votes on the data it just signed, wraps it with the selection proof
 and publishes it.</p>
@@ -721,7 +731,7 @@ ethlambda slashing-protection export --validators-dir ./validators --pubkeys 0xa
 </thead>
 <tbody>
 <tr><td><code>import &lt;file&gt;</code></td><td>Merges a version 5 interchange, complete or minimal, into the record. Each validator is reduced to its highest slot, source and target and merged by maximum, so nothing already recorded is lowered and slashable data in the file is absorbed rather than refused, except an attestation whose source is at or past its target outside genesis, which is refused. All or nothing. With no record yet, the import creates one for the interchange’s chain, and a failed import creates nothing; the client refuses the record at its next start if that is not its beacon node’s chain</td></tr>
-<tr><td><code>export [--pubkeys ...] &lt;file&gt;</code></td><td>Writes the record, or the named validators’ part of it, as a minimal version 5 interchange, readable by its owner only. A named validator with no record fails the export, so a typo or the wrong directory cannot produce a file that reads as complete. Takes the record’s lock, so the directory must be writable. Refuses to overwrite an existing file</td></tr>
+<tr><td><code>export [--pubkeys ...] &lt;file&gt;</code></td><td>Writes the record, or the named validators’ part of it, as a minimal version 5 interchange, readable by its owner only. A named validator with no record fails the export, so a typo or the wrong directory cannot produce a file that reads as complete. Writes nothing to the directory, and the lock is on the directory itself, so a read-only one will do. Refuses to overwrite an existing file</td></tr>
 </tbody>
 </table>
 </div>
