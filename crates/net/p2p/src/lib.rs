@@ -492,9 +492,10 @@ pub(crate) struct HeadWatch {
     /// that a whole window of deliveries has not moved the head with are not
     /// importing, however many more keep coming.
     delivering_since: Option<u64>,
-    /// The peers that handed blocks over since the head last moved, each with
-    /// the highest slot it handed over.
-    deliverers: HashMap<PeerId, u64>,
+    /// The peers that handed blocks over, each with the last slot of every
+    /// batch the head has not reached yet (the most recent
+    /// [`Self::MAX_TRACKED_BATCHES`]).
+    deliverers: HashMap<PeerId, Vec<u64>>,
     /// Watermark drops at the current head, each of which doubles the wait
     /// before the next one.
     drops: u32,
@@ -509,6 +510,9 @@ impl HeadWatch {
     /// under two hours on beacon.
     const MAX_BACKOFF: u32 = 4;
 
+    /// Batches kept per deliverer; older ones are forgotten.
+    const MAX_TRACKED_BATCHES: usize = 16;
+
     /// Note the head at `wall_slot`, and whether blocks are being handed over,
     /// returning how many slots it has stayed at `head_slot` since the first
     /// delivery after it last moved (since it moved, with none). Zero
@@ -520,7 +524,10 @@ impl HeadWatch {
             // A peer whose blocks the head has not reached yet is still
             // answerable for them: a valid prefix that moved the head must
             // not clear the invalid rest.
-            self.deliverers.retain(|_, through| *through > head_slot);
+            self.deliverers.retain(|_, ends| {
+                ends.retain(|end| *end > head_slot);
+                !ends.is_empty()
+            });
             self.drops = 0;
         }
         if delivering {
@@ -543,18 +550,29 @@ impl HeadWatch {
         self.seen.map(|(head_slot, _)| head_slot)
     }
 
-    /// Take the deliverers whose blocks the head at `head_slot` has reached.
+    /// The deliverers the head at `head_slot` has reached a batch of: they
+    /// served what they claimed, whatever else of theirs is still queued.
+    /// Batches reached are forgotten.
     pub(crate) fn reached(&mut self, head_slot: u64) -> Vec<PeerId> {
-        self.deliverers
-            .extract_if(|_, through| *through <= head_slot)
-            .map(|(peer, _)| peer)
-            .collect()
+        let mut reached = Vec::new();
+        self.deliverers.retain(|peer, ends| {
+            let before = ends.len();
+            ends.retain(|end| *end > head_slot);
+            if ends.len() != before {
+                reached.push(*peer);
+            }
+            !ends.is_empty()
+        });
+        reached
     }
 
-    /// Note that `peer` handed blocks over, through slot `through`.
+    /// Note that `peer` handed over a batch ending at slot `through`.
     pub(crate) fn note_delivery(&mut self, peer: PeerId, through: u64) {
-        let highest = self.deliverers.entry(peer).or_insert(through);
-        *highest = (*highest).max(through);
+        let ends = self.deliverers.entry(peer).or_default();
+        ends.push(through);
+        if ends.len() > Self::MAX_TRACKED_BATCHES {
+            ends.remove(0);
+        }
     }
 
     /// How long the head must stay flat before the next drop: `window`,
@@ -576,7 +594,10 @@ impl HeadWatch {
         self.delivering_since = None;
         self.watermark = head_slot;
         self.drops = self.drops.saturating_add(1);
-        self.deliverers.drain().collect()
+        self.deliverers
+            .drain()
+            .filter_map(|(peer, ends)| Some((peer, ends.into_iter().max()?)))
+            .collect()
     }
 }
 
@@ -2156,8 +2177,11 @@ impl P2PServer {
     pub(crate) fn beacon_status_v2(&mut self) -> Option<beacon::messages::StatusV2> {
         let wire = self.wire.beacon()?;
         let slot = wall_clock_slot(&self.store);
+        // Rebuilt on a new slot, and on a fork-digest switch within one: a
+        // peer that switched would take the old digest for another network.
         if let Some((built_at, status)) = &self.beacon_status
             && *built_at == slot
+            && status.fork_digest == wire.fork_digest
         {
             return Some(status.clone());
         }
@@ -2299,6 +2323,8 @@ impl P2PServer {
         }
         let status = RefreshStatus::build(self);
         for peer in peers {
+            // One request in flight per peer: no refresh until this is over.
+            self.peer_heads.begin_status_request(peer);
             match &status {
                 RefreshStatus::Beacon(v2) => {
                     let version = self.peer_heads.status_version(&peer);
@@ -2352,7 +2378,7 @@ async fn handle_swarm_event(
                 server.connected_peers.insert(peer_id, direction);
                 // Both chains send the handshake below; no refresh until it
                 // is answered or fails.
-                server.peer_heads.begin_handshake(peer_id);
+                server.peer_heads.begin_status_request(peer_id);
                 server.refresh_peer_metrics();
                 let peer_count = server.connected_peers.len();
                 metrics::notify_peer_connected(

@@ -37,6 +37,7 @@ use tracing::debug;
 
 use crate::P2PServer;
 use crate::beacon::handler::StatusVersion;
+use ethlambda_types::beacon::primitives::ForkDigest;
 
 /// Slots a `Status` head may sit past the wall clock and still count: Lighthouse's
 /// `FUTURE_SLOT_TOLERANCE` and Prysm's `maxFutureStatusHeadSlot`.
@@ -122,13 +123,13 @@ pub(crate) struct PeerHeads {
     /// Peers that have answered a `Status` of ours on this connection. The
     /// first answer is the handshake's, and every later one is a refresh's,
     /// which needs a larger lead to start a range sync. No refresh goes out
-    /// while the handshake is (see [`Self::awaiting_handshake`]), so the
+    /// while the handshake is (see [`Self::awaiting_answer`]), so the
     /// answers cannot arrive out of order.
     answered: HashSet<PeerId>,
     /// Peers whose handshake `Status` is still out: neither answered nor
     /// failed. They are not refreshed meanwhile, or a refresh answered before
     /// a slow handshake answer would be taken for the handshake's.
-    awaiting_handshake: HashSet<PeerId>,
+    awaiting_answer: HashSet<PeerId>,
     /// Each peer's failed range requests (an empty or refused answer, a
     /// timeout) since the head last reached blocks it handed over. A peer that has just failed is
     /// cooling down (see [`Self::range_cooling_down`]): it is not synced
@@ -164,9 +165,10 @@ pub(crate) struct PeerHeads {
     /// The wall-clock slot of each connected peer's last `Status` exchange, in
     /// either direction: the last time it told us its head, or we asked.
     last_exchange: HashMap<PeerId, u64>,
-    /// Peers whose last beacon `Status` came from a fork digest this node does
-    /// not hold, so a refresh that finds one still there is not a new event.
-    foreign_digest: HashSet<PeerId>,
+    /// The fork digest each peer's last beacon `Status` came from, while it is
+    /// one this node does not hold, so a refresh that finds the peer still
+    /// there is not a new event (a move to another such digest is).
+    foreign_digest: HashMap<PeerId, ForkDigest>,
     /// The `Status` version each beacon peer last exchanged in, so a refresh
     /// asks in the version the peer is known to speak.
     status_versions: HashMap<PeerId, StatusVersion>,
@@ -205,13 +207,17 @@ impl PeerHeads {
         Report::Counted
     }
 
-    /// Forget the failure runs whose longest cooldown ran out twice over by
-    /// `wall_slot`: kept across a reconnect, which would otherwise reset a
-    /// peer's backoff, they are dropped only once they no longer matter.
+    /// Forget the failure runs whose longest cooldown ran out by `wall_slot`:
+    /// kept across a reconnect, which would otherwise reset a peer's backoff,
+    /// they are dropped only once they no longer matter.
     pub(crate) fn prune_range_failures(&mut self, wall_slot: u64, interval: u64) {
+        // A run quiet for its longest cooldown is over: kept longer, a peer
+        // failing now and then would reach the suspicion threshold from
+        // failures far apart, and a run outliving the suspicion it led to
+        // would renew it at the next failure.
         let longest = interval.saturating_mul(1 << MAX_COOLDOWN_DOUBLINGS);
         self.range_failures
-            .retain(|_, failures| failures.last.saturating_add(2 * longest) > wall_slot);
+            .retain(|_, failures| failures.last.saturating_add(longest) > wall_slot);
     }
 
     /// Drop every report older than `lifetime` slots at `wall_slot`. Returns
@@ -229,7 +235,7 @@ impl PeerHeads {
     pub(crate) fn forget(&mut self, peer: &PeerId) {
         self.heads.remove(peer);
         self.answered.remove(peer);
-        self.awaiting_handshake.remove(peer);
+        self.awaiting_answer.remove(peer);
         self.muted.remove(peer);
         self.inbound_at.remove(peer);
         self.last_exchange.remove(peer);
@@ -319,7 +325,7 @@ impl PeerHeads {
         for peer in connected {
             connected_count += 1;
             let last = *self.last_exchange.entry(peer).or_insert(wall_slot);
-            if self.awaiting_handshake.contains(&peer) || self.muted.contains(&peer) {
+            if self.awaiting_answer.contains(&peer) || self.muted.contains(&peer) {
                 continue;
             }
             if last.saturating_add(interval) <= wall_slot {
@@ -396,15 +402,18 @@ impl PeerHeads {
         self.refreshed_at.replace(wall_slot) != Some(wall_slot)
     }
 
-    /// Note that the handshake `Status` to `peer` has gone out.
-    pub(crate) fn begin_handshake(&mut self, peer: PeerId) {
-        self.awaiting_handshake.insert(peer);
+    /// Note that a `Status` request to `peer` (the handshake, or a refresh)
+    /// has gone out. No other is sent until it is over, so answers come back
+    /// in the order the requests went out: a slow answer can neither be
+    /// taken for the handshake's nor overwrite a newer one's head.
+    pub(crate) fn begin_status_request(&mut self, peer: PeerId) {
+        self.awaiting_answer.insert(peer);
     }
 
-    /// Note that `peer`'s handshake is over, answered or failed, so it may be
-    /// refreshed again.
-    pub(crate) fn end_handshake(&mut self, peer: &PeerId) {
-        self.awaiting_handshake.remove(peer);
+    /// Note that `peer`'s outstanding `Status` request is over, answered or
+    /// failed, so it may be refreshed again.
+    pub(crate) fn end_status_request(&mut self, peer: &PeerId) {
+        self.awaiting_answer.remove(peer);
     }
 
     /// Note an answer from `peer` to a `Status` of ours, returning whether it
@@ -414,17 +423,18 @@ impl PeerHeads {
         !self.answered.insert(peer)
     }
 
-    /// Note whether `peer`'s latest beacon `Status` came from a fork digest
-    /// this node holds. Returns whether the peer has only now moved to one it
-    /// does not: the event worth a warning and a count, once, rather than on
-    /// every refresh of a connection that has been on a foreign digest all
-    /// along.
-    pub(crate) fn note_digest(&mut self, peer: PeerId, held: bool) -> bool {
-        if held {
-            self.foreign_digest.remove(&peer);
-            false
-        } else {
-            self.foreign_digest.insert(peer)
+    /// Note the fork digest `peer`'s latest beacon `Status` came from, `None`
+    /// for one this node holds. Returns whether the peer has only now moved
+    /// to a digest it does not hold: the event worth a warning and a count,
+    /// once per move, rather than on every refresh of a connection that has
+    /// been on it all along.
+    pub(crate) fn note_digest(&mut self, peer: PeerId, foreign: Option<ForkDigest>) -> bool {
+        match foreign {
+            None => {
+                self.foreign_digest.remove(&peer);
+                false
+            }
+            Some(digest) => self.foreign_digest.insert(peer, digest) != Some(digest),
         }
     }
 
@@ -661,7 +671,7 @@ mod tests {
         let peer = PeerId::random();
         heads.record(peer, 100, H256::ZERO, 100, false);
         assert!(!heads.answer_is_refresh(peer));
-        heads.note_digest(peer, false);
+        heads.note_digest(peer, Some(DIGEST_A));
         heads.note_status_version(peer, StatusVersion::V2);
         heads.forget(&peer);
         assert_eq!(heads.network_head(0, 1), None);
@@ -670,9 +680,21 @@ mod tests {
         heads.forget(&peer);
         assert_eq!(heads.status_version(&peer), StatusVersion::V1);
         // A reconnect on a foreign digest is news again.
-        assert!(heads.note_digest(peer, false));
+        assert!(heads.note_digest(peer, Some(DIGEST_A)));
         // A reconnect is a fresh handshake, not a refresh that is overdue.
         assert!(heads.due_for_refresh([peer], 1_000, 4).is_empty());
+    }
+
+    const DIGEST_A: ForkDigest = [0xaa; 4];
+    const DIGEST_B: ForkDigest = [0xbb; 4];
+
+    #[test]
+    fn a_move_between_two_foreign_digests_is_news() {
+        let mut heads = PeerHeads::default();
+        let peer = PeerId::random();
+        assert!(heads.note_digest(peer, Some(DIGEST_A)));
+        assert!(heads.note_digest(peer, Some(DIGEST_B)));
+        assert!(!heads.note_digest(peer, Some(DIGEST_B)));
     }
 
     #[test]
@@ -681,11 +703,11 @@ mod tests {
         // half epoch; only the move onto that digest is worth a warning.
         let mut heads = PeerHeads::default();
         let peer = PeerId::random();
-        assert!(heads.note_digest(peer, false));
-        assert!(!heads.note_digest(peer, false));
+        assert!(heads.note_digest(peer, Some(DIGEST_A)));
+        assert!(!heads.note_digest(peer, Some(DIGEST_A)));
         // Back on a held digest, then off again: a new move.
-        assert!(!heads.note_digest(peer, true));
-        assert!(heads.note_digest(peer, false));
+        assert!(!heads.note_digest(peer, None));
+        assert!(heads.note_digest(peer, Some(DIGEST_A)));
     }
 
     #[test]
@@ -751,10 +773,10 @@ mod tests {
         // taken for the handshake's, and could start a one-block range sync.
         let mut heads = PeerHeads::default();
         let peer = PeerId::random();
-        heads.begin_handshake(peer);
+        heads.begin_status_request(peer);
         heads.due_for_refresh([peer], 10, 4);
         assert!(heads.due_for_refresh([peer], 20, 4).is_empty());
-        heads.end_handshake(&peer);
+        heads.end_status_request(&peer);
         assert_eq!(heads.due_for_refresh([peer], 20, 4), vec![peer]);
     }
 
@@ -815,7 +837,7 @@ mod tests {
         heads.note_range_failure(peer, 200);
         heads.forget(&peer);
         assert!(heads.range_cooling_down(&peer, 200, 2));
-        heads.prune_range_failures(200 + 4 * (2 << MAX_COOLDOWN_DOUBLINGS), 2);
+        heads.prune_range_failures(200 + 2 * (2 << MAX_COOLDOWN_DOUBLINGS), 2);
         assert!(heads.range_failures.is_empty());
     }
 

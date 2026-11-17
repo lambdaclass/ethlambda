@@ -445,7 +445,7 @@ pub async fn handle_req_resp_message(
                             // never be refreshed.
                             None => {
                                 if is_status_protocol(request_id.protocol) {
-                                    server.peer_heads.end_handshake(&peer);
+                                    server.peer_heads.end_status_request(&peer);
                                 }
                             }
                         }
@@ -557,7 +557,7 @@ pub async fn handle_req_resp_message(
                     } else if is_status_protocol(request_id.protocol) {
                         // A handshake that failed is over: the refresh takes
                         // its place. A failed refresh changes nothing here.
-                        server.peer_heads.end_handshake(&peer);
+                        server.peer_heads.end_status_request(&peer);
                     }
                 }
             }
@@ -759,7 +759,7 @@ async fn handle_lean_status_response(server: &mut P2PServer, status: Status, pee
     // count against the next connection's handshake.
     let connected = server.connected_peers.contains_key(&peer);
     if connected {
-        server.peer_heads.end_handshake(&peer);
+        server.peer_heads.end_status_request(&peer);
     }
     let refresh = connected && server.peer_heads.answer_is_refresh(peer);
     let refresh_lead = refresh.then(|| peer_heads::thresholds(&server.store).peer_lead);
@@ -1904,7 +1904,7 @@ async fn handle_status_request(
         // answer honestly. Counting it is how a digest that has moved under us
         // becomes visible, so it is counted when the peer moves onto it, not
         // again on every `Status` the peer sends from there.
-        if server.peer_heads.note_digest(peer, false) {
+        if server.peer_heads.note_digest(peer, Some(peer_digest)) {
             warn!(
                 %peer,
                 peer_digest = %hex::encode(peer_digest),
@@ -1917,7 +1917,7 @@ async fn handle_status_request(
         }
         peer_heads::drop_claim(server, &peer);
     } else {
-        server.peer_heads.note_digest(peer, true);
+        server.peer_heads.note_digest(peer, None);
         trace!(
             %peer,
             peer_head_slot = peer_status.head_slot(),
@@ -2087,7 +2087,7 @@ async fn handle_status_response(
     }
     // Any answer ends the handshake, from whatever digest: the peer may be
     // refreshed from now on.
-    server.peer_heads.end_handshake(&peer);
+    server.peer_heads.end_status_request(&peer);
     let Some(wire) = server.wire.beacon() else {
         return;
     };
@@ -2101,7 +2101,7 @@ async fn handle_status_response(
     if !held {
         // Counted when the peer moves onto the digest, not again on every
         // refresh of a connection that stays there; see the request side.
-        if server.peer_heads.note_digest(peer, false) {
+        if server.peer_heads.note_digest(peer, Some(peer_digest)) {
             warn!(
                 %peer,
                 peer_digest = %hex::encode(peer_digest),
@@ -2115,7 +2115,7 @@ async fn handle_status_response(
         peer_heads::drop_claim(server, &peer);
         return;
     }
-    server.peer_heads.note_digest(peer, true);
+    server.peer_heads.note_digest(peer, None);
     // Answered at any held digest, but only synced from on the current one (or
     // the next, within clock skew): after a boundary, a peer still on the old
     // digest has not upgraded, and its chain is not the one being followed.
