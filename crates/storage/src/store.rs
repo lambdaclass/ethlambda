@@ -3339,9 +3339,10 @@ impl Store {
     /// The head slot the chain actor last judged the sync gate at, which P2P
     /// reads instead of the head itself: on beacon, reading the head decodes
     /// the whole head block, and the chain actor has just read it anyway.
-    /// `None` before the actor's first judgment. Never older than the latest
-    /// judgment, which follows every head change. Runtime-only and shared by
-    /// every clone of this `Store`.
+    /// `None` before the actor's first judgment. As old as the latest
+    /// judgment, which follows every head change on beacon; on lean the tick
+    /// judges before it may move the head, so it can trail the head by an
+    /// interval. Runtime-only and shared by every clone of this `Store`.
     pub fn head_slot_hint(&self) -> Option<u64> {
         let slot = self.head_slot_hint.load(Ordering::Relaxed);
         (slot != NO_NETWORK_HEAD).then_some(slot)

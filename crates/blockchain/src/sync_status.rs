@@ -56,7 +56,7 @@ impl Default for SyncStatusController {
 /// |---|---|
 /// | head advances past `high_water` | progress: window starts over, stall released |
 /// | head climbs past the highest reached since a move back (`climb`) | progress, likewise |
-/// | first move back below a high-water mark, or a new low below the climb's | window starts over, stall released |
+/// | first move back below a high-water mark, or (once per mark) a new low below the climb's | window starts over, stall released |
 /// | a judgment behind on the peers' word | slots added to the count (`StallCount`): a stretch in full, a slot after a short lapse once |
 /// | a claim after a lapse longer than the window, with something counted | count back to zero, once per count (`renewed`) |
 /// | the count past the window | stall: synced until progress |
@@ -84,13 +84,13 @@ pub(crate) struct SyncStatusTracker {
     /// The head at the last judgment, to tell a move back.
     last_head: Option<u64>,
     /// After the head moved back below [`Self::high_water`], while it has not
-    /// yet climbed past it: the lowest head reached since, and the highest.
-    /// Climbing past the highest is progress (a branch being re-imported
-    /// after an `INVALID` cut), and so is a new low (a deeper cut). A head
-    /// flipping between two branches does neither after its first two flips,
-    /// so it restarts the window at most twice per mark rather than on every
-    /// flip.
-    climb: Option<(u64, u64)>,
+    /// yet climbed past it. Climbing past the highest head reached since is
+    /// progress (a branch being re-imported after an `INVALID` cut), and so,
+    /// once per mark, is a new low (a deeper cut); a later new low only lowers
+    /// the floor. A head flipping between two branches, or stepping down a
+    /// slot at a time, therefore restarts the window a bounded number of
+    /// times per mark.
+    climb: Option<Climb>,
     /// The stall window's count at the current head position.
     stall: StallCount,
     /// Whether a peer-reported lead was given up on for making no progress
@@ -98,6 +98,18 @@ pub(crate) struct SyncStatusTracker {
     /// the head makes progress: the peers that claimed the lead repeat it on
     /// every refresh, so a fresh report is no reason to believe them again.
     stalled: bool,
+}
+
+/// The head's course since it moved back below the high-water mark; see
+/// `SyncStatusTracker::climb`.
+#[derive(Debug, Clone, Copy)]
+struct Climb {
+    /// The lowest head reached since the move back.
+    low: u64,
+    /// The highest head reached since the move back, or since the deeper cut.
+    high: u64,
+    /// Whether a deeper cut has already started the window over at this mark.
+    deeper_cut: bool,
 }
 
 /// How long the node has been behind on its peers' word with its head making
@@ -247,25 +259,34 @@ impl SyncStatusTracker {
             self.high_water = Some(head_slot);
             self.climb = None;
             self.start_window_over();
-        } else if let Some((low, climbed)) = self.climb {
-            if head_slot > climbed {
+        } else if let Some(climb) = &mut self.climb {
+            if head_slot > climb.high {
                 // Climbing back after a move back: each block past the
                 // highest reached since is progress, so a re-import after an
                 // `INVALID` cut stays syncing while it lasts.
-                self.climb = Some((low, head_slot));
+                climb.high = head_slot;
                 self.start_window_over();
-            } else if head_slot < low {
-                // A deeper cut than any since the mark: the peers may be
-                // right again.
-                self.climb = Some((head_slot, head_slot));
-                self.start_window_over();
+            } else if head_slot < climb.low {
+                climb.low = head_slot;
+                if !climb.deeper_cut {
+                    // A deeper cut than the first: the peers may be right
+                    // again. Once per mark, or a head stepping down a slot
+                    // at a time would restart the window at every step.
+                    climb.deeper_cut = true;
+                    climb.high = head_slot;
+                    self.start_window_over();
+                }
             }
         } else if head_slot < last_head {
             // The head moved back (an `INVALID` execution verdict cutting a
             // branch out, a reorg onto a shorter branch). The peers may have
             // been right about the chain all along, so the window starts over
             // and a lead given up on is believed again.
-            self.climb = Some((head_slot, head_slot));
+            self.climb = Some(Climb {
+                low: head_slot,
+                high: head_slot,
+                deeper_cut: false,
+            });
             self.start_window_over();
         }
 
@@ -587,6 +608,26 @@ mod tests {
             tracker.update(tripped + 2, 45, Some(tripped + 2)),
             SyncStatus::Syncing
         );
+    }
+
+    #[test]
+    fn a_head_stepping_down_a_slot_at_a_time_does_not_hold_the_window_open() {
+        // Finding: every new low started the window over, so a head moving
+        // down a slot at a time, more often than the window runs out, kept
+        // the node idle for as long as it kept going down.
+        let mut tracker = steady_lean();
+        assert_eq!(tracker.update(100, 60, Some(100)), SyncStatus::Syncing);
+        let mut gave_up_at = None;
+        for step in 1..=50u64 {
+            let current = 100 + 4 * step;
+            let head = 60 - step;
+            let status = tracker.update(current, head, Some(current));
+            if status == SyncStatus::Synced {
+                gave_up_at.get_or_insert(current);
+            }
+        }
+        let gave_up_at = gave_up_at.expect("the window ran out");
+        assert!(gave_up_at <= 112 + LEAN.stall_window, "{gave_up_at}");
     }
 
     #[test]
