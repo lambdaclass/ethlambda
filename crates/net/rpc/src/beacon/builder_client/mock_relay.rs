@@ -6,14 +6,18 @@
 //! registration signatures and refuses SSZ registrations, records blinded
 //! block submissions, and has `answer_headers_with` and
 //! `answer_submissions_with` to answer a call with exactly what a test needs.
+//! It serves `status` with 200, or 503 after `make_unavailable`, and answers
+//! every request with a 307 after `redirect_to`, or another status after
+//! `redirect_with`.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use ethlambda_state_transition::beacon::bls;
@@ -51,6 +55,15 @@ struct RelayState {
     submit_status: Option<StatusCode>,
     /// Submissions that arrived SSZ-encoded, refused or not.
     ssz_submissions: usize,
+    /// Whether `status` answers 503.
+    unavailable: bool,
+    /// `registerValidator` calls received, whatever their outcome.
+    registration_calls: usize,
+    /// Where every request is sent instead, and with what status: this base
+    /// URL followed by the request's own path.
+    redirect_to: Option<(StatusCode, String)>,
+    /// Redirects answered, whether or not the client followed them.
+    redirects_served: usize,
 }
 
 /// A fixed answer to every `getHeader`.
@@ -92,6 +105,8 @@ impl MockRelay {
             )
             .route("/eth/v1/builder/validators", post(register))
             .route("/eth/v2/builder/blinded_blocks", post(submit))
+            .route("/eth/v1/builder/status", get(status))
+            .layer(middleware::from_fn_with_state(state.clone(), redirect))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -148,12 +163,42 @@ impl MockRelay {
         self.state.lock().unwrap().submit_status = Some(status);
     }
 
+    /// Answer `status` with 503, as a builder that is not ready does.
+    pub(crate) fn make_unavailable(&self) {
+        self.state.lock().unwrap().unavailable = true;
+    }
+
+    /// Answer every request with a 307 to `base` followed by the request's
+    /// own path, as a builder that moved does. A 307 keeps the method and the
+    /// body, so a client that follows it lands a POST on `base` intact.
+    pub(crate) fn redirect_to(&self, base: &str) {
+        self.redirect_with(StatusCode::TEMPORARY_REDIRECT, base);
+    }
+
+    /// [`redirect_to`](Self::redirect_to), but answering with `status`. A
+    /// 301, 302 or 303 has a client that follows it resend a POST as a GET
+    /// without its body. `base` is sent as given, so it may be relative or
+    /// malformed.
+    pub(crate) fn redirect_with(&self, status: StatusCode, base: &str) {
+        self.state.lock().unwrap().redirect_to = Some((status, base.to_owned()));
+    }
+
+    /// How many requests were answered with a redirect.
+    pub(crate) fn redirects_served(&self) -> usize {
+        self.state.lock().unwrap().redirects_served
+    }
+
     pub(crate) fn blinded_blocks(&self) -> Vec<SignedBlindedBeaconBlock> {
         self.state.lock().unwrap().blinded_blocks.clone()
     }
 
     pub(crate) fn ssz_submissions(&self) -> usize {
         self.state.lock().unwrap().ssz_submissions
+    }
+
+    /// How many `registerValidator` calls arrived, whatever their outcome.
+    pub(crate) fn registration_calls(&self) -> usize {
+        self.state.lock().unwrap().registration_calls
     }
 
     pub(crate) fn registrations(&self) -> Vec<SignedValidatorRegistrationV1> {
@@ -181,6 +226,22 @@ impl MockRelay {
             signature: sign_for(RELAY_KEY, root),
         }
     }
+}
+
+async fn redirect(State(state): State<Shared>, request: Request, next: Next) -> Response {
+    let target = {
+        let mut state = state.lock().unwrap();
+        let target = state.redirect_to.clone();
+        if target.is_some() {
+            state.redirects_served += 1;
+        }
+        target
+    };
+    let Some((status, base)) = target else {
+        return next.run(request).await;
+    };
+    let location = format!("{base}{}", request.uri().path());
+    (status, [(header::LOCATION, location)]).into_response()
 }
 
 async fn header(
@@ -244,6 +305,7 @@ async fn header(
 
 async fn register(State(state): State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
     let mut state = state.lock().unwrap();
+    state.registration_calls += 1;
     // The client always registers in JSON (see `register_validators`); an
     // SSZ registration here is a regression.
     if is_ssz_request(&headers) {
@@ -262,6 +324,14 @@ async fn register(State(state): State<Shared>, headers: HeaderMap, body: Bytes) 
     }
     state.registrations.extend(registrations);
     StatusCode::OK.into_response()
+}
+
+async fn status(State(state): State<Shared>) -> Response {
+    if state.lock().unwrap().unavailable {
+        StatusCode::SERVICE_UNAVAILABLE.into_response()
+    } else {
+        StatusCode::OK.into_response()
+    }
 }
 
 async fn submit(State(state): State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
@@ -305,12 +375,30 @@ pub(crate) fn signed_registration(
         timestamp: 1_700_000_000,
         pubkey: BlsPubkey(secret_key_for(index).sk_to_pk().to_bytes()),
     };
+    sign_registration(index, message, genesis_fork_version)
+}
+
+/// `message` signed with test validator `index`'s key, for registrations
+/// that differ from [`signed_registration`]'s in timestamp or fee recipient.
+pub(crate) fn sign_registration(
+    index: usize,
+    message: ValidatorRegistrationV1,
+    genesis_fork_version: Version,
+) -> SignedValidatorRegistrationV1 {
     let domain = compute_builder_domain(genesis_fork_version);
     let root = compute_signing_root(message.hash_tree_root(), domain);
     SignedValidatorRegistrationV1 {
         message,
         signature: sign_for(index, root),
     }
+}
+
+/// A local URL nothing listens on: its port was bound and released, so a
+/// connection is refused at once. Port 1 usually is too, but a filtered
+/// port 1 would make a test wait for the call's timeout instead.
+pub(crate) fn unreachable_url() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    format!("http://{}", listener.local_addr().unwrap())
 }
 
 fn is_ssz_request(headers: &HeaderMap) -> bool {

@@ -14,9 +14,18 @@
 //! Responses are decoded by their own `Content-Type`, not by what was asked
 //! for: a builder may answer JSON to an SSZ request without refusing it.
 //!
+//! Redirects are not followed unless `--builder-follow-redirects` asks for
+//! it, so the node sends registrations and signed blocks only to the URL the
+//! operator named. Even then only a 307 or 308 is followed, up to ten hops
+//! and never from https to http (see `follows`). A redirect not followed is
+//! an error naming its target.
+//!
+//! `status` is a liveness probe the node calls once at startup.
+//!
 //! Every call is timed into `lean_beacon_builder_request_seconds`, by call
 //! and outcome.
 
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -27,8 +36,9 @@ use ethlambda_types::beacon::builder::{
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{BlsPubkey, ExecutionBlockHash, Slot};
 use libssz::{SszDecode as _, SszEncode as _};
-use reqwest::StatusCode;
 use reqwest::header::{self, HeaderMap};
+use reqwest::redirect::Policy;
+use reqwest::{StatusCode, Url};
 use tracing::info;
 
 use crate::metrics::observe_builder_request;
@@ -63,8 +73,19 @@ const REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
 /// fetching the payload from its relays before it answers.
 const SUBMIT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// `status` is a liveness probe; a builder that takes longer is not ready.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The most redirects one call follows with `--builder-follow-redirects`,
+/// which is reqwest's own default cap.
+const MAX_REDIRECTS: usize = 10;
+
 /// A builder API endpoint: a relay, or MEV-Boost in front of several.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is written out rather than derived: `base_url` may carry basic
+/// auth credentials from `--builder`, and a client logged with `{:?}` must
+/// not print them.
+#[derive(Clone)]
 pub struct BuilderClient {
     base_url: String,
     http: reqwest::Client,
@@ -82,7 +103,8 @@ pub struct VersionedBid {
 }
 
 impl BuilderClient {
-    /// A client for `base_url` that identifies itself as `user_agent`.
+    /// A client for `base_url` that identifies itself as `user_agent` and
+    /// does not follow redirects (see [`with_redirects`](Self::with_redirects)).
     ///
     /// `header_timeout` bounds `getHeader`. It is also sent to the builder as
     /// `X-Timeout-Ms`, so the builder can hold its answer for as long as the
@@ -92,18 +114,43 @@ impl BuilderClient {
         header_timeout: Duration,
         user_agent: &str,
     ) -> Result<Self, BuilderError> {
+        Self::with_redirects(base_url, header_timeout, user_agent, false)
+    }
+
+    /// [`new`](Self::new), but following a 307 or 308 redirect, up to ten
+    /// of them and never from https to http, when `follow_redirects` is set
+    /// (see `follows`).
+    ///
+    /// Without it every call goes exactly where `base_url` points. A redirect
+    /// not followed fails the call as [`BuilderError::Redirected`], which
+    /// names the target, rather than carrying registrations or a signed block
+    /// somewhere `--builder` does not name.
+    pub fn with_redirects(
+        base_url: impl Into<String>,
+        header_timeout: Duration,
+        user_agent: &str,
+        follow_redirects: bool,
+    ) -> Result<Self, BuilderError> {
         let base_url = base_url.into();
-        let url = reqwest::Url::parse(&base_url)
-            .map_err(|err| BuilderError::InvalidUrl(err.to_string()))?;
-        // `localhost:18550` parses, with `localhost` as its scheme.
-        if !matches!(url.scheme(), "http" | "https") {
-            return Err(BuilderError::InvalidUrl(format!(
-                "expected an http or https url, got scheme {:?}",
-                url.scheme()
-            )));
-        }
+        Self::check_url(&base_url)?;
+        let redirects = if follow_redirects {
+            // `stop`, never `error`: a stopped redirect comes back as the 3xx
+            // response itself, which `from_status` turns into `Redirected`
+            // naming its target, where an error would surface as a bare
+            // transport failure.
+            Policy::custom(|attempt| {
+                if follows(attempt.status(), attempt.url(), attempt.previous()) {
+                    attempt.follow()
+                } else {
+                    attempt.stop()
+                }
+            })
+        } else {
+            Policy::none()
+        };
         let http = reqwest::Client::builder()
             .user_agent(user_agent)
+            .redirect(redirects)
             .build()
             .map_err(|err| BuilderError::Transport(err.without_url().to_string()))?;
         let base_url = base_url.trim_end_matches('/').to_owned();
@@ -113,6 +160,22 @@ impl BuilderClient {
             header_timeout,
             json_only: Arc::default(),
         })
+    }
+
+    /// Whether `base_url` is a URL a client can be built for: one that
+    /// parses, with an http or https scheme. The CLI checks `--builder` with
+    /// this, so a bad value is refused while the flags are parsed.
+    pub fn check_url(base_url: &str) -> Result<(), BuilderError> {
+        let url = reqwest::Url::parse(base_url)
+            .map_err(|err| BuilderError::InvalidUrl(err.to_string()))?;
+        // `localhost:18550` parses, with `localhost` as its scheme.
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(BuilderError::InvalidUrl(format!(
+                "expected an http or https url, got scheme {:?}",
+                url.scheme()
+            )));
+        }
+        Ok(())
     }
 
     /// `getHeader`: the builder's best bid for `slot`, on top of
@@ -274,6 +337,30 @@ impl BuilderClient {
             .map_err(|err| BuilderError::from_reqwest(err, SUBMIT_TIMEOUT))
     }
 
+    /// `status`: whether the builder is up. The node calls it once at
+    /// startup, so a wrong `--builder` shows before the first proposal
+    /// rather than at it.
+    pub async fn status(&self) -> Result<(), BuilderError> {
+        let started = Instant::now();
+        let result = self.try_status().await;
+        observe_builder_request("status", outcome(&result), started.elapsed());
+        result
+    }
+
+    async fn try_status(&self) -> Result<(), BuilderError> {
+        let response = self
+            .http
+            .get(self.url("/eth/v1/builder/status"))
+            .timeout(STATUS_TIMEOUT)
+            .send()
+            .await
+            .map_err(|err| BuilderError::from_reqwest(err, STATUS_TIMEOUT))?;
+        match response.status() {
+            StatusCode::OK => Ok(()),
+            _ => Err(BuilderError::from_status(response, STATUS_TIMEOUT).await),
+        }
+    }
+
     fn fall_back_to_json(&self) {
         info!("Builder refused SSZ; using JSON from now on");
         self.json_only.store(true, Ordering::Relaxed);
@@ -282,6 +369,47 @@ impl BuilderClient {
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base_url)
     }
+}
+
+impl fmt::Debug for BuilderClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let base_url = Url::parse(&self.base_url)
+            .ok()
+            .and_then(error::without_credentials)
+            .map_or_else(|| "<unparsable>".to_owned(), String::from);
+        f.debug_struct("BuilderClient")
+            .field("base_url", &base_url)
+            .field("header_timeout", &self.header_timeout)
+            .field("json_only", &self.json_only.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+/// Whether `--builder-follow-redirects` follows a redirect answered with
+/// `status` to `next`, after the chain of URLs `previous` (the first of which
+/// is the URL the call started at).
+///
+/// - Only a 307 or 308. reqwest turns a POST answered with a 301, 302 or 303
+///   into a GET without its body before asking, and does not say which
+///   method the request had, so following one would send `registerValidator`
+///   or `submitBlindedBlockV2` on as an empty GET. Those three are not
+///   followed for any call, GETs included.
+/// - Never from https to http, which would send registrations or a signed
+///   block in the clear after the operator chose TLS.
+/// - Only to http or https, the only schemes reqwest follows: it fails a call
+///   told to follow any other as a transport error, which would not name the
+///   target.
+/// - At most [`MAX_REDIRECTS`] hops, as reqwest's default policy: a custom
+///   policy catches no loop on its own.
+fn follows(status: StatusCode, next: &Url, previous: &[Url]) -> bool {
+    let keeps_method = matches!(
+        status,
+        StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT
+    );
+    let downgrade =
+        next.scheme() == "http" && previous.last().is_some_and(|url| url.scheme() == "https");
+    let followable = matches!(next.scheme(), "http" | "https");
+    keeps_method && !downgrade && followable && previous.len() <= MAX_REDIRECTS
 }
 
 /// A bid, decoded by the response's own `Content-Type`.
