@@ -85,6 +85,10 @@ pub enum Error {
     ProposalRefused { slot: u64, reason: String },
     #[error("beacon node returned an inconsistent response: {0}")]
     InconsistentResponse(String),
+    /// `ethlambda voluntary-exit` refused to sign: the chain would refuse the
+    /// exit too, for the reason given. Deterministic, like a proposal refusal.
+    #[error("voluntary exit refused: {0}")]
+    ExitRefused(String),
     #[error("malformed response: {0}")]
     Decode(String),
 
@@ -115,15 +119,18 @@ pub enum Error {
     #[error("slashing protection {path}: {reason}")]
     SlashingProtection { path: String, reason: String },
     /// The record cannot be reached at all, as opposed to a record that
-    /// answered: its lock is poisoned because an earlier access panicked
-    /// while holding it, or the runtime is shutting down under the blocking
-    /// task.
+    /// answered: its lock is poisoned because an access panicked while
+    /// holding it, it stayed held past the wait, or the runtime is shutting
+    /// down under the blocking task.
     ///
     /// Kept apart from `SlashingProtection` and `Io` because the remedy
     /// differs: those name a file to look at, this one names a process to
     /// restart. A poisoned lock is a bug, never a disk, and it stays poisoned
-    /// for the life of the process, so every duty is refused until it is
-    /// restarted. Never retryable.
+    /// for the life of the process. Only attestations and proposals consult
+    /// the record, so those are what it refuses from then on; the other
+    /// duties would go on signing, which is why the client stops as soon as
+    /// the poisoning is seen, for its supervisor to restart (see
+    /// `slashing_protection::SharedProtection`). Never retryable.
     #[error("slashing protection is unusable: {reason}")]
     SlashingProtectionUnusable { reason: String },
 
@@ -167,6 +174,7 @@ impl Error {
             // A refusal repeats itself, and a record that could not be written
             // needs an operator: retrying within the slot helps neither.
             Self::ProposalRefused { .. }
+            | Self::ExitRefused(_)
             | Self::Keystore { .. }
             | Self::KeystoreVersion(_)
             | Self::KeystoreBadPassword
