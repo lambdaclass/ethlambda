@@ -709,7 +709,10 @@ async fn propose<B: BeaconNodeApi + 'static>(
     let budget = clock.until_attestation(slot, SystemTime::now());
     let deadline = tokio::time::Instant::now() + budget;
     match proposal.propose_by(slot, duty, store, deadline).await {
-        Ok(Proposed::Full(_) | Proposed::Blinded(BlindedOutcome::Published(_))) => {
+        // The service took the delay as soon as the block was accepted,
+        // before a gloas envelope's publish.
+        Ok(Proposed::Full(_)) => {}
+        Ok(Proposed::Blinded(BlindedOutcome::Published(_))) => {
             let elapsed = SystemTime::now()
                 .duration_since(clock.start_of(slot))
                 .unwrap_or_default();
@@ -1171,9 +1174,28 @@ mod tests {
             pubkey: pubkey(4),
             status: "withdrawal_done".to_string(),
         });
+        // Exiting and slashed are still active: the relay loads validators
+        // with `status=active,pending`, which takes in both.
+        node.validators.push(ValidatorEntry {
+            index: 55,
+            pubkey: pubkey(5),
+            status: "active_exiting".to_string(),
+        });
+        node.validators.push(ValidatorEntry {
+            index: 66,
+            pubkey: pubkey(6),
+            status: "active_slashed".to_string(),
+        });
         let node = Arc::new(node);
         let mut duties = DutiesService::new(node.clone(), Vec::new());
-        let keys = [pubkey(1), pubkey(2), pubkey(3), pubkey(4)];
+        let keys = [
+            pubkey(1),
+            pubkey(2),
+            pubkey(3),
+            pubkey(4),
+            pubkey(5),
+            pubkey(6),
+        ];
         let settings = settings(Some(H160([0xab; 20])));
 
         let registered = refresh_epoch(
@@ -1188,8 +1210,8 @@ mod tests {
         .await
         .expect("refreshes");
 
-        assert_eq!(registered, vec![pubkey(1), pubkey(3)]);
-        assert_eq!(node.preparations().len(), 4);
+        assert_eq!(registered, vec![pubkey(1), pubkey(3), pubkey(5), pubkey(6)]);
+        assert_eq!(node.preparations().len(), 6);
     }
 
     /// With nothing resolved there is nobody to register, and an empty array

@@ -124,6 +124,12 @@ pub struct MockBeaconNode {
     pub produce_gate: Option<Arc<Semaphore>>,
     /// Notified when `produce_block` is called, before the gate.
     pub produce_entered: Arc<Notify>,
+    /// When set, `publish_execution_payload_envelope` takes a permit before
+    /// it records the envelope and answers, for as long as the test holds it.
+    pub envelope_publish_gate: Option<Arc<Semaphore>>,
+    /// Notified when `publish_execution_payload_envelope` is called, before
+    /// the gate.
+    pub envelope_publish_entered: Arc<Notify>,
 
     /// What the test asserts against.
     pub submitted: Mutex<Vec<SingleAttestationDto>>,
@@ -352,6 +358,13 @@ impl MockBeaconNode {
     /// Make `produce_block` wait for a permit from `gate` before it answers.
     pub fn with_produce_gate(mut self, gate: Arc<Semaphore>) -> Self {
         self.produce_gate = Some(gate);
+        self
+    }
+
+    /// Make `publish_execution_payload_envelope` wait for a permit from
+    /// `gate` before it records the envelope and answers.
+    pub fn with_envelope_publish_gate(mut self, gate: Arc<Semaphore>) -> Self {
+        self.envelope_publish_gate = Some(gate);
         self
     }
 
@@ -891,6 +904,13 @@ impl BeaconNodeApi for MockBeaconNode {
         blob_data_included: bool,
     ) -> Result<()> {
         self.guard("publish_execution_payload_envelope")?;
+        self.envelope_publish_entered.notify_one();
+        if let Some(gate) = &self.envelope_publish_gate {
+            gate.acquire()
+                .await
+                .expect("the gate is never closed")
+                .forget();
+        }
         self.published_envelopes
             .lock()
             .expect("lock")

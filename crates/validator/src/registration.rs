@@ -172,9 +172,12 @@ impl Current {
 /// Two changes within a second put it one second ahead of the clock, which no
 /// relay refuses as being in the future. After a larger backward step it is
 /// further ahead: a relay may refuse it until its own clock catches up, and the
-/// epoch's full re-send then delivers it. With the clock's own reading
-/// instead, the relay would drop it as older on every re-send, since the
-/// cached signature keeps that timestamp until the settings change again.
+/// epoch's full re-send then delivers it. Meanwhile it costs its whole batch:
+/// the flashbots relay refuses a request over one timestamp more than ten
+/// seconds ahead, as it does over one unknown key. With the clock's own
+/// reading instead, the relay would drop it as older on every re-send, since
+/// the cached signature keeps that timestamp until the settings change again.
+/// Capping it near the clock would do the same.
 fn newer_than(held: Option<&SignedValidatorRegistrationV1>, now_secs: u64) -> u64 {
     held.map_or(now_secs, |held| {
         now_secs.max(held.message.timestamp.saturating_add(1))
