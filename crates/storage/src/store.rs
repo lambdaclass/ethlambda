@@ -3326,7 +3326,8 @@ impl Store {
     /// Publish the peers' head; see [`Self::network_head`]. P2P is the only
     /// writer.
     pub fn set_network_head(&self, slot: Option<u64>) {
-        let slot = slot.unwrap_or(NO_NETWORK_HEAD);
+        // A slot at the sentinel would read back as no report: clamp it.
+        let slot = slot.map_or(NO_NETWORK_HEAD, |slot| slot.min(NO_NETWORK_HEAD - 1));
         self.network_head.store(slot, Ordering::Relaxed);
     }
 

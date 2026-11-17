@@ -945,7 +945,7 @@ What each failure looks like:
 | `Peer said goodbye reason=129` right after a connection | nothing local: 129 is lighthouse's `TooManyPeers` |
 | `fork_digest` is not what a live crawl reports | the blob-schedule branch, or the schedule itself |
 | connections but no `Beacon handshake complete` | the `Status` encoding, or answering the wrong version |
-| `Handshake answered from another fork digest` | the digest |
+| `Status answered from another fork digest` | the digest |
 | `Beacon gossip decode failed` for `beacon_block` | the fork selection or the slot offset |
 | the same for `beacon_aggregate_and_proof` alone | the electra boundary in `decode_gossip`; the block path is fine |
 | connected peers above zero, no gossip at all | the topic hash: almost always the digest's hex formatting or `compute_message_id` |

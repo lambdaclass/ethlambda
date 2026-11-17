@@ -235,6 +235,18 @@ impl PeerHeads {
         self.suspects.contains_key(peer)
     }
 
+    /// Make `peer` a suspect for the blocks it handed over through slot
+    /// `through`, as of `wall_slot`. Suspected again, it is answerable for
+    /// more, but its time still runs from when it was first suspected, so a
+    /// suspicion stays bounded however often it is renewed.
+    pub(crate) fn suspect(&mut self, peer: PeerId, through: u64, wall_slot: u64) {
+        let suspicion = self.suspects.entry(peer).or_insert(Suspicion {
+            through,
+            since: wall_slot,
+        });
+        suspicion.through = suspicion.through.max(through);
+    }
+
     /// Clear the suspects the head at `head_slot` has passed, or that have
     /// been suspects for `lifetime` slots at `wall_slot`. Returns whether any
     /// was cleared.
@@ -436,14 +448,8 @@ pub(crate) fn drop_claim(server: &mut P2PServer, peer: &PeerId) {
 /// `through` (see [`PeerHeads::suspects`]), and republish the network head
 /// without its claim.
 pub(crate) fn suspect(server: &mut P2PServer, peer: &PeerId, through: u64) {
-    let since = crate::wall_clock_slot(&server.store);
-    let suspicion = server
-        .peer_heads
-        .suspects
-        .entry(*peer)
-        .or_insert(Suspicion { through, since });
-    suspicion.through = suspicion.through.max(through);
-    suspicion.since = since;
+    let wall_slot = crate::wall_clock_slot(&server.store);
+    server.peer_heads.suspect(*peer, through, wall_slot);
     publish(server);
 }
 
@@ -757,14 +763,10 @@ mod tests {
         // Past it: cleared.
         assert!(heads.clear_suspects(300, 120, 64));
         assert!(!heads.is_suspect(&peer));
-        // Or once its time is up, the head never getting there.
-        heads.suspects.insert(
-            peer,
-            Suspicion {
-                through: 300,
-                since: 100,
-            },
-        );
+        // Or once its time is up, the head never getting there; being
+        // suspected again later does not restart it.
+        heads.suspect(peer, 300, 100);
+        heads.suspect(peer, 400, 150);
         assert!(!heads.clear_suspects(0, 163, 64));
         assert!(heads.clear_suspects(0, 164, 64));
     }

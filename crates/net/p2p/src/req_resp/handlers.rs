@@ -2090,7 +2090,7 @@ async fn handle_status_response(
                 %peer,
                 peer_digest = %hex::encode(peer_digest),
                 our_digest = %hex::encode(our_digest),
-                "Handshake answered from another fork digest"
+                "Status answered from another fork digest"
             );
             metrics::inc_beacon_status_digest_mismatch();
         } else {
@@ -2123,7 +2123,7 @@ async fn handle_status_response(
         peer_head_slot,
         peer_finalized_epoch = status.finalized_epoch(),
         refresh,
-        "Beacon handshake complete"
+        "Beacon Status answered"
     );
     // A head this node already imported leaves nothing to fetch from this
     // peer (on a node keeping up, that is nearly every refresh answer), and
