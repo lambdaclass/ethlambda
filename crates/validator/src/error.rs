@@ -23,11 +23,15 @@ pub const EIP2335_KEYSTORE_VERSION: u64 = 4;
 /// construct the same variant without ever holding a real HTTP error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BeaconNodeFailure {
-    /// The request outlived its timeout.
+    /// The request outlived its timeout once connected.
     Timeout,
-    /// The connection could not be established.
+    /// The connection could not be established: refused, or not made within
+    /// the connect timeout. Nothing was sent.
     Connect,
-    /// The request could not be built or sent.
+    /// The request could not be built (an invalid URL or header, say), so
+    /// nothing was sent.
+    Build,
+    /// The request failed on its way out or back, after it may have left.
     Request,
     /// The response body could not be read.
     Body,
@@ -35,11 +39,17 @@ pub enum BeaconNodeFailure {
 
 impl BeaconNodeFailure {
     /// Classify a `reqwest` failure.
+    ///
+    /// reqwest reports a connect timeout as both a connect error and a
+    /// timeout. It is a connection never made, so the connect check comes
+    /// first: [`Error::outcome_unknown`] counts it as definite.
     pub fn classify(error: &reqwest::Error) -> Self {
-        if error.is_timeout() {
-            Self::Timeout
+        if error.is_builder() {
+            Self::Build
         } else if error.is_connect() {
             Self::Connect
+        } else if error.is_timeout() {
+            Self::Timeout
         } else if error.is_body() || error.is_decode() {
             Self::Body
         } else {
@@ -58,6 +68,12 @@ pub enum Error {
     },
     #[error("every configured beacon node failed; last error: {0}")]
     AllBeaconNodesFailed(String),
+    /// Every node failed a request, and at least one may have acted on it
+    /// first: it timed out or broke once sent, or answered a 5xx. Raised for
+    /// proposer preferences only, where whether a node may hold one decides
+    /// whether it can be signed again (see `PreferencesService`).
+    #[error("no beacon node confirmed the request, and one may have taken it; last error: {0}")]
+    NoNodeConfirmed(String),
     #[error("beacon node returned {status}: {body}")]
     BeaconNodeStatus { status: u16, body: String },
     #[error("beacon node is syncing")]
@@ -187,6 +203,23 @@ pub enum Error {
 }
 
 impl Error {
+    /// Whether a request that failed with this may still have been acted on
+    /// by the node: no answer came once it was sent (a timeout, a broken
+    /// connection, an unreadable body), or a 5xx other than 503 said it failed
+    /// partway. A 4xx, a 503, a syncing node, a connection never made and a
+    /// request never built are definite: the node did not take it.
+    pub fn outcome_unknown(&self) -> bool {
+        match self {
+            Self::NoNodeConfirmed(_) | Self::BlindedUnconfirmed { .. } => true,
+            Self::BeaconNode { failure, .. } => !matches!(
+                failure,
+                BeaconNodeFailure::Connect | BeaconNodeFailure::Build
+            ),
+            Self::BeaconNodeStatus { status, .. } => *status >= 500 && *status != 503,
+            _ => false,
+        }
+    }
+
     /// Whether the duty loop should try again rather than give up.
     ///
     /// The distinction the loop needs every slot: a beacon node that is down,
@@ -197,6 +230,7 @@ impl Error {
         match self {
             Self::BeaconNode { .. }
             | Self::AllBeaconNodesFailed(_)
+            | Self::NoNodeConfirmed(_)
             | Self::BeaconNodeStatus { .. }
             | Self::BeaconNodeSyncing
             | Self::BlindedUnconfirmed { .. }
@@ -222,3 +256,27 @@ impl Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A request reqwest could not build never left, so no node can have
+    /// taken it: a preference that failed so is signed afresh, not kept.
+    #[test]
+    fn a_request_never_built_is_a_definite_failure() {
+        let err = reqwest::Client::new()
+            .get("not a url")
+            .build()
+            .expect_err("a URL without a scheme does not build");
+        let failure = BeaconNodeFailure::classify(&err);
+        assert_eq!(failure, BeaconNodeFailure::Build);
+
+        let failed = Error::BeaconNode {
+            url: "not a url".to_string(),
+            failure,
+            detail: err.to_string(),
+        };
+        assert!(!failed.outcome_unknown());
+    }
+}
