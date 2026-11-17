@@ -11,6 +11,7 @@ mod network;
 mod slashing_protection;
 mod validator;
 mod version;
+mod voluntary_exit;
 
 // Jemalloc causes programs to deadlock during process startup under Shadow.
 // See https://github.com/shadow/shadow/issues/3763. Build the Shadow binary
@@ -109,6 +110,12 @@ fn main() -> eyre::Result<()> {
         Command::Validator(options) => {
             init_node_logging()?;
             validator::run(options)
+        }
+        // A one-shot command whose stdout may carry a pre-signed exit, so its
+        // logs go to stderr like keygen's.
+        Command::VoluntaryExit(options) => {
+            init_info_stderr_logging()?;
+            voluntary_exit::run(options)
         }
         // Offline file work: no runtime, and stdout left alone.
         Command::SlashingProtection(options) => {
