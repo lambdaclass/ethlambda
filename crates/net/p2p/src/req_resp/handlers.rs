@@ -984,13 +984,16 @@ async fn handle_lean_blocks_by_range_response(
     // Whether what was handed over imports is judged by the head: reaching it
     // ends the peer's run of failures, and a whole window without reaching it
     // makes the peer a suspect (see `expire_range_watermark`).
-    let Some(through) = handed_over_through else {
+    if handed_over_through.is_none() {
         // Nothing reached the chain actor, whose mailbox is gone: the session
         // makes no progress, and the peer is not to blame.
         server.end_range_session();
         return;
-    };
-    server.head_watch.note_delivery(peer, through);
+    }
+    // Judged by the end it was asked for, not the last block it handed over:
+    // the session's cursor moves past the whole span, so a batch cut short
+    // of a real gap is what the batches above it fail to connect through.
+    server.head_watch.note_delivery(peer, end_slot);
     if let Some(state) = &mut server.range_sync_state {
         state.complete_batch(end_slot);
         if range_session_exhausted(state) {
@@ -2948,7 +2951,8 @@ async fn handle_beacon_blocks_by_range_response(
     // head rather than the head alone.
     // As on lean: what was handed over is judged by the head.
     server.range_fetched_through = server.range_fetched_through.max(highest);
-    server.head_watch.note_delivery(peer, highest);
+    // As on lean: judged by the end it was asked for.
+    server.head_watch.note_delivery(peer, end_slot);
     if let Some(state) = &mut server.range_sync_state {
         state.complete_batch(end_slot);
         if range_session_exhausted(state) {
@@ -3771,6 +3775,26 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_disconnect_that_empties_the_session_ends_it_with_its_batch() {
+        // libp2p reports the closed connection before the batch's own
+        // failure, which then finds no request: nothing is left in flight to
+        // answer for a later session.
+        let mut server = unconnected_server().await;
+        let peer = connected_peer(&mut server);
+        let unknown = H256::repeat_byte(0x11);
+        on_lean_status_request(&mut server, peer, &lean_status_at(unknown, 500)).await;
+        assert!(server.range_sync_state.is_some());
+        server.connected_peers.remove(&peer);
+        peer_heads::forget(&mut server, &peer);
+        assert!(server.range_sync_state.is_none());
+        let batch_in_flight = server
+            .outbound_requests
+            .values()
+            .any(|kind| matches!(kind, PendingRequestKind::Range { .. }));
+        assert!(!batch_in_flight);
+    }
+
+    #[tokio::test]
     async fn a_peer_whose_head_this_node_holds_leaves_the_range_session() {
         // Its session head was merged in on an earlier claim: it has nothing
         // left to give, and a batch to it would fail on a head it left.
@@ -4019,6 +4043,21 @@ pub(crate) mod tests {
         assert_eq!(watch.note_drop(100, 200), vec![(first, 356)]);
         // The rest are forgotten, not held for the next drop.
         assert!(watch.note_drop(100, 300).is_empty());
+    }
+
+    #[test]
+    fn a_long_run_of_batches_keeps_its_lowest_end_for_the_blame() {
+        // Finding: over the cap, a peer's oldest (and lowest) batch end was
+        // forgotten first, so a liar delivering a bad batch and then many
+        // more had a lowest end above an honest peer's and escaped the blame.
+        let mut watch = crate::HeadWatch::default();
+        let (liar, honest) = (PeerId::random(), PeerId::random());
+        watch.note_delivery(liar, 1_124);
+        watch.note_delivery(honest, 2_148);
+        for batch in 3..=20u64 {
+            watch.note_delivery(liar, batch * 1_024 + 100);
+        }
+        assert_eq!(watch.note_drop(100, 200), vec![(liar, 20 * 1_024 + 100)]);
     }
 
     #[tokio::test]

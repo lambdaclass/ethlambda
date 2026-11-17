@@ -579,12 +579,20 @@ impl HeadWatch {
         reached
     }
 
-    /// Note that `peer` handed over a batch ending at slot `through`.
-    pub(crate) fn note_delivery(&mut self, peer: PeerId, through: u64) {
+    /// Note that `peer` handed over a batch it was asked for through slot
+    /// `end`. Over the cap, a batch end is forgotten, never the lowest (which
+    /// a drop blames by) or the highest (which a suspicion runs through).
+    pub(crate) fn note_delivery(&mut self, peer: PeerId, end: u64) {
         let ends = self.deliverers.entry(peer).or_default();
-        ends.push_back(through);
+        ends.push_back(end);
         if ends.len() > Self::MAX_TRACKED_BATCHES {
-            ends.pop_front();
+            let lowest = ends.iter().copied().min();
+            let highest = ends.iter().copied().max();
+            let forgettable = ends
+                .iter()
+                .position(|end| Some(*end) != lowest && Some(*end) != highest);
+            // With every end the lowest or the highest, any one goes.
+            ends.remove(forgettable.unwrap_or(1));
         }
     }
 
@@ -2206,8 +2214,8 @@ impl P2PServer {
     /// stored block yet). On beacon, reading the head decodes the whole head
     /// block.
     ///
-    /// Read by the watermark expiry and the beacon `Status` handlers on both
-    /// chains. Lean's own `Status` handling reads `Store::head_slot` instead,
+    /// Read by the watermark expiry (both chains) and the beacon `Status`
+    /// handlers. Lean's own `Status` handling reads `Store::head_slot` instead,
     /// a header read, to size its range requests on the head as it is at
     /// that moment.
     pub(crate) fn head_slot(&self) -> u64 {
@@ -2271,9 +2279,11 @@ impl P2PServer {
     /// import; later deliveries do not restart it, since a whole window of
     /// them that has not moved the head is not importing. A head that is
     /// still importing moves. On a drop, the session running ends with its
-    /// batch in flight, and the peers that handed blocks over since the head
-    /// last moved become suspects until the head passes what they handed
-    /// over (see `PeerHeads::suspects`). Each drop at the same head
+    /// batch in flight, and the senders of the lowest batch the head never
+    /// reached become suspects until the head passes what they handed over
+    /// (see `PeerHeads::suspects`); batches above it could not connect
+    /// without it, so their senders are not held to them. Each drop at the
+    /// same head
     /// doubles the wait before the next one, so a head that cannot move at
     /// all re-fetches the gap ever more rarely.
     pub(crate) fn expire_range_watermark(&mut self, wall_slot: u64) {

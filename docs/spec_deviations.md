@@ -82,8 +82,8 @@ head trails the wall clock **and** its peers report a head ahead of it.
   batch long with no block either way (its cursor moves only on delivered
   blocks): the parent lookups of newer blocks fill it, and the peers serving
   it stop counting for a while, so the node can read as synced meanwhile. The cost: if the node's own
-  import stalls for a window (an execution client down), honest peers that
-  delivered stop counting too, and the node reads as synced on its stale head
+  import stalls for a window (an execution client down), the honest peers
+  that delivered the lowest batch stop counting too, and the node reads as synced on its stale head
   until the head passes what they handed over, or for 4 stall windows at
   most. These bounds hold per peer identity: a fresh identity starts with
   none of the history (claims, cooldowns, suspicion) its predecessor

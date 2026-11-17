@@ -942,7 +942,8 @@ impl BlockChainServer {
     /// A lean tick judges the gate itself, and a beacon tick judges it in the
     /// head recompute at its end. Judging again every time would decode the
     /// beacon head block a second time, so this judges only when the tick
-    /// returned before doing so. That keeps a return added to the tick later
+    /// returned before doing so, or when a lean tick moved the head after
+    /// judging (its duties can). That keeps a return added to the tick later
     /// from leaving the gate unjudged. A judgment by a block arrival earlier
     /// in the slot counts too: arrivals judge after any head move, so a tick
     /// that returned early has nothing newer to judge.
