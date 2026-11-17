@@ -1574,8 +1574,13 @@ fn columns_without_known_custodian(server: &P2PServer, columns: &[u64]) -> Vec<u
 }
 
 fn fail_range_request(server: &mut P2PServer, peer: &PeerId) {
-    let wall_slot = crate::wall_clock_slot(&server.store);
-    server.peer_heads.note_range_failure(*peer, wall_slot);
+    // Only while connected: libp2p reports a closed connection before the
+    // request it failed, so a failure noted after `forget` would outlive the
+    // peer and hold back its next connection's handshake.
+    if server.connected_peers.contains_key(peer) {
+        let wall_slot = crate::wall_clock_slot(&server.store);
+        server.peer_heads.note_range_failure(*peer, wall_slot);
+    }
     let should_clear = if let Some(state) = &mut server.range_sync_state {
         state.fail_peer(peer);
         state.peer_set.is_empty()
@@ -3572,6 +3577,29 @@ pub(crate) mod tests {
         assert_eq!(watch.patience(16), 64);
         assert_eq!(watch.flat_for(5, 150), 0);
         assert_eq!(watch.patience(16), 16);
+        // A head that moved while a range session restarted the count resets
+        // the backoff too.
+        watch.note_drop(5, 160);
+        assert_eq!(watch.patience(16), 32);
+        watch.restart(6, 170);
+        assert_eq!(watch.patience(16), 16);
+        // The wait is capped.
+        for wall in 0..10 {
+            watch.note_drop(6, 200 + wall);
+        }
+        assert_eq!(watch.patience(16), 16 * 16);
+    }
+
+    #[tokio::test]
+    async fn a_range_failure_after_the_disconnect_leaves_no_cooldown() {
+        // Finding: libp2p reports a closed connection before the request it
+        // failed, so the failure was noted after `forget` and held back the
+        // peer's next handshake.
+        let mut server = unconnected_server().await;
+        let peer = PeerId::random();
+        fail_range_request(&mut server, &peer);
+        let wall = crate::wall_clock_slot(&server.store);
+        assert!(!server.peer_heads.range_cooling_down(&peer, wall, 2));
     }
 
     #[tokio::test]

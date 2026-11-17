@@ -484,8 +484,9 @@ pub(crate) struct HeadWatch {
 }
 
 impl HeadWatch {
-    /// Most doublings of the wait: 64 windows, a little over an hour on lean.
-    const MAX_BACKOFF: u32 = 6;
+    /// Most doublings of the wait: 16 windows, about 17 minutes on lean and
+    /// under two hours on beacon.
+    const MAX_BACKOFF: u32 = 4;
 
     /// Note the head at `wall_slot`, returning how many slots it has stayed
     /// at `head_slot`: zero whenever it has just moved, in either direction.
@@ -500,9 +501,12 @@ impl HeadWatch {
         }
     }
 
-    /// Start the count over at `wall_slot`, as if the head had just moved,
-    /// without forgetting the drops made at it.
+    /// Start the count over at `wall_slot`, as if the head had just moved.
+    /// The drops made at a head are kept only while it stays that head.
     pub(crate) fn restart(&mut self, head_slot: u64, wall_slot: u64) {
+        if self.seen.is_none_or(|(slot, _)| slot != head_slot) {
+            self.drops = 0;
+        }
         self.seen = Some((head_slot, wall_slot));
     }
 
