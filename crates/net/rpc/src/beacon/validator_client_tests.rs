@@ -41,6 +41,7 @@ use ethlambda_validator::{
         },
         http::HttpBeaconNode,
     },
+    exit::{ExitOptions, Outcome, run_with as run_exit},
     keys::ValidatorStore,
     signing::SigningContext,
     sync_committee::{SyncCommitteeService, subnets_of},
@@ -119,28 +120,61 @@ async fn serve_at(
     fulu.current_sync_committee = sync_committee.clone();
     fulu.next_sync_committee = sync_committee;
 
-    let (mut store, _root) = beacon_store_at(state.clone());
+    // On a clock where the slot after the head is running, the slot these
+    // tests propose for: production refuses a slot that has not started, and
+    // the wall clock may still be in the epoch's first slot, the head's own.
+    let (mut store, _root) =
+        crate::test_utils::beacon_store_at_clock(state.clone(), state.slot() + 1);
     // A block built on this head names the head block's real root as its
     // parent, which the fixture's placeholder anchor block does not have:
     // keep the state under that root too, as a real anchor would be.
+    let parent_root = real_head_root(&state);
+    store.insert_state(parent_root, state.clone()).unwrap();
+    let (client, network, _pool, address) = spawn_server(store.clone(), engine, None).await;
+    (client, state, network, address, store)
+}
+
+/// The root a block built on `state` names as its parent: its latest block
+/// header's, which the fixtures' placeholder anchor block does not have.
+fn real_head_root(state: &BeaconState) -> ethlambda_types::primitives::H256 {
     let advanced = ethlambda_state_transition::beacon::block_production::advance_to_slot(
-        &state,
+        state,
         state.slot() + 1,
         &ethlambda_types::beacon::config::Config::mainnet(),
     )
     .unwrap();
-    let parent_root = advanced.latest_block_header().hash_tree_root();
-    store.insert_state(parent_root, state.clone()).unwrap();
-    let (client, network, _pool, address) = spawn_server(store.clone(), engine).await;
-    (client, state, network, address, store)
+    advanced.latest_block_header().hash_tree_root()
 }
 
 /// Serve `store` through the router the real server builds, over a socket on an
 /// ephemeral port, and connect this crate's client to it. Also hands back the
 /// payload attestation pool the router fills and the socket it listens on.
+///
+/// With a `builder`, it is layered as `lib.rs` does when `--builder` is set,
+/// so the builder flow's endpoints see it.
 async fn spawn_server(
+    store: Store,
+    engine: Option<ethlambda_engine::EngineClient>,
+    builder: Option<Arc<crate::beacon::builder_flow::Builder>>,
+) -> (
+    HttpBeaconNode,
+    Arc<RecordingNetwork>,
+    SharedPayloadAttestationPool,
+    std::net::SocketAddr,
+) {
+    let sync_pool = SharedSyncCommitteePool::default();
+    spawn_server_sharing(store, engine, sync_pool, builder).await
+}
+
+/// [`spawn_server`] pooling sync committee messages in `sync_pool`, so a second
+/// node over the same head, on a clock a slot later, packs into its block what
+/// the first one pooled: block production refuses a slot that has not started,
+/// and a sync committee message is accepted only during its own slot.
+async fn spawn_server_sharing(
     mut store: Store,
     engine: Option<ethlambda_engine::EngineClient>,
+    sync_pool: SharedSyncCommitteePool,
+    builder: Option<Arc<crate::beacon::builder_flow::Builder>>,
 ) -> (
     HttpBeaconNode,
     Arc<RecordingNetwork>,
@@ -160,7 +194,7 @@ async fn spawn_server(
     let router = crate::build_beacon_api_router(store, "ethlambda/test", "peer".into())
         .layer(Extension(SyncStatusController::new(SyncStatus::Synced)))
         .layer(Extension(p2p))
-        .layer(Extension(SharedSyncCommitteePool::default()))
+        .layer(Extension(sync_pool))
         .layer(Extension(payload_pool.clone()))
         .layer(Extension(
             ethlambda_state_transition::beacon::builder_market::SharedBuilderMarket::default(),
@@ -171,6 +205,10 @@ async fn spawn_server(
         .layer(Extension(crate::beacon::graffiti::OwnVersion(Arc::new(
             own_version(),
         ))));
+    let router = match builder {
+        Some(builder) => router.layer(Extension(builder)),
+        None => router,
+    };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -194,6 +232,161 @@ fn keys_for(state: &BeaconState, indices: &[u64]) -> RwLock<ValidatorStore> {
         );
     }
     RwLock::new(keys)
+}
+
+/// `ethlambda voluntary-exit`, end to end: the client's own lookup of the
+/// validator, its signature, and this node's pool endpoint. The fixture's
+/// validators are all active since epoch 0 and the wall epoch is far past
+/// `SHARD_COMMITTEE_PERIOD`, so the node's gossip rules accept the exit.
+#[tokio::test]
+async fn the_validator_client_can_exit_a_validator_through_this_node() {
+    use ethlambda_types::beacon::{
+        containers::shared::{SignedVoluntaryExit, VoluntaryExit},
+        operation::BeaconOperation,
+    };
+
+    let (client, state, network) = serve().await;
+    let pubkey = state.validator(0).unwrap().pubkey;
+
+    let details = client
+        .validator(&pubkey)
+        .await
+        .expect("the node answers")
+        .expect("validator 0 is in the state");
+    assert_eq!(details.index, 0);
+    assert_eq!(details.status, "active_ongoing");
+    assert_eq!(
+        details.activation_epoch,
+        state.validator(0).unwrap().activation_epoch
+    );
+    assert_eq!(details.exit_epoch, state.validator(0).unwrap().exit_epoch);
+    assert!(
+        client
+            .validator(&BlsPubkey([9; 48]))
+            .await
+            .expect("a 404 is an answer, not an error")
+            .is_none(),
+        "a key the chain does not know is None"
+    );
+
+    // The whole command, minus the prompt, against this node over the socket.
+    let keys = {
+        let mut store = ValidatorStore::new();
+        store
+            .insert_secret("test", &secret_key_for(0).to_bytes())
+            .expect("valid key");
+        store
+    };
+    let options = ExitOptions {
+        no_confirmation: true,
+        no_wait: true,
+        ..ExitOptions::default()
+    };
+    let mut no_input = std::io::empty();
+    let mut no_input = std::io::BufReader::new(&mut no_input);
+    let outcome = run_exit(&client, &keys, pubkey, &options, &mut no_input)
+        .await
+        .expect("the node accepts the exit");
+    assert_eq!(outcome, Outcome::Published { accepted: None });
+
+    let published = network.operations.lock().unwrap().clone();
+    let [BeaconOperation::VoluntaryExit(exit)] = published.as_slice() else {
+        panic!("expected one published exit, got {published:?}");
+    };
+    assert_eq!(exit.message.validator_index, 0);
+    assert_eq!(exit.message.epoch, compute_epoch_at_slot(state.slot()));
+
+    // A refusal comes back as the node's 400 with its reason, not as a
+    // transport failure.
+    let forged = SignedVoluntaryExit {
+        message: VoluntaryExit {
+            epoch: exit.message.epoch,
+            validator_index: 1,
+        },
+        signature: exit.signature,
+    };
+    let err = client
+        .submit_voluntary_exit(&forged)
+        .await
+        .expect_err("validator 0's signature does not cover validator 1's exit");
+    assert!(
+        matches!(&err, Error::BeaconNodeStatus { status: 400, body } if body.contains("voluntary exit")),
+        "got {err:?}"
+    );
+
+    // An exit naming a past epoch is one the chain accepts too: it measures
+    // the shard committee period against its own epoch and verifies under
+    // the fork it is at, neither of which the exit's epoch moves.
+    let pubkey = state.validator(1).unwrap().pubkey;
+    let keys = {
+        let mut store = ValidatorStore::new();
+        store
+            .insert_secret("test", &secret_key_for(1).to_bytes())
+            .expect("valid key");
+        store
+    };
+    let options = ExitOptions {
+        epoch: Some(0),
+        no_confirmation: true,
+        no_wait: true,
+        ..ExitOptions::default()
+    };
+    run_exit(&client, &keys, pubkey, &options, &mut no_input)
+        .await
+        .expect("the node accepts an exit naming epoch 0");
+    let published = network.operations.lock().unwrap().clone();
+    let [_, BeaconOperation::VoluntaryExit(exit)] = published.as_slice() else {
+        panic!("expected a second published exit, got {published:?}");
+    };
+    assert_eq!(exit.message.validator_index, 1);
+    assert_eq!(exit.message.epoch, 0);
+}
+
+/// A network that shortens `SHARD_COMMITTEE_PERIOD`, the way a devnet lets an
+/// exit be tried without waiting out mainnet's 256 epochs, is followed: the
+/// command measures the validator against the period this node reports. Here
+/// the chain is at epoch 2 and the validators activated at epoch 0, so the
+/// node's two epochs make them eligible and mainnet's 256 would not.
+#[tokio::test]
+async fn the_validator_client_follows_this_nodes_shard_committee_period() {
+    use ethlambda_types::beacon::operation::BeaconOperation;
+
+    let mut config = fulu_schedule();
+    config.shard_committee_period = 2;
+    let sync_pool = SharedSyncCommitteePool::default();
+    let (client, state, network, _) = serve_fulu_pinned_under(config, None, sync_pool, 0).await;
+    assert_eq!(compute_epoch_at_slot(state.slot()), 2);
+    assert_eq!(state.validator(0).unwrap().activation_epoch, 0);
+
+    let spec = client.spec().await.expect("the client reads the spec");
+    assert_eq!(spec.shard_committee_period, 2);
+
+    let pubkey = state.validator(0).unwrap().pubkey;
+    let keys = {
+        let mut store = ValidatorStore::new();
+        store
+            .insert_secret("test", &secret_key_for(0).to_bytes())
+            .expect("valid key");
+        store
+    };
+    let options = ExitOptions {
+        no_confirmation: true,
+        no_wait: true,
+        ..ExitOptions::default()
+    };
+    let mut no_input = std::io::empty();
+    let mut no_input = std::io::BufReader::new(&mut no_input);
+    let outcome = run_exit(&*client, &keys, pubkey, &options, &mut no_input)
+        .await
+        .expect("the validator is past this node's shard committee period");
+    assert_eq!(outcome, Outcome::Published { accepted: None });
+
+    let published = network.operations.lock().unwrap().clone();
+    let [BeaconOperation::VoluntaryExit(exit)] = published.as_slice() else {
+        panic!("expected one published exit, got {published:?}");
+    };
+    assert_eq!(exit.message.validator_index, 0);
+    assert_eq!(exit.message.epoch, 2);
 }
 
 /// One slot of an attester's work, in the order `ethlambda validator` does it.
@@ -393,6 +586,8 @@ async fn block_production_without_an_execution_client_is_retryable() {
         proposer_index: 0,
         randao_reveal: Default::default(),
         graffiti: Default::default(),
+        builder_boost_factor: None,
+        builder_min_bid: 0,
     };
     let err = client.produce_block(&request).await.unwrap_err();
     assert!(matches!(err, Error::BeaconNodeSyncing), "got {err:?}");
@@ -420,18 +615,41 @@ fn valid_blob(seed: u8) -> Vec<u8> {
 /// The fulu bundle carries `blob_count` valid blobs with their commitments and
 /// cell proofs (flattened blob by blob, as `BlobsBundleV2` does).
 pub(super) async fn fake_execution_client(blob_count: usize) -> ethlambda_engine::EngineClient {
-    fake_execution_client_with(blob_count, None).await
+    let delay = std::time::Duration::ZERO;
+    fake_execution_client_with(blob_count, None, "0x2a", false, delay).await
+}
+
+/// [`fake_execution_client`] with no blobs, whose fulu payload pays
+/// `block_value` (hex wei) and carries `should_override_builder`.
+pub(super) async fn fake_execution_client_paying(
+    block_value: &'static str,
+    should_override_builder: bool,
+) -> ethlambda_engine::EngineClient {
+    let delay = std::time::Duration::ZERO;
+    fake_execution_client_with(0, None, block_value, should_override_builder, delay).await
+}
+
+/// [`fake_execution_client`] with no blobs, holding every `forkchoiceUpdated`
+/// answer back for `delay`: an execution client slow to start a build.
+pub(super) async fn fake_execution_client_slow_to_build(
+    delay: std::time::Duration,
+) -> ethlambda_engine::EngineClient {
+    fake_execution_client_with(0, None, "0x2a", false, delay).await
 }
 
 /// [`fake_execution_client`] whose gloas payloads carry `blob`, with its real
 /// commitment and cell proofs, in the blobs bundle.
 async fn fake_execution_client_with_blob(blob: Option<Vec<u8>>) -> ethlambda_engine::EngineClient {
-    fake_execution_client_with(0, blob).await
+    let delay = std::time::Duration::ZERO;
+    fake_execution_client_with(0, blob, "0x2a", false, delay).await
 }
 
 async fn fake_execution_client_with(
     blob_count: usize,
     blob: Option<Vec<u8>>,
+    block_value: &'static str,
+    should_override_builder: bool,
+    forkchoice_delay: std::time::Duration,
 ) -> ethlambda_engine::EngineClient {
     use axum::{Json, routing::post};
     use ethlambda_state_transition::beacon::kzg;
@@ -497,7 +715,11 @@ async fn fake_execution_client_with(
                     "excessBlobGas": "0x0",
                 })
             };
-            let result = match request["method"].as_str() {
+            let method = request["method"].as_str();
+            if let Some("engine_forkchoiceUpdatedV3" | "engine_forkchoiceUpdatedV4") = method {
+                tokio::time::sleep(forkchoice_delay).await;
+            }
+            let result = match method {
                 Some("engine_forkchoiceUpdatedV3" | "engine_forkchoiceUpdatedV4") => {
                     let mut attributes = request["params"][1].clone();
                     attributes["parentHash"] = request["params"][0]["headBlockHash"].clone();
@@ -513,9 +735,9 @@ async fn fake_execution_client_with(
                     v5_payload["blobGasUsed"] = blob_gas_used.clone().into();
                     serde_json::json!({
                         "executionPayload": v5_payload,
-                        "blockValue": "0x2a",
+                        "blockValue": block_value,
                         "blobsBundle": { "commitments": commitments, "proofs": proofs, "blobs": blobs },
-                        "shouldOverrideBuilder": false,
+                        "shouldOverrideBuilder": should_override_builder,
                         "executionRequests": [],
                     })
                 }
@@ -573,8 +795,15 @@ async fn produce_with_pool(
     };
     use ethlambda_types::beacon::constants::{DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO};
 
-    let (client, state, network, address, store) =
+    let (client, state, network, address, mut store) =
         serve_at(Some(fake_execution_client(blob_count).await)).await;
+    // The publish endpoints refuse a parent at the finalized slot other than
+    // the finalized block, so finalize the root the block names, as a real
+    // anchor's checkpoint does. Here only: the vote paths walk the block
+    // index, which holds the placeholder anchor.
+    let (anchor_root, _) = crate::beacon::validator::head(&store).unwrap();
+    let parent_root = real_head_root(&state);
+    crate::test_utils::finalize_at(&mut store, anchor_root, parent_root, state.slot());
     fill_pool(&store, &state);
     let slot = state.slot() + 1;
     let advanced = advance_to_slot(
@@ -599,6 +828,8 @@ async fn produce_with_pool(
         proposer_index: proposer,
         randao_reveal,
         graffiti: ethlambda_types::primitives::H256(graffiti),
+        builder_boost_factor: None,
+        builder_min_bid: 0,
     };
     let produced = client.produce_block(&request).await.unwrap();
     assert_eq!(produced.slot(), slot);
@@ -633,6 +864,8 @@ fn fulu_block(
     match &produced.contents {
         Contents::WithCellProofs { block, .. } | Contents::WithBlobProofs { block, .. } => block,
         Contents::Gloas { .. } => unreachable!("a fulu proposal"),
+        // These tests ask with no `builder_boost_factor`, so no blinded answer.
+        Contents::Blinded { .. } => unreachable!("builder proposals are off"),
     }
 }
 
@@ -801,7 +1034,9 @@ async fn the_json_block_carries_its_blobs_and_cell_proofs_as_hex() {
 // ---------------------------------------------------------------------------
 
 /// A fulu head state at the first slot of epoch 2, its header's root the one
-/// the store's head is under, served on a clock pinned to that slot.
+/// the store's head is under, served on a clock pinned to that slot, or
+/// `clock_ahead` slots after it, pooling sync committee messages in
+/// `sync_pool`.
 ///
 /// Unlike [`serve`] the head root is the root a block built on this state
 /// names as its parent, which is the root `process_sync_aggregate` reads back
@@ -811,6 +1046,24 @@ async fn the_json_block_carries_its_blobs_and_cell_proofs_as_hex() {
 /// own `fork` and the client's schedule give one domain.
 async fn serve_fulu_pinned(
     engine: Option<ethlambda_engine::EngineClient>,
+    sync_pool: SharedSyncCommitteePool,
+    clock_ahead: u64,
+) -> (
+    Arc<HttpBeaconNode>,
+    BeaconState,
+    Arc<RecordingNetwork>,
+    Arc<SigningContext>,
+) {
+    serve_fulu_pinned_under(fulu_schedule(), engine, sync_pool, clock_ahead).await
+}
+
+/// [`serve_fulu_pinned`] under `config`, which must keep [`fulu_schedule`]'s
+/// forks, for a test of a network that sets some other key its own way.
+async fn serve_fulu_pinned_under(
+    config: ethlambda_types::beacon::config::Config,
+    engine: Option<ethlambda_engine::EngineClient>,
+    sync_pool: SharedSyncCommitteePool,
+    clock_ahead: u64,
 ) -> (
     Arc<HttpBeaconNode>,
     BeaconState,
@@ -819,7 +1072,6 @@ async fn serve_fulu_pinned(
 ) {
     use ethlambda_types::beacon::containers::shared::Fork;
 
-    let config = fulu_schedule();
     let mut state = with_signing_validators_at(ForkName::Fulu, COUNT);
     let slot = compute_start_slot_at_epoch(2);
     {
@@ -857,9 +1109,9 @@ async fn serve_fulu_pinned(
         config,
         block,
         head_root,
-        slot,
+        slot + clock_ahead,
     );
-    let (client, network, _, _) = spawn_server(store, engine).await;
+    let (client, network, _, _) = spawn_server_sharing(store, engine, sync_pool, None).await;
     let genesis = client.genesis().await.expect("genesis");
     let spec = client
         .spec()
@@ -1031,12 +1283,17 @@ async fn the_validator_client_can_serve_on_the_sync_committee() {
         containers::SignedBeaconBlock,
     };
 
+    let engine = fake_execution_client(0).await;
+    let sync_pool = SharedSyncCommitteePool::default();
     let (client, state, network, context) =
-        serve_fulu_pinned(Some(fake_execution_client(0).await)).await;
+        serve_fulu_pinned(Some(engine.clone()), sync_pool.clone(), 0).await;
     let slot = state.slot();
     let root = sync_committee_slot(&client, &state, &network, context, slot).await;
 
     // The next slot's block packs what was pooled over the head it builds on.
+    // It is asked for once that slot has started: the same head and pool on a
+    // clock one slot later.
+    let (client, _, network, _) = serve_fulu_pinned(Some(engine), sync_pool, 1).await;
     let next = slot + 1;
     let advanced = advance_to_slot(&state, next, &fulu_schedule()).unwrap();
     let proposer = get_beacon_proposer_index(&advanced).unwrap();
@@ -1052,6 +1309,8 @@ async fn the_validator_client_can_serve_on_the_sync_committee() {
         proposer_index: proposer,
         randao_reveal,
         graffiti: Default::default(),
+        builder_boost_factor: None,
+        builder_min_bid: 0,
     };
     let produced = client.produce_block(&request).await.unwrap();
     let block_domain = get_domain(&advanced, DOMAIN_BEACON_PROPOSER, Some(epoch));
@@ -1147,6 +1406,16 @@ mod gloas {
         clock_slot: u64,
         engine: Option<ethlambda_engine::EngineClient>,
     ) -> Served {
+        serve_gloas_sharing(clock_slot, engine, SharedSyncCommitteePool::default()).await
+    }
+
+    /// [`serve_gloas`] pooling sync committee messages in `sync_pool`; see
+    /// [`spawn_server_sharing`].
+    async fn serve_gloas_sharing(
+        clock_slot: u64,
+        engine: Option<ethlambda_engine::EngineClient>,
+        sync_pool: SharedSyncCommitteePool,
+    ) -> Served {
         let state = head_state();
         let block = gloas_beacon_block(
             state.slot(),
@@ -1162,7 +1431,8 @@ mod gloas {
         let head_root = header.hash_tree_root();
         let store =
             beacon_store_with_head_block(state.clone(), config(), block, head_root, clock_slot);
-        let (client, network, payload_pool, _address) = spawn_server(store.clone(), engine).await;
+        let (client, network, payload_pool, _address) =
+            spawn_server_sharing(store.clone(), engine, sync_pool, None).await;
         let genesis = client.genesis().await.expect("genesis");
         let spec = client
             .spec()
@@ -1492,6 +1762,7 @@ mod gloas {
                 ),
             ),
             ethlambda_validator::slashing_protection::SlashingProtection::in_memory(),
+            None,
         );
         let duty = ProposerDutyDto {
             pubkey: encode_hex(&pubkey.0),
@@ -1582,18 +1853,28 @@ mod gloas {
     #[tokio::test]
     async fn the_validator_client_can_serve_on_the_sync_committee_at_a_gloas_slot() {
         let engine = fake_execution_client(0).await;
+        let sync_pool = SharedSyncCommitteePool::default();
         let Served {
             client,
             state,
             network,
-            store,
             context,
             ..
-        } = serve_gloas(32, Some(engine)).await;
+        } = serve_gloas_sharing(32, Some(engine.clone()), sync_pool.clone()).await;
         let client = Arc::new(client);
         let slot = state.slot();
         let root = sync_committee_slot(&client, &state, &network, context.clone(), slot).await;
 
+        // The next slot's block, asked for once that slot has started: the
+        // same head and pool on a clock one slot later.
+        let Served {
+            client,
+            network,
+            store,
+            context,
+            ..
+        } = serve_gloas_sharing(33, Some(engine), sync_pool).await;
+        let client = Arc::new(client);
         let next = slot + 1;
         let advanced = advance_to_slot(&state, next, &config()).unwrap();
         let proposer = get_beacon_proposer_index(&advanced).unwrap();
@@ -1611,6 +1892,7 @@ mod gloas {
                 ),
             ),
             ethlambda_validator::slashing_protection::SlashingProtection::in_memory(),
+            None,
         );
         let duty = ProposerDutyDto {
             pubkey: encode_hex(&pubkey.0),
@@ -1628,5 +1910,314 @@ mod gloas {
         };
         assert_eq!(signed.message.parent_root, root);
         assert_full_sync_aggregate(&advanced, &signed.message.body.sync_aggregate);
+    }
+}
+
+/// The builder flow through this node: the validator client's own
+/// registration, `produceBlockV3` with a boost factor, and blinded publish,
+/// against this node's routes with a `Builder` layered over a mock relay.
+mod builder_flow {
+    use super::*;
+    use crate::beacon::proposal::test_support::{
+        BuilderWorld, ETH, TARGET_GAS_LIMIT, builder_world,
+    };
+    use ethlambda_state_transition::beacon::helpers::accessors::get_beacon_proposer_index;
+    use ethlambda_types::beacon::builder::{
+        SignedBlindedBeaconBlock, SignedValidatorRegistrationV1, ValidatorRegistrationV1,
+    };
+    use ethlambda_types::beacon::primitives::ExecutionAddress;
+    use ethlambda_validator::beacon_node::Published;
+    use ethlambda_validator::beacon_node::block_contents::Producer;
+    use libssz::SszDecode as _;
+
+    /// What a test drives: this node served over a socket, the proposer's key
+    /// and the client's signing context.
+    struct Harness {
+        world: BuilderWorld,
+        client: HttpBeaconNode,
+        proposer: u64,
+        keys: RwLock<ValidatorStore>,
+        context: SigningContext,
+    }
+
+    /// `world`'s store served through the real beacon router, with its
+    /// `Builder` layered, behind a socket.
+    async fn harness(world: BuilderWorld, engine: ethlambda_engine::EngineClient) -> Harness {
+        // A block built on this head names the advanced header's root as its
+        // parent, which the fixture's placeholder anchor block does not have:
+        // keep the head state under that root too, as `serve_at` does, so the
+        // publish finds its parent.
+        let mut store = world.store.clone();
+        let (anchor_root, head_state) = crate::beacon::validator::head(&store).unwrap();
+        let parent_root = world.state.latest_block_header().hash_tree_root();
+        store
+            .insert_state(parent_root, (*head_state).clone())
+            .unwrap();
+        // The publish endpoints refuse a parent at the finalized slot other
+        // than the finalized block, so finalize the root the block names, as a
+        // real anchor's checkpoint does.
+        crate::test_utils::finalize_at(&mut store, anchor_root, parent_root, head_state.slot());
+
+        let (client, _network, _pool, _address) =
+            spawn_server(store, Some(engine), Some(world.builder.clone())).await;
+
+        let proposer = get_beacon_proposer_index(&world.state).unwrap();
+        let keys = keys_for(&world.state, &[proposer]);
+        let context = SigningContext {
+            config: (*world.store.config()).clone(),
+            genesis_validators_root: world.state.genesis_validators_root(),
+        };
+        Harness {
+            world,
+            client,
+            proposer,
+            keys,
+            context,
+        }
+    }
+
+    impl Harness {
+        fn pubkey(&self) -> BlsPubkey {
+            self.world.state.validator(self.proposer).unwrap().pubkey
+        }
+
+        /// The proposer's registration, signed by the client and sent through
+        /// this node. The relay checks the signature itself.
+        async fn register(&self) -> SignedValidatorRegistrationV1 {
+            let message = ValidatorRegistrationV1 {
+                fee_recipient: ExecutionAddress::repeat_byte(0x11),
+                gas_limit: TARGET_GAS_LIMIT,
+                timestamp: 1,
+                pubkey: self.pubkey(),
+            };
+            let signature = {
+                let keys = self.keys.read().await;
+                self.context
+                    .sign_validator_registration(&keys, &message)
+                    .unwrap()
+            };
+            let signed = SignedValidatorRegistrationV1 { message, signature };
+            self.client
+                .register_validators(std::slice::from_ref(&signed))
+                .await
+                .expect("the node takes the registration");
+            signed
+        }
+
+        async fn produce(
+            &self,
+            builder_boost_factor: Option<u64>,
+        ) -> ethlambda_validator::beacon_node::block_contents::ProducedBlock {
+            let epoch = compute_epoch_at_slot(self.world.slot);
+            // Signed under the head state's own fork rather than through the
+            // client's schedule: this world's state is not pinned to carry
+            // the schedule's fulu version (see `serve_fulu_pinned`), and the
+            // node verifies against the state, as the other proposal tests
+            // here do.
+            let randao_domain = get_domain(
+                &self.world.state,
+                ethlambda_types::beacon::constants::DOMAIN_RANDAO,
+                Some(epoch),
+            );
+            let randao_reveal = sign_for(
+                self.proposer as usize,
+                compute_signing_root(epoch.hash_tree_root(), randao_domain),
+            );
+            let request = BlockRequest {
+                slot: self.world.slot,
+                fork: ForkName::Fulu,
+                proposer_index: self.proposer,
+                randao_reveal,
+                graffiti: ethlambda_types::primitives::H256([0; 32]),
+                builder_boost_factor,
+                builder_min_bid: 0,
+            };
+            self.client.produce_block(&request).await.unwrap()
+        }
+
+        async fn sign(
+            &self,
+            produced: ethlambda_validator::beacon_node::block_contents::ProducedBlock,
+        ) -> Vec<u8> {
+            let domain = get_domain(
+                &self.world.state,
+                ethlambda_types::beacon::constants::DOMAIN_BEACON_PROPOSER,
+                Some(compute_epoch_at_slot(self.world.slot)),
+            );
+            let signature = sign_for(
+                self.proposer as usize,
+                compute_signing_root(produced.block_root(), domain),
+            );
+            produced.into_signed_ssz(signature)
+        }
+
+        /// Registered, a bid taken at the maximum factor, and the blinded
+        /// block signed: the node that produced it and the body to publish.
+        async fn signed_blinded(&self) -> (Producer, Vec<u8>) {
+            self.register().await;
+            self.world.offer(1, |_| {});
+            let produced = self.produce(Some(u64::MAX)).await;
+            assert!(produced.is_blinded());
+            let producer = produced.producer;
+            (producer, self.sign(produced).await)
+        }
+
+        async fn publish_blinded(
+            &self,
+            producer: Producer,
+            body: &[u8],
+        ) -> ethlambda_validator::Result<Published> {
+            self.client
+                .publish_blinded_block(producer, ForkName::Fulu, body)
+                .await
+        }
+    }
+
+    /// A relay refusing the block is a definite refusal at the client: the
+    /// node passes the builder's 400 through.
+    #[tokio::test]
+    async fn a_relay_refusing_the_blinded_block_is_a_definite_refusal() {
+        let world = builder_world(false, SyncStatus::Synced).await;
+        world
+            .relay
+            .answer_submissions_with(axum::http::StatusCode::BAD_REQUEST);
+        let engine = fake_execution_client_paying("0x2a", false).await;
+        let h = harness(world, engine).await;
+
+        let (producer, body) = h.signed_blinded().await;
+        let err = h
+            .publish_blinded(producer, &body)
+            .await
+            .expect_err("the relay refused it");
+        assert!(
+            matches!(err, Error::BeaconNodeStatus { status: 400, .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// A relay failing without saying whether it published is unconfirmed at
+    /// the client, not a missed proposal: the relay may still publish.
+    #[tokio::test]
+    async fn a_relay_failing_on_the_blinded_block_leaves_it_unconfirmed() {
+        let world = builder_world(false, SyncStatus::Synced).await;
+        world
+            .relay
+            .answer_submissions_with(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        let engine = fake_execution_client_paying("0x2a", false).await;
+        let h = harness(world, engine).await;
+
+        let (producer, body) = h.signed_blinded().await;
+        let err = h
+            .publish_blinded(producer, &body)
+            .await
+            .expect_err("the relay did not confirm it");
+        assert!(
+            matches!(
+                err,
+                Error::BlindedUnconfirmed {
+                    status: Some(500),
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// Once the node handed a blinded block to its builder, it refuses a
+    /// different block for the slot from the same client, as a second
+    /// signature for it would be an equivocation.
+    #[tokio::test]
+    async fn the_node_refuses_a_second_block_after_a_blinded_one() {
+        let world = builder_world(false, SyncStatus::Synced).await;
+        let engine = fake_execution_client_paying("0x2a", false).await;
+        let h = harness(world, engine).await;
+
+        let (producer, body) = h.signed_blinded().await;
+        let published = h.publish_blinded(producer, &body).await.expect("handed");
+        assert_eq!(published, Published::HandedToBuilder);
+
+        let full = h.produce(None).await;
+        assert!(!full.is_blinded());
+        let full = h.sign(full).await;
+        let err = h
+            .client
+            .publish_block(ForkName::Fulu, &full)
+            .await
+            .expect_err("the slot is claimed by the blinded block");
+        assert!(
+            matches!(&err, Error::BeaconNodeStatus { status: 400, body }
+                if body.contains("already published a different block")),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_validator_client_can_propose_a_builder_block_through_this_node() {
+        let world = builder_world(false, SyncStatus::Synced).await;
+        let engine = fake_execution_client_paying("0x2a", false).await;
+        let h = harness(world, engine).await;
+
+        let registered = h.register().await;
+        assert_eq!(h.world.relay.registrations(), [registered]);
+
+        // Worth far less than the local payload (42 wei), so only the maximum
+        // factor makes it win: a factor that is dropped or ignored (the node's
+        // default is 100) leaves a full block.
+        h.world.offer(1, |_| {});
+        let produced = h.produce(Some(u64::MAX)).await;
+        assert!(
+            produced.is_blinded(),
+            "the factor must reach the node and take the bid"
+        );
+
+        let producer = produced.producer;
+        let body = h.sign(produced).await;
+        let published = h
+            .client
+            .publish_blinded_block(producer, ForkName::Fulu, &body)
+            .await
+            .expect("the node hands the block to its builder");
+        assert_eq!(published, Published::HandedToBuilder);
+
+        let signed = SignedBlindedBeaconBlock::from_ssz_bytes(&body).unwrap();
+        assert_eq!(h.world.relay.blinded_blocks(), [signed]);
+    }
+
+    #[tokio::test]
+    async fn without_builder_proposals_the_client_gets_a_full_block() {
+        let world = builder_world(false, SyncStatus::Synced).await;
+        let engine = fake_execution_client_paying("0x2a", false).await;
+        let h = harness(world, engine).await;
+
+        // Registered, with a bid worth far more than the local payload: only
+        // the factor the client sends (0 for `None`) keeps the block local.
+        h.register().await;
+        h.world.offer(ETH, |_| {});
+        let produced = h.produce(None).await;
+        assert!(!produced.is_blinded());
+        assert!(h.world.relay.blinded_blocks().is_empty());
+        assert_eq!(
+            h.world.relay.header_requests().len(),
+            1,
+            "the node still asks the relay at a factor of 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relay_that_is_down_leaves_a_full_block() {
+        let world = builder_world(false, SyncStatus::Synced).await;
+        world.relay.answer_headers_with(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "application/json",
+            Vec::new(),
+            None,
+        );
+        let engine = fake_execution_client_paying("0x2a", false).await;
+        let h = harness(world, engine).await;
+
+        h.register().await;
+        h.world.offer(ETH, |_| {});
+        let produced = h.produce(Some(100)).await;
+        assert!(!produced.is_blinded());
     }
 }
