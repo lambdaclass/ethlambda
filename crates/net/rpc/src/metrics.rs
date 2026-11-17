@@ -1,5 +1,7 @@
 use axum::{Router, http::HeaderValue, http::header, response::IntoResponse, routing::get};
-use ethlambda_metrics::{Histogram, gather_default_metrics, register_histogram};
+use ethlambda_metrics::{
+    Histogram, HistogramVec, gather_default_metrics, register_histogram, register_histogram_vec,
+};
 use std::{sync::LazyLock, time::Duration};
 use tracing::warn;
 
@@ -16,6 +18,24 @@ pub(crate) fn observe_publish_data_columns(elapsed: Duration) {
         .unwrap()
     });
     LEAN_BEACON_PUBLISH_DATA_COLUMNS_SECONDS.observe(elapsed.as_secs_f64());
+}
+
+/// Record one builder API call: which call, how it ended, and how long it
+/// took. `getHeader` runs against the proposal's deadline, so its tail
+/// matters as much as its failures.
+pub(crate) fn observe_builder_request(call: &str, outcome: &str, elapsed: Duration) {
+    static LEAN_BEACON_BUILDER_REQUEST_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec!(
+            "lean_beacon_builder_request_seconds",
+            "Time a builder API call took, by call and outcome",
+            &["call", "outcome"],
+            vec![0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 2.0, 5.0, 10.0]
+        )
+        .unwrap()
+    });
+    LEAN_BEACON_BUILDER_REQUEST_SECONDS
+        .with_label_values(&[call, outcome])
+        .observe(elapsed.as_secs_f64());
 }
 
 pub fn start_prometheus_metrics_api() -> Router {
