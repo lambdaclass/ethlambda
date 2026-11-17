@@ -109,13 +109,13 @@ clock lag, one epoch of peer lead), a band of 4 slots that neither Lighthouse
 nor Prysm has (this node re-judges on every block arrival, and would otherwise
 flip twice a slot at the boundary), an epoch of stall window, and Prysm's
 `Status` refresh, every half epoch (Lighthouse refreshes every 300 s). The
-stall window has no counterpart in either client. A follower whose head stays
-flat for an epoch while peers report a lead (columns that never arrive, an
-execution client holding every payload) does its duties on a stale head,
-voting for the wrong head and target, which is penalized but not slashable.
-Without the window, a peer claiming a head it does not serve keeps the node
-from doing any duty for as long as it keeps claiming, which costs those votes
-and the proposals with them.
+stall window has no counterpart in either client. A follower more than two
+epochs behind the clock whose head stays flat for an epoch while peers report
+a lead (columns that never arrive, an execution client that is down) does its
+duties on a stale head, and its votes are penalized as wrong or missed, never
+slashed. Without the window, a peer claiming a head it does not serve keeps
+such a node from doing any duty for as long as it keeps claiming, which costs
+those votes and the proposals with them.
 consensus-specs has no sync gate, and the Beacon API leaves `is_syncing` to the
 client.
 

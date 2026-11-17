@@ -409,8 +409,8 @@ pub async fn handle_req_resp_message(
                         debug!(%peer, ?code, %error_str, "Received error response");
 
                         match server.outbound_requests.remove(&request_id) {
-                            Some(PendingRequestKind::Range { .. }) => {
-                                fail_range_request(server, &peer);
+                            Some(PendingRequestKind::Range { end_slot, .. }) => {
+                                fail_range_request(server, &peer, end_slot);
                             }
                             Some(PendingRequestKind::Root(root)) => {
                                 // An error response completes the exchange, so
@@ -478,7 +478,7 @@ pub async fn handle_req_resp_message(
                     start_slot,
                     end_slot,
                 }) => {
-                    fail_range_request(server, &peer);
+                    fail_range_request(server, &peer, end_slot);
                     debug!(
                         %peer,
                         start_slot,
@@ -945,7 +945,7 @@ async fn handle_lean_blocks_by_range_response(
     // cursor never moving past the span (see the stall window in
     // `docs/spec_deviations.md`).
     if blocks.is_empty() {
-        fail_range_request(server, &peer);
+        fail_range_request(server, &peer, end_slot);
         debug!(%peer, start_slot, end_slot, "Received no block in the requested range");
         return;
     }
@@ -1419,7 +1419,7 @@ async fn request_next_range_batch(server: &mut P2PServer) -> bool {
             count,
             "Failed to send BlocksByRange request"
         );
-        fail_range_request(server, &peer);
+        fail_range_request(server, &peer, batch.end.saturating_sub(1));
         return false;
     };
 
@@ -1533,7 +1533,7 @@ pub(super) async fn request_next_beacon_range_batch(
             planned,
             "Failed to send BeaconBlocksByRange request"
         );
-        fail_range_request(server, &peer);
+        fail_range_request(server, &peer, batch.end.saturating_sub(1));
         return false;
     }
 
@@ -1672,11 +1672,12 @@ fn on_status_failure(
     false
 }
 
-/// Count a failed range request against `peer` (a cooldown, and suspicion
-/// once they add up; see [`peer_heads::note_range_failure`]), and take it out
-/// of the range session, which ends with no peer left.
-fn fail_range_request(server: &mut P2PServer, peer: &PeerId) {
-    peer_heads::note_range_failure(server, peer);
+/// Count a failed range request, whose last slot is `end_slot`, against
+/// `peer` (a cooldown, and suspicion once they add up; see
+/// [`peer_heads::note_range_failure`]), and take it out of the range session,
+/// which ends with no peer left.
+fn fail_range_request(server: &mut P2PServer, peer: &PeerId, end_slot: u64) {
+    peer_heads::note_range_failure(server, peer, end_slot);
     let should_clear = if let Some(state) = &mut server.range_sync_state {
         state.fail_peer(peer);
         state.peer_set.is_empty()
@@ -2882,7 +2883,7 @@ async fn handle_beacon_blocks_by_range_response(
         .collect();
     // As on lean: no block in the range asked for is as good as no answer.
     if blocks.is_empty() {
-        fail_range_request(server, &peer);
+        fail_range_request(server, &peer, end_slot);
         debug!(%peer, start_slot, end_slot, "Received no block in the requested range");
         return;
     }
@@ -2974,7 +2975,7 @@ async fn retire_unanswered(
 ) {
     match kind {
         PendingRequestKind::Root(root) => handle_fetch_failure(server, root, peer, ctx).await,
-        PendingRequestKind::Range { .. } => fail_range_request(server, &peer),
+        PendingRequestKind::Range { end_slot, .. } => fail_range_request(server, &peer, end_slot),
         PendingRequestKind::Columns(block_root, _) => {
             handle_column_fetch_failure(server, block_root, peer, ctx).await;
         }
@@ -3630,7 +3631,7 @@ pub(crate) mod tests {
         on_lean_status_request(&mut server, liar, &lean_status_at(unknown, 500)).await;
         assert!(server.range_sync_state.is_some());
 
-        fail_range_request(&mut server, &liar);
+        fail_range_request(&mut server, &liar, 10);
         assert!(server.range_sync_state.is_none());
         on_lean_status_request(&mut server, liar, &lean_status_at(unknown, 501)).await;
         assert!(server.range_sync_state.is_none());
@@ -3690,12 +3691,30 @@ pub(crate) mod tests {
         let peer = connected_peer(&mut server);
         let unknown = H256::repeat_byte(0x11);
         on_lean_status_request(&mut server, peer, &lean_status_at(unknown, 500)).await;
-        fail_range_request(&mut server, &peer);
-        fail_range_request(&mut server, &peer);
+        fail_range_request(&mut server, &peer, 10);
+        fail_range_request(&mut server, &peer, 10);
         server.range_sync_state = Some(RangeSyncState::new(1..500, peer, 500));
         server.peer_heads.expire(u64::MAX, 0);
         assert_eq!(server.peer_heads.claimed_head(&peer), None);
-        fail_range_request(&mut server, &peer);
+        assert!(!server.peer_heads.is_suspect(&peer));
+        fail_range_request(&mut server, &peer, 10);
+        assert!(server.peer_heads.is_suspect(&peer));
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_left_the_session_is_suspected_through_its_failed_request() {
+        // Finding: a peer whose claim was dropped (and with it its place in
+        // the range session) while its third failing request was out had no
+        // head left to suspect it through.
+        let mut server = unconnected_server().await;
+        let peer = connected_peer(&mut server);
+        let unknown = H256::repeat_byte(0x11);
+        on_lean_status_request(&mut server, peer, &lean_status_at(unknown, 500)).await;
+        fail_range_request(&mut server, &peer, 10);
+        fail_range_request(&mut server, &peer, 10);
+        peer_heads::drop_claim(&mut server, &peer);
+        assert!(!server.peer_heads.is_suspect(&peer));
+        fail_range_request(&mut server, &peer, 20);
         assert!(server.peer_heads.is_suspect(&peer));
     }
 
@@ -3754,6 +3773,24 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_refusal_from_a_peer_already_gone_records_nothing() {
+        // Handled after the disconnect, a refusal would mute the peer, or note
+        // its version, past `forget` and into its next connection.
+        let mut server = crate::test_support::unconnected_beacon_server(Config::mainnet(), 0).await;
+        let gone = PeerId::random();
+        let v1 = ReqRespProtocol::BeaconStatusV1;
+        assert!(!on_status_failure(&mut server, gone, v1, true));
+        let v2 = ReqRespProtocol::BeaconStatusV2;
+        assert!(!on_status_failure(&mut server, gone, v2, true));
+        assert_eq!(server.peer_heads.status_version(&gone), StatusVersion::V1);
+        server.peer_heads.due_for_refresh([gone], 10, 2);
+        assert_eq!(
+            server.peer_heads.due_for_refresh([gone], 1_000, 2),
+            vec![gone]
+        );
+    }
+
+    #[tokio::test]
     async fn a_peer_that_drops_status_2_is_asked_in_status_1() {
         let mut server = crate::test_support::unconnected_beacon_server(Config::mainnet(), 0).await;
         let peer = connected_peer(&mut server);
@@ -3787,10 +3824,10 @@ pub(crate) mod tests {
         let unknown = H256::repeat_byte(0x11);
         on_lean_status_request(&mut server, liar, &lean_status_at(unknown, 500)).await;
         for _ in 0..2 {
-            fail_range_request(&mut server, &liar);
+            fail_range_request(&mut server, &liar, 10);
             assert!(!server.peer_heads.is_suspect(&liar));
         }
-        fail_range_request(&mut server, &liar);
+        fail_range_request(&mut server, &liar, 10);
         assert!(server.peer_heads.is_suspect(&liar));
     }
 
@@ -3904,7 +3941,7 @@ pub(crate) mod tests {
         // peer's next handshake.
         let mut server = unconnected_server().await;
         let peer = PeerId::random();
-        fail_range_request(&mut server, &peer);
+        fail_range_request(&mut server, &peer, 10);
         let wall = crate::wall_clock_slot(&server.store);
         assert!(!server.peer_heads.range_cooling_down(&peer, wall, 2));
     }

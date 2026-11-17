@@ -138,7 +138,8 @@ pub(crate) struct PeerHeads {
     /// [`LOST_AFTER_INTERVALS`] refresh intervals is taken as lost: libp2p
     /// ends a request long before that (its timeout is 10 s), so only one
     /// that never went anywhere (the swarm closing under the send) is still
-    /// out by then, and it must not keep its peer from being asked again.
+    /// out by then, and it must not keep its peer from being asked again. No
+    /// answer can come for it, so the order below still holds.
     awaiting_answer: HashMap<PeerId, u64>,
     /// Each peer's failed range requests (an empty or refused answer, a
     /// timeout) since the head last reached blocks it handed over. A peer that has just failed is
@@ -418,7 +419,8 @@ impl PeerHeads {
     }
 
     /// Note that a `Status` request to `peer` (the handshake, or a refresh)
-    /// has gone out. No other is sent until it is over, so answers come back
+    /// has gone out. No other is sent until it is over (or taken as lost; see
+    /// [`Self::awaiting_answer`]), so answers come back
     /// in the order the requests went out: a slow answer can neither be
     /// taken for the handshake's nor overwrite a newer one's head.
     pub(crate) fn begin_status_request(&mut self, peer: PeerId, wall_slot: u64) {
@@ -514,7 +516,11 @@ pub(crate) fn observe(
             wall_slot,
             "Ignoring a Status head past the wall clock"
         );
-        // Nor is it synced from on what it claimed before.
+    }
+    // Not synced from on a head it merged in before: one claiming the future
+    // is not to be believed about the present, and one whose head this node
+    // holds has nothing left to give it.
+    if matches!(report, Report::Future | Report::Held) {
         leave_range_session(server, &peer);
     }
     publish(server);
@@ -583,26 +589,31 @@ pub(crate) fn clear_suspects(server: &mut P2PServer, head_slot: u64, wall_slot: 
     }
 }
 
-/// Note a failed range request from `peer`, which starts or extends its
-/// cooldown, and republish the network head without its claim. Only while it
-/// is connected: libp2p reports a closed connection before the request it
+/// Note a failed range request from `peer`, whose last slot is `end_slot`,
+/// which starts or extends its cooldown, and republish the network head
+/// without its claim. Only while it is connected: libp2p reports a closed connection before the request it
 /// failed, so a failure noted after `forget` would outlive the peer and hold
 /// back its next connection's handshake.
-pub(crate) fn note_range_failure(server: &mut P2PServer, peer: &PeerId) {
+pub(crate) fn note_range_failure(server: &mut P2PServer, peer: &PeerId, end_slot: u64) {
     if !server.connected_peers.contains_key(peer) {
         return;
     }
     let wall_slot = crate::wall_clock_slot(&server.store);
     server.peer_heads.note_range_failure(*peer, wall_slot);
-    // Suspected through the head it claims or, that claim gone (expired
-    // while the request was out), the one the range session planned towards.
+    // Suspected through the head it claims. With that claim gone (expired
+    // while the request was out), through the one the range session planned
+    // towards; out of the session too (it left on a claim dropped
+    // meanwhile), through the last slot of the request it failed.
     let session_head = server
         .range_sync_state
         .as_ref()
         .and_then(|state| state.peer_set.get(peer).copied());
-    if server.peer_heads.failure_streak(peer) >= SUSPECT_AFTER_FAILURES
-        && let Some(through) = server.peer_heads.claimed_head(peer).or(session_head)
-    {
+    if server.peer_heads.failure_streak(peer) >= SUSPECT_AFTER_FAILURES {
+        let through = server
+            .peer_heads
+            .claimed_head(peer)
+            .or(session_head)
+            .unwrap_or(end_slot);
         server.peer_heads.suspect(*peer, through, wall_slot);
     }
     publish(server);
