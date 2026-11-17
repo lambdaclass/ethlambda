@@ -82,12 +82,14 @@
 //!
 //! "Went out" includes a send no node confirmed but some node may have taken
 //! (it timed out, broke once sent, or answered a 5xx): that preference is kept
-//! and sent again as signed, like one a node accepted. Signed afresh with
-//! settings changed meanwhile, it could be refused by a node that took the
-//! first and taken by one that did not, leaving the nodes with different
-//! preferences for the slot. Only a send every node definitely refused (a
-//! 4xx, a 503, no connection) is signed afresh at the next poll, so a change
-//! made since does go out.
+//! and sent again as signed, like one a node accepted, until its slot starts.
+//! Signed afresh with settings changed meanwhile, it could be refused by a
+//! node that took the first and taken by one that did not, leaving the nodes
+//! with different preferences for the slot. A later send's failure does not
+//! release it, not even a definite one: that says nothing of the send whose
+//! answer was lost. Only a preference every node definitely refused each time
+//! it was sent (a 4xx, a 503, no connection) is signed afresh at the next
+//! poll, so a change made since does go out.
 //!
 //! A restart with other settings (another `--suggested-fee-recipient` or
 //! `--gas-limit`, or the keymanager's overrides gone) is the same case seen
@@ -143,15 +145,15 @@ use crate::slot_clock::SlotClock;
 /// Where one `(proposal_slot, dependent_root)`'s preference stands.
 #[derive(Debug, Clone)]
 enum Sent {
-    /// Every node definitely refused the last one sent (see
+    /// Every node definitely refused each one sent (see
     /// [`crate::error::Error::outcome_unknown`]), and that was warned about.
     /// Signed afresh each poll, so an address set in between is the one that
     /// goes out.
     Refused,
     /// No node confirmed this message, but one may have taken it before its
     /// answer was lost. Sent again, as signed, each poll until a node accepts
-    /// it or every node definitely refuses it: see the module doc's "No
-    /// replacement".
+    /// it or its slot starts, whatever the later sends meet: see the module
+    /// doc's "No replacement".
     Unconfirmed(SignedProposerPreferences),
     /// A node accepted this message and another may not hold it: one refused
     /// or did not answer, or none took the epoch's re-send. Sent again, as
@@ -640,7 +642,11 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
                             outcome_unknown,
                             "No beacon node took a proposer preference again"
                         );
-                        let left = Sent::unanswered(entry, outcome_unknown);
+                        // One a node may hold stays so: this send's failure,
+                        // even a definite one, says nothing of the send whose
+                        // answer was lost.
+                        let may_be_held = outcome_unknown || before == Before::Unconfirmed;
+                        let left = Sent::unanswered(entry, may_be_held);
                         lock(&self.sent).insert(key, left);
                         Tally::default()
                     }
@@ -1156,6 +1162,56 @@ mod tests {
         assert_eq!(
             sent[0].1[0].message.fee_recipient, FEE_RECIPIENT,
             "sent as first signed, not signed again with the new address"
+        );
+        assert_eq!(stages(&service)[&(slot, root)], "everywhere");
+    }
+
+    /// A preference whose answer was lost stays as signed through a later
+    /// definite refusal: a 400 to the re-send says nothing of whether a node
+    /// took, and gossiped, the first. A fee recipient changed meanwhile is not
+    /// signed for the slot.
+    #[tokio::test]
+    async fn an_unconfirmed_preference_outlasts_a_later_refusal() {
+        let (store, pubkeys) = store_with_keys(1);
+        let store = Arc::new(RwLock::new(store));
+        let slot = slot_in(GLOAS_EPOCH, 10);
+        let root = Root::repeat_byte(0x11);
+        let node = MockBeaconNode::new().with_proposers_v2(
+            GLOAS_EPOCH,
+            root,
+            vec![duty(&pubkeys[0], 3, slot)],
+        );
+        node.failures
+            .lock()
+            .expect("lock")
+            .insert("submit_proposer_preferences", "timed out".to_string());
+        let settings = settings(Some(FEE_RECIPIENT));
+        let (service, node) = service(node, settings.clone());
+        let current = slot_in(GLOAS_EPOCH, 1);
+
+        service.clone().poll(current, store.clone()).await;
+        assert_eq!(stages(&service)[&(slot, root)], "unconfirmed");
+
+        settings.set_fee_recipient(&pubkeys[0], H160([0xcd; 20]));
+        node.failures.lock().expect("lock").clear();
+        node.refused_preference_slots
+            .lock()
+            .expect("lock")
+            .push(slot);
+        service.clone().poll(current + 1, store.clone()).await;
+        assert_eq!(stages(&service)[&(slot, root)], "unconfirmed");
+        assert_eq!(
+            service.accepted_fee_recipients(slot, 3),
+            vec![FEE_RECIPIENT]
+        );
+
+        node.refused_preference_slots.lock().expect("lock").clear();
+        service.clone().poll(current + 2, store).await;
+        let sent = submitted(&node);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].1[0].message.fee_recipient, FEE_RECIPIENT,
+            "sent as first signed, not signed again after the refusal"
         );
         assert_eq!(stages(&service)[&(slot, root)], "everywhere");
     }

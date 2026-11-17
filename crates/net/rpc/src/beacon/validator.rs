@@ -884,6 +884,22 @@ mod tests {
 
     const COUNT: usize = 64;
 
+    /// Each definition's slot where its subtraction saturates and past it. V2
+    /// is beacon-APIs' `compute_start_slot_at_epoch(epoch - 1) - 1`, which the
+    /// state transition's helper computes; an off-by-one there would still
+    /// pass this node's own preference check and fail every other client's.
+    #[test]
+    fn each_dependent_root_names_the_slot_beacon_apis_defines() {
+        let slots = preset::SLOTS_PER_EPOCH;
+        assert_eq!(DependentRoot::V1.slot(0), 0);
+        assert_eq!(DependentRoot::V1.slot(1), slots - 1);
+        assert_eq!(DependentRoot::V1.slot(100), 100 * slots - 1);
+        assert_eq!(DependentRoot::V2.slot(0), 0);
+        assert_eq!(DependentRoot::V2.slot(1), 0);
+        assert_eq!(DependentRoot::V2.slot(2), slots - 1);
+        assert_eq!(DependentRoot::V2.slot(100), 99 * slots - 1);
+    }
+
     /// A fulu state one epoch past genesis with its lookahead filled in, as
     /// every real fulu state has it, and distinct block roots per slot so a
     /// `dependent_root` taken from the wrong slot shows up.

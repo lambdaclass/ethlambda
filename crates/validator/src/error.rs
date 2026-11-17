@@ -23,9 +23,10 @@ pub const EIP2335_KEYSTORE_VERSION: u64 = 4;
 /// construct the same variant without ever holding a real HTTP error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BeaconNodeFailure {
-    /// The request outlived its timeout.
+    /// The request outlived its timeout once connected.
     Timeout,
-    /// The connection could not be established.
+    /// The connection could not be established: refused, or not made within
+    /// the connect timeout. Nothing was sent.
     Connect,
     /// The request could not be built or sent.
     Request,
@@ -35,11 +36,15 @@ pub enum BeaconNodeFailure {
 
 impl BeaconNodeFailure {
     /// Classify a `reqwest` failure.
+    ///
+    /// reqwest reports a connect timeout as both a connect error and a
+    /// timeout. It is a connection never made, so the connect check comes
+    /// first: [`Error::outcome_unknown`] counts it as definite.
     pub fn classify(error: &reqwest::Error) -> Self {
-        if error.is_timeout() {
-            Self::Timeout
-        } else if error.is_connect() {
+        if error.is_connect() {
             Self::Connect
+        } else if error.is_timeout() {
+            Self::Timeout
         } else if error.is_body() || error.is_decode() {
             Self::Body
         } else {

@@ -1827,7 +1827,7 @@ mod tests {
             matches!(
                 err,
                 Error::BeaconNode {
-                    failure: BeaconNodeFailure::Timeout,
+                    failure: BeaconNodeFailure::Connect,
                     ..
                 }
             ),
