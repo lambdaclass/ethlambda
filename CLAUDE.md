@@ -588,6 +588,17 @@ default** on its two SSZ endpoints and bare integers in JSON, because
 `checkpoint_sync.rs` and other clients' lean sync read those bytes and may send no
 `Accept` at all; `/lean/v0/blocks/finalized` now answers JSON when asked for it by name.
 
+With `--builder`, the beacon surface also runs the **fulu builder flow
+(MEV-Boost)**. `register_validator` forwards registrations to the builder
+(`beacon/registrations.rs`, client in `beacon/builder_client/`).
+`produceBlockV3` asks for the builder's bid alongside the local build and
+serves a blinded block when the bid passes its checks and wins on value
+(`beacon/builder_flow/`: bid checks, circuit breaker, boost-factor choice).
+`blinded_blocks` hands the signed block back for the builder to publish, with
+no local fallback, since a second block for the slot would be an equivocation. Gloas
+has no blinded blocks; its builder market is separate (the **Gloas** bullet
+under Beacon Chain STF).
+
 See [`docs/rpc.md`](docs/rpc.md) for the full reference: CLI flags and defaults, the lean API endpoints (health, finalized state/block, justified checkpoint, blocks by root/slot, fork-choice tree + D3.js UI, runtime aggregator toggle), the Beacon API endpoints and the three ids they refuse, the metrics/debug endpoints (Prometheus `/metrics`, jemalloc heap profiling), the Hive test-driver endpoints, plus request/response shapes, status codes, and content types.
 
 ## Beacon Chain types (`crates/common/types/src/beacon/`)
@@ -669,6 +680,12 @@ existing once per chain.
     validator: helpers that build the active-index `Vec` and then read each
     index back were the largest cost left in the import profile
     (`docs/beacon_stf.md`, "Registry and balances").
+- **`beacon::builder` holds builder-specs containers** (`ValidatorRegistrationV1`,
+  `BuilderBid`, `BlindedBeaconBlock`), not consensus ones: the MEV-Boost relay
+  flow's wire types. `BlindedBeaconBlock`'s root equals the full block's, which
+  is what lets a validator sign a block whose payload it never sees. Electra and
+  fulu shapes only. Tests decode builder-specs' own examples, vendored under
+  `crates/common/types/tests/fixtures/builder_specs/`.
 
 ## Beacon Chain STF (`crates/blockchain/state_transition/src/beacon/`)
 
@@ -874,6 +891,15 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   that is neither parseable nor listed, so a new fork forces a decision.
 - A fixture case with no `post` state asserts the input must be **rejected**. That
   rule lives in `check_transition`; do not add a runner that ignores it.
+- **`assemble_blinded_block` does not use a blinded STF.** It runs `process_block`
+  on a stand-in payload built from the builder's header, then patches the two
+  post-state fields that depend on the payload itself
+  (`latest_execution_payload_header`, `latest_block_header.body_root`). It
+  also checks the header's `withdrawals_root` itself: the stand-in carries the
+  expected withdrawals, so the STF's own withdrawals check passes trivially. Fulu
+  only, since it is the last fork with blinded blocks. Read the function's doc
+  before touching fulu's `process_block`;
+  `blinded_and_full_blocks_reach_the_same_state_root` fails on any drift.
 
 ## Configuration Files
 

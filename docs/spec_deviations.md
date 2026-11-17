@@ -158,7 +158,62 @@ from the Beacon API, and no other way.
   the bid's.
 - **Why:** gossip and API bids need only a pool and the gossip rules. A builder
   API client is a separate crate with its own failure modes and timeouts, and
-  is left for a later phase.
+  is left for a later phase for gloas. Fulu's builder API (MEV-Boost) is now
+  served (`produceBlockV3` and `blinded_blocks`); gloas's is not.
+
+## Builder bids: the fee recipient is not checked
+
+- **The specification:** builder-specs' `process_bid` asserts
+  `header.fee_recipient == fee_recipient`.
+- **ethlambda:** a mismatch is logged at `debug` only.
+- **Why:** a builder names its own address as the payload's fee recipient
+  (the coinbase), so priority fees and MEV accrue to it, and pays the proposer
+  with a transaction to the registered fee recipient, worth the bid's `value`,
+  as the payload's last transaction. A mismatch is therefore the normal case,
+  and the assertion would refuse nearly every real bid. Every client reviewed
+  (Lighthouse, Teku, Prysm, Nimbus, Lodestar, Grandine) skips it. A counter of
+  mismatches would rise on nearly every bid and tell an operator nothing.
+- **The payment itself is not checked either, by this node or any client
+  reviewed.** A bid carries only the payload's header: the transactions,
+  payment included, stay with the builder until the proposer has signed. After
+  signing, `submitBlindedBlockV2` returns no payload; the builder publishes
+  the block, which reaches this node over gossip like any other, by which time
+  nothing can be undone.
+- **Who does check it:** the relay. Before serving a builder's bid, a relay
+  validates the submission on an execution node, and that validation requires
+  the proposer payment. Flashbots' block-validation API
+  (`flashbots_validateBuilderSubmission*`) passes the registered fee
+  recipient and the bid's value to `ValidatePayload`, which requires the
+  block's last transaction to pay that address at least that much (or, if the
+  relay configures it, the address's balance to rise by it). The proposer
+  relies on the relay for this, as for the payload's validity. A relay
+  publishes what it delivered on its data API
+  (`/relay/v1/data/bidtraces/proposer_payload_delivered`), which is where an
+  underpayment would surface. An operator who wants more than that trust must
+  choose relays accordingly. A check after the fact, comparing a published
+  block's last transaction with the bid it won, is possible but not
+  implemented.
+
+## `builder_boost_factor` scales the bid before rounding
+
+- **The specification:** beacon-APIs' `produceBlockV3` serves the local payload
+  iff `exec_node_payload_value >= builder_boost_factor *
+  (builder_payload_value // 100)`: the bid is rounded down to a multiple of
+  100 wei, then scaled.
+- **ethlambda:** the local payload wins iff its value is at least
+  `(builder_boost_factor * builder_payload_value) // 100`, scaled first and
+  rounded down once (`builder_flow::choice::boosted`), saturating at
+  `u128::MAX`. A tie still goes local, and the factors 0, 100 and `2^64 - 1`
+  keep the meanings the specification gives them.
+- **Why:** rounding first loses up to 99 wei of the bid before it is weighed,
+  so even at the default factor of 100 a bid slightly better than the local
+  payload lost to it. Scaling first makes 100 an exact comparison. The two
+  differ by less than `factor` wei, only ever in the bid's favour. The gloas
+  `produceBlockV4` comparison (`bid_selection::choose_payload`) already
+  multiplies first. Teku and Lodestar compare `local * 100` against
+  `factor * bid`, and Nimbus computes `(factor * bid) div 100` (giving a tie to
+  the builder). Lighthouse follows the specification's order but skips the
+  arithmetic at factor 100 for the same reason (sigp/lighthouse#5352).
 
 ## Fee recipient and gas target come from proposer preferences, with fallbacks
 
