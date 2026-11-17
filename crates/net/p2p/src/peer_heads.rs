@@ -148,6 +148,9 @@ pub(crate) struct PeerHeads {
     /// The wall-clock slot of each connected peer's last `Status` request
     /// that was acted on: at most one a slot (see [`Self::inbound_due`]).
     inbound_at: HashMap<PeerId, u64>,
+    /// The wall-clock slot the refresh last asked peers at; see
+    /// [`Self::begin_refresh_slot`].
+    refreshed_at: Option<u64>,
     /// The wall-clock slot of each connected peer's last `Status` exchange, in
     /// either direction: the last time it told us its head, or we asked.
     last_exchange: HashMap<PeerId, u64>,
@@ -354,6 +357,12 @@ impl PeerHeads {
     /// on: the first in each slot is, later ones are only answered.
     pub(crate) fn inbound_due(&mut self, peer: PeerId, wall_slot: u64) -> bool {
         self.inbound_at.insert(peer, wall_slot) != Some(wall_slot)
+    }
+
+    /// Whether the refresh may ask peers at `wall_slot`: once a slot, so a
+    /// timer that fires twice in one does not ask two shares.
+    pub(crate) fn begin_refresh_slot(&mut self, wall_slot: u64) -> bool {
+        self.refreshed_at.replace(wall_slot) != Some(wall_slot)
     }
 
     /// Note that the handshake `Status` to `peer` has gone out.
@@ -710,6 +719,14 @@ mod tests {
         assert!(heads.due_for_refresh([peer], 20, 4).is_empty());
         heads.end_handshake(&peer);
         assert_eq!(heads.due_for_refresh([peer], 20, 4), vec![peer]);
+    }
+
+    #[test]
+    fn the_refresh_asks_once_a_slot() {
+        let mut heads = PeerHeads::default();
+        assert!(heads.begin_refresh_slot(10));
+        assert!(!heads.begin_refresh_slot(10));
+        assert!(heads.begin_refresh_slot(11));
     }
 
     #[test]

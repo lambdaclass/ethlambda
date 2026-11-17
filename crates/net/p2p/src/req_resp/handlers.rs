@@ -1916,9 +1916,11 @@ async fn handle_status_request(
             peer_heads::drop_claim(server, &peer);
         }
     }
-    let wire = server.wire.beacon().expect("checked above");
+    // Built once a slot (see `P2PServer::beacon_status_v2`), however many
+    // requests arrive in it.
+    let our_status_v2 = server.beacon_status_v2().expect("checked above");
     let our_status =
-        beacon_handler::build_status(&server.store, wire, StatusVersion::of(&peer_status));
+        beacon_handler::status_in_version(&our_status_v2, StatusVersion::of(&peer_status));
     respond(server, channel, ResponsePayload::Status(our_status));
 
     // As on lean (see `handle_lean_status_request`), a request that shows a
@@ -3032,6 +3034,7 @@ pub(crate) mod tests {
             outbound_requests: HashMap::new(),
             range_sync_state: None,
             range_fetched_through: 0,
+            beacon_status: None,
             head_watch: crate::HeadWatch::default(),
             peer_heads: Default::default(),
             bootnode_addrs: HashMap::new(),
@@ -3656,7 +3659,7 @@ pub(crate) mod tests {
                 .record(peer, 0, H256::ZERO, wall.saturating_sub(interval), false);
         }
 
-        server.refresh_due_peer_statuses().await;
+        server.refresh_due_peer_statuses_at(wall).await;
 
         // This slot's share was asked and counts as just exchanged; the rest
         // are still due.

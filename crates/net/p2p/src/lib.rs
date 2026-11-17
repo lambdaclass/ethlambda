@@ -224,6 +224,14 @@ const DIAL_ADDRESS_CONCURRENCY: NonZeroU8 = NonZeroU8::new(1).expect("1 > 0");
 
 const MAX_SYNC_RANGE: u64 = MAX_REQUEST_BLOCKS * 64; // 65,536 slots (~3 days)
 
+// `status_sync_target` measures a refresh's lead on a target this caps, so a
+// cap at or under a chain's peer lead would stop refreshes from ever
+// starting a range sync on it.
+const _: () = assert!(
+    MAX_SYNC_RANGE > ethlambda_network_api::sync::SyncThresholds::LEAN.peer_lead
+        && MAX_SYNC_RANGE > ethlambda_network_api::sync::SyncThresholds::BEACON.peer_lead
+);
+
 /// How many beacon gossip messages may be in stateful validation at once. A
 /// message arriving with none free is ignored rather than queued. Revisit once
 /// `lean_beacon_gossip_validation_seconds` has data from a follower.
@@ -1330,6 +1338,7 @@ impl P2P {
             outbound_requests: HashMap::new(),
             range_sync_state: None,
             range_fetched_through,
+            beacon_status: None,
             head_watch: HeadWatch::default(),
             peer_heads: Default::default(),
             bootnode_addrs: built.bootnode_addrs,
@@ -1499,6 +1508,9 @@ pub struct P2PServer {
     /// `range_sync_target`. Dropped back to the head when the blocks above
     /// the head never import; see [`Self::expire_range_watermark`].
     pub(crate) range_fetched_through: u64,
+    /// This node's beacon `Status` (v2) and the wall-clock slot it was built
+    /// at; see [`Self::beacon_status_v2`].
+    pub(crate) beacon_status: Option<(u64, beacon::messages::StatusV2)>,
     /// How long the store's head has stayed put, for
     /// [`Self::expire_range_watermark`].
     pub(crate) head_watch: HeadWatch,
@@ -2115,15 +2127,33 @@ enum RefreshStatus {
 }
 
 impl RefreshStatus {
-    fn build(server: &P2PServer) -> Self {
-        match server.wire.beacon() {
-            Some(wire) => Self::Beacon(beacon::handler::build_status_v2(&server.store, wire)),
+    fn build(server: &mut P2PServer) -> Self {
+        match server.beacon_status_v2() {
+            Some(status) => Self::Beacon(status),
             None => Self::Lean(build_status(&server.store)),
         }
     }
 }
 
 impl P2PServer {
+    /// This node's beacon `Status` in v2, built at most once a wall-clock
+    /// slot and shared by every inbound request and the refresh: building one
+    /// decodes the head block, and requests are not rate limited on the wire.
+    /// A head imported within the slot shows from the next one. `None` on a
+    /// lean node.
+    pub(crate) fn beacon_status_v2(&mut self) -> Option<beacon::messages::StatusV2> {
+        let wire = self.wire.beacon()?;
+        let slot = wall_clock_slot(&self.store);
+        if let Some((built_at, status)) = &self.beacon_status
+            && *built_at == slot
+        {
+            return Some(status.clone());
+        }
+        let status = beacon::handler::build_status_v2(&self.store, wire);
+        self.beacon_status = Some((slot, status.clone()));
+        Some(status)
+    }
+
     /// Drop [`Self::range_fetched_through`] back to the store's head once the
     /// head has stayed below it, without moving, for longer than the stall
     /// window (`SyncThresholds::stall_window`) counted from the first
@@ -2223,11 +2253,21 @@ impl P2PServer {
     /// every refresh.
     pub(crate) async fn refresh_due_peer_statuses(&mut self) {
         let wall_slot = wall_clock_slot(&self.store);
+        self.refresh_due_peer_statuses_at(wall_slot).await;
+    }
+
+    /// [`Self::refresh_due_peer_statuses`] at `wall_slot`. Asks at most once
+    /// a slot: the timer drifting so that it fires twice in one would
+    /// otherwise ask two shares of the peers.
+    pub(crate) async fn refresh_due_peer_statuses_at(&mut self, wall_slot: u64) {
         // Once a slot, the same cadence as the refresh: a report past its
         // lifetime is no longer evidence of where the network is, and a
         // watermark the head never reaches is no longer a floor.
         peer_heads::publish(self);
         self.expire_range_watermark(wall_slot);
+        if !self.peer_heads.begin_refresh_slot(wall_slot) {
+            return;
+        }
         let interval = peer_heads::thresholds(&self.store).status_refresh_slots;
         let peers = self.peer_heads.due_for_refresh(
             self.connected_peers.keys().copied(),
@@ -3365,6 +3405,7 @@ pub(crate) mod test_support {
             outbound_requests: HashMap::new(),
             range_sync_state: None,
             range_fetched_through: 0,
+            beacon_status: None,
             head_watch: crate::HeadWatch::default(),
             peer_heads: Default::default(),
             bootnode_addrs: HashMap::new(),
