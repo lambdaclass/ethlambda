@@ -3733,6 +3733,28 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_claim_found_held_at_a_publish_takes_its_peer_out_of_the_session() {
+        // Finding: a claim whose head was imported after it was counted was
+        // dropped at the next publish, but its peer stayed in the range
+        // session, to be sent a batch on a head it had nothing above.
+        let mut server = unconnected_server().await;
+        let peer = connected_peer(&mut server);
+        let block = signed_block(5, server.store.head().expect("a head"));
+        let root = block.message.hash_tree_root();
+        on_lean_status_request(&mut server, peer, &lean_status_at(root, 5)).await;
+        assert!(server.range_sync_state.is_some());
+        server
+            .store
+            .insert_signed_block(root, SignedBeaconBlock::Lean(block))
+            .expect("insert");
+        let head = ForkCheckpoints::head_only(root);
+        server.store.update_checkpoints(head).expect("advance head");
+        peer_heads::publish(&mut server);
+        assert_eq!(server.store.network_head(), None);
+        assert!(server.range_sync_state.is_none());
+    }
+
+    #[tokio::test]
     async fn a_disconnected_peer_leaves_the_range_session() {
         // A member that had no batch in flight stayed in the session after
         // its disconnect, to be picked for a batch it could not answer.

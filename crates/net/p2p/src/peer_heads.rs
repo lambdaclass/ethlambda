@@ -647,7 +647,8 @@ pub(crate) fn note_range_failure(server: &mut P2PServer, peer: &PeerId, end_slot
 ///
 /// A claim whose head this node has imported since it arrived (a block
 /// fetched by root, a lighter branch imported later) is no lead any more, and
-/// is dropped here rather than counting until the peer's next `Status`.
+/// is dropped here rather than counting until the peer's next `Status`; its
+/// peer leaves the range session, as on a `Status` showing that head.
 /// Checked from the top, so a publish normally costs one lookup.
 pub(crate) fn publish(server: &mut P2PServer) {
     let wall_slot = crate::wall_clock_slot(&server.store);
@@ -661,6 +662,8 @@ pub(crate) fn publish(server: &mut P2PServer) {
         match server.peer_heads.top_claim(wall_slot, interval) {
             Some((peer, _, root)) if holds_block(&server.store, &root) => {
                 server.peer_heads.drop_claim(&peer);
+                // As on a `Status` showing a held head: nothing left to give.
+                leave_range_session(server, &peer);
             }
             top => break top.map(|(_, head_slot, _)| head_slot),
         }
