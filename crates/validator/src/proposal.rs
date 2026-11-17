@@ -81,7 +81,9 @@
 //!
 //! The duty loop gives a proposal until the point attesters stop waiting for
 //! the block ([`ProposalService::propose_by`]). Everything up to a full
-//! block's publish ends there. A signed blinded block's publish does not: it
+//! block's publish ends there, and so does a gloas envelope's publish after
+//! it, though a deadline there fails the envelope, not the proposal: the block
+//! is out by then. A signed blinded block's publish does not end there: it
 //! runs on its own task, since the beacon node waits up to 5 s for the relay,
 //! and past the deadline the proposal returns
 //! [`BlindedOutcome::StillPublishing`] while the task reports the outcome.
@@ -202,8 +204,9 @@ pub struct ProposalService<B> {
     /// The `min_bid` sent with each gloas block request, in gwei: the floor
     /// below which the node takes no p2p bid. `0` unless set.
     builder_min_bid: u64,
-    /// Where a slot starts, so a blinded publish that outlives the deadline
-    /// can observe its own publication delay. `None` observes nothing.
+    /// Where a slot starts, so a full block's publication delay is taken as
+    /// soon as the block is accepted, and a blinded publish that outlives the
+    /// deadline can observe its own. `None` observes neither.
     clock: Option<SlotClock>,
     /// The proposer preferences a node accepted, whose fee recipient a gloas
     /// block may rightly pay instead of the current one. `None` compares
@@ -364,7 +367,10 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
     /// Production and signing, and a full block's publish (with its envelope
     /// from gloas), end at the deadline with [`Error::ProposalDeadline`]: a
     /// full block that late has lost most of its value, and every further
-    /// second comes out of the slot's attestations.
+    /// second comes out of the slot's attestations. A self-built gloas block's
+    /// envelope is published by the same deadline, but a deadline there is
+    /// the envelope's failure, logged and counted as any other, not the
+    /// proposal's: the block is out by then.
     ///
     /// A signed blinded block's publish is not cut: the beacon node may wait
     /// several seconds on the relay, and the block may already be out. It runs
@@ -392,7 +398,10 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
     ) -> Result<Proposed> {
         // Nothing awaits between signing and the end of `produce_and_sign`,
         // and a completed future is never discarded at the deadline, so a
-        // signed block always reaches the publish step below.
+        // signed block always reaches the publish step below. A deadline
+        // before the signature can leave the slot recorded in slashing
+        // protection with nothing signed: the slot is forgone, never signed
+        // twice.
         let signed = before(deadline, slot, self.produce_and_sign(slot, duty, store)).await?;
         let validator = duty.validator_index;
         if signed.blinded {
@@ -407,13 +416,9 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
                 )
                 .await;
         }
-        before(
-            deadline,
-            slot,
-            self.publish_full(slot, validator, store, signed),
-        )
-        .await
-        .map(Proposed::Full)
+        self.publish_full(slot, validator, store, signed, deadline)
+            .await
+            .map(Proposed::Full)
     }
 
     /// Everything up to and including the block signature: the slashing
@@ -584,14 +589,30 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         })
     }
 
+    /// Record how long after `slot`'s start its block was accepted, when the
+    /// service has the clock.
+    fn observe_publication_delay(&self, slot: Slot) {
+        if let Some(clock) = &self.clock {
+            let elapsed = SystemTime::now()
+                .duration_since(clock.start_of(slot))
+                .unwrap_or_default();
+            crate::metrics::observe_block_publication_delay(elapsed.as_secs_f64());
+        }
+    }
+
     /// Publish a signed full block, then, for a self-built gloas payload, its
     /// envelope.
+    ///
+    /// Both by `deadline`. The block's publish cut there is the proposal's
+    /// [`Error::ProposalDeadline`]; the envelope's is the envelope's failure,
+    /// since the block is out by then.
     async fn publish_full(
         &self,
         slot: Slot,
         validator: u64,
         store: &RwLock<ValidatorStore>,
         signed: SignedBlock,
+        deadline: Option<Instant>,
     ) -> Result<Published> {
         let SignedBlock {
             pubkey,
@@ -602,16 +623,21 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
             body,
             ..
         } = signed;
-        let published = self.publish(fork, &body, slot, validator).await?;
+        let publish = self.publish(fork, &body, slot, validator);
+        let published = before(deadline, slot, publish).await?;
         crate::metrics::inc_blocks_proposed();
+        // Taken here, not by the caller, which hears back only once a gloas
+        // envelope has gone out (or been cut) too.
+        self.observe_publication_delay(slot);
 
         // Only a self-built payload is this client's to reveal.
         if builder_index == Some(BUILDER_INDEX_SELF_BUILD) {
             // Logged and counted rather than propagated. The block is out and
             // the proposal did happen; what failed is the reveal, which has its
             // own series because it is the failure that costs the payload.
-            let _ = self
-                .publish_envelope(slot, validator, &pubkey, block_root, payload, store)
+            let reveal =
+                self.publish_envelope(slot, validator, &pubkey, block_root, payload, store);
+            let _ = before(deadline, slot, reveal)
                 .await
                 .inspect(|()| crate::metrics::inc_envelopes_published())
                 .inspect_err(|err| {
@@ -2000,6 +2026,40 @@ mod gloas_tests {
         let request = node.block_requests().remove(0);
         assert_eq!(request.fork, ForkName::Gloas);
         assert_eq!(request.graffiti, Bytes32::repeat_byte(0xcd));
+    }
+
+    /// A deadline that passes while the envelope is being published fails the
+    /// envelope, not the proposal: the block is already out, and counting it
+    /// as a missed proposal too would put one block in both series.
+    #[tokio::test]
+    async fn a_deadline_during_the_envelope_publish_fails_only_the_envelope() {
+        let (store, pubkey) = store();
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_gloas_block(slot(), 7, BUILDER_INDEX_SELF_BUILD, true)
+                .with_envelope_publish_gate(Arc::new(tokio::sync::Semaphore::new(0))),
+        );
+        let service = service(node.clone());
+
+        let revealing = node.envelope_publish_entered.clone();
+        let this_duty = duty(&pubkey);
+        let hour = std::time::Duration::from_secs(3600);
+        let proposal = service.propose_by(slot(), &this_duty, &store, Instant::now() + hour);
+        tokio::pin!(proposal);
+        tokio::select! {
+            outcome = &mut proposal => panic!("the envelope is still at the node, yet: {outcome:?}"),
+            () = revealing.notified() => {}
+        }
+        tokio::time::pause();
+        tokio::time::advance(hour * 2).await;
+        let proposed = proposal
+            .await
+            .expect("the block went out before the deadline");
+        tokio::time::resume();
+
+        assert_eq!(proposed, Proposed::Full(Published::Imported));
+        assert_eq!(node.published_blocks().len(), 1);
+        assert!(node.published_envelopes().is_empty());
     }
 
     /// The builder domain is not the proposer domain: an envelope signature

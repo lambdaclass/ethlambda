@@ -99,7 +99,9 @@ pub enum Error {
     AttestationDeadline { slot: u64 },
     /// The slot's proposal ran past its deadline, the point attesters stop
     /// waiting for a block, before its block was published, and was
-    /// abandoned.
+    /// abandoned. Also what a self-built gloas block's envelope fails with
+    /// when the deadline cuts its publish, after the block is out: that fails
+    /// the envelope alone, not the proposal (see `ProposalService::propose_by`).
     ///
     /// The proposal counterpart of [`Self::AttestationDeadline`], and
     /// retryable in the same sense only. Never raised once a blinded block is
