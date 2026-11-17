@@ -160,6 +160,10 @@ impl Current {
     }
 }
 
+/// How far ahead of its own clock the flashbots relay takes a registration's
+/// timestamp: one further ahead fails its whole request.
+const RELAY_FUTURE_TOLERANCE_SECS: u64 = 10;
+
 /// The timestamp for a registration replacing `held`: `now_secs`, or one
 /// second past `held`'s when the clock does not say later.
 ///
@@ -296,10 +300,20 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
                 continue;
             }
 
+            let timestamp = newer_than(held, now_secs);
+            if timestamp > now_secs + RELAY_FUTURE_TOLERANCE_SECS {
+                warn!(
+                    pubkey = %encode_hex(&pubkey.0),
+                    timestamp,
+                    now = now_secs,
+                    "A builder registration is signed ahead of the clock, which stepped back; \
+                     the relay refuses its batch until the clock catches up"
+                );
+            }
             let message = ValidatorRegistrationV1 {
                 fee_recipient,
                 gas_limit,
-                timestamp: newer_than(held, now_secs),
+                timestamp,
                 pubkey: *pubkey,
             };
             // A key the keymanager removed since the epoch refresh is the one

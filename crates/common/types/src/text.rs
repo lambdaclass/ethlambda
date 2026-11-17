@@ -29,6 +29,8 @@ pub fn one_line(text: &str, max_bytes: usize) -> String {
     let mut kept_if_cut = 0;
     for c in text.chars() {
         let escaped = rewrites_the_line(c).then(|| c.escape_default());
+        // An escape's length in chars is its length in bytes, since
+        // `escape_default` writes ASCII only (`\u{..}`, `\n`, ...).
         let len = escaped
             .as_ref()
             .map_or(c.len_utf8(), ExactSizeIterator::len);
