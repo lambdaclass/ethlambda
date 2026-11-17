@@ -2555,8 +2555,13 @@ impl BlockChainServer {
             // what this does: the head simply does not move.
             warn!(%err, "Failed to compute beacon head");
             timings.head_end = Some(Instant::now());
-            // The head did not move, but the clock did.
-            self.update_sync_status(self.wall_clock_slot());
+            // The head did not move, but the clock did. Judged on the head
+            // slot judged last, which takes no decode of the head block.
+            let head_slot = self
+                .store
+                .judged_head_slot()
+                .or_else(|| self.known_head_slot());
+            self.judge_sync_status(self.wall_clock_slot(), head_slot);
             return timings;
         }
         timings.head_end = Some(Instant::now());

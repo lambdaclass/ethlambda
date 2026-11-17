@@ -3708,11 +3708,21 @@ pub(crate) mod tests {
         let mut server = unconnected_server().await;
         let peer = connected_peer(&mut server);
         let unknown = H256::repeat_byte(0x11);
+        let batch_in_flight = |server: &P2PServer| {
+            server
+                .outbound_requests
+                .values()
+                .any(|kind| matches!(kind, PendingRequestKind::Range { .. }))
+        };
         on_lean_status_request(&mut server, peer, &lean_status_at(unknown, 500)).await;
         assert!(server.range_sync_state.is_some());
+        assert!(batch_in_flight(&server));
         let future = crate::wall_clock_slot(&server.store) + 100;
         on_lean_status_request(&mut server, peer, &lean_status_at(unknown, future)).await;
         assert!(server.range_sync_state.is_none());
+        // Its batch goes with the session: answered after another peer
+        // started one, it would complete that session's batch.
+        assert!(!batch_in_flight(&server));
 
         on_lean_status_request(&mut server, peer, &lean_status_at(unknown, 500)).await;
         assert!(server.range_sync_state.is_some());

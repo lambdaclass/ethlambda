@@ -58,8 +58,15 @@ pub fn build_status(store: &Store, wire: &BeaconWire, version: StatusVersion) ->
 /// that sends one `Status` in several versions (the periodic refresh) and so
 /// should read the head, a whole-block decode, once.
 pub fn build_status_v2(store: &Store, wire: &BeaconWire) -> StatusV2 {
+    status_at_head(store, wire, store.beacon_head())
+}
+
+/// [`build_status_v2`] off a head already read through
+/// [`Store::beacon_head`]: `None` gives the all-zero `Status` of a store with
+/// no head block yet.
+pub fn status_at_head(store: &Store, wire: &BeaconWire, head: Option<(u64, Root)>) -> StatusV2 {
     let (finalized_root, finalized_epoch, head_root, head_slot, earliest_available_slot) =
-        match store.beacon_head() {
+        match head {
             Some((head_slot, head_root)) => {
                 let finalized = store.beacon_finalized_checkpoint();
                 // Where this directory's chain begins, not where it has

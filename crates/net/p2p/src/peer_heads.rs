@@ -522,15 +522,18 @@ pub(crate) fn observe(
 }
 
 /// Take `peer` out of the range session, so no later batch goes to it on a
-/// head it merged in before; a request of its already out stays out. The
-/// session ends with no peer left, as on a failure.
+/// head it merged in before. While other peers remain, a request of its
+/// already out stays out and answers for the session's batch. With none
+/// left the session ends, and its requests with it (`end_range_session`):
+/// answered after a later session started, one would complete that
+/// session's batch instead.
 fn leave_range_session(server: &mut P2PServer, peer: &PeerId) {
     let emptied = server.range_sync_state.as_mut().is_some_and(|state| {
         state.peer_set.remove(peer);
         state.peer_set.is_empty()
     });
     if emptied {
-        server.range_sync_state = None;
+        server.end_range_session();
     }
 }
 

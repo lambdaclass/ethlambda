@@ -619,8 +619,8 @@ impl HeadWatch {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StatusKey {
     wall_slot: u64,
-    head: H256,
-    finalized: ethlambda_types::checkpoint::Checkpoint,
+    head: Option<H256>,
+    finalized: Option<ethlambda_types::checkpoint::Checkpoint>,
 }
 
 /// The next [`RangeSyncState::id`].
@@ -2212,20 +2212,18 @@ impl P2PServer {
     ///
     /// Rebuilt whenever what it says can have changed: a new head root (a
     /// reorg within the slot included), a new finalized checkpoint, a new
-    /// fork digest, and at least once a wall-clock slot, which also covers
-    /// the window before the anchor block is stored, when the head root
-    /// names no block yet. The head root and the finalized checkpoint are
+    /// fork digest, and at least once a wall-clock slot. One built while the
+    /// head root names no stored block yet (the anchor, before the fork
+    /// choice inserts it) is not kept, since the block's arrival changes no
+    /// part of the key. The head root and the finalized checkpoint are
     /// metadata reads; it is the head's slot that takes the decode. `None` on
     /// a lean node.
     pub(crate) fn beacon_status_v2(&mut self) -> Option<beacon::messages::StatusV2> {
         let wire = self.wire.beacon()?;
         let key = StatusKey {
             wall_slot: wall_clock_slot(&self.store),
-            head: self.store.head().expect("head block exists"),
-            finalized: self
-                .store
-                .latest_finalized()
-                .expect("finalized checkpoint exists"),
+            head: self.store.head().ok(),
+            finalized: self.store.latest_finalized().ok(),
         };
         // A fork-digest switch within the slot counts too: a peer that
         // switched would take the old digest for another network.
@@ -2235,8 +2233,9 @@ impl P2PServer {
         {
             return Some(status.clone());
         }
-        let status = beacon::handler::build_status_v2(&self.store, wire);
-        self.beacon_status = Some((key, status.clone()));
+        let head = self.store.beacon_head();
+        let status = beacon::handler::status_at_head(&self.store, wire, head);
+        self.beacon_status = head.map(|_| (key, status.clone()));
         Some(status)
     }
 
@@ -2344,7 +2343,7 @@ impl P2PServer {
     /// and so does every release it leads to (its answer, its failure, and
     /// the check after the answer), and a custody deadline only re-checks a
     /// wait that runs from the later session's own start.
-    fn end_range_session(&mut self) {
+    pub(crate) fn end_range_session(&mut self) {
         self.range_sync_state = None;
         self.outbound_requests.retain(|_, kind| {
             !matches!(
@@ -4427,15 +4426,22 @@ mod tests {
                 signature: Default::default(),
             })
         };
-        // The anchor the store was initialized with, then two siblings at one
-        // slot, told apart by their graffiti.
+        // Before the anchor block the store was initialized with is stored,
+        // the head names no block: that all-zero `Status` is not kept past
+        // the block's arrival, which changes no part of the key.
+        let status = server.beacon_status_v2().expect("a beacon node");
+        assert_eq!(status.head_slot, 0);
         server
             .store
-            .insert_signed_block(H256::ZERO, block(0, 0))
+            .insert_signed_block(H256::ZERO, block(7, 0))
             .expect("insert anchor");
+        let status = server.beacon_status_v2().expect("a beacon node");
+        assert_eq!(status.head_slot, 7);
+
+        // Two siblings at one slot, told apart by their graffiti.
         let mut siblings = Vec::new();
         for graffiti in [1, 2] {
-            let block = block(5, graffiti);
+            let block = block(9, graffiti);
             let root = block.message_hash_tree_root();
             server
                 .store
@@ -4454,11 +4460,11 @@ mod tests {
         server.store.update_checkpoints(head).expect("reorg");
         let status = server.beacon_status_v2().expect("a beacon node");
         assert_eq!(status.head_root, siblings[1]);
-        assert_eq!(status.head_slot, 5);
+        assert_eq!(status.head_slot, 9);
 
         let finalized = Checkpoint {
             root: siblings[1],
-            slot: 5,
+            slot: 9,
         };
         let finality = ForkCheckpoints::new(siblings[1], None, Some(finalized));
         server.store.update_checkpoints(finality).expect("finality");
