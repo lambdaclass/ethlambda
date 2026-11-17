@@ -439,7 +439,15 @@ pub async fn handle_req_resp_message(
                             Some(PendingRequestKind::EnvelopeRange { .. }) => {
                                 release_envelope_gate(server, ctx).await;
                             }
-                            None => {}
+                            // An untracked request. A `Status` answered with
+                            // an error (`RateLimited`, say) ends a handshake
+                            // as surely as a failure does, or the peer would
+                            // never be refreshed.
+                            None => {
+                                if is_status_protocol(request_id.protocol) {
+                                    server.peer_heads.end_handshake(&peer);
+                                }
+                            }
                         }
                     }
                 }
@@ -530,12 +538,7 @@ pub async fn handle_req_resp_message(
                     {
                         // The handshake goes on, on `status/2`.
                         crate::beacon::handler::retry_status_on_other_version(server, peer).await;
-                    } else if matches!(
-                        request_id.protocol,
-                        ReqRespProtocol::LeanStatus
-                            | ReqRespProtocol::BeaconStatusV1
-                            | ReqRespProtocol::BeaconStatusV2
-                    ) {
+                    } else if is_status_protocol(request_id.protocol) {
                         // A handshake that failed is over: the refresh takes
                         // its place. A failed refresh changes nothing here.
                         server.peer_heads.end_handshake(&peer);
@@ -595,6 +598,17 @@ pub(super) fn respond(
     server
         .swarm_handle
         .send_response(channel, Response::success(payload));
+}
+
+/// Whether `protocol` is one of the `Status` protocols, whose requests
+/// `outbound_requests` does not track.
+fn is_status_protocol(protocol: ReqRespProtocol) -> bool {
+    matches!(
+        protocol,
+        ReqRespProtocol::LeanStatus
+            | ReqRespProtocol::BeaconStatusV1
+            | ReqRespProtocol::BeaconStatusV2
+    )
 }
 
 /// Answer a request with an error code and a reason.
@@ -904,9 +918,23 @@ async fn handle_lean_blocks_by_range_response(
 ) {
     trace!(%peer, count = blocks.len(), "Received BlocksByRange response");
 
+    let blocks: Vec<_> = blocks
+        .into_iter()
+        .filter(|block| {
+            let slot = block.message.slot;
+            let in_range = (start_slot..=end_slot).contains(&slot);
+            if !in_range {
+                debug!(%peer, %slot, start_slot, end_slot, "Received block outside requested range");
+            }
+            in_range
+        })
+        .collect();
+    // No block in the range asked for is as good as no answer: counted as a
+    // success, a single stray block would clear a peer's cooldown (see
+    // `PeerHeads::range_cooling_down`) without serving anything.
     if blocks.is_empty() {
         fail_range_request(server, &peer);
-        debug!(%peer, start_slot, end_slot, "Received empty BlocksByRange response");
+        debug!(%peer, start_slot, end_slot, "Received no block in the requested range");
         return;
     }
 
@@ -918,12 +946,6 @@ async fn handle_lean_blocks_by_range_response(
 
     for block in blocks {
         let slot = block.message.slot;
-
-        if slot < start_slot || slot > end_slot {
-            debug!(%peer, %slot, start_slot, end_slot, "Received block outside requested range");
-            continue;
-        }
-
         let block_root = block.message.hash_tree_root();
         let handed_over = blockchain.new_block(
             SignedBeaconBlock::Lean(block),
@@ -2758,7 +2780,8 @@ async fn handle_data_column_sidecars_response(
 /// answer has no counterpart here, because it needs none:
 /// [`handle_blocks_by_root_response`] answers for both wires. A block outside
 /// the range is dropped on its own rather than failing the batch, since the
-/// rest of the answer may still be what was requested. The chunk-level checks
+/// rest of the answer may still be what was requested; an answer with no
+/// block in the range fails it, like an empty one. The chunk-level checks
 /// that *do* fail the whole answer, on the fork digest and the SSZ shape,
 /// already ran in the codec.
 async fn handle_beacon_blocks_by_range_response(
@@ -2771,9 +2794,22 @@ async fn handle_beacon_blocks_by_range_response(
 ) {
     trace!(%peer, count = blocks.len(), "Received beacon blocks response");
 
+    let received = blocks.len();
+    let blocks: Vec<_> = blocks
+        .into_iter()
+        .filter(|block| {
+            let slot = block.slot();
+            let in_range = (start_slot..=end_slot).contains(&slot);
+            if !in_range {
+                debug!(%peer, %slot, start_slot, end_slot, "Beacon block outside requested range");
+            }
+            in_range
+        })
+        .collect();
+    // As on lean: no block in the range asked for is as good as no answer.
     if blocks.is_empty() {
         fail_range_request(server, &peer);
-        debug!(%peer, start_slot, end_slot, "Received empty BeaconBlocksByRange response");
+        debug!(%peer, start_slot, end_slot, "Received no block in the requested range");
         return;
     }
 
@@ -2786,17 +2822,11 @@ async fn handle_beacon_blocks_by_range_response(
         return;
     };
 
-    let received = blocks.len();
     let mut accepted = 0usize;
     let mut highest_forwarded_slot: Option<u64> = None;
 
     for block in blocks {
         let slot = block.slot();
-        if slot < start_slot || slot > end_slot {
-            debug!(%peer, %slot, start_slot, end_slot, "Beacon block outside requested range");
-            continue;
-        }
-
         highest_forwarded_slot =
             Some(highest_forwarded_slot.map_or(slot, |max: u64| max.max(slot)));
         accepted += 1;
@@ -3532,6 +3562,20 @@ pub(crate) mod tests {
         let state = server.range_sync_state.as_ref().expect("honest peer");
         assert!(state.peer_set.contains_key(&honest));
         assert!(!state.peer_set.contains_key(&liar));
+    }
+
+    #[tokio::test]
+    async fn an_answer_with_no_block_in_range_is_a_failure() {
+        // Finding: one stray block counted as a successful answer, which
+        // cleared the peer's cooldown without serving anything, so a liar
+        // kept the highest head and took every batch.
+        let mut server = unconnected_server().await;
+        let peer = connected_peer(&mut server);
+        let stray = vec![signed_block(500, H256::ZERO)];
+        handle_lean_blocks_by_range_response(&mut server, stray, peer, 10, 20).await;
+        let wall = crate::wall_clock_slot(&server.store);
+        let interval = SyncThresholds::LEAN.status_refresh_slots;
+        assert!(server.peer_heads.range_cooling_down(&peer, wall, interval));
     }
 
     #[tokio::test]

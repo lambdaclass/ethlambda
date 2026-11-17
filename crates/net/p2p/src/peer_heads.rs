@@ -77,8 +77,10 @@ struct RangeFailures {
     streak: u32,
 }
 
-/// Most doublings of a failed peer's cooldown: 32 refresh intervals.
-const MAX_COOLDOWN_DOUBLINGS: u32 = 5;
+/// Most doublings of a failed peer's cooldown: 8 refresh intervals (16 slots
+/// on lean, 128 on beacon). A slow honest peer that keeps timing out loses
+/// its lead for that long at most.
+const MAX_COOLDOWN_DOUBLINGS: u32 = 3;
 
 /// A peer's reported head, and the wall-clock slot the report arrived at.
 #[derive(Debug, Clone, Copy)]
