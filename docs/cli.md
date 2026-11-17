@@ -345,18 +345,17 @@ more every epoch while its slot is ahead, at the epoch's second-to-last slot
 since a node that restarts loses what it accepted. A node restarted mid-epoch
 thus lacks the preferences of the slots before that re-send and holds the
 later ones; one restarted after it lacks the next epoch's too, all but its
-last slot's, which the next epoch's re-send covers. A re-send covers only the slots
-that have not started when its duties fetch returns, so slow nodes ahead of
-the one that answers can leave the next epoch's first slots out.
+last slot's, which the next epoch's re-send covers. A re-send covers only the
+slots that have not started when its duties fetch returns, so slow nodes
+ahead of the one that answers can leave the next epoch's first slots out.
 Each preference is its own request, and a poll sends all of them, for both
 epochs, to every node at once, so a node that does not answer delays the end
 of the poll by one request timeout, not the other nodes' delivery. The duties
 are fetched from one node at a time, so each node that does not answer,
 listed ahead of the one that does, delays every send by a request timeout.
-Duties outside their epoch, and all but the
-first for a slot, are dropped before anything is signed. A
-validator with no fee recipient is skipped, with one warning per epoch naming
-the count. A preference cannot be replaced for the same slot and root, so a
+Duties outside their epoch, and all but the first for a slot, are dropped
+before anything is signed. A validator with no fee recipient is skipped, with
+one warning per epoch naming the count. A preference cannot be replaced for the same slot and root, so a
 fee recipient changed through the keymanager API applies from the next
 dependent root.
 

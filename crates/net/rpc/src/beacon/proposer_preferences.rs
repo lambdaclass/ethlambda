@@ -122,16 +122,22 @@ fn submit(
         let validator = signed.message.validator_index;
         // An entry identical to the one held is a success, checked before
         // `validate` so no rule of it (a started slot, say) can refuse a
-        // resubmission, and at no signature check's cost. Asked again after
-        // `record_preferences` too: gossip can record the same message
-        // (relayed by another node this client posted it to) while this copy
-        // is being validated.
+        // resubmission, and at no signature check's cost. Asked again after a
+        // refusal and after `record_preferences` too: gossip can record the
+        // same message (relayed by another node this client posted it to)
+        // while this copy is being validated.
         if holds(market, &signed) {
             debug!(%slot, validator, "Proposer preferences already cached; not republishing");
             continue;
         }
         let verdict = validate(market, store, &signed, now_ms);
         if verdict != Outcome::Accept {
+            // Gossip may have recorded this very message since the check
+            // above, and `validate` then calls it already seen.
+            if holds(market, &signed) {
+                debug!(%slot, validator, "Proposer preferences cached meanwhile; not republishing");
+                continue;
+            }
             let (outcome, reason) = verdict.labels();
             warn!(%slot, validator, outcome, reason, "Refused submitted proposer preferences");
             failures.push(Failure {

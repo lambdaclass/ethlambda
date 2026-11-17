@@ -1804,6 +1804,12 @@ mod tests {
     /// neither warned about nor counted, but a node may still hold it: it is
     /// kept as unconfirmed, so the block's fee check knows the address it may
     /// pay.
+    ///
+    /// The slot clock reads the wall clock, so the margins are wide: the slot
+    /// starts two to three seconds after the test does, and the node answers
+    /// after three and a half. The send must go out before the slot starts,
+    /// which only a two-second stall would prevent, and the answer always
+    /// comes after it.
     #[tokio::test]
     async fn a_late_send_a_node_may_hold_is_kept() {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -1814,18 +1820,18 @@ mod tests {
         let root = Root::repeat_byte(0x11);
         let node = MockBeaconNode::new()
             .with_proposers_v2(GLOAS_EPOCH, root, vec![duty(&pubkeys[0], 3, slot)])
-            .with_preference_delay(std::time::Duration::from_millis(1100));
+            .with_preference_delay(std::time::Duration::from_millis(3500));
         node.failures
             .lock()
             .expect("lock")
             .insert("submit_proposer_preferences", "timed out".to_string());
-        // `slot` starts within the next second, before the node's answer.
+        // `slot` starts at the third whole second from now.
         let config = context().config.clone();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("after 1970")
             .as_secs();
-        let genesis = now + 1 - slot * config.slot_duration_ms / 1000;
+        let genesis = now + 3 - slot * config.slot_duration_ms / 1000;
         let clock = SlotClock::from_config(genesis, &config);
         let node = Arc::new(node);
         let service = Arc::new(
