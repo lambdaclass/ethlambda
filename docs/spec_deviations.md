@@ -74,7 +74,13 @@ head trails the wall clock **and** its peers report a head ahead of it.
   each head the node reaches (two around an outage), not the rest of a
   network stall. A peer that has just failed to serve a range request, or
   whose range blocks left the head where it was for a whole window, does
-  not count towards the lead for a while either. The cost: if the node's own
+  not count towards the lead for a while either. An empty range answer
+  counts as such a failure even over a span an honest chain skipped every slot
+  of (a long run of missed proposals): it cannot be told from a peer claiming
+  a head it does not serve, and excused, that peer would take a range batch
+  on every `Status` it sends. Peers serving such a span stop counting for a
+  while, and the node can read as synced while the parent lookups of newer
+  blocks fill the gap. The cost: if the node's own
   import stalls for a window (an execution client down), honest peers that
   delivered stop counting too, and the node reads as synced on its stale head
   until the head passes what they handed over, or for 4 stall windows at

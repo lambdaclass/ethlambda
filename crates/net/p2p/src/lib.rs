@@ -429,6 +429,9 @@ pub(crate) enum PendingRequestKind {
     EnvelopeRange {
         start_slot: u64,
         end_slot: u64,
+        /// The range session that asked, whose gate the answer (or its
+        /// failure) releases; see [`RangeSyncState::id`].
+        session: Option<u64>,
     },
 }
 
@@ -616,8 +619,8 @@ impl HeadWatch {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StatusKey {
     wall_slot: u64,
-    head: Option<H256>,
-    finalized: Option<H256>,
+    head: H256,
+    finalized: ethlambda_types::checkpoint::Checkpoint,
 }
 
 /// The next [`RangeSyncState::id`].
@@ -1780,9 +1783,7 @@ impl P2PServer {
         msg: p2p_protocol::ResumeRangeAfterEnvelopes,
         ctx: &Context<Self>,
     ) {
-        if self.is_range_session(msg.session) {
-            req_resp::handlers::release_envelope_gate(self, ctx).await;
-        }
+        req_resp::handlers::release_envelope_gate(self, ctx, Some(msg.session)).await;
     }
 
     #[send_handler]
@@ -2191,16 +2192,11 @@ impl RefreshStatus {
 }
 
 impl P2PServer {
-    /// Whether `id` is the range session running now.
-    pub(crate) fn is_range_session(&self, id: u64) -> bool {
-        self.range_sync_state
-            .as_ref()
-            .is_some_and(|state| state.id == id)
-    }
-
     /// The head slot: as the chain actor last published it
-    /// (`Store::head_slot_hint`), or read from the head before its first
-    /// judgment. On beacon, reading the head decodes the whole head block.
+    /// (`Store::head_slot_hint`), or read from the head while it publishes
+    /// none (before its first judgment, and while a beacon head names no
+    /// stored block yet). On beacon, reading the head decodes the whole head
+    /// block.
     pub(crate) fn head_slot(&self) -> u64 {
         self.store
             .head_slot_hint()
@@ -2224,12 +2220,11 @@ impl P2PServer {
         let wire = self.wire.beacon()?;
         let key = StatusKey {
             wall_slot: wall_clock_slot(&self.store),
-            head: self.store.head().ok(),
+            head: self.store.head().expect("head block exists"),
             finalized: self
                 .store
                 .latest_finalized()
-                .ok()
-                .map(|checkpoint| checkpoint.root),
+                .expect("finalized checkpoint exists"),
         };
         // A fork-digest switch within the slot counts too: a peer that
         // switched would take the old digest for another network.
@@ -2344,10 +2339,11 @@ impl P2PServer {
     /// now matches no request, so it cannot raise the watermark again or
     /// release a later session's envelope gate. The envelope gate and a batch
     /// held for custody belong to the session and go with it, so a later
-    /// session starts with its gate open. Nor can what is already scheduled
-    /// for this one act on a later one: an envelope check's release names
-    /// its session, and a custody deadline only re-checks a wait that runs
-    /// from the later session's own start.
+    /// session starts with its gate open. Nor can anything of this one's that
+    /// outlives it act on a later one: an envelope request names its session,
+    /// and so does every release it leads to (its answer, its failure, and
+    /// the check after the answer), and a custody deadline only re-checks a
+    /// wait that runs from the later session's own start.
     fn end_range_session(&mut self) {
         self.range_sync_state = None;
         self.outbound_requests.retain(|_, kind| {

@@ -314,9 +314,11 @@ pub async fn handle_req_resp_message(
                                 Some(PendingRequestKind::EnvelopeRange {
                                     start_slot,
                                     end_slot,
+                                    session,
                                 }) => {
+                                    let span = (start_slot, end_slot);
                                     handle_envelopes_by_range_response(
-                                        server, peer, start_slot, end_slot, envelopes, ctx,
+                                        server, peer, span, session, envelopes, ctx,
                                     )
                                     .await;
                                 }
@@ -436,8 +438,8 @@ pub async fn handle_req_resp_message(
                             // Nothing retries it, and the chain actor re-asks
                             // by root; but range pacing waits on the answer,
                             // so it must be released here.
-                            Some(PendingRequestKind::EnvelopeRange { .. }) => {
-                                release_envelope_gate(server, ctx).await;
+                            Some(PendingRequestKind::EnvelopeRange { session, .. }) => {
+                                release_envelope_gate(server, ctx, session).await;
                             }
                             // An untracked request. A `Status` answered with
                             // an error (`RateLimited`, say) ends a handshake
@@ -508,6 +510,7 @@ pub async fn handle_req_resp_message(
                 Some(PendingRequestKind::EnvelopeRange {
                     start_slot,
                     end_slot,
+                    session,
                 }) => {
                     debug!(
                         %peer,
@@ -515,7 +518,7 @@ pub async fn handle_req_resp_message(
                         end_slot,
                         "ExecutionPayloadEnvelopesByRange request failed; envelopes fall back to the by-root path"
                     );
-                    release_envelope_gate(server, ctx).await;
+                    release_envelope_gate(server, ctx, session).await;
                 }
                 // The handshake is the only *tracked* request kind absent
                 // here: every other outcome for a `Root`, `Range` or `Columns`
@@ -958,12 +961,16 @@ async fn handle_lean_blocks_by_range_response(
             in_range
         })
         .collect();
-    // No block in the range asked for serves nothing: counted as a success, a
-    // single stray block would clear a peer's cooldown (see
-    // `PeerHeads::range_cooling_down`). Whether it counts against the peer is
-    // `fail_empty_range_answer`'s call.
+    // No block in the range asked for is as good as no answer: counted as a
+    // success, a single stray block would clear a peer's cooldown (see
+    // `PeerHeads::range_cooling_down`) without serving anything. That holds
+    // below the head the peer claims too, although an honest chain can skip
+    // every slot of such a span: the two cannot be told apart from here, and a
+    // peer excused for it would take a batch on every `Status` it sends, the
+    // session's cursor never moving past the span (see the stall window in
+    // `docs/spec_deviations.md`).
     if blocks.is_empty() {
-        fail_empty_range_answer(server, &peer, start_slot, end_slot);
+        fail_range_request(server, &peer);
         debug!(%peer, start_slot, end_slot, "Received no block in the requested range");
         return;
     }
@@ -1657,35 +1664,9 @@ fn columns_without_known_custodian(server: &P2PServer, columns: &[u64]) -> Vec<u
 
 /// Count a failed range request against `peer` (a cooldown, and suspicion
 /// once they add up; see [`peer_heads::note_range_failure`]), and take it out
-/// of the range session.
+/// of the range session, which ends with no peer left.
 fn fail_range_request(server: &mut P2PServer, peer: &PeerId) {
     peer_heads::note_range_failure(server, peer);
-    drop_from_range_session(server, peer);
-}
-
-/// [`fail_range_request`] for an answer with no block in
-/// `start_slot..=end_slot`, which counts against `peer` only when the span
-/// holds the head it claims, the one slot it must have a block at. A span
-/// below that head can be skipped slots throughout (a long run of missed
-/// proposals, the very recovery the gate is for), and one above it holds
-/// nothing the peer said it had, so an honest peer can answer either with
-/// nothing; held against it, the answer would take its claim out of the
-/// network head. The peer leaves the session either way. A peer with no
-/// standing claim has nothing to excuse an empty answer with.
-fn fail_empty_range_answer(server: &mut P2PServer, peer: &PeerId, start_slot: u64, end_slot: u64) {
-    let excused = server
-        .peer_heads
-        .claimed_head(peer)
-        .is_some_and(|claimed| !(start_slot..=end_slot).contains(&claimed));
-    if excused {
-        drop_from_range_session(server, peer);
-    } else {
-        fail_range_request(server, peer);
-    }
-}
-
-/// Take `peer` out of the range session, which ends with no peer left.
-fn drop_from_range_session(server: &mut P2PServer, peer: &PeerId) {
     let should_clear = if let Some(state) = &mut server.range_sync_state {
         state.fail_peer(peer);
         state.peer_set.is_empty()
@@ -1911,8 +1892,8 @@ async fn handle_status_request(
     let syncable = held && transition::is_syncable_digest(wire, peer_digest, unix_now_ms());
 
     // Answered first, so recording the peer's head (store lookups, possibly a
-    // range batch) never holds up the answer. Built once a slot (see
-    // `P2PServer::beacon_status_v2`), however many requests arrive in it.
+    // range batch) never holds up the answer. Cached (see
+    // `P2PServer::beacon_status_v2`), however many requests arrive.
     let Some(our_status_v2) = server.beacon_status_v2() else {
         return;
     };
@@ -2892,9 +2873,9 @@ async fn handle_beacon_blocks_by_range_response(
             in_range
         })
         .collect();
-    // As on lean: no block in the range asked for serves nothing.
+    // As on lean: no block in the range asked for is as good as no answer.
     if blocks.is_empty() {
-        fail_empty_range_answer(server, &peer, start_slot, end_slot);
+        fail_range_request(server, &peer);
         debug!(%peer, start_slot, end_slot, "Received no block in the requested range");
         return;
     }
@@ -2994,7 +2975,9 @@ async fn retire_unanswered(
         PendingRequestKind::EnvelopeRoot(block_root) => {
             handle_envelope_fetch_failure(server, block_root, peer, ctx).await;
         }
-        PendingRequestKind::EnvelopeRange { .. } => release_envelope_gate(server, ctx).await,
+        PendingRequestKind::EnvelopeRange { session, .. } => {
+            release_envelope_gate(server, ctx, session).await;
+        }
     }
 }
 
@@ -3670,31 +3653,25 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn an_empty_answer_counts_against_a_peer_only_over_its_claimed_head() {
-        // Finding: an empty answer over skipped slots below the head a peer
-        // claims cooled it down and, three in a row, made it a suspect, which
-        // took an honest claim out of the network head while the peer was
-        // serving a sparse span.
+    async fn an_empty_answer_below_the_claimed_head_still_counts() {
+        // Excusing an empty answer below the head a peer claims (where an
+        // honest chain can have skipped every slot) let a liar claiming a
+        // high head take a batch on every `Status` it sent, with nothing held
+        // against it: the session's cursor never moves past an empty span, so
+        // the batch holding its head was never asked for.
         let mut server = unconnected_server().await;
-        let peer = connected_peer(&mut server);
+        let liar = connected_peer(&mut server);
         let unknown = H256::repeat_byte(0x11);
-        on_lean_status_request(&mut server, peer, &lean_status_at(unknown, 500)).await;
+        on_lean_status_request(&mut server, liar, &lean_status_at(unknown, 500)).await;
         assert!(server.range_sync_state.is_some());
+        handle_lean_blocks_by_range_response(&mut server, Vec::new(), liar, 10, 20).await;
         let wall = crate::wall_clock_slot(&server.store);
         let interval = SyncThresholds::LEAN.status_refresh_slots;
-        // Three in a row is what makes a peer a suspect.
-        for _ in 0..3 {
-            handle_lean_blocks_by_range_response(&mut server, Vec::new(), peer, 10, 20).await;
-        }
-        assert!(!server.peer_heads.range_cooling_down(&peer, wall, interval));
-        assert!(!server.peer_heads.is_suspect(&peer));
-        assert_eq!(server.store.network_head(), Some(500));
-        // It leaves the session all the same.
+        assert!(server.peer_heads.range_cooling_down(&liar, wall, interval));
         assert!(server.range_sync_state.is_none());
-
-        // A span holding the head it claims is one it owes a block in.
-        handle_lean_blocks_by_range_response(&mut server, Vec::new(), peer, 490, 510).await;
-        assert!(server.peer_heads.range_cooling_down(&peer, wall, interval));
+        // Its next `Status` starts no session towards it.
+        on_lean_status_request(&mut server, liar, &lean_status_at(unknown, 501)).await;
+        assert!(server.range_sync_state.is_none());
     }
 
     #[tokio::test]
@@ -3944,6 +3921,7 @@ pub(crate) mod tests {
         let envelopes = PendingRequestKind::EnvelopeRange {
             start_slot: 1,
             end_slot: 10,
+            session: None,
         };
         server
             .outbound_requests

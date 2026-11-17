@@ -3636,7 +3636,7 @@ impl BlockChainServer {
     }
 
     /// [`Self::judge_sync_status`] off the head read through
-    /// [`Self::head_slot`], which is where the per-chain part of that lives
+    /// [`Self::known_head_slot`], which is where the per-chain part of that lives
     /// (lean's `Store::head_slot` and beacon's `Store::beacon_head` decode
     /// different tables). For a caller that has not just read the head.
     fn update_sync_status(&mut self, current_slot: u64) {

@@ -901,9 +901,12 @@ mod tests {
                 let mark = 60;
                 let depth = 1 + rng.below(5);
                 let start = mark + 2 * thresholds.clock_lag + 1;
+                // The first judgment is at the mark, so the wander starts
+                // below the highest head the tracker has seen.
                 let mut head = mark;
-                let mut idle_slots = 0;
-                for current in start..start + 100 * window {
+                tracker.update(start, head, Some(start));
+                let mut idle_slots = 1;
+                for current in start + 1..start + 100 * window {
                     let mut idle = false;
                     for _ in 0..1 + rng.below(3) {
                         // Now and then the head moves, anywhere within
