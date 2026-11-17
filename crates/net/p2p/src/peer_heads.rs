@@ -91,6 +91,13 @@ struct Suspicion {
 /// good.
 const SUSPICION_WINDOWS: u64 = 4;
 
+/// Range failures in a row after which a peer becomes a suspect for the head
+/// it claims (see [`PeerHeads::suspects`]). A cooldown alone runs out, and
+/// with the head moving on by gossip each return of the claim would start
+/// the stall window over: held as a suspect, the claim stays out until the
+/// head passes it, or for [`SUSPICION_WINDOWS`] stall windows.
+const SUSPECT_AFTER_FAILURES: u32 = 3;
+
 /// Most doublings of a failed peer's cooldown: 8 refresh intervals (16 slots
 /// on lean, 128 on beacon). A slow honest peer that keeps timing out loses
 /// its lead for that long at most.
@@ -148,6 +155,9 @@ pub(crate) struct PeerHeads {
     /// The wall-clock slot of each connected peer's last `Status` request
     /// that was acted on: at most one a slot (see [`Self::inbound_due`]).
     inbound_at: HashMap<PeerId, u64>,
+    /// Peers that refused both `Status` versions on this connection, which
+    /// the refresh no longer asks.
+    muted: HashSet<PeerId>,
     /// The wall-clock slot the refresh last asked peers at; see
     /// [`Self::begin_refresh_slot`].
     refreshed_at: Option<u64>,
@@ -213,11 +223,14 @@ impl PeerHeads {
         self.heads.len() != before
     }
 
-    /// Forget a disconnected peer.
+    /// Forget a disconnected peer, all but its suspicion and its run of range
+    /// failures: a reconnect must not shed either. Both are bounded on their
+    /// own (see `Self::clear_suspects` and `Self::prune_range_failures`).
     pub(crate) fn forget(&mut self, peer: &PeerId) {
         self.heads.remove(peer);
         self.answered.remove(peer);
         self.awaiting_handshake.remove(peer);
+        self.muted.remove(peer);
         self.inbound_at.remove(peer);
         self.last_exchange.remove(peer);
         self.foreign_digest.remove(peer);
@@ -246,6 +259,7 @@ impl PeerHeads {
     }
 
     /// Whether any peer is a suspect.
+    #[cfg(test)]
     pub(crate) fn has_suspects(&self) -> bool {
         !self.suspects.is_empty()
     }
@@ -305,7 +319,7 @@ impl PeerHeads {
         for peer in connected {
             connected_count += 1;
             let last = *self.last_exchange.entry(peer).or_insert(wall_slot);
-            if self.awaiting_handshake.contains(&peer) {
+            if self.awaiting_handshake.contains(&peer) || self.muted.contains(&peer) {
                 continue;
             }
             if last.saturating_add(interval) <= wall_slot {
@@ -333,6 +347,18 @@ impl PeerHeads {
         failures.streak = failures.streak.saturating_add(1);
     }
 
+    /// How many range requests `peer` has failed in a row.
+    pub(crate) fn failure_streak(&self, peer: &PeerId) -> u32 {
+        self.range_failures
+            .get(peer)
+            .map_or(0, |failures| failures.streak)
+    }
+
+    /// The head slot `peer` last claimed, while its claim stands.
+    pub(crate) fn claimed_head(&self, peer: &PeerId) -> Option<u64> {
+        self.heads.get(peer).map(|claim| claim.head_slot)
+    }
+
     /// Note that the head reached blocks `peer` handed over, ending its run of
     /// failures.
     pub(crate) fn note_range_success(&mut self, peer: &PeerId) {
@@ -357,6 +383,11 @@ impl PeerHeads {
     /// on: the first in each slot is, later ones are only answered.
     pub(crate) fn inbound_due(&mut self, peer: PeerId, wall_slot: u64) -> bool {
         self.inbound_at.insert(peer, wall_slot) != Some(wall_slot)
+    }
+
+    /// Stop refreshing `peer`, which speaks neither `Status` version.
+    pub(crate) fn mute(&mut self, peer: PeerId) {
+        self.muted.insert(peer);
     }
 
     /// Whether the refresh may ask peers at `wall_slot`: once a slot, so a
@@ -415,7 +446,8 @@ impl PeerHeads {
 /// Whether this node has already imported `root`: its own head, or any block
 /// it holds a post-state for. On either chain: `Store::head` is the head key
 /// both share (`Store::beacon_head` reads it too), and `has_state` covers
-/// beacon states. A pending or held block has no post-state, so it
+/// beacon states. A block whose state was pruned below finality reads as not
+/// held, which is harmless: a head that old leads this node by nothing. A pending or held block has no post-state, so it
 /// does not count, the same as a block the node has never seen.
 fn holds_block(store: &Store, root: &H256) -> bool {
     store.head().is_ok_and(|head| head == *root) || store.has_state(root).unwrap_or(false)
@@ -500,6 +532,11 @@ pub(crate) fn note_range_failure(server: &mut P2PServer, peer: &PeerId) {
     }
     let wall_slot = crate::wall_clock_slot(&server.store);
     server.peer_heads.note_range_failure(*peer, wall_slot);
+    if server.peer_heads.failure_streak(peer) >= SUSPECT_AFTER_FAILURES
+        && let Some(claimed) = server.peer_heads.claimed_head(peer)
+    {
+        server.peer_heads.suspect(*peer, claimed, wall_slot);
+    }
     publish(server);
 }
 
@@ -719,6 +756,18 @@ mod tests {
         assert!(heads.due_for_refresh([peer], 20, 4).is_empty());
         heads.end_handshake(&peer);
         assert_eq!(heads.due_for_refresh([peer], 20, 4), vec![peer]);
+    }
+
+    #[test]
+    fn a_muted_peer_is_not_refreshed_until_it_reconnects() {
+        let mut heads = PeerHeads::default();
+        let peer = PeerId::random();
+        heads.due_for_refresh([peer], 10, 4);
+        heads.mute(peer);
+        assert!(heads.due_for_refresh([peer], 20, 4).is_empty());
+        heads.forget(&peer);
+        heads.due_for_refresh([peer], 30, 4);
+        assert_eq!(heads.due_for_refresh([peer], 40, 4), vec![peer]);
     }
 
     #[test]

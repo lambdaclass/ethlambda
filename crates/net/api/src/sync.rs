@@ -65,7 +65,11 @@ pub struct SyncThresholds {
     ///
     /// A peer that claims a head it does not serve (an empty answer, invalid
     /// blocks, no answer) would otherwise keep a node that is behind the
-    /// clock syncing for as long as it repeats the claim. Sized above what can
+    /// clock syncing for as long as it repeats the claim. A head advance
+    /// starts the window over, so across advances the bound also rests on
+    /// P2P: range sync sends the next batch to the peer with the highest
+    /// head, and a peer that fails it cools down or becomes a suspect, after
+    /// which its claim no longer counts. Sized above what can
     /// legitimately hold a catching-up head still: the range batch custody
     /// wait (30 s), an execution client's retry ladder (about 26 s), lean
     /// proof verification of a whole batch.

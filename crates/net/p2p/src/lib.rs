@@ -2136,6 +2136,18 @@ impl RefreshStatus {
 }
 
 impl P2PServer {
+    /// The head slot: as the chain actor last published it
+    /// (`Store::head_slot_hint`), or read from the head before its first
+    /// judgment. On beacon, reading the head decodes the whole head block.
+    pub(crate) fn head_slot(&self) -> u64 {
+        self.store
+            .head_slot_hint()
+            .unwrap_or_else(|| match self.store.chain() {
+                Chain::Lean => self.store.head_slot(),
+                Chain::Beacon => self.store.beacon_head().map_or(0, |(slot, _)| slot),
+            })
+    }
+
     /// This node's beacon `Status` in v2, built at most once a wall-clock
     /// slot and shared by every inbound request and the refresh: building one
     /// decodes the head block, and requests are not rate limited on the wire.
@@ -2179,20 +2191,24 @@ impl P2PServer {
     /// doubles the wait before the next one, so a head that cannot move at
     /// all re-fetches the gap ever more rarely.
     pub(crate) fn expire_range_watermark(&mut self, wall_slot: u64) {
-        // Nothing to watch: no session, nothing handed over above the head
-        // last seen, no suspect waiting on the head. Skipped without reading
-        // the head, which on beacon decodes the whole head block: on a node
-        // keeping up, that is nearly every tick.
-        let idle = self.range_sync_state.is_none()
-            && self.range_fetched_through <= self.head_watch.last_head().unwrap_or(0)
-            && !self.peer_heads.has_suspects();
-        if idle {
-            return;
+        let head_slot = self.head_slot();
+        // A head that moved back below the watermark (an `INVALID` cut, a
+        // reorg onto a shorter branch) leaves what was handed over above it
+        // off the chain being followed: the watermark is no floor there any
+        // more, and goes at once. Nobody is suspected for it.
+        if self
+            .head_watch
+            .last_head()
+            .is_some_and(|last| head_slot < last)
+            && self.range_fetched_through > head_slot
+        {
+            debug!(
+                head_slot,
+                fetched_through = self.range_fetched_through,
+                "The head moved back below the range watermark; lowering it"
+            );
+            self.range_fetched_through = head_slot;
         }
-        let head_slot = match self.store.chain() {
-            Chain::Lean => self.store.head_slot(),
-            Chain::Beacon => self.store.beacon_head().map_or(0, |(slot, _)| slot),
-        };
         // Peers whose blocks the head has reached served what they handed
         // over: that, not an answer merely reaching the chain actor, ends
         // their run of range failures.
@@ -2232,6 +2248,10 @@ impl P2PServer {
         // session's batch early). Whoever handed the blocks over was not
         // serving the chain the head can follow, and is a suspect until the
         // head passes what it handed over.
+        // The envelope gate and a batch held for custody belong to the session
+        // and go with it: `release_envelope_gate` and the custody timer act on
+        // whatever session there is when they run, so a later session starts
+        // with its gate open.
         self.range_sync_state = None;
         self.outbound_requests.retain(|_, kind| {
             !matches!(
@@ -2434,6 +2454,8 @@ async fn handle_swarm_event(
                     .remove(&peer_id)
                     .unwrap_or(closed_direction);
                 forget_discovered_peer(server, &peer_id);
+                // Keeps the peer's suspicion and range-failure run: a reconnect
+                // must not shed them (see `PeerHeads::forget`).
                 peer_heads::forget(server, &peer_id);
                 server.refresh_peer_metrics();
                 let peer_count = server.connected_peers.len();
