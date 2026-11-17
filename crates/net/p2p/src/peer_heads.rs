@@ -139,7 +139,8 @@ pub(crate) struct PeerHeads {
     /// ends a request long before that (its timeout is 10 s), so only one
     /// that never went anywhere (the swarm closing under the send) is still
     /// out by then, and it must not keep its peer from being asked again. No
-    /// answer can come for it, so the order below still holds.
+    /// answer can come for it, so the order [`Self::answered`] relies on
+    /// still holds.
     awaiting_answer: HashMap<PeerId, u64>,
     /// Each peer's failed range requests (an empty or refused answer, a
     /// timeout) since the head last reached blocks it handed over. A peer that has just failed is
@@ -480,8 +481,9 @@ impl PeerHeads {
 /// it holds a post-state for. On either chain: `Store::head` is the head key
 /// both share (`Store::beacon_head` reads it too), and `has_state` covers
 /// beacon states. A block whose state was pruned below finality reads as not
-/// held, which is harmless: a head that old leads this node by nothing. A pending or held block has no post-state, so it
-/// does not count, the same as a block the node has never seen.
+/// held, which is harmless: a head that old leads this node by nothing. A
+/// pending or held block has no post-state, so it does not count, the same as
+/// a block the node has never seen.
 fn holds_block(store: &Store, root: &H256) -> bool {
     store.head().is_ok_and(|head| head == *root)
         || store
@@ -591,9 +593,10 @@ pub(crate) fn clear_suspects(server: &mut P2PServer, head_slot: u64, wall_slot: 
 
 /// Note a failed range request from `peer`, whose last slot is `end_slot`,
 /// which starts or extends its cooldown, and republish the network head
-/// without its claim. Only while it is connected: libp2p reports a closed connection before the request it
-/// failed, so a failure noted after `forget` would outlive the peer and hold
-/// back its next connection's handshake.
+/// without its claim. Only while it is connected: libp2p reports a closed
+/// connection before the request it failed, so a failure noted after
+/// `forget` would outlive the peer and hold back its next connection's
+/// handshake.
 pub(crate) fn note_range_failure(server: &mut P2PServer, peer: &PeerId, end_slot: u64) {
     if !server.connected_peers.contains_key(peer) {
         return;

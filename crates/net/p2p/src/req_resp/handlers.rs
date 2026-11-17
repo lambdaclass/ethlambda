@@ -3708,14 +3708,47 @@ pub(crate) mod tests {
         // head left to suspect it through.
         let mut server = unconnected_server().await;
         let peer = connected_peer(&mut server);
+        let other = connected_peer(&mut server);
         let unknown = H256::repeat_byte(0x11);
         on_lean_status_request(&mut server, peer, &lean_status_at(unknown, 500)).await;
         fail_range_request(&mut server, &peer, 10);
         fail_range_request(&mut server, &peer, 10);
+        // Back in a session another peer keeps alive, then out of it with its
+        // claim, its third request still out.
+        let mut session = RangeSyncState::new(1..501, other, 500);
+        session.merge_peer(peer, 500, 501);
+        server.range_sync_state = Some(session);
         peer_heads::drop_claim(&mut server, &peer);
+        let state = server.range_sync_state.as_ref().expect("kept alive");
+        assert!(!state.peer_set.contains_key(&peer));
         assert!(!server.peer_heads.is_suspect(&peer));
         fail_range_request(&mut server, &peer, 20);
         assert!(server.peer_heads.is_suspect(&peer));
+        // Through that request's last slot: cleared once the head passes it.
+        let wall = crate::wall_clock_slot(&server.store);
+        peer_heads::clear_suspects(&mut server, 19, wall);
+        assert!(server.peer_heads.is_suspect(&peer));
+        peer_heads::clear_suspects(&mut server, 20, wall);
+        assert!(!server.peer_heads.is_suspect(&peer));
+    }
+
+    #[tokio::test]
+    async fn a_peer_whose_head_this_node_holds_leaves_the_range_session() {
+        // Its session head was merged in on an earlier claim: it has nothing
+        // left to give, and a batch to it would fail on a head it left.
+        let mut server = unconnected_server().await;
+        let peer = connected_peer(&mut server);
+        let unknown = H256::repeat_byte(0x11);
+        on_lean_status_request(&mut server, peer, &lean_status_at(unknown, 500)).await;
+        assert!(server.range_sync_state.is_some());
+        let ours = server.store.head().expect("a head");
+        on_lean_status_request(&mut server, peer, &lean_status_at(ours, 0)).await;
+        assert!(server.range_sync_state.is_none());
+        let batch_in_flight = server
+            .outbound_requests
+            .values()
+            .any(|kind| matches!(kind, PendingRequestKind::Range { .. }));
+        assert!(!batch_in_flight);
     }
 
     #[tokio::test]
