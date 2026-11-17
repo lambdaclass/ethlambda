@@ -76,6 +76,9 @@ pub fn process_block(
 
 /// [`process_block`]'s dispatch: every signature the block's processing needs
 /// is pushed into `signatures`, which [`process_block`] then verifies.
+///
+/// An `Err` here, or from the batch after it, leaves `state` partly mutated;
+/// see [`process_block`]. A new caller must discard the state after an error.
 #[allow(clippy::too_many_arguments)]
 fn process_block_with_signatures(
     state: &mut BeaconState,

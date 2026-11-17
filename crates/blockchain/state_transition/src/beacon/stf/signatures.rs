@@ -108,6 +108,15 @@ impl SignatureBatch {
     /// One batch check. On failure, re-checks the sets one by one and rejects with
     /// the first failing set's `what`, so the error names the same check it does
     /// today.
+    ///
+    /// A failing batch therefore costs the batch plus up to one single check
+    /// per set, roughly twice what checking each set on push would. That stays
+    /// bounded: only a block that is rejected pays it, the block's operation
+    /// limits cap how many sets it pushes, and on import `apply_block` checks
+    /// the proposer's signature (and the header its proposer index) before
+    /// this runs, so making such a block takes the slot proposer's key.
+    /// Bisecting the failed batch would cut the re-checks if this ever shows
+    /// up in a profile.
     pub(crate) fn verify(self) -> Result<()> {
         if verify_signature_sets(&self.sets) {
             return Ok(());

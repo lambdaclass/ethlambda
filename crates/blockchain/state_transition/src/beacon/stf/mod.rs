@@ -72,7 +72,7 @@ use crate::beacon::helpers::accessors::{ActiveBalanceCache, CommitteeCache, get_
 use crate::beacon::helpers::misc::compute_signing_root;
 use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
-use crate::beacon::primitives::{HashTreeRoot as _, Slot};
+use crate::beacon::primitives::{BlsSignature, HashTreeRoot as _, Root, Slot, ValidatorIndex};
 use crate::beacon::{bls, config::Config, constants};
 
 /// What the execution layer would answer for a block's payload.
@@ -229,15 +229,46 @@ pub fn block_signature_set(
     state: &BeaconState,
     signed_block: &containers::SignedBeaconBlock,
 ) -> Option<bls::SignatureSet> {
-    let index = signed_block.proposer_index();
-    let proposer = state.validator(index).ok()?;
+    proposer_signature_set(
+        state,
+        signed_block.proposer_index(),
+        signed_block.message_hash_tree_root(),
+        &signed_block.signature(),
+    )
+}
+
+/// Whether `signature` is `proposer_index`'s over the block whose root is
+/// `block_root`, under `state`'s proposer domain.
+///
+/// A blinded block has the root of its full block, so one check serves
+/// both.
+pub fn verify_proposer_signature(
+    state: &BeaconState,
+    proposer_index: ValidatorIndex,
+    block_root: Root,
+    signature: &BlsSignature,
+) -> bool {
+    proposer_signature_set(state, proposer_index, block_root, signature)
+        .is_some_and(|set| set.verify())
+}
+
+/// [`verify_proposer_signature`]'s check, resolved but not yet run. `None` is
+/// a proposer index outside the registry, or a key or signature that does not
+/// validate.
+fn proposer_signature_set(
+    state: &BeaconState,
+    proposer_index: ValidatorIndex,
+    block_root: Root,
+    signature: &BlsSignature,
+) -> Option<bls::SignatureSet> {
+    let proposer = state.validator(proposer_index).ok()?;
     let domain = get_domain(state, constants::DOMAIN_BEACON_PROPOSER, None);
-    let signing_root = compute_signing_root(signed_block.message_hash_tree_root(), domain);
+    let signing_root = compute_signing_root(block_root, domain);
     let proposer = bls::IndexedPubkey {
-        index,
+        index: proposer_index,
         pubkey: proposer.pubkey,
     };
-    bls::SignatureSet::single(&proposer, signing_root, &signed_block.signature())
+    bls::SignatureSet::single(&proposer, signing_root, signature)
 }
 
 /// Advances the state to `slot`, running epoch processing at each boundary and
