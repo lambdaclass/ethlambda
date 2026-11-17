@@ -3799,9 +3799,17 @@ pub(crate) mod tests {
         server.range_fetched_through = 100;
         server.expire_range_watermark(200);
         assert_eq!(server.range_fetched_through, 100);
+        // A session was running, with a batch delivered by a peer.
+        let peer = connected_peer(&mut server);
+        server.range_sync_state = Some(RangeSyncState::new(101..200, peer, 200));
+        server.head_watch.note_delivery(peer, 100);
         server.store.set_head_slot_hint(90);
         server.expire_range_watermark(201);
         assert_eq!(server.range_fetched_through, 90);
+        // The session goes, its cursor being past the cut-out span, and the
+        // delivery is held against nobody.
+        assert!(server.range_sync_state.is_none());
+        assert!(server.head_watch.reached(u64::MAX).is_empty());
         assert!(!server.peer_heads.has_suspects());
     }
 

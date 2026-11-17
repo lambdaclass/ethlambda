@@ -540,6 +540,13 @@ impl HeadWatch {
         wall_slot.saturating_sub(since)
     }
 
+    /// Forget every delivery, held against nobody: what was handed over is
+    /// off the chain the head now follows.
+    pub(crate) fn forget_deliveries(&mut self) {
+        self.deliverers.clear();
+        self.delivering_since = None;
+    }
+
     /// Forget when deliveries started, nothing being above the head.
     pub(crate) fn clear_delivery(&mut self) {
         self.delivering_since = None;
@@ -2221,7 +2228,11 @@ impl P2PServer {
         // A head that moved back below the watermark (an `INVALID` cut, a
         // reorg onto a shorter branch) leaves what was handed over above it
         // off the chain being followed: the watermark is no floor there any
-        // more, and goes at once. Nobody is suspected for it.
+        // more, and goes at once. So does a running session, whose cursor is
+        // past the cut-out span and whose batch in flight would raise the
+        // watermark again; and what was delivered above the head is nobody's
+        // fault, so it is not held against its senders. Nothing is suspected
+        // and the backoff is not counted.
         if self
             .head_watch
             .last_head()
@@ -2234,6 +2245,8 @@ impl P2PServer {
                 "The head moved back below the range watermark; lowering it"
             );
             self.range_fetched_through = head_slot;
+            self.end_range_session();
+            self.head_watch.forget_deliveries();
         }
         // Peers whose blocks the head has reached served what they handed
         // over: that, not an answer merely reaching the chain actor, ends
@@ -2275,10 +2288,19 @@ impl P2PServer {
         // session's batch early). Whoever handed the blocks over was not
         // serving the chain the head can follow, and is a suspect until the
         // head passes what it handed over.
-        // The envelope gate and a batch held for custody belong to the session
-        // and go with it: `release_envelope_gate` and the custody timer act on
-        // whatever session there is when they run, so a later session starts
-        // with its gate open.
+        self.end_range_session();
+        for (peer, through) in self.head_watch.note_drop(head_slot, wall_slot) {
+            peer_heads::suspect(self, &peer, through);
+        }
+    }
+
+    /// End the range session, with its requests in flight: an answer to one
+    /// now matches no request, so it cannot raise the watermark again or
+    /// release a later session's envelope gate. The envelope gate and a batch
+    /// held for custody belong to the session and go with it:
+    /// `release_envelope_gate` and the custody timer act on whatever session
+    /// there is when they run, so a later session starts with its gate open.
+    fn end_range_session(&mut self) {
         self.range_sync_state = None;
         self.outbound_requests.retain(|_, kind| {
             !matches!(
@@ -2286,9 +2308,6 @@ impl P2PServer {
                 PendingRequestKind::Range { .. } | PendingRequestKind::EnvelopeRange { .. }
             )
         });
-        for (peer, through) in self.head_watch.note_drop(head_slot, wall_slot) {
-            peer_heads::suspect(self, &peer, through);
-        }
     }
 
     /// Re-ask this slot's share of the connected peers that are due for their
