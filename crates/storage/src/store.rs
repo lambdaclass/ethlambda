@@ -3344,9 +3344,9 @@ impl Store {
     /// `None` before the actor's first judgment, and while a beacon head row
     /// names a block the store holds no header for yet (see
     /// [`Store::beacon_head`]). As old as the latest judgment, which follows
-    /// every head change on beacon; on lean the tick judges before it may
-    /// move the head, so it can trail the head by an interval. Runtime-only
-    /// and shared by every clone of this `Store`.
+    /// every head change on both chains (a lean tick that moved the head
+    /// judges again after it). Runtime-only and shared by every clone of this
+    /// `Store`.
     pub fn judged_head_slot(&self) -> Option<u64> {
         let slot = self.judged_head_slot.load(Ordering::Relaxed);
         (slot != UNSET_SLOT).then_some(slot)

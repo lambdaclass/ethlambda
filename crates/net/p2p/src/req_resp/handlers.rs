@@ -951,7 +951,7 @@ async fn handle_lean_blocks_by_range_response(
     }
 
     let Some(ref blockchain) = server.blockchain else {
-        server.range_sync_state = None;
+        server.end_range_session();
         debug!(%peer, "No blockchain handler available");
         return;
     };
@@ -987,7 +987,7 @@ async fn handle_lean_blocks_by_range_response(
     let Some(through) = handed_over_through else {
         // Nothing reached the chain actor, whose mailbox is gone: the session
         // makes no progress, and the peer is not to blame.
-        server.range_sync_state = None;
+        server.end_range_session();
         return;
     };
     server.head_watch.note_delivery(peer, through);
@@ -2892,7 +2892,7 @@ async fn handle_beacon_blocks_by_range_response(
         // No actor to forward into. A range session makes no progress either
         // way, so it is dropped rather than spun uselessly on further
         // batches, matching handle_lean_blocks_by_range_response.
-        server.range_sync_state = None;
+        server.end_range_session();
         debug!(%peer, "No blockchain handler available");
         return;
     };
@@ -2927,7 +2927,7 @@ async fn handle_beacon_blocks_by_range_response(
     debug!(%peer, received, in_range, "Beacon blocks received");
     let Some(highest) = highest_forwarded_slot else {
         // As on lean: nothing reached the chain actor, whose mailbox is gone.
-        server.range_sync_state = None;
+        server.end_range_session();
         return;
     };
 
@@ -3733,6 +3733,22 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_disconnected_peer_leaves_the_range_session() {
+        // A member that had no batch in flight stayed in the session after
+        // its disconnect, to be picked for a batch it could not answer.
+        let mut server = unconnected_server().await;
+        let (gone, other) = (connected_peer(&mut server), connected_peer(&mut server));
+        let mut session = RangeSyncState::new(1..501, other, 500);
+        session.merge_peer(gone, 600, 601);
+        server.range_sync_state = Some(session);
+        server.connected_peers.remove(&gone);
+        peer_heads::forget(&mut server, &gone);
+        let state = server.range_sync_state.as_ref().expect("kept alive");
+        assert!(!state.peer_set.contains_key(&gone));
+        assert!(state.peer_set.contains_key(&other));
+    }
+
+    #[tokio::test]
     async fn a_peer_whose_head_this_node_holds_leaves_the_range_session() {
         // Its session head was merged in on an earlier claim: it has nothing
         // left to give, and a batch to it would fail on a head it left.
@@ -3965,6 +3981,22 @@ pub(crate) mod tests {
             watch.note_drop(5, 200 + wall);
         }
         assert_eq!(watch.patience(16), 16 * 16);
+    }
+
+    #[test]
+    fn a_drop_blames_only_the_lowest_batch_the_head_never_reached() {
+        // Finding: every deliverer since the head last moved was made a
+        // suspect, an honest peer serving later batches too, whose blocks
+        // could not connect without the bad batch below them.
+        let mut watch = crate::HeadWatch::default();
+        let (first, later) = (PeerId::random(), PeerId::random());
+        watch.note_delivery(first, 164);
+        watch.note_delivery(later, 228);
+        watch.note_delivery(later, 292);
+        watch.note_delivery(first, 356);
+        assert_eq!(watch.note_drop(100, 200), vec![(first, 356)]);
+        // The rest are forgotten, not held for the next drop.
+        assert!(watch.note_drop(100, 300).is_empty());
     }
 
     #[tokio::test]

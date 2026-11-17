@@ -481,6 +481,30 @@ pub fn inc_beacon_status_digest_mismatch() {
     LEAN_BEACON_STATUS_DIGEST_MISMATCH_TOTAL.inc();
 }
 
+static LEAN_SYNC_PEERS_HELD_BACK: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "lean_sync_peers_held_back",
+        "Peers whose Status head does not count towards the sync gate's network head, by reason",
+        &["reason"]
+    )
+    .unwrap()
+});
+
+/// Publish how many peers' `Status` heads are held back from the network head
+/// the sync gate reads: `suspect` for peers whose range blocks never imported
+/// or that kept failing range requests, `cooling` for the others cooling down
+/// from a failed range request. Set from a full count whenever the network
+/// head is published, which is at least once a slot.
+pub fn set_sync_peers_held_back(suspects: usize, cooling: usize) {
+    let as_gauge = |count: usize| i64::try_from(count).unwrap_or(i64::MAX);
+    LEAN_SYNC_PEERS_HELD_BACK
+        .with_label_values(&["suspect"])
+        .set(as_gauge(suspects));
+    LEAN_SYNC_PEERS_HELD_BACK
+        .with_label_values(&["cooling"])
+        .set(as_gauge(cooling));
+}
+
 /// Publish the current fork digest as a label, so a dashboard can tell at a
 /// glance whether a node is stranded on a boundary it failed to cross.
 ///

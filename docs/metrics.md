@@ -243,6 +243,7 @@ samples nothing and publishes no series here.
 | `lean_peers_by_direction` | Gauge | Connected peers by the direction the connection was opened in | On every connection established and closed | direction=inbound,outbound |
 | `lean_swarm_established_connections` | Gauge | Established connections as libp2p itself counts them | On the swarm's own metric tick | direction=inbound,outbound |
 | `lean_custody_column_peers` | Gauge | Connected peers known to custody each data column this node samples | On every connection established and closed, and whenever a peer's custody is recorded from its `metadata/3` answer or its ENR `cgc` | column=`<index>` |
+| `lean_sync_peers_held_back` | Gauge | Peers whose `Status` head does not count towards the sync gate's network head: suspects (range blocks that never imported, or range requests that kept failing) and peers cooling down from a failed range request. Both include peers since disconnected, whose history outlives the connection. A count that keeps climbing while the node reads as syncing is fresh identities claiming a lead | On every publish of the network head, at least once a slot | reason=suspect,cooling |
 
 ### Block Import Timing
 

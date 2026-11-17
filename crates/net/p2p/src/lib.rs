@@ -600,15 +600,19 @@ impl HeadWatch {
     }
 
     /// Note a drop of the watermark to `head_slot` at `wall_slot`, starting
-    /// the count over, and return the peers that handed blocks over since
-    /// the head last moved, each with the highest slot it handed over.
+    /// the count over, and return the peers to blame, each with the highest
+    /// slot it handed over: those that handed over the lowest batch the head
+    /// never reached. Batches above it could not connect without it, so
+    /// their senders are forgotten, held against no one.
     pub(crate) fn note_drop(&mut self, head_slot: u64, wall_slot: u64) -> Vec<(PeerId, u64)> {
         self.seen = Some((head_slot, wall_slot));
         self.delivering_since = None;
         self.watermark = head_slot;
         self.drops = self.drops.saturating_add(1);
+        let lowest = self.deliverers.values().flatten().copied().min();
         self.deliverers
             .drain()
+            .filter(|(_, ends)| ends.iter().copied().min() == lowest)
             .filter_map(|(peer, ends)| Some((peer, ends.into_iter().max()?)))
             .collect()
     }
@@ -616,6 +620,10 @@ impl HeadWatch {
 
 /// What a cached beacon `Status` was built from (see
 /// [`P2PServer::beacon_status_v2`]), all of it read without the head block.
+/// Nothing else in a `Status` can change under it: the fork digest is
+/// compared off the `Status` itself, and `earliest_available_slot` is the
+/// store's anchor, fixed for its life (a backfill that moved it would need
+/// it here).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StatusKey {
     wall_slot: u64,
@@ -2197,6 +2205,11 @@ impl P2PServer {
     /// none (before its first judgment, and while a beacon head names no
     /// stored block yet). On beacon, reading the head decodes the whole head
     /// block.
+    ///
+    /// Read by the watermark expiry and the beacon `Status` handlers on both
+    /// chains. Lean's own `Status` handling reads `Store::head_slot` instead,
+    /// a header read, to size its range requests on the head as it is at
+    /// that moment.
     pub(crate) fn head_slot(&self) -> u64 {
         self.store
             .judged_head_slot()
@@ -2325,10 +2338,10 @@ impl P2PServer {
         // A session still running is fetching past blocks that never
         // imported, and its batch in flight would raise the watermark again:
         // both go, and an answer to that batch now matches no request (nor
-        // to its envelope request, for the same blocks). Whoever handed the
-        // blocks over was not
-        // serving the chain the head can follow, and is a suspect until the
-        // head passes what it handed over.
+        // to its envelope request, for the same blocks). Whoever handed over
+        // the lowest batch the head never reached was not serving the chain
+        // the head can follow, and is a suspect until the head passes what it
+        // handed over; batches above it could not connect without it.
         self.end_range_session();
         let deliverers = self.head_watch.note_drop(head_slot, wall_slot);
         peer_heads::suspect(self, deliverers, wall_slot);
@@ -2338,11 +2351,12 @@ impl P2PServer {
     /// now matches no request, so it cannot raise the watermark again, and
     /// its envelope requests go too, being for the blocks given up on. The
     /// envelope gate and a batch held for custody belong to the session and
-    /// go with it, so a later session starts with its gate open. Nor can anything of this one's that
-    /// outlives it act on a later one: an envelope request names its session,
-    /// and so does every release it leads to (its answer, its failure, and
-    /// the check after the answer), and a custody deadline only re-checks a
-    /// wait that runs from the later session's own start.
+    /// go with it, so a later session starts with its gate open. Nor can
+    /// anything of this one's that outlives it act on a later one: an
+    /// envelope request names its session, and so does every release it
+    /// leads to (its answer, its failure, and the check after the answer),
+    /// and a custody deadline only re-checks a wait that runs from the later
+    /// session's own start.
     pub(crate) fn end_range_session(&mut self) {
         self.range_sync_state = None;
         self.outbound_requests.retain(|_, kind| {

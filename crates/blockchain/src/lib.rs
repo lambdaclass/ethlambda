@@ -943,10 +943,17 @@ impl BlockChainServer {
     /// head recompute at its end. Judging again every time would decode the
     /// beacon head block a second time, so this judges only when the tick
     /// returned before doing so. That keeps a return added to the tick later
-    /// from leaving the gate unjudged.
+    /// from leaving the gate unjudged. A judgment by a block arrival earlier
+    /// in the slot counts too: arrivals judge after any head move, so a tick
+    /// that returned early has nothing newer to judge.
     async fn on_tick(&mut self, timestamp_ms: u64, ctx: &Context<Self>) {
         let slot = self.run_tick(timestamp_ms, ctx).await;
-        if self.sync_status.judged_through() < slot {
+        // A lean tick judges before its duties, which can move the head (a
+        // proposal, attestations accepted): judged again when they did, so
+        // the published head slot follows it. The lean head is a header read.
+        let lean_head_moved = self.store.chain() == Chain::Lean
+            && self.store.judged_head_slot() != Some(self.store.head_slot());
+        if self.sync_status.judged_through() < slot || lean_head_moved {
             self.update_sync_status(slot);
         }
     }

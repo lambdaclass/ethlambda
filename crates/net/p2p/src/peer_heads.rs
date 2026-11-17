@@ -282,6 +282,20 @@ impl PeerHeads {
         !self.suspects.is_empty()
     }
 
+    /// How many peers are suspects, and how many others are cooling down from
+    /// a failed range request at `wall_slot`: the claims held back from the
+    /// network head. Both count peers since disconnected, whose suspicion and
+    /// failure runs outlive the connection.
+    pub(crate) fn held_back(&self, wall_slot: u64, interval: u64) -> (usize, usize) {
+        let cooling = self
+            .range_failures
+            .keys()
+            .filter(|peer| !self.suspects.contains_key(*peer))
+            .filter(|peer| self.range_cooling_down(peer, wall_slot, interval))
+            .count();
+        (self.suspects.len(), cooling)
+    }
+
     /// Whether `peer` is a suspect (see [`Self::suspects`]).
     pub(crate) fn is_suspect(&self, peer: &PeerId) -> bool {
         self.suspects.contains_key(peer)
@@ -545,9 +559,13 @@ fn leave_range_session(server: &mut P2PServer, peer: &PeerId) {
     }
 }
 
-/// Forget a disconnected peer's head and republish the network head.
+/// Forget a disconnected peer's head and its place in the range session,
+/// and republish the network head. Its batch in flight, if any, fails on
+/// its own (libp2p reports the closed connection to each request), so with
+/// other peers left the session needs nothing more; with none left it ends.
 pub(crate) fn forget(server: &mut P2PServer, peer: &PeerId) {
     server.peer_heads.forget(peer);
+    leave_range_session(server, peer);
     publish(server);
 }
 
@@ -648,6 +666,8 @@ pub(crate) fn publish(server: &mut P2PServer) {
         }
     };
     server.store.set_network_head(network_head);
+    let (suspects, cooling) = server.peer_heads.held_back(wall_slot, interval);
+    crate::metrics::set_sync_peers_held_back(suspects, cooling);
 }
 
 #[cfg(test)]
@@ -655,6 +675,19 @@ mod tests {
     use super::*;
 
     const BEACON_REFRESH: u64 = SyncThresholds::BEACON.status_refresh_slots;
+
+    #[test]
+    fn the_held_back_count_splits_suspects_from_peers_cooling_down() {
+        let mut heads = PeerHeads::default();
+        let (suspect, cooling, counted) = (PeerId::random(), PeerId::random(), PeerId::random());
+        heads.note_range_failure(suspect, 10);
+        heads.suspect(suspect, 100, 10);
+        heads.note_range_failure(cooling, 10);
+        heads.record(counted, 50, H256::ZERO, 10, false);
+        assert_eq!(heads.held_back(10, 4), (1, 1));
+        // The cooldown runs out; the suspicion stays.
+        assert_eq!(heads.held_back(14, 4), (1, 0));
+    }
 
     #[test]
     fn no_report_is_no_network_head() {
