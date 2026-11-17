@@ -206,7 +206,9 @@ impl SyncStatusTracker {
         if on_peers_word {
             self.behind_for = match (self.counted_at, self.lapsed_at.take()) {
                 // Behind since the last judgment: the whole stretch counts.
-                (Some(counted), None) => self.behind_for + current_slot.saturating_sub(counted),
+                (Some(counted), None) => self
+                    .behind_for
+                    .saturating_add(current_slot.saturating_sub(counted)),
                 // Back after a lapse longer than the window: a new claim,
                 // with a window of its own, once per head position. Only
                 // once something was counted at this head: the first claim
@@ -220,7 +222,9 @@ impl SyncStatusTracker {
                 }
                 // Back after a shorter lapse: this slot counts once, however
                 // many judgments it has.
-                (Some(counted), Some(_)) => self.behind_for + u64::from(current_slot != counted),
+                (Some(counted), Some(_)) => self
+                    .behind_for
+                    .saturating_add(u64::from(current_slot != counted)),
                 // Behind for the first time since the head advanced.
                 (None, _) => self.behind_for,
             };
