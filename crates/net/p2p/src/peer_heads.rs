@@ -121,6 +121,12 @@ pub(crate) struct PeerHeads {
     /// clock, such a claim would otherwise idle the node for a stall window
     /// after every block the network manages to make.
     range_failures: HashMap<PeerId, RangeFailures>,
+    /// Peers whose range blocks left the head where it was for a whole window
+    /// (see `P2PServer::expire_range_watermark`). Like a peer cooling down,
+    /// they are not synced towards and their claims do not count, but until
+    /// the head next moves rather than for a time, and no later answer of
+    /// theirs clears it: they were not serving a chain the head can follow.
+    suspects: HashSet<PeerId>,
     /// The wall-clock slot of each connected peer's last `Status` request
     /// that was acted on: at most one a slot (see [`Self::inbound_due`]).
     inbound_at: HashMap<PeerId, u64>,
@@ -182,6 +188,7 @@ impl PeerHeads {
         self.awaiting_handshake.remove(peer);
         self.inbound_at.remove(peer);
         self.range_failures.remove(peer);
+        self.suspects.remove(peer);
         self.last_exchange.remove(peer);
         self.foreign_digest.remove(peer);
         self.status_versions.remove(peer);
@@ -194,8 +201,14 @@ impl PeerHeads {
         self.heads
             .iter()
             .filter(|(peer, _)| !self.range_cooling_down(peer, wall_slot, interval))
+            .filter(|(peer, _)| !self.suspects.contains(peer))
             .map(|(_, claim)| claim.head_slot)
             .max()
+    }
+
+    /// Whether `peer` is a suspect (see [`Self::suspects`]).
+    pub(crate) fn is_suspect(&self, peer: &PeerId) -> bool {
+        self.suspects.contains(peer)
     }
 
     /// Drop `peer`'s claim, returning whether it had one.
@@ -363,9 +376,7 @@ pub(crate) fn observe(
 /// Drop the reports older than `SyncThresholds::report_lifetime` at
 /// `wall_slot`, and republish the network head: a cooldown that has run out
 /// changes it as surely as an expired report does.
-pub(crate) fn expire(server: &mut P2PServer, wall_slot: u64) {
-    let lifetime = thresholds(&server.store).report_lifetime();
-    server.peer_heads.expire(wall_slot, lifetime);
+pub(crate) fn expire(server: &mut P2PServer, _wall_slot: u64) {
     publish(server);
 }
 
@@ -384,6 +395,24 @@ pub(crate) fn drop_claim(server: &mut P2PServer, peer: &PeerId) {
     }
 }
 
+/// Make `peer` a suspect until the head next moves (see
+/// [`PeerHeads::suspects`]), and republish the network head without its
+/// claim. Only while it is connected, as for a failure.
+pub(crate) fn suspect(server: &mut P2PServer, peer: &PeerId) {
+    if server.connected_peers.contains_key(peer) && server.peer_heads.suspects.insert(*peer) {
+        publish(server);
+    }
+}
+
+/// Clear every suspect, the head having moved, and republish the network
+/// head with their claims.
+pub(crate) fn clear_suspects(server: &mut P2PServer) {
+    if !server.peer_heads.suspects.is_empty() {
+        server.peer_heads.suspects.clear();
+        publish(server);
+    }
+}
+
 /// Note a failed range request from `peer`, which starts or extends its
 /// cooldown, and republish the network head without its claim. Only while it
 /// is connected: libp2p reports a closed connection before the request it
@@ -398,10 +427,17 @@ pub(crate) fn note_range_failure(server: &mut P2PServer, peer: &PeerId) {
     publish(server);
 }
 
-fn publish(server: &P2PServer) {
+/// Publish the network head as of now, dropping reports past their lifetime
+/// first, so no path republishes one between the refresh timer's ticks.
+fn publish(server: &mut P2PServer) {
     let wall_slot = crate::wall_clock_slot(&server.store);
-    let interval = thresholds(&server.store).status_refresh_slots;
-    let network_head = server.peer_heads.network_head(wall_slot, interval);
+    let thresholds = thresholds(&server.store);
+    server
+        .peer_heads
+        .expire(wall_slot, thresholds.report_lifetime());
+    let network_head = server
+        .peer_heads
+        .network_head(wall_slot, thresholds.status_refresh_slots);
     server.store.set_network_head(network_head);
 }
 

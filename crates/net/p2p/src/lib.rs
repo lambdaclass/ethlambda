@@ -521,6 +521,11 @@ impl HeadWatch {
         wall_slot.saturating_sub(since)
     }
 
+    /// The head slot last seen.
+    pub(crate) fn head(&self) -> Option<u64> {
+        self.seen.map(|(head_slot, _)| head_slot)
+    }
+
     /// Note that `peer` handed blocks over.
     pub(crate) fn note_delivery(&mut self, peer: PeerId) {
         self.deliverers.insert(peer);
@@ -2117,14 +2122,15 @@ impl P2PServer {
     /// after the head last moved, so the first batch gets a whole window to
     /// import; later deliveries do not restart it, since a whole window of
     /// them that has not moved the head is not importing. A head that is
-    /// still importing moves. On a drop, the session running ends, and the
-    /// peers that handed blocks over since the head last moved cool down
-    /// (see `PeerHeads::range_cooling_down`). Each drop at the same head
+    /// still importing moves. On a drop, the session running ends with its
+    /// batch in flight, and the peers that handed blocks over since the head
+    /// last moved become suspects until it moves (see `PeerHeads::suspects`). Each drop at the same head
     /// doubles the wait before the next one, so a head that cannot move at
     /// all re-fetches the gap ever more rarely.
     pub(crate) fn expire_range_watermark(&mut self, wall_slot: u64) {
         let head_slot = match self.store.chain() {
             Chain::Lean => self.store.head_slot(),
+            // The head's header entry, not the block: no body is decoded.
             Chain::Beacon => self.store.beacon_head().map_or(0, |(slot, _)| slot),
         };
         // Blocks being handed over: a session running, or the watermark moved
@@ -2132,6 +2138,11 @@ impl P2PServer {
         // two).
         let watermark_moved = self.head_watch.watermark_moved(self.range_fetched_through);
         let delivering = self.range_sync_state.is_some() || watermark_moved;
+        // A head that moved clears the suspects: what they handed over may
+        // have been what moved it, and either way it is a new position.
+        if self.head_watch.head() != Some(head_slot) {
+            peer_heads::clear_suspects(self);
+        }
         let flat_for = self.head_watch.flat_for(head_slot, wall_slot, delivering);
         let window = peer_heads::thresholds(&self.store).stall_window;
         if self.range_fetched_through <= head_slot || flat_for <= self.head_watch.patience(window) {
@@ -2145,11 +2156,15 @@ impl P2PServer {
         );
         self.range_fetched_through = head_slot;
         // A session still running is fetching past blocks that never
-        // imported, and whoever handed them over was not serving the chain
-        // the head can follow.
+        // imported, and its batch in flight would raise the watermark again:
+        // both go, and an answer to that batch now matches no request.
+        // Whoever handed the blocks over was not serving the chain the head
+        // can follow, and is a suspect until the head moves.
         self.range_sync_state = None;
+        self.outbound_requests
+            .retain(|_, kind| !matches!(kind, PendingRequestKind::Range { .. }));
         for peer in self.head_watch.note_drop(head_slot, wall_slot) {
-            peer_heads::note_range_failure(self, &peer);
+            peer_heads::suspect(self, &peer);
         }
     }
 

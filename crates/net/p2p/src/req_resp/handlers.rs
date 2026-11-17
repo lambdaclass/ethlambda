@@ -524,18 +524,26 @@ pub async fn handle_req_resp_message(
                 // Only the former is worth acting on: a peer that has dropped
                 // `status/1` refuses the stream outright, and without a
                 // handshake it never enters the sync peer set at all. Only a
-                // refused `status/1`: the retry is `status/2`, so retrying a
-                // refused `status/2` (a refresh asks in whichever version the
-                // peer last answered) would only be refused again, forever.
-                // A peer that answered v1 and later refuses v2 is therefore
-                // not retried either; it is still asked in v1 next time.
+                // refused `status/1` is retried at once, on `status/2`. A
+                // refused `status/2` is not, or the two would bounce off a
+                // peer that speaks neither; it is noted instead, so the next
+                // refresh asks in `status/1` rather than repeating a version
+                // the peer has dropped (a refresh asks in whichever version
+                // the peer last answered).
                 None => {
-                    if request_id.protocol == ReqRespProtocol::BeaconStatusV1
-                        && matches!(
-                            error,
-                            request_response::OutboundFailure::UnsupportedProtocols
-                        )
+                    let unsupported = matches!(
+                        error,
+                        request_response::OutboundFailure::UnsupportedProtocols
+                    );
+                    if request_id.protocol == ReqRespProtocol::BeaconStatusV2
+                        && unsupported
+                        && server.connected_peers.contains_key(&peer)
                     {
+                        server
+                            .peer_heads
+                            .note_status_version(peer, StatusVersion::V1);
+                    }
+                    if request_id.protocol == ReqRespProtocol::BeaconStatusV1 && unsupported {
                         // The handshake goes on, on `status/2`.
                         crate::beacon::handler::retry_status_on_other_version(server, peer).await;
                     } else if is_status_protocol(request_id.protocol) {
@@ -641,8 +649,11 @@ async fn handle_lean_status_request(
     // sync too. Lighthouse does the same: both go through `process_status`.
     // At most one a slot per peer is acted on: requests are not rate limited
     // on the wire, and each now reads the store and may start a batch.
+    // Connected first, so a request handled after the disconnect does not
+    // use up the next connection's slot.
     let wall_slot = crate::wall_clock_slot(&server.store);
-    if server.peer_heads.inbound_due(peer, wall_slot) {
+    if server.connected_peers.contains_key(&peer) && server.peer_heads.inbound_due(peer, wall_slot)
+    {
         on_lean_status_request(server, peer, &request).await;
     }
 }
@@ -690,12 +701,14 @@ fn sync_towards_peer(
     refresh_lead: Option<u64>,
 ) -> bool {
     // A peer that just failed a range request is not synced towards again
-    // for a refresh interval (see `PeerHeads::range_cooling_down`).
+    // for a refresh interval (see `PeerHeads::range_cooling_down`), nor one
+    // whose blocks left the head where it was (see `PeerHeads::suspects`).
     let wall_slot = crate::wall_clock_slot(&server.store);
     let cooldown = peer_heads::thresholds(&server.store).status_refresh_slots;
     if server
         .peer_heads
         .range_cooling_down(&peer, wall_slot, cooldown)
+        || server.peer_heads.is_suspect(&peer)
     {
         return false;
     }
@@ -3737,6 +3750,21 @@ pub(crate) mod tests {
         let honest = connected_peer(&mut server);
         let window = SyncThresholds::LEAN.stall_window;
         server.range_sync_state = Some(RangeSyncState::new(1..2000, liar, 2000));
+        // Its next batch is in flight when the drop comes.
+        let in_flight = server
+            .swarm_handle
+            .send_request(
+                liar,
+                Request::BlocksByRange(BlocksByRangeRequest::new(1, 10)),
+                ReqRespProtocol::LeanBlocksByRange,
+            )
+            .await
+            .expect("a request id");
+        let batch = PendingRequestKind::Range {
+            start_slot: 1,
+            end_slot: 10,
+        };
+        server.outbound_requests.insert(in_flight, batch);
         // A batch every slot, none of which moves the head.
         for (batch, wall) in (100..=101 + window).enumerate() {
             server.range_fetched_through = 100 * (batch as u64 + 1);
@@ -3746,12 +3774,18 @@ pub(crate) mod tests {
         let head = server.store.head_slot();
         assert_eq!(server.range_fetched_through, head);
         assert!(server.range_sync_state.is_none(), "the session ends");
-        let wall = crate::wall_clock_slot(&server.store);
-        let interval = SyncThresholds::LEAN.status_refresh_slots;
-        assert!(server.peer_heads.range_cooling_down(&liar, wall, interval));
+        assert!(
+            !server.outbound_requests.contains_key(&in_flight),
+            "its answer is not taken"
+        );
+        assert!(server.peer_heads.is_suspect(&liar));
+        // Its claims do not count, and its requests start nothing.
+        let unknown = H256::repeat_byte(0x11);
+        on_lean_status_request(&mut server, liar, &lean_status_at(unknown, 900)).await;
+        assert_eq!(server.store.network_head(), None);
+        assert!(server.range_sync_state.is_none());
 
         // The honest peer is synced from, starting at the head.
-        let unknown = H256::repeat_byte(0x11);
         on_lean_status_request(&mut server, honest, &lean_status_at(unknown, 500)).await;
         let state = server.range_sync_state.as_ref().expect("honest peer");
         assert_eq!(state.current_range.start, head + 1);
