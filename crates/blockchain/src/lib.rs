@@ -3659,7 +3659,7 @@ impl BlockChainServer {
     /// head at slot zero.
     fn judge_sync_status(&mut self, current_slot: u64, head_slot: Option<u64>) {
         // P2P reads the head slot from here rather than decoding the head.
-        self.store.set_head_slot_hint(head_slot);
+        self.store.set_judged_head_slot(head_slot);
         let head_slot = head_slot.unwrap_or(0);
         let past_followed_forks = self.store.chain() == Chain::Beacon
             && Self::clock_is_past_followed_forks(&self.store.config(), current_slot, head_slot);

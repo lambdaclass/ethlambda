@@ -2193,13 +2193,13 @@ impl RefreshStatus {
 
 impl P2PServer {
     /// The head slot: as the chain actor last published it
-    /// (`Store::head_slot_hint`), or read from the head while it publishes
+    /// (`Store::judged_head_slot`), or read from the head while it publishes
     /// none (before its first judgment, and while a beacon head names no
     /// stored block yet). On beacon, reading the head decodes the whole head
     /// block.
     pub(crate) fn head_slot(&self) -> u64 {
         self.store
-            .head_slot_hint()
+            .judged_head_slot()
             .unwrap_or_else(|| match self.store.chain() {
                 Chain::Lean => self.store.head_slot(),
                 Chain::Beacon => self.store.beacon_head().map_or(0, |(slot, _)| slot),
@@ -2331,9 +2331,8 @@ impl P2PServer {
         // serving the chain the head can follow, and is a suspect until the
         // head passes what it handed over.
         self.end_range_session();
-        for (peer, through) in self.head_watch.note_drop(head_slot, wall_slot) {
-            peer_heads::suspect(self, &peer, through, wall_slot);
-        }
+        let deliverers = self.head_watch.note_drop(head_slot, wall_slot);
+        peer_heads::suspect(self, deliverers, wall_slot);
     }
 
     /// End the range session, with its requests in flight: an answer to one
@@ -2391,7 +2390,7 @@ impl P2PServer {
         let status = RefreshStatus::build(self);
         for peer in peers {
             // One request in flight per peer: no refresh until this is over.
-            self.peer_heads.begin_status_request(peer);
+            self.peer_heads.begin_status_request(peer, wall_slot);
             match &status {
                 RefreshStatus::Beacon(v2) => {
                     let version = self.peer_heads.status_version(&peer);
@@ -2445,7 +2444,8 @@ async fn handle_swarm_event(
                 server.connected_peers.insert(peer_id, direction);
                 // Both chains send the handshake below; no refresh until it
                 // is answered or fails.
-                server.peer_heads.begin_status_request(peer_id);
+                let wall_slot = wall_clock_slot(&server.store);
+                server.peer_heads.begin_status_request(peer_id, wall_slot);
                 server.refresh_peer_metrics();
                 let peer_count = server.connected_peers.len();
                 metrics::notify_peer_connected(
@@ -4448,7 +4448,7 @@ mod tests {
         let status = server.beacon_status_v2().expect("a beacon node");
         assert_eq!(status.head_root, siblings[0]);
 
-        // Within the slot, and with the slot hint never set (nor would it
+        // Within the slot, and with the judged head slot never set (nor would it
         // change: the slot is the same).
         let head = ForkCheckpoints::head_only(siblings[1]);
         server.store.update_checkpoints(head).expect("reorg");

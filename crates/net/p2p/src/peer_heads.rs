@@ -99,6 +99,11 @@ const SUSPICION_WINDOWS: u64 = 4;
 /// head passes it, or for [`SUSPICION_WINDOWS`] stall windows.
 const SUSPECT_AFTER_FAILURES: u32 = 3;
 
+/// Refresh intervals after which a `Status` request still out is taken as
+/// lost; see `PeerHeads::awaiting_answer`. As long as a report counts
+/// (`SyncThresholds::report_lifetime`).
+const LOST_AFTER_INTERVALS: u64 = 4;
+
 /// Most doublings of a failed peer's cooldown: 8 refresh intervals (16 slots
 /// on lean, 128 on beacon). A slow honest peer that keeps timing out loses
 /// its lead for that long at most.
@@ -126,10 +131,15 @@ pub(crate) struct PeerHeads {
     /// while the handshake is (see [`Self::awaiting_answer`]), so the
     /// answers cannot arrive out of order.
     answered: HashSet<PeerId>,
-    /// Peers whose handshake `Status` is still out: neither answered nor
-    /// failed. They are not refreshed meanwhile, or a refresh answered before
-    /// a slow handshake answer would be taken for the handshake's.
-    awaiting_answer: HashSet<PeerId>,
+    /// Peers whose `Status` request (the handshake or a refresh) is still
+    /// out, neither answered nor failed, with the wall-clock slot it went out
+    /// at. They are not refreshed meanwhile, or a refresh answered before a
+    /// slow handshake answer would be taken for the handshake's. One out for
+    /// [`LOST_AFTER_INTERVALS`] refresh intervals is taken as lost: libp2p
+    /// ends a request long before that (its timeout is 10 s), so only one
+    /// that never went anywhere (the swarm closing under the send) is still
+    /// out by then, and it must not keep its peer from being asked again.
+    awaiting_answer: HashMap<PeerId, u64>,
     /// Each peer's failed range requests (an empty or refused answer, a
     /// timeout) since the head last reached blocks it handed over. A peer that has just failed is
     /// cooling down (see [`Self::range_cooling_down`]): it is not synced
@@ -320,13 +330,16 @@ impl PeerHeads {
         interval: u64,
     ) -> Vec<PeerId> {
         let interval = interval.max(1);
+        let awaiting = |asked: &u64| {
+            asked.saturating_add(interval.saturating_mul(LOST_AFTER_INTERVALS)) > wall_slot
+        };
         // The share is of the peers that can be asked: counting muted ones
         // (or ones awaiting an answer) would inflate it for the rest.
         let mut connected_count = 0usize;
         let mut due = Vec::new();
         for peer in connected {
             let last = *self.last_exchange.entry(peer).or_insert(wall_slot);
-            if self.awaiting_answer.contains(&peer) || self.muted.contains(&peer) {
+            if self.awaiting_answer.get(&peer).is_some_and(awaiting) || self.muted.contains(&peer) {
                 continue;
             }
             connected_count += 1;
@@ -408,14 +421,14 @@ impl PeerHeads {
     /// has gone out. No other is sent until it is over, so answers come back
     /// in the order the requests went out: a slow answer can neither be
     /// taken for the handshake's nor overwrite a newer one's head.
-    pub(crate) fn begin_status_request(&mut self, peer: PeerId) {
-        self.awaiting_answer.insert(peer);
+    pub(crate) fn begin_status_request(&mut self, peer: PeerId, wall_slot: u64) {
+        self.awaiting_answer.insert(peer, wall_slot);
     }
 
     /// Whether a `Status` request to `peer` is outstanding.
     #[cfg(test)]
     pub(crate) fn is_awaiting_answer(&self, peer: &PeerId) -> bool {
-        self.awaiting_answer.contains(peer)
+        self.awaiting_answer.contains_key(peer)
     }
 
     /// Note that `peer`'s outstanding `Status` request is over, answered or
@@ -501,9 +514,24 @@ pub(crate) fn observe(
             wall_slot,
             "Ignoring a Status head past the wall clock"
         );
+        // Nor is it synced from on what it claimed before.
+        leave_range_session(server, &peer);
     }
     publish(server);
     report
+}
+
+/// Take `peer` out of the range session, so no later batch goes to it on a
+/// head it merged in before; a request of its already out stays out. The
+/// session ends with no peer left, as on a failure.
+fn leave_range_session(server: &mut P2PServer, peer: &PeerId) {
+    let emptied = server.range_sync_state.as_mut().is_some_and(|state| {
+        state.peer_set.remove(peer);
+        state.peer_set.is_empty()
+    });
+    if emptied {
+        server.range_sync_state = None;
+    }
 }
 
 /// Forget a disconnected peer's head and republish the network head.
@@ -514,18 +542,26 @@ pub(crate) fn forget(server: &mut P2PServer, peer: &PeerId) {
 
 /// Drop `peer`'s claim and republish the network head, for a peer whose
 /// latest `Status` came from a fork digest this node does not sync from: its
-/// earlier report is not about the chain being followed any more.
+/// earlier report is not about the chain being followed any more, and
+/// neither is the head it joined the range session on.
 pub(crate) fn drop_claim(server: &mut P2PServer, peer: &PeerId) {
+    leave_range_session(server, peer);
     if server.peer_heads.drop_claim(peer) {
         publish(server);
     }
 }
 
-/// Make `peer` a suspect, as of `wall_slot`, for the blocks it handed over
-/// through slot `through` (see [`PeerHeads::suspects`]), and republish the
-/// network head without its claim.
-pub(crate) fn suspect(server: &mut P2PServer, peer: &PeerId, through: u64, wall_slot: u64) {
-    server.peer_heads.suspect(*peer, through, wall_slot);
+/// Make each `(peer, through)` a suspect, as of `wall_slot`, for the blocks
+/// it handed over through slot `through` (see [`PeerHeads::suspects`]), and
+/// republish the network head without their claims, once for them all.
+pub(crate) fn suspect(
+    server: &mut P2PServer,
+    suspects: impl IntoIterator<Item = (PeerId, u64)>,
+    wall_slot: u64,
+) {
+    for (peer, through) in suspects {
+        server.peer_heads.suspect(peer, through, wall_slot);
+    }
     publish(server);
 }
 
@@ -555,10 +591,16 @@ pub(crate) fn note_range_failure(server: &mut P2PServer, peer: &PeerId) {
     }
     let wall_slot = crate::wall_clock_slot(&server.store);
     server.peer_heads.note_range_failure(*peer, wall_slot);
+    // Suspected through the head it claims or, that claim gone (expired
+    // while the request was out), the one the range session planned towards.
+    let session_head = server
+        .range_sync_state
+        .as_ref()
+        .and_then(|state| state.peer_set.get(peer).copied());
     if server.peer_heads.failure_streak(peer) >= SUSPECT_AFTER_FAILURES
-        && let Some(claimed) = server.peer_heads.claimed_head(peer)
+        && let Some(through) = server.peer_heads.claimed_head(peer).or(session_head)
     {
-        server.peer_heads.suspect(*peer, claimed, wall_slot);
+        server.peer_heads.suspect(*peer, through, wall_slot);
     }
     publish(server);
 }
@@ -786,11 +828,25 @@ mod tests {
         // taken for the handshake's, and could start a one-block range sync.
         let mut heads = PeerHeads::default();
         let peer = PeerId::random();
-        heads.begin_status_request(peer);
+        heads.begin_status_request(peer, 10);
         heads.due_for_refresh([peer], 10, 4);
         assert!(heads.due_for_refresh([peer], 20, 4).is_empty());
         heads.end_status_request(&peer);
         assert_eq!(heads.due_for_refresh([peer], 20, 4), vec![peer]);
+    }
+
+    #[test]
+    fn a_status_request_that_never_ends_is_taken_as_lost() {
+        // Finding: a request whose send went nowhere raised no failure, so
+        // its peer stayed awaiting an answer, and was never asked again for
+        // the rest of the connection.
+        let mut heads = PeerHeads::default();
+        let peer = PeerId::random();
+        heads.due_for_refresh([peer], 10, 4);
+        heads.begin_status_request(peer, 10);
+        let lost_at = 10 + LOST_AFTER_INTERVALS * 4;
+        assert!(heads.due_for_refresh([peer], lost_at - 1, 4).is_empty());
+        assert_eq!(heads.due_for_refresh([peer], lost_at, 4), vec![peer]);
     }
 
     #[test]

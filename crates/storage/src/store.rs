@@ -255,7 +255,7 @@ impl Chain {
 const STATE_CACHE_CAPACITY: usize = 32;
 
 /// The marker for an unset slot: [`Store::network_head`] with no peer
-/// reporting, and [`Store::head_slot_hint`] before the chain actor's first
+/// reporting, and [`Store::judged_head_slot`] before the chain actor's first
 /// judgment. No slot reaches it.
 ///
 /// No report can be this slot: P2P drops a head more than a slot past the
@@ -1213,8 +1213,8 @@ pub struct Store {
     network_head: Arc<AtomicU64>,
     /// The head slot as the chain actor last judged the sync gate at, or
     /// [`UNSET_SLOT`] before its first judgment. Written by the chain
-    /// actor, read by P2P; see [`Store::head_slot_hint`].
-    head_slot_hint: Arc<AtomicU64>,
+    /// actor, read by P2P; see [`Store::judged_head_slot`].
+    judged_head_slot: Arc<AtomicU64>,
     /// The total active balance per epoch, shared the way
     /// [`Self::committee_cache`] is: by the chain actor's state transition
     /// and anything else holding a `Store` clone. See
@@ -1866,7 +1866,7 @@ impl Store {
             committee_cache: Arc::new(CommitteeCache::default()),
             observed_liveness: Arc::new(ObservedLiveness::default()),
             network_head: Arc::new(AtomicU64::new(UNSET_SLOT)),
-            head_slot_hint: Arc::new(AtomicU64::new(UNSET_SLOT)),
+            judged_head_slot: Arc::new(AtomicU64::new(UNSET_SLOT)),
             active_balance_cache: Arc::new(ActiveBalanceCache::default()),
             beacon: Default::default(),
             state_writer,
@@ -3347,17 +3347,17 @@ impl Store {
     /// every head change on beacon; on lean the tick judges before it may
     /// move the head, so it can trail the head by an interval. Runtime-only
     /// and shared by every clone of this `Store`.
-    pub fn head_slot_hint(&self) -> Option<u64> {
-        let slot = self.head_slot_hint.load(Ordering::Relaxed);
+    pub fn judged_head_slot(&self) -> Option<u64> {
+        let slot = self.judged_head_slot.load(Ordering::Relaxed);
         (slot != UNSET_SLOT).then_some(slot)
     }
 
     /// Publish the head slot, `None` for no head; see
-    /// [`Self::head_slot_hint`]. The chain actor is the only writer.
-    pub fn set_head_slot_hint(&self, slot: Option<u64>) {
+    /// [`Self::judged_head_slot`]. The chain actor is the only writer.
+    pub fn set_judged_head_slot(&self, slot: Option<u64>) {
         // A slot at the sentinel would read back as no head: clamp it.
         let slot = slot.map_or(UNSET_SLOT, |slot| slot.min(UNSET_SLOT - 1));
-        self.head_slot_hint.store(slot, Ordering::Relaxed);
+        self.judged_head_slot.store(slot, Ordering::Relaxed);
     }
 
     /// The total-active-balance cache shared by every clone of this store.

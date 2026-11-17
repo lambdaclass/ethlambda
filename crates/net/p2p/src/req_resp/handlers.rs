@@ -538,32 +538,9 @@ pub async fn handle_req_resp_message(
                         error,
                         request_response::OutboundFailure::UnsupportedProtocols
                     );
-                    if request_id.protocol == ReqRespProtocol::BeaconStatusV2
-                        && unsupported
-                        && server.connected_peers.contains_key(&peer)
-                    {
-                        // A peer asked in `status/2` either answered in it
-                        // before (and has dropped it) or refused `status/1`
-                        // just now: on a peer last noted as `status/1`, both
-                        // are refused, and refreshing it is pointless.
-                        if server.peer_heads.status_version(&peer) == StatusVersion::V1 {
-                            server.peer_heads.mute(peer);
-                        } else {
-                            server
-                                .peer_heads
-                                .note_status_version(peer, StatusVersion::V1);
-                        }
-                    }
-                    if request_id.protocol == ReqRespProtocol::BeaconStatusV1
-                        && unsupported
-                        && server.connected_peers.contains_key(&peer)
-                    {
+                    if on_status_failure(server, peer, request_id.protocol, unsupported) {
                         // The handshake goes on, on `status/2`.
                         crate::beacon::handler::retry_status_on_other_version(server, peer).await;
-                    } else if is_status_protocol(request_id.protocol) {
-                        // A handshake that failed is over: the refresh takes
-                        // its place. A failed refresh changes nothing here.
-                        server.peer_heads.end_status_request(&peer);
                     }
                 }
             }
@@ -1658,6 +1635,41 @@ fn columns_without_known_custodian(server: &P2PServer, columns: &[u64]) -> Vec<u
         .copied()
         .filter(|&column| columns_custodied_by(server, column).is_empty())
         .collect()
+}
+
+/// Act on a failed untracked request to `peer` over `protocol`, where
+/// `unsupported` says the peer refused the protocol outright. Only a `Status`
+/// request is acted on. Returns whether to retry the handshake on
+/// `status/2`, which leaves it out; any other failure of a `Status` request
+/// ends it.
+fn on_status_failure(
+    server: &mut P2PServer,
+    peer: PeerId,
+    protocol: ReqRespProtocol,
+    unsupported: bool,
+) -> bool {
+    let refused = unsupported && server.connected_peers.contains_key(&peer);
+    if protocol == ReqRespProtocol::BeaconStatusV2 && refused {
+        // A peer asked in `status/2` either answered in it before (and has
+        // dropped it) or refused `status/1` just now: on a peer last noted as
+        // `status/1`, both are refused, and refreshing it is pointless.
+        if server.peer_heads.status_version(&peer) == StatusVersion::V1 {
+            server.peer_heads.mute(peer);
+        } else {
+            server
+                .peer_heads
+                .note_status_version(peer, StatusVersion::V1);
+        }
+    }
+    if protocol == ReqRespProtocol::BeaconStatusV1 && refused {
+        return true;
+    }
+    if is_status_protocol(protocol) {
+        // A handshake that failed is over: the refresh takes its place. A
+        // failed refresh changes nothing here.
+        server.peer_heads.end_status_request(&peer);
+    }
+    false
 }
 
 /// Count a failed range request against `peer` (a cooldown, and suspicion
@@ -3670,6 +3682,92 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_peer_whose_claim_lapsed_is_suspected_through_its_session_head() {
+        // Finding: a peer whose claim expired while its third failing
+        // request was out escaped suspicion, there being no head to suspect
+        // it through.
+        let mut server = unconnected_server().await;
+        let peer = connected_peer(&mut server);
+        let unknown = H256::repeat_byte(0x11);
+        on_lean_status_request(&mut server, peer, &lean_status_at(unknown, 500)).await;
+        fail_range_request(&mut server, &peer);
+        fail_range_request(&mut server, &peer);
+        server.range_sync_state = Some(RangeSyncState::new(1..500, peer, 500));
+        server.peer_heads.expire(u64::MAX, 0);
+        assert_eq!(server.peer_heads.claimed_head(&peer), None);
+        fail_range_request(&mut server, &peer);
+        assert!(server.peer_heads.is_suspect(&peer));
+    }
+
+    #[tokio::test]
+    async fn a_peer_whose_claim_is_dropped_leaves_the_range_session() {
+        // Finding: a peer whose claim was dropped (a head past the clock, a
+        // digest this node does not sync from) stayed in the range session,
+        // where the next batch could still go to it on the head it merged
+        // in before.
+        let mut server = unconnected_server().await;
+        let peer = connected_peer(&mut server);
+        let unknown = H256::repeat_byte(0x11);
+        on_lean_status_request(&mut server, peer, &lean_status_at(unknown, 500)).await;
+        assert!(server.range_sync_state.is_some());
+        let future = crate::wall_clock_slot(&server.store) + 100;
+        on_lean_status_request(&mut server, peer, &lean_status_at(unknown, future)).await;
+        assert!(server.range_sync_state.is_none());
+
+        on_lean_status_request(&mut server, peer, &lean_status_at(unknown, 500)).await;
+        assert!(server.range_sync_state.is_some());
+        peer_heads::drop_claim(&mut server, &peer);
+        assert!(server.range_sync_state.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_peer_refusing_both_status_versions_is_no_longer_refreshed() {
+        let mut server = crate::test_support::unconnected_beacon_server(Config::mainnet(), 0).await;
+        let peer = connected_peer(&mut server);
+        server.peer_heads.due_for_refresh([peer], 10, 2);
+        server.peer_heads.begin_status_request(peer, 10);
+        // The handshake opens on `status/1`. Refused, it goes on on
+        // `status/2`, still out.
+        let v1 = ReqRespProtocol::BeaconStatusV1;
+        assert!(on_status_failure(&mut server, peer, v1, true));
+        assert!(server.peer_heads.is_awaiting_answer(&peer));
+        // Refused too: the handshake is over, and the peer is not asked again.
+        let v2 = ReqRespProtocol::BeaconStatusV2;
+        assert!(!on_status_failure(&mut server, peer, v2, true));
+        assert!(!server.peer_heads.is_awaiting_answer(&peer));
+        assert!(
+            server
+                .peer_heads
+                .due_for_refresh([peer], 1_000, 2)
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_drops_status_2_is_asked_in_status_1() {
+        let mut server = crate::test_support::unconnected_beacon_server(Config::mainnet(), 0).await;
+        let peer = connected_peer(&mut server);
+        server.peer_heads.due_for_refresh([peer], 10, 2);
+        server
+            .peer_heads
+            .note_status_version(peer, StatusVersion::V2);
+        server.peer_heads.begin_status_request(peer, 10);
+        let v2 = ReqRespProtocol::BeaconStatusV2;
+        assert!(!on_status_failure(&mut server, peer, v2, true));
+        assert_eq!(server.peer_heads.status_version(&peer), StatusVersion::V1);
+        assert_eq!(
+            server.peer_heads.due_for_refresh([peer], 1_000, 2),
+            vec![peer]
+        );
+        // A failure other than a refusal (a timeout) only ends the request.
+        server.peer_heads.begin_status_request(peer, 1_000);
+        let v1 = ReqRespProtocol::BeaconStatusV1;
+        assert!(!on_status_failure(&mut server, peer, v1, false));
+        assert!(!server.peer_heads.is_awaiting_answer(&peer));
+        assert_eq!(server.peer_heads.status_version(&peer), StatusVersion::V1);
+    }
+
+    #[tokio::test]
     async fn a_peer_that_keeps_failing_becomes_a_suspect_for_its_claim() {
         // Finding: a cooldown runs out, and with the head moving on by gossip
         // each return of the claim started the stall window over, so a peer
@@ -3833,7 +3931,7 @@ pub(crate) mod tests {
         // `INVALID` cut) left the watermark above it, so the cut-out range
         // was never asked for again from the branch the head now follows.
         let mut server = unconnected_server().await;
-        server.store.set_head_slot_hint(Some(100));
+        server.store.set_judged_head_slot(Some(100));
         server.range_fetched_through = 100;
         server.expire_range_watermark(200);
         assert_eq!(server.range_fetched_through, 100);
@@ -3841,7 +3939,7 @@ pub(crate) mod tests {
         let peer = connected_peer(&mut server);
         server.range_sync_state = Some(RangeSyncState::new(101..200, peer, 200));
         server.head_watch.note_delivery(peer, 100);
-        server.store.set_head_slot_hint(Some(90));
+        server.store.set_judged_head_slot(Some(90));
         server.expire_range_watermark(201);
         assert_eq!(server.range_fetched_through, 90);
         // The session goes, its cursor being past the cut-out span, and the
