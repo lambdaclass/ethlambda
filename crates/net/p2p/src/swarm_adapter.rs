@@ -486,6 +486,9 @@ fn disconnect_slow_peers(swarm: &mut libp2p::Swarm<Behaviour>, slow_peers: &mut 
         );
     }
     for (peer_id, failed) in disconnect {
+        // `Err` only means the peer had no connection left, so there is no
+        // queue to free and nothing to retry; its streak is gone, which is
+        // right for a peer that reconnects with a fresh handler.
         if swarm.disconnect_peer_id(peer_id).is_ok() {
             metrics::inc_gossipsub_slow_peer_disconnects();
             info!(
