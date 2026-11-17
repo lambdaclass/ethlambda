@@ -484,8 +484,9 @@ pub(crate) struct HeadWatch {
     /// that a whole window of deliveries has not moved the head with are not
     /// importing, however many more keep coming.
     delivering_since: Option<u64>,
-    /// The peers that handed blocks over since the head last moved.
-    deliverers: HashSet<PeerId>,
+    /// The peers that handed blocks over since the head last moved, each with
+    /// the highest slot it handed over.
+    deliverers: HashMap<PeerId, u64>,
     /// Watermark drops at the current head, each of which doubles the wait
     /// before the next one.
     drops: u32,
@@ -521,14 +522,10 @@ impl HeadWatch {
         wall_slot.saturating_sub(since)
     }
 
-    /// The head slot last seen.
-    pub(crate) fn head(&self) -> Option<u64> {
-        self.seen.map(|(head_slot, _)| head_slot)
-    }
-
-    /// Note that `peer` handed blocks over.
-    pub(crate) fn note_delivery(&mut self, peer: PeerId) {
-        self.deliverers.insert(peer);
+    /// Note that `peer` handed blocks over, through slot `through`.
+    pub(crate) fn note_delivery(&mut self, peer: PeerId, through: u64) {
+        let highest = self.deliverers.entry(peer).or_insert(through);
+        *highest = (*highest).max(through);
     }
 
     /// How long the head must stay flat before the next drop: `window`,
@@ -544,8 +541,8 @@ impl HeadWatch {
 
     /// Note a drop of the watermark to `head_slot` at `wall_slot`, starting
     /// the count over, and return the peers that handed blocks over since
-    /// the head last moved.
-    pub(crate) fn note_drop(&mut self, head_slot: u64, wall_slot: u64) -> Vec<PeerId> {
+    /// the head last moved, each with the highest slot it handed over.
+    pub(crate) fn note_drop(&mut self, head_slot: u64, wall_slot: u64) -> Vec<(PeerId, u64)> {
         self.seen = Some((head_slot, wall_slot));
         self.delivering_since = None;
         self.watermark = head_slot;
@@ -2124,7 +2121,8 @@ impl P2PServer {
     /// them that has not moved the head is not importing. A head that is
     /// still importing moves. On a drop, the session running ends with its
     /// batch in flight, and the peers that handed blocks over since the head
-    /// last moved become suspects until it moves (see `PeerHeads::suspects`). Each drop at the same head
+    /// last moved become suspects until the head passes what they handed
+    /// over (see `PeerHeads::suspects`). Each drop at the same head
     /// doubles the wait before the next one, so a head that cannot move at
     /// all re-fetches the gap ever more rarely.
     pub(crate) fn expire_range_watermark(&mut self, wall_slot: u64) {
@@ -2138,11 +2136,8 @@ impl P2PServer {
         // two).
         let watermark_moved = self.head_watch.watermark_moved(self.range_fetched_through);
         let delivering = self.range_sync_state.is_some() || watermark_moved;
-        // A head that moved clears the suspects: what they handed over may
-        // have been what moved it, and either way it is a new position.
-        if self.head_watch.head() != Some(head_slot) {
-            peer_heads::clear_suspects(self);
-        }
+        // Suspects the head has passed, or that have served their time.
+        peer_heads::clear_suspects(self, head_slot, wall_slot);
         let flat_for = self.head_watch.flat_for(head_slot, wall_slot, delivering);
         let window = peer_heads::thresholds(&self.store).stall_window;
         if self.range_fetched_through <= head_slot || flat_for <= self.head_watch.patience(window) {
@@ -2157,14 +2152,20 @@ impl P2PServer {
         self.range_fetched_through = head_slot;
         // A session still running is fetching past blocks that never
         // imported, and its batch in flight would raise the watermark again:
-        // both go, and an answer to that batch now matches no request.
-        // Whoever handed the blocks over was not serving the chain the head
-        // can follow, and is a suspect until the head moves.
+        // both go, and an answer to that batch now matches no request (its
+        // envelope request too, or its answer would release a later
+        // session's batch early). Whoever handed the blocks over was not
+        // serving the chain the head can follow, and is a suspect until the
+        // head passes what it handed over.
         self.range_sync_state = None;
-        self.outbound_requests
-            .retain(|_, kind| !matches!(kind, PendingRequestKind::Range { .. }));
-        for peer in self.head_watch.note_drop(head_slot, wall_slot) {
-            peer_heads::suspect(self, &peer);
+        self.outbound_requests.retain(|_, kind| {
+            !matches!(
+                kind,
+                PendingRequestKind::Range { .. } | PendingRequestKind::EnvelopeRange { .. }
+            )
+        });
+        for (peer, through) in self.head_watch.note_drop(head_slot, wall_slot) {
+            peer_heads::suspect(self, &peer, through);
         }
     }
 

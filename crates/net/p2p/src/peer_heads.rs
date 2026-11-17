@@ -77,6 +77,20 @@ struct RangeFailures {
     streak: u32,
 }
 
+/// Why a peer is a suspect: the highest slot it handed over that the head
+/// did not reach, and the wall-clock slot it became one at.
+#[derive(Debug, Clone, Copy)]
+struct Suspicion {
+    through: u64,
+    since: u64,
+}
+
+/// Stall windows a peer stays a suspect for at most, if the head never
+/// passes what it handed over: an execution client that was down while an
+/// honest peer's blocks were handed over must not keep that peer out for
+/// good.
+const SUSPICION_WINDOWS: u64 = 4;
+
 /// Most doublings of a failed peer's cooldown: 8 refresh intervals (16 slots
 /// on lean, 128 on beacon). A slow honest peer that keeps timing out loses
 /// its lead for that long at most.
@@ -124,9 +138,12 @@ pub(crate) struct PeerHeads {
     /// Peers whose range blocks left the head where it was for a whole window
     /// (see `P2PServer::expire_range_watermark`). Like a peer cooling down,
     /// they are not synced towards and their claims do not count, but until
-    /// the head next moves rather than for a time, and no later answer of
+    /// the head passes the highest slot they handed over (or
+    /// [`SUSPICION_WINDOWS`] stall windows pass), and no later answer of
     /// theirs clears it: they were not serving a chain the head can follow.
-    suspects: HashSet<PeerId>,
+    /// Kept across a reconnect, which would otherwise shed it, and dropped
+    /// only on those two conditions, which also bound how many are held.
+    suspects: HashMap<PeerId, Suspicion>,
     /// The wall-clock slot of each connected peer's last `Status` request
     /// that was acted on: at most one a slot (see [`Self::inbound_due`]).
     inbound_at: HashMap<PeerId, u64>,
@@ -188,7 +205,6 @@ impl PeerHeads {
         self.awaiting_handshake.remove(peer);
         self.inbound_at.remove(peer);
         self.range_failures.remove(peer);
-        self.suspects.remove(peer);
         self.last_exchange.remove(peer);
         self.foreign_digest.remove(peer);
         self.status_versions.remove(peer);
@@ -201,14 +217,25 @@ impl PeerHeads {
         self.heads
             .iter()
             .filter(|(peer, _)| !self.range_cooling_down(peer, wall_slot, interval))
-            .filter(|(peer, _)| !self.suspects.contains(peer))
+            .filter(|(peer, _)| !self.suspects.contains_key(peer))
             .map(|(_, claim)| claim.head_slot)
             .max()
     }
 
     /// Whether `peer` is a suspect (see [`Self::suspects`]).
     pub(crate) fn is_suspect(&self, peer: &PeerId) -> bool {
-        self.suspects.contains(peer)
+        self.suspects.contains_key(peer)
+    }
+
+    /// Clear the suspects the head at `head_slot` has passed, or that have
+    /// been suspects for `lifetime` slots at `wall_slot`. Returns whether any
+    /// was cleared.
+    pub(crate) fn clear_suspects(&mut self, head_slot: u64, wall_slot: u64, lifetime: u64) -> bool {
+        let before = self.suspects.len();
+        self.suspects.retain(|_, suspicion| {
+            head_slot < suspicion.through && suspicion.since.saturating_add(lifetime) > wall_slot
+        });
+        self.suspects.len() != before
     }
 
     /// Drop `peer`'s claim, returning whether it had one.
@@ -395,20 +422,32 @@ pub(crate) fn drop_claim(server: &mut P2PServer, peer: &PeerId) {
     }
 }
 
-/// Make `peer` a suspect until the head next moves (see
-/// [`PeerHeads::suspects`]), and republish the network head without its
-/// claim. Only while it is connected, as for a failure.
-pub(crate) fn suspect(server: &mut P2PServer, peer: &PeerId) {
-    if server.connected_peers.contains_key(peer) && server.peer_heads.suspects.insert(*peer) {
-        publish(server);
-    }
+/// Make `peer` a suspect for the blocks it handed over through slot
+/// `through` (see [`PeerHeads::suspects`]), and republish the network head
+/// without its claim.
+pub(crate) fn suspect(server: &mut P2PServer, peer: &PeerId, through: u64) {
+    let since = crate::wall_clock_slot(&server.store);
+    let suspicion = server
+        .peer_heads
+        .suspects
+        .entry(*peer)
+        .or_insert(Suspicion { through, since });
+    suspicion.through = suspicion.through.max(through);
+    suspicion.since = since;
+    publish(server);
 }
 
-/// Clear every suspect, the head having moved, and republish the network
-/// head with their claims.
-pub(crate) fn clear_suspects(server: &mut P2PServer) {
-    if !server.peer_heads.suspects.is_empty() {
-        server.peer_heads.suspects.clear();
+/// Clear the suspects the head at `head_slot` has passed or that have served
+/// their time at `wall_slot`, republishing the network head with their
+/// claims if any was.
+pub(crate) fn clear_suspects(server: &mut P2PServer, head_slot: u64, wall_slot: u64) {
+    let lifetime = thresholds(&server.store)
+        .stall_window
+        .saturating_mul(SUSPICION_WINDOWS);
+    if server
+        .peer_heads
+        .clear_suspects(head_slot, wall_slot, lifetime)
+    {
         publish(server);
     }
 }
@@ -679,6 +718,39 @@ mod tests {
         heads.note_range_success(&peer);
         heads.note_range_failure(peer, 300);
         assert!(!heads.range_cooling_down(&peer, 302, 2));
+    }
+
+    #[test]
+    fn a_suspect_is_cleared_once_the_head_passes_what_it_handed_over_or_its_time_is_up() {
+        let mut heads = PeerHeads::default();
+        let peer = PeerId::random();
+        heads.record(peer, 500, 100, false);
+        heads.suspects.insert(
+            peer,
+            Suspicion {
+                through: 300,
+                since: 100,
+            },
+        );
+        assert_eq!(heads.network_head(100, 2), None);
+        // A head that moved, but not past what it handed over.
+        assert!(!heads.clear_suspects(250, 110, 64));
+        // A reconnect does not shed it.
+        heads.forget(&peer);
+        assert!(heads.is_suspect(&peer));
+        // Past it: cleared.
+        assert!(heads.clear_suspects(300, 120, 64));
+        assert!(!heads.is_suspect(&peer));
+        // Or once its time is up, the head never getting there.
+        heads.suspects.insert(
+            peer,
+            Suspicion {
+                through: 300,
+                since: 100,
+            },
+        );
+        assert!(!heads.clear_suspects(0, 163, 64));
+        assert!(heads.clear_suspects(0, 164, 64));
     }
 
     #[test]

@@ -962,7 +962,7 @@ async fn handle_lean_blocks_by_range_response(
         return;
     };
 
-    let mut handed_over_any = false;
+    let mut handed_over_through: Option<u64> = None;
     for block in blocks {
         let slot = block.message.slot;
         let block_root = block.message.hash_tree_root();
@@ -977,7 +977,7 @@ async fn handle_lean_blocks_by_range_response(
             // `range_sync_target`.
             Ok(_) => {
                 server.range_fetched_through = server.range_fetched_through.max(slot);
-                handed_over_any = true;
+                handed_over_through = Some(handed_over_through.map_or(slot, |max| max.max(slot)));
             }
             Err(err) => error!(
                 %err, %slot, %peer,
@@ -989,9 +989,9 @@ async fn handle_lean_blocks_by_range_response(
 
     // A success only once something reached the chain actor; whether it
     // imports is judged later, by the head (see `expire_range_watermark`).
-    if handed_over_any {
+    if let Some(through) = handed_over_through {
         server.peer_heads.note_range_success(&peer);
-        server.head_watch.note_delivery(peer);
+        server.head_watch.note_delivery(peer, through);
     }
     if let Some(state) = &mut server.range_sync_state {
         state.complete_batch(end_slot);
@@ -2902,7 +2902,7 @@ async fn handle_beacon_blocks_by_range_response(
     if let Some(highest) = highest_forwarded_slot {
         server.range_fetched_through = server.range_fetched_through.max(highest);
         server.peer_heads.note_range_success(&peer);
-        server.head_watch.note_delivery(peer);
+        server.head_watch.note_delivery(peer, highest);
     }
     if let Some(state) = &mut server.range_sync_state {
         state.complete_batch(end_slot);
@@ -3687,7 +3687,7 @@ pub(crate) mod tests {
         assert_eq!(watch.flat_for(4, 100, false), 0);
         // A drop hands back who delivered; each drop at a head doubles the
         // wait, and moving resets it.
-        watch.note_delivery(PeerId::random());
+        watch.note_delivery(PeerId::random(), 200);
         assert_eq!(watch.patience(16), 16);
         assert_eq!(watch.note_drop(4, 110).len(), 1);
         assert_eq!(watch.patience(16), 32);
@@ -3768,7 +3768,9 @@ pub(crate) mod tests {
         // A batch every slot, none of which moves the head.
         for (batch, wall) in (100..=101 + window).enumerate() {
             server.range_fetched_through = 100 * (batch as u64 + 1);
-            server.head_watch.note_delivery(liar);
+            server
+                .head_watch
+                .note_delivery(liar, server.range_fetched_through);
             server.expire_range_watermark(wall);
         }
         let head = server.store.head_slot();
