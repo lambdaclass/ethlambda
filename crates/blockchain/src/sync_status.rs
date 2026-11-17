@@ -106,7 +106,8 @@ pub(crate) struct SyncStatusTracker {
     /// Invariants, with [`Self::lapsed_at`]: `counted_at` is `None` only
     /// while nothing was judged behind since the window last started over,
     /// and `behind_for` is then zero; `lapsed_at` is `Some` only while the
-    /// latest judgment was not behind, and the next behind judgment takes it.
+    /// latest judgment was not behind on the peers' word (it may have been on
+    /// the clock's), and the next judgment that is takes it.
     counted_at: Option<u64>,
     /// The wall-clock slot from which no judgment has found the node behind
     /// on its peers' word, while that lasts. A lapse longer than the stall
