@@ -100,6 +100,7 @@ const MAX_COOLDOWN_DOUBLINGS: u32 = 3;
 #[derive(Debug, Clone, Copy)]
 struct Claim {
     head_slot: u64,
+    root: H256,
     reported_at: u64,
 }
 
@@ -122,7 +123,7 @@ pub(crate) struct PeerHeads {
     /// a slow handshake answer would be taken for the handshake's.
     awaiting_handshake: HashSet<PeerId>,
     /// Each peer's failed range requests (an empty or refused answer, a
-    /// timeout) since its last successful one. A peer that has just failed is
+    /// timeout) since the head last reached blocks it handed over. A peer that has just failed is
     /// cooling down (see [`Self::range_cooling_down`]): it is not synced
     /// towards, and its claim does not count towards the network head, for a
     /// refresh interval doubled for every further failure in a row.
@@ -169,6 +170,7 @@ impl PeerHeads {
         &mut self,
         peer: PeerId,
         head_slot: u64,
+        root: H256,
         wall_slot: u64,
         held: bool,
     ) -> Report {
@@ -183,6 +185,7 @@ impl PeerHeads {
         }
         let claim = Claim {
             head_slot,
+            root,
             reported_at: wall_slot,
         };
         self.heads.insert(peer, claim);
@@ -220,14 +223,28 @@ impl PeerHeads {
 
     /// The network's head as the peers report it: the highest counted report
     /// from a peer not cooling down from a failed range request (see
-    /// [`Self::range_cooling_down`]), `None` with none at all.
+    /// [`Self::range_cooling_down`]), `None` with none at all. What `publish`
+    /// computes, less its check against the blocks this node holds.
+    #[cfg(test)]
     pub(crate) fn network_head(&self, wall_slot: u64, interval: u64) -> Option<u64> {
+        self.top_claim(wall_slot, interval)
+            .map(|(_, head_slot, _)| head_slot)
+    }
+
+    /// The claim [`Self::network_head`] reads: the highest that counts, with
+    /// its peer and root.
+    fn top_claim(&self, wall_slot: u64, interval: u64) -> Option<(PeerId, u64, H256)> {
         self.heads
             .iter()
             .filter(|(peer, _)| !self.range_cooling_down(peer, wall_slot, interval))
             .filter(|(peer, _)| !self.suspects.contains_key(peer))
-            .map(|(_, claim)| claim.head_slot)
-            .max()
+            .max_by_key(|(_, claim)| claim.head_slot)
+            .map(|(peer, claim)| (*peer, claim.head_slot, claim.root))
+    }
+
+    /// Whether any peer is a suspect.
+    pub(crate) fn has_suspects(&self) -> bool {
+        !self.suspects.is_empty()
     }
 
     /// Whether `peer` is a suspect (see [`Self::suspects`]).
@@ -313,8 +330,8 @@ impl PeerHeads {
         failures.streak = failures.streak.saturating_add(1);
     }
 
-    /// Note that `peer` answered a range request with blocks, ending its run
-    /// of failures.
+    /// Note that the head reached blocks `peer` handed over, ending its run of
+    /// failures.
     pub(crate) fn note_range_success(&mut self, peer: &PeerId) {
         self.range_failures.remove(peer);
     }
@@ -409,7 +426,9 @@ pub(crate) fn observe(
     }
     let wall_slot = crate::wall_clock_slot(&server.store);
     let held = holds_block(&server.store, &head_root);
-    let report = server.peer_heads.record(peer, head_slot, wall_slot, held);
+    let report = server
+        .peer_heads
+        .record(peer, head_slot, head_root, wall_slot, held);
     if report == Report::Future {
         debug!(
             %peer,
@@ -420,13 +439,6 @@ pub(crate) fn observe(
     }
     publish(server);
     report
-}
-
-/// Republish the network head as of now, which drops reports past their
-/// lifetime (see `publish`): run once a slot, since a report or a cooldown
-/// running out changes the network head with nothing else happening.
-pub(crate) fn refresh(server: &mut P2PServer) {
-    publish(server);
 }
 
 /// Forget a disconnected peer's head and republish the network head.
@@ -483,19 +495,30 @@ pub(crate) fn note_range_failure(server: &mut P2PServer, peer: &PeerId) {
 }
 
 /// Publish the network head as of now, dropping reports past their lifetime
-/// first, so no path republishes one between the refresh timer's ticks.
-fn publish(server: &mut P2PServer) {
+/// first, so no path republishes one between the refresh timer's ticks. Run
+/// once a slot too, since a report or a cooldown running out changes the
+/// network head with nothing else happening.
+///
+/// A claim whose head this node has imported since it arrived (a block
+/// fetched by root, a lighter branch imported later) is no lead any more, and
+/// is dropped here rather than counting until the peer's next `Status`.
+/// Checked from the top, so a publish normally costs one lookup.
+pub(crate) fn publish(server: &mut P2PServer) {
     let wall_slot = crate::wall_clock_slot(&server.store);
     let thresholds = thresholds(&server.store);
+    let interval = thresholds.status_refresh_slots;
     server
         .peer_heads
         .expire(wall_slot, thresholds.report_lifetime());
-    server
-        .peer_heads
-        .prune_range_failures(wall_slot, thresholds.status_refresh_slots);
-    let network_head = server
-        .peer_heads
-        .network_head(wall_slot, thresholds.status_refresh_slots);
+    server.peer_heads.prune_range_failures(wall_slot, interval);
+    let network_head = loop {
+        match server.peer_heads.top_claim(wall_slot, interval) {
+            Some((peer, _, root)) if holds_block(&server.store, &root) => {
+                server.peer_heads.drop_claim(&peer);
+            }
+            top => break top.map(|(_, head_slot, _)| head_slot),
+        }
+    };
     server.store.set_network_head(network_head);
 }
 
@@ -514,8 +537,8 @@ mod tests {
     fn the_highest_report_counts() {
         // A stale or still-syncing peer does not veto a fresher one.
         let mut heads = PeerHeads::default();
-        heads.record(PeerId::random(), 100, 100, false);
-        heads.record(PeerId::random(), 40, 100, false);
+        heads.record(PeerId::random(), 100, H256::ZERO, 100, false);
+        heads.record(PeerId::random(), 40, H256::ZERO, 100, false);
         assert_eq!(heads.network_head(0, 1), Some(100));
     }
 
@@ -526,9 +549,9 @@ mod tests {
         // one peer that is current; the sync tracker's stall window is what
         // bounds a single peer that lies.
         let mut heads = PeerHeads::default();
-        heads.record(PeerId::random(), 600, 600, false);
-        heads.record(PeerId::random(), 50, 600, false);
-        heads.record(PeerId::random(), 50, 600, false);
+        heads.record(PeerId::random(), 600, H256::ZERO, 600, false);
+        heads.record(PeerId::random(), 50, H256::ZERO, 600, false);
+        heads.record(PeerId::random(), 50, H256::ZERO, 600, false);
         assert_eq!(heads.network_head(0, 1), Some(600));
     }
 
@@ -539,12 +562,15 @@ mod tests {
         // them.
         let mut heads = PeerHeads::default();
         let on_lighter_fork = PeerId::random();
-        assert_eq!(heads.record(on_lighter_fork, 110, 110, true), Report::Held);
+        assert_eq!(
+            heads.record(on_lighter_fork, 110, H256::ZERO, 110, true),
+            Report::Held
+        );
         assert_eq!(heads.network_head(0, 1), None);
         // A peer that had reported an unknown head is dropped once its head is
         // one we hold.
-        heads.record(on_lighter_fork, 109, 110, false);
-        heads.record(on_lighter_fork, 110, 110, true);
+        heads.record(on_lighter_fork, 109, H256::ZERO, 110, false);
+        heads.record(on_lighter_fork, 110, H256::ZERO, 110, true);
         assert_eq!(heads.network_head(0, 1), None);
     }
 
@@ -552,13 +578,22 @@ mod tests {
     fn a_head_past_the_clock_is_dropped_with_the_peers_earlier_report() {
         let mut heads = PeerHeads::default();
         let liar = PeerId::random();
-        assert_eq!(heads.record(liar, 90, 100, false), Report::Counted);
         assert_eq!(
-            heads.record(liar, 100 + FUTURE_HEAD_TOLERANCE, 100, false),
+            heads.record(liar, 90, H256::ZERO, 100, false),
             Report::Counted
         );
         assert_eq!(
-            heads.record(liar, 100 + FUTURE_HEAD_TOLERANCE + 1, 100, false),
+            heads.record(liar, 100 + FUTURE_HEAD_TOLERANCE, H256::ZERO, 100, false),
+            Report::Counted
+        );
+        assert_eq!(
+            heads.record(
+                liar,
+                100 + FUTURE_HEAD_TOLERANCE + 1,
+                H256::ZERO,
+                100,
+                false
+            ),
             Report::Future
         );
         assert_eq!(heads.network_head(0, 1), None);
@@ -569,8 +604,8 @@ mod tests {
         // Latest, not highest: a peer that reorged to a lower head is believed.
         let mut heads = PeerHeads::default();
         let peer = PeerId::random();
-        heads.record(peer, 100, 100, false);
-        heads.record(peer, 95, 100, false);
+        heads.record(peer, 100, H256::ZERO, 100, false);
+        heads.record(peer, 95, H256::ZERO, 100, false);
         assert_eq!(heads.network_head(0, 1), Some(95));
     }
 
@@ -578,7 +613,7 @@ mod tests {
     fn a_disconnected_peer_is_forgotten() {
         let mut heads = PeerHeads::default();
         let peer = PeerId::random();
-        heads.record(peer, 100, 100, false);
+        heads.record(peer, 100, H256::ZERO, 100, false);
         assert!(!heads.answer_is_refresh(peer));
         heads.note_digest(peer, false);
         heads.note_status_version(peer, StatusVersion::V2);
@@ -636,7 +671,7 @@ mod tests {
         let mut heads = PeerHeads::default();
         let peer = PeerId::random();
         heads.due_for_refresh([peer], 10, 4);
-        heads.record(peer, 12, 12, false);
+        heads.record(peer, 12, H256::ZERO, 12, false);
         assert!(heads.due_for_refresh([peer], 14, 4).is_empty());
         assert_eq!(heads.due_for_refresh([peer], 16, 4), vec![peer]);
     }
@@ -746,7 +781,7 @@ mod tests {
     fn a_suspect_is_cleared_once_the_head_passes_what_it_handed_over_or_its_time_is_up() {
         let mut heads = PeerHeads::default();
         let peer = PeerId::random();
-        heads.record(peer, 500, 100, false);
+        heads.record(peer, 500, H256::ZERO, 100, false);
         heads.suspects.insert(
             peer,
             Suspicion {
@@ -779,8 +814,8 @@ mod tests {
         let mut heads = PeerHeads::default();
         let liar = PeerId::random();
         let honest = PeerId::random();
-        heads.record(liar, 500, 500, false);
-        heads.record(honest, 400, 500, false);
+        heads.record(liar, 500, H256::ZERO, 500, false);
+        heads.record(honest, 400, H256::ZERO, 500, false);
         assert_eq!(heads.network_head(500, 2), Some(500));
         heads.note_range_failure(liar, 500);
         assert_eq!(heads.network_head(501, 2), Some(400));
@@ -799,7 +834,7 @@ mod tests {
         let refresh = SyncThresholds::LEAN.status_refresh_slots;
         let mut heads = PeerHeads::default();
         let peer = PeerId::random();
-        heads.record(peer, 100, 100, false);
+        heads.record(peer, 100, H256::ZERO, 100, false);
         // A refresh that times out (10 s, under 3 lean slots) and the one
         // after it come and go before the claim does.
         assert!(!heads.expire(100 + 2 * refresh + 3, lifetime));
@@ -808,7 +843,7 @@ mod tests {
         assert!(heads.expire(100 + lifetime + 1, lifetime));
         assert_eq!(heads.network_head(0, 1), None);
         // A fresh report counts again.
-        heads.record(peer, 120, 120, false);
+        heads.record(peer, 120, H256::ZERO, 120, false);
         assert_eq!(heads.network_head(0, 1), Some(120));
     }
 }

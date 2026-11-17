@@ -987,10 +987,10 @@ async fn handle_lean_blocks_by_range_response(
         }
     }
 
-    // A success only once something reached the chain actor; whether it
-    // imports is judged later, by the head (see `expire_range_watermark`).
+    // Whether what was handed over imports is judged by the head: reaching it
+    // ends the peer's run of failures, and a whole window without reaching it
+    // makes the peer a suspect (see `expire_range_watermark`).
     if let Some(through) = handed_over_through {
-        server.peer_heads.note_range_success(&peer);
         server.head_watch.note_delivery(peer, through);
     }
     if let Some(state) = &mut server.range_sync_state {
@@ -1869,15 +1869,15 @@ async fn handle_status_request(
     // connected: `forget` has already run for one that is not.
     // At most one request a slot per peer is acted on, as on lean.
     let wall_slot = crate::wall_clock_slot(&server.store);
-    let connected = server.connected_peers.contains_key(&peer)
+    let act_on = server.connected_peers.contains_key(&peer)
         && server.peer_heads.inbound_due(peer, wall_slot);
-    if connected {
+    if act_on {
         server
             .peer_heads
             .note_status_version(peer, StatusVersion::of(&peer_status));
     }
     let mut counted = false;
-    if !connected {
+    if !act_on {
         // Nothing to record.
     } else if !held {
         // Not grounds for closing the stream: the peer told us who it is and we
@@ -2897,10 +2897,9 @@ async fn handle_beacon_blocks_by_range_response(
     // Highest slot *handed to* the actor, not the highest imported: see
     // [`range_sync_target`] for why range sync reads this beside the store's
     // head rather than the head alone.
-    // As on lean: a success only once something reached the chain actor.
+    // As on lean: what was handed over is judged by the head.
     if let Some(highest) = highest_forwarded_slot {
         server.range_fetched_through = server.range_fetched_through.max(highest);
-        server.peer_heads.note_range_success(&peer);
         server.head_watch.note_delivery(peer, highest);
     }
     if let Some(state) = &mut server.range_sync_state {
@@ -3654,7 +3653,7 @@ pub(crate) mod tests {
             // Last heard from an interval ago, so due now.
             server
                 .peer_heads
-                .record(peer, 0, wall.saturating_sub(interval), false);
+                .record(peer, 0, H256::ZERO, wall.saturating_sub(interval), false);
         }
 
         server.refresh_due_peer_statuses().await;
@@ -3684,6 +3683,12 @@ pub(crate) mod tests {
         }
         // Moving back counts as moving.
         assert_eq!(watch.flat_for(4, 100, false), 0);
+        // The head reaching what a peer handed over takes it off the list:
+        // that, not an answer reaching the chain actor, clears its failures.
+        let served = PeerId::random();
+        watch.note_delivery(served, 105);
+        assert!(watch.reached(104).is_empty());
+        assert_eq!(watch.reached(105), vec![served]);
         // A peer whose blocks the head has not reached is still on the hook
         // after the head moves: a valid prefix does not clear the rest.
         let partly_valid = PeerId::random();
@@ -3797,6 +3802,24 @@ pub(crate) mod tests {
             end_slot: 10,
         };
         server.outbound_requests.insert(in_flight, batch);
+        // And its envelope request: a late answer must not release a later
+        // session's batch.
+        let envelopes_in_flight = server
+            .swarm_handle
+            .send_request(
+                liar,
+                Request::BlocksByRange(BlocksByRangeRequest::new(1, 10)),
+                ReqRespProtocol::LeanBlocksByRange,
+            )
+            .await
+            .expect("a request id");
+        let envelopes = PendingRequestKind::EnvelopeRange {
+            start_slot: 1,
+            end_slot: 10,
+        };
+        server
+            .outbound_requests
+            .insert(envelopes_in_flight, envelopes);
         // A batch every slot, none of which moves the head.
         for (batch, wall) in (100..=101 + window).enumerate() {
             server.range_fetched_through = 100 * (batch as u64 + 1);
@@ -3812,6 +3835,7 @@ pub(crate) mod tests {
             !server.outbound_requests.contains_key(&in_flight),
             "its answer is not taken"
         );
+        assert!(!server.outbound_requests.contains_key(&envelopes_in_flight));
         assert!(server.peer_heads.is_suspect(&liar));
         // Its claims do not count, and its requests start nothing.
         let unknown = H256::repeat_byte(0x11);
@@ -3827,13 +3851,31 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_claim_whose_head_was_imported_since_is_no_lead() {
+        // Finding: whether a claim's head is held was checked only when its
+        // `Status` arrived, so a head imported later (a lighter branch) went
+        // on counting as a lead until the peer's next `Status`.
+        let mut server = unconnected_server().await;
+        let peer = connected_peer(&mut server);
+        let wall = crate::wall_clock_slot(&server.store);
+        let our_head = server.store.head().expect("head exists");
+        // Counted when it arrived, as if the block was not held then...
+        server.peer_heads.record(peer, 50, our_head, wall, false);
+        // ...and held now: the next publish drops it.
+        peer_heads::publish(&mut server);
+        assert_eq!(server.store.network_head(), None);
+    }
+
+    #[tokio::test]
     async fn the_refresh_timer_ages_out_a_claim_nobody_repeats() {
         let mut server = unconnected_server().await;
         let peer = connected_peer(&mut server);
         let wall = crate::wall_clock_slot(&server.store);
         let lifetime = SyncThresholds::LEAN.report_lifetime();
         let reported_at = wall.saturating_sub(lifetime + 1);
-        server.peer_heads.record(peer, 100, reported_at, false);
+        server
+            .peer_heads
+            .record(peer, 100, H256::ZERO, reported_at, false);
         // As published when the report arrived.
         let published = server.peer_heads.network_head(reported_at, 2);
         server.store.set_network_head(published);

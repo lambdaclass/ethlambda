@@ -530,6 +530,19 @@ impl HeadWatch {
         self.delivering_since = None;
     }
 
+    /// The head slot last seen.
+    pub(crate) fn last_head(&self) -> Option<u64> {
+        self.seen.map(|(head_slot, _)| head_slot)
+    }
+
+    /// Take the deliverers whose blocks the head at `head_slot` has reached.
+    pub(crate) fn reached(&mut self, head_slot: u64) -> Vec<PeerId> {
+        self.deliverers
+            .extract_if(|_, through| *through <= head_slot)
+            .map(|(peer, _)| peer)
+            .collect()
+    }
+
     /// Note that `peer` handed blocks over, through slot `through`.
     pub(crate) fn note_delivery(&mut self, peer: PeerId, through: u64) {
         let highest = self.deliverers.entry(peer).or_insert(through);
@@ -2087,7 +2100,8 @@ pub(crate) fn wall_clock_slot(store: &Store) -> u64 {
 /// The refresh timer's period: one slot, each tick asking that slot's share
 /// of the peers that are due.
 fn status_refresh_tick(store: &Store) -> Duration {
-    Duration::from_millis(store.config().slot_duration_ms)
+    // The same slot length `wall_clock_slot` divides by.
+    Duration::from_millis(store.config().time_grid().milliseconds_per_slot)
 }
 
 /// The `Status` the periodic refresh sends, built once per refresh tick
@@ -2135,11 +2149,26 @@ impl P2PServer {
     /// doubles the wait before the next one, so a head that cannot move at
     /// all re-fetches the gap ever more rarely.
     pub(crate) fn expire_range_watermark(&mut self, wall_slot: u64) {
+        // Nothing to watch: no session, nothing handed over above the head
+        // last seen, no suspect waiting on the head. Skipped without reading
+        // the head, which on beacon decodes the whole head block: on a node
+        // keeping up, that is nearly every tick.
+        let idle = self.range_sync_state.is_none()
+            && self.range_fetched_through <= self.head_watch.last_head().unwrap_or(0)
+            && !self.peer_heads.has_suspects();
+        if idle {
+            return;
+        }
         let head_slot = match self.store.chain() {
             Chain::Lean => self.store.head_slot(),
-            // The head's header entry, not the block: no body is decoded.
             Chain::Beacon => self.store.beacon_head().map_or(0, |(slot, _)| slot),
         };
+        // Peers whose blocks the head has reached served what they handed
+        // over: that, not an answer merely reaching the chain actor, ends
+        // their run of range failures.
+        for peer in self.head_watch.reached(head_slot) {
+            self.peer_heads.note_range_success(&peer);
+        }
         // Blocks being handed over: a session running, or the watermark moved
         // since the last tick (a short session can start and end between
         // two), and only with blocks above the head to show for it. A session
@@ -2197,7 +2226,7 @@ impl P2PServer {
         // Once a slot, the same cadence as the refresh: a report past its
         // lifetime is no longer evidence of where the network is, and a
         // watermark the head never reaches is no longer a floor.
-        peer_heads::refresh(self);
+        peer_heads::publish(self);
         self.expire_range_watermark(wall_slot);
         let interval = peer_heads::thresholds(&self.store).status_refresh_slots;
         let peers = self.peer_heads.due_for_refresh(

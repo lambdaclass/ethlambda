@@ -78,7 +78,10 @@ head trails the wall clock **and** its peers report a head ahead of it.
   import stalls for a window (an execution client down), honest peers that
   delivered stop counting too, and the node reads as synced on its stale head
   until the head passes what they handed over, or for 4 stall windows at
-  most. The window is sized above what can legitimately hold a
+  most. These bounds hold per peer identity: a fresh identity starts with
+  none of the history (claims, cooldowns, suspicion) its predecessor
+  earned, so an adversary with many identities is bounded by how many it
+  can connect, as for any client. The window is sized above what can legitimately hold a
   catching-up head still.
 - **Why:** imported blocks cannot tell "the network is stalled" from "this node
   is behind". A node catching up has imported nothing recent either, so the
