@@ -32,11 +32,13 @@ pub mod duties;
 pub mod error;
 pub mod exit;
 pub mod http_api;
+pub(crate) mod in_flight;
 pub mod keys;
 pub mod metrics;
 pub mod payload_attestation;
 pub mod proposal;
 pub mod proposer_settings;
+pub mod registration;
 pub(crate) mod secure_fs;
 pub mod signing;
 pub mod slashing_protection;
@@ -65,8 +67,9 @@ use crate::beacon_node::http::HttpBeaconNode;
 use crate::duties::DutiesService;
 use crate::keys::ValidatorStore;
 use crate::payload_attestation::PayloadAttestationService;
-use crate::proposal::ProposalService;
+use crate::proposal::{BlindedOutcome, ProposalService, Proposed};
 use crate::proposer_settings::ProposerSettings;
+use crate::registration::RegistrationService;
 use crate::signing::SigningContext;
 use crate::slot_clock::SlotClock;
 use crate::sync_committee::SyncCommitteeService;
@@ -92,10 +95,22 @@ pub struct ValidatorConfig {
     /// Bind address for the keymanager API. `None` when `--enable-keymanager`
     /// was not passed, in which case it is never spawned.
     pub keymanager: Option<std::net::SocketAddr>,
+    /// Builder proposals, or `None` when `--builder-proposals` is off.
+    pub builder: Option<BuilderProposals>,
     /// Register keys that have no slashing-protection record as never having
     /// signed, instead of refusing to start. See
     /// [`slashing_protection::SlashingProtection::open`].
     pub init_slashing_protection: bool,
+}
+
+/// Builder proposals: register each validator with the beacon node's builder
+/// and accept a blinded block when the builder's bid wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuilderProposals {
+    /// The `builder_boost_factor` sent with every pre-gloas block request:
+    /// 100 compares the bid and the local payload as they are; `u64::MAX`
+    /// takes the builder whenever there is a bid.
+    pub boost_factor: u64,
 }
 
 /// Run the validator client until the process is stopped.
@@ -113,6 +128,18 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
              execution-layer rewards to an address chosen by the beacon node, which is very \
              unlikely to be yours, unless that validator is given its own address through the \
              keymanager API."
+        );
+    }
+    // Accepted, as every other client's flag accepts it, but said loudly:
+    // nobody holds the zero address's key, so what it is paid is burned, and
+    // a builder registration or proposer preference signs that into a
+    // commitment the builder honours. Only the default can be zero, since the
+    // keymanager API refuses it for a single validator.
+    if config.suggested_fee_recipient == Some(ExecutionAddress::ZERO) {
+        error!(
+            "--suggested-fee-recipient is the zero address. Every validator without its own \
+             address burns its execution-layer rewards, and builder registrations and proposer \
+             preferences sign that address for the builder to pay."
         );
     }
     let settings = Arc::new(ProposerSettings::new(
@@ -217,7 +244,20 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         context.clone(),
         settings.clone(),
         protection.clone(),
-    );
+        config.builder.map(|builder| builder.boost_factor),
+    )
+    .with_clock(clock.clone());
+    let registration = config.builder.map(|builder| {
+        info!(
+            boost_factor = builder.boost_factor,
+            "Builder proposals on: registering validators and accepting blinded blocks"
+        );
+        Arc::new(RegistrationService::new(
+            beacon_node.clone(),
+            context.clone(),
+            settings.clone(),
+        ))
+    });
 
     // Cancelled when the duty loop below ends, whatever ended it: the
     // keymanager server then stops accepting requests and finishes the ones
@@ -306,7 +346,19 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                     &context,
                 );
                 match refreshed.await {
-                    Ok(()) => last_epoch = Some(epoch),
+                    Ok(resolved) => {
+                        last_epoch = Some(epoch);
+                        // Only after a refresh that got all the way through, so a
+                        // failing one does not respawn a full send every slot, and
+                        // spawned so a slow or hung node never delays this epoch's
+                        // duties: a missed registration costs at most a builder
+                        // block, never a duty.
+                        if let Some(registration) = &registration {
+                            let registration = registration.clone();
+                            let store = store.clone();
+                            tokio::spawn(registration.register_all(epoch, resolved, store));
+                        }
+                    }
                     // A beacon node that is down, syncing or answering badly will
                     // likely answer next epoch, so keep the schedule already held
                     // and try again. Anything else will not fix itself, and looping
@@ -361,6 +413,13 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                 &store,
             )
             .await;
+
+            // Off the slot loop, like the epoch's full send: a keymanager change
+            // to a fee recipient or gas limit reaches the builder within a slot,
+            // and a slow node cannot delay the next slot's duties.
+            if let Some(registration) = &registration {
+                tokio::spawn(registration.clone().register_changed(epoch, store.clone()));
+            }
         }
     };
 
@@ -727,7 +786,7 @@ async fn aggregate<B: BeaconNodeApi>(
 /// Failures are logged and counted rather than propagated. A proposal is one
 /// slot's work; losing it must not stop the client attesting for the rest of
 /// the epoch.
-async fn propose<B: BeaconNodeApi>(
+async fn propose<B: BeaconNodeApi + 'static>(
     proposal: &ProposalService<B>,
     clock: &SlotClock,
     slot: u64,
@@ -735,19 +794,28 @@ async fn propose<B: BeaconNodeApi>(
     store: &RwLock<ValidatorStore>,
 ) {
     let budget = clock.until_attestation(slot, SystemTime::now());
-    let attempt = tokio::time::timeout(budget, proposal.propose(slot, duty, store));
-    match attempt.await {
-        Ok(Ok(_)) => {
-            let elapsed = SystemTime::now()
-                .duration_since(clock.start_of(slot))
-                .unwrap_or_default();
-            metrics::observe_block_publication_delay(elapsed.as_secs_f64());
+    let deadline = tokio::time::Instant::now() + budget;
+    match proposal.propose_by(slot, duty, store, deadline).await {
+        // The service took the delay when the node accepted the block: a
+        // full one's before a gloas envelope's publish, a blinded one's in
+        // the task that published it.
+        Ok(Proposed::Full(_) | Proposed::Blinded(BlindedOutcome::Published(_))) => {}
+        // Already logged at error and counted on its own series; the block
+        // may well be out, so it is neither a published-in-time delay nor a
+        // failure.
+        Ok(Proposed::Blinded(BlindedOutcome::Unconfirmed)) => {}
+        // The beacon node waits up to 5 s for the relay, which can outlast
+        // this budget. Not a missed proposal: the publish goes on, on its own
+        // task, which reports and counts the real outcome.
+        Ok(Proposed::Blinded(BlindedOutcome::StillPublishing)) => {
+            info!(
+                %slot,
+                validator = duty.validator_index,
+                budget_ms = budget.as_millis() as u64,
+                "Blinded block signed; its publish outlived the proposal budget and continues"
+            );
         }
-        Ok(Err(err)) => {
-            error!(%slot, validator = duty.validator_index, %err, "Failed to propose this slot's block");
-            metrics::inc_block_proposal_failures();
-        }
-        Err(_) => {
+        Err(Error::ProposalDeadline { .. }) => {
             warn!(
                 %slot,
                 validator = duty.validator_index,
@@ -756,11 +824,19 @@ async fn propose<B: BeaconNodeApi>(
             );
             metrics::inc_block_proposal_failures();
         }
+        Err(err) => {
+            error!(%slot, validator = duty.validator_index, %err, "Failed to propose this slot's block");
+            metrics::inc_block_proposal_failures();
+        }
     }
 }
 
 /// Resolve any newly activated validators, refresh the duty schedule, and
 /// re-send subnet subscriptions if it moved.
+///
+/// Returns the pubkeys a builder registration is signed for: those the beacon
+/// node resolved to an index whose validator is pending or active (see
+/// [`is_registrable`]).
 async fn refresh_epoch<B: BeaconNodeApi>(
     beacon_node: &Arc<B>,
     duties: &mut DutiesService<B>,
@@ -769,12 +845,12 @@ async fn refresh_epoch<B: BeaconNodeApi>(
     settings: &ProposerSettings,
     store: &RwLock<ValidatorStore>,
     context: &SigningContext,
-) -> Result<()> {
+) -> Result<Vec<BlsPubkey>> {
     // Nothing to resolve, nothing to schedule, nothing to register. Returning
     // here also keeps an empty pubkey list away from `validator_indices`, whose
     // endpoint reads one as "every validator on the chain".
     if pubkeys.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     if beacon_node.is_optimistic_or_syncing().await? {
@@ -845,7 +921,22 @@ async fn refresh_epoch<B: BeaconNodeApi>(
         subscriptions::subscribe(beacon_node, &duties.all(), store, context).await?;
     }
     metrics::set_beacon_node_available(true);
-    Ok(())
+    let registrable = entries.iter().filter(|entry| is_registrable(&entry.status));
+    Ok(registrable.map(|entry| entry.pubkey).collect())
+}
+
+/// Whether a validator whose Beacon API `status` is this one is sent a builder
+/// registration: one that is pending or active, not one that exited or was
+/// withdrawn.
+///
+/// The flashbots relay refuses a whole registration request over one key it
+/// does not know, and it knows only pending and active validators, so one
+/// exited key would cost every other in its batch of up to
+/// [`beacon_node::REGISTRATION_BATCH`]. Teku's validator client leaves exited
+/// keys out the same way, and Lighthouse's beacon node drops them before
+/// forwarding; a node that forwards as it gets would otherwise pass them on.
+fn is_registrable(status: &str) -> bool {
+    status.starts_with("pending") || status.starts_with("active")
 }
 
 /// Fetch the payload timeliness committee schedule for this epoch and the next,
@@ -1145,6 +1236,64 @@ mod tests {
             resolved.is_empty(),
             "the answer to 'resolve nothing' is nothing, not everything"
         );
+    }
+
+    /// Only pending and active validators get a builder registration: the
+    /// flashbots relay refuses a whole batch over one key it does not know, and
+    /// it knows no exited or withdrawn one. Proposer preparations still go to
+    /// every resolved validator.
+    #[tokio::test]
+    async fn only_pending_and_active_validators_are_registered() {
+        let mut node = node();
+        node.validators[1].status = "exited_unslashed".to_string();
+        node.validators.push(ValidatorEntry {
+            index: 33,
+            pubkey: pubkey(3),
+            status: "pending_queued".to_string(),
+        });
+        node.validators.push(ValidatorEntry {
+            index: 44,
+            pubkey: pubkey(4),
+            status: "withdrawal_done".to_string(),
+        });
+        // Exiting and slashed are still active: the relay loads validators
+        // with `status=active,pending`, which takes in both.
+        node.validators.push(ValidatorEntry {
+            index: 55,
+            pubkey: pubkey(5),
+            status: "active_exiting".to_string(),
+        });
+        node.validators.push(ValidatorEntry {
+            index: 66,
+            pubkey: pubkey(6),
+            status: "active_slashed".to_string(),
+        });
+        let node = Arc::new(node);
+        let mut duties = DutiesService::new(node.clone(), Vec::new());
+        let keys = [
+            pubkey(1),
+            pubkey(2),
+            pubkey(3),
+            pubkey(4),
+            pubkey(5),
+            pubkey(6),
+        ];
+        let settings = settings(Some(H160([0xab; 20])));
+
+        let registered = refresh_epoch(
+            &node,
+            &mut duties,
+            &keys,
+            3,
+            &settings,
+            &empty_store(),
+            &context(),
+        )
+        .await
+        .expect("refreshes");
+
+        assert_eq!(registered, vec![pubkey(1), pubkey(3), pubkey(5), pubkey(6)]);
+        assert_eq!(node.preparations().len(), 6);
     }
 
     /// With nothing resolved there is nobody to register, and an empty array
