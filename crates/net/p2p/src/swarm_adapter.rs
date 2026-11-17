@@ -447,6 +447,21 @@ impl SlowPeers {
     }
 }
 
+/// Whether gossipsub peer scoring is on, which is what makes a node beacon
+/// rather than lean: the gate both periodic disconnect passes share.
+///
+/// `peer_score` is `Some` for any peer id, this node's own included, exactly
+/// when scoring is on, so asking about our own id answers without depending
+/// on which peers are connected. `beacon::scoring`'s
+/// `only_the_beacon_swarm_scores_peers` pins that answer for both chains.
+fn scoring_enabled(swarm: &libp2p::Swarm<Behaviour>) -> bool {
+    swarm
+        .behaviour()
+        .gossipsub
+        .peer_score(swarm.local_peer_id())
+        .is_some()
+}
+
 /// Disconnect the peers [`SlowPeers`] finds persistently failing to take
 /// gossipsub messages, up to its per-check cap.
 ///
@@ -457,12 +472,7 @@ fn disconnect_slow_peers(swarm: &mut libp2p::Swarm<Behaviour>, slow_peers: &mut 
         disconnect,
         deferred,
     } = slow_peers.check();
-    if swarm
-        .behaviour()
-        .gossipsub
-        .peer_score(swarm.local_peer_id())
-        .is_none()
-    {
+    if !scoring_enabled(swarm) {
         return;
     }
     if deferred > 0 {
@@ -496,12 +506,10 @@ fn disconnect_slow_peers(swarm: &mut libp2p::Swarm<Behaviour>, slow_peers: &mut 
 ///
 /// Does nothing on lean, which runs without scoring.
 fn disconnect_graylisted_peers(swarm: &mut libp2p::Swarm<Behaviour>) {
-    let gossipsub = &swarm.behaviour().gossipsub;
-    // `peer_score` is `Some` for any peer id, this node's own included,
-    // exactly when scoring is on.
-    if gossipsub.peer_score(swarm.local_peer_id()).is_none() {
+    if !scoring_enabled(swarm) {
         return;
     }
+    let gossipsub = &swarm.behaviour().gossipsub;
     let mut bands: HashMap<&'static str, i64> =
         scoring::SCORE_BANDS.iter().map(|&band| (band, 0)).collect();
     let mut graylisted = Vec::new();
