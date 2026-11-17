@@ -162,17 +162,24 @@ impl SyncStatusTracker {
             self.renewed = false;
         } else if head_slot < progress_head {
             // The head moved back (an `INVALID` execution verdict cutting a
-            // branch out): progress is measured from where it now is, or the
-            // re-imports below the old mark would not count. Moving back is
-            // not itself progress, so the time spent behind stands.
+            // branch out, a reorg onto a shorter branch). The peers may have
+            // been right about the chain all along, so the stall window starts
+            // over and a lead given up on is believed again, as after an
+            // advance; progress is measured from where the head now is, or
+            // the re-imports below the old mark would not count. Only fork
+            // choice moves the head, so no peer can do this to the node.
             self.progress_head = Some(head_slot);
+            self.behind_for = 0;
+            self.counted_at = None;
+            self.lapsed_at = None;
+            self.renewed = false;
+            self.stalled_at_head = None;
         }
-        match self.stalled_at_head {
-            Some(stalled) if head_slot > stalled => self.stalled_at_head = None,
-            // Same for a head that moved back below where the lead was given
-            // up on: the next advance from there releases it.
-            Some(stalled) if head_slot < stalled => self.stalled_at_head = Some(head_slot),
-            _ => {}
+        if self
+            .stalled_at_head
+            .is_some_and(|stalled| head_slot > stalled)
+        {
+            self.stalled_at_head = None;
         }
 
         let network_head = if network_at_clock {
@@ -470,6 +477,31 @@ mod tests {
         assert_eq!(
             tracker.update(past_the_old_window, 51, Some(past_the_old_window)),
             SyncStatus::Syncing
+        );
+    }
+
+    #[test]
+    fn a_head_that_moves_back_after_a_stall_is_judged_afresh() {
+        // Finding: after an `INVALID` verdict cut the branch out, the stall
+        // stayed, and the node kept its duties on peers that may well have
+        // been right.
+        let mut tracker = steady_lean();
+        assert_eq!(tracker.update(100, 60, Some(100)), SyncStatus::Syncing);
+        let tripped = 101 + LEAN.stall_window;
+        assert_eq!(
+            tracker.update(tripped, 60, Some(tripped)),
+            SyncStatus::Synced
+        );
+        assert_eq!(
+            tracker.update(tripped + 1, 55, Some(tripped + 1)),
+            SyncStatus::Syncing
+        );
+        // And gets a whole window from there.
+        let end = tripped + 1 + LEAN.stall_window;
+        assert_eq!(tracker.update(end, 55, Some(end)), SyncStatus::Syncing);
+        assert_eq!(
+            tracker.update(end + 1, 55, Some(end + 1)),
+            SyncStatus::Synced
         );
     }
 
