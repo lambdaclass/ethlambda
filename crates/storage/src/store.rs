@@ -255,6 +255,10 @@ impl Chain {
 const STATE_CACHE_CAPACITY: usize = 32;
 
 /// [`Store::network_head`]'s "no peer has reported" marker. No slot reaches it.
+///
+/// No report can be this slot: P2P drops a head more than a slot past the
+/// wall clock. `Relaxed` is enough on both sides, since the value is the
+/// whole message: nothing else is published with it.
 const NO_NETWORK_HEAD: u64 = u64::MAX;
 
 /// Keep block proofs for at least this many slots below the tip, even once

@@ -69,6 +69,17 @@ pub(crate) enum Report {
     Disconnected,
 }
 
+/// A peer's run of failed range requests: when the last one failed, and how
+/// many in a row since its last successful answer.
+#[derive(Debug, Clone, Copy)]
+struct RangeFailures {
+    last: u64,
+    streak: u32,
+}
+
+/// Most doublings of a failed peer's cooldown: 32 refresh intervals.
+const MAX_COOLDOWN_DOUBLINGS: u32 = 5;
+
 /// A peer's reported head, and the wall-clock slot the report arrived at.
 #[derive(Debug, Clone, Copy)]
 struct Claim {
@@ -91,13 +102,20 @@ pub(crate) struct PeerHeads {
     /// arrive after the first refresh has gone out, and a mark per peer would
     /// then swap the two.
     answered: HashSet<PeerId>,
-    /// The wall-clock slot each peer last failed a range request at (an empty
-    /// or refused answer, a timeout). A peer is not synced towards again for
-    /// a refresh interval after: its own `Status` requests are not rate
-    /// limited, and the highest head gets the next batch, so a peer claiming
-    /// a head it does not serve could otherwise rejoin after every failure
-    /// and take every batch.
-    range_failed_at: HashMap<PeerId, u64>,
+    /// Each peer's failed range requests (an empty or refused answer, a
+    /// timeout) since its last successful one. A peer that has just failed is
+    /// cooling down (see [`Self::range_cooling_down`]): it is not synced
+    /// towards, and its claim does not count towards the network head, for a
+    /// refresh interval doubled for every further failure in a row.
+    ///
+    /// Not synced towards, because its own `Status` requests are not rate
+    /// limited and the highest head gets the next batch, so a peer claiming a
+    /// head it does not serve could otherwise take every batch. Not counted,
+    /// because a lead its peer has just failed to serve is no evidence the
+    /// node is behind: during a network-wide stall, when every node trails the
+    /// clock, such a claim would otherwise idle the node for a stall window
+    /// after every block the network manages to make.
+    range_failures: HashMap<PeerId, RangeFailures>,
     /// The wall-clock slot of each connected peer's last `Status` exchange, in
     /// either direction: the last time it told us its head, or we asked.
     last_exchange: HashMap<PeerId, u64>,
@@ -153,16 +171,26 @@ impl PeerHeads {
     pub(crate) fn forget(&mut self, peer: &PeerId) {
         self.heads.remove(peer);
         self.answered.remove(peer);
-        self.range_failed_at.remove(peer);
+        self.range_failures.remove(peer);
         self.last_exchange.remove(peer);
         self.foreign_digest.remove(peer);
         self.status_versions.remove(peer);
     }
 
-    /// The network's head as the peers report it: the highest counted report,
-    /// `None` with none at all.
-    pub(crate) fn network_head(&self) -> Option<u64> {
-        self.heads.values().map(|claim| claim.head_slot).max()
+    /// The network's head as the peers report it: the highest counted report
+    /// from a peer not cooling down from a failed range request (see
+    /// [`Self::range_cooling_down`]), `None` with none at all.
+    pub(crate) fn network_head(&self, wall_slot: u64, interval: u64) -> Option<u64> {
+        self.heads
+            .iter()
+            .filter(|(peer, _)| !self.range_cooling_down(peer, wall_slot, interval))
+            .map(|(_, claim)| claim.head_slot)
+            .max()
+    }
+
+    /// Drop `peer`'s claim, returning whether it had one.
+    pub(crate) fn drop_claim(&mut self, peer: &PeerId) -> bool {
+        self.heads.remove(peer).is_some()
     }
 
     /// The connected peers to re-ask for their `Status` at `wall_slot`, at
@@ -204,15 +232,32 @@ impl PeerHeads {
 
     /// Note that `peer` failed a range request at `wall_slot`.
     pub(crate) fn note_range_failure(&mut self, peer: PeerId, wall_slot: u64) {
-        self.range_failed_at.insert(peer, wall_slot);
+        let failures = self.range_failures.entry(peer).or_insert(RangeFailures {
+            last: wall_slot,
+            streak: 0,
+        });
+        failures.last = wall_slot;
+        failures.streak = failures.streak.saturating_add(1);
     }
 
-    /// Whether `peer` failed a range request less than `cooldown` slots
-    /// before `wall_slot`.
-    pub(crate) fn range_cooling_down(&self, peer: &PeerId, wall_slot: u64, cooldown: u64) -> bool {
-        self.range_failed_at
-            .get(peer)
-            .is_some_and(|failed| failed.saturating_add(cooldown) > wall_slot)
+    /// Note that `peer` answered a range request with blocks, ending its run
+    /// of failures.
+    pub(crate) fn note_range_success(&mut self, peer: &PeerId) {
+        self.range_failures.remove(peer);
+    }
+
+    /// Whether `peer` is cooling down from a failed range request at
+    /// `wall_slot`: for `interval` slots after the failure, doubled for every
+    /// earlier failure in the same run, up to [`MAX_COOLDOWN_DOUBLINGS`].
+    pub(crate) fn range_cooling_down(&self, peer: &PeerId, wall_slot: u64, interval: u64) -> bool {
+        self.range_failures.get(peer).is_some_and(|failures| {
+            let doublings = failures
+                .streak
+                .saturating_sub(1)
+                .min(MAX_COOLDOWN_DOUBLINGS);
+            let cooldown = interval.saturating_mul(1 << doublings);
+            failures.last.saturating_add(cooldown) > wall_slot
+        })
     }
 
     /// Note an answer from `peer` to a `Status` of ours, returning whether it
@@ -286,12 +331,12 @@ pub(crate) fn observe(
 }
 
 /// Drop the reports older than `SyncThresholds::report_lifetime` at
-/// `wall_slot`, republishing the network head if any was.
+/// `wall_slot`, and republish the network head: a cooldown that has run out
+/// changes it as surely as an expired report does.
 pub(crate) fn expire(server: &mut P2PServer, wall_slot: u64) {
     let lifetime = thresholds(&server.store).report_lifetime();
-    if server.peer_heads.expire(wall_slot, lifetime) {
-        publish(server);
-    }
+    server.peer_heads.expire(wall_slot, lifetime);
+    publish(server);
 }
 
 /// Forget a disconnected peer's head and republish the network head.
@@ -300,10 +345,34 @@ pub(crate) fn forget(server: &mut P2PServer, peer: &PeerId) {
     publish(server);
 }
 
+/// Drop `peer`'s claim and republish the network head, for a peer whose
+/// latest `Status` came from a fork digest this node does not sync from: its
+/// earlier report is not about the chain being followed any more.
+pub(crate) fn drop_claim(server: &mut P2PServer, peer: &PeerId) {
+    if server.peer_heads.drop_claim(peer) {
+        publish(server);
+    }
+}
+
+/// Note a failed range request from `peer`, which starts or extends its
+/// cooldown, and republish the network head without its claim. Only while it
+/// is connected: libp2p reports a closed connection before the request it
+/// failed, so a failure noted after `forget` would outlive the peer and hold
+/// back its next connection's handshake.
+pub(crate) fn note_range_failure(server: &mut P2PServer, peer: &PeerId) {
+    if !server.connected_peers.contains_key(peer) {
+        return;
+    }
+    let wall_slot = crate::wall_clock_slot(&server.store);
+    server.peer_heads.note_range_failure(*peer, wall_slot);
+    publish(server);
+}
+
 fn publish(server: &P2PServer) {
-    server
-        .store
-        .set_network_head(server.peer_heads.network_head());
+    let wall_slot = crate::wall_clock_slot(&server.store);
+    let interval = thresholds(&server.store).status_refresh_slots;
+    let network_head = server.peer_heads.network_head(wall_slot, interval);
+    server.store.set_network_head(network_head);
 }
 
 #[cfg(test)]
@@ -314,7 +383,7 @@ mod tests {
 
     #[test]
     fn no_report_is_no_network_head() {
-        assert_eq!(PeerHeads::default().network_head(), None);
+        assert_eq!(PeerHeads::default().network_head(0, 1), None);
     }
 
     #[test]
@@ -323,7 +392,7 @@ mod tests {
         let mut heads = PeerHeads::default();
         heads.record(PeerId::random(), 100, 100, false);
         heads.record(PeerId::random(), 40, 100, false);
-        assert_eq!(heads.network_head(), Some(100));
+        assert_eq!(heads.network_head(0, 1), Some(100));
     }
 
     #[test]
@@ -336,7 +405,7 @@ mod tests {
         heads.record(PeerId::random(), 600, 600, false);
         heads.record(PeerId::random(), 50, 600, false);
         heads.record(PeerId::random(), 50, 600, false);
-        assert_eq!(heads.network_head(), Some(600));
+        assert_eq!(heads.network_head(0, 1), Some(600));
     }
 
     #[test]
@@ -347,12 +416,12 @@ mod tests {
         let mut heads = PeerHeads::default();
         let on_lighter_fork = PeerId::random();
         assert_eq!(heads.record(on_lighter_fork, 110, 110, true), Report::Held);
-        assert_eq!(heads.network_head(), None);
+        assert_eq!(heads.network_head(0, 1), None);
         // A peer that had reported an unknown head is dropped once its head is
         // one we hold.
         heads.record(on_lighter_fork, 109, 110, false);
         heads.record(on_lighter_fork, 110, 110, true);
-        assert_eq!(heads.network_head(), None);
+        assert_eq!(heads.network_head(0, 1), None);
     }
 
     #[test]
@@ -368,7 +437,7 @@ mod tests {
             heads.record(liar, 100 + FUTURE_HEAD_TOLERANCE + 1, 100, false),
             Report::Future
         );
-        assert_eq!(heads.network_head(), None);
+        assert_eq!(heads.network_head(0, 1), None);
     }
 
     #[test]
@@ -378,7 +447,7 @@ mod tests {
         let peer = PeerId::random();
         heads.record(peer, 100, 100, false);
         heads.record(peer, 95, 100, false);
-        assert_eq!(heads.network_head(), Some(95));
+        assert_eq!(heads.network_head(0, 1), Some(95));
     }
 
     #[test]
@@ -390,7 +459,7 @@ mod tests {
         heads.note_digest(peer, false);
         heads.note_status_version(peer, StatusVersion::V2);
         heads.forget(&peer);
-        assert_eq!(heads.network_head(), None);
+        assert_eq!(heads.network_head(0, 1), None);
         // The next connection's first answer is its handshake's again.
         assert!(!heads.answer_is_refresh(peer));
         heads.forget(&peer);
@@ -499,6 +568,50 @@ mod tests {
     }
 
     #[test]
+    fn each_failure_in_a_row_doubles_the_cooldown_until_a_success() {
+        let mut heads = PeerHeads::default();
+        let peer = PeerId::random();
+        heads.note_range_failure(peer, 100);
+        heads.note_range_failure(peer, 102);
+        assert!(heads.range_cooling_down(&peer, 105, 2));
+        assert!(!heads.range_cooling_down(&peer, 106, 2));
+        heads.note_range_failure(peer, 106);
+        assert!(heads.range_cooling_down(&peer, 113, 2));
+        assert!(!heads.range_cooling_down(&peer, 114, 2));
+        // Capped.
+        for wall in 200..220 {
+            heads.note_range_failure(peer, wall);
+        }
+        let cap = 2 << MAX_COOLDOWN_DOUBLINGS;
+        assert!(heads.range_cooling_down(&peer, 219 + cap - 1, 2));
+        assert!(!heads.range_cooling_down(&peer, 219 + cap, 2));
+        // A successful answer ends the run.
+        heads.note_range_success(&peer);
+        heads.note_range_failure(peer, 300);
+        assert!(!heads.range_cooling_down(&peer, 302, 2));
+    }
+
+    #[test]
+    fn a_cooling_peers_claim_does_not_count() {
+        // Finding: during a network-wide stall every node trails the clock,
+        // so a peer claiming a head it never serves idled the node for a
+        // stall window after every block the network made.
+        let mut heads = PeerHeads::default();
+        let liar = PeerId::random();
+        let honest = PeerId::random();
+        heads.record(liar, 500, 500, false);
+        heads.record(honest, 400, 500, false);
+        assert_eq!(heads.network_head(500, 2), Some(500));
+        heads.note_range_failure(liar, 500);
+        assert_eq!(heads.network_head(501, 2), Some(400));
+        assert_eq!(heads.network_head(502, 2), Some(500));
+        // A digest the node does not sync from takes the claim away for good.
+        assert!(heads.drop_claim(&liar));
+        assert!(!heads.drop_claim(&liar));
+        assert_eq!(heads.network_head(600, 2), Some(400));
+    }
+
+    #[test]
     fn a_report_counts_for_its_lifetime_and_no_longer() {
         // Finding: a connected peer that stopped answering kept its last
         // head in the network head for as long as it stayed connected.
@@ -511,11 +624,11 @@ mod tests {
         // after it come and go before the claim does.
         assert!(!heads.expire(100 + 2 * refresh + 3, lifetime));
         assert!(!heads.expire(100 + lifetime, lifetime));
-        assert_eq!(heads.network_head(), Some(100));
+        assert_eq!(heads.network_head(0, 1), Some(100));
         assert!(heads.expire(100 + lifetime + 1, lifetime));
-        assert_eq!(heads.network_head(), None);
+        assert_eq!(heads.network_head(0, 1), None);
         // A fresh report counts again.
         heads.record(peer, 120, 120, false);
-        assert_eq!(heads.network_head(), Some(120));
+        assert_eq!(heads.network_head(0, 1), Some(120));
     }
 }

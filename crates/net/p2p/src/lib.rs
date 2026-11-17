@@ -481,6 +481,10 @@ pub(crate) struct HeadWatch {
     /// Watermark drops at the current head, each of which doubles the wait
     /// before the next one.
     drops: u32,
+    /// The watermark as the last tick saw it. A watermark that has moved
+    /// since means blocks were handed over, by a range session the once-a-slot
+    /// tick may never have seen running, and they get a whole window too.
+    watermark: u64,
 }
 
 impl HeadWatch {
@@ -516,9 +520,16 @@ impl HeadWatch {
         window.saturating_mul(1 << self.drops.min(Self::MAX_BACKOFF))
     }
 
-    /// Note a drop at `wall_slot`, starting the count over.
+    /// Note `watermark`, returning whether it has moved since the last call.
+    pub(crate) fn watermark_moved(&mut self, watermark: u64) -> bool {
+        std::mem::replace(&mut self.watermark, watermark) != watermark
+    }
+
+    /// Note a drop of the watermark to `head_slot` at `wall_slot`, starting
+    /// the count over.
     pub(crate) fn note_drop(&mut self, head_slot: u64, wall_slot: u64) {
         self.restart(head_slot, wall_slot);
+        self.watermark = head_slot;
         self.drops = self.drops.saturating_add(1);
     }
 }
@@ -2086,8 +2097,9 @@ impl P2PServer {
     /// otherwise never be asked for again, leaving the node to walk back to
     /// them one parent at a time. A head that is still importing moves, so a
     /// slow catch-up never trips this, and the count starts over for as long
-    /// as a range session runs, so the blocks its last batch handed over get
-    /// a whole window to import. Each drop at the same head doubles the wait
+    /// as a range session runs and whenever the watermark has moved since the
+    /// last tick, so the blocks a batch handed over get a whole window to
+    /// import. Each drop at the same head doubles the wait
     /// before the next one, so a head that cannot move at all re-fetches the
     /// gap ever more rarely rather than once a window.
     pub(crate) fn expire_range_watermark(&mut self, wall_slot: u64) {
@@ -2095,7 +2107,11 @@ impl P2PServer {
             Chain::Lean => self.store.head_slot(),
             Chain::Beacon => self.store.beacon_head().map_or(0, |(slot, _)| slot),
         };
-        if self.range_sync_state.is_some() {
+        // A session running, or one that handed blocks over since the last
+        // tick (a short one can start and end between two), restarts the
+        // count, so the blocks it delivered get a whole window to import.
+        let watermark_moved = self.head_watch.watermark_moved(self.range_fetched_through);
+        if self.range_sync_state.is_some() || watermark_moved {
             self.head_watch.restart(head_slot, wall_slot);
             return;
         }

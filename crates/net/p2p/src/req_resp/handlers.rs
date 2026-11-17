@@ -519,6 +519,8 @@ pub async fn handle_req_resp_message(
                 // refused `status/1`: the retry is `status/2`, so retrying a
                 // refused `status/2` (a refresh asks in whichever version the
                 // peer last answered) would only be refused again, forever.
+                // A peer that answered v1 and later refuses v2 is therefore
+                // not retried either; it is still asked in v1 next time.
                 None => {
                     if request_id.protocol == ReqRespProtocol::BeaconStatusV1
                         && matches!(
@@ -909,24 +911,26 @@ async fn handle_lean_blocks_by_range_response(
             continue;
         }
 
-        // Highest slot handed to the actor, not the highest imported; see
-        // `range_sync_target`.
-        server.range_fetched_through = server.range_fetched_through.max(slot);
         let block_root = block.message.hash_tree_root();
-        if let Err(err) = blockchain.new_block(
+        let handed_over = blockchain.new_block(
             SignedBeaconBlock::Lean(block),
             BlockSource::Sync,
             BlockArrival::now(),
             BlockAnnouncement::Silent,
-        ) {
-            error!(
+        );
+        match handed_over {
+            // Highest slot handed to the actor, not the highest imported; see
+            // `range_sync_target`.
+            Ok(_) => server.range_fetched_through = server.range_fetched_through.max(slot),
+            Err(err) => error!(
                 %err, %slot, %peer,
                 block_root = %ethlambda_types::ShortRoot(&block_root.0),
                 "Failed to forward range-fetched block to blockchain"
-            );
+            ),
         }
     }
 
+    server.peer_heads.note_range_success(&peer);
     if let Some(state) = &mut server.range_sync_state {
         state.complete_batch(end_slot);
         if range_session_exhausted(state) {
@@ -1574,13 +1578,7 @@ fn columns_without_known_custodian(server: &P2PServer, columns: &[u64]) -> Vec<u
 }
 
 fn fail_range_request(server: &mut P2PServer, peer: &PeerId) {
-    // Only while connected: libp2p reports a closed connection before the
-    // request it failed, so a failure noted after `forget` would outlive the
-    // peer and hold back its next connection's handshake.
-    if server.connected_peers.contains_key(peer) {
-        let wall_slot = crate::wall_clock_slot(&server.store);
-        server.peer_heads.note_range_failure(*peer, wall_slot);
-    }
+    peer_heads::note_range_failure(server, peer);
     let should_clear = if let Some(state) = &mut server.range_sync_state {
         state.fail_peer(peer);
         state.peer_set.is_empty()
@@ -1805,11 +1803,18 @@ async fn handle_status_request(
     // followed.
     let syncable = held && transition::is_syncable_digest(wire, peer_digest, unix_now_ms());
 
-    server
-        .peer_heads
-        .note_status_version(peer, StatusVersion::of(&peer_status));
+    // Answered whatever happens below, but recorded only for a peer still
+    // connected: `forget` has already run for one that is not.
+    let connected = server.connected_peers.contains_key(&peer);
+    if connected {
+        server
+            .peer_heads
+            .note_status_version(peer, StatusVersion::of(&peer_status));
+    }
     let mut counted = false;
-    if !held {
+    if !connected {
+        // Nothing to record.
+    } else if !held {
         // Not grounds for closing the stream: the peer told us who it is and we
         // answer honestly. Counting it is how a digest that has moved under us
         // becomes visible, so it is counted when the peer moves onto it, not
@@ -1825,6 +1830,7 @@ async fn handle_status_request(
         } else {
             debug!(%peer, peer_digest = %hex::encode(peer_digest), "Peer still on another fork digest");
         }
+        peer_heads::drop_claim(server, &peer);
     } else {
         server.peer_heads.note_digest(peer, true);
         trace!(
@@ -1841,6 +1847,8 @@ async fn handle_status_request(
                 peer_status.head_root(),
             );
             counted = report == Report::Counted;
+        } else {
+            peer_heads::drop_claim(server, &peer);
         }
     }
     let wire = server.wire.beacon().expect("checked above");
@@ -1991,9 +1999,11 @@ async fn handle_status_response(
     status: BeaconStatus,
     ctx: &Context<P2PServer>,
 ) {
-    // Checked first, as on lean.
-    let refresh =
-        server.connected_peers.contains_key(&peer) && server.peer_heads.answer_is_refresh(peer);
+    // An answer delivered after the disconnect: `forget` has already run, and
+    // nothing recorded now would ever be cleared.
+    if !server.connected_peers.contains_key(&peer) {
+        return;
+    }
     let Some(wire) = server.wire.beacon() else {
         return;
     };
@@ -2012,13 +2022,13 @@ async fn handle_status_response(
                 %peer,
                 peer_digest = %hex::encode(peer_digest),
                 our_digest = %hex::encode(our_digest),
-                refresh,
                 "Handshake answered from another fork digest"
             );
             metrics::inc_beacon_status_digest_mismatch();
         } else {
             debug!(%peer, peer_digest = %hex::encode(peer_digest), "Peer still on another fork digest");
         }
+        peer_heads::drop_claim(server, &peer);
         return;
     }
     server.peer_heads.note_digest(peer, true);
@@ -2032,8 +2042,13 @@ async fn handle_status_response(
             our_digest = %hex::encode(our_digest),
             "Not syncing from a peer on a superseded fork digest"
         );
+        peer_heads::drop_claim(server, &peer);
         return;
     }
+    // Counted only once the answer is one this node syncs from: an answer
+    // from another digest around a fork boundary must not use up the
+    // handshake's any-lead start for the first answer that can sync.
+    let refresh = server.peer_heads.answer_is_refresh(peer);
     let peer_head_slot = status.head_slot();
     trace!(
         %peer,
@@ -2808,6 +2823,7 @@ async fn handle_beacon_blocks_by_range_response(
     if let Some(highest) = highest_forwarded_slot {
         server.range_fetched_through = server.range_fetched_through.max(highest);
     }
+    server.peer_heads.note_range_success(&peer);
     if let Some(state) = &mut server.range_sync_state {
         state.complete_batch(end_slot);
         if range_session_exhausted(state) {
@@ -3491,8 +3507,8 @@ pub(crate) mod tests {
         assert!(server.range_sync_state.is_none());
         on_lean_status_request(&mut server, liar, &lean_status_at(unknown, 501)).await;
         assert!(server.range_sync_state.is_none());
-        // Its claim still counts towards the network head the gate reads.
-        assert_eq!(server.store.network_head(), Some(501));
+        // Nor does its claim count towards the network head the gate reads.
+        assert_eq!(server.store.network_head(), None);
 
         // An honest peer is synced from meanwhile.
         let honest = connected_peer(&mut server);
@@ -3629,12 +3645,16 @@ pub(crate) mod tests {
         server.expire_range_watermark(ended + window + 1);
         assert_eq!(server.range_fetched_through, head);
 
-        // A head that cannot move waits twice as long for the next drop.
+        // Blocks handed over between two ticks, by a session the tick never
+        // saw running: the moved watermark restarts the count, so they get a
+        // whole window, here doubled since this head has already had a drop.
         let dropped = ended + window + 1;
         server.range_fetched_through = 2000;
-        server.expire_range_watermark(dropped + 2 * window);
+        let delivered = dropped + 1;
+        server.expire_range_watermark(delivered);
+        server.expire_range_watermark(delivered + 2 * window);
         assert_eq!(server.range_fetched_through, 2000);
-        server.expire_range_watermark(dropped + 2 * window + 1);
+        server.expire_range_watermark(delivered + 2 * window + 1);
         assert_eq!(server.range_fetched_through, head);
     }
 
@@ -3648,9 +3668,8 @@ pub(crate) mod tests {
             .peer_heads
             .record(peer, 100, wall - lifetime - 1, false);
         // As published when the report arrived.
-        server
-            .store
-            .set_network_head(server.peer_heads.network_head());
+        let published = server.peer_heads.network_head(wall - lifetime - 1, 2);
+        server.store.set_network_head(published);
         assert_eq!(server.store.network_head(), Some(100));
 
         server.refresh_due_peer_statuses().await;
