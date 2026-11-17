@@ -2225,6 +2225,14 @@ impl P2PServer {
     /// all re-fetches the gap ever more rarely.
     pub(crate) fn expire_range_watermark(&mut self, wall_slot: u64) {
         let head_slot = self.head_slot();
+        // Peers whose blocks the head has reached served what they handed
+        // over: that, not an answer merely reaching the chain actor, ends
+        // their run of range failures. First, before a move back forgets the
+        // deliveries or `flat_for`'s clean-up on a head move drops them, so
+        // neither takes the credit away.
+        for peer in self.head_watch.reached(head_slot) {
+            self.peer_heads.note_range_success(&peer);
+        }
         // A head that moved back below the watermark (an `INVALID` cut, a
         // reorg onto a shorter branch) leaves what was handed over above it
         // off the chain being followed: the watermark is no floor there any
@@ -2247,13 +2255,6 @@ impl P2PServer {
             self.range_fetched_through = head_slot;
             self.end_range_session();
             self.head_watch.forget_deliveries();
-        }
-        // Peers whose blocks the head has reached served what they handed
-        // over: that, not an answer merely reaching the chain actor, ends
-        // their run of range failures. Before `flat_for`, whose own clean-up
-        // on a head move would drop those batches without the credit.
-        for peer in self.head_watch.reached(head_slot) {
-            self.peer_heads.note_range_success(&peer);
         }
         // Blocks being handed over: a session running, or the watermark moved
         // since the last tick (a short session can start and end between
