@@ -748,6 +748,13 @@ and absent is not the same as zero.
 | `ethlambda_validator_aggregates_published_total` | Counter | Aggregates accepted by a beacon node. Bursty rather than steady: a validator is selected a few times a day, so hours at zero are normal for a small deployment |
 | `ethlambda_validator_aggregation_failures_total` | Counter | Aggregation duties that ended in no published aggregate, including ones abandoned for overrunning the slot |
 | `ethlambda_validator_fee_recipient_mismatches_total` | Counter | Blocks paying execution rewards to an address this client did not request. Should read zero forever; a non-zero value means every proposal is paying somewhere else |
+| `ethlambda_validator_builder_registrations_sent_total` | Counter | Builder registrations a beacon node accepted (`--builder-proposals`) |
+| `ethlambda_validator_builder_registration_failures_total` | Counter | Registration batches no beacon node accepted. A missed registration costs at most a builder block, never a duty |
+| `ethlambda_validator_proposer_preferences_published_total` | Counter | Signed proposer preferences a beacon node accepted, counted once per preference, when the first node accepts it (re-sends to nodes that missed it do not count). Published for every proposal from the epoch before gloas, whether or not `--builder-proposals` is set |
+| `ethlambda_validator_proposer_preferences_failures_total` | Counter | Proposer preference sends some beacon node refused or did not answer (one count per preference per attempt, re-sends included, so a node that keeps refusing shows up here even while another accepts). After a restart with other settings, a node holding the preference signed before it refuses the new one every slot until the slot starts, so a steady climb then is expected rather than a fault. So is one while the beacon nodes follow different heads: a node whose dependent root differs from the one the duties came from refuses the preference until the root changes or the slot starts. The next slot retries; a node that misses a preference never gossips it, and until some node accepts it, builders' bids for its slot are ignored. A send whose slot started before the nodes answered is not counted |
+| `ethlambda_validator_proposer_preferences_duty_fetch_failures_total` | Counter | v2 proposer-duty fetches no beacon node answered (one count per target epoch per attempt). Without the duties no preference is signed for that epoch; a syncing node, or one without the v2 endpoint, shows up here |
+| `ethlambda_validator_blinded_blocks_proposed_total` | Counter | Blinded blocks a beacon node handed to its builder. A subset of `blocks_proposed_total` |
+| `ethlambda_validator_blinded_blocks_unconfirmed_total` | Counter | Blinded blocks the beacon node did not confirm (a 5xx other than 503, or no answer once connected), which the relay may still have published. Not retried, since a second block for the slot would be an equivocation |
 | `ethlambda_validator_block_publication_delay_seconds` | Histogram | Slot start to block accepted. Its buckets are tighter than the attestation histogram's, because a block is due at the slot boundary rather than a third of the way in |
 | `ethlambda_validator_beacon_node_available` | Gauge | 1 when a beacon node answered the last duty refresh or attestation |
 | `ethlambda_validator_signing_duration_seconds` | Histogram | Time to sign one slot's batch, store read lock included |
@@ -764,13 +771,17 @@ second points at the beacon nodes; a rise in the third points at the clock or
 the duty schedule and is worth investigating even though the attestation was
 correctly suppressed.
 
-The proposal series split the same way, plus one that is neither a success nor
+The proposal series split the same way, plus two that are neither a success nor
 a failure. `blocks_proposed_total` counts blocks a node accepted;
 `block_proposal_failures_total` counts duties that produced none;
 `blocks_refused_total` counts blocks deliberately not signed. Between them,
 `blocks_broadcast_not_imported_total` counts blocks that did reach the network
 but that the node answering could not import, which is a beacon-node fault
 rather than a validator one and is why it is not folded into either.
+`blinded_blocks_unconfirmed_total` is the other: a blinded block the node did
+not confirm, which the relay may still have published. It is not in
+`blocks_proposed_total` nor in the publication delay histogram, and it is not a
+failure either.
 
 Gloas adds two pairs. A gloas proposal ends in a block and then an envelope,
 and the envelope's failure does not fail the proposal: `blocks_proposed_total`

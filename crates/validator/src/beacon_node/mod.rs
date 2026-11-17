@@ -6,6 +6,7 @@
 //! (a reorg invalidating duties, a node failing mid-slot) untestable.
 
 use async_trait::async_trait;
+use ethlambda_types::beacon::builder::SignedValidatorRegistrationV1;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::shared::{AttestationData, SignedVoluntaryExit};
 use ethlambda_types::beacon::fork::ForkName;
@@ -14,12 +15,12 @@ use ethlambda_types::beacon::primitives::{
 };
 use ethlambda_types::beacon::signing::compute_epoch_at_slot;
 
-use crate::beacon_node::block_contents::ProducedBlock;
+use crate::beacon_node::block_contents::{ProducedBlock, Producer};
 use crate::beacon_node::dto::{
     AttesterDutyDto, CommitteeSubscriptionDto, ProposerDutyDto, ProposerPreparationDto, PtcDutyDto,
     SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto,
 };
-use crate::error::Result;
+use crate::error::{BeaconNodeFailure, Error, Result};
 use ethlambda_types::beacon::containers::altair;
 use ethlambda_types::beacon::containers::electra;
 use ethlambda_types::beacon::containers::gloas;
@@ -31,6 +32,11 @@ pub mod http;
 
 #[cfg(test)]
 pub mod mock;
+
+/// Builder registrations per request. Lighthouse's batch size: large enough
+/// that a few thousand validators take a handful of requests, small enough
+/// that one request stays well under a node's body limit.
+pub const REGISTRATION_BATCH: usize = 500;
 
 /// Check that `data` is an answer about `slot`, which is in `fork`, as the
 /// contract on [`BeaconNodeApi::attestation_data`] requires.
@@ -203,6 +209,17 @@ pub struct BlockRequest {
     pub randao_reveal: BlsSignature,
     /// Thirty-two bytes consensus never reads.
     pub graffiti: Bytes32,
+    /// The `builder_boost_factor` to send, or `None` when builder proposals are
+    /// off. `None` sends `0` and refuses a blinded answer; `Some` sends the
+    /// factor and accepts one. From gloas the factor travels in
+    /// `produceBlockV4`'s body instead of the query, so a pooled p2p bid can
+    /// win on value; a gloas answer is never blinded.
+    pub builder_boost_factor: Option<u64>,
+    /// The smallest p2p bid, in gwei, the node may take for a gloas block
+    /// (`produceBlockV4`'s `min_bid`): `--builder-min-bid`, with or without
+    /// builder proposals, since a node whose local build fails may still build
+    /// on a pooled bid. Not sent before gloas, where no endpoint takes it.
+    pub builder_min_bid: u64,
 }
 
 /// What became of a published block.
@@ -218,6 +235,25 @@ pub enum Published {
     Imported,
     /// 202: broadcast, but the node could not import it.
     BroadcastNotImported,
+    /// 200 from `blinded_blocks`: the node handed the signed blinded block to
+    /// its builder, which publishes the block and reveals the payload. Nothing
+    /// says the node imported it.
+    HandedToBuilder,
+}
+
+/// How many of the configured nodes took something sent to every node.
+///
+/// The caller needs it when what it sends lives on each node separately and
+/// a node that missed it never hears it any other way. Proposer preferences
+/// are such a send: each node gossips only what it accepted, and the service
+/// sends a preference every node holds only once an epoch more, so "some
+/// node accepted" must not be mistaken for "every node did".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// Every configured node accepted. The only answer a single node gives.
+    Everywhere,
+    /// At least one node accepted and at least one refused or did not answer.
+    Partly,
 }
 
 /// Check that `block` is the block that was asked for.
@@ -396,6 +432,18 @@ pub trait BeaconNodeApi: Send + Sync {
     /// treats the two the same way will act on a stale proposer schedule.
     async fn proposer_duties(&self, epoch: Epoch) -> Result<ProposerDuties>;
 
+    /// Every proposer duty in `epoch` with v2's `dependent_root`: the block at
+    /// `compute_start_slot_at_epoch(epoch - 1) - 1`, the shuffling dependent
+    /// root fulu's proposer lookahead fixes the epoch's proposers from. Signed
+    /// proposer preferences must carry exactly this root, which v1's
+    /// definition (one epoch later) is not.
+    ///
+    /// The fallback fails over quietly here: when every node fails it logs
+    /// nothing of its own, since its one caller, the preferences service,
+    /// reports the failure itself, once per epoch. A new caller that needs
+    /// the failure seen must log it.
+    async fn proposer_duties_v2(&self, epoch: Epoch) -> Result<ProposerDuties>;
+
     /// Produce the attestation data for `slot`, which is in `fork`.
     ///
     /// No committee index is ever a parameter here. Before gloas the query
@@ -446,12 +494,13 @@ pub trait BeaconNodeApi: Send + Sync {
     /// returning, so that a node answering about the wrong slot or naming the
     /// wrong proposer is failed over from rather than signed for.
     ///
-    /// # Contract: never a blinded block
+    /// # Contract: a blinded block only when builder proposals are on
     ///
-    /// This client does not implement the builder flow, so it cannot publish a
-    /// blinded block and must not sign one. An implementation must ask for an
-    /// unblinded block and reject a blinded answer rather than returning
-    /// something the caller will sign and then be unable to send.
+    /// A blinded block is returned only when `request.builder_boost_factor` is
+    /// `Some`, since only then does the caller publish one through
+    /// [`Self::publish_blinded_block`]. With `None` an implementation must ask
+    /// for an unblinded block and reject a blinded answer rather than
+    /// returning something the caller will sign and then be unable to send.
     async fn produce_block(&self, request: &BlockRequest) -> Result<ProducedBlock>;
 
     /// Publish an already-signed block, given the SSZ body and the fork it was
@@ -466,6 +515,112 @@ pub trait BeaconNodeApi: Send + Sync {
     /// a `Vec` here would be cloned once per configured node on every
     /// proposal, whether or not the first one succeeded.
     async fn publish_block(&self, fork: ForkName, body: &[u8]) -> Result<Published>;
+
+    /// Publish a signed blinded block, produced under `fork` by `producer`
+    /// (the [`ProducedBlock::producer`] of the block it was signed from), to
+    /// `POST /eth/v2/beacon/blinded_blocks`. The node hands it to its builder.
+    ///
+    /// # Contract: the node that produced it, and no other
+    ///
+    /// Only the producing node's builder holds the payload, and only that node
+    /// claimed the slot. Failover must not offer it elsewhere: the fallback
+    /// sends it to `producer` alone.
+    ///
+    /// # Contract: which error means what
+    ///
+    /// The line is whether the node can have handed the block to its builder.
+    ///
+    /// - **Definite**, an `Err` other than `Error::BlindedUnconfirmed`: the
+    ///   block was not published. A 4xx; a 503, which a syncing node answers
+    ///   before it hands anything to a builder; and a connection that was never
+    ///   established, refused or timed out, since the request never left.
+    /// - **Unconfirmed**, `Error::BlindedUnconfirmed`: every other 5xx, and any
+    ///   failure once the connection was up (no answer in time, a reset). The
+    ///   relay may still publish the block.
+    ///
+    /// The status cannot always tell, and the HTTP implementation documents the
+    /// edges it knowingly reads the wrong way.
+    async fn publish_blinded_block(
+        &self,
+        producer: Producer,
+        fork: ForkName,
+        body: &[u8],
+    ) -> Result<Published>;
+
+    /// Send signed builder registrations to the node in one request, which it
+    /// forwards to its builder. JSON, since a node may forward the body
+    /// unchanged to MEV-Boost. State installed on the node's builder, so
+    /// failover sends it to every node.
+    async fn register_validators(
+        &self,
+        registrations: &[SignedValidatorRegistrationV1],
+    ) -> Result<()>;
+
+    /// Send `registrations` in requests of at most [`REGISTRATION_BATCH`], one
+    /// after another, and say what became of each batch: one outcome per
+    /// batch, in order, `Ok` when the node accepted it.
+    ///
+    /// Batched here, below the fallback's fan-out, so that each node works
+    /// through its own sequence of batches beside the others: a hung node
+    /// holds back only its own. Batched above it, every batch would wait for
+    /// every node before the next one started.
+    ///
+    /// Once the node cannot be reached ([`Error::BeaconNode`]) the batches left
+    /// are not sent, and fail with that error: each would cost another
+    /// timeout, and the send waiting on them holds back the next keymanager
+    /// change (see `crate::registration`). A node that answered with an error
+    /// status is up, so it is still given the rest.
+    ///
+    /// [`Error::BeaconNode`]: crate::error::Error::BeaconNode
+    async fn register_validators_in_batches(
+        &self,
+        registrations: &[SignedValidatorRegistrationV1],
+    ) -> Vec<Result<()>> {
+        let mut outcomes = Vec::new();
+        let mut unreachable: Option<(String, BeaconNodeFailure, String)> = None;
+        for batch in registrations.chunks(REGISTRATION_BATCH) {
+            if let Some((url, failure, detail)) = &unreachable {
+                outcomes.push(Err(Error::BeaconNode {
+                    url: url.clone(),
+                    failure: *failure,
+                    detail: format!(
+                        "not sent, an earlier batch could not reach the node: {detail}"
+                    ),
+                }));
+                continue;
+            }
+            let outcome = self.register_validators(batch).await;
+            if let Err(Error::BeaconNode {
+                url,
+                failure,
+                detail,
+            }) = &outcome
+            {
+                unreachable = Some((url.clone(), *failure, detail.clone()));
+            }
+            outcomes.push(outcome);
+        }
+        outcomes
+    }
+
+    /// Submit signed proposer preferences, which the node validates with the
+    /// `proposer_preferences` gossip rules and publishes. `fork` is the
+    /// `Eth-Consensus-Version`: the fork the preferences belong to, that of
+    /// their proposal epoch.
+    ///
+    /// A 400 naming per-index failures is an `Err`: the whole call failed for
+    /// the caller's purposes, although the node may have published the entries
+    /// that passed. A node only short-circuits an identical entry, so one it
+    /// holds for the same `(slot, dependent_root)` with other content fails
+    /// every call that carries it. The caller therefore sends one preference
+    /// per call. State on the node's gossip, so failover sends it to every
+    /// node, and answers [`Delivery::Partly`] when only some of them accepted
+    /// it, so the caller knows to send it again.
+    async fn submit_proposer_preferences(
+        &self,
+        fork: ForkName,
+        preferences: &[gloas::SignedProposerPreferences],
+    ) -> Result<Delivery>;
 
     /// The envelope the node cached for the self-built payload of the block
     /// whose root is `block_root`, proposed at `slot`.
