@@ -604,6 +604,16 @@ mod tests {
     }
 
     #[test]
+    fn fast_aggregate_verify_rejects_an_empty_key_list() {
+        // Even with the identity signature, which is the one input the eth2
+        // wrapper accepts for an empty list.
+        let message = ethlambda_types::beacon::primitives::H256([3u8; 32]);
+        let signature = BlsSignature(G2_POINT_AT_INFINITY);
+        assert!(!fast_aggregate_verify(&[], message, &signature));
+        assert!(eth_fast_aggregate_verify(&[], message, &signature));
+    }
+
+    #[test]
     fn the_batched_sum_matches_the_sequential_one_at_every_size() {
         // One point, a pair, then both sides of blst's 384-point thread-pool
         // threshold, then larger runs. Which side of the threshold runs also
