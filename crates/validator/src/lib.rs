@@ -754,15 +754,10 @@ async fn propose<B: BeaconNodeApi + 'static>(
     let budget = clock.until_attestation(slot, SystemTime::now());
     let deadline = tokio::time::Instant::now() + budget;
     match proposal.propose_by(slot, duty, store, deadline).await {
-        // The service took the delay as soon as the block was accepted,
-        // before a gloas envelope's publish.
-        Ok(Proposed::Full(_)) => {}
-        Ok(Proposed::Blinded(BlindedOutcome::Published(_))) => {
-            let elapsed = SystemTime::now()
-                .duration_since(clock.start_of(slot))
-                .unwrap_or_default();
-            metrics::observe_block_publication_delay(elapsed.as_secs_f64());
-        }
+        // The service took the delay when the node accepted the block: a
+        // full one's before a gloas envelope's publish, a blinded one's in
+        // the task that published it.
+        Ok(Proposed::Full(_) | Proposed::Blinded(BlindedOutcome::Published(_))) => {}
         // Already logged at error and counted on its own series; the block
         // may well be out, so it is neither a published-in-time delay nor a
         // failure.

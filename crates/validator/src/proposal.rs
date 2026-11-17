@@ -123,10 +123,9 @@ use crate::slot_clock::SlotClock;
 
 /// What became of a proposal, as the duty loop needs it.
 ///
-/// Every outcome here has already been logged and its block counted. What the
-/// loop still owes is the publication delay of a block the node confirmed
-/// while it was waiting: [`Proposed::Full`] and
-/// [`BlindedOutcome::Published`].
+/// Every outcome here has already been logged, its block counted, and, for a
+/// block the node accepted, its publication delay taken when the node
+/// answered. What the loop still owes is a failed proposal's count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Proposed {
     /// A full block, and what the node made of it.
@@ -204,9 +203,8 @@ pub struct ProposalService<B> {
     /// The `min_bid` sent with each gloas block request, in gwei: the floor
     /// below which the node takes no p2p bid. `0` unless set.
     builder_min_bid: u64,
-    /// Where a slot starts, so a full block's publication delay is taken as
-    /// soon as the block is accepted, and a blinded publish that outlives the
-    /// deadline can observe its own. `None` observes neither.
+    /// Where a slot starts, so each block's publication delay is taken as the
+    /// node accepts it. `None` observes nothing.
     clock: Option<SlotClock>,
     /// The proposer preferences a node accepted, whose fee recipient a gloas
     /// block may rightly pay instead of the current one. `None` compares
@@ -249,9 +247,10 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         self
     }
 
-    /// Give the service the slot clock, so a blinded block's publication delay
-    /// is observed by the task that publishes it when that outlives
-    /// [`Self::propose_by`]'s deadline.
+    /// Give the service the slot clock, so each block's publication delay is
+    /// taken as the node accepts it: a full block's before a gloas envelope's
+    /// publish, a blinded block's by the task that publishes it, deadline or
+    /// not. Without it no delay is taken.
     pub fn with_clock(mut self, clock: SlotClock) -> Self {
         self.clock = Some(clock);
         self
@@ -593,10 +592,7 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
     /// service has the clock.
     fn observe_publication_delay(&self, slot: Slot) {
         if let Some(clock) = &self.clock {
-            let elapsed = SystemTime::now()
-                .duration_since(clock.start_of(slot))
-                .unwrap_or_default();
-            crate::metrics::observe_block_publication_delay(elapsed.as_secs_f64());
+            observe_publication_delay_since(clock.start_of(slot));
         }
     }
 
@@ -732,9 +728,9 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
     ///
     /// Two edges are not covered. A task that panics after the deadline is
     /// reported by nobody. A caller that drops the proposal after the task
-    /// has sent its outcome takes the rest of the reporting (the delay sample,
-    /// or a refusal's failure count) with it. The node's answer itself is
-    /// logged and counted by the task either way.
+    /// has sent its outcome takes the rest of the reporting (a refusal's
+    /// failure count) with it. The node's answer itself is logged and
+    /// counted, and an accepted block's delay taken, by the task either way.
     ///
     /// # Why an unconfirmed publish is not an error
     ///
@@ -765,10 +761,14 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
                 .publish_blinded_block(producer, fork, &body)
                 .await;
             let outcome = blinded_outcome(slot, validator, bytes, answer);
+            // Taken at the answer, whoever ends up holding the outcome.
+            if let (Ok(BlindedOutcome::Published(_)), Some(start)) = (&outcome, slot_start) {
+                observe_publication_delay_since(start);
+            }
             // Fails once the receiving side has stopped waiting, which hands
             // the outcome back here to report.
             if let Err(outcome) = handoff.send(outcome) {
-                report_unawaited(slot, validator, slot_start, outcome);
+                report_unawaited(slot, validator, outcome);
             }
         });
 
@@ -899,24 +899,26 @@ fn blinded_outcome(
     }
 }
 
+/// Record how long after `slot_start` a block was accepted.
+fn observe_publication_delay_since(slot_start: SystemTime) {
+    let elapsed = SystemTime::now()
+        .duration_since(slot_start)
+        .unwrap_or_default();
+    crate::metrics::observe_block_publication_delay(elapsed.as_secs_f64());
+}
+
 /// What the duty loop does with a blinded outcome it receives in time, done by
 /// the publish task when nobody is waiting for it any more (past the deadline,
-/// or a dropped proposal): the publication delay of a confirmed block, and a
-/// refusal counted as a failed proposal.
-fn report_unawaited(
-    slot: Slot,
-    validator: u64,
-    slot_start: Option<SystemTime>,
-    outcome: Result<BlindedOutcome>,
-) {
+/// or a dropped proposal): a refusal counted as a failed proposal.
+fn report_unawaited(slot: Slot, validator: u64, outcome: Result<BlindedOutcome>) {
     match outcome {
-        Ok(BlindedOutcome::Published(_)) => {
-            if let Some(start) = slot_start {
-                let elapsed = SystemTime::now().duration_since(start).unwrap_or_default();
-                crate::metrics::observe_block_publication_delay(elapsed.as_secs_f64());
-            }
-        }
-        Ok(BlindedOutcome::Unconfirmed | BlindedOutcome::StillPublishing) => {}
+        // Logged and counted, and an accepted block's delay taken, by the
+        // task already; the task never answers `StillPublishing`.
+        Ok(
+            BlindedOutcome::Published(_)
+            | BlindedOutcome::Unconfirmed
+            | BlindedOutcome::StillPublishing,
+        ) => {}
         Err(err) => {
             error!(
                 %slot,

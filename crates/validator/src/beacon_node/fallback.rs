@@ -39,6 +39,8 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// A `BeaconNodeApi` backed by an ordered list of others, answering from the
 /// first one that succeeds.
 pub struct FallbackBeaconNode<B> {
+    /// In the order given, which never changes: a [`Producer`] is a position
+    /// in it, so a blinded block goes back to the node that produced it.
     nodes: Vec<B>,
 }
 
