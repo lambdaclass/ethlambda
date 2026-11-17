@@ -312,6 +312,7 @@ what they sign.
 | `--checkpoint-sync-url` | Where the anchor comes from. Required on a fresh data directory for a built-in network, since those never start from genesis. A resumable data directory is used before it; a network loaded from a directory anchors at its own `genesis.ssz` when no URL is given |
 | `--node-key` | Optional, but worth persisting: the columns this node custodies are a function of its node id, so without a key file it changes identity, and custody set, on every restart |
 | `--execution-endpoint`, `--execution-jwt-secret` | Optional Engine API pairing, given together. Without them, blocks import without payload validation |
+| `--builder` | Optional builder API endpoint, normally MEV-Boost. With it, a fulu proposal from a validator registered through this node gets a blinded block when the builder's bid wins; without it every block is built locally |
 
 A built-in network needs nothing else on disk. Its `eth-clients` `config.yaml`
 and bootnode list, and the two genesis values the fork digest is computed from,
@@ -337,9 +338,10 @@ endpoints.
 
 A separate process that holds the keys and performs the duties: attestations,
 block proposals, aggregation, sync committee messages and, from Gloas on, the
-payload envelope and the payload timeliness vote. It talks to a beacon node over
-the standard Beacon API, so it works against `ethlambda beacon` (run with the
-`--execution-*` flags) or any other conformant beacon node.
+payload envelope, proposer preferences and the payload timeliness vote. It
+talks to a beacon node over the standard Beacon API, so it works against
+`ethlambda beacon` (run with the `--execution-*` flags) or any other conformant
+beacon node.
 
 > **Slashing protection:** every block and attestation is checked against a
 > durable per-validator record in `--validators-dir` before it is signed, and a
@@ -368,6 +370,8 @@ the standard Beacon API, so it works against `ethlambda beacon` (run with the
 | `--secrets-dir` | One password file per keystore, named after the validator's public key |
 | `--suggested-fee-recipient` | Execution address for block rewards, `0x`-prefixed. Optional, but without it the beacon node picks an address that is not yours |
 | `--graffiti` | Text for proposed blocks, at most 32 bytes |
+| `--gas-limit` | The gas limit validators target (default `60000000`). From gloas the beacon node builds this client's own payloads toward it, so set it on a network whose limit is elsewhere. Sepolia and Platåberget schedule `200000000`: pass `--gas-limit 200000000` there (until [#795](https://github.com/lambdaclass/ethlambda/issues/795)) |
+| `--builder-proposals` | Propose builder blocks before gloas: register each validator with the beacon node's builder (`--builder` on an ethlambda node) and sign a blinded block when the builder's bid wins. Off by default. From gloas, with or without it, a node that cannot build the payload itself may build on a builder's p2p bid, and that block is signed |
 | `--enable-keymanager` | Serve the keymanager API on `--keymanager-port` (default `5062`). Off by default, since it mutates key material |
 
 Metrics are served on `--metrics-port` (default `5064`). See

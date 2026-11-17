@@ -178,6 +178,12 @@ fn apply(
     // Every signature an operation defers is checked once the operation has
     // run, which is how a block's own driver treats them: a case whose only
     // defect is a bad signature is still rejected, only later.
+    //
+    // `run`'s outer `Err` (no handler for the case) is not a verdict, so the
+    // closure parks it in `unhandled` and returns `Ok`: the batch, empty since
+    // nothing ran, then passes, and the parked error is what is reported. The
+    // crate's own `Err` is returned from the closure as is, which skips the
+    // batch, as a block's driver does.
     let mut unhandled = None;
     let outcome = SignatureBatch::deferred(|signatures| {
         run(handler, case, state, config, committees, signatures).unwrap_or_else(|err| {

@@ -424,8 +424,11 @@ pub fn fast_aggregate_verify(
     let Some(points) = validated_pubkeys(pubkeys) else {
         return false;
     };
-    // `pubkeys` is non-empty, so there is always a sum. The signature was
-    // validated above, which is why the group check stays off here.
+    // `points` is non-empty because of the early return on an empty `pubkeys`
+    // at the top, not because of `validated_pubkeys` (which maps an empty
+    // input to an empty `Some`), so the `None` arm is unreachable. The
+    // signature was validated above, which is why the group check stays off
+    // here.
     let Some(aggregated) = sum_validated_points(&points) else {
         return false;
     };
@@ -615,6 +618,16 @@ mod tests {
     #[test]
     fn the_batched_sum_of_nothing_is_none() {
         assert!(sum_validated_points(&[]).is_none());
+    }
+
+    #[test]
+    fn fast_aggregate_verify_rejects_an_empty_key_list() {
+        // Even with the identity signature, which is the one input the eth2
+        // wrapper accepts for an empty list.
+        let message = ethlambda_types::beacon::primitives::H256([3u8; 32]);
+        let signature = BlsSignature(G2_POINT_AT_INFINITY);
+        assert!(!fast_aggregate_verify(&[], message, &signature));
+        assert!(eth_fast_aggregate_verify(&[], message, &signature));
     }
 
     #[test]

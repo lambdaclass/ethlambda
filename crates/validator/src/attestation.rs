@@ -135,7 +135,7 @@ impl<B: BeaconNodeApi> AttestationService<B> {
         // returned; failing here loses the slot rather than trying the next
         // node. That is why the same check now lives in the implementation,
         // where an `Err` is something failover can act on.
-        validate_attestation_data(slot, &data)?;
+        validate_attestation_data(slot, slot_fork, &data)?;
 
         // Consistent with the check just above: `data.target.epoch` is now
         // known to equal `expected_target_epoch`, so this is the fork this
@@ -427,7 +427,7 @@ mod tests {
         keys: &[ethlambda_types::beacon::primitives::BlsPubkey],
     ) -> SharedProtection {
         let protection = SlashingProtection::open(dir, Root::ZERO, keys, true).expect("opens");
-        Arc::new(std::sync::Mutex::new(protection))
+        crate::slashing_protection::SharedProtection::new(protection)
     }
 
     /// The restart shape the old in-memory guard could not cover: a fresh
@@ -705,7 +705,14 @@ mod tests {
         let store = RwLock::new(store);
         let pubkey_hex = encode_hex(&pubkey.0);
 
-        let node = Arc::new(MockBeaconNode::new().with_attestation_data(96));
+        // A node that breaks the trait's contract and hands the stale data
+        // back unchecked, so the refusal below is `attest`'s own, the last
+        // one before a signature, and not the implementation's.
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_attestation_data(96)
+                .without_attestation_data_check(),
+        );
         let service =
             AttestationService::new(node.clone(), context(), SlashingProtection::in_memory());
 
@@ -734,7 +741,8 @@ mod tests {
         let store = RwLock::new(store);
         let pubkey_hex = encode_hex(&pubkey.0);
 
-        let mut node = MockBeaconNode::new();
+        // Unchecked by the node, so `attest`'s own check is what refuses.
+        let mut node = MockBeaconNode::new().without_attestation_data_check();
         node.attestation_data = Some(AttestationData {
             slot: 96,
             index: 0,
@@ -761,6 +769,49 @@ mod tests {
 
         assert!(matches!(err, Error::InconsistentResponse(_)), "got {err:?}");
         assert!(node.submitted().is_empty());
+    }
+
+    /// A liveness check rather than a slashing one: an index that cannot be
+    /// valid at the slot's fork is refused before anything is recorded, so
+    /// the validator's one vote for the epoch is not spent on an attestation
+    /// every peer would reject, and a correct answer for the same slot is
+    /// still signed. `context()` is mainnet's schedule, where slot 96 is long
+    /// before gloas, so 1 is not an index a vote there can carry.
+    ///
+    /// The node hands its answer back unchecked, so what refuses it is
+    /// `attest`'s own check, under the fork `attest` derives for the slot:
+    /// with that check gone, or run under gloas, the first call would sign.
+    #[tokio::test]
+    async fn an_index_invalid_at_the_slots_fork_is_refused_and_records_nothing() {
+        let mut store = ValidatorStore::new();
+        let pubkey = store.insert_secret("test", &secret()).expect("inserts");
+        let duties = vec![duty(&encode_hex(&pubkey.0), 1337, 96, 3)];
+        let store = RwLock::new(store);
+        let protection = SlashingProtection::in_memory();
+
+        let wrong = Arc::new(
+            MockBeaconNode::new()
+                .with_attestation_data(96)
+                .with_attestation_index(1)
+                .without_attestation_data_check(),
+        );
+        let err = AttestationService::new(wrong.clone(), context(), protection.clone())
+            .attest(96, &duties, &store)
+            .await
+            .expect_err("must reject an index of 1 before gloas");
+        assert!(matches!(err, Error::InconsistentResponse(_)), "got {err:?}");
+        assert!(wrong.submitted().is_empty(), "nothing may be signed");
+
+        let right = Arc::new(MockBeaconNode::new().with_attestation_data(96));
+        let attested = AttestationService::new(right.clone(), context(), protection)
+            .attest(96, &duties, &store)
+            .await
+            .expect("attests");
+        assert_eq!(
+            (attested.published, attested.refused),
+            (1, 0),
+            "the refused answer must not have recorded the target"
+        );
     }
 
     /// The regression test for why `attest` derives the `Eth-Consensus-Version`
