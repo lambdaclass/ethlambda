@@ -509,7 +509,10 @@ impl HeadWatch {
         if self.seen.is_none_or(|(slot, _)| slot != head_slot) {
             self.seen = Some((head_slot, wall_slot));
             self.delivering_since = None;
-            self.deliverers.clear();
+            // A peer whose blocks the head has not reached yet is still
+            // answerable for them: a valid prefix that moved the head must
+            // not clear the invalid rest.
+            self.deliverers.retain(|_, through| *through > head_slot);
             self.drops = 0;
         }
         if delivering {
@@ -2103,9 +2106,10 @@ impl RefreshStatus {
 
 impl P2PServer {
     /// Drop [`Self::range_fetched_through`] back to the store's head once the
-    /// head has stayed below it, without moving and with no range session
-    /// running, for longer than the stall window
-    /// (`SyncThresholds::stall_window`).
+    /// head has stayed below it, without moving, for longer than the stall
+    /// window (`SyncThresholds::stall_window`) counted from the first
+    /// delivery since it last moved, whether or not a range session is still
+    /// running.
     ///
     /// The watermark measures every later `Status` from the highest slot a
     /// range answer handed to the chain actor, which keeps a catch-up from
@@ -2181,7 +2185,7 @@ impl P2PServer {
         // Once a slot, the same cadence as the refresh: a report past its
         // lifetime is no longer evidence of where the network is, and a
         // watermark the head never reaches is no longer a floor.
-        peer_heads::expire(self, wall_slot);
+        peer_heads::refresh(self);
         self.expire_range_watermark(wall_slot);
         let interval = peer_heads::thresholds(&self.store).status_refresh_slots;
         let peers = self.peer_heads.due_for_refresh(

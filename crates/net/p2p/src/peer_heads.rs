@@ -189,6 +189,15 @@ impl PeerHeads {
         Report::Counted
     }
 
+    /// Forget the failure runs whose longest cooldown ran out twice over by
+    /// `wall_slot`: kept across a reconnect, which would otherwise reset a
+    /// peer's backoff, they are dropped only once they no longer matter.
+    pub(crate) fn prune_range_failures(&mut self, wall_slot: u64, interval: u64) {
+        let longest = interval.saturating_mul(1 << MAX_COOLDOWN_DOUBLINGS);
+        self.range_failures
+            .retain(|_, failures| failures.last.saturating_add(2 * longest) > wall_slot);
+    }
+
     /// Drop every report older than `lifetime` slots at `wall_slot`. Returns
     /// whether any was dropped.
     pub(crate) fn expire(&mut self, wall_slot: u64, lifetime: u64) -> bool {
@@ -204,7 +213,6 @@ impl PeerHeads {
         self.answered.remove(peer);
         self.awaiting_handshake.remove(peer);
         self.inbound_at.remove(peer);
-        self.range_failures.remove(peer);
         self.last_exchange.remove(peer);
         self.foreign_digest.remove(peer);
         self.status_versions.remove(peer);
@@ -400,10 +408,10 @@ pub(crate) fn observe(
     report
 }
 
-/// Drop the reports older than `SyncThresholds::report_lifetime` at
-/// `wall_slot`, and republish the network head: a cooldown that has run out
-/// changes it as surely as an expired report does.
-pub(crate) fn expire(server: &mut P2PServer, _wall_slot: u64) {
+/// Republish the network head as of now, which drops reports past their
+/// lifetime (see `publish`): run once a slot, since a report or a cooldown
+/// running out changes the network head with nothing else happening.
+pub(crate) fn refresh(server: &mut P2PServer) {
     publish(server);
 }
 
@@ -474,6 +482,9 @@ fn publish(server: &mut P2PServer) {
     server
         .peer_heads
         .expire(wall_slot, thresholds.report_lifetime());
+    server
+        .peer_heads
+        .prune_range_failures(wall_slot, thresholds.status_refresh_slots);
     let network_head = server
         .peer_heads
         .network_head(wall_slot, thresholds.status_refresh_slots);
@@ -690,10 +701,13 @@ mod tests {
         assert!(heads.range_cooling_down(&peer, 100, 2));
         assert!(heads.range_cooling_down(&peer, 101, 2));
         assert!(!heads.range_cooling_down(&peer, 102, 2));
-        // A reconnect starts clean.
+        // A reconnect does not reset it, or a peer could shed its backoff by
+        // reconnecting; it is pruned once it no longer matters.
         heads.note_range_failure(peer, 200);
         heads.forget(&peer);
-        assert!(!heads.range_cooling_down(&peer, 200, 2));
+        assert!(heads.range_cooling_down(&peer, 200, 2));
+        heads.prune_range_failures(200 + 4 * (2 << MAX_COOLDOWN_DOUBLINGS), 2);
+        assert!(heads.range_failures.is_empty());
     }
 
     #[test]

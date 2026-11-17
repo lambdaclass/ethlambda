@@ -72,7 +72,13 @@ head trails the wall clock **and** its peers report a head ahead of it.
   that head. A peer that claims a head it does not serve (an empty answer,
   invalid blocks, no answer at all) therefore costs at most that window at
   each head the node reaches (two around an outage), not the rest of a
-  network stall. The window is sized above what can legitimately hold a
+  network stall. A peer that has just failed to serve a range request, or
+  whose range blocks left the head where it was for a whole window, does
+  not count towards the lead for a while either. The cost: if the node's own
+  import stalls for a window (an execution client down), honest peers that
+  delivered stop counting too, and the node reads as synced on its stale head
+  until the head passes what they handed over, or for 4 stall windows at
+  most. The window is sized above what can legitimately hold a
   catching-up head still.
 - **Why:** imported blocks cannot tell "the network is stalled" from "this node
   is behind". A node catching up has imported nothing recent either, so the

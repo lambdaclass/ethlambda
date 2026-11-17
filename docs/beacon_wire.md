@@ -754,16 +754,19 @@ since: 748 blocks in 66 bursts on one follower. A `Status` answer is
 therefore measured against the higher of the watermark and the store's head
 (`range_sync_target`). The head is a safe floor, since a head block's whole
 ancestry is already imported. Lean range sync reads the same watermark, for
-the same reason. A watermark the head stays below, unmoved and with no range
-session running, for longer than the stall window is dropped back to the head
+the same reason. A watermark the head stays below, unmoved, for longer than
+the stall window is dropped back to the head
 (`P2PServer::expire_range_watermark`): blocks handed over that never imported
 (an invalid answer, a fork the head did not follow) would otherwise never be
 asked for again. The count starts at the first tick that sees blocks handed
 over since the head last moved, so a batch gets a whole window to import, and
 later deliveries do not restart it: a whole window of them that has not moved
-the head is not importing. A drop ends the running session and cools down
-the peers that handed those blocks over, and each drop at the same head
-doubles the wait before the next. A peer that fails a range request is not
+the head is not importing. A drop ends the running session, cancels its
+requests in flight, and makes the peers that handed those blocks over
+suspects (`PeerHeads::suspects`): not synced towards and not counted towards
+the network head until the head passes what they handed over, or for 4 stall
+windows at most. Each drop at the same head doubles the wait before the
+next. A peer that fails a range request is not
 synced towards again for a refresh interval, since its own `Status` requests
 are not rate limited and the highest head gets the next batch.
 

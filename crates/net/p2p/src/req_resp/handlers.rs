@@ -977,7 +977,7 @@ async fn handle_lean_blocks_by_range_response(
             // `range_sync_target`.
             Ok(_) => {
                 server.range_fetched_through = server.range_fetched_through.max(slot);
-                handed_over_through = Some(handed_over_through.map_or(slot, |max| max.max(slot)));
+                handed_over_through = handed_over_through.max(Some(slot));
             }
             Err(err) => error!(
                 %err, %slot, %peer,
@@ -2876,8 +2876,7 @@ async fn handle_beacon_blocks_by_range_response(
                 |err| error!(%err, %slot, %peer, "Failed to forward beacon block to blockchain"),
             );
         if handed_over.is_ok() {
-            highest_forwarded_slot =
-                Some(highest_forwarded_slot.map_or(slot, |max: u64| max.max(slot)));
+            highest_forwarded_slot = highest_forwarded_slot.max(Some(slot));
         }
     }
 
@@ -3685,6 +3684,13 @@ pub(crate) mod tests {
         }
         // Moving back counts as moving.
         assert_eq!(watch.flat_for(4, 100, false), 0);
+        // A peer whose blocks the head has not reached is still on the hook
+        // after the head moves: a valid prefix does not clear the rest.
+        let partly_valid = PeerId::random();
+        watch.note_delivery(partly_valid, 120);
+        assert_eq!(watch.flat_for(110, 101, false), 0);
+        assert_eq!(watch.note_drop(110, 102), vec![(partly_valid, 120)]);
+        assert_eq!(watch.flat_for(4, 103, false), 0);
         // A drop hands back who delivered; each drop at a head doubles the
         // wait, and moving resets it.
         watch.note_delivery(PeerId::random(), 200);
