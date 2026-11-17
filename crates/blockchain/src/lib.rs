@@ -998,8 +998,10 @@ impl BlockChainServer {
         metrics::update_current_slot(slot);
         // Beacon judges the gate in the head recompute this tick ends in (see
         // `update_head_from_fork_choice`), off the head it has just read;
-        // judging here too would only be overwritten moments later, at the
-        // cost of another whole-block decode.
+        // judging here too would only be overwritten moments later. Every
+        // beacon tick that gets this far reaches that recompute: the only
+        // returns above are the duplicate-tick guard and a lean-only check,
+        // and nothing below returns before it.
         if self.store.chain() == Chain::Lean {
             self.update_sync_status(slot);
         }

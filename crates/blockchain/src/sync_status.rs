@@ -49,6 +49,21 @@ impl Default for SyncStatusController {
 /// The sync gate: judges, from the clock, the node's own head and the head its
 /// peers report, whether the node is too far behind to do validator duties.
 /// See [`SyncThresholds`] for the rule and the numbers.
+///
+/// How the stall window is kept, in short:
+///
+/// | event | effect |
+/// |---|---|
+/// | head advances past `high_water` | progress: window starts over, stall released |
+/// | head climbs past `climbing_back` after a move back | progress, likewise |
+/// | first move back below a high-water mark | window starts over, stall released, climb begins |
+/// | a judgment behind on the peers' word | slots added to `behind_for`: a stretch in full, a slot after a short lapse once |
+/// | a claim after a lapse longer than the window, with something counted | count back to zero, once per mark (`renewed`) |
+/// | `behind_for` past the window | stall: synced until progress |
+///
+/// With the head flat, no schedule of claims and lapses keeps the node
+/// syncing for more than about two windows' worth of slots at one head:
+/// `no_claim_schedule_idles_a_flat_head_past_two_windows` checks that.
 pub(crate) struct SyncStatusTracker {
     syncing: bool,
     /// Whether the syncing state suppresses validator duties.
@@ -720,6 +735,63 @@ mod tests {
         }
         let past = back + LEAN.stall_window + 1;
         assert_eq!(tracker.update(past, 50, Some(past)), SyncStatus::Synced);
+    }
+
+    /// A small deterministic generator, so the schedule test needs no
+    /// dependency and fails the same way every run.
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn below(&mut self, n: u64) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x % n
+        }
+    }
+
+    #[test]
+    fn no_claim_schedule_idles_a_flat_head_past_two_windows() {
+        // The backstop's bound against arbitrary schedules: with the head
+        // flat, a peer making and dropping its claim however it likes, within
+        // and across slots, gets the node to read syncing in at most two
+        // windows' worth of slots (the first, and one renewal after a long
+        // lapse), give or take a slot of rounding at each.
+        for thresholds in [LEAN, BEACON] {
+            let window = thresholds.stall_window;
+            for seed in 1..=300u64 {
+                let mut rng = XorShift(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+                let mut tracker = SyncStatusTracker::new(true, thresholds);
+                let head = 50;
+                let start = head + 2 * thresholds.clock_lag + 1;
+                // Runs of claims and lapses, from a slot to a few windows long,
+                // judged one to three times a slot.
+                let mut claiming = true;
+                let mut run_left = 0;
+                let mut idle_slots = 0;
+                for current in start..start + 30 * window {
+                    if run_left == 0 {
+                        claiming = !claiming;
+                        run_left = 1 + rng.below(3 * window);
+                    }
+                    run_left -= 1;
+                    let mut idle = false;
+                    for _ in 0..1 + rng.below(3) {
+                        // Within a slot, a claim may lapse for a judgment.
+                        let claim = claiming && rng.below(4) != 0;
+                        let network_head = claim.then_some(current);
+                        idle |= tracker.update(current, head, network_head) == SyncStatus::Syncing;
+                    }
+                    idle_slots += u64::from(idle);
+                }
+                assert!(
+                    idle_slots <= 2 * window + 2,
+                    "seed {seed}, window {window}: idle for {idle_slots} slots"
+                );
+            }
+        }
     }
 
     #[test]
