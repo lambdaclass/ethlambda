@@ -639,7 +639,12 @@ async fn handle_lean_status_request(
     // fire at different points in the slot, one of them only ever receives
     // requests, so a request that shows a lead has to be able to start the
     // sync too. Lighthouse does the same: both go through `process_status`.
-    on_lean_status_request(server, peer, &request).await;
+    // At most one a slot per peer is acted on: requests are not rate limited
+    // on the wire, and each now reads the store and may start a batch.
+    let wall_slot = crate::wall_clock_slot(&server.store);
+    if server.peer_heads.inbound_due(peer, wall_slot) {
+        on_lean_status_request(server, peer, &request).await;
+    }
 }
 
 /// A lean peer's own `Status` request, once answered: recorded, and synced
@@ -944,6 +949,7 @@ async fn handle_lean_blocks_by_range_response(
         return;
     };
 
+    let mut handed_over_any = false;
     for block in blocks {
         let slot = block.message.slot;
         let block_root = block.message.hash_tree_root();
@@ -956,7 +962,10 @@ async fn handle_lean_blocks_by_range_response(
         match handed_over {
             // Highest slot handed to the actor, not the highest imported; see
             // `range_sync_target`.
-            Ok(_) => server.range_fetched_through = server.range_fetched_through.max(slot),
+            Ok(_) => {
+                server.range_fetched_through = server.range_fetched_through.max(slot);
+                handed_over_any = true;
+            }
             Err(err) => error!(
                 %err, %slot, %peer,
                 block_root = %ethlambda_types::ShortRoot(&block_root.0),
@@ -965,7 +974,12 @@ async fn handle_lean_blocks_by_range_response(
         }
     }
 
-    server.peer_heads.note_range_success(&peer);
+    // A success only once something reached the chain actor; whether it
+    // imports is judged later, by the head (see `expire_range_watermark`).
+    if handed_over_any {
+        server.peer_heads.note_range_success(&peer);
+        server.head_watch.note_delivery(peer);
+    }
     if let Some(state) = &mut server.range_sync_state {
         state.complete_batch(end_slot);
         if range_session_exhausted(state) {
@@ -1840,7 +1854,10 @@ async fn handle_status_request(
 
     // Answered whatever happens below, but recorded only for a peer still
     // connected: `forget` has already run for one that is not.
-    let connected = server.connected_peers.contains_key(&peer);
+    // At most one request a slot per peer is acted on, as on lean.
+    let wall_slot = crate::wall_clock_slot(&server.store);
+    let connected = server.connected_peers.contains_key(&peer)
+        && server.peer_heads.inbound_due(peer, wall_slot);
     if connected {
         server
             .peer_heads
@@ -2827,8 +2844,6 @@ async fn handle_beacon_blocks_by_range_response(
 
     for block in blocks {
         let slot = block.slot();
-        highest_forwarded_slot =
-            Some(highest_forwarded_slot.map_or(slot, |max: u64| max.max(slot)));
         accepted += 1;
 
         // No block root in the failure log: reaching it means the actor
@@ -2837,7 +2852,7 @@ async fn handle_beacon_blocks_by_range_response(
         // (execution payload included) that would then be paid for every
         // block on the sync path. [`handle_blocks_by_root_response`] computes
         // one because it has an answer to check; a range batch does not.
-        let _ = blockchain
+        let handed_over = blockchain
             .new_block(
                 block,
                 BlockSource::Sync,
@@ -2847,6 +2862,10 @@ async fn handle_beacon_blocks_by_range_response(
             .inspect_err(
                 |err| error!(%err, %slot, %peer, "Failed to forward beacon block to blockchain"),
             );
+        if handed_over.is_ok() {
+            highest_forwarded_slot =
+                Some(highest_forwarded_slot.map_or(slot, |max: u64| max.max(slot)));
+        }
     }
 
     debug!(%peer, received, accepted, "Beacon blocks received");
@@ -2866,10 +2885,12 @@ async fn handle_beacon_blocks_by_range_response(
     // Highest slot *handed to* the actor, not the highest imported: see
     // [`range_sync_target`] for why range sync reads this beside the store's
     // head rather than the head alone.
+    // As on lean: a success only once something reached the chain actor.
     if let Some(highest) = highest_forwarded_slot {
         server.range_fetched_through = server.range_fetched_through.max(highest);
+        server.peer_heads.note_range_success(&peer);
+        server.head_watch.note_delivery(peer);
     }
-    server.peer_heads.note_range_success(&peer);
     if let Some(state) = &mut server.range_sync_state {
         state.complete_batch(end_slot);
         if range_session_exhausted(state) {
@@ -3619,7 +3640,9 @@ pub(crate) mod tests {
                 .connected_peers
                 .insert(peer, ConnectionDirection::Inbound);
             // Last heard from an interval ago, so due now.
-            server.peer_heads.record(peer, 0, wall - interval, false);
+            server
+                .peer_heads
+                .record(peer, 0, wall.saturating_sub(interval), false);
         }
 
         server.refresh_due_peer_statuses().await;
@@ -3634,34 +3657,34 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_head_watch_counts_from_the_last_move() {
+    fn a_head_watch_counts_from_the_first_delivery_since_the_head_moved() {
         let mut watch = crate::HeadWatch::default();
-        assert_eq!(watch.flat_for(5, 10), 0);
-        assert_eq!(watch.flat_for(5, 20), 10);
+        assert_eq!(watch.flat_for(5, 10, false), 0);
+        assert_eq!(watch.flat_for(5, 20, false), 10);
+        // A delivery starts the count afresh, once: later ones do not move it.
+        assert_eq!(watch.flat_for(5, 30, true), 0);
+        assert_eq!(watch.flat_for(5, 40, true), 10);
+        assert_eq!(watch.flat_for(5, 45, false), 15);
         // A head that keeps moving, however slowly, is never flat for long.
-        for (head, wall) in [(6, 30), (7, 45), (8, 60)] {
-            assert_eq!(watch.flat_for(head, wall), 0);
-            assert_eq!(watch.flat_for(head, wall + 14), 14);
+        for (head, wall) in [(6, 50), (7, 65), (8, 80)] {
+            assert_eq!(watch.flat_for(head, wall, true), 0);
+            assert_eq!(watch.flat_for(head, wall + 14, true), 14);
         }
         // Moving back counts as moving.
-        assert_eq!(watch.flat_for(4, 80), 0);
-        // Each drop at a head doubles the wait; moving resets it.
+        assert_eq!(watch.flat_for(4, 100, false), 0);
+        // A drop hands back who delivered; each drop at a head doubles the
+        // wait, and moving resets it.
+        watch.note_delivery(PeerId::random());
         assert_eq!(watch.patience(16), 16);
-        watch.note_drop(4, 100);
+        assert_eq!(watch.note_drop(4, 110).len(), 1);
         assert_eq!(watch.patience(16), 32);
-        watch.note_drop(4, 140);
+        assert!(watch.note_drop(4, 140).is_empty());
         assert_eq!(watch.patience(16), 64);
-        assert_eq!(watch.flat_for(5, 150), 0);
-        assert_eq!(watch.patience(16), 16);
-        // A head that moved while a range session restarted the count resets
-        // the backoff too.
-        watch.note_drop(5, 160);
-        assert_eq!(watch.patience(16), 32);
-        watch.restart(6, 170);
+        assert_eq!(watch.flat_for(5, 150, false), 0);
         assert_eq!(watch.patience(16), 16);
         // The wait is capped.
         for wall in 0..10 {
-            watch.note_drop(6, 200 + wall);
+            watch.note_drop(5, 200 + wall);
         }
         assert_eq!(watch.patience(16), 16 * 16);
     }
@@ -3685,32 +3708,18 @@ pub(crate) mod tests {
         let mut server = unconnected_server().await;
         let head = server.store.head_slot();
         let window = SyncThresholds::LEAN.stall_window;
+        // The count starts at the first tick that sees blocks handed over,
+        // however long the head was flat before, so they get a whole window.
         server.range_fetched_through = 2000;
         server.expire_range_watermark(100);
         server.expire_range_watermark(100 + window);
         assert_eq!(server.range_fetched_through, 2000);
-
-        // A range session running keeps it, and restarts the count: the
-        // blocks its last batch handed over get a whole window to import
-        // once it ends.
-        let session = RangeSyncState::new(1..10, PeerId::random(), 10);
-        server.range_sync_state = Some(session);
-        let ended = 101 + window;
-        server.expire_range_watermark(ended);
-        assert_eq!(server.range_fetched_through, 2000);
-        server.range_sync_state = None;
-        server.expire_range_watermark(ended + 1);
-        server.expire_range_watermark(ended + window);
-        assert_eq!(server.range_fetched_through, 2000);
-        server.expire_range_watermark(ended + window + 1);
+        server.expire_range_watermark(101 + window);
         assert_eq!(server.range_fetched_through, head);
 
-        // Blocks handed over between two ticks, by a session the tick never
-        // saw running: the moved watermark restarts the count, so they get a
-        // whole window, here doubled since this head has already had a drop.
-        let dropped = ended + window + 1;
+        // Handed over again at the same head: a window twice as long.
         server.range_fetched_through = 2000;
-        let delivered = dropped + 1;
+        let delivered = 102 + window;
         server.expire_range_watermark(delivered);
         server.expire_range_watermark(delivered + 2 * window);
         assert_eq!(server.range_fetched_through, 2000);
@@ -3719,16 +3728,46 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_peer_whose_blocks_never_import_is_cut_off_after_a_window() {
+        // Finding: a peer answering every batch with in-range blocks that
+        // never import kept the watermark rising and its count restarting,
+        // so honest peers' heads stayed below it and were never synced from.
+        let mut server = unconnected_server().await;
+        let liar = connected_peer(&mut server);
+        let honest = connected_peer(&mut server);
+        let window = SyncThresholds::LEAN.stall_window;
+        server.range_sync_state = Some(RangeSyncState::new(1..2000, liar, 2000));
+        // A batch every slot, none of which moves the head.
+        for (batch, wall) in (100..=101 + window).enumerate() {
+            server.range_fetched_through = 100 * (batch as u64 + 1);
+            server.head_watch.note_delivery(liar);
+            server.expire_range_watermark(wall);
+        }
+        let head = server.store.head_slot();
+        assert_eq!(server.range_fetched_through, head);
+        assert!(server.range_sync_state.is_none(), "the session ends");
+        let wall = crate::wall_clock_slot(&server.store);
+        let interval = SyncThresholds::LEAN.status_refresh_slots;
+        assert!(server.peer_heads.range_cooling_down(&liar, wall, interval));
+
+        // The honest peer is synced from, starting at the head.
+        let unknown = H256::repeat_byte(0x11);
+        on_lean_status_request(&mut server, honest, &lean_status_at(unknown, 500)).await;
+        let state = server.range_sync_state.as_ref().expect("honest peer");
+        assert_eq!(state.current_range.start, head + 1);
+        assert!(!state.peer_set.contains_key(&liar));
+    }
+
+    #[tokio::test]
     async fn the_refresh_timer_ages_out_a_claim_nobody_repeats() {
         let mut server = unconnected_server().await;
         let peer = connected_peer(&mut server);
         let wall = crate::wall_clock_slot(&server.store);
         let lifetime = SyncThresholds::LEAN.report_lifetime();
-        server
-            .peer_heads
-            .record(peer, 100, wall - lifetime - 1, false);
+        let reported_at = wall.saturating_sub(lifetime + 1);
+        server.peer_heads.record(peer, 100, reported_at, false);
         // As published when the report arrived.
-        let published = server.peer_heads.network_head(wall - lifetime - 1, 2);
+        let published = server.peer_heads.network_head(reported_at, 2);
         server.store.set_network_head(published);
         assert_eq!(server.store.network_head(), Some(100));
 

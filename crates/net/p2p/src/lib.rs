@@ -472,18 +472,26 @@ pub struct ReqRespRequestId {
     pub id: OutboundRequestId,
 }
 
-/// How long the store's head has stayed where it is, as the once-a-slot
-/// refresh timer sees it; see [`P2PServer::expire_range_watermark`].
+/// How long the store's head has stayed where it is while blocks were being
+/// handed over above it, as the once-a-slot refresh timer sees it; see
+/// [`P2PServer::expire_range_watermark`].
 #[derive(Debug, Default)]
 pub(crate) struct HeadWatch {
-    /// The head slot last seen, and the wall-clock slot the count started at.
+    /// The head slot last seen, and the wall-clock slot it was first seen at.
     seen: Option<(u64, u64)>,
+    /// The wall-clock slot of the first tick, since the head last moved, that
+    /// saw blocks being handed over. Later deliveries do not move it: blocks
+    /// that a whole window of deliveries has not moved the head with are not
+    /// importing, however many more keep coming.
+    delivering_since: Option<u64>,
+    /// The peers that handed blocks over since the head last moved.
+    deliverers: HashSet<PeerId>,
     /// Watermark drops at the current head, each of which doubles the wait
     /// before the next one.
     drops: u32,
     /// The watermark as the last tick saw it. A watermark that has moved
     /// since means blocks were handed over, by a range session the once-a-slot
-    /// tick may never have seen running, and they get a whole window too.
+    /// tick may never have seen running.
     watermark: u64,
 }
 
@@ -492,26 +500,30 @@ impl HeadWatch {
     /// under two hours on beacon.
     const MAX_BACKOFF: u32 = 4;
 
-    /// Note the head at `wall_slot`, returning how many slots it has stayed
-    /// at `head_slot`: zero whenever it has just moved, in either direction.
-    pub(crate) fn flat_for(&mut self, head_slot: u64, wall_slot: u64) -> u64 {
-        match self.seen {
-            Some((slot, since)) if slot == head_slot => wall_slot.saturating_sub(since),
-            _ => {
-                self.seen = Some((head_slot, wall_slot));
-                self.drops = 0;
-                0
-            }
-        }
-    }
-
-    /// Start the count over at `wall_slot`, as if the head had just moved.
-    /// The drops made at a head are kept only while it stays that head.
-    pub(crate) fn restart(&mut self, head_slot: u64, wall_slot: u64) {
+    /// Note the head at `wall_slot`, and whether blocks are being handed over,
+    /// returning how many slots it has stayed at `head_slot` since the first
+    /// delivery after it last moved (since it moved, with none). Zero
+    /// whenever it has just moved, in either direction.
+    pub(crate) fn flat_for(&mut self, head_slot: u64, wall_slot: u64, delivering: bool) -> u64 {
         if self.seen.is_none_or(|(slot, _)| slot != head_slot) {
+            self.seen = Some((head_slot, wall_slot));
+            self.delivering_since = None;
+            self.deliverers.clear();
             self.drops = 0;
         }
-        self.seen = Some((head_slot, wall_slot));
+        if delivering {
+            self.delivering_since.get_or_insert(wall_slot);
+        }
+        let since = self
+            .delivering_since
+            .or(self.seen.map(|(_, since)| since))
+            .unwrap_or(wall_slot);
+        wall_slot.saturating_sub(since)
+    }
+
+    /// Note that `peer` handed blocks over.
+    pub(crate) fn note_delivery(&mut self, peer: PeerId) {
+        self.deliverers.insert(peer);
     }
 
     /// How long the head must stay flat before the next drop: `window`,
@@ -526,11 +538,14 @@ impl HeadWatch {
     }
 
     /// Note a drop of the watermark to `head_slot` at `wall_slot`, starting
-    /// the count over.
-    pub(crate) fn note_drop(&mut self, head_slot: u64, wall_slot: u64) {
-        self.restart(head_slot, wall_slot);
+    /// the count over, and return the peers that handed blocks over since
+    /// the head last moved.
+    pub(crate) fn note_drop(&mut self, head_slot: u64, wall_slot: u64) -> Vec<PeerId> {
+        self.seen = Some((head_slot, wall_slot));
+        self.delivering_since = None;
         self.watermark = head_slot;
         self.drops = self.drops.saturating_add(1);
+        self.deliverers.drain().collect()
     }
 }
 
@@ -2093,29 +2108,31 @@ impl P2PServer {
     /// The watermark measures every later `Status` from the highest slot a
     /// range answer handed to the chain actor, which keeps a catch-up from
     /// fetching blocks still queued for import again. Blocks that never
-    /// import (an invalid answer, a fork the head did not follow) would
-    /// otherwise never be asked for again, leaving the node to walk back to
-    /// them one parent at a time. A head that is still importing moves, so a
-    /// slow catch-up never trips this, and the count starts over for as long
-    /// as a range session runs and whenever the watermark has moved since the
-    /// last tick, so the blocks a batch handed over get a whole window to
-    /// import. Each drop at the same head doubles the wait
-    /// before the next one, so a head that cannot move at all re-fetches the
-    /// gap ever more rarely rather than once a window.
+    /// import (invalid ones, a fork the head did not follow) would otherwise
+    /// keep it above the head for good, and an honest peer's head below it
+    /// would never be synced from.
+    ///
+    /// The count starts at the first tick that sees blocks being handed over
+    /// (a range session running, or the watermark moved since the last tick)
+    /// after the head last moved, so the first batch gets a whole window to
+    /// import; later deliveries do not restart it, since a whole window of
+    /// them that has not moved the head is not importing. A head that is
+    /// still importing moves. On a drop, the session running ends, and the
+    /// peers that handed blocks over since the head last moved cool down
+    /// (see `PeerHeads::range_cooling_down`). Each drop at the same head
+    /// doubles the wait before the next one, so a head that cannot move at
+    /// all re-fetches the gap ever more rarely.
     pub(crate) fn expire_range_watermark(&mut self, wall_slot: u64) {
         let head_slot = match self.store.chain() {
             Chain::Lean => self.store.head_slot(),
             Chain::Beacon => self.store.beacon_head().map_or(0, |(slot, _)| slot),
         };
-        // A session running, or one that handed blocks over since the last
-        // tick (a short one can start and end between two), restarts the
-        // count, so the blocks it delivered get a whole window to import.
+        // Blocks being handed over: a session running, or the watermark moved
+        // since the last tick (a short session can start and end between
+        // two).
         let watermark_moved = self.head_watch.watermark_moved(self.range_fetched_through);
-        if self.range_sync_state.is_some() || watermark_moved {
-            self.head_watch.restart(head_slot, wall_slot);
-            return;
-        }
-        let flat_for = self.head_watch.flat_for(head_slot, wall_slot);
+        let delivering = self.range_sync_state.is_some() || watermark_moved;
+        let flat_for = self.head_watch.flat_for(head_slot, wall_slot, delivering);
         let window = peer_heads::thresholds(&self.store).stall_window;
         if self.range_fetched_through <= head_slot || flat_for <= self.head_watch.patience(window) {
             return;
@@ -2127,7 +2144,13 @@ impl P2PServer {
             "Blocks handed over above the head never imported; fetching them again"
         );
         self.range_fetched_through = head_slot;
-        self.head_watch.note_drop(head_slot, wall_slot);
+        // A session still running is fetching past blocks that never
+        // imported, and whoever handed them over was not serving the chain
+        // the head can follow.
+        self.range_sync_state = None;
+        for peer in self.head_watch.note_drop(head_slot, wall_slot) {
+            peer_heads::note_range_failure(self, &peer);
+        }
     }
 
     /// Re-ask this slot's share of the connected peers that are due for their

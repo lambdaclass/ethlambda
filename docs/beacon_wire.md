@@ -758,8 +758,11 @@ the same reason. A watermark the head stays below, unmoved and with no range
 session running, for longer than the stall window is dropped back to the head
 (`P2PServer::expire_range_watermark`): blocks handed over that never imported
 (an invalid answer, a fork the head did not follow) would otherwise never be
-asked for again. The count restarts while a session runs, so a batch just
-handed over gets a whole window to import, and each drop at the same head
+asked for again. The count starts at the first tick that sees blocks handed
+over since the head last moved, so a batch gets a whole window to import, and
+later deliveries do not restart it: a whole window of them that has not moved
+the head is not importing. A drop ends the running session and cools down
+the peers that handed those blocks over, and each drop at the same head
 doubles the wait before the next. A peer that fails a range request is not
 synced towards again for a refresh interval, since its own `Status` requests
 are not rate limited and the highest head gets the next batch.
