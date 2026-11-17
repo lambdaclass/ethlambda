@@ -410,8 +410,11 @@ pub fn fast_aggregate_verify(
     let Some(points) = validated_pubkeys(pubkeys) else {
         return false;
     };
-    // `pubkeys` is non-empty, so there is always a sum. The signature was
-    // validated above, which is why the group check stays off here.
+    // `points` is non-empty because of the early return on an empty `pubkeys`
+    // at the top, not because of `validated_pubkeys` (which maps an empty
+    // input to an empty `Some`), so the `None` arm is unreachable. The
+    // signature was validated above, which is why the group check stays off
+    // here.
     let Some(aggregated) = sum_validated_points(&points) else {
         return false;
     };
