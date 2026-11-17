@@ -735,22 +735,47 @@ mod tests {
     fn several_reports_within_one_check_count_once_towards_the_streak() {
         let peer = PeerId::random();
         let mut slow_peers = SlowPeers::default();
+        // A whole streak's worth of reports before a single check.
         for _ in 0..checks_in_a_streak() {
             slow_peers.record(peer, &failed(COUNTED));
         }
         assert_eq!(slow_peers.check(), nothing());
+
+        // That check was the streak's first: the peer is returned exactly at
+        // the limit counting it. Had it not counted, the last check below
+        // would return nothing; had it counted more than once, one in the
+        // loop would already have returned the peer.
+        for _ in 2..SLOW_PEER_CHECK_LIMIT {
+            slow_peers.record(peer, &failed(COUNTED));
+            assert_eq!(slow_peers.check(), nothing());
+        }
+        slow_peers.record(peer, &failed(COUNTED));
+        // Every report's failures are kept, the first check's included.
+        let reports = checks_in_a_streak() + checks_in_a_streak() - 1;
+        let expected = SlowPeerCheck {
+            disconnect: vec![(peer, COUNTED * reports)],
+            deferred: 0,
+        };
+        assert_eq!(slow_peers.check(), expected);
     }
 
     #[test]
     fn a_returned_peer_starts_a_new_streak() {
         let peer = PeerId::random();
         let mut slow_peers = SlowPeers::default();
-        for _ in 0..SLOW_PEER_CHECK_LIMIT {
-            slow_peers.record(peer, &failed(COUNTED));
-            slow_peers.check();
-        }
+        let returned = SlowPeerCheck {
+            disconnect: vec![(peer, COUNTED * checks_in_a_streak())],
+            deferred: 0,
+        };
+        checks_before_the_limit(&mut slow_peers, &[(peer, COUNTED)]);
         slow_peers.record(peer, &failed(COUNTED));
-        assert_eq!(slow_peers.check(), nothing());
+        assert_eq!(slow_peers.check(), returned);
+
+        // Still failing afterwards, it needs a whole new streak to be returned
+        // again, and only that streak's failures are counted.
+        checks_before_the_limit(&mut slow_peers, &[(peer, COUNTED)]);
+        slow_peers.record(peer, &failed(COUNTED));
+        assert_eq!(slow_peers.check(), returned);
     }
 
     #[test]
