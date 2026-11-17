@@ -959,10 +959,12 @@ impl BeaconNodeApi for MockBeaconNode {
         fork: ForkName,
         preferences: &[gloas::SignedProposerPreferences],
     ) -> Result<Delivery> {
-        self.guard("submit_proposer_preferences")?;
+        // Before the guard, so a failing node can be a slow one too: one
+        // whose answer times out.
         if let Some(delay) = self.preference_delay {
             tokio::time::sleep(delay).await;
         }
+        self.guard("submit_proposer_preferences")?;
         let refused = self.refused_preference_slots.lock().expect("lock").clone();
         if let Some(entry) = preferences
             .iter()

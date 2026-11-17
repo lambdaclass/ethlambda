@@ -121,7 +121,8 @@
 //! fetch warns once per epoch, a preference no node took once, and the
 //! preferences some node did not take once per poll that finds new ones. A
 //! preference whose slot started before the nodes answered is neither: gossip
-//! ignores a started slot, and the poll was late, not refused.
+//! ignores a started slot, and the poll was late, not refused. One a node may
+//! still have taken is kept all the same, for the block's fee check.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -602,6 +603,12 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
                     %err,
                     "A proposer preference's slot started before a beacon node took it"
                 );
+                // A message no node was known to hold may be held now, so
+                // the block's fee check must know its address. One already
+                // kept stays as it is.
+                if err.outcome_unknown() && matches!(before, Before::Unsent | Before::Refused) {
+                    lock(&self.sent).insert(key, Sent::Unconfirmed(entry));
+                }
                 Tally::default()
             }
             Err(err) => {
@@ -1791,6 +1798,49 @@ mod tests {
         let sent = submitted(&node);
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].1[0].message.proposal_slot, ahead);
+    }
+
+    /// A send whose slot starts before its answer, which never comes, is
+    /// neither warned about nor counted, but a node may still hold it: it is
+    /// kept as unconfirmed, so the block's fee check knows the address it may
+    /// pay.
+    #[tokio::test]
+    async fn a_late_send_a_node_may_hold_is_kept() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let (store, pubkeys) = store_with_keys(1);
+        let store = Arc::new(RwLock::new(store));
+        let slot = slot_in(GLOAS_EPOCH, 10);
+        let root = Root::repeat_byte(0x11);
+        let node = MockBeaconNode::new()
+            .with_proposers_v2(GLOAS_EPOCH, root, vec![duty(&pubkeys[0], 3, slot)])
+            .with_preference_delay(std::time::Duration::from_millis(1100));
+        node.failures
+            .lock()
+            .expect("lock")
+            .insert("submit_proposer_preferences", "timed out".to_string());
+        // `slot` starts within the next second, before the node's answer.
+        let config = context().config.clone();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("after 1970")
+            .as_secs();
+        let genesis = now + 1 - slot * config.slot_duration_ms / 1000;
+        let clock = SlotClock::from_config(genesis, &config);
+        let node = Arc::new(node);
+        let service = Arc::new(
+            PreferencesService::new(node.clone(), context(), settings(Some(FEE_RECIPIENT)))
+                .with_clock(clock),
+        );
+
+        service.clone().poll(slot - 1, store).await;
+
+        assert!(submitted(&node).is_empty());
+        assert_eq!(stages(&service)[&(slot, root)], "unconfirmed");
+        assert_eq!(
+            service.accepted_fee_recipients(slot, 3),
+            vec![FEE_RECIPIENT]
+        );
     }
 
     /// No keys loaded: no duties are fetched and nothing is signed.
