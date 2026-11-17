@@ -476,11 +476,17 @@ pub struct ReqRespRequestId {
 /// refresh timer sees it; see [`P2PServer::expire_range_watermark`].
 #[derive(Debug, Default)]
 pub(crate) struct HeadWatch {
-    /// The head slot last seen, and the wall-clock slot it was first seen at.
+    /// The head slot last seen, and the wall-clock slot the count started at.
     seen: Option<(u64, u64)>,
+    /// Watermark drops at the current head, each of which doubles the wait
+    /// before the next one.
+    drops: u32,
 }
 
 impl HeadWatch {
+    /// Most doublings of the wait: 64 windows, a little over an hour on lean.
+    const MAX_BACKOFF: u32 = 6;
+
     /// Note the head at `wall_slot`, returning how many slots it has stayed
     /// at `head_slot`: zero whenever it has just moved, in either direction.
     pub(crate) fn flat_for(&mut self, head_slot: u64, wall_slot: u64) -> u64 {
@@ -488,14 +494,28 @@ impl HeadWatch {
             Some((slot, since)) if slot == head_slot => wall_slot.saturating_sub(since),
             _ => {
                 self.seen = Some((head_slot, wall_slot));
+                self.drops = 0;
                 0
             }
         }
     }
 
-    /// Start the count over at `wall_slot`, as if the head had just moved.
+    /// Start the count over at `wall_slot`, as if the head had just moved,
+    /// without forgetting the drops made at it.
     pub(crate) fn restart(&mut self, head_slot: u64, wall_slot: u64) {
         self.seen = Some((head_slot, wall_slot));
+    }
+
+    /// How long the head must stay flat before the next drop: `window`,
+    /// doubled for every drop already made at this head.
+    pub(crate) fn patience(&self, window: u64) -> u64 {
+        window.saturating_mul(1 << self.drops.min(Self::MAX_BACKOFF))
+    }
+
+    /// Note a drop at `wall_slot`, starting the count over.
+    pub(crate) fn note_drop(&mut self, head_slot: u64, wall_slot: u64) {
+        self.restart(head_slot, wall_slot);
+        self.drops = self.drops.saturating_add(1);
     }
 }
 
@@ -2061,19 +2081,23 @@ impl P2PServer {
     /// import (an invalid answer, a fork the head did not follow) would
     /// otherwise never be asked for again, leaving the node to walk back to
     /// them one parent at a time. A head that is still importing moves, so a
-    /// slow catch-up never trips this. Once dropped, the count starts over,
-    /// so a head that cannot move at all is fetched for at most once a window.
+    /// slow catch-up never trips this, and the count starts over for as long
+    /// as a range session runs, so the blocks its last batch handed over get
+    /// a whole window to import. Each drop at the same head doubles the wait
+    /// before the next one, so a head that cannot move at all re-fetches the
+    /// gap ever more rarely rather than once a window.
     pub(crate) fn expire_range_watermark(&mut self, wall_slot: u64) {
         let head_slot = match self.store.chain() {
             Chain::Lean => self.store.head_slot(),
             Chain::Beacon => self.store.beacon_head().map_or(0, |(slot, _)| slot),
         };
+        if self.range_sync_state.is_some() {
+            self.head_watch.restart(head_slot, wall_slot);
+            return;
+        }
         let flat_for = self.head_watch.flat_for(head_slot, wall_slot);
         let window = peer_heads::thresholds(&self.store).stall_window;
-        if self.range_sync_state.is_some()
-            || self.range_fetched_through <= head_slot
-            || flat_for <= window
-        {
+        if self.range_fetched_through <= head_slot || flat_for <= self.head_watch.patience(window) {
             return;
         }
         debug!(
@@ -2083,7 +2107,7 @@ impl P2PServer {
             "Blocks handed over above the head never imported; fetching them again"
         );
         self.range_fetched_through = head_slot;
-        self.head_watch.restart(head_slot, wall_slot);
+        self.head_watch.note_drop(head_slot, wall_slot);
     }
 
     /// Re-ask this slot's share of the connected peers that are due for their

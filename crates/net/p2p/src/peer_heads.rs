@@ -91,6 +91,13 @@ pub(crate) struct PeerHeads {
     /// arrive after the first refresh has gone out, and a mark per peer would
     /// then swap the two.
     answered: HashSet<PeerId>,
+    /// The wall-clock slot each peer last failed a range request at (an empty
+    /// or refused answer, a timeout). A peer is not synced towards again for
+    /// a refresh interval after: its own `Status` requests are not rate
+    /// limited, and the highest head gets the next batch, so a peer claiming
+    /// a head it does not serve could otherwise rejoin after every failure
+    /// and take every batch.
+    range_failed_at: HashMap<PeerId, u64>,
     /// The wall-clock slot of each connected peer's last `Status` exchange, in
     /// either direction: the last time it told us its head, or we asked.
     last_exchange: HashMap<PeerId, u64>,
@@ -146,6 +153,7 @@ impl PeerHeads {
     pub(crate) fn forget(&mut self, peer: &PeerId) {
         self.heads.remove(peer);
         self.answered.remove(peer);
+        self.range_failed_at.remove(peer);
         self.last_exchange.remove(peer);
         self.foreign_digest.remove(peer);
         self.status_versions.remove(peer);
@@ -192,6 +200,19 @@ impl PeerHeads {
                 peer
             })
             .collect()
+    }
+
+    /// Note that `peer` failed a range request at `wall_slot`.
+    pub(crate) fn note_range_failure(&mut self, peer: PeerId, wall_slot: u64) {
+        self.range_failed_at.insert(peer, wall_slot);
+    }
+
+    /// Whether `peer` failed a range request less than `cooldown` slots
+    /// before `wall_slot`.
+    pub(crate) fn range_cooling_down(&self, peer: &PeerId, wall_slot: u64, cooldown: u64) -> bool {
+        self.range_failed_at
+            .get(peer)
+            .is_some_and(|failed| failed.saturating_add(cooldown) > wall_slot)
     }
 
     /// Note an answer from `peer` to a `Status` of ours, returning whether it
@@ -460,6 +481,21 @@ mod tests {
         assert!(!heads.answer_is_refresh(peer));
         assert!(heads.answer_is_refresh(peer));
         assert!(heads.answer_is_refresh(peer));
+    }
+
+    #[test]
+    fn a_peer_that_failed_a_range_request_cools_down_for_an_interval() {
+        let mut heads = PeerHeads::default();
+        let peer = PeerId::random();
+        assert!(!heads.range_cooling_down(&peer, 100, 2));
+        heads.note_range_failure(peer, 100);
+        assert!(heads.range_cooling_down(&peer, 100, 2));
+        assert!(heads.range_cooling_down(&peer, 101, 2));
+        assert!(!heads.range_cooling_down(&peer, 102, 2));
+        // A reconnect starts clean.
+        heads.note_range_failure(peer, 200);
+        heads.forget(&peer);
+        assert!(!heads.range_cooling_down(&peer, 200, 2));
     }
 
     #[test]

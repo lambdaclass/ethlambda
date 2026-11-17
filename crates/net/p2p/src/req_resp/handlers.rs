@@ -613,9 +613,15 @@ async fn handle_lean_status_request(
     // fire at different points in the slot, one of them only ever receives
     // requests, so a request that shows a lead has to be able to start the
     // sync too. Lighthouse does the same: both go through `process_status`.
-    // Held to a refresh answer's lead, since it arrives as often as one.
+    on_lean_status_request(server, peer, &request).await;
+}
+
+/// A lean peer's own `Status` request, once answered: recorded, and synced
+/// towards like an answer to a refresh, whose lead it is held to since it
+/// arrives as often as one.
+async fn on_lean_status_request(server: &mut P2PServer, peer: PeerId, status: &Status) {
     let refresh_lead = Some(peer_heads::thresholds(&server.store).peer_lead);
-    on_lean_status(server, peer, &request, refresh_lead).await;
+    on_lean_status(server, peer, status, refresh_lead).await;
 }
 
 /// Record a lean peer's `Status`, whether its request or its answer to ours,
@@ -652,6 +658,16 @@ fn sync_towards_peer(
     head_slot: u64,
     refresh_lead: Option<u64>,
 ) -> bool {
+    // A peer that just failed a range request is not synced towards again
+    // for a refresh interval (see `PeerHeads::range_cooling_down`).
+    let wall_slot = crate::wall_clock_slot(&server.store);
+    let cooldown = peer_heads::thresholds(&server.store).status_refresh_slots;
+    if server
+        .peer_heads
+        .range_cooling_down(&peer, wall_slot, cooldown)
+    {
+        return false;
+    }
     let fetched_through = server.range_fetched_through;
     let Some(target_range) =
         status_sync_target(fetched_through, head_slot, peer_head_slot, refresh_lead)
@@ -687,7 +703,10 @@ fn sync_towards_peer(
 /// would fetch them all again.
 async fn handle_lean_status_response(server: &mut P2PServer, status: Status, peer: PeerId) {
     trace!(finalized_slot=%status.finalized.slot, head_slot=%status.head.slot, "Received status response from peer {peer}");
-    let refresh = server.peer_heads.answer_is_refresh(peer);
+    // Checked first, so an answer delivered after the disconnect does not
+    // count against the next connection's handshake.
+    let refresh =
+        server.connected_peers.contains_key(&peer) && server.peer_heads.answer_is_refresh(peer);
     let refresh_lead = refresh.then(|| peer_heads::thresholds(&server.store).peer_lead);
     on_lean_status(server, peer, &status, refresh_lead).await;
 }
@@ -1555,6 +1574,8 @@ fn columns_without_known_custodian(server: &P2PServer, columns: &[u64]) -> Vec<u
 }
 
 fn fail_range_request(server: &mut P2PServer, peer: &PeerId) {
+    let wall_slot = crate::wall_clock_slot(&server.store);
+    server.peer_heads.note_range_failure(*peer, wall_slot);
     let should_clear = if let Some(state) = &mut server.range_sync_state {
         state.fail_peer(peer);
         state.peer_set.is_empty()
@@ -1965,7 +1986,9 @@ async fn handle_status_response(
     status: BeaconStatus,
     ctx: &Context<P2PServer>,
 ) {
-    let refresh = server.peer_heads.answer_is_refresh(peer);
+    // Checked first, as on lean.
+    let refresh =
+        server.connected_peers.contains_key(&peer) && server.peer_heads.answer_is_refresh(peer);
     let Some(wire) = server.wire.beacon() else {
         return;
     };
@@ -3439,19 +3462,39 @@ pub(crate) mod tests {
         let lead = SyncThresholds::LEAN.peer_lead;
         let unknown = H256::repeat_byte(0x11);
 
-        on_lean_status(
-            &mut server,
-            peer,
-            &lean_status_at(unknown, lead),
-            Some(lead),
-        )
-        .await;
+        on_lean_status_request(&mut server, peer, &lean_status_at(unknown, lead)).await;
         assert!(server.range_sync_state.is_none());
 
-        on_lean_status(&mut server, peer, &lean_status_at(unknown, 500), Some(lead)).await;
+        on_lean_status_request(&mut server, peer, &lean_status_at(unknown, 500)).await;
         let state = server.range_sync_state.as_ref().expect("past the lead");
         assert_eq!(state.current_range, 1..501);
         assert!(state.in_flight, "the first batch goes out at once");
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_failed_a_range_request_is_not_synced_towards_at_once() {
+        // Finding: a peer's requests are not rate limited and the highest head
+        // gets the next batch, so a peer claiming a head it does not serve
+        // rejoined after every failure and took every batch.
+        let mut server = unconnected_server().await;
+        let liar = connected_peer(&mut server);
+        let unknown = H256::repeat_byte(0x11);
+        on_lean_status_request(&mut server, liar, &lean_status_at(unknown, 500)).await;
+        assert!(server.range_sync_state.is_some());
+
+        fail_range_request(&mut server, &liar);
+        assert!(server.range_sync_state.is_none());
+        on_lean_status_request(&mut server, liar, &lean_status_at(unknown, 501)).await;
+        assert!(server.range_sync_state.is_none());
+        // Its claim still counts towards the network head the gate reads.
+        assert_eq!(server.store.network_head(), Some(501));
+
+        // An honest peer is synced from meanwhile.
+        let honest = connected_peer(&mut server);
+        on_lean_status_request(&mut server, honest, &lean_status_at(unknown, 400)).await;
+        let state = server.range_sync_state.as_ref().expect("honest peer");
+        assert!(state.peer_set.contains_key(&honest));
+        assert!(!state.peer_set.contains_key(&liar));
     }
 
     #[tokio::test]
@@ -3487,7 +3530,9 @@ pub(crate) mod tests {
         let mut server = unconnected_server().await;
         let interval = SyncThresholds::LEAN.status_refresh_slots;
         let wall = crate::wall_clock_slot(&server.store);
-        let peers: Vec<PeerId> = (0..4).map(|_| PeerId::random()).collect();
+        // Five, so that asking nobody (five still due, three returned) and
+        // asking the share (two still due) cannot look alike.
+        let peers: Vec<PeerId> = (0..5).map(|_| PeerId::random()).collect();
         for &peer in &peers {
             server
                 .connected_peers
@@ -3519,6 +3564,14 @@ pub(crate) mod tests {
         }
         // Moving back counts as moving.
         assert_eq!(watch.flat_for(4, 80), 0);
+        // Each drop at a head doubles the wait; moving resets it.
+        assert_eq!(watch.patience(16), 16);
+        watch.note_drop(4, 100);
+        assert_eq!(watch.patience(16), 32);
+        watch.note_drop(4, 140);
+        assert_eq!(watch.patience(16), 64);
+        assert_eq!(watch.flat_for(5, 150), 0);
+        assert_eq!(watch.patience(16), 16);
     }
 
     #[tokio::test]
@@ -3533,21 +3586,27 @@ pub(crate) mod tests {
         server.expire_range_watermark(100 + window);
         assert_eq!(server.range_fetched_through, 2000);
 
-        // A range session still running keeps it.
+        // A range session running keeps it, and restarts the count: the
+        // blocks its last batch handed over get a whole window to import
+        // once it ends.
         let session = RangeSyncState::new(1..10, PeerId::random(), 10);
         server.range_sync_state = Some(session);
-        server.expire_range_watermark(101 + window);
+        let ended = 101 + window;
+        server.expire_range_watermark(ended);
         assert_eq!(server.range_fetched_through, 2000);
         server.range_sync_state = None;
-        server.expire_range_watermark(101 + window);
+        server.expire_range_watermark(ended + 1);
+        server.expire_range_watermark(ended + window);
+        assert_eq!(server.range_fetched_through, 2000);
+        server.expire_range_watermark(ended + window + 1);
         assert_eq!(server.range_fetched_through, head);
 
-        // The count starts over, so a head that cannot move is fetched for at
-        // most once a window.
+        // A head that cannot move waits twice as long for the next drop.
+        let dropped = ended + window + 1;
         server.range_fetched_through = 2000;
-        server.expire_range_watermark(101 + 2 * window);
+        server.expire_range_watermark(dropped + 2 * window);
         assert_eq!(server.range_fetched_through, 2000);
-        server.expire_range_watermark(102 + 2 * window);
+        server.expire_range_watermark(dropped + 2 * window + 1);
         assert_eq!(server.range_fetched_through, head);
     }
 
