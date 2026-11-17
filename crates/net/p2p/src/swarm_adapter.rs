@@ -410,7 +410,8 @@ impl SlowPeers {
         if priority <= SLOW_PEER_REPORT_THRESHOLD && non_priority <= SLOW_PEER_REPORT_THRESHOLD {
             return;
         }
-        *self.reported.entry(peer_id).or_default() += priority + non_priority;
+        let reported = self.reported.entry(peer_id).or_default();
+        *reported = reported.saturating_add(priority.saturating_add(non_priority));
     }
 
     /// Closes one check: a peer reported since the last one extends its
@@ -427,7 +428,7 @@ impl SlowPeers {
         for (peer_id, failed) in reported {
             let (checks, total) = self.streaks.entry(peer_id).or_default();
             *checks += 1;
-            *total += failed;
+            *total = total.saturating_add(failed);
             if *checks >= SLOW_PEER_CHECK_LIMIT {
                 persistent.push((peer_id, *total));
             }
