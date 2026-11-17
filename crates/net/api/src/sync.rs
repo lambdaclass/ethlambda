@@ -39,14 +39,19 @@ use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
 pub struct SyncThresholds {
     /// Slots the head may trail the wall clock before the node can be syncing.
     pub clock_lag: u64,
-    /// Slots the peers' head must lead ours before the node can be syncing.
+    /// The node can be syncing only once the peers' head leads ours by more
+    /// than this many slots (a lead of exactly `peer_lead` is not enough).
     ///
-    /// Also how far ahead a peer must be before its answer to a `Status`
-    /// *refresh*, or its own `Status` request, starts a range sync. A
-    /// handshake answer starts one at any lead, but refreshes and requests
-    /// land every few slots on a node that is keeping up with gossip, where a
-    /// peer a slot ahead is ordinary and a one-block range request would only
-    /// race gossip.
+    /// Also how far ahead a peer must be (more than this) before its answer
+    /// to a `Status` *refresh*, or its own `Status` request, starts a range
+    /// sync. A handshake answer starts one at any lead, but refreshes and
+    /// requests land every few slots on a node that is keeping up with
+    /// gossip, where a peer a slot ahead is ordinary and a one-block range
+    /// request would only race gossip. Once syncing, the gate keeps counting
+    /// a lead down through the [`Self::hysteresis`] band, where a refresh
+    /// starts no range sync: a lead that small is filled by gossip and the
+    /// parent lookups its blocks start, and a head that stays below it is
+    /// bounded by [`Self::stall_window`] like any other.
     pub peer_lead: u64,
     /// Recovery band: once syncing, the node reports synced again only when
     /// the clock lag or the peer lead drops this many slots below its
@@ -136,6 +141,13 @@ impl SyncThresholds {
     /// last reported [`Self::status_refresh_slots`] ago sees a lead of
     /// `clock_lag - status_refresh_slots`, which has to clear
     /// [`Self::peer_lead`].
+    ///
+    /// The bound assumes the refreshes are answered. A report kept past one
+    /// that failed (see [`Self::report_lifetime`]) is older, and can show no
+    /// lead at all (on lean, one as old as the lifetime shows none from a
+    /// node just past the clock threshold). That node reads as synced until
+    /// the peer answers again, as it would with the report expired: keeping a
+    /// report can only add a lead, never take one away.
     pub const fn is_consistent(&self) -> bool {
         self.peer_lead + self.status_refresh_slots < self.clock_lag
             && self.hysteresis <= self.clock_lag

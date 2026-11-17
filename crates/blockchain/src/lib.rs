@@ -945,16 +945,14 @@ impl BlockChainServer {
     /// returned before doing so. That keeps a return added to the tick later
     /// from leaving the gate unjudged.
     async fn on_tick(&mut self, timestamp_ms: u64, ctx: &Context<Self>) {
-        self.run_tick(timestamp_ms, ctx).await;
-        let time_config = self.store.config().time_grid();
-        let since_genesis_ms = timestamp_ms.saturating_sub(time_config.genesis_time_ms());
-        let slot = since_genesis_ms / time_config.milliseconds_per_slot.max(1);
+        let slot = self.run_tick(timestamp_ms, ctx).await;
         if self.sync_status.judged_through() < slot {
             self.update_sync_status(slot);
         }
     }
 
-    async fn run_tick(&mut self, timestamp_ms: u64, ctx: &Context<Self>) {
+    /// One tick at `timestamp_ms`; returns its wall-clock slot.
+    async fn run_tick(&mut self, timestamp_ms: u64, ctx: &Context<Self>) -> u64 {
         let time_config = self.store.config().time_grid();
 
         // Calculate current slot and interval from milliseconds
@@ -993,7 +991,7 @@ impl BlockChainServer {
                 store_time,
                 "Skipping already-processed tick"
             );
-            return;
+            return slot;
         }
 
         // Fail fast: a state with zero validators is invalid and would cause
@@ -1008,7 +1006,7 @@ impl BlockChainServer {
         };
         if self.store.chain() == Chain::Lean && num_validators == 0 {
             error!("Head state has no validators, skipping tick");
-            return;
+            return slot;
         }
 
         // Update current slot metric
@@ -1128,6 +1126,7 @@ impl BlockChainServer {
         // anything, when the clock advance above crosses an epoch boundary and
         // pulls up unrealized checkpoints.
         self.refresh_chain_metrics();
+        slot
     }
 
     /// Push the head, justified and finalized slots to their gauges.
@@ -1289,13 +1288,19 @@ impl BlockChainServer {
         }
     }
 
-    /// This chain's head slot: `Store::head_slot` on lean,
-    /// `Store::beacon_head` on beacon, which decode different tables. Zero on
-    /// a beacon store with no head recorded yet.
+    /// This chain's head slot: [`Self::known_head_slot`], zero on a beacon
+    /// store with no head recorded yet.
     fn head_slot(&self) -> u64 {
+        self.known_head_slot().unwrap_or(0)
+    }
+
+    /// This chain's head slot: `Store::head_slot` on lean,
+    /// `Store::beacon_head` on beacon, which decode different tables. `None`
+    /// on a beacon store with no head recorded yet.
+    fn known_head_slot(&self) -> Option<u64> {
         match self.store.chain() {
-            Chain::Lean => self.store.head_slot(),
-            Chain::Beacon => self.store.beacon_head().map_or(0, |(slot, _)| slot),
+            Chain::Lean => Some(self.store.head_slot()),
+            Chain::Beacon => self.store.beacon_head().map(|(slot, _)| slot),
         }
     }
 
@@ -2560,8 +2565,7 @@ impl BlockChainServer {
             metrics::update_head_slot(head_slot);
         }
         self.pin_head_shufflings(head);
-        let head_slot = head.map_or(0, |(slot, _)| slot);
-        self.judge_sync_status(self.wall_clock_slot(), head_slot);
+        self.judge_sync_status(self.wall_clock_slot(), head.map(|(slot, _)| slot));
         timings
     }
 
@@ -3636,7 +3640,7 @@ impl BlockChainServer {
     /// (lean's `Store::head_slot` and beacon's `Store::beacon_head` decode
     /// different tables). For a caller that has not just read the head.
     fn update_sync_status(&mut self, current_slot: u64) {
-        let head_slot = self.head_slot();
+        let head_slot = self.known_head_slot();
         self.judge_sync_status(current_slot, head_slot);
     }
 
@@ -3650,9 +3654,13 @@ impl BlockChainServer {
     /// the node does not follow (see [`Self::clock_is_past_followed_forks`])
     /// the network is treated as being at the clock, since no peer on that
     /// fork can tell it so.
-    fn judge_sync_status(&mut self, current_slot: u64, head_slot: u64) {
+    ///
+    /// `head_slot` is `None` with no head recorded yet, which is judged as a
+    /// head at slot zero.
+    fn judge_sync_status(&mut self, current_slot: u64, head_slot: Option<u64>) {
         // P2P reads the head slot from here rather than decoding the head.
         self.store.set_head_slot_hint(head_slot);
+        let head_slot = head_slot.unwrap_or(0);
         let past_followed_forks = self.store.chain() == Chain::Beacon
             && Self::clock_is_past_followed_forks(&self.store.config(), current_slot, head_slot);
         let status = if past_followed_forks {

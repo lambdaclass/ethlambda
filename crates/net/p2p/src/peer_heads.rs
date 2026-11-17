@@ -521,11 +521,10 @@ pub(crate) fn drop_claim(server: &mut P2PServer, peer: &PeerId) {
     }
 }
 
-/// Make `peer` a suspect for the blocks it handed over through slot
-/// `through` (see [`PeerHeads::suspects`]), and republish the network head
-/// without its claim.
-pub(crate) fn suspect(server: &mut P2PServer, peer: &PeerId, through: u64) {
-    let wall_slot = crate::wall_clock_slot(&server.store);
+/// Make `peer` a suspect, as of `wall_slot`, for the blocks it handed over
+/// through slot `through` (see [`PeerHeads::suspects`]), and republish the
+/// network head without its claim.
+pub(crate) fn suspect(server: &mut P2PServer, peer: &PeerId, through: u64, wall_slot: u64) {
     server.peer_heads.suspect(*peer, through, wall_slot);
     publish(server);
 }

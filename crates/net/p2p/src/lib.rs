@@ -32,7 +32,10 @@ use std::{
     net::{IpAddr, SocketAddr},
     num::{NonZeroU8, NonZeroUsize},
     ops::Range,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -608,7 +611,22 @@ impl HeadWatch {
     }
 }
 
+/// What a cached beacon `Status` was built from (see
+/// [`P2PServer::beacon_status_v2`]), all of it read without the head block.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StatusKey {
+    wall_slot: u64,
+    head: Option<H256>,
+    finalized: Option<H256>,
+}
+
+/// The next [`RangeSyncState::id`].
+static NEXT_RANGE_SESSION: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) struct RangeSyncState {
+    /// This session's identity, carried by what is scheduled for it, so that
+    /// something outliving the session is not taken for a later one's.
+    pub(crate) id: u64,
     /// Remaining slots to request, with an exclusive end.
     pub(crate) current_range: Range<u64>,
     /// Latest advertised head slot for each peer.
@@ -643,6 +661,7 @@ pub(crate) enum CustodyWait {
 impl RangeSyncState {
     pub(crate) fn new(current_range: Range<u64>, peer: PeerId, peer_head: u64) -> Self {
         Self {
+            id: NEXT_RANGE_SESSION.fetch_add(1, Ordering::Relaxed),
             current_range,
             peer_set: HashMap::from([(peer, peer_head)]),
             in_flight: false,
@@ -1536,9 +1555,9 @@ pub struct P2PServer {
     /// `range_sync_target`. Dropped back to the head when the blocks above
     /// the head never import; see [`Self::expire_range_watermark`].
     pub(crate) range_fetched_through: u64,
-    /// This node's beacon `Status` (v2), with the wall-clock slot and the head
-    /// slot hint it was built at; see [`Self::beacon_status_v2`].
-    pub(crate) beacon_status: Option<(u64, Option<u64>, beacon::messages::StatusV2)>,
+    /// This node's beacon `Status` (v2), with what it was built from; see
+    /// [`Self::beacon_status_v2`].
+    pub(crate) beacon_status: Option<(StatusKey, beacon::messages::StatusV2)>,
     /// How long the store's head has stayed put, for
     /// [`Self::expire_range_watermark`].
     pub(crate) head_watch: HeadWatch,
@@ -1707,7 +1726,7 @@ pub(crate) trait P2PProtocol: Send + Sync {
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_envelope_fetch(&self, block_root: H256) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
-    fn resume_range_after_envelopes(&self) -> Result<(), ActorError>;
+    fn resume_range_after_envelopes(&self, session: u64) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_peer_redial(&self, peer_id: PeerId) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
@@ -1751,13 +1770,19 @@ impl P2PServer {
         }
     }
 
+    /// A range answer's envelopes are checked and forwarded. The check runs
+    /// on its own task, so the session that asked for them may have ended
+    /// meanwhile (`end_range_session`), and a later one may be waiting on
+    /// envelopes of its own, which this must not release.
     #[send_handler]
     async fn handle_resume_range_after_envelopes(
         &mut self,
-        _msg: p2p_protocol::ResumeRangeAfterEnvelopes,
+        msg: p2p_protocol::ResumeRangeAfterEnvelopes,
         ctx: &Context<Self>,
     ) {
-        req_resp::handlers::release_envelope_gate(self, ctx).await;
+        if self.is_range_session(msg.session) {
+            req_resp::handlers::release_envelope_gate(self, ctx).await;
+        }
     }
 
     #[send_handler]
@@ -1920,7 +1945,9 @@ impl P2PServer {
     }
 
     /// The deadline of a range batch held back for custody. Scheduled once,
-    /// when the batch starts waiting; see [`RANGE_BATCH_CUSTODY_WAIT`].
+    /// when the batch starts waiting; see [`RANGE_BATCH_CUSTODY_WAIT`]. One
+    /// that outlives its session only re-checks: a later session's batch
+    /// waits from its own start (`RangeSyncState::wait_for_custody`).
     #[send_handler]
     async fn handle_retry_beacon_range_batch(
         &mut self,
@@ -2140,8 +2167,8 @@ pub(crate) fn wall_clock_slot(store: &Store) -> u64 {
 /// The refresh timer's period: one slot, each tick asking that slot's share
 /// of the peers that are due.
 fn status_refresh_tick(store: &Store) -> Duration {
-    // The same slot length `wall_clock_slot` divides by.
-    Duration::from_millis(store.config().time_grid().milliseconds_per_slot)
+    // The same slot length `wall_clock_slot` divides by, floored the same way.
+    Duration::from_millis(store.config().time_grid().milliseconds_per_slot.max(1))
 }
 
 /// The `Status` the periodic refresh sends, built once per refresh tick
@@ -2164,6 +2191,13 @@ impl RefreshStatus {
 }
 
 impl P2PServer {
+    /// Whether `id` is the range session running now.
+    pub(crate) fn is_range_session(&self, id: u64) -> bool {
+        self.range_sync_state
+            .as_ref()
+            .is_some_and(|state| state.id == id)
+    }
+
     /// The head slot: as the chain actor last published it
     /// (`Store::head_slot_hint`), or read from the head before its first
     /// judgment. On beacon, reading the head decodes the whole head block.
@@ -2176,26 +2210,37 @@ impl P2PServer {
             })
     }
 
-    /// This node's beacon `Status` in v2, shared by every inbound request and
-    /// the refresh: building one decodes the head block, and requests are not
-    /// rate limited on the wire. Rebuilt on a new slot, a new head (as the
-    /// chain actor publishes it, so at most one judgment stale) or a new fork
-    /// digest. `None` on a lean node.
+    /// This node's beacon `Status` in v2, shared by every inbound request, the
+    /// handshake and the refresh: building one decodes the head block, and
+    /// requests are not rate limited on the wire.
+    ///
+    /// Rebuilt whenever what it says can have changed: a new head root (a
+    /// reorg within the slot included), a new finalized checkpoint, a new
+    /// fork digest, and at least once a wall-clock slot, which also covers
+    /// the window before the anchor block is stored, when the head root
+    /// names no block yet. The two roots are metadata reads; it is the
+    /// head's slot that takes the decode. `None` on a lean node.
     pub(crate) fn beacon_status_v2(&mut self) -> Option<beacon::messages::StatusV2> {
         let wire = self.wire.beacon()?;
-        let slot = wall_clock_slot(&self.store);
-        let head = self.store.head_slot_hint();
+        let key = StatusKey {
+            wall_slot: wall_clock_slot(&self.store),
+            head: self.store.head().ok(),
+            finalized: self
+                .store
+                .latest_finalized()
+                .ok()
+                .map(|checkpoint| checkpoint.root),
+        };
         // A fork-digest switch within the slot counts too: a peer that
         // switched would take the old digest for another network.
-        if let Some((built_at, built_on, status)) = &self.beacon_status
-            && *built_at == slot
-            && *built_on == head
+        if let Some((built_from, status)) = &self.beacon_status
+            && *built_from == key
             && status.fork_digest == wire.fork_digest
         {
             return Some(status.clone());
         }
         let status = beacon::handler::build_status_v2(&self.store, wire);
-        self.beacon_status = Some((slot, head, status.clone()));
+        self.beacon_status = Some((key, status.clone()));
         Some(status)
     }
 
@@ -2291,16 +2336,18 @@ impl P2PServer {
         // head passes what it handed over.
         self.end_range_session();
         for (peer, through) in self.head_watch.note_drop(head_slot, wall_slot) {
-            peer_heads::suspect(self, &peer, through);
+            peer_heads::suspect(self, &peer, through, wall_slot);
         }
     }
 
     /// End the range session, with its requests in flight: an answer to one
     /// now matches no request, so it cannot raise the watermark again or
     /// release a later session's envelope gate. The envelope gate and a batch
-    /// held for custody belong to the session and go with it:
-    /// `release_envelope_gate` and the custody timer act on whatever session
-    /// there is when they run, so a later session starts with its gate open.
+    /// held for custody belong to the session and go with it, so a later
+    /// session starts with its gate open. Nor can what is already scheduled
+    /// for this one act on a later one: an envelope check's release names
+    /// its session, and a custody deadline only re-checks a wait that runs
+    /// from the later session's own start.
     fn end_range_session(&mut self) {
         self.range_sync_state = None;
         self.outbound_requests.retain(|_, kind| {
@@ -2410,16 +2457,16 @@ async fn handle_swarm_event(
                     "success",
                 );
                 // Compute the beacon status and its log fields first, so no
-                // borrow of `server.wire` is alive across the send.
-                let beacon_status = server.wire.beacon().map(|wire| {
-                    (
-                        beacon::handler::build_status(
-                            &server.store,
-                            wire,
-                            beacon::handler::StatusVersion::V1,
-                        ),
-                        hex::encode(wire.fork_digest),
-                    )
+                // borrow of `server` is alive across the send. The cached
+                // `Status`, as an inbound request gets: a burst of connections
+                // would otherwise decode the head block once each.
+                let beacon_status = server.beacon_status_v2().map(|status| {
+                    let digest = hex::encode(status.fork_digest);
+                    let status = beacon::handler::status_in_version(
+                        &status,
+                        beacon::handler::StatusVersion::V1,
+                    );
+                    (status, digest)
                 });
                 match beacon_status {
                     Some((status, digest)) => {
@@ -4345,6 +4392,81 @@ mod tests {
         assert!(!state.in_flight);
         assert!(!state.peer_set.contains_key(&stale_peer));
         assert_eq!(state.peer_set.get(&current_peer), Some(&2999));
+    }
+
+    /// Finding: the cached `Status` was keyed on the head's slot, so a reorg
+    /// onto a sibling at the same slot, or finality moving under a head that
+    /// stayed, went on advertising the old roots until the next slot.
+    #[tokio::test]
+    async fn the_cached_status_follows_the_head_root_and_finality_within_a_slot() {
+        use ethlambda_storage::ForkCheckpoints;
+        use ethlambda_types::beacon::containers::{SignedBeaconBlock, phase0};
+        use ethlambda_types::beacon::primitives::Root;
+        use ethlambda_types::checkpoint::Checkpoint;
+
+        let mut server = crate::test_support::unconnected_beacon_server(
+            ethlambda_types::beacon::config::Config::mainnet(),
+            0,
+        )
+        .await;
+        let block = |slot: u64, graffiti: u8| {
+            SignedBeaconBlock::Phase0(phase0::SignedBeaconBlock {
+                message: phase0::BeaconBlock {
+                    slot,
+                    proposer_index: 0,
+                    parent_root: Root::ZERO,
+                    state_root: Root::ZERO,
+                    body: phase0::BeaconBlockBody {
+                        randao_reveal: Default::default(),
+                        eth1_data: Default::default(),
+                        graffiti: Root::repeat_byte(graffiti),
+                        proposer_slashings: Default::default(),
+                        attester_slashings: Default::default(),
+                        attestations: Default::default(),
+                        deposits: Default::default(),
+                        voluntary_exits: Default::default(),
+                    },
+                },
+                signature: Default::default(),
+            })
+        };
+        // The anchor the store was initialized with, then two siblings at one
+        // slot, told apart by their graffiti.
+        server
+            .store
+            .insert_signed_block(H256::ZERO, block(0, 0))
+            .expect("insert anchor");
+        let mut siblings = Vec::new();
+        for graffiti in [1, 2] {
+            let block = block(5, graffiti);
+            let root = block.message_hash_tree_root();
+            server
+                .store
+                .insert_signed_block(root, block)
+                .expect("insert");
+            siblings.push(root);
+        }
+        let head = ForkCheckpoints::head_only(siblings[0]);
+        server.store.update_checkpoints(head).expect("head");
+        let status = server.beacon_status_v2().expect("a beacon node");
+        assert_eq!(status.head_root, siblings[0]);
+
+        // Within the slot, and with the slot hint never set (nor would it
+        // change: the slot is the same).
+        let head = ForkCheckpoints::head_only(siblings[1]);
+        server.store.update_checkpoints(head).expect("reorg");
+        let status = server.beacon_status_v2().expect("a beacon node");
+        assert_eq!(status.head_root, siblings[1]);
+        assert_eq!(status.head_slot, 5);
+
+        let finalized = Checkpoint {
+            root: siblings[1],
+            slot: 5,
+        };
+        let finality = ForkCheckpoints::new(siblings[1], None, Some(finalized));
+        server.store.update_checkpoints(finality).expect("finality");
+        let status = server.beacon_status_v2().expect("a beacon node");
+        assert_eq!(status.finalized_root, siblings[1]);
     }
 
     #[test]

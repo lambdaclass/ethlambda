@@ -243,11 +243,13 @@ pub async fn request_metadata(server: &P2PServer, peer_id: PeerId) {
 /// sends `status/2`. A refresh asks in the version the peer last answered in,
 /// so a peer that has dropped v1 is asked in v2 from then on rather than
 /// refused and retried every time.
-pub async fn retry_status_on_other_version(server: &P2PServer, peer_id: PeerId) {
-    let Some(wire) = server.wire.beacon() else {
+///
+/// Sends the cached `Status` (see `P2PServer::beacon_status_v2`).
+pub async fn retry_status_on_other_version(server: &mut P2PServer, peer_id: PeerId) {
+    let Some(status) = server.beacon_status_v2() else {
         return;
     };
-    let status = build_status(&server.store, wire, StatusVersion::V2);
+    let status = status_in_version(&status, StatusVersion::V2);
     debug!(%peer_id, "Retrying the beacon handshake on status/2");
     send_status(server, peer_id, status).await;
 }

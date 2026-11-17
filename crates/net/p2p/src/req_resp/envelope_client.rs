@@ -358,13 +358,18 @@ pub(super) async fn handle_envelopes_by_range_response(
     if dropped > 0 {
         debug!(%peer, start_slot, end_slot, dropped, "Dropping out-of-range envelopes");
     }
+    // The release names this session: the check runs on its own task, and
+    // the session may have ended by the time it finishes.
+    let session = server.range_sync_state.as_ref().map(|state| state.id);
     let resume = ctx.clone();
     let done: envelope_checks::Done = Box::new(move || {
-        send_after(
-            Duration::ZERO,
-            resume,
-            p2p_protocol::ResumeRangeAfterEnvelopes,
-        );
+        if let Some(session) = session {
+            send_after(
+                Duration::ZERO,
+                resume,
+                p2p_protocol::ResumeRangeAfterEnvelopes { session },
+            );
+        }
     });
     envelope_checks::check_and_forward_then(server, envelopes, Some(done));
 }
@@ -588,6 +593,20 @@ mod tests {
         assert!(state.next_batch().is_none());
         state.envelopes_pending = false;
         assert!(state.next_batch().is_some());
+    }
+
+    /// Finding: an envelope check finishing after its range session ended
+    /// released whatever session was running then, so a later session's
+    /// next batch could go before its own envelopes were forwarded.
+    #[tokio::test]
+    async fn a_release_belongs_to_the_session_it_was_scheduled_for() {
+        let mut server = crate::test_support::unconnected_beacon_server(Config::mainnet(), 0).await;
+        let peer = PeerId::random();
+        server.range_sync_state = Some(crate::RangeSyncState::new(0..100, peer, 99));
+        let ended = server.range_sync_state.as_ref().unwrap().id;
+        assert!(server.is_range_session(ended));
+        server.range_sync_state = Some(crate::RangeSyncState::new(0..100, peer, 99));
+        assert!(!server.is_range_session(ended));
     }
 
     /// The release runs the completion callback even with nothing to forward,

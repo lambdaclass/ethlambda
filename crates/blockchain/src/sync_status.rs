@@ -885,6 +885,47 @@ mod tests {
     }
 
     #[test]
+    fn no_head_course_below_its_mark_idles_a_node_for_long() {
+        // The backstop's bound with the head moving: a head wandering below
+        // the highest it reached (branch flips, `INVALID` cuts, re-imports),
+        // never past it, with a peer claiming a lead throughout, starts the
+        // window over once on its first move back, once per new high on the
+        // way back up, and once more for one deeper cut. A wander over
+        // `depth` slots therefore idles the node for at most `2 * depth + 3`
+        // windows, however long it goes on.
+        for thresholds in [LEAN, BEACON] {
+            let window = thresholds.stall_window;
+            for seed in 1..=300u64 {
+                let mut rng = XorShift(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+                let mut tracker = SyncStatusTracker::new(true, thresholds);
+                let mark = 60;
+                let depth = 1 + rng.below(5);
+                let start = mark + 2 * thresholds.clock_lag + 1;
+                let mut head = mark;
+                let mut idle_slots = 0;
+                for current in start..start + 100 * window {
+                    let mut idle = false;
+                    for _ in 0..1 + rng.below(3) {
+                        // Now and then the head moves, anywhere within
+                        // `depth` of the mark.
+                        if rng.below(4) == 0 {
+                            head = mark - rng.below(depth + 1);
+                        }
+                        let status = tracker.update(current, head, Some(current));
+                        idle |= status == SyncStatus::Syncing;
+                    }
+                    idle_slots += u64::from(idle);
+                }
+                let bound = (2 * depth + 3) * window + 2;
+                assert!(
+                    idle_slots <= bound,
+                    "seed {seed}, window {window}, depth {depth}: idle for {idle_slots} slots"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_single_judgment_behind_does_not_use_up_the_renewal() {
         // Finding: one judgment behind, then a long lapse, used up the fresh
         // window an outage after real counting would need.

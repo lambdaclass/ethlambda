@@ -551,7 +551,10 @@ pub async fn handle_req_resp_message(
                                 .note_status_version(peer, StatusVersion::V1);
                         }
                     }
-                    if request_id.protocol == ReqRespProtocol::BeaconStatusV1 && unsupported {
+                    if request_id.protocol == ReqRespProtocol::BeaconStatusV1
+                        && unsupported
+                        && server.connected_peers.contains_key(&peer)
+                    {
                         // The handshake goes on, on `status/2`.
                         crate::beacon::handler::retry_status_on_other_version(server, peer).await;
                     } else if is_status_protocol(request_id.protocol) {
@@ -955,11 +958,12 @@ async fn handle_lean_blocks_by_range_response(
             in_range
         })
         .collect();
-    // No block in the range asked for is as good as no answer: counted as a
-    // success, a single stray block would clear a peer's cooldown (see
-    // `PeerHeads::range_cooling_down`) without serving anything.
+    // No block in the range asked for serves nothing: counted as a success, a
+    // single stray block would clear a peer's cooldown (see
+    // `PeerHeads::range_cooling_down`). Whether it counts against the peer is
+    // `fail_empty_range_answer`'s call.
     if blocks.is_empty() {
-        fail_range_request(server, &peer);
+        fail_empty_range_answer(server, &peer, start_slot, end_slot);
         debug!(%peer, start_slot, end_slot, "Received no block in the requested range");
         return;
     }
@@ -1651,8 +1655,37 @@ fn columns_without_known_custodian(server: &P2PServer, columns: &[u64]) -> Vec<u
         .collect()
 }
 
+/// Count a failed range request against `peer` (a cooldown, and suspicion
+/// once they add up; see [`peer_heads::note_range_failure`]), and take it out
+/// of the range session.
 fn fail_range_request(server: &mut P2PServer, peer: &PeerId) {
     peer_heads::note_range_failure(server, peer);
+    drop_from_range_session(server, peer);
+}
+
+/// [`fail_range_request`] for an answer with no block in
+/// `start_slot..=end_slot`, which counts against `peer` only when the span
+/// holds the head it claims, the one slot it must have a block at. A span
+/// below that head can be skipped slots throughout (a long run of missed
+/// proposals, the very recovery the gate is for), and one above it holds
+/// nothing the peer said it had, so an honest peer can answer either with
+/// nothing; held against it, the answer would take its claim out of the
+/// network head. The peer leaves the session either way. A peer with no
+/// standing claim has nothing to excuse an empty answer with.
+fn fail_empty_range_answer(server: &mut P2PServer, peer: &PeerId, start_slot: u64, end_slot: u64) {
+    let excused = server
+        .peer_heads
+        .claimed_head(peer)
+        .is_some_and(|claimed| !(start_slot..=end_slot).contains(&claimed));
+    if excused {
+        drop_from_range_session(server, peer);
+    } else {
+        fail_range_request(server, peer);
+    }
+}
+
+/// Take `peer` out of the range session, which ends with no peer left.
+fn drop_from_range_session(server: &mut P2PServer, peer: &PeerId) {
     let should_clear = if let Some(state) = &mut server.range_sync_state {
         state.fail_peer(peer);
         state.peer_set.is_empty()
@@ -1891,8 +1924,14 @@ async fn handle_status_request(
     // one that is not.
     // At most one request a slot per peer is acted on, as on lean.
     let wall_slot = crate::wall_clock_slot(&server.store);
-    let act_on = server.connected_peers.contains_key(&peer)
-        && server.peer_heads.inbound_due(peer, wall_slot);
+    let connected = server.connected_peers.contains_key(&peer);
+    // A peer on a digest this node does not sync from has no claim on the
+    // chain being followed, however soon after its last request it says so.
+    // Dropping one is cheap; it is the rest that is paced.
+    if connected && !syncable {
+        peer_heads::drop_claim(server, &peer);
+    }
+    let act_on = connected && server.peer_heads.inbound_due(peer, wall_slot);
     if act_on {
         server
             .peer_heads
@@ -1917,7 +1956,6 @@ async fn handle_status_request(
         } else {
             debug!(%peer, peer_digest = %hex::encode(peer_digest), "Peer still on another fork digest");
         }
-        peer_heads::drop_claim(server, &peer);
     } else {
         server.peer_heads.note_digest(peer, None);
         trace!(
@@ -1934,8 +1972,6 @@ async fn handle_status_request(
                 peer_status.head_root(),
             );
             counted = report == Report::Counted;
-        } else {
-            peer_heads::drop_claim(server, &peer);
         }
     }
 
@@ -2131,9 +2167,11 @@ async fn handle_status_response(
         peer_heads::drop_claim(server, &peer);
         return;
     }
-    // Counted only once the answer is one this node syncs from: an answer
-    // from another digest around a fork boundary must not use up the
-    // handshake's any-lead start for the first answer that can sync.
+    // The handshake is the first answer this node can sync from, whatever it
+    // shows: one from another digest around a fork boundary must not use up
+    // its any-lead start, but one with a head this node holds (or past the
+    // clock) does, since the handshake found nothing to fetch and later
+    // leads are the refresh's to judge.
     let refresh = server.peer_heads.answer_is_refresh(peer);
     let peer_head_slot = status.head_slot();
     trace!(
@@ -2854,9 +2892,9 @@ async fn handle_beacon_blocks_by_range_response(
             in_range
         })
         .collect();
-    // As on lean: no block in the range asked for is as good as no answer.
+    // As on lean: no block in the range asked for serves nothing.
     if blocks.is_empty() {
-        fail_range_request(server, &peer);
+        fail_empty_range_answer(server, &peer, start_slot, end_slot);
         debug!(%peer, start_slot, end_slot, "Received no block in the requested range");
         return;
     }
@@ -3632,6 +3670,34 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn an_empty_answer_counts_against_a_peer_only_over_its_claimed_head() {
+        // Finding: an empty answer over skipped slots below the head a peer
+        // claims cooled it down and, three in a row, made it a suspect, which
+        // took an honest claim out of the network head while the peer was
+        // serving a sparse span.
+        let mut server = unconnected_server().await;
+        let peer = connected_peer(&mut server);
+        let unknown = H256::repeat_byte(0x11);
+        on_lean_status_request(&mut server, peer, &lean_status_at(unknown, 500)).await;
+        assert!(server.range_sync_state.is_some());
+        let wall = crate::wall_clock_slot(&server.store);
+        let interval = SyncThresholds::LEAN.status_refresh_slots;
+        // Three in a row is what makes a peer a suspect.
+        for _ in 0..3 {
+            handle_lean_blocks_by_range_response(&mut server, Vec::new(), peer, 10, 20).await;
+        }
+        assert!(!server.peer_heads.range_cooling_down(&peer, wall, interval));
+        assert!(!server.peer_heads.is_suspect(&peer));
+        assert_eq!(server.store.network_head(), Some(500));
+        // It leaves the session all the same.
+        assert!(server.range_sync_state.is_none());
+
+        // A span holding the head it claims is one it owes a block in.
+        handle_lean_blocks_by_range_response(&mut server, Vec::new(), peer, 490, 510).await;
+        assert!(server.peer_heads.range_cooling_down(&peer, wall, interval));
+    }
+
+    #[tokio::test]
     async fn a_peer_that_keeps_failing_becomes_a_suspect_for_its_claim() {
         // Finding: a cooldown runs out, and with the head moving on by gossip
         // each return of the claim started the stall window over, so a peer
@@ -3795,7 +3861,7 @@ pub(crate) mod tests {
         // `INVALID` cut) left the watermark above it, so the cut-out range
         // was never asked for again from the branch the head now follows.
         let mut server = unconnected_server().await;
-        server.store.set_head_slot_hint(100);
+        server.store.set_head_slot_hint(Some(100));
         server.range_fetched_through = 100;
         server.expire_range_watermark(200);
         assert_eq!(server.range_fetched_through, 100);
@@ -3803,7 +3869,7 @@ pub(crate) mod tests {
         let peer = connected_peer(&mut server);
         server.range_sync_state = Some(RangeSyncState::new(101..200, peer, 200));
         server.head_watch.note_delivery(peer, 100);
-        server.store.set_head_slot_hint(90);
+        server.store.set_head_slot_hint(Some(90));
         server.expire_range_watermark(201);
         assert_eq!(server.range_fetched_through, 90);
         // The session goes, its cursor being past the cut-out span, and the

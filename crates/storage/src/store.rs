@@ -3341,20 +3341,23 @@ impl Store {
     /// The head slot the chain actor last judged the sync gate at, which P2P
     /// reads instead of the head itself: on beacon, reading the head decodes
     /// the whole head block, and the chain actor has just read it anyway.
-    /// `None` before the actor's first judgment. As old as the latest
-    /// judgment, which follows every head change on beacon; on lean the tick
-    /// judges before it may move the head, so it can trail the head by an
-    /// interval. Runtime-only and shared by every clone of this `Store`.
+    /// `None` before the actor's first judgment, and while a beacon head row
+    /// names a block the store holds no header for yet (see
+    /// [`Store::beacon_head`]). As old as the latest judgment, which follows
+    /// every head change on beacon; on lean the tick judges before it may
+    /// move the head, so it can trail the head by an interval. Runtime-only
+    /// and shared by every clone of this `Store`.
     pub fn head_slot_hint(&self) -> Option<u64> {
         let slot = self.head_slot_hint.load(Ordering::Relaxed);
         (slot != UNSET_SLOT).then_some(slot)
     }
 
-    /// Publish the head slot; see [`Self::head_slot_hint`]. The chain actor
-    /// is the only writer.
-    pub fn set_head_slot_hint(&self, slot: u64) {
-        self.head_slot_hint
-            .store(slot.min(UNSET_SLOT - 1), Ordering::Relaxed);
+    /// Publish the head slot, `None` for no head; see
+    /// [`Self::head_slot_hint`]. The chain actor is the only writer.
+    pub fn set_head_slot_hint(&self, slot: Option<u64>) {
+        // A slot at the sentinel would read back as no head: clamp it.
+        let slot = slot.map_or(UNSET_SLOT, |slot| slot.min(UNSET_SLOT - 1));
+        self.head_slot_hint.store(slot, Ordering::Relaxed);
     }
 
     /// The total-active-balance cache shared by every clone of this store.
