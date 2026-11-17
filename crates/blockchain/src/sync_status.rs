@@ -59,9 +59,19 @@ pub(crate) struct SyncStatusTracker {
     /// `--disable-duty-sync-gate` flag (gating stays on by default).
     gate_duties: bool,
     thresholds: SyncThresholds,
-    /// The head slot progress is measured from: the highest the head has
-    /// reached, or where it last moved back to. Set by the first update.
-    progress_head: Option<u64>,
+    /// The latest wall-clock slot judged at. A judgment carrying an older one
+    /// (a tick handled behind a catch-up's arrivals) is judged at this one,
+    /// so time never runs backwards between judgments.
+    last_slot: u64,
+    /// The highest head reached since the stall window last started over.
+    /// Only an advance past it is progress. Set by the first update.
+    high_water: Option<u64>,
+    /// The head at the last judgment, to tell a move back.
+    last_head: Option<u64>,
+    /// Whether a move back has already started the window over at this
+    /// high-water mark. Once per mark, so a head flipping between two branches
+    /// cannot hold the window open by restarting it on every flip.
+    moved_back: bool,
     /// Slots the node has spent behind on its peers' word since its head last
     /// advanced, measured against [`SyncThresholds::stall_window`].
     ///
@@ -87,9 +97,9 @@ pub(crate) struct SyncStatusTracker {
     renewed: bool,
     /// The head slot at which a peer-reported lead was given up on for making
     /// no progress (see [`SyncThresholds::stall_window`]). Holds the node
-    /// synced until the head moves past it: the peers that claimed the lead
-    /// repeat it on every refresh, so a fresh report is no reason to believe
-    /// them again.
+    /// synced until the head makes progress (past [`Self::high_water`]): the
+    /// peers that claimed the lead repeat it on every refresh, so a fresh
+    /// report is no reason to believe them again.
     stalled_at_head: Option<u64>,
 }
 
@@ -100,7 +110,10 @@ impl SyncStatusTracker {
             syncing: false,
             gate_duties,
             thresholds,
-            progress_head: None,
+            last_slot: 0,
+            high_water: None,
+            last_head: None,
+            moved_back: false,
             behind_for: 0,
             counted_at: None,
             lapsed_at: None,
@@ -153,33 +166,30 @@ impl SyncStatusTracker {
             ..
         } = self.thresholds;
 
-        let progress_head = *self.progress_head.get_or_insert(head_slot);
-        if head_slot > progress_head {
-            self.progress_head = Some(head_slot);
-            self.behind_for = 0;
-            self.counted_at = None;
-            self.lapsed_at = None;
-            self.renewed = false;
-        } else if head_slot < progress_head {
+        // One clock: lean's tick judges at the slot it was scheduled for, an
+        // arrival at the wall clock's, and a tick handled behind a catch-up's
+        // arrivals would otherwise take time backwards and count slots twice.
+        let current_slot = current_slot.max(self.last_slot);
+        self.last_slot = current_slot;
+
+        let high_water = *self.high_water.get_or_insert(head_slot);
+        let last_head = self.last_head.replace(head_slot).unwrap_or(head_slot);
+        if head_slot > high_water {
+            // Progress: past every head reached since the window last started
+            // over. The window starts over, and a lead given up on is believed
+            // again.
+            self.high_water = Some(head_slot);
+            self.moved_back = false;
+            self.start_window_over();
+        } else if head_slot < last_head && !self.moved_back {
             // The head moved back (an `INVALID` execution verdict cutting a
             // branch out, a reorg onto a shorter branch). The peers may have
-            // been right about the chain all along, so the stall window starts
-            // over and a lead given up on is believed again, as after an
-            // advance; progress is measured from where the head now is, or
-            // the re-imports below the old mark would not count. Only fork
-            // choice moves the head, so no peer can do this to the node.
-            self.progress_head = Some(head_slot);
-            self.behind_for = 0;
-            self.counted_at = None;
-            self.lapsed_at = None;
-            self.renewed = false;
-            self.stalled_at_head = None;
-        }
-        if self
-            .stalled_at_head
-            .is_some_and(|stalled| head_slot > stalled)
-        {
-            self.stalled_at_head = None;
+            // been right about the chain all along, so the window starts over
+            // and a lead given up on is believed again, once per high-water
+            // mark: climbing back to it is not progress, and a head flipping
+            // between two branches must not restart the window on every flip.
+            self.moved_back = true;
+            self.start_window_over();
         }
 
         let network_head = if network_at_clock {
@@ -269,6 +279,15 @@ impl SyncStatusTracker {
         } else {
             SyncStatus::Synced
         }
+    }
+
+    /// Start the stall window over, and believe a lead given up on again.
+    fn start_window_over(&mut self) {
+        self.behind_for = 0;
+        self.counted_at = None;
+        self.lapsed_at = None;
+        self.renewed = false;
+        self.stalled_at_head = None;
     }
 
     /// Whether the tracker currently considers the node to be syncing,
@@ -470,17 +489,60 @@ mod tests {
     }
 
     #[test]
-    fn a_head_that_moves_back_and_climbs_again_is_progress() {
-        // An `INVALID` execution verdict moves the head back. Re-importing
-        // from there is progress even while still below the old head.
+    fn a_head_that_moves_back_gets_one_fresh_window() {
+        // An `INVALID` execution verdict moves the head back: the window
+        // starts over there. Climbing back towards the old head is not
+        // progress past it, so the window then runs out as usual.
         let mut tracker = steady_lean();
         assert_eq!(tracker.update(100, 60, Some(100)), SyncStatus::Syncing);
         assert_eq!(tracker.update(105, 50, Some(105)), SyncStatus::Syncing);
         assert_eq!(tracker.update(110, 51, Some(110)), SyncStatus::Syncing);
-        let past_the_old_window = 101 + LEAN.stall_window;
+        let end = 105 + LEAN.stall_window;
+        assert_eq!(tracker.update(end, 55, Some(end)), SyncStatus::Syncing);
         assert_eq!(
-            tracker.update(past_the_old_window, 51, Some(past_the_old_window)),
-            SyncStatus::Syncing
+            tracker.update(end + 1, 55, Some(end + 1)),
+            SyncStatus::Synced
+        );
+    }
+
+    #[test]
+    fn a_head_flipping_between_two_branches_does_not_hold_the_window_open() {
+        // Finding: every flip, up or down, started the window over, so a head
+        // flipping between branches at two slots, with a peer claiming a lead
+        // throughout, kept the node idle indefinitely.
+        let mut tracker = steady_lean();
+        assert_eq!(tracker.update(100, 60, Some(100)), SyncStatus::Syncing);
+        let mut gave_up_at = None;
+        let last = 100 + 4 * LEAN.stall_window;
+        for current in 101..=last {
+            let head = if current % 2 == 0 { 60 } else { 59 };
+            let status = tracker.update(current, head, Some(current));
+            if status == SyncStatus::Synced {
+                gave_up_at.get_or_insert(current);
+            }
+            if current == last {
+                assert_eq!(status, SyncStatus::Synced, "stays given up on");
+            }
+        }
+        let gave_up_at = gave_up_at.expect("the window ran out");
+        assert!(gave_up_at <= 102 + LEAN.stall_window, "{gave_up_at}");
+    }
+
+    #[test]
+    fn a_judgment_older_than_the_last_counts_no_slot_twice() {
+        // Finding: lean's tick judges at the slot it was scheduled for, and a
+        // tick handled behind a catch-up's arrivals took time backwards, so
+        // the next arrival counted the same slots again.
+        let mut tracker = steady_lean();
+        assert_eq!(tracker.update(100, 50, Some(100)), SyncStatus::Syncing);
+        tracker.update(110, 50, Some(110));
+        tracker.update(105, 50, Some(105));
+        tracker.update(110, 50, Some(110));
+        let end = 100 + LEAN.stall_window;
+        assert_eq!(tracker.update(end, 50, Some(end)), SyncStatus::Syncing);
+        assert_eq!(
+            tracker.update(end + 1, 50, Some(end + 1)),
+            SyncStatus::Synced
         );
     }
 
