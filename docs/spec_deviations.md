@@ -78,9 +78,10 @@ head trails the wall clock **and** its peers report a head ahead of it.
   counts as such a failure even over a span an honest chain skipped every slot
   of (a long run of missed proposals): it cannot be told from a peer claiming
   a head it does not serve, and excused, that peer would take a range batch
-  on every `Status` it sends. Peers serving such a span stop counting for a
-  while, and the node can read as synced while the parent lookups of newer
-  blocks fill the gap. The cost: if the node's own
+  on every `Status` it sends. Range sync does not step past a span a whole
+  batch long with no block either way (its cursor moves only on delivered
+  blocks): the parent lookups of newer blocks fill it, and the peers serving
+  it stop counting for a while, so the node can read as synced meanwhile. The cost: if the node's own
   import stalls for a window (an execution client down), honest peers that
   delivered stop counting too, and the node reads as synced on its stale head
   until the head passes what they handed over, or for 4 stall windows at

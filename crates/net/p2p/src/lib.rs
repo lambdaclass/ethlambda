@@ -2214,8 +2214,9 @@ impl P2PServer {
     /// reorg within the slot included), a new finalized checkpoint, a new
     /// fork digest, and at least once a wall-clock slot, which also covers
     /// the window before the anchor block is stored, when the head root
-    /// names no block yet. The two roots are metadata reads; it is the
-    /// head's slot that takes the decode. `None` on a lean node.
+    /// names no block yet. The head root and the finalized checkpoint are
+    /// metadata reads; it is the head's slot that takes the decode. `None` on
+    /// a lean node.
     pub(crate) fn beacon_status_v2(&mut self) -> Option<beacon::messages::StatusV2> {
         let wire = self.wire.beacon()?;
         let key = StatusKey {
@@ -2324,9 +2325,9 @@ impl P2PServer {
         self.range_fetched_through = head_slot;
         // A session still running is fetching past blocks that never
         // imported, and its batch in flight would raise the watermark again:
-        // both go, and an answer to that batch now matches no request (its
-        // envelope request too, or its answer would release a later
-        // session's batch early). Whoever handed the blocks over was not
+        // both go, and an answer to that batch now matches no request (nor
+        // to its envelope request, for the same blocks). Whoever handed the
+        // blocks over was not
         // serving the chain the head can follow, and is a suspect until the
         // head passes what it handed over.
         self.end_range_session();
@@ -2336,10 +2337,10 @@ impl P2PServer {
     }
 
     /// End the range session, with its requests in flight: an answer to one
-    /// now matches no request, so it cannot raise the watermark again or
-    /// release a later session's envelope gate. The envelope gate and a batch
-    /// held for custody belong to the session and go with it, so a later
-    /// session starts with its gate open. Nor can anything of this one's that
+    /// now matches no request, so it cannot raise the watermark again, and
+    /// its envelope requests go too, being for the blocks given up on. The
+    /// envelope gate and a batch held for custody belong to the session and
+    /// go with it, so a later session starts with its gate open. Nor can anything of this one's that
     /// outlives it act on a later one: an envelope request names its session,
     /// and so does every release it leads to (its answer, its failure, and
     /// the check after the answer), and a custody deadline only re-checks a
@@ -4463,6 +4464,18 @@ mod tests {
         server.store.update_checkpoints(finality).expect("finality");
         let status = server.beacon_status_v2().expect("a beacon node");
         assert_eq!(status.finalized_root, siblings[1]);
+        assert_eq!(status.finalized_epoch, 0);
+
+        // An epoch with no block finalizes on the same root: only the epoch
+        // moves.
+        let finalized = Checkpoint {
+            root: siblings[1],
+            slot: SLOTS_PER_EPOCH,
+        };
+        let finality = ForkCheckpoints::new(siblings[1], None, Some(finalized));
+        server.store.update_checkpoints(finality).expect("finality");
+        let status = server.beacon_status_v2().expect("a beacon node");
+        assert_eq!(status.finalized_epoch, 1);
     }
 
     #[test]

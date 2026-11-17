@@ -961,13 +961,11 @@ async fn handle_lean_blocks_by_range_response(
             in_range
         })
         .collect();
-    // No block in the range asked for is as good as no answer: counted as a
-    // success, a single stray block would clear a peer's cooldown (see
-    // `PeerHeads::range_cooling_down`) without serving anything. That holds
-    // below the head the peer claims too, although an honest chain can skip
-    // every slot of such a span: the two cannot be told apart from here, and a
-    // peer excused for it would take a batch on every `Status` it sends, the
-    // session's cursor never moving past the span (see the stall window in
+    // No block in the range asked for is as good as no answer, below the head
+    // the peer claims too, although an honest chain can skip every slot of
+    // such a span: the two cannot be told apart from here, and a peer excused
+    // for it would take a batch on every `Status` it sends, the session's
+    // cursor never moving past the span (see the stall window in
     // `docs/spec_deviations.md`).
     if blocks.is_empty() {
         fail_range_request(server, &peer);
@@ -1855,14 +1853,11 @@ fn beacon_wire_or_refuse(
 ///
 /// Does not use [`beacon_wire_or_refuse`]: that helper takes `&mut P2PServer`
 /// and returns a `&BeaconWire` tied to its whole lifetime, which is fine for
-/// [`handle_ping`] and [`handle_metadata_request`] below, neither of which
-/// needs another field of `server` alive at the same time. This handler does:
-/// `build_status` now reads `&server.store` alongside `wire`, and a `wire`
-/// borrowed through that helper's `&mut P2PServer` parameter would hold the
-/// whole server borrowed for as long as it lives, not just `server.wire`,
-/// which would make `&server.store` a conflicting borrow. Reading
-/// `server.wire.beacon()` directly, as below, borrows only that one field, so
-/// `&server.store` can be taken alongside it.
+/// [`handle_ping`] and [`handle_metadata_request`] below, which need nothing
+/// else of `server` while it lives. This handler reads the peer's digest
+/// against `wire` and then needs `server` again (the cached `Status`, the
+/// peer's records), so it reads `server.wire.beacon()` directly: a borrow of
+/// that one field, which ends where `wire` is last used.
 async fn handle_status_request(
     server: &mut P2PServer,
     peer: PeerId,
@@ -3907,8 +3902,7 @@ pub(crate) mod tests {
             end_slot: 10,
         };
         server.outbound_requests.insert(in_flight, batch);
-        // And its envelope request: a late answer must not release a later
-        // session's batch.
+        // And its envelope request, for the same blocks.
         let envelopes_in_flight = server
             .swarm_handle
             .send_request(
@@ -3918,10 +3912,11 @@ pub(crate) mod tests {
             )
             .await
             .expect("a request id");
+        let session = server.range_sync_state.as_ref().map(|state| state.id);
         let envelopes = PendingRequestKind::EnvelopeRange {
             start_slot: 1,
             end_slot: 10,
-            session: None,
+            session,
         };
         server
             .outbound_requests
