@@ -16,6 +16,7 @@ use axum::routing::{get, post};
 use axum::{Extension, Router};
 use subtle::ConstantTimeEq as _;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::Error;
@@ -187,6 +188,25 @@ pub fn router(context: KeymanagerContext, token: String) -> Router {
 
 /// The largest request body the keymanager API reads.
 const KEYMANAGER_BODY_LIMIT: usize = 64 * 1024 * 1024;
+
+/// Serve the keymanager API on `listener` until `shutdown` is cancelled, then
+/// stop accepting requests and return once the ones in flight have answered.
+///
+/// Stopping that way matters to an import. It saves its keys before it
+/// registers them, and takes them off disk again if the registration fails
+/// (see [`keystores::import`]). Dropped in between, as it would be if the
+/// runtime went away under it, it leaves keys that are saved and enabled with
+/// no slashing-protection record, which the next start refuses, and the start
+/// after that.
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    router: Router,
+    shutdown: CancellationToken,
+) -> std::io::Result<()> {
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown.cancelled_owned())
+        .await
+}
 
 #[derive(Clone)]
 struct ApiToken(String);

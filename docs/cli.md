@@ -279,7 +279,13 @@ implementation's, so none of the [common flags](#common-flags) apply to it.
 > regular file, since a dangling one would read as "no record"; and
 > the directory should be a local disk, since every signature waits for the
 > record to be flushed to it, and the lock that keeps a second process off it
-> is an `flock`, which a network filesystem may not honour. Unix only. A key with no record is refused at startup unless
+> is an `flock`, which a network filesystem may not honour. Unix only. Run the
+> client under a supervisor that restarts it (systemd's `Restart=on-failure`,
+> a Kubernetes pod): if a bug ever panics while the record is held, the record
+> is unusable for the rest of that process and no attestation or block can be
+> signed, so the client stops at once and exits with a failure, after letting
+> a keymanager request in flight finish, and the restart rereads the record
+> from disk. A key with no record is refused at startup unless
 > `--init-slashing-protection` is passed. A key moving here from another client
 > brings its history with [`slashing-protection import`](#slashing-protection),
 > or in the same keymanager API request that imports the key. See
@@ -313,8 +319,12 @@ advance so it can collect the votes.
 Each slot it wakes at the boundary. If one of its validators proposes that
 slot, it signs the RANDAO reveal, asks the beacon node for a block, checks that
 the block is for the slot and proposer it asked about, signs it and publishes
-it. One third into the slot it fetches the attestation data, signs for every
-validator due that slot, and submits the batch. Two thirds in, for any duty it
+it. One third into the slot it fetches the attestation data, checks that it is
+for the slot it asked about and that its `index` is one the slot's fork allows
+(0 before gloas, 0 or 1 from it, where it is the payload signal), signs for
+every validator due that slot, and submits the batch. A node whose answer fails
+either check is passed over for the next one in `--beacon-nodes`, before
+anything is recorded or signed. Two thirds in, for any duty it
 was selected to aggregate, it asks the node for the aggregate covering that
 committee's votes on the data it just signed, wraps it with the selection proof
 and publishes it.
@@ -545,7 +555,7 @@ ethlambda slashing-protection export --validators-dir ./validators --pubkeys 0xa
 | Sub-command | Does |
 |---|---|
 | `import <file>` | Merges a version 5 interchange, complete or minimal, into the record. Each validator is reduced to its highest slot, source and target and merged by maximum, so nothing already recorded is lowered and slashable data in the file is absorbed rather than refused, except an attestation whose source is at or past its target outside genesis, which is refused. All or nothing. With no record yet, the import creates one for the interchange's chain, and a failed import creates nothing; the client refuses the record at its next start if that is not its beacon node's chain |
-| `export [--pubkeys ...] <file>` | Writes the record, or the named validators' part of it, as a minimal version 5 interchange, readable by its owner only. A named validator with no record fails the export, so a typo or the wrong directory cannot produce a file that reads as complete. Takes the record's lock, so the directory must be writable. Refuses to overwrite an existing file |
+| `export [--pubkeys ...] <file>` | Writes the record, or the named validators' part of it, as a minimal version 5 interchange, readable by its owner only. A named validator with no record fails the export, so a typo or the wrong directory cannot produce a file that reads as complete. Writes nothing to the directory, and the lock is on the directory itself, so a read-only one will do. Refuses to overwrite an existing file |
 
 ## `benchmark import` flags
 

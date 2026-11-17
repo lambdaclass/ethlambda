@@ -472,6 +472,14 @@ mod tests {
     use crate::beacon_node::mock::MockBeaconNode;
     use ethlambda_types::beacon::primitives::Root;
 
+    /// The fork a caller asks about `slot` under: the one mainnet's schedule
+    /// puts it in, as `AttestationService` derives it, rather than one made
+    /// up here that the slot does not belong to.
+    fn fork_of(slot: Slot) -> ForkName {
+        let epoch = ethlambda_types::beacon::signing::compute_epoch_at_slot(slot);
+        ethlambda_types::beacon::config::Config::mainnet().fork_at_epoch(epoch)
+    }
+
     fn healthy() -> MockBeaconNode {
         let mut node = MockBeaconNode::new();
         node.genesis = Some(Genesis {
@@ -510,7 +518,7 @@ mod tests {
         let fallback = FallbackBeaconNode::new(vec![stale, fresh]);
 
         let data = fallback
-            .attestation_data(96, ForkName::Electra)
+            .attestation_data(96, fork_of(96))
             .await
             .expect("the second node answers correctly");
 
@@ -530,11 +538,35 @@ mod tests {
         ]);
 
         let err = fallback
-            .attestation_data(96, ForkName::Electra)
+            .attestation_data(96, fork_of(96))
             .await
             .expect_err("no node answered about the requested slot");
 
         assert!(matches!(err, Error::AllBeaconNodesFailed(_)), "got {err:?}");
+    }
+
+    /// The same arrangement for the index: a node answering with one no vote
+    /// at the slot's fork can carry is failed over from, rather than its
+    /// answer being signed, recorded and then rejected by every peer.
+    #[tokio::test]
+    async fn a_node_answering_with_an_index_invalid_at_the_fork_is_failed_over_from() {
+        // Slot 96 is before gloas, where the index is zero; node 1 answers 1
+        // regardless.
+        let wrong = MockBeaconNode::new()
+            .with_attestation_data(96)
+            .with_attestation_index(1);
+        let right = MockBeaconNode::new().with_attestation_data(96);
+        let fallback = FallbackBeaconNode::new(vec![wrong, right]);
+
+        let data = fallback
+            .attestation_data(96, fork_of(96))
+            .await
+            .expect("the second node answers correctly");
+
+        assert_eq!(
+            data.index, 0,
+            "the invalid answer must not be the one returned"
+        );
     }
 
     /// A syncing node at the head of the list must not stop duties being

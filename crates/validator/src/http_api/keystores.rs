@@ -388,12 +388,18 @@ pub async fn import(
             undo_import(&context, &mut definitions, &added, &replaced, &files)
         }
     };
-    if let Err(err) = &rolled_back {
-        tracing::error!(
+    match &rolled_back {
+        Ok(()) => {}
+        Err(UndoFailure::Definitions(err)) => tracing::error!(
             %err,
-            "Could not undo a failed import; the next start refuses its keys until they have a \
-             slashing-protection record"
-        );
+            "Could not undo a failed import; the next start refuses the keys it added until \
+             they have a slashing-protection record"
+        ),
+        Err(UndoFailure::Files(left)) => tracing::error!(
+            keys = left.len(),
+            "A failed import's definitions entries are undone, so the next start loads nothing \
+             it added, but not all of its keystore and password files could be put back"
+        ),
     }
 
     // The definitions guard stays held across the store lock, in the order
@@ -406,34 +412,11 @@ pub async fn import(
         .into_iter()
         .map(|result| match (result, &registration) {
             (Ok((_, secret, _)), Ok(_)) => finish_import(&mut store, &secret),
-            (Ok((pubkey, _, _)), Err(err)) => {
-                if before.contains_key(&pubkey) {
-                    // Its keystore was rewritten; its entry is back as it was
-                    // and nothing about it changed in memory, so it stays
-                    // whatever it was, loaded since startup in the ordinary
-                    // case.
-                    let entry = if rolled_back.is_ok() {
-                        "its definitions entry is back as it was"
-                    } else {
-                        "its definitions entry could not be put back"
-                    };
-                    KeyStatus::error(format!(
-                        "keystore rewritten, but the slashing-protection record could not be \
-                         written: {err}; {entry}"
-                    ))
-                } else if rolled_back.is_err() {
-                    // Still on disk, not loaded now, and refused at the next
-                    // start until it has a record.
-                    KeyStatus::error(format!(
-                        "saved, but not loaded: its slashing-protection record could not be \
-                         written: {err}"
-                    ))
-                } else {
-                    KeyStatus::error(format!(
-                        "not imported: its slashing-protection record could not be written: {err}"
-                    ))
-                }
-            }
+            (Ok((pubkey, _, _)), Err(err)) => unregistered_status(
+                before.contains_key(&pubkey),
+                Undone::of(&rolled_back, &pubkey),
+                err,
+            ),
             (Err(status), _) => status,
         })
         .collect();
@@ -443,6 +426,83 @@ pub async fn import(
     Json(StatusResponse { data })
 }
 
+/// What [`undo_import`] could not undo, by the step that failed, since the
+/// two leave different things on disk.
+#[derive(Debug)]
+enum UndoFailure {
+    /// The definitions file could not be saved, so nothing was undone: the
+    /// entries the request wrote are the ones on disk, and so are its
+    /// keystore and password files. A key it added is listed with no record,
+    /// which the next start refuses.
+    Definitions(Error),
+    /// The definitions file is back as it was, so the next start loads
+    /// nothing the request added, but the keystore or password file of these
+    /// keys could not be put back.
+    Files(Vec<(BlsPubkey, Error)>),
+}
+
+/// What became of one saved key when its registration failed and the import
+/// was undone.
+#[derive(Debug, Clone, Copy)]
+enum Undone<'a> {
+    /// Its entry and its files are what they were before the request.
+    Fully,
+    /// Nothing was put back: its entry and its files are the request's.
+    NotAtAll,
+    /// Its entry is what it was before the request; its files are not, for
+    /// this reason.
+    EntryOnly(&'a Error),
+}
+
+impl<'a> Undone<'a> {
+    fn of(rolled_back: &'a std::result::Result<(), UndoFailure>, pubkey: &BlsPubkey) -> Self {
+        match rolled_back {
+            Ok(()) => Self::Fully,
+            Err(UndoFailure::Definitions(_)) => Self::NotAtAll,
+            Err(UndoFailure::Files(left)) => left
+                .iter()
+                .find(|(key, _)| key == pubkey)
+                .map_or(Self::Fully, |(_, err)| Self::EntryOnly(err)),
+        }
+    }
+}
+
+/// The status of a key that was saved but could not be registered: what is on
+/// disk for it now, which depends on how far the undo got. `listed_before` is
+/// whether the definitions file already listed the key, in which case the
+/// request rewrote its keystore rather than added one, and nothing about the
+/// key changed in memory: it stays whatever it was, loaded since startup in
+/// the ordinary case.
+fn unregistered_status(listed_before: bool, undone: Undone<'_>, err: &Error) -> KeyStatus {
+    let cause = format!("its slashing-protection record could not be written: {err}");
+    KeyStatus::error(match (listed_before, undone) {
+        (true, Undone::Fully) => format!(
+            "not imported: {cause}; its keystore and definitions entry are back as they were"
+        ),
+        (false, Undone::Fully) => format!("not imported: {cause}"),
+        (true, Undone::NotAtAll) => format!(
+            "keystore rewritten, but {cause}; the rewrite could not be undone, so its \
+             definitions entry, keystore and password are the ones this request wrote"
+        ),
+        // Still listed and enabled on disk, with no record: not loaded now,
+        // and `SlashingProtection::open` refuses the whole client for it.
+        (false, Undone::NotAtAll) => format!(
+            "saved, but not loaded: {cause}; it could not be taken off disk again, so the \
+             client will not start again until the key has a record or is removed"
+        ),
+        (true, Undone::EntryOnly(undo)) => format!(
+            "not imported: {cause}; its definitions entry is back as it was, but its keystore \
+             and password files could not be put back ({undo}) and may be the ones this \
+             request wrote"
+        ),
+        // Orphans: nothing lists them, so nothing loads them.
+        (false, Undone::EntryOnly(undo)) => format!(
+            "not imported: {cause}; its definitions entry is removed, but its keystore and \
+             password files could not be ({undo}) and are left behind, unused"
+        ),
+    })
+}
+
 /// Undo what a failed import did: the definitions entries it added are
 /// removed and the ones it replaced put back, in one save, then every
 /// keystore and password file it wrote goes back to what was at its path
@@ -450,13 +510,16 @@ pub async fn import(
 /// first, since it is what the next start loads from, so a crash in between
 /// leaves orphan files and never a key that would be loaded without a
 /// record. A file that is already gone is not an error.
+///
+/// Reports which step failed. A key whose files cannot be put back does not
+/// stop the others': each is tried, and the ones left are named.
 fn undo_import(
     context: &KeymanagerContext,
     definitions: &mut ValidatorDefinitions,
     added: &[BlsPubkey],
     replaced: &[(BlsPubkey, ValidatorDefinition)],
     files: &[(BlsPubkey, &Overwritten)],
-) -> crate::Result<()> {
+) -> std::result::Result<(), UndoFailure> {
     if added.is_empty() && replaced.is_empty() {
         return Ok(());
     }
@@ -472,19 +535,42 @@ fn undo_import(
             *definition = previous.clone();
         }
     }
-    save_definitions(context, definitions)?;
+    match save_definitions(context, definitions) {
+        Ok(()) => {}
+        // The file is replaced and every reader sees it, so the entries are
+        // undone and the files follow. Only its survival of a power loss is
+        // in doubt, and the file that would come back lists keys with no
+        // record, which the next start refuses.
+        Err(Error::Unflushed { path, source }) => warn!(
+            %path,
+            %source,
+            "Validator definitions put back, but the directory could not be flushed"
+        ),
+        Err(err) => return Err(UndoFailure::Definitions(err)),
+    }
     // Newest first: a key listed twice in one request snapshotted, the second
     // time, what the first time wrote, so the earliest snapshot must be the
     // one that lands last.
+    let mut left = Vec::new();
     for (pubkey, overwritten) in files.iter().rev() {
-        let [keystore, password] = written_paths(context, pubkey)?;
-        put_back(&keystore, overwritten.keystore.as_deref())?;
-        put_back(
-            &password,
-            overwritten.password.as_deref().map(|bytes| &bytes[..]),
-        )?;
+        // The password only after the keystore: one that stays the request's
+        // keeps the password it was encrypted under.
+        let put = written_paths(context, pubkey).and_then(|[keystore, password]| {
+            put_back(&keystore, overwritten.keystore.as_deref())?;
+            put_back(
+                &password,
+                overwritten.password.as_deref().map(|bytes| &bytes[..]),
+            )
+        });
+        if let Err(err) = put {
+            left.push((*pubkey, err));
+        }
     }
-    Ok(())
+    if left.is_empty() {
+        Ok(())
+    } else {
+        Err(UndoFailure::Files(left))
+    }
 }
 
 /// Put `path` back to `previous`: its former bytes, or nothing.
@@ -1380,7 +1466,7 @@ mod tests {
                 .expect("opens with no keys");
         let mut context =
             context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
-        context.protection = Arc::new(std::sync::Mutex::new(protection));
+        context.protection = crate::slashing_protection::SharedProtection::new(protection);
         let protection = context.protection.clone();
 
         let (_, body) = send(
@@ -1424,7 +1510,7 @@ mod tests {
         std::fs::create_dir(&record).expect("a directory in its place");
         let mut context =
             context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
-        context.protection = Arc::new(std::sync::Mutex::new(protection));
+        context.protection = crate::slashing_protection::SharedProtection::new(protection);
         let store = context.store.clone();
 
         let (_, body) = send(
@@ -1497,7 +1583,7 @@ mod tests {
             .expect("saves");
         let mut context =
             context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
-        context.protection = Arc::new(std::sync::Mutex::new(protection));
+        context.protection = crate::slashing_protection::SharedProtection::new(protection);
 
         let (_, body) = send(
             router(context, TOKEN.to_string()),
@@ -1512,11 +1598,12 @@ mod tests {
         )
         .await;
         assert_eq!(body["data"][0]["status"], "error", "got {body}");
+        // Not "keystore rewritten": the undo put the files back too, so the
+        // message must not send the operator looking for a new keystore.
+        let message = body["data"][0]["message"].as_str().unwrap_or_default();
+        assert!(message.starts_with("not imported"), "got {body}");
         assert!(
-            body["data"][0]["message"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("back as it was"),
+            message.ends_with("its keystore and definitions entry are back as they were"),
             "got {body}"
         );
         let definitions = ValidatorDefinitions::open(dir.path()).expect("opens");
@@ -1566,7 +1653,7 @@ mod tests {
             .expect("saves");
         let mut context =
             context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
-        context.protection = Arc::new(std::sync::Mutex::new(protection));
+        context.protection = crate::slashing_protection::SharedProtection::new(protection);
 
         let (_, body) = send(
             router(context, TOKEN.to_string()),
@@ -1641,9 +1728,174 @@ mod tests {
         assert_eq!(definitions.0, vec![previous]);
     }
 
-    /// A request that carries history is refused whole, importing nothing.
+    /// The entry an import writes for `pubkey` in `dir`.
+    fn imported_entry(dir: &std::path::Path, pubkey: &BlsPubkey) -> ValidatorDefinition {
+        let base = encode_hex(&pubkey.0);
+        ValidatorDefinition {
+            enabled: true,
+            voting_public_key: base.clone(),
+            voting_keystore_path: dir.join(format!("{base}.json")),
+            voting_keystore_password_path: dir.join(base),
+        }
+    }
+
+    /// A non-empty directory at `path`: neither a file to remove nor a place
+    /// a rename can land, whoever runs the test.
+    fn obstruct(path: &std::path::Path) {
+        std::fs::create_dir(path).expect("a directory in its place");
+        std::fs::write(path.join("inside"), b"x").expect("writes");
+    }
+
+    /// The undo's two steps leave different things on disk, and it says which
+    /// one failed. Here the definitions are saved and one key's keystore
+    /// cannot be removed: both entries are undone, that key is named, and the
+    /// other key's files still go, since one failure does not stop the rest.
+    #[test]
+    fn an_undo_names_the_keys_whose_files_it_could_not_put_back() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let context = context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
+        let (stuck, fine) = (BlsPubkey([1; 48]), BlsPubkey([2; 48]));
+        let stuck_entry = imported_entry(dir.path(), &stuck);
+        let fine_entry = imported_entry(dir.path(), &fine);
+        obstruct(&stuck_entry.voting_keystore_path);
+        std::fs::write(&stuck_entry.voting_keystore_password_path, b"password").expect("writes");
+        std::fs::write(&fine_entry.voting_keystore_path, b"keystore").expect("writes");
+        std::fs::write(&fine_entry.voting_keystore_password_path, b"password").expect("writes");
+        let mut definitions = ValidatorDefinitions(vec![stuck_entry.clone(), fine_entry.clone()]);
+        definitions.save(dir.path()).expect("saves");
+
+        // Neither key had files before. Undone newest first, so `stuck`
+        // fails before `fine` is reached.
+        let nothing = Overwritten {
+            keystore: None,
+            password: None,
+        };
+        let files = [(fine, &nothing), (stuck, &nothing)];
+        let failure = undo_import(&context, &mut definitions, &[stuck, fine], &[], &files)
+            .expect_err("one keystore cannot be removed");
+
+        let UndoFailure::Files(left) = &failure else {
+            panic!("the definitions were saved, got {failure:?}");
+        };
+        assert_eq!(
+            left.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            vec![stuck]
+        );
+        assert!(
+            ValidatorDefinitions::open(dir.path())
+                .expect("opens")
+                .0
+                .is_empty(),
+            "both entries are undone, so the next start loads neither key"
+        );
+        assert!(
+            !fine_entry.voting_keystore_path.exists()
+                && !fine_entry.voting_keystore_password_path.exists(),
+            "the other key's files still go"
+        );
+        assert!(
+            stuck_entry.voting_keystore_password_path.exists(),
+            "a keystore that stays keeps the password it was encrypted under"
+        );
+
+        let rolled_back = Err(failure);
+        assert!(matches!(
+            Undone::of(&rolled_back, &stuck),
+            Undone::EntryOnly(_)
+        ));
+        assert!(matches!(Undone::of(&rolled_back, &fine), Undone::Fully));
+    }
+
+    /// The other step: the definitions file cannot be saved, so nothing is
+    /// undone, the files the entry names are left where they are, and every
+    /// key of the request is reported that way.
+    #[test]
+    fn an_undo_that_cannot_save_the_definitions_undoes_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let context = context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
+        let key = BlsPubkey([1; 48]);
+        let entry = imported_entry(dir.path(), &key);
+        std::fs::write(&entry.voting_keystore_path, b"keystore").expect("writes");
+        std::fs::write(&entry.voting_keystore_password_path, b"password").expect("writes");
+        let mut definitions = ValidatorDefinitions(vec![entry.clone()]);
+        obstruct(&dir.path().join(crate::keys::definitions::DEFINITIONS_FILE));
+
+        let nothing = Overwritten {
+            keystore: None,
+            password: None,
+        };
+        let failure = undo_import(&context, &mut definitions, &[key], &[], &[(key, &nothing)])
+            .expect_err("the definitions cannot be saved");
+
+        assert!(
+            matches!(failure, UndoFailure::Definitions(_)),
+            "got {failure:?}"
+        );
+        assert!(
+            entry.voting_keystore_path.exists() && entry.voting_keystore_password_path.exists(),
+            "the files a still-listed entry names are not removed from under it"
+        );
+        assert!(matches!(Undone::of(&Err(failure), &key), Undone::NotAtAll));
+    }
+
+    /// Each way the undo can end gets a status that says what is on disk for
+    /// the key, and why the files stayed when they did.
+    #[test]
+    fn the_status_of_an_unregistered_key_says_what_is_on_disk() {
+        let err = Error::SlashingProtectionUnusable {
+            reason: "the record's reason".to_string(),
+        };
+        let undo = Error::Keystore {
+            path: "a path".to_string(),
+            reason: "the undo's reason".to_string(),
+        };
+        let message = |listed_before, undone| {
+            let status = unregistered_status(listed_before, undone, &err);
+            assert_eq!(status.status, "error");
+            let message = status.message.expect("an error says why");
+            assert!(message.contains("the record's reason"), "{message}");
+            message
+        };
+
+        let added = message(false, Undone::Fully);
+        assert!(added.starts_with("not imported"), "{added}");
+        let replaced = message(true, Undone::Fully);
+        assert!(
+            replaced.ends_with("its keystore and definitions entry are back as they were"),
+            "{replaced}"
+        );
+
+        let added = message(false, Undone::NotAtAll);
+        assert!(added.starts_with("saved, but not loaded"), "{added}");
+        assert!(added.contains("will not start again"), "{added}");
+        let replaced = message(true, Undone::NotAtAll);
+        assert!(replaced.starts_with("keystore rewritten"), "{replaced}");
+        assert!(replaced.contains("could not be undone"), "{replaced}");
+
+        let added = message(false, Undone::EntryOnly(&undo));
+        assert!(added.starts_with("not imported"), "{added}");
+        assert!(
+            added.contains("its definitions entry is removed"),
+            "{added}"
+        );
+        assert!(added.contains("left behind"), "{added}");
+        assert!(added.contains("the undo's reason"), "{added}");
+        let replaced = message(true, Undone::EntryOnly(&undo));
+        assert!(replaced.starts_with("not imported"), "{replaced}");
+        assert!(
+            replaced.contains("its definitions entry is back as it was"),
+            "{replaced}"
+        );
+        assert!(replaced.contains("could not be put back"), "{replaced}");
+        assert!(replaced.contains("the undo's reason"), "{replaced}");
+    }
+
+    /// A request whose history does not parse as an interchange is refused
+    /// whole, importing nothing: `{}` has neither metadata nor data. History
+    /// that does parse is imported with its keys (see
+    /// `an_import_brings_its_slashing_protection_history`).
     #[tokio::test]
-    async fn an_import_carrying_history_is_refused_whole() {
+    async fn an_import_whose_history_does_not_parse_is_refused_whole() {
         let dir = tempfile::tempdir().expect("temp dir");
         let context = context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
         let store = context.store.clone();
@@ -1662,6 +1914,14 @@ mod tests {
         )
         .await;
         assert_eq!(body["data"][0]["status"], "error", "got {body}");
+        // Refused for the history, and for its shape: not for the keystore,
+        // and not for some later step.
+        let message = body["data"][0]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with("slashing_protection was not imported")
+                && message.contains("malformed"),
+            "got {body}"
+        );
         assert!(store.read().await.pubkeys().is_empty());
         assert!(
             ValidatorDefinitions::open(dir.path())
@@ -1686,7 +1946,7 @@ mod tests {
         std::fs::create_dir(&record).expect("a directory in its place");
         let mut context =
             context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
-        context.protection = Arc::new(std::sync::Mutex::new(protection));
+        context.protection = crate::slashing_protection::SharedProtection::new(protection);
 
         let (_, body) = send(
             router(context, TOKEN.to_string()),
@@ -1724,6 +1984,118 @@ mod tests {
         );
     }
 
+    /// The reason the client stops gracefully. An import has saved its key
+    /// and is waiting to register it when a bug poisons the record: the
+    /// client stops, which used to drop the runtime with the request parked
+    /// there, leaving a key saved and enabled with no record, refused at
+    /// every start after. Told to stop instead, the server lets the import
+    /// meet the poisoned record, take its key off disk again and answer.
+    #[tokio::test]
+    async fn an_import_in_flight_when_the_record_is_poisoned_is_undone_before_the_client_stops() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (context, protection) = context_with_record(dir.path());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds");
+        let address = listener.local_addr().expect("bound");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let server = tokio::spawn({
+            let router = router(context, TOKEN.to_string());
+            let shutdown = shutdown.clone();
+            async move {
+                crate::http_api::serve(listener, router, shutdown)
+                    .await
+                    .expect("serves");
+            }
+        });
+
+        // Another access holds the record, so the import's registration
+        // waits for it, and will panic with it held: the bug.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (locked, is_locked) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn({
+            let protection = protection.clone();
+            move || {
+                let _guard = protection.lock().expect("not poisoned yet");
+                locked.send(()).expect("the test is waiting");
+                held.recv().expect("released");
+                panic!("a bug while holding the record");
+            }
+        });
+        is_locked.recv().expect("the record is held");
+
+        let request = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("http://{address}/eth/v1/keystores"))
+                .bearer_auth(TOKEN)
+                .json(&serde_json::json!({
+                    "keystores": [keystore_json()],
+                    "passwords": [PASSWORD],
+                }))
+                .send()
+                .await
+                .expect("the request in flight is answered")
+                .json::<serde_json::Value>()
+                .await
+                .expect("with a body")
+        });
+
+        // The import has saved its key once the definitions file lists it.
+        let saved = async {
+            loop {
+                let listed = ValidatorDefinitions::open(dir.path())
+                    .map(|definitions| !definitions.0.is_empty())
+                    .unwrap_or(false);
+                if listed {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(60), saved)
+            .await
+            .expect("the import saves its key");
+        release.send(()).expect("the holder is waiting");
+        holder.join().expect_err("the holder panics");
+
+        // What `run` does from here: stop on the record, the keymanager last.
+        let stopped = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            crate::run_until_stopped(std::future::pending(), &protection, shutdown, Some(server)),
+        )
+        .await
+        .expect("the client stops");
+        assert!(
+            matches!(stopped, Error::SlashingProtectionUnusable { .. }),
+            "got {stopped}"
+        );
+
+        // Checked before the answer is read: by the time the client is
+        // reported stopped, which is when the runtime goes, the import has
+        // already been undone.
+        assert!(
+            ValidatorStore::load(dir.path())
+                .expect("loads")
+                .pubkeys()
+                .is_empty(),
+            "the next start finds no key to refuse"
+        );
+        assert!(
+            !dir.path().join(format!("{KEYSTORE_PUBKEY}.json")).exists(),
+            "the keystore is off disk again"
+        );
+
+        let body = request.await.expect("the request task ends");
+        assert_eq!(body["data"][0]["status"], "error", "got {body}");
+        assert!(
+            body["data"][0]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("not imported"),
+            "got {body}"
+        );
+    }
+
     /// A key that fails to persist must leave no slashing-protection record
     /// behind: a record would later let the same keystore, copied in by hand,
     /// past the startup check as if it had been registered on purpose.
@@ -1744,7 +2116,7 @@ mod tests {
                 .expect("opens with no keys");
         let mut context =
             context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
-        context.protection = Arc::new(std::sync::Mutex::new(protection));
+        context.protection = crate::slashing_protection::SharedProtection::new(protection);
         let protection = context.protection.clone();
 
         let (_, body) = send(
@@ -1781,7 +2153,7 @@ mod tests {
         )
         .expect("opens with no keys");
         let mut context = context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir);
-        context.protection = Arc::new(std::sync::Mutex::new(protection));
+        context.protection = crate::slashing_protection::SharedProtection::new(protection);
         let protection = context.protection.clone();
         (context, protection)
     }
