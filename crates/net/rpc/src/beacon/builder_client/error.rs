@@ -5,7 +5,7 @@ use std::time::Duration;
 use reqwest::header;
 use reqwest::{StatusCode, Url};
 
-use super::{read_body, truncate_error_text};
+use super::{error_text, read_body};
 
 /// A failed builder API call.
 ///
@@ -27,6 +27,13 @@ pub enum BuilderError {
     /// A status the call does not expect.
     #[error("builder answered {status}: {body}")]
     Status { status: u16, body: String },
+    /// A success status other than the 202 `submitBlindedBlockV2` succeeds
+    /// with. Told apart from [`Status`](Self::Status) because the builder may
+    /// well have taken the block: 200 is what the V1 call answered.
+    #[error(
+        "builder answered {status}, a success but not the 202 Accepted submitBlindedBlockV2 requires; it may have taken the block anyway"
+    )]
+    UnexpectedSuccess { status: u16 },
     /// A redirect the client did not follow: any redirect without
     /// `--builder-follow-redirects`, and with it a 301, 302 or 303, an https
     /// to http downgrade, or the hop past the tenth.
@@ -84,13 +91,13 @@ impl BuilderError {
         if status != StatusCode::BAD_REQUEST {
             return Self::Status {
                 status: status.as_u16(),
-                body: truncate_error_text(body),
+                body: error_text(body),
             };
         }
         let message = serde_json::from_str::<ErrorMessage>(&body)
             .map(|error| error.message)
             .unwrap_or(body);
-        Self::BadRequest(truncate_error_text(message))
+        Self::BadRequest(error_text(message))
     }
 
     /// How the call ended, as a metric label.
@@ -100,6 +107,7 @@ impl BuilderError {
             Self::Transport(_) => "unreachable",
             Self::BadRequest(_) => "bad_request",
             Self::Status { .. } => "unexpected_status",
+            Self::UnexpectedSuccess { .. } => "unexpected_success",
             Self::Redirected { .. } => "redirected",
             Self::Decode(_) | Self::Incomplete(_) | Self::TooLarge { .. } => "invalid_response",
             Self::InvalidUrl(_) => "invalid_url",
@@ -151,10 +159,7 @@ pub(super) fn shown_target(base: &Url, location: &[u8]) -> String {
     base.join(&location)
         .ok()
         .and_then(without_credentials)
-        .map_or_else(
-            || UNSHOWN_LOCATION.to_owned(),
-            |url| truncate_error_text(url.into()),
-        )
+        .map_or_else(|| UNSHOWN_LOCATION.to_owned(), |url| error_text(url.into()))
 }
 
 /// `url` without its user and password, or `None` when it cannot hold them

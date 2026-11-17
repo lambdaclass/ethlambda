@@ -18,7 +18,9 @@ what each workload measures; `benchmark import`'s flags are in
 [their own section](#benchmark-import-flags) below. `ethlambda validator` is
 the validator client: a separate process that holds keys and performs duties
 against a beacon node over the standard REST API, documented in
-[its own section](#validator-flags) below. `ethlambda slashing-protection`
+[its own section](#validator-flags) below. `ethlambda voluntary-exit` signs one
+validator's voluntary exit and hands it to a beacon node; see
+[its section](#voluntary-exit) below. `ethlambda slashing-protection`
 moves that client's EIP-3076 history in and out of its directory, offline; see
 [its section](#slashing-protection) below.
 
@@ -119,6 +121,9 @@ from a normal build.
 | `--builder` | none | Base URL of a builder API endpoint, normally MEV-Boost (e.g. `http://127.0.0.1:18550`). Without it every block is built locally |
 | `--builder-header-timeout` | `1000` | Milliseconds block production waits for the builder's bid; also sent to the builder as `X-Timeout-Ms`. Requires `--builder` |
 | `--builder-follow-redirects` | off | Follow the builder's 307 and 308 redirects, up to ten per call, never from https to http. A 301, 302 or 303 is not followed even then, since following one resends a POST as a GET without its body. Off, every redirect fails the call with an error naming its target, so registrations and signed blocks go only where `--builder` points; on, so does any redirect it does not follow. Requires `--builder` |
+| `--builder-fallback-skips` | `3` | Build locally when more than this many consecutive slots right before the proposal had no block (the circuit breaker). Requires `--builder` |
+| `--builder-fallback-skips-per-epoch` | `8` | Build locally when more than this many of the slots in the epoch's worth before the proposal had no block. Requires `--builder` |
+| `--builder-fallback-epochs-since-finalization` | `3` | Build locally when the proposal is more than this many epochs past the finalized checkpoint. Requires `--builder` |
 
 Accepted range is `CUSTODY_REQUIREMENT` to `NUMBER_OF_CUSTODY_GROUPS` (4 to
 128), enforced at parse time rather than clamped: serving a different set than
@@ -280,7 +285,13 @@ implementation's, so none of the [common flags](#common-flags) apply to it.
 > regular file, since a dangling one would read as "no record"; and
 > the directory should be a local disk, since every signature waits for the
 > record to be flushed to it, and the lock that keeps a second process off it
-> is an `flock`, which a network filesystem may not honour. Unix only. A key with no record is refused at startup unless
+> is an `flock`, which a network filesystem may not honour. Unix only. Run the
+> client under a supervisor that restarts it (systemd's `Restart=on-failure`,
+> a Kubernetes pod): if a bug ever panics while the record is held, the record
+> is unusable for the rest of that process and no attestation or block can be
+> signed, so the client stops at once and exits with a failure, after letting
+> a keymanager request in flight finish, and the restart rereads the record
+> from disk. A key with no record is refused at startup unless
 > `--init-slashing-protection` is passed. A key moving here from another client
 > brings its history with [`slashing-protection import`](#slashing-protection),
 > or in the same keymanager API request that imports the key. See
@@ -314,8 +325,12 @@ advance so it can collect the votes.
 Each slot it wakes at the boundary. If one of its validators proposes that
 slot, it signs the RANDAO reveal, asks the beacon node for a block, checks that
 the block is for the slot and proposer it asked about, signs it and publishes
-it. One third into the slot it fetches the attestation data, signs for every
-validator due that slot, and submits the batch. Two thirds in, for any duty it
+it. One third into the slot it fetches the attestation data, checks that it is
+for the slot it asked about and that its `index` is one the slot's fork allows
+(0 before gloas, 0 or 1 from it, where it is the payload signal), signs for
+every validator due that slot, and submits the batch. A node whose answer fails
+either check is passed over for the next one in `--beacon-nodes`, before
+anything is recorded or signed. Two thirds in, for any duty it
 was selected to aggregate, it asks the node for the aggregate covering that
 committee's votes on the data it just signed, wraps it with the selection proof
 and publishes it.
@@ -381,8 +396,9 @@ assigned to slot `S` sign for `S - 1`. Both halves are bounded by the end of the
 slot.
 
 Not implemented: the builder flow and blinded blocks (the client asks for an
-unblinded block and refuses a blinded one), voluntary exits, doppelganger
-protection and remote signing.
+unblinded block and refuses a blinded one), doppelganger protection and remote
+signing. Voluntary exits are signed by the keymanager API's `voluntary_exit`
+route and by [`ethlambda voluntary-exit`](#voluntary-exit).
 
 ### Duty offsets come from the network
 
@@ -418,7 +434,16 @@ Off unless `--enable-keymanager` is passed. It serves `GET`, `POST` and
 if absent. The token file is written `0600` and a file too short to be a real
 token is refused rather than accepted.
 
-It also serves `GET`, `POST` and `DELETE` on
+It also serves `POST /eth/v1/validator/{pubkey}/voluntary_exit`, which signs a
+voluntary exit for a validator this client holds and answers with the
+`SignedVoluntaryExit`, for the exit's `epoch` query parameter or the current
+epoch when none is given. **It does not publish the exit.** As the
+specification has it, the caller hands the message to a beacon node's
+`POST /eth/v1/beacon/pool/voluntary_exits`, or holds on to it. The validator
+index comes from the beacon node on each call, so a key whose deposit the chain
+has not processed yet is a `404` saying so.
+
+And it serves `GET`, `POST` and `DELETE` on
 `/eth/v1/validator/{pubkey}/feerecipient`, `/graffiti` and `/gas_limit`, which
 give one validator its own value in place of the command line's default:
 
@@ -458,6 +483,65 @@ beacon chain. Every series is registered at startup so it reads zero rather
 than being absent before its first event, which is what lets an alert fire on
 "attestations stopped". See [Metrics](./metrics.md#validator-client).
 
+## `voluntary-exit`
+
+`ethlambda voluntary-exit` signs a voluntary exit for one validator and hands
+it to a beacon node, which validates it against its head and gossips it. It is
+a command of its own rather than part of `ethlambda validator`: it takes one
+keystore and none of the client's flags, runs once and ends.
+
+```sh
+ethlambda voluntary-exit \
+  --keystore ~/validators/0xabc.../voting-keystore.json \
+  --password-file ~/secrets/0xabc... \
+  --beacon-node http://localhost:5052
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--keystore` | required | The validator's EIP-2335 voting keystore |
+| `--password-file` | required | The file holding that keystore's password. A trailing newline is ignored |
+| `--beacon-node` | `http://localhost:5052` | Base URL of the beacon node's HTTP API. One node, not a list: this is a one-shot command, and an operator whose node is down picks another |
+| `--epoch` | the current epoch | The exit's epoch, before which the chain refuses it. An earlier one is as good as the current one. A later one needs `--presign`: a node refuses an exit whose epoch has not come, so the command refuses to publish one |
+| `--presign` | off | Sign the exit and print it as JSON on stdout without publishing it, for an operator who wants to hold a signed exit for later. Logs go to stderr, so the JSON pipes cleanly into a file |
+| `--no-confirmation` | off | Publish without asking for the confirmation phrase. For scripts; use with care |
+| `--no-wait` | off | Return as soon as the beacon node has accepted the exit, without waiting for the chain to process it |
+
+**A voluntary exit is irreversible.** Once the chain processes it the
+validator is queued to leave, stops earning after its exit epoch, and the key
+can never validate again. So before publishing anything the command refuses a
+beacon node that is still syncing, refuses a validator the chain would refuse
+(one that is not `active_ongoing`, or not yet `SHARD_COMMITTEE_PERIOD` epochs
+past its activation, naming the epoch it becomes eligible at), and then prints
+a warning and asks for the phrase `Exit my validator` on stdin. Anything else,
+an empty stdin included, aborts without publishing and with a failing exit
+status, so a script cannot take an exit that never went out for one that did.
+
+The shard committee period is measured the way the chain measures it: against
+the epoch the exit is processed in, which is now for an exit being published
+and the exit's own epoch for a `--presign` one naming a later epoch. Its
+length is the beacon node's own `SHARD_COMMITTEE_PERIOD`, read from
+`/eth/v1/config/spec`, so a devnet that shortens it is followed. One rule
+of the chain's cannot be checked up front: from electra on it refuses a
+validator with a partial withdrawal still pending. That refusal comes back as
+the beacon node's `400`, with its reason.
+
+After publishing, unless `--no-wait` is given, it polls the validator's status
+once a slot, for up to two epochs. When the chain reports `active_exiting` it
+prints the current, exit and withdrawable epochs and how long until the exit
+epoch, and returns; **keep the validator running until that epoch**, since it
+still has duties until then. Any later status (`exited_*`, `withdrawal_*`) and
+`active_slashed` end the wait too, reported as such. If the chain has not
+processed the exit when the wait runs out, the command says so and returns
+successfully, since the exit was published; a beacon node that cannot answer a
+poll is asked again at the next slot rather than failing the run.
+
+Exits are signed for the fork that processes them, not the one their epoch
+falls in. From deneb on that is `CAPELLA_FORK_VERSION` whatever epoch the exit
+names (EIP-7044), an epoch from before deneb included, so a pre-signed exit
+stays valid across every fork to come. The command signs that way, and the
+[keymanager API](#the-keymanager-api)'s `voluntary_exit` route does too.
+
 ## `slashing-protection`
 
 Moves the validator client's EIP-3076 history in and out of its
@@ -477,7 +561,7 @@ ethlambda slashing-protection export --validators-dir ./validators --pubkeys 0xa
 | Sub-command | Does |
 |---|---|
 | `import <file>` | Merges a version 5 interchange, complete or minimal, into the record. Each validator is reduced to its highest slot, source and target and merged by maximum, so nothing already recorded is lowered and slashable data in the file is absorbed rather than refused, except an attestation whose source is at or past its target outside genesis, which is refused. All or nothing. With no record yet, the import creates one for the interchange's chain, and a failed import creates nothing; the client refuses the record at its next start if that is not its beacon node's chain |
-| `export [--pubkeys ...] <file>` | Writes the record, or the named validators' part of it, as a minimal version 5 interchange, readable by its owner only. A named validator with no record fails the export, so a typo or the wrong directory cannot produce a file that reads as complete. Takes the record's lock, so the directory must be writable. Refuses to overwrite an existing file |
+| `export [--pubkeys ...] <file>` | Writes the record, or the named validators' part of it, as a minimal version 5 interchange, readable by its owner only. A named validator with no record fails the export, so a typo or the wrong directory cannot produce a file that reads as complete. Writes nothing to the directory, and the lock is on the directory itself, so a read-only one will do. Refuses to overwrite an existing file |
 
 ## `benchmark import` flags
 
